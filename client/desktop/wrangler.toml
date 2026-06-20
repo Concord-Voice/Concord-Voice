@@ -1,0 +1,5 @@
+# Cloudflare Pages config for the Concord SPA (T4a, #976 / ADR-0015).
+# CI deploys via: npx wrangler pages deploy dist/renderer --project-name=concord-spa
+name = "concord-spa"
+pages_build_output_dir = "dist/renderer"
+compatibility_date = "2026-06-06"

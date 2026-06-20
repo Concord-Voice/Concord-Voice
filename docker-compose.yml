@@ -1,0 +1,282 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: concordvoice-postgres
+    environment:
+      POSTGRES_USER: concord
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set - copy .env.example to .env}
+      POSTGRES_DB: concord
+    # Enable WAL replication so the failover replica on port 5433 can connect.
+    # These settings are lightweight and harmless when no replica is running.
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=3
+        -c hot_standby=on
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/docker/postgres/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U concord"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - concordvoice-data
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: concordvoice-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set - copy .env.example to .env}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - concordvoice-data
+
+  # NATS Message Broker (for inter-service messaging)
+  nats:
+    image: nats:2-alpine
+    container_name: concordvoice-nats
+    # -js enables JetStream; -c points at our config which pins store_dir to
+    # /data/jetstream with a 5G max_file cap. The nats-data named volume below
+    # persists JetStream streams across container restarts so we no longer see
+    # the "Temporary storage directory used" warning on startup.
+    command: "-js -c /etc/nats/nats-server.conf -m 8222"
+    ports:
+      - "4222:4222"  # Client connections
+      - "8222:8222"  # HTTP monitoring
+    volumes:
+      - nats-data:/data
+      - ./infrastructure/docker/nats/nats-cluster.conf:/etc/nats/nats-server.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - concordvoice-services
+
+  # TURN/STUN Server (coturn)
+  coturn:
+    image: coturn/coturn:4.6.3-alpine
+    container_name: concordvoice-coturn
+    # PUBLIC_IP is REQUIRED. If left unset coturn would advertise
+    # 127.0.0.1 as the relay address and every relayed media packet would
+    # be black-holed — fail loud at startup instead. --cert/--pkey use
+    # absolute paths from the mounted cert dir so the DTLS/TLS listeners
+    # don't fall through to coturn's default CWD lookup (which emits
+    # "cannot find certificate file" + "//turn_server_cert.pem" warnings).
+    command: >
+      turnserver
+        -c /etc/coturn/turnserver.conf
+        --static-auth-secret=${TURN_SECRET:?TURN_SECRET must be set - copy .env.example to .env}
+        --realm=${TURN_REALM:-example.com}
+        --listening-ip=0.0.0.0
+        --external-ip=${PUBLIC_IP:?PUBLIC_IP must be set to the host's public IP}
+        --relay-ip=${PUBLIC_IP}
+        --cert=/etc/coturn/certs/cert.pem
+        --pkey=/etc/coturn/certs/key.pem
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "5349:5349/tcp"
+      - "49152-49252:49152-49252/udp"  # TURN relay range
+    volumes:
+      - ./infrastructure/docker/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      # Set COTURN_CERTS_DIR in .env to choose the host directory mounted at /etc/coturn/certs.
+      # Production sets it to /opt/concord/certs/coturn (real cert files copied from the
+      # certbot deploy hook). Dev defaults to the repo placeholder directory — place a
+      # self-signed cert.pem + key.pem there if you want local TLS.
+      - ${COTURN_CERTS_DIR:-./infrastructure/docker/coturn/certs}:/etc/coturn/certs:ro
+    healthcheck:
+      test: ["CMD", "turnutils_stunclient", "127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - concordvoice-services
+
+  # MinIO Object Storage (S3-compatible)
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: concordvoice-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set - copy .env.example to .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set - copy .env.example to .env}
+    # No host ports published in base compose — production layers on top of this file
+    # and Compose merges port lists additively. Use docker-compose.override.yml for
+    # dev host access, or access MinIO via `docker compose exec` / internal network.
+    expose:
+      - "9000"  # S3 API (internal only)
+      - "9001"  # Web console (internal only)
+    volumes:
+      - minio-data:/data
+    # No healthcheck — the MinIO image is minimal (no curl/wget/mc).
+    # The control plane handles MinIO readiness via its 15s startup timeout.
+    networks:
+      - concordvoice-data
+
+  # PostgreSQL Admin (optional, for development)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: concordvoice-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@concordvoice.local
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - concordvoice-data
+    profiles:
+      - tools
+
+  # Redis Commander (optional, for development)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: concordvoice-redis-commander
+    environment:
+      REDIS_HOSTS: local:redis:6379:0:${REDIS_PASSWORD:?}
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - concordvoice-data
+    profiles:
+      - tools
+
+  # Control Plane Service (Go)
+  control-plane:
+    build:
+      context: ./services/control-plane
+      dockerfile: Dockerfile
+    container_name: concordvoice-control-plane
+    env_file:
+      - spa.env.example
+    environment:
+      DATABASE_URL: postgres://concord:${POSTGRES_PASSWORD:?}@postgres:5432/concord?sslmode=disable
+      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
+      NATS_URL: nats://nats:4222
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set - copy .env.example to .env}
+      TURN_SERVER_HOST: ${TURN_SERVER_HOST:-localhost}
+      TURN_SECRET: ${TURN_SECRET:?}
+      TURN_REALM: ${TURN_REALM:-example.com}
+      MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-}
+      SMTP_HOST: ${SMTP_HOST:-smtp.resend.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-resend}
+      SMTP_PASSWORD: ${RESEND_API_KEY:-${SMTP_PASSWORD:-}}
+      SMTP_FROM: ${SMTP_FROM:-noreply@example.com}
+      WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-localhost}
+      WEBAUTHN_RP_ORIGINS: ${WEBAUTHN_RP_ORIGINS:-http://localhost:3001}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?}
+      MINIO_USE_SSL: "false"
+      MINIO_BUCKET: ${MINIO_BUCKET:-concord-media}
+      UPLOAD_MAX_SIZE: ${UPLOAD_MAX_SIZE:-26214400}
+      KLIPY_API_KEY: ${KLIPY_API_KEY:-}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.19.0.0/16}
+      PORT: 8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - concordvoice-data
+      - concordvoice-services
+    profiles:
+      - services
+
+  # Media Plane Service (Node.js + mediasoup)
+  media-plane:
+    build:
+      context: ./services/media-plane
+      dockerfile: Dockerfile
+    container_name: concordvoice-media-plane
+    environment:
+      CONTROL_PLANE_URL: http://control-plane:8080
+      NATS_URL: nats://nats:4222
+      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
+      JWT_SECRET: ${JWT_SECRET:?}
+      RTC_MIN_PORT: 40000
+      RTC_MAX_PORT: 49999
+      ANNOUNCED_IP: 127.0.0.1
+      PORT: 3000
+    ports:
+      - "3000:3000"
+      - "40000-40099:40000-40099/udp"  # RTC ports (limited range for dev)
+    depends_on:
+      nats:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    networks:
+      - concordvoice-services
+      - concordvoice-data
+    profiles:
+      - services
+
+  # Licensing Authority Service (Go)
+  licensing-authority:
+    build:
+      context: ./services/licensing-authority
+      dockerfile: Dockerfile
+    container_name: concordvoice-licensing-authority
+    environment:
+      DATABASE_URL: postgres://concord:${POSTGRES_PASSWORD:?}@postgres:5432/concord?sslmode=disable
+      PRIVATE_KEY_PATH: /app/keys/license_private_key.pem
+      PORT: 8082
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./infrastructure/docker/licensing/keys:/app/keys
+    networks:
+      - concordvoice-data
+    profiles:
+      - licensing
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  minio-data:
+    driver: local
+  nats-data:
+    driver: local
+
+networks:
+  concordvoice-data:
+    driver: bridge
+  concordvoice-services:
+    driver: bridge

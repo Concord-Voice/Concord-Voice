@@ -1,0 +1,60 @@
+{
+  "name": "@concordvoice/media-plane",
+  "version": "0.1.0",
+  "description": "Concord Voice Media Plane - WebRTC SFU for voice routing",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "keywords": [
+    "webrtc",
+    "sfu",
+    "mediasoup",
+    "voice"
+  ],
+  "author": "Concord Voice Team",
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mediasoup": "^3.20.7",
+    "nats": "^2.29.3",
+    "redis": "^6.0.0",
+    "socket.io": "^4.8.3",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^25.9.3",
+    "@vitest/coverage-istanbul": "^4.1.8",
+    "eslint": "^10.5.0",
+    "globals": "^17.6.0",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1",
+    "vitest": "^4.1.9"
+  },
+  "//overrides_rationale": "node-domexception@1.0.0 is deprecated upstream and has no replacement version. fetch-blob@3.x and 4.x both still declare it as a hard dep. We override to a local stub that re-exports globalThis.DOMException (native in Node 18+). Remove this override + the stubs/ directory once mediasoup ships a release pulling node-fetch@^4 stable, OR fetch-blob ships a version that drops the polyfill dep entirely.",
+  "//overrides_security": "ws@^8.21.0 closes GHSA-96hv-2xvq-fx4p (memory-exhaustion DoS; transitive via socket.io->engine.io->ws, vulnerable <8.21.0). @babel/core@^7.29.7 closes GHSA-4x5r-pxfx-6jf8 (arbitrary file read via sourceMappingURL; transitive via @vitest/coverage-istanbul). Both are forced because the intermediates pin older ranges. Drop each override once the parent pulls a patched version natively.",
+  "overrides": {
+    "node-domexception": "file:./stubs/node-domexception",
+    "ws": "^8.21.0",
+    "@babel/core": "^7.29.7"
+  },
+  "engines": {
+    "node": ">=24.0.0",
+    "npm": ">=10.0.0"
+  }
+}

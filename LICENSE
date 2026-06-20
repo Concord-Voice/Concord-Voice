@@ -1,0 +1,411 @@
+CONCORD VOICE SOURCE LICENSE, VERSION 1.0
+==========================================
+
+Abbreviation: CVSL-1.0-AGPL-3.0-or-later
+
+Notice
+------
+
+Copyright (c) 2026 Concord Voice LLC. All rights reserved.
+
+This License is a source-available software license that grants free use of
+the Software for personal and non-profit purposes, requires a separate
+commercial license for use by for-profit and governmental entities, prohibits
+use of the Software in products that compete with the Software, and converts
+to an open-source license on the Change Date defined below.
+
+This License is inspired by, and structurally based on, the Functional Source
+License 1.1 (https://fsl.software/) and the Business Source License 1.1
+(https://mariadb.com/bsl11/), but is a distinct license authored by Concord
+Voice LLC. It is not the Functional Source License, the Business Source
+License, or any other established license, and should not be referred to as
+such.
+
+By using, copying, modifying, distributing, or otherwise interacting with the
+Software, you agree to be bound by the terms and conditions of this License.
+
+-----------------------------------------------------------------------------
+
+Section 1. Definitions
+----------------------
+
+"Software" means each version of the Concord Voice software made available
+by Concord Voice LLC under this License, including without limitation source
+code, object code, build scripts, database schema migrations, configuration
+templates, documentation, and accompanying media.
+
+"Licensor", "We", and "Us" mean Concord Voice LLC, a Virginia limited
+liability company.
+
+"You" and "Licensee" mean the individual or legal entity exercising rights
+granted under this License.
+
+"Personal Use" means use by an individual natural person, in their personal
+capacity, for non-commercial purposes, including without limitation use in a
+personal homelab, household, or hobbyist setting.
+
+"Non-Profit Organization" means (i) an organization recognized as tax-exempt
+under United States Internal Revenue Code section 501(c)(3); (ii) the foreign
+equivalent thereof, including charitable, educational, religious, scientific,
+and public-research organizations; or (iii) an accredited educational
+institution, in each case operating consistently with its non-profit or
+charitable mission and not for commercial gain.
+
+"Non-Profit Use" means use of the Software by a Non-Profit Organization for
+purposes consistent with its non-profit or charitable mission.
+
+"Commercial Entity" means any individual, business entity, sole proprietorship,
+partnership, corporation, limited liability company, joint venture,
+governmental agency, governmental authority, public corporation, state-owned
+enterprise, public benefit corporation, B-corporation, or any other person or
+organization that is not a Non-Profit Organization and is not engaged in
+Personal Use.
+
+"Commercial Use" means any use of the Software by, or for the benefit of, a
+Commercial Entity, including without limitation any use by a governmental
+agency, public authority, or state-owned enterprise.
+
+"Concord Voice Service" means the hosted software-as-a-service offering made
+available by Licensor at example.com or any successor domain operated
+by Licensor.
+
+"Permitted Purpose" means Personal Use or Non-Profit Use that is not a
+Competing Use.
+
+"Competing Use" means any use of the Software, in whole or in part, to
+develop, market, distribute, host, operate, sell, or otherwise make available
+a product or service that competes with the Software or the Concord Voice
+Service. A Competing Use includes, without limitation, any real-time voice,
+video, messaging, presence, or collaboration platform offered to third
+parties on a hosted, managed, or self-distributed basis.
+
+"Change Date" means February 15, 2030, or the fourth anniversary of the
+first publicly available distribution of a specific version of the Software
+under this License, whichever comes first. Each version of the Software has
+its own Change Date.
+
+"Change License" means the GNU Affero General Public License, Version 3.0,
+or any later version published by the Free Software Foundation, the text of
+which is available at https://www.gnu.org/licenses/agpl-3.0.html.
+
+"Commercial License" means a separate written agreement between Licensor (or
+an Authorized Reseller) and a Commercial Entity authorizing Commercial Use
+of the Software. Information regarding Commercial Licenses is available at
+https://concordvoice.com/commercial-license.
+
+"Authorized Reseller" means a person or entity that has entered into a
+written reseller, wholesale, or distribution agreement with Licensor
+authorizing it to grant Commercial Licenses on behalf of Licensor.
+
+"Marks" means the names, trademarks, service marks, trade dress, logos, and
+domain names of Licensor or its affiliates, including without limitation
+"Concord," "Concord Voice," "example.com," "concordvoice.com," and any
+mark confusingly similar to any of the foregoing.
+
+Section 2. License Grant
+------------------------
+
+Subject to your continuing compliance with this License, Licensor hereby
+grants you a worldwide, non-exclusive, no-charge, royalty-free,
+non-transferable copyright license to use, copy, modify, create derivative
+works of, publicly perform, publicly display, and redistribute the Software,
+solely for a Permitted Purpose.
+
+For the avoidance of doubt:
+  (a) Use by an individual natural person for personal, non-commercial
+      purposes is Personal Use and is permitted under this Section 2 without
+      a Commercial License.
+  (b) Use by a Non-Profit Organization for purposes consistent with its
+      non-profit or charitable mission is Non-Profit Use and is permitted
+      under this Section 2 without a Commercial License.
+  (c) Any other use of the Software, including without limitation any
+      Commercial Use, requires a Commercial License or other written
+      authorization from Licensor.
+
+Section 3. Patent License
+-------------------------
+
+Subject to your continuing compliance with this License, Licensor hereby
+grants you a worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+(except as expressly provided in this Section 3) patent license to make,
+have made, use, offer to sell, sell, import, and otherwise transfer the
+Software for a Permitted Purpose, where such patent license applies only to
+those patent claims licensable by Licensor that are necessarily infringed by
+the Software alone.
+
+If you, or any entity controlled by you, controlling you, or under common
+control with you, institute patent litigation against any entity, including
+a cross-claim or counterclaim in a lawsuit, alleging that the Software or
+any contribution incorporated within the Software constitutes direct or
+contributory patent infringement, then any licenses granted to you under
+this License shall terminate as of the date such litigation is filed.
+
+Section 4. Prohibition on Competing Use
+---------------------------------------
+
+You may not use the Software, in whole or in part, for any Competing Use.
+For clarity, the prohibition on Competing Use applies regardless of whether
+you would otherwise qualify for Personal Use, Non-Profit Use, or hold a
+Commercial License, unless a Commercial License or other written
+authorization from Licensor expressly permits a specific Competing Use.
+
+Section 5. Commercial Use Requires a Commercial License
+-------------------------------------------------------
+
+Any Commercial Use of the Software requires a Commercial License. Commercial
+Licenses are available through self-serve tiers, negotiated enterprise
+agreements, and wholesale or reseller arrangements with Authorized Resellers.
+Information regarding Commercial Licenses, including tiers, pricing, and
+terms, is available at https://concordvoice.com/commercial-license. To
+inquire about commercial licensing, contact us at
+contact-us@concordvoice.com.
+
+A good-faith evaluation period of up to thirty (30) days is permitted for a
+prospective Commercial Licensee to evaluate the Software for the purpose of
+determining whether to obtain a Commercial License, provided that such
+evaluation use is internal, non-production, and does not involve the
+distribution of the Software to any third party.
+
+Section 6. Branding, Trademarks, and Attribution
+------------------------------------------------
+
+Except as expressly provided in this Section 6, this License does not grant
+you any right to use the Marks, and all rights in the Marks are expressly
+reserved by Licensor.
+
+You shall not:
+  (a) use the Marks in connection with any product, service, fork,
+      modification, or derivative of the Software, except for factual
+      attribution of origin (for example, "Built on Concord Voice -
+      (c) Concord Voice LLC");
+  (b) represent the Software, or any modification or derivative of the
+      Software, as your own original work or as the work of any third party
+      other than Licensor;
+  (c) remove, alter, or obscure any copyright notice, attribution notice,
+      trademark notice, or this License from any copy of the Software;
+  (d) use the Marks in any manner that creates confusion as to the source,
+      sponsorship, affiliation, or endorsement of any product or service; or
+  (e) register or attempt to register any domain name, trademark, trade
+      name, or social-media handle that incorporates, is confusingly similar
+      to, or could be mistaken for any of the Marks.
+
+Section 7. Redistribution
+-------------------------
+
+If you redistribute the Software, or any modification or derivative of the
+Software, you must:
+  (a) include a complete and unmodified copy of this License with the
+      redistribution;
+  (b) retain all copyright notices, attribution notices, and trademark
+      notices in the Software;
+  (c) clearly identify any modifications you have made; and
+  (d) ensure that recipients receive the Software under the terms of this
+      License (or, if the Change Date for the version being redistributed
+      has occurred, under the terms of the Change License at the recipient's
+      election).
+
+Section 8. Reverse Engineering for Interoperability
+---------------------------------------------------
+
+Nothing in this License restricts your right to reverse engineer the
+Software to the extent permitted by applicable law, including without
+limitation 17 U.S.C. section 1201(f) of the United States Digital Millennium
+Copyright Act, Article 6 of European Union Directive 2009/24/EC (the
+Software Directive), and analogous provisions in other jurisdictions, in
+each case solely to the extent necessary to achieve interoperability with an
+independently created computer program.
+
+Section 9. Sanctions Compliance and Export Controls
+---------------------------------------------------
+
+You represent and warrant that:
+  (a) you are not located in, organized under the laws of, or ordinarily
+      resident in any country, territory, or jurisdiction that is subject to
+      comprehensive economic sanctions administered by the United States
+      Department of the Treasury Office of Foreign Assets Control ("OFAC"),
+      the European Union, the United Kingdom, or the United Nations Security
+      Council, including without limitation Cuba, Iran, North Korea, Syria,
+      and the Crimea, Donetsk, Luhansk, Kherson, and Zaporizhzhia regions of
+      Ukraine;
+  (b) you are not listed on, and are not 50% or more owned or controlled by
+      any person or entity listed on, the OFAC Specially Designated
+      Nationals and Blocked Persons List, the EU Consolidated List of
+      Sanctions, the UK Office of Financial Sanctions Implementation
+      Consolidated List, the UN Security Council Consolidated List, or any
+      analogous list maintained by any other competent authority; and
+  (c) you will not use, distribute, or sublicense the Software in violation
+      of any applicable export-control, economic-sanctions, or
+      anti-money-laundering law of the United States, the European Union,
+      the United Kingdom, the United Nations, or any other jurisdiction
+      with competent authority.
+
+The Software includes cryptographic functionality and may be subject to
+export-control laws, including without limitation the United States Export
+Administration Regulations (15 C.F.R. Parts 730-774) and Council Regulation
+(EU) 2021/821 on dual-use items. You are responsible for compliance with
+all such laws as they apply to your use, distribution, or sublicensing of
+the Software.
+
+Section 10. Cure Period; Termination
+------------------------------------
+
+(a) First-time inadvertent breach. If you cease all breach of this License
+    within thirty (30) days of your first receipt of written notice from
+    Licensor identifying the breach, your rights under this License are
+    automatically reinstated.
+
+(b) Repeat breach. Second and subsequent breaches by you, or by any entity
+    controlled by you, controlling you, or under common control with you,
+    will result in immediate termination of all rights granted under this
+    License, without further notice and without a right of cure.
+
+(c) Material breach without cure. Notwithstanding paragraph (a) of this
+    Section 10, any breach of Section 4 (Prohibition on Competing Use),
+    Section 6(b) or 6(d) (misrepresentation of authorship or affiliation),
+    or Section 9 (Sanctions Compliance and Export Controls), or any
+    intentional or willful breach of this License, will result in immediate
+    termination of all rights granted under this License, without right of
+    cure.
+
+(d) Effect of termination. Upon termination, you shall cease all use of the
+    Software, destroy or return all copies of the Software in your
+    possession or control, and certify in writing to Licensor that you have
+    done so. The provisions of Sections 11 (Grant of Future License), 12
+    (Disclaimer of Warranty), 13 (Limitation of Liability), 14 (Governing
+    Law; Venue), 15 (General Provisions), and any other provision that by
+    its nature should survive termination, shall survive termination of
+    this License. Termination of this License does not affect Licensor's
+    right to bring legal action for breaches occurring prior to
+    termination.
+
+Section 11. Grant of Future License
+-----------------------------------
+
+Effective on the Change Date applicable to a specific version of the
+Software, Licensor hereby grants you, on an irrevocable basis, an additional
+license to use that version of the Software under the Change License. On or
+after the applicable Change Date, you may, at your option, continue using
+that version of the Software under this License (subject to its terms and
+conditions) or use that version of the Software under the Change License,
+in which case the terms of the Change License will govern such use.
+
+This grant of future license is irrevocable. The occurrence of the Change
+Date for a specific version of the Software does not affect this License
+with respect to any other version of the Software that has not yet reached
+its Change Date.
+
+Section 12. Disclaimer of Warranty
+----------------------------------
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED
+"AS IS" AND "AS AVAILABLE," WITHOUT WARRANTY OR CONDITION OF ANY KIND,
+WHETHER EXPRESS, IMPLIED, OR STATUTORY. LICENSOR EXPRESSLY DISCLAIMS ALL
+WARRANTIES AND CONDITIONS, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTY OR CONDITION OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
+TITLE, NON-INFRINGEMENT, ACCURACY, INTEGRATION, AVAILABILITY, COMPLIANCE
+WITH ANY LAW OR REGULATION, OR ANY WARRANTY OR CONDITION ARISING FROM A
+COURSE OF DEALING OR USAGE OF TRADE.
+
+LICENSOR DOES NOT WARRANT THAT THE SOFTWARE WILL MEET YOUR REQUIREMENTS,
+THAT THE OPERATION OF THE SOFTWARE WILL BE UNINTERRUPTED OR ERROR-FREE,
+THAT ANY DEFECTS WILL BE CORRECTED, OR THAT THE SOFTWARE IS FREE OF VIRUSES
+OR OTHER HARMFUL COMPONENTS.
+
+Section 13. Limitation of Liability
+-----------------------------------
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT WILL
+LICENSOR, ITS AFFILIATES, OR ANY OF ITS OR THEIR OFFICERS, DIRECTORS,
+MEMBERS, EMPLOYEES, OR AGENTS BE LIABLE TO YOU FOR ANY INDIRECT,
+INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES,
+INCLUDING WITHOUT LIMITATION DAMAGES FOR LOST PROFITS, LOST REVENUE, LOST
+DATA, LOSS OF USE, BUSINESS INTERRUPTION, OR COST OF SUBSTITUTE GOODS OR
+SERVICES, ARISING OUT OF OR RELATED TO THIS LICENSE OR THE SOFTWARE, EVEN
+IF LICENSOR HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+LICENSOR'S TOTAL AGGREGATE LIABILITY TO YOU FOR ALL CLAIMS ARISING OUT OF
+OR RELATED TO THIS LICENSE OR THE SOFTWARE SHALL NOT EXCEED THE GREATER OF
+(a) ONE HUNDRED UNITED STATES DOLLARS ($100.00 USD) OR (b) THE TOTAL AMOUNT
+PAID BY YOU TO LICENSOR UNDER A COMMERCIAL LICENSE OR OTHER WRITTEN
+AGREEMENT DURING THE TWELVE (12) MONTHS PRECEDING THE EVENT GIVING RISE TO
+THE CLAIM.
+
+THE FOREGOING LIMITATIONS APPLY REGARDLESS OF THE FORM OF ACTION, WHETHER
+IN CONTRACT, TORT (INCLUDING NEGLIGENCE), STRICT LIABILITY, OR OTHERWISE,
+AND EVEN IF ANY LIMITED REMEDY IS DEEMED TO HAVE FAILED OF ITS ESSENTIAL
+PURPOSE.
+
+Section 14. Governing Law; Venue
+--------------------------------
+
+This License shall be governed by, and construed in accordance with, the
+laws of the Commonwealth of Virginia, United States of America, without
+regard to its conflict-of-laws principles. The United Nations Convention
+on Contracts for the International Sale of Goods and the Uniform Computer
+Information Transaction Act are expressly excluded from this License.
+
+Any dispute, controversy, or claim arising out of or relating to this
+License or the Software shall be brought exclusively in the state or
+federal courts located in Fairfax County, Virginia, and the parties
+consent to personal jurisdiction and venue in such courts. The parties
+waive any objection to the jurisdiction or venue of such courts and any
+defense based on the doctrine of forum non conveniens.
+
+Section 15. General Provisions
+------------------------------
+
+(a) Severability. If any provision of this License is held to be invalid,
+    illegal, or unenforceable by a court of competent jurisdiction, the
+    remaining provisions shall remain in full force and effect, and the
+    invalid, illegal, or unenforceable provision shall be replaced by a
+    valid, legal, and enforceable provision that most closely reflects the
+    intent of the original.
+
+(b) Entire agreement. This License constitutes the entire agreement between
+    you and Licensor with respect to the Software and supersedes all prior
+    or contemporaneous understandings, agreements, representations, and
+    warranties, whether written or oral, with respect to the Software. A
+    Commercial License between Licensor and a Commercial Entity may
+    supplement, but does not supersede, this License with respect to the
+    underlying source rights granted herein.
+
+(c) Assignment. You may not assign or transfer this License or any rights
+    or obligations hereunder, in whole or in part, whether by operation of
+    law, merger, acquisition, or otherwise, without the prior written
+    consent of Licensor, and any attempted assignment or transfer in
+    violation of the foregoing shall be null and void. Licensor may freely
+    assign or transfer this License.
+
+(d) Waiver. A waiver of any provision of this License shall be effective
+    only if in writing and signed by Licensor. No waiver of any breach
+    shall constitute a waiver of any subsequent breach.
+
+(e) No partnership. Nothing in this License shall be construed as creating
+    any partnership, joint venture, agency, employment, or fiduciary
+    relationship between you and Licensor.
+
+(f) Independent contractors. The parties are independent contractors with
+    respect to one another, and nothing in this License creates any
+    obligation of one party to act on behalf of the other.
+
+(g) No third-party beneficiaries. This License does not create any
+    third-party beneficiary rights in any person or entity that is not a
+    party to this License.
+
+(h) Headings. Section headings in this License are for convenience of
+    reference only and do not affect the interpretation of any provision.
+
+Section 16. Contact
+-------------------
+
+For information regarding commercial licensing, including self-serve tiers,
+negotiated enterprise agreements, and wholesale or reseller arrangements,
+visit https://concordvoice.com/commercial-license or contact us at
+contact-us@concordvoice.com.
+
+For all other inquiries regarding this License, contact us at
+contact-us@concordvoice.com.
+
+-----------------------------------------------------------------------------
+
+End of Concord Voice Source License, Version 1.0

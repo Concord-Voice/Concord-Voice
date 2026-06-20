@@ -1,0 +1,35 @@
+name: CI (Go)
+
+# Public-repo CI subset (#1666). Runs in Concord-Voice/Concord-Voice on the MIRRORED tree.
+# Build + vet — the "does the source compile + pass static analysis" signal + over-filter
+# canary (a needed .go file dropped by the filter fails compilation here).
+#
+# NOTE: this does NOT run `go test ./...`. control-plane has no unit/integration split
+# (no build tags, no testing.Short()); its tests connect to Postgres/Redis and would
+# fail-red without that infra. Integration tests stay in Alpha (spec §6); provisioning DB
+# services in the public repo would duplicate Alpha and contradict that boundary. `go build`
+# + `go vet` is the reliable, infra-free public signal. No secrets, no private actions.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-vet:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/control-plane
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: services/control-plane/go.sum
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...

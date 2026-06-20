@@ -1,0 +1,33 @@
+-- Revert TIMESTAMPTZ columns back to TIMESTAMP.
+
+ALTER TABLE users
+    ALTER COLUMN created_at TYPE TIMESTAMP USING created_at AT TIME ZONE 'UTC',
+    ALTER COLUMN updated_at TYPE TIMESTAMP USING updated_at AT TIME ZONE 'UTC';
+
+ALTER TABLE user_keys
+    ALTER COLUMN created_at TYPE TIMESTAMP USING created_at AT TIME ZONE 'UTC',
+    ALTER COLUMN updated_at TYPE TIMESTAMP USING updated_at AT TIME ZONE 'UTC';
+
+ALTER TABLE refresh_tokens
+    ALTER COLUMN expires_at TYPE TIMESTAMP USING expires_at AT TIME ZONE 'UTC',
+    ALTER COLUMN created_at TYPE TIMESTAMP USING created_at AT TIME ZONE 'UTC',
+    ALTER COLUMN last_used_at TYPE TIMESTAMP USING last_used_at AT TIME ZONE 'UTC';
+
+ALTER TABLE servers
+    ALTER COLUMN created_at TYPE TIMESTAMP USING created_at AT TIME ZONE 'UTC',
+    ALTER COLUMN updated_at TYPE TIMESTAMP USING updated_at AT TIME ZONE 'UTC';
+
+ALTER TABLE channels
+    ALTER COLUMN created_at TYPE TIMESTAMP USING created_at AT TIME ZONE 'UTC',
+    ALTER COLUMN updated_at TYPE TIMESTAMP USING updated_at AT TIME ZONE 'UTC';
+
+ALTER TABLE server_members
+    ALTER COLUMN joined_at TYPE TIMESTAMP USING joined_at AT TIME ZONE 'UTC';
+
+ALTER TABLE messages
+    ALTER COLUMN edited_at TYPE TIMESTAMP USING edited_at AT TIME ZONE 'UTC',
+    ALTER COLUMN created_at TYPE TIMESTAMP USING created_at AT TIME ZONE 'UTC',
+    ALTER COLUMN updated_at TYPE TIMESTAMP USING updated_at AT TIME ZONE 'UTC';
+
+ALTER TABLE channel_read_states
+    ALTER COLUMN last_read_at TYPE TIMESTAMP USING last_read_at AT TIME ZONE 'UTC';

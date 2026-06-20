@@ -1,0 +1,47 @@
+# Concord Voice — Development overlay
+# Used by scripts/concord-dev.sh as: docker compose -f docker-compose.yml -f docker-compose.dev.yml
+#
+# This overlay parallels docker-compose.production.yml / docker-compose.staging.yml.
+# Edits should preserve the symmetry with those overlays where reasonable.
+
+name: concordvoice-dev
+
+services:
+  postgres:
+    healthcheck:
+      # Faster start-feedback in dev; looser timeout for slow first-boot.
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  redis:
+    healthcheck:
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  nats:
+    # -DV: debug + verbose logging for local NATS troubleshooting.
+    command: "-js -c /etc/nats/nats-server.conf -m 8222 -DV"
+    healthcheck:
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  coturn:
+    healthcheck:
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  minio:
+    # Expose console on host port 9001 for dev browser access.
+    # NOTE: MinIO has no healthcheck — the base image is minimal (no curl/wget/mc).
+    # See docker-compose.yml:128 for rationale. concord-dev.sh accounts for this
+    # by counting only the 4 healthcheck-bearing services (postgres/redis/nats/coturn).
+    ports:
+      - "9001:9001"

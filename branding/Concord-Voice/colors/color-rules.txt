@@ -1,0 +1,15 @@
+Background:
+Hex: #0d0821
+CMYK: 61-76-0-87
+
+Main:
+Hex: #ffffff
+CMYK: 0-0-0-0
+
+Auxiliary 1:
+Hex: #fa709a
+CMYK: 0-55-38-2
+
+Auxiliary 2:
+Hex: #ffe13f
+CMYK: 0-12-75-0

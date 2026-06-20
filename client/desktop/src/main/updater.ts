@@ -1,0 +1,425 @@
+import { autoUpdater, type UpdateInfo, type ProgressInfo } from 'electron-updater';
+import { app, type BrowserWindow } from 'electron';
+import path from 'node:path';
+import fs from 'node:fs';
+import { getPersistedApiBase } from './tokenManager';
+import { createUpdateLogger, type UpdateLogger } from './updateLogger';
+import { prepareForUpdate } from './updateSafety';
+import { updateSplashStatus, showSplashProgress, updateSplashError } from './splashWindow';
+import { extractChain, verifyChain } from './verifyWindowsSignature';
+
+// Check every 4 hours; delay first check 10s so it doesn't block app startup
+const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
+const STARTUP_CHECK_DELAY_MS = 10_000;
+
+// Windows-only: electron-updater verifies the downloaded Setup.exe's
+// Authenticode signer subject against this list before running the
+// installer. Defeats MITM of the update feed on Windows. Ignored on
+// macOS and Linux. Array syntax supports multiple allowed publishers
+// (useful during cert-rotation transitions across LLC renames).
+// See issue #404 and spec [internal]specs/2026-04-15-404-*.md
+const ALLOWED_WINDOWS_PUBLISHERS: readonly string[] = Object.freeze(['Concord Voice LLC']);
+
+// Persisted preference for pre-release updates (same pattern as hw-accel.json)
+const prereleasePrefPath = path.join(app.getPath('userData'), 'update-prefs.json');
+
+interface UpdatePrefs {
+  allowPrerelease: boolean;
+}
+
+function logReadError(msg: string): void {
+  if (logger) logger.error(msg);
+  // eslint-disable-next-line no-restricted-syntax -- msg is a caller-stringified error message (param type `msg: string`), not a raw Error; no err.cause chain to propagate
+  else console.error('[updater]', msg);
+}
+
+function readUpdatePrefs(): UpdatePrefs {
+  try {
+    const data = JSON.parse(fs.readFileSync(prereleasePrefPath, 'utf-8'));
+    return { allowPrerelease: data.allowPrerelease !== false };
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === 'ENOENT') {
+      // Expected on first run; silently return default.
+      return { allowPrerelease: true };
+    }
+    if (err instanceof SyntaxError) {
+      const corruptPath = `${prereleasePrefPath}.corrupt.${Date.now()}`;
+      try {
+        fs.renameSync(prereleasePrefPath, corruptPath);
+        logReadError(
+          `Corrupt update-prefs.json (SyntaxError); moved to ${corruptPath}. Resetting to defaults.`
+        );
+      } catch (renameErr) {
+        logReadError(
+          `Corrupt update-prefs.json (SyntaxError); also failed to rename it: ${(renameErr as Error).message}`
+        );
+      }
+      return { allowPrerelease: true };
+    }
+    logReadError(`Failed to read update prefs (${e.code ?? 'unknown'}): ${e.message}`);
+    return { allowPrerelease: true };
+  }
+}
+
+function writeUpdatePrefs(prefs: UpdatePrefs): void {
+  try {
+    fs.writeFileSync(prereleasePrefPath, JSON.stringify(prefs), 'utf-8');
+  } catch (err) {
+    const message = `Failed to write update prefs: ${(err as Error).message}`;
+    if (logger) logger.error(message);
+    // eslint-disable-next-line no-restricted-syntax -- message is a locally-built string from (err as Error).message above, not a raw Error; no err.cause chain to propagate
+    else console.error('[updater]', message);
+  }
+}
+
+let checkInterval: ReturnType<typeof setInterval> | null = null;
+let getWindow: (() => BrowserWindow | null) | null = null;
+let handlersRegistered = false;
+let logger: UpdateLogger | null = null;
+let pendingUpdateVersion: string | null = null;
+
+/**
+ * Returns the module logger, throwing if it has not been initialized.
+ * Used inside code paths that only run after ensureUpdaterReady() has
+ * executed (event handlers, post-init hooks). Converts a structural
+ * invariant into an explicit runtime check so we don't need non-null
+ * assertions sprinkled at every call site.
+ */
+function requireLogger(): UpdateLogger {
+  if (!logger) {
+    throw new Error('updater: logger accessed before ensureUpdaterReady()');
+  }
+  return logger;
+}
+
+/** Send an IPC event to the renderer (if the window exists). */
+function sendToRenderer(channel: string, data: unknown): void {
+  const win = getWindow?.();
+  if (win && !win.isDestroyed()) {
+    win.webContents.send(channel, data);
+  }
+}
+
+/** Configure updater settings and register event handlers (runs exactly once). */
+function ensureUpdaterReady(): void {
+  if (handlersRegistered) return;
+  handlersRegistered = true;
+
+  // Initialize structured file logger (#383)
+  logger = createUpdateLogger();
+  autoUpdater.logger = logger;
+
+  // Privacy-first: require explicit user action to download.
+  // autoInstallOnAppQuit is false so updates always go through safeQuitAndInstall (#384).
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+
+  // Read persisted preference (defaults to true for 0.x pre-release cycle)
+  autoUpdater.allowPrerelease = readUpdatePrefs().allowPrerelease;
+
+  // Windows-only runtime cert-chain verification. Defeats MITM scenarios
+  // where an attacker obtains a CN-matching cert from a different CA —
+  // pinning the Microsoft Trusted Signing intermediate blocks that.
+  //
+  // Leaf-thumbprint pinning is intentionally NOT used: Microsoft Trusted
+  // Signing leaf certs are 72-hour short-lived, auto-renewed daily. See
+  // spec [internal]specs/2026-04-15-644-update-trust-hardening-design.md
+  if (process.platform === 'win32') {
+    // electron-updater exposes `verifyUpdateCodeSignature` as a runtime hook
+    // on the AppUpdater instance — it's a documented monkey-patch point in
+    // electron-builder's codebase but is not in the published TypeScript
+    // types. A narrow intersection cast `as typeof autoUpdater & { ... }` is
+    // redundant per typescript:S4323 (the intersection doesn't actually
+    // change the assignability, since `autoUpdater` already accepts property
+    // assignment). `as any` is the pragmatic workaround with a specific
+    // invariant rationale rather than a pretend-narrower type.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- electron-updater.AppUpdater type omits the runtime-monkey-patchable verifyUpdateCodeSignature hook; see extractChain comment block above for the pinning rationale this override enables
+    (autoUpdater as any).verifyUpdateCodeSignature = async (
+      publisherNames: string[],
+      filePath: string
+    ): Promise<string | null> => {
+      try {
+        const chain = await extractChain(filePath);
+        const result = verifyChain(chain, publisherNames);
+        if (result === null) {
+          logger?.info('Runtime chain verification passed');
+        } else {
+          logger?.error(`SECURITY: chain verification rejected update — ${result}`);
+        }
+        return result;
+      } catch (err) {
+        const msg = `extractChain threw: ${(err as Error).message}`;
+        logger?.error(`SECURITY: ${msg}`);
+        return msg;
+      }
+    };
+  }
+
+  // ─── Event handlers ─────────────────────────────────────────────────
+
+  autoUpdater.on('checking-for-update', () => {
+    requireLogger().info(
+      `Checking for updates (current: v${app.getVersion()}, ${process.platform}/${process.arch})`
+    );
+    updateSplashStatus('Checking the airwaves...');
+  });
+
+  autoUpdater.on('update-available', (info: UpdateInfo) => {
+    requireLogger().info(
+      `Update available: v${app.getVersion()} → v${info.version} (released ${info.releaseDate ?? 'unknown'})`
+    );
+    updateSplashStatus(`New flight plan detected: v${info.version}`);
+    sendToRenderer('update:available', {
+      version: info.version,
+      releaseNotes: info.releaseNotes,
+      releaseDate: info.releaseDate,
+    });
+  });
+
+  autoUpdater.on('update-not-available', (info: UpdateInfo) => {
+    requireLogger().info(`Up to date (v${info.version})`);
+    updateSplashStatus('All systems go');
+    sendToRenderer('update:not-available', { version: info.version });
+  });
+
+  autoUpdater.on('download-progress', (progress: ProgressInfo) => {
+    const msg = `${progress.percent.toFixed(1)}% (${formatBytes(progress.transferred)}/${formatBytes(progress.total)})`;
+    requireLogger().info(`Download: ${msg}`);
+    showSplashProgress(progress.percent);
+    updateSplashStatus(`Fueling up... ${progress.percent.toFixed(0)}%`);
+    sendToRenderer('update:download-progress', {
+      percent: progress.percent,
+      transferred: progress.transferred,
+      total: progress.total,
+      bytesPerSecond: progress.bytesPerSecond,
+    });
+  });
+
+  autoUpdater.on('update-downloaded', (info: UpdateInfo) => {
+    pendingUpdateVersion = info.version;
+    requireLogger().info(`Downloaded v${info.version} — ready to install`);
+    showSplashProgress(100);
+    updateSplashStatus('Ready for liftoff');
+    sendToRenderer('update:downloaded', { version: info.version });
+  });
+
+  autoUpdater.on('error', (error: Error) => {
+    const msg = error.message;
+    // Cert-pin failures surface as net-layer TLS errors (e.g. ERR_CERT_*,
+    // "certificate verify failed"). They are security events with their own
+    // subtype so the renderer can show the cert-pin-specific banner copy. #658
+    const isCertPinFailure = /certificate|cert.?pin|ERR_CERT/i.test(msg);
+    const isPublisherFailure = /publisher|signature|not signed/i.test(msg);
+    const isSecurityEvent = isCertPinFailure || isPublisherFailure;
+    let subtype: 'cert-pin-failure' | 'publisher-failure' | undefined;
+    if (isCertPinFailure) {
+      subtype = 'cert-pin-failure';
+    } else if (isPublisherFailure) {
+      subtype = 'publisher-failure';
+    }
+
+    if (isSecurityEvent) {
+      const label = isCertPinFailure ? 'cert-pin verification' : 'signer verification';
+      requireLogger().error(
+        `SECURITY: Update ${label} failed — ${msg}${error.stack ? '\n' + error.stack : ''}`
+      );
+      updateSplashError(
+        isCertPinFailure
+          ? 'Update blocked: cert verification failed'
+          : 'Update blocked: signature verification failed'
+      );
+    } else {
+      requireLogger().error(`Error: ${msg}${error.stack ? '\n' + error.stack : ''}`);
+      updateSplashError('Houston, we have a problem');
+    }
+    sendToRenderer('update:error', {
+      message: msg,
+      securityEvent: isSecurityEvent,
+      subtype,
+    });
+  });
+}
+
+/** Start the scheduled update check interval (idempotent). */
+function startScheduledChecks(): void {
+  if (checkInterval) return;
+
+  const scheduledCheck = () => {
+    checkForUpdates().catch((err: unknown) => {
+      logger?.error(`Scheduled update check failed: ${(err as Error).message}`);
+    });
+  };
+  setTimeout(scheduledCheck, STARTUP_CHECK_DELAY_MS);
+  checkInterval = setInterval(scheduledCheck, UPDATE_CHECK_INTERVAL_MS);
+}
+
+export function initAutoUpdater(mainWindowGetter: () => BrowserWindow | null): void {
+  getWindow = mainWindowGetter;
+
+  if (!app.isPackaged) {
+    // No logger yet in dev mode — use console directly
+    console.debug('[updater] Skipping auto-update in development');
+    return;
+  }
+
+  // Always register settings and event handlers so renderer events work
+  // even if the feed URL is set later via setUpdateFeedUrl().
+  ensureUpdaterReady();
+
+  // Privacy-first: update checks go through our server, never GitHub directly.
+  // The server serves release assets from disk via GET /api/v1/updates/*
+  const apiBase = getPersistedApiBase();
+  if (apiBase) {
+    if (apiBase.startsWith('https://')) {
+      autoUpdater.setFeedURL({
+        provider: 'generic',
+        url: `${apiBase}/api/v1/updates`,
+        publisherName: [...ALLOWED_WINDOWS_PUBLISHERS],
+      });
+      if (process.platform === 'win32') {
+        logger?.info(`Publisher verification active: ${ALLOWED_WINDOWS_PUBLISHERS.join(', ')}`);
+      } else if (process.platform === 'darwin') {
+        logger?.info('Publisher verification delegated to macOS Gatekeeper/notarization');
+      } else {
+        logger?.warn(
+          'Publisher verification NOT enforced on this platform — updates trust the feed'
+        );
+      }
+      startScheduledChecks();
+    } else {
+      logger?.warn(`Refusing to configure update feed with non-HTTPS apiBase: ${apiBase}`);
+    }
+  } else {
+    // No persisted API base (first launch, never logged in).
+    // Updates will be enabled after login via setUpdateFeedUrl().
+    requireLogger().info('No API base available, deferring update check until login');
+  }
+}
+
+// ─── Public API (consumed by IPC handlers in main.ts) ─────────────────
+
+export async function checkForUpdates(): Promise<void> {
+  try {
+    await autoUpdater.checkForUpdates();
+  } catch (error) {
+    // Log for diagnostics, then rethrow so the IPC invoke rejects
+    // and the renderer can transition out of the "checking" state.
+    logger?.error(`Check failed: ${(error as Error).message}`);
+    throw error;
+  }
+}
+
+/**
+ * Force an immediate update check, bypassing the scheduled-check cadence.
+ * Invoked by the renderer's attestation 403-retry path (and user-triggered
+ * "check now" actions). Always uses the pinned generic feed (#719) — never a
+ * server-supplied URL.
+ */
+export async function forceCheckForUpdates(
+  reason: 'attestation_required' | 'user_triggered'
+): Promise<void> {
+  logger?.info(`forceCheckForUpdates: ${reason}`);
+  await autoUpdater.checkForUpdates();
+}
+
+export function downloadUpdate(): Promise<string[]> {
+  return autoUpdater.downloadUpdate();
+}
+
+/**
+ * Safe quit-and-install: creates a backup + sentinel before handing off
+ * to electron-updater's quitAndInstall(). If backup creation fails the
+ * install is aborted and the user is notified (#384).
+ */
+export async function safeQuitAndInstall(): Promise<void> {
+  const currentVersion = app.getVersion();
+  const targetVersion = pendingUpdateVersion;
+
+  if (!targetVersion) {
+    logger?.error('safeQuitAndInstall called but no pending update version');
+    sendToRenderer('update:error', { message: 'No update downloaded.' });
+    return;
+  }
+
+  logger?.info(`Preparing safe update: v${currentVersion} → v${targetVersion}`);
+
+  const prepared = await prepareForUpdate(currentVersion, targetVersion, requireLogger());
+  if (!prepared) {
+    logger?.error('Failed to prepare safety backup, aborting update install');
+    sendToRenderer('update:error', {
+      message: 'Failed to create safety backup. Update aborted — you can retry.',
+    });
+    return;
+  }
+
+  // On macOS/Windows no file backup is taken (Squirrel.Mac / NSIS handle the
+  // atomic swap); prepareForUpdate() only writes the rollback sentinel. The old
+  // wording falsely implied a backup. The sentinel log already reports
+  // "(backup: none)" accurately. Linux AppImage is the only path that backs up.
+  logger?.info('Safety sentinel written, proceeding with quitAndInstall()');
+  autoUpdater.quitAndInstall();
+}
+
+export function getAllowPrerelease(): boolean {
+  return autoUpdater.allowPrerelease;
+}
+
+export function setAllowPrerelease(enabled: boolean): void {
+  autoUpdater.allowPrerelease = enabled;
+  writeUpdatePrefs({ allowPrerelease: enabled });
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Set the update feed URL after login (when apiBase becomes available). */
+export function setUpdateFeedUrl(apiBase: string): void {
+  if (!app.isPackaged) {
+    console.debug('[updater] setUpdateFeedUrl: no-op in development mode');
+    return;
+  }
+  if (!apiBase.startsWith('https://')) {
+    // Refuse non-HTTPS in packaged production builds only (dev bypassed above).
+    logger?.warn(`Refusing to configure update feed with non-HTTPS apiBase: ${apiBase}`);
+    return;
+  }
+  ensureUpdaterReady();
+  autoUpdater.setFeedURL({
+    provider: 'generic',
+    url: `${apiBase}/api/v1/updates`,
+    publisherName: [...ALLOWED_WINDOWS_PUBLISHERS],
+  });
+  if (process.platform === 'win32') {
+    logger?.info(`Publisher verification active: ${ALLOWED_WINDOWS_PUBLISHERS.join(', ')}`);
+  } else if (process.platform === 'darwin') {
+    logger?.info('Publisher verification delegated to macOS Gatekeeper/notarization');
+  } else {
+    logger?.warn('Publisher verification NOT enforced on this platform — updates trust the feed');
+  }
+  requireLogger().info(`Feed URL set to ${apiBase}/api/v1/updates`);
+  startScheduledChecks();
+}
+
+/** Stop scheduled update checks (called on app quit). */
+export function stopAutoUpdater(): void {
+  if (checkInterval) {
+    clearInterval(checkInterval);
+    checkInterval = null;
+  }
+}
+
+/** Get the update logger instance (available after initAutoUpdater or ensureUpdaterReady). */
+export function getUpdateLogger(): UpdateLogger | null {
+  return logger;
+}
+
+/** Get the path to today's update log file. */
+export function getUpdateLogPath(): string | null {
+  return logger?.getLogPath() ?? null;
+}
