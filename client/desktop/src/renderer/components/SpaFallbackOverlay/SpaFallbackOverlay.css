@@ -1,0 +1,61 @@
+/*
+ * #830 Option C — non-blocking fallback diagnostic banner. Wired to the
+ * actual theme tokens defined per-scheme in styles/index.css so it
+ * adapts across all 13 color schemes:
+ *   --bg-secondary        — surface color (light/dark per theme)
+ *   --text-warning-strong — high-contrast amber warning text per
+ *                           styles/index.css definitions; also used as
+ *                           the bottom border to signal "warning"
+ *                           without introducing a fictional banner-bg
+ *                           token
+ *   --accent-primary      — focus-ring color (matches Modal.css convention)
+ *
+ * Stacking choice — z-index 950: deliberately sits between SettingsOverlayHost
+ * (900) and Modal (1000). Above all standard renderer-content layers
+ * (panels, autocomplete, search at z-index 100) so the diagnostic always
+ * wins over routine UI; below modals, ConnectionLostOverlay (9999),
+ * ForceUpdateOverlay (10000), and ContextMenu (100000+) so true
+ * blocking surfaces still cover it. Position fixed at top:0.
+ */
+
+.spa-fallback-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 950;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: var(--bg-secondary);
+  color: var(--text-warning-strong);
+  font-size: 14px;
+  border-bottom: 1px solid var(--text-warning-strong);
+}
+
+.spa-fallback-overlay__message {
+  flex: 1;
+  text-align: center;
+}
+
+.spa-fallback-overlay__dismiss {
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 8px;
+  margin-left: 16px;
+}
+
+.spa-fallback-overlay__dismiss:hover {
+  background: rgba(0, 0, 0, 0.1);
+  border-radius: 4px;
+}
+
+.spa-fallback-overlay__dismiss:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}

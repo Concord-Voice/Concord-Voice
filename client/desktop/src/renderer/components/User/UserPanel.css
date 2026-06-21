@@ -1,0 +1,255 @@
+.user-panel {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  padding: 0 calc(8px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  width: 100%;
+}
+
+/* Separator line above the panel */
+.user-panel-separator {
+  width: 100%;
+  height: 1px;
+  background: var(--border-color);
+  margin-bottom: calc(8px * var(--sp, 1));
+}
+
+/* Avatar button */
+.user-avatar-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  border: 2px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  position: relative;
+  padding: 0;
+}
+
+.user-avatar-btn:hover,
+.user-avatar-btn.active {
+  border-color: var(--accent-primary);
+  border-radius: 35%;
+}
+
+.user-avatar-btn:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+.user-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+.user-avatar-initial {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  color: var(--text-primary);
+}
+
+/* Status dot — dynamic by status class */
+.user-status-dot {
+  position: absolute;
+  bottom: -2px;
+  right: -2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--bg-primary);
+  background: var(--text-muted);
+}
+
+.user-status-dot.online {
+  background: var(--status-connected);
+}
+
+.user-status-dot.dnd {
+  background: var(--status-disconnected);
+}
+
+.user-status-dot.invisible,
+.user-status-dot.offline {
+  background: var(--text-muted);
+}
+
+/* Loading skeleton */
+.user-avatar-skeleton {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  animation: skeletonPulse 1.5s ease-in-out infinite;
+}
+
+/* Avatar wrapper — horizontal row in full mode */
+.user-avatar-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--sp, 1));
+  padding: calc(4px * var(--sp, 1));
+  border-radius: 6px;
+  transition: background-color 0.15s ease;
+}
+
+.user-panel:not(.user-panel-compact) .user-avatar-wrapper:hover {
+  background: var(--bg-hover);
+}
+
+/* ─── Username + Status Info ──────────────────────────────────────────────── */
+
+.user-panel-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.user-panel-username {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+
+/* Status line is a button so it opens the custom-status popover (#1233 B5). */
+.user-panel-status-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  min-width: 0;
+  border-radius: 4px;
+}
+
+.user-panel-status-btn:hover {
+  background: var(--bg-hover);
+}
+
+.user-panel-custom-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.user-panel-custom-status-emoji {
+  flex-shrink: 0;
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.3;
+}
+
+.user-panel-custom-status-text {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-secondary, var(--text-muted));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+
+.user-panel-status {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 500;
+  line-height: 1.3;
+  color: var(--text-muted);
+}
+
+.user-panel-status.online {
+  color: var(--status-connected);
+}
+
+.user-panel-status.dnd {
+  color: var(--status-disconnected);
+}
+
+.user-panel-status.invisible,
+.user-panel-status.offline {
+  color: var(--text-muted);
+}
+
+/* ─── Settings Button ─────────────────────────────────────────────────────── */
+
+.user-panel-settings-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+
+.user-panel-settings-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.user-panel-settings-btn:active {
+  transform: scale(0.92);
+}
+
+/* ─── Compact Mode (inline in message input area) ───────────────────────── */
+
+.user-panel-compact {
+  margin-top: 0;
+  padding: 0;
+  width: auto;
+  flex-direction: row;
+}
+
+.user-panel-compact .user-avatar-btn {
+  width: 36px;
+  height: 36px;
+}
+
+.user-panel-compact .user-avatar-btn.compact {
+  width: 36px;
+  height: 36px;
+}
+
+.user-panel-compact .user-avatar-initial {
+  font-size: calc(14px * var(--font-scale, 1));
+}
+
+.user-panel-compact .user-status-dot {
+  width: 8px;
+  height: 8px;
+}
+
+.user-panel-compact .user-avatar-skeleton {
+  width: 36px;
+  height: 36px;
+}
+
+.user-avatar-skeleton.compact {
+  width: 36px;
+  height: 36px;
+}

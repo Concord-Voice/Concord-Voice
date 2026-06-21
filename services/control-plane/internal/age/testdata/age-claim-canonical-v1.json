@@ -1,0 +1,19 @@
+{
+  "_comment": "Cross-impl byte-parity fixture for the age-claim canonical signing form v1 (#1623, child-B contract). 'canonical_utf8' is the exact byte string both the Go server (age.Claim.CanonicalBytes) and the child-B WebCrypto signer MUST produce from 'claim'. 'signature_b64' + 'public_key_spki_b64' are backfilled in Task 4 with a committed test keypair so child B can verify byte+signature parity. The nonce here is a low-entropy placeholder; the Task-4 backfill uses a real high-entropy nonce (allowlisted in .secrets.baseline).",
+  "canonical_version": 1,
+  "claim": {
+    "canonical_version": 1,
+    "user_id": "11111111-1111-4111-8111-111111111111",
+    "valid_age": true,
+    "nsfw_auth": false,
+    "jurisdiction_obligation": 1,
+    "nonce": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "timestamp": 1750000000,
+    "key_version": 1,
+    "client_version": "0.2.0"
+  },
+  "canonical_utf8": "age-claim/v1\ncanonical_version=1\nuser_id=11111111-1111-4111-8111-111111111111\nvalid_age=true\nnsfw_auth=false\njurisdiction_obligation=1\nnonce=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\ntimestamp=1750000000\nkey_version=1\nclient_version=0.2.0",
+  "salt_length": "PSSSaltLengthEqualsHash (= 32, SHA-256 length) — child B MUST use salt length 32; PSSSaltLengthAuto fails verify",
+  "signature_b64": "AlCegBC1bpPNqWnovFKW4HSVafKNez3nXTqbHHK3gahoiOz3uir4vqGp2f6x4hersTdM90SYt/Xa+t8vyz7ydhLaZr69cbOIDWwVFsJ97Zk898br2d1cPFljIIwgLQRUhIoyKvnm3xItFaIcz0az9DcGHYlZKQLfoP/uL8nIcUQCBWDlMNrsZB8Mg8jcJSDCmyDsPT38sOiVXhoMb8IOFBnQUFtKSnx84b+fI/kEVxwpfm7RBNegh6w/yLv6shcvFtiuFLAYoDcDnmo6J2D6wRIf2X1C/v4WR/Dfxe9IhUyO22F9uJlSkNW5zP4GBrs8VU/wSCBTROsZTfN8cP75yrQA74KjNf1Y4ZXDfHGqo6kWFDpj6T4j98ADewTUkQ/lpNiQ2o3InttuvmjDUX0n31OLMLKnxFFtsjwhjSirt8zghvfEZLrLgjj0rSXA2qWRnj7mYqfcEzh/+AiH7EVqkMRYJtoesYJ8swmsNqwdrPs4/X0ByD4e8a9HWQzLAjfY+x2BGss/FIx5Tj9Gn/Y/CJ9QkvzY3luYtJGEWxwq+GB/PnKLLiPWK7esPo6YWumym8GHnybbx8tCg9GzD0ZVNrg/L9yOiSed4MKi+/w/xvuOS7oVv+qmliwFjSjQOsybUJdvPJFh3HvYIB65lCtc+uhUegsx5EQ777LfOlEisuo=",
+  "public_key_spki_b64": "MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA2qM/seYPo49k6tRZvNCVl0A7jKbVTGWwsPYSfX6MWd7/VU4ocUh6v/au02rvDIXoCyHHHAP/YCN+SLgZBJnSd77KqzWBoXczEd3uZhr/rHIfPAewHKYICj2tKXKAr6KduK42I0guEODiHXwWT4vHfzUEk7dJRALhNnKc6utjBjD9fyeasC/m12hw9b007NoyA9xUIeVT0/n+Yy+BmJSmhlgEXywQ0NCXQtJnW3Vj6iZiDhORt7udauPYlzdf1N7YCM0rMs/BtdgNE8m+/mj4OazKasRn8hOCPDOuHfprbDhW6yaACugsjtX3chE7TeXzg+q41+zARuC/YgkPZy7FgNuUsOONSvkHefi0b646+CzUcXE8I4oJQ7MIpjGb7n+h52TH4VO9GWdLwHAOd1A19XyniI7+NeH/D5pJNW6HJqbq5CTAhYAWXvEymnow2nX4MBNtin5fNovmIsh3Z9mGhvl2e3D3kBfgtMO+n6PW4c0k1g6qBhGwMwrx+f0nLKDii/tXN2GBLM3URPxjob55O4YJk+6FyGUNekfw1IFcf4mp0klytHaIEHQFBxpnYf+/0rTO1a59m98nVxY8LBjBFuzFAhFNB1nCSL0P1T5G1AkLbIE2myKOIsksDVo7WNyqvbwaqk4B7zKXkOUUXIhJLgX8oLduD74OgMqGXhZDTXUCAwEAAQ=="
+}

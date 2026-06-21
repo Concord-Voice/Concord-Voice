@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      CSP chain for the desktop SPA:
+        1. services/control-plane/internal/middleware/security.go sets
+           `default-src 'none'` globally on API responses.
+        2. SPA response headers are now set by the Cloudflare Pages
+           `client/desktop/public/_headers` file (post-#976, T4a).
+           The Go handler (internal/spa/handler.go) was removed in #976;
+           `_headers` does NOT impose `default-src 'none'` on SPA responses
+           (mirrors the old handler behavior — a meta-CSP + `default-src`
+           interaction would block the bundle, per #914).
+        3. Cloudflare's JavaScript Detections (JSD) bot-intelligence
+           injection is disabled zone-wide via Super Bot Fight Mode →
+           JavaScript Detections (Pro plan, 2026-05-13, #917 Tier 2
+           resolution, PR #970).
+      The meta tag below is the authoritative CSP for the renderer.
+      connect-src already covers *.example.com, so the SPA origin
+      moving to spa.example.com requires no connect-src change.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self';
+                   script-src 'self' 'wasm-unsafe-eval';
+                   script-src-elem 'self' 'wasm-unsafe-eval';
+                   style-src 'self' 'unsafe-inline';
+                   connect-src 'self' ws://localhost:* http://localhost:* wss://localhost:* https://localhost:* ws://127.0.0.1:* http://127.0.0.1:* https://example.com wss://example.com https://*.example.com wss://*.example.com;
+                   img-src 'self' data: blob: https://cdn.jsdelivr.net http://localhost:* http://127.0.0.1:* https://example.com https://*.example.com;
+                   media-src 'self' blob: http://localhost:* http://127.0.0.1:* https://example.com https://*.example.com;
+                   base-uri 'self';
+                   form-action 'self';"
+    />
+    <title>Concord Voice</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/renderer/main.tsx"></script>
+  </body>
+</html>

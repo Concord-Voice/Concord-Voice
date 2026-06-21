@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS saved_gifs;
+ALTER TABLE dm_messages DROP COLUMN IF EXISTS gif_slug;
+ALTER TABLE messages DROP COLUMN IF EXISTS gif_slug;

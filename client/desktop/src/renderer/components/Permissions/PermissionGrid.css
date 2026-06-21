@@ -1,0 +1,147 @@
+.permission-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.permission-category {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.permission-category-header {
+  padding: 12px 16px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+  font-family: var(--font-display-stack);
+  font-size: calc(13px * var(--font-scale, 1));
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+}
+
+.permission-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  transition: background 0.2s ease;
+}
+
+.permission-row:not(:last-child) {
+  border-bottom: 1px solid var(--border-color);
+}
+
+.permission-row:hover {
+  background: var(--bg-tertiary);
+}
+
+.permission-row.disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.permission-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+  margin-right: 16px;
+}
+
+.permission-label {
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.permission-description {
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+/* Role mode: pill toggle switch */
+.permission-toggle {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  border-radius: 10px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+
+.permission-toggle.active {
+  background: var(--accent-fill);
+  border-color: var(--accent-primary);
+}
+
+.permission-toggle-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--text-secondary);
+  transition: all 0.2s ease;
+}
+
+.permission-toggle.active .permission-toggle-knob {
+  left: 18px;
+  background: #fff;
+}
+
+/* Override mode: tri-state buttons */
+.permission-tristate {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.permission-tristate-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  padding: 0;
+  font-size: calc(14px * var(--font-scale, 1));
+  line-height: 1;
+}
+
+.permission-tristate-btn:hover {
+  border-color: var(--text-secondary);
+  color: var(--text-secondary);
+}
+
+.permission-tristate-btn.allow-active {
+  background: var(--success-color);
+  border-color: var(--success-color);
+  color: #fff;
+}
+
+.permission-tristate-btn.neutral-active {
+  background: var(--bg-primary);
+  border-color: var(--text-muted);
+  color: var(--text-secondary);
+}
+
+.permission-tristate-btn.deny-active {
+  background: var(--error-color);
+  border-color: var(--error-color);
+  color: #fff;
+}

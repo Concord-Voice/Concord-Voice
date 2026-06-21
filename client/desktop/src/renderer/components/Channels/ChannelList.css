@@ -1,0 +1,705 @@
+.channel-list {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background-color: var(--bg-secondary);
+  overflow-y: auto;
+}
+
+/* Channel Groups */
+.channel-group {
+  margin: calc(6px * var(--sp, 1)) 0;
+}
+
+.channel-group-header {
+  display: flex;
+  align-items: center;
+  gap: calc(4px * var(--sp, 1));
+  padding: calc(4px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  margin-bottom: calc(4px * var(--sp, 1));
+}
+
+.channel-group-header--collapsible {
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.channel-group-header--collapsible:hover {
+  background-color: var(--bg-tertiary);
+}
+
+.channel-group-header__chevron {
+  display: flex;
+  align-items: center;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.channel-group-header__toggle {
+  all: unset;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: calc(2px * var(--sp, 1));
+  cursor: pointer;
+  color: inherit;
+  flex: 1;
+  min-width: 0;
+}
+
+.channel-group-header__toggle:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.channel-group-header span {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-secondary);
+  font-family: var(--font-display-stack); /* category header (#1034) */
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.channel-group-header__count {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+  font-size: calc(10px * var(--font-scale, 1));
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+/* Stacked voice user avatars (collapsed category) */
+.channel-group-header__voice-users {
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.channel-group-header__avatar {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--bg-tertiary);
+  border: 2px solid var(--bg-secondary);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-left: -6px;
+  position: relative;
+}
+
+.channel-group-header__avatar:first-child {
+  margin-left: 0;
+}
+
+.channel-group-header__avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.channel-group-header__avatar span {
+  font-size: 8px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.channel-group-header__avatar-overflow {
+  font-size: calc(9px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-left: 2px;
+  flex-shrink: 0;
+}
+
+/* When both voice users and unread count are shown, unread needs explicit margin */
+.channel-group-header__voice-users + .channel-group-header__count {
+  margin-left: calc(6px * var(--sp, 1));
+}
+
+/* Uncategorized group — no header, tighter spacing */
+.channel-group--uncategorized {
+  margin-top: calc(2px * var(--sp, 1));
+}
+
+/* Channel Items */
+.channel-item-wrapper {
+  padding: 0 calc(8px * var(--sp, 1));
+}
+
+.channel-item {
+  background: none;
+  border: none;
+  font: inherit;
+  color: inherit;
+  display: flex;
+  align-items: center;
+  text-align: left;
+  width: 100%;
+  box-sizing: border-box;
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  margin: calc(2px * var(--sp, 1)) 0;
+  border-radius: 4px;
+  border-left: 3px solid transparent;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+  position: relative;
+}
+
+.channel-item:hover {
+  background-color: var(--bg-tertiary);
+}
+
+.channel-item.active {
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-weight: 600;
+  border-left: 3px solid var(--accent-primary);
+  border-right: 3px solid var(--accent-primary);
+  padding-left: calc(9px * var(--sp, 1));
+  padding-right: calc(9px * var(--sp, 1));
+}
+
+/* Active channel arrow indicator — points right toward the chat area */
+.channel-item.active::after {
+  content: '';
+  position: absolute;
+  right: -8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 0;
+  height: 0;
+  border-top: 6px solid transparent;
+  border-bottom: 6px solid transparent;
+  border-left: 6px solid var(--accent-primary);
+}
+
+.channel-type-icon {
+  margin-right: calc(6px * var(--sp, 1));
+  color: var(--text-secondary);
+  min-width: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.channel-item.active .channel-type-icon {
+  color: var(--accent-primary);
+}
+
+.channel-item.active .channel-name {
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.channel-custom-emoji {
+  margin-right: calc(6px * var(--sp, 1));
+  font-size: calc(16px * var(--font-scale, 1));
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.channel-name {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  flex: 1;
+}
+
+/* E2EE lock icon */
+.channel-encrypted-icon {
+  display: flex;
+  align-items: center;
+  color: var(--text-muted, var(--text-tertiary));
+  margin-left: calc(4px * var(--sp, 1));
+  flex-shrink: 0;
+  opacity: 0.6;
+}
+
+/* Draft indicator */
+.channel-draft-indicator {
+  display: flex;
+  align-items: center;
+  color: var(--text-muted);
+  opacity: 0.7;
+  margin-left: auto;
+  margin-right: 4px;
+  flex-shrink: 0;
+}
+
+/* Unread badge */
+.channel-unread-badge {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: calc(6px * var(--sp, 1));
+  flex-shrink: 0;
+}
+
+.channel-item.has-unread .channel-name {
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+/* Loading Skeletons */
+.channel-list-skeletons {
+  padding: calc(12px * var(--sp, 1));
+}
+
+.channel-skeleton {
+  height: 32px;
+  background: linear-gradient(
+    90deg,
+    var(--bg-secondary) 25%,
+    var(--bg-tertiary) 50%,
+    var(--bg-secondary) 75%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-loading 1.5s ease-in-out infinite;
+  border-radius: 4px;
+  margin-bottom: calc(8px * var(--sp, 1));
+}
+
+@keyframes skeleton-loading {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+/* Error State */
+.channel-list-error {
+  padding: calc(20px * var(--sp, 1));
+  text-align: center;
+  color: var(--error-color);
+}
+
+.channel-list-error p {
+  margin-bottom: calc(12px * var(--sp, 1));
+  font-size: calc(14px * var(--font-scale, 1));
+}
+
+.retry-btn {
+  padding: calc(8px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: calc(14px * var(--font-scale, 1));
+  transition: all 0.2s ease;
+}
+
+.retry-btn:hover {
+  background-color: var(--bg-tertiary);
+  border-color: var(--accent-primary);
+}
+
+/* Empty State */
+.channel-list-empty {
+  padding: calc(40px * var(--sp, 1)) calc(20px * var(--sp, 1));
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+.channel-list-empty p {
+  margin-bottom: calc(8px * var(--sp, 1));
+  font-size: calc(14px * var(--font-scale, 1));
+}
+
+.channel-list-empty-hint {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-tertiary);
+}
+
+/* ── Hierarchy connector lines for grouped channels ── */
+
+/* Grouped channel wrapper — positioning context + continuous vertical trunk.
+   display:flex creates a BFC so child margins are contained within the wrapper,
+   preventing margin-collapse gaps that would break the vertical trunk line. */
+.channel-item-wrapper--grouped {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Vertical trunk line — runs between items to form the tree spine.
+   Position: 18px from wrapper left edge. */
+.channel-item-wrapper--grouped::before {
+  content: '';
+  position: absolute;
+  left: calc(18px * var(--sp, 1));
+  top: 0;
+  bottom: 0;
+  border-left: 1.5px solid var(--border-color);
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* First wrapper after header — extend trunk up to bridge the header gap */
+.channel-group-header + .channel-item-wrapper--grouped::before {
+  top: calc(-6px * var(--sp, 1));
+}
+
+/* Last grouped wrapper (no more --grouped siblings after it).
+   Trunk stops where the L-connector's border-radius curve begins so the
+   straight trunk doesn't poke past the rounded elbow. */
+.channel-item-wrapper--grouped:not(:has(~ .channel-item-wrapper--grouped))::before {
+  bottom: auto;
+  height: calc(50% - 6px);
+}
+
+/* Only grouped wrapper in the category — hide trunk; L-connector alone suffices. */
+.channel-group-header
+  + .channel-item-wrapper--grouped:not(:has(~ .channel-item-wrapper--grouped))::before {
+  display: none;
+}
+
+/* Grouped channel items — indented to make room for tree connectors.
+   30px total indent from wrapper outer edge: 8px wrapper padding + 22px margin.
+   width:auto overrides the base 100% so margin-left doesn't cause overflow. */
+.channel-item--grouped {
+  width: auto;
+  margin-left: calc(22px * var(--sp, 1));
+  padding-left: calc(8px * var(--sp, 1));
+}
+
+/* Rounded L-connector: curves from trunk to the channel item.
+   ::before is positioned relative to the item's PADDING edge (inside the 3px border).
+   To land at 18px from wrapper: 30px margin + 3px border - left = 18px → left = -15px.
+   Width = 9px — stops 3px before the highlight edge for a clean gap. */
+.channel-item--grouped::before {
+  content: '';
+  position: absolute;
+  left: calc(-12px * var(--sp, 1) - 3px);
+  top: 0;
+  height: 50%;
+  width: calc(9px * var(--sp, 1));
+  border-left: 1.5px solid var(--border-color);
+  border-bottom: 1.5px solid var(--border-color);
+  border-bottom-left-radius: 6px;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Active grouped channel — accent border, keep consistent padding */
+.channel-item--grouped.active {
+  border-left: 3px solid var(--accent-primary);
+  border-right: 3px solid var(--accent-primary);
+  padding-left: calc(8px * var(--sp, 1));
+  padding-right: calc(9px * var(--sp, 1));
+}
+
+/* ── Voice channel sub-items container ── */
+/* Subtle highlighted box that wraps the ENTIRE voice channel (name + text chat
+   + participants) as one unified group. Extends upward behind the channel item
+   via negative margin; the wrapper's z-index keeps the channel item on top.
+   When unfocused: subtle bg visible behind the transparent channel item.
+   When active: channel highlight covers the top, sub-container matches bg. */
+
+/* Ensure the channel item wrapper paints above the sub-container's extended bg */
+.channel-item-wrapper:has(+ .voice-channel-sub-container) {
+  position: relative;
+  z-index: 1;
+}
+
+.voice-channel-sub-container {
+  position: relative;
+  /* Left: starts right after the 3px accent border (margin 8 + border 3 = 11px).
+     Right: ends before the 4px border-radius curve (margin 8 + radius 4 = 12px). */
+  margin: -33px calc(8px * var(--sp, 1) + 5px) 0 calc(8px * var(--sp, 1) + 4px);
+  padding: 35px 0 calc(4px * var(--sp, 1));
+  background: color-mix(in srgb, var(--bg-tertiary) 40%, var(--bg-secondary) 60%);
+  border-radius: 4px;
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.35);
+  transition: background 0.15s ease;
+  cursor: pointer;
+}
+
+/* When active: match highlight bg so it blends as a sub-element */
+.voice-channel-sub-container--active {
+  background: var(--bg-tertiary);
+}
+
+.voice-channel-sub-container--grouped {
+  margin-left: calc(30px * var(--sp, 1) + 4px);
+}
+
+/* Trunk line continuation through voice sub-containers in grouped channels.
+   The sub-container sits as a sibling between channel-item-wrapper--grouped
+   elements — without this, the vertical trunk line has a gap when the
+   sub-container expands. Only render when more grouped items follow. */
+.voice-channel-sub-container--grouped:has(~ .channel-item-wrapper--grouped)::before {
+  content: '';
+  position: absolute;
+  left: calc(-12px * var(--sp, 1) - 4px);
+  top: 0;
+  bottom: 0;
+  border-left: 1.5px solid var(--border-color);
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Children indentation — relative to container.
+   Ungrouped: container left = 8sp+4. Connector target 36px: M + 4 = 36 → M = 32.
+   Grouped: container left = 30sp+4. Connector target 70px: M + 4 + 30 = 70 → M = 36. */
+.voice-channel-sub-container .channel-item--voice-text {
+  margin-left: calc(30px * var(--sp, 1));
+}
+
+.voice-channel-sub-container .channel-item--voice-text-grouped {
+  margin-left: calc(36px * var(--sp, 1));
+}
+
+/* Participant padding — relative to container.
+   Ungrouped: 24 - 12 = 12px.  Grouped: 54 - 34 = 20px. */
+.voice-channel-sub-container .voice-channel-participants {
+  padding-left: calc(12px * var(--sp, 1));
+}
+
+.voice-channel-sub-container .voice-channel-participants--grouped {
+  padding-left: calc(20px * var(--sp, 1));
+}
+
+/* ── Voice text chat — sub-item below parent voice channel ── */
+/* Self-contained styles (no .channel-item base class on this element). */
+
+/* Ungrouped voice text chat — connector centered under parent voice icon.
+   Perceptual icon center ≈ 28px (8 margin + 3 border + 12 padding + 5 visual).
+   Element at 36px, connector left -8px → vertical at 28px (centered). */
+.channel-item--voice-text {
+  background: none;
+  border: none;
+  font: inherit;
+  color: inherit;
+  display: flex;
+  align-items: center;
+  position: relative;
+  margin-left: calc(36px * var(--sp, 1));
+  padding: calc(2px * var(--sp, 1)) calc(6px * var(--sp, 1));
+  border-radius: 3px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.channel-item--voice-text:hover {
+  background-color: var(--bg-tertiary);
+}
+
+/* L-connector for voice text chat. Connector width = 8px.
+   Vertical trunk at left edge aligns with parent voice icon center. */
+.channel-item--voice-text::before {
+  content: '';
+  position: absolute;
+  left: calc(-8px * var(--sp, 1));
+  top: calc(-2px * var(--sp, 1));
+  height: calc(50% + 2px * var(--sp, 1));
+  width: calc(8px * var(--sp, 1));
+  border-left: 1.5px solid var(--border-color);
+  border-bottom: 1.5px solid var(--border-color);
+  border-bottom-left-radius: 5px;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Grouped variant — shift right to account for category indentation.
+   Grouped perceptual icon center ≈ 46px (30 margin + 3 border + 8 padding + 5 visual).
+   Element at 62px, connector 16px wide → vertical at 46px (centered). */
+.channel-item--voice-text-grouped {
+  margin-left: calc(70px * var(--sp, 1));
+}
+
+/* Grouped connector needs wider reach (16px) to align with deeper-indented icon */
+.channel-item--voice-text-grouped::before {
+  left: calc(-16px * var(--sp, 1));
+  width: calc(16px * var(--sp, 1));
+}
+
+.channel-item--voice-text .channel-name {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.channel-item--voice-text .channel-type-icon {
+  color: var(--text-muted);
+  margin-right: calc(3px * var(--sp, 1));
+  min-width: 12px;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.channel-item--voice-text.active .channel-name {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* Voice channel participants */
+.voice-channel-participants {
+  padding: 2px 0 4px calc(24px * var(--sp, 1));
+}
+
+/* Voice participants within grouped channels — extra indent */
+.voice-channel-participants--grouped {
+  padding-left: calc(54px * var(--sp, 1));
+}
+
+.voice-channel-participant {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  border-radius: 3px;
+}
+
+.voice-channel-participant.speaking {
+  color: var(--success);
+}
+
+.voice-channel-participant-name {
+  /* Button-reset: the interactive variant renders as a native <button> (a11y
+     S6819/S6845/S6848); these neutralize default button chrome so it matches the
+     plain-text span variant. Harmless on the <span> (non-interactive) variant. */
+  appearance: none;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voice-channel-participant__icon--server-enforced {
+  display: inline-flex;
+  align-items: center;
+  position: relative;
+  color: var(--warning);
+}
+
+.voice-channel-participant__lock {
+  position: absolute;
+  bottom: -1px;
+  right: -3px;
+}
+
+.voice-channel-participant__icon--muted {
+  color: var(--danger);
+}
+
+/* ── Drag-and-drop ── */
+
+.channel-item[draggable='true'],
+.channel-group-header[draggable='true'] {
+  cursor: pointer;
+}
+
+.channel-item[draggable='true']:active,
+.channel-group-header[draggable='true']:active {
+  cursor: grabbing;
+}
+
+.channel-item.dragging,
+.channel-group-header.dragging {
+  opacity: 0.4;
+}
+
+.channel-group-header.drag-over {
+  background-color: color-mix(in srgb, var(--accent-primary) 15%, transparent);
+  border-radius: 4px;
+}
+
+.channel-drag-ghost {
+  height: 2px;
+  margin: 0;
+  background: var(--accent-fill);
+  border-radius: 1px;
+  pointer-events: none;
+}
+
+/* Gap drop zone between categories — drop here to ungroup a channel.
+   Always rendered in DOM to avoid drag soft-locks; hidden until dragging. */
+.channel-drag-gap {
+  height: 0;
+  margin: 0 calc(8px * var(--sp, 1));
+  border-radius: 4px;
+  transition:
+    height 0.1s ease,
+    background-color 0.15s ease;
+  overflow: hidden;
+}
+
+.channel-drag-gap--visible {
+  height: 8px;
+}
+
+.channel-drag-gap--active {
+  background-color: color-mix(in srgb, var(--accent-primary) 25%, transparent);
+  box-shadow: inset 0 0 0 1.5px var(--accent-primary);
+}
+
+/* Valid drop target while a voice participant is being dragged (#487 Scope B). */
+.channel-item--participant-drop-target {
+  background-color: color-mix(in srgb, var(--accent-primary) 18%, transparent);
+  box-shadow: inset 0 0 0 1.5px var(--accent-primary);
+  border-radius: 4px;
+}
+
+/* Scrollbar Styling */
+.channel-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.channel-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.channel-list::-webkit-scrollbar-thumb {
+  background-color: var(--bg-tertiary);
+  border-radius: 4px;
+}
+
+.channel-list::-webkit-scrollbar-thumb:hover {
+  background-color: var(--border-color);
+}

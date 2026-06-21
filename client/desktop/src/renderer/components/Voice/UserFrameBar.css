@@ -1,0 +1,62 @@
+/* ─── User Frame Bar (Mode B — top horizontal strip) ─────────── */
+
+.user-frame-bar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  background-color: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  overflow: hidden;
+  /* Slide animation for hide/show */
+  transition:
+    transform 300ms ease,
+    opacity 300ms ease;
+}
+
+.user-frame-bar--hidden {
+  transform: translateY(-100%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.user-frame-bar__scroll {
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+  height: 100%;
+  padding: 4px 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* Thin custom scrollbar for horizontal overflow */
+.user-frame-bar__scroll::-webkit-scrollbar {
+  height: 4px;
+}
+
+.user-frame-bar__scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.user-frame-bar__scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+}
+
+.user-frame-bar__scroll::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.25);
+}
+
+/* Compact tiles in the bar */
+.user-frame-bar .participant-tile {
+  width: 80px;
+  flex-shrink: 0;
+}
+
+.user-frame-bar .participant-tile--video {
+  width: auto;
+  height: calc(100% - 8px);
+}

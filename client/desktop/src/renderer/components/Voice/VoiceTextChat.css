@@ -1,0 +1,164 @@
+/* ─── Voice Text Chat Panel ──────────────────────────────────── */
+
+.voice-text-chat {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background-color: var(--bg-primary);
+}
+
+.voice-text-chat--empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
+  color: var(--text-muted);
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+/* ─── Header ─────────────────────────────────────────────────── */
+
+.voice-text-chat__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: calc(6px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.voice-text-chat__title {
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ─── Error ──────────────────────────────────────────────────── */
+
+.voice-text-chat__error {
+  padding: 6px 12px;
+  background: rgba(240, 71, 71, 0.1);
+  color: var(--danger);
+  font-size: calc(12px * var(--font-scale, 1));
+  flex-shrink: 0;
+}
+
+/* ─── Messages area ──────────────────────────────────────────── */
+
+.voice-text-chat__messages {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ─── TTS Speaking Indicator ─────────────────────────────────── */
+
+.voice-text-chat__tts-indicator {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 12px;
+  background-color: rgba(67, 181, 129, 0.1);
+  color: var(--success);
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 500;
+  flex-shrink: 0;
+  animation: tts-fade-in 0.2s ease;
+}
+
+@keyframes tts-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ─── Input area ─────────────────────────────────────────────── */
+
+.voice-text-chat__input {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border-color);
+}
+
+/* ─── Resize Handle ──────────────────────────────────────────── */
+
+.voice-text-chat-resize {
+  height: 6px;
+  cursor: row-resize;
+  background-color: var(--bg-secondary);
+  border-top: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.15s ease;
+}
+
+.voice-text-chat-resize:active {
+  background-color: var(--accent-primary);
+}
+
+.voice-text-chat-resize__grip {
+  width: 32px;
+  height: 2px;
+  border-radius: 1px;
+  background-color: var(--text-muted);
+  opacity: 0.5;
+}
+
+.voice-text-chat-resize:active .voice-text-chat-resize__grip {
+  background-color: #fff;
+  opacity: 0.8;
+}
+
+/* ─── Vertical Resize Handle ────────────────────────────────────── */
+
+.voice-text-chat-resize--vertical {
+  width: 6px;
+  height: auto;
+  cursor: col-resize;
+  border-top: none;
+  border-bottom: none;
+  border-left: 1px solid var(--border-color);
+  border-right: 1px solid var(--border-color);
+  flex-shrink: 0;
+  flex-direction: column;
+}
+
+.voice-text-chat-resize--vertical .voice-text-chat-resize__grip {
+  width: 2px;
+  height: 32px;
+}
+
+/* ─── Layout Toggle Button ──────────────────────────────────────── */
+
+.voice-text-chat__layout-toggle {
+  margin-left: auto;
+  padding: 2px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.voice-text-chat__layout-toggle:hover {
+  color: var(--text-primary);
+  background-color: var(--bg-modifier-hover);
+}

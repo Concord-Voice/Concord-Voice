@@ -1,0 +1,405 @@
+/* ─── Server Bar (Horizontal Top Navigation) ────────────────────────────── */
+
+.server-bar {
+  display: flex;
+  align-items: center;
+  background-color: var(--bg-primary);
+  border-bottom: 1px solid var(--border-color);
+  padding: 0 calc(8px * var(--sp, 1));
+  overflow: hidden;
+  position: relative;
+  min-height: 48px;
+  height: 100%;
+}
+
+/* ─── Sticky Icons (Active Server + PM, Add Server) ──────────────────────── */
+
+.server-bar-sticky {
+  display: flex;
+  align-items: center;
+  gap: calc(6px * var(--sp, 1));
+  flex-shrink: 0;
+}
+
+/* Active server icon */
+.server-bar-active-icon {
+  border-radius: 25%;
+  background: var(--bg-secondary);
+  border: 2px solid var(--accent-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  overflow: hidden;
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.2s ease;
+  padding: 0;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.server-bar-active-icon:hover {
+  border-color: var(--accent-hover);
+  box-shadow: 0 0 0 2px rgba(250, 112, 154, 0.2);
+}
+
+/* When DM page is focused, de-emphasise the active server icon */
+.server-bar-active-icon.inactive {
+  border-color: var(--border-color);
+}
+
+.server-bar-active-icon.inactive:hover {
+  border-color: var(--accent-primary);
+}
+
+/* Empty placeholder when no server is active — dashed circle */
+.server-bar-empty-server {
+  border-radius: 25%;
+  background: var(--bg-secondary);
+  border: 2px dashed var(--border-color);
+  flex-shrink: 0;
+}
+
+.server-bar-active-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.server-bar-active-icon .server-bar-icon-initial {
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  color: var(--text-primary);
+}
+
+/* PM icon */
+.server-bar-pm-icon {
+  border-radius: 25%;
+  background: var(--bg-secondary);
+  border: 2px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    color 0.2s ease;
+  color: var(--text-muted);
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.server-bar-pm-icon:hover,
+.server-bar-pm-icon.active {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+/* Vertical divider between sticky and scrollable */
+.server-bar-divider {
+  width: 2px;
+  height: 28px;
+  background: var(--border-color);
+  border-radius: 1px;
+  margin: 0 calc(8px * var(--sp, 1));
+  flex-shrink: 0;
+  align-self: center;
+  transition: margin 0.2s ease-out;
+}
+
+/* ─── Scrollable Server List ────────────────────────────────────────────── */
+
+.server-bar-scroll-container {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  z-index: 1;
+}
+
+.server-bar-scroll {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--sp, 1));
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: calc(4px * var(--sp, 1)) 4px;
+  scroll-behavior: smooth;
+  flex: 1;
+}
+
+/* Hide scrollbar */
+.server-bar-scroll::-webkit-scrollbar {
+  height: 0;
+}
+
+/* Scroll arrow buttons */
+.server-bar-scroll-arrow {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 10;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: all 0.15s ease;
+  padding: 0;
+}
+
+.server-bar-scroll-arrow:hover {
+  color: var(--text-primary);
+  background: var(--bg-active);
+}
+
+.server-bar-scroll-arrow.left {
+  left: 0;
+}
+
+.server-bar-scroll-arrow.right {
+  right: 0;
+}
+
+/* ─── Server Icon (in scrollable list) ──────────────────────────────────── */
+
+.server-bar-icon-wrapper {
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.server-bar-icon {
+  border-radius: 25%;
+  background: var(--bg-secondary);
+  border: 2px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+  overflow: hidden;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.server-bar-icon:hover {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 1px rgba(250, 112, 154, 0.15);
+}
+
+.server-bar-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.server-bar-icon .server-bar-icon-initial {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  color: var(--text-primary);
+}
+
+/* ─── Muted Server Treatment ──────────────────────────────────────────────
+ *
+ * A muted server gets ~60% opacity on its icon plus a small bell-with-slash
+ * overlay in the bottom-right corner. Both cues are intentional: the
+ * opacity is the at-a-glance signal (the eye scans for "darker = quieter")
+ * and the overlay is the explicit confirmation. Unread badges are
+ * suppressed at the data level (no badge ever appears for a muted server),
+ * so the overlay never visually competes with one.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+.server-bar-icon[data-muted='true'] {
+  opacity: 0.6;
+}
+
+.server-bar-mute-overlay {
+  position: absolute;
+  bottom: -2px;
+  right: -2px;
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  pointer-events: none;
+  z-index: 6;
+}
+
+/* ─── Unread Badge ──────────────────────────────────────────────────────── */
+
+.server-bar-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--danger);
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 5;
+  pointer-events: none;
+}
+
+/* ─── Server Tooltip (fixed, portaled to body) ─────────────────────────── */
+
+.server-bar-tooltip-fixed {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  white-space: nowrap;
+  z-index: 9999;
+  pointer-events: none;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  min-width: 120px;
+}
+
+.server-bar-tooltip-name {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  font-family: var(--font-display-stack); /* server name (#1034) */
+  margin-bottom: 2px;
+}
+
+.server-bar-tooltip-stats {
+  display: flex;
+  align-items: center;
+  gap: calc(6px * var(--sp, 1));
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+.server-bar-tooltip-dot {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.server-bar-tooltip-voice {
+  color: var(--text-muted);
+}
+
+.server-bar-tooltip-voice--active {
+  color: var(--success);
+  font-weight: 600;
+}
+
+.server-bar-tooltip-unread {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--danger);
+  font-weight: 500;
+  margin-top: 2px;
+}
+
+/* ─── Add Server Button ─────────────────────────────────────────────────── */
+
+.server-bar-add {
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  border: 2px dashed var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  padding: 0;
+}
+
+.server-bar-add:hover {
+  border-color: var(--success);
+  color: var(--success);
+  background: rgba(67, 181, 129, 0.08);
+  border-radius: 25%;
+}
+
+/* ─── Drag & Drop ───────────────────────────────────────────────────────── */
+
+.server-bar-icon-wrapper[draggable='true'] {
+  cursor: pointer;
+}
+
+.server-bar-icon-wrapper[draggable='true']:active {
+  cursor: grabbing;
+}
+
+/* Shrink and fade the source icon while it's being dragged */
+.server-bar-icon-wrapper.dragging {
+  opacity: 0.35;
+  transform: scale(0.75);
+  transition:
+    opacity 0.15s ease,
+    transform 0.15s ease;
+}
+
+/* Ghost placeholder — shows where the dragged icon will land */
+.server-bar-icon-ghost {
+  border-radius: 25%;
+  border: 2px dashed var(--accent-primary);
+  background: rgba(250, 112, 154, 0.08);
+  flex-shrink: 0;
+  animation: ghost-expand 0.15s ease-out;
+}
+
+@keyframes ghost-expand {
+  from {
+    transform: scaleX(0);
+    opacity: 0;
+  }
+  to {
+    transform: scaleX(1);
+    opacity: 1;
+  }
+}
+
+/* ─── Add Server Tooltip (portaled to body) ─────────────────────────────── */
+
+.server-bar-add-tooltip {
+  position: fixed;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 500;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 9999;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.server-bar-add-tooltip.visible {
+  opacity: 1;
+}

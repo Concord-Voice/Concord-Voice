@@ -1,0 +1,213 @@
+.message-list-container {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.message-list {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: calc(16px * var(--sp, 1)) 0;
+}
+
+/* Inner wrapper whose height tracks the rendered messages. The
+   ResizeObserver in MessageList.tsx watches this element so it can re-pin
+   the scroll container to the bottom when message rows grow (e.g. a GIF
+   embed or image attachment finishes loading). The scroll container itself
+   is fixed by flex layout and never resizes. */
+.message-list-content {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Scrollbar styling */
+.message-list::-webkit-scrollbar {
+  width: 12px;
+}
+
+.message-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.message-list::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 6px;
+  border: 3px solid var(--bg-primary);
+}
+
+.message-list::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* Empty state */
+.message-list-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: calc(48px * var(--sp, 1)) calc(24px * var(--sp, 1));
+  color: var(--text-secondary);
+}
+
+.empty-icon {
+  font-size: calc(64px * var(--font-scale, 1));
+  margin-bottom: calc(16px * var(--sp, 1));
+  opacity: 0.5;
+}
+
+.message-list-empty h3 {
+  font-family: var(--font-display-stack);
+  font-size: calc(24px * var(--font-scale, 1));
+  color: var(--text-primary);
+  margin-bottom: calc(8px * var(--sp, 1));
+}
+
+.message-list-empty p {
+  font-size: calc(15px * var(--font-scale, 1));
+  margin-bottom: calc(4px * var(--sp, 1));
+}
+
+.message-list-empty-hint {
+  color: var(--text-muted);
+  font-size: calc(14px * var(--font-scale, 1));
+}
+
+/* Loading states */
+.loading-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: calc(12px * var(--sp, 1));
+  padding: calc(16px * var(--sp, 1));
+  color: var(--text-muted);
+  font-size: calc(14px * var(--font-scale, 1));
+}
+
+.message-list-loading {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.message-list-loading.small .message-list-spinner {
+  width: 16px;
+  height: 16px;
+  border-width: 2px;
+}
+
+.message-list-spinner {
+  width: 24px;
+  height: 24px;
+  border: 3px solid var(--border-color);
+  border-top-color: var(--accent-primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+/* Date dividers */
+.date-divider {
+  display: flex;
+  align-items: center;
+  gap: calc(16px * var(--sp, 1));
+  margin: calc(24px * var(--sp, 1)) calc(16px * var(--sp, 1)) calc(16px * var(--sp, 1));
+}
+
+.date-divider-line {
+  flex: 1;
+  height: 1px;
+  background-color: var(--border-color);
+}
+
+.date-divider-text {
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+
+/* Scroll to bottom button */
+.scroll-to-bottom {
+  position: absolute;
+  bottom: calc(16px * var(--sp, 1));
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--gradient-brand);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: 24px;
+  padding: calc(10px * var(--sp, 1)) calc(20px * var(--sp, 1));
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--sp, 1));
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  transition: all 0.2s ease;
+  z-index: 5;
+}
+
+.scroll-to-bottom:hover {
+  transform: translateX(-50%) translateY(-2px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+}
+
+.scroll-to-bottom:active {
+  transform: translateX(-50%) translateY(0);
+}
+
+/* New message badge on the scroll-to-bottom button */
+.new-message-badge {
+  position: absolute;
+  top: -8px;
+  right: -4px;
+  background: var(--accent-fill);
+  color: var(--on-accent);
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 700;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+.scroll-to-bottom svg {
+  animation: bounce 1s infinite;
+}
+
+@keyframes bounce {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(3px);
+  }
+}
+
+/* Reply scroll-to-message highlight */
+.message-highlight {
+  animation: reply-highlight 2s ease-out;
+  border-radius: 4px;
+}
+
+@keyframes reply-highlight {
+  0% {
+    background-color: color-mix(in srgb, var(--accent-color, #5865f2) 20%, transparent);
+  }
+  100% {
+    background-color: transparent;
+  }
+}

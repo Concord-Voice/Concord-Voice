@@ -1,0 +1,147 @@
+/* ─── Settings Live Preview Panel (#489) ───────────────────────────────────
+ *
+ * Compact preview tiles that demonstrate how the user's draft settings render
+ * across the chat and voice surfaces. The preview elements reuse the real
+ * `.message-*` and `.participant-tile-*` classes so they pick up every
+ * theme / accent / font-size / UI-scale / compact / animation / contrast
+ * change through the existing CSS cascade — no per-preview value plumbing.
+ */
+
+.settings-preview-grid {
+  display: grid;
+  /* Each tile asks for ≥360px of content; collapses to a single column once
+     the container can't grant that. This means the grid stays 2-col on a
+     wide settings panel + low UI scale, then flips to 1-col when the user
+     zooms in (UI scale compounds into --sp-base which compounds into
+     padding/gap consumption) or shrinks the window. Replaces the previous
+     fixed `1fr 1fr` that left both columns dangerously narrow at higher
+     scales. */
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: calc(16px * var(--sp, 1));
+  margin-top: calc(8px * var(--sp, 1));
+}
+
+.settings-preview-tile {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: calc(12px * var(--sp, 1));
+  display: flex;
+  flex-direction: column;
+  gap: calc(8px * var(--sp, 1));
+  min-height: 220px;
+}
+
+.settings-preview-label {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* ─── Chat preview ───────────────────────────────────────────────────────── */
+
+.settings-preview-chat {
+  display: flex;
+  flex-direction: column;
+  gap: calc(6px * var(--sp, 1));
+}
+
+.settings-preview-reply {
+  display: flex;
+  gap: 6px;
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  margin-bottom: 4px;
+  /* Discord-style left border to indicate a quoted parent. */
+  border-left: 2px solid var(--accent-primary);
+  padding-left: 8px;
+  opacity: 0.85;
+}
+
+.settings-preview-reply-author {
+  color: var(--accent-primary);
+  font-weight: 600;
+}
+
+.settings-preview-reply-text {
+  color: var(--text-secondary);
+}
+
+.settings-preview-reactions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.settings-preview-reaction {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-secondary);
+}
+
+.settings-preview-reaction-count {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+/* Author-color accents — drawn from the accent palette so they re-tint with
+   each color scheme automatically. Only -a and -b are used (alice + bob
+   usernames in the chat preview). The -c / -d variants were previously
+   applied to the carol/dave voice-tile avatar fallback letters but were
+   removed when the fallback color was unified to var(--bg-primary) for HCM
+   contrast — keeping the avatar letters readable across schemes. */
+.settings-preview-author-a {
+  color: var(--accent-primary);
+}
+.settings-preview-author-b {
+  color: var(--accent-secondary);
+}
+
+/* ─── Voice preview ──────────────────────────────────────────────────────── */
+
+.settings-preview-voice {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: calc(6px * var(--sp, 1));
+  flex: 1;
+}
+
+.settings-preview-voice .participant-tile {
+  /* Compact override — the real ParticipantTile is sized for the voice grid,
+     but here we want a thumbnail. The fixed min-height keeps the 4 tiles
+     visually balanced across themes. */
+  min-height: 80px;
+  border-radius: 6px;
+  position: relative;
+}
+
+.settings-preview-tile-speaking {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+/* Empty video stub — gradient matches the brand so the tile reads as
+   "video on" without a real <video> stream. */
+.settings-preview-video-stub {
+  background: var(--gradient-brand);
+  opacity: 0.6;
+}
+
+.settings-preview-state-icon {
+  position: absolute;
+  bottom: 4px;
+  right: 4px;
+  font-size: 14px;
+  background: var(--bg-secondary);
+  border-radius: 4px;
+  padding: 2px 4px;
+  border: 1px solid var(--border-color);
+}

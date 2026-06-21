@@ -1,0 +1,74 @@
+/* ─── Tune In Overlay ────────────────────────────────────────── */
+
+.tune-in-overlay {
+  display: flex;
+  flex-wrap: wrap;
+  gap: calc(8px * var(--sp, 1));
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  justify-content: center;
+}
+
+/* ─── Tune In Button ─────────────────────────────────────────── */
+
+.tune-in-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border: 1px solid rgba(88, 101, 242, 0.4);
+  border-radius: 6px;
+  background: rgba(88, 101, 242, 0.12);
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  cursor: pointer;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+}
+
+.tune-in-btn:hover {
+  background: rgba(88, 101, 242, 0.25);
+  border-color: rgba(88, 101, 242, 0.7);
+  color: #fff;
+}
+
+.tune-in-btn--disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.tune-in-btn--disabled:hover {
+  background: rgba(88, 101, 242, 0.12);
+  border-color: rgba(88, 101, 242, 0.4);
+  color: var(--text-secondary);
+}
+
+.tune-in-btn__icon {
+  flex-shrink: 0;
+  color: var(--accent-primary);
+}
+
+.tune-in-btn__label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+.tune-in-btn__hint {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--accent-primary);
+  font-weight: 600;
+  opacity: 0;
+  transition: opacity 150ms ease;
+  margin-left: 4px;
+}
+
+.tune-in-btn:hover .tune-in-btn__hint {
+  opacity: 1;
+}
+
+.tune-in-btn--disabled .tune-in-btn__hint {
+  display: none;
+}

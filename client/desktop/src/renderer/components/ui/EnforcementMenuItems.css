@@ -1,0 +1,25 @@
+.ctx-enforcement-icon--active-hard {
+  color: var(--warning);
+}
+
+.ctx-enforcement-icon--active-user {
+  color: var(--danger);
+}
+
+.ctx-enforcement-icon--inactive {
+  color: var(--text-muted);
+  opacity: 0.5;
+}
+
+.ctx-enforcement-icon-group {
+  display: inline-flex;
+  align-items: center;
+  position: relative;
+}
+
+.ctx-enforcement-lock {
+  position: absolute;
+  bottom: -1px;
+  right: -3px;
+  color: inherit;
+}

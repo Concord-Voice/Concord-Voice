@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <!-- Concord Voice tray glyph (#1099): crescent + primary sparkle, derived
+       from public/branding/Concord-Voice/logos/symbol-transparent-vector.svg.
+       Secondary sparkle dropped for 16px legibility (spec §5). The gradient
+       matches the brand mark exactly (#fa709a bottom → #ffe13f top, vertical).
+       Regenerate the PNGs with: node scripts/generate-tray-icons.mjs -->
+  <defs>
+    <linearGradient id="brand" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#fa709a"/>
+      <stop offset="100%" stop-color="#ffe13f"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#brand)" d="M.83 50c0 26.786 21.715 48.5 48.5 48.5 19.997 0 37.164-12.102 44.589-29.38a40.839 40.839 0 0 1-28.152 11.192c-22.646 0-41-18.361-41-41.007 0-17.008 10.357-31.595 25.102-37.805C22.869 1.23.83 22.98.83 50zM54.388 12.864h.118c0 11.185 9.15 20.334 20.334 20.334v.118c-11.185 0-20.334 9.15-20.334 20.334h-.118c0-11.185-9.149-20.334-20.334-20.334v-.118c11.178 0 20.334-9.149 20.334-20.334z"/>
+</svg>

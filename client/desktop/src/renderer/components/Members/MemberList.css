@@ -1,0 +1,331 @@
+/* ─── Member List Panel ─────────────────────────────────────────────────── */
+
+.member-list {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  background-color: var(--bg-secondary);
+  border-left: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: calc(12px * var(--sp, 1));
+}
+
+.member-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.member-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.member-list::-webkit-scrollbar-thumb {
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+}
+
+.member-list::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* ─── Header ────────────────────────────────────────────────────────────── */
+
+.member-list-header {
+  padding: 0 calc(8px * var(--sp, 1));
+  margin-bottom: calc(12px * var(--sp, 1));
+}
+
+.member-list-header h3 {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* ─── Search ───────────────────────────────────────────────────────────── */
+
+.member-list-search {
+  padding: 0 calc(8px * var(--sp, 1));
+  margin-bottom: calc(8px * var(--sp, 1));
+}
+
+.member-list-search-input {
+  width: 100%;
+  padding: calc(5px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  font-size: calc(12px * var(--font-scale, 1));
+  font-family: inherit;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  outline: none;
+  transition: border-color 0.15s ease;
+  box-sizing: border-box;
+}
+
+.member-list-search-input::placeholder {
+  color: var(--text-muted);
+}
+
+.member-list-search-input:focus {
+  border-color: var(--accent-primary);
+}
+
+/* ─── Role Group Headers ────────────────────────────────────────────────── */
+
+.member-group {
+  margin-bottom: calc(12px * var(--sp, 1));
+}
+
+.member-group-header {
+  display: flex;
+  align-items: center;
+  gap: calc(4px * var(--sp, 1));
+  padding: calc(4px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  margin-bottom: calc(4px * var(--sp, 1));
+  background: none;
+  border: none;
+  width: 100%;
+  font-family: inherit;
+  text-align: left;
+}
+
+.member-group-header--clickable {
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.member-group-header--clickable:hover {
+  background: var(--bg-tertiary);
+}
+
+.member-group-header span {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-muted);
+  font-family: var(--font-display-stack); /* category header (#1034) */
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.member-group-chevron {
+  color: var(--text-muted);
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+
+.member-group-chevron.collapsed {
+  transform: rotate(-90deg);
+}
+
+.member-group-emoji {
+  margin-right: calc(3px * var(--sp, 1));
+}
+
+.member-group-color-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-left: calc(4px * var(--sp, 1));
+  vertical-align: middle;
+}
+
+/* ─── Member Items ──────────────────────────────────────────────────────── */
+
+.member-item {
+  all: unset;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: calc(6px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  margin: 1px 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: inherit;
+  color: inherit;
+  text-align: left;
+  transition: background-color 0.15s ease;
+}
+
+.member-item:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+.member-item:hover {
+  background-color: var(--bg-tertiary);
+}
+
+.member-item.offline {
+  opacity: 0.45;
+}
+
+.member-item.offline:hover {
+  opacity: 0.75;
+}
+
+/* ─── Avatar ────────────────────────────────────────────────────────────── */
+
+.member-avatar {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--bg-tertiary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-right: calc(8px * var(--sp, 1));
+}
+
+.member-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.member-avatar-initial {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+/* ─── Status Dot ────────────────────────────────────────────────────────── */
+
+.member-status-dot {
+  position: absolute;
+  bottom: -1px;
+  right: -1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--bg-secondary);
+}
+
+.member-status-dot.online {
+  background-color: var(--status-connected);
+}
+
+.member-status-dot.dnd {
+  background-color: var(--status-disconnected);
+}
+
+.member-status-dot.offline,
+.member-status-dot.invisible {
+  background-color: var(--text-muted);
+}
+
+/* ─── Username + Custom Status (#1233) ──────────────────────────────────── */
+
+.member-item-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.member-username {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.member-custom-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.member-custom-status-emoji {
+  flex-shrink: 0;
+  font-size: calc(11px * var(--font-scale, 1));
+  line-height: 1.2;
+}
+
+.member-custom-status-text {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.2;
+}
+
+/* ─── Loading Skeletons ─────────────────────────────────────────────────── */
+
+.member-list-skeletons {
+  padding: calc(8px * var(--sp, 1));
+}
+
+.member-skeleton {
+  height: 28px;
+  background: linear-gradient(
+    90deg,
+    var(--bg-tertiary) 25%,
+    var(--bg-secondary) 50%,
+    var(--bg-tertiary) 75%
+  );
+  background-size: 200% 100%;
+  animation: member-skeleton-loading 1.5s ease-in-out infinite;
+  border-radius: 4px;
+  margin-bottom: calc(8px * var(--sp, 1));
+}
+
+@keyframes member-skeleton-loading {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+/* ─── Error & Empty States ──────────────────────────────────────────────── */
+
+.member-list-error,
+.member-list-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: calc(24px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  text-align: center;
+}
+
+.member-list-error p,
+.member-list-empty p {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  margin-bottom: calc(8px * var(--sp, 1));
+}
+
+.member-list-error .retry-btn {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--accent-primary);
+  background: none;
+  border: 1px solid var(--accent-primary);
+  border-radius: 4px;
+  padding: calc(4px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.member-list-error .retry-btn:hover {
+  background-color: var(--bg-tertiary);
+}

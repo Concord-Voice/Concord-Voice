@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <!-- Brand gradient: pink (#fa709a) to yellow (#ffe13f), bottom to top -->
+    <linearGradient id="brand-gradient" x1="0" y1="1" x2="0" y2="0" gradientUnits="objectBoundingBox">
+      <stop offset="0%" stop-color="#fa709a"/>
+      <stop offset="100%" stop-color="#ffe13f"/>
+    </linearGradient>
+    <!-- Subtle radial glow -->
+    <radialGradient id="bg-glow" cx="50%" cy="45%" r="50%">
+      <stop offset="0%" stop-color="#1a0f3a"/>
+      <stop offset="100%" stop-color="#0d0821"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="128" cy="128" r="128" fill="#0d0821"/>
+  <circle cx="128" cy="128" r="128" fill="url(#bg-glow)"/>
+
+  <!-- Moon+Stars Symbol with gradient fill applied directly to path -->
+  <!-- Symbol native bounds: ~0.83 to ~94 x, ~1.5 to ~98.5 y (~93x97) -->
+  <!-- Scale 1.65 → ~154x160. Center in 256: translate((256-154)/2=51, (256-160)/2=48) adjust for path origin -->
+  <g transform="translate(50, 45) scale(1.65)">
+    <path fill="url(#brand-gradient)" d="M.83 50c0 26.786 21.715 48.5 48.5 48.5 19.997 0 37.164-12.102 44.589-29.38a40.839 40.839 0 0 1-28.152 11.192c-22.646 0-41-18.361-41-41.007 0-17.008 10.357-31.595 25.102-37.805C22.869 1.23.83 22.98.83 50zm74.065-6.12h.07c0 6.396 5.23 11.626 11.626 11.626v.07c-6.397 0-11.627 5.23-11.627 11.619h-.069c0-6.39-5.23-11.62-11.626-11.62v-.069c6.396 0 11.626-5.23 11.626-11.626zM54.388 12.864h.118c0 11.185 9.15 20.334 20.334 20.334v.118c-11.185 0-20.334 9.15-20.334 20.334h-.118c0-11.185-9.149-20.334-20.334-20.334v-.118c11.178 0 20.334-9.149 20.334-20.334z"/>
+  </g>
+</svg>

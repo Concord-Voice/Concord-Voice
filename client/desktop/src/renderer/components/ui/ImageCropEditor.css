@@ -1,0 +1,111 @@
+.image-crop-preview {
+  /* Reset button defaults — element is <button> for accessibility */
+  appearance: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-align: inherit;
+
+  position: relative;
+  width: 100%;
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  overflow: hidden;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.image-crop-preview:active {
+  cursor: grabbing;
+}
+
+.image-crop-canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.image-crop-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 0 4px;
+}
+
+.image-crop-zoom-label {
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  font-family: 'SourceSans', sans-serif;
+  white-space: nowrap;
+}
+
+.image-crop-zoom-slider {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--bg-tertiary);
+  border-radius: 2px;
+  outline: none;
+}
+
+.image-crop-zoom-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent-fill);
+  cursor: pointer;
+  border: 2px solid var(--bg-secondary);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+.image-crop-zoom-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+
+.image-crop-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.image-crop-hint {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  margin-top: 8px;
+  text-align: center;
+  font-family: 'SourceSans', sans-serif;
+}
+
+.image-crop-warning {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--warning, #f0a030);
+  margin-top: 8px;
+  text-align: center;
+  font-family: 'SourceSans', sans-serif;
+}
+
+.image-crop-error {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--danger, #f04747);
+  margin-top: 8px;
+  text-align: center;
+  font-family: 'SourceSans', sans-serif;
+}
+
+.image-crop-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 300px;
+  color: var(--text-muted);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+}

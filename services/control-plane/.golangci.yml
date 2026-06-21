@@ -1,0 +1,27 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - gosec
+    - ineffassign
+    - misspell
+    - unconvert
+    - nakedret
+    - prealloc
+    - revive
+    - nilerr
+    - asciicheck
+    - bidichk
+    - durationcheck
+
+  settings:
+    gosec:
+      excludes:
+        - G701
+
+run:
+  timeout: 5m

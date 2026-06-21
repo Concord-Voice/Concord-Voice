@@ -1,0 +1,4 @@
+/* ConfirmActionModal styles — re-exports the shared destructive action modal styles.
+   Class names kept as-is (delete-server-*) for backward compatibility with
+   DeleteServerModal, LeaveServerModal, DeleteChannelModal, DeleteCategoryModal. */
+@import '../Servers/DeleteServerModal.css';

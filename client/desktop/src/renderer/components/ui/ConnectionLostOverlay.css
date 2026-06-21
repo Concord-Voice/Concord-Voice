@@ -1,0 +1,147 @@
+.connection-lost-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  animation: modalOverlayFadeIn 0.3s ease-out;
+  pointer-events: all;
+}
+
+.connection-lost-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  padding: 40px;
+  max-width: 440px;
+  text-align: center;
+  animation: modalSlideIn 0.3s ease-out;
+}
+
+.connection-lost-icon {
+  color: var(--text-muted);
+  margin-bottom: 16px;
+}
+
+.connection-lost-icon.spinning {
+  animation: spin 1.5s linear infinite;
+}
+
+.connection-lost-icon.error {
+  color: var(--danger-color, #e74c3c);
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.connection-lost-title {
+  font-size: calc(22px * var(--font-scale, 1));
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  color: var(--text-primary);
+  letter-spacing: 0.3px;
+  margin: 0 0 12px;
+}
+
+.connection-lost-message {
+  font-size: calc(14px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  line-height: 1.6;
+  margin: 0 0 24px;
+}
+
+/* ── Diagnostic checklist ──────────────────────────────────────── */
+
+.connection-lost-diagnostics {
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 24px;
+  text-align: left;
+}
+
+.connection-lost-diag-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+.connection-lost-diag-label {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.connection-lost-diag-value {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.connection-lost-diag-value.ok {
+  color: var(--success-color, #2ecc71);
+}
+
+.connection-lost-diag-value.failed {
+  color: var(--danger-color, #e74c3c);
+}
+
+.connection-lost-diag-value.unknown {
+  color: var(--text-secondary);
+}
+
+/* ── Action buttons ────────────────────────────────────────────── */
+
+.connection-lost-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.connection-lost-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 24px;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.2s ease,
+    opacity 0.2s ease;
+}
+
+.connection-lost-btn.primary {
+  background: var(--accent-fill);
+  color: var(--on-accent); /* HCM: see SettingsPage.css .settings-pending-blob-apply */
+}
+
+.connection-lost-btn.primary:hover {
+  opacity: 0.9;
+}
+
+.connection-lost-btn.secondary {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+.connection-lost-btn.secondary:hover {
+  background: var(--bg-quaternary, var(--bg-tertiary));
+  color: var(--text-primary);
+}

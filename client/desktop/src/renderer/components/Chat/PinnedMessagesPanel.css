@@ -1,0 +1,138 @@
+.pinned-panel-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.pinned-panel-backdrop-dismiss {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.3);
+  border: none;
+  cursor: pointer;
+  z-index: 0;
+}
+
+.pinned-panel {
+  z-index: 1;
+  width: 340px;
+  max-width: 90%;
+  height: 100%;
+  background: var(--bg-primary);
+  border-left: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.pinned-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.pinned-panel-header h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.pinned-panel-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+}
+
+.pinned-panel-close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.pinned-panel-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.pinned-panel-loading,
+.pinned-panel-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 16px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.pinned-panel-empty-hint {
+  font-size: 13px;
+  margin-top: 4px;
+  opacity: 0.7;
+}
+
+.pinned-message-card {
+  padding: 12px;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  margin-bottom: 8px;
+}
+
+.pinned-message-meta {
+  margin-bottom: 4px;
+}
+
+.pinned-message-author {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.pinned-message-content {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+  word-break: break-word;
+  margin-bottom: 8px;
+}
+
+.pinned-message-encrypted {
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.pinned-message-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.pinned-message-jump,
+.pinned-message-unpin {
+  background: none;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.pinned-message-jump:hover {
+  background: var(--bg-hover);
+  color: var(--accent-color);
+  border-color: var(--accent-color);
+}
+
+.pinned-message-unpin:hover {
+  background: var(--bg-hover);
+  color: var(--error-color);
+  border-color: var(--error-color);
+}

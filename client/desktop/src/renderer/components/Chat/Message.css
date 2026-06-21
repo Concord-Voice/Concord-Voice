@@ -1,0 +1,447 @@
+.message {
+  display: flex;
+  gap: calc(12px * var(--sp, 1));
+  padding: 2px calc(16px * var(--sp, 1));
+  padding-top: calc(8px * var(--sp, 1));
+  transition: background-color 0.15s ease;
+}
+
+.message.message-grouped {
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+
+.message:hover {
+  background-color: var(--bg-secondary);
+}
+
+.message-avatar {
+  flex-shrink: 0;
+  /* Pin a fixed footprint so a broken/404/CSP-blocked avatar still
+     occupies a 40x40 slot — otherwise the button shrink-wraps to its
+     alt-text width and content-wrappers shift left/right unpredictably,
+     misaligning non-grouped messages against grouped (.message-gutter)
+     siblings which have a hard 40px width. */
+  width: 40px;
+  height: 40px;
+  cursor: pointer;
+  border: none;
+  background: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+}
+
+.message-avatar:hover .avatar-image,
+.message-avatar:hover .avatar-circle {
+  opacity: 0.8;
+}
+
+/* Gutter for grouped messages — holds hover timestamp */
+.message-gutter {
+  flex-shrink: 0;
+  width: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.message-gutter-timestamp {
+  display: none;
+  font-size: calc(10px * var(--font-scale, 1));
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.message.message-grouped:hover .message-gutter-timestamp {
+  display: block;
+}
+
+.avatar-circle {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--gradient-brand);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-display-stack);
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--bg-primary);
+}
+
+.avatar-image {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.message-content-wrapper {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+}
+
+.message-header {
+  display: flex;
+  align-items: baseline;
+  gap: calc(8px * var(--sp, 1));
+  margin-bottom: calc(4px * var(--sp, 1));
+}
+
+.message-role-emoji {
+  font-size: calc(14px * var(--font-scale, 1));
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+/* Username is a <button> (opens the author profile card, #226) but must read
+   as inline text — strip the native button chrome and only reveal
+   interactivity on hover. */
+.message-username {
+  font-weight: 600;
+  color: var(--text-primary);
+  font-size: calc(15px * var(--font-scale, 1));
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  /* Display face for the most-frequent hierarchical text in the app (#1034).
+     Non-Latin usernames fall through the stack's system-ui/sans-serif tail. */
+  font-family: var(--font-display-stack);
+  letter-spacing: var(--font-display-tracking);
+  cursor: pointer;
+}
+
+.message-username:hover {
+  text-decoration: underline;
+}
+
+.message-timestamp {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+.message-edited {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.message-edited-inline {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  font-style: italic;
+  margin-left: 4px;
+}
+
+.message-text {
+  color: var(--text-secondary);
+  font-size: calc(15px * var(--font-scale, 1));
+  line-height: 1.5;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+}
+
+/* Base emoji size — renders emojis larger than surrounding text */
+.message-text .emoji {
+  font-size: calc(24px * var(--font-scale, 1));
+  line-height: 1;
+  vertical-align: -0.15em;
+}
+
+/* Emoji-only messages: jumbo emojis inherit parent font-size */
+.message-text[class*='emoji-jumbo'] .emoji {
+  font-size: inherit;
+  vertical-align: baseline;
+}
+.message-text.emoji-jumbo-1 {
+  font-size: calc(48px * var(--font-scale, 1));
+  line-height: 1.2;
+}
+.message-text.emoji-jumbo-2 {
+  font-size: calc(42px * var(--font-scale, 1));
+  line-height: 1.2;
+}
+.message-text.emoji-jumbo-3 {
+  font-size: calc(36px * var(--font-scale, 1));
+  line-height: 1.25;
+}
+.message-text.emoji-jumbo-4 {
+  font-size: calc(30px * var(--font-scale, 1));
+  line-height: 1.3;
+}
+.message-text.emoji-jumbo-5 {
+  font-size: calc(24px * var(--font-scale, 1));
+  line-height: 1.35;
+}
+
+.decrypt-failed {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-style: italic;
+  opacity: 0.8;
+}
+
+.decrypt-failed.pending-keys {
+  color: var(--state-encryption-pending);
+  opacity: 0.9;
+}
+
+/* Own message styling */
+.own-message {
+  background-color: color-mix(in srgb, var(--accent-primary) 5%, transparent);
+}
+
+.own-message:hover {
+  background-color: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+}
+
+/* Edit mode */
+.message-edit-box {
+  margin-top: 4px;
+}
+
+.message-edit-input {
+  width: 100%;
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(15px * var(--font-scale, 1));
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  resize: vertical;
+  min-height: 60px;
+}
+
+.message-edit-input:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
+.message-edit-actions {
+  display: flex;
+  gap: calc(8px * var(--sp, 1));
+  margin-top: calc(8px * var(--sp, 1));
+}
+
+.btn-edit-cancel,
+.btn-edit-save {
+  padding: calc(6px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  border-radius: 4px;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border: none;
+}
+
+.btn-edit-cancel {
+  background-color: transparent;
+  color: var(--text-secondary);
+}
+
+.btn-edit-cancel:hover {
+  color: var(--text-primary);
+  text-decoration: underline;
+}
+
+.btn-edit-save {
+  background-color: var(--accent-primary);
+  color: var(--bg-primary);
+}
+
+.btn-edit-save:hover:not(:disabled) {
+  background-color: var(--accent-hover);
+}
+
+.btn-edit-save:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Message options */
+.message-options {
+  position: absolute;
+  top: -4px;
+  right: 0;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.message:hover .message-options {
+  opacity: 1;
+}
+
+/* Quick delete button (Shift+hover) */
+.message-quick-delete {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 4px 6px;
+  cursor: pointer;
+  color: var(--danger);
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.message-quick-delete:hover {
+  background-color: rgba(240, 71, 71, 0.15);
+  border-color: var(--danger);
+}
+
+.message-quick-reply,
+.message-quick-reaction {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 4px 6px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.message-quick-reply:hover,
+.message-quick-reaction:hover {
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.message-options-trigger {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 4px 6px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.message-options-trigger:hover {
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.message-options-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  z-index: 10;
+  min-width: 140px;
+}
+
+.message-option {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--sp, 1));
+  width: 100%;
+  padding: calc(10px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+  text-align: left;
+}
+
+.message-option:hover {
+  background-color: var(--bg-secondary);
+}
+
+.message-option-danger {
+  color: var(--danger);
+}
+
+.message-option-danger:hover {
+  background-color: rgba(240, 71, 71, 0.1);
+}
+
+/* @mention highlights — uses theme accent via color-mix so the highlight
+   adapts per-theme instead of leaking Discord blurple. */
+.mention-highlight {
+  color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
+  border-radius: 3px;
+  padding: 0 2px;
+  font-weight: 500;
+}
+
+.mention-highlight:hover {
+  background: color-mix(in srgb, var(--accent-primary) 24%, transparent);
+}
+
+/* Pinned message indicator */
+.message.pinned {
+  border-left: 2px solid var(--accent-color);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Compact mode — Settings > Appearance > Compact Mode                */
+/*  Subtly tightens message spacing and avatar size. The deltas are    */
+/*  intentionally small (~25% padding, 40→32 avatar, ~10% line-height) */
+/*  so the layout still breathes and the layout-shift fixes from       */
+/*  b31f591 continue to reserve correct space for GIFs / images.       */
+/* ------------------------------------------------------------------ */
+html[data-compact='true'] .message {
+  padding-top: calc(6px * var(--sp, 1));
+  padding-bottom: 0;
+  gap: calc(10px * var(--sp, 1));
+}
+
+html[data-compact='true'] .message.message-grouped {
+  padding-top: 1px;
+  padding-bottom: 1px;
+}
+
+html[data-compact='true'] .message-avatar,
+html[data-compact='true'] .message-gutter,
+html[data-compact='true'] .avatar-circle,
+html[data-compact='true'] .avatar-image {
+  width: 32px;
+  height: 32px;
+}
+
+html[data-compact='true'] .avatar-circle {
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+html[data-compact='true'] .message-header {
+  gap: calc(6px * var(--sp, 1));
+  margin-bottom: calc(2px * var(--sp, 1));
+}
+
+html[data-compact='true'] .message-text {
+  line-height: 1.35;
+}
+
+.message-pinned-indicator {
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent-color);
+  margin-left: 4px;
+  opacity: 0.7;
+}

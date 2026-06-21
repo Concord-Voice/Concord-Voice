@@ -1,0 +1,2375 @@
+/* Global Styles */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* Concord Brand Fonts */
+@font-face {
+  font-family: 'Droidiga';
+  src: url('/branding/Concord-Voice/fonts/Droidiga.otf') format('opentype');
+  font-weight: normal;
+  font-style: normal;
+}
+
+@font-face {
+  font-family: 'SourceSans';
+  src: url('/branding/Concord-Voice/fonts/SourceSans.otf') format('opentype');
+  font-weight: normal;
+  font-style: normal;
+}
+
+/* Agency theme fonts — SIL OFL 1.1 (see public/branding/Concord-Voice/fonts/LICENSES.md) */
+@font-face {
+  font-family: 'Atkinson Hyperlegible Next';
+  src:
+    url('/branding/Concord-Voice/fonts/AtkinsonHyperlegibleNextVF-Variable.woff2')
+      format('woff2-variations'),
+    url('/branding/Concord-Voice/fonts/AtkinsonHyperlegibleNextVF-Variable.woff2') format('woff2');
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Lato';
+  src: url('/branding/Concord-Voice/fonts/Lato-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Lato';
+  src: url('/branding/Concord-Voice/fonts/Lato-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Lato';
+  src: url('/branding/Concord-Voice/fonts/Lato-Italic.ttf') format('truetype');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Lato';
+  src: url('/branding/Concord-Voice/fonts/Lato-BoldItalic.ttf') format('truetype');
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+
+/* User-selectable application fonts (Settings ▸ Appearance ▸ Fonts) — SIL OFL 1.1.
+   Self-hosted; see fonts/LICENSES.md. Applied via [data-appfont='…'] at end of file. */
+@font-face {
+  font-family: 'OpenDyslexic';
+  src: url('/branding/Concord-Voice/fonts/OpenDyslexic-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'OpenDyslexic';
+  src: url('/branding/Concord-Voice/fonts/OpenDyslexic-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('/branding/Concord-Voice/fonts/Inter-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Lexend';
+  src: url('/branding/Concord-Voice/fonts/Lexend-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  /* Button / highlight FILL token. Defaults to --accent-primary so every theme
+     renders identically; a gradient-capable theme (e.g. Pride) overrides it to a
+     gradient, which works because consuming sites use the `background` shorthand.
+     Lazy var() resolution means this tracks each scheme's --accent-primary. */
+  --accent-fill: var(--accent-primary);
+
+  /* Font Scale & Spacing Scale
+   *
+   * Two-layer model (#489): font-size discrete buckets and the continuous
+   * UI scale slider COEXIST and compound, rather than overriding each
+   * other. `*-discrete` holds whatever the font-size selector picks; the
+   * effective `--font-scale` / `--sp-base` consumers see is the discrete
+   * value times `--ui-scale`. So "Large + 1.2x UI scale" = 1.175 × 1.2 =
+   * 1.41 — both controls land additively.
+   *
+   * Custom properties resolve at use time, so the existing
+   * `data-fontsize='small'` / `'large'` rules only need to set the
+   * discrete variant; the compounding calc() in :root resolves against
+   * the cascaded value automatically. */
+  --ui-scale: 1;
+  --font-scale-discrete: 1;
+  --sp-base-discrete: 1;
+  --font-scale: calc(var(--font-scale-discrete) * var(--ui-scale));
+  --sp-base: calc(var(--sp-base-discrete) * var(--ui-scale));
+  --compact-factor: 1;
+  --sp: calc(var(--sp-base) * var(--compact-factor));
+
+  /* Concord Brand Colors */
+  --bg-primary: #0d0821;
+  --bg-secondary: #151028;
+  --bg-tertiary: #1d1630;
+  --text-primary: #ffffff;
+  --text-secondary: #b8b8c8;
+  --text-muted: #7f7f9e;
+  --accent-primary: #fa709a;
+  --accent-secondary: #ffe13f;
+  --accent-hover: #ff8bb0;
+  --gradient-brand: linear-gradient(90deg, #fa709a 0%, #ffe13f 100%);
+  --success: #43b581;
+  --danger: #f04747;
+  --border-color: #2a2440;
+
+  /* Semantic aliases (used by channel/modal components) */
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #5f5f7e;
+  --bg-hover: #1a1230;
+  --bg-active: #241e38;
+
+  /* Utility colors */
+  --on-accent: #ffffff;
+  --danger-hover: #d43b3b;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+
+  /* Warning text — readable foreground on yellow-tinted backgrounds */
+  --text-warning-strong: #f59e0b; /* Amber-500, high-contrast on dark backgrounds */
+  /* Error text — readable foreground on red-tinted backgrounds */
+  --text-error-strong: #f87171; /* Red-400, high-contrast on dark backgrounds */
+
+  /*
+   * Design-token taxonomy (#1033, extended #1035) — 23 tokens across 7 families:
+   *   - State (3):       --state-selected, --state-focused, --state-hover
+   *   - Typography (4):  --font-display-stack, --font-body-stack, --font-display-tracking, --font-display-tracking-tight
+   *   - Display (4):     --text-display-{xl,lg,md,sm} (4-step display type scale, #1035)
+   *   - Scale (3):       --radius-base, --radius-elevated, --radius-modal
+   *   - Motion (5):      --motion-duration-{fast,base,slow}, --motion-curve-{base,decel}
+   *   - Link (3):        --link-color, --link-color-hover, --link-color-visited
+   *   - Encryption (1):  --state-encryption-pending
+   *
+   * All tokens are mirrored across all 32 blocks (root, generic light, 15 schemes × 2 modes)
+   * with uniform initial values. Individual themes opt into per-token divergence in
+   * follow-up sibling issues — initial schema symmetry is the load-bearing invariant.
+   */
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Font Size Scaling — discrete buckets feed the *-discrete variants only;
+   --font-scale / --sp-base get the compounded UI-scale × discrete via the
+   calc() in :root (#489). */
+[data-fontsize='small'] {
+  --font-scale-discrete: 0.825;
+  --sp-base-discrete: 0.825;
+}
+[data-fontsize='large'] {
+  --font-scale-discrete: 1.175;
+  --sp-base-discrete: 1.175;
+}
+
+/* Compact Mode — reduces spacing globally without affecting font sizes */
+[data-compact='true'] {
+  --compact-factor: 0.75;
+}
+
+/* Reduce Animations — disables all CSS transitions and animations globally */
+[data-reduce-animations='true'],
+[data-reduce-animations='true'] *,
+[data-reduce-animations='true'] *::before,
+[data-reduce-animations='true'] *::after {
+  transition-duration: 0s !important;
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+}
+
+/* Concord Light */
+[data-theme='light'] {
+  --bg-primary: #f5f5f7;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #e8e8ec;
+  --text-primary: #1a1a2e;
+  --text-secondary: #4a4a6a;
+  --text-muted: #8888a8;
+  --accent-primary: #fa709a;
+  --accent-secondary: #ffe13f;
+  --accent-hover: #ff8bb0;
+  --gradient-brand: linear-gradient(90deg, #fa709a 0%, #ffe13f 100%);
+  --success: #2d9f6f;
+  --danger: #e03e3e;
+  --border-color: #d4d4de;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #6a6a8a;
+  --bg-hover: #dddde2;
+  --bg-active: #d2d2d8;
+  --on-accent: #ffffff;
+  --danger-hover: #c83232;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e; /* Amber-800, high-contrast on light backgrounds */
+  --text-error-strong: #991b1b; /* Red-800, high-contrast on light backgrounds */
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #ae4e6b;
+  --link-color-hover: #9f576e;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Concord Dark (explicit scheme selector for identity scoping) */
+[data-scheme='concord'] {
+  --bg-primary: #0d0821;
+  --bg-secondary: #151028;
+  --bg-tertiary: #1d1630;
+  --text-primary: #ffffff;
+  --text-secondary: #b8b8c8;
+  --text-muted: #7f7f9e;
+  --accent-primary: #fa709a;
+  --accent-secondary: #ffe13f;
+  --accent-hover: #ff8bb0;
+  --gradient-brand: linear-gradient(90deg, #fa709a 0%, #ffe13f 100%);
+  --success: #43b581;
+  --danger: #f04747;
+  --border-color: #2a2440;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #5f5f7e;
+  --bg-hover: #1a1230;
+  --bg-active: #241e38;
+  --on-accent: #ffffff;
+  --danger-hover: #d43b3b;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Concord Light (explicit scheme selector for identity scoping) */
+[data-scheme='concord'][data-theme='light'] {
+  --bg-primary: #f5f5f7;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #e8e8ec;
+  --text-primary: #1a1a2e;
+  --text-secondary: #4a4a6a;
+  --text-muted: #8888a8;
+  --accent-primary: #fa709a;
+  --accent-secondary: #ffe13f;
+  --accent-hover: #ff8bb0;
+  --gradient-brand: linear-gradient(90deg, #fa709a 0%, #ffe13f 100%);
+  --success: #2d9f6f;
+  --danger: #e03e3e;
+  --border-color: #d4d4de;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #6a6a8a;
+  --bg-hover: #dddde2;
+  --bg-active: #d2d2d8;
+  --on-accent: #ffffff;
+  --danger-hover: #c83232;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #ae4e6b;
+  --link-color-hover: #9f576e;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Morky Dark */
+[data-scheme='morky'] {
+  --bg-primary: #0a0a0a;
+  --bg-secondary: #141414;
+  --bg-tertiary: #1e1e1e;
+  --text-primary: #f0f0f0;
+  --text-secondary: #a0a0a0;
+  --text-muted: #666666;
+  --accent-primary: #e63946;
+  --accent-secondary: #ff6b35;
+  --accent-hover: #ff4d5e;
+  --gradient-brand: linear-gradient(90deg, #e63946 0%, #ff6b35 100%);
+  --success: #4caf50;
+  --danger: #f44336;
+  --border-color: #2a2a2a;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #505050;
+  --bg-hover: #262626;
+  --bg-active: #2e2e2e;
+  --on-accent: #ffffff;
+  --danger-hover: #d43030;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Morky Light */
+[data-scheme='morky'][data-theme='light'] {
+  --bg-primary: #f8f8f8;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #ebebeb;
+  --text-primary: #1a1a1a;
+  --text-secondary: #555555;
+  --text-muted: #888888;
+  --accent-primary: #e63946;
+  --accent-secondary: #ff6b35;
+  --accent-hover: #ff4d5e;
+  --gradient-brand: linear-gradient(90deg, #e63946 0%, #ff6b35 100%);
+  --success: #2e7d32;
+  --danger: #c62828;
+  --border-color: #d0d0d0;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #707070;
+  --bg-hover: #e2e2e2;
+  --bg-active: #d8d8d8;
+  --on-accent: #ffffff;
+  --danger-hover: #a82020;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #cf333f;
+  --link-color-hover: #c73c49;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Bardic Dark */
+[data-scheme='bardic'] {
+  --bg-primary: #120a1e;
+  --bg-secondary: #1a1028;
+  --bg-tertiary: #251a35;
+  --text-primary: #f0e6ff;
+  --text-secondary: #b8a0d4;
+  --text-muted: #7a6894;
+  --accent-primary: #c471ed;
+  --accent-secondary: #f64f8e;
+  --accent-hover: #d999f5;
+  --gradient-brand: linear-gradient(90deg, #c471ed 0%, #f64f8e 100%);
+  --success: #6bcb77;
+  --danger: #e05279;
+  --border-color: #332548;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #5e4c78;
+  --bg-hover: #2e2042;
+  --bg-active: #36264c;
+  --on-accent: #ffffff;
+  --danger-hover: #c43a60;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Bardic Light */
+[data-scheme='bardic'][data-theme='light'] {
+  --bg-primary: #f8f4fc;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #efe6f7;
+  --text-primary: #1e0e2e;
+  --text-secondary: #5a4570;
+  --text-muted: #9080a6;
+  --accent-primary: #b04fd9;
+  --accent-secondary: #e8447e;
+  --accent-hover: #c87ae5;
+  --gradient-brand: linear-gradient(90deg, #b04fd9 0%, #e8447e 100%);
+  --success: #2e8b4a;
+  --danger: #c23660;
+  --border-color: #d8cce5;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #7a6a90;
+  --bg-hover: #e6dcf0;
+  --bg-active: #ddd0ea;
+  --on-accent: #ffffff;
+  --danger-hover: #a82a50;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #9d46c1;
+  --link-color-hover: #8f57a4;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Fox Den Dark */
+[data-scheme='foxden'] {
+  --bg-primary: #3d1e00;
+  --bg-secondary: #4a2600;
+  --bg-tertiary: #5a3200;
+  --text-primary: #ffe0b2;
+  --text-secondary: #ffcc80;
+  --text-muted: #c47a30;
+  --accent-primary: #ff6d00;
+  --accent-secondary: #ff9100;
+  --accent-hover: #ff8a24;
+  --gradient-brand: linear-gradient(90deg, #ff6d00 0%, #ff9100 100%);
+  --success: #8bc34a;
+  --danger: #ef5350;
+  --border-color: #6b3f10;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #9a5a1e;
+  --bg-hover: #6a3c08;
+  --bg-active: #7a4810;
+  --on-accent: #ffffff;
+  --danger-hover: #d43838;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  /* Fox Den breaks the default --link-color = --accent-primary aliasing.
+     The accent (#ff6d00 orange) on #3d1e00 saddle-brown background is
+     technically 5.6:1 — passes WCAG AA — but perceived contrast is much
+     lower because both hues sit on the warm side of the wheel and the
+     link "blends" with the surrounding UI. Sky blue is complementary to
+     orange, lifts perceived contrast to ~9.5:1, and stays clearly
+     identifiable as a link rather than another accent surface. */
+  --link-color: #80d8ff;
+  --link-color-hover: #b3e5fc;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Fox Den Light */
+[data-scheme='foxden'][data-theme='light'] {
+  --bg-primary: #fff3e0;
+  --bg-secondary: #fff8f0;
+  --bg-tertiary: #ffe8c8;
+  --text-primary: #1a0e02;
+  --text-secondary: #8a4500;
+  --text-muted: #b87830;
+  --accent-primary: #e65100;
+  --accent-secondary: #ef6c00;
+  --accent-hover: #ff7d1a;
+  --gradient-brand: linear-gradient(90deg, #e65100 0%, #ef6c00 100%);
+  --success: #558b2f;
+  --danger: #c62828;
+  --border-color: #f0c890;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #a06a28;
+  --bg-hover: #ffe0b0;
+  --bg-active: #ffd898;
+  --on-accent: #ffffff;
+  --danger-hover: #a82020;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  /* Same warm-on-warm rationale as Fox Den Dark — accent (#e65100) on the
+     #fff3e0 cream background sits at ~5.0:1 mathematical contrast but reads
+     as a muddy orange-on-cream link rather than something obviously
+     interactive. Deep blue is complementary and lifts contrast to ~9.0:1. */
+  --link-color: #01579b;
+  --link-color-hover: #0272b4;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Hacker Dark */
+[data-scheme='hacker'] {
+  --bg-primary: #000000;
+  --bg-secondary: #080808;
+  --bg-tertiary: #111111;
+  --text-primary: #00ff41;
+  --text-secondary: #00cc33;
+  --text-muted: #00801f;
+  --accent-primary: #00ff41;
+  --accent-secondary: #00ee38;
+  --accent-hover: #44ff77;
+  --gradient-brand: linear-gradient(90deg, #00ff41 0%, #00ee38 100%);
+  --success: #00ff41;
+  --danger: #ff2020;
+  --border-color: #0a2a0a;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #005818;
+  --bg-hover: #181818;
+  --bg-active: #202020;
+  --on-accent: #000000;
+  --danger-hover: #cc1818;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Hacker Light */
+[data-scheme='hacker'][data-theme='light'] {
+  --bg-primary: #e8ffe8;
+  --bg-secondary: #f2fff2;
+  --bg-tertiary: #d0f0d0;
+  --text-primary: #003a00;
+  --text-secondary: #005a00;
+  --text-muted: #408040;
+  --accent-primary: #008a20;
+  --accent-secondary: #007018;
+  --accent-hover: #00aa2a;
+  --gradient-brand: linear-gradient(90deg, #008a20 0%, #007018 100%);
+  --success: #008a20;
+  --danger: #cc1111;
+  --border-color: #c0dcc0;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #307030;
+  --bg-hover: #c2e8c2;
+  --bg-active: #b0d8b0;
+  --on-accent: #ffffff;
+  --danger-hover: #a80e0e;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #00821e;
+  --link-color-hover: #008220;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Spooky Dark */
+[data-scheme='spooky'] {
+  --bg-primary: #0a0a0a;
+  --bg-secondary: #121010;
+  --bg-tertiary: #1c1518;
+  --text-primary: #e8d8c8;
+  --text-secondary: #a08878;
+  --text-muted: #6a5040;
+  --accent-primary: #ff6a00;
+  --accent-secondary: #8b20aa;
+  --accent-hover: #ff8833;
+  --gradient-brand: linear-gradient(90deg, #ff6a00 0%, #8b20aa 100%);
+  --success: #4a8a3a;
+  --danger: #cc2222;
+  --border-color: #2a1e1e;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #4e3a2e;
+  --bg-hover: #221818;
+  --bg-active: #2a1e1e;
+  --on-accent: #ffffff;
+  --danger-hover: #aa1a1a;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Spooky Light */
+[data-scheme='spooky'][data-theme='light'] {
+  --bg-primary: #f5efe8;
+  --bg-secondary: #faf6f0;
+  --bg-tertiary: #e8ddd0;
+  --text-primary: #1a0e06;
+  --text-secondary: #5a4030;
+  --text-muted: #8a7060;
+  --accent-primary: #cc5500;
+  --accent-secondary: #7a18a0;
+  --accent-hover: #e06600;
+  --gradient-brand: linear-gradient(90deg, #cc5500 0%, #7a18a0 100%);
+  --success: #3a7a2e;
+  --danger: #b81c1c;
+  --border-color: #d4c4b0;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #7a6050;
+  --bg-hover: #e0d4c4;
+  --bg-active: #d6c8b6;
+  --on-accent: #ffffff;
+  --danger-hover: #981414;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #b24a00;
+  --link-color-hover: #ae4f00;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Leviathan Dark */
+[data-scheme='leviathan'] {
+  --bg-primary: #020c14;
+  --bg-secondary: #061420;
+  --bg-tertiary: #0c1e2e;
+  --text-primary: #c8dce8;
+  --text-secondary: #7aa0bc;
+  --text-muted: #3e6880;
+  --accent-primary: #0ea5e9;
+  --accent-secondary: #06b6d4;
+  --accent-hover: #38bdf8;
+  --gradient-brand: linear-gradient(90deg, #0ea5e9 0%, #06b6d4 100%);
+  --success: #2dd4bf;
+  --danger: #f43f5e;
+  --border-color: #122a3e;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #2a4e66;
+  --bg-hover: #0e2438;
+  --bg-active: #142e44;
+  --on-accent: #ffffff;
+  --danger-hover: #d6354f;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Leviathan Light */
+[data-scheme='leviathan'][data-theme='light'] {
+  --bg-primary: #ecf6fc;
+  --bg-secondary: #f4faff;
+  --bg-tertiary: #d8ecf6;
+  --text-primary: #041820;
+  --text-secondary: #1a4a64;
+  --text-muted: #5a8aa4;
+  --accent-primary: #0284c7;
+  --accent-secondary: #0891b2;
+  --accent-hover: #0ea5e9;
+  --gradient-brand: linear-gradient(90deg, #0284c7 0%, #0891b2 100%);
+  --success: #0d9488;
+  --danger: #e11d48;
+  --border-color: #b8d8ea;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #4a7a94;
+  --bg-hover: #cce4f2;
+  --bg-active: #c0dae8;
+  --on-accent: #ffffff;
+  --danger-hover: #be123c;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #0273ad;
+  --link-color-hover: #0a74a4;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Grassy Nill Dark */
+[data-scheme='grassynill'] {
+  --bg-primary: #0c0e08;
+  --bg-secondary: #141810;
+  --bg-tertiary: #1e2418;
+  --text-primary: #d8dcc8;
+  --text-secondary: #a0a888;
+  --text-muted: #687050;
+  --accent-primary: #6b8e23;
+  --accent-secondary: #8b7355;
+  --accent-hover: #7fa828;
+  --gradient-brand: linear-gradient(90deg, #6b8e23 0%, #8b7355 100%);
+  --success: #6b8e23;
+  --danger: #b85c38;
+  --border-color: #2a3020;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #4a5238;
+  --bg-hover: #222a1a;
+  --bg-active: #2a3222;
+  --on-accent: #ffffff;
+  --danger-hover: #9a4a2c;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Grassy Nill Light */
+[data-scheme='grassynill'][data-theme='light'] {
+  --bg-primary: #f2f4ec;
+  --bg-secondary: #f8faf4;
+  --bg-tertiary: #e4e8d8;
+  --text-primary: #1a1e10;
+  --text-secondary: #4a5030;
+  --text-muted: #7a8260;
+  --accent-primary: #5a7a1a;
+  --accent-secondary: #7a6345;
+  --accent-hover: #6b8e23;
+  --gradient-brand: linear-gradient(90deg, #5a7a1a 0%, #7a6345 100%);
+  --success: #5a7a1a;
+  --danger: #a04e2e;
+  --border-color: #c8d0b8;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #68724c;
+  --bg-hover: #dae0cc;
+  --bg-active: #d0d6c0;
+  --on-accent: #ffffff;
+  --danger-hover: #884020;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #577619;
+  --link-color-hover: #59761d;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Cotton Candy Dark */
+[data-scheme='cottoncandy'] {
+  --bg-primary: #0a0810;
+  --bg-secondary: #120e18;
+  --bg-tertiary: #1a1620;
+  --text-primary: #d0e8ff;
+  --text-secondary: #90b8e0;
+  --text-muted: #5880a8;
+  --accent-primary: #ff6ea8;
+  --accent-secondary: #40c8ff;
+  --accent-hover: #ff90be;
+  --gradient-brand: linear-gradient(90deg, #ff6ea8 0%, #40c8ff 100%);
+  --success: #40c8ff;
+  --danger: #ff5080;
+  --border-color: #26202e;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #406888;
+  --bg-hover: #1e1a28;
+  --bg-active: #262230;
+  --on-accent: #c0e0ff;
+  --danger-hover: #e03868;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Cotton Candy Light */
+[data-scheme='cottoncandy'][data-theme='light'] {
+  --bg-primary: #e8f0ff;
+  --bg-secondary: #eff5ff;
+  --bg-tertiary: #d4e4fa;
+  --text-primary: #081428;
+  --text-secondary: #14305a;
+  --text-muted: #3a6098;
+  --accent-primary: #ff2880;
+  --accent-secondary: #00a0f0;
+  --accent-hover: #ff50a0;
+  --gradient-brand: linear-gradient(90deg, #ff2880 0%, #00a0f0 100%);
+  --success: #00a0f0;
+  --danger: #ff1060;
+  --border-color: #a8c8f0;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #305880;
+  --bg-hover: #c4d8f4;
+  --bg-active: #b4ccea;
+  --on-accent: #c0e0ff;
+  --danger-hover: #d80050;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #c92065;
+  --link-color-hover: #b83a73;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Driftwood Dark */
+[data-scheme='driftwood'] {
+  --bg-primary: #120e0a;
+  --bg-secondary: #1a1410;
+  --bg-tertiary: #241c16;
+  --text-primary: #e8ddd0;
+  --text-secondary: #b8a890;
+  --text-muted: #7a6a54;
+  --accent-primary: #c8a46c;
+  --accent-secondary: #a07848;
+  --accent-hover: #d8b880;
+  --gradient-brand: linear-gradient(90deg, #c8a46c 0%, #a07848 100%);
+  --success: #8a9a5a;
+  --danger: #c45a3a;
+  --border-color: #322820;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #5a4c3a;
+  --bg-hover: #2a221a;
+  --bg-active: #322a20;
+  --on-accent: #12100a;
+  --danger-hover: #a84830;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Driftwood Light */
+[data-scheme='driftwood'][data-theme='light'] {
+  --bg-primary: #f4efe8;
+  --bg-secondary: #faf6f0;
+  --bg-tertiary: #e8dfd4;
+  --text-primary: #1e1610;
+  --text-secondary: #4a3c2c;
+  --text-muted: #8a7860;
+  --accent-primary: #9a7840;
+  --accent-secondary: #7a5c30;
+  --accent-hover: #b08c50;
+  --gradient-brand: linear-gradient(90deg, #9a7840 0%, #7a5c30 100%);
+  --success: #6a7a3c;
+  --danger: #a84428;
+  --border-color: #d0c4b0;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #706048;
+  --bg-hover: #e0d4c4;
+  --bg-active: #d6c8b6;
+  --on-accent: #faf6f0;
+  --danger-hover: #8c361e;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #826536;
+  --link-color-hover: #80663a;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Eclipse Dark */
+[data-scheme='eclipse'] {
+  --bg-primary: #000000;
+  --bg-secondary: #0a0000;
+  --bg-tertiary: #140808;
+  --text-primary: #e8c8c8;
+  --text-secondary: #a08080;
+  --text-muted: #684848;
+  --accent-primary: #cc0000;
+  --accent-secondary: #880000;
+  --accent-hover: #ee2020;
+  --gradient-brand: linear-gradient(90deg, #cc0000 0%, #880000 100%);
+  --success: #aa2020;
+  --danger: #ff1a1a;
+  --border-color: #2a1010;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #4a2e2e;
+  --bg-hover: #1a0808;
+  --bg-active: #221010;
+  --on-accent: #e8c8c8;
+  --danger-hover: #dd0000;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #d83e3e;
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Eclipse Light */
+[data-scheme='eclipse'][data-theme='light'] {
+  --bg-primary: #f4e8e8;
+  --bg-secondary: #faf2f2;
+  --bg-tertiary: #e8d4d4;
+  --text-primary: #180808;
+  --text-secondary: #4a1e1e;
+  --text-muted: #8a5050;
+  --accent-primary: #aa0000;
+  --accent-secondary: #700000;
+  --accent-hover: #cc0000;
+  --gradient-brand: linear-gradient(90deg, #aa0000 0%, #700000 100%);
+  --success: #881818;
+  --danger: #cc0000;
+  --border-color: #d0b0b0;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #6a3838;
+  --bg-hover: #dcc4c4;
+  --bg-active: #d0b8b8;
+  --on-accent: #f4e8e8;
+  --danger-hover: #990000;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Midnight Sky Dark */
+[data-scheme='midnightsky'] {
+  --bg-primary: #060a18;
+  --bg-secondary: #0c1228;
+  --bg-tertiary: #141c38;
+  --text-primary: #c8d0e8;
+  --text-secondary: #7080b0;
+  --text-muted: #3e4c78;
+  --accent-primary: #6d8cff;
+  --accent-secondary: #a78bfa;
+  --accent-hover: #8da6ff;
+  --gradient-brand: linear-gradient(90deg, #6d8cff 0%, #a78bfa 100%);
+  --success: #6ee7b7;
+  --danger: #fb7185;
+  --border-color: #1c2848;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #2e3c68;
+  --bg-hover: #1a2444;
+  --bg-active: #222e52;
+  --on-accent: #ffffff;
+  --danger-hover: #e05068;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Midnight Sky Light */
+[data-scheme='midnightsky'][data-theme='light'] {
+  --bg-primary: #eef0f8;
+  --bg-secondary: #f6f7fc;
+  --bg-tertiary: #dce0f0;
+  --text-primary: #0a0e1c;
+  --text-secondary: #2a3460;
+  --text-muted: #6070a0;
+  --accent-primary: #4a6ae0;
+  --accent-secondary: #7c5cc8;
+  --accent-hover: #6d8cff;
+  --gradient-brand: linear-gradient(90deg, #4a6ae0 0%, #7c5cc8 100%);
+  --success: #059669;
+  --danger: #e11d48;
+  --border-color: #b8c0dc;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #4a5888;
+  --bg-hover: #d0d6ea;
+  --bg-active: #c4cae0;
+  --on-accent: #ffffff;
+  --danger-hover: #be123c;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #4462cf;
+  --link-color-hover: #4f65b9;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Agency Dark — atmospheric near-black with magenta + cyan brand accents.
+ * Theme inspired by the "Agency" concept of digital self-determination.
+ * Brand provenance + font installation steps: docs/design/agency-theme-handoff.md */
+[data-scheme='agency'] {
+  --bg-primary: #050912;
+  --bg-secondary: #0a1224;
+  --bg-tertiary: #0d294a;
+  --text-primary: #f0f5fa;
+  --text-secondary: #94a8c4;
+  --text-muted: #5e718f;
+  --accent-primary: #e0004e;
+  --accent-secondary: #017fa4;
+  --accent-hover: #ff1860;
+  --gradient-brand: linear-gradient(90deg, #e0004e 0%, #017fa4 100%);
+  --success: #6ccdb8;
+  --danger: #ff2050;
+  --border-color: #1e3258;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #455770;
+  --bg-hover: #122545;
+  --bg-active: #1a3666;
+  --on-accent: #ffffff;
+  --danger-hover: #ff3060;
+  --status-connected: #6ccdb8;
+  --status-connecting: #f1b435;
+  --status-disconnected: #e0004e;
+  --text-warning-strong: #f1b435;
+  --text-error-strong: #ff5070;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Atkinson Hyperlegible Next', 'Lato', system-ui, sans-serif;
+  /* #1643: body font is applied via the data-appfont sink (SCHEME_FONTS → atkinson),
+     not this token. Kept at the canonical default for design-token schema symmetry
+     (design-tokens.test.ts); --font-body-stack remains globally unconsumed. */
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  /* Link color = brand mint (AAA 10.4:1 on bg-primary).
+   * Brand cyan #017fa4 falls 0.2 short of WCAG AA (4.27) on this near-black bg,
+   * so mint takes the link role and cyan stays in icon/button role (3.0 floor). */
+  --link-color: #6ccdb8;
+  --link-color-hover: #8eecd6;
+  --link-color-visited: #105f66;
+  --state-encryption-pending: #f1b435;
+}
+
+/* Agency Light — palette inverted with darkened accents for WCAG AA+ contrast. */
+[data-scheme='agency'][data-theme='light'] {
+  --bg-primary: #f5f7fa;
+  --bg-secondary: #eaeff6;
+  --bg-tertiary: #d9e2ed;
+  --text-primary: #0a1424;
+  --text-secondary: #3a4a66;
+  --text-muted: #5e708a;
+  --accent-primary: #a30038;
+  --accent-secondary: #015a73;
+  --accent-hover: #c8004a;
+  --gradient-brand: linear-gradient(90deg, #a30038 0%, #015a73 100%);
+  --success: #2a8a72;
+  --danger: #c4003d;
+  --border-color: #b8c4d4;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #768aa6;
+  --bg-hover: #e0e8f0;
+  --bg-active: #cdd9e6;
+  --on-accent: #ffffff;
+  --danger-hover: #a30030;
+  --status-connected: #2a8a72;
+  --status-connecting: #a87000;
+  --status-disconnected: #c4003d;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Atkinson Hyperlegible Next', 'Lato', system-ui, sans-serif;
+  /* #1643: body font is applied via the data-appfont sink (SCHEME_FONTS → atkinson),
+     not this token. Kept at the canonical default for design-token schema symmetry
+     (design-tokens.test.ts); --font-body-stack remains globally unconsumed. */
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  /* Light variant: darker cyan family hits AA on pale-cool bg.
+   * Hover is even deeper (12.15:1 AAA) — more contrast = "lift" on light bg. */
+  --link-color: #015a73;
+  --link-color-hover: #013548;
+  --link-color-visited: #105f66;
+  --state-encryption-pending: #b07a00;
+}
+
+/* Defacto Dark — neutral graphite, GitHub-blue accent */
+[data-scheme='defacto'] {
+  --bg-primary: #1c1c1f;
+  --bg-secondary: #26262a;
+  --bg-tertiary: #303035;
+  --text-primary: #e4e4e7;
+  --text-secondary: #b4b4bd;
+  --text-muted: #9b9ba3;
+  --accent-primary: #58a6ff;
+  --accent-secondary: #79c0ff;
+  --accent-hover: #79c0ff;
+  --gradient-brand: linear-gradient(90deg, #58a6ff 0%, #79c0ff 100%);
+  --success: #3fb950;
+  --danger: #f85149;
+  --border-color: #3a3a40;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #6e6e77;
+  --bg-hover: #2a2a30;
+  --bg-active: #34343b;
+  --on-accent: #0d1117;
+  --danger-hover: #da3633;
+  --status-connected: #3fb950;
+  --status-connecting: #d29922;
+  --status-disconnected: #f85149;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #58a6ff;
+  --link-color-hover: #79c0ff;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Defacto Light — GitHub-Light mirror */
+[data-scheme='defacto'][data-theme='light'] {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f6f8fa;
+  --bg-tertiary: #eaeef2;
+  --text-primary: #1f2328;
+  --text-secondary: #57606a;
+  --text-muted: #6e7781;
+  --accent-primary: #0969da;
+  --accent-secondary: #218bff;
+  --accent-hover: #0860ca;
+  --gradient-brand: linear-gradient(90deg, #0969da 0%, #218bff 100%);
+  --success: #1a7f37;
+  --danger: #cf222e;
+  --border-color: #d0d7de;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #818b98;
+  --bg-hover: #f3f4f6;
+  --bg-active: #eaeef2;
+  --on-accent: #ffffff;
+  --danger-hover: #a40e26;
+  --status-connected: #1a7f37;
+  --status-connecting: #9a6700;
+  --status-disconnected: #cf222e;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #0969da;
+  --link-color-hover: #0860ca;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Pride Dark — deep base, hot-pink + azure accents, rainbow brand gradient */
+[data-scheme='pride'] {
+  --bg-primary: #1a1622;
+  --bg-secondary: #231d2e;
+  --bg-tertiary: #2d2539;
+  --text-primary: #f6eef7;
+  --text-secondary: #c7b6d1;
+  --text-muted: #8d7d99;
+  --accent-primary: #ff4d9e;
+  --accent-secondary: #3b9eff;
+  --accent-hover: #ff78b6;
+  --gradient-brand: linear-gradient(
+    90deg,
+    #e40303 0%,
+    #ff8c00 20%,
+    #ffed00 40%,
+    #008026 60%,
+    #004dff 80%,
+    #750787 100%
+  );
+  --success: #2fbf71;
+  --danger: #ff5c5c;
+  --border-color: #352b44;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #6c5d79;
+  --bg-hover: #2b2336;
+  --bg-active: #342a42;
+  --on-accent: #ffffff;
+  --danger-hover: #e04848;
+  --status-connected: #1aaa55;
+  --status-connecting: #e6b432;
+  --status-disconnected: #fa6464;
+  --text-warning-strong: #f59e0b;
+  --text-error-strong: #f87171;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: var(--accent-primary);
+  --link-color-hover: var(--accent-hover);
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+/* Pride Light */
+[data-scheme='pride'][data-theme='light'] {
+  --bg-primary: #fdf6fb;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #f6ecf3;
+  --text-primary: #20172a;
+  --text-secondary: #59496a;
+  --text-muted: #897a96;
+  --accent-primary: #d61f7a;
+  --accent-secondary: #1d6fd6;
+  --accent-hover: #e84d97;
+  --gradient-brand: linear-gradient(
+    90deg,
+    #e40303 0%,
+    #ff8c00 20%,
+    #ffd000 40%,
+    #008026 60%,
+    #004dff 80%,
+    #750787 100%
+  );
+  --success: #2e8b4a;
+  --danger: #d33d3d;
+  --border-color: #ead9e4;
+  --accent-color: var(--accent-primary);
+  --error-color: var(--danger);
+  --success-color: var(--success);
+  --text-tertiary: #6c5d79;
+  --bg-hover: #f3e7ef;
+  --bg-active: #ebdce7;
+  --on-accent: #ffffff;
+  --danger-hover: #b32f2f;
+  --status-connected: #1a9a4a;
+  --status-connecting: #c89a20;
+  --status-disconnected: #e05050;
+  --text-warning-strong: #92400e;
+  --text-error-strong: #991b1b;
+  /* Design-token taxonomy extension (#1033) */
+  --state-selected: var(--accent-primary);
+  --state-focused: var(--accent-secondary);
+  --state-hover: var(--bg-hover);
+  --font-display-stack: 'Droidiga', system-ui, sans-serif;
+  --font-body-stack: 'SourceSans', system-ui, sans-serif;
+  --font-display-tracking: 0;
+  --font-display-tracking-tight: -0.02em;
+  --text-display-xl: calc(32px * var(--font-scale, 1));
+  --text-display-lg: calc(24px * var(--font-scale, 1));
+  --text-display-md: calc(20px * var(--font-scale, 1));
+  --text-display-sm: calc(16px * var(--font-scale, 1));
+  --radius-base: 4px;
+  --radius-elevated: 8px;
+  --radius-modal: 12px;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-curve-base: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-curve-decel: cubic-bezier(0, 0, 0.2, 1);
+  --link-color: #d61f7a;
+  --link-color-hover: #b01563;
+  --link-color-visited: var(--accent-secondary);
+  --state-encryption-pending: #faa61a;
+}
+
+body {
+  font-family:
+    'SourceSans',
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    'Roboto',
+    'Oxygen',
+    'Ubuntu',
+    'Cantarell',
+    'Fira Sans',
+    'Droid Sans',
+    'Helvetica Neue',
+    sans-serif;
+  font-size: calc(14px * var(--font-scale, 1));
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  overflow: hidden;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* Views */
+.view-container {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+/* Main View — now uses CSS Grid via AppLayout */
+.main-view {
+  display: flex;
+  flex-direction: column;
+}
+
+.channels-sidebar {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  overflow: hidden;
+}
+
+.channels-sidebar-header h3 {
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.main-content {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.main-content__body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.main-content__body--with-side-chat {
+  flex-direction: row;
+}
+
+.main-content__primary {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ─── Vertical Voice Text Chat Side Panel ───────────────────────── */
+
+.main-content__side-resize {
+  width: 6px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--bg-secondary);
+}
+
+.main-content__side-resize-grip {
+  width: 3px;
+  height: 40px;
+  border-radius: 2px;
+  background-color: var(--border-color);
+  transition: background-color 0.15s ease;
+}
+
+.main-content__side-resize:hover .main-content__side-resize-grip {
+  background-color: var(--text-muted);
+}
+
+.main-content__side-chat {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-left: 1px solid var(--border-color);
+  background-color: var(--bg-primary);
+}
+
+.main-content-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: calc(40px * var(--sp, 1));
+  text-align: center;
+}
+
+.empty-server-graphic {
+  color: var(--text-muted);
+  opacity: 0.4;
+  margin-bottom: calc(16px * var(--sp, 1));
+}
+
+.empty-server-hint {
+  color: var(--text-secondary);
+}
+
+.main-content h2 {
+  font-size: calc(24px * var(--font-scale, 1));
+  margin-bottom: calc(8px * var(--sp, 1));
+}
+
+.main-content p {
+  color: var(--text-secondary);
+  font-size: calc(15px * var(--font-scale, 1));
+}
+
+.sidebar-section {
+  width: 100%;
+  margin-bottom: calc(24px * var(--sp, 1));
+}
+
+.sidebar-section h3 {
+  font-size: calc(12px * var(--font-scale, 1));
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: calc(8px * var(--sp, 1));
+  font-weight: 600;
+}
+
+.placeholder-text {
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-muted);
+  font-style: italic;
+  margin-top: calc(8px * var(--sp, 1));
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--bg-hover);
+}
+
+/* Font-scale responsive spacing for text-adjacent elements */
+
+/* Buttons */
+.login-form button,
+.login-form button.secondary,
+.auth-placeholder button,
+.login-submit-btn,
+.login-back-btn,
+.register-submit-btn,
+.register-back-btn,
+.server-connect-btn,
+.server-back-btn,
+.connection-continue,
+.create-server-cancel-btn,
+.create-server-submit-btn,
+.profile-cancel-btn,
+.profile-save-btn,
+.profile-password-btn,
+.session-revoke-btn,
+.sessions-revoke-all-btn,
+.btn-edit-cancel,
+.btn-edit-save,
+.scroll-to-bottom,
+.settings-back-btn,
+.profile-link-add {
+  padding: calc(12px * var(--sp, 1)) calc(20px * var(--sp, 1));
+}
+
+/* Inputs */
+.login-form input,
+.form-input,
+.server-url-input,
+.message-edit-input {
+  padding: calc(12px * var(--sp, 1)) calc(16px * var(--sp, 1));
+}
+
+/* Menu items & nav */
+.user-popover-item,
+.message-option,
+.context-menu-item,
+.settings-nav-item {
+  padding: calc(10px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  gap: calc(10px * var(--sp, 1));
+}
+
+/* Badges & pills */
+.settings-nav-badge,
+.session-card-badge {
+  padding: calc(2px * var(--sp, 1)) calc(6px * var(--sp, 1));
+}
+
+/* Settings sections */
+.settings-row {
+  padding: calc(12px * var(--sp, 1)) 0;
+}
+
+/* Error banners */
+.form-error-banner,
+.settings-error {
+  padding: calc(12px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  gap: calc(12px * var(--sp, 1));
+}
+
+/* Session cards */
+.session-card {
+  padding: calc(16px * var(--sp, 1));
+  gap: calc(16px * var(--sp, 1));
+}
+
+/* Popover */
+.user-popover-header {
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  gap: calc(10px * var(--sp, 1));
+}
+
+/* Tooltip */
+.info-tooltip-popup {
+  padding: calc(12px * var(--sp, 1)) calc(14px * var(--sp, 1));
+}
+
+/* ─── External-link styling (closes #800) ───────────────────────────────────
+ *
+ * Anchors that target a new window (target="_blank") are, by Concord
+ * convention, links to externally-hosted resources — chat-rendered URLs via
+ * Markdown's SafeLink, user-profile "Links" cards, and the ForceUpdateOverlay
+ * manual-download link are the current consumers. Before this rule, those
+ * anchors fell through to the user-agent's default ~#0000ee link blue, which
+ * is effectively invisible against the dark Concord palette.
+ *
+ * The styling is intentionally global on `a[target="_blank"]` (not scoped
+ * to a parent class) so any future surface rendering an external link picks
+ * up the theme-aware treatment for free. Internal navigation anchors don't
+ * carry target="_blank" and stay unaffected.
+ *
+ * Tokens `--link-color` and `--link-color-hover` were added to all 26 theme
+ * blocks by PR #1076 (design-token taxonomy, #1033) — this rule is the
+ * consumer that finally puts those tokens to work. Each color scheme can
+ * override them independently; the default initial value aliases to the
+ * accent family. Underline is always-on (relying on color alone would fail
+ * WCAG 1.4.1 contrast-only semantics).
+ * `:visited` is intentionally not differentiated even though the
+ * `--link-color-visited` token exists in the taxonomy. Two reasons: CSS
+ * locks `:visited` styling to a tiny property whitelist for history-leak
+ * prevention, and most modern chat apps don't distinguish visited links to
+ * avoid stale-feeling URLs in conversation. The token stays defined so a
+ * future surface (e.g., a docs viewer) can opt into a visited variant
+ * without re-establishing the taxonomy.
+ *
+ * Exemption: `.update-security-banner__cta` is excluded from the global
+ * color rule. The security update banner uses `color: inherit` so its CTA
+ * picks up the banner's local foreground (white-on-critical-red), which
+ * is the only readable choice against the danger-tinted background. The
+ * banner's own CSS already specifies the underline, so visually nothing
+ * changes — we just stop fighting its deliberate color decision. */
+a[target='_blank']:not(.update-security-banner__cta) {
+  color: var(--link-color);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  transition: color 0.15s ease;
+}
+
+a[target='_blank']:not(.update-security-banner__cta):hover {
+  color: var(--link-color-hover);
+}
+
+/* ─── High Contrast Mode (#489) ──────────────────────────────────────────────
+ *
+ * Declared at the END of the cascade so it wins over every scheme-specific
+ * block ([data-scheme='X']) at the same specificity. The override replaces
+ * the entire color palette with a stark, accessibility-first set: pure
+ * black/white backgrounds + text, saturated primary/secondary accents that
+ * meet WCAG AAA (≥7:1) on both backgrounds. Brand identity is
+ * intentionally discarded — high contrast is for users who need
+ * legibility, not aesthetics.
+ *
+ * Two variants: dark (default) and a `[data-theme='light']` compound for
+ * light mode. The compound has specificity (0,2,0) which beats both the
+ * base `[data-high-contrast='true']` (0,1,0) and any per-scheme light
+ * block (0,2,0 only if the scheme block also matches — but no scheme
+ * block carries `data-high-contrast`, so the compound here wins by source
+ * order at equal specificity).
+ *
+ * Focus indicators are also boosted (3px outline) since the standard
+ * 2px ring can be hard to perceive for users who need HCM.
+ */
+[data-high-contrast='true'] {
+  --bg-primary: #000000;
+  --bg-secondary: #000000;
+  --bg-tertiary: #1a1a1a;
+  --text-primary: #ffffff;
+  --text-secondary: #ffffff;
+  --text-muted: #cccccc;
+  --text-tertiary: #cccccc;
+  --accent-primary: #ffff00;
+  --accent-secondary: #00ffff;
+  --accent-hover: #ffff80;
+  --accent-color: #ffff00;
+  --gradient-brand: linear-gradient(90deg, #ffff00 0%, #00ffff 100%);
+  --success: #00ff00;
+  --danger: #ff4040;
+  --border-color: #ffffff;
+  --error-color: #ff4040;
+  --success-color: #00ff00;
+  --bg-hover: #333333;
+  --bg-active: #4d4d4d;
+  --on-accent: #000000;
+  --danger-hover: #ff8080;
+  --status-connected: #00ff00;
+  --status-connecting: #ffff00;
+  --status-disconnected: #ff4040;
+  --text-warning-strong: #ffff00;
+  --text-error-strong: #ff4040;
+  --link-color: #ffff00;
+  --link-color-hover: #ffff80;
+  --link-color-visited: #00ffff;
+}
+
+[data-high-contrast='true'][data-theme='light'] {
+  --bg-primary: #ffffff;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #f0f0f0;
+  --text-primary: #000000;
+  --text-secondary: #000000;
+  --text-muted: #333333;
+  --text-tertiary: #333333;
+  --accent-primary: #0000cc;
+  --accent-secondary: #800080;
+  --accent-hover: #0000a0;
+  --accent-color: #0000cc;
+  --gradient-brand: linear-gradient(90deg, #0000cc 0%, #800080 100%);
+  --success: #006600;
+  --danger: #cc0000;
+  --border-color: #000000;
+  --error-color: #cc0000;
+  --success-color: #006600;
+  --bg-hover: #e0e0e0;
+  --bg-active: #c0c0c0;
+  --on-accent: #ffffff;
+  --danger-hover: #990000;
+  --status-connected: #006600;
+  --status-connecting: #cc6600;
+  --status-disconnected: #cc0000;
+  --text-warning-strong: #806600;
+  --text-error-strong: #cc0000;
+  --link-color: #0000cc;
+  --link-color-hover: #0000a0;
+  --link-color-visited: #800080;
+}
+
+[data-high-contrast='true'] *:focus-visible {
+  outline: 3px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* Application-font override (Settings ▸ Appearance ▸ Fonts).
+   The body font is hardcoded (not token-driven — `--font-body-stack` is currently
+   an unconsumed token owned by the theme-font work in #1643), so override the body
+   font-family directly. `[data-appfont='…'] body` outranks the bare `body` rule by
+   specificity. Body/UI text only — brand/heading surfaces keep var(--font-display-stack).
+   `data-appfont` reflects the RESOLVED font (utils/effectiveFont.ts); 'default' has no
+   rule, so the base body stack stands. Self-hosted faces only (no CDN). See
+   [internal]specs/2026-06-18-1642-appearance-fonts-foundation-design.md §3.5. */
+[data-appfont='system'] body {
+  font-family:
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    'Roboto',
+    'Helvetica Neue',
+    'Arial',
+    'Noto Sans',
+    sans-serif;
+}
+[data-appfont='opendyslexic'] body {
+  font-family: 'OpenDyslexic', 'SourceSans', sans-serif;
+}
+[data-appfont='inter'] body {
+  font-family: 'Inter', 'SourceSans', sans-serif;
+}
+[data-appfont='lexend'] body {
+  font-family: 'Lexend', 'SourceSans', sans-serif;
+}
+[data-appfont='lato'] body {
+  font-family: 'Lato', 'SourceSans', sans-serif;
+}
+[data-appfont='atkinson'] body {
+  font-family: 'Atkinson Hyperlegible Next', 'SourceSans', sans-serif;
+}

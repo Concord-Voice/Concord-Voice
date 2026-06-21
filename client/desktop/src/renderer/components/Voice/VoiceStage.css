@@ -1,0 +1,268 @@
+/* ─── Voice Stage (Mode B — center stage for screen shares) ─────── */
+
+.voice-stage {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #000;
+  min-height: 200px;
+  overflow: hidden;
+}
+
+.voice-stage--empty {
+  background-color: var(--bg-secondary);
+}
+
+.voice-stage__empty-text {
+  color: var(--text-muted);
+  font-size: calc(14px * var(--font-scale, 1));
+}
+
+/* ─── Single video cell ───────────────────────────────────────── */
+
+.voice-stage__cell {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.voice-stage__video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.voice-stage__cell-overlay {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 6px 12px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.7));
+  pointer-events: none;
+}
+
+/* ─── Bottom Overlay (focus mode) ─────────────────────────────── */
+
+.voice-stage__overlay {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.7));
+  pointer-events: none;
+}
+
+.voice-stage__sharer-name {
+  color: #fff;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 500;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+
+.voice-stage__count {
+  color: rgba(255, 255, 255, 0.7);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+/* ─── Equal Mode: Grid ────────────────────────────────────────── */
+
+.voice-stage--equal {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  background-color: #000;
+  min-height: 200px;
+  overflow: hidden;
+}
+
+.voice-stage__grid {
+  flex: 1;
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  height: 100%;
+}
+
+/* Dynamic grid columns based on stream count */
+.voice-stage__grid[data-count='1'] {
+  grid-template-columns: 1fr;
+}
+
+.voice-stage__grid[data-count='2'] {
+  grid-template-columns: 1fr 1fr;
+}
+
+.voice-stage__grid[data-count='3'] {
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+
+/* 3rd cell spans full width on second row */
+.voice-stage__grid[data-count='3'] .voice-stage__cell:nth-child(3) {
+  grid-column: 1 / -1;
+}
+
+.voice-stage__grid[data-count='4'] {
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+
+.voice-stage__grid[data-count='5'] {
+  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+
+/* 4th and 5th cells on second row: center the 2 remaining under 3 */
+.voice-stage__grid[data-count='5'] .voice-stage__cell:nth-child(4) {
+  grid-column: 1 / 2;
+}
+
+.voice-stage__grid[data-count='5'] .voice-stage__cell:nth-child(5) {
+  grid-column: 2 / 3;
+}
+
+/* ─── Layout Toggle Button (top-left) ─────────────────────────── */
+
+.voice-stage__layout-toggle {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition:
+    opacity 200ms ease,
+    background 150ms ease;
+  z-index: 2;
+}
+
+.voice-stage:hover .voice-stage__layout-toggle,
+.voice-stage--equal:hover .voice-stage__layout-toggle {
+  opacity: 1;
+}
+
+.voice-stage__layout-toggle:hover {
+  background: rgba(0, 0, 0, 0.75);
+}
+
+/* ─── Navigation Buttons (focus mode) ─────────────────────────── */
+
+.voice-stage__nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition:
+    opacity 200ms ease,
+    background 150ms ease;
+}
+
+.voice-stage:hover .voice-stage__nav {
+  opacity: 1;
+}
+
+.voice-stage__nav:hover {
+  background: rgba(0, 0, 0, 0.75);
+}
+
+.voice-stage__nav--prev {
+  left: 12px;
+}
+
+.voice-stage__nav--next {
+  right: 12px;
+}
+
+/* ─── PiP Button (focus mode, top-right) ──────────────────────── */
+
+.voice-stage__pip-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition:
+    opacity 200ms ease,
+    background 150ms ease;
+}
+
+.voice-stage:hover .voice-stage__pip-btn {
+  opacity: 1;
+}
+
+.voice-stage__pip-btn:hover {
+  background: rgba(0, 0, 0, 0.75);
+}
+
+.voice-stage__pip-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+/* ─── Paused Placeholder (auto-pause active, stream still live) ── */
+
+.voice-stage__paused-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 100%;
+  padding: 24px;
+  text-align: center;
+  background-color: var(--bg-secondary, #1a1a2e);
+}
+
+.voice-stage__paused-title {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary, #e0e0e0);
+}
+
+.voice-stage__paused-hint {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted, #888);
+  line-height: 1.4;
+  max-width: 340px;
+}

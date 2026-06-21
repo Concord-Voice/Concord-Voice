@@ -1,0 +1,294 @@
+.message-input-container {
+  border-top: 1px solid var(--border-color);
+  background-color: var(--bg-primary);
+  padding: calc(14px * var(--sp, 1)) calc(16px * var(--sp, 1));
+}
+
+/* E2EE status bar — always visible above the message input */
+.e2ee-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  margin-bottom: 6px;
+  font-size: calc(12px * var(--font-scale, 1));
+  border-radius: 4px;
+}
+
+.e2ee-status-bar.encrypted {
+  color: var(--success, #4caf50);
+  background-color: rgba(76, 175, 80, 0.08);
+}
+
+.message-input-wrapper {
+  max-width: 100%;
+}
+
+.message-input-box {
+  display: flex;
+  align-items: center;
+  gap: calc(10px * var(--sp, 1));
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  transition: border-color 0.15s ease;
+}
+
+.message-input-box:focus-within {
+  border-color: var(--accent-primary);
+}
+
+.message-input-textarea {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(14px * var(--font-scale, 1));
+  line-height: 1.25;
+  resize: none;
+  outline: none;
+  overflow-y: auto;
+  height: auto;
+}
+
+.message-input-textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.message-input-textarea:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.message-input-actions {
+  display: flex;
+  align-items: center;
+  align-self: flex-end;
+  gap: calc(8px * var(--sp, 1));
+}
+
+.encryption-toggle {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: calc(6px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  cursor: pointer;
+  font-size: calc(16px * var(--font-scale, 1));
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.6;
+}
+
+.encryption-toggle:hover {
+  opacity: 1;
+  border-color: var(--accent-primary);
+}
+
+.encryption-toggle.active {
+  opacity: 1;
+  background-color: rgba(250, 112, 154, 0.1);
+  border-color: var(--accent-primary);
+}
+
+.char-counter {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 40px;
+  text-align: right;
+}
+
+.char-counter.warning {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.send-button {
+  background: var(--gradient-brand);
+  border: none;
+  border-radius: 6px;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  color: var(--bg-primary);
+  flex-shrink: 0;
+}
+
+.send-button:hover:not(:disabled) {
+  transform: scale(1.05);
+  box-shadow: 0 4px 12px rgba(250, 112, 154, 0.4);
+}
+
+.send-button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.send-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.message-input-hints {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: calc(8px * var(--sp, 1));
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  gap: calc(16px * var(--sp, 1));
+  flex-wrap: wrap;
+}
+
+.hint {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+kbd {
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-family: monospace;
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-secondary);
+}
+
+.message-input-extras {
+  display: flex;
+  align-items: center;
+  gap: calc(6px * var(--sp, 1));
+  margin-right: calc(8px * var(--sp, 1));
+}
+
+.encryption-hint {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent-primary);
+  margin-right: 4px;
+}
+
+.encryption-hint svg {
+  color: var(--accent-primary);
+}
+
+.media-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 3px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.media-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  background-color: var(--bg-tertiary);
+}
+
+.media-btn.active {
+  color: var(--accent-primary);
+  background-color: var(--bg-tertiary);
+}
+
+.media-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ─── User Panel inline in message input ─────────────────────────────────── */
+
+.message-input-user-panel {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+/* Scrollbar styling for textarea */
+.message-input-textarea::-webkit-scrollbar {
+  width: 8px;
+}
+
+.message-input-textarea::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.message-input-textarea::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 4px;
+}
+
+.message-input-textarea::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* ─── Markdown hint + help icon ─────────────────────────────────────────── */
+
+.input-hint {
+  font-size: 0.8rem;
+  color: var(--text-secondary, #666);
+  padding: 4px 8px 0 8px;
+}
+
+.input-hint .help-icon {
+  background: none;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 50%;
+  width: 16px;
+  height: 16px;
+  font-size: 0.7rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  margin-left: 4px;
+  vertical-align: middle;
+  transition:
+    color 0.2s ease,
+    background-color 0.2s ease,
+    border-color 0.2s ease;
+}
+
+.input-hint .help-icon:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-color: var(--text-muted);
+}
+
+.input-hint .help-icon:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* ─── 24000-char capacity counter ───────────────────────────────────────── */
+
+.counter {
+  font-size: 0.78rem;
+  color: var(--text-secondary, #666);
+  margin-right: 8px;
+}
+
+.counter.warn {
+  color: var(--warning, #c27800);
+}
+
+.counter.error {
+  color: var(--error, #c72a28);
+  font-weight: 600;
+}

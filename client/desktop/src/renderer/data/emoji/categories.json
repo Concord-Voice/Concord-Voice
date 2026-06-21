@@ -1,0 +1,65 @@
+[
+  {
+    "id": "smileys",
+    "name": "Smileys & Emotion",
+    "icon": "😀",
+    "file": "smileys.json",
+    "count": 169
+  },
+  {
+    "id": "people",
+    "name": "People & Body",
+    "icon": "👋",
+    "file": "people.json",
+    "count": 386
+  },
+  {
+    "id": "animals",
+    "name": "Animals & Nature",
+    "icon": "🐱",
+    "file": "animals.json",
+    "count": 159
+  },
+  {
+    "id": "food",
+    "name": "Food & Drink",
+    "icon": "🍎",
+    "file": "food.json",
+    "count": 131
+  },
+  {
+    "id": "travel",
+    "name": "Travel & Places",
+    "icon": "🚗",
+    "file": "travel.json",
+    "count": 218
+  },
+  {
+    "id": "activities",
+    "name": "Activities",
+    "icon": "⚽",
+    "file": "activities.json",
+    "count": 85
+  },
+  {
+    "id": "objects",
+    "name": "Objects",
+    "icon": "💡",
+    "file": "objects.json",
+    "count": 264
+  },
+  {
+    "id": "symbols",
+    "name": "Symbols",
+    "icon": "❤️",
+    "file": "symbols.json",
+    "count": 224
+  },
+  {
+    "id": "flags",
+    "name": "Flags",
+    "icon": "🏁",
+    "file": "flags.json",
+    "count": 270
+  }
+]

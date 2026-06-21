@@ -1,0 +1,1747 @@
+/* ─── Conversation List (left panel) ──────────────────────────────────── */
+
+.conversation-list {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background-color: var(--bg-secondary);
+  overflow-y: auto;
+}
+
+.conversation-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.conversation-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.conversation-list::-webkit-scrollbar-thumb {
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+}
+
+.conversation-list::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* Search bar */
+.conversation-search {
+  display: flex;
+  align-items: center;
+  gap: calc(6px * var(--sp, 1));
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+}
+
+.conversation-search input {
+  width: 100%;
+  padding: calc(6px * var(--sp, 1)) calc(10px * var(--sp, 1));
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.conversation-search input::placeholder {
+  color: var(--text-muted);
+}
+
+.conversation-search input:focus {
+  border-color: var(--accent-primary);
+}
+
+/* Conversation items */
+.conversation-item {
+  display: flex;
+  align-items: center;
+  padding: calc(10px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  margin: calc(2px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+  gap: calc(10px * var(--sp, 1));
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  width: calc(100% - calc(16px * var(--sp, 1)));
+  text-align: left;
+}
+
+.conversation-item:hover {
+  background-color: var(--bg-tertiary);
+}
+
+.conversation-item.active {
+  background-color: var(--bg-tertiary);
+  border-left: 3px solid var(--accent-primary);
+  border-right: 3px solid var(--accent-primary);
+  padding-left: calc(9px * var(--sp, 1));
+  padding-right: calc(9px * var(--sp, 1));
+}
+
+/* Avatar */
+.conversation-avatar {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--bg-tertiary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.conversation-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.conversation-avatar-initial {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.conversation-avatar .member-status-dot {
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--bg-secondary);
+}
+
+/* Group avatar — overlapping circles */
+.conversation-avatar.group {
+  border-radius: 8px;
+}
+
+/* Content area */
+.conversation-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.conversation-top-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: calc(6px * var(--sp, 1));
+}
+
+.conversation-name {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-item.unread .conversation-name {
+  font-weight: 700;
+}
+
+.conversation-time {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.conversation-bottom-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: calc(6px * var(--sp, 1));
+}
+
+.conversation-preview {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.conversation-item.unread .conversation-preview {
+  color: var(--text-primary);
+}
+
+.conversation-badges {
+  display: flex;
+  align-items: center;
+  gap: calc(4px * var(--sp, 1));
+  flex-shrink: 0;
+}
+
+.conversation-draft-indicator {
+  display: flex;
+  align-items: center;
+  color: var(--text-muted);
+  opacity: 0.7;
+  margin-right: 4px;
+  flex-shrink: 0;
+}
+
+.conversation-unread-badge {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.conversation-missed-call {
+  color: var(--status-disconnected);
+  display: flex;
+  align-items: center;
+}
+
+/* In-call indicator (#1209 F5 + #1219 R6). The base class styles the 1:1 🔊
+   badge; the `.group` modifier styles the multi-participant "N of M in call"
+   tally as a small, muted, theme-aware pill. */
+.conversation-in-call-badge {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+.conversation-in-call-badge.group {
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+/* Empty state */
+.conversation-list-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: calc(40px * var(--sp, 1)) calc(20px * var(--sp, 1));
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.conversation-list-empty p {
+  font-size: calc(13px * var(--font-scale, 1));
+  margin-top: calc(8px * var(--sp, 1));
+}
+
+/* ─── DM Chat Area ───────────────────────────────────────────────────── */
+
+.dm-chat-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-height: 0;
+  color: var(--text-muted);
+  gap: calc(12px * var(--sp, 1));
+  padding: calc(24px * var(--sp, 1));
+  text-align: center;
+  user-select: none;
+}
+
+.dm-chat-empty-icon {
+  color: var(--text-muted);
+  opacity: 0.4;
+}
+
+.dm-chat-empty h3 {
+  font-size: calc(18px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.dm-chat-empty p {
+  font-size: calc(14px * var(--font-scale, 1));
+  color: var(--text-muted);
+  max-width: 320px;
+}
+
+/* DM chat header */
+.dm-chat-header {
+  display: flex;
+  align-items: center;
+  gap: calc(10px * var(--sp, 1));
+  padding: calc(10px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+}
+
+.dm-chat-header-name {
+  font-size: calc(15px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.dm-chat-header-status {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+/* DM chat placeholder body */
+.dm-chat-placeholder {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.dm-chat-placeholder-body {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: calc(14px * var(--font-scale, 1));
+}
+
+.dm-chat-placeholder-input {
+  padding: calc(12px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  border-top: 1px solid var(--border-color);
+}
+
+.dm-chat-placeholder-input input {
+  width: 100%;
+  padding: calc(10px * var(--sp, 1)) calc(14px * var(--sp, 1));
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  outline: none;
+}
+
+.dm-chat-placeholder-input input::placeholder {
+  color: var(--text-muted);
+}
+
+/* ─── Friends List (right panel) ─────────────────────────────────────── */
+
+.friends-list {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  background-color: var(--bg-secondary);
+  border-left: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: calc(12px * var(--sp, 1));
+}
+
+.friends-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.friends-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.friends-list::-webkit-scrollbar-thumb {
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+}
+
+.friends-list::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* Header */
+.friends-list-header h3 {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* Friend category */
+.friend-category {
+  margin-bottom: calc(12px * var(--sp, 1));
+}
+
+.friend-category-header {
+  display: flex;
+  align-items: center;
+  gap: calc(4px * var(--sp, 1));
+  padding: calc(4px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  margin-bottom: calc(4px * var(--sp, 1));
+  cursor: pointer;
+  border-radius: 4px;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  width: 100%;
+  text-align: left;
+}
+
+.friend-category-header:hover {
+  background-color: var(--bg-tertiary);
+}
+
+.friend-category-header span {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.friend-category-count {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+/* Friend items — reuse member-item pattern */
+.friend-item {
+  display: flex;
+  align-items: center;
+  padding: calc(6px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  margin: 1px 0;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  width: 100%;
+  text-align: left;
+}
+
+.friend-item:hover {
+  background-color: var(--bg-tertiary);
+}
+
+.friend-item.offline {
+  opacity: 0.45;
+}
+
+.friend-item.offline:hover {
+  opacity: 0.75;
+}
+
+/* Friends list header layout */
+.friends-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 calc(8px * var(--sp, 1));
+  margin-bottom: calc(12px * var(--sp, 1));
+}
+
+/* Add friend button in header */
+.friends-add-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  background: var(--bg-tertiary);
+  border: none;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.friends-add-btn:hover {
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+}
+
+/* Friends-list header action group (Manage categories + Add friend) */
+.friends-list-header-actions {
+  display: flex;
+  align-items: center;
+  gap: calc(4px * var(--sp, 1));
+}
+
+/* Category emoji shown in the section header (#324) */
+.friend-category-header .category-item-emoji {
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1;
+  /* override the uppercase/letter-spacing the header applies to its <span>s */
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+/* Section header row: drag handle + collapsible header (#324) */
+.friend-category-header-row {
+  display: flex;
+  align-items: center;
+}
+
+.friend-category-header-row .friend-category-header {
+  flex: 1;
+  width: auto;
+}
+
+/* Drag handle for keyboard/pointer section reorder */
+.friend-category-drag-handle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: calc(4px * var(--sp, 1));
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: grab;
+  border-radius: 4px;
+  opacity: 0;
+  transition:
+    opacity 0.15s ease,
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.friend-category:hover .friend-category-drag-handle,
+.friend-category-drag-handle:focus-visible {
+  opacity: 1;
+}
+
+.friend-category-drag-handle:hover {
+  color: var(--text-secondary);
+  background-color: var(--bg-tertiary);
+}
+
+.friend-category-drag-handle[aria-pressed='true'] {
+  opacity: 1;
+  color: var(--accent-fill);
+  background-color: var(--bg-tertiary);
+}
+
+.friend-category-dragging {
+  opacity: 0.5;
+}
+
+.friend-category-grabbed {
+  outline: 2px solid var(--accent-fill);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+
+/* Visually-hidden live region for keyboard-reorder announcements */
+.friends-list .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ─── Personal Thread (pinned entry) ────────────────────────────────── */
+
+.conversation-item.personal-thread {
+  padding: calc(6px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  gap: calc(8px * var(--sp, 1));
+  margin: calc(2px * var(--sp, 1)) calc(8px * var(--sp, 1));
+}
+
+.personal-thread-avatar {
+  width: 28px !important;
+  height: 28px !important;
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+}
+
+.personal-thread-name {
+  font-size: calc(13px * var(--font-scale, 1)) !important;
+}
+
+.personal-thread-divider {
+  height: 1px;
+  background: var(--border-color);
+  margin: calc(4px * var(--sp, 1)) calc(8px * var(--sp, 1));
+}
+
+/* ─── Add Friend Modal ──────────────────────────────────────────────── */
+
+.add-friend-modal {
+  display: flex;
+  flex-direction: column;
+  gap: calc(16px * var(--sp, 1));
+}
+
+.add-friend-section {
+  display: flex;
+  flex-direction: column;
+  gap: calc(10px * var(--sp, 1));
+}
+
+.add-friend-section-title {
+  display: flex;
+  align-items: center;
+  gap: calc(6px * var(--sp, 1));
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 0;
+}
+
+.add-friend-divider {
+  height: 1px;
+  background: var(--border-color);
+  margin: calc(4px * var(--sp, 1)) 0;
+}
+
+.add-friend-input {
+  width: 100%;
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  outline: none;
+  transition: border-color 0.15s ease;
+  box-sizing: border-box;
+}
+
+.add-friend-input::placeholder {
+  color: var(--text-muted);
+}
+
+.add-friend-input:focus {
+  border-color: var(--accent-primary);
+}
+
+.add-friend-code-input-row {
+  display: flex;
+  gap: calc(8px * var(--sp, 1));
+}
+
+.add-friend-error {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--status-disconnected);
+  padding: calc(4px * var(--sp, 1)) 0;
+}
+
+.add-friend-success {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--status-connected);
+  padding: calc(4px * var(--sp, 1)) 0;
+}
+
+/* Friend code preview card */
+.friend-code-preview,
+.search-result-item {
+  display: flex;
+  align-items: center;
+  gap: calc(10px * var(--sp, 1));
+  padding: calc(8px * var(--sp, 1)) calc(10px * var(--sp, 1));
+  background: var(--bg-tertiary);
+  border-radius: 6px;
+}
+
+.friend-code-preview-name,
+.search-result-name {
+  flex: 1;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-result-username {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  margin-left: calc(6px * var(--sp, 1));
+  font-weight: 400;
+}
+
+.add-friend-action-btn {
+  display: flex;
+  align-items: center;
+  gap: calc(4px * var(--sp, 1));
+  padding: calc(6px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: 4px;
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+  flex-shrink: 0;
+}
+
+.add-friend-action-btn:hover {
+  opacity: 0.85;
+}
+
+.add-friend-action-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Code generation options */
+.add-friend-options {
+  display: flex;
+  gap: calc(12px * var(--sp, 1));
+  flex-wrap: wrap;
+}
+
+.add-friend-option-group {
+  display: flex;
+  flex-direction: column;
+  gap: calc(4px * var(--sp, 1));
+}
+
+.add-friend-option-group label {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.add-friend-option-group select {
+  padding: calc(4px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  outline: none;
+  cursor: pointer;
+}
+
+.add-friend-option-group select:focus {
+  border-color: var(--accent-primary);
+}
+
+/* Toggle switch for auto-accept */
+.add-friend-toggle {
+  position: relative;
+  width: 38px;
+  height: 20px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.add-friend-toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.add-friend-toggle-track {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  transition: all 0.2s ease;
+}
+
+.add-friend-toggle input:checked + .add-friend-toggle-track {
+  background: var(--accent-fill);
+  border-color: var(--accent-primary);
+}
+
+.add-friend-toggle-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  background: var(--text-primary);
+  border-radius: 50%;
+  transition: transform 0.2s ease;
+  pointer-events: none;
+}
+
+.add-friend-toggle input:checked ~ .add-friend-toggle-thumb {
+  transform: translateX(18px);
+}
+
+/* Generated code display */
+.add-friend-code-display {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--sp, 1));
+  padding: calc(10px * var(--sp, 1)) calc(14px * var(--sp, 1));
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  min-height: 40px;
+}
+
+/* Active codes list */
+.add-friend-active-codes {
+  display: flex;
+  flex-direction: column;
+  gap: calc(6px * var(--sp, 1));
+  margin-top: calc(4px * var(--sp, 1));
+}
+
+.add-friend-active-codes h5 {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 0;
+}
+
+.add-friend-code-item {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--sp, 1));
+  padding: calc(6px * var(--sp, 1)) calc(10px * var(--sp, 1));
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+}
+
+.add-friend-code-item.expired {
+  opacity: 0.45;
+}
+
+.add-friend-code-meta {
+  flex: 1;
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+.add-friend-revoke-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.add-friend-revoke-btn:hover {
+  color: var(--status-disconnected);
+  background: var(--bg-primary);
+}
+
+/* ─── DM Privacy Blocked ────────────────────────────────────────────── */
+
+.dm-privacy-blocked {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: calc(16px * var(--sp, 1));
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.dm-privacy-blocked p {
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-muted);
+  text-align: center;
+  max-width: 500px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+/* Empty state */
+.friends-list-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: calc(24px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  text-align: center;
+}
+
+.friends-list-empty p {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+/* ─── DM Disabled Notice ──────────────────────────────────────────── */
+
+.dm-disabled-notice {
+  padding: 14px 16px;
+  margin: 0 12px 12px;
+  text-align: center;
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+}
+
+/* ─── Friend Request Items ─────────────────────────────────────────── */
+
+.friends-header-badge {
+  margin-left: calc(6px * var(--sp, 1));
+  vertical-align: middle;
+}
+
+.friend-request-item {
+  cursor: default;
+}
+
+.friend-request-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.friend-request-info .member-username {
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+.friend-request-meta {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+.friend-request-actions {
+  display: flex;
+  align-items: center;
+  gap: calc(4px * var(--sp, 1));
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.friend-request-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+  padding: 0;
+}
+
+.friend-request-accept {
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.friend-request-accept:hover:not(:disabled) {
+  background: var(--status-connected);
+  color: var(--bg-primary);
+}
+
+.friend-request-decline {
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.friend-request-decline:hover:not(:disabled) {
+  background: var(--status-disconnected);
+  color: var(--bg-primary);
+}
+
+.friend-request-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.friend-request-outgoing {
+  opacity: 0.65;
+}
+
+.friend-request-pending-label {
+  display: flex;
+  align-items: center;
+  gap: calc(4px * var(--sp, 1));
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+/* Inline spinner for request action buttons */
+.friend-request-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid transparent;
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+/* ─── Create Group Button (in search bar) ─────────────────────────────── */
+
+.create-group-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  background: var(--bg-tertiary);
+  border: none;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.create-group-btn:hover {
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+}
+
+/* ─── Create Group Modal ──────────────────────────────────────────────── */
+
+.create-group-modal-overlay,
+.edit-group-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.create-group-modal,
+.edit-group-modal {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  width: 440px;
+  max-width: 90vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.create-group-modal-header,
+.edit-group-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: calc(14px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  border-bottom: 1px solid var(--border-color);
+}
+
+.create-group-modal-header h3,
+.edit-group-modal-header h3 {
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.create-group-close-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.create-group-close-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.create-group-modal-body,
+.edit-group-modal-body {
+  padding: calc(14px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  display: flex;
+  flex-direction: column;
+  gap: calc(10px * var(--sp, 1));
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.create-group-name-input {
+  width: 100%;
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  outline: none;
+  transition: border-color 0.15s ease;
+  box-sizing: border-box;
+}
+
+.create-group-name-input::placeholder {
+  color: var(--text-muted);
+}
+
+.create-group-name-input:focus {
+  border-color: var(--accent-primary);
+}
+
+/* Selected user chips */
+.create-group-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: calc(6px * var(--sp, 1));
+}
+
+.create-group-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(4px * var(--sp, 1));
+  padding: calc(3px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  background: var(--bg-tertiary);
+  border-radius: 12px;
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-primary);
+}
+
+.create-group-chip button {
+  display: flex;
+  align-items: center;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+  border-radius: 50%;
+  transition: color 0.15s ease;
+}
+
+.create-group-chip button:hover {
+  color: var(--text-primary);
+}
+
+/* Search input */
+.create-group-search {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--sp, 1));
+  padding: calc(6px * var(--sp, 1)) calc(10px * var(--sp, 1));
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  transition: border-color 0.15s ease;
+}
+
+.create-group-search:focus-within {
+  border-color: var(--accent-primary);
+}
+
+.create-group-search-icon {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.create-group-search input {
+  flex: 1;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  outline: none;
+}
+
+.create-group-search input::placeholder {
+  color: var(--text-muted);
+}
+
+.create-group-limit {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  text-align: center;
+  padding: calc(4px * var(--sp, 1)) 0;
+}
+
+/* Search results list */
+.create-group-results {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.create-group-results::-webkit-scrollbar {
+  width: 6px;
+}
+
+.create-group-results::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.create-group-results::-webkit-scrollbar-thumb {
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+}
+
+.create-group-no-results {
+  text-align: center;
+  padding: calc(16px * var(--sp, 1));
+  color: var(--text-muted);
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+.create-group-user-row {
+  display: flex;
+  align-items: center;
+  gap: calc(10px * var(--sp, 1));
+  padding: calc(6px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  border-radius: 4px;
+  transition: background-color 0.15s ease;
+}
+
+.create-group-user-row:hover {
+  background: var(--bg-tertiary);
+}
+
+.create-group-user-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.create-group-user-display {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.create-group-user-username {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+.create-group-add-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: var(--bg-tertiary);
+  border: none;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.create-group-add-btn:hover:not(:disabled) {
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+}
+
+.create-group-add-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.create-group-error {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--status-disconnected);
+  padding: calc(4px * var(--sp, 1)) 0;
+}
+
+.create-group-modal-footer,
+.edit-group-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: calc(8px * var(--sp, 1));
+  padding: calc(12px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  border-top: 1px solid var(--border-color);
+}
+
+.create-group-create-btn {
+  padding: calc(8px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: 4px;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.create-group-create-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.create-group-create-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ─── Edit Group Modal ────────────────────────────────────────────────── */
+
+.edit-group-label {
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.edit-group-cancel-btn {
+  padding: calc(8px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: none;
+  border-radius: 4px;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.edit-group-cancel-btn:hover {
+  background: var(--bg-primary);
+}
+
+/* ─── DM Chat Area Wrapper (chat + group info side panel) ─────────────── */
+
+.dm-chat-area-wrapper {
+  display: flex;
+  height: 100%;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Group info toggle in chat header */
+.dm-chat-header-group-info-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.dm-chat-header-group-info-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* Join voice call header affordance (#1219 R5). Accent-styled pill so an
+   active group call the user isn't in reads as an invitation, not a passive
+   icon. Theme-aware via CSS custom properties. */
+.dm-chat-header-join-call-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  background: var(--accent, var(--bg-tertiary));
+  border: none;
+  border-radius: 16px;
+  color: var(--text-on-accent, #fff);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition:
+    background-color 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.dm-chat-header-join-call-btn:hover {
+  opacity: 0.85;
+}
+
+/* ─── Group Info Panel (right side) ───────────────────────────────────── */
+
+.group-info-panel {
+  width: 280px;
+  flex-shrink: 0;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.group-info-panel::-webkit-scrollbar {
+  width: 6px;
+}
+
+.group-info-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.group-info-panel::-webkit-scrollbar-thumb {
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+}
+
+.group-info-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: calc(10px * var(--sp, 1)) calc(14px * var(--sp, 1));
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.group-info-header h3 {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.group-info-close-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.group-info-close-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.group-info-body {
+  padding: calc(14px * var(--sp, 1));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: calc(10px * var(--sp, 1));
+}
+
+.group-info-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 12px;
+  background: var(--bg-tertiary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.group-info-icon span {
+  font-size: calc(22px * var(--font-scale, 1));
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.group-info-name-row {
+  display: flex;
+  align-items: center;
+  gap: calc(6px * var(--sp, 1));
+}
+
+.group-info-name {
+  font-size: calc(15px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+  text-align: center;
+  word-break: break-word;
+}
+
+.group-info-edit-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  flex-shrink: 0;
+  transition: color 0.15s ease;
+}
+
+.group-info-edit-btn:hover {
+  color: var(--accent-primary);
+}
+
+.group-info-member-count {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+.group-info-error {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--status-disconnected);
+  text-align: center;
+  padding: calc(4px * var(--sp, 1)) 0;
+  width: 100%;
+}
+
+/* Member list */
+.group-info-members {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: calc(6px * var(--sp, 1));
+}
+
+.group-info-members-title {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 0 0 calc(6px * var(--sp, 1)) 0;
+}
+
+/* ─── Group Member Item ───────────────────────────────────────────────── */
+
+.group-member-item {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--sp, 1));
+  padding: calc(6px * var(--sp, 1)) calc(6px * var(--sp, 1));
+  border-radius: 4px;
+  transition: background-color 0.15s ease;
+}
+
+.group-member-item:hover {
+  background: var(--bg-tertiary);
+}
+
+.group-member-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.group-member-name {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-member-you {
+  font-weight: 400;
+  color: var(--text-muted);
+  font-size: calc(11px * var(--font-scale, 1));
+}
+
+.group-member-username {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+.group-member-role-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+  border-radius: 8px;
+  font-size: calc(10px * var(--font-scale, 1));
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+/* Member actions dropdown */
+.group-member-actions {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.group-member-menu-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.group-member-menu-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-primary);
+}
+
+.group-member-menu {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  width: 180px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  z-index: 100;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+
+.group-member-menu-item {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--sp, 1));
+  padding: calc(6px * var(--sp, 1)) calc(10px * var(--sp, 1));
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+  text-align: left;
+  width: 100%;
+}
+
+.group-member-menu-item:hover {
+  background: var(--bg-tertiary);
+}
+
+.group-member-menu-item-danger {
+  color: var(--status-disconnected);
+}
+
+.group-member-menu-item-danger:hover {
+  background: rgba(255, 70, 70, 0.1);
+}
+
+/* Action buttons at bottom */
+.group-info-actions {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: calc(6px * var(--sp, 1));
+  margin-top: calc(12px * var(--sp, 1));
+  padding-top: calc(12px * var(--sp, 1));
+  border-top: 1px solid var(--border-color);
+}
+
+.group-info-action-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: calc(6px * var(--sp, 1));
+  padding: calc(8px * var(--sp, 1));
+  border: none;
+  border-radius: 4px;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    opacity 0.15s ease;
+  width: 100%;
+}
+
+.group-info-leave-btn {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.group-info-leave-btn:hover {
+  background: var(--bg-primary);
+}
+
+.group-info-delete-btn {
+  background: transparent;
+  color: var(--status-disconnected);
+}
+
+.group-info-delete-btn:hover {
+  background: rgba(255, 70, 70, 0.1);
+}

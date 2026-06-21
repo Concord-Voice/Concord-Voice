@@ -1,0 +1,207 @@
+/* ─── PiP Window ──────────────────────────────────────────────── */
+
+.pip-window {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100vh;
+  background-color: var(--bg-primary, #1e1f22);
+  color: var(--text-primary, #dbdee1);
+  overflow: hidden;
+  user-select: none;
+}
+
+.pip-window--screen {
+  background-color: #000;
+}
+
+.pip-window--controls {
+  background-color: var(--bg-secondary, #2b2d31);
+}
+
+/* ─── PiP Header ──────────────────────────────────────────────── */
+
+.pip-header {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  background-color: var(--bg-secondary, #2b2d31);
+  flex-shrink: 0;
+}
+
+.pip-header__drag {
+  flex: 1;
+  height: 24px;
+  -webkit-app-region: drag;
+  cursor: grab;
+}
+
+.pip-header__btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted, #949ba4);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  transition:
+    background 150ms ease,
+    color 150ms ease;
+}
+
+.pip-header__btn:hover {
+  background-color: var(--bg-hover, #35373c);
+  color: var(--text-primary, #dbdee1);
+}
+
+.pip-header__btn--active {
+  color: var(--accent-primary, #5865f2);
+}
+
+.pip-header__btn--active:hover {
+  color: var(--accent-primary, #5865f2);
+}
+
+.pip-header__btn--close:hover {
+  background-color: var(--danger, #ed4245);
+  color: #fff;
+}
+
+/* ─── Frames PiP Grid ─────────────────────────────────────────── */
+
+.pip-frames-grid {
+  flex: 1;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  align-content: center;
+  gap: 4px;
+  padding: 4px;
+  overflow: hidden;
+}
+
+.pip-empty {
+  color: var(--text-muted, #949ba4);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ─── Controls PiP ───────────────────────────────────────────── */
+
+.pip-controls-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 12px;
+  flex-shrink: 0;
+}
+
+.pip-control-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 50%;
+  background-color: var(--bg-tertiary, #1e1f22);
+  color: var(--text-primary, #dbdee1);
+  cursor: pointer;
+  transition:
+    background 150ms ease,
+    color 150ms ease;
+}
+
+.pip-control-btn:hover {
+  background-color: var(--bg-hover, #35373c);
+}
+
+.pip-control-btn--active {
+  background-color: var(--accent-primary, #5865f2);
+  color: #fff;
+}
+
+.pip-control-btn--active:hover {
+  background-color: var(--accent-hover, #4752c4);
+}
+
+.pip-control-btn--danger {
+  background-color: var(--danger, #ed4245);
+  color: #fff;
+}
+
+.pip-control-btn--danger:hover {
+  background-color: #c93b3e;
+}
+
+.pip-control-btn--leave {
+  background-color: var(--danger, #ed4245);
+  color: #fff;
+}
+
+.pip-control-btn--leave:hover {
+  background-color: #c93b3e;
+}
+
+.pip-controls-status {
+  text-align: center;
+  font-size: 10px;
+  color: var(--text-muted, #949ba4);
+  padding: 0 8px 6px;
+  flex-shrink: 0;
+}
+
+/* ─── Screen PiP ─────────────────────────────────────────────── */
+
+.pip-screen-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 16px;
+}
+
+.pip-screen-placeholder__text {
+  color: var(--text-secondary, #b5bac1);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.pip-screen-placeholder__sub {
+  color: var(--text-muted, #949ba4);
+  font-size: 11px;
+}
+
+.pip-screen-video {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  object-fit: contain;
+  background-color: #000;
+}
+
+.pip-screen-overlay {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 6px 12px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.7));
+  pointer-events: none;
+}
+
+.pip-screen-overlay__name {
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}

@@ -1,0 +1,186 @@
+/* Thin spacer when no actions available */
+.channel-actions-spacer {
+  border-bottom: 1px solid var(--border-color);
+}
+
+/* Combined action strip below the server banner */
+.channel-actions-strip {
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  border-bottom: 1px solid var(--border-color);
+  background-color: var(--bg-secondary);
+  position: relative;
+}
+
+.channel-action-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: calc(8px * var(--sp, 1)) 0 calc(6px * var(--sp, 1));
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+/* When only one button, limit its width and center */
+.channel-actions-strip.single .channel-action-item {
+  flex: none;
+  padding: calc(8px * var(--sp, 1)) calc(32px * var(--sp, 1)) calc(6px * var(--sp, 1));
+}
+
+.channel-action-item:hover {
+  color: var(--text-primary);
+  background-color: var(--bg-tertiary);
+}
+
+.channel-action-item.active {
+  color: var(--accent-primary);
+}
+
+.channel-action-divider {
+  width: 1px;
+  background-color: var(--border-color);
+  align-self: stretch;
+  margin: calc(6px * var(--sp, 1)) 0;
+}
+
+/* Add menu popup (Channel / Category) */
+.add-menu-popup {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 12px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: calc(4px * var(--sp, 1));
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  min-width: 140px;
+}
+
+.add-menu-item {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--sp, 1));
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: left;
+}
+
+.add-menu-item:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* Invite popup */
+.invite-popup {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 12px;
+  right: 12px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: calc(12px * var(--sp, 1));
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.invite-popup-section {
+  display: flex;
+  flex-direction: column;
+  gap: calc(8px * var(--sp, 1));
+}
+
+.invite-popup-divider {
+  height: 1px;
+  background: var(--border-color);
+  margin: calc(10px * var(--sp, 1)) 0;
+}
+
+.invite-popup-header {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  letter-spacing: 0.5px;
+}
+
+.invite-popup-code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: calc(18px * var(--font-scale, 1));
+  letter-spacing: 0.2em;
+  text-align: center;
+  padding: calc(8px * var(--sp, 1));
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  user-select: all;
+}
+
+.invite-popup-action-btn {
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  background: var(--gradient-brand, var(--accent-primary));
+  border: none;
+  border-radius: 6px;
+  color: var(--bg-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: calc(6px * var(--sp, 1));
+}
+
+.invite-popup-action-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(250, 112, 154, 0.3);
+}
+
+.invite-popup-action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.invite-popup-action-btn.secondary {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+}
+
+.invite-popup-action-btn.secondary:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  transform: none;
+  box-shadow: none;
+}
+
+.invite-popup-hint {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  text-align: center;
+}

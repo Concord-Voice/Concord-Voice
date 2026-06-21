@@ -1,0 +1,64 @@
+/* Auth Flow Container */
+.auth-flow {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+/* Screen Transition Animation */
+.auth-screen {
+  animation: screenFadeIn 0.3s ease-out;
+  width: 100%;
+  height: 100%;
+}
+
+@keyframes screenFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Placeholder for self-hosted auth */
+.auth-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  gap: 16px;
+  padding: 40px;
+  animation: screenFadeIn 0.3s ease-out;
+}
+
+.auth-placeholder h2 {
+  font-family: var(--font-display-stack);
+  color: var(--text-primary);
+}
+
+.auth-placeholder p {
+  color: var(--text-secondary);
+}
+
+.auth-placeholder button {
+  padding: 12px 24px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.auth-placeholder button:hover {
+  border-color: var(--accent-primary);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}

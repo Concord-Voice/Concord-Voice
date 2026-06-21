@@ -1,0 +1,49 @@
+/* Native <dialog> reset: remove default border/padding/margin/max sizing */
+.settings-overlay-host {
+  border: none;
+  padding: 0;
+  margin: 0;
+  max-width: 100vw;
+  max-height: 100vh;
+  width: 100vw;
+  height: 100vh;
+  background: var(--bg-primary, #1e1f22);
+  color: inherit;
+  z-index: 900;
+  overflow: hidden;
+}
+
+.settings-overlay-host[open] {
+  display: flex;
+  flex-direction: column;
+  animation: settingsOverlayFadeIn 0.15s ease-out;
+}
+
+.settings-overlay-host::backdrop {
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.settings-overlay-host__panel {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-overlay-host__panel > .view-container {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+}
+
+@keyframes settingsOverlayFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}

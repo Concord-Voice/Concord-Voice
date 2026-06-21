@@ -1,0 +1,95 @@
+/* LinkedAccountsList — Settings -> Security view of linked SSO identities */
+
+.linked-accounts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.linked-accounts__loading,
+.linked-accounts__empty {
+  color: var(--text-muted, #888);
+  font-size: 14px;
+  margin: 8px 0;
+}
+
+.linked-accounts__error {
+  background: var(--danger-background, rgba(220, 53, 69, 0.1));
+  border: 1px solid var(--danger-border, rgba(220, 53, 69, 0.3));
+  color: var(--danger-text, #c0392b);
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  margin: 0;
+}
+
+.linked-accounts__list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.linked-accounts__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.1));
+  border-radius: 6px;
+  background: var(--background-secondary, transparent);
+}
+
+.linked-accounts__info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.linked-accounts__provider {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text-primary, inherit);
+}
+
+.linked-accounts__email {
+  font-size: 13px;
+  color: var(--text-secondary, #555);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.linked-accounts__last-used {
+  font-size: 12px;
+  color: var(--text-muted, #888);
+}
+
+.linked-accounts__unlink-btn {
+  background: transparent;
+  border: 1px solid var(--danger-border, rgba(220, 53, 69, 0.4));
+  color: var(--danger-text, #c0392b);
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+  flex-shrink: 0;
+}
+
+.linked-accounts__unlink-btn:hover:not(:disabled) {
+  background: var(--danger-background, rgba(220, 53, 69, 0.1));
+}
+
+.linked-accounts__unlink-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

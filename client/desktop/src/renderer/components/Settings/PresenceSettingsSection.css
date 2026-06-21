@@ -1,0 +1,67 @@
+/* Segmented control for the custom-status visibility tier (#1233 B6).
+   A native <fieldset> (implicit role="group") wrapping native <button>
+   elements, per the accessibility rule (S6819/WCAG) — no role="group" on a
+   <div> and no role+tabIndex spans. The block below resets the user-agent
+   <fieldset> defaults (border, margin, padding, min-inline-size) so the
+   segmented-control visual is identical to the prior <div role="group">. */
+.presence-tier-segmented {
+  display: inline-flex;
+  flex-shrink: 0;
+  margin: 0;
+  padding: 0;
+  min-inline-size: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-tertiary);
+}
+
+/* Visually-hidden legend — provides the accessible group name (replacing the
+   old aria-label) without affecting layout. */
+.presence-tier-legend {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.presence-tier-option {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  padding: calc(6px * var(--sp, 1)) calc(14px * var(--sp, 1));
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border-right: 1px solid var(--border-color);
+}
+
+.presence-tier-option:last-child {
+  border-right: none;
+}
+
+.presence-tier-option:hover:not(:disabled):not(.active) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.presence-tier-option.active {
+  background: var(--accent-primary);
+  color: #fff;
+}
+
+.presence-tier-option:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.presence-tier-option:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

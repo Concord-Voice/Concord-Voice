@@ -1,0 +1,27 @@
+/* CallEventMessage — DM voice call event inline rendering (#1209 F6). */
+
+.call-event-message {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin: 4px 0;
+  background: var(--surface-muted, #2a2d33);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-secondary, #aab);
+}
+
+.call-event-message__icon {
+  flex-shrink: 0;
+}
+
+.call-event-message__text {
+  flex: 1;
+}
+
+.call-event-message__time {
+  font-size: 11px;
+  color: var(--text-muted, #888);
+  margin-left: auto;
+}

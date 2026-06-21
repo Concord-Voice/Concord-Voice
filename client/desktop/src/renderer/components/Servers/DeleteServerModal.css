@@ -1,0 +1,112 @@
+@import '../Auth/AuthForm.css';
+
+.delete-server-content {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* Warning section */
+.delete-server-warning {
+  display: flex;
+  gap: 12px;
+  padding: 16px;
+  background: rgba(240, 71, 71, 0.08);
+  border: 1px solid rgba(240, 71, 71, 0.3);
+  border-radius: 8px;
+}
+
+.delete-server-warning .warning-icon {
+  flex-shrink: 0;
+  color: var(--danger);
+  margin-top: 2px;
+}
+
+.delete-server-warning p {
+  font-size: calc(14px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.delete-server-warning strong {
+  color: var(--text-primary);
+}
+
+/* Confirm input */
+.delete-server-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.delete-server-confirm .form-label strong {
+  color: var(--text-primary);
+}
+
+/* Action buttons */
+.delete-server-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.delete-server-cancel-btn {
+  padding: 12px 24px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.delete-server-cancel-btn:hover:not(:disabled) {
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.delete-server-cancel-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.delete-server-confirm-btn {
+  padding: 12px 24px;
+  background: var(--danger);
+  border: none;
+  border-radius: 8px;
+  color: var(--on-accent);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.delete-server-confirm-btn:hover:not(:disabled) {
+  background: var(--danger-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(240, 71, 71, 0.3);
+}
+
+.delete-server-confirm-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.delete-server-confirm-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.delete-server-confirm-btn:focus-visible {
+  outline: 2px solid var(--danger);
+  outline-offset: 2px;
+}

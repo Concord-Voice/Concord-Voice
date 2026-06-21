@@ -1,0 +1,151 @@
+.override-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+
+.override-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.override-item-select {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.override-item:hover {
+  background: var(--bg-primary);
+}
+
+.override-item.selected {
+  outline: 1px solid var(--accent-primary);
+}
+
+.override-target {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+}
+
+.override-target-name {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.override-target-type {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.override-summary {
+  display: flex;
+  gap: 8px;
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+.override-allow-count {
+  color: var(--success-color);
+}
+
+.override-deny-count {
+  color: var(--error-color);
+}
+
+.override-delete-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  transition: all 0.15s ease;
+}
+
+.override-delete-btn:hover {
+  color: var(--error-color);
+  background: var(--bg-secondary);
+}
+
+.add-override-section {
+  border-top: 1px solid var(--border-color);
+  padding-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.add-override-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.add-override-select {
+  padding: 8px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  flex: 1;
+}
+
+.add-override-btn {
+  padding: 8px 20px;
+  background: var(--gradient-brand);
+  border: none;
+  border-radius: 6px;
+  color: var(--bg-primary);
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  font-size: calc(12px * var(--font-scale, 1));
+  cursor: pointer;
+  letter-spacing: 0.5px;
+  transition: all 0.2s ease;
+}
+
+.add-override-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.add-override-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.section-header {
+  font-family: var(--font-display-stack);
+  font-size: calc(12px * var(--font-scale, 1));
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.no-overrides {
+  padding: 20px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: calc(13px * var(--font-scale, 1));
+}

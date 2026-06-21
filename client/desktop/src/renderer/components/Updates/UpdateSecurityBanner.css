@@ -1,0 +1,85 @@
+/* UpdateSecurityBanner — persistent red banner for critical update-channel
+   failures (cert-pin or publisher-signature). Renders sticky at the top of
+   the app shell so the user can't miss it. Issue #658.
+
+   Colors are intentionally theme-agnostic: the dark-red surface and white
+   text are hardcoded so the banner is unmistakable across all 12 themes.
+   No suitable per-theme token exists with the same "critical-failure red"
+   semantic; var(--danger) varies in saturation in ways that could weaken
+   the unmistakable-red contract. */
+
+.update-security-banner {
+  position: sticky;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  background: #8b0000;
+  color: #ffffff;
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 14px;
+  line-height: 1.4;
+  border-bottom: 2px solid #5a0000;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
+}
+
+.update-security-banner__icon {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+}
+
+.update-security-banner__message {
+  flex: 1;
+  min-width: 0;
+}
+
+.update-security-banner__cta {
+  color: inherit;
+  text-decoration: underline;
+  font-weight: 600;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.update-security-banner__cta:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+.update-security-banner__dismiss,
+.update-security-banner__confirm {
+  flex-shrink: 0;
+  background: transparent;
+  color: inherit;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.update-security-banner__dismiss:hover,
+.update-security-banner__confirm:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.update-security-banner__confirm-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+  min-width: 0;
+}
+
+.update-security-banner__confirm-copy {
+  font-size: 13px;
+  font-style: italic;
+  opacity: 0.9;
+}

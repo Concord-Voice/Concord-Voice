@@ -1,0 +1,756 @@
+/* ── MFA Tier Selector ──────────────────────────────────────────── */
+
+.mfa-tier-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mfa-tier-card {
+  border: 1px solid var(--border-color, #444);
+  border-radius: 8px;
+  padding: 16px;
+  background: var(--bg-secondary, #2a2a2a);
+  position: relative;
+  transition: border-color 0.2s;
+}
+
+.mfa-tier-card:hover:not(.mfa-tier-locked) {
+  border-color: var(--accent-color, #5865f2);
+}
+
+.mfa-tier-active {
+  border-color: var(--success-color, #3ba55d);
+}
+
+.mfa-tier-locked {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.mfa-tier-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.mfa-tier-name {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary, #fff);
+}
+
+.mfa-tier-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--success-color, #2d7d46);
+  color: #fff;
+  font-weight: 500;
+}
+
+.mfa-tier-desc {
+  color: var(--text-tertiary, #999);
+  font-size: 13px;
+  margin: 4px 0 8px;
+  line-height: 1.4;
+}
+
+.mfa-tier-methods-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.mfa-tier-methods {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 1;
+}
+
+.mfa-tier-actions-inline {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.mfa-tier-method {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--bg-tertiary, #333);
+  color: var(--text-secondary, #bbb);
+}
+
+.mfa-tier-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-top: 8px;
+  gap: 8px;
+}
+
+.mfa-tier-actions-left {
+  justify-content: flex-start;
+}
+
+.btn-uniform {
+  min-width: 72px;
+  padding: 5px 14px;
+  font-size: 12px;
+  border-radius: 4px;
+  text-align: center;
+  justify-content: center;
+  box-sizing: border-box;
+}
+
+.mfa-tier-lock-overlay {
+  font-size: 12px;
+  color: var(--text-tertiary, #999);
+  font-style: italic;
+}
+
+.mfa-backup-status {
+  font-size: 13px;
+  color: var(--text-secondary, #bbb);
+  padding: 8px 0;
+}
+
+/* ── Recovery-Only / Hardened Toggle Rows ─────────────────────── */
+
+.mfa-tier-badge-recovery {
+  background: var(--warning-color, #f0a020);
+}
+
+.mfa-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: var(--bg-tertiary, #333);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.mfa-toggle-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.mfa-recovery-only-label {
+  color: var(--text-primary, #fff);
+  font-weight: 500;
+}
+
+.mfa-recovery-only-hint {
+  color: var(--text-tertiary, #999);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.mfa-hardened-toggle {
+  margin-top: 4px;
+  border: 1px solid var(--warning-color, #f0a020);
+  background: rgba(240, 160, 32, 0.08);
+}
+
+.mfa-recovery-only-preview {
+  font-size: 12px;
+  color: var(--text-tertiary, #999);
+  font-style: italic;
+  margin: 4px 0 0;
+}
+
+/* ── Credential List (WebAuthn per-key) ──────────────────────── */
+
+.mfa-credential-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.mfa-credential-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--bg-tertiary, #333);
+  border-radius: 6px;
+}
+
+.mfa-credential-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mfa-credential-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary, #fff);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mfa-credential-meta {
+  font-size: 11px;
+  color: var(--text-tertiary, #999);
+}
+
+.mfa-action-hint {
+  font-size: 11px;
+  color: var(--warning-color, #f0a020);
+  flex: 1;
+  text-align: right;
+}
+
+/* ── Backup Email ────────────────────────────────────────────── */
+
+.mfa-backup-email-section {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--bg-tertiary, #333);
+  border-radius: 6px;
+}
+
+.mfa-backup-email-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary, #fff);
+  margin-bottom: 2px;
+}
+
+.mfa-backup-email-hint {
+  display: block;
+  font-size: 12px;
+  color: var(--text-tertiary, #999);
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+
+.mfa-backup-email-display {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mfa-backup-email-value {
+  font-size: 13px;
+  color: var(--text-secondary, #bbb);
+}
+
+.mfa-backup-email-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mfa-backup-email-input {
+  padding: 6px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border-color, #444);
+  background: var(--bg-primary, #1e1e1e);
+  color: var(--text-primary, #fff);
+  font-size: 13px;
+}
+
+.mfa-backup-email-input:focus {
+  outline: none;
+  border-color: var(--accent-color, #5865f2);
+}
+
+.mfa-backup-email-error {
+  font-size: 12px;
+  color: var(--error-color, #ed4245);
+}
+
+.mfa-backup-email-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* ── Danger Button ───────────────────────────────────────────── */
+
+.btn-danger {
+  background: var(--error-color, #c0392b);
+  color: #fff;
+  border: none;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: #d63739;
+}
+
+.btn-danger:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── MFA Setup Wizard ──────────────────────────────────────────── */
+
+.mfa-setup-wizard {
+  max-width: 400px;
+}
+
+.mfa-setup-wizard h3 {
+  margin: 0 0 16px;
+  color: var(--text-primary, #fff);
+}
+
+.mfa-setup-step {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mfa-setup-step p {
+  color: var(--text-secondary, #bbb);
+  font-size: 14px;
+  margin: 0;
+  line-height: 1.5;
+}
+
+.mfa-setup-error {
+  color: var(--error-color, #ed4245);
+  font-size: 13px;
+  margin: 0;
+}
+
+.mfa-setup-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(237, 66, 69, 0.15);
+  border: 1px solid var(--error-color, #ed4245);
+  border-radius: 6px;
+  padding: 12px 16px;
+  color: var(--error-color, #ed4245);
+  font-size: 14px;
+  font-weight: 500;
+  text-align: left;
+  margin: 8px 0;
+}
+
+.mfa-setup-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.mfa-setup-success h4 {
+  color: var(--success-color, #3ba55d);
+  margin: 0;
+}
+
+.mfa-qr-container {
+  display: flex;
+  justify-content: center;
+  padding: 16px;
+  background: #fff;
+  border-radius: 8px;
+  width: fit-content;
+  margin: 0 auto;
+}
+
+/* ── Dev Mode Email/SMS Stub ──────────────────────────────────── */
+
+.mfa-dev-banner {
+  background: rgba(240, 160, 32, 0.15);
+  border: 1px solid var(--warning-color, #f0a020);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--warning-color, #f0a020);
+  margin-bottom: 12px;
+}
+
+.mfa-dev-codes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  background: var(--bg-tertiary, #333);
+  border-radius: 8px;
+  border: 1px dashed var(--warning-color, #f0a020);
+}
+
+.mfa-dev-code-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.mfa-dev-code-label {
+  font-size: 13px;
+  color: var(--text-secondary, #bbb);
+  min-width: 80px;
+}
+
+.mfa-dev-code-value {
+  font-family: var(--font-mono, monospace);
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--warning-color, #f0a020);
+  letter-spacing: 4px;
+  user-select: all;
+}
+
+.mfa-verify-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mfa-verify-field label {
+  font-size: 12px;
+  color: var(--text-secondary, #bbb);
+  font-weight: 500;
+}
+
+.mfa-verify-field input {
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color, #444);
+  background: var(--bg-secondary, #2b2b2b);
+  color: var(--text-primary, #fff);
+  font-size: 14px;
+}
+
+.mfa-verify-field input:focus {
+  outline: none;
+  border-color: var(--accent-color, #5865f2);
+}
+
+.mfa-manual-entry {
+  font-size: 13px;
+  color: var(--text-tertiary, #999);
+  cursor: pointer;
+}
+
+.mfa-secret-display {
+  display: block;
+  margin-top: 8px;
+  padding: 8px;
+  background: var(--bg-tertiary, #333);
+  border-radius: 4px;
+  font-size: 14px;
+  word-break: break-all;
+  user-select: all;
+}
+
+/* ── Backup Code Display ───────────────────────────────────────── */
+
+.backup-code-display {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.backup-code-warning {
+  background: rgba(237, 66, 69, 0.1);
+  border: 1px solid var(--error-color, #ed4245);
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 13px;
+  color: var(--error-color, #ed4245);
+  font-weight: 500;
+}
+
+.backup-code-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.backup-code-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg-tertiary, #333);
+  border-radius: 4px;
+}
+
+.backup-code-number {
+  color: var(--text-tertiary, #999);
+  font-size: 12px;
+  min-width: 16px;
+}
+
+.backup-code-value {
+  font-family: var(--font-mono, monospace);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary, #fff);
+  user-select: all;
+  letter-spacing: 1px;
+}
+
+.backup-code-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.backup-code-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary, #bbb);
+  cursor: pointer;
+}
+
+.backup-code-checkbox input {
+  cursor: pointer;
+}
+
+/* ── MFA Challenge Modal ───────────────────────────────────────── */
+
+.mfa-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+
+.mfa-modal {
+  background: var(--bg-primary, #1e1e1e);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 12px;
+  padding: 24px;
+  max-width: 380px;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.mfa-modal h3 {
+  margin: 0;
+  color: var(--text-primary, #fff);
+}
+
+.mfa-modal-desc {
+  color: var(--text-secondary, #bbb);
+  font-size: 14px;
+  margin: 0;
+}
+
+.mfa-modal-alt {
+  font-size: 12px;
+  color: var(--text-tertiary, #999);
+  margin: 0;
+}
+
+.mfa-modal-cancel {
+  align-self: center;
+}
+
+/* ── Backup Code Input ─────────────────────────────────────────── */
+
+.backup-code-input {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.backup-code-label {
+  color: var(--text-secondary, #bbb);
+  font-size: 13px;
+  margin: 0;
+}
+
+.backup-code-field {
+  max-width: 200px;
+  font-size: 18px;
+}
+
+.backup-code-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ── MFA Status Bar ──────────────────────────────────────────────── */
+
+.mfa-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--bg-secondary, #2a2a2a);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+
+.mfa-status-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary, #bbb);
+}
+
+.mfa-status-item-right {
+  margin-left: auto;
+}
+
+.mfa-status-item strong {
+  color: var(--accent-color, #5865f2);
+}
+
+.mfa-status-warn {
+  color: var(--error-color, #ed4245) !important;
+}
+
+.mfa-status-muted {
+  color: var(--text-tertiary, #999);
+  font-style: italic;
+  font-weight: 400;
+}
+
+.btn-xs {
+  padding: 3px 10px;
+  font-size: 12px;
+  border-radius: 4px;
+  line-height: 1.4;
+}
+
+.btn-reset-danger {
+  background: transparent;
+  color: var(--text-tertiary, #999);
+  border: 1px solid var(--border-color, #444);
+  padding: 3px 10px;
+  font-size: 11px;
+  border-radius: 4px;
+  line-height: 1.3;
+  text-align: center;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s,
+    border-color 0.15s;
+}
+
+.btn-reset-danger:hover:not(:disabled) {
+  background: var(--error-color, #c0392b);
+  color: #fff;
+  border-color: var(--error-color, #c0392b);
+}
+
+.btn-reset-danger:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── MFA Verify Prompt ───────────────────────────────────────────── */
+
+.mfa-verify-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mfa-verify-prompt-label {
+  font-size: 12px;
+  color: var(--text-secondary, #bbb);
+  font-weight: 500;
+}
+
+/* ── SSO Security toggles (issue #270) ───────────────────────────── */
+
+.sso-toggle-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 16px 0;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.08));
+}
+
+.sso-toggle-row:last-child {
+  border-bottom: none;
+}
+
+.sso-toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary, inherit);
+  cursor: pointer;
+}
+
+.sso-toggle-label input[type='checkbox']:disabled {
+  cursor: not-allowed;
+}
+
+.sso-toggle-warning {
+  font-size: 12px;
+  color: var(--text-muted, #888);
+  margin: 0 0 0 24px;
+  line-height: 1.4;
+}
+
+.sso-toggle-confirm {
+  margin: 8px 0 0 24px;
+  padding: 12px;
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.1));
+  border-radius: 6px;
+  background: var(--background-secondary, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sso-toggle-confirm label {
+  font-size: 12px;
+  color: var(--text-secondary, #bbb);
+  font-weight: 500;
+}
+
+.sso-toggle-confirm input[type='password'] {
+  padding: 6px 8px;
+  border: 1px solid var(--border-color, #444);
+  border-radius: 4px;
+  background: var(--bg-input, transparent);
+  color: var(--text-primary, inherit);
+  font-size: 14px;
+}
+
+.sso-toggle-error {
+  color: var(--danger-text, #c0392b);
+  font-size: 12px;
+  margin: 0;
+}
+
+.sso-toggle-confirm-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}

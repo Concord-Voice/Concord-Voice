@@ -1,0 +1,303 @@
+/* ─── Member Profile Card ───────────────────────────────────────────────── */
+
+.member-profile-card {
+  width: 280px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  animation: memberProfileFadeIn 0.15s ease;
+  overflow: hidden;
+}
+
+@keyframes memberProfileFadeIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* ─── Banner ────────────────────────────────────────────────────────────── */
+
+.member-profile-banner {
+  height: 60px;
+  background: var(--gradient-brand);
+  opacity: 0.6;
+}
+
+.member-profile-banner.has-image {
+  opacity: 1;
+  background: var(--bg-tertiary);
+}
+
+.member-profile-banner-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* ─── Header / Avatar ───────────────────────────────────────────────────── */
+
+.member-profile-header {
+  display: flex;
+  padding: 0 calc(16px * var(--sp, 1));
+  margin-top: -24px;
+}
+
+.member-profile-avatar {
+  position: relative;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--bg-tertiary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 3px solid var(--bg-secondary);
+  overflow: visible;
+}
+
+.member-profile-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.member-profile-avatar-initial {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: calc(18px * var(--font-scale, 1));
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.member-profile-status {
+  position: absolute;
+  bottom: -2px;
+  right: -2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 3px solid var(--bg-secondary);
+}
+
+.member-profile-status.online {
+  background-color: var(--status-connected);
+}
+
+.member-profile-status.dnd {
+  background-color: var(--status-disconnected);
+}
+
+.member-profile-status.offline,
+.member-profile-status.invisible {
+  background-color: var(--text-muted);
+}
+
+/* ─── Body ──────────────────────────────────────────────────────────────── */
+
+.member-profile-body {
+  padding: calc(12px * var(--sp, 1)) calc(16px * var(--sp, 1)) calc(16px * var(--sp, 1));
+}
+
+.member-profile-name {
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-top: calc(4px * var(--sp, 1));
+}
+
+.member-profile-username {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+/* ─── Separator ─────────────────────────────────────────────────────────── */
+
+.member-profile-separator {
+  height: 1px;
+  background: var(--border-color);
+  margin: calc(10px * var(--sp, 1)) 0;
+}
+
+/* ─── Details ───────────────────────────────────────────────────────────── */
+
+.member-profile-details {
+  display: flex;
+  flex-direction: column;
+  gap: calc(6px * var(--sp, 1));
+}
+
+.member-profile-detail-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.member-profile-detail-label {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.member-profile-detail-value {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-secondary);
+}
+
+.member-profile-detail-value.status-online {
+  color: var(--status-connected);
+}
+
+.member-profile-detail-value.status-dnd {
+  color: var(--status-disconnected);
+}
+
+.member-profile-detail-value.status-offline,
+.member-profile-detail-value.status-invisible {
+  color: var(--text-muted);
+}
+
+/* Custom Status detail row (#1233) — emoji + text, right-aligned, clamped. */
+.member-profile-custom-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 60%;
+  justify-content: flex-end;
+}
+
+.member-profile-custom-status-emoji {
+  flex-shrink: 0;
+}
+
+.member-profile-custom-status-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ─── Role Badge ────────────────────────────────────────────────────────── */
+
+.member-profile-role-badge {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  padding: 2px calc(8px * var(--sp, 1));
+  border-radius: 10px;
+  text-transform: capitalize;
+}
+
+.member-profile-role-badge.role-owner {
+  background: var(--accent-fill);
+  color: var(--on-accent);
+}
+
+.member-profile-role-badge.role-admin {
+  background: var(--accent-secondary);
+  color: #000000;
+}
+
+.member-profile-role-badge.role-member {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+/* ─── Bio ───────────────────────────────────────────────────────────────── */
+
+.member-profile-bio p {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  line-height: 1.4;
+  margin-top: calc(4px * var(--sp, 1));
+  word-wrap: break-word;
+}
+
+/* ─── View Full Profile Button ──────────────────────────────────────────── */
+
+.member-profile-view-full-btn {
+  width: 100%;
+  padding: calc(8px * var(--sp, 1));
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.member-profile-view-full-btn:hover {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+  background: var(--bg-secondary);
+}
+
+/* ─── Action row (friend request + view full profile) ───────────────────── */
+
+.member-profile-actions {
+  display: flex;
+  flex-direction: column;
+  gap: calc(6px * var(--sp, 1));
+}
+
+/* Send-friend-request button — primary-accent treatment to distinguish the
+   actionable "send" state from the secondary "View Full Profile". Inert and
+   error variants below tone it down / signal failure. */
+.send-friend-request-btn {
+  width: 100%;
+  padding: calc(8px * var(--sp, 1));
+  border-radius: 6px;
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border: 1px solid var(--accent-primary);
+  background: var(--accent-fill);
+  color: var(--on-accent);
+}
+
+.send-friend-request-btn:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+/* Already-friends / pending — non-interactive label, muted. */
+.send-friend-request-btn--inert {
+  background: var(--bg-tertiary);
+  border-color: var(--border-color);
+  color: var(--text-muted);
+  cursor: default;
+}
+
+/* Transient post-send confirmation. */
+.send-friend-request-btn--sent {
+  background: var(--success);
+  border-color: var(--success);
+  color: var(--on-accent);
+}
+
+/* Send failed — surfaces the error message inline. */
+.send-friend-request-btn--error {
+  background: var(--bg-tertiary);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.send-friend-request-btn:disabled {
+  opacity: 0.8;
+  cursor: default;
+}

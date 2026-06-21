@@ -1,0 +1,174 @@
+.force-update-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+  animation: modalOverlayFadeIn 0.3s ease-out;
+  pointer-events: all;
+}
+
+.force-update-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  padding: 40px;
+  max-width: 460px;
+  text-align: center;
+  animation: modalSlideIn 0.3s ease-out;
+}
+
+.force-update-icon {
+  color: var(--text-warning-strong);
+  margin-bottom: 16px;
+}
+
+.force-update-title {
+  font-size: calc(22px * var(--font-scale, 1));
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  color: var(--text-primary);
+  letter-spacing: 0.3px;
+  margin: 0 0 12px;
+}
+
+.force-update-message {
+  font-size: calc(14px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  line-height: 1.6;
+  margin: 0 0 24px;
+}
+
+.force-update-message strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* ── Status area ──────────────────────────────────────────────── */
+
+.force-update-status {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 24px;
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-secondary);
+}
+
+.force-update-status.success {
+  color: var(--success-color);
+}
+
+.force-update-status.error {
+  color: var(--danger);
+}
+
+.force-update-spinner {
+  animation: spin 1.5s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── Progress bar ─────────────────────────────────────────────── */
+
+.force-update-progress-bar {
+  width: 100%;
+  max-width: 320px;
+  height: 6px;
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.force-update-progress-fill {
+  height: 100%;
+  background: var(--accent-fill);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.force-update-progress-text {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Action buttons ───────────────────────────────────────────── */
+
+.force-update-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.force-update-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 24px;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.2s ease,
+    opacity 0.2s ease;
+}
+
+.force-update-btn.primary {
+  background: var(--accent-fill);
+  color: var(--on-accent); /* HCM: see SettingsPage.css .settings-pending-blob-apply */
+}
+
+.force-update-btn.primary:hover {
+  opacity: 0.9;
+}
+
+.force-update-btn.secondary {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+.force-update-btn.secondary:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* ── Manual download link ────────────────────────────────────── */
+
+.force-update-manual-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 16px;
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-tertiary);
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+
+.force-update-manual-link:hover {
+  color: var(--accent-primary);
+  text-decoration: underline;
+}
+
+/* ── Escape hatch ────────────────────────────────────────────── */
+
+.force-update-escape {
+  margin-top: 12px;
+}

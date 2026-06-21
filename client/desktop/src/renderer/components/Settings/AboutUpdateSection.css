@@ -1,0 +1,278 @@
+/* About & Updates section (#155 Tier 4) */
+
+/* ─── Client Info grid ─────────────────────────────────────────────── */
+
+.about-info-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.about-info-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+
+.about-info-row:nth-child(odd) {
+  background: var(--bg-tertiary);
+}
+
+.about-info-label {
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-secondary);
+}
+
+.about-info-value {
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-primary);
+  font-family: 'SFMono-Regular', 'Consolas', 'Liberation Mono', monospace;
+  user-select: text;
+}
+
+/* ─── Log path row ────────────────────────────────────────────────── */
+
+.about-info-value--log {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-end;
+}
+
+.about-info-log-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.about-info-copy-btn {
+  border: none;
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s ease;
+  white-space: nowrap;
+}
+
+.about-info-copy-btn:hover {
+  background: var(--accent-fill);
+  color: var(--on-accent); /* HCM: see SettingsPage.css .settings-pending-blob-apply */
+}
+
+/* ─── Third-party services ────────────────────────────────────────── */
+
+.about-third-party {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-primary);
+}
+
+.about-third-party-title {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.about-third-party-item {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+
+/* ─── Legal ────────────────────────────────────────────────────────── */
+
+.about-legal {
+  margin-top: 12px;
+  padding-top: 8px;
+}
+
+.about-legal-text {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-tertiary);
+}
+
+/* ─── Update settings ──────────────────────────────────────────────── */
+
+.about-setting-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+}
+
+.about-setting-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.about-setting-label {
+  font-size: calc(14px * var(--font-scale, 1));
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.about-setting-description {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-tertiary);
+  line-height: 1.4;
+}
+
+/* ─── Check for updates button ─────────────────────────────────────── */
+
+.about-update-check {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  border-top: 1px solid var(--bg-tertiary);
+  margin-top: 4px;
+}
+
+.about-update-btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: none;
+  background: var(--accent-fill);
+  color: var(--on-accent);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.about-update-btn:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.about-update-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.about-update-last-checked {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-tertiary);
+}
+
+/* ─── Update status panel ──────────────────────────────────────────── */
+
+.about-update-status {
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  margin-top: 8px;
+}
+
+.about-update-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-primary);
+}
+
+.about-update-status-row svg {
+  flex-shrink: 0;
+}
+
+.about-update-status-col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.about-update-status--up-to-date {
+  color: var(--success-color, #4ade80);
+}
+
+.about-update-status--up-to-date svg {
+  color: var(--success-color, #4ade80);
+}
+
+.about-update-status--available svg {
+  color: var(--accent-primary);
+}
+
+.about-update-status--error {
+  border: 1px solid var(--error-color, #ef4444);
+}
+
+.about-update-status--error svg {
+  color: var(--error-color, #ef4444);
+}
+
+.about-update-error-text {
+  color: var(--error-color, #ef4444);
+}
+
+/* ─── Action buttons inside status panel ───────────────────────────── */
+
+.about-update-action-btn {
+  margin-left: auto;
+  padding: 5px 12px;
+  border-radius: 5px;
+  border: 1px solid var(--accent-primary);
+  background: transparent;
+  color: var(--accent-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.about-update-action-btn:hover {
+  background: var(--accent-fill);
+  color: var(--on-accent);
+}
+
+.about-update-action-btn--primary {
+  background: var(--accent-fill);
+  color: var(--on-accent);
+}
+
+.about-update-action-btn--primary:hover {
+  opacity: 0.9;
+}
+
+/* ─── Download progress bar ────────────────────────────────────────── */
+
+.about-update-progress-bar {
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-tertiary);
+  overflow: hidden;
+}
+
+.about-update-progress-fill {
+  height: 100%;
+  background: var(--accent-fill);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.about-update-progress-detail {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-tertiary);
+}

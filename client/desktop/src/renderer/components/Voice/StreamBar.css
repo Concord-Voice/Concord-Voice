@@ -1,0 +1,141 @@
+/* ─── Stream Bar (Mode B — bottom horizontal strip) ──────────── */
+
+.stream-bar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  background-color: var(--bg-secondary);
+  border-top: 1px solid var(--border-color);
+  overflow: hidden;
+  /* Slide animation for hide/show */
+  transition:
+    transform 300ms ease,
+    opacity 300ms ease;
+}
+
+.stream-bar--hidden {
+  transform: translateY(100%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.stream-bar__scroll {
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 100%;
+  padding: 4px 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* Thin custom scrollbar */
+.stream-bar__scroll::-webkit-scrollbar {
+  height: 4px;
+}
+
+.stream-bar__scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.stream-bar__scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+}
+
+/* ─── Stream Thumbnail ───────────────────────────────────────── */
+
+.stream-thumbnail {
+  position: relative;
+  flex-shrink: 0;
+  height: calc(100% - 8px);
+  aspect-ratio: 16 / 9;
+  border-radius: 6px;
+  overflow: hidden;
+  background-color: #000;
+  cursor: pointer;
+  transition: outline 150ms ease;
+}
+
+.stream-thumbnail__select {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.stream-thumbnail:hover {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.stream-thumbnail__video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.stream-thumbnail__label {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 2px 6px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.7));
+  color: #fff;
+  font-size: calc(10px * var(--font-scale, 1));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stream-thumbnail__close {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 150ms ease;
+}
+
+.stream-thumbnail:hover .stream-thumbnail__close {
+  opacity: 1;
+}
+
+.stream-thumbnail__close:hover {
+  background: var(--danger);
+}
+
+/* ─── Paused Thumbnail (auto-pause active) ───────────────────── */
+
+.stream-thumbnail__paused {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--bg-secondary, #1a1a2e);
+}
+
+.stream-thumbnail__paused-text {
+  font-size: calc(10px * var(--font-scale, 1));
+  color: var(--text-muted, #888);
+  font-weight: 500;
+}

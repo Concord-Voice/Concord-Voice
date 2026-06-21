@@ -1,0 +1,2281 @@
+@import '../Auth/AuthForm.css';
+
+/* Full-page settings wrapper (no sidebar) */
+.settings-fullpage {
+  background: var(--bg-primary);
+}
+
+/* Settings page content area */
+.settings-page-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 32px clamp(24px, 4vw, 64px);
+}
+
+.settings-page-inner {
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+/* Back button */
+.settings-back-btn {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  padding: 4px 0;
+  margin-bottom: 8px;
+  transition: color 0.15s ease;
+}
+
+.settings-back-btn:hover {
+  color: var(--text-primary);
+}
+
+/* Page title (inside nav sidebar) */
+.settings-page-title {
+  font-family: var(--font-display-stack);
+  font-size: calc(22px * var(--font-scale, 1));
+  margin-bottom: 16px;
+  color: var(--text-primary);
+}
+
+/* Two-column layout */
+.settings-layout {
+  display: flex;
+  gap: 32px;
+}
+
+/* Left navigation (includes back button and title) */
+.settings-nav {
+  width: 200px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: calc(100vh - 64px);
+  overflow: visible;
+  padding-top: 4px;
+}
+
+.settings-nav-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.settings-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: left;
+}
+
+.settings-nav-item:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.settings-nav-item.active {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border-left: 3px solid var(--accent-primary);
+  border-right: 3px solid var(--accent-primary);
+  padding-left: 9px;
+  padding-right: 9px;
+}
+
+.settings-nav-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.settings-nav-item-icon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.settings-nav-badge {
+  margin-left: auto;
+  font-size: calc(10px * var(--font-scale, 1));
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+/* Right content area */
+.settings-content {
+  flex: 1;
+  min-width: 0;
+  transition: opacity 0.15s ease;
+}
+
+.settings-content-loading {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+/* Section cards */
+.settings-section {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 24px;
+  margin-bottom: 24px;
+}
+
+.settings-section-title {
+  font-family: var(--font-display-stack);
+  font-size: var(--text-display-md); /* 20px section header (#1035) */
+  color: var(--text-primary);
+  letter-spacing: var(--font-display-tracking);
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+/* ─── Collapsible Sections ────────────────────────────────────────────────── */
+
+.settings-collapsible {
+  padding: 0;
+}
+
+.settings-collapsible-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  transition: background 0.15s ease;
+  border-radius: 12px;
+}
+
+.settings-collapsible-header::-webkit-details-marker {
+  display: none;
+}
+
+.settings-collapsible-header::marker {
+  display: none;
+  content: '';
+}
+
+.settings-collapsible-header:hover {
+  background: var(--bg-tertiary);
+}
+
+.settings-collapsible-header .settings-section-title {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.settings-collapsible-chevron {
+  color: var(--text-muted);
+  transition: transform 0.2s ease;
+  flex-shrink: 0;
+}
+
+.settings-collapsible[open] > .settings-collapsible-header {
+  border-radius: 12px 12px 0 0;
+}
+
+.settings-collapsible[open] > .settings-collapsible-header .settings-collapsible-chevron {
+  transform: rotate(180deg);
+}
+
+.settings-collapsible-body {
+  padding: 0 24px 24px;
+}
+
+[data-reduce-animations='true'] .settings-collapsible-chevron {
+  transition-duration: 0s;
+}
+
+/*
+ * Smooth open/close animation on <details.settings-collapsible> (closes #297).
+ *
+ * Uses three modern Chromium CSS primitives (all available in Electron 42's
+ * bundled Chromium 136, the minimum we ship):
+ *   - ::details-content        (Chromium 131+) — the implicit pseudo wrapping
+ *                                                a <details> element's body
+ *   - interpolate-size: allow-keywords (Chromium 129+) — lets `auto`-sized
+ *                                                       block-size animate
+ *   - @starting-style          (Chromium 117+) — starting values for entry
+ *                                                transitions
+ *
+ * Net effect: clicking a section header transitions the body height from
+ * 0 → auto over 200ms (closing reverses). The `[data-reduce-animations='true']`
+ * opt-out collapses the transition to 0s so the existing accessibility
+ * preference is honored.
+ */
+.settings-collapsible::details-content {
+  block-size: 0;
+  overflow: hidden;
+  /* `allow-discrete` lets `content-visibility` toggle survive the transition
+     so the body is visible during the closing animation, not snapped away by
+     the browser the instant `[open]` is removed. */
+  transition:
+    block-size 200ms ease,
+    content-visibility 200ms ease allow-discrete;
+  interpolate-size: allow-keywords;
+}
+
+.settings-collapsible[open]::details-content {
+  block-size: auto;
+}
+
+/* Entry transition starting state: when [open] is first applied, animate
+   from 0 height up. Without @starting-style the body would just appear at
+   final height with no transition. */
+@starting-style {
+  .settings-collapsible[open]::details-content {
+    block-size: 0;
+  }
+}
+
+[data-reduce-animations='true'] .settings-collapsible::details-content {
+  transition-duration: 0s;
+}
+
+/* ─── Expand/Collapse All Button (#297) ─────────────────────────────────── */
+
+.settings-expand-collapse-all-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.settings-expand-collapse-all-btn:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+}
+
+.settings-expand-collapse-all-btn:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+.settings-expand-collapse-all-chevron {
+  flex-shrink: 0;
+  transition: transform 0.2s ease;
+}
+
+/* Mirror the per-section chevron-rotation convention: chevron points down
+   when more is hidden (action = expand), up when everything is open
+   (action = collapse). Keeps the visual language consistent with the
+   chevron on each section header. */
+.settings-expand-collapse-all-chevron[data-expanded='true'] {
+  transform: rotate(180deg);
+}
+
+[data-reduce-animations='true'] .settings-expand-collapse-all-chevron {
+  transition-duration: 0s;
+}
+
+/* Header row above the rendered settings section. Holds the
+   Expand/Collapse All button right-aligned (the button self-hides when
+   the active panel has no collapsibles, in which case this row collapses
+   to zero visual cost via the empty-but-zero-height path below). */
+.settings-content-header {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 0 0 12px 0;
+  min-height: 0;
+}
+
+.settings-content-header:empty {
+  /* When the ExpandCollapseAllButton returns null (hasSections=false),
+     the header row leaves no <button> child. The :empty selector collapses
+     the row entirely so the rendered section sits flush against the top. */
+  padding: 0;
+}
+
+.settings-section-description {
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-muted);
+  margin-bottom: 20px;
+  line-height: 1.5;
+}
+
+.settings-subsection-title {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-top: 24px;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.settings-subsection-title:first-of-type {
+  margin-top: 0;
+}
+
+/* Setting row */
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 12px 0;
+}
+
+.settings-row + .settings-row {
+  border-top: 1px solid var(--border-color);
+}
+
+/* Child settings spawned by a parent toggle — no separator line */
+.settings-row-child {
+  border-top: none !important;
+}
+
+.settings-row-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0; /* allow text to shrink/wrap */
+}
+
+.settings-row-label {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.settings-row-hint {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+/* Color scheme active label */
+.color-scheme-active-label {
+  display: block;
+  font-size: calc(20px * var(--font-scale, 1));
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  color: var(--accent-primary);
+  margin-bottom: 12px;
+}
+
+/* Grid of gradient circles */
+.color-scheme-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+/* Individual gradient circle */
+.color-scheme-circle {
+  width: 40px;
+  height: 40px;
+  min-width: 40px;
+  min-height: 40px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  padding: 0;
+  background-origin: border-box;
+}
+
+.color-scheme-circle:hover {
+  transform: scale(1.1);
+}
+
+.color-scheme-circle.selected {
+  box-shadow:
+    0 0 0 3px var(--bg-primary),
+    0 0 0 5px var(--text-primary);
+}
+
+.color-scheme-circle:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 4px;
+}
+
+/* Custom "+" circle */
+.color-scheme-circle.custom-add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  transition: all 0.2s ease;
+}
+
+.color-scheme-circle.custom-add:hover {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.color-scheme-circle.custom-add.selected {
+  border-style: solid;
+  border-color: transparent;
+}
+
+/* Custom theme picker panel */
+.custom-theme-picker {
+  margin-top: calc(16px * var(--sp, 1));
+  padding: calc(16px * var(--sp, 1));
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: calc(12px * var(--sp, 1));
+}
+
+.custom-theme-picker-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.custom-theme-picker-label {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.custom-theme-picker-input-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Native color picker input */
+.custom-theme-color-input {
+  width: 36px;
+  height: 36px;
+  border: 2px solid var(--border-color);
+  border-radius: 8px;
+  padding: 2px;
+  cursor: pointer;
+  background: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.custom-theme-color-input::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.custom-theme-color-input::-webkit-color-swatch {
+  border: none;
+  border-radius: 4px;
+}
+
+.custom-theme-color-input:hover {
+  border-color: var(--accent-primary);
+}
+
+/* Hex text input */
+.custom-theme-hex-input {
+  width: 80px;
+  padding: calc(6px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-family: monospace;
+  text-transform: uppercase;
+}
+
+.custom-theme-hex-input:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
+/* Theme selector */
+.theme-selector {
+  display: flex;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.theme-option {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 12px;
+  background: var(--bg-tertiary);
+  border: 2px solid var(--border-color);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: var(--text-secondary);
+}
+
+.theme-option:hover {
+  border-color: var(--accent-hover);
+  color: var(--text-primary);
+}
+
+.theme-option.selected {
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+}
+
+.theme-option-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.theme-option-label {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+}
+
+/* Font size selector */
+.font-size-selector {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.font-size-option {
+  flex: 1;
+  padding: 10px 16px;
+  background: var(--bg-tertiary);
+  border: 2px solid var(--border-color);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: var(--text-secondary);
+  font-family: 'SourceSans', sans-serif;
+  text-align: center;
+}
+
+.font-size-option:hover {
+  border-color: var(--accent-hover);
+  color: var(--text-primary);
+}
+
+.font-size-option.selected {
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+}
+
+.font-size-option.small {
+  font-size: 12px;
+}
+.font-size-option.default {
+  font-size: 14px;
+}
+.font-size-option.large {
+  font-size: 16px;
+}
+
+/* ─── UI Scale slider (#489) ───────────────────────────────────────────────
+   Coexists with the discrete Font Size selector; CSS compounding lives in
+   :root via `--ui-scale × --font-scale-discrete`. */
+.ui-scale-slider-row {
+  display: flex;
+  align-items: center;
+  gap: calc(12px * var(--sp, 1));
+  margin-top: calc(8px * var(--sp, 1));
+}
+
+.ui-scale-slider {
+  flex: 1;
+  min-width: 120px;
+  accent-color: var(--accent-primary);
+  cursor: pointer;
+}
+
+.ui-scale-value {
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  min-width: 48px;
+  text-align: right;
+}
+
+.ui-scale-reset-btn {
+  padding: 6px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(12px * var(--font-scale, 1));
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.ui-scale-reset-btn:hover:not(:disabled) {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.ui-scale-reset-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Toggle switch */
+.settings-toggle {
+  position: relative;
+  width: 44px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.settings-toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.settings-toggle-track {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.settings-toggle input:checked + .settings-toggle-track {
+  background: var(--accent-fill);
+  border-color: var(--accent-primary);
+}
+
+.settings-toggle-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  background: var(--text-primary);
+  border-radius: 50%;
+  transition: transform 0.2s ease;
+  pointer-events: none;
+}
+
+.settings-toggle input:checked ~ .settings-toggle-thumb {
+  transform: translateX(20px);
+}
+
+/* Sessions list */
+.sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.session-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  transition: border-color 0.15s ease;
+}
+
+.session-card.current {
+  border-color: var(--accent-primary);
+}
+
+.session-card.past {
+  opacity: 0.6;
+}
+
+.session-card.past:hover {
+  opacity: 0.8;
+}
+
+.session-card-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.session-card-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.session-card-title {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-card-badge {
+  font-size: calc(10px * var(--font-scale, 1));
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.session-card-badge.past {
+  background: var(--text-muted);
+}
+
+.session-card-details {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  margin-top: 4px;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.session-card-actions {
+  flex-shrink: 0;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.session-revoke-btn {
+  padding: 6px 14px;
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.session-revoke-btn:hover:not(:disabled) {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: rgba(240, 71, 71, 0.08);
+}
+
+.session-revoke-btn.confirm {
+  border-color: var(--danger);
+  color: var(--bg-primary);
+  background: var(--danger);
+}
+
+.session-revoke-btn.confirm:hover:not(:disabled) {
+  background: var(--danger);
+  opacity: 0.9;
+}
+
+.session-revoke-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.session-cancel-btn {
+  padding: 6px 14px;
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.session-cancel-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--text-muted);
+}
+
+.session-confirm-warning {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: rgba(240, 71, 71, 0.08);
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  color: var(--danger);
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.4;
+}
+
+/* Revocation mode toggle (Simple / Secure) */
+.session-revocation-mode {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+
+.session-revocation-mode-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.session-revocation-mode-label {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.session-revocation-mode-description {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.session-revocation-mode-toggle {
+  display: flex;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.revocation-mode-btn {
+  padding: 6px 14px;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.revocation-mode-btn:hover:not(.active) {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.revocation-mode-btn.active {
+  background: var(--accent-fill);
+  /* See .settings-pending-blob-apply for the HCM rationale on --on-accent. */
+  color: var(--on-accent);
+  cursor: default;
+}
+
+.sessions-actions-top {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 12px;
+}
+
+.revoke-password-input {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.revoke-password-input label {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-secondary);
+}
+
+.revoke-password-input input {
+  padding: 8px 12px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  outline: none;
+}
+
+.revoke-password-input input:focus {
+  border-color: var(--danger);
+}
+
+.revoke-password-error {
+  color: var(--danger);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+.revoke-all-modal-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.revoke-all-modal-description {
+  color: var(--text-secondary);
+  font-size: calc(14px * var(--font-scale, 1));
+  line-height: 1.5;
+  margin: 0;
+}
+
+.revoke-all-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.revoke-all-modal-cancel-btn {
+  padding: 8px 16px;
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.revoke-all-modal-cancel-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--text-muted);
+}
+
+.revoke-all-modal-confirm-btn {
+  padding: 8px 16px;
+  background: var(--danger);
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  color: #fff;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.revoke-all-modal-confirm-btn:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.revoke-all-modal-confirm-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sessions-revoke-all-btn {
+  padding: 10px 20px;
+  background: none;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  color: var(--danger);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sessions-revoke-all-btn:hover:not(:disabled) {
+  background: rgba(240, 71, 71, 0.08);
+}
+
+.sessions-revoke-all-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Loading state */
+.settings-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  color: var(--text-muted);
+}
+
+/* Error state */
+.settings-error {
+  padding: 12px 16px;
+  background: rgba(240, 71, 71, 0.08);
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  color: var(--danger);
+  font-size: calc(13px * var(--font-scale, 1));
+  margin-bottom: 16px;
+}
+
+/* ─── Audio & Video Section ─────────────────────────────────────────── */
+
+/* Widen device selectors in settings context */
+.settings-device-row .device-selector__select {
+  max-width: 100%;
+  width: 100%;
+}
+
+.settings-quality-premium-badge {
+  font-size: calc(10px * var(--font-scale, 1));
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--accent-secondary, var(--accent-primary));
+  color: var(--bg-primary);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* ─── Disabled row (Music Mode) ────────────────────────────────────── */
+
+.settings-row-disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+/* Disabled toggle styling */
+.settings-toggle input:disabled + .settings-toggle-track {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ─── OS Permission Status Badges (#197) ──────────────────────────── */
+
+.os-perm-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.os-perm-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.os-perm-badge--granted {
+  background: color-mix(in srgb, var(--success-color, #22c55e) 15%, transparent);
+  color: var(--success-color, #22c55e);
+}
+
+.os-perm-badge--denied {
+  background: color-mix(in srgb, var(--error-color, #ef4444) 15%, transparent);
+  color: var(--error-color, #ef4444);
+}
+
+.os-perm-badge--pending {
+  background: color-mix(in srgb, var(--text-tertiary, #888) 15%, transparent);
+  color: var(--text-tertiary, #888);
+}
+
+.os-perm-badge--unavailable {
+  background: color-mix(in srgb, var(--text-tertiary, #888) 10%, transparent);
+  color: var(--text-tertiary, #888);
+  font-style: italic;
+}
+
+.os-perm-critical {
+  color: var(--error-color, #ef4444);
+  font-weight: 600;
+  font-size: 0.8em;
+}
+
+.os-perm-warning {
+  color: var(--error-color, #ef4444);
+}
+
+.settings-row--warning {
+  border-left: 3px solid var(--error-color, #ef4444);
+  padding-left: 12px;
+}
+
+.os-perm-actions .btn {
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+  transition: opacity 0.15s;
+}
+
+.os-perm-actions .btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.os-perm-actions .btn-sm {
+  padding: 4px 10px;
+}
+
+.os-perm-actions .btn-primary {
+  background: var(--accent-primary, #4f46e5);
+  color: #fff;
+}
+
+.os-perm-actions .btn-primary:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.os-perm-actions .btn-secondary {
+  background: var(--bg-hover, #333);
+  color: var(--text-primary, #fff);
+}
+
+.os-perm-actions .btn-secondary:hover:not(:disabled) {
+  opacity: 0.8;
+}
+
+/* ─── Audio Quality Tier Slider ────────────────────────────────────── */
+
+.settings-tier-slider-container {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+
+/*
+ * Labels — 7 equal-width flex items.
+ * Centers sit at ~7.14%, ~21.4%, ~35.7%, 50%, ~64.3%, ~78.6%, ~92.9% of the container.
+ */
+.settings-tier-labels {
+  display: flex;
+}
+
+.settings-tier-label {
+  flex: 1;
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 0;
+  transition: all 0.15s ease;
+  text-align: center;
+  user-select: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Reset native <button> styling so the labels render as text, not chips. */
+  background: none;
+  border: none;
+  font-family: inherit;
+  font-weight: inherit;
+  appearance: none;
+}
+
+.settings-tier-label:focus {
+  outline: none;
+}
+
+.settings-tier-label:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.settings-tier-label:hover {
+  color: var(--text-primary);
+}
+
+.settings-tier-label.active {
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+/*
+ * Track wrapper — holds the slider + ticks.
+ * The slider is inset so the thumb's center range aligns with the N
+ * equal-width label centers above.
+ *
+ * Math: for N=7 columns, each column is ~14.28% wide, centers at
+ * 7.14%, 21.43%, 35.71%, 50%, 64.29%, 78.57%, 92.86%.
+ * The slider thumb travels from 7.14% to 92.86% of the container,
+ * achieved by adding ~7.14% padding on each side (minus half-thumb).
+ */
+.settings-tier-track {
+  position: relative;
+  height: 20px;
+  padding: 0 calc(100% / 14 - 10px); /* ~7.14% inset minus half-thumb-width */
+}
+
+/* Tick marks — evenly spaced across the inset track */
+.settings-tier-ticks {
+  position: absolute;
+  top: 0;
+  /* Inset by ~7.14% of parent for thumb center alignment */
+  left: calc(100% / 14);
+  right: calc(100% / 14);
+  height: 100%;
+  pointer-events: none;
+  z-index: 0;
+  display: flex;
+  justify-content: space-between;
+}
+
+.settings-tier-tick {
+  width: 2px;
+  height: 14px;
+  margin-top: 3px; /* vertically center within 20px track */
+  background: var(--border-color);
+  border-radius: 1px;
+  transition: background 0.15s ease;
+  flex-shrink: 0;
+}
+
+.settings-tier-tick.active {
+  background: var(--accent-fill);
+}
+
+.settings-tier-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 6px;
+  margin: 7px 0; /* center the 6px track within the 20px wrapper */
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+  outline: none;
+}
+
+.settings-tier-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent-fill);
+  cursor: pointer;
+  border: 3px solid var(--bg-primary);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+}
+
+.settings-tier-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.1);
+}
+
+/* Floating kbps badge below the slider — styled like the active codec highlight */
+.settings-tier-kbps-container {
+  position: relative;
+  height: 28px;
+  margin-top: 4px;
+  margin-bottom: 4px;
+}
+
+.settings-tier-kbps-label {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  outline: 1.5px solid var(--accent-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 700;
+  color: var(--accent-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+  transition: left 0.15s ease;
+}
+
+/* Inline estimated-bitrate badge — same visual treatment as the kbps slider label */
+.settings-estimated-bitrate {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  justify-content: center;
+  padding: 4px 14px;
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  outline: 1.5px solid var(--accent-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 700;
+  color: var(--accent-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  margin-top: 8px;
+  width: fit-content;
+}
+
+/* KLIPY ID chip — inherits estimated-bitrate styling but allows text to wrap/shrink */
+.settings-klipy-id-chip {
+  font-family: monospace;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  word-break: break-all;
+  white-space: normal;
+  max-width: 100%;
+  padding: 4px 10px;
+}
+
+/* Rotate button next to the ID chip */
+.settings-rotate-id-btn {
+  flex-shrink: 0;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1.5px solid var(--accent-primary);
+  background: transparent;
+  color: var(--accent-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s;
+  align-self: center;
+}
+
+.settings-rotate-id-btn:hover:not(:disabled) {
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+}
+
+.settings-rotate-id-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.settings-codec-info-badge {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  justify-content: center;
+  padding: 4px 14px;
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  outline: 1.5px solid var(--accent-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 700;
+  color: var(--accent-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: normal;
+  margin-top: 8px;
+  width: fit-content;
+  line-height: 1.5;
+}
+
+.settings-codec-meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 10px;
+  row-gap: 4px;
+  padding: 8px 14px;
+  font-weight: 500;
+  max-width: 520px;
+}
+
+.settings-codec-meta .settings-codec-meta-row {
+  display: contents;
+}
+
+.settings-codec-meta dt {
+  font-weight: 700;
+  color: var(--accent-primary);
+}
+
+.settings-codec-meta dd {
+  margin: 0;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.settings-codec-meta dd em {
+  font-style: normal;
+  color: var(--text-tertiary);
+}
+
+.settings-tier-description {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.settings-tier-description span:first-child {
+  font-weight: 600;
+  color: var(--text-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+  letter-spacing: 0.03em;
+}
+
+/*
+ * DM Privacy slider override — 4 stops instead of 7.
+ * For N=4 labels with flex:1, centers are at 12.5%, 37.5%, 62.5%, 87.5%.
+ * The -10px compensates for Chromium's range thumb being 10px inset from edges,
+ * matching the audio quality slider's approach (calc(100%/14 - 10px) for 7 stops).
+ */
+.dm-privacy-track {
+  padding: 0 calc(12.5% - 10px);
+}
+
+.dm-privacy-track .settings-tier-ticks {
+  left: 12.5%;
+  right: 12.5%;
+}
+
+/* ─── Audio Settings Controls ──────────────────────────────────────── */
+
+.settings-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 140px;
+  height: 4px;
+  background: var(--bg-tertiary);
+  border-radius: 2px;
+  outline: none;
+  flex-shrink: 0;
+}
+
+.settings-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent-fill);
+  cursor: pointer;
+  border: 2px solid var(--bg-primary);
+}
+
+/* Volume slider — wider track, bigger thumb */
+.settings-volume-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+  outline: none;
+}
+
+.settings-volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent-fill);
+  cursor: pointer;
+  border: 2px solid var(--bg-primary);
+}
+
+.settings-volume-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0 12px;
+}
+
+.settings-volume-label {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  min-width: 100px;
+}
+
+.settings-select {
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  outline: none;
+  flex-shrink: 0;
+}
+
+.settings-select:focus {
+  border-color: var(--accent-primary);
+}
+
+/* ─── Basic / Advanced Mode Toggle ──────────────────────────────── */
+
+.settings-mode-toggle {
+  display: flex;
+  gap: 0;
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  padding: 3px;
+  margin-bottom: 16px;
+  border: 1px solid var(--border-color);
+}
+
+.settings-mode-pill {
+  flex: 1;
+  text-align: center;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.settings-mode-pill:hover {
+  color: var(--text-secondary);
+}
+
+.settings-mode-pill.active {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+}
+
+/* ─── Codec & Hardware Section ─────────────────────────────────────── */
+
+.settings-gpu-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  font-family: monospace;
+  vertical-align: middle;
+}
+
+/* Codec grid — two-column layout for HW vs SW */
+.settings-codec-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.settings-codec-column {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-primary);
+}
+
+.settings-codec-column.active {
+  border-color: rgba(80, 200, 120, 0.3);
+}
+
+.settings-codec-column-header {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.settings-codec-column-header.active {
+  color: #50c878;
+}
+
+.settings-codec-column-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.settings-codec-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  font-size: calc(12px * var(--font-scale, 1));
+  cursor: default;
+}
+
+.settings-codec-item.preferred {
+  background: rgba(80, 200, 120, 0.12);
+  outline: 1px solid rgba(80, 200, 120, 0.3);
+}
+
+.settings-codec-item.in-use {
+  outline: 1.5px solid var(--accent-primary);
+}
+
+.settings-codec-item.unsupported {
+  background: transparent;
+}
+
+.settings-codec-name {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.settings-codec-name.strikethrough {
+  text-decoration: line-through;
+  color: var(--text-muted);
+}
+
+.settings-codec-empty {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.settings-hw-fallback-notice {
+  padding: 8px 12px;
+  margin-top: 4px;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  background: rgba(255, 170, 0, 0.08);
+  border: 1px solid rgba(255, 170, 0, 0.25);
+  color: var(--text-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.5;
+}
+
+.settings-codec-preference-notice {
+  padding: 8px 12px;
+  margin-top: 4px;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  background: rgba(88, 166, 255, 0.08);
+  border: 1px solid rgba(88, 166, 255, 0.2);
+  color: var(--text-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.4;
+}
+
+/* Codec tooltips (delayed, CSS-only) */
+[data-tooltip] {
+  position: relative;
+}
+
+[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 500;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  transition-delay: 0s;
+  z-index: 10;
+}
+
+[data-tooltip]:hover::after {
+  opacity: 1;
+  transition-delay: 0.5s;
+}
+
+/* ─── Mic Test ─────────────────────────────────────────────────────────────── */
+
+.settings-mic-test-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 0 8px;
+}
+
+.settings-mic-test-btn {
+  padding: 6px 18px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+  white-space: nowrap;
+}
+
+.settings-mic-test-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--accent-primary);
+}
+
+.settings-mic-test-btn.testing {
+  background: #3b1515;
+  border-color: #b91c1c;
+  color: #fca5a5;
+}
+
+.settings-mic-test-btn.testing:hover {
+  background: rgba(239, 68, 68, 0.2);
+}
+
+.settings-mic-test-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.settings-mic-test-error {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: #f87171;
+}
+
+/* ─── Output Test ───────────────────────────────────────────────────────────── */
+
+.settings-output-test-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 0 8px;
+}
+
+.settings-output-test-btn {
+  padding: 6px 18px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+  white-space: nowrap;
+}
+
+.settings-output-test-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--accent-primary);
+}
+
+.settings-output-test-btn.testing {
+  background: #3b1515;
+  border-color: #b91c1c;
+  color: #fca5a5;
+}
+
+.settings-output-test-btn.testing:hover {
+  background: rgba(239, 68, 68, 0.2);
+}
+
+.settings-output-test-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.settings-output-test-error {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: #f87171;
+}
+
+/* ─── Camera Test ───────────────────────────────────────────────────────────── */
+
+.settings-camera-test-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 0 8px;
+}
+
+.settings-camera-test-btn {
+  padding: 6px 18px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+  white-space: nowrap;
+}
+
+.settings-camera-test-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--accent-primary);
+}
+
+.settings-camera-test-btn.testing {
+  background: #3b1515;
+  border-color: #b91c1c;
+  color: #fca5a5;
+}
+
+.settings-camera-test-btn.testing:hover {
+  background: rgba(239, 68, 68, 0.2);
+}
+
+.settings-camera-test-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.settings-camera-test-error {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: #f87171;
+}
+
+.settings-mic-meter-container {
+  padding: 0 0 12px;
+}
+
+.settings-mic-meter-track {
+  position: relative;
+  height: 8px;
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.settings-mic-meter-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  border-radius: 4px;
+  background: linear-gradient(
+    90deg,
+    #22c55e 0%,
+    #22c55e 75%,
+    #eab308 75%,
+    #eab308 92.5%,
+    #ef4444 92.5%,
+    #ef4444 100%
+  );
+  transition: width 0.05s linear;
+  will-change: width;
+}
+
+.settings-mic-meter-ticks {
+  display: flex;
+  justify-content: space-between;
+  padding-top: 4px;
+  font-size: calc(10px * var(--font-scale, 1));
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Tree Navigation ─────────────────────────────────────────────────────── */
+
+.settings-nav-group {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Tree container under active nav item */
+.settings-nav-tree {
+  display: flex;
+  flex-direction: column;
+  padding-left: 18px;
+  position: relative;
+}
+
+/* Each tree item wrapper — holds the vertical trunk line */
+.settings-nav-tree-item-wrapper {
+  position: relative;
+}
+
+/* Vertical trunk line */
+.settings-nav-tree-item-wrapper::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-left: 1.5px solid var(--border-color);
+  pointer-events: none;
+}
+
+/* Last item: trunk stops where the L-connector curves */
+.settings-nav-tree-item-wrapper--last::before {
+  bottom: auto;
+  height: calc(50% - 5px);
+}
+
+/* Tree item button */
+.settings-nav-tree-item {
+  display: block;
+  width: 100%;
+  padding: 6px 8px 6px 20px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: calc(12px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  text-align: left;
+  transition: color 0.15s ease;
+  position: relative;
+}
+
+/* L-connector from trunk to item */
+.settings-nav-tree-item::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 50%;
+  width: 12px;
+  border-left: 1.5px solid var(--border-color);
+  border-bottom: 1.5px solid var(--border-color);
+  border-bottom-left-radius: 6px;
+  pointer-events: none;
+}
+
+.settings-nav-tree-item:hover {
+  color: var(--text-secondary);
+}
+
+.settings-nav-tree-item.active {
+  color: var(--accent-primary);
+  font-weight: 600;
+}
+
+/* ─── Slider Value Above Bar ─────────────────────────────────────── */
+
+.settings-slider-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  min-width: 140px;
+  flex-shrink: 0;
+}
+
+.settings-slider-value {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 700;
+  color: var(--accent-primary);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+/* ─── Secondary Button ───────────────────────────────────────────── */
+
+.settings-btn-secondary {
+  padding: 8px 18px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.settings-btn-secondary:hover {
+  background: var(--bg-hover, var(--bg-secondary));
+  border-color: var(--accent-primary);
+}
+
+/* ─── Blocked back button ────────────────────────────────────────────────── */
+
+.settings-back-btn--blocked {
+  cursor: not-allowed;
+  opacity: 0.4;
+  color: var(--text-muted);
+}
+
+.settings-back-btn--blocked:hover {
+  color: var(--text-muted);
+}
+
+/* ─── Pending changes blob ───────────────────────────────────────────────── */
+
+.settings-pending-blob {
+  margin-top: 16px;
+  padding: 14px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  animation: blobSlideIn 0.3s ease-out;
+}
+
+@keyframes blobSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.settings-pending-blob-text {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  margin: 0 0 10px;
+  line-height: 1.4;
+}
+
+.settings-pending-blob-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.settings-pending-blob-apply {
+  flex: 1;
+  padding: 7px 14px;
+  background: var(--accent-fill);
+  border: none;
+  border-radius: 6px;
+  /* Use the theme's on-accent token instead of hardcoded white so the
+     button stays readable in High Contrast mode (where --accent-primary
+     is pure yellow and --on-accent flips to pure black). #489 contrast
+     pass discovered the original `#fff` here unreadable against HCM
+     yellow. */
+  color: var(--on-accent);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  transition: filter 0.15s ease;
+}
+
+.settings-pending-blob-apply:hover {
+  filter: brightness(1.1);
+}
+
+.settings-pending-blob-revert {
+  flex: 1;
+  padding: 7px 14px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.settings-pending-blob-revert:hover {
+  border-color: var(--accent-primary);
+}
+
+/* ─── Blob bounce animation (triggered on back button hover) ─────────────── */
+
+.settings-pending-blob--bouncing {
+  animation: blobBounce 1.5s ease-in-out infinite;
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.25),
+    0 0 20px 4px rgba(var(--accent-primary-rgb, 250, 112, 154), 0.4);
+  border-color: var(--accent-primary);
+}
+
+@keyframes blobBounce {
+  0%,
+  100% {
+    transform: translateY(0) scale(1);
+    box-shadow:
+      0 4px 16px rgba(0, 0, 0, 0.25),
+      0 0 20px 4px rgba(var(--accent-primary-rgb, 250, 112, 154), 0.4);
+  }
+  25% {
+    transform: translateY(-10px) scale(1.03);
+    box-shadow:
+      0 12px 32px rgba(0, 0, 0, 0.35),
+      0 0 30px 8px rgba(var(--accent-primary-rgb, 250, 112, 154), 0.6);
+  }
+  50% {
+    transform: translateY(0) scale(1);
+    box-shadow:
+      0 4px 16px rgba(0, 0, 0, 0.25),
+      0 0 20px 4px rgba(var(--accent-primary-rgb, 250, 112, 154), 0.4);
+  }
+}
+
+/* ─── Blob glow fadeout (after mouse leaves back button) ──────────────────── */
+
+.settings-pending-blob--fading {
+  border-color: var(--accent-primary);
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.25),
+    0 0 20px 4px rgba(var(--accent-primary-rgb, 250, 112, 154), 0.4);
+  animation: blobGlowFade 3s ease-out forwards;
+}
+
+@keyframes blobGlowFade {
+  from {
+    box-shadow:
+      0 4px 16px rgba(0, 0, 0, 0.25),
+      0 0 20px 4px rgba(var(--accent-primary-rgb, 250, 112, 154), 0.4);
+    border-color: var(--accent-primary);
+  }
+  to {
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    border-color: var(--border-color);
+  }
+}
+
+/* ─── Advanced mode notice ───────────────────────────────────────────────── */
+
+.settings-mode-notice {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  margin: 6px 0 0;
+  padding: 8px 12px;
+  background: rgba(var(--accent-primary-rgb, 250, 112, 154), 0.06);
+  border-left: 2px solid var(--accent-primary);
+  border-radius: 0 6px 6px 0;
+  line-height: 1.4;
+}
+
+/* ─── Reduce animations support ──────────────────────────────────────────── */
+
+[data-reduce-animations='true'] .settings-pending-blob,
+[data-reduce-animations='true'] .settings-pending-blob--bouncing,
+[data-reduce-animations='true'] .settings-pending-blob--fading {
+  animation-duration: 0s;
+}
+
+/* ─── Notification Permission Banner ─────────────────────────────────────── */
+
+.settings-notification-permission-banner {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 16px 24px;
+  margin-bottom: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-notification-permission-banner p {
+  font-size: calc(14px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+.settings-notification-permission-btn {
+  background: var(--accent-fill);
+  /* See .settings-pending-blob-apply for the HCM rationale on --on-accent. */
+  color: var(--on-accent);
+  border: none;
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity 0.15s ease;
+}
+
+.settings-notification-permission-btn:hover {
+  opacity: 0.85;
+}
+
+/* ─── Time Input (Quiet Hours) ───────────────────────────────────────────── */
+
+.settings-time-input {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  color: var(--text-primary);
+  color-scheme: light dark;
+}
+
+.settings-time-input:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}

@@ -1,0 +1,4 @@
+{
+  "//": "Tracked HIGH/CRITICAL npm-audit advisory exceptions for services/media-plane. Consumed by scripts/security/npm-audit-gate.{sh,mjs} via the build.yml 'Dependency audit' step. PREFER bumping the dependency (an `overrides` entry in package.json) over accepting. Only add an entry here when no fixed version exists yet. Each entry: { \"id\": \"GHSA-xxxx-xxxx-xxxx\", \"reason\": \"why accepted + tracking link\", \"review_by\": \"YYYY-MM-DD\" }. An expired review_by emits a CI warning (never a block). See [internal]quality-gate-definition.md 'npm-audit gate'.",
+  "accepted": []
+}

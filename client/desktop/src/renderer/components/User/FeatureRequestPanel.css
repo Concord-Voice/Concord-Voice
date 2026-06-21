@@ -1,0 +1,123 @@
+/* ─── Feature Request panel (#160) ───────────────────────────────────────────
+ *
+ * The feature-mode body of the feedback modal. Lives inside
+ * `.feedback-panel-body` (FeedbackModal.css) and provides the form-field
+ * chrome. Mirrors the bug-report panel's visual language (label + control +
+ * counter) so the two modes feel identical; differs only in the optional
+ * category <select> (vs the bug panel's diagnostics checkbox).
+ */
+
+.feature-request-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.feature-request-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.feature-request-label {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.feature-request-required {
+  color: var(--danger);
+}
+
+.feature-request-optional {
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+.feature-request-input,
+.feature-request-textarea,
+.feature-request-select {
+  width: 100%;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(14px * var(--font-scale, 1));
+  padding: 8px 10px;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease;
+}
+
+.feature-request-textarea {
+  resize: vertical;
+  min-height: 120px;
+  line-height: 1.5;
+}
+
+.feature-request-select {
+  cursor: pointer;
+}
+
+.feature-request-input:focus,
+.feature-request-textarea:focus,
+.feature-request-select:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
+.feature-request-input:disabled,
+.feature-request-textarea:disabled,
+.feature-request-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.feature-request-input::placeholder,
+.feature-request-textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.feature-request-counter {
+  align-self: flex-end;
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Submit ────────────────────────────────────────────────────────────── */
+
+.feature-request-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.feature-request-submit {
+  background: var(--accent-fill);
+  border: 1px solid var(--accent-primary);
+  color: var(--on-accent);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  padding: 8px 18px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.feature-request-submit:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.feature-request-submit:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+.feature-request-submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

@@ -1,0 +1,92 @@
+/* OutgoingCallModal — centered modal styling (#1209 plan task F2). */
+
+.outgoing-call-modal__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+}
+
+.outgoing-call-modal {
+  min-width: 340px;
+  max-width: 420px;
+  padding: 32px 28px;
+  background: var(--surface-elevated, #2a2d33);
+  color: var(--text-primary, #ffffff);
+  border: 1px solid var(--border-accent, #4a4d55);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.outgoing-call-modal__avatar {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: var(--surface-muted, #3a3d45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid var(--border-accent, #5865f2);
+}
+
+.outgoing-call-modal__initials {
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.outgoing-call-modal__text {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.outgoing-call-modal__name {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.outgoing-call-modal__subtitle {
+  font-size: 13px;
+  color: var(--text-secondary, #aab);
+  text-align: center;
+}
+
+/* Group tally (#1219 R3): ringing callees in the normal subtitle color;
+   decliners struck-through + dimmed so the caller sees who dropped out. */
+.outgoing-call-modal__ringing {
+  color: var(--text-secondary, #aab);
+}
+
+.outgoing-call-modal__declinee {
+  color: var(--text-muted, #777);
+  text-decoration: line-through;
+}
+
+.outgoing-call-modal__cancel {
+  border: none;
+  border-radius: 6px;
+  padding: 10px 28px;
+  /* Darker red fallback ensures WCAG AA contrast (5.07:1) with white text.
+     The CSS variable from theme typically resolves first; the fallback is
+     used only when --danger is unset (early SSR, theme not loaded). */
+  background: var(--danger, #b91c1c);
+  color: white;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.outgoing-call-modal__cancel:hover {
+  opacity: 0.9;
+}

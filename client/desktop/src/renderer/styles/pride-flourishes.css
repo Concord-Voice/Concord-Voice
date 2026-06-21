@@ -1,0 +1,140 @@
+/* ─── Pride scheme — rainbow flourishes (experiment/theme) ────────────────────
+ *
+ * Decorative overrides scoped to [data-scheme='pride'] ONLY — they lean the
+ * rainbow into the app chrome (titlebar, active indicators, dividers,
+ * scrollbars) while body text and the functional pink/azure accents from the
+ * theme block stay readable.
+ *
+ * Kept OUT of index.css on purpose: the design-tokens drift guard
+ * (tests/unit/styles/design-tokens.test.ts) counts every `[data-scheme=` line in
+ * index.css as a theme block, and these descendant-selector overrides are not
+ * blocks. Living in a separate, component-imported stylesheet keeps that guard
+ * honest. Most rules win over the per-component base styles on specificity
+ * ([data-scheme='pride'] .x = 0,2,0 > .x = 0,1,0); the scrollbar uses
+ * !important to beat per-component scrollbar rules.
+ *
+ * The six-stop gradient is the Pride flag: red, orange, yellow, green, blue,
+ * violet. Horizontal flourishes reuse --gradient-brand (the 90deg flag from the
+ * theme block); vertical ones reuse --gradient-brand-vertical (the 180deg variant
+ * declared once on the scheme below).
+ */
+
+/* Buttons & solid highlights → rainbow. The fill sites use
+   `background: var(--accent-fill)`, which defaults to --accent-primary for every
+   other theme; here it becomes the flag gradient. Text / border / box-shadow
+   uses of --accent-primary stay pink (a gradient can't substitute a color).
+   --gradient-brand-vertical is the 180deg companion to --gradient-brand, declared
+   once here and reused by the stripe / divider / scrollbar flourishes below. */
+[data-scheme='pride'] {
+  --accent-fill: var(--gradient-brand);
+  --gradient-brand-vertical: linear-gradient(
+    180deg,
+    #e40303,
+    #ff8c00,
+    #ffed00,
+    #008026,
+    #004dff,
+    #750787
+  );
+}
+
+/* Rainbow line under the titlebar + rainbow wordmark */
+[data-scheme='pride'] .titlebar {
+  position: relative;
+  border-bottom-color: transparent;
+}
+[data-scheme='pride'] .titlebar::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--gradient-brand);
+}
+[data-scheme='pride'] .titlebar-title {
+  background: var(--gradient-brand);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+/* Rainbow left stripe on the active channel (alongside the existing arrow) */
+[data-scheme='pride'] .channel-item.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--gradient-brand-vertical);
+}
+
+/* Rainbow divider in the server bar */
+[data-scheme='pride'] .server-bar-divider {
+  background: var(--gradient-brand-vertical);
+}
+
+/* Rainbow scrollbar thumbs (!important to beat per-component scrollbar styles) */
+[data-scheme='pride'] ::-webkit-scrollbar-thumb {
+  background: var(--gradient-brand-vertical) !important;
+}
+
+/* ─── Legibility halo over the rainbow fills (WCAG 1.4.3 mitigation) ───────────
+ * The rainbow --accent-fill backs text-bearing buttons/badges whose foreground is
+ * a single static color, which cannot stay legible across all six flag stops
+ * (white washes out over yellow/green; near-black washes out over blue/violet).
+ * A contrasting text-shadow halo restores readability over any stop. Two groups
+ * by foreground color: white text (--on-accent) gets a dark halo; dark text
+ * (--bg-primary) gets a light halo. Pride-scoped, so the other 14 schemes (solid
+ * --accent-primary fills) are untouched.
+ *
+ * MAINTENANCE: when a surface adopts `background: var(--accent-fill)` AND paints
+ * text on it, add its selector to the group below matching its foreground color.
+ * Regression-locked by tests/unit/styles/accent-fill.test.ts. */
+
+/* White text (color: var(--on-accent)) → dark halo */
+[data-scheme='pride'] .sso-link-confirm__submit,
+[data-scheme='pride'] .sso-eager-unlock__submit,
+[data-scheme='pride'] .sso-passphrase-setup__submit,
+[data-scheme='pride'] .new-message-badge,
+[data-scheme='pride'] .member-profile-role-badge.role-owner,
+[data-scheme='pride'] .send-friend-request-btn,
+[data-scheme='pride'] .user-profile-modal-role-badge.role-owner,
+[data-scheme='pride'] .about-info-copy-btn:hover,
+[data-scheme='pride'] .about-update-btn,
+[data-scheme='pride'] .about-update-action-btn:hover,
+[data-scheme='pride'] .about-update-action-btn--primary,
+[data-scheme='pride'] .font-option-theme-badge,
+[data-scheme='pride'] .revocation-mode-btn.active,
+[data-scheme='pride'] .settings-pending-blob-apply,
+[data-scheme='pride'] .settings-notification-permission-btn,
+[data-scheme='pride'] .bug-report-submit,
+[data-scheme='pride'] .feature-request-submit,
+[data-scheme='pride'] .connection-lost-btn.primary,
+[data-scheme='pride'] .force-update-btn.primary,
+[data-scheme='pride'] .update-banner__btn.primary {
+  text-shadow:
+    0 0 2px rgba(0, 0, 0, 0.85),
+    0 0 4px rgba(0, 0, 0, 0.5);
+}
+
+/* Dark text (color: var(--bg-primary)) → light halo */
+[data-scheme='pride'] .channel-group-header__count,
+[data-scheme='pride'] .channel-unread-badge,
+[data-scheme='pride'] .conversation-unread-badge,
+[data-scheme='pride'] .friends-add-btn:hover,
+[data-scheme='pride'] .personal-thread-avatar,
+[data-scheme='pride'] .add-friend-action-btn,
+[data-scheme='pride'] .create-group-btn:hover,
+[data-scheme='pride'] .create-group-add-btn:hover:not(:disabled),
+[data-scheme='pride'] .create-group-create-btn,
+[data-scheme='pride'] .group-member-role-badge,
+[data-scheme='pride'] .session-card-badge,
+[data-scheme='pride'] .settings-rotate-id-btn:hover:not(:disabled) {
+  text-shadow:
+    0 0 2px rgba(255, 255, 255, 0.9),
+    0 0 4px rgba(255, 255, 255, 0.55);
+}

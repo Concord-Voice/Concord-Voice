@@ -1,0 +1,60 @@
+/* ─── Typing Indicator ──────────────────────────────────────────────────── */
+
+.typing-indicator-container {
+  height: calc(24px * var(--sp, 1));
+  display: flex;
+  align-items: center;
+  padding: 0 calc(16px * var(--sp, 1));
+  min-height: calc(24px * var(--sp, 1));
+}
+
+.typing-indicator-text {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: calc(4px * var(--sp, 1));
+}
+
+/* ─── Animated Dots ────────────────────────────────────────────────────── */
+
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: calc(2px * var(--sp, 1));
+}
+
+.typing-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background-color: var(--text-muted);
+  animation: typingPulse 1.4s ease-in-out infinite;
+}
+
+.typing-dot:nth-child(1) {
+  animation-delay: 0s;
+}
+
+.typing-dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.typing-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes typingPulse {
+  0%,
+  60%,
+  100% {
+    opacity: 0.3;
+    transform: scale(0.8);
+  }
+  30% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}

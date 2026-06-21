@@ -1,0 +1,19 @@
+# Cloudflare Pages headers — replaces the deleted Go spa.Handler per-response headers (#976 / ADR-0015).
+# Hashed assets (content-hash in filename) are immutable; index.html is short-TTL for fast rollback.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+  X-Content-Type-Options: nosniff
+/*
+  Cache-Control: public, max-age=300
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+  Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+  Permissions-Policy: camera=(self), microphone=(self), geolocation=(), payment=(), usb=(), magnetometer=(), gyroscope=(), accelerometer=()
+# HSTS + Permissions-Policy mirror the deleted nginx /spa/ block. The
+# Permissions-Policy keeps getUserMedia (camera/microphone) available to the SPA
+# on the Pages origin and denies unused features.
+# NOTE: no Content-Security-Policy here — the bundle's index.html ships its own
+# meta-CSP (connect-src covers *.example.com). Imposing default-src 'none'
+# would block the bundle (mirrors the deleted handler.go:93 CSP deletion).
+# NOTE: no X-XSS-Protection — it is deprecated; the meta-CSP is the real XSS defense.

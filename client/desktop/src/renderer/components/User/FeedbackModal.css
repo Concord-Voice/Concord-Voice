@@ -1,0 +1,156 @@
+/* ─── Feedback modal (#158) ──────────────────────────────────────────────────
+ *
+ * Layout reuses the standard Modal chrome (.modal-container, .modal-header,
+ * .modal-body). The body container below adds the mode switcher tab strip,
+ * the panel body (filled in by #159 / #160), and the footer. The panels
+ * themselves carry their own form-field styles in the follow-up branches.
+ */
+
+.feedback-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 16px 24px 20px;
+}
+
+/* ─── Mode switcher tabs ────────────────────────────────────────────────── */
+
+.feedback-mode-switch {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 0;
+}
+
+.feedback-mode-tab {
+  flex: 1;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  padding: 10px 16px;
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease;
+  /* Pull the tab's own bottom border down to overlap the strip's separator,
+     so the active underline reads as a single continuous line. */
+  margin-bottom: -1px;
+}
+
+.feedback-mode-tab:hover {
+  color: var(--text-primary);
+}
+
+.feedback-mode-tab:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.feedback-mode-tab.active {
+  color: var(--text-primary);
+  border-bottom-color: var(--accent-primary);
+}
+
+/* ─── Panel body ────────────────────────────────────────────────────────── */
+
+.feedback-panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 200px;
+}
+
+.feedback-panel-placeholder {
+  color: var(--text-muted);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-style: italic;
+}
+
+.feedback-panel-placeholder code {
+  font-family: 'SourceCodePro', 'Courier New', monospace;
+  font-style: normal;
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+/* ─── Submit state surfaces ─────────────────────────────────────────────── */
+
+/* Polite live region (#159). Kept in the DOM even when empty so an
+   aria-live announcement fires the moment submit progress / success content
+   is inserted — a region mounted only on demand is announced less reliably. */
+.feedback-submit-region {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.feedback-submit-status {
+  color: var(--text-muted);
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+.feedback-submit-success {
+  background: rgba(0, 200, 100, 0.08);
+  border: 1px solid var(--success);
+  border-radius: 6px;
+  padding: 12px 14px;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.feedback-submit-success a {
+  color: var(--link-color);
+  text-decoration: underline;
+}
+
+.feedback-submit-error {
+  background: rgba(240, 71, 71, 0.08);
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  padding: 12px 14px;
+  color: var(--danger);
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+/* ─── Footer ────────────────────────────────────────────────────────────── */
+
+.feedback-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid var(--border-color);
+  padding-top: 14px;
+}
+
+.feedback-btn-secondary {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.feedback-btn-secondary:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent-primary);
+}
+
+.feedback-btn-secondary:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}

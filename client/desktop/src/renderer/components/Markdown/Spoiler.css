@@ -1,0 +1,30 @@
+.spoiler {
+  display: inline;
+  background-color: var(--spoiler-bg, rgba(0, 0, 0, 0.6));
+  color: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 0 2px;
+  margin: 0;
+  font: inherit;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
+}
+
+.spoiler:hover {
+  background-color: var(--spoiler-bg-hover, rgba(0, 0, 0, 0.45));
+}
+
+.spoiler-revealed {
+  background-color: var(--spoiler-bg-revealed, rgba(0, 0, 0, 0.08));
+  color: inherit;
+  user-select: text;
+}
+
+.spoiler:focus-visible {
+  outline: 2px solid var(--focus-ring, #4a90e2);
+  outline-offset: 1px;
+}

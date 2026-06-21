@@ -1,0 +1,22 @@
+/**
+ * VoiceParticipantContextMenu — styling hooks.
+ *
+ * The menu reuses the shared ContextMenu chrome (ctx-menu-* classes from
+ * ContextMenu.css) and the EnforcementMenuItems styles; this file only adds
+ * the small affordances specific to the voice-participant menu. Keep it lean —
+ * theming flows from the CSS custom properties defined at the theme root.
+ */
+
+/* Sidebar participant name becomes interactive: pointer + subtle hover. */
+.voice-participant-name--interactive {
+  cursor: pointer;
+}
+
+.voice-participant-name--interactive:hover {
+  color: var(--text-primary);
+}
+
+/* Drag affordance: the participant being dragged dims slightly. */
+.voice-participant-name--dragging {
+  opacity: 0.5;
+}

@@ -1,0 +1,157 @@
+.totp-input-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.totp-digits {
+  display: flex;
+  gap: 8px;
+}
+
+.totp-digit {
+  width: 44px;
+  height: 52px;
+  text-align: center;
+  font-size: 22px;
+  font-family: var(--font-mono, monospace);
+  font-weight: 600;
+  border: 2px solid var(--border-color, #444);
+  border-radius: 8px;
+  background: var(--bg-secondary, #2a2a2a);
+  color: var(--text-primary, #fff);
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.totp-digit:focus {
+  border-color: var(--accent-color, #5865f2);
+  box-shadow: 0 0 0 2px rgba(88, 101, 242, 0.25);
+}
+
+.totp-digit-error {
+  border-color: var(--error-color, #ed4245);
+}
+
+.totp-digit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.totp-error {
+  color: var(--error-color, #ed4245);
+  font-size: 13px;
+  margin: 0;
+}
+
+.totp-backup-link {
+  background: none;
+  border: none;
+  color: var(--text-tertiary, #999);
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+}
+
+.totp-backup-link:hover {
+  color: var(--text-secondary, #bbb);
+}
+
+.totp-backup-link:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── MFA Method Picker ────────────────────────────────────────── */
+
+.mfa-method-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+}
+
+.mfa-method-picker-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary, #fff);
+}
+
+.mfa-method-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mfa-method-picker-option {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color, #444);
+  border-radius: 8px;
+  background: var(--bg-secondary, #2a2a2a);
+  color: var(--text-primary, #fff);
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    background 0.15s;
+  text-align: left;
+  width: 100%;
+}
+
+.mfa-method-picker-option:hover {
+  border-color: var(--accent-color, #5865f2);
+  background: var(--bg-tertiary, #333);
+}
+
+.mfa-method-picker-active {
+  border-color: var(--accent-color, #5865f2);
+  background: rgba(88, 101, 242, 0.1);
+}
+
+.mfa-method-picker-icon {
+  flex-shrink: 0;
+  color: var(--text-secondary, #bbb);
+  display: flex;
+  align-items: center;
+}
+
+.mfa-method-picker-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mfa-method-picker-label {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.mfa-method-picker-desc {
+  font-size: 11px;
+  color: var(--text-tertiary, #999);
+}
+
+.mfa-choose-another {
+  background: none;
+  border: none;
+  color: var(--text-tertiary, #999);
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 4px 0 0;
+  align-self: center;
+}
+
+.mfa-choose-another:hover {
+  color: var(--text-secondary, #bbb);
+}
+
+.mfa-choose-another:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

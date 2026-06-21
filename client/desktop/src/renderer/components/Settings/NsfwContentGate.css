@@ -1,0 +1,46 @@
+.nsfw-gate__fields {
+  display: flex;
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.nsfw-gate__input {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--input-bg, var(--bg-secondary));
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+/* <fieldset> reset — used as the semantic group for the confirm step (S6819). */
+.nsfw-gate__confirm {
+  border: none;
+  padding: 0;
+  margin: 0;
+  min-inline-size: 0;
+}
+
+.nsfw-gate__actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+/* display:block because the status states render as <output> (inline by default). */
+.nsfw-gate__status,
+.nsfw-gate__error,
+.nsfw-gate__satisfied {
+  display: block;
+  margin: 8px 0;
+  color: var(--text-secondary);
+}
+
+.nsfw-gate__status--ok {
+  color: var(--success-color, var(--accent-color));
+}
+
+.nsfw-gate__error,
+.nsfw-gate__disabled {
+  color: var(--error-color, var(--danger-color));
+}

@@ -1,0 +1,24 @@
+# Ignore host-side build outputs and dev metadata so they don't clobber
+# the in-container builder stage's freshly-installed/compiled artifacts.
+#
+# Without this file, `COPY . .` in the Dockerfile's builder stage copies
+# the host's node_modules/ (including a host-platform mediasoup-worker
+# binary) on top of the container's freshly-Linux-compiled one — producing
+# an image whose worker fails to spawn with `ENOEXEC`. The OLD Dockerfile
+# masked this bug because the production stage's `npm ci --omit=dev`
+# silently reinstalled mediasoup. The post-#1098 compile-then-copy
+# architecture exposes it. See `[internal]rules/media-plane.md`
+# "Docker Build Context Invariant" for the discipline.
+
+node_modules
+dist
+coverage
+.git
+.github
+.env
+.env.*
+*.md
+docs/
+*.test
+*.log
+.DS_Store

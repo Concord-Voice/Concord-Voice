@@ -1,0 +1,328 @@
+/* ------------------------------------------------------------------ */
+/*  Shared Context Menu Styles                                        */
+/* ------------------------------------------------------------------ */
+
+.ctx-menu-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  /* Context menus must float above every other in-app chrome (composer,
+     modals, force-update overlay at 10000, voice controls at 99999).
+     Using 100000+ guarantees the full menu is visible regardless of where
+     the right-click happens in the chat view — see QA bug #571 item #3. */
+  z-index: 100000;
+}
+
+.ctx-menu-overlay-closing {
+  pointer-events: none;
+}
+
+.ctx-menu {
+  position: fixed;
+  min-width: 180px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 6px;
+  z-index: 100001;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  animation: ctxMenuIn 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  transform-origin: top left;
+}
+
+@keyframes ctxMenuIn {
+  from {
+    opacity: 0;
+    transform: scale(0.92) translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+/* Close animation */
+.ctx-menu-closing {
+  animation: ctxMenuOut 0.15s cubic-bezier(0.32, 0.72, 0, 1) forwards;
+}
+
+.ctx-menu-closing .ctx-menu-item,
+.ctx-menu-closing .ctx-menu-header,
+.ctx-menu-closing .ctx-menu-separator {
+  animation: none !important;
+}
+
+@keyframes ctxMenuOut {
+  from {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.95) translateY(-3px);
+  }
+}
+
+/* Header */
+.ctx-menu-header {
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Separator */
+.ctx-menu-separator {
+  height: 1px;
+  background: var(--border-color);
+  margin: 4px 6px;
+}
+
+/* Menu item */
+.ctx-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  cursor: pointer;
+  border-radius: 4px;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    transform 0.1s ease;
+  text-align: left;
+}
+
+.ctx-menu-item:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.ctx-menu-item:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.ctx-menu-item-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: inherit;
+  transition: transform 0.15s ease;
+}
+
+.ctx-menu-item:hover .ctx-menu-item-icon {
+  transform: scale(1.1);
+}
+
+/* Danger variant */
+.ctx-menu-item-danger {
+  color: var(--danger);
+}
+
+.ctx-menu-item-danger:hover {
+  background: rgba(240, 71, 71, 0.1);
+  color: var(--danger);
+}
+
+/* Disabled variant */
+.ctx-menu-item-disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.ctx-menu-item-disabled:hover {
+  background: none;
+  color: var(--text-muted);
+}
+
+.ctx-menu-item-disabled:active {
+  transform: none;
+}
+
+.ctx-menu-item-disabled:hover .ctx-menu-item-icon {
+  transform: none;
+}
+
+/* Chevron for submenu triggers */
+.ctx-menu-item-chevron {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  color: var(--text-muted);
+  margin-left: auto;
+  transition:
+    transform 0.25s cubic-bezier(0.32, 0.72, 0, 1),
+    color 0.2s ease;
+}
+
+.ctx-menu-item:hover .ctx-menu-item-chevron {
+  color: var(--text-primary);
+  transform: translateX(3px);
+}
+
+/* SubMenu – flyout panel */
+.ctx-menu-item-wrapper {
+  position: relative;
+}
+
+.ctx-submenu {
+  position: absolute;
+  top: -4px;
+  left: 100%;
+  margin-left: 6px;
+  min-width: 150px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 6px;
+  z-index: 100002;
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.45),
+    0 2px 8px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(8px);
+  animation: ctxSubMenuIn 0.25s cubic-bezier(0.32, 0.72, 0, 1) forwards;
+  transform-origin: left center;
+}
+
+.ctx-submenu.ctx-submenu-flip {
+  left: auto;
+  right: 100%;
+  margin-left: 0;
+  margin-right: 6px;
+  transform-origin: right center;
+  animation-name: ctxSubMenuInFlip;
+}
+
+@keyframes ctxSubMenuIn {
+  from {
+    opacity: 0;
+    transform: translateX(-8px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+@keyframes ctxSubMenuInFlip {
+  from {
+    opacity: 0;
+    transform: translateX(8px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+/* SubMenu close animation */
+.ctx-submenu-closing {
+  animation: ctxSubMenuOut 0.15s cubic-bezier(0.32, 0.72, 0, 1) forwards !important;
+}
+
+.ctx-submenu-closing.ctx-submenu-flip {
+  animation: ctxSubMenuOutFlip 0.15s cubic-bezier(0.32, 0.72, 0, 1) forwards !important;
+}
+
+/* Cancel child entrance animations during close to prevent flash */
+.ctx-submenu-closing .ctx-menu-item,
+.ctx-submenu-closing .ctx-menu-header,
+.ctx-submenu-closing .ctx-menu-separator {
+  animation: none !important;
+}
+
+@keyframes ctxSubMenuOut {
+  from {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(-6px) scale(0.96);
+  }
+}
+
+@keyframes ctxSubMenuOutFlip {
+  from {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(6px) scale(0.96);
+  }
+}
+
+.ctx-submenu .ctx-menu-item:nth-child(1) {
+  animation-delay: 0.05s;
+}
+.ctx-submenu .ctx-menu-item:nth-child(2) {
+  animation-delay: 0.08s;
+}
+.ctx-submenu .ctx-menu-item:nth-child(3) {
+  animation-delay: 0.11s;
+}
+.ctx-submenu .ctx-menu-item:nth-child(4) {
+  animation-delay: 0.14s;
+}
+.ctx-submenu .ctx-menu-item:nth-child(5) {
+  animation-delay: 0.17s;
+}
+
+/* Staggered item entrance */
+.ctx-menu-item,
+.ctx-menu-header,
+.ctx-menu-separator {
+  animation: ctxItemSlideIn 0.2s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+
+.ctx-menu-item:nth-child(1) {
+  animation-delay: 0.02s;
+}
+.ctx-menu-item:nth-child(2) {
+  animation-delay: 0.04s;
+}
+.ctx-menu-item:nth-child(3) {
+  animation-delay: 0.06s;
+}
+.ctx-menu-item:nth-child(4) {
+  animation-delay: 0.08s;
+}
+.ctx-menu-item:nth-child(5) {
+  animation-delay: 0.1s;
+}
+.ctx-menu-item:nth-child(6) {
+  animation-delay: 0.12s;
+}
+.ctx-menu-item:nth-child(7) {
+  animation-delay: 0.14s;
+}
+.ctx-menu-item:nth-child(8) {
+  animation-delay: 0.16s;
+}
+
+@keyframes ctxItemSlideIn {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}

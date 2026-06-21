@@ -1,0 +1,231 @@
+.server-list {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: calc(8px * var(--sp, 1));
+  width: 100%;
+  padding: 0 calc(12px * var(--sp, 1));
+}
+
+/* Server icon wrapper for active pill positioning */
+.server-icon-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Active server pill indicator */
+.server-active-pill {
+  position: absolute;
+  left: -12px;
+  width: 4px;
+  height: 36px;
+  background: var(--accent-fill);
+  border-radius: 0 4px 4px 0;
+  transition: height 0.2s ease;
+}
+
+.server-icon-wrapper:hover .server-active-pill {
+  height: 20px;
+}
+
+.server-icon-wrapper:hover:has(.server-icon-btn.active) .server-active-pill {
+  height: 36px;
+}
+
+/* Unread server pill indicator */
+.server-unread-pill {
+  position: absolute;
+  left: -12px;
+  width: 4px;
+  height: 8px;
+  background: var(--text-primary);
+  border-radius: 0 4px 4px 0;
+  transition: height 0.2s ease;
+}
+
+.server-icon-wrapper:hover .server-unread-pill {
+  height: 20px;
+}
+
+.server-icon-btn.has-unread {
+  border-color: var(--text-muted);
+}
+
+/* Server icon button */
+.server-icon-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  border: 2px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  overflow: hidden;
+  padding: 0;
+}
+
+.server-icon-btn:hover,
+.server-icon-btn.active {
+  border-radius: 35%;
+  border-color: var(--accent-primary);
+}
+
+.server-icon-btn:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+.server-icon-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.server-icon-initial {
+  font-size: calc(18px * var(--font-scale, 1));
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  color: var(--text-primary);
+}
+
+/* Tooltip */
+.server-tooltip {
+  display: none;
+  position: absolute;
+  left: calc(100% + 12px);
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: calc(6px * var(--sp, 1)) calc(10px * var(--sp, 1));
+  white-space: nowrap;
+  z-index: 100;
+  pointer-events: none;
+  flex-direction: column;
+  gap: calc(2px * var(--sp, 1));
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.server-icon-wrapper:hover .server-tooltip {
+  display: flex;
+}
+
+.server-tooltip-name {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  font-family: 'SourceSans', sans-serif;
+}
+
+.server-tooltip-role {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 500;
+  text-transform: capitalize;
+}
+
+.server-tooltip-role.role-owner {
+  color: var(--accent-primary);
+}
+
+.server-tooltip-role.role-admin {
+  color: var(--accent-secondary);
+}
+
+.server-tooltip-role.role-member {
+  color: var(--text-muted);
+}
+
+/* Separator */
+.server-list-separator {
+  width: 32px;
+  height: 2px;
+  background: var(--border-color);
+  border-radius: 1px;
+}
+
+/* Add server button */
+.add-server-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  border: 2px dashed var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: var(--text-muted);
+}
+
+.add-server-btn:hover {
+  border-color: var(--success);
+  color: var(--success);
+  background: rgba(67, 181, 129, 0.08);
+  border-radius: 35%;
+}
+
+.add-server-btn:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* Loading skeletons */
+.server-list-skeletons {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: calc(8px * var(--sp, 1));
+}
+
+.server-skeleton {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  animation: skeletonPulse 1.5s ease-in-out infinite;
+}
+
+.server-skeleton:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.server-skeleton:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes skeletonPulse {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+/* Error retry button */
+.server-error-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  border: 2px solid var(--danger);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: var(--danger);
+}
+
+.server-error-btn:hover {
+  background: rgba(240, 71, 71, 0.08);
+  border-radius: 35%;
+}

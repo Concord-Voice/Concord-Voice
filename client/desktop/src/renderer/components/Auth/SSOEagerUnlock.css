@@ -1,0 +1,109 @@
+/* Shared auth form variables (form-input, form-label, form-error, etc.) */
+@import './AuthForm.css';
+
+.sso-eager-unlock {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 460px;
+  margin: auto;
+  padding: 40px;
+  gap: 20px;
+  background: var(--bg-primary);
+}
+
+.sso-eager-unlock--locked {
+  align-items: stretch;
+}
+
+.sso-eager-unlock__title {
+  font-size: calc(28px * var(--font-scale, 1));
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  color: var(--text-primary);
+  letter-spacing: 0.3px;
+  text-align: center;
+  margin-bottom: 4px;
+}
+
+.sso-eager-unlock__intro {
+  font-size: calc(14px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  line-height: 1.5;
+  text-align: center;
+  margin-bottom: 12px;
+}
+
+.sso-eager-unlock__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sso-eager-unlock__label {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.sso-eager-unlock__input {
+  padding: 10px 12px;
+  font-size: calc(14px * var(--font-scale, 1));
+  background: var(--bg-secondary);
+  border: 2px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-primary);
+  transition: border-color 0.15s ease;
+}
+
+.sso-eager-unlock__input:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
+.sso-eager-unlock__input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.sso-eager-unlock__error {
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  color: var(--danger);
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+.sso-eager-unlock__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sso-eager-unlock__submit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 16px;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  background: var(--accent-fill);
+  color: var(--on-accent);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.sso-eager-unlock__submit:hover:not(:disabled) {
+  background: var(--accent-primary-hover, var(--accent-primary));
+}
+
+.sso-eager-unlock__submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

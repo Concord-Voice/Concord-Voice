@@ -1,0 +1,145 @@
+/* ─── Bug Report panel (#159) ────────────────────────────────────────────────
+ *
+ * The bug-mode body of the feedback modal. Lives inside `.feedback-panel-body`
+ * (FeedbackModal.css) and provides the form-field chrome. Mirrors the
+ * settings-form visual language (label + control + counter) so the modal feels
+ * native to the rest of the app.
+ */
+
+.bug-report-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.bug-report-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.bug-report-label {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.bug-report-required {
+  color: var(--danger);
+}
+
+.bug-report-input,
+.bug-report-textarea {
+  width: 100%;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(14px * var(--font-scale, 1));
+  padding: 8px 10px;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease;
+}
+
+.bug-report-textarea {
+  resize: vertical;
+  min-height: 120px;
+  line-height: 1.5;
+}
+
+.bug-report-input:focus,
+.bug-report-textarea:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
+.bug-report-input:disabled,
+.bug-report-textarea:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.bug-report-input::placeholder,
+.bug-report-textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.bug-report-counter {
+  align-self: flex-end;
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Include diagnostic logs ───────────────────────────────────────────── */
+
+.bug-report-diagnostics {
+  gap: 8px;
+}
+
+.bug-report-checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.bug-report-checkbox-label input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent-primary);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.bug-report-disclosure {
+  margin: 0;
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.5;
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+/* ─── Submit ────────────────────────────────────────────────────────────── */
+
+.bug-report-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.bug-report-submit {
+  background: var(--accent-fill);
+  border: 1px solid var(--accent-primary);
+  color: var(--on-accent);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  padding: 8px 18px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.bug-report-submit:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.bug-report-submit:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+.bug-report-submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

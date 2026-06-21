@@ -1,0 +1,30 @@
+/* Server-specific context menu styles */
+
+.server-ctx-name {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  font-family: 'SourceSans', sans-serif;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+.server-ctx-role {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 500;
+  text-transform: capitalize;
+}
+
+.server-ctx-role.role-owner {
+  color: var(--accent-primary);
+}
+
+.server-ctx-role.role-admin {
+  color: var(--accent-secondary);
+}
+
+.server-ctx-role.role-member {
+  color: var(--text-muted);
+}

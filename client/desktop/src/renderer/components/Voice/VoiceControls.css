@@ -1,0 +1,214 @@
+/* ─── Shared ──────────────────────────────────────────────────── */
+
+.voice-controls__buttons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: calc(4px * var(--sp, 1));
+}
+
+.voice-controls__btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px;
+  border: none;
+  border-radius: 50%;
+  background-color: var(--bg-tertiary);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.voice-controls__btn:hover {
+  background-color: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.voice-controls__btn--active {
+  background-color: var(--danger);
+  color: #fff;
+}
+
+.voice-controls__btn--active:hover {
+  background-color: #d83c3c;
+  color: #fff;
+}
+
+.voice-controls__btn--locked {
+  opacity: 0.7;
+  cursor: not-allowed;
+  background-color: rgba(var(--warning-rgb, 230, 126, 34), 0.2);
+  color: var(--warning);
+}
+
+.voice-controls__btn--locked:hover {
+  opacity: 0.7;
+  background-color: rgba(var(--warning-rgb, 230, 126, 34), 0.25);
+}
+
+.voice-controls__btn--danger {
+  background-color: rgba(240, 71, 71, 0.2);
+  color: var(--danger);
+}
+
+.voice-controls__btn--danger:hover {
+  background-color: var(--danger);
+  color: #fff;
+}
+
+/* Chat toggle active state (accent instead of danger) */
+
+.voice-controls__btn--chat-active {
+  background-color: var(--accent-primary);
+  color: #fff;
+}
+
+.voice-controls__btn--chat-active:hover {
+  background-color: var(--accent-primary);
+  opacity: 0.85;
+  color: #fff;
+}
+
+/* ─── Video Slot Error Toast ──────────────────────────────────── */
+
+.voice-controls__slot-error {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-bottom: 8px;
+  padding: 8px 16px;
+  border-radius: 6px;
+  background-color: rgba(250, 166, 26, 0.15);
+  border: 1px solid rgba(250, 166, 26, 0.3);
+  color: var(--text-warning-strong);
+  font-size: calc(12px * var(--font-scale, 1));
+  white-space: nowrap;
+  max-width: 90%;
+  text-align: center;
+  animation: slot-error-in 200ms ease-out;
+  pointer-events: none;
+}
+
+@keyframes slot-error-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+/* ─── Full variant (inside VoiceView) ─────────────────────────── */
+
+.voice-controls--full {
+  position: relative;
+  padding: calc(12px * var(--sp, 1));
+  background-color: var(--bg-secondary);
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.voice-controls--full .voice-controls__btn {
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.voice-controls__btn-label {
+  font-size: calc(12px * var(--font-scale, 1));
+  white-space: nowrap;
+}
+
+/* ─── Persistent context (pin/unpin actions) ─────────────────── */
+
+.voice-controls__persistent-actions {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+}
+
+.voice-controls__pin-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.voice-controls__pin-btn:hover {
+  color: var(--text-primary);
+  background-color: var(--bg-hover);
+}
+
+/* ─── PiP Menu ─────────────────────────────────────────────────── */
+
+.voice-controls__pip-wrap {
+  position: relative;
+}
+
+.voice-controls__pip-menu {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-bottom: 8px;
+  min-width: 200px;
+  background-color: var(--bg-floating, #111214);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  z-index: 99999;
+}
+
+.voice-controls__pip-menu-item {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 150ms ease,
+    color 150ms ease;
+}
+
+.voice-controls__pip-menu-item:hover {
+  background-color: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.voice-controls__pip-menu-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.voice-controls__pip-menu-item:disabled:hover {
+  background: transparent;
+  color: var(--text-secondary);
+}

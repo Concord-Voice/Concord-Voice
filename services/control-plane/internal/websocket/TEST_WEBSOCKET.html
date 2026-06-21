@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Concord WebSocket Test Client</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #e0e0e0;
+        }
+        h1 {
+            color: #00d4ff;
+        }
+        .section {
+            background: #2a2a2a;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-radius: 8px;
+            border: 1px solid #3a3a3a;
+        }
+        input, textarea, button {
+            font-size: 14px;
+            padding: 8px;
+            margin: 5px 0;
+            border-radius: 4px;
+            border: 1px solid #444;
+            background: #333;
+            color: #e0e0e0;
+        }
+        input, textarea {
+            width: calc(100% - 20px);
+        }
+        button {
+            cursor: pointer;
+            background: #00d4ff;
+            color: #000;
+            border: none;
+            font-weight: 600;
+        }
+        button:hover {
+            background: #00a8cc;
+        }
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            font-weight: 600;
+        }
+        .status.connected {
+            background: #15803d;
+            color: #fff;
+        }
+        .status.disconnected {
+            background: #a51;
+            color: #fff;
+        }
+        #messages {
+            background: #1a1a1a;
+            border: 1px solid #444;
+            padding: 15px;
+            height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+        }
+        .message {
+            margin: 5px 0;
+            padding: 5px;
+            border-left: 3px solid #666;
+            padding-left: 10px;
+        }
+        .message.sent {
+            border-color: #00d4ff;
+            background: #1a3a4a;
+        }
+        .message.received {
+            border-color: #0a8;
+            background: #1a3a2a;
+        }
+        .message.system {
+            border-color: #fa0;
+            background: #3a2a1a;
+        }
+        .message.error {
+            border-color: #f44;
+            background: #3a1a1a;
+        }
+        .timestamp {
+            color: #888;
+            font-size: 11px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔌 Concord WebSocket Test Client</h1>
+
+    <div class="section">
+        <h2>Connection</h2>
+        <input type="text" id="wsUrl" aria-label="WebSocket URL" placeholder="WebSocket URL" value="ws://localhost:8080/api/v1/ws">
+        <textarea id="jwtToken" aria-label="JWT token" placeholder="Paste your JWT token here (from login response)" rows="3"></textarea>
+        <div>
+            <button id="connectBtn" onclick="connect()">Connect</button>
+            <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+        </div>
+        <div id="status" class="status disconnected">Disconnected</div>
+        <div style="font-size: 12px; color: #888; margin-top: 10px;">
+            <strong>How to get a JWT token:</strong><br>
+            1. POST to <code>http://localhost:8080/api/v1/auth/login</code><br>
+            2. Copy the <code>access_token</code> from the response<br>
+            3. Paste it above and click Connect
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Channel Subscription</h2>
+        <input type="text" id="channelId" aria-label="Channel UUID to subscribe to" placeholder="Channel UUID">
+        <div>
+            <button onclick="subscribe()" id="subscribeBtn" disabled>Subscribe</button>
+            <button onclick="unsubscribe()" id="unsubscribeBtn" disabled>Unsubscribe</button>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Send Message</h2>
+        <input type="text" id="messageChannel" aria-label="Channel UUID to send the message to" placeholder="Channel UUID">
+        <textarea id="messageContent" aria-label="Message content" placeholder="Message content" rows="2"></textarea>
+        <button onclick="sendMessage()" id="sendBtn" disabled>Send Message</button>
+    </div>
+
+    <div class="section">
+        <h2>Typing Indicator</h2>
+        <input type="text" id="typingChannel" aria-label="Channel UUID for typing indicator" placeholder="Channel UUID">
+        <div>
+            <button onclick="sendTyping(true)" id="typingStartBtn" disabled>Start Typing</button>
+            <button onclick="sendTyping(false)" id="typingStopBtn" disabled>Stop Typing</button>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Messages</h2>
+        <button onclick="clearMessages()">Clear Messages</button>
+        <div id="messages"></div>
+    </div>
+
+    <script>
+        let ws = null;
+        let clientId = null;
+        let userId = null;
+
+        function updateStatus(connected) {
+            const status = document.getElementById('status');
+            const connectBtn = document.getElementById('connectBtn');
+            const disconnectBtn = document.getElementById('disconnectBtn');
+            const subscribeBtn = document.getElementById('subscribeBtn');
+            const unsubscribeBtn = document.getElementById('unsubscribeBtn');
+            const sendBtn = document.getElementById('sendBtn');
+            const typingStartBtn = document.getElementById('typingStartBtn');
+            const typingStopBtn = document.getElementById('typingStopBtn');
+
+            if (connected) {
+                status.textContent = `Connected (Client: ${clientId}, User: ${userId})`;
+                status.className = 'status connected';
+                connectBtn.disabled = true;
+                disconnectBtn.disabled = false;
+                subscribeBtn.disabled = false;
+                unsubscribeBtn.disabled = false;
+                sendBtn.disabled = false;
+                typingStartBtn.disabled = false;
+                typingStopBtn.disabled = false;
+            } else {
+                status.textContent = 'Disconnected';
+                status.className = 'status disconnected';
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+                subscribeBtn.disabled = true;
+                unsubscribeBtn.disabled = true;
+                sendBtn.disabled = true;
+                typingStartBtn.disabled = true;
+                typingStopBtn.disabled = true;
+            }
+        }
+
+        function addMessage(text, type = 'system') {
+            const messages = document.getElementById('messages');
+            const msg = document.createElement('div');
+            msg.className = `message ${type}`;
+
+            const timestamp = new Date().toLocaleTimeString();
+            msg.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${text}`;
+
+            messages.appendChild(msg);
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function connect() {
+            const url = document.getElementById('wsUrl').value;
+            const token = document.getElementById('jwtToken').value.trim();
+
+            if (!token) {
+                addMessage('Error: JWT token required', 'error');
+                return;
+            }
+
+            const wsUrlWithToken = `${url}?token=${encodeURIComponent(token)}`;
+
+            addMessage(`Connecting to ${url}...`, 'system');
+
+            ws = new WebSocket(wsUrlWithToken);
+
+            ws.onopen = () => {
+                addMessage('WebSocket connection opened', 'system');
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const msg = JSON.parse(event.data);
+                    handleMessage(msg);
+                } catch (err) {
+                    addMessage(`Invalid message: ${event.data} (${err.message})`, 'error');
+                }
+            };
+
+            ws.onerror = (error) => {
+                addMessage(`WebSocket error: ${error}`, 'error');
+            };
+
+            ws.onclose = (event) => {
+                addMessage(`WebSocket closed (code: ${event.code}, reason: ${event.reason || 'none'})`, 'system');
+                updateStatus(false);
+                ws = null;
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                addMessage('Disconnecting...', 'system');
+            }
+        }
+
+        function handleMessage(msg) {
+            switch (msg.type) {
+                case 'connected':
+                    clientId = msg.data.client_id;
+                    userId = msg.data.user_id;
+                    addMessage(`✅ Connected! Client ID: ${clientId}, User ID: ${userId}`, 'system');
+                    updateStatus(true);
+                    break;
+
+                case 'subscribed':
+                    addMessage(`✅ Subscribed to channel: ${msg.data.channel_id}`, 'system');
+                    break;
+
+                case 'message': {
+                    const content = JSON.stringify(msg.data.content);
+                    addMessage(`📨 Message from ${msg.data.user_id} in ${msg.data.channel_id}: ${content}`, 'received');
+                    break;
+                }
+
+                case 'typing': {
+                    const status = msg.data.is_typing ? 'typing' : 'stopped typing';
+                    addMessage(`⌨️  ${msg.data.user_id} is ${status} in ${msg.data.channel_id}`, 'received');
+                    break;
+                }
+
+                default:
+                    addMessage(`📥 Received: ${JSON.stringify(msg)}`, 'received');
+            }
+        }
+
+        function subscribe() {
+            const channelId = document.getElementById('channelId').value.trim();
+            if (!channelId) {
+                addMessage('Error: Channel ID required', 'error');
+                return;
+            }
+
+            const msg = {
+                type: 'subscribe',
+                data: {
+                    channel_id: channelId
+                }
+            };
+
+            ws.send(JSON.stringify(msg));
+            addMessage(`📤 Subscribing to channel: ${channelId}`, 'sent');
+        }
+
+        function unsubscribe() {
+            const channelId = document.getElementById('channelId').value.trim();
+            if (!channelId) {
+                addMessage('Error: Channel ID required', 'error');
+                return;
+            }
+
+            const msg = {
+                type: 'unsubscribe',
+                data: {
+                    channel_id: channelId
+                }
+            };
+
+            ws.send(JSON.stringify(msg));
+            addMessage(`📤 Unsubscribing from channel: ${channelId}`, 'sent');
+        }
+
+        function sendMessage() {
+            const channelId = document.getElementById('messageChannel').value.trim();
+            const content = document.getElementById('messageContent').value.trim();
+
+            if (!channelId || !content) {
+                addMessage('Error: Channel ID and message content required', 'error');
+                return;
+            }
+
+            const msg = {
+                type: 'message',
+                data: {
+                    channel_id: channelId,
+                    content: content,
+                    timestamp: Date.now()
+                }
+            };
+
+            ws.send(JSON.stringify(msg));
+            addMessage(`📤 Sent message to ${channelId}: ${content}`, 'sent');
+            document.getElementById('messageContent').value = '';
+        }
+
+        function sendTyping(isTyping) {
+            const channelId = document.getElementById('typingChannel').value.trim();
+
+            if (!channelId) {
+                addMessage('Error: Channel ID required', 'error');
+                return;
+            }
+
+            const msg = {
+                type: 'typing',
+                data: {
+                    channel_id: channelId,
+                    is_typing: isTyping
+                }
+            };
+
+            ws.send(JSON.stringify(msg));
+            addMessage(`📤 Typing indicator: ${isTyping ? 'START' : 'STOP'} in ${channelId}`, 'sent');
+        }
+
+        function clearMessages() {
+            document.getElementById('messages').innerHTML = '';
+        }
+
+        // Initialize
+        updateStatus(false);
+    </script>
+</body>
+</html>

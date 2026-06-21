@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <!-- Brand gradient: pink (#fa709a) to yellow (#ffe13f) -->
+    <linearGradient id="brand-gradient" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#fa709a"/>
+      <stop offset="100%" stop-color="#ffe13f"/>
+    </linearGradient>
+    <linearGradient id="accent-line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#fa709a" stop-opacity="0"/>
+      <stop offset="20%" stop-color="#fa709a"/>
+      <stop offset="80%" stop-color="#ffe13f"/>
+      <stop offset="100%" stop-color="#ffe13f" stop-opacity="0"/>
+    </linearGradient>
+    <!-- Mask for gradient fill on symbol -->
+    <mask id="symbol-mask">
+      <g transform="translate(0, 0)">
+        <path fill="white" d="M.83 50c0 26.786 21.715 48.5 48.5 48.5 19.997 0 37.164-12.102 44.589-29.38a40.839 40.839 0 0 1-28.152 11.192c-22.646 0-41-18.361-41-41.007 0-17.008 10.357-31.595 25.102-37.805C22.869 1.23.83 22.98.83 50zm74.065-6.12h.07c0 6.396 5.23 11.626 11.626 11.626v.07c-6.397 0-11.627 5.23-11.627 11.619h-.069c0-6.39-5.23-11.62-11.626-11.62v-.069c6.396 0 11.626-5.23 11.626-11.626zM54.388 12.864h.118c0 11.185 9.15 20.334 20.334 20.334v.118c-11.185 0-20.334 9.15-20.334 20.334h-.118c0-11.185-9.149-20.334-20.334-20.334v-.118c11.178 0 20.334-9.149 20.334-20.334z"/>
+      </g>
+    </mask>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1280" height="640" fill="#0d0821"/>
+
+  <!-- Subtle radial glow behind logo area -->
+  <radialGradient id="bg-glow" cx="50%" cy="42%" r="35%">
+    <stop offset="0%" stop-color="#1a0f3a"/>
+    <stop offset="100%" stop-color="#0d0821"/>
+  </radialGradient>
+  <rect width="1280" height="640" fill="url(#bg-glow)"/>
+
+  <!-- Moon+Stars Symbol with gradient - centered above text -->
+  <g transform="translate(561, 150) scale(1.7)">
+    <!-- Gradient-filled symbol -->
+    <rect x="-6" y="-6" width="106" height="110" fill="url(#brand-gradient)" mask="url(#symbol-mask)"/>
+  </g>
+
+  <!-- CONCORD wordmark - using the extracted letter paths, centered -->
+  <g transform="translate(416, 360) scale(2.6)" fill="#ffffff">
+    <!-- C -->
+    <g transform="translate(0, 0)">
+      <path d="M14.66-3.86C10.00-3.86 6.28-7.22 6.28-12.64C6.28-17.73 9.46-21.41 14.66-21.41C16.97-21.41 19.10-20.47 20.62-18.96L23.58-21.92C21.30-24.23 18.16-25.64 14.66-25.64C7.26-25.64 1.99-20.26 1.99-12.64C1.99-4.69 7.69 0.36 14.66 0.36C18.16 0.36 21.30-1.05 23.58-3.32L20.62-6.32C19.10-4.80 16.97-3.86 14.66-3.86Z" transform="translate(-1.99, 25.64)"/>
+    </g>
+    <!-- O -->
+    <g transform="translate(25, 0)">
+      <path d="M14.34-25.60C-2.31-25.60-2.35 0.32 14.34 0.32C30.94 0.32 30.91-25.60 14.34-25.60ZM14.34-3.76C3.39-3.76 3.43-21.48 14.34-21.48C25.28-21.48 25.28-3.76 14.34-3.76Z" transform="translate(-1.84, 25.64)"/>
+    </g>
+    <!-- N -->
+    <g transform="translate(53, 0)">
+      <path d="M23.90-25.28L19.72-25.28L19.72-7.29L7.11-25.28L2.85-25.28L2.85 0L7.08 0L7.08-17.98L19.64 0L23.90 0Z" transform="translate(-2.85, 25.64)"/>
+    </g>
+    <!-- Symbol (moon+stars) inline -->
+    <g transform="translate(78, 1.24)">
+      <g transform="scale(0.24)">
+        <path fill="url(#brand-gradient)" d="M.83 50c0 26.786 21.715 48.5 48.5 48.5 19.997 0 37.164-12.102 44.589-29.38a40.839 40.839 0 0 1-28.152 11.192c-22.646 0-41-18.361-41-41.007 0-17.008 10.357-31.595 25.102-37.805C22.869 1.23.83 22.98.83 50zm74.065-6.12h.07c0 6.396 5.23 11.626 11.626 11.626v.07c-6.397 0-11.627 5.23-11.627 11.619h-.069c0-6.39-5.23-11.62-11.626-11.62v-.069c6.396 0 11.626-5.23 11.626-11.626zM54.388 12.864h.118c0 11.185 9.15 20.334 20.334 20.334v.118c-11.185 0-20.334 9.15-20.334 20.334h-.118c0-11.185-9.149-20.334-20.334-20.334v-.118c11.178 0 20.334-9.149 20.334-20.334z"/>
+      </g>
+    </g>
+    <!-- O -->
+    <g transform="translate(104, 0)">
+      <path d="M14.34-25.60C-2.31-25.60-2.35 0.32 14.34 0.32C30.94 0.32 30.91-25.60 14.34-25.60ZM14.34-3.76C3.39-3.76 3.43-21.48 14.34-21.48C25.28-21.48 25.28-3.76 14.34-3.76Z" transform="translate(-1.84, 25.64)"/>
+    </g>
+    <!-- R -->
+    <g transform="translate(132, 0)">
+      <path d="M15.31 0L19.97 0L14.80-11.19C17.08-12.02 19.68-13.83 19.68-17.91C19.68-25.28 11.23-25.28 11.23-25.28L2.82-25.28L2.82 0L7.04 0L7.04-10.54L10.47-10.54ZM7.04-21.05L11.23-21.05C11.23-21.05 15.45-21.05 15.45-17.91C15.45-14.73 11.23-14.73 11.23-14.73L7.04-14.73Z" transform="translate(-2.82, 25.64)"/>
+    </g>
+    <!-- D -->
+    <g transform="translate(153, 0)">
+      <path d="M2.85-25.28L2.85 0L7.08 0C13.36 0 21.85-1.84 21.85-12.64C21.85-23.87 13.22-25.28 7.08-25.28ZM7.08-4.12L7.08-21.16C7.08-21.16 17.58-22.75 17.58-12.64C17.58-2.67 7.08-4.12 7.08-4.12Z" transform="translate(-2.85, 25.64)"/>
+    </g>
+  </g>
+
+  <!-- Accent gradient line -->
+  <rect x="340" y="435" width="600" height="2" fill="url(#accent-line)" rx="1"/>
+
+  <!-- Tagline -->
+  <text x="640" y="475" text-anchor="middle" fill="#ffffff" font-family="'Source Sans Pro', 'Source Sans 3', -apple-system, sans-serif" font-size="24" font-weight="300" letter-spacing="4" opacity="0.85">OWN YOUR VOICE</text>
+
+  <!-- Subtle description -->
+  <text x="640" y="515" text-anchor="middle" fill="#ffffff" font-family="'Source Sans Pro', 'Source Sans 3', -apple-system, sans-serif" font-size="16" font-weight="300" opacity="0.5">Privacy-first voice &amp; text communication platform</text>
+</svg>

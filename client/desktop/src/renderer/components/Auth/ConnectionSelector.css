@@ -1,0 +1,257 @@
+/* Hide native radio inputs — custom radio visuals rendered via .radio-outer/.radio-inner */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.connection-selector {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  padding: 40px;
+  background: var(--bg-primary);
+}
+
+.connection-content {
+  width: 100%;
+  max-width: 640px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+/* Header */
+.connection-header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.connection-logo {
+  height: 64px;
+  width: auto;
+  margin-bottom: 4px;
+}
+
+/* Connection Options - Grid Layout */
+.connection-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.connection-option {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 14px;
+  background: var(--bg-secondary);
+  border: 2px solid var(--border-color);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-align: center;
+  min-height: 170px;
+}
+
+/* Make the third option (self-hosted) span both columns */
+.connection-option:nth-child(3) {
+  grid-column: 1 / -1;
+  min-height: auto;
+  padding: 20px;
+  flex-direction: row;
+  justify-content: flex-start;
+  text-align: left;
+  gap: 16px;
+}
+
+.connection-option:hover {
+  border-color: var(--accent-primary);
+  background: var(--bg-tertiary);
+}
+
+.connection-option.selected {
+  border-color: var(--accent-primary);
+  background: var(--bg-tertiary);
+  box-shadow: 0 0 0 3px rgba(250, 112, 154, 0.1);
+}
+
+.connection-option:focus-within {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* Radio Button */
+.option-radio {
+  flex-shrink: 0;
+}
+
+.radio-outer {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--text-muted);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color 0.2s ease;
+}
+
+.connection-option.selected .radio-outer {
+  border-color: var(--accent-primary);
+}
+
+.radio-inner {
+  width: 10px;
+  height: 10px;
+  background: var(--accent-fill);
+  border-radius: 50%;
+  animation: radioAppear 0.2s ease;
+}
+
+@keyframes radioAppear {
+  from {
+    transform: scale(0);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+
+/* Option Content */
+.option-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+}
+
+.option-title {
+  font-size: calc(15px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  font-family: var(--font-display-stack);
+  letter-spacing: 0.3px;
+}
+
+.option-description {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: flex-start;
+  width: 100%;
+}
+
+.option-feature {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  line-height: 1.4;
+  text-align: left;
+}
+
+/* Adjust content for horizontal third option */
+.connection-option:nth-child(3) .option-content {
+  align-items: flex-start;
+  text-align: left;
+  gap: 8px;
+}
+
+.connection-option:nth-child(3) .option-title {
+  font-size: calc(16px * var(--font-scale, 1));
+}
+
+.connection-option:nth-child(3) .option-description {
+  flex-direction: row;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.connection-option:nth-child(3) .option-feature {
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* Continue Button */
+.connection-continue {
+  width: 100%;
+  padding: 14px 24px;
+  background: var(--gradient-brand);
+  border: none;
+  border-radius: 8px;
+  color: var(--bg-primary);
+  font-size: calc(15px * var(--font-scale, 1));
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.connection-continue:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(250, 112, 154, 0.3);
+}
+
+.connection-continue:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.connection-continue:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 3px;
+  box-shadow: 0 0 0 5px rgba(250, 112, 154, 0.2);
+}
+
+.connection-continue:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Footer */
+.connection-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+.footer-link {
+  all: unset;
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.footer-link:hover {
+  color: var(--accent-primary);
+}
+
+.footer-link:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.footer-link:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.footer-separator {
+  color: var(--text-muted);
+}

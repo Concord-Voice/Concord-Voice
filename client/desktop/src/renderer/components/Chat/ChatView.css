@@ -1,0 +1,99 @@
+.chat-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+}
+
+.chat-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: calc(12px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  border-bottom: 1px solid var(--border-color);
+  background-color: var(--bg-secondary);
+  flex-shrink: 0;
+}
+
+.chat-header-emoji {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.chat-header-icon {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.chat-header-name {
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-header-search-button {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+}
+
+.chat-header-search-button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.chat-header-pin-button {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  position: relative;
+}
+
+.chat-header-pin-button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.pin-count-badge {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent-color);
+}
+
+.chat-messages {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.chat-input {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border-color);
+  background-color: var(--bg-secondary);
+}
+
+.chat-error {
+  padding: calc(8px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  background-color: rgba(240, 71, 71, 0.1);
+  color: var(--danger);
+  font-size: calc(13px * var(--font-scale, 1));
+  text-align: center;
+  flex-shrink: 0;
+}

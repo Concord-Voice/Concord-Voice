@@ -1,0 +1,42 @@
+@font-face {
+  font-family: 'Droidiga';
+  src: url('/branding/Concord-Voice/fonts/Droidiga.otf') format('opentype');
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+}
+
+.titlebar {
+  height: 32px;
+  background-color: var(--bg-secondary);
+  color: var(--text-primary);
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  app-region: drag;
+  padding-right: 140px;
+  padding-left: 16px;
+  flex-shrink: 0;
+}
+
+.titlebar--mac {
+  padding-left: 80px;
+  padding-right: 16px;
+}
+
+.titlebar-title {
+  font-family: var(--font-display-stack);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  app-region: drag;
+}
+
+.titlebar-version {
+  margin-left: 8px;
+  font-size: 11px;
+  opacity: 0.4;
+  letter-spacing: 0.04em;
+  app-region: drag;
+}

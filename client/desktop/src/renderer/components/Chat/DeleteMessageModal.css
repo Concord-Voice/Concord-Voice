@@ -1,0 +1,97 @@
+.delete-message-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.delete-message-warning {
+  display: flex;
+  gap: 12px;
+  padding: 16px;
+  background: rgba(240, 71, 71, 0.08);
+  border: 1px solid rgba(240, 71, 71, 0.3);
+  border-radius: 8px;
+}
+
+.delete-message-warning .warning-icon {
+  flex-shrink: 0;
+  color: var(--danger);
+  margin-top: 2px;
+}
+
+.delete-message-warning p {
+  font-size: calc(14px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.delete-message-hint {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+.delete-message-hint kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  font-size: calc(11px * var(--font-scale, 1));
+  font-family: 'SourceSans', monospace;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  box-shadow: 0 1px 0 var(--border-color);
+}
+
+/* Action buttons */
+.delete-message-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.delete-message-cancel-btn {
+  padding: 10px 20px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.delete-message-cancel-btn:hover {
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.delete-message-confirm-btn {
+  padding: 10px 20px;
+  background: var(--danger);
+  border: none;
+  border-radius: 8px;
+  color: var(--on-accent);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 700;
+  font-family: var(--font-display-stack);
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.delete-message-confirm-btn:hover {
+  background: var(--danger-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(240, 71, 71, 0.3);
+}
+
+.delete-message-confirm-btn:active {
+  transform: translateY(0);
+}
+
+.delete-message-confirm-btn:focus-visible {
+  outline: 2px solid var(--danger);
+  outline-offset: 2px;
+}

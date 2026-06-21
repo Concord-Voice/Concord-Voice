@@ -1,0 +1,37 @@
+/* Native <dialog> opened via showModal(): the UA centers it in the top layer
+   and renders ::backdrop for the dim. We reset its default chrome and let the
+   inner card carry the surface styling. */
+.key-recovery-prompt {
+  border: none;
+  padding: 0;
+  background: transparent;
+  max-width: 420px;
+}
+.key-recovery-prompt::backdrop {
+  background: rgba(0, 0, 0, 0.5);
+}
+.key-recovery-prompt__card {
+  background: var(--color-surface, #1e1e24);
+  color: var(--color-text, #e8e8ea);
+  padding: 24px;
+  border-radius: 12px;
+}
+.key-recovery-prompt__ack {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 16px 0;
+}
+.key-recovery-prompt__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+.key-recovery-prompt__danger:not(:disabled) {
+  background: #dc2626;
+  color: #fff;
+}
+.key-recovery-prompt__danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

@@ -1,0 +1,384 @@
+/* ─── CSS Grid Layout Shell ─────────────────────────────────────────────── */
+
+.app-layout {
+  display: grid;
+  grid-template-rows: auto auto auto auto 1fr;
+  grid-template-columns: auto 1fr auto;
+  grid-template-areas:
+    'serverbar     serverbar     serverbar'
+    'serverbar-h   serverbar-h   serverbar-h'
+    'folderbar     folderbar     folderbar'
+    'folderbar-h   folderbar-h   folderbar-h'
+    'channels      chat          members';
+  height: 100%;
+  overflow: hidden;
+  position: relative;
+}
+
+/* Channel pinned = show column; unpinned = collapse to 0 */
+.app-layout[data-channel-pinned='false'] {
+  grid-template-columns: 0 1fr auto;
+}
+
+/* Member panel modes */
+.app-layout[data-member-mode='hidden'] {
+  grid-template-columns: auto 1fr 0;
+}
+
+.app-layout[data-channel-pinned='false'][data-member-mode='hidden'] {
+  grid-template-columns: 0 1fr 0;
+}
+
+/* ─── Grid Area Assignments ─────────────────────────────────────────────── */
+
+.layout-server-bar {
+  grid-area: serverbar;
+  overflow: hidden;
+}
+
+.layout-server-bar-resize {
+  grid-area: serverbar-h;
+}
+
+.layout-folder-bar {
+  grid-area: folderbar;
+  overflow: visible;
+  position: relative;
+  z-index: 100;
+}
+
+.layout-folder-bar-resize {
+  grid-area: folderbar-h;
+}
+
+.layout-channel-panel {
+  grid-area: channels;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  min-height: 0;
+  transition: width 0.3s ease;
+}
+
+/* Allow the overlay to escape the 0-width column when unpinned */
+.app-layout[data-channel-pinned='false'] .layout-channel-panel {
+  overflow: visible;
+}
+
+.layout-chat-area {
+  grid-area: chat;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.layout-member-space {
+  grid-area: members;
+  overflow: hidden;
+  display: flex;
+  min-height: 0;
+  background-color: var(--bg-secondary);
+  transition: width 0.3s ease;
+}
+
+/* Resizable member/friends panel wrapper */
+.member-list-container {
+  flex-shrink: 0;
+  display: flex;
+  overflow: hidden;
+}
+
+/* ─── Channel Panel Transitions ─────────────────────────────────────────── */
+
+/* Unpinned overlay mode */
+.channel-panel-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 50;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  border-radius: 0 8px 8px 0;
+  box-shadow: 4px 0 16px rgba(0, 0, 0, 0.3);
+  transition:
+    transform 0.25s ease,
+    opacity 0.25s ease;
+}
+
+.channel-panel-overlay.slide-in {
+  transform: translateX(0);
+  opacity: 1;
+}
+
+.channel-panel-overlay.slide-out {
+  transform: translateX(-100%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ─── Channel Panel Pin Button (#188) ───────────────────────────────────── */
+
+.channel-panel-pin-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease,
+    transform 0.15s ease;
+}
+
+.channel-panel-pin-btn:hover {
+  color: var(--text-primary);
+  background-color: var(--bg-hover);
+}
+
+.channel-panel-pin-btn:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* Pinned (locked-open) state — accent colour + 45° rotation so the pinned
+   vs. unpinned state is unmistakable at a glance (#188). */
+.channel-panel-pin-btn.pinned {
+  color: var(--accent-primary);
+  transform: rotate(45deg);
+}
+
+.channel-panel-pin-btn.pinned:hover {
+  color: var(--accent-hover);
+}
+
+/* ─── Channel Panel Edge Lip (#188) ─────────────────────────────────────── */
+
+/* Discoverable handle at the left edge of the channel-panel area, offset DOWN
+   to sit just below the channel-name header band so it doesn't blend into that
+   same-coloured heading (#188 feedback). The offset approximates the header
+   height (~chat-header: 12px×2 padding + name line + border) and tracks the
+   spacing (--sp) and font (--font-scale) multipliers that size it, plus a small
+   fixed gap for breathing room, so the lip stays clearly below the header under
+   Compact Mode and UI Scale. Replaces the
+   previously invisible ServerBar hover zone as the reveal cue. At rest it's a
+   thin 8px tab; hovering widens it and reveals the panel, clicking re-pins.
+   z-index sits just below the overlay (50) so the revealed panel covers it. */
+.channel-panel-lip {
+  position: absolute;
+  left: 0;
+  top: calc(24px * var(--sp, 1) + 24px * var(--font-scale, 1) + 12px);
+  z-index: 49;
+  width: 8px;
+  height: 56px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-left: none;
+  border-radius: 0 6px 6px 0;
+  color: var(--text-muted);
+  cursor: pointer;
+  overflow: hidden;
+  transition:
+    width 0.15s ease,
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.channel-panel-lip:hover {
+  width: 16px;
+  background-color: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.channel-panel-lip:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+.channel-panel-lip svg {
+  flex-shrink: 0;
+}
+
+/* ─── Member Panel Transitions ──────────────────────────────────────────── */
+
+/* Collapsed avatar strip */
+.member-panel-collapsed {
+  width: 48px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: calc(8px * var(--sp, 1)) 0;
+  gap: calc(4px * var(--sp, 1));
+  overflow-y: auto;
+  background-color: var(--bg-secondary);
+  border-left: 1px solid var(--border-color);
+}
+
+.member-panel-collapsed::-webkit-scrollbar {
+  width: 0;
+}
+
+/* Collapsed avatar items */
+.member-avatar-strip-item {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  overflow: visible;
+  flex-shrink: 0;
+  cursor: default;
+}
+
+.member-avatar-strip-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.member-avatar-strip-initial {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-tertiary);
+  border-radius: 50%;
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.member-avatar-strip-item .member-strip-status {
+  position: absolute;
+  bottom: -1px;
+  right: -1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 2px solid var(--bg-secondary);
+}
+
+.member-strip-status.online {
+  background: var(--status-connected);
+}
+
+.member-strip-status.dnd {
+  background: var(--status-disconnected);
+}
+
+.member-strip-status.offline,
+.member-strip-status.invisible {
+  background: var(--text-muted);
+}
+
+/* Strip tooltip on hover */
+.member-avatar-strip-item .member-strip-tooltip {
+  display: none;
+  position: absolute;
+  right: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 4px 8px;
+  white-space: nowrap;
+  z-index: 60;
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-primary);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+}
+
+.member-avatar-strip-item:hover .member-strip-tooltip {
+  display: block;
+}
+
+/* ─── Member Panel Toggle ───────────────────────────────────────────────── */
+
+.member-panel-toggle {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 40;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-right: none;
+  border-radius: 6px 0 0 6px;
+  padding: 8px 4px;
+  cursor: pointer;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.member-panel-toggle:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+/* ─── Resize Handles ────────────────────────────────────────────────────── */
+
+.layout-resize-handle {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  transition: background-color 0.15s ease;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.layout-resize-handle::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  right: -3px;
+}
+
+.layout-resize-handle:active {
+  background-color: var(--accent-primary);
+}
+
+/* Horizontal resize handle for bar heights */
+.layout-resize-handle-h {
+  height: 3px;
+  cursor: row-resize;
+  background: transparent;
+  transition: background-color 0.15s ease;
+  position: relative;
+}
+
+.layout-resize-handle-h::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -3px;
+  bottom: -3px;
+}
+
+.layout-resize-handle-h:active {
+  background-color: var(--accent-primary);
+}

@@ -1,0 +1,11 @@
+# Ignore files not needed in Docker build context
+.git
+.github
+.env
+.env.*
+*.md
+docs/
+tests/benchmarks/
+tmp/
+*.test
+coverage.out

@@ -1,0 +1,219 @@
+.voice-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background-color: var(--bg-primary);
+}
+
+/* ─── Header ──────────────────────────────────────────────────── */
+
+.voice-view__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: calc(12px * var(--sp, 1)) calc(16px * var(--sp, 1));
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.voice-view__channel-name {
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  font-family: var(--font-display-stack); /* hero channel name (#1034) */
+  margin: 0;
+}
+
+.voice-view__header-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.voice-view__badge {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  background-color: var(--bg-tertiary);
+}
+
+.voice-view__badge--encrypted {
+  color: var(--success);
+  background-color: rgba(67, 181, 129, 0.1);
+}
+
+.voice-view__badge--quality {
+  text-transform: capitalize;
+}
+
+.voice-view__badge--decoder-yellow {
+  color: var(--text-warning-strong);
+  background-color: rgba(250, 166, 26, 0.12);
+}
+
+.voice-view__badge--decoder-red {
+  color: var(--text-error-strong);
+  background-color: rgba(240, 71, 71, 0.12);
+}
+
+/* ─── Content Wrapper (voice area + optional text chat) ────────── */
+
+.voice-view__content {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.voice-view__content--horizontal {
+  flex-direction: column;
+}
+
+.voice-view__content--vertical {
+  flex-direction: row;
+}
+
+/* ─── Voice Area (Mode A/B container — resizable vs text chat) ── */
+
+.voice-view__voice-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 200px;
+}
+
+.voice-view__content--vertical .voice-view__voice-area {
+  min-width: 200px;
+}
+
+/* ─── Section Resize Handle (between Mode B sections) ─────────── */
+
+.voice-view__section-handle {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  height: 8px;
+}
+
+.voice-view__section-handle-grip {
+  width: 100%;
+  height: 100%;
+  cursor: row-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.voice-view__section-handle-grip::after {
+  content: '';
+  width: 40px;
+  height: 3px;
+  border-radius: 2px;
+  background-color: var(--border-color);
+  transition: background-color 150ms ease;
+}
+
+.voice-view__section-handle-grip:hover::after {
+  background-color: var(--text-muted);
+}
+
+.voice-view__section-toggle {
+  position: absolute;
+  right: 8px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition:
+    opacity 150ms ease,
+    background 150ms ease;
+}
+
+.voice-view__section-handle:hover .voice-view__section-toggle {
+  opacity: 1;
+}
+
+.voice-view__section-toggle:hover {
+  background: var(--bg-modifier-hover);
+  color: var(--text-primary);
+}
+
+/* ─── Join prompt (not connected) ─────────────────────────────── */
+
+.voice-view__join {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: calc(12px * var(--sp, 1));
+}
+
+.voice-view__join-icon {
+  color: var(--text-muted);
+  opacity: 0.5;
+}
+
+.voice-view__join-title {
+  font-size: var(--text-display-lg); /* pre-join hero (#1035) */
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: var(--font-display-tracking-tight);
+  margin: 0;
+}
+
+.voice-view__join-subtitle {
+  font-size: calc(14px * var(--font-scale, 1));
+  color: var(--text-muted);
+  margin: 0;
+}
+
+.voice-view__join-btn {
+  margin-top: calc(8px * var(--sp, 1));
+  padding: 10px 32px;
+  border: none;
+  border-radius: 6px;
+  background: var(--gradient-brand);
+  color: #fff;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.voice-view__join-btn:hover {
+  opacity: 0.9;
+}
+
+.voice-view__join-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ─── Text chat panel (horizontal: below voice, vertical: right side) ── */
+
+.voice-view__text-chat {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.voice-view__text-chat--vertical {
+  border-left: 1px solid var(--border-color);
+  height: auto;
+}

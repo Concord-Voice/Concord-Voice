@@ -1,0 +1,223 @@
+/* ─── Square User Frame ────────────────────────────────────────── */
+
+.participant-tile {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: 8px;
+  overflow: hidden;
+  background-color: var(--bg-tertiary);
+  display: flex;
+  flex-direction: column;
+  /* Magnification animation — fast attack, slower release */
+  transition: transform 120ms ease-out;
+  /* Padding reserve for magnification overflow */
+  margin: 6px;
+}
+
+/* Video active — use 16:9 aspect ratio for video content */
+.participant-tile--video {
+  aspect-ratio: 16 / 9;
+}
+
+/* Compact mode for horizontal bars */
+.participant-tile--compact {
+  margin: 3px;
+}
+
+/* ─── Banner (top ~35% of square frame) ───────────────────────── */
+
+.participant-tile__banner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 35%;
+  z-index: 0;
+}
+
+/* ─── Body (avatar + name, below banner) ──────────────────────── */
+
+.participant-tile__body {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px;
+  padding-top: 20%; /* Push content below banner */
+}
+
+/* ─── Avatar ─────────────────────────────────────────────────── */
+
+.participant-tile__avatar {
+  flex-shrink: 0;
+}
+
+.participant-tile__avatar-img {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2px solid var(--bg-primary);
+}
+
+.participant-tile__avatar-fallback {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--gradient-brand);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: calc(22px * var(--font-scale, 1));
+  font-weight: 700;
+  /* Use bg-primary (the opposite end of the brightness range from
+     gradient-brand in every theme) for the letter so it stays readable
+     in High Contrast mode where gradient-brand is bright yellow→cyan.
+     Matches the .avatar-circle pattern in Message.css. */
+  color: var(--bg-primary);
+  border: 2px solid var(--bg-primary);
+}
+
+/* Compact variant — smaller avatar */
+.participant-tile--compact .participant-tile__avatar-img,
+.participant-tile--compact .participant-tile__avatar-fallback {
+  width: 36px;
+  height: 36px;
+  font-size: calc(14px * var(--font-scale, 1));
+}
+
+/* ─── Display Name ───────────────────────────────────────────── */
+
+.participant-tile__name {
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 500;
+  color: var(--text-primary);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.participant-tile--compact .participant-tile__name {
+  font-size: calc(10px * var(--font-scale, 1));
+}
+
+/* ─── Video Mode ─────────────────────────────────────────────── */
+
+.participant-tile__video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background-color: #000;
+}
+
+.participant-tile__video-name {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 4px 8px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.7));
+}
+
+.participant-tile__video-name-text {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+}
+
+/* ─── Status Overlays ────────────────────────────────────────── */
+
+.participant-tile__overlays {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  gap: 4px;
+  z-index: 3;
+}
+
+.participant-tile__status {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: rgba(0, 0, 0, 0.6);
+}
+
+.participant-tile--compact .participant-tile__status {
+  width: 18px;
+  height: 18px;
+}
+
+.participant-tile__status--muted {
+  color: var(--danger);
+}
+
+.participant-tile__status--deafened {
+  color: var(--danger);
+}
+
+.participant-tile__status--server-muted,
+.participant-tile__status--server-deafened {
+  color: var(--warning);
+  position: relative;
+}
+
+.participant-tile__lock-badge {
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+}
+
+.participant-tile__status--screen {
+  color: var(--accent-primary);
+}
+
+.participant-tile__menu-trigger {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  padding: 0;
+  z-index: 4;
+}
+
+.participant-tile:hover .participant-tile__menu-trigger,
+.participant-tile__menu-trigger:focus-visible {
+  opacity: 1;
+}
+
+.participant-tile__menu-trigger:focus-visible {
+  outline: 2px solid var(--accent-primary, #4a9eff);
+  outline-offset: 2px;
+}
+
+.participant-tile--compact .participant-tile__menu-trigger {
+  width: 16px;
+  height: 16px;
+  top: 4px;
+  left: 4px;
+}

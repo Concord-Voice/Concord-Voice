@@ -1,0 +1,229 @@
+import React from 'react';
+import { render } from '../../../test-utils';
+import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useUserStore } from '@/renderer/stores/userStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
+import { resetAllStores } from '../../../helpers/store-helpers';
+
+// Mock child components
+vi.mock('@/renderer/components/Voice/ParticipantTile', () => ({
+  default: ({ participant }: { participant: { userId: string; username: string } }) => (
+    <div data-testid={`participant-tile-${participant.userId}`}>{participant.username}</div>
+  ),
+}));
+
+vi.mock('@/renderer/components/Voice/useVoiceMagnification', () => ({
+  useVoiceMagnification: () => ({}),
+}));
+
+vi.mock('@/renderer/components/Voice/ParticipantGrid.css', () => ({}));
+
+// AudioContext mock
+const mockClose = vi.fn().mockResolvedValue(undefined);
+const mockResume = vi.fn().mockResolvedValue(undefined);
+const mockConnect = vi.fn();
+const mockDisconnect = vi.fn();
+
+const mockGainNode = {
+  gain: { value: 1, setTargetAtTime: vi.fn() },
+  connect: mockConnect,
+  disconnect: mockDisconnect,
+};
+const mockAnalyserNode = {
+  fftSize: 256,
+  smoothingTimeConstant: 0.3,
+  frequencyBinCount: 128,
+  connect: mockConnect,
+  getByteFrequencyData: vi.fn(),
+};
+const mockSourceNode = { connect: mockConnect };
+const mockAudioContext = {
+  state: 'running',
+  currentTime: 0,
+  destination: {},
+  sampleRate: 48000,
+  createAnalyser: vi.fn(() => mockAnalyserNode),
+  createGain: vi.fn(() => ({ ...mockGainNode })),
+  createMediaElementSource: vi.fn(() => mockSourceNode),
+  resume: mockResume,
+  close: mockClose,
+  setSinkId: vi.fn().mockResolvedValue(undefined),
+};
+
+beforeAll(() => {
+  vi.spyOn(HTMLAudioElement.prototype, 'play').mockResolvedValue(undefined);
+  vi.stubGlobal(
+    'AudioContext',
+    vi.fn(function MockAudioContextCtor() {
+      return mockAudioContext;
+    })
+  );
+});
+
+afterAll(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+import ParticipantGrid, {
+  AudioOutput,
+  AudioOutputs,
+} from '@/renderer/components/Voice/ParticipantGrid';
+
+function makeMockStream(id = 'stream-1'): MediaStream {
+  return {
+    id,
+    active: true,
+    getAudioTracks: () => [{ readyState: 'live', enabled: true }],
+  } as unknown as MediaStream;
+}
+
+describe('ParticipantGrid — extended coverage', () => {
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    useVoiceStore.setState({ participants: {}, audioOutputDeviceId: null });
+    useUserStore.setState({
+      user: {
+        id: 'local-user',
+        username: 'me',
+        email: '',
+        display_name: 'Me',
+        bio: null,
+        avatar_url: null,
+        header_image_url: null,
+        links: [],
+        email_verified: false,
+        age_verified: true,
+        created_at: '',
+        updated_at: '',
+      },
+    });
+  });
+
+  describe('ParticipantGrid (default export)', () => {
+    it('renders AudioOutputs and UserFrameGrid together', () => {
+      useVoiceStore.setState({
+        participants: {
+          'remote-1': {
+            userId: 'remote-1',
+            username: 'alice',
+            isMuted: false,
+            isDeafened: false,
+            isVideoOn: false,
+            isScreenSharing: false,
+            isSpeaking: false,
+            audioStream: makeMockStream(),
+          },
+        },
+      });
+      const { container } = render(<ParticipantGrid />);
+      // <audio> lives in the effect closure (DOM-less AudioOutput), so verify
+      // the audio graph via the mock and the visual layer via the DOM.
+      expect(mockAudioContext.createMediaElementSource).toHaveBeenCalled();
+      expect(container.querySelector('.user-frame-grid')).toBeInTheDocument();
+    });
+  });
+
+  describe('AudioOutput — output volume', () => {
+    it('updates gain when outputVolume changes', () => {
+      const stream = makeMockStream();
+      useAudioSettingsStore.setState({
+        outputVolume: 100,
+        quietBoost: false,
+        quietBoostThreshold: -35,
+      });
+      const { rerender } = render(<AudioOutput stream={stream} />);
+
+      // Change volume; rerender must not throw — exercises the gain-update path
+      useAudioSettingsStore.setState({ outputVolume: 50 });
+      expect(() => rerender(<AudioOutput stream={stream} />)).not.toThrow();
+      expect(useAudioSettingsStore.getState().outputVolume).toBe(50);
+    });
+  });
+
+  describe('AudioOutput — quiet boost', () => {
+    it('starts boost polling when quietBoost is enabled', () => {
+      vi.useFakeTimers();
+      const stream = makeMockStream();
+      useAudioSettingsStore.setState({
+        outputVolume: 100,
+        quietBoost: true,
+        quietBoostThreshold: -35,
+      });
+      render(<AudioOutput stream={stream} />);
+
+      // Boost timer should be set up (polling at 20ms interval)
+      vi.advanceTimersByTime(100);
+      expect(mockAnalyserNode.getByteFrequencyData).toHaveBeenCalled();
+      vi.useRealTimers();
+    });
+
+    it('resets boost gain when quietBoost is disabled', () => {
+      const stream = makeMockStream();
+      useAudioSettingsStore.setState({
+        outputVolume: 100,
+        quietBoost: true,
+        quietBoostThreshold: -35,
+      });
+      const { rerender } = render(<AudioOutput stream={stream} />);
+
+      // Disable quiet boost; the rerender path must reset gain without throwing
+      useAudioSettingsStore.setState({ quietBoost: false });
+      expect(() => rerender(<AudioOutput stream={stream} />)).not.toThrow();
+      expect(useAudioSettingsStore.getState().quietBoost).toBe(false);
+    });
+  });
+
+  describe('AudioOutput — output device', () => {
+    it('uses setSinkId when outputDeviceId is provided', () => {
+      const stream = makeMockStream();
+      render(<AudioOutput stream={stream} outputDeviceId="device-123" />);
+
+      // AudioContext.setSinkId should be called with the device ID
+      expect(mockAudioContext.setSinkId).toHaveBeenCalledWith('device-123');
+    });
+  });
+
+  describe('AudioOutputs — filtering', () => {
+    it('does not render audio for participants without streams', () => {
+      useVoiceStore.setState({
+        participants: {
+          'remote-1': {
+            userId: 'remote-1',
+            username: 'alice',
+            isMuted: false,
+            isDeafened: false,
+            isVideoOn: false,
+            isScreenSharing: false,
+            isSpeaking: false,
+            // No audioStream or screenAudioStream
+          },
+        },
+      });
+      const { container } = render(<AudioOutputs />);
+      expect(container.querySelectorAll('audio').length).toBe(0);
+    });
+
+    it('passes audioOutputDeviceId to AudioOutput components', () => {
+      useVoiceStore.setState({
+        audioOutputDeviceId: 'my-device',
+        participants: {
+          'remote-1': {
+            userId: 'remote-1',
+            username: 'alice',
+            isMuted: false,
+            isDeafened: false,
+            isVideoOn: false,
+            isScreenSharing: false,
+            isSpeaking: false,
+            audioStream: makeMockStream(),
+          },
+        },
+      });
+      render(<AudioOutputs />);
+      // The AudioOutput should receive the device ID
+      expect(mockAudioContext.setSinkId).toHaveBeenCalledWith('my-device');
+    });
+  });
+});

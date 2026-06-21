@@ -1,0 +1,119 @@
+/* Client Behavior section — polish layer.
+ * Matches the Theme + Font Size segmented-control aesthetic from
+ * SettingsPage.css so the new subsection feels native to the Appearance
+ * family. Honors all 26 CSS theme blocks via custom-property tokens. */
+
+.client-behavior-section {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.client-behavior-fieldset {
+  border: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.client-behavior-legend {
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0;
+  margin-bottom: 2px;
+}
+
+.client-behavior-options {
+  display: flex;
+  gap: 8px;
+}
+
+.client-behavior-option {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 16px;
+  background: var(--bg-tertiary);
+  border: 2px solid var(--border-color);
+  border-radius: 8px;
+  cursor: pointer;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease,
+    color 150ms ease,
+    opacity 150ms ease;
+  color: var(--text-secondary);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  text-align: center;
+  user-select: none;
+}
+
+.client-behavior-option:hover:not(.client-behavior-option--disabled) {
+  border-color: var(--accent-hover);
+  color: var(--text-primary);
+}
+
+.client-behavior-option--selected {
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+}
+
+.client-behavior-option--disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  /* Keep the border + bg so the disabled card still reads as part of the
+   * group rather than blank space — opacity carries the "not available"
+   * message visually. */
+}
+
+/* Visually hide the radio input but keep it keyboard-accessible and a
+ * valid focus target. Focus ring lifts to the wrapping label via :has(). */
+.client-behavior-option-input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+}
+
+.client-behavior-option:has(.client-behavior-option-input:focus-visible) {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* Explanation panel — typographic hierarchy. The dynamic copy that updates
+ * as the user changes toggles, so the panel itself anchors the section. */
+.client-behavior-explanation {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 18px;
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  border-left: 3px solid var(--accent-primary);
+}
+
+.client-behavior-explanation p {
+  margin: 0;
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.client-behavior-explanation strong {
+  display: inline;
+  color: var(--text-primary);
+  font-weight: 600;
+}

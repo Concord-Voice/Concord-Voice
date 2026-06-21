@@ -1,0 +1,79 @@
+.overflow-md-attachment {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  margin-top: 4px;
+}
+
+/* Expand / Collapse buttons */
+.overflow-md-attachment__expand,
+.overflow-md-attachment__collapse {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  cursor: pointer;
+  align-self: flex-start;
+  transition: background 0.1s ease;
+}
+
+.overflow-md-attachment__expand:hover,
+.overflow-md-attachment__collapse:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* Loading spinner row */
+.overflow-md-attachment__spinner {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+/* Fallback file-chip layout */
+.overflow-md-attachment--fallback {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.overflow-md-attachment--fallback svg {
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.overflow-md-attachment__filename {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.overflow-md-attachment__message {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+/* Spin animation — similar to (but distinct from) the `spin` animation in AttachmentDisplay.css */
+.overflow-md-attachment .spinner {
+  animation: overflow-spin 1s linear infinite;
+}
+
+@keyframes overflow-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

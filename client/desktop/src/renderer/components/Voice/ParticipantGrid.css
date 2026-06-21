@@ -1,0 +1,22 @@
+/* ─── Mode A: Centered User Frame Grid ──────────────────────── */
+
+.user-frame-grid {
+  flex: 1;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  align-content: center;
+  gap: 4px;
+  padding: calc(12px * var(--sp, 1));
+  overflow: hidden; /* No scrollbars — tiles shrink to fit */
+  min-height: 0;
+}
+
+/* Dynamic tile sizing: dimensions set by useGridLayout hook via CSS vars */
+.user-frame-grid .participant-tile {
+  width: var(--tile-w, 200px);
+  height: var(--tile-h, 112px);
+  flex-shrink: 0;
+  flex-grow: 0;
+}

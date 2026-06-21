@@ -1,0 +1,66 @@
+/* SSOButton — Google brand-guidelines-compliant "Sign in with Google" + Apple HIG variant */
+
+.sso-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  height: 40px;
+  padding: 0 16px;
+  border: 1px solid #dadce0;
+  border-radius: 4px;
+  background: #fff;
+  color: #3c4043;
+  font-family:
+    'Roboto',
+    system-ui,
+    -apple-system,
+    sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease;
+}
+
+.sso-button:hover:not(:disabled) {
+  background: #f7f8fa;
+  border-color: #c4c7c5;
+}
+
+.sso-button:focus-visible {
+  outline: 2px solid #4285f4;
+  outline-offset: 2px;
+}
+
+.sso-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.sso-button__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+}
+
+.sso-button__text {
+  flex: 1;
+  text-align: center;
+}
+
+/* Apple variant — Sign in with Apple HIG: black background, white glyph. */
+.sso-button--apple {
+  background: #000;
+  color: #fff;
+  border-color: #000;
+}
+
+.sso-button--apple:hover:not(:disabled) {
+  background: #1a1a1a;
+  border-color: #1a1a1a;
+}

@@ -1,0 +1,185 @@
+/*
+ * Shared Auth Form Styles
+ * Used across Login, Register, and other auth components
+ */
+
+/* Form Container */
+.form-group {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Form Labels */
+.form-label {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* Form Inputs */
+.form-input {
+  width: 100%;
+  padding: 12px 16px;
+  background: var(--bg-secondary);
+  border: 2px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-size: calc(15px * var(--font-scale, 1));
+  font-family: 'SourceSans', sans-serif;
+  transition: all 0.2s ease;
+}
+
+.form-input:focus {
+  outline: none;
+  border-color: var(--state-focused);
+  background: var(--bg-tertiary);
+}
+
+/* Enhanced keyboard focus visibility — uses --state-focused (distinct from
+   --state-selected, which is --accent-primary) so a focused input doesn't
+   visually merge with adjacent selected list items / tabs. Issue #798. */
+.form-input:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--state-focused) 15%, transparent);
+}
+
+.form-input.error {
+  border-color: var(--danger);
+  background: rgba(240, 71, 71, 0.05);
+}
+
+.form-input.error:focus {
+  background: rgba(240, 71, 71, 0.08);
+}
+
+.form-input.success {
+  border-color: var(--success);
+  background: rgba(67, 181, 129, 0.05);
+}
+
+.form-input.success:focus {
+  background: rgba(67, 181, 129, 0.08);
+}
+
+.form-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.form-input::placeholder {
+  color: var(--text-muted);
+}
+
+/* Form Feedback Messages */
+.form-error {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--danger);
+  margin-top: 4px;
+  animation: fadeInShake 0.3s ease-out;
+}
+
+.form-success {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--success);
+  margin-top: 4px;
+  font-weight: 600;
+  animation: fadeInSlide 0.3s ease-out;
+}
+
+@keyframes fadeInShake {
+  0% {
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+  50% {
+    transform: translateX(2px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes fadeInSlide {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.form-hint {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Error Banner */
+.form-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: rgba(240, 71, 71, 0.12);
+  border: 1px solid rgba(240, 71, 71, 0.4);
+  border-radius: 8px;
+  color: var(--danger);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 500;
+  animation: errorBannerSlideIn 0.3s ease-out;
+}
+
+.form-error-banner::before {
+  content: '⚠️';
+  font-size: calc(16px * var(--font-scale, 1));
+  flex-shrink: 0;
+}
+
+@keyframes errorBannerSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Footer */
+.footer-text {
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.footer-terms {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  line-height: 1.4;
+  max-width: 400px;
+}
+
+/* Shared button pulse animation (used by Login and Register submit buttons) */
+@keyframes buttonPulse {
+  0%,
+  100% {
+    opacity: 0.8;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}

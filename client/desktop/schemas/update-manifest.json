@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "concord:update-manifest",
+  "title": "Concord Voice electron-updater manifest",
+  "description": "Shape of latest.yml / latest-mac.yml / latest-linux.yml produced by the release job in .github/workflows/build-desktop.yml. Single source of truth for both generation (scripts/generate-update-manifest.mts) and read-side verification (scripts/verify-update-manifest.mjs). See docs/policies/update-trust-model.md for the governing trust model.",
+  "type": "object",
+  "required": ["version", "files", "releaseDate"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Release semver triple: MAJOR.MINOR.PATCH. No pre-release or build metadata suffix — release tags are bare semver.",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "files": {
+      "type": "array",
+      "description": "Per-platform artifact list. electron-updater downloads files[*].url and verifies their bytes against files[*].sha512 before applying the update.",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["url", "sha512", "size"],
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Artifact filename (relative to the manifest location on the release server).",
+            "minLength": 1
+          },
+          "sha512": {
+            "type": "string",
+            "description": "Base64-encoded SHA-512 digest of the artifact bytes. SHA-512 over 64 bytes encodes to exactly 88 base64 characters: 86 payload + '==' padding. Regex enforces both the structure (payload chars followed by exactly two '=') and length is implicit in the pattern (86 + 2 = 88).",
+            "pattern": "^[A-Za-z0-9+/]{86}==$"
+          },
+          "size": {
+            "type": "integer",
+            "description": "Artifact size in bytes (matches the on-disk size of the file at files[*].url).",
+            "minimum": 1
+          },
+          "blockMapSize": {
+            "type": "integer",
+            "description": "Byte size of the sibling <url>.blockmap file (electron-builder differential-download block manifest). Present only for macOS .zip entries; omitted for platforms without a blockmap.",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "releaseDate": {
+      "type": "string",
+      "description": "ISO 8601 timestamp when the release was generated. Used by electron-updater for staged-rollout decisions.",
+      "format": "date-time"
+    }
+  }
+}

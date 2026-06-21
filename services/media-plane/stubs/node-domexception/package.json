@@ -1,0 +1,7 @@
+{
+  "name": "node-domexception-stub",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "description": "Local stub re-exporting globalThis.DOMException; replaces deprecated node-domexception@1.0.0 in the install tree. See services/media-plane/package.json overrides comment."
+}

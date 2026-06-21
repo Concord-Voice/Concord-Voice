@@ -1,0 +1,114 @@
+.gif-embed {
+  position: relative;
+  display: block;
+  /* Width/height are set inline from the resolved (clamped) GIF dimensions
+     so the container reserves the final rendered size from the first paint
+     and skeleton → media swap doesn't shift layout. Falls back to fit-content
+     for the placeholder/error states which size themselves intrinsically. */
+  width: fit-content;
+  max-width: 400px;
+  margin-top: 2px;
+  margin-bottom: 0;
+  border-radius: 8px;
+  overflow: hidden;
+  line-height: 0;
+}
+
+.gif-embed-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 8px;
+  object-fit: contain;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.gif-embed-image.loaded {
+  opacity: 1;
+}
+
+.gif-embed-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 8px;
+  object-fit: contain;
+}
+
+.gif-embed-video.loaded {
+  opacity: 1;
+}
+
+.gif-embed-skeleton {
+  /* Fill the container's inline-sized box so the skeleton occupies the same
+     space the resolved GIF will, eliminating the size flip on resolve. When
+     the parent has no inline size yet (very first render of an unknown GIF),
+     fall back to a sensible default so the skeleton is visible. */
+  width: 100%;
+  height: 100%;
+  min-width: 250px;
+  min-height: 180px;
+  border-radius: 8px;
+  background: var(--bg-tertiary, #2a2a2e);
+  animation: gif-skeleton-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes gif-skeleton-pulse {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+.gif-embed-placeholder {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border: 1px dashed var(--border-primary, #444);
+  border-radius: 8px;
+  background: var(--bg-secondary, #1e1e22);
+  color: var(--text-secondary, #aaa);
+  cursor: pointer;
+  font-size: 13px;
+  transition: background 0.15s ease;
+}
+
+.gif-embed-placeholder:hover {
+  background: var(--bg-tertiary, #2a2a2e);
+}
+
+.gif-embed-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--bg-secondary, #1e1e22);
+  color: var(--text-muted, #777);
+  font-size: 13px;
+}
+
+.gif-embed-attribution {
+  position: absolute;
+  bottom: 4px;
+  right: 6px;
+  font-size: 9px;
+  color: rgba(255, 255, 255, 0.5);
+  pointer-events: none;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+}
+
+/* Respect reduce-animations */
+[data-reduce-animations='true'] .gif-embed-skeleton {
+  animation: none;
+  opacity: 0.5;
+}
+
+[data-reduce-animations='true'] .gif-embed-image {
+  transition: none;
+}
