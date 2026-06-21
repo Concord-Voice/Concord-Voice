@@ -4,6 +4,19 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.1] — 2026-06-20 (macOS DMG installer delivery)
+
+> Patch release. v0.2.0-Beta shipped the macOS client as a `.zip` only — the
+> signed-and-notarized `.dmg` installer was built, signed, and notarized by CI
+> but never attached to the GitHub Release because the release-asset glob
+> omitted `*.dmg`. This release corrects the release pipeline so the branded
+> drag-to-Applications `.dmg` ships alongside the `.zip` (which remains the
+> electron-updater auto-update artifact — the `.dmg` is install-only).
+
+### Fixed
+
+- **macOS `.dmg` installer now attached to releases** ([#1722](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1722)) — the release-asset `find` glob in `build-desktop.yml` (feeding `gh release create`) omitted `*.dmg`, so the notarized installer was missing from the v0.2.0 GitHub Release and the public mirror. The DMG is now attached and normalized to `ConcordVoice-<version>-macos-<arch>.dmg`, consistent with the `.zip`. The `latest-mac.yml` auto-updater manifest deliberately remains `.zip`-only (Squirrel.Mac cannot auto-update from a DMG).
+
 ## [0.2.0-Beta] — 2026-06-20 (Phase 2 — Beta release)
 
 > Release-level rollup of Phase 2A + Phase 2B work. Per-revision detail lives in the `[0.1.12]`–`[0.1.18]` entries below; this entry surfaces the user-visible themes that close the v0.2.0-Beta milestone.
