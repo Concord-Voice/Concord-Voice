@@ -20,10 +20,17 @@ import { buildInviteUrl } from '../../utils/inviteUrl';
 import AttachmentUploadPreview from './AttachmentUploadPreview';
 import ReplyPreviewBar from './ReplyPreviewBar';
 import { composeMarkdownOverflow } from '../../utils/overflowToMarkdown';
-import { MAX_ATTACHMENTS } from '../../utils/attachmentCrypto';
+import { MAX_ATTACHMENTS, formatFileSize } from '../../utils/attachmentCrypto';
+import { useEntitlement } from '../../hooks/useEntitlement';
 import './MessageInput.css';
 
 const MAX_CONTENT_LENGTH = 5120;
+/** Premium raises the free message/attachment limits by this factor (UX hint
+ *  copy only — the server is the authority on the real premium caps). */
+const PREMIUM_MULTIPLIER = 2;
+/** Counter announcement thresholds (a11y U1): announce ONLY at 75% / 90% /
+ *  at-limit — never per keystroke. */
+const COUNTER_ANNOUNCE_RATIOS = [0.75, 0.9, 1] as const;
 /** Renderer-side DoS ceiling: paste/typing beyond this is silently discarded.
  *  Content between MAX_CONTENT_LENGTH and DOS_PROTECTION_LIMIT reaches
  *  handleSend intact so the overflow path can synthesize a .md attachment. */
@@ -132,7 +139,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
   onSendMessage,
   onTyping,
   placeholder = 'Type a message...',
-  maxLength = MAX_CONTENT_LENGTH,
+  maxLength: maxLengthProp,
   disabled = false,
   channelName,
   serverId,
@@ -143,7 +150,18 @@ const MessageInput: React.FC<MessageInputProps> = ({
   canAttachFiles = true,
 }) => {
   const channelPanelPinned = useLayoutStore((s) => s.channelPanelPinned);
+  // L7/L9 (#1301): informational-only premium caps. The message char-limit and
+  // attachment-size limit are server-authoritative; these only drive UX hints —
+  // NEVER a hard client block (the server re-checks every send/upload).
+  const maxMessageChars = useEntitlement((e) => e.maxMessageChars);
+  const maxAttachmentBytes = useEntitlement((e) => e.maxAttachmentBytes);
+  // The active char limit: an explicit prop (tests/special hosts) wins; otherwise
+  // the entitlement's maxMessageChars (free floor = MAX_CONTENT_LENGTH = 5120,
+  // the historical default, kept as the ultimate fallback).
+  const maxLength = maxLengthProp ?? maxMessageChars ?? MAX_CONTENT_LENGTH;
   const [content, setContent] = useState('');
+  // L9: a non-modal inline banner for an over-limit attachment attempt.
+  const [attachUpsell, setAttachUpsell] = useState<string | null>(null);
   const [helpModalOpen, setHelpModalOpen] = useState(false);
   const draftTargetId = channelId || conversationId;
   const {
@@ -572,8 +590,29 @@ const MessageInput: React.FC<MessageInputProps> = ({
     }
   };
 
+  /**
+   * L9 (#1301): inspect a selection for a file over the free attachment-size
+   * cap and surface a non-modal upsell banner. Returns the over-limit file's
+   * banner text (also stored in `attachUpsell`) or null. This does NOT block —
+   * the file still flows to `addFiles`, whose own hard MAX_FILE_SIZE validation
+   * (the DoS ceiling) decides acceptance. The banner is purely informational.
+   */
+  const checkAttachmentUpsell = (incoming: FileList | File[]): void => {
+    const over = Array.from(incoming).find((f) => f.size > maxAttachmentBytes);
+    if (over) {
+      setAttachUpsell(
+        `${over.name} is ${formatFileSize(over.size)}. Free limit ${formatFileSize(
+          maxAttachmentBytes
+        )}. Premium raises it to ${formatFileSize(maxAttachmentBytes * PREMIUM_MULTIPLIER)}.`
+      );
+    } else {
+      setAttachUpsell(null);
+    }
+  };
+
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
+      checkAttachmentUpsell(e.target.files);
       const error = addFiles(e.target.files);
       if (error) setUploadError(error);
       else setUploadError(null);
@@ -600,6 +639,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
     e.stopPropagation();
     setDragOver(false);
     if (!canAttachFiles || !e.dataTransfer.files.length) return;
+    checkAttachmentUpsell(e.dataTransfer.files);
     const error = addFiles(e.dataTransfer.files);
     if (error) setUploadError(error);
     else setUploadError(null);
@@ -672,6 +712,22 @@ const MessageInput: React.FC<MessageInputProps> = ({
   const charCount = content.length;
   const counterVisible = charCount >= Math.floor(maxLength * COUNTER_VISIBLE_RATIO);
   const counterClass = getCounterClass(charCount, maxLength);
+  const atLimit = charCount >= maxLength;
+
+  // L7 (a11y U1): announce ONLY at 75% / 90% / at-limit thresholds. The message
+  // is a function of the highest band CROSSED, so the aria-live text changes
+  // (and re-announces) only on a band transition — never per keystroke.
+  const announceRatio = [...COUNTER_ANNOUNCE_RATIOS]
+    .reverse()
+    .find((r) => charCount >= Math.floor(maxLength * r));
+  let counterAnnouncement = '';
+  if (announceRatio === 1) {
+    counterAnnouncement = `Message at the ${maxLength}-character limit. Longer messages send as a .md attachment.`;
+  } else if (announceRatio === 0.9) {
+    counterAnnouncement = `Approaching the ${maxLength}-character limit.`;
+  } else if (announceRatio === 0.75) {
+    counterAnnouncement = `${maxLength - charCount} characters remaining.`;
+  }
 
   return (
     <div className="message-input-container">
@@ -726,6 +782,20 @@ const MessageInput: React.FC<MessageInputProps> = ({
           {hasFiles && <AttachmentUploadPreview files={uploadFiles} onRemove={removeFile} />}
           {uploadError && <div className="upload-error">{uploadError}</div>}
           {uploadStatus && !uploadError && <div className="upload-status">{uploadStatus}</div>}
+          {/* L9: non-modal inline attachment-size upsell banner (#1301). */}
+          {attachUpsell && (
+            <output className="attachment-upsell-banner">
+              <span>{attachUpsell}</span>
+              <button
+                type="button"
+                className="attachment-upsell-dismiss"
+                aria-label="Dismiss"
+                onClick={() => setAttachUpsell(null)}
+              >
+                ×
+              </button>
+            </output>
+          )}
           <textarea
             ref={textareaRef}
             className="message-input-textarea"
@@ -737,6 +807,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
             onPaste={(e) => {
               if (canAttachFiles && e.clipboardData.files.length > 0) {
                 e.preventDefault();
+                checkAttachmentUpsell(e.clipboardData.files);
                 const error = addFiles(e.clipboardData.files);
                 if (error) setUploadError(error);
                 else setUploadError(null);
@@ -751,8 +822,22 @@ const MessageInput: React.FC<MessageInputProps> = ({
             {counterVisible && (
               <span className={counterClass}>
                 {charCount}/{maxLength}
+                {/* L7: at the limit, advertise the .md-attachment overflow path
+                    and the premium uplift. Informational — send is NEVER blocked. */}
+                {atLimit && (
+                  <span className="counter-overflow-hint">
+                    {' '}
+                    · .md attachment · {PREMIUM_MULTIPLIER}× with Premium
+                  </span>
+                )}
               </span>
             )}
+            {/* L7 (a11y U1): threshold-only announcer — text changes only on a
+                band transition, so AT reads it at 75% / 90% / at-limit, not on
+                every keystroke. */}
+            <span className="sr-only" aria-live="polite">
+              {counterAnnouncement}
+            </span>
 
             <button
               className="send-button"

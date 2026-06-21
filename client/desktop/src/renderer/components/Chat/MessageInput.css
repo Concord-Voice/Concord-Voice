@@ -285,10 +285,60 @@ kbd {
 }
 
 .counter.warn {
-  color: var(--warning, #c27800);
+  /* L7 (#1301): amber via the high-contrast warning token (spec §5 P1 — full
+     opacity, ≥4.5:1), falling back to the prior --warning then a literal. */
+  color: var(--text-warning-strong, var(--warning, #c27800));
 }
 
 .counter.error {
   color: var(--error, #c72a28);
   font-weight: 600;
+}
+
+/* L7: the at-limit overflow + premium hint appended to the counter. */
+.counter-overflow-hint {
+  font-weight: 600;
+}
+
+/* L9 (#1301): non-modal inline attachment-size upsell banner. */
+.attachment-upsell-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--bg-secondary, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--accent-secondary, var(--accent-primary));
+  color: var(--text-primary);
+  font-size: 0.82rem;
+}
+
+.attachment-upsell-dismiss {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.attachment-upsell-dismiss:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+
+/* Visually-hidden live region for the L7 threshold announcer (a11y U1). */
+.message-input-container .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }

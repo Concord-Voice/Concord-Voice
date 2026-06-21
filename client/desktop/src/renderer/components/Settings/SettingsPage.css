@@ -2279,3 +2279,107 @@
   outline: none;
   border-color: var(--accent-primary);
 }
+
+/* ─── Premium lock affordances (#1301 — L1/L2 settings clamps) ────────────
+   a11y O1/P1/P2: locked controls stay focusable; "locked" is conveyed by the
+   🔒 glyph + the word "Premium" + a SOLID muted token at full opacity — never
+   opacity/colour alone. Do NOT reuse `.settings-row-disabled` (pointer-events:
+   none) for these. */
+
+/* L1: a premium audio-tier label. Receded via a solid muted colour (full
+   opacity), with a trailing lock glyph. Stays clickable (snaps back). */
+.settings-tier-label-locked {
+  color: var(--text-muted);
+}
+
+.settings-tier-lock-glyph {
+  font-size: 0.85em;
+  margin-left: 3px;
+  line-height: 1;
+  vertical-align: middle;
+}
+
+/* L1: the snap-back popover surfaced after a locked tier selection. Non-modal,
+   inline status; carries the interactive PremiumChip. */
+.settings-tier-lock-popover {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-secondary, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--accent-secondary, var(--accent-primary));
+}
+
+.settings-tier-lock-popover-text {
+  color: var(--text-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+/* L2: the inline chip surfaced after a locked ptime selection snaps back. */
+.settings-row-premium-note {
+  display: inline-flex;
+  margin-top: 4px;
+}
+
+/* Reduced motion: the popover appears instantly (no slide/fade). */
+@media (prefers-reduced-motion: reduce) {
+  .settings-tier-lock-popover {
+    transition: none;
+    animation: none;
+  }
+}
+
+/* ─── Premium lock affordances (#1301 — L5/L6 video clamps) ───────────────── */
+
+/* L6: the "your device supports more" note. Full-opacity legible text — the
+   information is conveyed by the word "Premium" (in the sibling chip) + this
+   note, never colour alone. */
+.settings-native-exceeds-note {
+  color: var(--text-muted);
+  font-size: calc(11px * var(--font-scale, 1));
+}
+
+/* L5: the manual-bitrate slider wrapper. When `capped`, the ghost-zone fences
+   off the premium range past the free thumb. The slider itself stays live. */
+.settings-bitrate-slider-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.settings-bitrate-ghost-zone {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+  padding: 0;
+}
+
+.settings-bitrate-ghost-zone:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* Decorative gradient hinting the locked premium range — aria-hidden, never the
+   sole signal of locked-ness (the chip + "Premium" word carry that). */
+.settings-bitrate-ghost-gradient {
+  display: inline-block;
+  width: 40px;
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--accent-secondary, var(--accent-primary)), transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-bitrate-ghost-zone {
+    transition: none;
+  }
+}

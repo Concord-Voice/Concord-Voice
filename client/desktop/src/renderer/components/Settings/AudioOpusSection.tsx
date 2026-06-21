@@ -1,7 +1,12 @@
+import { useState } from 'react';
 import ToggleSwitch from './ToggleSwitch';
 import CustomSelect from '../ui/CustomSelect';
+import PremiumGate from '../common/PremiumGate';
+import PremiumChip from '../common/PremiumChip';
+import { useGateActivation } from '../../hooks/useGateActivation';
 import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../../stores/voiceStore';
 import { type AudioPriority } from '../../stores/audioSettingsStore';
+import { useEntitlement } from '../../hooks/useEntitlement';
 import { useDraftAudioSetting, setDraftAudioSetting } from '../../hooks/useDraftSettings';
 
 // ─── Hint Helpers ────────────────────────────────────────────────────────────
@@ -51,7 +56,43 @@ const AudioOpusSection: React.FC<AudioOpusSectionProps> = ({ qualityTier }) => {
   const audioPriority = useDraftAudioSetting('audioPriority');
   const stereoOverride = useDraftAudioSetting('stereoOverride');
 
+  // Premium gates (#1301):
+  //  - L3 Music Mode: binary lock on `allowMusicMode`. Intercepting `dim` gate.
+  //  - L2 Frame Size (ptime): the 10 ms option is premium — free floor
+  //    `minPtimeMs` is 20, so any ptime BELOW the floor is paid. The select
+  //    stays usable for the free options; picking the locked 10 ms snaps back
+  //    to the highest free value (20 ms) and surfaces the chip.
+  const allowMusicMode = useEntitlement((e) => e.allowMusicMode);
+  const minPtimeMs = useEntitlement((e) => e.minPtimeMs);
+  const ptimeGate = useGateActivation('audio-tier');
+  // Show the snap-back chip after a locked ptime pick. Local UI state only.
+  const [ptimeLockHinted, setPtimeLockHinted] = useState(false);
+
   const tierConfig = AUDIO_QUALITY_TIERS[qualityTier];
+
+  /** The frame-size options, each tagged premium when its ptime is below the
+   *  free floor (`minPtimeMs`). `0` (tier default) and values ≥ floor are free. */
+  const frameSizeOptions: { value: string; label: string; premium: boolean }[] = [
+    { value: '0', label: `Default (${tierConfig.preferredFrameSize} ms)`, premium: false },
+    { value: '10', label: '10 ms (lowest latency)', premium: 10 < minPtimeMs },
+    { value: '20', label: '20 ms', premium: 20 < minPtimeMs },
+    { value: '40', label: '40 ms (efficient)', premium: 40 < minPtimeMs },
+    { value: '60', label: '60 ms (most efficient)', premium: 60 < minPtimeMs },
+  ];
+  const HIGHEST_FREE_PTIME = 20; // the free-tier floor value the snap-back lands on
+
+  const handleFrameSizeChange = (raw: string): void => {
+    const chosen = frameSizeOptions.find((o) => o.value === raw);
+    if (chosen?.premium) {
+      // L2 snap-back: a locked ptime never reaches the store. Clamp to the
+      // highest free value and reveal the chip (no mid-action modal).
+      setDraftAudioSetting('frameSize', HIGHEST_FREE_PTIME);
+      setPtimeLockHinted(true);
+      return;
+    }
+    setPtimeLockHinted(false);
+    setDraftAudioSetting('frameSize', Number(raw) as 0 | 10 | 20 | 40 | 60);
+  };
 
   return (
     <>
@@ -66,7 +107,17 @@ const AudioOpusSection: React.FC<AudioOpusSectionProps> = ({ qualityTier }) => {
               : 'Disabled. Standard voice processing is active with voice-optimized encoding.'}
           </span>
         </div>
-        <ToggleSwitch checked={musicMode} onChange={(v) => setDraftAudioSetting('musicMode', v)} />
+        <PremiumGate
+          mode="dim"
+          entitled={allowMusicMode}
+          feature="musicMode"
+          onActivateSection="music-mode"
+        >
+          <ToggleSwitch
+            checked={musicMode}
+            onChange={(v) => setDraftAudioSetting('musicMode', v)}
+          />
+        </PremiumGate>
       </div>
 
       <div className="settings-row">
@@ -90,18 +141,26 @@ const AudioOpusSection: React.FC<AudioOpusSectionProps> = ({ qualityTier }) => {
           <span className="settings-row-hint">
             {frameSizeHint(adaptivePtime, frameSize, tierConfig.preferredFrameSize)}
           </span>
+          {ptimeLockHinted && (
+            <span className="settings-row-premium-note">
+              <PremiumChip
+                label="lower latency"
+                onActivate={ptimeGate.onActivate}
+                id={ptimeGate.describedById}
+              />
+            </span>
+          )}
         </div>
         <CustomSelect
           className="settings-select"
-          options={[
-            { value: '0', label: `Default (${tierConfig.preferredFrameSize} ms)` },
-            { value: '10', label: '10 ms (lowest latency)' },
-            { value: '20', label: '20 ms' },
-            { value: '40', label: '40 ms (efficient)' },
-            { value: '60', label: '60 ms (most efficient)' },
-          ]}
+          // L2: premium ptime options carry a trailing 🔒 + "Premium" marker in
+          // their label. The select stays usable; selecting one snaps back.
+          options={frameSizeOptions.map((o) => ({
+            value: o.value,
+            label: o.premium ? `${o.label} \u{1F512} Premium` : o.label,
+          }))}
           value={String(adaptivePtime ? 0 : frameSize)}
-          onChange={(v) => setDraftAudioSetting('frameSize', Number(v) as 0 | 10 | 20 | 40 | 60)}
+          onChange={handleFrameSizeChange}
           disabled={adaptivePtime}
         />
       </div>

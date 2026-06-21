@@ -1,0 +1,69 @@
+/* ─── PremiumChip — the universal lock affordance (#1301) ─────────────────
+   Extends the existing `.settings-quality-premium-badge` (SettingsPage.css):
+   yellow pill (--accent-secondary bg, --bg-primary text), 🔒 glyph slot, the
+   literal word "Premium". The brand gradient is RESERVED for active-Premium
+   surfaces (dossier I.1 "the gradient is the reward") — the locked chip stays
+   in the flat yellow badge palette. */
+
+.premium-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: calc(10px * var(--font-scale, 1));
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--accent-secondary, var(--accent-primary));
+  color: var(--bg-primary);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  line-height: 1.4;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.premium-chip__glyph {
+  font-size: 0.95em;
+  line-height: 1;
+  /* The glyph carries its own accessible name (aria-label) — the surrounding
+     text is decorative repetition, so do NOT also hide the glyph from AT. */
+}
+
+.premium-chip__word {
+  /* The literal word "Premium" — load-bearing for a11y P2 (locked-ness is never
+     conveyed by colour/glyph alone). Full-opacity token; never dimmed. */
+}
+
+.premium-chip__label {
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 0.85; /* non-text chrome only — the "Premium" word stays full opacity */
+}
+
+/* Interactive chip = native <button>, reset to look like the pill, keyboard +
+   focus-visible affordance preserved (a11y O1: the lock is reachable). */
+.premium-chip--interactive {
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.premium-chip--interactive:hover {
+  filter: brightness(1.08);
+}
+
+.premium-chip--interactive:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* Reduced motion: the brightness/transition affordances become instant. */
+@media (prefers-reduced-motion: reduce) {
+  .premium-chip--interactive {
+    transition: none;
+  }
+  .premium-chip--interactive:hover {
+    filter: none;
+  }
+}

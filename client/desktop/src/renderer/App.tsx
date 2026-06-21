@@ -27,6 +27,8 @@ import { runRecoveryModule } from './utils/runRecoveryModule';
 import { useVideoSettingsStore } from './stores/videoSettingsStore';
 import { useOsPermissionStore, type OsPermissionType } from './stores/osPermissionStore';
 import { useWebSocket } from './hooks/useWebSocket';
+import { useLaunchReset } from './hooks/useLaunchReset';
+import SubscriptionResetModal from './components/Settings/SubscriptionResetModal';
 import { e2eeService } from './services/e2eeService';
 import { hydratePostLogin } from './services/postLoginHydration';
 import { usePrivacyStore } from './stores/privacyStore';
@@ -104,6 +106,15 @@ export function handleAppRootError() {
       console.error('[App] Failed to soft-restart, forcing reload:', errorMessage(err));
       globalThis.location.reload();
     });
+}
+
+// ─── Launch-reset host (#1301) ─────────────────────────────────────────
+// Runs the once-per-session free-tier settings clamp after entitlements are
+// known (hydrated by hydratePostLogin) and surfaces the one-time explainer.
+// Mounted inside the authenticated tree so it fires only for a logged-in user.
+function LaunchResetHost() {
+  const { showResetModal, acknowledge } = useLaunchReset();
+  return <SubscriptionResetModal open={showResetModal} onAcknowledge={acknowledge} />;
 }
 
 // ─── Authenticated Layout ──────────────────────────────────────────────
@@ -256,6 +267,7 @@ function AuthenticatedLayout() {
         <SettingsOverlayHost />
       </ErrorBoundary>
       <ConnectionLostOverlay />
+      <LaunchResetHost />
     </>
   );
 }

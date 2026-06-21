@@ -1,0 +1,62 @@
+/* ─── PremiumGate — dormant gated control treatment (#1301) ───────────────
+   a11y O1 (CRITICAL): the gated control stays FOCUSABLE.
+   - NEVER `pointer-events: none` (that is exactly what `.settings-row-disabled`
+     does — do NOT reuse it for gates).
+   - NEVER the HTML `disabled` attribute (set in the component, not here).
+   Locked-ness is conveyed by the 🔒 glyph + the word "Premium" (the inline
+   PremiumChip) + a full-opacity muted token — NEVER opacity/colour alone (P1/P2). */
+
+.premium-gate {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  /* No pointer-events / opacity here — interaction is intercepted in JS so the
+     control stays keyboard- and pointer-reachable (the click routes to the
+     upsell). */
+}
+
+/* The gated (dormant) control. After #1301's S6819 fix the control is the
+   wrapper's FIRST child — either the cloned gated element itself or the
+   `.premium-gate__control` fallback span — and the chip is the LAST child.
+   Scope the receding treatment to the first child (NOT the chip) via a child
+   combinator so it applies whether the control was cloned or wrapped. */
+.premium-gate > :first-child {
+  /* Receded treatment via a SOLID muted token at FULL opacity (P1) — the locked
+     text never drops below the 4.5:1 contrast floor that `opacity:0.5` would. */
+  color: var(--text-muted);
+}
+
+/* Per-mode receding. All three keep full opacity + full pointer reachability;
+   they differ only in how the dormant control is visually de-emphasised. */
+
+/* `dim` — a toggle / row that is muted but legible (L3 music mode, L4 custom
+   circle, L7 counter, L9 banner). */
+.premium-gate--dim > :first-child {
+  filter: grayscale(0.6);
+}
+
+/* `clamp` — a slider/segment whose premium end is fenced off (L1 tier slider,
+   L5 manual bitrate). */
+.premium-gate--clamp > :first-child {
+  filter: grayscale(0.4);
+}
+
+/* `option` — a select whose premium options carry the chip (L2 video quality).
+   The control itself stays fully legible; the chip does the signalling — so no
+   extra receding rule for the first child here. */
+
+.premium-gate__chip {
+  flex-shrink: 0;
+}
+
+/* Reduced motion: the gate has no animation of its own, but any host popover /
+   snap-back that consumes the gate must become instant. Declared here as the
+   gate-level contract so a host doesn't reintroduce motion under reduce. */
+@media (prefers-reduced-motion: reduce) {
+  .premium-gate,
+  .premium-gate > :first-child,
+  .premium-gate__chip {
+    transition: none !important;
+    animation: none !important;
+  }
+}

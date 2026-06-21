@@ -386,3 +386,42 @@
   justify-content: flex-end;
   margin-top: 16px;
 }
+
+/* ─── Premium informational hints (#1301 — L8/L9 profile) ────────────────── */
+
+/* L8: the username-cadence premium upsell appended to the existing form hint.
+   Full-opacity legible text — the word "Premium" carries the signal (P2). */
+.username-cadence-upsell {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+/* L9: non-modal inline avatar/banner size upsell banner. */
+.image-upsell-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--bg-secondary, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--accent-secondary, var(--accent-primary));
+  color: var(--text-primary);
+  font-size: 0.82rem;
+}
+
+.image-upsell-dismiss {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.image-upsell-dismiss:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}

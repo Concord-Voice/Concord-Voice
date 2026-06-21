@@ -49,6 +49,21 @@ vi.mock('@/renderer/hooks/useDraftSettings', () => ({
   setDraftVideoSetting: mockSetDraftVideoSetting,
 }));
 
+// These existing tests exercise device-derived resolution/fps/bitrate behaviour,
+// so grant unbounded premium video caps (#1301) — the lock variants (L2/L5/L6)
+// must not clamp the option lists here. Lock behaviour is covered in
+// VideoConfigSection.premium.test.tsx.
+vi.mock('@/renderer/hooks/useEntitlement', () => ({
+  useEntitlement: vi.fn((selector: (e: Record<string, unknown>) => unknown) =>
+    selector({
+      maxVideoHeight: 4320,
+      maxVideoFps: 240,
+      maxVideoPixelRate: Number.MAX_SAFE_INTEGER,
+      maxManualBitrateBps: 30_000_000,
+    })
+  ),
+}));
+
 vi.mock('@/renderer/services/mediaCapabilities', () => ({
   codecKey: vi.fn(
     (c: { mimeType: string; sdpFmtpLine?: string }) => `${c.mimeType}/${c.sdpFmtpLine || 'default'}`

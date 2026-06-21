@@ -89,6 +89,13 @@ export type { CustomColors } from '../utils/colorUtils';
 interface SettingsState {
   appearance: AppearanceSettings;
   clientBehavior: ClientBehavior;
+  /**
+   * One-time launch-reset explainer acknowledgement (#1301). Set true after the
+   * user dismisses `<SubscriptionResetModal>`. Persisted so the modal is shown
+   * once, ever — across restarts. Top-level (not an appearance setting); see the
+   * persist `merge` below, which must carry it through rehydration.
+   */
+  subscriptionResetAcknowledged: boolean;
   setTheme: (theme: AppearanceSettings['theme']) => void;
   setColorScheme: (scheme: AppearanceSettings['colorScheme']) => void;
   setFontSize: (size: AppearanceSettings['fontSize']) => void;
@@ -100,6 +107,7 @@ interface SettingsState {
   setAppFont: (id: AppFontId) => void;
   setDyslexicSupport: (on: boolean) => void;
   setClientBehavior: (value: ClientBehavior) => void;
+  setSubscriptionResetAcknowledged: (acknowledged: boolean) => void;
 }
 
 const defaultAppearance: AppearanceSettings = {
@@ -193,6 +201,7 @@ export const useSettingsStore = wrapStore(
       subscribeWithSelector((set) => ({
         appearance: defaultAppearance,
         clientBehavior: DEFAULT_CLIENT_BEHAVIOR,
+        subscriptionResetAcknowledged: false,
 
         setTheme: (theme) =>
           set((state) => ({
@@ -243,6 +252,9 @@ export const useSettingsStore = wrapStore(
         setDyslexicSupport: (dyslexicSupport) =>
           set((state) => ({ appearance: { ...state.appearance, dyslexicSupport } })),
 
+        setSubscriptionResetAcknowledged: (subscriptionResetAcknowledged) =>
+          set({ subscriptionResetAcknowledged }),
+
         setClientBehavior: (value: ClientBehavior) => {
           set({ clientBehavior: value });
           // Push to main so the close/minimize intercepts see the new value.
@@ -269,6 +281,9 @@ export const useSettingsStore = wrapStore(
             ...p,
             appearance: { ...defaultAppearance, ...p?.appearance },
             clientBehavior: { ...DEFAULT_CLIENT_BEHAVIOR, ...p?.clientBehavior },
+            // Default false when a pre-#1301 snapshot has no ack flag (the
+            // `...p` spread already carries it forward when present).
+            subscriptionResetAcknowledged: p?.subscriptionResetAcknowledged ?? false,
           };
         },
       }

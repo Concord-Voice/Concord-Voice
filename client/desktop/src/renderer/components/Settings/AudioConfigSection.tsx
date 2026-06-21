@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import { useVoiceStore, AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../../stores/voiceStore';
 import { useAudioSettingsStore } from '../../stores/audioSettingsStore';
 import {
@@ -7,6 +7,9 @@ import {
   batchSetAudioDrafts,
   useStashAndSwapAudioMode,
 } from '../../hooks/useDraftSettings';
+import { useEntitlement } from '../../hooks/useEntitlement';
+import { useGateActivation } from '../../hooks/useGateActivation';
+import PremiumChip from '../common/PremiumChip';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
 import AudioOpusSection from './AudioOpusSection';
@@ -85,6 +88,60 @@ const AudioConfigSection: React.FC = () => {
 
   const stashAndSwapAudioMode = useStashAndSwapAudioMode();
 
+  // L1 (#1301): the quality slider stays live across the free tiers; premium
+  // tiers (those NOT in `allowedAudioTiers`) render a 🔒 tick and snap back to
+  // the highest free tier when selected, surfacing a chip popover — no
+  // mid-action modal. The slider is fully keyboard-operable within the free
+  // range (we don't cap `max`; we intercept the value on change).
+  const allowedAudioTiers = useEntitlement((e) => e.allowedAudioTiers);
+  const audioTierGate = useGateActivation('audio-tier');
+  const [tierLockHinted, setTierLockHinted] = useState(false);
+
+  const isTierLocked = useCallback(
+    (tier: AudioQualityTier): boolean =>
+      AUDIO_QUALITY_TIERS[tier]?.premium === true && !allowedAudioTiers.includes(tier),
+    [allowedAudioTiers]
+  );
+
+  /** Highest free tier the snap-back lands on — the last allowed tier in
+   *  display order (falls back to 'standard' if the floor list is unexpected). */
+  const highestFreeTier: AudioQualityTier =
+    [...TIER_ORDER].reverse().find((t) => allowedAudioTiers.includes(t)) ?? 'standard';
+
+  /** Apply a tier selection, batching its drafts in basic mode (the existing
+   *  side effect). Shared by the slider + label paths. */
+  const applyTier = useCallback(
+    (tier: AudioQualityTier) => {
+      setQualityTier(tier);
+      if (!useAudioSettingsStore.getState().advancedMode) {
+        const tc = AUDIO_QUALITY_TIERS[tier];
+        batchSetAudioDrafts({
+          silenceDetection: tc.opusDtx,
+          inlineFec: tc.opusFec,
+          fecHeadroom: tc.opusFec,
+          frameSize: 0,
+          stereoOverride: null,
+        });
+      }
+    },
+    [setQualityTier]
+  );
+
+  /** Resolve a tier selection through the L1 gate: a locked tier snaps back to
+   *  the highest free tier and reveals the chip; a free tier passes through. */
+  const selectTierGated = useCallback(
+    (tier: AudioQualityTier) => {
+      if (isTierLocked(tier)) {
+        applyTier(highestFreeTier);
+        setTierLockHinted(true);
+        return;
+      }
+      setTierLockHinted(false);
+      applyTier(tier);
+    },
+    [isTierLocked, applyTier, highestFreeTier]
+  );
+
   // Audio processing settings (drafted)
   const noiseCancellation = useDraftAudioSetting('noiseCancellation');
   const echoCancellation = useDraftAudioSetting('echoCancellation');
@@ -101,22 +158,12 @@ const AudioConfigSection: React.FC = () => {
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const idx = Number(e.target.value);
       if (idx >= 0 && idx < TIER_ORDER.length) {
-        const tier = TIER_ORDER[idx];
-        setQualityTier(tier); // voiceStore — immediate, not drafted
-        if (!useAudioSettingsStore.getState().advancedMode) {
-          // Basic mode: batch-draft tier defaults
-          const tc = AUDIO_QUALITY_TIERS[tier];
-          batchSetAudioDrafts({
-            silenceDetection: tc.opusDtx,
-            inlineFec: tc.opusFec,
-            fecHeadroom: tc.opusFec,
-            frameSize: 0,
-            stereoOverride: null,
-          });
-        }
+        // L1: a drag/keyboard move onto a locked premium tier snaps back to the
+        // highest free tier and reveals the chip; free tiers pass through.
+        selectTierGated(TIER_ORDER[idx]);
       }
     },
-    [setQualityTier]
+    [selectTierGated]
   );
 
   const handleAdvancedToggle = useCallback(
@@ -180,26 +227,18 @@ const AudioConfigSection: React.FC = () => {
         <div className="settings-tier-labels">
           {TIER_ORDER.map((tier, i) => {
             const config = AUDIO_QUALITY_TIERS[tier];
+            const locked = isTierLocked(tier);
             return (
               <span
                 key={tier}
-                className={`settings-tier-label ${tierIndex === i ? 'active' : ''}`}
+                className={`settings-tier-label ${tierIndex === i ? 'active' : ''} ${locked ? 'settings-tier-label-locked' : ''}`}
                 role="tab"
                 tabIndex={0}
                 aria-selected={tierIndex === i}
-                onClick={() => {
-                  setQualityTier(tier);
-                  if (!useAudioSettingsStore.getState().advancedMode) {
-                    const tc = AUDIO_QUALITY_TIERS[tier];
-                    batchSetAudioDrafts({
-                      silenceDetection: tc.opusDtx,
-                      inlineFec: tc.opusFec,
-                      fecHeadroom: tc.opusFec,
-                      frameSize: 0,
-                      stereoOverride: null,
-                    });
-                  }
-                }}
+                // O1: locked tiers stay focusable + aria-disabled (never
+                // `disabled`/`pointer-events:none`); selecting one snaps back.
+                {...(locked ? { 'aria-disabled': 'true' } : {})}
+                onClick={() => selectTierGated(tier)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault();
@@ -208,6 +247,15 @@ const AudioConfigSection: React.FC = () => {
                 }}
               >
                 {config.label}
+                {locked && (
+                  <span
+                    className="settings-tier-lock-glyph"
+                    aria-label="Premium feature"
+                    role="img"
+                  >
+                    {'\u{1F512}'}
+                  </span>
+                )}
               </span>
             );
           })}
@@ -250,6 +298,19 @@ const AudioConfigSection: React.FC = () => {
               <span className="settings-quality-premium-badge">Premium</span>
             )}
           </div>
+        )}
+
+        {tierLockHinted && (
+          <output className="settings-tier-lock-popover">
+            <span className="settings-tier-lock-popover-text">
+              High-fidelity tiers need a subscription.
+            </span>
+            <PremiumChip
+              label="High / Hi-Fi / Studio"
+              onActivate={audioTierGate.onActivate}
+              id={audioTierGate.describedById}
+            />
+          </output>
         )}
       </div>
 

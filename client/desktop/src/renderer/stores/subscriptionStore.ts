@@ -38,6 +38,15 @@ export const FREE_ENTITLEMENT: Entitlement = {
 interface SubscriptionState {
   entitlement: Entitlement;
   degraded: boolean; // true when the last hydrate failed (showing the free floor)
+  /**
+   * True once an AUTHORITATIVE entitlement has been received — a successful
+   * `hydrate()` or an `entitlements_changed` WS push via `setEntitlement`. It is
+   * NOT set by a failed hydrate (which only flips `degraded`). Consumers that
+   * take a DESTRUCTIVE action on `tier` (e.g. the launch-reset free-tier clamp,
+   * #1301) MUST gate on `hydrated && !degraded` — otherwise they act on the
+   * pre-hydrate FREE default and silently wipe a premium user's settings.
+   */
+  hydrated: boolean;
   setEntitlement: (e: Entitlement) => void;
   hydrate: () => Promise<void>;
   /**
@@ -51,7 +60,8 @@ interface SubscriptionState {
 export const useSubscriptionStore = createStore<SubscriptionState>()((set) => ({
   entitlement: FREE_ENTITLEMENT,
   degraded: false,
-  setEntitlement: (e) => set({ entitlement: e, degraded: false }),
+  hydrated: false,
+  setEntitlement: (e) => set({ entitlement: e, degraded: false, hydrated: true }),
   hydrate: async () => {
     try {
       const res = await apiFetch('/api/v1/entitlements');
@@ -65,11 +75,16 @@ export const useSubscriptionStore = createStore<SubscriptionState>()((set) => ({
       // undefined fields. Keeps the fetch path symmetric with the
       // entitlements_changed dispatch boundary (#1297 / Gitar review).
       const dto = EntitlementsChangedSchema.shape.data.parse(raw);
-      set({ entitlement: dto, degraded: false });
+      set({ entitlement: dto, degraded: false, hydrated: true });
     } catch {
       // Fail closed: never grant premium on error — reset to the free floor.
+      // Do NOT set `hydrated`: a failed hydrate is not an authoritative result,
+      // so destructive tier-gated consumers must keep waiting (data-loss guard).
       set({ entitlement: FREE_ENTITLEMENT, degraded: true });
     }
   },
-  reset: () => set({ entitlement: FREE_ENTITLEMENT, degraded: false }),
+  // Account-switch resets to un-hydrated free so the next user's launch-reset
+  // waits for THEIR authoritative entitlement rather than acting on the prior
+  // session's (or the default) state.
+  reset: () => set({ entitlement: FREE_ENTITLEMENT, degraded: false, hydrated: false }),
 }));

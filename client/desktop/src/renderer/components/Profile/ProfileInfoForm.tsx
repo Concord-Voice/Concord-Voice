@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { useUserStore, UpdateProfileData } from '../../stores/userStore';
 import { useImageUpload } from '../../hooks/useImageUpload';
+import { useEntitlement } from '../../hooks/useEntitlement';
+import { formatFileSize } from '../../utils/attachmentCrypto';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import Modal from '../ui/Modal';
 import ImageCropEditor from '../ui/ImageCropEditor';
@@ -16,9 +18,27 @@ import {
   type ProfileFormErrors,
 } from './profileConstants';
 
+/** Premium uplift factor for the size-upsell copy (UX hint only). */
+const PREMIUM_IMAGE_MULTIPLIER = 2;
+/** Free username-change cadence (1 year) in seconds — when the entitlement
+ *  matches this, the L8 note advertises the premium (3-month) cadence. */
+const FREE_USERNAME_INTERVAL_SECONDS = 31_536_000;
+
 const ProfileInfoForm: React.FC = () => {
   const user = useUserStore((state) => state.user);
   const updateProfile = useUserStore((state) => state.updateProfile);
+
+  // L8/L9 (#1301): informational-only premium caps. The username-change cadence
+  // and avatar/banner size limits are server-authoritative; these only drive UX
+  // hints, never a hard client block.
+  const usernameChangeIntervalSeconds = useEntitlement((e) => e.usernameChangeIntervalSeconds);
+  const maxAvatarBytes = useEntitlement((e) => e.maxAvatarBytes);
+  const maxBannerBytes = useEntitlement((e) => e.maxBannerBytes);
+  // L9: a non-modal inline upsell banner for an over-limit avatar/banner pick.
+  const [avatarUpsell, setAvatarUpsell] = useState<string | null>(null);
+  const [bannerUpsell, setBannerUpsell] = useState<string | null>(null);
+  // Whether the free yearly cadence applies (drives the L8 premium upsell copy).
+  const onFreeUsernameCadence = usernameChangeIntervalSeconds >= FREE_USERNAME_INTERVAL_SECONDS;
 
   // Profile form state
   const [username, setUsername] = useState('');
@@ -264,6 +284,28 @@ const ProfileInfoForm: React.FC = () => {
     });
   };
 
+  /**
+   * L9 (#1301): build the size-upsell banner text for an over-limit image, or
+   * clear it when within the limit. Informational — does NOT block; the file
+   * still flows to the upload hook (whose own validation decides acceptance).
+   */
+  const makeImageUpsell = (file: File | undefined, limit: number): string | null => {
+    if (!file || file.size <= limit) return null;
+    return `This file is ${formatFileSize(file.size)}. Free limit ${formatFileSize(
+      limit
+    )}. Premium raises it to ${formatFileSize(limit * PREMIUM_IMAGE_MULTIPLIER)}.`;
+  };
+
+  const handleAvatarFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setAvatarUpsell(makeImageUpsell(e.target.files?.[0], maxAvatarBytes));
+    avatar.handleChange(e);
+  };
+
+  const handleBannerFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setBannerUpsell(makeImageUpsell(e.target.files?.[0], maxBannerBytes));
+    header.handleChange(e);
+  };
+
   return (
     <form className="profile-section" onSubmit={handleProfileSubmit}>
       <h2 className="profile-section-title">Profile Information</h2>
@@ -325,11 +367,25 @@ const ProfileInfoForm: React.FC = () => {
           ref={avatar.fileInputRef}
           type="file"
           accept="image/png,image/jpeg,image/gif,image/webp"
-          onChange={avatar.handleChange}
+          onChange={handleAvatarFileChange}
           hidden
         />
       </div>
       {profileErrors.avatar && <span className="form-error">{profileErrors.avatar}</span>}
+      {/* L9: non-modal avatar size upsell banner (#1301). */}
+      {avatarUpsell && (
+        <output className="image-upsell-banner">
+          <span>{avatarUpsell}</span>
+          <button
+            type="button"
+            className="image-upsell-dismiss"
+            aria-label="Dismiss"
+            onClick={() => setAvatarUpsell(null)}
+          >
+            ×
+          </button>
+        </output>
+      )}
 
       {/* Header Image */}
       <div className="profile-header-image-section">
@@ -377,11 +433,25 @@ const ProfileInfoForm: React.FC = () => {
           ref={header.fileInputRef}
           type="file"
           accept="image/png,image/jpeg,image/gif,image/webp"
-          onChange={header.handleChange}
+          onChange={handleBannerFileChange}
           hidden
         />
       </div>
       {profileErrors.header && <span className="form-error">{profileErrors.header}</span>}
+      {/* L9: non-modal banner size upsell banner (#1301). */}
+      {bannerUpsell && (
+        <output className="image-upsell-banner">
+          <span>{bannerUpsell}</span>
+          <button
+            type="button"
+            className="image-upsell-dismiss"
+            aria-label="Dismiss"
+            onClick={() => setBannerUpsell(null)}
+          >
+            ×
+          </button>
+        </output>
+      )}
 
       {/* Username */}
       <div className="form-group">
@@ -404,12 +474,20 @@ const ProfileInfoForm: React.FC = () => {
         {profileErrors.username && <span className="form-error">{profileErrors.username}</span>}
         {isUsernameOnCooldown && usernameChangeEligibleAt ? (
           <span className="form-hint form-hint-warning">
-            Username changes are limited to once per year. You can change it again on{' '}
+            Username changes are limited to once per year. Change again on{' '}
             {formatDate(usernameChangeEligibleAt.toISOString())}.
+            {/* L8 (#1301): premium cadence upsell — informational note. */}
+            {onFreeUsernameCadence && (
+              <span className="username-cadence-upsell"> Premium: every 3 months.</span>
+            )}
           </span>
         ) : (
           <span className="form-hint">
             {username.trim().length}/{USERNAME_MAX} characters. Can be changed once per year.
+            {/* L8 (#1301): premium cadence upsell — informational note. */}
+            {onFreeUsernameCadence && (
+              <span className="username-cadence-upsell"> Premium: every 3 months.</span>
+            )}
           </span>
         )}
       </div>

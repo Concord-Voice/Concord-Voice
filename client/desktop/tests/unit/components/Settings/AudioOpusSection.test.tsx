@@ -46,6 +46,16 @@ vi.mock('@/renderer/hooks/useDraftSettings', () => ({
   setDraftAudioSetting: (...args: unknown[]) => mockSetDraftAudioSetting(...args),
 }));
 
+// These existing tests exercise the control's native behaviour, so grant the
+// premium entitlements the lock variants gate (#1301): allowMusicMode (L3) and
+// a low minPtimeMs so the 10 ms frame-size option is NOT locked (L2). The lock
+// affordances themselves are covered in AudioOpusSection.premium.test.tsx.
+vi.mock('@/renderer/hooks/useEntitlement', () => ({
+  useEntitlement: vi.fn((selector: (e: Record<string, unknown>) => unknown) =>
+    selector({ allowMusicMode: true, minPtimeMs: 10 })
+  ),
+}));
+
 vi.mock('@/renderer/components/ui/CustomSelect', () => ({
   default: ({
     options,

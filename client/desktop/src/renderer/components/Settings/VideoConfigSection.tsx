@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useVoiceStore } from '../../stores/voiceStore';
 import {
   useVideoSettingsStore,
@@ -15,6 +15,10 @@ import {
 } from '../../services/mediaCapabilities';
 import { humanizeProfileLabel, getCodecMetadata } from './codecMetadata';
 import { useDraftVideoSetting, setDraftVideoSetting } from '../../hooks/useDraftSettings';
+import { useEntitlement } from '../../hooks/useEntitlement';
+import { useGateActivation } from '../../hooks/useGateActivation';
+import { nativeExceedsFree } from '../../utils/nativeExceedsFree';
+import PremiumChip from '../common/PremiumChip';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
 import CustomSelect from '../ui/CustomSelect';
@@ -162,6 +166,161 @@ const GpuVendorIcon: React.FC<{ vendor: string }> = ({ vendor }) => {
   return null;
 };
 
+// ─── Pure bitrate / preset helpers (extracted to keep VideoConfigSection's ────
+//     cognitive complexity ≤ 15; behaviour-preserving, unit-testable in isolation)
+
+/** Codec substrings that signal an efficient (modern) codec for bitrate estimation. */
+const EFFICIENT_CODEC_TOKENS = ['AV1', 'H265', 'HEVC', 'VP9'] as const;
+
+/** Whether a single codec id/mime string names an efficient codec. */
+function isEfficientCodec(codec: string): boolean {
+  return EFFICIENT_CODEC_TOKENS.some((token) => codec.includes(token));
+}
+
+/** The free-tier video ceilings consumed by the L2 preset-lock helpers. */
+interface FreeVideoCaps {
+  maxVideoHeight: number;
+  maxVideoFps: number;
+  maxVideoPixelRate: number;
+}
+
+/** Resolve the pixel dimensions for a screen-share resolution selection. Accepts
+ *  either a literal `WIDTHxHEIGHT` string or a named preset key. */
+function resolveScreenResolution(
+  screenResolution: string,
+  bestDisplay: { width: number; height: number }
+): { w: number; h: number } {
+  const resMap: Record<string, { w: number; h: number }> = {
+    '720p': { w: 1280, h: 720 },
+    '1080p': { w: 1920, h: 1080 },
+    '1440p': { w: 2560, h: 1440 },
+    '4K': { w: 3840, h: 2160 },
+    source: { w: bestDisplay.width, h: bestDisplay.height },
+  };
+  const parsed = /^(\d+)x(\d+)$/.exec(screenResolution);
+  if (parsed) return { w: Number(parsed[1]), h: Number(parsed[2]) };
+  return resMap[screenResolution] || resMap['1080p'];
+}
+
+/** Pure recommended-bitrate estimate (bytes-per-pixel heuristic). Efficient
+ *  codecs use a lower bpp. Effective codec precedence: active (in-use) >
+ *  preferred > auto-pick from capabilities. */
+function computeRecommendedBitrate(args: {
+  res: { w: number; h: number };
+  effectiveFps: number;
+  activeScreenCodec: string | null;
+  preferredVideoCodec: string | null;
+  codecCapabilities: CodecCapability[];
+}): number {
+  const { res, effectiveFps, activeScreenCodec, preferredVideoCodec, codecCapabilities } = args;
+  const effectiveCodec = activeScreenCodec ?? preferredVideoCodec;
+  const isEfficient = effectiveCodec
+    ? isEfficientCodec(effectiveCodec)
+    : codecCapabilities.some((c) => isEfficientCodec(c.mimeType));
+  const bpp = isEfficient ? 0.04 : 0.07;
+  const bps = res.w * res.h * effectiveFps * bpp;
+  return Math.round(bps / 100_000) * 100_000;
+}
+
+/** Does a camera preset exceed any free video ceiling (height/fps/pixel-rate)?
+ *  System Default (0/0) and unknown presets never exceed. Pure over caps. */
+function presetExceedsFreeCaps(key: string, caps: FreeVideoCaps): boolean {
+  const preset = VIDEO_QUALITY_PRESETS[key];
+  if (!preset) return false;
+  const pixelRate = preset.width * preset.height * preset.frameRate;
+  return (
+    preset.height > caps.maxVideoHeight ||
+    preset.frameRate > caps.maxVideoFps ||
+    pixelRate > caps.maxVideoPixelRate
+  );
+}
+
+/** Highest free camera preset (largest pixel-count within caps), falling back to
+ *  System Default. Pure over caps; mirrors clampToFreeTier's resolver. */
+function resolveHighestFreeCameraPreset(caps: FreeVideoCaps): string {
+  let best = 'system';
+  let bestScore = -1;
+  for (const [key, preset] of Object.entries(VIDEO_QUALITY_PRESETS)) {
+    // Reuse the lock predicate so the snap-back can never land on a preset the
+    // lock marks premium (e.g. 1080p60, which exceeds the free pixel-rate cap).
+    if (presetExceedsFreeCaps(key, caps)) continue;
+    const score = preset.height * preset.width * preset.frameRate;
+    if (score > bestScore) {
+      bestScore = score;
+      best = key;
+    }
+  }
+  return best;
+}
+
+/** A CustomSelect option row. */
+interface SelectOption {
+  value: string;
+  label: string;
+  group?: string;
+}
+
+/** Build the camera-preset select options, marking premium presets (above the
+ *  free ceilings) with a 🔒 + "Premium" suffix (L2). Pure — extracted from the
+ *  component body so the per-option ternary lives here, not in VideoConfigSection. */
+function buildCameraPresetOptions(presetExceedsFree: (key: string) => boolean): SelectOption[] {
+  return Object.entries(VIDEO_QUALITY_PRESETS).map(([key, preset]) => ({
+    value: key,
+    label: presetExceedsFree(key) ? `${preset.label} \u{1F512} Premium` : preset.label,
+  }));
+}
+
+/** Build the screen-share Resolution select options, clamped to the free video
+ *  ceiling (`clampedHeight`) per L6. Pure — the device-vs-cap `&&` ladder lives
+ *  here, dropping it out of the component body's cognitive complexity. */
+function buildResolutionOptions(args: {
+  bestDisplayHeight: number;
+  clampedHeight: number;
+  uniqueDisplayResolutions: { width: number; height: number; isPrimary: boolean }[];
+}): SelectOption[] {
+  const { bestDisplayHeight, clampedHeight, uniqueDisplayResolutions } = args;
+  const offer4K = bestDisplayHeight >= 2160 && clampedHeight >= 2160;
+  const offer1440 = bestDisplayHeight >= 1440 && clampedHeight >= 1440;
+  return [
+    { value: 'source', label: 'Native', group: 'Common Resolutions' },
+    ...(offer4K ? [{ value: '4K', label: '4K (3840×2160)', group: 'Common Resolutions' }] : []),
+    ...(offer1440
+      ? [{ value: '1440p', label: '1440p (2560×1440)', group: 'Common Resolutions' }]
+      : []),
+    { value: '1080p', label: '1080p (1920×1080)', group: 'Common Resolutions' },
+    { value: '720p', label: '720p (1280×720)', group: 'Common Resolutions' },
+    ...uniqueDisplayResolutions
+      .filter((d) => d.height <= clampedHeight)
+      .map((d) => ({
+        value: `${d.width}x${d.height}`,
+        label: `${d.width}×${d.height}${d.isPrimary ? ' (Primary)' : ''}`,
+        group: 'Your Displays',
+      })),
+  ];
+}
+
+/** Build the screen-share Frame Rate select options, clamped to the free fps
+ *  ceiling (`clampedFps`) per L6. Pure — the high-refresh `&&` ladder lives here. */
+function buildFrameRateOptions(args: {
+  maxRefreshRate: number;
+  clampedFps: number;
+}): SelectOption[] {
+  const { maxRefreshRate, clampedFps } = args;
+  const offer = (hz: number): boolean => maxRefreshRate >= hz && clampedFps >= hz;
+  return [
+    { value: '0', label: `Native (${maxRefreshRate} Hz)`, group: 'Common' },
+    { value: '60', label: '60 FPS', group: 'Common' },
+    { value: '30', label: '30 FPS', group: 'Common' },
+    ...(offer(120) ? [{ value: '120', label: '120 FPS', group: 'Additional' }] : []),
+    ...(offer(100) ? [{ value: '100', label: '100 FPS', group: 'Additional' }] : []),
+    ...(offer(90) ? [{ value: '90', label: '90 FPS', group: 'Additional' }] : []),
+    ...(offer(75) ? [{ value: '75', label: '75 FPS', group: 'Additional' }] : []),
+    { value: '24', label: '24 FPS (Cinematic)', group: 'Additional' },
+    { value: '15', label: '15 FPS', group: 'Additional' },
+    { value: '5', label: '5 FPS (Slideshow)', group: 'Additional' },
+  ];
+}
+
 // ─── Video Configuration Section ────────────────────────────────────────────
 
 const VideoConfigSection: React.FC = () => {
@@ -184,6 +343,18 @@ const VideoConfigSection: React.FC = () => {
   const degradationPreference = useDraftVideoSetting('degradationPreference');
   const hardwareAcceleration = useDraftVideoSetting('hardwareAcceleration');
   const hdrEncoding = useDraftVideoSetting('hdrEncoding');
+
+  // Premium entitlement caps (#1301):
+  //  - L2: camera-preset resolution/fps options above the free ceilings carry a
+  //    🔒 marker and snap back to the highest free preset.
+  //  - L5: the manual screen-share bitrate slider is fenced at the free cap.
+  //  - L6: device-derived resolution/fps option lists are clamped to the free
+  //    ceiling, with a "your device supports more" note when native exceeds it.
+  const entitlement = useEntitlement((e) => e);
+  const { maxVideoHeight, maxVideoFps, maxVideoPixelRate, maxManualBitrateBps } = entitlement;
+  const cameraPresetGate = useGateActivation('video-quality');
+  const bitrateGate = useGateActivation('manual-bitrate');
+  const [cameraPresetLockHinted, setCameraPresetLockHinted] = useState(false);
 
   const [displayInfo, setDisplayInfo] = useState<
     {
@@ -229,38 +400,19 @@ const VideoConfigSection: React.FC = () => {
       .sort((a, b) => b.width * b.height - a.width * a.height);
   }, [displayInfo]);
 
-  // Dynamic bitrate recommendation based on resolution, FPS, and codec
+  // Dynamic bitrate recommendation based on resolution, FPS, and codec.
+  // The estimation logic lives in pure module helpers; this memo only wires the
+  // current draft state into them (keeps the component's cognitive complexity low).
   const recommendedBitrate = useMemo(() => {
-    const resMap: Record<string, { w: number; h: number }> = {
-      '720p': { w: 1280, h: 720 },
-      '1080p': { w: 1920, h: 1080 },
-      '1440p': { w: 2560, h: 1440 },
-      '4K': { w: 3840, h: 2160 },
-      source: { w: bestDisplay.width, h: bestDisplay.height },
-    };
-    const parsed = /^(\d+)x(\d+)$/.exec(screenResolution);
-    const res = parsed
-      ? { w: Number(parsed[1]), h: Number(parsed[2]) }
-      : resMap[screenResolution] || resMap['1080p'];
+    const res = resolveScreenResolution(screenResolution, bestDisplay);
     const effectiveFps = screenFrameRate === 0 ? maxRefreshRate : screenFrameRate;
-    // Determine effective codec for efficiency: active (in-use) > preferred > auto-pick
-    // Auto cascade picks AV1 → HEVC → VP9 first, so if any efficient codec is available, auto uses it
-    const effectiveCodec = activeScreenCodec ?? preferredVideoCodec;
-    const isEfficient = effectiveCodec
-      ? effectiveCodec.includes('AV1') ||
-        effectiveCodec.includes('H265') ||
-        effectiveCodec.includes('HEVC') ||
-        effectiveCodec.includes('VP9')
-      : codecCapabilities.some(
-          (c) =>
-            c.mimeType.includes('AV1') ||
-            c.mimeType.includes('H265') ||
-            c.mimeType.includes('HEVC') ||
-            c.mimeType.includes('VP9')
-        );
-    const bpp = isEfficient ? 0.04 : 0.07;
-    const bps = res.w * res.h * effectiveFps * bpp;
-    return Math.round(bps / 100_000) * 100_000;
+    return computeRecommendedBitrate({
+      res,
+      effectiveFps,
+      activeScreenCodec,
+      preferredVideoCodec,
+      codecCapabilities,
+    });
   }, [
     screenResolution,
     screenFrameRate,
@@ -272,6 +424,55 @@ const VideoConfigSection: React.FC = () => {
   ]);
 
   const clampedRecommended = Math.max(1_500_000, Math.min(30_000_000, recommendedBitrate));
+
+  // ── L2: camera-preset resolution/fps lock ──────────────────────────────
+  // The free caps drive both the lock predicate and the snap-back resolver; the
+  // pure helpers (presetExceedsFreeCaps / resolveHighestFreeCameraPreset) close
+  // over this object so the component body stays flat.
+  const freeVideoCaps = useMemo<FreeVideoCaps>(
+    () => ({ maxVideoHeight, maxVideoFps, maxVideoPixelRate }),
+    [maxVideoHeight, maxVideoFps, maxVideoPixelRate]
+  );
+
+  const presetExceedsFree = useCallback(
+    (key: string): boolean => presetExceedsFreeCaps(key, freeVideoCaps),
+    [freeVideoCaps]
+  );
+
+  const handleCameraPresetChange = useCallback(
+    (key: string): void => {
+      if (presetExceedsFreeCaps(key, freeVideoCaps)) {
+        // L2 snap-back: a locked preset never reaches the store. Clamp to the
+        // highest free preset and reveal the chip (no mid-action modal).
+        setDraftVideoSetting('cameraPreset', resolveHighestFreeCameraPreset(freeVideoCaps));
+        setCameraPresetLockHinted(true);
+        return;
+      }
+      setCameraPresetLockHinted(false);
+      setDraftVideoSetting('cameraPreset', key);
+    },
+    [freeVideoCaps]
+  );
+
+  // ── L6: device-derived resolution / frame-rate native-exceeds guard ─────
+  // The screen-share Resolution + Frame Rate option lists are derived from the
+  // detected display. Clamp the offered ceiling to the free caps and surface a
+  // "your device supports more" note when the device genuinely exceeds free.
+  const nativeGuard = nativeExceedsFree(
+    { nativeHeight: bestDisplay.height, nativeFps: maxRefreshRate },
+    entitlement
+  );
+
+  // ── L5: manual screen-share bitrate clamp ──────────────────────────────
+  const FREE_BITRATE_CAP_MBPS = maxManualBitrateBps / 1_000_000; // 5.0 for free
+  const ABSOLUTE_BITRATE_MAX_MBPS = 30;
+  // The slider's effective ceiling: the free cap when not entitled (i.e. when
+  // the free cap is below the absolute max), else the absolute max.
+  const bitrateSliderMaxMbps = Math.min(FREE_BITRATE_CAP_MBPS, ABSOLUTE_BITRATE_MAX_MBPS);
+  const bitrateIsCapped = FREE_BITRATE_CAP_MBPS < ABSOLUTE_BITRATE_MAX_MBPS;
+  // When toggling automatic OFF, seed the manual cap at the recommended value
+  // but never above the free ceiling (so a free user starts within range).
+  const initialManualBitrate = Math.min(clampedRecommended, maxManualBitrateBps);
 
   return (
     <CollapsibleSection id="section-video-screen" title="Video Configuration">
@@ -319,15 +520,25 @@ const VideoConfigSection: React.FC = () => {
               ? "Constrains the camera's capture resolution and frame rate. Currently System Default \u2014 the camera and driver decide automatically."
               : `Constrains the camera's capture resolution and frame rate. Currently requesting ${VIDEO_QUALITY_PRESETS[cameraPreset]?.label ?? cameraPreset}.`}
           </span>
+          {cameraPresetLockHinted && (
+            <span className="settings-row-premium-note">
+              <PremiumChip
+                label="higher resolutions"
+                onActivate={cameraPresetGate.onActivate}
+                id={cameraPresetGate.describedById}
+              />
+            </span>
+          )}
         </div>
         <CustomSelect
           className="settings-select"
-          options={Object.entries(VIDEO_QUALITY_PRESETS).map(([key, preset]) => ({
-            value: key,
-            label: preset.label,
-          }))}
+          // L2: premium presets (above the free height/fps/pixel-rate ceilings)
+          // carry a trailing \ud83d\udd12 + "Premium" marker; the select stays usable and
+          // selecting one snaps back to the highest free preset. The per-option
+          // marker logic lives in the pure buildCameraPresetOptions helper.
+          options={buildCameraPresetOptions(presetExceedsFree)}
           value={cameraPreset}
-          onChange={(v) => setDraftVideoSetting('cameraPreset', v)}
+          onChange={handleCameraPresetChange}
         />
       </div>
 
@@ -345,25 +556,27 @@ const VideoConfigSection: React.FC = () => {
               ? "Default capture resolution for screen sharing. Currently Native \u2014 captures at your display's full resolution."
               : `Default capture resolution for screen sharing. Currently ${screenResolution}.`}
           </span>
+          {nativeGuard.exceeds && (
+            <span className="settings-row-premium-note">
+              <PremiumChip label="your device supports more" />
+              <span className="settings-native-exceeds-note">
+                Your device supports more \u2014 unlock with Premium
+              </span>
+            </span>
+          )}
         </div>
         <CustomSelect
           className="settings-select"
-          options={[
-            { value: 'source', label: 'Native', group: 'Common Resolutions' },
-            ...(bestDisplay.height >= 2160
-              ? [{ value: '4K', label: '4K (3840\u00d72160)', group: 'Common Resolutions' }]
-              : []),
-            ...(bestDisplay.height >= 1440
-              ? [{ value: '1440p', label: '1440p (2560\u00d71440)', group: 'Common Resolutions' }]
-              : []),
-            { value: '1080p', label: '1080p (1920\u00d71080)', group: 'Common Resolutions' },
-            { value: '720p', label: '720p (1280\u00d7720)', group: 'Common Resolutions' },
-            ...uniqueDisplayResolutions.map((d) => ({
-              value: `${d.width}x${d.height}`,
-              label: `${d.width}\u00d7${d.height}${d.isPrimary ? ' (Primary)' : ''}`,
-              group: 'Your Displays',
-            })),
-          ]}
+          // L6: device-derived resolution options are clamped to the free video
+          // ceiling (nativeGuard.clampedHeight) \u2014 premium resolutions above the
+          // free cap are not offered. The "supports more" note explains why. The
+          // device-vs-cap option ladder lives in the pure buildResolutionOptions
+          // helper (keeps the component body's cognitive complexity \u2264 15).
+          options={buildResolutionOptions({
+            bestDisplayHeight: bestDisplay.height,
+            clampedHeight: nativeGuard.clampedHeight,
+            uniqueDisplayResolutions,
+          })}
           value={screenResolution}
           onChange={(v) => setDraftVideoSetting('screenResolution', v)}
         />
@@ -380,26 +593,14 @@ const VideoConfigSection: React.FC = () => {
         </div>
         <CustomSelect
           className="settings-select"
-          options={[
-            { value: '0', label: `Native (${maxRefreshRate} Hz)`, group: 'Common' },
-            { value: '60', label: '60 FPS', group: 'Common' },
-            { value: '30', label: '30 FPS', group: 'Common' },
-            ...(maxRefreshRate >= 120
-              ? [{ value: '120', label: '120 FPS', group: 'Additional' }]
-              : []),
-            ...(maxRefreshRate >= 100
-              ? [{ value: '100', label: '100 FPS', group: 'Additional' }]
-              : []),
-            ...(maxRefreshRate >= 90
-              ? [{ value: '90', label: '90 FPS', group: 'Additional' }]
-              : []),
-            ...(maxRefreshRate >= 75
-              ? [{ value: '75', label: '75 FPS', group: 'Additional' }]
-              : []),
-            { value: '24', label: '24 FPS (Cinematic)', group: 'Additional' },
-            { value: '15', label: '15 FPS', group: 'Additional' },
-            { value: '5', label: '5 FPS (Slideshow)', group: 'Additional' },
-          ]}
+          // L6: high-refresh options are clamped to the free fps ceiling
+          // (nativeGuard.clampedFps) — frame rates above the free cap are not
+          // offered. The standard 60/30 and slow options always remain. The
+          // high-refresh option ladder lives in the pure buildFrameRateOptions helper.
+          options={buildFrameRateOptions({
+            maxRefreshRate,
+            clampedFps: nativeGuard.clampedFps,
+          })}
           value={String(screenFrameRate)}
           onChange={(v) => setDraftVideoSetting('screenFrameRate', Number(v))}
         />
@@ -815,7 +1016,9 @@ const VideoConfigSection: React.FC = () => {
             <ToggleSwitch
               checked={screenShareBitrate === 0}
               onChange={(v) =>
-                setDraftVideoSetting('screenShareBitrate', v ? 0 : clampedRecommended)
+                // L5: when disabling automatic, seed the manual cap within the
+                // free ceiling so a free user starts inside the live range.
+                setDraftVideoSetting('screenShareBitrate', v ? 0 : initialManualBitrate)
               }
             />
           </div>
@@ -825,27 +1028,50 @@ const VideoConfigSection: React.FC = () => {
                 <span className="settings-volume-label">Cap</span>
                 <span className="settings-row-hint">
                   Sets the maximum bitrate cap for screen sharing. Left (1.5 Mbps) for simple
-                  content. Right (30 Mbps) for high-motion content.
+                  content. Right ({bitrateSliderMaxMbps} Mbps) for high-motion content.
                 </span>
               </div>
               <div className="settings-slider-wrapper">
                 <span className="settings-slider-value">
                   {(screenShareBitrate / 1_000_000).toFixed(1)} Mbps
                 </span>
-                <input
-                  type="range"
-                  className="settings-volume-slider"
-                  min={1.5}
-                  max={30}
-                  step={0.5}
-                  value={screenShareBitrate / 1_000_000}
-                  onChange={(e) =>
-                    setDraftVideoSetting(
-                      'screenShareBitrate',
-                      Math.round(Number(e.target.value) * 1_000_000)
-                    )
-                  }
-                />
+                {/* L5: the slider stays LIVE up to the free cap. When capped, a
+                    decorative ghost-zone past the thumb advertises the premium
+                    range; the slider's `max` fences the live value at the cap. */}
+                <div className={`settings-bitrate-slider-wrap${bitrateIsCapped ? ' capped' : ''}`}>
+                  <input
+                    type="range"
+                    className="settings-volume-slider"
+                    min={1.5}
+                    max={bitrateSliderMaxMbps}
+                    step={0.5}
+                    value={Math.min(screenShareBitrate / 1_000_000, bitrateSliderMaxMbps)}
+                    onChange={(e) =>
+                      setDraftVideoSetting(
+                        'screenShareBitrate',
+                        Math.round(
+                          Math.min(Number(e.target.value), bitrateSliderMaxMbps) * 1_000_000
+                        )
+                      )
+                    }
+                  />
+                  {bitrateIsCapped && (
+                    <button
+                      type="button"
+                      className="settings-bitrate-ghost-zone"
+                      onClick={bitrateGate.onActivate}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') bitrateGate.onActivate(e);
+                      }}
+                    >
+                      <span aria-hidden="true" className="settings-bitrate-ghost-gradient" />
+                      <PremiumChip
+                        label={`beyond ${bitrateSliderMaxMbps} Mbps →`}
+                        id={bitrateGate.describedById}
+                      />
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           )}
