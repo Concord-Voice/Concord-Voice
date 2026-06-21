@@ -579,8 +579,17 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 			// failed validations also burn quota; 10/hour leaves slack for
 			// honest users to recover from client-side typos while still
 			// capping spam. Bug + feature share the same bucket on purpose.
+			// TEMPORARY (preflight testing window, Sat 2026-06-20 → Mon 2026-06-22):
+			// per-user cap raised 10 → 1000/hour so active preflight testers are not
+			// throttled while filing tickets. 1000 is STRICTLY above the global
+			// 500/hour aggregate (GlobalRateLimit below), so the per-user layer is
+			// provably never the binding constraint and the GLOBAL flood guard on
+			// this privileged-PAT public-repo write is UNCHANGED — worst case at the
+			// aggregate stays 500 issues/hour. REVERT to `10, 1*time.Hour` on
+			// Mon 2026-06-22. The 10/hour steady-state rationale in the comment block
+			// above is the design to restore.
 			protected.POST("/feedback",
-				middleware.RateLimitByUserFailClosed(redis, 10, 1*time.Hour),
+				middleware.RateLimitByUserFailClosed(redis, 1000, 1*time.Hour),
 				feedback.GlobalRateLimit(redis),
 				feedbackHandler.Submit,
 			)
