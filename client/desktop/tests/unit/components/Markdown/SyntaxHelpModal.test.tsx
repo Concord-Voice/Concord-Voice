@@ -1,8 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '../../../test-utils';
 import SyntaxHelpModal from '@/renderer/components/Markdown/SyntaxHelpModal';
+import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
 
 describe('SyntaxHelpModal', () => {
+  beforeEach(() => useSubscriptionStore.getState().reset()); // FREE_ENTITLEMENT (5120)
+
   it('renders when open', () => {
     render(<SyntaxHelpModal open onClose={vi.fn()} />);
     expect(screen.getByText(/Supported Markdown Syntax/i)).toBeInTheDocument();
@@ -51,5 +54,16 @@ describe('SyntaxHelpModal', () => {
     expect(screen.getByText(/sent as a \.md attachment/i)).toBeInTheDocument();
     // Negative: legacy "24,000" wording must be gone
     expect(screen.queryByText(/24,000/)).not.toBeInTheDocument();
+  });
+
+  it('tooltip cap reflects the premium entitlement (10,240) live', () => {
+    useSubscriptionStore.getState().setEntitlement({
+      ...useSubscriptionStore.getState().entitlement,
+      tier: 'premium',
+      maxMessageChars: 10240,
+    });
+    render(<SyntaxHelpModal open onClose={vi.fn()} />);
+    expect(screen.getByText(/Up to 10,240 characters per message/)).toBeInTheDocument();
+    expect(screen.queryByText(/Up to 5,120 characters per message/)).not.toBeInTheDocument();
   });
 });

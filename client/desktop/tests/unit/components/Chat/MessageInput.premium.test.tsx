@@ -10,23 +10,38 @@ vi.mock('@/renderer/components/User/UserPanel', () => ({
 vi.mock('@/renderer/stores/layoutStore', () => ({ useLayoutStore: () => false }));
 
 const mockAddFiles = vi.fn().mockReturnValue(null);
+let mockUploadFiles: Array<{ file: File; progress: number; status: 'pending' }> = [];
+const mockRemoveFile = vi.fn((index: number) => {
+  mockUploadFiles = mockUploadFiles.filter((_, i) => i !== index);
+});
 vi.mock('@/renderer/hooks/useFileUpload', () => ({
   useFileUpload: () => ({
-    files: [],
+    files: mockUploadFiles,
     addFiles: mockAddFiles,
-    removeFile: vi.fn(),
+    removeFile: mockRemoveFile,
     clearFiles: vi.fn(),
     uploadAll: vi.fn().mockResolvedValue({ ids: [], summaries: [] }),
     isUploading: false,
-    hasFiles: false,
+    hasFiles: mockUploadFiles.length > 0,
   }),
 }));
-vi.mock('@/renderer/components/Chat/AttachmentUploadPreview', () => ({ default: () => null }));
+vi.mock('@/renderer/components/Chat/AttachmentUploadPreview', () => ({
+  default: ({ onRemove }: { onRemove: (index: number) => void }) => (
+    <button type="button" onClick={() => onRemove(0)}>
+      Remove upload
+    </button>
+  ),
+}));
 
 // Entitlement: FREE floor by default (maxMessageChars 5120, maxAttachmentBytes 25 MiB).
 const entitlementOverrides: Record<string, unknown> = {};
 function freeEntitlement() {
-  return { maxMessageChars: 5120, maxAttachmentBytes: 26_214_400, ...entitlementOverrides };
+  return {
+    tier: 'free',
+    maxMessageChars: 5120,
+    maxAttachmentBytes: 26_214_400,
+    ...entitlementOverrides,
+  };
 }
 vi.mock('@/renderer/hooks/useEntitlement', () => ({
   useEntitlement: vi.fn((selector: (e: Record<string, unknown>) => unknown) =>
@@ -36,7 +51,7 @@ vi.mock('@/renderer/hooks/useEntitlement', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import MessageInput from '@/renderer/components/Chat/MessageInput';
 
 function setEntitlement(overrides: Record<string, unknown>) {
@@ -54,6 +69,7 @@ const onSendMessage = vi.fn();
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockUploadFiles = [];
   setEntitlement({});
 });
 
@@ -99,15 +115,44 @@ describe('MessageInput — L7 message-length (informational)', () => {
     // Below 75% → empty announcement.
     fireEvent.change(textarea, { target: { value: 'a'.repeat(50) } });
     expect(live.textContent).toBe('');
-    // 75% band → "characters remaining".
+    // 75% band -> static text, and it must not change on every keystroke.
     fireEvent.change(textarea, { target: { value: 'a'.repeat(75) } });
-    expect(live.textContent).toMatch(/characters remaining/);
+    const seventyFivePercentText = live.textContent;
+    expect(seventyFivePercentText).toBe('Message has reached 75% of the 100-character limit.');
+    fireEvent.change(textarea, { target: { value: 'a'.repeat(76) } });
+    expect(live.textContent).toBe(seventyFivePercentText);
     // 90% band → "Approaching".
     fireEvent.change(textarea, { target: { value: 'a'.repeat(90) } });
     expect(live.textContent).toMatch(/Approaching/);
     // At limit → "at the … limit".
     fireEvent.change(textarea, { target: { value: 'a'.repeat(100) } });
     expect(live.textContent).toMatch(/limit/);
+  });
+
+  it('clamps excessive entitlement message caps before they drive the renderer limit', () => {
+    setEntitlement({ tier: 'premium', maxMessageChars: 999_999 });
+    render(<MessageInput onSendMessage={onSendMessage} />);
+    const textarea = screen.getByRole('textbox');
+    fireEvent.change(textarea, { target: { value: 'a'.repeat(8000) } });
+    expect(screen.getByText('8000/10240')).toBeInTheDocument();
+    expect(screen.queryByText(/999999/)).not.toBeInTheDocument();
+  });
+
+  it('falls back to the tier ceiling for non-finite entitlement message caps', () => {
+    setEntitlement({ tier: 'premium', maxMessageChars: Number.POSITIVE_INFINITY });
+    render(<MessageInput onSendMessage={onSendMessage} />);
+    const textarea = screen.getByRole('textbox');
+    fireEvent.change(textarea, { target: { value: 'a'.repeat(8000) } });
+    expect(screen.getByText('8000/10240')).toBeInTheDocument();
+  });
+
+  it('does not show the premium message-limit upsell to premium users at their own cap', () => {
+    setEntitlement({ tier: 'premium', maxMessageChars: 10240 });
+    render(<MessageInput onSendMessage={onSendMessage} />);
+    const textarea = screen.getByRole('textbox');
+    fireEvent.change(textarea, { target: { value: 'a'.repeat(10240) } });
+    expect(screen.getByText(/10240\/10240/)).toHaveTextContent('.md attachment');
+    expect(screen.queryByText(/with Premium/)).not.toBeInTheDocument();
   });
 });
 
@@ -151,10 +196,50 @@ describe('MessageInput — L9 attachment-size upsell', () => {
   });
 
   it('entitled (premium attachment cap): no banner for a file within the higher cap', () => {
-    setEntitlement({ maxAttachmentBytes: 100 * 1024 * 1024 });
+    setEntitlement({ tier: 'premium', maxAttachmentBytes: 100 * 1024 * 1024 });
     render(<MessageInput onSendMessage={onSendMessage} />);
     const input = document.querySelector('input[type="file"]') as HTMLInputElement;
     fireEvent.change(input, { target: { files: [makeFile('huge.png', 40 * 1024 * 1024)] } });
     expect(document.querySelector('.attachment-upsell-banner')).not.toBeInTheDocument();
+  });
+
+  it('labels an over-premium file with the current limit, not free-tier upsell copy', () => {
+    setEntitlement({ tier: 'premium', maxAttachmentBytes: 100 * 1024 * 1024 });
+    render(<MessageInput onSendMessage={onSendMessage} />);
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [makeFile('huge.png', 120 * 1024 * 1024)] } });
+    const banner = document.querySelector('.attachment-upsell-banner') as HTMLElement;
+    expect(banner.textContent).toContain('Current limit');
+    expect(banner.textContent).not.toContain('Free limit');
+    expect(banner.textContent).not.toContain('Premium raises it to');
+  });
+
+  it('clears the attachment upsell after the offending file is removed', () => {
+    const oversizedFile = makeFile('huge.png', 40 * 1024 * 1024);
+    mockUploadFiles = [{ file: oversizedFile, progress: 0, status: 'pending' }];
+    render(<MessageInput onSendMessage={onSendMessage} />);
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [oversizedFile] } });
+    expect(document.querySelector('.attachment-upsell-banner')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove upload' }));
+
+    expect(mockRemoveFile).toHaveBeenCalledWith(0);
+    expect(document.querySelector('.attachment-upsell-banner')).not.toBeInTheDocument();
+  });
+
+  it('clears the attachment upsell after a successful send', async () => {
+    render(<MessageInput onSendMessage={onSendMessage} />);
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [makeFile('huge.png', 40 * 1024 * 1024)] } });
+    expect(document.querySelector('.attachment-upsell-banner')).toBeInTheDocument();
+
+    const textarea = screen.getByRole('textbox');
+    fireEvent.change(textarea, { target: { value: 'ship it' } });
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-upsell-banner')).not.toBeInTheDocument();
+    });
   });
 });

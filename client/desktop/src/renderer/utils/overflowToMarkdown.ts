@@ -6,7 +6,8 @@
  * Note: not technically pure (`new Date()` is read for the filename timestamp),
  * but the output is fully determined by the inputs at the moment of call.
  *
- * Used by MessageInput.handleSend when content.length exceeds MAX_CONTENT_LENGTH.
+ * Used by MessageInput.handleSend when content.length exceeds the active
+ * entitlement limit (ent.maxMessageChars: free 5120 / premium 10240).
  * The recipient renders the previewText inline and fetches the fileBlob on
  * [Expand] for full inline rendering.
  *

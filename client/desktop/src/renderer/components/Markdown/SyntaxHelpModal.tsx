@@ -1,4 +1,6 @@
 import React, { useEffect, useRef } from 'react';
+import { useEntitlement } from '../../hooks/useEntitlement';
+import { clampMessageCharsForTier } from '../../utils/entitlementLimits';
 import './SyntaxHelpModal.css';
 
 // jsdom (the vitest test environment) implements <dialog> but does NOT fire
@@ -49,6 +51,11 @@ interface Props {
 
 const SyntaxHelpModal: React.FC<Props> = ({ open, onClose }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
+  // Show the user's actual per-message cap (free 5120 / premium 10240), matching
+  // the entitlement-driven limit MessageInput now enforces (#1299).
+  const entitlementTier = useEntitlement((e) => e.tier);
+  const maxMessageChars = useEntitlement((e) => e.maxMessageChars);
+  const messageLimit = clampMessageCharsForTier(entitlementTier, maxMessageChars);
 
   // Fallback Escape handler — only installed when the runtime cannot rely on
   // <dialog>'s native cancel event (i.e., under jsdom). In Electron/Chrome
@@ -140,7 +147,10 @@ const SyntaxHelpModal: React.FC<Props> = ({ open, onClose }) => {
             line. The text after the opening backticks is treated as the language identifier (used
             for syntax highlighting).
           </p>
-          <p>Up to 5,120 characters per message. Longer messages are sent as a .md attachment.</p>
+          <p>
+            Up to {messageLimit.toLocaleString('en-US')} characters per message. Longer messages are
+            sent as a .md attachment.
+          </p>
         </footer>
       </div>
     </dialog>

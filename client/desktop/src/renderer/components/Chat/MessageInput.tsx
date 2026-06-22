@@ -13,6 +13,7 @@ import { buildAddendum, encodeMentionMeta, type ParsedMention } from '../../util
 import type { AttachmentSummary, MessageWithStatus } from '../../types/chat';
 import { useFileUpload } from '../../hooks/useFileUpload';
 import { useDraftMessage } from '../../hooks/useDraftMessage';
+import { useEntitlement } from '../../hooks/useEntitlement';
 import { useChatStore } from '../../stores/chatStore';
 import { usePermissionStore } from '../../stores/permissionStore';
 import { useInviteStore } from '../../stores/inviteStore';
@@ -21,24 +22,23 @@ import AttachmentUploadPreview from './AttachmentUploadPreview';
 import ReplyPreviewBar from './ReplyPreviewBar';
 import { composeMarkdownOverflow } from '../../utils/overflowToMarkdown';
 import { MAX_ATTACHMENTS, formatFileSize } from '../../utils/attachmentCrypto';
-import { useEntitlement } from '../../hooks/useEntitlement';
+import { PREMIUM_ATTACHMENT_BYTES, clampMessageCharsForTier } from '../../utils/entitlementLimits';
 import './MessageInput.css';
 
-const MAX_CONTENT_LENGTH = 5120;
-/** Premium raises the free message/attachment limits by this factor (UX hint
- *  copy only — the server is the authority on the real premium caps). */
+/** Premium raises the free message limit by this factor (UX hint copy only —
+ *  the server is the authority on the real premium caps). */
 const PREMIUM_MULTIPLIER = 2;
 /** Counter announcement thresholds (a11y U1): announce ONLY at 75% / 90% /
  *  at-limit — never per keystroke. */
 const COUNTER_ANNOUNCE_RATIOS = [0.75, 0.9, 1] as const;
 /** Renderer-side DoS ceiling: paste/typing beyond this is silently discarded.
- *  Content between MAX_CONTENT_LENGTH and DOS_PROTECTION_LIMIT reaches
- *  handleSend intact so the overflow path can synthesize a .md attachment. */
+ *  Content between the active entitlement limit (maxLength) and
+ *  DOS_PROTECTION_LIMIT reaches handleSend intact so the overflow path can
+ *  synthesize a .md attachment. */
 const DOS_PROTECTION_LIMIT = 1_048_576; // 1 MiB plaintext
 // Counter visibility and warn thresholds are expressed as ratios of the
-// active limit so that a test or future caller passing a smaller
-// `maxLength` keeps the same 75%/95% behaviour the production constants
-// encode (3840 / 5120 = 0.75, 4864 / 5120 = 0.95).
+// active limit (maxLength), so the same 75%/95% behaviour holds at any tier
+// (e.g. free 5120: 3840/5120 = 0.75, 4864/5120 = 0.95; premium 10240 scales).
 const COUNTER_VISIBLE_RATIO = 0.75;
 const COUNTER_WARN_RATIO = 0.95;
 
@@ -153,12 +153,14 @@ const MessageInput: React.FC<MessageInputProps> = ({
   // L7/L9 (#1301): informational-only premium caps. The message char-limit and
   // attachment-size limit are server-authoritative; these only drive UX hints —
   // NEVER a hard client block (the server re-checks every send/upload).
+  const entitlementTier = useEntitlement((e) => e.tier);
   const maxMessageChars = useEntitlement((e) => e.maxMessageChars);
   const maxAttachmentBytes = useEntitlement((e) => e.maxAttachmentBytes);
-  // The active char limit: an explicit prop (tests/special hosts) wins; otherwise
-  // the entitlement's maxMessageChars (free floor = MAX_CONTENT_LENGTH = 5120,
-  // the historical default, kept as the ultimate fallback).
-  const maxLength = maxLengthProp ?? maxMessageChars ?? MAX_CONTENT_LENGTH;
+  // The plaintext char split is client-authoritative (server sees only
+  // ciphertext under E2EE). Source it from the live entitlement so the counter
+  // and the .md overflow react to free (5120) / premium (10240) without a
+  // reload; the `maxLength` prop remains a test/override seam.
+  const maxLength = maxLengthProp ?? clampMessageCharsForTier(entitlementTier, maxMessageChars);
   const [content, setContent] = useState('');
   // L9: a non-modal inline banner for an over-limit attachment attempt.
   const [attachUpsell, setAttachUpsell] = useState<string | null>(null);
@@ -581,6 +583,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
       setShowMentions(false);
       selectedMentionsRef.current = [];
       clearFiles();
+      setAttachUpsell(null);
       onCancelReply?.();
       if (textareaRef.current) {
         textareaRef.current.style.height = 'auto';
@@ -599,16 +602,27 @@ const MessageInput: React.FC<MessageInputProps> = ({
    */
   const checkAttachmentUpsell = (incoming: FileList | File[]): void => {
     const over = Array.from(incoming).find((f) => f.size > maxAttachmentBytes);
-    if (over) {
-      setAttachUpsell(
-        `${over.name} is ${formatFileSize(over.size)}. Free limit ${formatFileSize(
-          maxAttachmentBytes
-        )}. Premium raises it to ${formatFileSize(maxAttachmentBytes * PREMIUM_MULTIPLIER)}.`
-      );
-    } else {
+    if (!over) {
       setAttachUpsell(null);
+      return;
     }
+    const prefix = `${over.name} is ${formatFileSize(over.size)}.`;
+    setAttachUpsell(
+      entitlementTier === 'premium'
+        ? `${prefix} Current limit ${formatFileSize(maxAttachmentBytes)}.`
+        : `${prefix} Free limit ${formatFileSize(
+            maxAttachmentBytes
+          )}. Premium raises it to ${formatFileSize(PREMIUM_ATTACHMENT_BYTES)}.`
+    );
   };
+
+  const handleRemoveFile = useCallback(
+    (index: number) => {
+      removeFile(index);
+      setAttachUpsell(null);
+    },
+    [removeFile]
+  );
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
@@ -713,6 +727,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
   const counterVisible = charCount >= Math.floor(maxLength * COUNTER_VISIBLE_RATIO);
   const counterClass = getCounterClass(charCount, maxLength);
   const atLimit = charCount >= maxLength;
+  const showPremiumLimitHint = entitlementTier !== 'premium';
 
   // L7 (a11y U1): announce ONLY at 75% / 90% / at-limit thresholds. The message
   // is a function of the highest band CROSSED, so the aria-live text changes
@@ -726,7 +741,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
   } else if (announceRatio === 0.9) {
     counterAnnouncement = `Approaching the ${maxLength}-character limit.`;
   } else if (announceRatio === 0.75) {
-    counterAnnouncement = `${maxLength - charCount} characters remaining.`;
+    counterAnnouncement = `Message has reached 75% of the ${maxLength}-character limit.`;
   }
 
   return (
@@ -779,7 +794,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
               <UserPanel compact />
             </div>
           )}
-          {hasFiles && <AttachmentUploadPreview files={uploadFiles} onRemove={removeFile} />}
+          {hasFiles && <AttachmentUploadPreview files={uploadFiles} onRemove={handleRemoveFile} />}
           {uploadError && <div className="upload-error">{uploadError}</div>}
           {uploadStatus && !uploadError && <div className="upload-status">{uploadStatus}</div>}
           {/* L9: non-modal inline attachment-size upsell banner (#1301). */}
@@ -827,7 +842,8 @@ const MessageInput: React.FC<MessageInputProps> = ({
                 {atLimit && (
                   <span className="counter-overflow-hint">
                     {' '}
-                    · .md attachment · {PREMIUM_MULTIPLIER}× with Premium
+                    · .md attachment
+                    {showPremiumLimitHint && <> · {PREMIUM_MULTIPLIER}× with Premium</>}
                   </span>
                 )}
               </span>

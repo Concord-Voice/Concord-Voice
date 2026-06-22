@@ -1,6 +1,7 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, act } from '../../../test-utils';
 import MessageInput from '@/renderer/components/Chat/MessageInput';
 import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
 import { vi } from 'vitest';
 import userEvent from '@testing-library/user-event';
 
@@ -55,6 +56,7 @@ describe('MessageInput', () => {
     uploadMockOverrides.hasFiles = false;
     uploadMockOverrides.isUploading = false;
     uploadMockOverrides.files = [];
+    useSubscriptionStore.getState().reset(); // back to FREE_ENTITLEMENT (5120)
   });
 
   it('warm-fetches channel SBAC overrides on mount when serverId + channelId are present', () => {
@@ -748,5 +750,67 @@ describe('MessageInput cap reduction + overflow', () => {
 
     // When uploadError is set, the upload-status div is hidden (conditional in JSX)
     expect(screen.queryByText(/long message sent as a .md/i)).not.toBeInTheDocument();
+  });
+
+  describe('entitlement-driven char limit', () => {
+    function setTier(maxMessageChars: number, tier: 'free' | 'premium' = 'premium') {
+      useSubscriptionStore
+        .getState()
+        .setEntitlement({ ...useSubscriptionStore.getState().entitlement, tier, maxMessageChars });
+    }
+
+    // beforeEach in a sibling describe does NOT run here — reset locally so a
+    // premium tier set by one test cannot leak into the next (free-assuming) one.
+    beforeEach(() => useSubscriptionStore.getState().reset());
+
+    it('counter denominator reflects the premium entitlement (10240)', () => {
+      setTier(10240);
+      render(<MessageInput onSendMessage={onSendMessage} channelId="c1" />);
+      const textarea = screen.getByLabelText('Message input');
+      // 8000 < HARD_CAP (11240) and >= 0.75*10240 (7680) so the counter is visible
+      fireEvent.change(textarea, { target: { value: 'a'.repeat(8000) } });
+      expect(screen.getByText('8000/10240')).toBeInTheDocument();
+    });
+
+    it('counter denominator reflects the free floor (5120) by default', () => {
+      // beforeEach reset() leaves FREE_ENTITLEMENT (5120)
+      render(<MessageInput onSendMessage={onSendMessage} channelId="c1" />);
+      const textarea = screen.getByLabelText('Message input');
+      // 6000 < HARD_CAP (6120) and > 5120 so the counter is visible and in error state
+      fireEvent.change(textarea, { target: { value: 'a'.repeat(6000) } });
+      expect(screen.getByText('6000/5120')).toBeInTheDocument();
+    });
+
+    it('counter reacts live to a tier change without remount (premium -> free)', () => {
+      setTier(10240);
+      render(<MessageInput onSendMessage={onSendMessage} channelId="c1" />);
+      const textarea = screen.getByLabelText('Message input');
+      fireEvent.change(textarea, { target: { value: 'a'.repeat(8000) } });
+      expect(screen.getByText('8000/10240')).toBeInTheDocument();
+      act(() => setTier(5120, 'free'));
+      expect(screen.getByText('8000/5120')).toBeInTheDocument();
+    });
+
+    it('explicit maxLength prop overrides the entitlement (test/override seam)', () => {
+      setTier(10240);
+      render(<MessageInput onSendMessage={onSendMessage} channelId="c1" maxLength={2000} />);
+      const textarea = screen.getByLabelText('Message input');
+      // HARD_CAP = 2000 + 1000 = 3000; 2500 is allowed and > 2000 (visible/error)
+      fireEvent.change(textarea, { target: { value: 'a'.repeat(2500) } });
+      expect(screen.getByText('2500/2000')).toBeInTheDocument();
+    });
+
+    it('premium message under the higher cap sends inline (no .md overflow)', async () => {
+      setTier(10240);
+      render(<MessageInput onSendMessage={onSendMessage} channelId="c1" />);
+      const textarea = screen.getByLabelText('Message input');
+      // 6000 > free 5120 but < premium 10240: must NOT overflow
+      fireEvent.change(textarea, { target: { value: 'a'.repeat(6000) } });
+      fireEvent.click(screen.getByRole('button', { name: /send/i }));
+      await vi.waitFor(() => expect(onSendMessage).toHaveBeenCalled());
+      const sentContent = onSendMessage.mock.calls[0][0] as string;
+      expect(sentContent.length).toBe(6000); // full content inline, not a 200-char preview
+      expect(mockUploadAll).not.toHaveBeenCalled(); // no overflow .md upload
+    });
   });
 });
