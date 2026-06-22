@@ -4,6 +4,8 @@ import { usePermissionStore } from '@/renderer/stores/permissionStore';
 import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
 import { vi } from 'vitest';
 import userEvent from '@testing-library/user-event';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 // Mock child components and stores that MessageInput depends on
 vi.mock('@/renderer/components/Chat/MessageInputContextMenu', () => ({
@@ -33,6 +35,27 @@ vi.mock('@/renderer/hooks/useFileUpload', () => ({
     hasFiles: uploadMockOverrides.hasFiles ?? false,
   }),
 }));
+
+const getCssDeclarations = (selector: string): Record<string, string> => {
+  const messageInputCss = readFileSync(
+    resolve(process.cwd(), 'src/renderer/components/Chat/MessageInput.css'),
+    'utf-8'
+  );
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`${escapedSelector}\\s*\\{(?<body>[^}]*)\\}`).exec(messageInputCss);
+  const body = match?.groups?.body ?? '';
+
+  return Object.fromEntries(
+    body
+      .split(';')
+      .map((declaration) => declaration.trim())
+      .filter(Boolean)
+      .map((declaration) => {
+        const [property, ...valueParts] = declaration.split(':');
+        return [property.trim(), valueParts.join(':').trim()];
+      })
+  );
+};
 
 // Mock AttachmentUploadPreview
 vi.mock('@/renderer/components/Chat/AttachmentUploadPreview', () => ({
@@ -78,6 +101,20 @@ describe('MessageInput', () => {
   it('renders textarea', () => {
     render(<MessageInput onSendMessage={onSendMessage} />);
     expect(screen.getByRole('textbox')).toBeInTheDocument();
+  });
+
+  it('uses the textarea itself as the expanded composer hit target', () => {
+    render(<MessageInput onSendMessage={onSendMessage} />);
+
+    const inputBox = document.querySelector('.message-input-box');
+    const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+    const textareaDeclarations = getCssDeclarations('.message-input-textarea');
+
+    expect(textarea.parentElement).toBe(inputBox);
+    expect(document.querySelector('.message-input-textarea-hitbox')).not.toBeInTheDocument();
+    expect(textareaDeclarations['align-self']).toBe('stretch');
+    expect(textareaDeclarations.padding).toBe('calc(8px * var(--sp, 1)) 0');
+    expect(textareaDeclarations.cursor).toBe('text');
   });
 
   it('shows channel name in placeholder', () => {

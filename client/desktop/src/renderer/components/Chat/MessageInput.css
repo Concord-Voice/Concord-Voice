@@ -26,12 +26,12 @@
 
 .message-input-box {
   display: flex;
-  align-items: center;
+  align-items: stretch;
   gap: calc(10px * var(--sp, 1));
   background-color: var(--bg-tertiary);
   border: 1px solid var(--border-color);
   border-radius: 8px;
-  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  padding: 0 calc(12px * var(--sp, 1));
   transition: border-color 0.15s ease;
 }
 
@@ -41,16 +41,20 @@
 
 .message-input-textarea {
   flex: 1;
+  min-width: 0;
+  align-self: stretch;
   background: transparent;
   border: none;
   color: var(--text-primary);
   font-family: 'SourceSans', sans-serif;
   font-size: calc(14px * var(--font-scale, 1));
   line-height: 1.25;
+  padding: calc(8px * var(--sp, 1)) 0;
   resize: none;
   outline: none;
   overflow-y: auto;
   height: auto;
+  cursor: text;
 }
 
 .message-input-textarea::placeholder {
@@ -65,8 +69,9 @@
 .message-input-actions {
   display: flex;
   align-items: center;
-  align-self: flex-end;
+  align-self: stretch;
   gap: calc(8px * var(--sp, 1));
+  padding: calc(8px * var(--sp, 1)) 0;
 }
 
 .encryption-toggle {
@@ -218,6 +223,7 @@ kbd {
   flex-shrink: 0;
   display: flex;
   align-items: center;
+  padding: calc(8px * var(--sp, 1)) 0;
 }
 
 /* Scrollbar styling for textarea */
