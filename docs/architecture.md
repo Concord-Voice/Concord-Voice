@@ -71,7 +71,7 @@ Concord Voice is a distributed real-time communications platform with three serv
 
 ### Infrastructure
 
-- **Database:** PostgreSQL 16, 67 migrations, 55 tables
+- **Database:** PostgreSQL 16 (schema under `services/control-plane/migrations/`)
 - **Cache:** Redis 7 for sessions, presence, RBAC cache, rate limiting (both planes connect to the same server)
 - **Messaging:** NATS 2.x for inter-service events
 - **CI/CD:** GitHub Actions → SonarQube Quality Gate (≥ 80% coverage)
@@ -235,7 +235,7 @@ Manifests + signed installers are served from the control-plane `updates` packag
 
 #### Database Schema
 
-PostgreSQL 16, **67 migrations → 55 tables** (`services/control-plane/migrations/`). Under E2EE-everywhere (#201) the `is_encrypted` columns were dropped (migration 000062) from `channels`, `messages`, `dm_conversations`, `dm_messages`, and `media_files` — they are intentionally absent below.
+PostgreSQL 16 (schema under `services/control-plane/migrations/`). Under E2EE-everywhere (#201) the `is_encrypted` columns were dropped (migration 000062) from `channels`, `messages`, `dm_conversations`, `dm_messages`, and `media_files` — they are intentionally absent below.
 
 **Identity, auth, RBAC & server structure:**
 

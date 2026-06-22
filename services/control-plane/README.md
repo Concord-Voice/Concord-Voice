@@ -62,7 +62,7 @@ control-plane/
 ├── pkg/
 │   ├── config/           # Configuration management
 │   └── logger/           # Structured logging
-├── migrations/           # 57 SQL migration pairs (000001-000057)
+├── migrations/           # SQL migration pairs (count: [internal] Key Counts)
 ├── tests/                # Integration tests (90 test files)
 ├── Dockerfile
 ├── go.mod
@@ -347,7 +347,7 @@ For detailed migration documentation, see [migrations/README.md](migrations/READ
 ### Additional Tables ✅
 - user_keys, server_invites, channel_keys, channel_key_recipients, channel_read_states, voice_participants, user_preferences, friend_codes, privacy_settings
 
-**57 migrations total** (000001-000057). See `migrations/` for full schema.
+See `migrations/` for the full schema; the current migration total lives in [[internal]](../..[internal]) "Key Counts" (single source of truth — not duplicated here to avoid drift).
 
 ## Current Status
 

@@ -38,7 +38,11 @@ const defaultSettings: PrivacySettings = {
   // #1766: default ON for new users (transient pre-fetch placeholder; the
   // authoritative value is the server's, applied by fetchPrivacy()).
   loadGifsAutomatically: true,
-  sharePersonalizationWithGifProvider: false,
+  // Transient pre-fetch placeholder; aligned to the authoritative default
+  // (migration 000056 column default + backend no-row fallback are both TRUE —
+  // personalization-on degrades nothing when KLIPY traffic is always proxied).
+  // Overwritten by fetchPrivacy() with the server value.
+  sharePersonalizationWithGifProvider: true,
 };
 
 interface PrivacyState {
@@ -82,7 +86,7 @@ export const usePrivacyStore = wrapStore(
                 allowEmbeddedContent: p.allow_embedded_content ?? false,
                 loadGifsAutomatically: p.load_gifs_automatically ?? false,
                 sharePersonalizationWithGifProvider:
-                  p.share_personalization_with_gif_provider ?? false,
+                  p.share_personalization_with_gif_provider ?? true,
               },
               isLoading: false,
             });
@@ -145,7 +149,7 @@ export const usePrivacyStore = wrapStore(
               allowEmbeddedContent: p.allow_embedded_content ?? false,
               loadGifsAutomatically: p.load_gifs_automatically ?? false,
               sharePersonalizationWithGifProvider:
-                p.share_personalization_with_gif_provider ?? false,
+                p.share_personalization_with_gif_provider ?? true,
             },
           });
         },
