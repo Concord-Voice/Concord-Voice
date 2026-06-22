@@ -60,7 +60,7 @@ describe('spaSelfHeal — R2 retry state machine', () => {
   it('retryCount=0: waits 500ms, resolves, loadURLs the result', async () => {
     mockResolve.mockResolvedValue({
       mode: 'remote',
-      url: 'https://api.example.com/spa/def5678/index.html',
+      url: 'https://api.concordvoice.chat/spa/def5678/index.html',
       reason: 'remote SPA compatible',
     });
 
@@ -72,7 +72,7 @@ describe('spaSelfHeal — R2 retry state machine', () => {
 
     expect(mockResolve).toHaveBeenCalledOnce();
     expect(mockLoadURL).toHaveBeenCalledWith(
-      'https://api.example.com/spa/def5678/index.html'
+      'https://api.concordvoice.chat/spa/def5678/index.html'
     );
     expect(mockLoadFile).not.toHaveBeenCalled();
     expect(outcome).toEqual({ mode: 'recovered', retryCount: 1 });
@@ -98,7 +98,7 @@ describe('spaSelfHeal — R2 retry state machine', () => {
     // First call gets us to retryCount=1.
     mockResolve.mockResolvedValue({
       mode: 'remote',
-      url: 'https://api.example.com/spa/def5678/index.html',
+      url: 'https://api.concordvoice.chat/spa/def5678/index.html',
       reason: 'remote SPA compatible',
     });
     const first = attemptSelfHeal({ reason: 'chunk-load' });
@@ -137,7 +137,7 @@ describe('spaSelfHeal — R2 retry state machine', () => {
   it('in-flight idempotency: simultaneous triggers collapse to one attempt', async () => {
     mockResolve.mockResolvedValue({
       mode: 'remote',
-      url: 'https://api.example.com/spa/def5678/index.html',
+      url: 'https://api.concordvoice.chat/spa/def5678/index.html',
       reason: 'remote SPA compatible',
     });
 
@@ -185,7 +185,7 @@ describe('spaSelfHeal — R2 retry state machine', () => {
     // the no-window path must not have permanently disabled self-heal.
     mockResolve.mockResolvedValueOnce({
       mode: 'remote',
-      url: 'https://api.example.com/spa/abc1234/index.html',
+      url: 'https://api.concordvoice.chat/spa/abc1234/index.html',
       reason: 'remote SPA compatible',
     });
     const followup = attemptSelfHeal({ reason: 'chunk-load' });
@@ -202,7 +202,7 @@ describe('spaSelfHeal — R2 retry state machine', () => {
     // and consume the retry slot so a subsequent trigger lands at exhaustion.
     mockResolve.mockResolvedValue({
       mode: 'remote',
-      url: 'https://api.example.com/spa/def5678/index.html',
+      url: 'https://api.concordvoice.chat/spa/def5678/index.html',
       reason: 'remote SPA compatible',
     });
     mockLoadURL.mockRejectedValueOnce(new Error('net::ERR_CONNECTION_RESET'));
@@ -220,7 +220,7 @@ describe('spaSelfHeal — R2 retry state machine', () => {
     expect(mockLoadURL).toHaveBeenCalledTimes(2);
     expect(mockLoadURL).toHaveBeenNthCalledWith(
       1,
-      'https://api.example.com/spa/def5678/index.html'
+      'https://api.concordvoice.chat/spa/def5678/index.html'
     );
     expect(mockLoadURL).toHaveBeenNthCalledWith(2, 'app://concord/index.html');
     expect(mockLoadFile).not.toHaveBeenCalled();

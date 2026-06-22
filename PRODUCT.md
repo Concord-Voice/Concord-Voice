@@ -8,7 +8,7 @@ Concord Voice is a **privacy-first, hybrid SaaS + self-hosted** real-time commun
 
 **Organization:** Concord Voice LLC
 **License:** CVSL 1.0 (source-available; converts to AGPL-3.0-or-later on 2030-02-15)
-**Domains:** example.com (infrastructure), concordvoice.com (public-facing)
+**Domains:** concordvoice.chat (infrastructure), concordvoice.com (public-facing)
 
 <!-- audit-exempt: historical reference (v0.1.0-Alpha is a shipped versioned identifier) -->
 ## Core Features (v0.1.0-Alpha + Phase 2B Shipped)

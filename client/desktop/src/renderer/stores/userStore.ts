@@ -78,9 +78,11 @@ export const useUserStore = wrapStore(
             const response = await apiFetch('/api/v1/users/me');
 
             if (response.status === 401) {
-              // Token expired and refresh failed — clear auth
+              // Token expired and refresh failed. apiClient.handleRefreshFailure
+              // (inside apiFetch) already made the rememberMe-aware disk decision
+              // — do NOT also call electron.clearTokens() here, which would wipe a
+              // "Remember Me" session unconditionally on a transient 401 (#1768).
               useAuthStore.getState().clearAccessToken();
-              globalThis.electron?.clearTokens?.();
               set({ user: null, isLoading: false, error: null });
               return;
             }
@@ -158,8 +160,9 @@ export const useUserStore = wrapStore(
           });
 
           if (response.status === 401) {
+            // Disk-token fate already decided by handleRefreshFailure
+            // (rememberMe-aware); do NOT wipe persisted tokens here (#1768).
             useAuthStore.getState().clearAccessToken();
-            globalThis.electron?.clearTokens?.();
             set({ user: null, isLoading: false, error: null });
             throw new Error('Session expired');
           }
@@ -231,8 +234,9 @@ export const useUserStore = wrapStore(
               if (data.error === 'Current password is incorrect') {
                 return { success: false, error: data.error };
               }
+              // Disk-token fate already decided by handleRefreshFailure
+              // (rememberMe-aware); do NOT wipe persisted tokens here (#1768).
               useAuthStore.getState().clearAccessToken();
-              globalThis.electron?.clearTokens?.();
               set({ user: null, isLoading: false, error: null });
               return { success: false, error: 'Session expired' };
             }

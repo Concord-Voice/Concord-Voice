@@ -82,7 +82,7 @@ Week 17               Week 24          Week 36
 - ✅ Rate limiting (Redis-based, per-IP and per-user)
 - ✅ Username validation with profanity filtering
 - ✅ Connection selector UI (hosted vs self-hosted)
-- ✅ Branding integration (example.com identity)
+- ✅ Branding integration (concordvoice.chat identity)
 - ✅ GitHub Actions CI/CD (TruffleHog, Semgrep, Trivy)
 - ✅ Pre-commit security hooks
 

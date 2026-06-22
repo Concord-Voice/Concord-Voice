@@ -23,6 +23,20 @@ import type { ActiveSpeakerDelta } from './activeSpeakerSet.js';
 /** Media source identifier — matches client-side appData.source */
 export type MediaSource = 'mic' | 'camera' | 'screen' | 'screen-audio';
 
+/**
+ * Per-user media entitlement (#1300) — the joining user's server-authoritative
+ * media caps, resolved by the control-plane and parsed in
+ * `validateChannelAccess` (middleware/auth.ts). Carried through `joinRoom` onto
+ * the Participant; consumed at the participant's OWN transport / produce
+ * boundary. Never sourced from the client (`socket.handshake.auth`).
+ */
+export interface MediaEntitlement {
+  tier: string;
+  allowedAudioTiers: string[];
+  minPtimeMs: number;
+  maxManualBitrateBps: number;
+}
+
 export interface Participant {
   userId: string;
   socketId: string;
@@ -45,7 +59,58 @@ export interface Participant {
    * moderator-enforced over NATS (`voice.enforce.deafen`).
    */
   isDeafened: boolean;
+  // ── Per-user media entitlement (#1300) ─────────────────────────────────
+  /** Subscription tier label (debug/log/forward-compat only — caps below drive enforcement). */
+  tier: string;
+  /** Aggregate send-bitrate ceiling (bps) applied to this peer's PRODUCING transport. */
+  maxManualBitrateBps: number;
+  /** Audio quality tiers this user may produce at (highest entry sets the opus bitrate ceiling). */
+  allowedAudioTiers: string[];
+  /** Minimum opus ptime (ms) this user may produce at (free 20, premium 10). */
+  minPtimeMs: number;
 }
+
+// ---------------------------------------------------------------------------
+// Audio-tier → opus bitrate ceiling (#1300)
+//
+// The free tier tops out at the "standard" audio quality tier. The opus
+// maxaveragebitrate ceiling for a tier is the per-tier `maxBitrate` (bps) the
+// CLIENT requests at produce time. Mirrored here as a server constant from the
+// canonical client map AUDIO_QUALITY_TIERS in
+// `client/desktop/src/renderer/stores/voiceStore.ts` — `standard.maxBitrate`
+// is 96_000 bps (the free ceiling). This is the audio-tier analogue of
+// FREE_MEDIA_ENTITLEMENT: a small, deliberately-pinned mirror of a client
+// value used only to enforce the floor. If a future tier's client maxBitrate
+// changes, update AUDIO_TIER_OPUS_BITRATE_CEILING_BPS to match.
+//
+// Only ceilings for tiers that can appear in a user's allowedAudioTiers are
+// needed; the resolver below takes the MAX ceiling across the user's allowed
+// tiers, so unknown tier strings are ignored (fail-closed: an unrecognised
+// tier contributes no ceiling).
+// ---------------------------------------------------------------------------
+export const AUDIO_TIER_OPUS_BITRATE_CEILING_BPS: Readonly<Record<string, number>> = {
+  minimum: 16_000,
+  low: 32_000,
+  moderate: 64_000,
+  standard: 96_000,
+  high: 192_000,
+  hifi: 256_000,
+  studio: 510_000,
+};
+
+/**
+ * Fail-closed free-floor entitlement used as the `joinRoom` default when no
+ * parsed entitlement is supplied (backward-compat callers / tests). Mirrors the
+ * Go FREE floor — the same values `validateChannelAccess` falls back to via
+ * `FREE_MEDIA_ENTITLEMENT`. The real join path ALWAYS passes the parsed
+ * entitlement, so this default only fires for callers that predate #1300.
+ */
+export const FREE_MEDIA_ENTITLEMENT: Readonly<MediaEntitlement> = {
+  tier: 'free',
+  allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
+  minPtimeMs: 20,
+  maxManualBitrateBps: 5_000_000,
+};
 
 export interface Room {
   id: string;
@@ -360,10 +425,9 @@ export class RoomManager {
     roomId: string,
     userId: string,
     socketId: string,
-    username: string,
-    displayName?: string,
-    avatarUrl?: string,
-    rtpCapabilities?: RtpCapabilities
+    identity: { username: string; displayName?: string; avatarUrl?: string },
+    rtpCapabilities?: RtpCapabilities,
+    entitlement?: MediaEntitlement
   ): Promise<{
     rtpCapabilities: RtpCapabilities;
     existingProducers: ProducerInfo[];
@@ -376,6 +440,7 @@ export class RoomManager {
     }>;
     e2eeEpoch: number;
   }> {
+    const { username, displayName, avatarUrl } = identity;
     let room = await this.getOrCreateRoom(roomId);
 
     // Check if user is already in this room (reconnect scenario)
@@ -392,6 +457,11 @@ export class RoomManager {
       room = await this.getOrCreateRoom(roomId);
     }
 
+    // Per-user media caps (#1300): from the parsed control-plane entitlement,
+    // or the fail-closed free floor for pre-#1300 callers. Copy the tiers array
+    // so a later mutation of the source can't leak into the participant.
+    const ent = entitlement ?? FREE_MEDIA_ENTITLEMENT;
+
     const participant: Participant = {
       userId,
       socketId,
@@ -407,6 +477,10 @@ export class RoomManager {
       serverMuted: false,
       serverDeafened: false,
       isDeafened: false,
+      tier: ent.tier,
+      maxManualBitrateBps: ent.maxManualBitrateBps,
+      allowedAudioTiers: [...ent.allowedAudioTiers],
+      minPtimeMs: ent.minPtimeMs,
     };
 
     room.participants.set(userId, participant);
@@ -540,12 +614,57 @@ export class RoomManager {
         config.mediasoup.webRtcTransport.initialAvailableOutgoingBitrate,
     });
 
-    // Set max incoming bitrate
-    if (config.mediasoup.webRtcTransport.maxIncomingBitrate) {
+    // Set max incoming bitrate.
+    //
+    // Per-user tier gating (#1300): `setMaxIncomingBitrate` caps the aggregate
+    // bitrate the SFU will ACCEPT from this transport — i.e. it caps what the
+    // peer can SEND. The producing direction is the `send` transport (the peer
+    // calls produce() on it — see produce() below), so for `send` we apply the
+    // joining user's tier ceiling `participant.maxManualBitrateBps` (free
+    // 5_000_000, premium 10_000_000), replacing the global ~50 Mbps default.
+    // The `recv` transport carries media TO the peer (the SFU never produces on
+    // it), so its incoming cap is irrelevant to send-side abuse — it keeps the
+    // existing global default. This is the workhorse server-authoritative lever
+    // (spec §1): it bounds aggregate cost/abuse. It is NOT a pixel/fps limit —
+    // a patched client can still encode low-quality 4K inside the envelope.
+    //
+    // Honest scope: this is a BWE/congestion-control ADVISORY, not a hard RTP
+    // policer. The SFU advertises the cap via REMB / transport-cc and a
+    // COOPERATIVE client (stock browser / Electron WebRTC) honours it and
+    // throttles its encoder. A patched client that ignores congestion-control
+    // feedback can still send above the cap and the SFU will forward what
+    // arrives — so this bounds real-world / cooperative cost, it does not
+    // hard-stop a deliberately misbehaving peer. Hard policing against a
+    // non-cooperative client is FUTURE work (server-side getStats() sampling +
+    // the #1542 voice.enforce.disconnect path), explicitly out of #1300 scope.
+    const incomingBitrateCap =
+      direction === 'send'
+        ? participant.maxManualBitrateBps
+        : config.mediasoup.webRtcTransport.maxIncomingBitrate;
+    if (incomingBitrateCap) {
       try {
-        await transport.setMaxIncomingBitrate(config.mediasoup.webRtcTransport.maxIncomingBitrate);
-      } catch {
-        // Some transports don't support this
+        await transport.setMaxIncomingBitrate(incomingBitrateCap);
+      } catch (err) {
+        // WebRtcTransport ALWAYS supports setMaxIncomingBitrate (unlike Plain/
+        // Pipe transports, which we never create here), so a failure is not a
+        // capability gap — it is a transient worker error. We do NOT fail the
+        // join closed: a legitimate peer should not be blocked by a flaky
+        // worker call. But the fail-open IS observable — the send transport is
+        // left at the mediasoup default (effectively uncapped), so the per-user
+        // bitrate cap silently does not apply for this session. Log it PII-safe
+        // (ids + direction only — NEVER identity/display fields or the err
+        // object, per observability.md #1/#2) so the uncapped state can be
+        // monitored, then proceed.
+        logger.warn(
+          'setMaxIncomingBitrate failed — send transport left uncapped (#1300 fail-open)',
+          {
+            roomId,
+            userId,
+            direction,
+            transportId: transport.id,
+            error: err instanceof Error ? err.message : 'unknown',
+          }
+        );
       }
     }
 
@@ -675,22 +794,24 @@ export class RoomManager {
       throw new Error('Invalid media source for producer kind');
     }
 
+    // Per-user audio-tier gating (#1300): for the joining user's OWN mic
+    // producer, reject (BEFORE creating the producer) an over-tier opus stream.
+    // Server-verifiable from rtpParameters at the produce boundary; the tier is
+    // server-authoritative (participant entitlement parsed from the join-authorize
+    // response, never socket.handshake.auth). Only mic is gated — screen-audio
+    // is system audio with no per-tier quality contract. TOCTOU-safe: this is a
+    // pure synchronous check before the `await produce()`, so a rejected stream
+    // never yields a (briefly-existing) producer.
+    if (kind === 'audio' && source === 'mic') {
+      this.enforceAudioTierGate(participant, rtpParameters, source);
+    }
+
     // Enforce per-room concurrent-producer caps (camera: tier-resolved free
     // default 8; screen: SCREEN_PRODUCER_CAP). TOCTOU-safe (#1539 review): the
-    // producer is only recorded in participant.producers AFTER the await below,
-    // so a bare synchronous count check lets concurrent produce() calls all pass
-    // against a stale count and overrun the cap. We reserve a slot synchronously
-    // — the check + reservation run with no intervening await, so concurrent
-    // invocations observe each other's reservations — and release it once the
-    // producer is recorded or if produce() fails.
-    const producerCap = this.resolveProducerCap(room, source);
-    if (producerCap !== null) {
-      const pending = room.pendingProducerCounts.get(source) ?? 0;
-      if (this.countProducersBySource(room, source) + pending >= producerCap) {
-        throw new Error(this.capExceededMessage(source, producerCap));
-      }
-      room.pendingProducerCounts.set(source, pending + 1);
-    }
+    // check + slot reservation run synchronously with no intervening await, so
+    // concurrent invocations observe each other's reservations. The reservation
+    // is released once the producer is recorded or if produce() fails.
+    const producerCap = this.reserveProducerSlot(room, source);
 
     let producer: Producer;
     try {
@@ -903,9 +1024,15 @@ export class RoomManager {
     // so the client's unconditional resume is refused by the guard until the
     // speaker enters the top-N. Screen-audio (not a mic producer) and video are
     // never managed.
+    //
+    // #1742: only seed paused when the room is GENUINELY over the cap. When every
+    // mic publisher fits under N, last-N is a no-op (see applyLastNDelta), so a
+    // fresh joiner must hear from the first frame — seeding it paused would clip
+    // the opening of the first words. The count is server-authoritative.
     if (
       newConsumer.kind === 'audio' &&
       room.micProducerIds.has(producerId) &&
+      room.micProducerIds.size > resolveAudioLastN(room) &&
       !room.activeSpeakers.current().has(producerId)
     ) {
       room.lastNPausedConsumers.add(newConsumer.id);
@@ -1029,8 +1156,46 @@ export class RoomManager {
    * The PRODUCER is never paused — only consumers.
    */
   private applyLastNDelta(room: Room, delta: ActiveSpeakerDelta): void {
+    // #1742: last-N is a capacity/DoS guardrail for rooms LARGER than the
+    // forwarded-speaker cap. When every mic publisher already fits under N,
+    // applying the cap is pure regression — the evict-on-silence pause/resume
+    // churn loses the leading frames of each utterance during the resume gap,
+    // producing Opus PLC crackle. So when the room is at/under the cap, never
+    // pause, and drain any consumer left paused from a prior over-cap window
+    // (resume-on-shrink). The count is server-authoritative (no new trust
+    // surface). The over-cap path below is unchanged: the #1544/#1632
+    // enforcement invariants only apply when the room genuinely exceeds N.
+    if (room.micProducerIds.size <= resolveAudioLastN(room)) {
+      this.drainLastNPaused(room);
+      return;
+    }
     for (const producerId of delta.removed) this.setAudioForwarding(room, producerId, false);
     for (const producerId of delta.added) this.setAudioForwarding(room, producerId, true);
+  }
+
+  /**
+   * #1742: resume every consumer currently last-N-paused, because last-N no
+   * longer applies (the room is at/under the cap — either always was, or just
+   * shrank back). `lastNPausedConsumers` is mutated SYNCHRONOUSLY before the
+   * async resume, mirroring setAudioForwarding's TOCTOU discipline so the
+   * resumeConsumer guard's view stays consistent under overlapping observer
+   * ticks. A server-deafened subscriber is cleared from the set (last-N no
+   * longer owns its pause) but is NOT resumed — the deafen pause must hold
+   * (moderation is not bypassed); server-undeafen + the client resume restores
+   * it, exactly as in setAudioForwarding's resume branch.
+   */
+  private drainLastNPaused(room: Room): void {
+    if (room.lastNPausedConsumers.size === 0) return;
+    for (const [, participant] of room.participants) {
+      for (const [consumerId, consumer] of participant.consumers) {
+        if (!room.lastNPausedConsumers.has(consumerId)) continue;
+        room.lastNPausedConsumers.delete(consumerId); // delete BEFORE resume
+        if (participant.serverDeafened) continue;
+        consumer
+          .resume()
+          .catch((err) => logger.warn('last-N drain resume failed', { consumerId, error: err }));
+      }
+    }
   }
 
   /**
@@ -1337,11 +1502,175 @@ export class RoomManager {
 
   // ─── Private helpers ─────────────────────────────────────────────────
 
+  /**
+   * Per-user audio-tier gate (#1300). REJECTS (throws — so the producer is never
+   * created) an over-tier mic opus stream for the participant's tier. Two
+   * server-verifiable checks against the inbound `rtpParameters`:
+   *
+   *  1. **ptime guard** — the effective opus packet duration. Reject when the
+   *     declared ptime is below `participant.minPtimeMs` (free 20 ms; premium
+   *     10 ms). Lower ptime = more packets/sec = higher overhead, a premium
+   *     lever.
+   *  2. **audio-tier (bitrate) guard** — the opus `maxaveragebitrate` fmtp.
+   *     Reject when it exceeds the ceiling implied by the highest tier in
+   *     `participant.allowedAudioTiers` (free tops out at `standard` = 96 kbps).
+   *
+   * PII-safe: on reject we log ONLY `{ userId, kind, source, reason }` — never
+   * the rtpParameters payload, codec parameters, or any media content
+   * (observability.md core principle #4). The thrown error is generic.
+   *
+   * Honest scope (BEST-EFFORT, NOT a hard guarantee). The values inspected are
+   * client-DECLARED, OPTIONAL opus `fmtp` parameters (`maxaveragebitrate`,
+   * `ptime`/`minptime`). They describe what the client SAYS it will send; they
+   * do not bind the local encoder. The gate therefore reliably rejects an
+   * HONEST/stock client that truthfully declares an over-tier opus, but a
+   * patched client evades it by simply OMITTING the fmtp (we admit-on-absence
+   * by design — the stock client legitimately omits these, so we cannot
+   * fail-closed on a missing fmtp without rejecting legitimate free users) or
+   * by mislabelling mic audio as `source: screen-audio` (only `mic` reaches
+   * here — screen-audio is intentionally ungated, bounded only by the advisory
+   * transport bitrate cap). This is a produce-time TRIPWIRE on declared intent,
+   * not a hard policer. Hard enforcement against a non-cooperative client is
+   * FUTURE work (server-side getStats() sampling + the #1542
+   * voice.enforce.disconnect path), explicitly out of #1300 scope. Mirrors the
+   * honest "NOT a pixel/fps limit" framing on createTransport — and like there,
+   * this gates AUDIO quality only, never video pixel/fps (client-enforced +
+   * bitrate-backstopped, see `[internal]rules/media-plane.md`). Only `mic`
+   * reaches here.
+   */
+  private enforceAudioTierGate(
+    participant: Participant,
+    rtpParameters: RtpParameters,
+    source: MediaSource
+  ): void {
+    const opus = RoomManager.findOpusCodec(rtpParameters);
+    // No opus codec entry → nothing tier-gated to inspect (e.g. a non-opus
+    // audio codec); the bitrate transport cap remains the backstop.
+    if (!opus) return;
+
+    const ptime = RoomManager.extractEffectivePtimeMs(opus, rtpParameters);
+    if (ptime !== null && ptime < participant.minPtimeMs) {
+      this.rejectAudioTier(participant.userId, source, 'ptime_below_tier_minimum');
+    }
+
+    const maxAvgBitrate = RoomManager.extractOpusMaxAverageBitrate(opus);
+    if (maxAvgBitrate !== null) {
+      const ceiling = RoomManager.resolveAllowedOpusBitrateCeiling(participant.allowedAudioTiers);
+      if (maxAvgBitrate > ceiling) {
+        this.rejectAudioTier(participant.userId, source, 'opus_bitrate_above_tier_ceiling');
+      }
+    }
+  }
+
+  /** Emit the PII-safe violation log and throw a generic produce error (#1300). */
+  private rejectAudioTier(userId: string, source: MediaSource, reason: string): never {
+    // PII-safe: userId (opaque id, no display fields), kind, source, reason ONLY.
+    // NEVER the rtpParameters / codec params / media (observability.md #4).
+    logger.warn('Audio producer rejected: over-tier media (#1300)', {
+      userId,
+      kind: 'audio',
+      source,
+      reason,
+    });
+    throw new Error('Audio producer exceeds tier media limits');
+  }
+
+  /** Find the opus codec entry in rtpParameters (case-insensitive mimeType match). */
+  private static findOpusCodec(
+    rtpParameters: RtpParameters
+  ): RtpParameters['codecs'][number] | undefined {
+    return rtpParameters.codecs?.find((c) => c.mimeType?.toLowerCase() === 'audio/opus');
+  }
+
+  /**
+   * Effective opus ptime in ms. Precedence: the codec-level `ptime` fmtp, else
+   * the transport-level `rtpParameters` ptime (some clients put it there).
+   * Returns null when neither is present (admit-on-absence by design).
+   *
+   * We deliberately DO NOT fall back to `minptime`. That fmtp is only the LOWER
+   * BOUND the encoder is permitted to drop to — NOT the actual packetization
+   * interval. Stock WebRTC stacks (Chromium / Electron, which the Concord
+   * desktop client is built on) emit `a=fmtp:111 minptime=10;useinbandfec=1` by
+   * DEFAULT while actually packetizing at 20 ms. Treating `minptime` as the
+   * effective ptime would make the gate read 10 ms for a normal free client and
+   * falsely reject EVERY stock free-tier mic (10 < 20) — breaking the core
+   * feature for the very tier this gate only means to constrain. So an
+   * undeclared ptime is not enforced (the transport bitrate cap remains the
+   * backstop); only an explicit, actual `ptime` is checked. (Gitar review, #1300.)
+   */
+  private static extractEffectivePtimeMs(
+    opus: RtpParameters['codecs'][number],
+    rtpParameters: RtpParameters
+  ): number | null {
+    const params = (opus.parameters ?? {}) as Record<string, unknown>;
+    const codecPtime = RoomManager.toFiniteNumber(params.ptime);
+    if (codecPtime !== null) return codecPtime;
+    return RoomManager.toFiniteNumber((rtpParameters as { ptime?: unknown }).ptime);
+  }
+
+  /** Opus `maxaveragebitrate` fmtp (bps), or null when not declared. */
+  private static extractOpusMaxAverageBitrate(
+    opus: RtpParameters['codecs'][number]
+  ): number | null {
+    const params = (opus.parameters ?? {}) as Record<string, unknown>;
+    return RoomManager.toFiniteNumber(params.maxaveragebitrate);
+  }
+
+  /**
+   * The opus bitrate ceiling (bps) a user may produce at = the MAX per-tier
+   * ceiling across their `allowedAudioTiers`. Unknown tier strings contribute
+   * no ceiling (fail-closed). An empty / all-unknown allow-list floors at the
+   * `standard` free ceiling so a malformed entitlement can never escalate.
+   */
+  private static resolveAllowedOpusBitrateCeiling(allowedAudioTiers: string[]): number {
+    let ceiling = 0;
+    for (const tier of allowedAudioTiers) {
+      const tierCeiling = AUDIO_TIER_OPUS_BITRATE_CEILING_BPS[tier];
+      if (typeof tierCeiling === 'number' && tierCeiling > ceiling) ceiling = tierCeiling;
+    }
+    // Fail-closed: no recognised tier → the free 'standard' ceiling, never 0
+    // (a 0 ceiling would reject every opus stream — a self-inflicted DoS).
+    return ceiling > 0 ? ceiling : AUDIO_TIER_OPUS_BITRATE_CEILING_BPS.standard;
+  }
+
+  /**
+   * Coerce a fmtp value to a finite number. mediasoup fmtp parameters can arrive
+   * as numbers OR numeric strings depending on the codec entry; both are valid
+   * here. Returns null for absent / non-numeric / non-finite values.
+   */
+  private static toFiniteNumber(value: unknown): number | null {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value === 'string' && value.trim() !== '') {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  }
+
   /** Per-room concurrent-producer cap for a capped source, or null if uncapped. */
   private resolveProducerCap(room: Room, source: MediaSource): number | null {
     if (source === 'camera') return resolveVideoPublisherCap(room);
     if (source === 'screen') return SCREEN_PRODUCER_CAP;
     return null; // mic, screen-audio — no count cap
+  }
+
+  /**
+   * Resolve the per-room cap for `source` and, if capped, reserve a slot
+   * synchronously (check + reserve with no intervening await — the #1539
+   * TOCTOU-safe path). Throws the cap-exceeded error when the cap is already
+   * met; returns the resolved cap (or null for uncapped sources) so the caller
+   * can release the reservation once the producer is recorded or produce()
+   * fails. No-op reservation for uncapped sources.
+   */
+  private reserveProducerSlot(room: Room, source: MediaSource): number | null {
+    const producerCap = this.resolveProducerCap(room, source);
+    if (producerCap === null) return null;
+    const pending = room.pendingProducerCounts.get(source) ?? 0;
+    if (this.countProducersBySource(room, source) + pending >= producerCap) {
+      throw new Error(this.capExceededMessage(source, producerCap));
+    }
+    room.pendingProducerCounts.set(source, pending + 1);
+    return producerCap;
   }
 
   /** Human-readable cap-exceeded message for a capped source (server-side ints only). */
@@ -1368,6 +1697,16 @@ export class RoomManager {
   private removeMicProducer(room: Room, producerId: string): void {
     room.activeSpeakers.remove(producerId);
     room.micProducerIds.delete(producerId);
+    // #1742: a publisher leaving can drop the room from over-cap back to <= N.
+    // Drive the resume-on-shrink drain from the leave EVENT here — this is the
+    // convergence point every producer-removal flow routes through — rather than
+    // waiting for the next AudioLevelObserver tick. Otherwise a consumer that was
+    // last-N-paused while the room was over-cap stays paused until the next
+    // 'volumes'/'silence' event (which may not fire if the room has gone quiet).
+    // The guard mirrors applyLastNDelta: drain only once the room fits under N.
+    if (room.micProducerIds.size <= resolveAudioLastN(room)) {
+      this.drainLastNPaused(room);
+    }
   }
 
   private countProducersBySource(room: Room, source: MediaSource): number {

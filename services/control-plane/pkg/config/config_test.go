@@ -124,7 +124,7 @@ func TestLoad_AllowedOriginsDefault_OmitsHostedSpaOrigin(t *testing.T) {
 	t.Setenv("ALLOWED_ORIGINS", "")        // force default
 	cfg, err := Load()
 	require.NoError(t, err)
-	assert.NotContains(t, cfg.AllowedOrigins, "https://spa.example.com",
+	assert.NotContains(t, cfg.AllowedOrigins, "https://spa.concordvoice.chat",
 		"hosted Pages SPA origin must NOT be a code default (set via env in production; #1664 mirror sanitization)")
 	// Positive: the neutral dev/test/CI origins remain.
 	assert.Contains(t, cfg.AllowedOrigins, "app://concord")
@@ -216,13 +216,19 @@ func validProductionConfig() *Config { // #nosec G101 -- test fixture with fake 
 		TrustedProxyCIDRs: []string{"10.0.0.0/8"},
 		// Satisfy the #725 MEDIA_PLANE_URL production guards: must be set,
 		// must not be the dev default, must not be the root zone.
-		MediaPlaneURL: "https://media.example.com",
+		MediaPlaneURL: "https://media.concordvoice.chat",
 		// #158 — feedback handler. Production requires both fields; empty
 		// either is a fatal-exit per the guards added on this branch.
 		GitHubFeedback: GitHubFeedbackConfig{ //nolint:gosec // G101: test fixture with fake PAT, not a real credential
 			Token: "ghp_real_production_pat", // #nosec G101 -- test fixture, not a real PAT
 			Repo:  "Concord-Voice/Concord-Voice-Feedback",
 		},
+		// #1688 — admin WebAuthn relying party. When the console is enabled,
+		// production requires RP_ID, ≥1 origin, AND a non-empty AAGUID allow-list
+		// (checkAAGUID is fail-closed; empty would brick enrollment).
+		AdminWebAuthnRPID:           "admin.concordvoice.chat",
+		AdminWebAuthnRPOrigins:      []string{"https://admin.concordvoice.chat"},
+		AdminWebAuthnAllowedAAGUIDs: []string{"ee882879-721c-4913-9775-3dfcce97072a"},
 	}
 }
 
@@ -234,6 +240,31 @@ func TestValidateDevelopmentSkipsAllChecks(t *testing.T) {
 func TestValidateProductionPassesWithValidConfig(t *testing.T) {
 	cfg := validProductionConfig()
 	assert.NoError(t, cfg.validate())
+}
+
+// TestValidateRedemptionAdminToken covers the #1303 issuer-authz token guard:
+// unset is allowed (endpoint disabled), a ≥32-char token is allowed, and a
+// set-but-too-short token is a fatal-exit.
+func TestValidateRedemptionAdminToken(t *testing.T) {
+	t.Run("unset is allowed (HTTP gen endpoint disabled)", func(t *testing.T) {
+		cfg := validProductionConfig()
+		cfg.RedemptionAdminToken = ""
+		assert.NoError(t, cfg.validate())
+	})
+
+	t.Run("valid 32+ char token allowed", func(t *testing.T) {
+		cfg := validProductionConfig()
+		cfg.RedemptionAdminToken = "0123456789abcdef0123456789abcdef" //nolint:gosec // 32-char test fixture // pragma: allowlist secret
+		assert.NoError(t, cfg.validate())
+	})
+
+	t.Run("short token is fatal", func(t *testing.T) {
+		cfg := validProductionConfig()
+		cfg.RedemptionAdminToken = "too-short"
+		err := cfg.validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "REDEMPTION_ADMIN_TOKEN")
+	})
 }
 
 func TestParseTrustedProxyCIDRs(t *testing.T) {
@@ -316,17 +347,17 @@ func TestValidateProductionRejectsDevDefaults(t *testing.T) {
 		{"empty MEDIA_PLANE_URL", func(c *Config) { c.MediaPlaneURL = "" }, "MEDIA_PLANE_URL"},
 		{"dev-default MEDIA_PLANE_URL", func(c *Config) { c.MediaPlaneURL = "http://localhost:3000" }, "MEDIA_PLANE_URL"},
 		// Class 2 — root-zone exact forms:
-		{"MEDIA_PLANE_URL root https", func(c *Config) { c.MediaPlaneURL = "https://example.com" }, "MEDIA_PLANE_URL"},
-		{"MEDIA_PLANE_URL root http", func(c *Config) { c.MediaPlaneURL = "http://example.com" }, "MEDIA_PLANE_URL"},
+		{"MEDIA_PLANE_URL root https", func(c *Config) { c.MediaPlaneURL = "https://concordvoice.chat" }, "MEDIA_PLANE_URL"},
+		{"MEDIA_PLANE_URL root http", func(c *Config) { c.MediaPlaneURL = "http://concordvoice.chat" }, "MEDIA_PLANE_URL"},
 		// Class 3 — root-zone variants that exact string match would miss.
 		// Per #725 review: Copilot + Seer + 3 subagents independently flagged
 		// that exact-match guards are bypassed by any of these variants.
-		{"MEDIA_PLANE_URL root with trailing slash", func(c *Config) { c.MediaPlaneURL = "https://example.com/" }, "MEDIA_PLANE_URL"},
-		{"MEDIA_PLANE_URL root with explicit port", func(c *Config) { c.MediaPlaneURL = "https://example.com:443" }, "MEDIA_PLANE_URL"},
-		{"MEDIA_PLANE_URL root with path", func(c *Config) { c.MediaPlaneURL = "https://example.com/api" }, "MEDIA_PLANE_URL"},
+		{"MEDIA_PLANE_URL root with trailing slash", func(c *Config) { c.MediaPlaneURL = "https://concordvoice.chat/" }, "MEDIA_PLANE_URL"},
+		{"MEDIA_PLANE_URL root with explicit port", func(c *Config) { c.MediaPlaneURL = "https://concordvoice.chat:443" }, "MEDIA_PLANE_URL"},
+		{"MEDIA_PLANE_URL root with path", func(c *Config) { c.MediaPlaneURL = "https://concordvoice.chat/api" }, "MEDIA_PLANE_URL"},
 		{"MEDIA_PLANE_URL root uppercase", func(c *Config) { c.MediaPlaneURL = "HTTPS://CONCORDVOICE.CHAT" }, "MEDIA_PLANE_URL"},
-		{"MEDIA_PLANE_URL root wss scheme", func(c *Config) { c.MediaPlaneURL = "wss://example.com" }, "MEDIA_PLANE_URL"},
-		{"MEDIA_PLANE_URL root with www", func(c *Config) { c.MediaPlaneURL = "https://www.example.com" }, "MEDIA_PLANE_URL"},
+		{"MEDIA_PLANE_URL root wss scheme", func(c *Config) { c.MediaPlaneURL = "wss://concordvoice.chat" }, "MEDIA_PLANE_URL"},
+		{"MEDIA_PLANE_URL root with www", func(c *Config) { c.MediaPlaneURL = "https://www.concordvoice.chat" }, "MEDIA_PLANE_URL"},
 		// #158 — feedback handler production guards. Either field empty must
 		// fatal-exit; same shape as the other "empty X in production" rows.
 		{"empty FEEDBACK_PAT", func(c *Config) { c.GitHubFeedback.Token = "" }, "FEEDBACK_PAT"},
@@ -350,9 +381,9 @@ func TestValidateProductionRejectsDevDefaults(t *testing.T) {
 // would reject legitimate media-plane hosts along with the root zone.
 func TestValidateProductionAcceptsMediaSubdomain(t *testing.T) {
 	accepts := []string{
-		"https://media.example.com",     // canonical production value
-		"https://media.example.com/",    // trailing slash OK on subdomain
-		"https://media.example.com:443", // explicit port OK on subdomain
+		"https://media.concordvoice.chat",     // canonical production value
+		"https://media.concordvoice.chat/",    // trailing slash OK on subdomain
+		"https://media.concordvoice.chat:443", // explicit port OK on subdomain
 		"https://other.example.com",           // unrelated host passes (operator override)
 		"http://media.example.com",            // http OK for non-production-hostname variants
 	}
@@ -361,7 +392,7 @@ func TestValidateProductionAcceptsMediaSubdomain(t *testing.T) {
 			cfg := validProductionConfig()
 			cfg.MediaPlaneURL = v
 			assert.NoError(t, cfg.validate(),
-				"%s must be accepted — only the root example.com zone is rejected", v)
+				"%s must be accepted — only the root concordvoice.chat zone is rejected", v)
 		})
 	}
 }
@@ -374,19 +405,19 @@ func TestMediaPlaneURLIsRoot(t *testing.T) {
 		root  bool
 	}{
 		// Root zone — should all be flagged:
-		{"https://example.com", true},
-		{"http://example.com", true},
-		{"https://example.com/", true},
-		{"https://example.com:443", true},
-		{"https://example.com/api", true},
+		{"https://concordvoice.chat", true},
+		{"http://concordvoice.chat", true},
+		{"https://concordvoice.chat/", true},
+		{"https://concordvoice.chat:443", true},
+		{"https://concordvoice.chat/api", true},
 		{"HTTPS://CONCORDVOICE.CHAT", true},
-		{"wss://example.com", true},
-		{"https://www.example.com", true},
+		{"wss://concordvoice.chat", true},
+		{"https://www.concordvoice.chat", true},
 		{"https://WWW.Concordvoice.Chat", true},
 		// Non-root — should all pass:
-		{"https://media.example.com", false},
-		{"https://api.example.com", false},
-		{"https://turn.example.com", false},
+		{"https://media.concordvoice.chat", false},
+		{"https://api.concordvoice.chat", false},
+		{"https://turn.concordvoice.chat", false},
 		{"https://example.com", false},
 		{"http://localhost:3000", false}, // dev default, rejected by a different guard
 		{"", false},                      // empty, rejected by a different guard
@@ -999,7 +1030,7 @@ func validAttestationConfig() *Config {
 		Environment:              "development", // bypass the production issuer check
 		RequireClientAttestation: true,
 		OIDCIssuer:               "https://token.actions.githubusercontent.com",
-		OIDCAudience:             "https://api.example.com",
+		OIDCAudience:             "https://api.concordvoice.chat",
 		OIDCSubjectPrefix:        "repo:markdrogersjr/Concord:",
 		OIDCSPAWorkflow:          "main-cd.yml",
 		OIDCSPARef:               "refs/heads/main",
@@ -1097,12 +1128,16 @@ func TestValidate_WarnsOnBroadRFC1918Fallback(t *testing.T) {
 		MinIOBucket:       "concord-media",
 		SMTPHost:          "smtp.example.com",
 		TrustedProxyCIDRs: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
-		MediaPlaneURL:     "https://media.example.com",
+		MediaPlaneURL:     "https://media.concordvoice.chat",
 		// #158 — feedback handler production guards.
 		GitHubFeedback: GitHubFeedbackConfig{ //nolint:gosec // G101: test fixture with fake PAT
 			Token: "ghp_real_production_pat", // #nosec G101 -- test fixture, not a real PAT
 			Repo:  "Concord-Voice/Concord-Voice-Feedback",
 		},
+		// #1688 — admin WebAuthn production guards.
+		AdminWebAuthnRPID:           "admin.concordvoice.chat",
+		AdminWebAuthnRPOrigins:      []string{"https://admin.concordvoice.chat"},
+		AdminWebAuthnAllowedAAGUIDs: []string{"ee882879-721c-4913-9775-3dfcce97072a"},
 	}
 
 	err := cfg.validate()

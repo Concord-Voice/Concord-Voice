@@ -43,7 +43,7 @@ export function getRemoteSpaUrl(): string | null {
  * LOAD-BEARING INVARIANT: when this returns `'/'` (the flat Pages host), the
  * validators' `pathname.startsWith('/')` prefix is vacuously true, so the
  * self-heal sender-frame trust check collapses to pure origin-equality. That is
- * safe ONLY because `spa.example.com` is a DEDICATED, SPA-only origin —
+ * safe ONLY because `spa.concordvoice.chat` is a DEDICATED, SPA-only origin —
  * "same origin" ⟺ "the SPA", so there is no non-SPA same-origin frame to spoof
  * and the worst case is a bounded reload. If that origin ever co-hosts non-SPA
  * or embeddable content (a second app, marketing pages, a third-party widget),

@@ -1215,7 +1215,7 @@ func (h *Handler) GetPrivacySettings(c *gin.Context) {
 				SearchableByEmail:                   false,
 				SearchableByPhone:                   false,
 				AllowEmbeddedContent:                false,
-				LoadGifsAutomatically:               false,
+				LoadGifsAutomatically:               true, // #1766: default ON for new users (matches schema default after migration 000078)
 				EnableKlipyProxy:                    false,
 				SharePersonalizationWithGifProvider: true,
 			},

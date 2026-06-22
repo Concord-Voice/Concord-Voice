@@ -10,7 +10,7 @@ import (
 func TestCheckOrigin(t *testing.T) {
 	// NewHandler with nil deps is safe — only the allowedOrigins and
 	// upgrader fields are used by CheckOrigin.
-	h := NewHandler(nil, nil, nil, "", []string{"https://example.com"})
+	h := NewHandler(nil, nil, nil, "", []string{"https://concordvoice.chat"})
 
 	tests := []struct {
 		name   string
@@ -22,7 +22,7 @@ func TestCheckOrigin(t *testing.T) {
 		{"null origin (sandboxed iframe)", "null", true, false},
 		{"file:// origin (Electron desktop)", "file://", true, true},
 		{"file:///path origin (Electron desktop)", "file:///app/index.html", true, true},
-		{"allowed origin", "https://example.com", true, true},
+		{"allowed origin", "https://concordvoice.chat", true, true},
 		{"disallowed origin", "https://evil.com", true, false},
 	}
 

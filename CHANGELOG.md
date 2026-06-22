@@ -31,7 +31,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **RBAC / SBAC permissions system** ([#242](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/242)) — granular role-based access control with audit logging; closes #82. Context menu wired to roles in [#548](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/548).
 - **Object storage on MinIO** ([#325](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/325)) — user image assets migrated from PostgreSQL to S3-compatible storage with two-tier media access; closes #166.
 - **Server ownership transfer** ([#351](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/351)) — full lifecycle with MFA, email confirmation, reversal tokens; closes #244.
-- **Email verification on registration** ([#273](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/273)) — SMTP-based verification; later migrated from Proton SMTP to Resend with branded templates and `verify.example.com` subdomain.
+- **Email verification on registration** ([#273](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/273)) — SMTP-based verification; later migrated from Proton SMTP to Resend with branded templates and `verify.concordvoice.chat` subdomain.
 - **Pending registrations** ([#688](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/688)) — registration creates `pending_registrations` with a 15-minute TTL; closes #527 and #621.
 - **Chat enhancements (#168 series)** — message reactions ([#459](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/459)), reply / quote ([#463](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/463)), pinning ([#465](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/465)), E2EE-native search ([#468](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/468)), file & image attachments ([#470](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/470)), draft persistence ([#477](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/477)), desktop notifications ([#478](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/478)), keyboard shortcuts ([#479](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/479)), group DMs ([#472](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/472)), extended Markdown rendering ([#711](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/711)).
 - **Klipy GIF integration** ([#557](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/557)) — GIF search, picker, and privacy proxy through the control-plane; theme-aware logos and disclaimers.
@@ -44,7 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **SPA deployment pipeline** ([#429](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/429)) — file server, versioning, and GitHub Actions workflow for hot-update SPA bundles. SPA deploy contract added in [#773](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/773) coupling bundle-hash and handler-path.
 - **Bundled-SPA fallback (Option C)** ([#831](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/831), [#832](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/832), [#835](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/835)) — desktop client falls back to the bundled SPA on hot-update failure with the `app://` scheme, an Option C user-facing overlay, and IPC v9.
 - **WebSocket reconnect race fix + subscribe-barrier protocol** ([#769](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/769)) — closes #752.
-- **Self-hosted coturn STUN/TURN** ([#124](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/124)) — infrastructure for NAT traversal; cert isolation and `turn.example.com` SAN added in [#577](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/577).
+- **Self-hosted coturn STUN/TURN** ([#124](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/124)) — infrastructure for NAT traversal; cert isolation and `turn.concordvoice.chat` SAN added in [#577](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/577).
 - **Public Tier-1 media proxy** ([#570](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/570)) — unauthenticated access for public media assets.
 - **Token theft detection** ([#89](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/89)) — machine ID + IP binding with automatic revocation. Sessions capture real client IP via trusted-proxy CIDR allowlist in [#702](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/702).
 - **Proactive token refresh** ([#329](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/329)) — main-process JWT refresh before expiry; closes #240 and #254.
@@ -121,7 +121,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **`Error.cause` propagation closed** ([#714](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/714)) — `console.error` / `console.warn` no longer pass raw `Error` arguments through main-process logs; ESLint enforcement and a Vitest regression test added.
 - **Token-fingerprint leaks removed** ([#704](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/704)) — 10 token-suffix leaks in `tokenManager.ts` removed; ESLint warnings remediated and security rules promoted to error.
 - **External-link scheme tightened** ([#774](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/774)) — `setWindowOpenHandler` and `will-navigate` restricted to `https:`-only with ESLint drift defense; user-initiated `open-external` IPC retains the broader `http:` / `https:` / `mailto:` policy. Closes #754.
-- **electron-updater TLS certificate pinning** on `api.example.com` ([#719](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/719)).
+- **electron-updater TLS certificate pinning** on `api.concordvoice.chat` ([#719](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/719)).
 - **nginx hardening** — H2C smuggling vector closed; Host header injection blocked ([#525](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/525)).
 - **GitHub Actions shell injection** resolved (Semgrep) ([#523](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/523)).
 - **CORS hardening** — null/empty origin rejection, custom header validation ([#259](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/259)).
@@ -269,7 +269,7 @@ Tracking at time of v0.2.0-Beta release. For the full open-issue list, see [issu
 
 - **KLIPY GIF proxy routes** — Nested `/gifs` path prefix added to match client-side route expectations (#580)
 - **Copilot review feedback** — Addressed review comments from PR #577 (#579)
-- **coturn TLS hardening** — Certificate isolation, `turn.example.com` SAN added, certbot deploy hook wired
+- **coturn TLS hardening** — Certificate isolation, `turn.concordvoice.chat` SAN added, certbot deploy hook wired
 - **NATS single-node config** — Corrected NATS configuration; coturn TLS and external-IP wiring fixed
 
 ---
@@ -349,7 +349,7 @@ Tracking at time of v0.2.0-Beta release. For the full open-issue list, see [issu
 - **Message component decomposition** — `Message` component decomposed; shared types extracted for the Phase 2B chat rewrite (#451)
 - **DM thread list real-time updates** — `last_message` included in `dm_unread_notify` events for live thread list refresh (#541)
 - **Dependency bumps** — TypeScript 6.0.2, typescript-eslint 8.58, eslint 10.1, mediasoup, lucide-react 1.7.0, Electron, `@types/node`, `@playwright/test`, Go module group, Actions group, media-plane dev-tooling (#411, #414, #511, #528–#529, #532–#536, #538–#539)
-- **Email infrastructure** — Transactional email migrated from Proton SMTP to Resend; branded templates; `verify.example.com` subdomain
+- **Email infrastructure** — Transactional email migrated from Proton SMTP to Resend; branded templates; `verify.concordvoice.chat` subdomain
 - **CI pipeline hardening** — Semgrep SAST added; quality gates formalized; CI performance optimized with `sync.Once` migrations, test sharding, and caching (#457, #471)
 - **Go and TypeScript complexity reduction** — Cognitive complexity reduced across control-plane handlers and frontend/media-plane code (#418, #419, #498)
 - **DRY modal components** — Shared modal panels extracted to eliminate duplication (#365, #481)

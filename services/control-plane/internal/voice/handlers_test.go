@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
@@ -540,5 +541,146 @@ func TestUserDeafen(t *testing.T) {
 
 		w := ts.DoRequest("POST", voiceEnforcePath(serverID, target.ID, pathUserDeafen), nil, testhelpers.AuthHeaders(actor.AccessToken))
 		assert.Equal(t, http.StatusForbidden, w.Code)
+	})
+}
+
+// --- AuthorizeJoin media_entitlements Tests (#1300) ---
+
+// insertSubscription inserts an active subscription row for a user so that the
+// entitlement cache's read-through (ResolveTier) resolves the given tier. Mirrors
+// internal/entitlements/resolver_test.go insertSub.
+func insertSubscription(t *testing.T, ts *testhelpers.TestServer, userID, tier string) {
+	t.Helper()
+	_, err := ts.DB.Exec(
+		`INSERT INTO subscriptions (user_id, tier, status, source) VALUES ($1, $2, 'active', 'code')`,
+		userID, tier,
+	)
+	require.NoError(t, err)
+}
+
+// assertMediaEntitlements asserts the media_entitlements object on a join-authorize
+// response body matches the entitlements.MediaFor(tier) source of truth.
+func assertMediaEntitlements(t *testing.T, body map[string]interface{}, tier string) {
+	t.Helper()
+	me, ok := body["media_entitlements"].(map[string]interface{})
+	require.True(t, ok, "media_entitlements present and is an object")
+
+	want := entitlements.MediaFor(tier)
+	assert.Equal(t, want.Tier, me["tier"], "tier")
+	assert.EqualValues(t, want.MinPtimeMs, me["min_ptime_ms"], "min_ptime_ms")
+	assert.EqualValues(t, want.MaxManualBitrateBps, me["max_manual_bitrate_bps"], "max_manual_bitrate_bps")
+
+	rawTiers, ok := me["allowed_audio_tiers"].([]interface{})
+	require.True(t, ok, "allowed_audio_tiers is an array")
+	gotTiers := make([]string, len(rawTiers))
+	for i, v := range rawTiers {
+		gotTiers[i] = v.(string)
+	}
+	assert.Equal(t, want.AllowedAudioTiers, gotTiers, "allowed_audio_tiers")
+}
+
+func TestAuthorizeJoin_MediaEntitlements(t *testing.T) {
+	t.Run("FreeUserGetsFreeCaps", func(t *testing.T) {
+		ts := setupTS(t)
+		owner := ts.CreateTestUser(t, "me_free_owner")
+		member := ts.CreateTestUser(t, "me_free_member")
+		serverID := ts.CreateTestServer(t, owner.ID, "ME Free Server")
+		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-me-free")
+
+		// No subscription row → fail-closed to free.
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assertMediaEntitlements(t, body, entitlements.TierFree)
+
+		// Spot-check the exact free floor the media-plane depends on.
+		me := body["media_entitlements"].(map[string]interface{})
+		assert.Equal(t, "free", me["tier"])
+		assert.EqualValues(t, 20, me["min_ptime_ms"])
+		assert.EqualValues(t, 5000000, me["max_manual_bitrate_bps"])
+		rawTiers := me["allowed_audio_tiers"].([]interface{})
+		require.NotEmpty(t, rawTiers)
+		assert.Equal(t, "minimum", rawTiers[0])
+		assert.Equal(t, "standard", rawTiers[len(rawTiers)-1])
+	})
+
+	t.Run("PremiumUserGetsPremiumCaps", func(t *testing.T) {
+		ts := setupTS(t)
+		owner := ts.CreateTestUser(t, "me_prem_owner")
+		member := ts.CreateTestUser(t, "me_prem_member")
+		serverID := ts.CreateTestServer(t, owner.ID, "ME Premium Server")
+		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-me-prem")
+
+		insertSubscription(t, ts, member.ID, entitlements.TierPremium)
+
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assertMediaEntitlements(t, body, entitlements.TierPremium)
+
+		me := body["media_entitlements"].(map[string]interface{})
+		assert.Equal(t, "premium", me["tier"])
+		assert.EqualValues(t, 10, me["min_ptime_ms"])
+		assert.EqualValues(t, 10000000, me["max_manual_bitrate_bps"])
+	})
+
+	t.Run("NoActiveSubscriptionFailsClosedToFree", func(t *testing.T) {
+		ts := setupTS(t)
+		owner := ts.CreateTestUser(t, "me_canceled_owner")
+		member := ts.CreateTestUser(t, "me_canceled_member")
+		serverID := ts.CreateTestServer(t, owner.ID, "ME Canceled Server")
+		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-me-canceled")
+
+		// A canceled premium subscription is NOT active → ResolveTier returns free.
+		_, err := ts.DB.Exec(
+			`INSERT INTO subscriptions (user_id, tier, status, source) VALUES ($1, 'premium', 'canceled', 'code')`,
+			member.ID,
+		)
+		require.NoError(t, err)
+
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assertMediaEntitlements(t, body, entitlements.TierFree)
+	})
+
+	t.Run("TierResolvedFromAuthenticatedUserNotBody", func(t *testing.T) {
+		// The premium subscription belongs to OWNER. MEMBER (a free user) joins and
+		// supplies a body claiming owner's id + tier=premium. The handler must resolve
+		// the tier from the authenticated member (free), ignoring any body value.
+		ts := setupTS(t)
+		owner := ts.CreateTestUser(t, "me_auth_owner")
+		member := ts.CreateTestUser(t, "me_auth_member")
+		serverID := ts.CreateTestServer(t, owner.ID, "ME Auth Server")
+		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-me-auth")
+
+		insertSubscription(t, ts, owner.ID, entitlements.TierPremium)
+
+		// Hostile body: claim the premium owner's id and a premium tier directly.
+		body := map[string]interface{}{
+			"user_id":            owner.ID,
+			"tier":               "premium",
+			"media_entitlements": map[string]interface{}{"tier": "premium", "max_manual_bitrate_bps": 99999999},
+		}
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, body, testhelpers.AuthHeaders(member.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+
+		var resp map[string]interface{}
+		testhelpers.ParseJSON(t, w, &resp)
+		// Resolved from the authenticated member (free), NOT the body-claimed premium.
+		assertMediaEntitlements(t, resp, entitlements.TierFree)
+		me := resp["media_entitlements"].(map[string]interface{})
+		assert.Equal(t, "free", me["tier"], "tier must come from the JWT user, not the request body")
+		assert.EqualValues(t, 5000000, me["max_manual_bitrate_bps"], "body cannot raise the bitrate cap")
 	})
 }

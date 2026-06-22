@@ -1306,7 +1306,7 @@ the extent that:
   infrastructure (for example, the Concord Public Directory listing
   service, if you opt into it).
 - You separately interact with Concord Voice LLC's hosted Service
-  (example.com) — for example, by creating an account.
+  (concordvoice.chat) — for example, by creating an account.
 - You purchase a Commercial License (Enterprise or MSP/OEM) and Concord
   Voice LLC processes information about you as part of the licensing
   and support relationship.

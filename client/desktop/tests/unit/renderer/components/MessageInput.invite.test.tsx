@@ -79,7 +79,7 @@ describe('MessageInput — invite affordance', () => {
     const textarea = screen.getByRole('textbox');
     await waitFor(() =>
       expect((textarea as HTMLTextAreaElement).value).toContain(
-        'https://invite.example.com/GHJKMNPQ'
+        'https://invite.concordvoice.chat/GHJKMNPQ'
       )
     );
   });

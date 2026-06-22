@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	originMain = "https://example.com"
-	originApp  = "https://app.example.com"
+	originMain = "https://concordvoice.chat"
+	originApp  = "https://app.concordvoice.chat"
 	originFile = "file://"
 )
 

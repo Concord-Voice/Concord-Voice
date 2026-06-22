@@ -15,6 +15,15 @@ const mockGetUpdateLogPath = vi
   .fn()
   .mockResolvedValue('/Users/test/Library/Logs/ConcordVoice/update-2026-03-25.log');
 
+// SPA (UI) update axis mocks — default: on remote, up to date.
+const mockSpaCheckForUpdate = vi.fn().mockResolvedValue({
+  currentMode: 'remote',
+  remoteAvailable: true,
+  newerBytesAvailable: false,
+  reason: 'remote SPA compatible',
+});
+const mockSpaReloadLatest = vi.fn().mockResolvedValue({ mode: 'remote', changed: true });
+
 beforeEach(() => {
   // window.electron is already defined as writable in setup.ts — just assign
   (window as any).electron = {
@@ -37,6 +46,10 @@ beforeEach(() => {
     setDeveloperMode: mockSetDeveloperMode,
     writeClipboard: mockWriteClipboard,
     getUpdateLogPath: mockGetUpdateLogPath,
+    spaUpdate: {
+      checkForUpdate: mockSpaCheckForUpdate,
+      reloadLatest: mockSpaReloadLatest,
+    },
     onUpdateAvailable: vi.fn((cb) => {
       eventCallbacks.updateAvailable = cb;
       return vi.fn();
@@ -353,5 +366,66 @@ describe('AboutUpdateSection', () => {
       expect(screen.getByText('App Version')).toBeInTheDocument();
     });
     expect(screen.queryByText('Update Log')).toBeNull();
+  });
+
+  // ── SPA (UI) update axis ────────────────────────────────────────────────
+  it('shows "up to date" for a remote SPA with no newer bytes (default)', async () => {
+    render(<AboutUpdateSection />);
+    await vi.waitFor(() => {
+      expect(screen.getByText('✓ Up to date')).toBeInTheDocument();
+    });
+    expect(screen.queryByRole('button', { name: /Load latest UI/ })).toBeNull();
+  });
+
+  it('shows the offline-fallback notice + a Load latest UI button when on bundled', async () => {
+    mockSpaCheckForUpdate.mockResolvedValueOnce({
+      currentMode: 'bundled',
+      remoteAvailable: true,
+      newerBytesAvailable: null,
+      reason: 'config fetch failed: timeout after 5000ms',
+    });
+    render(<AboutUpdateSection />);
+    await vi.waitFor(() => {
+      expect(screen.getByText('Offline fallback UI')).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: /Load latest UI/ })).toBeInTheDocument();
+  });
+
+  it('clicking "Load latest UI" calls spaUpdate.reloadLatest', async () => {
+    mockSpaCheckForUpdate.mockResolvedValueOnce({
+      currentMode: 'bundled',
+      remoteAvailable: true,
+      newerBytesAvailable: null,
+      reason: 'config fetch failed: timeout after 5000ms',
+    });
+    render(<AboutUpdateSection />);
+    const btn = await screen.findByRole('button', { name: /Load latest UI/ });
+    fireEvent.click(btn);
+    await vi.waitFor(() => {
+      expect(mockSpaReloadLatest).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('shows "newer UI available" + button for a remote SPA with newer bytes', async () => {
+    mockSpaCheckForUpdate.mockResolvedValueOnce({
+      currentMode: 'remote',
+      remoteAvailable: true,
+      newerBytesAvailable: true,
+      reason: 'remote SPA compatible',
+    });
+    render(<AboutUpdateSection />);
+    await vi.waitFor(() => {
+      expect(screen.getByText('Newer UI available')).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: /Load latest UI/ })).toBeInTheDocument();
+  });
+
+  it('degrades to an actionable error state when the SPA check fails', async () => {
+    mockSpaCheckForUpdate.mockRejectedValueOnce(new Error('ipc failed'));
+    render(<AboutUpdateSection />);
+    await vi.waitFor(() => {
+      expect(screen.getByText("Couldn't check")).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: /Load latest UI/ })).toBeInTheDocument();
   });
 });

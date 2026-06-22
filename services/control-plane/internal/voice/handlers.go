@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
@@ -27,22 +28,41 @@ type Handler struct {
 	resolver  *rbac.Resolver
 	nats      *natsclient.Client
 	audit     *rbac.AuditWriter
+	entCache  *entitlements.Cache
 	tempGrant *tempGrantManager
 }
 
-// NewHandler creates a new voice handler. audit may be nil (the move audit entry is
-// then skipped — used by lightweight test constructions); production wiring passes
-// the shared rbac.AuditWriter so hierarchy-crossing moves are recorded (#487 §6.1).
-func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, cfg *config.Config, resolver *rbac.Resolver, nats *natsclient.Client, audit *rbac.AuditWriter) *Handler {
+// HandlerDeps groups the dependencies required to construct a Handler.
+//
+// Audit may be nil (the move audit entry is then skipped — used by lightweight
+// test constructions); production wiring passes the shared rbac.AuditWriter so
+// hierarchy-crossing moves are recorded (#487 §6.1). EntCache is the shared
+// entitlement-tier cache (#1296) used to resolve the joining user's media
+// entitlements (#1300); production wiring passes the same instance the auth
+// handler receives.
+type HandlerDeps struct {
+	DB       *sql.DB
+	Log      *logger.Logger
+	Hub      *websocket.Hub
+	Cfg      *config.Config
+	Resolver *rbac.Resolver
+	NATS     *natsclient.Client
+	Audit    *rbac.AuditWriter
+	EntCache *entitlements.Cache
+}
+
+// NewHandler creates a new voice handler.
+func NewHandler(deps HandlerDeps) *Handler {
 	return &Handler{
-		db:        db,
-		log:       log,
-		hub:       hub,
-		cfg:       cfg,
-		resolver:  resolver,
-		nats:      nats,
-		audit:     audit,
-		tempGrant: newTempGrantManager(db, log, hub, resolver, nats),
+		db:        deps.DB,
+		log:       deps.Log,
+		hub:       deps.Hub,
+		cfg:       deps.Cfg,
+		resolver:  deps.Resolver,
+		nats:      deps.NATS,
+		audit:     deps.Audit,
+		entCache:  deps.EntCache,
+		tempGrant: newTempGrantManager(deps.DB, deps.Log, deps.Hub, deps.Resolver, deps.NATS),
 	}
 }
 
@@ -196,15 +216,23 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 		return
 	}
 
-	h.log.Info("Voice join authorized", "user_id", userID, "channel_id", channelID, "server_id", serverID)
+	// Resolve the joining user's media entitlements server-side from the
+	// AUTHENTICATED user_id (never a client value). GetTier fails closed to the
+	// free tier on any resolution failure, and MediaFor → For("") returns the free
+	// caps for an unknown/empty tier, so a tier-resolution problem degrades to the
+	// free floor without ever blocking the join or granting premium (#1300 §3/§5).
+	mediaEnt := entitlements.MediaFor(h.entCache.GetTier(c.Request.Context(), userID))
+
+	h.log.Info("Voice join authorized", "user_id", userID, "channel_id", channelID, "server_id", serverID, "media_tier", mediaEnt.Tier)
 
 	c.JSON(http.StatusOK, gin.H{
-		"allowed":          true,
-		"media_server_url": h.cfg.MediaPlaneURL,
-		"ice_servers":      h.cfg.ICEServers(userID),
-		"permissions":      strconv.FormatInt(int64(effectivePerms), 10),
-		"server_muted":     serverMuted,
-		"server_deafened":  serverDeafened,
+		"allowed":            true,
+		"media_server_url":   h.cfg.MediaPlaneURL,
+		"ice_servers":        h.cfg.ICEServers(userID),
+		"permissions":        strconv.FormatInt(int64(effectivePerms), 10),
+		"server_muted":       serverMuted,
+		"server_deafened":    serverDeafened,
+		"media_entitlements": mediaEnt,
 		"channel": gin.H{
 			"id":                 channelID,
 			"name":               channelName,

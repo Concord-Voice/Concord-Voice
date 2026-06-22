@@ -66,6 +66,42 @@ const SubmitSuccessLink: React.FC<{ url: string }> = ({ url }) => (
   </p>
 );
 
+/** Public Known Issues tracker — the pinned issue in the public repo. */
+const KNOWN_ISSUES_URL = 'https://github.com/Concord-Voice/Concord-Voice/issues/39';
+
+/**
+ * Pre-submit "before you file" notice linking the public Known Issues tracker.
+ * Rendered above both panel forms (so it shows in Bug and Feature modes from a
+ * single site) and hidden once a submit succeeds — it's a nudge to check for an
+ * existing report, not a post-submit message. Beyond pointing at the list, it
+ * tells users they can comment on an existing issue for visibility or 👍-react
+ * to bump its report count; the /feedback-triage skill tallies those reactions
+ * automatically. The link reuses the validated openExternal path (https-only,
+ * sender-frame checked in the main process), with target/rel as a safe
+ * fallback if the bridge is unavailable — same shape as SubmitSuccessLink.
+ */
+const KnownIssuesNotice: React.FC = () => (
+  <div className="feedback-known-issues">
+    <p>
+      <strong>Before you submit:</strong> check our{' '}
+      <a
+        href={KNOWN_ISSUES_URL}
+        target="_blank"
+        rel="noopener noreferrer"
+        onClick={(e) => {
+          e.preventDefault();
+          void globalThis.electron?.openExternal?.(KNOWN_ISSUES_URL);
+        }}
+      >
+        Known Issues
+      </a>{' '}
+      list first — your bug or request may already be tracked. If it is, sign in to GitHub and
+      comment on the issue to add detail and visibility, or give it a 👍 reaction to bump its report
+      count. We tally those reactions automatically, so even a reaction helps.
+    </p>
+  </div>
+);
+
 const FeedbackModal: React.FC<FeedbackModalProps> = ({ isOpen, onClose, initialMode = 'bug' }) => {
   const [mode, setMode] = useState<FeedbackMode>(initialMode);
   const [submitState, setSubmitState] = useState<SubmitState>({ status: 'idle' });
@@ -194,6 +230,10 @@ const FeedbackModal: React.FC<FeedbackModalProps> = ({ isOpen, onClose, initialM
           id={PANEL_ID}
           aria-labelledby={tabIdFor(mode)}
         >
+          {/* Known Issues nudge — shown above both forms, hidden on the
+              success surface (it's a pre-submit prompt). */}
+          {submitState.status !== 'success' && <KnownIssuesNotice />}
+
           {/* Bug mode — real form (#159). Hidden on success so the "thank
               you" surface reads cleanly; on error the form stays mounted so
               the user can retry without re-typing. */}

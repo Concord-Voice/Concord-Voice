@@ -26,7 +26,7 @@ import {
 const mockNet = net as unknown as { fetch: ReturnType<typeof vi.fn> };
 const mockCollect = collectAttestationSignals as unknown as ReturnType<typeof vi.fn>;
 
-const BASE_URL = 'https://api.example.com';
+const BASE_URL = 'https://api.concordvoice.chat';
 const JWT = 'test-jwt-123';
 const SESSION_ID = 'test-session-456';
 

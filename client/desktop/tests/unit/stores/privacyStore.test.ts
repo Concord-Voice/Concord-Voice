@@ -27,6 +27,8 @@ describe('privacyStore', () => {
     expect(settings.searchableByEmail).toBe(false);
     expect(settings.searchableByPhone).toBe(false);
     expect(settings.allowEmbeddedContent).toBe(false);
+    // #1766: GIF auto-load defaults ON for new users.
+    expect(settings.loadGifsAutomatically).toBe(true);
   });
 
   it('fetchPrivacy loads settings from API', async () => {

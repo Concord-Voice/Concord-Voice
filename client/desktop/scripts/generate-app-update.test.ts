@@ -9,9 +9,9 @@ describe('UPDATE_ENDPOINT_URL', () => {
     expect(UPDATE_ENDPOINT_URL.startsWith('https://')).toBe(true);
   });
 
-  it('points at api.example.com', () => {
+  it('points at api.concordvoice.chat', () => {
     const parsed = new URL(UPDATE_ENDPOINT_URL);
-    expect(parsed.host).toBe('api.example.com');
+    expect(parsed.host).toBe('api.concordvoice.chat');
   });
 
   it('targets the /api/v1/updates path', () => {

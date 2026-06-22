@@ -14,17 +14,17 @@ import { stripLoopbackCspEntries } from '../../scripts/csp-prod-strip';
 
 describe('stripLoopbackCspEntries', () => {
   it('removes http://localhost:* from the CSP', () => {
-    const input = `img-src 'self' http://localhost:* https://example.com;`;
+    const input = `img-src 'self' http://localhost:* https://concordvoice.chat;`;
     const result = stripLoopbackCspEntries(input);
     expect(result).not.toContain('http://localhost:*');
-    expect(result).toContain('https://example.com');
+    expect(result).toContain('https://concordvoice.chat');
   });
 
   it('removes http://127.0.0.1:* from the CSP', () => {
-    const input = `img-src 'self' http://127.0.0.1:* https://example.com;`;
+    const input = `img-src 'self' http://127.0.0.1:* https://concordvoice.chat;`;
     const result = stripLoopbackCspEntries(input);
     expect(result).not.toContain('http://127.0.0.1:*');
-    expect(result).toContain('https://example.com');
+    expect(result).toContain('https://concordvoice.chat');
   });
 
   it('removes all WebSocket loopback variants from connect-src', () => {
@@ -37,27 +37,27 @@ describe('stripLoopbackCspEntries', () => {
       '://localhost:* ws',
       '://127.0.0.1:*',
     ].join('');
-    const cspLine = `connect-src 'self' ${input} https://example.com;`;
+    const cspLine = `connect-src 'self' ${input} https://concordvoice.chat;`;
     const result = stripLoopbackCspEntries(cspLine);
     expect(result).not.toContain('localhost');
     expect(result).not.toContain('127.0.0.1');
-    expect(result).toContain('https://example.com');
+    expect(result).toContain('https://concordvoice.chat');
   });
 
   it('is idempotent — re-running on stripped output is a no-op', () => {
-    const input = `img-src 'self' http://localhost:* https://example.com;`;
+    const input = `img-src 'self' http://localhost:* https://concordvoice.chat;`;
     const once = stripLoopbackCspEntries(input);
     const twice = stripLoopbackCspEntries(once);
     expect(twice).toBe(once);
   });
 
   it('leaves non-loopback CSP entries unchanged', () => {
-    const input = `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; img-src 'self' data: blob: https://cdn.jsdelivr.net https://*.example.com;`;
+    const input = `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; img-src 'self' data: blob: https://cdn.jsdelivr.net https://*.concordvoice.chat;`;
     expect(stripLoopbackCspEntries(input)).toBe(input);
   });
 
   it('preserves CSP structure (semicolons + directive boundaries) when stripping', () => {
-    const input = `connect-src 'self' http://localhost:* https://example.com; img-src 'self' http://localhost:*;`;
+    const input = `connect-src 'self' http://localhost:* https://concordvoice.chat; img-src 'self' http://localhost:*;`;
     const result = stripLoopbackCspEntries(input);
     // Both directives still present, both still terminated with a semicolon.
     expect(result).toMatch(/connect-src\s+'self'\s+https:\/\/concordvoice\.chat\s*;/);
@@ -76,8 +76,8 @@ describe('stripLoopbackCspEntries', () => {
     });
 
     it('preserves the public production origins', () => {
-      expect(stripped).toContain('https://example.com');
-      expect(stripped).toContain('https://*.example.com');
+      expect(stripped).toContain('https://concordvoice.chat');
+      expect(stripped).toContain('https://*.concordvoice.chat');
     });
 
     it('preserves the renderer scaffold (root div, main.tsx entry, etc.)', () => {

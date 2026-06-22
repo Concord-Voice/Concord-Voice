@@ -31,18 +31,18 @@ describe('clientConfigStore', () => {
     useClientConfigStore.getState().setConfig({
       minVersion: '0.2.0',
       featureFlags: { gifsEnabled: true },
-      mediaPlaneUrl: 'https://media.example.com',
-      turn: { host: 'turn.example.com', realm: 'concord' },
-      spaUrl: 'https://app.example.com',
+      mediaPlaneUrl: 'https://media.concordvoice.chat',
+      turn: { host: 'turn.concordvoice.chat', realm: 'concord' },
+      spaUrl: 'https://app.concordvoice.chat',
       spaIpcContract: 3,
     });
 
     const state = useClientConfigStore.getState();
     expect(state.minVersion).toBe('0.2.0');
     expect(state.featureFlags.gifsEnabled).toBe(true);
-    expect(state.mediaPlaneUrl).toBe('https://media.example.com');
-    expect(state.turn.host).toBe('turn.example.com');
-    expect(state.spaUrl).toBe('https://app.example.com');
+    expect(state.mediaPlaneUrl).toBe('https://media.concordvoice.chat');
+    expect(state.turn.host).toBe('turn.concordvoice.chat');
+    expect(state.spaUrl).toBe('https://app.concordvoice.chat');
     expect(state.spaIpcContract).toBe(3);
     expect(state.lastFetchedAt).toBeGreaterThanOrEqual(before);
   });

@@ -50,7 +50,7 @@ info:
 servers:
 - url: http://localhost:8080/api/v1
   description: Local development
-- url: https://api.example.com/api/v1
+- url: https://api.concordvoice.chat/api/v1
   description: Production
 tags:
 - name: Age Verification
@@ -4569,6 +4569,224 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '502':
           description: GitHub API call failed (only on the non-dev path)
+  /redeem:
+    post:
+      tags:
+      - Redemption
+      summary: Redeem a code for the authenticated user
+      description: 'Redeem a universal redemption code (#1303). The engine checksum-filters
+        the input, hashes it, and runs an atomic conditional `UPDATE … RETURNING` that
+        claims the code only if it is live and under its redemption cap — double-spend-safe
+        under concurrency. A `premium:subscription` grant creates/extends the user''s
+        subscription and pushes `entitlements_changed` so the client updates live.
+
+
+        No-oracle property: invalid, not-found, expired, exhausted, revoked, and bad-checksum
+        all return the SAME generic 400 body — the client can never learn WHICH condition
+        failed, only that the code is not valid. The code value and its hash are NEVER
+        logged (only the outcome category + a sanitized user id).
+
+
+        Rate limit: 10 requests per minute (per user) AND 20 requests per minute (per
+        IP) — anti-abuse/enumeration layers; the 130-bit code entropy is the primary
+        defense.
+
+        '
+      operationId: redeemCode
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - code
+              properties:
+                code:
+                  type: string
+                  description: The redemption code as shown to the user (prefix + grouped
+                    plaintext, e.g. `KS-XXXX-XXXX-XXXX`). Normalized and checksum-validated
+                    server-side.
+      responses:
+        '200':
+          description: Code redeemed; the grant has been applied
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - success
+                - description
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  description:
+                    type: string
+                    description: Human-readable summary of the applied grant (e.g. `Premium
+                      subscription extended by 12 months`).
+        '400':
+          description: 'The code is not valid (generic — no oracle). Covers bad checksum,
+            not found, revoked, expired, not-yet-valid, exhausted, and unknown grant_kind;
+            also returned when the request body omits `code`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid Bearer token
+        '409':
+          description: The authenticated user has already redeemed this code (idempotent;
+            not an oracle — reflects only this user's own prior redemption).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: The code could not be redeemed right now (infrastructure error).
+            If a grant landed post-commit it is durable and surfaces on the next entitlements
+            fetch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /admin/redemption/codes:
+    post:
+      tags:
+      - Redemption
+      summary: Generate redemption codes (admin issuer)
+      description: 'Mint a batch of universal redemption codes (#1303). Returns the minted
+        plaintext codes ONCE — they are never persisted server-side (only the SHA-256
+        hash is stored) and cannot be re-fetched. Every generation writes an audit row
+        (issuer, context, grant_kind, count, batch_id) in the same transaction; the audit
+        row holds no plaintext or hash.
+
+
+        Authorization: gated by the `X-Admin-Token` shared secret (constant-time compared)
+        BEFORE the handler runs, in addition to normal Bearer auth. INTERIM issuer-authz
+        — no platform-admin RBAC role exists yet (see the AdminTokenAuth security scheme).
+        When REDEMPTION_ADMIN_TOKEN is unset the endpoint is DISABLED and returns 503.
+
+
+        Batch size is capped at 10,000 codes per request (`MaxBatchSize`) — both a usability
+        guard and a memory-exhaustion bound on the per-request allocation; larger campaigns
+        issue multiple batches.
+
+
+        Rate limit: 30 requests per minute (per user).
+
+        '
+      operationId: generateRedemptionCodes
+      security:
+      - BearerAuth: []
+        AdminTokenAuth: []  # AND semantics: both Bearer auth AND the X-Admin-Token gate are required
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - grant_kind
+              - count
+              properties:
+                grant_kind:
+                  type: string
+                  description: 'Catalog key for the grant effect (e.g. `premium:subscription`,
+                    `feature:custom_themes`, `cosmetic:founder_badge`). Rejected with
+                    400 if not supported by this binary.'
+                grant_params:
+                  type: object
+                  additionalProperties: true
+                  description: 'Effect parameters (e.g. `{"months": 12}` for `premium:subscription`).
+                    Defaults to `{}`.'
+                count:
+                  type: integer
+                  minimum: 1
+                  maximum: 10000
+                  description: Number of codes to mint. Must be ≥1 and ≤10000 (`MaxBatchSize`);
+                    out-of-range values are rejected with 400.
+                prefix:
+                  type: string
+                  maxLength: 16
+                  description: Non-secret support handle prepended to each code (e.g.
+                    `KS`, `PROMO`).
+                single_use:
+                  type: boolean
+                  default: true
+                  description: 'When true (default), each code is a one-off (max_redemptions=1).
+                    Set false for multi-use promotional codes.'
+                max_redemptions:
+                  type: integer
+                  minimum: 1
+                  nullable: true
+                  description: 'Per-code redemption cap. Null = unlimited (promotional);
+                    an unlimited, non-single-use code MUST carry `expires_at`.'
+                expires_at:
+                  type: string
+                  format: date-time
+                  nullable: true
+                  description: Hard expiry (RFC 3339). Required for unlimited promotional
+                    codes.
+                batch_id:
+                  type: string
+                  maxLength: 64
+                  description: Shared campaign label across the batch (audit + bulk-revoke
+                    handle).
+      responses:
+        '201':
+          description: Codes minted; plaintexts returned ONCE
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - count
+                - codes
+                properties:
+                  count:
+                    type: integer
+                    description: Number of codes minted.
+                  grant_kind:
+                    type: string
+                  batch_id:
+                    type: string
+                  codes:
+                    type: array
+                    items:
+                      type: string
+                    description: The minted plaintext codes — the ONLY time they are
+                      returned; persist immediately.
+        '400':
+          description: 'Invalid request body or issuer-validation failure — unsupported
+            grant_kind, count out of range (≤0 or >10000), prefix/batch_id too long,
+            or an unlimited promo missing expires_at. Carries a precise message (admin
+            side — no no-oracle concern).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid Bearer token
+        '403':
+          description: Missing or incorrect X-Admin-Token (issuer-authorization denied).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: The code-generation endpoint is disabled (REDEMPTION_ADMIN_TOKEN
+            is unset on this server).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /friends:
     get:
       tags:
@@ -11690,6 +11908,15 @@ components:
       in: cookie
       name: refresh_token
       description: HttpOnly refresh token cookie (30-day expiry)
+    AdminTokenAuth:
+      type: apiKey
+      in: header
+      name: X-Admin-Token
+      description: 'Shared-secret issuer-authorization gate for the redemption code-generation
+        endpoint (#1303). Constant-time compared against the server''s REDEMPTION_ADMIN_TOKEN.
+        INTERIM primitive — there is no platform-admin RBAC role in the codebase yet
+        (Role is per-server only); this is the closest existing privileged-auth gate.
+        When REDEMPTION_ADMIN_TOKEN is unset the endpoint is disabled (503).'
   parameters:
     ServerId:
       name: id

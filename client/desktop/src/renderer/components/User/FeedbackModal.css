@@ -78,6 +78,27 @@
   padding: 1px 4px;
 }
 
+/* ─── Known Issues notice (pre-submit nudge) ────────────────────────────── */
+
+.feedback-known-issues {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px 14px;
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.5;
+}
+
+.feedback-known-issues p {
+  margin: 0;
+}
+
+.feedback-known-issues a {
+  color: var(--link-color);
+  text-decoration: underline;
+}
+
 /* ─── Submit state surfaces ─────────────────────────────────────────────── */
 
 /* Polite live region (#159). Kept in the DOM even when empty so an

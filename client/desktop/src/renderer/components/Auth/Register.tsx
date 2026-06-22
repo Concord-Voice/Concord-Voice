@@ -315,7 +315,7 @@ const Register: React.FC<RegisterProps> = ({ onBack, onSuccess, onSwitchToLogin 
             />
             {errors.username && <span className="form-error">{errors.username}</span>}
             <span className="form-hint">
-              This will be your identity: {formData.username || 'username'}@example.com
+              This will be your identity: {formData.username || 'username'}@concordvoice.chat
             </span>
           </div>
 

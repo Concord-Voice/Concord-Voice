@@ -15,7 +15,7 @@
 
 ## Overview
 
-[Concord Voice](https://example.com) is source-available software
+[Concord Voice](https://concordvoice.chat) is source-available software
 governed by the [Concord Voice Source License 1.0](../../LICENSE) (the
 "License" or "CVSL"). The License grants free use of the Concord Voice
 source code for personal and non-profit purposes. Use of the source code
@@ -31,7 +31,7 @@ tracks, designed for two different kinds of organization:
   technology partners offering Concord Voice as part of their own
   product or service portfolio.
 
-Hosted use of the Concord Voice Service at example.com is governed
+Hosted use of the Concord Voice Service at concordvoice.chat is governed
 by the [Terms of Service](terms-of-service.md), not by the CVSL.
 
 ## When Do You Need a Commercial License?
@@ -43,7 +43,7 @@ by the [Terms of Service](terms-of-service.md), not by the CVSL.
 | You are an educational institution using Concord Voice for educational purposes | **No commercial license needed.** Educational use qualifies as Non-Profit Use. |
 | You are a for-profit business, public agency, or governmental entity deploying Concord Voice on your own infrastructure for internal use | **Enterprise track.** See below. |
 | You are a managed service provider, hosting company, or technology partner offering Concord Voice (with your branding or ours) to your own customers | **MSP & OEM track.** See below. |
-| You are using the hosted example.com Service (not self-hosting) | **No commercial license needed.** Your access is governed by the [Terms of Service](terms-of-service.md). |
+| You are using the hosted concordvoice.chat Service (not self-hosting) | **No commercial license needed.** Your access is governed by the [Terms of Service](terms-of-service.md). |
 | You want to build a product or service that competes with Concord Voice | **Not permitted.** Section 4 of the CVSL prohibits Competing Use regardless of commercial license status, unless expressly authorized in writing. |
 
 If you are unsure which track applies, contact us at
@@ -228,7 +228,7 @@ production-adjacent environment, contact
 ## Concord Voice Service (Hosted SaaS)
 
 Use of the hosted Concord Voice Service at
-[example.com](https://example.com) is governed by the
+[concordvoice.chat](https://concordvoice.chat) is governed by the
 [Terms of Service](terms-of-service.md), not by the License. Hosted
 Service use does not require a separate commercial license; subscription
 fees for the Service are described separately at
@@ -335,12 +335,12 @@ If you fork to develop a competing platform, your fork is in violation
 of Section 4 of the License regardless of whether you publish or
 distribute the fork.
 
-### Does my custom client connect to example.com?
+### Does my custom client connect to concordvoice.chat?
 
 No. Per Section 4 of the [Terms of Service](terms-of-service.md),
 access to the hosted Concord Voice Service is permitted only through
 official Concord Voice client software. Custom clients may not connect
-to example.com.
+to concordvoice.chat.
 
 Custom clients **are** permitted for self-hosted deployments — if you
 self-host Concord Voice under a commercial license (or under personal/

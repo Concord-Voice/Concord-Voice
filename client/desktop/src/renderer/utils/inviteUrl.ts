@@ -1,5 +1,5 @@
 /** Canonical public host for invite links (Slice 2 will serve a landing page here). */
-export const INVITE_HOST = 'invite.example.com';
+export const INVITE_HOST = 'invite.concordvoice.chat';
 
 /**
  * 8 chars from the ambiguity-stripped charset in
@@ -20,7 +20,7 @@ export function buildInviteUrl(code: string): string {
 
 /**
  * Find canonical invite-link codes in free text. ONLY exact-host
- * `https://invite.example.com/{code}` URLs match (host parsed via the URL
+ * `https://invite.concordvoice.chat/{code}` URLs match (host parsed via the URL
  * API for exactness — no bare codes, no look-alike hosts, https only). Deduped,
  * capped (default 3) — the anti-probing / anti-amplification rule.
  */

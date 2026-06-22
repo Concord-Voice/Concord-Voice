@@ -69,15 +69,23 @@ import {
   type SentinelResult,
 } from './updateSafety';
 import { resolveAppProtocolPath } from './appProtocol';
-import { resolveSpaSource, isUnexpectedBundled, captureSpaHash } from './spaLoader';
+import {
+  resolveSpaSource,
+  isUnexpectedBundled,
+  captureSpaHash,
+  hashEntryHtml,
+  type SpaLoadDecision,
+} from './spaLoader';
 import { handleDidFailLoad, handleSpaRequestSelfHeal } from './spaSelfHealMainFrame';
 import { buildRemotePipUrl, isValidPipOpenSender } from './pipUrl';
 import {
   getRemoteSpaBaseDir,
   getRemoteSpaBaseUrl,
   getRemoteSpaUrl,
+  getSpaHash,
   setRemoteSpaState,
 } from './spaState';
+import { isPermittedFrameUrl } from './ipc/frameValidation';
 import { IPC_CONTRACT_VERSION } from './ipcContract';
 import { registerIpcHandlers as registerPermissionHandlers } from './permissionManager';
 import { migrateUserData } from './userDataMigration';
@@ -207,13 +215,18 @@ async function loadDevRendererWithFallback(
 }
 
 /**
- * Load the packaged renderer: try the remote SPA first (Tier 3), fall back
- * to the bundled file on any failure. Extracted to keep createWindow simple.
+ * Apply a resolved SPA decision to a live window. Sets the remote-SPA state
+ * BEFORE loadURL — load-bearing so the will-navigate gate, PiP, openExternal,
+ * SSO, and versionInfo origin consumers key on the ACTUAL loaded origin — then
+ * navigates and best-effort-captures the entry HTML hash. Fails closed to the
+ * bundled app:// scheme on any remote-load failure. Shared by the launch path
+ * (loadPackagedRenderer) and the runtime `spa:reloadLatest` handler so the two
+ * can never drift. Returns the mode actually loaded.
  */
-async function loadPackagedRenderer(window: BrowserWindow, _bundledPath: string): Promise<void> {
-  const decision = await resolveSpaSource();
-  console.debug(`[SpaLoader] ${decision.mode}: ${decision.reason}`);
-
+async function applySpaDecision(
+  window: BrowserWindow,
+  decision: SpaLoadDecision
+): Promise<'remote' | 'bundled'> {
   if (decision.mode === 'remote' && decision.url) {
     try {
       setRemoteSpaState(decision.url);
@@ -221,7 +234,7 @@ async function loadPackagedRenderer(window: BrowserWindow, _bundledPath: string)
       // Capture the entry HTML hash for client attestation (#677). Best-effort:
       // captureSpaHash never throws, so this cannot break the load path.
       await captureSpaHash('remote', decision.url);
-      return;
+      return 'remote';
     } catch {
       console.warn('[SpaLoader] Failed to load remote SPA, falling back to bundled');
       setRemoteSpaState(null);
@@ -231,44 +244,80 @@ async function loadPackagedRenderer(window: BrowserWindow, _bundledPath: string)
   // consistent "not in remote-SPA mode" signal even on re-entry.
   setRemoteSpaState(null);
   // #830: load bundled via app:// scheme so renderer has a non-null Origin.
-  // The bundledPath param is preserved for backward-compat (and the dev fallback
-  // path), but packaged-mode bundled loads route through the app:// handler.
-  // #830 review: wrap in try/catch — bundled is the terminal load layer,
-  // so a failure here would leave a blank window with no further fallback.
-  // Surface to the splash error overlay so the user has SOME signal instead
-  // of a silently-broken state (e.g., if a future Electron version changes
-  // the protocol.handle contract or the asar bundle is corrupt).
+  // Bundled is the terminal load layer, so a failure here would leave a blank
+  // window with no further fallback — surface it to the splash error overlay.
   try {
     await window.loadURL('app://concord/index.html');
-    // Capture the entry HTML hash for client attestation (#677). Covers both
-    // genuine bundled mode AND the remote→bundled fallback, so the effective
-    // mode is always reflected accurately.  Best-effort: never throws.
+    // Covers genuine bundled mode AND the remote→bundled fallback, so the
+    // effective mode is always reflected accurately. Best-effort: never throws.
     await captureSpaHash('bundled');
   } catch (err) {
     console.error('[SpaLoader] bundled app:// loadURL failed:', (err as Error).message);
     updateSplashError('Could not load application — please reinstall');
   }
+  return 'bundled';
+}
+
+// #1742 follow-up: the SPA-source decision is made once at launch with a 5s
+// config-fetch timeout (spaLoader CONFIG_TIMEOUT_MS) and no retry. A cold-start
+// network (DNS/TLS/CF edge not yet warm) loses that race and strands the client
+// on the bundled SPA for the whole session. When the bundled fallback was
+// UNEXPECTED (config fetch failed — not a logged-out / no-spaUrl / contract
+// case), retry resolveSpaSource a few seconds later, on a now-warm network, and
+// switch to the remote SPA if it resolves. Bounded; stops on success or once
+// the delays are exhausted. The manual "Load latest UI" button (spa:reloadLatest)
+// remains the fallback. Mirrors the WebSocket onlineFallbackTimer pattern (#1768).
+const SPA_RETRY_DELAYS_MS = [4_000, 10_000];
+
+function scheduleSpaSourceRetry(window: BrowserWindow, attempt = 0): void {
+  if (attempt >= SPA_RETRY_DELAYS_MS.length) return;
+  setTimeout(() => {
+    void (async () => {
+      // Abort if the window is gone, or if we are already in remote mode (a
+      // prior retry or a manual reload succeeded — getRemoteSpaUrl is non-null
+      // only when the remote SPA is loaded).
+      if (window.isDestroyed() || getRemoteSpaUrl() !== null) return;
+      const decision = await resolveSpaSource();
+      if (decision.mode === 'remote' && decision.url) {
+        console.debug('[SpaLoader/retry] remote SPA reachable on warm network — switching');
+        // Use the EFFECTIVE mode: resolveSpaSource can return remote (config
+        // host reachable) while the remote SPA host itself is still down, in
+        // which case applySpaDecision falls back to bundled. Only stop retrying
+        // when we actually reached remote; otherwise keep retrying.
+        const mode = await applySpaDecision(window, decision);
+        if (mode === 'remote') return;
+      }
+      scheduleSpaSourceRetry(window, attempt + 1);
+    })();
+  }, SPA_RETRY_DELAYS_MS[attempt]);
+}
+
+/**
+ * Load the packaged renderer: try the remote SPA first (Tier 3), fall back
+ * to the bundled file on any failure. Extracted to keep createWindow simple.
+ */
+async function loadPackagedRenderer(window: BrowserWindow, _bundledPath: string): Promise<void> {
+  const decision = await resolveSpaSource();
+  console.debug(`[SpaLoader] ${decision.mode}: ${decision.reason}`);
+  await applySpaDecision(window, decision);
 
   // #830 Option C: surface a non-blocking diagnostic event if the bundled
   // fallback fired for an unexpected reason (config fetch failed, network
   // issue, spaUrl rejected, etc.). Expected fallbacks (first launch, no
-  // spaUrl, contract zero) do NOT trigger the event. The renderer-side
-  // overlay subscriber is deferred to a follow-up issue (preload.ts is
-  // currently protect-sensitive-blocked); the event is harmless without
-  // a subscriber — Electron's webContents.send to a non-listening
-  // renderer is a no-op.
-  // Delay 2000ms to ensure renderer listeners are registered (mirrors
-  // the existing rollback-event pattern at the post-createWindow site).
+  // spaUrl, contract zero) do NOT trigger it. The renderer shows the
+  // "Could not reach Concord servers" banner on app:configFetchFailed.
+  // Delay 2000ms to ensure renderer listeners are registered.
   if (decision.mode === 'bundled' && isUnexpectedBundled(decision.reason)) {
     setTimeout(() => {
-      // #830 review: guard against window destroyed during the 2s delay
-      // (rapid quit, crash). Mirrors the rollback-event pattern's
-      // optional-chaining safeguard at the post-createWindow site.
+      // Guard against window destroyed during the 2s delay (rapid quit, crash).
       if (window.isDestroyed()) return;
       window.webContents.send('app:configFetchFailed', {
         reason: 'Could not reach Concord servers',
       });
     }, 2000);
+    // Self-heal the cold-start race: retry on a warm network and switch to
+    // remote if it becomes reachable (#1742 follow-up launch-time retry).
+    scheduleSpaSourceRetry(window);
   }
 }
 
@@ -778,20 +827,70 @@ ipcMain.handle('app:relaunch', () => {
   app.quit();
 });
 
-// Hot SPA reload — main process re-runs spaLoader and points the window at the
-// freshly-discovered remote SPA URL. Used when clientConfigService notices a
-// new SPA build was deployed mid-session. Falls back to bundled if anything
-// in spaLoader's safety chain fails (no token, contract mismatch, etc).
-ipcMain.handle('app:reloadSpa', async () => {
-  if (!mainWindow) return;
-  const decision = await resolveSpaSource();
-  console.debug(`[SpaLoader/hot] ${decision.mode}: ${decision.reason}`);
-  if (decision.mode === 'remote' && decision.url) {
-    await mainWindow.loadURL(decision.url);
-  } else {
-    // #830: load bundled via app:// scheme.
-    await mainWindow.loadURL('app://concord/index.html');
+// Hot SPA reload — main process re-runs the spaLoader safety chain and points
+// the live window at the freshly-resolved remote SPA URL (or bundled on
+// fallback). Powers the Settings ▸ About "Load latest UI" button: lets a client
+// stranded on the bundled SPA (the cold-start config-fetch race) escape to
+// remote WITHOUT an app restart. SECURITY: the renderer only TRIGGERS this; the
+// URL is derived entirely in main from resolveSpaSource (getPersistedApiBase +
+// the authenticated /api/v1/client/config fetch). NO URL is accepted from the
+// renderer, so a compromised renderer cannot choose the origin. Reuses
+// applySpaDecision so launch and runtime cannot drift.
+ipcMain.handle('spa:reloadLatest', async (event) => {
+  // Privileged: this reaches a top-frame navigation. Reject an untrusted sender
+  // frame FIRST — before any window/packaged state check — so a compromised
+  // frame is refused regardless of state. isPermittedFrameUrl accepts both
+  // states this feature spans: app://concord (the stranded bundled state) and
+  // the active remote origin.
+  if (!isPermittedFrameUrl(event.senderFrame?.url ?? '', getRemoteSpaBaseUrl())) {
+    console.warn('[SpaLoader/reload] rejected spa:reloadLatest from untrusted frame');
+    return { mode: 'bundled', changed: false, rejected: true };
   }
+  if (!mainWindow || !app.isPackaged) return { mode: 'bundled', changed: false };
+  const before = getSpaHash();
+  const decision = await resolveSpaSource();
+  console.debug(`[SpaLoader/reload] ${decision.mode}: ${decision.reason}`);
+  const mode = await applySpaDecision(mainWindow, decision);
+  return { mode, changed: getSpaHash() !== before };
+});
+
+// SPA (UI) update check — the SECOND update axis, distinct from the
+// electron-updater desktop-binary axis (update:*). Reports whether the renderer
+// is on the bundled fallback vs remote, and whether NEWER remote-SPA bytes are
+// live (a SHA-256 diff of the served index.html — /client/config exposes no SPA
+// build id and the SPA URL is constant post-#976, so there is no version number
+// to show, only "newer bytes available"). Read-only and best-effort (never
+// throws); the network target is server-derived, not renderer-supplied.
+ipcMain.handle('spa:checkForUpdate', async (event) => {
+  // Read-only, but validate the sender frame for parity with spa:reloadLatest
+  // and defense-in-depth — closes the (minor) redundant-self-fetch surface a
+  // compromised/sandboxed frame could otherwise trigger.
+  if (!isPermittedFrameUrl(event.senderFrame?.url ?? '', getRemoteSpaBaseUrl())) {
+    return {
+      currentMode: 'bundled',
+      remoteAvailable: false,
+      newerBytesAvailable: null,
+      reason: 'rejected',
+    };
+  }
+  if (!app.isPackaged) {
+    return {
+      currentMode: 'remote',
+      remoteAvailable: false,
+      newerBytesAvailable: null,
+      reason: 'dev mode',
+    };
+  }
+  const currentMode = getRemoteSpaUrl() === null ? 'bundled' : 'remote';
+  const decision = await resolveSpaSource();
+  const remoteAvailable = decision.mode === 'remote' && !!decision.url;
+  let newerBytesAvailable: boolean | null = null;
+  if (remoteAvailable && decision.url) {
+    const available = await hashEntryHtml(decision.url);
+    // null (re-fetch failed) → unknown; the UI degrades to an unconditional offer.
+    newerBytesAvailable = available === null ? null : available !== getSpaHash();
+  }
+  return { currentMode, remoteAvailable, newerBytesAvailable, reason: decision.reason };
 });
 
 // Clean app exit (preserves persisted auth/remember-me state)

@@ -69,25 +69,25 @@ func TestParseDotenvDuplicateKeysLastWins(t *testing.T) {
 
 func TestNewLiveSpaConfigStaticModeNoFilePath(t *testing.T) {
 	cfg := &Config{
-		SpaURL:         "https://app.example.com",
+		SpaURL:         "https://app.concordvoice.chat",
 		SpaIpcContract: 7,
 	}
 
 	lsc := NewLiveSpaConfig(cfg, "", time.Minute)
 	require.NotNil(t, lsc)
 	// No background goroutine when filePath is empty — safe to check immediately
-	assert.Equal(t, "https://app.example.com", lsc.SpaURL())
+	assert.Equal(t, "https://app.concordvoice.chat", lsc.SpaURL())
 	assert.Equal(t, 7, lsc.SpaIpcContract())
 }
 
 func TestNewLiveSpaConfigStaticModeUsesConfigValues(t *testing.T) {
 	cfg := &Config{
-		SpaURL:         "https://staging.example.com",
+		SpaURL:         "https://staging.concordvoice.chat",
 		SpaIpcContract: 3,
 	}
 
 	lsc := NewLiveSpaConfig(cfg, "", time.Minute)
-	assert.Equal(t, "https://staging.example.com", lsc.SpaURL())
+	assert.Equal(t, "https://staging.concordvoice.chat", lsc.SpaURL())
 	assert.Equal(t, 3, lsc.SpaIpcContract())
 }
 

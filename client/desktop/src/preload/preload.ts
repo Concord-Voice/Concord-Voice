@@ -374,6 +374,24 @@ contextBridge.exposeInMainWorld('electron', {
     forceCheckForUpdates: (reason: 'attestation_required' | 'user_triggered'): Promise<void> =>
       ipcRenderer.invoke('updater:force-check', reason),
   },
+  // SPA (UI) update axis — distinct from the electron-updater desktop-binary
+  // axis above. Lets the user check for / load the latest remote UI without an
+  // app restart (escape the bundled-fallback cold-start trap). NO URL crosses
+  // the bridge: the main process derives the load URL from the authenticated
+  // config fetch, so a compromised renderer cannot choose the origin.
+  spaUpdate: {
+    checkForUpdate: (): Promise<{
+      currentMode: 'remote' | 'bundled';
+      remoteAvailable: boolean;
+      newerBytesAvailable: boolean | null;
+      reason: string;
+    }> => ipcRenderer.invoke('spa:checkForUpdate'),
+    reloadLatest: (): Promise<{
+      mode: 'remote' | 'bundled';
+      changed: boolean;
+      rejected?: boolean;
+    }> => ipcRenderer.invoke('spa:reloadLatest'),
+  },
 });
 
 // Type definitions for the exposed API
@@ -576,6 +594,21 @@ export interface ElectronAPI {
   // Force-check bridge (#677)
   updater: {
     forceCheckForUpdates: (reason: 'attestation_required' | 'user_triggered') => Promise<void>;
+  };
+
+  // SPA (UI) update axis — check for / load the latest remote UI without restart.
+  spaUpdate: {
+    checkForUpdate: () => Promise<{
+      currentMode: 'remote' | 'bundled';
+      remoteAvailable: boolean;
+      newerBytesAvailable: boolean | null;
+      reason: string;
+    }>;
+    reloadLatest: () => Promise<{
+      mode: 'remote' | 'bundled';
+      changed: boolean;
+      rejected?: boolean;
+    }>;
   };
 }
 

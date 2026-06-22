@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/dm"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 	"github.com/stretchr/testify/assert"
@@ -3878,7 +3879,7 @@ func TestHandleUserDisconnect_CancelsCallerInitiatedRings(t *testing.T) {
 	// router init; we test the HandleUserDisconnect path directly with
 	// a freshly-constructed Handler (the test ts.Hub + ts.DB are the
 	// authoritative path that production wires).
-	h := dm.NewHandler(ts.DB, logger.New("test"), ts.Hub, nil, nil, ts.Redis)
+	h := dm.NewHandler(ts.DB, logger.New("test"), ts.Hub, nil, nil, ts.Redis, entitlements.NewCache(ts.Redis, ts.DB))
 
 	callerUUID := uuid.MustParse(caller.ID)
 	h.HandleUserDisconnect(callerUUID)
@@ -3904,7 +3905,7 @@ func TestHandleUserDisconnect_IgnoresNonCallerDisconnects(t *testing.T) {
 
 	ringForTest(t, ts, caller, convID)
 
-	h := dm.NewHandler(ts.DB, logger.New("test"), ts.Hub, nil, nil, ts.Redis)
+	h := dm.NewHandler(ts.DB, logger.New("test"), ts.Hub, nil, nil, ts.Redis, entitlements.NewCache(ts.Redis, ts.DB))
 
 	// Simulate the CALLEE disconnecting — should NOT cancel the ring
 	calleeUUID := uuid.MustParse(callee.ID)
@@ -4067,7 +4068,7 @@ func TestOnRingTimeout_BroadcastsAndInsertsMissedEvent(t *testing.T) {
 	ring := dm.NewPendingCallForTest(convUUID, callerUUID, []uuid.UUID{calleeUUID})
 	dm.StoreRingForTest(convUUID, ring)
 
-	h := dm.NewHandler(ts.DB, logger.New("test"), ts.Hub, nil, nil, ts.Redis)
+	h := dm.NewHandler(ts.DB, logger.New("test"), ts.Hub, nil, nil, ts.Redis, entitlements.NewCache(ts.Redis, ts.DB))
 	dm.HandlerOnRingTimeoutForTest(h, convUUID, ring)
 
 	assert.False(t, dm.PendingDMCallExistsForTest(convUUID), "ring cleared after timeout")
@@ -4100,9 +4101,136 @@ func TestOnRingTimeout_OrphanedTimer_NoOp(t *testing.T) {
 	activeRing := dm.NewPendingCallForTest(convUUID, callerUUID, []uuid.UUID{calleeUUID})
 	dm.StoreRingForTest(convUUID, activeRing)
 
-	h := dm.NewHandler(ts.DB, logger.New("test"), ts.Hub, nil, nil, ts.Redis)
+	h := dm.NewHandler(ts.DB, logger.New("test"), ts.Hub, nil, nil, ts.Redis, entitlements.NewCache(ts.Redis, ts.DB))
 	dm.HandlerOnRingTimeoutForTest(h, convUUID, staleRing)
 
 	// Active ring still present (orphaned timer should not have deleted it).
 	assert.True(t, dm.PendingDMCallExistsForTest(convUUID), "active ring preserved when orphaned timer fires")
+}
+
+// --- AuthorizeVoiceJoin media_entitlements Tests (#1300) ---
+
+// insertDMSubscription inserts an active subscription row so the entitlement
+// cache's read-through resolves the given tier for a DM voice join.
+func insertDMSubscription(t *testing.T, ts *testhelpers.TestServer, userID, tier string) {
+	t.Helper()
+	_, err := ts.DB.Exec(
+		`INSERT INTO subscriptions (user_id, tier, status, source) VALUES ($1, $2, 'active', 'code')`,
+		userID, tier,
+	)
+	require.NoError(t, err)
+}
+
+// assertDMMediaEntitlements asserts the DM join-authorize response's
+// media_entitlements object matches entitlements.MediaFor(tier).
+func assertDMMediaEntitlements(t *testing.T, body map[string]interface{}, tier string) {
+	t.Helper()
+	me, ok := body["media_entitlements"].(map[string]interface{})
+	require.True(t, ok, "media_entitlements present and is an object")
+
+	want := entitlements.MediaFor(tier)
+	assert.Equal(t, want.Tier, me["tier"], "tier")
+	assert.EqualValues(t, want.MinPtimeMs, me["min_ptime_ms"], "min_ptime_ms")
+	assert.EqualValues(t, want.MaxManualBitrateBps, me["max_manual_bitrate_bps"], "max_manual_bitrate_bps")
+
+	rawTiers, ok := me["allowed_audio_tiers"].([]interface{})
+	require.True(t, ok, "allowed_audio_tiers is an array")
+	gotTiers := make([]string, len(rawTiers))
+	for i, v := range rawTiers {
+		gotTiers[i] = v.(string)
+	}
+	assert.Equal(t, want.AllowedAudioTiers, gotTiers, "allowed_audio_tiers")
+}
+
+func TestAuthorizeVoiceJoin_MediaEntitlements_Free(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dmme_free1")
+	user2 := ts.CreateTestUser(t, "dmme_free2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceJoin, nil, testhelpers.AuthHeaders(user1.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assertDMMediaEntitlements(t, body, entitlements.TierFree)
+
+	me := body["media_entitlements"].(map[string]interface{})
+	assert.Equal(t, "free", me["tier"])
+	assert.EqualValues(t, 20, me["min_ptime_ms"])
+	assert.EqualValues(t, 5000000, me["max_manual_bitrate_bps"])
+}
+
+func TestAuthorizeVoiceJoin_MediaEntitlements_Premium(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dmme_prem1")
+	user2 := ts.CreateTestUser(t, "dmme_prem2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	insertDMSubscription(t, ts, user1.ID, entitlements.TierPremium)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceJoin, nil, testhelpers.AuthHeaders(user1.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assertDMMediaEntitlements(t, body, entitlements.TierPremium)
+
+	me := body["media_entitlements"].(map[string]interface{})
+	assert.Equal(t, "premium", me["tier"])
+	assert.EqualValues(t, 10, me["min_ptime_ms"])
+	assert.EqualValues(t, 10000000, me["max_manual_bitrate_bps"])
+}
+
+// A DM peer with no active subscription gets the free floor (fail-closed). Here
+// user1 (premium) and user2 (no subscription) are in the same conversation; user2
+// joining must NOT inherit user1's premium tier — each user's caps are resolved
+// from their own authenticated id.
+func TestAuthorizeVoiceJoin_MediaEntitlements_FailClosedPerUser(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dmme_fc1")
+	user2 := ts.CreateTestUser(t, "dmme_fc2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	insertDMSubscription(t, ts, user1.ID, entitlements.TierPremium)
+
+	// user2 (free) joins → free caps, never user1's premium.
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceJoin, nil, testhelpers.AuthHeaders(user2.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assertDMMediaEntitlements(t, body, entitlements.TierFree)
+	me := body["media_entitlements"].(map[string]interface{})
+	assert.Equal(t, "free", me["tier"], "tier resolved from the joining user's own id")
+}
+
+// The tier is resolved from the AUTHENTICATED user, not any request-body value:
+// user2 (free) joins while supplying a hostile body claiming premium.
+func TestAuthorizeVoiceJoin_MediaEntitlements_TierFromAuthenticatedUser(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dmme_auth1")
+	user2 := ts.CreateTestUser(t, "dmme_auth2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	insertDMSubscription(t, ts, user1.ID, entitlements.TierPremium)
+
+	hostileBody := map[string]interface{}{
+		"user_id":            user1.ID,
+		"tier":               "premium",
+		"media_entitlements": map[string]interface{}{"tier": "premium", "max_manual_bitrate_bps": 99999999},
+	}
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceJoin, hostileBody, testhelpers.AuthHeaders(user2.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assertDMMediaEntitlements(t, body, entitlements.TierFree)
+	me := body["media_entitlements"].(map[string]interface{})
+	assert.Equal(t, "free", me["tier"], "tier must come from the JWT user, not the request body")
+	assert.EqualValues(t, 5000000, me["max_manual_bitrate_bps"], "body cannot raise the bitrate cap")
 }

@@ -628,6 +628,43 @@ describe('offline short-circuit (navigator.onLine gate)', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(mockFetch).not.toHaveBeenCalled();
   });
+
+  it('still reconnects when navigator.onLine is stuck false and "online" never fires (regression #1768)', async () => {
+    // Regression for #1768 (defect A): #1657 added the navigator.onLine
+    // short-circuit, which arms a ONE-SHOT 'online' listener and nothing else.
+    // In Electron, navigator.onLine can stick `false` across a network flap /
+    // server deploy and the 'online' event may never (re)fire — stranding the
+    // client in RECONNECTING forever until a manual app restart (the reported
+    // "requires a restart" symptom). A bounded fallback MUST still attempt a
+    // real reconnect even though 'online' never fires.
+    vi.useFakeTimers();
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ ticket: 'mock-ticket' }),
+    });
+    globalThis.fetch = mockFetch;
+    setOnLine(false);
+
+    const svc = new WebSocketService('ws://localhost:8080');
+    svc.connect('jwt-token');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Offline gate engaged: no immediate ticket POST, armed for recovery.
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(svc.getState()).toBe(ConnectionState.RECONNECTING);
+
+    // 'online' NEVER fires; navigator.onLine stays false the whole time.
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    // The client must NOT be stranded — a bounded fallback attempts a real
+    // reconnect (the ws-ticket fetch fires) despite the stuck offline signal.
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining('/auth/ws-ticket'),
+      expect.anything()
+    );
+
+    svc.disconnect();
+  });
 });
 
 describe('ticket cache', () => {

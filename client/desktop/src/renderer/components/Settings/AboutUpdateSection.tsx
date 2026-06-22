@@ -13,6 +13,15 @@ type UpdateStatus =
   | 'downloaded'
   | 'error';
 
+// SPA (UI) update axis — distinct from the electron-updater desktop-binary axis.
+type SpaCheckStatus =
+  | 'idle'
+  | 'checking'
+  | 'on-latest'
+  | 'newer-available'
+  | 'on-bundled'
+  | 'error';
+
 interface DownloadProgress {
   percent: number;
   transferred: number;
@@ -72,6 +81,10 @@ const AboutUpdateSection: React.FC = () => {
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [errorMessage, setErrorMessage] = useState('');
   const [lastChecked, setLastChecked] = useState<Date | null>(null);
+
+  // SPA (UI) update axis state — bundled-vs-remote + a manual "Load latest UI".
+  const [spaStatus, setSpaStatus] = useState<SpaCheckStatus>('idle');
+  const [spaReloading, setSpaReloading] = useState(false);
 
   // Developer Mode (TEMPORARY — remove before BETA)
   const [developerMode, setDeveloperMode] = useState(false);
@@ -141,6 +154,44 @@ const AboutUpdateSection: React.FC = () => {
     }
   }, []);
 
+  // SPA (UI) update axis: is the renderer on the bundled fallback vs remote, and
+  // are newer remote-SPA bytes available? Read-only; the main process derives
+  // everything (no URL crosses the bridge).
+  const refreshSpaStatus = useCallback(async () => {
+    setSpaStatus('checking');
+    try {
+      const res = await globalThis.electron?.spaUpdate?.checkForUpdate();
+      if (!res) {
+        setSpaStatus('error');
+        return;
+      }
+      if (res.currentMode === 'bundled') setSpaStatus('on-bundled');
+      else if (res.newerBytesAvailable === true) setSpaStatus('newer-available');
+      else if (res.newerBytesAvailable === false) setSpaStatus('on-latest');
+      // null = hash re-fetch failed (unknown) → neutral, still offer a reload.
+      else setSpaStatus('idle');
+    } catch {
+      setSpaStatus('error');
+    }
+  }, []);
+
+  // "Load latest UI": main re-resolves the SPA source and navigates the window
+  // to the validated remote SPA. On success the renderer tears down and this
+  // component unmounts mid-call; the fresh SPA re-auths from the main-process
+  // token (no re-login).
+  const handleLoadLatestUi = useCallback(async () => {
+    setSpaReloading(true);
+    try {
+      await globalThis.electron?.spaUpdate?.reloadLatest();
+    } catch {
+      setSpaReloading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshSpaStatus().catch(() => setSpaStatus('error'));
+  }, [refreshSpaStatus]);
+
   const handleDownload = useCallback(async () => {
     setUpdateStatus('downloading');
     setProgress({ percent: 0, transferred: 0, total: 0, bytesPerSecond: 0 });
@@ -182,6 +233,32 @@ const AboutUpdateSection: React.FC = () => {
           <div className="about-info-row">
             <span className="about-info-label">SPA Build</span>
             <span className="about-info-value">{SPA_VERSION}</span>
+          </div>
+          <div className="about-info-row">
+            <span className="about-info-label">Interface</span>
+            <span className="about-info-value about-info-value--log">
+              <span className="about-info-log-path">
+                {spaStatus === 'checking' && 'Checking…'}
+                {spaStatus === 'on-latest' && '✓ Up to date'}
+                {spaStatus === 'newer-available' && 'Newer UI available'}
+                {spaStatus === 'on-bundled' && 'Offline fallback UI'}
+                {spaStatus === 'error' && "Couldn't check"}
+                {spaStatus === 'idle' && 'Reload to refresh'}
+              </span>
+              {(spaStatus === 'on-bundled' ||
+                spaStatus === 'newer-available' ||
+                spaStatus === 'error' ||
+                spaStatus === 'idle') && (
+                <button
+                  className="about-info-copy-btn"
+                  disabled={spaReloading}
+                  onClick={handleLoadLatestUi}
+                  title="Reloads the interface to the latest version. Brief reconnect — you won't be logged out."
+                >
+                  {spaReloading ? 'Loading…' : 'Load latest UI'}
+                </button>
+              )}
+            </span>
           </div>
           {systemInfo && (
             <>

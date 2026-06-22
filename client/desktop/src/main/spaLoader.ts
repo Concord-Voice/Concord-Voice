@@ -184,47 +184,63 @@ export async function captureSpaHash(
   mode: 'remote' | 'bundled',
   remoteUrl?: string
 ): Promise<void> {
-  try {
-    // Determine the URL to fetch the entry HTML from.
-    const entryUrl = mode === 'remote' && remoteUrl ? remoteUrl : 'app://concord/index.html';
+  // Determine the URL to fetch the entry HTML from.
+  const entryUrl = mode === 'remote' && remoteUrl ? remoteUrl : 'app://concord/index.html';
 
-    const response = await net.fetch(entryUrl);
+  const hash = await hashEntryHtml(entryUrl);
+  // Best-effort capture: on a fetch/hash failure the singletons retain their
+  // previous values so the caller's SPA load path is not interrupted.
+  if (!hash) return;
+
+  // Derive the SPA version:
+  //   remote  → the <sha> segment from the URL path (/spa/<sha>/index.html)
+  //   bundled → sha7 derived from the build tag baked into the app at CI time
+  //
+  // The server's SPA registry is keyed by sha7 (main-cd.yml publishes with
+  // `GITHUB_SHA:0:7`), so the bundled-mode `spa_version` MUST be sha7 too.
+  // Using `getBuildTag()` directly here ships `release-<sha8>` (8 chars +
+  // prefix) which the server cannot resolve → 403 ATTESTATION_UNKNOWN_RELEASE
+  // even for legitimately-built bundles. `getBuildSha7()` returns the
+  // canonical sha7 form for release builds and '' for PR-smoke / dev builds
+  // (the latter is the correct fail-loud posture — non-release bundles are
+  // not in the server's registry).
+  let version: string;
+  if (mode === 'remote' && remoteUrl) {
+    try {
+      const pathname = new URL(remoteUrl).pathname;
+      const shaMatch = SPA_SHA_RE.exec(pathname);
+      version = shaMatch ? shaMatch[1] : '';
+    } catch {
+      version = '';
+    }
+  } else {
+    version = getBuildSha7();
+  }
+
+  setSpaHash(hash);
+  setSpaVersion(version);
+}
+
+/**
+ * Fetch the entry HTML at `url` and return its `sha256:<hex>` content hash, or
+ * null on any fetch/hash error (best-effort, never throws). Shared by
+ * captureSpaHash (load-time capture) and the spa:checkForUpdate handler
+ * (available-bytes diff) so both hash the served bytes identically.
+ *
+ * A production Vite build content-hashes asset filenames, so the entry HTML
+ * bytes (and this hash) change on every atomic Cloudflare Pages deploy — which
+ * is what makes a "newer UI bytes available" signal possible without a
+ * server-exposed build id.
+ */
+export async function hashEntryHtml(url: string): Promise<string | null> {
+  try {
+    const response = await net.fetch(url);
     const arrayBuffer = await response.arrayBuffer();
     const bytes = Buffer.from(arrayBuffer);
-
-    const hash = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
-
-    // Derive the SPA version:
-    //   remote  → the <sha> segment from the URL path (/spa/<sha>/index.html)
-    //   bundled → sha7 derived from the build tag baked into the app at CI time
-    //
-    // The server's SPA registry is keyed by sha7 (main-cd.yml publishes with
-    // `GITHUB_SHA:0:7`), so the bundled-mode `spa_version` MUST be sha7 too.
-    // Using `getBuildTag()` directly here ships `release-<sha8>` (8 chars +
-    // prefix) which the server cannot resolve → 403 ATTESTATION_UNKNOWN_RELEASE
-    // even for legitimately-built bundles. `getBuildSha7()` returns the
-    // canonical sha7 form for release builds and '' for PR-smoke / dev builds
-    // (the latter is the correct fail-loud posture — non-release bundles are
-    // not in the server's registry).
-    let version: string;
-    if (mode === 'remote' && remoteUrl) {
-      try {
-        const pathname = new URL(remoteUrl).pathname;
-        const shaMatch = SPA_SHA_RE.exec(pathname);
-        version = shaMatch ? shaMatch[1] : '';
-      } catch {
-        version = '';
-      }
-    } else {
-      version = getBuildSha7();
-    }
-
-    setSpaHash(hash);
-    setSpaVersion(version);
+    return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
   } catch (err) {
-    // Best-effort capture: swallow the error so the caller's SPA load path
-    // is not interrupted. The singletons retain their previous values.
     // Per [internal]rules/observability.md, never pass raw err to console.warn.
-    console.warn('[SpaLoader] hash capture failed:', (err as Error).message);
+    console.warn('[SpaLoader] entry HTML hash failed:', (err as Error).message);
+    return null;
   }
 }

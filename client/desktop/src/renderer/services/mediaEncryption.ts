@@ -298,6 +298,21 @@ export class MediaEncryption {
     if (!this.encryptKey) throw new Error('E2EE: no encrypt key');
 
     const data = new Uint8Array(frame.data);
+
+    // #1742 root cause: an empty (0-byte) DTX frame would otherwise encrypt to
+    // exactly 32 bytes (0-byte header + 16-byte GCM tag over an empty payload +
+    // 16-byte trailer). The decrypt side's "too small to be encrypted" guard is
+    // `length < TRAILER_SIZE + 17` (< 33), so that 32-byte frame is
+    // misclassified as unencrypted and fed to the Opus decoder UNDECIPHERED —
+    // the receiver-side garble-during-silence (confirmed via two-client capture
+    // 2026-06-22: 68-81% of frames passed through at size:32). An empty frame
+    // carries no audio content, so pass it through unchanged: it stays 0 bytes
+    // end-to-end and the decoder treats it as DTX silence, symmetric with the
+    // decrypt passthrough. Do NOT instead lower the decrypt threshold — a
+    // 32-byte frame then fails the small-cipher guard with a mismatched header,
+    // and the garble merely moves to a different branch.
+    if (data.length === 0) return;
+
     // Determine unencrypted header bytes based on frame type.
     // VP8 keyframes need 10 bytes, delta frames need 3, audio needs 1.
     // Per RFC 6386 §9.1 and the official WebRTC Insertable Streams sample.
@@ -327,7 +342,14 @@ export class MediaEncryption {
     result.set(header);
     result.set(new Uint8Array(ciphertext), header.length);
     let offset = header.length + ciphertext.byteLength;
-    result[offset] = headerBytes; // Encode how many header bytes were used
+    // Encode the ACTUAL header length, not the static getUnencryptedBytes()
+    // value. They are equal for every real frame (data.length >= headerBytes),
+    // so the wire format is byte-identical for production traffic — but for a
+    // frame shorter than headerBytes (e.g. a 1-byte video frame), storing the
+    // static value would make the decrypt header/ciphertext split overrun into
+    // the trailer (#1742 latent video boundary, H5). The 0-byte case is already
+    // handled by the early return above; this closes the residual sub-header case.
+    result[offset] = header.length;
     offset += 1;
     result[offset] = this.currentKeyId;
     offset += 1;

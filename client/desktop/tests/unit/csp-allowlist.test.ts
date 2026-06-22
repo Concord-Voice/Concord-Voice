@@ -43,11 +43,11 @@ describe('CSP allowlist (issue #817 regression guard)', () => {
     // No connect-src entry needed because app:// pages have origin null
     // from a CSP standpoint and CSP enforcement is bypassed by Electron
     // for same-origin asar reads. Listed here for documentation only.
-    // First-party example.com surfaces (production + staging)
-    'https://example.com',
-    'wss://example.com',
-    'https://*.example.com',
-    'wss://*.example.com',
+    // First-party concordvoice.chat surfaces (production + staging)
+    'https://concordvoice.chat',
+    'wss://concordvoice.chat',
+    'https://*.concordvoice.chat',
+    'wss://*.concordvoice.chat',
   ]);
 
   it('parses a connect-src directive from index.html', () => {

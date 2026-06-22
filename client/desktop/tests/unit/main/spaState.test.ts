@@ -20,13 +20,13 @@ describe('spaState — atomic lockstep invariant', () => {
   });
 
   it('setRemoteSpaState(url) sets both atomically', () => {
-    setRemoteSpaState('https://api.example.com/spa/abc1234/index.html');
-    expect(getRemoteSpaBaseUrl()).toBe('https://api.example.com');
-    expect(getRemoteSpaUrl()).toBe('https://api.example.com/spa/abc1234/index.html');
+    setRemoteSpaState('https://api.concordvoice.chat/spa/abc1234/index.html');
+    expect(getRemoteSpaBaseUrl()).toBe('https://api.concordvoice.chat');
+    expect(getRemoteSpaUrl()).toBe('https://api.concordvoice.chat/spa/abc1234/index.html');
   });
 
   it('setRemoteSpaState(null) clears both atomically', () => {
-    setRemoteSpaState('https://api.example.com/spa/abc/index.html');
+    setRemoteSpaState('https://api.concordvoice.chat/spa/abc/index.html');
     setRemoteSpaState(null);
     expect(getRemoteSpaBaseUrl()).toBeNull();
     expect(getRemoteSpaUrl()).toBeNull();
@@ -34,17 +34,17 @@ describe('spaState — atomic lockstep invariant', () => {
 
   it('setRemoteSpaState(malformed) clears both (fail-closed)', () => {
     // Pre-populate so the failure path is observable.
-    setRemoteSpaState('https://api.example.com/spa/abc/index.html');
+    setRemoteSpaState('https://api.concordvoice.chat/spa/abc/index.html');
     setRemoteSpaState('not a url');
     expect(getRemoteSpaBaseUrl()).toBeNull();
     expect(getRemoteSpaUrl()).toBeNull();
   });
 
   it('successive sets preserve lockstep (regression for #815 reconciliation)', () => {
-    setRemoteSpaState('https://api.example.com/spa/abc/index.html');
-    setRemoteSpaState('https://api.example.com/spa/def5678/index.html');
-    expect(getRemoteSpaBaseUrl()).toBe('https://api.example.com');
-    expect(getRemoteSpaUrl()).toBe('https://api.example.com/spa/def5678/index.html');
+    setRemoteSpaState('https://api.concordvoice.chat/spa/abc/index.html');
+    setRemoteSpaState('https://api.concordvoice.chat/spa/def5678/index.html');
+    expect(getRemoteSpaBaseUrl()).toBe('https://api.concordvoice.chat');
+    expect(getRemoteSpaUrl()).toBe('https://api.concordvoice.chat/spa/def5678/index.html');
   });
 });
 
@@ -58,22 +58,22 @@ describe('getRemoteSpaBaseDir — runtime SPA base directory (#976 self-heal)', 
   });
 
   it("derives '/spa/<sha>/' for the legacy per-SHA host", () => {
-    setRemoteSpaState('https://api.example.com/spa/abc1234/index.html');
+    setRemoteSpaState('https://api.concordvoice.chat/spa/abc1234/index.html');
     expect(getRemoteSpaBaseDir()).toBe('/spa/abc1234/');
   });
 
   it("derives '/' for the flat Cloudflare Pages host served at index.html", () => {
-    setRemoteSpaState('https://spa.example.com/index.html');
+    setRemoteSpaState('https://spa.concordvoice.chat/index.html');
     expect(getRemoteSpaBaseDir()).toBe('/');
   });
 
   it("derives '/' for the flat host served at the apex", () => {
-    setRemoteSpaState('https://spa.example.com/');
+    setRemoteSpaState('https://spa.concordvoice.chat/');
     expect(getRemoteSpaBaseDir()).toBe('/');
   });
 
   it('clears to null on malformed input (fail-closed, lockstep with origin/url)', () => {
-    setRemoteSpaState('https://spa.example.com/index.html');
+    setRemoteSpaState('https://spa.concordvoice.chat/index.html');
     setRemoteSpaState('not a url');
     expect(getRemoteSpaBaseDir()).toBeNull();
     expect(getRemoteSpaBaseUrl()).toBeNull();

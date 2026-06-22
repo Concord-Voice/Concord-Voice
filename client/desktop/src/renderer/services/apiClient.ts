@@ -562,7 +562,13 @@ async function handle401Recovery(
   } else {
     const now = Date.now();
     if (now - lastRefreshTimestamp < MIN_REFRESH_INTERVAL_MS) {
-      // Recently refreshed and no in-flight refresh — likely token revocation
+      // Recently refreshed and no in-flight refresh — likely token revocation.
+      // Route through the single rememberMe-aware authority (handleRefreshFailure)
+      // rather than returning a bare 401. Without this, a revoked !rememberMe
+      // session's encrypted disk token survived this ≤10s cooldown window
+      // un-wiped — the userStore 401 handlers used to mask the gap before #1768
+      // centralized the disk-token decision here (#1768 review, finding #6).
+      await handleRefreshFailure();
       return response;
     }
     lastRefreshTimestamp = now;

@@ -6,7 +6,7 @@ import { API_BASE } from '../config';
  * The control-plane emits avatar/banner/icon URLs as host-relative
  * `/api/v1/media/*` paths (the documented MediaURL contract — see
  * `types/ws-events.ts`). In the remote-SPA renderer, `document.baseURI` is the
- * SPA origin (spa.example.com), so a raw relative <img src> resolves to
+ * SPA origin (spa.concordvoice.chat), so a raw relative <img src> resolves to
  * the wrong host. Prefix API_BASE so it resolves against the API host.
  *
  * At least as strict as the MediaURL zod schema on dangerous schemes (plus blob:

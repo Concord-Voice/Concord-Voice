@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000073)
+## Existing Migrations (000001–000077)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -183,6 +183,10 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000071 | redemption_codes | `redemption_codes` registry (hashed, single-use/promo) #1295 |
 | 000072 | code_redemptions | `code_redemptions` ledger (UNIQUE(code_id,user_id)) #1295 |
 | 000073 | drop_users_e2ee_preference | Drop per-user `e2ee_preference` from users + pending_registrations (E2EE-everywhere residual, #1648) |
+| 000074 | user_presence_settings | `user_presence_settings` — per-user presence + custom-text-status preferences (#1233) |
+| 000075 | create_friend_organization | `friend_organization` — per-user zero-knowledge AES-256-GCM friend-category blob; server stores ciphertext + version only (#324) |
+| 000076 | redemption_code_issuance | `redemption_code_issuance` — platform audit trail for redemption-code generation (CLI + admin HTTP), one row per issue/batch in-txn with minted codes (#1303) |
+| 000077 | admin_auth | `admin_users` / `admin_webauthn_credentials` / `admin_audit_log` (append-only via `concord_admin_rt` role) — platform-admin auth for the Admin/Ops console #1688 |
 
 ## Troubleshooting
 

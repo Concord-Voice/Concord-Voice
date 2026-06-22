@@ -3,7 +3,7 @@ import type { PinConfig } from './updatePinning';
 // ⚠ SECURITY-CRITICAL — TLS pin configuration for the update feed. ⚠
 //
 // This file is the sole source of truth for which TLS certs are trusted to
-// serve the Concord Voice electron-updater feed on api.example.com.
+// serve the Concord Voice electron-updater feed on api.concordvoice.chat.
 // Every change requires:
 //   1. PR description linking to [internal]
 //   2. Security reviewer sign-off (enforced via CODEOWNERS)
@@ -16,7 +16,7 @@ import type { PinConfig } from './updatePinning';
 // this file to updatePinning.ts + main.ts + tests.
 
 export const PIN_CONFIG: PinConfig = {
-  pinnedHosts: ['api.example.com'] as const,
+  pinnedHosts: ['api.concordvoice.chat'] as const,
   primaryPins: [
     // Current production leaf SPKI SHA-256 (Let's Encrypt E7, via CloudFlare edge).
     // Measured 2026-05-08 — replaces pre-cutover pin (53257bb4...) after the
@@ -26,8 +26,8 @@ export const PIN_CONFIG: PinConfig = {
     // the backup keypair and engage the proper rotation invariant. This is a
     // public-key fingerprint, not a secret — reproducible by anyone connecting
     // to the host:
-    //   echo | openssl s_client -connect api.example.com:443 \
-    //     -servername api.example.com 2>/dev/null \
+    //   echo | openssl s_client -connect api.concordvoice.chat:443 \
+    //     -servername api.concordvoice.chat 2>/dev/null \
     //     | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \
     //     | openssl dgst -sha256 -binary | xxd -p | tr -d '\n'
     '0a4ccc0dfc2c60c67e4b814292467bbf7e525d6b75d38e32ea646153fc7c49f2', // pragma: allowlist secret

@@ -515,3 +515,98 @@ describe('MediaEncryption', () => {
     });
   });
 });
+
+// Regression for #1742: an empty (0-byte) DTX frame used to encrypt to exactly
+// 32 bytes, which the decrypt `< 33` too-small guard misclassified as
+// unencrypted and fed to the Opus decoder undeciphered — the receiver-side
+// garble-during-silence. The fix passes empty frames through unchanged.
+describe('MediaEncryption — #1742 empty DTX frame passthrough', () => {
+  it('passes an empty (0-byte) frame through unchanged on encrypt (never the 32-byte blob)', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    await sender.init(csk, 'sender-user-id');
+
+    const frame = fakeAudioFrame(0);
+    await sender.encryptFrame(frame);
+
+    // Must stay 0 bytes — the pre-fix bug produced exactly 32 bytes here.
+    expect(frame.data.byteLength).toBe(0);
+  });
+
+  it('round-trips an empty frame as empty (decoder sees DTX silence, not garble)', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    const receiver = new MediaEncryption();
+    await sender.init(csk, 'sender-user-id');
+    await receiver.init(csk, 'receiver-user-id');
+    await receiver.addDecryptKey(csk, 'sender-user-id');
+
+    const frame = fakeAudioFrame(0);
+    await sender.encryptFrame(frame);
+    await receiver.decryptFrame(frame, 'sender-user-id');
+
+    expect(frame.data.byteLength).toBe(0);
+  });
+
+  it('still round-trips a 1-byte audio frame (boundary just above empty)', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    const receiver = new MediaEncryption();
+    await sender.init(csk, 'sender-user-id');
+    await receiver.init(csk, 'receiver-user-id');
+    await receiver.addDecryptKey(csk, 'sender-user-id');
+
+    const frame = fakeAudioFrame(1);
+    const original = new Uint8Array(frame.data).slice();
+    await sender.encryptFrame(frame);
+    // 1-byte input encrypts to 33 bytes (>= the guard) — must decrypt, not pass through.
+    await receiver.decryptFrame(frame, 'sender-user-id');
+    expect(new Uint8Array(frame.data)).toEqual(original);
+  });
+
+  it('stores the ACTUAL header length in the trailer (closes the sub-header video boundary, H5)', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    const receiver = new MediaEncryption();
+    await sender.init(csk, 'sender-user-id');
+    await receiver.init(csk, 'receiver-user-id');
+    await receiver.addDecryptKey(csk, 'sender-user-id');
+
+    // A 1-byte video frame: getUnencryptedBytes()=2 but only 1 byte exists, so
+    // the trailer must record the actual header length (1), not the static 2 —
+    // else the decrypt header/ciphertext split overruns and the frame is
+    // mis-passed-through instead of decrypted.
+    const frame = fakeVideoFrame(1);
+    const original = new Uint8Array(frame.data).slice();
+    await sender.encryptFrame(frame);
+
+    const enc = new Uint8Array(frame.data);
+    expect(enc[enc.length - 16]).toBe(1); // headerBytes field = actual header length
+
+    await receiver.decryptFrame(frame, 'sender-user-id');
+    expect(new Uint8Array(frame.data)).toEqual(original);
+  });
+
+  it('does NOT consume an IV-counter value for a skipped empty frame (no nonce gap)', async () => {
+    // Security invariant: the empty-frame early return must stay ABOVE the
+    // frameCounter++ in encryptFrame, so a skipped 0-byte frame consumes no
+    // GCM nonce counter. This regression-locks that ordering against a future
+    // refactor that moves the guard below the counter increment.
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    await sender.init(csk, 'sender-user-id');
+
+    const empty = fakeAudioFrame(0);
+    await sender.encryptFrame(empty); // must not advance the counter
+    expect(empty.data.byteLength).toBe(0);
+
+    const real = fakeAudioFrame(50);
+    await sender.encryptFrame(real);
+    const enc = new Uint8Array(real.data);
+    // Trailer IV = bytes [-14, -2); its first 4 bytes are the big-endian counter.
+    const ivStart = enc.length - 14;
+    const counter =
+      (enc[ivStart] << 24) | (enc[ivStart + 1] << 16) | (enc[ivStart + 2] << 8) | enc[ivStart + 3];
+    expect(counter).toBe(0); // first real frame still uses counter 0
+  });
+});

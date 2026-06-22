@@ -40,7 +40,7 @@ describe('useSendInviteToFriend', () => {
 
     expect(createInvite).toHaveBeenCalledWith('server-1');
     expect(openDM).toHaveBeenCalledWith('user-2');
-    expect(mockSend).toHaveBeenCalledWith('dm-conv-9', 'https://invite.example.com/GHJKMNPQ');
+    expect(mockSend).toHaveBeenCalledWith('dm-conv-9', 'https://invite.concordvoice.chat/GHJKMNPQ');
     expect(res).toEqual({ ok: true, conversationId: 'dm-conv-9' });
   });
 

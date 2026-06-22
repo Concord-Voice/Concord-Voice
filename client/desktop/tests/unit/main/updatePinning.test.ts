@@ -45,10 +45,10 @@ describe('computeSpkiSha256', () => {
 });
 
 describe('isHostnamePinned (I5, I7)', () => {
-  const pinned = ['api.example.com'] as const;
+  const pinned = ['api.concordvoice.chat'] as const;
 
   it('matches an exact lowercase hostname', () => {
-    expect(isHostnamePinned('api.example.com', pinned)).toBe(true);
+    expect(isHostnamePinned('api.concordvoice.chat', pinned)).toBe(true);
   });
 
   it('is case-insensitive', () => {
@@ -57,8 +57,8 @@ describe('isHostnamePinned (I5, I7)', () => {
   });
 
   it('does NOT match subdomains (no wildcard)', () => {
-    expect(isHostnamePinned('staging.example.com', pinned)).toBe(false);
-    expect(isHostnamePinned('foo.api.example.com', pinned)).toBe(false);
+    expect(isHostnamePinned('staging.concordvoice.chat', pinned)).toBe(false);
+    expect(isHostnamePinned('foo.api.concordvoice.chat', pinned)).toBe(false);
   });
 
   it('does NOT match other hostnames', () => {
@@ -68,7 +68,7 @@ describe('isHostnamePinned (I5, I7)', () => {
   });
 
   it('returns false when the pinned list is empty', () => {
-    expect(isHostnamePinned('api.example.com', [])).toBe(false);
+    expect(isHostnamePinned('api.concordvoice.chat', [])).toBe(false);
   });
 });
 
@@ -77,13 +77,13 @@ describe('isHostnamePinned (I5, I7)', () => {
 const mkLogger = () => ({ warn: vi.fn(), error: vi.fn() });
 
 const validConfig: PinConfig = {
-  pinnedHosts: ['api.example.com'],
+  pinnedHosts: ['api.concordvoice.chat'],
   primaryPins: [fingerprints.primary],
   fallbackPins: [fingerprints.fallback],
 };
 
 const mkRequest = (overrides: Partial<VerifyProcRequest> = {}): VerifyProcRequest => ({
-  hostname: 'api.example.com',
+  hostname: 'api.concordvoice.chat',
   certificate: { data: primaryPem },
   errorCode: 0,
   verificationResult: 'net::OK',
@@ -120,7 +120,7 @@ describe('createPinningVerifyProc — hostname gate + Chromium defer (I2, I5, I7
   it('passes through subdomains (no wildcard) with callback(-3)', () => {
     const proc = createPinningVerifyProc(validConfig, mkLogger());
     const cb = vi.fn();
-    proc(mkRequest({ hostname: 'staging.example.com' }), cb);
+    proc(mkRequest({ hostname: 'staging.concordvoice.chat' }), cb);
     expect(cb).toHaveBeenCalledWith(-3);
   });
 
@@ -194,7 +194,7 @@ describe('createPinningVerifyProc — fail-closed + hygiene (I1, I9, I10)', () =
     proc(mkRequest({ certificate: { data: roguePem } }), vi.fn());
 
     const lines = logger.error.mock.calls.map((c) => String(c[0])).join(' ');
-    expect(lines).toContain('api.example.com');
+    expect(lines).toContain('api.concordvoice.chat');
     expect(lines).toMatch(/SPKI:…[0-9a-f]{8}/);
     expect(lines).not.toMatch(/[0-9a-f]{64}/);
     expect(lines).not.toMatch(/CN=|O=|OU=|C=/);

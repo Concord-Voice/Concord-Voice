@@ -1,6 +1,6 @@
 -- 000066_client_attestation_registry.up.sql
 -- Client attestation registry (#677): per-release hashes for verifying
--- official Concord Voice clients connecting to example.com.
+-- official Concord Voice clients connecting to concordvoice.chat.
 -- Two-axis: binary versions (vMAJOR.MINOR.PATCH) and SPA versions (sha7 commit
 -- hash) tracked independently per ADR-0010.
 

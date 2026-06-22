@@ -7,14 +7,14 @@ describe('buildRemotePipUrl', () => {
     // `remoteSpaBaseUrl` (origin only) used to be passed here, which stripped
     // the `/spa/<sha>/index.html` path. Without the path nginx falls through
     // to its catch-all `location /` and redirects to the marketing site.
-    const spaUrl = 'https://api.example.com/spa/abc1234/index.html';
+    const spaUrl = 'https://api.concordvoice.chat/spa/abc1234/index.html';
     const result = buildRemotePipUrl(spaUrl, 'window-1');
-    expect(result.startsWith('https://api.example.com/spa/abc1234/')).toBe(true);
+    expect(result.startsWith('https://api.concordvoice.chat/spa/abc1234/')).toBe(true);
   });
 
   it('appends the hash route in `#/pip/<id>` form', () => {
     const result = buildRemotePipUrl(
-      'https://api.example.com/spa/abc1234/index.html',
+      'https://api.concordvoice.chat/spa/abc1234/index.html',
       'window-2'
     );
     expect(result.endsWith('#/pip/window-2')).toBe(true);
@@ -33,12 +33,12 @@ describe('buildRemotePipUrl', () => {
     // URL; everything after is fragment. A pipId containing `#` cannot
     // escape upward into the path or authority.
     const result = buildRemotePipUrl(
-      'https://api.example.com/spa/abc/index.html',
+      'https://api.concordvoice.chat/spa/abc/index.html',
       'win#evil.com'
     );
     const firstHashIndex = result.indexOf('#');
     expect(result.substring(0, firstHashIndex)).toBe(
-      'https://api.example.com/spa/abc/index.html'
+      'https://api.concordvoice.chat/spa/abc/index.html'
     );
   });
 
@@ -46,10 +46,10 @@ describe('buildRemotePipUrl', () => {
     // Newlines in pipId stay inside the fragment — the URL path is fixed
     // by the SPA URL prefix.
     const result = buildRemotePipUrl(
-      'https://api.example.com/spa/abc/index.html',
+      'https://api.concordvoice.chat/spa/abc/index.html',
       'win\nmalicious'
     );
-    expect(result.startsWith('https://api.example.com/spa/abc/index.html#/pip/win')).toBe(
+    expect(result.startsWith('https://api.concordvoice.chat/spa/abc/index.html#/pip/win')).toBe(
       true
     );
   });
@@ -77,16 +77,16 @@ describe('isValidPipOpenSender', () => {
   });
 
   describe('packaged + remote SPA active', () => {
-    const spaUrl = 'https://api.example.com/spa/abc1234/index.html';
+    const spaUrl = 'https://api.concordvoice.chat/spa/abc1234/index.html';
 
     it('accepts sender from the SPA origin', () => {
       expect(
-        isValidPipOpenSender('https://api.example.com/spa/abc1234/index.html', true, spaUrl)
+        isValidPipOpenSender('https://api.concordvoice.chat/spa/abc1234/index.html', true, spaUrl)
       ).toBe(true);
     });
 
     it('accepts sender from the same origin with a different path', () => {
-      expect(isValidPipOpenSender('https://api.example.com/other', true, spaUrl)).toBe(true);
+      expect(isValidPipOpenSender('https://api.concordvoice.chat/other', true, spaUrl)).toBe(true);
     });
 
     it('rejects sender from a different origin', () => {
@@ -98,7 +98,7 @@ describe('isValidPipOpenSender', () => {
     });
 
     it('rejects malformed remoteSpaUrl (fail-closed)', () => {
-      expect(isValidPipOpenSender('https://api.example.com/', true, 'not a url')).toBe(false);
+      expect(isValidPipOpenSender('https://api.concordvoice.chat/', true, 'not a url')).toBe(false);
     });
   });
 
@@ -111,7 +111,7 @@ describe('isValidPipOpenSender', () => {
     });
 
     it('rejects https sender when bundled', () => {
-      expect(isValidPipOpenSender('https://api.example.com/', true, null)).toBe(false);
+      expect(isValidPipOpenSender('https://api.concordvoice.chat/', true, null)).toBe(false);
     });
 
     it('rejects localhost sender when bundled (packaged build)', () => {
@@ -162,7 +162,7 @@ describe('isValidPipOpenSender', () => {
       const result = isValidPipOpenSender(
         'app://concord/index.html',
         true,
-        'https://api.example.com/spa/abc1234/index.html'
+        'https://api.concordvoice.chat/spa/abc1234/index.html'
       );
       expect(result).toBe(false);
     });

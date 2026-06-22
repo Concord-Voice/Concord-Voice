@@ -14,6 +14,6 @@
 # Permissions-Policy keeps getUserMedia (camera/microphone) available to the SPA
 # on the Pages origin and denies unused features.
 # NOTE: no Content-Security-Policy here — the bundle's index.html ships its own
-# meta-CSP (connect-src covers *.example.com). Imposing default-src 'none'
+# meta-CSP (connect-src covers *.concordvoice.chat). Imposing default-src 'none'
 # would block the bundle (mirrors the deleted handler.go:93 CSP deletion).
 # NOTE: no X-XSS-Protection — it is deprecated; the meta-CSP is the real XSS defense.

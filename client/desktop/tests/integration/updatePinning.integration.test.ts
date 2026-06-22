@@ -23,7 +23,7 @@ import {
   type VerifyProcRequest,
 } from '../../src/main/updatePinning';
 
-const PINNED_HOST = 'api.example.com';
+const PINNED_HOST = 'api.concordvoice.chat';
 
 describe('updatePinning — freshly generated rogue cert rejection', () => {
   let roguePem: string;
@@ -113,7 +113,7 @@ describe('updatePinning — freshly generated rogue cert rejection', () => {
     // Edge case: hostname is pinned but the cert presented is not the one we pinned.
     const logger = { warn: vi.fn(), error: vi.fn() };
     const config: PinConfig = {
-      pinnedHosts: [PINNED_HOST, 'other.example.com'],
+      pinnedHosts: [PINNED_HOST, 'other.concordvoice.chat'],
       primaryPins: [goodSpki],
       fallbackPins: [goodSpki],
     };
@@ -122,7 +122,7 @@ describe('updatePinning — freshly generated rogue cert rejection', () => {
 
     proc(
       {
-        hostname: 'other.example.com',
+        hostname: 'other.concordvoice.chat',
         certificate: { data: roguePem },
         errorCode: 0,
         verificationResult: 'net::OK',

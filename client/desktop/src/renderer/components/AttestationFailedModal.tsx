@@ -38,7 +38,7 @@ export interface AttestationFailedModalProps {
  * Renders the "Update Required" dialog when the server rejects the client
  * with an attestation 403 (ATTESTATION_UNKNOWN_RELEASE, ATTESTATION_REVOKED,
  * CLIENT_VERSION_TOO_OLD). BSL clarity copy: users of self-hosted servers are
- * not blocked; only example.com requires official signed releases.
+ * not blocked; only concordvoice.chat requires official signed releases.
  *
  * SECURITY: downloadHelpUrl is server-supplied and therefore untrusted.
  * Scheme is validated against SAFE_PROTOCOLS before rendering or passing to
@@ -113,7 +113,7 @@ export function AttestationFailedModal({
       >
         <h2 id="attestation-modal-title">Update Required</h2>
         <p>
-          example.com requires an official Concord Voice client. Self-hosted servers may
+          concordvoice.chat requires an official Concord Voice client. Self-hosted servers may
           accept your build, but this server only accepts official signed releases.
         </p>
         {requiredMinVersion && (

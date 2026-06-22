@@ -12,7 +12,11 @@ vi.mock('@/config/index.js', () => ({
 
 const TEST_SIGNING_KEY = ['vitest', 'mock', 'jwt'].join('-'); // NOSONAR — test-only mock
 
-import { createAuthMiddleware, validateChannelAccess } from '../src/middleware/auth.js';
+import {
+  createAuthMiddleware,
+  validateChannelAccess,
+  FREE_MEDIA_ENTITLEMENT,
+} from '../src/middleware/auth.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -415,5 +419,197 @@ describe('validateChannelAccess', () => {
     const result = await validateChannelAccess('outsider-id', 'conv-1', 'token', 'dm');
 
     expect(result.allowed).toBe(false);
+  });
+
+  // ── Per-user media entitlements (#1300) ───────────────────────────────
+
+  const premiumEntitlements = {
+    tier: 'premium',
+    allowed_audio_tiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+    min_ptime_ms: 10,
+    max_manual_bitrate_bps: 10_000_000,
+  };
+
+  const freeEntitlements = {
+    tier: 'free',
+    allowed_audio_tiers: ['minimum', 'low', 'moderate', 'standard'],
+    min_ptime_ms: 20,
+    max_manual_bitrate_bps: 5_000_000,
+  };
+
+  it('parses free media_entitlements from the server-channel join response', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 's', name: 'n' },
+          media_entitlements: freeEntitlements,
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    expect(result.userTier).toBe('free');
+    expect(result.allowedAudioTiers).toEqual(['minimum', 'low', 'moderate', 'standard']);
+    expect(result.minPtimeMs).toBe(20);
+    expect(result.maxManualBitrateBps).toBe(5_000_000);
+  });
+
+  it('parses premium media_entitlements from the server-channel join response', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 's', name: 'n' },
+          media_entitlements: premiumEntitlements,
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    expect(result.userTier).toBe('premium');
+    expect(result.allowedAudioTiers).toContain('studio');
+    expect(result.minPtimeMs).toBe(10);
+    expect(result.maxManualBitrateBps).toBe(10_000_000);
+  });
+
+  it('parses media_entitlements from the DM authorize response (room-kind-independent)', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          authorized: true,
+          is_group: false,
+          media_entitlements: premiumEntitlements,
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'conv-1', 'token', 'dm');
+
+    expect(result.allowed).toBe(true);
+    expect(result.userTier).toBe('premium');
+    expect(result.maxManualBitrateBps).toBe(10_000_000);
+  });
+
+  it('fails closed to the free floor when media_entitlements is ABSENT', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 's', name: 'n' },
+          // media_entitlements intentionally omitted
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    expect(result.userTier).toBe(FREE_MEDIA_ENTITLEMENT.tier);
+    expect(result.allowedAudioTiers).toEqual(FREE_MEDIA_ENTITLEMENT.allowedAudioTiers);
+    expect(result.minPtimeMs).toBe(FREE_MEDIA_ENTITLEMENT.minPtimeMs);
+    expect(result.maxManualBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps);
+  });
+
+  it('fails closed to the free floor when media_entitlements is MALFORMED (wrong types)', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 's', name: 'n' },
+          media_entitlements: {
+            tier: 42, // wrong type
+            allowed_audio_tiers: 'not-an-array', // wrong type
+            min_ptime_ms: 'fast', // wrong type
+            max_manual_bitrate_bps: -1, // out of range
+          },
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    // Each field independently floors — a partial-malformed object never
+    // partially escalates above the free values.
+    expect(result.userTier).toBe(FREE_MEDIA_ENTITLEMENT.tier);
+    expect(result.allowedAudioTiers).toEqual(FREE_MEDIA_ENTITLEMENT.allowedAudioTiers);
+    expect(result.minPtimeMs).toBe(FREE_MEDIA_ENTITLEMENT.minPtimeMs);
+    expect(result.maxManualBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps);
+  });
+
+  it('floors only the malformed FIELDS, keeping valid ones (no all-or-nothing)', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 's', name: 'n' },
+          media_entitlements: {
+            tier: 'premium',
+            allowed_audio_tiers: [], // empty array → floor
+            min_ptime_ms: 10, // valid
+            max_manual_bitrate_bps: 0, // invalid (must be >0) → floor
+          },
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    expect(result.userTier).toBe('premium'); // valid, kept
+    expect(result.minPtimeMs).toBe(10); // valid, kept
+    expect(result.allowedAudioTiers).toEqual(FREE_MEDIA_ENTITLEMENT.allowedAudioTiers); // floored
+    expect(result.maxManualBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps); // floored
+  });
+
+  it('clamps a FREE tier carrying premium-shaped caps to the free floor (atomic-free defence-in-depth)', async () => {
+    // Cross-field inconsistency (client-unreachable, but possible via a CP bug
+    // or a downgrade race): tier=free yet valid premium caps. Caps are tied to
+    // the tier — only an explicit premium tier may carry premium values, so a
+    // free tier can never end up with a premium cap.
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 's', name: 'n' },
+          media_entitlements: {
+            tier: 'free',
+            allowed_audio_tiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+            min_ptime_ms: 10, // premium-shaped (lower) → must clamp UP to 20
+            max_manual_bitrate_bps: 10_000_000, // premium-shaped → must clamp DOWN to 5M
+          },
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    expect(result.userTier).toBe('free');
+    expect(result.allowedAudioTiers).toEqual(FREE_MEDIA_ENTITLEMENT.allowedAudioTiers);
+    expect(result.minPtimeMs).toBe(FREE_MEDIA_ENTITLEMENT.minPtimeMs); // 20, not 10
+    expect(result.maxManualBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps); // 5M, not 10M
+  });
+
+  it('denial paths carry the free-floor media entitlement (never escalate on denial)', async () => {
+    mockFetch().mockResolvedValueOnce({ ok: false, status: 403 });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    expect(result.allowed).toBe(false);
+    expect(result.userTier).toBe(FREE_MEDIA_ENTITLEMENT.tier);
+    expect(result.maxManualBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps);
+    expect(result.minPtimeMs).toBe(FREE_MEDIA_ENTITLEMENT.minPtimeMs);
   });
 });

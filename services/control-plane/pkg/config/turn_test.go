@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	turnHost   = "turn.example.com"
+	turnHost   = "turn.concordvoice.chat"
 	turnSecret = "test-secret"
 	turnUser1  = "user-1"
 )

@@ -53,7 +53,7 @@ describe('isRendererSelfHealRequest — runtime trust-boundary guard', () => {
     expect(
       isRendererSelfHealRequest({
         reason: 'chunk-load',
-        url: 'https://api.example.com/spa/abc1234/assets/x.js',
+        url: 'https://api.concordvoice.chat/spa/abc1234/assets/x.js',
       })
     ).toBe(true);
   });
@@ -86,7 +86,7 @@ describe('isRendererSelfHealRequest — runtime trust-boundary guard', () => {
   it('rejects when reason is missing', () => {
     expect(isRendererSelfHealRequest({})).toBe(false);
     expect(
-      isRendererSelfHealRequest({ url: 'https://api.example.com/spa/abc1234/assets/x.js' })
+      isRendererSelfHealRequest({ url: 'https://api.concordvoice.chat/spa/abc1234/assets/x.js' })
     ).toBe(false);
   });
 

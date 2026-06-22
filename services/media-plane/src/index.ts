@@ -249,15 +249,26 @@ async function main() {
           userId: data.userId,
         });
 
-        // Join the room via RoomManager
+        // Join the room via RoomManager. Thread the server-authoritative per-user
+        // media entitlement (#1300) parsed from the join-authorize response into
+        // the Participant — it caps THIS user's own send transport + mic produce
+        // (never sourced from socket.handshake.auth).
         const result = await roomManager.joinRoom(
           roomId,
           data.userId,
           socket.id,
-          data.username,
-          data.displayName,
-          data.avatarUrl,
-          rtpCapabilities
+          {
+            username: data.username,
+            displayName: data.displayName,
+            avatarUrl: data.avatarUrl,
+          },
+          rtpCapabilities,
+          {
+            tier: access.userTier,
+            allowedAudioTiers: access.allowedAudioTiers,
+            minPtimeMs: access.minPtimeMs,
+            maxManualBitrateBps: access.maxManualBitrateBps,
+          }
         );
 
         // Apply server enforcement if the joining user has active enforcement

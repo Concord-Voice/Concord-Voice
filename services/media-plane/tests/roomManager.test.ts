@@ -45,6 +45,9 @@ import {
   resolveAudioLastN,
   ABSOLUTE_AUDIO_LAST_N_CEILING,
 } from '../src/lib/roomManager.js';
+// `./mocks/logger.js` (imported above) replaces @/lib/logger with vi.fn() spies;
+// importing it here gives us the SAME mocked object to assert on.
+import { logger } from '../src/lib/logger.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -76,7 +79,7 @@ describe('RoomManager', () => {
 
   describe('joinRoom', () => {
     it('creates a new room and returns rtpCapabilities', async () => {
-      const result = await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      const result = await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
 
       expect(result.rtpCapabilities).toBeDefined();
       expect(result.existingProducers).toEqual([]);
@@ -85,27 +88,27 @@ describe('RoomManager', () => {
     });
 
     it('reuses existing room on second join', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
-      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', 'bob');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
 
       expect(mockMediasoup.getOrCreateRouter).toHaveBeenCalledTimes(1);
       expect(result.participants).toHaveLength(2);
     });
 
     it('discards stale room when router is closed', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       mockRouter.closed = true;
 
       // Second join should detect closed router and recreate
       const newRouter = createMockRouter();
       mockMediasoup.getOrCreateRouter.mockResolvedValue(newRouter);
 
-      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', 'bob');
+      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
       expect(result.rtpCapabilities).toBe(newRouter.rtpCapabilities);
     });
 
     it('returns existing producers from other participants', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
 
       // Add a producer for u-1
       const transport = createMockTransport();
@@ -124,7 +127,7 @@ describe('RoomManager', () => {
       );
 
       // u-2 joins and should see u-1's producer
-      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', 'bob');
+      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
       expect(result.existingProducers).toHaveLength(1);
       expect(result.existingProducers[0].userId).toBe('u-1');
     });
@@ -132,34 +135,34 @@ describe('RoomManager', () => {
 
   describe('Self-deafen (#685)', () => {
     it('setParticipantDeafen sets the isDeafened flag', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       manager.setParticipantDeafen('room-1', 'u-1', true);
       expect(manager.getParticipant('room-1', 'u-1')?.isDeafened).toBe(true);
     });
 
     it('setParticipantDeafen clears the isDeafened flag', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       manager.setParticipantDeafen('room-1', 'u-1', true);
       manager.setParticipantDeafen('room-1', 'u-1', false);
       expect(manager.getParticipant('room-1', 'u-1')?.isDeafened).toBe(false);
     });
 
     it('setParticipantDeafen is a no-op for an unknown participant', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       expect(() => manager.setParticipantDeafen('room-1', 'ghost', true)).not.toThrow();
       expect(manager.getParticipant('room-1', 'ghost')).toBeUndefined();
     });
 
     it('joinRoom snapshot defaults isDeafened to false', async () => {
-      const result = await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      const result = await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       expect(result.participants[0].isDeafened).toBe(false);
     });
 
     it('joinRoom snapshot carries an existing self-deafen (late joiner sees it)', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       manager.setParticipantDeafen('room-1', 'u-1', true);
 
-      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', 'bob');
+      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
       const alice = result.participants.find((p) => p.userId === 'u-1');
       expect(alice?.isDeafened).toBe(true);
     });
@@ -167,8 +170,8 @@ describe('RoomManager', () => {
 
   describe('joinRoom — reconnection', () => {
     it('cleans up old session when same userId rejoins', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-old', 'alice');
-      const result = await manager.joinRoom('room-1', 'u-1', 'sock-new', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-old', { username: 'alice' });
+      const result = await manager.joinRoom('room-1', 'u-1', 'sock-new', { username: 'alice' });
 
       // Should have exactly 1 participant (the new session)
       expect(result.participants).toHaveLength(1);
@@ -182,8 +185,8 @@ describe('RoomManager', () => {
       const handler = vi.fn();
       manager.onEvent(handler);
 
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
-      await manager.joinRoom('room-1', 'u-2', 'sock-2', 'bob');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
       await manager.leaveRoom('room-1', 'u-1');
 
       const room = manager.getRoom('room-1');
@@ -198,7 +201,7 @@ describe('RoomManager', () => {
       const handler = vi.fn();
       manager.onEvent(handler);
 
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       await manager.leaveRoom('room-1', 'u-1');
 
       expect(manager.getRoom('room-1')).toBeUndefined();
@@ -207,7 +210,7 @@ describe('RoomManager', () => {
     });
 
     it('cleans up transports, producers, and consumers', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
 
       // Create send transport + producer
       const transport = createMockTransport();
@@ -241,7 +244,7 @@ describe('RoomManager', () => {
 
   describe('createTransport', () => {
     beforeEach(async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
     });
 
     it('creates a send transport', async () => {
@@ -292,11 +295,97 @@ describe('RoomManager', () => {
         'Participant not found'
       );
     });
+
+    // ── Per-user tier bitrate cap (#1300) ─────────────────────────────────
+
+    it('caps the SEND transport with the FREE tier maxManualBitrateBps (5 Mbps)', async () => {
+      // u-free joins with the free entitlement (5_000_000 bps).
+      await manager.joinRoom('room-1', 'u-free', 'sock-free', { username: 'free' }, undefined, {
+        tier: 'free',
+        allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
+        minPtimeMs: 20,
+        maxManualBitrateBps: 5_000_000,
+      });
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+
+      await manager.createTransport('room-1', 'u-free', 'send');
+
+      // The producing (send) transport is capped at the user's tier ceiling,
+      // NOT the global ~50 Mbps default.
+      expect(transport.setMaxIncomingBitrate).toHaveBeenCalledWith(5_000_000);
+    });
+
+    it('caps the SEND transport with the PREMIUM tier maxManualBitrateBps (10 Mbps)', async () => {
+      await manager.joinRoom('room-1', 'u-prem', 'sock-prem', { username: 'prem' }, undefined, {
+        tier: 'premium',
+        allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+        minPtimeMs: 10,
+        maxManualBitrateBps: 10_000_000,
+      });
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+
+      await manager.createTransport('room-1', 'u-prem', 'send');
+
+      expect(transport.setMaxIncomingBitrate).toHaveBeenCalledWith(10_000_000);
+    });
+
+    it('does NOT apply the per-user cap to the RECV transport (keeps the global default)', async () => {
+      await manager.joinRoom('room-1', 'u-free', 'sock-free', { username: 'free' }, undefined, {
+        tier: 'free',
+        allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
+        minPtimeMs: 20,
+        maxManualBitrateBps: 5_000_000,
+      });
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+
+      await manager.createTransport('room-1', 'u-free', 'recv');
+
+      // recv carries media TO the peer — the global maxIncomingBitrate (50 Mbps
+      // from the config mock), never the per-user send cap.
+      expect(transport.setMaxIncomingBitrate).toHaveBeenCalledWith(50_000_000);
+      expect(transport.setMaxIncomingBitrate).not.toHaveBeenCalledWith(5_000_000);
+    });
+
+    it('defaults to the FREE floor send cap when no entitlement is supplied (pre-#1300 caller)', async () => {
+      // The default beforeEach join (u-1) passed no entitlement → free floor.
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+
+      await manager.createTransport('room-1', 'u-1', 'send');
+
+      expect(transport.setMaxIncomingBitrate).toHaveBeenCalledWith(5_000_000);
+    });
+
+    it('logs a PII-safe warning and PROCEEDS (does not fail the join) when setMaxIncomingBitrate rejects (#1300 fail-open)', async () => {
+      // A WebRtcTransport always supports setMaxIncomingBitrate, so a rejection
+      // is a transient worker error, not a capability gap. The security control
+      // fails OPEN (transport left uncapped) — but observably: a PII-safe warn
+      // is logged (ids + direction only) and the join still succeeds.
+      const warnSpy = vi.mocked(logger.warn);
+      warnSpy.mockClear();
+      const transport = createMockTransport();
+      transport.setMaxIncomingBitrate.mockRejectedValueOnce(new Error('worker IPC error'));
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+
+      const info = await manager.createTransport('room-1', 'u-1', 'send');
+      expect(info).toBeDefined(); // join not blocked by the flaky cap call
+
+      const call = warnSpy.mock.calls.find((c) => String(c[0]).includes('fail-open'));
+      expect(call).toBeDefined();
+      const meta = call![1] as Record<string, unknown>;
+      expect(meta.userId).toBe('u-1');
+      expect(meta.direction).toBe('send');
+      // No identity/display fields leaked.
+      expect(JSON.stringify(meta)).not.toMatch(/displayName|avatarUrl|username/);
+    });
   });
 
   describe('connectTransport', () => {
     it('calls transport.connect with dtlsParameters', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-1', 'send');
@@ -308,7 +397,7 @@ describe('RoomManager', () => {
     });
 
     it('throws if transport not found', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       await expect(manager.connectTransport('room-1', 'u-1', 'bad-id', {} as any)).rejects.toThrow(
         'Transport not found'
       );
@@ -321,7 +410,7 @@ describe('RoomManager', () => {
     let transport: ReturnType<typeof createMockTransport>;
 
     beforeEach(async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-1', 'send');
@@ -400,7 +489,7 @@ describe('RoomManager', () => {
       // Add 8 camera producers across multiple participants
       for (let i = 0; i < 8; i++) {
         const uid = `u-cam-${i}`;
-        await manager.joinRoom('room-1', uid, `sock-${i + 100}`, `user${i}`);
+        await manager.joinRoom('room-1', uid, `sock-${i + 100}`, { username: `user${i}` });
         const t = createMockTransport();
         mockRouter.createWebRtcTransport.mockResolvedValueOnce(t);
         await manager.createTransport('room-1', uid, 'send');
@@ -545,7 +634,7 @@ describe('RoomManager', () => {
     it('enforces screen share limit (max 5)', async () => {
       for (let i = 0; i < 5; i++) {
         const uid = `u-scr-${i}`;
-        await manager.joinRoom('room-1', uid, `sock-${i + 200}`, `user${i}`);
+        await manager.joinRoom('room-1', uid, `sock-${i + 200}`, { username: `user${i}` });
         const t = createMockTransport();
         mockRouter.createWebRtcTransport.mockResolvedValueOnce(t);
         await manager.createTransport('room-1', uid, 'send');
@@ -658,9 +747,210 @@ describe('RoomManager', () => {
     });
   });
 
+  // ── Per-user audio tier gating (#1300) ────────────────────────────────
+  describe('produce — per-user audio tier gating (#1300)', () => {
+    // u-1 (free floor: minPtime 20, standard opus ceiling 96 kbps) is joined by
+    // the parent produce beforeEach. Add a premium peer with their own transport.
+    let freeTransport: ReturnType<typeof createMockTransport>;
+    let premiumTransport: ReturnType<typeof createMockTransport>;
+
+    beforeEach(async () => {
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      freeTransport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(freeTransport);
+      await manager.createTransport('room-1', 'u-1', 'send');
+
+      await manager.joinRoom('room-1', 'u-prem', 'sock-prem', { username: 'prem' }, undefined, {
+        tier: 'premium',
+        allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+        minPtimeMs: 10,
+        maxManualBitrateBps: 10_000_000,
+      });
+      premiumTransport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(premiumTransport);
+      await manager.createTransport('room-1', 'u-prem', 'send');
+    });
+
+    it('REJECTS a free-tier mic producer with ptime below 20 ms (and never creates the producer)', async () => {
+      await expect(
+        manager.produce(
+          'room-1',
+          'u-1',
+          freeTransport.id,
+          'audio',
+          createRtpParameters({ ptime: 10 }) as any,
+          'mic'
+        )
+      ).rejects.toThrow('Audio producer exceeds tier media limits');
+
+      // The producer is rejected BEFORE the await — transport.produce never ran.
+      expect(freeTransport.produce).not.toHaveBeenCalled();
+      expect(manager.getParticipant('room-1', 'u-1')?.producers.size).toBe(0);
+    });
+
+    it('REJECTS a free-tier mic producer whose opus bitrate exceeds the standard ceiling (96 kbps)', async () => {
+      await expect(
+        manager.produce(
+          'room-1',
+          'u-1',
+          freeTransport.id,
+          'audio',
+          // 256 kbps = the hifi tier, above the free 'standard' ceiling of 96 kbps.
+          createRtpParameters({ maxaveragebitrate: 256_000 }) as any,
+          'mic'
+        )
+      ).rejects.toThrow('Audio producer exceeds tier media limits');
+
+      expect(freeTransport.produce).not.toHaveBeenCalled();
+      expect(manager.getParticipant('room-1', 'u-1')?.producers.size).toBe(0);
+    });
+
+    it('ADMITS a stock free client that declares only minptime (no actual ptime) — minptime is NOT the effective ptime', async () => {
+      // Regression lock (Gitar review, #1300): Chromium/Electron emit
+      // `minptime=10` (or lower) by default while actually packetizing at 20 ms.
+      // minptime is the LOWER BOUND the encoder may drop to, not the real ptime,
+      // so it must NOT trip the ptime gate — otherwise every stock free-tier mic
+      // is falsely rejected. An undeclared actual ptime admits (bitrate cap backstops).
+      const producer = createMockProducer({ kind: 'audio' });
+      freeTransport.produce.mockResolvedValueOnce(producer);
+      const info = await manager.produce(
+        'room-1',
+        'u-1',
+        freeTransport.id,
+        'audio',
+        createRtpParameters({ minptime: 5 }) as any, // only minptime, no ptime
+        'mic'
+      );
+      expect(info).toBeDefined();
+      expect(freeTransport.produce).toHaveBeenCalled();
+    });
+
+    it('ADMITS a free-tier mic producer at exactly the standard ceiling and 20 ms ptime', async () => {
+      const producer = createMockProducer({ kind: 'audio' });
+      freeTransport.produce.mockResolvedValueOnce(producer);
+
+      const info = await manager.produce(
+        'room-1',
+        'u-1',
+        freeTransport.id,
+        'audio',
+        createRtpParameters({ ptime: 20, maxaveragebitrate: 96_000 }) as any,
+        'mic'
+      );
+
+      expect(info.producerId).toBe(producer.id);
+      expect(freeTransport.produce).toHaveBeenCalled();
+    });
+
+    it('ADMITS a producer with NO opus fmtp params — DOCUMENTED best-effort residual, NOT benign default', async () => {
+      // This is the explicit, accepted #1300 residual (spec §5): the audio gate
+      // inspects only client-DECLARED, OPTIONAL opus fmtp. A patched client
+      // EVADES the gate simply by omitting `maxaveragebitrate`/`ptime` — and we
+      // admit-on-absence BY DESIGN, because the stock client legitimately omits
+      // these, so we cannot fail-closed on a missing fmtp without rejecting
+      // legitimate free users. The advisory transport bitrate cap is the only
+      // remaining backstop here; hard enforcement against a non-cooperative
+      // client is future stats-monitoring work (#1542), not this gate. This
+      // test asserts the residual is REACHED on purpose, not that an over-tier
+      // stream is benign.
+      const producer = createMockProducer({ kind: 'audio' });
+      freeTransport.produce.mockResolvedValueOnce(producer);
+
+      const info = await manager.produce(
+        'room-1',
+        'u-1',
+        freeTransport.id,
+        'audio',
+        createRtpParameters() as any, // no parameters → gate admits (residual)
+        'mic'
+      );
+
+      expect(info.producerId).toBe(producer.id);
+    });
+
+    it('ADMITS a PREMIUM mic producer at studio bitrate (510 kbps) and 10 ms ptime', async () => {
+      const producer = createMockProducer({ kind: 'audio' });
+      premiumTransport.produce.mockResolvedValueOnce(producer);
+
+      const info = await manager.produce(
+        'room-1',
+        'u-prem',
+        premiumTransport.id,
+        'audio',
+        createRtpParameters({ ptime: 10, maxaveragebitrate: 510_000 }) as any,
+        'mic'
+      );
+
+      expect(info.producerId).toBe(producer.id);
+      expect(premiumTransport.produce).toHaveBeenCalled();
+    });
+
+    it('does NOT gate a non-mic audio source (screen-audio is not tier-quality-gated)', async () => {
+      // Seed a screen producer (screen-audio requires one) ...
+      freeTransport.produce.mockResolvedValueOnce(createMockProducer({ kind: 'video', id: 'scr' }));
+      await manager.produce(
+        'room-1',
+        'u-1',
+        freeTransport.id,
+        'video',
+        createRtpParameters() as any,
+        'screen'
+      );
+
+      // ... then a screen-audio stream with an "over-tier" opus shape still passes
+      // (it is NOT mic, so the audio-tier gate does not apply).
+      const screenAudio = createMockProducer({ kind: 'audio', id: 'scr-aud' });
+      freeTransport.produce.mockResolvedValueOnce(screenAudio);
+      const info = await manager.produce(
+        'room-1',
+        'u-1',
+        freeTransport.id,
+        'audio',
+        createRtpParameters({ ptime: 5, maxaveragebitrate: 510_000 }) as any,
+        'screen-audio'
+      );
+
+      expect(info.source).toBe('screen-audio');
+    });
+
+    it('the rejection violation log contains NO rtpParameters payload, codec params, or display fields', async () => {
+      const { logger } = await import('../src/lib/logger.js');
+      const warnSpy = vi.mocked(logger.warn);
+      warnSpy.mockClear();
+
+      await expect(
+        manager.produce(
+          'room-1',
+          'u-1',
+          freeTransport.id,
+          'audio',
+          createRtpParameters({ ptime: 5, maxaveragebitrate: 256_000 }) as any,
+          'mic'
+        )
+      ).rejects.toThrow('Audio producer exceeds tier media limits');
+
+      // Exactly the PII-safe shape: { userId, kind, source, reason } — no more.
+      const rejectionCall = warnSpy.mock.calls.find((c) =>
+        String(c[0]).includes('over-tier media')
+      );
+      expect(rejectionCall).toBeDefined();
+      const meta = rejectionCall![1] as Record<string, unknown>;
+      expect(Object.keys(meta).sort()).toEqual(['kind', 'reason', 'source', 'userId']);
+      expect(meta.userId).toBe('u-1');
+      expect(meta.kind).toBe('audio');
+      expect(meta.source).toBe('mic');
+      // Nothing media-derived leaked.
+      const serialized = JSON.stringify(meta);
+      expect(serialized).not.toContain('256000');
+      expect(serialized).not.toContain('rtpParameters');
+      expect(serialized).not.toContain('maxaveragebitrate');
+      expect(serialized).not.toContain('codecs');
+    });
+  });
+
   describe('pauseProducer / resumeProducer', () => {
     it('pauses and resumes a producer', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-1', 'send');
@@ -684,7 +974,7 @@ describe('RoomManager', () => {
     });
 
     it('throws if producer not found', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       await expect(manager.pauseProducer('room-1', 'u-1', 'bad-id')).rejects.toThrow(
         'Producer not found'
       );
@@ -696,7 +986,7 @@ describe('RoomManager', () => {
       const handler = vi.fn();
       manager.onEvent(handler);
 
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-1', 'send');
@@ -733,7 +1023,7 @@ describe('RoomManager', () => {
 
     beforeEach(async () => {
       // u-1 joins and produces
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       const sendTransport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(sendTransport);
       await manager.createTransport('room-1', 'u-1', 'send');
@@ -753,9 +1043,7 @@ describe('RoomManager', () => {
         'room-1',
         'u-2',
         'sock-2',
-        'bob',
-        undefined,
-        undefined,
+        { username: 'bob' },
         createRtpCapabilities() as any
       );
       const recvTransport = createMockTransport();
@@ -786,9 +1074,7 @@ describe('RoomManager', () => {
         'room-1',
         'u-3',
         'sock-3',
-        'charlie',
-        undefined,
-        undefined,
+        { username: 'charlie' },
         createRtpCapabilities() as any
       );
 
@@ -799,7 +1085,7 @@ describe('RoomManager', () => {
 
     it('throws when rtpCapabilities not set', async () => {
       // u-4 joins WITHOUT rtpCapabilities
-      await manager.joinRoom('room-1', 'u-4', 'sock-4', 'dave');
+      await manager.joinRoom('room-1', 'u-4', 'sock-4', { username: 'dave' });
       const recvT = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(recvT);
       await manager.createTransport('room-1', 'u-4', 'recv');
@@ -812,7 +1098,7 @@ describe('RoomManager', () => {
 
   describe('resumeConsumer / pauseConsumer / closeConsumer', () => {
     it('resumes a consumer', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       const recvTransport = createMockTransport();
       const consumer = createMockConsumer();
       recvTransport.consume.mockResolvedValue(consumer);
@@ -828,7 +1114,7 @@ describe('RoomManager', () => {
     });
 
     it('pauses a consumer', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       const participant = manager.getParticipant('room-1', 'u-1')!;
       const consumer = createMockConsumer();
       participant.consumers.set(consumer.id, consumer as any);
@@ -838,7 +1124,7 @@ describe('RoomManager', () => {
     });
 
     it('closes a consumer and removes from map', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       const participant = manager.getParticipant('room-1', 'u-1')!;
       const consumer = createMockConsumer();
       participant.consumers.set(consumer.id, consumer as any);
@@ -863,7 +1149,7 @@ describe('RoomManager', () => {
     });
 
     it('returns null when fewer than 2 participants have capabilities', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       expect(manager.computeCodecFloor('room-1')).toBeNull();
     });
 
@@ -872,18 +1158,14 @@ describe('RoomManager', () => {
         'room-1',
         'u-1',
         'sock-1',
-        'alice',
-        undefined,
-        undefined,
+        { username: 'alice' },
         createRtpCapabilities(['video/VP8', 'video/VP9', 'video/H264']) as any
       );
       await manager.joinRoom(
         'room-1',
         'u-2',
         'sock-2',
-        'bob',
-        undefined,
-        undefined,
+        { username: 'bob' },
         createRtpCapabilities(['video/VP8', 'video/H264']) as any
       );
 
@@ -899,18 +1181,14 @@ describe('RoomManager', () => {
         'room-1',
         'u-1',
         'sock-1',
-        'alice',
-        undefined,
-        undefined,
+        { username: 'alice' },
         createRtpCapabilities(['video/VP8']) as any
       );
       await manager.joinRoom(
         'room-1',
         'u-2',
         'sock-2',
-        'bob',
-        undefined,
-        undefined,
+        { username: 'bob' },
         createRtpCapabilities(['video/VP8']) as any
       );
 
@@ -923,19 +1201,15 @@ describe('RoomManager', () => {
         'room-1',
         'u-1',
         'sock-1',
-        'alice',
-        undefined,
-        undefined,
+        { username: 'alice' },
         createRtpCapabilities(['video/VP8']) as any
       );
-      await manager.joinRoom('room-1', 'u-2', 'sock-2', 'bob'); // no capabilities
+      await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' }); // no capabilities
       await manager.joinRoom(
         'room-1',
         'u-3',
         'sock-3',
-        'charlie',
-        undefined,
-        undefined,
+        { username: 'charlie' },
         createRtpCapabilities(['video/VP8', 'video/VP9']) as any
       );
 
@@ -948,16 +1222,16 @@ describe('RoomManager', () => {
 
   describe('E2EE epoch', () => {
     it('increments epoch on join', async () => {
-      const result1 = await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      const result1 = await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       expect(result1.e2eeEpoch).toBe(1);
 
-      const result2 = await manager.joinRoom('room-1', 'u-2', 'sock-2', 'bob');
+      const result2 = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
       expect(result2.e2eeEpoch).toBe(2);
     });
 
     it('increments epoch on leave for forward secrecy', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
-      await manager.joinRoom('room-1', 'u-2', 'sock-2', 'bob');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
 
       await manager.leaveRoom('room-1', 'u-1');
 
@@ -970,7 +1244,7 @@ describe('RoomManager', () => {
 
   describe('query methods', () => {
     it('findRoomBySocketId returns correct roomId and userId', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       const found = manager.findRoomBySocketId('sock-1');
       expect(found).toEqual({ roomId: 'room-1', userId: 'u-1' });
     });
@@ -980,8 +1254,8 @@ describe('RoomManager', () => {
     });
 
     it('getRoomSocketIds returns all sockets in room', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
-      await manager.joinRoom('room-1', 'u-2', 'sock-2', 'bob');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
 
       const ids = manager.getRoomSocketIds('room-1');
       expect(ids).toContain('sock-1');
@@ -989,8 +1263,8 @@ describe('RoomManager', () => {
     });
 
     it('getStats returns correct aggregate counts', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
-      await manager.joinRoom('room-2', 'u-2', 'sock-2', 'bob');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await manager.joinRoom('room-2', 'u-2', 'sock-2', { username: 'bob' });
 
       const stats = manager.getStats();
       expect(stats.activeRooms).toBe(2);
@@ -1000,7 +1274,7 @@ describe('RoomManager', () => {
     });
 
     it('collectMetricsSample counts publishers by source and gathers recv-transport egress (#1553)', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       const p = manager.getRoom('room-1')!.participants.get('u-1')!;
       p.producers.set('pc', {
         producer: createMockProducer({ kind: 'video' }) as any,
@@ -1031,7 +1305,7 @@ describe('RoomManager', () => {
     });
 
     it('collectMetricsSample keeps a getStats-failed transport LIVE but omits its bytes (#1553)', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       const p = manager.getRoom('room-1')!.participants.get('u-1')!;
       p.recvTransports.set(
         't-bad',
@@ -1047,8 +1321,8 @@ describe('RoomManager', () => {
     });
 
     it('getActiveRoomIds returns all room IDs', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
-      await manager.joinRoom('room-2', 'u-2', 'sock-2', 'bob');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await manager.joinRoom('room-2', 'u-2', 'sock-2', { username: 'bob' });
 
       expect(manager.getActiveRoomIds()).toEqual(['room-1', 'room-2']);
     });
@@ -1063,7 +1337,7 @@ describe('RoomManager', () => {
       manager.onEvent(handler1);
       manager.onEvent(handler2);
 
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
 
       expect(handler1).toHaveBeenCalled();
       expect(handler2).toHaveBeenCalled();
@@ -1077,7 +1351,7 @@ describe('RoomManager', () => {
       manager.onEvent(badHandler);
       manager.onEvent(goodHandler);
 
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
 
       expect(badHandler).toHaveBeenCalled();
       expect(goodHandler).toHaveBeenCalled();
@@ -1088,7 +1362,7 @@ describe('RoomManager', () => {
 
   describe('updateRtpCapabilities', () => {
     it('updates participant capabilities', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
       const caps = createRtpCapabilities();
 
       manager.updateRtpCapabilities('room-1', 'u-1', caps as any);
@@ -1107,8 +1381,8 @@ describe('RoomManager', () => {
 
   describe('closeAll', () => {
     it('closes all rooms', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
-      await manager.joinRoom('room-2', 'u-2', 'sock-2', 'bob');
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await manager.joinRoom('room-2', 'u-2', 'sock-2', { username: 'bob' });
 
       await manager.closeAll();
 
@@ -1166,7 +1440,7 @@ describe('RoomManager', () => {
 
     describe('serverMuteUser', () => {
       it('should set serverMuted flag and pause audio producers', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
         const { producer } = await setupProducer(manager, mockRouter, 'room-1', 'u-1');
 
         await manager.serverMuteUser('room-1', 'u-1');
@@ -1177,7 +1451,7 @@ describe('RoomManager', () => {
       });
 
       it('should not pause video producers', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
         const { producer } = await setupProducer(
           manager,
           mockRouter,
@@ -1203,7 +1477,7 @@ describe('RoomManager', () => {
 
     describe('serverUnmuteUser', () => {
       it('should clear serverMuted flag without resuming producers', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
         const { producer } = await setupProducer(manager, mockRouter, 'room-1', 'u-1');
 
         await manager.serverMuteUser('room-1', 'u-1');
@@ -1218,7 +1492,7 @@ describe('RoomManager', () => {
     describe('serverDeafenUser', () => {
       it('should set both flags and pause audio producers and consumers', async () => {
         // u-1 produces audio
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
         const { producer, info: producerInfo } = await setupProducer(
           manager,
           mockRouter,
@@ -1231,9 +1505,7 @@ describe('RoomManager', () => {
           'room-1',
           'u-2',
           'sock-2',
-          'bob',
-          undefined,
-          undefined,
+          { username: 'bob' },
           createRtpCapabilities() as any
         );
         const { producer: u2Producer } = await setupProducer(manager, mockRouter, 'room-1', 'u-2');
@@ -1256,7 +1528,7 @@ describe('RoomManager', () => {
 
       it('should not pause video consumers', async () => {
         // u-1 produces video
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
         const { info: producerInfo } = await setupProducer(
           manager,
           mockRouter,
@@ -1271,9 +1543,7 @@ describe('RoomManager', () => {
           'room-1',
           'u-2',
           'sock-2',
-          'bob',
-          undefined,
-          undefined,
+          { username: 'bob' },
           createRtpCapabilities() as any
         );
         const { consumer: videoConsumer } = await setupConsumer(
@@ -1295,7 +1565,7 @@ describe('RoomManager', () => {
     describe('serverUndeafenUser', () => {
       it('should clear both flags without resuming producers or consumers', async () => {
         // u-1 produces audio
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
         const { info: producerInfo } = await setupProducer(manager, mockRouter, 'room-1', 'u-1');
 
         // u-2 joins, produces audio, and consumes u-1's audio
@@ -1303,9 +1573,7 @@ describe('RoomManager', () => {
           'room-1',
           'u-2',
           'sock-2',
-          'bob',
-          undefined,
-          undefined,
+          { username: 'bob' },
           createRtpCapabilities() as any
         );
         const { producer: u2Producer } = await setupProducer(manager, mockRouter, 'room-1', 'u-2');
@@ -1334,7 +1602,7 @@ describe('RoomManager', () => {
 
     describe('userMuteParticipant', () => {
       it('should pause audio producers without setting server flags', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
         const { producer } = await setupProducer(manager, mockRouter, 'room-1', 'u-1');
 
         await manager.userMuteParticipant('room-1', 'u-1');
@@ -1345,7 +1613,7 @@ describe('RoomManager', () => {
       });
 
       it('should not pause video producers', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
         const { producer } = await setupProducer(
           manager,
           mockRouter,
@@ -1364,7 +1632,7 @@ describe('RoomManager', () => {
     describe('userDeafenParticipant', () => {
       it('should pause audio producers and consumers without setting server flags', async () => {
         // u-1 produces audio
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
         const { info: producerInfo } = await setupProducer(manager, mockRouter, 'room-1', 'u-1');
 
         // u-2 joins, produces audio, and consumes u-1's audio
@@ -1372,9 +1640,7 @@ describe('RoomManager', () => {
           'room-1',
           'u-2',
           'sock-2',
-          'bob',
-          undefined,
-          undefined,
+          { username: 'bob' },
           createRtpCapabilities() as any
         );
         const { producer: u2Producer } = await setupProducer(manager, mockRouter, 'room-1', 'u-2');
@@ -1398,7 +1664,7 @@ describe('RoomManager', () => {
 
     describe('enforcement on join', () => {
       it('should initialize serverMuted and serverDeafened as false', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
 
         const participant = manager.getParticipant('room-1', 'u-1');
         expect(participant?.serverMuted).toBe(false);
@@ -1406,7 +1672,7 @@ describe('RoomManager', () => {
       });
 
       it('should persist flags after being set', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
 
         await manager.serverMuteUser('room-1', 'u-1');
         await manager.serverDeafenUser('room-1', 'u-1');
@@ -1442,7 +1708,7 @@ describe('resumeConsumer last-N guard (#1544)', () => {
     rm = new RoomManager(createMockMediasoupService(router) as any);
 
     // u-1 produces mic audio.
-    await rm.joinRoom('room-1', 'u-1', 'sock-1', 'alice');
+    await rm.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
     const sendTransport = createMockTransport();
     router.createWebRtcTransport.mockResolvedValueOnce(sendTransport);
     await rm.createTransport('room-1', 'u-1', 'send');
@@ -1462,9 +1728,7 @@ describe('resumeConsumer last-N guard (#1544)', () => {
       'room-1',
       'u-2',
       'sock-2',
-      'bob',
-      undefined,
-      undefined,
+      { username: 'bob' },
       createRtpCapabilities() as any
     );
     const recvTransport = createMockTransport();
@@ -1488,6 +1752,19 @@ describe('resumeConsumer last-N guard (#1544)', () => {
     consumerId: string
   ) {
     return room.participants.get(userId)!.consumers.get(consumerId) as any;
+  }
+
+  /**
+   * #1742: last-N only ENGAGES when the room exceeds the cap. Inflate the
+   * server-authoritative mic-publisher count past N (with filler ids, so we
+   * don't stand up N real producers) so the evict/admit path genuinely
+   * pauses/resumes consumers. In a room at/under N last-N is a no-op — that path
+   * has its own dedicated suite (`audio last-N small-room no-op (#1742)`).
+   */
+  function makeRoomOverCap(room: import('../src/lib/roomManager.js').Room): void {
+    while (room.micProducerIds.size <= resolveAudioLastN(room)) {
+      room.micProducerIds.add(`filler-${room.micProducerIds.size}`);
+    }
   }
 
   it('refuses to resume a consumer in lastNPausedConsumers (client cannot bypass the cap)', async () => {
@@ -1514,11 +1791,15 @@ describe('resumeConsumer last-N guard (#1544)', () => {
     expect(consumer.resume).toHaveBeenCalledOnce();
   });
 
-  it('never pauses the PRODUCER across an admit -> evict cycle (only consumers)', async () => {
+  it('never pauses the PRODUCER across an admit -> evict cycle, only consumers (over-cap room)', async () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(0);
       const { room, consumer } = await setupRoomWithAudioConsumer();
+      // #1742: last-N only engages over the cap; push the room over N so the
+      // evict path genuinely pauses a consumer (the invariant under test). In a
+      // room at/under N this whole cycle is a no-op — see the #1742 suite.
+      makeRoomOverCap(room);
       const observer = router._audioLevelObserver;
 
       // The mic producer's own mock — assert last-N never touches it.
@@ -1548,12 +1829,17 @@ describe('resumeConsumer last-N guard (#1544)', () => {
     }
   });
 
-  it('does NOT resume a SERVER-DEAFENED subscriber when its speaker enters top-N (no moderation bypass)', async () => {
+  it('does NOT resume a SERVER-DEAFENED subscriber when its speaker enters top-N (no moderation bypass, over-cap room)', async () => {
     const { rm, room, userId, consumer } = await setupRoomWithAudioConsumer();
+    // #1742: only meaningful over the cap, where last-N's admit path runs.
+    makeRoomOverCap(room);
+    // Simulate c-audio already last-N-paused (its speaker was out of the top-N),
+    // so the admit below genuinely reaches the resume branch the deafen blocks.
+    room.lastNPausedConsumers.add('c-audio');
     // Server-deafen u-2 (a moderation control) → all their audio consumers paused.
     await rm.serverDeafenUser(room.id, userId);
     consumer.resume.mockClear();
-    // p-mic enters the top-N — last-N would normally resume u-2's consumer.
+    // p-mic enters the top-N — last-N's admit would normally resume u-2's consumer.
     router._audioLevelObserver._emit('volumes', [{ producer: { id: 'p-mic' }, volume: -20 }]);
     await Promise.resolve();
     await Promise.resolve();
@@ -1570,6 +1856,239 @@ describe('resumeConsumer last-N guard (#1544)', () => {
     room.lastNPausedConsumers.add('c-audio');
     rm.closeConsumer(room.id, userId, 'c-audio');
     expect(room.lastNPausedConsumers.has('c-audio')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Audio last-N small-room no-op regression (#1742)
+//
+// Regression for the voice-crackle report: in a room whose mic-publisher count
+// is at or under the forwarded-speaker cap (N), last-N MUST be a structural
+// no-op — no mic consumer is ever paused, and a fresh consumer is never seeded
+// last-N-paused. The cap is a DoS guardrail for rooms LARGER than N; applying it
+// to a room that already fits under N is pure regression: the evict-on-silence
+// pause/resume churn loses the leading frames of each new utterance during the
+// resume gap → Opus PLC crackle (the user-reported symptom).
+// ---------------------------------------------------------------------------
+
+describe('audio last-N small-room no-op (#1742)', () => {
+  /**
+   * Build a small room: u-1 publishes mic audio 'p-mic'; u-2 subscribes with a
+   * deterministic consumer id 'c-audio'. micProducerIds.size === 1, well under
+   * the free cap N=8 — last-N should never engage. Mirrors the #1544 guard
+   * suite's scaffolding.
+   */
+  async function setupSmallRoom(opts: { overCap?: boolean } = {}): Promise<{
+    rm: RoomManager;
+    room: import('../src/lib/roomManager.js').Room;
+    router: ReturnType<typeof createMockRouter>;
+    consumer: ReturnType<typeof createMockConsumer>;
+  }> {
+    const router = createMockRouter();
+    const rm = new RoomManager(createMockMediasoupService(router) as any);
+
+    // u-1 publishes mic audio.
+    await rm.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+    const sendTransport = createMockTransport();
+    router.createWebRtcTransport.mockResolvedValueOnce(sendTransport);
+    await rm.createTransport('room-1', 'u-1', 'send');
+    const producer = createMockProducer({ kind: 'audio', id: 'p-mic' });
+    sendTransport.produce.mockResolvedValueOnce(producer);
+    const producerInfo = await rm.produce(
+      'room-1',
+      'u-1',
+      sendTransport.id,
+      'audio',
+      createRtpParameters() as any,
+      'mic'
+    );
+
+    const room = rm.getRoom('room-1')!;
+    // #1742: optionally simulate an over-cap room BEFORE the consume so the
+    // consume-time last-N seed exercises its over-cap branch.
+    if (opts.overCap) {
+      while (room.micProducerIds.size <= resolveAudioLastN(room)) {
+        room.micProducerIds.add(`filler-${room.micProducerIds.size}`);
+      }
+    }
+
+    // u-2 subscribes to u-1's mic with a deterministic consumer id.
+    await rm.joinRoom(
+      'room-1',
+      'u-2',
+      'sock-2',
+      { username: 'bob' },
+      createRtpCapabilities() as any
+    );
+    const recvTransport = createMockTransport();
+    const consumer = createMockConsumer({
+      id: 'c-audio',
+      producerId: producerInfo.producerId,
+      kind: 'audio',
+    });
+    recvTransport.consume.mockResolvedValue(consumer);
+    router.createWebRtcTransport.mockResolvedValueOnce(recvTransport);
+    await rm.createTransport('room-1', 'u-2', 'recv');
+    await rm.consume('room-1', 'u-2', producerInfo.producerId);
+
+    return { rm, room, router, consumer };
+  }
+
+  it('does not seed a fresh mic consumer as last-N-paused when the room is at/under the cap', async () => {
+    const { room } = await setupSmallRoom();
+    // micProducerIds (1) <= resolveAudioLastN (8): everyone fits under the cap,
+    // so a fresh joiner's consumer must NOT start last-N-paused (it must hear
+    // from the first frame). Pre-fix the consume-time seed pauses it because the
+    // producer is not yet in the (empty) top-N.
+    expect(room.micProducerIds.size).toBeLessThanOrEqual(resolveAudioLastN(room));
+    expect(room.lastNPausedConsumers.has('c-audio')).toBe(false);
+  });
+
+  it('never pauses a mic consumer across a speak/silence cycle when the room is at/under the cap', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      const { room, router, consumer } = await setupSmallRoom();
+      const observer = router._audioLevelObserver;
+
+      // Two full speak → (past-hold) silence → speak cycles, mirroring real
+      // back-and-forth conversation in a 2-person call. Each silence advances
+      // past the 2500ms hysteresis hold so ActiveSpeakerSet evicts the speaker.
+      for (let cycle = 0; cycle < 2; cycle++) {
+        observer._emit('volumes', [{ producer: { id: 'p-mic' }, volume: -20 }]);
+        await Promise.resolve();
+        await Promise.resolve();
+
+        vi.setSystemTime(2500 * (cycle + 1) + (cycle + 1));
+        observer._emit('silence');
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+
+      // A room that already fits under N must never pause a consumer. Pre-fix the
+      // evict-on-silence path pauses c-audio on every conversational silence
+      // boundary → the reported per-utterance crackle.
+      expect(consumer.pause).not.toHaveBeenCalled();
+      expect(room.lastNPausedConsumers.has('c-audio')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resumes a last-N-paused consumer once the room shrinks back to/under the cap (no stuck-silent participant)', async () => {
+    const { room, router, consumer } = await setupSmallRoom();
+    const observer = router._audioLevelObserver;
+
+    // Simulate the consumer having been last-N-paused during a prior over-cap
+    // window: push the count over N and mark/pause the consumer as the over-cap
+    // path would have.
+    while (room.micProducerIds.size <= resolveAudioLastN(room)) {
+      room.micProducerIds.add(`filler-${room.micProducerIds.size}`);
+    }
+    room.lastNPausedConsumers.add('c-audio');
+    await consumer.pause();
+    consumer.resume.mockClear();
+
+    // A second consumer that is NOT last-N-paused (e.g. an already-active mic or
+    // a screen-audio consumer): the drain must leave it untouched — it only
+    // resumes consumers it itself paused for last-N.
+    const otherConsumer = createMockConsumer({
+      id: 'c-other',
+      producerId: 'p-other',
+      kind: 'audio',
+    });
+    room.participants.get('u-2')!.consumers.set('c-other', otherConsumer as any);
+
+    // The room shrinks back to <= N (publishers left).
+    room.micProducerIds.clear();
+    room.micProducerIds.add('p-mic');
+    expect(room.micProducerIds.size).toBeLessThanOrEqual(resolveAudioLastN(room));
+
+    // Observer-tick drain path (backstop): an AudioLevelObserver tick drives
+    // applyLastNDelta → the small-room no-op branch, which drains the paused set
+    // and resumes the consumer. (The producer-close path — removeMicProducer —
+    // is the primary, event-driven trigger, covered by its own test below.)
+    observer._emit('silence');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(room.lastNPausedConsumers.has('c-audio')).toBe(false);
+    expect(consumer.resume).toHaveBeenCalled();
+    // The non-paused consumer is not touched by the drain.
+    expect(otherConsumer.resume).not.toHaveBeenCalled();
+  });
+
+  it('still seeds a fresh mic consumer last-N-paused when the room is over the cap (#1544/#1632 enforcement preserved)', async () => {
+    const { room } = await setupSmallRoom({ overCap: true });
+    expect(room.micProducerIds.size).toBeGreaterThan(resolveAudioLastN(room));
+    // Over the cap + the producer not yet in the (empty) top-N → the consumer is
+    // seeded last-N-paused so the client's unconditional resume is refused until
+    // the speaker enters the top-N (the egress cap still holds for large rooms).
+    expect(room.lastNPausedConsumers.has('c-audio')).toBe(true);
+  });
+
+  it('drains on shrink but does NOT resume a SERVER-DEAFENED subscriber (moderation not bypassed)', async () => {
+    const { rm, room, router, consumer } = await setupSmallRoom();
+    const observer = router._audioLevelObserver;
+
+    // Over-cap window: the consumer is last-N-paused.
+    while (room.micProducerIds.size <= resolveAudioLastN(room)) {
+      room.micProducerIds.add(`filler-${room.micProducerIds.size}`);
+    }
+    room.lastNPausedConsumers.add('c-audio');
+    // Moderation: server-deafen the subscriber.
+    await rm.serverDeafenUser(room.id, 'u-2');
+    consumer.resume.mockClear();
+
+    // Room shrinks back to <= N → the drain path runs on the next tick.
+    room.micProducerIds.clear();
+    room.micProducerIds.add('p-mic');
+    observer._emit('silence');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The consumer is cleared from the last-N set (last-N no longer owns it)…
+    expect(room.lastNPausedConsumers.has('c-audio')).toBe(false);
+    // …but it is NOT resumed — the deafen pause must hold (moderation control).
+    expect(consumer.resume).not.toHaveBeenCalled();
+  });
+
+  it('resumes a last-N-paused consumer when a publisher leaves and the room drops to <= N (event-driven, no observer tick)', async () => {
+    const { rm, room, router, consumer } = await setupSmallRoom();
+
+    // Add a second real publisher u-3 (p-extra) so closing it shrinks the room
+    // without tearing down c-audio (which subscribes to u-1's p-mic).
+    await rm.joinRoom('room-1', 'u-3', 'sock-3', { username: 'carol' });
+    const sendTransport3 = createMockTransport();
+    router.createWebRtcTransport.mockResolvedValueOnce(sendTransport3);
+    await rm.createTransport('room-1', 'u-3', 'send');
+    const producer3 = createMockProducer({ kind: 'audio', id: 'p-extra' });
+    sendTransport3.produce.mockResolvedValueOnce(producer3);
+    await rm.produce(
+      'room-1',
+      'u-3',
+      sendTransport3.id,
+      'audio',
+      createRtpParameters() as any,
+      'mic'
+    );
+
+    // Push the room over the cap and mark/pause c-audio as the over-cap path would.
+    while (room.micProducerIds.size <= resolveAudioLastN(room)) {
+      room.micProducerIds.add(`filler-${room.micProducerIds.size}`);
+    }
+    room.lastNPausedConsumers.add('c-audio');
+    await consumer.pause();
+    consumer.resume.mockClear();
+
+    // A DIFFERENT publisher leaves → closeProducer routes through removeMicProducer,
+    // which drops the room to <= N. The drain must fire from THIS leave event with
+    // NO AudioLevelObserver tick (the #1742 event-driven shrink-recovery path).
+    await rm.closeProducer('room-1', 'u-3', 'p-extra');
+
+    expect(room.micProducerIds.size).toBeLessThanOrEqual(resolveAudioLastN(room));
+    expect(room.lastNPausedConsumers.has('c-audio')).toBe(false);
+    expect(consumer.resume).toHaveBeenCalled();
   });
 });
 

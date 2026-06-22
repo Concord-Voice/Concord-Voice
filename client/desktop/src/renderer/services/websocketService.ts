@@ -130,6 +130,14 @@ export class WebSocketService {
   // client is known-offline (navigator.onLine === false). Cleared on the
   // open/disconnect paths and when it fires.
   private onlineListener: (() => void) | null = null;
+  // Bounded fallback timer armed alongside onlineListener. navigator.onLine is
+  // NOT reliable in Electron — it can stick `false` and the 'online' event may
+  // never (re)fire (e.g. across a server-deploy network flap). If 'online'
+  // hasn't fired within ONLINE_FALLBACK_MS, force a real reconnect attempt
+  // rather than wait forever, which would strand the client in RECONNECTING
+  // until a manual app restart (regression #1768).
+  private onlineFallbackTimer: NodeJS.Timeout | null = null;
+  private readonly ONLINE_FALLBACK_MS = 15_000;
 
   // Message handlers
   private readonly messageHandlers = new Map<string, Set<MessageHandler>>();
@@ -643,7 +651,7 @@ export class WebSocketService {
     return (await ticketRes.json()).ticket as string;
   }
 
-  private async createConnection(signal?: AbortSignal): Promise<void> {
+  private async createConnection(signal?: AbortSignal, forceDespiteOffline = false): Promise<void> {
     if (!this.token) {
       console.error('Cannot connect: No JWT token provided');
       this.setState(ConnectionState.ERROR);
@@ -672,7 +680,7 @@ export class WebSocketService {
     // reliable "definitely offline" signal; navigator.onLine === true is NOT
     // reliable (it only means a route exists), which is why this deliberately
     // does nothing for the origin-502 case — there the client IS online.
-    if (this.isKnownOffline()) {
+    if (this.isKnownOffline() && !forceDespiteOffline) {
       console.debug('[WebSocket] offline — deferring connect until the online event');
       this.setState(ConnectionState.RECONNECTING);
       this.armOnlineRetry();
@@ -951,21 +959,31 @@ export class WebSocketService {
       this.scheduleReconnect();
       return;
     }
-    const listener = () => {
+    // Shared by both the 'online' fast-path and the bounded fallback timer: do a
+    // real reconnect attempt that BYPASSES the offline gate (forceDespiteOffline)
+    // — otherwise the retry would re-hit isKnownOffline() and re-defer forever.
+    const reconnectNow = () => {
       this.clearOnlineRetry();
       this.resetReconnectState();
       this.connectAbort?.abort();
       this.connectAbort = new AbortController();
-      this.createConnection(this.connectAbort.signal);
+      this.createConnection(this.connectAbort.signal, true);
     };
+    const listener = () => reconnectNow();
     this.onlineListener = listener;
     globalThis.addEventListener('online', listener);
+    // Safety net for a stuck navigator.onLine where 'online' never fires (#1768).
+    this.onlineFallbackTimer = setTimeout(reconnectNow, this.ONLINE_FALLBACK_MS);
   }
 
   private clearOnlineRetry(): void {
     if (this.onlineListener) {
       globalThis.removeEventListener('online', this.onlineListener);
       this.onlineListener = null;
+    }
+    if (this.onlineFallbackTimer) {
+      clearTimeout(this.onlineFallbackTimer);
+      this.onlineFallbackTimer = null;
     }
   }
 

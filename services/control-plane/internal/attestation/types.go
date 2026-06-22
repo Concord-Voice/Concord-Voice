@@ -1,4 +1,4 @@
-// Package attestation implements client attestation for example.com (#677).
+// Package attestation implements client attestation for concordvoice.chat (#677).
 // See [internal]0010-client-attestation.md for design decisions.
 package attestation
 

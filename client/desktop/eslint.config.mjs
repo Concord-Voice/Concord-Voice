@@ -308,7 +308,7 @@ export default [
         },
         // #1586: server-origin media <img/video/audio src> must go through
         // resolveMediaUrl(), else a relative /api/v1/media/* path resolves
-        // against the SPA origin (spa.example.com) on the remote SPA
+        // against the SPA origin (spa.concordvoice.chat) on the remote SPA
         // instead of the API host. The `JSXExpressionContainer > X` DIRECT-child
         // form matches only the UNWRAPPED shape — `src={resolveMediaUrl(...)}`
         // nests the field inside a CallExpression and is correctly NOT flagged.

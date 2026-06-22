@@ -156,7 +156,7 @@ with content you share.
 
 ## 4. Permitted Clients
 
-**4.1** Access to the hosted Concord Voice service at example.com
+**4.1** Access to the hosted Concord Voice service at concordvoice.chat
 (the "Hosted Service") is permitted only through official Concord Voice
 client software distributed by Concord Voice ("Official Clients").
 Official Clients are limited to:
@@ -178,7 +178,7 @@ sole discretion, result in immediate suspension or termination of your
 account.
 
 **4.3** This Section 4 governs only the Hosted Service operated by Concord
-Voice at example.com. **It does not apply to self-hosted deployments
+Voice at concordvoice.chat. **It does not apply to self-hosted deployments
 of the Concord Voice source code under the Concord Voice Source License
 1.0.** Operators of self-hosted Concord Voice instances may permit any
 client of their choosing to connect to their own instances; the Official
@@ -477,7 +477,7 @@ properties.
 
 These Terms of Service govern your use of the Concord Voice **Hosted
 Service** — the servers, infrastructure, and services operated by
-Concord Voice at example.com and associated domains.
+Concord Voice at concordvoice.chat and associated domains.
 
 The Concord Voice **source code** is separately licensed under the
 **Concord Voice Source License 1.0** ("CVSL"), the full text of which
@@ -505,7 +505,7 @@ if and to the extent that:
   infrastructure (including but not limited to the Concord Voice
   network, Public Directory, or authentication services); or
 - you separately interact with the Hosted Service (for example, by
-  creating an account at example.com).
+  creating an account at concordvoice.chat).
 
 ### 9.4 Commercial License for For-Profit and Government Self-Hosting
 

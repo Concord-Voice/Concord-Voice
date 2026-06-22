@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/admin"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/api"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/attestation"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/auth"
@@ -35,6 +36,14 @@ const (
 )
 
 func main() {
+	// Admin CLI subcommand dispatch (#1688): `control-plane admin <verb>` runs the
+	// adminctl provisioning tooling (bootstrap / enroll / reset-enrollment) instead
+	// of booting the server. Invoked out-of-band via `docker exec` for first-admin
+	// provisioning and break-glass recovery — see the admin-auth design spec.
+	if len(os.Args) > 1 && os.Args[1] == "admin" {
+		os.Exit(admin.RunAdminCtl(os.Args[2:]))
+	}
+
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {

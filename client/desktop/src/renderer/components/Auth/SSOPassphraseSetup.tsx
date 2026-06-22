@@ -210,7 +210,7 @@ const SSOPassphraseSetup: React.FC = () => {
             placeholder="your_username"
           />
           <span className="sso-passphrase-setup__hint">
-            This will be your identity: {username || 'username'}@example.com
+            This will be your identity: {username || 'username'}@concordvoice.chat
           </span>
         </div>
 

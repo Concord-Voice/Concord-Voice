@@ -21,7 +21,7 @@ import (
 // separately) is a pass-through in this mode so existing routes are
 // unaffected by a degraded attestation surface.
 //
-// When REQUIRE_CLIENT_ATTESTATION=true (hosted example.com),
+// When REQUIRE_CLIENT_ATTESTATION=true (hosted concordvoice.chat),
 // initialization failures are fatal — matches the fail-closed posture
 // required by ADR-0010 D2.
 func buildAttestationHandler(

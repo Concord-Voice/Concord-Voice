@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
@@ -70,23 +71,28 @@ const (
 
 // Handler handles DM-related requests.
 type Handler struct {
-	db    *sql.DB
-	log   *logger.Logger
-	hub   *websocket.Hub
-	cfg   *config.Config
-	nats  *natsclient.Client
-	redis *redis.Client
+	db       *sql.DB
+	log      *logger.Logger
+	hub      *websocket.Hub
+	cfg      *config.Config
+	nats     *natsclient.Client
+	redis    *redis.Client
+	entCache *entitlements.Cache
 }
 
-// NewHandler creates a new DM handler.
-func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, cfg *config.Config, nats *natsclient.Client, redis *redis.Client) *Handler {
+// NewHandler creates a new DM handler. entCache is the shared entitlement-tier
+// cache (#1296) used to resolve the joining user's media entitlements for DM
+// voice joins (#1300); production wiring passes the same instance the auth and
+// voice handlers receive.
+func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, cfg *config.Config, nats *natsclient.Client, redis *redis.Client, entCache *entitlements.Cache) *Handler {
 	return &Handler{
-		db:    db,
-		log:   log,
-		hub:   hub,
-		cfg:   cfg,
-		nats:  nats,
-		redis: redis,
+		db:       db,
+		log:      log,
+		hub:      hub,
+		cfg:      cfg,
+		nats:     nats,
+		redis:    redis,
+		entCache: entCache,
 	}
 }
 
@@ -1551,14 +1557,24 @@ func (h *Handler) AuthorizeVoiceJoin(c *gin.Context) {
 		}
 	}
 
-	h.log.Info("DM voice join authorized", "user_id", userID, "conversation_id", convID)
+	// Resolve the joining user's media entitlements server-side from the
+	// AUTHENTICATED user_id (never a client value). Per-user enforcement is
+	// room-kind-independent, so DM voice joins carry the same media_entitlements
+	// object as server-channel joins. GetTier fails closed to free, and MediaFor →
+	// For("") returns the free caps for an unknown/empty tier — a resolution
+	// problem degrades to the free floor, never blocks the join, never grants
+	// premium (#1300 §3/§5).
+	mediaEnt := entitlements.MediaFor(h.entCache.GetTier(c.Request.Context(), userID))
+
+	h.log.Info("DM voice join authorized", "user_id", userID, "conversation_id", convID, "media_tier", mediaEnt.Tier)
 
 	c.JSON(http.StatusOK, gin.H{
-		"allowed":          true,
-		"media_server_url": h.cfg.MediaPlaneURL,
-		"ice_servers":      h.cfg.ICEServers(userID),
-		"server_muted":     serverMuted,
-		"server_deafened":  serverDeafened,
+		"allowed":            true,
+		"media_server_url":   h.cfg.MediaPlaneURL,
+		"ice_servers":        h.cfg.ICEServers(userID),
+		"server_muted":       serverMuted,
+		"server_deafened":    serverDeafened,
+		"media_entitlements": mediaEnt,
 		"conversation": gin.H{
 			"id":          convID,
 			"is_group":    isGroup,

@@ -865,6 +865,8 @@ func TestGetPrivacySettingsDefaults(t *testing.T) {
 	assert.Equal(t, true, priv["messages_server_members"])
 	assert.Equal(t, float64(2), priv["dm_privacy_level"])
 	assert.Equal(t, false, priv["searchable_by_username"])
+	// #1766: no-row fallback must default load_gifs_automatically ON for new users.
+	assert.Equal(t, true, priv["load_gifs_automatically"])
 }
 
 func TestGetPrivacySettingsWithSavedSettings(t *testing.T) {
@@ -997,8 +999,10 @@ func TestGetPrivacySettingsKlipyDefaults(t *testing.T) {
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
 	priv := body["privacy"].(map[string]interface{})
-	// Privacy-first defaults
-	assert.Equal(t, false, priv["load_gifs_automatically"])
+	// #1766: GIF auto-load now defaults ON for new users (KLIPY media is always
+	// proxied through the control-plane, so auto-load doesn't expose the user's IP).
+	assert.Equal(t, true, priv["load_gifs_automatically"])
+	// Proxy toggle stays privacy-first OFF (opt-in to the slight latency cost).
 	assert.Equal(t, false, priv["enable_klipy_proxy"])
 	// Personalization defaults ON because turning it OFF degrades search quality
 	assert.Equal(t, true, priv["share_personalization_with_gif_provider"])

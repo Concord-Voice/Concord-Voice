@@ -87,6 +87,54 @@ describe('userStore', () => {
       expect(useAuthStore.getState().accessToken).toBeNull();
     });
 
+    it('does NOT wipe persisted tokens on a 401 when "Remember Me" is on (regression #1768)', async () => {
+      // Regression for #1768 (defect B): a transient 401 (e.g. during a server
+      // deploy) must NOT delete the on-disk refresh token when rememberMe is set.
+      // apiClient.handleRefreshFailure already honors rememberMe ("DO NOT clear
+      // disk tokens"), but fetchUser then fired a SECOND, rememberMe-blind
+      // electron.clearTokens() that nuked secure-token.dat — so the next launch
+      // landed on the login screen despite "Remember Me" being checked.
+      const clearTokensSpy = vi.fn();
+      (window.electron as unknown as { clearTokens: () => void }).clearTokens = clearTokensSpy;
+      useAuthStore.getState().setRememberMe(true);
+      useAuthStore.getState().setAccessToken('mock-token');
+
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me`, () =>
+          HttpResponse.json({ error: 'Unauthorized' }, { status: 401 })
+        )
+      );
+
+      await useUserStore.getState().fetchUser();
+
+      // The remembered session must survive: disk tokens are NOT cleared.
+      expect(clearTokensSpy).not.toHaveBeenCalled();
+      // In-memory UI auth is still cleared (parity with prior behavior).
+      expect(useUserStore.getState().user).toBeNull();
+    });
+
+    it('DOES wipe persisted tokens on a 401 when "Remember Me" is off (token-clear authority)', async () => {
+      // Companion to the rememberMe=true case: with Remember Me OFF, a 401 whose
+      // refresh fails routes through apiClient.handleRefreshFailure -> nuclearReset
+      // -> electron.clearTokens(), wiping the disk session. Locks the "single
+      // authority" invariant from BOTH sides (#1768 review finding #7).
+      const clearTokensSpy = vi.fn();
+      (window.electron as unknown as { clearTokens: () => void }).clearTokens = clearTokensSpy;
+      useAuthStore.getState().setRememberMe(false);
+      useAuthStore.getState().setAccessToken('mock-token');
+
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me`, () =>
+          HttpResponse.json({ error: 'Unauthorized' }, { status: 401 })
+        )
+      );
+
+      await useUserStore.getState().fetchUser();
+
+      expect(clearTokensSpy).toHaveBeenCalled();
+      expect(useUserStore.getState().user).toBeNull();
+    });
+
     it('sets error on failure', async () => {
       server.use(
         http.get(`${API_BASE}/api/v1/users/me`, () =>

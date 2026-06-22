@@ -40,7 +40,7 @@ func newCacheForTest(repo *attestation.Repository, log *logger.Logger) *attestat
 //     non-nil Handler whose publish endpoint will reject all payloads (nil
 //     verifier short-circuits before reaching VerifySPA / VerifyBinary).
 //
-//   - REQUIRE_CLIENT_ATTESTATION=true (hosted example.com): the same
+//   - REQUIRE_CLIENT_ATTESTATION=true (hosted concordvoice.chat): the same
 //     failures are fatal via log.Fatal. Not exercised here — log.Fatal exits
 //     the test process, so coverage of the fatal branches comes from
 //     out-of-process integration tests, not unit tests.
@@ -117,7 +117,7 @@ func newDisabledAttestationConfig() *config.Config {
 		// branch fires. Required to cover the "OIDC verifier init failed"
 		// path without standing up a real JWKS provider.
 		OIDCIssuer:         "",
-		OIDCAudience:       "https://api.example.com",
+		OIDCAudience:       "https://api.concordvoice.chat",
 		OIDCSubjectPrefix:  "repo:markdrogersjr/Concord:",
 		OIDCSPAWorkflow:    "main-cd.yml",
 		OIDCSPARef:         "refs/heads/main",

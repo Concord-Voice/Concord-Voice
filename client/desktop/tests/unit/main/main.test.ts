@@ -1200,4 +1200,54 @@ describe('main.ts', () => {
       expect(callback).toHaveBeenCalledWith({ requestHeaders: {} });
     });
   });
+
+  describe('SPA reload IPC (spa:reloadLatest / spa:checkForUpdate)', () => {
+    it('spa:reloadLatest rejects an untrusted sender frame and does NOT navigate', async () => {
+      // The renderer never supplies a URL; an untrusted frame must be refused at
+      // the boundary FIRST — before any state check, resolveSpaSource, or loadURL.
+      (mockMainWindow.loadURL as Mock).mockClear();
+      const result = await handlers.get('spa:reloadLatest')!({
+        senderFrame: { url: 'https://evil.example/' },
+      });
+      expect(result).toEqual({ mode: 'bundled', changed: false, rejected: true });
+      expect(mockMainWindow.loadURL).not.toHaveBeenCalled();
+    });
+
+    it('spa:reloadLatest is inert (no navigation) in dev/unpackaged mode', async () => {
+      const { app } = await import('electron');
+      (app as unknown as { isPackaged: boolean }).isPackaged = false;
+      (mockMainWindow.loadURL as Mock).mockClear();
+      const result = await handlers.get('spa:reloadLatest')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      });
+      expect(result).toEqual({ mode: 'bundled', changed: false });
+      expect(mockMainWindow.loadURL).not.toHaveBeenCalled();
+    });
+
+    it('spa:checkForUpdate rejects an untrusted sender frame', async () => {
+      const result = await handlers.get('spa:checkForUpdate')!({
+        senderFrame: { url: 'https://evil.example/' },
+      });
+      expect(result).toEqual({
+        currentMode: 'bundled',
+        remoteAvailable: false,
+        newerBytesAvailable: null,
+        reason: 'rejected',
+      });
+    });
+
+    it('spa:checkForUpdate returns an inert result in dev/unpackaged mode (permitted frame)', async () => {
+      const { app } = await import('electron');
+      (app as unknown as { isPackaged: boolean }).isPackaged = false;
+      const result = await handlers.get('spa:checkForUpdate')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      });
+      expect(result).toEqual({
+        currentMode: 'remote',
+        remoteAvailable: false,
+        newerBytesAvailable: null,
+        reason: 'dev mode',
+      });
+    });
+  });
 });

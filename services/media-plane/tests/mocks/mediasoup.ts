@@ -151,7 +151,13 @@ export function createRtpCapabilities(videoCodecs: string[] = ['video/VP8', 'vid
   };
 }
 
-export function createRtpParameters() {
+/**
+ * Build mock RtpParameters for an opus audio producer. By default it omits opus
+ * fmtp parameters (the audio-tier gate is a no-op without them — mediasoup
+ * defaults apply). Pass `opusParameters` to simulate a client-declared opus
+ * ptime / maxaveragebitrate for the #1300 tier-gate tests.
+ */
+export function createRtpParameters(opusParameters?: Record<string, unknown>) {
   return {
     codecs: [
       {
@@ -159,6 +165,7 @@ export function createRtpParameters() {
         payloadType: 111,
         clockRate: 48000,
         channels: 2,
+        ...(opusParameters ? { parameters: opusParameters } : {}),
       },
     ],
     headerExtensions: [],

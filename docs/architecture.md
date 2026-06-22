@@ -104,8 +104,8 @@ flowchart TB
     end
 
     subgraph Edge
-        CFP["Cloudflare Pages<br/>spa.example.com<br/>(SPA bundle)"]
-        CF["Cloudflare proxy<br/>api.example.com"]
+        CFP["Cloudflare Pages<br/>spa.concordvoice.chat<br/>(SPA bundle)"]
+        CF["Cloudflare proxy<br/>api.concordvoice.chat"]
     end
 
     subgraph Services
@@ -158,7 +158,7 @@ The desktop client is the only shipping client. Source: `client/desktop/`.
 
 #### SPA Deploy Lifecycle (ADR-0001, ADR-0015)
 
-The SPA bundle is served by **Cloudflare Pages** at the CONSTANT URL `https://spa.example.com/index.html`; serving is decoupled from the Go control-plane. The per-deploy SHA no longer appears in the URL; Pages publishes each deployment atomically and serves the latest at the constant host. The bundle stays decoupled from its serving origin at build time: Vite's `base: './'` makes all chunks resolve relative to the URL `index.html` was loaded from.
+The SPA bundle is served by **Cloudflare Pages** at the CONSTANT URL `https://spa.concordvoice.chat/index.html`; serving is decoupled from the Go control-plane. The per-deploy SHA no longer appears in the URL; Pages publishes each deployment atomically and serves the latest at the constant host. The bundle stays decoupled from its serving origin at build time: Vite's `base: './'` makes all chunks resolve relative to the URL `index.html` was loaded from.
 
 The deploy pipeline `wrangler pages deploy`s the renderer bundle to Cloudflare Pages, writes `spa.env` with the constant `SPA_URL` (the per-deploy SHA is recorded as the `SPA_VERSION` annotation only, never in the URL), and commits + pushes `spa.env` back to main via a short-lived, least-privilege (Contents:write) GitHub App installation token.
 
@@ -269,7 +269,7 @@ erDiagram
         VARCHAR display_name
     }
     user_keys {
-        UUID user_id PK_FK
+        UUID user_id PK, FK
         BYTEA wrapped_private_key
         BYTEA key_derivation_salt
         INTEGER key_version
@@ -293,8 +293,8 @@ erDiagram
         UUID linked_voice_channel_id FK
     }
     server_members {
-        UUID server_id PK_FK
-        UUID user_id PK_FK
+        UUID server_id PK, FK
+        UUID user_id PK, FK
     }
     roles {
         UUID id PK
@@ -344,8 +344,8 @@ erDiagram
         UUID created_by FK
     }
     dm_participants {
-        UUID conversation_id PK_FK
-        UUID user_id PK_FK
+        UUID conversation_id PK, FK
+        UUID user_id PK, FK
         VARCHAR role "admin or member"
     }
     dm_messages {
@@ -419,8 +419,31 @@ erDiagram
 | Social / server-mgmt | `friend_codes` (000027); `server_invites` (000009); `ownership_transfers` (000047) |
 | Compliance | `audit_log` (000035); `account_deletions` (000059) |
 | Attestation | `release_binaries`, `release_spas` (000066) |
+| Admin console | `admin_users`, `admin_webauthn_credentials`, `admin_audit_log` (000077) — sessions are Redis-backed (opaque sids), not a table |
 
 > Notable schema history: group-DM admin roles added `dm_participants.role` (`admin`/`member`) + `dm_conversations.icon_url` (000053); `dm_messages` gained a `call_event` type + `call_event_payload` JSONB (000064), and the transient `kind` column was dropped in favor of `type` (000065); `account_deletions.sentry_delete_attempted` was dropped (000060) when Sentry was removed; `key_revocations.revoked_by` was changed to `ON DELETE SET NULL` (000059) so account erasure isn't blocked.
+
+#### Admin auth surface (#1688)
+
+The admin console is a **separate identity domain** — it never shares state with end-user auth (no JWT, no `users` table, no refresh tokens).
+
+**Identity:** `admin_users` table (separate from `users`). Admins are created via the `adminctl bootstrap` CLI subcommand inside the running container (first admin only) or via an authenticated in-console `POST /admin/api/v1/admins` (subsequent admins).
+
+**Auth flow (2FA mandatory):**
+1. `POST /admin/api/v1/auth/password` — constant-time password verify; returns a short-lived challenge handle + WebAuthn `BeginLogin` assertion. **Password alone never yields a session.**
+2. `POST /admin/api/v1/auth/webauthn` — `FinishLogin` with `userVerification: required`; on success mints an opaque Redis session.
+
+**Sessions:** 256-bit CSPRNG session id stored in Redis under `admin_session:{sid}`. Cookie `__Host-cv_admin_sid`: `Secure; HttpOnly; SameSite=Strict; Path=/`. Idle TTL 30 min (sliding); absolute cap 8 h. Logout `DEL`s the key (instant revocation). The `AdminAuthRequired` middleware validates the cookie → Redis → expiry on every `/admin` route.
+
+**Hardware key requirement:** `attestation: direct` is enforced at enrollment; the AAGUID is checked against `ADMIN_WEBAUTHN_ALLOWED_AAGUIDS` (canonical YubiKey 5-series set). Only approved hardware keys can become admin credentials.
+
+**Lockout:** per-account + per-IP exponential backoff in Redis (IP is **hashed**, not stored raw) after 5 consecutive failures.
+
+**Audit log:** `admin_audit_log` table — append-only, records every auth outcome and admin action with a sanitized actor identifier and opaque source reference. Never records passwords, assertion bytes, raw IPs, or end-user PII.
+
+**Dormancy:** the entire surface is gated by `ADMIN_CONSOLE_ENABLED` (default `false`). All `/admin/*` routes return 404 when disabled. See the "Post-deploy: bootstrap the first admin (#1688)" section in the deploy runbook for provisioning.
+
+**Config env vars** (all `vars.*`, non-secret): `ADMIN_CONSOLE_ENABLED`, `ADMIN_WEBAUTHN_RP_ID`, `ADMIN_WEBAUTHN_RP_ORIGINS`, `ADMIN_WEBAUTHN_ALLOWED_AAGUIDS`.
 
 ### Media Plane (Node.js + mediasoup) ✅ Implemented
 
@@ -589,7 +612,7 @@ sequenceDiagram
     A->>A: Generate CSK' at epoch N+1
     A->>S: Distribute wrapped CSK' to remaining members
     A->>S: Record key_revocations {revoked_epoch: N, successor_epoch: N+1}
-    Note over S: New messages use epoch N+1;<br/>removed member cannot derive CSK'
+    Note over S: New messages use epoch N+1<br/>removed member cannot derive CSK'
 ```
 
 Server channels (`channel_keys` / `key_revocations`) and DMs (`dm_channel_keys` / `dm_key_revocations`) use parallel epoch ledgers. The `CHECK(successor_epoch > revoked_epoch)` constraint is present on `dm_key_revocations` (migration 000041); on `key_revocations` the constraint was added only in a re-declaration (000035) that is a no-op once the table exists from 000028, so it may be absent on already-migrated databases.
@@ -606,12 +629,12 @@ The desktop client discovers its runtime config — it is **not** hardcoded. `cl
 
 ### SaaS (Cloud-Hosted)
 
-Production runs the Docker Compose stack on a VM behind the Cloudflare proxy (`api.example.com`), with the SPA bundle served separately by Cloudflare Pages (`spa.example.com`).
+Production runs the Docker Compose stack on a VM behind the Cloudflare proxy (`api.concordvoice.chat`), with the SPA bundle served separately by Cloudflare Pages (`spa.concordvoice.chat`).
 
 ```text
 Desktop client
    │
-   ├── SPA bundle ───────────► Cloudflare Pages (spa.example.com)
+   ├── SPA bundle ───────────► Cloudflare Pages (spa.concordvoice.chat)
    │
    └── API / WebSocket ──────► Cloudflare proxy ──► VM
                                                      ├── control-plane :8080
@@ -623,7 +646,7 @@ Desktop client
                                                      └── coturn (STUN/TURN, TLS)
 ```
 
-The Cloudflare proxy in front of `api.example.com` is load-bearing for the updates cache and rate limiting (it must stay proxied, not DNS-only). The 3-Dockerfile production-active stack is postgres (`infrastructure/docker/postgres/Dockerfile`), control-plane, and media-plane; built via `docker compose -f docker-compose.yml -f docker-compose.production.yml --profile services build`.
+The Cloudflare proxy in front of `api.concordvoice.chat` is load-bearing for the updates cache and rate limiting (it must stay proxied, not DNS-only). The 3-Dockerfile production-active stack is postgres (`infrastructure/docker/postgres/Dockerfile`), control-plane, and media-plane; built via `docker compose -f docker-compose.yml -f docker-compose.production.yml --profile services build`.
 
 ### Self-Hosted (Docker Compose)
 
@@ -676,7 +699,7 @@ sequenceDiagram
     S->>S: Create pending_key_requests rows
     S-->>A: WS key_needed {server_id, user_id, channel_ids}
     A->>S: GET /api/v1/users/{B}/public-key
-    A->>A: Unwrap CSK with own private key; re-wrap with B's public key
+    A->>A: Unwrap CSK with own private key, re-wrap with B's public key
     A->>S: POST /api/v1/channels/{id}/keys {user_id: B, wrapped_key}
     S-->>B: WS key_delivered {channel_id}
 

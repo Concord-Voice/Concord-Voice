@@ -294,6 +294,57 @@ describe('FeedbackModal', () => {
     });
   });
 
+  describe('Known Issues notice', () => {
+    const KNOWN_ISSUES_URL = 'https://github.com/Concord-Voice/Concord-Voice/issues/39';
+
+    it('renders a link to the public Known Issues tracker', () => {
+      render(<FeedbackModal isOpen={true} onClose={vi.fn()} />);
+      const link = screen.getByRole('link', { name: 'Known Issues' });
+      expect(link).toHaveAttribute('href', KNOWN_ISSUES_URL);
+    });
+
+    it('shows the notice in both bug and feature modes', () => {
+      render(<FeedbackModal isOpen={true} onClose={vi.fn()} />);
+      expect(screen.getByRole('link', { name: 'Known Issues' })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('tab', { name: 'Feature Request' }));
+      expect(screen.getByRole('link', { name: 'Known Issues' })).toBeInTheDocument();
+    });
+
+    it('opens the tracker via openExternal on click (not in-app navigation)', () => {
+      // setup.ts defines a non-configurable `window.electron` mock with no
+      // openExternal, so vi.stubGlobal can't redefine it. Add the method onto
+      // the existing (mutable) mock object and restore in finally instead.
+      const openExternal = vi.fn();
+      const electronMock = globalThis.electron as unknown as Record<string, unknown>;
+      const original = electronMock.openExternal;
+      electronMock.openExternal = openExternal;
+      try {
+        render(<FeedbackModal isOpen={true} onClose={vi.fn()} />);
+        fireEvent.click(screen.getByRole('link', { name: 'Known Issues' }));
+        expect(openExternal).toHaveBeenCalledWith(KNOWN_ISSUES_URL);
+      } finally {
+        electronMock.openExternal = original;
+      }
+    });
+
+    it('hides the notice on the post-submit success surface', async () => {
+      mockApiFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ dev: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      );
+      render(<FeedbackModal isOpen={true} onClose={vi.fn()} />);
+      fireEvent.change(screen.getByLabelText(/Title/), { target: { value: 'A bug' } });
+      fireEvent.change(screen.getByLabelText(/Description/), { target: { value: 'It broke.' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Submit Bug Report' }));
+      await waitFor(() =>
+        expect(screen.getByText(/Thank you for the feedback/)).toBeInTheDocument()
+      );
+      expect(screen.queryByRole('link', { name: 'Known Issues' })).not.toBeInTheDocument();
+    });
+  });
+
   describe('Modal width', () => {
     it('mounts inside the xlarge modal container (#158 wide layout)', () => {
       render(<FeedbackModal isOpen={true} onClose={vi.fn()} />);

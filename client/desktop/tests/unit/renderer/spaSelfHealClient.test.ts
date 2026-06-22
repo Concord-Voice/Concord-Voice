@@ -1,4 +1,4 @@
-// @vitest-environment-options { "url": "https://api.example.com/" }
+// @vitest-environment-options { "url": "https://api.concordvoice.chat/" }
 //
 // Initializes jsdom with the SPA's production origin so `globalThis.location.origin`
 // matches the chunk URLs the tests dispatch. The cross-origin guard in
@@ -47,7 +47,7 @@ describe('spaSelfHealClient — renderer detection', () => {
 
   it('IPCs on script error matching SPA chunk URL pattern', () => {
     const script = document.createElement('script');
-    script.src = 'https://api.example.com/spa/abc1234/assets/Settings-Xyz.js';
+    script.src = 'https://api.concordvoice.chat/spa/abc1234/assets/Settings-Xyz.js';
     document.body.appendChild(script);
 
     const event = new Event('error', { bubbles: false });
@@ -56,13 +56,13 @@ describe('spaSelfHealClient — renderer detection', () => {
 
     expect(mockRequestSelfHeal).toHaveBeenCalledWith({
       reason: 'chunk-load',
-      url: 'https://api.example.com/spa/abc1234/assets/Settings-Xyz.js',
+      url: 'https://api.concordvoice.chat/spa/abc1234/assets/Settings-Xyz.js',
     });
   });
 
   it('IPCs on link error matching SPA chunk URL pattern', () => {
     const link = document.createElement('link');
-    link.href = 'https://api.example.com/spa/abc1234/assets/main-Xyz.css';
+    link.href = 'https://api.concordvoice.chat/spa/abc1234/assets/main-Xyz.css';
     document.body.appendChild(link);
 
     const event = new Event('error', { bubbles: false });
@@ -71,13 +71,13 @@ describe('spaSelfHealClient — renderer detection', () => {
 
     expect(mockRequestSelfHeal).toHaveBeenCalledWith({
       reason: 'chunk-load',
-      url: 'https://api.example.com/spa/abc1234/assets/main-Xyz.css',
+      url: 'https://api.concordvoice.chat/spa/abc1234/assets/main-Xyz.css',
     });
   });
 
   it('does NOT IPC on errors with non-SPA URLs', () => {
     const script = document.createElement('script');
-    script.src = 'https://api.example.com/api/v1/messages/feed.js';
+    script.src = 'https://api.concordvoice.chat/api/v1/messages/feed.js';
     document.body.appendChild(script);
 
     const event = new Event('error', { bubbles: false });
@@ -92,7 +92,7 @@ describe('spaSelfHealClient — renderer detection', () => {
     // path that happens to match `/spa/<sha>/assets/...` would otherwise
     // trigger self-heal. The cross-origin guard in installSelfHealHandlers
     // requires the failing URL's origin to match `globalThis.location.origin`.
-    // Here, the page's origin is stubbed to `https://api.example.com`
+    // Here, the page's origin is stubbed to `https://api.concordvoice.chat`
     // (see beforeEach), but the script comes from `evil.example.com` — the
     // guard must reject it.
     const script = document.createElement('script');
@@ -155,7 +155,7 @@ describe('spaSelfHealClient — renderer detection', () => {
     freshInstall();
 
     const script = document.createElement('script');
-    script.src = 'https://api.example.com/spa/abc1234/assets/Settings-Xyz.js';
+    script.src = 'https://api.concordvoice.chat/spa/abc1234/assets/Settings-Xyz.js';
     document.body.appendChild(script);
 
     const event = new Event('error', { bubbles: false });
@@ -176,7 +176,7 @@ describe('spaSelfHealClient — renderer detection', () => {
     window.electron = undefined;
 
     const script = document.createElement('script');
-    script.src = 'https://api.example.com/spa/abc1234/assets/Settings-Xyz.js';
+    script.src = 'https://api.concordvoice.chat/spa/abc1234/assets/Settings-Xyz.js';
     document.body.appendChild(script);
 
     const event = new Event('error', { bubbles: false });

@@ -57,11 +57,11 @@ describe('dmMessageSender.sendDMMessage', () => {
   });
 
   it('enqueues, adds an optimistic message, and returns the client id', () => {
-    const id = sendDMMessage('dm-conv-1', 'https://invite.example.com/GHJKMNPQ');
+    const id = sendDMMessage('dm-conv-1', 'https://invite.concordvoice.chat/GHJKMNPQ');
     expect(id).toBe('client-msg-1');
     expect(mockEnqueue).toHaveBeenCalledWith(
       'dm-conv-1',
-      'https://invite.example.com/GHJKMNPQ',
+      'https://invite.concordvoice.chat/GHJKMNPQ',
       'dm_message',
       undefined,
       undefined
@@ -73,7 +73,7 @@ describe('dmMessageSender.sendDMMessage', () => {
   it('encrypts and sends via the websocket transport when connected', async () => {
     const encrypted = 'encrypted-base64-content-that-is-long-enough-for-validation';
     mockEncryptForChannel.mockResolvedValue(encrypted);
-    sendDMMessage('dm-conv-1', 'https://invite.example.com/GHJKMNPQ');
+    sendDMMessage('dm-conv-1', 'https://invite.concordvoice.chat/GHJKMNPQ');
     await vi.waitFor(() => {
       expect(mockSendDMMessage).toHaveBeenCalledWith(
         'dm-conv-1',
@@ -85,7 +85,7 @@ describe('dmMessageSender.sendDMMessage', () => {
 
   it('does not send over the socket when disconnected (queues instead)', () => {
     mockGetState.mockReturnValue(ConnectionState.DISCONNECTED);
-    sendDMMessage('dm-conv-1', 'https://invite.example.com/GHJKMNPQ');
+    sendDMMessage('dm-conv-1', 'https://invite.concordvoice.chat/GHJKMNPQ');
     expect(mockSendDMMessage).not.toHaveBeenCalled();
     expect(mockEnqueue).toHaveBeenCalled();
   });

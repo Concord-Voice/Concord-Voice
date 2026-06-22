@@ -52,12 +52,12 @@ This document describes which of those properties each platform verifies, and ho
 
 ### TLS-layer feed pinning (#658)
 
-On **all platforms**, the HTTPS connection to `https://api.example.com/api/v1/updates` is additionally pinned at the TLS layer via SPKI SHA-256 of the server's leaf certificate. This closes the rogue-cert MITM gap described in §Server-side trust boundary below.
+On **all platforms**, the HTTPS connection to `https://api.concordvoice.chat/api/v1/updates` is additionally pinned at the TLS layer via SPKI SHA-256 of the server's leaf certificate. This closes the rogue-cert MITM gap described in §Server-side trust boundary below.
 
 **How it works:**
 
 - `client/desktop/src/main/main.ts` installs a `Session.setCertificateVerifyProc` handler inside `app.whenReady()`. The handler is a pure function in `client/desktop/src/main/updatePinning.ts` configured from `updatePinningConfig.ts`.
-- For the pinned hostname (`api.example.com`), the handler computes SPKI SHA-256 of the leaf cert's `SubjectPublicKeyInfo` and compares against a primary+fallback pin pair. Dual-pin enables non-emergency rotation.
+- For the pinned hostname (`api.concordvoice.chat`), the handler computes SPKI SHA-256 of the leaf cert's `SubjectPublicKeyInfo` and compares against a primary+fallback pin pair. Dual-pin enables non-emergency rotation.
 - For non-pinned hostnames (self-hosted deployments, staging, localhost), the handler returns `callback(-3)` — Chromium's default cert validation applies, system CA trust works normally.
 - When both pins miss, the handler returns `callback(-2)` (explicit reject) and the renderer shows `UpdateSecurityBanner` directing the user to reinstall from GitHub Releases.
 
@@ -81,11 +81,11 @@ On **all platforms**, the HTTPS connection to `https://api.example.com/api/v1/up
 
 ## Server-side trust boundary
 
-The update feed is served at `https://api.example.com/api/v1/updates`. Transport protections:
+The update feed is served at `https://api.concordvoice.chat/api/v1/updates`. Transport protections:
 
 - **Non-HTTPS refused:** `client/desktop/src/main/updater.ts` explicitly refuses to configure the feed with a non-HTTPS `apiBase`.
 - **HTTPS only:** transport encryption + standard Web PKI cert validation on the server host.
-- **TLS-layer feed pinning (#658):** in addition to standard Web PKI validation, clients pin the SPKI SHA-256 of the CloudFlare edge certificate for `api.example.com`. See the dedicated subsection under §Per-platform trust model above.
+- **TLS-layer feed pinning (#658):** in addition to standard Web PKI validation, clients pin the SPKI SHA-256 of the CloudFlare edge certificate for `api.concordvoice.chat`. See the dedicated subsection under §Per-platform trust model above.
 
 **What HTTPS + pinning DOES guarantee:**
 

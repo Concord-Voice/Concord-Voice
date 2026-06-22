@@ -114,3 +114,32 @@ func For(tier string) Entitlement {
 	e.AllowedAudioTiers = tiers
 	return e
 }
+
+// MediaEntitlements is the server-authoritative per-user media-entitlement
+// payload the join-authorize responses carry to the media-plane (#1300). The
+// media-plane parses these per-user caps to enforce send bitrate and the audio
+// tier/ptime floor at the produce boundary; video resolution/fps stay
+// client-enforced with the bitrate cap as the backstop (the SFU does NOT enforce
+// pixel dimensions). All four fields are per-USER (resolved from the joining
+// user's own tier); the room-owner-scoped caps (MaxWebcamPublishers etc.) are
+// #1542's seam and are intentionally NOT carried here.
+type MediaEntitlements struct {
+	Tier                string   `json:"tier"`
+	AllowedAudioTiers   []string `json:"allowed_audio_tiers"`
+	MinPtimeMs          int      `json:"min_ptime_ms"`
+	MaxManualBitrateBps int      `json:"max_manual_bitrate_bps"`
+}
+
+// MediaFor resolves the media-entitlement payload for a tier string. It funnels
+// through For, so an unknown/empty tier fails closed to the free floor (premium
+// is never granted by accident). The returned AllowedAudioTiers slice is the
+// defensive copy For already makes.
+func MediaFor(tier string) MediaEntitlements {
+	e := For(tier)
+	return MediaEntitlements{
+		Tier:                e.Tier,
+		AllowedAudioTiers:   e.AllowedAudioTiers,
+		MinPtimeMs:          e.MinPtimeMs,
+		MaxManualBitrateBps: e.MaxManualBitrateBps,
+	}
+}

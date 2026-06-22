@@ -28,7 +28,7 @@ describe('isPermittedFrameUrl', () => {
       // PiP / self-heal can leave a remote origin set while a bundled frame
       // exists; the bundled origin is independently trusted.
       expect(
-        isPermittedFrameUrl('app://concord/index.html', 'https://spa.example.com')
+        isPermittedFrameUrl('app://concord/index.html', 'https://spa.concordvoice.chat')
       ).toBe(true);
     });
 
@@ -66,7 +66,7 @@ describe('isPermittedFrameUrl', () => {
   });
 
   describe('remote SPA origin', () => {
-    const origin = 'https://spa.example.com';
+    const origin = 'https://spa.concordvoice.chat';
 
     it('accepts a URL under the configured remote origin', () => {
       expect(isPermittedFrameUrl(`${origin}/index.html`, origin)).toBe(true);
@@ -77,8 +77,8 @@ describe('isPermittedFrameUrl', () => {
     });
 
     it('rejects an origin-prefix look-alike (no trailing slash boundary)', () => {
-      // `${origin}/` boundary prevents https://spa.example.com.evil.com/.
-      expect(isPermittedFrameUrl('https://spa.example.com.evil.com/', origin)).toBe(false);
+      // `${origin}/` boundary prevents https://spa.concordvoice.chat.evil.com/.
+      expect(isPermittedFrameUrl('https://spa.concordvoice.chat.evil.com/', origin)).toBe(false);
     });
   });
 

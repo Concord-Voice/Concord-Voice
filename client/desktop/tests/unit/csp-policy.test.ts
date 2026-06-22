@@ -72,8 +72,8 @@ describe('renderer CSP (dev-source from index.html)', () => {
 
     it('img-src allows the API origin in production', () => {
       const imgSrc = csp.match(/img-src\s+([^;]+);/)?.[1] ?? '';
-      expect(imgSrc).toContain('https://example.com');
-      expect(imgSrc).toContain('https://*.example.com');
+      expect(imgSrc).toContain('https://concordvoice.chat');
+      expect(imgSrc).toContain('https://*.concordvoice.chat');
     });
 
     it('media-src allows the API origin in dev (localhost)', () => {
@@ -84,8 +84,8 @@ describe('renderer CSP (dev-source from index.html)', () => {
 
     it('media-src allows the API origin in production', () => {
       const mediaSrc = csp.match(/media-src\s+([^;]+);/)?.[1] ?? '';
-      expect(mediaSrc).toContain('https://example.com');
-      expect(mediaSrc).toContain('https://*.example.com');
+      expect(mediaSrc).toContain('https://concordvoice.chat');
+      expect(mediaSrc).toContain('https://*.concordvoice.chat');
     });
   });
 
@@ -97,7 +97,7 @@ describe('renderer CSP (dev-source from index.html)', () => {
   it('connect-src allows the same API origins as img-src/media-src', () => {
     const connectSrc = csp.match(/connect-src\s+([^;]+);/)?.[1] ?? '';
     expect(connectSrc).toContain('http://localhost:*');
-    expect(connectSrc).toContain('https://example.com');
-    expect(connectSrc).toContain('https://*.example.com');
+    expect(connectSrc).toContain('https://concordvoice.chat');
+    expect(connectSrc).toContain('https://*.concordvoice.chat');
   });
 });

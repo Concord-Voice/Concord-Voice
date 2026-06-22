@@ -20,7 +20,7 @@ import { app } from 'electron';
 
 import { getPersistedApiBase } from './tokenManager';
 
-const PRODUCTION_API_BASE = 'https://api.example.com';
+const PRODUCTION_API_BASE = 'https://api.concordvoice.chat';
 const DEV_API_BASE = 'http://localhost:8080';
 
 export function getApiBaseUrl(): string {

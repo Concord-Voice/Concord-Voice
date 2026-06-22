@@ -45,7 +45,7 @@ func newTestVerifier() *OIDCVerifier {
 	return &OIDCVerifier{
 		cfg: OIDCConfig{
 			Issuer:         "https://token.actions.githubusercontent.com",
-			Audience:       "https://api.example.com",
+			Audience:       "https://api.concordvoice.chat",
 			SubjectPrefix:  "repo:markdrogersjr/Concord:",
 			SPAWorkflow:    "main-cd.yml",
 			SPARef:         "refs/heads/main",
@@ -278,7 +278,7 @@ func TestVerifySPA_RejectsClaimWithoutAtSeparator(t *testing.T) {
 func TestNewOIDCVerifier_BadIssuer(t *testing.T) {
 	cfg := OIDCConfig{
 		Issuer:         "https://0.0.0.0:1/unreachable",
-		Audience:       "https://api.example.com",
+		Audience:       "https://api.concordvoice.chat",
 		SubjectPrefix:  "repo:markdrogersjr/Concord:",
 		SPAWorkflow:    "main-cd.yml",
 		SPARef:         "refs/heads/main",
@@ -306,7 +306,7 @@ func TestNewOIDCVerifier_BadIssuer(t *testing.T) {
 func TestNewOIDCVerifier_EmptyFields(t *testing.T) {
 	base := OIDCConfig{
 		Issuer:         "https://token.actions.githubusercontent.com",
-		Audience:       "https://api.example.com",
+		Audience:       "https://api.concordvoice.chat",
 		SubjectPrefix:  "repo:markdrogersjr/Concord:",
 		SPAWorkflow:    "main-cd.yml",
 		SPARef:         "refs/heads/main",

@@ -158,7 +158,7 @@ The Concord Voice desktop app should show:
 - Registration and login screens with full validation
 - Password strength meter
 - E2EE information tooltips
-- Branding: example.com
+- Branding: concordvoice.chat
 
 **Try it out!** You can now register an account and log in. E2EE keys are generated automatically and stored securely.
 
@@ -206,7 +206,7 @@ docker exec -it concord-redis redis-cli ping
 - InfoTooltip component for user education
 - Client-side encryption (AES-GCM, PBKDF2, RSA-OAEP)
 - Token storage and automatic refresh mechanism
-- Branding integration (example.com)
+- Branding integration (concordvoice.chat)
 
 **DevOps & Security**:
 - Pre-commit hooks (backend tests, frontend tests, security scanning)

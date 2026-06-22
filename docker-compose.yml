@@ -81,7 +81,7 @@ services:
       turnserver
         -c /etc/coturn/turnserver.conf
         --static-auth-secret=${TURN_SECRET:?TURN_SECRET must be set - copy .env.example to .env}
-        --realm=${TURN_REALM:-example.com}
+        --realm=${TURN_REALM:-concordvoice.chat}
         --listening-ip=0.0.0.0
         --external-ip=${PUBLIC_IP:?PUBLIC_IP must be set to the host's public IP}
         --relay-ip=${PUBLIC_IP}
@@ -177,13 +177,13 @@ services:
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set - copy .env.example to .env}
       TURN_SERVER_HOST: ${TURN_SERVER_HOST:-localhost}
       TURN_SECRET: ${TURN_SECRET:?}
-      TURN_REALM: ${TURN_REALM:-example.com}
+      TURN_REALM: ${TURN_REALM:-concordvoice.chat}
       MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-}
       SMTP_HOST: ${SMTP_HOST:-smtp.resend.com}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USERNAME: ${SMTP_USERNAME:-resend}
       SMTP_PASSWORD: ${RESEND_API_KEY:-${SMTP_PASSWORD:-}}
-      SMTP_FROM: ${SMTP_FROM:-noreply@example.com}
+      SMTP_FROM: ${SMTP_FROM:-noreply@concordvoice.chat}
       WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-localhost}
       WEBAUTHN_RP_ORIGINS: ${WEBAUTHN_RP_ORIGINS:-http://localhost:3001}
       MINIO_ENDPOINT: minio:9000

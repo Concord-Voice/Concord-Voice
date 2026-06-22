@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	testOrigin                     = "https://example.com"
+	testOrigin                     = "https://concordvoice.chat"
 	testAppOrigin                  = "app://concord"
 	headerAccessControlAllowOrigin = "Access-Control-Allow-Origin"
 )

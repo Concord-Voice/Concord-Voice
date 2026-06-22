@@ -18,8 +18,8 @@
            JavaScript Detections (Pro plan, 2026-05-13, #917 Tier 2
            resolution, PR #970).
       The meta tag below is the authoritative CSP for the renderer.
-      connect-src already covers *.example.com, so the SPA origin
-      moving to spa.example.com requires no connect-src change.
+      connect-src already covers *.concordvoice.chat, so the SPA origin
+      moving to spa.concordvoice.chat requires no connect-src change.
     -->
     <meta
       http-equiv="Content-Security-Policy"
@@ -27,9 +27,9 @@
                    script-src 'self' 'wasm-unsafe-eval';
                    script-src-elem 'self' 'wasm-unsafe-eval';
                    style-src 'self' 'unsafe-inline';
-                   connect-src 'self' ws://localhost:* http://localhost:* wss://localhost:* https://localhost:* ws://127.0.0.1:* http://127.0.0.1:* https://example.com wss://example.com https://*.example.com wss://*.example.com;
-                   img-src 'self' data: blob: https://cdn.jsdelivr.net http://localhost:* http://127.0.0.1:* https://example.com https://*.example.com;
-                   media-src 'self' blob: http://localhost:* http://127.0.0.1:* https://example.com https://*.example.com;
+                   connect-src 'self' ws://localhost:* http://localhost:* wss://localhost:* https://localhost:* ws://127.0.0.1:* http://127.0.0.1:* https://concordvoice.chat wss://concordvoice.chat https://*.concordvoice.chat wss://*.concordvoice.chat;
+                   img-src 'self' data: blob: https://cdn.jsdelivr.net http://localhost:* http://127.0.0.1:* https://concordvoice.chat https://*.concordvoice.chat;
+                   media-src 'self' blob: http://localhost:* http://127.0.0.1:* https://concordvoice.chat https://*.concordvoice.chat;
                    base-uri 'self';
                    form-action 'self';"
     />
