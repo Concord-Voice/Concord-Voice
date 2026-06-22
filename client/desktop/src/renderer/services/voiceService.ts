@@ -33,7 +33,7 @@ import {
   type ScreenShareOptions,
 } from '../stores/videoSettingsStore';
 import { apiFetch } from './apiClient';
-import { MediaEncryption, deriveFrameKey, ratchetKey } from './mediaEncryption';
+import { MediaEncryption, deriveFrameKey } from './mediaEncryption';
 import { e2eeService } from './e2eeService';
 import { isPendingKeyError } from './e2eeErrors';
 import {
@@ -3460,44 +3460,70 @@ class VoiceService {
       this.onProducerClosed?.(producerId, userId);
     });
 
-    this.socket.on('user-joined', async ({ userId, username, displayName, avatarUrl }) => {
-      useVoiceStore.getState().addParticipant({
+    this.socket.on(
+      'user-joined',
+      async ({
         userId,
         username,
         displayName,
         avatarUrl,
-        isMuted: false,
-        isDeafened: false,
-        serverMuted: false,
-        serverDeafened: false,
-        isVideoOn: false,
-        isScreenSharing: false,
-        isSpeaking: false,
-      });
+        e2eeEpoch,
+      }: {
+        userId: string;
+        username: string;
+        displayName?: string;
+        avatarUrl?: string | null;
+        e2eeEpoch?: number;
+      }) => {
+        useVoiceStore.getState().addParticipant({
+          userId,
+          username,
+          displayName,
+          avatarUrl: avatarUrl ?? undefined,
+          isMuted: false,
+          isDeafened: false,
+          serverMuted: false,
+          serverDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: false,
+          isSpeaking: false,
+        });
 
-      // E2EE: add decrypt key for new participant & rotate keys (new epoch)
-      if (this.mediaEncryption) {
-        const channelId = useVoiceStore.getState().activeChannelId;
-        if (channelId) {
-          await this.addDecryptKeyForUser(channelId, userId);
-          this.debouncedRotateE2EEKeys();
+        // Solo bandwidth saving: exit solo mode when someone joins
+        this.checkSoloBandwidthSaving();
+
+        // E2EE: add decrypt key for new participant & rotate keys (new epoch)
+        if (this.mediaEncryption) {
+          const channelId = useVoiceStore.getState().activeChannelId;
+          if (channelId) {
+            const targetEpoch =
+              typeof e2eeEpoch === 'number'
+                ? e2eeEpoch
+                : this.mediaEncryption.getCurrentKeyId() + 1;
+            await this.addDecryptKeyForUser(channelId, userId, targetEpoch);
+            this.debouncedRotateE2EEKeys();
+          }
         }
       }
-
-      // Solo bandwidth saving: exit solo mode when someone joins
-      this.checkSoloBandwidthSaving();
-    });
+    );
 
     this.socket.on('user-left', async ({ userId }) => {
       useVoiceStore.getState().removeParticipant(userId);
 
-      // E2EE: rotate keys when a member leaves (forward secrecy)
-      if (this.mediaEncryption) {
-        this.debouncedRotateE2EEKeys();
-      }
-
       // Solo bandwidth saving: enter solo mode when everyone else leaves
       this.checkSoloBandwidthSaving();
+
+      // E2EE: rotate keys when a member leaves (forward secrecy)
+      if (this.mediaEncryption) {
+        const channelId = useVoiceStore.getState().activeChannelId;
+        if (channelId) {
+          await this.addDecryptKeysForActiveParticipantsAtEpoch(
+            channelId,
+            this.mediaEncryption.getCurrentKeyId() + 1
+          );
+        }
+        this.debouncedRotateE2EEKeys();
+      }
     });
 
     // E2EE: periodic epoch sync — recover from missed join/leave events
@@ -3510,6 +3536,10 @@ class VoiceService {
           `E2EE epoch sync: local=${localEpoch}, server=${epoch}, catching up ${gap} steps`
         );
         try {
+          const channelId = useVoiceStore.getState().activeChannelId;
+          if (channelId) {
+            await this.addDecryptKeysForActiveParticipantsAtEpoch(channelId, epoch);
+          }
           if (this.e2eeWorker) {
             this.e2eeWorker.postMessage({
               type: 'catchUpToEpoch',
@@ -3997,6 +4027,13 @@ class VoiceService {
         break;
       }
 
+      case 'requestKeyframe': {
+        if (useVoiceStore.getState().activeChannelId) {
+          this.socket?.emit('request-keyframe', { senderUserId: msg.senderUserId });
+        }
+        break;
+      }
+
       case 'log':
         // Forward Worker logs to renderer console
         // eslint-disable-next-line no-console -- worker log bridge; levels beyond .warn/.error/.debug need to propagate as the worker emitted them for parity with worker-side output
@@ -4043,29 +4080,25 @@ class VoiceService {
   private async deriveAndInstallDecryptKey(
     channelId: string,
     userId: string,
-    attempt: number
+    attempt: number,
+    targetEpoch?: number
   ): Promise<void> {
     if (!this.mediaEncryption) throw new Error('mediaEncryption destroyed');
     const channelCSK = await e2eeService.getChannelKey(channelId);
     if (!this.mediaEncryption) throw new Error('mediaEncryption destroyed');
-    const currentEpoch = this.mediaEncryption.getCurrentKeyId();
+    const keyId = targetEpoch ?? this.mediaEncryption.getCurrentKeyId();
 
-    if (currentEpoch > 100) {
-      throw new Error(`E2EE: epoch ${currentEpoch} exceeds ratchet limit (100), rejoin required`);
+    if (keyId > 100) {
+      throw new Error(`E2EE: epoch ${keyId} exceeds ratchet limit (100), rejoin required`);
     }
 
-    let key: CryptoKey = await deriveFrameKey(channelCSK, userId);
-    for (let i = 0; i < currentEpoch; i++) {
-      key = await ratchetKey(key);
-    }
-
-    this.mediaEncryption.addDecryptKeyDirect(userId, currentEpoch, key);
+    const key = await this.mediaEncryption.addDecryptKeyAtEpoch(channelCSK, userId, keyId);
 
     if (this.e2eeWorker) {
       this.e2eeWorker.postMessage({
         type: 'addDecryptKey',
         senderUserId: userId,
-        keyId: currentEpoch,
+        keyId,
         key,
       } satisfies E2EEWorkerMessage);
     }
@@ -4073,14 +4106,18 @@ class VoiceService {
     console.debug('E2EE: decrypt key added', {
       channelId,
       targetUserId: userId,
-      currentEpoch,
-      keyId: currentEpoch,
+      currentEpoch: this.mediaEncryption.getCurrentKeyId(),
+      keyId,
       attempt: attempt + 1,
     });
   }
 
   /** Add a decryption key for a remote user, pre-ratcheted to current epoch (with retry) */
-  private async addDecryptKeyForUser(channelId: string, userId: string): Promise<boolean> {
+  private async addDecryptKeyForUser(
+    channelId: string,
+    userId: string,
+    targetEpoch?: number
+  ): Promise<boolean> {
     if (!this.mediaEncryption) return false;
 
     const retryDelays = [500, 1000, 2000];
@@ -4088,7 +4125,7 @@ class VoiceService {
 
     for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
       try {
-        await this.deriveAndInstallDecryptKey(channelId, userId, attempt);
+        await this.deriveAndInstallDecryptKey(channelId, userId, attempt, targetEpoch);
         return true;
       } catch (err) {
         lastError = err;
@@ -4106,6 +4143,19 @@ class VoiceService {
       error: lastError instanceof Error ? lastError.message : lastError,
     });
     return false;
+  }
+
+  private async addDecryptKeysForActiveParticipantsAtEpoch(
+    channelId: string,
+    targetEpoch: number
+  ): Promise<void> {
+    const selfId = useUserStore.getState().user?.id;
+    const userIds = Object.keys(useVoiceStore.getState().participants).filter(
+      (userId) => userId !== selfId
+    );
+    await Promise.all(
+      userIds.map((userId) => this.addDecryptKeyForUser(channelId, userId, targetEpoch))
+    );
   }
 
   /**

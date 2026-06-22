@@ -444,8 +444,7 @@ describe('MediaEncryption', () => {
       const enc = new MediaEncryption();
       await enc.init(csk, 'user-1');
 
-      await enc.catchUpToEpoch(101);
-      // Should not have advanced — gap too large
+      await expect(enc.catchUpToEpoch(101)).rejects.toThrow('E2EE epoch gap too large');
       expect(enc.getCurrentKeyId()).toBe(0);
     });
   });
@@ -504,14 +503,14 @@ describe('MediaEncryption', () => {
       await receiver.decryptFrame(frame, 'sender');
     });
 
-    it('falls back to base key when epoch > 100', async () => {
+    it('rejects target epoch > 100', async () => {
       const csk = await generateTestCSK();
       const enc = new MediaEncryption();
       await enc.init(csk, 'user-1');
 
-      // Should not throw — falls back to addDecryptKey with epoch 0
-      await enc.addDecryptKeyAtEpoch(csk, 'sender', 101);
-      expect(enc.getCurrentKeyId()).toBeGreaterThanOrEqual(0);
+      await expect(enc.addDecryptKeyAtEpoch(csk, 'sender', 101)).rejects.toThrow(
+        'E2EE epoch gap too large'
+      );
     });
   });
 });

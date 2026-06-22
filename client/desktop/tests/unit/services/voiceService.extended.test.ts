@@ -102,6 +102,7 @@ const mockMediaEncryptionDestroy = vi.fn();
 const mockGetCurrentKeyId = vi.fn().mockReturnValue(0);
 const mockSetCurrentKeyId = vi.fn();
 const mockAddDecryptKeyDirect = vi.fn();
+const mockAddDecryptKeyAtEpoch = vi.fn().mockResolvedValue(undefined);
 const mockDebouncedRotateKeys = vi.fn();
 const mockCatchUpToEpoch = vi.fn().mockResolvedValue(undefined);
 
@@ -116,6 +117,7 @@ vi.mock('@/renderer/services/mediaEncryption', () => ({
     decryptFrame = vi.fn().mockResolvedValue(undefined);
     addDecryptKey = vi.fn().mockResolvedValue(undefined);
     addDecryptKeyDirect = mockAddDecryptKeyDirect;
+    addDecryptKeyAtEpoch = mockAddDecryptKeyAtEpoch;
     debouncedRotateKeys = mockDebouncedRotateKeys;
     catchUpToEpoch = mockCatchUpToEpoch;
   },
@@ -454,6 +456,7 @@ describe('VoiceService Extended', () => {
     mockEnsureOsPermission.mockResolvedValue('granted');
     mockCheckOne.mockResolvedValue('granted');
     mockGetCurrentKeyId.mockReturnValue(0);
+    mockAddDecryptKeyAtEpoch.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -1190,6 +1193,29 @@ describe('VoiceService Extended', () => {
       expect(mockCatchUpToEpoch).toHaveBeenCalledWith(5);
     });
 
+    it('pre-installs participant decrypt keys for the server epoch before catch-up', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      svc.mediaEncryption = new MediaEncryption();
+      useVoiceStore.getState().addParticipant({
+        userId: 'user-2',
+        username: 'sender',
+        isMuted: false,
+        isDeafened: false,
+        isVideoOn: true,
+        isScreenSharing: false,
+        isSpeaking: false,
+      });
+      mockGetCurrentKeyId.mockReturnValue(2);
+
+      triggerSocketEvent('epoch-sync', { epoch: 5 });
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'user-2', 5);
+      expect(mockCatchUpToEpoch).toHaveBeenCalledWith(5);
+    });
+
     it('ignores when mediaEncryption is not initialized', async () => {
       await joinVoiceChannel();
       // Ensure mediaEncryption is null (no E2EE worker setup)
@@ -1821,7 +1847,7 @@ describe('VoiceService Extended', () => {
 
       const result = await svc.addDecryptKeyForUser('ch1', 'u2');
       expect(result).toBe(true);
-      expect(mockAddDecryptKeyDirect).toHaveBeenCalled();
+      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'u2', 0);
     });
 
     it('returns false after all retries exhausted', async () => {
@@ -1889,6 +1915,16 @@ describe('VoiceService Extended', () => {
 
       svc.handleWorkerMessage({ type: 'requestRecovery', senderUserId: 'user-2' });
       expect(mockInvalidateChannelKey).toHaveBeenCalledWith('ch1');
+    });
+
+    it('forwards requestKeyframe messages to the media-plane socket', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useVoiceStore.getState().setActiveChannel('ch1', 'General', 'srv1');
+
+      svc.handleWorkerMessage({ type: 'requestKeyframe', senderUserId: 'user-2' });
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('request-keyframe', { senderUserId: 'user-2' });
     });
 
     it('handles log message', async () => {
@@ -2592,6 +2628,47 @@ describe('VoiceService Extended', () => {
       expect(useVoiceStore.getState().participants['user-3']).toBeDefined();
       expect(mockDebouncedRotateKeys).toHaveBeenCalled();
     });
+
+    it('pre-installs the joining participant decrypt key for the next epoch before rotation', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      svc.mediaEncryption = new MediaEncryption();
+      useVoiceStore.getState().setActiveChannel('channel-1', 'General', 'server-1');
+      mockGetCurrentKeyId.mockReturnValue(2);
+
+      triggerSocketEvent('user-joined', {
+        userId: 'user-3',
+        username: 'newcomer',
+        displayName: 'New User',
+        avatarUrl: null,
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'user-3', 3);
+      expect(mockDebouncedRotateKeys).toHaveBeenCalled();
+    });
+
+    it('uses the server epoch from user-joined when pre-installing the participant key', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      svc.mediaEncryption = new MediaEncryption();
+      useVoiceStore.getState().setActiveChannel('channel-1', 'General', 'server-1');
+      mockGetCurrentKeyId.mockReturnValue(2);
+
+      triggerSocketEvent('user-joined', {
+        userId: 'user-3',
+        username: 'newcomer',
+        displayName: 'New User',
+        avatarUrl: null,
+        e2eeEpoch: 4,
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'user-3', 4);
+      expect(mockDebouncedRotateKeys).toHaveBeenCalled();
+    });
   });
 
   describe('user-left with E2EE', () => {
@@ -2664,7 +2741,7 @@ describe('VoiceService Extended', () => {
       });
 
       await vi.advanceTimersByTimeAsync(100);
-      expect(mockAddDecryptKeyDirect).toHaveBeenCalled();
+      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'user-2', 0);
     });
   });
 

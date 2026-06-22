@@ -16,6 +16,34 @@ import { createOriginGate } from './lib/originGate.js';
 import { handleForceDisconnect } from './lib/forceDisconnect.js';
 import { handleSetDeafen } from './lib/setDeafen.js';
 
+const expectedKeyframeRequestErrors = new Set([
+  'Room not found',
+  'Requester not found',
+  'Sender not found',
+]);
+
+function getKeyframeSenderUserId(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object' || !('senderUserId' in payload)) {
+    return undefined;
+  }
+
+  const senderUserId = (payload as { senderUserId?: unknown }).senderUserId;
+  if (typeof senderUserId !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = senderUserId.trim();
+  return trimmed === '' ? undefined : trimmed;
+}
+
+function getExpectedKeyframeRequestError(error: unknown): string | undefined {
+  if (!(error instanceof Error)) {
+    return undefined;
+  }
+
+  return expectedKeyframeRequestErrors.has(error.message) ? error.message : undefined;
+}
+
 async function main() {
   // Create Express app
   const app = express();
@@ -291,6 +319,7 @@ async function main() {
           username: data.username,
           displayName: data.displayName,
           avatarUrl: data.avatarUrl,
+          e2eeEpoch: result.e2eeEpoch,
         });
 
         // Respond to the joining client
@@ -529,6 +558,35 @@ async function main() {
           producerId,
         });
         callback({ error: 'Failed to consume' });
+      }
+    });
+
+    // ── request-keyframe ─────────────────────────────────────────────
+    socket.on('request-keyframe', async (payload, callback?) => {
+      try {
+        const roomId = data.roomId;
+        if (!roomId) {
+          callback?.({ error: 'Not in a room' });
+          return;
+        }
+
+        const senderUserId = getKeyframeSenderUserId(payload);
+        if (!senderUserId) {
+          callback?.({ error: 'senderUserId is required' });
+          return;
+        }
+
+        const requested = await roomManager.requestKeyFrame(roomId, data.userId, senderUserId);
+        callback?.({ success: true, requested });
+      } catch (error) {
+        const message = getExpectedKeyframeRequestError(error);
+        if (message) {
+          callback?.({ error: message });
+          return;
+        }
+
+        logger.error('Error requesting keyframe', { error, userId: data.userId });
+        callback?.({ error: 'Failed to request keyframe' });
       }
     });
 

@@ -234,6 +234,17 @@ describe('RoomManager', () => {
       expect(transport.close).toHaveBeenCalled();
     });
 
+    it('drops keyframe cooldowns for departing participants', async () => {
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
+      const room = manager.getRoom('room-1')!;
+      room.keyframeRequestCooldowns.set('u-1', Date.now());
+
+      await manager.leaveRoom('room-1', 'u-1');
+
+      expect(room.keyframeRequestCooldowns.has('u-1')).toBe(false);
+    });
+
     it('is a no-op for non-existent room or participant', async () => {
       await manager.leaveRoom('nonexistent', 'u-1');
       expect(manager.getRoom('nonexistent')).toBeUndefined();
@@ -1141,6 +1152,130 @@ describe('RoomManager', () => {
     });
   });
 
+  describe('requestKeyFrame', () => {
+    async function setupVideoProducer() {
+      await manager.joinRoom('room-1', 'sender', 'sock-sender', { username: 'sender' });
+      await manager.joinRoom(
+        'room-1',
+        'viewer',
+        'sock-viewer',
+        { username: 'viewer' },
+        createRtpCapabilities() as any
+      );
+      const sendTransport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(sendTransport);
+      await manager.createTransport('room-1', 'sender', 'send');
+      const producer = createMockProducer({
+        kind: 'video',
+      });
+      sendTransport.produce.mockResolvedValueOnce(producer);
+      await manager.produce(
+        'room-1',
+        'sender',
+        sendTransport.id,
+        'video',
+        createRtpParameters() as any,
+        'camera'
+      );
+
+      const recvTransport = createMockTransport();
+      const consumer = createMockConsumer({
+        kind: 'video',
+        producerId: producer.id,
+        requestKeyFrame: vi.fn().mockResolvedValue(undefined),
+      });
+      recvTransport.consume.mockResolvedValueOnce(consumer);
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(recvTransport);
+      await manager.createTransport('room-1', 'viewer', 'recv');
+      await manager.consume('room-1', 'viewer', producer.id);
+      return consumer;
+    }
+
+    it('requests keyframes for the requester video consumers', async () => {
+      const consumer = await setupVideoProducer();
+      const requestKeyFrame = (manager as any).requestKeyFrame;
+      expect(requestKeyFrame).toBeTypeOf('function');
+
+      await requestKeyFrame.call(manager, 'room-1', 'viewer', 'sender');
+
+      expect(consumer.requestKeyFrame).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects an unknown sender', async () => {
+      await manager.joinRoom('room-1', 'viewer', 'sock-viewer', { username: 'viewer' });
+      const requestKeyFrame = (manager as any).requestKeyFrame;
+      expect(requestKeyFrame).toBeTypeOf('function');
+
+      await expect(requestKeyFrame.call(manager, 'room-1', 'viewer', 'missing')).rejects.toThrow(
+        'Sender not found'
+      );
+    });
+
+    it('reserves cooldown while the keyframe request is pending', async () => {
+      const consumer = await setupVideoProducer();
+      let release!: () => void;
+      const pending = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      (consumer.requestKeyFrame as any).mockReturnValueOnce(pending);
+      const requestKeyFrame = (manager as any).requestKeyFrame;
+
+      const first = requestKeyFrame.call(manager, 'room-1', 'viewer', 'sender');
+      const second = requestKeyFrame.call(manager, 'room-1', 'viewer', 'sender');
+
+      await expect(second).resolves.toBe(0);
+      expect(consumer.requestKeyFrame).toHaveBeenCalledTimes(1);
+
+      release();
+      await expect(first).resolves.toBe(1);
+    });
+
+    it('does not cooldown no-op requests without an active video producer', async () => {
+      await manager.joinRoom('room-1', 'viewer', 'sock-viewer', { username: 'viewer' });
+      await manager.joinRoom('room-1', 'sender', 'sock-sender', { username: 'sender' });
+      const room = manager.getRoom('room-1')!;
+      const requestKeyFrame = (manager as any).requestKeyFrame;
+
+      await expect(requestKeyFrame.call(manager, 'room-1', 'viewer', 'sender')).resolves.toBe(0);
+
+      expect(room.keyframeRequestCooldowns.has('sender')).toBe(false);
+    });
+
+    it('does not start cooldown when keyframe request fails', async () => {
+      const consumer = await setupVideoProducer();
+      const requestKeyFrame = (manager as any).requestKeyFrame;
+      (consumer.requestKeyFrame as any)
+        .mockRejectedValueOnce(new Error('pli failed'))
+        .mockResolvedValueOnce(undefined);
+
+      await expect(requestKeyFrame.call(manager, 'room-1', 'viewer', 'sender')).rejects.toThrow(
+        'pli failed'
+      );
+      await requestKeyFrame.call(manager, 'room-1', 'viewer', 'sender');
+
+      expect(consumer.requestKeyFrame).toHaveBeenCalledTimes(2);
+    });
+
+    it('suppresses repeated requests during the cooldown window', async () => {
+      vi.useFakeTimers();
+      try {
+        const consumer = await setupVideoProducer();
+        const requestKeyFrame = (manager as any).requestKeyFrame;
+        expect(requestKeyFrame).toBeTypeOf('function');
+
+        await requestKeyFrame.call(manager, 'room-1', 'viewer', 'sender');
+        await requestKeyFrame.call(manager, 'room-1', 'viewer', 'sender');
+        expect(consumer.requestKeyFrame).toHaveBeenCalledTimes(1);
+
+        await vi.advanceTimersByTimeAsync(5000);
+        await requestKeyFrame.call(manager, 'room-1', 'viewer', 'sender');
+        expect(consumer.requestKeyFrame).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   // ── Codec floor ─────────────────────────────────────────────────────
 
   describe('computeCodecFloor', () => {
@@ -1227,6 +1362,22 @@ describe('RoomManager', () => {
 
       const result2 = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
       expect(result2.e2eeEpoch).toBe(2);
+    });
+
+    it('emits user-joined with the authoritative E2EE epoch', async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'user-joined',
+          roomId: 'room-1',
+          userId: 'u-1',
+          e2eeEpoch: 1,
+        })
+      );
     });
 
     it('increments epoch on leave for forward secrecy', async () => {

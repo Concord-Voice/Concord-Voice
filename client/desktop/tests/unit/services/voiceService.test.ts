@@ -91,6 +91,7 @@ vi.mock('@/renderer/services/mediaEncryption', () => ({
     encryptFrame = vi.fn().mockResolvedValue(undefined);
     decryptFrame = vi.fn().mockResolvedValue(undefined);
     addDecryptKey = vi.fn().mockResolvedValue(undefined);
+    addDecryptKeyAtEpoch = vi.fn().mockResolvedValue({} as CryptoKey);
     addDecryptKeyDirect = vi.fn();
     debouncedRotateKeys = vi.fn();
     catchUpToEpoch = vi.fn().mockResolvedValue(undefined);

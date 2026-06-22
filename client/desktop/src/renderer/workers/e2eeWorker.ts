@@ -227,6 +227,9 @@ function handleDecrypt(
         }
         if (dropCount > 0) {
           log('info', `E2EE: decrypt recovered after ${dropCount} drops for ${senderUserId}`);
+          if ('type' in frame) {
+            postToMain({ type: 'requestKeyframe', senderUserId });
+          }
           dropCount = 0;
         }
       } catch (decryptErr) {

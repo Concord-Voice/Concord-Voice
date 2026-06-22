@@ -16,6 +16,7 @@ export type E2EEWorkerMessage =
 
 export type E2EEMainMessage =
   | { type: 'rotationComplete'; newKeyId: number }
+  | { type: 'requestKeyframe'; senderUserId: string }
   | {
       type: 'requestRecovery';
       senderUserId: string;

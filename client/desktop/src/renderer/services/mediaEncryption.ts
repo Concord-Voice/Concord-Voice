@@ -171,12 +171,13 @@ export class MediaEncryption {
   }
 
   /** Add a decryption key for a remote sender */
-  async addDecryptKey(channelCSK: CryptoKey, senderUserId: string, keyId = 0): Promise<void> {
+  async addDecryptKey(channelCSK: CryptoKey, senderUserId: string, keyId = 0): Promise<CryptoKey> {
     const key = await deriveFrameKey(channelCSK, senderUserId);
     this.decryptKeys.set(`${senderUserId}:${keyId}`, {
       key,
       expires: Date.now() + 3_600_000, // 1 hour
     });
+    return key;
   }
 
   /**
@@ -188,10 +189,9 @@ export class MediaEncryption {
     channelCSK: CryptoKey,
     senderUserId: string,
     targetEpoch: number
-  ): Promise<void> {
+  ): Promise<CryptoKey> {
     if (targetEpoch > 100) {
-      // Fallback to base key — self-healing ratchet will catch up
-      return this.addDecryptKey(channelCSK, senderUserId);
+      throw new Error('E2EE epoch gap too large (' + targetEpoch + '), rejoin required');
     }
     let key = await deriveFrameKey(channelCSK, senderUserId);
     for (let i = 0; i < targetEpoch; i++) {
@@ -201,6 +201,7 @@ export class MediaEncryption {
       key,
       expires: Date.now() + 3_600_000,
     });
+    return key;
   }
 
   /** Rotate keys (new epoch) — ratchet forward, keep old keys for overlap */
@@ -284,8 +285,7 @@ export class MediaEncryption {
     const steps = targetEpoch - this.currentKeyId;
     if (steps <= 0) return; // Already at or ahead of target
     if (steps > 100) {
-      console.warn(`E2EE epoch gap too large (${steps}), rejoin required`);
-      return;
+      throw new Error('E2EE epoch gap too large (' + steps + '), rejoin required');
     }
     for (let i = 0; i < steps; i++) {
       await this.rotateKeys();

@@ -176,7 +176,13 @@ describe('RedisService', () => {
       await service.connect();
       const handler = service.createRoomEventHandler();
 
-      handler({ type: 'user-joined', roomId: 'ch-1', userId: 'u-1', username: 'alice' });
+      handler({
+        type: 'user-joined',
+        roomId: 'ch-1',
+        userId: 'u-1',
+        username: 'alice',
+        e2eeEpoch: 1,
+      });
 
       // addParticipant is async but the handler is sync — it fires-and-forgets
       expect(mockClient.multi).toHaveBeenCalled();

@@ -131,6 +131,8 @@ export interface Room {
   lastNPausedConsumers: Set<string>;
   /** Mic-producer IDs (last-N managed set; screen-audio excluded). */
   micProducerIds: Set<string>;
+  /** Last accepted keyframe request timestamp by sender user ID. */
+  keyframeRequestCooldowns: Map<string, number>;
 }
 
 export interface ProducerInfo {
@@ -145,6 +147,9 @@ export const ABSOLUTE_VIDEO_PUBLISHER_CEILING = 25;
 
 /** Per-room concurrent screen-share producer cap (unchanged from the original hardcoded 5). */
 export const SCREEN_PRODUCER_CAP = 5;
+
+/** Per-sender keyframe request cooldown; mirrors the client-side E2EE recovery cooldown. */
+export const KEYFRAME_REQUEST_COOLDOWN_MS = 5000;
 
 /**
  * Resolve the per-room concurrent camera-producer cap.
@@ -208,6 +213,7 @@ export type RoomEvent =
       userId: string;
       username: string;
       displayName?: string;
+      e2eeEpoch: number;
     }
   | { type: 'user-left'; roomId: string; userId: string }
   | { type: 'room-empty'; roomId: string }
@@ -346,6 +352,7 @@ export class RoomManager {
       activeSpeakers: new ActiveSpeakerSet(lastN, config.audioLastNHoldMs),
       lastNPausedConsumers: new Set(),
       micProducerIds: new Set(),
+      keyframeRequestCooldowns: new Map(),
     };
 
     // Wire up active speaker events
@@ -501,6 +508,7 @@ export class RoomManager {
       userId,
       username,
       displayName,
+      e2eeEpoch: room.e2eeEpoch,
     });
 
     // Collect existing producers for the new joiner to consume
@@ -562,6 +570,7 @@ export class RoomManager {
       });
     }
     participant.producers.clear();
+    room.keyframeRequestCooldowns.delete(userId);
 
     // Close transports
     if (participant.sendTransport && !participant.sendTransport.closed) {
@@ -899,6 +908,55 @@ export class RoomManager {
 
     await entry.producer.resume();
     logger.debug('Producer resumed', { producerId, roomId, userId });
+  }
+
+  async requestKeyFrame(
+    roomId: string,
+    requesterUserId: string,
+    senderUserId: string
+  ): Promise<number> {
+    const room = this.rooms.get(roomId);
+    if (!room) throw new Error('Room not found');
+    const requester = room.participants.get(requesterUserId);
+    if (!requester) throw new Error('Requester not found');
+
+    const sender = room.participants.get(senderUserId);
+    if (!sender) throw new Error('Sender not found');
+
+    const now = Date.now();
+    const lastRequest = room.keyframeRequestCooldowns.get(senderUserId) ?? 0;
+    if (now - lastRequest < KEYFRAME_REQUEST_COOLDOWN_MS) return 0;
+
+    const videoProducerIds = [...sender.producers.values()]
+      .filter(
+        (entry) =>
+          entry.kind === 'video' &&
+          !entry.producer.closed &&
+          (entry.source === 'camera' || entry.source === 'screen')
+      )
+      .map((entry) => entry.producer.id);
+    if (videoProducerIds.length === 0) return 0;
+
+    const videoConsumers = [...requester.consumers.values()].filter(
+      (entry) =>
+        entry.kind === 'video' && !entry.closed && videoProducerIds.includes(entry.producerId)
+    );
+    if (videoConsumers.length === 0) return 0;
+
+    room.keyframeRequestCooldowns.set(senderUserId, now);
+    try {
+      await Promise.all(videoConsumers.map((consumer) => consumer.requestKeyFrame()));
+    } catch (error) {
+      room.keyframeRequestCooldowns.delete(senderUserId);
+      throw error;
+    }
+    logger.debug('Requested producer keyframe', {
+      roomId,
+      requesterUserId,
+      senderUserId,
+      count: videoConsumers.length,
+    });
+    return videoConsumers.length;
   }
 
   /** Close and remove a producer */

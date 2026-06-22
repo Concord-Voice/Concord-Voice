@@ -462,7 +462,7 @@ The admin console is a **separate identity domain** — it never shares state wi
 
 **Origin gate.** The Socket.IO `cors.origin` callback (`src/lib/originGate.ts`) maintains semantic parity with the control-plane CORS middleware: no-Origin → allow; `'null'` / `'file://'` → reject (case-insensitive, whitespace-tolerant); allowlist or `'*'` → allow; else reject. A production guard in `src/config/index.ts` fatal-exits if `ALLOWED_ORIGINS` contains `'*'` while `ENVIRONMENT=production` (CWE-942).
 
-**Socket.IO events:** `join-room`, `update-rtp-capabilities`, `create-transport`, `connect-transport`, `produce`, `consume`, `pause-producer` / `resume-producer`, `close-producer`, `pause-consumer` / `resume-consumer` / `close-consumer`, `leave-room`. The `resume-producer` / `resume-consumer` handlers enforce `server_muted` / `server_deafened`. (Voice quality tiers are applied client-side via producer `codecOptions`, not a Socket.IO event.)
+**Socket.IO events:** `join-room`, `update-rtp-capabilities`, `create-transport`, `connect-transport`, `produce`, `consume`, `request-keyframe`, `pause-producer` / `resume-producer`, `close-producer`, `pause-consumer` / `resume-consumer` / `close-consumer`, `leave-room`. `request-keyframe` lets a receiver ask the SFU to request a fresh video keyframe from a target sender after E2EE epoch recovery; the media plane validates room membership and applies a 5s per-sender cooldown before calling mediasoup `consumer.requestKeyFrame()` (PLI/FIR). The `resume-producer` / `resume-consumer` handlers enforce `server_muted` / `server_deafened`. (Voice quality tiers are applied client-side via producer `codecOptions`, not a Socket.IO event.)
 
 #### Media E2EE (frame encryption)
 
@@ -471,6 +471,7 @@ Voice and **video frames are end-to-end encrypted above the SFU** — the media 
 - **Cipher:** per-frame **AES-128-GCM** applied via WebRTC **Insertable Streams** before frames leave the sender — `RTCRtpScriptTransform` (Web Worker) on Chromium 129+, `createEncodedStreams` (main thread) on the legacy path.
 - **Frame keys:** derived `HKDF-SHA256(channelCSK, salt="concord-voice-e2ee", info=senderUserId)` from the **same channel CSK** used for text messages — so media encryption shares the `channel_keys` / `key_revocations` epoch ledger and rotates on member join/leave (with a short overlap window), and ratchets via `HKDF(oldKey, "concord-e2ee-ratchet")`.
 - **Framing:** a trailing `0xDE 0xAD` magic + self-describing header bytes distinguish encrypted frames and survive BUNDLE payload-type collisions; AES-GCM is used **without** AAD (intentional — the header travels in the clear). A self-healing decrypt-recovery pipeline handles transient key-rotation gaps.
+- **Video keyframe recovery:** when the receiver detects a missing or stale media decrypt key, `voiceService` pre-installs target-epoch decrypt keys for active participants, catches the worker up to the server epoch, and emits `request-keyframe { senderUserId }` for the affected video sender. The media plane validates requester/sender membership, finds the matching video consumers, and calls mediasoup `consumer.requestKeyFrame()` under the 5s per-sender cooldown.
 - **Media plane is blind by design:** no frame-crypto code exists in `services/media-plane/src/`; the SFU forwards opaque encrypted RTP payloads.
 
 ## Data Flow Examples
@@ -615,7 +616,7 @@ sequenceDiagram
     Note over S: New messages use epoch N+1<br/>removed member cannot derive CSK'
 ```
 
-Server channels (`channel_keys` / `key_revocations`) and DMs (`dm_channel_keys` / `dm_key_revocations`) use parallel epoch ledgers. The `CHECK(successor_epoch > revoked_epoch)` constraint is present on `dm_key_revocations` (migration 000041); on `key_revocations` the constraint was added only in a re-declaration (000035) that is a no-op once the table exists from 000028, so it may be absent on already-migrated databases.
+Server channels (`channel_keys` / `key_revocations`) and DMs (`dm_channel_keys` / `dm_key_revocations`) use parallel epoch ledgers. Media E2EE mirrors the same epoch discipline: the media plane includes the authoritative `e2eeEpoch` in `join-room` responses and `user-joined` broadcasts, and the desktop client installs target-epoch decrypt keys on join/leave/epoch-sync before worker catch-up to reduce dropped encrypted video frames. Epoch gaps above the local ratchet limit fail closed and require rejoin instead of installing an epoch-0 fallback key. The `CHECK(successor_epoch > revoked_epoch)` constraint is present on `dm_key_revocations` (migration 000041); on `key_revocations` the constraint was added only in a re-declaration (000035) that is a no-op once the table exists from 000028, so it may be absent on already-migrated databases.
 
 ### Account Erasure Cascade
 

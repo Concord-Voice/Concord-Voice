@@ -141,6 +141,15 @@ socket.emit('consume', { producerId, rtpCapabilities }, (data) => {
 });
 ```
 
+**request-keyframe**
+```typescript
+socket.emit('request-keyframe', { senderUserId }, (data) => {
+  // data: { success: true, requested: number } | { error: string }
+});
+```
+
+Requests a fresh video keyframe for the caller's consumer of `senderUserId` after E2EE epoch recovery. The media plane validates room membership and applies a 5s per-sender cooldown before calling mediasoup `consumer.requestKeyFrame()`.
+
 ### Server → Client
 
 **router-rtp-capabilities**

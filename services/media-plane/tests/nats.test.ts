@@ -103,6 +103,7 @@ describe('NatsService', () => {
         userId: 'u-1',
         username: 'alice',
         displayName: 'Alice',
+        e2eeEpoch: 1,
       });
 
       expect(mockNc.publish).toHaveBeenCalled();
