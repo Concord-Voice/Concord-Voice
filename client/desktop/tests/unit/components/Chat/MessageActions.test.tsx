@@ -33,11 +33,15 @@ describe('MessageActions', () => {
   });
 
   it('opens options menu on trigger click', () => {
-    render(<MessageActions {...defaultProps} />);
+    const { container } = render(<MessageActions {...defaultProps} />);
+    const options = container.querySelector('.message-options');
 
     const trigger = screen.getByLabelText('Message options');
+    expect(options).not.toHaveClass('message-options--open');
+
     fireEvent.click(trigger);
 
+    expect(options).toHaveClass('message-options--open');
     expect(screen.getByText('Edit')).toBeInTheDocument();
     expect(screen.getByText('Delete')).toBeInTheDocument();
   });
@@ -91,20 +95,23 @@ describe('MessageActions', () => {
   });
 
   it('closes options menu on outside click', () => {
-    render(
+    const { container } = render(
       <div>
         <MessageActions {...defaultProps} />
         <button data-testid="outside">Outside</button>
       </div>
     );
+    const options = container.querySelector('.message-options');
 
     // Open menu
     fireEvent.click(screen.getByLabelText('Message options'));
     expect(screen.getByText('Edit')).toBeInTheDocument();
+    expect(options).toHaveClass('message-options--open');
 
     // Click outside
     fireEvent.mouseDown(screen.getByTestId('outside'));
     expect(screen.queryByText('Edit')).not.toBeInTheDocument();
+    expect(options).not.toHaveClass('message-options--open');
   });
 
   it('does not show Edit when onEdit is undefined', () => {

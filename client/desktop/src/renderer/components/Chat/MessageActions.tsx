@@ -56,7 +56,10 @@ const MessageActions: React.FC<MessageActionsProps> = ({
   const hasMenuItems = !!(onEdit || onDelete || canShowPin);
 
   return (
-    <div className="message-options" ref={optionsRef}>
+    <div
+      className={`message-options${showOptions ? ' message-options--open' : ''}`}
+      ref={optionsRef}
+    >
       {onReaction && (
         <button
           className="message-quick-reaction"

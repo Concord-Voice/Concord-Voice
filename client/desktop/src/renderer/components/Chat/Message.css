@@ -281,6 +281,10 @@
   opacity: 1;
 }
 
+.message-options.message-options--open {
+  opacity: 1;
+}
+
 /* Quick delete button (Shift+hover) */
 .message-quick-delete {
   background-color: var(--bg-secondary);
