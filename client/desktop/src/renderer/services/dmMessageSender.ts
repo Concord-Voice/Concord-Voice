@@ -98,6 +98,7 @@ export function sendDMMessage(
   // Optimistically bump conversation to top of DM list (#656)
   useDMStore.getState().bumpConversation(conversationId, {
     content,
+    plaintextPreview: content,
     userId: userId || 'unknown',
     username,
     createdAt: optimisticMessage.created_at,

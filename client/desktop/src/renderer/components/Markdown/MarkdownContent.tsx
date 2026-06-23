@@ -34,6 +34,8 @@ interface MarkdownContentProps {
   content: string;
   editedAt: string | null | undefined;
   mentionLookup: MentionLookup;
+  currentUserId?: string;
+  currentUserRoleIds?: ReadonlySet<string>;
 }
 
 // Module-scope anchor override. Defined outside the parent component so it
@@ -53,7 +55,9 @@ const MarkdownA: React.FC<MarkdownAProps> = ({ href, title, children }) => (
 // so MentionChip gets the right resolver; the returned component is declared
 // once at module scope, not nested inside MarkdownContent.
 function makeMarkdownSpan(
-  mentionLookup: MentionLookup
+  mentionLookup: MentionLookup,
+  currentUserId: string | undefined,
+  currentUserRoleIds: ReadonlySet<string> | undefined
 ): React.FC<React.HTMLAttributes<HTMLSpanElement>> {
   const MarkdownSpan: React.FC<React.HTMLAttributes<HTMLSpanElement>> = ({
     className,
@@ -71,7 +75,14 @@ function makeMarkdownSpan(
       // DO NOT change this to `dataMention`; the JSX input from react-markdown uses kebab.
       const token = (props as { 'data-mention'?: string })['data-mention'];
       if (token) {
-        return <MentionChip token={token} lookup={mentionLookup} />;
+        return (
+          <MentionChip
+            token={token}
+            lookup={mentionLookup}
+            currentUserId={currentUserId}
+            currentUserRoleIds={currentUserRoleIds}
+          />
+        );
       }
     }
     return <span className={className}>{children}</span>;
@@ -85,6 +96,8 @@ const MarkdownContentInner: React.FC<MarkdownContentProps> = ({
   content,
   editedAt: _editedAt,
   mentionLookup,
+  currentUserId,
+  currentUserRoleIds,
 }) => {
   const theme = useSettingsStore((s) => s.appearance.theme);
 
@@ -96,9 +109,9 @@ const MarkdownContentInner: React.FC<MarkdownContentProps> = ({
   const components = useMemo(
     () => ({
       a: MarkdownA,
-      span: makeMarkdownSpan(mentionLookup),
+      span: makeMarkdownSpan(mentionLookup, currentUserId, currentUserRoleIds),
     }),
-    [mentionLookup]
+    [mentionLookup, currentUserId, currentUserRoleIds]
   );
 
   return (
@@ -119,7 +132,9 @@ function propsEqual(prev: MarkdownContentProps, next: MarkdownContentProps): boo
     prev.id === next.id &&
     prev.content === next.content &&
     prev.editedAt === next.editedAt &&
-    prev.mentionLookup === next.mentionLookup
+    prev.mentionLookup === next.mentionLookup &&
+    prev.currentUserId === next.currentUserId &&
+    prev.currentUserRoleIds === next.currentUserRoleIds
   );
 }
 

@@ -956,10 +956,10 @@ describe('handleError log level', () => {
 
     s.handleError(new Event('error'));
 
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('first-attempt transport drop'),
-      'error'
-    );
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('first-attempt transport drop'), {
+      type: 'Event',
+      event: 'error',
+    });
     expect(errorSpy).not.toHaveBeenCalled();
     expect(svc.getState()).toBe(ConnectionState.ERROR);
   });
@@ -973,9 +973,38 @@ describe('handleError log level', () => {
 
     s.handleError(new Event('error'));
 
-    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('transport error'), 'error');
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('transport error'), {
+      type: 'Event',
+      event: 'error',
+    });
     expect(warnSpy).not.toHaveBeenCalled();
     expect(svc.getState()).toBe(ConnectionState.ERROR);
+  });
+
+  it('logs structured Error details for transport failures', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    s.setAggressiveReconnect(false);
+    s.handleError(new Error('socket failed') as unknown as Event);
+
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('transport error'), {
+      type: 'Error',
+      message: 'socket failed',
+    });
+  });
+
+  it('logs structured CloseEvent details for transport failures', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    s.setAggressiveReconnect(false);
+    s.handleError(new CloseEvent('close', { code: 1006, reason: 'abnormal' }));
+
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('transport error'), {
+      type: 'CloseEvent',
+      event: 'close',
+      code: 1006,
+      reason: 'abnormal',
+    });
   });
 
   it('logs error when not in aggressive mode (normal exponential reconnect)', () => {
@@ -987,7 +1016,10 @@ describe('handleError log level', () => {
 
     s.handleError(new Event('error'));
 
-    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('transport error'), 'error');
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('transport error'), {
+      type: 'Event',
+      event: 'error',
+    });
     expect(warnSpy).not.toHaveBeenCalled();
     expect(svc.getState()).toBe(ConnectionState.ERROR);
   });

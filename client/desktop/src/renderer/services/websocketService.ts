@@ -17,6 +17,7 @@ import { WS_BASE } from '../config';
 import { useAuthStore } from '../stores/authStore';
 import { useConnectionStore } from '../stores/connectionStore';
 import { errorMessage, errorName } from '../utils/redactError';
+import { summarizeWsDiagnostic, summarizeWsServerError } from '../utils/wsDiagnostics';
 import {
   WebSocketEventSchema,
   scrubZodIssues,
@@ -827,7 +828,7 @@ export class WebSocketService {
         // message.data is an ErrorSchema-validated server payload object (not a JS Error).
         // The last console.error arg is a member-expression, not a bare Error identifier,
         // so the no-restricted-syntax raw-err guard's selector doesn't match.
-        console.error('WebSocket server error:', message.data);
+        console.error('WebSocket server error:', summarizeWsServerError(message.data));
         break;
 
       case 'connection_ready':
@@ -864,10 +865,13 @@ export class WebSocketService {
     // mode has burned through an attempt (or is off), restore the loud
     // signal — that's when something is actually wrong.
     const isExpectedFirstBounce = this.reconnectAttempts === 0 && this.aggressiveReconnect;
+    const summary = summarizeWsDiagnostic(event);
     if (isExpectedFirstBounce) {
-      console.warn('[WebSocket] first-attempt transport drop (will retry):', event.type);
+      // eslint-disable-next-line no-restricted-syntax -- summary is an audit-safe structured diagnostic; raw Event/Error objects and cause chains are not logged.
+      console.warn('[WebSocket] first-attempt transport drop (will retry):', summary);
     } else {
-      console.error('[WebSocket] transport error:', event.type);
+      // eslint-disable-next-line no-restricted-syntax -- summary is an audit-safe structured diagnostic; raw Event/Error objects and cause chains are not logged.
+      console.error('[WebSocket] transport error:', summary);
     }
     this.setState(ConnectionState.ERROR);
   }

@@ -387,15 +387,27 @@
 /* @mention highlights — uses theme accent via color-mix so the highlight
    adapts per-theme instead of leaking Discord blurple. */
 .mention-highlight {
-  color: var(--accent-primary);
-  background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
   border-radius: 3px;
   padding: 0 2px;
   font-weight: 500;
 }
 
-.mention-highlight:hover {
+.mention-highlight--self {
+  color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
+}
+
+.mention-highlight--self:hover {
   background: color-mix(in srgb, var(--accent-primary) 24%, transparent);
+}
+
+.mention-highlight--other {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--text-primary) 8%, transparent);
+}
+
+.mention-highlight--other:hover {
+  background: color-mix(in srgb, var(--text-primary) 14%, transparent);
 }
 
 /* Pinned message indicator */

@@ -188,39 +188,6 @@ export function encodeMentionMeta(addendum: MentionAddendum): string {
   return btoa(binary);
 }
 
-// ── Recipient-Side Scanning ──
-
-/**
- * Check if the current user is mentioned in a decrypted message.
- * Used by recipients after decryption to determine if they should
- * show a mention notification.
- */
-export function isUserMentioned(
-  text: string,
-  currentUserId: string,
-  _currentUsername: string,
-  _currentDisplayName: string | undefined,
-  memberRoleIds: string[],
-  ctx: MentionResolveContext
-): { mentioned: boolean; mentionEveryone: boolean } {
-  const mentions = parseMentions(text, ctx);
-  let mentioned = false;
-  let mentionEveryone = false;
-
-  for (const m of mentions) {
-    if (m.type === 'everyone' || m.type === 'here') {
-      mentioned = true;
-      mentionEveryone = true;
-    } else if (m.type === 'user' && m.id === currentUserId) {
-      mentioned = true;
-    } else if (m.type === 'role' && m.id && memberRoleIds.includes(m.id)) {
-      mentioned = true;
-    }
-  }
-
-  return { mentioned, mentionEveryone };
-}
-
 // ── Rendering Helpers ──
 
 /** A segment of message text, either plain text or a mention. */

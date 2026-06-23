@@ -357,10 +357,14 @@ function MessageTextContent({
   message,
   showAvatar,
   mentionLookup,
+  currentUserId,
+  currentUserRoleIds,
 }: Readonly<{
   message: MessageWithStatus;
   showAvatar: boolean;
   mentionLookup: MentionLookup;
+  currentUserId: string;
+  currentUserRoleIds?: ReadonlySet<string>;
 }>) {
   const emojiCount =
     !message.pendingKeys && !message.decryptFailed ? getEmojiOnlyCount(message.content) : 0;
@@ -392,6 +396,8 @@ function MessageTextContent({
         content={message.content}
         editedAt={message.edited_at ?? null}
         mentionLookup={mentionLookup}
+        currentUserId={currentUserId}
+        currentUserRoleIds={currentUserRoleIds}
       />
     );
   }
@@ -446,6 +452,12 @@ const Message: React.FC<MessageProps> = ({
     () => buildMentionLookup(members, allServerRoles),
     [members, allServerRoles]
   );
+  const currentUserRoleIds = useMemo(() => {
+    if (isDM) return undefined;
+    const currentMember = members.find((m) => m.user_id === currentUserId);
+    if (!currentMember?.roles.length) return undefined;
+    return new Set(currentMember.roles.map((role) => role.role_id));
+  }, [currentUserId, isDM, members]);
 
   const senderMember = isDM ? undefined : members.find((m) => m.user_id === message.user_id);
   const senderColors = resolveUserAccentColors(senderMember?.color_scheme);
@@ -554,6 +566,8 @@ const Message: React.FC<MessageProps> = ({
             message={message}
             showAvatar={showAvatar}
             mentionLookup={mentionLookup}
+            currentUserId={currentUserId}
+            currentUserRoleIds={currentUserRoleIds}
           />
         )}
 

@@ -26,6 +26,8 @@ interface MenuState {
 
 const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'email', 'password', 'tel', 'number']);
 
+export const DIRECT_MESSAGES_CONTEXT_AREA = 'direct-messages';
+
 /** Try to identify a recognizable context target from a single DOM node. */
 function matchNode(node: HTMLElement): ContextTarget | null {
   if (node.tagName === 'A' && (node as HTMLAnchorElement).href) {
@@ -229,6 +231,7 @@ const GenericMenu: React.FC<GenericMenuProps> = ({ target, position, onClose }) 
       );
 
     case 'area':
+      if (target.area === DIRECT_MESSAGES_CONTEXT_AREA) return null;
       return (
         <ContextMenu position={position} onClose={onClose}>
           <ContextMenu.Header>{areaLabel(target.area)}</ContextMenu.Header>

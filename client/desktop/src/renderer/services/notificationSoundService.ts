@@ -64,6 +64,8 @@ const noop = () => {
   /* intentionally empty */
 };
 
+const clampVolume = (volume: number): number => Math.max(0, Math.min(1, volume));
+
 type NotificationSoundSettings = ReturnType<typeof useNotificationStore.getState>;
 
 /** Maps each chat sound type to the store key that controls it */
@@ -151,6 +153,12 @@ class NotificationSoundService {
     return false;
   }
 
+  /** Check whether settings allow this sound type to play. */
+  private isTypeEnabled(type: NotificationSoundType, state: NotificationSoundSettings): boolean {
+    if (VOICE_SOUNDS.has(type)) return state.voiceEventSounds;
+    return Boolean(state[CHAT_TOGGLE[type as ChatSoundType]]);
+  }
+
   /**
    * Play a notification sound if settings allow it.
    * @param type - Sound category to play
@@ -186,6 +194,24 @@ class NotificationSoundService {
     if (!isVoice) {
       this.lastChatSoundTime = Date.now();
     }
+  }
+
+  /**
+   * Play a user-initiated preview sound at a supplied effective volume.
+   * Bypasses chat debounce and focus suppression, but still respects sound toggles.
+   */
+  playPreview(type: NotificationSoundType, volume: number): void {
+    if (!this.initialized) this.init();
+
+    const state = useNotificationStore.getState();
+    if (!state.enabled || !this.isTypeEnabled(type, state)) return;
+
+    const audio = this.sounds.get(type);
+    if (!audio) return;
+
+    audio.volume = clampVolume(volume);
+    audio.currentTime = 0;
+    Promise.resolve(audio.play()).catch(noop);
   }
 
   /**

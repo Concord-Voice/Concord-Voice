@@ -11,6 +11,7 @@ import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 import CreateGroupModal from './CreateGroupModal';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
+import { DIRECT_MESSAGES_CONTEXT_AREA } from '../ui/ContextMenuProvider';
 import DMConversationContextMenu from './DMConversationContextMenu';
 import DMProfileModal from './DMProfileModal';
 import './DirectMessages.css';
@@ -175,7 +176,7 @@ const ConversationList: React.FC<ConversationListProps> = ({
 
   useEffect(() => {
     for (const conv of conversations) {
-      if (conv.lastMessage?.content) {
+      if (conv.lastMessage?.content && !conv.lastMessage.plaintextPreview) {
         // Re-decrypt if no cache entry or the ciphertext changed (new message)
         const cached = decryptedPreviews[conv.id];
         if (!cached || cached.cipher !== conv.lastMessage.content) {
@@ -205,7 +206,7 @@ const ConversationList: React.FC<ConversationListProps> = ({
   };
 
   return (
-    <div className="conversation-list">
+    <div className="conversation-list" data-context-area={DIRECT_MESSAGES_CONTEXT_AREA}>
       <div className="conversation-search">
         <input
           type="text"
@@ -261,8 +262,11 @@ const ConversationList: React.FC<ConversationListProps> = ({
           const lastTime = conv.lastMessage?.createdAt || conv.createdAt;
           let preview = '';
           if (conv.lastMessage) {
-            // Use decrypted preview if available, otherwise show placeholder
-            preview = decryptedPreviews[conv.id]?.text || 'Encrypted message';
+            // Use optimistic local plaintext first, otherwise decrypted preview if available.
+            preview =
+              conv.lastMessage.plaintextPreview ||
+              decryptedPreviews[conv.id]?.text ||
+              'Encrypted message';
             // If no text content, show attachment type or generic fallback
             if (!preview || preview === 'Encrypted message') {
               if (conv.lastMessage.attachmentType) {

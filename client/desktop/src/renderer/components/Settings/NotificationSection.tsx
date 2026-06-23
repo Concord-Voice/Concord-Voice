@@ -1,8 +1,17 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { useOsPermissionStore } from '../../stores/osPermissionStore';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
+import {
+  notificationSoundService,
+  type NotificationSoundType,
+} from '../../services/notificationSoundService';
+
+const SOUND_PREVIEW_DEBOUNCE_MS = 200;
+
+const effectivePreviewVolume = (masterVolume: number, categoryVolume: number): number =>
+  (masterVolume / 100) * (categoryVolume / 100);
 
 interface CategoryVolumeRowProps {
   label: string;
@@ -11,6 +20,7 @@ interface CategoryVolumeRowProps {
   value: number;
   onValueChange: (volume: number) => void;
   masterEnabled: boolean;
+  onPreview: (volume: number) => void;
 }
 
 /** A labeled toggle with a volume slider underneath. The slider is disabled
@@ -22,6 +32,7 @@ const CategoryVolumeRow: React.FC<CategoryVolumeRowProps> = ({
   value,
   onValueChange,
   masterEnabled,
+  onPreview,
 }) => {
   const sliderDisabled = !masterEnabled || !toggle;
   return (
@@ -50,7 +61,11 @@ const CategoryVolumeRow: React.FC<CategoryVolumeRowProps> = ({
             max={100}
             step={1}
             value={value}
-            onChange={(e) => onValueChange(Number(e.target.value))}
+            onChange={(e) => {
+              const nextVolume = Number(e.target.value);
+              onValueChange(nextVolume);
+              if (!sliderDisabled) onPreview(nextVolume);
+            }}
             disabled={sliderDisabled}
             aria-label={`${label} volume`}
           />
@@ -61,6 +76,7 @@ const CategoryVolumeRow: React.FC<CategoryVolumeRowProps> = ({
 };
 
 const NotificationSection: React.FC = () => {
+  const previewTimerRef = useRef<number | null>(null);
   const enabled = useNotificationStore((s) => s.enabled);
   const volume = useNotificationStore((s) => s.volume);
   const messageSound = useNotificationStore((s) => s.messageSound);
@@ -109,6 +125,40 @@ const NotificationSection: React.FC = () => {
   const notificationPermission = useOsPermissionStore((s) => s.notifications);
   const requestOne = useOsPermissionStore((s) => s.requestOne);
   const openSettings = useOsPermissionStore((s) => s.openSettings);
+
+  const clearPreviewTimer = () => {
+    if (previewTimerRef.current === null) return;
+    window.clearTimeout(previewTimerRef.current);
+    previewTimerRef.current = null;
+  };
+
+  const scheduleSoundPreview = (
+    type: NotificationSoundType,
+    previewVolume: number,
+    canPreview: boolean
+  ) => {
+    clearPreviewTimer();
+    if (!canPreview) return;
+
+    previewTimerRef.current = window.setTimeout(() => {
+      previewTimerRef.current = null;
+      notificationSoundService.playPreview(type, previewVolume);
+    }, SOUND_PREVIEW_DEBOUNCE_MS);
+  };
+
+  const getMasterPreviewSound = (): {
+    type: NotificationSoundType;
+    categoryVolume: number;
+  } | null => {
+    if (messageSound) return { type: 'message', categoryVolume: messageVolume };
+    if (mentionSound) return { type: 'mention', categoryVolume: mentionVolume };
+    if (dmSound) return { type: 'dm', categoryVolume: dmVolume };
+    if (friendRequestSound) return { type: 'friend-request', categoryVolume: friendRequestVolume };
+    if (voiceEventSounds) return { type: 'voice-join', categoryVolume: voiceEventVolume };
+    return null;
+  };
+
+  useEffect(() => clearPreviewTimer, []);
 
   /** Request OS notification permission; fall back to opening system settings
    * if the OS doesn't flip to 'granted' (common on packaged builds where the
@@ -251,7 +301,20 @@ const NotificationSection: React.FC = () => {
               max={100}
               step={1}
               value={volume}
-              onChange={(e) => setVolume(Number(e.target.value))}
+              onChange={(e) => {
+                const nextVolume = Number(e.target.value);
+                const previewSound = getMasterPreviewSound();
+                setVolume(nextVolume);
+                if (previewSound) {
+                  scheduleSoundPreview(
+                    previewSound.type,
+                    effectivePreviewVolume(nextVolume, previewSound.categoryVolume),
+                    enabled
+                  );
+                } else {
+                  clearPreviewTimer();
+                }
+              }}
               aria-label="Master volume"
             />
           </div>
@@ -264,6 +327,13 @@ const NotificationSection: React.FC = () => {
           value={messageVolume}
           onValueChange={setMessageVolume}
           masterEnabled={enabled}
+          onPreview={(nextVolume) =>
+            scheduleSoundPreview(
+              'message',
+              effectivePreviewVolume(volume, nextVolume),
+              enabled && messageSound
+            )
+          }
         />
 
         <CategoryVolumeRow
@@ -273,6 +343,13 @@ const NotificationSection: React.FC = () => {
           value={mentionVolume}
           onValueChange={setMentionVolume}
           masterEnabled={enabled}
+          onPreview={(nextVolume) =>
+            scheduleSoundPreview(
+              'mention',
+              effectivePreviewVolume(volume, nextVolume),
+              enabled && mentionSound
+            )
+          }
         />
 
         <CategoryVolumeRow
@@ -282,6 +359,13 @@ const NotificationSection: React.FC = () => {
           value={dmVolume}
           onValueChange={setDmVolume}
           masterEnabled={enabled}
+          onPreview={(nextVolume) =>
+            scheduleSoundPreview(
+              'dm',
+              effectivePreviewVolume(volume, nextVolume),
+              enabled && dmSound
+            )
+          }
         />
 
         <CategoryVolumeRow
@@ -291,6 +375,13 @@ const NotificationSection: React.FC = () => {
           value={friendRequestVolume}
           onValueChange={setFriendRequestVolume}
           masterEnabled={enabled}
+          onPreview={(nextVolume) =>
+            scheduleSoundPreview(
+              'friend-request',
+              effectivePreviewVolume(volume, nextVolume),
+              enabled && friendRequestSound
+            )
+          }
         />
 
         <CategoryVolumeRow
@@ -300,6 +391,13 @@ const NotificationSection: React.FC = () => {
           value={voiceEventVolume}
           onValueChange={setVoiceEventVolume}
           masterEnabled={enabled}
+          onPreview={(nextVolume) =>
+            scheduleSoundPreview(
+              'voice-join',
+              effectivePreviewVolume(volume, nextVolume),
+              enabled && voiceEventSounds
+            )
+          }
         />
 
         <div className="settings-row">

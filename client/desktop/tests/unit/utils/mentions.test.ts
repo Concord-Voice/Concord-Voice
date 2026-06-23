@@ -3,7 +3,6 @@ import {
   parseMentions,
   buildAddendum,
   encodeMentionMeta,
-  isUserMentioned,
   segmentMessage,
   type MentionResolveContext,
   type ParsedMention,
@@ -192,49 +191,6 @@ describe('encodeMentionMeta', () => {
 
   it('encodes empty addendum', () => {
     expect(encodeMentionMeta({}).length).toBeGreaterThan(0);
-  });
-});
-
-describe('isUserMentioned', () => {
-  it('detects direct user mention', () => {
-    const r = isUserMentioned('@alice', 'user-1', 'alice', undefined, [], makeCtx());
-    expect(r.mentioned).toBe(true);
-    expect(r.mentionEveryone).toBe(false);
-  });
-
-  it('detects @all', () => {
-    const r = isUserMentioned('@all', 'user-1', 'alice', undefined, [], makeCtx());
-    expect(r).toEqual({ mentioned: true, mentionEveryone: true });
-  });
-
-  it('detects @here', () => {
-    expect(isUserMentioned('@here', 'user-1', 'alice', undefined, [], makeCtx()).mentioned).toBe(
-      true
-    );
-  });
-
-  it('detects role mention with matching role', () => {
-    expect(
-      isUserMentioned('@admin', 'user-1', 'alice', undefined, ['role-admin'], makeCtx()).mentioned
-    ).toBe(true);
-  });
-
-  it('no match for role without membership', () => {
-    expect(
-      isUserMentioned('@admin', 'user-1', 'alice', undefined, ['role-other'], makeCtx()).mentioned
-    ).toBe(false);
-  });
-
-  it('not mentioned for other user', () => {
-    expect(isUserMentioned('@bob', 'user-1', 'alice', undefined, [], makeCtx()).mentioned).toBe(
-      false
-    );
-  });
-
-  it('not mentioned for plain text', () => {
-    expect(
-      isUserMentioned('Hello world', 'user-1', 'alice', undefined, [], makeCtx()).mentioned
-    ).toBe(false);
   });
 });
 

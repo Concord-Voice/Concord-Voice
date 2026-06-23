@@ -114,6 +114,62 @@ describe('NotificationSoundService', () => {
     expect(mockPlay).toHaveBeenCalledTimes(1);
   });
 
+  describe('preview playback', () => {
+    const getAudio = (type: string): MockAudio | undefined => {
+      const sounds = (notificationSoundService as Record<string, unknown>)['sounds'] as Map<
+        string,
+        MockAudio
+      >;
+      return sounds.get(type);
+    };
+
+    it('plays a caller-supplied preview volume without starting chat debounce', () => {
+      notificationSoundService.playPreview('message', 0.42);
+
+      expect(mockPlay).toHaveBeenCalledTimes(1);
+      expect(getAudio('message')?.volume).toBeCloseTo(0.42, 5);
+      expect((notificationSoundService as Record<string, unknown>)['lastChatSoundTime']).toBe(0);
+
+      notificationSoundService.play('mention');
+      expect(mockPlay).toHaveBeenCalledTimes(2);
+    });
+
+    it('clamps preview volume and resets playback position before playing', () => {
+      notificationSoundService.init();
+      const audio = getAudio('dm');
+      if (audio) audio.currentTime = 12;
+
+      notificationSoundService.playPreview('dm', 1.5);
+
+      expect(getAudio('dm')?.volume).toBe(1);
+      expect(getAudio('dm')?.currentTime).toBe(0);
+    });
+
+    it('does not preview when master sounds are disabled', () => {
+      useNotificationStore.getState().setEnabled(false);
+
+      notificationSoundService.playPreview('message', 0.5);
+
+      expect(mockPlay).not.toHaveBeenCalled();
+    });
+
+    it('does not preview when the relevant category is disabled', () => {
+      useNotificationStore.getState().setMessageSound(false);
+      useNotificationStore.getState().setVoiceEventSounds(false);
+
+      notificationSoundService.playPreview('message', 0.5);
+      notificationSoundService.playPreview('voice-join', 0.5);
+
+      expect(mockPlay).not.toHaveBeenCalled();
+    });
+
+    it('handles preview play rejection gracefully', () => {
+      mockPlay.mockRejectedValueOnce(new DOMException('Autoplay blocked'));
+
+      expect(() => notificationSoundService.playPreview('message', 0.5)).not.toThrow();
+    });
+  });
+
   it('allows sound after rate limit expires', () => {
     notificationSoundService.play('message');
     expect(mockPlay).toHaveBeenCalledTimes(1);

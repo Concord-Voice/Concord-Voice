@@ -950,13 +950,18 @@ describe('useWebSocketMessages — extended handlers', () => {
       const ws = createMockWsService();
       renderHook(() => useWebSocketMessages(ws as never));
 
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
       const handler = ws.handlers.get('error')!;
       // Should not throw
       act(() => {
         handler({ type: 'error', data: { message: 'Unknown error' } });
       });
 
-      expect(handler).toBeDefined();
+      expect(errorSpy).toHaveBeenCalledWith('WebSocket error:', {
+        type: 'server_error',
+        code: 'unknown',
+      });
+      errorSpy.mockRestore();
     });
   });
 

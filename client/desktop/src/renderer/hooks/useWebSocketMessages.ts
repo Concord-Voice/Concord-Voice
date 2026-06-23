@@ -55,6 +55,7 @@ function isDoNotDisturb(): boolean {
 }
 import { indexMessage } from '../services/searchService';
 import { unwrapGifEnvelope } from '../utils/gifEnvelope';
+import { summarizeWsServerError } from '../utils/wsDiagnostics';
 import {
   desktopNotificationService,
   type NotificationType,
@@ -1617,8 +1618,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
           })
         );
       } else {
-        // eslint-disable-next-line no-restricted-syntax -- data is a server-supplied WS payload object, not an Error; logged for diagnostics (no err.cause propagation risk)
-        console.error('WebSocket error:', data);
+        console.error('WebSocket error:', summarizeWsServerError(data));
       }
     });
 

@@ -39,6 +39,7 @@ vi.mock('@/renderer/components/Chat/GifEmbed', () => ({
 }));
 import { useMemberStore } from '@/renderer/stores/memberStore';
 import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
+import { usePermissionStore } from '@/renderer/stores/permissionStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { vi } from 'vitest';
 import userEvent from '@testing-library/user-event';
@@ -435,6 +436,110 @@ describe('Message', () => {
     const mention = document.querySelector('.mention-highlight');
     expect(mention).toBeInTheDocument();
     expect(mention?.textContent).toBe('@Test User 2');
+  });
+
+  it('styles current-user mention tokens as self mentions', () => {
+    render(
+      <Message
+        message={{ ...mockMessage, content: 'Hey <@user-1> check this out' }}
+        currentUserId="user-1"
+        showAvatar={true}
+      />
+    );
+    const mention = document.querySelector('.mention-highlight');
+    expect(mention).toHaveClass('mention-highlight--self');
+    expect(mention).not.toHaveClass('mention-highlight--other');
+    expect(mention?.textContent).toBe('@Test User');
+  });
+
+  it('styles another user mention token as a non-self mention', () => {
+    useMemberStore.getState().addMember(mockMember2);
+    render(
+      <Message
+        message={{ ...mockMessage, content: 'Hey <@user-2> check this out' }}
+        currentUserId="user-1"
+        showAvatar={true}
+      />
+    );
+    const mention = document.querySelector('.mention-highlight');
+    expect(mention).toHaveClass('mention-highlight--other');
+    expect(mention).not.toHaveClass('mention-highlight--self');
+    expect(mention?.textContent).toBe('@Test User 2');
+  });
+
+  it('does not treat plain username mentions as self mentions', () => {
+    render(
+      <Message
+        message={{ ...mockMessage, content: 'Hey @testuser check this out' }}
+        currentUserId="user-1"
+        showAvatar={true}
+      />
+    );
+    const mention = document.querySelector('.mention-highlight');
+    expect(mention).toHaveClass('mention-highlight--other');
+    expect(mention).not.toHaveClass('mention-highlight--self');
+  });
+
+  it('styles broadcast mentions as self mentions', () => {
+    render(
+      <Message
+        message={{ ...mockMessage, content: 'Heads up @everyone' }}
+        currentUserId="user-1"
+        showAvatar={true}
+      />
+    );
+    const mention = document.querySelector('.mention-highlight');
+    expect(mention).toHaveClass('mention-highlight--self');
+    expect(mention).not.toHaveClass('mention-highlight--other');
+  });
+
+  it('styles current-user role mention tokens as self mentions', () => {
+    useMemberStore.setState({
+      members: [
+        {
+          ...mockMember,
+          roles: [
+            {
+              role_id: 'role-42',
+              role_name: 'Admin',
+              position: 2,
+            },
+          ],
+        },
+      ],
+    });
+    usePermissionStore.setState({
+      serverRoles: {
+        'server-1': [
+          {
+            id: 'role-42',
+            server_id: 'server-1',
+            name: 'Admin',
+            position: 2,
+            permissions: '0',
+            is_default: false,
+            display_separately: false,
+            mentionable: true,
+            require_mfa: false,
+            created_at: '2025-01-01T00:00:00Z',
+            updated_at: '2025-01-01T00:00:00Z',
+          },
+        ],
+      },
+    });
+
+    render(
+      <Message
+        message={{ ...mockMessage, content: 'Hey <@&role-42>' }}
+        currentUserId="user-1"
+        showAvatar={true}
+      />
+    );
+
+    const mention = document.querySelector('.mention-highlight');
+    expect(mention).toHaveClass('mention-highlight--self');
+    expect(mention).not.toHaveClass('mention-highlight--other');
+    expect(mention?.textContent).toBe('@Admin');
   });
 
   it('renders plain @username mentions as highlighted', () => {

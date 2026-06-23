@@ -90,4 +90,37 @@ describe('dmMessageSender.sendDMMessage', () => {
     expect(mockSendDMMessage).not.toHaveBeenCalled();
     expect(mockEnqueue).toHaveBeenCalled();
   });
+
+  it('stores self-sent plaintext as an optimistic in-memory preview', () => {
+    mockGetState.mockReturnValue(ConnectionState.DISCONNECTED);
+    useDMStore.setState({
+      conversations: [
+        {
+          id: 'dm-conv-1',
+          isGroup: false,
+          isPersonal: false,
+          name: null,
+          participants: [],
+          lastMessage: {
+            content: 'old-ciphertext',
+            userId: 'friend-id',
+            username: 'friend',
+            createdAt: '2026-01-01T00:00:00Z',
+          },
+          unreadCount: 0,
+          createdAt: '2026-01-01T00:00:00Z',
+        },
+      ],
+    } as Partial<ReturnType<typeof useDMStore.getState>>);
+
+    sendDMMessage('dm-conv-1', 'Latest self-sent DM', 'me');
+
+    const conv = useDMStore.getState().conversations.find((c) => c.id === 'dm-conv-1');
+    expect(conv?.lastMessage).toEqual(
+      expect.objectContaining({
+        content: 'Latest self-sent DM',
+        plaintextPreview: 'Latest self-sent DM',
+      })
+    );
+  });
 });

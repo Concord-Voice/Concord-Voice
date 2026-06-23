@@ -21,6 +21,8 @@ export interface DMLastMessage {
   userId: string;
   username: string;
   createdAt: string;
+  /** In-memory preview for optimistic local sends; dmStore only persists activeConversationId. */
+  plaintextPreview?: string;
   /** Media type label when message has no text content (e.g. 'Photo', 'Video', 'File'). */
   attachmentType?: string;
 }

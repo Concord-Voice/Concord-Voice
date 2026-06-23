@@ -368,8 +368,11 @@ describe('WebSocketService — extended', () => {
       const ws = await connectAndWaitForOpen(service);
 
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-      ws.simulateMessage({ type: 'error', data: { message: 'Server error' } });
-      expect(errorSpy).toHaveBeenCalled();
+      ws.simulateMessage({ type: 'error', data: {} });
+      expect(errorSpy).toHaveBeenCalledWith('WebSocket server error:', {
+        type: 'server_error',
+        code: 'unknown',
+      });
       errorSpy.mockRestore();
     });
 

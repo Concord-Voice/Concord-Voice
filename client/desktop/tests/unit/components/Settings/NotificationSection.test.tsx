@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, act } from '../../../test-utils';
 import { vi, type Mock } from 'vitest';
 
 // ── Mocks ──────────────────────────────────────────────────────────────
@@ -69,6 +69,14 @@ vi.mock('@/renderer/stores/osPermissionStore', () => ({
   }),
 }));
 
+const mockPlayPreview = vi.fn();
+
+vi.mock('@/renderer/services/notificationSoundService', () => ({
+  notificationSoundService: {
+    playPreview: (...args: unknown[]) => mockPlayPreview(...args),
+  },
+}));
+
 import NotificationSection from '@/renderer/components/Settings/NotificationSection';
 import { useOsPermissionStore } from '@/renderer/stores/osPermissionStore';
 
@@ -89,6 +97,29 @@ function setPermissionStatus(status: string) {
 describe('NotificationSection', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    Object.assign(mockNotificationState, {
+      enabled: true,
+      volume: 80,
+      messageSound: true,
+      messageVolume: 100,
+      mentionSound: true,
+      mentionVolume: 100,
+      dmSound: true,
+      dmVolume: 100,
+      friendRequestSound: true,
+      friendRequestVolume: 100,
+      voiceEventSounds: true,
+      voiceEventVolume: 100,
+      suppressWhenFocused: true,
+      desktopNotificationsEnabled: true,
+      desktopNotifyDMs: true,
+      desktopNotifyMentions: true,
+      desktopNotifyAllMessages: false,
+      doNotDisturb: false,
+      quietHoursEnabled: false,
+      quietHoursStart: '22:00',
+      quietHoursEnd: '08:00',
+    });
     // Reset to granted by default
     setPermissionStatus('granted');
   });
@@ -138,6 +169,85 @@ describe('NotificationSection', () => {
     expect(slider).toBeInTheDocument();
     fireEvent.change(slider!, { target: { value: '50' } });
     expect(mockNotificationState.setVolume).toHaveBeenCalledWith(50);
+  });
+
+  it('previews Master volume changes after the debounce window', () => {
+    vi.useFakeTimers();
+    try {
+      render(<NotificationSection />);
+
+      fireEvent.change(screen.getByLabelText('Master volume'), { target: { value: '50' } });
+      expect(mockPlayPreview).not.toHaveBeenCalled();
+
+      act(() => {
+        vi.advanceTimersByTime(200);
+      });
+
+      expect(mockPlayPreview).toHaveBeenCalledWith('message', 0.5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('debounces repeated Master volume changes into one latest preview', () => {
+    vi.useFakeTimers();
+    try {
+      render(<NotificationSection />);
+
+      fireEvent.change(screen.getByLabelText('Master volume'), { target: { value: '70' } });
+      fireEvent.change(screen.getByLabelText('Master volume'), { target: { value: '60' } });
+
+      act(() => {
+        vi.advanceTimersByTime(199);
+      });
+      expect(mockPlayPreview).not.toHaveBeenCalled();
+
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      expect(mockPlayPreview).toHaveBeenCalledTimes(1);
+      expect(mockPlayPreview).toHaveBeenCalledWith('message', 0.6);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not preview Master volume changes when notification sounds are disabled', () => {
+    vi.useFakeTimers();
+    mockNotificationState.enabled = false;
+    try {
+      render(<NotificationSection />);
+
+      fireEvent.change(screen.getByLabelText('Master volume'), { target: { value: '50' } });
+
+      act(() => {
+        vi.advanceTimersByTime(200);
+      });
+
+      expect(mockNotificationState.setVolume).toHaveBeenCalledWith(50);
+      expect(mockPlayPreview).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('previews the first enabled category when Message sounds are off', () => {
+    vi.useFakeTimers();
+    mockNotificationState.messageSound = false;
+    mockNotificationState.mentionVolume = 50;
+    try {
+      render(<NotificationSection />);
+
+      fireEvent.change(screen.getByLabelText('Master volume'), { target: { value: '60' } });
+
+      act(() => {
+        vi.advanceTimersByTime(200);
+      });
+
+      expect(mockPlayPreview).toHaveBeenCalledWith('mention', 0.3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // ── Permission banner: not-determined ─────────────────────────────
@@ -287,6 +397,25 @@ describe('NotificationSection', () => {
     render(<NotificationSection />);
     fireEvent.change(screen.getByLabelText('Message sounds volume'), { target: { value: '42' } });
     expect(mockNotificationState.setMessageVolume).toHaveBeenCalledWith(42);
+  });
+
+  it('previews category volume changes at effective master by category volume', () => {
+    vi.useFakeTimers();
+    try {
+      render(<NotificationSection />);
+
+      fireEvent.change(screen.getByLabelText('Message sounds volume'), {
+        target: { value: '50' },
+      });
+
+      act(() => {
+        vi.advanceTimersByTime(200);
+      });
+
+      expect(mockPlayPreview).toHaveBeenCalledWith('message', 0.4);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('mention volume slider calls setMentionVolume on change', () => {
