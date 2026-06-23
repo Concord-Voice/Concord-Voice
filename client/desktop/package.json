@@ -85,7 +85,7 @@
     "ajv-formats": "^3.0.1",
     "app-builder-bin": "^4.2.0",
     "concurrently": "^10.0.3",
-    "electron": "^42.4.0",
+    "electron": "^42.4.1",
     "esbuild": "^0.28.1",
     "eslint": "^10.5.0",
     "eslint-config-prettier": "^10.1.8",
