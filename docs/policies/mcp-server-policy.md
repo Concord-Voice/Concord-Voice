@@ -12,7 +12,7 @@ Model Context Protocol (MCP) servers extend AI-assisted development tools with e
 
 This policy defines the approved MCP server allowlist, the vetting process for adding or re-approving servers, and credential scoping requirements for all MCP integrations used in Concord development.
 
-**Configuration:** Approved servers are configured in two committed files at the project root — `.mcp.json` (Claude Code App + CLI + extension) and `.vscode/mcp.json` (VS Code native MCP). Both are version-controlled and shared across the team. Credentials are referenced via environment variables or VS Code's secret store — never hardcoded. See §3 for the per-host inventory.
+**Configuration:** Approved servers are configured in three committed files at the project root — `.mcp.json` (Claude Code App + CLI + extension), `.vscode/mcp.json` (VS Code native MCP), and `.codex/config.toml` (Codex App/CLI project MCP). All three are version-controlled and shared across the team. Credentials are referenced via environment variables or VS Code's secret store — never hardcoded. See §3 for the per-host inventory.
 
 ---
 
@@ -35,12 +35,13 @@ This policy defines the approved MCP server allowlist, the vetting process for a
 
 ## 3. Configuration
 
-Approved MCP servers are configured in two committed files at the project root, one per host:
+Approved MCP servers are configured in three committed files at the project root, one per host:
 
 - **`.mcp.json`** — Claude Code App + Claude Code CLI + Claude Code VS Code extension (the embedded-agent surface). Credentials come from process env (set via shell `export` for CLI, `launchctl setenv` for App + VS Code extension; see §8).
 - **`.vscode/mcp.json`** — VS Code's native MCP integration (the chat-panel surface). Credentials come from `${input:VAR}` prompts that store secrets in VS Code's secret store. The `.gitignore` carves both `mcp.json` and `extensions.json` out of the broad `.vscode/` ignore.
+- **`.codex/config.toml`** — Codex App/CLI project MCP. Credentials come from the Codex process environment for servers that declare `env_vars`.
 
-Both files use only vetted server implementations from §2. Do not substitute a different maintainer/package for an approved server without re-review.
+These files use only vetted server implementations from §2. Do not substitute a different maintainer/package for an approved server without re-review.
 
 ### Servers in `.mcp.json` (Claude Code App + CLI + VS Code extension)
 
@@ -66,9 +67,20 @@ Both files use only vetted server implementations from §2. Do not substitute a 
 
 **Documented host-warranted deviation — Stripe:** the VS Code native MCP entry uses Stripe's official hosted HTTP endpoint (`mcp.stripe.com`) instead of the npm `@stripe/mcp` package used in `.mcp.json`. Rationale: zero local process to manage in the IDE lifecycle; no version pin needed (Stripe owns the rolling endpoint); same trust boundary as the npm package's ultimate API destination (`api.stripe.com`). Adding more host-warranted deviations requires explicit justification in this policy doc plus security-reviewer approval at PR time.
 
-### Why two configs, not one?
+### Servers in `.codex/config.toml` (Codex App/CLI project MCP)
 
-Claude Code (App + CLI + VS Code extension) reads `.mcp.json`; VS Code's native MCP integration reads `.vscode/mcp.json`. They are different runtimes with different credential conventions: Claude Code passes credentials via process env (which is why §8's `launchctl setenv` discussion exists for the App + extension), while VS Code's native MCP uses encrypted secret-store prompts (`${input}`) that do not expose credentials to the process env at all. One file per host runtime keeps each config host-idiomatic.
+| Server | Approved Package | Version | Credentials |
+| ------ | ---------------- | ------- | ----------- |
+| SonarQube | `docker.io/mcp/sonarqube` (canonical SonarSource Docker image) | `latest` | `SONARQUBE_TOKEN` env var only. `SONARQUBE_ORG` (`concord-voice`) and `SONARQUBE_URL` (`https://sonarcloud.io`) are hardcoded since they are non-secret public values |
+| Context7 | `@upstash/context7-mcp` (Upstash) | 2.1.6 | None |
+| Playwright | `@playwright/mcp` (Microsoft) | 0.0.70 | None |
+| Terraform | `terraform-mcp-server` (HashiCorp) | 0.13.0 | None by default; registry lookups work without auth |
+| GitHub | `@modelcontextprotocol/server-github` | 2025.4.8 | `GITHUB_PERSONAL_ACCESS_TOKEN` — use a fine-grained PAT with minimum scope |
+| Stripe | `@stripe/mcp` (Stripe) | 0.3.3 | `STRIPE_SECRET_KEY` — **restricted test-mode keys only (`rk_test_*`)** |
+
+### Why separate configs?
+
+Claude Code (App + CLI + VS Code extension) reads `.mcp.json`; VS Code's native MCP integration reads `.vscode/mcp.json`; Codex reads `.codex/config.toml`. They are different runtimes with different credential conventions: Claude Code and Codex pass credentials via process env, while VS Code's native MCP uses encrypted secret-store prompts (`${input}`) that do not expose credentials to the process env at all. One file per host runtime keeps each config host-idiomatic.
 
 ### IDE-Managed (no MCP-config entry needed)
 
@@ -95,7 +107,8 @@ Before approving a new MCP server or re-vetting an existing one, complete each i
 - [ ] **Host classification:** Which host runtime is this server intended for? Options:
       - `.mcp.json` only (Claude Code App + CLI + VS Code extension) — server fits Claude Code's npm/Docker process model and consumes credentials from process env
       - `.vscode/mcp.json` only (VS Code native MCP) — server is IDE-introspection shaped (long-lived, surfaced through VS Code's chat panel) or its credential UX is meaningfully better via `${input}` prompts
-      - **Both** — only if the server is genuinely host-agnostic (same package and version usable in both runtimes; credentials map cleanly to each host's idiom) AND its presence on both surfaces is documented in §3
+      - `.codex/config.toml` only (Codex App/CLI project MCP) — server fits Codex's npm/Docker process model and consumes credentials from process env
+      - **Multiple hosts** — only if the server is genuinely host-agnostic (same package and version usable across those runtimes; credentials map cleanly to each host's idiom) AND its presence on each surface is documented in §3
 
       Additionally: any host-warranted deviation (different transport, different version, different credential mechanism per host) must be documented in §3 with rationale, regardless of which option above was chosen.
 
@@ -134,7 +147,7 @@ All MCP server credential assignments must follow these rules:
 
 ## 8. SonarQube Integration Notes & Credential-Surface Taxonomy
 
-The canonical SonarQube MCP integration is the SonarSource-published Docker image (`docker.io/mcp/sonarqube`). It exposes the `change_sonar_issue_status`, `search_sonar_issues_in_projects`, and related tools that all our MCP host runtimes (Claude Code App + CLI + VS Code extension, plus VS Code native MCP) consume. **See §3 for the per-host server inventory: which servers live in `.mcp.json` vs. `.vscode/mcp.json`.**
+The canonical SonarQube MCP integration is the SonarSource-published Docker image (`docker.io/mcp/sonarqube`). It exposes the `change_sonar_issue_status`, `search_sonar_issues_in_projects`, and related tools that all our MCP host runtimes (Claude Code App + CLI + VS Code extension, VS Code native MCP, and Codex App/CLI) consume. **See §3 for the per-host server inventory: which servers live in `.mcp.json`, `.vscode/mcp.json`, and `.codex/config.toml`.**
 
 ### Credential mechanism per surface
 
@@ -143,6 +156,7 @@ Concord developers run MCPs from three operationally-distinct surfaces, each wit
 | Surface | Credential mechanism | Secret persistence scope | Recommended? |
 | ------- | -------------------- | ------------------------ | ------------ |
 | **Claude Code CLI** (terminal `claude`) | Shell `export VAR=...` in `~/.zshrc` or `~/.bashrc` | Shell profile (per-user file readable by other terminal processes the user runs) | Default for CLI use; no alternative mechanism in current project tooling |
+| **Codex App/CLI** (`.codex/config.toml`) | Codex process env for servers listed with `env_vars` | Same exposure profile as the process that launches Codex | Acceptable; use minimum-scope dev credentials only |
 | **Claude Code App** (standalone `.app`) | `launchctl setenv VAR ...` (one-time) or LaunchAgent plist (persistent) | launchd env (process-wide — visible to **every GUI app the user launches** for the session, not just Claude Code) | Acceptable, but the launchd-env exposure is the textbook OWASP A02 misconfiguration — see "Rule of thumb" below |
 | **Claude Code VS Code extension** (embedded agent reading `.mcp.json`) | Same as Claude Code App: `launchctl setenv` (the extension inherits VS Code's process env, which inherits launchd's) | launchd env (same exposure profile as Claude Code App) | Acceptable with same OWASP A02 caveat as Claude Code App |
 | **VS Code native MCP** (`.vscode/mcp.json`, the chat-panel surface) | `${input:VAR}` prompts → VS Code secret store | VS Code secret store (encrypted, scoped per-workspace × per-user; never enters any process env) | **Preferred** — strictest credential boundary |
