@@ -114,7 +114,7 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 	}
 
 	cleanup := func() {
-		tables := []string{"dm_message_attachments", "message_attachments", "media_files", "dm_participants", "dm_conversations", "channel_keys", "channels", "member_roles", "roles", "server_members", "servers", "public_keys", "user_keys", "users"}
+		tables := []string{"dm_message_attachments", "message_attachments", "media_files", "dm_participants", "dm_conversations", "channel_keys", "channels", "member_roles", "roles", "server_invites", "server_members", "servers", "public_keys", "user_keys", "users"}
 		for _, table := range tables {
 			// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,go.lang.security.audit.sqli.gosql-sqli.gosql-sqli — test cleanup; table names from hardcoded slice above
 			_, _ = db.Exec(fmt.Sprintf("DELETE FROM %s", table)) //nolint:gosec
@@ -168,6 +168,22 @@ func (ts *testSetup) createTestServer(t *testing.T, ownerID, name string) string
 	)
 	require.NoError(t, err)
 	return serverID
+}
+
+func (ts *testSetup) setServerIconURL(t *testing.T, serverID, iconURL string) {
+	t.Helper()
+	_, err := ts.db.Exec(`UPDATE servers SET icon_url = $1 WHERE id = $2`, iconURL, serverID)
+	require.NoError(t, err)
+}
+
+func (ts *testSetup) createTestInviteCode(t *testing.T, serverID, createdBy, code string, revoked bool) {
+	t.Helper()
+	_, err := ts.db.Exec(
+		`INSERT INTO server_invites (id, server_id, code, created_by, max_uses, use_count, is_revoked)
+		 VALUES ($1, $2, $3, $4, NULL, 0, $5)`,
+		uuid.New().String(), serverID, code, createdBy, revoked,
+	)
+	require.NoError(t, err)
 }
 
 // createTestChannel inserts a channel and returns its ID.

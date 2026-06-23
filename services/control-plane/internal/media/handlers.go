@@ -25,6 +25,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
+	invitecodes "github.com/markdrogersjr/Concord/services/control-plane/internal/invites"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
@@ -34,6 +35,8 @@ const (
 	errMsgAccessDenied       = "Access denied"
 	errMsgFailedVerifyAccess = "Failed to verify access"
 	errMsgFailedVerifyPerms  = "Failed to verify permissions"
+	errMsgInternalServer     = "Internal server error"
+	storageErrNotFound       = "not found"
 	purposeDMIcon            = "dm-icon"
 	purposeServerIcon        = "server-icon"
 	purposeServerBanner      = "server-banner"
@@ -41,6 +44,7 @@ const (
 	headerContentType        = "Content-Type"
 	headerCacheControl       = "Cache-Control"
 	cacheControlPublic       = "public, max-age=3600, must-revalidate"
+	cacheControlPublicShort  = "public, max-age=60, must-revalidate"
 	cacheControlPrivate      = "private, max-age=3600, must-revalidate"
 )
 
@@ -266,7 +270,7 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 	// Stream the encrypted blob from MinIO to the client
 	obj, contentType, err := h.store.GetObject(c.Request.Context(), storageKey)
 	if err != nil {
-		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "not found") {
+		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), storageErrNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "File not found in storage"})
 			return
 		}
@@ -335,6 +339,51 @@ func (h *Handler) ProxyServerIcon(c *gin.Context) {
 	}
 
 	h.proxyTier1Media(c, fmt.Sprintf("server-icons/%s", serverID), true)
+}
+
+// ProxyInviteServerIcon serves a server icon through an invite-code-scoped URL.
+// Invalid, expired, revoked, maxed-out, missing, and iconless invites all return
+// the same fallback image so the route does not disclose server UUIDs.
+func (h *Handler) ProxyInviteServerIcon(c *gin.Context) {
+	code := c.Param("code")
+	if !invitecodes.IsValidCode(code) {
+		serveInviteIconFallback(c)
+		return
+	}
+
+	var (
+		serverID  string
+		expiresAt *time.Time
+		isRevoked bool
+		maxUses   *int
+		useCount  int
+		iconURL   *string
+	)
+	err := h.db.QueryRow(`
+		SELECT si.server_id, si.expires_at, si.is_revoked, si.max_uses, si.use_count,
+		       s.icon_url
+		FROM server_invites si
+		INNER JOIN servers s ON si.server_id = s.id
+		WHERE si.code = $1
+	`, code).Scan(&serverID, &expiresAt, &isRevoked, &maxUses, &useCount, &iconURL)
+	if err == sql.ErrNoRows {
+		serveInviteIconFallback(c)
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to fetch public invite icon", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalServer})
+		return
+	}
+	valid := !isRevoked &&
+		(expiresAt == nil || expiresAt.After(time.Now().UTC())) &&
+		(maxUses == nil || *maxUses == 0 || useCount < *maxUses)
+	if !valid || iconURL == nil {
+		serveInviteIconFallback(c)
+		return
+	}
+
+	h.proxyInviteIcon(c, fmt.Sprintf("server-icons/%s", serverID))
 }
 
 // ProxyServerBanner serves a server's banner through the control plane.
@@ -753,12 +802,12 @@ func createAttachmentRecord(h *Handler, _ *gin.Context, p attachmentParams) erro
 func (h *Handler) proxyTier1Media(c *gin.Context, key string, public bool) {
 	obj, contentType, err := h.store.GetObject(c.Request.Context(), key)
 	if err != nil {
-		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "not found") {
+		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), storageErrNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Not found"})
 			return
 		}
 		h.log.Error("Failed to fetch media from storage", "error", err, "key", key)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalServer})
 		return
 	}
 	defer func() { _ = obj.Close() }()
@@ -777,6 +826,33 @@ func (h *Handler) proxyTier1Media(c *gin.Context, key string, public bool) {
 	if _, err := io.Copy(c.Writer, obj); err != nil {
 		h.log.Warn("Failed to stream media to client", "error", err, "key", key)
 	}
+}
+
+func (h *Handler) proxyInviteIcon(c *gin.Context, key string) {
+	obj, contentType, err := h.store.GetObject(c.Request.Context(), key)
+	if err != nil {
+		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), storageErrNotFound) {
+			serveInviteIconFallback(c)
+			return
+		}
+		h.log.Error("Failed to fetch media from storage", "error", err, "key", key)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalServer})
+		return
+	}
+	defer func() { _ = obj.Close() }()
+
+	c.Header(headerCacheControl, cacheControlPublic)
+	c.Header(headerContentType, contentType)
+	c.Status(http.StatusOK)
+
+	if _, err := io.Copy(c.Writer, obj); err != nil {
+		h.log.Warn("Failed to stream media to client", "error", err, "key", key)
+	}
+}
+
+func serveInviteIconFallback(c *gin.Context) {
+	c.Header(headerCacheControl, cacheControlPublicShort)
+	c.Data(http.StatusOK, "image/svg+xml; charset=utf-8", []byte(invitecodes.PublicInviteIconSVG))
 }
 
 // userHasChannelAccess checks if a user is a member of the server that owns a channel.

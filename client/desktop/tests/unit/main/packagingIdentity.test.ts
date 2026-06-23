@@ -163,6 +163,21 @@ describe('Packaging Identity (#382)', () => {
       expect(config.packagerConfig?.appCategoryType).toMatch(/^public\.app-category\./);
     });
 
+    it('registers the concord invite-link protocol', async () => {
+      const config = await loadForgeConfig();
+      expect(config.packagerConfig?.protocols).toEqual([
+        { name: 'Concord Voice invite links', schemes: ['concord'] },
+      ]);
+      expect(config.packagerConfig?.extendInfo).toMatchObject({
+        CFBundleURLTypes: [
+          {
+            CFBundleURLName: 'Concord Voice invite links',
+            CFBundleURLSchemes: ['concord'],
+          },
+        ],
+      });
+    });
+
     it('has win32metadata.CompanyName set', async () => {
       const config = await loadForgeConfig();
       expect(config.packagerConfig?.win32metadata?.CompanyName).toBeTruthy();

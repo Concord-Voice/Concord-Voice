@@ -80,6 +80,7 @@ import {
 } from './spaLoader';
 import { handleDidFailLoad, handleSpaRequestSelfHeal } from './spaSelfHealMainFrame';
 import { buildRemotePipUrl, isValidPipOpenSender } from './pipUrl';
+import { extractInviteDeepLinkFromArgv, normalizeInviteDeepLink } from './deepLink';
 import {
   getRemoteSpaBaseDir,
   getRemoteSpaBaseUrl,
@@ -175,6 +176,60 @@ if (app.isPackaged) {
 }
 
 let mainWindow: BrowserWindow | null = null;
+let inviteRendererReady = false;
+const pendingInviteCodes: string[] = [];
+
+function registerInviteProtocolClient(): void {
+  if (!app.isPackaged) return;
+  if (typeof app.setAsDefaultProtocolClient !== 'function') return;
+  try {
+    if (process.platform === 'win32') {
+      app.setAsDefaultProtocolClient('concord', process.execPath, []);
+    } else {
+      app.setAsDefaultProtocolClient('concord');
+    }
+  } catch {
+    console.warn('[DeepLink] protocol registration failed');
+  }
+}
+
+function emitInviteReceived(code: string): boolean {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  if (!inviteRendererReady) return false;
+  mainWindow.webContents.send('invite:received', { code });
+  return true;
+}
+
+function queueInviteCode(code: string): void {
+  if (!emitInviteReceived(code)) pendingInviteCodes.push(code);
+}
+
+function drainPendingInviteCodes(): void {
+  const codes = pendingInviteCodes.splice(0);
+  for (const code of codes) {
+    queueInviteCode(code);
+  }
+}
+
+function handleInviteDeepLink(raw: string | undefined, source: string): void {
+  const result = normalizeInviteDeepLink(raw);
+  if (result.ok) {
+    queueInviteCode(result.code);
+    return;
+  }
+  if (result.reason !== 'empty') {
+    console.warn('[DeepLink] rejected invite deep link', 'source', source, 'reason', result.reason);
+  }
+}
+
+function handleInviteDeepLinksFromArgv(argv: readonly string[] | undefined, source: string): void {
+  const result = extractInviteDeepLinkFromArgv(argv);
+  if (result.ok) {
+    queueInviteCode(result.code);
+  } else if (result.reason !== 'empty') {
+    console.warn('[DeepLink] rejected invite argv', 'source', source, 'reason', result.reason);
+  }
+}
 
 // Set true by the before-quit handler so the [X] close intercept can
 // distinguish a genuine app quit (⌘Q, Dock→Quit, window:quit/app:quit, the
@@ -347,10 +402,15 @@ const createWindow = async (): Promise<void> => {
     width: savedState.width,
     height: savedState.height,
   });
+  inviteRendererReady = false;
 
   if (savedState.isMaximized) {
     mainWindow.maximize();
   }
+
+  mainWindow.webContents.on('did-start-loading', () => {
+    inviteRendererReady = false;
+  });
 
   // Wire resize/move/maximize/unmaximize/close listeners that persist
   // bounds to window-state.json with 500ms debounce (#806).
@@ -500,10 +560,12 @@ const createWindow = async (): Promise<void> => {
     cancelActiveAppleFlow();
     cancelActiveGoogleFlow();
     mainWindow = null;
+    inviteRendererReady = false;
   });
 
   // Log renderer crashes to diagnose voice join segfaults
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    inviteRendererReady = false;
     console.error('[MAIN] Renderer process gone:', details.reason, 'exitCode:', details.exitCode);
   });
 };
@@ -513,6 +575,8 @@ let rollbackResult: SentinelResult | null = null;
 
 // App lifecycle handlers
 app.whenReady().then(async () => {
+  registerInviteProtocolClient();
+
   // app:// protocol handler (#830) — serves the bundled SPA from the asar
   // bundle root. The pure resolver in appProtocol.ts validates the URL,
   // rejects path-traversal, and returns the absolute file path. Here we
@@ -650,7 +714,10 @@ app.whenReady().then(async () => {
     }
   }
 
-  createWindow();
+  void createWindow().then(() => {
+    drainPendingInviteCodes();
+    setTimeout(drainPendingInviteCodes, 1000);
+  });
 
   // System tray (#1099): init after the first window exists so the activate
   // handler has a window to reveal. Init failure is non-fatal — the app runs
@@ -1149,11 +1216,25 @@ ipcMain.handle('spa:requestSelfHeal', async (event, payload: unknown) => {
   });
 });
 
+ipcMain.on('invite:renderer-ready', (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) return;
+  inviteRendererReady = true;
+  drainPendingInviteCodes();
+});
+
 // Prevent multiple instances
 const gotTheLock = app.requestSingleInstanceLock();
 
 if (gotTheLock) {
-  app.on('second-instance', () => {
+  handleInviteDeepLinksFromArgv(process.argv, 'argv');
+
+  app.on('open-url', (event, url) => {
+    event.preventDefault();
+    handleInviteDeepLink(url, 'open-url');
+  });
+
+  app.on('second-instance', (_event, argv: string[]) => {
+    handleInviteDeepLinksFromArgv(argv, 'second-instance');
     // Someone tried to run a second instance, focus our window
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();

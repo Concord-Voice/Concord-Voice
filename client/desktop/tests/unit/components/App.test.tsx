@@ -1,4 +1,4 @@
-import { render, screen, act } from '../../test-utils';
+import { render, screen, act, waitFor } from '../../test-utils';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useChannelStore } from '@/renderer/stores/channelStore';
@@ -6,6 +6,7 @@ import { useDMStore } from '@/renderer/stores/dmStore';
 import { useNotificationNavigationStore } from '@/renderer/stores/notificationNavigationStore';
 import { usePendingRegistrationStore } from '@/renderer/stores/pendingRegistrationStore';
 import { useE2EEStore } from '@/renderer/stores/e2eeStore';
+import { useInviteStore } from '@/renderer/stores/inviteStore';
 // Mock child components to prevent complex rendering
 vi.mock('@/renderer/components/Auth/AuthFlow', () => ({
   default: () => <div data-testid="auth-flow">AuthFlow</div>,
@@ -120,6 +121,10 @@ describe('App', () => {
     useUserStore.setState({ user: null });
     usePendingRegistrationStore.getState().clearPending();
     useE2EEStore.getState().reset();
+    Object.assign(globalThis.electron ?? {}, {
+      onInviteReceived: undefined,
+      inviteRendererReady: undefined,
+    });
   });
 
   // ── Pending registration cleanup on startup ─────────────────────────────
@@ -328,6 +333,39 @@ describe('App', () => {
     expect(useDMStore.getState().activeConversationId).toBe('dm-conv-1');
     expect(mockClearBadge).toHaveBeenCalled();
     expect(useNotificationNavigationStore.getState().pendingNavigation).toBeNull();
+  });
+
+  it('queues invite deep links until the user is authenticated and verified', async () => {
+    let inviteHandler: ((payload: { code: string }) => void) | undefined;
+    const mockInviteRendererReady = vi.fn();
+    Object.assign(globalThis.electron ?? {}, {
+      onInviteReceived: vi.fn((handler: (payload: { code: string }) => void) => {
+        inviteHandler = handler;
+        return vi.fn();
+      }),
+      inviteRendererReady: mockInviteRendererReady,
+    });
+    useInviteStore.setState({ getInviteInfo: vi.fn().mockResolvedValue(null) });
+
+    render(<App />);
+
+    expect(mockInviteRendererReady).toHaveBeenCalled();
+
+    act(() => {
+      inviteHandler?.({ code: 'GHJKMNPQ' });
+    });
+
+    expect(screen.queryByText('Join a Server')).not.toBeInTheDocument();
+
+    act(() => {
+      authenticateUser();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Join a Server')).toBeInTheDocument();
+    });
+
+    expect((screen.getByPlaceholderText('AbCd1234') as HTMLInputElement).value).toBe('GHJKMNPQ');
   });
 
   // ── SSO eager-unlock gate (#270 Task 21b) ─────────────────────────────────

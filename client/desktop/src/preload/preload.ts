@@ -160,6 +160,14 @@ contextBridge.exposeInMainWorld('electron', {
       ipcRenderer.removeListener('app:configFetchFailed', handler);
     };
   },
+  onInviteReceived: (callback: (data: { code: string }) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: { code: string }) => callback(data);
+    ipcRenderer.on('invite:received', handler);
+    return () => {
+      ipcRenderer.removeListener('invite:received', handler);
+    };
+  },
+  inviteRendererReady: () => ipcRenderer.send('invite:renderer-ready'),
 
   // Machine ID for token theft detection (#89)
   getMachineId: () => ipcRenderer.invoke('auth:getMachineId') as Promise<string>,
@@ -501,6 +509,8 @@ export interface ElectronAPI {
 
   // Bundled-SPA fallback diagnostic event (#830/#831)
   onConfigFetchFailed: (callback: (data: { reason: string }) => void) => () => void;
+  onInviteReceived: (callback: (data: { code: string }) => void) => () => void;
+  inviteRendererReady: () => void;
 
   // Machine ID for token theft detection
   getMachineId: () => Promise<string>;

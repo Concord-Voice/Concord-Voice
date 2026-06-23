@@ -21,3 +21,23 @@ func GenerateCode() (string, error) {
 	}
 	return string(code), nil
 }
+
+// IsValidCode reports whether code matches the public invite-code shape.
+func IsValidCode(code string) bool {
+	if len(code) != 8 {
+		return false
+	}
+	for _, ch := range code {
+		found := false
+		for _, allowed := range charset {
+			if ch == allowed {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}

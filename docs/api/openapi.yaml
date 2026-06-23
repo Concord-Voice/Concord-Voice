@@ -5400,6 +5400,109 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /invites/{code}/icon:
+    get:
+      tags:
+      - Invites
+      summary: Get the public icon for an invite
+      operationId: invitesPublicIcon
+      description: 'Anonymous invite-card icon stream for invite.concordvoice.chat.
+
+        Invalid, missing, expired, revoked, maxed-out, and iconless invites all return
+        the same fallback SVG so the route does not disclose server UUIDs.
+
+        Rate limit: 2000 requests per minute (global).
+
+        '
+      security: []
+      parameters:
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 8
+          maxLength: 8
+          pattern: ^[ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789]{8}$
+        description: 8-character invite code
+      responses:
+        '200':
+          description: Invite icon image stream or anonymous fallback SVG
+          headers:
+            Cache-Control:
+              description: public cache directive for the icon stream
+              schema:
+                type: string
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Failed to fetch invite icon
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Media storage not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /invites/{code}/preview:
+    get:
+      tags:
+      - Invites
+      summary: Get a public invite preview
+      operationId: invitesPublicPreview
+      description: 'Anonymous, privacy-trimmed invite-card preview for invite.concordvoice.chat.
+
+        Invalid, missing, expired, revoked, and maxed-out invites return a generic
+        `valid: false` body.
+
+        Rate limit: 2000 requests per minute (global).
+
+        '
+      security: []
+      parameters:
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 8
+          maxLength: 8
+          pattern: ^[ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789]{8}$
+        description: 8-character invite code
+      responses:
+        '200':
+          description: Public invite preview
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - valid
+                properties:
+                  valid:
+                    type: boolean
+                  server_name:
+                    type: string
+                    description: Present only when the invite is valid
+                  icon_url:
+                    type: string
+                    description: Present only when the valid invite's server has an icon
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Failed to fetch invite preview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /klipy/customer-id:
     post:
       tags:

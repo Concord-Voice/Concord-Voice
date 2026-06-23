@@ -79,8 +79,12 @@
  *        POST) and the sso:googleCancel teardown channel. Server's spaIpcContract
  *        is NOT bumped — the channels are additive; the legacy renderer-driven
  *        google path no longer exists server-side (Callback route removed).
+ * - v15: Window behavior controls (#806/#1099): window:setClientBehavior,
+ *        window:quit, and window:setTitleBarOverlayColor.
+ * - v16: Invite deep links (#1355): preload exposes onInviteReceived and main
+ *        emits invite:received with a validated 8-character invite code only.
  */
-export const IPC_CONTRACT_VERSION = 15;
+export const IPC_CONTRACT_VERSION = 16;
 
 /**
  * Result shape returned by performRefresh() in the main process and

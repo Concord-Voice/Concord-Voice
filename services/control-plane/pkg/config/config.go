@@ -581,6 +581,9 @@ func (c *Config) validate() error {
 	if equalCIDRs(c.TrustedProxyCIDRs, broadRFC1918CIDRs()) {
 		log.Printf("WARNING: TRUSTED_PROXY_CIDRS is the broad RFC1918 fallback (%s). Tighten the TRUSTED_PROXY_CIDRS allowlist for stricter X-Forwarded-For trust.", strings.Join(c.TrustedProxyCIDRs, ","))
 	}
+	if !containsCloudflareProxyCIDR(c.TrustedProxyCIDRs) {
+		log.Printf("WARNING: TRUSTED_PROXY_CIDRS does not include Cloudflare published proxy CIDRs. Public invite preview rate limiting may bucket by Cloudflare edge IP until vars.TRUSTED_PROXY_CIDRS is refreshed and provisioned.")
+	}
 
 	if err := c.validateAttestation(); err != nil {
 		return err
@@ -727,6 +730,42 @@ func defaultTrustedProxyCIDRs() string {
 // via `gh variable set TRUSTED_PROXY_CIDRS --env production --body '<CIDR>'`.
 func broadRFC1918CIDRs() []string {
 	return []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+}
+
+// cloudflareProxyCIDRs is a fallback snapshot of Cloudflare's published proxy
+// ranges. Refresh TRUSTED_PROXY_CIDRS via the invite landing runbook.
+var cloudflareProxyCIDRs = map[string]struct{}{
+	"173.245.48.0/20":  {},
+	"103.21.244.0/22":  {},
+	"103.22.200.0/22":  {},
+	"103.31.4.0/22":    {},
+	"141.101.64.0/18":  {},
+	"108.162.192.0/18": {},
+	"190.93.240.0/20":  {},
+	"188.114.96.0/20":  {},
+	"197.234.240.0/22": {},
+	"198.41.128.0/17":  {},
+	"162.158.0.0/15":   {},
+	"104.16.0.0/13":    {},
+	"104.24.0.0/14":    {},
+	"172.64.0.0/13":    {},
+	"131.0.72.0/22":    {},
+	"2400:cb00::/32":   {},
+	"2606:4700::/32":   {},
+	"2803:f800::/32":   {},
+	"2405:b500::/32":   {},
+	"2405:8100::/32":   {},
+	"2a06:98c0::/29":   {},
+	"2c0f:f248::/32":   {},
+}
+
+func containsCloudflareProxyCIDR(cidrs []string) bool {
+	for _, cidr := range cidrs {
+		if _, ok := cloudflareProxyCIDRs[cidr]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // equalCIDRs returns true if a and b contain the same CIDR strings in

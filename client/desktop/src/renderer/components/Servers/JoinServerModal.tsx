@@ -12,11 +12,17 @@ interface JoinServerModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSuccess: (server: ServerWithRole) => void;
+  initialCode?: string | null;
 }
 
 const CODE_LENGTH = 8;
 
-const JoinServerModal: React.FC<JoinServerModalProps> = ({ isOpen, onClose, onSuccess }) => {
+const JoinServerModal: React.FC<JoinServerModalProps> = ({
+  isOpen,
+  onClose,
+  onSuccess,
+  initialCode,
+}) => {
   const [code, setCode] = useState('');
   const [preview, setPreview] = useState<InviteInfoResponse | null>(null);
   const [isLoadingPreview, setIsLoadingPreview] = useState(false);
@@ -35,6 +41,14 @@ const JoinServerModal: React.FC<JoinServerModalProps> = ({ isOpen, onClose, onSu
     const focusTimer = setTimeout(() => inputRef.current?.focus(), 100);
     return () => clearTimeout(focusTimer);
   }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || !initialCode) return;
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: seeds the modal from a deep-link invite code when opened; not a render loop
+    setCode(initialCode);
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: clears stale join success when a new deep-link invite is loaded; not a render loop
+    setSuccessMessage(null);
+  }, [isOpen, initialCode]);
 
   // Reset form on close
   useEffect(() => {

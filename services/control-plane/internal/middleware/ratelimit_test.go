@@ -146,6 +146,32 @@ func TestRateLimitByIP_DifferentIPsAreIndependent(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
+func TestRateLimitGlobal_SharedAcrossIPs(t *testing.T) {
+	ts := setupTS(t)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET(pathRateTest, middleware.RateLimitGlobal(ts.Redis, "ratelimit:test:global", 2, 1*time.Minute), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
+	for _, ip := range []string{"10.0.0.1:12345", "10.0.0.2:12345"} {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", pathRateTest, nil)
+		req.RemoteAddr = ip
+		router.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", pathRateTest, nil)
+	req.RemoteAddr = "10.0.0.3:12345"
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusTooManyRequests, w.Code)
+	assert.Equal(t, "0", w.Header().Get(headerRateLimitRem))
+}
+
 // --- RateLimitByUser Tests ---
 
 func TestRateLimitByUser_AuthenticatedUser(t *testing.T) {

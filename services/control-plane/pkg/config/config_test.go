@@ -1147,6 +1147,7 @@ func TestValidate_WarnsOnBroadRFC1918Fallback(t *testing.T) {
 	err := cfg.validate()
 	require.NoError(t, err)
 	assert.Contains(t, buf.String(), "TRUSTED_PROXY_CIDRS is the broad RFC1918 fallback")
+	assert.Contains(t, buf.String(), "does not include Cloudflare published proxy CIDRs")
 }
 
 // GitHub Feedback config tests (#158).

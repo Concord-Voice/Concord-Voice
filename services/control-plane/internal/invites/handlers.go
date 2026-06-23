@@ -19,6 +19,9 @@ const (
 	errMsgFailedJoinServer  = "Failed to join server"
 )
 
+// PublicInviteIconSVG is the shared anonymous fallback for invite icon routes.
+const PublicInviteIconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="28" fill="#20242c"/><circle cx="64" cy="58" r="30" fill="#eef3ff"/><path d="M34 106c6-20 20-31 30-31s24 11 30 31" fill="#eef3ff"/></svg>`
+
 // Handler handles invite-related requests.
 type Handler struct {
 	db       *sql.DB
@@ -104,6 +107,25 @@ func validateInvite(invite models.ServerInvite) (int, string) {
 		return http.StatusGone, "This invite has reached its maximum uses"
 	}
 	return 0, ""
+}
+
+type publicInvitePreview struct {
+	serverName string
+	serverIcon *string
+	expiresAt  *time.Time
+	isRevoked  bool
+	maxUses    *int
+	useCount   int
+}
+
+func (p publicInvitePreview) valid(now time.Time) bool {
+	if p.isRevoked {
+		return false
+	}
+	if p.expiresAt != nil && !p.expiresAt.After(now) {
+		return false
+	}
+	return p.maxUses == nil || *p.maxUses == 0 || p.useCount < *p.maxUses
 }
 
 func checkBanAndMembership(tx txQuerier, serverID, userID string) (int, string, error) {
@@ -287,7 +309,7 @@ func (h *Handler) CreateInvite(c *gin.Context) {
 		return
 	}
 
-	h.log.Info("Invite created", "server_id", serverID, "code", invite.Code, "created_by", userID)
+	h.log.Info("Invite created", "server_id", serverID, "created_by", userID)
 	c.JSON(http.StatusCreated, gin.H{"invite": invite})
 }
 
@@ -453,7 +475,7 @@ func (h *Handler) JoinServer(c *gin.Context) {
 		return
 	}
 
-	h.log.Info("User joined server", "user_id", userID, "server_id", invite.ServerID, "code", req.Code)
+	h.log.Info("User joined server", "user_id", userID, "server_id", invite.ServerID)
 	h.broadcastMemberJoined(invite.ServerID, userID)
 	h.createPendingKeyRequests(invite.ServerID, userID)
 
@@ -485,6 +507,62 @@ func (h *Handler) fetchServer(tx *sql.Tx, serverID string) (models.Server, error
 		&server.AllowEmbeddedContent, &server.CreatedAt, &server.UpdatedAt,
 	)
 	return server, err
+}
+
+func (h *Handler) lookupPublicInvitePreview(code string) (publicInvitePreview, error) {
+	var preview publicInvitePreview
+	err := h.db.QueryRow(`
+		SELECT si.expires_at, si.is_revoked, si.max_uses, si.use_count,
+		       s.name, s.icon_url
+		FROM server_invites si
+		INNER JOIN servers s ON si.server_id = s.id
+		WHERE si.code = $1
+	`, code).Scan(
+		&preview.expiresAt, &preview.isRevoked, &preview.maxUses, &preview.useCount,
+		&preview.serverName, &preview.serverIcon,
+	)
+	return preview, err
+}
+
+// GetPublicInvitePreview returns an unauthenticated, privacy-trimmed invite
+// card for invite.concordvoice.chat.
+func (h *Handler) GetPublicInvitePreview(c *gin.Context) {
+	code := c.Param("code")
+	if !IsValidCode(code) {
+		c.JSON(http.StatusOK, gin.H{"valid": false})
+		return
+	}
+
+	preview, err := h.lookupPublicInvitePreview(code)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusOK, gin.H{"valid": false})
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to fetch public invite preview", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch invite preview"})
+		return
+	}
+	if !preview.valid(time.Now().UTC()) {
+		c.JSON(http.StatusOK, gin.H{"valid": false})
+		return
+	}
+
+	body := gin.H{
+		"valid":       true,
+		"server_name": preview.serverName,
+	}
+	if preview.serverIcon != nil {
+		body["icon_url"] = "/api/v1/invites/" + code + "/icon"
+	}
+	c.JSON(http.StatusOK, body)
+}
+
+// GetPublicInviteIconFallback serves a constant icon when object storage is not
+// configured. Production route wiring uses media.ProxyInviteServerIcon.
+func (h *Handler) GetPublicInviteIconFallback(c *gin.Context) {
+	c.Header("Cache-Control", "public, max-age=60, must-revalidate")
+	c.Data(http.StatusOK, "image/svg+xml; charset=utf-8", []byte(PublicInviteIconSVG))
 }
 
 // GetInviteInfo returns a preview of the server for an invite code.

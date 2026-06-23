@@ -129,6 +129,13 @@ func isE2ETestEnv() bool {
 	return os.Getenv("CONCORD_ENV") == "test"
 }
 
+func publicInviteIconHandler(invitesHandler *invites.Handler, mediaHandler *media.Handler) gin.HandlerFunc {
+	if mediaHandler != nil {
+		return mediaHandler.ProxyInviteServerIcon
+	}
+	return invitesHandler.GetPublicInviteIconFallback
+}
+
 // NewRouter creates a new API router and returns the WebSocket hub and NATS client for lifecycle management.
 func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *config.Config, liveSpa *config.LiveSpaConfig, log *logger.Logger) (*gin.Engine, *websocket.Hub, *natsclient.Client) {
 	router := gin.New()
@@ -447,6 +454,19 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 		v1.GET("/updates/*filename",
 			middleware.RateLimitByIP(redis, 30, 1*time.Minute),
 			updatesHandler.ServeUpdateAsset,
+		)
+
+		// Public invite preview/card routes for invite.concordvoice.chat. The
+		// preview route is intentionally privacy-trimmed and returns a uniform
+		// invalid shape for missing, malformed, expired, revoked, and maxed invites.
+		v1.GET("/invites/:code/preview",
+			middleware.RateLimitByIP(redis, 20, 1*time.Minute),
+			middleware.RateLimitGlobal(redis, "ratelimit:global:invite-preview", 2000, 1*time.Minute),
+			invitesHandler.GetPublicInvitePreview,
+		)
+		v1.GET("/invites/:code/icon",
+			middleware.RateLimitByIP(redis, 60, 1*time.Minute),
+			publicInviteIconHandler(invitesHandler, mediaHandler),
 		)
 
 		// Tier 1 user image proxy GETs (public — required so <img> tags can

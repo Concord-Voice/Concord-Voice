@@ -155,6 +155,7 @@ const config: ForgeConfig = {
     executableName: process.platform === 'linux' ? 'concord-voice' : 'Concord Voice',
     icon: './build/icon',
     appBundleId: 'com.concordvoice.desktop',
+    protocols: [{ name: 'Concord Voice invite links', schemes: ['concord'] }],
     appCopyright: 'Copyright © 2026 Concord Voice LLC',
     appCategoryType: 'public.app-category.social-networking',
     win32metadata: {
@@ -166,6 +167,12 @@ const config: ForgeConfig = {
     ...macSigning,
     darwinDarkModeSupport: true,
     extendInfo: {
+      CFBundleURLTypes: [
+        {
+          CFBundleURLName: 'Concord Voice invite links',
+          CFBundleURLSchemes: ['concord'],
+        },
+      ],
       NSMicrophoneUsageDescription:
         'Concord Voice needs microphone access for voice calls and audio communication.',
       NSCameraUsageDescription: 'Concord Voice needs camera access for video calls.',
@@ -220,6 +227,7 @@ const config: ForgeConfig = {
         homepage: 'https://concordvoice.com',
         section: 'net',
         categories: ['Network', 'Chat'],
+        mimeType: ['x-scheme-handler/concord'],
         // Object form is load-bearing: electron-installer-common writes
         // hicolor theme icons only for resolution-keyed icon configs.
         icon: linuxIconConfig(),
@@ -237,6 +245,7 @@ const config: ForgeConfig = {
         license: 'LicenseRef-CVSL-1.0',
         group: 'Applications/Communications',
         categories: ['Network', 'Chat'],
+        mimeType: ['x-scheme-handler/concord'],
         icon: linuxIconConfig(),
       },
     }),

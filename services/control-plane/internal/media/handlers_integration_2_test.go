@@ -501,6 +501,75 @@ func TestProxyServerIconInvalidID(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
+func TestProxyInviteServerIconInvalidCodeFallback(t *testing.T) {
+	ts := setupMediaTest(t)
+
+	w := ts.doNoAuth(ts.handler.ProxyInviteServerIcon, "GET", "/api/v1/invites/not-a-code/icon", gin.Params{{Key: "code", Value: "not-a-code"}})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Header().Get(hdrContentType), "image/svg+xml")
+	assert.Contains(t, w.Header().Get(hdrCacheControl), "max-age=60")
+}
+
+func TestProxyInviteServerIconMissingInviteFallback(t *testing.T) {
+	ts := setupMediaTest(t)
+
+	w := ts.doNoAuth(ts.handler.ProxyInviteServerIcon, "GET", "/api/v1/invites/GHJKMNPQ/icon", gin.Params{{Key: "code", Value: "GHJKMNPQ"}})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Header().Get(hdrContentType), "image/svg+xml")
+}
+
+func TestProxyInviteServerIconSuccess(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "proxyinviteicon")
+	serverID := ts.createTestServer(t, owner, "Proxy Invite Icon")
+	code := "HJKLMNPQ"
+	ts.setServerIconURL(t, serverID, "server-icons/"+serverID)
+	ts.createTestInviteCode(t, serverID, owner, code, false)
+
+	key := fmt.Sprintf("server-icons/%s", serverID)
+	require.NoError(t, ts.store.PutObject(context.TODO(), key, bytes.NewReader(makePNG(t, 64, 64)), 100, mimeImagePNG))
+
+	w := ts.doNoAuth(ts.handler.ProxyInviteServerIcon, "GET", "/api/v1/invites/"+code+"/icon", gin.Params{{Key: "code", Value: code}})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, mimeImagePNG, w.Header().Get(hdrContentType))
+	assert.Contains(t, w.Header().Get(hdrCacheControl), "public")
+	assert.Contains(t, w.Header().Get(hdrCacheControl), "max-age=3600")
+}
+
+func TestProxyInviteServerIconRevokedInviteFallback(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "proxyinviteiconrev")
+	serverID := ts.createTestServer(t, owner, "Proxy Invite Revoked")
+	code := "JKLMNPQR"
+	ts.setServerIconURL(t, serverID, "server-icons/"+serverID)
+	ts.createTestInviteCode(t, serverID, owner, code, true)
+
+	key := fmt.Sprintf("server-icons/%s", serverID)
+	require.NoError(t, ts.store.PutObject(context.TODO(), key, bytes.NewReader(makePNG(t, 64, 64)), 100, mimeImagePNG))
+
+	w := ts.doNoAuth(ts.handler.ProxyInviteServerIcon, "GET", "/api/v1/invites/"+code+"/icon", gin.Params{{Key: "code", Value: code}})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Header().Get(hdrContentType), "image/svg+xml")
+}
+
+func TestProxyInviteServerIconMissingStorageFallback(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "proxyinviteiconnf")
+	serverID := ts.createTestServer(t, owner, "Proxy Invite Missing Storage")
+	code := "KLMNPQRS"
+	ts.setServerIconURL(t, serverID, "server-icons/"+serverID)
+	ts.createTestInviteCode(t, serverID, owner, code, false)
+
+	w := ts.doNoAuth(ts.handler.ProxyInviteServerIcon, "GET", "/api/v1/invites/"+code+"/icon", gin.Params{{Key: "code", Value: code}})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Header().Get(hdrContentType), "image/svg+xml")
+}
+
 func TestProxyServerBannerSuccess(t *testing.T) {
 	ts := setupMediaTest(t)
 	owner := ts.createTestUser(t, "proxysbsuc")

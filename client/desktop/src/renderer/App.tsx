@@ -18,6 +18,7 @@ import { OutgoingCallModal } from './components/Voice/OutgoingCallModal';
 import { useUpdateErrorListener } from './hooks/useUpdateErrorListener';
 import MFAChallengeModal from './components/Auth/MFAChallengeModal';
 import AttestationFailedModalHost from './components/AttestationFailedModal';
+import JoinServerModal from './components/Servers/JoinServerModal';
 import SSOEagerUnlock from './components/Auth/SSOEagerUnlock';
 import { useAuthStore } from './stores/authStore';
 import { useE2EEStore } from './stores/e2eeStore';
@@ -284,8 +285,11 @@ function App() {
   // Skip session restore entirely to avoid unnecessary token rotations.
   const isPipWindow = globalThis.location.hash.startsWith('#/pip/');
   const [isRestoring, setIsRestoring] = useState(!isPipWindow);
+  const [deepLinkInviteCode, setDeepLinkInviteCode] = useState<string | null>(null);
+  const [isDeepLinkInviteOpen, setIsDeepLinkInviteOpen] = useState(false);
   const accessToken = useAuthStore((state) => state.accessToken);
   const emailVerified = useAuthStore((state) => state.emailVerified);
+  const navigate = useNavigate();
 
   // Route cert-pin / publisher-signature failures into useUpdateStatusStore
   // so UpdateSecurityBanner can surface them. #658
@@ -299,6 +303,27 @@ function App() {
       pending.clearPending();
     }
   }, []);
+
+  useEffect(() => {
+    if (isPipWindow) return undefined;
+    const subscribe = globalThis.electron?.onInviteReceived;
+    if (typeof subscribe !== 'function') return undefined;
+    const unsubscribe = subscribe(({ code }) => {
+      setDeepLinkInviteCode(code);
+      if (useAuthStore.getState().accessToken && useAuthStore.getState().emailVerified) {
+        setIsDeepLinkInviteOpen(true);
+      }
+    });
+    globalThis.electron?.inviteRendererReady?.();
+    return unsubscribe;
+  }, [isPipWindow]);
+
+  useEffect(() => {
+    if (deepLinkInviteCode && accessToken && emailVerified) {
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: opens queued invite modal after auth state becomes eligible; not a render loop
+      setIsDeepLinkInviteOpen(true);
+    }
+  }, [deepLinkInviteCode, accessToken, emailVerified]);
 
   // Restore session on startup: ask main process to decrypt the
   // safeStorage-encrypted refresh token and exchange it for a fresh
@@ -415,6 +440,20 @@ function App() {
           <ForceUpdateOverlay />
           <MFAChallengeModal />
           <AttestationFailedModalHost />
+          <JoinServerModal
+            isOpen={!!deepLinkInviteCode && isDeepLinkInviteOpen && !!accessToken && emailVerified}
+            initialCode={deepLinkInviteCode}
+            onClose={() => {
+              setIsDeepLinkInviteOpen(false);
+              setDeepLinkInviteCode(null);
+            }}
+            onSuccess={(server) => {
+              useServerStore.getState().setActiveServer(server.id);
+              setIsDeepLinkInviteOpen(false);
+              setDeepLinkInviteCode(null);
+              navigate('/app');
+            }}
+          />
           <Suspense fallback={null}>
             <Routes>
               <Route

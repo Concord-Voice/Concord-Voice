@@ -58,6 +58,18 @@ func RateLimitByUser(redis *redis.Client, requests int, window time.Duration) gi
 	return rateLimit(redis, config)
 }
 
+// RateLimitGlobal creates a fail-open aggregate limiter shared by all callers.
+func RateLimitGlobal(redis *redis.Client, key string, requests int, window time.Duration) gin.HandlerFunc {
+	config := RateLimitConfig{
+		Requests: requests,
+		Window:   window,
+		KeyFunc: func(*gin.Context) string {
+			return key
+		},
+	}
+	return rateLimit(redis, config)
+}
+
 // RateLimitByUserFailClosed is RateLimitByUser with fail-CLOSED semantics: a
 // Redis backend error rejects the request (503) rather than allowing it. Use
 // ONLY for privileged-write routes where the limiter is the single velocity
