@@ -2,6 +2,7 @@ import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { useDMStore, type DMConversation } from '@/renderer/stores/dmStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { API_BASE } from '@/renderer/config';
 import { vi } from 'vitest';
 
 // Mock e2eeService
@@ -342,6 +343,61 @@ describe('ConversationList', () => {
     expect(initial?.textContent).toBe('A');
   });
 
+  it('shows the other users avatar for 1:1 conversations', () => {
+    useDMStore.setState({
+      conversations: [
+        makeConversation({
+          participants: [
+            { userId: 'user-1', username: 'me', displayName: 'Me' },
+            {
+              userId: 'user-2',
+              username: 'alice',
+              displayName: 'Alice',
+              avatarUrl: '/api/v1/media/avatars/alice.png',
+            },
+          ],
+        }),
+      ],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+    const { container } = render(
+      <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+    );
+
+    const image = container.querySelector('.conversation-avatar-img');
+    expect(image).toHaveAttribute('src', `${API_BASE}/api/v1/media/avatars/alice.png`);
+    expect(container.querySelector('.conversation-avatar-initial')).not.toBeInTheDocument();
+  });
+
+  it('falls back to initials when a 1:1 avatar image fails', async () => {
+    useDMStore.setState({
+      conversations: [
+        makeConversation({
+          participants: [
+            { userId: 'user-1', username: 'me', displayName: 'Me' },
+            {
+              userId: 'user-2',
+              username: 'alice',
+              displayName: 'Alice',
+              avatarUrl: 'https://example.com/broken.png',
+            },
+          ],
+        }),
+      ],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+    const { container } = render(
+      <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+    );
+
+    fireEvent.error(container.querySelector('.conversation-avatar-img') as HTMLImageElement);
+
+    await waitFor(() => {
+      expect(container.querySelector('.conversation-avatar-img')).not.toBeInTheDocument();
+      expect(container.querySelector('.conversation-avatar-initial')).toHaveTextContent('A');
+    });
+  });
+
   it('shows group avatar icon for group conversations', () => {
     useDMStore.setState({
       conversations: [
@@ -362,6 +418,60 @@ describe('ConversationList', () => {
     );
     const groupAvatar = container.querySelector('.conversation-avatar.group');
     expect(groupAvatar).toBeInTheDocument();
+  });
+
+  it('shows group conversation icons when set', () => {
+    useDMStore.setState({
+      conversations: [
+        makeConversation({
+          id: 'group-1',
+          isGroup: true,
+          name: 'Team',
+          iconUrl: '/api/v1/media/dm-icons/group-1.png',
+          participants: [
+            { userId: 'user-1', username: 'me' },
+            { userId: 'user-2', username: 'alice' },
+          ],
+        }),
+      ],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+    const { container } = render(
+      <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+    );
+
+    expect(container.querySelector('.conversation-avatar-img')).toHaveAttribute(
+      'src',
+      `${API_BASE}/api/v1/media/dm-icons/group-1.png`
+    );
+  });
+
+  it('falls back to the group icon when a group image fails', async () => {
+    useDMStore.setState({
+      conversations: [
+        makeConversation({
+          id: 'group-1',
+          isGroup: true,
+          name: 'Team',
+          iconUrl: 'https://example.com/broken-group.png',
+          participants: [
+            { userId: 'user-1', username: 'me' },
+            { userId: 'user-2', username: 'alice' },
+          ],
+        }),
+      ],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+    const { container } = render(
+      <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+    );
+
+    fireEvent.error(container.querySelector('.conversation-avatar-img') as HTMLImageElement);
+
+    await waitFor(() => {
+      expect(container.querySelector('.conversation-avatar-img')).not.toBeInTheDocument();
+      expect(container.querySelector('.conversation-avatar.group svg')).toBeInTheDocument();
+    });
   });
 
   it('opens context menu on right-click', () => {

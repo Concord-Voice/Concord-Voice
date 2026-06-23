@@ -1,12 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { MessageSquare, Users, BookOpen, UserPlus, PenLine } from 'lucide-react';
-import { useDMStore, type DMConversation } from '../../stores/dmStore';
+import { useDMStore, type DMConversation, type DMParticipant } from '../../stores/dmStore';
 import { useUserStore } from '../../stores/userStore';
 import { useVoiceStore } from '../../stores/voiceStore';
 import { useFriendStore } from '../../stores/friendStore';
 import { e2eeService } from '../../services/e2eeService';
 import { useDraftMessageStore } from '../../stores/draftMessageStore';
 import { errorMessage } from '../../utils/redactError';
+import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 import CreateGroupModal from './CreateGroupModal';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
@@ -17,6 +18,13 @@ import './DirectMessages.css';
 interface ConversationListProps {
   selectedThreadId: string | null;
   onSelectThread: (id: string) => void;
+}
+
+interface ConversationAvatarProps {
+  conv: DMConversation;
+  currentUserId: string;
+  other?: DMParticipant;
+  status: string;
 }
 
 /** Get display name for a conversation (other user's name for 1:1, group name for group) */
@@ -53,6 +61,46 @@ function getRelativeTime(dateStr: string): string {
 
   return date.toLocaleDateString();
 }
+
+const ConversationAvatar: React.FC<ConversationAvatarProps> = ({
+  conv,
+  currentUserId,
+  other,
+  status,
+}) => {
+  const [failedAvatarUrl, setFailedAvatarUrl] = useState<string | null>(null);
+  const avatarSrc = resolveMediaUrl(conv.isGroup ? conv.iconUrl : other?.avatarUrl);
+  const showImage = avatarSrc && avatarSrc !== failedAvatarUrl;
+  const fallback = conv.isGroup ? (
+    <Users size={18} />
+  ) : (
+    <span
+      className="conversation-avatar-initial"
+      style={(() => {
+        const colors = resolveUserAccentColors(other?.colorScheme);
+        return colors ? { background: colors.gradient } : undefined;
+      })()}
+    >
+      {getInitial(conv, currentUserId)}
+    </span>
+  );
+
+  return (
+    <div className={`conversation-avatar${conv.isGroup ? ' group' : ''}`}>
+      {showImage ? (
+        <img
+          src={avatarSrc}
+          alt=""
+          className="conversation-avatar-img"
+          onError={() => setFailedAvatarUrl(avatarSrc)}
+        />
+      ) : (
+        fallback
+      )}
+      {!conv.isGroup && <span className={`member-status-dot ${status}`} />}
+    </div>
+  );
+};
 
 const ConversationList: React.FC<ConversationListProps> = ({
   selectedThreadId,
@@ -244,22 +292,12 @@ const ConversationList: React.FC<ConversationListProps> = ({
               }}
               aria-label={name}
             >
-              <div className={`conversation-avatar${conv.isGroup ? ' group' : ''}`}>
-                {conv.isGroup ? (
-                  <Users size={18} />
-                ) : (
-                  <span
-                    className="conversation-avatar-initial"
-                    style={(() => {
-                      const colors = resolveUserAccentColors(other?.colorScheme);
-                      return colors ? { background: colors.gradient } : undefined;
-                    })()}
-                  >
-                    {getInitial(conv, currentUserId)}
-                  </span>
-                )}
-                {!conv.isGroup && <span className={`member-status-dot ${status}`} />}
-              </div>
+              <ConversationAvatar
+                conv={conv}
+                currentUserId={currentUserId}
+                other={other ?? undefined}
+                status={status}
+              />
 
               <div className="conversation-content">
                 <div className="conversation-top-row">
