@@ -4,7 +4,7 @@ import './mocks/logger.js';
 // Mock config
 vi.mock('@/config/index.js', () => ({
   config: {
-    redisUrl: 'redis://localhost:6379',
+    redisUrl: 'redis://:redis-secret@redis:6379',
   },
 }));
 
@@ -32,12 +32,15 @@ vi.mock('redis', () => ({
   createClient: vi.fn(() => mockClient),
 }));
 
-import { RedisService } from '../src/lib/redis.js';
+import { RedisService, redisLogTarget } from '../src/lib/redis.js';
+import { logger } from '../src/lib/logger.js';
+import { createClient } from 'redis';
 
 describe('RedisService', () => {
   let service: RedisService;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     service = new RedisService();
     // Reset multi chain mocks
     mockMulti.sAdd.mockReturnThis();
@@ -48,10 +51,34 @@ describe('RedisService', () => {
     mockMulti.exec.mockResolvedValue([]);
   });
 
+  describe('redisLogTarget', () => {
+    it('returns only host and port for credentialed URLs', () => {
+      expect(redisLogTarget('redis://:redis-secret@redis:6379')).toEqual({
+        endpoint: 'redis:6379',
+      });
+    });
+
+    it('falls back without echoing malformed Redis URLs', () => {
+      expect(redisLogTarget('not-a-url redis-secret')).toEqual({ endpoint: 'configured' });
+    });
+  });
+
   describe('connect', () => {
     it('creates a client and connects', async () => {
       await service.connect();
       expect(mockClient.connect).toHaveBeenCalled();
+    });
+
+    it('does not log Redis credentials', async () => {
+      await service.connect();
+
+      expect(createClient).toHaveBeenCalledWith({ url: 'redis://:redis-secret@redis:6379' });
+
+      const infoCalls = vi.mocked(logger.info).mock.calls.map((call) => JSON.stringify(call));
+      const logged = infoCalls.join('\n');
+      expect(logged).toContain('redis:6379');
+      expect(logged).not.toContain('redis-secret');
+      expect(logged).not.toContain('redis://');
     });
 
     it('registers error and reconnecting event handlers', async () => {

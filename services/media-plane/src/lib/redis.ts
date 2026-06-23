@@ -17,6 +17,16 @@ import type { RoomEvent, RoomEventHandler } from './roomManager.js';
 const ROOM_TTL = 120; // seconds
 const USER_TTL = 120;
 
+export function redisLogTarget(redisUrl: string): { endpoint: string } {
+  try {
+    const parsed = new URL(redisUrl);
+    const port = parsed.port ? `:${parsed.port}` : '';
+    return { endpoint: `${parsed.hostname}${port}` };
+  } catch {
+    return { endpoint: 'configured' };
+  }
+}
+
 export class RedisService {
   private client: RedisClientType | null = null;
 
@@ -33,7 +43,7 @@ export class RedisService {
       });
 
       await this.client.connect();
-      logger.info('Connected to Redis', { url: config.redisUrl });
+      logger.info('Connected to Redis', redisLogTarget(config.redisUrl));
     } catch (err) {
       logger.error('Failed to connect to Redis', { error: err });
       throw err;
