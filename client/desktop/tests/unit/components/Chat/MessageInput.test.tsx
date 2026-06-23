@@ -107,14 +107,43 @@ describe('MessageInput', () => {
     render(<MessageInput onSendMessage={onSendMessage} />);
 
     const inputBox = document.querySelector('.message-input-box');
+    const hitTarget = document.querySelector('.message-input-box-hit-target') as HTMLLabelElement;
     const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
     const textareaDeclarations = getCssDeclarations('.message-input-textarea');
+    const childLayerDeclarations = getCssDeclarations(
+      '.message-input-box > :not(.message-input-box-hit-target)'
+    );
 
     expect(textarea.parentElement).toBe(inputBox);
     expect(document.querySelector('.message-input-textarea-hitbox')).not.toBeInTheDocument();
+    expect(hitTarget).toBeInTheDocument();
+    expect(hitTarget.htmlFor).toBe(textarea.id);
+    expect(hitTarget).toHaveTextContent('Message input');
     expect(textareaDeclarations['align-self']).toBe('stretch');
     expect(textareaDeclarations.padding).toBe('calc(8px * var(--sp, 1)) 0');
     expect(textareaDeclarations.cursor).toBe('text');
+    expect(childLayerDeclarations.position).toBe('relative');
+    expect(childLayerDeclarations['z-index']).toBe('1');
+  });
+
+  it('links the visible input box hit target to the textarea', () => {
+    render(<MessageInput onSendMessage={onSendMessage} />);
+
+    const hitTarget = document.querySelector('.message-input-box-hit-target') as HTMLLabelElement;
+    const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+
+    expect(hitTarget.control).toBe(textarea);
+  });
+
+  it('does not redirect send-button mouse down to the textarea', () => {
+    render(<MessageInput onSendMessage={onSendMessage} />);
+
+    const textarea = screen.getByRole('textbox');
+    const sendButton = screen.getByLabelText('Send message');
+
+    fireEvent.mouseDown(sendButton);
+
+    expect(textarea).not.toHaveFocus();
   });
 
   it('shows channel name in placeholder', () => {
@@ -171,7 +200,17 @@ describe('MessageInput', () => {
 
   it('disables input when disabled prop is true', () => {
     render(<MessageInput onSendMessage={onSendMessage} disabled={true} />);
+    const inputBox = document.querySelector('.message-input-box') as HTMLElement;
+    const disabledBoxDeclarations = getCssDeclarations(".message-input-box[data-disabled='true']");
+    const disabledHitTargetDeclarations = getCssDeclarations(
+      ".message-input-box[data-disabled='true'] .message-input-box-hit-target"
+    );
+
     expect(screen.getByRole('textbox')).toBeDisabled();
+    expect(inputBox.dataset.disabled).toBe('true');
+    expect(disabledBoxDeclarations.cursor).toBe('default');
+    expect(disabledHitTargetDeclarations.cursor).toBe('default');
+    expect(disabledHitTargetDeclarations['pointer-events']).toBe('none');
   });
 
   it('calls onTyping when user starts typing', async () => {

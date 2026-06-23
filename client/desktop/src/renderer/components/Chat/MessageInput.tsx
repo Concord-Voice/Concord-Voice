@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useId } from 'react';
 import { Smile, ImagePlay, Paperclip, Lock, UserPlus } from 'lucide-react';
 import MessageInputContextMenu from './MessageInputContextMenu';
 import MentionAutocomplete, { type MentionAutocompleteHandle } from './MentionAutocomplete';
@@ -211,6 +211,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
   const createInvite = useInviteStore((s) => s.createInvite);
   const fetchChannelOverrides = usePermissionStore((s) => s.fetchChannelOverrides);
   const [showMentions, setShowMentions] = useState(false);
+  const textareaId = useId();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const emojiBtnRef = useRef<HTMLButtonElement>(null);
   const gifBtnRef = useRef<HTMLButtonElement>(null);
@@ -821,7 +822,14 @@ const MessageInput: React.FC<MessageInputProps> = ({
           />
         )}
 
-        <div className="message-input-box" onContextMenu={handleContextMenu}>
+        <div
+          className="message-input-box"
+          data-disabled={disabled ? 'true' : undefined}
+          onContextMenu={handleContextMenu}
+        >
+          <label className="message-input-box-hit-target" htmlFor={textareaId}>
+            <span className="sr-only">Message input</span>
+          </label>
           {!channelPanelPinned && (
             <div className="message-input-user-panel">
               <UserPanel compact />
@@ -845,6 +853,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
             </output>
           )}
           <textarea
+            id={textareaId}
             ref={textareaRef}
             className="message-input-textarea"
             placeholder={channelName ? `Message #${channelName}` : placeholder}
@@ -863,7 +872,6 @@ const MessageInput: React.FC<MessageInputProps> = ({
             }}
             disabled={disabled}
             rows={1}
-            aria-label="Message input"
           />
 
           <div className="message-input-actions">

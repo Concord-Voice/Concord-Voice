@@ -25,6 +25,7 @@
 }
 
 .message-input-box {
+  position: relative;
   display: flex;
   align-items: stretch;
   gap: calc(10px * var(--sp, 1));
@@ -32,7 +33,29 @@
   border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 0 calc(12px * var(--sp, 1));
+  cursor: text;
   transition: border-color 0.15s ease;
+}
+
+.message-input-box-hit-target {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  cursor: text;
+}
+
+.message-input-box[data-disabled='true'] {
+  cursor: default;
+}
+
+.message-input-box[data-disabled='true'] .message-input-box-hit-target {
+  cursor: default;
+  pointer-events: none;
+}
+
+.message-input-box > :not(.message-input-box-hit-target) {
+  position: relative;
+  z-index: 1;
 }
 
 .message-input-box:focus-within {
