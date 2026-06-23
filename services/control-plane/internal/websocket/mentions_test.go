@@ -325,13 +325,14 @@ func (m *mockMentionChecker) HasMentionPermission(_ context.Context, _, _, _ str
 // newTestHubWithChecker creates a minimal hub with a mock mention checker for unit testing.
 func newTestHubWithChecker(checker MentionPermissionChecker) *Hub {
 	hub := &Hub{
-		clients:              make(map[uuid.UUID]*Client),
-		userClients:          make(map[uuid.UUID]map[uuid.UUID]bool),
-		channelSubscriptions: make(map[uuid.UUID]map[uuid.UUID]bool),
-		usernames:            make(map[uuid.UUID]string),
-		serverSubscriptions:  make(map[uuid.UUID]map[uuid.UUID]bool),
-		dmSubscriptions:      make(map[uuid.UUID]map[uuid.UUID]bool),
-		onlineCountPending:   make(map[uuid.UUID]bool),
+		clients:                make(map[uuid.UUID]*Client),
+		userClients:            make(map[uuid.UUID]map[uuid.UUID]bool),
+		channelSubscriptions:   make(map[uuid.UUID]map[uuid.UUID]bool),
+		usernames:              make(map[uuid.UUID]string),
+		serverSubscriptions:    make(map[uuid.UUID]map[uuid.UUID]bool),
+		dmSubscriptions:        make(map[uuid.UUID]map[uuid.UUID]bool),
+		channelDeliveryResults: make(chan channelDeliveryResult, 256),
+		onlineCountPending:     make(map[uuid.UUID]bool),
 	}
 	hub.mentionChecker = checker
 	return hub
@@ -685,7 +686,7 @@ func TestSendMentionNotify_SendsToMentionedUsers(t *testing.T) {
 
 	mentionedUsers := map[uuid.UUID]bool{mentionedUserID: true}
 
-	hub.sendMentionNotify(serverID, channelID, mentionedUsers, true, false)
+	hub.sendMentionNotify(serverID, channelID, mentionedUsers, true, false, 0)
 
 	require.Len(t, client.Send, 1)
 	data := <-client.Send
@@ -714,9 +715,67 @@ func TestSendMentionNotify_SkipsSubscribedClients(t *testing.T) {
 
 	mentionedUsers := map[uuid.UUID]bool{mentionedUserID: true}
 
-	hub.sendMentionNotify(serverID, channelID, mentionedUsers, false, false)
+	hub.sendMentionNotify(serverID, channelID, mentionedUsers, false, false, 0)
 
 	assert.Len(t, client.Send, 0, "subscribed client should not receive mention notify")
+}
+
+func TestSendMentionNotify_SkipsViewerDeniedClients(t *testing.T) {
+	hub := newTestHubWithChecker(nil)
+
+	serverID := uuid.New()
+	channelID := uuid.New()
+	allowedUserID := uuid.New()
+	deniedUserID := uuid.New()
+	allowedClientID := uuid.New()
+	deniedClientID := uuid.New()
+	allowedClient := &Client{ID: allowedClientID, UserID: allowedUserID, Send: make(chan []byte, 10)}
+	deniedClient := &Client{ID: deniedClientID, UserID: deniedUserID, Send: make(chan []byte, 10)}
+
+	hub.clients[allowedClientID] = allowedClient
+	hub.clients[deniedClientID] = deniedClient
+	hub.userClients[allowedUserID] = map[uuid.UUID]bool{allowedClientID: true}
+	hub.userClients[deniedUserID] = map[uuid.UUID]bool{deniedClientID: true}
+	hub.channelSubscriptions[channelID] = map[uuid.UUID]bool{}
+	hub.SetChannelPermissionChecker(keyedChannelPermissionChecker{
+		{serverID: serverID.String(), userID: allowedUserID.String(), channelID: channelID.String(), permBit: permViewTextChannels}: true,
+	})
+
+	mentionedUsers := map[uuid.UUID]bool{allowedUserID: true, deniedUserID: true}
+
+	hub.sendMentionNotify(serverID, channelID, mentionedUsers, false, false, permViewTextChannels)
+	applyAsyncChannelDelivery(t, hub)
+
+	assert.Len(t, allowedClient.Send, 1, "authorized mentioned user should receive mention notify")
+	assert.Len(t, deniedClient.Send, 0, "viewer-denied mentioned user should not receive mention notify")
+}
+
+func TestSendMentionNotify_ChecksPermissionOffRunGoroutine(t *testing.T) {
+	hub := newTestHubWithChecker(nil)
+
+	serverID := uuid.New()
+	channelID := uuid.New()
+	userID := uuid.New()
+	clientID := uuid.New()
+	client := &Client{ID: clientID, UserID: userID, Send: make(chan []byte, 10)}
+	hub.clients[clientID] = client
+	hub.userClients[userID] = map[uuid.UUID]bool{clientID: true}
+	hub.channelSubscriptions[channelID] = map[uuid.UUID]bool{}
+	checker := newBlockingChannelPermissionChecker(true)
+	hub.SetChannelPermissionChecker(checker)
+
+	done := make(chan struct{})
+	go func() {
+		hub.sendMentionNotify(serverID, channelID, map[uuid.UUID]bool{userID: true}, false, false, permViewTextChannels)
+		close(done)
+	}()
+
+	requirePermissionCheckOffRunGoroutine(t, done, checker)
+	assert.Len(t, client.Send, 0, "mention notify should wait for async permission result")
+	close(checker.release)
+	applyAsyncChannelDelivery(t, hub)
+
+	assert.Len(t, client.Send, 1, "authorized mentioned user should receive async-filtered mention notify")
 }
 
 // --- sendDMMentionNotify tests ---
@@ -753,14 +812,14 @@ func TestSendDMMentionNotify_SendsToMentionedUsers(t *testing.T) {
 func TestRouteMentionNotifications_NilAddendum(_ *testing.T) {
 	hub := newTestHubWithChecker(nil)
 	// Should not panic
-	hub.routeMentionNotifications(uuid.New(), uuid.New(), uuid.New(), nil)
+	hub.routeMentionNotifications(uuid.New(), uuid.New(), uuid.New(), nil, 0)
 }
 
 func TestRouteMentionNotifications_EmptyAddendum(_ *testing.T) {
 	hub := newTestHubWithChecker(nil)
 	addendum := &MentionAddendum{}
 	// Should not panic
-	hub.routeMentionNotifications(uuid.New(), uuid.New(), uuid.New(), addendum)
+	hub.routeMentionNotifications(uuid.New(), uuid.New(), uuid.New(), addendum, 0)
 }
 
 // --- routeDMMentionNotifications edge cases ---

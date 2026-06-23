@@ -104,6 +104,15 @@ type Hub struct {
 	// Signal to recompute and broadcast server voice counts
 	voiceCountSignal chan struct{}
 
+	// Revalidate channel subscriptions after RBAC/SBAC changes. These are consumed
+	// on the Run goroutine, which owns subscription maps.
+	revalidateChannel chan channelRevalidation
+	revalidateServer  chan uuid.UUID
+
+	// Results from off-loop channel permission checks. The Run goroutine applies
+	// sends and subscription pruning so hub maps remain single-owner.
+	channelDeliveryResults chan channelDeliveryResult
+
 	// Shutdown signal
 	done chan struct{}
 
@@ -118,6 +127,9 @@ type Hub struct {
 
 	// Mention permission checker (injected after construction via SetMentionChecker)
 	mentionChecker MentionPermissionChecker
+
+	// Channel permission checker (injected after construction via SetChannelPermissionChecker)
+	channelPermissionChecker ChannelPermissionChecker
 
 	// DM voice ring canceller (injected after construction via
 	// SetDMRingCanceller). When the user's LAST WS connection drops,
@@ -136,31 +148,77 @@ type Hub struct {
 // The dm.Handler.HandleUserDisconnect method satisfies this type.
 type DMRingCanceller func(userID uuid.UUID)
 
+type channelRevalidation struct {
+	serverID  uuid.UUID
+	channelID uuid.UUID
+}
+
+type channelDeliveryKind uint8
+
+const (
+	channelDeliveryBroadcast channelDeliveryKind = iota
+	channelDeliveryUnread
+	channelDeliveryMention
+	channelDeliveryPrune
+)
+
+type channelDeliveryRecipient struct {
+	clientID uuid.UUID
+	userID   uuid.UUID
+}
+
+type channelDeliveryRequest struct {
+	kind       channelDeliveryKind
+	serverID   uuid.UUID
+	channelID  uuid.UUID
+	viewPerm   int64
+	data       []byte
+	recipients []channelDeliveryRecipient
+}
+
+type channelDeliveryDecision struct {
+	clientID   uuid.UUID
+	userID     uuid.UUID
+	allowed    bool
+	definitive bool
+}
+
+type channelDeliveryResult struct {
+	kind      channelDeliveryKind
+	serverID  uuid.UUID
+	channelID uuid.UUID
+	data      []byte
+	decisions []channelDeliveryDecision
+}
+
 // NewHub creates a new Hub
 func NewHub(db *sql.DB, redisClient *redis.Client) *Hub {
 	return &Hub{
-		db:                   db,
-		redis:                redisClient,
-		clients:              make(map[uuid.UUID]*Client),
-		userClients:          make(map[uuid.UUID]map[uuid.UUID]bool),
-		channelSubscriptions: make(map[uuid.UUID]map[uuid.UUID]bool),
-		usernames:            make(map[uuid.UUID]string),
-		serverSubscriptions:  make(map[uuid.UUID]map[uuid.UUID]bool),
-		dmSubscriptions:      make(map[uuid.UUID]map[uuid.UUID]bool),
-		register:             make(chan *Client),
-		unregister:           make(chan *Client),
-		incoming:             make(chan IncomingMessage, 256),
-		broadcast:            make(chan BroadcastMessage, 256),
-		globalBroadcast:      make(chan OutgoingMessage, 256),
-		userBroadcast:        make(chan UserBroadcastMessage, 256),
-		serverBroadcast:      make(chan ServerBroadcastMessage, 256),
-		dmBroadcast:          make(chan DMBroadcastMessage, 256),
-		disconnectUser:       make(chan uuid.UUID, 16),
-		disconnectSession:    make(chan string, 16),
-		voiceCountSignal:     make(chan struct{}, 1),
-		done:                 make(chan struct{}),
-		stopped:              make(chan struct{}),
-		onlineCountPending:   make(map[uuid.UUID]bool),
+		db:                     db,
+		redis:                  redisClient,
+		clients:                make(map[uuid.UUID]*Client),
+		userClients:            make(map[uuid.UUID]map[uuid.UUID]bool),
+		channelSubscriptions:   make(map[uuid.UUID]map[uuid.UUID]bool),
+		usernames:              make(map[uuid.UUID]string),
+		serverSubscriptions:    make(map[uuid.UUID]map[uuid.UUID]bool),
+		dmSubscriptions:        make(map[uuid.UUID]map[uuid.UUID]bool),
+		register:               make(chan *Client),
+		unregister:             make(chan *Client),
+		incoming:               make(chan IncomingMessage, 256),
+		broadcast:              make(chan BroadcastMessage, 256),
+		globalBroadcast:        make(chan OutgoingMessage, 256),
+		userBroadcast:          make(chan UserBroadcastMessage, 256),
+		serverBroadcast:        make(chan ServerBroadcastMessage, 256),
+		dmBroadcast:            make(chan DMBroadcastMessage, 256),
+		disconnectUser:         make(chan uuid.UUID, 16),
+		disconnectSession:      make(chan string, 16),
+		voiceCountSignal:       make(chan struct{}, 1),
+		revalidateChannel:      make(chan channelRevalidation, 256),
+		revalidateServer:       make(chan uuid.UUID, 16),
+		channelDeliveryResults: make(chan channelDeliveryResult, 256),
+		done:                   make(chan struct{}),
+		stopped:                make(chan struct{}),
+		onlineCountPending:     make(map[uuid.UUID]bool),
 	}
 }
 
@@ -168,6 +226,35 @@ func NewHub(db *sql.DB, redisClient *redis.Client) *Hub {
 // Called after Hub and Resolver are both constructed (breaks circular init dependency).
 func (h *Hub) SetMentionChecker(checker MentionPermissionChecker) {
 	h.mentionChecker = checker
+}
+
+// SetChannelPermissionChecker injects the RBAC checker for channel WebSocket authorization.
+func (h *Hub) SetChannelPermissionChecker(checker ChannelPermissionChecker) {
+	h.channelPermissionChecker = checker
+}
+
+// RevalidateChannelSubscriptions queues a visibility recheck for one channel.
+func (h *Hub) RevalidateChannelSubscriptions(serverID, channelID uuid.UUID) {
+	if h == nil || h.revalidateChannel == nil {
+		return
+	}
+	select {
+	case h.revalidateChannel <- channelRevalidation{serverID: serverID, channelID: channelID}:
+	default:
+		log.Printf("Channel subscription revalidation queue full")
+	}
+}
+
+// RevalidateServerSubscriptions queues visibility rechecks for subscribed channels in a server.
+func (h *Hub) RevalidateServerSubscriptions(serverID uuid.UUID) {
+	if h == nil || h.revalidateServer == nil {
+		return
+	}
+	select {
+	case h.revalidateServer <- serverID:
+	default:
+		log.Printf("Server subscription revalidation queue full")
+	}
 }
 
 // SetDMRingCanceller injects the DM voice ring cleanup callback invoked
@@ -225,6 +312,15 @@ func (h *Hub) Run() {
 
 		case <-h.voiceCountSignal:
 			h.broadcastServerVoiceCounts()
+
+		case req := <-h.revalidateChannel:
+			h.handleChannelRevalidation(req)
+
+		case serverID := <-h.revalidateServer:
+			h.handleServerRevalidation(serverID)
+
+		case result := <-h.channelDeliveryResults:
+			h.handleChannelDeliveryResult(result)
 
 		case <-h.done:
 			// Graceful shutdown: cancel async work, wait for completion, close connections
@@ -586,7 +682,301 @@ func (h *Hub) handleIncoming(msg IncomingMessage) {
 	}
 }
 
-// handleSubscribe subscribes a client to a channel after verifying membership
+// ChannelPermissionChecker is the interface the Hub needs from the RBAC resolver
+// to enforce channel-scoped WebSocket authorization without importing rbac.
+type ChannelPermissionChecker interface {
+	HasChannelPermission(ctx context.Context, serverID, userID, channelID string, permBit int64) (bool, error)
+}
+
+const (
+	permViewVoiceChannels int64 = 1 << 9
+	permViewTextChannels  int64 = 1 << 10
+	permSendMessages      int64 = 1 << 11
+	channelAuthCtxTimeout       = 3 * time.Second
+)
+
+func (h *Hub) authorizeChannelPermission(
+	msg IncomingMessage,
+	userID uuid.UUID,
+	chCtx *channelContext,
+	channelUUID uuid.UUID,
+	perm int64,
+	deniedMessage string,
+) bool {
+	if h.channelPermissionChecker == nil {
+		log.Printf("Channel permission checker not configured")
+		h.sendError(msg.ClientID, "Failed to verify channel access")
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), channelAuthCtxTimeout)
+	defer cancel()
+
+	hasPerm, err := h.channelPermissionChecker.HasChannelPermission(
+		ctx,
+		chCtx.serverUUID.String(),
+		userID.String(),
+		channelUUID.String(),
+		perm,
+	)
+	if err != nil {
+		log.Printf("Failed to check channel permission: %v", err)
+		h.sendError(msg.ClientID, "Failed to verify channel access")
+		return false
+	}
+	if !hasPerm {
+		h.sendError(msg.ClientID, deniedMessage)
+		return false
+	}
+	return true
+}
+
+func (h *Hub) clientHasChannelPermission(ctx context.Context, serverID, channelID uuid.UUID, client *Client, perm int64) (allowed, definitive bool) {
+	if perm == 0 || serverID == uuid.Nil {
+		return true, true
+	}
+	if h.channelPermissionChecker == nil {
+		log.Printf("Channel permission checker not configured")
+		return false, false
+	}
+	hasPerm, err := h.channelPermissionChecker.HasChannelPermission(
+		ctx,
+		serverID.String(),
+		client.UserID.String(),
+		channelID.String(),
+		perm,
+	)
+	if err != nil {
+		log.Printf("Failed to check channel delivery permission: %v", err)
+		return false, false
+	}
+	return hasPerm, true
+}
+
+func (h *Hub) dispatchChannelDelivery(req channelDeliveryRequest) {
+	if len(req.recipients) == 0 {
+		return
+	}
+	if req.viewPerm == 0 || req.serverID == uuid.Nil {
+		h.handleChannelDeliveryResult(allowAllChannelDelivery(req))
+		return
+	}
+
+	checker := h.channelPermissionChecker
+	if checker == nil {
+		log.Printf("Channel permission checker not configured")
+		h.handleChannelDeliveryResult(denyAllChannelDelivery(req))
+		return
+	}
+
+	results := h.channelDeliveryResults
+	if results == nil {
+		log.Printf("Channel delivery result queue not configured")
+		return
+	}
+
+	done := h.done
+	go func() {
+		result := checkChannelDeliveryPermissions(req, checker)
+		select {
+		case results <- result:
+		case <-done:
+		}
+	}()
+}
+
+func allowAllChannelDelivery(req channelDeliveryRequest) channelDeliveryResult {
+	result := channelDeliveryResult{
+		kind:      req.kind,
+		serverID:  req.serverID,
+		channelID: req.channelID,
+		data:      req.data,
+		decisions: make([]channelDeliveryDecision, 0, len(req.recipients)),
+	}
+	for _, recipient := range req.recipients {
+		result.decisions = append(result.decisions, channelDeliveryDecision{
+			clientID:   recipient.clientID,
+			userID:     recipient.userID,
+			allowed:    true,
+			definitive: true,
+		})
+	}
+	return result
+}
+
+func denyAllChannelDelivery(req channelDeliveryRequest) channelDeliveryResult {
+	result := channelDeliveryResult{
+		kind:      req.kind,
+		serverID:  req.serverID,
+		channelID: req.channelID,
+		data:      req.data,
+		decisions: make([]channelDeliveryDecision, 0, len(req.recipients)),
+	}
+	for _, recipient := range req.recipients {
+		result.decisions = append(result.decisions, channelDeliveryDecision{
+			clientID:   recipient.clientID,
+			userID:     recipient.userID,
+			allowed:    false,
+			definitive: false,
+		})
+	}
+	return result
+}
+
+func checkChannelDeliveryPermissions(req channelDeliveryRequest, checker ChannelPermissionChecker) channelDeliveryResult {
+	result := channelDeliveryResult{
+		kind:      req.kind,
+		serverID:  req.serverID,
+		channelID: req.channelID,
+		data:      req.data,
+		decisions: make([]channelDeliveryDecision, 0, len(req.recipients)),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), channelAuthCtxTimeout)
+	defer cancel()
+
+	for _, recipient := range req.recipients {
+		hasPerm, err := checker.HasChannelPermission(
+			ctx,
+			req.serverID.String(),
+			recipient.userID.String(),
+			req.channelID.String(),
+			req.viewPerm,
+		)
+		if err != nil {
+			log.Printf("Failed to check channel delivery permission: %v", err)
+			result.decisions = append(result.decisions, channelDeliveryDecision{
+				clientID:   recipient.clientID,
+				userID:     recipient.userID,
+				allowed:    false,
+				definitive: false,
+			})
+			continue
+		}
+		result.decisions = append(result.decisions, channelDeliveryDecision{
+			clientID:   recipient.clientID,
+			userID:     recipient.userID,
+			allowed:    hasPerm,
+			definitive: true,
+		})
+	}
+	return result
+}
+
+func (h *Hub) handleChannelDeliveryResult(result channelDeliveryResult) {
+	switch result.kind {
+	case channelDeliveryBroadcast:
+		h.applyBroadcastDeliveryResult(result)
+	case channelDeliveryUnread:
+		h.applyUnreadDeliveryResult(result)
+	case channelDeliveryMention:
+		h.applyMentionDeliveryResult(result)
+	case channelDeliveryPrune:
+		h.applyPruneDeliveryResult(result)
+	}
+}
+
+func (h *Hub) applyBroadcastDeliveryResult(result channelDeliveryResult) {
+	subscribers := h.channelSubscriptions[result.channelID]
+	for _, decision := range result.decisions {
+		client, ok := h.clients[decision.clientID]
+		if !ok || subscribers == nil || !subscribers[decision.clientID] {
+			continue
+		}
+		if !decision.allowed {
+			if decision.definitive {
+				h.removeChannelSubscription(result.channelID, client)
+			}
+			continue
+		}
+		select {
+		case client.Send <- result.data:
+		default:
+			h.handleUnregister(client)
+		}
+	}
+}
+
+func (h *Hub) applyUnreadDeliveryResult(result channelDeliveryResult) {
+	serverClients := h.serverSubscriptions[result.serverID]
+	channelClients := h.channelSubscriptions[result.channelID]
+	for _, decision := range result.decisions {
+		client, ok := h.clients[decision.clientID]
+		if !ok || serverClients == nil || !serverClients[decision.clientID] {
+			continue
+		}
+		if channelClients != nil && channelClients[decision.clientID] {
+			continue
+		}
+		if !decision.allowed {
+			continue
+		}
+		select {
+		case client.Send <- result.data:
+		default:
+		}
+	}
+}
+
+func (h *Hub) applyMentionDeliveryResult(result channelDeliveryResult) {
+	channelClients := h.channelSubscriptions[result.channelID]
+	for _, decision := range result.decisions {
+		client, ok := h.clients[decision.clientID]
+		if !ok {
+			continue
+		}
+		userClients := h.userClients[decision.userID]
+		if userClients == nil || !userClients[decision.clientID] {
+			continue
+		}
+		if channelClients != nil && channelClients[decision.clientID] {
+			continue
+		}
+		if !decision.allowed {
+			continue
+		}
+		select {
+		case client.Send <- result.data:
+		default:
+		}
+	}
+}
+
+func (h *Hub) applyPruneDeliveryResult(result channelDeliveryResult) {
+	for _, decision := range result.decisions {
+		if decision.allowed || !decision.definitive {
+			continue
+		}
+		client, ok := h.clients[decision.clientID]
+		if !ok {
+			continue
+		}
+		h.removeChannelSubscription(result.channelID, client)
+	}
+}
+
+func (h *Hub) removeChannelSubscription(channelID uuid.UUID, client *Client) {
+	delete(client.Channels, channelID)
+	if clients, ok := h.channelSubscriptions[channelID]; ok {
+		delete(clients, client.ID)
+		if len(clients) == 0 {
+			delete(h.channelSubscriptions, channelID)
+		}
+	}
+}
+
+func (ctx *channelContext) viewPermission() (int64, bool) {
+	switch ctx.channelType {
+	case "text", "bulletin":
+		return permViewTextChannels, true
+	case "voice":
+		return permViewVoiceChannels, true
+	default:
+		return 0, false
+	}
+}
+
+// handleSubscribe subscribes a client to a channel after verifying channel visibility.
 func (h *Hub) handleSubscribe(msg IncomingMessage) {
 	channelID, ok := msg.Data[keyChannelID].(string)
 	if !ok {
@@ -605,23 +995,16 @@ func (h *Hub) handleSubscribe(msg IncomingMessage) {
 		return
 	}
 
-	// Verify the user is a member of the channel's server
-	var isMember bool
-	err = h.db.QueryRow(
-		`SELECT EXISTS(
-			SELECT 1 FROM channels c
-			INNER JOIN server_members sm ON c.server_id = sm.server_id
-			WHERE c.id = $1 AND sm.user_id = $2
-		)`,
-		channelUUID, client.UserID,
-	).Scan(&isMember)
-	if err != nil {
-		log.Printf("Failed to check channel membership: %v", err)
-		h.sendError(msg.ClientID, "Failed to verify channel access")
+	chCtx := h.fetchChannelContext(msg, channelUUID)
+	if chCtx == nil {
 		return
 	}
-	if !isMember {
+	viewPerm, ok := chCtx.viewPermission()
+	if !ok {
 		h.sendError(msg.ClientID, "Not authorized to subscribe to this channel")
+		return
+	}
+	if !h.authorizeChannelPermission(msg, client.UserID, chCtx, channelUUID, viewPerm, "Not authorized to subscribe to this channel") {
 		return
 	}
 
@@ -668,16 +1051,7 @@ func (h *Hub) handleUnsubscribe(msg IncomingMessage) {
 		return
 	}
 
-	// Remove from client's channels
-	delete(client.Channels, channelUUID)
-
-	// Remove from channel subscriptions
-	if clients, ok := h.channelSubscriptions[channelUUID]; ok {
-		delete(clients, client.ID)
-		if len(clients) == 0 {
-			delete(h.channelSubscriptions, channelUUID)
-		}
-	}
+	h.removeChannelSubscription(channelUUID, client)
 
 	log.Printf("Client %s unsubscribed from channel %s", client.ID, channelUUID)
 }
@@ -975,24 +1349,97 @@ func (h *Hub) parseAttachmentIDs(msg IncomingMessage) ([]string, bool) {
 type channelContext struct {
 	serverAllowEmbeds bool
 	serverUUID        uuid.UUID
+	channelType       string
 }
 
-// fetchChannelContext queries embed policy and server ID for a channel.
+// fetchChannelContext queries server-side channel state.
 // Returns nil on failure (error already sent to client).
 // All channels are encrypted under E2EE-everywhere (#201).
 func (h *Hub) fetchChannelContext(msg IncomingMessage, channelUUID uuid.UUID) *channelContext {
 	var ctx channelContext
 	err := h.db.QueryRow(
-		`SELECT s.allow_embedded_content, c.server_id
+		`SELECT s.allow_embedded_content, c.server_id, c.type
 		 FROM channels c INNER JOIN servers s ON c.server_id = s.id
 		 WHERE c.id = $1`, channelUUID,
-	).Scan(&ctx.serverAllowEmbeds, &ctx.serverUUID)
+	).Scan(&ctx.serverAllowEmbeds, &ctx.serverUUID, &ctx.channelType)
 	if err != nil {
-		log.Printf("Failed to check channel embed status: %v", err)
+		log.Printf("Failed to check channel status: %v", err)
 		h.sendError(msg.ClientID, "Failed to verify channel status")
 		return nil
 	}
 	return &ctx
+}
+
+func (h *Hub) fetchChannelContextForAuth(channelUUID uuid.UUID) (*channelContext, error) {
+	if h.db == nil {
+		return nil, errors.New("database not configured")
+	}
+	var ctx channelContext
+	err := h.db.QueryRow(
+		`SELECT s.allow_embedded_content, c.server_id, c.type
+		 FROM channels c INNER JOIN servers s ON c.server_id = s.id
+		 WHERE c.id = $1`, channelUUID,
+	).Scan(&ctx.serverAllowEmbeds, &ctx.serverUUID, &ctx.channelType)
+	if err != nil {
+		return nil, err
+	}
+	return &ctx, nil
+}
+
+func (h *Hub) deliveryAuthForChannel(channelID uuid.UUID) (uuid.UUID, int64, bool) {
+	if h.db == nil {
+		return uuid.Nil, 0, true
+	}
+	chCtx, err := h.fetchChannelContextForAuth(channelID)
+	if err == sql.ErrNoRows {
+		h.removeAllChannelSubscriptions(channelID)
+		return uuid.Nil, 0, false
+	}
+	if err != nil {
+		log.Printf("Failed to fetch channel delivery auth: %v", err)
+		return uuid.Nil, 0, false
+	}
+	viewPerm, ok := chCtx.viewPermission()
+	if !ok {
+		h.removeAllChannelSubscriptions(channelID)
+		return uuid.Nil, 0, false
+	}
+	return chCtx.serverUUID, viewPerm, true
+}
+
+func (h *Hub) fetchServerChannelDeliveryAuth(serverID uuid.UUID) (map[uuid.UUID]int64, []uuid.UUID, error) {
+	if h.db == nil {
+		return nil, nil, nil
+	}
+	rows, err := h.db.Query(
+		`SELECT id, type
+		 FROM channels
+		 WHERE server_id = $1`, serverID,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	authByChannel := make(map[uuid.UUID]int64)
+	var invalidChannels []uuid.UUID
+	for rows.Next() {
+		var channelID uuid.UUID
+		var channelType string
+		if err := rows.Scan(&channelID, &channelType); err != nil {
+			return nil, nil, err
+		}
+		viewPerm, ok := (&channelContext{channelType: channelType}).viewPermission()
+		if !ok {
+			invalidChannels = append(invalidChannels, channelID)
+			continue
+		}
+		authByChannel[channelID] = viewPerm
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return authByChannel, invalidChannels, nil
 }
 
 // enforceWSEpoch checks that the key epoch is not revoked. Returns false if revoked or on error.
@@ -1314,7 +1761,9 @@ func (h *Hub) handleMessage(msg IncomingMessage) {
 		return
 	}
 
-	// Parse and validate input fields
+	// Parse and validate input fields before DB-backed channel checks. The
+	// envelope validator intentionally rejects malformed encrypted payloads
+	// with a WebSocket close frame before any database work.
 	input := h.parseMessageInput(msg)
 	if input == nil {
 		return
@@ -1323,11 +1772,19 @@ func (h *Hub) handleMessage(msg IncomingMessage) {
 		defer input.mentionAddendum.Wipe()
 	}
 
-	// Embed policy + epoch enforcement (all channels are encrypted under #201)
 	chCtx := h.fetchChannelContext(msg, channelUUID)
 	if chCtx == nil {
 		return
 	}
+	viewPerm, ok := chCtx.viewPermission()
+	if !ok || !h.authorizeChannelPermission(msg, client.UserID, chCtx, channelUUID, viewPerm, "Not authorized to send messages in this channel") {
+		return
+	}
+	if !h.authorizeChannelPermission(msg, client.UserID, chCtx, channelUUID, permSendMessages, "Not authorized to send messages in this channel") {
+		return
+	}
+
+	// Embed policy + epoch enforcement (all channels are encrypted under #201)
 	if !h.enforceWSEpoch(msg, channelUUID, channelID, input.keyVersion) {
 		return
 	}
@@ -1375,13 +1832,15 @@ func (h *Hub) handleMessage(msg IncomingMessage) {
 		replyToID: replyToID, gifSlug: input.gifSlug, attachments: attachmentSummaries,
 	})
 	h.broadcast <- BroadcastMessage{
-		ChannelID:   channelUUID,
-		ExcludeUser: &msg.UserID,
-		Data:        OutgoingMessage{Type: "message", Data: broadcastData},
+		ChannelID:      channelUUID,
+		ServerID:       chCtx.serverUUID,
+		ViewPermission: viewPerm,
+		ExcludeUser:    &msg.UserID,
+		Data:           OutgoingMessage{Type: "message", Data: broadcastData},
 	}
 
 	// Send lightweight unread_notify to server subscribers NOT subscribed to this channel.
-	h.sendUnreadNotify(chCtx.serverUUID, channelUUID, msg.UserID)
+	h.sendUnreadNotify(chCtx.serverUUID, channelUUID, msg.UserID, viewPerm)
 
 	// Mention routing: enforce RBAC, resolve targets, send enhanced notifications, wipe.
 	if input.mentionAddendum != nil {
@@ -1389,13 +1848,13 @@ func (h *Hub) handleMessage(msg IncomingMessage) {
 			chCtx.serverUUID.String(), msg.UserID.String(), channelUUID.String(),
 			input.mentionAddendum,
 		)
-		h.routeMentionNotifications(chCtx.serverUUID, channelUUID, msg.UserID, input.mentionAddendum)
+		h.routeMentionNotifications(chCtx.serverUUID, channelUUID, msg.UserID, input.mentionAddendum, viewPerm)
 	}
 }
 
 // sendUnreadNotify sends a lightweight notification to server subscribers
 // who are not subscribed to the given channel (they already get the full message).
-func (h *Hub) sendUnreadNotify(serverID, channelID, senderUserID uuid.UUID) {
+func (h *Hub) sendUnreadNotify(serverID, channelID, senderUserID uuid.UUID, viewPerm int64) {
 	serverClients, ok := h.serverSubscriptions[serverID]
 	if !ok {
 		return
@@ -1415,6 +1874,7 @@ func (h *Hub) sendUnreadNotify(serverID, channelID, senderUserID uuid.UUID) {
 		return
 	}
 
+	recipients := make([]channelDeliveryRecipient, 0, len(serverClients))
 	for clientID := range serverClients {
 		// Skip clients already subscribed to the channel — they got the full message
 		if channelClients != nil && channelClients[clientID] {
@@ -1430,12 +1890,83 @@ func (h *Hub) sendUnreadNotify(serverID, channelID, senderUserID uuid.UUID) {
 		if client.UserID == senderUserID {
 			continue
 		}
+		recipients = append(recipients, channelDeliveryRecipient{clientID: clientID, userID: client.UserID})
+	}
+	h.dispatchChannelDelivery(channelDeliveryRequest{
+		kind:       channelDeliveryUnread,
+		serverID:   serverID,
+		channelID:  channelID,
+		viewPerm:   viewPerm,
+		data:       data,
+		recipients: recipients,
+	})
+}
 
-		select {
-		case client.Send <- data:
-		default:
+func (h *Hub) handleChannelRevalidation(req channelRevalidation) {
+	chCtx, err := h.fetchChannelContextForAuth(req.channelID)
+	if err == sql.ErrNoRows {
+		h.removeAllChannelSubscriptions(req.channelID)
+		return
+	}
+	if err != nil {
+		log.Printf("Failed to revalidate channel subscriptions: %v", err)
+		return
+	}
+	if req.serverID != uuid.Nil && chCtx.serverUUID != req.serverID {
+		return
+	}
+	viewPerm, ok := chCtx.viewPermission()
+	if !ok {
+		h.removeAllChannelSubscriptions(req.channelID)
+		return
+	}
+	h.pruneUnauthorizedChannelSubscribers(chCtx.serverUUID, req.channelID, viewPerm)
+}
+
+func (h *Hub) handleServerRevalidation(serverID uuid.UUID) {
+	authByChannel, invalidChannels, err := h.fetchServerChannelDeliveryAuth(serverID)
+	if err != nil {
+		log.Printf("Failed to revalidate server subscriptions: %v", err)
+		return
+	}
+	for _, channelID := range invalidChannels {
+		h.removeAllChannelSubscriptions(channelID)
+	}
+	for channelID, viewPerm := range authByChannel {
+		h.pruneUnauthorizedChannelSubscribers(serverID, channelID, viewPerm)
+	}
+}
+
+func (h *Hub) pruneUnauthorizedChannelSubscribers(serverID, channelID uuid.UUID, viewPerm int64) {
+	subscribers := h.channelSubscriptions[channelID]
+	if len(subscribers) == 0 {
+		return
+	}
+	recipients := make([]channelDeliveryRecipient, 0, len(subscribers))
+	for clientID := range subscribers {
+		client, ok := h.clients[clientID]
+		if !ok {
+			delete(subscribers, clientID)
+			continue
+		}
+		recipients = append(recipients, channelDeliveryRecipient{clientID: clientID, userID: client.UserID})
+	}
+	h.dispatchChannelDelivery(channelDeliveryRequest{
+		kind:       channelDeliveryPrune,
+		serverID:   serverID,
+		channelID:  channelID,
+		viewPerm:   viewPerm,
+		recipients: recipients,
+	})
+}
+
+func (h *Hub) removeAllChannelSubscriptions(channelID uuid.UUID) {
+	for clientID := range h.channelSubscriptions[channelID] {
+		if client, ok := h.clients[clientID]; ok {
+			delete(client.Channels, channelID)
 		}
 	}
+	delete(h.channelSubscriptions, channelID)
 }
 
 // handleTyping handles typing indicator
@@ -1459,10 +1990,17 @@ func (h *Hub) handleTyping(msg IncomingMessage) {
 		return
 	}
 
+	serverID, viewPerm, ok := h.deliveryAuthForChannel(channelUUID)
+	if !ok {
+		return
+	}
+
 	// Broadcast typing indicator to all subscribers except sender
 	broadcastMsg := BroadcastMessage{
-		ChannelID:   channelUUID,
-		ExcludeUser: &msg.UserID,
+		ChannelID:      channelUUID,
+		ServerID:       serverID,
+		ViewPermission: viewPerm,
+		ExcludeUser:    &msg.UserID,
 		Data: OutgoingMessage{
 			Type: "typing",
 			Data: map[string]interface{}{
@@ -1537,7 +2075,7 @@ func (h *Hub) handleBroadcast(msg BroadcastMessage) {
 		log.Printf("Failed to marshal broadcast message: %v", err)
 		return
 	}
-
+	recipients := make([]channelDeliveryRecipient, 0, len(subscribers))
 	for clientID := range subscribers {
 		client, ok := h.clients[clientID]
 		if !ok {
@@ -1548,14 +2086,16 @@ func (h *Hub) handleBroadcast(msg BroadcastMessage) {
 		if msg.ExcludeUser != nil && client.UserID == *msg.ExcludeUser {
 			continue
 		}
-
-		select {
-		case client.Send <- messageData:
-		default:
-			// Client's send channel is full, perform full cleanup
-			h.handleUnregister(client)
-		}
+		recipients = append(recipients, channelDeliveryRecipient{clientID: clientID, userID: client.UserID})
 	}
+	h.dispatchChannelDelivery(channelDeliveryRequest{
+		kind:       channelDeliveryBroadcast,
+		serverID:   msg.ServerID,
+		channelID:  msg.ChannelID,
+		viewPerm:   msg.ViewPermission,
+		data:       messageData,
+		recipients: recipients,
+	})
 }
 
 // BroadcastToChannel broadcasts a message to all subscribers of a channel

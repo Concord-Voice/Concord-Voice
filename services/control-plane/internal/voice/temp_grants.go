@@ -145,6 +145,13 @@ func (m *tempGrantManager) revokeTemporaryChannelAccess(ctx context.Context, ser
 	if err := m.resolver.InvalidateChannel(ctx, serverID, channelID); err != nil {
 		m.log.Error("temp revoke: cache invalidate", "error", err, "channel_id", channelID, "server_id", serverID)
 	}
+	if m.hub != nil {
+		if serverUUID, serverErr := uuid.Parse(serverID); serverErr == nil {
+			if channelUUID, channelErr := uuid.Parse(channelID); channelErr == nil {
+				m.hub.RevalidateChannelSubscriptions(serverUUID, channelUUID)
+			}
+		}
+	}
 
 	// P2: rotate the channel CSK so the departed user cannot decrypt post-visit traffic.
 	m.rotator.TriggerForChannel(channelID, revokeReason, actorID)

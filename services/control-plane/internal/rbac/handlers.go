@@ -330,6 +330,7 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 	}
 
 	_ = h.cache.InvalidateServer(c.Request.Context(), serverID)
+	h.revalidateServerSubscribers(serverID)
 	h.auditRoleUpdate(c, serverID, userID, roleID, req)
 	h.broadcastRoleUpdated(serverID, roleID, role)
 
@@ -564,6 +565,7 @@ func (h *Handler) DeleteRole(c *gin.Context) {
 
 	// Invalidate cache
 	_ = h.cache.InvalidateServer(c.Request.Context(), serverID)
+	h.revalidateServerSubscribers(serverID)
 
 	// Audit log
 	if h.audit != nil {
@@ -805,6 +807,7 @@ func (h *Handler) AssignRole(c *gin.Context) {
 
 	// Invalidate cache
 	_ = h.cache.Invalidate(c.Request.Context(), serverID, targetUserID)
+	h.revalidateServerSubscribers(serverID)
 
 	// Audit log
 	if h.audit != nil {
@@ -906,6 +909,7 @@ func (h *Handler) UnassignRole(c *gin.Context) {
 
 	// Invalidate cache
 	_ = h.cache.Invalidate(c.Request.Context(), serverID, targetUserID)
+	h.revalidateServerSubscribers(serverID)
 
 	// Audit log
 	if h.audit != nil {
@@ -1159,6 +1163,7 @@ func (h *Handler) UpsertChannelOverride(c *gin.Context) {
 
 	// Invalidate cache for affected channel
 	_ = h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID)
+	h.revalidateChannelSubscribers(serverID, channelID)
 
 	// Audit log — xmax=0 means INSERT (new row), otherwise UPDATE (conflict)
 	if h.audit != nil {
@@ -1237,6 +1242,7 @@ func (h *Handler) DeleteChannelOverride(c *gin.Context) {
 
 	// Invalidate cache
 	_ = h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID)
+	h.revalidateChannelSubscribers(serverID, channelID)
 
 	// Audit log
 	if h.audit != nil {
@@ -1301,6 +1307,23 @@ func (h *Handler) getCategoryServerID(categoryID string) (string, error) {
 	var serverID string
 	err := h.db.QueryRow(`SELECT server_id FROM channel_groups WHERE id = $1`, categoryID).Scan(&serverID)
 	return serverID, err
+}
+
+func (h *Handler) revalidateChannelSubscribers(serverID, channelID string) {
+	serverUUID, serverErr := uuid.Parse(serverID)
+	channelUUID, channelErr := uuid.Parse(channelID)
+	if h.hub == nil || serverErr != nil || channelErr != nil {
+		return
+	}
+	h.hub.RevalidateChannelSubscriptions(serverUUID, channelUUID)
+}
+
+func (h *Handler) revalidateServerSubscribers(serverID string) {
+	serverUUID, err := uuid.Parse(serverID)
+	if h.hub == nil || err != nil {
+		return
+	}
+	h.hub.RevalidateServerSubscriptions(serverUUID)
 }
 
 // ListCategoryOverrides returns all permission overrides for a category
@@ -1623,6 +1646,7 @@ func (h *Handler) SetChannelPermissionSync(c *gin.Context) {
 			return
 		}
 		_ = h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID)
+		h.revalidateChannelSubscribers(serverID, channelID)
 	}
 
 	if h.audit != nil {
@@ -1729,6 +1753,7 @@ func (h *Handler) invalidateSyncedChannelCaches(ctx context.Context, serverID, c
 		var chID string
 		if err := rows.Scan(&chID); err == nil {
 			_ = h.cache.InvalidateChannel(ctx, serverID, chID)
+			h.revalidateChannelSubscribers(serverID, chID)
 		}
 	}
 }

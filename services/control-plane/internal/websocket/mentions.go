@@ -252,6 +252,7 @@ func (h *Hub) routeMentionNotifications(
 	serverID, channelID uuid.UUID,
 	senderUserID uuid.UUID,
 	addendum *MentionAddendum,
+	viewPerm int64,
 ) {
 	if addendum == nil || addendum.IsEmpty() {
 		return
@@ -270,7 +271,7 @@ func (h *Hub) routeMentionNotifications(
 
 	// Send mention-enhanced unread_notify to mentioned users who are connected
 	// but NOT subscribed to the channel (they'll detect it client-side if subscribed)
-	h.sendMentionNotify(serverID, channelID, mentionedUserIDs, addendum.Everyone, addendum.Here)
+	h.sendMentionNotify(serverID, channelID, mentionedUserIDs, addendum.Everyone, addendum.Here, viewPerm)
 }
 
 // resolveDirectUserMentions validates direct @user mentions against server membership
@@ -391,6 +392,7 @@ func (h *Hub) sendMentionNotify(
 	serverID, channelID uuid.UUID,
 	mentionedUsers map[uuid.UUID]bool,
 	isEveryone, isHere bool,
+	viewPerm int64,
 ) {
 	// Marshal once — payload is identical for all recipients
 	notifyMsg, err := marshalOutgoing(OutgoingMessage{
@@ -408,10 +410,30 @@ func (h *Hub) sendMentionNotify(
 	}
 
 	channelClients := h.channelSubscriptions[channelID]
-
+	recipients := make([]channelDeliveryRecipient, 0)
 	for userID := range mentionedUsers {
-		h.sendToUnsubscribedClients(userID, channelClients, notifyMsg)
+		clientIDs, ok := h.userClients[userID]
+		if !ok {
+			continue
+		}
+		for clientID := range clientIDs {
+			if channelClients != nil && channelClients[clientID] {
+				continue
+			}
+			if _, ok := h.clients[clientID]; !ok {
+				continue
+			}
+			recipients = append(recipients, channelDeliveryRecipient{clientID: clientID, userID: userID})
+		}
 	}
+	h.dispatchChannelDelivery(channelDeliveryRequest{
+		kind:       channelDeliveryMention,
+		serverID:   serverID,
+		channelID:  channelID,
+		viewPerm:   viewPerm,
+		data:       notifyMsg,
+		recipients: recipients,
+	})
 }
 
 // routeDMMentionNotifications sends mention-enhanced dm_unread_notify to mentioned
@@ -525,6 +547,15 @@ func (h *Hub) sendDMMentionNotify(
 // sendToUnsubscribedClients sends a message to all clients of a user that are NOT
 // in the given subscription set (channelClients or dmClients).
 func (h *Hub) sendToUnsubscribedClients(userID uuid.UUID, subscribedClients map[uuid.UUID]bool, msg []byte) {
+	h.sendToUnsubscribedClientsIf(userID, subscribedClients, msg, nil)
+}
+
+func (h *Hub) sendToUnsubscribedClientsIf(
+	userID uuid.UUID,
+	subscribedClients map[uuid.UUID]bool,
+	msg []byte,
+	allow func(*Client) bool,
+) {
 	clientIDs, ok := h.userClients[userID]
 	if !ok {
 		return
@@ -536,6 +567,9 @@ func (h *Hub) sendToUnsubscribedClients(userID uuid.UUID, subscribedClients map[
 		}
 		client, ok := h.clients[clientID]
 		if !ok {
+			continue
+		}
+		if allow != nil && !allow(client) {
 			continue
 		}
 		select {

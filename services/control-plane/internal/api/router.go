@@ -57,13 +57,17 @@ const (
 	routeVoiceTempAccess   = "/:id/voice/:userId/temp-access"
 )
 
-// mentionCheckerAdapter adapts an rbac.Resolver to the websocket.MentionPermissionChecker
-// interface, bridging the rbac.Permission type to int64 without a circular import.
-type mentionCheckerAdapter struct {
+// permissionCheckerAdapter adapts an rbac.Resolver to websocket checker interfaces
+// without making the websocket package import rbac.
+type permissionCheckerAdapter struct {
 	resolver *rbac.Resolver
 }
 
-func (a *mentionCheckerAdapter) HasMentionPermission(ctx context.Context, serverID, userID, channelID string, permBit int64) (bool, error) {
+func (a *permissionCheckerAdapter) HasMentionPermission(ctx context.Context, serverID, userID, channelID string, permBit int64) (bool, error) {
+	return a.resolver.HasPermission(ctx, serverID, userID, channelID, rbac.Permission(permBit))
+}
+
+func (a *permissionCheckerAdapter) HasChannelPermission(ctx context.Context, serverID, userID, channelID string, permBit int64) (bool, error) {
 	return a.resolver.HasPermission(ctx, serverID, userID, channelID, rbac.Permission(permBit))
 }
 
@@ -170,9 +174,11 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	// Initialize RBAC components (before handlers that depend on resolver)
 	permCache := rbac.NewPermissionCache(redis)
 	rbacResolver := rbac.NewResolver(db, permCache, log)
-	hub.SetMentionChecker(&mentionCheckerAdapter{resolver: rbacResolver})
+	permissionChecker := &permissionCheckerAdapter{resolver: rbacResolver}
+	hub.SetMentionChecker(permissionChecker)
+	hub.SetChannelPermissionChecker(permissionChecker)
 
-	// Start hub AFTER all dependencies are injected (avoids data race on mentionChecker)
+	// Start hub AFTER all dependencies are injected (avoids data races on checkers)
 	go hub.Run()
 	auditWriter := rbac.NewAuditWriter(db, log)
 	rbacHandler := rbac.NewHandler(db, log, redis, hub, rbacResolver, permCache, auditWriter)

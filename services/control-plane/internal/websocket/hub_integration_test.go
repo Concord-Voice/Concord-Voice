@@ -13,14 +13,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	testPermViewVoiceChannels int64 = 1 << 9
+	testPermViewTextChannels  int64 = 1 << 10
+	testPermSendMessages      int64 = 1 << 11
+	testBaseChannelPerms            = testPermViewVoiceChannels | testPermViewTextChannels | testPermSendMessages
+)
+
 // --- handleMessage integration tests (require DB) ---
 
 func setupMessageTest(t *testing.T) *hubTestSetup {
 	t.Helper()
 
 	db := setupHubTestDB(t)
-	redisClient := setupHubTestRedis(t)
-	hub := NewHub(db, redisClient)
+	hub := NewHub(db, nil)
+	hub.SetChannelPermissionChecker(&testChannelPermissionChecker{db: db})
 
 	userID := uuid.New()
 	hash := "$argon2id$v=19$m=65536,t=3,p=4$3pE9STD1TqLPoZQ2/BTLCg$8SKTCjsZh8Q7pAulEqAIEzJQK9eeOb5ipWhPz4REdCY" //nolint:gosec
@@ -33,6 +40,13 @@ func setupMessageTest(t *testing.T) *hubTestSetup {
 	serverID := uuid.New()
 	_, err = db.Exec(`INSERT INTO servers (id, name, owner_id, allow_embedded_content) VALUES ($1, $2, $3, true)`,
 		serverID.String(), "Test Server", userID.String())
+	require.NoError(t, err)
+
+	roleID := uuid.New()
+	_, err = db.Exec(
+		`INSERT INTO roles (id, server_id, name, position, permissions, is_default, is_managed)
+		 VALUES ($1, $2, '@all', 0, $3, TRUE, TRUE)`,
+		roleID.String(), serverID.String(), testBaseChannelPerms)
 	require.NoError(t, err)
 
 	// Add user as member
@@ -75,6 +89,136 @@ func setupMessageTest(t *testing.T) *hubTestSetup {
 		user1:  userID,
 		user2:  serverID, // reusing user2 field for serverID
 	}
+}
+
+func addHubMemberClient(t *testing.T, setup *hubTestSetup, username string) *Client {
+	t.Helper()
+
+	userID := uuid.New()
+	hash := "$argon2id$v=19$m=65536,t=3,p=4$3pE9STD1TqLPoZQ2/BTLCg$8SKTCjsZh8Q7pAulEqAIEzJQK9eeOb5ipWhPz4REdCY" //nolint:gosec
+	_, err := setup.db.Exec(
+		`INSERT INTO users (id, email, username, password_hash, age_verified, email_verified) VALUES ($1, $2, $3, $4, true, true)`,
+		userID.String(), username+"@test.concord.chat", username, hash)
+	require.NoError(t, err)
+
+	_, err = setup.db.Exec(
+		`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')`,
+		setup.user2.String(), userID.String())
+	require.NoError(t, err)
+
+	_, err = setup.db.Exec(
+		`INSERT INTO member_roles (server_id, user_id, role_id)
+		 SELECT $1, $2, id FROM roles WHERE server_id = $1 AND is_default = TRUE`,
+		setup.user2.String(), userID.String())
+	require.NoError(t, err)
+
+	client := &Client{
+		ID:       uuid.New(),
+		UserID:   userID,
+		Username: username,
+		Send:     make(chan []byte, 10),
+		Hub:      setup.hub,
+		Channels: make(map[uuid.UUID]bool),
+	}
+	setup.hub.clients[client.ID] = client
+	setup.hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
+	return client
+}
+
+func denyDefaultRolePermission(t *testing.T, setup *hubTestSetup, perm int64) {
+	t.Helper()
+
+	var roleID string
+	err := setup.db.QueryRow(
+		`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`,
+		setup.user2.String(),
+	).Scan(&roleID)
+	require.NoError(t, err)
+
+	_, err = setup.db.Exec(
+		`INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny)
+		 VALUES ($1, $2, 'role', $3, 0, $4)`,
+		uuid.New().String(), setup.convID, roleID, perm)
+	require.NoError(t, err)
+}
+
+type testChannelPermissionChecker struct {
+	db *sql.DB
+}
+
+func (c *testChannelPermissionChecker) HasChannelPermission(
+	ctx context.Context,
+	serverID, userID, channelID string,
+	permBit int64,
+) (bool, error) {
+	var isMember bool
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`,
+		serverID, userID).Scan(&isMember); err != nil {
+		return false, err
+	}
+	if !isMember {
+		return false, nil
+	}
+
+	var ownerID string
+	if err := c.db.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
+		return false, err
+	}
+	if ownerID == userID {
+		return true, nil
+	}
+
+	var basePerms int64
+	if err := c.db.QueryRowContext(ctx, `
+		SELECT COALESCE(BIT_OR(r.permissions), 0)
+		FROM member_roles mr
+		INNER JOIN roles r ON mr.role_id = r.id
+		WHERE mr.server_id = $1 AND mr.user_id = $2
+	`, serverID, userID).Scan(&basePerms); err != nil {
+		return false, err
+	}
+
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT target_type, allow, deny
+		FROM channel_permission_overrides
+		WHERE channel_id = $1
+		  AND (
+		      (target_type = 'user' AND target_id = $2)
+		      OR (target_type = 'role' AND target_id IN (
+		          SELECT role_id FROM member_roles
+		          WHERE server_id = $3 AND user_id = $2
+		      ))
+		  )`, channelID, userID, serverID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close() //nolint:errcheck
+
+	var userAllow, userDeny, roleAllow, roleDeny int64
+	for rows.Next() {
+		var targetType string
+		var allow, deny int64
+		if err := rows.Scan(&targetType, &allow, &deny); err != nil {
+			return false, err
+		}
+		if targetType == "user" {
+			userAllow |= allow
+			userDeny |= deny
+		} else {
+			roleAllow |= allow
+			roleDeny |= deny
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	finalPerms := basePerms
+	finalPerms |= roleAllow
+	finalPerms &^= roleDeny
+	finalPerms |= userAllow
+	finalPerms &^= userDeny
+	return finalPerms&permBit != 0, nil
 }
 
 func TestHandleMessagePlaintextSuccess(t *testing.T) {
@@ -125,6 +269,115 @@ func TestHandleMessageNotSubscribed(t *testing.T) {
 	assert.Equal(t, "error", resp["type"])
 	data := resp["data"].(map[string]interface{})
 	assert.Contains(t, data[keyMessage], "Not subscribed")
+}
+
+func TestHandleMessageDeniedByChannelSendOverride(t *testing.T) {
+	setup := setupMessageTest(t)
+	channelUUID, err := uuid.Parse(setup.convID)
+	require.NoError(t, err)
+
+	client := addHubMemberClient(t, setup, "hubsenddeny")
+	client.Channels[channelUUID] = true
+	setup.hub.channelSubscriptions[channelUUID][client.ID] = true
+	denyDefaultRolePermission(t, setup, testPermSendMessages)
+
+	msg := IncomingMessage{
+		Type:     "message",
+		UserID:   client.UserID,
+		ClientID: client.ID,
+		Data: map[string]interface{}{
+			keyChannelID:  setup.convID,
+			keyContent:    "blocked by channel override",
+			keyKeyVersion: float64(1),
+		},
+	}
+
+	setup.hub.handleMessage(msg)
+
+	resp := readClientMsg(t, client)
+	assert.Equal(t, "error", resp["type"])
+	data := resp["data"].(map[string]interface{})
+	assert.Contains(t, data[keyMessage], "Not authorized")
+}
+
+func TestHandleMessageDeniedByChannelVisibilityOverride(t *testing.T) {
+	setup := setupMessageTest(t)
+	channelUUID, err := uuid.Parse(setup.convID)
+	require.NoError(t, err)
+
+	client := addHubMemberClient(t, setup, "hubviewdeny")
+	client.Channels[channelUUID] = true
+	setup.hub.channelSubscriptions[channelUUID][client.ID] = true
+	denyDefaultRolePermission(t, setup, testPermViewTextChannels)
+
+	msg := IncomingMessage{
+		Type:     "message",
+		UserID:   client.UserID,
+		ClientID: client.ID,
+		Data: map[string]interface{}{
+			keyChannelID:  setup.convID,
+			keyContent:    "blocked by channel view override",
+			keyKeyVersion: float64(1),
+		},
+	}
+
+	setup.hub.handleMessage(msg)
+
+	resp := readClientMsg(t, client)
+	assert.Equal(t, "error", resp["type"])
+	data := resp["data"].(map[string]interface{})
+	assert.Contains(t, data[keyMessage], "Not authorized")
+}
+
+func TestDeliveryAuthForChannelLoadsViewPermission(t *testing.T) {
+	setup := setupMessageTest(t)
+	channelUUID, err := uuid.Parse(setup.convID)
+	require.NoError(t, err)
+
+	serverID, viewPerm, ok := setup.hub.deliveryAuthForChannel(channelUUID)
+
+	assert.True(t, ok)
+	assert.Equal(t, setup.user2, serverID)
+	assert.Equal(t, testPermViewTextChannels, viewPerm)
+}
+
+func TestHandleChannelRevalidationPrunesViewerDeniedSubscriber(t *testing.T) {
+	setup := setupMessageTest(t)
+	channelUUID, err := uuid.Parse(setup.convID)
+	require.NoError(t, err)
+
+	member := addHubMemberClient(t, setup, "hubchannelrevaldeny")
+	member.Channels[channelUUID] = true
+	setup.hub.channelSubscriptions[channelUUID][member.ID] = true
+	denyDefaultRolePermission(t, setup, testPermViewTextChannels)
+
+	setup.hub.handleChannelRevalidation(channelRevalidation{
+		serverID:  setup.user2,
+		channelID: channelUUID,
+	})
+	applyAsyncChannelDelivery(t, setup.hub)
+
+	assert.True(t, setup.hub.channelSubscriptions[channelUUID][setup.client.ID], "owner subscriber should remain")
+	assert.False(t, setup.hub.channelSubscriptions[channelUUID][member.ID], "viewer-denied member should be pruned")
+	assert.False(t, member.Channels[channelUUID], "viewer-denied member should lose local channel subscription")
+}
+
+func TestHandleServerRevalidationPrunesViewerDeniedSubscriber(t *testing.T) {
+	setup := setupMessageTest(t)
+	channelUUID, err := uuid.Parse(setup.convID)
+	require.NoError(t, err)
+
+	member := addHubMemberClient(t, setup, "hubserverrevaldeny")
+	member.Channels[channelUUID] = true
+	setup.hub.channelSubscriptions[channelUUID][member.ID] = true
+	denyDefaultRolePermission(t, setup, testPermViewTextChannels)
+
+	setup.hub.handleServerRevalidation(setup.user2)
+	applyAsyncChannelDelivery(t, setup.hub)
+
+	assert.True(t, setup.hub.channelSubscriptions[channelUUID][setup.client.ID], "owner subscriber should remain")
+	assert.False(t, setup.hub.channelSubscriptions[channelUUID][member.ID], "viewer-denied member should be pruned")
+	assert.False(t, member.Channels[channelUUID], "viewer-denied member should lose local channel subscription")
 }
 
 func TestHandleMessageEmptyContent(t *testing.T) {
@@ -371,6 +624,46 @@ func TestHandleSubscribeSuccess(t *testing.T) {
 	// Client should be in channel subscriptions
 	assert.True(t, setup.client.Channels[channelUUID])
 	assert.True(t, setup.hub.channelSubscriptions[channelUUID][setup.client.ID])
+}
+
+func TestHandleSubscribeDeniedByChannelVisibilityOverride(t *testing.T) {
+	tests := []struct {
+		name        string
+		channelType string
+		denyPerm    int64
+	}{
+		{name: "text", channelType: "text", denyPerm: testPermViewTextChannels},
+		{name: "voice", channelType: "voice", denyPerm: testPermViewVoiceChannels},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setup := setupMessageTest(t)
+			channelUUID, err := uuid.Parse(setup.convID)
+			require.NoError(t, err)
+
+			_, err = setup.db.Exec(`UPDATE channels SET type = $1 WHERE id = $2`, tt.channelType, setup.convID)
+			require.NoError(t, err)
+			client := addHubMemberClient(t, setup, "hubsubdeny"+tt.name)
+			denyDefaultRolePermission(t, setup, tt.denyPerm)
+
+			msg := IncomingMessage{
+				Type:     "subscribe",
+				UserID:   client.UserID,
+				ClientID: client.ID,
+				Data: map[string]interface{}{
+					keyChannelID: setup.convID,
+				},
+			}
+
+			setup.hub.handleSubscribe(msg)
+
+			resp := readClientMsg(t, client)
+			assert.Equal(t, "error", resp["type"])
+			assert.False(t, client.Channels[channelUUID])
+			assert.False(t, setup.hub.channelSubscriptions[channelUUID][client.ID])
+		})
+	}
 }
 
 func TestHandleSubscribeInvalidChannelID(t *testing.T) {

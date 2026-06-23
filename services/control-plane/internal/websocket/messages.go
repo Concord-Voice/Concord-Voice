@@ -29,6 +29,11 @@ type BroadcastMessage struct {
 	// Target channel ID
 	ChannelID uuid.UUID
 
+	// Server ID and required view permission for auth-filtered channel delivery.
+	// Zero values keep legacy internal broadcasts unchanged.
+	ServerID       uuid.UUID
+	ViewPermission int64
+
 	// Message to send
 	Data OutgoingMessage
 

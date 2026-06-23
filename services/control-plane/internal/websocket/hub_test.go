@@ -1,11 +1,13 @@
 package websocket
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,6 +61,76 @@ func TestSetMentionChecker(t *testing.T) {
 	assert.NotNil(t, hub.mentionChecker)
 }
 
+func TestNewHubInitializesRevalidationQueues(t *testing.T) {
+	hub := NewHub(nil, nil)
+
+	assert.NotNil(t, hub.revalidateChannel)
+	assert.NotNil(t, hub.revalidateServer)
+}
+
+func TestSetChannelPermissionChecker(t *testing.T) {
+	hub := NewHub(nil, nil)
+	assert.Nil(t, hub.channelPermissionChecker)
+
+	checker := staticChannelPermissionChecker{allowed: true}
+	hub.SetChannelPermissionChecker(checker)
+	assert.NotNil(t, hub.channelPermissionChecker)
+}
+
+func TestRevalidateChannelSubscriptionsQueuesRequest(t *testing.T) {
+	hub := NewHub(nil, nil)
+	serverID := uuid.New()
+	channelID := uuid.New()
+
+	hub.RevalidateChannelSubscriptions(serverID, channelID)
+
+	select {
+	case req := <-hub.revalidateChannel:
+		assert.Equal(t, serverID, req.serverID)
+		assert.Equal(t, channelID, req.channelID)
+	default:
+		t.Fatal("expected channel revalidation request")
+	}
+}
+
+func TestRevalidateChannelSubscriptionsNilSafe(t *testing.T) {
+	var nilHub *Hub
+	require.NotPanics(t, func() {
+		nilHub.RevalidateChannelSubscriptions(uuid.New(), uuid.New())
+	})
+
+	hub := newMinimalHub()
+	require.NotPanics(t, func() {
+		hub.RevalidateChannelSubscriptions(uuid.New(), uuid.New())
+	})
+}
+
+func TestRevalidateServerSubscriptionsQueuesRequest(t *testing.T) {
+	hub := NewHub(nil, nil)
+	serverID := uuid.New()
+
+	hub.RevalidateServerSubscriptions(serverID)
+
+	select {
+	case got := <-hub.revalidateServer:
+		assert.Equal(t, serverID, got)
+	default:
+		t.Fatal("expected server revalidation request")
+	}
+}
+
+func TestRevalidateServerSubscriptionsNilSafe(t *testing.T) {
+	var nilHub *Hub
+	require.NotPanics(t, func() {
+		nilHub.RevalidateServerSubscriptions(uuid.New())
+	})
+
+	hub := newMinimalHub()
+	require.NotPanics(t, func() {
+		hub.RevalidateServerSubscriptions(uuid.New())
+	})
+}
+
 // TestSetDMRingCanceller verifies the DM ring cleanup callback is stored
 // and that subsequent SetDMRingCanceller calls overwrite the previous
 // callback (last writer wins) — matches the SetMentionChecker pattern.
@@ -89,18 +161,19 @@ func TestSetDMRingCanceller(t *testing.T) {
 // (no DB/Redis, channels are nil-safe).
 func newMinimalHub() *Hub {
 	return &Hub{
-		clients:              make(map[uuid.UUID]*Client),
-		userClients:          make(map[uuid.UUID]map[uuid.UUID]bool),
-		channelSubscriptions: make(map[uuid.UUID]map[uuid.UUID]bool),
-		usernames:            make(map[uuid.UUID]string),
-		serverSubscriptions:  make(map[uuid.UUID]map[uuid.UUID]bool),
-		dmSubscriptions:      make(map[uuid.UUID]map[uuid.UUID]bool),
-		broadcast:            make(chan BroadcastMessage, 256),
-		globalBroadcast:      make(chan OutgoingMessage, 256),
-		userBroadcast:        make(chan UserBroadcastMessage, 256),
-		serverBroadcast:      make(chan ServerBroadcastMessage, 256),
-		dmBroadcast:          make(chan DMBroadcastMessage, 256),
-		onlineCountPending:   make(map[uuid.UUID]bool),
+		clients:                make(map[uuid.UUID]*Client),
+		userClients:            make(map[uuid.UUID]map[uuid.UUID]bool),
+		channelSubscriptions:   make(map[uuid.UUID]map[uuid.UUID]bool),
+		usernames:              make(map[uuid.UUID]string),
+		serverSubscriptions:    make(map[uuid.UUID]map[uuid.UUID]bool),
+		dmSubscriptions:        make(map[uuid.UUID]map[uuid.UUID]bool),
+		broadcast:              make(chan BroadcastMessage, 256),
+		globalBroadcast:        make(chan OutgoingMessage, 256),
+		userBroadcast:          make(chan UserBroadcastMessage, 256),
+		serverBroadcast:        make(chan ServerBroadcastMessage, 256),
+		dmBroadcast:            make(chan DMBroadcastMessage, 256),
+		channelDeliveryResults: make(chan channelDeliveryResult, 256),
+		onlineCountPending:     make(map[uuid.UUID]bool),
 	}
 }
 
@@ -113,6 +186,316 @@ func newTestClient(hub *Hub, userID uuid.UUID) *Client {
 		Send:     make(chan []byte, 256),
 		Channels: make(map[uuid.UUID]bool),
 	}
+}
+
+type staticChannelPermissionChecker struct {
+	allowed bool
+	err     error
+}
+
+func (c staticChannelPermissionChecker) HasChannelPermission(context.Context, string, string, string, int64) (bool, error) {
+	return c.allowed, c.err
+}
+
+type blockingChannelPermissionChecker struct {
+	allowed bool
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingChannelPermissionChecker(allowed bool) *blockingChannelPermissionChecker {
+	return &blockingChannelPermissionChecker{
+		allowed: allowed,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (c *blockingChannelPermissionChecker) HasChannelPermission(context.Context, string, string, string, int64) (bool, error) {
+	c.once.Do(func() {
+		close(c.entered)
+	})
+	<-c.release
+	return c.allowed, nil
+}
+
+func requirePermissionCheckOffRunGoroutine(t *testing.T, done <-chan struct{}, checker *blockingChannelPermissionChecker) {
+	t.Helper()
+	select {
+	case <-checker.entered:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected permission checker to be called")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(50 * time.Millisecond):
+		close(checker.release)
+		<-done
+		t.Fatal("permission check blocked hub handler")
+	}
+}
+
+func applyAsyncChannelDelivery(t *testing.T, hub *Hub) {
+	t.Helper()
+	select {
+	case result := <-hub.channelDeliveryResults:
+		hub.handleChannelDeliveryResult(result)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected async channel delivery result")
+	}
+}
+
+type channelPermissionKey struct {
+	serverID, userID, channelID string
+	permBit                     int64
+}
+
+type keyedChannelPermissionChecker map[channelPermissionKey]bool
+
+func (c keyedChannelPermissionChecker) HasChannelPermission(
+	_ context.Context,
+	serverID, userID, channelID string,
+	permBit int64,
+) (bool, error) {
+	return c[channelPermissionKey{
+		serverID:  serverID,
+		userID:    userID,
+		channelID: channelID,
+		permBit:   permBit,
+	}], nil
+}
+
+func TestAuthorizeChannelPermissionMissingCheckerFailsClosed(t *testing.T) {
+	hub := newMinimalHub()
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.clients[client.ID] = client
+
+	ok := hub.authorizeChannelPermission(
+		IncomingMessage{ClientID: client.ID},
+		userID,
+		&channelContext{serverUUID: uuid.New()},
+		uuid.New(),
+		permSendMessages,
+		"denied",
+	)
+
+	assert.False(t, ok)
+	resp := readClientMsg(t, client)
+	assert.Equal(t, "error", resp["type"])
+}
+
+func TestAuthorizeChannelPermissionCheckerErrorFailsClosed(t *testing.T) {
+	hub := newMinimalHub()
+	hub.SetChannelPermissionChecker(staticChannelPermissionChecker{err: errors.New("checker unavailable")})
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.clients[client.ID] = client
+
+	ok := hub.authorizeChannelPermission(
+		IncomingMessage{ClientID: client.ID},
+		userID,
+		&channelContext{serverUUID: uuid.New()},
+		uuid.New(),
+		permSendMessages,
+		"denied",
+	)
+
+	assert.False(t, ok)
+	resp := readClientMsg(t, client)
+	assert.Equal(t, "error", resp["type"])
+}
+
+func TestChannelContextViewPermission(t *testing.T) {
+	tests := []struct {
+		name        string
+		channelType string
+		wantPerm    int64
+		wantOK      bool
+	}{
+		{name: "text", channelType: "text", wantPerm: permViewTextChannels, wantOK: true},
+		{name: "bulletin", channelType: "bulletin", wantPerm: permViewTextChannels, wantOK: true},
+		{name: "voice", channelType: "voice", wantPerm: permViewVoiceChannels, wantOK: true},
+		{name: "unknown", channelType: "forum", wantPerm: 0, wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotPerm, gotOK := (&channelContext{channelType: tt.channelType}).viewPermission()
+			assert.Equal(t, tt.wantPerm, gotPerm)
+			assert.Equal(t, tt.wantOK, gotOK)
+		})
+	}
+}
+
+func TestClientHasChannelPermissionAllowsLegacyBroadcastMetadata(t *testing.T) {
+	hub := newMinimalHub()
+	client := newTestClient(hub, uuid.New())
+
+	allowed, definitive := hub.clientHasChannelPermission(context.Background(), uuid.Nil, uuid.New(), client, permViewTextChannels)
+	assert.True(t, allowed)
+	assert.True(t, definitive)
+
+	allowed, definitive = hub.clientHasChannelPermission(context.Background(), uuid.New(), uuid.New(), client, 0)
+	assert.True(t, allowed)
+	assert.True(t, definitive)
+}
+
+func TestClientHasChannelPermissionMissingCheckerFailsClosed(t *testing.T) {
+	hub := newMinimalHub()
+	client := newTestClient(hub, uuid.New())
+
+	allowed, definitive := hub.clientHasChannelPermission(context.Background(), uuid.New(), uuid.New(), client, permViewTextChannels)
+
+	assert.False(t, allowed)
+	assert.False(t, definitive)
+}
+
+func TestClientHasChannelPermissionCheckerErrorFailsClosed(t *testing.T) {
+	hub := newMinimalHub()
+	hub.SetChannelPermissionChecker(staticChannelPermissionChecker{err: errors.New("checker unavailable")})
+	client := newTestClient(hub, uuid.New())
+
+	allowed, definitive := hub.clientHasChannelPermission(context.Background(), uuid.New(), uuid.New(), client, permViewTextChannels)
+
+	assert.False(t, allowed)
+	assert.False(t, definitive)
+}
+
+func TestClientHasChannelPermissionUsesCheckerResult(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	channelID := uuid.New()
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.SetChannelPermissionChecker(keyedChannelPermissionChecker{
+		{serverID: serverID.String(), userID: userID.String(), channelID: channelID.String(), permBit: permViewTextChannels}: true,
+	})
+
+	allowed, definitive := hub.clientHasChannelPermission(context.Background(), serverID, channelID, client, permViewTextChannels)
+
+	assert.True(t, allowed)
+	assert.True(t, definitive)
+}
+
+func TestDeliveryAuthForChannelNilDBKeepsLegacyBroadcasts(t *testing.T) {
+	hub := newMinimalHub()
+
+	serverID, viewPerm, ok := hub.deliveryAuthForChannel(uuid.New())
+
+	assert.True(t, ok)
+	assert.Equal(t, uuid.Nil, serverID)
+	assert.Equal(t, int64(0), viewPerm)
+}
+
+func TestPruneUnauthorizedChannelSubscribersRemovesDeniedAndMissingClients(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	channelID := uuid.New()
+	allowedUserID := uuid.New()
+	deniedUserID := uuid.New()
+	missingClientID := uuid.New()
+
+	allowed := newTestClient(hub, allowedUserID)
+	denied := newTestClient(hub, deniedUserID)
+	allowed.Channels[channelID] = true
+	denied.Channels[channelID] = true
+	hub.clients[allowed.ID] = allowed
+	hub.clients[denied.ID] = denied
+	hub.channelSubscriptions[channelID] = map[uuid.UUID]bool{
+		allowed.ID:      true,
+		denied.ID:       true,
+		missingClientID: true,
+	}
+	hub.SetChannelPermissionChecker(keyedChannelPermissionChecker{
+		{serverID: serverID.String(), userID: allowedUserID.String(), channelID: channelID.String(), permBit: permViewTextChannels}: true,
+	})
+
+	hub.pruneUnauthorizedChannelSubscribers(serverID, channelID, permViewTextChannels)
+	applyAsyncChannelDelivery(t, hub)
+
+	assert.True(t, hub.channelSubscriptions[channelID][allowed.ID], "allowed subscriber should remain")
+	assert.False(t, hub.channelSubscriptions[channelID][denied.ID], "denied subscriber should be pruned")
+	assert.False(t, hub.channelSubscriptions[channelID][missingClientID], "missing client should be pruned")
+	assert.True(t, allowed.Channels[channelID], "allowed client should keep local channel state")
+	assert.False(t, denied.Channels[channelID], "denied client should lose local channel state")
+}
+
+func TestPruneUnauthorizedChannelSubscribersPermissionErrorKeepsSubscription(t *testing.T) {
+	hub := newMinimalHub()
+	channelID := uuid.New()
+	client := newTestClient(hub, uuid.New())
+	client.Channels[channelID] = true
+	hub.clients[client.ID] = client
+	hub.channelSubscriptions[channelID] = map[uuid.UUID]bool{client.ID: true}
+	hub.SetChannelPermissionChecker(staticChannelPermissionChecker{err: errors.New("checker unavailable")})
+
+	hub.pruneUnauthorizedChannelSubscribers(uuid.New(), channelID, permViewTextChannels)
+	applyAsyncChannelDelivery(t, hub)
+
+	assert.True(t, hub.channelSubscriptions[channelID][client.ID], "permission errors should not prune durable subscription state")
+	assert.True(t, client.Channels[channelID], "permission errors should not remove local channel state")
+}
+
+func TestPruneUnauthorizedChannelSubscribersChecksPermissionOffRunGoroutine(t *testing.T) {
+	hub := newMinimalHub()
+	channelID := uuid.New()
+	client := newTestClient(hub, uuid.New())
+	client.Channels[channelID] = true
+	hub.clients[client.ID] = client
+	hub.channelSubscriptions[channelID] = map[uuid.UUID]bool{client.ID: true}
+	checker := newBlockingChannelPermissionChecker(false)
+	hub.SetChannelPermissionChecker(checker)
+
+	done := make(chan struct{})
+	go func() {
+		hub.pruneUnauthorizedChannelSubscribers(uuid.New(), channelID, permViewTextChannels)
+		close(done)
+	}()
+
+	requirePermissionCheckOffRunGoroutine(t, done, checker)
+	close(checker.release)
+	applyAsyncChannelDelivery(t, hub)
+
+	assert.False(t, hub.channelSubscriptions[channelID][client.ID], "definitive deny should prune subscription")
+	assert.False(t, client.Channels[channelID], "definitive deny should remove local channel state")
+}
+
+func TestPruneUnauthorizedChannelSubscribersEmptyMapIsNoop(t *testing.T) {
+	hub := newMinimalHub()
+
+	require.NotPanics(t, func() {
+		hub.pruneUnauthorizedChannelSubscribers(uuid.New(), uuid.New(), permViewTextChannels)
+	})
+}
+
+func TestRemoveAllChannelSubscriptionsClearsHubAndClientState(t *testing.T) {
+	hub := newMinimalHub()
+	channelID := uuid.New()
+	otherChannelID := uuid.New()
+	clientA := newTestClient(hub, uuid.New())
+	clientB := newTestClient(hub, uuid.New())
+
+	clientA.Channels[channelID] = true
+	clientA.Channels[otherChannelID] = true
+	clientB.Channels[channelID] = true
+	hub.clients[clientA.ID] = clientA
+	hub.clients[clientB.ID] = clientB
+	hub.channelSubscriptions[channelID] = map[uuid.UUID]bool{
+		clientA.ID: true,
+		clientB.ID: true,
+	}
+	hub.channelSubscriptions[otherChannelID] = map[uuid.UUID]bool{clientA.ID: true}
+
+	hub.removeAllChannelSubscriptions(channelID)
+
+	assert.False(t, clientA.Channels[channelID])
+	assert.False(t, clientB.Channels[channelID])
+	assert.True(t, clientA.Channels[otherChannelID])
+	assert.NotContains(t, hub.channelSubscriptions, channelID)
+	assert.Contains(t, hub.channelSubscriptions, otherChannelID)
 }
 
 // --- IsUserOnline / MarkUserOnlineForTest tests ---
@@ -335,6 +718,117 @@ func TestHandleBroadcastExcludesUser(t *testing.T) {
 
 	assert.Len(t, sender.Send, 0, "excluded user should not receive message")
 	assert.Len(t, receiver.Send, 1, "non-excluded user should receive message")
+}
+
+func TestHandleBroadcastSkipsViewerDeniedByChannelPermission(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	channelID := uuid.New()
+	senderID := uuid.New()
+	allowedUserID := uuid.New()
+	deniedUserID := uuid.New()
+
+	sender := newTestClient(hub, senderID)
+	allowed := newTestClient(hub, allowedUserID)
+	denied := newTestClient(hub, deniedUserID)
+	allowed.Channels[channelID] = true
+	denied.Channels[channelID] = true
+
+	hub.clients[sender.ID] = sender
+	hub.clients[allowed.ID] = allowed
+	hub.clients[denied.ID] = denied
+	hub.channelSubscriptions[channelID] = map[uuid.UUID]bool{
+		sender.ID:  true,
+		allowed.ID: true,
+		denied.ID:  true,
+	}
+	hub.SetChannelPermissionChecker(keyedChannelPermissionChecker{
+		{serverID: serverID.String(), userID: allowedUserID.String(), channelID: channelID.String(), permBit: permViewTextChannels}: true,
+	})
+
+	msg := BroadcastMessage{
+		ChannelID:      channelID,
+		ServerID:       serverID,
+		ViewPermission: permViewTextChannels,
+		ExcludeUser:    &senderID,
+		Data: OutgoingMessage{
+			Type: "message",
+			Data: map[string]interface{}{"content": "hello"},
+		},
+	}
+
+	hub.handleBroadcast(msg)
+	applyAsyncChannelDelivery(t, hub)
+
+	assert.Len(t, allowed.Send, 1, "authorized subscriber should receive message")
+	assert.Len(t, denied.Send, 0, "viewer-denied subscriber should not receive message")
+	assert.False(t, denied.Channels[channelID], "viewer-denied subscriber should be pruned")
+	assert.False(t, hub.channelSubscriptions[channelID][denied.ID], "viewer-denied subscription should be pruned")
+}
+
+func TestHandleBroadcastPermissionErrorSkipsWithoutPruning(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	channelID := uuid.New()
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	client.Channels[channelID] = true
+	hub.clients[client.ID] = client
+	hub.channelSubscriptions[channelID] = map[uuid.UUID]bool{client.ID: true}
+	hub.SetChannelPermissionChecker(staticChannelPermissionChecker{err: errors.New("checker unavailable")})
+
+	msg := BroadcastMessage{
+		ChannelID:      channelID,
+		ServerID:       serverID,
+		ViewPermission: permViewTextChannels,
+		Data: OutgoingMessage{
+			Type: "message",
+			Data: map[string]interface{}{"content": "hello"},
+		},
+	}
+
+	hub.handleBroadcast(msg)
+	applyAsyncChannelDelivery(t, hub)
+
+	assert.Len(t, client.Send, 0, "permission errors should skip this delivery")
+	assert.True(t, hub.channelSubscriptions[channelID][client.ID], "permission errors should not prune durable subscription state")
+	assert.True(t, client.Channels[channelID], "permission errors should not remove local channel state")
+}
+
+func TestHandleBroadcastChecksPermissionOffRunGoroutine(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	channelID := uuid.New()
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	client.Channels[channelID] = true
+	hub.clients[client.ID] = client
+	hub.channelSubscriptions[channelID] = map[uuid.UUID]bool{client.ID: true}
+	checker := newBlockingChannelPermissionChecker(true)
+	hub.SetChannelPermissionChecker(checker)
+
+	msg := BroadcastMessage{
+		ChannelID:      channelID,
+		ServerID:       serverID,
+		ViewPermission: permViewTextChannels,
+		Data: OutgoingMessage{
+			Type: "message",
+			Data: map[string]interface{}{"content": "hello"},
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		hub.handleBroadcast(msg)
+		close(done)
+	}()
+
+	requirePermissionCheckOffRunGoroutine(t, done, checker)
+	assert.Len(t, client.Send, 0, "delivery should wait for async permission result")
+	close(checker.release)
+	applyAsyncChannelDelivery(t, hub)
+
+	assert.Len(t, client.Send, 1, "authorized subscriber should receive async-filtered message")
 }
 
 func TestHandleBroadcastNoSubscribers(_ *testing.T) {
@@ -986,7 +1480,7 @@ func TestSendUnreadNotifySendsToServerSubscribers(t *testing.T) {
 		sender.ID: true,
 	}
 
-	hub.sendUnreadNotify(serverID, channelID, senderID)
+	hub.sendUnreadNotify(serverID, channelID, senderID, 0)
 
 	assert.Len(t, sender.Send, 0, "sender should not receive unread notify")
 	assert.Len(t, receiver.Send, 1, "receiver should get unread notify")
@@ -1019,19 +1513,77 @@ func TestSendUnreadNotifySkipsChannelSubscribers(t *testing.T) {
 		subscribedUser.ID: true,
 	}
 
-	hub.sendUnreadNotify(serverID, channelID, senderID)
+	hub.sendUnreadNotify(serverID, channelID, senderID, 0)
 
 	assert.Len(t, subscribedUser.Send, 0, "channel subscriber should not get unread notify")
 	assert.Len(t, sender.Send, 0, "sender should not get unread notify")
 }
 
+func TestSendUnreadNotifySkipsViewerDeniedByChannelPermission(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	channelID := uuid.New()
+	senderID := uuid.New()
+	allowedUserID := uuid.New()
+	deniedUserID := uuid.New()
+
+	sender := newTestClient(hub, senderID)
+	allowed := newTestClient(hub, allowedUserID)
+	denied := newTestClient(hub, deniedUserID)
+
+	hub.clients[sender.ID] = sender
+	hub.clients[allowed.ID] = allowed
+	hub.clients[denied.ID] = denied
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{
+		sender.ID:  true,
+		allowed.ID: true,
+		denied.ID:  true,
+	}
+	hub.SetChannelPermissionChecker(keyedChannelPermissionChecker{
+		{serverID: serverID.String(), userID: allowedUserID.String(), channelID: channelID.String(), permBit: permViewTextChannels}: true,
+	})
+
+	hub.sendUnreadNotify(serverID, channelID, senderID, permViewTextChannels)
+	applyAsyncChannelDelivery(t, hub)
+
+	assert.Len(t, sender.Send, 0, "sender should not receive unread notify")
+	assert.Len(t, allowed.Send, 1, "authorized server subscriber should get unread_notify")
+	assert.Len(t, denied.Send, 0, "viewer-denied server subscriber should not receive unread_notify")
+}
+
+func TestSendUnreadNotifyChecksPermissionOffRunGoroutine(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	channelID := uuid.New()
+	senderID := uuid.New()
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.clients[client.ID] = client
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{client.ID: true}
+	checker := newBlockingChannelPermissionChecker(true)
+	hub.SetChannelPermissionChecker(checker)
+
+	done := make(chan struct{})
+	go func() {
+		hub.sendUnreadNotify(serverID, channelID, senderID, permViewTextChannels)
+		close(done)
+	}()
+
+	requirePermissionCheckOffRunGoroutine(t, done, checker)
+	assert.Len(t, client.Send, 0, "unread notify should wait for async permission result")
+	close(checker.release)
+	applyAsyncChannelDelivery(t, hub)
+
+	assert.Len(t, client.Send, 1, "authorized server subscriber should receive async-filtered unread_notify")
+}
+
 func TestSendUnreadNotifyNoServerSubscribers(_ *testing.T) {
 	hub := newMinimalHub()
 	// Should not panic
-	hub.sendUnreadNotify(uuid.New(), uuid.New(), uuid.New())
+	hub.sendUnreadNotify(uuid.New(), uuid.New(), uuid.New(), 0)
 }
 
-// --- handleTyping tests (no DB needed) ---
+// --- handleTyping tests ---
 
 func TestHandleTypingNotSubscribed(t *testing.T) {
 	hub := newMinimalHub()
@@ -1068,7 +1620,6 @@ func TestHandleTypingSubscribed(t *testing.T) {
 	userID := uuid.New()
 	client := newTestClient(hub, userID)
 	client.Channels[channelID] = true
-
 	hub.clients[client.ID] = client
 	hub.channelSubscriptions[channelID] = map[uuid.UUID]bool{client.ID: true}
 
