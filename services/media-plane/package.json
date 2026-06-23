@@ -40,10 +40,10 @@
     "@types/node": "^25.9.3",
     "@vitest/coverage-istanbul": "^4.1.8",
     "eslint": "^10.5.0",
-    "globals": "^17.6.0",
+    "globals": "^17.7.0",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.61.1",
+    "typescript-eslint": "^8.62.0",
     "vitest": "^4.1.9"
   },
   "//overrides_rationale": "node-domexception@1.0.0 is deprecated upstream and has no replacement version. fetch-blob@3.x and 4.x both still declare it as a hard dep. We override to a local stub that re-exports globalThis.DOMException (native in Node 18+). Remove this override + the stubs/ directory once mediasoup ships a release pulling node-fetch@^4 stable, OR fetch-blob ships a version that drops the polyfill dep entirely.",
