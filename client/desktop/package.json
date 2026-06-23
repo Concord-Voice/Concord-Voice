@@ -42,7 +42,7 @@
     "hash-wasm": "^4.12.0",
     "jose": "6.2.3",
     "lowlight": "^3.3.0",
-    "lucide-react": "^1.20.0",
+    "lucide-react": "^1.21.0",
     "mediasoup-client": "^3.21.0",
     "minisearch": "^7.2.0",
     "qrcode": "^1.5.4",
