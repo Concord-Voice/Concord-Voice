@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor } from '../../../test-utils';
 import userEvent from '@testing-library/user-event';
-import AttachmentDisplay from '@/renderer/components/Chat/AttachmentDisplay';
+import AttachmentDisplay, { extFromMime } from '@/renderer/components/Chat/AttachmentDisplay';
 import type { AttachmentSummary } from '@/renderer/types/chat';
 import { mockAttachment, mockAttachment2 } from '../../../mocks/fixtures';
 import { useSettingsStore } from '@/renderer/stores/settingsStore';
@@ -143,6 +143,95 @@ describe('AttachmentDisplay', () => {
     await waitFor(() => {
       expect(screen.getByText('Failed to load image')).toBeInTheDocument();
     });
+  });
+
+  // --- Image lightbox + right-click save (#1729) ---
+  async function renderLoadedImage(id: string) {
+    mockFetchSuccess(new ArrayBuffer(64), 'image/png');
+    installImmediateIO();
+    const img: AttachmentSummary = { ...mockAttachment, id, mime_type: 'image/png' };
+    const utils = render(<AttachmentDisplay attachments={[img]} channelId="ch-1" />);
+    const el = await waitFor(() => {
+      const node = utils.container.querySelector('img.attachment-image');
+      expect(node).toBeInTheDocument();
+      return node as HTMLImageElement;
+    });
+    return { ...utils, img: el, id };
+  }
+
+  it('opens the lightbox on image click and Escape closes it (#1729)', async () => {
+    const { img } = await renderLoadedImage('img-click');
+    expect(screen.queryByRole('dialog', { name: 'Image viewer' })).not.toBeInTheDocument();
+    fireEvent.click(img);
+    expect(screen.getByRole('dialog', { name: 'Image viewer' })).toBeInTheDocument();
+    // Escape routes back through the wiring's onClose → unmounts the lightbox.
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('dialog', { name: 'Image viewer' })).not.toBeInTheDocument();
+  });
+
+  it('exposes the image open trigger as a real <button> (keyboard-accessible) (#1729 a11y)', async () => {
+    await renderLoadedImage('img-key');
+    // A native <button> wraps the image, so Enter/Space activation is built in
+    // (no role/keydown shim on the non-interactive <img>).
+    expect(screen.getByRole('button', { name: 'Open image in viewer' })).toBeInTheDocument();
+  });
+
+  it('right-click opens a menu with Open + Save image (#1729)', async () => {
+    const { img } = await renderLoadedImage('img-ctx');
+    fireEvent.contextMenu(img);
+    expect(screen.getByText('Open')).toBeInTheDocument();
+    expect(screen.getByText('Save image…')).toBeInTheDocument();
+  });
+
+  it('right-click Open launches the lightbox', async () => {
+    const { img } = await renderLoadedImage('img-ctx-open');
+    fireEvent.contextMenu(img);
+    fireEvent.click(screen.getByText('Open'));
+    expect(screen.getByRole('dialog', { name: 'Image viewer' })).toBeInTheDocument();
+  });
+
+  it('Save image hands the decrypted bytes to the native Save-As IPC', async () => {
+    const saveImageAs = vi.fn().mockResolvedValue({ ok: true });
+    // window.electron is defined non-configurable (writable:true) in setup.ts, so
+    // assign directly rather than vi.stubGlobal (which redefines → throws here).
+    const origElectron = window.electron;
+    window.electron = { ...origElectron, saveImageAs } as typeof window.electron;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) })
+    );
+    try {
+      const { img, id } = await renderLoadedImage('img-save');
+      fireEvent.contextMenu(img);
+      fireEvent.click(screen.getByText('Save image…'));
+      await waitFor(() => {
+        expect(saveImageAs).toHaveBeenCalledWith(
+          expect.any(ArrayBuffer),
+          expect.stringContaining(`image-${id}`)
+        );
+      });
+    } finally {
+      window.electron = origElectron;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('swallows a Save failure when the blob fetch rejects (no crash)', async () => {
+    const saveImageAs = vi.fn();
+    const origElectron = window.electron;
+    window.electron = { ...origElectron, saveImageAs } as typeof window.electron;
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('blob gone')));
+    try {
+      const { img } = await renderLoadedImage('img-save-fail');
+      fireEvent.contextMenu(img);
+      fireEvent.click(screen.getByText('Save image…'));
+      // The rejection is caught in handleSaveImage; saveImageAs is never reached.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(saveImageAs).not.toHaveBeenCalled();
+    } finally {
+      window.electron = origElectron;
+      vi.unstubAllGlobals();
+    }
   });
 
   // --- File attachments ---
@@ -571,5 +660,22 @@ describe('AttachmentDisplay text/markdown dispatch', () => {
     // Generic file chip rendered — overflow component NOT mounted
     expect(screen.queryByTestId('overflow-md')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /download/i })).toBeInTheDocument();
+  });
+});
+
+describe('extFromMime (#1729 Save-As default name)', () => {
+  it('maps known image MIME types to extensions', () => {
+    expect(extFromMime('image/png')).toBe('.png');
+    expect(extFromMime('image/jpeg')).toBe('.jpg');
+    expect(extFromMime('image/gif')).toBe('.gif');
+    expect(extFromMime('image/webp')).toBe('.webp');
+    expect(extFromMime('image/avif')).toBe('.avif');
+    expect(extFromMime('image/svg+xml')).toBe('.svg');
+  });
+
+  it('returns "" for unmapped or absent MIME types', () => {
+    expect(extFromMime('application/pdf')).toBe('');
+    expect(extFromMime('')).toBe('');
+    expect(extFromMime(undefined)).toBe('');
   });
 });

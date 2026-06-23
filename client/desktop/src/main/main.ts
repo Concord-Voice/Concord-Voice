@@ -2,6 +2,7 @@
 // capture app.getPath('userData') at module-load time. See pinUserDataPath.ts.
 import './pinUserDataPath';
 import { registerOpenExternalHandler } from './ipc/openExternal';
+import { registerSaveImageHandler } from './ipc/saveImage';
 import { registerSSOIPC } from './ipc/sso';
 import { cancelActiveAppleFlow } from './oauth/apple/appleFlow';
 import { cancelActiveGoogleFlow } from './oauth/google/googleFlow';
@@ -532,6 +533,9 @@ app.whenReady().then(async () => {
   }
 
   registerOpenExternalHandler(getRemoteSpaBaseUrl);
+  // #1729 — native Save-As for decrypted image attachments. Lazy window provider
+  // (mirrors registerPermissionHandlers) so the dialog parents to the live window.
+  registerSaveImageHandler(() => mainWindow, getRemoteSpaBaseUrl);
   registerSSOIPC(getRemoteSpaBaseUrl);
   registerAttestationIpc(getRemoteSpaBaseUrl);
   // Permission request handler: explicitly allow app-required permissions, deny risky ones.

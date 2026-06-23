@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Download, FileText, Film, Music, File, Loader2 } from 'lucide-react';
+import { Download, FileText, Film, Music, File, Loader2, Maximize2 } from 'lucide-react';
 import { apiFetch } from '../../services/apiClient';
 import { e2eeService } from '../../services/e2eeService';
 import { decryptFile, formatFileSize } from '../../utils/attachmentCrypto';
@@ -7,6 +7,8 @@ import type { AttachmentSummary } from '../../types/chat';
 import { useSettingsStore } from '../../stores/settingsStore';
 import OverflowMarkdownAttachment from './OverflowMarkdownAttachment';
 import ThemedMediaPlayer from './ThemedMediaPlayer';
+import ImageLightbox from './ImageLightbox';
+import ContextMenu from '../ui/ContextMenu';
 import './AttachmentDisplay.css';
 
 interface AttachmentDisplayProps {
@@ -96,6 +98,21 @@ function clampAttachmentSize(
   return { width: Math.round(w * ratio), height: Math.round(h * ratio) };
 }
 
+/** Image MIME → file extension for the Save-As default filename. */
+const IMAGE_EXT: Readonly<Record<string, string>> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'image/avif': '.avif',
+  'image/svg+xml': '.svg',
+};
+
+/** Returns the extension for an image MIME type, or '' when unmapped/absent. */
+export function extFromMime(mime: string | undefined): string {
+  return (mime && IMAGE_EXT[mime]) || '';
+}
+
 function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
   const reduceAnimations = useSettingsStore((s) => s.appearance.reduceAnimations);
   // Animated GIF attachments under Reduce Animations play only on hover/focus.
@@ -112,6 +129,27 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
   const [naturalRatio, setNaturalRatio] = useState<number | null>(null);
   const observerRef = useRef<IntersectionObserver | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
+
+  // Save the decrypted image to disk via the native Save-As dialog (#1729).
+  // The blob is already decrypted in-renderer; read its bytes and hand them to
+  // the main process, which owns the dialog + write (the renderer cannot reach
+  // a native "Save Image As…" on a blob: URL). User-cancel is a no-op success.
+  // Sync wrapper whose promise chain ends in `.catch`, so the promise is handled
+  // (not floating) without the `void` operator, and callers invoke it directly.
+  const handleSaveImage = useCallback((): void => {
+    if (!url) return;
+    fetch(url)
+      .then((r) => r.arrayBuffer())
+      .then((bytes) =>
+        globalThis.electron.saveImageAs(
+          bytes,
+          `image-${attachment.id}${extFromMime(attachment.mime_type)}`
+        )
+      )
+      .catch(() => undefined); // Non-fatal: blob read or Save-As IPC failed.
+  }, [url, attachment.id, attachment.mime_type]);
 
   const load = useCallback(async () => {
     try {
@@ -187,24 +225,63 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
       )}
       {error && <div className="attachment-error">Failed to load image</div>}
       {showLiveImage && (
-        <img
-          src={url}
-          alt={`Attachment ${attachment.id}`}
-          className="attachment-image"
-          loading="lazy"
-          onLoad={(e) => {
-            if (clamped) return;
-            const img = e.currentTarget;
-            if (img.naturalWidth && img.naturalHeight) {
-              setNaturalRatio(img.naturalWidth / img.naturalHeight);
-            }
+        <button
+          type="button"
+          className="attachment-image-btn"
+          aria-label="Open image in viewer"
+          onClick={() => setLightboxOpen(true)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setMenuPos({ x: e.clientX, y: e.clientY });
           }}
-        />
+        >
+          <img
+            src={url}
+            alt={`Attachment ${attachment.id}`}
+            className="attachment-image"
+            loading="lazy"
+            onLoad={(e) => {
+              if (clamped) return;
+              const img = e.currentTarget;
+              if (img.naturalWidth && img.naturalHeight) {
+                setNaturalRatio(img.naturalWidth / img.naturalHeight);
+              }
+            }}
+          />
+        </button>
       )}
       {gatedByHover && !hovering && !loading && !error && (
         <div className="attachment-reduced-motion-hint" aria-hidden="true">
           Hover to play
         </div>
+      )}
+      {lightboxOpen && url && (
+        <ImageLightbox
+          src={url}
+          alt={`Attachment ${attachment.id}`}
+          onClose={() => setLightboxOpen(false)}
+          onSave={handleSaveImage}
+        />
+      )}
+      {menuPos && (
+        <ContextMenu position={menuPos} onClose={() => setMenuPos(null)}>
+          <ContextMenu.Item
+            icon={<Maximize2 size={16} />}
+            label="Open"
+            onClick={() => {
+              setMenuPos(null);
+              setLightboxOpen(true);
+            }}
+          />
+          <ContextMenu.Item
+            icon={<Download size={16} />}
+            label="Save image…"
+            onClick={() => {
+              setMenuPos(null);
+              handleSaveImage();
+            }}
+          />
+        </ContextMenu>
       )}
     </div>
   );

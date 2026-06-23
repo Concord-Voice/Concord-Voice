@@ -308,6 +308,17 @@ contextBridge.exposeInMainWorld('electron', {
       reason?: 'untrusted-sender' | 'invalid-protocol' | 'invalid-url';
     }>,
 
+  // Save a decrypted image attachment to disk via a native Save-As dialog
+  // (#1729). An E2EE attachment is decrypted only in the renderer (a blob URL),
+  // so the bytes are passed to the main process, which enforces sender-frame
+  // validation, a size cap, filename sanitisation, and a user-chosen path.
+  saveImageAs: (bytes: ArrayBuffer, suggestedName: string) =>
+    ipcRenderer.invoke('image:saveAs', bytes, suggestedName) as Promise<{
+      ok: boolean;
+      canceled?: boolean;
+      reason?: 'untrusted-sender' | 'invalid-args' | 'too-large' | 'write-failed';
+    }>,
+
   // SSO loopback HTTP server bridge (#270, extended for Apple in #271): main
   // process owns a 127.0.0.1 ephemeral-port server that captures the OAuth
   // callback. Renderer drives the provider redirect via the system browser
@@ -557,6 +568,16 @@ export interface ElectronAPI {
   openExternal: (url: string) => Promise<{
     ok: boolean;
     reason?: 'untrusted-sender' | 'invalid-protocol' | 'invalid-url';
+  }>;
+
+  // Save a decrypted image attachment to disk via a native Save-As dialog (#1729).
+  saveImageAs: (
+    bytes: ArrayBuffer,
+    suggestedName: string
+  ) => Promise<{
+    ok: boolean;
+    canceled?: boolean;
+    reason?: 'untrusted-sender' | 'invalid-args' | 'too-large' | 'write-failed';
   }>;
 
   // SSO loopback HTTP server bridge (#270, extended for Apple in #271)
