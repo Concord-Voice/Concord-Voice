@@ -37,6 +37,10 @@ export function buildBrowserWindowConfig(
     return { ...base, titleBarStyle: 'hiddenInset' };
   }
 
+  if (input.platform === 'linux' && input.isWayland) {
+    return base;
+  }
+
   const overlay = { ...DEFAULT_OVERLAY, ...input.titleBarOverlay };
   return {
     ...base,

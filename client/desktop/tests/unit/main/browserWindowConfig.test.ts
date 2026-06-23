@@ -35,15 +35,15 @@ describe('buildBrowserWindowConfig', () => {
     expect(config.titleBarOverlay).toEqual(expect.objectContaining({ height: 32 }));
   });
 
-  it('returns hidden + titleBarOverlay for linux (Wayland) — same as X11', () => {
+  it('returns standard framed chrome for linux (Wayland)', () => {
     const config = buildBrowserWindowConfig({
       platform: 'linux',
       isWayland: true,
       preloadPath: '/path/to/preload.js',
       isPackaged: true,
     });
-    expect(config.titleBarStyle).toBe('hidden');
-    expect(config.titleBarOverlay).toBeDefined();
+    expect(config.titleBarStyle).toBeUndefined();
+    expect(config.titleBarOverlay).toBeUndefined();
   });
 
   it('preserves common keys across all platforms', () => {

@@ -184,7 +184,11 @@ vi.mock('../../../src/main/updateSafety', () => ({
   runDeferredCleanup: vi.fn(() => Promise.resolve()),
 }));
 vi.mock('../../../src/main/userDataMigration', () => ({ migrateUserData: vi.fn() }));
-vi.mock('../../../src/main/splashWindow', () => ({ showSplash: vi.fn(), closeSplash: vi.fn() }));
+vi.mock('../../../src/main/splashWindow', () => ({
+  showSplash: vi.fn(),
+  closeSplash: vi.fn(),
+  updateSplashError: vi.fn(),
+}));
 vi.mock('../../../src/main/spaLoader', () => ({
   resolveSpaSource: vi.fn(() => Promise.resolve({ mode: 'bundled', reason: 'test' })),
 }));

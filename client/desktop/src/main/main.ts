@@ -10,6 +10,7 @@ import { registerWindowControlsIpc, getCachedClientBehavior } from './ipc/window
 import { initTray, destroyTray, isTrayActive } from './tray';
 import { registerVersionInfoIpc } from './ipc/versionInfo';
 import { buildBrowserWindowConfig } from './browserWindowConfig';
+import { revealLoadFailure } from './loadFailureVisibility';
 import { loadWindowState, attachWindowState } from './windowState';
 import { isWayland } from './waylandDetect';
 import { deriveCloseAction, deriveMinimizeAction } from '../shared/clientBehavior';
@@ -253,7 +254,7 @@ async function applySpaDecision(
     await captureSpaHash('bundled');
   } catch (err) {
     console.error('[SpaLoader] bundled app:// loadURL failed:', (err as Error).message);
-    updateSplashError('Could not load application — please reinstall');
+    revealLoadFailure(window, 'Could not load application — please reinstall');
   }
   return 'bundled';
 }
@@ -1230,6 +1231,9 @@ app.on('web-contents-created', (_, contents) => {
         remoteSpaBaseUrl: getRemoteSpaBaseUrl(),
         remoteSpaBaseDir: getRemoteSpaBaseDir(),
       });
+      if (isMainFrame && validatedURL === 'app://concord/index.html' && errorCode !== -3) {
+        revealLoadFailure(mainWindow, 'Could not load application — please reinstall');
+      }
     }
   );
 });

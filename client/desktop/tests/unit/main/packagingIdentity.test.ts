@@ -15,6 +15,7 @@ import path from 'node:path';
 // ── Constants ────────────────────────────────────────────────────────────
 
 const EXPECTED_DISPLAY_NAME = 'Concord Voice';
+const LINUX_ICON_SIZES = ['128x128', '256x256', '512x512'] as const;
 
 // ── Load configs ─────────────────────────────────────────────────────────
 
@@ -98,6 +99,16 @@ function getMakerOptions(config: any, platform: string) {
     }
   }
   return null;
+}
+
+function expectLinuxIconConfig(icon: unknown) {
+  expect(icon).toEqual(
+    expect.objectContaining({
+      '128x128': './build/icons/128x128.png',
+      '256x256': './build/icons/256x256.png',
+      '512x512': './build/icons/512x512.png',
+    })
+  );
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -317,6 +328,12 @@ describe('Packaging Identity (#382)', () => {
       const deb = getMakerOptions(config, 'Deb');
       expect(deb.section).toBeTruthy();
     });
+
+    it('uses hicolor icon sizes instead of a pixmap-only string', async () => {
+      const config = await loadForgeConfig();
+      const deb = getMakerOptions(config, 'Deb');
+      expectLinuxIconConfig(deb.icon);
+    });
   });
 
   describe('forge.config.ts — MakerRpm (Linux .rpm)', () => {
@@ -363,6 +380,12 @@ describe('Packaging Identity (#382)', () => {
       const rpm = getMakerOptions(config, 'Rpm');
       expect(rpm.group).toBeTruthy();
     });
+
+    it('uses hicolor icon sizes instead of a pixmap-only string', async () => {
+      const config = await loadForgeConfig();
+      const rpm = getMakerOptions(config, 'Rpm');
+      expectLinuxIconConfig(rpm.icon);
+    });
   });
 
   describe('forge.config.ts — MakerAppImage (Linux AppImage)', () => {
@@ -379,6 +402,12 @@ describe('Packaging Identity (#382)', () => {
       const appImage = getMakerOptions(config, 'AppImage');
       expect(appImage.productName).toBe(EXPECTED_DISPLAY_NAME);
     });
+
+    it('uses hicolor icon sizes instead of a pixmap-only string', async () => {
+      const config = await loadForgeConfig();
+      const appImage = getMakerOptions(config, 'AppImage');
+      expectLinuxIconConfig(appImage.icon);
+    });
   });
 
   describe('icon files', () => {
@@ -392,6 +421,10 @@ describe('Packaging Identity (#382)', () => {
 
     it('icon.png exists (Linux)', () => {
       expect(fs.existsSync(path.join(desktopRoot, 'build', 'icon.png'))).toBe(true);
+    });
+
+    it.each(LINUX_ICON_SIZES)('%s hicolor source exists (Linux)', (size) => {
+      expect(fs.existsSync(path.join(desktopRoot, 'build', 'icons', `${size}.png`))).toBe(true);
     });
 
     it('splash.gif exists (Windows installer splash)', () => {

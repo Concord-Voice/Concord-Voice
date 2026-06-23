@@ -108,6 +108,27 @@ npm run make
 
 This will create platform-specific installers in the `out/` directory.
 
+### Linux packages
+
+Install the Debian package from the directory containing the downloaded file:
+
+```bash
+sudo apt install ./concord-voice_<version>_linux-x64.deb
+```
+
+If apt prints a note like `Download is performed unsandboxed as root ... couldn't be accessed by user '_apt'`, that is informational when `Setting up concord-voice (...)` completes. It means apt's sandbox user could not read the local file path, not that the package failed to install.
+
+After install, the launcher entry should appear as **Concord Voice** with the Concord icon. If a desktop environment does not refresh its menu immediately, log out/in or run the desktop's menu refresh command.
+
+The AppImage is the fallback when a DEB/RPM install is not desirable:
+
+```bash
+chmod +x ConcordVoice-<version>-linux-x64.AppImage
+./ConcordVoice-<version>-linux-x64.AppImage
+```
+
+Do not launch packaged Linux builds with `--no-sandbox`. Electron's `chrome-sandbox` helper is expected to ship with SUID mode `4755`; the CI package verifier checks this for DEB and RPM artifacts.
+
 ### Google SSO build constant (`GOOGLE_OAUTH_CLIENT_SECRET_DESKTOP`)
 
 Google Sign-In uses a client-driven PKCE exchange (#975): the desktop main

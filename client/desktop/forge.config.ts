@@ -104,9 +104,15 @@ if (fs.existsSync('./googleClientSecret.json')) {
 } else if (process.env.CI === 'true' && process.env.GOOGLE_SSO_DESKTOP_REQUIRED === 'true') {
   throw new Error(
     'forge.config.ts: googleClientSecret.json missing in CI packaging with GOOGLE_SSO_DESKTOP_REQUIRED=true. ' +
-      'Run `npm run build:gclientsecret` before forge make/package (see build-desktop.yml).',
+      'Run `npm run build:gclientsecret` before forge make/package (see build-desktop.yml).'
   );
 }
+
+const LINUX_ICON_CONFIG = {
+  '128x128': './build/icons/128x128.png',
+  '256x256': './build/icons/256x256.png',
+  '512x512': './build/icons/512x512.png',
+};
 
 const config: ForgeConfig = {
   packagerConfig: {
@@ -214,7 +220,9 @@ const config: ForgeConfig = {
         homepage: 'https://concordvoice.com',
         section: 'net',
         categories: ['Network', 'Chat'],
-        icon: './build/icon.png',
+        // Object form is load-bearing: electron-installer-common writes
+        // hicolor theme icons only for resolution-keyed icon configs.
+        icon: LINUX_ICON_CONFIG,
       },
     }),
     new MakerRpm({
@@ -229,7 +237,7 @@ const config: ForgeConfig = {
         license: 'LicenseRef-CVSL-1.0',
         group: 'Applications/Communications',
         categories: ['Network', 'Chat'],
-        icon: './build/icon.png',
+        icon: LINUX_ICON_CONFIG,
       },
     }),
     new MakerAppImage({
@@ -237,7 +245,7 @@ const config: ForgeConfig = {
         bin: 'concord-voice',
         productName: 'Concord Voice',
         categories: ['Network', 'Chat'],
-        icon: './build/icon.png',
+        icon: LINUX_ICON_CONFIG,
       },
     }),
   ],

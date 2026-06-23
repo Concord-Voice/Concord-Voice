@@ -39,6 +39,9 @@ const { mockCancelAppleFlow, mockCancelGoogleFlow } = vi.hoisted(() => ({
   mockCancelAppleFlow: vi.fn(),
   mockCancelGoogleFlow: vi.fn(),
 }));
+const { mockRevealLoadFailure } = vi.hoisted(() => ({
+  mockRevealLoadFailure: vi.fn(),
+}));
 vi.mock('../../../src/main/oauth/apple/appleFlow', () => ({
   cancelActiveAppleFlow: mockCancelAppleFlow,
   runAppleSignIn: vi.fn(),
@@ -217,6 +220,11 @@ vi.mock('../../../src/main/userDataMigration', () => ({
 vi.mock('../../../src/main/splashWindow', () => ({
   showSplash: vi.fn(),
   closeSplash: vi.fn(),
+  updateSplashError: vi.fn(),
+}));
+
+vi.mock('../../../src/main/loadFailureVisibility', () => ({
+  revealLoadFailure: mockRevealLoadFailure,
 }));
 
 vi.mock('../../../src/main/spaLoader', () => ({
@@ -1248,6 +1256,38 @@ describe('main.ts', () => {
         newerBytesAvailable: null,
         reason: 'dev mode',
       });
+    });
+  });
+
+  describe('bundled SPA load failure visibility', () => {
+    function getDidFailLoadHandler(): CallbackFn {
+      const webContentsCreated = appOnCallbacks.get('web-contents-created');
+      expect(webContentsCreated).toBeDefined();
+      const mockContents = { on: vi.fn() };
+      webContentsCreated!({}, mockContents);
+
+      const call = mockContents.on.mock.calls.find(([event]) => event === 'did-fail-load');
+      expect(call).toBeTruthy();
+      return call![1] as CallbackFn;
+    }
+
+    it('reveals a real main-frame bundled app load failure', () => {
+      mockRevealLoadFailure.mockClear();
+
+      getDidFailLoadHandler()({}, -6, 'ERR_FILE_NOT_FOUND', 'app://concord/index.html', true);
+
+      expect(mockRevealLoadFailure).toHaveBeenCalledOnce();
+      expect(mockRevealLoadFailure.mock.calls[0]?.[1]).toBe(
+        'Could not load application — please reinstall'
+      );
+    });
+
+    it('does not reveal ERR_ABORTED app:// failures', () => {
+      mockRevealLoadFailure.mockClear();
+
+      getDidFailLoadHandler()({}, -3, 'ERR_ABORTED', 'app://concord/index.html', true);
+
+      expect(mockRevealLoadFailure).not.toHaveBeenCalled();
     });
   });
 });
