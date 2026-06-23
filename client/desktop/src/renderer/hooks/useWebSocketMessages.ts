@@ -1276,10 +1276,6 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       // quiet, not advance its preview behind the user's back.
       if (isDMMuted(conversationId)) return;
 
-      useDMStore.getState().incrementUnread(conversationId);
-      if (isDMMentioned) {
-        useUnreadStore.getState().incrementMention(conversationId);
-      }
       // Also update last message preview if provided
       if (data.last_message) {
         useDMStore.getState().updateLastMessage(conversationId, {
@@ -1288,6 +1284,17 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
           username: data.last_message.username || '',
           createdAt: data.last_message.created_at || new Date().toISOString(),
         });
+      }
+
+      if (conversationId === useDMStore.getState().activeConversationId) {
+        useDMStore.getState().clearUnread(conversationId);
+        useUnreadStore.getState().clearUnread(conversationId);
+        return;
+      }
+
+      useDMStore.getState().incrementUnread(conversationId);
+      if (isDMMentioned) {
+        useUnreadStore.getState().incrementMention(conversationId);
       }
 
       // Notification sound for unfocused DM messages

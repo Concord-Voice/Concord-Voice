@@ -24,7 +24,7 @@
   max-width: calc(100vw - 48px);
   max-height: calc(100vh - 48px);
   background: var(--bg-secondary);
-  color: var(--text-normal);
+  color: var(--text-primary);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
   overflow: hidden;
@@ -57,12 +57,281 @@
 }
 
 .category-manager-close-btn:hover {
-  color: var(--text-normal);
-  background: var(--bg-modifier-hover);
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.category-manager .roles-layout {
+  display: flex;
+  gap: 16px;
+  min-height: 360px;
+  padding: 16px;
+}
+
+.category-manager .roles-list {
+  display: flex;
+  flex: 0 0 200px;
+  flex-direction: column;
+  gap: 4px;
+  padding-right: 16px;
+  border-right: 1px solid var(--border-color);
+}
+
+.category-manager .role-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 36px;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.category-manager .role-item:hover {
+  background: var(--bg-hover);
+}
+
+.category-manager .role-item.selected {
+  background: var(--bg-tertiary);
+  box-shadow: inset 3px 0 0 var(--state-selected);
+}
+
+.category-manager .role-color-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 1px var(--border-color);
 }
 
 .category-item-emoji {
   margin-right: 4px;
+}
+
+.category-manager .create-role-btn {
+  min-height: 36px;
+  margin-top: 8px;
+  padding: 8px 12px;
+  border: 1px dashed var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.category-manager .create-role-btn:hover {
+  border-color: var(--accent-primary);
+  background: var(--bg-hover);
+  color: var(--accent-primary);
+}
+
+.category-manager .role-editor {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 16px;
+  overflow-y: auto;
+}
+
+.category-manager .form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+.category-manager .form-label {
+  color: var(--text-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.category-manager .form-input {
+  width: 100%;
+  min-height: 36px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-body-stack);
+  font-size: calc(14px * var(--font-scale, 1));
+  transition:
+    border-color 0.15s ease,
+    background-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.category-manager .form-input:focus {
+  outline: none;
+  border-color: var(--state-focused);
+  background: var(--bg-secondary);
+}
+
+.category-manager .form-input:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--state-focused) 15%, transparent);
+}
+
+.category-manager .emoji-input-wrapper {
+  position: relative;
+}
+
+.category-manager .emoji-input-container {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.category-manager .emoji-picker-button {
+  display: flex;
+  align-items: center;
+  min-height: 38px;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.category-manager .emoji-picker-button:hover {
+  border-color: var(--accent-primary);
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.category-manager .emoji-picker-button.has-emoji {
+  color: var(--text-primary);
+}
+
+.category-manager .emoji-picker-button-emoji {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.category-manager .emoji-picker-button-placeholder {
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+.category-manager .emoji-clear-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.category-manager .emoji-clear-btn:hover {
+  border-color: var(--danger);
+  background: var(--bg-hover);
+  color: var(--danger);
+}
+
+.category-manager .emoji-picker-container {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 2;
+  margin-top: 8px;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.category-manager .channel-form-hint {
+  color: var(--text-tertiary);
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.4;
+}
+
+.category-manager .role-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-color);
+}
+
+.category-manager .server-settings-cancel-btn {
+  padding: 8px 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.category-manager .server-settings-cancel-btn:hover {
+  border-color: var(--danger);
+  background: var(--bg-hover);
+  color: var(--danger);
+}
+
+.category-manager .server-settings-submit-btn {
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--gradient-brand);
+  color: var(--bg-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    filter 0.15s ease,
+    transform 0.15s ease;
+}
+
+.category-manager .server-settings-submit-btn:hover {
+  filter: brightness(1.05);
+  transform: translateY(-1px);
+}
+
+.category-manager .server-settings-submit-btn:active {
+  transform: translateY(0);
 }
 
 .category-manager-empty {
@@ -122,4 +391,27 @@
 
 .category-delete-confirm-btn:hover {
   background: var(--button-danger-background-hover, #c03537);
+}
+
+@media (max-width: 640px) {
+  .category-manager {
+    width: calc(100vw - 24px);
+    max-width: calc(100vw - 24px);
+  }
+
+  .category-manager .roles-layout {
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .category-manager .roles-list {
+    flex-basis: auto;
+    width: 100%;
+    max-height: 180px;
+    padding-right: 0;
+    padding-bottom: 12px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-color);
+    overflow-y: auto;
+  }
 }

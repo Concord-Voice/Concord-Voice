@@ -3,7 +3,7 @@ import { useVoiceStore } from '../../stores/voiceStore';
 import { useUserStore } from '../../stores/userStore';
 import { useAudioSettingsStore } from '../../stores/audioSettingsStore';
 import ParticipantTile from './ParticipantTile';
-import { useVoiceMagnification } from './useVoiceMagnification';
+import { VOICE_MAX_SCALE, useVoiceMagnification } from './useVoiceMagnification';
 import { useGridLayout } from '../../hooks/useGridLayout';
 import { errorMessage } from '../../utils/redactError';
 import './ParticipantGrid.css';
@@ -339,10 +339,14 @@ export const UserFrameGrid: React.FC = () => {
   const scales = useVoiceMagnification(participants);
   const gridRef = useRef<HTMLDivElement>(null);
   const hasAnyVideo = participantList.some((p) => p.isVideoOn);
+  const reservedScale = VOICE_MAX_SCALE;
   const { tileWidth, tileHeight } = useGridLayout(gridRef, participantList.length, {
     aspectRatio: hasAnyVideo ? 16 / 9 : 1,
     maxTileWidth: 320,
+    scale: reservedScale,
   });
+  const tileSlotWidth = tileWidth * reservedScale;
+  const tileSlotHeight = tileHeight * reservedScale;
 
   return (
     <div
@@ -350,19 +354,25 @@ export const UserFrameGrid: React.FC = () => {
       className="user-frame-grid"
       style={
         {
+          '--tile-slot-w': `${tileSlotWidth}px`,
+          '--tile-slot-h': `${tileSlotHeight}px`,
           '--tile-w': `${tileWidth}px`,
           '--tile-h': `${tileHeight}px`,
         } as React.CSSProperties
       }
     >
-      {participantList.map((p) => (
-        <ParticipantTile
-          key={p.userId}
-          participant={p}
-          isLocal={p.userId === localUserId}
-          magnificationScale={scales[p.userId]}
-        />
-      ))}
+      {participantList.map((p) => {
+        const scale = scales[p.userId] ?? 1;
+        return (
+          <div key={p.userId} className="user-frame-grid__slot">
+            <ParticipantTile
+              participant={p}
+              isLocal={p.userId === localUserId}
+              magnificationScale={scale}
+            />
+          </div>
+        );
+      })}
     </div>
   );
 };

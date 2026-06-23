@@ -13,6 +13,7 @@ vi.mock('@/renderer/components/Voice/ParticipantTile', () => ({
 }));
 
 vi.mock('@/renderer/components/Voice/useVoiceMagnification', () => ({
+  VOICE_MAX_SCALE: 1.12,
   useVoiceMagnification: () => ({}),
 }));
 

@@ -17,6 +17,19 @@ interface GridLayoutOptions {
   minTileWidth?: number;
   /** Maximum tile width in px (default: none). Clamps oversized tiles (e.g. single-user). */
   maxTileWidth?: number;
+  /** Visual scale to reserve around each tile, for transform-based growth. */
+  scale?: number;
+}
+
+interface FallbackLayoutInput {
+  containerWidth: number;
+  containerHeight: number;
+  count: number;
+  aspectRatio: number;
+  gap: number;
+  padding: number;
+  scale: number;
+  maxTileWidth?: number;
 }
 
 const DEFAULT_ASPECT_RATIO = 16 / 9;
@@ -33,22 +46,16 @@ function clampTile(tileW: number, tileH: number, aspectRatio: number, maxTileWid
 }
 
 /** Fallback layout when container is too small for minTileWidth. */
-function computeFallbackLayout(
-  containerWidth: number,
-  containerHeight: number,
-  count: number,
-  aspectRatio: number,
-  gap: number,
-  padding: number,
-  maxTileWidth?: number
-): GridLayout {
+function computeFallbackLayout(input: FallbackLayoutInput): GridLayout {
+  const { containerWidth, containerHeight, count, aspectRatio, gap, padding, scale, maxTileWidth } =
+    input;
   const rows = count; // single column
   const availW = Math.max(1, containerWidth - 2 * padding);
   const availH = Math.max(1, containerHeight - 2 * padding - (rows - 1) * gap);
-  let tileW = availW;
+  let tileW = availW / scale;
   let tileH = tileW / aspectRatio;
-  if (tileH * rows > availH) {
-    tileH = availH / rows;
+  if (tileH * rows * scale > availH) {
+    tileH = availH / rows / scale;
     tileW = tileH * aspectRatio;
   }
   const clamped = clampTile(tileW, tileH, aspectRatio, maxTileWidth);
@@ -78,7 +85,9 @@ export function computeGridLayout(
     padding = DEFAULT_PADDING,
     minTileWidth = DEFAULT_MIN_TILE_WIDTH,
     maxTileWidth,
+    scale = 1,
   } = options;
+  const reservedScale = Math.max(1, scale);
 
   if (count <= 0) return { tileWidth: 0, tileHeight: 0, columns: 0 };
 
@@ -102,12 +111,12 @@ export function computeGridLayout(
 
     if (availW <= 0 || availH <= 0) continue;
 
-    let tileW = availW / cols;
+    let tileW = availW / cols / reservedScale;
     let tileH = tileW / aspectRatio;
 
     // If tiles overflow vertically, constrain by height instead
-    if (tileH * rows > availH) {
-      tileH = availH / rows;
+    if (tileH * rows * reservedScale > availH) {
+      tileH = availH / rows / reservedScale;
       tileW = tileH * aspectRatio;
     }
 
@@ -125,15 +134,16 @@ export function computeGridLayout(
 
   // Fallback: container too small for minTileWidth — allow smaller tiles to avoid overflow
   if (bestArea === 0) {
-    return computeFallbackLayout(
+    return computeFallbackLayout({
       containerWidth,
       containerHeight,
       count,
       aspectRatio,
       gap,
       padding,
-      maxTileWidth
-    );
+      scale: reservedScale,
+      maxTileWidth,
+    });
   }
 
   return bestLayout;
@@ -154,6 +164,7 @@ export function useGridLayout(
     padding = DEFAULT_PADDING,
     minTileWidth = DEFAULT_MIN_TILE_WIDTH,
     maxTileWidth,
+    scale = 1,
   } = options;
 
   const [dimensions, setDimensions] = useState<{ width: number; height: number }>({
@@ -187,6 +198,7 @@ export function useGridLayout(
         padding,
         minTileWidth,
         maxTileWidth,
+        scale,
       }),
     [
       dimensions.width,
@@ -197,6 +209,7 @@ export function useGridLayout(
       padding,
       minTileWidth,
       maxTileWidth,
+      scale,
     ]
   );
 }

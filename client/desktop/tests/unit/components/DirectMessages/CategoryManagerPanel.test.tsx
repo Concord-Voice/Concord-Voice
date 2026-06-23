@@ -2,6 +2,8 @@ import { render, screen, fireEvent, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
 import { vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 // Mock the lazy emoji picker (same shape the RoleEditorPanel suite uses).
 vi.mock('@/renderer/components/EmojiPicker/LazyEmojiPicker', () => ({
@@ -22,6 +24,19 @@ import CategoryManagerPanel from '@/renderer/components/DirectMessages/CategoryM
 const resetFriendOrg = () =>
   useFriendOrgStore.getState()._hydrate({ v: 1, categories: [], sectionOrder: [] });
 
+const categoryManagerCss = readFileSync(
+  resolve(process.cwd(), 'src/renderer/components/DirectMessages/CategoryManagerPanel.css'),
+  'utf-8'
+);
+
+const expectLocalCssRule = (selector: string) => {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  expect(
+    categoryManagerCss,
+    `CategoryManagerPanel.css must define ${selector} because CategoryManagerPanel renders that class directly`
+  ).toMatch(new RegExp(`(?:^|\\n)${escapedSelector}\\s*\\{`));
+};
+
 describe('CategoryManagerPanel', () => {
   beforeEach(() => {
     resetAllStores();
@@ -32,6 +47,35 @@ describe('CategoryManagerPanel', () => {
   it('renders empty-state message when no category is selected', () => {
     render(<CategoryManagerPanel onClose={() => {}} />);
     expect(screen.getByText('Select a category to edit, or create a new one.')).toBeInTheDocument();
+  });
+
+  it('keeps the friend category manager styling contract local to its imported CSS', () => {
+    const localSelectors = [
+      '.category-manager .roles-layout',
+      '.category-manager .roles-list',
+      '.category-manager .role-item',
+      '.category-manager .role-item.selected',
+      '.category-manager .role-color-dot',
+      '.category-manager .create-role-btn',
+      '.category-manager .role-editor',
+      '.category-manager .form-group',
+      '.category-manager .form-label',
+      '.category-manager .form-input',
+      '.category-manager .emoji-input-wrapper',
+      '.category-manager .emoji-input-container',
+      '.category-manager .emoji-picker-button',
+      '.category-manager .emoji-picker-button-placeholder',
+      '.category-manager .emoji-clear-btn',
+      '.category-manager .emoji-picker-container',
+      '.category-manager .channel-form-hint',
+      '.category-manager .role-editor-actions',
+      '.category-manager .server-settings-cancel-btn',
+      '.category-manager .server-settings-submit-btn',
+    ];
+
+    for (const selector of localSelectors) {
+      expectLocalCssRule(selector);
+    }
   });
 
   it('creates a category from the form', () => {

@@ -13,10 +13,25 @@
   min-height: 0;
 }
 
-/* Dynamic tile sizing: dimensions set by useGridLayout hook via CSS vars */
+/* Dynamic tile sizing: dimensions set by useGridLayout hook via CSS vars.
+   Slots reserve speaking-scale growth so transformed tiles do not overlap. */
+.user-frame-grid__slot {
+  width: var(--tile-slot-w, var(--tile-w, 200px));
+  height: var(--tile-slot-h, var(--tile-h, 112px));
+  flex-shrink: 0;
+  flex-grow: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+}
+
 .user-frame-grid .participant-tile {
   width: var(--tile-w, 200px);
   height: var(--tile-h, 112px);
   flex-shrink: 0;
   flex-grow: 0;
+  margin: 0;
+  transform-origin: center;
 }

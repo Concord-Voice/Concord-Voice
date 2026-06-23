@@ -14,6 +14,8 @@ import { useConnectionStore } from '@/renderer/stores/connectionStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useFriendStore } from '@/renderer/stores/friendStore';
 import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
+import { useDMStore } from '@/renderer/stores/dmStore';
+import { useUnreadStore } from '@/renderer/stores/unreadStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel } from '../../mocks/fixtures';
 
@@ -76,6 +78,21 @@ function createMockWsService() {
     onConnectionChange: vi.fn(() => () => {}),
     disconnect: vi.fn(),
   };
+}
+
+function addDMConversation(id: string, unreadCount = 0) {
+  useDMStore.getState().addConversation({
+    id,
+    isGroup: false,
+    isPersonal: false,
+    name: null,
+    participants: [],
+    iconUrl: undefined,
+    createdBy: 'user-2',
+    lastMessage: null,
+    unreadCount,
+    createdAt: '2025-01-01T00:00:00Z',
+  });
 }
 
 beforeEach(() => {
@@ -311,6 +328,7 @@ describe('useWebSocketMessages — extended handlers', () => {
   describe('dm_unread_notify handler', () => {
     it('increments DM unread count', () => {
       const ws = createMockWsService();
+      addDMConversation('conv-1');
       renderHook(() => useWebSocketMessages(ws as never));
 
       const handler = ws.handlers.get('dm_unread_notify')!;
@@ -323,11 +341,15 @@ describe('useWebSocketMessages — extended handlers', () => {
 
       // DM store should have incremented unread
       // notificationSoundService should play dm sound
+      expect(useDMStore.getState().conversations.find((c) => c.id === 'conv-1')?.unreadCount).toBe(
+        1
+      );
       expect(notificationSoundService.play).toHaveBeenCalledWith('dm');
     });
 
     it('handles mention in DM unread', () => {
       const ws = createMockWsService();
+      addDMConversation('conv-1');
       renderHook(() => useWebSocketMessages(ws as never));
 
       const handler = ws.handlers.get('dm_unread_notify')!;
@@ -339,7 +361,39 @@ describe('useWebSocketMessages — extended handlers', () => {
       });
 
       expect(handler).toBeDefined();
+      expect(useUnreadStore.getState().mentionCounts.get('conv-1')).toBe(1);
       expect(notificationSoundService.play).toHaveBeenCalled();
+    });
+
+    it('keeps active DM unread clear while still updating the preview', () => {
+      const ws = createMockWsService();
+      addDMConversation('conv-1', 1);
+      useUnreadStore.getState().incrementMention('conv-1');
+      useDMStore.getState().setActiveConversation('conv-1');
+      renderHook(() => useWebSocketMessages(ws as never));
+
+      const handler = ws.handlers.get('dm_unread_notify')!;
+      act(() => {
+        handler({
+          type: 'dm_unread_notify',
+          data: {
+            conversation_id: 'conv-1',
+            mentioned: true,
+            last_message: {
+              content: 'Still reading this thread',
+              user_id: 'user-2',
+              username: 'alice',
+              created_at: '2025-01-01T01:00:00Z',
+            },
+          },
+        });
+      });
+
+      const conversation = useDMStore.getState().conversations.find((c) => c.id === 'conv-1');
+      expect(conversation?.unreadCount).toBe(0);
+      expect(conversation?.lastMessage?.content).toBe('Still reading this thread');
+      expect(useUnreadStore.getState().mentionCounts.get('conv-1')).toBeUndefined();
+      expect(notificationSoundService.play).not.toHaveBeenCalled();
     });
   });
 

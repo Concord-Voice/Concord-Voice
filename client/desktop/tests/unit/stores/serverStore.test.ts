@@ -3,6 +3,7 @@ import { useChannelStore } from '@/renderer/stores/channelStore';
 import { useChatStore } from '@/renderer/stores/chatStore';
 import { useUnreadStore } from '@/renderer/stores/unreadStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
+import { vi } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
 import {
   mockServer,
@@ -49,6 +50,41 @@ describe('serverStore', () => {
       server.use(http.get(`${API_BASE}/api/v1/servers`, () => HttpResponse.json({ servers: [] })));
       await useServerStore.getState().fetchServers();
       expect(useServerStore.getState().servers).toHaveLength(0);
+    });
+
+    it('preserves a restored activeServerId when the fetched server still exists', async () => {
+      useServerStore.getState().setActiveServer(mockServer.id);
+
+      await useServerStore.getState().fetchServers();
+
+      expect(useServerStore.getState().activeServerId).toBe(mockServer.id);
+    });
+
+    it('clears a restored activeServerId when the fetched server no longer exists', async () => {
+      useServerStore.getState().setActiveServer('removed-server');
+
+      await useServerStore.getState().fetchServers();
+
+      expect(useServerStore.getState().activeServerId).toBeNull();
+    });
+
+    it('waits for persisted hydration before validating the restored active server', async () => {
+      const hasHydratedSpy = vi.spyOn(useServerStore.persist, 'hasHydrated').mockReturnValue(false);
+      const rehydrateSpy = vi
+        .spyOn(useServerStore.persist, 'rehydrate')
+        .mockImplementation(async () => {
+          useServerStore.setState({ activeServerId: mockServer.id });
+        });
+
+      try {
+        await useServerStore.getState().fetchServers();
+
+        expect(rehydrateSpy).toHaveBeenCalledTimes(1);
+        expect(useServerStore.getState().activeServerId).toBe(mockServer.id);
+      } finally {
+        hasHydratedSpy.mockRestore();
+        rehydrateSpy.mockRestore();
+      }
     });
   });
 

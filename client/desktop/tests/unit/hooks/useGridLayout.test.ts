@@ -160,6 +160,24 @@ describe('computeGridLayout', () => {
     }
   });
 
+  it('reserves transform scale in the fitted tile footprint', () => {
+    const scale = 1.12;
+    const result = computeGridLayout(448, 224, 2, {
+      aspectRatio: 1,
+      gap: 0,
+      padding: 0,
+      scale,
+    });
+    const totalScaledWidth = result.columns * result.tileWidth * scale;
+    const totalScaledHeight = Math.ceil(2 / result.columns) * result.tileHeight * scale;
+
+    expect(result.columns).toBe(2);
+    expect(result.tileWidth).toBeCloseTo(200, 3);
+    expect(result.tileHeight).toBeCloseTo(200, 3);
+    expect(totalScaledWidth).toBeLessThanOrEqual(448);
+    expect(totalScaledHeight).toBeLessThanOrEqual(224);
+  });
+
   it('uses padding=0 by default (contentRect already excludes CSS padding)', () => {
     const result = computeGridLayout(400, 300, 1, { aspectRatio: AR, gap: 4 });
     expect(result.tileWidth).toBeGreaterThan(390);

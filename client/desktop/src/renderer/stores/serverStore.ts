@@ -22,7 +22,7 @@ interface ServerState {
   clearServers: () => void;
 }
 
-export const useServerStore = wrapStore(create<ServerState>()(
+const serverStore = create<ServerState>()(
   devtools(
     persist(
       (set, get) => ({
@@ -32,6 +32,10 @@ export const useServerStore = wrapStore(create<ServerState>()(
         error: null,
 
         fetchServers: async () => {
+          if (!serverStore.persist.hasHydrated()) {
+            await serverStore.persist.rehydrate();
+          }
+
           // Deduplicate concurrent fetches (e.g. multiple components mounting)
           if (get().isLoading) return;
           set({ isLoading: true, error: null });
@@ -128,4 +132,6 @@ export const useServerStore = wrapStore(create<ServerState>()(
     ),
     { name: 'ServerStore' }
   )
-));
+);
+
+export const useServerStore = wrapStore(serverStore);

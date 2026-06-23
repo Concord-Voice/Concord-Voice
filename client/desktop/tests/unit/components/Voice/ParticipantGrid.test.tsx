@@ -13,8 +13,13 @@ vi.mock('@/renderer/components/Voice/ParticipantTile', () => ({
   ),
 }));
 
+const mockVoiceMagnification = vi.hoisted(() => ({
+  scales: {} as Record<string, number>,
+}));
+
 vi.mock('@/renderer/components/Voice/useVoiceMagnification', () => ({
-  useVoiceMagnification: () => ({}),
+  VOICE_MAX_SCALE: 1.12,
+  useVoiceMagnification: () => mockVoiceMagnification.scales,
 }));
 
 const mockUseGridLayout = vi.fn(() => ({ tileWidth: 300, tileHeight: 169, columns: 3 }));
@@ -452,6 +457,8 @@ describe('UserFrameGrid', () => {
   beforeEach(() => {
     resetAllStores();
     vi.clearAllMocks();
+    mockUseGridLayout.mockReturnValue({ tileWidth: 300, tileHeight: 169, columns: 3 });
+    mockVoiceMagnification.scales = {};
     useVoiceStore.setState({ participants: {} });
     useUserStore.setState({
       user: {
@@ -528,6 +535,99 @@ describe('UserFrameGrid', () => {
     const grid = container.querySelector('.user-frame-grid') as HTMLElement;
     expect(grid.style.getPropertyValue('--tile-w')).toBe('300px');
     expect(grid.style.getPropertyValue('--tile-h')).toBe('169px');
+    expect(parseFloat(grid.style.getPropertyValue('--tile-slot-w'))).toBeCloseTo(336, 3);
+    expect(parseFloat(grid.style.getPropertyValue('--tile-slot-h'))).toBeCloseTo(189.28, 3);
+
+    const lastCall = mockUseGridLayout.mock.calls[mockUseGridLayout.mock.calls.length - 1];
+    expect(lastCall[2]).toEqual(expect.objectContaining({ scale: 1.12 }));
+  });
+
+  it('reserves active-speaker scale inside stable tile slots', () => {
+    mockUseGridLayout.mockReturnValue({ tileWidth: 200, tileHeight: 200, columns: 2 });
+    mockVoiceMagnification.scales = { u1: 1.12, u2: 1.12 };
+    useVoiceStore.setState({
+      participants: {
+        u1: {
+          userId: 'u1',
+          username: 'alice',
+          isMuted: false,
+          isDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: false,
+          isSpeaking: true,
+        },
+        u2: {
+          userId: 'u2',
+          username: 'bob',
+          isMuted: false,
+          isDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: false,
+          isSpeaking: true,
+        },
+      },
+    });
+    const { container } = render(<UserFrameGrid />);
+    const grid = container.querySelector('.user-frame-grid') as HTMLElement;
+
+    expect(container.querySelectorAll('.user-frame-grid__slot')).toHaveLength(2);
+    expect(parseFloat(grid.style.getPropertyValue('--tile-slot-w'))).toBeCloseTo(224, 3);
+    expect(parseFloat(grid.style.getPropertyValue('--tile-slot-h'))).toBeCloseTo(224, 3);
+    expect(parseFloat(grid.style.getPropertyValue('--tile-w'))).toBeCloseTo(200, 3);
+    expect(parseFloat(grid.style.getPropertyValue('--tile-h'))).toBeCloseTo(200, 3);
+
+    const lastCall = mockUseGridLayout.mock.calls[mockUseGridLayout.mock.calls.length - 1];
+    expect(lastCall[2]).toEqual(expect.objectContaining({ scale: 1.12 }));
+  });
+
+  it('reserves full speaking scale before the animation hook catches up', () => {
+    mockUseGridLayout.mockReturnValue({ tileWidth: 200, tileHeight: 200, columns: 2 });
+    useVoiceStore.setState({
+      participants: {
+        u1: {
+          userId: 'u1',
+          username: 'alice',
+          isMuted: false,
+          isDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: false,
+          isSpeaking: true,
+        },
+      },
+    });
+    const { container } = render(<UserFrameGrid />);
+    const grid = container.querySelector('.user-frame-grid') as HTMLElement;
+
+    expect(parseFloat(grid.style.getPropertyValue('--tile-w'))).toBeCloseTo(200, 3);
+    expect(parseFloat(grid.style.getPropertyValue('--tile-h'))).toBeCloseTo(200, 3);
+    expect(parseFloat(grid.style.getPropertyValue('--tile-slot-w'))).toBeCloseTo(224, 3);
+    expect(parseFloat(grid.style.getPropertyValue('--tile-slot-h'))).toBeCloseTo(224, 3);
+  });
+
+  it('keeps reserved slots at max scale during release animation', () => {
+    mockUseGridLayout.mockReturnValue({ tileWidth: 200, tileHeight: 200, columns: 2 });
+    mockVoiceMagnification.scales = { u1: 1.04 };
+    useVoiceStore.setState({
+      participants: {
+        u1: {
+          userId: 'u1',
+          username: 'alice',
+          isMuted: false,
+          isDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: false,
+          isSpeaking: false,
+        },
+      },
+    });
+    const { container } = render(<UserFrameGrid />);
+    const grid = container.querySelector('.user-frame-grid') as HTMLElement;
+
+    expect(parseFloat(grid.style.getPropertyValue('--tile-slot-w'))).toBeCloseTo(224, 3);
+    expect(parseFloat(grid.style.getPropertyValue('--tile-slot-h'))).toBeCloseTo(224, 3);
+
+    const lastCall = mockUseGridLayout.mock.calls[mockUseGridLayout.mock.calls.length - 1];
+    expect(lastCall[2]).toEqual(expect.objectContaining({ scale: 1.12 }));
   });
 
   it('attaches a ref to the grid container element', () => {
