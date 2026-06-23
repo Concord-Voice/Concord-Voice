@@ -209,6 +209,29 @@ describe('ContextMenuProvider', () => {
     expect(preventSpy).toHaveBeenCalled();
   });
 
+  it('does not show a global menu when a component already handled contextmenu', () => {
+    render(
+      <ContextMenuProvider>
+        <div data-context-area="members">
+          <button
+            type="button"
+            data-testid="friend-row"
+            onContextMenu={(event) => {
+              event.preventDefault();
+            }}
+          >
+            Friend
+          </button>
+        </div>
+      </ContextMenuProvider>
+    );
+
+    fireEvent.contextMenu(screen.getByTestId('friend-row'));
+
+    expect(screen.queryByText('Copy Server ID')).not.toBeInTheDocument();
+    expect(document.querySelector('.ctx-menu')).not.toBeInTheDocument();
+  });
+
   it('shows link context menu for anchor elements', () => {
     render(
       <ContextMenuProvider>

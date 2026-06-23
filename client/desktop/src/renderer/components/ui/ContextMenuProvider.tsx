@@ -295,6 +295,8 @@ const ContextMenuProvider: React.FC<ContextMenuProviderProps> = ({ children }) =
   const [menu, setMenu] = useState<MenuState | null>(null);
 
   const handleContextMenu = useCallback((e: MouseEvent) => {
+    if (e.defaultPrevented) return;
+
     // Always prevent the browser/Electron default context menu
     e.preventDefault();
 
