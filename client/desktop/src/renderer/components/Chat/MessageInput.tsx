@@ -83,6 +83,7 @@ async function tryUploadAttachments(
   channelId: string,
   conversationId: string | undefined,
   overflowFiles: File[],
+  expectedAttachmentCount: number,
   setUploadError: (msg: string | null) => void,
   setUploadStatus: (msg: string | null) => void
 ): Promise<{ ids: string[]; summaries: AttachmentSummary[] } | null> {
@@ -94,6 +95,10 @@ async function tryUploadAttachments(
       conversationId,
       overflowFiles.length > 0 ? overflowFiles : undefined
     );
+    if (result.ids.length < expectedAttachmentCount) {
+      setUploadError('Failed to upload all attachments');
+      return null;
+    }
     return result;
   } catch {
     setUploadError('Failed to upload attachments');
@@ -557,6 +562,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
           targetId,
           conversationId,
           overflowFiles,
+          uploadFiles.length + overflowFiles.length,
           setUploadError,
           setUploadStatus
         );

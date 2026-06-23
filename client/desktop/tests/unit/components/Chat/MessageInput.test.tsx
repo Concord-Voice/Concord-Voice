@@ -541,6 +541,36 @@ describe('MessageInput', () => {
     expect(onSendMessage).not.toHaveBeenCalled();
   });
 
+  it('blocks partial attachment sends when one queued upload fails', async () => {
+    uploadMockOverrides.hasFiles = true;
+    uploadMockOverrides.files = [
+      { file: { name: 'first.png' }, progress: 0, status: 'pending' },
+      { file: { name: 'second.png' }, progress: 0, status: 'pending' },
+      { file: { name: 'third.png' }, progress: 0, status: 'pending' },
+    ];
+    mockUploadAll.mockResolvedValue({
+      ids: ['file-1', 'file-2'],
+      summaries: [
+        { id: 'file-1', file_type: 'photo', mime_type: 'image/png', file_size: 100 },
+        { id: 'file-2', file_type: 'photo', mime_type: 'image/png', file_size: 100 },
+      ],
+    });
+
+    const user = userEvent.setup();
+    render(<MessageInput onSendMessage={onSendMessage} />);
+
+    const textarea = screen.getByRole('textbox');
+    await user.type(textarea, 'Photos');
+    await user.keyboard('{Enter}');
+
+    await vi.waitFor(() => {
+      expect(mockUploadAll).toHaveBeenCalled();
+    });
+    expect(screen.getByText('Failed to upload all attachments')).toBeInTheDocument();
+    expect(onSendMessage).not.toHaveBeenCalled();
+    expect(mockClearFiles).not.toHaveBeenCalled();
+  });
+
   it('renders attachment preview when files are present', () => {
     uploadMockOverrides.hasFiles = true;
     uploadMockOverrides.files = [{ file: { name: 'photo.png' }, progress: 0, status: 'pending' }];
