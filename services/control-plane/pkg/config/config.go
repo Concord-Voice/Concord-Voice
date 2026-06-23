@@ -182,6 +182,8 @@ type Config struct {
 	AdminWebAuthnRPID           string   // Admin Relying Party ID (e.g. "admin.concordvoice.chat")
 	AdminWebAuthnRPOrigins      []string // Allowed origins for the admin RP
 	AdminWebAuthnAllowedAAGUIDs []string // Allow-listed authenticator AAGUIDs (e.g. approved YubiKey models)
+	CFAccessAUD                 string   // Cloudflare Access audience tag verified by the origin
+	CFAccessTeamDomain          string   // Cloudflare Access team domain (issuer + JWKS base URL)
 
 	// Object Storage (MinIO / S3-compatible)
 	MinIOEndpoint  string // MinIO server endpoint (e.g. "minio:9000")
@@ -305,6 +307,8 @@ func Load() (*Config, error) {
 		AdminWebAuthnRPID:           getEnv("ADMIN_WEBAUTHN_RP_ID", "localhost"),
 		AdminWebAuthnRPOrigins:      parseOrigins(getEnv("ADMIN_WEBAUTHN_RP_ORIGINS", "https://localhost:8443")),
 		AdminWebAuthnAllowedAAGUIDs: parseOrigins(getEnv("ADMIN_WEBAUTHN_ALLOWED_AAGUIDS", "")),
+		CFAccessAUD:                 getEnv("CF_ACCESS_AUD", ""),
+		CFAccessTeamDomain:          getEnv("CF_ACCESS_TEAM_DOMAIN", ""),
 		MinIOEndpoint:               getEnv("MINIO_ENDPOINT", ""),
 		MinIOAccessKey:              getEnv("MINIO_ACCESS_KEY", "concord"),
 		MinIOSecretKey:              getEnv("MINIO_SECRET_KEY", devMinIOSecretKey), // #nosec G101 -- env var name, not a secret
@@ -552,6 +556,10 @@ func (c *Config) validate() error {
 			"ADMIN_WEBAUTHN_RP_ORIGINS must be set in production when ADMIN_CONSOLE_ENABLED=true. Without it the admin WebAuthn ceremony rejects every origin. Example: 'https://admin.concordvoice.chat'."},
 		{c.AdminConsoleEnabled && len(c.AdminWebAuthnAllowedAAGUIDs) == 0,
 			"ADMIN_WEBAUTHN_ALLOWED_AAGUIDS must list at least one authenticator AAGUID in production when ADMIN_CONSOLE_ENABLED=true. checkAAGUID is fail-closed — an empty list rejects every enrollment, bricking the console. Configure the approved YubiKey AAGUIDs (coordinate with #558)."},
+		{c.AdminConsoleEnabled && c.CFAccessAUD == "",
+			"CF_ACCESS_AUD must be set when ADMIN_CONSOLE_ENABLED=true — it is the Cloudflare Access audience tag the origin verifies; an empty AUD would accept any Access token (CWE-287)."},
+		{c.AdminConsoleEnabled && !strings.HasPrefix(c.CFAccessTeamDomain, "https://"),
+			"CF_ACCESS_TEAM_DOMAIN must be the https Cloudflare Access team domain (JWKS + issuer source) when ADMIN_CONSOLE_ENABLED=true."},
 		// #1303 — redemption admin token. An UNSET token is allowed in
 		// production (it simply disables the HTTP code-generation endpoint;
 		// codes can still be issued via the CLI). But a SET-yet-weak token is a

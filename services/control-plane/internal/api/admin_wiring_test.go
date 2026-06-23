@@ -1,10 +1,13 @@
 package api
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -42,6 +45,32 @@ func TestWireAdminRoutes_MountsAdminSurface(t *testing.T) {
 	assert.Contains(t, adminRoutes, "POST /admin/api/v1/auth/webauthn")
 	assert.Contains(t, adminRoutes, "POST /admin/api/v1/admins")
 	assert.Contains(t, adminRoutes, "GET /admin/enroll")
+}
+
+func TestWireAdminRoutes_KnownHostWithoutCFAccessIsRejectedBeforeAdminHandler(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	cfg := &config.Config{
+		AdminConsoleEnabled:         true,
+		AdminWebAuthnRPID:           "admin-codename.concordvoice.chat",
+		AdminWebAuthnRPOrigins:      []string{"https://admin-codename.concordvoice.chat"},
+		AdminWebAuthnAllowedAAGUIDs: []string{"ee882879-721c-4913-9775-3dfcce97072a"},
+		CFAccessAUD:                 "test-access-aud",
+		CFAccessTeamDomain:          "https://team.cloudflareaccess.com",
+	}
+
+	wireAdminRoutes(router, nil, rdb, cfg, logger.New("test"))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/enroll", nil)
+	req.Host = "admin-codename.concordvoice.chat"
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Empty(t, rec.Body.String(), "known host without CF Access must not reach enroll HTML")
 }
 
 // TestWireAdminRoutes_DisabledMountsNothing is the dormant-by-default property

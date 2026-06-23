@@ -8,6 +8,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/admin"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 )
@@ -41,5 +42,7 @@ func wireAdminRoutes(router *gin.Engine, db *sql.DB, rdb *redis.Client, cfg *con
 	if err != nil {
 		log.Fatal("Failed to create admin auth handler", "error", err)
 	}
-	admin.RegisterRoutes(&router.RouterGroup, handler, rdb)
+	edgeGated := router.Group("")
+	edgeGated.Use(middleware.RequireCloudflareAccessFromConfig(cfg, log.Logger))
+	admin.RegisterRoutes(edgeGated, handler, rdb)
 }

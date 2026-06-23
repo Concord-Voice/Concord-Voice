@@ -107,3 +107,49 @@ func TestValidateProductionAcceptsEnabledAdminWebAuthnSet(t *testing.T) {
 	cfg.AdminConsoleEnabled = true
 	assert.NoError(t, cfg.validate())
 }
+
+func TestLoad_CFAccessVars(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "development")
+	t.Setenv("CF_ACCESS_AUD", "access-aud")
+	t.Setenv("CF_ACCESS_TEAM_DOMAIN", "https://team.cloudflareaccess.com")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "access-aud", cfg.CFAccessAUD)
+	assert.Equal(t, "https://team.cloudflareaccess.com", cfg.CFAccessTeamDomain)
+}
+
+func TestValidateProductionRejectsEnabledAdminWithoutCFAccessAUD(t *testing.T) {
+	cfg := validProductionConfig()
+	cfg.AdminConsoleEnabled = true
+	cfg.CFAccessAUD = ""
+
+	err := cfg.validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CF_ACCESS_AUD")
+}
+
+func TestValidateProductionRejectsEnabledAdminWithoutHTTPSCFAccessTeamDomain(t *testing.T) {
+	cfg := validProductionConfig()
+	cfg.AdminConsoleEnabled = true
+	cfg.CFAccessTeamDomain = "team.cloudflareaccess.com"
+
+	err := cfg.validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CF_ACCESS_TEAM_DOMAIN")
+}
+
+func TestValidateProductionDormantConsoleNeedsNoCFAccessConfig(t *testing.T) {
+	cfg := validProductionConfig()
+	cfg.AdminConsoleEnabled = false
+	cfg.CFAccessAUD = ""
+	cfg.CFAccessTeamDomain = ""
+
+	assert.NoError(t, cfg.validate())
+}
+
+func TestValidateProductionAcceptsEnabledAdminCFAccessSet(t *testing.T) {
+	cfg := validProductionConfig()
+	cfg.AdminConsoleEnabled = true
+	assert.NoError(t, cfg.validate())
+}

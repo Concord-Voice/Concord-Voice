@@ -229,6 +229,8 @@ func validProductionConfig() *Config { // #nosec G101 -- test fixture with fake 
 		AdminWebAuthnRPID:           "admin.concordvoice.chat",
 		AdminWebAuthnRPOrigins:      []string{"https://admin.concordvoice.chat"},
 		AdminWebAuthnAllowedAAGUIDs: []string{"ee882879-721c-4913-9775-3dfcce97072a"},
+		CFAccessAUD:                 "test-access-aud",
+		CFAccessTeamDomain:          "https://team.cloudflareaccess.com",
 	}
 }
 
@@ -1138,6 +1140,8 @@ func TestValidate_WarnsOnBroadRFC1918Fallback(t *testing.T) {
 		AdminWebAuthnRPID:           "admin.concordvoice.chat",
 		AdminWebAuthnRPOrigins:      []string{"https://admin.concordvoice.chat"},
 		AdminWebAuthnAllowedAAGUIDs: []string{"ee882879-721c-4913-9775-3dfcce97072a"},
+		CFAccessAUD:                 "test-access-aud",
+		CFAccessTeamDomain:          "https://team.cloudflareaccess.com",
 	}
 
 	err := cfg.validate()
