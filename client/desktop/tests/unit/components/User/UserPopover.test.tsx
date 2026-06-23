@@ -1,4 +1,6 @@
 import { render, screen, fireEvent } from '../../../test-utils';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useMemberStore } from '@/renderer/stores/memberStore';
 import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
@@ -63,6 +65,18 @@ describe('UserPopover', () => {
     expect(screen.getByText('Invisible')).toBeInTheDocument();
   });
 
+  it('keeps the popover clear of the left-column edge with a viewport gutter', () => {
+    const css = readFileSync(
+      resolve(__dirname, '../../../../src/renderer/components/User/UserPopover.css'),
+      'utf-8'
+    );
+    const rule = css.match(/\.user-popover\s*\{[^}]*\}/);
+
+    expect(rule?.[0]).toContain('left: 88px');
+    expect(rule?.[0]).toContain('max-width: calc(100vw - 104px)');
+    expect(rule?.[0]).not.toContain('left: 80px');
+  });
+
   it('renders My Profile menu item', () => {
     render(<UserPopover {...defaultProps} />);
     expect(screen.getByText('My Profile')).toBeInTheDocument();
@@ -71,6 +85,27 @@ describe('UserPopover', () => {
   it('renders Settings menu item', () => {
     render(<UserPopover {...defaultProps} />);
     expect(screen.getByText('Settings')).toBeInTheDocument();
+  });
+
+  it('does NOT render the custom status item when onOpenCustomStatus is not provided', () => {
+    render(<UserPopover {...defaultProps} />);
+    expect(screen.queryByText('Set Custom Status')).not.toBeInTheDocument();
+  });
+
+  it('clicking Set Custom Status calls onClose then onOpenCustomStatus', () => {
+    const onOpenCustomStatus = vi.fn();
+    const calls: string[] = [];
+    const onClose = vi.fn(() => calls.push('close'));
+    onOpenCustomStatus.mockImplementation(() => calls.push('custom-status'));
+
+    render(
+      <UserPopover {...defaultProps} onClose={onClose} onOpenCustomStatus={onOpenCustomStatus} />
+    );
+    fireEvent.click(screen.getByText('Set Custom Status'));
+
+    expect(onClose).toHaveBeenCalled();
+    expect(onOpenCustomStatus).toHaveBeenCalled();
+    expect(calls).toEqual(['close', 'custom-status']);
   });
 
   it('renders Log Out button', () => {

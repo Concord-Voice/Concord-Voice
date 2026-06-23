@@ -50,11 +50,32 @@ const UserPanel: React.FC<UserPanelProps> = ({ compact = false }) => {
   }, [accessToken, user, fetchUser]);
 
   const handleTogglePopover = () => {
+    setIsCustomStatusOpen(false);
     setIsPopoverOpen((prev) => !prev);
+  };
+
+  const handleOpenCustomStatus = () => {
+    setIsPopoverOpen(false);
+    setIsCustomStatusOpen(true);
   };
 
   const panelClass = compact ? 'user-panel user-panel-compact' : 'user-panel';
   const avatarSize = compact ? 'user-avatar-btn compact' : 'user-avatar-btn';
+  const avatarClassName = `${avatarSize}${isPopoverOpen ? ' active' : ''}`;
+  const avatarContent = user ? (
+    <>
+      {resolveMediaUrl(user.avatar_url) ? (
+        <img
+          src={resolveMediaUrl(user.avatar_url)}
+          alt={user.username}
+          className="user-avatar-img"
+        />
+      ) : (
+        <span className="user-avatar-initial">{user.username.charAt(0).toUpperCase()}</span>
+      )}
+      <span className={`user-status-dot ${statusClassMap[selfStatus]}`} />
+    </>
+  ) : null;
 
   return (
     <div className={panelClass}>
@@ -68,49 +89,47 @@ const UserPanel: React.FC<UserPanelProps> = ({ compact = false }) => {
       {/* Loaded state */}
       {user && (
         <div className="user-avatar-wrapper">
-          <button
-            className={`${avatarSize} ${isPopoverOpen ? 'active' : ''}`}
-            onClick={handleTogglePopover}
-            title={user.username}
-            aria-label={`User menu for ${user.username}`}
-          >
-            {resolveMediaUrl(user.avatar_url) ? (
-              <img
-                src={resolveMediaUrl(user.avatar_url)}
-                alt={user.username}
-                className="user-avatar-img"
-              />
-            ) : (
-              <span className="user-avatar-initial">{user.username.charAt(0).toUpperCase()}</span>
-            )}
-            <div className={`user-status-dot ${statusClassMap[selfStatus]}`} />
-          </button>
-
-          {/* Full mode: show username, status (clickable to set custom text), and settings */}
-          {!compact && (
-            <div className="user-panel-info">
-              <span className="user-panel-username">{user.username}</span>
-              <button
-                type="button"
-                className="user-panel-status-btn"
-                onClick={() => setIsCustomStatusOpen((prev) => !prev)}
-                title="Set a custom status"
-                aria-label="Set a custom status"
-              >
-                {selfCustomText ? (
-                  <span className="user-panel-custom-status">
-                    {selfCustomTextEmoji && (
-                      <span className="user-panel-custom-status-emoji">{selfCustomTextEmoji}</span>
-                    )}
-                    <span className="user-panel-custom-status-text">{selfCustomText}</span>
-                  </span>
-                ) : (
-                  <span className={`user-panel-status ${statusClassMap[selfStatus]}`}>
-                    {statusLabelMap[selfStatus]}
-                  </span>
-                )}
-              </button>
-            </div>
+          {compact ? (
+            <button
+              type="button"
+              className={avatarClassName}
+              onClick={handleTogglePopover}
+              title={user.username}
+              aria-label={`User menu for ${user.username}`}
+            >
+              {avatarContent}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className={`user-panel-menu-btn${isPopoverOpen ? ' active' : ''}`}
+              onClick={handleTogglePopover}
+              title={user.username}
+              aria-label={`User menu for ${user.username}`}
+            >
+              <span className={avatarClassName} aria-hidden="true">
+                {avatarContent}
+              </span>
+              <span className="user-panel-info">
+                <span className="user-panel-username">{user.username}</span>
+                <span className="user-panel-status-line">
+                  {selfCustomText ? (
+                    <span className="user-panel-custom-status">
+                      {selfCustomTextEmoji && (
+                        <span className="user-panel-custom-status-emoji">
+                          {selfCustomTextEmoji}
+                        </span>
+                      )}
+                      <span className="user-panel-custom-status-text">{selfCustomText}</span>
+                    </span>
+                  ) : (
+                    <span className={`user-panel-status ${statusClassMap[selfStatus]}`}>
+                      {statusLabelMap[selfStatus]}
+                    </span>
+                  )}
+                </span>
+              </span>
+            </button>
           )}
 
           {!compact && isCustomStatusOpen && (
@@ -133,6 +152,7 @@ const UserPanel: React.FC<UserPanelProps> = ({ compact = false }) => {
               user={user}
               onClose={() => setIsPopoverOpen(false)}
               onOpenFeedback={() => setIsFeedbackOpen(true)}
+              onOpenCustomStatus={compact ? undefined : handleOpenCustomStatus}
             />
           )}
         </div>

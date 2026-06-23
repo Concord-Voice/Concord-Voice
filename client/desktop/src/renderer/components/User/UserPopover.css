@@ -2,8 +2,9 @@
 .user-popover {
   position: fixed;
   bottom: 12px;
-  left: 80px;
+  left: 88px;
   width: 240px;
+  max-width: calc(100vw - 104px);
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 8px;

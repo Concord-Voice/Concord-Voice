@@ -1,8 +1,9 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, act, waitFor } from '../../../test-utils';
 import ServerBar from '@/renderer/components/Layout/ServerBar';
 import { useServerStore } from '@/renderer/stores/serverStore';
 import { useLayoutStore } from '@/renderer/stores/layoutStore';
 import { useUnreadStore } from '@/renderer/stores/unreadStore';
+import { useDMStore, type DMConversation } from '@/renderer/stores/dmStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockServer, mockServer2 } from '../../../mocks/fixtures';
@@ -20,6 +21,21 @@ vi.mock('@/renderer/services/apiClient', () => ({
 describe('ServerBar', () => {
   const onOpenActionModal = vi.fn();
   const onContextMenu = vi.fn();
+  const mockDMConversation: DMConversation = {
+    id: 'dm-1',
+    isGroup: false,
+    isPersonal: true,
+    name: null,
+    participants: [
+      {
+        userId: 'user-1',
+        username: 'alex',
+      },
+    ],
+    lastMessage: null,
+    unreadCount: 0,
+    createdAt: '2026-06-23T00:00:00.000Z',
+  };
 
   beforeEach(() => {
     resetAllStores();
@@ -83,6 +99,34 @@ describe('ServerBar', () => {
     render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
     const badge = document.querySelector('.server-bar-badge');
     expect(badge).toBeInTheDocument();
+  });
+
+  it('shows an unread badge on the PM button when any DM has unreads', () => {
+    useDMStore.setState({
+      conversations: [{ ...mockDMConversation, unreadCount: 2 }],
+    });
+
+    render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
+
+    const pmButton = screen.getByLabelText('Direct Messages');
+    expect(pmButton.querySelector('.server-bar-badge')).toBeInTheDocument();
+  });
+
+  it('clears the PM unread badge when all DM conversations are read', () => {
+    useDMStore.setState({
+      conversations: [{ ...mockDMConversation, unreadCount: 2 }],
+    });
+
+    render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
+
+    act(() => {
+      useDMStore.getState().clearUnread(mockDMConversation.id);
+    });
+
+    const pmButton = screen.getByLabelText('Direct Messages');
+    return waitFor(() => {
+      expect(pmButton.querySelector('.server-bar-badge')).not.toBeInTheDocument();
+    });
   });
 
   it('shows loading skeletons when loading', () => {

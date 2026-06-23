@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useMemo } from 'react';
+import { SmilePlus } from 'lucide-react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { useNavigate } from 'react-router-dom';
 import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
@@ -14,6 +15,8 @@ interface UserPopoverProps {
   onClose: () => void;
   /** Open the feedback modal (#158). The popover closes itself first. */
   onOpenFeedback?: () => void;
+  /** Open the custom status editor after closing this popover. */
+  onOpenCustomStatus?: () => void;
 }
 
 const statusOptions: Array<{
@@ -40,7 +43,12 @@ const statusLabelMap: Record<PresenceStatus, string> = {
   offline: 'Offline',
 };
 
-const UserPopover: React.FC<UserPopoverProps> = ({ user, onClose, onOpenFeedback }) => {
+const UserPopover: React.FC<UserPopoverProps> = ({
+  user,
+  onClose,
+  onOpenFeedback,
+  onOpenCustomStatus,
+}) => {
   const popoverRef = useRef<HTMLDivElement>(null);
   const navigate = useNavigate();
   const logout = useUserStore((state) => state.logout);
@@ -123,7 +131,11 @@ const UserPopover: React.FC<UserPopoverProps> = ({ user, onClose, onOpenFeedback
       <div className="user-popover-header">
         <div className="user-popover-avatar">
           {resolveMediaUrl(user.avatar_url) ? (
-            <img src={resolveMediaUrl(user.avatar_url)} alt={user.username} className="user-popover-avatar-img" />
+            <img
+              src={resolveMediaUrl(user.avatar_url)}
+              alt={user.username}
+              className="user-popover-avatar-img"
+            />
           ) : (
             <span className="user-popover-avatar-initial">
               {user.username.charAt(0).toUpperCase()}
@@ -178,6 +190,19 @@ const UserPopover: React.FC<UserPopoverProps> = ({ user, onClose, onOpenFeedback
       <div className="user-popover-separator" />
 
       {/* Menu items */}
+      {onOpenCustomStatus && (
+        <button
+          className="user-popover-item"
+          onClick={() => {
+            onClose();
+            onOpenCustomStatus();
+          }}
+        >
+          <SmilePlus size={16} />
+          Set Custom Status
+        </button>
+      )}
+
       <button
         className="user-popover-item"
         onClick={() => {

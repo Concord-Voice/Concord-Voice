@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '../../../test-utils';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import MarkdownContent from '@/renderer/components/Markdown/MarkdownContent';
 import {
   indexCategory,
@@ -17,6 +19,14 @@ function renderMd(content: string, lookup = emptyLookup) {
   return render(
     <MarkdownContent id="m1" content={content} editedAt={null} mentionLookup={lookup} />
   );
+}
+
+function getMarkdownPreRule(): string {
+  const css = readFileSync(
+    resolve(__dirname, '../../../../src/renderer/components/Markdown/MarkdownContent.css'),
+    'utf-8'
+  );
+  return css.match(/\.markdown-content pre\s*\{[^}]*\}/)?.[0] ?? '';
 }
 
 describe('MarkdownContent', () => {
@@ -51,6 +61,29 @@ describe('MarkdownContent', () => {
       renderMd('```\nhello\n```');
       const code = screen.getByText(/hello/);
       expect(code.closest('pre')).not.toBeNull();
+    });
+
+    it('soft-wraps medium inline code blocks so every line remains readable', () => {
+      const codeLines = Array.from({ length: 10 }, (_, index) => `line ${index + 1};`);
+      const { container } = renderMd(`\`\`\`js\n${codeLines.join('\n')}\n\`\`\``);
+      const pre = container.querySelector('pre');
+
+      expect(pre).not.toBeNull();
+      expect(getMarkdownPreRule()).toContain('white-space: pre-wrap');
+      for (const line of codeLines) {
+        expect(pre?.textContent).toContain(line);
+      }
+    });
+
+    it('wraps very long code lines instead of clipping them behind horizontal-only scroll', () => {
+      const longLine = `const token = '${'a'.repeat(160)}';`;
+      const { container } = renderMd(`\`\`\`js\n${longLine}\n\`\`\``);
+      const pre = container.querySelector('pre');
+      const preRule = getMarkdownPreRule();
+
+      expect(pre).not.toBeNull();
+      expect(preRule).toContain('max-width: 100%');
+      expect(preRule).toContain('overflow-wrap: anywhere');
     });
 
     it('preserves hljs classes on fenced code block with explicit language', () => {

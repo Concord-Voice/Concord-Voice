@@ -9,12 +9,25 @@ import { mockUser } from '../../../mocks/fixtures';
 // The onOpenFeedback button mirrors the real popover's "Bug Report / Feature
 // Request" entry point so UserPanel's wire-up can be tested in isolation.
 vi.mock('@/renderer/components/User/UserPopover', () => ({
-  default: ({ onClose, onOpenFeedback }: { onClose: () => void; onOpenFeedback?: () => void }) => (
+  default: ({
+    onClose,
+    onOpenFeedback,
+    onOpenCustomStatus,
+  }: {
+    onClose: () => void;
+    onOpenFeedback?: () => void;
+    onOpenCustomStatus?: () => void;
+  }) => (
     <div data-testid="user-popover">
       <button onClick={onClose}>Close</button>
       {onOpenFeedback && (
         <button onClick={onOpenFeedback} data-testid="popover-feedback-btn">
           Open Feedback
+        </button>
+      )}
+      {onOpenCustomStatus && (
+        <button onClick={onOpenCustomStatus} data-testid="popover-custom-status-btn">
+          Open Custom Status
         </button>
       )}
     </div>
@@ -31,6 +44,14 @@ vi.mock('@/renderer/components/User/FeedbackModal', () => ({
         <button onClick={onClose}>Close Feedback</button>
       </div>
     ) : null,
+}));
+
+vi.mock('@/renderer/components/User/CustomStatusPopover', () => ({
+  default: ({ onClose }: { onClose: () => void }) => (
+    <div role="dialog" aria-label="Set custom status">
+      <button onClick={onClose}>Close Custom Status</button>
+    </div>
+  ),
 }));
 
 // Mock apiFetch
@@ -84,11 +105,44 @@ describe('UserPanel', () => {
     expect(screen.getByTestId('user-popover')).toBeInTheDocument();
   });
 
+  it('opens popover when username or status text is clicked', () => {
+    const { rerender } = render(<UserPanel />);
+
+    fireEvent.click(screen.getByText('testuser'));
+    expect(screen.getByTestId('user-popover')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Close'));
+    expect(screen.queryByTestId('user-popover')).not.toBeInTheDocument();
+
+    rerender(<UserPanel />);
+    fireEvent.click(screen.getByText('Online'));
+    expect(screen.getByTestId('user-popover')).toBeInTheDocument();
+  });
+
   it('clicks settings button and opens app settings overlay', () => {
     useSettingsOverlayStore.setState({ open: null, payload: null });
     render(<UserPanel />);
     fireEvent.click(screen.getByLabelText('Settings'));
     expect(useSettingsOverlayStore.getState().open).toBe('app');
+    expect(screen.queryByTestId('user-popover')).not.toBeInTheDocument();
+  });
+
+  it('opens custom status editor from the user popover command', () => {
+    render(<UserPanel />);
+
+    fireEvent.click(screen.getByText('testuser'));
+    fireEvent.click(screen.getByTestId('popover-custom-status-btn'));
+
+    expect(screen.getByRole('dialog', { name: 'Set custom status' })).toBeInTheDocument();
+  });
+
+  it('does not offer custom status editor from the compact popover', () => {
+    render(<UserPanel compact />);
+
+    fireEvent.click(screen.getByText('T'));
+
+    expect(screen.getByTestId('user-popover')).toBeInTheDocument();
+    expect(screen.queryByTestId('popover-custom-status-btn')).not.toBeInTheDocument();
   });
 
   it('renders loading state when user not loaded', () => {

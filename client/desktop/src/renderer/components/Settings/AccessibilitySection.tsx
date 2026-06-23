@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   useDraftTtsSetting,
   setDraftTtsSetting,
@@ -10,6 +10,11 @@ import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
 import CustomSelect from '../ui/CustomSelect';
 import SettingsPreviewPanel from './SettingsPreviewPanel';
+import {
+  getVoices as getTTSVoices,
+  preview as previewTTS,
+  stop as stopTTS,
+} from '../../services/ttsService';
 
 const fontSizes: { value: AppearanceSettings['fontSize']; label: string }[] = [
   { value: 'small', label: 'Small' },
@@ -144,37 +149,107 @@ const DisplaySection: React.FC = () => {
 
 // ─── Text-to-Speech Section ─────────────────────────────────────────────────
 
+type PreviewState = 'idle' | 'speaking' | 'error';
+
+const TTS_PREVIEW_TIMEOUT_MS = 15_000;
+
+function getPreviewUnavailableHint(
+  speechAvailable: boolean,
+  voicesLoaded: boolean,
+  voicesLength: number
+): string | null {
+  if (!speechAvailable) return 'Text-to-speech is not available on this system.';
+  if (!voicesLoaded) return 'Loading text-to-speech voices...';
+  if (voicesLength === 0) return 'No text-to-speech voices are available on this system.';
+  return null;
+}
+
+function getPreviewHint(
+  previewUnavailableHint: string | null,
+  previewState: PreviewState,
+  ttsVolume: number
+): string {
+  if (previewUnavailableHint) return previewUnavailableHint;
+  if (previewState === 'speaking') return 'Speaking preview...';
+  if (previewState === 'error') {
+    return 'Preview could not play. Check your system text-to-speech and output settings.';
+  }
+  if (ttsVolume === 0) return 'Preview is muted because TTS volume is set to 0%.';
+  return 'Preview uses the selected voice, speed, and volume.';
+}
+
 const TTSSection: React.FC = () => {
   const ttsEnabled = useDraftTtsSetting('ttsEnabled');
   const ttsVoice = useDraftTtsSetting('ttsVoice');
   const ttsRate = useDraftTtsSetting('ttsRate');
   const ttsVolume = useDraftTtsSetting('ttsVolume');
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [voicesLoaded, setVoicesLoaded] = useState(false);
+  const [previewState, setPreviewState] = useState<PreviewState>('idle');
+  const previewTimeoutRef = useRef<number | null>(null);
+  const mountedRef = useRef(true);
+
+  const clearPreviewTimeout = () => {
+    if (previewTimeoutRef.current === null) return;
+    window.clearTimeout(previewTimeoutRef.current);
+    previewTimeoutRef.current = null;
+  };
+
+  const finishPreview = (state: PreviewState) => {
+    clearPreviewTimeout();
+    if (mountedRef.current) setPreviewState(state);
+  };
 
   useEffect(() => {
     const loadVoices = () => {
-      const available = globalThis.speechSynthesis?.getVoices() ?? [];
+      const available = getTTSVoices();
       // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: updates voices list from SpeechSynthesis API on mount and when voices change; not a render loop
       setVoices(available);
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: marks the one-shot Web Speech voices probe complete
+      setVoicesLoaded(true);
     };
     loadVoices();
     globalThis.speechSynthesis?.addEventListener('voiceschanged', loadVoices);
     return () => globalThis.speechSynthesis?.removeEventListener('voiceschanged', loadVoices);
   }, []);
 
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+      clearPreviewTimeout();
+      stopTTS();
+    };
+  }, []);
+
+  const speechAvailable = typeof globalThis.speechSynthesis !== 'undefined';
+  const previewUnavailableHint = getPreviewUnavailableHint(
+    speechAvailable,
+    voicesLoaded,
+    voices.length
+  );
+  const previewHint = getPreviewHint(previewUnavailableHint, previewState, ttsVolume);
+  const previewDisabled = Boolean(previewUnavailableHint) || previewState === 'speaking';
+
   const handlePreview = () => {
-    if (!globalThis.speechSynthesis) return;
-    globalThis.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(
-      'This is a preview of text-to-speech in Concord Voice.'
-    );
-    utterance.rate = ttsRate;
-    utterance.volume = ttsVolume;
-    if (ttsVoice) {
-      const match = voices.find((v) => v.voiceURI === ttsVoice);
-      if (match) utterance.voice = match;
+    if (previewDisabled) return;
+
+    setPreviewState('speaking');
+    clearPreviewTimeout();
+    previewTimeoutRef.current = window.setTimeout(() => {
+      previewTimeoutRef.current = null;
+      if (mountedRef.current) setPreviewState('idle');
+    }, TTS_PREVIEW_TIMEOUT_MS);
+
+    const started = previewTTS({
+      voiceURI: ttsVoice || null,
+      rate: ttsRate,
+      volume: ttsVolume,
+      onEnd: () => finishPreview('idle'),
+      onError: () => finishPreview('error'),
+    });
+    if (!started) {
+      finishPreview('error');
     }
-    globalThis.speechSynthesis.speak(utterance);
   };
 
   return (
@@ -260,9 +335,18 @@ const TTSSection: React.FC = () => {
       </div>
 
       <div className="settings-row">
-        <button className="settings-btn-secondary" onClick={handlePreview}>
-          Preview
+        <button
+          type="button"
+          className="settings-btn-secondary"
+          onClick={handlePreview}
+          disabled={previewDisabled}
+          aria-describedby="tts-preview-hint"
+        >
+          {previewState === 'speaking' ? 'Speaking...' : 'Preview'}
         </button>
+        <span id="tts-preview-hint" className="settings-row-hint">
+          {previewHint}
+        </span>
       </div>
     </CollapsibleSection>
   );

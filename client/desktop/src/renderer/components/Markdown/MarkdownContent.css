@@ -20,12 +20,20 @@
   border-radius: 4px;
   padding: 8px 10px;
   overflow-x: auto;
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: normal;
   margin: 4px 0;
 }
 
 .markdown-content code {
   font-family: var(--code-font, Menlo, Consolas, monospace);
   font-size: 0.88em;
+}
+
+.markdown-content pre code {
+  white-space: inherit;
 }
 
 .markdown-content :not(pre) > code {

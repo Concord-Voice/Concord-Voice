@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, act, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
 
 // ── Mocks ──────────────────────────────────────────────────────────────
@@ -79,6 +79,8 @@ const mockGetVoices = vi.fn().mockReturnValue([
     default: false,
   },
 ]);
+const mockAddEventListener = vi.fn();
+const mockRemoveEventListener = vi.fn();
 
 // jsdom lacks SpeechSynthesisUtterance — provide a minimal stub
 if (typeof globalThis.SpeechSynthesisUtterance === 'undefined') {
@@ -93,23 +95,46 @@ if (typeof globalThis.SpeechSynthesisUtterance === 'undefined') {
   };
 }
 
-Object.defineProperty(globalThis, 'speechSynthesis', {
-  value: {
-    getVoices: mockGetVoices,
-    speak: mockSpeak,
-    cancel: mockCancel,
-    addEventListener: vi.fn(),
-    removeEventListener: vi.fn(),
-  },
-  writable: true,
-  configurable: true,
-});
+const mockSpeechSynthesis = {
+  getVoices: mockGetVoices,
+  speak: mockSpeak,
+  cancel: mockCancel,
+  addEventListener: mockAddEventListener,
+  removeEventListener: mockRemoveEventListener,
+} as unknown as SpeechSynthesis;
+
+const installSpeechSynthesis = (value: SpeechSynthesis | undefined) => {
+  Object.defineProperty(globalThis, 'speechSynthesis', {
+    value,
+    writable: true,
+    configurable: true,
+  });
+};
+
+installSpeechSynthesis(mockSpeechSynthesis);
 
 import AccessibilitySection from '@/renderer/components/Settings/AccessibilitySection';
 
 describe('AccessibilitySection', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetVoices.mockReturnValue([
+      {
+        voiceURI: 'en-US-Standard',
+        name: 'English US',
+        lang: 'en-US',
+        localService: true,
+        default: true,
+      },
+      {
+        voiceURI: 'en-GB-Standard',
+        name: 'English UK',
+        lang: 'en-GB',
+        localService: true,
+        default: false,
+      },
+    ]);
+    installSpeechSynthesis(mockSpeechSynthesis);
   });
 
   it('renders Text-to-Speech section title', () => {
@@ -297,6 +322,89 @@ describe('AccessibilitySection', () => {
     expect(utterance.text).toBe('This is a preview of text-to-speech in Concord Voice.');
     expect(utterance.rate).toBe(1);
     expect(utterance.volume).toBe(1);
+  });
+
+  it('disables Preview with a hint when speech synthesis is unavailable', () => {
+    installSpeechSynthesis(undefined);
+
+    render(<AccessibilitySection />);
+
+    expect(screen.getByRole('button', { name: 'Preview' })).toBeDisabled();
+    expect(screen.getByText('Text-to-speech is not available on this system.')).toBeInTheDocument();
+  });
+
+  it('disables Preview with a hint when no voices are available', () => {
+    mockGetVoices.mockReturnValue([]);
+
+    render(<AccessibilitySection />);
+
+    expect(screen.getByRole('button', { name: 'Preview' })).toBeDisabled();
+    expect(
+      screen.getByText('No text-to-speech voices are available on this system.')
+    ).toBeInTheDocument();
+  });
+
+  it('shows and clears a speaking state around preview playback', async () => {
+    render(<AccessibilitySection />);
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+
+    const utterance = mockSpeak.mock.calls[0][0];
+    expect(screen.getByRole('button', { name: 'Speaking...' })).toBeDisabled();
+
+    act(() => {
+      utterance.onend?.({} as SpeechSynthesisEvent);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Preview' })).not.toBeDisabled();
+    });
+  });
+
+  it('recovers the Preview button if speech synthesis never completes', async () => {
+    vi.useFakeTimers();
+    try {
+      const { unmount } = render(<AccessibilitySection />);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+      expect(screen.getByRole('button', { name: 'Speaking...' })).toBeDisabled();
+
+      act(() => {
+        vi.advanceTimersByTime(15_000);
+      });
+
+      expect(screen.getByRole('button', { name: 'Preview' })).not.toBeDisabled();
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops a playing preview when the settings section unmounts', () => {
+    const { unmount } = render(<AccessibilitySection />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+    expect(mockCancel).toHaveBeenCalledTimes(1);
+
+    unmount();
+
+    expect(mockCancel).toHaveBeenCalledTimes(2);
+  });
+
+  it('warns when preview volume is muted by the TTS volume slider', async () => {
+    const { useDraftTtsSetting } = await import('@/renderer/hooks/useDraftSettings');
+    (useDraftTtsSetting as ReturnType<typeof vi.fn>).mockImplementation((key: string) => {
+      if (key === 'ttsEnabled') return false;
+      if (key === 'ttsVoice') return '';
+      if (key === 'ttsRate') return 1;
+      if (key === 'ttsVolume') return 0;
+      return undefined;
+    });
+
+    render(<AccessibilitySection />);
+
+    expect(
+      screen.getByText('Preview is muted because TTS volume is set to 0%.')
+    ).toBeInTheDocument();
   });
 
   it('speed description mentions playback speed', () => {

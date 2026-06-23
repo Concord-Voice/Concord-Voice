@@ -35,7 +35,14 @@ Object.defineProperty(window, 'speechSynthesis', {
 });
 
 // Must import AFTER mocking
-import { speak, stop, getVoices, isSpeaking } from '@/renderer/services/ttsService';
+import {
+  speak,
+  stop,
+  getVoices,
+  isSpeaking,
+  preview,
+  TTS_PREVIEW_TEXT,
+} from '@/renderer/services/ttsService';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -85,6 +92,38 @@ describe('ttsService', () => {
       const utterance = mockSpeak.mock.calls[0][0];
       expect(utterance.text.length).toBeLessThanOrEqual(200);
       expect(utterance.text).toContain('...');
+    });
+  });
+
+  describe('preview', () => {
+    it('speaks the preview phrase even when TTS playback is disabled', () => {
+      const mockVoice = { voiceURI: 'preview-voice', name: 'Preview Voice', lang: 'en-US' };
+      mockGetVoices.mockReturnValue([mockVoice]);
+      useTTSSettingsStore.setState({
+        ttsEnabled: false,
+        ttsVoice: 'preview-voice',
+        ttsRate: 1.4,
+        ttsVolume: 0.35,
+      });
+
+      expect(preview()).toBe(true);
+
+      expect(mockCancel).toHaveBeenCalledTimes(1);
+      expect(mockSpeak).toHaveBeenCalledTimes(1);
+      const utterance = mockSpeak.mock.calls[0][0];
+      expect(utterance.text).toBe(TTS_PREVIEW_TEXT);
+      expect(utterance.rate).toBe(1.4);
+      expect(utterance.volume).toBe(0.35);
+      expect(utterance.voice).toBe(mockVoice);
+    });
+
+    it('returns false without speaking when no voices are available', () => {
+      mockGetVoices.mockReturnValue([]);
+
+      expect(preview()).toBe(false);
+
+      expect(mockCancel).not.toHaveBeenCalled();
+      expect(mockSpeak).not.toHaveBeenCalled();
     });
   });
 

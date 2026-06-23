@@ -13,6 +13,7 @@ import { useVoiceStore } from '../../stores/voiceStore';
 import { useLayoutStore } from '../../stores/layoutStore';
 import { useAuthStore } from '../../stores/authStore';
 import { useSettingsStore } from '../../stores/settingsStore';
+import { useDMStore } from '../../stores/dmStore';
 import { ServerWithRole } from '../../types/server';
 import './ServerBar.css';
 
@@ -48,6 +49,7 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
   const fetchServers = useServerStore((s) => s.fetchServers);
   const setActiveServer = useServerStore((s) => s.setActiveServer);
   const serverUnreadSet = useUnreadStore((s) => s.serverUnreadSet);
+  const hasUnreadDMs = useDMStore((s) => s.conversations.some((c) => c.unreadCount > 0));
   const serverVoiceCounts = useVoiceStore((s) => s.serverVoiceCounts);
   // Subscribe to the muted-servers map so this row re-renders when a mute
   // is toggled. We read entries inside the render closure (per-server) to
@@ -487,6 +489,7 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
           style={{ width: stickyIconSize, height: stickyIconSize }}
         >
           <MessageSquare size={Math.round(stickyIconSize * 0.45)} />
+          {hasUnreadDMs && <span className="server-bar-badge" />}
         </button>
 
         {activeServer ? (

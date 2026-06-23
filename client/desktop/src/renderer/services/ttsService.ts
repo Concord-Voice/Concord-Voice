@@ -3,8 +3,42 @@ import { useTTSSettingsStore } from '../stores/ttsSettingsStore';
 const MAX_UTTERANCE_LENGTH = 200;
 const MAX_QUEUE_SIZE = 3;
 const MIN_INTERVAL_MS = 2000;
+export const TTS_PREVIEW_TEXT = 'This is a preview of text-to-speech in Concord Voice.';
 
 let lastSpeakTime = 0;
+
+interface UtteranceSettings {
+  voiceURI: string | null;
+  rate: number;
+  volume: number;
+}
+
+export interface TTSPreviewOptions {
+  voiceURI?: string | null;
+  rate?: number;
+  volume?: number;
+  onEnd?: () => void;
+  onError?: () => void;
+}
+
+function createConfiguredUtterance(
+  text: string,
+  settings: UtteranceSettings,
+  voices = globalThis.speechSynthesis?.getVoices() ?? []
+): SpeechSynthesisUtterance {
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.rate = settings.rate;
+  utterance.volume = settings.volume;
+
+  if (settings.voiceURI) {
+    const match = voices.find((v) => v.voiceURI === settings.voiceURI);
+    if (match) {
+      utterance.voice = match;
+    }
+  }
+
+  return utterance;
+}
 
 /**
  * Speak text aloud using the Web Speech API.
@@ -36,20 +70,46 @@ export function speak(text: string, senderName?: string): void {
     utteranceText = utteranceText.slice(0, MAX_UTTERANCE_LENGTH - 3) + '...';
   }
 
-  const utterance = new SpeechSynthesisUtterance(utteranceText);
-  utterance.rate = ttsRate;
-  utterance.volume = ttsVolume;
-
-  // Set voice if specified
-  if (ttsVoice) {
-    const voices = globalThis.speechSynthesis.getVoices();
-    const match = voices.find((v) => v.voiceURI === ttsVoice);
-    if (match) {
-      utterance.voice = match;
-    }
-  }
+  const utterance = createConfiguredUtterance(utteranceText, {
+    voiceURI: ttsVoice,
+    rate: ttsRate,
+    volume: ttsVolume,
+  });
 
   globalThis.speechSynthesis.speak(utterance);
+}
+
+/**
+ * Speak a fixed preview phrase from Settings.
+ * Bypasses the TTS enabled gate and message rate limit because this is user-initiated.
+ */
+export function preview(options: TTSPreviewOptions = {}): boolean {
+  const synthesis = globalThis.speechSynthesis;
+  if (!synthesis) return false;
+
+  const voices = synthesis.getVoices();
+  if (voices.length === 0) return false;
+
+  const { ttsVoice, ttsRate, ttsVolume } = useTTSSettingsStore.getState();
+  const voiceURI = options.voiceURI === undefined ? ttsVoice : options.voiceURI;
+  const rate = options.rate ?? ttsRate;
+  const volume = options.volume ?? ttsVolume;
+
+  const utterance = createConfiguredUtterance(
+    TTS_PREVIEW_TEXT,
+    {
+      voiceURI: voiceURI ?? null,
+      rate,
+      volume,
+    },
+    voices
+  );
+  utterance.onend = () => options.onEnd?.();
+  utterance.onerror = () => options.onError?.();
+
+  synthesis.cancel();
+  synthesis.speak(utterance);
+  return true;
 }
 
 /**
