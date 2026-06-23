@@ -570,6 +570,22 @@ func TestProxyInviteServerIconMissingStorageFallback(t *testing.T) {
 	assert.Contains(t, w.Header().Get(hdrContentType), "image/svg+xml")
 }
 
+func TestProxyInviteServerIconStorageDisabledReturns503(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "proxyinviteiconoff")
+	serverID := ts.createTestServer(t, owner, "Proxy Invite Storage Off")
+	code := "LMNPQRST"
+	ts.setServerIconURL(t, serverID, "server-icons/"+serverID)
+	ts.createTestInviteCode(t, serverID, owner, code, false)
+	ts.handler.store = nil
+
+	var w *httptest.ResponseRecorder
+	require.NotPanics(t, func() {
+		w = ts.doNoAuth(ts.handler.ProxyInviteServerIcon, "GET", "/api/v1/invites/"+code+"/icon", gin.Params{{Key: "code", Value: code}})
+	})
+	assertStorageDisabledResponse(t, w)
+}
+
 func TestProxyServerBannerSuccess(t *testing.T) {
 	ts := setupMediaTest(t)
 	owner := ts.createTestUser(t, "proxysbsuc")

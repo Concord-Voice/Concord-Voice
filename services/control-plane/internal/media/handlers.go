@@ -36,6 +36,7 @@ const (
 	errMsgFailedVerifyAccess = "Failed to verify access"
 	errMsgFailedVerifyPerms  = "Failed to verify permissions"
 	errMsgInternalServer     = "Internal server error"
+	errMsgStorageUnavailable = "Object storage unavailable"
 	storageErrNotFound       = "not found"
 	purposeDMIcon            = "dm-icon"
 	purposeServerIcon        = "server-icon"
@@ -124,6 +125,14 @@ func NewHandler(db *sql.DB, store ObjectStore, log *logger.Logger, cfg *config.C
 	}
 }
 
+func (h *Handler) requireObjectStore(c *gin.Context) (ObjectStore, bool) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgStorageUnavailable})
+		return nil, false
+	}
+	return h.store, true
+}
+
 // UploadAvatar handles avatar image uploads.
 // POST /api/v1/media/upload/avatar
 // Accepts multipart/form-data with a "file" field.
@@ -193,7 +202,12 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 	fileID := uuid.New().String()
 	storageKey := fmt.Sprintf("attachments/%s", fileID)
 
-	if err := h.store.PutObject(c.Request.Context(), storageKey, file, header.Size, mimeOctetStream); err != nil {
+	store, ok := h.requireObjectStore(c)
+	if !ok {
+		return
+	}
+
+	if err := store.PutObject(c.Request.Context(), storageKey, file, header.Size, mimeOctetStream); err != nil {
 		h.log.Error("Failed to store attachment", "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store file"})
 		return
@@ -204,7 +218,9 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 		storageKey: storageKey, fileSize: header.Size, keyVersion: keyVersion,
 		channelID: channelID, conversationID: conversationID,
 	}); err != nil {
-		_ = h.store.DeleteObject(c.Request.Context(), storageKey)
+		if delErr := store.DeleteObject(c.Request.Context(), storageKey); delErr != nil {
+			h.log.Error("Failed to delete orphaned attachment object", "error", delErr, "storage_key", storageKey)
+		}
 		h.log.Error("Failed to record attachment metadata", "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record file metadata"})
 		return
@@ -253,22 +269,16 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 		return
 	}
 
-	// Verify membership in the associated channel or conversation
-	if channelID != nil {
-		if !h.userHasChannelAccess(c, userID, *channelID) {
-			return // response already sent
-		}
-	} else if conversationID != nil {
-		if !h.userHasDMAccess(c, userID, *conversationID) {
-			return
-		}
-	} else {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
+	if !h.userCanDownloadAttachment(c, userID, channelID, conversationID) {
 		return
 	}
 
 	// Stream the encrypted blob from MinIO to the client
-	obj, contentType, err := h.store.GetObject(c.Request.Context(), storageKey)
+	store, ok := h.requireObjectStore(c)
+	if !ok {
+		return
+	}
+	obj, contentType, err := store.GetObject(c.Request.Context(), storageKey)
 	if err != nil {
 		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), storageErrNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "File not found in storage"})
@@ -291,6 +301,18 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 
 	if _, err := io.Copy(c.Writer, obj); err != nil {
 		h.log.Warn("Failed to stream attachment to client", "error", err, "file_id", fileID)
+	}
+}
+
+func (h *Handler) userCanDownloadAttachment(c *gin.Context, userID string, channelID, conversationID *string) bool {
+	switch {
+	case channelID != nil:
+		return h.userHasChannelAccess(c, userID, *channelID)
+	case conversationID != nil:
+		return h.userHasDMAccess(c, userID, *conversationID)
+	default:
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
+		return false
 	}
 }
 
@@ -441,6 +463,11 @@ func (h *Handler) DeleteMedia(c *gin.Context) {
 		return
 	}
 
+	store, ok := h.requireObjectStore(c)
+	if !ok {
+		return
+	}
+
 	// Soft-delete in DB
 	_, err = h.db.Exec(`UPDATE media_files SET deleted_at = NOW() WHERE id = $1`, fileID)
 	if err != nil {
@@ -450,7 +477,7 @@ func (h *Handler) DeleteMedia(c *gin.Context) {
 	}
 
 	// Remove from object storage
-	if err := h.store.DeleteObject(c.Request.Context(), storageKey); err != nil {
+	if err := store.DeleteObject(c.Request.Context(), storageKey); err != nil {
 		h.log.Warn("Failed to delete object from storage (orphaned)", "error", err, "key", storageKey)
 	}
 
@@ -490,14 +517,19 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 
 	storageKey := tier1StorageKey(purpose, userID, serverID, conversationID)
 
+	store, ok := h.requireObjectStore(c)
+	if !ok {
+		return
+	}
+
 	reader := bytes.NewReader(processed.Data)
-	if err := h.store.PutObject(c.Request.Context(), storageKey, reader, int64(len(processed.Data)), processed.ContentType); err != nil {
+	if err := store.PutObject(c.Request.Context(), storageKey, reader, int64(len(processed.Data)), processed.ContentType); err != nil {
 		h.log.Error("Failed to store processed image", "error", err, "user_id", userID, "purpose", purpose)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store image"})
 		return
 	}
 
-	fileID, err := insertTier1Record(h, c, userID, storageKey, processed)
+	fileID, err := insertTier1Record(h, c, store, userID, storageKey, processed)
 	if err != nil {
 		return // response already sent
 	}
@@ -632,7 +664,7 @@ func tier1StorageKey(purpose, userID, serverID, conversationID string) string {
 	return fmt.Sprintf("media/%s/%s", purpose, userID)
 }
 
-func insertTier1Record(h *Handler, c *gin.Context, userID, storageKey string, processed *ProcessedImage) (string, error) {
+func insertTier1Record(h *Handler, c *gin.Context, store ObjectStore, userID, storageKey string, processed *ProcessedImage) (string, error) {
 	fileID := uuid.New().String()
 
 	insertQuery := `
@@ -646,7 +678,7 @@ func insertTier1Record(h *Handler, c *gin.Context, userID, storageKey string, pr
 		processed.ContentType, len(processed.Data), storageKey).Scan(&fileID)
 	if err != nil {
 		h.log.Error("Failed to record media metadata", "error", err, "user_id", userID)
-		if delErr := h.store.DeleteObject(c.Request.Context(), storageKey); delErr != nil {
+		if delErr := store.DeleteObject(c.Request.Context(), storageKey); delErr != nil {
 			h.log.Error("Failed to delete orphaned media object", "error", delErr, "storage_key", storageKey)
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record media metadata"})
@@ -800,7 +832,11 @@ func createAttachmentRecord(h *Handler, _ *gin.Context, p attachmentParams) erro
 // If public is true, the response is marked publicly cacheable (Cloudflare /
 // shared caches OK) — only safe for routes registered without auth middleware.
 func (h *Handler) proxyTier1Media(c *gin.Context, key string, public bool) {
-	obj, contentType, err := h.store.GetObject(c.Request.Context(), key)
+	store, ok := h.requireObjectStore(c)
+	if !ok {
+		return
+	}
+	obj, contentType, err := store.GetObject(c.Request.Context(), key)
 	if err != nil {
 		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), storageErrNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Not found"})
@@ -829,7 +865,11 @@ func (h *Handler) proxyTier1Media(c *gin.Context, key string, public bool) {
 }
 
 func (h *Handler) proxyInviteIcon(c *gin.Context, key string) {
-	obj, contentType, err := h.store.GetObject(c.Request.Context(), key)
+	store, ok := h.requireObjectStore(c)
+	if !ok {
+		return
+	}
+	obj, contentType, err := store.GetObject(c.Request.Context(), key)
 	if err != nil {
 		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), storageErrNotFound) {
 			serveInviteIconFallback(c)

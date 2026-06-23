@@ -91,6 +91,11 @@ func TestValidateUsernameLeetspeak(t *testing.T) {
 	}
 }
 
+func TestZAPSeedUsernameIsStableValidFixture(t *testing.T) {
+	assert.Error(t, ValidateUsername("zapscan28037908070"))
+	assert.NoError(t, ValidateUsername("zapci"))
+}
+
 func TestNormalizeUsername(t *testing.T) {
 	assert.Equal(t, "testuser", NormalizeUsername("TestUser"))
 	assert.Equal(t, "testuser", NormalizeUsername("TESTUSER"))

@@ -290,6 +290,14 @@ func parseBody(t *testing.T, w *httptest.ResponseRecorder) map[string]interface{
 	return body
 }
 
+func assertStorageDisabledResponse(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	resp := parseBody(t, w)
+	assert.Contains(t, resp["error"], "storage")
+}
+
 // =====================================================================
 // Tier 1 Upload Tests
 // =====================================================================
@@ -352,6 +360,21 @@ func TestUploadAvatarTooLarge(t *testing.T) {
 	// Rejected by MaxBytesReader (413) or size check (400)
 	assert.True(t, w.Code == http.StatusRequestEntityTooLarge || w.Code == http.StatusBadRequest,
 		"expected 413 or 400, got %d", w.Code)
+}
+
+func TestUploadAvatarStorageDisabledReturns503(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "avatarstorageoff")
+	ts.handler.store = nil
+
+	imgData := makePNG(t, 200, 200)
+	body, ct := multipartBody(t, "file", "avatar.png", imgData, nil)
+
+	var w *httptest.ResponseRecorder
+	require.NotPanics(t, func() {
+		w = ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct)
+	})
+	assertStorageDisabledResponse(t, w)
 }
 
 // =====================================================================
@@ -437,6 +460,26 @@ func TestUploadAttachmentSuccessChannel(t *testing.T) {
 	resp := parseBody(t, w)
 	assert.NotEmpty(t, resp["file_id"])
 	assert.Equal(t, "photo", resp["file_type"])
+}
+
+func TestUploadAttachmentStorageDisabledReturns503(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "attachstorageoff")
+	serverID := ts.createTestServer(t, owner, "Attach Storage Off")
+	channelID := ts.createTestChannel(t, serverID, "uploads")
+	ts.handler.store = nil
+
+	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("ciphertext-data"), map[string]string{
+		"channel_id": channelID,
+		"file_type":  "photo",
+		"mime_type":  "image/jpeg",
+	})
+
+	var w *httptest.ResponseRecorder
+	require.NotPanics(t, func() {
+		w = ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)
+	})
+	assertStorageDisabledResponse(t, w)
 }
 
 func TestUploadAttachmentXORBothContexts(t *testing.T) {
@@ -573,6 +616,29 @@ func TestDownloadAttachmentSuccess(t *testing.T) {
 	assert.Equal(t, "ciphertext", w.Body.String())
 }
 
+func TestDownloadAttachmentStorageDisabledReturns503(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "downloadstorageoff")
+	serverID := ts.createTestServer(t, owner, "Download Storage Off")
+	channelID := ts.createTestChannel(t, serverID, "downloads")
+
+	fileID := uuid.New().String()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	_, err := ts.db.Exec(
+		`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, channel_id)
+		 VALUES ($1, $2, 'photo', 2, 'image/jpeg', 10, $3, 1, $4)`,
+		fileID, owner, storageKey, channelID,
+	)
+	require.NoError(t, err)
+	ts.handler.store = nil
+
+	var w *httptest.ResponseRecorder
+	require.NotPanics(t, func() {
+		w = ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, owner, gin.Params{{Key: "file_id", Value: fileID}})
+	})
+	assertStorageDisabledResponse(t, w)
+}
+
 func TestDownloadAttachmentInvalidFileID(t *testing.T) {
 	ts := setupMediaTest(t)
 	user := ts.createTestUser(t, "badfid")
@@ -654,6 +720,34 @@ func TestDeleteMediaAlreadyDeleted(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
+func TestDeleteMediaStorageDisabledReturns503AndLeavesRowActive(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "delstorageoff")
+
+	serverID := ts.createTestServer(t, owner, "Del Storage Off")
+	channelID := ts.createTestChannel(t, serverID, "delstorage")
+	fileID := uuid.New().String()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	_, err := ts.db.Exec(
+		`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, channel_id)
+		 VALUES ($1, $2, 'file', 2, 'application/octet-stream', 4, $3, 1, $4)`,
+		fileID, owner, storageKey, channelID,
+	)
+	require.NoError(t, err)
+	ts.handler.store = nil
+
+	var w *httptest.ResponseRecorder
+	require.NotPanics(t, func() {
+		w = ts.doJSON(ts.handler.DeleteMedia, "DELETE", pathMediaPrefix+fileID, owner, gin.Params{{Key: "file_id", Value: fileID}})
+	})
+	assertStorageDisabledResponse(t, w)
+
+	var deletedAt sql.NullTime
+	err = ts.db.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt)
+	require.NoError(t, err)
+	assert.False(t, deletedAt.Valid, "media row should remain active when storage is disabled")
+}
+
 // =====================================================================
 // Proxy Tests
 // =====================================================================
@@ -673,6 +767,18 @@ func TestProxyAvatarInvalidID(t *testing.T) {
 	w := ts.doJSON(ts.handler.ProxyAvatar, "GET", "/api/v1/media/avatars/not-uuid", "any", gin.Params{{Key: "user_id", Value: valueNotUUID}})
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestProxyAvatarStorageDisabledReturns503(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := uuid.New().String()
+	ts.handler.store = nil
+
+	var w *httptest.ResponseRecorder
+	require.NotPanics(t, func() {
+		w = ts.doJSON(ts.handler.ProxyAvatar, "GET", "/api/v1/media/avatars/"+userID, userID, gin.Params{{Key: "user_id", Value: userID}})
+	})
+	assertStorageDisabledResponse(t, w)
 }
 
 // TestProxyServerIconPublic asserts that server-icons are now a public Tier 1
