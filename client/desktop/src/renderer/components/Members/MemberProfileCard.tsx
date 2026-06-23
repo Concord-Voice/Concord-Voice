@@ -2,8 +2,9 @@ import React, { useEffect, useRef, useState, useLayoutEffect } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import type { PresenceStatus } from '../../stores/memberStore';
 import { useRichPresenceStore } from '../../stores/richPresenceStore';
+import { useUserStore } from '../../stores/userStore';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
-import { useUserThemeScope } from '../../hooks/useUserThemeScope';
+import { EMPTY_USER_THEME_SCOPE, useUserThemeScope } from '../../hooks/useUserThemeScope';
 import SendFriendRequestButton from './SendFriendRequestButton';
 import { useFriendRequestState } from '../../hooks/useFriendRequestState';
 import './MemberProfileCard.css';
@@ -41,9 +42,11 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
   const cardRef = useRef<HTMLDivElement>(null);
   // Selective subscription: this member's custom-text status (undefined if none).
   const customText = useRichPresenceStore((s) => s.customTextByUser[member.user_id]);
+  const currentUserId = useUserStore((s) => s.user?.id);
   // Drives whether the friend-request row renders at all (hidden for self).
   const { visible: friendActionVisible } = useFriendRequestState(member.user_id);
   const showActions = friendActionVisible || !!onViewFullProfile;
+  const isSelf = currentUserId === member.user_id;
 
   // Close on outside click or Escape
   useEffect(() => {
@@ -146,8 +149,9 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
   const roleLabel = member.role
     ? member.role.charAt(0).toUpperCase() + member.role.slice(1)
     : undefined;
-  const userColors = resolveUserAccentColors(member.color_scheme);
-  const { scopeProps } = useUserThemeScope(member.color_scheme);
+  const userColors = isSelf ? null : resolveUserAccentColors(member.color_scheme);
+  const scopedTheme = useUserThemeScope(member.color_scheme);
+  const scopeProps = isSelf ? EMPTY_USER_THEME_SCOPE : scopedTheme.scopeProps;
 
   return (
     <div

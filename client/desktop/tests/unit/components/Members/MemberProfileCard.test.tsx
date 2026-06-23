@@ -25,6 +25,59 @@ describe('MemberProfileCard', () => {
     expect(screen.getByText('@testuser')).toBeInTheDocument();
   });
 
+  it('scopes another user card to their profile theme', () => {
+    const member = {
+      ...defaultProps.member,
+      color_scheme: JSON.stringify({ scheme: 'hacker', themeMode: 'light' }),
+    };
+
+    render(<MemberProfileCard {...defaultProps} member={member} />);
+
+    const card = document.querySelector('.member-profile-card');
+    expect(card).toHaveAttribute('data-scheme', 'hacker');
+    expect(card).toHaveAttribute('data-theme', 'light');
+  });
+
+  it('lets the viewer self-card inherit the app theme when profile theme is unset', () => {
+    useUserStore.setState({
+      user: {
+        id: mockMember.user_id,
+        username: mockMember.username,
+        email: 'me@test.com',
+        email_verified: true,
+      },
+    });
+
+    render(<MemberProfileCard {...defaultProps} />);
+
+    const card = document.querySelector('.member-profile-card');
+    expect(card).toHaveAttribute('data-scheme', '');
+    expect(card).toHaveAttribute('data-theme', '');
+  });
+
+  it('does not apply profile accent overrides to the viewer self-card', () => {
+    useUserStore.setState({
+      user: {
+        id: mockMember.user_id,
+        username: mockMember.username,
+        email: 'me@test.com',
+        email_verified: true,
+      },
+    });
+    const member = {
+      ...defaultProps.member,
+      color_scheme: JSON.stringify({ scheme: 'hacker', themeMode: 'light' }),
+    };
+
+    render(<MemberProfileCard {...defaultProps} member={member} />);
+
+    const card = document.querySelector('.member-profile-card');
+    expect(card).toHaveAttribute('data-scheme', '');
+    expect(card).toHaveAttribute('data-theme', '');
+    expect(screen.getByText('T')).not.toHaveStyle({ color: '#fff' });
+    expect((screen.getByText('T') as HTMLElement).style.background).toBe('');
+  });
+
   it('renders role badge', () => {
     render(<MemberProfileCard {...defaultProps} />);
     expect(screen.getByText('Owner')).toBeInTheDocument();

@@ -8,7 +8,7 @@ interface ThemeScopeProps {
   style?: CSSProperties;
 }
 
-const EMPTY_SCOPE: ThemeScopeProps = {
+export const EMPTY_USER_THEME_SCOPE: ThemeScopeProps = {
   'data-scheme': '',
   'data-theme': '',
 };
@@ -40,7 +40,7 @@ export function useUserThemeScope(colorSchemeJson: string | null | undefined): {
   const highContrast = useSettingsStore((s) => s.appearance.highContrast);
 
   const scopeProps = useMemo<ThemeScopeProps>(() => {
-    if (highContrast) return EMPTY_SCOPE;
+    if (highContrast) return EMPTY_USER_THEME_SCOPE;
     const scope = resolveUserThemeScope(colorSchemeJson);
     const props: ThemeScopeProps = {
       'data-scheme': scope.scheme === 'custom' ? '' : scope.scheme,
