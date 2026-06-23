@@ -15,6 +15,7 @@ import { createExpressErrorHandler } from './lib/expressErrorHandler.js';
 import { createOriginGate } from './lib/originGate.js';
 import { handleForceDisconnect } from './lib/forceDisconnect.js';
 import { handleSetDeafen } from './lib/setDeafen.js';
+import { handleSetTestingStatus } from './lib/setTestingStatus.js';
 
 const expectedKeyframeRequestErrors = new Set([
   'Room not found',
@@ -740,6 +741,11 @@ async function main() {
     // lib/setDeafen.ts (unit-tested; mirrors the forceDisconnect extraction).
     socket.on('set-deafen', ({ isDeafened }: { isDeafened?: unknown }, callback?) => {
       const result = handleSetDeafen(roomManager, socket, data.roomId, data.userId, isDeafened);
+      if (callback) callback(result);
+    });
+
+    socket.on('update-test-status', (payload: unknown, callback?) => {
+      const result = handleSetTestingStatus(roomManager, socket, data.roomId, data.userId, payload);
       if (callback) callback(result);
     });
 

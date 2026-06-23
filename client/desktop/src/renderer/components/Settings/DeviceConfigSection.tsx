@@ -16,6 +16,7 @@ const DeviceConfigSection: React.FC = () => {
       s.connectionState === 'connecting' ||
       s.connectionState === 'reconnecting'
   );
+  const localIsTesting = useVoiceStore((s) => s.localIsTesting);
   const { isTesting, dbfsLevel, error: micTestError, startTest, stopTest } = useMicTest();
   const { isTesting: isOutputTesting, error: outputTestError, playTestTone } = useOutputTest();
   const {
@@ -63,8 +64,8 @@ const DeviceConfigSection: React.FC = () => {
         <button
           className={`settings-mic-test-btn${isTesting ? ' testing' : ''}`}
           onClick={isTesting ? stopTest : startTest}
-          disabled={isInVoiceCall}
-          title={isInVoiceCall ? 'Unavailable during a voice call' : undefined}
+          disabled={localIsTesting && !isTesting}
+          title={localIsTesting && !isTesting ? 'Another audio test is running' : undefined}
         >
           {isTesting ? 'Stop Testing' : 'Test'}
         </button>
@@ -117,8 +118,8 @@ const DeviceConfigSection: React.FC = () => {
         <button
           className={`settings-output-test-btn${isOutputTesting ? ' testing' : ''}`}
           onClick={playTestTone}
-          disabled={isInVoiceCall || isOutputTesting}
-          title={isInVoiceCall ? 'Unavailable during a voice call' : undefined}
+          disabled={isOutputTesting || (localIsTesting && !isOutputTesting)}
+          title={localIsTesting && !isOutputTesting ? 'Another audio test is running' : undefined}
         >
           {isOutputTesting ? 'Playing...' : 'Test'}
         </button>

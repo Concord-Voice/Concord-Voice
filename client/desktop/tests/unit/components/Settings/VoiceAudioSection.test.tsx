@@ -287,7 +287,7 @@ describe('VoiceAudioSection', () => {
     render(<VoiceAudioSection />);
     expect(screen.getByText('Microphone access denied')).toBeInTheDocument();
   });
-  it('disables test button during voice call', async () => {
+  it('keeps mic test button enabled during voice call', async () => {
     const { useVoiceStore } = await import('@/renderer/stores/voiceStore');
     (useVoiceStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
       (s: (state: Record<string, unknown>) => unknown) =>
@@ -300,7 +300,7 @@ describe('VoiceAudioSection', () => {
         })
     );
     render(<VoiceAudioSection />);
-    expect(document.querySelector('.settings-mic-test-btn')).toBeDisabled();
+    expect(document.querySelector('.settings-mic-test-btn')).not.toBeDisabled();
   });
   it('renders quality section', () => {
     render(<VoiceAudioSection />);

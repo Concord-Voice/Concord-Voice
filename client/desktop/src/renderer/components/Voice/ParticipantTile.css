@@ -185,6 +185,10 @@
   color: var(--accent-primary);
 }
 
+.participant-tile__status--testing {
+  color: var(--accent-primary);
+}
+
 .participant-tile__menu-trigger {
   position: absolute;
   top: 6px;

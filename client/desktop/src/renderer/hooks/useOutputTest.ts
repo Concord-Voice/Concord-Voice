@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { useVoiceStore } from '../stores/voiceStore';
+import { voiceService } from '../services/voiceService';
 
 interface UseOutputTestReturn {
   isTesting: boolean;
@@ -23,8 +24,14 @@ export function useOutputTest(): UseOutputTestReturn {
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const callSuspensionRef = useRef(false);
 
   const cleanup = useCallback(() => {
+    if (callSuspensionRef.current) {
+      voiceService.endTestSuspension();
+      voiceService.setLocalTestingStatus(false);
+      callSuspensionRef.current = false;
+    }
     if (timeoutRef.current) {
       clearTimeout(timeoutRef.current);
       timeoutRef.current = null;
@@ -47,6 +54,21 @@ export function useOutputTest(): UseOutputTestReturn {
     setError(null);
 
     try {
+      const voiceState = useVoiceStore.getState();
+      const inVoiceCall =
+        voiceState.connectionState === 'connected' ||
+        voiceState.connectionState === 'connecting' ||
+        voiceState.connectionState === 'reconnecting';
+      if (inVoiceCall && voiceState.localIsTesting) {
+        setError('Another audio test is already running');
+        return;
+      }
+      if (inVoiceCall) {
+        voiceService.beginTestSuspension();
+        voiceService.setLocalTestingStatus(true);
+        callSuspensionRef.current = true;
+      }
+
       const ctx = new AudioContext({ sampleRate: 48000 });
       audioContextRef.current = ctx;
       if (ctx.state === 'suspended') await ctx.resume();

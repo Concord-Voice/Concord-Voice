@@ -46,6 +46,7 @@ export interface VoiceParticipant {
   isDeafened: boolean;
   serverMuted: boolean;
   serverDeafened: boolean;
+  isTesting?: boolean;
   isVideoOn: boolean;
   isScreenSharing: boolean;
   isSpeaking: boolean;
@@ -246,6 +247,7 @@ interface VoiceState {
   isDeafened: boolean;
   isVideoOn: boolean;
   isScreenSharing: boolean;
+  localIsTesting: boolean;
 
   // Participants (keyed by userId)
   participants: Record<string, VoiceParticipant>;
@@ -356,6 +358,7 @@ interface VoiceState {
   setDeafened: (deafened: boolean) => void;
   setVideoOn: (on: boolean) => void;
   setScreenSharing: (sharing: boolean) => void;
+  setLocalIsTesting: (testing: boolean) => void;
   setActiveSpeaker: (userId: string | null) => void;
   setAudioInputDevice: (deviceId: string) => void;
   setAudioOutputDevice: (deviceId: string) => void;
@@ -474,6 +477,7 @@ const initialState = {
   isDeafened: false,
   isVideoOn: false,
   isScreenSharing: false,
+  localIsTesting: false,
   participants: {} as Record<string, VoiceParticipant>,
   activeSpeakerId: null as string | null,
   audioInputDeviceId: persisted.audioInputDeviceId ?? null,
@@ -573,6 +577,7 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
   setDeafened: (isDeafened) => set({ isDeafened }),
   setVideoOn: (isVideoOn) => set({ isVideoOn }),
   setScreenSharing: (isScreenSharing) => set({ isScreenSharing }),
+  setLocalIsTesting: (localIsTesting) => set({ localIsTesting }),
   setActiveSpeaker: (activeSpeakerId) => set({ activeSpeakerId }),
   setAudioInputDevice: (audioInputDeviceId) => {
     set({ audioInputDeviceId });

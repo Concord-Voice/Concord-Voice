@@ -168,6 +168,26 @@ describe('RoomManager', () => {
     });
   });
 
+  describe('Audio testing status (#1163)', () => {
+    it('setParticipantTestingStatus sets and clears the isTesting flag', async () => {
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      manager.setParticipantTestingStatus('room-1', 'u-1', true);
+      expect(manager.getParticipant('room-1', 'u-1')?.isTesting).toBe(true);
+
+      manager.setParticipantTestingStatus('room-1', 'u-1', false);
+      expect(manager.getParticipant('room-1', 'u-1')?.isTesting).toBe(false);
+    });
+
+    it('joinRoom snapshot carries existing testing status', async () => {
+      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      manager.setParticipantTestingStatus('room-1', 'u-1', true);
+
+      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
+      const alice = result.participants.find((p) => p.userId === 'u-1');
+      expect(alice?.isTesting).toBe(true);
+    });
+  });
+
   describe('joinRoom — reconnection', () => {
     it('cleans up old session when same userId rejoins', async () => {
       await manager.joinRoom('room-1', 'u-1', 'sock-old', { username: 'alice' });

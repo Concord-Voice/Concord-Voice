@@ -110,7 +110,8 @@ MEDIASOUP_LOG_LEVEL=warn
 
 **join-room**
 ```typescript
-socket.emit('join-room', { roomId: string, userId: string });
+socket.emit('join-room', { roomId: string, rtpCapabilities });
+// room-joined participants include { userId, username, isDeafened, isTesting, ... }
 ```
 
 **create-transport**
@@ -150,6 +151,13 @@ socket.emit('request-keyframe', { senderUserId }, (data) => {
 
 Requests a fresh video keyframe for the caller's consumer of `senderUserId` after E2EE epoch recovery. The media plane validates room membership and applies a 5s per-sender cooldown before calling mediasoup `consumer.requestKeyFrame()`.
 
+**update-test-status**
+```typescript
+socket.emit('update-test-status', { isTesting: boolean }, (data) => {
+  // data: { success: true } | { error: string }
+});
+```
+
 ### Server → Client
 
 **router-rtp-capabilities**
@@ -177,6 +185,13 @@ socket.on('new-producer', ({ producerId, userId }) => {
 ```typescript
 socket.on('user-left', ({ userId }) => {
   // User left the room
+});
+```
+
+**participant-testing-changed**
+```typescript
+socket.on('participant-testing-changed', ({ userId, isTesting }) => {
+  // A participant started or stopped an audio device test
 });
 ```
 

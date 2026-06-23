@@ -83,6 +83,13 @@ interface ConsumerWithLayers {
   currentLayers?: { spatialLayer: number; temporalLayer: number };
   setPreferredLayers(layers: { spatialLayer: number; temporalLayer: number }): void;
 }
+
+interface TestSuspensionRestorePolicy {
+  keepAudioOutPaused: boolean;
+  keepProducersPaused: boolean;
+  keepMicPaused: boolean;
+}
+
 const HAS_ENCODED_STREAMS =
   typeof RTCRtpSender !== 'undefined' &&
   typeof (RTCRtpSender.prototype as RtpSenderWithEncodedStreams).createEncodedStreams ===
@@ -220,6 +227,8 @@ interface RoomJoinedResponse {
     /** Self-deafen state from the SFU room snapshot (#685) — optional for
      *  resilience against an older media-plane that omits it. */
     isDeafened?: boolean;
+    /** Audio-device testing state from the SFU room snapshot (#1163). */
+    isTesting?: boolean;
   }>;
   channelName: string;
   e2eeEpoch?: number;
@@ -259,6 +268,13 @@ class VoiceService {
   private readonly producers: Map<string, mediasoupTypes.Producer> = new Map();
   // Remote consumers: consumerId → Consumer
   private readonly consumers: Map<string, mediasoupTypes.Consumer> = new Map();
+  private testSuspensionDepth = 0;
+  private readonly testSuspendedProducerIds = new Set<string>();
+  private readonly testSuspendedConsumerIds = new Set<string>();
+  private readonly testRestoreEligibleProducerIds = new Set<string>();
+  private readonly testRestoreEligibleConsumerIds = new Set<string>();
+  private readonly testServerPausedConsumerIds = new Set<string>();
+  private readonly serverResumeOnUndeafenConsumerIds = new Set<string>();
   // Consumer metadata for ownership transfer (parallel to consumers Map)
   private readonly consumerMeta: Map<
     string,
@@ -1045,7 +1061,7 @@ class VoiceService {
       console.warn('liveReplaceAudioTrack failed:', errorMessage(err));
     }
 
-    producer.resume();
+    if (!this.shouldKeepProducerSuspendedForTest(producer.id)) producer.resume();
   }
 
   private async liveReplaceCameraTrack(): Promise<void> {
@@ -1448,6 +1464,7 @@ class VoiceService {
         avatarUrl: p.avatarUrl,
         isMuted: false,
         isDeafened: p.isDeafened ?? false,
+        isTesting: p.isTesting ?? false,
         serverMuted: false,
         serverDeafened: false,
         isVideoOn: producerState?.isVideoOn ?? false,
@@ -2025,8 +2042,17 @@ class VoiceService {
 
     this.producers.set('mic', producer);
 
+    if (this.testSuspensionDepth > 0) {
+      producer.pause();
+      this.socket?.emit('pause-producer', { producerId: producer.id });
+      this.testSuspendedProducerIds.add(producer.id);
+      this.testRestoreEligibleProducerIds.add(producer.id);
+    }
+
     // Start client-side VAD for instant speaking indicator
-    this.startLocalVAD(this.localMicStream);
+    if (!this.shouldKeepProducerSuspendedForTest(producer.id)) {
+      this.startLocalVAD(this.localMicStream);
+    }
 
     // Start packet loss monitor for dynamic FEC
     this.startPacketLossMonitor();
@@ -2427,6 +2453,224 @@ class VoiceService {
     this.applyOptimisticLocalState(store, { isDeafened: deafened }, 'applyOptimisticDeafen');
   }
 
+  private getTestSuspensionRestorePolicy(): TestSuspensionRestorePolicy {
+    const store = useVoiceStore.getState();
+    const localUserId = useUserStore.getState().user?.id;
+    const localParticipant = localUserId ? store.participants[localUserId] : undefined;
+
+    return {
+      keepAudioOutPaused: store.isDeafened || localParticipant?.serverDeafened === true,
+      keepProducersPaused: store.isSoloBandwidthSaving || localParticipant?.serverDeafened === true,
+      keepMicPaused: store.isMuted || localParticipant?.serverMuted === true,
+    };
+  }
+
+  private finishTestSuspension(): boolean {
+    if (this.testSuspensionDepth === 0) return false;
+    this.testSuspensionDepth--;
+    return this.testSuspensionDepth === 0;
+  }
+
+  private clearTestSuspensionState(): void {
+    this.testSuspendedProducerIds.clear();
+    this.testSuspendedConsumerIds.clear();
+    this.testRestoreEligibleProducerIds.clear();
+    this.testRestoreEligibleConsumerIds.clear();
+    this.testServerPausedConsumerIds.clear();
+  }
+
+  private shouldKeepProducerSuspendedForTest(producerId: string): boolean {
+    return this.testSuspensionDepth > 0 && this.testSuspendedProducerIds.has(producerId);
+  }
+
+  private shouldKeepConsumerSuspendedForTest(consumerId: string): boolean {
+    return this.testSuspensionDepth > 0 && this.testSuspendedConsumerIds.has(consumerId);
+  }
+
+  private shouldRestoreProducerPausedBeforeTest(
+    source: string,
+    policy: TestSuspensionRestorePolicy
+  ): boolean {
+    return source === 'mic' && (policy.keepProducersPaused || policy.keepMicPaused);
+  }
+
+  private hasCoordinatedConsumerPause(consumerId: string): boolean {
+    return (['visibility', 'ignis', 'manual'] as const).some((reason) =>
+      this.pauseCoordinator.hasReason(consumerId, reason)
+    );
+  }
+
+  private shouldRestoreConsumerPausedBeforeTest(
+    consumerId: string,
+    policy: TestSuspensionRestorePolicy
+  ): boolean {
+    return policy.keepAudioOutPaused && !this.hasCoordinatedConsumerPause(consumerId);
+  }
+
+  private suspendExistingAudioProducerForTest(
+    source: string,
+    producer: mediasoupTypes.Producer,
+    policy: TestSuspensionRestorePolicy
+  ): void {
+    if (source !== 'mic' || producer.kind !== 'audio') return;
+    this.testSuspendedProducerIds.add(producer.id);
+    if (producer.paused) {
+      if (this.shouldRestoreProducerPausedBeforeTest(source, policy)) {
+        this.testRestoreEligibleProducerIds.add(producer.id);
+      }
+      return;
+    }
+    producer.pause();
+    this.socket?.emit('pause-producer', { producerId: producer.id });
+    this.testRestoreEligibleProducerIds.add(producer.id);
+  }
+
+  private suspendExistingAudioConsumerForTest(
+    consumerId: string,
+    consumer: mediasoupTypes.Consumer,
+    policy: TestSuspensionRestorePolicy
+  ): void {
+    if (consumer.kind !== 'audio') return;
+    this.testSuspendedConsumerIds.add(consumerId);
+    if (consumer.paused) {
+      if (this.shouldRestoreConsumerPausedBeforeTest(consumerId, policy)) {
+        this.testRestoreEligibleConsumerIds.add(consumerId);
+      }
+      return;
+    }
+    consumer.pause();
+    this.testRestoreEligibleConsumerIds.add(consumerId);
+  }
+
+  private restoreTestSuspendedProducer(
+    source: string,
+    producer: mediasoupTypes.Producer,
+    policy: TestSuspensionRestorePolicy
+  ): void {
+    if (!this.testSuspendedProducerIds.has(producer.id)) return;
+    if (!this.testRestoreEligibleProducerIds.has(producer.id)) return;
+    if (!producer.paused || producer.closed) return;
+    if (policy.keepProducersPaused) return;
+    if (source === 'mic' && policy.keepMicPaused) return;
+
+    producer.resume();
+    this.socket?.emit('resume-producer', { producerId: producer.id });
+  }
+
+  private restoreTestSuspendedConsumer(
+    consumerId: string,
+    consumer: mediasoupTypes.Consumer,
+    policy: TestSuspensionRestorePolicy
+  ): void {
+    if (!this.testSuspendedConsumerIds.has(consumerId) || consumer.closed) return;
+    if (!this.testRestoreEligibleConsumerIds.has(consumerId)) return;
+    if (policy.keepAudioOutPaused) {
+      if (this.testServerPausedConsumerIds.has(consumerId)) {
+        this.serverResumeOnUndeafenConsumerIds.add(consumerId);
+      }
+      return;
+    }
+
+    if (this.testServerPausedConsumerIds.has(consumerId)) {
+      this.socket?.emit('resume-consumer', { consumerId });
+      this.serverResumeOnUndeafenConsumerIds.delete(consumerId);
+    }
+    if (consumer.paused) consumer.resume();
+  }
+
+  beginTestSuspension(): void {
+    this.testSuspensionDepth++;
+    if (this.testSuspensionDepth > 1) return;
+
+    const policy = this.getTestSuspensionRestorePolicy();
+    this.testSuspendedProducerIds.clear();
+    this.testSuspendedConsumerIds.clear();
+    this.testRestoreEligibleProducerIds.clear();
+    this.testRestoreEligibleConsumerIds.clear();
+    this.testServerPausedConsumerIds.clear();
+
+    for (const [source, producer] of this.producers) {
+      this.suspendExistingAudioProducerForTest(source, producer, policy);
+    }
+
+    for (const [consumerId, consumer] of this.consumers) {
+      this.suspendExistingAudioConsumerForTest(consumerId, consumer, policy);
+    }
+  }
+
+  endTestSuspension(): void {
+    if (!this.finishTestSuspension()) return;
+
+    const policy = this.getTestSuspensionRestorePolicy();
+    for (const [source, producer] of this.producers) {
+      this.restoreTestSuspendedProducer(source, producer, policy);
+    }
+
+    for (const [consumerId, consumer] of this.consumers) {
+      this.restoreTestSuspendedConsumer(consumerId, consumer, policy);
+    }
+
+    this.clearTestSuspensionState();
+  }
+
+  setLocalTestingStatus(isTesting: boolean): void {
+    const store = useVoiceStore.getState();
+    store.setLocalIsTesting(isTesting);
+    const localUserId = useUserStore.getState().user?.id;
+    if (localUserId) store.updateParticipant(localUserId, { isTesting });
+    if (store.activeChannelId) this.socket?.emit('update-test-status', { isTesting });
+  }
+
+  private canUnmuteMic(store: ReturnType<typeof useVoiceStore.getState>): boolean {
+    const localUserId = useUserStore.getState().user?.id;
+    return !localUserId || store.participants[localUserId]?.serverMuted !== true;
+  }
+
+  private async unmuteMicProducer(
+    store: ReturnType<typeof useVoiceStore.getState>,
+    producer: mediasoupTypes.Producer
+  ): Promise<void> {
+    if (!this.canUnmuteMic(store)) return;
+
+    const keepSuspended = this.shouldKeepProducerSuspendedForTest(producer.id);
+    if (!keepSuspended) {
+      await producer.resume();
+      this.socket?.emit('resume-producer', { producerId: producer.id });
+    }
+
+    store.setMuted(false);
+    this.applyOptimisticMute(store, false);
+    notificationSoundService.play('unmute');
+    if (this.localMicStream && !keepSuspended) this.startLocalVAD(this.localMicStream);
+  }
+
+  private async muteMicProducer(
+    store: ReturnType<typeof useVoiceStore.getState>,
+    producer: mediasoupTypes.Producer
+  ): Promise<void> {
+    await producer.pause();
+    this.socket?.emit('pause-producer', { producerId: producer.id });
+    store.setMuted(true);
+    this.applyOptimisticMute(store, true);
+    notificationSoundService.play('mute');
+    this.stopLocalVAD();
+  }
+
+  private async revertMicProducerState(
+    producer: mediasoupTypes.Producer,
+    wasMuted: boolean
+  ): Promise<void> {
+    try {
+      if (wasMuted) {
+        await producer.pause();
+      } else {
+        await producer.resume();
+      }
+    } catch {
+      // Best-effort producer revert — UI state is already rolled back.
+    }
+  }
+
   /** Toggle mute (pause/resume mic producer) */
   async toggleMute(): Promise<void> {
     const store = useVoiceStore.getState();
@@ -2436,38 +2680,15 @@ class VoiceService {
     const wasMuted = store.isMuted;
     try {
       if (wasMuted) {
-        const localUserId = useUserStore.getState().user?.id;
-        if (localUserId && store.participants[localUserId]?.serverMuted) {
-          return;
-        }
-
-        await producer.resume();
-        this.socket?.emit('resume-producer', { producerId: producer.id });
-        store.setMuted(false);
-        this.applyOptimisticMute(store, false);
-        notificationSoundService.play('unmute');
-        if (this.localMicStream) this.startLocalVAD(this.localMicStream);
+        await this.unmuteMicProducer(store, producer);
       } else {
-        await producer.pause();
-        this.socket?.emit('pause-producer', { producerId: producer.id });
-        store.setMuted(true);
-        this.applyOptimisticMute(store, true);
-        notificationSoundService.play('mute');
-        this.stopLocalVAD();
+        await this.muteMicProducer(store, producer);
       }
     } catch (error) {
       console.error('[VoiceService] toggleMute failed:', errorMessage(error));
       store.setMuted(wasMuted);
       this.applyOptimisticMute(store, wasMuted);
-      try {
-        if (wasMuted) {
-          await producer.pause();
-        } else {
-          await producer.resume();
-        }
-      } catch {
-        // Best-effort producer revert — UI state is already rolled back
-      }
+      await this.revertMicProducerState(producer, wasMuted);
     }
   }
 
@@ -2478,6 +2699,11 @@ class VoiceService {
     const localUserId = useUserStore.getState().user?.id;
     if (!localUserId) return false;
     return store.participants[localUserId]?.serverDeafened === true;
+  }
+
+  private resumeServerIfHeldForAudioOutput(consumerId: string): void {
+    if (!this.serverResumeOnUndeafenConsumerIds.delete(consumerId)) return;
+    this.socket?.emit('resume-consumer', { consumerId });
   }
 
   /** Toggle deafen (mute all incoming audio) */
@@ -2496,11 +2722,12 @@ class VoiceService {
     notificationSoundService.play(newDeafened ? 'deafen' : 'undeafen');
 
     // Mute/unmute all audio consumers
-    for (const [, consumer] of this.consumers) {
+    for (const [consumerId, consumer] of this.consumers) {
       if (consumer.kind === 'audio') {
         if (newDeafened) {
           consumer.pause();
-        } else {
+        } else if (!this.shouldKeepConsumerSuspendedForTest(consumerId)) {
+          this.resumeServerIfHeldForAudioOutput(consumerId);
           consumer.resume();
         }
       }
@@ -3318,11 +3545,25 @@ class VoiceService {
         this.consumers.delete(consumer.id);
         this.consumerMeta.delete(consumer.id);
         this.pauseCoordinator.clearConsumer(consumer.id);
+        this.testSuspendedConsumerIds.delete(consumer.id);
+        this.testRestoreEligibleConsumerIds.delete(consumer.id);
+        this.testServerPausedConsumerIds.delete(consumer.id);
+        this.serverResumeOnUndeafenConsumerIds.delete(consumer.id);
       });
 
-      // Resume the consumer (was created paused on server)
-      await this.emitAsync('resume-consumer', { consumerId: consumer.id });
-      console.debug('[consume] consumer resumed', { consumerId: consumer.id });
+      if (this.testSuspensionDepth > 0 && consumer.kind === 'audio') {
+        if (!consumer.paused) consumer.pause();
+        this.testSuspendedConsumerIds.add(consumer.id);
+        this.testRestoreEligibleConsumerIds.add(consumer.id);
+        this.testServerPausedConsumerIds.add(consumer.id);
+        console.debug('[consume] consumer held during test suspension', {
+          consumerId: consumer.id,
+        });
+      } else {
+        // Resume the consumer (was created paused on server)
+        await this.emitAsync('resume-consumer', { consumerId: consumer.id });
+        console.debug('[consume] consumer resumed', { consumerId: consumer.id });
+      }
 
       // #1541: apply pending visibility intent AFTER the resume emit above. An
       // initially-hidden tile's pause-consumer must run after the unconditional
@@ -3426,6 +3667,13 @@ class VoiceService {
       'participant-deafen-changed',
       ({ userId, isDeafened }: { userId: string; isDeafened: boolean }) => {
         useVoiceStore.getState().updateParticipant(userId, { isDeafened });
+      }
+    );
+
+    this.socket.on(
+      'participant-testing-changed',
+      ({ userId, isTesting }: { userId: string; isTesting: boolean }) => {
+        useVoiceStore.getState().updateParticipant(userId, { isTesting });
       }
     );
 
@@ -4354,6 +4602,13 @@ class VoiceService {
     }
     this.consumers.clear();
     this.consumerMeta.clear();
+    this.testSuspensionDepth = 0;
+    this.testSuspendedProducerIds.clear();
+    this.testSuspendedConsumerIds.clear();
+    this.testRestoreEligibleProducerIds.clear();
+    this.testRestoreEligibleConsumerIds.clear();
+    this.testServerPausedConsumerIds.clear();
+    this.serverResumeOnUndeafenConsumerIds.clear();
     this.pendingScreenAudioProducers.clear();
     // Reset IGNIS recovery state on channel leave — consumers are gone, so stale
     // ids must not linger and the green-cycle counter must not carry across

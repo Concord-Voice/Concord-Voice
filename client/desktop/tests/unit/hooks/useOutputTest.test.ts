@@ -3,12 +3,25 @@ import { renderHook, act } from '@testing-library/react';
 
 vi.mock('@/renderer/stores/voiceStore', () => ({
   useVoiceStore: Object.assign(vi.fn(), {
-    getState: vi.fn(() => ({ audioOutputDeviceId: 'speaker-1' })),
+    getState: vi.fn(() => ({
+      audioOutputDeviceId: 'speaker-1',
+      connectionState: 'disconnected',
+      localIsTesting: false,
+    })),
   }),
+}));
+
+vi.mock('@/renderer/services/voiceService', () => ({
+  voiceService: {
+    beginTestSuspension: vi.fn(),
+    endTestSuspension: vi.fn(),
+    setLocalTestingStatus: vi.fn(),
+  },
 }));
 
 import { useOutputTest } from '@/renderer/hooks/useOutputTest';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { voiceService } from '@/renderer/services/voiceService';
 
 let mockSetSinkId: ReturnType<typeof vi.fn>;
 let mockPlay: ReturnType<typeof vi.fn>;
@@ -22,6 +35,11 @@ function createMockNode(extras: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.useFakeTimers();
+  (useVoiceStore as any).getState.mockReturnValue({
+    audioOutputDeviceId: 'speaker-1',
+    connectionState: 'disconnected',
+    localIsTesting: false,
+  });
 
   const mockCtx = {
     state: 'running',
@@ -83,6 +101,29 @@ describe('useOutputTest', () => {
     expect(result.current.isTesting).toBe(true);
   });
 
+  it('suspends call audio while output test runs in-call', async () => {
+    (useVoiceStore as any).getState.mockReturnValue({
+      audioOutputDeviceId: 'speaker-1',
+      connectionState: 'connected',
+      localIsTesting: false,
+    });
+    const { result } = renderHook(() => useOutputTest());
+
+    await act(async () => {
+      await result.current.playTestTone();
+    });
+
+    expect(voiceService.beginTestSuspension).toHaveBeenCalled();
+    expect(voiceService.setLocalTestingStatus).toHaveBeenCalledWith(true);
+
+    await act(async () => {
+      vi.advanceTimersByTime(700);
+    });
+
+    expect(voiceService.endTestSuspension).toHaveBeenCalled();
+    expect(voiceService.setLocalTestingStatus).toHaveBeenCalledWith(false);
+  });
+
   it('routes audio to the selected output device via setSinkId', async () => {
     const { result } = renderHook(() => useOutputTest());
     await act(async () => {
@@ -133,7 +174,11 @@ describe('useOutputTest', () => {
   });
 
   it('skips setSinkId when no output device selected', async () => {
-    (useVoiceStore as any).getState.mockReturnValueOnce({ audioOutputDeviceId: null });
+    (useVoiceStore as any).getState.mockReturnValue({
+      audioOutputDeviceId: null,
+      connectionState: 'disconnected',
+      localIsTesting: false,
+    });
     const { result } = renderHook(() => useOutputTest());
     await act(async () => {
       await result.current.playTestTone();

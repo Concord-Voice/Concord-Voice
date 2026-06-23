@@ -38,9 +38,19 @@ vi.mock('@/renderer/stores/voiceStore', () => ({
     getState: vi.fn(() => ({
       audioInputDeviceId: null,
       audioOutputDeviceId: null,
+      connectionState: 'disconnected',
+      localIsTesting: false,
     })),
     subscribe: vi.fn(() => () => {}),
   }),
+}));
+
+vi.mock('@/renderer/services/voiceService', () => ({
+  voiceService: {
+    beginTestSuspension: vi.fn(),
+    endTestSuspension: vi.fn(),
+    setLocalTestingStatus: vi.fn(),
+  },
 }));
 
 vi.mock('@/renderer/stores/osPermissionStore', () => ({
@@ -49,7 +59,9 @@ vi.mock('@/renderer/stores/osPermissionStore', () => ({
 
 import { ensureOsPermission } from '@/renderer/stores/osPermissionStore';
 import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
+import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { useMicTest } from '@/renderer/hooks/useMicTest';
+import { voiceService } from '@/renderer/services/voiceService';
 
 // Build a comprehensive mock audio pipeline
 const mockTrackStop = vi.fn();
@@ -95,6 +107,14 @@ function createMockAudioPipeline() {
 beforeEach(() => {
   vi.clearAllMocks();
   (useAudioSettingsStore as any)._reset();
+  vi.mocked(useVoiceStore.subscribe).mockImplementation(() => () => {});
+  vi.mocked((useAudioSettingsStore as any).subscribe).mockImplementation(() => () => {});
+  vi.mocked(useVoiceStore.getState).mockReturnValue({
+    audioInputDeviceId: null,
+    audioOutputDeviceId: null,
+    connectionState: 'disconnected',
+    localIsTesting: false,
+  } as any);
 
   // Mock AudioContext constructor — must use a class/function form for `new`
   const mockCtx = createMockAudioPipeline();
@@ -126,6 +146,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -211,6 +232,77 @@ describe('useMicTest', () => {
 
       expect(result.current.isTesting).toBe(true);
       expect(result.current.error).toBeNull();
+    });
+
+    it('suspends call audio while mic test runs in-call', async () => {
+      vi.mocked(useVoiceStore.getState).mockReturnValue({
+        audioInputDeviceId: null,
+        audioOutputDeviceId: null,
+        connectionState: 'connected',
+        localIsTesting: false,
+      } as any);
+      const { result } = renderHook(() => useMicTest());
+
+      await act(async () => {
+        await result.current.startTest();
+      });
+
+      expect(voiceService.beginTestSuspension).toHaveBeenCalled();
+      expect(voiceService.setLocalTestingStatus).toHaveBeenCalledWith(true);
+
+      act(() => {
+        result.current.stopTest();
+      });
+
+      expect(voiceService.endTestSuspension).toHaveBeenCalled();
+      expect(voiceService.setLocalTestingStatus).toHaveBeenCalledWith(false);
+    });
+
+    it('keeps call audio suspended while restarting an in-call test', async () => {
+      vi.useFakeTimers();
+      let voiceSubscriber: ((state: any, prev: any) => void) | undefined;
+      vi.mocked(useVoiceStore.subscribe).mockImplementation((listener: any) => {
+        voiceSubscriber = listener;
+        return () => {};
+      });
+      vi.mocked(useVoiceStore.getState).mockReturnValue({
+        audioInputDeviceId: 'mic-1',
+        audioOutputDeviceId: null,
+        connectionState: 'connected',
+        localIsTesting: false,
+      } as any);
+      const { result } = renderHook(() => useMicTest());
+
+      await act(async () => {
+        await result.current.startTest();
+      });
+
+      expect(voiceService.beginTestSuspension).toHaveBeenCalledTimes(1);
+      expect(voiceService.endTestSuspension).not.toHaveBeenCalled();
+
+      await act(async () => {
+        voiceSubscriber?.(
+          {
+            audioInputDeviceId: 'mic-2',
+            audioOutputDeviceId: null,
+          },
+          {
+            audioInputDeviceId: 'mic-1',
+            audioOutputDeviceId: null,
+          }
+        );
+        await vi.runOnlyPendingTimersAsync();
+      });
+
+      expect(voiceService.endTestSuspension).not.toHaveBeenCalled();
+      expect(voiceService.beginTestSuspension).toHaveBeenCalledTimes(1);
+
+      act(() => {
+        result.current.stopTest();
+      });
+
+      expect(voiceService.endTestSuspension).toHaveBeenCalledTimes(1);
+      vi.useRealTimers();
     });
 
     it('starts meter polling via requestAnimationFrame', async () => {

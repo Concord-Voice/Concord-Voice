@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useMemo, useState, useId } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
-import { MicOff, HeadphoneOff, Lock, Monitor, MoreVertical } from 'lucide-react';
+import { MicOff, HeadphoneOff, Lock, Monitor, MoreVertical, Wrench } from 'lucide-react';
 import { VoiceParticipantContextMenu } from './VoiceParticipantContextMenu';
 import MemberProfileCard, { type ProfileCardMember } from '../Members/MemberProfileCard';
 import { useVoiceStore, type VoiceParticipant } from '../../stores/voiceStore';
@@ -136,7 +136,11 @@ function ParticipantAvatar({
   return (
     <div className="participant-tile__avatar">
       {resolveMediaUrl(avatarUrl) ? (
-        <img src={resolveMediaUrl(avatarUrl)} alt={displayName} className="participant-tile__avatar-img" />
+        <img
+          src={resolveMediaUrl(avatarUrl)}
+          alt={displayName}
+          className="participant-tile__avatar-img"
+        />
       ) : (
         <div
           className="participant-tile__avatar-fallback"
@@ -355,6 +359,14 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
       {/* Status overlays */}
       <div className="participant-tile__overlays">
         <ParticipantStatusOverlay participant={participant} compact={compact} />
+        {participant.isTesting && (
+          <div
+            className="participant-tile__status participant-tile__status--testing"
+            title="Testing audio devices"
+          >
+            <Wrench size={compact ? 10 : 14} />
+          </div>
+        )}
         {participant.isScreenSharing && (
           <div className="participant-tile__status participant-tile__status--screen">
             <Monitor size={compact ? 10 : 14} />

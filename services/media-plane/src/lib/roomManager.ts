@@ -59,6 +59,8 @@ export interface Participant {
    * moderator-enforced over NATS (`voice.enforce.deafen`).
    */
   isDeafened: boolean;
+  /** Audio-device test indicator (#1163). UI signal only; identity comes from socket auth. */
+  isTesting: boolean;
   // ── Per-user media entitlement (#1300) ─────────────────────────────────
   /** Subscription tier label (debug/log/forward-compat only — caps below drive enforcement). */
   tier: string;
@@ -484,6 +486,7 @@ export class RoomManager {
       serverMuted: false,
       serverDeafened: false,
       isDeafened: false,
+      isTesting: false,
       tier: ent.tier,
       maxManualBitrateBps: ent.maxManualBitrateBps,
       allowedAudioTiers: [...ent.allowedAudioTiers],
@@ -532,6 +535,7 @@ export class RoomManager {
       displayName: p.displayName,
       avatarUrl: p.avatarUrl,
       isDeafened: p.isDeafened,
+      isTesting: p.isTesting,
     }));
 
     return {
@@ -1342,6 +1346,13 @@ export class RoomManager {
     if (!participant) return;
     participant.isDeafened = isDeafened;
     logger.info('User-level deafen state changed', { roomId, userId, isDeafened });
+  }
+
+  setParticipantTestingStatus(roomId: string, userId: string, isTesting: boolean): void {
+    const participant = this.getParticipant(roomId, userId);
+    if (!participant) return;
+    participant.isTesting = isTesting;
+    logger.info('Audio test state changed', { roomId, userId, isTesting });
   }
 
   /** User-level mute: pause all audio producers without setting server flags */

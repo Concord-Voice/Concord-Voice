@@ -38,9 +38,12 @@ vi.mock('@/renderer/hooks/useCameraTest', () => ({
 }));
 
 let mockConnectionState = 'disconnected';
+let mockLocalIsTesting = false;
 vi.mock('@/renderer/stores/voiceStore', () => ({
   useVoiceStore: vi.fn((s: any) =>
-    s ? s({ connectionState: mockConnectionState }) : { connectionState: mockConnectionState }
+    s
+      ? s({ connectionState: mockConnectionState, localIsTesting: mockLocalIsTesting })
+      : { connectionState: mockConnectionState, localIsTesting: mockLocalIsTesting }
   ),
 }));
 
@@ -70,6 +73,8 @@ describe('DeviceConfigSection', () => {
       toggleTest: mockToggleCameraTest,
       stopTest: vi.fn(),
     };
+    mockConnectionState = 'disconnected';
+    mockLocalIsTesting = false;
   });
 
   it('renders Input, Output, and Camera subsections', () => {
@@ -146,11 +151,21 @@ describe('DeviceConfigSection', () => {
     expect(btn).toHaveClass('settings-camera-test-btn');
   });
 
-  it('disables test buttons while in a voice call', () => {
+  it('keeps mic/output tests enabled in a voice call but leaves camera disabled', () => {
     mockConnectionState = 'connected';
     render(<DeviceConfigSection />);
     const testButtons = screen.getAllByRole('button', { name: /^Test$/ });
-    for (const b of testButtons) expect(b).toBeDisabled();
-    mockConnectionState = 'disconnected';
+    expect(testButtons[0]).not.toBeDisabled();
+    expect(testButtons[1]).not.toBeDisabled();
+    expect(testButtons[2]).toBeDisabled();
+  });
+
+  it('disables the other audio test while one is already running', () => {
+    mockLocalIsTesting = true;
+    render(<DeviceConfigSection />);
+    const testButtons = screen.getAllByRole('button', { name: /^Test$/ });
+    expect(testButtons[0]).toBeDisabled();
+    expect(testButtons[1]).toBeDisabled();
+    expect(testButtons[2]).not.toBeDisabled();
   });
 });

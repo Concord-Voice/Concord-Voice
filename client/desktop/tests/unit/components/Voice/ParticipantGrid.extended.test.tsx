@@ -52,6 +52,7 @@ const mockAudioContext = {
 
 beforeAll(() => {
   vi.spyOn(HTMLAudioElement.prototype, 'play').mockResolvedValue(undefined);
+  vi.spyOn(HTMLAudioElement.prototype, 'pause').mockImplementation(() => {});
   vi.stubGlobal(
     'AudioContext',
     vi.fn(function MockAudioContextCtor() {
@@ -182,6 +183,65 @@ describe('ParticipantGrid — extended coverage', () => {
 
       // AudioContext.setSinkId should be called with the device ID
       expect(mockAudioContext.setSinkId).toHaveBeenCalledWith('device-123');
+    });
+
+    it('retargets an already-mounted output when outputDeviceId changes', () => {
+      const stream = makeMockStream();
+      const audioContextCtor = globalThis.AudioContext as unknown as ReturnType<typeof vi.fn>;
+      const { rerender } = render(<AudioOutput stream={stream} outputDeviceId="speaker-a" />);
+
+      expect(mockAudioContext.setSinkId).toHaveBeenCalledWith('speaker-a');
+      expect(audioContextCtor).toHaveBeenCalledTimes(1);
+
+      mockAudioContext.setSinkId.mockClear();
+      mockAudioContext.createMediaElementSource.mockClear();
+
+      rerender(<AudioOutput stream={stream} outputDeviceId="speaker-b" />);
+
+      expect(mockAudioContext.setSinkId).toHaveBeenCalledWith('speaker-b');
+      expect(audioContextCtor).toHaveBeenCalledTimes(1);
+      expect(mockAudioContext.createMediaElementSource).not.toHaveBeenCalled();
+    });
+
+    it('reapplies outputDeviceId when the stream is replaced', () => {
+      const audioContextCtor = globalThis.AudioContext as unknown as ReturnType<typeof vi.fn>;
+      const { rerender } = render(
+        <AudioOutput stream={makeMockStream('stream-a')} outputDeviceId="speaker-a" />
+      );
+
+      expect(mockAudioContext.setSinkId).toHaveBeenCalledWith('speaker-a');
+      expect(audioContextCtor).toHaveBeenCalledTimes(1);
+
+      mockAudioContext.setSinkId.mockClear();
+
+      rerender(<AudioOutput stream={makeMockStream('stream-b')} outputDeviceId="speaker-a" />);
+
+      expect(audioContextCtor).toHaveBeenCalledTimes(2);
+      expect(mockAudioContext.setSinkId).toHaveBeenCalledWith('speaker-a');
+    });
+
+    it('clears failed setSinkId state so the same output can be retried', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockAudioContext.setSinkId.mockRejectedValueOnce(new Error('device unavailable'));
+
+      const stream = makeMockStream();
+      const { rerender } = render(<AudioOutput stream={stream} outputDeviceId="speaker-a" />);
+
+      expect(mockAudioContext.setSinkId).toHaveBeenCalledWith('speaker-a');
+      await Promise.resolve();
+      expect(warnSpy).toHaveBeenCalledWith(
+        'Failed to set audio output device:',
+        'device unavailable'
+      );
+
+      mockAudioContext.setSinkId.mockClear();
+      rerender(<AudioOutput stream={stream} />);
+      expect(mockAudioContext.setSinkId).not.toHaveBeenCalled();
+
+      rerender(<AudioOutput stream={stream} outputDeviceId="speaker-a" />);
+      expect(mockAudioContext.setSinkId).toHaveBeenCalledWith('speaker-a');
+
+      warnSpy.mockRestore();
     });
   });
 

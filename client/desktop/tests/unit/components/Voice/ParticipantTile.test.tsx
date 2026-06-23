@@ -82,6 +82,14 @@ describe('ParticipantTile', () => {
     expect(container.querySelector('.participant-tile__status--screen')).toBeInTheDocument();
   });
 
+  it('shows testing indicator when participant is testing audio devices', () => {
+    const { container } = render(
+      <ParticipantTile participant={makeParticipant({ isTesting: true })} />
+    );
+    expect(container.querySelector('.participant-tile__status--testing')).toBeInTheDocument();
+    expect(screen.getByTitle('Testing audio devices')).toBeInTheDocument();
+  });
+
   it('renders compact class when compact prop is true', () => {
     const { container } = render(<ParticipantTile participant={makeParticipant()} compact />);
     expect(container.querySelector('.participant-tile--compact')).toBeInTheDocument();

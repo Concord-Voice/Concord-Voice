@@ -1015,6 +1015,258 @@ describe('VoiceService', () => {
     });
   });
 
+  describe('test audio suspension (#1163)', () => {
+    it('pauses active audio producer and consumers, then restores them once', async () => {
+      const { micProducer } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const consumer = createMockConsumer('c1', 'audio', 'p1');
+      svc.consumers.set('c1', consumer);
+      mockSocket.emit.mockClear();
+
+      voiceService.beginTestSuspension();
+
+      expect(micProducer.pause).toHaveBeenCalled();
+      expect(consumer.pause).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith('pause-producer', {
+        producerId: micProducer.id,
+      });
+
+      micProducer.paused = true;
+      consumer.paused = true;
+      voiceService.endTestSuspension();
+
+      expect(micProducer.resume).toHaveBeenCalled();
+      expect(consumer.resume).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith('resume-producer', {
+        producerId: micProducer.id,
+      });
+    });
+
+    it('does not resume a suspended mic producer when unmuting during a test', async () => {
+      const { micProducer } = await joinVoiceChannel();
+      voiceService.beginTestSuspension();
+      micProducer.paused = true;
+      useVoiceStore.getState().setMuted(true);
+
+      micProducer.resume.mockClear();
+      mockSocket.emit.mockClear();
+
+      await voiceService.toggleMute();
+
+      expect(useVoiceStore.getState().isMuted).toBe(false);
+      expect(micProducer.resume).not.toHaveBeenCalled();
+      expect(mockSocket.emit).not.toHaveBeenCalledWith('resume-producer', {
+        producerId: micProducer.id,
+      });
+
+      voiceService.endTestSuspension();
+
+      expect(micProducer.resume).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith('resume-producer', {
+        producerId: micProducer.id,
+      });
+    });
+
+    it('keeps a pre-muted mic producer suspended when unmuting during a test', async () => {
+      const { micProducer } = await joinVoiceChannel();
+      micProducer.paused = true;
+      useVoiceStore.getState().setMuted(true);
+      voiceService.beginTestSuspension();
+
+      micProducer.resume.mockClear();
+      mockSocket.emit.mockClear();
+
+      await voiceService.toggleMute();
+
+      expect(useVoiceStore.getState().isMuted).toBe(false);
+      expect(micProducer.resume).not.toHaveBeenCalled();
+      expect(mockSocket.emit).not.toHaveBeenCalledWith('resume-producer', {
+        producerId: micProducer.id,
+      });
+
+      voiceService.endTestSuspension();
+
+      expect(micProducer.resume).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith('resume-producer', {
+        producerId: micProducer.id,
+      });
+    });
+
+    it('does not resume pre-paused screen audio when a test ends', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const screenAudioProducer = createMockProducer('prod-screen-audio', 'screen-audio');
+      screenAudioProducer.paused = true;
+      svc.producers.set('screen-audio', screenAudioProducer);
+
+      voiceService.beginTestSuspension();
+      screenAudioProducer.resume.mockClear();
+      mockSocket.emit.mockClear();
+
+      voiceService.endTestSuspension();
+
+      expect(screenAudioProducer.resume).not.toHaveBeenCalled();
+      expect(mockSocket.emit).not.toHaveBeenCalledWith('resume-producer', {
+        producerId: 'prod-screen-audio',
+      });
+    });
+
+    it('does not pause active screen audio during a test', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const screenAudioProducer = createMockProducer('prod-screen-audio', 'screen-audio');
+      svc.producers.set('screen-audio', screenAudioProducer);
+      mockSocket.emit.mockClear();
+
+      voiceService.beginTestSuspension();
+
+      expect(screenAudioProducer.pause).not.toHaveBeenCalled();
+      expect(mockSocket.emit).not.toHaveBeenCalledWith('pause-producer', {
+        producerId: 'prod-screen-audio',
+      });
+
+      voiceService.endTestSuspension();
+
+      expect(screenAudioProducer.resume).not.toHaveBeenCalled();
+    });
+
+    it('does not resume suspended audio consumers when undeafening during a test', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const consumer = createMockConsumer('c1', 'audio', 'p1');
+      svc.consumers.set('c1', consumer);
+      voiceService.beginTestSuspension();
+      consumer.paused = true;
+      useVoiceStore.getState().setDeafened(true);
+
+      consumer.resume.mockClear();
+
+      voiceService.toggleDeafen();
+
+      expect(useVoiceStore.getState().isDeafened).toBe(false);
+      expect(consumer.resume).not.toHaveBeenCalled();
+
+      voiceService.endTestSuspension();
+
+      expect(consumer.resume).toHaveBeenCalled();
+    });
+
+    it('keeps pre-deafened audio consumers suspended when undeafening during a test', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const consumer = createMockConsumer('c1', 'audio', 'p1');
+      consumer.paused = true;
+      svc.consumers.set('c1', consumer);
+      useVoiceStore.getState().setDeafened(true);
+      voiceService.beginTestSuspension();
+
+      consumer.resume.mockClear();
+
+      voiceService.toggleDeafen();
+
+      expect(useVoiceStore.getState().isDeafened).toBe(false);
+      expect(consumer.resume).not.toHaveBeenCalled();
+
+      voiceService.endTestSuspension();
+
+      expect(consumer.resume).toHaveBeenCalled();
+    });
+
+    it('does not resume manually paused audio consumers when a test ends', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const consumer = createMockConsumer('c1', 'audio', 'p1');
+      svc.consumers.set('c1', consumer);
+
+      voiceService.pauseConsumer('c1');
+      consumer.paused = true;
+      consumer.resume.mockClear();
+      mockSocket.emit.mockClear();
+
+      voiceService.beginTestSuspension();
+      voiceService.endTestSuspension();
+
+      expect(consumer.resume).not.toHaveBeenCalled();
+      expect(mockSocket.emit).not.toHaveBeenCalledWith('resume-consumer', {
+        consumerId: 'c1',
+      });
+    });
+
+    it('does not resume server-side consumers when audio output should stay paused', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const consumer = createMockConsumer('c1', 'audio', 'p1');
+      svc.consumers.set('c1', consumer);
+      voiceService.beginTestSuspension();
+      consumer.paused = true;
+      svc.testServerPausedConsumerIds.add('c1');
+      mockSocket.emit.mockClear();
+      useVoiceStore.getState().setDeafened(true);
+
+      voiceService.endTestSuspension();
+
+      expect(consumer.resume).not.toHaveBeenCalled();
+      expect(mockSocket.emit).not.toHaveBeenCalledWith('resume-consumer', {
+        consumerId: 'c1',
+      });
+    });
+
+    it('resumes server-side consumers held by a deafened test when undeafening', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const consumer = createMockConsumer('c1', 'audio', 'p1');
+      svc.consumers.set('c1', consumer);
+      voiceService.beginTestSuspension();
+      consumer.paused = true;
+      svc.testServerPausedConsumerIds.add('c1');
+      useVoiceStore.getState().setDeafened(true);
+
+      voiceService.endTestSuspension();
+      mockSocket.emit.mockClear();
+      consumer.resume.mockClear();
+
+      voiceService.toggleDeafen();
+
+      expect(useVoiceStore.getState().isDeafened).toBe(false);
+      expect(consumer.resume).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith('resume-consumer', {
+        consumerId: 'c1',
+      });
+    });
+
+    it('keeps a replaced mic producer paused during a test suspension', async () => {
+      const { micProducer } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      voiceService.beginTestSuspension();
+      micProducer.paused = true;
+      micProducer.resume.mockClear();
+
+      await svc.liveReplaceAudioTrack();
+
+      expect(micProducer.resume).not.toHaveBeenCalled();
+
+      voiceService.endTestSuspension();
+
+      expect(micProducer.resume).toHaveBeenCalled();
+    });
+
+    it('holds a recreated mic producer during a test suspension', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const newProducer = createMockProducer('prod-mic-new', 'mic');
+      sendTransport.produce.mockResolvedValue(newProducer);
+      voiceService.beginTestSuspension();
+      mockSocket.emit.mockClear();
+
+      await svc.liveReproduceAudio();
+
+      expect(newProducer.pause).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith('pause-producer', {
+        producerId: 'prod-mic-new',
+      });
+    });
+  });
+
   // ===== pauseConsumer / resumeConsumer =====
 
   describe('pauseConsumer / resumeConsumer', () => {
@@ -1920,6 +2172,27 @@ describe('VoiceService', () => {
       expect(useVoiceStore.getState().participants['user-2']?.isMuted).toBe(false);
     });
 
+    it('handles participant-testing-changed event', async () => {
+      await joinVoiceChannel();
+
+      useVoiceStore.getState().addParticipant({
+        userId: 'user-2',
+        username: 'other',
+        isMuted: false,
+        isDeafened: false,
+        isSpeaking: false,
+        isVideoOn: false,
+        isScreenSharing: false,
+        serverMuted: false,
+        serverDeafened: false,
+      });
+
+      const handler = socketListeners['participant-testing-changed']?.[0];
+      handler?.({ userId: 'user-2', isTesting: true });
+
+      expect(useVoiceStore.getState().participants['user-2']?.isTesting).toBe(true);
+    });
+
     it('handles producer-closed event', async () => {
       await joinVoiceChannel();
 
@@ -2011,6 +2284,53 @@ describe('VoiceService', () => {
       const participant = useVoiceStore.getState().participants['user-2'];
       expect(participant).toBeDefined();
       expect(participant?.audioStream).toBeDefined();
+    });
+
+    it('keeps audio consumers created during a test suspension paused until restore', async () => {
+      const { recvTransport } = await joinVoiceChannel();
+      useVoiceStore.getState().addParticipant({
+        userId: 'user-2',
+        username: 'other',
+        isMuted: false,
+        isDeafened: false,
+        isSpeaking: false,
+        isVideoOn: false,
+        isScreenSharing: false,
+      });
+
+      const consumer = createMockConsumer('cons-test', 'audio', 'prod-remote');
+      recvTransport.consume.mockResolvedValue(consumer);
+      setupEmitResponses({
+        consume: {
+          id: 'cons-test',
+          producerId: 'prod-remote',
+          kind: 'audio',
+          rtpParameters: {},
+          source: 'mic',
+          producerUserId: 'user-2',
+        },
+        'resume-consumer': undefined,
+      });
+
+      const svc = voiceService as any;
+      voiceService.beginTestSuspension();
+      mockSocket.emit.mockClear();
+
+      await svc.consumeProducer('prod-remote', 'user-2', 'audio');
+
+      expect(consumer.pause).toHaveBeenCalled();
+      expect(mockSocket.emit).not.toHaveBeenCalledWith('resume-consumer', {
+        consumerId: 'cons-test',
+      });
+
+      consumer.paused = true;
+      mockSocket.emit.mockClear();
+      voiceService.endTestSuspension();
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('resume-consumer', {
+        consumerId: 'cons-test',
+      });
+      expect(consumer.resume).toHaveBeenCalled();
     });
 
     it('skips consume when no device', async () => {

@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useCallback } from 'react';
 import { useVoiceStore } from '../../stores/voiceStore';
 import { useUserStore } from '../../stores/userStore';
 import { useAudioSettingsStore } from '../../stores/audioSettingsStore';
@@ -34,11 +34,17 @@ export const AudioOutput: React.FC<{
   const boostGainRef = useRef<GainNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const boostTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
   // Output-device fallback path creates a separate <audio> element bound to a
   // MediaStreamDestination. Track it so we can pause + detach on unmount —
   // without this, the fallback element keeps playing the silent stream and
   // retains the AudioContext destination graph.
   const fallbackElRef = useRef<HTMLAudioElement | null>(null);
+  const fallbackDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const appliedOutputDeviceRef = useRef(false);
+  const appliedSinkIdRef = useRef<string | null>(null);
+  const latestOutputDeviceIdRef = useRef(outputDeviceId);
+  latestOutputDeviceIdRef.current = outputDeviceId;
 
   const outputVolume = useAudioSettingsStore((s) => s.outputVolume);
   const quietBoost = useAudioSettingsStore((s) => s.quietBoost);
@@ -46,6 +52,57 @@ export const AudioOutput: React.FC<{
   const participantVolume = useAudioSettingsStore((s) =>
     userId ? (s.perParticipantVolume[userId] ?? 100) : 100
   );
+
+  const retargetOutputDevice = useCallback((selectedOutputDeviceId?: string) => {
+    const ctx = ctxRef.current;
+    const boostGain = boostGainRef.current;
+    const el = audioElRef.current;
+    if (!ctx || !boostGain || ctx.state === 'closed') return;
+    if (!selectedOutputDeviceId && !appliedOutputDeviceRef.current) return;
+
+    const sinkId = selectedOutputDeviceId ?? '';
+    if (appliedOutputDeviceRef.current && appliedSinkIdRef.current === sinkId) return;
+    appliedOutputDeviceRef.current = true;
+    appliedSinkIdRef.current = sinkId;
+    const resetAppliedSinkOnFailure = () => {
+      if (appliedSinkIdRef.current !== sinkId) return;
+      appliedOutputDeviceRef.current = false;
+      appliedSinkIdRef.current = null;
+    };
+
+    // Prefer AudioContext.setSinkId (Chrome 110+), fall back to routing through
+    // a MediaStreamDestination + <audio> with setSinkId.
+    if ('setSinkId' in ctx) {
+      (ctx as AudioContext & { setSinkId: (id: string) => Promise<void> })
+        .setSinkId(sinkId)
+        .catch((err) => {
+          console.warn('Failed to set audio output device:', errorMessage(err));
+          resetAppliedSinkOnFailure();
+        });
+      return;
+    }
+
+    if (!el || !('setSinkId' in el)) return;
+    if (!selectedOutputDeviceId && !fallbackElRef.current) return;
+
+    if (!fallbackElRef.current) {
+      boostGain.disconnect(ctx.destination);
+      const fallbackDest = ctx.createMediaStreamDestination();
+      fallbackDestRef.current = fallbackDest;
+      boostGain.connect(fallbackDest);
+      const fallbackEl = document.createElement('audio');
+      fallbackEl.srcObject = fallbackDest.stream;
+      fallbackEl.play().catch(() => {});
+      fallbackElRef.current = fallbackEl;
+    }
+
+    (fallbackElRef.current as HTMLAudioElement & { setSinkId: (id: string) => Promise<void> })
+      .setSinkId(sinkId)
+      .catch((err) => {
+        console.warn('Failed to set fallback audio output device:', errorMessage(err));
+        resetAppliedSinkOnFailure();
+      });
+  }, []);
 
   // Set up the Web Audio processing chain.
   //
@@ -65,6 +122,7 @@ export const AudioOutput: React.FC<{
   // second invocation. Creating a fresh element per mount avoids this.
   useEffect(() => {
     const el = document.createElement('audio');
+    audioElRef.current = el;
 
     // Play the consumer stream through the <audio> element first
     el.srcObject = stream;
@@ -106,33 +164,7 @@ export const AudioOutput: React.FC<{
     analyserRef.current = analyser;
     boostGainRef.current = boostGain;
     volumeGainRef.current = volumeGain;
-
-    // Set output device: prefer AudioContext.setSinkId (Chrome 110+),
-    // fall back to routing through a MediaStreamDestination + <audio> with setSinkId
-    if (outputDeviceId) {
-      if ('setSinkId' in ctx) {
-        (ctx as AudioContext & { setSinkId: (id: string) => Promise<void> })
-          .setSinkId(outputDeviceId)
-          .catch((err) => {
-            console.warn('Failed to set audio output device:', errorMessage(err));
-          });
-      } else if ('setSinkId' in el) {
-        // Fallback: disconnect from ctx.destination, route through a destination node
-        // to a separate <audio> element that supports setSinkId
-        boostGain.disconnect(ctx.destination);
-        const fallbackDest = ctx.createMediaStreamDestination();
-        boostGain.connect(fallbackDest);
-        const fallbackEl = document.createElement('audio');
-        fallbackEl.srcObject = fallbackDest.stream;
-        (fallbackEl as HTMLAudioElement & { setSinkId: (id: string) => Promise<void> })
-          .setSinkId(outputDeviceId)
-          .catch((err) => {
-            console.warn('Failed to set fallback audio output device:', errorMessage(err));
-          });
-        fallbackEl.play().catch(() => {});
-        fallbackElRef.current = fallbackEl;
-      }
-    }
+    retargetOutputDevice(latestOutputDeviceIdRef.current);
 
     console.debug('[AudioOutput] setup', {
       ctxState: ctx.state,
@@ -151,11 +183,15 @@ export const AudioOutput: React.FC<{
       // Stop playback and unbind the stream so the element can be GC'd.
       el.pause();
       el.srcObject = null;
+      audioElRef.current = null;
       if (fallbackElRef.current) {
         fallbackElRef.current.pause();
         fallbackElRef.current.srcObject = null;
         fallbackElRef.current = null;
       }
+      fallbackDestRef.current = null;
+      appliedOutputDeviceRef.current = false;
+      appliedSinkIdRef.current = null;
       if (ctx.state !== 'closed') ctx.close().catch(() => {});
       ctxRef.current = null;
       volumeGainRef.current = null;
@@ -164,7 +200,12 @@ export const AudioOutput: React.FC<{
     };
     // `userId` is stable for a given AudioOutput instance (the parent keys by
     // userId), but ESLint needs it listed since we read it during setup.
-  }, [stream, outputDeviceId, userId]);
+  }, [stream, userId, retargetOutputDevice]);
+
+  // Retarget the active output device without rebuilding the audio graph.
+  useEffect(() => {
+    retargetOutputDevice(outputDeviceId);
+  }, [outputDeviceId, retargetOutputDevice]);
 
   // Update output volume in real-time. Applies master × per-participant.
   useEffect(() => {
