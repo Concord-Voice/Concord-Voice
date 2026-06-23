@@ -627,6 +627,26 @@ async function main() {
       }
     });
 
+    // ── set-preferred-layers ─────────────────────────────────────────
+    socket.on('set-preferred-layers', async (payload, callback?) => {
+      try {
+        const roomId = data.roomId;
+        if (!roomId) {
+          callback?.({ error: 'Not in a room' });
+          return;
+        }
+
+        const result = await roomManager.setPreferredCameraLayers(roomId, data.userId, payload);
+        callback?.({ success: true, effectiveLayers: result.effectiveLayers });
+      } catch (error) {
+        logger.warn('Set preferred layers rejected', {
+          userId: data.userId,
+          error: error instanceof Error ? error.message : 'unknown',
+        });
+        callback?.({ error: 'Failed to set preferred layers' });
+      }
+    });
+
     // ── pause-consumer ──────────────────────────────────────────────
     socket.on('pause-consumer', async ({ consumerId }, callback?) => {
       try {
@@ -867,6 +887,10 @@ async function main() {
         kind: event.kind,
         source: event.source,
       });
+    }
+
+    if (event.type === 'camera-layering-gate') {
+      io.to(event.roomId).emit('camera-layering-gate', { enabled: event.enabled });
     }
   });
 

@@ -48,6 +48,12 @@ import type {
 import { notificationSoundService } from './notificationSoundService';
 import { selectCodecFromCascade, type CodecLookup } from './voiceCodecSelection';
 import { ConsumerPauseCoordinator } from './consumerPauseCoordinator';
+import { buildCameraEncodingPlan } from './cameraLayering';
+import {
+  computeRemoteVideoLayerRequest,
+  type RemoteVideoLayerRequest,
+  type RemoteVideoRole,
+} from './remoteVideoLayerPolicy';
 import {
   applyLegacyDecryptPipeline,
   type DecryptRecoveryCallbacks,
@@ -59,6 +65,7 @@ import { errorMessage } from '../utils/redactError';
 // frame drops, BUNDLE collisions, or key rotation issues. When false,
 // only errors, warnings, and key lifecycle events are logged.
 const E2EE_VERBOSE = false;
+const MAX_REMOTE_VIDEO_DEVICE_PIXEL_RATIO = 8;
 
 // Detect which Insertable Streams API is available at module load.
 //
@@ -76,20 +83,35 @@ interface RtpSenderWithEncodedStreams {
 
 /** Decoder health zone classification for IGNIS profiling. */
 type DecoderHealthZone = 'green' | 'yellow' | 'red';
+type ConsumerLayerSelection = { spatialLayer: number; temporalLayer: number };
 
 /** SFU-layer-aware consumer — mediasoup-client exposes currentLayers/setPreferredLayers
  *  on the server but not in the public client type definitions. */
 interface ConsumerWithLayers {
-  currentLayers?: { spatialLayer: number; temporalLayer: number };
-  setPreferredLayers(layers: { spatialLayer: number; temporalLayer: number }): void;
+  currentLayers?: ConsumerLayerSelection;
+  setPreferredLayers(layers: ConsumerLayerSelection): void;
 }
+
+interface RemoteVideoTileRenderState {
+  visible: boolean;
+  cssWidth: number;
+  cssHeight: number;
+  role: RemoteVideoRole;
+  focusedWindow: boolean;
+}
+
+interface RemoteVideoLayerPayload extends RemoteVideoTileRenderState, RemoteVideoLayerRequest {
+  devicePixelRatio: number;
+  pressureStepDown: boolean;
+}
+
+type CameraPressureLayerRequestResult = 'emitted' | 'handled' | 'fallback';
 
 interface TestSuspensionRestorePolicy {
   keepAudioOutPaused: boolean;
   keepProducersPaused: boolean;
   keepMicPaused: boolean;
 }
-
 const HAS_ENCODED_STREAMS =
   typeof RTCRtpSender !== 'undefined' &&
   typeof (RTCRtpSender.prototype as RtpSenderWithEncodedStreams).createEncodedStreams ===
@@ -761,9 +783,21 @@ class VoiceService {
     return Math.max(100, Math.min(10_000, Math.round((targetBps * 0.5) / 1000)));
   }
 
+  private cameraStartBitrate(encodings: mediasoupTypes.RtpEncodingParameters[]): number {
+    let maxBitrate = 0;
+    for (const encoding of encodings) {
+      const bitrate = encoding.maxBitrate;
+      if (typeof bitrate === 'number' && Number.isFinite(bitrate)) {
+        maxBitrate = Math.max(maxBitrate, bitrate);
+      }
+    }
+    return maxBitrate || 2_500_000;
+  }
+
   /**
-   * Pick the best codec for camera video. Single-layer encoding only (E2EE
-   * requires byte-for-byte SFU forwarding — SVC/simulcast break AES-GCM #291).
+   * Pick the best codec for camera video. Single-encoding remains the default;
+   * when the room gate enables camera layering, buildCameraEncodingPlan supplies
+   * SVC or simulcast encodings for compatible codecs.
    *
    * Cascade: user pref → AV1 → HEVC → H264 High → VP9:2 (HDR) → H264 → VP9 → VP8
    * Two-pass: HW-accelerated first, then SW fallback.
@@ -795,7 +829,32 @@ class VoiceService {
     const base: Partial<mediasoupTypes.RtpEncodingParameters> =
       prio === 'off' ? {} : { priority: prio, networkPriority: prio };
 
-    return { codec, encodings: [{ ...base, maxBitrate: preset.maxBitrate }] };
+    if (!this.cameraLayeringEnabled) {
+      return { codec, encodings: [{ ...base, maxBitrate: preset.maxBitrate }] };
+    }
+
+    const layeringCodec = this.pickCameraLayeringCodec(codec);
+    const plan = buildCameraEncodingPlan({
+      codec: layeringCodec,
+      maxBitrate: preset.maxBitrate,
+      scalabilityMode: vs.scalabilityMode,
+      priority: base,
+    });
+    return { codec: layeringCodec, encodings: plan.encodings };
+  }
+
+  private pickCameraLayeringCodec(
+    fallbackCodec?: mediasoupTypes.RtpCodecCapability
+  ): mediasoupTypes.RtpCodecCapability | undefined {
+    // Layering rooms use the approved SVC-first ladder; user preference only
+    // participates through the general-cascade fallback below.
+    const candidates = ['video/AV1', 'video/VP9', 'video/H264:640034', 'video/H264', 'video/VP8'];
+    for (const key of candidates) {
+      if (!this.isInCodecFloor(key)) continue;
+      const codec = this.findSendCodec(key);
+      if (codec) return codec;
+    }
+    return fallbackCodec;
   }
 
   /**
@@ -1192,7 +1251,7 @@ class VoiceService {
 
     // Pick new codec respecting the floor
     const { codec, encodings } = this.pickCameraCodec();
-    const cameraBitrate = encodings[0]?.maxBitrate ?? 2_500_000;
+    const cameraBitrate = this.cameraStartBitrate(encodings);
 
     const newProducer = await this.sendTransport.produce({
       track,
@@ -1419,6 +1478,15 @@ class VoiceService {
    * tile is hidden. Survives consumer create/teardown.
    */
   private readonly tileVisibilityByUser = new Map<string, Map<string, boolean>>();
+  private cameraLayeringEnabled = false;
+  private cameraLayeringReproduceInFlight = false;
+  private cameraLayeringReproducePending = false;
+  private readonly remoteVideoPressureByUser = new Map<string, boolean>();
+  private readonly lastPreferredLayerKeyByConsumer = new Map<string, string>();
+  private readonly remoteVideoRenderStateByUser = new Map<
+    string,
+    Map<string, RemoteVideoTileRenderState>
+  >();
   /** Whether the whole window is currently hidden (document.hidden). */
   private documentHidden = false;
   /** Bound visibilitychange handler, retained for removeEventListener. */
@@ -1881,6 +1949,7 @@ class VoiceService {
     this.consumers.clear();
     this.consumerMeta.clear();
     this.pendingScreenAudioProducers.clear();
+    this.resetRemoteVideoLayeringState();
 
     for (const t of [this.sendTransport, this.recvTransportAudio, this.recvTransportVideo]) {
       try {
@@ -2172,7 +2241,7 @@ class VoiceService {
       const track = this.localCameraStream.getVideoTracks()[0];
 
       const { codec, encodings } = this.pickCameraCodec();
-      const cameraBitrate = encodings[0]?.maxBitrate ?? 2_500_000;
+      const cameraBitrate = this.cameraStartBitrate(encodings);
 
       const producer = await this.sendTransport.produce({
         track,
@@ -2902,6 +2971,7 @@ class VoiceService {
         consumer.close();
         this.consumers.delete(consumerId);
         this.consumerMeta.delete(consumerId);
+        this.lastPreferredLayerKeyByConsumer.delete(consumerId);
         this.pauseCoordinator.clearConsumer(consumerId);
       }
     }
@@ -2941,6 +3011,7 @@ class VoiceService {
           consumer.close();
           this.consumers.delete(cid);
           this.consumerMeta.delete(cid);
+          this.lastPreferredLayerKeyByConsumer.delete(cid);
           this.pauseCoordinator.clearConsumer(cid);
           this.socket?.emit('close-consumer', { consumerId: cid });
         }
@@ -2971,6 +3042,49 @@ class VoiceService {
   }
 
   // ─── Visibility-pause (#1541) ──────────────────────────────────────
+
+  private resetRemoteVideoLayeringState(): void {
+    this.cameraLayeringEnabled = false;
+    this.cameraLayeringReproducePending = false;
+    this.remoteVideoPressureByUser.clear();
+    this.lastPreferredLayerKeyByConsumer.clear();
+    this.remoteVideoRenderStateByUser.clear();
+  }
+
+  private scheduleCameraLayeringReproduce(): void {
+    if (this.cameraLayeringReproduceInFlight) {
+      this.cameraLayeringReproducePending = true;
+      return;
+    }
+
+    this.cameraLayeringReproduceInFlight = true;
+    void this.drainCameraLayeringReproduceQueue();
+  }
+
+  private async drainCameraLayeringReproduceQueue(): Promise<void> {
+    try {
+      do {
+        this.cameraLayeringReproducePending = false;
+        try {
+          await this.fastReproduceCamera();
+        } catch (err) {
+          console.warn(
+            '[camera-layering] failed to re-produce camera after gate change:',
+            errorMessage(err)
+          );
+        }
+      } while (this.cameraLayeringReproducePending);
+    } finally {
+      this.cameraLayeringReproduceInFlight = false;
+    }
+  }
+
+  private findCameraConsumerIdForUser(userId: string): string | null {
+    for (const [id, meta] of this.consumerMeta) {
+      if (meta.source === 'camera' && meta.producerUserId === userId) return id;
+    }
+    return null;
+  }
 
   /** Remote camera consumer ids for a given producing user. */
   private cameraConsumerIdsForUser(userId: string): string[] {
@@ -3003,6 +3117,161 @@ class VoiceService {
     else this.pauseCoordinator.removeReason(consumerId, 'visibility');
   }
 
+  private remoteVideoDevicePixelRatio(): number {
+    const dpr = globalThis.devicePixelRatio || 1;
+    return Number.isFinite(dpr) && dpr > 0 ? Math.min(dpr, MAX_REMOTE_VIDEO_DEVICE_PIXEL_RATIO) : 1;
+  }
+
+  private layerPayloadForTileState(
+    userId: string,
+    state: RemoteVideoTileRenderState,
+    pressureStepDown = this.remoteVideoPressureByUser.get(userId) === true
+  ): RemoteVideoLayerPayload {
+    const devicePixelRatio = this.remoteVideoDevicePixelRatio();
+    const request = computeRemoteVideoLayerRequest({
+      ...state,
+      devicePixelRatio,
+      pressureStepDown,
+    });
+
+    return {
+      ...state,
+      ...request,
+      devicePixelRatio,
+      pressureStepDown,
+    };
+  }
+
+  private computePreferredLayerPayloadForUser(
+    userId: string,
+    pressureStepDown?: boolean
+  ): RemoteVideoLayerPayload | null {
+    const states = this.remoteVideoRenderStateByUser.get(userId);
+    if (!states || states.size === 0) return null;
+
+    let bestVisible: RemoteVideoLayerPayload | null = null;
+    let hidden: RemoteVideoLayerPayload | null = null;
+
+    for (const state of states.values()) {
+      const payload = this.layerPayloadForTileState(userId, state, pressureStepDown);
+      if (!payload.visible) {
+        hidden ??= payload;
+        continue;
+      }
+
+      if (
+        !bestVisible ||
+        payload.spatialLayer > bestVisible.spatialLayer ||
+        (payload.spatialLayer === bestVisible.spatialLayer &&
+          payload.temporalLayer > bestVisible.temporalLayer)
+      ) {
+        bestVisible = payload;
+      }
+    }
+
+    return bestVisible ?? hidden;
+  }
+
+  private clampRemoteVideoLayer(layer: number): 0 | 1 | 2 {
+    if (layer <= 0) return 0;
+    if (layer >= 2) return 2;
+    return 1;
+  }
+
+  private emitPreferredLayers(consumerId: string, payload: RemoteVideoLayerPayload): void {
+    if (!this.socket) return;
+    const key = [
+      payload.spatialLayer,
+      payload.temporalLayer,
+      payload.visible,
+      payload.cssWidth,
+      payload.cssHeight,
+      payload.devicePixelRatio,
+      payload.role,
+      payload.focusedWindow,
+      payload.pressureStepDown,
+    ].join(':');
+    if (this.lastPreferredLayerKeyByConsumer.get(consumerId) === key) return;
+    this.lastPreferredLayerKeyByConsumer.set(consumerId, key);
+    this.socket.emit('set-preferred-layers', {
+      consumerId,
+      spatialLayer: payload.spatialLayer,
+      temporalLayer: payload.temporalLayer,
+      visible: payload.visible,
+      cssWidth: payload.cssWidth,
+      cssHeight: payload.cssHeight,
+      devicePixelRatio: payload.devicePixelRatio,
+      role: payload.role,
+      focusedWindow: payload.focusedWindow,
+      pressureStepDown: payload.pressureStepDown,
+    });
+  }
+
+  private emitPreferredLayersForUser(userId: string): void {
+    const consumerId = this.findCameraConsumerIdForUser(userId);
+    if (!consumerId) return;
+
+    const payload = this.computePreferredLayerPayloadForUser(userId);
+    if (!payload) return;
+
+    this.emitPreferredLayers(consumerId, payload);
+  }
+
+  private tryEmitCameraPressureLayerRequest(
+    consumerId: string,
+    currentLayers: ConsumerLayerSelection | undefined
+  ): CameraPressureLayerRequestResult {
+    const meta = this.consumerMeta.get(consumerId);
+    if (meta?.source !== 'camera' || !this.socket) return 'fallback';
+
+    const targetConsumerId = this.findCameraConsumerIdForUser(meta.producerUserId);
+    if (!targetConsumerId) return 'fallback';
+
+    const states = this.remoteVideoRenderStateByUser.get(meta.producerUserId);
+    if (!states || states.size === 0) return 'fallback';
+
+    const payload = this.computePreferredLayerPayloadForUser(meta.producerUserId, true);
+    if (!payload) return 'handled';
+
+    if (currentLayers) {
+      const spatialLayer = this.clampRemoteVideoLayer(
+        Math.min(payload.spatialLayer, currentLayers.spatialLayer)
+      );
+      const temporalLayer = this.clampRemoteVideoLayer(
+        Math.min(payload.temporalLayer, currentLayers.temporalLayer)
+      );
+      if (
+        spatialLayer >= currentLayers.spatialLayer &&
+        temporalLayer >= currentLayers.temporalLayer
+      ) {
+        return 'handled';
+      }
+
+      this.remoteVideoPressureByUser.set(meta.producerUserId, true);
+      this.emitPreferredLayers(targetConsumerId, {
+        ...payload,
+        spatialLayer,
+        temporalLayer,
+      });
+      return 'emitted';
+    }
+
+    this.remoteVideoPressureByUser.set(meta.producerUserId, true);
+    this.emitPreferredLayers(targetConsumerId, payload);
+    return 'emitted';
+  }
+
+  private clearRemoteVideoPressureAndEmit(): void {
+    const pressuredUserIds = [...this.remoteVideoPressureByUser.entries()]
+      .filter(([, pressured]) => pressured)
+      .map(([userId]) => userId);
+
+    for (const userId of pressuredUserIds) {
+      this.remoteVideoPressureByUser.delete(userId);
+      this.emitPreferredLayersForUser(userId);
+    }
+  }
+
   /**
    * Renderer reports whether ONE camera tile (a stable per-instance `tileId`) is visible.
    * The same participant can render in several tiles at once (grid + bar + PiP); the consumer
@@ -3018,6 +3287,33 @@ class VoiceService {
     }
   }
 
+  setRemoteVideoRenderState(
+    userId: string,
+    tileId: string,
+    state: {
+      visible: boolean;
+      cssWidth: number;
+      cssHeight: number;
+      role: RemoteVideoRole;
+      focusedWindow: boolean;
+    }
+  ): void {
+    const tiles =
+      this.remoteVideoRenderStateByUser.get(userId) ??
+      new Map<string, RemoteVideoTileRenderState>();
+    tiles.set(tileId, {
+      visible: state.visible,
+      cssWidth: state.cssWidth,
+      cssHeight: state.cssHeight,
+      role: state.role,
+      focusedWindow: state.focusedWindow,
+    });
+    this.remoteVideoRenderStateByUser.set(userId, tiles);
+
+    this.setRemoteVideoVisibility(userId, state.visible, tileId);
+    this.emitPreferredLayersForUser(userId);
+  }
+
   /**
    * Deregister a camera tile on unmount — NOT a "report hidden", so a closing PiP frame
    * doesn't freeze a still-visible grid tile. Prunes the user entry when empty so the map
@@ -3025,17 +3321,28 @@ class VoiceService {
    */
   removeRemoteVideoTile(userId: string, tileId: string): void {
     const tiles = this.tileVisibilityByUser.get(userId);
-    if (!tiles) return;
-    tiles.delete(tileId);
-    if (tiles.size === 0) this.tileVisibilityByUser.delete(userId);
-    for (const id of this.cameraConsumerIdsForUser(userId)) {
-      this.updateVisibilityReason(id, userId);
+    if (tiles) {
+      tiles.delete(tileId);
+      if (tiles.size === 0) this.tileVisibilityByUser.delete(userId);
+      for (const id of this.cameraConsumerIdsForUser(userId)) {
+        this.updateVisibilityReason(id, userId);
+      }
     }
+
+    const renderStates = this.remoteVideoRenderStateByUser.get(userId);
+    if (!renderStates) return;
+    renderStates.delete(tileId);
+    if (renderStates.size === 0) {
+      this.remoteVideoRenderStateByUser.delete(userId);
+      return;
+    }
+    this.emitPreferredLayersForUser(userId);
   }
 
   /** Apply the current visibility intent to a freshly-routed camera consumer. */
   private applyInitialVisibilityReason(consumerId: string, userId: string): void {
     this.updateVisibilityReason(consumerId, userId);
+    this.emitPreferredLayersForUser(userId);
   }
 
   /** Window hidden/shown → fan the visibility reason across all remote video consumers. */
@@ -3065,6 +3372,7 @@ class VoiceService {
     }
     this.documentHidden = false;
     this.tileVisibilityByUser.clear();
+    this.resetRemoteVideoLayeringState();
   }
 
   /** Get consumer IDs filtered by source (e.g. 'audio', 'camera', 'screen'). No filter returns all. */
@@ -3544,6 +3852,7 @@ class VoiceService {
         console.debug('[consume] transport closed for consumer', consumer.id);
         this.consumers.delete(consumer.id);
         this.consumerMeta.delete(consumer.id);
+        this.lastPreferredLayerKeyByConsumer.delete(consumer.id);
         this.pauseCoordinator.clearConsumer(consumer.id);
         this.testSuspendedConsumerIds.delete(consumer.id);
         this.testRestoreEligibleConsumerIds.delete(consumer.id);
@@ -3684,6 +3993,7 @@ class VoiceService {
           consumer.close();
           this.consumers.delete(consumerId);
           this.consumerMeta.delete(consumerId);
+          this.lastPreferredLayerKeyByConsumer.delete(consumerId);
           this.pauseCoordinator.clearConsumer(consumerId);
           break;
         }
@@ -3827,6 +4137,13 @@ class VoiceService {
       this.handleCodecFloorChange(previousFloor, codecFloor);
     });
 
+    this.socket.on('camera-layering-gate', ({ enabled }: { enabled: boolean }) => {
+      const nextEnabled = enabled === true;
+      if (this.cameraLayeringEnabled === nextEnabled) return;
+      this.cameraLayeringEnabled = nextEnabled;
+      this.scheduleCameraLayeringReproduce();
+    });
+
     this.socket.on('consumer-closed', ({ consumerId }) => {
       const consumer = this.consumers.get(consumerId);
       if (consumer) {
@@ -3840,6 +4157,7 @@ class VoiceService {
         consumer.close();
         this.consumers.delete(consumerId);
         this.consumerMeta.delete(consumerId);
+        this.lastPreferredLayerKeyByConsumer.delete(consumerId);
         this.pauseCoordinator.clearConsumer(consumerId);
       }
     });
@@ -3971,12 +4289,27 @@ class VoiceService {
   private handleRedZone(
     consumer: mediasoupTypes.Consumer,
     consumerWithLayers: ConsumerWithLayers,
-    currentLayers: { spatialLayer: number; temporalLayer: number } | undefined,
+    currentLayers: ConsumerLayerSelection | undefined,
     rho: number,
     p95DecodeMs: number,
     currentFps: number
   ): void {
     if (currentLayers && currentLayers.spatialLayer > 0) {
+      const pressureResult = this.tryEmitCameraPressureLayerRequest(consumer.id, currentLayers);
+      if (pressureResult === 'emitted') {
+        console.warn(
+          'IGNIS RED: lowering camera layers via render policy for consumer:',
+          consumer.id,
+          'rho:',
+          rho.toFixed(2),
+          'decode p95ms:',
+          p95DecodeMs.toFixed(1),
+          'fps:',
+          currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
+        );
+        return;
+      }
+      if (pressureResult === 'handled') return;
       consumerWithLayers.setPreferredLayers({
         spatialLayer: currentLayers.spatialLayer - 1,
         temporalLayer: currentLayers.temporalLayer,
@@ -3995,6 +4328,17 @@ class VoiceService {
     }
 
     if (currentLayers && currentLayers.temporalLayer > 0) {
+      const pressureResult = this.tryEmitCameraPressureLayerRequest(consumer.id, currentLayers);
+      if (pressureResult === 'emitted') {
+        console.warn(
+          'IGNIS RED: lowering camera temporal demand via render policy for consumer:',
+          consumer.id,
+          'rho:',
+          rho.toFixed(2)
+        );
+        return;
+      }
+      if (pressureResult === 'handled') return;
       consumerWithLayers.setPreferredLayers({
         spatialLayer: currentLayers.spatialLayer,
         temporalLayer: currentLayers.temporalLayer - 1,
@@ -4070,25 +4414,72 @@ class VoiceService {
       return 'red';
     }
     if (rho >= 0.8) {
-      if (currentLayers && currentLayers.temporalLayer > 0) {
-        consumerWithLayers.setPreferredLayers({
-          spatialLayer: currentLayers.spatialLayer,
-          temporalLayer: currentLayers.temporalLayer - 1,
-        });
-        console.warn(
-          'IGNIS YELLOW: lowering temporal layer for consumer:',
-          consumer.id,
-          'rho:',
-          rho.toFixed(2),
-          'decode p95ms:',
-          p95DecodeMs.toFixed(1),
-          'fps:',
-          currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
-        );
-      }
-      return worstZone === 'red' ? 'red' : 'yellow';
+      return this.handleYellowZone(
+        consumer,
+        consumerWithLayers,
+        currentLayers,
+        rho,
+        p95DecodeMs,
+        currentFps,
+        worstZone
+      );
     }
     return worstZone;
+  }
+
+  private handleYellowZone(
+    consumer: mediasoupTypes.Consumer,
+    consumerWithLayers: ConsumerWithLayers,
+    currentLayers: ConsumerLayerSelection | undefined,
+    rho: number,
+    p95DecodeMs: number,
+    currentFps: number,
+    worstZone: DecoderHealthZone
+  ): DecoderHealthZone {
+    if (!currentLayers || currentLayers.temporalLayer <= 0) {
+      return VoiceService.mergeDecoderZones(worstZone, 'yellow');
+    }
+
+    const pressureResult = this.tryEmitCameraPressureLayerRequest(consumer.id, currentLayers);
+    if (pressureResult === 'emitted') {
+      console.warn(
+        'IGNIS YELLOW: lowering camera layers via render policy for consumer:',
+        consumer.id,
+        'rho:',
+        rho.toFixed(2),
+        'decode p95ms:',
+        p95DecodeMs.toFixed(1),
+        'fps:',
+        currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
+      );
+      return VoiceService.mergeDecoderZones(worstZone, 'yellow');
+    }
+    if (pressureResult === 'handled') return VoiceService.mergeDecoderZones(worstZone, 'yellow');
+
+    consumerWithLayers.setPreferredLayers({
+      spatialLayer: currentLayers.spatialLayer,
+      temporalLayer: currentLayers.temporalLayer - 1,
+    });
+    console.warn(
+      'IGNIS YELLOW: lowering temporal layer for consumer:',
+      consumer.id,
+      'rho:',
+      rho.toFixed(2),
+      'decode p95ms:',
+      p95DecodeMs.toFixed(1),
+      'fps:',
+      currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
+    );
+    return VoiceService.mergeDecoderZones(worstZone, 'yellow');
+  }
+
+  private static mergeDecoderZones(
+    current: DecoderHealthZone,
+    next: DecoderHealthZone
+  ): DecoderHealthZone {
+    if (current === 'red' || next === 'red') return 'red';
+    if (current === 'yellow' || next === 'yellow') return 'yellow';
+    return 'green';
   }
 
   private async profileDecoders(): Promise<void> {
@@ -4134,6 +4525,7 @@ class VoiceService {
     this.consecutiveGreenIntervals++;
     if (this.consecutiveGreenIntervals >= VoiceService.IGNIS_RECOVERY_GREEN_INTERVALS) {
       this.recoverFromDecoderThrottle();
+      this.clearRemoteVideoPressureAndEmit();
       this.consecutiveGreenIntervals = 0;
     }
   }
@@ -4610,6 +5002,7 @@ class VoiceService {
     this.testServerPausedConsumerIds.clear();
     this.serverResumeOnUndeafenConsumerIds.clear();
     this.pendingScreenAudioProducers.clear();
+    this.resetRemoteVideoLayeringState();
     // Reset IGNIS recovery state on channel leave — consumers are gone, so stale
     // ids must not linger and the green-cycle counter must not carry across
     // channels (#1540; mirrors the emergency cleanupTimersAndE2EE path).

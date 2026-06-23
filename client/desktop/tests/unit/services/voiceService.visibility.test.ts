@@ -36,7 +36,12 @@ describe('voiceService visibility-pause (#1541)', () => {
     svc.consumerMeta.clear();
     svc.pauseCoordinator.reset();
     svc.tileVisibilityByUser.clear();
+    svc.remoteVideoPressureByUser?.clear();
+    svc.lastPreferredLayerKeyByConsumer?.clear();
+    svc.remoteVideoRenderStateByUser?.clear();
     svc.documentHidden = false;
+    svc.consecutiveGreenIntervals = 0;
+    (globalThis as any).devicePixelRatio = 1;
     emit = vi.fn();
     svc.socket = { emit };
   });
@@ -111,5 +116,249 @@ describe('voiceService visibility-pause (#1541)', () => {
     svc.consumerMeta.set('aud-1', { source: 'mic', producerUserId: 'user-A', producerId: 'pa' });
     svc.handleDocumentVisibilityChange(true);
     expect(audio.pause).not.toHaveBeenCalled();
+  });
+
+  it('render state emits set-preferred-layers for the owned camera consumer', () => {
+    seedCameraConsumer(svc, 'cam-1', 'user-A');
+    svc.setRemoteVideoRenderState('user-A', 'tile-1', {
+      visible: true,
+      cssWidth: 1280,
+      cssHeight: 720,
+      role: 'focus',
+      focusedWindow: true,
+    });
+    expect(emit).toHaveBeenCalledWith('set-preferred-layers', {
+      consumerId: 'cam-1',
+      spatialLayer: 1,
+      temporalLayer: 2,
+      visible: true,
+      cssWidth: 1280,
+      cssHeight: 720,
+      devicePixelRatio: 1,
+      role: 'focus',
+      focusedWindow: true,
+      pressureStepDown: false,
+    });
+  });
+
+  it('caps emitted DPR to the media-plane validator ceiling', () => {
+    (globalThis as any).devicePixelRatio = 16;
+    seedCameraConsumer(svc, 'cam-1', 'user-A');
+
+    svc.setRemoteVideoRenderState('user-A', 'tile-1', {
+      visible: true,
+      cssWidth: 320,
+      cssHeight: 180,
+      role: 'focus',
+      focusedWindow: true,
+    });
+
+    expect(emit).toHaveBeenCalledWith('set-preferred-layers', {
+      consumerId: 'cam-1',
+      spatialLayer: 2,
+      temporalLayer: 2,
+      visible: true,
+      cssWidth: 320,
+      cssHeight: 180,
+      devicePixelRatio: 8,
+      role: 'focus',
+      focusedWindow: true,
+      pressureStepDown: false,
+    });
+  });
+
+  it('dedupes unchanged preferred layer emits for the same consumer', () => {
+    seedCameraConsumer(svc, 'cam-1', 'user-A');
+    const state = {
+      visible: true,
+      cssWidth: 1280,
+      cssHeight: 720,
+      role: 'focus' as const,
+      focusedWindow: true,
+    };
+
+    svc.setRemoteVideoRenderState('user-A', 'tile-1', state);
+    svc.setRemoteVideoRenderState('user-A', 'tile-1', state);
+
+    expect(emit.mock.calls.filter(([event]) => event === 'set-preferred-layers')).toHaveLength(1);
+  });
+
+  it('re-emits when render metadata changes even if layer stays the same', () => {
+    seedCameraConsumer(svc, 'cam-1', 'user-A');
+
+    svc.setRemoteVideoRenderState('user-A', 'tile-1', {
+      visible: true,
+      cssWidth: 900,
+      cssHeight: 600,
+      role: 'focus',
+      focusedWindow: true,
+    });
+    svc.setRemoteVideoRenderState('user-A', 'tile-1', {
+      visible: true,
+      cssWidth: 1000,
+      cssHeight: 600,
+      role: 'focus',
+      focusedWindow: true,
+    });
+
+    expect(emit.mock.calls.filter(([event]) => event === 'set-preferred-layers')).toHaveLength(2);
+  });
+
+  it('visible focus tile keeps preferred layer above visible thumbnail regardless of update order', () => {
+    seedCameraConsumer(svc, 'cam-1', 'user-A');
+
+    svc.setRemoteVideoRenderState('user-A', 'thumb', {
+      visible: true,
+      cssWidth: 160,
+      cssHeight: 90,
+      role: 'thumbnail',
+      focusedWindow: true,
+    });
+    svc.setRemoteVideoRenderState('user-A', 'focus', {
+      visible: true,
+      cssWidth: 1920,
+      cssHeight: 1080,
+      role: 'focus',
+      focusedWindow: true,
+    });
+
+    expect(emit).toHaveBeenLastCalledWith('set-preferred-layers', {
+      consumerId: 'cam-1',
+      spatialLayer: 2,
+      temporalLayer: 2,
+      visible: true,
+      cssWidth: 1920,
+      cssHeight: 1080,
+      devicePixelRatio: 1,
+      role: 'focus',
+      focusedWindow: true,
+      pressureStepDown: false,
+    });
+
+    emit.mockClear();
+    svc.setRemoteVideoRenderState('user-A', 'focus', {
+      visible: true,
+      cssWidth: 1280,
+      cssHeight: 720,
+      role: 'focus',
+      focusedWindow: true,
+    });
+    svc.setRemoteVideoRenderState('user-A', 'thumb', {
+      visible: true,
+      cssWidth: 160,
+      cssHeight: 90,
+      role: 'thumbnail',
+      focusedWindow: true,
+    });
+
+    expect(emit).toHaveBeenLastCalledWith('set-preferred-layers', {
+      consumerId: 'cam-1',
+      spatialLayer: 1,
+      temporalLayer: 2,
+      visible: true,
+      cssWidth: 1280,
+      cssHeight: 720,
+      devicePixelRatio: 1,
+      role: 'focus',
+      focusedWindow: true,
+      pressureStepDown: false,
+    });
+  });
+
+  it('camera pressure layer requests never raise a current decoder layer', () => {
+    seedCameraConsumer(svc, 'cam-1', 'user-A');
+    svc.setRemoteVideoRenderState('user-A', 'focus', {
+      visible: true,
+      cssWidth: 1920,
+      cssHeight: 1080,
+      role: 'focus',
+      focusedWindow: true,
+    });
+    emit.mockClear();
+
+    const result = svc.tryEmitCameraPressureLayerRequest('cam-1', {
+      spatialLayer: 2,
+      temporalLayer: 0,
+    });
+
+    expect(result).toBe('emitted');
+    expect(emit).toHaveBeenCalledWith('set-preferred-layers', {
+      consumerId: 'cam-1',
+      spatialLayer: 1,
+      temporalLayer: 0,
+      visible: true,
+      cssWidth: 1920,
+      cssHeight: 1080,
+      devicePixelRatio: 1,
+      role: 'focus',
+      focusedWindow: true,
+      pressureStepDown: true,
+    });
+  });
+
+  it('camera pressure no-op stays on policy path without setting pressure or local fallback', () => {
+    const c = seedCameraConsumer(svc, 'cam-1', 'user-A') as any;
+    c.currentLayers = { spatialLayer: 0, temporalLayer: 1 };
+    c.setPreferredLayers = vi.fn();
+    svc.setRemoteVideoRenderState('user-A', 'thumb', {
+      visible: true,
+      cssWidth: 160,
+      cssHeight: 90,
+      role: 'thumbnail',
+      focusedWindow: true,
+    });
+    emit.mockClear();
+
+    const result = svc.tryEmitCameraPressureLayerRequest('cam-1', c.currentLayers);
+
+    expect(result).toBe('handled');
+    expect(svc.remoteVideoPressureByUser.has('user-A')).toBe(false);
+    expect(emit).not.toHaveBeenCalledWith(
+      'set-preferred-layers',
+      expect.objectContaining({ pressureStepDown: true })
+    );
+
+    svc.handleRedZone(c, c, c.currentLayers, 1, 20, 30);
+
+    expect(c.setPreferredLayers).not.toHaveBeenCalled();
+    expect(svc.remoteVideoPressureByUser.has('user-A')).toBe(false);
+  });
+
+  it('green recovery clears camera pressure after hysteresis and re-emits normal demand', () => {
+    seedCameraConsumer(svc, 'cam-1', 'user-A');
+    svc.setRemoteVideoRenderState('user-A', 'focus', {
+      visible: true,
+      cssWidth: 1920,
+      cssHeight: 1080,
+      role: 'focus',
+      focusedWindow: true,
+    });
+    svc.tryEmitCameraPressureLayerRequest('cam-1', { spatialLayer: 2, temporalLayer: 2 });
+    emit.mockClear();
+
+    svc.updateDecoderRecoveryState('green');
+    svc.updateDecoderRecoveryState('green');
+
+    expect(svc.remoteVideoPressureByUser.get('user-A')).toBe(true);
+    expect(emit).not.toHaveBeenCalledWith(
+      'set-preferred-layers',
+      expect.objectContaining({ pressureStepDown: false })
+    );
+
+    svc.updateDecoderRecoveryState('green');
+
+    expect(svc.remoteVideoPressureByUser.has('user-A')).toBe(false);
+    expect(emit).toHaveBeenCalledWith('set-preferred-layers', {
+      consumerId: 'cam-1',
+      spatialLayer: 2,
+      temporalLayer: 2,
+      visible: true,
+      cssWidth: 1920,
+      cssHeight: 1080,
+      devicePixelRatio: 1,
+      role: 'focus',
+      focusedWindow: true,
+      pressureStepDown: false,
+    });
   });
 });

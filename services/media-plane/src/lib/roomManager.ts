@@ -15,6 +15,15 @@ import { MediasoupService } from './mediasoup.js';
 import type { MetricsSample } from './mediaMetrics.js';
 import { ActiveSpeakerSet } from './activeSpeakerSet.js';
 import type { ActiveSpeakerDelta } from './activeSpeakerSet.js';
+import {
+  clampCameraLayerDemand,
+  computeCameraLayeringGate,
+  parseCameraLayerDemand,
+  storedDemand,
+  type LayeredCodecKind,
+  type LayerValue,
+  type StoredCameraLayerDemand,
+} from './cameraLayerGovernor.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -135,6 +144,10 @@ export interface Room {
   micProducerIds: Set<string>;
   /** Last accepted keyframe request timestamp by sender user ID. */
   keyframeRequestCooldowns: Map<string, number>;
+  /** Raw client camera layer demand, parsed and stored by consumer ID. */
+  cameraLayerDemands: Map<string, StoredCameraLayerDemand>;
+  /** Current room-level camera layering gate state. */
+  cameraLayeringGateEnabled: boolean;
 }
 
 export interface ProducerInfo {
@@ -235,9 +248,11 @@ export type RoomEvent =
       kind: MediaKind;
       source: MediaSource;
     }
+  | { type: 'camera-layering-gate'; roomId: string; enabled: boolean }
   | { type: 'active-speaker'; roomId: string; userId: string; volume: number };
 
 export type RoomEventHandler = (event: RoomEvent) => void;
+type CameraLayerSelection = { spatialLayer: 0 | 1 | 2; temporalLayer: 0 | 1 | 2 };
 
 // ---------------------------------------------------------------------------
 // Pure helpers (extracted to reduce cognitive complexity of computeCodecFloor)
@@ -355,6 +370,8 @@ export class RoomManager {
       lastNPausedConsumers: new Set(),
       micProducerIds: new Set(),
       keyframeRequestCooldowns: new Map(),
+      cameraLayerDemands: new Map(),
+      cameraLayeringGateEnabled: false,
     };
 
     // Wire up active speaker events
@@ -554,38 +571,17 @@ export class RoomManager {
     const participant = room.participants.get(userId);
     if (!participant) return;
 
-    // Close all consumers
-    for (const [, consumer] of participant.consumers) {
-      if (!consumer.closed) consumer.close();
-    }
-    participant.consumers.clear();
-
-    // Close all producers (also removes from AudioLevelObserver)
-    for (const [producerId, entry] of participant.producers) {
-      if (!entry.producer.closed) entry.producer.close();
-      this.removeMicProducer(room, producerId);
-      this.emitEvent({
-        type: 'producer-removed',
-        roomId,
-        userId,
-        producerId,
-        kind: entry.kind,
-        source: entry.source,
-      });
-    }
-    participant.producers.clear();
+    this.clearParticipantCameraLayerDemands(room, participant);
+    this.closeParticipantConsumers(participant);
+    const removedCameraProducer = this.closeParticipantProducers(room, participant, roomId, userId);
     room.keyframeRequestCooldowns.delete(userId);
 
-    // Close transports
-    if (participant.sendTransport && !participant.sendTransport.closed) {
-      participant.sendTransport.close();
-    }
-    for (const [, transport] of participant.recvTransports) {
-      if (!transport.closed) transport.close();
-    }
-    participant.recvTransports.clear();
+    this.closeParticipantTransports(participant);
 
     room.participants.delete(userId);
+    if (room.participants.size > 0 && (removedCameraProducer || room.cameraLayerDemands.size > 0)) {
+      this.recomputeCameraLayeringGate(room);
+    }
 
     // E2EE: increment epoch on leave (forward secrecy)
     room.e2eeEpoch++;
@@ -602,6 +598,47 @@ export class RoomManager {
     if (room.participants.size === 0) {
       await this.closeRoom(roomId);
     }
+  }
+
+  private closeParticipantConsumers(participant: Participant): void {
+    for (const [, consumer] of participant.consumers) {
+      if (!consumer.closed) consumer.close();
+    }
+    participant.consumers.clear();
+  }
+
+  private closeParticipantProducers(
+    room: Room,
+    participant: Participant,
+    roomId: string,
+    userId: string
+  ): boolean {
+    let removedCameraProducer = false;
+    for (const [producerId, entry] of participant.producers) {
+      if (!entry.producer.closed) entry.producer.close();
+      if (entry.source === 'camera') removedCameraProducer = true;
+      this.removeMicProducer(room, producerId);
+      this.emitEvent({
+        type: 'producer-removed',
+        roomId,
+        userId,
+        producerId,
+        kind: entry.kind,
+        source: entry.source,
+      });
+    }
+    participant.producers.clear();
+    return removedCameraProducer;
+  }
+
+  private closeParticipantTransports(participant: Participant): void {
+    if (participant.sendTransport && !participant.sendTransport.closed) {
+      participant.sendTransport.close();
+    }
+    for (const [, transport] of participant.recvTransports) {
+      if (!transport.closed) transport.close();
+    }
+    participant.recvTransports.clear();
   }
 
   // ─── Transport management ────────────────────────────────────────────
@@ -841,6 +878,7 @@ export class RoomManager {
     participant.producers.set(producer.id, { producer, source, kind });
     // Release the reservation: the producer is now counted via participant.producers.
     this.releaseProducerReservation(room, source, producerCap);
+    if (source === 'camera') this.recomputeCameraLayeringGate(room);
 
     // Add mic audio producers to the AudioLevelObserver (skip screen-audio to
     // avoid false active-speaker detection from system audio)
@@ -867,6 +905,7 @@ export class RoomManager {
     producer.on('transportclose', () => {
       participant.producers.delete(producer.id);
       this.removeMicProducer(room, producer.id);
+      if (source === 'camera') this.recomputeCameraLayeringGate(room);
     });
 
     const info: ProducerInfo = {
@@ -981,6 +1020,7 @@ export class RoomManager {
     if (!entry.producer.closed) entry.producer.close();
     participant.producers.delete(producerId);
     this.removeMicProducer(room, producerId);
+    if (entry.source === 'camera') this.recomputeCameraLayeringGate(room);
 
     this.emitEvent({
       type: 'producer-removed',
@@ -1077,6 +1117,11 @@ export class RoomManager {
       producerId,
       rtpCapabilities: consumer.rtpCapabilities,
       paused: true, // Start paused — client resumes after setup
+      appData: {
+        source: producerEntry.source,
+        producerUserId,
+        producerId,
+      },
     });
 
     consumer.consumers.set(newConsumer.id, newConsumer);
@@ -1104,10 +1149,12 @@ export class RoomManager {
     newConsumer.on('transportclose', () => {
       consumer.consumers.delete(newConsumer.id);
       room.lastNPausedConsumers.delete(newConsumer.id);
+      this.clearCameraLayerDemand(room, newConsumer.id);
     });
     newConsumer.on('producerclose', () => {
       consumer.consumers.delete(newConsumer.id);
       room.lastNPausedConsumers.delete(newConsumer.id);
+      this.clearCameraLayerDemand(room, newConsumer.id);
     });
 
     logger.info('Consumer created with transport state', {
@@ -1173,6 +1220,38 @@ export class RoomManager {
     logger.debug('Consumer paused', { consumerId, roomId, userId });
   }
 
+  async setPreferredCameraLayers(
+    roomId: string,
+    userId: string,
+    raw: unknown
+  ): Promise<{
+    effectiveLayers: CameraLayerSelection;
+  }> {
+    const parsed = parseCameraLayerDemand(raw);
+    if (!parsed.ok) throw new Error(parsed.error);
+
+    const room = this.rooms.get(roomId);
+    if (!room) throw new Error('Room not found');
+    const participant = room.participants.get(userId);
+    if (!participant) throw new Error('Participant not found');
+    const consumer = participant.consumers.get(parsed.value.consumerId);
+    if (!consumer) throw new Error('Consumer not found');
+    if (consumer.kind !== 'video') throw new Error('Consumer is not video');
+
+    const appData = consumer.appData as { source?: unknown } | undefined;
+    if (appData?.source !== 'camera') throw new Error('Consumer is not camera');
+
+    const maxSpatialLayer = this.maxCameraSpatialLayerForParticipant(participant);
+    const effectiveLayers = clampCameraLayerDemand(parsed.value, maxSpatialLayer);
+    room.cameraLayerDemands.set(parsed.value.consumerId, storedDemand(parsed.value, maxSpatialLayer));
+    this.recomputeCameraLayeringGate(room);
+    const consumerType = (consumer as { type?: unknown }).type;
+    if (consumerType === 'simulcast' || consumerType === 'svc') {
+      await consumer.setPreferredLayers(effectiveLayers);
+    }
+    return { effectiveLayers };
+  }
+
   /** Close and remove a consumer (client-initiated, e.g. tune-out of screen share) */
   closeConsumer(roomId: string, userId: string, consumerId: string): boolean {
     const room = this.rooms.get(roomId);
@@ -1189,6 +1268,7 @@ export class RoomManager {
     // Explicit close does NOT fire the consumer's transportclose/producerclose
     // handlers, so clean up the last-N guard set here too (else the entry leaks).
     room.lastNPausedConsumers.delete(consumerId);
+    this.clearCameraLayerDemand(room, consumerId);
     logger.debug('Consumer closed', { consumerId, roomId, userId });
     return true;
   }
@@ -1389,9 +1469,12 @@ export class RoomManager {
   /** Get a participant by userId in a specific room */
   /** Update a participant's RTP capabilities (after device.load on client) */
   updateRtpCapabilities(roomId: string, userId: string, rtpCapabilities: RtpCapabilities): void {
-    const participant = this.rooms.get(roomId)?.participants.get(userId);
+    const room = this.rooms.get(roomId);
+    if (!room) return;
+    const participant = room.participants.get(userId);
     if (participant) {
       participant.rtpCapabilities = rtpCapabilities;
+      if (room.cameraLayerDemands.size > 0) this.recomputeCameraLayeringGate(room);
     }
   }
 
@@ -1776,6 +1859,42 @@ export class RoomManager {
     if (room.micProducerIds.size <= resolveAudioLastN(room)) {
       this.drainLastNPaused(room);
     }
+  }
+
+  private recomputeCameraLayeringGate(room: Room): void {
+    const enabled = computeCameraLayeringGate({
+      codecKind: this.cameraLayeringCodecKind(room),
+      cameraProducerCount: this.countProducersBySource(room, 'camera'),
+      demands: Array.from(room.cameraLayerDemands.values()),
+      previouslyEnabled: room.cameraLayeringGateEnabled,
+    });
+    if (enabled === room.cameraLayeringGateEnabled) return;
+    room.cameraLayeringGateEnabled = enabled;
+    this.emitEvent({ type: 'camera-layering-gate', roomId: room.id, enabled });
+  }
+
+  private maxCameraSpatialLayerForParticipant(participant: Participant): LayerValue {
+    return participant.maxManualBitrateBps > FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps ? 2 : 1;
+  }
+
+  private clearCameraLayerDemand(room: Room, consumerId: string): void {
+    if (!room.cameraLayerDemands.delete(consumerId)) return;
+    this.recomputeCameraLayeringGate(room);
+  }
+
+  private clearParticipantCameraLayerDemands(room: Room, participant: Participant): void {
+    let changed = false;
+    for (const consumerId of participant.consumers.keys()) {
+      if (room.cameraLayerDemands.delete(consumerId)) changed = true;
+    }
+    if (changed) this.recomputeCameraLayeringGate(room);
+  }
+
+  private cameraLayeringCodecKind(room: Room): LayeredCodecKind {
+    const floor = this.computeCodecFloor(room.id);
+    if (!floor) return 'svc';
+    if (floor.some((codec) => codec === 'video/av1' || codec === 'video/vp9')) return 'svc';
+    return 'simulcast';
   }
 
   private countProducersBySource(room: Room, source: MediaSource): number {

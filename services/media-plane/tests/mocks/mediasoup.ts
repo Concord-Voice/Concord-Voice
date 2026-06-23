@@ -50,11 +50,13 @@ export function createMockConsumer(overrides: Record<string, unknown> = {}) {
     kind: 'audio' as const,
     rtpParameters: {},
     producerId: '',
+    appData: {},
     closed: false,
     // pause/resume return resolved promises (mediasoup's real API is async — the
     // last-N applyLastNDelta path calls `.catch()` on the returned promise).
     pause: vi.fn(() => Promise.resolve()),
     resume: vi.fn(() => Promise.resolve()),
+    setPreferredLayers: vi.fn(() => Promise.resolve()),
     close: vi.fn(),
     on: emitter.on,
     _emit: emitter.emit,

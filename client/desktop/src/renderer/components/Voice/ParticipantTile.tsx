@@ -247,7 +247,7 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
   // (grid + bar + PiP), so the voice service tracks visibility per tile, not per user.
   const tileId = useId();
 
-  // #1541 visibility-pause: report this remote camera tile's on-screen state to the
+  // #1541 visibility-pause: report this remote camera tile's render state to the
   // voice service, which pauses the SFU consumer (egress cut) when off-screen.
   // Declared after `hasVideo` so the deps array does not hit its temporal dead zone.
   useEffect(() => {
@@ -256,16 +256,46 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
     if (!el) return;
     let disposed = false;
     let svc: {
-      setRemoteVideoVisibility(userId: string, visible: boolean, tileId: string): void;
+      setRemoteVideoRenderState(
+        userId: string,
+        tileId: string,
+        state: {
+          visible: boolean;
+          cssWidth: number;
+          cssHeight: number;
+          role: 'thumbnail' | 'grid' | 'focus';
+          focusedWindow: boolean;
+        }
+      ): void;
       removeRemoteVideoTile(userId: string, tileId: string): void;
     } | null = null;
     const observer = new IntersectionObserver(
-      ([entry]) => svc?.setRemoteVideoVisibility(participant.userId, entry.isIntersecting, tileId),
+      ([entry]) => {
+        if (disposed || !svc) return;
+        const rect = el.getBoundingClientRect();
+        svc.setRemoteVideoRenderState(participant.userId, tileId, {
+          visible: entry.isIntersecting,
+          cssWidth: rect.width,
+          cssHeight: rect.height,
+          role: compact ? 'thumbnail' : 'grid',
+          focusedWindow: document.visibilityState !== 'hidden',
+        });
+      },
       { threshold: 0 }
     );
     void import('../../services/voiceService').then((m) => {
       if (disposed) return;
-      svc = m.voiceService;
+      const candidate = m.voiceService as Partial<NonNullable<typeof svc>>;
+      if (
+        typeof candidate.setRemoteVideoRenderState !== 'function' ||
+        typeof candidate.removeRemoteVideoTile !== 'function'
+      ) {
+        return;
+      }
+      svc = {
+        setRemoteVideoRenderState: candidate.setRemoteVideoRenderState.bind(candidate),
+        removeRemoteVideoTile: candidate.removeRemoteVideoTile.bind(candidate),
+      };
       observer.observe(el);
     });
     return () => {
@@ -275,7 +305,7 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
       // video still visible in another surface (grid / bar / PiP).
       svc?.removeRemoteVideoTile(participant.userId, tileId);
     };
-  }, [isLocal, hasVideo, participant.userId, tileId]);
+  }, [compact, isLocal, hasVideo, participant.userId, tileId]);
   const memberColorScheme = useMemberStore((state) => {
     const member = state.members.find((m) => m.user_id === participant.userId);
     return member?.color_scheme;

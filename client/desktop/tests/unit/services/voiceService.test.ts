@@ -1656,6 +1656,45 @@ describe('VoiceService', () => {
       useVoiceStore.getState().setCodecFloor(['video/vp8', 'video/vp9']);
       expect(useVoiceStore.getState().codecFloor).toEqual(['video/vp8', 'video/vp9']);
     });
+
+    it('camera layering gate coalesces re-produce while one is in flight', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      let resolveFirst: (() => void) | undefined;
+      const firstReproduce = new Promise<void>((resolve) => {
+        resolveFirst = resolve;
+      });
+      const fastReproduceCamera = vi
+        .fn()
+        .mockReturnValueOnce(firstReproduce)
+        .mockResolvedValue(undefined);
+      svc.cameraLayeringEnabled = false;
+      svc.fastReproduceCamera = fastReproduceCamera;
+
+      try {
+        const handler = socketListeners['camera-layering-gate']?.[0];
+        expect(handler).toBeDefined();
+
+        handler?.({ enabled: true });
+
+        expect(svc.cameraLayeringEnabled).toBe(true);
+        expect(fastReproduceCamera).toHaveBeenCalledTimes(1);
+
+        handler?.({ enabled: false });
+
+        expect(svc.cameraLayeringEnabled).toBe(false);
+        expect(fastReproduceCamera).toHaveBeenCalledTimes(1);
+
+        resolveFirst?.();
+        await firstReproduce;
+        await Promise.resolve();
+
+        expect(fastReproduceCamera).toHaveBeenCalledTimes(2);
+      } finally {
+        svc.cameraLayeringEnabled = false;
+        delete svc.fastReproduceCamera;
+      }
+    });
   });
 
   // ===== Connection state =====
@@ -1903,6 +1942,36 @@ describe('VoiceService', () => {
       expect(result.codec).toBeDefined();
       expect(result.encodings).toBeInstanceOf(Array);
       expect(result.encodings.length).toBe(1);
+    });
+
+    it('pickCameraCodec uses AV1 SVC encoding when camera layering is enabled', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      svc.cameraLayeringEnabled = true;
+      try {
+        const result = svc.pickCameraCodec();
+        expect(result.codec?.mimeType).toBe('video/AV1');
+        expect(result.encodings).toHaveLength(1);
+        expect(result.encodings[0].scalabilityMode).toBe('L3T3_KEY');
+      } finally {
+        svc.cameraLayeringEnabled = false;
+      }
+    });
+
+    it('pickCameraCodec prefers VP9 SVC over H264 when layering is enabled and AV1 is excluded', async () => {
+      useVoiceStore.getState().setCodecFloor(['video/vp9', 'video/h264']);
+      useVideoSettingsStore.setState({ preferredVideoCodec: 'video/H264' });
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      svc.cameraLayeringEnabled = true;
+      try {
+        const result = svc.pickCameraCodec();
+        expect(result.codec?.mimeType).toBe('video/VP9');
+        expect(result.encodings).toHaveLength(1);
+        expect(result.encodings[0].scalabilityMode).toBe('L3T3_KEY');
+      } finally {
+        svc.cameraLayeringEnabled = false;
+      }
     });
 
     it('pickScreenCodec includes effectiveBitrate', async () => {
