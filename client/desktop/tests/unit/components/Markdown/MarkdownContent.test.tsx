@@ -126,6 +126,13 @@ describe('MarkdownContent', () => {
       expect(screen.getByText('a').closest('ol')).not.toBeNull();
     });
 
+    it('preserves the typed start number for ordered lists', () => {
+      const { container } = renderMd('2. test message');
+      const list = container.querySelector('ol');
+      expect(list).toHaveAttribute('start', '2');
+      expect(screen.getByText('test message').closest('ol')).toBe(list);
+    });
+
     it('renders explicit link via SafeLink', () => {
       renderMd('[hello](https://example.com)');
       const link = screen.getByText('hello');

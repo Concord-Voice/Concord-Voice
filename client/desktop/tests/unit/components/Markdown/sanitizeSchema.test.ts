@@ -69,6 +69,16 @@ describe('sanitizeSchema', () => {
     }
   });
 
+  it('allows numeric ordered-list start values', async () => {
+    const html = await sanitizeHtml('<ol start="2"><li>second</li></ol>');
+    expect(html).toContain('<ol start="2">');
+  });
+
+  it('rejects non-numeric ordered-list start values', async () => {
+    const html = await sanitizeHtml('<ol start="2x"><li>second</li></ol>');
+    expect(html).not.toContain('start=');
+  });
+
   it('allows class values starting with hljs- or language- on code', async () => {
     const html = await sanitizeHtml('<code class="hljs-keyword">if</code>');
     expect(html).toContain('class="hljs-keyword"');

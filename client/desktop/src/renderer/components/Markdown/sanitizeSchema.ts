@@ -55,6 +55,7 @@ const SPAN_CLASS_PATTERN = new RegExp(
 // format (@alice, @all, @here). Anchored so no other attribute content
 // can reach the DOM.
 const MENTION_TOKEN_PATTERN = /^(?:<@&?[\w-]+>|@[\w.-]+)$/;
+const ORDERED_LIST_START_PATTERN = /^\d+$/;
 
 export const sanitizeSchema: Schema = {
   tagNames: [
@@ -78,6 +79,7 @@ export const sanitizeSchema: Schema = {
   ],
   attributes: {
     a: ['href', 'title'],
+    ol: [['start', ORDERED_LIST_START_PATTERN]],
     code: [['className', CODE_CLASS_PATTERN]],
     span: [
       ['className', SPAN_CLASS_PATTERN],
