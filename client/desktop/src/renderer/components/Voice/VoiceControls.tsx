@@ -470,12 +470,14 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
           document.body
         )}
 
-      {showScreenPicker && (
-        <ScreenSharePicker
-          onSelect={handleScreenSourceSelected}
-          onCancel={() => setShowScreenPicker(false)}
-        />
-      )}
+      {showScreenPicker &&
+        createPortal(
+          <ScreenSharePicker
+            onSelect={handleScreenSourceSelected}
+            onCancel={() => setShowScreenPicker(false)}
+          />,
+          document.body
+        )}
     </>
   );
 };

@@ -430,6 +430,27 @@ describe('VoiceControls', () => {
     globalThis.electron = origElectron;
   });
 
+  it('portals screen share picker to the document body', async () => {
+    const origElectron = globalThis.electron;
+    globalThis.electron = {
+      ...globalThis.electron,
+      getDesktopSources: vi.fn().mockResolvedValue([]),
+    } as unknown as typeof globalThis.electron;
+
+    setVoiceState({ isScreenSharing: false });
+    const { container } = render(<VoiceControls />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('Share Screen'));
+    });
+
+    const picker = screen.getByTestId('screen-share-picker');
+    expect(document.body).toContainElement(picker);
+    expect(container).not.toContainElement(picker);
+
+    globalThis.electron = origElectron;
+  });
+
   it('calls toggleScreenShare with sourceId when picker source selected', async () => {
     const origElectron = globalThis.electron;
     globalThis.electron = {
