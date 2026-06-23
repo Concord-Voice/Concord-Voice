@@ -64,6 +64,7 @@ describe('dmMessageSender.sendDMMessage', () => {
       'https://invite.concordvoice.chat/GHJKMNPQ',
       'dm_message',
       undefined,
+      undefined,
       undefined
     );
     const msgs = useChatStore.getState().messagesByChannel.get('dm-conv-1');

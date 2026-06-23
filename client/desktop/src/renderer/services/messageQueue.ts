@@ -64,7 +64,8 @@ export class MessageQueue {
     content: string,
     type: 'message' | 'dm_message' | 'typing' | 'other' = 'message',
     mentionMeta?: string,
-    replyToId?: string
+    replyToId?: string,
+    gifSlug?: string
   ): string {
     const messageId = this.generateMessageId();
 
@@ -79,6 +80,7 @@ export class MessageQueue {
       type,
       mentionMeta,
       replyToId,
+      gifSlug,
     };
 
     this.queue.push(queuedMessage);

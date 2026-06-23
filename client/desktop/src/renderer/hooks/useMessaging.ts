@@ -173,7 +173,8 @@ export function useMessaging() {
         content,
         'message',
         mentionMeta,
-        replyToId
+        replyToId,
+        gifSlug
       );
 
       // Build replied_to summary from store for optimistic display

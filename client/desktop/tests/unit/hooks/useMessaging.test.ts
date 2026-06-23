@@ -129,6 +129,7 @@ describe('useMessaging', () => {
       'Hello world',
       'message',
       undefined,
+      undefined,
       undefined
     );
     expect(clientId!).toBe('client-msg-1');
@@ -298,7 +299,8 @@ describe('useMessaging', () => {
       'Reply msg',
       'message',
       'mention-meta',
-      'reply-target-id'
+      'reply-target-id',
+      undefined
     );
   });
 
@@ -363,7 +365,25 @@ describe('useMessaging', () => {
       'Hello DM',
       'dm_message',
       undefined,
+      undefined,
       undefined
+    );
+  });
+
+  it('sendDMMessage preserves GIF slugs in the retry queue', () => {
+    const { result } = renderHook(() => useMessaging());
+
+    act(() => {
+      result.current.sendDMMessage('dm-conv-1', ' ', 'testuser', { gifSlug: 'cat-wave' });
+    });
+
+    expect(mockEnqueue).toHaveBeenCalledWith(
+      'dm-conv-1',
+      ' ',
+      'dm_message',
+      undefined,
+      undefined,
+      'cat-wave'
     );
   });
 

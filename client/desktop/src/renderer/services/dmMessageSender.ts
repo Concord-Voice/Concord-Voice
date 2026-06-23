@@ -50,7 +50,8 @@ export function sendDMMessage(
     content,
     'dm_message',
     mentionMeta,
-    replyToId
+    replyToId,
+    gifSlug
   );
 
   // Build replied_to summary from store for optimistic display

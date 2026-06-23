@@ -215,10 +215,11 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
       mentionMeta?: string,
       replyToId?: string,
       attachmentIds?: string[],
-      attachments?: import('../../types/chat').AttachmentSummary[]
+      attachments?: import('../../types/chat').AttachmentSummary[],
+      gifSlug?: string
     ) => {
       if (!selectedThreadId) return;
-      sendMessage(content, { mentionMeta, replyToId, attachmentIds, attachments });
+      sendMessage(content, { mentionMeta, replyToId, attachmentIds, attachments, gifSlug });
     },
     [selectedThreadId, sendMessage]
   );

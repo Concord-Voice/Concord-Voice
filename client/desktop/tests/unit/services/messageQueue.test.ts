@@ -32,6 +32,11 @@ describe('MessageQueue', () => {
       const msg = queue.getMessage(id);
       expect(msg?.retryCount).toBe(0);
     });
+
+    it('stores gif slugs for queued retry sends', () => {
+      const id = queue.enqueue('channel-1', ' ', 'dm_message', undefined, undefined, 'cat-wave');
+      expect(queue.getMessage(id)?.gifSlug).toBe('cat-wave');
+    });
   });
 
   describe('markAsSent', () => {

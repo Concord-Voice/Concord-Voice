@@ -73,7 +73,8 @@ vi.mock('@/renderer/components/Chat/MessageInput', () => ({
       mentionMeta?: string,
       replyToId?: string,
       attachmentIds?: string[],
-      attachments?: unknown[]
+      attachments?: unknown[],
+      gifSlug?: string
     ) => void;
     onTyping?: (isTyping: boolean) => void;
     replyingTo?: unknown;
@@ -89,6 +90,14 @@ vi.mock('@/renderer/components/Chat/MessageInput', () => ({
       >
         <button data-testid="trigger-send" onClick={() => props.onSendMessage?.('Hello world')}>
           Send
+        </button>
+        <button
+          data-testid="trigger-send-gif"
+          onClick={() =>
+            props.onSendMessage?.(' ', undefined, undefined, undefined, undefined, 'cat-wave')
+          }
+        >
+          SendGif
         </button>
         <button
           data-testid="trigger-send-with-reply"
@@ -771,6 +780,20 @@ describe('DMChatArea', () => {
       'Hello world',
       'testuser',
       expect.objectContaining({})
+    );
+  });
+
+  it('preserves selected GIF slugs when sending DMs', () => {
+    useDMStore.setState({ conversations: [makeConversation()] });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+
+    fireEvent.click(screen.getByTestId('trigger-send-gif'));
+
+    expect(mockSendDMMessage).toHaveBeenCalledWith(
+      'conv-1',
+      ' ',
+      'testuser',
+      expect.objectContaining({ gifSlug: 'cat-wave' })
     );
   });
 
