@@ -410,6 +410,18 @@ describe('Packaging Identity (#382)', () => {
     });
   });
 
+  it('keeps Linux maker icon maps isolated from AppImage normalization', async () => {
+    const config = await loadForgeConfig();
+    const deb = getMakerOptions(config, 'Deb');
+    const rpm = getMakerOptions(config, 'Rpm');
+    const appImage = getMakerOptions(config, 'AppImage');
+
+    (appImage.icon as Record<string, string>).default = '512x512';
+
+    expect(deb.icon.default).toBeUndefined();
+    expect(rpm.icon.default).toBeUndefined();
+  });
+
   describe('icon files', () => {
     it('icon.ico exists (Windows)', () => {
       expect(fs.existsSync(path.join(desktopRoot, 'build', 'icon.ico'))).toBe(true);

@@ -108,11 +108,11 @@ if (fs.existsSync('./googleClientSecret.json')) {
   );
 }
 
-const LINUX_ICON_CONFIG = {
+const linuxIconConfig = () => ({
   '128x128': './build/icons/128x128.png',
   '256x256': './build/icons/256x256.png',
   '512x512': './build/icons/512x512.png',
-};
+});
 
 const config: ForgeConfig = {
   packagerConfig: {
@@ -222,7 +222,7 @@ const config: ForgeConfig = {
         categories: ['Network', 'Chat'],
         // Object form is load-bearing: electron-installer-common writes
         // hicolor theme icons only for resolution-keyed icon configs.
-        icon: LINUX_ICON_CONFIG,
+        icon: linuxIconConfig(),
       },
     }),
     new MakerRpm({
@@ -237,7 +237,7 @@ const config: ForgeConfig = {
         license: 'LicenseRef-CVSL-1.0',
         group: 'Applications/Communications',
         categories: ['Network', 'Chat'],
-        icon: LINUX_ICON_CONFIG,
+        icon: linuxIconConfig(),
       },
     }),
     new MakerAppImage({
@@ -245,7 +245,7 @@ const config: ForgeConfig = {
         bin: 'concord-voice',
         productName: 'Concord Voice',
         categories: ['Network', 'Chat'],
-        icon: LINUX_ICON_CONFIG,
+        icon: linuxIconConfig(),
       },
     }),
   ],
