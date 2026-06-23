@@ -2,7 +2,9 @@ import { render, screen, fireEvent } from '../../../test-utils';
 import { vi } from 'vitest';
 import type { DMParticipant } from '@/renderer/stores/dmStore';
 
-import GroupMemberItem from '@/renderer/components/DirectMessages/GroupMemberItem';
+import GroupMemberItem, {
+  GROUP_MEMBER_MENU_Z_INDEX,
+} from '@/renderer/components/DirectMessages/GroupMemberItem';
 
 describe('GroupMemberItem', () => {
   const mockOnRoleChange = vi.fn();
@@ -33,6 +35,18 @@ describe('GroupMemberItem', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it('keeps the member action menu on the shared context-menu z-index tier', () => {
+    const { container } = render(
+      <GroupMemberItem {...defaultProps} participant={memberParticipant} />
+    );
+
+    fireEvent.click(screen.getByLabelText('Member actions'));
+
+    const menu = container.querySelector('.group-member-menu') as HTMLElement | null;
+    expect(menu).not.toBeNull();
+    expect(menu).toHaveStyle({ zIndex: String(GROUP_MEMBER_MENU_Z_INDEX) });
   });
 
   it('renders participant name and username', () => {

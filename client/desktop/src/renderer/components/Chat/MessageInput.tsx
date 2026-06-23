@@ -204,12 +204,17 @@ const MessageInput: React.FC<MessageInputProps> = ({
   );
   const gifsEnabled = useClientConfigStore((s) => s.featureFlags.gifsEnabled ?? false);
   const [invitePickerOpen, setInvitePickerOpen] = useState(false);
+  const [invitePickerPos, setInvitePickerPos] = useState<{ x: number; y: number }>({
+    x: 0,
+    y: 0,
+  });
   const createInvite = useInviteStore((s) => s.createInvite);
   const fetchChannelOverrides = usePermissionStore((s) => s.fetchChannelOverrides);
   const [showMentions, setShowMentions] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const emojiBtnRef = useRef<HTMLButtonElement>(null);
   const gifBtnRef = useRef<HTMLButtonElement>(null);
+  const inviteBtnRef = useRef<HTMLButtonElement>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isTypingRef = useRef(false);
   // Track mentions selected via autocomplete (for building the addendum)
@@ -364,6 +369,16 @@ const MessageInput: React.FC<MessageInputProps> = ({
     return { x, y, anchorCenterX };
   }, []);
 
+  const getInvitePickerPosition = useCallback((anchor: HTMLButtonElement | null) => {
+    if (!anchor) return { x: 0, y: 0 };
+
+    const rect = anchor.getBoundingClientRect();
+    const width = 220;
+    const x = Math.max(8, Math.min(rect.left, globalThis.innerWidth - width - 8));
+
+    return { x, y: rect.bottom + 4 };
+  }, []);
+
   const toggleEmojiPicker = useCallback(() => {
     if (showEmojiPicker) {
       setShowEmojiPicker(false);
@@ -383,6 +398,18 @@ const MessageInput: React.FC<MessageInputProps> = ({
       setShowGifPicker(true);
     }
   }, [showGifPicker, getPickerPosition]);
+
+  const toggleInvitePicker = useCallback(() => {
+    if (invitePickerOpen) {
+      setInvitePickerOpen(false);
+      return;
+    }
+
+    setShowEmojiPicker(false);
+    setShowGifPicker(false);
+    setInvitePickerPos(getInvitePickerPosition(inviteBtnRef.current));
+    setInvitePickerOpen(true);
+  }, [invitePickerOpen, getInvitePickerPosition]);
 
   const handleGifSelect = useCallback(
     (gifSlug: string) => {
@@ -926,9 +953,10 @@ const MessageInput: React.FC<MessageInputProps> = ({
             {conversationId && (
               <div className="message-input__invite" style={{ position: 'relative' }}>
                 <button
+                  ref={inviteBtnRef}
                   type="button"
                   className="media-btn"
-                  onClick={() => setInvitePickerOpen((o) => !o)}
+                  onClick={toggleInvitePicker}
                   aria-label="Invite to a server"
                   title="Invite to a server"
                 >
@@ -936,6 +964,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
                 </button>
                 {invitePickerOpen && (
                   <InviteServerPicker
+                    position={invitePickerPos}
                     onPick={handlePickInviteServer}
                     onClose={() => setInvitePickerOpen(false)}
                   />

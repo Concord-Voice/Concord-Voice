@@ -3,6 +3,8 @@ import { MoreHorizontal, Shield, ShieldOff, UserMinus } from 'lucide-react';
 import type { DMParticipant } from '../../stores/dmStore';
 import './DirectMessages.css';
 
+export const GROUP_MEMBER_MENU_Z_INDEX = 100001;
+
 interface GroupMemberItemProps {
   participant: DMParticipant;
   conversationId: string;
@@ -81,7 +83,7 @@ const GroupMemberItem: React.FC<GroupMemberItemProps> = ({
           </button>
 
           {showMenu && (
-            <div className="group-member-menu">
+            <div className="group-member-menu" style={{ zIndex: GROUP_MEMBER_MENU_Z_INDEX }}>
               <button
                 type="button"
                 className="group-member-menu-item"
