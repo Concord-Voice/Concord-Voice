@@ -16,24 +16,44 @@
   justify-content: center;
   user-select: none;
   app-region: drag;
-  padding-right: 140px;
-  padding-left: 16px;
+  position: relative;
+  padding: 0 140px;
   flex-shrink: 0;
+  box-sizing: border-box;
 }
 
 .titlebar--mac {
   padding-left: 80px;
-  padding-right: 16px;
+  padding-right: 80px;
+}
+
+.titlebar-center {
+  position: absolute;
+  left: 50%;
+  max-width: calc(100% - 280px);
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  transform: translateX(-50%);
+  app-region: drag;
+}
+
+.titlebar--mac .titlebar-center {
+  max-width: calc(100% - 160px);
 }
 
 .titlebar-title {
   font-family: var(--font-display-stack);
   font-size: 13px;
   letter-spacing: 0.08em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   app-region: drag;
 }
 
 .titlebar-version {
+  flex-shrink: 0;
   margin-left: 8px;
   font-size: 11px;
   opacity: 0.4;

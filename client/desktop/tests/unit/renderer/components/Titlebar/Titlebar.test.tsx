@@ -65,6 +65,21 @@ describe('Titlebar', () => {
     expect(container.querySelector('.titlebar')).not.toBeNull();
   });
 
+  it('renders brand and version inside a centered titlebar group', async () => {
+    const spy = vi.spyOn(window.navigator, 'platform', 'get');
+    spy.mockReturnValue('Win32');
+    mockGet.mockResolvedValue({ appVersion: '0.1.40', spaHash: 'abc123' });
+    mockOnChange.mockReturnValue(() => {});
+    const { container } = render(<Titlebar />);
+    const center = container.querySelector('.titlebar-center');
+    expect(center).not.toBeNull();
+    expect(center?.querySelector('.titlebar-title')?.textContent).toBe('Concord Voice');
+    await waitFor(() => {
+      expect(center?.querySelector('.titlebar-version')?.textContent).toBe('v0.1.40-abc123');
+    });
+    spy.mockRestore();
+  });
+
   // Coverage additions during SonarQube reconcile — exercise the catch branch
   // and the defensive early-return when the electron bridge is absent.
   it('logs error to console.error when version.get() rejects', async () => {

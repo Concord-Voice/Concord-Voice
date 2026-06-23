@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import { ConnectionMode } from '../../types/auth';
 import './ConnectionSelector.css';
 
+const SELF_HOSTING_HELP_URL = 'https://concordvoice.com/self-hosting';
+
 interface ConnectionSelectorProps {
   onSelect: (mode: ConnectionMode) => void;
 }
@@ -17,6 +19,10 @@ const ConnectionSelector: React.FC<ConnectionSelectorProps> = ({ onSelect }) => 
     if (selectedMode) {
       onSelect(selectedMode);
     }
+  };
+
+  const handleSelfHostingHelp = () => {
+    void globalThis.electron?.openExternal?.(SELF_HOSTING_HELP_URL);
   };
 
   return (
@@ -122,7 +128,7 @@ const ConnectionSelector: React.FC<ConnectionSelectorProps> = ({ onSelect }) => 
 
         {/* Footer Links */}
         <div className="connection-footer">
-          <button type="button" className="footer-link" disabled aria-disabled="true">
+          <button type="button" className="footer-link" onClick={handleSelfHostingHelp}>
             Learn about self-hosting
           </button>
         </div>

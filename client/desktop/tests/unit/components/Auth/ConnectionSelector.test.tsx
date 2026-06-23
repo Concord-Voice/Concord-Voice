@@ -97,10 +97,28 @@ describe('ConnectionSelector', () => {
     expect(screen.getByRole('button', { name: /learn about self-hosting/i })).toBeInTheDocument();
   });
 
-  it('self-hosting button is disabled until wired', () => {
+  it('opens self-hosting help in the external browser', () => {
+    const openExternal = vi.fn();
+    const electron = globalThis.electron as { openExternal?: typeof openExternal } | undefined;
+    const originalOpenExternal = electron?.openExternal;
+    if (electron) {
+      electron.openExternal = openExternal;
+    }
+
     render(<ConnectionSelector onSelect={mockOnSelect} />);
     const button = screen.getByRole('button', { name: /learn about self-hosting/i });
-    expect(button).toBeDisabled();
+    expect(button).not.toBeDisabled();
+
+    fireEvent.click(button);
+    expect(openExternal).toHaveBeenCalledWith('https://concordvoice.com/self-hosting');
+
+    if (electron) {
+      if (originalOpenExternal) {
+        electron.openExternal = originalOpenExternal;
+      } else {
+        delete electron.openExternal;
+      }
+    }
   });
 
   it('labels have accessible text', () => {
