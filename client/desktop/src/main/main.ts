@@ -76,6 +76,7 @@ import {
   isUnexpectedBundled,
   captureSpaHash,
   hashEntryHtml,
+  SPA_NO_CACHE_LOAD_OPTIONS,
   type SpaLoadDecision,
 } from './spaLoader';
 import { handleDidFailLoad, handleSpaRequestSelfHeal } from './spaSelfHealMainFrame';
@@ -287,7 +288,7 @@ async function applySpaDecision(
   if (decision.mode === 'remote' && decision.url) {
     try {
       setRemoteSpaState(decision.url);
-      await window.loadURL(decision.url);
+      await window.loadURL(decision.url, SPA_NO_CACHE_LOAD_OPTIONS);
       // Capture the entry HTML hash for client attestation (#677). Best-effort:
       // captureSpaHash never throws, so this cannot break the load path.
       await captureSpaHash('remote', decision.url);
@@ -1032,30 +1033,27 @@ ipcMain.handle('app:getSystemInfo', () => ({
 
 // ─── Secure Auth Token Management (safeStorage) ──────────────────────
 
-ipcMain.handle(
-  'auth:storeRefreshToken',
-  (
-    _event,
-    data: {
-      refreshToken: string;
-      rememberMe: boolean;
-      apiBase: string;
-      accessToken?: string;
-    }
-  ) => {
-    storeRefreshToken(data);
-    // Clear any cached restore result so subsequent restoreSession calls
-    // (e.g. after HMR or renderer reload) use the fresh token, not a stale
-    // 'refresh_failed' from a previous attempt.
-    restoreSessionPromise = null;
-
-    // Activate auto-updater now that we have an API base
-    // (first-launch users won't have this until login)
-    if (data.apiBase) {
-      setUpdateFeedUrl(data.apiBase);
-    }
+ipcMain.handle('auth:storeRefreshToken', (event, data: unknown) => {
+  if (!isTrustedAuthSender(event)) {
+    return rejectUntrustedAuthSender('auth:storeRefreshToken');
   }
-);
+  if (!isStoreRefreshTokenPayload(data)) {
+    return rejectInvalidAuthPayload('auth:storeRefreshToken');
+  }
+
+  storeRefreshToken(data);
+  // Clear any cached restore result so subsequent restoreSession calls
+  // (e.g. after HMR or renderer reload) use the fresh token, not a stale
+  // 'refresh_failed' from a previous attempt.
+  restoreSessionPromise = null;
+
+  // Activate auto-updater now that we have an API base
+  // (first-launch users won't have this until login)
+  if (data.apiBase) {
+    setUpdateFeedUrl(data.apiBase);
+  }
+  return undefined;
+});
 
 // Deduplicate restoreSession: React Strict Mode can fire the renderer's
 // useEffect twice, causing two IPC calls.  Without dedup each call would
@@ -1066,9 +1064,85 @@ let restoreSessionPromise: Promise<{
   accessToken?: string;
   sessionId?: string;
   e2eeKeys?: unknown;
+  rememberMe?: boolean;
 }> | null = null;
 
-ipcMain.handle('auth:restoreSession', () => {
+function isTrustedAuthSender(event: Electron.IpcMainInvokeEvent): boolean {
+  return isPermittedFrameUrl(event.senderFrame?.url ?? '', getRemoteSpaBaseUrl());
+}
+
+function rejectUntrustedAuthSender(channel: string): { status: 'rejected' } {
+  console.warn(`[${channel}] rejected — sender frame validation failed`);
+  return { status: 'rejected' };
+}
+
+function rejectInvalidAuthPayload(channel: string): { status: 'rejected' } {
+  console.warn(`[${channel}] rejected — invalid payload`);
+  return { status: 'rejected' };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function isValidApiBase(value: unknown): value is string {
+  if (!isNonEmptyString(value)) return false;
+  try {
+    const parsed = new URL(value);
+    return (
+      (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
+      parsed.username === '' &&
+      parsed.password === '' &&
+      parsed.origin !== 'null'
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isStoreRefreshTokenPayload(data: unknown): data is {
+  refreshToken: string;
+  rememberMe: boolean;
+  apiBase: string;
+  accessToken?: string;
+} {
+  return (
+    isRecord(data) &&
+    isNonEmptyString(data.refreshToken) &&
+    typeof data.rememberMe === 'boolean' &&
+    isValidApiBase(data.apiBase) &&
+    (data.accessToken === undefined || typeof data.accessToken === 'string')
+  );
+}
+
+function isStoreE2EEKeysPayload(data: unknown): data is {
+  wrappingKeyBase64: string;
+  preferencesKeyBase64: string;
+  wrappedPrivateKeyBase64: string;
+} {
+  return (
+    isRecord(data) &&
+    isNonEmptyString(data.wrappingKeyBase64) &&
+    isNonEmptyString(data.preferencesKeyBase64) &&
+    isNonEmptyString(data.wrappedPrivateKeyBase64)
+  );
+}
+
+function isLogoutPayload(data: unknown): data is { accessToken?: string } | undefined {
+  if (data === undefined) return true;
+  if (!isRecord(data)) return false;
+  return data.accessToken === undefined || typeof data.accessToken === 'string';
+}
+
+ipcMain.handle('auth:restoreSession', (event) => {
+  if (!isTrustedAuthSender(event)) {
+    return rejectUntrustedAuthSender('auth:restoreSession');
+  }
+
   if (restoreSessionPromise) return restoreSessionPromise;
 
   restoreSessionPromise = (async () => {
@@ -1076,7 +1150,8 @@ ipcMain.handle('auth:restoreSession', () => {
     if (restored.status !== 'ok') {
       return { status: restored.status };
     }
-    // Token restored from disk — refresh it to get a fresh access token
+    // Token restored from disk or main-process memory — refresh it to get a
+    // fresh access token.
     const refreshResult = await performRefresh();
     if (refreshResult.status === 'ok' && refreshResult.accessToken) {
       // Also restore E2EE keys if available
@@ -1086,45 +1161,74 @@ ipcMain.handle('auth:restoreSession', () => {
         accessToken: refreshResult.accessToken,
         sessionId: refreshResult.sessionId,
         e2eeKeys,
+        rememberMe: restored.rememberMe,
       };
     }
     return { status: 'refresh_failed' };
-  })();
+  })().finally(() => {
+    restoreSessionPromise = null;
+  });
 
   return restoreSessionPromise;
 });
 
-ipcMain.handle(
-  'auth:storeE2EEKeys',
-  (
-    _event,
-    data: {
-      wrappingKeyBase64: string;
-      preferencesKeyBase64: string;
-      wrappedPrivateKeyBase64: string;
-    }
-  ) => {
-    storeE2EEKeys(data);
+ipcMain.handle('auth:storeE2EEKeys', (event, data: unknown) => {
+  if (!isTrustedAuthSender(event)) {
+    return rejectUntrustedAuthSender('auth:storeE2EEKeys');
   }
-);
+  if (!isStoreE2EEKeysPayload(data)) {
+    return rejectInvalidAuthPayload('auth:storeE2EEKeys');
+  }
 
-ipcMain.handle('auth:refreshToken', async () => {
+  storeE2EEKeys(data);
+  return undefined;
+});
+
+ipcMain.handle('auth:refreshToken', async (event) => {
+  if (!isTrustedAuthSender(event)) {
+    return rejectUntrustedAuthSender('auth:refreshToken');
+  }
+
   return performRefresh();
 });
 
-ipcMain.handle('auth:logout', async (_event, data?: { accessToken?: string }) => {
+ipcMain.handle('auth:logout', async (event, data?: { accessToken?: string }) => {
+  if (!isTrustedAuthSender(event)) {
+    return rejectUntrustedAuthSender('auth:logout');
+  }
+  if (!isLogoutPayload(data)) {
+    return rejectInvalidAuthPayload('auth:logout');
+  }
+
   await performLogout(data?.accessToken);
+  return undefined;
 });
 
-ipcMain.handle('auth:clearTokens', () => {
+ipcMain.handle('auth:clearTokens', (event) => {
+  if (!isTrustedAuthSender(event)) {
+    return rejectUntrustedAuthSender('auth:clearTokens');
+  }
+
   clearTokens();
+  return undefined;
 });
 
-ipcMain.handle('auth:getCapabilities', () => {
+ipcMain.handle('auth:getCapabilities', (event) => {
+  if (!isTrustedAuthSender(event)) {
+    console.warn('[auth:getCapabilities] rejected — sender frame validation failed');
+    // Fail closed with this handler's own shape (not the {status:'rejected'}
+    // reject shape) so callers always get a valid, safe default.
+    return { persistAvailable: false };
+  }
   return getCapabilities();
 });
 
-ipcMain.handle('auth:getMachineId', () => {
+ipcMain.handle('auth:getMachineId', (event) => {
+  if (!isTrustedAuthSender(event)) {
+    console.warn('[auth:getMachineId] rejected — sender frame validation failed');
+    return '';
+  }
+
   return getMachineId();
 });
 

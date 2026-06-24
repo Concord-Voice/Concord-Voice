@@ -3,6 +3,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Mock the spaLoader module so we can control resolveSpaSource() per test.
 vi.mock('@/main/spaLoader', () => ({
   resolveSpaSource: vi.fn(),
+  SPA_NO_CACHE_LOAD_OPTIONS: {
+    extraHeaders: 'Cache-Control: no-cache\nPragma: no-cache\n',
+  },
 }));
 
 // Mock electron's BrowserWindow / webContents.
@@ -72,7 +75,10 @@ describe('spaSelfHeal — R2 retry state machine', () => {
 
     expect(mockResolve).toHaveBeenCalledOnce();
     expect(mockLoadURL).toHaveBeenCalledWith(
-      'https://api.concordvoice.chat/spa/def5678/index.html'
+      'https://api.concordvoice.chat/spa/def5678/index.html',
+      expect.objectContaining({
+        extraHeaders: expect.stringContaining('Cache-Control: no-cache'),
+      })
     );
     expect(mockLoadFile).not.toHaveBeenCalled();
     expect(outcome).toEqual({ mode: 'recovered', retryCount: 1 });
@@ -220,7 +226,10 @@ describe('spaSelfHeal — R2 retry state machine', () => {
     expect(mockLoadURL).toHaveBeenCalledTimes(2);
     expect(mockLoadURL).toHaveBeenNthCalledWith(
       1,
-      'https://api.concordvoice.chat/spa/def5678/index.html'
+      'https://api.concordvoice.chat/spa/def5678/index.html',
+      expect.objectContaining({
+        extraHeaders: expect.stringContaining('Cache-Control: no-cache'),
+      })
     );
     expect(mockLoadURL).toHaveBeenNthCalledWith(2, 'app://concord/index.html');
     expect(mockLoadFile).not.toHaveBeenCalled();

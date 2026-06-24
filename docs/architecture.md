@@ -51,7 +51,7 @@ Concord Voice is a distributed real-time communications platform with three serv
 - WebRTC SFU for voice and video (Opus codec, 7 quality tiers)
 - Socket.IO signaling for transport negotiation
 - `RoomManager` is authoritative for produce/consume/transport lifecycle
-- Frames are E2EE *above* the SFU (see [Media E2EE](#media-e2ee-frame-encryption)); the SFU forwards opaque RTP
+- Frames are E2EE _above_ the SFU (see [Media E2EE](#media-e2ee-frame-encryption)); the SFU forwards opaque RTP
 - NATS integration for participant state events to control plane
 
 #### Desktop Client (Electron 42 + React 19)
@@ -150,9 +150,9 @@ The desktop client is the only shipping client. Source: `client/desktop/`.
   - `renderer/` — the React SPA: `stores/` (41 Zustand stores), `services/` (singletons incl. `e2eeService.ts`, `mediaEncryption.ts`, `searchService.ts`, WebSocket, API client, voice), `components/`, `hooks/`, `types/ws-events.ts` (zod WS schema).
   - `shared/` — three cross-process modules: `clientBehavior.ts` (window close/minimize routing), `spaIpcTypes.ts` (self-heal IPC contract), `spaUrlPattern.ts` (the shared SPA chunk-URL regex; the legacy `SPA_URL_PATTERN` was removed by #1657 in favor of runtime base-dir matching).
   - `constants/` — typed constants + build-time generators (e.g. `updateEndpoint.mts`), included in the Istanbul coverage set.
-- **Responsibilities:** browser-inspired UI (server bar, channel panel), WebRTC media handling (Opus, 7 quality tiers), voice controls (mute/deafen/PTT, device selection, per-user volume), screen sharing, video calls, E2EE encrypt/decrypt via `e2eeService` (`encryptForChannel` / `decryptForChannel`), secure token storage via `safeStorage`. *(This list is non-exhaustive — the renderer also carries TTS (`ttsService.ts`), keyboard-shortcut customization, OS-permission management (`permissionManager.ts`, macOS screen-recording/mic TCC), and a startup splash window.)*
+- **Responsibilities:** browser-inspired UI (server bar, channel panel), WebRTC media handling (Opus, 7 quality tiers), voice controls (mute/deafen/PTT, device selection, per-user volume), screen sharing, video calls, E2EE encrypt/decrypt via `e2eeService` (`encryptForChannel` / `decryptForChannel`), secure token storage via `safeStorage`. _(This list is non-exhaustive — the renderer also carries TTS (`ttsService.ts`), keyboard-shortcut customization, OS-permission management (`permissionManager.ts`, macOS screen-recording/mic TCC), and a startup splash window.)_
 - **Security posture:** `contextIsolation` ON and `nodeIntegration` OFF unconditionally; no `@electron/remote`. `sandbox` (and `webSecurity`) are ON in packaged builds (`sandbox: isPackaged` in `browserWindowConfig.ts`) and off in dev/unpackaged runs. IPC handlers that reach privileged side effects validate the sender frame via `isPermittedFrameUrl` (`src/main/ipc/frameValidation.ts`).
-- **Token storage:** the refresh token and E2EE session keys are persisted by `tokenManager.ts` via Electron `safeStorage` (OS keychain — Keychain / DPAPI / libsecret) to `secure-token.dat` / `secure-e2ee.dat` under the pinned userData dir. The access token is **memory-only** (never persisted to disk); it is returned to the renderer via IPC and also cached in main-process memory (`cachedAccessToken`) for proactive refresh.
+- **Token storage:** when Remember Me is enabled, the refresh token and E2EE session keys are persisted by `tokenManager.ts` via Electron `safeStorage` (OS keychain — Keychain / DPAPI / libsecret) to `secure-token.dat` / `secure-e2ee.dat` under the pinned userData dir. When Remember Me is disabled, the refresh token **and the E2EE key material** stay in main-process memory only (`inMemoryRefreshToken` / `inMemoryE2EEKeys`) and disk token files are deleted; renderer soft reloads restore both from that process memory (so session-only content stays decryptable across a reload), but app restarts require login. The in-memory E2EE keys are wiped on `clearTokens()`/logout. On every successful session restore the renderer re-runs `hydratePostLogin()` so a session-only soft reload reloads servers/profile/preferences rather than landing authenticated-but-empty (#1870). The access token is **memory-only** (never persisted to disk); it is returned to the renderer via IPC and also cached in main-process memory (`cachedAccessToken`) for proactive refresh.
 - **Path identity:** `pinUserDataPath.ts` pins `userData` to `<appData>/ConcordVoice` as `main.ts`'s first import, decoupling the machine path-identity from the mutable display name.
 - **Communication:** HTTP/WebSocket → Control Plane; Socket.IO → Media Plane (signaling); WebRTC (DTLS-SRTP carrying E2EE frames) → Media Plane (audio/video).
 
@@ -162,12 +162,13 @@ The SPA bundle is served by **Cloudflare Pages** at the CONSTANT URL `https://sp
 
 The deploy pipeline `wrangler pages deploy`s the renderer bundle to Cloudflare Pages, writes `spa.env` with the constant `SPA_URL` (the per-deploy SHA is recorded as the `SPA_VERSION` annotation only, never in the URL), and commits + pushes `spa.env` back to main via a short-lived, least-privilege (Contents:write) GitHub App installation token.
 
-Four invariants enforce the contract:
+Five invariants enforce the contract:
 
 1. **Build invariant** — `vite.config.ts` keeps `base: './'`. Locked by `vite-base-relative.test.ts`.
 2. **Deploy invariant** — `spa.env` is a generated artifact, verified by a CI contract check. The committed `spa.env` is bind-mounted into the control-plane container as a single file, so the deploy step rsyncs it with `--inplace` (writes the existing inode rather than atomic-rename to a new one) to avoid a stale-inode `spaUrl` class of bug.
 3. **Runtime safety net** — the renderer self-heals on chunk-load failures via two-layer detection (renderer-side listeners in `spaSelfHealClient.ts` + main-process `did-fail-load` in `spaSelfHeal.ts` / `spaSelfHealMainFrame.ts`) feeding a shared recovery primitive with R2 retry.
 4. **Bundled fallback** — when `spaLoader.ts`'s `resolveSpaSource()` cannot validate the remote SPA (HTTPS + IPC-contract checks fail), it falls back to `mode: 'bundled'`, loading `app://concord/index.html` from the asar bundle. The `app://` scheme is registered privileged (`standard`/`secure`/`supportFetchAPI`/`corsEnabled`) in `main.ts` and resolved by `appProtocol.ts` (host check + path-traversal rejection).
+5. **Freshness check** — `clientConfigService.ts` asks main's `spaUpdate.checkForUpdate()` to compare the served entry bytes at startup, every five minutes, on focus, and on visible-resume. If newer bytes are available, it applies through main's `spa:reloadLatest` soft-reload path, which re-runs `resolveSpaSource()` and uses no-cache `net.fetch` / `loadURL` options. Auto-apply is deferred while voice is connecting/connected/reconnecting, screen share is active, or a DM call is ringing/in-call.
 
 The deploy-contract rationale and the move from the Go control-plane to Cloudflare Pages are captured in the project's architecture decision records.
 
@@ -190,38 +191,38 @@ Manifests + signed installers are served from the control-plane `updates` packag
 
 **Internal packages** (`services/control-plane/internal/`, 30 packages):
 
-| Package | Responsibility |
-|---|---|
-| `api` | Router wiring — assembles all handlers into the Gin engine |
-| `attestation` | Client attestation registry: verify, publish, revoke, cache, OIDC, prune |
-| `auth` | Register, login, refresh, logout, recovery flows, WS ticket issuance, SSO adapter |
-| `channels` | Channel CRUD, key distribution, unread tracking, epoch validation |
-| `clientconfig` | Serves dynamic runtime config (SPA URL, media-plane URL, TURN, feature flags, minVersion) |
-| `database` | PostgreSQL connection + migration runner |
-| `dm` | DM conversation CRUD, DM messages, DM voice calls (ring/decline/cancel), DM key distribution |
-| `email` | Email sending (verification codes, notifications) via SMTP/Resend |
-| `friends` | Friend requests, acceptance/decline, blocking, friend codes |
-| `invites` | Server invite code generation, listing, revoking, joining, preview |
-| `klipy` | KLIPY GIF API + media proxy with SSRF egress guard |
-| `media` | Object-store handler: avatar, banner, server-icon, attachment up/download |
-| `members` | Server membership: add, update role, remove, ban/unban |
-| `messages` | Channel + DM message CRUD, reactions, pins, embed suppression |
-| `mfa` | TOTP, WebAuthn, backup codes, recovery key, trusted devices, recovery circle |
-| `middleware` | Auth, CORS, rate-limiting, security headers, attestation gate, request-ID |
-| `models` | Shared Go struct types |
-| `notifications` | Notification mute preferences (per-server/channel/DM) |
-| `oauth` | OAuth 2.0 / OIDC provider integrations for SSO (Google, Apple) |
-| `ownership` | Server ownership transfer: initiate, confirm, cancel, reverse |
-| `privacy` | GDPR Article 17 account-erasure endpoint |
-| `rbac` | Role-based access control: resolver, cache, middleware, audit log |
-| `servers` | Server CRUD, unread-status aggregation |
-| `sessions` | Session listing, per-session and all-session revocation |
-| `storage` | S3-compatible (MinIO) client wrapper |
-| `testhelpers` | Integration-test utilities |
-| `updates` | Serves electron-updater manifests + signed installer binaries |
-| `users` | User profile, keys, password, SSO identities, search, account deletion, E2EE blob sync |
-| `voice` | Voice channel join authorization, participants, server-mute/deafen, NATS subscriber |
-| `websocket` | WS hub, client pump, message dispatch, broadcast routing |
+| Package         | Responsibility                                                                               |
+| --------------- | -------------------------------------------------------------------------------------------- |
+| `api`           | Router wiring — assembles all handlers into the Gin engine                                   |
+| `attestation`   | Client attestation registry: verify, publish, revoke, cache, OIDC, prune                     |
+| `auth`          | Register, login, refresh, logout, recovery flows, WS ticket issuance, SSO adapter            |
+| `channels`      | Channel CRUD, key distribution, unread tracking, epoch validation                            |
+| `clientconfig`  | Serves dynamic runtime config (SPA URL, media-plane URL, TURN, feature flags, minVersion)    |
+| `database`      | PostgreSQL connection + migration runner                                                     |
+| `dm`            | DM conversation CRUD, DM messages, DM voice calls (ring/decline/cancel), DM key distribution |
+| `email`         | Email sending (verification codes, notifications) via SMTP/Resend                            |
+| `friends`       | Friend requests, acceptance/decline, blocking, friend codes                                  |
+| `invites`       | Server invite code generation, listing, revoking, joining, preview                           |
+| `klipy`         | KLIPY GIF API + media proxy with SSRF egress guard                                           |
+| `media`         | Object-store handler: avatar, banner, server-icon, attachment up/download                    |
+| `members`       | Server membership: add, update role, remove, ban/unban                                       |
+| `messages`      | Channel + DM message CRUD, reactions, pins, embed suppression                                |
+| `mfa`           | TOTP, WebAuthn, backup codes, recovery key, trusted devices, recovery circle                 |
+| `middleware`    | Auth, CORS, rate-limiting, security headers, attestation gate, request-ID                    |
+| `models`        | Shared Go struct types                                                                       |
+| `notifications` | Notification mute preferences (per-server/channel/DM)                                        |
+| `oauth`         | OAuth 2.0 / OIDC provider integrations for SSO (Google, Apple)                               |
+| `ownership`     | Server ownership transfer: initiate, confirm, cancel, reverse                                |
+| `privacy`       | GDPR Article 17 account-erasure endpoint                                                     |
+| `rbac`          | Role-based access control: resolver, cache, middleware, audit log                            |
+| `servers`       | Server CRUD, unread-status aggregation                                                       |
+| `sessions`      | Session listing, per-session and all-session revocation                                      |
+| `storage`       | S3-compatible (MinIO) client wrapper                                                         |
+| `testhelpers`   | Integration-test utilities                                                                   |
+| `updates`       | Serves electron-updater manifests + signed installer binaries                                |
+| `users`         | User profile, keys, password, SSO identities, search, account deletion, E2EE blob sync       |
+| `voice`         | Voice channel join authorization, participants, server-mute/deafen, NATS subscriber          |
+| `websocket`     | WS hub, client pump, message dispatch, broadcast routing                                     |
 
 **Responsibilities:** authentication; server/channel CRUD; membership + RBAC; user presence; WebSocket signaling and message relay; E2EE ciphertext relay (the server never decrypts); MFA; SSO; account erasure; object storage; client attestation; rate limiting.
 
@@ -409,17 +410,17 @@ erDiagram
 
 **Supporting tables** (covered for completeness; most carry a simple `user_id → users` FK):
 
-| Domain | Tables (creating migration) |
-|---|---|
-| Auth / registration | `pending_registrations` (000058) |
-| MFA / recovery | `user_mfa_totp`, `user_mfa_webauthn` (000029); `user_recovery_keys` (000043); `trusted_recovery_devices`, `recovery_requests` (000044); `recovery_circles`, `recovery_circle_shares`, `recovery_circle_requests`, `recovery_circle_responses` (000045) |
-| Profile / prefs | `user_preferences` (000016); `privacy_settings` (000027); `username_history` (000046); `saved_gifs` (000055); `notification_preferences` (000063, polymorphic target) |
-| Voice | `voice_participants` (000020); `dm_voice_participants` (000026) |
-| Media | `media_files` (000042) |
-| Social / server-mgmt | `friend_codes` (000027); `server_invites` (000009); `ownership_transfers` (000047) |
-| Compliance | `audit_log` (000035); `account_deletions` (000059) |
-| Attestation | `release_binaries`, `release_spas` (000066) |
-| Admin console | `admin_users`, `admin_webauthn_credentials`, `admin_audit_log` (000077) — sessions are Redis-backed (opaque sids), not a table |
+| Domain               | Tables (creating migration)                                                                                                                                                                                                                            |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Auth / registration  | `pending_registrations` (000058)                                                                                                                                                                                                                       |
+| MFA / recovery       | `user_mfa_totp`, `user_mfa_webauthn` (000029); `user_recovery_keys` (000043); `trusted_recovery_devices`, `recovery_requests` (000044); `recovery_circles`, `recovery_circle_shares`, `recovery_circle_requests`, `recovery_circle_responses` (000045) |
+| Profile / prefs      | `user_preferences` (000016); `privacy_settings` (000027); `username_history` (000046); `saved_gifs` (000055); `notification_preferences` (000063, polymorphic target)                                                                                  |
+| Voice                | `voice_participants` (000020); `dm_voice_participants` (000026)                                                                                                                                                                                        |
+| Media                | `media_files` (000042)                                                                                                                                                                                                                                 |
+| Social / server-mgmt | `friend_codes` (000027); `server_invites` (000009); `ownership_transfers` (000047)                                                                                                                                                                     |
+| Compliance           | `audit_log` (000035); `account_deletions` (000059)                                                                                                                                                                                                     |
+| Attestation          | `release_binaries`, `release_spas` (000066)                                                                                                                                                                                                            |
+| Admin console        | `admin_users`, `admin_webauthn_credentials`, `admin_audit_log` (000077) — sessions are Redis-backed (opaque sids), not a table                                                                                                                         |
 
 > Notable schema history: group-DM admin roles added `dm_participants.role` (`admin`/`member`) + `dm_conversations.icon_url` (000053); `dm_messages` gained a `call_event` type + `call_event_payload` JSONB (000064), and the transient `kind` column was dropped in favor of `type` (000065); `account_deletions.sentry_delete_attempted` was dropped (000060) when Sentry was removed; `key_revocations.revoked_by` was changed to `ON DELETE SET NULL` (000059) so account erasure isn't blocked.
 
@@ -430,6 +431,7 @@ The admin console is a **separate identity domain** — it never shares state wi
 **Identity:** `admin_users` table (separate from `users`). Admins are created via the `adminctl bootstrap` CLI subcommand inside the running container (first admin only) or via an authenticated in-console `POST /admin/api/v1/admins` (subsequent admins).
 
 **Auth flow (2FA mandatory):**
+
 1. `POST /admin/api/v1/auth/password` — constant-time password verify; returns a short-lived challenge handle + WebAuthn `BeginLogin` assertion. **Password alone never yields a session.**
 2. `POST /admin/api/v1/auth/webauthn` — `FinishLogin` with `userVerification: required`; on success mints an opaque Redis session.
 
@@ -468,7 +470,7 @@ The admin console is a **separate identity domain** — it never shares state wi
 
 #### Media E2EE (frame encryption)
 
-Voice and **video frames are end-to-end encrypted above the SFU** — the media plane never sees plaintext media. This is a separate layer from transport DTLS-SRTP (which terminates *at* the SFU). Implementation: `client/desktop/src/renderer/services/mediaEncryption.ts` (+ `voiceE2eeTransforms.ts`):
+Voice and **video frames are end-to-end encrypted above the SFU** — the media plane never sees plaintext media. This is a separate layer from transport DTLS-SRTP (which terminates _at_ the SFU). Implementation: `client/desktop/src/renderer/services/mediaEncryption.ts` (+ `voiceE2eeTransforms.ts`):
 
 - **Cipher:** per-frame **AES-256-GCM** applied via WebRTC **Insertable Streams** before frames leave the sender — `RTCRtpScriptTransform` (Web Worker) on Chromium 129+, `createEncodedStreams` (main thread) on the legacy path.
 - **Frame keys:** derived `HKDF-SHA256(channelCSK, salt="concord-voice-e2ee", info=senderUserId)` from the **same channel CSK** used for text messages — so media encryption shares the `channel_keys` / `key_revocations` epoch ledger and rotates on member join/leave (with a short overlap window), and ratchets via `HKDF(oldKey, "concord-e2ee-ratchet")`.
@@ -526,7 +528,7 @@ sequenceDiagram
 
 ### Message Search (client-side, E2EE-native)
 
-Because the server holds only ciphertext, full-text **message search runs entirely in the renderer**. `searchService.ts` builds an in-memory MiniSearch index over *decrypted* message content — no plaintext is written to disk or sent to the server. The client backfills the index by pulling ciphertext from a rate-limited bulk-fetch endpoint and decrypting locally; the index is memory-only, capped at ~50K messages / ~3MB with per-channel LRU eviction. (User-search and Klipy GIF-search, by contrast, are server-side.)
+Because the server holds only ciphertext, full-text **message search runs entirely in the renderer**. `searchService.ts` builds an in-memory MiniSearch index over _decrypted_ message content — no plaintext is written to disk or sent to the server. The client backfills the index by pulling ciphertext from a rate-limited bulk-fetch endpoint and decrypting locally; the index is memory-only, capped at ~50K messages / ~3MB with per-channel LRU eviction. (User-search and Klipy GIF-search, by contrast, are server-side.)
 
 ### Encrypted Cross-Device Sync
 
@@ -729,7 +731,7 @@ sequenceDiagram
 
 ## Logging Discipline
 
-Concord has **no telemetry, tracing, or metrics pipeline** — there is no Prometheus, Loki, Grafana, Jaeger, or Sentry (Sentry was removed entirely on 2026-04-22; the `account_deletions.sentry_delete_attempted` column was dropped in migration 000060). What remains is *logging hygiene*: services emit structured logs to stdout, governed by a logging-discipline rule.
+Concord has **no telemetry, tracing, or metrics pipeline** — there is no Prometheus, Loki, Grafana, Jaeger, or Sentry (Sentry was removed entirely on 2026-04-22; the `account_deletions.sentry_delete_attempted` column was dropped in migration 000060). What remains is _logging hygiene_: services emit structured logs to stdout, governed by a logging-discipline rule.
 
 Core logging rules (enforced by lint + AST regression tests, not convention):
 
@@ -762,18 +764,18 @@ Concord/
 
 ## Technology Decisions Summary
 
-| Component | Technology | Rationale |
-|-----------|-----------|-----------|
-| Desktop client | Electron 42 + React 19 + TS 6 | Mature WebRTC, fast iteration, OS keychain access |
-| Control plane | Go 1.26 + Gin | Fast, concurrent, single-binary deploy |
-| Media plane | Node.js 24 + mediasoup 3.20 | Best-in-class WebRTC SFU |
-| Database | PostgreSQL 16 | Relational + JSONB, mature, declarative partitioning available |
-| Cache | Redis 7 (server; node-redis 6.x client) | Sessions, presence, RBAC cache, rate limiting, voice room state |
-| Messaging | NATS 2.x | Lightweight inter-service voice events |
-| Object storage | MinIO / S3 | Avatars, banners, attachments (tiered: server-readable vs E2EE) |
-| SPA serving | Cloudflare Pages | Atomic deploys, decoupled from the control plane (ADR-0015) |
-| Auth | JWT + HttpOnly refresh | Stateless access, revocable refresh |
-| GIF search | Klipy (privacy proxy) | Tenant key + SSRF-guarded server-side proxy; no direct client calls |
+| Component      | Technology                              | Rationale                                                           |
+| -------------- | --------------------------------------- | ------------------------------------------------------------------- |
+| Desktop client | Electron 42 + React 19 + TS 6           | Mature WebRTC, fast iteration, OS keychain access                   |
+| Control plane  | Go 1.26 + Gin                           | Fast, concurrent, single-binary deploy                              |
+| Media plane    | Node.js 24 + mediasoup 3.20             | Best-in-class WebRTC SFU                                            |
+| Database       | PostgreSQL 16                           | Relational + JSONB, mature, declarative partitioning available      |
+| Cache          | Redis 7 (server; node-redis 6.x client) | Sessions, presence, RBAC cache, rate limiting, voice room state     |
+| Messaging      | NATS 2.x                                | Lightweight inter-service voice events                              |
+| Object storage | MinIO / S3                              | Avatars, banners, attachments (tiered: server-readable vs E2EE)     |
+| SPA serving    | Cloudflare Pages                        | Atomic deploys, decoupled from the control plane (ADR-0015)         |
+| Auth           | JWT + HttpOnly refresh                  | Stateless access, revocable refresh                                 |
+| GIF search     | Klipy (privacy proxy)                   | Tenant key + SSRF-guarded server-side proxy; no direct client calls |
 
 ## Planned / Not Yet Implemented
 

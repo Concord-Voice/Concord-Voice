@@ -112,7 +112,12 @@ vi.mock('@/renderer/services/savedGifsSync', () => ({
   },
 }));
 
-import App, { handleAppRootError } from '@/renderer/App';
+const mockHydratePostLogin = vi.fn().mockResolvedValue(undefined);
+vi.mock('@/renderer/services/postLoginHydration', () => ({
+  hydratePostLogin: (...args: unknown[]) => mockHydratePostLogin(...args),
+}));
+
+import App, { handleAppRootError, __resetRestoreSessionCalledForTesting } from '@/renderer/App';
 
 describe('App', () => {
   beforeEach(() => {
@@ -121,7 +126,9 @@ describe('App', () => {
     useUserStore.setState({ user: null });
     usePendingRegistrationStore.getState().clearPending();
     useE2EEStore.getState().reset();
+    __resetRestoreSessionCalledForTesting();
     Object.assign(globalThis.electron ?? {}, {
+      restoreSession: undefined,
       onInviteReceived: undefined,
       inviteRendererReady: undefined,
     });
@@ -250,6 +257,66 @@ describe('App', () => {
     const { container } = render(<App />);
     // Should eventually show content (either auth or main)
     expect(container.querySelector('.app')).toBeInTheDocument();
+  });
+
+  it('preserves rememberMe=false from restored session', async () => {
+    const restoreSession = vi.fn().mockResolvedValue({
+      status: 'restored',
+      accessToken: 'restored-token',
+      rememberMe: false,
+    });
+    useAuthStore.getState().setRememberMe(true);
+    Object.assign(globalThis.electron ?? {}, { restoreSession });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(useAuthStore.getState().accessToken).toBe('restored-token');
+    });
+    expect(useAuthStore.getState().rememberMe).toBe(false);
+  });
+
+  it('inits E2EE and hydrates post-login state on a session-only soft reload (#1870)', async () => {
+    const e2eeKeys = {
+      wrappingKeyBase64: 'wk',
+      preferencesKeyBase64: 'pk',
+      wrappedPrivateKeyBase64: 'wpk', // pragma: allowlist secret
+    };
+    const restoreSession = vi.fn().mockResolvedValue({
+      status: 'restored',
+      accessToken: 'restored-token',
+      rememberMe: false,
+      e2eeKeys, // supplied from main-process memory for a session-only user
+    });
+    Object.assign(globalThis.electron ?? {}, { restoreSession });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(useAuthStore.getState().accessToken).toBe('restored-token');
+    });
+    // E2EE initialized from the memory-restored keys, AND post-login state
+    // hydrated — not the old authenticated-but-empty half-restore.
+    expect(mockInitializeFromStoredKeys).toHaveBeenCalledWith(e2eeKeys);
+    await waitFor(() => expect(mockHydratePostLogin).toHaveBeenCalledTimes(1));
+  });
+
+  it('runs post-login hydration on every successful restore, even without e2ee keys', async () => {
+    const restoreSession = vi.fn().mockResolvedValue({
+      status: 'restored',
+      accessToken: 'restored-token',
+      rememberMe: true,
+      // no e2eeKeys on this path
+    });
+    Object.assign(globalThis.electron ?? {}, { restoreSession });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(useAuthStore.getState().accessToken).toBe('restored-token');
+    });
+    expect(mockInitializeFromStoredKeys).not.toHaveBeenCalled();
+    await waitFor(() => expect(mockHydratePostLogin).toHaveBeenCalledTimes(1));
   });
 
   // ── App structure ──

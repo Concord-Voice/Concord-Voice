@@ -131,6 +131,38 @@ describe('tokenManager', () => {
   });
 
   describe('restoreRefreshToken', () => {
+    it('restores rememberMe=false session from main-process memory only', () => {
+      storeRefreshToken({
+        refreshToken: 'memory-token',
+        rememberMe: false,
+        apiBase: 'http://localhost:8080',
+      });
+      fsRead.impl = () => {
+        throw new Error('disk should not be read for memory session');
+      };
+
+      expect(restoreRefreshToken()).toEqual({
+        status: 'ok',
+        token: 'memory-token',
+        apiBase: 'http://localhost:8080',
+        rememberMe: false,
+      });
+      expect(fsWriteCalls.length).toBe(0);
+    });
+
+    it('returns memory API base for rememberMe=false sessions', () => {
+      storeRefreshToken({
+        refreshToken: 'memory-token',
+        rememberMe: false,
+        apiBase: 'http://localhost:8080',
+      });
+      fsRead.impl = () => {
+        throw new Error('disk should not be read for memory session');
+      };
+
+      expect(getPersistedApiBase()).toBe('http://localhost:8080');
+    });
+
     it('returns unavailable when safeStorage off', () => {
       safeStorageAvailable = false;
       expect(restoreRefreshToken()).toEqual({ status: 'unavailable' });
@@ -156,6 +188,7 @@ describe('tokenManager', () => {
         status: 'ok',
         token: 'stored-token',
         apiBase: 'http://localhost:8080',
+        rememberMe: true,
       });
     });
 
@@ -207,19 +240,67 @@ describe('tokenManager', () => {
       expect(fsWriteCalls.length).toBe(0);
     });
 
-    it('storeE2EEKeys does nothing when rememberMe=false', () => {
+    it('storeE2EEKeys keeps keys in main-process memory (never disk) when rememberMe=false', () => {
       storeRefreshToken({
         refreshToken: 'tk',
         rememberMe: false,
         apiBase: 'http://localhost:8080',
       });
       fsWriteCalls.length = 0;
-      storeE2EEKeys({
-        wrappingKeyBase64: 'k',
-        preferencesKeyBase64: 'k',
-        wrappedPrivateKeyBase64: 'k',
-      });
+      const keys = {
+        wrappingKeyBase64: 'wk',
+        preferencesKeyBase64: 'pk',
+        wrappedPrivateKeyBase64: 'wpk',
+      };
+      storeE2EEKeys(keys);
+      // Session-only key material is NEVER written to disk (#1870)...
       expect(fsWriteCalls.length).toBe(0);
+      // ...but it IS held in main-process memory so it survives a soft reload.
+      fsRead.impl = () => {
+        throw new Error('disk should not be read for memory-only E2EE keys');
+      };
+      expect(restoreE2EEKeys()).toEqual(keys);
+    });
+
+    it('restoreE2EEKeys prefers the in-memory copy over disk', () => {
+      storeRefreshToken({ refreshToken: 'tk', rememberMe: true, apiBase: 'http://localhost:8080' });
+      const memKeys = {
+        wrappingKeyBase64: 'mem',
+        preferencesKeyBase64: 'mem',
+        wrappedPrivateKeyBase64: 'mem', // pragma: allowlist secret
+      };
+      storeE2EEKeys(memKeys);
+      // Disk would decode to a DIFFERENT set; the memory copy must win.
+      fsRead.impl = () =>
+        Buffer.from(
+          JSON.stringify({
+            wrappingKeyBase64: 'disk',
+            preferencesKeyBase64: 'disk',
+            wrappedPrivateKeyBase64: 'disk', // pragma: allowlist secret
+          })
+        );
+      expect(restoreE2EEKeys()).toEqual(memKeys);
+    });
+
+    it('clearTokens wipes the in-memory E2EE keys (no heap residue after logout)', () => {
+      storeRefreshToken({
+        refreshToken: 'tk',
+        rememberMe: false,
+        apiBase: 'http://localhost:8080',
+      });
+      storeE2EEKeys({
+        wrappingKeyBase64: 'wk',
+        preferencesKeyBase64: 'pk',
+        wrappedPrivateKeyBase64: 'wpk',
+      });
+      // Present before clear (from memory; no disk file for a session-only user).
+      fsRead.impl = () => {
+        throw new Error('ENOENT');
+      };
+      expect(restoreE2EEKeys()).not.toBeNull();
+      clearTokens();
+      // Gone after clear — memory wiped, disk has nothing.
+      expect(restoreE2EEKeys()).toBeNull();
     });
 
     it('restoreE2EEKeys decrypts and returns keys', () => {

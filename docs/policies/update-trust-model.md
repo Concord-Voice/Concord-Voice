@@ -98,6 +98,20 @@ The update feed is served at `https://api.concordvoice.chat/api/v1/updates`. Tra
 
 Those gaps are why the per-platform trust anchors above are load-bearing — they provide defense in depth.
 
+## SPA UI Update Trust Boundary
+
+The SPA update axis is separate from binary auto-update. A SPA soft reload is a top-frame navigation selected by the Electron main process after `resolveSpaSource()` validates the server-advertised HTTPS URL and IPC contract. The renderer can request a check or reload, but it never supplies the target URL.
+
+Current Phase 1 behavior:
+
+- remote SPA config and entry-byte fetches use targeted no-cache `net.fetch` options;
+- remote SPA navigations use `BrowserWindow.loadURL()` with no-cache headers;
+- session-only users keep their in-memory refresh token across renderer reloads, without writing it to disk;
+- session-only users likewise keep their E2EE key material in main-process memory only (never disk), wiped on logout/`clearTokens`, so a soft reload restores decryptable content; post-login state (servers/profile/preferences) is re-hydrated on every successful restore, not only when E2EE keys are present;
+- auto-apply is deferred during active voice, screen share, and DM call states.
+
+Persistent cached SPA execution is not enabled. A future last-known-good SPA cache must verify a signed manifest with a public key shipped in the desktop binary before any cached remote bytes can execute. The cache must verify the complete Vite asset graph, reject traversal/symlink/partial/stale/incompatible entries, and fall back to the signed bundled `app://concord` renderer when verification fails.
+
 ## CI integrity gate
 
 The `build-desktop.yml` workflow runs, in order:
@@ -116,7 +130,7 @@ Step 4 catches the concrete threat of a tampered manifest between sign and publi
 - **No certificate transparency monitoring.** We do not monitor public CT logs for the issuance of certs matching our leaf CN from CAs outside the pinned Microsoft chain. Future work.
 - **No binary transparency / Rekor publication.** Our release hashes are not published to a public transparency log. Future work, likely bundled with #654.
 - **Linux update signing deferred.** Tracked in #653.
-- **Chain validity is asserted at the leaf, not walked end-to-end by our hook.** `verifyWindowsSignature.ts` requires `Get-AuthenticodeSignature` to return `Status = Valid` on the downloaded installer — that status already covers signature integrity, root-of-trust chaining, expiry (including timestamp validity), and revocation via the Windows certificate store. On top of that, our hook inspects chain *structure* to enforce the leaf CN allow-list and issuer-prefix pin. We do not separately walk or re-validate each intermediate; we trust the OS-level chain build that produced the `Valid` status. If that upstream check is ever bypassed, our structural checks alone would not detect a revoked or untrusted intermediate.
+- **Chain validity is asserted at the leaf, not walked end-to-end by our hook.** `verifyWindowsSignature.ts` requires `Get-AuthenticodeSignature` to return `Status = Valid` on the downloaded installer — that status already covers signature integrity, root-of-trust chaining, expiry (including timestamp validity), and revocation via the Windows certificate store. On top of that, our hook inspects chain _structure_ to enforce the leaf CN allow-list and issuer-prefix pin. We do not separately walk or re-validate each intermediate; we trust the OS-level chain build that produced the `Valid` status. If that upstream check is ever bypassed, our structural checks alone would not detect a revoked or untrusted intermediate.
 
 ## Related documents
 

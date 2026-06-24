@@ -21,6 +21,7 @@ const { mockMainWindow, mockWebContents, MockBrowserWindow } = vi.hoisted(() => 
     close: vi.fn(),
     focus: vi.fn(),
     isMinimized: vi.fn(() => false),
+    isDestroyed: vi.fn(() => false),
     restore: vi.fn(),
     setAlwaysOnTop: vi.fn(),
     webContents: mockWebContents,
@@ -168,8 +169,9 @@ vi.mock('../../../src/main/tokenManager', () => ({
   storeRefreshToken: vi.fn(),
   restoreRefreshToken: vi.fn(() => ({
     status: 'ok',
-    refreshToken: 'mock-token',
+    token: 'mock-token',
     apiBase: 'http://localhost:8080',
+    rememberMe: true,
   })),
   performRefresh: vi.fn(() =>
     Promise.resolve({ status: 'ok', accessToken: 'mock-access', sessionId: 'mock-session' })
@@ -229,6 +231,12 @@ vi.mock('../../../src/main/loadFailureVisibility', () => ({
 
 vi.mock('../../../src/main/spaLoader', () => ({
   resolveSpaSource: vi.fn(() => Promise.resolve({ mode: 'bundled', reason: 'test' })),
+  isUnexpectedBundled: vi.fn(() => false),
+  captureSpaHash: vi.fn(() => Promise.resolve()),
+  hashEntryHtml: vi.fn(() => Promise.resolve('sha256:available')),
+  SPA_NO_CACHE_LOAD_OPTIONS: {
+    extraHeaders: 'Cache-Control: no-cache\nPragma: no-cache\n',
+  },
 }));
 
 vi.mock('../../../src/main/ipcContract', () => ({
@@ -471,18 +479,93 @@ describe('main.ts', () => {
       const { storeRefreshToken } = await import('../../../src/main/tokenManager');
       const { setUpdateFeedUrl } = await import('../../../src/main/updater');
       const data = { refreshToken: 'tok', rememberMe: true, apiBase: 'http://localhost:8080' };
-      await handlers.get('auth:storeRefreshToken')!({}, data);
+      await handlers.get('auth:storeRefreshToken')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        data
+      );
       expect(storeRefreshToken).toHaveBeenCalledWith(data);
       expect(setUpdateFeedUrl).toHaveBeenCalledWith('http://localhost:8080');
     });
 
+    it('auth:storeRefreshToken rejects untrusted sender frames', async () => {
+      const { storeRefreshToken } = await import('../../../src/main/tokenManager');
+      (storeRefreshToken as Mock).mockClear();
+      const result = await handlers.get('auth:storeRefreshToken')!(
+        { senderFrame: { url: 'https://evil.example/' } },
+        { refreshToken: 'tok', rememberMe: true, apiBase: 'http://localhost:8080' }
+      );
+      expect(result).toEqual({ status: 'rejected' });
+      expect(storeRefreshToken).not.toHaveBeenCalled();
+    });
+
+    it('auth:storeRefreshToken rejects malformed payloads', async () => {
+      const { storeRefreshToken } = await import('../../../src/main/tokenManager');
+      const { setUpdateFeedUrl } = await import('../../../src/main/updater');
+      (storeRefreshToken as Mock).mockClear();
+      (setUpdateFeedUrl as Mock).mockClear();
+
+      const result = await handlers.get('auth:storeRefreshToken')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        { refreshToken: 'tok', rememberMe: true, apiBase: 'javascript:alert(1)' }
+      );
+
+      expect(result).toEqual({ status: 'rejected' });
+      expect(storeRefreshToken).not.toHaveBeenCalled();
+      expect(setUpdateFeedUrl).not.toHaveBeenCalled();
+    });
+
     it('auth:restoreSession restores and refreshes token', async () => {
-      const result = (await handlers.get('auth:restoreSession')!()) as {
+      const result = (await handlers.get('auth:restoreSession')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      })) as {
         status: string;
         accessToken?: string;
+        rememberMe?: boolean;
       };
       expect(result.status).toBe('restored');
       expect(result.accessToken).toBe('mock-access');
+      expect(result.rememberMe).toBe(true);
+    });
+
+    it('auth:restoreSession returns rememberMe=false for memory-only sessions', async () => {
+      const { restoreRefreshToken } = await import('../../../src/main/tokenManager');
+      (restoreRefreshToken as Mock).mockReturnValueOnce({
+        status: 'ok',
+        token: 'memory-token',
+        apiBase: 'http://localhost:8080',
+        rememberMe: false,
+      });
+
+      const result = (await handlers.get('auth:restoreSession')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      })) as { status: string; rememberMe?: boolean };
+
+      expect(result.status).toBe('restored');
+      expect(result.rememberMe).toBe(false);
+    });
+
+    it('auth:restoreSession clears single-flight cache after the restore settles', async () => {
+      const { restoreRefreshToken, performRefresh } =
+        await import('../../../src/main/tokenManager');
+      (restoreRefreshToken as Mock).mockClear();
+      (performRefresh as Mock).mockClear();
+
+      const event = { senderFrame: { url: 'app://concord/index.html' } };
+      await handlers.get('auth:restoreSession')!(event);
+      await handlers.get('auth:restoreSession')!(event);
+
+      expect(restoreRefreshToken).toHaveBeenCalledTimes(2);
+      expect(performRefresh).toHaveBeenCalledTimes(2);
+    });
+
+    it('auth:restoreSession rejects untrusted sender frames', async () => {
+      const { restoreRefreshToken } = await import('../../../src/main/tokenManager');
+      (restoreRefreshToken as Mock).mockClear();
+      const result = await handlers.get('auth:restoreSession')!({
+        senderFrame: { url: 'https://evil.example/' },
+      });
+      expect(result).toEqual({ status: 'rejected' });
+      expect(restoreRefreshToken).not.toHaveBeenCalled();
     });
 
     it('auth:storeE2EEKeys stores keys', async () => {
@@ -492,37 +575,131 @@ describe('main.ts', () => {
         preferencesKeyBase64: 'b',
         wrappedPrivateKeyBase64: 'c',
       };
-      await handlers.get('auth:storeE2EEKeys')!({}, data);
+      await handlers.get('auth:storeE2EEKeys')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        data
+      );
       expect(storeE2EEKeys).toHaveBeenCalledWith(data);
     });
 
+    it('auth:storeE2EEKeys rejects untrusted sender frames', async () => {
+      const { storeE2EEKeys } = await import('../../../src/main/tokenManager');
+      (storeE2EEKeys as Mock).mockClear();
+      const result = await handlers.get('auth:storeE2EEKeys')!(
+        { senderFrame: { url: 'https://evil.example/' } },
+        { wrappingKeyBase64: 'a', preferencesKeyBase64: 'b', wrappedPrivateKeyBase64: 'c' }
+      );
+      expect(result).toEqual({ status: 'rejected' });
+      expect(storeE2EEKeys).not.toHaveBeenCalled();
+    });
+
+    it('auth:storeE2EEKeys rejects malformed payloads', async () => {
+      const { storeE2EEKeys } = await import('../../../src/main/tokenManager');
+      (storeE2EEKeys as Mock).mockClear();
+
+      const result = await handlers.get('auth:storeE2EEKeys')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        { wrappingKeyBase64: 'a', preferencesKeyBase64: 42, wrappedPrivateKeyBase64: 'c' }
+      );
+
+      expect(result).toEqual({ status: 'rejected' });
+      expect(storeE2EEKeys).not.toHaveBeenCalled();
+    });
+
     it('auth:refreshToken delegates to performRefresh', async () => {
-      const result = (await handlers.get('auth:refreshToken')!()) as { status: string };
+      const result = (await handlers.get('auth:refreshToken')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      })) as { status: string };
       expect(result.status).toBe('ok');
+    });
+
+    it('auth:refreshToken rejects untrusted sender frames', async () => {
+      const { performRefresh } = await import('../../../src/main/tokenManager');
+      (performRefresh as Mock).mockClear();
+      const result = await handlers.get('auth:refreshToken')!({
+        senderFrame: { url: 'https://evil.example/' },
+      });
+      expect(result).toEqual({ status: 'rejected' });
+      expect(performRefresh).not.toHaveBeenCalled();
     });
 
     it('auth:logout delegates to performLogout', async () => {
       const { performLogout } = await import('../../../src/main/tokenManager');
-      await handlers.get('auth:logout')!({}, { accessToken: 'tok' });
+      await handlers.get('auth:logout')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        { accessToken: 'tok' }
+      );
       expect(performLogout).toHaveBeenCalledWith('tok');
+    });
+
+    it('auth:logout rejects untrusted sender frames', async () => {
+      const { performLogout } = await import('../../../src/main/tokenManager');
+      (performLogout as Mock).mockClear();
+      const result = await handlers.get('auth:logout')!(
+        { senderFrame: { url: 'https://evil.example/' } },
+        { accessToken: 'tok' }
+      );
+      expect(result).toEqual({ status: 'rejected' });
+      expect(performLogout).not.toHaveBeenCalled();
+    });
+
+    it('auth:logout rejects malformed payloads', async () => {
+      const { performLogout } = await import('../../../src/main/tokenManager');
+      (performLogout as Mock).mockClear();
+      const result = await handlers.get('auth:logout')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        { accessToken: 42 }
+      );
+      expect(result).toEqual({ status: 'rejected' });
+      expect(performLogout).not.toHaveBeenCalled();
     });
 
     it('auth:clearTokens delegates to clearTokens', async () => {
       const { clearTokens } = await import('../../../src/main/tokenManager');
-      await handlers.get('auth:clearTokens')!();
+      await handlers.get('auth:clearTokens')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      });
       expect(clearTokens).toHaveBeenCalled();
     });
 
-    it('auth:getCapabilities returns capabilities', async () => {
-      const result = (await handlers.get('auth:getCapabilities')!()) as {
+    it('auth:clearTokens rejects untrusted sender frames', async () => {
+      const { clearTokens } = await import('../../../src/main/tokenManager');
+      (clearTokens as Mock).mockClear();
+      const result = await handlers.get('auth:clearTokens')!({
+        senderFrame: { url: 'https://evil.example/' },
+      });
+      expect(result).toEqual({ status: 'rejected' });
+      expect(clearTokens).not.toHaveBeenCalled();
+    });
+
+    it('auth:getCapabilities returns capabilities for a trusted sender', async () => {
+      const result = (await handlers.get('auth:getCapabilities')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      })) as {
         safeStorage: boolean;
       };
       expect(result.safeStorage).toBe(true);
     });
 
+    it('auth:getCapabilities rejects untrusted sender frames (fails closed)', async () => {
+      const result = await handlers.get('auth:getCapabilities')!({
+        senderFrame: { url: 'https://evil.example/' },
+      });
+      expect(result).toEqual({ persistAvailable: false });
+    });
+
     it('auth:getMachineId returns machine id', async () => {
-      const result = await handlers.get('auth:getMachineId')!();
+      const result = await handlers.get('auth:getMachineId')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      });
       expect(result).toBe('mock-machine-id');
+    });
+
+    it('auth:getMachineId rejects untrusted sender frames', async () => {
+      const result = await handlers.get('auth:getMachineId')!({
+        senderFrame: { url: 'https://evil.example/' },
+      });
+      expect(result).toBe('');
     });
   });
 
@@ -1095,14 +1272,15 @@ describe('main.ts', () => {
       // The restoreSession handler caches its promise — calling it twice
       // should return the same result without re-invoking performRefresh.
       const handler = handlers.get('auth:restoreSession')!;
-      const result1 = await handler();
-      const result2 = await handler();
+      const event = { senderFrame: { url: 'app://concord/index.html' } };
+      const result1 = await handler(event);
+      const result2 = await handler(event);
       expect(result1).toEqual(result2);
     });
 
     it('restoreSession handler exists and returns an object', async () => {
       const handler = handlers.get('auth:restoreSession')!;
-      const result = await handler();
+      const result = await handler({ senderFrame: { url: 'app://concord/index.html' } });
       expect(result).toHaveProperty('status');
     });
   });
@@ -1242,6 +1420,35 @@ describe('main.ts', () => {
       });
       expect(result).toEqual({ mode: 'bundled', changed: false });
       expect(mockMainWindow.loadURL).not.toHaveBeenCalled();
+    });
+
+    it('spa:reloadLatest loads remote SPA with no-cache headers in packaged mode', async () => {
+      const { app } = await import('electron');
+      const { BrowserWindow } = await import('electron');
+      const { resolveSpaSource } = await import('../../../src/main/spaLoader');
+      (app as unknown as { isPackaged: boolean }).isPackaged = true;
+      (
+        (BrowserWindow as unknown as { getAllWindows: Mock }).getAllWindows as Mock
+      ).mockReturnValueOnce([]);
+      appOnCallbacks.get('activate')!();
+      (resolveSpaSource as unknown as Mock).mockResolvedValueOnce({
+        mode: 'remote',
+        url: 'https://spa.concordvoice.chat/index.html',
+        reason: 'remote SPA compatible',
+      });
+      (mockMainWindow.loadURL as Mock).mockClear();
+
+      const result = await handlers.get('spa:reloadLatest')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      });
+
+      expect(mockMainWindow.loadURL).toHaveBeenCalledWith(
+        'https://spa.concordvoice.chat/index.html',
+        expect.objectContaining({
+          extraHeaders: expect.stringContaining('Cache-Control: no-cache'),
+        })
+      );
+      expect(result).toEqual({ mode: 'remote', changed: false });
     });
 
     it('spa:checkForUpdate rejects an untrusted sender frame', async () => {

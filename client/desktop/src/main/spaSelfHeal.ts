@@ -40,7 +40,7 @@
  */
 
 import { app, BrowserWindow } from 'electron';
-import { resolveSpaSource } from './spaLoader';
+import { resolveSpaSource, SPA_NO_CACHE_LOAD_OPTIONS } from './spaLoader';
 import { setRemoteSpaState } from './spaState';
 import type { SelfHealReason } from '../shared/spaIpcTypes';
 
@@ -131,7 +131,7 @@ async function loadBundledFallback(wc: Electron.WebContents): Promise<void> {
  */
 async function attemptRemoteLoad(wc: Electron.WebContents, url: string): Promise<boolean> {
   try {
-    await wc.loadURL(url);
+    await wc.loadURL(url, SPA_NO_CACHE_LOAD_OPTIONS);
     // Refresh SPA state — recovery may have landed on a different SHA than
     // the original load (e.g., if a deploy ran between failure and retry).
     // PiP needs the current full URL to reach the same nginx route the

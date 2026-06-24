@@ -34,6 +34,7 @@ import {
   isUnexpectedBundled,
   captureSpaHash,
   hashEntryHtml,
+  SPA_NO_CACHE_LOAD_OPTIONS,
 } from '@/main/spaLoader';
 
 const mockNet = net as unknown as { fetch: ReturnType<typeof vi.fn> };
@@ -77,6 +78,13 @@ describe('spaLoader — defensive /api/v1/spa/ sentinel', () => {
     const result = await resolveSpaSource();
     expect(result.mode).toBe('remote');
     expect(result.url).toBe('https://api.concordvoice.chat/spa/abc1234/index.html');
+    expect(mockNet.fetch).toHaveBeenCalledWith(
+      'https://api.concordvoice.chat/api/v1/client/config?ipc=7',
+      expect.objectContaining({
+        cache: 'no-store',
+        headers: expect.objectContaining({ 'Cache-Control': 'no-cache', Pragma: 'no-cache' }),
+      })
+    );
   });
 
   // T4a (#976): SPA bundle moved to Cloudflare Pages at a constant host.
@@ -94,6 +102,13 @@ describe('spaLoader — defensive /api/v1/spa/ sentinel', () => {
     const result = await resolveSpaSource();
     expect(result.mode).toBe('bundled');
     expect(result.reason).toMatch(/non-HTTPS protocol/);
+  });
+});
+
+describe('SPA_NO_CACHE_LOAD_OPTIONS', () => {
+  it('carries no-cache headers for BrowserWindow.loadURL', () => {
+    expect(SPA_NO_CACHE_LOAD_OPTIONS.extraHeaders).toContain('Cache-Control: no-cache');
+    expect(SPA_NO_CACHE_LOAD_OPTIONS.extraHeaders).toContain('Pragma: no-cache');
   });
 });
 
@@ -142,6 +157,7 @@ describe('isUnexpectedBundled', () => {
  */
 function mockFetchResponse(bytes: Buffer): Response {
   return {
+    ok: true,
     arrayBuffer: vi
       .fn()
       .mockResolvedValue(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)),
@@ -184,7 +200,13 @@ describe('captureSpaHash — remote mode', () => {
   it('uses net.fetch with the remote URL (not the bundled URL)', async () => {
     mockNet.fetch.mockResolvedValue(mockFetchResponse(knownBytes));
     await captureSpaHash('remote', remoteUrl);
-    expect(mockNet.fetch).toHaveBeenCalledWith(remoteUrl);
+    expect(mockNet.fetch).toHaveBeenCalledWith(
+      remoteUrl,
+      expect.objectContaining({
+        cache: 'no-store',
+        headers: expect.objectContaining({ 'Cache-Control': 'no-cache', Pragma: 'no-cache' }),
+      })
+    );
   });
 });
 
@@ -231,7 +253,13 @@ describe('captureSpaHash — bundled mode', () => {
   it('fetches app://concord/index.html (not a remote URL)', async () => {
     mockNet.fetch.mockResolvedValue(mockFetchResponse(knownBytes));
     await captureSpaHash('bundled');
-    expect(mockNet.fetch).toHaveBeenCalledWith('app://concord/index.html');
+    expect(mockNet.fetch).toHaveBeenCalledWith(
+      'app://concord/index.html',
+      expect.objectContaining({
+        cache: 'no-store',
+        headers: expect.objectContaining({ 'Cache-Control': 'no-cache', Pragma: 'no-cache' }),
+      })
+    );
   });
 });
 
@@ -270,11 +298,29 @@ describe('hashEntryHtml', () => {
     const expected = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
     mockNet.fetch.mockResolvedValue(mockFetchResponse(bytes));
     await expect(hashEntryHtml('https://spa.concordvoice.chat/index.html')).resolves.toBe(expected);
-    expect(mockNet.fetch).toHaveBeenCalledWith('https://spa.concordvoice.chat/index.html');
+    expect(mockNet.fetch).toHaveBeenCalledWith(
+      'https://spa.concordvoice.chat/index.html',
+      expect.objectContaining({
+        cache: 'no-store',
+        headers: expect.objectContaining({ 'Cache-Control': 'no-cache', Pragma: 'no-cache' }),
+      })
+    );
   });
 
   it('returns null (fail-open, never throws) when net.fetch rejects', async () => {
     mockNet.fetch.mockRejectedValue(new Error('net::ERR_CONNECTION_REFUSED'));
     await expect(hashEntryHtml('https://spa.concordvoice.chat/index.html')).resolves.toBeNull();
+  });
+
+  it('returns null for non-ok entry responses', async () => {
+    const arrayBuffer = vi.fn();
+    mockNet.fetch.mockResolvedValue({
+      ok: false,
+      status: 500,
+      arrayBuffer,
+    } as unknown as Response);
+
+    await expect(hashEntryHtml('https://spa.concordvoice.chat/index.html')).resolves.toBeNull();
+    expect(arrayBuffer).not.toHaveBeenCalled();
   });
 });

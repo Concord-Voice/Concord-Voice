@@ -280,6 +280,10 @@ function AuthenticatedLayout() {
 // can trigger two sequential token rotations.
 let restoreSessionCalled = false;
 
+export function __resetRestoreSessionCalledForTesting(): void {
+  restoreSessionCalled = false;
+}
+
 function App() {
   // PiP windows don't need auth — they communicate via BroadcastChannel.
   // Skip session restore entirely to avoid unnecessary token rotations.
@@ -356,16 +360,17 @@ function App() {
       if (result.status === 'restored' && result.accessToken) {
         useAuthStore.getState().setAccessToken(result.accessToken);
         if (result.sessionId) useAuthStore.getState().setSessionId(result.sessionId);
+        if (typeof result.rememberMe === 'boolean') {
+          useAuthStore.getState().setRememberMe(result.rememberMe);
+        }
 
-        // Restore E2EE service from safeStorage-persisted key material
+        // Restore E2EE service from the restored key material (disk for
+        // rememberMe sessions; main-process memory for session-only soft
+        // reloads — see tokenManager.restoreE2EEKeys). Skip only when there is
+        // genuinely no key material to initialize from.
         if (result.e2eeKeys) {
           try {
             await e2eeService.initializeFromStoredKeys(result.e2eeKeys);
-            // Hydrate post-login user state via the shared helper (#1297) so the
-            // session-restore path mirrors the fresh-login and SSO paths exactly.
-            // Each hydration step swallows its own network blips, so a transient
-            // failure here doesn't block the session-restore flow.
-            await hydratePostLogin();
             console.debug('E2EE service restored from stored session keys');
           } catch (err) {
             console.warn(
@@ -373,6 +378,18 @@ function App() {
               errorMessage(err)
             );
           }
+        }
+
+        // Hydrate post-login user state on EVERY successful restore (#1297, #1870)
+        // — not only when e2eeKeys are present — so a session-only (rememberMe=false)
+        // soft reload, which restores auth + E2EE from main-process memory, also
+        // reloads servers/profile/preferences instead of landing authenticated but
+        // empty. Runs after E2EE init so decrypted content has its keys. Wrapped so
+        // a hydration throw cannot strand the UI in the restoring state.
+        try {
+          await hydratePostLogin();
+        } catch (err) {
+          console.warn('Post-login hydration failed during session restore:', errorMessage(err));
         }
       } else {
         // Session cannot be restored — clear content stores but keep disk tokens.

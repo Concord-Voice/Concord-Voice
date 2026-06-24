@@ -20,10 +20,21 @@ import type { RefreshResult } from './ipcContract';
 
 // ─── Module State (never leaves this process) ────────────────────────
 
+type E2EEKeyMaterial = {
+  wrappingKeyBase64: string;
+  preferencesKeyBase64: string;
+  wrappedPrivateKeyBase64: string;
+};
+
 let inMemoryRefreshToken: string | null = null;
 let inMemoryRememberMe = true;
 let inMemoryApiBase = '';
 let cachedAccessToken: string | null = null;
+// Session-only (rememberMe=false) E2EE key material lives here and ONLY here —
+// never on disk — so it survives a renderer soft reload (the main process
+// persists across the reload) while honoring the "no session-only key material
+// on disk/localStorage" invariant (#1870). Mirrors inMemoryRefreshToken.
+let inMemoryE2EEKeys: E2EEKeyMaterial | null = null;
 let refreshPromise: Promise<RefreshResult> | null = null;
 
 export function getCachedAccessToken(): string | null {
@@ -288,8 +299,17 @@ export function storeRefreshToken(data: {
  * Returns the token or an error status.
  */
 export function restoreRefreshToken():
-  | { status: 'ok'; token: string; apiBase: string }
+  | { status: 'ok'; token: string; apiBase: string; rememberMe: boolean }
   | { status: 'no_session' | 'tampered' | 'unavailable' } {
+  if (inMemoryRefreshToken && inMemoryApiBase) {
+    return {
+      status: 'ok',
+      token: inMemoryRefreshToken,
+      apiBase: inMemoryApiBase,
+      rememberMe: inMemoryRememberMe,
+    };
+  }
+
   if (!canPersist()) {
     console.debug('[TokenManager] restoreRefreshToken: safeStorage unavailable');
     return { status: 'unavailable' };
@@ -313,7 +333,7 @@ export function restoreRefreshToken():
     inMemoryRefreshToken = token;
     inMemoryRememberMe = meta.rememberMe;
     inMemoryApiBase = meta.apiBase;
-    return { status: 'ok', token, apiBase: meta.apiBase };
+    return { status: 'ok', token, apiBase: meta.apiBase, rememberMe: meta.rememberMe };
   } catch (err) {
     // decryptString throws on tampered ciphertext (AES-GCM auth tag failure)
     console.error('[TokenManager] Token decryption failed (tampered?):', (err as Error).message);
@@ -481,6 +501,9 @@ export function clearTokens(): void {
   inMemoryRememberMe = true;
   inMemoryApiBase = '';
   cachedAccessToken = null;
+  // Drop session-only E2EE key custody on logout/clear — the in-memory keys
+  // must not outlive the session (CWE-212). performLogout() flows through here.
+  inMemoryE2EEKeys = null;
   deleteFiles();
 }
 
@@ -490,13 +513,15 @@ export function clearTokens(): void {
  * Store E2EE session keys encrypted via safeStorage.
  * Called after login/registration when E2EE service has been initialized.
  */
-export function storeE2EEKeys(data: {
-  wrappingKeyBase64: string;
-  preferencesKeyBase64: string;
-  wrappedPrivateKeyBase64: string;
-}): void {
+export function storeE2EEKeys(data: E2EEKeyMaterial): void {
+  // Always hold the key material in main-process memory, regardless of
+  // rememberMe, so a session-only user's E2EE keys survive a renderer soft
+  // reload. This is memory only — the disk write below stays gated on
+  // rememberMe, so session-only key material never touches disk (#1870).
+  inMemoryE2EEKeys = data;
+
   if (!canPersist() || !inMemoryRememberMe) {
-    return; // Only persist if safeStorage available and rememberMe is on
+    return; // Only persist to disk if safeStorage available and rememberMe is on
   }
 
   try {
@@ -512,11 +537,12 @@ export function storeE2EEKeys(data: {
  * Restore E2EE session keys from safeStorage.
  * Returns the key material or null if unavailable.
  */
-export function restoreE2EEKeys(): {
-  wrappingKeyBase64: string;
-  preferencesKeyBase64: string;
-  wrappedPrivateKeyBase64: string;
-} | null {
+export function restoreE2EEKeys(): E2EEKeyMaterial | null {
+  // Prefer the in-memory copy (set by storeE2EEKeys) so a session-only soft
+  // reload restores keys that were never written to disk. Mirrors the
+  // memory-first branch in restoreRefreshToken().
+  if (inMemoryE2EEKeys) return inMemoryE2EEKeys;
+
   if (!canPersist()) return null;
 
   try {
@@ -534,6 +560,7 @@ export function restoreE2EEKeys(): {
  * Used by the SPA loader to fetch client config before the renderer loads.
  */
 export function getPersistedApiBase(): string | null {
+  if (inMemoryApiBase) return inMemoryApiBase;
   const meta = readMeta();
   return meta?.apiBase || null;
 }
@@ -554,6 +581,7 @@ export function _resetForTesting(): void {
   inMemoryRememberMe = true;
   inMemoryApiBase = '';
   cachedAccessToken = null;
+  inMemoryE2EEKeys = null;
   refreshPromise = null;
   proactiveRefreshCallback = null;
   lastProactiveRefreshTimestamp = 0;

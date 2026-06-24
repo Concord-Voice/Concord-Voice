@@ -115,6 +115,7 @@ contextBridge.exposeInMainWorld('electron', {
         preferencesKeyBase64: string;
         wrappedPrivateKeyBase64: string;
       } | null;
+      rememberMe?: boolean;
     }>,
   refreshToken: () =>
     ipcRenderer.invoke('auth:refreshToken') as Promise<{
@@ -482,6 +483,7 @@ export interface ElectronAPI {
       preferencesKeyBase64: string;
       wrappedPrivateKeyBase64: string;
     } | null;
+    rememberMe?: boolean;
   }>;
   refreshToken: () => Promise<{
     status: string;

@@ -26,6 +26,14 @@ import { setSpaHash, setSpaVersion } from './spaState';
 import { getBuildSha7 } from './buildInfo';
 
 const CONFIG_TIMEOUT_MS = 5_000;
+const SPA_NO_CACHE_HEADERS = {
+  'Cache-Control': 'no-cache',
+  Pragma: 'no-cache',
+} as const;
+
+export const SPA_NO_CACHE_LOAD_OPTIONS = {
+  extraHeaders: 'Cache-Control: no-cache\nPragma: no-cache\n',
+} as const;
 
 interface ClientConfigResponse {
   spaUrl?: string;
@@ -124,7 +132,7 @@ function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
     }, timeoutMs);
 
     net
-      .fetch(url, { signal: controller.signal })
+      .fetch(url, { signal: controller.signal, headers: SPA_NO_CACHE_HEADERS, cache: 'no-store' })
       .then((response) => {
         clearTimeout(timer);
         resolve(response);
@@ -234,7 +242,13 @@ export async function captureSpaHash(
  */
 export async function hashEntryHtml(url: string): Promise<string | null> {
   try {
-    const response = await net.fetch(url);
+    const response = await net.fetch(url, {
+      headers: SPA_NO_CACHE_HEADERS,
+      cache: 'no-store',
+    });
+    if (!response.ok) {
+      return null;
+    }
     const arrayBuffer = await response.arrayBuffer();
     const bytes = Buffer.from(arrayBuffer);
     return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
