@@ -240,6 +240,7 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
         if (aborted) return;
         const rawMsgs: MessageWithStatus[] = (data.messages || []).map((m: MessageWithStatus) => ({
           ...m,
+          channel_id: m.channel_id || channelId,
           status: 'delivered' as const,
         }));
 
@@ -307,6 +308,7 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
       const data = await safeJson<{ messages?: MessageWithStatus[] }>(res);
       const rawMsgs: MessageWithStatus[] = (data.messages || []).map((m: MessageWithStatus) => ({
         ...m,
+        channel_id: m.channel_id || requestChannelId,
         status: 'delivered' as const,
       }));
 

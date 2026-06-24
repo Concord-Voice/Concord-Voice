@@ -86,28 +86,29 @@ export async function decryptPins(
 
   return Promise.all(
     msgs.map(async (m) => {
+      const message = { ...m, channel_id: m.channel_id || contextId };
       try {
-        const kv = m.key_version;
+        const kv = message.key_version;
         let plaintext: string;
         if (kv && kv > 1) {
           const vKey = versionedKeys.get(kv);
           plaintext = vKey
-            ? await e2eeService.decryptWithKey(m.content, vKey)
-            : await e2eeService.decryptForChannelWithVersion(contextId, m.content, kv);
+            ? await e2eeService.decryptWithKey(message.content, vKey)
+            : await e2eeService.decryptForChannelWithVersion(contextId, message.content, kv);
         } else {
           plaintext = channelKey
-            ? await e2eeService.decryptWithKey(m.content, channelKey)
-            : await e2eeService.decryptForChannel(contextId, m.content);
+            ? await e2eeService.decryptWithKey(message.content, channelKey)
+            : await e2eeService.decryptForChannel(contextId, message.content);
         }
         const { text, gifSlug } = unwrapGifEnvelope(plaintext);
         return {
-          ...m,
+          ...message,
           content: text,
-          gif_slug: gifSlug ?? m.gif_slug,
+          gif_slug: gifSlug ?? message.gif_slug,
           decrypted: true,
         };
       } catch {
-        return { ...m, content: '', decryptFailed: true };
+        return { ...message, content: '', decryptFailed: true };
       }
     })
   );

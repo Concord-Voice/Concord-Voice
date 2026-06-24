@@ -110,6 +110,16 @@ describe('e2eeService', () => {
   });
 
   describe('getChannelKey', () => {
+    it('rejects a missing channel id without a network request', async () => {
+      await expect(e2eeService.getChannelKey(undefined as unknown as string)).rejects.toMatchObject(
+        {
+          name: 'E2EEKeyUnavailableError',
+          code: 'INVALID_REQUEST',
+        }
+      );
+      expect(mockApiFetch).not.toHaveBeenCalled();
+    });
+
     it('fetches and unwraps channel key from server', async () => {
       await e2eeService.initialize(
         testPassword,
@@ -321,6 +331,16 @@ describe('e2eeService', () => {
         regKeys.wrappedPrivateKey,
         regKeys.keyDerivationSalt
       );
+    });
+
+    it('rejects a missing channel id without a network request', async () => {
+      await expect(
+        e2eeService.getChannelKeyByVersion(undefined as unknown as string, 2)
+      ).rejects.toMatchObject({
+        name: 'E2EEKeyUnavailableError',
+        code: 'INVALID_REQUEST',
+      });
+      expect(mockApiFetch).not.toHaveBeenCalled();
     });
 
     it.each([

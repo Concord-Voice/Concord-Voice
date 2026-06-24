@@ -34,8 +34,15 @@ vi.mock('@/renderer/components/Chat/GifEmbed', () => ({
 }));
 
 vi.mock('@/renderer/components/Chat/AttachmentDisplay', () => ({
-  default: ({ attachments }: { attachments: { id: string; filename: string }[] }) => (
+  default: ({
+    attachments,
+    channelId,
+  }: {
+    attachments: { id: string; filename: string }[];
+    channelId: string;
+  }) => (
     <div data-testid="attachment-display">
+      <span data-testid="attachment-channel-id">{channelId}</span>
       {attachments.map((a) => (
         <span key={a.id}>{a.filename}</span>
       ))}
@@ -116,6 +123,17 @@ describe('PinContent', () => {
     expect(screen.getByText('photo.png')).toBeInTheDocument();
   });
 
+  it('passes the decrypted pin channel_id to AttachmentDisplay', () => {
+    const msg: DecryptedPin = {
+      ...decryptedTextPin,
+      channel_id: 'conv-1',
+      content: '',
+      attachments: [{ id: 'a-1', filename: 'photo.png', file_type: 'image/png', file_size: 1000 }],
+    } as DecryptedPin;
+    render(<PinContent message={msg} />);
+    expect(screen.getByTestId('attachment-channel-id')).toHaveTextContent('conv-1');
+  });
+
   it('renders text + GIF + attachments together', () => {
     const msg: DecryptedPin = {
       ...decryptedTextPin,
@@ -165,6 +183,17 @@ describe('decryptPins', () => {
     expect(result[0].decrypted).toBe(true);
     expect(result[0].decryptFailed).toBeUndefined();
     expect(result[0].gif_slug).toBeUndefined();
+  });
+
+  it('uses the context id as channel_id for pinned rows without one', async () => {
+    await setE2EEInitialized(true);
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockDecryptWithKey.mockResolvedValue('decrypted text');
+
+    const msg = { ...baseMsg, channel_id: undefined as unknown as string, content: 'ciphertext' };
+    const result = await decryptPins('conv-1', [msg]);
+
+    expect(result[0].channel_id).toBe('conv-1');
   });
 
   it('applies unwrapGifEnvelope when plaintext is a GIF envelope', async () => {

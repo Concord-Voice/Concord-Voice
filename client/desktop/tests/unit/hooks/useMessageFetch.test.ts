@@ -121,6 +121,23 @@ describe('useMessageFetch', () => {
     });
   });
 
+  it('uses the conversation id as channel_id for DM history rows without one', async () => {
+    mockFetchResponse([
+      {
+        ...mockMessage,
+        id: 'dm-msg-1',
+        channel_id: undefined as unknown as string,
+      },
+    ]);
+
+    renderHook(() => useMessageFetch('conv-1', { type: 'dm' }));
+
+    await waitFor(() => {
+      const stored = useChatStore.getState().messagesByChannel.get('conv-1');
+      expect(stored?.[0]?.channel_id).toBe('conv-1');
+    });
+  });
+
   it('uses the correct endpoint for channel type', async () => {
     mockFetchResponse([]);
 

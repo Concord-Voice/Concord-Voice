@@ -369,6 +369,10 @@ class E2EEService {
    * Uses pendingKeyFetches to prevent cache stampeding (concurrent fetches for the same channel).
    */
   async getChannelKey(channelId: string): Promise<CryptoKey> {
+    if (!channelId) {
+      throw new E2EEKeyUnavailableError('INVALID_REQUEST', false);
+    }
+
     // Check cache for wrapped key. Guard against refetch-marker slots whose
     // `wrappedKey` is empty (see fetchAndUnwrapChannelKey cache-poison path).
     const cached = this.channelKeyCache.get(channelId);
@@ -656,6 +660,10 @@ class E2EEService {
    * Results are cached in the versioned key cache.
    */
   async getChannelKeyByVersion(channelId: string, version: number): Promise<CryptoKey> {
+    if (!channelId) {
+      throw new E2EEKeyUnavailableError('INVALID_REQUEST', false);
+    }
+
     // Check if this is the current version — use main cache.
     // Guard against empty wrappedKey (cache-poison marker slot).
     const mainCached = this.channelKeyCache.get(channelId);
