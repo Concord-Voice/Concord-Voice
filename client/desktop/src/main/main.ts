@@ -11,6 +11,7 @@ import { registerWindowControlsIpc, getCachedClientBehavior } from './ipc/window
 import { initTray, destroyTray, isTrayActive } from './tray';
 import { registerVersionInfoIpc } from './ipc/versionInfo';
 import { buildBrowserWindowConfig } from './browserWindowConfig';
+import { PRODUCTION_API_BASE } from './apiBaseUrl';
 import { revealLoadFailure } from './loadFailureVisibility';
 import { loadWindowState, attachWindowState } from './windowState';
 import { isWayland } from './waylandDetect';
@@ -1093,12 +1094,23 @@ function isValidApiBase(value: unknown): value is string {
   if (!isNonEmptyString(value)) return false;
   try {
     const parsed = new URL(value);
-    return (
+    const wellFormed =
       (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
       parsed.username === '' &&
       parsed.password === '' &&
-      parsed.origin !== 'null'
-    );
+      parsed.origin !== 'null';
+    if (!wellFormed) return false;
+    // Defense-in-depth (#1872 review): a packaged client only ever talks to the
+    // single SaaS control-plane the updater already TLS-pins, so pin the
+    // renderer-supplied apiBase to that origin too. This denies a
+    // compromised-but-correctly-framed renderer the ability to steer the update
+    // feed / persisted API origin at an attacker host — the one path
+    // code-signing doesn't cover on Linux (no publisher verification). Dev/LAN
+    // builds (isPackaged=false) keep the host-agnostic check.
+    // TODO(#210): single-tenant origin pin — when self-hosted desktop lands,
+    // derive the expected origin from the chosen server, not PRODUCTION_API_BASE.
+    if (app.isPackaged) return parsed.origin === new URL(PRODUCTION_API_BASE).origin;
+    return true;
   } catch {
     return false;
   }

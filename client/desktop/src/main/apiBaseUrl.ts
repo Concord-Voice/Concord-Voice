@@ -20,7 +20,10 @@ import { app } from 'electron';
 
 import { getPersistedApiBase } from './tokenManager';
 
-const PRODUCTION_API_BASE = 'https://api.concordvoice.chat';
+// Exported so the auth-IPC apiBase guard (main.ts `isValidApiBase`) can pin the
+// renderer-supplied apiBase to this same single-tenant origin in packaged builds
+// — the host the updater already TLS-pins (updatePinningConfig.ts).
+export const PRODUCTION_API_BASE = 'https://api.concordvoice.chat';
 const DEV_API_BASE = 'http://localhost:8080';
 
 export function getApiBaseUrl(): string {

@@ -514,6 +514,44 @@ describe('main.ts', () => {
       expect(setUpdateFeedUrl).not.toHaveBeenCalled();
     });
 
+    it('auth:storeRefreshToken pins apiBase to the production origin in packaged builds (#1872)', async () => {
+      const { storeRefreshToken } = await import('../../../src/main/tokenManager');
+      const { setUpdateFeedUrl } = await import('../../../src/main/updater');
+      const electron = await import('electron');
+      // Same object main.ts holds (destructured from the mocked module); flipping
+      // it exercises the isPackaged-gated host pin in isValidApiBase.
+      const app = electron.app as unknown as { isPackaged: boolean };
+      (storeRefreshToken as Mock).mockClear();
+      (setUpdateFeedUrl as Mock).mockClear();
+
+      app.isPackaged = true;
+      try {
+        // Attacker host rejected even with a trusted frame + well-formed https URL.
+        const evil = await handlers.get('auth:storeRefreshToken')!(
+          { senderFrame: { url: 'app://concord/index.html' } },
+          { refreshToken: 'tok', rememberMe: true, apiBase: 'https://evil.example' }
+        );
+        expect(evil).toEqual({ status: 'rejected' });
+        expect(storeRefreshToken).not.toHaveBeenCalled();
+        expect(setUpdateFeedUrl).not.toHaveBeenCalled();
+
+        // The single SaaS control-plane origin is accepted (trailing slash too).
+        const data = {
+          refreshToken: 'tok',
+          rememberMe: true,
+          apiBase: 'https://api.concordvoice.chat/',
+        };
+        await handlers.get('auth:storeRefreshToken')!(
+          { senderFrame: { url: 'app://concord/index.html' } },
+          data
+        );
+        expect(storeRefreshToken).toHaveBeenCalledWith(data);
+        expect(setUpdateFeedUrl).toHaveBeenCalledWith('https://api.concordvoice.chat/');
+      } finally {
+        app.isPackaged = false;
+      }
+    });
+
     it('auth:restoreSession restores and refreshes token', async () => {
       const result = (await handlers.get('auth:restoreSession')!({
         senderFrame: { url: 'app://concord/index.html' },
