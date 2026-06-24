@@ -1,6 +1,6 @@
 /**
- * WCAG 2.1 AA contrast guard for `--link-color` (and `--link-color-hover`)
- * against `--bg-primary` across all 30 theme blocks in `index.css`.
+ * WCAG contrast guard for text, link, and non-text token pairs across all
+ * 32 theme blocks in `index.css`.
  *
  * ## Why this test exists
  *
@@ -12,8 +12,8 @@
  * to complementary sky blue. The catch was accidental — the other 11 themes
  * were not spot-checked.
  *
- * This test asserts the WCAG AA contrast floor (4.5:1) for every theme block,
- * so a future theme author cannot silently ship a sub-AA link/bg pair.
+ * This test asserts the relevant WCAG contrast floors for every theme block,
+ * so a future theme author cannot silently ship a sub-threshold token pair.
  *
  * ## Why 4.5:1 and not 7:1 (AAA)
  *
@@ -42,41 +42,371 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const WCAG_AA_THRESHOLD = 4.5;
+const WCAG_NON_TEXT_THRESHOLD = 3.0;
+
+type ColorToken =
+  | '--accent-primary'
+  | '--border-color'
+  | '--danger'
+  | '--link-color'
+  | '--link-color-hover'
+  | '--link-color-visited'
+  | '--state-focused'
+  | '--success'
+  | '--text-muted'
+  | '--text-primary'
+  | '--text-warning-strong';
+
+type BackgroundToken = '--bg-primary' | '--bg-secondary' | '--bg-tertiary';
+
+type ContrastPair = {
+  foreground: ColorToken;
+  background: BackgroundToken;
+  threshold: number;
+  standard: 'WCAG AA text' | 'WCAG 1.4.11 non-text';
+};
+
+const CONTRAST_PAIRS: readonly ContrastPair[] = [
+  {
+    foreground: '--text-primary',
+    background: '--bg-secondary',
+    threshold: WCAG_AA_THRESHOLD,
+    standard: 'WCAG AA text',
+  },
+  {
+    foreground: '--text-primary',
+    background: '--bg-tertiary',
+    threshold: WCAG_AA_THRESHOLD,
+    standard: 'WCAG AA text',
+  },
+  {
+    foreground: '--text-muted',
+    background: '--bg-primary',
+    threshold: WCAG_AA_THRESHOLD,
+    standard: 'WCAG AA text',
+  },
+  {
+    foreground: '--link-color',
+    background: '--bg-secondary',
+    threshold: WCAG_AA_THRESHOLD,
+    standard: 'WCAG AA text',
+  },
+  {
+    foreground: '--link-color',
+    background: '--bg-tertiary',
+    threshold: WCAG_AA_THRESHOLD,
+    standard: 'WCAG AA text',
+  },
+  {
+    foreground: '--link-color-hover',
+    background: '--bg-secondary',
+    threshold: WCAG_AA_THRESHOLD,
+    standard: 'WCAG AA text',
+  },
+  {
+    foreground: '--link-color-hover',
+    background: '--bg-tertiary',
+    threshold: WCAG_AA_THRESHOLD,
+    standard: 'WCAG AA text',
+  },
+  {
+    foreground: '--link-color-visited',
+    background: '--bg-primary',
+    threshold: WCAG_AA_THRESHOLD,
+    standard: 'WCAG AA text',
+  },
+  {
+    foreground: '--link-color-visited',
+    background: '--bg-secondary',
+    threshold: WCAG_AA_THRESHOLD,
+    standard: 'WCAG AA text',
+  },
+  {
+    foreground: '--link-color-visited',
+    background: '--bg-tertiary',
+    threshold: WCAG_AA_THRESHOLD,
+    standard: 'WCAG AA text',
+  },
+  {
+    foreground: '--accent-primary',
+    background: '--bg-primary',
+    threshold: WCAG_NON_TEXT_THRESHOLD,
+    standard: 'WCAG 1.4.11 non-text',
+  },
+  {
+    foreground: '--danger',
+    background: '--bg-primary',
+    threshold: WCAG_NON_TEXT_THRESHOLD,
+    standard: 'WCAG 1.4.11 non-text',
+  },
+  {
+    foreground: '--success',
+    background: '--bg-primary',
+    threshold: WCAG_NON_TEXT_THRESHOLD,
+    standard: 'WCAG 1.4.11 non-text',
+  },
+  {
+    foreground: '--text-warning-strong',
+    background: '--bg-primary',
+    threshold: WCAG_AA_THRESHOLD,
+    standard: 'WCAG AA text',
+  },
+  {
+    foreground: '--state-focused',
+    background: '--bg-primary',
+    threshold: WCAG_NON_TEXT_THRESHOLD,
+    standard: 'WCAG 1.4.11 non-text',
+  },
+  {
+    foreground: '--border-color',
+    background: '--bg-primary',
+    threshold: WCAG_NON_TEXT_THRESHOLD,
+    standard: 'WCAG 1.4.11 non-text',
+  },
+] as const;
+
+type KnownNoncompliantContrast = {
+  foreground: ColorToken;
+  background: BackgroundToken;
+  blocks: readonly string[];
+  issue: `#${number}`;
+};
 
 /**
- * Exemption list for theme blocks whose `--link-color` / `--link-color-hover`
- * fall below the WCAG-AA threshold (4.5:1) against `--bg-primary`.
+ * Temporary, issue-tracked exemptions for current sub-threshold contrast pairs.
  *
- * As of #1182 this list is INTENTIONALLY EMPTY. The 24 previously-failing
- * (block, token) pairs across 13 themes were fixed with explicit per-theme
- * `--link-color` / `--link-color-hover` overrides in `index.css` (decoupled
- * from `--accent-primary`, mirroring the Fox Den precedent from #800 /
- * PR #1090). The guard now enforces AA on every block with zero exemptions
- * and zero `.skip`.
- *
- * The mechanism (`isExempt` + the `it.skip` branches below) is retained on
- * purpose: a future theme that regresses below AA — or a new block added
- * without a compliant link color — fails LOUD rather than being silently
- * skipped. The #1183 guard-expansion (non-text / focus-ring contrast) stacks
- * on top of it.
- *
- * **If an entry is ever re-added, do so ONLY as a temporary, issue-tracked
- * exemption, and remove it by fixing the theme's contrast — never by lowering
- * the threshold or carving out a per-theme exception.**
+ * The original #1182 link-color failures are still fixed and stay absent here.
+ * #1183's expanded surface exposes existing theme debt; these grouped block
+ * lists keep that debt explicit without repeating one object per failure.
  */
-const KNOWN_NONCOMPLIANT_BLOCKS: ReadonlyArray<{
-  block: string;
-  token: '--link-color' | '--link-color-hover';
-  ratio: number;
-}> = [
-  // Intentionally empty as of #1182 — every block now meets AA in index.css.
-  // See the exemption-list contract above for why the mechanism is retained.
+const KNOWN_NONCOMPLIANT_BLOCKS: readonly KnownNoncompliantContrast[] = [
+  {
+    foreground: '--text-muted',
+    background: '--bg-primary',
+    issue: '#1183',
+    blocks: [
+      "[data-theme='light']",
+      "[data-scheme='concord'][data-theme='light']",
+      "[data-scheme='morky']",
+      "[data-scheme='morky'][data-theme='light']",
+      "[data-scheme='bardic']",
+      "[data-scheme='bardic'][data-theme='light']",
+      "[data-scheme='foxden']",
+      "[data-scheme='foxden'][data-theme='light']",
+      "[data-scheme='hacker']",
+      "[data-scheme='spooky']",
+      "[data-scheme='spooky'][data-theme='light']",
+      "[data-scheme='leviathan']",
+      "[data-scheme='leviathan'][data-theme='light']",
+      "[data-scheme='grassynill']",
+      "[data-scheme='grassynill'][data-theme='light']",
+      "[data-scheme='driftwood']",
+      "[data-scheme='driftwood'][data-theme='light']",
+      "[data-scheme='eclipse']",
+      "[data-scheme='midnightsky']",
+      "[data-scheme='midnightsky'][data-theme='light']",
+      "[data-scheme='agency']",
+      "[data-scheme='pride'][data-theme='light']",
+    ],
+  },
+  {
+    foreground: '--link-color',
+    background: '--bg-secondary',
+    issue: '#1183',
+    blocks: ["[data-scheme='morky']"],
+  },
+  {
+    foreground: '--link-color',
+    background: '--bg-tertiary',
+    issue: '#1183',
+    blocks: [
+      "[data-theme='light']",
+      "[data-scheme='concord'][data-theme='light']",
+      "[data-scheme='morky']",
+      "[data-scheme='morky'][data-theme='light']",
+      "[data-scheme='bardic'][data-theme='light']",
+      "[data-scheme='hacker'][data-theme='light']",
+      "[data-scheme='spooky'][data-theme='light']",
+      "[data-scheme='leviathan'][data-theme='light']",
+      "[data-scheme='grassynill']",
+      "[data-scheme='grassynill'][data-theme='light']",
+      "[data-scheme='cottoncandy'][data-theme='light']",
+      "[data-scheme='driftwood'][data-theme='light']",
+      "[data-scheme='eclipse']",
+      "[data-scheme='midnightsky'][data-theme='light']",
+      "[data-scheme='defacto'][data-theme='light']",
+      "[data-scheme='pride'][data-theme='light']",
+    ],
+  },
+  {
+    foreground: '--link-color-hover',
+    background: '--bg-tertiary',
+    issue: '#1183',
+    blocks: [
+      "[data-theme='light']",
+      "[data-scheme='concord'][data-theme='light']",
+      "[data-scheme='morky'][data-theme='light']",
+      "[data-scheme='bardic'][data-theme='light']",
+      "[data-scheme='foxden'][data-theme='light']",
+      "[data-scheme='hacker'][data-theme='light']",
+      "[data-scheme='spooky'][data-theme='light']",
+      "[data-scheme='leviathan'][data-theme='light']",
+      "[data-scheme='grassynill'][data-theme='light']",
+      "[data-scheme='cottoncandy'][data-theme='light']",
+      "[data-scheme='driftwood'][data-theme='light']",
+      "[data-scheme='eclipse'][data-theme='light']",
+      "[data-scheme='midnightsky'][data-theme='light']",
+    ],
+  },
+  {
+    foreground: '--link-color-visited',
+    background: '--bg-primary',
+    issue: '#1183',
+    blocks: [
+      "[data-theme='light']",
+      "[data-scheme='concord'][data-theme='light']",
+      "[data-scheme='morky'][data-theme='light']",
+      "[data-scheme='bardic'][data-theme='light']",
+      "[data-scheme='foxden'][data-theme='light']",
+      "[data-scheme='spooky']",
+      "[data-scheme='leviathan'][data-theme='light']",
+      "[data-scheme='grassynill']",
+      "[data-scheme='cottoncandy'][data-theme='light']",
+      "[data-scheme='eclipse']",
+      "[data-scheme='midnightsky'][data-theme='light']",
+      "[data-scheme='agency']",
+      "[data-scheme='defacto'][data-theme='light']",
+    ],
+  },
+  {
+    foreground: '--link-color-visited',
+    background: '--bg-secondary',
+    issue: '#1183',
+    blocks: [
+      "[data-theme='light']",
+      "[data-scheme='concord'][data-theme='light']",
+      "[data-scheme='morky'][data-theme='light']",
+      "[data-scheme='bardic'][data-theme='light']",
+      "[data-scheme='foxden'][data-theme='light']",
+      "[data-scheme='spooky']",
+      "[data-scheme='leviathan'][data-theme='light']",
+      "[data-scheme='grassynill']",
+      "[data-scheme='cottoncandy'][data-theme='light']",
+      "[data-scheme='eclipse']",
+      "[data-scheme='agency']",
+      "[data-scheme='defacto'][data-theme='light']",
+    ],
+  },
+  {
+    foreground: '--link-color-visited',
+    background: '--bg-tertiary',
+    issue: '#1183',
+    blocks: [
+      "[data-theme='light']",
+      "[data-scheme='concord'][data-theme='light']",
+      "[data-scheme='morky'][data-theme='light']",
+      "[data-scheme='bardic'][data-theme='light']",
+      "[data-scheme='foxden'][data-theme='light']",
+      "[data-scheme='spooky']",
+      "[data-scheme='leviathan'][data-theme='light']",
+      "[data-scheme='grassynill']",
+      "[data-scheme='cottoncandy'][data-theme='light']",
+      "[data-scheme='driftwood']",
+      "[data-scheme='eclipse']",
+      "[data-scheme='midnightsky'][data-theme='light']",
+      "[data-scheme='agency']",
+      "[data-scheme='defacto'][data-theme='light']",
+      "[data-scheme='pride'][data-theme='light']",
+    ],
+  },
+  {
+    foreground: '--accent-primary',
+    background: '--bg-primary',
+    issue: '#1183',
+    blocks: ["[data-theme='light']", "[data-scheme='concord'][data-theme='light']"],
+  },
+  {
+    foreground: '--success',
+    background: '--bg-primary',
+    issue: '#1183',
+    blocks: ["[data-scheme='cottoncandy'][data-theme='light']", "[data-scheme='eclipse']"],
+  },
+  {
+    foreground: '--state-focused',
+    background: '--bg-primary',
+    issue: '#1183',
+    blocks: [
+      "[data-theme='light']",
+      "[data-scheme='concord'][data-theme='light']",
+      "[data-scheme='morky'][data-theme='light']",
+      "[data-scheme='foxden'][data-theme='light']",
+      "[data-scheme='spooky']",
+      "[data-scheme='cottoncandy'][data-theme='light']",
+      "[data-scheme='eclipse']",
+    ],
+  },
+  {
+    foreground: '--border-color',
+    background: '--bg-primary',
+    issue: '#1183',
+    blocks: [
+      ':root',
+      "[data-theme='light']",
+      "[data-scheme='concord']",
+      "[data-scheme='concord'][data-theme='light']",
+      "[data-scheme='morky']",
+      "[data-scheme='morky'][data-theme='light']",
+      "[data-scheme='bardic']",
+      "[data-scheme='bardic'][data-theme='light']",
+      "[data-scheme='foxden']",
+      "[data-scheme='foxden'][data-theme='light']",
+      "[data-scheme='hacker']",
+      "[data-scheme='hacker'][data-theme='light']",
+      "[data-scheme='spooky']",
+      "[data-scheme='spooky'][data-theme='light']",
+      "[data-scheme='leviathan']",
+      "[data-scheme='leviathan'][data-theme='light']",
+      "[data-scheme='grassynill']",
+      "[data-scheme='grassynill'][data-theme='light']",
+      "[data-scheme='cottoncandy']",
+      "[data-scheme='cottoncandy'][data-theme='light']",
+      "[data-scheme='driftwood']",
+      "[data-scheme='driftwood'][data-theme='light']",
+      "[data-scheme='eclipse']",
+      "[data-scheme='eclipse'][data-theme='light']",
+      "[data-scheme='midnightsky']",
+      "[data-scheme='midnightsky'][data-theme='light']",
+      "[data-scheme='agency']",
+      "[data-scheme='agency'][data-theme='light']",
+      "[data-scheme='defacto']",
+      "[data-scheme='defacto'][data-theme='light']",
+      "[data-scheme='pride']",
+      "[data-scheme='pride'][data-theme='light']",
+    ],
+  },
 ];
 
-function isExempt(block: string, token: '--link-color' | '--link-color-hover'): boolean {
-  return KNOWN_NONCOMPLIANT_BLOCKS.some((e) => e.block === block && e.token === token);
+function isExempt(block: string, foreground: ColorToken, background: BackgroundToken): boolean {
+  return KNOWN_NONCOMPLIANT_BLOCKS.some(
+    (e) => e.foreground === foreground && e.background === background && e.blocks.includes(block)
+  );
 }
 
+function knownNoncompliantEntries(): Array<{
+  block: string;
+  foreground: ColorToken;
+  background: BackgroundToken;
+  issue: `#${number}`;
+}> {
+  return KNOWN_NONCOMPLIANT_BLOCKS.flatMap((entry) =>
+    entry.blocks.map((block) => ({
+      block,
+      foreground: entry.foreground,
+      background: entry.background,
+      issue: entry.issue,
+    }))
+  );
+}
 const ALL_32_BLOCKS = [
   ':root',
   "[data-theme='light']",
@@ -200,6 +530,14 @@ function extractDeclaration(blockBody: string, tokenName: string): string | null
     return null;
   }
   return blockBody.slice(startPos + needleLen, semiPos).trim();
+}
+
+function extractCascadedDeclaration(
+  blockBody: string,
+  rootBody: string,
+  tokenName: string
+): string | null {
+  return extractDeclaration(blockBody, tokenName) ?? extractDeclaration(rootBody, tokenName);
 }
 
 /**
@@ -444,7 +782,30 @@ describe('resolveToHex helper', () => {
   });
 });
 
-describe('WCAG-AA link contrast across all theme blocks', () => {
+describe('extractCascadedDeclaration helper', () => {
+  const rootBody = `
+    --bg-secondary: #15121f;
+    --accent-primary: #fa709a;
+  `;
+  const themeBody = `
+    --bg-primary: #0d0821;
+    --accent-primary: #80d8ff;
+  `;
+
+  it('prefers a block declaration over :root', () => {
+    expect(extractCascadedDeclaration(themeBody, rootBody, '--accent-primary')).toBe('#80d8ff');
+  });
+
+  it('falls back to :root when the block omits a token', () => {
+    expect(extractCascadedDeclaration(themeBody, rootBody, '--bg-secondary')).toBe('#15121f');
+  });
+
+  it('returns null when neither the block nor :root declares a token', () => {
+    expect(extractCascadedDeclaration(themeBody, rootBody, '--missing-token')).toBeNull();
+  });
+});
+
+describe('WCAG contrast across all theme blocks', () => {
   const cssPath = resolve(__dirname, '../../../src/renderer/styles/index.css');
   const css = readFileSync(cssPath, 'utf-8');
   const rootBody = extractBlockBody(css, ':root') ?? '';
@@ -476,7 +837,7 @@ describe('WCAG-AA link contrast across all theme blocks', () => {
       ).not.toBeNull();
     });
 
-    const linkTest = isExempt(block, '--link-color') ? it.skip : it;
+    const linkTest = isExempt(block, '--link-color', '--bg-primary') ? it.skip : it;
     linkTest(
       `--link-color has WCAG AA contrast ≥ ${WCAG_AA_THRESHOLD}:1 against --bg-primary`,
       () => {
@@ -505,7 +866,8 @@ describe('WCAG-AA link contrast across all theme blocks', () => {
     // — honest-skip); an in-body early `return` would show a misleading pass.
     // Also skips KNOWN_NONCOMPLIANT exemptions.
     const hoverValue = extractDeclaration(blockBody ?? '', '--link-color-hover');
-    const hoverTest = hoverValue === null || isExempt(block, '--link-color-hover') ? it.skip : it;
+    const hoverTest =
+      hoverValue === null || isExempt(block, '--link-color-hover', '--bg-primary') ? it.skip : it;
     hoverTest(
       `--link-color-hover has WCAG AA contrast ≥ ${WCAG_AA_THRESHOLD}:1 against --bg-primary`,
       () => {
@@ -528,15 +890,10 @@ describe('WCAG-AA link contrast across all theme blocks', () => {
     );
 
     // #1183: body-text contrast guard. --text-primary / --text-secondary must meet
-    // WCAG 2.1 AA (≥ 4.5:1 normal text) against --bg-primary. All 30 blocks already
-    // pass (verified at authoring), so no exemption inventory is needed — these
-    // assertions lock in compliance and catch future regressions. Only blocks that
-    // *declare* the token are enforced (inherited values are covered by :root —
-    // today all 30 blocks declare both, so every pair is checked directly).
-    //
-    // Deliberately scoped to text (the 4.5:1 threshold). The non-text surface —
-    // accent/status/focus-ring colours at the 3:1 WCAG 1.4.11 threshold — is a
-    // separate follow-up under #1183 (different threshold + per-pair design calls).
+    // WCAG 2.1 AA (>= 4.5:1 normal text) against --bg-primary. All 32 blocks already
+    // pass (verified at authoring), so no exemption inventory is needed for this
+    // older slice; the expanded #1183 matrix below carries per-pair exemptions for
+    // the remaining text, link, and non-text token surfaces.
     for (const textToken of ['--text-primary', '--text-secondary'] as const) {
       // Gate at collection time so a token inherited from :root (undeclared in
       // this block) reports as a visible SKIP rather than a silent green pass
@@ -565,6 +922,40 @@ describe('WCAG-AA link contrast across all theme blocks', () => {
         }
       );
     }
+
+    for (const pair of CONTRAST_PAIRS) {
+      const foregroundValue = extractCascadedDeclaration(
+        blockBody ?? '',
+        rootBody,
+        pair.foreground
+      );
+      const backgroundValue = extractCascadedDeclaration(
+        blockBody ?? '',
+        rootBody,
+        pair.background
+      );
+      const pairTest = isExempt(block, pair.foreground, pair.background) ? it.skip : it;
+
+      pairTest(
+        `${pair.foreground} has ${pair.standard} contrast ≥ ${pair.threshold}:1 against ${pair.background}`,
+        () => {
+          const foregroundHex = resolveToHex(foregroundValue ?? '', blockBody ?? '', rootBody);
+          const backgroundHex = resolveToHex(backgroundValue ?? '', blockBody ?? '', rootBody);
+
+          if (foregroundHex === null || backgroundHex === null) {
+            throw new Error(
+              `Could not resolve ${pair.foreground} or ${pair.background} to hex for block ${block}`
+            );
+          }
+
+          const ratio = wcagContrast(foregroundHex, backgroundHex);
+          expect(
+            ratio,
+            `Theme '${block}' ${pair.foreground} '${foregroundHex}' on ${pair.background} '${backgroundHex}' = ${ratio.toFixed(2)}:1, below ${pair.standard} ${pair.threshold}:1`
+          ).toBeGreaterThanOrEqual(pair.threshold);
+        }
+      );
+    }
   });
 });
 
@@ -572,8 +963,8 @@ describe('failure-path: detects deliberately-bad link/bg pair', () => {
   // Synthetic fixture so we don't have to mutate index.css to verify
   // that the assertion fires with a useful message. Pair chosen to be
   // unambiguously below 4.5:1 — `#cc0000` on `#000000` computes to 3.57:1
-  // (the same ratio as the production [data-scheme='eclipse'] failure
-  // captured in KNOWN_NONCOMPLIANT_BLOCKS).
+  // (the same ratio as the historical [data-scheme='eclipse'] failure
+  // from #1182 before the link-color fix landed).
   const badFixture = `
 :root {
   --bg-primary: #000000;
@@ -620,14 +1011,14 @@ describe('failure-path: detects deliberately-bad link/bg pair', () => {
 });
 
 describe('exemption discipline', () => {
-  // KNOWN_NONCOMPLIANT_BLOCKS is empty as of #1182, so these three invariant
-  // checks currently pass vacuously. They are retained to harden the exemption
-  // mechanism for any future (issue-tracked) re-population — e.g. the #1183
-  // guard-expansion. See the exemption-list contract above the array.
+  const cssPath = resolve(__dirname, '../../../src/renderer/styles/index.css');
+  const css = readFileSync(cssPath, 'utf-8');
+  const rootBody = extractBlockBody(css, ':root') ?? '';
+
   it('KNOWN_NONCOMPLIANT_BLOCKS contains no duplicates', () => {
     const seen = new Set<string>();
-    for (const e of KNOWN_NONCOMPLIANT_BLOCKS) {
-      const key = `${e.block}|${e.token}`;
+    for (const e of knownNoncompliantEntries()) {
+      const key = `${e.block}|${e.foreground}|${e.background}`;
       expect(seen.has(key), `Duplicate exemption: ${key}`).toBe(false);
       seen.add(key);
     }
@@ -635,7 +1026,7 @@ describe('exemption discipline', () => {
 
   it('every exempted block exists in ALL_32_BLOCKS', () => {
     const validBlocks = new Set<string>(ALL_32_BLOCKS);
-    for (const e of KNOWN_NONCOMPLIANT_BLOCKS) {
+    for (const e of knownNoncompliantEntries()) {
       expect(
         validBlocks.has(e.block),
         `Exempted block '${e.block}' is not in ALL_32_BLOCKS — typo or stale entry`
@@ -643,12 +1034,52 @@ describe('exemption discipline', () => {
     }
   });
 
-  it('every exempted ratio is below the AA threshold (sanity-check exemption rationale)', () => {
-    for (const e of KNOWN_NONCOMPLIANT_BLOCKS) {
+  it('every exempted pair is covered by a contrast assertion', () => {
+    const validPairs = new Set(CONTRAST_PAIRS.map((p) => `${p.foreground}|${p.background}`));
+    validPairs.add('--link-color|--bg-primary');
+    validPairs.add('--link-color-hover|--bg-primary');
+    for (const e of knownNoncompliantEntries()) {
+      const key = `${e.foreground}|${e.background}`;
+      expect(validPairs.has(key), `Exempted pair '${key}' has no matching assertion`).toBe(true);
+    }
+  });
+
+  it('every exempted ratio is still below the asserted threshold', () => {
+    for (const e of knownNoncompliantEntries()) {
+      const pair = CONTRAST_PAIRS.find(
+        (p) => p.foreground === e.foreground && p.background === e.background
+      );
+      const threshold = pair?.threshold ?? WCAG_AA_THRESHOLD;
+      const blockBody = extractBlockBody(css, e.block) ?? '';
+      const foregroundValue = extractDeclaration(blockBody, e.foreground);
+      const backgroundValue = extractDeclaration(blockBody, e.background);
       expect(
-        e.ratio < WCAG_AA_THRESHOLD,
-        `Exempted entry ${e.block}/${e.token} has ratio ${e.ratio} ≥ ${WCAG_AA_THRESHOLD} — should not be exempt`
-      ).toBe(true);
+        foregroundValue,
+        `${e.foreground} not declared in exempted block ${e.block}`
+      ).not.toBeNull();
+      expect(
+        backgroundValue,
+        `${e.background} not declared in exempted block ${e.block}`
+      ).not.toBeNull();
+      const foregroundHex = resolveToHex(foregroundValue ?? '', blockBody, rootBody);
+      const backgroundHex = resolveToHex(backgroundValue ?? '', blockBody, rootBody);
+      expect(
+        foregroundHex,
+        `${e.foreground} did not resolve in exempted block ${e.block}`
+      ).not.toBeNull();
+      expect(
+        backgroundHex,
+        `${e.background} did not resolve in exempted block ${e.block}`
+      ).not.toBeNull();
+      const currentRatio = wcagContrast(foregroundHex ?? '#000', backgroundHex ?? '#fff');
+      expect(
+        currentRatio,
+        `Exempted entry ${e.block}/${e.foreground}/${e.background} is now ${currentRatio.toFixed(2)} ≥ ${threshold}; remove the exemption`
+      ).toBeLessThan(threshold);
+      expect(
+        e.issue,
+        `Exempted entry ${e.block}/${e.foreground}/${e.background} needs an issue reference`
+      ).toMatch(/^#\d+$/);
     }
   });
 });
