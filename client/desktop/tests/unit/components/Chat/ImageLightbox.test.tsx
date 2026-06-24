@@ -1,6 +1,8 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { vi } from 'vitest';
 import ImageLightbox from '@/renderer/components/Chat/ImageLightbox';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 describe('ImageLightbox', () => {
   const baseProps = { src: 'blob:fake-url', alt: 'pic', onClose: vi.fn() };
@@ -13,6 +15,15 @@ describe('ImageLightbox', () => {
     render(<ImageLightbox {...baseProps} />);
     expect(screen.getByAltText('pic')).toHaveAttribute('src', 'blob:fake-url');
     expect(screen.getByRole('dialog', { name: 'Image viewer' })).toBeInTheDocument();
+  });
+
+  it('uses a plain cursor at rest, grab when zoomed (no magnifier)', () => {
+    render(<ImageLightbox {...baseProps} />);
+    const img = screen.getByAltText('pic');
+    // At 1× the image must show the default select cursor, not zoom-in.
+    expect(img.style.cursor).toBe('default');
+    fireEvent.click(screen.getByLabelText('Zoom in'));
+    expect(img.style.cursor).toBe('grab'); // pannable once zoomed
   });
 
   it('focuses the close button on open (a11y)', () => {
@@ -125,5 +136,25 @@ describe('ImageLightbox', () => {
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Tab' });
     // Zoom-out/Reset are disabled at 1×, so the first enabled control is Zoom in.
     expect(screen.getByLabelText('Zoom in')).toHaveFocus();
+  });
+});
+
+// Source guard for the CSS-only part of the fix (jsdom can't verify layout). The
+// lightbox renders into a native <dialog>, which keeps its UA `width/height:
+// fit-content` — collapsing the overlay to its content box at top-left (image
+// off-center, backdrop not covering the window). The overlay MUST force the full
+// viewport, or both centering AND the darkening backdrop silently regress.
+describe('ImageLightbox.css — full-viewport overlay (#1729 centering + darkening)', () => {
+  const css = readFileSync(
+    resolve(__dirname, '../../../../src/renderer/components/Chat/ImageLightbox.css'),
+    'utf-8'
+  );
+  const start = css.indexOf('.image-lightbox-overlay {');
+  const overlay = css.slice(start, css.indexOf('}', start));
+
+  it('pins the overlay to the full viewport so the image centers and the window dims', () => {
+    expect(overlay).toMatch(/position:\s*fixed/);
+    expect(overlay).toMatch(/width:\s*100vw/);
+    expect(overlay).toMatch(/height:\s*100vh/);
   });
 });

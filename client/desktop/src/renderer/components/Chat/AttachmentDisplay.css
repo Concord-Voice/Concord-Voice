@@ -28,7 +28,7 @@
   margin: 0;
   border: none;
   background: none;
-  cursor: zoom-in;
+  cursor: pointer;
 }
 
 .attachment-image {

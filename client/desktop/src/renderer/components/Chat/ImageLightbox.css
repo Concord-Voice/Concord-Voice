@@ -4,11 +4,16 @@
 .image-lightbox-overlay {
   position: fixed;
   inset: 0;
+  /* A native <dialog> keeps its UA `width/height: fit-content`, which shrinks
+     this overlay to its content box at top-left — collapsing both the flex
+     centering and the full-screen darkening backdrop. Force it to the viewport. */
+  width: 100vw;
+  height: 100vh;
   z-index: 1100; /* above modals (modal-overlay) — opened from the message list */
   display: flex;
   align-items: center;
   justify-content: center;
-  /* Reset the native <dialog> UA chrome (border/padding/margin/size/color). */
+  /* Reset the rest of the native <dialog> UA chrome (border/padding/margin/color). */
   margin: 0;
   max-width: none;
   max-height: none;

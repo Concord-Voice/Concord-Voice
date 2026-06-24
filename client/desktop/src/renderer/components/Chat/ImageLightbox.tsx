@@ -203,7 +203,7 @@ const ImageLightbox: React.FC<ImageLightboxProps> = ({ src, alt, onClose, onSave
         className="image-lightbox-image"
         style={{
           transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})`,
-          cursor: scale > MIN_SCALE ? 'grab' : 'zoom-in',
+          cursor: scale > MIN_SCALE ? 'grab' : 'default',
         }}
         onDoubleClick={onDoubleClick}
         onPointerDown={onPointerDown}
