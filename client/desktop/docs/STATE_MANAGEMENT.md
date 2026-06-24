@@ -65,7 +65,7 @@ Full analysis was performed during Phase 1A architecture decisions (internal).
 | **savedGifsStore**              | User's saved/favourite GIFs (Klipy integration)              | ✅                    | 2B    |
 | **settingsOverlayStore**        | Settings panel open/close and active tab state               | ❌                    | 2B    |
 
-**Total: 36 Zustand stores** across Phases 1A–2B — see [internal] "Key Counts" for the authoritative count. The inventory above details 30 core stores; 6 added in later work (`attestationFailureStore`, `e2eeStore`, `notificationPrefsStore`, `pendingRegistrationStore`, `ssoStore`, `updateStatusStore`) are not yet broken out individually here — see `src/renderer/stores/` for the canonical set.
+**Total: 41 Zustand stores** across Phases 1A–2B — see [internal] "Key Counts" for the authoritative count. The inventory above details 30 core stores; 11 added in later work are not yet broken out individually here — see `src/renderer/stores/` for the canonical set.
 
 ---
 
@@ -619,7 +619,7 @@ Or use the `userStore.logout()` action which does this automatically.
 
 **Memory Usage:**
 
-- Zustand: ~4MB (all 30 stores loaded)
+- Zustand: ~4MB (all 41 stores loaded)
 - Redux: ~12MB (estimated with DevTools + middleware)
 - **Savings:** ~8MB
 

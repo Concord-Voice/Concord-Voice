@@ -107,6 +107,7 @@ const mockDebouncedRotateKeys = vi.fn();
 const mockCatchUpToEpoch = vi.fn().mockResolvedValue(undefined);
 
 vi.mock('@/renderer/services/mediaEncryption', () => ({
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 2,
   MediaEncryption: class MockMediaEncryption {
     init = mockMediaEncryptionInit;
     initFromKey = mockMediaEncryptionInitFromKey;
@@ -217,7 +218,7 @@ Object.defineProperty(globalThis, 'MediaStream', {
   configurable: true,
 });
 
-// Mock RTCRtpSender (no createEncodedStreams)
+// Mock RTCRtpSender constructor; producer doubles below model createEncodedStreams.
 function MockRTCRtpSender() {}
 Object.defineProperty(globalThis, 'RTCRtpSender', {
   value: MockRTCRtpSender,
@@ -312,6 +313,7 @@ function makeJoinResponse(co?: Record<string, unknown>) {
 function makeRoomJoined(ov?: Record<string, unknown>) {
   return {
     rtpCapabilities: mockDeviceRtpCapabilities,
+    mediaFrameCryptoVersion: 2,
     existingProducers: [],
     participants: [{ userId: 'user-1', username: 'testuser', displayName: 'Test User' }],
     channelName: 'General',
@@ -346,10 +348,29 @@ function createMockProducer(id = 'prod-1', source = 'mic') {
         codecs: [{ mimeType: 'audio/opus' }],
       }),
       setParameters: vi.fn().mockResolvedValue(undefined),
+      createEncodedStreams: vi.fn().mockImplementation(() => ({
+        readable: new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        writable: new WritableStream(),
+      })),
       transform: null,
     },
     appData: { source },
     producerId: id,
+  };
+}
+
+function createEncodedStreamPair() {
+  return {
+    readable: new ReadableStream({
+      start(controller) {
+        controller.close();
+      },
+    }),
+    writable: new WritableStream(),
   };
 }
 
@@ -366,7 +387,10 @@ function createMockConsumer(id = 'cons-1', kind: 'audio' | 'video' = 'audio', pr
     resume: vi.fn(),
     on: vi.fn(),
     getStats: vi.fn().mockResolvedValue(new Map()),
-    rtpReceiver: { transform: null },
+    rtpReceiver: {
+      transform: null,
+      createEncodedStreams: vi.fn().mockImplementation(createEncodedStreamPair),
+    },
   };
 }
 
@@ -1927,6 +1951,16 @@ describe('VoiceService Extended', () => {
       expect(mockSocket.emit).toHaveBeenCalledWith('request-keyframe', { senderUserId: 'user-2' });
     });
 
+    it('forwards legacy decrypt recovery keyframe requests to the media-plane socket', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useVoiceStore.getState().setActiveChannel('ch1', 'General', 'srv1');
+
+      svc.decryptRecoveryCallbacks().requestKeyframe('user-2');
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('request-keyframe', { senderUserId: 'user-2' });
+    });
+
     it('handles log message', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
@@ -1934,6 +1968,83 @@ describe('VoiceService Extended', () => {
       svc.handleWorkerMessage({ type: 'log', level: 'debug', message: 'test log' });
       expect(spy).toHaveBeenCalledWith('test log', '');
       spy.mockRestore();
+    });
+  });
+
+  // ===== applyEncryptTransform =====
+
+  describe('applyEncryptTransform', () => {
+    it('fails closed when an encrypted producer has no sender transform API', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const producer = createMockProducer('cam-no-transform', 'camera');
+      delete (producer.rtpSender as Record<string, unknown>).createEncodedStreams;
+      svc.producers.set('camera', producer);
+
+      expect(() => svc.applyEncryptTransform(producer)).toThrow(
+        'E2EE: failed to attach encrypt transform'
+      );
+
+      expect(producer.close).toHaveBeenCalled();
+      expect(svc.producers.has('camera')).toBe(false);
+      expect(mockSocket.emit).toHaveBeenCalledWith('close-producer', {
+        producerId: 'cam-no-transform',
+      });
+    });
+  });
+
+  // ===== applyDecryptTransform =====
+
+  describe('applyDecryptTransform', () => {
+    it('fails closed before routing when an encrypted consumer has no receiver transform API', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      svc.recvTransportAudio = makeRecvTransport('recv-audio');
+
+      const consumer = createMockConsumer('c-no-transform', 'audio', 'p-audio');
+      delete (consumer.rtpReceiver as Record<string, unknown>).createEncodedStreams;
+      svc.recvTransportAudio.consume.mockResolvedValue(consumer);
+
+      setupEmitResponses({
+        consume: {
+          id: 'c-no-transform',
+          producerId: 'p-audio',
+          kind: 'audio',
+          rtpParameters: {},
+          producerUserId: 'user-2',
+          source: 'mic',
+        },
+        'resume-consumer': undefined,
+        'close-consumer': undefined,
+      });
+
+      const store = useVoiceStore.getState();
+      store.addParticipant({
+        userId: 'user-2',
+        username: 'u2',
+        isMuted: false,
+        isDeafened: false,
+        isVideoOn: false,
+        isScreenSharing: false,
+        isSpeaking: false,
+      });
+      const updateSpy = vi.spyOn(store, 'updateParticipant');
+
+      await svc.consumeProducerImpl('p-audio', 'user-2', 'audio');
+
+      expect(consumer.close).toHaveBeenCalled();
+      expect(svc.consumers.has('c-no-transform')).toBe(false);
+      expect(svc.consumerMeta.has('c-no-transform')).toBe(false);
+      expect(mockSocket.emit).toHaveBeenCalledWith('close-consumer', {
+        consumerId: 'c-no-transform',
+      });
+      expect(mockSocket.emit).not.toHaveBeenCalledWith('resume-consumer', {
+        consumerId: 'c-no-transform',
+      });
+      expect(updateSpy).not.toHaveBeenCalledWith(
+        'user-2',
+        expect.objectContaining({ audioStream: expect.any(MediaStream) })
+      );
     });
   });
 
@@ -2693,6 +2804,117 @@ describe('VoiceService Extended', () => {
 
       expect(useVoiceStore.getState().participants['user-2']).toBeUndefined();
       expect(mockDebouncedRotateKeys).toHaveBeenCalled();
+    });
+
+    it('uses authoritative leave epoch when local media epoch is behind', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const workerPostMessage = vi.fn();
+      svc.e2eeWorker = { postMessage: workerPostMessage, terminate: vi.fn() };
+      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      svc.mediaEncryption = new MediaEncryption();
+      mockGetCurrentKeyId.mockReturnValue(1);
+
+      useVoiceStore.getState().addParticipant({
+        userId: 'user-2',
+        username: 'leaver',
+        isMuted: false,
+        isDeafened: false,
+        isVideoOn: false,
+        isScreenSharing: false,
+        isSpeaking: false,
+      });
+      useVoiceStore.getState().addParticipant({
+        userId: 'user-3',
+        username: 'remaining',
+        isMuted: false,
+        isDeafened: false,
+        isVideoOn: false,
+        isScreenSharing: false,
+        isSpeaking: false,
+      });
+
+      triggerSocketEvent('user-left', { userId: 'user-2', e2eeEpoch: 4 });
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'user-3', 4);
+      expect(workerPostMessage).toHaveBeenCalledWith({ type: 'catchUpToEpoch', targetEpoch: 4 });
+      expect(mockCatchUpToEpoch).toHaveBeenCalledWith(4);
+      expect(mockAddDecryptKeyAtEpoch).not.toHaveBeenCalledWith(expect.anything(), 'user-2', 4);
+    });
+
+    it('does not catch up when authoritative leave epoch is not ahead locally', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const workerPostMessage = vi.fn();
+      svc.e2eeWorker = { postMessage: workerPostMessage, terminate: vi.fn() };
+      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      svc.mediaEncryption = new MediaEncryption();
+      mockGetCurrentKeyId.mockReturnValue(4);
+
+      useVoiceStore.getState().addParticipant({
+        userId: 'user-2',
+        username: 'leaver',
+        isMuted: false,
+        isDeafened: false,
+        isVideoOn: false,
+        isScreenSharing: false,
+        isSpeaking: false,
+      });
+      useVoiceStore.getState().addParticipant({
+        userId: 'user-3',
+        username: 'remaining',
+        isMuted: false,
+        isDeafened: false,
+        isVideoOn: false,
+        isScreenSharing: false,
+        isSpeaking: false,
+      });
+
+      triggerSocketEvent('user-left', { userId: 'user-2', e2eeEpoch: 4 });
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'user-3', 4);
+      expect(workerPostMessage).not.toHaveBeenCalledWith({
+        type: 'catchUpToEpoch',
+        targetEpoch: 4,
+      });
+      expect(mockCatchUpToEpoch).not.toHaveBeenCalled();
+      expect(mockDebouncedRotateKeys).not.toHaveBeenCalled();
+    });
+
+    it('logs authoritative leave epoch catch-up failures', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      svc.mediaEncryption = new MediaEncryption();
+      mockGetCurrentKeyId.mockReturnValue(1);
+      mockCatchUpToEpoch.mockRejectedValueOnce(new Error('catch-up failed'));
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      useVoiceStore.getState().addParticipant({
+        userId: 'user-2',
+        username: 'leaver',
+        isMuted: false,
+        isDeafened: false,
+        isVideoOn: false,
+        isScreenSharing: false,
+        isSpeaking: false,
+      });
+
+      triggerSocketEvent('user-left', { userId: 'user-2', e2eeEpoch: 4 });
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(mockCatchUpToEpoch).toHaveBeenCalledWith(4);
+      expect(errorSpy).toHaveBeenCalledWith(
+        'E2EE: leave epoch catch-up failed — decrypt may fail until rejoin',
+        expect.objectContaining({
+          localEpoch: 1,
+          serverEpoch: 4,
+          error: 'catch-up failed',
+        })
+      );
+      errorSpy.mockRestore();
     });
   });
 

@@ -6,7 +6,7 @@ WebRTC Selective Forwarding Unit (SFU) for routing voice and video media in Conc
 
 ## Tech Stack
 
-- **Node.js** 20+
+- **Node.js** 24+
 - **TypeScript**
 - **mediasoup** - WebRTC SFU library
 - **Socket.IO** - WebSocket signaling
@@ -57,7 +57,7 @@ media-plane/
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 24+
 - npm 10+
 - Python 3 (for mediasoup build)
 - Build tools (make, g++)
@@ -110,9 +110,17 @@ MEDIASOUP_LOG_LEVEL=warn
 
 **join-room**
 ```typescript
-socket.emit('join-room', { roomId: string, rtpCapabilities });
+socket.emit('join-room', {
+  roomId: string,
+  rtpCapabilities,
+  mediaFrameCryptoVersion: 2,
+});
 // room-joined participants include { userId, username, isDeafened, isTesting, ... }
 ```
+
+`mediaFrameCryptoVersion: 2` is the AES-256-GCM media-frame format. The media
+plane rejects missing or legacy frame-format declarations and keeps one
+room-wide value so mixed AES-128/AES-256 clients cannot enter the same call.
 
 **create-transport**
 ```typescript

@@ -53,7 +53,7 @@ desktop/
 │   └── renderer/      # React application
 │       ├── components/ # React components
 │       ├── hooks/     # Custom React hooks
-│       ├── stores/    # State management (36 Zustand stores)
+│       ├── stores/    # State management (41 Zustand stores)
 │       ├── utils/     # Utility functions
 │       ├── styles/    # CSS styles
 │       ├── App.tsx    # Main app component
@@ -165,7 +165,7 @@ without the value produces an inert Google SSO (empty secret), not a failure.
 - Presence indicators (online/offline/typing)
 - Server invites with code sharing
 - Channel read states and unread badges
-- Custom themes (11 theme blocks, 5 color schemes x dark/light)
+- Custom themes (32 theme blocks, 15 color schemes x dark/light + root + base light)
 - Compact mode, resizable panels, font scaling
 
 ### Phase 1C: Voice & Media ✅
@@ -178,7 +178,7 @@ without the value produces an inert Google SSO (empty secret), not a failure.
 - Channel groups with drag-and-drop ordering
 - Custom context menus
 - Profile popovers
-- **36 Zustand stores** (Zustand 5.0.12) for state management — see [STATE_MANAGEMENT.md](docs/STATE_MANAGEMENT.md) and [internal] for authoritative counts
+- **41 Zustand stores** (Zustand 5.0.12) for state management — see [STATE_MANAGEMENT.md](docs/STATE_MANAGEMENT.md) and [internal] for authoritative counts
 
 ### Security ✅
 

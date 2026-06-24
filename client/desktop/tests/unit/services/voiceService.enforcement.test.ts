@@ -57,6 +57,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 
 // --- mediaEncryption ---
 vi.mock('@/renderer/services/mediaEncryption', () => ({
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 2,
   MediaEncryption: class MockMediaEncryption {
     init = vi.fn().mockResolvedValue(undefined);
     initFromKey = vi.fn();
@@ -217,6 +218,14 @@ function createMockProducer(id = 'prod-1', source = 'mic') {
         codecs: [{ mimeType: 'audio/opus' }],
       }),
       setParameters: vi.fn().mockResolvedValue(undefined),
+      createEncodedStreams: vi.fn().mockImplementation(() => ({
+        readable: new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        writable: new WritableStream(),
+      })),
       transform: null,
     },
     appData: { source },
@@ -237,7 +246,17 @@ function createMockConsumer(id = 'cons-1', kind: 'audio' | 'video' = 'audio', pr
     resume: vi.fn(),
     on: vi.fn(),
     getStats: vi.fn().mockResolvedValue(new Map()),
-    rtpReceiver: { transform: null },
+    rtpReceiver: {
+      transform: null,
+      createEncodedStreams: vi.fn().mockImplementation(() => ({
+        readable: new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        writable: new WritableStream(),
+      })),
+    },
   };
 }
 

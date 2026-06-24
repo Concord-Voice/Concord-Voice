@@ -223,8 +223,8 @@ docker exec -it concord-redis redis-cli ping
 - Presence system (online/offline, typing indicators)
 - Server invites, session management, unread tracking
 - Browser-inspired UI layout (server bar, folder bar, channel panel)
-- Custom context menus, ~30 Zustand stores (see `[internal]` for current count)
-- 272 frontend test files, 90 Go test files (see `[internal]` for current count)
+- Custom context menus, ~41 Zustand stores (see `[internal]` for current count)
+- 509 frontend test files, 213 backend test files (see `[internal]` for current count)
 
 ### ✅ Phase 1C Complete (Voice & Media)
 
@@ -330,7 +330,7 @@ All core features are implemented. Good starting points:
 - **Auth flow:** `services/control-plane/internal/auth/` — Argon2id, JWT, E2EE key storage
 - **WebSocket:** `services/control-plane/internal/websocket/` — Hub, ticket-based auth, channel subscriptions
 - **Voice:** `services/media-plane/src/lib/roomManager.ts` — mediasoup SFU, WebRTC transport management
-- **Frontend stores:** `client/desktop/src/renderer/stores/` — ~30 Zustand stores (see `[internal]` for current count)
+- **Frontend stores:** `client/desktop/src/renderer/stores/` — ~41 Zustand stores (see `[internal]` for current count)
 
 ### 3. Run the Tests
 
@@ -438,8 +438,8 @@ You're ready to start building! Here are the immediate priorities:
 - [x] WebSocket real-time messaging with E2EE
 - [x] Presence system (online/offline, typing)
 - [x] Server invites, unread tracking, session management
-- [x] Browser-inspired UI layout with ~30 Zustand stores (see `[internal]`)
-- [x] 272 frontend test files, 90 Go test files (see `[internal]`)
+- [x] Browser-inspired UI layout with ~41 Zustand stores (see `[internal]`)
+- [x] 509 frontend test files, 213 backend test files (see `[internal]`)
 
 **Phase 1C: Voice & Media** ✅ COMPLETE
 

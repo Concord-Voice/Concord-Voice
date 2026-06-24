@@ -5,6 +5,7 @@ const { mockDecryptFrame } = vi.hoisted(() => ({
 }));
 
 vi.mock('@/renderer/services/mediaEncryption', () => ({
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 2,
   MediaEncryption: class {
     initFromKey = vi.fn();
     addDecryptKeyDirect = vi.fn();

@@ -22,13 +22,16 @@ function mockCallbacks(): DecryptRecoveryCallbacks {
     getActiveChannelId: vi.fn().mockReturnValue('channel-1'),
     addDecryptKeyForUser: vi.fn().mockResolvedValue(true),
     invalidateChannelKey: vi.fn(),
+    requestKeyframe: vi.fn(),
   };
 }
 
 type TransformFn = (
-  frame: { data: ArrayBuffer },
+  frame: { data: ArrayBuffer; type?: string },
   controller: { enqueue: ReturnType<typeof vi.fn> }
 ) => Promise<void>;
+
+let capturedTransformFn: TransformFn | null = null;
 
 function mockReceiver(): InsertableStreamsReceiver {
   const mockReadable = {
@@ -42,11 +45,15 @@ function mockReceiver(): InsertableStreamsReceiver {
   };
 }
 
+function requireCapturedTransformFn(): TransformFn {
+  if (!capturedTransformFn) throw new Error('decrypt transform was not captured');
+  return capturedTransformFn;
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────
 
 describe('applyLegacyDecryptPipeline', () => {
   const origTransformStream = globalThis.TransformStream;
-  let capturedTransformFn: TransformFn | null = null;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -71,9 +78,11 @@ describe('applyLegacyDecryptPipeline', () => {
     vi.restoreAllMocks();
   });
 
-  it('warns when createEncodedStreams is not available', () => {
+  it('throws when createEncodedStreams is not available', () => {
     const receiver: InsertableStreamsReceiver = {};
-    applyLegacyDecryptPipeline(receiver, 'user-1', mockEncryption(), mockCallbacks(), false);
+    expect(() =>
+      applyLegacyDecryptPipeline(receiver, 'user-1', mockEncryption(), mockCallbacks(), false)
+    ).toThrow('no Insertable Streams API available');
     expect(console.warn).toHaveBeenCalledWith(
       'E2EE: no Insertable Streams API available — frames will not be decrypted'
     );
@@ -99,14 +108,16 @@ describe('applyLegacyDecryptPipeline', () => {
     );
   });
 
-  it('handles createEncodedStreams throwing', () => {
+  it('throws when createEncodedStreams throws', () => {
     const receiver = {
       createEncodedStreams: vi.fn().mockImplementation(() => {
         throw new Error('API not ready');
       }),
     };
 
-    applyLegacyDecryptPipeline(receiver, 'user-1', mockEncryption(), mockCallbacks(), false);
+    expect(() =>
+      applyLegacyDecryptPipeline(receiver, 'user-1', mockEncryption(), mockCallbacks(), false)
+    ).toThrow('createEncodedStreams failed on receiver');
 
     expect(console.error).toHaveBeenCalledWith(
       'E2EE: createEncodedStreams failed on receiver:',
@@ -121,7 +132,7 @@ describe('applyLegacyDecryptPipeline', () => {
     expect(capturedTransformFn).toBeTypeOf('function');
     const frame = { data: new ArrayBuffer(100) };
     const controller = { enqueue: vi.fn() };
-    await capturedTransformFn!(frame, controller);
+    await requireCapturedTransformFn()(frame, controller);
 
     expect(encryption.decryptFrame).toHaveBeenCalledWith(frame, 'user-1');
     expect(controller.enqueue).toHaveBeenCalledWith(frame);
@@ -139,7 +150,7 @@ describe('applyLegacyDecryptPipeline', () => {
     expect(capturedTransformFn).toBeTypeOf('function');
     const frame = { data: new ArrayBuffer(100) };
     const controller = { enqueue: vi.fn() };
-    await capturedTransformFn!(frame, controller);
+    await requireCapturedTransformFn()(frame, controller);
 
     expect(controller.enqueue).not.toHaveBeenCalled();
     expect(console.warn).toHaveBeenCalledWith(
@@ -165,7 +176,7 @@ describe('applyLegacyDecryptPipeline', () => {
     const controller = { enqueue: vi.fn() };
 
     for (let i = 0; i < 50; i++) {
-      await capturedTransformFn!(frame, controller);
+      await requireCapturedTransformFn()(frame, controller);
     }
 
     expect(callbacks.invalidateChannelKey).toHaveBeenCalledWith('channel-1');
@@ -184,7 +195,7 @@ describe('applyLegacyDecryptPipeline', () => {
     expect(capturedTransformFn).toBeTypeOf('function');
     const frame = { data: new ArrayBuffer(100) };
     const controller = { enqueue: vi.fn() };
-    await capturedTransformFn!(frame, controller);
+    await requireCapturedTransformFn()(frame, controller);
 
     expect(console.warn).toHaveBeenCalledWith(
       expect.stringContaining('E2EE: dropping frame for sender'),
@@ -208,7 +219,7 @@ describe('applyLegacyDecryptPipeline', () => {
     const controller = { enqueue: vi.fn() };
 
     for (let i = 0; i < 500; i++) {
-      await capturedTransformFn!(frame, controller);
+      await requireCapturedTransformFn()(frame, controller);
     }
 
     expect(console.error).toHaveBeenCalledWith(
@@ -232,7 +243,7 @@ describe('applyLegacyDecryptPipeline', () => {
     const controller = { enqueue: vi.fn() };
 
     for (let i = 0; i < 50; i++) {
-      await capturedTransformFn!(frame, controller);
+      await requireCapturedTransformFn()(frame, controller);
     }
 
     expect(callbacks.addDecryptKeyForUser).not.toHaveBeenCalled();
@@ -281,12 +292,38 @@ describe('applyLegacyDecryptPipeline', () => {
     const controller = { enqueue: vi.fn() };
 
     for (let i = 0; i < 4; i++) {
-      await capturedTransformFn!(frame, controller);
+      await requireCapturedTransformFn()(frame, controller);
     }
 
     expect(console.debug).toHaveBeenCalledWith(
       expect.stringContaining('E2EE: decrypt recovered after 3 dropped frames')
     );
     expect(controller.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('requests a fresh keyframe when video decrypt recovers after dropped frames', async () => {
+    let failCount = 0;
+    const encryption = {
+      decryptFrame: vi.fn().mockImplementation(() => {
+        failCount++;
+        if (failCount <= 3) throw new Error('key mismatch');
+        return Promise.resolve();
+      }),
+      getCurrentKeyId: vi.fn().mockReturnValue(0),
+    } as unknown as MediaEncryption;
+    const callbacks = mockCallbacks();
+
+    applyLegacyDecryptPipeline(mockReceiver(), 'user-1', encryption, callbacks, false);
+
+    expect(capturedTransformFn).toBeTypeOf('function');
+    const frame = { data: new ArrayBuffer(100), type: 'delta' };
+    const controller = { enqueue: vi.fn() };
+
+    for (let i = 0; i < 4; i++) {
+      await requireCapturedTransformFn()(frame, controller);
+    }
+
+    expect(callbacks.requestKeyframe).toHaveBeenCalledWith('user-1');
+    expect(callbacks.requestKeyframe).toHaveBeenCalledTimes(1);
   });
 });

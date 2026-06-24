@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { config } from './config/index.js';
 import { logger } from './lib/logger.js';
 import { MediasoupService } from './lib/mediasoup.js';
-import { RoomManager } from './lib/roomManager.js';
+import { parseMediaFrameCryptoVersion, RoomManager } from './lib/roomManager.js';
 import type { MediaSource } from './lib/roomManager.js';
 import { MediaMetrics } from './lib/mediaMetrics.js';
 import { createAuthMiddleware, validateChannelAccess } from './middleware/auth.js';
@@ -241,10 +241,13 @@ async function main() {
     });
 
     // ── join-room ────────────────────────────────────────────────────
-    // Client sends: { roomId, rtpCapabilities }
+    // Client sends: { roomId, rtpCapabilities, mediaFrameCryptoVersion }
     // Server responds with: room-joined event containing router caps, existing producers, participants
-    socket.on('join-room', async ({ roomId, rtpCapabilities }, callback?) => {
+    socket.on('join-room', async ({ roomId, rtpCapabilities, mediaFrameCryptoVersion }, callback?) => {
       try {
+        const parsedMediaFrameCryptoVersion =
+          parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
+
         // Validate channel access via control plane. Room kind is a
         // routing hint from the renderer's Socket.IO handshake (per
         // #1209 plan C1 + spec §6.5): 'channel' hits the server-channel
@@ -297,7 +300,8 @@ async function main() {
             allowedAudioTiers: access.allowedAudioTiers,
             minPtimeMs: access.minPtimeMs,
             maxManualBitrateBps: access.maxManualBitrateBps,
-          }
+          },
+          parsedMediaFrameCryptoVersion
         );
 
         // Apply server enforcement if the joining user has active enforcement
@@ -326,6 +330,7 @@ async function main() {
         // Respond to the joining client
         const response = {
           rtpCapabilities: result.rtpCapabilities,
+          mediaFrameCryptoVersion: result.mediaFrameCryptoVersion,
           existingProducers: result.existingProducers,
           participants: result.participants,
           channelName: access.channelName,
@@ -852,9 +857,6 @@ async function main() {
       return;
     }
 
-    // Notify others before cleanup
-    socket.to(roomId).emit('user-left', { userId });
-
     // Clean up via RoomManager (closes transports, producers, consumers)
     await roomManager.leaveRoom(roomId, userId);
 
@@ -886,6 +888,13 @@ async function main() {
         userId: event.userId,
         kind: event.kind,
         source: event.source,
+      });
+    }
+
+    if (event.type === 'user-left') {
+      io.to(event.roomId).except(event.socketId).emit('user-left', {
+        userId: event.userId,
+        e2eeEpoch: event.e2eeEpoch,
       });
     }
 

@@ -120,7 +120,13 @@ describe('NatsService', () => {
     it('maps user-left to voice.left', () => {
       const handler = service.createRoomEventHandler();
 
-      handler({ type: 'user-left', roomId: 'ch-1', userId: 'u-1' });
+      handler({
+        type: 'user-left',
+        roomId: 'ch-1',
+        userId: 'u-1',
+        socketId: 'sock-1',
+        e2eeEpoch: 3,
+      });
 
       const subject = mockNc.publish.mock.calls.at(-1)?.[0];
       expect(subject).toBe('voice.left');

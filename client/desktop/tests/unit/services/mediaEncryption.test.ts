@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 // MediaEncryption is the default export-less class — import directly
 let MediaEncryption: typeof import('@/renderer/services/mediaEncryption').MediaEncryption;
@@ -121,36 +121,142 @@ describe('MediaEncryption', () => {
       await receiver.decryptFrame(frame, 'sender-user-id');
       expect(new Uint8Array(frame.data)).toEqual(originalData);
     });
+
+    it('serializes overlapping key rotations so epochs are not lost', async () => {
+      const csk = await generateTestCSK();
+      const sender = new MediaEncryption();
+      const receiver = new MediaEncryption();
+
+      await sender.init(csk, 'sender-user-id');
+      await receiver.init(csk, 'receiver-user-id');
+      await receiver.addDecryptKey(csk, 'sender-user-id');
+
+      await Promise.all([sender.rotateKeys(), sender.rotateKeys()]);
+      expect(sender.getCurrentKeyId()).toBe(2);
+
+      await receiver.catchUpToEpoch(2);
+
+      const frame = fakeAudioFrame(40);
+      const originalData = new Uint8Array(frame.data).slice();
+
+      await sender.encryptFrame(frame);
+      const encrypted = new Uint8Array(frame.data);
+      expect(encrypted[encrypted.length - 15]).toBe(2);
+
+      await receiver.decryptFrame(frame, 'sender-user-id');
+      expect(new Uint8Array(frame.data)).toEqual(originalData);
+    });
+
+    it('keeps ciphertext and trailer keyId on the same epoch when rotation overlaps encryption', async () => {
+      const csk = await generateTestCSK();
+      const sender = new MediaEncryption();
+      const receiver = new MediaEncryption();
+
+      await sender.init(csk, 'sender-user-id');
+      await receiver.init(csk, 'receiver-user-id');
+      await receiver.addDecryptKey(csk, 'sender-user-id', 0);
+      await receiver.addDecryptKeyAtEpoch(csk, 'sender-user-id', 1);
+
+      const frame = fakeVideoFrame(200);
+      const originalData = new Uint8Array(frame.data).slice();
+
+      const originalEncrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+      let signalEncryptStarted: (() => void) | null = null;
+      let releaseEncrypt: (() => void) | null = null;
+      const encryptStarted = new Promise<void>((resolve) => {
+        signalEncryptStarted = resolve;
+      });
+      const encryptGate = new Promise<void>((resolve) => {
+        releaseEncrypt = resolve;
+      });
+
+      const encryptSpy = vi
+        .spyOn(crypto.subtle, 'encrypt')
+        .mockImplementation(async (algorithm, key, data) => {
+          if (!signalEncryptStarted) throw new Error('test signal not initialized');
+          signalEncryptStarted();
+          await encryptGate;
+          return originalEncrypt(algorithm, key, data);
+        });
+
+      try {
+        const encryptPromise = sender.encryptFrame(frame);
+        await encryptStarted;
+
+        await sender.rotateKeys();
+        expect(sender.getCurrentKeyId()).toBe(1);
+
+        if (!releaseEncrypt) throw new Error('test release not initialized');
+        releaseEncrypt();
+        await encryptPromise;
+
+        const encrypted = new Uint8Array(frame.data);
+        expect(encrypted[encrypted.length - 15]).toBe(0);
+
+        await receiver.decryptFrame(frame, 'sender-user-id');
+        expect(new Uint8Array(frame.data)).toEqual(originalData);
+      } finally {
+        encryptSpy.mockRestore();
+      }
+    });
   });
 
   describe('rejection paths', () => {
-    it('passes through frames without magic trailer', async () => {
+    it('rejects non-empty frames without magic trailer', async () => {
       const csk = await generateTestCSK();
       const me = new MediaEncryption();
       await me.init(csk, 'user-id');
       await me.addDecryptKey(csk, 'sender-id');
 
       const frame = fakeAudioFrame(50);
+
+      await expect(me.decryptFrame(frame, 'sender-id')).rejects.toThrow(
+        'unencrypted media frame received'
+      );
+    });
+
+    it('passes through empty frames', async () => {
+      const csk = await generateTestCSK();
+      const me = new MediaEncryption();
+      await me.init(csk, 'user-id');
+
+      const frame = fakeAudioFrame(0);
       const originalData = new Uint8Array(frame.data).slice();
 
-      // No encryption → no magic trailer → should pass through unchanged
       await me.decryptFrame(frame, 'sender-id');
       expect(new Uint8Array(frame.data)).toEqual(originalData);
     });
 
-    it('passes through frames that are too small', async () => {
+    it('rejects non-empty too-small frames without magic trailer', async () => {
       const csk = await generateTestCSK();
       const me = new MediaEncryption();
       await me.init(csk, 'user-id');
 
       const frame = fakeAudioFrame(10);
-      const originalData = new Uint8Array(frame.data).slice();
 
-      await me.decryptFrame(frame, 'sender-id');
-      expect(new Uint8Array(frame.data)).toEqual(originalData);
+      await expect(me.decryptFrame(frame, 'sender-id')).rejects.toThrow(
+        'unencrypted media frame received'
+      );
     });
 
-    it('passes through frames with coincidental 0xDEAD but too small for valid ciphertext', async () => {
+    it('rejects too-small frames that carry the E2EE magic trailer', async () => {
+      const csk = await generateTestCSK();
+      const me = new MediaEncryption();
+      await me.init(csk, 'user-id');
+
+      const buf = new ArrayBuffer(10);
+      const view = new Uint8Array(buf);
+      view.fill(0x42);
+      view[8] = 0xde;
+      view[9] = 0xad;
+      const frame = { data: buf } as unknown as RTCEncodedAudioFrame;
+
+      await expect(me.decryptFrame(frame, 'sender-id')).rejects.toThrow(
+        'malformed encrypted frame'
+      );
+    });
+
+    it('rejects frames with magic trailer but too-small ciphertext', async () => {
       const csk = await generateTestCSK();
       const me = new MediaEncryption();
       await me.init(csk, 'user-id');
@@ -165,14 +271,13 @@ describe('MediaEncryption', () => {
       view[32] = 0xad;
       view[17] = 2; // headerBytes = 2 at position length-16
       const frame = { data: buf } as unknown as RTCEncodedAudioFrame;
-      const originalData = new Uint8Array(buf).slice();
 
-      // Should pass through: ciphertext is 15 bytes < 16 (GCM auth tag minimum)
-      await me.decryptFrame(frame, 'sender-id');
-      expect(new Uint8Array(frame.data)).toEqual(originalData);
+      await expect(me.decryptFrame(frame, 'sender-id')).rejects.toThrow(
+        'malformed encrypted frame'
+      );
     });
 
-    it('passes through frames with invalid headerBytes in trailer', async () => {
+    it('rejects frames with invalid headerBytes in trailer', async () => {
       const csk = await generateTestCSK();
       const me = new MediaEncryption();
       await me.init(csk, 'user-id');
@@ -185,10 +290,10 @@ describe('MediaEncryption', () => {
       view[49] = 0xad;
       view[34] = 0; // headerBytes = 0 (invalid, must be 1-10)
       const frame = { data: buf } as unknown as RTCEncodedAudioFrame;
-      const originalData = new Uint8Array(buf).slice();
 
-      await me.decryptFrame(frame, 'sender-id');
-      expect(new Uint8Array(frame.data)).toEqual(originalData);
+      await expect(me.decryptFrame(frame, 'sender-id')).rejects.toThrow(
+        'malformed encrypted frame'
+      );
     });
 
     it('throws when no decrypt key is available', async () => {
@@ -236,6 +341,17 @@ describe('MediaEncryption', () => {
   });
 
   describe('Worker-path APIs (initFromKey / addDecryptKeyDirect / setCurrentKeyId)', () => {
+    it('derives and ratchets 256-bit AES-GCM frame keys', async () => {
+      const csk = await generateTestCSK();
+      const key = await deriveFrameKey(csk, 'user-a');
+      const ratcheted = await ratchetKey(key);
+
+      expect(key.algorithm.name).toBe('AES-GCM');
+      expect((key.algorithm as AesKeyAlgorithm).length).toBe(256);
+      expect(ratcheted.algorithm.name).toBe('AES-GCM');
+      expect((ratcheted.algorithm as AesKeyAlgorithm).length).toBe(256);
+    });
+
     it('initFromKey enables encryptFrame and sets currentKeyId', async () => {
       const csk = await generateTestCSK();
       const key = await deriveFrameKey(csk, 'user-a');
@@ -382,7 +498,9 @@ describe('MediaEncryption', () => {
         // Advance past 2s debounce
         await vi.advanceTimersByTimeAsync(2500);
 
-        expect(enc.getCurrentKeyId()).toBe(1);
+        await vi.waitFor(() => {
+          expect(enc.getCurrentKeyId()).toBe(1);
+        });
       } finally {
         vi.useRealTimers();
       }
@@ -404,7 +522,9 @@ describe('MediaEncryption', () => {
         await vi.advanceTimersByTimeAsync(2500);
 
         // Should have rotated exactly once (not 5 times)
-        expect(enc.getCurrentKeyId()).toBe(1);
+        await vi.waitFor(() => {
+          expect(enc.getCurrentKeyId()).toBe(1);
+        });
       } finally {
         vi.useRealTimers();
       }
@@ -420,6 +540,26 @@ describe('MediaEncryption', () => {
 
       await enc.catchUpToEpoch(3);
       expect(enc.getCurrentKeyId()).toBe(3);
+    });
+
+    it('does not overshoot when duplicate catch-up requests overlap', async () => {
+      const csk = await generateTestCSK();
+      const enc = new MediaEncryption();
+      await enc.init(csk, 'user-1');
+
+      await Promise.all([enc.catchUpToEpoch(2), enc.catchUpToEpoch(2)]);
+
+      expect(enc.getCurrentKeyId()).toBe(2);
+    });
+
+    it('rejects instead of spinning when catch-up cannot advance', async () => {
+      const csk = await generateTestCSK();
+      const enc = new MediaEncryption();
+      await enc.init(csk, 'user-1');
+      enc.destroy();
+
+      await expect(enc.catchUpToEpoch(1)).rejects.toThrow('E2EE epoch catch-up stalled');
+      expect(enc.getCurrentKeyId()).toBe(0);
     });
 
     it('no-op when already at target', async () => {
@@ -586,26 +726,24 @@ describe('MediaEncryption — #1742 empty DTX frame passthrough', () => {
     expect(new Uint8Array(frame.data)).toEqual(original);
   });
 
-  it('does NOT consume an IV-counter value for a skipped empty frame (no nonce gap)', async () => {
-    // Security invariant: the empty-frame early return must stay ABOVE the
-    // frameCounter++ in encryptFrame, so a skipped 0-byte frame consumes no
-    // GCM nonce counter. This regression-locks that ordering against a future
-    // refactor that moves the guard below the counter increment.
+  it('uses a fully random 96-bit GCM IV for encrypted frames', async () => {
+    // Security invariant: empty-frame early return must stay above IV
+    // generation, and real encrypted frames request the full 96-bit GCM nonce
+    // from WebCrypto rather than combining a counter prefix with random suffix.
     const csk = await generateTestCSK();
     const sender = new MediaEncryption();
     await sender.init(csk, 'sender-user-id');
+    const randomSpy = vi.spyOn(crypto, 'getRandomValues');
 
     const empty = fakeAudioFrame(0);
     await sender.encryptFrame(empty); // must not advance the counter
     expect(empty.data.byteLength).toBe(0);
+    expect(randomSpy).not.toHaveBeenCalled();
 
     const real = fakeAudioFrame(50);
     await sender.encryptFrame(real);
-    const enc = new Uint8Array(real.data);
-    // Trailer IV = bytes [-14, -2); its first 4 bytes are the big-endian counter.
-    const ivStart = enc.length - 14;
-    const counter =
-      (enc[ivStart] << 24) | (enc[ivStart + 1] << 16) | (enc[ivStart + 2] << 8) | enc[ivStart + 3];
-    expect(counter).toBe(0); // first real frame still uses counter 0
+    expect(randomSpy).toHaveBeenCalledTimes(1);
+    expect((randomSpy.mock.calls[0][0] as Uint8Array).byteLength).toBe(12);
+    randomSpy.mockRestore();
   });
 });

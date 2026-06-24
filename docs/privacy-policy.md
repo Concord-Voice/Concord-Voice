@@ -318,7 +318,7 @@ the keys necessary to decrypt the content.
 
 Voice and video streams transmitted via our media plane (a mediasoup
 SFU) are **end-to-end encrypted at the frame level**. Media frames are
-encrypted on your device using **AES-128-GCM** via the WebRTC Encoded
+encrypted on your device using **AES-256-GCM** via the WebRTC Encoded
 Transform API before they reach our media server. The media server (a
 Selective Forwarding Unit, or SFU) forwards the encrypted RTP payloads
 to other participants in the same channel or call without seeing the

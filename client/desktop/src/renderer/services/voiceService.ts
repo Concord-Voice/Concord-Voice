@@ -33,7 +33,11 @@ import {
   type ScreenShareOptions,
 } from '../stores/videoSettingsStore';
 import { apiFetch } from './apiClient';
-import { MediaEncryption, deriveFrameKey } from './mediaEncryption';
+import {
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION,
+  MediaEncryption,
+  deriveFrameKey,
+} from './mediaEncryption';
 import { e2eeService } from './e2eeService';
 import { isPendingKeyError } from './e2eeErrors';
 import {
@@ -77,7 +81,7 @@ const MAX_REMOTE_VIDEO_DEVICE_PIXEL_RATIO = 8;
 // RTCRtpScriptTransform WITHOUT encodedInsertableStreams receives no frames at all.
 // createEncodedStreams + encodedInsertableStreams is the proven path (#295).
 //
-interface RtpSenderWithEncodedStreams {
+interface RtpSenderWithEncodedStreams extends RTCRtpSender {
   createEncodedStreams?: () => { readable: ReadableStream; writable: WritableStream };
 }
 
@@ -235,6 +239,7 @@ interface JoinResponse {
 
 interface RoomJoinedResponse {
   rtpCapabilities: mediasoupTypes.RtpCapabilities;
+  mediaFrameCryptoVersion?: number;
   existingProducers: Array<{
     producerId: string;
     userId: string;
@@ -253,6 +258,11 @@ interface RoomJoinedResponse {
     isTesting?: boolean;
   }>;
   channelName: string;
+  e2eeEpoch?: number;
+}
+
+interface UserLeftEvent {
+  userId: string;
   e2eeEpoch?: number;
 }
 
@@ -858,8 +868,8 @@ class VoiceService {
   }
 
   /**
-   * Pick the best codec for screen sharing. Single-layer encoding only (E2EE
-   * requires byte-for-byte SFU forwarding — SVC/simulcast break AES-GCM #291).
+   * Pick the best codec for screen sharing. Screen currently publishes one
+   * encoding; camera layering is negotiated separately by the media-plane gate.
    *
    * Cascade: user pref → AV1 → HEVC → H264 High → VP9:2 (HDR) → H264 → VP9 → VP8
    * Two-pass: HW-accelerated first, then SW fallback.
@@ -1771,7 +1781,11 @@ class VoiceService {
       const roomJoined = await this.emitAsync<RoomJoinedResponse>('join-room', {
         roomId: channel.id,
         rtpCapabilities: undefined, // Will be set after device.load
+        mediaFrameCryptoVersion: MEDIA_E2EE_FRAME_CRYPTO_VERSION,
       });
+      if (roomJoined.mediaFrameCryptoVersion !== MEDIA_E2EE_FRAME_CRYPTO_VERSION) {
+        throw new Error('Media frame crypto version mismatch');
+      }
 
       // Step 4: Load device with router capabilities
       this.device = new Device();
@@ -2206,7 +2220,7 @@ class VoiceService {
     return 'Could not start camera. Try a different camera or video preset in Settings.';
   }
 
-  /** Produce camera video — VP9 SVC (L3T3) preferred, H264 simulcast fallback */
+  /** Produce camera video — single-layer until the media-plane gate enables AV1/VP9 SVC or H264/VP8 simulcast. */
   async produceVideo(deviceId?: string): Promise<void> {
     if (!this.sendTransport || !this.device) return;
 
@@ -2254,6 +2268,10 @@ class VoiceService {
       this.applyDegradationPreference(producer);
       this.producers.set('camera', producer);
 
+      if (this.mediaEncryption) {
+        this.applyEncryptTransform(producer);
+      }
+
       useVoiceStore.getState().setActiveCameraCodec(codec?.mimeType?.toLowerCase() ?? null);
 
       const store = useVoiceStore.getState();
@@ -2264,10 +2282,6 @@ class VoiceService {
           videoStream: this.localCameraStream,
           isVideoOn: true,
         });
-      }
-
-      if (this.mediaEncryption) {
-        this.applyEncryptTransform(producer);
       }
 
       producer.on('transportclose', () => {
@@ -2400,7 +2414,7 @@ class VoiceService {
     }
   }
 
-  /** Produce screen share — AV1 SVC preferred (best compression for static content), VP9 fallback */
+  /** Produce screen share — single-layer, codec-floor compatible publishing for opt-in viewing. */
   async produceScreen(sourceId?: string, options?: ScreenShareOptions): Promise<void> {
     if (!this.sendTransport || !this.device) {
       console.warn('produceScreen: no sendTransport or device — cannot share screen');
@@ -2447,13 +2461,14 @@ class VoiceService {
 
       this.applyDegradationPreference(producer);
       this.producers.set('screen', producer);
-      useVoiceStore.getState().setActiveScreenCodec(codec?.mimeType?.toLowerCase() ?? null);
-
-      updateStoreForScreenShare(producer.id, this.localScreenStream);
 
       if (this.mediaEncryption) {
         this.applyEncryptTransform(producer);
       }
+
+      useVoiceStore.getState().setActiveScreenCodec(codec?.mimeType?.toLowerCase() ?? null);
+
+      updateStoreForScreenShare(producer.id, this.localScreenStream);
 
       await this.produceScreenAudioFromStream(stream);
 
@@ -3716,12 +3731,18 @@ class VoiceService {
       if (channelId) {
         try {
           await this.initEncryption(channelId);
-        } catch {
-          console.warn('E2EE: lazy re-init failed, consumer will receive encrypted frames');
+        } catch (err) {
+          console.warn('E2EE: lazy re-init failed, closing consumer fail-closed', {
+            error: errorMessage(err),
+          });
         }
       }
     }
-    if (!this.mediaEncryption) return;
+    if (!this.mediaEncryption) {
+      throw new Error(
+        'E2EE: failed to attach decrypt transform (media encryption is not initialized)'
+      );
+    }
 
     // Fire-and-forget: add decrypt key without blocking the consume queue.
     const channelId = useVoiceStore.getState().activeChannelId;
@@ -3842,7 +3863,12 @@ class VoiceService {
 
       // Apply E2EE decrypt transform (all channels are always encrypted)
       const producerUserId = senderUserId || result.producerUserId;
-      await this.ensureE2EEForConsumer(consumer, producerUserId);
+      try {
+        await this.ensureE2EEForConsumer(consumer, producerUserId);
+      } catch (err) {
+        this.closeConsumerAfterDecryptTransformFailure(consumer, errorMessage(err));
+        return;
+      }
 
       // Attach stream to participant
       this.routeConsumerToStore(consumer, result);
@@ -4065,23 +4091,8 @@ class VoiceService {
       }
     );
 
-    this.socket.on('user-left', async ({ userId }) => {
-      useVoiceStore.getState().removeParticipant(userId);
-
-      // Solo bandwidth saving: enter solo mode when everyone else leaves
-      this.checkSoloBandwidthSaving();
-
-      // E2EE: rotate keys when a member leaves (forward secrecy)
-      if (this.mediaEncryption) {
-        const channelId = useVoiceStore.getState().activeChannelId;
-        if (channelId) {
-          await this.addDecryptKeysForActiveParticipantsAtEpoch(
-            channelId,
-            this.mediaEncryption.getCurrentKeyId() + 1
-          );
-        }
-        this.debouncedRotateE2EEKeys();
-      }
+    this.socket.on('user-left', async (event: UserLeftEvent) => {
+      await this.handleUserLeft(event);
     });
 
     // E2EE: periodic epoch sync — recover from missed join/leave events
@@ -4682,6 +4693,52 @@ class VoiceService {
     }
   }
 
+  private async handleUserLeft({ userId, e2eeEpoch }: UserLeftEvent): Promise<void> {
+    useVoiceStore.getState().removeParticipant(userId);
+    this.checkSoloBandwidthSaving();
+    await this.rotateE2EEAfterUserLeft(e2eeEpoch);
+  }
+
+  private async rotateE2EEAfterUserLeft(e2eeEpoch: number | undefined): Promise<void> {
+    const mediaEncryption = this.mediaEncryption;
+    if (!mediaEncryption) return;
+
+    const targetEpoch = e2eeEpoch ?? mediaEncryption.getCurrentKeyId() + 1;
+    const channelId = useVoiceStore.getState().activeChannelId;
+    if (channelId) {
+      await this.addDecryptKeysForActiveParticipantsAtEpoch(channelId, targetEpoch);
+    }
+
+    await this.catchUpToAuthoritativeLeaveEpoch(e2eeEpoch);
+  }
+
+  private async catchUpToAuthoritativeLeaveEpoch(e2eeEpoch: number | undefined): Promise<void> {
+    const mediaEncryption = this.mediaEncryption;
+    if (!mediaEncryption) return;
+
+    if (e2eeEpoch === undefined) {
+      this.debouncedRotateE2EEKeys();
+      return;
+    }
+
+    const localEpoch = mediaEncryption.getCurrentKeyId();
+    if (e2eeEpoch <= localEpoch) return;
+
+    try {
+      this.e2eeWorker?.postMessage({
+        type: 'catchUpToEpoch',
+        targetEpoch: e2eeEpoch,
+      } satisfies E2EEWorkerMessage);
+      await mediaEncryption.catchUpToEpoch(e2eeEpoch);
+    } catch (err) {
+      console.error('E2EE: leave epoch catch-up failed — decrypt may fail until rejoin', {
+        localEpoch,
+        serverEpoch: e2eeEpoch,
+        error: err instanceof Error ? err.message : err,
+      });
+    }
+  }
+
   /**
    * Debounced key rotation: collapses rapid join/leave bursts.
    * For Worker path: sends rotateKeys to the Worker.
@@ -4806,8 +4863,7 @@ class VoiceService {
   private applyEncryptTransform(producer: mediasoupTypes.Producer): void {
     const sender = producer.rtpSender;
     if (!sender) {
-      console.warn('E2EE: no rtpSender on producer — frames will not be encrypted');
-      return;
+      this.failClosedEncryptTransform(producer, 'no rtpSender on producer');
     }
 
     // Modern path: RTCRtpScriptTransform (Chromium 129+)
@@ -4818,19 +4874,21 @@ class VoiceService {
         console.debug('E2EE: encrypt transform applied (RTCRtpScriptTransform)');
       } catch (err) {
         console.error('E2EE: RTCRtpScriptTransform failed on sender:', errorMessage(err));
+        this.failClosedEncryptTransform(producer, 'RTCRtpScriptTransform failed');
       }
       return;
     }
 
     // Legacy path: createEncodedStreams (Chromium 86-130)
-    if (!this.mediaEncryption) return;
+    if (!this.mediaEncryption) {
+      this.failClosedEncryptTransform(producer, 'media encryption is not initialized');
+    }
     const encryption = this.mediaEncryption;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- createEncodedStreams is a non-standard Chromium 86-130 API not in RTCRtpSender's typed surface; runtime check below gates usage
-    const senderAny = sender as any;
+    const legacySender = sender as RtpSenderWithEncodedStreams;
 
-    if (typeof senderAny.createEncodedStreams === 'function') {
+    if (typeof legacySender.createEncodedStreams === 'function') {
       try {
-        const { readable, writable } = senderAny.createEncodedStreams();
+        const { readable, writable } = legacySender.createEncodedStreams();
         let encryptDropCount = 0;
         let firstEncryptLogged = false;
         const transform = new TransformStream({
@@ -4869,10 +4927,21 @@ class VoiceService {
         console.debug('E2EE: encrypt transform applied (createEncodedStreams)');
       } catch (err) {
         console.error('E2EE: createEncodedStreams failed on sender:', errorMessage(err));
+        this.failClosedEncryptTransform(producer, 'createEncodedStreams failed');
       }
     } else {
       console.warn('E2EE: no Insertable Streams API available — frames will not be encrypted');
+      this.failClosedEncryptTransform(producer, 'Insertable Streams API unavailable');
     }
+  }
+
+  private failClosedEncryptTransform(producer: mediasoupTypes.Producer, reason: string): never {
+    const source =
+      typeof producer.appData?.source === 'string' ? producer.appData.source : undefined;
+    producer.close();
+    if (source) this.producers.delete(source);
+    this.socket?.emit('close-producer', { producerId: producer.id });
+    throw new Error(`E2EE: failed to attach encrypt transform (${reason})`);
   }
 
   /**
@@ -4886,14 +4955,18 @@ class VoiceService {
       getActiveChannelId: () => useVoiceStore.getState().activeChannelId,
       addDecryptKeyForUser: (channelId, userId) => this.addDecryptKeyForUser(channelId, userId),
       invalidateChannelKey: (channelId) => e2eeService.invalidateChannelKey(channelId),
+      requestKeyframe: (senderUserId) => {
+        if (useVoiceStore.getState().activeChannelId) {
+          this.socket?.emit('request-keyframe', { senderUserId });
+        }
+      },
     };
   }
 
   private applyDecryptTransform(consumer: mediasoupTypes.Consumer, senderUserId: string): void {
     const receiver = consumer.rtpReceiver;
     if (!receiver) {
-      console.warn('E2EE: no rtpReceiver on consumer — frames will not be decrypted');
-      return;
+      throw new Error('E2EE: failed to attach decrypt transform (no rtpReceiver on consumer)');
     }
 
     // Modern path: RTCRtpScriptTransform (Chromium 129+)
@@ -4906,12 +4979,19 @@ class VoiceService {
         );
       } catch (err) {
         console.error('E2EE: RTCRtpScriptTransform failed on receiver:', errorMessage(err));
+        throw new Error(
+          `E2EE: failed to attach decrypt transform (RTCRtpScriptTransform failed: ${errorMessage(err)})`
+        );
       }
       return;
     }
 
     // Legacy path: createEncodedStreams (Chromium 86-130)
-    if (!this.mediaEncryption) return;
+    if (!this.mediaEncryption) {
+      throw new Error(
+        'E2EE: failed to attach decrypt transform (media encryption is not initialized)'
+      );
+    }
     applyLegacyDecryptPipeline(
       receiver as InsertableStreamsReceiver,
       senderUserId,
@@ -4919,6 +4999,27 @@ class VoiceService {
       this.decryptRecoveryCallbacks(),
       E2EE_VERBOSE
     );
+  }
+
+  private closeConsumerAfterDecryptTransformFailure(
+    consumer: mediasoupTypes.Consumer,
+    reason: string
+  ): void {
+    console.error('E2EE: closing consumer because decrypt transform failed', {
+      consumerId: consumer.id,
+      producerId: consumer.producerId,
+      reason,
+    });
+    if (!consumer.closed) consumer.close();
+    this.consumers.delete(consumer.id);
+    this.consumerMeta.delete(consumer.id);
+    this.lastPreferredLayerKeyByConsumer.delete(consumer.id);
+    this.pauseCoordinator.clearConsumer(consumer.id);
+    this.testSuspendedConsumerIds.delete(consumer.id);
+    this.testRestoreEligibleConsumerIds.delete(consumer.id);
+    this.testServerPausedConsumerIds.delete(consumer.id);
+    this.serverResumeOnUndeafenConsumerIds.delete(consumer.id);
+    this.socket?.emit('close-consumer', { consumerId: consumer.id });
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────

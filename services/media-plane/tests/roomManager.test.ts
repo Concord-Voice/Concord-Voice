@@ -44,6 +44,8 @@ import {
   ABSOLUTE_VIDEO_PUBLISHER_CEILING,
   resolveAudioLastN,
   ABSOLUTE_AUDIO_LAST_N_CEILING,
+  SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+  parseMediaFrameCryptoVersion,
 } from '../src/lib/roomManager.js';
 // `./mocks/logger.js` (imported above) replaces @/lib/logger with vi.fn() spies;
 // importing it here gives us the SAME mocked object to assert on.
@@ -58,6 +60,26 @@ function createMockMediasoupService(router = createMockRouter()) {
     getOrCreateRouter: vi.fn().mockResolvedValue(router),
     removeRouter: vi.fn(),
   };
+}
+
+function joinRoomWithSupportedCrypto(
+  manager: RoomManager,
+  roomId: string,
+  userId: string,
+  socketId: string,
+  identity: { username: string; displayName?: string; avatarUrl?: string },
+  rtpCapabilities?: any,
+  entitlement?: any
+) {
+  return manager.joinRoom(
+    roomId,
+    userId,
+    socketId,
+    identity,
+    rtpCapabilities,
+    entitlement,
+    SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -79,7 +101,9 @@ describe('RoomManager', () => {
 
   describe('joinRoom', () => {
     it('creates a new room and returns rtpCapabilities', async () => {
-      const result = await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      const result = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+        username: 'alice',
+      });
 
       expect(result.rtpCapabilities).toBeDefined();
       expect(result.existingProducers).toEqual([]);
@@ -88,27 +112,31 @@ describe('RoomManager', () => {
     });
 
     it('reuses existing room on second join', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
-      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      const result = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', {
+        username: 'bob',
+      });
 
       expect(mockMediasoup.getOrCreateRouter).toHaveBeenCalledTimes(1);
       expect(result.participants).toHaveLength(2);
     });
 
     it('discards stale room when router is closed', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       mockRouter.closed = true;
 
       // Second join should detect closed router and recreate
       const newRouter = createMockRouter();
       mockMediasoup.getOrCreateRouter.mockResolvedValue(newRouter);
 
-      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
+      const result = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', {
+        username: 'bob',
+      });
       expect(result.rtpCapabilities).toBe(newRouter.rtpCapabilities);
     });
 
     it('returns existing producers from other participants', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
 
       // Add a producer for u-1
       const transport = createMockTransport();
@@ -127,42 +155,165 @@ describe('RoomManager', () => {
       );
 
       // u-2 joins and should see u-1's producer
-      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
+      const result = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', {
+        username: 'bob',
+      });
       expect(result.existingProducers).toHaveLength(1);
       expect(result.existingProducers[0].userId).toBe('u-1');
+    });
+
+    it('seeds the room media-frame crypto version from the first participant', async () => {
+      const result = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+        username: 'alice',
+      });
+
+      expect(result.mediaFrameCryptoVersion).toBe(SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION);
+      expect(manager.getRoom('room-1')?.mediaFrameCryptoVersion).toBe(
+        SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION
+      );
+      expect(manager.getParticipant('room-1', 'u-1')?.mediaFrameCryptoVersion).toBe(
+        SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION
+      );
+    });
+
+    it('allows a second participant with the matching media-frame crypto version', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+
+      const result = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', {
+        username: 'bob',
+      });
+
+      expect(result.participants).toHaveLength(2);
+      expect(result.mediaFrameCryptoVersion).toBe(SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION);
+    });
+
+    it('rejects legacy media-frame crypto versions before storing the participant', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      const room = manager.getRoom('room-1')!;
+      const epochBefore = room.e2eeEpoch;
+
+      await expect(
+        manager.joinRoom(
+          'room-1',
+          'u-legacy',
+          'sock-legacy',
+          { username: 'legacy' },
+          undefined,
+          undefined,
+          1
+        )
+      ).rejects.toThrow('Unsupported media frame crypto version 1');
+
+      expect(room.participants.has('u-legacy')).toBe(false);
+      expect(room.e2eeEpoch).toBe(epochBefore);
+    });
+
+    it('rejects omitted media-frame crypto version before storing the participant', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      const room = manager.getRoom('room-1')!;
+      const epochBefore = room.e2eeEpoch;
+
+      await expect(
+        manager.joinRoom(
+          'room-1',
+          'u-missing',
+          'sock-missing',
+          { username: 'missing' },
+          undefined,
+          undefined,
+          undefined
+        )
+      ).rejects.toThrow('Unsupported media frame crypto version missing');
+
+      expect(room.participants.has('u-missing')).toBe(false);
+      expect(room.e2eeEpoch).toBe(epochBefore);
+    });
+
+    it('rejects legacy reconnect attempts before replacing the existing participant', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-original', {
+        username: 'alice',
+      });
+      const room = manager.getRoom('room-1')!;
+      const epochBefore = room.e2eeEpoch;
+
+      await expect(
+        manager.joinRoom(
+          'room-1',
+          'u-1',
+          'sock-legacy',
+          { username: 'legacy' },
+          undefined,
+          undefined,
+          1
+        )
+      ).rejects.toThrow('Unsupported media frame crypto version 1');
+
+      expect(room.participants.get('u-1')?.socketId).toBe('sock-original');
+      expect(room.e2eeEpoch).toBe(epochBefore);
+    });
+
+    it('rejects missing or legacy media-frame crypto declarations at the socket boundary', () => {
+      expect(parseMediaFrameCryptoVersion(SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION)).toBe(
+        SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION
+      );
+      expect(() => parseMediaFrameCryptoVersion(undefined)).toThrow(
+        'Unsupported media frame crypto version missing'
+      );
+      expect(() => parseMediaFrameCryptoVersion(1)).toThrow(
+        'Unsupported media frame crypto version 1'
+      );
+      expect(() => parseMediaFrameCryptoVersion(null)).toThrow(
+        'Unsupported media frame crypto version null'
+      );
+      expect(() => parseMediaFrameCryptoVersion('2')).toThrow(
+        'Unsupported media frame crypto version 2'
+      );
+      expect(() => parseMediaFrameCryptoVersion(false)).toThrow(
+        'Unsupported media frame crypto version false'
+      );
+      expect(() => parseMediaFrameCryptoVersion([])).toThrow(
+        'Unsupported media frame crypto version array'
+      );
+      expect(() => parseMediaFrameCryptoVersion({ version: 2 })).toThrow(
+        'Unsupported media frame crypto version object'
+      );
     });
   });
 
   describe('Self-deafen (#685)', () => {
     it('setParticipantDeafen sets the isDeafened flag', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       manager.setParticipantDeafen('room-1', 'u-1', true);
       expect(manager.getParticipant('room-1', 'u-1')?.isDeafened).toBe(true);
     });
 
     it('setParticipantDeafen clears the isDeafened flag', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       manager.setParticipantDeafen('room-1', 'u-1', true);
       manager.setParticipantDeafen('room-1', 'u-1', false);
       expect(manager.getParticipant('room-1', 'u-1')?.isDeafened).toBe(false);
     });
 
     it('setParticipantDeafen is a no-op for an unknown participant', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       expect(() => manager.setParticipantDeafen('room-1', 'ghost', true)).not.toThrow();
       expect(manager.getParticipant('room-1', 'ghost')).toBeUndefined();
     });
 
     it('joinRoom snapshot defaults isDeafened to false', async () => {
-      const result = await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      const result = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+        username: 'alice',
+      });
       expect(result.participants[0].isDeafened).toBe(false);
     });
 
     it('joinRoom snapshot carries an existing self-deafen (late joiner sees it)', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       manager.setParticipantDeafen('room-1', 'u-1', true);
 
-      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
+      const result = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', {
+        username: 'bob',
+      });
       const alice = result.participants.find((p) => p.userId === 'u-1');
       expect(alice?.isDeafened).toBe(true);
     });
@@ -170,7 +321,7 @@ describe('RoomManager', () => {
 
   describe('Audio testing status (#1163)', () => {
     it('setParticipantTestingStatus sets and clears the isTesting flag', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       manager.setParticipantTestingStatus('room-1', 'u-1', true);
       expect(manager.getParticipant('room-1', 'u-1')?.isTesting).toBe(true);
 
@@ -179,10 +330,12 @@ describe('RoomManager', () => {
     });
 
     it('joinRoom snapshot carries existing testing status', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       manager.setParticipantTestingStatus('room-1', 'u-1', true);
 
-      const result = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
+      const result = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', {
+        username: 'bob',
+      });
       const alice = result.participants.find((p) => p.userId === 'u-1');
       expect(alice?.isTesting).toBe(true);
     });
@@ -190,8 +343,12 @@ describe('RoomManager', () => {
 
   describe('joinRoom — reconnection', () => {
     it('cleans up old session when same userId rejoins', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-old', { username: 'alice' });
-      const result = await manager.joinRoom('room-1', 'u-1', 'sock-new', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-old', {
+        username: 'alice',
+      });
+      const result = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-new', {
+        username: 'alice',
+      });
 
       // Should have exactly 1 participant (the new session)
       expect(result.participants).toHaveLength(1);
@@ -205,8 +362,8 @@ describe('RoomManager', () => {
       const handler = vi.fn();
       manager.onEvent(handler);
 
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
-      await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', { username: 'bob' });
       await manager.leaveRoom('room-1', 'u-1');
 
       const room = manager.getRoom('room-1');
@@ -217,11 +374,31 @@ describe('RoomManager', () => {
       expect(leftEvent![0].userId).toBe('u-1');
     });
 
+    it('emits user-left with the authoritative post-leave E2EE epoch', async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', { username: 'bob' });
+
+      await manager.leaveRoom('room-1', 'u-1');
+
+      const leftEvent = handler.mock.calls.find((c: any[]) => c[0].type === 'user-left');
+      expect(leftEvent?.[0]).toEqual(
+        expect.objectContaining({
+          type: 'user-left',
+          roomId: 'room-1',
+          userId: 'u-1',
+          e2eeEpoch: 3,
+        })
+      );
+    });
+
     it('closes room and emits room-empty when last participant leaves', async () => {
       const handler = vi.fn();
       manager.onEvent(handler);
 
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       await manager.leaveRoom('room-1', 'u-1');
 
       expect(manager.getRoom('room-1')).toBeUndefined();
@@ -230,7 +407,7 @@ describe('RoomManager', () => {
     });
 
     it('cleans up transports, producers, and consumers', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
 
       // Create send transport + producer
       const transport = createMockTransport();
@@ -255,8 +432,8 @@ describe('RoomManager', () => {
     });
 
     it('drops keyframe cooldowns for departing participants', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
-      await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', { username: 'bob' });
       const room = manager.getRoom('room-1')!;
       room.keyframeRequestCooldowns.set('u-1', Date.now());
 
@@ -275,7 +452,7 @@ describe('RoomManager', () => {
 
   describe('createTransport', () => {
     beforeEach(async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
     });
 
     it('creates a send transport', async () => {
@@ -331,12 +508,20 @@ describe('RoomManager', () => {
 
     it('caps the SEND transport with the FREE tier maxManualBitrateBps (5 Mbps)', async () => {
       // u-free joins with the free entitlement (5_000_000 bps).
-      await manager.joinRoom('room-1', 'u-free', 'sock-free', { username: 'free' }, undefined, {
-        tier: 'free',
-        allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
-        minPtimeMs: 20,
-        maxManualBitrateBps: 5_000_000,
-      });
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-free',
+        'sock-free',
+        { username: 'free' },
+        undefined,
+        {
+          tier: 'free',
+          allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
+          minPtimeMs: 20,
+          maxManualBitrateBps: 5_000_000,
+        }
+      );
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
 
@@ -348,12 +533,20 @@ describe('RoomManager', () => {
     });
 
     it('caps the SEND transport with the PREMIUM tier maxManualBitrateBps (10 Mbps)', async () => {
-      await manager.joinRoom('room-1', 'u-prem', 'sock-prem', { username: 'prem' }, undefined, {
-        tier: 'premium',
-        allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
-        minPtimeMs: 10,
-        maxManualBitrateBps: 10_000_000,
-      });
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-prem',
+        'sock-prem',
+        { username: 'prem' },
+        undefined,
+        {
+          tier: 'premium',
+          allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+          minPtimeMs: 10,
+          maxManualBitrateBps: 10_000_000,
+        }
+      );
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
 
@@ -363,12 +556,20 @@ describe('RoomManager', () => {
     });
 
     it('does NOT apply the per-user cap to the RECV transport (keeps the global default)', async () => {
-      await manager.joinRoom('room-1', 'u-free', 'sock-free', { username: 'free' }, undefined, {
-        tier: 'free',
-        allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
-        minPtimeMs: 20,
-        maxManualBitrateBps: 5_000_000,
-      });
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-free',
+        'sock-free',
+        { username: 'free' },
+        undefined,
+        {
+          tier: 'free',
+          allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
+          minPtimeMs: 20,
+          maxManualBitrateBps: 5_000_000,
+        }
+      );
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
 
@@ -416,7 +617,7 @@ describe('RoomManager', () => {
 
   describe('connectTransport', () => {
     it('calls transport.connect with dtlsParameters', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-1', 'send');
@@ -428,7 +629,7 @@ describe('RoomManager', () => {
     });
 
     it('throws if transport not found', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       await expect(manager.connectTransport('room-1', 'u-1', 'bad-id', {} as any)).rejects.toThrow(
         'Transport not found'
       );
@@ -441,7 +642,7 @@ describe('RoomManager', () => {
     let transport: ReturnType<typeof createMockTransport>;
 
     beforeEach(async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-1', 'send');
@@ -520,7 +721,9 @@ describe('RoomManager', () => {
       // Add 8 camera producers across multiple participants
       for (let i = 0; i < 8; i++) {
         const uid = `u-cam-${i}`;
-        await manager.joinRoom('room-1', uid, `sock-${i + 100}`, { username: `user${i}` });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', uid, `sock-${i + 100}`, {
+          username: `user${i}`,
+        });
         const t = createMockTransport();
         mockRouter.createWebRtcTransport.mockResolvedValueOnce(t);
         await manager.createTransport('room-1', uid, 'send');
@@ -665,7 +868,9 @@ describe('RoomManager', () => {
     it('enforces screen share limit (max 5)', async () => {
       for (let i = 0; i < 5; i++) {
         const uid = `u-scr-${i}`;
-        await manager.joinRoom('room-1', uid, `sock-${i + 200}`, { username: `user${i}` });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', uid, `sock-${i + 200}`, {
+          username: `user${i}`,
+        });
         const t = createMockTransport();
         mockRouter.createWebRtcTransport.mockResolvedValueOnce(t);
         await manager.createTransport('room-1', uid, 'send');
@@ -786,17 +991,25 @@ describe('RoomManager', () => {
     let premiumTransport: ReturnType<typeof createMockTransport>;
 
     beforeEach(async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       freeTransport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(freeTransport);
       await manager.createTransport('room-1', 'u-1', 'send');
 
-      await manager.joinRoom('room-1', 'u-prem', 'sock-prem', { username: 'prem' }, undefined, {
-        tier: 'premium',
-        allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
-        minPtimeMs: 10,
-        maxManualBitrateBps: 10_000_000,
-      });
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-prem',
+        'sock-prem',
+        { username: 'prem' },
+        undefined,
+        {
+          tier: 'premium',
+          allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+          minPtimeMs: 10,
+          maxManualBitrateBps: 10_000_000,
+        }
+      );
       premiumTransport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(premiumTransport);
       await manager.createTransport('room-1', 'u-prem', 'send');
@@ -981,7 +1194,7 @@ describe('RoomManager', () => {
 
   describe('pauseProducer / resumeProducer', () => {
     it('pauses and resumes a producer', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-1', 'send');
@@ -1005,7 +1218,7 @@ describe('RoomManager', () => {
     });
 
     it('throws if producer not found', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       await expect(manager.pauseProducer('room-1', 'u-1', 'bad-id')).rejects.toThrow(
         'Producer not found'
       );
@@ -1017,7 +1230,7 @@ describe('RoomManager', () => {
       const handler = vi.fn();
       manager.onEvent(handler);
 
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-1', 'send');
@@ -1055,7 +1268,7 @@ describe('RoomManager', () => {
 
     beforeEach(async () => {
       // u-1 joins and produces
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const sendTransport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(sendTransport);
       await manager.createTransport('room-1', 'u-1', 'send');
@@ -1071,7 +1284,8 @@ describe('RoomManager', () => {
       );
 
       // u-2 joins with rtpCapabilities and creates recv transport
-      await manager.joinRoom(
+      await joinRoomWithSupportedCrypto(
+        manager,
         'room-1',
         'u-2',
         'sock-2',
@@ -1102,7 +1316,8 @@ describe('RoomManager', () => {
 
     it('throws when no recv transport exists', async () => {
       // u-3 joins without creating recv transport
-      await manager.joinRoom(
+      await joinRoomWithSupportedCrypto(
+        manager,
         'room-1',
         'u-3',
         'sock-3',
@@ -1117,7 +1332,7 @@ describe('RoomManager', () => {
 
     it('throws when rtpCapabilities not set', async () => {
       // u-4 joins WITHOUT rtpCapabilities
-      await manager.joinRoom('room-1', 'u-4', 'sock-4', { username: 'dave' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-4', 'sock-4', { username: 'dave' });
       const recvT = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(recvT);
       await manager.createTransport('room-1', 'u-4', 'recv');
@@ -1161,7 +1376,8 @@ describe('RoomManager', () => {
 
     async function ensureParticipant(userId: string, videoCodecs?: string[]) {
       if (manager.getParticipant('room-1', userId)) return;
-      await manager.joinRoom(
+      await joinRoomWithSupportedCrypto(
+        manager,
         'room-1',
         userId,
         `sock-${userId}`,
@@ -1202,10 +1418,11 @@ describe('RoomManager', () => {
     }
 
     it('rejects a consumer not owned by the caller', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
 
-      await expect(manager.setPreferredCameraLayers('room-1', 'u-1', validLayerDemand('missing')))
-        .rejects.toThrow('Consumer not found');
+      await expect(
+        manager.setPreferredCameraLayers('room-1', 'u-1', validLayerDemand('missing'))
+      ).rejects.toThrow('Consumer not found');
     });
 
     it('clamps and applies preferred layers for an owned camera consumer', async () => {
@@ -1258,7 +1475,7 @@ describe('RoomManager', () => {
     });
 
     it('rejects a video consumer that is not a camera source', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const participant = manager.getParticipant('room-1', 'u-1')!;
       const consumer = createMockConsumer({
         id: 'screen-c1',
@@ -1469,7 +1686,7 @@ describe('RoomManager', () => {
 
   describe('resumeConsumer / pauseConsumer / closeConsumer', () => {
     it('resumes a consumer', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const recvTransport = createMockTransport();
       const consumer = createMockConsumer();
       recvTransport.consume.mockResolvedValue(consumer);
@@ -1485,7 +1702,7 @@ describe('RoomManager', () => {
     });
 
     it('pauses a consumer', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const participant = manager.getParticipant('room-1', 'u-1')!;
       const consumer = createMockConsumer();
       participant.consumers.set(consumer.id, consumer as any);
@@ -1495,7 +1712,7 @@ describe('RoomManager', () => {
     });
 
     it('closes a consumer and removes from map', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const participant = manager.getParticipant('room-1', 'u-1')!;
       const consumer = createMockConsumer();
       participant.consumers.set(consumer.id, consumer as any);
@@ -1514,8 +1731,11 @@ describe('RoomManager', () => {
 
   describe('requestKeyFrame', () => {
     async function setupVideoProducer() {
-      await manager.joinRoom('room-1', 'sender', 'sock-sender', { username: 'sender' });
-      await manager.joinRoom(
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'sender', 'sock-sender', {
+        username: 'sender',
+      });
+      await joinRoomWithSupportedCrypto(
+        manager,
         'room-1',
         'viewer',
         'sock-viewer',
@@ -1562,7 +1782,9 @@ describe('RoomManager', () => {
     });
 
     it('rejects an unknown sender', async () => {
-      await manager.joinRoom('room-1', 'viewer', 'sock-viewer', { username: 'viewer' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'viewer', 'sock-viewer', {
+        username: 'viewer',
+      });
       const requestKeyFrame = (manager as any).requestKeyFrame;
       expect(requestKeyFrame).toBeTypeOf('function');
 
@@ -1591,8 +1813,12 @@ describe('RoomManager', () => {
     });
 
     it('does not cooldown no-op requests without an active video producer', async () => {
-      await manager.joinRoom('room-1', 'viewer', 'sock-viewer', { username: 'viewer' });
-      await manager.joinRoom('room-1', 'sender', 'sock-sender', { username: 'sender' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'viewer', 'sock-viewer', {
+        username: 'viewer',
+      });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'sender', 'sock-sender', {
+        username: 'sender',
+      });
       const room = manager.getRoom('room-1')!;
       const requestKeyFrame = (manager as any).requestKeyFrame;
 
@@ -1644,19 +1870,21 @@ describe('RoomManager', () => {
     });
 
     it('returns null when fewer than 2 participants have capabilities', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       expect(manager.computeCodecFloor('room-1')).toBeNull();
     });
 
     it('returns intersection of video codecs', async () => {
-      await manager.joinRoom(
+      await joinRoomWithSupportedCrypto(
+        manager,
         'room-1',
         'u-1',
         'sock-1',
         { username: 'alice' },
         createRtpCapabilities(['video/VP8', 'video/VP9', 'video/H264']) as any
       );
-      await manager.joinRoom(
+      await joinRoomWithSupportedCrypto(
+        manager,
         'room-1',
         'u-2',
         'sock-2',
@@ -1672,14 +1900,16 @@ describe('RoomManager', () => {
     });
 
     it('normalizes mimeType to lowercase', async () => {
-      await manager.joinRoom(
+      await joinRoomWithSupportedCrypto(
+        manager,
         'room-1',
         'u-1',
         'sock-1',
         { username: 'alice' },
         createRtpCapabilities(['video/VP8']) as any
       );
-      await manager.joinRoom(
+      await joinRoomWithSupportedCrypto(
+        manager,
         'room-1',
         'u-2',
         'sock-2',
@@ -1692,15 +1922,17 @@ describe('RoomManager', () => {
     });
 
     it('skips participants with null rtpCapabilities', async () => {
-      await manager.joinRoom(
+      await joinRoomWithSupportedCrypto(
+        manager,
         'room-1',
         'u-1',
         'sock-1',
         { username: 'alice' },
         createRtpCapabilities(['video/VP8']) as any
       );
-      await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' }); // no capabilities
-      await manager.joinRoom(
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', { username: 'bob' }); // no capabilities
+      await joinRoomWithSupportedCrypto(
+        manager,
         'room-1',
         'u-3',
         'sock-3',
@@ -1717,10 +1949,14 @@ describe('RoomManager', () => {
 
   describe('E2EE epoch', () => {
     it('increments epoch on join', async () => {
-      const result1 = await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      const result1 = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+        username: 'alice',
+      });
       expect(result1.e2eeEpoch).toBe(1);
 
-      const result2 = await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
+      const result2 = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', {
+        username: 'bob',
+      });
       expect(result2.e2eeEpoch).toBe(2);
     });
 
@@ -1728,7 +1964,7 @@ describe('RoomManager', () => {
       const handler = vi.fn();
       manager.onEvent(handler);
 
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
 
       expect(handler).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -1741,8 +1977,8 @@ describe('RoomManager', () => {
     });
 
     it('increments epoch on leave for forward secrecy', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
-      await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', { username: 'bob' });
 
       await manager.leaveRoom('room-1', 'u-1');
 
@@ -1755,7 +1991,7 @@ describe('RoomManager', () => {
 
   describe('query methods', () => {
     it('findRoomBySocketId returns correct roomId and userId', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const found = manager.findRoomBySocketId('sock-1');
       expect(found).toEqual({ roomId: 'room-1', userId: 'u-1' });
     });
@@ -1765,8 +2001,8 @@ describe('RoomManager', () => {
     });
 
     it('getRoomSocketIds returns all sockets in room', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
-      await manager.joinRoom('room-1', 'u-2', 'sock-2', { username: 'bob' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', { username: 'bob' });
 
       const ids = manager.getRoomSocketIds('room-1');
       expect(ids).toContain('sock-1');
@@ -1774,8 +2010,8 @@ describe('RoomManager', () => {
     });
 
     it('getStats returns correct aggregate counts', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
-      await manager.joinRoom('room-2', 'u-2', 'sock-2', { username: 'bob' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-2', 'u-2', 'sock-2', { username: 'bob' });
 
       const stats = manager.getStats();
       expect(stats.activeRooms).toBe(2);
@@ -1785,7 +2021,7 @@ describe('RoomManager', () => {
     });
 
     it('collectMetricsSample counts publishers by source and gathers recv-transport egress (#1553)', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const p = manager.getRoom('room-1')!.participants.get('u-1')!;
       p.producers.set('pc', {
         producer: createMockProducer({ kind: 'video' }) as any,
@@ -1816,7 +2052,7 @@ describe('RoomManager', () => {
     });
 
     it('collectMetricsSample keeps a getStats-failed transport LIVE but omits its bytes (#1553)', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const p = manager.getRoom('room-1')!.participants.get('u-1')!;
       p.recvTransports.set(
         't-bad',
@@ -1832,8 +2068,8 @@ describe('RoomManager', () => {
     });
 
     it('getActiveRoomIds returns all room IDs', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
-      await manager.joinRoom('room-2', 'u-2', 'sock-2', { username: 'bob' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-2', 'u-2', 'sock-2', { username: 'bob' });
 
       expect(manager.getActiveRoomIds()).toEqual(['room-1', 'room-2']);
     });
@@ -1848,7 +2084,7 @@ describe('RoomManager', () => {
       manager.onEvent(handler1);
       manager.onEvent(handler2);
 
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
 
       expect(handler1).toHaveBeenCalled();
       expect(handler2).toHaveBeenCalled();
@@ -1862,7 +2098,7 @@ describe('RoomManager', () => {
       manager.onEvent(badHandler);
       manager.onEvent(goodHandler);
 
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
 
       expect(badHandler).toHaveBeenCalled();
       expect(goodHandler).toHaveBeenCalled();
@@ -1873,7 +2109,7 @@ describe('RoomManager', () => {
 
   describe('updateRtpCapabilities', () => {
     it('updates participant capabilities', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const caps = createRtpCapabilities();
 
       manager.updateRtpCapabilities('room-1', 'u-1', caps as any);
@@ -1892,8 +2128,8 @@ describe('RoomManager', () => {
 
   describe('closeAll', () => {
     it('closes all rooms', async () => {
-      await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
-      await manager.joinRoom('room-2', 'u-2', 'sock-2', { username: 'bob' });
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      await joinRoomWithSupportedCrypto(manager, 'room-2', 'u-2', 'sock-2', { username: 'bob' });
 
       await manager.closeAll();
 
@@ -1951,7 +2187,9 @@ describe('RoomManager', () => {
 
     describe('serverMuteUser', () => {
       it('should set serverMuted flag and pause audio producers', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
         const { producer } = await setupProducer(manager, mockRouter, 'room-1', 'u-1');
 
         await manager.serverMuteUser('room-1', 'u-1');
@@ -1962,7 +2200,9 @@ describe('RoomManager', () => {
       });
 
       it('should not pause video producers', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
         const { producer } = await setupProducer(
           manager,
           mockRouter,
@@ -1988,7 +2228,9 @@ describe('RoomManager', () => {
 
     describe('serverUnmuteUser', () => {
       it('should clear serverMuted flag without resuming producers', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
         const { producer } = await setupProducer(manager, mockRouter, 'room-1', 'u-1');
 
         await manager.serverMuteUser('room-1', 'u-1');
@@ -2003,7 +2245,9 @@ describe('RoomManager', () => {
     describe('serverDeafenUser', () => {
       it('should set both flags and pause audio producers and consumers', async () => {
         // u-1 produces audio
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
         const { producer, info: producerInfo } = await setupProducer(
           manager,
           mockRouter,
@@ -2012,7 +2256,8 @@ describe('RoomManager', () => {
         );
 
         // u-2 joins, produces audio, and consumes u-1's audio
-        await manager.joinRoom(
+        await joinRoomWithSupportedCrypto(
+          manager,
           'room-1',
           'u-2',
           'sock-2',
@@ -2039,7 +2284,9 @@ describe('RoomManager', () => {
 
       it('should not pause video consumers', async () => {
         // u-1 produces video
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
         const { info: producerInfo } = await setupProducer(
           manager,
           mockRouter,
@@ -2050,7 +2297,8 @@ describe('RoomManager', () => {
         );
 
         // u-2 joins and consumes u-1's video
-        await manager.joinRoom(
+        await joinRoomWithSupportedCrypto(
+          manager,
           'room-1',
           'u-2',
           'sock-2',
@@ -2076,11 +2324,14 @@ describe('RoomManager', () => {
     describe('serverUndeafenUser', () => {
       it('should clear both flags without resuming producers or consumers', async () => {
         // u-1 produces audio
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
         const { info: producerInfo } = await setupProducer(manager, mockRouter, 'room-1', 'u-1');
 
         // u-2 joins, produces audio, and consumes u-1's audio
-        await manager.joinRoom(
+        await joinRoomWithSupportedCrypto(
+          manager,
           'room-1',
           'u-2',
           'sock-2',
@@ -2113,7 +2364,9 @@ describe('RoomManager', () => {
 
     describe('userMuteParticipant', () => {
       it('should pause audio producers without setting server flags', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
         const { producer } = await setupProducer(manager, mockRouter, 'room-1', 'u-1');
 
         await manager.userMuteParticipant('room-1', 'u-1');
@@ -2124,7 +2377,9 @@ describe('RoomManager', () => {
       });
 
       it('should not pause video producers', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
         const { producer } = await setupProducer(
           manager,
           mockRouter,
@@ -2143,11 +2398,14 @@ describe('RoomManager', () => {
     describe('userDeafenParticipant', () => {
       it('should pause audio producers and consumers without setting server flags', async () => {
         // u-1 produces audio
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
         const { info: producerInfo } = await setupProducer(manager, mockRouter, 'room-1', 'u-1');
 
         // u-2 joins, produces audio, and consumes u-1's audio
-        await manager.joinRoom(
+        await joinRoomWithSupportedCrypto(
+          manager,
           'room-1',
           'u-2',
           'sock-2',
@@ -2175,7 +2433,9 @@ describe('RoomManager', () => {
 
     describe('enforcement on join', () => {
       it('should initialize serverMuted and serverDeafened as false', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
 
         const participant = manager.getParticipant('room-1', 'u-1');
         expect(participant?.serverMuted).toBe(false);
@@ -2183,7 +2443,9 @@ describe('RoomManager', () => {
       });
 
       it('should persist flags after being set', async () => {
-        await manager.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
 
         await manager.serverMuteUser('room-1', 'u-1');
         await manager.serverDeafenUser('room-1', 'u-1');
@@ -2219,7 +2481,7 @@ describe('resumeConsumer last-N guard (#1544)', () => {
     rm = new RoomManager(createMockMediasoupService(router) as any);
 
     // u-1 produces mic audio.
-    await rm.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+    await joinRoomWithSupportedCrypto(rm, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
     const sendTransport = createMockTransport();
     router.createWebRtcTransport.mockResolvedValueOnce(sendTransport);
     await rm.createTransport('room-1', 'u-1', 'send');
@@ -2235,7 +2497,8 @@ describe('resumeConsumer last-N guard (#1544)', () => {
     );
 
     // u-2 subscribes to u-1's audio with a deterministic consumer id.
-    await rm.joinRoom(
+    await joinRoomWithSupportedCrypto(
+      rm,
       'room-1',
       'u-2',
       'sock-2',
@@ -2399,7 +2662,7 @@ describe('audio last-N small-room no-op (#1742)', () => {
     const rm = new RoomManager(createMockMediasoupService(router) as any);
 
     // u-1 publishes mic audio.
-    await rm.joinRoom('room-1', 'u-1', 'sock-1', { username: 'alice' });
+    await joinRoomWithSupportedCrypto(rm, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
     const sendTransport = createMockTransport();
     router.createWebRtcTransport.mockResolvedValueOnce(sendTransport);
     await rm.createTransport('room-1', 'u-1', 'send');
@@ -2424,7 +2687,8 @@ describe('audio last-N small-room no-op (#1742)', () => {
     }
 
     // u-2 subscribes to u-1's mic with a deterministic consumer id.
-    await rm.joinRoom(
+    await joinRoomWithSupportedCrypto(
+      rm,
       'room-1',
       'u-2',
       'sock-2',
@@ -2569,7 +2833,7 @@ describe('audio last-N small-room no-op (#1742)', () => {
 
     // Add a second real publisher u-3 (p-extra) so closing it shrinks the room
     // without tearing down c-audio (which subscribes to u-1's p-mic).
-    await rm.joinRoom('room-1', 'u-3', 'sock-3', { username: 'carol' });
+    await joinRoomWithSupportedCrypto(rm, 'room-1', 'u-3', 'sock-3', { username: 'carol' });
     const sendTransport3 = createMockTransport();
     router.createWebRtcTransport.mockResolvedValueOnce(sendTransport3);
     await rm.createTransport('room-1', 'u-3', 'send');

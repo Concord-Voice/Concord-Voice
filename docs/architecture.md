@@ -13,13 +13,13 @@ Concord Voice is a distributed real-time communications platform with three serv
 ```text
 ┌──────────────────────────────────────────────────────────────────┐
 │  Desktop Client (Electron + React + TypeScript)                  │
-│  - 36 Zustand stores, E2EE via WebCrypto, safeStorage tokens    │
+│  - 41 Zustand stores, E2EE via WebCrypto, safeStorage tokens    │
 └──────┬────────────────────────────────┬──────────────────────────┘
        │ HTTP/WebSocket :8080           │ Socket.IO + WebRTC :3000
        ▼                                ▼
 ┌──────────────────────┐    ┌─────────────────────────────────────┐
 │  Control Plane (Go)  │    │  Media Plane (Node.js + mediasoup)  │
-│  Gin 1.12, 213 routes│    │  WebRTC SFU, Socket.IO signaling    │
+│  Gin 1.12, 232 routes│    │  WebRTC SFU, Socket.IO signaling    │
 │  Auth, RBAC, chat,   │    │  Voice/video routing, RoomManager   │
 │  WebSocket hub       │    │  1 router per room, transport/user  │
 └──────┬───────┬───────┘    └──────┬──────────────────────────────┘
@@ -27,7 +27,7 @@ Concord Voice is a distributed real-time communications platform with three serv
        ▼       ▼                   ▼
 ┌──────────┐ ┌───────┐      ┌───────┐
 │PostgreSQL│ │ Redis │      │ Redis │
-│ 16 (66   │ │ 7     │      │ 7     │
+│ 16 (78   │ │ 7     │      │ 7     │
 │ migr's)  │ │       │      │       │
 └──────────┘ └───┬───┘      └───┬───┘
                  │              │
@@ -44,7 +44,7 @@ Concord Voice is a distributed real-time communications platform with three serv
 - WebSocket hub for real-time messaging and presence
 - DM system (8 tables, E2EE with key-epoch enforcement)
 - MFA (TOTP, WebAuthn), email verification, ownership transfer
-- ~213 route registrations (REST + the `/ws` upgrade) across 20+ route groups
+- 232 route registrations (REST + the `/ws` upgrade) across 20+ route groups
 
 #### Media Plane (Node.js + mediasoup, port 3000)
 
@@ -59,7 +59,7 @@ Concord Voice is a distributed real-time communications platform with three serv
 - Secure IPC via preload bridge (contextIsolation ON, nodeIntegration OFF)
 - E2EE: AES-256-GCM message encryption, RSA-OAEP 4096-bit key wrapping
 - Token storage via Electron safeStorage (OS keychain)
-- 36 Zustand stores for state management
+- 41 Zustand stores for state management
 - Adaptive renderer load: remote SPA (Cloudflare Pages) with bundled `app://` fallback
 
 ### Data Flow
@@ -147,7 +147,7 @@ The desktop client is the only shipping client. Source: `client/desktop/`.
 - **Process layout** (`client/desktop/src/` has five top-level source dirs):
   - `main/` — Electron main process: `BrowserWindow` creation, `app://` scheme registration, IPC dispatch, updater wiring, quit lifecycle (`main.ts`); secure token persistence (`tokenManager.ts`); adaptive renderer loading (`spaLoader.ts`); the `app://` resolver (`appProtocol.ts`); device fingerprint (`machineId.ts`); userData path pinning (`pinUserDataPath.ts`); auto-update trust chain (`updater.ts`, `updateSafety.ts`, `verifyWindowsSignature.ts`).
   - `preload/preload.ts` — the single `contextBridge` bridge exposing a minimal typed `window.electron` API.
-  - `renderer/` — the React SPA: `stores/` (36 Zustand stores), `services/` (singletons incl. `e2eeService.ts`, `mediaEncryption.ts`, `searchService.ts`, WebSocket, API client, voice), `components/`, `hooks/`, `types/ws-events.ts` (zod WS schema).
+  - `renderer/` — the React SPA: `stores/` (41 Zustand stores), `services/` (singletons incl. `e2eeService.ts`, `mediaEncryption.ts`, `searchService.ts`, WebSocket, API client, voice), `components/`, `hooks/`, `types/ws-events.ts` (zod WS schema).
   - `shared/` — three cross-process modules: `clientBehavior.ts` (window close/minimize routing), `spaIpcTypes.ts` (self-heal IPC contract), `spaUrlPattern.ts` (the shared SPA chunk-URL regex; the legacy `SPA_URL_PATTERN` was removed by #1657 in favor of runtime base-dir matching).
   - `constants/` — typed constants + build-time generators (e.g. `updateEndpoint.mts`), included in the Istanbul coverage set.
 - **Responsibilities:** browser-inspired UI (server bar, channel panel), WebRTC media handling (Opus, 7 quality tiers), voice controls (mute/deafen/PTT, device selection, per-user volume), screen sharing, video calls, E2EE encrypt/decrypt via `e2eeService` (`encryptForChannel` / `decryptForChannel`), secure token storage via `safeStorage`. *(This list is non-exhaustive — the renderer also carries TTS (`ttsService.ts`), keyboard-shortcut customization, OS-permission management (`permissionManager.ts`, macOS screen-recording/mic TCC), and a startup splash window.)*
@@ -225,7 +225,7 @@ Manifests + signed installers are served from the control-plane `updates` packag
 
 **Responsibilities:** authentication; server/channel CRUD; membership + RBAC; user presence; WebSocket signaling and message relay; E2EE ciphertext relay (the server never decrypts); MFA; SSO; account erasure; object storage; client attestation; rate limiting.
 
-**API:** ~213 route registrations (REST handlers + the single `/ws` upgrade endpoint) across 20+ route groups (`/auth`, `/auth/sso`, `/mfa`, `/users`, `/sessions`, `/servers`, `/channels`, `/categories`, `/e2ee`, `/messages`, `/dm/conversations`, `/friends`, `/invites`, `/voice`, `/media`, `/notifications`, `/privacy`, `/klipy`, `/updates`, `/ws`). The Klipy routes register only when `KLIPY_API_KEY` is set; some media routes register a 503 fallback when object storage is unconfigured. See [API Documentation](./api/README.md). (Route counts are maintained by a repo count-generator script and may drift slightly from this document between audits.)
+**API:** 232 route registrations (REST handlers + the single `/ws` upgrade endpoint) across 20+ route groups (`/auth`, `/auth/sso`, `/mfa`, `/users`, `/sessions`, `/servers`, `/channels`, `/categories`, `/e2ee`, `/messages`, `/dm/conversations`, `/friends`, `/invites`, `/voice`, `/media`, `/notifications`, `/privacy`, `/klipy`, `/updates`, `/ws`). The Klipy routes register only when `KLIPY_API_KEY` is set; some media routes register a 503 fallback when object storage is unconfigured. See [API Documentation](./api/README.md). (Route counts are maintained by a repo count-generator script and may drift slightly from this document between audits.)
 
 **E2EE relay (zero-knowledge):** the server relays ciphertext and never decrypts. On the REST path, `messages` handlers (`internal/messages/handlers.go`) validate ciphertext structurally (`isValidCiphertext` — base64 + ≥28-byte decoded length) and enforce epoch revocation (`enforceE2EE`). On the WebSocket path, the hub validates the envelope (`validateEnvelope` — `key_version` present, length cap) and enforces epochs (`enforceWSEpoch` in `internal/websocket/hub.go`); it stores the `content` column verbatim. The E2EE-everywhere posture (#201) removed all per-row `is_encrypted` flags (migration 000062) — encryption is structural, not a runtime branch.
 
@@ -458,21 +458,22 @@ The admin console is a **separate identity domain** — it never shares state wi
 **Component split (authoritative vs. infrastructure):**
 
 - `MediasoupService` (`src/lib/mediasoup.ts`) owns **workers and routers only** — `init()` creates the worker pool, `getOrCreateRouter(roomId)` / `removeRouter(roomId)` manage one router per room. It holds no participant state.
-- `RoomManager` (`src/lib/roomManager.ts`) is **authoritative for everything else** — `joinRoom` / `leaveRoom`, `createTransport`, `connectTransport`, `produce` / `consume`, producer/consumer pause/resume/close, and the server-mute/deafen methods. `MediasoupService` is injected as a dependency. The `Room` struct carries `{ id, router, audioLevelObserver, participants, createdAt, e2eeEpoch }` — **no `isEncrypted` field**.
+- `RoomManager` (`src/lib/roomManager.ts`) is **authoritative for everything else** — `joinRoom` / `leaveRoom`, `createTransport`, `connectTransport`, `produce` / `consume`, producer/consumer pause/resume/close, and the server-mute/deafen methods. `MediasoupService` is injected as a dependency. The `Room` struct carries `{ id, router, audioLevelObserver, participants, createdAt, e2eeEpoch, mediaFrameCryptoVersion }` — **no `isEncrypted` field**.
 
 **Transport encryption is structurally mandatory.** All transports are created via `router.createWebRtcTransport` (DTLS-SRTP by construction); there is no `createPlainRtpTransport` path and no per-room encryption flag anywhere in `src/`. The `e2eeEpoch` counter increments unconditionally on every join/leave for forward-secrecy signaling.
 
 **Origin gate.** The Socket.IO `cors.origin` callback (`src/lib/originGate.ts`) maintains semantic parity with the control-plane CORS middleware: no-Origin → allow; `'null'` / `'file://'` → reject (case-insensitive, whitespace-tolerant); allowlist or `'*'` → allow; else reject. A production guard in `src/config/index.ts` fatal-exits if `ALLOWED_ORIGINS` contains `'*'` while `ENVIRONMENT=production` (CWE-942).
 
-**Socket.IO events:** `join-room`, `update-rtp-capabilities`, `create-transport`, `connect-transport`, `produce`, `consume`, `request-keyframe`, `set-preferred-layers`, `update-test-status`, `pause-producer` / `resume-producer`, `close-producer`, `pause-consumer` / `resume-consumer` / `close-consumer`, `leave-room`; room broadcasts include `participant-testing-changed` and `camera-layering-gate`. `join-room` participant summaries carry `isTesting` so clients can render in-call device tests. `request-keyframe` lets a receiver ask the SFU to request a fresh video keyframe from a target sender after E2EE epoch recovery; the media plane validates room membership and applies a 5s per-sender cooldown before calling mediasoup `consumer.requestKeyFrame()` (PLI/FIR). `set-preferred-layers` carries receiver render demand for camera consumers (`consumerId`, desired layers, visibility, CSS size, device pixel ratio, role/focus/pressure flags); the media plane verifies ownership, video kind, camera source, entitlement layer cap, and only calls mediasoup `consumer.setPreferredLayers()` for simulcast/SVC consumers. The resulting server-owned `camera-layering-gate` broadcast tells clients when layered camera production is beneficial for the room. The `resume-producer` / `resume-consumer` handlers enforce `server_muted` / `server_deafened`. (Voice quality tiers are applied client-side via producer `codecOptions`, not a Socket.IO event.)
+**Socket.IO events:** `join-room`, `update-rtp-capabilities`, `create-transport`, `connect-transport`, `produce`, `consume`, `request-keyframe`, `set-preferred-layers`, `update-test-status`, `pause-producer` / `resume-producer`, `close-producer`, `pause-consumer` / `resume-consumer` / `close-consumer`, `leave-room`; room broadcasts include `participant-testing-changed` and `camera-layering-gate`. `join-room` carries `mediaFrameCryptoVersion`; the media plane accepts only the AES-256 media-frame format version and keeps one room-wide value so legacy AES-128 clients cannot join the same call and fail later as black frames. `join-room` participant summaries carry `isTesting` so clients can render in-call device tests. `request-keyframe` lets a receiver ask the SFU to request a fresh video keyframe from a target sender after E2EE epoch recovery; the media plane validates room membership and applies a 5s per-sender cooldown before calling mediasoup `consumer.requestKeyFrame()` (PLI/FIR). `set-preferred-layers` carries receiver render demand for camera consumers (`consumerId`, desired layers, visibility, CSS size, device pixel ratio, role/focus/pressure flags); the media plane verifies ownership, video kind, camera source, entitlement layer cap, and only calls mediasoup `consumer.setPreferredLayers()` for simulcast/SVC consumers. The resulting server-owned `camera-layering-gate` broadcast tells clients when layered camera production is beneficial for the room. The `resume-producer` / `resume-consumer` handlers enforce `server_muted` / `server_deafened`. (Voice quality tiers are applied client-side via producer `codecOptions`, not a Socket.IO event.)
 
 #### Media E2EE (frame encryption)
 
 Voice and **video frames are end-to-end encrypted above the SFU** — the media plane never sees plaintext media. This is a separate layer from transport DTLS-SRTP (which terminates *at* the SFU). Implementation: `client/desktop/src/renderer/services/mediaEncryption.ts` (+ `voiceE2eeTransforms.ts`):
 
-- **Cipher:** per-frame **AES-128-GCM** applied via WebRTC **Insertable Streams** before frames leave the sender — `RTCRtpScriptTransform` (Web Worker) on Chromium 129+, `createEncodedStreams` (main thread) on the legacy path.
+- **Cipher:** per-frame **AES-256-GCM** applied via WebRTC **Insertable Streams** before frames leave the sender — `RTCRtpScriptTransform` (Web Worker) on Chromium 129+, `createEncodedStreams` (main thread) on the legacy path.
 - **Frame keys:** derived `HKDF-SHA256(channelCSK, salt="concord-voice-e2ee", info=senderUserId)` from the **same channel CSK** used for text messages — so media encryption shares the `channel_keys` / `key_revocations` epoch ledger and rotates on member join/leave (with a short overlap window), and ratchets via `HKDF(oldKey, "concord-e2ee-ratchet")`.
-- **Framing:** a trailing `0xDE 0xAD` magic + self-describing header bytes distinguish encrypted frames and survive BUNDLE payload-type collisions; AES-GCM is used **without** AAD (intentional — the header travels in the clear). A self-healing decrypt-recovery pipeline handles transient key-rotation gaps.
+- **Frame-format admission:** the desktop advertises `MEDIA_E2EE_FRAME_CRYPTO_VERSION = 2` on `join-room`; the media plane accepts only that value and rejects missing or legacy versions before storing the participant or bumping the room E2EE epoch. This is the rollout guard for the AES-128 -> AES-256 media-frame key change.
+- **Framing and fail-closed receive:** a trailing `0xDE 0xAD` magic + self-describing header bytes distinguish encrypted frames and survive BUNDLE payload-type collisions; AES-GCM is used **without** AAD (intentional — the header travels in the clear). Receivers reject every non-empty frame without the E2EE magic trailer, while allowing empty DTX/control frames. If a decrypt transform cannot attach, `voiceService` closes the consumer before store routing or server resume; attached transforms drop undecryptable frames and use self-healing recovery for transient key-rotation gaps.
 - **Video keyframe recovery:** when the receiver detects a missing or stale media decrypt key, `voiceService` pre-installs target-epoch decrypt keys for active participants, catches the worker up to the server epoch, and emits `request-keyframe { senderUserId }` for the affected video sender. The media plane validates requester/sender membership, finds the matching video consumers, and calls mediasoup `consumer.requestKeyFrame()` under the 5s per-sender cooldown.
 - **Media plane is blind by design:** no frame-crypto code exists in `services/media-plane/src/`; the SFU forwards opaque encrypted RTP payloads.
 
@@ -568,7 +569,7 @@ sequenceDiagram
 
     C->>CP: POST /api/v1/channels/:id/voice/join (authorize)
     CP-->>C: { allowed: true, media_server_url, ice_servers, server_muted, server_deafened }
-    C->>MP: Socket.IO connect → join-room {roomId, rtpCapabilities}
+    C->>MP: Socket.IO connect → join-room {roomId, rtpCapabilities, mediaFrameCryptoVersion}
     Note over C,MP: userId is taken from the verified JWT, not the payload
     MP->>MP: RoomManager.getOrCreateRoom → MediasoupService.getOrCreateRouter
     MP-->>C: router RTP capabilities
@@ -749,7 +750,7 @@ Concord/
 │   ├── src/shared/           # Cross-process types (clientBehavior, spaIpcTypes, spaUrlPattern)
 │   └── src/constants/        # Typed constants + build-time generators
 ├── services/
-│   ├── control-plane/        # Go backend (internal/ has 30 packages; migrations/)
+│   ├── control-plane/        # Go backend (internal/ has 38 packages; migrations/)
 │   ├── media-plane/          # Node.js mediasoup WebRTC SFU (src/lib/ RoomManager, mediasoup)
 │   └── licensing-authority/  # Planned (Phase 3) — profile-gated, not production-active
 ├── infrastructure/

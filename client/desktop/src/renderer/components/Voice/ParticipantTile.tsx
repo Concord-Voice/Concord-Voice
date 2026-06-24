@@ -283,21 +283,26 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
       },
       { threshold: 0 }
     );
-    void import('../../services/voiceService').then((m) => {
-      if (disposed) return;
-      const candidate = m.voiceService as Partial<NonNullable<typeof svc>>;
-      if (
-        typeof candidate.setRemoteVideoRenderState !== 'function' ||
-        typeof candidate.removeRemoteVideoTile !== 'function'
-      ) {
-        return;
-      }
-      svc = {
-        setRemoteVideoRenderState: candidate.setRemoteVideoRenderState.bind(candidate),
-        removeRemoteVideoTile: candidate.removeRemoteVideoTile.bind(candidate),
-      };
-      observer.observe(el);
-    });
+    void import('../../services/voiceService')
+      .then((m) => {
+        if (disposed) return;
+        const candidate = m.voiceService as Partial<NonNullable<typeof svc>>;
+        if (
+          typeof candidate.setRemoteVideoRenderState !== 'function' ||
+          typeof candidate.removeRemoteVideoTile !== 'function'
+        ) {
+          return;
+        }
+        svc = {
+          setRemoteVideoRenderState: candidate.setRemoteVideoRenderState.bind(candidate),
+          removeRemoteVideoTile: candidate.removeRemoteVideoTile.bind(candidate),
+        };
+        observer.observe(el);
+      })
+      .catch((err: unknown) => {
+        // Tile visibility is an optimization; ignore late import teardown races.
+        if (!disposed) console.debug('Voice tile visibility reporter unavailable', err);
+      });
     return () => {
       disposed = true;
       observer.disconnect();

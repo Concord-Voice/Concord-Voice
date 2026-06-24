@@ -127,7 +127,7 @@ channels and direct messages, and voice and video streams in
 server-channel voice rooms and direct-message 1:1 calls. Messages are
 encrypted on your device before transmission using AES-256-GCM, with
 encryption keys wrapped using RSA-OAEP 4096-bit encryption. Voice and
-video media frames are encrypted on your device using AES-128-GCM via
+video media frames are encrypted on your device using AES-256-GCM via
 the WebRTC Encoded Transform API, with frame keys derived from the
 same per-channel symmetric keys (via HKDF-SHA256) that protect text
 messages; the media server (a mediasoup Selective Forwarding Unit)

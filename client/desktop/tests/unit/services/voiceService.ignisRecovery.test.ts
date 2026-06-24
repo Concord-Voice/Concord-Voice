@@ -66,6 +66,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 
 // --- mediaEncryption ---
 vi.mock('@/renderer/services/mediaEncryption', () => ({
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 2,
   MediaEncryption: class MockMediaEncryption {
     init = vi.fn().mockResolvedValue(undefined);
     initFromKey = vi.fn();

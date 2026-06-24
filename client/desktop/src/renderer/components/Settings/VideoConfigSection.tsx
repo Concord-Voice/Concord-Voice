@@ -1139,10 +1139,9 @@ const VideoConfigSection: React.FC = () => {
             />
           </div>
 
-          {/* Video Quality Layers (SVC) removed from UI — E2EE forces
-              single-layer encoding (#291). The scalabilityMode store value
-              is preserved and still applied to non-E2EE channels using
-              whatever value was last persisted (default 'auto' → L3T3). */}
+          {/* Layer mode is not exposed as a manual screen-share control here;
+              camera layering is negotiated by the media-plane gate. The
+              scalabilityMode store value is preserved for codec planning. */}
         </>
       )}
     </CollapsibleSection>

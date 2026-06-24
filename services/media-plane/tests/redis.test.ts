@@ -219,7 +219,13 @@ describe('RedisService', () => {
       await service.connect();
       const handler = service.createRoomEventHandler();
 
-      handler({ type: 'user-left', roomId: 'ch-1', userId: 'u-1' });
+      handler({
+        type: 'user-left',
+        roomId: 'ch-1',
+        userId: 'u-1',
+        socketId: 'sock-1',
+        e2eeEpoch: 3,
+      });
 
       expect(mockMulti.sRem).toHaveBeenCalled();
     });
