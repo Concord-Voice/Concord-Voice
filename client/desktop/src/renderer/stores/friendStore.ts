@@ -212,6 +212,7 @@ export const useFriendStore = wrapStore(
             }
 
             const data = await safeJson<ApiFriendsListResponse>(response);
+            const currentStatusByUser = new Map(get().friends.map((f) => [f.userId, f.status]));
             const friends: Friend[] = (data.friends || []).map((f) => ({
               id: f.id,
               userId: f.user_id,
@@ -219,7 +220,7 @@ export const useFriendStore = wrapStore(
               displayName: f.display_name,
               avatarUrl: f.avatar_url,
               colorScheme: f.color_scheme,
-              status: f.status || 'offline',
+              status: f.status ?? currentStatusByUser.get(f.user_id) ?? 'offline',
               createdAt: f.created_at,
             }));
 

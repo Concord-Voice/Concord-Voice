@@ -124,6 +124,7 @@ const ConversationList: React.FC<ConversationListProps> = ({
   const [profileTarget, setProfileTarget] = useState<DMConversation | null>(null);
   const blockUser = useFriendStore((s) => s.blockUser);
   const removeFriend = useFriendStore((s) => s.removeFriend);
+  const friends = useFriendStore((s) => s.friends);
   const conversations = useDMStore((s) => s.conversations);
   const fetchConversations = useDMStore((s) => s.fetchConversations);
   const openPersonalThread = useDMStore((s) => s.openPersonalThread);
@@ -258,7 +259,11 @@ const ConversationList: React.FC<ConversationListProps> = ({
           const other = conv.isGroup
             ? null
             : conv.participants.find((p) => p.userId !== currentUserId);
-          const status = other?.status || 'offline';
+          const friendStatus = other
+            ? friends.find((f) => f.userId === other.userId)?.status
+            : undefined;
+          const participantStatus = other?.status;
+          const status = friendStatus ?? participantStatus ?? 'offline';
           const lastTime = conv.lastMessage?.createdAt || conv.createdAt;
           let preview = '';
           if (conv.lastMessage) {

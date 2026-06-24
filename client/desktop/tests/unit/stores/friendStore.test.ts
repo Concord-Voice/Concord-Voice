@@ -311,6 +311,27 @@ describe('friendStore', () => {
       expect(useFriendStore.getState().friends[0].status).toBe('offline');
     });
 
+    it('preserves live presence when API omits status', async () => {
+      useFriendStore.getState().addFriend({
+        id: 'friendship-1',
+        userId: 'user-2',
+        username: 'bob',
+        displayName: 'Bob',
+        status: 'online',
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/friends`, () => {
+          return HttpResponse.json({
+            friends: [{ id: 'f-1', user_id: 'user-2', username: 'bob' }],
+          });
+        })
+      );
+
+      await useFriendStore.getState().fetchFriends();
+
+      expect(useFriendStore.getState().friends[0].status).toBe('online');
+    });
+
     it('sets error on API failure', async () => {
       server.use(
         http.get(`${API_BASE}/api/v1/friends`, () => {

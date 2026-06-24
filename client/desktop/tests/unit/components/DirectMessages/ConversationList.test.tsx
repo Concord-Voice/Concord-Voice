@@ -1,5 +1,6 @@
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { useDMStore, type DMConversation, type DMLastMessage } from '@/renderer/stores/dmStore';
+import { useFriendStore } from '@/renderer/stores/friendStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { API_BASE } from '@/renderer/config';
@@ -66,6 +67,7 @@ describe('ConversationList', () => {
       fetchConversations: vi.fn().mockResolvedValue(undefined),
       openPersonalThread: vi.fn().mockResolvedValue(personalThread),
     });
+    useFriendStore.setState({ friends: [] });
   });
 
   it('renders conversation list container', () => {
@@ -105,6 +107,73 @@ describe('ConversationList', () => {
     });
     render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
     expect(screen.getByText('Alice')).toBeInTheDocument();
+  });
+
+  it('updates a 1:1 DM row from live friend presence', async () => {
+    useFriendStore.getState().addFriend({
+      id: 'friendship-1',
+      userId: 'user-2',
+      username: 'alice',
+      displayName: 'Alice',
+      status: 'offline',
+    });
+    useDMStore.setState({
+      conversations: [
+        makeConversation({
+          participants: [
+            { userId: 'user-1', username: 'me', displayName: 'Me' },
+            { userId: 'user-2', username: 'alice', displayName: 'Alice', status: 'offline' },
+          ],
+        }),
+      ],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const { container } = render(
+      <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+    );
+    expect(
+      container.querySelector('.conversation-avatar .member-status-dot.offline')
+    ).toBeInTheDocument();
+
+    act(() => {
+      useFriendStore.getState().updateFriendPresence('user-2', 'online');
+    });
+
+    await waitFor(() =>
+      expect(
+        container.querySelector('.conversation-avatar .member-status-dot.online')
+      ).toBeInTheDocument()
+    );
+  });
+
+  it('uses live friend presence over a stale DM participant snapshot', () => {
+    useFriendStore.getState().addFriend({
+      id: 'friendship-1',
+      userId: 'user-2',
+      username: 'alice',
+      displayName: 'Alice',
+      status: 'offline',
+    });
+    useDMStore.setState({
+      conversations: [
+        makeConversation({
+          participants: [
+            { userId: 'user-1', username: 'me', displayName: 'Me' },
+            { userId: 'user-2', username: 'alice', displayName: 'Alice', status: 'online' },
+          ],
+        }),
+      ],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const { container } = render(
+      <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+    );
+
+    expect(
+      container.querySelector('.conversation-avatar .member-status-dot.offline')
+    ).toBeInTheDocument();
   });
 
   it('renders group conversation with group name', () => {
