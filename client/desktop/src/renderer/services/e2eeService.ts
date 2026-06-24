@@ -92,6 +92,15 @@ class E2EEService {
   private readonly pendingKeyFetches: Map<string, Promise<CryptoKey>> = new Map();
   private rateLimitedUntil: number = 0; // timestamp when rate limit expires
 
+  // #1878: authoritative CSK-rotation signal. Fires when a strictly-higher
+  // channel key version is observed/cached — the sender re-base trigger. The
+  // first-ever observation for a channel does NOT fire (no prior baseline to
+  // rotate from); only an increase from a previously-seen version does.
+  private readonly keyRotationListeners = new Set<
+    (e: { channelId: string; keyVersion: number }) => void
+  >();
+  private readonly highestSeenVersion = new Map<string, number>();
+
   /** Cached exported keys for safeStorage persistence (set during initialize) */
   private sessionKeys: E2EESessionKeys | null = null;
 
@@ -379,6 +388,9 @@ class E2EEService {
     if (cached?.wrappedKey && Date.now() - cached.lastUsed < CHANNEL_KEY_CACHE_TTL) {
       cached.lastUsed = Date.now();
       const privateKey = await this.derivePrivateKey();
+      // #1878: a cache hit re-observes the cached version (idempotent — only a
+      // strictly-higher version fires the rotation emitter).
+      this.noteChannelVersion(channelId, cached.keyVersion);
       return unwrapChannelKey(cached.wrappedKey, privateKey);
     }
 
@@ -454,6 +466,10 @@ class E2EEService {
       lastUsed: Date.now(),
       refetchAfterMalformed: 0,
     });
+
+    // #1878: a fresh current-key fetch observes its version — fires the rotation
+    // emitter if the channel's current version advanced.
+    this.noteChannelVersion(channelId, keyVersion);
 
     // JIT unwrap: derive private key, unwrap channel key, private key falls out of scope
     const privateKey = await this.derivePrivateKey();
@@ -656,8 +672,26 @@ class E2EEService {
   }
 
   /**
+   * #1878: the authoritative channel-key version currently cached for a channel,
+   * or 0 when no key is cached yet. Used by voiceService to bind the media
+   * encrypt key's version at E2EE init (the value stamped into the v3 frame
+   * trailer). Distinct from `getCurrentKeyVersion` (defaults to 1) — here the
+   * floor is 0 so an unbound channel maps to the "no version known yet" value
+   * rather than silently claiming v1.
+   */
+  getChannelKeyVersion(channelId: string): number {
+    return this.channelKeyCache.get(channelId)?.keyVersion ?? 0;
+  }
+
+  /**
    * Fetch and unwrap a specific key version for a channel (for decrypting old messages).
    * Results are cached in the versioned key cache.
+   *
+   * Cache hits return BEFORE allocating an in-flight dedup promise. Concurrent
+   * cache-miss callers for the same `(channelId, version)` share one network
+   * fetch via `pendingKeyFetches` under a compound key `${channelId}:v${version}`
+   * — distinct from `getChannelKey`'s bare-`channelId` entries, so the two paths
+   * never collide (#1878).
    */
   async getChannelKeyByVersion(channelId: string, version: number): Promise<CryptoKey> {
     if (!channelId) {
@@ -670,6 +704,7 @@ class E2EEService {
     if (mainCached?.wrappedKey && mainCached.keyVersion === version) {
       mainCached.lastUsed = Date.now();
       const privateKey = await this.derivePrivateKey();
+      this.noteChannelVersion(channelId, version); // #1878
       return unwrapChannelKey(mainCached.wrappedKey, privateKey);
     }
 
@@ -678,6 +713,7 @@ class E2EEService {
     if (versionCached?.wrappedKey && Date.now() - versionCached.lastUsed < CHANNEL_KEY_CACHE_TTL) {
       versionCached.lastUsed = Date.now();
       const privateKey = await this.derivePrivateKey();
+      this.noteChannelVersion(channelId, version); // #1878
       return unwrapChannelKey(versionCached.wrappedKey, privateKey);
     }
 
@@ -686,6 +722,32 @@ class E2EEService {
       throw new E2EEKeyUnavailableError('NO_KEY_YET', false);
     }
 
+    // #1878: by-version in-flight dedup. Compound key cannot collide with the
+    // bare-channelId entries getChannelKey uses. Allocated only AFTER the cache
+    // misses above, so a cache hit never creates a pending promise.
+    const dedupKey = `${channelId}:v${version}`;
+    const inflight = this.pendingKeyFetches.get(dedupKey);
+    if (inflight) {
+      return inflight;
+    }
+    const fetchPromise = this.fetchChannelKeyByVersion(channelId, version);
+    this.pendingKeyFetches.set(dedupKey, fetchPromise);
+    try {
+      return await fetchPromise;
+    } finally {
+      this.pendingKeyFetches.delete(dedupKey);
+    }
+  }
+
+  /**
+   * Internal: fetch a specific channel-key version from the server, validate the
+   * wrap shape (bounded cache-poison refetch), cache it in the versioned cache,
+   * note the observed version (rotation emitter), and unwrap. Extracted from
+   * `getChannelKeyByVersion` so the in-flight dedup wraps exactly one body and
+   * the malformed-wrap retry recurses on the body (never re-allocating a dedup
+   * promise). See #1878.
+   */
+  private async fetchChannelKeyByVersion(channelId: string, version: number): Promise<CryptoKey> {
     // Fetch specific version from server
     const res = await apiFetch(`/api/v1/e2ee/keys/${channelId}?version=${version}`);
     if (!res.ok) {
@@ -704,7 +766,7 @@ class E2EEService {
       this.validateWrapShape(wrappedKey);
     } catch (err) {
       if (this.handleMalformedVersionedWrap(channelId, version, err)) {
-        return this.getChannelKeyByVersion(channelId, version);
+        return this.fetchChannelKeyByVersion(channelId, version);
       }
       throw err;
     }
@@ -728,6 +790,9 @@ class E2EEService {
     if (staleMarker && !staleMarker.wrappedKey) {
       this.channelKeyCache.delete(channelId);
     }
+
+    // #1878: observe the fetched version — fires the rotation emitter on increase.
+    this.noteChannelVersion(channelId, version);
 
     const privateKey = await this.derivePrivateKey();
     return unwrapChannelKey(wrappedKey, privateKey);
@@ -836,6 +901,10 @@ class E2EEService {
     this.channelKeyCache.clear();
     this.versionedKeyCache.clear();
     this.pendingKeyFetches.clear();
+    // #1878: drop all rotation baselines on logout — a new session must not
+    // inherit a stale highest-seen version. Listeners are NOT cleared here:
+    // subscribers (voiceService) own their unsubscribe lifecycle.
+    this.highestSeenVersion.clear();
 
     // Reset the reactive flag so the post-auth gate (#270 Task 21b) goes
     // back to its pre-init state. We deliberately do NOT touch
@@ -850,6 +919,53 @@ class E2EEService {
   invalidateChannelKey(channelId: string): void {
     this.channelKeyCache.delete(channelId);
     this.versionedKeyCache.delete(channelId);
+    // #1878: DO NOT clear highestSeenVersion here. invalidateChannelKey is the
+    // primary CSK-rotation trigger path (WS revocation / performKeyRotation,
+    // requestRecovery self-heal, key_delivered, channel_access_revoked) — it
+    // runs BEFORE the subsequent getChannelKey refetch re-observes the new
+    // version. If we deleted the baseline, that refetch would see prev=-1
+    // (first-ever) and only re-seed, so noteChannelVersion would NOT fire the
+    // rotation emitter — the sender would never re-base and would keep stamping
+    // the OLD keyVersion, defeating the entire #1878 fix (caught by Gitar +
+    // e2ee-reviewer on PR #1885). Keeping the baseline is safe: noteChannelVersion
+    // only fires on a STRICTLY-higher version, so a cache-bust followed by a
+    // same-version refetch produces no fire, while a genuine rotation (higher
+    // version) correctly fires. Logout drops all baselines via clearKeys().
+  }
+
+  /**
+   * #1878: Subscribe to confirmed CSK rotations. The listener receives
+   * `{ channelId, keyVersion }` exactly once per strictly-higher version that
+   * the service observes/caches for a channel. Returns an unsubscribe fn.
+   */
+  onKeyRotation(listener: (e: { channelId: string; keyVersion: number }) => void): () => void {
+    this.keyRotationListeners.add(listener);
+    return () => this.keyRotationListeners.delete(listener);
+  }
+
+  /**
+   * #1878: Record an observed channel-key version. Fires the rotation emitter
+   * once when `keyVersion` is strictly higher than the previously-seen version
+   * for the channel. The first-ever observation only seeds the baseline (no
+   * fire). Listener errors are swallowed so a misbehaving subscriber can never
+   * break the key-fetch flow.
+   */
+  private noteChannelVersion(channelId: string, keyVersion: number): void {
+    const prev = this.highestSeenVersion.get(channelId) ?? -1;
+    if (keyVersion <= prev) {
+      return;
+    }
+    this.highestSeenVersion.set(channelId, keyVersion);
+    if (prev < 0) {
+      return; // first-ever observation — seed baseline only, do not fire
+    }
+    for (const listener of this.keyRotationListeners) {
+      try {
+        listener({ channelId, keyVersion });
+      } catch {
+        /* listener errors never break the key flow (#1878) */
+      }
+    }
   }
 }
 

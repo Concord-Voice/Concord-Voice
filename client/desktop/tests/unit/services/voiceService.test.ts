@@ -77,23 +77,35 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn().mockResolvedValue(null),
     invalidateChannelKey: vi.fn(),
+    // #1878: version binding + sender re-base surface.
+    getChannelKeyVersion: vi.fn().mockReturnValue(0),
+    getChannelKeyByVersion: vi.fn().mockResolvedValue(null),
+    onKeyRotation: vi.fn().mockReturnValue(() => {}),
   },
 }));
 
 // --- mediaEncryption ---
 vi.mock('@/renderer/services/mediaEncryption', () => ({
-  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 2,
+  // The client now negotiates v3 (#1878 Task 6); the mock mirrors the live
+  // constant so the join-version assertion (sender advertises === ack confirms)
+  // stays self-consistent. The media-plane gate accepts {2,3} during rollout.
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 3,
   MediaEncryption: class MockMediaEncryption {
     init = vi.fn().mockResolvedValue(undefined);
     initFromKey = vi.fn();
     destroy = vi.fn();
     getCurrentKeyId = vi.fn().mockReturnValue(0);
     setCurrentKeyId = vi.fn();
+    // #1878: encrypt-version binding.
+    setKeyVersion = vi.fn();
+    getKeyVersion = vi.fn().mockReturnValue(0);
     encryptFrame = vi.fn().mockResolvedValue(undefined);
     decryptFrame = vi.fn().mockResolvedValue(undefined);
     addDecryptKey = vi.fn().mockResolvedValue(undefined);
     addDecryptKeyAtEpoch = vi.fn().mockResolvedValue({} as CryptoKey);
+    addDecryptKeyAtVersion = vi.fn().mockResolvedValue({} as CryptoKey);
     addDecryptKeyDirect = vi.fn();
+    addDecryptKeyDirectV3 = vi.fn();
     debouncedRotateKeys = vi.fn();
     catchUpToEpoch = vi.fn().mockResolvedValue(undefined);
   },
@@ -247,6 +259,7 @@ import { useUserStore } from '@/renderer/stores/userStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
 import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
+import { useUpdateStatusStore } from '@/renderer/stores/updateStatusStore';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -285,7 +298,7 @@ function makeJoinResponse(co?: Record<string, unknown>) {
 function makeRoomJoined(ov?: Record<string, unknown>) {
   return {
     rtpCapabilities: mockDeviceRtpCapabilities,
-    mediaFrameCryptoVersion: 2,
+    mediaFrameCryptoVersion: 3,
     existingProducers: [],
     participants: [{ userId: 'user-1', username: 'testuser', displayName: 'Test User' }],
     channelName: 'General',
@@ -535,7 +548,7 @@ describe('VoiceService', () => {
         'join-room',
         expect.objectContaining({
           roomId: 'channel-1',
-          mediaFrameCryptoVersion: 2,
+          mediaFrameCryptoVersion: 3,
         }),
         expect.any(Function)
       );
@@ -554,6 +567,31 @@ describe('VoiceService', () => {
         'Media frame crypto version mismatch'
       );
       expect(mockDeviceLoad).not.toHaveBeenCalled();
+    });
+
+    it('maps a typed crypto_version_mismatch join ack to the update-required banner state', async () => {
+      setupAuth();
+      mockApiFetch.mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      mockSocket.connected = true;
+      // Media-plane returns the typed ack: the room is at a higher version and
+      // this (lower-version) client must update to rejoin (#1878).
+      setupEmitResponses({
+        'join-room': {
+          error: 'Media frame crypto version mismatch: room=3, join=2',
+          code: 'crypto_version_mismatch',
+          roomVersion: 3,
+          joinVersion: 2,
+        },
+      });
+
+      await expect(voiceService.joinChannel('channel-1')).rejects.toBeTruthy();
+      expect(mockDeviceLoad).not.toHaveBeenCalled();
+
+      const critical = useUpdateStatusStore.getState().criticalError;
+      expect(critical?.subtype).toBe('media-crypto-version');
     });
 
     it('falls back to personal tier when channel tier invalid', async () => {

@@ -28,6 +28,11 @@ const COPY_BY_SUBTYPE: Record<UpdateCriticalErrorSubtype, { headline: string; co
     confirm:
       'I understand Concord cannot verify the downloaded update and I will reinstall manually.',
   },
+  'media-crypto-version': {
+    headline:
+      'Your app is out of date — this voice call uses a newer encryption format your version cannot join. Update to rejoin.',
+    confirm: 'I understand I must update Concord to join encrypted voice calls.',
+  },
 };
 
 /**

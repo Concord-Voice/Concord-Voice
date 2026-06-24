@@ -6,8 +6,19 @@
 // ─── Main Thread → Worker ────────────────────────────────────────────
 
 export type E2EEWorkerMessage =
-  | { type: 'init'; encryptKey: CryptoKey; currentKeyId: number }
-  | { type: 'addDecryptKey'; senderUserId: string; keyId: number; key: CryptoKey }
+  // #1878: init carries the authoritative CSK keyVersion so the worker stamps
+  // it into every outgoing v3 frame trailer (binds encrypt version at init /
+  // reconnect / post-rotation — never a stale 0 when the channel is higher).
+  | { type: 'init'; encryptKey: CryptoKey; currentKeyId: number; keyVersion: number }
+  // #1878: addDecryptKey carries the CSK keyVersion so the worker keys its
+  // decrypt map by senderId:keyVersion:keyId (matches the v3 frame trailer).
+  | {
+      type: 'addDecryptKey';
+      senderUserId: string;
+      keyVersion: number;
+      keyId: number;
+      key: CryptoKey;
+    }
   | { type: 'rotateKeys' }
   | { type: 'catchUpToEpoch'; targetEpoch: number }
   | { type: 'destroy' };
@@ -21,6 +32,15 @@ export type E2EEMainMessage =
       type: 'requestRecovery';
       senderUserId: string;
       dropCount: number;
+    }
+  // #1878: typed decrypt-miss → on-demand key request for an exact
+  // (senderUserId, keyVersion, keyId). Distinct from requestRecovery, which
+  // handles the OperationError/persistent-failure self-heal case.
+  | {
+      type: 'requestFrameKey';
+      senderUserId: string;
+      keyVersion: number;
+      keyId: number;
     }
   | {
       type: 'log';

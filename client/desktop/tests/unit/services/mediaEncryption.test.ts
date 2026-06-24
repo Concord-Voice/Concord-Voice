@@ -5,12 +5,14 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 let MediaEncryption: typeof import('@/renderer/services/mediaEncryption').MediaEncryption;
 let deriveFrameKey: typeof import('@/renderer/services/mediaEncryption').deriveFrameKey;
 let ratchetKey: typeof import('@/renderer/services/mediaEncryption').ratchetKey;
+let FrameKeyMissError: typeof import('@/renderer/services/mediaEncryption').FrameKeyMissError;
 
 beforeEach(async () => {
   const mod = await import('@/renderer/services/mediaEncryption');
   MediaEncryption = mod.MediaEncryption;
   deriveFrameKey = mod.deriveFrameKey;
   ratchetKey = mod.ratchetKey;
+  FrameKeyMissError = mod.FrameKeyMissError;
 });
 
 /** Helper: generate a test AES-256 key (simulates a channel CSK) */
@@ -60,8 +62,8 @@ describe('MediaEncryption', () => {
       expect(encrypted[encrypted.length - 1]).toBe(0xad);
       expect(encrypted[encrypted.length - 2]).toBe(0xde);
 
-      // headerBytes field should be 1 (audio)
-      expect(encrypted[encrypted.length - 16]).toBe(1);
+      // headerBytes field should be 1 (audio) — v3 trailer position -21
+      expect(encrypted[encrypted.length - 21]).toBe(1);
 
       // Decrypt
       await receiver.decryptFrame(frame, 'sender-user-id');
@@ -86,9 +88,9 @@ describe('MediaEncryption', () => {
       await sender.encryptFrame(frame);
       expect(frame.data.byteLength).toBeGreaterThan(200);
 
-      // headerBytes field should be 2 (video)
+      // headerBytes field should be 2 (video) — v3 trailer position -21
       const encrypted = new Uint8Array(frame.data);
-      expect(encrypted[encrypted.length - 16]).toBe(2);
+      expect(encrypted[encrypted.length - 21]).toBe(2);
 
       await receiver.decryptFrame(frame, 'sender-user-id');
       expect(new Uint8Array(frame.data)).toEqual(originalData);
@@ -114,9 +116,9 @@ describe('MediaEncryption', () => {
 
       await sender.encryptFrame(frame);
 
-      // keyId in trailer should be 2
+      // keyId in trailer should be 2 — v3 keyId is 2B BE, low byte at -19
       const encrypted = new Uint8Array(frame.data);
-      expect(encrypted[encrypted.length - 15]).toBe(2);
+      expect(encrypted[encrypted.length - 19]).toBe(2);
 
       await receiver.decryptFrame(frame, 'sender-user-id');
       expect(new Uint8Array(frame.data)).toEqual(originalData);
@@ -141,7 +143,7 @@ describe('MediaEncryption', () => {
 
       await sender.encryptFrame(frame);
       const encrypted = new Uint8Array(frame.data);
-      expect(encrypted[encrypted.length - 15]).toBe(2);
+      expect(encrypted[encrypted.length - 19]).toBe(2);
 
       await receiver.decryptFrame(frame, 'sender-user-id');
       expect(new Uint8Array(frame.data)).toEqual(originalData);
@@ -191,7 +193,7 @@ describe('MediaEncryption', () => {
         await encryptPromise;
 
         const encrypted = new Uint8Array(frame.data);
-        expect(encrypted[encrypted.length - 15]).toBe(0);
+        expect(encrypted[encrypted.length - 19]).toBe(0);
 
         await receiver.decryptFrame(frame, 'sender-user-id');
         expect(new Uint8Array(frame.data)).toEqual(originalData);
@@ -244,6 +246,8 @@ describe('MediaEncryption', () => {
       const me = new MediaEncryption();
       await me.init(csk, 'user-id');
 
+      // 10 bytes is below the v3 minimum (TRAILER_SIZE_V3 21 + MIN_GCM_OVERHEAD
+      // 17 = 38), so the "too small" guard fires.
       const buf = new ArrayBuffer(10);
       const view = new Uint8Array(buf);
       view.fill(0x42);
@@ -262,14 +266,15 @@ describe('MediaEncryption', () => {
       await me.init(csk, 'user-id');
       await me.addDecryptKey(csk, 'sender-id');
 
-      // 33 bytes = minimum size to pass the first check, but with headerBytes=2
-      // the ciphertext would be 33 - 16 (trailer) - 2 (header) = 15 bytes < 16
-      const buf = new ArrayBuffer(33);
+      // 38 bytes = minimum size to pass the v3 "too small" check, but with
+      // headerBytes=2 the ciphertext would be 38 - 21 (trailer) - 2 (header) =
+      // 15 bytes < 16, so the ciphertext-too-small guard fires.
+      const buf = new ArrayBuffer(38);
       const view = new Uint8Array(buf);
       view.fill(0x42);
-      view[31] = 0xde; // magic
-      view[32] = 0xad;
-      view[17] = 2; // headerBytes = 2 at position length-16
+      view[36] = 0xde; // magic
+      view[37] = 0xad;
+      view[17] = 2; // headerBytes = 2 at v3 position length-21
       const frame = { data: buf } as unknown as RTCEncodedAudioFrame;
 
       await expect(me.decryptFrame(frame, 'sender-id')).rejects.toThrow(
@@ -288,7 +293,7 @@ describe('MediaEncryption', () => {
       view.fill(0x42);
       view[48] = 0xde;
       view[49] = 0xad;
-      view[34] = 0; // headerBytes = 0 (invalid, must be 1-10)
+      view[50 - 21] = 0; // headerBytes = 0 (invalid, must be 1-10) at v3 position length-21
       const frame = { data: buf } as unknown as RTCEncodedAudioFrame;
 
       await expect(me.decryptFrame(frame, 'sender-id')).rejects.toThrow(
@@ -371,8 +376,8 @@ describe('MediaEncryption', () => {
       expect(data[data.length - 1]).toBe(0xad);
       expect(data[data.length - 2]).toBe(0xde);
 
-      // keyId in trailer should be 5
-      expect(data[data.length - 15]).toBe(5);
+      // keyId in trailer should be 5 — v3 keyId is 2B BE, low byte at -19
+      expect(data[data.length - 19]).toBe(5);
     });
 
     it('addDecryptKeyDirect allows decryptFrame for matching keyId', async () => {
@@ -444,8 +449,8 @@ describe('MediaEncryption', () => {
 
       const data = new Uint8Array(frame.data);
       expect(data.length).toBeGreaterThan(40);
-      // keyId in trailer should be 7
-      expect(data[data.length - 15]).toBe(7);
+      // keyId in trailer should be 7 — v3 keyId is 2B BE, low byte at -19
+      expect(data[data.length - 19]).toBe(7);
     });
 
     it('full Worker-path round-trip: initFromKey + addDecryptKeyDirect + rotation', async () => {
@@ -471,9 +476,9 @@ describe('MediaEncryption', () => {
 
       await sender.encryptFrame(frame);
 
-      // keyId should be 1
+      // keyId should be 1 — v3 keyId is 2B BE, low byte at -19
       const encrypted = new Uint8Array(frame.data);
-      expect(encrypted[encrypted.length - 15]).toBe(1);
+      expect(encrypted[encrypted.length - 19]).toBe(1);
 
       await receiver.decryptFrame(frame, 'alice');
       expect(new Uint8Array(frame.data)).toEqual(originalData);
@@ -720,7 +725,7 @@ describe('MediaEncryption — #1742 empty DTX frame passthrough', () => {
     await sender.encryptFrame(frame);
 
     const enc = new Uint8Array(frame.data);
-    expect(enc[enc.length - 16]).toBe(1); // headerBytes field = actual header length
+    expect(enc[enc.length - 21]).toBe(1); // headerBytes field = actual header length (v3 -21)
 
     await receiver.decryptFrame(frame, 'sender-user-id');
     expect(new Uint8Array(frame.data)).toEqual(original);
@@ -745,5 +750,110 @@ describe('MediaEncryption — #1742 empty DTX frame passthrough', () => {
     expect(randomSpy).toHaveBeenCalledTimes(1);
     expect((randomSpy.mock.calls[0][0] as Uint8Array).byteLength).toBe(12);
     randomSpy.mockRestore();
+  });
+});
+
+describe('channel CSK rotation desync (#1878)', () => {
+  it('baseline: shared CSK round-trips', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    await sender.init(csk, 'alice');
+    const receiver = new MediaEncryption();
+    await receiver.addDecryptKey(csk, 'alice', 0);
+
+    const frame = fakeVideoFrame(200);
+    await sender.encryptFrame(frame);
+    await expect(receiver.decryptFrame(frame, 'alice')).resolves.toBeUndefined();
+  });
+
+  it('a CSK rotation is deterministic when the frame carries the version (#1878 fixed)', async () => {
+    const cskOld = await generateTestCSK();
+    const cskNew = await generateTestCSK();
+
+    const sender = new MediaEncryption();
+    sender.setKeyVersion(2); // sender re-based onto NEW CSK at version 2
+    await sender.init(cskNew, 'alice');
+
+    const receiver = new MediaEncryption();
+    // Receiver holds BOTH versions (v1 old + v2 new) — the 3-part map keeps them distinct.
+    await receiver.addDecryptKeyAtVersion(cskOld, 'alice', 1, 0);
+    await receiver.addDecryptKeyAtVersion(cskNew, 'alice', 2, 0);
+
+    const frame = fakeVideoFrame(200);
+    await sender.encryptFrame(frame);
+    // Frame stamps version 2 → receiver selects the v2 key deterministically.
+    await expect(receiver.decryptFrame(frame, 'alice')).resolves.toBeUndefined();
+  });
+});
+
+describe('frame crypto v3 (#1878)', () => {
+  it('round-trips a v3 frame carrying (keyVersion, keyId)', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    sender.setKeyVersion(7); // new API: bind encrypt keyVersion
+    await sender.init(csk, 'alice');
+    const receiver = new MediaEncryption();
+    await receiver.addDecryptKeyAtVersion(csk, 'alice', 7, 0); // new API: (csk, sender, version, keyId)
+
+    const frame = fakeVideoFrame(200);
+    await sender.encryptFrame(frame);
+    // trailer is now 21 bytes; magic still last 2
+    const bytes = new Uint8Array(frame.data);
+    expect(bytes.at(-1)).toBe(0xad);
+    expect(bytes.at(-2)).toBe(0xde);
+
+    await expect(receiver.decryptFrame(frame, 'alice')).resolves.toBeUndefined();
+  });
+
+  it('never decrypts a v(N) frame with a v(M) key (version isolation)', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    sender.setKeyVersion(2);
+    await sender.init(csk, 'alice');
+    const receiver = new MediaEncryption();
+    await receiver.addDecryptKeyAtVersion(csk, 'alice', 3, 0); // wrong version held
+
+    const frame = fakeVideoFrame(200);
+    await sender.encryptFrame(frame);
+    // Map key is senderId:2:0 (from frame); receiver holds senderId:3:0 → miss.
+    await expect(receiver.decryptFrame(frame, 'alice')).rejects.toThrow(/no decrypt key/);
+  });
+
+  it('keyVersion boundary: a large version (e.g. 65537) survives the 4-byte BE field', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    sender.setKeyVersion(65537);
+    await sender.init(csk, 'alice');
+    const receiver = new MediaEncryption();
+    await receiver.addDecryptKeyAtVersion(csk, 'alice', 65537, 0);
+    const frame = fakeVideoFrame(200);
+    await sender.encryptFrame(frame);
+    await expect(receiver.decryptFrame(frame, 'alice')).resolves.toBeUndefined();
+  });
+
+  it('a decrypt miss throws FrameKeyMissError with (keyVersion,keyId), not OperationError', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    sender.setKeyVersion(9);
+    await sender.init(csk, 'alice');
+    const receiver = new MediaEncryption(); // holds NO key
+    const frame = fakeVideoFrame(200);
+    await sender.encryptFrame(frame);
+
+    let caught: unknown;
+    try {
+      await receiver.decryptFrame(frame, 'alice');
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(FrameKeyMissError);
+    expect(caught).toMatchObject({
+      name: 'FrameKeyMissError',
+      senderUserId: 'alice',
+      keyVersion: 9,
+      keyId: 0,
+    });
+    // Message still contains "no decrypt key" so the existing regex tests pass.
+    expect((caught as Error).message).toMatch(/no decrypt key/);
   });
 });

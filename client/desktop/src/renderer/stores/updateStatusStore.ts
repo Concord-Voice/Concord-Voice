@@ -2,11 +2,17 @@ import { createStore } from '../utils/createStore';
 
 /**
  * State for critical update-channel errors that warrant a persistent
- * in-app banner (see UpdateSecurityBanner). Currently covers cert-pin
- * and publisher signature failures routed from the updater via the
- * `update:error` IPC channel. Per #658.
+ * in-app banner (see UpdateSecurityBanner). Covers cert-pin and publisher
+ * signature failures routed from the updater via the `update:error` IPC
+ * channel (#658), plus the media-frame crypto-version floor (#1878): when the
+ * media-plane rejects a voice join because the room negotiated a newer frame
+ * crypto version than this client can speak, the client is too old to join and
+ * must update — surfaced through the same "Download the latest" banner.
  */
-export type UpdateCriticalErrorSubtype = 'cert-pin-failure' | 'publisher-failure';
+export type UpdateCriticalErrorSubtype =
+  | 'cert-pin-failure'
+  | 'publisher-failure'
+  | 'media-crypto-version';
 
 export interface UpdateCriticalError {
   readonly subtype: UpdateCriticalErrorSubtype;

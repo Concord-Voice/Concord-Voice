@@ -4,7 +4,11 @@ import { createServer } from 'node:http';
 import { config } from './config/index.js';
 import { logger } from './lib/logger.js';
 import { MediasoupService } from './lib/mediasoup.js';
-import { parseMediaFrameCryptoVersion, RoomManager } from './lib/roomManager.js';
+import {
+  CryptoVersionMismatchError,
+  parseMediaFrameCryptoVersion,
+  RoomManager,
+} from './lib/roomManager.js';
 import type { MediaSource } from './lib/roomManager.js';
 import { MediaMetrics } from './lib/mediaMetrics.js';
 import { createAuthMiddleware, validateChannelAccess } from './middleware/auth.js';
@@ -22,6 +26,39 @@ const expectedKeyframeRequestErrors = new Set([
   'Requester not found',
   'Sender not found',
 ]);
+
+// #1878: extracted from the join-room handler's catch block so that handler
+// stays under the S3776 cognitive-complexity limit. Logs the failure and sends
+// the structured crypto_version_mismatch ack (so a lower-version client can
+// prompt "update required") or a generic failure ack to the client.
+function emitJoinError(
+  socket: Socket,
+  roomId: string,
+  userId: string,
+  error: unknown,
+  callback?: (payload: unknown) => void
+): void {
+  logger.error('Error joining room', {
+    error: error instanceof Error ? error.message : error,
+    stack: error instanceof Error ? error.stack : undefined,
+    roomId,
+    userId,
+  });
+  const errPayload =
+    error instanceof CryptoVersionMismatchError
+      ? {
+          error: error.message,
+          code: error.code,
+          roomVersion: error.roomVersion,
+          joinVersion: error.joinVersion,
+        }
+      : { error: 'Failed to join room' };
+  if (callback) {
+    callback(errPayload);
+    return;
+  }
+  socket.emit('error', errPayload);
+}
 
 function getKeyframeSenderUserId(payload: unknown): string | undefined {
   if (!payload || typeof payload !== 'object' || !('senderUserId' in payload)) {
@@ -243,135 +280,133 @@ async function main() {
     // ── join-room ────────────────────────────────────────────────────
     // Client sends: { roomId, rtpCapabilities, mediaFrameCryptoVersion }
     // Server responds with: room-joined event containing router caps, existing producers, participants
-    socket.on('join-room', async ({ roomId, rtpCapabilities, mediaFrameCryptoVersion }, callback?) => {
-      try {
-        const parsedMediaFrameCryptoVersion =
-          parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
+    socket.on(
+      'join-room',
+      async ({ roomId, rtpCapabilities, mediaFrameCryptoVersion }, callback?) => {
+        try {
+          const parsedMediaFrameCryptoVersion =
+            parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
 
-        // Validate channel access via control plane. Room kind is a
-        // routing hint from the renderer's Socket.IO handshake (per
-        // #1209 plan C1 + spec §6.5): 'channel' hits the server-channel
-        // voice-join endpoint; 'dm' hits the DM authorize endpoint
-        // (G7 defense-in-depth). Only the userId in `data` comes from
-        // the verified JWT (see createAuthMiddleware); the display
-        // fields (username/displayName/avatarUrl) currently flow from
-        // socket.handshake.auth and are a known client-supplied gap.
-        // room_kind is the same shape: a client-supplied routing hint
-        // that doesn't grant any privilege beyond which control-plane
-        // endpoint is consulted for authorization.
-        const token = socket.handshake.auth.token;
-        const roomKind: 'channel' | 'dm' =
-          socket.handshake.auth.room_kind === 'dm' ? 'dm' : 'channel';
-        const access = await validateChannelAccess(data.userId, roomId, token, roomKind);
+          // Validate channel access via control plane. Room kind is a
+          // routing hint from the renderer's Socket.IO handshake (per
+          // #1209 plan C1 + spec §6.5): 'channel' hits the server-channel
+          // voice-join endpoint; 'dm' hits the DM authorize endpoint
+          // (G7 defense-in-depth). Only the userId in `data` comes from
+          // the verified JWT (see createAuthMiddleware); the display
+          // fields (username/displayName/avatarUrl) currently flow from
+          // socket.handshake.auth and are a known client-supplied gap.
+          // room_kind is the same shape: a client-supplied routing hint
+          // that doesn't grant any privilege beyond which control-plane
+          // endpoint is consulted for authorization.
+          const token = socket.handshake.auth.token;
+          const roomKind: 'channel' | 'dm' =
+            socket.handshake.auth.room_kind === 'dm' ? 'dm' : 'channel';
+          const access = await validateChannelAccess(data.userId, roomId, token, roomKind);
 
-        if (!access.allowed) {
-          logger.warn('Channel access denied', {
-            userId: data.userId,
+          if (!access.allowed) {
+            logger.warn('Channel access denied', {
+              userId: data.userId,
+              roomId,
+              error: access.error,
+            });
+            const errPayload = { error: access.error || 'Access denied' };
+            if (callback) return callback(errPayload);
+            socket.emit('error', errPayload);
+            return;
+          }
+
+          logger.debug('Channel access validated', {
             roomId,
-            error: access.error,
+            userId: data.userId,
           });
-          const errPayload = { error: access.error || 'Access denied' };
-          if (callback) return callback(errPayload);
-          socket.emit('error', errPayload);
-          return;
-        }
 
-        logger.debug('Channel access validated', {
-          roomId,
-          userId: data.userId,
-        });
+          // Join the room via RoomManager. Thread the server-authoritative per-user
+          // media entitlement (#1300) parsed from the join-authorize response into
+          // the Participant — it caps THIS user's own send transport + mic produce
+          // (never sourced from socket.handshake.auth).
+          const result = await roomManager.joinRoom(
+            roomId,
+            data.userId,
+            socket.id,
+            {
+              username: data.username,
+              displayName: data.displayName,
+              avatarUrl: data.avatarUrl,
+            },
+            rtpCapabilities,
+            {
+              tier: access.userTier,
+              allowedAudioTiers: access.allowedAudioTiers,
+              minPtimeMs: access.minPtimeMs,
+              maxManualBitrateBps: access.maxManualBitrateBps,
+            },
+            parsedMediaFrameCryptoVersion
+          );
 
-        // Join the room via RoomManager. Thread the server-authoritative per-user
-        // media entitlement (#1300) parsed from the join-authorize response into
-        // the Participant — it caps THIS user's own send transport + mic produce
-        // (never sourced from socket.handshake.auth).
-        const result = await roomManager.joinRoom(
-          roomId,
-          data.userId,
-          socket.id,
-          {
+          // Apply server enforcement if the joining user has active enforcement
+          if (access.serverMuted) {
+            await roomManager.serverMuteUser(roomId, data.userId);
+            logger.info('Applied server-mute enforcement on join', { roomId, userId: data.userId });
+          }
+          if (access.serverDeafened) {
+            await roomManager.serverDeafenUser(roomId, data.userId);
+            logger.info('Applied server-deafen enforcement on join', {
+              roomId,
+              userId: data.userId,
+            });
+          }
+
+          // Join Socket.IO room for broadcasting
+          socket.join(roomId);
+          data.roomId = roomId;
+
+          // Notify others in the room
+          socket.to(roomId).emit('user-joined', {
+            userId: data.userId,
             username: data.username,
             displayName: data.displayName,
             avatarUrl: data.avatarUrl,
-          },
-          rtpCapabilities,
-          {
-            tier: access.userTier,
-            allowedAudioTiers: access.allowedAudioTiers,
-            minPtimeMs: access.minPtimeMs,
-            maxManualBitrateBps: access.maxManualBitrateBps,
-          },
-          parsedMediaFrameCryptoVersion
-        );
+            e2eeEpoch: result.e2eeEpoch,
+          });
 
-        // Apply server enforcement if the joining user has active enforcement
-        if (access.serverMuted) {
-          await roomManager.serverMuteUser(roomId, data.userId);
-          logger.info('Applied server-mute enforcement on join', { roomId, userId: data.userId });
+          // Respond to the joining client
+          const response = {
+            rtpCapabilities: result.rtpCapabilities,
+            mediaFrameCryptoVersion: result.mediaFrameCryptoVersion,
+            existingProducers: result.existingProducers,
+            participants: result.participants,
+            channelName: access.channelName,
+            e2eeEpoch: result.e2eeEpoch,
+          };
+
+          logger.info('Room join response', {
+            roomId,
+            userId: data.userId,
+            existingProducerCount: result.existingProducers.length,
+            participantCount: result.participants.length,
+          });
+
+          logger.debug('Room join existing producers', {
+            roomId,
+            userId: data.userId,
+            existingProducers: result.existingProducers.map((p) => ({
+              producerId: p.producerId,
+              userId: p.userId,
+              kind: p.kind,
+              source: p.source,
+            })),
+          });
+
+          if (callback) {
+            callback(response);
+          } else {
+            socket.emit('room-joined', response);
+          }
+        } catch (error) {
+          emitJoinError(socket, roomId, data.userId, error, callback);
         }
-        if (access.serverDeafened) {
-          await roomManager.serverDeafenUser(roomId, data.userId);
-          logger.info('Applied server-deafen enforcement on join', { roomId, userId: data.userId });
-        }
-
-        // Join Socket.IO room for broadcasting
-        socket.join(roomId);
-        data.roomId = roomId;
-
-        // Notify others in the room
-        socket.to(roomId).emit('user-joined', {
-          userId: data.userId,
-          username: data.username,
-          displayName: data.displayName,
-          avatarUrl: data.avatarUrl,
-          e2eeEpoch: result.e2eeEpoch,
-        });
-
-        // Respond to the joining client
-        const response = {
-          rtpCapabilities: result.rtpCapabilities,
-          mediaFrameCryptoVersion: result.mediaFrameCryptoVersion,
-          existingProducers: result.existingProducers,
-          participants: result.participants,
-          channelName: access.channelName,
-          e2eeEpoch: result.e2eeEpoch,
-        };
-
-        logger.info('Room join response', {
-          roomId,
-          userId: data.userId,
-          existingProducerCount: result.existingProducers.length,
-          participantCount: result.participants.length,
-        });
-
-        logger.debug('Room join existing producers', {
-          roomId,
-          userId: data.userId,
-          existingProducers: result.existingProducers.map((p) => ({
-            producerId: p.producerId,
-            userId: p.userId,
-            kind: p.kind,
-            source: p.source,
-          })),
-        });
-
-        if (callback) {
-          callback(response);
-        } else {
-          socket.emit('room-joined', response);
-        }
-      } catch (error) {
-        logger.error('Error joining room', {
-          error: error instanceof Error ? error.message : error,
-          stack: error instanceof Error ? error.stack : undefined,
-          roomId,
-          userId: data.userId,
-        });
-        const errPayload = { error: 'Failed to join room' };
-        if (callback) return callback(errPayload);
-        socket.emit('error', errPayload);
       }
-    });
+    );
 
     // ── update-rtp-capabilities ─────────────────────────────────────
     // Client sends this after device.load() to provide its actual RTP capabilities

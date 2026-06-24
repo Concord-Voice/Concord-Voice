@@ -170,8 +170,42 @@ export const SCREEN_PRODUCER_CAP = 5;
 /** Per-sender keyframe request cooldown; mirrors the client-side E2EE recovery cooldown. */
 export const KEYFRAME_REQUEST_COOLDOWN_MS = 5000;
 
-/** AES-256-GCM media-frame format. v1 was the legacy AES-128-GCM frame key. */
-export const SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION = 2;
+/**
+ * AES-256-GCM media-frame format advertised by clients at join time.
+ * v1 was the legacy AES-128-GCM frame key; v2 keyed only by the ratchet keyId;
+ * v3 (#1878) additionally stamps the channel-key version into the frame trailer
+ * so decryption is deterministic across mid-session CSK rotations. v3 is the
+ * current target version — the room ratchets UP to the MAX advertised version.
+ */
+export const SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION = 3;
+
+/**
+ * Versions accepted at the admission gate during the v2→v3 rollout window
+ * (#1878). v2 is tolerated so already-running v2 clients can keep joining while
+ * the fleet upgrades; DROP 2 from this set post-rollout (follow-up) so the gate
+ * hard-requires v3. v1 (legacy AES-128) is permanently rejected.
+ */
+const ACCEPTED_MEDIA_FRAME_CRYPTO_VERSIONS = new Set<number>([2, 3]);
+
+/**
+ * Thrown when a participant advertises a media-frame crypto version strictly
+ * LOWER than the room's already-negotiated version (#1878, OQ-1). The room
+ * version is the MAX of advertised versions (higher-version-wins): a higher
+ * joiner ratchets the room up; an equal joiner is allowed; a lower joiner is
+ * rejected with this typed error so the Socket.IO handler can return an
+ * actionable `crypto_version_mismatch` ack and the client can prompt "update
+ * required" instead of surfacing a generic join failure.
+ */
+export class CryptoVersionMismatchError extends Error {
+  readonly code = 'crypto_version_mismatch' as const;
+  constructor(
+    public readonly roomVersion: number,
+    public readonly joinVersion: number
+  ) {
+    super(`Media frame crypto version mismatch: room=${roomVersion}, join=${joinVersion}`);
+    this.name = 'CryptoVersionMismatchError';
+  }
+}
 
 function formatMediaFrameCryptoVersion(value: unknown): string {
   if (value === undefined) return 'missing';
@@ -189,10 +223,11 @@ function formatMediaFrameCryptoVersion(value: unknown): string {
 }
 
 export function parseMediaFrameCryptoVersion(value: unknown): number {
-  if (value !== SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION) {
+  if (typeof value !== 'number' || !ACCEPTED_MEDIA_FRAME_CRYPTO_VERSIONS.has(value)) {
     const received = formatMediaFrameCryptoVersion(value);
+    const accepted = [...ACCEPTED_MEDIA_FRAME_CRYPTO_VERSIONS].join(', ');
     throw new Error(
-      `Unsupported media frame crypto version ${received}; expected ${SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION}`
+      `Unsupported media frame crypto version ${received}; expected one of ${accepted}`
     );
   }
   return value;
@@ -517,15 +552,34 @@ export class RoomManager {
       await this.leaveRoom(roomId, userId);
       // Room may have been closed if user was the only participant — re-create
       room = await this.getOrCreateRoom(roomId);
+      // NOTE: the crypto-version gate below runs AFTER this teardown. A reconnect
+      // that DOWNGRADES the user's crypto version (lower than the room's) is
+      // rejected at the gate — so the user's stale session is fully cleaned up
+      // here (no leak) and they are then ejected+rejected. That is intentional:
+      // a downgraded client must update to rejoin (the gate is the authority).
     }
 
+    // Media-frame crypto-version admission gate (#1878, OQ-1: higher-version-wins).
+    // The room version is the MAX of advertised versions:
+    //   - empty room  → seed with the joiner's version.
+    //   - joiner > room → ratchet the room UP to the joiner's version.
+    //   - joiner < room → reject with a typed CryptoVersionMismatchError so the
+    //     Socket.IO handler can return an actionable `crypto_version_mismatch`
+    //     ack (client → "update required") rather than a generic join failure.
+    //   - joiner == room → allow.
+    // This runs BEFORE participant storage and the e2eeEpoch++ below — do NOT
+    // move it past either (see [internal]rules/media-plane.md admission-gate rule).
     if (room.mediaFrameCryptoVersion === null) {
       room.mediaFrameCryptoVersion = parsedMediaFrameCryptoVersion;
-    } else if (room.mediaFrameCryptoVersion !== parsedMediaFrameCryptoVersion) {
-      throw new Error(
-        `Media frame crypto version mismatch: room=${room.mediaFrameCryptoVersion}, join=${parsedMediaFrameCryptoVersion}`
+    } else if (parsedMediaFrameCryptoVersion > room.mediaFrameCryptoVersion) {
+      room.mediaFrameCryptoVersion = parsedMediaFrameCryptoVersion;
+    } else if (parsedMediaFrameCryptoVersion < room.mediaFrameCryptoVersion) {
+      throw new CryptoVersionMismatchError(
+        room.mediaFrameCryptoVersion,
+        parsedMediaFrameCryptoVersion
       );
     }
+    // equal → allow (fall through)
 
     // Per-user media caps (#1300): from the parsed control-plane entitlement,
     // or the fail-closed free floor for pre-#1300 callers. Copy the tiers array
@@ -557,7 +611,11 @@ export class RoomManager {
 
     room.participants.set(userId, participant);
 
-    // E2EE epoch tracking: increment epoch on every join (forward secrecy)
+    // E2EE media-epoch (keyId) sync nudge — incremented on every join so
+    // receivers ratchet their per-frame keyId in lockstep. NOT a forward-secrecy
+    // boundary: the access boundary is the channel-key version (key_version) the
+    // frame now carries (#1878, Decision B). Inter-version forward secrecy lives
+    // in the CSK rotation/re-wrap on membership change, not here.
     room.e2eeEpoch++;
 
     logger.info('Participant joined room', {
@@ -629,7 +687,10 @@ export class RoomManager {
       this.recomputeCameraLayeringGate(room);
     }
 
-    // E2EE: increment epoch on leave (forward secrecy)
+    // E2EE media-epoch (keyId) sync nudge — incremented on leave for the same
+    // lockstep-ratchet reason as the join site above; NOT a forward-secrecy
+    // boundary (#1878, Decision B). Forward secrecy on membership change is the
+    // CSK rotation/re-wrap, not this counter.
     room.e2eeEpoch++;
 
     logger.info('Participant left room', {

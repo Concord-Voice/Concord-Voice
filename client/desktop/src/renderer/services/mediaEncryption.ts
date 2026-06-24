@@ -8,13 +8,15 @@
  * Key derivation:
  *   frameKey = HKDF-SHA256(channelCSK, salt="concord-voice-e2ee", info=senderUserId)
  *
- * Frame format (encrypted):
- *   [unencrypted header (1–10 bytes)][AES-GCM ciphertext + 16-byte auth tag][1-byte headerBytes][1-byte keyId][12-byte IV][0xDE 0xAD magic]
+ * Frame format (encrypted, v3 — #1878):
+ *   [unencrypted header (1–10 bytes)][AES-GCM ciphertext + 16-byte auth tag][1-byte headerBytes][2-byte keyId BE][4-byte keyVersion BE][12-byte IV][0xDE 0xAD magic]
  *
- * Trailer (16 bytes total): headerBytes + keyId + IV + magic.
+ * Trailer (21 bytes total): headerBytes + keyId + keyVersion + IV + magic.
  * The headerBytes field tells the receiver how many leading bytes were left
  * unencrypted, so the split point is self-describing and robust against
- * frame misrouting between consumers in a BUNDLE group.
+ * frame misrouting between consumers in a BUNDLE group. The keyVersion field
+ * carries the channel-key (CSK) version so receivers derive the exact key a
+ * frame needs across mid-session CSK rotations — no lockstep epoch counter.
  *
  * AES-GCM is used WITHOUT additionalData (no AAD). This is intentional:
  * Chromium's SDP BUNDLE can produce payload_type collisions that misroute
@@ -47,10 +49,14 @@ const RATCHET_INFO = new TextEncoder().encode('concord-e2ee-ratchet');
 const MAGIC_0 = 0xde;
 const MAGIC_1 = 0xad;
 // Media-frame crypto format advertised to the SFU at join time. v1 was the
-// legacy AES-128-GCM frame key; v2 is AES-256-GCM and must not mix in a room.
-export const MEDIA_E2EE_FRAME_CRYPTO_VERSION = 2;
-// Total trailer size: 1-byte headerBytes + 1-byte keyId + 12-byte IV + 2-byte magic = 16
-const TRAILER_SIZE = 16;
+// legacy AES-128-GCM frame key; v2 was AES-256-GCM keyed only by ratchet keyId;
+// v3 additionally stamps the channel-key version so decryption is deterministic
+// across mid-session CSK rotations (#1878).
+export const MEDIA_E2EE_FRAME_CRYPTO_VERSION = 3;
+// v3 trailer: 1B headerBytes + 2B keyId(BE) + 4B keyVersion(BE) + 12B IV + 2B magic = 21
+const TRAILER_SIZE_V3 = 21;
+// Minimum encrypted frame: 1 header byte + 16-byte GCM tag (empty plaintext) + trailer.
+const MIN_GCM_OVERHEAD = 17;
 
 // Reference: ideal unencrypted header bytes per codec (not used directly —
 // getUnencryptedBytes() uses static 1/2 for sender/receiver agreement safety).
@@ -128,14 +134,50 @@ export async function ratchetKey(currentKey: CryptoKey): Promise<CryptoKey> {
 }
 
 // ---------------------------------------------------------------------------
+// FrameKeyMissError
+// ---------------------------------------------------------------------------
+
+/**
+ * #1878: thrown when `decryptFrame` has no key for the frame's exact
+ * (senderUserId, keyVersion, keyId) and cannot ratchet to it. Distinct from a
+ * WebCrypto `OperationError` (GCM auth failure on a wrong-base key) so the
+ * worker can route a typed miss to on-demand key provisioning (`requestFrameKey`)
+ * while leaving the OperationError/persistent-failure self-heal path untouched.
+ * The message still contains "no decrypt key" so existing regex assertions hold.
+ */
+export class FrameKeyMissError extends Error {
+  override name = 'FrameKeyMissError';
+  constructor(
+    public senderUserId: string,
+    public keyVersion: number,
+    public keyId: number,
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // MediaEncryption class
 // ---------------------------------------------------------------------------
 
 export class MediaEncryption {
   private currentKeyId = 0;
+  // #1878: the channel-key (CSK) version bound to the encrypt key. Stamped into
+  // every outgoing frame's v3 trailer so receivers select the exact key.
+  private currentKeyVersion = 0;
   private encryptKey: CryptoKey | null = null;
   private readonly decryptKeys: Map<string, { key: CryptoKey; expires: number }> = new Map();
   private rotationChain: Promise<void> = Promise.resolve();
+
+  /**
+   * Compose the decrypt-key map key. #1878: keyed by senderId:keyVersion:keyId
+   * (was senderId:keyId — collided across CSK versions). Sender userIds are
+   * UUIDs (no embedded colons), so the 3-part split is unambiguous.
+   */
+  private static mapKey(senderUserId: string, keyVersion: number, keyId: number): string {
+    return `${senderUserId}:${keyVersion}:${keyId}`;
+  }
 
   // Debounced key rotation — collapses rapid join/leave bursts into a single
   // rotation to avoid O(N²) HKDF cost when many users join simultaneously.
@@ -162,42 +204,82 @@ export class MediaEncryption {
     this.currentKeyId = keyId;
   }
 
-  /** Add a pre-derived decrypt key directly (used by Worker) */
+  /** Bind the encrypt key's channel-key version (the authoritative CSK version). */
+  setKeyVersion(keyVersion: number): void {
+    this.currentKeyVersion = keyVersion;
+  }
+
+  getKeyVersion(): number {
+    return this.currentKeyVersion;
+  }
+
+  /**
+   * Legacy 2-arg worker-path adder — defaults keyVersion to the encrypt
+   * version. Thin wrapper over addDecryptKeyDirectV3; remaining call sites
+   * pass version explicitly in a later task (#1878 Task 5).
+   */
   addDecryptKeyDirect(senderUserId: string, keyId: number, key: CryptoKey): void {
-    this.decryptKeys.set(`${senderUserId}:${keyId}`, {
+    this.addDecryptKeyDirectV3(senderUserId, this.currentKeyVersion, keyId, key);
+  }
+
+  /** Worker-path: add a pre-derived decrypt key at an explicit (version, keyId). */
+  addDecryptKeyDirectV3(
+    senderUserId: string,
+    keyVersion: number,
+    keyId: number,
+    key: CryptoKey
+  ): void {
+    this.decryptKeys.set(MediaEncryption.mapKey(senderUserId, keyVersion, keyId), {
       key,
       expires: Date.now() + 3_600_000,
     });
   }
 
-  /** Add a decryption key for a remote sender */
+  /**
+   * Legacy 2-arg adder — defaults keyVersion to the encrypt version. Thin
+   * wrapper over addDecryptKeyAtVersion (#1878 Task 5 removes remaining
+   * version-blind call sites).
+   */
   async addDecryptKey(channelCSK: CryptoKey, senderUserId: string, keyId = 0): Promise<CryptoKey> {
-    const key = await deriveFrameKey(channelCSK, senderUserId);
-    this.decryptKeys.set(`${senderUserId}:${keyId}`, {
-      key,
-      expires: Date.now() + 3_600_000, // 1 hour
-    });
-    return key;
+    return this.addDecryptKeyAtVersion(channelCSK, senderUserId, this.currentKeyVersion, keyId);
   }
 
   /**
-   * Add a decryption key for a remote sender, pre-ratcheted to a target epoch.
-   * Avoids the expensive per-frame self-healing ratchet when a decrypt key is
-   * added mid-session (e.g., during tuneIn or late new-producer events).
+   * Legacy adder pre-ratcheted to a target epoch — defaults keyVersion to the
+   * encrypt version. Thin wrapper over addDecryptKeyAtVersion.
    */
   async addDecryptKeyAtEpoch(
     channelCSK: CryptoKey,
     senderUserId: string,
     targetEpoch: number
   ): Promise<CryptoKey> {
-    if (targetEpoch > 100) {
-      throw new Error('E2EE epoch gap too large (' + targetEpoch + '), rejoin required');
+    return this.addDecryptKeyAtVersion(
+      channelCSK,
+      senderUserId,
+      this.currentKeyVersion,
+      targetEpoch
+    );
+  }
+
+  /**
+   * Main-path: derive + ratchet a decrypt key for an explicit (version, keyId).
+   * Avoids the expensive per-frame self-healing ratchet when a decrypt key is
+   * added mid-session (e.g., during tuneIn or late new-producer events).
+   */
+  async addDecryptKeyAtVersion(
+    channelCSK: CryptoKey,
+    senderUserId: string,
+    keyVersion: number,
+    keyId = 0
+  ): Promise<CryptoKey> {
+    if (keyId > 100) {
+      throw new Error('E2EE epoch gap too large (' + keyId + '), rejoin required');
     }
     let key = await deriveFrameKey(channelCSK, senderUserId);
-    for (let i = 0; i < targetEpoch; i++) {
+    for (let i = 0; i < keyId; i++) {
       key = await ratchetKey(key);
     }
-    this.decryptKeys.set(`${senderUserId}:${targetEpoch}`, {
+    this.decryptKeys.set(MediaEncryption.mapKey(senderUserId, keyVersion, keyId), {
       key,
       expires: Date.now() + 3_600_000,
     });
@@ -229,20 +311,33 @@ export class MediaEncryption {
     // sync with senders.  Without this, decrypt keys stay at keyId 0 while
     // senders advance on every join/leave, causing "No decrypt key" errors
     // once the gap exceeds the self-healing ratchet limit.
-    const toRatchet: { senderUserId: string; entry: { key: CryptoKey; expires: number } }[] = [];
+    // #1878: the map key is now senderId:keyVersion:keyId (3-part). Match the
+    // keyId field by parsing, not endsWith(':oldKeyId') — and re-insert at the
+    // SAME keyVersion so each version's ratchet chain stays independent.
+    const toRatchet: {
+      senderUserId: string;
+      keyVersion: number;
+      entry: { key: CryptoKey; expires: number };
+    }[] = [];
     for (const [id, entry] of this.decryptKeys) {
-      if (id.endsWith(`:${oldKeyId}`)) {
-        const senderUserId = id.slice(0, id.lastIndexOf(':'));
-        toRatchet.push({ senderUserId, entry });
+      const parts = id.split(':');
+      if (parts.length !== 3) continue; // sender UUIDs have no colons
+      const [senderUserId, ver, kid] = parts;
+      if (Number(kid) === oldKeyId) {
+        toRatchet.push({ senderUserId, keyVersion: Number(ver), entry });
       }
     }
-    for (const { senderUserId, entry } of toRatchet) {
+    for (const { senderUserId, keyVersion, entry } of toRatchet) {
       const newKey = await ratchetKey(entry.key);
-      this.decryptKeys.set(`${senderUserId}:${newKeyId}`, {
+      this.decryptKeys.set(MediaEncryption.mapKey(senderUserId, keyVersion, newKeyId), {
         key: newKey,
         expires: Date.now() + 3_600_000,
       });
-      // Expire the old key after overlap window
+      // Keep the old keyId for a 10s overlap so in-flight frames from before the
+      // ratchet still decrypt. This is a delivery-overlap window, NOT a forward-
+      // secrecy boundary (intra-version FS is intentionally dropped — #1878
+      // Decision B; FS is enforced by CSK key_version rotation on membership
+      // change).
       entry.expires = Date.now() + 10_000;
     }
 
@@ -318,17 +413,17 @@ export class MediaEncryption {
     const data = new Uint8Array(frame.data);
 
     // #1742 root cause: an empty (0-byte) DTX frame would otherwise encrypt to
-    // exactly 32 bytes (0-byte header + 16-byte GCM tag over an empty payload +
-    // 16-byte trailer). The decrypt side's "too small to be encrypted" guard is
-    // `length < TRAILER_SIZE + 17` (< 33), so that 32-byte frame is
-    // misclassified as unencrypted and fed to the Opus decoder UNDECIPHERED —
-    // the receiver-side garble-during-silence (confirmed via two-client capture
-    // 2026-06-22: 68-81% of frames passed through at size:32). An empty frame
-    // carries no audio content, so pass it through unchanged: it stays 0 bytes
-    // end-to-end and the decoder treats it as DTX silence, symmetric with the
-    // decrypt passthrough. Do NOT instead lower the decrypt threshold — a
-    // 32-byte frame then fails the small-cipher guard with a mismatched header,
-    // and the garble merely moves to a different branch.
+    // a small fixed blob (0-byte header + 16-byte GCM tag over an empty payload
+    // + trailer) that falls just below the decrypt side's "too small to be
+    // encrypted" guard (`length < TRAILER_SIZE_V3 + MIN_GCM_OVERHEAD`). Such a
+    // frame would be misclassified as unencrypted and fed to the Opus decoder
+    // UNDECIPHERED — the receiver-side garble-during-silence (originally
+    // confirmed via two-client capture 2026-06-22 under the v2 trailer). An
+    // empty frame carries no audio content, so pass it through unchanged: it
+    // stays 0 bytes end-to-end and the decoder treats it as DTX silence,
+    // symmetric with the decrypt passthrough. Do NOT instead lower the decrypt
+    // threshold — the blob would then fail the small-cipher guard with a
+    // mismatched header, and the garble merely moves to a different branch.
     if (data.length === 0) return;
 
     // Determine unencrypted header bytes based on frame type.
@@ -349,10 +444,12 @@ export class MediaEncryption {
     // which would cause an AAD mismatch if we authenticated the header).
     const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, encryptKey, payload);
 
-    // Compose: [header][ciphertext + 16-byte tag][1-byte headerBytes][1-byte keyId][12-byte IV][2-byte magic]
-    const result = new Uint8Array(header.length + ciphertext.byteLength + 1 + 1 + 12 + 2);
+    // Compose v3 trailer: [headerBytes:1][keyId:2 BE][keyVersion:4 BE][IV:12][magic:2]
+    const keyVersion = this.currentKeyVersion;
+    const result = new Uint8Array(header.length + ciphertext.byteLength + TRAILER_SIZE_V3);
     result.set(header);
     result.set(new Uint8Array(ciphertext), header.length);
+    const view = new DataView(result.buffer);
     let offset = header.length + ciphertext.byteLength;
     // Encode the ACTUAL header length, not the static getUnencryptedBytes()
     // value. They are equal for every real frame (data.length >= headerBytes),
@@ -361,11 +458,13 @@ export class MediaEncryption {
     // static value would make the decrypt header/ciphertext split overrun into
     // the trailer (#1742 latent video boundary, H5). The 0-byte case is already
     // handled by the early return above; this closes the residual sub-header case.
-    result[offset] = header.length;
+    result[offset] = header.length; // headerBytes (1)
     offset += 1;
-    result[offset] = keyId;
-    offset += 1;
-    result.set(iv, offset);
+    view.setUint16(offset, keyId & 0xffff, false); // keyId (2, BE)
+    offset += 2;
+    view.setUint32(offset, keyVersion >>> 0, false); // keyVersion (4, BE)
+    offset += 4;
+    result.set(iv, offset); // IV (12)
     offset += 12;
     result[offset] = MAGIC_0;
     result[offset + 1] = MAGIC_1;
@@ -381,16 +480,24 @@ export class MediaEncryption {
    */
   private async deriveRatchetedKey(
     senderUserId: string,
+    keyVersion: number,
     targetKeyId: number
   ): Promise<{ key: CryptoKey; expires: number } | null> {
     let bestKeyId = -1;
     let bestEntry: { key: CryptoKey; expires: number } | null = null;
 
+    // #1878: parse the 3-part key (senderId:keyVersion:keyId) by field, never
+    // positional index — and ONLY ratchet entries of the SAME keyVersion. A
+    // v(M) key must never ratchet toward a v(N) target.
     for (const [id, entry] of this.decryptKeys) {
-      if (!id.startsWith(`${senderUserId}:`)) continue;
-      const kid = Number.parseInt(id.split(':')[1], 10);
-      if (kid < targetKeyId && kid > bestKeyId) {
-        bestKeyId = kid;
+      const parts = id.split(':');
+      if (parts.length !== 3) continue; // sender UUIDs have no colons
+      const [sid, ver, kid] = parts;
+      if (sid !== senderUserId) continue;
+      if (Number(ver) !== keyVersion) continue;
+      const kidNum = Number.parseInt(kid, 10);
+      if (kidNum < targetKeyId && kidNum > bestKeyId) {
+        bestKeyId = kidNum;
         bestEntry = entry;
       }
     }
@@ -403,13 +510,15 @@ export class MediaEncryption {
     let currentKey = bestEntry.key;
     for (let i = bestKeyId; i < targetKeyId; i++) {
       currentKey = await ratchetKey(currentKey);
-      this.decryptKeys.set(`${senderUserId}:${i + 1}`, {
+      this.decryptKeys.set(MediaEncryption.mapKey(senderUserId, keyVersion, i + 1), {
         key: currentKey,
         expires: Date.now() + 3_600_000,
       });
     }
 
-    return this.decryptKeys.get(`${senderUserId}:${targetKeyId}`) ?? null;
+    return (
+      this.decryptKeys.get(MediaEncryption.mapKey(senderUserId, keyVersion, targetKeyId)) ?? null
+    );
   }
 
   /**
@@ -437,54 +546,60 @@ export class MediaEncryption {
       throw new Error('E2EE: unencrypted media frame received');
     }
 
-    // Minimum: 1 header + 16 GCM tag + 16 trailer = 33 bytes
-    if (data.length < TRAILER_SIZE + 17) {
+    // Minimum: 1 header + 16 GCM tag + 21 trailer (derive from the constant).
+    if (data.length < TRAILER_SIZE_V3 + MIN_GCM_OVERHEAD) {
       throw new Error('E2EE: malformed encrypted frame too small');
     }
 
-    // Extract components from the trailer (before magic bytes).
-    // The length guard above (data.length < TRAILER_SIZE + 17) ensures indices
-    // -15 and -16 are in-bounds, but Uint8Array.at() still returns T|undefined
-    // at the type level — narrow explicitly rather than assert non-null.
-    const iv = data.slice(-14, -2);
-    const keyId = data.at(-15);
-    const headerBytes = data.at(-16); // Sender-encoded header byte count
-    if (keyId === undefined || headerBytes === undefined) {
-      // Unreachable in practice: the length guard above (data.length >=
-      // TRAILER_SIZE + 17 = 33) mathematically guarantees indices -15 and
-      // -16 are defined. If we ever reach here, the guard was weakened or
-      // the data was mutated mid-function — either way the frame is
-      // corrupted and silent-passthrough would hide a real invariant bug.
-      // The magic-trailer check above already identified this as our frame.
+    // v3 trailer offsets from end: magic[-2,-1], IV[-14,-3],
+    // keyVersion[-18,-15] (4B BE), keyId[-20,-19] (2B BE), headerBytes[-21].
+    // The length guard above mathematically guarantees these indices are
+    // in-bounds; DataView reads still need an explicit narrow on headerBytes.
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const n = data.length;
+    const iv = data.slice(n - 14, n - 2);
+    const keyVersion = view.getUint32(n - 18, false);
+    const keyId = view.getUint16(n - 20, false);
+    const headerBytes = data.at(n - 21); // Sender-encoded header byte count
+    if (headerBytes === undefined) {
+      // Unreachable in practice: the length guard above guarantees index -21 is
+      // defined. If we ever reach here, the guard was weakened or the data was
+      // mutated mid-function — either way the frame is corrupted and
+      // silent-passthrough would hide a real invariant bug. The magic-trailer
+      // check above already identified this as our frame.
       throw new Error(
-        'mediaEncryption: decrypt invariant violated — at(-15/-16) undefined despite length guard'
+        'mediaEncryption: decrypt invariant violated — headerBytes undefined despite length guard'
       );
     }
 
     // Sanity check: headerBytes should be 1-10
-    if (headerBytes < 1 || headerBytes > 10 || headerBytes >= data.length - TRAILER_SIZE) {
+    if (headerBytes < 1 || headerBytes > 10 || headerBytes >= data.length - TRAILER_SIZE_V3) {
       throw new Error('E2EE: malformed encrypted frame trailer');
     }
 
     const header = data.slice(0, headerBytes);
-    const ciphertext = data.slice(headerBytes, data.length - TRAILER_SIZE);
+    const ciphertext = data.slice(headerBytes, data.length - TRAILER_SIZE_V3);
 
     // AES-GCM ciphertext must be at least 16 bytes (the auth tag alone)
     if (ciphertext.byteLength < 16) {
       throw new Error('E2EE: malformed encrypted frame ciphertext');
     }
 
-    // Find the right decryption key, ratcheting forward if needed
-    let keyEntry = this.decryptKeys.get(`${senderUserId}:${keyId}`);
-    keyEntry ??= (await this.deriveRatchetedKey(senderUserId, keyId)) ?? undefined;
+    // Find the right decryption key, ratcheting forward if needed. #1878: the
+    // map key is senderId:keyVersion:keyId, both read straight from the frame.
+    let keyEntry = this.decryptKeys.get(MediaEncryption.mapKey(senderUserId, keyVersion, keyId));
+    keyEntry ??= (await this.deriveRatchetedKey(senderUserId, keyVersion, keyId)) ?? undefined;
     if (!keyEntry) {
       // Count available keys for this sender (avoid full iteration in hot path)
       let availableCount = 0;
       for (const id of this.decryptKeys.keys()) {
         if (id.startsWith(`${senderUserId}:`)) availableCount++;
       }
-      throw new Error(
-        `E2EE: no decrypt key for sender=${senderUserId} keyId=${keyId} (${availableCount} keys held for sender)`
+      throw new FrameKeyMissError(
+        senderUserId,
+        keyVersion,
+        keyId,
+        `E2EE: no decrypt key for sender=${senderUserId} v=${keyVersion} keyId=${keyId} (${availableCount} keys held for sender)`
       );
     }
 

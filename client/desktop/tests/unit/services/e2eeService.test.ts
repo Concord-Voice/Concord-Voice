@@ -656,4 +656,280 @@ describe('e2eeService', () => {
       expect(mockApiFetch).toHaveBeenCalledTimes(4);
     });
   });
+
+  describe('getChannelKeyByVersion in-flight dedup (#1878)', () => {
+    beforeEach(async () => {
+      e2eeService.clearKeys();
+      (e2eeService as unknown as { rateLimitedUntil: number }).rateLimitedUntil = 0;
+      vi.clearAllMocks();
+      regKeys = await generateRegistrationKeys(testPassword);
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+    });
+
+    const okKeyResponse = (wrappedKey: string, keyVersion: number) =>
+      ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: () =>
+          Promise.resolve({
+            key: { wrapped_key: wrappedKey, key_version: keyVersion },
+            kind: 'channel',
+          }),
+      }) as unknown as Response;
+
+    it('concurrent callers for the same (channel, version) share one network fetch', async () => {
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+
+      // A slow, single-resolution fetch so both callers overlap on the in-flight promise.
+      mockApiFetch.mockImplementation(
+        () =>
+          new Promise<Response>((resolve) =>
+            setTimeout(() => resolve(okKeyResponse(wrappedForUser, 5)), 10)
+          )
+      );
+
+      const [a, b] = await Promise.all([
+        e2eeService.getChannelKeyByVersion('chan-1', 5),
+        e2eeService.getChannelKeyByVersion('chan-1', 5),
+      ]);
+
+      expect(a).toBeInstanceOf(CryptoKey);
+      expect(b).toBeInstanceOf(CryptoKey);
+      // Only ONE network request, and it carried version=5.
+      const versionedCalls = mockApiFetch.mock.calls.filter((c) =>
+        String(c[0]).includes('version=5')
+      );
+      expect(versionedCalls.length).toBe(1);
+    });
+
+    it('does not collide with getChannelKey bare-channelId in-flight entries', async () => {
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+
+      // getChannelKey returns version 1; getChannelKeyByVersion fetches version 5.
+      mockApiFetch.mockImplementation((url: unknown) => {
+        const wrapVer = String(url).includes('version=5') ? 5 : 1;
+        return Promise.resolve(okKeyResponse(wrappedForUser, wrapVer));
+      });
+
+      const [bare, versioned] = await Promise.all([
+        e2eeService.getChannelKey('chan-collide'),
+        e2eeService.getChannelKeyByVersion('chan-collide', 5),
+      ]);
+
+      expect(bare).toBeInstanceOf(CryptoKey);
+      expect(versioned).toBeInstanceOf(CryptoKey);
+      // Two distinct fetches — the compound dedup key must NOT swallow the bare fetch.
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('a cache hit does not allocate an in-flight dedup promise', async () => {
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      mockApiFetch.mockResolvedValue(okKeyResponse(wrappedForUser, 5));
+
+      // Warm the versioned cache.
+      await e2eeService.getChannelKeyByVersion('chan-2', 5);
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+
+      // Second call hits cache; no new fetch, and no lingering pending entry.
+      await e2eeService.getChannelKeyByVersion('chan-2', 5);
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+
+      const pending = (e2eeService as unknown as { pendingKeyFetches: Map<string, unknown> })
+        .pendingKeyFetches;
+      expect(pending.has('chan-2:v5')).toBe(false);
+    });
+  });
+
+  describe('e2ee-key-rotation emitter (#1878)', () => {
+    beforeEach(async () => {
+      e2eeService.clearKeys();
+      (e2eeService as unknown as { rateLimitedUntil: number }).rateLimitedUntil = 0;
+      vi.clearAllMocks();
+      regKeys = await generateRegistrationKeys(testPassword);
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+    });
+
+    const okKeyResponse = (wrappedKey: string, keyVersion: number) =>
+      ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: () =>
+          Promise.resolve({
+            key: { wrapped_key: wrappedKey, key_version: keyVersion },
+            kind: 'channel',
+          }),
+      }) as unknown as Response;
+
+    it('fires once with {channelId, keyVersion} when a strictly-higher version is cached', async () => {
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      mockApiFetch.mockImplementation((url: unknown) => {
+        const m = /version=(\d+)/.exec(String(url));
+        const ver = m ? Number(m[1]) : 1;
+        return Promise.resolve(okKeyResponse(wrappedForUser, ver));
+      });
+
+      const events: Array<{ channelId: string; keyVersion: number }> = [];
+      const off = e2eeService.onKeyRotation((e) => events.push(e));
+
+      await e2eeService.getChannelKeyByVersion('chan-1', 5); // first observe v5 → no fire (first-ever)
+      await e2eeService.getChannelKeyByVersion('chan-1', 6); // strictly higher → fires
+      await e2eeService.getChannelKeyByVersion('chan-1', 6); // same → no fire
+      off();
+
+      expect(events).toEqual([{ channelId: 'chan-1', keyVersion: 6 }]);
+    });
+
+    it('still fires after invalidateChannelKey when a real rotation re-observes a higher version (#1885 regression)', async () => {
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      mockApiFetch.mockImplementation((url: unknown) => {
+        const m = /version=(\d+)/.exec(String(url));
+        const ver = m ? Number(m[1]) : 1;
+        return Promise.resolve(okKeyResponse(wrappedForUser, ver));
+      });
+
+      const events: Array<{ channelId: string; keyVersion: number }> = [];
+      const off = e2eeService.onKeyRotation((e) => events.push(e));
+
+      // Observe the baseline version.
+      await e2eeService.getChannelKeyByVersion('chan-1', 5); // first-ever → no fire
+
+      // Simulate the real CSK-rotation path: the WS/recovery handler busts the
+      // cache via invalidateChannelKey BEFORE the new version is re-fetched.
+      e2eeService.invalidateChannelKey('chan-1');
+
+      // The post-invalidate refetch observes the NEW, higher version. This MUST
+      // fire onKeyRotation — otherwise the sender never re-bases (the #1878 bug
+      // Gitar + e2ee-reviewer caught on PR #1885: deleting the baseline inside
+      // invalidateChannelKey suppressed this fire). The cache-bust must not
+      // erase the rotation baseline.
+      await e2eeService.getChannelKeyByVersion('chan-1', 6); // higher → MUST fire
+      off();
+
+      expect(events).toEqual([{ channelId: 'chan-1', keyVersion: 6 }]);
+    });
+
+    it('does not fire when invalidateChannelKey is followed by a same-version refetch', async () => {
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      mockApiFetch.mockImplementation((url: unknown) => {
+        const m = /version=(\d+)/.exec(String(url));
+        const ver = m ? Number(m[1]) : 1;
+        return Promise.resolve(okKeyResponse(wrappedForUser, ver));
+      });
+
+      const events: Array<{ channelId: string; keyVersion: number }> = [];
+      const off = e2eeService.onKeyRotation((e) => events.push(e));
+
+      await e2eeService.getChannelKeyByVersion('chan-1', 4); // baseline → no fire
+      e2eeService.invalidateChannelKey('chan-1'); // cache bust, NOT a rotation
+      await e2eeService.getChannelKeyByVersion('chan-1', 4); // same version → no spurious fire
+      off();
+
+      expect(events).toEqual([]);
+    });
+
+    it('does not fire on equal or lower observed versions', async () => {
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      mockApiFetch.mockImplementation((url: unknown) => {
+        const m = /version=(\d+)/.exec(String(url));
+        const ver = m ? Number(m[1]) : 1;
+        return Promise.resolve(okKeyResponse(wrappedForUser, ver));
+      });
+
+      const events: Array<{ channelId: string; keyVersion: number }> = [];
+      const off = e2eeService.onKeyRotation((e) => events.push(e));
+
+      await e2eeService.getChannelKeyByVersion('chan-1', 7); // first observe → no fire
+      await e2eeService.getChannelKeyByVersion('chan-1', 5); // lower → no fire
+      await e2eeService.getChannelKeyByVersion('chan-1', 7); // equal to highest-seen → no fire
+      off();
+
+      expect(events).toEqual([]);
+    });
+
+    it('unsubscribe stops further events', async () => {
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      mockApiFetch.mockImplementation((url: unknown) => {
+        const m = /version=(\d+)/.exec(String(url));
+        const ver = m ? Number(m[1]) : 1;
+        return Promise.resolve(okKeyResponse(wrappedForUser, ver));
+      });
+
+      const events: Array<{ channelId: string; keyVersion: number }> = [];
+      const off = e2eeService.onKeyRotation((e) => events.push(e));
+
+      await e2eeService.getChannelKeyByVersion('chan-1', 2); // first observe
+      off(); // unsubscribe before the increase
+      await e2eeService.getChannelKeyByVersion('chan-1', 3); // would fire, but listener removed
+
+      expect(events).toEqual([]);
+    });
+
+    it('a throwing listener never breaks the key-fetch flow', async () => {
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      mockApiFetch.mockImplementation((url: unknown) => {
+        const m = /version=(\d+)/.exec(String(url));
+        const ver = m ? Number(m[1]) : 1;
+        return Promise.resolve(okKeyResponse(wrappedForUser, ver));
+      });
+
+      const off = e2eeService.onKeyRotation(() => {
+        throw new Error('listener boom');
+      });
+
+      await e2eeService.getChannelKeyByVersion('chan-1', 4); // first observe
+      // The strictly-higher observation fires the throwing listener — must still resolve.
+      await expect(e2eeService.getChannelKeyByVersion('chan-1', 5)).resolves.toBeInstanceOf(
+        CryptoKey
+      );
+      off();
+    });
+
+    // NOTE (#1885): the former test here asserted that invalidateChannelKey
+    // resets the highest-seen baseline so a subsequent higher-version observation
+    // does NOT fire. That encoded the #1878-defeating bug (Gitar + e2ee-reviewer):
+    // invalidateChannelKey is the primary rotation path, so suppressing the fire
+    // there meant the sender never re-based. The correct behavior — fire on a
+    // real higher-version refetch after invalidate, stay silent on a same-version
+    // refetch — is covered by the two tests above ("still fires after
+    // invalidateChannelKey …" + "does not fire when … same-version refetch").
+
+    it('fires from getChannelKey success path using the cached keyVersion', async () => {
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+
+      const events: Array<{ channelId: string; keyVersion: number }> = [];
+      const off = e2eeService.onKeyRotation((e) => events.push(e));
+
+      // First observe v2 via the versioned path → first-ever, no fire.
+      mockApiFetch.mockResolvedValueOnce(okKeyResponse(wrappedForUser, 2));
+      await e2eeService.getChannelKeyByVersion('chan-gk', 2);
+
+      // getChannelKey fetches fresh (main cache empty), server returns the new
+      // current version 3 → strictly higher → the getChannelKey success path fires.
+      mockApiFetch.mockResolvedValueOnce(okKeyResponse(wrappedForUser, 3));
+      await e2eeService.getChannelKey('chan-gk');
+      off();
+
+      expect(events).toEqual([{ channelId: 'chan-gk', keyVersion: 3 }]);
+    });
+  });
 });

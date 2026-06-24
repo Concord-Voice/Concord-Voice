@@ -46,6 +46,7 @@ import {
   ABSOLUTE_AUDIO_LAST_N_CEILING,
   SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
   parseMediaFrameCryptoVersion,
+  CryptoVersionMismatchError,
 } from '../src/lib/roomManager.js';
 // `./mocks/logger.js` (imported above) replaces @/lib/logger with vi.fn() spies;
 // importing it here gives us the SAME mocked object to assert on.
@@ -277,6 +278,62 @@ describe('RoomManager', () => {
       expect(() => parseMediaFrameCryptoVersion({ version: 2 })).toThrow(
         'Unsupported media frame crypto version object'
       );
+    });
+
+    it('accepts v2 during the v2→v3 rollout window', () => {
+      expect(parseMediaFrameCryptoVersion(2)).toBe(2);
+      expect(parseMediaFrameCryptoVersion(3)).toBe(3);
+    });
+
+    it('raises the room version when a higher-version participant joins (higher-version-wins)', async () => {
+      // Seed the room at v2 (a rollout-window client), then a v3 client joins.
+      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, undefined, 2);
+      const res = await manager.joinRoom(
+        'r',
+        'u2',
+        's2',
+        { username: 'b' },
+        undefined,
+        undefined,
+        3
+      );
+
+      expect(res.mediaFrameCryptoVersion).toBe(3);
+      expect(manager.getRoom('r')?.mediaFrameCryptoVersion).toBe(3);
+    });
+
+    it('keeps the room version when an equal-version participant joins', async () => {
+      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, undefined, 3);
+      const res = await manager.joinRoom(
+        'r',
+        'u2',
+        's2',
+        { username: 'b' },
+        undefined,
+        undefined,
+        3
+      );
+
+      expect(res.mediaFrameCryptoVersion).toBe(3);
+      expect(manager.getRoom('r')?.mediaFrameCryptoVersion).toBe(3);
+    });
+
+    it('rejects a lower-version joiner into a higher-version room with a typed mismatch', async () => {
+      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, undefined, 3);
+      const room = manager.getRoom('r')!;
+      const epochBefore = room.e2eeEpoch;
+
+      const promise = manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, undefined, 2);
+      await expect(promise).rejects.toMatchObject({
+        code: 'crypto_version_mismatch',
+        roomVersion: 3,
+        joinVersion: 2,
+      });
+      await expect(promise).rejects.toBeInstanceOf(CryptoVersionMismatchError);
+
+      // Gate must fire BEFORE participant storage / epoch mutation.
+      expect(room.participants.has('u2')).toBe(false);
+      expect(room.e2eeEpoch).toBe(epochBefore);
     });
   });
 

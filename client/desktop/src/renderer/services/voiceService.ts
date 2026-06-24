@@ -19,6 +19,7 @@ import { Device, types as mediasoupTypes } from 'mediasoup-client';
 import { io, Socket } from 'socket.io-client';
 import { useAuthStore } from '../stores/authStore';
 import { useUserStore } from '../stores/userStore';
+import { useUpdateStatusStore } from '../stores/updateStatusStore';
 import {
   useVoiceStore,
   AUDIO_QUALITY_TIERS,
@@ -332,6 +333,9 @@ class VoiceService {
   private mediaEncryption: MediaEncryption | null = null;
   // RTCRtpScriptTransform Worker (Chromium 129+) — owns frame crypto in a dedicated thread
   private e2eeWorker: Worker | null = null;
+  // #1878: unsubscribe handle for the e2eeService key-rotation subscription
+  // (sender re-base trigger). Cleared in cleanupTimersAndE2EE.
+  private keyRotationOff: (() => void) | null = null;
   // Debounced rotation state (extracted from MediaEncryption for Worker path)
   private rotationTimer: ReturnType<typeof setTimeout> | null = null;
   private rotationPending = false;
@@ -1896,11 +1900,36 @@ class VoiceService {
     return raw.replace(/[\x00-\x1F\x7F]/g, '').slice(0, 200);
   }
 
+  /**
+   * True when a thrown join error carries the media-plane's typed
+   * `crypto_version_mismatch` ack code (#1878). emitAsync copies the ack's
+   * `code` onto the rejected Error so this branch is reachable from the
+   * handleJoinFailure recovery path.
+   */
+  private isCryptoVersionMismatch(err: unknown): boolean {
+    return (
+      err instanceof Error && (err as Error & { code?: string }).code === 'crypto_version_mismatch'
+    );
+  }
+
   private async handleJoinFailure(err: unknown): Promise<void> {
     const store = useVoiceStore.getState();
     // Sanitized error for log sink — strips control chars + bounds length
     // (Sonar S4790 / [internal]rules/observability.md "Console error logging").
     console.error('Failed to join voice channel:', this.sanitizeErrForLog(err));
+    // #1878: a typed `crypto_version_mismatch` ack means the room negotiated a
+    // newer media-frame crypto version than this client speaks — the client is
+    // too old to join and must update. Surface the persistent "update required"
+    // banner (same path as updater cert/publisher failures) instead of leaving
+    // the user with a generic, non-actionable join failure.
+    if (this.isCryptoVersionMismatch(err)) {
+      useUpdateStatusStore
+        .getState()
+        .setSecurityError(
+          'media-crypto-version',
+          'This voice call requires a newer app version to join.'
+        );
+    }
     notificationSoundService.stopAllLoops();
     // Defense in depth: if cleanup() throws (mediasoup transport teardown,
     // E2EE worker crash mid-destroy, etc.), the store.reset() + 'error'
@@ -2034,6 +2063,10 @@ class VoiceService {
     this.unregisterDocumentVisibilityListener();
     this.pauseCoordinator.reset();
     this.consecutiveGreenIntervals = 0;
+    // #1878: drop the CSK key-rotation subscription so a torn-down session can't
+    // re-base a destroyed encryption instance.
+    this.keyRotationOff?.();
+    this.keyRotationOff = null;
     this.terminateE2EEWorker();
     if (this.rotationTimer) {
       clearTimeout(this.rotationTimer);
@@ -4621,6 +4654,11 @@ class VoiceService {
     if (!userId) throw new Error('No local userId for E2EE init');
 
     const encryptKey = await deriveFrameKey(channelCSK, userId);
+    // #1878: bind the encrypt key to the channel's authoritative CSK version so
+    // every outgoing v3 frame stamps it. getChannelKey above has already cached
+    // the version, so this is the value the SFU and every remote sender share.
+    // Never leave the encrypt version at a stale 0 when the channel is higher.
+    const keyVersion = e2eeService.getChannelKeyVersion(channelId);
 
     if (USE_SCRIPT_TRANSFORM) {
       this.initE2EEWorker();
@@ -4629,20 +4667,86 @@ class VoiceService {
         type: 'init',
         encryptKey,
         currentKeyId: 0,
+        keyVersion,
       } satisfies E2EEWorkerMessage);
       this.mediaEncryption = new MediaEncryption();
       this.mediaEncryption.initFromKey(encryptKey, 0);
+      this.mediaEncryption.setKeyVersion(keyVersion);
     } else {
       this.mediaEncryption = new MediaEncryption();
       await this.mediaEncryption.init(channelCSK, userId);
+      this.mediaEncryption.setKeyVersion(keyVersion);
     }
+
+    // #1878: subscribe to authoritative CSK rotations so the sender re-bases its
+    // encrypt key onto the new version after a confirmed fetch (see
+    // subscribeKeyRotation). Re-subscribe per init (the prior sub is cleared in
+    // cleanupTimersAndE2EE); a no-op if onKeyRotation is unavailable.
+    this.subscribeKeyRotation();
 
     console.debug('E2EE: encryption initialized', {
       channelId,
       userId,
+      keyVersion,
       attempt: attempt + 1,
       useScriptTransform: USE_SCRIPT_TRANSFORM,
     });
+  }
+
+  /**
+   * #1878 (the crux): subscribe to authoritative CSK rotations so the sender
+   * re-bases its encrypt key onto the new version. The ordering IS the
+   * rewrap-window seam: keep stamping the OLD version until the NEW CSK fetch is
+   * CONFIRMED, then derive + install the new encrypt key and advance the stamped
+   * version atomically. On fetch failure: no-op (stay on the old version; the
+   * next rotation or epoch-sync retries). Stores the unsubscribe handle; cleared
+   * in cleanupTimersAndE2EE.
+   */
+  private subscribeKeyRotation(): void {
+    // Replace any prior subscription (re-init / reconnect).
+    this.keyRotationOff?.();
+    this.keyRotationOff = null;
+    // Tolerate test/legacy harnesses where onKeyRotation is unavailable.
+    if (typeof e2eeService.onKeyRotation !== 'function') return;
+    this.keyRotationOff = e2eeService.onKeyRotation(({ channelId, keyVersion }) => {
+      // Only the ACTIVE channel's rotation re-bases the live encrypt key.
+      if (channelId !== useVoiceStore.getState().activeChannelId) return;
+      void this.rebaseEncryptKey(channelId, keyVersion);
+    });
+  }
+
+  /**
+   * #1878: re-base the sender's encrypt key onto a rotated CSK after a CONFIRMED
+   * fetch. Until the fetch resolves, outgoing frames still stamp the old version
+   * (the encrypt key is untouched), so there is no window where the sender
+   * stamps a version it can't back with a key.
+   */
+  private async rebaseEncryptKey(channelId: string, keyVersion: number): Promise<void> {
+    try {
+      const newCsk = await e2eeService.getChannelKeyByVersion(channelId, keyVersion);
+      // Re-check the active channel after the await (it may have changed).
+      if (channelId !== useVoiceStore.getState().activeChannelId) return;
+      const userId = useUserStore.getState().user?.id;
+      if (!userId || !this.mediaEncryption) return;
+      const newEncryptKey = await deriveFrameKey(newCsk, userId);
+      if (channelId !== useVoiceStore.getState().activeChannelId || !this.mediaEncryption) return;
+      // Advance the local encrypt key + stamped version together.
+      this.mediaEncryption.initFromKey(newEncryptKey, 0);
+      this.mediaEncryption.setKeyVersion(keyVersion);
+      this.e2eeWorker?.postMessage({
+        type: 'init',
+        encryptKey: newEncryptKey,
+        currentKeyId: 0,
+        keyVersion,
+      } satisfies E2EEWorkerMessage);
+      console.debug('E2EE: sender re-based encrypt key on CSK rotation', {
+        channelId,
+        keyVersion,
+      });
+    } catch {
+      // Confirmed-fetch failed → stay on the old version. The next rotation or
+      // epoch-sync retries; receivers self-heal via requestFrameKey meanwhile.
+    }
   }
 
   /** Initialize media encryption for an encrypted channel (fail-closed with retry) */
@@ -4725,6 +4829,38 @@ class VoiceService {
           e2eeService.invalidateChannelKey(channelId);
           this.addDecryptKeyForUser(channelId, msg.senderUserId).catch(() => {});
         }
+        break;
+      }
+
+      case 'requestFrameKey': {
+        // #1878: the worker hit a typed decrypt miss for an exact
+        // (sender, keyVersion, keyId). Fetch the authoritative CSK at that
+        // version, derive the receiver key, and post it back. Fail-closed on
+        // fetch failure (pending-404 / permanent-403): the worker rate-limits
+        // and caps its own retries, so a no-op here is safe.
+        const channelId = useVoiceStore.getState().activeChannelId;
+        if (!channelId || !this.mediaEncryption) break;
+        const mediaEncryption = this.mediaEncryption;
+        e2eeService
+          .getChannelKeyByVersion(channelId, msg.keyVersion)
+          .then(async (csk) => {
+            const key = await mediaEncryption.addDecryptKeyAtVersion(
+              csk,
+              msg.senderUserId,
+              msg.keyVersion,
+              msg.keyId
+            );
+            this.e2eeWorker?.postMessage({
+              type: 'addDecryptKey',
+              senderUserId: msg.senderUserId,
+              keyVersion: msg.keyVersion,
+              keyId: msg.keyId,
+              key,
+            } satisfies E2EEWorkerMessage);
+          })
+          .catch(() => {
+            /* fail-closed: worker rate-limits + caps retries */
+          });
         break;
       }
 
@@ -4842,9 +4978,14 @@ class VoiceService {
     const key = await this.mediaEncryption.addDecryptKeyAtEpoch(channelCSK, userId, keyId);
 
     if (this.e2eeWorker) {
+      // #1878: stamp the bound CSK version so the worker keys its decrypt map by
+      // senderId:keyVersion:keyId (matches what addDecryptKeyAtEpoch registered
+      // on the main-thread instance via its currentKeyVersion). Task 5 makes the
+      // sender re-base advance this version authoritatively.
       this.e2eeWorker.postMessage({
         type: 'addDecryptKey',
         senderUserId: userId,
+        keyVersion: this.mediaEncryption.getKeyVersion(),
         keyId,
         key,
       } satisfies E2EEWorkerMessage);
@@ -5104,10 +5245,15 @@ class VoiceService {
         reject(new Error(`Socket emit timeout: ${event}`));
       }, 10_000);
 
-      this.socket.emit(event, data, (response: T & { error?: string }) => {
+      this.socket.emit(event, data, (response: T & { error?: string; code?: string }) => {
         clearTimeout(timeout);
         if (response && typeof response === 'object' && 'error' in response) {
-          reject(new Error(response.error));
+          // Preserve a typed `code` (e.g. #1878 'crypto_version_mismatch') on the
+          // rejected error so callers can branch on it. emitAsync otherwise
+          // discards every ack field but `error`; the bare Error loses the code.
+          const err = new Error(response.error) as Error & { code?: string };
+          if (typeof response.code === 'string') err.code = response.code;
+          reject(err);
         } else {
           resolve(response);
         }

@@ -9,8 +9,20 @@
  * triggers an `rtctransform` event here with { readable, writable } streams.
  */
 
-import { MediaEncryption } from '../services/mediaEncryption';
+import { MediaEncryption, type FrameKeyMissError } from '../services/mediaEncryption';
 import type { E2EEWorkerMessage, E2EEMainMessage, E2EETransformOptions } from './e2eeProtocol';
+
+/**
+ * #1878: discriminate the typed decrypt miss by error `name`, not `instanceof`.
+ * The class is type-imported (no runtime value) so unit tests that fully mock
+ * `mediaEncryption` need not re-export it, and the check is immune to the
+ * cross-realm `instanceof` pitfall for errors crossing a Worker boundary. The
+ * real `FrameKeyMissError` sets `name = 'FrameKeyMissError'` (asserted in
+ * mediaEncryption.test.ts), so this is behavior-equivalent.
+ */
+function isFrameKeyMiss(err: unknown): err is FrameKeyMissError {
+  return err instanceof Error && err.name === 'FrameKeyMissError';
+}
 
 const encryption = new MediaEncryption();
 
@@ -21,6 +33,35 @@ const RECOVERY_COOLDOWN_MS = 5000;
 
 // Per-sender recovery state
 const recoveryState = new Map<string, { lastAttempt: number; inProgress: boolean }>();
+
+// #1878: typed-miss on-demand key requests. A FrameKeyMissError means the
+// receiver has no key for the frame's exact (sender, keyVersion, keyId), so we
+// ask main to fetch + derive it. Dedup'd per key with a short backoff (the key
+// may not be published yet — pending-404), capped so a permanent 403 (not a
+// member) can't loop forever. The success case is handled by the existing
+// keyframe-on-recovery once the key arrives and a frame decrypts.
+// #1885: one consolidated tracking map keyed (sender:keyVersion:keyId) →
+// { lastAttempt, attempts }. Two correctness properties this shape must hold:
+//   (1) Gitar #3 — a legitimately slow-published key (pending-404 where the CSK
+//       re-wrap takes longer than the burst window, e.g. 0–2s+ under load) must
+//       NOT be permanently blacked. We retry in bursts (FRAME_KEY_BURST_CAP at
+//       FRAME_KEY_BACKOFF_MS), then PAUSE; after FRAME_KEY_RETRY_RESET_MS of idle
+//       the burst resets so requests resume — recovery latency is bounded to the
+//       reset window, never infinite. (A true permanent 403 just re-requests at
+//       the low ~1/reset-window rate; the main-thread rateLimitedUntil/429 path
+//       throttles server amplification.)
+//   (2) security-reviewer LOW — the map is globally size-capped so a misbehaving
+//       in-room sender stamping a unique (keyVersion,keyId) per frame cannot grow
+//       it unboundedly; at capacity we evict the least-recently-TOUCHED entry
+//       (LRU — touches re-insert at the end), so an actively-requested legit key
+//       is never the eviction victim during a churn attack (Gitar #1885).
+// Exported for unit testing of the retry policy (burst cap / idle reset / size
+// cap). Not consumed by the Worker runtime, which only uses the side effects.
+export const frameKeyRequests = new Map<string, { lastAttempt: number; attempts: number }>();
+const FRAME_KEY_BACKOFF_MS = 350; // min gap between requests for the same key
+const FRAME_KEY_BURST_CAP = 8; // requests per burst before pausing
+const FRAME_KEY_RETRY_RESET_MS = 15_000; // idle gap after which a burst resets (slow-key recovery)
+const FRAME_KEY_MAX_TRACKED = 512; // global size cap (DoS bound)
 
 function postToMain(msg: E2EEMainMessage): void {
   self.postMessage(msg);
@@ -41,13 +82,24 @@ self.onmessage = (event: MessageEvent<E2EEWorkerMessage>) => {
   switch (msg.type) {
     case 'init':
       encryption.initFromKey(msg.encryptKey, msg.currentKeyId);
-      log('debug', 'E2EE Worker: initialized', { keyId: msg.currentKeyId });
+      // #1878: bind the encrypt key's channel-key version so outgoing frames
+      // stamp the authoritative CSK version (not a stale 0).
+      encryption.setKeyVersion(msg.keyVersion);
+      log('debug', 'E2EE Worker: initialized', {
+        keyId: msg.currentKeyId,
+        keyVersion: msg.keyVersion,
+      });
       break;
 
     case 'addDecryptKey':
-      encryption.addDecryptKeyDirect(msg.senderUserId, msg.keyId, msg.key);
+      // #1878: keyed by (senderUserId, keyVersion, keyId) to match the v3 frame
+      // trailer. A successful add also clears any pending requestFrameKey backoff
+      // so a later miss (e.g., a fresh keyVersion) re-requests promptly.
+      encryption.addDecryptKeyDirectV3(msg.senderUserId, msg.keyVersion, msg.keyId, msg.key);
+      clearFrameKeyRequest(msg.senderUserId, msg.keyVersion, msg.keyId);
       log('debug', 'E2EE Worker: decrypt key added', {
         senderUserId: msg.senderUserId,
+        keyVersion: msg.keyVersion,
         keyId: msg.keyId,
       });
       break;
@@ -81,6 +133,7 @@ self.onmessage = (event: MessageEvent<E2EEWorkerMessage>) => {
     case 'destroy':
       encryption.destroy();
       recoveryState.clear();
+      frameKeyRequests.clear();
       log('debug', 'E2EE Worker: destroyed');
       break;
   }
@@ -176,6 +229,46 @@ function attemptRecovery(senderUserId: string, dropCount: number): void {
   }, RECOVERY_COOLDOWN_MS);
 }
 
+/**
+ * #1878: request the exact key for a typed decrypt miss. Dedup'd per
+ * (sender, keyVersion, keyId) with a short backoff and a hard retry cap. Fail-
+ * closed: while we wait, the frame is dropped (never enqueued as ciphertext).
+ */
+export function requestFrameKeyOnce(senderUserId: string, keyVersion: number, keyId: number): void {
+  const k = `${senderUserId}:${keyVersion}:${keyId}`;
+  const now = Date.now();
+  let st = frameKeyRequests.get(k);
+
+  // Idle-reset: a long gap since the last request means either a slow-published
+  // key we paused on (resume so it can recover — Gitar #3) or a stale entry.
+  if (st && now - st.lastAttempt >= FRAME_KEY_RETRY_RESET_MS) {
+    frameKeyRequests.delete(k);
+    st = undefined;
+  }
+  if (st) {
+    if (st.attempts >= FRAME_KEY_BURST_CAP) return; // burst exhausted — wait for the reset window
+    if (now - st.lastAttempt < FRAME_KEY_BACKOFF_MS) return; // rate-limit within the burst
+    // LRU touch: delete so the re-set below moves this key to the most-recent
+    // (last) position. That keeps the size-cap eviction least-recently-TOUCHED
+    // rather than FIFO oldest-inserted, so an actively-requested legit key is
+    // never the eviction victim while a sender churns unique keys (Gitar #1885).
+    frameKeyRequests.delete(k);
+  } else if (frameKeyRequests.size >= FRAME_KEY_MAX_TRACKED) {
+    // Global size cap (DoS bound): evict the least-recently-touched entry (the
+    // first key, since touches re-insert at the end) before adding the new one.
+    const oldest = frameKeyRequests.keys().next().value;
+    if (oldest !== undefined) frameKeyRequests.delete(oldest);
+  }
+
+  frameKeyRequests.set(k, { lastAttempt: now, attempts: (st?.attempts ?? 0) + 1 });
+  postToMain({ type: 'requestFrameKey', senderUserId, keyVersion, keyId });
+}
+
+/** Clear the dedup/backoff state for a key once it has been provisioned. */
+function clearFrameKeyRequest(senderUserId: string, keyVersion: number, keyId: number): void {
+  frameKeyRequests.delete(`${senderUserId}:${keyVersion}:${keyId}`);
+}
+
 /** Handle a decryption failure: log, attempt recovery at threshold, flag persistent failures */
 function handleDecryptError(
   senderUserId: string,
@@ -233,8 +326,15 @@ function handleDecrypt(
           dropCount = 0;
         }
       } catch (decryptErr) {
-        dropCount++;
-        handleDecryptError(senderUserId, dropCount, decryptErr, frame.data.byteLength);
+        if (isFrameKeyMiss(decryptErr)) {
+          // #1878: typed miss — request the exact key on demand. The frame is
+          // dropped (fail-closed); it is never enqueued as ciphertext.
+          requestFrameKeyOnce(decryptErr.senderUserId, decryptErr.keyVersion, decryptErr.keyId);
+        } else {
+          // OperationError (wrong-base GCM auth) / other — existing self-heal path.
+          dropCount++;
+          handleDecryptError(senderUserId, dropCount, decryptErr, frame.data.byteLength);
+        }
       }
     },
   });

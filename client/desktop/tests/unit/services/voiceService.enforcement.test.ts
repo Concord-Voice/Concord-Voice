@@ -52,22 +52,35 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn().mockResolvedValue(null),
     invalidateChannelKey: vi.fn(),
+    // #1878: version binding + sender re-base surface.
+    getChannelKeyVersion: vi.fn().mockReturnValue(0),
+    getChannelKeyByVersion: vi.fn().mockResolvedValue(null),
+    onKeyRotation: vi.fn().mockReturnValue(() => {}),
   },
 }));
 
 // --- mediaEncryption ---
 vi.mock('@/renderer/services/mediaEncryption', () => ({
-  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 2,
+  // #1878 Task 6: the client negotiates v3. Mirror the live constant so the mock
+  // doesn't drift from production (these suites don't drive the join handshake,
+  // but keeping the value accurate avoids a misleading pin).
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 3,
   MediaEncryption: class MockMediaEncryption {
     init = vi.fn().mockResolvedValue(undefined);
     initFromKey = vi.fn();
     destroy = vi.fn();
     getCurrentKeyId = vi.fn().mockReturnValue(0);
     setCurrentKeyId = vi.fn();
+    // #1878: encrypt-version binding.
+    setKeyVersion = vi.fn();
+    getKeyVersion = vi.fn().mockReturnValue(0);
     encryptFrame = vi.fn().mockResolvedValue(undefined);
     decryptFrame = vi.fn().mockResolvedValue(undefined);
     addDecryptKey = vi.fn().mockResolvedValue(undefined);
+    addDecryptKeyAtEpoch = vi.fn().mockResolvedValue({} as CryptoKey);
+    addDecryptKeyAtVersion = vi.fn().mockResolvedValue({} as CryptoKey);
     addDecryptKeyDirect = vi.fn();
+    addDecryptKeyDirectV3 = vi.fn();
     debouncedRotateKeys = vi.fn();
     catchUpToEpoch = vi.fn().mockResolvedValue(undefined);
   },

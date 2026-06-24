@@ -88,10 +88,17 @@ vi.mock('@/renderer/services/apiClient', () => ({
 // --- e2eeService ---
 const mockGetChannelKey = vi.fn().mockResolvedValue({} as CryptoKey);
 const mockInvalidateChannelKey = vi.fn();
+const mockGetChannelKeyVersion = vi.fn().mockReturnValue(0);
+const mockGetChannelKeyByVersion = vi.fn().mockResolvedValue({} as CryptoKey);
+const mockOnKeyRotation = vi.fn().mockReturnValue(() => {});
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     getChannelKey: (...args: unknown[]) => mockGetChannelKey(...args),
     invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
+    // #1878: version binding + sender re-base surface.
+    getChannelKeyVersion: (...args: unknown[]) => mockGetChannelKeyVersion(...args),
+    getChannelKeyByVersion: (...args: unknown[]) => mockGetChannelKeyByVersion(...args),
+    onKeyRotation: (...args: unknown[]) => mockOnKeyRotation(...args),
   },
 }));
 
@@ -107,18 +114,27 @@ const mockDebouncedRotateKeys = vi.fn();
 const mockCatchUpToEpoch = vi.fn().mockResolvedValue(undefined);
 
 vi.mock('@/renderer/services/mediaEncryption', () => ({
-  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 2,
+  // #1878 Task 6: the client now negotiates v3. The mock mirrors the live
+  // constant so the join-version self-check (advertise === ack) stays
+  // consistent; the media-plane gate accepts {2,3} during the rollout window.
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 3,
   MediaEncryption: class MockMediaEncryption {
     init = mockMediaEncryptionInit;
     initFromKey = mockMediaEncryptionInitFromKey;
     destroy = mockMediaEncryptionDestroy;
     getCurrentKeyId = mockGetCurrentKeyId;
     setCurrentKeyId = mockSetCurrentKeyId;
+    // #1878: version-aware surface the production code now reads (keyVersion is
+    // stamped onto the addDecryptKey worker message via getKeyVersion()).
+    getKeyVersion = vi.fn().mockReturnValue(0);
+    setKeyVersion = vi.fn();
     encryptFrame = vi.fn().mockResolvedValue(undefined);
     decryptFrame = vi.fn().mockResolvedValue(undefined);
     addDecryptKey = vi.fn().mockResolvedValue(undefined);
     addDecryptKeyDirect = mockAddDecryptKeyDirect;
+    addDecryptKeyDirectV3 = vi.fn();
     addDecryptKeyAtEpoch = mockAddDecryptKeyAtEpoch;
+    addDecryptKeyAtVersion = vi.fn().mockResolvedValue(undefined);
     debouncedRotateKeys = mockDebouncedRotateKeys;
     catchUpToEpoch = mockCatchUpToEpoch;
   },
@@ -321,7 +337,7 @@ function makeJoinResponse(co?: Record<string, unknown>) {
 function makeRoomJoined(ov?: Record<string, unknown>) {
   return {
     rtpCapabilities: mockDeviceRtpCapabilities,
-    mediaFrameCryptoVersion: 2,
+    mediaFrameCryptoVersion: 3,
     existingProducers: [],
     participants: [{ userId: 'user-1', username: 'testuser', displayName: 'Test User' }],
     channelName: 'General',
