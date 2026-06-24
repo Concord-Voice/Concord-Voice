@@ -621,6 +621,12 @@ describe('main.ts', () => {
       expect(callback).toHaveBeenCalledWith(true);
     });
 
+    it('allows speaker-selection requests', () => {
+      const callback = vi.fn();
+      sessionHandlers.permissionRequest!(null, 'speaker-selection', callback);
+      expect(callback).toHaveBeenCalledWith(true);
+    });
+
     it('permission check denies geolocation', () => {
       expect(sessionHandlers.permissionCheck).toBeDefined();
       const result = sessionHandlers.permissionCheck!(null, 'geolocation');
@@ -632,10 +638,16 @@ describe('main.ts', () => {
       expect(result).toBe(true);
     });
 
-    it('device permission allows camera/microphone/hid', () => {
+    it('permission check allows speaker-selection', () => {
+      const result = sessionHandlers.permissionCheck!(null, 'speaker-selection');
+      expect(result).toBe(true);
+    });
+
+    it('device permission allows camera/microphone/speaker/hid', () => {
       expect(sessionHandlers.devicePermission).toBeDefined();
       expect(sessionHandlers.devicePermission!({ deviceType: 'camera' })).toBe(true);
       expect(sessionHandlers.devicePermission!({ deviceType: 'microphone' })).toBe(true);
+      expect(sessionHandlers.devicePermission!({ deviceType: 'speaker' })).toBe(true);
       expect(sessionHandlers.devicePermission!({ deviceType: 'hid' })).toBe(true);
     });
 

@@ -80,6 +80,49 @@ function makeMockStream(id = 'stream-1'): MediaStream {
   } as unknown as MediaStream;
 }
 
+function installFallbackDestination() {
+  const origCreateMediaStreamDestination = (
+    mockAudioContext as { createMediaStreamDestination?: unknown }
+  ).createMediaStreamDestination;
+  const createMediaStreamDestination = vi.fn(() => ({ stream: {} as MediaStream }));
+  (
+    mockAudioContext as { createMediaStreamDestination: typeof createMediaStreamDestination }
+  ).createMediaStreamDestination = createMediaStreamDestination;
+
+  const restore = () => {
+    if (origCreateMediaStreamDestination !== undefined) {
+      (mockAudioContext as { createMediaStreamDestination: unknown }).createMediaStreamDestination =
+        origCreateMediaStreamDestination;
+    } else {
+      delete (mockAudioContext as { createMediaStreamDestination?: unknown })
+        .createMediaStreamDestination;
+    }
+  };
+
+  return { createMediaStreamDestination, restore };
+}
+
+function installAudioSinkElements(
+  setSinkIdFactory: () => ReturnType<typeof vi.fn> = () => vi.fn().mockResolvedValue(undefined)
+) {
+  const audioElements: HTMLAudioElement[] = [];
+  const origCreate = document.createElement.bind(document);
+  const createElement = (tag: string) => {
+    const el = origCreate(tag);
+    if (tag !== 'audio') return el;
+
+    Object.assign(el, {
+      play: vi.fn().mockResolvedValue(undefined),
+      setSinkId: setSinkIdFactory(),
+    });
+    audioElements.push(el as HTMLAudioElement);
+    return el;
+  };
+  const createSpy = vi.spyOn(document, 'createElement').mockImplementation(createElement);
+
+  return { audioElements, restore: () => createSpy.mockRestore() };
+}
+
 describe('ParticipantGrid — extended coverage', () => {
   beforeEach(() => {
     resetAllStores();
@@ -243,6 +286,73 @@ describe('ParticipantGrid — extended coverage', () => {
       expect(mockAudioContext.setSinkId).toHaveBeenCalledWith('speaker-a');
 
       warnSpy.mockRestore();
+    });
+
+    it('routes selected output through an audio-element sink when available', () => {
+      const fallbackDest = installFallbackDestination();
+      const audioSinks = installAudioSinkElements();
+
+      try {
+        render(<AudioOutput stream={makeMockStream()} outputDeviceId="speaker-fallback" />);
+
+        expect(fallbackDest.createMediaStreamDestination).toHaveBeenCalled();
+        const fallbackEl = audioSinks.audioElements[
+          audioSinks.audioElements.length - 1
+        ] as HTMLAudioElement & {
+          setSinkId: ReturnType<typeof vi.fn>;
+        };
+        expect(fallbackEl.setSinkId).toHaveBeenCalledWith('speaker-fallback');
+        expect(mockAudioContext.setSinkId).not.toHaveBeenCalled();
+      } finally {
+        audioSinks.restore();
+        fallbackDest.restore();
+      }
+    });
+
+    it('sets the fallback sink before playing routed call audio', async () => {
+      const fallbackDest = installFallbackDestination();
+      const audioSinks = installAudioSinkElements();
+
+      try {
+        render(<AudioOutput stream={makeMockStream()} outputDeviceId="speaker-fallback" />);
+        await Promise.resolve();
+
+        const fallbackEl = audioSinks.audioElements[
+          audioSinks.audioElements.length - 1
+        ] as HTMLAudioElement & {
+          play: ReturnType<typeof vi.fn>;
+          setSinkId: ReturnType<typeof vi.fn>;
+        };
+        expect(fallbackEl.setSinkId.mock.invocationCallOrder[0]).toBeLessThan(
+          fallbackEl.play.mock.invocationCallOrder[0]
+        );
+      } finally {
+        audioSinks.restore();
+        fallbackDest.restore();
+      }
+    });
+
+    it('keeps call audio audible if fallback sink selection fails', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const fallbackDest = installFallbackDestination();
+      const audioSinks = installAudioSinkElements(() =>
+        vi.fn().mockRejectedValue(new Error('sink blocked'))
+      );
+
+      try {
+        render(<AudioOutput stream={makeMockStream()} outputDeviceId="speaker-fallback" />);
+        await Promise.resolve();
+        await Promise.resolve();
+
+        const fallbackEl = audioSinks.audioElements[
+          audioSinks.audioElements.length - 1
+        ] as HTMLAudioElement & { play: ReturnType<typeof vi.fn> };
+        expect(fallbackEl.play).toHaveBeenCalled();
+      } finally {
+        warnSpy.mockRestore();
+        audioSinks.restore();
+        fallbackDest.restore();
+      }
     });
   });
 

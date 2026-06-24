@@ -11,6 +11,29 @@ import './ParticipantGrid.css';
 /** Maximum boost gain: +18 dB ≈ 8x linear. Prevents extreme noise amplification. */
 const MAX_BOOST_LINEAR = Math.pow(10, 18 / 20); // ~7.94
 
+type SinkAudioElement = HTMLAudioElement & { setSinkId: (id: string) => Promise<void> };
+type SinkResult = { ok: true } | { ok: false; err: unknown };
+
+async function playAudioElement(el: HTMLAudioElement): Promise<void> {
+  try {
+    await el.play();
+  } catch {
+    // Playback rejection is non-fatal; the call audio graph stays intact.
+  }
+}
+
+async function setSinkThenPlay(el: SinkAudioElement, sinkId: string): Promise<SinkResult> {
+  try {
+    await el.setSinkId(sinkId);
+  } catch (err) {
+    await playAudioElement(el);
+    return { ok: false, err };
+  }
+
+  await playAudioElement(el);
+  return { ok: true };
+}
+
 /**
  * Plays a remote participant's audio stream through a Web Audio GainNode
  * chain for output volume + quiet user boost. Renders nothing visible — the
@@ -70,36 +93,41 @@ export const AudioOutput: React.FC<{
       appliedSinkIdRef.current = null;
     };
 
-    // Prefer AudioContext.setSinkId (Chrome 110+), fall back to routing through
-    // a MediaStreamDestination + <audio> with setSinkId.
-    if ('setSinkId' in ctx) {
-      (ctx as AudioContext & { setSinkId: (id: string) => Promise<void> })
-        .setSinkId(sinkId)
-        .catch((err) => {
-          console.warn('Failed to set audio output device:', errorMessage(err));
+    const retargetViaAudioElement = () => {
+      if (!el || !('setSinkId' in el)) return false;
+      if (!selectedOutputDeviceId && !fallbackElRef.current) return false;
+      if (!fallbackElRef.current) {
+        boostGain.disconnect(ctx.destination);
+        const fallbackDest = ctx.createMediaStreamDestination();
+        fallbackDestRef.current = fallbackDest;
+        boostGain.connect(fallbackDest);
+        const fallbackEl = document.createElement('audio');
+        fallbackEl.srcObject = fallbackDest.stream;
+        fallbackElRef.current = fallbackEl;
+      }
+
+      const fallbackEl = fallbackElRef.current as SinkAudioElement;
+      void setSinkThenPlay(fallbackEl, sinkId).then((result) => {
+        if (!result.ok) {
+          // Sink selection failed; keep call audio audible on the platform default.
+          console.warn('Failed to set fallback audio output device:', errorMessage(result.err));
           resetAppliedSinkOnFailure();
-        });
+        }
+      });
+      return true;
+    };
+
+    if (retargetViaAudioElement()) return;
+
+    if (!('setSinkId' in ctx)) {
+      resetAppliedSinkOnFailure();
       return;
     }
 
-    if (!el || !('setSinkId' in el)) return;
-    if (!selectedOutputDeviceId && !fallbackElRef.current) return;
-
-    if (!fallbackElRef.current) {
-      boostGain.disconnect(ctx.destination);
-      const fallbackDest = ctx.createMediaStreamDestination();
-      fallbackDestRef.current = fallbackDest;
-      boostGain.connect(fallbackDest);
-      const fallbackEl = document.createElement('audio');
-      fallbackEl.srcObject = fallbackDest.stream;
-      fallbackEl.play().catch(() => {});
-      fallbackElRef.current = fallbackEl;
-    }
-
-    (fallbackElRef.current as HTMLAudioElement & { setSinkId: (id: string) => Promise<void> })
+    (ctx as AudioContext & { setSinkId: (id: string) => Promise<void> })
       .setSinkId(sinkId)
       .catch((err) => {
-        console.warn('Failed to set fallback audio output device:', errorMessage(err));
+        console.warn('Failed to set audio output device:', errorMessage(err));
         resetAppliedSinkOnFailure();
       });
   }, []);

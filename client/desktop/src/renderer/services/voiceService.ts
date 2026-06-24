@@ -363,6 +363,8 @@ class VoiceService {
   // Live settings subscriptions (apply changes during active calls)
   private liveAudioUnsub: (() => void) | null = null;
   private liveVideoUnsub: (() => void) | null = null;
+  private liveVoiceUnsub: (() => void) | null = null;
+  private liveAudioTrackReplaceSeq = 0;
 
   // Packet loss monitor
   private packetLossTimer: ReturnType<typeof setInterval> | null = null;
@@ -969,6 +971,12 @@ class VoiceService {
     this.liveVideoUnsub = useVideoSettingsStore.subscribe((state, prev) => {
       this.handleVideoSettingsChange(state, prev);
     });
+
+    this.liveVoiceUnsub = useVoiceStore.subscribe((state, prev) => {
+      if (state.audioInputDeviceId !== prev.audioInputDeviceId) {
+        this.liveReplaceAudioTrack();
+      }
+    });
   }
 
   /** Handle video settings store changes — extracted to reduce cognitive complexity. */
@@ -1028,6 +1036,8 @@ class VoiceService {
     this.liveAudioUnsub = null;
     this.liveVideoUnsub?.();
     this.liveVideoUnsub = null;
+    this.liveVoiceUnsub?.();
+    this.liveVoiceUnsub = null;
   }
 
   // --- Instant update helpers (setParameters, no track change) ---
@@ -1087,27 +1097,61 @@ class VoiceService {
 
   // --- replaceTrack: re-acquire media with new constraints, swap on existing producer ---
 
+  private shouldResumeMicAfterTrackReplacement(producerId: string): boolean {
+    if (this.shouldKeepProducerSuspendedForTest(producerId)) return false;
+
+    const store = useVoiceStore.getState();
+    if (store.isMuted || store.isDeafened || store.isSoloBandwidthSaving) return false;
+
+    const localUserId = useUserStore.getState().user?.id;
+    const localParticipant = localUserId ? store.participants[localUserId] : undefined;
+    return localParticipant?.serverMuted !== true && localParticipant?.serverDeafened !== true;
+  }
+
+  private stopMediaStream(stream: MediaStream | null): void {
+    if (!stream) return;
+    for (const t of stream.getTracks()) t.stop();
+  }
+
+  private isStaleAudioTrackReplacement(replaceSeq: number, stream: MediaStream): boolean {
+    if (replaceSeq === this.liveAudioTrackReplaceSeq) return false;
+    this.stopMediaStream(stream);
+    return true;
+  }
+
+  private swapLiveMicStream(
+    stream: MediaStream,
+    adv: ReturnType<typeof useAudioSettingsStore.getState>
+  ): MediaStreamTrack {
+    this.stopNoiseGate();
+    this.stopInputVolume();
+    this.stopMediaStream(this.localMicStream);
+    this.localMicStream = stream;
+
+    let track = stream.getAudioTracks()[0];
+    if (adv.noiseGateMode === 'manual') {
+      track = this.applyNoiseGate(stream, adv.noiseGateLevel);
+    }
+    return this.applyInputVolume(track, adv.inputVolume);
+  }
+
   private async liveReplaceAudioTrack(): Promise<void> {
     const producer = this.producers.get('mic');
     if (!producer) return;
 
+    const replaceSeq = ++this.liveAudioTrackReplaceSeq;
     const adv = useAudioSettingsStore.getState();
     const useProcessing = !adv.musicMode;
+    const selectedDeviceId = useVoiceStore.getState().audioInputDeviceId;
 
     // Briefly mute to hide transition
     producer.pause();
 
     try {
-      // Stop old processing chain
-      this.stopNoiseGate();
-      this.stopInputVolume();
-      if (this.localMicStream) {
-        for (const t of this.localMicStream.getTracks()) t.stop();
-      }
-
       // Re-acquire mic with new constraints
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
+          deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
           echoCancellation: useProcessing && adv.echoCancellation,
           noiseSuppression: useProcessing && adv.noiseCancellation,
           autoGainControl: useProcessing && adv.autoGainControl,
@@ -1115,22 +1159,23 @@ class VoiceService {
           channelCount: 2,
         },
       });
-      this.localMicStream = stream;
-      let track = stream.getAudioTracks()[0];
 
-      // Re-apply processing chain
-      if (adv.noiseGateMode === 'manual') {
-        track = this.applyNoiseGate(stream, adv.noiseGateLevel);
-      }
-      track = this.applyInputVolume(track, adv.inputVolume);
+      if (this.isStaleAudioTrackReplacement(replaceSeq, stream)) return;
 
       // Swap track on existing producer (no SDP renegotiation)
-      await producer.replaceTrack({ track });
+      await producer.replaceTrack({ track: this.swapLiveMicStream(stream, adv) });
     } catch (err) {
-      console.warn('liveReplaceAudioTrack failed:', errorMessage(err));
+      if (replaceSeq === this.liveAudioTrackReplaceSeq) {
+        console.warn('liveReplaceAudioTrack failed:', errorMessage(err));
+      }
+    } finally {
+      if (
+        replaceSeq === this.liveAudioTrackReplaceSeq &&
+        this.shouldResumeMicAfterTrackReplacement(producer.id)
+      ) {
+        producer.resume();
+      }
     }
-
-    if (!this.shouldKeepProducerSuspendedForTest(producer.id)) producer.resume();
   }
 
   private async liveReplaceCameraTrack(): Promise<void> {
@@ -2078,8 +2123,9 @@ class VoiceService {
     if (!this.sendTransport || !this.device) return;
 
     const adv = useAudioSettingsStore.getState();
+    const selectedDeviceId = deviceId ?? useVoiceStore.getState().audioInputDeviceId ?? undefined;
     this.localMicStream = await this.resolveAudioStream(
-      deviceId,
+      selectedDeviceId,
       preAcquiredStream,
       adv.musicMode,
       adv

@@ -265,6 +265,14 @@ function createMockMediaStream(tracks?: Array<{ kind: string; id?: string }>) {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 // ---------------------------------------------------------------------------
 // Import voiceService AFTER all mocks
 // ---------------------------------------------------------------------------
@@ -583,6 +591,85 @@ describe('VoiceService Extended', () => {
       expect(micProducer.pause).toHaveBeenCalled();
       expect(micProducer.replaceTrack).toHaveBeenCalled();
       expect(micProducer.resume).toHaveBeenCalled();
+    });
+
+    it('captures from the selected microphone when replacing the live track', async () => {
+      const { micProducer } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      svc.producers.set('mic', micProducer);
+      useVoiceStore.setState({ audioInputDeviceId: 'mic-selected' });
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'audio', id: 'new-mic' }]));
+
+      await svc.liveReplaceAudioTrack();
+
+      expect(mockGetUserMedia).toHaveBeenLastCalledWith({
+        audio: expect.objectContaining({
+          deviceId: { exact: 'mic-selected' },
+        }),
+      });
+    });
+
+    it('keeps the latest microphone replacement when requests overlap', async () => {
+      const { micProducer } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      svc.teardownLiveSubscriptions();
+      svc.producers.set('mic', micProducer);
+      vi.spyOn(svc, 'applyInputVolume').mockImplementation((track) => track);
+
+      const firstStream = createMockMediaStream([{ kind: 'audio', id: 'mic-old' }]);
+      const secondStream = createMockMediaStream([{ kind: 'audio', id: 'mic-new' }]);
+      const firstCapture = deferred<unknown>();
+      const secondCapture = deferred<unknown>();
+      mockGetUserMedia
+        .mockImplementationOnce(() => firstCapture.promise)
+        .mockImplementationOnce(() => secondCapture.promise);
+
+      useVoiceStore.setState({ audioInputDeviceId: 'mic-old' });
+      const firstReplacement = svc.liveReplaceAudioTrack();
+      useVoiceStore.setState({ audioInputDeviceId: 'mic-new' });
+      const secondReplacement = svc.liveReplaceAudioTrack();
+
+      secondCapture.resolve(secondStream);
+      await secondReplacement;
+      firstCapture.resolve(firstStream);
+      await firstReplacement;
+
+      expect(svc.localMicStream).toBe(secondStream);
+      expect(micProducer.replaceTrack).toHaveBeenLastCalledWith({
+        track: secondStream.getAudioTracks()[0],
+      });
+    });
+
+    it.each([
+      ['self-muted', () => useVoiceStore.setState({ isMuted: true })],
+      [
+        'server-muted',
+        () => useVoiceStore.getState().updateParticipant('user-1', { serverMuted: true }),
+      ],
+    ])('does not resume the mic producer while %s', async (_reason, applyPauseState) => {
+      const { micProducer } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      svc.producers.set('mic', micProducer);
+      applyPauseState();
+      micProducer.resume.mockClear();
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'audio', id: 'new-mic' }]));
+
+      await svc.liveReplaceAudioTrack();
+
+      expect(micProducer.replaceTrack).toHaveBeenCalled();
+      expect(micProducer.resume).not.toHaveBeenCalled();
+    });
+
+    it('replaces the live mic track when the selected microphone changes', async () => {
+      const { micProducer } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      svc.producers.set('mic', micProducer);
+      const replaceSpy = vi.spyOn(svc, 'liveReplaceAudioTrack').mockResolvedValue(undefined);
+
+      useVoiceStore.setState({ audioInputDeviceId: 'mic-next' });
+
+      expect(replaceSpy).toHaveBeenCalled();
+      replaceSpy.mockRestore();
     });
 
     it('noop without mic producer', async () => {
@@ -1557,6 +1644,27 @@ describe('VoiceService Extended', () => {
       await svc.closeProducer('mic');
       await svc.produceAudio(undefined, preStream);
       expect(sendTransport.produce).toHaveBeenCalled();
+    });
+
+    it('uses the selected microphone when no explicit deviceId is passed', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      useVoiceStore.setState({ audioInputDeviceId: 'mic-selected' });
+      mockGetUserMedia.mockReset();
+      mockGetUserMedia.mockResolvedValue(
+        createMockMediaStream([{ kind: 'audio', id: 'stored-mic' }])
+      );
+      const newProducer = createMockProducer('new-mic', 'mic');
+      sendTransport.produce.mockResolvedValue(newProducer);
+
+      await svc.closeProducer('mic');
+      await svc.produceAudio();
+
+      expect(mockGetUserMedia).toHaveBeenCalledWith({
+        audio: expect.objectContaining({
+          deviceId: { exact: 'mic-selected' },
+        }),
+      });
     });
 
     it('stops pre-acquired stream when deviceId changes', async () => {
