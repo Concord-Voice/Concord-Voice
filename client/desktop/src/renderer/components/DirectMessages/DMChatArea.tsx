@@ -5,7 +5,7 @@ import DMPinnedMessagesPanel from './DMPinnedMessagesPanel';
 import { getPins } from '../../services/pinService';
 import MessageInput from '../Chat/MessageInput';
 import TypingIndicator from '../Chat/TypingIndicator';
-import { useDMStore, type DMConversation } from '../../stores/dmStore';
+import { useDMStore } from '../../stores/dmStore';
 import { useUserStore } from '../../stores/userStore';
 import { useDMSubscription } from '../../hooks/useDMSubscription';
 import { errorMessage } from '../../utils/redactError';
@@ -16,31 +16,14 @@ import { useVoiceStore } from '../../stores/voiceStore';
 import { voiceService } from '../../services/voiceService';
 import { usePrivacyStore } from '../../stores/privacyStore';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
+import { getThreadName } from '../../utils/dmThreadName';
 import GroupInfoPanel from './GroupInfoPanel';
+import VoiceView from '../Voice/VoiceView';
 import type { ChatContext } from '../../types/chat';
 import './DirectMessages.css';
 
-/*
- * Split view concept (future implementation):
- * When an active voice call is in progress within a DM, the chat area splits:
- *   - Top half: voice/video/screen-share view (reuse VoiceView/ParticipantGrid)
- *   - Bottom half: text chat (reuse MessageList + MessageInput)
- * If no active call, the text chat takes the full height.
- */
-
 interface DMChatAreaProps {
   selectedThreadId: string | null;
-}
-
-/** Get display name for the header */
-function getThreadName(conv: DMConversation | undefined, currentUserId: string): string {
-  if (!conv) return 'Conversation';
-  if (conv.isPersonal) return 'Personal Thread';
-  if (conv.isGroup) {
-    return conv.name || conv.participants.map((p) => p.displayName || p.username).join(', ');
-  }
-  const other = conv.participants.find((p) => p.userId !== currentUserId);
-  return other?.displayName || other?.username || 'Unknown';
 }
 
 const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
@@ -234,6 +217,15 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
         <p>Select a message thread or server to get started</p>
       </div>
     );
+  }
+
+  // In this conversation's call → the pane becomes the voice surface. VoiceView
+  // supplies its own header/grid/controls; the DM messages stay reachable via
+  // the voice text-chat toggle (VoiceTextChat reads isDMCall). Leaving the call
+  // flips isInThisCall false → the text view below returns, messages intact
+  // (#1873). Placed after all hooks so the rules-of-hooks hold.
+  if (isInThisCall) {
+    return <VoiceView channelId={selectedThreadId} channelName={threadName} />;
   }
 
   return (

@@ -3811,9 +3811,12 @@ class VoiceService {
     const hasParticipant = !!store.participants[result.producerUserId];
 
     if (!hasParticipant) {
-      console.warn('[consume] participant not in store!', {
+      // The producer's user-joined roster entry has not landed yet (the
+      // join-vs-consume race — pronounced for DM calls, #1873). PII-safe:
+      // UUID + source enum only, never names/streams (observability.md).
+      console.warn('[consume] participant not in store; hydrating from consume', {
         producerUserId: result.producerUserId,
-        knownUserIds: Object.keys(store.participants),
+        source,
       });
     }
 
@@ -3824,7 +3827,10 @@ class VoiceService {
     };
     const update = routeMap[source] ?? (result.kind === 'audio' ? { audioStream: stream } : null);
     if (update) {
-      store.updateParticipant(result.producerUserId, update);
+      // upsert (not updateParticipant): a consumed track must never be dropped
+      // when the participant has not been hydrated yet (#1873). A later
+      // user-joined upsert backfills name/avatar without clobbering the stream.
+      store.upsertParticipant(result.producerUserId, update);
     }
 
     console.debug('[consume] stream attached', {
@@ -4105,18 +4111,16 @@ class VoiceService {
         avatarUrl?: string | null;
         e2eeEpoch?: number;
       }) => {
-        useVoiceStore.getState().addParticipant({
-          userId,
+        // upsert (not addParticipant) with ROSTER fields only: if the consume
+        // path already created a record for this user (join-vs-consume race,
+        // #1873), a plain insert — or an upsert carrying isVideoOn/isMuted:false
+        // — would clobber the media/enforcement state the consume path set.
+        // upsertParticipant's create-branch supplies the false defaults for a
+        // genuinely-new participant; the merge-branch preserves existing media.
+        useVoiceStore.getState().upsertParticipant(userId, {
           username,
           displayName,
           avatarUrl: avatarUrl ?? undefined,
-          isMuted: false,
-          isDeafened: false,
-          serverMuted: false,
-          serverDeafened: false,
-          isVideoOn: false,
-          isScreenSharing: false,
-          isSpeaking: false,
         });
 
         // Solo bandwidth saving: exit solo mode when someone joins

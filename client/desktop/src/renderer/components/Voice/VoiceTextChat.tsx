@@ -1,38 +1,25 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { MessageSquare, Volume2, PanelBottom, PanelRight } from 'lucide-react';
 import MessageList from '../Chat/MessageList';
 import MessageInput from '../Chat/MessageInput';
-import { useChannelStore } from '../../stores/channelStore';
 import { useVoiceStore } from '../../stores/voiceStore';
 import { useUserStore } from '../../stores/userStore';
+import { usePrivacyStore } from '../../stores/privacyStore';
 import { useTTSSettingsStore } from '../../stores/ttsSettingsStore';
-import { useServerStore } from '../../stores/serverStore';
-import { useChannelSubscription } from '../../hooks/useChannelSubscription';
 import { useMessageFetch } from '../../hooks/useMessageFetch';
 import { useChatController } from '../../hooks/useChatController';
-import type { ChatContext } from '../../types/chat';
+import { useVoiceTextChatTarget } from '../../hooks/useVoiceTextChatTarget';
 import './VoiceTextChat.css';
 
 const VoiceTextChat: React.FC = () => {
-  const activeChannelId = useVoiceStore((s) => s.activeChannelId);
   const voiceTextChatLayout = useVoiceStore((s) => s.voiceTextChatLayout);
   const toggleVoiceTextChatLayout = useVoiceStore((s) => s.toggleVoiceTextChatLayout);
-  const getLinkedTextChannel = useChannelStore((s) => s.getLinkedTextChannel);
-
-  const linkedChannel = activeChannelId ? getLinkedTextChannel(activeChannelId) : undefined;
-  const channelId = linkedChannel?.id ?? null;
-
   const user = useUserStore((s) => s.user);
-  const activeServerId = useServerStore((s) => s.activeServerId);
+  const dmPrivacyLevel = usePrivacyStore((s) => s.settings.dmPrivacyLevel);
 
-  const ctx: ChatContext = useMemo(
-    () => ({
-      type: 'voice' as const,
-      id: channelId || '',
-      serverId: activeServerId ?? undefined,
-    }),
-    [channelId, activeServerId]
-  );
+  // DM-vs-server target resolution + subscription wiring lives in the hook
+  // (#1873) so this component stays within the S3776 cognitive-complexity bound.
+  const { isDMCall, targetId, targetName, fetchType, ctx } = useVoiceTextChatTarget();
 
   const {
     sendMessage,
@@ -59,12 +46,9 @@ const VoiceTextChat: React.FC = () => {
     return () => clearInterval(interval);
   }, [ttsEnabled]);
 
-  // Subscribe to the linked text channel for real-time messages
-  useChannelSubscription(channelId);
-
   // Shared fetch/decrypt/paginate logic
-  const { messages, isLoading, hasMore, error, handleLoadMore } = useMessageFetch(channelId, {
-    type: 'channel',
+  const { messages, isLoading, hasMore, error, handleLoadMore } = useMessageFetch(targetId, {
+    type: fetchType,
   });
 
   const currentUserId = user?.id || '';
@@ -76,15 +60,15 @@ const VoiceTextChat: React.FC = () => {
     attachmentIds?: string[],
     attachments?: import('../../types/chat').AttachmentSummary[]
   ) => {
-    if (!channelId) return;
+    if (!targetId) return;
     sendMessage(content, { mentionMeta, replyToId, attachmentIds, attachments });
   };
 
-  if (!channelId || !linkedChannel) {
+  if (!targetId) {
     return (
       <div className="voice-text-chat voice-text-chat--empty">
         <MessageSquare size={20} />
-        <span>No text channel linked</span>
+        <span>{isDMCall ? 'No conversation' : 'No text channel linked'}</span>
       </div>
     );
   }
@@ -93,7 +77,7 @@ const VoiceTextChat: React.FC = () => {
     <div className="voice-text-chat">
       <div className="voice-text-chat__header">
         <MessageSquare size={14} />
-        <span className="voice-text-chat__title">{linkedChannel.name} Text Chat</span>
+        <span className="voice-text-chat__title">{targetName} Text Chat</span>
         <button
           type="button"
           className="voice-text-chat__layout-toggle"
@@ -116,11 +100,11 @@ const VoiceTextChat: React.FC = () => {
 
       <div className="voice-text-chat__messages">
         <MessageList
-          key={channelId}
+          key={targetId}
           messages={messages}
           currentUserId={currentUserId}
           chatContext={chatContext}
-          channelName={linkedChannel.name}
+          channelName={targetName}
           isLoading={isLoading}
           hasMore={hasMore}
           onLoadMore={handleLoadMore}
@@ -139,17 +123,26 @@ const VoiceTextChat: React.FC = () => {
         </div>
       )}
 
-      <div className="voice-text-chat__input">
-        <MessageInput
-          onSendMessage={handleSendMessage}
-          onTyping={sendTyping}
-          channelName={linkedChannel.name}
-          disabled={!currentUserId}
-          placeholder={`Message ${linkedChannel.name} text chat...`}
-          replyingTo={replyingTo}
-          onCancelReply={cancelReply}
-        />
-      </div>
+      {isDMCall && dmPrivacyLevel === 0 ? (
+        // Preserve the DM privacy-disabled behavior from DMChatArea (#1873):
+        // when the local user has globally disabled DMs, the voice text panel
+        // shows the same notice instead of a composer. Server voice is unaffected.
+        <div className="dm-disabled-notice">
+          All DMs have been disabled. Change your privacy settings to restore DMs.
+        </div>
+      ) : (
+        <div className="voice-text-chat__input">
+          <MessageInput
+            onSendMessage={handleSendMessage}
+            onTyping={sendTyping}
+            channelName={targetName}
+            disabled={!currentUserId}
+            placeholder={`Message ${targetName} text chat...`}
+            replyingTo={replyingTo}
+            onCancelReply={cancelReply}
+          />
+        </div>
+      )}
     </div>
   );
 };

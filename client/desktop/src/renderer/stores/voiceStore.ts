@@ -377,6 +377,14 @@ interface VoiceState {
   addParticipant: (participant: VoiceParticipant) => void;
   removeParticipant: (userId: string) => void;
   updateParticipant: (userId: string, update: Partial<VoiceParticipant>) => void;
+  /**
+   * Create-or-merge a participant. Unlike updateParticipant (present-only
+   * no-op) this never drops the update: absent → create from defaults +
+   * partial; present → merge (preserving existing media streams). Used by the
+   * consume path so a consumed track is never lost to the join-vs-consume
+   * race — the symptom behind DM calls with no remote audio (#1873).
+   */
+  upsertParticipant: (userId: string, update: Partial<VoiceParticipant>) => void;
   setParticipants: (participants: VoiceParticipant[]) => void;
   clearParticipants: () => void;
 
@@ -657,6 +665,25 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
           [userId]: { ...existing, ...update },
         },
       };
+    }),
+  upsertParticipant: (userId, update) =>
+    set((state) => {
+      const existing = state.participants[userId];
+      const next: VoiceParticipant = existing
+        ? { ...existing, ...update }
+        : {
+            userId,
+            username: '',
+            isMuted: false,
+            isDeafened: false,
+            serverMuted: false,
+            serverDeafened: false,
+            isVideoOn: false,
+            isScreenSharing: false,
+            isSpeaking: false,
+            ...update,
+          };
+      return { participants: { ...state.participants, [userId]: next } };
     }),
   setParticipants: (participants) =>
     set({

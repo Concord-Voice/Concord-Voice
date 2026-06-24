@@ -194,6 +194,7 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
   const effectiveQualityTier = useVoiceStore((s) => s.effectiveQualityTier);
   const decoderHealth = useVoiceStore((s) => s.decoderHealth);
   const showVoiceTextChat = useVoiceStore((s) => s.showVoiceTextChat);
+  const isDMCall = useVoiceStore((s) => s.isDMCall);
   const voiceTextChatHeight = useVoiceStore((s) => s.voiceTextChatHeight);
   const setVoiceTextChatHeight = useVoiceStore((s) => s.setVoiceTextChatHeight);
   const voiceTextChatLayout = useVoiceStore((s) => s.voiceTextChatLayout);
@@ -214,7 +215,9 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
   const keepActiveWhileUnfocused = useVoiceStore((s) => s.keepActiveWhileUnfocused);
 
   const getLinkedTextChannel = useChannelStore((s) => s.getLinkedTextChannel);
-  const hasLinkedText = !!getLinkedTextChannel(channelId);
+  // DM calls always have a conversation to show in the text panel; server
+  // voice still requires an explicitly linked text channel (#1873).
+  const hasLinkedText = isDMCall || !!getLinkedTextChannel(channelId);
 
   const hasJoinedRef = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);

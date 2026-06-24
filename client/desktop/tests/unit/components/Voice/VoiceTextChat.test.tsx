@@ -4,12 +4,18 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { useChannelStore } from '@/renderer/stores/channelStore';
 import { useUserStore } from '@/renderer/stores/userStore';
+import { useDMStore } from '@/renderer/stores/dmStore';
+import { usePrivacyStore } from '@/renderer/stores/privacyStore';
 import { mockUser } from '../../../mocks/fixtures';
 import { vi } from 'vitest';
 
 // ── Hooks mocks ──────────────────────────────────────────────────────────────
 vi.mock('@/renderer/hooks/useChannelSubscription', () => ({
   useChannelSubscription: vi.fn(),
+}));
+
+vi.mock('@/renderer/hooks/useDMSubscription', () => ({
+  useDMSubscription: vi.fn(),
 }));
 
 const mockSendMessage = vi.fn();
@@ -289,5 +295,70 @@ describe('VoiceTextChat', () => {
     render(<VoiceTextChat />);
     expect(capturedMessageListProps.onPinToggle).toBeInstanceOf(Function);
     expect(capturedMessageListProps.canPin).toBeDefined();
+  });
+});
+
+// ── DM call mode (#1873) ──────────────────────────────────────────────────────
+
+describe('VoiceTextChat — DM call', () => {
+  const dmConversation = {
+    id: 'dm-1',
+    isGroup: false,
+    isPersonal: false,
+    name: '',
+    participants: [
+      { userId: 'me', username: 'me' },
+      { userId: 'u2', username: 'bob', displayName: 'Bob' },
+    ],
+  };
+
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    capturedMessageListProps = {};
+    capturedMessageInputProps = {};
+    useVoiceStore.setState({
+      activeChannelId: 'dm-1',
+      isDMCall: true,
+      dmConversationId: 'dm-1',
+      voiceTextChatLayout: 'horizontal',
+    });
+    useDMStore.setState({ conversations: [dmConversation] } as never);
+    useUserStore.setState({ user: { id: 'me', username: 'me' } } as never);
+  });
+
+  it('renders the DM conversation (not the server linked-channel empty state)', () => {
+    render(<VoiceTextChat />);
+    expect(screen.queryByText('No text channel linked')).not.toBeInTheDocument();
+    expect(screen.getByText('Bob Text Chat')).toBeInTheDocument();
+  });
+
+  it('passes the DM thread name to MessageList', () => {
+    render(<VoiceTextChat />);
+    expect(screen.getByTestId('message-list')).toHaveTextContent('Bob');
+  });
+
+  it('still exposes the layout toggle in DM mode', () => {
+    render(<VoiceTextChat />);
+    expect(screen.getByTitle(/Switch to (side|bottom) layout/)).toBeInTheDocument();
+  });
+
+  it('shows the DM empty state when the conversation id is missing', () => {
+    useVoiceStore.setState({ isDMCall: true, dmConversationId: null });
+    render(<VoiceTextChat />);
+    expect(screen.getByText('No conversation')).toBeInTheDocument();
+  });
+
+  it('renders the composer when DMs are not disabled (default privacy)', () => {
+    render(<VoiceTextChat />);
+    expect(screen.getByTestId('message-input')).toBeInTheDocument();
+    expect(screen.queryByText(/All DMs have been disabled/)).not.toBeInTheDocument();
+  });
+
+  it('preserves the DM privacy-disabled behavior (no composer when DMs are off)', () => {
+    usePrivacyStore.setState((s) => ({ settings: { ...s.settings, dmPrivacyLevel: 0 } }));
+    render(<VoiceTextChat />);
+    expect(screen.getByText(/All DMs have been disabled/)).toBeInTheDocument();
+    expect(screen.queryByTestId('message-input')).not.toBeInTheDocument();
   });
 });

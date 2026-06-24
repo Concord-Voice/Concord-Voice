@@ -201,6 +201,13 @@ vi.mock('@/renderer/services/messageQueue', () => ({
   }),
 }));
 
+// Stub VoiceView so the in-call routing test asserts routing, not VoiceView internals (#1873).
+vi.mock('@/renderer/components/Voice/VoiceView', () => ({
+  default: ({ channelName }: { channelName: string }) => (
+    <div data-testid="voice-view">{channelName}</div>
+  ),
+}));
+
 import DMChatArea from '@/renderer/components/DirectMessages/DMChatArea';
 
 // --- Test fixtures ---
@@ -1220,5 +1227,40 @@ describe('DMChatArea', () => {
     useVoiceStore.getState().seedActiveDMCall('conv-1', ['user-2'], 2);
     render(<DMChatArea selectedThreadId="conv-1" />);
     expect(screen.queryByRole('button', { name: /join voice call/i })).not.toBeInTheDocument();
+  });
+});
+
+// ── Active DM call → VoiceView surface (#1873) ────────────────────────────────
+
+describe('DMChatArea — active DM call (#1873)', () => {
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    mockGetPins.mockResolvedValue([]);
+    mockPinMessage.mockResolvedValue({});
+    mockUnpinMessage.mockResolvedValue({});
+    useUserStore.setState({ user: mockUser });
+    useDMStore.setState({ conversations: [makeConversation()] });
+  });
+
+  it('renders the VoiceView surface when the local user is in this conversation call', () => {
+    useVoiceStore.setState({ isDMCall: true, dmConversationId: 'conv-1' });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    const voiceView = screen.getByTestId('voice-view');
+    expect(voiceView).toBeInTheDocument();
+    // channelName is the resolved thread name (the other 1:1 participant).
+    expect(voiceView).toHaveTextContent('Alice');
+  });
+
+  it('renders the normal text view (no VoiceView) when not in any call', () => {
+    useVoiceStore.setState({ isDMCall: false, dmConversationId: null });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    expect(screen.queryByTestId('voice-view')).not.toBeInTheDocument();
+  });
+
+  it('does not render VoiceView while in a DIFFERENT conversation call', () => {
+    useVoiceStore.setState({ isDMCall: true, dmConversationId: 'other-conv' });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    expect(screen.queryByTestId('voice-view')).not.toBeInTheDocument();
   });
 });
