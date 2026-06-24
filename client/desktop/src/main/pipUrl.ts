@@ -4,6 +4,8 @@
  * spaSelfHealMainFrame.ts pattern, #753 reconciliation finding TA3).
  */
 
+import { SPA_CACHE_HOST, SPA_CACHE_SCHEME } from './spaCache/manifestSchema';
+
 /**
  * Build the URL the PiP child window should load.
  *
@@ -27,9 +29,11 @@ export function buildRemotePipUrl(spaUrl: string, pipId: string): string {
  *   origin must match the SPA's origin.
  * - **Packaged + bundled fallback** (`remoteSpaUrl` null): the sender must
  *   load via `app://concord` (the bundled renderer served by the custom
- *   protocol handler registered in main.ts; see #830). Legacy `file://`
- *   senders are rejected — that origin should no longer occur in packaged
- *   builds after #830.
+ *   protocol handler registered in main.ts; see #830) OR `spa-cache://concord`
+ *   (the signed last-known-good cache served by the dedicated privileged scheme;
+ *   see #1870). Both are first-party, protocol-gated, bundled-equivalent
+ *   fallbacks and are trusted identically here. Legacy `file://` senders are
+ *   rejected — that origin should no longer occur in packaged builds after #830.
  *
  * Returns `false` for empty / malformed sender URLs (fail-closed).
  */
@@ -61,9 +65,14 @@ export function isValidPipOpenSender(
   }
 
   // #830: bundled-mode renderer loads via app://concord/index.html (Task 4).
+  // #1870: the signed last-known-good cache serves from spa-cache://concord.
   // Reject the legacy file:// origin — it should no longer occur in packaged
   // builds, so seeing it would indicate a regression worth catching loudly.
   // Note: `URL.origin` returns the literal string "null" for non-special
-  // schemes like `app:` (per WHATWG URL spec), so we compare protocol + host.
-  return sender.protocol === 'app:' && sender.host === 'concord';
+  // schemes like `app:` / `spa-cache:` (per WHATWG URL spec), so we compare
+  // protocol + host (the constants stay the single source of truth).
+  if (sender.protocol === 'app:' && sender.host === 'concord') {
+    return true;
+  }
+  return sender.protocol === `${SPA_CACHE_SCHEME}:` && sender.host === SPA_CACHE_HOST;
 }

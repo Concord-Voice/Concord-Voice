@@ -110,6 +110,17 @@ describe('isValidPipOpenSender', () => {
       expect(isValidPipOpenSender('app://concord/index.html', true, null)).toBe(true);
     });
 
+    it('accepts spa-cache://concord sender (#1870 signed LKG cache)', () => {
+      // The signed last-known-good cache serves from spa-cache://concord — a
+      // first-party, protocol-gated, bundled-equivalent fallback trusted here
+      // identically to app://concord.
+      expect(isValidPipOpenSender('spa-cache://concord/index.html', true, null)).toBe(true);
+    });
+
+    it('rejects a spa-cache look-alike host (spa-cache://concord.evil)', () => {
+      expect(isValidPipOpenSender('spa-cache://concord.evil/index.html', true, null)).toBe(false);
+    });
+
     it('rejects https sender when bundled', () => {
       expect(isValidPipOpenSender('https://api.concordvoice.chat/', true, null)).toBe(false);
     });

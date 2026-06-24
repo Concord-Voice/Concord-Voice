@@ -75,11 +75,17 @@ import { resolveAppProtocolPath } from './appProtocol';
 import {
   resolveSpaSource,
   isUnexpectedBundled,
+  isTransientRemoteFailure,
   captureSpaHash,
   hashEntryHtml,
   SPA_NO_CACHE_LOAD_OPTIONS,
   type SpaLoadDecision,
 } from './spaLoader';
+import { handleCacheProtocolRequest } from './spaCache/cacheProtocol';
+import { getLiveDir } from './spaCache/cacheStore';
+import { populateCacheFromRemote } from './spaCache/populateCache';
+import { resolveCachedSpa } from './spaCache/resolveCachedSpa';
+import { SPA_CACHE_HOST, SPA_CACHE_SCHEME } from './spaCache/manifestSchema';
 import { handleDidFailLoad, handleSpaRequestSelfHeal } from './spaSelfHealMainFrame';
 import { buildRemotePipUrl, isValidPipOpenSender } from './pipUrl';
 import { extractInviteDeepLinkFromArgv, normalizeInviteDeepLink } from './deepLink';
@@ -167,6 +173,19 @@ if (app.isPackaged) {
   protocol.registerSchemesAsPrivileged([
     {
       scheme: 'app',
+      privileges: {
+        standard: true,
+        secure: true,
+        supportFetchAPI: true,
+        corsEnabled: true,
+      },
+    },
+    // spa-cache:// scheme (#1870) — serves the signed last-known-good SPA cache
+    // from a DEDICATED privileged origin, distinct from app://concord (bundled).
+    // Same privileges as app:// (non-null Origin for server CORS, secure context
+    // for WebCrypto/ServiceWorker, fetch + CORS). Packaged-only: dev uses Vite.
+    {
+      scheme: SPA_CACHE_SCHEME,
       privileges: {
         standard: true,
         secure: true,
@@ -273,38 +292,19 @@ async function loadDevRendererWithFallback(
   }
 }
 
+/** Effective SPA load outcome: remote, the signed LKG cache (#1870), or bundled. */
+type SpaLoadOutcome = 'remote' | 'cache' | 'bundled';
+
 /**
- * Apply a resolved SPA decision to a live window. Sets the remote-SPA state
- * BEFORE loadURL — load-bearing so the will-navigate gate, PiP, openExternal,
- * SSO, and versionInfo origin consumers key on the ACTUAL loaded origin — then
- * navigates and best-effort-captures the entry HTML hash. Fails closed to the
- * bundled app:// scheme on any remote-load failure. Shared by the launch path
- * (loadPackagedRenderer) and the runtime `spa:reloadLatest` handler so the two
- * can never drift. Returns the mode actually loaded.
+ * Load the terminal bundled `app://concord` renderer. #830: app:// gives the
+ * renderer a non-null Origin for server CORS. Bundled is the terminal load
+ * layer, so a failure here leaves a blank window with no further fallback —
+ * surface it to the splash error overlay. Always clears remote-SPA state first.
  */
-async function applySpaDecision(
-  window: BrowserWindow,
-  decision: SpaLoadDecision
-): Promise<'remote' | 'bundled'> {
-  if (decision.mode === 'remote' && decision.url) {
-    try {
-      setRemoteSpaState(decision.url);
-      await window.loadURL(decision.url, SPA_NO_CACHE_LOAD_OPTIONS);
-      // Capture the entry HTML hash for client attestation (#677). Best-effort:
-      // captureSpaHash never throws, so this cannot break the load path.
-      await captureSpaHash('remote', decision.url);
-      return 'remote';
-    } catch {
-      console.warn('[SpaLoader] Failed to load remote SPA, falling back to bundled');
-      setRemoteSpaState(null);
-    }
-  }
-  // Bundled-mode load: clear state so PiP and origin-only consumers see a
-  // consistent "not in remote-SPA mode" signal even on re-entry.
+async function loadBundledFallback(window: BrowserWindow): Promise<'bundled'> {
+  // Clear state so PiP and origin-only consumers see a consistent "not in
+  // remote-SPA mode" signal even on re-entry.
   setRemoteSpaState(null);
-  // #830: load bundled via app:// scheme so renderer has a non-null Origin.
-  // Bundled is the terminal load layer, so a failure here would leave a blank
-  // window with no further fallback — surface it to the splash error overlay.
   try {
     await window.loadURL('app://concord/index.html');
     // Covers genuine bundled mode AND the remote→bundled fallback, so the
@@ -315,6 +315,97 @@ async function applySpaDecision(
     revealLoadFailure(window, 'Could not load application — please reinstall');
   }
   return 'bundled';
+}
+
+/**
+ * Attempt to serve the signed last-known-good cache (#1870). Returns 'cache'
+ * iff a valid live cache verified AND the cache URL loaded; otherwise null so
+ * the caller falls through to the bundled path. The cache is a LOCAL privileged
+ * origin (spa-cache://concord), NOT a remote SPA — so we clear remote-SPA state
+ * and treat it like bundled for origin/attestation purposes (captureSpaHash
+ * fetches the cache's index.html via the protocol handler, which serves it).
+ */
+async function tryCacheLoad(window: BrowserWindow): Promise<'cache' | null> {
+  const cached = resolveCachedSpa();
+  if (!cached) {
+    return null;
+  }
+  try {
+    setRemoteSpaState(null);
+    await window.loadURL(cached.url);
+    await captureSpaHash('bundled');
+    console.debug('[SpaLoader] served signed last-known-good cache');
+    return 'cache';
+  } catch (err) {
+    console.warn('[SpaLoader] cache load failed, falling back to bundled:', (err as Error).message);
+    return null;
+  }
+}
+
+/**
+ * Apply a resolved SPA decision to a live window. Sets the remote-SPA state
+ * BEFORE loadURL — load-bearing so the will-navigate gate, PiP, openExternal,
+ * SSO, and versionInfo origin consumers key on the ACTUAL loaded origin — then
+ * navigates and best-effort-captures the entry HTML hash.
+ *
+ * Fallback order on a remote failure:
+ *   1. signed LKG cache (#1870) — ONLY when the remote `loadURL` threw, or the
+ *      decision is bundled for a TRANSIENT remote reason (config fetch failed /
+ *      5xx). NOT for expected-bundled reasons (no apiBase / no spaUrl / contract
+ *      zero) or an IPC-mismatch — those must not be masked by a stale cache.
+ *   2. bundled app://concord (terminal).
+ *
+ * On a successful remote load, fires a best-effort cache refresh (fire-and-
+ * forget; never awaited, never throws into the load path).
+ *
+ * Shared by the launch path (loadPackagedRenderer) and the runtime
+ * `spa:reloadLatest` handler so the two can never drift. Returns the effective
+ * mode actually loaded.
+ */
+async function applySpaDecision(
+  window: BrowserWindow,
+  decision: SpaLoadDecision
+): Promise<SpaLoadOutcome> {
+  if (decision.mode === 'remote' && decision.url) {
+    try {
+      setRemoteSpaState(decision.url);
+      await window.loadURL(decision.url, SPA_NO_CACHE_LOAD_OPTIONS);
+      // Capture the entry HTML hash for client attestation (#677). Best-effort:
+      // captureSpaHash never throws, so this cannot break the load path.
+      await captureSpaHash('remote', decision.url);
+      // #1870: best-effort refresh the signed LKG cache from the live origin.
+      // Fire-and-forget — must NOT delay the visible load; swallow rejections.
+      try {
+        const origin = new URL(decision.url).origin + '/';
+        void populateCacheFromRemote(origin).catch(() => {});
+      } catch {
+        // Malformed decision.url — already loaded fine; just skip the refresh.
+      }
+      return 'remote';
+    } catch {
+      console.warn('[SpaLoader] Failed to load remote SPA, trying cache then bundled');
+      setRemoteSpaState(null);
+      // The remote loadURL threw — a genuine remote failure, so the cache may
+      // bridge the gap (#1870).
+      const cacheMode = await tryCacheLoad(window);
+      if (cacheMode) {
+        return cacheMode;
+      }
+      return loadBundledFallback(window);
+    }
+  }
+
+  // Bundled decision. Consult the signed cache ONLY for a transient remote
+  // failure (config fetch failed / 5xx) — never for expected-bundled reasons or
+  // an IPC-mismatch (those must not be masked by a stale cache).
+  if (isTransientRemoteFailure(decision.reason)) {
+    const cacheMode = await tryCacheLoad(window);
+    if (cacheMode) {
+      return cacheMode;
+    }
+  }
+
+  return loadBundledFallback(window);
 }
 
 // #1742 follow-up: the SPA-source decision is made once at launch with a 5s
@@ -596,6 +687,12 @@ app.whenReady().then(async () => {
       // path.resolve emits drive-letter paths like C:\app\...
       return net.fetch(pathToFileURL(result.absolutePath).href);
     });
+
+    // spa-cache:// protocol handler (#1870) — serves the VERIFIED last-known-good
+    // SPA cache from the live cache dir. The pure resolver in cacheProtocol.ts
+    // mirrors appProtocol.ts's path-traversal rejection; getLiveDir resolves the
+    // pinned userData path lazily at request time.
+    protocol.handle(SPA_CACHE_SCHEME, (request) => handleCacheProtocolRequest(request, getLiveDir));
   }
 
   registerOpenExternalHandler(getRemoteSpaBaseUrl);
@@ -924,7 +1021,14 @@ ipcMain.handle('spa:reloadLatest', async (event) => {
   const before = getSpaHash();
   const decision = await resolveSpaSource();
   console.debug(`[SpaLoader/reload] ${decision.mode}: ${decision.reason}`);
-  const mode = await applySpaDecision(mainWindow, decision);
+  const outcome = await applySpaDecision(mainWindow, decision);
+  // Collapse the internal 'cache' outcome to 'bundled' for the renderer-facing
+  // IPC contract (#1870): the signed LKG cache is a local fallback origin, not a
+  // remote SPA, and no renderer consumer distinguishes it — checkForUpdate's
+  // currentMode already reports 'bundled' when serving from cache (remote-SPA
+  // state is null). Keeps the preload `mode: 'remote' | 'bundled'` type honest
+  // without leaking the internal selection detail to the renderer.
+  const mode: 'remote' | 'bundled' = outcome === 'remote' ? 'remote' : 'bundled';
   return { mode, changed: getSpaHash() !== before };
 });
 
@@ -1297,6 +1401,19 @@ ipcMain.handle(
       // `/spa/<sha>/` path component. Origin-only would fall through to
       // nginx's catch-all and redirect to the marketing site (#802).
       pip.loadURL(buildRemotePipUrl(remoteUrl, opts.id));
+    } else if (
+      (mainWindow?.webContents.getURL() ?? '').startsWith(
+        `${SPA_CACHE_SCHEME}://${SPA_CACHE_HOST}/`
+      )
+    ) {
+      // #1870: the main window is serving from the signed last-known-good cache
+      // (setRemoteSpaState(null) means remoteUrl is null, but the cache origin is
+      // the active shell). Load the PiP child from the SAME cache origin so it
+      // renders the cached shell, not the possibly-older bundled asset. The
+      // will-navigate gate + spa-cache protocol handler permit and
+      // integrity-verify it. Derived from the live main-window URL (stateless) so
+      // it cannot drift from the actual effective mode.
+      pip.loadURL(`${SPA_CACHE_SCHEME}://${SPA_CACHE_HOST}/index.html#/pip/${opts.id}`);
     } else {
       // #830: PiP bundled mode loads via app:// for consistent origin.
       pip.loadURL(`app://concord/index.html#/pip/${opts.id}`);
@@ -1361,6 +1478,32 @@ if (gotTheLock) {
   app.quit();
 }
 
+/**
+ * Packaged-mode same-origin navigation allowlist for the `will-navigate` gate.
+ * Returns true when `parsedUrl` is a permitted in-window navigation target:
+ *   - the active remote SPA origin (origin-equality), OR
+ *   - the bundled `app://concord` origin, OR
+ *   - the signed last-known-good cache `spa-cache://concord` origin (#1870).
+ *
+ * For the two non-special schemes, compare protocol + host (WHATWG `URL.origin`
+ * is the literal "null" for non-special schemes — same gotcha as
+ * pipUrl.ts:isValidPipOpenSender). A remote/compromised page cannot reach
+ * `app://` or `spa-cache://` here: no branch matches a remote-origin frame, and
+ * Chromium scheme-gating blocks remote→privileged navigation independently.
+ *
+ * Extracted from the will-navigate handler so that handler stays within the
+ * cognitive-complexity budget (S3776) as origins are added.
+ */
+function isPermittedPackagedNavTarget(parsedUrl: URL, spaOrigin: string | null): boolean {
+  if (spaOrigin && parsedUrl.origin === spaOrigin) {
+    return true;
+  }
+  if (parsedUrl.protocol === 'app:' && parsedUrl.host === 'concord') {
+    return true;
+  }
+  return parsedUrl.protocol === `${SPA_CACHE_SCHEME}:` && parsedUrl.host === SPA_CACHE_HOST;
+}
+
 // Security: validate navigation. After #754: extends with externalization
 // safety net — bare <a href="https://..."> clicks (or programmatic
 // navigation) route to the OS browser via shell.openExternal instead of
@@ -1379,22 +1522,17 @@ app.on('web-contents-created', (_, contents) => {
     }
 
     if (app.isPackaged) {
-      // Packaged release: allow same-origin SPA navigation. spaOrigin is
-      // already an origin string (set via `new URL(decision.url).origin`),
-      // so a direct read suffices.
-      const spaOrigin = getRemoteSpaBaseUrl();
-      if (spaOrigin && parsedUrl.origin === spaOrigin) {
-        return;
-      }
-      // #830 review: in bundled-fallback mode (post-Task-4), the renderer
-      // loads from app://concord/index.html and setRemoteSpaState(null)
-      // leaves spaOrigin empty. SPA navigations within the app://concord
-      // origin (e.g., chunk reloads, programmatic location.assign) must
-      // still be allowed through this gate. Use protocol+host comparison
-      // rather than parsedUrl.origin because WHATWG URL spec returns
-      // "null" for URL.origin on non-special schemes — same gotcha as in
-      // pipUrl.ts:isValidPipOpenSender.
-      if (parsedUrl.protocol === 'app:' && parsedUrl.host === 'concord') {
+      // Packaged release: allow same-origin SPA navigation within the active
+      // remote SPA origin, the bundled `app://concord` origin, or the signed
+      // last-known-good cache `spa-cache://concord` origin (#1870). This permits
+      // in-window navigations these origins legitimately perform — chunk reloads,
+      // programmatic location.assign, and full-page reloads from the error-
+      // boundary "Reload" / resetService.softRestart() crash-recovery paths
+      // (load-bearing for the cache, which is exactly the degraded-network state
+      // where recovery matters). See isPermittedPackagedNavTarget for the
+      // protocol+host comparison rationale and why a remote page cannot reach the
+      // privileged schemes here.
+      if (isPermittedPackagedNavTarget(parsedUrl, getRemoteSpaBaseUrl())) {
         return;
       }
       // Block in-window navigation to anything else.

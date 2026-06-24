@@ -28,6 +28,8 @@
  * or http://localhost:3000.evil.com/.
  */
 
+import { SPA_CACHE_HOST, SPA_CACHE_SCHEME } from '../spaCache/manifestSchema';
+
 const LOCAL_DEV_PATTERN = /^http:\/\/localhost:\d+(\/|$)/;
 const BUNDLED_PREFIX = 'file://';
 const BUNDLED_APP_HOST = 'concord';
@@ -45,7 +47,14 @@ const BUNDLED_APP_HOST = 'concord';
 function isBundledAppUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
-    return parsed.protocol === 'app:' && parsed.host === BUNDLED_APP_HOST;
+    if (parsed.protocol === 'app:' && parsed.host === BUNDLED_APP_HOST) {
+      return true;
+    }
+    // #1870: the verified last-known-good SPA cache serves from the dedicated
+    // privileged spa-cache://concord scheme - the same class of first-party,
+    // protocol-gated local origin as app://concord (cacheProtocol.ts serves only
+    // signature+hash-verified bytes), so it is trusted identically.
+    return parsed.protocol === `${SPA_CACHE_SCHEME}:` && parsed.host === SPA_CACHE_HOST;
   } catch {
     return false;
   }

@@ -169,6 +169,30 @@ export function isUnexpectedBundled(reason: string): boolean {
 }
 
 /**
+ * Classify a bundled-fallback reason as a TRANSIENT remote failure — i.e. the
+ * server was reachable-in-principle but the config fetch failed or returned a
+ * 5xx. The signed LKG cache (#1870) is consulted ONLY for these reasons: a
+ * transient network/server hiccup is exactly when a last-known-good cache should
+ * bridge the gap.
+ *
+ * Deliberately NARROW. It must NOT match:
+ *   - expected bundled reasons (no apiBase, no spaUrl, contract zero) — those
+ *     are normal operation, not an outage; serving a cache there would mask a
+ *     legitimately-bundled posture.
+ *   - IPC-contract mismatch or a rejected spaUrl — a stale cache must not bypass
+ *     a required binary update or a server-side misconfiguration signal.
+ *
+ * Matches `resolveSpaSource`'s two transient reason shapes:
+ *   - `config fetch failed: <message>`        (network error / timeout, line 118)
+ *   - `config fetch returned 5xx`             (server-side 5xx, line 64)
+ * A 4xx (`config fetch returned 4xx`) is NOT transient — it is a client/auth
+ * problem, so the cache is not consulted.
+ */
+export function isTransientRemoteFailure(reason: string): boolean {
+  return reason.startsWith('config fetch failed') || /^config fetch returned 5\d\d/.test(reason);
+}
+
+/**
  * Regex to extract the deploy SHA from a remote SPA URL path of the form
  * `/spa/<sha>/...`. Mirrors the pattern in versionInfo.ts.
  */

@@ -27,9 +27,9 @@ describe('isPermittedFrameUrl', () => {
     it('accepts app://concord even when a remote SPA origin is also configured', () => {
       // PiP / self-heal can leave a remote origin set while a bundled frame
       // exists; the bundled origin is independently trusted.
-      expect(
-        isPermittedFrameUrl('app://concord/index.html', 'https://spa.concordvoice.chat')
-      ).toBe(true);
+      expect(isPermittedFrameUrl('app://concord/index.html', 'https://spa.concordvoice.chat')).toBe(
+        true
+      );
     });
 
     it('rejects app://other (wrong host)', () => {
@@ -42,6 +42,46 @@ describe('isPermittedFrameUrl', () => {
 
     it('rejects a host-suffix look-alike app://concordX', () => {
       expect(isPermittedFrameUrl('app://concordX/index.html', null)).toBe(false);
+    });
+  });
+
+  describe('spa-cache://concord cache renderer (#1870, Finding C)', () => {
+    // The signed last-known-good cache serves from spa-cache://concord and must
+    // be a permitted frame — otherwise every privileged IPC (attestation token,
+    // spa:reloadLatest, SSO, openExternal) rejects the cache renderer exactly as
+    // the bundled build was rejected before #830. The cache origin is granted
+    // the SAME trust as app://concord.
+    //
+    // NOTE: depends on the orchestrator applying the (hook-blocked) source edit
+    // to src/main/ipc/frameValidation.ts that accepts spa-cache://concord.
+    it('accepts spa-cache://concord when no remote SPA is active', () => {
+      expect(isPermittedFrameUrl('spa-cache://concord', null)).toBe(true);
+    });
+
+    it('accepts spa-cache://concord/index.html', () => {
+      expect(isPermittedFrameUrl('spa-cache://concord/index.html', null)).toBe(true);
+    });
+
+    it('accepts spa-cache://concord with a hash route', () => {
+      expect(isPermittedFrameUrl('spa-cache://concord/index.html#/channels/1', null)).toBe(true);
+    });
+
+    it('accepts spa-cache://concord even when a remote SPA origin is configured', () => {
+      expect(
+        isPermittedFrameUrl('spa-cache://concord/index.html', 'https://spa.concordvoice.chat')
+      ).toBe(true);
+    });
+
+    it('rejects a look-alike host spa-cache://concord.evil', () => {
+      expect(isPermittedFrameUrl('spa-cache://concord.evil/index.html', null)).toBe(false);
+    });
+
+    it('rejects a host-suffix look-alike spa-cache://evil', () => {
+      expect(isPermittedFrameUrl('spa-cache://evil/index.html', null)).toBe(false);
+    });
+
+    it('rejects a scheme look-alike spa-cacheX://concord', () => {
+      expect(isPermittedFrameUrl('spa-cacheX://concord/index.html', null)).toBe(false);
     });
   });
 

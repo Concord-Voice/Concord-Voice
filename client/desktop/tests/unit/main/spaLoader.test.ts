@@ -32,6 +32,7 @@ import { getSpaHash, getSpaVersion, setSpaHash, setSpaVersion } from '@/main/spa
 import {
   resolveSpaSource,
   isUnexpectedBundled,
+  isTransientRemoteFailure,
   captureSpaHash,
   hashEntryHtml,
   SPA_NO_CACHE_LOAD_OPTIONS,
@@ -147,6 +148,43 @@ describe('isUnexpectedBundled', () => {
 
   it('treats unknown reasons as UNEXPECTED (fail-loud)', () => {
     expect(isUnexpectedBundled('something we did not anticipate')).toBe(true);
+  });
+});
+
+// ─── isTransientRemoteFailure (#1870 cache-selection gate) ───────────────────
+
+describe('isTransientRemoteFailure', () => {
+  it('treats config-fetch-failed (network/timeout) as transient → cache may serve', () => {
+    expect(isTransientRemoteFailure('config fetch failed: timeout after 5000ms')).toBe(true);
+    expect(isTransientRemoteFailure('config fetch failed: ECONNREFUSED')).toBe(true);
+  });
+
+  it('treats a 5xx config response as transient → cache may serve', () => {
+    expect(isTransientRemoteFailure('config fetch returned 500')).toBe(true);
+    expect(isTransientRemoteFailure('config fetch returned 503')).toBe(true);
+  });
+
+  it('treats a 4xx config response as NOT transient (client/auth problem)', () => {
+    expect(isTransientRemoteFailure('config fetch returned 404')).toBe(false);
+    expect(isTransientRemoteFailure('config fetch returned 401')).toBe(false);
+  });
+
+  it('treats EXPECTED bundled reasons as NOT transient (no cache masking)', () => {
+    expect(isTransientRemoteFailure('no persisted API base (first launch or logged out)')).toBe(
+      false
+    );
+    expect(isTransientRemoteFailure('server has no spaUrl configured')).toBe(false);
+    expect(isTransientRemoteFailure('server spaIpcContract is zero or absent')).toBe(false);
+  });
+
+  it('treats IPC-contract-mismatch as NOT transient (must not bypass binary update)', () => {
+    expect(isTransientRemoteFailure('IPC contract 8 < required 9 — shell update needed')).toBe(
+      false
+    );
+  });
+
+  it('treats spaUrl-rejected as NOT transient (server misconfiguration signal)', () => {
+    expect(isTransientRemoteFailure('spaUrl rejected: non-HTTPS protocol http:')).toBe(false);
   });
 });
 

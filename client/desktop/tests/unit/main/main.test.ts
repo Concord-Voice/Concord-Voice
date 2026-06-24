@@ -232,6 +232,7 @@ vi.mock('../../../src/main/loadFailureVisibility', () => ({
 vi.mock('../../../src/main/spaLoader', () => ({
   resolveSpaSource: vi.fn(() => Promise.resolve({ mode: 'bundled', reason: 'test' })),
   isUnexpectedBundled: vi.fn(() => false),
+  isTransientRemoteFailure: vi.fn(() => false),
   captureSpaHash: vi.fn(() => Promise.resolve()),
   hashEntryHtml: vi.fn(() => Promise.resolve('sha256:available')),
   SPA_NO_CACHE_LOAD_OPTIONS: {
@@ -1288,6 +1289,68 @@ describe('main.ts', () => {
         expect(() => willNavigate(event, 'not-a-valid-url-at-all')).not.toThrow();
         expect(event.preventDefault).toHaveBeenCalled();
         expect(shell.openExternal).not.toHaveBeenCalled();
+      } finally {
+        (app as unknown as { isPackaged: boolean }).isPackaged = false;
+      }
+    });
+
+    // #1870 Finding D: the signed LKG cache serves from spa-cache://concord and
+    // (like bundled app://concord) leaves the SPA origin empty. A same-origin
+    // full-page reload within the cache (error-boundary "Reload", crash recovery)
+    // must be ALLOWED through the packaged will-navigate gate; without the branch
+    // it would hit preventDefault() and strand the user in the very degraded state
+    // the cache exists for. These mirror the app://concord same-origin allow case
+    // and prove the new branch did NOT widen the gate to other origins / hosts.
+    it('packaged mode: ALLOWS same-origin spa-cache://concord navigation (no preventDefault)', async () => {
+      const electron = await import('electron');
+      const { app, shell } = electron;
+      (app as unknown as { isPackaged: boolean }).isPackaged = true;
+      try {
+        const webContentsCreated = (app.on as Mock).mock.calls.find(
+          (c: unknown[]) => c[0] === 'web-contents-created'
+        );
+        const mockContents = { on: vi.fn() };
+        webContentsCreated![1]({}, mockContents);
+        const willNavigate = mockContents.on.mock.calls.find(
+          (c: unknown[]) => c[0] === 'will-navigate'
+        )![1] as (event: { preventDefault: () => void }, url: string) => void;
+
+        (shell.openExternal as Mock).mockClear();
+        const event = { preventDefault: vi.fn() };
+        willNavigate(event, 'spa-cache://concord/index.html');
+        // Allowed in-window: the handler returns WITHOUT preventDefault, and does
+        // not externalize to the OS browser.
+        expect(event.preventDefault).not.toHaveBeenCalled();
+        expect(shell.openExternal).not.toHaveBeenCalled();
+      } finally {
+        (app as unknown as { isPackaged: boolean }).isPackaged = false;
+      }
+    });
+
+    it('packaged mode: BLOCKS spa-cache:// with a non-concord host (host-exactness)', async () => {
+      const electron = await import('electron');
+      const { app, shell } = electron;
+      (app as unknown as { isPackaged: boolean }).isPackaged = true;
+      try {
+        const webContentsCreated = (app.on as Mock).mock.calls.find(
+          (c: unknown[]) => c[0] === 'web-contents-created'
+        );
+        const mockContents = { on: vi.fn() };
+        webContentsCreated![1]({}, mockContents);
+        const willNavigate = mockContents.on.mock.calls.find(
+          (c: unknown[]) => c[0] === 'will-navigate'
+        )![1] as (event: { preventDefault: () => void }, url: string) => void;
+
+        // spa-cache://evil and spa-cache://concord.evil are NOT the exact host
+        // SPA_CACHE_HOST ('concord'), so the allow branch must not match → blocked.
+        for (const url of ['spa-cache://evil/index.html', 'spa-cache://concord.evil/index.html']) {
+          (shell.openExternal as Mock).mockClear();
+          const event = { preventDefault: vi.fn() };
+          willNavigate(event, url);
+          expect(event.preventDefault).toHaveBeenCalled();
+          // Non-https scheme → silently dropped after preventDefault (no externalize).
+          expect(shell.openExternal).not.toHaveBeenCalled();
+        }
       } finally {
         (app as unknown as { isPackaged: boolean }).isPackaged = false;
       }
