@@ -58,6 +58,7 @@ npx @redocly/cli lint docs/api/openapi.yaml
 | DMs | `/dm/conversations`, `/dm/conversations/{id}/messages` | Bearer |
 | Friends | `/friends/codes` | Bearer |
 | Voice | `/voice/{join,leave,signal}` | Bearer |
+| Platform (public) | `/client/config`, `/server/capabilities` | Public (rate-limited) |
 
 ## Base URL
 

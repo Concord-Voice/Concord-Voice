@@ -146,6 +146,13 @@ type Config struct {
 	SpaIpcContract   int    // Minimum IPC contract version required by the remote SPA; 0 = no remote SPA
 	SpaConfigFile    string // Path to mounted spa.env for hot-reload; empty = static config from env vars
 
+	// Self-hosted capability seam (#662). InstanceType ∈ {"saas","self-hosted"};
+	// unknown/empty is normalized to "saas" at the capabilities handler so a
+	// misconfigured value can never accidentally unlock self-hosted mode.
+	// ServerVersion is advertised for client version-skew clamping; "dev" when unset.
+	InstanceType  string // INSTANCE_TYPE: "saas" (default) | "self-hosted"
+	ServerVersion string // SERVER_VERSION: advertised server version; "dev" when unset
+
 	// Desktop update assets — local directory populated by deploy.sh
 	ReleasesDir string // Path to directory containing release assets; empty disables update endpoint
 
@@ -291,6 +298,8 @@ func Load() (*Config, error) {
 		SpaURL:                getEnv("SPA_URL", ""),
 		SpaIpcContract:        getEnvInt("SPA_IPC_CONTRACT", 0),
 		SpaConfigFile:         getEnv("SPA_CONFIG_FILE", ""),
+		InstanceType:          getEnv("INSTANCE_TYPE", "saas"),
+		ServerVersion:         getEnv("SERVER_VERSION", "dev"),
 		ReleasesDir:           getEnv("RELEASES_DIR", ""),
 		SMTPHost:              getEnv("SMTP_HOST", ""),
 		SMTPPort:              getEnvInt("SMTP_PORT", 587),

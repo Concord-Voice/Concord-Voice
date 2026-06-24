@@ -28,6 +28,7 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/notifications"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/ownership"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/servercapabilities"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/servers"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/sessions"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/updates"
@@ -246,6 +247,7 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	wsHandler := websocket.NewHandler(hub, db, redis, cfg.JWTSecret, cfg.AllowedOrigins)
 	wsTicketHandler := auth.NewWSTicketHandler(redis, cfg.JWTSecret)
 	clientConfigHandler := clientconfig.NewHandler(cfg, liveSpa, log)
+	serverCapabilitiesHandler := servercapabilities.NewHandler(cfg)
 	updatesHandler := updates.NewHandler(cfg, log)
 	privacyHandler := buildPrivacyHandler(db, log)
 	oauthHandler := buildOAuthHandler(db, redis, cfg, authHandler, log)
@@ -448,6 +450,21 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 		v1.GET("/client/config",
 			middleware.RateLimitByIP(redis, 30, 1*time.Minute),
 			clientConfigHandler.GetConfig,
+		)
+
+		// Server capabilities (public — pre-auth discovery; clients clamp their
+		// feature surface to this before/at login). Rate-limited at 30/min/IP to
+		// match the sibling /client/config: this is the FIRST pre-auth request a
+		// client makes, and self-hosted/corporate deployments (this endpoint's
+		// primary driver, #1615) commonly egress many clients through one NAT IP,
+		// so a tighter budget would 429 the (N>cap)th simultaneous launcher and
+		// block login. The descriptor is constant and auth-state-independent, so
+		// there is nothing to enumerate; the limit is pure abuse/DoS throttling,
+		// for which parity with the more-sensitive, less-cacheable /client/config
+		// is the right calibration (#662).
+		v1.GET("/server/capabilities",
+			middleware.RateLimitByIP(redis, 30, 1*time.Minute),
+			serverCapabilitiesHandler.GetCapabilities,
 		)
 
 		// Desktop update assets (public — electron-updater needs this pre-auth)

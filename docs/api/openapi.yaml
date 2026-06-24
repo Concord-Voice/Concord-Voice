@@ -2667,6 +2667,102 @@ paths:
                 $ref: '#/components/schemas/ClientConfig'
         '429':
           $ref: '#/components/responses/RateLimited'
+  /server/capabilities:
+    get:
+      tags:
+      - Platform
+      summary: Discover server capabilities
+      description: 'Public pre-auth endpoint advertising server auth options and feature
+
+        surface so clients can render the correct login form and clamp their feature
+
+        set before login (version skew). Response is identical regardless of auth
+
+        state. Cache-Control: public, max-age=300. Rate limit: 10 requests per minute
+
+        (IP-based). Schema is additively-evolvable (new fields optional).
+
+        '
+      operationId: getServerCapabilities
+      security: []
+      responses:
+        '200':
+          description: Server capability descriptor
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - server
+                - auth
+                - features
+                - policyVersion
+                properties:
+                  server:
+                    type: object
+                    required:
+                    - name
+                    - version
+                    - instanceType
+                    properties:
+                      name:
+                        type: string
+                      version:
+                        type: string
+                      instanceType:
+                        type: string
+                        enum:
+                        - saas
+                        - self-hosted
+                  auth:
+                    type: object
+                    required:
+                    - emailVerificationRequired
+                    - mfaEnabled
+                    - mfaMethods
+                    - oauthProviders
+                    - ldapEnabled
+                    - samlEnabled
+                    properties:
+                      emailVerificationRequired:
+                        type: boolean
+                      mfaEnabled:
+                        type: boolean
+                      mfaMethods:
+                        type: array
+                        items:
+                          type: string
+                      oauthProviders:
+                        type: array
+                        items:
+                          type: string
+                      ldapEnabled:
+                        type: boolean
+                      samlEnabled:
+                        type: boolean
+                  features:
+                    type: object
+                    required:
+                    - voiceTiersSupported
+                    - e2eeEnforcedEverywhere
+                    - maxMembersPerServer
+                    - entitlementMode
+                    properties:
+                      voiceTiersSupported:
+                        type: boolean
+                      e2eeEnforcedEverywhere:
+                        type: boolean
+                      maxMembersPerServer:
+                        type: integer
+                      entitlementMode:
+                        type: string
+                        enum:
+                        - saas
+                        - self-hosted-unlocked
+                  policyVersion:
+                    type: string
+        '429':
+          $ref: '#/components/responses/RateLimited'
   /dm/conversations:
     get:
       tags:
