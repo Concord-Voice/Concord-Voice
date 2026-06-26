@@ -19,6 +19,18 @@ export const PINNED_USER_DATA_DIR = 'ConcordVoice';
 
 /** Pin userData to <appData>/ConcordVoice. Idempotent; safe before app ready. */
 export function pinUserDataPath(): void {
+  // Honor an explicit --user-data-dir (multi-instance dev, e.g. concord-dev.sh
+  // --clients N). Electron applies that switch to `userData` before app code
+  // runs; pinning over it would collapse every instance onto one userData (and
+  // one single-instance lock), so only one client could launch. macOS resolves
+  // app.getPath('appData') via the Cocoa API and ignores $HOME, so --user-data-dir
+  // is the ONLY reliable per-instance isolation. Production never passes the
+  // switch, so the pin below still applies there unchanged (ADR-0020).
+  const hasExplicitUserDataDir = process.argv.some(
+    (arg) => arg === '--user-data-dir' || arg.startsWith('--user-data-dir=')
+  );
+  if (hasExplicitUserDataDir) return;
+
   app.setPath('userData', path.join(app.getPath('appData'), PINNED_USER_DATA_DIR));
 }
 

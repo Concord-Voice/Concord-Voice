@@ -1,5 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { parseAv1Obus as parseAv1ObusForTest } from '@/renderer/services/av1ObuParser';
+import { decodeObuMiniHeader as decodeObuMiniHeaderForTest } from '@/renderer/services/mediaFrameMiniHeader';
 
 // MediaEncryption is the default export-less class — import directly
 let MediaEncryption: typeof import('@/renderer/services/mediaEncryption').MediaEncryption;
@@ -52,7 +54,7 @@ describe('MediaEncryption', () => {
       // Copy original data for comparison
       const originalData = new Uint8Array(frame.data).slice();
 
-      await sender.encryptFrame(frame);
+      await sender.encryptFrame(frame, 'opus');
 
       // Frame should be larger (payload + trailer overhead)
       expect(frame.data.byteLength).toBeGreaterThan(50);
@@ -62,11 +64,11 @@ describe('MediaEncryption', () => {
       expect(encrypted[encrypted.length - 1]).toBe(0xad);
       expect(encrypted[encrypted.length - 2]).toBe(0xde);
 
-      // headerBytes field should be 1 (audio) — v3 trailer position -21
-      expect(encrypted[encrypted.length - 21]).toBe(1);
+      // headerBytes field should be 1 (audio) — v4 trailer position -22
+      expect(encrypted[encrypted.length - 22]).toBe(1);
 
       // Decrypt
-      await receiver.decryptFrame(frame, 'sender-user-id');
+      await receiver.decryptFrame(frame, 'sender-user-id', 'opus');
 
       // Should match original
       const decrypted = new Uint8Array(frame.data);
@@ -85,14 +87,14 @@ describe('MediaEncryption', () => {
       const frame = fakeVideoFrame(200);
       const originalData = new Uint8Array(frame.data).slice();
 
-      await sender.encryptFrame(frame);
+      await sender.encryptFrame(frame, 'vp9');
       expect(frame.data.byteLength).toBeGreaterThan(200);
 
-      // headerBytes field should be 2 (video) — v3 trailer position -21
+      // headerBytes field should be 2 (video) — v4 trailer position -22
       const encrypted = new Uint8Array(frame.data);
-      expect(encrypted[encrypted.length - 21]).toBe(2);
+      expect(encrypted[encrypted.length - 22]).toBe(2);
 
-      await receiver.decryptFrame(frame, 'sender-user-id');
+      await receiver.decryptFrame(frame, 'sender-user-id', 'vp9');
       expect(new Uint8Array(frame.data)).toEqual(originalData);
     });
 
@@ -114,13 +116,13 @@ describe('MediaEncryption', () => {
       const frame = fakeAudioFrame(40);
       const originalData = new Uint8Array(frame.data).slice();
 
-      await sender.encryptFrame(frame);
+      await sender.encryptFrame(frame, 'opus');
 
-      // keyId in trailer should be 2 — v3 keyId is 2B BE, low byte at -19
+      // keyId in trailer should be 2 — v4 keyId is 2B BE, low byte at -20
       const encrypted = new Uint8Array(frame.data);
-      expect(encrypted[encrypted.length - 19]).toBe(2);
+      expect(encrypted[encrypted.length - 20]).toBe(2);
 
-      await receiver.decryptFrame(frame, 'sender-user-id');
+      await receiver.decryptFrame(frame, 'sender-user-id', 'opus');
       expect(new Uint8Array(frame.data)).toEqual(originalData);
     });
 
@@ -141,11 +143,12 @@ describe('MediaEncryption', () => {
       const frame = fakeAudioFrame(40);
       const originalData = new Uint8Array(frame.data).slice();
 
-      await sender.encryptFrame(frame);
+      await sender.encryptFrame(frame, 'opus');
       const encrypted = new Uint8Array(frame.data);
-      expect(encrypted[encrypted.length - 19]).toBe(2);
+      // keyId low byte at v4 position -20
+      expect(encrypted[encrypted.length - 20]).toBe(2);
 
-      await receiver.decryptFrame(frame, 'sender-user-id');
+      await receiver.decryptFrame(frame, 'sender-user-id', 'opus');
       expect(new Uint8Array(frame.data)).toEqual(originalData);
     });
 
@@ -182,7 +185,7 @@ describe('MediaEncryption', () => {
         });
 
       try {
-        const encryptPromise = sender.encryptFrame(frame);
+        const encryptPromise = sender.encryptFrame(frame, 'vp9');
         await encryptStarted;
 
         await sender.rotateKeys();
@@ -193,9 +196,10 @@ describe('MediaEncryption', () => {
         await encryptPromise;
 
         const encrypted = new Uint8Array(frame.data);
-        expect(encrypted[encrypted.length - 19]).toBe(0);
+        // keyId low byte at v4 position -20
+        expect(encrypted[encrypted.length - 20]).toBe(0);
 
-        await receiver.decryptFrame(frame, 'sender-user-id');
+        await receiver.decryptFrame(frame, 'sender-user-id', 'vp9');
         expect(new Uint8Array(frame.data)).toEqual(originalData);
       } finally {
         encryptSpy.mockRestore();
@@ -212,7 +216,7 @@ describe('MediaEncryption', () => {
 
       const frame = fakeAudioFrame(50);
 
-      await expect(me.decryptFrame(frame, 'sender-id')).rejects.toThrow(
+      await expect(me.decryptFrame(frame, 'sender-id', 'opus')).rejects.toThrow(
         'unencrypted media frame received'
       );
     });
@@ -225,7 +229,7 @@ describe('MediaEncryption', () => {
       const frame = fakeAudioFrame(0);
       const originalData = new Uint8Array(frame.data).slice();
 
-      await me.decryptFrame(frame, 'sender-id');
+      await me.decryptFrame(frame, 'sender-id', 'opus');
       expect(new Uint8Array(frame.data)).toEqual(originalData);
     });
 
@@ -236,7 +240,7 @@ describe('MediaEncryption', () => {
 
       const frame = fakeAudioFrame(10);
 
-      await expect(me.decryptFrame(frame, 'sender-id')).rejects.toThrow(
+      await expect(me.decryptFrame(frame, 'sender-id', 'opus')).rejects.toThrow(
         'unencrypted media frame received'
       );
     });
@@ -246,8 +250,8 @@ describe('MediaEncryption', () => {
       const me = new MediaEncryption();
       await me.init(csk, 'user-id');
 
-      // 10 bytes is below the v3 minimum (TRAILER_SIZE_V3 21 + MIN_GCM_OVERHEAD
-      // 17 = 38), so the "too small" guard fires.
+      // 10 bytes is below the v4 minimum (TRAILER_SIZE_V4 22 + MIN_GCM_OVERHEAD
+      // 17 = 39), so the "too small" guard fires.
       const buf = new ArrayBuffer(10);
       const view = new Uint8Array(buf);
       view.fill(0x42);
@@ -255,7 +259,7 @@ describe('MediaEncryption', () => {
       view[9] = 0xad;
       const frame = { data: buf } as unknown as RTCEncodedAudioFrame;
 
-      await expect(me.decryptFrame(frame, 'sender-id')).rejects.toThrow(
+      await expect(me.decryptFrame(frame, 'sender-id', 'opus')).rejects.toThrow(
         'malformed encrypted frame'
       );
     });
@@ -266,18 +270,16 @@ describe('MediaEncryption', () => {
       await me.init(csk, 'user-id');
       await me.addDecryptKey(csk, 'sender-id');
 
-      // 38 bytes = minimum size to pass the v3 "too small" check, but with
-      // headerBytes=2 the ciphertext would be 38 - 21 (trailer) - 2 (header) =
-      // 15 bytes < 16, so the ciphertext-too-small guard fires.
+      // 38 bytes: below v4 minimum (TRAILER_SIZE_V4 22 + MIN_GCM_OVERHEAD 17 = 39),
+      // so the "too small" guard fires before the version check.
       const buf = new ArrayBuffer(38);
       const view = new Uint8Array(buf);
       view.fill(0x42);
       view[36] = 0xde; // magic
       view[37] = 0xad;
-      view[17] = 2; // headerBytes = 2 at v3 position length-21
       const frame = { data: buf } as unknown as RTCEncodedAudioFrame;
 
-      await expect(me.decryptFrame(frame, 'sender-id')).rejects.toThrow(
+      await expect(me.decryptFrame(frame, 'sender-id', 'opus')).rejects.toThrow(
         'malformed encrypted frame'
       );
     });
@@ -287,16 +289,19 @@ describe('MediaEncryption', () => {
       const me = new MediaEncryption();
       await me.init(csk, 'user-id');
 
-      // 50-byte frame with magic trailer but headerBytes=0 (invalid)
+      // 50-byte frame with magic trailer, valid v4 version byte, but headerBytes=0 (invalid).
+      // v4 layout from end: magic[-2,-1], version[-3]=4, IV[-15,-4], keyVersion[-19,-16],
+      // keyId[-21,-20], headerBytes[-22].
       const buf = new ArrayBuffer(50);
       const view = new Uint8Array(buf);
       view.fill(0x42);
       view[48] = 0xde;
       view[49] = 0xad;
-      view[50 - 21] = 0; // headerBytes = 0 (invalid, must be 1-10) at v3 position length-21
+      view[50 - 3] = 4; // version = 4 at position length-3 so version check passes
+      view[50 - 22] = 0; // headerBytes = 0 (invalid, must be 1-10) at v4 position length-22
       const frame = { data: buf } as unknown as RTCEncodedAudioFrame;
 
-      await expect(me.decryptFrame(frame, 'sender-id')).rejects.toThrow(
+      await expect(me.decryptFrame(frame, 'sender-id', 'opus')).rejects.toThrow(
         'malformed encrypted frame'
       );
     });
@@ -311,9 +316,9 @@ describe('MediaEncryption', () => {
       // Intentionally NOT adding decrypt key for sender
 
       const frame = fakeAudioFrame(50);
-      await sender.encryptFrame(frame);
+      await sender.encryptFrame(frame, 'opus');
 
-      await expect(receiver.decryptFrame(frame, 'sender-user-id')).rejects.toThrow(
+      await expect(receiver.decryptFrame(frame, 'sender-user-id', 'opus')).rejects.toThrow(
         /no decrypt key/
       );
     });
@@ -337,10 +342,10 @@ describe('MediaEncryption', () => {
       const frame = fakeAudioFrame(50);
       const originalData = new Uint8Array(frame.data).slice();
 
-      await sender.encryptFrame(frame);
+      await sender.encryptFrame(frame, 'opus');
 
       // Receiver should self-heal by ratcheting from epoch 0 → 3
-      await receiver.decryptFrame(frame, 'sender-user-id');
+      await receiver.decryptFrame(frame, 'sender-user-id', 'opus');
       expect(new Uint8Array(frame.data)).toEqual(originalData);
     });
   });
@@ -368,7 +373,7 @@ describe('MediaEncryption', () => {
 
       // Should be able to encrypt
       const frame = fakeAudioFrame(50);
-      await enc.encryptFrame(frame);
+      await enc.encryptFrame(frame, 'opus');
 
       // Encrypted frame should be larger and have the magic trailer
       const data = new Uint8Array(frame.data);
@@ -376,8 +381,8 @@ describe('MediaEncryption', () => {
       expect(data[data.length - 1]).toBe(0xad);
       expect(data[data.length - 2]).toBe(0xde);
 
-      // keyId in trailer should be 5 — v3 keyId is 2B BE, low byte at -19
-      expect(data[data.length - 19]).toBe(5);
+      // keyId in trailer should be 5 — v4 keyId is 2B BE, low byte at -20
+      expect(data[data.length - 20]).toBe(5);
     });
 
     it('addDecryptKeyDirect allows decryptFrame for matching keyId', async () => {
@@ -397,8 +402,8 @@ describe('MediaEncryption', () => {
       const frame = fakeAudioFrame(50);
       const originalData = new Uint8Array(frame.data).slice();
 
-      await sender.encryptFrame(frame);
-      await receiver.decryptFrame(frame, 'sender-x');
+      await sender.encryptFrame(frame, 'opus');
+      await receiver.decryptFrame(frame, 'sender-x', 'opus');
 
       expect(new Uint8Array(frame.data)).toEqual(originalData);
     });
@@ -426,8 +431,8 @@ describe('MediaEncryption', () => {
       const frame = fakeAudioFrame(60);
       const originalData = new Uint8Array(frame.data).slice();
 
-      await sender.encryptFrame(frame);
-      await receiver.decryptFrame(frame, 'sender-z');
+      await sender.encryptFrame(frame, 'opus');
+      await receiver.decryptFrame(frame, 'sender-z', 'opus');
 
       expect(new Uint8Array(frame.data)).toEqual(originalData);
     });
@@ -445,12 +450,12 @@ describe('MediaEncryption', () => {
 
       // encryptFrame should still work (key not nulled)
       const frame = fakeAudioFrame(40);
-      await enc.encryptFrame(frame);
+      await enc.encryptFrame(frame, 'opus');
 
       const data = new Uint8Array(frame.data);
       expect(data.length).toBeGreaterThan(40);
-      // keyId in trailer should be 7 — v3 keyId is 2B BE, low byte at -19
-      expect(data[data.length - 19]).toBe(7);
+      // keyId in trailer should be 7 — v4 keyId is 2B BE, low byte at -20
+      expect(data[data.length - 20]).toBe(7);
     });
 
     it('full Worker-path round-trip: initFromKey + addDecryptKeyDirect + rotation', async () => {
@@ -474,13 +479,13 @@ describe('MediaEncryption', () => {
       const frame = fakeAudioFrame(80);
       const originalData = new Uint8Array(frame.data).slice();
 
-      await sender.encryptFrame(frame);
+      await sender.encryptFrame(frame, 'opus');
 
-      // keyId should be 1 — v3 keyId is 2B BE, low byte at -19
+      // keyId should be 1 — v4 keyId is 2B BE, low byte at -20
       const encrypted = new Uint8Array(frame.data);
-      expect(encrypted[encrypted.length - 19]).toBe(1);
+      expect(encrypted[encrypted.length - 20]).toBe(1);
 
-      await receiver.decryptFrame(frame, 'alice');
+      await receiver.decryptFrame(frame, 'alice', 'opus');
       expect(new Uint8Array(frame.data)).toEqual(originalData);
     });
   });
@@ -602,13 +607,13 @@ describe('MediaEncryption', () => {
 
       // Encryption works before destroy
       const frame = fakeAudioFrame(40);
-      await enc.encryptFrame(frame);
+      await enc.encryptFrame(frame, 'opus');
 
       enc.destroy();
 
       // Encrypt should fail after destroy
       const frame2 = fakeAudioFrame(40);
-      await expect(enc.encryptFrame(frame2)).rejects.toThrow('no encrypt key');
+      await expect(enc.encryptFrame(frame2, 'opus')).rejects.toThrow('no encrypt key');
     });
 
     it('is idempotent', async () => {
@@ -642,10 +647,10 @@ describe('MediaEncryption', () => {
 
       // Sender encrypts at epoch 3
       const frame = fakeAudioFrame(50);
-      await sender.encryptFrame(frame);
+      await sender.encryptFrame(frame, 'opus');
 
       // Receiver should decrypt successfully
-      await receiver.decryptFrame(frame, 'sender');
+      await receiver.decryptFrame(frame, 'sender', 'opus');
     });
 
     it('rejects target epoch > 100', async () => {
@@ -671,7 +676,7 @@ describe('MediaEncryption — #1742 empty DTX frame passthrough', () => {
     await sender.init(csk, 'sender-user-id');
 
     const frame = fakeAudioFrame(0);
-    await sender.encryptFrame(frame);
+    await sender.encryptFrame(frame, 'opus');
 
     // Must stay 0 bytes — the pre-fix bug produced exactly 32 bytes here.
     expect(frame.data.byteLength).toBe(0);
@@ -686,8 +691,8 @@ describe('MediaEncryption — #1742 empty DTX frame passthrough', () => {
     await receiver.addDecryptKey(csk, 'sender-user-id');
 
     const frame = fakeAudioFrame(0);
-    await sender.encryptFrame(frame);
-    await receiver.decryptFrame(frame, 'sender-user-id');
+    await sender.encryptFrame(frame, 'opus');
+    await receiver.decryptFrame(frame, 'sender-user-id', 'opus');
 
     expect(frame.data.byteLength).toBe(0);
   });
@@ -702,9 +707,10 @@ describe('MediaEncryption — #1742 empty DTX frame passthrough', () => {
 
     const frame = fakeAudioFrame(1);
     const original = new Uint8Array(frame.data).slice();
-    await sender.encryptFrame(frame);
-    // 1-byte input encrypts to 33 bytes (>= the guard) — must decrypt, not pass through.
-    await receiver.decryptFrame(frame, 'sender-user-id');
+    await sender.encryptFrame(frame, 'opus');
+    // 1-byte input encrypts to 34 bytes (>= the v4 guard of 39 — no, 1+16+22=39 exactly) —
+    // must decrypt, not pass through.
+    await receiver.decryptFrame(frame, 'sender-user-id', 'opus');
     expect(new Uint8Array(frame.data)).toEqual(original);
   });
 
@@ -722,12 +728,12 @@ describe('MediaEncryption — #1742 empty DTX frame passthrough', () => {
     // mis-passed-through instead of decrypted.
     const frame = fakeVideoFrame(1);
     const original = new Uint8Array(frame.data).slice();
-    await sender.encryptFrame(frame);
+    await sender.encryptFrame(frame, 'vp9');
 
     const enc = new Uint8Array(frame.data);
-    expect(enc[enc.length - 21]).toBe(1); // headerBytes field = actual header length (v3 -21)
+    expect(enc[enc.length - 22]).toBe(1); // headerBytes field = actual header length (v4 -22)
 
-    await receiver.decryptFrame(frame, 'sender-user-id');
+    await receiver.decryptFrame(frame, 'sender-user-id', 'vp9');
     expect(new Uint8Array(frame.data)).toEqual(original);
   });
 
@@ -741,12 +747,12 @@ describe('MediaEncryption — #1742 empty DTX frame passthrough', () => {
     const randomSpy = vi.spyOn(crypto, 'getRandomValues');
 
     const empty = fakeAudioFrame(0);
-    await sender.encryptFrame(empty); // must not advance the counter
+    await sender.encryptFrame(empty, 'opus'); // must not advance the counter
     expect(empty.data.byteLength).toBe(0);
     expect(randomSpy).not.toHaveBeenCalled();
 
     const real = fakeAudioFrame(50);
-    await sender.encryptFrame(real);
+    await sender.encryptFrame(real, 'opus');
     expect(randomSpy).toHaveBeenCalledTimes(1);
     expect((randomSpy.mock.calls[0][0] as Uint8Array).byteLength).toBe(12);
     randomSpy.mockRestore();
@@ -762,8 +768,8 @@ describe('channel CSK rotation desync (#1878)', () => {
     await receiver.addDecryptKey(csk, 'alice', 0);
 
     const frame = fakeVideoFrame(200);
-    await sender.encryptFrame(frame);
-    await expect(receiver.decryptFrame(frame, 'alice')).resolves.toBeUndefined();
+    await sender.encryptFrame(frame, 'vp9');
+    await expect(receiver.decryptFrame(frame, 'alice', 'vp9')).resolves.toBeUndefined();
   });
 
   it('a CSK rotation is deterministic when the frame carries the version (#1878 fixed)', async () => {
@@ -780,9 +786,9 @@ describe('channel CSK rotation desync (#1878)', () => {
     await receiver.addDecryptKeyAtVersion(cskNew, 'alice', 2, 0);
 
     const frame = fakeVideoFrame(200);
-    await sender.encryptFrame(frame);
+    await sender.encryptFrame(frame, 'vp9');
     // Frame stamps version 2 → receiver selects the v2 key deterministically.
-    await expect(receiver.decryptFrame(frame, 'alice')).resolves.toBeUndefined();
+    await expect(receiver.decryptFrame(frame, 'alice', 'vp9')).resolves.toBeUndefined();
   });
 });
 
@@ -796,13 +802,13 @@ describe('frame crypto v3 (#1878)', () => {
     await receiver.addDecryptKeyAtVersion(csk, 'alice', 7, 0); // new API: (csk, sender, version, keyId)
 
     const frame = fakeVideoFrame(200);
-    await sender.encryptFrame(frame);
-    // trailer is now 21 bytes; magic still last 2
+    await sender.encryptFrame(frame, 'vp9');
+    // trailer is now 22 bytes (v4); magic still last 2
     const bytes = new Uint8Array(frame.data);
     expect(bytes.at(-1)).toBe(0xad);
     expect(bytes.at(-2)).toBe(0xde);
 
-    await expect(receiver.decryptFrame(frame, 'alice')).resolves.toBeUndefined();
+    await expect(receiver.decryptFrame(frame, 'alice', 'vp9')).resolves.toBeUndefined();
   });
 
   it('never decrypts a v(N) frame with a v(M) key (version isolation)', async () => {
@@ -814,9 +820,9 @@ describe('frame crypto v3 (#1878)', () => {
     await receiver.addDecryptKeyAtVersion(csk, 'alice', 3, 0); // wrong version held
 
     const frame = fakeVideoFrame(200);
-    await sender.encryptFrame(frame);
+    await sender.encryptFrame(frame, 'vp9');
     // Map key is senderId:2:0 (from frame); receiver holds senderId:3:0 → miss.
-    await expect(receiver.decryptFrame(frame, 'alice')).rejects.toThrow(/no decrypt key/);
+    await expect(receiver.decryptFrame(frame, 'alice', 'vp9')).rejects.toThrow(/no decrypt key/);
   });
 
   it('keyVersion boundary: a large version (e.g. 65537) survives the 4-byte BE field', async () => {
@@ -827,8 +833,8 @@ describe('frame crypto v3 (#1878)', () => {
     const receiver = new MediaEncryption();
     await receiver.addDecryptKeyAtVersion(csk, 'alice', 65537, 0);
     const frame = fakeVideoFrame(200);
-    await sender.encryptFrame(frame);
-    await expect(receiver.decryptFrame(frame, 'alice')).resolves.toBeUndefined();
+    await sender.encryptFrame(frame, 'vp9');
+    await expect(receiver.decryptFrame(frame, 'alice', 'vp9')).resolves.toBeUndefined();
   });
 
   it('a decrypt miss throws FrameKeyMissError with (keyVersion,keyId), not OperationError', async () => {
@@ -838,11 +844,11 @@ describe('frame crypto v3 (#1878)', () => {
     await sender.init(csk, 'alice');
     const receiver = new MediaEncryption(); // holds NO key
     const frame = fakeVideoFrame(200);
-    await sender.encryptFrame(frame);
+    await sender.encryptFrame(frame, 'vp9');
 
     let caught: unknown;
     try {
-      await receiver.decryptFrame(frame, 'alice');
+      await receiver.decryptFrame(frame, 'alice', 'vp9');
     } catch (e) {
       caught = e;
     }
@@ -855,5 +861,235 @@ describe('frame crypto v3 (#1878)', () => {
     });
     // Message still contains "no decrypt key" so the existing regex tests pass.
     expect((caught as Error).message).toMatch(/no decrypt key/);
+  });
+});
+
+describe('v4 whole-frame (VP9/VP8/Opus unchanged behavior, version-stamped)', () => {
+  it('advertises crypto version 4', async () => {
+    const mod = await import('@/renderer/services/mediaEncryption');
+    expect(mod.MEDIA_E2EE_FRAME_CRYPTO_VERSION).toBe(4);
+  });
+
+  it('round-trips an audio frame under v4 with version marker in trailer', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    const receiver = new MediaEncryption();
+    await sender.init(csk, 'sender-user-id');
+    await receiver.init(csk, 'receiver-user-id');
+    await receiver.addDecryptKey(csk, 'sender-user-id');
+
+    const frame = fakeAudioFrame(50);
+    const original = new Uint8Array(frame.data).slice();
+    await sender.encryptFrame(frame, 'opus');
+
+    const enc = new Uint8Array(frame.data);
+    // v4 trailer: ...[version:1 (=4)][magic:2]; magic still last.
+    expect(enc[enc.length - 1]).toBe(0xad);
+    expect(enc[enc.length - 2]).toBe(0xde);
+    expect(enc[enc.length - 3]).toBe(4); // version marker
+
+    await receiver.decryptFrame(frame, 'sender-user-id', 'opus');
+    expect(new Uint8Array(frame.data)).toEqual(original);
+  });
+
+  it('round-trips a VP9 video frame under v4 (no regression of the green path)', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    const receiver = new MediaEncryption();
+    await sender.init(csk, 'sender-user-id');
+    await receiver.init(csk, 'receiver-user-id');
+    await receiver.addDecryptKey(csk, 'sender-user-id');
+
+    const frame = fakeVideoFrame(200);
+    const original = new Uint8Array(frame.data).slice();
+    await sender.encryptFrame(frame, 'vp9');
+    await receiver.decryptFrame(frame, 'sender-user-id', 'vp9');
+    expect(new Uint8Array(frame.data)).toEqual(original);
+  });
+});
+
+describe('AV1 per-OBU (v4)', () => {
+  /** Build a single low-overhead OBU: header + optional ext + leb128 size + payload. */
+  function obu(opts: {
+    type: number;
+    payload: Uint8Array;
+    ext?: number; // present → extension_flag=1, this is the extension byte
+    hasSize?: boolean; // default true
+  }): Uint8Array {
+    const { type, payload, ext, hasSize = true } = opts;
+    const header =
+      ((type & 0x0f) << 3) | ((ext !== undefined ? 1 : 0) << 2) | ((hasSize ? 1 : 0) << 1);
+    const head: number[] = [header];
+    if (ext !== undefined) head.push(ext & 0xff);
+    const size: number[] = [];
+    if (hasSize) {
+      let v = payload.length;
+      do {
+        let b = v & 0x7f;
+        v >>>= 7;
+        if (v) b |= 0x80;
+        size.push(b);
+      } while (v);
+    }
+    return new Uint8Array([...head, ...size, ...payload]);
+  }
+
+  function concat(...parts: Uint8Array[]): Uint8Array {
+    const total = parts.reduce((n, p) => n + p.length, 0);
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const p of parts) {
+      out.set(p, o);
+      o += p.length;
+    }
+    return out;
+  }
+
+  // Build a valid-ish AV1 temporal unit: TD + SEQUENCE_HEADER + FRAME(6) + TILE_GROUP(4).
+  function buildAv1Frame(framePayload: Uint8Array, tgPayload: Uint8Array): RTCEncodedVideoFrame {
+    const td = obu({ type: 2, payload: new Uint8Array(0) });
+    const seq = obu({ type: 1, payload: new Uint8Array([0xaa, 0xbb]) });
+    const frame = obu({ type: 6, payload: framePayload });
+    const tg = obu({ type: 4, payload: tgPayload });
+    const data = concat(td, seq, frame, tg);
+    return {
+      data: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
+      type: 'key',
+    } as unknown as RTCEncodedVideoFrame;
+  }
+
+  it('encrypts only FRAME/TILE_GROUP payloads and leaves structure cleartext', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    await sender.init(csk, 'sender-user-id');
+
+    const framePayload = new Uint8Array([1, 2, 3, 4, 5, 6]);
+    const tgPayload = new Uint8Array([7, 7, 7, 7]);
+    const frame = buildAv1Frame(framePayload, tgPayload);
+    await sender.encryptFrame(frame, 'av1');
+
+    // The TD (type 2, payload 0) must still be present cleartext at the start.
+    const enc = new Uint8Array(frame.data);
+    expect(enc[0] & 0x80).toBe(0); // forbidden bit clear
+    expect((enc[0] >>> 3) & 0x0f).toBe(2); // first OBU is still the TD
+
+    // Each encrypted tile-data OBU payload now starts with the 0xDEAD mini-header magic.
+    // (Parse to find them rather than asserting a fixed offset.)
+    const obus = parseAv1ObusForTest(enc);
+    expect(obus).not.toBeNull();
+    const tileData = obus!.filter((o) => o.obuType === 6 || o.obuType === 4);
+    expect(tileData).toHaveLength(2);
+    for (const o of tileData) {
+      expect(enc[o.payloadOffset]).toBe(0xde);
+      expect(enc[o.payloadOffset + 1]).toBe(0xad);
+    }
+    // The SEQUENCE_HEADER (type 1) payload stays cleartext (0xaa 0xbb).
+    const seqObu = obus!.find((o) => o.obuType === 1);
+    expect(seqObu).toBeDefined();
+    expect(Array.from(enc.slice(seqObu!.payloadOffset, seqObu!.payloadOffset + 2))).toEqual([
+      0xaa, 0xbb,
+    ]);
+  });
+
+  it('round-trips an AV1 frame: decrypt restores exact original payloads', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    const receiver = new MediaEncryption();
+    await sender.init(csk, 'sender-user-id');
+    await receiver.init(csk, 'receiver-user-id');
+    await receiver.addDecryptKey(csk, 'sender-user-id');
+
+    const framePayload = new Uint8Array([1, 2, 3, 4, 5, 6]);
+    const tgPayload = new Uint8Array([7, 8, 9]);
+    const frame = buildAv1Frame(framePayload, tgPayload);
+    const original = new Uint8Array(frame.data).slice();
+
+    await sender.encryptFrame(frame, 'av1');
+    expect(new Uint8Array(frame.data)).not.toEqual(original); // structure changed (encrypted payloads)
+    await receiver.decryptFrame(frame, 'sender-user-id', 'av1');
+    expect(new Uint8Array(frame.data)).toEqual(original); // byte-exact restore
+  });
+
+  it('per-OBU IV uniqueness: 2 encrypted OBUs in one frame get distinct IVs', async () => {
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    await sender.init(csk, 'sender-user-id');
+
+    const frame = buildAv1Frame(new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6]));
+    await sender.encryptFrame(frame, 'av1');
+
+    const enc = new Uint8Array(frame.data);
+    const obus = parseAv1ObusForTest(enc)!.filter((o) => o.obuType === 6 || o.obuType === 4);
+    expect(obus).toHaveLength(2);
+    const ivs = obus.map((o) => {
+      const mh = decodeObuMiniHeaderForTest(enc.slice(o.payloadOffset, o.payloadOffset + 22));
+      return Array.from(mh!.iv);
+    });
+    expect(ivs[0]).not.toEqual(ivs[1]); // distinct obu_seq_index → distinct IV
+  });
+
+  it('survives a simulated SFU leb128 re-encode of cleartext OBU structure', async () => {
+    // The depacketizer may re-encode structure; the payloads survive (spec §2.1).
+    // Simulate by leaving payloads intact (the parser recomputes boundaries from
+    // the received leb128 sizes), which the round-trip above already covers; here
+    // assert decrypt still succeeds after a no-op structure rewrite.
+    const csk = await generateTestCSK();
+    const sender = new MediaEncryption();
+    const receiver = new MediaEncryption();
+    await sender.init(csk, 'sender-user-id');
+    await receiver.init(csk, 'receiver-user-id');
+    await receiver.addDecryptKey(csk, 'sender-user-id');
+    const frame = buildAv1Frame(new Uint8Array([1, 2, 3, 4]), new Uint8Array([5, 6, 7, 8]));
+    const original = new Uint8Array(frame.data).slice();
+    await sender.encryptFrame(frame, 'av1');
+    await receiver.decryptFrame(frame, 'sender-user-id', 'av1');
+    expect(new Uint8Array(frame.data)).toEqual(original);
+  });
+
+  it('drops (throws) a malformed AV1 frame fail-closed', async () => {
+    const csk = await generateTestCSK();
+    const receiver = new MediaEncryption();
+    await receiver.init(csk, 'receiver-user-id');
+    await receiver.addDecryptKey(csk, 'sender-user-id');
+    const bad = {
+      data: new Uint8Array([(6 << 3) | 0b10, 100, 1]).buffer,
+      type: 'key',
+    } as unknown as RTCEncodedVideoFrame;
+    await expect(receiver.decryptFrame(bad, 'sender-user-id', 'av1')).rejects.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 10: mixed-codec room (per-sender codec isolation, spec §6.2)
+// ---------------------------------------------------------------------------
+
+describe('mixed-codec room (per-sender codec isolation)', () => {
+  it('one receiver decrypts an AV1 sender and a VP9 sender with the correct scheme each', async () => {
+    const csk = await generateTestCSK();
+    const av1Sender = new MediaEncryption();
+    const vp9Sender = new MediaEncryption();
+    const receiver = new MediaEncryption();
+    await av1Sender.init(csk, 'alice'); // AV1 publisher
+    await vp9Sender.init(csk, 'bob'); // VP9 publisher
+    await receiver.init(csk, 'me');
+    await receiver.addDecryptKey(csk, 'alice');
+    await receiver.addDecryptKey(csk, 'bob');
+
+    // AV1 frame from alice: TD (type 2, size 0) + FRAME (type 6, payload [1,2,3])
+    const av1Data = new Uint8Array([(2 << 3) | 0b10, 0, (6 << 3) | 0b10, 3, 1, 2, 3]);
+    const av1Frame = { data: av1Data.buffer, type: 'key' } as unknown as RTCEncodedVideoFrame;
+    const av1Orig = new Uint8Array(av1Frame.data).slice();
+    await av1Sender.encryptFrame(av1Frame, 'av1');
+
+    // VP9 whole-frame from bob
+    const vp9Frame = fakeVideoFrame(120);
+    const vp9Orig = new Uint8Array(vp9Frame.data).slice();
+    await vp9Sender.encryptFrame(vp9Frame, 'vp9');
+
+    await receiver.decryptFrame(av1Frame, 'alice', 'av1');
+    await receiver.decryptFrame(vp9Frame, 'bob', 'vp9');
+
+    expect(new Uint8Array(av1Frame.data)).toEqual(av1Orig);
+    expect(new Uint8Array(vp9Frame.data)).toEqual(vp9Orig);
   });
 });

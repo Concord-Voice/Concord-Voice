@@ -1,5 +1,10 @@
+// @vitest-environment node
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { MediaEncryption } from '../../../src/renderer/services/mediaEncryption';
+import {
+  FrameKeyMissError,
+  MediaEncryption as MediaEncryptionClass,
+} from '../../../src/renderer/services/mediaEncryption';
 import {
   applyLegacyDecryptPipeline,
   type DecryptRecoveryCallbacks,
@@ -134,7 +139,7 @@ describe('applyLegacyDecryptPipeline', () => {
     const controller = { enqueue: vi.fn() };
     await requireCapturedTransformFn()(frame, controller);
 
-    expect(encryption.decryptFrame).toHaveBeenCalledWith(frame, 'user-1');
+    expect(encryption.decryptFrame).toHaveBeenCalledWith(frame, 'user-1', undefined);
     expect(controller.enqueue).toHaveBeenCalledWith(frame);
   });
 
@@ -325,5 +330,196 @@ describe('applyLegacyDecryptPipeline', () => {
 
     expect(callbacks.requestKeyframe).toHaveBeenCalledWith('user-1');
     expect(callbacks.requestKeyframe).toHaveBeenCalledTimes(1);
+  });
+
+  // ─── #1895 regression: v3 key-version provisioning on the legacy path ──
+
+  it('provisions the exact key version on a typed FrameKeyMiss (regression #1895)', async () => {
+    // The legacy createEncodedStreams decrypt path is the path all current
+    // Electron builds run (USE_SCRIPT_TRANSFORM=false, #295). Under mid-session
+    // CSK rotation, decryptFrame throws a typed FrameKeyMissError carrying the
+    // frame's (senderUserId, keyVersion, keyId). The Worker path routes that to
+    // on-demand provisioning (e2eeWorker.ts requestFrameKeyOnce); the legacy
+    // path must do the same via a requestFrameKey callback — otherwise it
+    // black-screens video (#1878/#1885 residual: v3 provisioning was wired into
+    // the Worker decrypt path only, never applyLegacyDecryptPipeline).
+    const encryption = {
+      decryptFrame: vi
+        .fn()
+        .mockRejectedValue(
+          new FrameKeyMissError(
+            'user-1',
+            5,
+            0,
+            'E2EE: no decrypt key for sender=user-1 v=5 keyId=0'
+          )
+        ),
+      getCurrentKeyId: vi.fn().mockReturnValue(0),
+    } as unknown as MediaEncryption;
+
+    // requestFrameKey is supplied via an intersection cast so this repro needs
+    // no production change to compile: it fails today because the pipeline catch
+    // block never calls it (Phase-1 RED), and turns green once the fix wires the
+    // typed-miss branch onto the callback.
+    const requestFrameKey = vi.fn();
+    const callbacks = {
+      ...mockCallbacks(),
+      requestFrameKey,
+    } as DecryptRecoveryCallbacks & { requestFrameKey: typeof requestFrameKey };
+
+    applyLegacyDecryptPipeline(mockReceiver(), 'user-1', encryption, callbacks, false);
+
+    expect(capturedTransformFn).toBeTypeOf('function');
+    const frame = { data: new ArrayBuffer(100), type: 'delta' };
+    const controller = { enqueue: vi.fn() };
+    await requireCapturedTransformFn()(frame, controller);
+
+    // Fail-closed: the undecryptable frame is dropped, never enqueued as ciphertext.
+    expect(controller.enqueue).not.toHaveBeenCalled();
+    // The fix: the exact (keyVersion, keyId) is requested on the FIRST typed
+    // miss — not after 50 version-blind self-heal drops, and not never.
+    expect(requestFrameKey).toHaveBeenCalledWith('user-1', 5, 0);
+  });
+});
+
+// ─── #1885 regression lock: legacy path dispatches by codec ──────────────────
+//
+// fakeReceiver drives applyLegacyDecryptPipeline with real Node streams (no
+// TransformStream mock) and real MediaEncryption so the decrypt path is
+// exercised end-to-end — not through a captured callback. This is the
+// regression lock for #1885: wiring v3/v4 provisioning into the Worker path
+// only, never applyLegacyDecryptPipeline, caused black-screen video for all
+// current Electron builds (USE_SCRIPT_TRANSFORM=false, #295).
+
+/** Identity-streams fake receiver: readable yields the queued frames; writable collects them. */
+function fakeReceiver(
+  frames: Array<{ data: ArrayBuffer; type?: string }>,
+  sink: Array<{ data: ArrayBuffer }>
+) {
+  return {
+    createEncodedStreams() {
+      const readable = new ReadableStream({
+        start(controller) {
+          for (const f of frames) controller.enqueue(f);
+          controller.close();
+        },
+      });
+      const writable = new WritableStream({
+        write(chunk: { data: ArrayBuffer }) {
+          sink.push(chunk);
+        },
+      });
+      return { readable, writable };
+    },
+  };
+}
+
+function makeCallbacks(): DecryptRecoveryCallbacks {
+  return {
+    getActiveChannelId: () => 'chan',
+    addDecryptKeyForUser: async () => true,
+    invalidateChannelKey: () => {},
+    requestKeyframe: () => {},
+    requestFrameKey: () => {},
+  };
+}
+
+describe('applyLegacyDecryptPipeline — both schemes wired (#1885 lock)', () => {
+  it('decrypts a VP9 v4 whole-frame on the legacy path', async () => {
+    const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, [
+      'encrypt',
+      'decrypt',
+    ]);
+    const sender = new MediaEncryptionClass();
+    const receiver = new MediaEncryptionClass();
+    await sender.init(key, 'sender');
+    await receiver.init(key, 'me');
+    await receiver.addDecryptKey(key, 'sender');
+
+    const frame = { data: new Uint8Array([10, 20, 30, 40, 50]).buffer, type: 'delta' };
+    const original = new Uint8Array(frame.data).slice();
+    await sender.encryptFrame(frame as never, 'vp9');
+
+    const sink: Array<{ data: ArrayBuffer }> = [];
+    applyLegacyDecryptPipeline(
+      fakeReceiver([frame], sink) as never,
+      'sender',
+      receiver,
+      makeCallbacks(),
+      false,
+      'vp9'
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    expect(new Uint8Array(sink[0].data)).toEqual(original);
+  });
+
+  it('decrypts an AV1 v4 per-OBU frame on the legacy path (regression lock)', async () => {
+    const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, [
+      'encrypt',
+      'decrypt',
+    ]);
+    const sender = new MediaEncryptionClass();
+    const receiver = new MediaEncryptionClass();
+    await sender.init(key, 'sender');
+    await receiver.init(key, 'me');
+    await receiver.addDecryptKey(key, 'sender');
+
+    // Build a minimal valid AV1 temporal unit (TD + FRAME).
+    const frameData = new Uint8Array([
+      (2 << 3) | 0b10,
+      0, // TD, size 0
+      (6 << 3) | 0b10,
+      4,
+      1,
+      2,
+      3,
+      4, // FRAME, size 4, payload [1,2,3,4]
+    ]);
+    const frame = { data: frameData.buffer, type: 'key' };
+    const original = new Uint8Array(frame.data).slice();
+    await sender.encryptFrame(frame as never, 'av1');
+
+    const sink: Array<{ data: ArrayBuffer }> = [];
+    applyLegacyDecryptPipeline(
+      fakeReceiver([frame], sink) as never,
+      'sender',
+      receiver,
+      makeCallbacks(),
+      false,
+      'av1'
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    expect(new Uint8Array(sink[0].data)).toEqual(original); // black-screen regression lock
+  });
+});
+
+// ─── #1895 diagnostic cleanup guard ──────────────────────────────────────────
+//
+// Asserts that all temporary #1895 diagnostic symbols have been removed from
+// voiceE2eeTransforms.ts and voiceService.ts. These tests fail when any
+// diagnostic code is still present, preventing accidental shipping of
+// pass-through code that disables video E2EE (AV1_PASSTHROUGH_DIAG=true).
+
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+describe('#1895 diagnostics removed (rig out of pass-through)', () => {
+  it('voiceE2eeTransforms.ts has no AV1_PASSTHROUGH_DIAG / parseAv1Obus / fnv1a32Hex', () => {
+    const src = readFileSync(
+      resolve(__dirname, '../../../src/renderer/services/voiceE2eeTransforms.ts'),
+      'utf8'
+    );
+    expect(src).not.toMatch(/AV1_PASSTHROUGH_DIAG/);
+    expect(src).not.toMatch(/\bfnv1a32Hex\b/);
+    expect(src).not.toMatch(/export function parseAv1Obus/);
+  });
+  it('voiceService.ts has E2EE_VERBOSE=false and no passthrough diagnostic', () => {
+    const src = readFileSync(
+      resolve(__dirname, '../../../src/renderer/services/voiceService.ts'),
+      'utf8'
+    );
+    expect(src).toMatch(/const E2EE_VERBOSE = false/);
+    expect(src).not.toMatch(/AV1_PASSTHROUGH_DIAG/);
+    expect(src).not.toMatch(/AV1-PAYLOAD SEND/);
   });
 });

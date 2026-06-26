@@ -172,20 +172,19 @@ export const KEYFRAME_REQUEST_COOLDOWN_MS = 5000;
 
 /**
  * AES-256-GCM media-frame format advertised by clients at join time.
- * v1 was the legacy AES-128-GCM frame key; v2 keyed only by the ratchet keyId;
- * v3 (#1878) additionally stamps the channel-key version into the frame trailer
- * so decryption is deterministic across mid-session CSK rotations. v3 is the
- * current target version — the room ratchets UP to the MAX advertised version.
+ * v1 legacy AES-128; v2 keyed by ratchet keyId; v3 (#1878) stamped the channel-key
+ * version; v4 (#1895) is per-codec — AV1 per-OBU payload encryption, VP9/VP8/Opus
+ * whole-frame. v4 is the current target; the room ratchets UP to the MAX advertised.
  */
-export const SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION = 3;
+export const SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION = 4;
 
 /**
- * Versions accepted at the admission gate during the v2→v3 rollout window
- * (#1878). v2 is tolerated so already-running v2 clients can keep joining while
- * the fleet upgrades; DROP 2 from this set post-rollout (follow-up) so the gate
- * hard-requires v3. v1 (legacy AES-128) is permanently rejected.
+ * Versions accepted at the admission gate during the v3→v4 rollout window
+ * (#1895). v3 is tolerated so already-running v3 clients keep joining while the
+ * fleet upgrades; DROP 3 post-rollout so the gate hard-requires v4. v1/v2 are
+ * permanently rejected.
  */
-const ACCEPTED_MEDIA_FRAME_CRYPTO_VERSIONS = new Set<number>([2, 3]);
+const ACCEPTED_MEDIA_FRAME_CRYPTO_VERSIONS = new Set<number>([3, 4]);
 
 /**
  * Thrown when a participant advertises a media-frame crypto version strictly

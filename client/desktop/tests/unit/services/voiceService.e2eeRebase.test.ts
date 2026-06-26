@@ -300,3 +300,101 @@ describe('voiceService E2EE sender re-base (#1878 Task 5)', () => {
     expect(e2eeMockState.pendingByVersion.size).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #1895 — legacy createEncodedStreams decrypt-path frame-key provisioning.
+//
+// The shared provisionFrameKey is reached by BOTH the Worker requestFrameKey IPC
+// handler and the legacy applyLegacyDecryptPipeline `requestFrameKey` recovery
+// callback. These exercise the version-specific fetch → addDecryptKeyAtVersion →
+// (Worker) postMessage path, plus the fail-closed catch.
+// ---------------------------------------------------------------------------
+describe('voiceService #1895 — legacy-path frame-key provisioning', () => {
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    vi.spyOn(console, 'debug').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    mediaEncryptionInstances.length = 0;
+    e2eeMockState.channelKeyVersion = 0;
+    e2eeMockState.rotationListeners.clear();
+    e2eeMockState.pendingByVersion.clear();
+    useUserStore.setState({ user: { id: 'local-user' } as never });
+    useVoiceStore.setState({ activeChannelId: CHANNEL });
+  });
+
+  afterEach(() => {
+    svc.cleanupTimersAndE2EE();
+    vi.restoreAllMocks();
+  });
+
+  it('provisionFrameKey fetches the exact CSK version, derives the key, and posts it to the worker', async () => {
+    e2eeMockState.channelKeyVersion = 5;
+    await svc.initEncryptionCore(CHANNEL, 0);
+    const enc = latestEncryption();
+    workerPostMessage.mockClear();
+    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    (e2eeService.getChannelKeyByVersion as ReturnType<typeof vi.fn>).mockClear();
+
+    svc.provisionFrameKey(CHANNEL, 'sender-9', 7, 2);
+    expect(e2eeService.getChannelKeyByVersion).toHaveBeenCalledWith(CHANNEL, 7);
+
+    resolveVersionFetch(CHANNEL, 7);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(enc.addDecryptKeyAtVersion).toHaveBeenCalledWith(fakeCsk, 'sender-9', 7, 2);
+    const addMsg = workerPostMessage.mock.calls
+      .map((c) => c[0])
+      .find((m) => m?.type === 'addDecryptKey');
+    expect(addMsg).toMatchObject({ senderUserId: 'sender-9', keyVersion: 7, keyId: 2 });
+  });
+
+  it('the legacy requestFrameKey recovery callback routes through provisionFrameKey', async () => {
+    e2eeMockState.channelKeyVersion = 5;
+    await svc.initEncryptionCore(CHANNEL, 0);
+    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    (e2eeService.getChannelKeyByVersion as ReturnType<typeof vi.fn>).mockClear();
+
+    const cbs = svc.decryptRecoveryCallbacks();
+    cbs.requestFrameKey('sender-3', 4, 1);
+    expect(e2eeService.getChannelKeyByVersion).toHaveBeenCalledWith(CHANNEL, 4);
+  });
+
+  it('is fail-closed when the version fetch rejects (no key added, no worker post, no throw)', async () => {
+    e2eeMockState.channelKeyVersion = 5;
+    await svc.initEncryptionCore(CHANNEL, 0);
+    const enc = latestEncryption();
+    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    (e2eeService.getChannelKeyByVersion as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('403 not a member')
+    );
+    workerPostMessage.mockClear();
+
+    svc.provisionFrameKey(CHANNEL, 'sender-x', 9, 0);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(enc.addDecryptKeyAtVersion).not.toHaveBeenCalled();
+    expect(
+      workerPostMessage.mock.calls.map((c) => c[0]).some((m) => m?.type === 'addDecryptKey')
+    ).toBe(false);
+  });
+
+  it('the worker requestFrameKey IPC message provisions via the shared path', async () => {
+    e2eeMockState.channelKeyVersion = 5;
+    await svc.initEncryptionCore(CHANNEL, 0);
+    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    (e2eeService.getChannelKeyByVersion as ReturnType<typeof vi.fn>).mockClear();
+
+    svc.handleWorkerMessage({
+      type: 'requestFrameKey',
+      senderUserId: 'sender-7',
+      keyVersion: 8,
+      keyId: 3,
+    });
+    expect(e2eeService.getChannelKeyByVersion).toHaveBeenCalledWith(CHANNEL, 8);
+  });
+});

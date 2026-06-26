@@ -10,7 +10,12 @@
  */
 
 import { MediaEncryption, type FrameKeyMissError } from '../services/mediaEncryption';
-import type { E2EEWorkerMessage, E2EEMainMessage, E2EETransformOptions } from './e2eeProtocol';
+import type {
+  CodecFamily,
+  E2EEWorkerMessage,
+  E2EEMainMessage,
+  E2EETransformOptions,
+} from './e2eeProtocol';
 
 /**
  * #1878: discriminate the typed decrypt miss by error `name`, not `instanceof`.
@@ -150,13 +155,13 @@ self.addEventListener('rtctransform', ((event: RTCTransformEvent) => {
   log('debug', `E2EE: rtctransform event fired`, { role: opts.role });
 
   if (opts.role === 'encrypt') {
-    handleEncrypt(transformer.readable, transformer.writable);
+    handleEncrypt(transformer.readable, transformer.writable, opts.codecFamily);
   } else if (opts.role === 'decrypt') {
     if (!opts.senderUserId) {
       log('error', 'E2EE: decrypt transform missing senderUserId');
       return;
     }
-    handleDecrypt(transformer.readable, transformer.writable, opts.senderUserId);
+    handleDecrypt(transformer.readable, transformer.writable, opts.senderUserId, opts.codecFamily);
   } else {
     log('error', 'E2EE: unknown transform role', { role: String(opts.role) });
   }
@@ -166,7 +171,8 @@ self.addEventListener('rtctransform', ((event: RTCTransformEvent) => {
 
 function handleEncrypt(
   readable: ReadableStream<RTCEncodedAudioFrame | RTCEncodedVideoFrame>,
-  writable: WritableStream<RTCEncodedAudioFrame | RTCEncodedVideoFrame>
+  writable: WritableStream<RTCEncodedAudioFrame | RTCEncodedVideoFrame>,
+  codecFamily: CodecFamily | undefined
 ): void {
   let dropCount = 0;
   let firstLogged = false;
@@ -177,7 +183,7 @@ function handleEncrypt(
   >({
     async transform(frame, controller) {
       try {
-        await encryption.encryptFrame(frame);
+        await encryption.encryptFrame(frame, codecFamily);
         controller.enqueue(frame);
         if (!firstLogged) {
           firstLogged = true;
@@ -301,7 +307,8 @@ function handleDecryptError(
 function handleDecrypt(
   readable: ReadableStream<RTCEncodedAudioFrame | RTCEncodedVideoFrame>,
   writable: WritableStream<RTCEncodedAudioFrame | RTCEncodedVideoFrame>,
-  senderUserId: string
+  senderUserId: string,
+  codecFamily: CodecFamily | undefined
 ): void {
   let dropCount = 0;
   let firstLogged = false;
@@ -312,7 +319,7 @@ function handleDecrypt(
   >({
     async transform(frame, controller) {
       try {
-        await encryption.decryptFrame(frame, senderUserId);
+        await encryption.decryptFrame(frame, senderUserId, codecFamily);
         controller.enqueue(frame);
         if (!firstLogged) {
           firstLogged = true;

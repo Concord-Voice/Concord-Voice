@@ -8,15 +8,25 @@
  * Key derivation:
  *   frameKey = HKDF-SHA256(channelCSK, salt="concord-voice-e2ee", info=senderUserId)
  *
- * Frame format (encrypted, v3 — #1878):
- *   [unencrypted header (1–10 bytes)][AES-GCM ciphertext + 16-byte auth tag][1-byte headerBytes][2-byte keyId BE][4-byte keyVersion BE][12-byte IV][0xDE 0xAD magic]
+ * Frame format (encrypted, v4 — #1895):
+ *   VP9/VP8/Opus (whole-frame):
+ *     [unencrypted header (1–10 bytes)][AES-GCM ciphertext + 16-byte auth tag]
+ *     [1-byte headerBytes][2-byte keyId BE][4-byte keyVersion BE][12-byte IV]
+ *     [1-byte version (=4)][0xDE 0xAD magic]
+ *   v4 whole-frame trailer (22 bytes total).
  *
- * Trailer (21 bytes total): headerBytes + keyId + keyVersion + IV + magic.
+ *   AV1 (per-OBU, Task 4):
+ *     Per eligible OBU (OBU_FRAME/OBU_TILE_GROUP): encrypted payload with
+ *     OBU_MINI_HEADER_SIZE (22 bytes) mini-header prepended.
+ *
  * The headerBytes field tells the receiver how many leading bytes were left
  * unencrypted, so the split point is self-describing and robust against
  * frame misrouting between consumers in a BUNDLE group. The keyVersion field
  * carries the channel-key (CSK) version so receivers derive the exact key a
  * frame needs across mid-session CSK rotations — no lockstep epoch counter.
+ *
+ * The explicit version byte (=4) before the magic allows deterministic
+ * fail-closed rejection of injected v3 frames in a v4 room (spec §10.5).
  *
  * AES-GCM is used WITHOUT additionalData (no AAD). This is intentional:
  * Chromium's SDP BUNDLE can produce payload_type collisions that misroute
@@ -41,6 +51,14 @@
  * and sends them to the Worker via postMessage (CryptoKey is structured-clonable).
  */
 
+import { parseAv1Obus, AV1_OBU_FRAME, AV1_OBU_TILE_GROUP, type ParsedObu } from './av1ObuParser';
+import {
+  OBU_MINI_HEADER_SIZE,
+  encodeObuMiniHeader,
+  decodeObuMiniHeader,
+  buildObuIv,
+} from './mediaFrameMiniHeader';
+
 const SALT = new TextEncoder().encode('concord-voice-e2ee');
 const RATCHET_INFO = new TextEncoder().encode('concord-e2ee-ratchet');
 
@@ -48,15 +66,25 @@ const RATCHET_INFO = new TextEncoder().encode('concord-e2ee-ratchet');
 // distinguish encrypted frames from unencrypted ones.
 const MAGIC_0 = 0xde;
 const MAGIC_1 = 0xad;
-// Media-frame crypto format advertised to the SFU at join time. v1 was the
-// legacy AES-128-GCM frame key; v2 was AES-256-GCM keyed only by ratchet keyId;
-// v3 additionally stamps the channel-key version so decryption is deterministic
-// across mid-session CSK rotations (#1878).
-export const MEDIA_E2EE_FRAME_CRYPTO_VERSION = 3;
-// v3 trailer: 1B headerBytes + 2B keyId(BE) + 4B keyVersion(BE) + 12B IV + 2B magic = 21
-const TRAILER_SIZE_V3 = 21;
+// v1 AES-128-GCM; v2 AES-256-GCM keyed by ratchet keyId; v3 stamped the channel-key
+// version; v4 (#1895) is per-codec: AV1 → per-OBU payload encryption (av1ObuParser +
+// mini-header), VP9/VP8/Opus → whole-frame with the v4 trailer below.
+export const MEDIA_E2EE_FRAME_CRYPTO_VERSION = 4;
+// v4 whole-frame trailer: v3 fields + 1B version marker (=4) before the magic, so a
+// mid-session injected v3 frame into a v4 room fails closed deterministically (spec §5.3/§8/§10.5).
+//   [headerBytes:1][keyId:2 BE][keyVersion:4 BE][IV:12][version:1 (=4)][magic:2] = 22
+const TRAILER_SIZE_V4 = 22;
+const FRAME_CRYPTO_VERSION_V4 = 4;
 // Minimum encrypted frame: 1 header byte + 16-byte GCM tag (empty plaintext) + trailer.
 const MIN_GCM_OVERHEAD = 17;
+
+/**
+ * Codec family for frame-crypto dispatch (spec §6.1 / §6.2).
+ * AV1 uses per-OBU payload encryption; all other codecs use whole-frame v4.
+ * Task 5 moves the canonical definition to e2eeProtocol.ts and re-exports it
+ * from there; this inline definition keeps Task 3 self-contained.
+ */
+export type CodecFamily = 'opus' | 'vp8' | 'vp9' | 'av1' | 'h264';
 
 // Reference: ideal unencrypted header bytes per codec (not used directly —
 // getUnencryptedBytes() uses static 1/2 for sender/receiver agreement safety).
@@ -134,6 +162,43 @@ export async function ratchetKey(currentKey: CryptoKey): Promise<CryptoKey> {
 }
 
 // ---------------------------------------------------------------------------
+// AV1 per-OBU helpers (#1895)
+// ---------------------------------------------------------------------------
+
+/**
+ * Encode a non-negative integer as AV1 leb128 (little-endian base-128). Uses
+ * integer division (not `<<`) so values above 2^28 don't overflow the 32-bit
+ * shift; bounded by the caller (OBU payloads are size-capped by the parser).
+ */
+function encodeLeb128(value: number): Uint8Array {
+  const out: number[] = [];
+  let v = value >>> 0;
+  do {
+    let b = v & 0x7f;
+    v = Math.floor(v / 128);
+    if (v !== 0) b |= 0x80;
+    out.push(b);
+  } while (v !== 0);
+  return new Uint8Array(out);
+}
+
+/**
+ * Concatenate a list of byte chunks into a single contiguous Uint8Array backed
+ * by a plain ArrayBuffer (so `.buffer` is assignable to `frame.data`).
+ */
+function concatBytes(parts: Uint8Array[]): Uint8Array<ArrayBuffer> {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(new ArrayBuffer(total));
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // FrameKeyMissError
 // ---------------------------------------------------------------------------
 
@@ -164,11 +229,18 @@ export class FrameKeyMissError extends Error {
 export class MediaEncryption {
   private currentKeyId = 0;
   // #1878: the channel-key (CSK) version bound to the encrypt key. Stamped into
-  // every outgoing frame's v3 trailer so receivers select the exact key.
+  // every outgoing frame's v4 trailer so receivers select the exact key.
   private currentKeyVersion = 0;
   private encryptKey: CryptoKey | null = null;
   private readonly decryptKeys: Map<string, { key: CryptoKey; expires: number }> = new Map();
   private rotationChain: Promise<void> = Promise.resolve();
+  // #1895: AV1 per-OBU IV construction (encryptAv1PerObu). obuSeqIndex resets to
+  // 0 at the start of each frame and increments per encrypted OBU so no two OBUs
+  // in one frame share an IV; frameCounter advances once per frame. The 6 CSPRNG
+  // bytes in each IV (buildObuIv) are the actual cross-frame nonce-uniqueness
+  // guarantee — these counters are a structural separator on top.
+  private obuSeqIndex = 0;
+  private frameCounter = 0;
 
   /**
    * Compose the decrypt-key map key. #1878: keyed by senderId:keyVersion:keyId
@@ -307,6 +379,15 @@ export class MediaEncryption {
     this.currentKeyId = newKeyId;
     this.encryptKey = newEncryptKey;
 
+    // #1895 (e2ee-review H1): reset the per-frame IV counters whenever the encrypt
+    // key ratchets. Each keyId epoch is a distinct GCM key, so starting
+    // frame_counter/obu_seq_index at 0 makes (frame_counter, obu_seq_index) a
+    // DETERMINISTIC unique GCM-nonce prefix within the epoch (spec §10.2). The
+    // 32-bit frame_counter cannot wrap within a single epoch (epochs ratchet on
+    // every join/leave); the 6 CSPRNG bytes in buildObuIv are defense-in-depth.
+    this.frameCounter = 0;
+    this.obuSeqIndex = 0;
+
     // Ratchet ALL decrypt keys at oldKeyId → newKeyId so receivers stay in
     // sync with senders.  Without this, decrypt keys stay at keyId 0 while
     // senders advance on every join/leave, causing "No decrypt key" errors
@@ -403,11 +484,27 @@ export class MediaEncryption {
     }
   }
 
-  /** Encrypt a media frame (called by Insertable Streams transform).
-   *  Throws if encryption fails — caller should drop the frame. */
-  async encryptFrame(frame: RTCEncodedAudioFrame | RTCEncodedVideoFrame): Promise<void> {
-    if (!this.encryptKey) throw new Error('E2EE: no encrypt key');
+  /**
+   * Encrypt a media frame, dispatching by the LOCAL send codec (spec §6.1):
+   * AV1 → per-OBU payload encryption; VP9/VP8/Opus/H264 → whole-frame v4.
+   * Throws on failure — the caller drops the frame.
+   */
+  async encryptFrame(
+    frame: RTCEncodedAudioFrame | RTCEncodedVideoFrame,
+    codec?: CodecFamily
+  ): Promise<void> {
+    if (codec === 'av1') {
+      await this.encryptAv1PerObu(frame);
+      return;
+    }
+    await this.encryptWholeFrame(frame);
+  }
 
+  /** Whole-frame v4 encrypt for VP9/VP8/Opus/H264 (byte-transparent codecs). */
+  private async encryptWholeFrame(
+    frame: RTCEncodedAudioFrame | RTCEncodedVideoFrame
+  ): Promise<void> {
+    if (!this.encryptKey) throw new Error('E2EE: no encrypt key');
     const encryptKey = this.encryptKey;
     const keyId = this.currentKeyId;
     const data = new Uint8Array(frame.data);
@@ -415,15 +512,10 @@ export class MediaEncryption {
     // #1742 root cause: an empty (0-byte) DTX frame would otherwise encrypt to
     // a small fixed blob (0-byte header + 16-byte GCM tag over an empty payload
     // + trailer) that falls just below the decrypt side's "too small to be
-    // encrypted" guard (`length < TRAILER_SIZE_V3 + MIN_GCM_OVERHEAD`). Such a
-    // frame would be misclassified as unencrypted and fed to the Opus decoder
-    // UNDECIPHERED — the receiver-side garble-during-silence (originally
-    // confirmed via two-client capture 2026-06-22 under the v2 trailer). An
-    // empty frame carries no audio content, so pass it through unchanged: it
-    // stays 0 bytes end-to-end and the decoder treats it as DTX silence,
-    // symmetric with the decrypt passthrough. Do NOT instead lower the decrypt
-    // threshold — the blob would then fail the small-cipher guard with a
-    // mismatched header, and the garble merely moves to a different branch.
+    // encrypted" guard. Such a frame would be misclassified as unencrypted and
+    // fed to the Opus decoder UNDECIPHERED — the receiver-side garble-during-silence.
+    // An empty frame carries no audio content, so pass it through unchanged.
+    // Do NOT instead lower the decrypt threshold.
     if (data.length === 0) return;
 
     // Determine unencrypted header bytes based on frame type.
@@ -444,9 +536,11 @@ export class MediaEncryption {
     // which would cause an AAD mismatch if we authenticated the header).
     const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, encryptKey, payload);
 
-    // Compose v3 trailer: [headerBytes:1][keyId:2 BE][keyVersion:4 BE][IV:12][magic:2]
+    // Compose v4 trailer: [headerBytes:1][keyId:2 BE][keyVersion:4 BE][IV:12][version:1 (=4)][magic:2]
+    // The version byte before the magic lets receivers deterministically reject injected v3 frames
+    // (spec §5.3/§8/§10.5 downgrade protection).
     const keyVersion = this.currentKeyVersion;
-    const result = new Uint8Array(header.length + ciphertext.byteLength + TRAILER_SIZE_V3);
+    const result = new Uint8Array(header.length + ciphertext.byteLength + TRAILER_SIZE_V4);
     result.set(header);
     result.set(new Uint8Array(ciphertext), header.length);
     const view = new DataView(result.buffer);
@@ -460,16 +554,201 @@ export class MediaEncryption {
     // handled by the early return above; this closes the residual sub-header case.
     result[offset] = header.length; // headerBytes (1)
     offset += 1;
-    view.setUint16(offset, keyId & 0xffff, false); // keyId (2, BE)
+    view.setUint16(offset, keyId & 0xffff, false); // keyId (2 BE)
     offset += 2;
-    view.setUint32(offset, keyVersion >>> 0, false); // keyVersion (4, BE)
+    view.setUint32(offset, keyVersion >>> 0, false); // keyVersion (4 BE)
     offset += 4;
     result.set(iv, offset); // IV (12)
     offset += 12;
+    result[offset] = FRAME_CRYPTO_VERSION_V4; // version (1) = 4
+    offset += 1;
     result[offset] = MAGIC_0;
     result[offset + 1] = MAGIC_1;
 
     frame.data = result.buffer;
+  }
+
+  /**
+   * Recover the byte offset of an OBU's header (the first header byte) from the
+   * parser's `payloadOffset`. The parser emits OBUs in contiguous bitstream
+   * order with `nextStart = payloadOffset + payloadLen`, so the i-th OBU's start
+   * is the (i-1)-th OBU's end, and the first starts at 0. This recovers each
+   * OBU's `[header(+ext)+size]` span without trusting any sender-stamped offset
+   * (spec §9.10): the boundaries come purely from the wire leb128 sizes that the
+   * hardened parser already validated.
+   */
+  private static obuStarts(obus: ParsedObu[]): number[] {
+    const starts: number[] = [];
+    let next = 0;
+    for (const o of obus) {
+      starts.push(next);
+      next = o.payloadOffset + o.payloadLen;
+    }
+    return starts;
+  }
+
+  /**
+   * AV1 per-OBU payload encryption (spec §4.1). Walks the OBU list and replaces
+   * the payload of each OBU_FRAME(6) / OBU_TILE_GROUP(4) with
+   *   [mini-header 22B][AES-256-GCM(payload)][tag 16B]
+   * re-encoding the cleartext leb128 size to cover the new payload length. All
+   * other OBU types are copied through cleartext (the SFU may rewrite them).
+   *
+   * IV uniqueness: obuSeqIndex resets to 0 here and increments per encrypted OBU;
+   * frameCounter advances once per frame (GCM nonce uniqueness, spec §10.2).
+   */
+  private async encryptAv1PerObu(
+    frame: RTCEncodedVideoFrame | RTCEncodedAudioFrame
+  ): Promise<void> {
+    if (!this.encryptKey) throw new Error('E2EE: no encrypt key');
+    const encryptKey = this.encryptKey;
+    const keyId = this.currentKeyId;
+    const keyVersion = this.currentKeyVersion;
+    const data: Uint8Array<ArrayBuffer> = new Uint8Array(frame.data);
+    if (data.length === 0) return;
+
+    const obus = parseAv1Obus(data);
+    if (obus === null) throw new Error('E2EE: AV1 parse failed (encrypt) — dropping frame');
+    const starts = MediaEncryption.obuStarts(obus);
+
+    // GCM nonce uniqueness (spec §10.2): frameCounter resets to 0 on each key
+    // ratchet (rotateKeysOnce), so within one keyId epoch (frame_counter,
+    // obu_seq_index) is a DETERMINISTIC unique IV prefix — frameCounter advances
+    // once per frame, obuSeqIndex resets to 0 here and increments per encrypted
+    // OBU, so no two OBUs under the same key ever share an IV. The 32-bit counter
+    // cannot wrap within an epoch (epochs ratchet on join/leave). The 6 trailing
+    // CSPRNG bytes (buildObuIv) are defense-in-depth across reconnects.
+    const fc = this.frameCounter;
+    this.frameCounter = (this.frameCounter + 1) >>> 0;
+    this.obuSeqIndex = 0;
+
+    const parts: Uint8Array[] = [];
+    for (let i = 0; i < obus.length; i++) {
+      const o = obus[i];
+      const obuStart = starts[i];
+      if (o.obuType === AV1_OBU_FRAME || o.obuType === AV1_OBU_TILE_GROUP) {
+        const payload = data.subarray(o.payloadOffset, o.payloadOffset + o.payloadLen);
+        // Copy into a plain-ArrayBuffer-backed view so the IV satisfies WebCrypto's
+        // BufferSource<ArrayBuffer> typing (buildObuIv returns ArrayBufferLike-typed).
+        const iv: Uint8Array<ArrayBuffer> = new Uint8Array(buildObuIv(fc, this.obuSeqIndex++));
+        const ciphertext = new Uint8Array(
+          await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, encryptKey, payload)
+        );
+        const mini = encodeObuMiniHeader({ iv, keyId, keyVersion });
+        const newPayloadLen = OBU_MINI_HEADER_SIZE + ciphertext.byteLength; // includes the 16B tag
+        // Rebuild [header byte(s)(+ext)] + [re-encoded leb128 size] + [mini][ct].
+        const headerByte = data[obuStart];
+        const extByte = ((headerByte >>> 2) & 0x01) === 1 ? data[obuStart + 1] : undefined;
+        // Force has_size_field=1 on the rebuilt OBU so the size is explicit (the
+        // receiver re-derives the ciphertext length from it). Set bit 1.
+        const head: number[] = [headerByte | 0b10];
+        if (extByte !== undefined) head.push(extByte);
+        parts.push(new Uint8Array(head), encodeLeb128(newPayloadLen), mini, ciphertext);
+      } else {
+        // Pass the whole OBU (header + ext + size + payload) through cleartext.
+        parts.push(data.slice(obuStart, o.payloadOffset + o.payloadLen));
+      }
+    }
+    frame.data = concatBytes(parts).buffer;
+  }
+
+  /**
+   * Decrypt one tile-data OBU payload (OBU_FRAME / OBU_TILE_GROUP). Returns the
+   * reconstructed cleartext OBU chunks — [header(+ext), leb128 size, plaintext] —
+   * ready for concatenation. Throws on any failure (magic absent, key miss, GCM
+   * error) so `decryptAv1PerObu` can propagate directly (fail-closed, spec §5.1).
+   *
+   * @param data   Full received frame bytes (re-parsed from wire).
+   * @param obuStart Byte offset of this OBU's header byte inside `data`.
+   * @param region   `data.subarray(payloadOffset, payloadOffset + payloadLen)`.
+   * @param senderUserId Authenticated sender identity for key lookup.
+   */
+  private async decryptOneObu(
+    data: Uint8Array<ArrayBuffer>,
+    obuStart: number,
+    region: Uint8Array<ArrayBuffer>,
+    senderUserId: string
+  ): Promise<Uint8Array[]> {
+    const mini = decodeObuMiniHeader(region);
+    if (mini === null) {
+      // No mini-header magic on a tile-data OBU → not our ciphertext. Fail
+      // closed: never forward a tile-data payload we did not decrypt.
+      throw new Error('E2EE: AV1 tile-data OBU missing mini-header — dropping frame');
+    }
+    const ciphertext = region.subarray(OBU_MINI_HEADER_SIZE);
+    if (ciphertext.byteLength < 16) {
+      throw new Error('E2EE: AV1 OBU ciphertext too small — dropping frame');
+    }
+    let keyEntry = this.decryptKeys.get(
+      MediaEncryption.mapKey(senderUserId, mini.keyVersion, mini.keyId)
+    );
+    keyEntry ??=
+      (await this.deriveRatchetedKey(senderUserId, mini.keyVersion, mini.keyId)) ?? undefined;
+    if (!keyEntry) {
+      let availableCount = 0;
+      for (const id of this.decryptKeys.keys()) {
+        if (id.startsWith(`${senderUserId}:`)) availableCount++;
+      }
+      throw new FrameKeyMissError(
+        senderUserId,
+        mini.keyVersion,
+        mini.keyId,
+        `E2EE: no decrypt key for sender=${senderUserId} v=${mini.keyVersion} keyId=${mini.keyId} (${availableCount} keys held for sender)`
+      );
+    }
+    // Copy the IV into a plain-ArrayBuffer-backed view (mini.iv is
+    // ArrayBufferLike-typed) so it satisfies WebCrypto's BufferSource typing.
+    const iv: Uint8Array<ArrayBuffer> = new Uint8Array(mini.iv);
+    const plaintext = new Uint8Array(
+      await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, keyEntry.key, ciphertext)
+    );
+    // Rebuild the cleartext OBU: [header(+ext)] + [leb128 size = plaintext.len] + [plaintext].
+    const headerByte = data[obuStart];
+    const extByte = ((headerByte >>> 2) & 0x01) === 1 ? data[obuStart + 1] : undefined;
+    const head: number[] = [headerByte | 0b10]; // ensure has_size_field=1
+    if (extByte !== undefined) head.push(extByte);
+    return [new Uint8Array(head), encodeLeb128(plaintext.byteLength), plaintext];
+  }
+
+  /**
+   * AV1 per-OBU payload decryption (spec §4.1 / §5.1). Re-parses the OBU list from
+   * the RECEIVED (post-SFU-rewrite) bytes — boundaries come from the wire leb128
+   * sizes, never a sender-stamped offset (spec §9.10) — decrypts each tile-data
+   * OBU's payload, and reconstructs the cleartext frame byte-exact.
+   *
+   * Structure-only passthrough (no OBU_FRAME / OBU_TILE_GROUP): AV1 frames that
+   * contain no tile-data OBUs (e.g. show_existing_frame, metadata-only frames) carry
+   * no coded pixel payload and pass through cleartext by design. This is the
+   * documented no-AAD authentication scope (spec §10.1): OBU structure is cleartext
+   * and unauthenticated; at worst a tampered structure-only frame causes a decode
+   * glitch, never plaintext pixel disclosure (there are no pixels to disclose).
+   * Requiring ≥1 encrypted tile per frame would incorrectly reject legitimate
+   * tile-less AV1 frames that the encoder and SFU may legally produce.
+   */
+  private async decryptAv1PerObu(
+    frame: RTCEncodedVideoFrame | RTCEncodedAudioFrame,
+    senderUserId: string
+  ): Promise<void> {
+    const data: Uint8Array<ArrayBuffer> = new Uint8Array(frame.data);
+    if (data.length === 0) return;
+
+    const obus = parseAv1Obus(data);
+    if (obus === null) throw new Error('E2EE: AV1 parse failed (decrypt) — dropping frame');
+    const starts = MediaEncryption.obuStarts(obus);
+
+    const parts: Uint8Array[] = [];
+    for (let i = 0; i < obus.length; i++) {
+      const o = obus[i];
+      const obuStart = starts[i];
+      if (o.obuType === AV1_OBU_FRAME || o.obuType === AV1_OBU_TILE_GROUP) {
+        const region = data.subarray(o.payloadOffset, o.payloadOffset + o.payloadLen);
+        const chunks = await this.decryptOneObu(data, obuStart, region, senderUserId);
+        parts.push(...chunks);
+      } else {
+        parts.push(data.slice(obuStart, o.payloadOffset + o.payloadLen));
+      }
+    }
+    frame.data = concatBytes(parts).buffer;
   }
 
   /**
@@ -522,7 +801,25 @@ export class MediaEncryption {
   }
 
   /**
-   * Decrypt a media frame (called by Insertable Streams transform).
+   * Decrypt a media frame, dispatching by the RECEIVED codec (spec §6.2):
+   * AV1 → per-OBU payload decryption; VP9/VP8/Opus/H264 → whole-frame v4.
+   * Returns normally if decryption succeeds or the frame is empty (DTX).
+   * Throws for any non-empty frame that fails — caller should DROP the frame.
+   */
+  async decryptFrame(
+    frame: RTCEncodedAudioFrame | RTCEncodedVideoFrame,
+    senderUserId: string,
+    codec?: CodecFamily
+  ): Promise<void> {
+    if (codec === 'av1') {
+      await this.decryptAv1PerObu(frame, senderUserId);
+      return;
+    }
+    await this.decryptWholeFrame(frame, senderUserId);
+  }
+
+  /**
+   * Whole-frame v4 decrypt for VP9/VP8/Opus/H264 (byte-transparent codecs).
    *
    * Returns normally if decryption succeeds or the frame is empty (e.g. DTX).
    * Throws for any non-empty frame without the E2EE magic trailer or any frame
@@ -530,7 +827,7 @@ export class MediaEncryption {
    * those frames to avoid feeding plaintext-policy violations or ciphertext
    * into the audio/video decoder.
    */
-  async decryptFrame(
+  private async decryptWholeFrame(
     frame: RTCEncodedAudioFrame | RTCEncodedVideoFrame,
     senderUserId: string
   ): Promise<void> {
@@ -546,39 +843,44 @@ export class MediaEncryption {
       throw new Error('E2EE: unencrypted media frame received');
     }
 
-    // Minimum: 1 header + 16 GCM tag + 21 trailer (derive from the constant).
-    if (data.length < TRAILER_SIZE_V3 + MIN_GCM_OVERHEAD) {
+    // Minimum: 1 header + 16 GCM tag + 22 v4 trailer.
+    if (data.length < TRAILER_SIZE_V4 + MIN_GCM_OVERHEAD) {
       throw new Error('E2EE: malformed encrypted frame too small');
     }
 
-    // v3 trailer offsets from end: magic[-2,-1], IV[-14,-3],
-    // keyVersion[-18,-15] (4B BE), keyId[-20,-19] (2B BE), headerBytes[-21].
-    // The length guard above mathematically guarantees these indices are
-    // in-bounds; DataView reads still need an explicit narrow on headerBytes.
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    // v4 trailer offsets from end (22 bytes total):
+    //   magic[-2,-1], version[-3] (=4), IV[-15,-4] (12B),
+    //   keyVersion[-19,-16] (4B BE), keyId[-21,-20] (2B BE), headerBytes[-22].
+    // The length guard above mathematically guarantees these indices are in-bounds.
     const n = data.length;
-    const iv = data.slice(n - 14, n - 2);
-    const keyVersion = view.getUint32(n - 18, false);
-    const keyId = view.getUint16(n - 20, false);
-    const headerBytes = data.at(n - 21); // Sender-encoded header byte count
+
+    // Reject v3 frames: explicit version check before any crypto (spec §5.3/§10.5).
+    const version = data.at(n - 3);
+    if (version !== FRAME_CRYPTO_VERSION_V4) {
+      throw new Error('E2EE: unexpected frame crypto version');
+    }
+
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const iv = data.slice(n - 15, n - 3); // 12B
+    const keyVersion = view.getUint32(n - 19, false); // 4B BE
+    const keyId = view.getUint16(n - 21, false); // 2B BE
+    const headerBytes = data.at(n - 22); // 1B
     if (headerBytes === undefined) {
-      // Unreachable in practice: the length guard above guarantees index -21 is
+      // Unreachable in practice: the length guard above guarantees index -22 is
       // defined. If we ever reach here, the guard was weakened or the data was
-      // mutated mid-function — either way the frame is corrupted and
-      // silent-passthrough would hide a real invariant bug. The magic-trailer
-      // check above already identified this as our frame.
+      // mutated mid-function — either way the frame is corrupted.
       throw new Error(
         'mediaEncryption: decrypt invariant violated — headerBytes undefined despite length guard'
       );
     }
 
     // Sanity check: headerBytes should be 1-10
-    if (headerBytes < 1 || headerBytes > 10 || headerBytes >= data.length - TRAILER_SIZE_V3) {
+    if (headerBytes < 1 || headerBytes > 10 || headerBytes >= data.length - TRAILER_SIZE_V4) {
       throw new Error('E2EE: malformed encrypted frame trailer');
     }
 
     const header = data.slice(0, headerBytes);
-    const ciphertext = data.slice(headerBytes, data.length - TRAILER_SIZE_V3);
+    const ciphertext = data.slice(headerBytes, data.length - TRAILER_SIZE_V4);
 
     // AES-GCM ciphertext must be at least 16 bytes (the auth tag alone)
     if (ciphertext.byteLength < 16) {
@@ -627,5 +929,7 @@ export class MediaEncryption {
     this.rotationChain = Promise.resolve();
     this.encryptKey = null;
     this.decryptKeys.clear();
+    this.obuSeqIndex = 0;
+    this.frameCounter = 0;
   }
 }

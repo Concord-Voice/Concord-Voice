@@ -6,8 +6,19 @@
  * because it's a 6-line branch with no stateful logic.
  */
 
-import type { MediaEncryption } from './mediaEncryption';
+import type { MediaEncryption, FrameKeyMissError } from './mediaEncryption';
 import { errorMessage } from '../utils/redactError';
+import type { CodecFamily } from '../workers/e2eeProtocol';
+
+/**
+ * #1895/#1878: discriminate the typed decrypt miss by error `name` (not
+ * `instanceof`) — identical to the Worker's check (e2eeWorker.ts). Name-based
+ * matching is immune to cross-realm/duplicate-class pitfalls and lets unit
+ * tests mock `mediaEncryption` without re-exporting the class.
+ */
+function isFrameKeyMiss(err: unknown): err is FrameKeyMissError {
+  return err instanceof Error && err.name === 'FrameKeyMissError';
+}
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -22,6 +33,13 @@ export interface DecryptRecoveryCallbacks {
   addDecryptKeyForUser: (channelId: string, userId: string) => Promise<boolean>;
   invalidateChannelKey: (channelId: string) => void;
   requestKeyframe: (senderUserId: string) => void;
+  /**
+   * #1895: provision the exact key for a typed FrameKeyMiss on demand (mirrors
+   * the Worker path's requestFrameKeyOnce). Optional + fail-safe: if a caller
+   * omits it the pipeline still drops the frame (fail-closed) — it just can't
+   * self-provision the missing CSK version. VoiceService always supplies it.
+   */
+  requestFrameKey?: (senderUserId: string, keyVersion: number, keyId: number) => void;
 }
 
 // ─── Constants ───────────────────────────────────────────────────────
@@ -126,7 +144,8 @@ export function applyLegacyDecryptPipeline(
   senderUserId: string,
   encryption: MediaEncryption,
   callbacks: DecryptRecoveryCallbacks,
-  verbose: boolean
+  verbose: boolean,
+  codecFamily?: CodecFamily // #1895: SENDER's codec — drives per-codec decrypt dispatch
 ): void {
   if (typeof receiver.createEncodedStreams !== 'function') {
     const message = 'E2EE: no Insertable Streams API available — frames will not be decrypted';
@@ -143,7 +162,7 @@ export function applyLegacyDecryptPipeline(
     const transform = new TransformStream({
       transform: async (frame: RTCEncodedAudioFrame | RTCEncodedVideoFrame, controller) => {
         try {
-          await encryption.decryptFrame(frame, senderUserId);
+          await encryption.decryptFrame(frame, senderUserId, codecFamily);
           controller.enqueue(frame);
 
           if (!firstDecryptLogged) {
@@ -160,6 +179,21 @@ export function applyLegacyDecryptPipeline(
             dropCount = 0;
           }
         } catch (decryptErr) {
+          if (isFrameKeyMiss(decryptErr)) {
+            // #1895: typed version miss — provision the exact (keyVersion, keyId)
+            // on demand, mirroring the Worker path (e2eeWorker.ts). Fail-closed:
+            // the frame is dropped while the key is fetched; a later frame
+            // decrypts once it lands. NOT counted toward the generic
+            // drop/self-heal counter below — that recovery is version-blind (the
+            // #1878/#1885 residual this fixes); only the wrong-base OperationError
+            // case needs it.
+            callbacks.requestFrameKey?.(
+              decryptErr.senderUserId,
+              decryptErr.keyVersion,
+              decryptErr.keyId
+            );
+            return;
+          }
           dropCount++;
           logDecryptFailure(senderUserId, dropCount, frame, decryptErr, encryption, verbose);
 

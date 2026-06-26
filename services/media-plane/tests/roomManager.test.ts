@@ -278,16 +278,24 @@ describe('RoomManager', () => {
       expect(() => parseMediaFrameCryptoVersion({ version: 2 })).toThrow(
         'Unsupported media frame crypto version object'
       );
+      expect(() => parseMediaFrameCryptoVersion('4')).toThrow(
+        'Unsupported media frame crypto version 4'
+      );
     });
 
-    it('accepts v2 during the v2→v3 rollout window', () => {
-      expect(parseMediaFrameCryptoVersion(2)).toBe(2);
+    it('accepts v3 and v4 during the v3→v4 rollout window', () => {
       expect(parseMediaFrameCryptoVersion(3)).toBe(3);
+      expect(parseMediaFrameCryptoVersion(4)).toBe(4);
     });
 
-    it('raises the room version when a higher-version participant joins (higher-version-wins)', async () => {
-      // Seed the room at v2 (a rollout-window client), then a v3 client joins.
-      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, undefined, 2);
+    it('rejects v2 now that the window has moved to v3→v4', () => {
+      expect(() => parseMediaFrameCryptoVersion(2)).toThrow(
+        'Unsupported media frame crypto version 2'
+      );
+    });
+
+    it('raises the room from v3 to v4 when a v4 participant joins (higher-version-wins)', async () => {
+      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, undefined, 3);
       const res = await manager.joinRoom(
         'r',
         'u2',
@@ -295,15 +303,15 @@ describe('RoomManager', () => {
         { username: 'b' },
         undefined,
         undefined,
-        3
+        4
       );
 
-      expect(res.mediaFrameCryptoVersion).toBe(3);
-      expect(manager.getRoom('r')?.mediaFrameCryptoVersion).toBe(3);
+      expect(res.mediaFrameCryptoVersion).toBe(4);
+      expect(manager.getRoom('r')?.mediaFrameCryptoVersion).toBe(4);
     });
 
     it('keeps the room version when an equal-version participant joins', async () => {
-      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, undefined, 3);
+      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, undefined, 4);
       const res = await manager.joinRoom(
         'r',
         'u2',
@@ -311,23 +319,23 @@ describe('RoomManager', () => {
         { username: 'b' },
         undefined,
         undefined,
-        3
+        4
       );
 
-      expect(res.mediaFrameCryptoVersion).toBe(3);
-      expect(manager.getRoom('r')?.mediaFrameCryptoVersion).toBe(3);
+      expect(res.mediaFrameCryptoVersion).toBe(4);
+      expect(manager.getRoom('r')?.mediaFrameCryptoVersion).toBe(4);
     });
 
-    it('rejects a lower-version joiner into a higher-version room with a typed mismatch', async () => {
-      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, undefined, 3);
+    it('rejects a v3 joiner into a v4 room with a typed mismatch', async () => {
+      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, undefined, 4);
       const room = manager.getRoom('r')!;
       const epochBefore = room.e2eeEpoch;
 
-      const promise = manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, undefined, 2);
+      const promise = manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, undefined, 3);
       await expect(promise).rejects.toMatchObject({
         code: 'crypto_version_mismatch',
-        roomVersion: 3,
-        joinVersion: 2,
+        roomVersion: 4,
+        joinVersion: 3,
       });
       await expect(promise).rejects.toBeInstanceOf(CryptoVersionMismatchError);
 

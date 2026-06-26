@@ -45,10 +45,11 @@ import {
   useOsPermissionStore,
   ensureOsPermission as ensureOsPermissionShared,
 } from '../stores/osPermissionStore';
-import type {
-  E2EEWorkerMessage,
-  E2EEMainMessage,
-  E2EETransformOptions,
+import {
+  codecFamilyFromRtpParameters,
+  type E2EEWorkerMessage,
+  type E2EEMainMessage,
+  type E2EETransformOptions,
 } from '../workers/e2eeProtocol';
 import { notificationSoundService } from './notificationSoundService';
 import { selectCodecFromCascade, type CodecLookup } from './voiceCodecSelection';
@@ -4833,34 +4834,14 @@ class VoiceService {
       }
 
       case 'requestFrameKey': {
-        // #1878: the worker hit a typed decrypt miss for an exact
-        // (sender, keyVersion, keyId). Fetch the authoritative CSK at that
-        // version, derive the receiver key, and post it back. Fail-closed on
-        // fetch failure (pending-404 / permanent-403): the worker rate-limits
-        // and caps its own retries, so a no-op here is safe.
+        // #1878/#1895: the worker hit a typed decrypt miss for an exact
+        // (sender, keyVersion, keyId). Provision the version-specific key via the
+        // shared path — the same one the legacy createEncodedStreams pipeline
+        // uses (#1895), so both decrypt paths recover identically.
         const channelId = useVoiceStore.getState().activeChannelId;
-        if (!channelId || !this.mediaEncryption) break;
-        const mediaEncryption = this.mediaEncryption;
-        e2eeService
-          .getChannelKeyByVersion(channelId, msg.keyVersion)
-          .then(async (csk) => {
-            const key = await mediaEncryption.addDecryptKeyAtVersion(
-              csk,
-              msg.senderUserId,
-              msg.keyVersion,
-              msg.keyId
-            );
-            this.e2eeWorker?.postMessage({
-              type: 'addDecryptKey',
-              senderUserId: msg.senderUserId,
-              keyVersion: msg.keyVersion,
-              keyId: msg.keyId,
-              key,
-            } satisfies E2EEWorkerMessage);
-          })
-          .catch(() => {
-            /* fail-closed: worker rate-limits + caps retries */
-          });
+        if (channelId) {
+          this.provisionFrameKey(channelId, msg.senderUserId, msg.keyVersion, msg.keyId);
+        }
         break;
       }
 
@@ -5057,10 +5038,13 @@ class VoiceService {
       this.failClosedEncryptTransform(producer, 'no rtpSender on producer');
     }
 
+    // #1895: resolve LOCAL send codec to drive per-codec encrypt dispatch (AV1 per-OBU vs whole-frame)
+    const codecFamily = codecFamilyFromRtpParameters(producer.rtpParameters);
+
     // Modern path: RTCRtpScriptTransform (Chromium 129+)
     if (USE_SCRIPT_TRANSFORM && this.e2eeWorker) {
       try {
-        const options: E2EETransformOptions = { role: 'encrypt' };
+        const options: E2EETransformOptions = { role: 'encrypt', codecFamily };
         sender.transform = new RTCRtpScriptTransform(this.e2eeWorker, options);
         console.debug('E2EE: encrypt transform applied (RTCRtpScriptTransform)');
       } catch (err) {
@@ -5085,7 +5069,7 @@ class VoiceService {
         const transform = new TransformStream({
           async transform(frame: RTCEncodedAudioFrame | RTCEncodedVideoFrame, controller) {
             try {
-              await encryption.encryptFrame(frame);
+              await encryption.encryptFrame(frame, codecFamily);
               controller.enqueue(frame);
               if (!firstEncryptLogged) {
                 firstEncryptLogged = true;
@@ -5140,6 +5124,50 @@ class VoiceService {
    * Modern path: RTCRtpScriptTransform (Chromium 129+, Worker-based).
    * Legacy path: createEncodedStreams (Chromium 86-130, main-thread).
    */
+  /**
+   * #1878/#1895: provision the exact (keyVersion, keyId) decrypt key for a typed
+   * FrameKeyMiss. Shared by the Worker `requestFrameKey` IPC handler and the
+   * legacy createEncodedStreams pipeline's `requestFrameKey` callback so both
+   * decrypt paths recover identically.
+   *
+   * Adds the derived key to the main-thread MediaEncryption — which IS the
+   * instance the legacy pipeline decrypts with — and, on the Worker path, also
+   * posts the key into the Worker's own instance. Fail-closed on fetch failure
+   * (pending-404 / permanent-403): getChannelKeyByVersion rate-limits and the
+   * Worker caps its retries, so a swallowed rejection is safe.
+   */
+  private provisionFrameKey(
+    channelId: string,
+    senderUserId: string,
+    keyVersion: number,
+    keyId: number
+  ): void {
+    const mediaEncryption = this.mediaEncryption;
+    if (!mediaEncryption) return;
+    e2eeService
+      .getChannelKeyByVersion(channelId, keyVersion)
+      .then(async (csk) => {
+        const key = await mediaEncryption.addDecryptKeyAtVersion(
+          csk,
+          senderUserId,
+          keyVersion,
+          keyId
+        );
+        if (USE_SCRIPT_TRANSFORM) {
+          this.e2eeWorker?.postMessage({
+            type: 'addDecryptKey',
+            senderUserId,
+            keyVersion,
+            keyId,
+            key,
+          } satisfies E2EEWorkerMessage);
+        }
+      })
+      .catch(() => {
+        /* fail-closed: getChannelKeyByVersion rate-limits; worker caps retries */
+      });
+  }
+
   /** Build DecryptRecoveryCallbacks bound to this VoiceService instance. */
   private decryptRecoveryCallbacks(): DecryptRecoveryCallbacks {
     return {
@@ -5151,6 +5179,14 @@ class VoiceService {
           this.socket?.emit('request-keyframe', { senderUserId });
         }
       },
+      // #1895: typed-miss provisioning for the legacy createEncodedStreams path,
+      // routed through the same shared provisionFrameKey as the Worker IPC path.
+      requestFrameKey: (senderUserId, keyVersion, keyId) => {
+        const channelId = useVoiceStore.getState().activeChannelId;
+        if (channelId) {
+          this.provisionFrameKey(channelId, senderUserId, keyVersion, keyId);
+        }
+      },
     };
   }
 
@@ -5160,10 +5196,15 @@ class VoiceService {
       throw new Error('E2EE: failed to attach decrypt transform (no rtpReceiver on consumer)');
     }
 
+    // #1895: resolve SENDER's codec from consumer.rtpParameters (populated before this is called —
+    // consumeProducerImpl creates the consumer from result.rtpParameters then calls applyDecryptTransform,
+    // so there is no race — OQ-8). Drives per-codec decrypt dispatch (AV1 per-OBU vs whole-frame).
+    const codecFamily = codecFamilyFromRtpParameters(consumer.rtpParameters);
+
     // Modern path: RTCRtpScriptTransform (Chromium 129+)
     if (USE_SCRIPT_TRANSFORM && this.e2eeWorker) {
       try {
-        const options: E2EETransformOptions = { role: 'decrypt', senderUserId };
+        const options: E2EETransformOptions = { role: 'decrypt', senderUserId, codecFamily };
         receiver.transform = new RTCRtpScriptTransform(this.e2eeWorker, options);
         console.debug(
           `E2EE: decrypt transform applied for ${senderUserId} (RTCRtpScriptTransform)`
@@ -5188,7 +5229,8 @@ class VoiceService {
       senderUserId,
       this.mediaEncryption,
       this.decryptRecoveryCallbacks(),
-      E2EE_VERBOSE
+      E2EE_VERBOSE,
+      codecFamily
     );
   }
 
