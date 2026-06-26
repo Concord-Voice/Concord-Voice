@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { wrapStore } from '../utils/createStore';
-import type { CodecCapability } from '../services/mediaCapabilities';
+import type { CodecCapability, GpuInfo } from '../services/mediaCapabilities';
 
 // ---------------------------------------------------------------------------
 // Video quality presets
@@ -102,7 +102,7 @@ export interface VideoSettings {
 
   // Cached capabilities (non-persisted in practice, but ok to persist for fast initial render)
   codecCapabilities: CodecCapability[];
-  gpuInfo: { vendor: string; device: string } | null;
+  gpuInfo: GpuInfo | null;
 }
 
 interface VideoSettingsState extends VideoSettings {
@@ -120,7 +120,7 @@ interface VideoSettingsState extends VideoSettings {
   setHdrEncoding: (enabled: boolean) => void;
   setVideoAdvancedMode: (enabled: boolean) => void;
   setCodecCapabilities: (caps: CodecCapability[]) => void;
-  setGpuInfo: (info: { vendor: string; device: string } | null) => void;
+  setGpuInfo: (info: GpuInfo | null) => void;
 }
 
 const defaults: VideoSettings = {
@@ -142,34 +142,36 @@ const defaults: VideoSettings = {
   gpuInfo: null,
 };
 
-export const useVideoSettingsStore = wrapStore(create<VideoSettingsState>()(
-  persist(
-    (set) => ({
-      ...defaults,
+export const useVideoSettingsStore = wrapStore(
+  create<VideoSettingsState>()(
+    persist(
+      (set) => ({
+        ...defaults,
 
-      setVideoAdvancedMode: (videoAdvancedMode) => set({ videoAdvancedMode }),
-      setCameraPreset: (cameraPreset) => set({ cameraPreset }),
-      setPreferredVideoCodec: (preferredVideoCodec) => set({ preferredVideoCodec }),
-      setCameraPriority: (cameraPriority) => set({ cameraPriority }),
-      setScreenResolution: (screenResolution) => set({ screenResolution }),
-      setScreenFrameRate: (screenFrameRate) => set({ screenFrameRate }),
-      setScreenContentType: (screenContentType) => set({ screenContentType }),
-      setScreenSharePriority: (screenSharePriority) => set({ screenSharePriority }),
-      setScreenShareBitrate: (screenShareBitrate) => set({ screenShareBitrate }),
-      setDegradationPreference: (degradationPreference) => set({ degradationPreference }),
-      setScalabilityMode: (scalabilityMode) => set({ scalabilityMode }),
-      setHardwareAcceleration: (hardwareAcceleration) => set({ hardwareAcceleration }),
-      setHdrEncoding: (hdrEncoding) => set({ hdrEncoding }),
-      setCodecCapabilities: (codecCapabilities) => set({ codecCapabilities }),
-      setGpuInfo: (gpuInfo) => set({ gpuInfo }),
-    }),
-    {
-      name: 'concord:video-settings',
-      partialize: (state) => {
-        // Exclude runtime-only fields from persistence
-        const { systemHdr: _, ...rest } = state;
-        return rest;
-      },
-    }
+        setVideoAdvancedMode: (videoAdvancedMode) => set({ videoAdvancedMode }),
+        setCameraPreset: (cameraPreset) => set({ cameraPreset }),
+        setPreferredVideoCodec: (preferredVideoCodec) => set({ preferredVideoCodec }),
+        setCameraPriority: (cameraPriority) => set({ cameraPriority }),
+        setScreenResolution: (screenResolution) => set({ screenResolution }),
+        setScreenFrameRate: (screenFrameRate) => set({ screenFrameRate }),
+        setScreenContentType: (screenContentType) => set({ screenContentType }),
+        setScreenSharePriority: (screenSharePriority) => set({ screenSharePriority }),
+        setScreenShareBitrate: (screenShareBitrate) => set({ screenShareBitrate }),
+        setDegradationPreference: (degradationPreference) => set({ degradationPreference }),
+        setScalabilityMode: (scalabilityMode) => set({ scalabilityMode }),
+        setHardwareAcceleration: (hardwareAcceleration) => set({ hardwareAcceleration }),
+        setHdrEncoding: (hdrEncoding) => set({ hdrEncoding }),
+        setCodecCapabilities: (codecCapabilities) => set({ codecCapabilities }),
+        setGpuInfo: (gpuInfo) => set({ gpuInfo }),
+      }),
+      {
+        name: 'concord:video-settings',
+        partialize: (state) => {
+          // Exclude runtime-only fields from persistence
+          const { systemHdr: _, ...rest } = state;
+          return rest;
+        },
+      }
+    )
   )
-));
+);

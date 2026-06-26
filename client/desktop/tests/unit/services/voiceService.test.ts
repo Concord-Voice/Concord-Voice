@@ -2718,8 +2718,8 @@ describe('VoiceService', () => {
       useVideoSettingsStore.setState({
         hardwareAcceleration: false,
         codecCapabilities: [
-          { mimeType: 'video/AV1', powerEfficient: true },
-          { mimeType: 'video/VP8', powerEfficient: false },
+          { mimeType: 'video/AV1', powerEfficient: true, hwAvailable: true },
+          { mimeType: 'video/VP8', powerEfficient: false, hwAvailable: false },
         ],
       });
       const cameraProducer = createMockProducer('prod-cam', 'camera');

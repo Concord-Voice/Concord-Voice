@@ -50,10 +50,13 @@ describe('videoSettingsStore', () => {
   });
 
   it('sets GPU info', () => {
-    useVideoSettingsStore.getState().setGpuInfo({ vendor: 'NVIDIA', renderer: 'RTX 4090' });
+    useVideoSettingsStore
+      .getState()
+      .setGpuInfo({ vendor: 'NVIDIA', device: 'RTX 4090', encodeProfiles: ['video/H264'] });
     expect(useVideoSettingsStore.getState().gpuInfo).toEqual({
       vendor: 'NVIDIA',
-      renderer: 'RTX 4090',
+      device: 'RTX 4090',
+      encodeProfiles: ['video/H264'],
     });
   });
 });

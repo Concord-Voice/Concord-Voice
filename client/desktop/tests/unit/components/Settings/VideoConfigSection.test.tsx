@@ -122,10 +122,11 @@ import { getCodecInfo } from '@/renderer/services/mediaCapabilities';
 const makeCodec = (
   mimeType: string,
   powerEfficient: boolean,
-  opts: { sdpFmtpLine?: string; profileLabel?: string; isHdr?: boolean } = {}
+  opts: { sdpFmtpLine?: string; profileLabel?: string; isHdr?: boolean; hwAvailable?: boolean } = {}
 ) => ({
   mimeType,
   powerEfficient,
+  hwAvailable: 'hwAvailable' in opts ? opts.hwAvailable : powerEfficient,
   sdpFmtpLine: opts.sdpFmtpLine || 'default',
   profileLabel: opts.profileLabel || '',
   isHdr: opts.isHdr || false,
@@ -511,6 +512,20 @@ describe('VideoConfigSection', () => {
       mockDraftSettings({ hardwareAcceleration: true });
       renderComponent();
       expect(screen.getByText(/Hardware acceleration is enabled, but none/)).toBeInTheDocument();
+    });
+
+    it('suppresses HW fallback notice when hardware status is unknown', () => {
+      const unknownCodecs = [makeCodec('video/VP8', false, { hwAvailable: undefined })];
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: unknownCodecs,
+        gpuInfo: { vendor: 'Apple', device: 'M-series', encodeProfiles: [] },
+      });
+      mockDraftSettings({ hardwareAcceleration: true });
+      renderComponent();
+      expect(
+        screen.queryByText(/Hardware acceleration is enabled, but none/)
+      ).not.toBeInTheDocument();
     });
 
     it('does not show HW fallback notice when HW codecs are supported', () => {

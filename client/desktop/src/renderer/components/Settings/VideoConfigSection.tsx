@@ -725,12 +725,15 @@ const VideoConfigSection: React.FC = () => {
                 return out;
               };
 
-              // HW column: codecs with GPU acceleration
+              // HW column: codecs with confirmed GPU acceleration
               // SW column: ALL codecs (every codec has a software encoder fallback)
               const hwCodecs = dedupe(
-                codecCapabilities.filter((c) => c.powerEfficient).sort(sortByPriority)
+                codecCapabilities.filter((c) => c.hwAvailable === true).sort(sortByPriority)
               );
               const swCodecs = dedupe([...codecCapabilities].sort(sortByPriority));
+              const systemProfilesPopulated =
+                (gpuInfo?.encodeProfiles?.length ?? 0) > 0 ||
+                codecCapabilities.some((c) => c.hwAvailable === false);
 
               // Which column is active
               const hwHasSupported = hwCodecs.some((c) => isSupported(c));
@@ -824,11 +827,10 @@ const VideoConfigSection: React.FC = () => {
                       </div>
                     </div>
                   </div>
-                  {hardwareAcceleration && !hwHasSupported && (
+                  {hardwareAcceleration && systemProfilesPopulated && !hwHasSupported && (
                     <div className="settings-hw-fallback-notice">
                       Hardware acceleration is enabled, but none of your GPU&apos;s codecs are
-                      currently supported. Concord Voice has automatically failed over to software
-                      encoding.
+                      currently supported by Concord Voice. Software encoding will be used for now.
                     </div>
                   )}
                 </>

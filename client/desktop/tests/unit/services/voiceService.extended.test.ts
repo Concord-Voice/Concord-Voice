@@ -3153,11 +3153,11 @@ describe('VoiceService Extended', () => {
       expect(svc.isHwAccelerated('video/VP8')).toBe(false);
     });
 
-    it('returns true when powerEfficient codec found', async () => {
+    it('returns true when hardware is confirmed for a codec', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
       useVideoSettingsStore.setState({
-        codecCapabilities: [{ mimeType: 'video/VP8', powerEfficient: true }],
+        codecCapabilities: [{ mimeType: 'video/VP8', powerEfficient: false, hwAvailable: true }],
       } as any);
       expect(svc.isHwAccelerated('video/VP8')).toBe(true);
     });
@@ -3322,8 +3322,8 @@ describe('VoiceService Extended', () => {
       // Set up codec capabilities so AV1 is HW-accelerated but VP8 is not
       useVideoSettingsStore.setState({
         codecCapabilities: [
-          { mimeType: 'video/AV1', powerEfficient: true },
-          { mimeType: 'video/VP8', powerEfficient: false },
+          { mimeType: 'video/AV1', powerEfficient: true, hwAvailable: true },
+          { mimeType: 'video/VP8', powerEfficient: false, hwAvailable: false },
         ],
       } as any);
 

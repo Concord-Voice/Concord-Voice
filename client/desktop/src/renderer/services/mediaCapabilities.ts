@@ -19,11 +19,18 @@ export interface WebcamCapability {
 export interface CodecCapability {
   mimeType: string; // e.g. "video/VP9"
   sdpFmtpLine?: string;
-  powerEfficient: boolean; // true = hardware accelerated
+  powerEfficient: boolean; // raw MediaCapabilities hint; false means "not confirmed"
+  hwAvailable?: boolean; // true = confirmed HW, false = populated profiles exclude it, undefined = unknown
   supported: boolean;
   profileId: string | null; // "640034" for H264 High, "2" for VP9 P2, null for VP8/AV1
   profileLabel: string | null; // "High", "Main", "Baseline", "HDR", null for no-profile codecs
   isHdr: boolean; // true for HDR-only profiles (VP9 P2). AV1 is HDR-capable but works in SDR too.
+}
+
+export interface GpuInfo {
+  vendor: string;
+  device: string;
+  encodeProfiles: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +210,22 @@ const HW_PROBE_CONFIGS = [
 const cachedWebcamCaps: Map<string, WebcamCapability[]> = new Map();
 let cachedCodecCaps: CodecCapability[] | null = null;
 
+function mimeSet(values: string[] | undefined): Set<string> {
+  return new Set((values ?? []).map((value) => value.toLowerCase()));
+}
+
+function resolveHardwareAvailability(
+  mimeType: string,
+  encodeMimes: Set<string>,
+  powerEfficient: boolean,
+  profilesPopulated: boolean
+): boolean | undefined {
+  if (encodeMimes.has(mimeType.toLowerCase())) return true;
+  if (powerEfficient) return true;
+  if (profilesPopulated) return false;
+  return undefined;
+}
+
 /**
  * Enumerate supported resolutions and frame rates for a given webcam.
  * Results are cached per deviceId to avoid repeated probing.
@@ -307,19 +330,40 @@ export async function detectCodecCapabilities(): Promise<CodecCapability[]> {
     })
   );
 
-  cachedCodecCaps = uniqueCodecs.map((codec) => {
+  const gpuInfo = await globalThis.electron?.getGPUInfo?.().catch(() => null);
+  const profileSignalUnavailable = gpuInfo === undefined;
+  const encodeMimes = mimeSet(gpuInfo?.encodeProfiles);
+  const profilesPopulated = encodeMimes.size > 0;
+
+  const caps = uniqueCodecs.map((codec) => {
     const { id, label, isHdr } = parseProfile(codec.mimeType, codec.sdpFmtpLine);
+    const powerEfficient = hwByMime.get(codec.mimeType) ?? false;
+    const hwAvailable = resolveHardwareAvailability(
+      codec.mimeType,
+      encodeMimes,
+      powerEfficient,
+      profilesPopulated
+    );
     return {
       mimeType: codec.mimeType,
       sdpFmtpLine: codec.sdpFmtpLine,
-      powerEfficient: hwByMime.get(codec.mimeType) ?? false,
+      powerEfficient,
+      hwAvailable,
       supported: true,
       profileId: id,
       profileLabel: label,
       isHdr,
     };
   });
-  return cachedCodecCaps;
+  if (
+    caps.length > 0 &&
+    (profileSignalUnavailable ||
+      profilesPopulated ||
+      caps.every((cap) => cap.hwAvailable === true && cap.powerEfficient))
+  ) {
+    cachedCodecCaps = caps;
+  }
+  return caps;
 }
 
 /** Clear cached capabilities (e.g. on device change) */

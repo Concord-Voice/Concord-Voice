@@ -64,7 +64,11 @@ contextBridge.exposeInMainWorld('electron', {
 
   // GPU, display info & hardware acceleration
   getGPUInfo: () =>
-    ipcRenderer.invoke('gpu:getInfo') as Promise<{ vendor: string; device: string } | null>,
+    ipcRenderer.invoke('gpu:getInfo') as Promise<{
+      vendor: string;
+      device: string;
+      encodeProfiles: string[];
+    } | null>,
   getDisplayInfo: () =>
     ipcRenderer.invoke('screen:getDisplayInfo') as Promise<
       {
@@ -441,7 +445,7 @@ export interface ElectronAPI {
 
   getDesktopSources: () => Promise<DesktopSource[]>;
   writeClipboard: (text: string) => Promise<void>;
-  getGPUInfo: () => Promise<{ vendor: string; device: string } | null>;
+  getGPUInfo: () => Promise<{ vendor: string; device: string; encodeProfiles: string[] } | null>;
   getDisplayInfo: () => Promise<
     {
       width: number;

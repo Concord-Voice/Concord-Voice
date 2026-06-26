@@ -190,6 +190,44 @@ describe('mediaCapabilities', () => {
       expect(caps).toEqual([]);
     });
 
+    it('does not cache an empty filtered codec list', async () => {
+      const getCapabilities = vi
+        .fn()
+        .mockReturnValueOnce({
+          codecs: [{ mimeType: 'video/rtx' }],
+        })
+        .mockReturnValueOnce({
+          codecs: [{ mimeType: 'video/VP8' }],
+        });
+      (globalThis as any).RTCRtpSender = { getCapabilities };
+      Object.defineProperty(navigator, 'mediaCapabilities', {
+        value: {
+          encodingInfo: vi.fn().mockResolvedValue({
+            supported: true,
+            smooth: true,
+            powerEfficient: true,
+          }),
+        },
+        configurable: true,
+      });
+      window.electron = {
+        ...window.electron,
+        getGPUInfo: vi.fn().mockResolvedValue({
+          vendor: 'NVIDIA',
+          device: 'RTX 5090',
+          encodeProfiles: ['video/VP8'],
+        }),
+      } as typeof window.electron;
+
+      const caps1 = await detectCodecCapabilities();
+      const caps2 = await detectCodecCapabilities();
+
+      expect(caps1).toEqual([]);
+      expect(caps2).toHaveLength(1);
+      expect(caps2[0].mimeType).toBe('video/VP8');
+      expect(getCapabilities).toHaveBeenCalledTimes(2);
+    });
+
     it('detects codecs from RTCRtpSender capabilities', async () => {
       (globalThis as any).RTCRtpSender = {
         getCapabilities: vi.fn(() => ({
@@ -282,6 +320,95 @@ describe('mediaCapabilities', () => {
       clearCapabilitiesCache();
       const caps = await detectCodecCapabilities();
       expect(caps[0].powerEfficient).toBe(true);
+    });
+
+    it('uses system encode profiles when MediaCapabilities cannot confirm hardware', async () => {
+      (globalThis as any).RTCRtpSender = {
+        getCapabilities: vi.fn(() => ({
+          codecs: [{ mimeType: 'video/H264', sdpFmtpLine: 'profile-level-id=640034' }],
+        })),
+      };
+      Object.defineProperty(navigator, 'mediaCapabilities', {
+        value: {
+          encodingInfo: vi.fn().mockResolvedValue({
+            supported: true,
+            smooth: true,
+            powerEfficient: false,
+          }),
+        },
+        configurable: true,
+      });
+      window.electron = {
+        ...window.electron,
+        getGPUInfo: vi.fn().mockResolvedValue({
+          vendor: 'NVIDIA',
+          device: 'RTX 5090',
+          encodeProfiles: ['video/H264'],
+        }),
+      } as typeof window.electron;
+
+      clearCapabilitiesCache();
+      const caps = await detectCodecCapabilities();
+      const h264 = caps.find((c) => c.mimeType === 'video/H264');
+
+      expect((h264 as any).hwAvailable).toBe(true);
+    });
+
+    it('does not cache unknown hardware results from empty system profiles', async () => {
+      (globalThis as any).RTCRtpSender = {
+        getCapabilities: vi.fn(() => ({
+          codecs: [{ mimeType: 'video/VP8' }],
+        })),
+      };
+      Object.defineProperty(navigator, 'mediaCapabilities', {
+        value: {
+          encodingInfo: vi.fn().mockResolvedValue({ powerEfficient: false }),
+        },
+        configurable: true,
+      });
+      window.electron = {
+        ...window.electron,
+        getGPUInfo: vi.fn().mockResolvedValue({
+          vendor: 'Apple',
+          device: 'M-series',
+          encodeProfiles: [],
+        }),
+      } as typeof window.electron;
+
+      clearCapabilitiesCache();
+      const caps1 = await detectCodecCapabilities();
+      const caps2 = await detectCodecCapabilities();
+
+      expect(caps1).not.toBe(caps2);
+      expect(caps1[0].hwAvailable).toBeUndefined();
+      expect(window.electron.getGPUInfo).toHaveBeenCalledTimes(2);
+    });
+
+    it('marks a codec false when populated system profiles exclude it', async () => {
+      (globalThis as any).RTCRtpSender = {
+        getCapabilities: vi.fn(() => ({
+          codecs: [{ mimeType: 'video/AV1' }],
+        })),
+      };
+      Object.defineProperty(navigator, 'mediaCapabilities', {
+        value: {
+          encodingInfo: vi.fn().mockResolvedValue({ powerEfficient: false }),
+        },
+        configurable: true,
+      });
+      window.electron = {
+        ...window.electron,
+        getGPUInfo: vi.fn().mockResolvedValue({
+          vendor: 'NVIDIA',
+          device: 'RTX 3090',
+          encodeProfiles: ['video/H264'],
+        }),
+      } as typeof window.electron;
+
+      clearCapabilitiesCache();
+      const caps = await detectCodecCapabilities();
+
+      expect(caps[0].hwAvailable).toBe(false);
     });
 
     it('deduplicates codecs by mimeType + profile', async () => {

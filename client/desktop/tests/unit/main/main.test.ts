@@ -422,13 +422,17 @@ describe('main.ts', () => {
 
   describe('IPC: GPU info', () => {
     it('gpu:getInfo returns vendor and device', async () => {
+      const { app } = await import('electron');
       const result = (await handlers.get('gpu:getInfo')!()) as {
         vendor: string;
         device: string;
+        encodeProfiles: string[];
       } | null;
       expect(result).not.toBeNull();
       expect(result!.vendor).toBe('NVIDIA');
       expect(result!.device).toBe('GeForce GTX 1080');
+      expect(result!.encodeProfiles).toEqual([]);
+      expect(app.getGPUInfo).toHaveBeenCalledWith('complete');
     });
 
     it('gpu:getInfo returns null on failure', async () => {
@@ -1009,6 +1013,25 @@ describe('main.ts', () => {
       });
       const result = (await handlers.get('gpu:getInfo')!()) as { vendor: string } | null;
       expect(result!.vendor).toBe('Apple'); // Falls back to vendor map, not hex string
+    });
+
+    it('maps interleaved Chromium encode profiles by exact value', async () => {
+      const { app } = await import('electron');
+      (app.getGPUInfo as Mock).mockResolvedValueOnce({
+        gpuDevice: [{ vendorId: 0x10de, deviceId: 0x0001 }],
+        videoEncodeAcceleratorSupportedProfiles: [
+          { profile: 24 }, // AV1, not HEVC
+          { profile: 16 }, // HEVC
+          { profile: 23 }, // Theora, ignored
+          { profile: 27 }, // Dolby Vision, ignored
+          { profile: 35 }, // HEVC extension profile
+          { profile: 11 }, // VP8
+        ],
+      });
+      const result = (await handlers.get('gpu:getInfo')!()) as {
+        encodeProfiles: string[];
+      } | null;
+      expect(result!.encodeProfiles.sort()).toEqual(['video/AV1', 'video/HEVC', 'video/VP8']);
     });
   });
 

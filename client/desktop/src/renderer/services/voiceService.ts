@@ -732,7 +732,7 @@ class VoiceService {
   private isHwAccelerated(key: string): boolean {
     const caps = useVideoSettingsStore.getState().codecCapabilities;
     const mime = key.split(':')[0].toLowerCase();
-    return caps.some((c) => c.mimeType.toLowerCase() === mime && c.powerEfficient);
+    return caps.some((c) => c.mimeType.toLowerCase() === mime && c.hwAvailable === true);
   }
 
   /**

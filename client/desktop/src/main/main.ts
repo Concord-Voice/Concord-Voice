@@ -941,9 +941,41 @@ const GPU_VENDORS: Record<number, string> = {
   0x13b5: 'ARM',
 };
 
+const VIDEO_CODEC_PROFILE_MIMES = new Map<number, string>([
+  ...[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((profile) => [profile, 'video/H264'] as const),
+  [11, 'video/VP8'],
+  ...[12, 13, 14, 15].map((profile) => [profile, 'video/VP9'] as const),
+  // Chromium 148 VideoCodecProfile: 19-22/27-28/37-38 are Dolby Vision, 23 is Theora.
+  ...[16, 17, 18, 29, 30, 31, 32, 33, 34, 35, 36].map(
+    (profile) => [profile, 'video/HEVC'] as const
+  ),
+  ...[24, 25, 26].map((profile) => [profile, 'video/AV1'] as const),
+]);
+
+function extractEncodeProfiles(info: unknown): string[] {
+  if (!isRecord(info)) return [];
+  const profiles = info.videoEncodeAcceleratorSupportedProfiles;
+  if (profiles === undefined) return [];
+  if (!Array.isArray(profiles)) {
+    console.warn('[gpu:getInfo] unexpected videoEncodeAcceleratorSupportedProfiles shape');
+    return [];
+  }
+
+  const mimes = new Set<string>();
+  for (const entry of profiles) {
+    const profile = isRecord(entry) ? entry.profile : entry;
+    if (typeof profile !== 'number') continue;
+    const mime = VIDEO_CODEC_PROFILE_MIMES.get(profile);
+    if (mime) mimes.add(mime);
+  }
+  return [...mimes];
+}
+
 ipcMain.handle('gpu:getInfo', async () => {
   try {
-    const info = await app.getGPUInfo('basic');
+    // Read-only GPU metadata: no filesystem/network/keychain/OS mutation, bounded
+    // shape parsing below, so this fits [internal]rules/electron.md's low-stakes IPC exception.
+    const info = await app.getGPUInfo('complete');
     const gpu = (
       info as {
         gpuDevice?: Array<{
@@ -962,7 +994,7 @@ ipcMain.handle('gpu:getInfo', async () => {
         driverName || GPU_VENDORS[gpu.vendorId] || `Unknown (0x${gpu.vendorId.toString(16)})`;
       const device =
         gpu.driverDescription || (gpu.deviceId ? `Device 0x${gpu.deviceId.toString(16)}` : '');
-      return { vendor, device };
+      return { vendor, device, encodeProfiles: extractEncodeProfiles(info) };
     }
     return null;
   } catch {
