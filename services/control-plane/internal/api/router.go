@@ -613,6 +613,17 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 				ageHandler.SubmitClaim,
 			)
 
+			// Age-verification status read (#1763). Read-back companion to the
+			// claim ingest so the client rehydrates the verified state on mount
+			// instead of re-prompting for DOB. JWT-scoped single-row lookup,
+			// returns only the eligibility booleans (identity-blind). Generous
+			// per-user limit — a settings panel mounts rarely, but the cap bounds
+			// abuse of an authenticated read.
+			protected.GET("/age/status",
+				middleware.RateLimitByUser(redis, 30, 1*time.Minute),
+				ageHandler.GetStatus,
+			)
+
 			// Feedback (#158): bug report / feature request submission. This
 			// is the one privileged-PAT write to a PUBLIC GitHub repo, so the
 			// rate limiters are the SOLE velocity controls — they fail CLOSED

@@ -1,20 +1,25 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import type { AgeStatus } from '@/renderer/hooks/useAgeStatus';
 
-const { mockSubmit, mockStatus } = vi.hoisted(() => ({
+const { mockSubmit, ageStatusRef } = vi.hoisted(() => ({
   mockSubmit: vi.fn(),
-  mockStatus: { nsfwAuth: 'unknown' as boolean | 'unknown' },
+  // Mutable holder so individual tests can swap the AgeStatus union variant.
+  // Default 'unverified' → the DOB form renders (what most tests below exercise).
+  ageStatusRef: { current: { state: 'unverified' } as AgeStatus },
 }));
 
 // Module-boundary mock (NOT a fetch mock — satisfies [internal]rules/tests.md). The
 // service has its own tests; here we isolate the component. evaluateAge is a SEPARATE
-// module and stays REAL so the outcome-branch logic is exercised end-to-end.
+// module and stays REAL so the outcome-branch logic is exercised end-to-end. The
+// useAgeStatus hook has its own MSW-backed tests; the rehydrate path is covered
+// end-to-end in NsfwContentGate.verifiedStatePersists.test.tsx (#1763).
 vi.mock('@/renderer/services/ageClaim/ageClaimService', () => ({
   submitSignedAgeClaim: (input: unknown) => mockSubmit(input),
 }));
 vi.mock('@/renderer/hooks/useAgeStatus', () => ({
-  useAgeStatus: () => mockStatus,
+  useAgeStatus: () => ageStatusRef.current,
 }));
 
 import NsfwContentGate from '@/renderer/components/Settings/NsfwContentGate';
@@ -34,17 +39,32 @@ describe('NsfwContentGate', () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-06-20T00:00:00Z'));
     resetAllStores();
-    mockStatus.nsfwAuth = 'unknown';
+    ageStatusRef.current = { state: 'unverified' };
     mockSubmit.mockReset();
   });
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  it('skips the gate when nsfw_auth is already satisfied', () => {
-    mockStatus.nsfwAuth = true;
+  it('skips the gate when a verified status is already known (nsfw enabled)', () => {
+    ageStatusRef.current = { state: 'verified', validAge: true, nsfwAuth: true };
     render(<NsfwContentGate />);
     expect(screen.getByText(/already verified/i)).toBeInTheDocument();
+    expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
+  });
+
+  it('shows the verified-but-locked state on mount for a known 16–17 verification', () => {
+    ageStatusRef.current = { state: 'verified', validAge: true, nsfwAuth: false };
+    render(<NsfwContentGate />);
+    expect(screen.getByText(/remains\s+locked/i)).toBeInTheDocument();
+    expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
+  });
+
+  it('shows a neutral checking state while the status is loading (no DOB flash)', () => {
+    ageStatusRef.current = { state: 'loading' };
+    render(<NsfwContentGate />);
+    expect(screen.getByText(/checking your verification status/i)).toBeInTheDocument();
+    // The DOB form must NOT flash while we are still resolving the durable outcome.
     expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
   });
 

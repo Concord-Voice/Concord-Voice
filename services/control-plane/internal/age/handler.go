@@ -162,6 +162,45 @@ func (h *Handler) SubmitClaim(c *gin.Context) {
 	})
 }
 
+// statusResponse is the wire shape for GET /api/v1/age/status. Identity-blind: it
+// carries ONLY the verified-outcome booleans — never any DOB/age/jurisdiction-name
+// value (none exist in age_verification_records by construction; ADR-0025).
+type statusResponse struct {
+	Verified bool `json:"verified"`
+	ValidAge bool `json:"valid_age"`
+	NSFWAuth bool `json:"nsfw_auth"`
+}
+
+// GetStatus handles GET /api/v1/age/status — the read-back companion to SubmitClaim
+// (#1763). It lets the client rehydrate the verified state on mount instead of
+// re-rendering the first-run DOB-entry form. Returns the authenticated user's durable
+// outcome (the two eligibility booleans) from age_verification_records; no row →
+// {verified:false}. The user_id is taken from the authenticated context, never the
+// request — the row is strictly JWT-scoped, so a client cannot read another user's
+// status. No DOB/age value is exposed because the schema stores none.
+func (h *Handler) GetStatus(c *gin.Context) {
+	ctx := c.Request.Context()
+	userID := c.GetString("user_id")
+	if userID == "" {
+		fail(c, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+
+	var validAge, nsfwAuth bool
+	err := h.db.QueryRowContext(ctx,
+		`SELECT valid_age, nsfw_auth FROM age_verification_records WHERE user_id = $1`,
+		userID).Scan(&validAge, &nsfwAuth)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusOK, statusResponse{Verified: false})
+		return
+	}
+	if err != nil {
+		fail(c, http.StatusServiceUnavailable, "unavailable")
+		return
+	}
+	c.JSON(http.StatusOK, statusResponse{Verified: true, ValidAge: validAge, NSFWAuth: nsfwAuth})
+}
+
 // isDisabled reads the immediate-effect denylist. The caller treats a Redis error as
 // fail-closed (503); users.disabled is the source of truth, the denylist is the fast path.
 func (h *Handler) isDisabled(ctx context.Context, userID string) (bool, error) {

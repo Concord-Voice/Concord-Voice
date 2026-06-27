@@ -40,6 +40,9 @@ describe('NsfwContentGate (integration via MSW)', () => {
   it('submits a real signed claim through the service and unlocks for an adult', async () => {
     let putBody: Record<string, unknown> | null = null;
     server.use(
+      // Mount-time status read (#1763): no prior record → the gate falls closed to the
+      // DOB-entry form, which this test then drives through a real signed submit.
+      http.get('*/api/v1/age/status', () => HttpResponse.json({ verified: false })),
       http.get('*/api/v1/users/:id/public-key', () => HttpResponse.json({ key_version: 1 })),
       http.put('*/api/v1/age/claim', async ({ request }) => {
         putBody = (await request.json()) as Record<string, unknown>;
@@ -48,7 +51,8 @@ describe('NsfwContentGate (integration via MSW)', () => {
     );
 
     render(<NsfwContentGate />);
-    fireEvent.change(screen.getByRole('spinbutton', { name: /year/i }), {
+    // Wait out the brief "Checking…" status phase before the DOB form is present.
+    fireEvent.change(await screen.findByRole('spinbutton', { name: /year/i }), {
       target: { value: '2000' },
     });
     fireEvent.change(screen.getByRole('spinbutton', { name: /month/i }), {

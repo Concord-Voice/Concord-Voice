@@ -223,6 +223,60 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SSOError'
+  /age/status:
+    get:
+      tags:
+      - Age Verification
+      summary: Read the caller's age-verification status
+      operationId: getAgeStatus
+      description: 'Identity-blind read-back of the authenticated user''s durable
+        age-verification outcome (#1763). Returns only the eligibility booleans from
+        age_verification_records — no DOB, age value, jurisdiction name, or location is
+        exposed (the schema stores none; ADR-0025). Lets the client rehydrate the verified
+        state on mount instead of re-prompting for a date of birth. user_id is taken from
+        the bearer token, never the query, so the row is strictly per-user. A caller with
+        no record reads back {verified:false}.
+
+        Rate limit: 30 requests per minute (user-based). Requires a verified email.
+
+        '
+      security:
+      - BearerAuth: []
+      responses:
+        '200':
+          description: The caller's verification status (verified=false when no record exists)
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - verified
+                - valid_age
+                - nsfw_auth
+                properties:
+                  verified:
+                    type: boolean
+                    description: True if a verification record exists for the caller.
+                  valid_age:
+                    type: boolean
+                    description: True if the caller is 16+. Always false when verified is false.
+                  nsfw_auth:
+                    type: boolean
+                    description: True if the caller is 18+ (NSFW-eligible). Always false when verified is false.
+        '401':
+          description: 'Missing/invalid bearer token (error_code: unauthenticated)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SSOError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: 'DB unavailable on the status read (error_code: unavailable)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SSOError'
   /attestation/verify:
     post:
       tags:

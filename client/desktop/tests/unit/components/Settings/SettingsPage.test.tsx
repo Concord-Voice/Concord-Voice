@@ -75,12 +75,16 @@ describe('SettingsPage', () => {
     expect(screen.queryAllByText('Soon')).toHaveLength(0);
   });
 
-  it('opens the Account section and shows the NSFW Content Access gate', () => {
+  it('opens the Account section and shows the NSFW Content Access gate', async () => {
     render(<SettingsPage />);
     fireEvent.click(screen.getByText('Account'));
     // "NSFW Content Access" appears in the nav tree AND as the section heading.
     expect(screen.getAllByText('NSFW Content Access').length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByRole('button', { name: /verify age/i })).toBeInTheDocument();
+    // The gate now resolves its durable verification status on mount (#1763): it shows a
+    // brief "Checking…" state, then — with no verified record (mocked apiFetch yields no
+    // age-status row) — falls closed to the DOB-entry form. Await the form rather than
+    // asserting it synchronously, which would race the status fetch.
+    expect(await screen.findByRole('button', { name: /verify age/i })).toBeInTheDocument();
   });
 
   it('defaults to appearance section', () => {

@@ -1,12 +1,60 @@
+import { useEffect, useState } from 'react';
+import { apiFetch, safeJson } from '../services/apiClient';
+
+// Durable age-verification status for the NSFW gate's mount-time short-circuit (#1763).
+// The verified OUTCOME lives server-side in age_verification_records (written by
+// PUT /age/claim); this hook reads it back via GET /api/v1/age/status so the gate
+// rehydrates the verified state instead of re-rendering the first-run DOB-entry form.
 //
-// Seam selector for the NSFW gate's "already satisfied" short-circuit (#1625).
-// No producer of a prior age-assurance signal exists yet: there is no client-readable
-// nsfw_auth state (no GET status endpoint; UserProfile has no age field). This hook is
-// the SINGLE integration point that lights up when the SSO assurance path (#1626) or a
-// future status endpoint lands — at which point this body reads that source instead of
-// returning the inert default. It is a wired-but-currently-inert branch, NOT dead code
-// (mirrors the resolveVideoPublisherCap tier-seam pattern, #1294).
-// eslint-disable-next-line @eslint-react/no-unnecessary-use-prefix -- intentional hook seam: the `use` prefix is load-bearing because this WILL call a store/context hook once the SSO-assurance producer (#1626) or a status endpoint lands; renaming now would churn every call site back later (#1625).
-export function useAgeStatus(): { nsfwAuth: boolean | 'unknown' } {
-  return { nsfwAuth: 'unknown' };
+// Identity-blind: the endpoint returns ONLY the two eligibility booleans, never any
+// DOB/age value (the schema stores none; ADR-0025), so nothing sensitive is cached
+// in the renderer.
+//
+// FAIL-CLOSED: any error / non-OK / unparseable / unverified response resolves to
+// 'unverified' — NEVER 'verified' on a degraded read. A failed fetch can only
+// over-prompt (re-ask for DOB), never under-gate (treat an unverified user as
+// verified). Re-prompting is the accepted lesser evil (#1763 security note).
+export type AgeStatus =
+  | { state: 'loading' }
+  | { state: 'unverified' }
+  | { state: 'verified'; validAge: boolean; nsfwAuth: boolean };
+
+interface AgeStatusResponse {
+  verified?: boolean;
+  valid_age?: boolean;
+  nsfw_auth?: boolean;
+}
+
+export function useAgeStatus(): AgeStatus {
+  const [status, setStatus] = useState<AgeStatus>({ state: 'loading' });
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      // Default to the fail-closed verdict; only a definitively-verified response
+      // upgrades it.
+      let next: AgeStatus = { state: 'unverified' };
+      try {
+        const res = await apiFetch('/api/v1/age/status');
+        if (res.ok) {
+          const data = await safeJson<AgeStatusResponse>(res);
+          if (data?.verified === true) {
+            next = {
+              state: 'verified',
+              validAge: data.valid_age === true,
+              nsfwAuth: data.nsfw_auth === true,
+            };
+          }
+        }
+      } catch {
+        // Network / parse error → fail closed (leave next as 'unverified').
+      }
+      if (active) setStatus(next);
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  return status;
 }

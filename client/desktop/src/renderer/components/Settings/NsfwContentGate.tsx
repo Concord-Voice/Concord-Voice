@@ -77,13 +77,27 @@ const NsfwContentGate = () => {
     if (phase.kind === 'confirm') confirmRef.current?.focus();
   }, [phase.kind]);
 
-  // Already satisfied via a prior assurance signal (e.g. SSO) → skip the gate entirely.
-  if (status.nsfwAuth === true) {
-    return (
-      <p className="nsfw-gate__satisfied">
-        Your age is already verified — NSFW content access is enabled.
-      </p>
-    );
+  // Mount-time rehydration of the durable verified outcome (#1763). Only short-circuits
+  // the first-run form: once the user has entered the local submit flow (confirm /
+  // submitting / a terminal result), those phases own the render below. A fail-closed
+  // 'unverified' status falls through to the DOB form, so a degraded read re-prompts
+  // rather than under-gates.
+  if (phase.kind === 'form') {
+    if (status.state === 'loading') {
+      return <output className="nsfw-gate__status">Checking your verification status…</output>;
+    }
+    if (status.state === 'verified') {
+      return status.nsfwAuth ? (
+        <p className="nsfw-gate__satisfied">
+          Your age is already verified — NSFW content access is enabled.
+        </p>
+      ) : (
+        <output className="nsfw-gate__status">
+          Your age is verified. NSFW content access requires you to be 18 or older, so it remains
+          locked.
+        </output>
+      );
+    }
   }
 
   const clearDob = () => {

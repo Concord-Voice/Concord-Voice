@@ -399,6 +399,80 @@ func TestAgeIT_DisabledInDB_NoDenylistKey_PersistGuard_403(t *testing.T) {
 	assert.Equal(t, 0, count, "disabled account must not write/overwrite its record")
 }
 
+// getStatus invokes GET /api/v1/age/status for the env's authenticated user (#1763).
+func (e *ageITEnv) getStatus(t *testing.T) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/age/status", nil)
+	c.Set("user_id", e.userID)
+	e.h.GetStatus(c)
+	return w
+}
+
+type ageStatusBody struct {
+	Verified bool `json:"verified"`
+	ValidAge bool `json:"valid_age"`
+	NSFWAuth bool `json:"nsfw_auth"`
+}
+
+func (e *ageITEnv) statusBody(t *testing.T, w *httptest.ResponseRecorder) ageStatusBody {
+	t.Helper()
+	var resp ageStatusBody
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	return resp
+}
+
+// TestAgeIT_GetStatus_NoRecord_ReturnsUnverified — the read-back path for a user who
+// has never verified returns {verified:false}, so the client renders the DOB form
+// (the correct first-run state) rather than a stale verified state (#1763).
+func TestAgeIT_GetStatus_NoRecord_ReturnsUnverified(t *testing.T) {
+	env, cleanup := setupAgeIT(t, true)
+	defer cleanup()
+
+	w := env.getStatus(t)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	got := env.statusBody(t, w)
+	assert.False(t, got.Verified, "a user with no record must read back unverified")
+	assert.False(t, got.ValidAge)
+	assert.False(t, got.NSFWAuth)
+}
+
+// TestAgeIT_GetStatus_AfterClaim_ReturnsVerified — the core #1763 fix: a written claim
+// reads back as verified, which is what lets the client rehydrate the verified state on
+// mount instead of re-prompting for DOB.
+func TestAgeIT_GetStatus_AfterClaim_ReturnsVerified(t *testing.T) {
+	env, cleanup := setupAgeIT(t, true)
+	defer cleanup()
+
+	// freshClaim is an adult (valid_age=true) with nsfw_auth=false.
+	require.Equal(t, http.StatusOK, env.submit(t, env.signBody(t, env.freshClaim(), nil)).Code)
+
+	w := env.getStatus(t)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	got := env.statusBody(t, w)
+	assert.True(t, got.Verified, "after a successful claim the outcome must read back verified")
+	assert.True(t, got.ValidAge)
+	assert.False(t, got.NSFWAuth, "freshClaim has nsfw_auth=false")
+}
+
+// TestAgeIT_GetStatus_NsfwEnabled_ReflectsNsfwAuth — the status read echoes the stored
+// nsfw_auth so the client can distinguish "verified, NSFW enabled" from "verified,
+// NSFW locked" on mount.
+func TestAgeIT_GetStatus_NsfwEnabled_ReflectsNsfwAuth(t *testing.T) {
+	env, cleanup := setupAgeIT(t, true)
+	defer cleanup()
+
+	c := env.freshClaim()
+	c.NSFWAuth = true
+	require.Equal(t, http.StatusOK, env.submit(t, env.signBody(t, c, nil)).Code)
+
+	got := env.statusBody(t, env.getStatus(t))
+	assert.True(t, got.Verified)
+	assert.True(t, got.NSFWAuth, "nsfw-enabled claim must read back nsfw_auth=true")
+}
+
 // TestAgeIT_LastChange_MatchesPersistedValue proves Fix #5: the 200 response echoes the
 // DB-persisted last_change (via RETURNING), not a separate h.now() clock.
 func TestAgeIT_LastChange_MatchesPersistedValue(t *testing.T) {
