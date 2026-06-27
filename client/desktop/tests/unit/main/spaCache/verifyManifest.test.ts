@@ -234,24 +234,25 @@ describe('verifyManifest (#1870 trust root)', () => {
   });
 });
 
-// ── Shipped trust-root is dormant / fail-closed (Finding E3) ────────────────
-// Asserts the COMMITTED default state of the public-key module: the placeholder
-// is empty and `isSpaManifestKeyConfigured()` is false, so the verifier refuses
-// ALL manifests until the operator runs the key ceremony. This makes any future
-// key-ceremony commit a DELIBERATE, reviewed change to this test — a silent
-// trust-root flip cannot land green. (No vi.mock here — the REAL module values.)
-describe('spaManifestPublicKey shipped default (#1870 Finding E3)', () => {
-  it('ships with an EMPTY placeholder public key (cache dormant)', () => {
-    expect(SPA_MANIFEST_PUBLIC_KEY_PEM).toBe('');
+// ── Shipped trust-root state (#1870 / activation #1907) ─────────────────────
+// Asserts the COMMITTED state of the public-key module. After the operator key
+// ceremony (#1907) a real SPKI public key is configured and the verifier treats
+// it as the trust anchor. (Before activation this asserted the empty placeholder
+// / dormant cache.) Still the genuine module values — no vi.mock — so any future
+// change to the committed trust root (rotation, or reverting to dormant) is a
+// DELIBERATE, reviewed edit to this test; a silent trust-root flip cannot land green.
+describe('spaManifestPublicKey shipped trust root (#1870)', () => {
+  it('ships with a configured public key', () => {
+    expect(SPA_MANIFEST_PUBLIC_KEY_PEM).toContain('BEGIN PUBLIC KEY');
   });
 
-  it('reports the key as NOT configured (fail-closed)', () => {
-    expect(isSpaManifestKeyConfigured()).toBe(false);
+  it('reports the key as configured', () => {
+    expect(isSpaManifestKeyConfigured()).toBe(true);
   });
 
-  it('verifyManifest fails closed under the shipped (empty) public key', () => {
-    // End-to-end: a manifest signed by a real ephemeral key still cannot verify
-    // against the committed empty trust root — confirms dormancy is enforced.
+  it('verifyManifest rejects a manifest signed by a key other than the committed one', () => {
+    // End-to-end: a manifest signed by some OTHER (ephemeral) key cannot verify
+    // against the committed trust root — confirms the committed key is the anchor.
     const kp = makeKeypair();
     const { manifestBytes, signatureBase64 } = buildSignedManifest(kp, { entry: entryFixture() });
     const result = verifyManifest({
@@ -262,6 +263,6 @@ describe('spaManifestPublicKey shipped default (#1870 Finding E3)', () => {
       nowMs: Date.now(),
     });
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toMatch(/no verification key configured/);
+    if (!result.ok) expect(result.reason).toMatch(/signature does not verify/);
   });
 });
