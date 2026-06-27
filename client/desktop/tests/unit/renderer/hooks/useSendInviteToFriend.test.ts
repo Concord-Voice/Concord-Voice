@@ -3,6 +3,7 @@ import { renderHook } from '@testing-library/react';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useInviteStore } from '@/renderer/stores/inviteStore';
 import { useDMStore } from '@/renderer/stores/dmStore';
+import { useUserStore } from '@/renderer/stores/userStore';
 import { useSendInviteToFriend } from '@/renderer/hooks/useSendInviteToFriend';
 import type { Friend } from '@/renderer/stores/friendStore';
 
@@ -29,7 +30,41 @@ describe('useSendInviteToFriend', () => {
     mockInitialized = true;
   });
 
-  it('mints, opens the DM, and sends the canonical URL (ok)', async () => {
+  it('mints, opens the DM, and sends the canonical URL attributed to the sender (#1740)', async () => {
+    const createInvite = vi.fn().mockResolvedValue({ code: 'GHJKMNPQ' });
+    const openDM = vi.fn().mockResolvedValue({ id: 'dm-conv-9' });
+    useInviteStore.setState({ createInvite });
+    useDMStore.setState({ openDM } as Partial<ReturnType<typeof useDMStore.getState>>);
+    // Sender identity must reach the optimistic bubble, else it falls back to "You".
+    useUserStore.setState({
+      user: {
+        id: 'user-1',
+        username: 'alice',
+        display_name: 'Alice',
+        avatar_url: '/api/v1/media/avatars/alice.png',
+      },
+    });
+
+    const { result } = renderHook(() => useSendInviteToFriend('server-1'));
+    const res = await result.current.send(friend);
+
+    expect(createInvite).toHaveBeenCalledWith('server-1');
+    expect(openDM).toHaveBeenCalledWith('user-2');
+    // regression for #1740: the sender's own username/display_name/avatar must be passed
+    // so the optimistic invite bubble is attributed to them, never the "You" fallback.
+    expect(mockSend).toHaveBeenCalledWith(
+      'dm-conv-9',
+      'https://invite.concordvoice.chat/GHJKMNPQ',
+      'alice',
+      { displayName: 'Alice', avatarUrl: '/api/v1/media/avatars/alice.png' }
+    );
+    expect(res).toEqual({ ok: true, conversationId: 'dm-conv-9' });
+  });
+
+  it('falls back to the "You" default when no user is resolved (#1740)', async () => {
+    // resetAllStores() leaves userStore.user null; the hook passes undefined for
+    // username, and sendDMMessage applies its own 'You' default — a safe degrade,
+    // not a throw. Locks the else-branch of `me?.username`.
     const createInvite = vi.fn().mockResolvedValue({ code: 'GHJKMNPQ' });
     const openDM = vi.fn().mockResolvedValue({ id: 'dm-conv-9' });
     useInviteStore.setState({ createInvite });
@@ -38,9 +73,12 @@ describe('useSendInviteToFriend', () => {
     const { result } = renderHook(() => useSendInviteToFriend('server-1'));
     const res = await result.current.send(friend);
 
-    expect(createInvite).toHaveBeenCalledWith('server-1');
-    expect(openDM).toHaveBeenCalledWith('user-2');
-    expect(mockSend).toHaveBeenCalledWith('dm-conv-9', 'https://invite.concordvoice.chat/GHJKMNPQ');
+    expect(mockSend).toHaveBeenCalledWith(
+      'dm-conv-9',
+      'https://invite.concordvoice.chat/GHJKMNPQ',
+      undefined,
+      { displayName: undefined, avatarUrl: undefined }
+    );
     expect(res).toEqual({ ok: true, conversationId: 'dm-conv-9' });
   });
 

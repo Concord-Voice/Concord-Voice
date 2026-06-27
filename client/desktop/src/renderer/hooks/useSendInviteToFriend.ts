@@ -1,6 +1,7 @@
 import { useCallback } from 'react';
 import { useInviteStore } from '../stores/inviteStore';
 import { useDMStore } from '../stores/dmStore';
+import { useUserStore } from '../stores/userStore';
 import { buildInviteUrl } from '../utils/inviteUrl';
 import { sendDMMessage } from '../services/dmMessageSender';
 import { e2eeService } from '../services/e2eeService';
@@ -45,7 +46,15 @@ export function useSendInviteToFriend(serverId: string) {
         return { ok: false, reason: 'dm_blocked' };
       }
 
-      sendDMMessage(conversationId, url);
+      // Attribute the optimistic invite bubble to the sender — without the resolved
+      // identity, sendDMMessage falls back to username='You' (#1740). Read at call
+      // time (consistent with dmMessageSender's own getState() reads), so the user
+      // need not be a callback dependency.
+      const me = useUserStore.getState().user;
+      sendDMMessage(conversationId, url, me?.username, {
+        displayName: me?.display_name,
+        avatarUrl: me?.avatar_url,
+      });
       return { ok: true, conversationId };
     },
     [serverId, createInvite, openDM]
