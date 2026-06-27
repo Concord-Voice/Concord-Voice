@@ -25,8 +25,8 @@ export interface FeedbackDiagnostics {
   appVersion: string;
   platform: string;
   machineIdPrefix: string;
-  gpu?: SystemInfo['gpu'];
-  display?: SystemInfo['display'];
+  gpu?: NonNullable<SystemInfo['gpu']>;
+  display?: NonNullable<SystemInfo['display']>;
   connectionPhase: string;
   logs: string;
 }

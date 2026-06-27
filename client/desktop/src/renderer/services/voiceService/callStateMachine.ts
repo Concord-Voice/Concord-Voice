@@ -120,8 +120,7 @@ export type CallState =
  */
 export async function initiateDMCall(conversationId: string): Promise<void> {
   const dmState = useDMStore.getState();
-  const conversation = dmState.conversations.find((c) => c.id === conversationId);
-  if (!conversation) {
+  if (!dmState.conversations.some((c) => c.id === conversationId)) {
     throw new Error(`Conversation ${conversationId} not found in dmStore`);
   }
 

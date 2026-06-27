@@ -601,6 +601,61 @@ const SSOToggleRow: React.FC<SSOToggleRowProps> = ({
   </div>
 );
 
+interface SessionCardProps {
+  session: Session;
+  confirmRevoke: string | null;
+  revokingId: string | null;
+  onRevoke: React.ComponentProps<typeof SessionCardActions>['onRevoke'];
+  onCancelConfirm: () => void;
+}
+
+/**
+ * One row in the active-sessions list. Extracted from PrivacySecuritySection to
+ * keep that component's cognitive complexity within the SonarCloud S3776 budget
+ * (the per-row is_current / confirm-warning conditionals were its deepest-nested
+ * branches). Behaviour is identical — same markup, props threaded straight through.
+ */
+const SessionCard: React.FC<SessionCardProps> = ({
+  session,
+  confirmRevoke,
+  revokingId,
+  onRevoke,
+  onCancelConfirm,
+}) => (
+  <div className={`session-card ${session.is_current ? 'current' : ''}`}>
+    <div className="session-card-icon">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+        <rect x="2" y="3" width="16" height="12" rx="2" stroke="currentColor" strokeWidth="1.5" />
+        <path d="M7 19h6M10 15v4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+      </svg>
+    </div>
+    <div className="session-card-info">
+      <div className="session-card-title">
+        {parseUserAgent(session.user_agent)}
+        {session.is_current && <span className="session-card-badge">This Device</span>}
+      </div>
+      <div className="session-card-details">
+        <span>{session.ip_address}</span>
+        <span>Active {formatRelativeTime(session.last_used)}</span>
+        <span>Created {formatRelativeTime(session.created_at)}</span>
+      </div>
+      {confirmRevoke === session.id && session.is_current && (
+        <div className="session-confirm-warning">
+          This is your current active session. Revoking it will log you out and you must sign back
+          in.
+        </div>
+      )}
+    </div>
+    <SessionCardActions
+      sessionId={session.id}
+      isConfirming={confirmRevoke === session.id}
+      isRevoking={revokingId === session.id}
+      onRevoke={onRevoke}
+      onCancelConfirm={onCancelConfirm}
+    />
+  </div>
+);
+
 const PrivacySecuritySection: React.FC = () => {
   const accessToken = useAuthStore((s) => s.accessToken);
   const logout = useUserStore((s) => s.logout);
@@ -1437,56 +1492,14 @@ const PrivacySecuritySection: React.FC = () => {
 
             <div className="sessions-list">
               {sortedSessions.map((session) => (
-                <div
+                <SessionCard
                   key={session.id}
-                  className={`session-card ${session.is_current ? 'current' : ''}`}
-                >
-                  <div className="session-card-icon">
-                    <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-                      <rect
-                        x="2"
-                        y="3"
-                        width="16"
-                        height="12"
-                        rx="2"
-                        stroke="currentColor"
-                        strokeWidth="1.5"
-                      />
-                      <path
-                        d="M7 19h6M10 15v4"
-                        stroke="currentColor"
-                        strokeWidth="1.5"
-                        strokeLinecap="round"
-                      />
-                    </svg>
-                  </div>
-                  <div className="session-card-info">
-                    <div className="session-card-title">
-                      {parseUserAgent(session.user_agent)}
-                      {session.is_current && (
-                        <span className="session-card-badge">This Device</span>
-                      )}
-                    </div>
-                    <div className="session-card-details">
-                      <span>{session.ip_address}</span>
-                      <span>Active {formatRelativeTime(session.last_used)}</span>
-                      <span>Created {formatRelativeTime(session.created_at)}</span>
-                    </div>
-                    {confirmRevoke === session.id && session.is_current && (
-                      <div className="session-confirm-warning">
-                        This is your current active session. Revoking it will log you out and you
-                        must sign back in.
-                      </div>
-                    )}
-                  </div>
-                  <SessionCardActions
-                    sessionId={session.id}
-                    isConfirming={confirmRevoke === session.id}
-                    isRevoking={revokingId === session.id}
-                    onRevoke={handleRevoke}
-                    onCancelConfirm={() => setConfirmRevoke(null)}
-                  />
-                </div>
+                  session={session}
+                  confirmRevoke={confirmRevoke}
+                  revokingId={revokingId}
+                  onRevoke={handleRevoke}
+                  onCancelConfirm={() => setConfirmRevoke(null)}
+                />
               ))}
             </div>
           </>

@@ -128,7 +128,7 @@ const NotificationSection: React.FC = () => {
 
   const clearPreviewTimer = () => {
     if (previewTimerRef.current === null) return;
-    window.clearTimeout(previewTimerRef.current);
+    globalThis.clearTimeout(previewTimerRef.current);
     previewTimerRef.current = null;
   };
 

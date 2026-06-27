@@ -191,7 +191,7 @@ const TTSSection: React.FC = () => {
 
   const clearPreviewTimeout = () => {
     if (previewTimeoutRef.current === null) return;
-    window.clearTimeout(previewTimeoutRef.current);
+    globalThis.clearTimeout(previewTimeoutRef.current);
     previewTimeoutRef.current = null;
   };
 
@@ -221,7 +221,7 @@ const TTSSection: React.FC = () => {
     };
   }, []);
 
-  const speechAvailable = typeof globalThis.speechSynthesis !== 'undefined';
+  const speechAvailable = globalThis.speechSynthesis !== undefined;
   const previewUnavailableHint = getPreviewUnavailableHint(
     speechAvailable,
     voicesLoaded,

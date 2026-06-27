@@ -1,5 +1,5 @@
 .markdown-content {
-  word-break: break-word;
+  overflow-wrap: break-word;
 }
 
 .markdown-content > *:first-child {

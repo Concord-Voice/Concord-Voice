@@ -275,7 +275,7 @@ const SettingsPage: React.FC = () => {
         const details = el.closest('details');
         if (details instanceof HTMLDetailsElement && !details.open) details.open = true;
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        (el as HTMLElement).focus();
+        el.focus();
       }
       clearFocusRequest();
     }, 50);

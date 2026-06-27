@@ -32,7 +32,7 @@ const WINDOWS_POWERSHELL_PATH = path.join(
 export async function extractChain(filePath: string): Promise<CertInfo[]> {
   if (process.platform !== 'win32') return [];
   const escapedPath = filePath.replaceAll("'", "''");
-  const script = String.raw`
+  const script = `
     $ErrorActionPreference = 'Stop'
     $sig = Get-AuthenticodeSignature -FilePath '${escapedPath}'
     if ($sig.Status -ne 'Valid') { throw "Authenticode status: $($sig.Status)" }

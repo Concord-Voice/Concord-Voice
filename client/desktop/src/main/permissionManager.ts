@@ -39,13 +39,13 @@ export type OsPermissionStatus =
 
 export type OsPermissionState = Record<OsPermissionType, OsPermissionStatus>;
 
-const PERMISSION_TYPES: OsPermissionType[] = [
+const PERMISSION_TYPES = new Set<OsPermissionType>([
   'microphone',
   'camera',
   'screen',
   'secureStorage',
   'notifications',
-];
+]);
 
 // ─── Platform Helpers ─────────────────────────────────────────────────
 
@@ -241,14 +241,14 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
   });
 
   ipcMain.handle('permission:check', (_event, type: string) => {
-    if (!PERMISSION_TYPES.includes(type as OsPermissionType)) {
+    if (!PERMISSION_TYPES.has(type as OsPermissionType)) {
       throw new Error(`Unknown permission type: ${type}`);
     }
     return checkPermission(type as OsPermissionType);
   });
 
   ipcMain.handle('permission:request', async (_event, type: string) => {
-    if (!PERMISSION_TYPES.includes(type as OsPermissionType)) {
+    if (!PERMISSION_TYPES.has(type as OsPermissionType)) {
       throw new Error(`Unknown permission type: ${type}`);
     }
     const status = await requestPermission(type as OsPermissionType);
@@ -263,7 +263,7 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
   });
 
   ipcMain.handle('permission:openSettings', (_event, type: string) => {
-    if (!PERMISSION_TYPES.includes(type as OsPermissionType)) {
+    if (!PERMISSION_TYPES.has(type as OsPermissionType)) {
       throw new Error(`Unknown permission type: ${type}`);
     }
     openSystemSettings(type as OsPermissionType);

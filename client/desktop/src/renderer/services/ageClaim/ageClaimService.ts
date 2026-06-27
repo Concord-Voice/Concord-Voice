@@ -54,7 +54,7 @@ function getCurrentUserId(): string | null {
 async function getClientVersion(): Promise<string> {
   let raw = '';
   try {
-    raw = await window.electron.getVersion();
+    raw = await globalThis.electron.getVersion();
   } catch {
     raw = '';
   }
@@ -76,7 +76,7 @@ async function fetchCurrentKeyVersion(userId: string): Promise<number> {
   }
   const data = (await res.json()) as { key_version?: number };
   if (typeof data.key_version !== 'number' || !Number.isInteger(data.key_version)) {
-    throw new Error('age-claim: malformed key-version response');
+    throw new TypeError('age-claim: malformed key-version response');
   }
   return data.key_version;
 }

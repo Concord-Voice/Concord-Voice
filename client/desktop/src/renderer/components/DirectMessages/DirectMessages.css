@@ -1523,7 +1523,7 @@
   color: var(--text-primary);
   margin: 0;
   text-align: center;
-  word-break: break-word;
+  overflow-wrap: break-word;
 }
 
 .group-info-edit-btn {
