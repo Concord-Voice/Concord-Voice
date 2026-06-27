@@ -7,6 +7,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/storage"
 )
 
 // mockStore is an in-memory ObjectStore implementation for testing.
@@ -44,7 +46,8 @@ func (m *mockStore) GetObject(_ context.Context, key string) (io.ReadCloser, str
 	defer m.mu.Unlock()
 	obj, ok := m.objects[key]
 	if !ok {
-		return nil, "", fmt.Errorf("NoSuchKey: %s not found", key)
+		// Wrapped to mirror the real client, proving errors.Is sees through wrapping.
+		return nil, "", fmt.Errorf("mock get %q: %w", key, storage.ErrObjectNotFound)
 	}
 	return io.NopCloser(bytes.NewReader(obj.data)), obj.contentType, nil
 }
@@ -53,7 +56,7 @@ func (m *mockStore) PresignedGetURL(_ context.Context, key string, _ time.Durati
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.objects[key]; !ok {
-		return "", fmt.Errorf("NoSuchKey: %s not found", key)
+		return "", fmt.Errorf("mock presign %q: %w", key, storage.ErrObjectNotFound)
 	}
 	return "http://minio:9000/test-bucket/" + key + "?presigned=true", nil
 }

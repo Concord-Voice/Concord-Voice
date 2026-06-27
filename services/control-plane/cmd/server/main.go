@@ -177,8 +177,8 @@ func main() {
 }
 
 func initStorageClient(cfg *config.Config, log *logger.Logger) *storage.Client {
-	if cfg.MinIOEndpoint == "" {
-		log.Info("Object storage not configured (MINIO_ENDPOINT empty) — media endpoints disabled")
+	if cfg.StorageEndpoint == "" {
+		log.Info("Object storage not configured (STORAGE_ENDPOINT/MINIO_ENDPOINT empty) — media endpoints disabled")
 		return nil
 	}
 

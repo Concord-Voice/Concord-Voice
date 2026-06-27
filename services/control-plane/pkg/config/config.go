@@ -192,13 +192,16 @@ type Config struct {
 	CFAccessAUD                 string   // Cloudflare Access audience tag verified by the origin
 	CFAccessTeamDomain          string   // Cloudflare Access team domain (issuer + JWKS base URL)
 
-	// Object Storage (MinIO / S3-compatible)
-	MinIOEndpoint  string // MinIO server endpoint (e.g. "minio:9000")
-	MinIOAccessKey string // MinIO access key (root user)
-	MinIOSecretKey string // MinIO secret key // #nosec G101 -- config field, loaded from env
-	MinIOUseSSL    bool   // Use SSL for MinIO connection
-	MinIOBucket    string // Bucket name for media storage (e.g. "concord-media")
-	UploadMaxSize  int64  // Global max upload size in bytes (default 25 MB)
+	// Object Storage (S3-compatible; MinIO is the default backend — #1611 / ADR-0024).
+	// Configured via STORAGE_*; MINIO_* accepted as deprecated aliases.
+	StorageBackend   string // Backend selector: minio (default) | s3 | r2 | b2
+	StorageEndpoint  string // Endpoint host:port (e.g. "minio:9000")
+	StorageRegion    string // Region (empty = auto-detect; set for AWS S3/R2)
+	StorageAccessKey string // Access key
+	StorageSecretKey string // Secret key // #nosec G101 -- config field, loaded from env
+	StorageUseSSL    bool   // Use TLS for the storage connection
+	StorageBucket    string // Bucket name for media storage (e.g. "concord-media")
+	UploadMaxSize    int64  // Global max upload size in bytes (default 25 MB)
 
 	// KLIPY GIF integration (optional — empty key disables the feature).
 	// SECURITY: this key is server-side ONLY. It is never delivered to clients.
@@ -318,11 +321,13 @@ func Load() (*Config, error) {
 		AdminWebAuthnAllowedAAGUIDs: parseOrigins(getEnv("ADMIN_WEBAUTHN_ALLOWED_AAGUIDS", "")),
 		CFAccessAUD:                 getEnv("CF_ACCESS_AUD", ""),
 		CFAccessTeamDomain:          getEnv("CF_ACCESS_TEAM_DOMAIN", ""),
-		MinIOEndpoint:               getEnv("MINIO_ENDPOINT", ""),
-		MinIOAccessKey:              getEnv("MINIO_ACCESS_KEY", "concord"),
-		MinIOSecretKey:              getEnv("MINIO_SECRET_KEY", devMinIOSecretKey), // #nosec G101 -- env var name, not a secret
-		MinIOUseSSL:                 getEnv("MINIO_USE_SSL", "false") == "true",
-		MinIOBucket:                 getEnv("MINIO_BUCKET", "concord-media"),
+		StorageBackend:              getEnvAlias("STORAGE_BACKEND", "", "minio"),
+		StorageEndpoint:             getEnvAlias("STORAGE_ENDPOINT", "MINIO_ENDPOINT", ""),
+		StorageRegion:               getEnvAlias("STORAGE_REGION", "", ""),
+		StorageAccessKey:            getEnvAlias("STORAGE_ACCESS_KEY", "MINIO_ACCESS_KEY", "concord"),
+		StorageSecretKey:            getEnvAlias("STORAGE_SECRET_KEY", "MINIO_SECRET_KEY", devMinIOSecretKey), // #nosec G101 -- env var name, not a secret
+		StorageUseSSL:               getEnvAlias("STORAGE_USE_SSL", "MINIO_USE_SSL", "false") == "true",
+		StorageBucket:               getEnvAlias("STORAGE_BUCKET", "MINIO_BUCKET", "concord-media"),
 		UploadMaxSize:               getEnvInt64("UPLOAD_MAX_SIZE", 25*1024*1024), // 25 MB default
 		KlipyAPIKey:                 getEnv("KLIPY_API_KEY", ""),
 		GitHubFeedback: GitHubFeedbackConfig{
@@ -510,18 +515,18 @@ func (c *Config) validate() error {
 			"REDIS_URL must be set to a secure value in production. The default dev connection string is not allowed."},
 		{c.MFAEncryptionKey == devMFAEncKey,
 			"MFA_ENCRYPTION_KEY must be set to a secure value in production. The default dev key is not allowed. Generate with: openssl rand -hex 32"},
-		{c.MinIOSecretKey == devMinIOSecretKey, // #nosec G101 -- dev default comparison
-			"MINIO_SECRET_KEY must be set to a secure value in production. The default dev credential is not allowed."},
+		{c.StorageSecretKey == devMinIOSecretKey, // #nosec G101 -- dev default comparison
+			"STORAGE_SECRET_KEY (or MINIO_SECRET_KEY alias) must be set to a secure value in production. The default dev credential is not allowed."},
 		{c.SMTPHost == "",
 			"SMTP_HOST must be set in production. Email verification cannot fall back to dev mode (logging codes to stdout) in production."},
-		{c.MinIOAccessKey == "",
-			"MINIO_ACCESS_KEY must be set in production."},
-		{c.MinIOSecretKey == "", // #nosec G101 -- env var validation
-			"MINIO_SECRET_KEY must be set in production."},
-		{c.MinIOEndpoint == "",
-			"MINIO_ENDPOINT must be set in production."},
-		{c.MinIOBucket == "",
-			"MINIO_BUCKET must be set in production."},
+		{c.StorageAccessKey == "",
+			"STORAGE_ACCESS_KEY (or MINIO_ACCESS_KEY alias) must be set in production."},
+		{c.StorageSecretKey == "", // #nosec G101 -- env var validation
+			"STORAGE_SECRET_KEY (or MINIO_SECRET_KEY alias) must be set in production."},
+		{c.StorageEndpoint == "",
+			"STORAGE_ENDPOINT (or MINIO_ENDPOINT alias) must be set in production."},
+		{c.StorageBucket == "",
+			"STORAGE_BUCKET (or MINIO_BUCKET alias) must be set in production."},
 		{len(c.TrustedProxyCIDRs) == 0,
 			"TRUSTED_PROXY_CIDRS must be set in production. Without it, c.ClientIP() returns the reverse-proxy address instead of the real client IP, breaking rate limiting and session audit logs."},
 		// #725 review: MEDIA_PLANE_URL guard parity with other dev-default /
@@ -698,6 +703,21 @@ func parseOrigins(raw string) []string {
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
+	}
+	return defaultValue
+}
+
+// getEnvAlias returns the primary env var if set, else the deprecated alias if set,
+// else the default. Backs the STORAGE_* (primary) → MINIO_* (deprecated alias) config
+// seam (#1611 / ADR-0024). Pass alias == "" for fields with no deprecated alias.
+func getEnvAlias(primary, alias, defaultValue string) string {
+	if value := os.Getenv(primary); value != "" {
+		return value
+	}
+	if alias != "" {
+		if value := os.Getenv(alias); value != "" {
+			return value
+		}
 	}
 	return defaultValue
 }

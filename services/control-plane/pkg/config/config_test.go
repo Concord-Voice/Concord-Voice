@@ -208,10 +208,10 @@ func validProductionConfig() *Config { // #nosec G101 -- test fixture with fake 
 		DatabaseURL:       dbURL,
 		RedisURL:          redisURL,
 		MFAEncryptionKey:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		MinIOSecretKey:    "real-minio-secret",
-		MinIOAccessKey:    "real-minio-access",
-		MinIOEndpoint:     "minio:9000",
-		MinIOBucket:       "concord-media",
+		StorageSecretKey:  "real-minio-secret",
+		StorageAccessKey:  "real-minio-access",
+		StorageEndpoint:   "minio:9000",
+		StorageBucket:     "concord-media",
 		SMTPHost:          "smtp.example.com",
 		TrustedProxyCIDRs: []string{"10.0.0.0/8"},
 		// Satisfy the #725 MEDIA_PLANE_URL production guards: must be set,
@@ -336,11 +336,11 @@ func TestValidateProductionRejectsDevDefaults(t *testing.T) {
 		{"dev DATABASE_URL", func(c *Config) { c.DatabaseURL = defaultDevDatabaseURL() }, "DATABASE_URL"},
 		{"dev REDIS_URL", func(c *Config) { c.RedisURL = defaultDevRedisURL() }, "REDIS_URL"},
 		{"dev MFA encryption key", func(c *Config) { c.MFAEncryptionKey = devMFAEncKey }, "MFA_ENCRYPTION_KEY"},
-		{"dev MinIO secret key", func(c *Config) { c.MinIOSecretKey = devMinIOSecretKey }, "MINIO_SECRET_KEY"},
+		{"dev storage secret key", func(c *Config) { c.StorageSecretKey = devMinIOSecretKey }, "STORAGE_SECRET_KEY"},
 		{"empty SMTP host", func(c *Config) { c.SMTPHost = "" }, "SMTP_HOST"},
-		{"empty MinIO access key", func(c *Config) { c.MinIOAccessKey = "" }, "MINIO_ACCESS_KEY"},
-		{"empty MinIO endpoint", func(c *Config) { c.MinIOEndpoint = "" }, "MINIO_ENDPOINT"},
-		{"empty MinIO bucket", func(c *Config) { c.MinIOBucket = "" }, "MINIO_BUCKET"},
+		{"empty storage access key", func(c *Config) { c.StorageAccessKey = "" }, "STORAGE_ACCESS_KEY"},
+		{"empty storage endpoint", func(c *Config) { c.StorageEndpoint = "" }, "STORAGE_ENDPOINT"},
+		{"empty storage bucket", func(c *Config) { c.StorageBucket = "" }, "STORAGE_BUCKET"},
 		{"empty TRUSTED_PROXY_CIDRS", func(c *Config) { c.TrustedProxyCIDRs = nil }, "TRUSTED_PROXY_CIDRS"},
 		// #725 cross-cutting: MEDIA_PLANE_URL guards. Three classes of failure
 		// should all be rejected by the production validate() pass.
@@ -1124,10 +1124,10 @@ func TestValidate_WarnsOnBroadRFC1918Fallback(t *testing.T) {
 		DatabaseURL:       dbURL,
 		RedisURL:          redisURL,
 		MFAEncryptionKey:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		MinIOAccessKey:    "ak",
-		MinIOSecretKey:    "real-minio-secret",
-		MinIOEndpoint:     "minio:9000",
-		MinIOBucket:       "concord-media",
+		StorageAccessKey:  "ak",
+		StorageSecretKey:  "real-minio-secret",
+		StorageEndpoint:   "minio:9000",
+		StorageBucket:     "concord-media",
 		SMTPHost:          "smtp.example.com",
 		TrustedProxyCIDRs: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
 		MediaPlaneURL:     "https://media.concordvoice.chat",
@@ -1272,4 +1272,48 @@ func TestCloudflareKVBridgeConfig_String_RedactsToken(t *testing.T) {
 	assert.Contains(t, output, "acct-123")
 	assert.Contains(t, output, "ns-456")
 	assert.Contains(t, output, "REDACTED")
+}
+
+// TestStorageConfig_Precedence locks the #1611 STORAGE_* → MINIO_* alias seam:
+// STORAGE_* wins, MINIO_* is the fallback alias, and defaults apply when neither is set.
+func TestStorageConfig_Precedence(t *testing.T) {
+	t.Run("STORAGE_* wins over MINIO_* alias", func(t *testing.T) {
+		t.Setenv("ENVIRONMENT", "development") // skip production guards
+		t.Setenv("STORAGE_ENDPOINT", "s3.example.com")
+		t.Setenv("MINIO_ENDPOINT", "minio:9000")
+		t.Setenv("STORAGE_ACCESS_KEY", "ak-new")
+		t.Setenv("MINIO_ACCESS_KEY", "ak-old")
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, "s3.example.com", cfg.StorageEndpoint)
+		assert.Equal(t, "ak-new", cfg.StorageAccessKey)
+	})
+
+	t.Run("MINIO_* alias used when STORAGE_* unset", func(t *testing.T) {
+		t.Setenv("ENVIRONMENT", "development")
+		t.Setenv("MINIO_ENDPOINT", "minio:9000")
+		t.Setenv("MINIO_BUCKET", "legacy-bucket")
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, "minio:9000", cfg.StorageEndpoint)
+		assert.Equal(t, "legacy-bucket", cfg.StorageBucket)
+	})
+
+	t.Run("defaults when neither set", func(t *testing.T) {
+		t.Setenv("ENVIRONMENT", "development")
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, "minio", cfg.StorageBackend)
+		assert.Equal(t, "concord-media", cfg.StorageBucket)
+		assert.Equal(t, "", cfg.StorageRegion)
+		assert.False(t, cfg.StorageUseSSL)
+	})
+
+	t.Run("STORAGE_USE_SSL true parses", func(t *testing.T) {
+		t.Setenv("ENVIRONMENT", "development")
+		t.Setenv("STORAGE_USE_SSL", "true")
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.True(t, cfg.StorageUseSSL)
+	})
 }

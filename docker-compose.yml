@@ -186,11 +186,14 @@ services:
       SMTP_FROM: ${SMTP_FROM:-noreply@concordvoice.chat}
       WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-localhost}
       WEBAUTHN_RP_ORIGINS: ${WEBAUTHN_RP_ORIGINS:-http://localhost:3001}
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?}
-      MINIO_USE_SSL: "false"
-      MINIO_BUCKET: ${MINIO_BUCKET:-concord-media}
+      # Object storage (#1611): control-plane client config uses STORAGE_*;
+      # creds derive from the MinIO server root creds (MINIO_ROOT_*).
+      STORAGE_BACKEND: minio
+      STORAGE_ENDPOINT: minio:9000
+      STORAGE_ACCESS_KEY: ${MINIO_ROOT_USER:?}
+      STORAGE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?}
+      STORAGE_USE_SSL: "false"
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-${MINIO_BUCKET:-concord-media}}
       UPLOAD_MAX_SIZE: ${UPLOAD_MAX_SIZE:-26214400}
       KLIPY_API_KEY: ${KLIPY_API_KEY:-}
       TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.19.0.0/16}

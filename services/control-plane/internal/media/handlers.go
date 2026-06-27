@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -27,6 +28,7 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	invitecodes "github.com/markdrogersjr/Concord/services/control-plane/internal/invites"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/storage"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 )
@@ -37,7 +39,6 @@ const (
 	errMsgFailedVerifyPerms  = "Failed to verify permissions"
 	errMsgInternalServer     = "Internal server error"
 	errMsgStorageUnavailable = "Object storage unavailable"
-	storageErrNotFound       = "not found"
 	purposeDMIcon            = "dm-icon"
 	purposeServerIcon        = "server-icon"
 	purposeServerBanner      = "server-banner"
@@ -280,7 +281,7 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 	}
 	obj, contentType, err := store.GetObject(c.Request.Context(), storageKey)
 	if err != nil {
-		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), storageErrNotFound) {
+		if errors.Is(err, storage.ErrObjectNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "File not found in storage"})
 			return
 		}
@@ -838,7 +839,7 @@ func (h *Handler) proxyTier1Media(c *gin.Context, key string, public bool) {
 	}
 	obj, contentType, err := store.GetObject(c.Request.Context(), key)
 	if err != nil {
-		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), storageErrNotFound) {
+		if errors.Is(err, storage.ErrObjectNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Not found"})
 			return
 		}
@@ -871,7 +872,7 @@ func (h *Handler) proxyInviteIcon(c *gin.Context, key string) {
 	}
 	obj, contentType, err := store.GetObject(c.Request.Context(), key)
 	if err != nil {
-		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), storageErrNotFound) {
+		if errors.Is(err, storage.ErrObjectNotFound) {
 			serveInviteIconFallback(c)
 			return
 		}

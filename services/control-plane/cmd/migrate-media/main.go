@@ -64,9 +64,12 @@ func main() {
 		log.Fatalf("Failed to ping database: %v", err)
 	}
 
-	mc, err := minio.New(cfg.MinIOEndpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(cfg.MinIOAccessKey, cfg.MinIOSecretKey, ""),
-		Secure: cfg.MinIOUseSSL,
+	mc, err := minio.New(cfg.StorageEndpoint, &minio.Options{
+		// NewStaticV4's 3rd arg is the STS session token, not the region — pass "".
+		// Region is supplied via Options.Region only (#1611 Gitar review).
+		Creds:  credentials.NewStaticV4(cfg.StorageAccessKey, cfg.StorageSecretKey, ""),
+		Secure: cfg.StorageUseSSL,
+		Region: cfg.StorageRegion,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create MinIO client: %v", err)
@@ -76,15 +79,15 @@ func main() {
 	defer cancel()
 
 	// Ensure bucket exists
-	exists, err := mc.BucketExists(ctx, cfg.MinIOBucket)
+	exists, err := mc.BucketExists(ctx, cfg.StorageBucket)
 	if err != nil {
 		log.Fatalf("Failed to check bucket: %v", err)
 	}
 	if !exists {
-		if err := mc.MakeBucket(ctx, cfg.MinIOBucket, minio.MakeBucketOptions{}); err != nil {
+		if err := mc.MakeBucket(ctx, cfg.StorageBucket, minio.MakeBucketOptions{}); err != nil {
 			log.Fatalf("Failed to create bucket: %v", err)
 		}
-		log.Printf("Created bucket: %s", cfg.MinIOBucket)
+		log.Printf("Created bucket: %s", cfg.StorageBucket)
 	}
 
 	mode := "LIVE"
@@ -93,14 +96,14 @@ func main() {
 	}
 	log.Printf("=== Media Migration (%s) ===", mode)
 	log.Printf("Database: %s", maskDSN(cfg.DatabaseURL))
-	log.Printf("MinIO:    %s/%s", cfg.MinIOEndpoint, cfg.MinIOBucket)
+	log.Printf("MinIO:    %s/%s", cfg.StorageEndpoint, cfg.StorageBucket)
 	log.Println()
 
 	total := &migrationStats{}
 
 	// Migrate user avatars
 	log.Println("--- User Avatars ---")
-	stats := migrateColumn(ctx, db, mc, cfg.MinIOBucket, *dryRun, *batchSize, migrateOpts{
+	stats := migrateColumn(ctx, db, mc, cfg.StorageBucket, *dryRun, *batchSize, migrateOpts{
 		table:     "users",
 		column:    "avatar_url",
 		idColumn:  "id",
@@ -114,7 +117,7 @@ func main() {
 
 	// Migrate user banners
 	log.Println("--- User Banners ---")
-	stats = migrateColumn(ctx, db, mc, cfg.MinIOBucket, *dryRun, *batchSize, migrateOpts{
+	stats = migrateColumn(ctx, db, mc, cfg.StorageBucket, *dryRun, *batchSize, migrateOpts{
 		table:     "users",
 		column:    "header_image_url",
 		idColumn:  "id",
@@ -128,7 +131,7 @@ func main() {
 
 	// Migrate server icons
 	log.Println("--- Server Icons ---")
-	stats = migrateColumn(ctx, db, mc, cfg.MinIOBucket, *dryRun, *batchSize, migrateOpts{
+	stats = migrateColumn(ctx, db, mc, cfg.StorageBucket, *dryRun, *batchSize, migrateOpts{
 		table:     "servers",
 		column:    "icon_url",
 		idColumn:  "id",
@@ -142,7 +145,7 @@ func main() {
 
 	// Migrate server banners
 	log.Println("--- Server Banners ---")
-	stats = migrateColumn(ctx, db, mc, cfg.MinIOBucket, *dryRun, *batchSize, migrateOpts{
+	stats = migrateColumn(ctx, db, mc, cfg.StorageBucket, *dryRun, *batchSize, migrateOpts{
 		table:     "servers",
 		column:    "banner_url",
 		idColumn:  "id",

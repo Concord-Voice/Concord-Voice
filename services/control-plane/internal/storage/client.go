@@ -5,6 +5,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -16,6 +17,24 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 )
 
+// ErrObjectNotFound is returned by read operations when the object does not exist.
+// Consumers classify with errors.Is(err, ErrObjectNotFound) — the minio SDK error
+// shape stays confined to this package (#1611).
+var ErrObjectNotFound = errors.New("storage: object not found")
+
+// mapNotFound converts a minio NoSuchKey error into ErrObjectNotFound; nil stays nil
+// and any other error passes through unchanged. Uses the structured SDK error code
+// (matching ObjectExists), not a fragile err.Error() substring match.
+func mapNotFound(err error) error {
+	if err == nil {
+		return nil
+	}
+	if minio.ToErrorResponse(err).Code == "NoSuchKey" {
+		return ErrObjectNotFound
+	}
+	return err
+}
+
 // Client wraps the MinIO SDK client with application-specific operations.
 type Client struct {
 	minio  *minio.Client
@@ -23,30 +42,52 @@ type Client struct {
 	log    *logger.Logger
 }
 
-// New creates a new storage client and ensures the configured bucket exists.
+// New selects the storage backend by cfg.StorageBackend and returns a ready client.
+// All currently-supported backends are S3-compatible, so there is exactly one
+// constructor and NO backend branch in the hot path — the switch is construction-time
+// only (#1611 / ADR-0024).
 func New(cfg *config.Config, log *logger.Logger) (*Client, error) {
-	mc, err := minio.New(cfg.MinIOEndpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(cfg.MinIOAccessKey, cfg.MinIOSecretKey, ""),
-		Secure: cfg.MinIOUseSSL,
-	})
+	switch cfg.StorageBackend {
+	case "minio", "s3", "r2", "b2":
+		return newS3Client(cfg, log)
+	default:
+		return nil, fmt.Errorf("storage: unknown STORAGE_BACKEND %q (want one of: minio, s3, r2, b2)", cfg.StorageBackend)
+	}
+}
+
+// s3Options maps the resolved STORAGE_* config onto minio-go client options.
+// Pure (no network) so the credential/region/TLS wiring is unit-testable.
+func s3Options(cfg *config.Config) *minio.Options {
+	return &minio.Options{
+		// NewStaticV4's 3rd arg is the STS session token, NOT the region — pass "".
+		// The region is supplied only via Options.Region below. (#1611 Gitar review.)
+		Creds:  credentials.NewStaticV4(cfg.StorageAccessKey, cfg.StorageSecretKey, ""),
+		Secure: cfg.StorageUseSSL,
+		Region: cfg.StorageRegion,
+	}
+}
+
+// newS3Client builds the single S3-compatible (minio-go) client and ensures the bucket.
+func newS3Client(cfg *config.Config, log *logger.Logger) (*Client, error) {
+	mc, err := minio.New(cfg.StorageEndpoint, s3Options(cfg))
 	if err != nil {
-		return nil, fmt.Errorf("storage: failed to create MinIO client: %w", err)
+		return nil, fmt.Errorf("storage: failed to create S3 client: %w", err)
 	}
 
 	client := &Client{
 		minio:  mc,
-		bucket: cfg.MinIOBucket,
+		bucket: cfg.StorageBucket,
 		log:    log,
 	}
 
-	// Ensure bucket exists on startup (fail fast if MinIO is unreachable)
+	// Ensure bucket exists on startup (fail fast if the backend is unreachable)
 	initCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := client.ensureBucket(initCtx); err != nil {
 		return nil, err
 	}
 
-	log.Info("Object storage connected", "endpoint", cfg.MinIOEndpoint, "bucket", cfg.MinIOBucket)
+	log.Info("Object storage connected", "backend", cfg.StorageBackend, "endpoint", cfg.StorageEndpoint, "bucket", cfg.StorageBucket)
 	return client, nil
 }
 
@@ -87,13 +128,14 @@ func (c *Client) PutObject(ctx context.Context, key string, reader io.Reader, si
 func (c *Client) GetObject(ctx context.Context, key string) (io.ReadCloser, string, error) {
 	obj, err := c.minio.GetObject(ctx, c.bucket, key, minio.GetObjectOptions{})
 	if err != nil {
-		return nil, "", fmt.Errorf("storage: failed to get object %q: %w", key, err)
+		return nil, "", fmt.Errorf("storage: failed to get object %q: %w", key, mapNotFound(err))
 	}
 
+	// minio-go's GetObject is lazy — a missing object surfaces NoSuchKey at Stat().
 	info, err := obj.Stat()
 	if err != nil {
 		_ = obj.Close()
-		return nil, "", fmt.Errorf("storage: failed to stat object %q: %w", key, err)
+		return nil, "", fmt.Errorf("storage: failed to stat object %q: %w", key, mapNotFound(err))
 	}
 
 	return obj, info.ContentType, nil
