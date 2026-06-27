@@ -395,36 +395,18 @@ const SystemPermissionsSection: React.FC = () => {
   const requestOne = useOsPermissionStore((s) => s.requestOne);
   const openSettings = useOsPermissionStore((s) => s.openSettings);
   const isLoaded = useOsPermissionStore((s) => s.isLoaded);
-  const [platform, setPlatform] = useState('');
 
-  // Fetch fresh permission statuses when Settings is opened
+  // Fetch fresh permission statuses when Settings is opened.
   useEffect(() => {
     fetchAll();
-    globalThis.electron?.getPlatform?.().then(setPlatform);
   }, [fetchAll]);
-
-  // On non-macOS, mic/camera/screen are always 'granted' (Chromium handles them).
-  // Hide request/fix buttons for those since there's no OS-level gate.
-  const hasMacOsGate = (type: OsPermissionType): boolean => {
-    if (platform !== 'darwin') return false;
-    return type === 'microphone' || type === 'camera' || type === 'screen';
-  };
-
-  const showActionButton = (type: OsPermissionType, status: OsPermissionStatus): boolean => {
-    // secureStorage: show "Fix" if unavailable (all platforms)
-    if (type === 'secureStorage') return status === 'unavailable';
-    // notifications: show "Request" if not-determined (all platforms)
-    if (type === 'notifications') return status === 'not-determined';
-    // mic/camera/screen: only actionable on macOS
-    if (!hasMacOsGate(type)) return false;
-    return status === 'not-determined' || status === 'denied' || status === 'restricted';
-  };
 
   return (
     <CollapsibleSection id="section-system-permissions" title="System Permissions">
       <p className="settings-section-description">
-        Concord requests system permissions only when needed. If a permission is denied, you can
-        grant it in your operating system&apos;s settings.
+        These show the status of permissions managed by your operating system — they are not in-app
+        switches. Concord requests each permission only when it&apos;s needed. Use &ldquo;Open
+        System Settings&rdquo; to review or change a permission in your OS.
       </p>
 
       {isLoaded ? (
@@ -435,7 +417,6 @@ const SystemPermissionsSection: React.FC = () => {
             label={row.label}
             description={row.description}
             critical={row.critical}
-            showAction={showActionButton}
             onRequest={requestOne}
             onOpenSettings={openSettings}
           />
@@ -454,10 +435,9 @@ const PermissionRow: React.FC<{
   label: string;
   description: string;
   critical?: boolean;
-  showAction: (type: OsPermissionType, status: OsPermissionStatus) => boolean;
   onRequest: (type: OsPermissionType) => Promise<OsPermissionStatus>;
   onOpenSettings: (type: OsPermissionType) => Promise<void>;
-}> = ({ type, label, description, critical, showAction, onRequest, onOpenSettings }) => {
+}> = ({ type, label, description, critical, onRequest, onOpenSettings }) => {
   const status = useOsPermissionStore((s) => s[type]);
   const badge = permissionStatusBadge(status);
   const [isRequesting, setIsRequesting] = useState(false);
@@ -485,6 +465,7 @@ const PermissionRow: React.FC<{
           {critical && <span className="os-perm-critical"> (Required)</span>}
         </span>
         <span className="settings-row-hint">{description}</span>
+        <span className="settings-row-hint os-perm-managed">Managed by your operating system.</span>
         {critical && status !== 'granted' && (
           <span className="settings-row-hint os-perm-warning">
             Secure storage is required for login. Please enable keychain / credential manager
@@ -494,22 +475,18 @@ const PermissionRow: React.FC<{
       </div>
       <div className="os-perm-actions">
         <span className={badge.className}>{badge.label}</span>
-        {showAction(type, status) && (
-          <>
-            {status === 'not-determined' ? (
-              <button
-                className="btn btn-sm btn-primary"
-                onClick={handleRequest}
-                disabled={isRequesting}
-              >
-                {isRequesting ? 'Requesting...' : 'Request'}
-              </button>
-            ) : (
-              <button className="btn btn-sm btn-secondary" onClick={handleOpenSettings}>
-                Fix
-              </button>
-            )}
-          </>
+        {status === 'not-determined' ? (
+          <button
+            className="btn btn-sm btn-primary"
+            onClick={handleRequest}
+            disabled={isRequesting}
+          >
+            {isRequesting ? 'Requesting...' : 'Request'}
+          </button>
+        ) : (
+          <button className="btn btn-sm btn-secondary" onClick={handleOpenSettings}>
+            Open System Settings
+          </button>
         )}
       </div>
     </div>

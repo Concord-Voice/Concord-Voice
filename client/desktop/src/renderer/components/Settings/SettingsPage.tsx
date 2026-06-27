@@ -186,6 +186,8 @@ const SettingsPage: React.FC = () => {
   const [isPending, startTransition] = useTransition();
   const [activeSubsection, setActiveSubsection] = useState<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  // Sub-section to scroll to after a pane switch triggered by a sub-nav click (#1743).
+  const pendingScrollRef = useRef<string | null>(null);
 
   // Draft settings lifecycle
   useDraftSettingsLifecycle();
@@ -255,6 +257,30 @@ const SettingsPage: React.FC = () => {
     }
     el.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }, []);
+
+  // Sub-nav click (#1743): sub-trees now render for every pane, so a clicked
+  // sub-section may belong to a pane that isn't active yet. If so, switch to its
+  // pane first and defer the scroll until it mounts (same post-commit delay the
+  // focusRequest effect uses); otherwise scroll immediately.
+  const handleSubNavClick = useCallback(
+    (paneId: SettingsSection, subId: string) => {
+      if (activeSection === paneId) {
+        scrollToSection(subId);
+        return;
+      }
+      pendingScrollRef.current = subId;
+      startTransition(() => setActiveSection(paneId));
+    },
+    [activeSection, scrollToSection]
+  );
+
+  useEffect(() => {
+    if (!pendingScrollRef.current) return;
+    const subId = pendingScrollRef.current;
+    pendingScrollRef.current = null;
+    const timer = setTimeout(() => scrollToSection(subId), 60);
+    return () => clearTimeout(timer);
+  }, [activeSection, scrollToSection]);
 
   // Cross-section focus (#1644): the locked Appearance font picker's back-link
   // requests focus on the Accessibility dyslexic toggle. Switch to the target
@@ -356,7 +382,9 @@ const SettingsPage: React.FC = () => {
 
                 {navItems.map((item) => {
                   const isActive = activeSection === item.id;
-                  const subs = isActive ? NAV_SUBSECTIONS[item.id] : undefined;
+                  // Render every pane's sub-tree so sub-sections (e.g. System
+                  // Permissions) are reachable from the top-level nav (#1743).
+                  const subs = NAV_SUBSECTIONS[item.id];
 
                   return (
                     <div key={item.id} className="settings-nav-group">
@@ -381,7 +409,7 @@ const SettingsPage: React.FC = () => {
                             >
                               <button
                                 className={`settings-nav-tree-item${activeSubsection === sub.id ? ' active' : ''}`}
-                                onClick={() => scrollToSection(sub.id)}
+                                onClick={() => handleSubNavClick(item.id, sub.id)}
                               >
                                 {sub.label}
                               </button>

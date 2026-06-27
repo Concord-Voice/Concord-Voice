@@ -782,6 +782,109 @@ describe('PrivacySecuritySection', () => {
     await vi.waitFor(() => expect(screen.getByText('Unavailable')).toBeInTheDocument());
   });
 
+  // ── System Permissions: every row has a navigable action (#1743) ─────────
+
+  it('shows "Open System Settings" for every granted row and no dead ends (#1743)', async () => {
+    // Set the all-granted impl explicitly — vi.clearAllMocks() does NOT reset a
+    // mockImplementation a prior test installed, so the default factory mock does
+    // not reliably leak through as all-granted when this test runs mid-suite.
+    vi.mocked(
+      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+    ).mockImplementation((s) =>
+      s({
+        microphone: 'granted',
+        camera: 'granted',
+        screen: 'granted',
+        secureStorage: 'granted',
+        notifications: 'granted',
+        isLoaded: true,
+        fetchAll: vi.fn().mockResolvedValue(undefined),
+        requestOne: vi.fn().mockResolvedValue('granted'),
+        openSettings: vi.fn().mockResolvedValue(undefined),
+      })
+    );
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByText('Microphone')).toBeInTheDocument());
+    expect(screen.getAllByText('Open System Settings').length).toBe(5);
+    // Status is still shown as a read-only badge, not a toggle.
+    expect(screen.getAllByText('Granted').length).toBe(5);
+    // The OS-managed nature is made explicit per row.
+    expect(screen.getAllByText('Managed by your operating system.').length).toBe(5);
+  });
+
+  it('shows "Request" (not "Open System Settings") for a not-determined row (#1743)', async () => {
+    const requestOneMock = vi.fn().mockResolvedValue('granted');
+    vi.mocked(
+      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+    ).mockImplementation((s) =>
+      s({
+        microphone: 'not-determined',
+        camera: 'granted',
+        screen: 'granted',
+        secureStorage: 'granted',
+        notifications: 'granted',
+        isLoaded: true,
+        fetchAll: vi.fn().mockResolvedValue(undefined),
+        requestOne: requestOneMock,
+        openSettings: vi.fn().mockResolvedValue(undefined),
+      })
+    );
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByText('Request')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('Request'));
+    await vi.waitFor(() => expect(requestOneMock).toHaveBeenCalledWith('microphone'));
+  });
+
+  it('"Open System Settings" calls openSettings for the row type (#1743)', async () => {
+    const openSettingsMock = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(
+      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+    ).mockImplementation((s) =>
+      s({
+        microphone: 'denied',
+        camera: 'granted',
+        screen: 'granted',
+        secureStorage: 'granted',
+        notifications: 'granted',
+        isLoaded: true,
+        fetchAll: vi.fn().mockResolvedValue(undefined),
+        requestOne: vi.fn().mockResolvedValue('granted'),
+        openSettings: openSettingsMock,
+      })
+    );
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByText('Denied')).toBeInTheDocument());
+    // Scope to the Microphone row — row order is secureStorage, microphone, …, so
+    // a bare index 0 would be secureStorage.
+    const micRow = screen.getByText('Microphone').closest('.settings-row')!;
+    const micBtn = Array.from(micRow.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Open System Settings'
+    )!;
+    fireEvent.click(micBtn);
+    await vi.waitFor(() => expect(openSettingsMock).toHaveBeenCalledWith('microphone'));
+  });
+
+  it('does not crash if openSettings rejects (#1743)', async () => {
+    vi.mocked(
+      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+    ).mockImplementation((s) =>
+      s({
+        microphone: 'granted',
+        camera: 'granted',
+        screen: 'granted',
+        secureStorage: 'granted',
+        notifications: 'granted',
+        isLoaded: true,
+        fetchAll: vi.fn().mockResolvedValue(undefined),
+        requestOne: vi.fn().mockResolvedValue('granted'),
+        openSettings: vi.fn().mockRejectedValue(new Error('no settings panel')),
+      })
+    );
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getAllByText('Open System Settings').length).toBe(5));
+    expect(() => fireEvent.click(screen.getAllByText('Open System Settings')[0])).not.toThrow();
+  });
+
   // ── Past sessions rendering ─────────────────────────────────────────────
 
   it('renders past sessions when they exist', async () => {
@@ -2229,9 +2332,9 @@ describe('PrivacySecuritySection', () => {
     await vi.waitFor(() => expect(mockRequestOne).toHaveBeenCalledWith('notifications'));
   });
 
-  // ── Permission Fix button click (secure storage) ──────────────────────
+  // ── Permission "Open System Settings" click (secure storage) ───────────
 
-  it('calls openSettings when Fix button clicked for unavailable secure storage', async () => {
+  it('calls openSettings when Open System Settings clicked for unavailable secure storage', async () => {
     const mockOpenSettings = vi.fn().mockResolvedValue(undefined);
     vi.mocked(
       await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
@@ -2249,8 +2352,18 @@ describe('PrivacySecuritySection', () => {
       })
     );
     render(<PrivacySecuritySection />);
-    await vi.waitFor(() => expect(screen.getByText('Fix')).toBeInTheDocument());
-    fireEvent.click(screen.getByText('Fix'));
+    // "Fix" was unified into a universal "Open System Settings" action (#1743).
+    // Scope to the Secure Storage row via its unique required-warning copy.
+    await vi.waitFor(() =>
+      expect(screen.getByText(/Secure storage is required for login/)).toBeInTheDocument()
+    );
+    const secureRow = screen
+      .getByText(/Secure storage is required for login/)
+      .closest('.settings-row')!;
+    const secureBtn = Array.from(secureRow.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Open System Settings'
+    )!;
+    fireEvent.click(secureBtn);
     expect(mockOpenSettings).toHaveBeenCalledWith('secureStorage');
   });
 
@@ -2339,9 +2452,9 @@ describe('PrivacySecuritySection', () => {
     );
   });
 
-  // ── Secure Storage unavailable shows Fix ──────────────────────────────
+  // ── Secure Storage unavailable shows a navigable action ───────────────
 
-  it('shows Fix button for unavailable secure storage', async () => {
+  it('shows Open System Settings for unavailable secure storage', async () => {
     vi.mocked(
       await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
@@ -2359,9 +2472,15 @@ describe('PrivacySecuritySection', () => {
     );
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByText('Unavailable')).toBeInTheDocument());
-    // Secure storage should show warning and Fix button
+    // Secure storage shows the required-warning plus a navigable action (#1743).
     expect(screen.getByText(/Secure storage is required for login/)).toBeInTheDocument();
-    expect(screen.getByText('Fix')).toBeInTheDocument();
+    const secureRow = screen
+      .getByText(/Secure storage is required for login/)
+      .closest('.settings-row')!;
+    const secureBtn = Array.from(secureRow.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Open System Settings'
+    );
+    expect(secureBtn).toBeTruthy();
   });
 
   // ── Notification not-determined shows Request ──────────────────────────

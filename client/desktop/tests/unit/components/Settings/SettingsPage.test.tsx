@@ -229,10 +229,14 @@ describe('SettingsPage', () => {
   it('privacy section shows all 4 subsections in nav tree', () => {
     render(<SettingsPage />);
     fireEvent.click(screen.getByText('Privacy & Security'));
-    // "Privacy" appears in nav item ("Privacy & Security") and tree subsection
-    const privacyTreeItem = document.querySelector('.settings-nav-tree-item');
-    expect(privacyTreeItem).toBeInTheDocument();
-    expect(privacyTreeItem!.textContent).toBe('Privacy');
+    // Sub-trees now render for every pane (#1743), so the global first
+    // `.settings-nav-tree-item` is Appearance's "Color Scheme" — scope to the
+    // Privacy & Security nav group instead.
+    const privacyGroup = Array.from(document.querySelectorAll('.settings-nav-group')).find((g) =>
+      g.querySelector('.settings-nav-item')?.textContent?.includes('Privacy & Security')
+    )!;
+    expect(privacyGroup).toBeTruthy();
+    expect(privacyGroup.querySelector('.settings-nav-tree-item')!.textContent).toBe('Privacy');
     expect(screen.getByText('Multi-Factor Auth')).toBeInTheDocument();
     // "Active Sessions" and "Past Sessions" appear in both nav tree and content
     const activeSessionEls = screen.getAllByText('Active Sessions');
@@ -542,5 +546,23 @@ describe('SettingsPage', () => {
     // Also renders the Sounds and Quiet Hours sections
     const soundEls = screen.getAllByText('Sounds');
     expect(soundEls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  // ─── Sub-nav reachability from the top-level nav (#1743) ─────────────────
+
+  it('System Permissions sub-nav is reachable without first opening Privacy (#1743)', () => {
+    render(<SettingsPage />);
+    // Default pane is Appearance; the privacy sub-tree (incl. System Permissions)
+    // now renders regardless of which pane is active.
+    expect(screen.getByText('System Permissions')).toBeInTheDocument();
+  });
+
+  it('clicking the System Permissions sub-nav switches to the Privacy pane (#1743)', async () => {
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByText('System Permissions'));
+    await vi.waitFor(() => {
+      const active = document.querySelector('.settings-nav-item.active');
+      expect(active?.textContent).toContain('Privacy & Security');
+    });
   });
 });
