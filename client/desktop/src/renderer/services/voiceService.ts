@@ -1302,7 +1302,10 @@ class VoiceService {
       return;
     }
 
-    // Close old producer (does NOT stop the track)
+    // Close old producer. The track is reused below, so it MUST survive close():
+    // producers are created with stopTracks:false (the track is owned by
+    // localCameraStream), so close() does not stop it. (Without that, mediasoup
+    // close() stops the track and the produce() below throws 'track ended'.)
     producer.close();
     // Drain transport queue so stopSending SDP renegotiation finishes before produce()
     await this.drainSendTransportQueue();
@@ -1318,6 +1321,7 @@ class VoiceService {
       encodings,
       codec,
       codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(cameraBitrate) },
+      stopTracks: false,
       appData: { source: 'camera' },
     });
 
@@ -1363,7 +1367,10 @@ class VoiceService {
 
     const oldProducerId = oldProducer.id;
 
-    // Close old producer (does NOT stop the track)
+    // Close old producer. The track is reused below, so it MUST survive close():
+    // producers are created with stopTracks:false (the track is owned by
+    // localScreenStream), so close() does not stop it. (Without that, mediasoup
+    // close() stops the track and the produce() below throws 'track ended'.)
     oldProducer.close();
     // Drain transport queue so stopSending SDP renegotiation finishes before produce()
     await this.drainSendTransportQueue();
@@ -1378,6 +1385,7 @@ class VoiceService {
       encodings,
       codec,
       codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(screenBitrate) },
+      stopTracks: false,
       appData: { source: 'screen' },
     });
 
@@ -1442,6 +1450,7 @@ class VoiceService {
       const newAudioProducer = await this.sendTransport.produce({
         track: audioTrack,
         codecOptions: { opusStereo: true, opusDtx: false },
+        stopTracks: false,
         appData: { source: 'screen-audio' },
       });
       this.producers.set('screen-audio', newAudioProducer);
@@ -2342,6 +2351,10 @@ class VoiceService {
         encodings,
         codec,
         codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(cameraBitrate) },
+        // The track is owned by localCameraStream and reused across codec/layer
+        // re-produces (fastReproduceCamera). stopTracks:false keeps producer.close()
+        // from stopping it; every teardown path stops localCameraStream explicitly.
+        stopTracks: false,
         appData: { source: 'camera' },
       });
 
@@ -2475,6 +2488,9 @@ class VoiceService {
       const audioProducer = await this.sendTransport.produce({
         track: audioTracks[0],
         codecOptions: { opusStereo: true, opusDtx: false },
+        // Track owned by localScreenStream and reused across re-produces
+        // (reProduceScreenAudio); stopTracks:false keeps close() from stopping it.
+        stopTracks: false,
         appData: { source: 'screen-audio' },
       });
 
@@ -2536,6 +2552,9 @@ class VoiceService {
         encodings,
         codec,
         codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(screenBitrate) },
+        // Track owned by localScreenStream and reused across codec re-produces
+        // (fastReproduceScreen); stopTracks:false keeps close() from stopping it.
+        stopTracks: false,
         appData: { source: 'screen' },
       });
 
@@ -5116,6 +5135,20 @@ class VoiceService {
     producer.close();
     if (source) this.producers.delete(source);
     this.socket?.emit('close-producer', { producerId: producer.id });
+    // Producers are created with stopTracks:false, so producer.close() above does
+    // NOT stop the capture track. Tear down the owning capture stream explicitly so
+    // a fail-closed E2EE path never leaves the camera/mic hardware capture light on
+    // (CWE-212). Same cleanup helpers the toggle-off / leave-call paths use.
+    if (source === 'camera') this.cleanupCameraState();
+    else if (source === 'mic') this.cleanupMicState();
+    else if (source === 'screen' || source === 'screen-audio')
+      // cleanupScreenState is async (awaits the transport queue drain); this path
+      // is intentionally fire-and-forget because failClosed throws synchronously
+      // below. Attach a catch so a failing async teardown logs (PII-safe) instead
+      // of surfacing as an unhandled promise rejection.
+      void this.cleanupScreenState().catch((err) =>
+        console.error('E2EE: fail-closed screen cleanup failed:', errorMessage(err))
+      );
     throw new Error(`E2EE: failed to attach encrypt transform (${reason})`);
   }
 
