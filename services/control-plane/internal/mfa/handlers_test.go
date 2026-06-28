@@ -3193,7 +3193,14 @@ func TestWebAuthnRegisterBeginPlatform(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	assert.NotNil(t, body["publicKey"])
+	publicKey, ok := body["publicKey"].(map[string]interface{})
+	require.True(t, ok)
+	selection, ok := publicKey["authenticatorSelection"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "platform", selection["authenticatorAttachment"])
+	assert.Equal(t, "required", selection["residentKey"])
+	assert.Equal(t, true, selection["requireResidentKey"])
+	assert.Equal(t, "required", selection["userVerification"])
 }
 
 // --- WebAuthn Register Begin: Default credential name ---

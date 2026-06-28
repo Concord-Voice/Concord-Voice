@@ -825,7 +825,9 @@ func (h *Handler) WebAuthnRegisterBegin(c *gin.Context) {
 	if credType == "platform" {
 		regOpts = append(regOpts, webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
 			AuthenticatorAttachment: protocol.Platform,
-			UserVerification:        protocol.VerificationPreferred,
+			RequireResidentKey:      protocol.ResidentKeyRequired(),
+			ResidentKey:             protocol.ResidentKeyRequirementRequired,
+			UserVerification:        protocol.VerificationRequired,
 		}))
 	} else {
 		regOpts = append(regOpts, webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
