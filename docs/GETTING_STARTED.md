@@ -8,6 +8,10 @@ Concord Voice is a privacy-first, real-time voice communication platform with tw
 - **SaaS** - Cloud-hosted with freemium pricing
 - **Self-Hosted** - Licensed deployment for organizations
 
+> **Self-hosting?** Run `[internal]install-selfhost.sh` and pick a TLS mode
+> when prompted (`letsencrypt` recommended; `local` self-signed for a trusted LAN; `import`
+> for a BYO cert). Full guide: [[internal]self-hosted-tls.md](runbooks/self-hosted-tls.md).
+
 ### Key Features
 
 ✅ **Privacy-First** - No biometric ID, minimal telemetry
