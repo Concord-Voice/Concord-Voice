@@ -14,9 +14,18 @@ vi.mock('@/renderer/components/Auth/LoadingSpinner', () => ({
   default: () => <div data-testid="loading-spinner">Loading...</div>,
 }));
 
-import ProfilePage from '@/renderer/components/Profile/ProfilePage';
+// NsfwContentGate (the sibling section in AccountSection) reads age status.
+vi.mock('@/renderer/hooks/useAgeStatus', () => ({
+  useAgeStatus: () => ({ nsfwAuth: 'unknown' }),
+}));
 
-describe('ProfilePage', () => {
+import AccountSection from '@/renderer/components/Settings/AccountSection';
+
+// Profile/password form behavior, exercised through their new host AccountSection ▸
+// My Profile (#1773). Was tests/unit/components/Profile/ProfilePage.test.tsx before the
+// standalone page was removed; retained here so ProfileInfoForm + PasswordChangeForm
+// (an OWASP A07 surface) coverage does not regress during the move.
+describe('AccountSection ▸ My Profile', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useUserStore.setState({
@@ -30,51 +39,46 @@ describe('ProfilePage', () => {
     });
   });
 
-  it('renders profile page title', () => {
-    render(<ProfilePage />);
+  it('renders the My Profile section title', () => {
+    render(<AccountSection />);
     expect(screen.getByText('My Profile')).toBeInTheDocument();
   });
 
-  it('renders back button', () => {
-    render(<ProfilePage />);
-    expect(screen.getByText('Back to app')).toBeInTheDocument();
-  });
-
   it('renders profile information section', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByText('Profile Information')).toBeInTheDocument();
   });
 
   it('renders username field with value', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByText('Username')).toBeInTheDocument();
     const input = screen.getByDisplayValue('testuser');
     expect(input).toBeInTheDocument();
   });
 
   it('renders display name field with value', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByText('Display Name')).toBeInTheDocument();
     const input = screen.getByDisplayValue('Test Display');
     expect(input).toBeInTheDocument();
   });
 
   it('renders bio field with value', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByText('About')).toBeInTheDocument();
     const textarea = screen.getByDisplayValue('Test bio here');
     expect(textarea).toBeInTheDocument();
   });
 
   it('renders links section', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByText('Links')).toBeInTheDocument();
     const linkInput = screen.getByDisplayValue('https://example.com');
     expect(linkInput).toBeInTheDocument();
   });
 
   it('renders avatar upload area', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByLabelText('Upload avatar')).toBeInTheDocument();
   });
 
@@ -82,71 +86,71 @@ describe('ProfilePage', () => {
     useUserStore.setState({
       user: { ...mockUser, avatar_url: undefined, display_name: null, bio: null, links: [] },
     });
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByText('T')).toBeInTheDocument(); // First letter of "testuser"
   });
 
   it('renders password change section', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     // "Change Password" appears as h2 title AND as submit button text
     const elements = screen.getAllByText('Change Password');
     expect(elements.length).toBeGreaterThanOrEqual(2);
   });
 
   it('renders current password field', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByPlaceholderText('Enter your current password')).toBeInTheDocument();
   });
 
   it('renders new password field', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByPlaceholderText('Enter your new password')).toBeInTheDocument();
   });
 
   it('renders confirm password field', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByPlaceholderText('Confirm your new password')).toBeInTheDocument();
   });
 
   it('renders save and cancel buttons', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const saveButtons = screen.getAllByText('Save Changes');
     expect(saveButtons.length).toBeGreaterThanOrEqual(1);
   });
 
   it('shows character count for username', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     // "testuser" = 8 chars out of 32; hint includes cooldown notice
     expect(screen.getByText(/8\/32 characters/)).toBeInTheDocument();
   });
 
   it('shows character count for bio', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     // "Test bio here" = 13 chars out of 500
     expect(screen.getByText('13/500 characters')).toBeInTheDocument();
   });
 
   it('updates username on input change', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const input = screen.getByDisplayValue('testuser');
     fireEvent.change(input, { target: { value: 'newname' } });
     expect(screen.getByDisplayValue('newname')).toBeInTheDocument();
   });
 
   it('renders add link button when under max links', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByText('+ Add link')).toBeInTheDocument();
   });
 
   it('renders member since date', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const memberSince = document.querySelector('.profile-member-since');
     expect(memberSince).toBeInTheDocument();
     expect(memberSince?.textContent).toMatch(/Member since/);
   });
 
   it('adds a new link when Add Link is clicked', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     fireEvent.click(screen.getByText('+ Add link'));
     // Should now have 2 link inputs (1 existing + 1 new)
     const linkInputs = screen.getAllByPlaceholderText('https://example.com');
@@ -154,7 +158,7 @@ describe('ProfilePage', () => {
   });
 
   it('removes a link when remove button is clicked', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const removeBtn = screen.getByLabelText('Remove link');
     fireEvent.click(removeBtn);
     // Link input should be gone
@@ -162,42 +166,42 @@ describe('ProfilePage', () => {
   });
 
   it('updates display name on input change', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const input = screen.getByDisplayValue('Test Display');
     fireEvent.change(input, { target: { value: 'New Name' } });
     expect(screen.getByDisplayValue('New Name')).toBeInTheDocument();
   });
 
   it('updates bio on textarea change', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const textarea = screen.getByDisplayValue('Test bio here');
     fireEvent.change(textarea, { target: { value: 'New bio' } });
     expect(screen.getByDisplayValue('New bio')).toBeInTheDocument();
   });
 
   it('updates current password on input change', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const input = screen.getByPlaceholderText('Enter your current password');
     fireEvent.change(input, { target: { value: 'mypassword' } });
     expect(screen.getByDisplayValue('mypassword')).toBeInTheDocument();
   });
 
   it('updates new password on input change', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const input = screen.getByPlaceholderText('Enter your new password');
     fireEvent.change(input, { target: { value: 'newpass123456' } });
     expect(screen.getByDisplayValue('newpass123456')).toBeInTheDocument();
   });
 
   it('updates confirm password on input change', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const input = screen.getByPlaceholderText('Confirm your new password');
     fireEvent.change(input, { target: { value: 'newpass123456' } });
     expect(screen.getByDisplayValue('newpass123456')).toBeInTheDocument();
   });
 
   it('shows password strength indicator', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const input = screen.getByPlaceholderText('Enter your new password');
     fireEvent.change(input, { target: { value: 'newpass123456' } });
     expect(screen.getByTestId('password-strength')).toBeInTheDocument();
@@ -205,7 +209,7 @@ describe('ProfilePage', () => {
   });
 
   it('updates link value on change', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const linkInput = screen.getByDisplayValue('https://example.com');
     fireEvent.change(linkInput, { target: { value: 'https://newsite.com' } });
     expect(screen.getByDisplayValue('https://newsite.com')).toBeInTheDocument();
@@ -221,7 +225,7 @@ describe('ProfilePage', () => {
         links: [],
       },
     });
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByText('Remove avatar')).toBeInTheDocument();
   });
 
@@ -235,19 +239,19 @@ describe('ProfilePage', () => {
         links: [],
       },
     });
-    render(<ProfilePage />);
+    render(<AccountSection />);
     fireEvent.click(screen.getByText('Remove avatar'));
     // After removing, avatar initial should show
     expect(screen.getByText('T')).toBeInTheDocument();
   });
 
   it('shows links count', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByText('1/5 links')).toBeInTheDocument();
   });
 
   it('validates empty username on submit', async () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const input = screen.getByDisplayValue('testuser');
     fireEvent.change(input, { target: { value: '' } });
     // Submit the profile form
@@ -257,7 +261,7 @@ describe('ProfilePage', () => {
   });
 
   it('validates short username on submit', async () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const input = screen.getByDisplayValue('testuser');
     fireEvent.change(input, { target: { value: 'ab' } });
     const saveBtn = screen.getAllByText('Save Changes')[0];
@@ -266,7 +270,7 @@ describe('ProfilePage', () => {
   });
 
   it('validates password required fields on submit', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     // Find the password Change Password submit button (it's a button, not submit in a separate form)
     const changePwdButtons = screen.getAllByText('Change Password');
     // The last one is the submit button
@@ -276,7 +280,7 @@ describe('ProfilePage', () => {
   });
 
   it('validates password mismatch on submit', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     fireEvent.change(screen.getByPlaceholderText('Enter your current password'), {
       target: { value: 'oldpass123456' },
     });
@@ -293,7 +297,7 @@ describe('ProfilePage', () => {
   });
 
   it('validates short new password', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     fireEvent.change(screen.getByPlaceholderText('Enter your current password'), {
       target: { value: 'oldpass123456' },
     });
@@ -324,7 +328,7 @@ describe('ProfilePage', () => {
         ],
       },
     });
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.queryByText('+ Add link')).not.toBeInTheDocument();
     expect(screen.getByText('5/5 links')).toBeInTheDocument();
   });
@@ -332,12 +336,12 @@ describe('ProfilePage', () => {
   // --- Header image tests ---
 
   it('renders header image upload area', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByLabelText('Upload header image')).toBeInTheDocument();
   });
 
   it('shows placeholder text when no header image', () => {
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByText('Click to upload a banner image')).toBeInTheDocument();
   });
 
@@ -351,7 +355,7 @@ describe('ProfilePage', () => {
         links: ['https://example.com'],
       },
     });
-    render(<ProfilePage />);
+    render(<AccountSection />);
     const img = screen.getByAltText('Header preview');
     expect(img).toBeInTheDocument();
   });
@@ -366,7 +370,7 @@ describe('ProfilePage', () => {
         links: [],
       },
     });
-    render(<ProfilePage />);
+    render(<AccountSection />);
     expect(screen.getByText('Remove banner')).toBeInTheDocument();
   });
 
@@ -380,7 +384,7 @@ describe('ProfilePage', () => {
         links: [],
       },
     });
-    render(<ProfilePage />);
+    render(<AccountSection />);
     fireEvent.click(screen.getByText('Remove banner'));
     // After removing, placeholder should show
     expect(screen.getByText('Click to upload a banner image')).toBeInTheDocument();

@@ -38,8 +38,8 @@ tests/
 │   │   ├── Members/                # MemberContextMenu, MemberList, MemberProfileCard
 │   │   ├── Layout/                 # AppLayout, ChannelPanel, FolderBar, MemberFlexSpace, ServerBar
 │   │   ├── User/                   # UserPanel, UserPopover
-│   │   ├── Settings/               # SettingsPage
-│   │   ├── Profile/                # ProfilePage
+│   │   ├── Settings/               # SettingsPage, AccountSection (incl. My Profile forms), SettingsOverlayHost
+│   │   ├── Profile/                # ProfileInfoForm
 │   │   ├── MainView/               # MainView
 │   │   ├── ConnectionStatus/       # ConnectionStatus
 │   │   ├── ui/                     # ContextMenu, Modal

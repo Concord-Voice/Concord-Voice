@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useMemberStore } from '@/renderer/stores/memberStore';
 import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
+import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
 import { mockUser } from '../../../mocks/fixtures';
 
 // Mock websocketService
@@ -133,11 +134,16 @@ describe('UserPopover', () => {
     expect(img).toHaveAttribute('src', 'https://example.com/avatar.png');
   });
 
-  it('clicks My Profile and opens profile settings overlay', () => {
+  it('clicks My Profile, opens app settings and deep-links to section-profile', () => {
     useSettingsOverlayStore.setState({ open: null, payload: null });
+    useSettingsNavStore.getState().clearFocusRequest();
     render(<UserPopover {...defaultProps} />);
     fireEvent.click(screen.getByText('My Profile'));
-    expect(useSettingsOverlayStore.getState().open).toBe('profile');
+    expect(useSettingsOverlayStore.getState().open).toBe('app');
+    expect(useSettingsNavStore.getState().focusRequest).toEqual({
+      section: 'account',
+      controlId: 'section-profile',
+    });
     expect(mockOnClose).toHaveBeenCalled();
   });
 

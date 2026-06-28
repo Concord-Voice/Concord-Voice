@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useMemo } from 'react';
 import { SmilePlus } from 'lucide-react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { openProfilePage } from '../../utils/openProfilePage';
 import { useNavigate } from 'react-router-dom';
 import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
 import { UserProfile, useUserStore } from '../../stores/userStore';
@@ -207,7 +208,7 @@ const UserPopover: React.FC<UserPopoverProps> = ({
         className="user-popover-item"
         onClick={() => {
           onClose();
-          useSettingsOverlayStore.getState().openSettings('profile');
+          openProfilePage();
         }}
       >
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none">

@@ -157,7 +157,10 @@ const NAV_SUBSECTIONS: Record<string, { id: string; label: string }[]> = {
     { id: 'active-sessions', label: 'Active Sessions' },
     { id: 'past-sessions', label: 'Past Sessions' },
   ],
-  account: [{ id: 'nsfw-content', label: 'NSFW Content Access' }],
+  account: [
+    { id: 'profile', label: 'My Profile' },
+    { id: 'nsfw-content', label: 'NSFW Content Access' },
+  ],
   notifications: [
     { id: 'desktop-notifications', label: 'Desktop Notifications' },
     { id: 'notification-sounds', label: 'Sounds' },

@@ -16,4 +16,12 @@ describe('AccountSection', () => {
     expect(screen.getByText('NSFW Content Access')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /verify age/i })).toBeInTheDocument();
   });
+
+  it('renders the My Profile subsection with both forms (#1773)', () => {
+    render(<AccountSection />);
+    expect(screen.getByText('My Profile')).toBeInTheDocument();
+    expect(screen.getByText('Profile Information')).toBeInTheDocument();
+    // "Change Password" appears as the section h2 title AND the submit button.
+    expect(screen.getAllByText('Change Password').length).toBeGreaterThanOrEqual(2);
+  });
 });

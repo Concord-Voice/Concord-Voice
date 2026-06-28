@@ -6,10 +6,6 @@ vi.mock('@/renderer/components/Settings/SettingsPage', () => ({
   default: () => <div data-testid="mock-settings-page">SettingsPage</div>,
 }));
 
-vi.mock('@/renderer/components/Profile/ProfilePage', () => ({
-  default: () => <div data-testid="mock-profile-page">ProfilePage</div>,
-}));
-
 vi.mock('@/renderer/components/Servers/ServerSettingsPage', () => ({
   default: ({ serverId }: { serverId: string }) => (
     <div data-testid="mock-server-settings-page">ServerSettingsPage:{serverId}</div>
@@ -71,14 +67,6 @@ describe('SettingsOverlayHost', () => {
     });
     expect(await screen.findByTestId('mock-settings-page')).toBeInTheDocument();
     expect(getDialog().hasAttribute('open')).toBe(true);
-  });
-
-  it('renders ProfilePage when open === "profile"', async () => {
-    render(<SettingsOverlayHost />);
-    act(() => {
-      useSettingsOverlayStore.getState().openSettings('profile');
-    });
-    expect(await screen.findByTestId('mock-profile-page')).toBeInTheDocument();
   });
 
   it('renders ServerSettingsPage with serverId when open === "server"', async () => {

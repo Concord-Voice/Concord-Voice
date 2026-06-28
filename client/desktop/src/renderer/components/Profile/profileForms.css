@@ -1,50 +1,10 @@
+/* Profile editor form styles (#1773).
+   Recovered from the former Profile/ProfilePage.css when the standalone page was removed.
+   The page-chrome selectors (.profile-fullpage / .profile-page-content / .profile-page-inner /
+   .profile-back-btn / .profile-page-title) were dropped with the page; the form/avatar/header/
+   links/section rules below are still used by ProfileInfoForm + PasswordChangeForm, which now
+   render inside Settings ▸ Account ▸ My Profile. Imported by Settings/AccountSection.tsx (the new host). */
 @import '../Auth/AuthForm.css';
-
-/* Full-page profile wrapper (no sidebar) */
-.profile-fullpage {
-  background: var(--bg-primary);
-}
-
-/* Profile page content area */
-.profile-page-content {
-  flex: 1;
-  overflow-y: auto;
-  padding: 32px 48px;
-}
-
-.profile-page-inner {
-  max-width: 640px;
-  margin: 0 auto;
-}
-
-/* Back button */
-.profile-back-btn {
-  background: none;
-  border: none;
-  color: var(--text-secondary);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: calc(14px * var(--font-scale, 1));
-  font-family: 'SourceSans', sans-serif;
-  padding: 4px 0;
-  margin-bottom: 24px;
-  transition: color 0.15s ease;
-}
-
-.profile-back-btn:hover {
-  color: var(--text-primary);
-}
-
-/* Page title */
-.profile-page-title {
-  font-family: var(--font-display-stack);
-  font-size: calc(28px * var(--font-scale, 1));
-  margin-bottom: 32px;
-  color: var(--text-primary);
-}
-
 /* Section container */
 .profile-section {
   background: var(--bg-secondary);

@@ -4,14 +4,13 @@ import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
 import './SettingsOverlayHost.css';
 
 const SettingsPage = lazy(() => import('./SettingsPage'));
-const ProfilePage = lazy(() => import('../Profile/ProfilePage'));
 const ServerSettingsPage = lazy(() => import('../Servers/ServerSettingsPage'));
 
 /**
  * SettingsOverlayHost
  *
- * Renders the active "settings" surface (app settings, profile editor, or
- * server settings) as a fullscreen native <dialog> portal on top of the
+ * Renders the active "settings" surface (app settings or server settings)
+ * as a fullscreen native <dialog> portal on top of the
  * persistent chat layout. Mounted once inside AuthenticatedLayout so the
  * underlying MainView / DirectMessagesView tree is never unmounted when
  * settings open.
@@ -76,8 +75,6 @@ const SettingsOverlayHost: React.FC = () => {
   let content: React.ReactNode = null;
   if (open === 'app') {
     content = <SettingsPage />;
-  } else if (open === 'profile') {
-    content = <ProfilePage />;
   } else if (open === 'server' && payload?.serverId) {
     content = <ServerSettingsPage serverId={payload.serverId} />;
   }

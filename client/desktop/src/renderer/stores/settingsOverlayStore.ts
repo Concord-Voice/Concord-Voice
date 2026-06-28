@@ -3,15 +3,15 @@ import { createStore } from '../utils/createStore';
 /**
  * Settings Overlay Store
  *
- * Drives which "settings" surface (app settings, profile editor, server settings)
- * is rendered as a fullscreen portal overlay on top of the persistent chat layout.
+ * Drives which "settings" surface (app settings or server settings) is rendered
+ * as a fullscreen portal overlay on top of the persistent chat layout.
  *
  * Rendering settings as overlays (instead of routes that replace MainView) keeps
  * the WebSocket-bound chat tree mounted underneath, eliminating subscribe /
  * unsubscribe churn whenever the user opens settings.
  */
 
-export type SettingsOverlayKind = 'app' | 'profile' | 'server';
+export type SettingsOverlayKind = 'app' | 'server';
 
 export interface SettingsOverlayPayload {
   /** Required when kind === 'server'. */

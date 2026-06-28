@@ -17,9 +17,6 @@ vi.mock('@/renderer/components/MainView/MainView', () => ({
 vi.mock('@/renderer/components/DirectMessages/DirectMessagesView', () => ({
   default: () => <div data-testid="dm-view">DirectMessagesView</div>,
 }));
-vi.mock('@/renderer/components/Profile/ProfilePage', () => ({
-  default: () => <div data-testid="profile-page">ProfilePage</div>,
-}));
 vi.mock('@/renderer/components/Settings/SettingsPage', () => ({
   default: () => <div data-testid="settings-page">SettingsPage</div>,
 }));
