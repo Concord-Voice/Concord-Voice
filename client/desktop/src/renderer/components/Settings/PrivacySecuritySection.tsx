@@ -22,6 +22,7 @@ import ContentSafetyControls from './ContentSafetyControls';
 import SearchVisibilityControls from './SearchVisibilityControls';
 import LinkedAccountsList from './LinkedAccountsList';
 import PresenceSettingsSection from './PresenceSettingsSection';
+import ToggleSwitch from './ToggleSwitch';
 import './MFA.css';
 
 interface Session {
@@ -512,7 +513,7 @@ interface SSOToggleRowProps {
 }
 
 /**
- * One SSO-security toggle row (checkbox + warning + inline passphrase-confirm).
+ * One SSO-security toggle row (switch + warning + inline passphrase-confirm).
  * Extracted from PrivacySecuritySection (SC-2) so the two near-identical rows
  * (trust-SSO-security, disable-password-login) share one implementation and stop
  * inflating the parent's cognitive complexity. Behavior is unchanged.
@@ -531,52 +532,61 @@ const SSOToggleRow: React.FC<SSOToggleRowProps> = ({
   onToggle,
   onSubmit,
   onCancel,
-}) => (
-  <div className="sso-toggle-row">
-    <label className="sso-toggle-label">
-      <input
-        type="checkbox"
-        checked={checked}
-        onChange={(e) => onToggle(field, e.target.checked)}
-        disabled={activeField !== null && activeField !== field}
-      />
-      <span>{label}</span>
-    </label>
-    <p className="sso-toggle-warning">{warning}</p>
-    {activeField === field && (
-      <div className="sso-toggle-confirm">
-        <label htmlFor={confirmInputId}>Enter your passphrase to confirm</label>
-        <input
-          id={confirmInputId}
-          type="password"
-          value={passphrase}
-          onChange={(e) => onPassphraseChange(e.target.value)}
-          disabled={loading}
-          autoComplete="current-password"
+}) => {
+  const labelId = `sso-toggle-${field}-label`;
+  const switchId = `sso-toggle-${field}`;
+
+  return (
+    <div className="sso-toggle-row">
+      <div className="sso-toggle-label">
+        <ToggleSwitch
+          id={switchId}
+          checked={checked}
+          onChange={(nextChecked) => onToggle(field, nextChecked)}
+          disabled={activeField !== null && activeField !== field}
+          ariaLabelledBy={labelId}
+          inputRole="switch"
         />
-        {error && <p className="sso-toggle-error">{error}</p>}
-        <div className="sso-toggle-confirm-actions">
-          <button
-            type="button"
-            className="btn btn-sm btn-primary"
-            onClick={onSubmit}
-            disabled={loading || !passphrase}
-          >
-            {loading ? 'Saving...' : 'Confirm'}
-          </button>
-          <button
-            type="button"
-            className="btn btn-sm btn-secondary"
-            onClick={onCancel}
-            disabled={loading}
-          >
-            Cancel
-          </button>
-        </div>
+        <label id={labelId} htmlFor={switchId}>
+          {label}
+        </label>
       </div>
-    )}
-  </div>
-);
+      <p className="sso-toggle-warning">{warning}</p>
+      {activeField === field && (
+        <div className="sso-toggle-confirm">
+          <label htmlFor={confirmInputId}>Enter your passphrase to confirm</label>
+          <input
+            id={confirmInputId}
+            type="password"
+            value={passphrase}
+            onChange={(e) => onPassphraseChange(e.target.value)}
+            disabled={loading}
+            autoComplete="current-password"
+          />
+          {error && <p className="sso-toggle-error">{error}</p>}
+          <div className="sso-toggle-confirm-actions">
+            <button
+              type="button"
+              className="btn btn-sm btn-primary"
+              onClick={onSubmit}
+              disabled={loading || !passphrase}
+            >
+              {loading ? 'Saving...' : 'Confirm'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm btn-secondary"
+              onClick={onCancel}
+              disabled={loading}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
 
 interface SessionCardProps {
   session: Session;
@@ -762,7 +772,7 @@ const PrivacySecuritySection: React.FC = () => {
   }, [accessToken]);
 
   // Hydrate the SSO Security toggle states from GET /users/me/security so the
-  // checkboxes reflect actual server state on mount. Preserves last-known state
+  // switches reflect actual server state on mount. Preserves last-known state
   // on transient failure (helper returns `null`) rather than snapping back to
   // false, which would silently override user changes during a refetch.
   const fetchSSOSecurity = useCallback(async () => {
@@ -1370,7 +1380,8 @@ const PrivacySecuritySection: React.FC = () => {
 
       <CollapsibleSection id="section-sso-security" title="SSO Security">
         <p className="settings-section-description">
-          Manage your linked single sign-on providers and how they interact with your account.
+          Linked SSO providers can change how Concord verifies future sign-ins. Keep these settings
+          aligned with the MFA and recovery protections on your SSO provider.
         </p>
 
         <LinkedAccountsList />
@@ -1378,8 +1389,8 @@ const PrivacySecuritySection: React.FC = () => {
         <SSOToggleRow
           field="trust_sso_security"
           checked={trustSSOSecurity}
-          label="Trust SSO provider security (skip Concord MFA on SSO login)"
-          warning="Only enable this if your Google account has multi-factor authentication enabled. If your Google account is compromised, an attacker could access your Concord account without additional verification."
+          label="Trust SSO provider verification"
+          warning="Concord will skip its own MFA after a successful SSO sign-in. Only enable this if your SSO provider enforces MFA."
           confirmInputId="sso-confirm-passphrase-trust"
           activeField={ssoConfirmField}
           passphrase={ssoConfirmPassphrase}
@@ -1394,11 +1405,11 @@ const PrivacySecuritySection: React.FC = () => {
         <SSOToggleRow
           field="password_login_disabled"
           checked={passwordLoginDisabled}
-          label="Disable password login (require SSO every sign-in)"
+          label="Require SSO for sign-in"
           warning={
             passwordLoginDisabled
-              ? 'You can only sign in with your linked SSO providers. Make sure Social Recovery trustees are configured.'
-              : 'Your account will be vulnerable to password phishing.'
+              ? 'You can only sign in with your linked SSO providers. Keep recovery options configured before enabling this.'
+              : 'Password login remains available for this account.'
           }
           confirmInputId="sso-confirm-passphrase-pwlogin"
           activeField={ssoConfirmField}

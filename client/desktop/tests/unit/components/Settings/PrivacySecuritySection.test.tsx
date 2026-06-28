@@ -2905,23 +2905,21 @@ describe('PrivacySecuritySection', () => {
   });
 
   // ─── SSO Security toggles (issue #270) ─────────────────────────────
-  it('renders SSO Security section with both toggles and warnings', async () => {
+  it('renders SSO Security controls as provider-generic switches', async () => {
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByText('SSO Security')).toBeInTheDocument());
 
+    expect(screen.getByText('Trust SSO provider verification')).toBeInTheDocument();
+    expect(screen.getByText('Require SSO for sign-in')).toBeInTheDocument();
     expect(
-      screen.getByText('Trust SSO provider security (skip Concord MFA on SSO login)')
+      screen.getByText(/Only enable this if your SSO provider enforces MFA/i)
     ).toBeInTheDocument();
+    expect(screen.queryByText(/Google account/i)).not.toBeInTheDocument();
+
     expect(
-      screen.getByText('Disable password login (require SSO every sign-in)')
+      screen.getByRole('switch', { name: /Trust SSO provider verification/i })
     ).toBeInTheDocument();
-    // Risk warnings (verbatim from spec §4.20)
-    expect(
-      screen.getByText(/Only enable this if your Google account has multi-factor authentication/i)
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/Your account will be vulnerable to password phishing/i)
-    ).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: /Require SSO for sign-in/i })).toBeInTheDocument();
   });
 
   it('Trust SSO toggle reveals passphrase confirm and PATCHes on submit', async () => {
@@ -2938,11 +2936,10 @@ describe('PrivacySecuritySection', () => {
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByText('SSO Security')).toBeInTheDocument());
 
-    // Click the trust-SSO checkbox
-    const trustToggle = screen
-      .getByText('Trust SSO provider security (skip Concord MFA on SSO login)')
-      .closest('label')!
-      .querySelector('input[type="checkbox"]') as HTMLInputElement;
+    // Click the trust-SSO switch
+    const trustToggle = screen.getByRole('switch', {
+      name: /Trust SSO provider verification/i,
+    }) as HTMLInputElement;
     fireEvent.click(trustToggle);
 
     // Inline confirm UI appears
@@ -2978,10 +2975,9 @@ describe('PrivacySecuritySection', () => {
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByText('SSO Security')).toBeInTheDocument());
 
-    const pwToggle = screen
-      .getByText('Disable password login (require SSO every sign-in)')
-      .closest('label')!
-      .querySelector('input[type="checkbox"]') as HTMLInputElement;
+    const pwToggle = screen.getByRole('switch', {
+      name: /Require SSO for sign-in/i,
+    }) as HTMLInputElement;
     fireEvent.click(pwToggle);
 
     const passInput = await screen.findByLabelText(/enter your passphrase to confirm/i);
@@ -3011,14 +3007,12 @@ describe('PrivacySecuritySection', () => {
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByText('SSO Security')).toBeInTheDocument());
 
-    const trustToggle = screen
-      .getByText('Trust SSO provider security (skip Concord MFA on SSO login)')
-      .closest('label')!
-      .querySelector('input[type="checkbox"]') as HTMLInputElement;
-    const pwToggle = screen
-      .getByText('Disable password login (require SSO every sign-in)')
-      .closest('label')!
-      .querySelector('input[type="checkbox"]') as HTMLInputElement;
+    const trustToggle = screen.getByRole('switch', {
+      name: /Trust SSO provider verification/i,
+    }) as HTMLInputElement;
+    const pwToggle = screen.getByRole('switch', {
+      name: /Require SSO for sign-in/i,
+    }) as HTMLInputElement;
 
     await vi.waitFor(() => expect(trustToggle.checked).toBe(true));
     expect(pwToggle.checked).toBe(true);

@@ -7,6 +7,7 @@ interface ToggleSwitchProps {
   label?: string;
   ariaLabelledBy?: string;
   id?: string;
+  inputRole?: 'switch';
   /**
    * Forwarded onto the focusable `<input>` so a wrapping `PremiumGate` can mark a
    * locked toggle dormant WITHOUT removing it from the tab order (#1301 O1 — the
@@ -25,21 +26,24 @@ const ToggleSwitch: React.FC<ToggleSwitchProps> = ({
   label,
   ariaLabelledBy,
   id,
+  inputRole,
   'aria-disabled': ariaDisabled,
   'aria-describedby': ariaDescribedBy,
 }) => (
   <label
     className="settings-toggle"
-    {...(ariaLabelledBy
-      ? { 'aria-labelledby': ariaLabelledBy }
-      : { 'aria-label': label || 'Toggle' })}
+    aria-label={ariaLabelledBy ? undefined : label || 'Toggle'}
+    aria-labelledby={ariaLabelledBy}
   >
     <input
       type="checkbox"
+      role={inputRole}
       id={id}
       checked={checked}
       onChange={(e) => onChange(e.target.checked)}
       disabled={disabled}
+      aria-label={ariaLabelledBy ? undefined : label || 'Toggle'}
+      aria-labelledby={ariaLabelledBy}
       aria-disabled={ariaDisabled}
       aria-describedby={ariaDescribedBy}
     />
