@@ -1,5 +1,10 @@
-import { autoUpdater, type UpdateInfo, type ProgressInfo } from 'electron-updater';
-import { app, type BrowserWindow } from 'electron';
+import {
+  autoUpdater,
+  type UpdateInfo,
+  type UpdateDownloadedEvent,
+  type ProgressInfo,
+} from 'electron-updater';
+import { app, net, type BrowserWindow } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getPersistedApiBase } from './tokenManager';
@@ -7,6 +12,7 @@ import { createUpdateLogger, type UpdateLogger } from './updateLogger';
 import { prepareForUpdate } from './updateSafety';
 import { updateSplashStatus, showSplashProgress, updateSplashError } from './splashWindow';
 import { extractChain, verifyChain } from './verifyWindowsSignature';
+import { verifyLinuxArtifact, type LinuxVerifyResult } from './verifyLinuxSignature';
 
 // Check every 4 hours; delay first check 10s so it doesn't block app startup
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
@@ -78,6 +84,10 @@ let getWindow: (() => BrowserWindow | null) | null = null;
 let handlersRegistered = false;
 let logger: UpdateLogger | null = null;
 let pendingUpdateVersion: string | null = null;
+// Captured from the update-downloaded event for the Linux pre-install
+// signature gate (#653). The path to the downloaded artifact in the
+// electron-updater cache.
+let pendingDownloadedFile: string | null = null;
 
 /**
  * Returns the module logger, throwing if it has not been initialized.
@@ -196,12 +206,13 @@ function ensureUpdaterReady(): void {
     });
   });
 
-  autoUpdater.on('update-downloaded', (info: UpdateInfo) => {
-    pendingUpdateVersion = info.version;
-    requireLogger().info(`Downloaded v${info.version} — ready to install`);
+  autoUpdater.on('update-downloaded', (event: UpdateDownloadedEvent) => {
+    pendingUpdateVersion = event.version;
+    pendingDownloadedFile = event.downloadedFile;
+    requireLogger().info(`Downloaded v${event.version} — ready to install`);
     showSplashProgress(100);
     updateSplashStatus('Ready for liftoff');
-    sendToRenderer('update:downloaded', { version: info.version });
+    sendToRenderer('update:downloaded', { version: event.version });
   });
 
   autoUpdater.on('error', (error: Error) => {
@@ -328,6 +339,32 @@ export function downloadUpdate(): Promise<string[]> {
 }
 
 /**
+ * Linux-only pre-install signature gate (#653). Verifies the downloaded
+ * artifact's detached Ed25519 signature against the bundled public key.
+ * Returns a LinuxVerifyResult — `verified: true` to proceed, otherwise REFUSE.
+ * Fail-closed: a null/non-HTTPS feed or a missing downloaded path refuses with
+ * `kind: 'unavailable'` (a config/availability state, not evidence of
+ * tampering). The `.sig` is fetched from the same update feed the updater
+ * already uses; `net.fetch` rides the default session where the TLS pin lives
+ * (main.ts), so the fetch is pinned without a dedicated wrapper.
+ */
+async function verifyLinuxUpdateBeforeInstall(): Promise<LinuxVerifyResult> {
+  const apiBase = getPersistedApiBase();
+  if (!apiBase?.startsWith('https://')) {
+    return {
+      verified: false,
+      reason: 'no valid HTTPS update feed configured',
+      kind: 'unavailable',
+    };
+  }
+  if (!pendingDownloadedFile) {
+    return { verified: false, reason: 'no downloaded artifact path captured', kind: 'unavailable' };
+  }
+  const sigUrl = `${apiBase}/api/v1/updates/${path.basename(pendingDownloadedFile)}.sig`;
+  return verifyLinuxArtifact(pendingDownloadedFile, sigUrl, net.fetch);
+}
+
+/**
  * Safe quit-and-install: creates a backup + sentinel before handing off
  * to electron-updater's quitAndInstall(). If backup creation fails the
  * install is aborted and the user is notified (#384).
@@ -357,6 +394,42 @@ export async function safeQuitAndInstall(): Promise<void> {
   // atomic swap); prepareForUpdate() only writes the rollback sentinel. The old
   // wording falsely implied a backup. The sentinel log already reports
   // "(backup: none)" accurately. Linux AppImage is the only path that backs up.
+
+  // Linux has no electron-updater signature hook (verifyUpdateCodeSignature is
+  // Windows-only), so verify the downloaded artifact's detached Ed25519
+  // signature against the bundled public key here — the single install choke
+  // point — BEFORE handing off. Fail-closed: refuse on ANY verification
+  // failure. quitAndInstall() follows a successful verify with no intervening
+  // await, minimizing the verify->install TOCTOU window (spec §6, #653).
+  //
+  // The refusal is the same for both failure kinds; the kind only shapes the
+  // user message (#653 / Gitar review). A cryptographic verify-false ('tampered')
+  // is genuine evidence of an altered artifact → the security banner. An
+  // availability failure ('unavailable' — network/IO, missing `.sig`, no feed)
+  // is retryable → a non-alarming "try again" message, so a transient blip
+  // doesn't cry wolf and erode the tamper warning's credibility.
+  if (process.platform === 'linux') {
+    const result = await verifyLinuxUpdateBeforeInstall();
+    if (!result.verified) {
+      if (result.kind === 'tampered') {
+        requireLogger().error(`SECURITY: Linux update signature INVALID — ${result.reason}`);
+        updateSplashError('Update blocked: signature verification failed');
+        sendToRenderer('update:error', {
+          message: `Update blocked: ${result.reason}`,
+          securityEvent: true,
+          subtype: 'signature-failure',
+        });
+      } else {
+        requireLogger().warn(`Linux update could not be verified — ${result.reason}`);
+        updateSplashError('Update could not be verified — try again later');
+        sendToRenderer('update:error', {
+          message: `Update could not be verified right now (${result.reason}). Please try again later, or download the latest from the official Releases page.`,
+        });
+      }
+      return;
+    }
+  }
+
   logger?.info('Safety sentinel written, proceeding with quitAndInstall()');
   autoUpdater.quitAndInstall();
 }

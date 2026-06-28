@@ -13,6 +13,12 @@ export interface DesktopSource {
   appIcon: string | null; // data URL
 }
 
+// Critical update-error subtypes carried on the `update:error` IPC channel
+// (#658, #653). Intentionally narrower than the renderer's
+// UpdateCriticalErrorSubtype — `media-crypto-version` reaches the banner via a
+// different channel, not update:error.
+export type UpdateErrorSubtype = 'cert-pin-failure' | 'publisher-failure' | 'signature-failure';
+
 export type PermissionStatus =
   | 'granted'
   | 'denied'
@@ -252,7 +258,7 @@ contextBridge.exposeInMainWorld('electron', {
     callback: (error: {
       message: string;
       securityEvent?: boolean;
-      subtype?: 'cert-pin-failure' | 'publisher-failure';
+      subtype?: UpdateErrorSubtype;
     }) => void
   ) => {
     const handler = (
@@ -260,7 +266,7 @@ contextBridge.exposeInMainWorld('electron', {
       data: {
         message: string;
         securityEvent?: boolean;
-        subtype?: 'cert-pin-failure' | 'publisher-failure';
+        subtype?: UpdateErrorSubtype;
       }
     ) => callback(data);
     ipcRenderer.on('update:error', handler);
@@ -557,7 +563,7 @@ export interface ElectronAPI {
     callback: (error: {
       message: string;
       securityEvent?: boolean;
-      subtype?: 'cert-pin-failure' | 'publisher-failure';
+      subtype?: UpdateErrorSubtype;
     }) => void
   ) => () => void;
   onUpdateRollback: (

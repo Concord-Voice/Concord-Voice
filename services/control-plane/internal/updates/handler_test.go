@@ -46,6 +46,7 @@ func TestIsMetadataFile(t *testing.T) {
 	assert.False(t, isMetadataFile("ConcordVoice-0.1.4-macos-arm64.zip"))
 	assert.False(t, isMetadataFile("latest-mac.zip"))
 	assert.False(t, isMetadataFile("ConcordVoice-0.1.59-macos-arm64.zip.blockmap"))
+	assert.False(t, isMetadataFile("ConcordVoice-0.1.4-linux-x64.AppImage.sig"))
 	assert.False(t, isMetadataFile(""))
 }
 
@@ -62,6 +63,7 @@ func TestContentTypeForFile(t *testing.T) {
 		{"ConcordVoice-0.1.4-linux-x64.AppImage", "application/x-executable"},
 		{"ConcordVoice-0.1.4-windows-x64-full.nupkg", "application/octet-stream"},
 		{"ConcordVoice-0.1.59-macos-arm64.zip.blockmap", "application/octet-stream"},
+		{"ConcordVoice-0.1.4-linux-x64.AppImage.sig", "application/octet-stream"},
 		{"unknown-file.bin", "application/octet-stream"},
 	}
 	for _, tt := range tests {
@@ -176,6 +178,37 @@ func TestServeUpdateAssetServesBlockmap(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "fake-blockmap-bytes", w.Body.String())
 	assert.Equal(t, "application/octet-stream", w.Header().Get("Content-Type"))
+	assert.Equal(t, "public, max-age=86400", w.Header().Get("Cache-Control"))
+}
+
+// TestServeUpdateAssetSignatureSidecar locks the #653 (Linux update signing)
+// wire contract end-to-end (HTTP 200, application/octet-stream, 24h binary cache,
+// body round-trip) through the real ServeUpdateAsset handler for the detached
+// .sig update-signature sidecar. The .sig name is NOT in isMetadataFile's
+// allowlist and falls through contentTypeForFile's default case, so it must serve
+// as a binary with the 24h cache — NOT the 5-minute metadata cache. This test
+// prevents a future refactor from regressing that (e.g. an over-broad metadata
+// match or a new Content-Type branch).
+func TestServeUpdateAssetSignatureSidecar(t *testing.T) {
+	dir := createTestReleasesDir(t)
+	const sigName = "ConcordVoice-0.1.4-linux-x64.AppImage.sig"
+	sigBytes := make([]byte, 64)
+	for i := range sigBytes {
+		sigBytes[i] = byte(i)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, sigName), sigBytes, 0600))
+	h := newTestHandler(dir)
+	r := setupRouter(h)
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("GET", "/api/v1/updates/"+sigName, nil)
+	require.NoError(t, err)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, sigBytes, w.Body.Bytes())
+	assert.Equal(t, "application/octet-stream", w.Header().Get("Content-Type"))
+	// Binary 24h cache, NOT the 5-minute metadata cache.
 	assert.Equal(t, "public, max-age=86400", w.Header().Get("Cache-Control"))
 }
 

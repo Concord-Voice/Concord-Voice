@@ -7,12 +7,16 @@ import { createStore } from '../utils/createStore';
  * channel (#658), plus the media-frame crypto-version floor (#1878): when the
  * media-plane rejects a voice join because the room negotiated a newer frame
  * crypto version than this client can speak, the client is too old to join and
- * must update — surfaced through the same "Download the latest" banner.
+ * must update — surfaced through the same "Download the latest" banner. Also
+ * covers Linux update-signature verification failures (#653): when a downloaded
+ * Linux update fails its detached Ed25519 signature check in safeQuitAndInstall,
+ * the install is refused and surfaced through the same banner.
  */
 export type UpdateCriticalErrorSubtype =
   | 'cert-pin-failure'
   | 'publisher-failure'
-  | 'media-crypto-version';
+  | 'media-crypto-version'
+  | 'signature-failure';
 
 export interface UpdateCriticalError {
   readonly subtype: UpdateCriticalErrorSubtype;

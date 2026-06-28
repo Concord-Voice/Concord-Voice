@@ -40,15 +40,24 @@ This document describes which of those properties each platform verifies, and ho
 
 ### Linux
 
-**Not yet signature-verified. Tracked in #653.**
+**Shipped in #653.** See [ADR-0026](../adr/0026-linux-update-signing.md) for the tool-choice rationale.
 
-- **Build-time:** AppImage / deb / rpm artifacts are NOT signed.
-- **CI verification:** only the manifest SHA-512 cross-check (#644) runs — no signature verification tool.
-- **Install-time:** electron-updater verifies the SHA-512 hash declared in `latest-linux.yml`, but the manifest itself is trusted to be authentic purely on the basis of TLS transport security.
+`electron-updater` has no Linux signature hook (`verifyUpdateCodeSignature` is wired only into the Windows `NsisUpdater`), so Linux verification is **out-of-band**, at a choke point Concord owns inside its own `safeQuitAndInstall()`.
 
-**What the user is trusting on Linux today:** HTTPS + the server-side update feed. A compromise of the update server or a successful MITM with a rogue certificate would allow forged updates to install.
+- **Build-time:** each Linux artifact (`.AppImage` / `.deb` / `.rpm`, both arches) is signed in CI (`.github/workflows/build-desktop.yml` release job) with a **raw Ed25519 detached signature** — `openssl pkeyutl -sign -rawin` — producing a 64-byte `<artifact>.sig` next to each artifact. The private key is the repo-scope CI secret `LINUX_UPDATE_SIGNING_KEY`.
+- **CI verification:** the signing step self-verifies each `.sig` against the committed public key (a signing-key/bundled-key mismatch tripwire), and the existing `required_assets` asset-set gate hard-fails the release if any of the six Linux `.sig` files are missing — so an unsigned Linux Release cannot publish.
+- **Install-time:** inside `safeQuitAndInstall()` on Linux, the client fetches `<artifact>.sig` from the persisted HTTPS update feed and verifies it over the downloaded artifact bytes with one native `crypto.verify(null, …)` call against the bundled public key (`client/desktop/src/main/linuxUpdatePublicKey.ts`, via `client/desktop/src/main/verifyLinuxSignature.ts`). The verify is **fail-closed**: the only path to install is `verify → true`; a `null`/non-HTTPS feed, a missing artifact, a non-2xx `.sig` fetch, a signature not exactly 64 bytes, a `verify → false`, or any thrown exception refuses the install (identical install boundary in every case). The *message* distinguishes the cause: only a cryptographic `verify → false` — the one outcome that is genuine evidence of an altered artifact — surfaces the `signature-failure` security banner; availability failures (network/IO error, a missing or malformed `.sig`, no feed configured) refuse with a retryable non-security "couldn't verify right now" message instead, so a transient blip does not cry wolf and erode the banner's credibility. An attacker who strips/blocks the `.sig` lands in the availability path and still cannot install. electron-updater still cross-checks the `latest-linux.yml` SHA-512 at download (#644); the Ed25519 signature is the layer that defends a manifest the attacker controls.
 
-**Tracked follow-up:** #653 will add a detached-signature scheme (minisign / cosign / GPG — TBD) with the public key baked into the client bundle.
+**What the user is trusting on Linux:** the bundled Ed25519 public key. **This is the SOLE trust anchor** — it holds even with no TLS pinning, because an attacker who fully MITMs an unpinned feed (self-hosted / LAN / dev builds) controls both the artifact and its `.sig` but cannot forge a signature without the private key. TLS-layer feed pinning (#658, below) is defense-in-depth on the canonical `api.concordvoice.chat` host, not load-bearing for this guarantee.
+
+**What this defends:** a forged or tampered Linux update artifact served from a compromised feed (`/opt/concord/releases/`), a compromised GitHub Release, the public mirror, or an on-path attacker.
+
+**What this does NOT defend (by design):**
+
+- **Update freeze** — a feed-controlling attacker answering "you're up to date" (`update-not-available`) can pin a victim indefinitely to a specific signed-but-known-vulnerable build. This product rides the prerelease channel fleet-wide (`allowPrerelease` default true), so the consequence is concrete: indefinite pinning to a known-CVE *signed* build. Artifact signing provides zero mitigation. Deferred to #654 (manifest freshness / attestation).
+- **The verify→install TOCTOU residual (accepted).** The client verifies the bytes at the downloaded path, then `quitAndInstall()` independently re-reads the **same** cached path with no install-time checksum. A local process with write access to the updater cache (under user-writable `userData`) could swap the file in the gap — a wider window than the Windows model, whose verify runs inside electron-updater's install flow. Accepted because it requires a local attacker who already has `userData` write (who can compromise the app more cheaply) and is parity with the unavoidable disk-read-at-install on every platform. Mitigated by calling `quitAndInstall()` immediately after a successful verify with no intervening `await`.
+
+**Key rotation** requires shipping a new client build (the trust anchor is bundled, not fetched). See [`[internal]refresh-linux-update-key.md`](../runbooks/refresh-linux-update-key.md).
 
 ### TLS-layer feed pinning (#658)
 
@@ -129,7 +138,7 @@ Step 4 catches the concrete threat of a tampered manifest between sign and publi
 - **No SLSA-style attestation yet.** Artifacts are not accompanied by in-toto provenance signed via Sigstore OIDC. Tracked in #654 (phase-3).
 - **No certificate transparency monitoring.** We do not monitor public CT logs for the issuance of certs matching our leaf CN from CAs outside the pinned Microsoft chain. Future work.
 - **No binary transparency / Rekor publication.** Our release hashes are not published to a public transparency log. Future work, likely bundled with #654.
-- **Linux update signing deferred.** Tracked in #653.
+- **Linux update freeze + verify→install TOCTOU.** Linux update *artifact* signing shipped in #653 (see the Linux section above) — but a feed-controlling attacker can still pin a victim to a known-vulnerable *signed* build via update-freeze, and a local `userData`-write attacker has a narrow verify→install swap window. Both are accepted residuals; freeze defense is deferred to #654 (manifest freshness / attestation).
 - **Chain validity is asserted at the leaf, not walked end-to-end by our hook.** `verifyWindowsSignature.ts` requires `Get-AuthenticodeSignature` to return `Status = Valid` on the downloaded installer — that status already covers signature integrity, root-of-trust chaining, expiry (including timestamp validity), and revocation via the Windows certificate store. On top of that, our hook inspects chain _structure_ to enforce the leaf CN allow-list and issuer-prefix pin. We do not separately walk or re-validate each intermediate; we trust the OS-level chain build that produced the `Valid` status. If that upstream check is ever bypassed, our structural checks alone would not detect a revoked or untrusted intermediate.
 
 ## Related documents

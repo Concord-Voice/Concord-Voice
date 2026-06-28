@@ -33,6 +33,11 @@ const COPY_BY_SUBTYPE: Record<UpdateCriticalErrorSubtype, { headline: string; co
       'Your app is out of date — this voice call uses a newer encryption format your version cannot join. Update to rejoin.',
     confirm: 'I understand I must update Concord to join encrypted voice calls.',
   },
+  'signature-failure': {
+    headline:
+      "Update blocked — this update's signature couldn't be verified, so it wasn't installed. This protects you from tampered updates.",
+    confirm: 'I understand Concord could not verify this update and I will reinstall manually.',
+  },
 };
 
 /**

@@ -24,6 +24,8 @@ const mockLogger = vi.hoisted(() => ({
   getLogPath: vi.fn().mockReturnValue('/tmp/test-update.log'),
 }));
 
+const mockVerifyLinuxArtifact = vi.hoisted(() => vi.fn());
+
 vi.mock('electron-updater', () => ({
   autoUpdater: mockAutoUpdater,
 }));
@@ -35,6 +37,11 @@ vi.mock('electron', () => ({
     isPackaged: true,
   },
   BrowserWindow: vi.fn(),
+  net: { fetch: vi.fn() },
+}));
+
+vi.mock('../../../src/main/verifyLinuxSignature', () => ({
+  verifyLinuxArtifact: mockVerifyLinuxArtifact,
 }));
 
 vi.mock('node:fs', () => ({
@@ -366,6 +373,146 @@ describe('updater', () => {
       await expect(updater.forceCheckForUpdates('attestation_required')).rejects.toThrow(
         'feed unreachable'
       );
+    });
+  });
+
+  describe('Linux signature gate (#653)', () => {
+    let originalPlatform: PropertyDescriptor | undefined;
+    const mockSend = vi.fn();
+    const mockWindow = {
+      isDestroyed: () => false,
+      webContents: { send: mockSend },
+    } as unknown as import('electron').BrowserWindow;
+
+    beforeEach(async () => {
+      vi.clearAllMocks();
+      vi.resetModules();
+      mockSend.mockClear();
+      originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+      const tm = await import('../../../src/main/tokenManager');
+      vi.mocked(tm.getPersistedApiBase).mockReturnValue('https://api.concordvoice.chat');
+    });
+
+    afterEach(() => {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+    });
+
+    function setPlatform(p: NodeJS.Platform): void {
+      Object.defineProperty(process, 'platform', { value: p, configurable: true });
+    }
+
+    /** Arm a downloaded update (sets pendingUpdateVersion + pendingDownloadedFile). */
+    function armDownloaded(downloadedFile: string | undefined): void {
+      const call = mockAutoUpdater.on.mock.calls.find(
+        (c: unknown[]) => c[0] === 'update-downloaded'
+      );
+      if (!call) throw new Error("no 'update-downloaded' handler registered");
+      (call[1] as (e: unknown) => void)({ version: '2.0.0', downloadedFile });
+    }
+
+    it('refuses install + shows the security banner on a TAMPERED signature (linux)', async () => {
+      setPlatform('linux');
+      mockVerifyLinuxArtifact.mockResolvedValue({
+        verified: false,
+        reason: 'signature does not verify',
+        kind: 'tampered',
+      });
+      const updater = await import('../../../src/main/updater');
+      updater.initAutoUpdater(() => mockWindow);
+      armDownloaded('/tmp/cache/ConcordVoice-2.0.0-linux-x64.AppImage');
+
+      await updater.safeQuitAndInstall();
+
+      expect(mockVerifyLinuxArtifact).toHaveBeenCalledOnce();
+      expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
+      expect(mockSend).toHaveBeenCalledWith(
+        'update:error',
+        expect.objectContaining({ securityEvent: true, subtype: 'signature-failure' })
+      );
+    });
+
+    it('refuses install with a retryable, NON-security message when UNAVAILABLE (linux)', async () => {
+      setPlatform('linux');
+      mockVerifyLinuxArtifact.mockResolvedValue({
+        verified: false,
+        reason: 'signature fetch failed: HTTP 503',
+        kind: 'unavailable',
+      });
+      const updater = await import('../../../src/main/updater');
+      updater.initAutoUpdater(() => mockWindow);
+      armDownloaded('/tmp/cache/ConcordVoice-2.0.0-linux-x64.AppImage');
+
+      await updater.safeQuitAndInstall();
+
+      expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
+      // update:error IS dispatched, but NOT as a security event — a transient
+      // blip must not raise the tamper banner (#653 / Gitar review).
+      const errorCalls = mockSend.mock.calls.filter((c) => c[0] === 'update:error');
+      expect(errorCalls.length).toBeGreaterThan(0);
+      for (const [, payload] of errorCalls) {
+        expect((payload as { securityEvent?: boolean }).securityEvent).not.toBe(true);
+        expect((payload as { subtype?: string }).subtype).not.toBe('signature-failure');
+      }
+    });
+
+    it('derives the .sig URL from the downloaded artifact basename (linux)', async () => {
+      setPlatform('linux');
+      mockVerifyLinuxArtifact.mockResolvedValue({ verified: true });
+      const updater = await import('../../../src/main/updater');
+      updater.initAutoUpdater(() => mockWindow);
+      armDownloaded('/tmp/cache/ConcordVoice-2.0.0-linux-x64.AppImage');
+
+      await updater.safeQuitAndInstall();
+
+      expect(mockVerifyLinuxArtifact).toHaveBeenCalledWith(
+        '/tmp/cache/ConcordVoice-2.0.0-linux-x64.AppImage',
+        'https://api.concordvoice.chat/api/v1/updates/ConcordVoice-2.0.0-linux-x64.AppImage.sig',
+        expect.any(Function)
+      );
+      expect(mockAutoUpdater.quitAndInstall).toHaveBeenCalledOnce();
+    });
+
+    it('fail-closed (refuse) when no downloaded path was captured — unavailable, not tamper (linux)', async () => {
+      setPlatform('linux');
+      const updater = await import('../../../src/main/updater');
+      updater.initAutoUpdater(() => mockWindow);
+      armDownloaded(undefined);
+
+      await updater.safeQuitAndInstall();
+
+      // A missing path is a config/availability state, not evidence of
+      // tampering: refuse without calling the verifier and without the banner.
+      expect(mockVerifyLinuxArtifact).not.toHaveBeenCalled();
+      expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
+      const errorCalls = mockSend.mock.calls.filter((c) => c[0] === 'update:error');
+      expect(errorCalls.length).toBeGreaterThan(0);
+      for (const [, payload] of errorCalls) {
+        expect((payload as { securityEvent?: boolean }).securityEvent).not.toBe(true);
+      }
+    });
+
+    it('does NOT verify on darwin (mac path unchanged)', async () => {
+      setPlatform('darwin');
+      const updater = await import('../../../src/main/updater');
+      updater.initAutoUpdater(() => mockWindow);
+      armDownloaded('/tmp/cache/ConcordVoice-2.0.0-macos.zip');
+
+      await updater.safeQuitAndInstall();
+
+      expect(mockVerifyLinuxArtifact).not.toHaveBeenCalled();
+      expect(mockAutoUpdater.quitAndInstall).toHaveBeenCalledOnce();
+    });
+
+    it('does NOT verify on win32 (windows path unchanged)', async () => {
+      setPlatform('win32');
+      const updater = await import('../../../src/main/updater');
+      updater.initAutoUpdater(() => mockWindow);
+      armDownloaded('C:/cache/ConcordVoice-2.0.0-windows-x64-Setup.exe');
+
+      await updater.safeQuitAndInstall();
+
+      expect(mockVerifyLinuxArtifact).not.toHaveBeenCalled();
+      expect(mockAutoUpdater.quitAndInstall).toHaveBeenCalledOnce();
     });
   });
 });
