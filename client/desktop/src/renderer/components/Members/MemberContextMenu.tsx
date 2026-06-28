@@ -1,15 +1,31 @@
 import React, { useEffect, useState } from 'react';
+import { Clock, TimerOff } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { ServerMember, useMemberStore } from '../../stores/memberStore';
 import { usePermissionStore } from '../../stores/permissionStore';
 import { useDMStore } from '../../stores/dmStore';
 import { useUserStore } from '../../stores/userStore';
 import { useVoiceStore } from '../../stores/voiceStore';
-import { Permissions, MUTE_MEMBERS, DEAFEN_MEMBERS } from '../../utils/permissions';
+import {
+  Permissions,
+  MUTE_MEMBERS,
+  DEAFEN_MEMBERS,
+  TIMEOUT_MEMBERS,
+} from '../../utils/permissions';
 import ContextMenu from '../ui/ContextMenu';
 import { errorMessage } from '../../utils/redactError';
 import { EnforcementMenuItems } from '../ui/EnforcementMenuItems';
 import { useFriendRequestState } from '../../hooks/useFriendRequestState';
+import { apiFetch, safeJson } from '../../services/apiClient';
+
+const TIMEOUT_DURATIONS = [
+  { label: '1 minute', seconds: 60 },
+  { label: '5 minutes', seconds: 300 },
+  { label: '10 minutes', seconds: 600 },
+  { label: '1 hour', seconds: 3600 },
+  { label: '1 day', seconds: 86400 },
+  { label: '1 week', seconds: 604800 },
+] as const;
 
 interface MemberContextMenuProps {
   member: ServerMember;
@@ -34,7 +50,11 @@ const MemberContextMenu: React.FC<MemberContextMenuProps> = ({
 }) => {
   const [showRolePicker, setShowRolePicker] = useState(false);
   const [rolePickerClosing, setRolePickerClosing] = useState(false);
+  const [showTimeoutPicker, setShowTimeoutPicker] = useState(false);
+  const [timeoutPickerClosing, setTimeoutPickerClosing] = useState(false);
   const [togglingRoleId, setTogglingRoleId] = useState<string | null>(null);
+  const [timeoutActionPending, setTimeoutActionPending] = useState(false);
+  const [renderedAtMs] = useState(() => Date.now());
 
   const navigate = useNavigate();
   const currentUserId = useUserStore((s) => s.user?.id);
@@ -60,6 +80,10 @@ const MemberContextMenu: React.FC<MemberContextMenuProps> = ({
   const canKick = hasServerPerm(serverId, Permissions.KICK) && !targetIsOwner && !isSelf;
   const canMute = hasServerPerm(serverId, MUTE_MEMBERS) && !targetIsOwner && !isSelf;
   const canDeafen = hasServerPerm(serverId, DEAFEN_MEMBERS) && !targetIsOwner && !isSelf;
+  const canTimeout = hasServerPerm(serverId, TIMEOUT_MEMBERS) && !targetIsOwner && !isSelf;
+  const isTimedOut = Boolean(
+    member.timed_out_until && new Date(member.timed_out_until).getTime() > renderedAtMs
+  );
 
   // Check if target is currently in a voice channel on this server
   const channelVoiceMembers = useVoiceStore((s) => s.channelVoiceMembers);
@@ -122,6 +146,62 @@ const MemberContextMenu: React.FC<MemberContextMenuProps> = ({
     // feedback lives on the profile-card surface, not the transient menu.
     void friendReq.send();
     onClose();
+  };
+
+  const toggleTimeoutPicker = () => {
+    if (showTimeoutPicker) {
+      setTimeoutPickerClosing(true);
+      setTimeout(() => {
+        setShowTimeoutPicker(false);
+        setTimeoutPickerClosing(false);
+      }, 150);
+    } else {
+      setShowTimeoutPicker(true);
+    }
+  };
+
+  const applyTimeout = async (durationSeconds: number) => {
+    if (timeoutActionPending) return;
+    setTimeoutActionPending(true);
+    try {
+      const res = await apiFetch(
+        '/api/v1/servers/' + serverId + '/members/' + member.user_id + '/timeout',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ duration_seconds: durationSeconds }),
+        }
+      );
+      const data = await safeJson<{ error?: string; timed_out_until?: string }>(res);
+      if (!res.ok) throw new Error(data.error || 'Failed to timeout member');
+      useMemberStore.getState().setMemberTimeout(member.user_id, data.timed_out_until ?? null);
+      onClose();
+    } catch (error) {
+      console.error('Failed to timeout member:', errorMessage(error));
+    } finally {
+      setTimeoutActionPending(false);
+    }
+  };
+
+  const removeTimeout = async () => {
+    if (timeoutActionPending) return;
+    setTimeoutActionPending(true);
+    try {
+      const res = await apiFetch(
+        '/api/v1/servers/' + serverId + '/members/' + member.user_id + '/timeout',
+        {
+          method: 'DELETE',
+        }
+      );
+      const data = await safeJson<{ error?: string }>(res);
+      if (!res.ok) throw new Error(data.error || 'Failed to remove timeout');
+      useMemberStore.getState().setMemberTimeout(member.user_id, null);
+      onClose();
+    } catch (error) {
+      console.error('Failed to remove timeout:', errorMessage(error));
+    } finally {
+      setTimeoutActionPending(false);
+    }
   };
 
   return (
@@ -309,6 +389,46 @@ const MemberContextMenu: React.FC<MemberContextMenuProps> = ({
           }}
           onClose={onClose}
         />
+      )}
+
+      {/* Timeout controls require TIMEOUT_MEMBERS and are hidden for owner/self */}
+      {canTimeout && (
+        <>
+          <ContextMenu.Separator />
+          <div className="ctx-menu-item-wrapper">
+            <ContextMenu.Item
+              icon={<Clock size={16} />}
+              label={timeoutActionPending ? 'Updating...' : 'Timeout'}
+              disabled={timeoutActionPending}
+              hasSubMenu
+              onClick={toggleTimeoutPicker}
+            />
+            {showTimeoutPicker && !timeoutActionPending && (
+              <ContextMenu.SubMenu closing={timeoutPickerClosing}>
+                {TIMEOUT_DURATIONS.map((duration) => (
+                  <ContextMenu.Item
+                    key={duration.seconds}
+                    icon={<span style={{ width: 16 }} />}
+                    label={duration.label}
+                    onClick={() => {
+                      void applyTimeout(duration.seconds);
+                    }}
+                  />
+                ))}
+              </ContextMenu.SubMenu>
+            )}
+          </div>
+          {isTimedOut && (
+            <ContextMenu.Item
+              icon={<TimerOff size={16} />}
+              label="Remove Timeout"
+              disabled={timeoutActionPending}
+              onClick={() => {
+                void removeTimeout();
+              }}
+            />
+          )}
+        </>
       )}
 
       {/* Danger zone separator */}

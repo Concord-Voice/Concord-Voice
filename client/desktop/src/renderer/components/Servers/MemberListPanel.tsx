@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { createPortal } from 'react-dom';
-import { MicOff, HeadphoneOff, Lock } from 'lucide-react';
+import { MicOff, HeadphoneOff, Lock, Clock } from 'lucide-react';
 import { useMemberStore, type ServerMember } from '../../stores/memberStore';
 import type { Role } from '../../types/server';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
@@ -163,6 +163,7 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
   const [fullProfileUserId, setFullProfileUserId] = useState<string | null>(null);
   const [banTarget, setBanTarget] = useState<ServerMember | null>(null);
   const [kickTarget, setKickTarget] = useState<ServerMember | null>(null);
+  const [renderedAtMs] = useState(() => Date.now());
 
   const fullProfileMemberData = fullProfileUserId
     ? (members.find((m) => m.user_id === fullProfileUserId) ?? null)
@@ -200,6 +201,10 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
             (role) => !member.roles.some((r) => r.role_id === role.id)
           );
           const initial = (member.display_name || member.username).charAt(0).toUpperCase();
+          const timedOutUntilMs = member.timed_out_until
+            ? new Date(member.timed_out_until).getTime()
+            : 0;
+          const isTimedOut = Number.isFinite(timedOutUntilMs) && timedOutUntilMs > renderedAtMs;
 
           return (
             <li
@@ -243,6 +248,14 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
                     <span className="member-enforcement-badge" title="Server Muted">
                       <MicOff size={14} />
                       <Lock size={8} className="enforcement-lock-badge" />
+                    </span>
+                  )}
+                  {isTimedOut && (
+                    <span
+                      className="member-enforcement-badge member-enforcement-badge--timeout"
+                      title="Timed Out"
+                    >
+                      <Clock size={14} />
                     </span>
                   )}
                   {member.display_name && (

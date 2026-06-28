@@ -332,6 +332,36 @@
   margin-left: 4px;
 }
 
+.member-enforcement-badge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-left: 6px;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  vertical-align: middle;
+}
+
+.member-enforcement-badge--timeout {
+  color: #fde68a;
+  background: #78350f;
+  border-color: #b45309;
+}
+
+.enforcement-lock-badge {
+  position: absolute;
+  right: 1px;
+  bottom: 1px;
+  color: currentColor;
+  background: var(--bg-primary);
+  border-radius: 50%;
+}
+
 .role-badge {
   padding: 2px 8px;
   border-radius: 10px;

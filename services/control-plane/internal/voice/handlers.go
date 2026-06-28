@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -175,12 +176,13 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 	// Fetch channel details + verify membership in one query
 	var channelName, channelType, serverID string
 	var audioQualityTier *string
+	var timedOutUntil sql.NullTime
 	err := h.db.QueryRow(`
-		SELECT c.id, c.name, c.type, c.server_id, c.audio_quality_tier
+		SELECT c.id, c.name, c.type, c.server_id, c.audio_quality_tier, sm.timed_out_until
 		FROM channels c
 		INNER JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = $2
 		WHERE c.id = $1
-	`, channelID, userID).Scan(&channelID, &channelName, &channelType, &serverID, &audioQualityTier)
+	`, channelID, userID).Scan(&channelID, &channelName, &channelType, &serverID, &audioQualityTier, &timedOutUntil)
 
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Channel not found or access denied"})
@@ -205,6 +207,14 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 	}
 	if !hasPerm {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return
+	}
+	if timedOutUntil.Valid && timedOutUntil.Time.After(time.Now().UTC()) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":           "Member is timed out",
+			"code":            "member_timed_out",
+			"timed_out_until": timedOutUntil.Time,
+		})
 		return
 	}
 

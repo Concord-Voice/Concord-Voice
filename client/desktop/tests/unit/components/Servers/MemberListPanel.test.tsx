@@ -376,6 +376,19 @@ describe('MemberListPanel', () => {
     expect(screen.queryByTitle('Server Deafened')).not.toBeInTheDocument();
   });
 
+  it('shows Timed Out badge while timed_out_until is in the future', () => {
+    const members: ServerMember[] = [
+      {
+        ...mockMembers[0],
+        timed_out_until: '2999-01-01T00:00:00.000Z',
+      },
+    ];
+    render(<MemberListPanel {...defaultProps} members={members} />);
+    const badge = screen.getByTitle('Timed Out');
+    expect(badge).toBeInTheDocument();
+    expect(badge).toHaveClass('member-enforcement-badge--timeout');
+  });
+
   // ── Context menu (right-click) ──
 
   it('right-click on a member row opens the context menu', () => {

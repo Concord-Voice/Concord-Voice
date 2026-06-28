@@ -695,6 +695,43 @@ const (
 	channelAuthCtxTimeout       = 3 * time.Second
 )
 
+func (h *Hub) rejectActiveMemberTimeout(msg IncomingMessage, serverID, userID uuid.UUID) bool {
+	if h.db == nil {
+		return false
+	}
+
+	var timedOutUntil sql.NullTime
+	err := h.db.QueryRow(
+		"SELECT timed_out_until FROM server_members WHERE server_id = $1 AND user_id = $2",
+		serverID, userID,
+	).Scan(&timedOutUntil)
+	if err != nil {
+		log.Printf("Failed to check member timeout: %v", err)
+		h.sendError(msg.ClientID, "Failed to verify timeout status")
+		return true
+	}
+	if !timedOutUntil.Valid || !timedOutUntil.Time.After(time.Now().UTC()) {
+		return false
+	}
+
+	h.sendErrorWithData(msg.ClientID, "member_timed_out", map[string]interface{}{
+		keyMessage:        "Member is timed out",
+		"timed_out_until": timedOutUntil.Time,
+	})
+	return true
+}
+
+func (h *Hub) authorizeMessageSend(msg IncomingMessage, userID uuid.UUID, chCtx *channelContext, channelUUID uuid.UUID, viewPerm int64) bool {
+	denied := "Not authorized to send messages in this channel"
+	if !h.authorizeChannelPermission(msg, userID, chCtx, channelUUID, viewPerm, denied) {
+		return false
+	}
+	if !h.authorizeChannelPermission(msg, userID, chCtx, channelUUID, permSendMessages, denied) {
+		return false
+	}
+	return !h.rejectActiveMemberTimeout(msg, chCtx.serverUUID, userID)
+}
+
 func (h *Hub) authorizeChannelPermission(
 	msg IncomingMessage,
 	userID uuid.UUID,
@@ -1777,10 +1814,10 @@ func (h *Hub) handleMessage(msg IncomingMessage) {
 		return
 	}
 	viewPerm, ok := chCtx.viewPermission()
-	if !ok || !h.authorizeChannelPermission(msg, client.UserID, chCtx, channelUUID, viewPerm, "Not authorized to send messages in this channel") {
+	if !ok {
 		return
 	}
-	if !h.authorizeChannelPermission(msg, client.UserID, chCtx, channelUUID, permSendMessages, "Not authorized to send messages in this channel") {
+	if !h.authorizeMessageSend(msg, client.UserID, chCtx, channelUUID, viewPerm) {
 		return
 	}
 

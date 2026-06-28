@@ -923,6 +923,15 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       }
     });
 
+    // Member timeout changed; msg.data narrowed to MemberTimeoutPayload.
+    const unsubMemberTimeout = wsService.on('member_timeout', (msg) => {
+      const { server_id: serverId, user_id: userId, timed_out_until: timedOutUntil } = msg.data;
+      const activeServerId = useServerStore.getState().activeServerId;
+      if (serverId === activeServerId) {
+        useMemberStore.getState().setMemberTimeout(userId, timedOutUntil ?? null);
+      }
+    });
+
     // Lightweight unread notification handler — from server subscription
     const unsubUnreadNotify = wsService.on('unread_notify', (msg) => {
       handleUnreadNotify(msg);
@@ -1699,6 +1708,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       unsubChannelsReordered();
       unsubServerDeleted();
       unsubMemberRemoved();
+      unsubMemberTimeout();
       unsubUnreadNotify();
       unsubKeyNeeded();
       unsubKeyRevocation();

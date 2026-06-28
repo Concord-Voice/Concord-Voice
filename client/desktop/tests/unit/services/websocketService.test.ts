@@ -97,6 +97,7 @@ describe('WebSocketService', () => {
 
   afterEach(() => {
     service.disconnect();
+    vi.restoreAllMocks();
     vi.useRealTimers();
     globalThis.fetch = originalFetch;
   });
@@ -156,6 +157,7 @@ describe('WebSocketService', () => {
     });
 
     it('refuses to connect when the ticket contains URL-control characters', async () => {
+      vi.spyOn(Math, 'random').mockReturnValue(0.5);
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: () => Promise.resolve({ ticket: 'foo&secondary=hijack' }),
@@ -168,6 +170,7 @@ describe('WebSocketService', () => {
     });
 
     it('refuses to connect when the ticket is oversized', async () => {
+      vi.spyOn(Math, 'random').mockReturnValue(0.5);
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: () => Promise.resolve({ ticket: 'a'.repeat(5000) }),

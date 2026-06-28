@@ -955,7 +955,7 @@ export const RichPresenceClearSchema = z.object({
   }),
 });
 
-// ──────────── Channel + server lifecycle (12 events) — Task A8 ────────
+// ──────────── Channel + server lifecycle (13 events) — Task A8 ────────
 
 /**
  * `member_joined` — user joined server via invite.
@@ -985,6 +985,19 @@ export const MemberRemovedSchema = z.object({
     server_id: UUID,
     user_id: UUID,
     reason: z.string().optional(),
+  }),
+});
+
+/**
+ * member_timeout: server member timeout set or cleared. timed_out_until is null when cleared.
+ * Server emitter: services/control-plane/internal/members/handlers.go timeout endpoints.
+ */
+export const MemberTimeoutSchema = z.object({
+  type: z.literal('member_timeout'),
+  data: z.object({
+    server_id: UUID,
+    user_id: UUID,
+    timed_out_until: ISOTimestamp.nullable().optional(),
   }),
 });
 
@@ -1379,9 +1392,10 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   RichPresenceUpdateSchema,
   RichPresenceClearSchema,
 
-  // Channel + server lifecycle (12)
+  // Channel + server lifecycle (13)
   MemberJoinedSchema,
   MemberRemovedSchema,
+  MemberTimeoutSchema,
   ServerUpdatedSchema,
   ServerDeletedSchema,
   ChannelUpdatedSchema,
@@ -1482,6 +1496,7 @@ export type CustomTextPresencePayload = z.infer<typeof CustomTextPresencePayload
 // Channel + server lifecycle
 export type MemberJoinedPayload = z.infer<typeof MemberJoinedSchema>['data'];
 export type MemberRemovedPayload = z.infer<typeof MemberRemovedSchema>['data'];
+export type MemberTimeoutPayload = z.infer<typeof MemberTimeoutSchema>['data'];
 export type ServerUpdatedPayload = z.infer<typeof ServerUpdatedSchema>['data'];
 export type ServerDeletedPayload = z.infer<typeof ServerDeletedSchema>['data'];
 export type ChannelUpdatedPayload = z.infer<typeof ChannelUpdatedSchema>['data'];

@@ -25,6 +25,7 @@ func TestPermissionHasAdministratorBypass(t *testing.T) {
 	assert.True(t, perms.Has(PermManageServer))
 	assert.True(t, perms.Has(PermBan))
 	assert.True(t, perms.Has(PermManageCryptoRotation))
+	assert.True(t, perms.Has(PermTimeoutMembers))
 }
 
 func TestPermissionAdd(t *testing.T) {
@@ -77,6 +78,7 @@ func TestBasePermissionsContainsExpected(t *testing.T) {
 	assert.False(t, BasePermissions.Has(PermManageServer))
 	assert.False(t, BasePermissions.Has(PermMentionEveryone))
 	assert.False(t, BasePermissions.Has(PermManageDevResources))
+	assert.False(t, BasePermissions.Has(PermTimeoutMembers))
 }
 
 func TestModeratorPermissionsExtendsBase(t *testing.T) {
@@ -89,6 +91,7 @@ func TestModeratorPermissionsExtendsBase(t *testing.T) {
 	assert.True(t, ModeratorPermissions.Has(PermManageAllMessages))
 	assert.True(t, ModeratorPermissions.Has(PermKick))
 	assert.True(t, ModeratorPermissions.Has(PermMuteMembers))
+	assert.True(t, ModeratorPermissions.Has(PermTimeoutMembers))
 }
 
 func TestAdminPermissionsExtendsModerator(t *testing.T) {
@@ -116,7 +119,7 @@ func TestPermissionNamesAllMapped(t *testing.T) {
 		PermViewTextChannels, PermViewVoiceChannels, PermSendMessages, PermReadMessageHistory, PermManageOwnMessages,
 		PermManageAllMessages, PermPinMessages, PermJoinVoice, PermSpeak, PermMuteMembers, PermDeafenMembers,
 		PermMoveMembers, PermScreenShare, PermAttachFiles, PermUseExternalEmoji,
-		PermMentionEveryone, PermMentionRoles, PermMentionUsers, PermManageDevResources, PermVideo, PermAdministrator,
+		PermMentionEveryone, PermMentionRoles, PermMentionUsers, PermManageDevResources, PermVideo, PermTimeoutMembers, PermAdministrator,
 	}
 
 	for _, perm := range allPerms {
@@ -134,7 +137,7 @@ func TestPermissionNoBitOverlap(t *testing.T) {
 		PermViewTextChannels, PermViewVoiceChannels, PermSendMessages, PermReadMessageHistory, PermManageOwnMessages,
 		PermManageAllMessages, PermPinMessages, PermJoinVoice, PermSpeak, PermMuteMembers, PermDeafenMembers,
 		PermMoveMembers, PermScreenShare, PermAttachFiles, PermUseExternalEmoji,
-		PermMentionEveryone, PermMentionRoles, PermMentionUsers, PermManageDevResources, PermVideo, PermAdministrator,
+		PermMentionEveryone, PermMentionRoles, PermMentionUsers, PermManageDevResources, PermVideo, PermTimeoutMembers, PermAdministrator,
 	}
 
 	for i := 0; i < len(allPerms); i++ {

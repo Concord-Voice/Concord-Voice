@@ -230,6 +230,15 @@ describe('memberStore', () => {
       expect(member?.server_muted).toBe(true);
       expect(member?.server_deafened).toBe(false);
     });
+
+    it('updates and clears timed_out_until for existing members', () => {
+      useMemberStore.getState().addMember(mockMember);
+      useMemberStore.getState().setMemberTimeout('user-1', '2026-06-28T12:00:00Z');
+      expect(useMemberStore.getState().members[0].timed_out_until).toBe('2026-06-28T12:00:00Z');
+
+      useMemberStore.getState().setMemberTimeout('user-1', null);
+      expect(useMemberStore.getState().members[0].timed_out_until).toBeNull();
+    });
   });
 
   describe('clearMembers', () => {

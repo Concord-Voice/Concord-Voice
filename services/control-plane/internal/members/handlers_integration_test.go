@@ -28,6 +28,10 @@ func memberPath(serverID, userID string) string {
 	return fmt.Sprintf("/api/v1/servers/%s/members/%s", serverID, userID)
 }
 
+func timeoutPath(serverID, userID string) string {
+	return fmt.Sprintf("/api/v1/servers/%s/members/%s/timeout", serverID, userID)
+}
+
 func banPath(serverID, userID string) string {
 	return fmt.Sprintf("/api/v1/servers/%s/bans/%s", serverID, userID)
 }
@@ -971,6 +975,203 @@ func TestUpdateMemberMissingBody(t *testing.T) {
 
 	w := ts.DoRequest("PATCH", memberPath(serverID, member.ID), nil, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// -- TimeoutMember -------------------------------------------------------------
+
+func TestTimeoutMemberSuccess(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "timeoutown")
+	member := ts.CreateTestUser(t, "timeoutmem")
+
+	serverID := ts.CreateTestServer(t, owner.ID, "TimeoutServer")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+	w := ts.DoRequest("POST", timeoutPath(serverID, member.ID), map[string]interface{}{
+		"duration_seconds": 300,
+		"reason":           "cool down",
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Member timed out", body["message"])
+	assert.Equal(t, member.ID, body["user_id"])
+	assert.NotEmpty(t, body["timed_out_until"])
+
+	w = ts.DoRequest("GET", membersPath(serverID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	testhelpers.ParseJSON(t, w, &body)
+	members := body["members"].([]interface{})
+	found := false
+	for _, raw := range members {
+		m := raw.(map[string]interface{})
+		if m["user_id"] == member.ID {
+			found = true
+			assert.NotEmpty(t, m["timed_out_until"])
+		}
+	}
+	assert.True(t, found, "timed-out member should be in member list")
+}
+
+func TestRemoveTimeoutSuccess(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "untimeoutown")
+	member := ts.CreateTestUser(t, "untimeoutmem")
+
+	serverID := ts.CreateTestServer(t, owner.ID, "RemoveTimeoutServer")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	_, err := ts.DB.Exec("UPDATE server_members SET timed_out_until = NOW() + INTERVAL '1 hour' WHERE server_id = $1 AND user_id = $2", serverID, member.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("DELETE", timeoutPath(serverID, member.ID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var cleared bool
+	err = ts.DB.QueryRow("SELECT timed_out_until IS NULL FROM server_members WHERE server_id = $1 AND user_id = $2", serverID, member.ID).Scan(&cleared)
+	require.NoError(t, err)
+	assert.True(t, cleared)
+}
+
+func TestTimeoutMemberDurationBounds(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "timeoutboundsown")
+	member := ts.CreateTestUser(t, "timeoutboundsmem")
+
+	serverID := ts.CreateTestServer(t, owner.ID, "TimeoutBoundsServer")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+	w := ts.DoRequest("POST", timeoutPath(serverID, member.ID), map[string]interface{}{
+		"duration_seconds": 59,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestTimeoutMemberInsufficientPermissions(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "timeoutpermown")
+	actor := ts.CreateTestUser(t, "timeoutpermactor")
+	target := ts.CreateTestUser(t, "timeoutpermtarget")
+
+	serverID := ts.CreateTestServer(t, owner.ID, "TimeoutPermServer")
+	ts.AddMemberToServer(t, serverID, actor.ID, "member")
+	ts.AddMemberToServer(t, serverID, target.ID, "member")
+
+	w := ts.DoRequest("POST", timeoutPath(serverID, target.ID), map[string]interface{}{
+		"duration_seconds": 300,
+	}, testhelpers.AuthHeaders(actor.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestTimeoutMemberInvalidIDs(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "timeoutinvown")
+	member := ts.CreateTestUser(t, "timeoutinvmem")
+	serverID := ts.CreateTestServer(t, owner.ID, "TimeoutInvalidIDsServer")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+	payload := map[string]interface{}{"duration_seconds": 300}
+	w := ts.DoRequest("POST", timeoutPath(notAUUID, member.ID), payload, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	w = ts.DoRequest("POST", timeoutPath(serverID, notAUUID), payload, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestTimeoutMemberMissingBody(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "timeoutbodyown")
+	member := ts.CreateTestUser(t, "timeoutbodymem")
+	serverID := ts.CreateTestServer(t, owner.ID, "TimeoutMissingBodyServer")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+	w := ts.DoRequest("POST", timeoutPath(serverID, member.ID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestTimeoutMemberCannotTargetSelf(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "timeoutselfown")
+	serverID := ts.CreateTestServer(t, owner.ID, "TimeoutSelfServer")
+
+	w := ts.DoRequest("POST", timeoutPath(serverID, owner.ID), map[string]interface{}{
+		"duration_seconds": 300,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestTimeoutMemberCannotTargetOwner(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "timeoutownerown")
+	admin := ts.CreateTestUser(t, "timeoutowneradm")
+	serverID := ts.CreateTestServer(t, owner.ID, "TimeoutOwnerServer")
+	ts.AddMemberToServer(t, serverID, admin.ID, "admin")
+
+	w := ts.DoRequest("POST", timeoutPath(serverID, owner.ID), map[string]interface{}{
+		"duration_seconds": 300,
+	}, testhelpers.AuthHeaders(admin.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestTimeoutMemberTargetNotMember(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "timeoutmissingown")
+	target := ts.CreateTestUser(t, "timeoutmissingtarget")
+	serverID := ts.CreateTestServer(t, owner.ID, "TimeoutTargetMissingServer")
+
+	w := ts.DoRequest("POST", timeoutPath(serverID, target.ID), map[string]interface{}{
+		"duration_seconds": 300,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestTimeoutMemberHierarchyCheck(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "timeouthierown")
+	admin := ts.CreateTestUser(t, "timeouthieradm")
+	otherAdmin := ts.CreateTestUser(t, "timeouthieroth")
+
+	serverID := ts.CreateTestServer(t, owner.ID, "TimeoutHierarchyServer")
+	ts.AddMemberToServer(t, serverID, admin.ID, "admin")
+	ts.AddMemberToServer(t, serverID, otherAdmin.ID, "member")
+
+	var adminRoleID string
+	err := ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND name = 'admin'`, serverID).Scan(&adminRoleID)
+	require.NoError(t, err)
+	ts.AssignRoleToUser(t, serverID, otherAdmin.ID, adminRoleID)
+
+	w := ts.DoRequest("POST", timeoutPath(serverID, otherAdmin.ID), map[string]interface{}{
+		"duration_seconds": 300,
+	}, testhelpers.AuthHeaders(admin.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestRemoveTimeoutInvalidIDs(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "untimeoutinvown")
+	member := ts.CreateTestUser(t, "untimeoutinvmem")
+	serverID := ts.CreateTestServer(t, owner.ID, "RemoveTimeoutInvalidIDsServer")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+	w := ts.DoRequest("DELETE", timeoutPath(notAUUID, member.ID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	w = ts.DoRequest("DELETE", timeoutPath(serverID, notAUUID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestRemoveTimeoutInsufficientPermissions(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "untimeoutpermown")
+	actor := ts.CreateTestUser(t, "untimeoutpermactor")
+	target := ts.CreateTestUser(t, "untimeoutpermtarget")
+
+	serverID := ts.CreateTestServer(t, owner.ID, "RemoveTimeoutPermServer")
+	ts.AddMemberToServer(t, serverID, actor.ID, "member")
+	ts.AddMemberToServer(t, serverID, target.ID, "member")
+
+	w := ts.DoRequest("DELETE", timeoutPath(serverID, target.ID), nil, testhelpers.AuthHeaders(actor.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
 // ── Unverified email blocks member routes ────────────────────────────────────

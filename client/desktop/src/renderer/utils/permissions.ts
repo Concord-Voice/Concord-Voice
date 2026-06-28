@@ -33,6 +33,7 @@ export const DEAFEN_MEMBERS = 1n << 19n;
 export const MOVE_MEMBERS = 1n << 20n;
 export const SCREEN_SHARE = 1n << 21n;
 export const VIDEO = 1n << 28n;
+export const TIMEOUT_MEMBERS = 1n << 29n;
 
 // Content permissions
 export const ATTACH_FILES = 1n << 22n;
@@ -67,7 +68,13 @@ export const BASE_PERMISSIONS =
   VIDEO;
 
 export const MODERATOR_PERMISSIONS =
-  BASE_PERMISSIONS | MANAGE_ALL_MESSAGES | KICK | MUTE_MEMBERS | DEAFEN_MEMBERS | MOVE_MEMBERS;
+  BASE_PERMISSIONS |
+  MANAGE_ALL_MESSAGES |
+  KICK |
+  MUTE_MEMBERS |
+  DEAFEN_MEMBERS |
+  MOVE_MEMBERS |
+  TIMEOUT_MEMBERS;
 
 export const ADMIN_PERMISSIONS =
   MODERATOR_PERMISSIONS |
@@ -110,6 +117,7 @@ export const Permissions = {
   MENTION_USERS,
   MANAGE_DEV_RESOURCES,
   VIDEO,
+  TIMEOUT_MEMBERS,
   ADMINISTRATOR,
 } as const;
 
@@ -384,6 +392,12 @@ export const PERMISSION_CATEGORIES: PermissionCategory[] = [
         bit: MUTE_MEMBERS,
         label: 'Mute Members',
         description: 'Server-mute other members',
+      },
+      {
+        key: 'TIMEOUT_MEMBERS',
+        bit: TIMEOUT_MEMBERS,
+        label: 'Timeout Members',
+        description: 'Temporarily bar members from sending messages and joining voice',
       },
       {
         key: 'DEAFEN_MEMBERS',

@@ -51,6 +51,28 @@ func TestToggleReactionAddSuccess(t *testing.T) {
 	assert.Equal(t, true, reaction["me"])
 }
 
+func TestToggleReactionTimedOutMemberForbidden(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "reacttimeoutown")
+	member := ts.CreateTestUser(t, "reacttimeoutmem")
+	serverID := ts.CreateTestServer(t, owner.ID, "Reaction Timeout Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	msgID := ts.CreateTestMessage(t, channelID, owner, testContent)
+
+	_, err := ts.DB.Exec("UPDATE server_members SET timed_out_until = NOW() + INTERVAL '1 hour' WHERE server_id = $1 AND user_id = $2", serverID, member.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("PUT", reactURL(msgID), emojiBody("👍"),
+		testhelpers.AuthHeaders(member.AccessToken))
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	var resp map[string]interface{}
+	testhelpers.ParseJSON(t, w, &resp)
+	assert.Equal(t, "member_timed_out", resp["code"])
+	assert.NotEmpty(t, resp["timed_out_until"])
+}
+
 func TestToggleReactionRemoveSuccess(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "toggleuser")

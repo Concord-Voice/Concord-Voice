@@ -1,7 +1,7 @@
 /**
  * ws-events.test.ts — zod schema coverage for the WebSocket wire contract.
  *
- * 4 describe-blocks: happy path (56), rejection (17), discriminator (3), PII scrubber (4).
+ * 4 describe-blocks: happy path (57), rejection (17), discriminator (3), PII scrubber (4).
  *
  * @see client/desktop/src/renderer/types/ws-events.ts
  * @see [internal]specs/2026-05-23-709-ws-discriminated-union-design.md §6
@@ -52,9 +52,10 @@ import {
   ServerOnlineCountsSchema,
   ServerVoiceCountsSchema,
   ProfileUpdatedSchema,
-  // Channel + server lifecycle (12)
+  // Channel + server lifecycle (13)
   MemberJoinedSchema,
   MemberRemovedSchema,
+  MemberTimeoutSchema,
   ServerUpdatedSchema,
   ServerDeletedSchema,
   ChannelUpdatedSchema,
@@ -575,7 +576,7 @@ describe('ws-events schemas — happy path (one per event)', () => {
     expect(result.success).toBe(true);
   });
 
-  // ──────────── Channel + server lifecycle (12) ────────────────────────
+  // ──────────── Channel + server lifecycle (13) ────────────────────────
 
   it('MemberJoinedSchema accepts a canonical joined envelope', () => {
     const result = MemberJoinedSchema.safeParse({
@@ -597,6 +598,28 @@ describe('ws-events schemas — happy path (one per event)', () => {
       },
     });
     expect(result.success).toBe(true);
+  });
+
+  it('MemberTimeoutSchema accepts set and clear envelopes', () => {
+    const setResult = MemberTimeoutSchema.safeParse({
+      type: 'member_timeout',
+      data: {
+        server_id: UUID_A,
+        user_id: UUID_B,
+        timed_out_until: ISO_NOW,
+      },
+    });
+    expect(setResult.success).toBe(true);
+
+    const clearResult = MemberTimeoutSchema.safeParse({
+      type: 'member_timeout',
+      data: {
+        server_id: UUID_A,
+        user_id: UUID_B,
+        timed_out_until: null,
+      },
+    });
+    expect(clearResult.success).toBe(true);
   });
 
   it('ServerUpdatedSchema accepts a canonical server-updated envelope', () => {

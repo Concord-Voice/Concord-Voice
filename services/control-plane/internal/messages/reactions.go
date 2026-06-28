@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
+	"time"
 	"unicode"
 
 	"github.com/gin-gonic/gin"
@@ -129,6 +130,25 @@ func (h *Handler) lookupMessageContext(c *gin.Context, messageID, userID string)
 	return ctx, true
 }
 
+func (h *Handler) rejectActiveMemberTimeout(c *gin.Context, serverID, userID string) bool {
+	var timedOutUntil sql.NullTime
+	if err := h.db.QueryRow("SELECT timed_out_until FROM server_members WHERE server_id = $1 AND user_id = $2", serverID, userID).Scan(&timedOutUntil); err != nil {
+		h.log.Error("Failed to check member timeout", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgReactionFailed})
+		return true
+	}
+	if !timedOutUntil.Valid || !timedOutUntil.Time.After(time.Now().UTC()) {
+		return false
+	}
+
+	c.JSON(http.StatusForbidden, gin.H{
+		"error":           "Member is timed out",
+		"code":            "member_timed_out",
+		"timed_out_until": timedOutUntil.Time,
+	})
+	return true
+}
+
 // ToggleReaction adds or removes a reaction on a message.
 func (h *Handler) ToggleReaction(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -170,6 +190,10 @@ func (h *Handler) ToggleReaction(c *gin.Context) {
 	}
 	if !hasPerm {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return
+	}
+
+	if h.rejectActiveMemberTimeout(c, serverID, userID) {
 		return
 	}
 

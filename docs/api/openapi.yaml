@@ -9953,6 +9953,107 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /servers/{id}/members/{user_id}/timeout:
+    post:
+      tags:
+      - Members
+      summary: Timeout a member
+      description: 'Temporarily bar a server member from sending messages, adding reactions, and joining
+        voice channels. Requires the Timeout Members permission; the target must be strictly lower
+        in role hierarchy and cannot be the caller or the server owner.
+
+        Rate limit: 5 requests per minute.
+
+        '
+      operationId: timeoutServerMember
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ServerId'
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TimeoutMemberRequest'
+      responses:
+        '200':
+          description: Member timed out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberTimeoutResponse'
+        '400':
+          description: Invalid IDs, invalid duration, invalid body, or self-timeout attempt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Insufficient permissions, server-owner target, or hierarchy violation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Target user is not a member of this server
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+      - Members
+      summary: Remove a member timeout
+      description: 'Clear the active timeout restriction from a server member. Requires the Timeout Members
+        permission; the target must be strictly lower in role hierarchy and cannot be the caller or
+        the server owner.
+
+        Rate limit: 5 requests per minute.
+
+        '
+      operationId: removeServerMemberTimeout
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ServerId'
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Member timeout removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberTimeoutResponse'
+        '400':
+          description: Invalid IDs or self-timeout attempt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Insufficient permissions, server-owner target, or hierarchy violation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Target user is not a member of this server
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /servers/{id}/mute-states:
     get:
       tags:
@@ -12640,6 +12741,42 @@ components:
           enum:
           - admin
           - member
+    TimeoutMemberRequest:
+      type: object
+      required:
+      - duration_seconds
+      properties:
+        duration_seconds:
+          type: integer
+          format: int64
+          minimum: 60
+          maximum: 604800
+          description: Timeout duration in seconds, from 1 minute to 7 days
+        reason:
+          type: string
+          nullable: true
+          description: Optional audit-log reason for the timeout
+    MemberTimeoutResponse:
+      type: object
+      properties:
+        message:
+          type: string
+        server_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        timed_out_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: UTC timestamp when the timeout expires, or null when cleared
+      required:
+      - message
+      - server_id
+      - user_id
+      - timed_out_until
     CreateInviteRequest:
       type: object
       properties:
@@ -12896,6 +13033,11 @@ components:
           format: int64
           nullable: true
           description: Unix timestamp of last activity
+        timed_out_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: UTC timestamp until this member may send messages, react, or join voice channels
     ServerInvite:
       type: object
       properties:

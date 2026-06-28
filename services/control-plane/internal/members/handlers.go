@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -28,8 +29,13 @@ const (
 	errMsgFailedUpdateMember   = "Failed to update member"
 	errMsgFailedRemoveMember   = "Failed to remove member"
 	errMsgFailedBanMember      = "Failed to ban member"
+	errMsgFailedTimeoutMember  = "Failed to timeout member"
 	errMsgFailedGetServerOwner = "Failed to get server owner"
 	errMsgFailedCheckPerms     = "Failed to check permissions"
+	errMsgUserNotMember        = "User is not a member of this server"
+
+	minTimeoutDuration = time.Minute
+	maxTimeoutDuration = 7 * 24 * time.Hour
 )
 
 // Handler handles member-related requests
@@ -66,6 +72,12 @@ type UpdateMemberRequest struct {
 	Role string `json:"role" binding:"required,oneof=admin member"`
 }
 
+// TimeoutMemberRequest represents a request to temporarily restrict a server member.
+type TimeoutMemberRequest struct {
+	DurationSeconds int64  `json:"duration_seconds" binding:"required"`
+	Reason          string `json:"reason"`
+}
+
 // MemberRoleInfo represents a lightweight role reference for display
 type MemberRoleInfo struct {
 	RoleID            string  `json:"role_id"`
@@ -91,6 +103,7 @@ type MemberWithUser struct {
 	Roles          []MemberRoleInfo `json:"roles"`
 	ServerMuted    bool             `json:"server_muted"`
 	ServerDeafened bool             `json:"server_deafened"`
+	TimedOutUntil  *time.Time       `json:"timed_out_until,omitempty"`
 }
 
 // ListMembers returns all members of a server
@@ -144,7 +157,7 @@ func (h *Handler) ListMembers(c *gin.Context) {
 func (h *Handler) queryServerMembers(serverID string) ([]MemberWithUser, error) {
 	query := `
 		SELECT sm.user_id, u.username, u.display_name, u.bio, u.avatar_url, u.header_image_url, u.color_scheme,
-		       sm.role, sm.joined_at, sm.server_muted, sm.server_deafened
+		       sm.role, sm.joined_at, sm.server_muted, sm.server_deafened, sm.timed_out_until
 		FROM server_members sm
 		INNER JOIN users u ON sm.user_id = u.id
 		WHERE sm.server_id = $1
@@ -161,6 +174,7 @@ func (h *Handler) queryServerMembers(serverID string) ([]MemberWithUser, error) 
 	members := []MemberWithUser{}
 	for rows.Next() {
 		var member MemberWithUser
+		var timedOutUntil sql.NullTime
 		err := rows.Scan(
 			&member.UserID,
 			&member.Username,
@@ -173,10 +187,15 @@ func (h *Handler) queryServerMembers(serverID string) ([]MemberWithUser, error) 
 			&member.JoinedAt,
 			&member.ServerMuted,
 			&member.ServerDeafened,
+			&timedOutUntil,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan member", "error", err)
 			continue
+		}
+		if timedOutUntil.Valid {
+			t := timedOutUntil.Time
+			member.TimedOutUntil = &t
 		}
 		members = append(members, member)
 	}
@@ -426,7 +445,7 @@ func (h *Handler) UpdateMember(c *gin.Context) {
 		serverID, targetUserID,
 	).Scan(&targetExists)
 	if !targetExists {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User is not a member of this server"})
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
 		return
 	}
 
@@ -465,6 +484,177 @@ func (h *Handler) UpdateMember(c *gin.Context) {
 	h.log.Info("Member role updated", "server_id", serverID, "target_user", targetUserID, "new_role", req.Role, "updated_by", userID)
 
 	c.JSON(http.StatusOK, gin.H{"member": member})
+}
+
+func (h *Handler) authorizeTimeout(c *gin.Context, serverID, userID, targetUserID string) (int, string, bool) {
+	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, "", rbac.PermTimeoutMembers)
+	if err != nil {
+		h.log.Error(errMsgFailedCheckPerms, "error", err)
+		return http.StatusInternalServerError, errMsgFailedTimeoutMember, false
+	}
+	if !hasPerm {
+		return http.StatusForbidden, errMsgInsufficientPerms, false
+	}
+	if targetUserID == userID {
+		return http.StatusBadRequest, "Cannot timeout yourself", false
+	}
+
+	targetExists, err := h.checkMembership(serverID, targetUserID)
+	if err != nil {
+		h.log.Error("Failed to check target membership", "error", err)
+		return http.StatusInternalServerError, errMsgFailedTimeoutMember, false
+	}
+	if !targetExists {
+		return http.StatusNotFound, errMsgUserNotMember, false
+	}
+
+	ownerID, err := h.getServerOwnerID(serverID)
+	if err != nil {
+		h.log.Error(errMsgFailedGetServerOwner, "error", err)
+		return http.StatusInternalServerError, errMsgFailedTimeoutMember, false
+	}
+	if targetUserID == ownerID {
+		return http.StatusForbidden, "Cannot timeout the server owner", false
+	}
+	if h.resolver.CheckHierarchy(c.Request.Context(), serverID, userID, targetUserID) != nil {
+		return http.StatusForbidden, "Cannot timeout a member with equal or higher role position", false
+	}
+
+	return 0, "", true
+}
+
+func (h *Handler) broadcastTimeout(serverID, targetUserID string, timedOutUntil *time.Time) {
+	if h.hub == nil {
+		return
+	}
+	serverUUID, err := uuid.Parse(serverID)
+	if err != nil {
+		return
+	}
+
+	var timeoutValue interface{}
+	if timedOutUntil != nil {
+		timeoutValue = timedOutUntil.UTC().Format(time.RFC3339)
+	}
+
+	h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
+		Type: "member_timeout",
+		Data: map[string]interface{}{
+			"server_id":       serverID,
+			"user_id":         targetUserID,
+			"timed_out_until": timeoutValue,
+		},
+	})
+}
+
+// TimeoutMember temporarily bars a member from sending messages and joining voice.
+func (h *Handler) TimeoutMember(c *gin.Context) {
+	userID := c.GetString("user_id")
+	serverID := c.Param("id")
+	targetUserID := c.Param("user_id")
+
+	if _, err := uuid.Parse(serverID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
+		return
+	}
+	if _, err := uuid.Parse(targetUserID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
+		return
+	}
+
+	var req TimeoutMemberRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return
+	}
+
+	duration := time.Duration(req.DurationSeconds) * time.Second
+	if duration < minTimeoutDuration || duration > maxTimeoutDuration {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "duration_seconds must be between 60 and 604800"})
+		return
+	}
+
+	if status, msg, ok := h.authorizeTimeout(c, serverID, userID, targetUserID); !ok {
+		c.JSON(status, gin.H{"error": msg})
+		return
+	}
+
+	timedOutUntil := time.Now().UTC().Add(duration)
+	var storedUntil time.Time
+	if err := h.db.QueryRowContext(c.Request.Context(),
+		"UPDATE server_members SET timed_out_until = $1 WHERE server_id = $2 AND user_id = $3 RETURNING timed_out_until",
+		timedOutUntil, serverID, targetUserID,
+	).Scan(&storedUntil); err != nil {
+		h.log.Error("Failed to timeout member", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedTimeoutMember})
+		return
+	}
+
+	if h.audit != nil {
+		metadata := map[string]interface{}{"duration_seconds": req.DurationSeconds}
+		if req.Reason != "" {
+			metadata["reason"] = req.Reason
+		}
+		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "member_timed_out", "member", &targetUserID, metadata) //nolint:errcheck
+	}
+
+	h.broadcastTimeout(serverID, targetUserID, &storedUntil)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":         "Member timed out",
+		"server_id":       serverID,
+		"user_id":         targetUserID,
+		"timed_out_until": storedUntil,
+	})
+}
+
+// RemoveTimeout clears a member timeout restriction.
+func (h *Handler) RemoveTimeout(c *gin.Context) {
+	userID := c.GetString("user_id")
+	serverID := c.Param("id")
+	targetUserID := c.Param("user_id")
+
+	if _, err := uuid.Parse(serverID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
+		return
+	}
+	if _, err := uuid.Parse(targetUserID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
+		return
+	}
+
+	if status, msg, ok := h.authorizeTimeout(c, serverID, userID, targetUserID); !ok {
+		c.JSON(status, gin.H{"error": msg})
+		return
+	}
+
+	result, err := h.db.ExecContext(c.Request.Context(),
+		"UPDATE server_members SET timed_out_until = NULL WHERE server_id = $1 AND user_id = $2",
+		serverID, targetUserID,
+	)
+	if err != nil {
+		h.log.Error("Failed to remove member timeout", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedTimeoutMember})
+		return
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
+		return
+	}
+
+	if h.audit != nil {
+		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "member_timeout_removed", "member", &targetUserID, nil) //nolint:errcheck
+	}
+
+	h.broadcastTimeout(serverID, targetUserID, nil)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":         "Member timeout removed",
+		"server_id":       serverID,
+		"user_id":         targetUserID,
+		"timed_out_until": nil,
+	})
 }
 
 func (h *Handler) checkMembership(serverID, userID string) (bool, error) {
@@ -562,7 +752,7 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	}
 	targetExists, err := h.checkMembership(serverID, targetUserID)
 	if err != nil || !targetExists {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User is not a member of this server"})
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
 		return
 	}
 

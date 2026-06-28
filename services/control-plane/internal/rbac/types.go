@@ -47,6 +47,9 @@ const (
 	PermScreenShare   Permission = 1 << 21 // Share screen in voice channels
 	PermVideo         Permission = 1 << 28 // Enable camera/video in voice channels
 
+	// Moderation permissions
+	PermTimeoutMembers Permission = 1 << 29 // Temporarily bar members from sending messages and joining voice
+
 	// Content permissions
 	PermAttachFiles      Permission = 1 << 22 // Upload files and images in channels
 	PermUseExternalEmoji Permission = 1 << 23 // Use emoji from other servers
@@ -72,7 +75,7 @@ var BasePermissions = PermViewTextChannels | PermViewVoiceChannels | PermSendMes
 
 // ModeratorPermissions extends base permissions with moderation capabilities
 var ModeratorPermissions = BasePermissions | PermManageAllMessages | PermKick |
-	PermMuteMembers | PermDeafenMembers | PermMoveMembers
+	PermMuteMembers | PermDeafenMembers | PermMoveMembers | PermTimeoutMembers
 
 // AdminPermissions extends moderator permissions with administrative capabilities
 var AdminPermissions = ModeratorPermissions | PermManageChannels | PermManageRoles |
@@ -132,5 +135,6 @@ var PermissionNames = map[Permission]string{
 	PermMentionUsers:         "mention_users",
 	PermManageDevResources:   "manage_dev_resources",
 	PermVideo:                "video",
+	PermTimeoutMembers:       "timeout_members",
 	PermAdministrator:        "administrator",
 }

@@ -20,6 +20,7 @@ export interface ServerMember {
   roles: MemberRoleInfo[];
   server_muted?: boolean;
   server_deafened?: boolean;
+  timed_out_until?: string | null;
 }
 
 interface MemberState {
@@ -43,6 +44,7 @@ interface MemberState {
       >
     >
   ) => void;
+  setMemberTimeout: (userId: string, timedOutUntil: string | null) => void;
   setOnlineUsers: (userIds: string[]) => void;
   setUserOnline: (userId: string) => void;
   setUserOffline: (userId: string) => void;
@@ -117,6 +119,16 @@ export const useMemberStore = wrapStore(create<MemberState>()(
           if (idx < 0) return state;
           const updated = [...state.members];
           updated[idx] = { ...updated[idx], ...updates };
+          return { members: updated };
+        });
+      },
+
+      setMemberTimeout: (userId: string, timedOutUntil: string | null) => {
+        set((state) => {
+          const idx = state.members.findIndex((m) => m.user_id === userId);
+          if (idx < 0) return state;
+          const updated = [...state.members];
+          updated[idx] = { ...updated[idx], timed_out_until: timedOutUntil };
           return { members: updated };
         });
       },

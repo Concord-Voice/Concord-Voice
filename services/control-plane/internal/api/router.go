@@ -48,6 +48,7 @@ const (
 	routeRecoveryCircle    = "/recovery-circle"
 	pathIDMembers          = "/:id/members"
 	pathIDMembersUserID    = "/:id/members/:user_id"
+	pathIDMembersTimeout   = "/:id/members/:user_id/timeout"
 	pathIDRead             = "/:id/read"
 	pathIDKeys             = "/:id/keys"
 	pathIDOverrides        = "/:id/overrides"
@@ -1080,6 +1081,16 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 				serverRoutes.DELETE(pathIDMembersUserID,
 					middleware.RateLimitByUser(redis, 5, 1*time.Minute),
 					membersHandler.RemoveMember,
+				)
+
+				// Timeout member (5 requests per minute - sensitive moderation action)
+				serverRoutes.POST(pathIDMembersTimeout,
+					middleware.RateLimitByUser(redis, 5, 1*time.Minute),
+					membersHandler.TimeoutMember,
+				)
+				serverRoutes.DELETE(pathIDMembersTimeout,
+					middleware.RateLimitByUser(redis, 5, 1*time.Minute),
+					membersHandler.RemoveTimeout,
 				)
 
 				// Ban management

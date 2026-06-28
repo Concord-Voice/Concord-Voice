@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -393,13 +394,14 @@ func (h *Handler) validateReplyToID(c *gin.Context, replyToID *string, channelID
 func (h *Handler) checkSendAccess(c *gin.Context, channelID, userID string) (string, bool, bool) {
 	var serverID string
 	var serverAllowEmbeds bool
+	var timedOutUntil sql.NullTime
 	err := h.db.QueryRow(`
-		SELECT c.server_id, s.allow_embedded_content
+		SELECT c.server_id, s.allow_embedded_content, sm.timed_out_until
 		FROM channels c
 		INNER JOIN server_members sm ON c.server_id = sm.server_id
 		INNER JOIN servers s ON c.server_id = s.id
 		WHERE c.id = $1 AND sm.user_id = $2
-	`, channelID, userID).Scan(&serverID, &serverAllowEmbeds)
+	`, channelID, userID).Scan(&serverID, &serverAllowEmbeds, &timedOutUntil)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
 		return "", false, false
@@ -418,6 +420,14 @@ func (h *Handler) checkSendAccess(c *gin.Context, channelID, userID string) (str
 	}
 	if !hasPerm {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return "", false, false
+	}
+	if timedOutUntil.Valid && timedOutUntil.Time.After(time.Now().UTC()) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":           "Member is timed out",
+			"code":            "member_timed_out",
+			"timed_out_until": timedOutUntil.Time,
+		})
 		return "", false, false
 	}
 

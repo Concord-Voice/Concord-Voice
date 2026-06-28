@@ -4,9 +4,16 @@ import { mockMember, mockMember2 } from '../../../mocks/fixtures';
 import { usePermissionStore } from '@/renderer/stores/permissionStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useFriendStore } from '@/renderer/stores/friendStore';
-import { ADMIN_PERMISSIONS, BASE_PERMISSIONS } from '@/renderer/utils/permissions';
+import { useMemberStore } from '@/renderer/stores/memberStore';
+import { apiFetch, safeJson } from '@/renderer/services/apiClient';
+import { ADMIN_PERMISSIONS, BASE_PERMISSIONS, TIMEOUT_MEMBERS } from '@/renderer/utils/permissions';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import type { Role } from '@/renderer/types/server';
+
+vi.mock('@/renderer/services/apiClient', () => ({
+  apiFetch: vi.fn(),
+  safeJson: vi.fn(),
+}));
 
 const SERVER_ID = 'server-1';
 const OWNER_USER_ID = 'user-1'; // mockMember.user_id / mockServer.owner_id
@@ -83,6 +90,8 @@ describe('MemberContextMenu', () => {
     });
     // Set current user to the owner (user-1) so self-guards don't hide items
     useUserStore.setState({ user: { id: OWNER_USER_ID, username: 'testuser' } as never });
+    vi.mocked(apiFetch).mockResolvedValue({ ok: true } as Response);
+    vi.mocked(safeJson).mockResolvedValue({});
   });
 
   afterEach(() => {
@@ -191,6 +200,24 @@ describe('MemberContextMenu', () => {
     expect(screen.getByText('Kick')).toBeInTheDocument();
   });
 
+  it('shows Timeout for users with the timeout permission', () => {
+    usePermissionStore.setState({
+      serverPermissions: { [SERVER_ID]: TIMEOUT_MEMBERS },
+      serverRoles: { [SERVER_ID]: mockRoles },
+    });
+    render(<MemberContextMenu {...defaultProps} />);
+    expect(screen.getByText('Timeout')).toBeInTheDocument();
+  });
+
+  it('hides Timeout for regular members', () => {
+    usePermissionStore.setState({
+      serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS },
+      serverRoles: { [SERVER_ID]: mockRoles },
+    });
+    render(<MemberContextMenu {...defaultProps} />);
+    expect(screen.queryByText('Timeout')).not.toBeInTheDocument();
+  });
+
   it('hides Kick for regular member', () => {
     usePermissionStore.setState({
       serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS },
@@ -211,6 +238,56 @@ describe('MemberContextMenu', () => {
     render(<MemberContextMenu {...defaultProps} />);
     fireEvent.click(screen.getByText('Kick'));
     expect(mockOnKick).toHaveBeenCalledWith(mockMember2);
+    expect(mockOnClose).toHaveBeenCalled();
+  });
+
+  it('posts selected timeout duration and updates the member timeout', async () => {
+    const timedOutUntil = '2026-06-28T18:00:00.000Z';
+    vi.mocked(safeJson).mockResolvedValue({ timed_out_until: timedOutUntil });
+    useMemberStore.getState().addMember(mockMember2);
+
+    render(<MemberContextMenu {...defaultProps} />);
+    fireEvent.click(screen.getByText('Timeout'));
+    fireEvent.click(screen.getByText('5 minutes'));
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(apiFetch).toHaveBeenCalledWith(
+      '/api/v1/servers/server-1/members/user-2/timeout',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ duration_seconds: 300 }),
+      })
+    );
+    expect(useMemberStore.getState().members[0].timed_out_until).toBe(timedOutUntil);
+    expect(mockOnClose).toHaveBeenCalled();
+  });
+
+  it('removes an active timeout', async () => {
+    useMemberStore.getState().addMember({
+      ...mockMember2,
+      timed_out_until: '2999-01-01T00:00:00.000Z',
+    });
+
+    render(
+      <MemberContextMenu
+        {...defaultProps}
+        member={{ ...mockMember2, timed_out_until: '2999-01-01T00:00:00.000Z' }}
+      />
+    );
+    fireEvent.click(screen.getByText('Remove Timeout'));
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(apiFetch).toHaveBeenCalledWith(
+      '/api/v1/servers/server-1/members/user-2/timeout',
+      expect.objectContaining({ method: 'DELETE' })
+    );
+    expect(useMemberStore.getState().members[0].timed_out_until).toBeNull();
     expect(mockOnClose).toHaveBeenCalled();
   });
 

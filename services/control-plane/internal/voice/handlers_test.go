@@ -114,6 +114,26 @@ func TestAuthorizeJoin(t *testing.T) {
 	})
 }
 
+func TestAuthorizeJoinTimedOutMemberForbidden(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "vjtimeoutown")
+	member := ts.CreateTestUser(t, "vjtimeoutmem")
+	serverID := ts.CreateTestServer(t, owner.ID, "VoiceJoin Timeout")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-timeout")
+
+	_, err := ts.DB.Exec("UPDATE server_members SET timed_out_until = NOW() + INTERVAL '1 hour' WHERE server_id = $1 AND user_id = $2", serverID, member.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusForbidden, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "member_timed_out", body["code"])
+	assert.NotEmpty(t, body["timed_out_until"])
+}
+
 // --- AuthorizeVoiceAction Tests (table-driven to reduce duplication) ---
 
 func TestAuthorizeVoiceAction_ValidActions(t *testing.T) {
