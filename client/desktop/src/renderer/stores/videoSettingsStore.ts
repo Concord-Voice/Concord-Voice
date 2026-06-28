@@ -93,6 +93,10 @@ export interface VideoSettings {
   degradationPreference: DegradationPreference; // How to handle congestion: drop fps or resolution
   scalabilityMode: 'auto' | 'L1T3' | 'L2T3' | 'L3T3'; // SVC spatial×temporal layers
 
+  // Casting eligibility (codec-derived kind is gated by these allow-lists)
+  supportSvc: boolean; // AV1/VP9 may publish layered SVC
+  supportSimulcast: boolean; // H264/VP8 may publish simulcast
+
   // Hardware
   hardwareAcceleration: boolean;
 
@@ -116,6 +120,8 @@ interface VideoSettingsState extends VideoSettings {
   setScreenShareBitrate: (bitrate: number) => void;
   setDegradationPreference: (pref: DegradationPreference) => void;
   setScalabilityMode: (mode: 'auto' | 'L1T3' | 'L2T3' | 'L3T3') => void;
+  setSupportSvc: (enabled: boolean) => void;
+  setSupportSimulcast: (enabled: boolean) => void;
   setHardwareAcceleration: (enabled: boolean) => void;
   setHdrEncoding: (enabled: boolean) => void;
   setVideoAdvancedMode: (enabled: boolean) => void;
@@ -135,6 +141,8 @@ const defaults: VideoSettings = {
   screenShareBitrate: 0, // Auto
   degradationPreference: 'balanced',
   scalabilityMode: 'auto', // Auto = L3T3 for SVC codecs
+  supportSvc: true,
+  supportSimulcast: true,
   hardwareAcceleration: true,
   hdrEncoding: false,
   systemHdr: false,
@@ -159,6 +167,8 @@ export const useVideoSettingsStore = wrapStore(
         setScreenShareBitrate: (screenShareBitrate) => set({ screenShareBitrate }),
         setDegradationPreference: (degradationPreference) => set({ degradationPreference }),
         setScalabilityMode: (scalabilityMode) => set({ scalabilityMode }),
+        setSupportSvc: (supportSvc) => set({ supportSvc }),
+        setSupportSimulcast: (supportSimulcast) => set({ supportSimulcast }),
         setHardwareAcceleration: (hardwareAcceleration) => set({ hardwareAcceleration }),
         setHdrEncoding: (hdrEncoding) => set({ hdrEncoding }),
         setCodecCapabilities: (codecCapabilities) => set({ codecCapabilities }),

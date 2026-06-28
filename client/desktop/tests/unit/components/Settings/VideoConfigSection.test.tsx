@@ -1335,4 +1335,71 @@ describe('VideoConfigSection', () => {
       expect(advancedPill.getAttribute('aria-selected')).toBe('true');
     });
   });
+
+  // ─── SVC / Simulcast casting toggles (#1921) ──────────────────────────────
+  describe('casting toggles (#1921)', () => {
+    beforeEach(() => {
+      mockVideoSettingsStore({ videoAdvancedMode: true });
+      mockDraftSettings({ supportSvc: true, supportSimulcast: true });
+    });
+
+    it('renders both casting toggles under the codec select in advanced mode', () => {
+      renderComponent();
+      expect(screen.getByText('Support SVC')).toBeInTheDocument();
+      expect(screen.getByText('Support Simulcast')).toBeInTheDocument();
+    });
+
+    it('does NOT render the casting toggles in basic mode', () => {
+      mockVideoSettingsStore({ videoAdvancedMode: false });
+      renderComponent();
+      expect(screen.queryByText('Support SVC')).not.toBeInTheDocument();
+      expect(screen.queryByText('Support Simulcast')).not.toBeInTheDocument();
+    });
+
+    it('calls setDraftVideoSetting when the Support SVC toggle is flipped', () => {
+      renderComponent();
+      const checkboxes = screen.getAllByRole('checkbox');
+      const svcToggle = checkboxes.find((cb) =>
+        cb.closest('.settings-row')?.textContent?.includes('Support SVC')
+      );
+      expect(svcToggle).toBeTruthy();
+      fireEvent.click(svcToggle!);
+      expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('supportSvc', false);
+    });
+
+    it('calls setDraftVideoSetting when the Support Simulcast toggle is flipped', () => {
+      renderComponent();
+      const checkboxes = screen.getAllByRole('checkbox');
+      const simToggle = checkboxes.find((cb) =>
+        cb.closest('.settings-row')?.textContent?.includes('Support Simulcast')
+      );
+      expect(simToggle).toBeTruthy();
+      fireEvent.click(simToggle!);
+      expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('supportSimulcast', false);
+    });
+
+    it('shows the single-stream notice only when both toggles are off', () => {
+      mockDraftSettings({ supportSvc: false, supportSimulcast: false });
+      renderComponent();
+      expect(screen.getByText(/single stream to everyone/i)).toBeInTheDocument();
+    });
+
+    it('does NOT show the single-stream notice when at least one toggle is on', () => {
+      mockDraftSettings({ supportSvc: true, supportSimulcast: false });
+      renderComponent();
+      expect(screen.queryByText(/single stream to everyone/i)).not.toBeInTheDocument();
+    });
+
+    it('toggles stay interactive (not disabled) even when codec-inert', () => {
+      // Auto codec (null) → both toggles codec-inert but must remain enabled.
+      mockDraftSettings({ supportSvc: true, supportSimulcast: true, preferredVideoCodec: '' });
+      renderComponent();
+      const checkboxes = screen.getAllByRole('checkbox');
+      const svcToggle = checkboxes.find((cb) =>
+        cb.closest('.settings-row')?.textContent?.includes('Support SVC')
+      );
+      expect(svcToggle).toBeTruthy();
+      expect((svcToggle as HTMLInputElement).disabled).toBe(false);
+    });
+  });
 });

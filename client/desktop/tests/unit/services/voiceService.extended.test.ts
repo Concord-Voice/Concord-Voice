@@ -3334,4 +3334,76 @@ describe('VoiceService Extended', () => {
       expect(useVideoSettingsStore.getState().hardwareAcceleration).toBe(false);
     });
   });
+
+  // ===== SVC/Simulcast toggle mid-call reproduce trigger (#1921) =====
+  describe('casting-toggle reproduce trigger (#1921)', () => {
+    const flip = (over: Partial<ReturnType<typeof useVideoSettingsStore.getState>>) =>
+      ({ ...useVideoSettingsStore.getState(), ...over }) as ReturnType<
+        typeof useVideoSettingsStore.getState
+      >;
+
+    it('supportSvc change reproduces camera once', () => {
+      const svc = voiceService as any;
+      svc.producers.set('camera', createMockProducer('cam-1', 'camera'));
+      const spy = vi.spyOn(svc, 'liveReproduceCamera').mockImplementation(() => {});
+      const prev = flip({ supportSvc: true });
+      const state = flip({ supportSvc: false });
+      svc.applyCameraSettingsChange(state, prev);
+      expect(spy).toHaveBeenCalledTimes(1);
+    });
+
+    it('supportSimulcast change reproduces camera once', () => {
+      const svc = voiceService as any;
+      svc.producers.set('camera', createMockProducer('cam-1', 'camera'));
+      const spy = vi.spyOn(svc, 'liveReproduceCamera').mockImplementation(() => {});
+      const prev = flip({ supportSimulcast: true });
+      const state = flip({ supportSimulcast: false });
+      svc.applyCameraSettingsChange(state, prev);
+      expect(spy).toHaveBeenCalledTimes(1);
+    });
+
+    it('supportSimulcast change does NOT reproduce screen (SVC-only, #1921 Gitar fix)', () => {
+      // Screenshare is SVC-only in v1 (pickScreenCodec forces simulcast=false), so a
+      // supportSimulcast flip cannot change the screen plan — reproducing would be a
+      // wasteful no-op teardown/rebuild. Regression-locks the Gitar finding on PR #1929.
+      const svc = voiceService as any;
+      svc.producers.set('screen', createMockProducer('scr-1', 'screen'));
+      const spy = vi.spyOn(svc, 'fastReproduceScreen').mockImplementation(() => {});
+      const prev = flip({ supportSimulcast: true });
+      const state = flip({ supportSimulcast: false });
+      svc.applyScreenShareSettingsChange(state, prev);
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it('supportSvc change reproduces screen once', () => {
+      const svc = voiceService as any;
+      svc.producers.set('screen', createMockProducer('scr-1', 'screen'));
+      const spy = vi.spyOn(svc, 'fastReproduceScreen').mockImplementation(() => {});
+      const prev = flip({ supportSvc: true });
+      const state = flip({ supportSvc: false });
+      svc.applyScreenShareSettingsChange(state, prev);
+      expect(spy).toHaveBeenCalledTimes(1);
+    });
+
+    it('no toggle change does NOT reproduce camera or screen', () => {
+      const svc = voiceService as any;
+      svc.producers.set('camera', createMockProducer('cam-1', 'camera'));
+      svc.producers.set('screen', createMockProducer('scr-1', 'screen'));
+      const camSpy = vi.spyOn(svc, 'liveReproduceCamera').mockImplementation(() => {});
+      const scrSpy = vi.spyOn(svc, 'fastReproduceScreen').mockImplementation(() => {});
+      const same = flip({});
+      svc.applyCameraSettingsChange(same, same);
+      svc.applyScreenShareSettingsChange(same, same);
+      expect(camSpy).not.toHaveBeenCalled();
+      expect(scrSpy).not.toHaveBeenCalled();
+    });
+
+    it('does NOT reproduce camera when no camera producer exists', () => {
+      const svc = voiceService as any;
+      svc.producers.delete('camera');
+      const spy = vi.spyOn(svc, 'liveReproduceCamera').mockImplementation(() => {});
+      svc.applyCameraSettingsChange(flip({ supportSvc: false }), flip({ supportSvc: true }));
+      expect(spy).not.toHaveBeenCalled();
+    });
+  });
 });

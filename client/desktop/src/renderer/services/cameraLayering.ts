@@ -17,6 +17,41 @@ export interface BuildCameraEncodingPlanInput {
   maxBitrate: number;
   scalabilityMode: CameraScalabilitySetting;
   priority: CameraLayeringPriority;
+  eligibility: CastingEligibility;
+}
+
+/** Casting-eligibility allow-list (#1921). Each flag GATES a casting kind; it never
+ *  forces one. AV1/VP9 publish SVC, H264/VP8 publish simulcast — so AV1+simulcast is
+ *  structurally unreachable: no codec maps to both kinds. */
+export interface CastingEligibility {
+  svc: boolean;
+  simulcast: boolean;
+}
+
+/** Pure codec→casting-kind classifier. Codec-derived (not toggle-derived): the toggles
+ *  only SUBTRACT eligibility downstream; this never returns simulcast for an SVC codec. */
+export function castingKindForCodec(mime: string): CameraLayeringKind {
+  const m = mime.toLowerCase();
+  if (m === 'video/av1' || m === 'video/vp9') return 'svc';
+  if (m === 'video/h264' || m === 'video/vp8') return 'simulcast';
+  return 'single';
+}
+
+/** Whether a casting kind is permitted by the eligibility allow-list. `single` is always
+ *  allowed (it is the forced fallback when a layered kind is ineligible). */
+export function isCastingEligible(kind: CameraLayeringKind, e: CastingEligibility): boolean {
+  if (kind === 'svc') return e.svc;
+  if (kind === 'simulcast') return e.simulcast;
+  return true; // single is always allowed
+}
+
+/** First codec KEY in `candidates` whose casting kind is eligible. Key may carry a
+ *  ':profile' suffix (e.g. 'video/H264:640034') — classify on the mime prefix. */
+export function firstEligibleLayeringKey(
+  candidates: string[],
+  e: CastingEligibility
+): string | undefined {
+  return candidates.find((key) => isCastingEligible(castingKindForCodec(key.split(':')[0]), e));
 }
 
 export function resolveCameraScalabilityMode(mode: CameraScalabilitySetting): string {
@@ -41,7 +76,14 @@ export function buildCameraEncodingPlan(input: BuildCameraEncodingPlanInput): Ca
   const mime = codecMime(input.codec);
   const base = { ...input.priority };
 
-  if (mime === 'video/av1' || mime === 'video/vp9') {
+  // Codec-derived casting kind, then collapse to single when the eligibility allow-list
+  // forbids it. This is the one chokepoint that makes AV1+simulcast unreachable (#1921).
+  const kind = castingKindForCodec(mime);
+  if (!isCastingEligible(kind, input.eligibility)) {
+    return { kind: 'single', encodings: [{ ...base, maxBitrate: input.maxBitrate }] };
+  }
+
+  if (kind === 'svc') {
     return {
       kind: 'svc',
       encodings: [
@@ -54,7 +96,7 @@ export function buildCameraEncodingPlan(input: BuildCameraEncodingPlanInput): Ca
     };
   }
 
-  if (mime === 'video/h264' || mime === 'video/vp8') {
+  if (kind === 'simulcast') {
     return {
       kind: 'simulcast',
       encodings: [

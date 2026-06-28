@@ -60,3 +60,23 @@ describe('videoSettingsStore', () => {
     });
   });
 });
+
+describe('videoSettingsStore casting toggles (#1921)', () => {
+  beforeEach(() => {
+    resetAllStores();
+    localStorage.clear();
+  });
+
+  it('defaults supportSvc and supportSimulcast ON', () => {
+    const s = useVideoSettingsStore.getState();
+    expect(s.supportSvc).toBe(true);
+    expect(s.supportSimulcast).toBe(true);
+  });
+
+  it('setters flip the values', () => {
+    useVideoSettingsStore.getState().setSupportSvc(false);
+    useVideoSettingsStore.getState().setSupportSimulcast(false);
+    expect(useVideoSettingsStore.getState().supportSvc).toBe(false);
+    expect(useVideoSettingsStore.getState().supportSimulcast).toBe(false);
+  });
+});

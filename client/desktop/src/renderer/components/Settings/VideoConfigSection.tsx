@@ -14,6 +14,7 @@ import {
   type CodecCapability,
 } from '../../services/mediaCapabilities';
 import { humanizeProfileLabel, getCodecMetadata } from './codecMetadata';
+import { castingCopy } from './castingCopy';
 import { useDraftVideoSetting, setDraftVideoSetting } from '../../hooks/useDraftSettings';
 import { useEntitlement } from '../../hooks/useEntitlement';
 import { useGateActivation } from '../../hooks/useGateActivation';
@@ -343,6 +344,8 @@ const VideoConfigSection: React.FC = () => {
   const degradationPreference = useDraftVideoSetting('degradationPreference');
   const hardwareAcceleration = useDraftVideoSetting('hardwareAcceleration');
   const hdrEncoding = useDraftVideoSetting('hdrEncoding');
+  const supportSvc = useDraftVideoSetting('supportSvc');
+  const supportSimulcast = useDraftVideoSetting('supportSimulcast');
 
   // Premium entitlement caps (#1301):
   //  - L2: camera-preset resolution/fps options above the free ceilings carry a
@@ -984,6 +987,53 @@ const VideoConfigSection: React.FC = () => {
             );
           })()}
 
+          {/* SVC / Simulcast casting toggles (#1921). Codec-eligibility allow-lists:
+              they only SUBTRACT eligibility — casting kind stays codec-derived. A
+              codec-inert toggle stays ON + interactive (never disabled). Helper copy
+              is a pure function of (preferredVideoCodec, supportSvc, supportSimulcast). */}
+          {(() => {
+            const copy = castingCopy(preferredVideoCodec, supportSvc, supportSimulcast);
+            return (
+              <>
+                <div className="settings-row">
+                  <div className="settings-row-info">
+                    <span className="settings-row-label" id="casting-svc-label">
+                      Support SVC
+                    </span>
+                    <span className="settings-row-hint" id="casting-svc-hint">
+                      {copy.svc}
+                    </span>
+                  </div>
+                  <ToggleSwitch
+                    id="casting-svc"
+                    ariaLabelledBy="casting-svc-label"
+                    aria-describedby="casting-svc-hint"
+                    checked={supportSvc}
+                    onChange={(v) => setDraftVideoSetting('supportSvc', v)}
+                  />
+                </div>
+                <div className="settings-row">
+                  <div className="settings-row-info">
+                    <span className="settings-row-label" id="casting-simulcast-label">
+                      Support Simulcast
+                    </span>
+                    <span className="settings-row-hint" id="casting-simulcast-hint">
+                      {copy.simulcast}
+                    </span>
+                  </div>
+                  <ToggleSwitch
+                    id="casting-simulcast"
+                    ariaLabelledBy="casting-simulcast-label"
+                    aria-describedby="casting-simulcast-hint"
+                    checked={supportSimulcast}
+                    onChange={(v) => setDraftVideoSetting('supportSimulcast', v)}
+                  />
+                </div>
+                {copy.notice && <output className="settings-row-hint">{copy.notice}</output>}
+              </>
+            );
+          })()}
+
           <div className="settings-row">
             <div className="settings-row-info">
               <span className="settings-row-label">Hardware Acceleration</span>
@@ -1140,10 +1190,6 @@ const VideoConfigSection: React.FC = () => {
               onChange={(v) => setDraftVideoSetting('screenSharePriority', v as VideoPriority)}
             />
           </div>
-
-          {/* Layer mode is not exposed as a manual screen-share control here;
-              camera layering is negotiated by the media-plane gate. The
-              scalabilityMode store value is preserved for codec planning. */}
         </>
       )}
     </CollapsibleSection>

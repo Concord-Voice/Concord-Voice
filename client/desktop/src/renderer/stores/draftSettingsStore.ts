@@ -63,6 +63,8 @@ const VIDEO_DRAFTABLE_KEYS: (keyof DraftableVideoSettings)[] = [
   'scalabilityMode',
   'hardwareAcceleration',
   'hdrEncoding',
+  'supportSvc',
+  'supportSimulcast',
 ];
 
 const TTS_DRAFTABLE_KEYS: (keyof DraftableTTSSettings)[] = [

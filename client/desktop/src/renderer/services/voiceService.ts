@@ -54,7 +54,7 @@ import {
 import { notificationSoundService } from './notificationSoundService';
 import { selectCodecFromCascade, type CodecLookup } from './voiceCodecSelection';
 import { ConsumerPauseCoordinator } from './consumerPauseCoordinator';
-import { buildCameraEncodingPlan } from './cameraLayering';
+import { buildCameraEncodingPlan, castingKindForCodec, isCastingEligible } from './cameraLayering';
 import {
   computeRemoteVideoLayerRequest,
   type RemoteVideoLayerRequest,
@@ -856,6 +856,7 @@ class VoiceService {
       maxBitrate: preset.maxBitrate,
       scalabilityMode: vs.scalabilityMode,
       priority: base,
+      eligibility: { svc: vs.supportSvc, simulcast: vs.supportSimulcast },
     });
     return { codec: layeringCodec, encodings: plan.encodings };
   }
@@ -864,9 +865,14 @@ class VoiceService {
     fallbackCodec?: mediasoupTypes.RtpCodecCapability
   ): mediasoupTypes.RtpCodecCapability | undefined {
     // Layering rooms use the approved SVC-first ladder; user preference only
-    // participates through the general-cascade fallback below.
+    // participates through the general-cascade fallback below. The SVC/Simulcast
+    // eligibility toggles (#1921) pre-filter the ladder so an ineligible casting
+    // kind's codec is skipped — keeping casting strictly codec-derived.
+    const vs = useVideoSettingsStore.getState();
+    const eligibility = { svc: vs.supportSvc, simulcast: vs.supportSimulcast };
     const candidates = ['video/AV1', 'video/VP9', 'video/H264:640034', 'video/H264', 'video/VP8'];
     for (const key of candidates) {
+      if (!isCastingEligible(castingKindForCodec(key.split(':')[0]), eligibility)) continue;
       if (!this.isInCodecFloor(key)) continue;
       const codec = this.findSendCodec(key);
       if (codec) return codec;
@@ -875,8 +881,11 @@ class VoiceService {
   }
 
   /**
-   * Pick the best codec for screen sharing. Screen currently publishes one
-   * encoding; camera layering is negotiated separately by the media-plane gate.
+   * Pick the best codec for screen sharing. Screen honors the SVC half of the
+   * casting toggles only (#1921): AV1/VP9 screen → SVC (1 encoding, server-passive,
+   * cost-neutral), H264/VP8 → single. Simulcast is hard-forced off for screen in v1
+   * — there is no media-plane screen-layering gate yet, so full simulcast-screenshare
+   * parity is deferred to a follow-up issue. SVC is one stream → no server gate needed.
    *
    * Cascade: user pref → AV1 → HEVC → H264 High → VP9:2 (HDR) → H264 → VP9 → VP8
    * Two-pass: HW-accelerated first, then SW fallback.
@@ -901,9 +910,17 @@ class VoiceService {
     const base: Partial<mediasoupTypes.RtpEncodingParameters> =
       prio === 'off' ? {} : { priority: prio, networkPriority: prio };
 
+    const plan = buildCameraEncodingPlan({
+      codec,
+      maxBitrate: bitrate,
+      scalabilityMode: vs.scalabilityMode,
+      priority: base,
+      eligibility: { svc: vs.supportSvc, simulcast: false },
+    });
+
     return {
       codec,
-      encodings: [{ ...base, maxBitrate: bitrate }],
+      encodings: plan.encodings,
       effectiveBitrate: bitrate,
     };
   }
@@ -1016,6 +1033,13 @@ class VoiceService {
         this.fastReproduceScreen();
       }
     }
+    // SVC/Simulcast casting toggles (#1921): a shape-only change does not alter the
+    // codec MIME, so reProduceIfBetterCodec early-returns — reproduce explicitly.
+    // liveReproduceCamera rides the existing stopTracks:false (#1902) + fail-closed
+    // capture-stop (CWE-212) path; do NOT call sendTransport.produce directly.
+    if (state.supportSvc !== prev.supportSvc || state.supportSimulcast !== prev.supportSimulcast) {
+      this.liveReproduceCamera();
+    }
   }
 
   /** Screen share instant parameter updates — extracted for complexity reduction. */
@@ -1031,6 +1055,14 @@ class VoiceService {
     }
     if (state.screenShareBitrate !== prev.screenShareBitrate) {
       this.liveUpdateScreenBitrate(screenProducer, state.screenShareBitrate);
+    }
+    // SVC/Simulcast casting toggles (#1921): screenshare is SVC-only in v1
+    // (pickScreenCodec forces eligibility.simulcast=false), so only a supportSvc
+    // change can alter the screen plan — a supportSimulcast flip is a no-op for
+    // screen and must NOT trigger a wasteful reproduce. fastReproduceScreen rides
+    // the existing stopTracks:false (#1902) + fail-closed capture-stop (CWE-212) path.
+    if (state.supportSvc !== prev.supportSvc) {
+      this.fastReproduceScreen();
     }
     // Note: screen resolution/FPS/contentType changes cannot use replaceTrack
     // because getDisplayMedia requires a user gesture. Apply on next session.
