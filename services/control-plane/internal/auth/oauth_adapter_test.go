@@ -374,3 +374,12 @@ func TestValidatePasswordStrength_RejectsWeak(t *testing.T) {
 	require.Error(t, rig.Handler.ValidatePasswordStrength("short"))
 	require.Error(t, rig.Handler.ValidatePasswordStrength("alllowercase1234"))
 }
+
+// TestNormalizeUsername_LowercasesViaAdapter verifies the wrapper delegates to
+// the package-level NormalizeUsername (lowercase fold) so the SSO path stores
+// usernames identically to the password path (#1931).
+func TestNormalizeUsername_LowercasesViaAdapter(t *testing.T) {
+	rig := newAdapterRig(t)
+	assert.Equal(t, "mixedcase", rig.Handler.NormalizeUsername("MixedCase"))
+	assert.Equal(t, "alllower", rig.Handler.NormalizeUsername("alllower"))
+}

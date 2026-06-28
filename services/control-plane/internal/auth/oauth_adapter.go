@@ -211,6 +211,14 @@ func (h *Handler) ValidateUsername(username string) error {
 	return ValidateUsername(username)
 }
 
+// NormalizeUsername delegates to the package-level NormalizeUsername (lowercase
+// fold) so the SSO registration path stores usernames identically to the
+// password path (#1931). Exposed on *Handler for the same import-cycle-avoidance
+// reason as ValidateUsername.
+func (h *Handler) NormalizeUsername(username string) string {
+	return NormalizeUsername(username)
+}
+
 // ValidatePasswordStrength delegates to the package-level
 // ValidatePasswordStrength — length bounds (≥12, ≤128) and char-class
 // diversity (≥3 of upper/lower/digit/special). Same delegation rationale as

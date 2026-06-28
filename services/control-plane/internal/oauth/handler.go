@@ -85,6 +85,12 @@ type AuthAdapter interface {
 	// to keep the SSO path's username gating identical to the password-path
 	// registration without creating an internal/auth import cycle.
 	ValidateUsername(username string) error
+	// NormalizeUsername delegates to internal/auth/username.NormalizeUsername
+	// (lowercase fold). The SSO path stores the normalized value so usernames
+	// are stored identically to the password path (#1931) — identity is
+	// case-insensitive everywhere (LOWER() lookups), and a mixed-case stored
+	// username otherwise breaks the profile-edit no-op guard and friend-add.
+	NormalizeUsername(username string) string
 	// ValidatePasswordStrength delegates to internal/auth/password.ValidatePasswordStrength:
 	// length bounds and char-class diversity (≥3 of upper/lower/digit/special).
 	// The 128-char max is the critical DoS defense — Argon2id hashing scales
@@ -284,7 +290,15 @@ func (h *Handler) createSSOUser(ctx context.Context, tx *sql.Tx, p *createSSOUse
 		if strings.Contains(err.Error(), "users_email_key") {
 			return "", "email_taken", err
 		}
-		if strings.Contains(err.Error(), "users_username_key") {
+		// Two unique indexes can fire on a duplicate username: the original raw
+		// users_username_key (000001) and the case-insensitive users_username_lower_key
+		// (000079, #1931). The username is normalized to lowercase before this INSERT,
+		// so a duplicate normally trips the raw index first — but matching BOTH names
+		// keeps the 409 mapping order-independent and robust if a raw value ever reaches
+		// here (otherwise it would mis-map to a 500). Note: "users_username_lower_key"
+		// does NOT contain "users_username_key" as a substring, so the explicit OR is required.
+		if strings.Contains(err.Error(), "users_username_key") ||
+			strings.Contains(err.Error(), "users_username_lower_key") {
 			return "", "username_taken", err
 		}
 		return "", "user_create_failed", err
@@ -854,9 +868,12 @@ func (h *Handler) CompleteRegistration(c *gin.Context) {
 	defer func() { _ = tx.Rollback() }()
 
 	userID, errCode, err := h.createSSOUser(ctx, tx, &createSSOUserParams{
-		Info:     info,
-		Hash:     hash,
-		Username: req.Username,
+		Info: info,
+		Hash: hash,
+		// Store the normalized (lowercase) username so the SSO path matches the
+		// password path (#1931). ValidateUsername above ran on the user-facing
+		// value; identity is case-insensitive everywhere (LOWER() lookups).
+		Username: h.deps.AuthHandler.NormalizeUsername(req.Username),
 		Wrapped:  wrapped,
 		Salt:     salt,
 		PubKey:   pubKey,

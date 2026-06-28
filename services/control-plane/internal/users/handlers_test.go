@@ -323,6 +323,53 @@ func TestUpdateMeUsernameChangeSameUsername(t *testing.T) {
 	assert.Equal(t, "No fields to update", body["error"])
 }
 
+// TestUpdateMeMixedCaseUsernameNoOpAllowsProfileEdit locks the #1931 fix: a
+// legacy SSO-style row stored with a mixed-case username must NOT trip the
+// username-change cooldown when the user edits an unrelated profile field while
+// the renderer re-sends the (unchanged) username. Pre-fix the case-sensitive
+// no-op guard missed and returned 403; post-fix it is a case-insensitive no-op
+// and the display-name change succeeds.
+func TestUpdateMeMixedCaseUsernameNoOpAllowsProfileEdit(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "mixedcaseedit")
+
+	// Simulate the legacy SSO storage (raw mixed-case), bypassing the now-
+	// normalizing registration path. username_changed_at is NOW() (cooldown live).
+	_, err := ts.DB.Exec(`UPDATE users SET username = 'MixedCaseEdit' WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest(methodPatch, urlUsersMe, map[string]interface{}{
+		keyUsername:    "MixedCaseEdit", // unchanged (case-insensitively); must be a no-op
+		"display_name": "New Display Name",
+	}, testhelpers.AuthHeaders(user.AccessToken))
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	userData := body["user"].(map[string]interface{})
+	assert.Equal(t, "New Display Name", userData["display_name"])
+	// Username unchanged — the no-op guard skipped the username clause entirely.
+	assert.Equal(t, "MixedCaseEdit", userData[keyUsername])
+}
+
+// TestUpdateMeMixedCaseUsernamePureNoOp: re-submitting only the mixed-case
+// username (any case) is a no-op → 400 "No fields to update", NOT a 403 cooldown.
+func TestUpdateMeMixedCaseUsernamePureNoOp(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "mixedcasenoop")
+	_, err := ts.DB.Exec(`UPDATE users SET username = 'MixedCaseNoOp' WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest(methodPatch, urlUsersMe, map[string]interface{}{
+		keyUsername: "mixedcasenoop", // any case of the same username → no-op
+	}, testhelpers.AuthHeaders(user.AccessToken))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "No fields to update", body["error"])
+}
+
 func TestUpdateMeUsernameWithPeriod(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "periodtest")

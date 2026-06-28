@@ -402,8 +402,12 @@ func (h *Handler) validateUsername(b *profileUpdateBuilder, username string, use
 		return http.StatusInternalServerError, errMsgFailedUpdateProfile
 	}
 
-	if normalized == currentUsername {
-		return 0, "" // no-op
+	if normalized == auth.NormalizeUsername(currentUsername) {
+		// no-op: case-insensitive comparison. SSO-registered rows may store a
+		// mixed-case username (pre-#1931); identity is case-insensitive
+		// everywhere (LOWER() lookups), so re-submitting one's own username in
+		// any case is genuinely a no-op and must not trip the change cooldown.
+		return 0, ""
 	}
 
 	cooldownEnd := usernameChangedAt.Add(ent.UsernameChangeInterval)
@@ -416,7 +420,7 @@ func (h *Handler) validateUsername(b *profileUpdateBuilder, username string, use
 
 	var count int
 	err = h.db.QueryRow(
-		`SELECT COUNT(*) FROM users WHERE username = $1 AND id != $2`,
+		`SELECT COUNT(*) FROM users WHERE LOWER(username) = $1 AND id != $2`,
 		normalized, userID,
 	).Scan(&count)
 	if err != nil {

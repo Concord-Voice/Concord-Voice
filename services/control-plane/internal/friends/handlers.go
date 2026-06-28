@@ -176,7 +176,9 @@ func (h *Handler) resolveTargetUserID(req SendRequestBody) resolveResult {
 	}
 	if req.Username != nil {
 		var targetUserID string
-		err := h.db.QueryRow(`SELECT id FROM users WHERE username = $1`, strings.ToLower(strings.TrimSpace(*req.Username))).Scan(&targetUserID)
+		// LOWER(username): identity is case-insensitive; legacy SSO rows may be
+		// stored mixed-case (pre-#1931), so match case-insensitively.
+		err := h.db.QueryRow(`SELECT id FROM users WHERE LOWER(username) = $1`, strings.ToLower(strings.TrimSpace(*req.Username))).Scan(&targetUserID)
 		if err == sql.ErrNoRows {
 			return resolveResult{status: http.StatusNotFound, errMsg: "User not found"}
 		}

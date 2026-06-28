@@ -303,6 +303,9 @@ func (f *fakeAuthAdapter) ValidateUsername(_ string) error {
 	}
 	return nil
 }
+func (f *fakeAuthAdapter) NormalizeUsername(u string) string {
+	return strings.ToLower(u)
+}
 func (f *fakeAuthAdapter) ValidatePasswordStrength(_ string) error {
 	if f.ValidatePasswordFail {
 		return fmt.Errorf("password must contain at least 3 character classes")
@@ -377,6 +380,53 @@ func TestCompleteRegistration_HappyPath(t *testing.T) {
 	// Verify sso_token consumed (single-use defense).
 	_, err = rig.Redis.Get(context.Background(), "sso_token:"+ssoToken).Bytes()
 	require.Error(t, err, "sso_token must be deleted after consumption")
+}
+
+// TestCompleteRegistration_NormalizesUsername locks the #1931 SSO half: the
+// username is stored normalized (lowercase) so the SSO path matches the password
+// path. A mixed-case submission must persist lowercase in users.username.
+func TestCompleteRegistration_NormalizesUsername(t *testing.T) {
+	rig := newSSOCallbackTestRig(t, "http://unused")
+	rig.Engine.POST("/api/v1/auth/sso/:provider/complete-registration",
+		rig.Handler.CompleteRegistration)
+
+	ssoToken := "sso-token-mixedcase-1" //nolint:gosec // test fixture, not a real secret
+	payload := map[string]any{
+		"provider":         "google",
+		"provider_user_id": "google-sub-mixedcase",
+		"provider_email":   "mixedcase@example.test",
+		"name":             "Mixed Case",
+		"branch":           "new_user",
+		"created_at":       time.Now().UTC().Format(time.RFC3339),
+	}
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+
+	body := map[string]any{
+		"sso_token":           ssoToken,
+		"username":            "NewCompMixed",         // mixed-case submission
+		"password":            "TestPassphrase!12345", // pragma: allowlist secret
+		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("wrapped-priv-key-bytes")),
+		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("salt-bytes-xxxxxxx")),
+		"public_key":          base64.StdEncoding.EncodeToString([]byte("public-key-bytes")),
+	}
+	bodyJSON, err := json.Marshal(body)
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost,
+		"/api/v1/auth/sso/google/complete-registration", bytes.NewReader(bodyJSON))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	rig.Engine.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	var storedUsername string
+	require.NoError(t, rig.DB.QueryRow(
+		`SELECT username FROM users WHERE email = $1`, "mixedcase@example.test",
+	).Scan(&storedUsername))
+	assert.Equal(t, "newcompmixed", storedUsername,
+		"SSO registration must store the username normalized (lowercase) — #1931")
 }
 
 // TestCompleteRegistration_ReplayedSSOToken_Rejected covers the single-use
@@ -599,6 +649,51 @@ func TestCompleteRegistration_UsernameTaken_409(t *testing.T) {
 	rig.Engine.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusConflict, w.Code)
+	assert.Contains(t, w.Body.String(), "username_taken")
+}
+
+// TestCompleteRegistration_UsernameTaken_CaseVariant_409 locks the #1931 review
+// finding: an SSO username that collides only CASE-INSENSITIVELY with an existing
+// user must still map to 409 username_taken (not 500). The username is normalized
+// to lowercase before INSERT (C2), so the duplicate trips a unique index; the
+// error-code detection matches BOTH users_username_key and users_username_lower_key
+// so the 409 mapping is order-independent.
+func TestCompleteRegistration_UsernameTaken_CaseVariant_409(t *testing.T) {
+	rig := newSSOCallbackTestRig(t, "http://unused")
+	rig.Engine.POST("/api/v1/auth/sso/:provider/complete-registration",
+		rig.Handler.CompleteRegistration)
+
+	// Seed a lowercase user; the SSO flow will submit a mixed-case variant.
+	_ = insertSSOTestUser(t, rig.DB, "casevariant-seed@example.test", "casevariant")
+
+	ssoToken := "sso-token-username-taken-casevariant" //nolint:gosec // test fixture, not a real secret
+	payload := map[string]any{
+		"provider":         "google",
+		"provider_user_id": "google-sub-casevariant",
+		"provider_email":   "casevariant-fresh@example.test",
+		"branch":           "new_user",
+	}
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+
+	body := map[string]any{
+		"sso_token":           ssoToken,
+		"username":            "CaseVariant",          // case-insensitive collision with 'casevariant'
+		"password":            "TestPassphrase!12345", // pragma: allowlist secret
+		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("k")),
+		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("s")),
+		"public_key":          base64.StdEncoding.EncodeToString([]byte("p")),
+	}
+	bodyJSON, err := json.Marshal(body)
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost,
+		"/api/v1/auth/sso/google/complete-registration", bytes.NewReader(bodyJSON))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	rig.Engine.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusConflict, w.Code, "case-variant collision must be 409, not 500")
 	assert.Contains(t, w.Body.String(), "username_taken")
 }
 

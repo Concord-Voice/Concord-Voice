@@ -433,6 +433,26 @@ func TestSendRequest_ByUsername(t *testing.T) {
 	assert.Equal(t, http.StatusCreated, w.Code)
 }
 
+// TestSendRequest_ByUsername_MixedCaseStored locks the #1931 friend-add half: a
+// legacy SSO-style row stored with a mixed-case username must still be resolvable
+// by username (lookup is case-insensitive). Pre-fix the raw `username = $1` match
+// against the lowercased input returned "User not found".
+func TestSendRequest_ByUsername_MixedCaseStored(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "sender3mixed")
+	user2 := ts.CreateTestUser(t, "receiver3mixed")
+
+	// Simulate legacy SSO storage (raw mixed-case), bypassing normalization.
+	_, err := ts.DB.Exec(`UPDATE users SET username = 'Receiver3Mixed' WHERE id = $1`, user2.ID)
+	require.NoError(t, err)
+
+	// Send by ANY case — the handler lowercases the input and matches LOWER(username).
+	w := ts.DoRequest("POST", pathFriendRequest, map[string]interface{}{
+		"username": "ReCeIvEr3MiXeD",
+	}, testhelpers.AuthHeaders(user1.AccessToken))
+	assert.Equal(t, http.StatusCreated, w.Code, "mixed-case stored username must resolve, not 404")
+}
+
 func TestSendRequest_InvalidUserID(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "sendinvalid")
