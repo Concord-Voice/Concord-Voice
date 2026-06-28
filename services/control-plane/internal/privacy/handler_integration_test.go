@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/auth"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 )
 
@@ -42,6 +43,54 @@ func TestEraseAccount_Integration_HappyPath(t *testing.T) {
 		WHERE user_id IS NULL AND deleted_at >= NOW() - INTERVAL '1 minute'
 	`).Scan(&auditRows))
 	assert.GreaterOrEqual(t, auditRows, 1, "audit row must be inserted with NULL user_id")
+}
+
+func TestEraseAccount_Integration_BlacklistsCurrentAccessToken(t *testing.T) {
+	// Regression for #718: erasure must revoke the caller's still-live access token.
+	ts := testhelpers.SetupTestServer(t)
+	user := ts.CreateTestUser(t, "eraseblacklist")
+	headers := testhelpers.AuthHeaders(user.AccessToken)
+
+	w := ts.DoRequest(
+		http.MethodPost,
+		"/api/v1/privacy/erase-account",
+		map[string]interface{}{},
+		headers,
+	)
+	require.Equal(t, http.StatusNoContent, w.Code)
+
+	w = ts.DoRequest(
+		http.MethodPost,
+		"/api/v1/auth/ws-ticket",
+		nil,
+		headers,
+	)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestEraseAccount_Integration_DeniesOtherLiveAccessTokens(t *testing.T) {
+	// Regression for Gitar review on #718: erasure must reject every already-issued
+	// access token for the erased user, not only the token that called erasure.
+	ts := testhelpers.SetupTestServer(t)
+	user := ts.CreateTestUser(t, "eraseallsessions")
+	otherAccessToken, err := auth.GenerateAccessToken(user.ID, testhelpers.TestJWTSecret, true)
+	require.NoError(t, err)
+
+	w := ts.DoRequest(
+		http.MethodPost,
+		"/api/v1/privacy/erase-account",
+		map[string]interface{}{},
+		testhelpers.AuthHeaders(user.AccessToken),
+	)
+	require.Equal(t, http.StatusNoContent, w.Code)
+
+	w = ts.DoRequest(
+		http.MethodPost,
+		"/api/v1/auth/ws-ticket",
+		nil,
+		testhelpers.AuthHeaders(otherAccessToken),
+	)
+	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
 // TestEraseAccount_Integration_IgnoresUnknownClientId is the end-to-end

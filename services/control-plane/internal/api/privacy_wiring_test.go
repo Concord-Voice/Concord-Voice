@@ -19,7 +19,7 @@ func TestBuildPrivacyHandler_ConstructsHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	log := logger.New("test")
 
-	h := buildPrivacyHandler(nil, log)
+	h := buildPrivacyHandler(nil, nil, log)
 	require.NotNil(t, h, "buildPrivacyHandler must return a non-nil handler")
 }
 
@@ -30,7 +30,7 @@ func TestBuildPrivacyHandler_NilLogger(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	require.NotPanics(t, func() {
-		h := buildPrivacyHandler(nil, nil)
+		h := buildPrivacyHandler(nil, nil, nil)
 		require.NotNil(t, h)
 	})
 }

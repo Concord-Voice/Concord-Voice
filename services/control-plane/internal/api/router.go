@@ -250,7 +250,7 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	clientConfigHandler := clientconfig.NewHandler(cfg, liveSpa, log)
 	serverCapabilitiesHandler := servercapabilities.NewHandler(cfg)
 	updatesHandler := updates.NewHandler(cfg, log)
-	privacyHandler := buildPrivacyHandler(db, log)
+	privacyHandler := buildPrivacyHandler(db, redis, log)
 	oauthHandler := buildOAuthHandler(db, redis, cfg, authHandler, log)
 
 	// Client attestation (#677, ADR-0010). When REQUIRE_CLIENT_ATTESTATION=false

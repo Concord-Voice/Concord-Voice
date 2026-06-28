@@ -14,9 +14,15 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// authError is the single generic message returned for all authentication failures.
-// Detailed diagnostics are intentionally omitted to avoid leaking information.
-const authError = "Authentication required"
+const (
+	// authError is the single generic message returned for all authentication failures.
+	// Detailed diagnostics are intentionally omitted to avoid leaking information.
+	authError = "Authentication required"
+
+	// JWTClaimsContextKey stores validated JWT claims on the Gin context for
+	// handlers that must act on the current token without reparsing it.
+	JWTClaimsContextKey = "jwt_claims"
+)
 
 // AuthRequired returns a middleware that validates JWT tokens and checks the
 // token blacklist in Redis. Tokens that have been revoked (e.g. on logout)
@@ -57,6 +63,7 @@ func AuthRequired(jwtSecret string, redisClient *redis.Client) gin.HandlerFunc {
 		}
 
 		c.Set("user_id", userID)
+		c.Set(JWTClaimsContextKey, claims)
 		c.Set("email_verified", emailVerifiedFromClaims(claims))
 		c.Next()
 	}

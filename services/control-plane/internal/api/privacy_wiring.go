@@ -4,6 +4,8 @@ package api
 import (
 	"database/sql"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/privacy"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/users"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
@@ -12,7 +14,7 @@ import (
 // buildPrivacyHandler constructs the privacy handler wired to the
 // account-deletion service. Telemetry-related wiring was removed in #758 (sub-epic G);
 // the handler now exposes only POST /api/v1/privacy/erase-account.
-func buildPrivacyHandler(db *sql.DB, log *logger.Logger) *privacy.Handler {
+func buildPrivacyHandler(db *sql.DB, redisClient *redis.Client, log *logger.Logger) *privacy.Handler {
 	account := users.NewAccountService(db, log)
-	return privacy.NewHandler(account, log)
+	return privacy.NewHandler(account, redisClient, log)
 }

@@ -2,12 +2,19 @@
 package privacy
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/redis/go-redis/v9"
 
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/auth"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/users"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 )
@@ -15,6 +22,7 @@ import (
 // Handler exposes the privacy erasure endpoints.
 type Handler struct {
 	account users.AccountDeleter
+	redis   *redis.Client
 	log     *logger.Logger
 }
 
@@ -23,14 +31,16 @@ type Handler struct {
 // a nil value would surface as an opaque nil-pointer panic on the first
 // request. Panicking at construction makes mis-wiring obvious at startup.
 //
-// A nil logger IS allowed in tests that do not exercise the failure path;
-// production callers must always pass a non-nil logger. The log field is
+// A nil redis client IS allowed in direct unit tests that do not exercise
+// current-token revocation; production callers must always pass a non-nil
+// client. A nil logger IS allowed in tests that do not exercise the failure
+// path; production callers must always pass a non-nil logger. The log field is
 // only dereferenced behind a nil-check on the error path.
-func NewHandler(account users.AccountDeleter, log *logger.Logger) *Handler {
+func NewHandler(account users.AccountDeleter, redisClient *redis.Client, log *logger.Logger) *Handler {
 	if account == nil {
 		panic("privacy.NewHandler: account AccountDeleter must not be nil")
 	}
-	return &Handler{account: account, log: log}
+	return &Handler{account: account, redis: redisClient, log: log}
 }
 
 // eraseAccountRequest is intentionally empty. Unknown fields in the
@@ -81,5 +91,54 @@ func (h *Handler) EraseAccount(c *gin.Context) {
 		return
 	}
 
+	if err := h.revokeAccessTokens(c, userID); err != nil {
+		if h.log != nil {
+			h.log.Error("erase-account: access token revocation failed",
+				"user_id", userID,
+				"error", err,
+			)
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "access token revocation failed"})
+		return
+	}
+
 	c.Status(http.StatusNoContent)
+}
+
+func (h *Handler) revokeAccessTokens(c *gin.Context, userID string) error {
+	if h.redis == nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+	if err := h.redis.Set(ctx, middleware.UserDisabledKey(userID), "1", auth.AccessTokenTTL).Err(); err != nil {
+		return fmt.Errorf("denylist erased user: %w", err)
+	}
+
+	rawClaims, ok := c.Get(middleware.JWTClaimsContextKey)
+	if !ok {
+		return nil
+	}
+	claims, ok := rawClaims.(jwt.MapClaims)
+	if !ok {
+		return errors.New("jwt claims have unexpected type")
+	}
+
+	jti, ok := claims["jti"].(string)
+	if !ok || jti == "" {
+		return errors.New("jwt claims missing jti")
+	}
+	expiresAt, err := claims.GetExpirationTime()
+	if err != nil {
+		return fmt.Errorf("read jwt expiration: %w", err)
+	}
+	if expiresAt == nil {
+		return errors.New("jwt claims missing expiration")
+	}
+
+	if err := middleware.BlacklistToken(ctx, h.redis, jti, time.Until(expiresAt.Time)); err != nil {
+		return fmt.Errorf("blacklist current access token: %w", err)
+	}
+	return nil
 }

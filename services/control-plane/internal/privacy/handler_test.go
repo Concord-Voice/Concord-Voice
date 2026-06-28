@@ -7,12 +7,17 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/auth"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/privacy"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/users"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 )
@@ -53,7 +58,7 @@ func newTestContext(t *testing.T, body string, userID string) (*gin.Context, *ht
 // not as an opaque nil-pointer dereference at first request.
 func TestNewHandler_PanicsOnNilAccount(t *testing.T) {
 	require.Panics(t, func() {
-		privacy.NewHandler(nil, logger.New("test"))
+		privacy.NewHandler(nil, nil, logger.New("test"))
 	})
 }
 
@@ -63,13 +68,13 @@ func TestNewHandler_PanicsOnNilAccount(t *testing.T) {
 func TestNewHandler_ToleratesNilLogger(t *testing.T) {
 	stub := &stubAccountDeleter{}
 	require.NotPanics(t, func() {
-		_ = privacy.NewHandler(stub, nil)
+		_ = privacy.NewHandler(stub, nil, nil)
 	})
 }
 
 func TestEraseAccount_Returns401WhenUserIDMissing(t *testing.T) {
 	stub := &stubAccountDeleter{}
-	h := privacy.NewHandler(stub, logger.New("test"))
+	h := privacy.NewHandler(stub, nil, logger.New("test"))
 
 	c, _ := newTestContext(t, `{}`, "")
 	h.EraseAccount(c)
@@ -80,7 +85,7 @@ func TestEraseAccount_Returns401WhenUserIDMissing(t *testing.T) {
 
 func TestEraseAccount_Returns400OnInvalidJSON(t *testing.T) {
 	stub := &stubAccountDeleter{}
-	h := privacy.NewHandler(stub, logger.New("test"))
+	h := privacy.NewHandler(stub, nil, logger.New("test"))
 
 	c, _ := newTestContext(t, `{not-json`, "test-user-uuid")
 	h.EraseAccount(c)
@@ -91,7 +96,7 @@ func TestEraseAccount_Returns400OnInvalidJSON(t *testing.T) {
 
 func TestEraseAccount_Returns204OnEmptyBody(t *testing.T) {
 	stub := &stubAccountDeleter{}
-	h := privacy.NewHandler(stub, logger.New("test"))
+	h := privacy.NewHandler(stub, nil, logger.New("test"))
 
 	c, _ := newTestContext(t, ``, "test-user-uuid")
 	h.EraseAccount(c)
@@ -103,7 +108,7 @@ func TestEraseAccount_Returns204OnEmptyBody(t *testing.T) {
 
 func TestEraseAccount_Returns204OnEmptyJSONBody(t *testing.T) {
 	stub := &stubAccountDeleter{}
-	h := privacy.NewHandler(stub, logger.New("test"))
+	h := privacy.NewHandler(stub, nil, logger.New("test"))
 
 	c, _ := newTestContext(t, `{}`, "test-user-uuid")
 	h.EraseAccount(c)
@@ -112,9 +117,96 @@ func TestEraseAccount_Returns204OnEmptyJSONBody(t *testing.T) {
 	assert.True(t, stub.called)
 }
 
+func TestEraseAccount_RevokesAccessTokensFromClaims(t *testing.T) {
+	rdb, cleanup := testhelpers.SetupTestRedis(t)
+	defer cleanup()
+
+	stub := &stubAccountDeleter{}
+	h := privacy.NewHandler(stub, rdb, logger.New("test"))
+
+	const jti = "erase-account-current-token"
+	c, _ := newTestContext(t, `{}`, "test-user-uuid")
+	c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{
+		"jti": jti,
+		"exp": float64(time.Now().Add(15 * time.Minute).Unix()),
+	})
+
+	h.EraseAccount(c)
+
+	assert.Equal(t, http.StatusNoContent, c.Writer.Status())
+	assert.True(t, stub.called)
+
+	ctx := context.Background()
+	val, err := rdb.Get(ctx, "blacklist:"+jti).Result()
+	require.NoError(t, err)
+	assert.Equal(t, "1", val)
+
+	ttl, err := rdb.TTL(ctx, "blacklist:"+jti).Result()
+	require.NoError(t, err)
+	assert.Greater(t, ttl, time.Duration(0))
+
+	disabledVal, err := rdb.Get(ctx, middleware.UserDisabledKey("test-user-uuid")).Result()
+	require.NoError(t, err)
+	assert.Equal(t, "1", disabledVal)
+
+	disabledTTL, err := rdb.TTL(ctx, middleware.UserDisabledKey("test-user-uuid")).Result()
+	require.NoError(t, err)
+	assert.Greater(t, disabledTTL, time.Duration(0))
+	assert.LessOrEqual(t, disabledTTL, auth.AccessTokenTTL)
+}
+
+func TestEraseAccount_FailsClosedOnMalformedAccessTokenClaims(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name   string
+		claims any
+	}{
+		{
+			name:   "unexpected type",
+			claims: "not-jwt-map-claims",
+		},
+		{
+			name: "missing jti",
+			claims: jwt.MapClaims{
+				"exp": float64(now.Add(15 * time.Minute).Unix()),
+			},
+		},
+		{
+			name: "invalid expiration",
+			claims: jwt.MapClaims{
+				"jti": "invalid-expiration",
+				"exp": "soon",
+			},
+		},
+		{
+			name: "missing expiration",
+			claims: jwt.MapClaims{
+				"jti": "missing-expiration",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rdb, cleanup := testhelpers.SetupTestRedis(t)
+			defer cleanup()
+
+			stub := &stubAccountDeleter{}
+			h := privacy.NewHandler(stub, rdb, logger.New("test"))
+			c, _ := newTestContext(t, `{}`, "test-user-uuid")
+			c.Set(middleware.JWTClaimsContextKey, tt.claims)
+
+			h.EraseAccount(c)
+
+			assert.Equal(t, http.StatusInternalServerError, c.Writer.Status())
+			assert.True(t, stub.called, "claims are validated after account deletion succeeds")
+		})
+	}
+}
+
 func TestEraseAccount_Returns404OnUserNotFound(t *testing.T) {
 	stub := &stubAccountDeleter{err: users.ErrUserNotFound}
-	h := privacy.NewHandler(stub, logger.New("test"))
+	h := privacy.NewHandler(stub, nil, logger.New("test"))
 
 	c, _ := newTestContext(t, `{}`, "missing-user-uuid")
 	h.EraseAccount(c)
@@ -124,7 +216,7 @@ func TestEraseAccount_Returns404OnUserNotFound(t *testing.T) {
 
 func TestEraseAccount_Returns500OnUnknownError(t *testing.T) {
 	stub := &stubAccountDeleter{err: errors.New("db unavailable")}
-	h := privacy.NewHandler(stub, logger.New("test"))
+	h := privacy.NewHandler(stub, nil, logger.New("test"))
 
 	c, _ := newTestContext(t, `{}`, "test-user-uuid")
 	h.EraseAccount(c)
@@ -141,7 +233,7 @@ func TestEraseAccount_Returns500OnUnknownError(t *testing.T) {
 func TestEraseAccount_IgnoresUnknownClientIdField(t *testing.T) {
 	const sentinelClientID = "deadbeefcafef00d1122334455667788" //nolint:gosec // pragma: allowlist secret — test sentinel
 	stub := &stubAccountDeleter{}
-	h := privacy.NewHandler(stub, logger.New("test"))
+	h := privacy.NewHandler(stub, nil, logger.New("test"))
 
 	body := `{"clientId":"` + sentinelClientID + `"}`
 	c, _ := newTestContext(t, body, "test-user-uuid")
