@@ -1622,12 +1622,10 @@ func (h *Handler) SetRecoveryHardened(c *gin.Context) {
 	})
 }
 
-// ── Email/SMS MFA (Dev Stub) ──────────────────────────────────────────────────
+// ── Email/SMS MFA ──────────────────────────────────────────────────────────────
 //
-// These endpoints provide a testable Email/SMS MFA flow for development.
-// In dev mode, generated codes are returned in the API response (displayed on screen).
-// In production, these endpoints refuse to operate — real email/SMS delivery is a
-// separate issue requiring provider integration (SendGrid, Twilio, etc.).
+// Email setup sends codes through the configured email service. SMS remains
+// unavailable in production until an SMS provider is wired.
 
 // generateNumericCode creates a cryptographically random N-digit numeric code.
 func generateNumericCode(digits int) (string, error) {
@@ -1668,6 +1666,33 @@ func (h *Handler) generateAndStoreEmailSmsCodes(ctx context.Context, userID stri
 	return codes, nil
 }
 
+func (h *Handler) sendEmailSmsSetupEmail(c *gin.Context, userID string, userEmail string, codes map[string]string) bool {
+	code, ok := codes["email"]
+	if !ok {
+		return true
+	}
+
+	if h.emailSvc == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Email delivery is not configured"})
+		return false
+	}
+
+	if err := h.emailSvc.SendVerificationCode(userEmail, code); err != nil {
+		h.log.Error("Failed to send MFA email code", "error", err, "user_id", userID)
+		if h.redis != nil {
+			ctx := context.Background()
+			if c.Request != nil {
+				ctx = c.Request.Context()
+			}
+			h.redis.Del(ctx, fmt.Sprintf(redisKeyEmailSmsSetup, userID, "email"))
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send verification email"})
+		return false
+	}
+
+	return true
+}
+
 // EmailSmsSetup enables email and/or SMS as MFA methods.
 // Requires password + MFA (if active). Email codes are delivered via the email service;
 // SMS is still dev-only (requires Twilio integration).
@@ -1699,6 +1724,13 @@ func (h *Handler) EmailSmsSetup(c *gin.Context) {
 		return
 	}
 
+	for _, method := range req.Methods {
+		if method == "email" && h.emailSvc == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Email delivery is not configured"})
+			return
+		}
+	}
+
 	var userEmail string
 	if err := h.db.QueryRowContext(ctx, `SELECT email FROM users WHERE id = $1`, userID).Scan(&userEmail); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to look up account email"})
@@ -1711,12 +1743,8 @@ func (h *Handler) EmailSmsSetup(c *gin.Context) {
 		return
 	}
 
-	if code, ok := codes["email"]; ok && h.emailSvc != nil {
-		if err := h.emailSvc.SendVerificationCode(userEmail, code); err != nil {
-			h.log.Error("Failed to send MFA email code", "error", err, "user_id", userID)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send verification email"})
-			return
-		}
+	if !h.sendEmailSmsSetupEmail(c, userID, userEmail, codes) {
+		return
 	}
 
 	resp := gin.H{
@@ -1815,7 +1843,7 @@ func (h *Handler) EmailSmsVerify(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":  "Email/SMS MFA methods activated",
+		"message":  "MFA methods activated",
 		"verified": verified,
 	})
 }

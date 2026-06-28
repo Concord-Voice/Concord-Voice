@@ -770,7 +770,7 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 					mfaHandler.SetRecoveryHardened,
 				)
 
-				// Email/SMS MFA (dev stub — blocked in production)
+				// Email MFA setup, with SMS blocked in production until provider integration
 				mfaRoutes.POST("/email-sms/setup",
 					middleware.RateLimitByUser(redis, 5, 1*time.Minute),
 					mfaHandler.EmailSmsSetup,
