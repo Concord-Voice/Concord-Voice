@@ -30,6 +30,36 @@ export type OsPermissionState = Record<OsPermissionType, OsPermissionStatus>;
 
 const INITIAL_STATUS: OsPermissionStatus = 'not-determined';
 
+function notificationPermissionToStatus(permission: NotificationPermission): OsPermissionStatus {
+  if (permission === 'granted') return 'granted';
+  if (permission === 'denied') return 'denied';
+  return 'not-determined';
+}
+
+function browserNotificationStatus(): OsPermissionStatus | null {
+  const notificationApi = globalThis.Notification;
+  if (notificationApi === undefined) return null;
+  return notificationPermissionToStatus(notificationApi.permission);
+}
+
+function reconcileNotificationStatus(status: OsPermissionStatus): OsPermissionStatus {
+  if (status !== 'not-determined') return status;
+  const browserStatus = browserNotificationStatus();
+  return browserStatus && browserStatus !== 'not-determined' ? browserStatus : status;
+}
+
+async function requestBrowserNotificationStatus(): Promise<OsPermissionStatus | null> {
+  const notificationApi = globalThis.Notification;
+  if (notificationApi === undefined) return null;
+  const requestPermission = notificationApi.requestPermission;
+  if (requestPermission === undefined) return browserNotificationStatus();
+  try {
+    return notificationPermissionToStatus(await requestPermission.call(notificationApi));
+  } catch {
+    return browserNotificationStatus();
+  }
+}
+
 interface OsPermissionStoreState {
   // Permission statuses
   microphone: OsPermissionStatus;
@@ -85,7 +115,7 @@ export const useOsPermissionStore = createStore<OsPermissionStoreState>()((set, 
         camera: state.camera ?? INITIAL_STATUS,
         screen: state.screen ?? INITIAL_STATUS,
         secureStorage: state.secureStorage ?? INITIAL_STATUS,
-        notifications: state.notifications ?? INITIAL_STATUS,
+        notifications: reconcileNotificationStatus(state.notifications ?? INITIAL_STATUS),
         isLoaded: true,
       });
     } catch (err) {
@@ -98,8 +128,9 @@ export const useOsPermissionStore = createStore<OsPermissionStoreState>()((set, 
     if (!globalThis.electron?.checkPermission) return get()[type];
     try {
       const status = await globalThis.electron.checkPermission(type);
-      set({ [type]: status });
-      return status;
+      const resolved = type === 'notifications' ? reconcileNotificationStatus(status) : status;
+      set({ [type]: resolved });
+      return resolved;
     } catch (err) {
       console.error('[osPermissionStore] checkOne failed:', type, errorMessage(err));
       return get()[type];
@@ -107,11 +138,26 @@ export const useOsPermissionStore = createStore<OsPermissionStoreState>()((set, 
   },
 
   requestOne: async (type) => {
-    if (!globalThis.electron?.requestPermission) return get()[type];
+    let browserStatus: OsPermissionStatus | null = null;
+    if (type === 'notifications') {
+      browserStatus = await requestBrowserNotificationStatus();
+      if (browserStatus === 'denied') {
+        set({ [type]: browserStatus });
+        return browserStatus;
+      }
+    }
+    if (!globalThis.electron?.requestPermission) {
+      if (browserStatus && browserStatus !== 'not-determined') {
+        set({ [type]: browserStatus });
+        return browserStatus;
+      }
+      return get()[type];
+    }
     try {
       const status = await globalThis.electron.requestPermission(type);
-      set({ [type]: status });
-      return status;
+      const resolved = type === 'notifications' ? reconcileNotificationStatus(status) : status;
+      set({ [type]: resolved });
+      return resolved;
     } catch (err) {
       console.error('[osPermissionStore] requestOne failed:', type, errorMessage(err));
       return get()[type];

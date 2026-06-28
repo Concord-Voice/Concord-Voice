@@ -1,7 +1,26 @@
 import { vi } from 'vitest';
 import { useOsPermissionStore, ensureOsPermission } from '@/renderer/stores/osPermissionStore';
 
+function mockBrowserNotification(
+  permission: NotificationPermission,
+  requestPermission: (() => Promise<NotificationPermission>) | undefined = vi
+    .fn()
+    .mockResolvedValue(permission)
+): void {
+  Object.defineProperty(globalThis, 'Notification', {
+    value: {
+      permission,
+      requestPermission,
+    },
+    configurable: true,
+  });
+}
+
 beforeEach(() => {
+  Object.defineProperty(globalThis, 'Notification', {
+    value: undefined,
+    configurable: true,
+  });
   useOsPermissionStore.setState({
     microphone: 'not-determined',
     camera: 'not-determined',
@@ -70,6 +89,128 @@ describe('osPermissionStore', () => {
     expect(result).toBe('granted');
     expect(useOsPermissionStore.getState().camera).toBe('granted');
     expect(window.electron.requestPermission).toHaveBeenCalledWith('camera');
+  });
+
+  it('fetchAll uses browser-granted notifications when Electron reports not-determined (#1948)', async () => {
+    mockBrowserNotification('granted');
+    window.electron.checkAllPermissions = vi.fn().mockResolvedValue({
+      microphone: 'granted',
+      camera: 'granted',
+      screen: 'granted',
+      secureStorage: 'granted',
+      notifications: 'not-determined',
+    });
+
+    await useOsPermissionStore.getState().fetchAll();
+
+    expect(useOsPermissionStore.getState().notifications).toBe('granted');
+  });
+
+  it('fetchAll preserves concrete Electron notification denial over browser grant (#1948)', async () => {
+    mockBrowserNotification('granted');
+    window.electron.checkAllPermissions = vi.fn().mockResolvedValue({
+      microphone: 'granted',
+      camera: 'granted',
+      screen: 'granted',
+      secureStorage: 'granted',
+      notifications: 'denied',
+    });
+
+    await useOsPermissionStore.getState().fetchAll();
+
+    expect(useOsPermissionStore.getState().notifications).toBe('denied');
+  });
+
+  it('requestOne refreshes notification permission from the browser request result (#1948)', async () => {
+    mockBrowserNotification('granted');
+    window.electron.requestPermission = vi.fn().mockResolvedValue('not-determined');
+
+    const result = await useOsPermissionStore.getState().requestOne('notifications');
+
+    expect(result).toBe('granted');
+    expect(useOsPermissionStore.getState().notifications).toBe('granted');
+    expect(globalThis.Notification.requestPermission).toHaveBeenCalled();
+  });
+
+  it('requestOne preserves concrete Electron notification denial over browser grant (#1948)', async () => {
+    mockBrowserNotification('granted');
+    window.electron.requestPermission = vi.fn().mockResolvedValue('denied');
+
+    const result = await useOsPermissionStore.getState().requestOne('notifications');
+
+    expect(result).toBe('denied');
+    expect(useOsPermissionStore.getState().notifications).toBe('denied');
+    expect(globalThis.Notification.requestPermission).toHaveBeenCalled();
+    expect(window.electron.requestPermission).toHaveBeenCalledWith('notifications');
+  });
+
+  it('checkOne uses browser notification grant when Electron status is stale (#1948)', async () => {
+    mockBrowserNotification('granted');
+    window.electron.checkPermission = vi.fn().mockResolvedValue('not-determined');
+
+    const result = await useOsPermissionStore.getState().checkOne('notifications');
+
+    expect(result).toBe('granted');
+    expect(useOsPermissionStore.getState().notifications).toBe('granted');
+  });
+
+  it('checkOne preserves concrete Electron notification denial over browser grant (#1948)', async () => {
+    mockBrowserNotification('granted');
+    window.electron.checkPermission = vi.fn().mockResolvedValue('denied');
+
+    const result = await useOsPermissionStore.getState().checkOne('notifications');
+
+    expect(result).toBe('denied');
+    expect(useOsPermissionStore.getState().notifications).toBe('denied');
+  });
+
+  it('requestOne preserves denied browser notification permission (#1948)', async () => {
+    mockBrowserNotification('denied');
+    window.electron.requestPermission = vi.fn().mockResolvedValue('granted');
+
+    const result = await useOsPermissionStore.getState().requestOne('notifications');
+
+    expect(result).toBe('denied');
+    expect(useOsPermissionStore.getState().notifications).toBe('denied');
+    expect(window.electron.requestPermission).not.toHaveBeenCalled();
+  });
+
+  it('requestOne falls back to Electron when the browser remains default (#1948)', async () => {
+    mockBrowserNotification('default');
+    window.electron.requestPermission = vi.fn().mockResolvedValue('granted');
+
+    const result = await useOsPermissionStore.getState().requestOne('notifications');
+
+    expect(result).toBe('granted');
+    expect(useOsPermissionStore.getState().notifications).toBe('granted');
+    expect(globalThis.Notification.requestPermission).toHaveBeenCalled();
+    expect(window.electron.requestPermission).toHaveBeenCalledWith('notifications');
+  });
+
+  it('requestOne uses current browser status when notification request throws (#1948)', async () => {
+    const requestPermission = vi.fn().mockRejectedValue(new Error('request failed'));
+    mockBrowserNotification('denied', requestPermission);
+    window.electron.requestPermission = vi.fn().mockResolvedValue('granted');
+
+    const result = await useOsPermissionStore.getState().requestOne('notifications');
+
+    expect(result).toBe('denied');
+    expect(useOsPermissionStore.getState().notifications).toBe('denied');
+    expect(requestPermission).toHaveBeenCalled();
+    expect(window.electron.requestPermission).not.toHaveBeenCalled();
+  });
+
+  it('requestOne reads browser status when requestPermission is unavailable (#1948)', async () => {
+    mockBrowserNotification('granted');
+    Object.assign(globalThis.Notification, { requestPermission: undefined });
+    window.electron.requestPermission = vi.fn().mockResolvedValue('not-determined');
+
+    const result = await useOsPermissionStore.getState().requestOne('notifications');
+
+    expect(result).toBe('granted');
+    expect(useOsPermissionStore.getState().notifications).toBe('granted');
+    expect(globalThis.Notification.requestPermission).toBeUndefined();
+    expect(window.electron.requestPermission).toHaveBeenCalledWith('notifications');
   });
 
   it('updateStatus directly sets a permission', () => {
