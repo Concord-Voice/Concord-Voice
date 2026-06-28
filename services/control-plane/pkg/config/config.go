@@ -296,7 +296,7 @@ func Load() (*Config, error) {
 		TURNSecret:            getEnv("TURN_SECRET", ""),
 		TURNRealm:             getEnv("TURN_REALM", "localhost"),
 		LicensingAuthorityURL: getEnv("LICENSING_AUTHORITY_URL", "http://localhost:8082"),
-		AllowedOrigins:        parseOrigins(getEnv("ALLOWED_ORIGINS", "http://localhost:3001,http://localhost:3002,app://concord")),
+		AllowedOrigins:        parseOrigins(getEnv("ALLOWED_ORIGINS", "http://localhost:3001,http://localhost:3002,app://concord,spa-cache://concord")),
 		ClientMinVersion:      getEnv("CLIENT_MIN_VERSION", ""),
 		SpaURL:                getEnv("SPA_URL", ""),
 		SpaIpcContract:        getEnvInt("SPA_IPC_CONTRACT", 0),
