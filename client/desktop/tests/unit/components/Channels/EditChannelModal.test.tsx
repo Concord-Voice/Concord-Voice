@@ -1,7 +1,8 @@
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useChannelStore } from '@/renderer/stores/channelStore';
-import { mockChannel } from '../../../mocks/fixtures';
+import { useServerStore } from '@/renderer/stores/serverStore';
+import { mockChannel, mockServer } from '../../../mocks/fixtures';
 
 vi.mock('@/renderer/services/apiClient', () => ({
   apiFetch: vi.fn(),
@@ -169,5 +170,25 @@ describe('EditChannelModal', () => {
     );
     fireEvent.click(screen.getByText('Cancel'));
     expect(mockOnClose).toHaveBeenCalled();
+  });
+
+  it('renders the audio quality slider (not the box-select) for voice channels', () => {
+    const voiceChannel = { ...mockChannel, type: 'voice' as const };
+    useServerStore.getState().addServer({ ...mockServer, server_tier: 'groundspeed' });
+    useChannelStore.getState().addChannel(voiceChannel);
+
+    render(
+      <EditChannelModal
+        isOpen={true}
+        channel={voiceChannel}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+      />
+    );
+
+    // Slider renders with a Personal stop
+    expect(screen.getAllByText('Personal').length).toBeGreaterThanOrEqual(1);
+    // Old box-select "Each user uses their own quality setting" button is gone
+    expect(screen.queryByRole('button', { name: /Each user uses their own quality/i })).toBeNull();
   });
 });

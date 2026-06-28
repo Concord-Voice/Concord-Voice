@@ -610,6 +610,7 @@ func TestJoinServerResponseContainsServerDetails(t *testing.T) {
 	assert.Equal(t, serverID, server["id"])
 	assert.Equal(t, "Detail Server", server["name"])
 	assert.Equal(t, owner.ID, server["owner_id"])
+	assert.Equal(t, "groundspeed", server["server_tier"])
 	assert.Equal(t, "member", body["role"])
 }
 

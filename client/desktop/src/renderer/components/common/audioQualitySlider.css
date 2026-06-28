@@ -1,0 +1,253 @@
+/* Shared audio-quality tier slider styles. Consumed by the personal slider
+ * (Settings ▸ AudioConfigSection, via SettingsPage.css @import), DMPrivacyControls
+ * (same), and the per-channel slider (#179, ChannelAudioQualitySlider). Single
+ * source — do not duplicate these rules. */
+
+/* ─── Audio Quality Tier Slider ────────────────────────────────────── */
+
+.settings-tier-slider-container {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+
+/*
+ * Labels — 7 equal-width flex items.
+ * Centers sit at ~7.14%, ~21.4%, ~35.7%, 50%, ~64.3%, ~78.6%, ~92.9% of the container.
+ */
+.settings-tier-labels {
+  display: flex;
+}
+
+.settings-tier-label {
+  flex: 1;
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 0;
+  transition: all 0.15s ease;
+  text-align: center;
+  user-select: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Reset native <button> styling so the labels render as text, not chips. */
+  background: none;
+  border: none;
+  font-family: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+  margin: 0;
+  appearance: none;
+}
+
+.settings-tier-label:disabled {
+  cursor: default;
+}
+
+.settings-tier-label:focus {
+  outline: none;
+}
+
+.settings-tier-label:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.settings-tier-label:hover {
+  color: var(--text-primary);
+}
+
+.settings-tier-label.active {
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+/*
+ * Track wrapper — holds the slider + ticks.
+ * The slider is inset so the thumb's center range aligns with the N
+ * equal-width label centers above.
+ *
+ * Math: for N=7 columns, each column is ~14.28% wide, centers at
+ * 7.14%, 21.43%, 35.71%, 50%, 64.29%, 78.57%, 92.86%.
+ * The slider thumb travels from 7.14% to 92.86% of the container,
+ * achieved by adding ~7.14% padding on each side (minus half-thumb).
+ */
+.settings-tier-track {
+  position: relative;
+  height: 20px;
+  padding: 0 calc(100% / 14 - 10px); /* ~7.14% inset minus half-thumb-width */
+}
+
+/* Tick marks — evenly spaced across the inset track */
+.settings-tier-ticks {
+  position: absolute;
+  top: 0;
+  /* Inset by ~7.14% of parent for thumb center alignment */
+  left: calc(100% / 14);
+  right: calc(100% / 14);
+  height: 100%;
+  pointer-events: none;
+  z-index: 0;
+  display: flex;
+  justify-content: space-between;
+}
+
+.settings-tier-tick {
+  width: 2px;
+  height: 14px;
+  margin-top: 3px; /* vertically center within 20px track */
+  background: var(--border-color);
+  border-radius: 1px;
+  transition: background 0.15s ease;
+  flex-shrink: 0;
+}
+
+.settings-tier-tick.active {
+  background: var(--accent-fill);
+}
+
+.settings-tier-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 6px;
+  margin: 7px 0; /* center the 6px track within the 20px wrapper */
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+  outline: none;
+}
+
+.settings-tier-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent-fill);
+  cursor: pointer;
+  border: 3px solid var(--bg-primary);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+}
+
+.settings-tier-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.1);
+}
+
+/* Floating kbps badge below the slider — styled like the active codec highlight */
+.settings-tier-kbps-container {
+  position: relative;
+  height: 28px;
+  margin-top: 4px;
+  margin-bottom: 4px;
+}
+
+.settings-tier-kbps-label {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  outline: 1.5px solid var(--accent-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 700;
+  color: var(--accent-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+  transition: left 0.15s ease;
+}
+
+.settings-tier-description {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.settings-tier-description span:first-child {
+  font-weight: 600;
+  color: var(--text-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+  letter-spacing: 0.03em;
+}
+
+/*
+ * DM Privacy slider override — 4 stops instead of 7.
+ * For N=4 labels with flex:1, centers are at 12.5%, 37.5%, 62.5%, 87.5%.
+ * The -10px compensates for Chromium's range thumb being 10px inset from edges,
+ * matching the audio quality slider's approach (calc(100%/14 - 10px) for 7 stops).
+ */
+.dm-privacy-track {
+  padding: 0 calc(12.5% - 10px);
+}
+
+.dm-privacy-track .settings-tier-ticks {
+  left: 12.5%;
+  right: 12.5%;
+}
+
+/* ─── Premium lock affordances (#1301 — L1/L2 settings clamps) ────────────
+   a11y O1/P1/P2: locked controls stay focusable; "locked" is conveyed by the
+   🔒 glyph + the word "Premium" + a SOLID muted token at full opacity — never
+   opacity/colour alone. Do NOT reuse `.settings-row-disabled` (pointer-events:
+   none) for these. */
+
+/* L1: a premium audio-tier label. Receded via a solid muted colour (full
+   opacity), with a trailing lock glyph. Stays clickable to explain the lock. */
+.settings-tier-label-locked {
+  color: var(--text-muted);
+}
+
+.settings-tier-lock-glyph {
+  font-size: 0.85em;
+  margin-left: 3px;
+  line-height: 1;
+  vertical-align: middle;
+}
+
+/* L1: the snap-back popover surfaced after a locked tier selection. Non-modal,
+   inline status; carries the interactive PremiumChip. */
+.settings-tier-lock-popover {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-secondary, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--accent-secondary, var(--accent-primary));
+}
+
+.settings-tier-lock-popover-text {
+  color: var(--text-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+/* L2: the inline chip surfaced after a locked ptime selection snaps back. */
+.settings-row-premium-note {
+  display: inline-flex;
+  margin-top: 4px;
+}
+
+/* Reduced motion: the popover appears instantly (no slide/fade). */
+@media (prefers-reduced-motion: reduce) {
+  .settings-tier-lock-popover {
+    transition: none;
+    animation: none;
+  }
+}

@@ -187,7 +187,10 @@ interface MediaEntitlementsWire {
   allowed_audio_tiers?: unknown;
   min_ptime_ms?: unknown;
   max_manual_bitrate_bps?: unknown;
+  channel_audio_uplift?: unknown;
 }
+
+const CHANNEL_AUDIO_UPLIFT_MIN_PTIME_MS = 10;
 
 /**
  * Parse the control-plane `media_entitlements` object into the typed
@@ -236,6 +239,8 @@ function parseMediaEntitlements(raw: unknown): {
       ? me.max_manual_bitrate_bps
       : FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps;
 
+  const channelAudioUplift = me.channel_audio_uplift === true;
+
   // Atomic-free clamp (#1300 adversarial-review defence-in-depth). The
   // per-field validation above floors INVALID fields but keeps any VALID
   // premium-shaped value regardless of the resolved tier. That leaves a
@@ -248,11 +253,18 @@ function parseMediaEntitlements(raw: unknown): {
   // can never carry a premium cap. Clamp DIRECTION matters — minPtime floors
   // UP (lower ptime is the premium lever), the others floor DOWN/to the free
   // set. Premium values flow through untouched only when the tier is premium.
+  // A fixed channel audio standard (#179) is the narrow exception: the
+  // control-plane marks channel_audio_uplift=true when it has bounded the grant
+  // by the server tier, so only the audio tier list and ptime floor may widen.
   if (userTier !== 'premium') {
     return {
       userTier,
-      allowedAudioTiers: [...FREE_MEDIA_ENTITLEMENT.allowedAudioTiers],
-      minPtimeMs: Math.max(minPtimeMs, FREE_MEDIA_ENTITLEMENT.minPtimeMs),
+      allowedAudioTiers: channelAudioUplift
+        ? allowedAudioTiers
+        : [...FREE_MEDIA_ENTITLEMENT.allowedAudioTiers],
+      minPtimeMs: channelAudioUplift
+        ? Math.max(minPtimeMs, CHANNEL_AUDIO_UPLIFT_MIN_PTIME_MS)
+        : Math.max(minPtimeMs, FREE_MEDIA_ENTITLEMENT.minPtimeMs),
       maxManualBitrateBps: Math.min(
         maxManualBitrateBps,
         FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps

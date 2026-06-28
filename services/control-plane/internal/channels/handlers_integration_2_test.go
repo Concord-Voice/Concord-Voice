@@ -327,17 +327,19 @@ func TestUpdateChannelEdgeCases(t *testing.T) {
 		testhelpers.ParseJSON(t, w, &createBody)
 		voiceChID := createBody[keyChannel].(map[string]interface{})["id"].(string)
 
+		// "standard" is the ceiling on a Groundspeed server (#179); "hifi" is
+		// above the ceiling and now correctly rejected. Use "standard" here.
 		w = ts.DoRequest("PATCH", pathChannelsPrefix+voiceChID, map[string]interface{}{
 			"name":               "voice-aqt",
 			"type":               "voice",
-			"audio_quality_tier": "hifi",
+			"audio_quality_tier": "standard",
 		}, testhelpers.AuthHeaders(user.AccessToken))
 		assert.Equal(t, http.StatusOK, w.Code)
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
 		channel := body[keyChannel].(map[string]interface{})
-		assert.Equal(t, "hifi", channel["audio_quality_tier"])
+		assert.Equal(t, "standard", channel["audio_quality_tier"])
 	})
 
 	t.Run("WithGroupID", func(t *testing.T) {

@@ -21,15 +21,16 @@ import (
 
 // Handler handles voice-related requests.
 type Handler struct {
-	db        *sql.DB
-	log       *logger.Logger
-	hub       *websocket.Hub
-	cfg       *config.Config
-	resolver  *rbac.Resolver
-	nats      *natsclient.Client
-	audit     *rbac.AuditWriter
-	entCache  *entitlements.Cache
-	tempGrant *tempGrantManager
+	db          *sql.DB
+	log         *logger.Logger
+	hub         *websocket.Hub
+	cfg         *config.Config
+	resolver    *rbac.Resolver
+	nats        *natsclient.Client
+	audit       *rbac.AuditWriter
+	entCache    *entitlements.Cache
+	serverTiers entitlements.ServerTierResolver
+	tempGrant   *tempGrantManager
 }
 
 // HandlerDeps groups the dependencies required to construct a Handler.
@@ -41,29 +42,38 @@ type Handler struct {
 // entitlements (#1300); production wiring passes the same instance the auth
 // handler receives.
 type HandlerDeps struct {
-	DB       *sql.DB
-	Log      *logger.Logger
-	Hub      *websocket.Hub
-	Cfg      *config.Config
-	Resolver *rbac.Resolver
-	NATS     *natsclient.Client
-	Audit    *rbac.AuditWriter
-	EntCache *entitlements.Cache
+	DB          *sql.DB
+	Log         *logger.Logger
+	Hub         *websocket.Hub
+	Cfg         *config.Config
+	Resolver    *rbac.Resolver
+	NATS        *natsclient.Client
+	Audit       *rbac.AuditWriter
+	EntCache    *entitlements.Cache
+	ServerTiers entitlements.ServerTierResolver
 }
 
 // NewHandler creates a new voice handler.
 func NewHandler(deps HandlerDeps) *Handler {
 	return &Handler{
-		db:        deps.DB,
-		log:       deps.Log,
-		hub:       deps.Hub,
-		cfg:       deps.Cfg,
-		resolver:  deps.Resolver,
-		nats:      deps.NATS,
-		audit:     deps.Audit,
-		entCache:  deps.EntCache,
-		tempGrant: newTempGrantManager(deps.DB, deps.Log, deps.Hub, deps.Resolver, deps.NATS),
+		db:          deps.DB,
+		log:         deps.Log,
+		hub:         deps.Hub,
+		cfg:         deps.Cfg,
+		resolver:    deps.Resolver,
+		nats:        deps.NATS,
+		audit:       deps.Audit,
+		entCache:    deps.EntCache,
+		serverTiers: deps.ServerTiers,
+		tempGrant:   newTempGrantManager(deps.DB, deps.Log, deps.Hub, deps.Resolver, deps.NATS),
 	}
+}
+
+func (h *Handler) serverTier(ctx context.Context, serverID string) string {
+	if h.serverTiers != nil {
+		return h.serverTiers.GetServerTier(ctx, serverID)
+	}
+	return entitlements.ResolveServerTier(ctx, h.db, serverID)
 }
 
 // Participant represents a user currently in a voice channel.
@@ -216,12 +226,21 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 		return
 	}
 
-	// Resolve the joining user's media entitlements server-side from the
-	// AUTHENTICATED user_id (never a client value). GetTier fails closed to the
-	// free tier on any resolution failure, and MediaFor → For("") returns the free
-	// caps for an unknown/empty tier, so a tier-resolution problem degrades to the
-	// free floor without ever blocking the join or granting premium (#1300 §3/§5).
-	mediaEnt := entitlements.MediaFor(h.entCache.GetTier(c.Request.Context(), userID))
+	// Resolve channel-aware media entitlements: the per-channel audio standard
+	// (admin-set) uplifts every member, bounded by the server's Mach tier. The
+	// joining user's tier is resolved server-side from the AUTHENTICATED user_id;
+	// the server-tier resolver is the #1521 seam (Groundspeed today, Mach when
+	// #1556 ships); MediaForChannel fails closed (Personal/free) on any unknown
+	// value. See [internal]rules/media-plane.md "Per-channel audio standard".
+	channelTier := ""
+	if audioQualityTier != nil {
+		channelTier = *audioQualityTier
+	}
+	mediaEnt := entitlements.MediaForChannel(
+		h.entCache.GetTier(c.Request.Context(), userID),
+		h.serverTier(c.Request.Context(), serverID),
+		channelTier,
+	)
 
 	h.log.Info("Voice join authorized", "user_id", userID, "channel_id", channelID, "server_id", serverID, "media_tier", mediaEnt.Tier)
 

@@ -12583,6 +12583,11 @@ components:
         emoji:
           type: string
           nullable: true
+        audio_quality_tier:
+          allOf:
+          - $ref: '#/components/schemas/AudioQualityTier'
+          nullable: true
+          description: 'Voice-channel audio standard. Null means Personal (each member uses their own tier). Groundspeed servers allow up to standard; Mach servers allow up to studio.'
     DistributeKeysRequest:
       type: object
       required:
@@ -12695,6 +12700,43 @@ components:
           description: Base64-encoded PBKDF2 salt
         key_version:
           type: integer
+    AudioQualityTier:
+      type: string
+      enum:
+      - minimum
+      - low
+      - moderate
+      - standard
+      - high
+      - hifi
+      - studio
+    ServerTier:
+      type: string
+      enum:
+      - groundspeed
+      - mach
+    MediaEntitlements:
+      type: object
+      properties:
+        tier:
+          type: string
+          enum:
+          - free
+          - premium
+          description: Joining user's subscription tier.
+        allowed_audio_tiers:
+          type: array
+          items:
+            $ref: '#/components/schemas/AudioQualityTier'
+        min_ptime_ms:
+          type: integer
+          description: Minimum Opus packet duration allowed at produce time.
+        max_manual_bitrate_bps:
+          type: integer
+          description: Manual bitrate ceiling; channel audio uplift does not raise this cap.
+        channel_audio_uplift:
+          type: boolean
+          description: True when a fixed channel audio standard widened allowed_audio_tiers/min_ptime_ms, bounded by server_tier.
     Server:
       type: object
       properties:
@@ -12709,6 +12751,8 @@ components:
         owner_id:
           type: string
           format: uuid
+        server_tier:
+          $ref: '#/components/schemas/ServerTier'
         created_at:
           type: string
           format: date-time
@@ -12753,6 +12797,11 @@ components:
         emoji:
           type: string
           nullable: true
+        audio_quality_tier:
+          allOf:
+          - $ref: '#/components/schemas/AudioQualityTier'
+          nullable: true
+          description: 'Voice-channel audio standard. Null means Personal; non-null tiers are bounded by the server_tier ceiling.'
         position:
           type: integer
         created_at:
@@ -13034,16 +13083,11 @@ components:
               type: string
               format: uuid
             audio_quality_tier:
-              type: string
+              allOf:
+              - $ref: '#/components/schemas/AudioQualityTier'
               nullable: true
-              enum:
-              - minimum
-              - low
-              - moderate
-              - standard
-              - high
-              - hifi
-              - studio
+        media_entitlements:
+          $ref: '#/components/schemas/MediaEntitlements'
     DMVoiceJoinResponse:
       type: object
       properties:
@@ -13072,6 +13116,8 @@ components:
               enum:
               - admin
               - member
+        media_entitlements:
+          $ref: '#/components/schemas/MediaEntitlements'
     ChannelGroup:
       type: object
       properties:

@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
@@ -468,6 +469,7 @@ func (h *Handler) JoinServer(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedJoinServer})
 		return
 	}
+	server.ServerTier = entitlements.ResolveServerTier(c.Request.Context(), h.db, server.ID)
 
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit", "error", err)

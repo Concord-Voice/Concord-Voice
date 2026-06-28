@@ -157,6 +157,26 @@ export const AUDIO_QUALITY_TIERS: Record<AudioQualityTier, AudioQualityTierConfi
   },
 };
 
+/** The 7-tier audio ladder, ascending. Single source for slider ordering.
+ *  Mirrors the Go entitlements.audioTierOrder. */
+export const AUDIO_TIER_ORDER: AudioQualityTier[] = [
+  'minimum',
+  'low',
+  'moderate',
+  'standard',
+  'high',
+  'hifi',
+  'studio',
+];
+
+/** Highest audio tier a channel admin may set, by server tier. Binary mirror of
+ *  Go entitlements.ServerAudioCeilingTier: groundspeed → 'standard' (≤96 kbps),
+ *  any Mach → 'studio' (≤510 kbps). Fails closed to 'standard'. UX gating only —
+ *  the control-plane is authoritative (see [internal]rules/media-plane.md). */
+export function serverAudioCeilingTier(serverTier?: string): AudioQualityTier {
+  return serverTier === 'mach' ? 'studio' : 'standard';
+}
+
 // ---------------------------------------------------------------------------
 // Available screen shares (opt-in "Tune In" model)
 // ---------------------------------------------------------------------------

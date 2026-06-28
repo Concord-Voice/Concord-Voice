@@ -5,11 +5,16 @@ import "time"
 
 // Server represents a Concord server (Discord-like community)
 type Server struct {
-	ID                   string    `json:"id" db:"id"`
-	Name                 string    `json:"name" db:"name"`
-	IconURL              *string   `json:"icon_url,omitempty" db:"icon_url"`
-	BannerURL            *string   `json:"banner_url,omitempty" db:"banner_url"`
-	OwnerID              string    `json:"owner_id" db:"owner_id"`
+	ID        string  `json:"id" db:"id"`
+	Name      string  `json:"name" db:"name"`
+	IconURL   *string `json:"icon_url,omitempty" db:"icon_url"`
+	BannerURL *string `json:"banner_url,omitempty" db:"banner_url"`
+	OwnerID   string  `json:"owner_id" db:"owner_id"`
+	// ServerTier is the server-axis subscription tier ("groundspeed"|"mach"),
+	// RESOLVED (not a DB column) via entitlements.ResolveServerTier — db:"-" so
+	// struct scanners skip it. Client gates server-scoped UX (e.g. the #179
+	// channel audio slider ceiling, #1522 cosmetics) on it.
+	ServerTier           string    `json:"server_tier" db:"-"`
 	AllowEmbeddedContent bool      `json:"allow_embedded_content" db:"allow_embedded_content"`
 	CreatedAt            time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt            time.Time `json:"updated_at" db:"updated_at"`

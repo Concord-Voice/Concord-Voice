@@ -1,6 +1,7 @@
 package voice_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
@@ -683,4 +684,68 @@ func TestAuthorizeJoin_MediaEntitlements(t *testing.T) {
 		assert.Equal(t, "free", me["tier"], "tier must come from the JWT user, not the request body")
 		assert.EqualValues(t, 5000000, me["max_manual_bitrate_bps"], "body cannot raise the bitrate cap")
 	})
+}
+
+func TestAuthorizeJoin_ChannelStandard_ShapesMediaEntitlements(t *testing.T) {
+	// A free member joins a voice channel whose audio_quality_tier='standard'
+	// on a Groundspeed (default) server. The channel standard uplifts the member
+	// so "standard" appears in allowed_audio_tiers.  "studio" must NOT appear
+	// (Groundspeed ceiling is standard, not studio).
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "ch_std_owner")
+	member := ts.CreateTestUser(t, "ch_std_member")
+	serverID := ts.CreateTestServer(t, owner.ID, "ChannelStd Server")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-ch-std")
+
+	// Set audio_quality_tier on the channel directly via SQL.
+	_, err := ts.DB.Exec("UPDATE channels SET audio_quality_tier=$1 WHERE id=$2", "standard", channelID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+
+	me, ok := body["media_entitlements"].(map[string]interface{})
+	require.True(t, ok, "media_entitlements present")
+
+	rawTiers := me["allowed_audio_tiers"].([]interface{})
+	gotTiers := make([]string, len(rawTiers))
+	for i, v := range rawTiers {
+		gotTiers[i] = v.(string)
+	}
+	assert.Contains(t, gotTiers, "standard", "standard tier must be granted by the channel")
+	assert.NotContains(t, gotTiers, "studio", "studio must not be granted on a Groundspeed server")
+}
+
+func TestAuthorizeJoin_MachChannelStandardUsesServerTierCache(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "ch_mach_owner")
+	member := ts.CreateTestUser(t, "ch_mach_member")
+	serverID := ts.CreateTestServer(t, owner.ID, "Mach ChannelStd Server")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-ch-mach")
+	require.NoError(t, entitlements.NewServerCache(ts.Redis, ts.DB).
+		SetServerTier(context.Background(), serverID, entitlements.TierMach))
+
+	_, err := ts.DB.Exec("UPDATE channels SET audio_quality_tier=$1 WHERE id=$2", "studio", channelID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	me, ok := body["media_entitlements"].(map[string]interface{})
+	require.True(t, ok, "media_entitlements present")
+
+	rawTiers := me["allowed_audio_tiers"].([]interface{})
+	gotTiers := make([]string, len(rawTiers))
+	for i, v := range rawTiers {
+		gotTiers[i] = v.(string)
+	}
+	assert.Contains(t, gotTiers, "studio", "Studio must be granted by a Mach-bounded channel standard")
+	assert.EqualValues(t, 10, me["min_ptime_ms"], "Studio channel standard must allow 10ms ptime")
 }

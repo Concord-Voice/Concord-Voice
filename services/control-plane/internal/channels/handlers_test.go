@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -782,4 +783,53 @@ func TestRequestRewrapRateLimited(t *testing.T) {
 	w := ts.DoRequest("POST", "/api/v1/e2ee/keys/"+channelID+"/rewrap", nil,
 		testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusTooManyRequests, w.Code)
+}
+
+// --- Audio tier server-ceiling validation ---
+
+func TestUpdateChannel_RejectsAudioTierAboveServerCeiling(t *testing.T) {
+	// A Groundspeed server's audio ceiling is "standard". Setting "studio" must
+	// be rejected with 400 (the server-ceiling guard introduced by #179).
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "ceil_owner")
+	serverID := ts.CreateTestServer(t, owner.ID, "Ceiling Test Server")
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-ceiling")
+
+	w := ts.DoRequest("PATCH", pathChannelsPrefix+channelID, map[string]interface{}{
+		"name":               "voice-ceiling",
+		"type":               "voice",
+		"audio_quality_tier": "studio",
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestUpdateChannel_AcceptsAudioTierAtServerCeiling(t *testing.T) {
+	// "standard" is at the Groundspeed ceiling → must be accepted (200).
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "ceil_ok_owner")
+	serverID := ts.CreateTestServer(t, owner.ID, "Ceiling OK Server")
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-ceiling-ok")
+
+	w := ts.DoRequest("PATCH", pathChannelsPrefix+channelID, map[string]interface{}{
+		"name":               "voice-ceiling-ok",
+		"type":               "voice",
+		"audio_quality_tier": "standard",
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestUpdateChannel_AcceptsMachAudioTierFromServerTierCache(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "ceil_mach_owner")
+	serverID := ts.CreateTestServer(t, owner.ID, "Mach Ceiling Server")
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-ceiling-mach")
+	require.NoError(t, entitlements.NewServerCache(ts.Redis, ts.DB).
+		SetServerTier(context.Background(), serverID, entitlements.TierMach))
+
+	w := ts.DoRequest("PATCH", pathChannelsPrefix+channelID, map[string]interface{}{
+		"name":               "voice-ceiling-mach",
+		"type":               "voice",
+		"audio_quality_tier": "studio",
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
 }

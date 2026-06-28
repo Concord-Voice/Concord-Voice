@@ -602,6 +602,33 @@ describe('validateChannelAccess', () => {
     expect(result.maxManualBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps); // 5M, not 10M
   });
 
+  it('allows server-authoritative channel audio uplift for free users without raising manual bitrate', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 's', name: 'n' },
+          media_entitlements: {
+            tier: 'free',
+            channel_audio_uplift: true,
+            allowed_audio_tiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+            min_ptime_ms: 10,
+            max_manual_bitrate_bps: 10_000_000,
+          },
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    expect(result.userTier).toBe('free');
+    expect(result.allowedAudioTiers).toContain('studio');
+    expect(result.minPtimeMs).toBe(10);
+    expect(result.maxManualBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps);
+  });
+
   it('denial paths carry the free-floor media entitlement (never escalate on denial)', async () => {
     mockFetch().mockResolvedValueOnce({ ok: false, status: 403 });
 

@@ -6,8 +6,9 @@ import Modal from '../ui/Modal';
 import CustomSelect from '../ui/CustomSelect';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import { useChannelStore } from '../../stores/channelStore';
-import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../../stores/voiceStore';
+import { useServerStore } from '../../stores/serverStore';
 import { apiFetch } from '../../services/apiClient';
+import ChannelAudioQualitySlider from './ChannelAudioQualitySlider';
 import { Channel } from '../../types/chat';
 import './CreateChannelModal.css';
 
@@ -47,6 +48,9 @@ const EditChannelModal: React.FC<EditChannelModalProps> = ({
 
   const updateChannel = useChannelStore((state) => state.updateChannel);
   const channelGroups = useChannelStore((state) => state.channelGroups);
+  const serverTier = useServerStore(
+    (s) => s.servers.find((sv) => sv.id === channel.server_id)?.server_tier
+  );
 
   // Reset form when channel changes
   useEffect(() => {
@@ -225,45 +229,20 @@ const EditChannelModal: React.FC<EditChannelModalProps> = ({
           </div>
         )}
 
-        {/* Audio Quality Tier (voice channels only) */}
+        {/* Audio Quality Standard (voice channels only) */}
         {channel.type === 'voice' && (
           <div className="channel-form-group">
             <span className="channel-form-label">Audio Quality</span>
             <span className="channel-form-hint" style={{ marginBottom: 8 }}>
-              Override personal quality settings for all users in this channel.
+              Set a channel-wide audio standard for everyone, or leave on Personal so each member
+              uses their own setting.
             </span>
-            <div className="channel-type-selector">
-              <button
-                type="button"
-                className={`channel-type-option ${audioQualityTier === null ? 'selected' : ''}`}
-                onClick={() => setAudioQualityTier(null)}
-                disabled={isSubmitting}
-              >
-                <div className="channel-type-info">
-                  <span className="channel-type-name">Personal</span>
-                  <span className="channel-type-desc">
-                    Each user uses their own quality setting
-                  </span>
-                </div>
-              </button>
-              {(Object.keys(AUDIO_QUALITY_TIERS) as AudioQualityTier[]).map((tier) => {
-                const config = AUDIO_QUALITY_TIERS[tier];
-                return (
-                  <button
-                    key={tier}
-                    type="button"
-                    className={`channel-type-option ${audioQualityTier === tier ? 'selected' : ''}`}
-                    onClick={() => setAudioQualityTier(tier)}
-                    disabled={isSubmitting}
-                  >
-                    <div className="channel-type-info">
-                      <span className="channel-type-name">{config.label}</span>
-                      <span className="channel-type-desc">{config.description}</span>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
+            <ChannelAudioQualitySlider
+              value={audioQualityTier}
+              onChange={setAudioQualityTier}
+              serverTier={serverTier}
+              disabled={isSubmitting}
+            />
           </div>
         )}
 

@@ -206,19 +206,20 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	sessionsHandler := sessions.NewHandler(db, redis, log, hub, mfaHandler)
 	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache)
 	serversHandler := servers.NewHandler(db, log, hub, rbacResolver, serverEntCache)
-	channelsHandler := channels.NewHandler(db, log, hub, rbacResolver, redis)
+	channelsHandler := channels.NewHandler(db, log, hub, rbacResolver, redis, serverEntCache)
 	membersHandler := members.NewHandler(db, log, redis, hub, rbacResolver, auditWriter)
 	messagesHandler := messages.NewHandler(db, log, hub, rbacResolver)
 	invitesHandler := invites.NewHandler(db, log, hub, rbacResolver)
 	voiceHandler := voice.NewHandler(voice.HandlerDeps{
-		DB:       db,
-		Log:      log,
-		Hub:      hub,
-		Cfg:      cfg,
-		Resolver: rbacResolver,
-		NATS:     natsClient,
-		Audit:    auditWriter,
-		EntCache: entCache,
+		DB:          db,
+		Log:         log,
+		Hub:         hub,
+		Cfg:         cfg,
+		Resolver:    rbacResolver,
+		NATS:        natsClient,
+		Audit:       auditWriter,
+		EntCache:    entCache,
+		ServerTiers: serverEntCache,
 	})
 	dmHandler := dm.NewHandler(db, log, hub, cfg, natsClient, redis, entCache)
 	// Wire DM voice ring cleanup-on-disconnect (#1209 plan task B7 Part 2).

@@ -2,6 +2,7 @@
 package channels
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
@@ -45,22 +47,35 @@ const (
 
 // Handler handles channel-related requests
 type Handler struct {
-	db       *sql.DB
-	log      *logger.Logger
-	hub      *websocket.Hub
-	resolver *rbac.Resolver
-	redis    *redis.Client
+	db          *sql.DB
+	log         *logger.Logger
+	hub         *websocket.Hub
+	resolver    *rbac.Resolver
+	redis       *redis.Client
+	serverTiers entitlements.ServerTierResolver
 }
 
 // NewHandler creates a new channel handler
-func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, redis *redis.Client) *Handler {
-	return &Handler{
-		db:       db,
-		log:      log,
-		hub:      hub,
-		resolver: resolver,
-		redis:    redis,
+func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, redis *redis.Client, serverTiers ...entitlements.ServerTierResolver) *Handler {
+	var st entitlements.ServerTierResolver
+	if len(serverTiers) > 0 {
+		st = serverTiers[0]
 	}
+	return &Handler{
+		db:          db,
+		log:         log,
+		hub:         hub,
+		resolver:    resolver,
+		redis:       redis,
+		serverTiers: st,
+	}
+}
+
+func (h *Handler) serverTier(ctx context.Context, serverID string) string {
+	if h.serverTiers != nil {
+		return h.serverTiers.GetServerTier(ctx, serverID)
+	}
+	return entitlements.ResolveServerTier(ctx, h.db, serverID)
 }
 
 // CreateChannelRequest represents a request to create a channel
@@ -549,9 +564,20 @@ func (h *Handler) UpdateChannel(c *gin.Context) {
 		return
 	}
 
-	if req.AudioQualityTier != nil && *req.AudioQualityTier != "" && !validAudioQualityTiers[*req.AudioQualityTier] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid audio quality tier"})
-		return
+	if req.AudioQualityTier != nil && *req.AudioQualityTier != "" {
+		if !validAudioQualityTiers[*req.AudioQualityTier] {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid audio quality tier"})
+			return
+		}
+		// Bound the channel standard to the server's audio ceiling (#179):
+		// Groundspeed → Standard, any Mach → Studio. The server-tier resolver is
+		// the #1521 seam (Groundspeed today). Authoritative server-side guard —
+		// the client slider lock is UX only.
+		if !entitlements.AudioTierAllowedForServer(*req.AudioQualityTier,
+			h.serverTier(c.Request.Context(), serverID)) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Audio quality tier exceeds this server's tier"})
+			return
+		}
 	}
 
 	channel, err := h.executeChannelUpdate(channelID, req)

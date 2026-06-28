@@ -61,6 +61,7 @@ func TestCreateServerSuccess(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	server := body["server"].(map[string]interface{})
 	assert.Equal(t, "New Server", server["name"])
+	assert.Equal(t, "groundspeed", server["server_tier"])
 	assert.Equal(t, "owner", body["role"])
 }
 
@@ -137,6 +138,7 @@ func TestUpdateServerAsOwner(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	server := body["server"].(map[string]interface{})
 	assert.Equal(t, "New Name", server["name"])
+	assert.Equal(t, "groundspeed", server["server_tier"])
 }
 
 func TestUpdateServerNotOwnerOrAdmin(t *testing.T) {
@@ -177,4 +179,36 @@ func TestDeleteServerNotOwner(t *testing.T) {
 
 	w := ts.DoRequest("DELETE", "/api/v1/servers/"+serverID, nil, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+// --- Server tier exposure (#179) ---
+
+func TestGetServer_IncludesServerTier(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "tier_owner")
+	serverID := ts.CreateTestServer(t, owner.ID, "Tier Test Server")
+
+	w := ts.DoRequest("GET", "/api/v1/servers/"+serverID, nil, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	server := body["server"].(map[string]interface{})
+	assert.Equal(t, "groundspeed", server["server_tier"], "server_tier must be present and 'groundspeed'")
+}
+
+func TestListServers_IncludesServerTier(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "tier_list_owner")
+	ts.CreateTestServer(t, owner.ID, "Tier List Server")
+
+	w := ts.DoRequest("GET", "/api/v1/servers", nil, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	servers := body["servers"].([]interface{})
+	assert.NotEmpty(t, servers)
+	first := servers[0].(map[string]interface{})
+	assert.Equal(t, "groundspeed", first["server_tier"], "server_tier must be present and 'groundspeed' in list")
 }

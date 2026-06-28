@@ -121,6 +121,7 @@ func (h *Handler) ListServers(c *gin.Context) {
 			h.log.Error("Failed to scan server", "error", err)
 			continue
 		}
+		server.ServerTier = h.serverTiers.GetServerTier(c.Request.Context(), server.ID)
 		servers = append(servers, server)
 	}
 	if err := rows.Err(); err != nil {
@@ -250,6 +251,7 @@ func (h *Handler) CreateServer(c *gin.Context) {
 	}
 
 	h.log.Info("Server created", "server_id", serverID, "user_id", userID)
+	server.ServerTier = h.serverTiers.GetServerTier(c.Request.Context(), server.ID)
 
 	c.JSON(http.StatusCreated, gin.H{
 		"server": server,
@@ -311,6 +313,8 @@ func (h *Handler) GetServer(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetch})
 		return
 	}
+
+	server.ServerTier = h.serverTiers.GetServerTier(c.Request.Context(), serverID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"server": server,
@@ -438,6 +442,7 @@ func (h *Handler) UpdateServer(c *gin.Context) {
 	}
 
 	h.log.Info("Server updated", "server_id", serverID, "user_id", userID)
+	server.ServerTier = h.serverTiers.GetServerTier(c.Request.Context(), server.ID)
 
 	// Broadcast update to server subscribers so members see changes in real time
 	if serverUUID, parseErr := uuid.Parse(serverID); parseErr == nil {

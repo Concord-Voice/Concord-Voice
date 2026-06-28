@@ -4,6 +4,7 @@ export interface Server {
   icon_url?: string;
   banner_url?: string;
   owner_id: string;
+  server_tier?: 'groundspeed' | 'mach'; // server-axis tier (#179/#1521); absent on stale cache
   allow_embedded_content: boolean;
   created_at: string;
   updated_at: string;
