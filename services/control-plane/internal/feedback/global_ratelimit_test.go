@@ -14,29 +14,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// setupFeedbackTestRedis returns a Redis client on DB index 1 (isolated from
-// dev data), skipping the test if Redis is unreachable. Deliberately does NOT
+// setupFeedbackTestRedis returns a Redis client isolated from dev data by
+// default, skipping the test if Redis is unreachable. Deliberately does NOT
 // use internal/testhelpers — that package imports internal/api, which imports
 // this (feedback) package via feedback_wiring.go, so importing it from a
 // package-internal test would create an import cycle. The client/cleanup shape
 // mirrors testhelpers.SetupTestRedis.
 //
-// NOTE: tests using this share the FIXED globalFeedbackKey on DB 1. The key is
-// deleted at setup AND cleanup so SERIAL runs stay isolated, but for that
-// reason these tests MUST NOT call t.Parallel() — they would race on the
-// shared key (project shared-test-DB isolation discipline).
+// NOTE: tests using this share the FIXED globalFeedbackKey on one Redis DB.
+// The key is deleted at setup AND cleanup so SERIAL runs stay isolated, but for
+// that reason these tests MUST NOT call t.Parallel().
 func setupFeedbackTestRedis(t *testing.T) *redis.Client {
 	t.Helper()
 
 	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
+	useDefaultDB := redisURL == ""
+	if useDefaultDB {
 		redisURL = "redis://:concord_dev_redis@localhost:6379" //nolint:gosec // dev-only default, matches docker-compose
 	}
 	opts, err := redis.ParseURL(redisURL)
 	if err != nil {
 		t.Fatalf("feedback test: failed to parse redis URL: %v", err)
 	}
-	opts.DB = 1 // isolate from dev data on DB 0
+	if useDefaultDB {
+		opts.DB = 1 // isolate from dev data on DB 0
+	}
 
 	client := redis.NewClient(opts)
 	ctx := context.Background()

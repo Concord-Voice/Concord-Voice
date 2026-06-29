@@ -12,12 +12,13 @@ var defaultTestRedisURL = "redis://:" + testRedisVal + "@localhost:6379" //nolin
 
 var testRedisVal = "concord_dev_redis" //nolint:gosec // dev-only default
 
-// SetupTestRedis creates a Redis client on DB index 1 (isolated from dev data).
+// SetupTestRedis creates a Redis client isolated from dev data by default.
 func SetupTestRedis(t *testing.T) (*redis.Client, func()) {
 	t.Helper()
 
 	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
+	useDefaultDB := redisURL == ""
+	if useDefaultDB {
 		redisURL = defaultTestRedisURL
 	}
 
@@ -26,8 +27,10 @@ func SetupTestRedis(t *testing.T) (*redis.Client, func()) {
 		t.Fatalf("testhelpers: failed to parse redis URL: %v", err)
 	}
 
-	// Use DB 1 to avoid colliding with development data on DB 0
-	opts.DB = 1
+	// Use DB 1 for the default dev URL; honor explicit REDIS_URL DBs for isolated runs.
+	if useDefaultDB {
+		opts.DB = 1
+	}
 
 	client := redis.NewClient(opts)
 

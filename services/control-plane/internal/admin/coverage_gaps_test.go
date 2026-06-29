@@ -322,7 +322,7 @@ func TestPasswordLogin_LockedOut_Returns429(t *testing.T) {
 	t.Cleanup(rCleanup)
 
 	engine := adminAuthEngine(t, db, rdb)
-	username := uniqueAdminUsername("locked")
+	_, username, _ := enrolledAdmin(t, db, rdb)
 
 	// 5 consecutive failures trip the lockout (threshold = 5).
 	for i := 0; i < 5; i++ {

@@ -96,14 +96,17 @@ func krSetupDB(t *testing.T) *sql.DB {
 func krSetupRedis(t *testing.T) *redis.Client {
 	t.Helper()
 	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
+	useDefaultDB := redisURL == ""
+	if useDefaultDB {
 		redisURL = "redis://:" + krTestRedisPassword + "@localhost:6379" //nolint:gosec
 	}
 	opts, err := redis.ParseURL(redisURL)
 	if err != nil {
 		t.Fatalf("keyrotation_test: failed to parse redis URL: %v", err)
 	}
-	opts.DB = 1 // matches testhelpers test-isolation DB index
+	if useDefaultDB {
+		opts.DB = 1 // matches testhelpers default test-isolation DB index
+	}
 	client := redis.NewClient(opts)
 	require.NoError(t, client.Ping(context.Background()).Err(), "keyrotation_test: failed to ping redis")
 	t.Cleanup(func() { _ = client.Close() })

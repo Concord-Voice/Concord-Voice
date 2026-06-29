@@ -26,9 +26,9 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 )
 
-// newSSOTestRig wires a Gin engine, real Redis (DB 1), and a Handler with the
-// Google provider registered. Returns the engine, the Redis client (so tests
-// can read state keys directly), and the handler.
+// newSSOTestRig wires a Gin engine, test Redis, and a Handler with the Google
+// provider registered. Returns the engine, the Redis client (so tests can read
+// state keys directly), and the handler.
 func newSSOTestRig(t *testing.T) (*gin.Engine, *redis.Client, *oauth.Handler) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)

@@ -105,15 +105,18 @@ func setupHubTestDB(t *testing.T) *sql.DB {
 func setupHubTestRedis(t *testing.T) *redis.Client {
 	t.Helper()
 	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
+	useDefaultDB := redisURL == ""
+	if useDefaultDB {
 		redisURL = "redis://:" + hubTestRedisPassword + "@localhost:6379" //nolint:gosec
 	}
 	opts, err := redis.ParseURL(redisURL)
 	if err != nil {
 		t.Fatalf("hub_epoch_test: failed to parse redis URL: %v", err)
 	}
-	// Use DB 1 for test isolation (matches testhelpers/testredis.go)
-	opts.DB = 1
+	// Use DB 1 for the default dev URL; honor explicit REDIS_URL DBs for isolated runs.
+	if useDefaultDB {
+		opts.DB = 1
+	}
 	client := redis.NewClient(opts)
 	ctx := context.Background()
 	require.NoError(t, client.Ping(ctx).Err(), "hub_epoch_test: failed to ping redis")
