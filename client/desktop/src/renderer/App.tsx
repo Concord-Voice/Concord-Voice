@@ -15,6 +15,7 @@ import UpdateBanner from './components/ui/UpdateBanner';
 import { UpdateSecurityBanner } from './components/Updates/UpdateSecurityBanner';
 import { IncomingCallBanner } from './components/Voice/IncomingCallBanner';
 import { OutgoingCallModal } from './components/Voice/OutgoingCallModal';
+import { AudioOutputs } from './components/Voice/ParticipantGrid';
 import { useUpdateErrorListener } from './hooks/useUpdateErrorListener';
 import MFAChallengeModal from './components/Auth/MFAChallengeModal';
 import AttestationFailedModalHost from './components/AttestationFailedModal';
@@ -40,6 +41,7 @@ import { useNotificationNavigationStore } from './stores/notificationNavigationS
 import { useServerStore } from './stores/serverStore';
 import { useChannelStore } from './stores/channelStore';
 import { useDMStore } from './stores/dmStore';
+import { useVoiceStore } from './stores/voiceStore';
 import { desktopNotificationService } from './services/desktopNotificationService';
 import { usePendingRegistrationStore } from './stores/pendingRegistrationStore';
 // resetService is loaded on-demand via dynamic import() to allow code splitting
@@ -130,6 +132,11 @@ function AuthenticatedLayout() {
   // letting us fall through to <Outlet /> on the next render.
   const e2eeReady = useE2EEStore((s) => s.ready);
   const needsSSOUnlock = useE2EEStore((s) => s.needsSSOUnlock);
+  const voiceActiveChannelId = useVoiceStore((s) => s.activeChannelId);
+  const voiceConnectionState = useVoiceStore((s) => s.connectionState);
+  const isInVoice =
+    Boolean(voiceActiveChannelId) &&
+    (voiceConnectionState === 'connected' || voiceConnectionState === 'reconnecting');
   const navigate = useNavigate();
 
   // Single WebSocket connection that persists across all authenticated routes
@@ -261,6 +268,11 @@ function AuthenticatedLayout() {
 
   return (
     <>
+      {isInVoice && (
+        <ErrorBoundary fallback={null}>
+          <AudioOutputs />
+        </ErrorBoundary>
+      )}
       <ErrorBoundary fallback={<AuthenticatedViewFallback />}>
         <Outlet />
       </ErrorBoundary>

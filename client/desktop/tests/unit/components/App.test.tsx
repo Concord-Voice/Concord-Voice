@@ -7,6 +7,9 @@ import { useNotificationNavigationStore } from '@/renderer/stores/notificationNa
 import { usePendingRegistrationStore } from '@/renderer/stores/pendingRegistrationStore';
 import { useE2EEStore } from '@/renderer/stores/e2eeStore';
 import { useInviteStore } from '@/renderer/stores/inviteStore';
+import { useVoiceStore } from '@/renderer/stores/voiceStore';
+
+const mockDirectMessagesView = vi.hoisted(() => ({ shouldThrow: false }));
 // Mock child components to prevent complex rendering
 vi.mock('@/renderer/components/Auth/AuthFlow', () => ({
   default: () => <div data-testid="auth-flow">AuthFlow</div>,
@@ -15,7 +18,12 @@ vi.mock('@/renderer/components/MainView/MainView', () => ({
   default: () => <div data-testid="main-view">MainView</div>,
 }));
 vi.mock('@/renderer/components/DirectMessages/DirectMessagesView', () => ({
-  default: () => <div data-testid="dm-view">DirectMessagesView</div>,
+  default: () => {
+    if (mockDirectMessagesView.shouldThrow) {
+      throw new Error('DM view crashed');
+    }
+    return <div data-testid="dm-view">DirectMessagesView</div>;
+  },
 }));
 vi.mock('@/renderer/components/Settings/SettingsPage', () => ({
   default: () => <div data-testid="settings-page">SettingsPage</div>,
@@ -25,6 +33,9 @@ vi.mock('@/renderer/components/Servers/ServerSettingsPage', () => ({
 }));
 vi.mock('@/renderer/components/Voice/PipWindow', () => ({
   default: () => <div data-testid="pip-window">PipWindow</div>,
+}));
+vi.mock('@/renderer/components/Voice/ParticipantGrid', () => ({
+  AudioOutputs: () => <div data-testid="audio-outputs" />,
 }));
 vi.mock('@/renderer/hooks/useWebSocket', () => ({
   useWebSocket: vi.fn(),
@@ -118,11 +129,13 @@ import App, { handleAppRootError, __resetRestoreSessionCalledForTesting } from '
 
 describe('App', () => {
   beforeEach(() => {
+    mockDirectMessagesView.shouldThrow = false;
     vi.clearAllMocks();
     useAuthStore.getState().clearAccessToken();
     useUserStore.setState({ user: null });
     usePendingRegistrationStore.getState().clearPending();
     useE2EEStore.getState().reset();
+    useVoiceStore.getState().reset();
     __resetRestoreSessionCalledForTesting();
     Object.assign(globalThis.electron ?? {}, {
       restoreSession: undefined,
@@ -397,6 +410,38 @@ describe('App', () => {
     expect(useDMStore.getState().activeConversationId).toBe('dm-conv-1');
     expect(mockClearBadge).toHaveBeenCalled();
     expect(useNotificationNavigationStore.getState().pendingNavigation).toBeNull();
+  });
+
+  it('keeps voice audio outputs mounted while viewing DMs', () => {
+    authenticateUser();
+    useVoiceStore.setState({
+      activeChannelId: 'voice-1',
+      connectionState: 'connected',
+    });
+
+    render(<App />);
+
+    expect(screen.getByTestId('dm-view')).toBeInTheDocument();
+    expect(screen.getByTestId('audio-outputs')).toBeInTheDocument();
+  });
+
+  it('keeps voice audio outputs mounted if the active route crashes', () => {
+    authenticateUser();
+    useVoiceStore.setState({
+      activeChannelId: 'voice-1',
+      connectionState: 'connected',
+    });
+    mockDirectMessagesView.shouldThrow = true;
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      render(<App />);
+
+      expect(screen.getByTestId('audio-outputs')).toBeInTheDocument();
+      expect(screen.getByText('This view failed to load')).toBeInTheDocument();
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it('queues invite deep links until the user is authenticated and verified', async () => {

@@ -89,9 +89,6 @@ vi.mock('@/renderer/components/Voice/PersistentVoiceBar', () => ({
 vi.mock('@/renderer/components/Voice/VoiceTextChat', () => ({
   default: () => <div data-testid="voice-text-chat">VoiceTextChat</div>,
 }));
-vi.mock('@/renderer/components/Voice/ParticipantGrid', () => ({
-  AudioOutputs: () => <div data-testid="audio-outputs">AudioOutputs</div>,
-}));
 vi.mock('@/renderer/services/pipSignalingProxy', () => ({
   // Regular function (not arrow) so `new PipSignalingProxy(...)` works.
   // Returns the mock object so proxy.dispose() is callable.
@@ -427,57 +424,7 @@ describe('MainView', () => {
     expect(container.querySelector('.main-view')).toBeInTheDocument();
   });
 
-  // ── Voice persistence ──────────────────────────────────────────────────────
-
-  it('renders AudioOutputs persistently when user is connected to voice', () => {
-    useVoiceStore.setState({
-      activeChannelId: 'voice-ch-1',
-      connectionState: 'connected',
-    });
-    // Active channel is a text channel (user browsed away from voice)
-    useChannelStore.setState({
-      channels: [mockChannel],
-      activeChannelId: 'channel-1',
-    });
-    render(<MainView />);
-    expect(screen.getByTestId('audio-outputs')).toBeInTheDocument();
-  });
-
-  it('renders AudioOutputs when connection state is reconnecting', () => {
-    useVoiceStore.setState({
-      activeChannelId: 'voice-ch-1',
-      connectionState: 'reconnecting',
-    });
-    useChannelStore.setState({
-      channels: [mockChannel],
-      activeChannelId: 'channel-1',
-    });
-    render(<MainView />);
-    expect(screen.getByTestId('audio-outputs')).toBeInTheDocument();
-  });
-
-  it('does not render AudioOutputs when not connected to voice', () => {
-    useVoiceStore.setState({
-      activeChannelId: null,
-      connectionState: 'disconnected',
-    });
-    render(<MainView />);
-    expect(screen.queryByTestId('audio-outputs')).not.toBeInTheDocument();
-  });
-
-  it('renders AudioOutputs even while viewing the active voice channel', () => {
-    const voiceChannel = { ...mockChannel, id: 'voice-ch-1', type: 'voice' as const };
-    useVoiceStore.setState({
-      activeChannelId: 'voice-ch-1',
-      connectionState: 'connected',
-    });
-    useChannelStore.setState({
-      channels: [voiceChannel],
-      activeChannelId: 'voice-ch-1',
-    });
-    render(<MainView />);
-    expect(screen.getByTestId('audio-outputs')).toBeInTheDocument();
-  });
+  // ── Voice routing ───────────────────────────────────────────────────────────
 
   it('renders VoiceView when active channel type is voice', () => {
     const voiceChannel = { ...mockChannel, id: 'voice-ch-1', type: 'voice' as const };

@@ -1,6 +1,5 @@
 import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
-import { AudioOutputs } from '../Voice/ParticipantGrid';
 import { PipSignalingProxy } from '../../services/pipSignalingProxy';
 import { createResizeKeyHandler } from '../../utils/resizeKeyboard';
 import ChannelList from '../Channels/ChannelList';
@@ -284,7 +283,7 @@ const MainView: React.FC = () => {
   );
 
   // ─── Voice & layout detection ───
-  // Include 'reconnecting' so AudioOutputs and PiP proxy survive transient
+  // Include 'reconnecting' so voice UI and PiP proxy survive transient
   // network blips — only tear them down on an explicit disconnect/reset.
   const isInVoice =
     Boolean(voiceActiveChannelId) &&
@@ -411,10 +410,6 @@ const MainView: React.FC = () => {
 
           {/* Persistent voice controls bar — shown when in voice but viewing another channel */}
           {showPersistentBar && <PersistentVoiceBar />}
-
-          {/* Persistent audio outputs — kept mounted across navigation so remote audio
-              never cuts out when the user browses text channels, DMs, or settings. */}
-          {isInVoice && <AudioOutputs />}
         </div>
 
         {/* Vertical voice text chat side panel */}
