@@ -3,7 +3,9 @@ package admin_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -64,6 +66,11 @@ func TestEnroll_HappyPath_RegistersKeyAndActivates(t *testing.T) {
 	ctx := context.Background()
 
 	adminID, username, token := pendingAdminWithToken(t, db, rdb)
+	sum := sha256.Sum256([]byte(token))
+	tokenKey := "admin_enroll:" + hex.EncodeToString(sum[:])
+	boundID, err := rdb.Get(context.Background(), tokenKey).Result()
+	require.NoError(t, err)
+	require.Equal(t, adminID, boundID, "test setup token must bind to pending admin")
 	engine, _ := adminEnrollEngine(t, db, rdb)
 
 	// Begin.
@@ -143,7 +150,17 @@ func TestEnroll_TokenIsSingleUse(t *testing.T) {
 	rdb, rCleanup := testhelpers.SetupTestRedis(t)
 	t.Cleanup(rCleanup)
 
-	_, username, token := pendingAdminWithToken(t, db, rdb)
+	adminID, username, token := pendingAdminWithToken(t, db, rdb)
+	sum := sha256.Sum256([]byte(token))
+	tokenKey := "admin_enroll:" + hex.EncodeToString(sum[:])
+	boundID, err := rdb.Get(context.Background(), tokenKey).Result()
+	require.NoError(t, err)
+	require.Equal(t, adminID, boundID, "test setup token must bind to pending admin")
+	got, err := admin.NewAdminRepo(db).GetByUsername(context.Background(), username)
+	require.NoError(t, err)
+	ok, err := auth.VerifyPassword(adminTestPassword, got.PasswordHash)
+	require.NoError(t, err)
+	require.True(t, ok, "test setup password must verify")
 	engine, _ := adminEnrollEngine(t, db, rdb)
 
 	first := postJSON(engine, "/admin/api/v1/enroll/begin", map[string]string{

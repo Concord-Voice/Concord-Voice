@@ -39,13 +39,17 @@ func SetupTestRedis(t *testing.T) (*redis.Client, func()) {
 		t.Fatalf("testhelpers: failed to ping redis: %v", err)
 	}
 
+	if err := flushTestRedis(ctx, client); err != nil {
+		t.Fatalf("testhelpers: failed to flush redis: %v", err)
+	}
+
 	cleanup := func() {
-		_ = client.FlushDB(context.Background()).Err()
 		_ = client.Close()
 	}
 
-	// Start clean
-	client.FlushDB(ctx)
-
 	return client, cleanup
+}
+
+func flushTestRedis(ctx context.Context, client *redis.Client) error {
+	return client.Do(ctx, "FLUSHDB", "SYNC").Err()
 }

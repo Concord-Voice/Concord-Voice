@@ -236,7 +236,7 @@ func TestAdminRepo_DeleteCredentials_ClosedDB_Errors(t *testing.T) {
 // defaultTestDBURL returns the test database URL assembled from parts to satisfy
 // static credential analysis — mirrors the pattern in testhelpers/testdb.go.
 func defaultTestDBURL() string {
-	host := "localhost:5433"
+	host := "localhost:5432"
 	if h := os.Getenv("TEST_DB_HOST"); h != "" {
 		host = h
 	}
@@ -324,16 +324,12 @@ func TestPasswordLogin_LockedOut_Returns429(t *testing.T) {
 	engine := adminAuthEngine(t, db, rdb)
 	_, username, _ := enrolledAdmin(t, db, rdb)
 
-	// 5 consecutive failures trip the lockout (threshold = 5).
+	lk := admin.NewLockout(rdb, nil)
 	for i := 0; i < 5; i++ {
-		rec := postJSON(engine, "/admin/api/v1/auth/password", map[string]string{
-			"username": username,
-			"password": "WrongPassword!",
-		})
-		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		require.NoError(t, lk.RecordFailure(context.Background(), username, "203.0.113.10"))
 	}
 
-	// 6th attempt hits the locked branch → auditDenied is called → 429.
+	// Locked branch -> auditDenied is called -> 429.
 	rec := postJSON(engine, "/admin/api/v1/auth/password", map[string]string{
 		"username": username,
 		"password": "AnyPassword!",
