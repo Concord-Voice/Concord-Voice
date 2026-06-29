@@ -22,7 +22,7 @@
 import { describe, it, expect, vi, afterEach, type Mock } from 'vitest';
 
 // ── Hoisted shared mocks (available during vi.mock factory execution) ──────
-const { mockMainWindow, MockBrowserWindow, mockApp } = vi.hoisted(() => {
+const { mockMainWindow, MockBrowserWindow, mockApp, mockElectronAutoUpdater } = vi.hoisted(() => {
   const mockWebContents = {
     openDevTools: vi.fn(),
     closeDevTools: vi.fn(),
@@ -69,12 +69,14 @@ const { mockMainWindow, MockBrowserWindow, mockApp } = vi.hoisted(() => {
     on: vi.fn(),
     getGPUInfo: vi.fn(() => Promise.resolve({ gpuDevice: [] })),
   };
-  return { mockMainWindow, MockBrowserWindow: bw, mockApp };
+  const mockElectronAutoUpdater = { on: vi.fn() };
+  return { mockMainWindow, MockBrowserWindow: bw, mockApp, mockElectronAutoUpdater };
 });
 
 vi.mock('electron', () => ({
   BrowserWindow: MockBrowserWindow,
   app: mockApp,
+  autoUpdater: mockElectronAutoUpdater,
   ipcMain: { handle: vi.fn(), on: vi.fn() },
   nativeImage: {
     createFromPath: vi.fn(() => ({ isEmpty: () => false, toDataURL: () => '' })),
@@ -200,12 +202,15 @@ type HandlerFn = (...args: unknown[]) => unknown;
 const PLATFORMS = ['darwin', 'win32', 'linux'] as const;
 const originalPlatform = process.platform;
 
-async function importMainUnderPlatform(
-  platform: (typeof PLATFORMS)[number]
-): Promise<{ closeHandlers: HandlerFn[]; beforeQuit?: HandlerFn }> {
+async function importMainUnderPlatform(platform: (typeof PLATFORMS)[number]): Promise<{
+  closeHandlers: HandlerFn[];
+  beforeQuit?: HandlerFn;
+  beforeQuitForUpdate?: HandlerFn;
+}> {
   vi.resetModules();
   mockMainWindow.on.mockClear();
   mockApp.on.mockClear();
+  mockElectronAutoUpdater.on.mockClear();
   Object.defineProperty(process, 'platform', { value: platform, configurable: true });
 
   // Import re-runs main.ts module init under this platform; createWindow runs
@@ -218,7 +223,14 @@ async function importMainUnderPlatform(
     .filter((c) => c[0] === 'close')
     .map((c) => c[1] as HandlerFn);
   const beforeQuitCall = (mockApp.on as Mock).mock.calls.find((c) => c[0] === 'before-quit');
-  return { closeHandlers, beforeQuit: beforeQuitCall?.[1] as HandlerFn | undefined };
+  const beforeQuitForUpdateCall = (mockElectronAutoUpdater.on as Mock).mock.calls.find(
+    (c) => c[0] === 'before-quit-for-update'
+  );
+  return {
+    closeHandlers,
+    beforeQuit: beforeQuitCall?.[1] as HandlerFn | undefined,
+    beforeQuitForUpdate: beforeQuitForUpdateCall?.[1] as HandlerFn | undefined,
+  };
 }
 
 /** Fire every registered 'close' listener with the same event, as Electron does. */
@@ -257,6 +269,24 @@ describe('quit lifecycle deadlock — regression for #1383', () => {
       ).not.toHaveBeenCalled();
     });
   }
+
+  it('[darwin] update install restart must bypass close-to-tray before app.quit fires (#1897)', async () => {
+    const { closeHandlers, beforeQuitForUpdate } = await importMainUnderPlatform('darwin');
+    expect(closeHandlers.length, '[darwin] at least one close listener').toBeGreaterThan(0);
+    expect(
+      beforeQuitForUpdate,
+      "[darwin] 'before-quit-for-update' handler should be registered"
+    ).toBeTypeOf('function');
+
+    beforeQuitForUpdate!();
+    const event = { preventDefault: vi.fn() };
+    fireClose(closeHandlers, event);
+
+    expect(
+      event.preventDefault,
+      '[darwin] update restart must not be intercepted as close-to-tray'
+    ).not.toHaveBeenCalled();
+  });
 });
 
 describe('first-run close default — tray landed (#1099, supersedes the #1383 interim)', () => {

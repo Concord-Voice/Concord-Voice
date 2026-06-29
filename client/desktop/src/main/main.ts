@@ -18,6 +18,7 @@ import { isWayland } from './waylandDetect';
 import { deriveCloseAction, deriveMinimizeAction } from '../shared/clientBehavior';
 import {
   app,
+  autoUpdater as electronAutoUpdater,
   BrowserWindow,
   clipboard,
   desktopCapturer,
@@ -776,7 +777,12 @@ app.whenReady().then(async () => {
   // ─── Update safety: startup validation (#384) ─────────────────────
   // Must run before createWindow() so we can stash rollback info,
   // but after initAutoUpdater() so the logger is available.
-  initAutoUpdater(() => mainWindow);
+  initAutoUpdater(
+    () => mainWindow,
+    () => {
+      isQuitting = true;
+    }
+  );
 
   const updateLogger = getUpdateLogger();
   if (updateLogger) {
@@ -869,6 +875,12 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin' && !isTrayActive()) {
     app.quit();
   }
+});
+
+// autoUpdater.quitAndInstall() closes windows before the normal before-quit
+// event, so release the close-to-tray veto at the update-specific hook too (#1897).
+electronAutoUpdater.on('before-quit-for-update', () => {
+  isQuitting = true;
 });
 
 // Clean up scheduled update checks on quit; flush update log (#383)

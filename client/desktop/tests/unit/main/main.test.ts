@@ -65,6 +65,7 @@ vi.mock('electron', () => ({
       toDataURL: vi.fn(() => 'data:image/png;base64,MOCKICON'),
     })),
   },
+  autoUpdater: { on: vi.fn() },
   app: {
     getPath: vi.fn(() => '/tmp/test-userdata'),
     setPath: vi.fn(), // pinUserDataPath.ts calls app.setPath at import time (#1291)

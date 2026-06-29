@@ -503,6 +503,23 @@ describe('updater', () => {
       expect(mockAutoUpdater.quitAndInstall).toHaveBeenCalledOnce();
     });
 
+    it('releases the close-to-tray quit veto before quitAndInstall', async () => {
+      setPlatform('darwin');
+      const releaseQuitVeto = vi.fn();
+      const updater = await import('../../../src/main/updater');
+      updater.initAutoUpdater(() => mockWindow, releaseQuitVeto);
+      armDownloaded('/tmp/cache/ConcordVoice-2.0.0-macos.zip');
+
+      await updater.safeQuitAndInstall();
+
+      const releaseOrder = releaseQuitVeto.mock.invocationCallOrder[0];
+      const quitOrder = mockAutoUpdater.quitAndInstall.mock.invocationCallOrder[0];
+      expect(releaseQuitVeto).toHaveBeenCalledOnce();
+      expect(releaseOrder).toBeDefined();
+      expect(quitOrder).toBeDefined();
+      expect(releaseOrder!).toBeLessThan(quitOrder!);
+    });
+
     it('does NOT verify on win32 (windows path unchanged)', async () => {
       setPlatform('win32');
       const updater = await import('../../../src/main/updater');

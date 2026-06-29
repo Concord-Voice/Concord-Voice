@@ -74,6 +74,7 @@ const { mockMainWindow, MockBrowserWindow, mockApp, mockTrayCtor } = vi.hoisted(
 vi.mock('electron', () => ({
   BrowserWindow: MockBrowserWindow,
   app: mockApp,
+  autoUpdater: { on: vi.fn() },
   ipcMain: { handle: vi.fn(), on: vi.fn() },
   nativeImage: {
     createFromPath: vi.fn(() => ({ isEmpty: () => false, toDataURL: () => '' })),

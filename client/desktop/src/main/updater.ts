@@ -81,6 +81,7 @@ function writeUpdatePrefs(prefs: UpdatePrefs): void {
 
 let checkInterval: ReturnType<typeof setInterval> | null = null;
 let getWindow: (() => BrowserWindow | null) | null = null;
+let releaseQuitVetoForUpdate: (() => void) | null = null;
 let handlersRegistered = false;
 let logger: UpdateLogger | null = null;
 let pendingUpdateVersion: string | null = null;
@@ -265,8 +266,12 @@ function startScheduledChecks(): void {
   checkInterval = setInterval(scheduledCheck, UPDATE_CHECK_INTERVAL_MS);
 }
 
-export function initAutoUpdater(mainWindowGetter: () => BrowserWindow | null): void {
+export function initAutoUpdater(
+  mainWindowGetter: () => BrowserWindow | null,
+  releaseUpdateQuitVeto?: () => void
+): void {
   getWindow = mainWindowGetter;
+  releaseQuitVetoForUpdate = releaseUpdateQuitVeto ?? null;
 
   if (!app.isPackaged) {
     // No logger yet in dev mode — use console directly
@@ -431,6 +436,8 @@ export async function safeQuitAndInstall(): Promise<void> {
   }
 
   logger?.info('Safety sentinel written, proceeding with quitAndInstall()');
+  // ponytail: shared install choke point; native before-quit-for-update stays as a macOS fallback.
+  releaseQuitVetoForUpdate?.();
   autoUpdater.quitAndInstall();
 }
 
