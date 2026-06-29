@@ -204,6 +204,7 @@ func TruncateAllTables(db *sql.DB) error {
 		dm_conversations,
 		dm_participants,
 		dm_messages,
+		dm_message_reactions,
 		dm_channel_keys,
 		dm_pending_key_requests,
 		dm_read_states,

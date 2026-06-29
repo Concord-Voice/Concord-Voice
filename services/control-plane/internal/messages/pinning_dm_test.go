@@ -296,25 +296,6 @@ func TestGetChannelPins_InvalidUUID_400(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
-func TestReactions_DMMessage_Returns404(t *testing.T) {
-	// Reactions on DM messages are not yet supported; the handler must
-	// resolve the DM context and return 404 to non-owners of the feature.
-	ts := setupTS(t)
-	u1 := ts.CreateTestUser(t, "dmreact_a")
-	u2 := ts.CreateTestUser(t, "dmreact_b")
-	convID := ts.CreateDMConversation(t, u1.ID, u2.ID)
-	msgID := insertDMMessageDirect(t, ts, convID, u1.ID, "emoji me")
-
-	body := map[string]interface{}{"emoji": "👍"}
-	w := ts.DoRequest("PUT", pinAPIMsg+msgID+"/reactions", body,
-		testhelpers.AuthHeaders(u1.AccessToken))
-	assert.Equal(t, http.StatusNotFound, w.Code)
-
-	wg := ts.DoRequest("GET", pinAPIMsg+msgID+"/reactions", nil,
-		testhelpers.AuthHeaders(u1.AccessToken))
-	assert.Equal(t, http.StatusNotFound, wg.Code)
-}
-
 func TestUnpinMessage_InvalidUUID_400(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "unpininvalid")

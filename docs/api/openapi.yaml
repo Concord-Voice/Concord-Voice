@@ -7056,10 +7056,11 @@ paths:
       tags:
       - Messages
       summary: Toggle a reaction
-      description: 'Add the caller''s reaction to a server-channel message, or remove it if it already
+      description: 'Add the caller''s reaction to a server-channel or DM message, or remove it if it already
         exists.
 
-        Requires the Send Messages permission. DM messages are not supported (404).
+        Server-channel messages require the Send Messages permission. DM messages require the caller
+        to be a current participant.
 
         Rate limit: 30 requests per minute.
 
@@ -7116,7 +7117,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '404':
-          description: Message not found (includes DM messages, which this endpoint does not support)
+          description: Message not found, or DM message not visible to the caller
           content:
             application/json:
               schema:
@@ -7127,10 +7128,8 @@ paths:
       tags:
       - Messages
       summary: Get message reactions
-      description: 'All reactions for a server-channel message, grouped by emoji. Requires Read Message
-        History.
-
-        DM messages are not supported (404).
+      description: 'All reactions for a server-channel or DM message, grouped by emoji. Server-channel
+        messages require Read Message History; DM messages require the caller to be a current participant.
 
         Rate limit: 30 requests per minute.
 
@@ -7167,7 +7166,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '404':
-          description: Message not found (includes DM messages, which this endpoint does not support)
+          description: Message not found, or DM message not visible to the caller
           content:
             application/json:
               schema:
@@ -13387,6 +13386,11 @@ components:
                 type: string
               file_size:
                 type: integer
+        reactions:
+          type: array
+          description: Present only when the message has reactions
+          items:
+            $ref: '#/components/schemas/ReactionSummary'
         call_event_payload:
           type: object
           nullable: true

@@ -2,6 +2,7 @@ package messages
 
 import (
 	"database/sql"
+	"errors"
 	"log"
 	"net/http"
 	"time"
@@ -19,6 +20,81 @@ const (
 	errMsgInvalidEmoji   = "Invalid emoji"
 	errMsgReactionFailed = "Failed to toggle reaction"
 	errMsgFetchReactions = "Failed to fetch reactions"
+)
+
+var errDMReactionNotParticipant = errors.New("dm reaction user is not a current participant")
+
+const (
+	messageReactionInsertSQL = `
+		INSERT INTO message_reactions (id, message_id, user_id, emoji)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (message_id, user_id, emoji) DO NOTHING
+	`
+	dmMessageReactionInsertSQL = `
+		INSERT INTO dm_message_reactions (id, message_id, user_id, emoji)
+		SELECT $1, $2, $3, $4
+		WHERE EXISTS (
+			SELECT 1
+			FROM dm_messages dm
+			INNER JOIN dm_participants dp ON dp.conversation_id = dm.conversation_id AND dp.user_id = $3
+			WHERE dm.id = $2
+		)
+		ON CONFLICT (message_id, user_id, emoji) DO NOTHING
+	`
+	messageReactionDeleteSQL = `
+		DELETE FROM message_reactions
+		WHERE message_id = $1 AND user_id = $2 AND emoji = $3
+	`
+	dmMessageReactionDeleteSQL = `
+		DELETE FROM dm_message_reactions mr
+		USING dm_messages dm, dm_participants dp
+		WHERE mr.message_id = $1 AND mr.user_id = $2 AND mr.emoji = $3
+			AND dm.id = mr.message_id
+			AND dp.conversation_id = dm.conversation_id
+			AND dp.user_id = $2
+	`
+	messageReactionSummarySQL = `
+		SELECT mr.user_id, u.username, u.display_name
+		FROM message_reactions mr
+		INNER JOIN users u ON mr.user_id = u.id
+		WHERE mr.message_id = $1 AND mr.emoji = $2
+		ORDER BY mr.created_at ASC
+	`
+	dmMessageReactionSummarySQL = `
+		SELECT mr.user_id, u.username, u.display_name
+		FROM dm_message_reactions mr
+		INNER JOIN users u ON mr.user_id = u.id
+		WHERE mr.message_id = $1 AND mr.emoji = $2
+		ORDER BY mr.created_at ASC
+	`
+	messageReactionsByMessageSQL = `
+		SELECT mr.emoji, mr.user_id, u.username, u.display_name
+		FROM message_reactions mr
+		INNER JOIN users u ON mr.user_id = u.id
+		WHERE mr.message_id = $1
+		ORDER BY mr.emoji, mr.created_at ASC
+	`
+	dmMessageReactionsByMessageSQL = `
+		SELECT mr.emoji, mr.user_id, u.username, u.display_name
+		FROM dm_message_reactions mr
+		INNER JOIN users u ON mr.user_id = u.id
+		WHERE mr.message_id = $1
+		ORDER BY mr.emoji, mr.created_at ASC
+	`
+	messageReactionsForMessagesSQL = `
+		SELECT mr.message_id, mr.emoji, mr.user_id, u.username, u.display_name
+		FROM message_reactions mr
+		INNER JOIN users u ON mr.user_id = u.id
+		WHERE mr.message_id = ANY($1::uuid[])
+		ORDER BY mr.message_id, mr.emoji, mr.created_at ASC
+	`
+	dmMessageReactionsForMessagesSQL = `
+		SELECT mr.message_id, mr.emoji, mr.user_id, u.username, u.display_name
+		FROM dm_message_reactions mr
+		INNER JOIN users u ON mr.user_id = u.id
+		WHERE mr.message_id = ANY($1::uuid[])
+		ORDER BY mr.message_id, mr.emoji, mr.created_at ASC
+	`
 )
 
 // ToggleReactionRequest is the request body for toggling a reaction.
@@ -175,8 +251,7 @@ func (h *Handler) ToggleReaction(c *gin.Context) {
 		return
 	}
 	if mctx.isDM {
-		// Reactions on DM messages are not yet supported by this endpoint.
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		h.toggleDMReaction(c, messageID, userID, req.Emoji, mctx.conversationID)
 		return
 	}
 	channelID, serverID := mctx.channelID, mctx.serverID
@@ -197,44 +272,105 @@ func (h *Handler) ToggleReaction(c *gin.Context) {
 		return
 	}
 
-	// Toggle: try INSERT, if unique constraint fires → DELETE
-	reactionID := uuid.New().String()
-	result, err := h.db.Exec(`
-		INSERT INTO message_reactions (id, message_id, user_id, emoji)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (message_id, user_id, emoji) DO NOTHING
-	`, reactionID, messageID, userID, req.Emoji)
+	action, err := h.toggleReactionRow(messageReactionInsertSQL, messageReactionDeleteSQL, messageID, userID, req.Emoji)
 	if err != nil {
-		h.log.Error("Failed to insert reaction", "error", err)
+		h.log.Error("Failed to toggle reaction", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgReactionFailed})
 		return
 	}
 
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		h.log.Error("Failed to get affected rows for reaction insert", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgReactionFailed})
-		return
-	}
-	action := "added"
-	if rowsAffected == 0 {
-		// Reaction already existed — remove it
-		_, err = h.db.Exec(`
-			DELETE FROM message_reactions
-			WHERE message_id = $1 AND user_id = $2 AND emoji = $3
-		`, messageID, userID, req.Emoji)
-		if err != nil {
-			h.log.Error("Failed to delete reaction", "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgReactionFailed})
-			return
-		}
-		action = "removed"
-	}
-
-	// Build updated summary and broadcast + respond
 	summary := h.buildReactionSummary(messageID, req.Emoji, userID)
 	h.broadcastReaction(channelID, messageID, req.Emoji, userID, action, summary)
+	writeToggleReactionResponse(c, action, summary)
 
+}
+
+func (h *Handler) toggleDMReaction(c *gin.Context, messageID, userID, emoji, conversationID string) {
+	action, err := h.toggleDMReactionRow(messageID, userID, emoji)
+	if err != nil {
+		if errors.Is(err, errDMReactionNotParticipant) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+			return
+		}
+		h.log.Error("Failed to toggle DM reaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgReactionFailed})
+		return
+	}
+
+	summary := h.buildDMReactionSummary(messageID, emoji, userID)
+	h.broadcastDMReaction(conversationID, messageID, emoji, userID, action, summary)
+	writeToggleReactionResponse(c, action, summary)
+}
+
+func (h *Handler) toggleDMReactionRow(messageID, userID, emoji string) (string, error) {
+	reactionID := uuid.New().String()
+	result, err := h.db.Exec(dmMessageReactionInsertSQL, reactionID, messageID, userID, emoji)
+	if err != nil {
+		return "", err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if rowsAffected > 0 {
+		return "added", nil
+	}
+
+	result, err = h.db.Exec(dmMessageReactionDeleteSQL, messageID, userID, emoji)
+	if err != nil {
+		return "", err
+	}
+	rowsAffected, err = result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if rowsAffected > 0 {
+		return "removed", nil
+	}
+
+	isParticipant, err := h.isDMMessageParticipant(messageID, userID)
+	if err != nil {
+		return "", err
+	}
+	if !isParticipant {
+		return "", errDMReactionNotParticipant
+	}
+	return "removed", nil
+}
+
+func (h *Handler) isDMMessageParticipant(messageID, userID string) (bool, error) {
+	var isParticipant bool
+	err := h.db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1
+			FROM dm_messages dm
+			INNER JOIN dm_participants dp ON dp.conversation_id = dm.conversation_id AND dp.user_id = $2
+			WHERE dm.id = $1
+		)
+	`, messageID, userID).Scan(&isParticipant)
+	return isParticipant, err
+}
+
+func (h *Handler) toggleReactionRow(insertSQL, deleteSQL, messageID, userID, emoji string) (string, error) {
+	reactionID := uuid.New().String()
+	result, err := h.db.Exec(insertSQL, reactionID, messageID, userID, emoji)
+	if err != nil {
+		return "", err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if rowsAffected > 0 {
+		return "added", nil
+	}
+	if _, err := h.db.Exec(deleteSQL, messageID, userID, emoji); err != nil {
+		return "", err
+	}
+	return "removed", nil
+}
+
+func writeToggleReactionResponse(c *gin.Context, action string, summary *models.ReactionSummary) {
 	response := gin.H{"action": action}
 	if summary != nil {
 		response["reaction"] = summary
@@ -245,45 +381,102 @@ func (h *Handler) ToggleReaction(c *gin.Context) {
 // buildReactionSummary queries the current state of a specific emoji reaction on a message.
 // Returns nil if no reactions exist for this emoji.
 func (h *Handler) buildReactionSummary(messageID, emoji, currentUserID string) *models.ReactionSummary {
-	rows, err := h.db.Query(`
-		SELECT mr.user_id, u.username, u.display_name
-		FROM message_reactions mr
-		INNER JOIN users u ON mr.user_id = u.id
-		WHERE mr.message_id = $1 AND mr.emoji = $2
-		ORDER BY mr.created_at ASC
-	`, messageID, emoji)
+	return h.buildReactionSummaryWithQuery(messageReactionSummarySQL, messageID, emoji, currentUserID)
+}
+
+func (h *Handler) buildDMReactionSummary(messageID, emoji, currentUserID string) *models.ReactionSummary {
+	return h.buildReactionSummaryWithQuery(dmMessageReactionSummarySQL, messageID, emoji, currentUserID)
+}
+
+func (h *Handler) buildReactionSummaryWithQuery(query, messageID, emoji, currentUserID string) *models.ReactionSummary {
+	rows, err := h.db.Query(query, messageID, emoji)
 	if err != nil {
 		h.log.Error("Failed to query reaction summary", "error", err)
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
-
-	summary := &models.ReactionSummary{
-		Emoji: emoji,
-		Users: []models.ReactionUser{},
-	}
-
-	for rows.Next() {
-		var user models.ReactionUser
-		if err := rows.Scan(&user.UserID, &user.Username, &user.DisplayName); err != nil {
-			continue
-		}
-		summary.Users = append(summary.Users, user)
-		summary.Count++
-		if user.UserID == currentUserID {
-			summary.Me = true
-		}
-	}
-
-	if err := rows.Err(); err != nil {
+	summary, err := scanSingleReactionSummary(rows, emoji, currentUserID)
+	if err != nil {
 		h.log.Error("Error iterating reaction summary rows", "error", err)
 		return nil
 	}
-
-	if summary.Count == 0 {
-		return nil
-	}
 	return summary
+}
+
+func scanSingleReactionSummary(rows *sql.Rows, emoji, currentUserID string) (summary *models.ReactionSummary, err error) {
+	defer func() {
+		if closeErr := rows.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
+
+	summary = newReactionSummary(emoji)
+	for rows.Next() {
+		var user models.ReactionUser
+		if err := rows.Scan(&user.UserID, &user.Username, &user.DisplayName); err != nil {
+			return nil, err
+		}
+		appendReactionUser(summary, user.UserID, user.Username, user.DisplayName, currentUserID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if summary.Count == 0 {
+		return nil, nil
+	}
+	return summary, nil
+}
+
+func scanReactionSummaries(rows *sql.Rows, currentUserID string) (reactions []models.ReactionSummary, err error) {
+	defer func() {
+		if closeErr := rows.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
+
+	summaryMap := make(map[string]*models.ReactionSummary)
+	var order []string
+	for rows.Next() {
+		var emoji, rUserID, username string
+		var displayName *string
+		if err := rows.Scan(&emoji, &rUserID, &username, &displayName); err != nil {
+			return nil, err
+		}
+		s, exists := summaryMap[emoji]
+		if !exists {
+			s = newReactionSummary(emoji)
+			summaryMap[emoji] = s
+			order = append(order, emoji)
+		}
+		appendReactionUser(s, rUserID, username, displayName, currentUserID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return orderedReactionSummaries(summaryMap, order), nil
+}
+
+func newReactionSummary(emoji string) *models.ReactionSummary {
+	return &models.ReactionSummary{Emoji: emoji, Users: []models.ReactionUser{}}
+}
+
+func appendReactionUser(summary *models.ReactionSummary, userID, username string, displayName *string, currentUserID string) {
+	summary.Users = append(summary.Users, models.ReactionUser{
+		UserID:      userID,
+		Username:    username,
+		DisplayName: displayName,
+	})
+	summary.Count++
+	if userID == currentUserID {
+		summary.Me = true
+	}
+}
+
+func orderedReactionSummaries(summaryMap map[string]*models.ReactionSummary, order []string) []models.ReactionSummary {
+	reactions := make([]models.ReactionSummary, 0, len(order))
+	for _, emoji := range order {
+		reactions = append(reactions, *summaryMap[emoji])
+	}
+	return reactions
 }
 
 // broadcastReaction sends a reaction event to all channel subscribers.
@@ -292,26 +485,32 @@ func (h *Handler) broadcastReaction(channelID, messageID, emoji, userID, action 
 	if err != nil {
 		return
 	}
+	eventType, eventData := reactionEvent(messageID, emoji, userID, action, summary)
+	eventData["channel_id"] = channelID
+	h.hub.BroadcastToChannel(channelUUID, websocket.OutgoingMessage{Type: eventType, Data: eventData})
+}
 
+func (h *Handler) broadcastDMReaction(conversationID, messageID, emoji, userID, action string, summary *models.ReactionSummary) {
+	conversationUUID, err := uuid.Parse(conversationID)
+	if err != nil {
+		return
+	}
+	eventType, eventData := reactionEvent(messageID, emoji, userID, action, summary)
+	eventData["conversation_id"] = conversationID
+	eventData["channel_id"] = conversationID // Back-compat: renderer stores DMs by conversation id.
+	h.hub.BroadcastToDM(conversationUUID, websocket.OutgoingMessage{Type: eventType, Data: eventData})
+}
+
+func reactionEvent(messageID, emoji, userID, action string, summary *models.ReactionSummary) (string, map[string]interface{}) {
 	eventType := "message_reaction_added"
 	if action == "removed" {
 		eventType = "message_reaction_removed"
 	}
-
-	eventData := map[string]interface{}{
-		"message_id": messageID,
-		"channel_id": channelID,
-		"emoji":      emoji,
-		"user_id":    userID,
-	}
+	eventData := map[string]interface{}{"message_id": messageID, "emoji": emoji, "user_id": userID}
 	if summary != nil {
 		eventData["reaction_summary"] = summary
 	}
-
-	h.hub.BroadcastToChannel(channelUUID, websocket.OutgoingMessage{
-		Type: eventType,
-		Data: eventData,
-	})
+	return eventType, eventData
 }
 
 // GetReactions returns all reactions for a message, grouped by emoji.
@@ -329,8 +528,7 @@ func (h *Handler) GetReactions(c *gin.Context) {
 		return
 	}
 	if mctx.isDM {
-		// Reactions on DM messages are not yet supported by this endpoint.
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		h.getDMReactions(c, messageID, userID)
 		return
 	}
 	channelID, serverID := mctx.channelID, mctx.serverID
@@ -347,123 +545,83 @@ func (h *Handler) GetReactions(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
-		SELECT mr.emoji, mr.user_id, u.username, u.display_name
-		FROM message_reactions mr
-		INNER JOIN users u ON mr.user_id = u.id
-		WHERE mr.message_id = $1
-		ORDER BY mr.emoji, mr.created_at ASC
-	`, messageID)
+	h.writeReactionsResponse(c, messageReactionsByMessageSQL, messageID, userID)
+
+}
+
+func (h *Handler) getDMReactions(c *gin.Context, messageID, userID string) {
+	h.writeReactionsResponse(c, dmMessageReactionsByMessageSQL, messageID, userID)
+}
+
+func (h *Handler) writeReactionsResponse(c *gin.Context, query, messageID, userID string) {
+	rows, err := h.db.Query(query, messageID)
 	if err != nil {
 		h.log.Error("Failed to query reactions", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFetchReactions})
 		return
 	}
-	defer func() { _ = rows.Close() }()
-
-	// Group by emoji
-	summaryMap := make(map[string]*models.ReactionSummary)
-	var order []string
-
-	for rows.Next() {
-		var emoji, rUserID, username string
-		var displayName *string
-		if err := rows.Scan(&emoji, &rUserID, &username, &displayName); err != nil {
-			continue
-		}
-
-		s, exists := summaryMap[emoji]
-		if !exists {
-			s = &models.ReactionSummary{
-				Emoji: emoji,
-				Users: []models.ReactionUser{},
-			}
-			summaryMap[emoji] = s
-			order = append(order, emoji)
-		}
-		s.Users = append(s.Users, models.ReactionUser{
-			UserID:      rUserID,
-			Username:    username,
-			DisplayName: displayName,
-		})
-		s.Count++
-		if rUserID == userID {
-			s.Me = true
-		}
-	}
-
-	if err := rows.Err(); err != nil {
+	reactions, err := scanReactionSummaries(rows, userID)
+	if err != nil {
 		h.log.Error("Error iterating reaction rows", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFetchReactions})
 		return
 	}
-
-	reactions := make([]models.ReactionSummary, 0, len(order))
-	for _, emoji := range order {
-		reactions = append(reactions, *summaryMap[emoji])
-	}
-
 	c.JSON(http.StatusOK, gin.H{"reactions": reactions})
 }
 
 // loadReactionsForMessages batch-loads reaction summaries for a set of messages.
 // Returns a map from message ID to its reaction summaries. Avoids N+1 queries.
 func loadReactionsForMessages(db *sql.DB, messageIDs []string, currentUserID string) (map[string][]models.ReactionSummary, error) {
+	return loadReactionsForMessagesWithQuery(db, messageReactionsForMessagesSQL, messageIDs, currentUserID)
+}
+
+// LoadDMReactionsForMessages batch-loads reaction summaries for DM messages.
+func LoadDMReactionsForMessages(db *sql.DB, messageIDs []string, currentUserID string) (map[string][]models.ReactionSummary, error) {
+	return loadReactionsForMessagesWithQuery(db, dmMessageReactionsForMessagesSQL, messageIDs, currentUserID)
+}
+
+func loadReactionsForMessagesWithQuery(db *sql.DB, query string, messageIDs []string, currentUserID string) (map[string][]models.ReactionSummary, error) {
 	if len(messageIDs) == 0 {
 		return nil, nil
 	}
-
-	rows, err := db.Query(`
-		SELECT mr.message_id, mr.emoji, mr.user_id, u.username, u.display_name
-		FROM message_reactions mr
-		INNER JOIN users u ON mr.user_id = u.id
-		WHERE mr.message_id = ANY($1::uuid[])
-		ORDER BY mr.message_id, mr.emoji, mr.created_at ASC
-	`, pq.Array(messageIDs))
+	rows, err := db.Query(query, pq.Array(messageIDs))
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
+	return scanReactionsForMessages(rows, currentUserID)
+}
 
-	// Accumulate: messageID → emoji → *ReactionSummary
+func scanReactionsForMessages(rows *sql.Rows, currentUserID string) (result map[string][]models.ReactionSummary, err error) {
+	defer func() {
+		if closeErr := rows.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
+
 	type key struct{ msgID, emoji string }
 	summaries := make(map[key]*models.ReactionSummary)
-	orderByMsg := make(map[string][]string) // messageID → ordered emoji list
-
+	orderByMsg := make(map[string][]string)
 	for rows.Next() {
 		var msgID, emoji, rUserID, username string
 		var displayName *string
 		if err := rows.Scan(&msgID, &emoji, &rUserID, &username, &displayName); err != nil {
-			continue
+			return nil, err
 		}
 
 		k := key{msgID, emoji}
 		s, exists := summaries[k]
 		if !exists {
-			s = &models.ReactionSummary{
-				Emoji: emoji,
-				Users: []models.ReactionUser{},
-			}
+			s = newReactionSummary(emoji)
 			summaries[k] = s
 			orderByMsg[msgID] = append(orderByMsg[msgID], emoji)
 		}
-		s.Users = append(s.Users, models.ReactionUser{
-			UserID:      rUserID,
-			Username:    username,
-			DisplayName: displayName,
-		})
-		s.Count++
-		if rUserID == currentUserID {
-			s.Me = true
-		}
+		appendReactionUser(s, rUserID, username, displayName, currentUserID)
 	}
-
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	// Convert to result map
-	result := make(map[string][]models.ReactionSummary, len(orderByMsg))
+	result = make(map[string][]models.ReactionSummary, len(orderByMsg))
 	for msgID, emojis := range orderByMsg {
 		reactionList := make([]models.ReactionSummary, 0, len(emojis))
 		for _, emoji := range emojis {
@@ -471,7 +629,6 @@ func loadReactionsForMessages(db *sql.DB, messageIDs []string, currentUserID str
 		}
 		result[msgID] = reactionList
 	}
-
 	return result, nil
 }
 

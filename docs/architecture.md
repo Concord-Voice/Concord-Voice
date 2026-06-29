@@ -310,7 +310,7 @@ erDiagram
     }
 ```
 
-**Messaging & DM system (the 8-table DM core created in migration 000026):**
+**Messaging & DM system (the 8-table DM core plus later message extensions):**
 
 ```mermaid
 erDiagram
@@ -325,6 +325,7 @@ erDiagram
     dm_conversations ||--o{ dm_messages : "contains"
     dm_conversations ||--o{ dm_read_states : "tracks"
     dm_messages ||--o{ dm_message_attachments : "carries"
+    dm_messages ||--o{ dm_message_reactions : "has"
     media_files ||--o{ message_attachments : "stored as"
     media_files ||--o{ dm_message_attachments : "stored as"
 
@@ -361,6 +362,11 @@ erDiagram
     message_reactions {
         UUID message_id FK
         UUID user_id FK
+    }
+    dm_message_reactions {
+        UUID message_id FK
+        UUID user_id FK
+        VARCHAR emoji
     }
     media_files {
         UUID id PK

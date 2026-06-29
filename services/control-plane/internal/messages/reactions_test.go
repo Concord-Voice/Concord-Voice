@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"testing"
 
+	messagehandlers "github.com/markdrogersjr/Concord/services/control-plane/internal/messages"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
@@ -328,12 +329,8 @@ func TestGetMessagesNoReactionsOmitsField(t *testing.T) {
 
 // --- DM message reaction tests ---
 
-// TestReactions_DMMessage_Participant_Returns404 verifies that a valid DM
-// participant receives 404 (not 200) when attempting to toggle or fetch
-// reactions on a DM message. DM reactions are intentionally not yet supported;
-// the handler resolves the DM context successfully but then returns 404 because
-// the feature gate is not open. This is distinct from the non-participant case.
-func TestReactions_DMMessage_Participant_Returns404(t *testing.T) {
+func TestReactions_DMMessage_Participant_AddGetRemove(t *testing.T) {
+	// regression for #1713
 	ts := setupTS(t)
 	u1 := ts.CreateTestUser(t, "dmreact_part_a")
 	u2 := ts.CreateTestUser(t, "dmreact_part_b")
@@ -342,13 +339,51 @@ func TestReactions_DMMessage_Participant_Returns404(t *testing.T) {
 
 	wPut := ts.DoRequest("PUT", reactURL(msgID), emojiBody("👍"),
 		testhelpers.AuthHeaders(u1.AccessToken))
-	assert.Equal(t, http.StatusNotFound, wPut.Code,
-		"participant should get 404 (DM reactions not supported): %s", wPut.Body.String())
+	require.Equal(t, http.StatusOK, wPut.Code, "participant should react to DM: %s", wPut.Body.String())
+
+	var putResp struct {
+		Action   string                  `json:"action"`
+		Reaction *models.ReactionSummary `json:"reaction"`
+	}
+	testhelpers.ParseJSON(t, wPut, &putResp)
+	require.Equal(t, "added", putResp.Action)
+	require.NotNil(t, putResp.Reaction)
+	assert.Equal(t, "👍", putResp.Reaction.Emoji)
+	assert.Equal(t, 1, putResp.Reaction.Count)
+	assert.True(t, putResp.Reaction.Me)
 
 	wGet := ts.DoRequest("GET", reactURL(msgID), nil,
+		testhelpers.AuthHeaders(u2.AccessToken))
+	require.Equal(t, http.StatusOK, wGet.Code, "other participant should fetch DM reactions: %s", wGet.Body.String())
+
+	var getResp struct {
+		Reactions []models.ReactionSummary `json:"reactions"`
+	}
+	testhelpers.ParseJSON(t, wGet, &getResp)
+	require.Len(t, getResp.Reactions, 1)
+	assert.Equal(t, "👍", getResp.Reactions[0].Emoji)
+	assert.Equal(t, 1, getResp.Reactions[0].Count)
+	assert.False(t, getResp.Reactions[0].Me)
+
+	loaded, err := messagehandlers.LoadDMReactionsForMessages(ts.DB, []string{msgID}, u1.ID)
+	require.NoError(t, err)
+	require.Len(t, loaded[msgID], 1)
+	assert.True(t, loaded[msgID][0].Me)
+	emptyLoaded, err := messagehandlers.LoadDMReactionsForMessages(ts.DB, nil, u1.ID)
+	require.NoError(t, err)
+	assert.Nil(t, emptyLoaded)
+
+	wRemove := ts.DoRequest("PUT", reactURL(msgID), emojiBody("👍"),
 		testhelpers.AuthHeaders(u1.AccessToken))
-	assert.Equal(t, http.StatusNotFound, wGet.Code,
-		"participant should get 404 on GET reactions (DM reactions not supported): %s", wGet.Body.String())
+	require.Equal(t, http.StatusOK, wRemove.Code, "participant should remove DM reaction: %s", wRemove.Body.String())
+
+	var removeResp struct {
+		Action   string                  `json:"action"`
+		Reaction *models.ReactionSummary `json:"reaction"`
+	}
+	testhelpers.ParseJSON(t, wRemove, &removeResp)
+	assert.Equal(t, "removed", removeResp.Action)
+	assert.Nil(t, removeResp.Reaction)
 }
 
 // TestReactions_DMMessage_NonParticipant_Returns404 verifies the new DM

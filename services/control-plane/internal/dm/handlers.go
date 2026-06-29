@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
+	messagehandlers "github.com/markdrogersjr/Concord/services/control-plane/internal/messages"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
@@ -111,6 +112,27 @@ type dmMessageResponse struct {
 	DisplayName      *string                    `json:"display_name,omitempty"`
 	AvatarURL        *string                    `json:"avatar_url,omitempty"`
 	Attachments      []models.AttachmentSummary `json:"attachments,omitempty"`
+	Reactions        []models.ReactionSummary   `json:"reactions,omitempty"`
+}
+
+func (h *Handler) enrichDMReactions(messages []dmMessageResponse, userID string) {
+	if len(messages) == 0 {
+		return
+	}
+	msgIDs := make([]string, len(messages))
+	for i, m := range messages {
+		msgIDs[i] = m.ID
+	}
+	reactionMap, err := messagehandlers.LoadDMReactionsForMessages(h.db, msgIDs, userID)
+	if err != nil {
+		h.log.Error("Failed to load DM reactions", "error", err)
+		return
+	}
+	for i := range messages {
+		if reactions, ok := reactionMap[messages[i].ID]; ok {
+			messages[i].Reactions = reactions
+		}
+	}
 }
 
 // enrichDMAttachments batch-loads and attaches file attachment summaries to DM messages.
@@ -1227,7 +1249,8 @@ func (h *Handler) GetMessages(c *gin.Context) {
 		return
 	}
 
-	// Enrich messages with attachment metadata (non-fatal on failure)
+	// Enrich messages with reaction and attachment metadata (non-fatal on failure)
+	h.enrichDMReactions(messages, userID)
 	h.enrichDMAttachments(messages)
 
 	c.JSON(http.StatusOK, gin.H{"messages": messages})

@@ -1195,6 +1195,51 @@ func TestGetMessages_MessageFields(t *testing.T) {
 	assert.NotEmpty(t, msg["username"])
 }
 
+func TestGetMessages_IncludesDMReactions(t *testing.T) {
+	// regression for #1713 reload behavior
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "getmsgreact1")
+	user2 := ts.CreateTestUser(t, "getmsgreact2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+	msgID := insertDMMessage(t, ts, convID, user1.ID, "react then reload")
+
+	wReact := ts.DoRequest("PUT", "/api/v1/messages/"+msgID+"/reactions", map[string]interface{}{"emoji": "👍"}, testhelpers.AuthHeaders(user1.AccessToken))
+	require.Equal(t, http.StatusOK, wReact.Code, "react to DM before reload: %s", wReact.Body.String())
+
+	w := ts.DoRequest("GET", pathDMConversationsPrefix+convID+pathMessages, nil, testhelpers.AuthHeaders(user2.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body struct {
+		Messages []struct {
+			ID        string `json:"id"`
+			Reactions []struct {
+				Emoji string `json:"emoji"`
+				Count int    `json:"count"`
+				Me    bool   `json:"me"`
+				Users []struct {
+					UserID string `json:"user_id"`
+				} `json:"users"`
+			} `json:"reactions"`
+		} `json:"messages"`
+	}
+	testhelpers.ParseJSON(t, w, &body)
+
+	for _, msg := range body.Messages {
+		if msg.ID != msgID {
+			continue
+		}
+		require.Len(t, msg.Reactions, 1)
+		assert.Equal(t, "👍", msg.Reactions[0].Emoji)
+		assert.Equal(t, 1, msg.Reactions[0].Count)
+		assert.False(t, msg.Reactions[0].Me)
+		require.Len(t, msg.Reactions[0].Users, 1)
+		assert.Equal(t, user1.ID, msg.Reactions[0].Users[0].UserID)
+		return
+	}
+	t.Fatalf("DM message %s not found in history", msgID)
+}
+
 func TestGetMessages_IncludesCallEventPayload(t *testing.T) {
 	ts := setupTS(t)
 	caller := ts.CreateTestUser(t, "cep-caller")

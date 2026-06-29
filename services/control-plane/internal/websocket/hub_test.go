@@ -1021,6 +1021,54 @@ func TestHandleDMBroadcastSendsToSubscribers(t *testing.T) {
 	assert.Len(t, client2.Send, 1)
 }
 
+func TestHandleDMBroadcastSkipsRemovedDMParticipant(t *testing.T) {
+	db := setupHubTestDB(t)
+	hub := NewHub(db, nil)
+	convID := uuid.New()
+	currentUser := uuid.New()
+	removedUser := uuid.New()
+
+	_, err := db.Exec(
+		`INSERT INTO users (id, email, username, password_hash, age_verified, email_verified)
+		 VALUES ($1, $2, $3, 'hash', true, true), ($4, $5, $6, 'hash', true, true)`,
+		currentUser.String(), currentUser.String()+"@test.concord.chat", "hubdmcurrent",
+		removedUser.String(), removedUser.String()+"@test.concord.chat", "hubdmremoved",
+	)
+	require.NoError(t, err)
+	_, err = db.Exec(
+		`INSERT INTO dm_conversations (id, created_by) VALUES ($1, $2)`,
+		convID.String(), currentUser.String(),
+	)
+	require.NoError(t, err)
+	_, err = db.Exec(
+		`INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2), ($1, $3)`,
+		convID.String(), currentUser.String(), removedUser.String(),
+	)
+	require.NoError(t, err)
+	_, err = db.Exec(
+		"DELETE "+"FROM dm_participants WHERE conversation_id = $1 AND user_id = $2",
+		convID.String(), removedUser.String(),
+	)
+	require.NoError(t, err)
+
+	currentClient := newTestClient(hub, currentUser)
+	removedClient := newTestClient(hub, removedUser)
+	hub.clients[currentClient.ID] = currentClient
+	hub.clients[removedClient.ID] = removedClient
+	hub.dmSubscriptions[convID] = map[uuid.UUID]bool{
+		currentClient.ID: true,
+		removedClient.ID: true,
+	}
+
+	hub.handleDMBroadcast(DMBroadcastMessage{
+		ConversationID: convID,
+		Data:           OutgoingMessage{Type: "message_reaction_added", Data: map[string]interface{}{}},
+	})
+
+	assert.Len(t, currentClient.Send, 1)
+	assert.Len(t, removedClient.Send, 0)
+}
+
 func TestHandleDMBroadcastExcludesUser(t *testing.T) {
 	hub := newMinimalHub()
 	convID := uuid.New()

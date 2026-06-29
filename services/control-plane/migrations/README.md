@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000077)
+## Existing Migrations (000001–000081)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -187,6 +187,10 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000075 | create_friend_organization | `friend_organization` — per-user zero-knowledge AES-256-GCM friend-category blob; server stores ciphertext + version only (#324) |
 | 000076 | redemption_code_issuance | `redemption_code_issuance` — platform audit trail for redemption-code generation (CLI + admin HTTP), one row per issue/batch in-txn with minted codes (#1303) |
 | 000077 | admin_auth | `admin_users` / `admin_webauthn_credentials` / `admin_audit_log` (append-only via `concord_admin_rt` role) — platform-admin auth for the Admin/Ops console #1688 |
+| 000078 | default_load_gifs_automatically_true | Default GIF autoload preference to true for new users (#1766) |
+| 000079 | username_case_normalization | Lowercase usernames + unique `LOWER(username)` index (#1931) |
+| 000080 | add_member_timeout | Member timeout moderation state (#549) |
+| 000081 | dm_message_reactions | `dm_message_reactions` table (#1713) |
 
 ## Troubleshooting
 

@@ -2826,6 +2826,10 @@ func (h *Hub) handleDMBroadcast(msg DMBroadcastMessage) {
 		if msg.ExcludeUser != nil && client.UserID == *msg.ExcludeUser {
 			continue
 		}
+		if !h.isCurrentDMParticipant(msg.ConversationID, client.UserID) {
+			delete(subscribers, clientID)
+			continue
+		}
 
 		select {
 		case client.Send <- messageData:
@@ -2833,6 +2837,23 @@ func (h *Hub) handleDMBroadcast(msg DMBroadcastMessage) {
 			h.handleUnregister(client)
 		}
 	}
+}
+
+func (h *Hub) isCurrentDMParticipant(conversationID, userID uuid.UUID) bool {
+	if h.db == nil {
+		return true
+	}
+
+	var ok bool
+	err := h.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)`,
+		conversationID.String(), userID.String(),
+	).Scan(&ok)
+	if err != nil {
+		log.Printf("Failed to verify DM broadcast participant: %v", err)
+		return false
+	}
+	return ok
 }
 
 // BroadcastToDM sends a message to all clients subscribed to a DM conversation (thread-safe).
