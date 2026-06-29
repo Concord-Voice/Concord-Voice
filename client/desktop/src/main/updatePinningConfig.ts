@@ -18,7 +18,11 @@ import type { PinConfig } from './updatePinning';
 export const PIN_CONFIG: PinConfig = {
   pinnedHosts: ['api.concordvoice.chat'] as const,
   primaryPins: [
-    // Current production leaf SPKI SHA-256 (Let's Encrypt E7, via CloudFlare edge).
+    // Emergency 2026-06-29: Cloudflare edge cert renewed with a new keypair.
+    // Primary avoids fallback-warning spam on every API request. The previous
+    // production pin below is rollback-only and test-guarded to expire by 2026-07-29.
+    '6f7894c8ade945ca564b5c26cd0bae8f2994bd417da5d25e4c29e9b4564a5ac2', // pragma: allowlist secret
+    // Previous production leaf SPKI SHA-256 (Let's Encrypt E7, via CloudFlare edge).
     // Measured 2026-05-08 — replaces pre-cutover pin (53257bb4...) after the
     // cert was renewed during the #885 webroot-certbot switch. The renewal
     // generated a new keypair instead of following the rotation runbook's

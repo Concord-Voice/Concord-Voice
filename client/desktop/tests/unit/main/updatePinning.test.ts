@@ -9,6 +9,10 @@ import {
   type PinConfig,
   type VerifyProcRequest,
 } from '../../../src/main/updatePinning';
+import { PIN_CONFIG } from '../../../src/main/updatePinningConfig';
+
+const PREVIOUS_PRODUCTION_SPKI = '0a4ccc0dfc2c60c67e4b814292467bbf7e525d6b75d38e32ea646153fc7c49f2'; // pragma: allowlist secret
+const PREVIOUS_PIN_RECOVERY_WINDOW_END_MS = Date.parse('2026-07-29T00:00:00.000Z');
 
 const FIXTURES_DIR = join(__dirname, '../../fixtures/pinning');
 const fingerprints = JSON.parse(
@@ -17,6 +21,7 @@ const fingerprints = JSON.parse(
 const primaryPem = readFileSync(join(FIXTURES_DIR, 'primary.pem'), 'utf-8');
 const fallbackPem = readFileSync(join(FIXTURES_DIR, 'fallback.pem'), 'utf-8');
 const roguePem = readFileSync(join(FIXTURES_DIR, 'rogue.pem'), 'utf-8');
+const rotated20260629Pem = readFileSync(join(FIXTURES_DIR, 'rotated-2026-06-29.pem'), 'utf-8');
 
 describe('computeSpkiSha256', () => {
   it('matches the committed fingerprint for the primary fixture', () => {
@@ -41,6 +46,18 @@ describe('computeSpkiSha256', () => {
 
   it('different keypairs yield different SPKI fingerprints', () => {
     expect(computeSpkiSha256(primaryPem)).not.toBe(computeSpkiSha256(roguePem));
+  });
+});
+
+describe('PIN_CONFIG production pins', () => {
+  it('trusts the 2026-06-29 Cloudflare edge SPKI rotation', () => {
+    expect(PIN_CONFIG.primaryPins).toContain(computeSpkiSha256(rotated20260629Pem));
+  });
+
+  it('bounds the previous production pin to the recovery window', () => {
+    if (PIN_CONFIG.primaryPins.includes(PREVIOUS_PRODUCTION_SPKI)) {
+      expect(Date.now()).toBeLessThan(PREVIOUS_PIN_RECOVERY_WINDOW_END_MS);
+    }
   });
 });
 
