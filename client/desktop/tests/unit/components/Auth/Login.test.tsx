@@ -2,6 +2,7 @@ import { render, screen, userEvent, within } from '../../../test-utils';
 import Login from '@/renderer/components/Auth/Login';
 import { vi } from 'vitest';
 import { useAuthStore } from '@/renderer/stores/authStore';
+import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock global fetch
@@ -93,6 +94,9 @@ describe('Login', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetAllStores();
+    useClientConfigStore.getState().setServerCapabilities({
+      auth: { oauthProviders: ['google', 'apple'] },
+    });
   });
 
   // ── Rendering ──────────────────────────────────────────────────────────
@@ -581,7 +585,11 @@ describe('Login', () => {
     const { apiFetch } = await import('@/renderer/services/apiClient');
     // First reset attempt (no code) → 403 mfa_required; retry (with code) → ok.
     (apiFetch as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ok: false, status: 403, json: async () => ({ error: 'mfa_required' }) })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        json: async () => ({ error: 'mfa_required' }),
+      })
       .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
 
     Object.defineProperty(globalThis, 'electron', {
@@ -664,7 +672,10 @@ describe('Login', () => {
     mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
     const { apiFetch } = await import('@/renderer/services/apiClient');
     // The reset PUT fails — the early-set token must NOT survive.
-    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: false, json: async () => ({}) });
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({}),
+    });
 
     Object.defineProperty(globalThis, 'electron', {
       value: {
@@ -997,6 +1008,30 @@ describe('Login', () => {
     await user.click(ssoBtn);
     // No throw + the button stays present (not disabled by submit state).
     expect(ssoBtn).toBeInTheDocument();
+  });
+
+  it('hides default SSO buttons and divider when server capabilities are unavailable', () => {
+    useClientConfigStore.getState().setServerCapabilities(null);
+
+    render(<Login {...defaultProps} />);
+
+    expect(screen.queryByRole('button', { name: /sign in with google/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /sign in with apple/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('separator', { name: /or sign in with email/i })
+    ).not.toBeInTheDocument();
+  });
+
+  it('renders only SSO providers advertised by server capabilities', () => {
+    useClientConfigStore.getState().setServerCapabilities({
+      auth: { oauthProviders: ['google'] },
+    });
+
+    render(<Login {...defaultProps} />);
+
+    expect(screen.getByRole('button', { name: /sign in with google/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /sign in with apple/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('separator', { name: /or sign in with email/i })).toBeInTheDocument();
   });
 
   it('clicks the Apple SSO button on the SSO-only branch when both providers are listed', async () => {

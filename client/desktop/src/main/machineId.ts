@@ -8,23 +8,25 @@
  * The machine ID is never deleted on logout — it's per-installation, not per-session.
  */
 
-import { app } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { profilePathsForApiBase } from './selfHostedProfile';
 
-const MACHINE_ID_FILE = path.join(app.getPath('userData'), 'machine-id.json');
+const DEFAULT_PROFILE_API_BASE = 'https://api.concordvoice.chat';
 
-let cachedId: string | null = null;
+const cachedIds = new Map<string, string>();
 
-export function getMachineId(): string {
+export function getMachineId(apiBase = DEFAULT_PROFILE_API_BASE): string {
+  const machineIdFile = profilePathsForApiBase(apiBase || DEFAULT_PROFILE_API_BASE).machineIdFile;
+  const cachedId = cachedIds.get(machineIdFile);
   if (cachedId) return cachedId;
 
   // Try to read existing ID
   try {
-    const data = JSON.parse(fs.readFileSync(MACHINE_ID_FILE, 'utf-8'));
+    const data = JSON.parse(fs.readFileSync(machineIdFile, 'utf-8'));
     if (data.id && typeof data.id === 'string') {
-      cachedId = data.id;
+      cachedIds.set(machineIdFile, data.id);
       return data.id;
     }
   } catch {
@@ -32,12 +34,18 @@ export function getMachineId(): string {
   }
 
   // Generate and persist
-  cachedId = randomUUID();
+  const id = randomUUID();
+  cachedIds.set(machineIdFile, id);
   try {
-    fs.writeFileSync(MACHINE_ID_FILE, JSON.stringify({ id: cachedId }), 'utf-8');
+    fs.mkdirSync(path.dirname(machineIdFile), { recursive: true });
+    fs.writeFileSync(machineIdFile, JSON.stringify({ id }), 'utf-8');
   } catch (err) {
     console.error('[MachineId] Failed to persist machine ID:', (err as Error).message);
   }
 
-  return cachedId;
+  return id;
+}
+
+export function _resetMachineIdForTesting(): void {
+  cachedIds.clear();
 }

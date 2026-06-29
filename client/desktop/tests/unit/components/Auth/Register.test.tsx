@@ -3,6 +3,7 @@ import Register from '@/renderer/components/Auth/Register';
 import { vi } from 'vitest';
 import { usePendingRegistrationStore } from '@/renderer/stores/pendingRegistrationStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
+import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
@@ -68,6 +69,9 @@ describe('Register', () => {
     vi.clearAllMocks();
     e2eeState.initialized = false;
     resetAllStores();
+    useClientConfigStore.getState().setServerCapabilities({
+      auth: { oauthProviders: ['google', 'apple'] },
+    });
     usePendingRegistrationStore.getState().clearPending();
   });
 
@@ -418,6 +422,30 @@ describe('Register', () => {
     expect(screen.getByRole('button', { name: /sign in with apple/i })).toBeInTheDocument();
     // Google still rendered — Apple is additive, not a replacement.
     expect(screen.getByRole('button', { name: /sign in with google/i })).toBeInTheDocument();
+  });
+
+  it('hides SSO buttons and divider when server capabilities are unavailable', () => {
+    useClientConfigStore.getState().setServerCapabilities(null);
+
+    render(<Register onBack={onBack} onSuccess={onSuccess} onSwitchToLogin={onSwitchToLogin} />);
+
+    expect(screen.queryByRole('button', { name: /sign in with google/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /sign in with apple/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('separator', { name: /or sign up with email/i })
+    ).not.toBeInTheDocument();
+  });
+
+  it('renders only SSO providers advertised by server capabilities', () => {
+    useClientConfigStore.getState().setServerCapabilities({
+      auth: { oauthProviders: ['apple'] },
+    });
+
+    render(<Register onBack={onBack} onSuccess={onSuccess} onSwitchToLogin={onSwitchToLogin} />);
+
+    expect(screen.queryByRole('button', { name: /sign in with google/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /sign in with apple/i })).toBeInTheDocument();
+    expect(screen.getByRole('separator', { name: /or sign up with email/i })).toBeInTheDocument();
   });
 
   it('calls useSSOFlow().begin("apple") when the Sign in with Apple button is clicked', async () => {

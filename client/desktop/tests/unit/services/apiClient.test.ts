@@ -6,6 +6,10 @@ import { resetAllStores } from '../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useConnectionStore } from '@/renderer/stores/connectionStore';
 import { useMFAChallengeStore } from '@/renderer/stores/mfaChallengeStore';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/runtimeServerBase';
 
 // Mock resetService (dynamically imported by apiClient)
 const mockGracefulReset = vi.fn();
@@ -35,11 +39,13 @@ describe('apiClient', () => {
     resetAllStores();
     _resetRefreshState();
     vi.clearAllMocks();
+    resetRuntimeServerBase();
     // Reset connection store to stable (default)
     useConnectionStore.getState().reset();
   });
 
   afterEach(() => {
+    resetRuntimeServerBase();
     // Clean up electron mock
     (globalThis as any).electron = undefined;
   });
@@ -60,6 +66,18 @@ describe('apiClient', () => {
 
     const headers = mockFetch.mock.calls[0][1].headers as Headers;
     expect(headers.get('Authorization')).toBe('Bearer test-token');
+  });
+
+  it('uses the active runtime API base for requests', async () => {
+    setRuntimeServerBase('https://homelab.lan:8443');
+    mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
+    await apiFetch('/api/v1/test');
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://homelab.lan:8443/api/v1/test',
+      expect.objectContaining({ credentials: 'include' })
+    );
   });
 
   it('does not inject Authorization header when no token', async () => {
@@ -550,6 +568,21 @@ describe('apiClient', () => {
 
       const headers = mockFetch.mock.calls[0][1].headers as Headers;
       expect(headers.get('X-Machine-Id')).toBe('machine-uuid-123');
+    });
+
+    it('caches machine IDs per active runtime API base', async () => {
+      const getMachineId = vi
+        .fn()
+        .mockResolvedValueOnce('saas-machine')
+        .mockResolvedValueOnce('self-machine');
+      globalThis.electron = { getMachineId } as any;
+
+      await expect(ensureMachineId()).resolves.toBe('saas-machine');
+      setRuntimeServerBase('https://homelab.lan:8443');
+      await expect(ensureMachineId()).resolves.toBe('self-machine');
+
+      expect(getMachineId).toHaveBeenNthCalledWith(1, API_BASE);
+      expect(getMachineId).toHaveBeenNthCalledWith(2, 'https://homelab.lan:8443');
     });
 
     it('includes X-Machine-Id on retry after 401 refresh', async () => {

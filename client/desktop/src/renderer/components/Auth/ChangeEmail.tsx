@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { usePendingRegistrationStore } from '../../stores/pendingRegistrationStore';
-import { API_BASE } from '../../services/apiClient';
+import { apiUrl } from '../../services/runtimeServerBase';
 import './ChangeEmail.css';
 
 interface Props {
@@ -22,7 +22,7 @@ interface ChangeEmailResult {
 }
 
 async function submitChangeEmail(pendingId: string, newEmail: string): Promise<ChangeEmailResult> {
-  const res = await fetch(`${API_BASE}/api/v1/auth/register/change-email`, {
+  const res = await fetch(apiUrl('/api/v1/auth/register/change-email'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ pending_id: pendingId, new_email: newEmail }),

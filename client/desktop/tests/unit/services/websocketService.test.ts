@@ -2,7 +2,12 @@ import {
   WebSocketService,
   ConnectionState,
   fullJitter,
+  getWebSocketService,
 } from '@/renderer/services/websocketService';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/runtimeServerBase';
 
 // Mock WebSocket
 class MockWebSocket {
@@ -92,11 +97,13 @@ describe('WebSocketService', () => {
       json: () => Promise.resolve({ ticket: 'mock-ticket' }),
     });
     globalThis.fetch = mockFetch;
+    resetRuntimeServerBase();
     service = new WebSocketService('ws://localhost:8080');
   });
 
   afterEach(() => {
     service.disconnect();
+    resetRuntimeServerBase();
     vi.restoreAllMocks();
     vi.useRealTimers();
     globalThis.fetch = originalFetch;
@@ -152,6 +159,36 @@ describe('WebSocketService', () => {
       expect(mockFetch.mock.calls[1][1]?.headers).toMatchObject({
         Authorization: 'Bearer fresh-token',
       });
+    });
+
+    it('uses the active runtime WebSocket base when no constructor base is supplied', async () => {
+      setRuntimeServerBase('https://homelab.lan:8443');
+      const runtimeService = new WebSocketService();
+
+      runtimeService.connect('test-token');
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const ws = (runtimeService as any).ws as MockWebSocket;
+      expect(ws.url).toBe('wss://homelab.lan:8443/api/v1/ws?ticket=mock-ticket');
+      runtimeService.disconnect();
+    });
+
+    it('recreates the singleton when the runtime WebSocket base changes', async () => {
+      const saasService = getWebSocketService();
+      setRuntimeServerBase('https://homelab.lan:8443');
+      const selfHostedService = getWebSocketService();
+
+      expect(selfHostedService).not.toBe(saasService);
+
+      selfHostedService.connect('test-token');
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const ws = (selfHostedService as any).ws as MockWebSocket;
+      expect(ws.url).toBe('wss://homelab.lan:8443/api/v1/ws?ticket=mock-ticket');
+      saasService.disconnect();
+      selfHostedService.disconnect();
     });
 
     it('detaches a superseded connecting socket when the token rotates after ticket fetch (#1977)', async () => {

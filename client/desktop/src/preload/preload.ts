@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
+import type { SelfHostedProbeResult } from '../main/ipcContract';
 import type { AppleSignInResult } from '../shared/appleSso';
 import type { SSOSignInResult } from '../shared/sso';
 
@@ -141,6 +142,11 @@ contextBridge.exposeInMainWorld('electron', {
   getAuthCapabilities: () =>
     ipcRenderer.invoke('auth:getCapabilities') as Promise<{ persistAvailable: boolean }>,
 
+  selfHosted: {
+    probeServer: (url: string): Promise<SelfHostedProbeResult> =>
+      ipcRenderer.invoke('selfHosted:probeServer', url),
+  },
+
   // E2EE key persistence (safeStorage via main process)
   storeE2EEKeys: (data: {
     wrappingKeyBase64: string;
@@ -181,7 +187,8 @@ contextBridge.exposeInMainWorld('electron', {
   inviteRendererReady: () => ipcRenderer.send('invite:renderer-ready'),
 
   // Machine ID for token theft detection (#89)
-  getMachineId: () => ipcRenderer.invoke('auth:getMachineId') as Promise<string>,
+  getMachineId: (apiBase?: string) =>
+    ipcRenderer.invoke('auth:getMachineId', apiBase) as Promise<string>,
 
   // System info for About page (#155 Tier 4)
   getSystemInfo: () =>
@@ -507,6 +514,10 @@ export interface ElectronAPI {
   logout: (data?: { accessToken?: string }) => Promise<void>;
   getAuthCapabilities: () => Promise<{ persistAvailable: boolean }>;
 
+  selfHosted: {
+    probeServer: (url: string) => Promise<SelfHostedProbeResult>;
+  };
+
   // E2EE key persistence
   storeE2EEKeys: (data: {
     wrappingKeyBase64: string;
@@ -525,7 +536,7 @@ export interface ElectronAPI {
   inviteRendererReady: () => void;
 
   // Machine ID for token theft detection
-  getMachineId: () => Promise<string>;
+  getMachineId: (apiBase?: string) => Promise<string>;
 
   // System info for About page (#155 Tier 4)
   getSystemInfo: () => Promise<{

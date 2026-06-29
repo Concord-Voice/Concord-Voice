@@ -3,6 +3,9 @@ import { useAuthStore } from '@/renderer/stores/authStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { usePendingRegistrationStore } from '@/renderer/stores/pendingRegistrationStore';
 import { useSSOStore } from '@/renderer/stores/ssoStore';
+import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
+import { API_BASE } from '@/renderer/config';
+import { getApiBase, resetRuntimeServerBase } from '@/renderer/services/runtimeServerBase';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock child components to isolate AuthFlow logic
@@ -127,7 +130,12 @@ import AuthFlow from '@/renderer/components/Auth/AuthFlow';
 describe('AuthFlow', () => {
   beforeEach(() => {
     resetAllStores();
+    resetRuntimeServerBase();
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    resetRuntimeServerBase();
   });
 
   it('renders connection selector initially', () => {
@@ -177,11 +185,34 @@ describe('AuthFlow', () => {
     expect(screen.getByTestId('register')).toBeInTheDocument();
   });
 
-  it('shows self-hosted auth after server connect', () => {
+  it('routes self-hosted connect into the real login screen and sets the runtime API base', () => {
     render(<AuthFlow />);
     fireEvent.click(screen.getByText('Select Self-Hosted'));
     fireEvent.click(screen.getByText('Connect'));
-    expect(screen.getByText('Connecting to: https://my.server.com')).toBeInTheDocument();
+    expect(screen.getByTestId('login')).toBeInTheDocument();
+    expect(getApiBase()).toBe('https://my.server.com');
+  });
+
+  it('clears stale SaaS SSO capabilities when entering self-hosted login', () => {
+    useClientConfigStore.getState().setServerCapabilities({
+      auth: { oauthProviders: ['google', 'apple'] },
+    });
+
+    render(<AuthFlow />);
+    fireEvent.click(screen.getByText('Select Self-Hosted'));
+    fireEvent.click(screen.getByText('Connect'));
+
+    expect(useClientConfigStore.getState().serverCapabilities).toBeNull();
+  });
+
+  it('resets the runtime API base when backing out of self-hosted login', () => {
+    render(<AuthFlow />);
+    fireEvent.click(screen.getByText('Select Self-Hosted'));
+    fireEvent.click(screen.getByText('Connect'));
+    fireEvent.click(screen.getByText('Back'));
+
+    expect(screen.getByTestId('connection-selector')).toBeInTheDocument();
+    expect(getApiBase()).toBe(API_BASE);
   });
 
   it('handles registration success — routes to email-verification', () => {

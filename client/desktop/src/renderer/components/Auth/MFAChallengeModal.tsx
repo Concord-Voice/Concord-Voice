@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useMemo } from 'react';
 import { useMFAChallengeStore, type MFAVerifyResponse } from '../../stores/mfaChallengeStore';
-import { API_BASE, ensureMachineId, safeJson } from '../../services/apiClient';
+import { ensureMachineId, safeJson } from '../../services/apiClient';
+import { apiUrl } from '../../services/runtimeServerBase';
 import TOTPInput from './TOTPInput';
 import BackupCodeInput from './BackupCodeInput';
 import WebAuthnPrompt from './WebAuthnPrompt';
@@ -54,7 +55,7 @@ const MFAChallengeModal: React.FC = () => {
       setError('');
       try {
         const machineId = await ensureMachineId();
-        const res = await fetch(`${API_BASE}/api/v1/auth/mfa/verify`, {
+        const res = await fetch(apiUrl('/api/v1/auth/mfa/verify'), {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -108,7 +109,7 @@ const MFAChallengeModal: React.FC = () => {
       setError('');
       try {
         const machineId = await ensureMachineId();
-        const res = await fetch(`${API_BASE}/api/v1/auth/mfa/verify`, {
+        const res = await fetch(apiUrl('/api/v1/auth/mfa/verify'), {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',

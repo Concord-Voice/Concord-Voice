@@ -7,7 +7,7 @@
  */
 
 import { apiFetch } from './apiClient';
-import { useClientConfigStore } from '../stores/clientConfigStore';
+import { useClientConfigStore, type ServerCapabilities } from '../stores/clientConfigStore';
 import { useVoiceStore } from '../stores/voiceStore';
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -21,6 +21,18 @@ interface ServerConfigResponse {
   turn: { host?: string; realm?: string };
   spaUrl?: string;
   spaIpcContract?: number;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function normalizeServerCapabilities(value: unknown): ServerCapabilities {
+  const auth = isRecord(value) && isRecord(value.auth) ? value.auth : {};
+  const providers = Array.isArray(auth.oauthProviders)
+    ? auth.oauthProviders.filter((provider): provider is string => typeof provider === 'string')
+    : [];
+  return { auth: { oauthProviders: providers } };
 }
 
 class ClientConfigService {
@@ -116,6 +128,7 @@ class ClientConfigService {
       }
 
       const data: ServerConfigResponse = await res.json();
+      const serverCapabilities = await this.fetchServerCapabilities();
       // Snapshot the previous config so we can decide whether to log a
       // change. Polling fires every 5 minutes; without this gate the
       // [ClientConfig] Updated config line spammed the console every poll
@@ -135,7 +148,8 @@ class ClientConfigService {
         prevState.mediaPlaneUrl !== data.mediaPlaneUrl ||
         prevState.spaIpcContract !== nextSpaIpcContract ||
         JSON.stringify(prevState.featureFlags) !== JSON.stringify(data.featureFlags) ||
-        JSON.stringify(prevState.turn) !== JSON.stringify(nextTurn);
+        JSON.stringify(prevState.turn) !== JSON.stringify(nextTurn) ||
+        JSON.stringify(prevState.serverCapabilities) !== JSON.stringify(serverCapabilities);
 
       useClientConfigStore.getState().setConfig({
         minVersion: data.minVersion,
@@ -144,6 +158,7 @@ class ClientConfigService {
         turn: nextTurn,
         spaUrl: nextSpaUrl,
         spaIpcContract: nextSpaIpcContract,
+        serverCapabilities,
       });
 
       // SPA updates are applied through main's spaUpdate bridge so the shell
@@ -165,6 +180,16 @@ class ClientConfigService {
       }
     } catch (err) {
       console.warn('[ClientConfig] Fetch error:', err instanceof Error ? err.message : 'unknown');
+    }
+  }
+
+  private async fetchServerCapabilities(): Promise<ServerCapabilities | null> {
+    try {
+      const res = await apiFetch('/api/v1/server/capabilities');
+      if (!res.ok) return null;
+      return normalizeServerCapabilities(await res.json());
+    } catch {
+      return null;
     }
   }
 

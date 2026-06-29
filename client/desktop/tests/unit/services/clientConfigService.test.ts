@@ -14,9 +14,9 @@ const mockSpaCheckForUpdate = vi.fn();
 const mockSpaReloadLatest = vi.fn();
 
 async function flushFetchPath(): Promise<void> {
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
+  for (let i = 0; i < 8; i += 1) {
+    await Promise.resolve();
+  }
 }
 
 // Import after mocking
@@ -33,6 +33,7 @@ beforeEach(() => {
     turn: { host: '', realm: '' },
     spaUrl: '',
     spaIpcContract: 0,
+    serverCapabilities: null,
     lastFetchedAt: null,
   });
   useVoiceStore.setState({
@@ -78,6 +79,58 @@ describe('clientConfigService', () => {
 
       // Should not throw
       await expect(clientConfigService.fetch()).resolves.not.toThrow();
+    });
+
+    it('fetches server capabilities and stores OAuth provider availability', async () => {
+      mockApiFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              minVersion: '0.2.0',
+              featureFlags: {},
+              mediaPlaneUrl: '',
+              turn: {},
+              spaUrl: '',
+              spaIpcContract: 0,
+            }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ auth: { oauthProviders: ['google'] } }),
+        } as Response);
+
+      await clientConfigService.fetch();
+
+      expect(mockApiFetch).toHaveBeenNthCalledWith(1, '/api/v1/client/config');
+      expect(mockApiFetch).toHaveBeenNthCalledWith(2, '/api/v1/server/capabilities');
+      expect(useClientConfigStore.getState().serverCapabilities).toEqual({
+        auth: { oauthProviders: ['google'] },
+      });
+    });
+
+    it('fails closed to null server capabilities when the capabilities request fails', async () => {
+      useClientConfigStore.setState({
+        serverCapabilities: { auth: { oauthProviders: ['google', 'apple'] } },
+      });
+      mockApiFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              minVersion: '0.2.0',
+              featureFlags: {},
+              mediaPlaneUrl: '',
+              turn: {},
+              spaUrl: '',
+              spaIpcContract: 0,
+            }),
+        } as Response)
+        .mockResolvedValueOnce({ ok: false } as Response);
+
+      await clientConfigService.fetch();
+
+      expect(useClientConfigStore.getState().serverCapabilities).toBeNull();
     });
   });
 
@@ -252,11 +305,15 @@ describe('clientConfigService', () => {
 
       clientConfigService.start();
       await vi.advanceTimersByTimeAsync(2_000);
-      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+      await flushFetchPath();
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+      expect(mockApiFetch).toHaveBeenNthCalledWith(1, '/api/v1/client/config');
+      expect(mockApiFetch).toHaveBeenNthCalledWith(2, '/api/v1/server/capabilities');
       expect(mockSpaCheckForUpdate).toHaveBeenCalledTimes(1);
 
       await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
-      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+      await flushFetchPath();
+      expect(mockApiFetch).toHaveBeenCalledTimes(4);
       expect(mockSpaCheckForUpdate).toHaveBeenCalledTimes(2);
     });
   });

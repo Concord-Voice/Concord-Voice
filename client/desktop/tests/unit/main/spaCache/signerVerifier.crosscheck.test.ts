@@ -35,7 +35,7 @@ const SIGNER_SCRIPT = fileURLToPath(
   new URL('../../../../scripts/sign-spa-manifest.mjs', import.meta.url)
 );
 
-const IPC_CONTRACT = 16; // stamped value (mirrors ipcContract.ts IPC_CONTRACT_VERSION)
+const IPC_CONTRACT = 17; // stamped value (mirrors ipcContract.ts IPC_CONTRACT_VERSION)
 const ENTRY_HTML = '<!doctype html><html><body><div id="root"></div></body></html>';
 const ASSET_JS = 'console.log("concord spa bundle");\n';
 const ASSET_CSS = ':root{--x:1}\n';

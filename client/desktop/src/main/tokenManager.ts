@@ -12,11 +12,16 @@
  * - Tamper detection: safeStorage.decryptString() throws on corrupted ciphertext
  */
 
-import { app, safeStorage, net } from 'electron';
+import { safeStorage, net } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getMachineId } from './machineId';
 import type { RefreshResult } from './ipcContract';
+import {
+  profileIdForApiBase,
+  profilePathsForApiBase,
+  type ProfilePaths,
+} from './selfHostedProfile';
 
 // ─── Module State (never leaves this process) ────────────────────────
 
@@ -62,9 +67,7 @@ let proactiveTimer: ReturnType<typeof setTimeout> | null = null;
 let proactiveRefreshCallback: ((accessToken: string, sessionId?: string) => void) | null = null;
 let lastProactiveRefreshTimestamp = 0;
 
-const TOKEN_FILE = path.join(app.getPath('userData'), 'secure-token.dat');
-const META_FILE = path.join(app.getPath('userData'), 'token-meta.json');
-const E2EE_FILE = path.join(app.getPath('userData'), 'secure-e2ee.dat');
+const DEFAULT_PROFILE_API_BASE = 'https://api.concordvoice.chat';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -72,36 +75,90 @@ function canPersist(): boolean {
   return safeStorage.isEncryptionAvailable();
 }
 
+function pathsForApiBase(apiBase: string): ProfilePaths {
+  return profilePathsForApiBase(apiBase || DEFAULT_PROFILE_API_BASE);
+}
+
+function activePaths(): ProfilePaths {
+  return pathsForApiBase(inMemoryApiBase || DEFAULT_PROFILE_API_BASE);
+}
+
+function activeProfileFile(): string {
+  return path.join(
+    path.dirname(pathsForApiBase(DEFAULT_PROFILE_API_BASE).metaFile),
+    'active-profile.json'
+  );
+}
+
+function ensureParentDir(filePath: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+}
+
 function writeMeta(apiBase: string, rememberMe: boolean): void {
+  const paths = pathsForApiBase(apiBase);
   try {
-    fs.writeFileSync(META_FILE, JSON.stringify({ apiBase, rememberMe }), 'utf-8');
+    ensureParentDir(paths.metaFile);
+    fs.writeFileSync(
+      paths.metaFile,
+      JSON.stringify({ apiBase, rememberMe, profileId: profileIdForApiBase(apiBase) }),
+      'utf-8'
+    );
+    fs.writeFileSync(activeProfileFile(), JSON.stringify({ apiBase }), 'utf-8');
   } catch (err) {
     console.error('[TokenManager] Failed to write meta file:', (err as Error).message);
   }
 }
 
-function readMeta(): { apiBase: string; rememberMe: boolean } | null {
+function readActiveApiBase(): string | null {
   try {
-    const raw = fs.readFileSync(META_FILE, 'utf-8');
+    const raw = fs.readFileSync(activeProfileFile(), 'utf-8');
+    const parsed = JSON.parse(raw) as { apiBase?: unknown };
+    return typeof parsed.apiBase === 'string' ? parsed.apiBase : null;
+  } catch {
+    return null;
+  }
+}
+
+function readMeta(metaFile = pathsForApiBase(DEFAULT_PROFILE_API_BASE).metaFile): {
+  apiBase: string;
+  rememberMe: boolean;
+} | null {
+  try {
+    const raw = fs.readFileSync(metaFile, 'utf-8');
     return JSON.parse(raw);
   } catch {
     return null;
   }
 }
 
-function deleteFiles(): void {
+function readActiveMeta(): { apiBase: string; rememberMe: boolean } | null {
+  const activeApiBase = readActiveApiBase();
+  if (activeApiBase) {
+    const activeMeta = readMeta(pathsForApiBase(activeApiBase).metaFile);
+    if (activeMeta) return activeMeta;
+  }
+  return readMeta();
+}
+
+function deleteFiles(apiBase = inMemoryApiBase || DEFAULT_PROFILE_API_BASE): void {
+  const paths = pathsForApiBase(apiBase);
   try {
-    fs.unlinkSync(TOKEN_FILE);
+    fs.unlinkSync(paths.tokenFile);
   } catch {
     /* no-op */
   }
   try {
-    fs.unlinkSync(META_FILE);
+    fs.unlinkSync(paths.metaFile);
   } catch {
     /* no-op */
   }
   try {
-    fs.unlinkSync(E2EE_FILE);
+    fs.unlinkSync(paths.e2eeFile);
+  } catch {
+    /* no-op */
+  }
+  try {
+    fs.unlinkSync(activeProfileFile());
   } catch {
     /* no-op */
   }
@@ -271,7 +328,9 @@ export function storeRefreshToken(data: {
 
   try {
     const encrypted = safeStorage.encryptString(data.refreshToken);
-    fs.writeFileSync(TOKEN_FILE, encrypted);
+    const paths = pathsForApiBase(data.apiBase);
+    ensureParentDir(paths.tokenFile);
+    fs.writeFileSync(paths.tokenFile, encrypted);
     writeMeta(data.apiBase, data.rememberMe);
 
     // Verify disk round-trip: read back and compare.
@@ -282,7 +341,7 @@ export function storeRefreshToken(data: {
     // for anyone with access to stdout, crash dumps, or any other log sink.
     // See [internal]rules/e2ee.md "Private keys, channel keys, and session keys
     // NEVER logged" — refresh tokens are in scope.
-    const readBack = fs.readFileSync(TOKEN_FILE);
+    const readBack = fs.readFileSync(paths.tokenFile);
     const decrypted = safeStorage.decryptString(readBack);
     if (decrypted !== data.refreshToken) {
       console.error(
@@ -315,9 +374,10 @@ export function restoreRefreshToken():
     return { status: 'unavailable' };
   }
 
-  const meta = readMeta();
+  const meta = readActiveMeta();
   if (!meta) {
-    const tokenFileExists = fs.existsSync(TOKEN_FILE);
+    const paths = pathsForApiBase(DEFAULT_PROFILE_API_BASE);
+    const tokenFileExists = fs.existsSync(paths.tokenFile);
     console.debug(
       `[TokenManager] restoreRefreshToken: no meta file (token file exists: ${tokenFileExists})`
     );
@@ -325,7 +385,7 @@ export function restoreRefreshToken():
   }
 
   try {
-    const encrypted = fs.readFileSync(TOKEN_FILE);
+    const encrypted = fs.readFileSync(pathsForApiBase(meta.apiBase).tokenFile);
     const token = safeStorage.decryptString(encrypted);
     // Key-material audit: previously logged the token's last-8 chars + a
     // sha256 fingerprint plus rememberMe + apiBase — removed to keep
@@ -337,7 +397,7 @@ export function restoreRefreshToken():
   } catch (err) {
     // decryptString throws on tampered ciphertext (AES-GCM auth tag failure)
     console.error('[TokenManager] Token decryption failed (tampered?):', (err as Error).message);
-    deleteFiles();
+    deleteFiles(meta.apiBase);
     return { status: 'tampered' };
   }
 }
@@ -381,7 +441,9 @@ function persistRotatedToken(newRefreshToken: string): void {
 
   try {
     const encrypted = safeStorage.encryptString(newRefreshToken);
-    fs.writeFileSync(TOKEN_FILE, encrypted);
+    const paths = activePaths();
+    ensureParentDir(paths.tokenFile);
+    fs.writeFileSync(paths.tokenFile, encrypted);
     // Key-material audit: previously logged the new refresh token's last-8
     // chars — removed to keep token bytes off stdout.
   } catch (err) {
@@ -412,7 +474,7 @@ export function performRefresh(): Promise<RefreshResult> {
         method: 'POST',
         headers: {
           'X-Refresh-Token': inMemoryRefreshToken,
-          'X-Machine-Id': getMachineId(),
+          'X-Machine-Id': getMachineId(inMemoryApiBase),
         },
         // Omit cookies — Chromium's persistent cookie store may contain a stale
         // refresh_token cookie from a previous session/login.  The server reads
@@ -496,6 +558,7 @@ export async function performLogout(accessToken?: string): Promise<void> {
  * Clear all token state — in-memory and on disk.
  */
 export function clearTokens(): void {
+  const apiBaseToClear = inMemoryApiBase || DEFAULT_PROFILE_API_BASE;
   stopProactiveRefresh();
   inMemoryRefreshToken = null;
   inMemoryRememberMe = true;
@@ -504,7 +567,7 @@ export function clearTokens(): void {
   // Drop session-only E2EE key custody on logout/clear — the in-memory keys
   // must not outlive the session (CWE-212). performLogout() flows through here.
   inMemoryE2EEKeys = null;
-  deleteFiles();
+  deleteFiles(apiBaseToClear);
 }
 
 // ─── E2EE Key Persistence (safeStorage) ──────────────────────────────
@@ -527,7 +590,9 @@ export function storeE2EEKeys(data: E2EEKeyMaterial): void {
   try {
     const json = JSON.stringify(data);
     const encrypted = safeStorage.encryptString(json);
-    fs.writeFileSync(E2EE_FILE, encrypted);
+    const paths = activePaths();
+    ensureParentDir(paths.e2eeFile);
+    fs.writeFileSync(paths.e2eeFile, encrypted);
   } catch (err) {
     console.error('[TokenManager] Failed to encrypt/write E2EE keys:', (err as Error).message);
   }
@@ -546,7 +611,7 @@ export function restoreE2EEKeys(): E2EEKeyMaterial | null {
   if (!canPersist()) return null;
 
   try {
-    const encrypted = fs.readFileSync(E2EE_FILE);
+    const encrypted = fs.readFileSync(activePaths().e2eeFile);
     const json = safeStorage.decryptString(encrypted);
     return JSON.parse(json);
   } catch {
@@ -561,7 +626,7 @@ export function restoreE2EEKeys(): E2EEKeyMaterial | null {
  */
 export function getPersistedApiBase(): string | null {
   if (inMemoryApiBase) return inMemoryApiBase;
-  const meta = readMeta();
+  const meta = readActiveMeta();
   return meta?.apiBase || null;
 }
 

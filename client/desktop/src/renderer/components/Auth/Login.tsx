@@ -4,7 +4,9 @@ import { e2eeService } from '../../services/e2eeService';
 import { errorMessage } from '../../utils/redactError';
 import { hydratePostLogin } from '../../services/postLoginHydration';
 import { useAuthStore } from '../../stores/authStore';
-import { API_BASE, apiFetch, ensureMachineId } from '../../services/apiClient';
+import { useClientConfigStore } from '../../stores/clientConfigStore';
+import { apiFetch, ensureMachineId } from '../../services/apiClient';
+import { apiUrl, getApiBase } from '../../services/runtimeServerBase';
 import { UserProfile } from '../../stores/userStore';
 import TOTPInput from './TOTPInput';
 import BackupCodeInput from './BackupCodeInput';
@@ -87,6 +89,8 @@ interface FormErrors {
   general?: string;
 }
 
+const EMPTY_OAUTH_PROVIDERS: string[] = [];
+
 const Login: React.FC<LoginProps> = ({
   onBack,
   onSuccess,
@@ -107,6 +111,12 @@ const Login: React.FC<LoginProps> = ({
   // never stranded with credentials they can't actually use.
   const [ssoOnlyProviders, setSsoOnlyProviders] = useState<string[] | null>(null);
   const { begin: beginSSO } = useSSOFlow();
+  const oauthProviders = useClientConfigStore(
+    (state) => state.serverCapabilities?.auth.oauthProviders ?? EMPTY_OAUTH_PROVIDERS
+  );
+  const showGoogleSSO = oauthProviders.includes('google');
+  const showAppleSSO = oauthProviders.includes('apple');
+  const hasDefaultSSO = showGoogleSSO || showAppleSSO;
 
   // MFA state
   const [mfaRequired, setMfaRequired] = useState(false);
@@ -198,7 +208,7 @@ const Login: React.FC<LoginProps> = ({
       const machineId = await ensureMachineId();
 
       // Login with backend
-      const response = await fetch(`${API_BASE}/api/v1/auth/login`, {
+      const response = await fetch(apiUrl('/api/v1/auth/login'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -413,7 +423,7 @@ const Login: React.FC<LoginProps> = ({
       await globalThis.electron.storeRefreshToken({
         refreshToken: data.refresh_token,
         rememberMe: data.remember_me ?? formData.rememberMe,
-        apiBase: API_BASE,
+        apiBase: getApiBase(),
         accessToken: data.access_token,
       });
     }
@@ -443,7 +453,7 @@ const Login: React.FC<LoginProps> = ({
     setMfaError('');
     try {
       const machineId = await ensureMachineId();
-      const res = await fetch(`${API_BASE}/api/v1/auth/mfa/verify`, {
+      const res = await fetch(apiUrl('/api/v1/auth/mfa/verify'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -516,7 +526,7 @@ const Login: React.FC<LoginProps> = ({
     setMfaError('');
     try {
       const machineId = await ensureMachineId();
-      const res = await fetch(`${API_BASE}/api/v1/auth/mfa/verify`, {
+      const res = await fetch(apiUrl('/api/v1/auth/mfa/verify'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -738,13 +748,29 @@ const Login: React.FC<LoginProps> = ({
             (rendered by AuthFlow once Task 21 wires it). Apple SSO (#271)
             lives next to Google to satisfy App Store policy parity (mobile
             clients #205 require both when either is offered). */}
-        <div className="login-sso-row">
-          <SSOButton provider="google" onClick={() => beginSSO('google')} disabled={isSubmitting} />
-          <SSOButton provider="apple" onClick={() => beginSSO('apple')} disabled={isSubmitting} />
-        </div>
-        <div className="login-divider" role="separator" aria-label="or sign in with email">
-          <span className="login-divider__text">or</span>
-        </div>
+        {hasDefaultSSO && (
+          <div className="login-sso-row">
+            {showGoogleSSO && (
+              <SSOButton
+                provider="google"
+                onClick={() => beginSSO('google')}
+                disabled={isSubmitting}
+              />
+            )}
+            {showAppleSSO && (
+              <SSOButton
+                provider="apple"
+                onClick={() => beginSSO('apple')}
+                disabled={isSubmitting}
+              />
+            )}
+          </div>
+        )}
+        {hasDefaultSSO && (
+          <div className="login-divider" role="separator" aria-label="or sign in with email">
+            <span className="login-divider__text">or</span>
+          </div>
+        )}
 
         <form className="login-form" onSubmit={handleSubmit}>
           {/* Email */}

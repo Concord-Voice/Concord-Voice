@@ -43,6 +43,9 @@ const { mockCancelAppleFlow, mockCancelGoogleFlow } = vi.hoisted(() => ({
 const { mockRevealLoadFailure } = vi.hoisted(() => ({
   mockRevealLoadFailure: vi.fn(),
 }));
+const { mockProbeSelfHostedServer } = vi.hoisted(() => ({
+  mockProbeSelfHostedServer: vi.fn(),
+}));
 const { mockMaybePromptMove } = vi.hoisted(() => ({
   mockMaybePromptMove: vi.fn(() => false),
 }));
@@ -197,6 +200,10 @@ vi.mock('../../../src/main/tokenManager', () => ({
 
 vi.mock('../../../src/main/machineId', () => ({
   getMachineId: vi.fn(() => 'mock-machine-id'),
+}));
+
+vi.mock('../../../src/main/selfHostedProbe', () => ({
+  probeSelfHostedServer: mockProbeSelfHostedServer,
 }));
 
 vi.mock('../../../src/main/updater', () => ({
@@ -536,7 +543,7 @@ describe('main.ts', () => {
       expect(setUpdateFeedUrl).not.toHaveBeenCalled();
     });
 
-    it('auth:storeRefreshToken pins apiBase to the production origin in packaged builds (#1872)', async () => {
+    it('auth:storeRefreshToken rejects unvalidated non-SaaS apiBase values in packaged builds (#1872)', async () => {
       const { storeRefreshToken } = await import('../../../src/main/tokenManager');
       const { setUpdateFeedUrl } = await import('../../../src/main/updater');
       const electron = await import('electron');
@@ -571,6 +578,37 @@ describe('main.ts', () => {
         expect(setUpdateFeedUrl).toHaveBeenCalledWith('https://api.concordvoice.chat/');
       } finally {
         app.isPackaged = false;
+      }
+    });
+
+    it('auth:storeRefreshToken accepts a validated self-hosted apiBase in packaged builds', async () => {
+      const { storeRefreshToken } = await import('../../../src/main/tokenManager');
+      const { setUpdateFeedUrl } = await import('../../../src/main/updater');
+      const { _resetSelfHostedProfileForTesting, rememberValidatedSelfHostedApiBase } =
+        await import('../../../src/main/selfHostedProfile');
+      const electron = await import('electron');
+      const app = electron.app as unknown as { isPackaged: boolean };
+      (storeRefreshToken as Mock).mockClear();
+      (setUpdateFeedUrl as Mock).mockClear();
+      _resetSelfHostedProfileForTesting();
+      rememberValidatedSelfHostedApiBase('https://homelab.lan/setup');
+
+      app.isPackaged = true;
+      try {
+        const data = {
+          refreshToken: 'tok',
+          rememberMe: true,
+          apiBase: 'https://homelab.lan',
+        };
+        await handlers.get('auth:storeRefreshToken')!(
+          { senderFrame: { url: 'app://concord/index.html' } },
+          data
+        );
+        expect(storeRefreshToken).toHaveBeenCalledWith(data);
+        expect(setUpdateFeedUrl).toHaveBeenCalledWith('https://homelab.lan');
+      } finally {
+        app.isPackaged = false;
+        _resetSelfHostedProfileForTesting();
       }
     });
 
@@ -749,10 +787,28 @@ describe('main.ts', () => {
     });
 
     it('auth:getMachineId returns machine id', async () => {
+      const { getMachineId } = await import('../../../src/main/machineId');
       const result = await handlers.get('auth:getMachineId')!({
         senderFrame: { url: 'app://concord/index.html' },
       });
       expect(result).toBe('mock-machine-id');
+      expect(getMachineId).toHaveBeenCalledWith();
+    });
+
+    it('auth:getMachineId returns the machine id for a validated self-hosted apiBase', async () => {
+      const { getMachineId } = await import('../../../src/main/machineId');
+      const { rememberValidatedSelfHostedApiBase } =
+        await import('../../../src/main/selfHostedProfile');
+      (getMachineId as Mock).mockClear();
+      rememberValidatedSelfHostedApiBase('https://homelab.lan');
+
+      const result = await handlers.get('auth:getMachineId')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        'https://homelab.lan'
+      );
+
+      expect(result).toBe('mock-machine-id');
+      expect(getMachineId).toHaveBeenCalledWith('https://homelab.lan');
     });
 
     it('auth:getMachineId rejects untrusted sender frames', async () => {
@@ -760,6 +816,46 @@ describe('main.ts', () => {
         senderFrame: { url: 'https://evil.example/' },
       });
       expect(result).toBe('');
+    });
+
+    it('selfHosted:probeServer delegates for trusted sender frames', async () => {
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      (probeSelfHostedServer as Mock).mockResolvedValueOnce({
+        status: 'ok',
+        apiBase: 'https://homelab.lan',
+        clientConfig: {},
+        capabilities: {},
+      });
+
+      const result = await handlers.get('selfHosted:probeServer')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        'https://homelab.lan'
+      );
+
+      expect(result).toEqual({
+        status: 'ok',
+        apiBase: 'https://homelab.lan',
+        clientConfig: {},
+        capabilities: {},
+      });
+      expect(probeSelfHostedServer).toHaveBeenCalledWith('https://homelab.lan');
+    });
+
+    it('selfHosted:probeServer rejects untrusted sender frames', async () => {
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      (probeSelfHostedServer as Mock).mockClear();
+
+      const result = await handlers.get('selfHosted:probeServer')!(
+        { senderFrame: { url: 'https://evil.example/' } },
+        'https://homelab.lan'
+      );
+
+      expect(result).toEqual({
+        status: 'error',
+        code: 'rejected',
+        message: 'Self-hosted server probing is not available from this frame.',
+      });
+      expect(probeSelfHostedServer).not.toHaveBeenCalled();
     });
   });
 

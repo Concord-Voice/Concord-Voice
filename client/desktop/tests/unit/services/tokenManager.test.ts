@@ -4,13 +4,16 @@
 
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-const { mockNetFetch } = vi.hoisted(() => ({
+const { mockGetMachineId, mockNetFetch } = vi.hoisted(() => ({
+  mockGetMachineId: vi.fn(() => 'mid'),
   mockNetFetch: vi.fn(),
 }));
 
 let safeStorageAvailable = true;
 const fsWriteCalls: unknown[][] = [];
+const fsFiles = new Map<string, unknown>();
 let fsUnlinkCount = 0;
+const fsUnlinkCalls: string[] = [];
 const fsRead: { impl: (...a: unknown[]) => unknown } = { impl: () => Buffer.from('x') };
 
 vi.mock('electron', () => ({
@@ -22,26 +25,34 @@ vi.mock('electron', () => ({
   },
   net: { fetch: mockNetFetch },
 }));
-vi.mock('../../../src/main/machineId', () => ({ getMachineId: () => 'mid' }));
+vi.mock('../../../src/main/machineId', () => ({ getMachineId: mockGetMachineId }));
 vi.mock('fs', () => ({
   default: {
     writeFileSync: (...a: unknown[]) => {
       fsWriteCalls.push(a);
+      fsFiles.set(String(a[0]), a[1]);
     },
     readFileSync: (...a: unknown[]) => fsRead.impl(...a),
-    unlinkSync: () => {
+    unlinkSync: (path: string) => {
       fsUnlinkCount++;
+      fsUnlinkCalls.push(path);
+      fsFiles.delete(path);
     },
-    existsSync: () => false,
+    existsSync: (path: string) => fsFiles.has(path),
+    mkdirSync: () => undefined,
   },
   writeFileSync: (...a: unknown[]) => {
     fsWriteCalls.push(a);
+    fsFiles.set(String(a[0]), a[1]);
   },
   readFileSync: (...a: unknown[]) => fsRead.impl(...a),
-  unlinkSync: () => {
+  unlinkSync: (path: string) => {
     fsUnlinkCount++;
+    fsUnlinkCalls.push(path);
+    fsFiles.delete(path);
   },
-  existsSync: () => false,
+  existsSync: (path: string) => fsFiles.has(path),
+  mkdirSync: () => undefined,
 }));
 
 import {
@@ -82,9 +93,12 @@ describe('tokenManager', () => {
   beforeEach(() => {
     safeStorageAvailable = true;
     fsWriteCalls.length = 0;
+    fsFiles.clear();
     fsUnlinkCount = 0;
+    fsUnlinkCalls.length = 0;
     fsRead.impl = () => Buffer.from('x');
     _resetForTesting();
+    mockGetMachineId.mockClear();
     mockNetFetch.mockReset();
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -107,6 +121,28 @@ describe('tokenManager', () => {
       const paths = fsWriteCalls.map((c) => c[0] as string);
       expect(paths.some((p) => p.includes('secure-token.dat'))).toBe(true);
       expect(paths.some((p) => p.includes('token-meta.json'))).toBe(true);
+    });
+
+    it('writes self-hosted tokens under a per-origin profile namespace', () => {
+      storeRefreshToken({
+        refreshToken: 'my-token',
+        rememberMe: true,
+        apiBase: 'https://homelab.lan',
+      });
+
+      const paths = fsWriteCalls.map((c) => c[0] as string);
+      expect(paths).toContainEqual(
+        expect.stringMatching(/^\/tmp\/td\/profiles\/[0-9a-f]{64}\/secure-token\.dat$/)
+      );
+      expect(paths).toContainEqual(
+        expect.stringMatching(/^\/tmp\/td\/profiles\/[0-9a-f]{64}\/token-meta\.json$/)
+      );
+      const metaWrite = fsWriteCalls.find((c) => String(c[0]).endsWith('token-meta.json'));
+      expect(JSON.parse(metaWrite?.[1] as string)).toMatchObject({
+        apiBase: 'https://homelab.lan',
+        rememberMe: true,
+        profileId: expect.stringMatching(/^selfhost-[0-9a-f]{16}$/),
+      });
     });
 
     it('deletes disk files when rememberMe=false', () => {
@@ -176,11 +212,12 @@ describe('tokenManager', () => {
     });
 
     it('restores token successfully from disk', () => {
-      let callNum = 0;
-      fsRead.impl = () => {
-        callNum++;
-        if (callNum === 1)
+      fsRead.impl = (path) => {
+        const file = String(path);
+        if (file.endsWith('active-profile.json')) throw new Error('ENOENT');
+        if (file.endsWith('token-meta.json')) {
           return JSON.stringify({ apiBase: 'http://localhost:8080', rememberMe: true });
+        }
         return Buffer.from('stored-token');
       };
       const result = restoreRefreshToken();
@@ -192,12 +229,35 @@ describe('tokenManager', () => {
       });
     });
 
+    it('restores a remembered self-hosted token after main-process restart', () => {
+      storeRefreshToken({
+        refreshToken: 'self-token',
+        rememberMe: true,
+        apiBase: 'https://homelab.lan',
+      });
+      _resetForTesting();
+      fsRead.impl = (path) => {
+        const value = fsFiles.get(String(path));
+        if (value === undefined) throw new Error('ENOENT');
+        return value;
+      };
+
+      expect(restoreRefreshToken()).toEqual({
+        status: 'ok',
+        token: 'self-token',
+        apiBase: 'https://homelab.lan',
+        rememberMe: true,
+      });
+      expect(getPersistedApiBase()).toBe('https://homelab.lan');
+    });
+
     it('returns tampered when decryption fails (read throws)', () => {
-      let callNum = 0;
-      fsRead.impl = () => {
-        callNum++;
-        if (callNum === 1)
+      fsRead.impl = (path) => {
+        const file = String(path);
+        if (file.endsWith('active-profile.json')) throw new Error('ENOENT');
+        if (file.endsWith('token-meta.json')) {
           return JSON.stringify({ apiBase: 'http://localhost:8080', rememberMe: true });
+        }
         throw new Error('read error');
       };
       expect(restoreRefreshToken()).toEqual({ status: 'tampered' });
@@ -216,6 +276,29 @@ describe('tokenManager', () => {
       clearTokens();
       expect(fsUnlinkCount).toBeGreaterThan(0);
     });
+
+    it('clears the active self-hosted profile files, not the SaaS root files', () => {
+      storeRefreshToken({ refreshToken: 'tk', rememberMe: true, apiBase: 'https://homelab.lan' });
+      storeE2EEKeys({
+        wrappingKeyBase64: 'wk',
+        preferencesKeyBase64: 'pk',
+        wrappedPrivateKeyBase64: 'wpk',
+      });
+      fsUnlinkCalls.length = 0;
+
+      clearTokens();
+
+      expect(fsUnlinkCalls).toContainEqual(
+        expect.stringMatching(/^\/tmp\/td\/profiles\/[0-9a-f]{64}\/secure-token\.dat$/)
+      );
+      expect(fsUnlinkCalls).toContainEqual(
+        expect.stringMatching(/^\/tmp\/td\/profiles\/[0-9a-f]{64}\/token-meta\.json$/)
+      );
+      expect(fsUnlinkCalls).toContainEqual(
+        expect.stringMatching(/^\/tmp\/td\/profiles\/[0-9a-f]{64}\/secure-e2ee\.dat$/)
+      );
+      expect(fsUnlinkCalls).not.toContain('/tmp/td/secure-token.dat');
+    });
   });
 
   describe('E2EE keys', () => {
@@ -228,6 +311,21 @@ describe('tokenManager', () => {
         wrappedPrivateKeyBase64: 'wpk',
       });
       expect(fsWriteCalls.length).toBeGreaterThan(0);
+    });
+
+    it('writes self-hosted E2EE keys under the active profile namespace', () => {
+      storeRefreshToken({ refreshToken: 'tk', rememberMe: true, apiBase: 'https://homelab.lan' });
+      fsWriteCalls.length = 0;
+
+      storeE2EEKeys({
+        wrappingKeyBase64: 'wk',
+        preferencesKeyBase64: 'pk',
+        wrappedPrivateKeyBase64: 'wpk',
+      });
+
+      expect(fsWriteCalls.map((c) => c[0] as string)).toContainEqual(
+        expect.stringMatching(/^\/tmp\/td\/profiles\/[0-9a-f]{64}\/secure-e2ee\.dat$/)
+      );
     });
 
     it('storeE2EEKeys does nothing when safeStorage unavailable', () => {
@@ -386,6 +484,7 @@ describe('tokenManager', () => {
       expect(opts.headers['X-Refresh-Token']).toBe('rt-abc');
       expect(opts.headers['X-Machine-Id']).toBe('mid');
       expect(opts.credentials).toBe('omit');
+      expect(mockGetMachineId).toHaveBeenCalledWith('http://localhost:8080');
     });
 
     it('returns refresh_failed on non-ok HTTP status', async () => {

@@ -11,7 +11,7 @@ import {
   deriveSharedSecret,
   decryptWithSharedSecret,
 } from '../../utils/crypto';
-import { API_BASE } from '../../services/apiClient';
+import { apiUrl } from '../../services/runtimeServerBase';
 import { assertValidUUID, isValidUUID } from '../../utils/uuid';
 import LoadingSpinner from './LoadingSpinner';
 import './Login.css';
@@ -63,7 +63,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
     setLoading(true);
     setError('');
     try {
-      const res = await fetch(`${API_BASE}/api/v1/auth/recovery/begin`, {
+      const res = await fetch(apiUrl('/api/v1/auth/recovery/begin'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email }),
@@ -85,7 +85,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
     setLoading(true);
     setError('');
     try {
-      const res = await fetch(`${API_BASE}/api/v1/auth/recovery/verify-code`, {
+      const res = await fetch(apiUrl('/api/v1/auth/recovery/verify-code'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, code }),
@@ -145,7 +145,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
       setEcdhKeyPair(keyPair);
       const pubKeyBase64 = await exportECDHPublicKey(keyPair.publicKey);
 
-      const res = await fetch(`${API_BASE}/api/v1/auth/recovery/device-request`, {
+      const res = await fetch(apiUrl('/api/v1/auth/recovery/device-request'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -182,7 +182,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
     const pollDevice = async () => {
       try {
         const safeId = encodeURIComponent(assertValidUUID(deviceRequestId, 'deviceRequestId'));
-        const res = await fetch(`${API_BASE}/api/v1/auth/recovery/device-request/${safeId}`, {
+        const res = await fetch(apiUrl(`/api/v1/auth/recovery/device-request/${safeId}`), {
           headers: { Authorization: `Bearer ${recoveryToken}` },
         });
         const data = await res.json();
@@ -230,7 +230,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
       setEcdhKeyPair(keyPair);
       const pubKeyBase64 = await exportECDHPublicKey(keyPair.publicKey);
 
-      const res = await fetch(`${API_BASE}/api/v1/auth/recovery/social-request`, {
+      const res = await fetch(apiUrl('/api/v1/auth/recovery/social-request'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -265,7 +265,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
     const pollSocial = async () => {
       try {
         const safeId = encodeURIComponent(assertValidUUID(socialRequestId, 'socialRequestId'));
-        const res = await fetch(`${API_BASE}/api/v1/auth/recovery/social-request/${safeId}`, {
+        const res = await fetch(apiUrl(`/api/v1/auth/recovery/social-request/${safeId}`), {
           headers: { Authorization: `Bearer ${recoveryToken}` },
         });
         const data = await res.json();
@@ -352,7 +352,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
         wrappedResult.set(iv, 0);
         wrappedResult.set(new Uint8Array(wrapped), 12);
 
-        const res = await fetch(`${API_BASE}/api/v1/auth/recovery/reset-password`, {
+        const res = await fetch(apiUrl('/api/v1/auth/recovery/reset-password'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -371,7 +371,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
         // Account reset path — new keypair, data loss
         const newKeys = await generateRegistrationKeys(newPassword);
 
-        const res = await fetch(`${API_BASE}/api/v1/auth/recovery/reset-account`, {
+        const res = await fetch(apiUrl('/api/v1/auth/recovery/reset-account'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

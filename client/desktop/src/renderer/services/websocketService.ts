@@ -13,7 +13,7 @@
  * @see services/control-plane/internal/websocket for backend implementation
  */
 
-import { WS_BASE } from '../config';
+import { getWsBase } from './runtimeServerBase';
 import { useAuthStore } from '../stores/authStore';
 import { useConnectionStore } from '../stores/connectionStore';
 import { errorMessage, errorName } from '../utils/redactError';
@@ -157,7 +157,7 @@ export class WebSocketService {
   private readonly subscribedServers = new Set<string>();
   private readonly subscribedDMs = new Set<string>();
 
-  constructor(baseUrl: string = WS_BASE) {
+  constructor(baseUrl: string = getWsBase()) {
     this.url = `${baseUrl}/api/v1/ws`;
   }
 
@@ -1117,9 +1117,15 @@ export class WebSocketService {
 
 // Singleton instance
 let wsService: WebSocketService | null = null;
+let wsServiceBaseUrl: string | null = null;
 
 export const getWebSocketService = (baseUrl?: string): WebSocketService => {
-  wsService ??= new WebSocketService(baseUrl);
+  const nextBaseUrl = baseUrl ?? getWsBase();
+  if (!wsService || wsServiceBaseUrl !== nextBaseUrl) {
+    wsService?.disconnect();
+    wsService = new WebSocketService(nextBaseUrl);
+    wsServiceBaseUrl = nextBaseUrl;
+  }
   return wsService;
 };
 

@@ -3,7 +3,7 @@ import TOTPInput from './TOTPInput';
 import LoadingSpinner from './LoadingSpinner';
 import { useAuthStore } from '../../stores/authStore';
 import { usePendingRegistrationStore } from '../../stores/pendingRegistrationStore';
-import { API_BASE } from '../../services/apiClient';
+import { apiUrl, getApiBase } from '../../services/runtimeServerBase';
 import './EmailVerification.css';
 import './TOTPInput.css';
 
@@ -109,7 +109,7 @@ const EmailVerification: React.FC<EmailVerificationProps> = ({
       setError('');
 
       try {
-        const response = await fetch(`${API_BASE}/api/v1/auth/register/confirm`, {
+        const response = await fetch(apiUrl('/api/v1/auth/register/confirm'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           credentials: 'include',
@@ -127,7 +127,7 @@ const EmailVerification: React.FC<EmailVerificationProps> = ({
             await globalThis.electron.storeRefreshToken({
               refreshToken: data.refresh_token,
               rememberMe: true,
-              apiBase: API_BASE,
+              apiBase: getApiBase(),
               accessToken: data.access_token,
             });
           }
@@ -161,7 +161,7 @@ const EmailVerification: React.FC<EmailVerificationProps> = ({
     setError('');
 
     try {
-      const response = await fetch(`${API_BASE}/api/v1/auth/register/resend`, {
+      const response = await fetch(apiUrl('/api/v1/auth/register/resend'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pending_id: pendingId }),
@@ -201,7 +201,7 @@ const EmailVerification: React.FC<EmailVerificationProps> = ({
     if (!pendingId || isCancelling) return;
     setIsCancelling(true);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/auth/register/${pendingId}`, {
+      const res = await fetch(apiUrl(`/api/v1/auth/register/${pendingId}`), {
         method: 'DELETE',
       });
       if (res.status === 204 || res.status === 404) {

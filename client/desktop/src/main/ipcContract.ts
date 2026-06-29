@@ -83,8 +83,12 @@
  *        window:quit, and window:setTitleBarOverlayColor.
  * - v16: Invite deep links (#1355): preload exposes onInviteReceived and main
  *        emits invite:received with a validated 8-character invite code only.
+ * - v17: Self-hosted server discovery (#1618): selfHosted:probeServer handler
+ *        validates a user-entered origin in the main process and probes
+ *        /api/v1/client/config plus /api/v1/server/capabilities before the
+ *        renderer may route auth storage to that origin.
  */
-export const IPC_CONTRACT_VERSION = 16;
+export const IPC_CONTRACT_VERSION = 17;
 
 /**
  * Result shape returned by performRefresh() in the main process and
@@ -99,3 +103,16 @@ export interface RefreshResult {
   mfaMethods?: string[];
   mfaRecoveryOnlyMethods?: string[];
 }
+
+export type SelfHostedProbeResult =
+  | {
+      status: 'ok';
+      apiBase: string;
+      clientConfig: unknown;
+      capabilities: unknown;
+    }
+  | {
+      status: 'error';
+      code: string;
+      message: string;
+    };

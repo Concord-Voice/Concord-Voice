@@ -5,9 +5,11 @@ import LoadingSpinner from './LoadingSpinner';
 import { SSOButton } from './SSOButton';
 import { useSSOFlow } from '../../hooks/useSSOFlow';
 import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
-import { API_BASE, ensureMachineId } from '../../services/apiClient';
+import { ensureMachineId } from '../../services/apiClient';
+import { apiUrl } from '../../services/runtimeServerBase';
 import { e2eeService } from '../../services/e2eeService';
 import { errorMessage } from '../../utils/redactError';
+import { useClientConfigStore } from '../../stores/clientConfigStore';
 import {
   usePendingRegistrationStore,
   type PendingRegistrationResponse,
@@ -37,6 +39,8 @@ interface FormErrors {
   general?: string;
 }
 
+const EMPTY_OAUTH_PROVIDERS: string[] = [];
+
 const Register: React.FC<RegisterProps> = ({ onBack, onSuccess, onSwitchToLogin }) => {
   const [formData, setFormData] = useState<FormData>({
     email: '',
@@ -50,6 +54,12 @@ const Register: React.FC<RegisterProps> = ({ onBack, onSuccess, onSwitchToLogin 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [passwordsMatch, setPasswordsMatch] = useState(false);
   const { begin: beginSSO } = useSSOFlow();
+  const oauthProviders = useClientConfigStore(
+    (state) => state.serverCapabilities?.auth.oauthProviders ?? EMPTY_OAUTH_PROVIDERS
+  );
+  const showGoogleSSO = oauthProviders.includes('google');
+  const showAppleSSO = oauthProviders.includes('apple');
+  const hasDefaultSSO = showGoogleSSO || showAppleSSO;
 
   const validateForm = (): boolean => {
     const newErrors: FormErrors = {};
@@ -142,7 +152,7 @@ const Register: React.FC<RegisterProps> = ({ onBack, onSuccess, onSwitchToLogin 
       const machineId = await ensureMachineId();
 
       // Register with backend
-      const response = await fetch(`${API_BASE}/api/v1/auth/register`, {
+      const response = await fetch(apiUrl('/api/v1/auth/register'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -273,13 +283,29 @@ const Register: React.FC<RegisterProps> = ({ onBack, onSuccess, onSwitchToLogin 
         {/* SSO entry point — clicking begins the loopback OAuth flow. New
             users coming from Google or Apple (#271) enter the SSO new-user
             wizard via useSSOStore once Task 21 wires AuthFlow. */}
-        <div className="register-sso-row">
-          <SSOButton provider="google" onClick={() => beginSSO('google')} disabled={isSubmitting} />
-          <SSOButton provider="apple" onClick={() => beginSSO('apple')} disabled={isSubmitting} />
-        </div>
-        <div className="register-divider" role="separator" aria-label="or sign up with email">
-          <span className="register-divider__text">or</span>
-        </div>
+        {hasDefaultSSO && (
+          <div className="register-sso-row">
+            {showGoogleSSO && (
+              <SSOButton
+                provider="google"
+                onClick={() => beginSSO('google')}
+                disabled={isSubmitting}
+              />
+            )}
+            {showAppleSSO && (
+              <SSOButton
+                provider="apple"
+                onClick={() => beginSSO('apple')}
+                disabled={isSubmitting}
+              />
+            )}
+          </div>
+        )}
+        {hasDefaultSSO && (
+          <div className="register-divider" role="separator" aria-label="or sign up with email">
+            <span className="register-divider__text">or</span>
+          </div>
+        )}
 
         <form className="register-form" onSubmit={handleSubmit}>
           {/* Email */}

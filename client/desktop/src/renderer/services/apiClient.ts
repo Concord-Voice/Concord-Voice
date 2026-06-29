@@ -13,25 +13,29 @@
  */
 
 import { useAuthStore } from '../stores/authStore';
-import { API_BASE } from '../config';
+import { apiUrl, getApiBase } from './runtimeServerBase';
 import type { TerminalAttestationCode } from '../stores/attestationFailureStore';
 
 export { API_BASE } from '../config';
 
 // ─── Machine ID cache (for X-Machine-Id header, #89) ─────────────────
-let cachedMachineId: string | null = null;
+const cachedMachineIds = new Map<string, string>();
 
 export async function ensureMachineId(): Promise<string> {
+  const apiBase = getApiBase();
+  const cachedMachineId = cachedMachineIds.get(apiBase);
   if (cachedMachineId) return cachedMachineId;
   if (globalThis.electron?.getMachineId) {
-    cachedMachineId = await globalThis.electron.getMachineId();
+    const machineId = await globalThis.electron.getMachineId(apiBase);
+    cachedMachineIds.set(apiBase, machineId);
+    return machineId;
   }
-  return cachedMachineId ?? '';
+  return '';
 }
 
 /** Synchronous accessor — returns '' until ensureMachineId() resolves */
 export function getMachineIdSync(): string {
-  return cachedMachineId ?? '';
+  return cachedMachineIds.get(getApiBase()) ?? '';
 }
 
 // ─── Proactive Token Refresh (#240-A) ────────────────────────────────
@@ -132,6 +136,7 @@ export function stopProactiveRefresh(): void {
 /** Reset rate limiter state (for tests only). */
 export function _resetRefreshState(): void {
   lastRefreshTimestamp = 0;
+  cachedMachineIds.clear();
   stopProactiveRefresh();
 }
 
@@ -258,7 +263,7 @@ export async function refreshAccessToken(): Promise<string | null> {
  *
  * - Automatically adds Authorization header
  * - On 401, refreshes token via main process IPC and retries once
- * - Paths are relative to API_BASE (pass full path starting with /)
+ * - Paths are relative to the active runtime API base (pass full path starting with /)
  */
 /**
  * Safely parse a JSON response, handling non-JSON responses (e.g. Cloudflare HTML pages).
@@ -310,10 +315,10 @@ async function handleRefreshFailure(): Promise<void> {
  * Internal raw-fetch helper.
  *
  * Every API request in this module funnels through this single function so
- * URL construction is centralized — `${API_BASE}${path}` happens exactly here
+ * URL construction is centralized — `apiUrl(path)` happens exactly here
  * and nowhere else. `path` is the relative API route supplied by internal
  * callers (always `/api/v1/...` shaped). The function is the only place that
- * concatenates the constant API_BASE with caller-supplied path.
+ * combines the active runtime API base with caller-supplied path.
  *
  * `credentials: 'include'` is non-negotiable for the auth cookie path.
  */
@@ -322,7 +327,7 @@ function apiFetchRaw(
   init: RequestInit | undefined,
   headers: Headers
 ): Promise<Response> {
-  return fetch(`${API_BASE}${path}`, {
+  return fetch(apiUrl(path), {
     ...init,
     headers,
     credentials: 'include',

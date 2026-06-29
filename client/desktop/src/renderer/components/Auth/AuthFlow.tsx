@@ -5,6 +5,8 @@ import { useAuthStore } from '../../stores/authStore';
 import { useUserStore, UserProfile } from '../../stores/userStore';
 import { usePendingRegistrationStore } from '../../stores/pendingRegistrationStore';
 import { useSSOStore } from '../../stores/ssoStore';
+import { useClientConfigStore } from '../../stores/clientConfigStore';
+import { resetRuntimeServerBase, setRuntimeServerBase } from '../../services/runtimeServerBase';
 import ConnectionSelector from './ConnectionSelector';
 import ServerInput from './ServerInput';
 import Register from './Register';
@@ -66,7 +68,6 @@ type AuthStep =
   | 'server-input'
   | 'hosted-register'
   | 'hosted-login'
-  | 'self-hosted-auth'
   | 'email-verification'
   | 'change-email'
   | 'forgot-password';
@@ -94,7 +95,6 @@ const AuthFlow: React.FC = () => {
   };
 
   const [step, setStep] = useState<AuthStep>(getInitialStep);
-  const [serverUrl, setServerUrl] = useState<string>('');
 
   // Watch for async verification state changes (e.g. session restore → /users/me fetch
   // flips emailVerified to false after mount). Transition to verification when needed.
@@ -116,15 +116,14 @@ const AuthFlow: React.FC = () => {
   };
 
   const handleServerConnect = (url: string) => {
-    setServerUrl(url);
-    setStep('self-hosted-auth');
-    // Deferred: see #602 — requires self-hosted installer (#210)
-    console.debug('Connecting to self-hosted server:', url);
+    setRuntimeServerBase(url);
+    useClientConfigStore.getState().setServerCapabilities(null);
+    setStep('hosted-login');
   };
 
   const handleBack = () => {
+    resetRuntimeServerBase();
     setStep('connection-select');
-    setServerUrl('');
   };
 
   const handleRegistrationSuccess = (_data: { pendingId: string; email: string }) => {
@@ -267,15 +266,6 @@ const AuthFlow: React.FC = () => {
             onBack={() => setStep('hosted-login')}
             onComplete={() => setStep('hosted-login')}
           />
-        </div>
-      )}
-
-      {step === 'self-hosted-auth' && (
-        <div className="auth-placeholder">
-          <h2>Self-Hosted Auth</h2>
-          <p>Connecting to: {serverUrl}</p>
-          <p>Server&apos;s auth flow will be proxied here</p>
-          <button onClick={handleBack}>← Back</button>
         </div>
       )}
     </div>

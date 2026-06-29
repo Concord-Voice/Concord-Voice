@@ -1,4 +1,4 @@
-import { API_BASE } from '../config';
+import { mediaUrl } from '../services/runtimeServerBase';
 
 /**
  * Absolutize a server-origin media URL for use in an <img>/<video>/<audio> src.
@@ -7,10 +7,10 @@ import { API_BASE } from '../config';
  * `/api/v1/media/*` paths (the documented MediaURL contract — see
  * `types/ws-events.ts`). In the remote-SPA renderer, `document.baseURI` is the
  * SPA origin (spa.concordvoice.chat), so a raw relative <img src> resolves to
- * the wrong host. Prefix API_BASE so it resolves against the API host.
+ * the wrong host. Prefix the active runtime API base so it resolves against the API host.
  *
  * At least as strict as the MediaURL zod schema on dangerous schemes (plus blob:
- * for local crop previews): a leading-`/` path is API_BASE-prefixed; data:/blob:/http(s)://
+ * for local crop previews): a leading-`/` path is runtime-API-prefixed; data:/blob:/http(s)://
  * pass through unchanged; anything else (including javascript:) returns
  * undefined (do NOT render — never broaden what reaches an <img src>).
  *
@@ -20,10 +20,5 @@ import { API_BASE } from '../config';
  * stays relative, e.g. in `useImageUpload.imageUrl`).
  */
 export function resolveMediaUrl(url?: string | null): string | undefined {
-  if (!url) return undefined;
-  if (url.startsWith('/')) return `${API_BASE}${url}`;
-  if (url.startsWith('data:') || url.startsWith('blob:') || /^https?:\/\//i.test(url)) {
-    return url;
-  }
-  return undefined;
+  return mediaUrl(url);
 }

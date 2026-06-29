@@ -49,6 +49,8 @@ import {
   getApiBaseOrigin,
 } from './tokenManager';
 import { getMachineId } from './machineId';
+import { probeSelfHostedServer } from './selfHostedProbe';
+import { isValidatedSelfHostedApiBase } from './selfHostedProfile';
 import {
   initAutoUpdater,
   stopAutoUpdater,
@@ -1185,6 +1187,26 @@ ipcMain.handle('app:getSystemInfo', () => ({
 
 // ─── Secure Auth Token Management (safeStorage) ──────────────────────
 
+ipcMain.handle('selfHosted:probeServer', async (event, url: unknown) => {
+  if (!isTrustedAuthSender(event)) {
+    console.warn('[selfHosted:probeServer] rejected — sender frame validation failed');
+    return {
+      status: 'error',
+      code: 'rejected',
+      message: 'Self-hosted server probing is not available from this frame.',
+    };
+  }
+  if (typeof url !== 'string') {
+    return {
+      status: 'error',
+      code: 'invalid_url',
+      message: 'Enter a self-hosted server URL.',
+    };
+  }
+
+  return probeSelfHostedServer(url);
+});
+
 ipcMain.handle('auth:storeRefreshToken', (event, data: unknown) => {
   if (!isTrustedAuthSender(event)) {
     return rejectUntrustedAuthSender('auth:storeRefreshToken');
@@ -1258,9 +1280,12 @@ function isValidApiBase(value: unknown): value is string {
     // feed / persisted API origin at an attacker host — the one path
     // code-signing doesn't cover on Linux (no publisher verification). Dev/LAN
     // builds (isPackaged=false) keep the host-agnostic check.
-    // TODO(#210): single-tenant origin pin — when self-hosted desktop lands,
-    // derive the expected origin from the chosen server, not PRODUCTION_API_BASE.
-    if (app.isPackaged) return parsed.origin === new URL(PRODUCTION_API_BASE).origin;
+    if (app.isPackaged) {
+      return (
+        parsed.origin === new URL(PRODUCTION_API_BASE).origin ||
+        isValidatedSelfHostedApiBase(parsed.origin)
+      );
+    }
     return true;
   } catch {
     return false;
@@ -1386,13 +1411,15 @@ ipcMain.handle('auth:getCapabilities', (event) => {
   return getCapabilities();
 });
 
-ipcMain.handle('auth:getMachineId', (event) => {
+ipcMain.handle('auth:getMachineId', (event, apiBase?: unknown) => {
   if (!isTrustedAuthSender(event)) {
     console.warn('[auth:getMachineId] rejected — sender frame validation failed');
     return '';
   }
 
-  return getMachineId();
+  if (apiBase === undefined) return getMachineId();
+  if (!isValidApiBase(apiBase)) return '';
+  return getMachineId(apiBase);
 });
 
 // ─── PiP (Picture-in-Picture) Window Management ──────────────────────

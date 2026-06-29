@@ -49,13 +49,21 @@ const ServerInput: React.FC<ServerInputProps> = ({ onConnect, onBack }) => {
     setIsValidating(true);
 
     try {
-      // Test server connectivity (will implement full discovery later)
-      // For now, just validate the URL format
-      onConnect(fullUrl);
+      const result = await globalThis.electron?.selfHosted?.probeServer(fullUrl);
+      if (!result) {
+        setError('Self-hosted server discovery is unavailable in this app version.');
+        setIsValidating(false);
+        return;
+      }
+      if (result.status === 'ok') {
+        onConnect(result.apiBase);
+        return;
+      }
+      setError(result.message);
     } catch {
       setError('Could not connect to server. Please check the URL.');
-      setIsValidating(false);
     }
+    setIsValidating(false);
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {

@@ -17,6 +17,12 @@ interface TURNConfig {
   realm: string;
 }
 
+export interface ServerCapabilities {
+  auth: {
+    oauthProviders: string[];
+  };
+}
+
 interface ClientConfigState {
   minVersion: string;
   featureFlags: FeatureFlags;
@@ -24,8 +30,12 @@ interface ClientConfigState {
   turn: TURNConfig;
   spaUrl: string;
   spaIpcContract: number;
+  serverCapabilities: ServerCapabilities | null;
   lastFetchedAt: number | null;
-  setConfig: (config: Omit<ClientConfigState, 'lastFetchedAt' | 'setConfig'>) => void;
+  setConfig: (
+    config: Omit<ClientConfigState, 'lastFetchedAt' | 'setConfig' | 'setServerCapabilities'>
+  ) => void;
+  setServerCapabilities: (capabilities: ServerCapabilities | null) => void;
 }
 
 export const useClientConfigStore = createStore<ClientConfigState>()((set) => ({
@@ -35,6 +45,8 @@ export const useClientConfigStore = createStore<ClientConfigState>()((set) => ({
   turn: { host: '', realm: '' },
   spaUrl: '',
   spaIpcContract: 0,
+  serverCapabilities: null,
   lastFetchedAt: null,
   setConfig: (config) => set({ ...config, lastFetchedAt: Date.now() }),
+  setServerCapabilities: (serverCapabilities) => set({ serverCapabilities }),
 }));

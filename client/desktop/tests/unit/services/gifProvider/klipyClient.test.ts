@@ -1,5 +1,9 @@
 import { klipyClient, rewriteMediaUrl } from '@/renderer/services/gifProvider/klipyClient';
 import { API_BASE } from '@/renderer/config';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/runtimeServerBase';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // All KLIPY traffic now goes through the control-plane proxy via apiFetch.
@@ -20,9 +24,14 @@ describe('klipyClient', () => {
   beforeEach(() => {
     resetAllStores();
     apiFetchMock.mockReset();
+    resetRuntimeServerBase();
     // Fully reset the singleton client (clears cached customer_id between tests)
     (klipyClient as unknown as { _resetForTesting: () => void })._resetForTesting();
     localStorage.clear();
+  });
+
+  afterEach(() => {
+    resetRuntimeServerBase();
   });
 
   describe('proxy routing', () => {
@@ -299,6 +308,14 @@ describe('klipyClient', () => {
 });
 
 describe('rewriteMediaUrl', () => {
+  beforeEach(() => {
+    resetRuntimeServerBase();
+  });
+
+  afterEach(() => {
+    resetRuntimeServerBase();
+  });
+
   // The rewritten URL MUST be absolute — see the regression-guard test below
   // and the comment on rewriteMediaUrl in klipyClient.ts for context.
   const proxy = (u: string) => `${API_BASE}/api/v1/klipy/media?url=${encodeURIComponent(u)}`;
@@ -320,6 +337,14 @@ describe('rewriteMediaUrl', () => {
   it('rewrites klipy.com subdomains', () => {
     expect(rewriteMediaUrl('https://media.klipy.com/a.mp4')).toBe(
       proxy('https://media.klipy.com/a.mp4')
+    );
+  });
+
+  it('rewrites through the active runtime API base', () => {
+    setRuntimeServerBase('https://homelab.lan:8443');
+
+    expect(rewriteMediaUrl('https://media.klipy.com/a.mp4')).toBe(
+      `https://homelab.lan:8443/api/v1/klipy/media?url=${encodeURIComponent('https://media.klipy.com/a.mp4')}`
     );
   });
 

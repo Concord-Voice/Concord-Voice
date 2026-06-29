@@ -10,7 +10,10 @@ Concord Voice is a privacy-first, real-time voice communication platform with tw
 
 > **Self-hosting?** Run `[internal]install-selfhost.sh` and pick a TLS mode
 > when prompted (`letsencrypt` recommended; `local` self-signed for a trusted LAN; `import`
-> for a BYO cert). Full guide: [[internal]self-hosted-tls.md](runbooks/self-hosted-tls.md).
+> for a BYO cert). The desktop client can connect to CA-trusted self-hosted servers;
+> in-app self-signed certificate consent is tracked separately, so local/self-signed mode
+> must be trusted by the OS for now. Full guides: [[internal]self-hosted-tls.md](runbooks/self-hosted-tls.md)
+> and [docs/self-hosted-client.md](self-hosted-client.md).
 
 ### Key Features
 
@@ -165,6 +168,8 @@ The Concord Voice desktop app should show:
 - Branding: concordvoice.chat
 
 **Try it out!** You can now register an account and log in. E2EE keys are generated automatically and stored securely.
+
+For self-hosted testing, choose **Self-Hosted** in the connection selector and enter the server origin. The desktop shell probes `/api/v1/client/config` and `/api/v1/server/capabilities` before routing login/registration to that origin.
 
 ## Verify Everything Works
 
