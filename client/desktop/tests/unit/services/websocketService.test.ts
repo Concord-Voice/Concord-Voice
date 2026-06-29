@@ -137,6 +137,62 @@ describe('WebSocketService', () => {
       expect(service.getState()).toBe(ConnectionState.CONNECTED);
     });
 
+    it('restarts an in-flight connect when called with a newer token (#1977)', () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: () => new Promise(() => undefined),
+      });
+
+      service.connect('stale-token');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+
+      service.connect('fresh-token');
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(mockFetch.mock.calls[1][1]?.headers).toMatchObject({
+        Authorization: 'Bearer fresh-token',
+      });
+    });
+
+    it('detaches a superseded connecting socket when the token rotates after ticket fetch (#1977)', async () => {
+      service.connect('stale-token');
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const staleWs = (service as any).ws as MockWebSocket;
+      expect(staleWs).not.toBeNull();
+      expect(staleWs.onopen).not.toBeNull();
+
+      service.connect('fresh-token');
+
+      expect(staleWs.onopen).toBeNull();
+      expect(staleWs.onmessage).toBeNull();
+      expect(staleWs.onerror).toBeNull();
+      expect(staleWs.onclose).toBeNull();
+      expect(staleWs.readyState).toBe(MockWebSocket.CLOSED);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('clears an armed reconnect timer when a fresh token supersedes reconnecting (#1977)', async () => {
+      vi.spyOn(Math, 'random').mockReturnValue(0.5);
+      const s = service as unknown as {
+        token: string | null;
+        state: ConnectionState;
+        reconnectTimer: NodeJS.Timeout | null;
+        scheduleReconnect: () => void;
+      };
+      s.token = 'stale-token';
+      s.state = ConnectionState.RECONNECTING;
+      s.scheduleReconnect();
+      expect(s.reconnectTimer).not.toBeNull();
+
+      service.connect('fresh-token');
+
+      expect(s.reconnectTimer).toBeNull();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
     // ─── Connection-boundary validation (defense-in-depth) ──────────────
     // The validator fails-closed before `new WebSocket(wsUrl)` to defend
     // against future regressions that let attacker-influenced data reach
@@ -671,26 +727,58 @@ describe('offline short-circuit (navigator.onLine gate)', () => {
 });
 
 describe('ticket cache', () => {
-  it('consumes cached ticket within TTL', () => {
+  type CacheHarness = {
+    token: string | null;
+    ticketCache: {
+      ticket: string;
+      issuedAt: number;
+      token: string;
+      sessionId: string | null;
+    } | null;
+    consumeCachedTicket: () => string | null;
+  };
+
+  it('consumes cached ticket within TTL for the same token/session', () => {
     const svc = new WebSocketService('ws://localhost:8080');
-    const s = svc as unknown as {
-      ticketCache: { ticket: string; issuedAt: number } | null;
-      consumeCachedTicket: () => string | null;
+    const s = svc as unknown as CacheHarness;
+    s.token = 'current-token';
+    s.ticketCache = {
+      ticket: 'cached-ticket-abc',
+      issuedAt: Date.now(),
+      token: 'current-token',
+      sessionId: null,
     };
-    s.ticketCache = { ticket: 'cached-ticket-abc', issuedAt: Date.now() };
     const consumed = s.consumeCachedTicket();
     expect(consumed).toBe('cached-ticket-abc');
     // Cache is cleared after consumption (single-use invariant)
     expect(s.ticketCache).toBeNull();
   });
 
+  it('rejects cached ticket from a different token (#1977)', () => {
+    const svc = new WebSocketService('ws://localhost:8080');
+    const s = svc as unknown as CacheHarness;
+    s.token = 'fresh-token';
+    s.ticketCache = {
+      ticket: 'stale-token-ticket',
+      issuedAt: Date.now(),
+      token: 'stale-token',
+      sessionId: null,
+    };
+    const consumed = s.consumeCachedTicket();
+    expect(consumed).toBeNull();
+    expect(s.ticketCache).toBeNull();
+  });
+
   it('rejects cached ticket older than TTL', () => {
     const svc = new WebSocketService('ws://localhost:8080');
-    const s = svc as unknown as {
-      ticketCache: { ticket: string; issuedAt: number } | null;
-      consumeCachedTicket: () => string | null;
+    const s = svc as unknown as CacheHarness;
+    s.token = 'current-token';
+    s.ticketCache = {
+      ticket: 'stale-ticket',
+      issuedAt: Date.now() - 10_000,
+      token: 'current-token',
+      sessionId: null,
     };
-    s.ticketCache = { ticket: 'stale-ticket', issuedAt: Date.now() - 10_000 };
     const consumed = s.consumeCachedTicket();
     expect(consumed).toBeNull();
     expect(s.ticketCache).toBeNull(); // stale entries cleared too

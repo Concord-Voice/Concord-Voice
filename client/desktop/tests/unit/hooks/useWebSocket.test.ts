@@ -136,6 +136,25 @@ describe('useWebSocket', () => {
       expect(mockWsService.connect).not.toHaveBeenCalled();
       expect(mockWsService.disconnect).not.toHaveBeenCalled();
     });
+
+    it('restarts a connecting handshake when the access token rotates (#1977)', () => {
+      useAuthStore.getState().setAccessToken('stale-token');
+      renderHook(() => useWebSocket());
+      expect(mockWsService.connect).toHaveBeenCalledWith('stale-token');
+
+      mockWsService.getState.mockReturnValue(ConnectionState.CONNECTING);
+      mockWsService.connect.mockClear();
+      mockWsService.updateToken.mockClear();
+      mockWsService.resetReconnectState.mockClear();
+
+      act(() => {
+        useAuthStore.getState().setAccessToken('fresh-token');
+      });
+
+      expect(mockWsService.resetReconnectState).toHaveBeenCalledTimes(1);
+      expect(mockWsService.connect).toHaveBeenCalledWith('fresh-token');
+      expect(mockWsService.updateToken).not.toHaveBeenCalled();
+    });
   });
 
   describe('handler registration', () => {

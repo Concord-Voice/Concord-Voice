@@ -114,7 +114,12 @@ export class WebSocketService {
   private reconnectAttempts = 0;
   private readonly maxReconnectAttempts = 10;
   private readonly MAX_AGGRESSIVE_ATTEMPTS = 3;
-  private ticketCache: { ticket: string; issuedAt: number } | null = null;
+  private ticketCache: {
+    ticket: string;
+    issuedAt: number;
+    token: string;
+    sessionId: string | null;
+  } | null = null;
   private readonly TICKET_CACHE_TTL_MS = 5_000;
   private readonly CONNECTION_READY_TIMEOUT_MS = 5_000;
   private connectionReadyPromise: Promise<void> | null = null;
@@ -160,8 +165,21 @@ export class WebSocketService {
    * Connect to WebSocket server with JWT token
    */
   connect(token: string): void {
-    if (this.state === ConnectionState.CONNECTED || this.state === ConnectionState.CONNECTING) {
-      return;
+    if (this.state === ConnectionState.CONNECTED) return;
+    if (this.state === ConnectionState.CONNECTING && this.token === token) return;
+
+    this.clearReconnectTimer();
+
+    if (this.ws) {
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onerror = null;
+      this.ws.onclose = null;
+      if (this.ws.readyState === WebSocket.OPEN) {
+        this.ws.close(1000, 'Superseded connect');
+      }
+      this.ws = null;
+      this.clearPingInterval();
     }
 
     this.token = token;
@@ -594,6 +612,8 @@ export class WebSocketService {
     this.ticketCache = null;
     if (!entry) return null;
     if (Date.now() - entry.issuedAt >= this.TICKET_CACHE_TTL_MS) return null;
+    const sessionId = useAuthStore.getState().sessionId ?? null;
+    if (entry.token !== this.token || entry.sessionId !== sessionId) return null;
     return entry.ticket;
   }
 
@@ -636,8 +656,11 @@ export class WebSocketService {
     ticketUrl.protocol = wsBaseUrl.protocol === 'wss:' ? 'https:' : 'http:';
     ticketUrl.pathname = ticketUrl.pathname.replace(/\/ws$/, '/auth/ws-ticket');
 
-    const ticketHeaders: Record<string, string> = { Authorization: `Bearer ${this.token}` };
-    const sessionId = useAuthStore.getState().sessionId;
+    const token = this.token;
+    if (!token) throw new Error('WebSocket ticket request missing token');
+
+    const ticketHeaders: Record<string, string> = { Authorization: `Bearer ${token}` };
+    const sessionId = useAuthStore.getState().sessionId ?? null;
     if (sessionId) ticketHeaders['X-Session-ID'] = sessionId;
 
     const ticketRes = await fetch(ticketUrl.href, {
@@ -691,11 +714,9 @@ export class WebSocketService {
     try {
       const ticket = await this.acquireTicket(wsBaseUrl, signal);
 
-      // If disconnect() was called while we awaited the ticket, cache it for reuse
-      if (signal?.aborted) {
-        this.ticketCache = { ticket, issuedAt: Date.now() };
-        return;
-      }
+      // If this attempt was superseded while awaiting the ticket, discard it.
+      // The replacement attempt may be using a different token/session.
+      if (signal?.aborted) return;
 
       if (!isValidWsTicket(ticket)) {
         // Ticket-shape failure is treated as TRANSIENT — a server bug or
