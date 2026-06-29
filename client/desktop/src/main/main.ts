@@ -101,6 +101,7 @@ import { IPC_CONTRACT_VERSION } from './ipcContract';
 import { registerIpcHandlers as registerPermissionHandlers } from './permissionManager';
 import { migrateUserData } from './userDataMigration';
 import { showSplash, closeSplash, updateSplashError } from './splashWindow';
+import { maybePromptMove } from './applicationsFolderGate';
 
 // One-time migration: consolidate any legacy userData tree into the pinned
 // "ConcordVoice" dir (#1291). Runs after pinUserDataPath.ts has set the path,
@@ -668,6 +669,8 @@ let rollbackResult: SentinelResult | null = null;
 
 // App lifecycle handlers
 app.whenReady().then(async () => {
+  if (maybePromptMove()) return;
+
   registerInviteProtocolClient();
 
   // app:// protocol handler (#830) — serves the bundled SPA from the asar

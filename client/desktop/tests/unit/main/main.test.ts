@@ -43,6 +43,9 @@ const { mockCancelAppleFlow, mockCancelGoogleFlow } = vi.hoisted(() => ({
 const { mockRevealLoadFailure } = vi.hoisted(() => ({
   mockRevealLoadFailure: vi.fn(),
 }));
+const { mockMaybePromptMove } = vi.hoisted(() => ({
+  mockMaybePromptMove: vi.fn(() => false),
+}));
 vi.mock('../../../src/main/oauth/apple/appleFlow', () => ({
   cancelActiveAppleFlow: mockCancelAppleFlow,
   runAppleSignIn: vi.fn(),
@@ -229,6 +232,10 @@ vi.mock('../../../src/main/loadFailureVisibility', () => ({
   revealLoadFailure: mockRevealLoadFailure,
 }));
 
+vi.mock('../../../src/main/applicationsFolderGate', () => ({
+  maybePromptMove: mockMaybePromptMove,
+}));
+
 vi.mock('../../../src/main/spaLoader', () => ({
   resolveSpaSource: vi.fn(() => Promise.resolve({ mode: 'bundled', reason: 'test' })),
   isUnexpectedBundled: vi.fn(() => false),
@@ -360,6 +367,15 @@ describe('main.ts', () => {
 
     it('registers before-quit handler', () => {
       expect(appOnCallbacks.has('before-quit')).toBe(true);
+    });
+
+    it('checks Applications-folder relocation before creating BrowserWindow', () => {
+      const gateOrder = mockMaybePromptMove.mock.invocationCallOrder[0];
+      const windowOrder = MockBrowserWindow.mock.invocationCallOrder[0];
+
+      expect(gateOrder).toBeDefined();
+      expect(windowOrder).toBeDefined();
+      expect(gateOrder).toBeLessThan(windowOrder);
     });
   });
 
