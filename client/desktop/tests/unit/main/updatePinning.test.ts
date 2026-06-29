@@ -12,6 +12,7 @@ import {
 import { PIN_CONFIG } from '../../../src/main/updatePinningConfig';
 
 const PREVIOUS_PRODUCTION_SPKI = '0a4ccc0dfc2c60c67e4b814292467bbf7e525d6b75d38e32ea646153fc7c49f2'; // pragma: allowlist secret
+const CURRENT_PRODUCTION_SPKI = 'adc59f988ed774248efa8e2a5cf3a5114ddf05252abc72ae93ee445ba5d8ce75'; // pragma: allowlist secret
 const PREVIOUS_PIN_RECOVERY_WINDOW_END_MS = Date.parse('2026-07-29T00:00:00.000Z');
 
 const FIXTURES_DIR = join(__dirname, '../../fixtures/pinning');
@@ -52,6 +53,10 @@ describe('computeSpkiSha256', () => {
 describe('PIN_CONFIG production pins', () => {
   it('trusts the 2026-06-29 Cloudflare edge SPKI rotation', () => {
     expect(PIN_CONFIG.primaryPins).toContain(computeSpkiSha256(rotated20260629Pem));
+  });
+
+  it('trusts the current production Cloudflare edge SPKI', () => {
+    expect(PIN_CONFIG.primaryPins).toContain(CURRENT_PRODUCTION_SPKI);
   });
 
   it('bounds the previous production pin to the recovery window', () => {
