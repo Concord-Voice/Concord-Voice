@@ -65,6 +65,7 @@ describe('DesktopNotificationService', () => {
       desktopNotifyDMs: true,
       desktopNotifyMentions: true,
       desktopNotifyAllMessages: false,
+      notificationContent: 'full',
       doNotDisturb: false,
       quietHoursEnabled: false,
       quietHoursStart: '22:00',
@@ -245,9 +246,12 @@ describe('DesktopNotificationService', () => {
   // ── notify ────────────────────────────────────────────────────────
 
   describe('notify', () => {
-    it('creates a Notification with correct title and body', () => {
+    it('creates a Notification with original title and body in full mode', () => {
+      useNotificationStore.setState({ notificationContent: 'full' });
+
       desktopNotificationService.notify({
         title: 'Alice',
+        senderDisplayName: 'Alice',
         body: 'Hello there!',
         targetType: 'dm',
         targetId: 'dm-123',
@@ -259,11 +263,46 @@ describe('DesktopNotificationService', () => {
       expect(MockNotification.instances[0].body).toBe('Hello there!');
     });
 
+    it('shows only sender name in sender_only mode', () => {
+      useNotificationStore.setState({ notificationContent: 'sender_only' });
+
+      desktopNotificationService.notify({
+        title: 'Alice in #ops',
+        senderDisplayName: 'Alice',
+        body: 'Hello there!',
+        targetType: 'dm',
+        targetId: 'dm-123',
+        senderId: 'user-1',
+      });
+
+      expect(MockNotification.instances).toHaveLength(1);
+      expect(MockNotification.instances[0].title).toBe('Alice');
+      expect(MockNotification.instances[0].body).toBe('');
+    });
+
+    it('hides title and body content in minimal mode', () => {
+      useNotificationStore.setState({ notificationContent: 'minimal' });
+
+      desktopNotificationService.notify({
+        title: 'Alice',
+        senderDisplayName: 'Alice',
+        body: 'Hello there!',
+        targetType: 'dm',
+        targetId: 'dm-123',
+        senderId: 'user-1',
+      });
+
+      expect(MockNotification.instances).toHaveLength(1);
+      expect(MockNotification.instances[0].title).toBe('New Message');
+      expect(MockNotification.instances[0].body).toBe('');
+    });
+
     it('truncates body to 100 chars', () => {
       const longBody = 'A'.repeat(150);
 
       desktopNotificationService.notify({
         title: 'Alice',
+        senderDisplayName: 'Alice',
         body: longBody,
         targetType: 'dm',
         targetId: 'dm-123',
@@ -277,8 +316,11 @@ describe('DesktopNotificationService', () => {
     });
 
     it('shows "New encrypted message" fallback for empty body', () => {
+      useNotificationStore.setState({ notificationContent: 'full' });
+
       desktopNotificationService.notify({
         title: 'Alice',
+        senderDisplayName: 'Alice',
         body: '',
         targetType: 'dm',
         targetId: 'dm-123',
@@ -292,6 +334,7 @@ describe('DesktopNotificationService', () => {
     it('sets silent to true', () => {
       desktopNotificationService.notify({
         title: 'Alice',
+        senderDisplayName: 'Alice',
         body: 'Hello',
         targetType: 'dm',
         targetId: 'dm-123',
@@ -305,6 +348,7 @@ describe('DesktopNotificationService', () => {
     it('calls flashFrame to attract attention', () => {
       desktopNotificationService.notify({
         title: 'Alice',
+        senderDisplayName: 'Alice',
         body: 'Hello',
         targetType: 'dm',
         targetId: 'dm-123',
@@ -317,6 +361,7 @@ describe('DesktopNotificationService', () => {
     it('onclick calls focusWindow and sets pending navigation', async () => {
       desktopNotificationService.notify({
         title: 'Alice',
+        senderDisplayName: 'Alice',
         body: 'Hello',
         targetType: 'channel',
         targetId: 'ch-456',

@@ -392,6 +392,63 @@
   color: var(--text-muted);
 }
 
+.settings-radio-fieldset {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, max-content);
+  align-items: center;
+  gap: 12px 24px;
+  min-width: 0;
+  margin: 0;
+  padding: 12px 0;
+  border: 0;
+}
+
+.settings-radio-legend {
+  padding: 0;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.settings-radio-options {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px 16px;
+}
+
+.settings-radio-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.settings-radio-option input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent-primary);
+}
+
+.settings-radio-fieldset:disabled .settings-radio-option {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+@media (max-width: 640px) {
+  .settings-radio-fieldset {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-radio-options {
+    justify-content: flex-start;
+  }
+}
+
 /* Color scheme active label */
 .color-scheme-active-label {
   display: block;

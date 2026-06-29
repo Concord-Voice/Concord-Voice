@@ -63,7 +63,7 @@ control-plane/
 │   ├── config/           # Configuration management
 │   └── logger/           # Structured logging
 ├── migrations/           # SQL migration pairs (count: [internal] Key Counts)
-├── tests/                # Integration tests (90 test files)
+├── tests/                # Integration test docs (backend count: [internal] Key Counts)
 ├── Dockerfile
 ├── go.mod
 └── go.sum
@@ -222,13 +222,13 @@ POST /api/v1/channels/:id/keys/rotate
 
 ```bash
 # Run tests
-go test ./...
+go test -p 1 ./...
 
 # Run tests with coverage
-go test -cover ./...
+go test -p 1 -cover ./...
 
 # Run tests with race detector
-go test -race ./...
+go test -race -p 1 ./...
 ```
 
 ### Building

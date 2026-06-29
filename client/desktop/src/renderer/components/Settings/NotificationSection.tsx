@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { useNotificationStore } from '../../stores/notificationStore';
+import { useNotificationStore, type NotificationContentMode } from '../../stores/notificationStore';
 import { useOsPermissionStore } from '../../stores/osPermissionStore';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
@@ -9,6 +9,12 @@ import {
 } from '../../services/notificationSoundService';
 
 const SOUND_PREVIEW_DEBOUNCE_MS = 200;
+
+const NOTIFICATION_CONTENT_OPTIONS: { value: NotificationContentMode; label: string }[] = [
+  { value: 'full', label: 'Sender and message' },
+  { value: 'sender_only', label: 'Sender only' },
+  { value: 'minimal', label: 'Hide all details' },
+];
 
 const effectivePreviewVolume = (masterVolume: number, categoryVolume: number): number =>
   (masterVolume / 100) * (categoryVolume / 100);
@@ -94,6 +100,7 @@ const NotificationSection: React.FC = () => {
   const desktopNotifyDMs = useNotificationStore((s) => s.desktopNotifyDMs);
   const desktopNotifyMentions = useNotificationStore((s) => s.desktopNotifyMentions);
   const desktopNotifyAllMessages = useNotificationStore((s) => s.desktopNotifyAllMessages);
+  const notificationContent = useNotificationStore((s) => s.notificationContent);
   const doNotDisturb = useNotificationStore((s) => s.doNotDisturb);
   const quietHoursEnabled = useNotificationStore((s) => s.quietHoursEnabled);
   const quietHoursStart = useNotificationStore((s) => s.quietHoursStart);
@@ -117,6 +124,7 @@ const NotificationSection: React.FC = () => {
   const setDesktopNotifyDMs = useNotificationStore((s) => s.setDesktopNotifyDMs);
   const setDesktopNotifyMentions = useNotificationStore((s) => s.setDesktopNotifyMentions);
   const setDesktopNotifyAllMessages = useNotificationStore((s) => s.setDesktopNotifyAllMessages);
+  const setNotificationContent = useNotificationStore((s) => s.setNotificationContent);
   const setDoNotDisturb = useNotificationStore((s) => s.setDoNotDisturb);
   const setQuietHoursEnabled = useNotificationStore((s) => s.setQuietHoursEnabled);
   const setQuietHoursStart = useNotificationStore((s) => s.setQuietHoursStart);
@@ -253,6 +261,27 @@ const NotificationSection: React.FC = () => {
             label="All Messages"
           />
         </div>
+
+        <fieldset
+          className="settings-radio-fieldset settings-row-child"
+          disabled={!desktopNotificationsEnabled}
+        >
+          <legend className="settings-radio-legend">Notification content</legend>
+          <div className="settings-radio-options">
+            {NOTIFICATION_CONTENT_OPTIONS.map((option) => (
+              <label key={option.value} className="settings-radio-option">
+                <input
+                  type="radio"
+                  name="notification-content"
+                  value={option.value}
+                  checked={notificationContent === option.value}
+                  onChange={() => setNotificationContent(option.value)}
+                />
+                <span>{option.label}</span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
 
         <div className="settings-row">
           <div className="settings-row-info">

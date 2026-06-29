@@ -108,7 +108,7 @@ pkg/
     └── logger_test.go              # Logger tests
 ```
 
-**90 test files total** across 22 packages.
+**Backend test file count:** see [[internal]](../../..[internal]) Key Counts.
 
 ## Running Tests
 
@@ -116,13 +116,13 @@ pkg/
 cd services/control-plane
 
 # Run all tests
-go test ./...
+go test -p 1 ./...
 
 # Run with race detection
-go test -race ./...
+go test -race -p 1 ./...
 
 # Run with verbose output
-go test -v ./...
+go test -p 1 -v ./...
 
 # Run specific package
 go test ./internal/auth/...

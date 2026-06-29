@@ -4,6 +4,7 @@ export type NotificationType = 'dm' | 'mention' | 'message';
 
 interface NotifyOptions {
   title: string;
+  senderDisplayName: string;
   body: string;
   targetType: 'channel' | 'dm';
   targetId: string;
@@ -15,6 +16,23 @@ interface ShouldNotifyOptions {
   type: NotificationType;
   isWindowFocused: boolean;
   isActiveChannel: boolean;
+}
+
+export function applyContentPrivacy(options: NotifyOptions): { title: string; body: string } {
+  const mode = useNotificationStore.getState().notificationContent;
+
+  switch (mode) {
+    case 'minimal':
+      return { title: 'New Message', body: '' };
+    case 'sender_only':
+      return { title: options.senderDisplayName || 'New Message', body: '' };
+    case 'full':
+    default:
+      return {
+        title: options.title,
+        body: options.body || 'New encrypted message',
+      };
+  }
 }
 
 class DesktopNotificationService {
@@ -57,19 +75,17 @@ class DesktopNotificationService {
    * Show a desktop notification.
    */
   notify(options: NotifyOptions): void {
-    // Determine body content
-    let body = options.body;
-    if (!body) {
-      body = 'New encrypted message';
-    }
+    const content = applyContentPrivacy(options);
+    let body = content.body;
+
     // Truncate body to 100 chars
     if (body.length > 100) {
       body = body.slice(0, 97) + '...';
     }
 
     try {
-      const notification = new Notification(options.title, {
-        body: body || 'New message',
+      const notification = new Notification(content.title, {
+        body,
         silent: true, // We handle sounds separately via notificationSoundService
       });
 

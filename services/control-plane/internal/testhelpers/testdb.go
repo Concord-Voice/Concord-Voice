@@ -2,6 +2,7 @@
 package testhelpers
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -21,6 +22,16 @@ var (
 	migrateOnce sync.Once
 	migrateErr  error
 )
+
+var (
+	testDBLockMu sync.Mutex
+	// The advisory lock uses its own pool so no test's DB cleanup can close the lock session early.
+	testDBLockDB       *sql.DB
+	testDBLockConn     *sql.Conn
+	testDBLockRefCount int
+)
+
+const testDBAdvisoryLockID int64 = 0x434f4e434f5244 // "CONCORD"
 
 // defaultTestDatabaseURL is used when DATABASE_URL is not set.
 // Assembled from parts to satisfy static credential analysis (S6698/S2068).
@@ -51,17 +62,121 @@ func SetupTestDB(t *testing.T) (*sql.DB, func()) {
 	db.SetConnMaxLifetime(30 * time.Second)
 	db.SetConnMaxIdleTime(10 * time.Second)
 
-	// Migrate once per package binary; cleanup truncation between tests ensures isolation.
-	ensureMigrations(t, db)
+	releaseLock := acquireTestDatabaseLock(t, dbURL)
 
-	cleanup := func() {
-		if err := TruncateAllTables(db); err != nil {
-			t.Errorf("testhelpers: failed to truncate tables: %v", err)
-		}
+	// Migrate once per package binary; cleanup truncation between tests ensures isolation.
+	if err := ensureMigrations(db); err != nil {
+		releaseLock()
 		_ = db.Close()
+		t.Fatalf("testhelpers: migration failed: %v", err)
 	}
 
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			if err := TruncateAllTables(db); err != nil {
+				t.Errorf("testhelpers: failed to truncate tables: %v", err)
+			}
+			releaseLock()
+			_ = db.Close()
+		})
+	}
+	t.Cleanup(cleanup)
+
 	return db, cleanup
+}
+
+func acquireTestDatabaseLock(t *testing.T, dbURL string) func() {
+	t.Helper()
+
+	testDBLockMu.Lock()
+	defer testDBLockMu.Unlock()
+
+	if testDBLockRefCount == 0 {
+		testDBLockDB, testDBLockConn = openTestDatabaseLockConn(t, dbURL)
+	}
+	testDBLockRefCount++
+
+	return releaseTestDatabaseLock(t)
+}
+
+func openTestDatabaseLockConn(t *testing.T, dbURL string) (*sql.DB, *sql.Conn) {
+	t.Helper()
+
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		t.Fatalf("testhelpers: failed to open database lock pool: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("testhelpers: failed to reserve database lock connection: %v", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `SELECT pg_advisory_lock($1)`, testDBAdvisoryLockID); err != nil {
+		_ = conn.Close()
+		_ = db.Close()
+		t.Fatalf("testhelpers: failed to acquire database lock: %v", err)
+	}
+	return db, conn
+}
+
+func releaseTestDatabaseLock(t *testing.T) func() {
+	t.Helper()
+
+	var releaseOnce sync.Once
+	return func() {
+		releaseOnce.Do(func() {
+			releaseSharedTestDatabaseLock(t)
+		})
+	}
+}
+
+func releaseSharedTestDatabaseLock(t *testing.T) {
+	t.Helper()
+
+	testDBLockMu.Lock()
+	defer testDBLockMu.Unlock()
+
+	testDBLockRefCount--
+	if testDBLockRefCount > 0 {
+		return
+	}
+
+	conn := testDBLockConn
+	db := testDBLockDB
+	testDBLockDB = nil
+	testDBLockConn = nil
+	if conn == nil {
+		closeTestDatabaseLockDB(t, db)
+		return
+	}
+	releaseTestDatabaseLockConn(t, conn)
+	closeTestDatabaseLockDB(t, db)
+}
+
+func releaseTestDatabaseLockConn(t *testing.T, conn *sql.Conn) {
+	t.Helper()
+
+	if _, err := conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, testDBAdvisoryLockID); err != nil {
+		t.Errorf("testhelpers: failed to release database lock: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Errorf("testhelpers: failed to close database lock connection: %v", err)
+	}
+}
+
+func closeTestDatabaseLockDB(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	if db == nil {
+		return
+	}
+	if err := db.Close(); err != nil {
+		t.Errorf("testhelpers: failed to close database lock pool: %v", err)
+	}
 }
 
 // TruncateAllTables removes all data from application tables.
@@ -124,14 +239,11 @@ func migrationsPath() string {
 }
 
 // ensureMigrations runs migrations exactly once per package binary via sync.Once.
-func ensureMigrations(t *testing.T, db *sql.DB) {
-	t.Helper()
+func ensureMigrations(db *sql.DB) error {
 	migrateOnce.Do(func() {
 		migrateErr = runMigrations(db, migrationsPath())
 	})
-	if migrateErr != nil {
-		t.Fatalf("testhelpers: migration failed: %v", migrateErr)
-	}
+	return migrateErr
 }
 
 func runMigrations(db *sql.DB, migrationsDir string) error {

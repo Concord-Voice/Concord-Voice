@@ -581,6 +581,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
             .channels.find((c) => c.id === channelId)?.name;
           desktopNotificationService.notify({
             title: `${data.username || 'Unknown'} in #${channelName || 'channel'}`,
+            senderDisplayName: data.username || 'Unknown',
             body: data.content || '',
             targetType: 'channel',
             targetId: channelId,
@@ -1227,6 +1228,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
         ) {
           desktopNotificationService.notify({
             title: `DM from ${data.display_name || data.username || 'Unknown'}`,
+            senderDisplayName: data.display_name || data.username || 'Unknown',
             body: data.content || '',
             targetType: 'dm',
             targetId: conversationId,

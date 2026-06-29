@@ -365,6 +365,6 @@ describe('OverflowMarkdownAttachment', () => {
 
     // Wait for rendered state — Collapse button should receive focus
     const collapseButton = await screen.findByRole('button', { name: /collapse/i });
-    expect(collapseButton).toHaveFocus();
+    await waitFor(() => expect(collapseButton).toHaveFocus());
   });
 });

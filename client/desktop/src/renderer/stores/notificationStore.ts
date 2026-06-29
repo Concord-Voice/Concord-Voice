@@ -5,6 +5,19 @@ import { wrapStore } from '../utils/createStore';
 /** Clamp a volume value to the 0–100 range */
 const clamp = (value: number): number => Math.max(0, Math.min(100, value));
 
+export type NotificationContentMode = 'full' | 'sender_only' | 'minimal';
+
+const isNotificationContentMode = (value: unknown): value is NotificationContentMode =>
+  value === 'full' || value === 'sender_only' || value === 'minimal';
+
+const normalizePersistedNotificationContent = (
+  value: unknown,
+  fallback: NotificationContentMode
+): NotificationContentMode => {
+  if (value === undefined) return fallback;
+  return isNotificationContentMode(value) ? value : 'minimal';
+};
+
 export interface NotificationSoundSettings {
   /** Master toggle for all notification sounds */
   enabled: boolean;
@@ -40,6 +53,8 @@ export interface NotificationSoundSettings {
   desktopNotifyMentions: boolean;
   /** Show desktop notification for all channel messages */
   desktopNotifyAllMessages: boolean;
+  /** Controls how much message detail OS-level desktop notifications show */
+  notificationContent: NotificationContentMode;
   /** Suppress all notifications when DND status is active */
   doNotDisturb: boolean;
   /** Enable quiet hours (time-based suppression) */
@@ -68,88 +83,101 @@ interface NotificationStore extends NotificationSoundSettings {
   setDesktopNotifyDMs: (enabled: boolean) => void;
   setDesktopNotifyMentions: (enabled: boolean) => void;
   setDesktopNotifyAllMessages: (enabled: boolean) => void;
+  setNotificationContent: (value: NotificationContentMode) => void;
   setDoNotDisturb: (enabled: boolean) => void;
   setQuietHoursEnabled: (enabled: boolean) => void;
   setQuietHoursStart: (start: string) => void;
   setQuietHoursEnd: (end: string) => void;
 }
 
-export const useNotificationStore = wrapStore(create<NotificationStore>()(
-  persist(
-    (set) => ({
-      enabled: true,
-      volume: 80,
-      messageSound: true,
-      messageVolume: 100,
-      mentionSound: true,
-      mentionVolume: 100,
-      dmSound: true,
-      dmVolume: 100,
-      friendRequestSound: true,
-      friendRequestVolume: 100,
-      voiceEventSounds: true,
-      voiceEventVolume: 100,
-      suppressWhenFocused: true,
-      desktopNotificationsEnabled: true,
-      desktopNotifyDMs: true,
-      desktopNotifyMentions: true,
-      desktopNotifyAllMessages: false,
-      doNotDisturb: false,
-      quietHoursEnabled: false,
-      quietHoursStart: '22:00',
-      quietHoursEnd: '08:00',
+export const useNotificationStore = wrapStore(
+  create<NotificationStore>()(
+    persist(
+      (set) => ({
+        enabled: true,
+        volume: 80,
+        messageSound: true,
+        messageVolume: 100,
+        mentionSound: true,
+        mentionVolume: 100,
+        dmSound: true,
+        dmVolume: 100,
+        friendRequestSound: true,
+        friendRequestVolume: 100,
+        voiceEventSounds: true,
+        voiceEventVolume: 100,
+        suppressWhenFocused: true,
+        desktopNotificationsEnabled: true,
+        desktopNotifyDMs: true,
+        desktopNotifyMentions: true,
+        desktopNotifyAllMessages: false,
+        notificationContent: 'full',
+        doNotDisturb: false,
+        quietHoursEnabled: false,
+        quietHoursStart: '22:00',
+        quietHoursEnd: '08:00',
 
-      setEnabled: (enabled) => set({ enabled }),
-      setVolume: (volume) => set({ volume: clamp(volume) }),
-      setMessageSound: (enabled) => set({ messageSound: enabled }),
-      setMessageVolume: (volume) => set({ messageVolume: clamp(volume) }),
-      setMentionSound: (enabled) => set({ mentionSound: enabled }),
-      setMentionVolume: (volume) => set({ mentionVolume: clamp(volume) }),
-      setDmSound: (enabled) => set({ dmSound: enabled }),
-      setDmVolume: (volume) => set({ dmVolume: clamp(volume) }),
-      setFriendRequestSound: (enabled) => set({ friendRequestSound: enabled }),
-      setFriendRequestVolume: (volume) => set({ friendRequestVolume: clamp(volume) }),
-      setVoiceEventSounds: (enabled) => set({ voiceEventSounds: enabled }),
-      setVoiceEventVolume: (volume) => set({ voiceEventVolume: clamp(volume) }),
-      setSuppressWhenFocused: (suppress) => set({ suppressWhenFocused: suppress }),
-      setDesktopNotificationsEnabled: (enabled) => set({ desktopNotificationsEnabled: enabled }),
-      setDesktopNotifyDMs: (enabled) => set({ desktopNotifyDMs: enabled }),
-      setDesktopNotifyMentions: (enabled) => set({ desktopNotifyMentions: enabled }),
-      setDesktopNotifyAllMessages: (enabled) => set({ desktopNotifyAllMessages: enabled }),
-      setDoNotDisturb: (enabled) => set({ doNotDisturb: enabled }),
-      setQuietHoursEnabled: (enabled) => set({ quietHoursEnabled: enabled }),
-      setQuietHoursStart: (start) => set({ quietHoursStart: start }),
-      setQuietHoursEnd: (end) => set({ quietHoursEnd: end }),
-    }),
-    {
-      name: 'concord:notification-sounds',
-      partialize: (state) => ({
-        enabled: state.enabled,
-        volume: state.volume,
-        messageSound: state.messageSound,
-        messageVolume: state.messageVolume,
-        mentionSound: state.mentionSound,
-        mentionVolume: state.mentionVolume,
-        dmSound: state.dmSound,
-        dmVolume: state.dmVolume,
-        friendRequestSound: state.friendRequestSound,
-        friendRequestVolume: state.friendRequestVolume,
-        voiceEventSounds: state.voiceEventSounds,
-        voiceEventVolume: state.voiceEventVolume,
-        suppressWhenFocused: state.suppressWhenFocused,
-        desktopNotificationsEnabled: state.desktopNotificationsEnabled,
-        desktopNotifyDMs: state.desktopNotifyDMs,
-        desktopNotifyMentions: state.desktopNotifyMentions,
-        desktopNotifyAllMessages: state.desktopNotifyAllMessages,
-        doNotDisturb: state.doNotDisturb,
-        quietHoursEnabled: state.quietHoursEnabled,
-        quietHoursStart: state.quietHoursStart,
-        quietHoursEnd: state.quietHoursEnd,
+        setEnabled: (enabled) => set({ enabled }),
+        setVolume: (volume) => set({ volume: clamp(volume) }),
+        setMessageSound: (enabled) => set({ messageSound: enabled }),
+        setMessageVolume: (volume) => set({ messageVolume: clamp(volume) }),
+        setMentionSound: (enabled) => set({ mentionSound: enabled }),
+        setMentionVolume: (volume) => set({ mentionVolume: clamp(volume) }),
+        setDmSound: (enabled) => set({ dmSound: enabled }),
+        setDmVolume: (volume) => set({ dmVolume: clamp(volume) }),
+        setFriendRequestSound: (enabled) => set({ friendRequestSound: enabled }),
+        setFriendRequestVolume: (volume) => set({ friendRequestVolume: clamp(volume) }),
+        setVoiceEventSounds: (enabled) => set({ voiceEventSounds: enabled }),
+        setVoiceEventVolume: (volume) => set({ voiceEventVolume: clamp(volume) }),
+        setSuppressWhenFocused: (suppress) => set({ suppressWhenFocused: suppress }),
+        setDesktopNotificationsEnabled: (enabled) => set({ desktopNotificationsEnabled: enabled }),
+        setDesktopNotifyDMs: (enabled) => set({ desktopNotifyDMs: enabled }),
+        setDesktopNotifyMentions: (enabled) => set({ desktopNotifyMentions: enabled }),
+        setDesktopNotifyAllMessages: (enabled) => set({ desktopNotifyAllMessages: enabled }),
+        setNotificationContent: (value) => set({ notificationContent: value }),
+        setDoNotDisturb: (enabled) => set({ doNotDisturb: enabled }),
+        setQuietHoursEnabled: (enabled) => set({ quietHoursEnabled: enabled }),
+        setQuietHoursStart: (start) => set({ quietHoursStart: start }),
+        setQuietHoursEnd: (end) => set({ quietHoursEnd: end }),
       }),
-      merge: (persisted, current) => ({
-        ...current,
-        ...(persisted as Partial<NotificationSoundSettings>),
-      }),
-    }
+      {
+        name: 'concord:notification-sounds',
+        partialize: (state) => ({
+          enabled: state.enabled,
+          volume: state.volume,
+          messageSound: state.messageSound,
+          messageVolume: state.messageVolume,
+          mentionSound: state.mentionSound,
+          mentionVolume: state.mentionVolume,
+          dmSound: state.dmSound,
+          dmVolume: state.dmVolume,
+          friendRequestSound: state.friendRequestSound,
+          friendRequestVolume: state.friendRequestVolume,
+          voiceEventSounds: state.voiceEventSounds,
+          voiceEventVolume: state.voiceEventVolume,
+          suppressWhenFocused: state.suppressWhenFocused,
+          desktopNotificationsEnabled: state.desktopNotificationsEnabled,
+          desktopNotifyDMs: state.desktopNotifyDMs,
+          desktopNotifyMentions: state.desktopNotifyMentions,
+          desktopNotifyAllMessages: state.desktopNotifyAllMessages,
+          notificationContent: state.notificationContent,
+          doNotDisturb: state.doNotDisturb,
+          quietHoursEnabled: state.quietHoursEnabled,
+          quietHoursStart: state.quietHoursStart,
+          quietHoursEnd: state.quietHoursEnd,
+        }),
+        merge: (persisted, current) => {
+          const persistedState = persisted as Partial<NotificationSoundSettings> | undefined;
+          return {
+            ...current,
+            ...persistedState,
+            notificationContent: normalizePersistedNotificationContent(
+              persistedState?.notificationContent,
+              current.notificationContent
+            ),
+          };
+        },
+      }
+    )
   )
-));
+);

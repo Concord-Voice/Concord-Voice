@@ -3,6 +3,7 @@ import { useNotificationStore } from '../../../src/renderer/stores/notificationS
 
 describe('notificationStore', () => {
   beforeEach(() => {
+    localStorage.clear();
     // Reset store to defaults
     useNotificationStore.setState({
       enabled: true,
@@ -26,6 +27,7 @@ describe('notificationStore', () => {
       quietHoursEnabled: false,
       quietHoursStart: '22:00',
       quietHoursEnd: '08:00',
+      notificationContent: 'full',
     });
   });
 
@@ -96,6 +98,37 @@ describe('notificationStore', () => {
     expect(state.quietHoursEnabled).toBe(false);
     expect(state.quietHoursStart).toBe('22:00');
     expect(state.quietHoursEnd).toBe('08:00');
+    expect(state.notificationContent).toBe('full');
+  });
+
+  it('sets notificationContent', () => {
+    useNotificationStore.getState().setNotificationContent('sender_only');
+    expect(useNotificationStore.getState().notificationContent).toBe('sender_only');
+
+    useNotificationStore.getState().setNotificationContent('minimal');
+    expect(useNotificationStore.getState().notificationContent).toBe('minimal');
+  });
+
+  it('persists notificationContent', () => {
+    useNotificationStore.getState().setNotificationContent('minimal');
+
+    const stored = JSON.parse(localStorage.getItem('concord:notification-sounds') || '{}');
+    expect(stored.state.notificationContent).toBe('minimal');
+  });
+
+  it('fails closed for invalid persisted notificationContent values', async () => {
+    localStorage.setItem(
+      'concord:notification-sounds',
+      JSON.stringify({ state: { notificationContent: 'full_body_preview' }, version: 0 })
+    );
+
+    await (
+      useNotificationStore as typeof useNotificationStore & {
+        persist: { rehydrate: () => Promise<void> };
+      }
+    ).persist.rehydrate();
+
+    expect(useNotificationStore.getState().notificationContent).toBe('minimal');
   });
 
   it('toggles desktopNotificationsEnabled', () => {

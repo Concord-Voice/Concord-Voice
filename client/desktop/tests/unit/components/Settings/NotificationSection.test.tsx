@@ -21,6 +21,7 @@ const mockNotificationState = {
   desktopNotifyDMs: true,
   desktopNotifyMentions: true,
   desktopNotifyAllMessages: false,
+  notificationContent: 'full',
   doNotDisturb: false,
   quietHoursEnabled: false,
   quietHoursStart: '22:00',
@@ -42,6 +43,7 @@ const mockNotificationState = {
   setDesktopNotifyDMs: vi.fn(),
   setDesktopNotifyMentions: vi.fn(),
   setDesktopNotifyAllMessages: vi.fn(),
+  setNotificationContent: vi.fn(),
   setDoNotDisturb: vi.fn(),
   setQuietHoursEnabled: vi.fn(),
   setQuietHoursStart: vi.fn(),
@@ -115,6 +117,7 @@ describe('NotificationSection', () => {
       desktopNotifyDMs: true,
       desktopNotifyMentions: true,
       desktopNotifyAllMessages: false,
+      notificationContent: 'full',
       doNotDisturb: false,
       quietHoursEnabled: false,
       quietHoursStart: '22:00',
@@ -159,6 +162,35 @@ describe('NotificationSection', () => {
     expect(mockNotificationState.setDesktopNotificationsEnabled).toHaveBeenCalledWith(
       expect.any(Boolean)
     );
+  });
+
+  it('renders notification content radio options', () => {
+    render(<NotificationSection />);
+
+    expect(screen.getByRole('group', { name: 'Notification content' })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: 'Sender and message' })).toBeChecked();
+    expect(screen.getByRole('radio', { name: 'Sender only' })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: 'Hide all details' })).toBeInTheDocument();
+  });
+
+  it('updates notification content mode from radio options', () => {
+    const cases = [
+      { initial: 'minimal', label: 'Sender and message', value: 'full' },
+      { initial: 'full', label: 'Sender only', value: 'sender_only' },
+      { initial: 'full', label: 'Hide all details', value: 'minimal' },
+    ];
+
+    for (const { initial, label, value } of cases) {
+      mockNotificationState.notificationContent = initial;
+      mockNotificationState.setNotificationContent.mockClear();
+
+      const { unmount } = render(<NotificationSection />);
+
+      fireEvent.click(screen.getByRole('radio', { name: label }));
+      expect(mockNotificationState.setNotificationContent).toHaveBeenCalledWith(value);
+
+      unmount();
+    }
   });
 
   // ── Volume slider ────────────────────────────────────────────────
