@@ -82,8 +82,8 @@ const SubscriptionResetModal: React.FC<SubscriptionResetModalProps> = ({ open, o
       <div className="subscription-reset-modal">
         <h2 id="subscription-reset-modal-title">Some features are now part of Premium</h2>
         <p id="subscription-reset-modal-body">
-          Your custom theme and audio/video quality were reset to free defaults. You can unlock them
-          again any time with Premium.
+          Your audio/video quality was reset to free defaults. You can unlock it again any time with
+          Premium.
         </p>
         <div className="subscription-reset-modal__actions">
           <button

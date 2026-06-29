@@ -22,7 +22,7 @@ const PREMIUM_ENTITLEMENT: Entitlement = {
   maxManualBitrateBps: 30_000_000,
 };
 
-/** Put every store into an over-cap (premium) state. */
+/** Put stores into a custom-theme plus premium-only over-cap state. */
 function seedOverCapSettings(): void {
   useSettingsStore.getState().setColorScheme('custom');
   useVoiceStore.getState().setQualityTier('studio');
@@ -48,13 +48,13 @@ afterEach(() => {
 });
 
 describe('useLaunchReset — free user with over-cap settings', () => {
-  it('clamps every over-cap setting back through the real setters', () => {
+  it('clamps premium-only over-cap settings back through the real setters', () => {
     seedOverCapSettings();
     useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
 
     renderHook(() => useLaunchReset());
 
-    expect(useSettingsStore.getState().appearance.colorScheme).toBe('concord');
+    expect(useSettingsStore.getState().appearance.colorScheme).toBe('custom');
     expect(useVoiceStore.getState().qualityTier).toBe('standard');
     expect(useVideoSettingsStore.getState().cameraPreset).not.toBe('4K60');
     expect(useVideoSettingsStore.getState().screenShareBitrate).toBe(
@@ -114,8 +114,8 @@ describe('useLaunchReset — no-op paths', () => {
     const { result } = renderHook(() => useLaunchReset());
 
     expect(result.current.showResetModal).toBe(false);
-    // Clamp still runs — the modal is just suppressed.
-    expect(useSettingsStore.getState().appearance.colorScheme).toBe('concord');
+    // Premium-only clamps still run; the modal is just suppressed.
+    expect(useSettingsStore.getState().appearance.colorScheme).toBe('custom');
     expect(useAudioSettingsStore.getState().musicMode).toBe(false);
   });
 
@@ -182,6 +182,6 @@ describe('useLaunchReset — data-loss guard (Gitar review, #1301)', () => {
     act(() => useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT));
 
     expect(useVoiceStore.getState().qualityTier).toBe('standard');
-    expect(useSettingsStore.getState().appearance.colorScheme).toBe('concord');
+    expect(useSettingsStore.getState().appearance.colorScheme).toBe('custom');
   });
 });

@@ -24,9 +24,6 @@ export interface ClampableSettings {
   musicMode: boolean;
 }
 
-/** The default color scheme an over-cap custom scheme is reset to. */
-export const DEFAULT_COLOR_SCHEME: AppearanceSettings['colorScheme'] = 'concord';
-
 /** The highest free audio tier a premium tier is clamped down to. */
 const FREE_AUDIO_TIER_FLOOR: AudioQualityTier = 'standard';
 
@@ -74,7 +71,6 @@ function cameraPresetExceedsCaps(cameraPreset: string, entitlement: Entitlement)
  * reset explainer.
  *
  * Clamp targets:
- *  - custom color scheme            → default scheme
  *  - premium audio tier             → 'standard'
  *  - camera preset over video caps  → highest free preset (height/fps/pixelRate)
  *  - manual screen-share bitrate    → entitlement.maxManualBitrateBps (0 = auto, never clamped)
@@ -90,13 +86,7 @@ export function clampToFreeTier(
   const next: ClampableSettings = { ...settings };
   let changed = false;
 
-  // 1. Custom color scheme → default (gated by allowCustomScheme).
-  if (settings.colorScheme === 'custom' && !entitlement.allowCustomScheme) {
-    next.colorScheme = DEFAULT_COLOR_SCHEME;
-    changed = true;
-  }
-
-  // 2. Premium audio tier → 'standard'. A tier the entitlement no longer allows
+  // 1. Premium audio tier -> 'standard'. A tier the entitlement no longer allows
   //    is clamped to the highest free tier (Standard).
   if (
     AUDIO_QUALITY_TIERS[settings.qualityTier]?.premium &&
@@ -106,13 +96,13 @@ export function clampToFreeTier(
     changed = true;
   }
 
-  // 3. Camera preset over the free video ceiling → highest free preset.
+  // 2. Camera preset over the free video ceiling -> highest free preset.
   if (cameraPresetExceedsCaps(settings.cameraPreset, entitlement)) {
     next.cameraPreset = highestFreeCameraPreset(entitlement);
     changed = true;
   }
 
-  // 4. Manual screen-share bitrate over the free cap → cap. 0 (= auto) is never
+  // 3. Manual screen-share bitrate over the free cap -> cap. 0 (= auto) is never
   //    a manual value, so it is left untouched.
   if (
     settings.screenShareBitrate > 0 &&
@@ -122,7 +112,7 @@ export function clampToFreeTier(
     changed = true;
   }
 
-  // 5. Music mode → off (gated by allowMusicMode).
+  // 4. Music mode -> off (gated by allowMusicMode).
   if (settings.musicMode && !entitlement.allowMusicMode) {
     next.musicMode = false;
     changed = true;

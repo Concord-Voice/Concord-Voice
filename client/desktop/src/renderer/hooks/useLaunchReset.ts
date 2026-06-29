@@ -39,7 +39,7 @@ export function useLaunchReset(): { showResetModal: boolean; acknowledge: () => 
     // hydrate falls closed to free with `degraded === true`. Acting on either
     // would run the destructive free-tier clamp against a premium user whose
     // real entitlement simply has not arrived yet — silently and persistently
-    // wiping their custom theme / audio / video settings. So do NOT set `ranRef`
+    // wiping their premium-only audio / video settings. So do NOT set `ranRef`
     // and do NOT clamp until `hydrated && !degraded`; the effect re-runs as
     // these flip and acts exactly once when the truth is known.
     if (!hydrated || degraded) return;

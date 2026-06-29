@@ -1,9 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  clampToFreeTier,
-  DEFAULT_COLOR_SCHEME,
-  type ClampableSettings,
-} from '@/renderer/utils/clampToFreeTier';
+import { clampToFreeTier, type ClampableSettings } from '@/renderer/utils/clampToFreeTier';
 import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/subscriptionStore';
 
 /** A premium entitlement that allows everything the free floor blocks. */
@@ -41,7 +37,7 @@ describe('clampToFreeTier — free user clamps', () => {
   it('clamps every over-cap field and reports changed', () => {
     const { settings, changed } = clampToFreeTier(OVER_CAP_SETTINGS, FREE_ENTITLEMENT);
     expect(changed).toBe(true);
-    expect(settings.colorScheme).toBe(DEFAULT_COLOR_SCHEME);
+    expect(settings.colorScheme).toBe('custom');
     expect(settings.qualityTier).toBe('standard');
     expect(settings.musicMode).toBe(false);
     // 16 Mbps → 5 Mbps free cap
@@ -50,13 +46,13 @@ describe('clampToFreeTier — free user clamps', () => {
     expect(settings.cameraPreset).not.toBe('4K60');
   });
 
-  it('clamps a custom scheme to the default', () => {
+  it('leaves a custom scheme untouched for free users', () => {
     const { settings, changed } = clampToFreeTier(
       { ...FREE_SETTINGS, colorScheme: 'custom' },
       FREE_ENTITLEMENT
     );
-    expect(changed).toBe(true);
-    expect(settings.colorScheme).toBe(DEFAULT_COLOR_SCHEME);
+    expect(changed).toBe(false);
+    expect(settings.colorScheme).toBe('custom');
   });
 
   it('clamps a premium audio tier (studio) to standard', () => {

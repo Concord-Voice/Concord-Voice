@@ -3,7 +3,6 @@ import { useSettingsStore } from '@/renderer/stores/settingsStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
-import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/subscriptionStore';
 import { mockUser } from '../../../mocks/fixtures';
 
 // Mock apiFetch for session fetching
@@ -31,13 +30,6 @@ describe('SettingsPage', () => {
     vi.clearAllMocks();
     useAuthStore.getState().setAccessToken('mock-token');
     useUserStore.setState({ user: mockUser });
-    // Grant the custom-scheme entitlement (#1301 L4) so these Appearance tests
-    // exercise the custom-circle's native picker behaviour rather than the
-    // premium lock (which intercepts the click under the FREE floor). The lock
-    // behaviour itself is covered in AppearanceSection.premium.test.tsx.
-    useSubscriptionStore
-      .getState()
-      .setEntitlement({ ...FREE_ENTITLEMENT, allowCustomScheme: true });
     useSettingsStore.setState({
       appearance: {
         theme: 'dark',

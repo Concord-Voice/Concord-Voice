@@ -2,12 +2,10 @@ import React from 'react';
 import type { AppearanceSettings, CustomColors } from '../../stores/settingsStore';
 import { useDraftAppearance, setDraftAppearanceSetting } from '../../hooks/useDraftSettings';
 import { useLayoutStore } from '../../stores/layoutStore';
-import { useEntitlement } from '../../hooks/useEntitlement';
 import { isValidHex } from '../../utils/colorUtils';
 import CollapsibleSection from './CollapsibleSection';
 import { ClientBehaviorSection } from './ClientBehaviorSection';
 import ToggleSwitch from './ToggleSwitch';
-import PremiumGate from '../common/PremiumGate';
 import SettingsPreviewPanel from './SettingsPreviewPanel';
 import FontSection from './FontSection';
 
@@ -123,10 +121,6 @@ export const LayoutSection: React.FC = () => {
 
 const AppearanceSection: React.FC = () => {
   const appearance = useDraftAppearance();
-  // L4 (#1301): the custom color scheme add-circle is a binary premium lock. The
-  // PremiumGate keeps the button focusable + aria-disabled (O1); a locked click
-  // routes to Subscription instead of opening the custom-colour picker.
-  const allowCustomScheme = useEntitlement((e) => e.allowCustomScheme);
 
   return (
     <>
@@ -149,50 +143,42 @@ const AppearanceSection: React.FC = () => {
               title={cs.label}
             />
           ))}
-          {/* Custom theme circle — L4 premium lock (#1301). */}
-          <PremiumGate
-            mode="dim"
-            entitled={allowCustomScheme}
-            feature="customScheme"
-            onActivateSection="custom-scheme"
-          >
-            <button
-              className={`color-scheme-circle custom-add ${appearance.colorScheme === 'custom' ? 'selected' : ''}`}
-              style={
-                appearance.customColors
-                  ? {
-                      background: `linear-gradient(135deg, ${appearance.customColors.background}, ${appearance.customColors.accentPrimary}, ${appearance.customColors.accentSecondary})`,
-                    }
-                  : undefined
+          <button
+            className={`color-scheme-circle custom-add ${appearance.colorScheme === 'custom' ? 'selected' : ''}`}
+            style={
+              appearance.customColors
+                ? {
+                    background: `linear-gradient(135deg, ${appearance.customColors.background}, ${appearance.customColors.accentPrimary}, ${appearance.customColors.accentSecondary})`,
+                  }
+                : undefined
+            }
+            onClick={() => {
+              if (appearance.customColors) {
+                setDraftAppearanceSetting('customColors', appearance.customColors);
+                setDraftAppearanceSetting('colorScheme', 'custom');
+              } else {
+                const defaults: CustomColors = {
+                  background: '#0d0821',
+                  accentPrimary: '#fa709a',
+                  accentSecondary: '#ffe13f',
+                };
+                setDraftAppearanceSetting('customColors', defaults);
+                setDraftAppearanceSetting('colorScheme', 'custom');
               }
-              onClick={() => {
-                if (appearance.customColors) {
-                  setDraftAppearanceSetting('customColors', appearance.customColors);
-                  setDraftAppearanceSetting('colorScheme', 'custom');
-                } else {
-                  const defaults: CustomColors = {
-                    background: '#0d0821',
-                    accentPrimary: '#fa709a',
-                    accentSecondary: '#ffe13f',
-                  };
-                  setDraftAppearanceSetting('customColors', defaults);
-                  setDraftAppearanceSetting('colorScheme', 'custom');
-                }
-              }}
-              title="Custom"
-            >
-              {!appearance.customColors && (
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                  <path
-                    d="M8 2v12M2 8h12"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                  />
-                </svg>
-              )}
-            </button>
-          </PremiumGate>
+            }}
+            title="Custom"
+          >
+            {!appearance.customColors && (
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path
+                  d="M8 2v12M2 8h12"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                />
+              </svg>
+            )}
+          </button>
         </div>
 
         {/* Custom theme color picker panel */}
