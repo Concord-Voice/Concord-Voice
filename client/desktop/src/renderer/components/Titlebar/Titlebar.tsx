@@ -1,18 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import './Titlebar.css';
+import { SPA_VERSION } from '../../config';
+import { compactSpaHash, formatClientVersion } from '../../utils/clientVersion';
 
-// Compose the version text from two independent state slices. Returns empty
-// string for both `null` (loading state) AND empty-string (degenerate upstream
-// case where `app.getVersion()` returned ''). The truthiness gate at the
-// rendering site (`{versionText && <span>...}`) then suppresses the version
-// span entirely — no broken `'v'` or `'v-<hash>'` content ever reaches the DOM.
-// Defense-in-depth note: the strict-null check that previously lived here
-// (Gitar #1153 finding) would let `formatVersionText('', null)` return `'v'`,
-// the exact broken state this PR aims to prevent. Truthiness check forecloses it.
-function formatVersionText(appVersion: string | null, spaHash: string | null): string {
-  if (!appVersion) return '';
-  if (spaHash) return `v${appVersion}-${spaHash}`;
-  return `v${appVersion}`;
+const RENDERER_SPA_VERSION = compactSpaHash(SPA_VERSION) ? SPA_VERSION : null;
+
+function selectDisplaySpaHash(ipcSpaHash: string | null): string | null {
+  return RENDERER_SPA_VERSION ?? ipcSpaHash;
 }
 
 export const Titlebar: React.FC = () => {
@@ -21,7 +15,7 @@ export const Titlebar: React.FC = () => {
   // fired before get() resolved, briefly rendering 'v' or 'v-<hash>'. The
   // two slices update independently and the formatter gates on appVersion.
   const [appVersion, setAppVersion] = useState<string | null>(null);
-  const [spaHash, setSpaHash] = useState<string | null>(null);
+  const [spaHash, setSpaHash] = useState<string | null>(RENDERER_SPA_VERSION);
   const platform =
     typeof navigator === 'undefined'
       ? ''
@@ -47,7 +41,7 @@ export const Titlebar: React.FC = () => {
         const v = await versionApi.get();
         if (mounted) {
           setAppVersion(v.appVersion);
-          setSpaHash(v.spaHash);
+          setSpaHash(selectDisplaySpaHash(v.spaHash));
         }
       } catch (err) {
         console.error('[Titlebar] failed to fetch version:', (err as Error).message);
@@ -58,7 +52,7 @@ export const Titlebar: React.FC = () => {
     // appVersion stays null and formatVersionText returns ''; no broken
     // 'v' or 'v-<hash>' state is ever rendered.
     const unsubscribe = versionApi.onChange((data) => {
-      setSpaHash(data.spaHash);
+      setSpaHash(selectDisplaySpaHash(data.spaHash));
     });
 
     return () => {
@@ -67,7 +61,7 @@ export const Titlebar: React.FC = () => {
     };
   }, []);
 
-  const versionText = formatVersionText(appVersion, spaHash);
+  const versionText = formatClientVersion(appVersion, spaHash);
 
   return (
     <div className={`titlebar ${isMac ? 'titlebar--mac' : ''}`}>

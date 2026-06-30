@@ -1,12 +1,37 @@
 /// <reference types="vitest" />
-import { defineConfig } from 'vite';
+import fs from 'node:fs';
+import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 import { cspProdStripPlugin } from './scripts/csp-prod-strip';
 
+const legalDocumentModules = new Map([
+  ['virtual:concord-legal/license', path.resolve(__dirname, '../../LICENSE')],
+  ['virtual:concord-legal/notice', path.resolve(__dirname, '../../NOTICE.md')],
+  ['virtual:concord-legal/privacy-policy', path.resolve(__dirname, '../../docs/privacy-policy.md')],
+  [
+    'virtual:concord-legal/terms-of-service',
+    path.resolve(__dirname, '../../docs/legal/terms-of-service.md'),
+  ],
+]);
+
+function legalDocumentPlugin(): Plugin {
+  return {
+    name: 'concord-legal-documents',
+    resolveId(id) {
+      return legalDocumentModules.has(id) ? id : null;
+    },
+    load(id) {
+      const filePath = legalDocumentModules.get(id);
+      if (!filePath) return null;
+      return `export default ${JSON.stringify(fs.readFileSync(filePath, 'utf8'))};`;
+    },
+  };
+}
+
 export default defineConfig(() => {
   return {
-    plugins: [react(), cspProdStripPlugin()],
+    plugins: [react(), legalDocumentPlugin(), cspProdStripPlugin()],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, './src'),

@@ -1,5 +1,5 @@
 import { app, ipcMain, type BrowserWindow } from 'electron';
-import { getRemoteSpaUrl, onSpaStateChange } from '../spaState';
+import { getRemoteSpaUrl, getSpaHash, getSpaVersion, onSpaStateChange } from '../spaState';
 
 // Path-anchored so a URL like `https://evil.com/proxy/spa/abc/` doesn't
 // extract a hash; only top-level `/spa/<hash>` is valid per the SPA-deploy
@@ -23,12 +23,17 @@ export interface VersionString {
   spaHash: string | null;
 }
 
+export function getCurrentSpaDisplayHash(url: string | null): string | null {
+  if (!url) return null;
+  return getSpaVersion() || extractSpaHash(url) || getSpaHash() || null;
+}
+
 export function registerVersionInfoIpc(getWindow: () => BrowserWindow | null): void {
   ipcMain.handle(
     'window:getVersionString',
     (): VersionString => ({
       appVersion: app.getVersion(),
-      spaHash: extractSpaHash(getRemoteSpaUrl()),
+      spaHash: getCurrentSpaDisplayHash(getRemoteSpaUrl()),
     })
   );
 
@@ -36,7 +41,7 @@ export function registerVersionInfoIpc(getWindow: () => BrowserWindow | null): v
     const win = getWindow();
     if (!win || win.isDestroyed()) return;
     win.webContents.send('spa:versionChanged', {
-      spaHash: extractSpaHash(url),
+      spaHash: getCurrentSpaDisplayHash(url),
     });
   });
 }

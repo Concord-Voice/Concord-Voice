@@ -97,13 +97,66 @@
 /* ─── Legal ────────────────────────────────────────────────────────── */
 
 .about-legal {
-  margin-top: 12px;
-  padding-top: 8px;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-primary);
 }
 
-.about-legal-text {
-  font-size: calc(12px * var(--font-scale, 1));
+.about-legal-title {
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.about-legal-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.about-legal-document {
+  border: 1px solid var(--border-primary);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+
+.about-legal-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+}
+
+.about-legal-source {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text-tertiary);
+  font-family: 'SFMono-Regular', 'Consolas', 'Liberation Mono', monospace;
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 400;
+}
+
+.about-legal-content {
+  max-height: 260px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  border-top: 1px solid var(--border-primary);
+  color: var(--text-secondary);
+  font-family: 'SFMono-Regular', 'Consolas', 'Liberation Mono', monospace;
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.45;
+  white-space: pre-wrap;
 }
 
 /* ─── Update settings ──────────────────────────────────────────────── */

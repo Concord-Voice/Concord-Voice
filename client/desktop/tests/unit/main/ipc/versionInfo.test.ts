@@ -7,11 +7,13 @@ vi.mock('electron', () => ({
 
 vi.mock('@/main/spaState', () => ({
   getRemoteSpaUrl: vi.fn(() => 'https://example.com/spa/abc123/index.html'),
+  getSpaHash: vi.fn(() => ''),
+  getSpaVersion: vi.fn(() => ''),
   onSpaStateChange: vi.fn(() => () => {}),
 }));
 
 import { ipcMain } from 'electron';
-import { onSpaStateChange } from '@/main/spaState';
+import { getRemoteSpaUrl, getSpaHash, getSpaVersion, onSpaStateChange } from '@/main/spaState';
 import { registerVersionInfoIpc, extractSpaHash } from '@/main/ipc/versionInfo';
 
 describe('extractSpaHash', () => {
@@ -43,6 +45,9 @@ describe('extractSpaHash', () => {
 describe('registerVersionInfoIpc', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getRemoteSpaUrl).mockReturnValue('https://example.com/spa/abc123/index.html');
+    vi.mocked(getSpaHash).mockReturnValue('');
+    vi.mocked(getSpaVersion).mockReturnValue('');
   });
 
   it('registers the window:getVersionString handler', () => {
@@ -59,6 +64,43 @@ describe('registerVersionInfoIpc', () => {
     );
     const handler = handlerCall![1];
     expect(handler()).toEqual({ appVersion: '0.1.40', spaHash: 'abc123' });
+  });
+
+  it('handler uses captured SPA version before legacy URL parsing', () => {
+    vi.mocked(getSpaVersion).mockReturnValue('feedbee');
+    const mockWindow = { webContents: { send: vi.fn() }, isDestroyed: () => false };
+    registerVersionInfoIpc(() => mockWindow as never);
+    const handlerCall = (ipcMain.handle as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c) => c[0] === 'window:getVersionString'
+    );
+    const handler = handlerCall![1];
+    expect(handler()).toEqual({ appVersion: '0.1.40', spaHash: 'feedbee' });
+  });
+
+  it('handler falls back to captured HTML hash for flat remote SPA URLs', () => {
+    const htmlHash = `sha256:${'b'.repeat(64)}`;
+    vi.mocked(getRemoteSpaUrl).mockReturnValue('https://spa.concordvoice.chat/index.html');
+    vi.mocked(getSpaHash).mockReturnValue(htmlHash);
+    const mockWindow = { webContents: { send: vi.fn() }, isDestroyed: () => false };
+    registerVersionInfoIpc(() => mockWindow as never);
+    const handlerCall = (ipcMain.handle as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c) => c[0] === 'window:getVersionString'
+    );
+    const handler = handlerCall![1];
+    expect(handler()).toEqual({ appVersion: '0.1.40', spaHash: htmlHash });
+  });
+
+  it('handler does not report a captured hash after remote SPA state is cleared', () => {
+    const htmlHash = `sha256:${'b'.repeat(64)}`;
+    vi.mocked(getRemoteSpaUrl).mockReturnValue(null);
+    vi.mocked(getSpaHash).mockReturnValue(htmlHash);
+    const mockWindow = { webContents: { send: vi.fn() }, isDestroyed: () => false };
+    registerVersionInfoIpc(() => mockWindow as never);
+    const handlerCall = (ipcMain.handle as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c) => c[0] === 'window:getVersionString'
+    );
+    const handler = handlerCall![1];
+    expect(handler()).toEqual({ appVersion: '0.1.40', spaHash: null });
   });
 
   it('subscribes to spa state changes', () => {

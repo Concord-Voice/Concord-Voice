@@ -4,6 +4,7 @@ import { Titlebar } from '@/renderer/components/Titlebar/Titlebar';
 
 const mockGet = vi.fn();
 const mockOnChange = vi.fn();
+const FULL_HASH = 'a'.repeat(40);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -41,6 +42,16 @@ describe('Titlebar', () => {
     });
   });
 
+  it('shortens a full SPA hash from version.get()', async () => {
+    mockGet.mockResolvedValue({ appVersion: '0.1.40', spaHash: FULL_HASH });
+    mockOnChange.mockReturnValue(() => {});
+    render(<Titlebar />);
+    await waitFor(() => {
+      expect(screen.getByText('v0.1.40-aaaaaaa')).toBeInTheDocument();
+    });
+    expect(screen.queryByText(`v0.1.40-${FULL_HASH}`)).toBeNull();
+  });
+
   it('subscribes to version changes and updates on receipt', async () => {
     let changeListener: ((data: { spaHash: string | null }) => void) | undefined;
     mockGet.mockResolvedValue({ appVersion: '0.1.40', spaHash: 'abc123' });
@@ -55,6 +66,23 @@ describe('Titlebar', () => {
     changeListener!({ spaHash: 'def456' });
     await waitFor(() => {
       expect(screen.getByText(/v0\.1\.40-def456/)).toBeInTheDocument();
+    });
+  });
+
+  it('shortens a full SPA hash received from version.onChange()', async () => {
+    let changeListener: ((data: { spaHash: string | null }) => void) | undefined;
+    mockGet.mockResolvedValue({ appVersion: '0.1.40', spaHash: 'abc123' });
+    mockOnChange.mockImplementation((cb) => {
+      changeListener = cb;
+      return () => {};
+    });
+    render(<Titlebar />);
+    await waitFor(() => {
+      expect(screen.getByText(/v0\.1\.40-abc123/)).toBeInTheDocument();
+    });
+    changeListener!({ spaHash: FULL_HASH });
+    await waitFor(() => {
+      expect(screen.getByText('v0.1.40-aaaaaaa')).toBeInTheDocument();
     });
   });
 

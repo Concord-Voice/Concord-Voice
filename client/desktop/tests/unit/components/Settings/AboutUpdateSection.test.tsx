@@ -1,6 +1,10 @@
 import { render, screen, fireEvent, userEvent } from '../../../test-utils';
 import { vi } from 'vitest';
 
+vi.mock('@/renderer/config', () => ({
+  SPA_VERSION: 'a'.repeat(40),
+}));
+
 const eventCallbacks: Record<string, (...args: unknown[]) => void> = {};
 
 const mockCheckForUpdates = vi.fn().mockResolvedValue(undefined);
@@ -89,9 +93,40 @@ describe('AboutUpdateSection', () => {
     render(<AboutUpdateSection />);
     expect(screen.getByText('App Version')).toBeInTheDocument();
   });
-  it('renders license text', () => {
+  it('renders legal document entries for all canonical source documents', () => {
     render(<AboutUpdateSection />);
-    expect(screen.getByText(/CVSL 1.0 License/)).toBeInTheDocument();
+    expect(screen.getAllByText('LICENSE').length).toBeGreaterThan(0);
+    expect(screen.getByText('Privacy Policy')).toBeInTheDocument();
+    expect(screen.getByText('Terms of Service')).toBeInTheDocument();
+    expect(screen.getAllByText('NOTICE.md').length).toBeGreaterThan(0);
+  });
+
+  it('opens Privacy Policy content with the source draft marker preserved', () => {
+    render(<AboutUpdateSection />);
+    const summary = screen.getByText('Privacy Policy');
+    const details = summary.closest('details') as HTMLDetailsElement;
+    fireEvent.click(summary);
+    expect(details.open).toBe(true);
+    expect(details.querySelector('.about-legal-content')?.textContent).toContain(
+      'TO BE SET ON PUBLICATION — currently 2026-05-30 in draft'
+    );
+  });
+
+  it('opens Terms of Service content with the source draft marker preserved', () => {
+    render(<AboutUpdateSection />);
+    const summary = screen.getByText('Terms of Service');
+    const details = summary.closest('details') as HTMLDetailsElement;
+    fireEvent.click(summary);
+    expect(details.open).toBe(true);
+    expect(details.querySelector('.about-legal-content')?.textContent).toContain(
+      'Last Updated:** _[TO BE SET ON PUBLICATION]_'
+    );
+  });
+
+  it('shortens full SPA build hashes in Client Info', () => {
+    render(<AboutUpdateSection />);
+    expect(screen.getByText('aaaaaaa')).toBeInTheDocument();
+    expect(screen.queryByText('a'.repeat(40))).toBeNull();
   });
 
   it('renders app version after loading', async () => {

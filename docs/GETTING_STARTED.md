@@ -233,7 +233,7 @@ docker exec -it concord-redis redis-cli ping
 - Server invites, session management, unread tracking
 - Browser-inspired UI layout (server bar, folder bar, channel panel)
 - Custom context menus, ~41 Zustand stores (see `[internal]` for current count)
-- 509 frontend test files, 213 backend test files (see `[internal]` for current count)
+- Frontend and backend test coverage tracked in `[internal]` Key Counts
 
 ### ✅ Phase 1C Complete (Voice & Media)
 
@@ -448,7 +448,7 @@ You're ready to start building! Here are the immediate priorities:
 - [x] Presence system (online/offline, typing)
 - [x] Server invites, unread tracking, session management
 - [x] Browser-inspired UI layout with ~41 Zustand stores (see `[internal]`)
-- [x] 509 frontend test files, 213 backend test files (see `[internal]`)
+- [x] Frontend and backend test coverage tracked in `[internal]` Key Counts
 
 **Phase 1C: Voice & Media** ✅ COMPLETE
 

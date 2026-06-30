@@ -2,6 +2,8 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import CollapsibleSection from './CollapsibleSection';
 import ToggleSwitch from './ToggleSwitch';
 import { SPA_VERSION } from '../../config';
+import { LEGAL_DOCUMENTS } from '../../legalDocuments';
+import { compactSpaHash } from '../../utils/clientVersion';
 import './AboutUpdateSection.css';
 
 type UpdateStatus =
@@ -232,7 +234,7 @@ const AboutUpdateSection: React.FC = () => {
           </div>
           <div className="about-info-row">
             <span className="about-info-label">SPA Build</span>
-            <span className="about-info-value">{SPA_VERSION}</span>
+            <span className="about-info-value">{compactSpaHash(SPA_VERSION) ?? SPA_VERSION}</span>
           </div>
           <div className="about-info-row">
             <span className="about-info-label">Interface</span>
@@ -318,7 +320,18 @@ const AboutUpdateSection: React.FC = () => {
         </div>
 
         <div className="about-legal">
-          <span className="about-legal-text">CVSL 1.0 License &middot; Concord Voice</span>
+          <div className="about-legal-title">Legal and attribution</div>
+          <div className="about-legal-list">
+            {LEGAL_DOCUMENTS.map((doc) => (
+              <details className="about-legal-document" key={doc.sourcePath}>
+                <summary className="about-legal-summary">
+                  <span>{doc.label}</span>
+                  <span className="about-legal-source">{doc.sourcePath}</span>
+                </summary>
+                <pre className="about-legal-content">{doc.content}</pre>
+              </details>
+            ))}
+          </div>
         </div>
       </CollapsibleSection>
 
