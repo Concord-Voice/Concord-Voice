@@ -21,6 +21,11 @@ func NewHTTPHandler(db *sql.DB, redisClient *redis.Client, log *logger.Logger) *
 	return &HTTPHandler{cache: NewCache(redisClient, db), log: log}
 }
 
+// NewHTTPHandlerForInstance builds the handler with the deployment-mode seam.
+func NewHTTPHandlerForInstance(db *sql.DB, redisClient *redis.Client, log *logger.Logger, instanceType string) *HTTPHandler {
+	return &HTTPHandler{cache: NewCacheForInstance(redisClient, db, instanceType), log: log}
+}
+
 // Get returns the acting user's entitlement capability set as JSON. The tier
 // read fails closed to free on any cache/DB error (Cache.GetTier never errors),
 // so this endpoint always returns 200 with a valid set — never a 500 that would

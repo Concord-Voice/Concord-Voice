@@ -65,3 +65,15 @@ func TestGet_PremiumSubscription_ReturnsPremiumSet(t *testing.T) {
 	assert.Equal(t, "premium", dto.Tier)
 	assert.True(t, dto.AllowMusicMode)
 }
+
+func TestGet_SelfHostedNoSubscription_ReturnsPremiumSet(t *testing.T) {
+	h := entitlements.NewHTTPHandlerForInstance(nil, nil, logger.New("test"), "self-hosted")
+
+	w := doGet(t, h, "user-1")
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var dto entitlements.EntitlementDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &dto))
+	assert.Equal(t, entitlements.TierPremium, dto.Tier)
+	assert.True(t, dto.AllowMusicMode)
+}

@@ -6,19 +6,16 @@ package servercapabilities
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
 )
 
 const (
-	instanceTypeSaaS       = "saas"
-	instanceTypeSelfHosted = "self-hosted"
-	entitlementSelfHosted  = "self-hosted-unlocked"
-	defaultServerVersion   = "dev"
-	policyVersion          = "2026-06-01"
-	maxMembersPerServer    = 500
+	entitlementSelfHosted = "self-hosted-unlocked"
+	defaultServerVersion  = "dev"
+	policyVersion         = "2026-06-01"
+	maxMembersPerServer   = 500
 )
 
 // Handler serves GET /api/v1/server/capabilities.
@@ -67,21 +64,9 @@ type Response struct {
 	PolicyVersion string       `json:"policyVersion"`
 }
 
-// normalizeInstanceType fail-safes unknown/empty values to "saas" so a
-// misconfigured INSTANCE_TYPE can never accidentally unlock self-hosted mode.
-// Whitespace- and case-tolerant so an operator's " Self-Hosted" typo unlocks
-// as intended rather than silently degrading them to SaaS; any genuinely
-// unrecognized value still falls through to the SaaS fail-safe.
-func normalizeInstanceType(raw string) string {
-	if strings.ToLower(strings.TrimSpace(raw)) == instanceTypeSelfHosted {
-		return instanceTypeSelfHosted
-	}
-	return instanceTypeSaaS
-}
-
 // GetCapabilities returns the capability descriptor. Public — no auth.
 func (h *Handler) GetCapabilities(c *gin.Context) {
-	instanceType := normalizeInstanceType(h.cfg.InstanceType)
+	instanceType := config.NormalizeInstanceType(h.cfg.InstanceType)
 
 	mfaMethods := []string{"totp"}
 	if h.cfg.WebAuthnRPID != "" {
@@ -96,8 +81,8 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 		oauthProviders = append(oauthProviders, "apple")
 	}
 
-	entitlementMode := instanceTypeSaaS
-	if instanceType == instanceTypeSelfHosted {
+	entitlementMode := config.InstanceTypeSaaS
+	if instanceType == config.InstanceTypeSelfHosted {
 		entitlementMode = entitlementSelfHosted
 	}
 
@@ -129,7 +114,7 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			SAMLEnabled:               false,
 		},
 		Features: FeaturesInfo{
-			VoiceTiersSupported:    instanceType == instanceTypeSaaS,
+			VoiceTiersSupported:    instanceType == config.InstanceTypeSaaS,
 			E2EEEnforcedEverywhere: true,
 			MaxMembersPerServer:    maxMembersPerServer,
 			EntitlementMode:        entitlementMode,

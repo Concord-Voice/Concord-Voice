@@ -196,14 +196,14 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	emailSvc := email.NewService(cfg, log)
 
 	// Initialize handlers
-	authHandler := auth.NewHandler(db, redis, log, cfg.JWTSecret, hub)
+	authHandler := auth.NewHandlerForInstance(db, redis, log, cfg.JWTSecret, hub, cfg.InstanceType)
 	authHandler.SetEmailService(emailSvc)
 	// Wire cross-references (breaks circular init dependency)
 	authHandler.SetMFAChecker(mfaHandler)
 	mfaHandler.SetLoginCompleter(authHandler)
 	mfaHandler.SetEmailService(emailSvc)
-	entCache := entitlements.NewCache(redis, db)
-	serverEntCache := entitlements.NewServerCache(redis, db)
+	entCache := entitlements.NewCacheForInstance(redis, db, cfg.InstanceType)
+	serverEntCache := entitlements.NewServerCacheForInstance(redis, db, cfg.InstanceType)
 	sessionsHandler := sessions.NewHandler(db, redis, log, hub, mfaHandler)
 	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache)
 	serversHandler := servers.NewHandler(db, log, hub, rbacResolver, serverEntCache)
@@ -268,7 +268,7 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 
 	// Entitlement capability set handler (#1297). Owns its own read-through Cache
 	// (NOT borrowed from auth.Handler — internal/auth is a protected path).
-	entitlementsHandler := entitlements.NewHTTPHandler(db, redis, log)
+	entitlementsHandler := entitlements.NewHTTPHandlerForInstance(db, redis, log, cfg.InstanceType)
 
 	// Redemption engine + issuer (#1303). The first LIVE caller of the
 	// entitlements.OnTierChange convergence point: a premium code grant

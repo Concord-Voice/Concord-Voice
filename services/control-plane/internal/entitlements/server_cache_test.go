@@ -26,6 +26,12 @@ func TestServerCache_GetServerTier_MissReadsThroughGroundspeed(t *testing.T) {
 	assert.True(t, ttl > 0 && ttl <= 5*time.Minute, "populated key carries the 5-min TTL")
 }
 
+func TestServerCache_GetServerTier_SelfHostedReturnsMachWithoutDBOrRedis(t *testing.T) {
+	cache := entitlements.NewServerCacheForInstance(nil, nil, " self-hosted ")
+
+	assert.Equal(t, entitlements.TierMach, cache.GetServerTier(context.Background(), uuid.New().String()))
+}
+
 // A cache hit is honored verbatim — GetServerTier must not re-resolve when a
 // value is already cached (this is how a future Mach value survives the TTL).
 func TestServerCache_HitHonorsCachedValue(t *testing.T) {

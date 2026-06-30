@@ -31,6 +31,23 @@ func TestGetServerEntitlements_MemberGetsGroundspeed(t *testing.T) {
 	assert.Equal(t, false, ent["UnlockServerVideoQualityCaps"])
 }
 
+func TestGetServerEntitlements_SelfHostedMemberGetsMach(t *testing.T) {
+	t.Setenv("INSTANCE_TYPE", "self-hosted")
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "serventselfhost")
+	serverID := ts.CreateTestServer(t, owner.ID, "Self Hosted Entitlement Server")
+
+	w := ts.DoRequest("GET", "/api/v1/servers/"+serverID+"/entitlements", nil,
+		testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	ent := body["entitlement"].(map[string]interface{})
+	assert.Equal(t, "mach", ent["Tier"])
+	assert.Equal(t, true, ent["UnlockServerAudioQualityCaps"])
+}
+
 // A non-member is forbidden — the endpoint mirrors GetServer's membership gate.
 func TestGetServerEntitlements_NonMemberForbidden(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)

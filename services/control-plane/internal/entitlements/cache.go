@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -17,14 +18,21 @@ const cacheTTL = 5 * time.Minute
 // per user (ent:{userID}) so Invalidate needs no SCAN. GetTier never errors —
 // every failure path fails closed to TierFree (least privilege).
 type Cache struct {
-	redis *redis.Client
-	db    *sql.DB
-	ttl   time.Duration
+	redis        *redis.Client
+	db           *sql.DB
+	ttl          time.Duration
+	instanceType string
 }
 
 // NewCache builds the cache from the existing Redis + DB handles.
 func NewCache(redisClient *redis.Client, db *sql.DB) *Cache {
-	return &Cache{redis: redisClient, db: db, ttl: cacheTTL}
+	return NewCacheForInstance(redisClient, db, config.InstanceTypeSaaS)
+}
+
+// NewCacheForInstance builds the cache with the deployment-mode seam. In
+// self-hosted mode, all users resolve to the maximal current entitlement tier.
+func NewCacheForInstance(redisClient *redis.Client, db *sql.DB, instanceType string) *Cache {
+	return &Cache{redis: redisClient, db: db, ttl: cacheTTL, instanceType: instanceType}
 }
 
 func (c *Cache) key(userID string) string { return "ent:" + userID }
@@ -33,6 +41,10 @@ func (c *Cache) key(userID string) string { return "ent:" + userID }
 // a cache miss and populating the cache. On a Redis error (other than a miss) it
 // degrades to a direct DB resolve rather than failing open.
 func (c *Cache) GetTier(ctx context.Context, userID string) string {
+	if config.IsSelfHostedInstance(c.instanceType) {
+		return TierPremium
+	}
+
 	val, err := c.redis.Get(ctx, c.key(userID)).Result()
 	switch {
 	case err == nil:

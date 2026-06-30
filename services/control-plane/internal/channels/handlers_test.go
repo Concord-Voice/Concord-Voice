@@ -818,6 +818,21 @@ func TestUpdateChannel_AcceptsAudioTierAtServerCeiling(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
+func TestUpdateChannel_AcceptsStudioAudioTierWhenSelfHosted(t *testing.T) {
+	t.Setenv("INSTANCE_TYPE", "self-hosted")
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "ceil_selfhost_owner")
+	serverID := ts.CreateTestServer(t, owner.ID, "Self-hosted Ceiling Server")
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-ceiling-selfhost")
+
+	w := ts.DoRequest("PATCH", pathChannelsPrefix+channelID, map[string]interface{}{
+		"name":               "voice-ceiling-selfhost",
+		"type":               "voice",
+		"audio_quality_tier": "studio",
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
 func TestUpdateChannel_AcceptsMachAudioTierFromServerTierCache(t *testing.T) {
 	ts := setupTS(t)
 	owner := ts.CreateTestUser(t, "ceil_mach_owner")

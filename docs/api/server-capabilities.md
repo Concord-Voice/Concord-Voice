@@ -32,7 +32,7 @@ desktop client connects to an older self-hosted server).
 | `features.voiceTiersSupported` | boolean | `true` on SaaS; `false` on self-hosted (all features unlocked, tiers moot). |
 | `features.e2eeEnforcedEverywhere` | boolean | Always `true` (E2EE-everywhere, #201). |
 | `features.maxMembersPerServer` | integer | Advisory ceiling. |
-| `features.entitlementMode` | string | `"saas"` or `"self-hosted-unlocked"` (derived from `instanceType`). |
+| `features.entitlementMode` | string | `"saas"` or `"self-hosted-unlocked"` (derived from `instanceType`). On self-hosted, the control-plane entitlement resolver returns the maximal current entitlement set for every user. |
 | `policyVersion` | string | Bumped when the server policy set changes. |
 
 ## Additive-evolution contract
@@ -43,7 +43,10 @@ at the boundary (zod per `[internal]rules/frontend.md`) and degrade gracefully r
 than erroring on an unexpected shape. This is the single handshake that the
 self-hosted epic's SSO-suppression (#1619) and entitlement-unlock (#1620) children
 ride — they read `auth.oauthProviders` and `features.entitlementMode` respectively,
-rather than adding their own round-trips.
+rather than adding their own round-trips. `features.entitlementMode = "self-hosted-unlocked"`
+means `/api/v1/entitlements`, entitlement JWT claims, `entitlements_changed`,
+server entitlements, channel audio ceilings, and media join authorization resolve
+the current maximal entitlement set server-side.
 
 ## Example — SaaS instance
 
@@ -99,7 +102,7 @@ GET /api/v1/server/capabilities
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `INSTANCE_TYPE` | `saas` | `saas` or `self-hosted`. The self-hosted deploy sets `self-hosted`; unknown values normalize to `saas` at the handler. |
+| `INSTANCE_TYPE` | `saas` | `saas` or `self-hosted`. The self-hosted deploy sets `self-hosted`; unknown values normalize to `saas` before capabilities and entitlement resolution. |
 | `SERVER_VERSION` | `dev` | Advertised server version. The SaaS deploy pipeline sets the release tag. |
 
 Both are non-secret, safe-defaulted, and provisioned through `provision-secrets.yml`

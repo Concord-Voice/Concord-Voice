@@ -18,6 +18,28 @@ const devJWTSecret = "dev_jwt_secret_change_in_production"                      
 const devMFAEncKey = "0000000000000000000000000000000000000000000000000000000000000000" // #nosec G101 -- 32-byte zero key, dev only
 const devMinIOSecretKey = "concord_dev_minio"                                           // #nosec G101 -- dev default, guarded by validate()
 
+// Instance type values advertised by GET /server/capabilities and consumed by
+// entitlement resolution. Unknown values normalize to SaaS so misconfiguration
+// never unlocks self-hosted privileges by accident.
+const (
+	InstanceTypeSaaS       = "saas"
+	InstanceTypeSelfHosted = "self-hosted"
+)
+
+// NormalizeInstanceType returns the only two supported deployment instance
+// types, tolerating casing/whitespace for operator-authored env vars.
+func NormalizeInstanceType(raw string) string {
+	if strings.ToLower(strings.TrimSpace(raw)) == InstanceTypeSelfHosted {
+		return InstanceTypeSelfHosted
+	}
+	return InstanceTypeSaaS
+}
+
+// IsSelfHostedInstance reports whether raw selects the self-hosted deployment mode.
+func IsSelfHostedInstance(raw string) bool {
+	return NormalizeInstanceType(raw) == InstanceTypeSelfHosted
+}
+
 // Development-only connection values. NOT secrets — match docker-compose.yml.
 // validate() rejects these in production.
 var (

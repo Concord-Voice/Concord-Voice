@@ -2732,7 +2732,7 @@ paths:
 
         set before login (version skew). Response is identical regardless of auth
 
-        state. Cache-Control: public, max-age=300. Rate limit: 10 requests per minute
+        state. Cache-Control: public, max-age=300. Rate limit: 30 requests per minute
 
         (IP-based). Schema is additively-evolvable (new fields optional).
 
@@ -4569,9 +4569,11 @@ paths:
       summary: Get current entitlement capability set
       description: 'Returns the authenticated user''s entitlement capability set (the
         free/premium feature limits) so the client can gate UX locally with zero
-        per-action server calls. The tier resolves from the subscriptions source of
-        truth via a Redis read-through cache and fails closed to the free set on any
-        resolve error, so this endpoint always returns 200 with a valid set.
+        per-action server calls. On SaaS, the tier resolves from the subscriptions
+        source of truth via a Redis read-through cache and fails closed to the free
+        set on any resolve error. On self-hosted instances, INSTANCE_TYPE=self-hosted
+        resolves every user to the current maximal user tier before Redis or DB. This
+        endpoint always returns 200 with a valid set.
 
         '
       operationId: getEntitlements

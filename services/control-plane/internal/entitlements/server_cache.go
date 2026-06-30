@@ -7,33 +7,44 @@ import (
 	"log"
 	"time"
 
+	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
 	"github.com/redis/go-redis/v9"
 )
 
 // ServerCache is a Redis-backed, read-through cache of a server's entitlement
 // tier. It mirrors Cache (the user axis): one key per server
 // (ent:server:{serverID}), the shared 5-min cacheTTL, and Unlink invalidation.
-// GetServerTier never errors — every failure path fails closed to
+// GetServerTier never errors. SaaS failure paths fail closed to
 // TierGroundspeed (least privilege), so a Redis/DB hiccup can never escalate a
-// server to Mach.
+// server to Mach; self-hosted instances short-circuit to Mach by deployment mode.
 type ServerCache struct {
-	redis *redis.Client
-	db    *sql.DB
-	ttl   time.Duration
+	redis        *redis.Client
+	db           *sql.DB
+	ttl          time.Duration
+	instanceType string
 }
 
 // NewServerCache builds the server-tier cache from the existing Redis + DB handles.
 func NewServerCache(redisClient *redis.Client, db *sql.DB) *ServerCache {
-	return &ServerCache{redis: redisClient, db: db, ttl: cacheTTL}
+	return NewServerCacheForInstance(redisClient, db, config.InstanceTypeSaaS)
+}
+
+// NewServerCacheForInstance builds the server-tier cache with the deployment-mode seam.
+func NewServerCacheForInstance(redisClient *redis.Client, db *sql.DB, instanceType string) *ServerCache {
+	return &ServerCache{redis: redisClient, db: db, ttl: cacheTTL, instanceType: instanceType}
 }
 
 func (c *ServerCache) key(serverID string) string { return "ent:server:" + serverID }
 
 // GetServerTier returns the server's tier, reading through to ResolveServerTier
 // on a cache miss and populating the cache. On a Redis error (other than a miss)
-// it degrades to a direct resolve rather than failing open. Today the resolver is
-// the inert Groundspeed hook, so this returns TierGroundspeed for every server.
+// it degrades to a direct resolve rather than failing open. On self-hosted
+// instances, every server resolves to the maximal current server tier.
 func (c *ServerCache) GetServerTier(ctx context.Context, serverID string) string {
+	if config.IsSelfHostedInstance(c.instanceType) {
+		return TierMach
+	}
+
 	val, err := c.redis.Get(ctx, c.key(serverID)).Result()
 	switch {
 	case err == nil:

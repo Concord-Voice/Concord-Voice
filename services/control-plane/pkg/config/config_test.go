@@ -66,6 +66,33 @@ func TestParseOrigins(t *testing.T) {
 	})
 }
 
+func TestNormalizeInstanceType(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "empty defaults to saas", raw: "", want: InstanceTypeSaaS},
+		{name: "saas stays saas", raw: "saas", want: InstanceTypeSaaS},
+		{name: "self hosted exact", raw: "self-hosted", want: InstanceTypeSelfHosted},
+		{name: "self hosted trims and lowercases", raw: " Self-Hosted ", want: InstanceTypeSelfHosted},
+		{name: "unknown fails safe", raw: "enterprise", want: InstanceTypeSaaS},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, NormalizeInstanceType(tt.raw))
+		})
+	}
+}
+
+func TestIsSelfHostedInstance(t *testing.T) {
+	assert.True(t, IsSelfHostedInstance(" SELF-HOSTED "))
+	assert.False(t, IsSelfHostedInstance(""))
+	assert.False(t, IsSelfHostedInstance("saas"))
+	assert.False(t, IsSelfHostedInstance("enterprise"))
+}
+
 func TestLoad(t *testing.T) {
 	// Save and unset all env vars to test defaults
 	envVars := []string{"ENVIRONMENT", "PORT", "DATABASE_URL", "REDIS_URL", "JWT_SECRET", "NATS_URL", "ALLOWED_ORIGINS", "TRUSTED_PROXY_CIDRS"}

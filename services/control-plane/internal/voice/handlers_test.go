@@ -740,6 +740,34 @@ func TestAuthorizeJoin_ChannelStandard_ShapesMediaEntitlements(t *testing.T) {
 	assert.NotContains(t, gotTiers, "studio", "studio must not be granted on a Groundspeed server")
 }
 
+func TestAuthorizeJoin_SelfHostedChannelStandardAllowsStudio(t *testing.T) {
+	t.Setenv("INSTANCE_TYPE", "self-hosted")
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "ch_selfhost_owner")
+	member := ts.CreateTestUser(t, "ch_selfhost_member")
+	serverID := ts.CreateTestServer(t, owner.ID, "Self-hosted ChannelStd Server")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-ch-selfhost")
+
+	_, err := ts.DB.Exec("UPDATE channels SET audio_quality_tier=$1 WHERE id=$2", "studio", channelID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	me, ok := body["media_entitlements"].(map[string]interface{})
+	require.True(t, ok, "media_entitlements present")
+
+	rawTiers := me["allowed_audio_tiers"].([]interface{})
+	gotTiers := make([]string, len(rawTiers))
+	for i, v := range rawTiers {
+		gotTiers[i] = v.(string)
+	}
+	assert.Contains(t, gotTiers, "studio")
+}
+
 func TestAuthorizeJoin_MachChannelStandardUsesServerTierCache(t *testing.T) {
 	ts := setupTS(t)
 	owner := ts.CreateTestUser(t, "ch_mach_owner")

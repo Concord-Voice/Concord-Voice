@@ -95,6 +95,7 @@ func SetupTestServer(t *testing.T) *TestServer {
 		Port:              "0",
 		JWTSecret:         TestJWTSecret,
 		AllowedOrigins:    []string{"*"},
+		InstanceType:      os.Getenv("INSTANCE_TYPE"),
 		MFAEncryptionKey:  "0000000000000000000000000000000000000000000000000000000000000000",
 		WebAuthnRPID:      "localhost",
 		WebAuthnRPOrigins: []string{"http://localhost:3001"},

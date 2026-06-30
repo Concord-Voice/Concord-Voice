@@ -395,6 +395,8 @@ lsof -ti:5432 | xargs kill -9
 | `DATABASE_URL` | (see above) | PostgreSQL connection |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection |
 | `JWT_SECRET` | (dev secret) | JWT signing key |
+| `INSTANCE_TYPE` | `saas` | Deployment/entitlement mode (`saas` or `self-hosted`) |
+| `SERVER_VERSION` | `dev` | Advertised server version for capability discovery |
 | `NATS_URL` | `nats://localhost:4222` | NATS connection |
 
 ### Media Plane

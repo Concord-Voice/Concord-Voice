@@ -61,3 +61,9 @@ func TestCache_GetTier_RedisDownDegradesToDB(t *testing.T) {
 	// Get errors (not redis.Nil) -> degrade to direct DB resolve -> premium.
 	assert.Equal(t, "premium", cache.GetTier(context.Background(), uid))
 }
+
+func TestCache_GetTier_SelfHostedReturnsPremiumWithoutDBOrRedis(t *testing.T) {
+	cache := entitlements.NewCacheForInstance(nil, nil, " self-hosted ")
+
+	assert.Equal(t, entitlements.TierPremium, cache.GetTier(context.Background(), "user-1"))
+}

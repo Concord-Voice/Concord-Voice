@@ -142,6 +142,12 @@ type Handler struct {
 
 // NewHandler creates a new authentication handler.
 func NewHandler(db *sql.DB, redisClient *redis.Client, log *logger.Logger, jwtSecret string, hub SessionDisconnector) *Handler {
+	return NewHandlerForInstance(db, redisClient, log, jwtSecret, hub, "")
+}
+
+// NewHandlerForInstance creates a new authentication handler with the
+// deployment-mode entitlement seam used for JWT tier claims.
+func NewHandlerForInstance(db *sql.DB, redisClient *redis.Client, log *logger.Logger, jwtSecret string, hub SessionDisconnector, instanceType string) *Handler {
 	return &Handler{
 		db:        db,
 		redis:     redisClient,
@@ -149,7 +155,7 @@ func NewHandler(db *sql.DB, redisClient *redis.Client, log *logger.Logger, jwtSe
 		jwtSecret: jwtSecret,
 		hub:       hub,
 		pending:   NewPendingRepo(db),
-		entCache:  entitlements.NewCache(redisClient, db),
+		entCache:  entitlements.NewCacheForInstance(redisClient, db, instanceType),
 	}
 }
 
