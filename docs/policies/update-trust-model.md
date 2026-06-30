@@ -1,6 +1,6 @@
 # Update Trust Model
 
-> **Status:** Living document. Last updated 2026-06-29 (#1981).
+> **Status:** Living document. Last updated 2026-06-30 (#654).
 > **Audience:** Concord Voice contributors, security reviewers, and users who want to understand what they trust when accepting an auto-update.
 
 ## What users implicitly trust when accepting an auto-update
@@ -54,7 +54,7 @@ This document describes which of those properties each platform verifies, and ho
 
 **What this does NOT defend (by design):**
 
-- **Update freeze** — a feed-controlling attacker answering "you're up to date" (`update-not-available`) can pin a victim indefinitely to a specific signed-but-known-vulnerable build. This product rides the prerelease channel fleet-wide (`allowPrerelease` default true), so the consequence is concrete: indefinite pinning to a known-CVE *signed* build. Artifact signing provides zero mitigation. Deferred to #654 (manifest freshness / attestation).
+- **Update freeze** — a feed-controlling attacker answering "you're up to date" (`update-not-available`) can pin a victim indefinitely to a specific signed-but-known-vulnerable build. This product rides the prerelease channel fleet-wide (`allowPrerelease` default true), so the consequence is concrete: indefinite pinning to a known-CVE *signed* build. Artifact signing provides zero mitigation. #654 adds public distribution provenance and Alpha/public byte binding, but freeze defense still needs a separate manifest-freshness control.
 - **The verify→install TOCTOU residual (accepted).** The client verifies the bytes at the downloaded path, then `quitAndInstall()` independently re-reads the **same** cached path with no install-time checksum. A local process with write access to the updater cache (under user-writable `userData`) could swap the file in the gap — a wider window than the Windows model, whose verify runs inside electron-updater's install flow. Accepted because it requires a local attacker who already has `userData` write (who can compromise the app more cheaply) and is parity with the unavoidable disk-read-at-install on every platform. Mitigated by calling `quitAndInstall()` immediately after a successful verify with no intervening `await`.
 
 **Key rotation** requires shipping a new client build (the trust anchor is bundled, not fetched). See [`[internal]refresh-linux-update-key.md`](../runbooks/refresh-linux-update-key.md).
@@ -129,16 +129,16 @@ The `build-desktop.yml` workflow runs, in order:
 3. **Re-verify the signature** (per-platform, see workflow line references above)
 4. **Verify update manifest SHA-512** (added by #644): `client/desktop/scripts/verify-update-manifest.mjs` reads `latest*.yml` and cross-checks every listed artifact hash against the actual file bytes on disk
 5. Upload artifact and publish release
-6. Mirror the signed release to the public repo via `.github/workflows/publish-public-mirror.yml`; `scripts/public-mirror/mirror-release.sh` fails closed unless the source and public release contain the expected `latest.yml`, `latest-mac.yml`, `latest-linux.yml`, platform installers, blockmaps, and Linux `.sig` files needed by the public recovery feed
+6. Mirror the signed release to the public repo via `.github/workflows/publish-public-mirror.yml`; `scripts/public-mirror/mirror-release.sh` fails closed unless the source and public release contain exactly the expected `latest.yml`, `latest-mac.yml`, `latest-linux.yml`, platform installers, blockmaps, and Linux `.sig` files needed by the public recovery feed, then checks every public release asset digest against the Alpha source asset, passes the Alpha-generated digest manifest to the public `public-release-attestation.yml` workflow, verifies every public release asset attestation, and only then promotes `/releases/latest` before the mirror is considered successful
 
-Step 4 catches the concrete threat of a tampered manifest between sign and publish. Step 3 catches broken signing and corrupted artifacts.
+Step 4 catches the concrete threat of a tampered manifest between sign and publish. Step 3 catches broken signing and corrupted artifacts. Step 6 adds public distribution provenance for the bytes hosted in `Concord-Voice/Concord-Voice`; it does not prove original Alpha build-runner provenance.
 
 ## Known gaps
 
-- **No SLSA-style attestation yet.** Artifacts are not accompanied by in-toto provenance signed via Sigstore OIDC. Tracked in #654 (phase-3).
+- **Public release attestations are distribution provenance, not Alpha build provenance.** Public desktop release assets mirrored to `Concord-Voice/Concord-Voice` are attested by the public repo workflow after #654 and can be verified with `gh attestation verify --repo Concord-Voice/Concord-Voice --signer-workflow github.com/Concord-Voice/Concord-Voice/.github/workflows/public-release-attestation.yml`. Alpha-private Gate B remains disabled until Alpha is public or on GitHub Enterprise Cloud, so original private build-runner provenance remains a known gap.
 - **No certificate transparency monitoring.** We do not monitor public CT logs for the issuance of certs matching our leaf CN from CAs outside the pinned Microsoft chain. Future work.
-- **No binary transparency / Rekor publication.** Our release hashes are not published to a public transparency log. Future work, likely bundled with #654.
-- **Linux update freeze + verify→install TOCTOU.** Linux update *artifact* signing shipped in #653 (see the Linux section above) — but a feed-controlling attacker can still pin a victim to a known-vulnerable *signed* build via update-freeze, and a local `userData`-write attacker has a narrow verify→install swap window. Both are accepted residuals; freeze defense is deferred to #654 (manifest freshness / attestation).
+- **No binary transparency / Rekor publication.** Our release hashes are not published to a public transparency log. Future work.
+- **Linux update freeze + verify→install TOCTOU.** Linux update *artifact* signing shipped in #653 (see the Linux section above) — but a feed-controlling attacker can still pin a victim to a known-vulnerable *signed* build via update-freeze, and a local `userData`-write attacker has a narrow verify→install swap window. Both are accepted residuals; freeze defense still needs a separate manifest-freshness/attestation control.
 - **Chain validity is asserted at the leaf, not walked end-to-end by our hook.** `verifyWindowsSignature.ts` requires `Get-AuthenticodeSignature` to return `Status = Valid` on the downloaded installer — that status already covers signature integrity, root-of-trust chaining, expiry (including timestamp validity), and revocation via the Windows certificate store. On top of that, our hook inspects chain _structure_ to enforce the leaf CN allow-list and issuer-prefix pin. We do not separately walk or re-validate each intermediate; we trust the OS-level chain build that produced the `Valid` status. If that upstream check is ever bypassed, our structural checks alone would not detect a revoked or untrusted intermediate.
 
 ## Related documents

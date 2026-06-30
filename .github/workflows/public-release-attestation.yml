@@ -1,0 +1,175 @@
+name: Public release attestations
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Desktop release tag to attest, e.g. desktop-v0.2.3.'
+        required: true
+        type: string
+      expected_asset_sha256_b64:
+        description: 'Base64-encoded SHA-256 manifest generated from the Alpha source release assets.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  attest-release:
+    name: Attest public release assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and validate public release assets
+        id: validate_release_assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          EXPECTED_ASSET_SHA256_B64: ${{ inputs.expected_asset_sha256_b64 }}
+        run: |
+          set -euo pipefail
+          allowed_dispatch_actor=0
+          for actor in \
+            'concord-public-mirror-publisher[bot]' \
+            'concord-voice-public-mirror-publisher[bot]' \
+            'concord-ci-bot[bot]' \
+            'concord-voice-ci-bot[bot]'; do
+            if [ "${GITHUB_ACTOR:-}" = "$actor" ]; then
+              allowed_dispatch_actor=1
+              break
+            fi
+          done
+          if [ "$allowed_dispatch_actor" -ne 1 ]; then
+            echo "::error::public release attestations must be dispatched by Concord's public mirror publisher App; got actor '${GITHUB_ACTOR:-unknown}'"
+            exit 1
+          fi
+
+          case "$RELEASE_TAG" in
+            desktop-v*) ;;
+            *) echo "::error::release_tag must start with desktop-v"; exit 1 ;;
+          esac
+          version="${RELEASE_TAG#desktop-v}"
+          floor="${PMIRROR_VERSION_FLOOR:-0.2.0}"
+          if [ "$(printf '%s\n%s\n' "${version%%[-+]*}" "$floor" | sort -V | head -n1)" != "$floor" ]; then
+            printf 'should_attest=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf 'should_attest=true\n' >> "$GITHUB_OUTPUT"
+          rm -rf release-assets
+          mkdir -p release-assets
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets
+
+          expected_release_asset_names() {
+            local version="$1" arch
+            for arch in arm64 x64; do
+              printf 'ConcordVoice-%s-macos-%s.dmg\n' "$version" "$arch"
+              printf 'ConcordVoice-%s-macos-%s.zip\n' "$version" "$arch"
+              printf 'ConcordVoice-%s-macos-%s.zip.blockmap\n' "$version" "$arch"
+              printf 'ConcordVoice-%s-windows-%s-Setup.exe\n' "$version" "$arch"
+              printf 'ConcordVoice-%s-windows-%s-full.nupkg\n' "$version" "$arch"
+              printf 'ConcordVoice-%s-linux-%s.AppImage\n' "$version" "$arch"
+              printf 'concord-voice_%s_linux-%s.deb\n' "$version" "$arch"
+              printf 'concord-voice-%s-linux-%s.rpm\n' "$version" "$arch"
+              printf 'ConcordVoice-%s-linux-%s.AppImage.sig\n' "$version" "$arch"
+              printf 'concord-voice_%s_linux-%s.deb.sig\n' "$version" "$arch"
+              printf 'concord-voice-%s-linux-%s.rpm.sig\n' "$version" "$arch"
+            done
+            printf 'latest.yml\nlatest-mac.yml\nlatest-linux.yml\n'
+          }
+
+          shopt -s nullglob
+          files=(release-assets/*)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::release $RELEASE_TAG has no assets to attest"
+            exit 1
+          fi
+
+          missing=()
+          unexpected=()
+          expected_names=()
+          while IFS= read -r expected; do
+            expected_names+=("$expected")
+            found=0
+            for asset in "${files[@]}"; do
+              if [ "${asset##*/}" = "$expected" ]; then
+                found=1
+                break
+              fi
+            done
+            if [ "$found" -ne 1 ]; then
+              missing+=("$expected")
+            fi
+          done < <(expected_release_asset_names "$version")
+
+          for asset in "${files[@]}"; do
+            found=0
+            for expected in "${expected_names[@]}"; do
+              if [ "${asset##*/}" = "$expected" ]; then
+                found=1
+                break
+              fi
+            done
+            if [ "$found" -ne 1 ]; then
+              unexpected+=("${asset##*/}")
+            fi
+          done
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::release $RELEASE_TAG is missing required asset(s): ${missing[*]}"
+            exit 1
+          fi
+          if [ "${#unexpected[@]}" -ne 0 ]; then
+            echo "::error::release $RELEASE_TAG contains unexpected asset(s): ${unexpected[*]}"
+            exit 1
+          fi
+
+          decode_base64() {
+            if base64 --help 2>&1 | grep -q -- '--decode'; then
+              base64 --decode
+            else
+              base64 -D
+            fi
+          }
+          sha256_file() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | awk '{print $1}'
+            else
+              shasum -a 256 "$1" | awk '{print $1}'
+            fi
+          }
+
+          if ! printf '%s' "$EXPECTED_ASSET_SHA256_B64" | decode_base64 > expected-sha256.txt; then
+            echo "::error::expected_asset_sha256_b64 is not valid base64"
+            exit 1
+          fi
+          : > actual-sha256.txt
+          for asset in "${files[@]}"; do
+            printf '%s  %s\n' "$(sha256_file "$asset")" "${asset##*/}" >> actual-sha256.txt
+          done
+          LC_ALL=C sort expected-sha256.txt > expected-sha256.sorted
+          LC_ALL=C sort actual-sha256.txt > actual-sha256.sorted
+          if ! diff -u expected-sha256.sorted actual-sha256.sorted; then
+            echo "::error::public release asset digest mismatch versus Alpha source manifest"
+            exit 1
+          fi
+
+      - name: Attest release assets
+        if: steps.validate_release_assets.outputs.should_attest == 'true'
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: release-assets/*
+
+      - name: Verify release attestations
+        if: steps.validate_release_assets.outputs.should_attest == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for asset in release-assets/*; do
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow github.com/Concord-Voice/Concord-Voice/.github/workflows/public-release-attestation.yml
+          done
