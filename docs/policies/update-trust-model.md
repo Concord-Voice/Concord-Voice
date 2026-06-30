@@ -1,6 +1,6 @@
 # Update Trust Model
 
-> **Status:** Living document. Last updated 2026-04-15 (#644).
+> **Status:** Living document. Last updated 2026-06-29 (#1981).
 > **Audience:** Concord Voice contributors, security reviewers, and users who want to understand what they trust when accepting an auto-update.
 
 ## What users implicitly trust when accepting an auto-update
@@ -46,9 +46,9 @@ This document describes which of those properties each platform verifies, and ho
 
 - **Build-time:** each Linux artifact (`.AppImage` / `.deb` / `.rpm`, both arches) is signed in CI (`.github/workflows/build-desktop.yml` release job) with a **raw Ed25519 detached signature** — `openssl pkeyutl -sign -rawin` — producing a 64-byte `<artifact>.sig` next to each artifact. The private key is the repo-scope CI secret `LINUX_UPDATE_SIGNING_KEY`.
 - **CI verification:** the signing step self-verifies each `.sig` against the committed public key (a signing-key/bundled-key mismatch tripwire), and the existing `required_assets` asset-set gate hard-fails the release if any of the six Linux `.sig` files are missing — so an unsigned Linux Release cannot publish.
-- **Install-time:** inside `safeQuitAndInstall()` on Linux, the client fetches `<artifact>.sig` from the persisted HTTPS update feed and verifies it over the downloaded artifact bytes with one native `crypto.verify(null, …)` call against the bundled public key (`client/desktop/src/main/linuxUpdatePublicKey.ts`, via `client/desktop/src/main/verifyLinuxSignature.ts`). The verify is **fail-closed**: the only path to install is `verify → true`; a `null`/non-HTTPS feed, a missing artifact, a non-2xx `.sig` fetch, a signature not exactly 64 bytes, a `verify → false`, or any thrown exception refuses the install (identical install boundary in every case). The *message* distinguishes the cause: only a cryptographic `verify → false` — the one outcome that is genuine evidence of an altered artifact — surfaces the `signature-failure` security banner; availability failures (network/IO error, a missing or malformed `.sig`, no feed configured) refuse with a retryable non-security "couldn't verify right now" message instead, so a transient blip does not cry wolf and erode the banner's credibility. An attacker who strips/blocks the `.sig` lands in the availability path and still cannot install. electron-updater still cross-checks the `latest-linux.yml` SHA-512 at download (#644); the Ed25519 signature is the layer that defends a manifest the attacker controls.
+- **Install-time:** inside `safeQuitAndInstall()` on Linux, the client fetches `<artifact>.sig` from the static public recovery feed (`https://github.com/Concord-Voice/Concord-Voice/releases/latest/download`) and verifies it over the downloaded artifact bytes with one native `crypto.verify(null, …)` call against the bundled public key (`client/desktop/src/main/linuxUpdatePublicKey.ts`, via `client/desktop/src/main/verifyLinuxSignature.ts`). The verify is **fail-closed**: the only path to install is `verify → true`; a missing artifact, a non-2xx `.sig` fetch, a signature not exactly 64 bytes, a `verify → false`, or any thrown exception refuses the install (identical install boundary in every case). The *message* distinguishes the cause: only a cryptographic `verify → false` — the one outcome that is genuine evidence of an altered artifact — surfaces the `signature-failure` security banner; availability failures (network/IO error, a missing or malformed `.sig`) refuse with a retryable non-security "couldn't verify right now" message instead, so a transient blip does not cry wolf and erode the banner's credibility. An attacker who strips/blocks the `.sig` lands in the availability path and still cannot install. electron-updater still cross-checks the `latest-linux.yml` SHA-512 at download (#644); the Ed25519 signature is the layer that defends a manifest the attacker controls.
 
-**What the user is trusting on Linux:** the bundled Ed25519 public key. **This is the SOLE trust anchor** — it holds even with no TLS pinning, because an attacker who fully MITMs an unpinned feed (self-hosted / LAN / dev builds) controls both the artifact and its `.sig` but cannot forge a signature without the private key. TLS-layer feed pinning (#658, below) is defense-in-depth on the canonical `api.concordvoice.chat` host, not load-bearing for this guarantee.
+**What the user is trusting on Linux:** the bundled Ed25519 public key. **This is the SOLE trust anchor** — it holds even with no API-host TLS pinning, because an attacker who controls the public recovery feed controls both the artifact and its `.sig` but cannot forge a signature without the private key. TLS-layer API pinning (#658, below) is defense-in-depth for the API host, not load-bearing for this guarantee.
 
 **What this defends:** a forged or tampered Linux update artifact served from a compromised feed (`/opt/concord/releases/`), a compromised GitHub Release, the public mirror, or an on-path attacker.
 
@@ -59,9 +59,9 @@ This document describes which of those properties each platform verifies, and ho
 
 **Key rotation** requires shipping a new client build (the trust anchor is bundled, not fetched). See [`[internal]refresh-linux-update-key.md`](../runbooks/refresh-linux-update-key.md).
 
-### TLS-layer feed pinning (#658)
+### TLS-layer API pinning (#658)
 
-On **all platforms**, the HTTPS connection to `https://api.concordvoice.chat/api/v1/updates` is additionally pinned at the TLS layer via SPKI SHA-256 of the server's leaf certificate. This closes the rogue-cert MITM gap described in §Server-side trust boundary below.
+On **all platforms**, HTTPS connections to `api.concordvoice.chat` are additionally pinned at the TLS layer via SPKI SHA-256 of the server's leaf certificate. This closes the rogue-cert MITM gap described in §API-host trust boundary below. Since #1981, packaged binary auto-updates use the public GitHub recovery feed instead, so an API-host pin mismatch no longer strands the only automatic update path.
 
 **How it works:**
 
@@ -88,24 +88,23 @@ On **all platforms**, the HTTPS connection to `https://api.concordvoice.chat/api
 - Design spec: [`[internal]specs/2026-04-20-658-updater-feed-cert-pin-design.md`](../superpowers/specs/2026-04-20-658-updater-feed-cert-pin-design.md)
 - Rotation runbook: [`[internal]`](update-cert-pinning-runbook.md)
 
-## Server-side trust boundary
+## API-host trust boundary
 
-The update feed is served at `https://api.concordvoice.chat/api/v1/updates`. Transport protections:
+The packaged binary update feed is `https://github.com/Concord-Voice/Concord-Voice/releases/latest/download`. The API-hosted release directory remains an operational surface, but it is not the only packaged-client recovery path. API-host transport protections are:
 
-- **Non-HTTPS refused:** `client/desktop/src/main/updater.ts` explicitly refuses to configure the feed with a non-HTTPS `apiBase`.
 - **HTTPS only:** transport encryption + standard Web PKI cert validation on the server host.
-- **TLS-layer feed pinning (#658):** in addition to standard Web PKI validation, clients pin the SPKI SHA-256 of the CloudFlare edge certificate for `api.concordvoice.chat`. See the dedicated subsection under §Per-platform trust model above.
+- **TLS-layer API pinning (#658):** in addition to standard Web PKI validation, clients pin the SPKI SHA-256 of the CloudFlare edge certificate for `api.concordvoice.chat`. See the dedicated subsection under §Per-platform trust model above.
 
-**What HTTPS + pinning DOES guarantee:**
+**What HTTPS + API pinning DOES guarantee:**
 
-- An attacker with a rogue cert for the host (e.g., via a compromised intermediate CA) CANNOT MITM the update feed, because the rogue cert's SPKI will not match either pin.
+- An attacker with a rogue cert for the API host (e.g., via a compromised intermediate CA) CANNOT MITM API-host traffic, because the rogue cert's SPKI will not match either pin.
 
-**What HTTPS + pinning does NOT guarantee:**
+**What HTTPS + API pinning does NOT guarantee:**
 
-- That the server host itself has not been compromised (an attacker with root on the origin could serve real malicious updates with a real signed keypair — this is outside pinning's scope; the artifact-level signing layer from #644 is what defends that case).
+- That the server host itself has not been compromised (an attacker with root on the origin could serve hostile API responses or alter any API-hosted release directory — this is outside pinning's scope; the artifact-level signing layer from #644 is what defends update artifacts).
 - Self-hosted deployments at a different `apiBase`: pinning is SaaS-only; self-hosted deployments use system-CA trust.
 
-Those gaps are why the per-platform trust anchors above are load-bearing — they provide defense in depth.
+Those gaps are why the per-platform artifact trust anchors above are load-bearing. The public recovery feed is transport-diverse from the API host, but artifact signing remains the update-authenticity boundary.
 
 ## SPA UI Update Trust Boundary
 
@@ -130,6 +129,7 @@ The `build-desktop.yml` workflow runs, in order:
 3. **Re-verify the signature** (per-platform, see workflow line references above)
 4. **Verify update manifest SHA-512** (added by #644): `client/desktop/scripts/verify-update-manifest.mjs` reads `latest*.yml` and cross-checks every listed artifact hash against the actual file bytes on disk
 5. Upload artifact and publish release
+6. Mirror the signed release to the public repo via `.github/workflows/publish-public-mirror.yml`; `scripts/public-mirror/mirror-release.sh` fails closed unless the source and public release contain the expected `latest.yml`, `latest-mac.yml`, `latest-linux.yml`, platform installers, blockmaps, and Linux `.sig` files needed by the public recovery feed
 
 Step 4 catches the concrete threat of a tampered manifest between sign and publish. Step 3 catches broken signing and corrupted artifacts.
 

@@ -25,6 +25,8 @@ const mockLogger = vi.hoisted(() => ({
 }));
 
 const mockVerifyLinuxArtifact = vi.hoisted(() => vi.fn());
+const PUBLIC_RECOVERY_FEED_URL =
+  'https://github.com/Concord-Voice/Concord-Voice/releases/latest/download';
 
 vi.mock('electron-updater', () => ({
   autoUpdater: mockAutoUpdater,
@@ -87,6 +89,7 @@ describe('updater', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.resetModules();
   });
 
@@ -376,6 +379,44 @@ describe('updater', () => {
     });
   });
 
+  describe('public recovery feed (#1981)', () => {
+    it('configures and schedules the public recovery feed when no API base is persisted', async () => {
+      vi.useFakeTimers();
+      const tm = await import('../../../src/main/tokenManager');
+      vi.mocked(tm.getPersistedApiBase).mockReturnValue(null);
+      const { updater } = await loadModule();
+
+      updater.initAutoUpdater(() => null);
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(mockAutoUpdater.setFeedURL).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: 'generic',
+          url: PUBLIC_RECOVERY_FEED_URL,
+        })
+      );
+      expect(mockAutoUpdater.checkForUpdates).toHaveBeenCalledOnce();
+    });
+
+    it('does not replace the public recovery feed with the API feed after login', async () => {
+      const { updater } = await loadModule();
+
+      updater.setUpdateFeedUrl('https://api.concordvoice.chat');
+
+      expect(mockAutoUpdater.setFeedURL).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: 'generic',
+          url: PUBLIC_RECOVERY_FEED_URL,
+        })
+      );
+      expect(mockAutoUpdater.setFeedURL).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: 'https://api.concordvoice.chat/api/v1/updates',
+        })
+      );
+    });
+  });
+
   describe('Linux signature gate (#653)', () => {
     let originalPlatform: PropertyDescriptor | undefined;
     const mockSend = vi.fn();
@@ -466,7 +507,7 @@ describe('updater', () => {
 
       expect(mockVerifyLinuxArtifact).toHaveBeenCalledWith(
         '/tmp/cache/ConcordVoice-2.0.0-linux-x64.AppImage',
-        'https://api.concordvoice.chat/api/v1/updates/ConcordVoice-2.0.0-linux-x64.AppImage.sig',
+        'https://github.com/Concord-Voice/Concord-Voice/releases/latest/download/ConcordVoice-2.0.0-linux-x64.AppImage.sig',
         expect.any(Function)
       );
       expect(mockAutoUpdater.quitAndInstall).toHaveBeenCalledOnce();

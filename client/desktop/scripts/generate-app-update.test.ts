@@ -9,14 +9,14 @@ describe('UPDATE_ENDPOINT_URL', () => {
     expect(UPDATE_ENDPOINT_URL.startsWith('https://')).toBe(true);
   });
 
-  it('points at api.concordvoice.chat', () => {
+  it('points at the public GitHub mirror', () => {
     const parsed = new URL(UPDATE_ENDPOINT_URL);
-    expect(parsed.host).toBe('api.concordvoice.chat');
+    expect(parsed.host).toBe('github.com');
   });
 
-  it('targets the /api/v1/updates path', () => {
+  it('targets the public release latest/download path', () => {
     const parsed = new URL(UPDATE_ENDPOINT_URL);
-    expect(parsed.pathname).toBe('/api/v1/updates');
+    expect(parsed.pathname).toBe('/Concord-Voice/Concord-Voice/releases/latest/download');
   });
 
   it('has no query string or fragment', () => {

@@ -176,12 +176,12 @@ The deploy-contract rationale and the move from the Go control-plane to Cloudfla
 
 The SPA hot-update path above is distinct from the **binary** auto-update path that ships new Electron app versions. The latter is a security-critical, signature-verified pipeline in `src/main/` (see the [update trust model](policies/update-trust-model.md)):
 
-- **`updater.ts`** — `electron-updater` wiring with `autoDownload = false` (the download is a deliberate, user-gated step, not silent) and prerelease opt-in gating. It pins the certificate chain by monkey-patching `verifyUpdateCodeSignature` to require the Microsoft Trusted Signing intermediate (`updatePinning.ts` / `updatePinningConfig.ts`).
+- **`updater.ts`** — `electron-updater` wiring with `autoDownload = false` (the download is a deliberate, user-gated step, not silent), prerelease opt-in gating, and a static public GitHub recovery feed (`releases/latest/download`). It pins the Windows publisher chain by monkey-patching `verifyUpdateCodeSignature` to require the Microsoft Trusted Signing intermediate (`updatePinning.ts` / `updatePinningConfig.ts`).
 - **`verifyWindowsSignature.ts`** — independent Authenticode signature verification of the downloaded Windows installer.
 - **`updateSafety.ts`** — update-safety gating (refuses unsafe transitions) before an update is applied.
 - **`userDataMigration.ts`** — migrates the userData tree across versions, tied to the path-identity pinning described above.
 
-Manifests + signed installers are served from the control-plane `updates` package (`GET /api/v1/updates/*`); the trust decisions (signature + cert-chain + safety) all happen client-side in the main process. This is also defended at the transport layer by TLS pinning on `electron-updater`.
+Packaged clients fetch binary update manifests + signed installers from the public `Concord-Voice/Concord-Voice` GitHub Releases `latest/download` feed; the trust decisions (signature + cert-chain + safety) all happen client-side in the main process. API-host certificate pinning remains defense-in-depth for the API host, not the binary updater feed.
 
 ### Control Plane (Go)
 
@@ -219,7 +219,7 @@ Manifests + signed installers are served from the control-plane `updates` packag
 | `sessions`      | Session listing, per-session and all-session revocation                                      |
 | `storage`       | S3-compatible (MinIO) client wrapper                                                         |
 | `testhelpers`   | Integration-test utilities                                                                   |
-| `updates`       | Serves electron-updater manifests + signed installer binaries                                |
+| `updates`       | Legacy/private update manifest surface; packaged clients use the public GitHub recovery feed |
 | `users`         | User profile, keys, password, SSO identities, search, account deletion, E2EE blob sync       |
 | `voice`         | Voice channel join authorization, participants, server-mute/deafen, NATS subscriber          |
 | `websocket`     | WS hub, client pump, message dispatch, broadcast routing                                     |

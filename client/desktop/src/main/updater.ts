@@ -7,7 +7,7 @@ import {
 import { app, net, type BrowserWindow } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
-import { getPersistedApiBase } from './tokenManager';
+import { UPDATE_ENDPOINT_URL } from '../shared/updateEndpoint';
 import { createUpdateLogger, type UpdateLogger } from './updateLogger';
 import { prepareForUpdate } from './updateSafety';
 import { updateSplashStatus, showSplashProgress, updateSplashError } from './splashWindow';
@@ -102,6 +102,26 @@ function requireLogger(): UpdateLogger {
     throw new Error('updater: logger accessed before ensureUpdaterReady()');
   }
   return logger;
+}
+
+function logPublisherVerificationPosture(): void {
+  if (process.platform === 'win32') {
+    logger?.info(`Publisher verification active: ${ALLOWED_WINDOWS_PUBLISHERS.join(', ')}`);
+  } else if (process.platform === 'darwin') {
+    logger?.info('Publisher verification delegated to macOS Gatekeeper/notarization');
+  } else {
+    logger?.warn('Publisher verification not enforced by electron-updater on this platform');
+  }
+}
+
+function configureUpdateFeed(): void {
+  autoUpdater.setFeedURL({
+    provider: 'generic',
+    url: UPDATE_ENDPOINT_URL,
+    publisherName: [...ALLOWED_WINDOWS_PUBLISHERS],
+  });
+  logPublisherVerificationPosture();
+  requireLogger().info(`Feed URL set to ${UPDATE_ENDPOINT_URL}`);
 }
 
 /** Send an IPC event to the renderer (if the window exists). */
@@ -280,37 +300,11 @@ export function initAutoUpdater(
   }
 
   // Always register settings and event handlers so renderer events work
-  // even if the feed URL is set later via setUpdateFeedUrl().
+  // even when login/session restore has not run yet.
   ensureUpdaterReady();
 
-  // Privacy-first: update checks go through our server, never GitHub directly.
-  // The server serves release assets from disk via GET /api/v1/updates/*
-  const apiBase = getPersistedApiBase();
-  if (apiBase) {
-    if (apiBase.startsWith('https://')) {
-      autoUpdater.setFeedURL({
-        provider: 'generic',
-        url: `${apiBase}/api/v1/updates`,
-        publisherName: [...ALLOWED_WINDOWS_PUBLISHERS],
-      });
-      if (process.platform === 'win32') {
-        logger?.info(`Publisher verification active: ${ALLOWED_WINDOWS_PUBLISHERS.join(', ')}`);
-      } else if (process.platform === 'darwin') {
-        logger?.info('Publisher verification delegated to macOS Gatekeeper/notarization');
-      } else {
-        logger?.warn(
-          'Publisher verification NOT enforced on this platform — updates trust the feed'
-        );
-      }
-      startScheduledChecks();
-    } else {
-      logger?.warn(`Refusing to configure update feed with non-HTTPS apiBase: ${apiBase}`);
-    }
-  } else {
-    // No persisted API base (first launch, never logged in).
-    // Updates will be enabled after login via setUpdateFeedUrl().
-    requireLogger().info('No API base available, deferring update check until login');
-  }
+  configureUpdateFeed();
+  startScheduledChecks();
 }
 
 // ─── Public API (consumed by IPC handlers in main.ts) ─────────────────
@@ -329,8 +323,8 @@ export async function checkForUpdates(): Promise<void> {
 /**
  * Force an immediate update check, bypassing the scheduled-check cadence.
  * Invoked by the renderer's attestation 403-retry path (and user-triggered
- * "check now" actions). Always uses the pinned generic feed (#719) — never a
- * server-supplied URL.
+ * "check now" actions). Always uses the static public recovery feed (#1981) —
+ * never a server-supplied URL.
  */
 export async function forceCheckForUpdates(
   reason: 'attestation_required' | 'user_triggered'
@@ -347,25 +341,15 @@ export function downloadUpdate(): Promise<string[]> {
  * Linux-only pre-install signature gate (#653). Verifies the downloaded
  * artifact's detached Ed25519 signature against the bundled public key.
  * Returns a LinuxVerifyResult — `verified: true` to proceed, otherwise REFUSE.
- * Fail-closed: a null/non-HTTPS feed or a missing downloaded path refuses with
- * `kind: 'unavailable'` (a config/availability state, not evidence of
- * tampering). The `.sig` is fetched from the same update feed the updater
- * already uses; `net.fetch` rides the default session where the TLS pin lives
- * (main.ts), so the fetch is pinned without a dedicated wrapper.
+ * Fail-closed: a missing downloaded path refuses with `kind: 'unavailable'`
+ * (a config/availability state, not evidence of tampering). The `.sig` is
+ * fetched from the same static public recovery feed the updater already uses.
  */
 async function verifyLinuxUpdateBeforeInstall(): Promise<LinuxVerifyResult> {
-  const apiBase = getPersistedApiBase();
-  if (!apiBase?.startsWith('https://')) {
-    return {
-      verified: false,
-      reason: 'no valid HTTPS update feed configured',
-      kind: 'unavailable',
-    };
-  }
   if (!pendingDownloadedFile) {
     return { verified: false, reason: 'no downloaded artifact path captured', kind: 'unavailable' };
   }
-  const sigUrl = `${apiBase}/api/v1/updates/${path.basename(pendingDownloadedFile)}.sig`;
+  const sigUrl = `${UPDATE_ENDPOINT_URL}/${path.basename(pendingDownloadedFile)}.sig`;
   return verifyLinuxArtifact(pendingDownloadedFile, sigUrl, net.fetch);
 }
 
@@ -410,7 +394,7 @@ export async function safeQuitAndInstall(): Promise<void> {
   // The refusal is the same for both failure kinds; the kind only shapes the
   // user message (#653 / Gitar review). A cryptographic verify-false ('tampered')
   // is genuine evidence of an altered artifact → the security banner. An
-  // availability failure ('unavailable' — network/IO, missing `.sig`, no feed)
+  // availability failure ('unavailable' — network/IO or missing `.sig`)
   // is retryable → a non-alarming "try again" message, so a transient blip
   // doesn't cry wolf and erode the tamper warning's credibility.
   if (process.platform === 'linux') {
@@ -458,31 +442,14 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** Set the update feed URL after login (when apiBase becomes available). */
-export function setUpdateFeedUrl(apiBase: string): void {
+/** Compatibility hook after login; packaged builds keep the static recovery feed. */
+export function setUpdateFeedUrl(_apiBase: string): void {
   if (!app.isPackaged) {
     console.debug('[updater] setUpdateFeedUrl: no-op in development mode');
     return;
   }
-  if (!apiBase.startsWith('https://')) {
-    // Refuse non-HTTPS in packaged production builds only (dev bypassed above).
-    logger?.warn(`Refusing to configure update feed with non-HTTPS apiBase: ${apiBase}`);
-    return;
-  }
   ensureUpdaterReady();
-  autoUpdater.setFeedURL({
-    provider: 'generic',
-    url: `${apiBase}/api/v1/updates`,
-    publisherName: [...ALLOWED_WINDOWS_PUBLISHERS],
-  });
-  if (process.platform === 'win32') {
-    logger?.info(`Publisher verification active: ${ALLOWED_WINDOWS_PUBLISHERS.join(', ')}`);
-  } else if (process.platform === 'darwin') {
-    logger?.info('Publisher verification delegated to macOS Gatekeeper/notarization');
-  } else {
-    logger?.warn('Publisher verification NOT enforced on this platform — updates trust the feed');
-  }
-  requireLogger().info(`Feed URL set to ${apiBase}/api/v1/updates`);
+  configureUpdateFeed();
   startScheduledChecks();
 }
 
