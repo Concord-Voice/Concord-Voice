@@ -17,6 +17,7 @@ import { useEntitlement } from '../../hooks/useEntitlement';
 import { useChatStore } from '../../stores/chatStore';
 import { usePermissionStore } from '../../stores/permissionStore';
 import { useInviteStore } from '../../stores/inviteStore';
+import { hasPermission, Permissions } from '../../utils/permissions';
 import { buildInviteUrl } from '../../utils/inviteUrl';
 import AttachmentUploadPreview from './AttachmentUploadPreview';
 import ReplyPreviewBar from './ReplyPreviewBar';
@@ -210,6 +211,11 @@ const MessageInput: React.FC<MessageInputProps> = ({
   });
   const createInvite = useInviteStore((s) => s.createInvite);
   const fetchChannelOverrides = usePermissionStore((s) => s.fetchChannelOverrides);
+  const fetchChannelPermissions = usePermissionStore((s) => s.fetchChannelPermissions);
+  const serverPerms = usePermissionStore(
+    (s) => (serverId ? s.serverPermissions[serverId] : undefined) ?? 0n
+  );
+  const canViewChannelOverrides = hasPermission(serverPerms, Permissions.MANAGE_CHANNELS);
   const [showMentions, setShowMentions] = useState(false);
   const textareaId = useId();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -248,18 +254,31 @@ const MessageInput: React.FC<MessageInputProps> = ({
     }
   }, [initialDraft, draftTargetId]);
 
-  // Warm the channel's SBAC permission overrides so MentionAutocomplete can compute the
-  // viewer's channel-effective mention permissions before the first '@'. No-op in DMs.
+  // Warm effective channel permissions for mention gating. Raw SBAC overrides
+  // remain manager-only because the control-plane rejects normal members there
+  // to avoid leaking access-control state.
   useEffect(() => {
-    if (serverId && channelId) {
-      // Fire-and-forget; fetchChannelOverrides handles its own errors internally. Using
-      // `.catch` (the codebase's fire-and-forget idiom) instead of the `void` operator
-      // keeps both no-floating-promises and SonarQube S3735 satisfied.
+    if (!serverId || !channelId) return;
+
+    // Fire-and-forget; store actions handle their own errors internally. Using
+    // `.catch` (the codebase's fire-and-forget idiom) instead of the `void` operator
+    // keeps both no-floating-promises and SonarQube S3735 satisfied.
+    fetchChannelPermissions(channelId).catch(() => {
+      /* swallowed: the store action already handles/logs failures */
+    });
+
+    if (canViewChannelOverrides) {
       fetchChannelOverrides(channelId).catch(() => {
         /* swallowed: the store action already handles/logs failures */
       });
     }
-  }, [serverId, channelId, fetchChannelOverrides]);
+  }, [
+    serverId,
+    channelId,
+    canViewChannelOverrides,
+    fetchChannelPermissions,
+    fetchChannelOverrides,
+  ]);
 
   // Save draft when reply context changes (so switching channels preserves reply state)
   const prevReplyRef = useRef(replyingTo);

@@ -157,6 +157,7 @@ const MentionAutocomplete = forwardRef<MentionAutocompleteHandle, MentionAutocom
     }, [conversationId, dmConversations, serverMembers]);
     const serverPermissions = usePermissionStore((s) => s.serverPermissions);
     const serverRoles = usePermissionStore((s) => s.serverRoles);
+    const channelPermissions = usePermissionStore((s) => s.channelPermissions);
     const channelOverrides = usePermissionStore((s) => s.channelOverrides);
     const viewerUserId = useUserStore((s) => s.user?.id ?? '');
 
@@ -201,18 +202,19 @@ const MentionAutocomplete = forwardRef<MentionAutocompleteHandle, MentionAutocom
         };
       }
       const basePerm = serverPermissions[serverId] ?? 0n;
-      // Fold channel-level SBAC overrides into the base permission when a channel is in
-      // context, mirroring the control-plane resolver (internal/rbac/resolver.go). The
-      // server is the enforcement boundary; this only narrows/widens what we *suggest*.
-      const effectivePerm = channelId
-        ? resolveChannelPermissions(
-            basePerm,
-            channelOverrides[channelId],
-            viewerUserId,
-            viewerRoleIds,
-            viewerIsOwner
-          )
-        : basePerm;
+      // Prefer backend-computed channel permissions when loaded. Managers can still
+      // fall back to raw overrides because they are allowed to inspect SBAC state.
+      const loadedChannelPerm = channelId ? channelPermissions[channelId] : undefined;
+      const effectivePerm =
+        channelId && loadedChannelPerm === undefined
+          ? resolveChannelPermissions(
+              basePerm,
+              channelOverrides[channelId],
+              viewerUserId,
+              viewerRoleIds,
+              viewerIsOwner
+            )
+          : (loadedChannelPerm ?? basePerm);
       const hasMentionEveryone = hasPermission(effectivePerm, MENTION_EVERYONE);
       return {
         canMentionEveryone: hasMentionEveryone,
@@ -224,6 +226,7 @@ const MentionAutocomplete = forwardRef<MentionAutocompleteHandle, MentionAutocom
       serverId,
       channelId,
       serverPermissions,
+      channelPermissions,
       channelOverrides,
       viewerUserId,
       viewerRoleIds,

@@ -31,6 +31,8 @@ interface PermissionState {
   serverRoles: Record<string, Role[]>;
   // User's effective permissions per server (BigInt as string for storage)
   serverPermissions: Record<string, bigint>;
+  // User's effective permissions per channel
+  channelPermissions: Record<string, bigint>;
   // Channel overrides keyed by channel ID
   channelOverrides: Record<string, ChannelOverride[]>;
 
@@ -62,6 +64,7 @@ interface PermissionState {
 
   // --- Server permissions ---
   fetchServerPermissions: (serverId: string) => Promise<void>;
+  fetchChannelPermissions: (channelId: string) => Promise<void>;
 
   // --- Channel overrides (SBAC) ---
   fetchChannelOverrides: (channelId: string) => Promise<void>;
@@ -80,6 +83,7 @@ interface PermissionState {
 export const usePermissionStore = createStore<PermissionState>()((set, get) => ({
   serverRoles: {},
   serverPermissions: {},
+  channelPermissions: {},
   channelOverrides: {},
 
   hasServerPermission: (serverId: string, perm: bigint): boolean => {
@@ -234,6 +238,22 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
         serverPermissions: {
           ...state.serverPermissions,
           [serverId]: parsePermissions(data.permissions),
+        },
+      }));
+    } catch {
+      // Network error
+    }
+  },
+
+  fetchChannelPermissions: async (channelId: string) => {
+    try {
+      const res = await apiFetch(`/api/v1/channels/${channelId}/permissions`);
+      if (!res.ok) return;
+      const data = await res.json();
+      set((state) => ({
+        channelPermissions: {
+          ...state.channelPermissions,
+          [channelId]: parsePermissions(data.permissions),
         },
       }));
     } catch {

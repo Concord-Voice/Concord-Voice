@@ -2,6 +2,7 @@ import { render, screen, fireEvent, act } from '../../../test-utils';
 import MessageInput from '@/renderer/components/Chat/MessageInput';
 import { usePermissionStore } from '@/renderer/stores/permissionStore';
 import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
+import { Permissions } from '@/renderer/utils/permissions';
 import { vi } from 'vitest';
 import userEvent from '@testing-library/user-event';
 import { readFileSync } from 'node:fs';
@@ -79,23 +80,60 @@ describe('MessageInput', () => {
     uploadMockOverrides.hasFiles = false;
     uploadMockOverrides.isUploading = false;
     uploadMockOverrides.files = [];
+    usePermissionStore.setState({
+      serverPermissions: {},
+      channelPermissions: {},
+      channelOverrides: {},
+    });
     useSubscriptionStore.getState().reset(); // back to FREE_ENTITLEMENT (5120)
   });
 
-  it('warm-fetches channel SBAC overrides on mount when serverId + channelId are present', () => {
+  it('warm-fetches effective channel permissions on server channel mount', () => {
+    const fetchPermissionsSpy = vi.fn().mockResolvedValue(undefined);
+    usePermissionStore.setState({ fetchChannelPermissions: fetchPermissionsSpy } as never);
+    render(
+      <MessageInput onSendMessage={onSendMessage} serverId="server-1" channelId="channel-1" />
+    );
+    expect(fetchPermissionsSpy).toHaveBeenCalledWith('channel-1');
+  });
+
+  it('warm-fetches channel SBAC overrides when the viewer can manage channels', () => {
     const fetchSpy = vi.fn().mockResolvedValue(undefined);
-    usePermissionStore.setState({ fetchChannelOverrides: fetchSpy });
+    const fetchPermissionsSpy = vi.fn().mockResolvedValue(undefined);
+    usePermissionStore.setState({
+      fetchChannelOverrides: fetchSpy,
+      fetchChannelPermissions: fetchPermissionsSpy,
+      serverPermissions: { 'server-1': Permissions.MANAGE_CHANNELS },
+    } as never);
     render(
       <MessageInput onSendMessage={onSendMessage} serverId="server-1" channelId="channel-1" />
     );
     expect(fetchSpy).toHaveBeenCalledWith('channel-1');
   });
 
+  it('does not warm-fetch channel SBAC overrides without manage-channel permission', () => {
+    const fetchSpy = vi.fn().mockResolvedValue(undefined);
+    const fetchPermissionsSpy = vi.fn().mockResolvedValue(undefined);
+    usePermissionStore.setState({
+      fetchChannelOverrides: fetchSpy,
+      fetchChannelPermissions: fetchPermissionsSpy,
+    } as never);
+    render(
+      <MessageInput onSendMessage={onSendMessage} serverId="server-1" channelId="channel-1" />
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it('does not warm-fetch overrides in DM context (no serverId)', () => {
     const fetchSpy = vi.fn().mockResolvedValue(undefined);
-    usePermissionStore.setState({ fetchChannelOverrides: fetchSpy });
+    const fetchPermissionsSpy = vi.fn().mockResolvedValue(undefined);
+    usePermissionStore.setState({
+      fetchChannelOverrides: fetchSpy,
+      fetchChannelPermissions: fetchPermissionsSpy,
+    } as never);
     render(<MessageInput onSendMessage={onSendMessage} conversationId="dm-1" />);
     expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchPermissionsSpy).not.toHaveBeenCalled();
   });
 
   it('renders textarea', () => {

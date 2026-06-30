@@ -33,6 +33,7 @@ beforeEach(() => {
   usePermissionStore.setState({
     serverRoles: {},
     serverPermissions: {},
+    channelPermissions: {},
     channelOverrides: {},
   });
 });
@@ -45,6 +46,7 @@ describe('permissionStore', () => {
       const state = usePermissionStore.getState();
       expect(state.serverRoles).toEqual({});
       expect(state.serverPermissions).toEqual({});
+      expect(state.channelPermissions).toEqual({});
       expect(state.channelOverrides).toEqual({});
     });
   });
@@ -602,6 +604,33 @@ describe('permissionStore', () => {
 
       await usePermissionStore.getState().fetchServerPermissions('server-1');
       expect(usePermissionStore.getState().serverPermissions['server-2']).toBe(999n);
+    });
+  });
+
+  // ── fetchChannelPermissions ──────────────────────────────────────────
+
+  describe('fetchChannelPermissions', () => {
+    it('loads effective channel permissions and parses as bigint', async () => {
+      server.use(
+        http.get(`${API_BASE}/api/v1/channels/:id/permissions`, () => {
+          return HttpResponse.json({ permissions: '2048' });
+        })
+      );
+
+      await usePermissionStore.getState().fetchChannelPermissions('ch-1');
+      const perms = usePermissionStore.getState().channelPermissions['ch-1'];
+      expect(perms).toBe(2048n);
+    });
+
+    it('handles API error silently', async () => {
+      server.use(
+        http.get(`${API_BASE}/api/v1/channels/:id/permissions`, () => {
+          return HttpResponse.json({ error: 'Forbidden' }, { status: 403 });
+        })
+      );
+
+      await usePermissionStore.getState().fetchChannelPermissions('ch-1');
+      expect(usePermissionStore.getState().channelPermissions['ch-1']).toBeUndefined();
     });
   });
 

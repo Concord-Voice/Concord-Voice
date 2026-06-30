@@ -69,6 +69,7 @@ describe('MentionAutocomplete', () => {
           },
         ],
       },
+      channelPermissions: {},
       channelOverrides: {},
     });
   });
@@ -532,6 +533,16 @@ describe('MentionAutocomplete', () => {
             },
           ],
         },
+      });
+      render(<MentionAutocomplete {...defaultProps} text="@a" cursorPosition={2} />);
+      expect(screen.queryByText('all')).not.toBeInTheDocument();
+    });
+
+    it('uses loaded effective channel permissions when raw overrides are unavailable', () => {
+      usePermissionStore.setState({
+        serverPermissions: { 'server-1': MENTION_EVERYONE | MENTION_USERS | MENTION_ROLES },
+        channelPermissions: { 'channel-1': MENTION_USERS | MENTION_ROLES },
+        channelOverrides: {},
       });
       render(<MentionAutocomplete {...defaultProps} text="@a" cursorPosition={2} />);
       expect(screen.queryByText('all')).not.toBeInTheDocument();
