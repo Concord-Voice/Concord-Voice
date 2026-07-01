@@ -43,7 +43,7 @@ export function resetAllStores(): void {
   usePrivacyStore.getState().clearPrivacy();
   useMFAChallengeStore.getState().clearChallenge();
   useSavedGifsStore.setState({ gifs: [] });
-  useChannelScrollStore.setState({ positions: {} });
+  useChannelScrollStore.setState({ positions: {}, latestMessageIds: {} });
   useVoiceStore.getState().reset();
   useVoiceStore.setState({ channelVoiceMembers: {}, serverVoiceCounts: {} });
   useUpdateStatusStore.getState().reset();

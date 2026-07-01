@@ -184,7 +184,7 @@ describe('MessageList', () => {
 
   describe('scroll position preservation', () => {
     beforeEach(() => {
-      useChannelScrollStore.setState({ positions: {} });
+      useChannelScrollStore.setState({ positions: {}, latestMessageIds: {} });
     });
 
     it('restores saved scroll position on mount when persistenceKey has a saved value', () => {
@@ -200,6 +200,123 @@ describe('MessageList', () => {
       expect(list.scrollTop).toBe(350);
     });
 
+    it('ignores stale saved scroll when the latest message has changed', () => {
+      // regression for #2006
+      const originalScrollHeight = Object.getOwnPropertyDescriptor(
+        HTMLElement.prototype,
+        'scrollHeight'
+      );
+      Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+        configurable: true,
+        get() {
+          return this.classList?.contains('message-list') ? 1000 : 0;
+        },
+      });
+
+      try {
+        useChannelScrollStore.getState().saveScroll('chan-stale', 350, mockMessage.id);
+        render(
+          <MessageList
+            messages={[mockMessage, mockMessage2]}
+            currentUserId="user-1"
+            persistenceKey="chan-stale"
+          />
+        );
+
+        const list = document.querySelector('.message-list') as HTMLElement;
+        expect(list.scrollTop).toBe(1000);
+      } finally {
+        if (originalScrollHeight) {
+          Object.defineProperty(HTMLElement.prototype, 'scrollHeight', originalScrollHeight);
+        } else {
+          delete (HTMLElement.prototype as { scrollHeight?: number }).scrollHeight;
+        }
+      }
+    });
+
+    it('ignores stale saved scroll after cached messages finish loading', () => {
+      const originalScrollHeight = Object.getOwnPropertyDescriptor(
+        HTMLElement.prototype,
+        'scrollHeight'
+      );
+      Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+        configurable: true,
+        get() {
+          return this.classList?.contains('message-list') ? 1000 : 0;
+        },
+      });
+
+      const cachedLast = { ...mockMessage2, id: 'cached-last-message' };
+      const fetchedLast = { ...mockMessage2, id: 'fetched-last-message' };
+
+      try {
+        useChannelScrollStore.getState().saveScroll('chan-cached-stale', 350, cachedLast.id);
+        const { rerender } = render(
+          <MessageList
+            messages={[mockMessage, cachedLast]}
+            currentUserId="user-1"
+            isLoading={false}
+            persistenceKey="chan-cached-stale"
+          />
+        );
+        const list = document.querySelector('.message-list') as HTMLElement;
+        expect(list.scrollTop).toBe(350);
+
+        rerender(
+          <MessageList
+            messages={[mockMessage, cachedLast]}
+            currentUserId="user-1"
+            isLoading={true}
+            persistenceKey="chan-cached-stale"
+          />
+        );
+        rerender(
+          <MessageList
+            messages={[mockMessage, fetchedLast]}
+            currentUserId="user-1"
+            isLoading={false}
+            persistenceKey="chan-cached-stale"
+          />
+        );
+
+        expect(list.scrollTop).toBe(1000);
+      } finally {
+        if (originalScrollHeight) {
+          Object.defineProperty(HTMLElement.prototype, 'scrollHeight', originalScrollHeight);
+        } else {
+          delete (HTMLElement.prototype as { scrollHeight?: number }).scrollHeight;
+        }
+      }
+    });
+
+    it('keeps saved scroll when only the latest optimistic message server id changed', () => {
+      const optimisticLast = {
+        ...mockMessage2,
+        id: 'temp-last-message',
+        clientMessageId: 'client-last-message',
+      };
+      const confirmedLast = {
+        ...mockMessage2,
+        id: 'server-last-message',
+        clientMessageId: 'client-last-message',
+      };
+
+      useChannelScrollStore
+        .getState()
+        .saveScroll('chan-optimistic', 350, optimisticLast.clientMessageId);
+
+      render(
+        <MessageList
+          messages={[mockMessage, confirmedLast]}
+          currentUserId="user-1"
+          persistenceKey="chan-optimistic"
+        />
+      );
+
+      const list = document.querySelector('.message-list') as HTMLElement;
+      expect(list.scrollTop).toBe(350);
+    });
+
     it('saves scroll position on unmount', () => {
       const { unmount } = render(
         <MessageList messages={[mockMessage]} currentUserId="user-1" persistenceKey="chan-save" />
@@ -208,6 +325,56 @@ describe('MessageList', () => {
       Object.defineProperty(list, 'scrollTop', { value: 175, writable: true });
       unmount();
       expect(useChannelScrollStore.getState().getScroll('chan-save')).toBe(175);
+    });
+
+    it('keeps saved scroll when mounting during an in-flight load', () => {
+      useChannelScrollStore.getState().saveScroll('chan-loading-mount', 350, mockMessage.id);
+      const { rerender } = render(
+        <MessageList
+          messages={[mockMessage]}
+          currentUserId="user-1"
+          isLoading={true}
+          persistenceKey="chan-loading-mount"
+        />
+      );
+
+      rerender(
+        <MessageList
+          messages={[mockMessage]}
+          currentUserId="user-1"
+          isLoading={false}
+          persistenceKey="chan-loading-mount"
+        />
+      );
+
+      const list = document.querySelector('.message-list') as HTMLElement;
+      expect(list.scrollTop).toBe(350);
+    });
+
+    it('saves the latest scroll position when unmounting during loading', () => {
+      const { rerender, unmount } = render(
+        <MessageList
+          messages={[mockMessage]}
+          currentUserId="user-1"
+          isLoading={false}
+          persistenceKey="chan-loading-save"
+        />
+      );
+      const list = document.querySelector('.message-list') as HTMLElement;
+      Object.defineProperty(list, 'scrollTop', { value: 175, writable: true, configurable: true });
+
+      rerender(
+        <MessageList
+          messages={[mockMessage]}
+          currentUserId="user-1"
+          isLoading={true}
+          persistenceKey="chan-loading-save"
+        />
+      );
+      list.scrollTop = 425;
+      unmount();
+
+      expect(useChannelScrollStore.getState().getScroll('chan-loading-save')).toBe(425);
     });
 
     it('does not restore when there is no saved value (keeps auto-bottom behavior)', () => {

@@ -81,6 +81,10 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     onUnseenOnLeaveRef.current = onUnseenOnLeave;
     const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
     const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const restoredPersistenceKeyRef = useRef<string | null>(null);
+    const postLoadingRestoreCheckKeyRef = useRef<string | null>(null);
+    const latestMessage = messages.at(-1);
+    const latestMessageId = latestMessage?.clientMessageId ?? latestMessage?.id;
 
     // Real group flag for DM call-event rendering (#1568): when this list is a
     // DM thread, look up the conversation by persistenceKey (its id) and read
@@ -148,26 +152,54 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     // Scroll-position preservation across channel/DM switches.
     //
     // Uses useLayoutEffect so restoration happens after layout but before
-    // paint, avoiding a one-frame jump. When a saved offset exists we also
-    // flip isNearBottomRef to false so the sibling auto-pin effects (which
-    // watch ResizeObserver and the messages array) don't fight the restore
-    // and yank the user back to the bottom. On unmount we persist whatever
-    // the current scrollTop is so the next mount can restore it.
+    // paint, avoiding a one-frame jump. Restore only when the saved offset was
+    // captured against the current latest message; otherwise open at latest.
     useLayoutEffect(() => {
-      if (!persistenceKey) return;
+      if (!persistenceKey || !latestMessageId) return;
       const list = listRef.current;
       if (!list) return;
-      const saved = useChannelScrollStore.getState().getScroll(persistenceKey);
-      if (typeof saved === 'number') {
-        list.scrollTop = saved;
-        isNearBottomRef.current = false;
-      }
-      return () => {
+
+      const saveCurrentScroll = () => {
         // Use the element captured at setup so cleanup records scroll on the
         // same node; listRef.current may have changed by the time this runs.
-        useChannelScrollStore.getState().saveScroll(persistenceKey, list.scrollTop);
+        useChannelScrollStore
+          .getState()
+          .saveScroll(persistenceKey, list.scrollTop, latestMessageId);
       };
-    }, [persistenceKey]);
+
+      if (isLoading) {
+        if (restoredPersistenceKeyRef.current === persistenceKey) {
+          postLoadingRestoreCheckKeyRef.current = persistenceKey;
+          return saveCurrentScroll;
+        }
+        return;
+      }
+
+      const shouldRestoreSavedScroll = restoredPersistenceKeyRef.current !== persistenceKey;
+      const shouldValidateAfterLoading = postLoadingRestoreCheckKeyRef.current === persistenceKey;
+
+      if (shouldRestoreSavedScroll || shouldValidateAfterLoading) {
+        const scrollStore = useChannelScrollStore.getState();
+        const saved = scrollStore.getScroll(persistenceKey);
+        const savedLatestMessageId = scrollStore.getScrollLatestMessageId(persistenceKey);
+        if (
+          typeof saved === 'number' &&
+          (!savedLatestMessageId || savedLatestMessageId === latestMessageId)
+        ) {
+          if (shouldRestoreSavedScroll) {
+            list.scrollTop = saved;
+            isNearBottomRef.current = false;
+          }
+        } else if (typeof saved === 'number') {
+          list.scrollTop = list.scrollHeight;
+          isNearBottomRef.current = true;
+        }
+        restoredPersistenceKeyRef.current = persistenceKey;
+        postLoadingRestoreCheckKeyRef.current = null;
+      }
+
+      return saveCurrentScroll;
+    }, [persistenceKey, latestMessageId, isLoading]);
 
     // Auto-scroll when messages change (new message arrives) if user is near bottom.
     // Also track new messages arriving while the user is scrolled up.

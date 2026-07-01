@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { useChannelScrollStore } from '@/renderer/stores/channelScrollStore';
 
 beforeEach(() => {
-  useChannelScrollStore.setState({ positions: {} });
+  useChannelScrollStore.setState({ positions: {}, latestMessageIds: {} });
 });
 
 describe('channelScrollStore', () => {

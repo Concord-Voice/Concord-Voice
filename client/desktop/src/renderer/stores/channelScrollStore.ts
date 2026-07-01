@@ -12,21 +12,35 @@ import { createStore } from '../utils/createStore';
 
 export interface ChannelScrollState {
   positions: Record<string, number>;
-  saveScroll: (id: string, scrollTop: number) => void;
+  latestMessageIds: Record<string, string>;
+  saveScroll: (id: string, scrollTop: number, latestMessageId?: string) => void;
   getScroll: (id: string) => number | undefined;
+  getScrollLatestMessageId: (id: string) => string | undefined;
   clearScroll: (id: string) => void;
 }
 
 export const useChannelScrollStore = createStore<ChannelScrollState>()((set, get) => ({
   positions: {},
-  saveScroll: (id, scrollTop) =>
-    set((state) => ({ positions: { ...state.positions, [id]: scrollTop } })),
+  latestMessageIds: {},
+  saveScroll: (id, scrollTop, latestMessageId) =>
+    set((state) => {
+      const nextLatest = { ...state.latestMessageIds };
+      if (latestMessageId) nextLatest[id] = latestMessageId;
+      else delete nextLatest[id];
+      return {
+        positions: { ...state.positions, [id]: scrollTop },
+        latestMessageIds: nextLatest,
+      };
+    }),
   getScroll: (id) => get().positions[id],
+  getScrollLatestMessageId: (id) => get().latestMessageIds[id],
   clearScroll: (id) =>
     set((state) => {
       if (!(id in state.positions)) return state;
       const next = { ...state.positions };
+      const nextLatest = { ...state.latestMessageIds };
       delete next[id];
-      return { positions: next };
+      delete nextLatest[id];
+      return { positions: next, latestMessageIds: nextLatest };
     }),
 }));
