@@ -39,9 +39,9 @@ const ChatView: React.FC = () => {
     () => ({
       type: 'channel' as const,
       id: activeChannelId || '',
-      serverId: activeServerId ?? undefined,
+      serverId: activeChannel?.server_id ?? activeServerId ?? undefined,
     }),
-    [activeChannelId, activeServerId]
+    [activeChannelId, activeChannel?.server_id, activeServerId]
   );
 
   const {

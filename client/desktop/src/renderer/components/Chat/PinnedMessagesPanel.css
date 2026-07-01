@@ -104,6 +104,26 @@
   margin-bottom: 8px;
 }
 
+.pinned-message-content .attachment-display {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.pinned-message-content
+  :is(.attachment-image-container, .attachment-media-container, .attachment-file-card) {
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.pinned-message-content :is(.attachment-image, .attachment-video, .attachment-audio) {
+  max-width: 100%;
+}
+
+.pinned-message-content .themed-media-player {
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
 .pinned-message-encrypted {
   font-style: italic;
   color: var(--text-muted);

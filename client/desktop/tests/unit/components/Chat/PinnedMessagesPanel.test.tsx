@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import PinnedMessagesPanel from '@/renderer/components/Chat/PinnedMessagesPanel';
 import { vi } from 'vitest';
@@ -81,6 +83,26 @@ describe('PinnedMessagesPanel', () => {
   it('returns null when not open', () => {
     const { container } = render(<PinnedMessagesPanel {...defaultProps} isOpen={false} />);
     expect(container.querySelector('.pinned-panel-backdrop')).not.toBeInTheDocument();
+  });
+
+  it('constrains pinned attachment media to the card width', () => {
+    const css = readFileSync(
+      resolve(__dirname, '../../../../src/renderer/components/Chat/PinnedMessagesPanel.css'),
+      'utf-8'
+    );
+
+    expect(css).toMatch(
+      /\.pinned-message-content\s+\.attachment-display\s*\{[^}]*max-width:\s*100%;[^}]*\}/s
+    );
+    expect(css).toMatch(
+      /\.pinned-message-content\s+:is\(\s*\.attachment-image-container,\s*\.attachment-media-container,\s*\.attachment-file-card\s*\)\s*\{[^}]*max-width:\s*100%;[^}]*box-sizing:\s*border-box;[^}]*\}/s
+    );
+    expect(css).toMatch(
+      /\.pinned-message-content\s+:is\(\.attachment-image,\s*\.attachment-video,\s*\.attachment-audio\)\s*\{[^}]*max-width:\s*100%;[^}]*\}/s
+    );
+    expect(css).toMatch(
+      /\.pinned-message-content\s+\.themed-media-player\s*\{[^}]*max-width:\s*100%;[^}]*box-sizing:\s*border-box;[^}]*\}/s
+    );
   });
 
   it('shows loading state then renders pinned messages', async () => {

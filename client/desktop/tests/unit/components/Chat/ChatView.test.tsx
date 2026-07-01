@@ -4,6 +4,8 @@ import { useChatStore } from '@/renderer/stores/chatStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useServerStore } from '@/renderer/stores/serverStore';
 import { useUnreadStore } from '@/renderer/stores/unreadStore';
+import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { PIN_MESSAGES } from '@/renderer/utils/permissions';
 import { mockUser, mockChannel, mockMessage, mockMessage2 } from '../../../mocks/fixtures';
 
 // Mock apiFetch to prevent hanging fetches
@@ -285,6 +287,36 @@ describe('ChatView', () => {
     render(<ChatView />);
     const input = screen.getByTestId('message-input');
     expect(input).toHaveAttribute('data-channel-id', 'channel-1');
+  });
+
+  it('enables server-channel pinning from the channel server id when activeServerId is stale', () => {
+    useServerStore.setState({ activeServerId: null });
+    usePermissionStore.setState({ serverPermissions: { 'server-1': PIN_MESSAGES } });
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+
+    render(<ChatView />);
+
+    expect(capturedMessageListProps.canPin).toBe(true);
+  });
+
+  it('falls back to activeServerId for pin permission when channel metadata is unavailable', () => {
+    useChannelStore.setState({ channels: [], activeChannelId: 'channel-unknown' });
+    useServerStore.setState({ activeServerId: 'server-1' });
+    usePermissionStore.setState({ serverPermissions: { 'server-1': PIN_MESSAGES } });
+
+    render(<ChatView />);
+
+    expect(capturedMessageListProps.canPin).toBe(true);
+  });
+
+  it('disables pin permission when no server context is available', () => {
+    useChannelStore.setState({ channels: [], activeChannelId: 'channel-unknown' });
+    useServerStore.setState({ activeServerId: null });
+    usePermissionStore.setState({ serverPermissions: { 'server-1': PIN_MESSAGES } });
+
+    render(<ChatView />);
+
+    expect(capturedMessageListProps.canPin).toBe(false);
   });
 
   it('disables input when no user', () => {
