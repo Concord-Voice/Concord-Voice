@@ -1,5 +1,5 @@
-export const MAX_AVATAR_SIZE = 1024 * 1024; // 1MB
-export const MAX_HEADER_SIZE = 2 * 1024 * 1024; // 2MB
+export const MAX_AVATAR_SIZE = 5 * 1024 * 1024; // 5 MiB
+export const MAX_HEADER_SIZE = 5 * 1024 * 1024; // 5 MiB
 export const ALLOWED_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 export const USERNAME_MIN = 3;
 export const USERNAME_MAX = 32;

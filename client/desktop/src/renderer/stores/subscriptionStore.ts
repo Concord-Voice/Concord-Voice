@@ -29,8 +29,8 @@ export const FREE_ENTITLEMENT: Entitlement = {
   maxScreensharePublishers: 1,
   maxMessageChars: 5120,
   maxAttachmentBytes: 26214400,
-  maxAvatarBytes: 1048576,
-  maxBannerBytes: 2097152,
+  maxAvatarBytes: 5242880,
+  maxBannerBytes: 5242880,
   allowAnimatedProfile: false,
   usernameChangeIntervalSeconds: 31536000,
 };

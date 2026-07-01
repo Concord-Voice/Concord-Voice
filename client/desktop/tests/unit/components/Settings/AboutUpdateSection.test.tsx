@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, userEvent } from '../../../test-utils';
+import { render, screen, fireEvent, userEvent, within } from '../../../test-utils';
 import { vi } from 'vitest';
 
 vi.mock('@/renderer/config', () => ({
@@ -211,6 +211,16 @@ describe('AboutUpdateSection', () => {
     expect(screen.getByText('Check for Updates')).toBeInTheDocument();
   });
 
+  it('does not render the hidden Client Info interface update row', async () => {
+    render(<AboutUpdateSection />);
+    await vi.waitFor(() => {
+      expect(screen.getByText('✓ Up to date')).toBeInTheDocument();
+    });
+    const clientInfo = screen.getByText('Client Info').closest('details') as HTMLElement;
+    expect(within(clientInfo).queryByText('Interface')).toBeNull();
+    expect(screen.queryByRole('button', { name: /Load latest UI/ })).toBeNull();
+  });
+
   it('shows pre-release enabled description when on', async () => {
     render(<AboutUpdateSection />);
     await vi.waitFor(() => {
@@ -240,6 +250,14 @@ describe('AboutUpdateSection', () => {
     render(<AboutUpdateSection />);
     await user.click(screen.getByText('Check for Updates'));
     expect(mockCheckForUpdates).toHaveBeenCalled();
+  });
+
+  it('checks desktop and interface updates from the unified button', async () => {
+    const user = userEvent.setup();
+    render(<AboutUpdateSection />);
+    await user.click(screen.getByText('Check for Updates'));
+    expect(mockCheckForUpdates).toHaveBeenCalledTimes(1);
+    expect(mockSpaCheckForUpdate).toHaveBeenCalledTimes(2);
   });
 
   it('shows Checking text while checking for updates', async () => {
@@ -298,6 +316,21 @@ describe('AboutUpdateSection', () => {
       expect(screen.getByText('v0.3.0 ready to install')).toBeInTheDocument();
       expect(screen.getByText('Restart Now')).toBeInTheDocument();
     });
+  });
+
+  it('opens Update Settings from the App Version update indicator', async () => {
+    const user = userEvent.setup();
+    render(<AboutUpdateSection />);
+    eventCallbacks.updateDownloaded({ version: '0.3.0' });
+    const updateSettings = screen
+      .getByText('Update Settings')
+      .closest('details') as HTMLDetailsElement;
+
+    expect(updateSettings.open).toBe(false);
+    await user.click(await screen.findByRole('button', { name: /App update ready/i }));
+
+    expect(updateSettings.open).toBe(true);
+    expect(screen.getByText('Restart Now')).toBeInTheDocument();
   });
 
   it('calls installUpdate when Restart Now is clicked', async () => {
@@ -423,6 +456,26 @@ describe('AboutUpdateSection', () => {
     await vi.waitFor(() => {
       expect(screen.getByText('Offline fallback UI')).toBeInTheDocument();
     });
+    expect(screen.getByRole('button', { name: /Load latest UI/ })).toBeInTheDocument();
+  });
+
+  it('opens Update Settings from the SPA Build update indicator', async () => {
+    const user = userEvent.setup();
+    mockSpaCheckForUpdate.mockResolvedValueOnce({
+      currentMode: 'remote',
+      remoteAvailable: true,
+      newerBytesAvailable: true,
+      reason: 'remote SPA compatible',
+    });
+    render(<AboutUpdateSection />);
+    const updateSettings = screen
+      .getByText('Update Settings')
+      .closest('details') as HTMLDetailsElement;
+
+    expect(updateSettings.open).toBe(false);
+    await user.click(await screen.findByRole('button', { name: /Interface update available/i }));
+
+    expect(updateSettings.open).toBe(true);
     expect(screen.getByRole('button', { name: /Load latest UI/ })).toBeInTheDocument();
   });
 

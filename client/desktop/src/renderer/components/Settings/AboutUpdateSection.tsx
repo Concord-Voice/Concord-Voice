@@ -95,6 +95,12 @@ const AboutUpdateSection: React.FC = () => {
   const [logPathCopied, setLogPathCopied] = useState(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const openUpdateSettings = useCallback(() => {
+    const el = document.getElementById('section-update-settings');
+    if (el instanceof HTMLDetailsElement) el.open = true;
+    el?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+  }, []);
+
   // Cleanup copy timer on unmount to avoid state update on unmounted component
   useEffect(() => {
     return () => {
@@ -145,17 +151,6 @@ const AboutUpdateSection: React.FC = () => {
     };
   }, []);
 
-  const handleCheckForUpdates = useCallback(async () => {
-    setUpdateStatus('checking');
-    setErrorMessage('');
-    try {
-      await globalThis.electron?.checkForUpdates();
-    } catch {
-      setUpdateStatus('error');
-      setErrorMessage('Failed to check for updates.');
-    }
-  }, []);
-
   // SPA (UI) update axis: is the renderer on the bundled fallback vs remote, and
   // are newer remote-SPA bytes available? Read-only; the main process derives
   // everything (no URL crosses the bridge).
@@ -176,6 +171,25 @@ const AboutUpdateSection: React.FC = () => {
       setSpaStatus('error');
     }
   }, []);
+
+  const handleCheckForUpdates = useCallback(async () => {
+    setUpdateStatus('checking');
+    setErrorMessage('');
+    let desktopCheckFailed = false;
+    const desktopCheck = (async () => {
+      try {
+        await globalThis.electron?.checkForUpdates();
+      } catch {
+        desktopCheckFailed = true;
+      }
+    })();
+
+    await Promise.all([desktopCheck, refreshSpaStatus()]);
+    if (desktopCheckFailed) {
+      setUpdateStatus('error');
+      setErrorMessage('Failed to check for updates.');
+    }
+  }, [refreshSpaStatus]);
 
   // "Load latest UI": main re-resolves the SPA source and navigates the window
   // to the validated remote SPA. On success the renderer tears down and this
@@ -223,6 +237,18 @@ const AboutUpdateSection: React.FC = () => {
     globalThis.electron?.setAllowPrerelease?.(enabled);
   }, []);
 
+  let appUpdateIndicator: { label: string; ariaLabel: string } | null = null;
+  if (updateStatus === 'downloaded') {
+    appUpdateIndicator = { label: 'Ready', ariaLabel: 'App update ready' };
+  } else if (updateStatus === 'available' || updateStatus === 'downloading') {
+    appUpdateIndicator = { label: 'Update', ariaLabel: 'App update available' };
+  }
+
+  const spaUpdateIndicator =
+    spaStatus === 'newer-available'
+      ? { label: 'Update', ariaLabel: 'Interface update available' }
+      : null;
+
   return (
     <>
       {/* Client Info */}
@@ -230,34 +256,32 @@ const AboutUpdateSection: React.FC = () => {
         <div className="about-info-grid">
           <div className="about-info-row">
             <span className="about-info-label">App Version</span>
-            <span className="about-info-value">v{appVersion || '...'}</span>
+            <span className="about-info-value about-version-value">
+              <span>v{appVersion || '...'}</span>
+              {appUpdateIndicator && (
+                <button
+                  className="about-update-chip"
+                  onClick={openUpdateSettings}
+                  aria-label={appUpdateIndicator.ariaLabel}
+                  title="Go to Update Settings"
+                >
+                  {appUpdateIndicator.label}
+                </button>
+              )}
+            </span>
           </div>
           <div className="about-info-row">
             <span className="about-info-label">SPA Build</span>
-            <span className="about-info-value">{compactSpaHash(SPA_VERSION) ?? SPA_VERSION}</span>
-          </div>
-          <div className="about-info-row">
-            <span className="about-info-label">Interface</span>
-            <span className="about-info-value about-info-value--log">
-              <span className="about-info-log-path">
-                {spaStatus === 'checking' && 'Checking…'}
-                {spaStatus === 'on-latest' && '✓ Up to date'}
-                {spaStatus === 'newer-available' && 'Newer UI available'}
-                {spaStatus === 'on-bundled' && 'Offline fallback UI'}
-                {spaStatus === 'error' && "Couldn't check"}
-                {spaStatus === 'idle' && 'Reload to refresh'}
-              </span>
-              {(spaStatus === 'on-bundled' ||
-                spaStatus === 'newer-available' ||
-                spaStatus === 'error' ||
-                spaStatus === 'idle') && (
+            <span className="about-info-value about-version-value">
+              <span>{compactSpaHash(SPA_VERSION) ?? SPA_VERSION}</span>
+              {spaUpdateIndicator && (
                 <button
-                  className="about-info-copy-btn"
-                  disabled={spaReloading}
-                  onClick={handleLoadLatestUi}
-                  title="Reloads the interface to the latest version. Brief reconnect — you won't be logged out."
+                  className="about-update-chip"
+                  onClick={openUpdateSettings}
+                  aria-label={spaUpdateIndicator.ariaLabel}
+                  title="Go to Update Settings"
                 >
-                  {spaReloading ? 'Loading…' : 'Load latest UI'}
+                  {spaUpdateIndicator.label}
                 </button>
               )}
             </span>
@@ -383,6 +407,33 @@ const AboutUpdateSection: React.FC = () => {
               Last checked: {lastChecked.toLocaleTimeString()}
             </span>
           )}
+        </div>
+
+        <div className="about-update-status about-update-status--interface">
+          <div className="about-update-status-row">
+            <span className="about-update-status-label">Interface</span>
+            <span className="about-update-status-text">
+              {spaStatus === 'checking' && 'Checking...'}
+              {spaStatus === 'on-latest' && '✓ Up to date'}
+              {spaStatus === 'newer-available' && 'Newer UI available'}
+              {spaStatus === 'on-bundled' && 'Offline fallback UI'}
+              {spaStatus === 'error' && "Couldn't check"}
+              {spaStatus === 'idle' && 'Reload to refresh'}
+            </span>
+            {(spaStatus === 'on-bundled' ||
+              spaStatus === 'newer-available' ||
+              spaStatus === 'error' ||
+              spaStatus === 'idle') && (
+              <button
+                className="about-update-action-btn"
+                disabled={spaReloading}
+                onClick={handleLoadLatestUi}
+                title="Reloads the interface to the latest version. Brief reconnect — you won't be logged out."
+              >
+                {spaReloading ? 'Loading...' : 'Load latest UI'}
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Update status */}

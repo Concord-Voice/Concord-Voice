@@ -34,9 +34,7 @@ describe('useImageUpload', () => {
 
   it('passes through a data: initialUrl unchanged for preview and wire value (#1586)', () => {
     const dataUrl = 'data:image/png;base64,AAAA';
-    const { result } = renderHook(() =>
-      useImageUpload({ ...defaultOptions, initialUrl: dataUrl })
-    );
+    const { result } = renderHook(() => useImageUpload({ ...defaultOptions, initialUrl: dataUrl }));
     expect(result.current.preview).toBe(dataUrl);
     expect(result.current.imageUrl).toBe(dataUrl);
   });
@@ -223,18 +221,18 @@ describe('useImageUpload', () => {
     });
   });
 
-  it('shows 2MB in error message for larger size limits', () => {
+  it('shows the configured limit in error messages', () => {
     const onError = vi.fn();
     const { result } = renderHook(() =>
       useImageUpload({
         ...defaultOptions,
-        maxSize: 2 * 1024 * 1024,
+        maxSize: 5 * 1024 * 1024,
         onError,
       })
     );
 
     const largeFile = new File(['data'], 'big.png', { type: 'image/png' });
-    Object.defineProperty(largeFile, 'size', { value: 3 * 1024 * 1024 });
+    Object.defineProperty(largeFile, 'size', { value: 6 * 1024 * 1024 });
 
     act(() =>
       result.current.handleChange({
@@ -242,7 +240,7 @@ describe('useImageUpload', () => {
       } as unknown as React.ChangeEvent<HTMLInputElement>)
     );
 
-    expect(onError).toHaveBeenCalledWith('Image must be smaller than 2MB');
+    expect(onError).toHaveBeenCalledWith('Image must be smaller than 5MB');
   });
 
   it('provides a stable fileInputRef', () => {

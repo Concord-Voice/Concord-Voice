@@ -349,9 +349,9 @@ func TestUploadAvatarTooLarge(t *testing.T) {
 	ts := setupMediaTest(t)
 	userID := ts.createTestUser(t, "bigavatar")
 
-	// Create a body that exceeds the free-tier MaxAvatarBytes (1 MiB).
-	// setupMediaTest uses freeTierStub so the limit is entitlements.TierFree (1 MiB).
-	const freeAvatarLimit = 1 * 1024 * 1024 // matches entitlements.freeEntitlement.MaxAvatarBytes
+	// Create a body that exceeds the free-tier MaxAvatarBytes (5 MiB).
+	// setupMediaTest uses freeTierStub so the limit is entitlements.TierFree (5 MiB).
+	const freeAvatarLimit = 5 * 1024 * 1024 // matches entitlements.freeEntitlement.MaxAvatarBytes
 	bigData := make([]byte, freeAvatarLimit+1024)
 	body, ct := multipartBody(t, "file", "huge.png", bigData, nil)
 
@@ -418,6 +418,40 @@ func TestUploadServerIconInvalidServerID(t *testing.T) {
 	w := ts.doMultipart(ts.handler.UploadServerIcon, "POST", pathUploadServerIcon, owner, body, ct)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestEnforceTier1UploadLimit_GroundspeedServerImagesRejectOverFiveMiB(t *testing.T) {
+	for _, purpose := range []string{purposeServerIcon, purposeServerBanner} {
+		t.Run(purpose, func(t *testing.T) {
+			h := &Handler{serverTiers: serverTierStub{entitlements.TierGroundspeed}}
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest("POST", "/", nil)
+
+			ok := enforceTier1UploadLimit(c, h, purpose, uuid.New().String(), 5*1024*1024+1, serverImageMaxUpload)
+
+			assert.False(t, ok)
+			assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+			resp := parseBody(t, w)
+			assert.Equal(t, float64(5*1024*1024), resp["max_size"])
+		})
+	}
+}
+
+func TestEnforceTier1UploadLimit_MachServerImagesAllowFiveMiBPlusOne(t *testing.T) {
+	for _, purpose := range []string{purposeServerIcon, purposeServerBanner} {
+		t.Run(purpose, func(t *testing.T) {
+			h := &Handler{serverTiers: serverTierStub{entitlements.TierMach}}
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest("POST", "/", nil)
+
+			ok := enforceTier1UploadLimit(c, h, purpose, uuid.New().String(), 5*1024*1024+1, serverImageMaxUpload)
+
+			assert.True(t, ok)
+			assert.Equal(t, http.StatusOK, w.Code)
+		})
+	}
 }
 
 // =====================================================================
@@ -1076,23 +1110,23 @@ func doImageUpload(t *testing.T, handlerFunc gin.HandlerFunc, nBytes int) *httpt
 	return w
 }
 
-// TestUploadAvatar_FreeCapsAtOneMiB: 2 MiB > free 1 MiB → 413.
-func TestUploadAvatar_FreeCapsAtOneMiB(t *testing.T) {
+// TestUploadAvatar_FreeCapsAtFiveMiB: 6 MiB > free 5 MiB -> 413.
+func TestUploadAvatar_FreeCapsAtFiveMiB(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 	cfg := &config.Config{}
 	free := NewHandler(db, nil, logger.New("test"), cfg, nil, tierStub{entitlements.TierFree})
-	w := doImageUpload(t, free.UploadAvatar, 2*1024*1024)
+	w := doImageUpload(t, free.UploadAvatar, 6*1024*1024)
 	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 }
 
-// TestUploadBanner_FreeCapsAtTwoMiB: 3 MiB > free 2 MiB → 413.
-func TestUploadBanner_FreeCapsAtTwoMiB(t *testing.T) {
+// TestUploadBanner_FreeCapsAtFiveMiB: 6 MiB > free 5 MiB -> 413.
+func TestUploadBanner_FreeCapsAtFiveMiB(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 	cfg := &config.Config{}
 	free := NewHandler(db, nil, logger.New("test"), cfg, nil, tierStub{entitlements.TierFree})
-	w := doImageUpload(t, free.UploadBanner, 3*1024*1024)
+	w := doImageUpload(t, free.UploadBanner, 6*1024*1024)
 	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 }
 
@@ -1100,3 +1134,7 @@ func TestUploadBanner_FreeCapsAtTwoMiB(t *testing.T) {
 type tierStub struct{ tier string }
 
 func (s tierStub) GetTier(context.Context, string) string { return s.tier }
+
+type serverTierStub struct{ tier string }
+
+func (s serverTierStub) GetServerTier(context.Context, string) string { return s.tier }

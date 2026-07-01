@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,6 +28,20 @@ const (
 	methodPatch          = "PATCH"
 	testPassword         = "TestPassword123!" //nolint:gosec // G101 false positive: test credential, not used in production
 )
+
+const dataImagePNGPrefix = "data:image/png;base64,"
+
+func oversizedFreeAvatarDataURL() string {
+	return oversizedProfileDataURL(entitlements.For(entitlements.TierFree).MaxAvatarBytes)
+}
+
+func oversizedFreeBannerDataURL() string {
+	return oversizedProfileDataURL(entitlements.For(entitlements.TierFree).MaxBannerBytes)
+}
+
+func oversizedProfileDataURL(maxBytes int64) string {
+	return dataImagePNGPrefix + strings.Repeat("A", base64.StdEncoding.EncodedLen(int(maxBytes))+100)
+}
 
 func setupTS(t *testing.T) *testhelpers.TestServer {
 	t.Helper()
@@ -282,19 +297,19 @@ func TestUpdateMeUsernameChangeFreeBlockedAt100Days(t *testing.T) {
 
 // TestUpdateMeAvatarDataURLCappedAtFreeForAllTiers: inline data-URL avatars are
 // broadcast verbatim to every client (UpdateMe -> BroadcastToAll), so the inline cap is
-// the FREE value (1 MiB) for ALL tiers — a >1 MiB data-URL is rejected even for premium.
-// Premium's 5 MiB allowance applies on the MinIO upload path (covered in media tests),
+// the FREE value (5 MiB) for ALL tiers — a >5 MiB data-URL is rejected even for premium.
+// Premium's 8 MiB allowance applies on the MinIO upload path (covered in media tests),
 // which broadcasts a storage key, not the blob (#1298 review — Gitar amplification guard).
 func TestUpdateMeAvatarDataURLCappedAtFreeForAllTiers(t *testing.T) {
 	ts := setupTS(t)
-	// base64 payload encoding ~1.5 MiB raw: over the free 1 MiB inline cap.
-	big := "data:image/png;base64," + strings.Repeat("A", base64.StdEncoding.EncodedLen(1572864))
+	// Encoded data URL over the free inline string-length cap.
+	big := oversizedFreeAvatarDataURL()
 
 	freeUser := ts.CreateTestUser(t, "freeavatardata")
 	wFree := ts.DoRequest(methodPatch, urlUsersMe, map[string]interface{}{
 		"avatar_url": big,
 	}, testhelpers.AuthHeaders(freeUser.AccessToken))
-	assert.Equal(t, http.StatusBadRequest, wFree.Code, "free rejects >1 MiB inline data-URL")
+	assert.Equal(t, http.StatusBadRequest, wFree.Code, "free rejects >5 MiB inline data-URL")
 
 	premUser := ts.CreateTestUser(t, "premavatardata")
 	grantPremium(t, ts, premUser.ID)

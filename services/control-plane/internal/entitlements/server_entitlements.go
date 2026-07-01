@@ -38,6 +38,8 @@ type ServerEntitlement struct {
 	// Cosmetic count-gates (A10 — server-scoped).
 	MaxServerCustomEmoji int
 	MaxServerStickers    int
+	MaxServerIconBytes   int64
+	MaxServerBannerBytes int64
 
 	// Shared storage pool (A11 — value OPEN, see ServerStoragePoolUnset).
 	MaxServerStoragePoolBytes int64
@@ -54,6 +56,8 @@ var (
 		Tier:                         TierGroundspeed,
 		MaxServerCustomEmoji:         75,
 		MaxServerStickers:            10,
+		MaxServerIconBytes:           5_242_880,
+		MaxServerBannerBytes:         5_242_880,
 		MaxServerStoragePoolBytes:    ServerStoragePoolUnset,
 		UnlockServerAudioQualityCaps: false,
 		UnlockServerVideoQualityCaps: false,
@@ -63,6 +67,8 @@ var (
 		Tier:                         TierMach,
 		MaxServerCustomEmoji:         125,
 		MaxServerStickers:            75,
+		MaxServerIconBytes:           8_388_608,
+		MaxServerBannerBytes:         8_388_608,
 		MaxServerStoragePoolBytes:    ServerStoragePoolUnset, // A11-pending; same sentinel as free until #1523
 		UnlockServerAudioQualityCaps: true,
 		UnlockServerVideoQualityCaps: true,

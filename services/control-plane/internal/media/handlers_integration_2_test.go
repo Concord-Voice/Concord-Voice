@@ -12,6 +12,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 )
 
 const (
@@ -67,7 +69,7 @@ func TestUploadBannerTooLarge(t *testing.T) {
 	ts := setupMediaTest(t)
 	userID := ts.createTestUser(t, "bigbanner")
 
-	bigData := make([]byte, bannerMaxUpload+1024)
+	bigData := make([]byte, entitlements.For(entitlements.TierFree).MaxBannerBytes+1024)
 	body, ct := multipartBody(t, "file", "huge.png", bigData, nil)
 
 	w := ts.doMultipart(ts.handler.UploadBanner, "POST", pathUploadBanner, userID, body, ct)

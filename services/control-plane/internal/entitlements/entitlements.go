@@ -72,8 +72,8 @@ var (
 		MaxScreensharePublishers: 1,
 		MaxMessageChars:          5120,
 		MaxAttachmentBytes:       26_214_400, // 25 MiB — matches current UPLOAD_MAX_SIZE
-		MaxAvatarBytes:           1_048_576,  // 1 MiB
-		MaxBannerBytes:           2_097_152,  // 2 MiB
+		MaxAvatarBytes:           5_242_880,  // 5 MiB
+		MaxBannerBytes:           5_242_880,  // 5 MiB
 		AllowAnimatedProfile:     false,
 		UsernameChangeInterval:   365 * 24 * time.Hour,
 	}
@@ -93,8 +93,8 @@ var (
 		MaxScreensharePublishers: 3,
 		MaxMessageChars:          10240,
 		MaxAttachmentBytes:       536_870_912, // 512 MiB
-		MaxAvatarBytes:           5_242_880,   // 5 MiB
-		MaxBannerBytes:           5_242_880,   // 5 MiB
+		MaxAvatarBytes:           8_388_608,   // 8 MiB
+		MaxBannerBytes:           8_388_608,   // 8 MiB
 		AllowAnimatedProfile:     true,
 		UsernameChangeInterval:   91 * 24 * time.Hour,
 	}

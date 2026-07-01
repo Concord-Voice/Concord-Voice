@@ -1,11 +1,13 @@
 package servers_test
 
 import (
+	"encoding/base64"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,6 +20,18 @@ const (
 	dataImagePrefix    = "data:image/png;base64,"
 	testDataURL        = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 )
+
+func oversizedGroundspeedServerIconDataURL() string {
+	return oversizedServerDataURL(entitlements.ForServer(entitlements.TierGroundspeed).MaxServerIconBytes)
+}
+
+func oversizedGroundspeedServerBannerDataURL() string {
+	return oversizedServerDataURL(entitlements.ForServer(entitlements.TierGroundspeed).MaxServerBannerBytes)
+}
+
+func oversizedServerDataURL(maxBytes int64) string {
+	return dataImagePrefix + strings.Repeat("A", base64.StdEncoding.EncodedLen(int(maxBytes))+100)
+}
 
 // =============================================================================
 // CreateServer edge cases
@@ -74,7 +88,7 @@ func TestCreateServerWithTooLargeIcon(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "createlargeicon")
 
-	largeIcon := dataImagePrefix + strings.Repeat("A", 1500001)
+	largeIcon := oversizedGroundspeedServerIconDataURL()
 	w := ts.DoRequest("POST", pathServers, map[string]interface{}{
 		"name":     "Large Icon Server",
 		"icon_url": largeIcon,
@@ -115,7 +129,7 @@ func TestCreateServerWithTooLargeBanner(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "createlargebanner")
 
-	largeBanner := dataImagePrefix + strings.Repeat("A", 3000001)
+	largeBanner := oversizedGroundspeedServerBannerDataURL()
 	w := ts.DoRequest("POST", pathServers, map[string]interface{}{
 		"name":       "Large Banner Server",
 		"banner_url": largeBanner,
@@ -351,7 +365,7 @@ func TestUpdateServerWithTooLargeDataURLIcon(t *testing.T) {
 	user := ts.CreateTestUser(t, "updlrgdataicon")
 	serverID := ts.CreateTestServer(t, user.ID, "Large Data Icon Server")
 
-	largeIcon := dataImagePrefix + strings.Repeat("A", 1500001)
+	largeIcon := oversizedGroundspeedServerIconDataURL()
 	w := ts.DoRequest("PATCH", pathServersSlash+serverID, map[string]interface{}{
 		"name":     "Large Icon",
 		"icon_url": largeIcon,
@@ -364,12 +378,38 @@ func TestUpdateServerWithTooLargeDataURLBanner(t *testing.T) {
 	user := ts.CreateTestUser(t, "updlrgdatabnr")
 	serverID := ts.CreateTestServer(t, user.ID, "Large Data Banner Server")
 
-	largeBanner := dataImagePrefix + strings.Repeat("A", 3000001)
+	largeBanner := oversizedGroundspeedServerBannerDataURL()
 	w := ts.DoRequest("PATCH", pathServersSlash+serverID, map[string]interface{}{
 		"name":       "Large Banner",
 		"banner_url": largeBanner,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestUpdateServerMachTierStillRejectsGroundspeedInlineDataURL(t *testing.T) {
+	t.Setenv("INSTANCE_TYPE", "self-hosted")
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "updmachinline")
+	serverID := ts.CreateTestServer(t, user.ID, "Mach Inline Server")
+
+	tierResp := ts.DoRequest("GET", pathServersSlash+serverID, nil, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, tierResp.Code)
+	var tierBody map[string]interface{}
+	testhelpers.ParseJSON(t, tierResp, &tierBody)
+	server := tierBody["server"].(map[string]interface{})
+	require.Equal(t, entitlements.TierMach, server["server_tier"])
+
+	iconResp := ts.DoRequest("PATCH", pathServersSlash+serverID, map[string]interface{}{
+		"name":     "Mach Inline Server",
+		"icon_url": oversizedGroundspeedServerIconDataURL(),
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, iconResp.Code)
+
+	bannerResp := ts.DoRequest("PATCH", pathServersSlash+serverID, map[string]interface{}{
+		"name":       "Mach Inline Server",
+		"banner_url": oversizedGroundspeedServerBannerDataURL(),
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, bannerResp.Code)
 }
 
 func TestUpdateServerWithAllowEmbeddedContent(t *testing.T) {

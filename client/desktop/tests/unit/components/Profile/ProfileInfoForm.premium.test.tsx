@@ -46,8 +46,8 @@ const entitlementOverrides: Record<string, unknown> = {};
 function freeEntitlement() {
   return {
     usernameChangeIntervalSeconds: 31_536_000,
-    maxAvatarBytes: 1_048_576,
-    maxBannerBytes: 2_097_152,
+    maxAvatarBytes: 5_242_880,
+    maxBannerBytes: 5_242_880,
     ...entitlementOverrides,
   };
 }
@@ -113,11 +113,21 @@ describe('ProfileInfoForm — L8 username cadence', () => {
 // ─── L9: avatar / banner size upsell ────────────────────────────────────────
 
 describe('ProfileInfoForm — L9 avatar/banner size upsell', () => {
-  it('avatar over 1 MB: shows the non-modal banner with sizes', () => {
+  it('avatar hint shows the current free floor', () => {
+    render(<ProfileInfoForm />);
+    const hint = document.querySelector(
+      '.profile-avatar-actions .profile-avatar-actions-label'
+    ) as HTMLElement;
+    expect(hint.textContent?.replace(/\s+/g, ' ')).toContain(
+      'Click to upload an avatar (PNG, JPEG, GIF, WebP — max 5.0 MB)'
+    );
+  });
+
+  it('avatar over 5 MB: shows the non-modal banner with sizes', () => {
     render(<ProfileInfoForm />);
     const inputs = document.querySelectorAll('input[type="file"]');
     const avatar = inputs[0] as HTMLInputElement;
-    fireEvent.change(avatar, { target: { files: [makeFile('big.png', 2 * 1024 * 1024)] } });
+    fireEvent.change(avatar, { target: { files: [makeFile('big.png', 6 * 1024 * 1024)] } });
     const banner = document.querySelector('.image-upsell-banner') as HTMLElement;
     expect(banner).toBeInTheDocument();
     expect(banner.textContent).toContain('This file is');
@@ -128,14 +138,14 @@ describe('ProfileInfoForm — L9 avatar/banner size upsell', () => {
   it('avatar over limit: does NOT block — handleChange still runs', () => {
     render(<ProfileInfoForm />);
     const avatar = document.querySelectorAll('input[type="file"]')[0] as HTMLInputElement;
-    fireEvent.change(avatar, { target: { files: [makeFile('big.png', 2 * 1024 * 1024)] } });
+    fireEvent.change(avatar, { target: { files: [makeFile('big.png', 6 * 1024 * 1024)] } });
     expect(avatarHandleChange).toHaveBeenCalled();
   });
 
-  it('banner over 2 MB: shows the upsell banner', () => {
+  it('banner over 5 MB: shows the upsell banner', () => {
     render(<ProfileInfoForm />);
     const header = document.querySelectorAll('input[type="file"]')[1] as HTMLInputElement;
-    fireEvent.change(header, { target: { files: [makeFile('wide.png', 3 * 1024 * 1024)] } });
+    fireEvent.change(header, { target: { files: [makeFile('wide.png', 6 * 1024 * 1024)] } });
     expect(document.querySelector('.image-upsell-banner')).toBeInTheDocument();
     expect(headerHandleChange).toHaveBeenCalled();
   });
@@ -143,14 +153,14 @@ describe('ProfileInfoForm — L9 avatar/banner size upsell', () => {
   it('within limit: no banner', () => {
     render(<ProfileInfoForm />);
     const avatar = document.querySelectorAll('input[type="file"]')[0] as HTMLInputElement;
-    fireEvent.change(avatar, { target: { files: [makeFile('ok.png', 500 * 1024)] } });
+    fireEvent.change(avatar, { target: { files: [makeFile('ok.png', 4 * 1024 * 1024)] } });
     expect(document.querySelector('.image-upsell-banner')).not.toBeInTheDocument();
   });
 
   it('the banner is dismissible', () => {
     render(<ProfileInfoForm />);
     const avatar = document.querySelectorAll('input[type="file"]')[0] as HTMLInputElement;
-    fireEvent.change(avatar, { target: { files: [makeFile('big.png', 2 * 1024 * 1024)] } });
+    fireEvent.change(avatar, { target: { files: [makeFile('big.png', 6 * 1024 * 1024)] } });
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
     expect(document.querySelector('.image-upsell-banner')).not.toBeInTheDocument();
   });
@@ -159,7 +169,7 @@ describe('ProfileInfoForm — L9 avatar/banner size upsell', () => {
     setEntitlement({ maxAvatarBytes: 10 * 1024 * 1024 });
     render(<ProfileInfoForm />);
     const avatar = document.querySelectorAll('input[type="file"]')[0] as HTMLInputElement;
-    fireEvent.change(avatar, { target: { files: [makeFile('big.png', 2 * 1024 * 1024)] } });
+    fireEvent.change(avatar, { target: { files: [makeFile('big.png', 6 * 1024 * 1024)] } });
     expect(document.querySelector('.image-upsell-banner')).not.toBeInTheDocument();
   });
 });

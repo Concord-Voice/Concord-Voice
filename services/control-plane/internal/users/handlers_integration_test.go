@@ -1176,7 +1176,7 @@ func TestUpdateMeAvatarTooLarge(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "avatarbig")
 
-	bigData := "data:image/png;base64," + strings.Repeat("A", 1500001)
+	bigData := oversizedFreeAvatarDataURL()
 	payload := map[string]interface{}{
 		"avatar_url": bigData,
 	}
@@ -1190,7 +1190,7 @@ func TestUpdateMeHeaderImageTooLarge(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "headerbig")
 
-	bigData := "data:image/png;base64," + strings.Repeat("A", 3000001)
+	bigData := oversizedFreeBannerDataURL()
 	payload := map[string]interface{}{
 		"header_image_url": bigData,
 	}

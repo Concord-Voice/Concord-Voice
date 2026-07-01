@@ -33,6 +33,30 @@
   user-select: text;
 }
 
+.about-version-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.about-update-chip {
+  border: 1px solid var(--accent-primary);
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: transparent;
+  color: var(--accent-primary);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.about-update-chip:hover,
+.about-update-chip:focus-visible {
+  background: var(--accent-fill);
+  color: var(--on-accent);
+}
+
 /* ─── Log path row ────────────────────────────────────────────────── */
 
 .about-info-value--log {
@@ -242,6 +266,19 @@
   gap: 8px;
   font-size: calc(13px * var(--font-scale, 1));
   color: var(--text-primary);
+}
+
+.about-update-status--interface {
+  margin-top: 0;
+}
+
+.about-update-status-label {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.about-update-status-text {
+  min-width: 0;
 }
 
 .about-update-status-row svg {

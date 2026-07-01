@@ -69,7 +69,9 @@ describe('MentionAutocomplete', () => {
           },
         ],
       },
-      channelPermissions: {},
+      channelPermissions: {
+        'channel-1': MENTION_EVERYONE | MENTION_USERS | MENTION_ROLES,
+      },
       channelOverrides: {},
     });
   });
@@ -149,6 +151,7 @@ describe('MentionAutocomplete', () => {
   it('hides @all when user lacks MENTION_EVERYONE permission', () => {
     usePermissionStore.setState({
       serverPermissions: { 'server-1': MENTION_USERS },
+      channelPermissions: { 'channel-1': MENTION_USERS },
     });
     render(<MentionAutocomplete {...defaultProps} text="@al" cursorPosition={3} />);
     expect(screen.queryByText('all')).not.toBeInTheDocument();
@@ -157,6 +160,7 @@ describe('MentionAutocomplete', () => {
   it('hides @here when user lacks MENTION_EVERYONE permission in server context', () => {
     usePermissionStore.setState({
       serverPermissions: { 'server-1': MENTION_USERS },
+      channelPermissions: { 'channel-1': MENTION_USERS },
     });
     render(<MentionAutocomplete {...defaultProps} text="@her" cursorPosition={4} />);
     expect(screen.queryByText('here')).not.toBeInTheDocument();
@@ -181,6 +185,7 @@ describe('MentionAutocomplete', () => {
   it('hides roles when user lacks MENTION_ROLES permission', () => {
     usePermissionStore.setState({
       serverPermissions: { 'server-1': MENTION_USERS | MENTION_EVERYONE },
+      channelPermissions: { 'channel-1': MENTION_USERS | MENTION_EVERYONE },
     });
     render(<MentionAutocomplete {...defaultProps} text="@mod" cursorPosition={4} />);
     expect(screen.queryByText('Moderator')).not.toBeInTheDocument();
@@ -189,6 +194,7 @@ describe('MentionAutocomplete', () => {
   it('hides user mentions when user lacks MENTION_USERS permission', () => {
     usePermissionStore.setState({
       serverPermissions: { 'server-1': MENTION_EVERYONE },
+      channelPermissions: { 'channel-1': MENTION_EVERYONE },
     });
     render(<MentionAutocomplete {...defaultProps} text="@test" cursorPosition={5} />);
     expect(screen.queryByText('testuser')).not.toBeInTheDocument();
@@ -362,6 +368,7 @@ describe('MentionAutocomplete', () => {
     useMemberStore.setState({ members: [mockMember] });
     usePermissionStore.setState({
       serverPermissions: { 'server-1': MENTION_USERS },
+      channelPermissions: { 'channel-1': MENTION_USERS },
       serverRoles: { 'server-1': [] },
     });
     render(<MentionAutocomplete ref={ref} {...defaultProps} text="@test" cursorPosition={5} />);
@@ -492,47 +499,12 @@ describe('MentionAutocomplete', () => {
     expect(label.style.color).toBe('rgb(231, 76, 60)');
   });
 
-  // ── Channel SBAC overrides (#600) ──
-  describe('channel SBAC overrides', () => {
-    const VIEWER_ID = 'user-1';
-
-    beforeEach(() => {
-      // Viewer = user-1 carrying the Moderator role; outer beforeEach already granted
-      // all three mention perms via serverPermissions['server-1'].
-      useUserStore.setState({
-        user: { id: VIEWER_ID, username: 'testuser' },
-      });
-      useMemberStore.setState({
-        members: [
-          {
-            ...mockMember,
-            user_id: VIEWER_ID,
-            // mockMember defaults role:'owner'; owners are immune to overrides, so the
-            // override-applies cases below MUST use a non-owner viewer (see owner test).
-            role: 'member',
-            roles: [{ role_id: 'role-mod', role_name: 'Moderator', position: 1 }],
-          },
-          mockMember2,
-        ],
-      });
-    });
-
-    it('suppresses @all when a channel override denies MENTION_EVERYONE to the viewer role', () => {
+  // -- Channel effective permissions (#600) --
+  describe('channel effective permissions', () => {
+    it('suppresses @all when loaded effective channel permissions deny MENTION_EVERYONE', () => {
       usePermissionStore.setState({
-        channelOverrides: {
-          'channel-1': [
-            {
-              id: 'ovr-1',
-              channel_id: 'channel-1',
-              target_type: 'role',
-              target_id: 'role-mod',
-              allow: '0',
-              deny: MENTION_EVERYONE.toString(),
-              created_at: '2025-01-01T00:00:00Z',
-              updated_at: '2025-01-01T00:00:00Z',
-            },
-          ],
-        },
+        channelPermissions: { 'channel-1': MENTION_USERS | MENTION_ROLES },
+        channelOverrides: {},
       });
       render(<MentionAutocomplete {...defaultProps} text="@a" cursorPosition={2} />);
       expect(screen.queryByText('all')).not.toBeInTheDocument();
@@ -548,15 +520,57 @@ describe('MentionAutocomplete', () => {
       expect(screen.queryByText('all')).not.toBeInTheDocument();
     });
 
-    it('still offers @all when no override denies MENTION_EVERYONE', () => {
-      usePermissionStore.setState({ channelOverrides: { 'channel-1': [] } });
+    it('does not fall back to server permissions before channel permissions load', () => {
+      usePermissionStore.setState({
+        serverPermissions: { 'server-1': MENTION_EVERYONE | MENTION_USERS | MENTION_ROLES },
+        channelPermissions: {},
+        channelOverrides: {},
+      });
       render(<MentionAutocomplete {...defaultProps} text="@a" cursorPosition={2} />);
-      expect(screen.getByText('all')).toBeInTheDocument();
+      expect(screen.queryByText('all')).not.toBeInTheDocument();
     });
 
-    it('surfaces role mentions when an override grants MENTION_ROLES the base lacks', () => {
+    it('does not use raw override state before effective channel permissions load', () => {
+      useUserStore.setState({
+        user: { id: 'user-1', username: 'testuser' },
+      });
+      useMemberStore.setState({
+        members: [
+          {
+            ...mockMember,
+            user_id: 'user-1',
+            role: 'member',
+            roles: [{ role_id: 'role-mod', role_name: 'Moderator', position: 1 }],
+          },
+          mockMember2,
+        ],
+      });
+      usePermissionStore.setState({
+        serverPermissions: { 'server-1': MENTION_USERS | MENTION_ROLES },
+        channelPermissions: {},
+        channelOverrides: {
+          'channel-1': [
+            {
+              id: 'ovr-allow',
+              channel_id: 'channel-1',
+              target_type: 'role',
+              target_id: 'role-mod',
+              allow: MENTION_EVERYONE.toString(),
+              deny: '0',
+              created_at: '2025-01-01T00:00:00Z',
+              updated_at: '2025-01-01T00:00:00Z',
+            },
+          ],
+        },
+      });
+      render(<MentionAutocomplete {...defaultProps} text="@a" cursorPosition={2} />);
+      expect(screen.queryByText('all')).not.toBeInTheDocument();
+    });
+
+    it('surfaces role mentions when loaded effective channel permissions grant MENTION_ROLES the base lacks', () => {
       usePermissionStore.setState({
         serverPermissions: { 'server-1': MENTION_USERS },
+        channelPermissions: { 'channel-1': MENTION_USERS | MENTION_ROLES },
         serverRoles: {
           'server-1': [
             {
@@ -574,38 +588,15 @@ describe('MentionAutocomplete', () => {
             },
           ],
         },
-        channelOverrides: {
-          'channel-1': [
-            {
-              id: 'ovr-2',
-              channel_id: 'channel-1',
-              target_type: 'role',
-              target_id: 'role-mod',
-              allow: MENTION_ROLES.toString(),
-              deny: '0',
-              created_at: '2025-01-01T00:00:00Z',
-              updated_at: '2025-01-01T00:00:00Z',
-            },
-          ],
-        },
+        channelOverrides: {},
       });
       render(<MentionAutocomplete {...defaultProps} text="@Ping" cursorPosition={5} />);
       expect(screen.getByText('Pingable')).toBeInTheDocument();
     });
 
-    it('does not apply overrides to a server owner — @all stays offered despite a denying override', () => {
-      useMemberStore.setState({
-        members: [
-          {
-            ...mockMember,
-            user_id: VIEWER_ID,
-            role: 'owner',
-            roles: [{ role_id: 'role-mod', role_name: 'Moderator', position: 1 }],
-          },
-          mockMember2,
-        ],
-      });
+    it('offers @all when loaded effective channel permissions include MENTION_EVERYONE', () => {
       usePermissionStore.setState({
+        channelPermissions: { 'channel-1': MENTION_EVERYONE | MENTION_USERS | MENTION_ROLES },
         channelOverrides: {
           'channel-1': [
             {
@@ -622,7 +613,6 @@ describe('MentionAutocomplete', () => {
         },
       });
       render(<MentionAutocomplete {...defaultProps} text="@a" cursorPosition={2} />);
-      // Owner is immune to channel overrides (mirrors the backend owner-id bypass).
       expect(screen.getByText('all')).toBeInTheDocument();
     });
   });

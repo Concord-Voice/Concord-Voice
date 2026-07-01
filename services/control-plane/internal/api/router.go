@@ -242,7 +242,7 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	})
 	var mediaHandler *media.Handler
 	if store != nil {
-		mediaHandler = media.NewHandler(db, store, log, cfg, rbacResolver, entCache)
+		mediaHandler = media.NewHandler(db, store, log, cfg, rbacResolver, entCache, serverEntCache)
 		usersHandler.SetMediaStore(store)
 		serversHandler.SetMediaStore(store)
 	}

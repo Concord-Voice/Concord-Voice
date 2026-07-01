@@ -12,10 +12,8 @@ import { AtSign, Users, Shield } from 'lucide-react';
 import { useMemberStore } from '../../stores/memberStore';
 import { useDMStore } from '../../stores/dmStore';
 import { usePermissionStore } from '../../stores/permissionStore';
-import { useUserStore } from '../../stores/userStore';
 import {
   hasPermission,
-  resolveChannelPermissions,
   MENTION_EVERYONE,
   MENTION_USERS,
   MENTION_ROLES,
@@ -31,10 +29,9 @@ export interface MentionAutocompleteProps {
   /** Server ID for permission checks (undefined = DM context, all mentions allowed) */
   serverId?: string;
   /**
-   * Channel ID for SBAC override resolution. When provided alongside `serverId`,
-   * the viewer's effective mention permissions are computed as
-   * (server base ⊕ channel allow/deny overrides) via `resolveChannelPermissions`,
-   * mirroring the control-plane resolver. Undefined in DM context.
+   * Channel ID for SBAC permission lookup. When provided alongside `serverId`,
+   * the viewer's backend-computed effective mention permissions are read from
+   * `permissionStore.channelPermissions`. Undefined in DM context.
    */
   channelId?: string;
   /** DM conversation ID — when set, source members from DM participants instead of server members */
@@ -158,20 +155,6 @@ const MentionAutocomplete = forwardRef<MentionAutocompleteHandle, MentionAutocom
     const serverPermissions = usePermissionStore((s) => s.serverPermissions);
     const serverRoles = usePermissionStore((s) => s.serverRoles);
     const channelPermissions = usePermissionStore((s) => s.channelPermissions);
-    const channelOverrides = usePermissionStore((s) => s.channelOverrides);
-    const viewerUserId = useUserStore((s) => s.user?.id ?? '');
-
-    // The viewer's role ids + owner flag in this server, used to resolve SBAC overrides.
-    // Owner detection mirrors the backend owner-id bypass (resolver.go step 2): OwnerPermissions
-    // does NOT carry the ADMINISTRATOR bit, so the resolver needs the explicit owner signal to
-    // exempt owners from channel overrides the way the server does.
-    const { viewerRoleIds, viewerIsOwner } = useMemo(() => {
-      const self = serverMembers.find((m) => m.user_id === viewerUserId);
-      return {
-        viewerRoleIds: new Set((self?.roles ?? []).map((r) => r.role_id)),
-        viewerIsOwner: self?.role === 'owner',
-      };
-    }, [serverMembers, viewerUserId]);
 
     // Extract the @query from text at cursor position
     const query = useMemo(() => {
@@ -202,19 +185,11 @@ const MentionAutocomplete = forwardRef<MentionAutocompleteHandle, MentionAutocom
         };
       }
       const basePerm = serverPermissions[serverId] ?? 0n;
-      // Prefer backend-computed channel permissions when loaded. Managers can still
-      // fall back to raw overrides because they are allowed to inspect SBAC state.
       const loadedChannelPerm = channelId ? channelPermissions[channelId] : undefined;
-      const effectivePerm =
-        channelId && loadedChannelPerm === undefined
-          ? resolveChannelPermissions(
-              basePerm,
-              channelOverrides[channelId],
-              viewerUserId,
-              viewerRoleIds,
-              viewerIsOwner
-            )
-          : (loadedChannelPerm ?? basePerm);
+      let effectivePerm = basePerm;
+      if (channelId) {
+        effectivePerm = loadedChannelPerm ?? 0n;
+      }
       const hasMentionEveryone = hasPermission(effectivePerm, MENTION_EVERYONE);
       return {
         canMentionEveryone: hasMentionEveryone,
@@ -222,16 +197,7 @@ const MentionAutocomplete = forwardRef<MentionAutocompleteHandle, MentionAutocom
         canMentionUsers: hasPermission(effectivePerm, MENTION_USERS),
         canMentionRoles: hasPermission(effectivePerm, MENTION_ROLES),
       };
-    }, [
-      serverId,
-      channelId,
-      serverPermissions,
-      channelPermissions,
-      channelOverrides,
-      viewerUserId,
-      viewerRoleIds,
-      viewerIsOwner,
-    ]);
+    }, [serverId, channelId, serverPermissions, channelPermissions]);
 
     // Build filtered options
     const options = useMemo(() => {

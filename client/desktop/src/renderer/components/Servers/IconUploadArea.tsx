@@ -8,6 +8,7 @@ interface IconUploadAreaProps {
   onRemove: () => void;
   onFileChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
+  hint?: string;
 }
 
 const IconUploadArea: React.FC<IconUploadAreaProps> = ({
@@ -18,6 +19,7 @@ const IconUploadArea: React.FC<IconUploadAreaProps> = ({
   onRemove,
   onFileChange,
   fileInputRef,
+  hint,
 }) => (
   <div className="server-icon-upload">
     <button
@@ -45,11 +47,14 @@ const IconUploadArea: React.FC<IconUploadAreaProps> = ({
         </div>
       )}
     </button>
-    {preview && (
-      <button type="button" className="icon-remove-btn" onClick={onRemove}>
-        Remove
-      </button>
-    )}
+    <div className="banner-upload-actions">
+      {hint && <span className="banner-upload-hint">{hint}</span>}
+      {preview && (
+        <button type="button" className="icon-remove-btn" onClick={onRemove}>
+          Remove
+        </button>
+      )}
+    </div>
     <input
       ref={fileInputRef}
       type="file"

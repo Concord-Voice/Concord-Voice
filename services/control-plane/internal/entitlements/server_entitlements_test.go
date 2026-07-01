@@ -12,6 +12,8 @@ func TestForServer_Groundspeed(t *testing.T) {
 	assert.Equal(t, "groundspeed", e.Tier)
 	assert.Equal(t, 75, e.MaxServerCustomEmoji)
 	assert.Equal(t, 10, e.MaxServerStickers)
+	assert.Equal(t, int64(5_242_880), e.MaxServerIconBytes)
+	assert.Equal(t, int64(5_242_880), e.MaxServerBannerBytes)
 	assert.Equal(t, entitlements.ServerStoragePoolUnset, e.MaxServerStoragePoolBytes)
 	assert.False(t, e.UnlockServerAudioQualityCaps)
 	assert.False(t, e.UnlockServerVideoQualityCaps)
@@ -22,6 +24,8 @@ func TestForServer_Mach(t *testing.T) {
 	assert.Equal(t, "mach", e.Tier)
 	assert.Equal(t, 125, e.MaxServerCustomEmoji)
 	assert.Equal(t, 75, e.MaxServerStickers)
+	assert.Equal(t, int64(8_388_608), e.MaxServerIconBytes)
+	assert.Equal(t, int64(8_388_608), e.MaxServerBannerBytes)
 	// Storage pool is A11-pending: same sentinel on BOTH tiers until #1523 lands.
 	assert.Equal(t, entitlements.ServerStoragePoolUnset, e.MaxServerStoragePoolBytes)
 	assert.True(t, e.UnlockServerAudioQualityCaps)

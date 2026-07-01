@@ -72,10 +72,11 @@ const (
 // These are purpose-specific, not type-specific — kept small because
 // the server resizes everything down anyway.
 // avatarMaxUpload and bannerMaxUpload are replaced by entitlement-resolved limits
-// in UploadAvatar/UploadBanner (#1298); bannerMaxUpload is kept for server assets.
+// in UploadAvatar/UploadBanner (#1298). Server uploads parse at the absolute
+// server-axis max, then apply the tier-specific cap after server_id validation.
 const (
-	bannerMaxUpload = 10 * 1024 * 1024 // 10 MB — server-banner/dm-icon (server assets, not user-tier-gated)
-	iconMaxUpload   = 5 * 1024 * 1024  // 5 MB
+	serverImageMaxUpload = 8 * 1024 * 1024 // 8 MiB — Mach cap, used only before multipart parsing
+	iconMaxUpload        = 5 * 1024 * 1024 // 5 MiB — group-DM icons stay on the existing limit
 )
 
 // Allowed MIME types for Tier 1 image uploads
@@ -106,24 +107,37 @@ const (
 
 // Handler provides HTTP handlers for media operations.
 type Handler struct {
-	db       *sql.DB
-	store    ObjectStore
-	log      *logger.Logger
-	cfg      *config.Config
-	resolver *rbac.Resolver
-	tiers    entitlements.TierResolver
+	db          *sql.DB
+	store       ObjectStore
+	log         *logger.Logger
+	cfg         *config.Config
+	resolver    *rbac.Resolver
+	tiers       entitlements.TierResolver
+	serverTiers entitlements.ServerTierResolver
 }
 
 // NewHandler creates a new media handler.
-func NewHandler(db *sql.DB, store ObjectStore, log *logger.Logger, cfg *config.Config, resolver *rbac.Resolver, tiers entitlements.TierResolver) *Handler {
-	return &Handler{
-		db:       db,
-		store:    store,
-		log:      log,
-		cfg:      cfg,
-		resolver: resolver,
-		tiers:    tiers,
+func NewHandler(db *sql.DB, store ObjectStore, log *logger.Logger, cfg *config.Config, resolver *rbac.Resolver, tiers entitlements.TierResolver, serverTiers ...entitlements.ServerTierResolver) *Handler {
+	var st entitlements.ServerTierResolver
+	if len(serverTiers) > 0 {
+		st = serverTiers[0]
 	}
+	return &Handler{
+		db:          db,
+		store:       store,
+		log:         log,
+		cfg:         cfg,
+		resolver:    resolver,
+		tiers:       tiers,
+		serverTiers: st,
+	}
+}
+
+func (h *Handler) serverTier(ctx context.Context, serverID string) string {
+	if h.serverTiers != nil {
+		return h.serverTiers.GetServerTier(ctx, serverID)
+	}
+	return entitlements.ResolveServerTier(ctx, h.db, serverID)
 }
 
 func (h *Handler) requireObjectStore(c *gin.Context) (ObjectStore, bool) {
@@ -157,14 +171,14 @@ func (h *Handler) UploadBanner(c *gin.Context) {
 // POST /api/v1/media/upload/server-icon
 func (h *Handler) UploadServerIcon(c *gin.Context) {
 	userID := c.GetString("user_id")
-	h.handleTier1Upload(c, userID, purposeServerIcon, iconMaxUpload, IconMaxDim, IconMaxDim)
+	h.handleTier1Upload(c, userID, purposeServerIcon, serverImageMaxUpload, IconMaxDim, IconMaxDim)
 }
 
 // UploadServerBanner handles server banner uploads.
 // POST /api/v1/media/upload/server-banner
 func (h *Handler) UploadServerBanner(c *gin.Context) {
 	userID := c.GetString("user_id")
-	h.handleTier1Upload(c, userID, purposeServerBanner, bannerMaxUpload, BannerMaxW, BannerMaxH)
+	h.handleTier1Upload(c, userID, purposeServerBanner, serverImageMaxUpload, BannerMaxW, BannerMaxH)
 }
 
 // UploadDMIcon handles group DM icon uploads.
@@ -504,6 +518,9 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 	if !ok {
 		return
 	}
+	if !enforceTier1UploadLimit(c, h, purpose, serverID, header.Size, maxSize) {
+		return
+	}
 
 	if !validateImageType(c, file, header) {
 		return
@@ -553,6 +570,26 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 		"width":       processed.Width,
 		"height":      processed.Height,
 	})
+}
+
+func enforceTier1UploadLimit(c *gin.Context, h *Handler, purpose, serverID string, fileSize, defaultMaxSize int64) bool {
+	maxSize := defaultMaxSize
+	if purpose == purposeServerIcon || purpose == purposeServerBanner {
+		ent := entitlements.ForServer(h.serverTier(c.Request.Context(), serverID))
+		if purpose == purposeServerIcon {
+			maxSize = ent.MaxServerIconBytes
+		} else {
+			maxSize = ent.MaxServerBannerBytes
+		}
+	}
+	if fileSize > maxSize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error":    fmt.Sprintf("File exceeds maximum size of %d bytes", maxSize),
+			"max_size": maxSize,
+		})
+		return false
+	}
+	return true
 }
 
 // --- Extracted helpers for handleTier1Upload ---

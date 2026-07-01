@@ -3,6 +3,7 @@ package servers
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 
 const (
 	dataImagePrefix       = "data:image/"
+	dataURLHeaderSlack    = 64
 	errMsgInvalidServerID = "Invalid server ID"
 	errMsgServerNotFound  = "Server not found"
 	errMsgFailedCreate    = "Failed to create server"
@@ -148,6 +150,10 @@ func validateCreateDataURL(url *string, maxLen int, label, sizeHint string) stri
 	return ""
 }
 
+func maxDataURLLen(maxBytes int64) int {
+	return base64.StdEncoding.EncodedLen(int(maxBytes)) + dataURLHeaderSlack
+}
+
 // insertServerRow inserts the server row and scans back the timestamps.
 func insertServerRow(tx *sql.Tx, server *models.Server) error {
 	query := `
@@ -201,11 +207,12 @@ func (h *Handler) CreateServer(c *gin.Context) {
 		return
 	}
 
-	if errMsg := validateCreateDataURL(req.IconURL, 1500000, "Icon", "~1MB"); errMsg != "" {
+	groundspeed := entitlements.ForServer(entitlements.TierGroundspeed)
+	if errMsg := validateCreateDataURL(req.IconURL, maxDataURLLen(groundspeed.MaxServerIconBytes), "Icon", "5MB"); errMsg != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
 		return
 	}
-	if errMsg := validateCreateDataURL(req.BannerURL, 3000000, "Banner", "~2MB"); errMsg != "" {
+	if errMsg := validateCreateDataURL(req.BannerURL, maxDataURLLen(groundspeed.MaxServerBannerBytes), "Banner", "5MB"); errMsg != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
 		return
 	}
@@ -392,13 +399,16 @@ func (h *Handler) UpdateServer(c *gin.Context) {
 		h.log.Warn("Failed to fetch legacy role for UpdateServer response", "error", err, "server_id", serverID, "user_id", userID)
 	}
 
-	// Parse and validate icon_url / banner_url
+	// Parse and validate icon_url / banner_url. Inline data URLs are broadcast verbatim
+	// to server subscribers, so they stay pinned to the Groundspeed floor; the
+	// per-tier allowance applies on the uploaded-media path, which broadcasts keys.
+	inlineEnt := entitlements.ForServer(entitlements.TierGroundspeed)
 	iconURLProvided, iconURL, iconErr := parseMediaURL(req.IconURL)
 	if iconErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid icon_url format"})
 		return
 	}
-	if err := validateMediaURL(iconURL, fmt.Sprintf("/api/v1/media/server-icons/%s", serverID), 1500000, "Icon"); err != nil {
+	if err := validateMediaURL(iconURL, fmt.Sprintf("/api/v1/media/server-icons/%s", serverID), maxDataURLLen(inlineEnt.MaxServerIconBytes), "Icon"); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -408,7 +418,7 @@ func (h *Handler) UpdateServer(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid banner_url format"})
 		return
 	}
-	if err := validateMediaURL(bannerURL, fmt.Sprintf("/api/v1/media/server-banners/%s", serverID), 3000000, "Banner"); err != nil {
+	if err := validateMediaURL(bannerURL, fmt.Sprintf("/api/v1/media/server-banners/%s", serverID), maxDataURLLen(inlineEnt.MaxServerBannerBytes), "Banner"); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

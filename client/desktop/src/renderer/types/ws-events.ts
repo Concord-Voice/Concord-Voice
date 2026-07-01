@@ -37,7 +37,7 @@ export const ISOTimestamp = z.string().datetime({ offset: true });
  *     produced by `services/control-plane/internal/users/handlers.go:378`
  *     and `internal/servers/handlers.go`).
  *  2. `data:image/...` data URLs (allowed for client-supplied inline avatars
- *     per `users/handlers.go:379`; capped server-side at ~1MB/~2MB).
+ *     per `users/handlers.go:379`; capped server-side at the free entitlement floor).
  *  3. Absolute `http(s)://...` URLs (kept for forward-compat with a future
  *     CDN-backed media path).
  *

@@ -7,8 +7,6 @@ import LoadingSpinner from '../Auth/LoadingSpinner';
 import Modal from '../ui/Modal';
 import ImageCropEditor from '../ui/ImageCropEditor';
 import {
-  MAX_AVATAR_SIZE,
-  MAX_HEADER_SIZE,
   ALLOWED_TYPES,
   USERNAME_MIN,
   USERNAME_MAX,
@@ -52,14 +50,14 @@ const ProfileInfoForm: React.FC = () => {
 
   // Image upload hooks (declared after setProfileErrors to avoid TDZ confusion)
   const avatar = useImageUpload({
-    maxSize: MAX_AVATAR_SIZE,
+    maxSize: maxAvatarBytes,
     allowedTypes: ALLOWED_TYPES,
     onError: (msg) => setProfileErrors((prev) => ({ ...prev, avatar: msg })),
     initialUrl: user?.avatar_url,
   });
 
   const header = useImageUpload({
-    maxSize: MAX_HEADER_SIZE,
+    maxSize: maxBannerBytes,
     allowedTypes: ALLOWED_TYPES,
     onError: (msg) => setProfileErrors((prev) => ({ ...prev, header: msg })),
     initialUrl: user?.header_image_url,
@@ -351,7 +349,8 @@ const ProfileInfoForm: React.FC = () => {
         </button>
         <div className="profile-avatar-actions">
           <span className="profile-avatar-actions-label">
-            Click to upload an avatar (PNG, JPEG, GIF, WebP &mdash; max 1MB)
+            Click to upload an avatar (PNG, JPEG, GIF, WebP &mdash; max{' '}
+            {formatFileSize(maxAvatarBytes)})
           </span>
           {avatar.preview && (
             <button
@@ -417,7 +416,8 @@ const ProfileInfoForm: React.FC = () => {
         </button>
         <div className="profile-header-actions">
           <span className="profile-avatar-actions-label">
-            PNG, JPEG, GIF, WebP &mdash; max 2MB. Recommended: 600&times;120 or wider.
+            PNG, JPEG, GIF, WebP &mdash; max {formatFileSize(maxBannerBytes)}. Recommended:
+            600&times;120 or wider.
           </span>
           {header.preview && (
             <button

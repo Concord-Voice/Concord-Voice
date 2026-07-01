@@ -1,6 +1,8 @@
 import { useState, useRef, useCallback } from 'react';
 import { resolveMediaUrl } from '../utils/resolveMediaUrl';
 
+const formatImageLimit = (bytes: number): string => `${Math.round(bytes / (1024 * 1024))}MB`;
+
 export interface UseImageUploadOptions {
   maxSize: number;
   allowedTypes: string[];
@@ -69,9 +71,8 @@ export function useImageUpload({
         return;
       }
 
-      const sizeMB = maxSize >= 2 * 1024 * 1024 ? '2MB' : '1MB';
       if (file.size > maxSize) {
-        onError(`Image must be smaller than ${sizeMB}`);
+        onError(`Image must be smaller than ${formatImageLimit(maxSize)}`);
         clearFileInput();
         return;
       }

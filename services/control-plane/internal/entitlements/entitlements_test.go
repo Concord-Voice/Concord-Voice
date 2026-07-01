@@ -24,8 +24,8 @@ func TestFor_Free(t *testing.T) {
 	assert.Equal(t, 1, e.MaxScreensharePublishers)
 	assert.Equal(t, 5120, e.MaxMessageChars)
 	assert.Equal(t, int64(26_214_400), e.MaxAttachmentBytes)
-	assert.Equal(t, int64(1_048_576), e.MaxAvatarBytes)
-	assert.Equal(t, int64(2_097_152), e.MaxBannerBytes)
+	assert.Equal(t, int64(5_242_880), e.MaxAvatarBytes)
+	assert.Equal(t, int64(5_242_880), e.MaxBannerBytes)
 	assert.False(t, e.AllowAnimatedProfile)
 	assert.Equal(t, 365*24*time.Hour, e.UsernameChangeInterval)
 }
@@ -46,8 +46,8 @@ func TestFor_Premium(t *testing.T) {
 	assert.Equal(t, 3, e.MaxScreensharePublishers)
 	assert.Equal(t, 10240, e.MaxMessageChars)
 	assert.Equal(t, int64(536_870_912), e.MaxAttachmentBytes)
-	assert.Equal(t, int64(5_242_880), e.MaxAvatarBytes)
-	assert.Equal(t, int64(5_242_880), e.MaxBannerBytes)
+	assert.Equal(t, int64(8_388_608), e.MaxAvatarBytes)
+	assert.Equal(t, int64(8_388_608), e.MaxBannerBytes)
 	assert.True(t, e.AllowAnimatedProfile)
 	assert.Equal(t, 91*24*time.Hour, e.UsernameChangeInterval)
 }

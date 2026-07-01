@@ -104,6 +104,8 @@
 [data-scheme='pride'] .send-friend-request-btn,
 [data-scheme='pride'] .user-profile-modal-role-badge.role-owner,
 [data-scheme='pride'] .about-info-copy-btn:hover,
+[data-scheme='pride'] .about-update-chip:hover,
+[data-scheme='pride'] .about-update-chip:focus-visible,
 [data-scheme='pride'] .about-update-btn,
 [data-scheme='pride'] .about-update-action-btn:hover,
 [data-scheme='pride'] .about-update-action-btn--primary,

@@ -687,7 +687,7 @@ Supported uploads:
 
 ### Is there a file size limit?
 
-Yes — configurable per-deployment via the `UPLOAD_MAX_SIZE` env var on the control-plane (defaults to 25 MB for general attachments). Profile and server image assets have separate caps (avatars and server icons 5 MB; banners 10 MB) defined in `services/control-plane/internal/media/handlers.go`.
+Yes — configurable per-deployment via the `UPLOAD_MAX_SIZE` env var on the control-plane (defaults to 25 MB for general attachments). Profile and server image uploads use entitlement-tiered caps: free users and Groundspeed servers can upload avatars, profile banners, server icons, and server banners up to 5 MiB; Supersonic users and Mach servers can upload those image assets up to 8 MiB. The authoritative values live in `services/control-plane/internal/entitlements/entitlements.go` and `services/control-plane/internal/entitlements/server_entitlements.go`, with enforcement in `services/control-plane/internal/media/handlers.go`.
 
 ---
 

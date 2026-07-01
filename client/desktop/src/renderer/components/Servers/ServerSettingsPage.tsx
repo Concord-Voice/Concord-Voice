@@ -9,8 +9,8 @@ import IconUploadArea from './IconUploadArea';
 import BannerUploadArea from './BannerUploadArea';
 import { useImageUpload } from '../../hooks/useImageUpload';
 import {
-  MAX_ICON_SIZE,
-  MAX_BANNER_SIZE,
+  maxServerIconSizeForTier,
+  maxServerBannerSizeForTier,
   ALLOWED_TYPES,
   NAME_MIN,
   NAME_MAX,
@@ -22,6 +22,7 @@ import { usePermissionStore } from '../../stores/permissionStore';
 import { useMemberStore } from '../../stores/memberStore';
 import { Permissions } from '../../utils/permissions';
 import { apiFetch } from '../../services/apiClient';
+import { formatFileSize } from '../../utils/attachmentCrypto';
 import type { ServerInviteWithCreator, Role } from '../../types/server';
 import './ServerSettingsPage.css';
 
@@ -69,17 +70,19 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
   const [allowEmbeddedContent, setAllowEmbeddedContent] = useState(
     server?.allow_embedded_content ?? false
   );
+  const maxServerIconBytes = maxServerIconSizeForTier(server?.server_tier);
+  const maxServerBannerBytes = maxServerBannerSizeForTier(server?.server_tier);
 
   // Image upload hooks
   const icon = useImageUpload({
-    maxSize: MAX_ICON_SIZE,
+    maxSize: maxServerIconBytes,
     allowedTypes: ALLOWED_TYPES,
     onError: (msg) => setErrors((prev) => ({ ...prev, icon: msg })),
     initialUrl: server?.icon_url,
   });
 
   const banner = useImageUpload({
-    maxSize: MAX_BANNER_SIZE,
+    maxSize: maxServerBannerBytes,
     allowedTypes: ALLOWED_TYPES,
     onError: (msg) => setErrors((prev) => ({ ...prev, banner: msg })),
     initialUrl: server?.banner_url,
@@ -452,6 +455,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
           onRemove={icon.handleRemove}
           onFileChange={icon.handleChange}
           fileInputRef={icon.fileInputRef}
+          hint={`PNG, JPEG, GIF, WebP — max ${formatFileSize(maxServerIconBytes)}.`}
         />
 
         {/* Banner Upload */}
@@ -463,7 +467,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
           onRemove={banner.handleRemove}
           onFileChange={banner.handleChange}
           fileInputRef={banner.fileInputRef}
-          hint="PNG, JPEG, GIF, WebP — max 2MB. Optional."
+          hint={`PNG, JPEG, GIF, WebP — max ${formatFileSize(maxServerBannerBytes)}. Optional.`}
         />
 
         {/* Server Name */}

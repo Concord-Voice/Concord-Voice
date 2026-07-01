@@ -6451,7 +6451,7 @@ paths:
       summary: Upload an avatar image
       operationId: mediaUploadAvatar
       description: 'Tier 1 authenticated upload. Image is resized to fit 512x512 and re-encoded; max raw
-        upload 5 MB.
+        upload 5 MiB for free users or 8 MiB for Supersonic users.
 
         Rate limit: 5 requests per minute.
 
@@ -6505,7 +6505,7 @@ paths:
       summary: Upload a profile banner image
       operationId: mediaUploadBanner
       description: 'Tier 1 authenticated upload. Image is resized to fit 1500x500 and re-encoded; max
-        raw upload 10 MB.
+        raw upload 5 MiB for free users or 8 MiB for Supersonic users.
 
         Rate limit: 5 requests per minute.
 
@@ -6560,7 +6560,7 @@ paths:
       operationId: mediaUploadDMIcon
       description: 'Tier 1 authenticated upload. Caller must be an admin participant of the group DM.
 
-        Image is resized to fit 512x512 and re-encoded; max raw upload 5 MB. Also updates the conversation''s
+        Image is resized to fit 512x512 and re-encoded; max raw upload 5 MiB. Also updates the conversation''s
         icon URL.
 
         Rate limit: 10 requests per minute.
@@ -6627,7 +6627,7 @@ paths:
       operationId: mediaUploadServerBanner
       description: 'Tier 1 authenticated upload. Requires the manage_server permission on the target server.
 
-        Image is resized to fit 1500x500 and re-encoded; max raw upload 10 MB.
+        Image is resized to fit 1500x500 and re-encoded; max raw upload 5 MiB for Groundspeed servers or 8 MiB for Mach servers.
 
         Rate limit: 5 requests per minute.
 
@@ -6693,7 +6693,7 @@ paths:
       operationId: mediaUploadServerIcon
       description: 'Tier 1 authenticated upload. Requires the manage_server permission on the target server.
 
-        Image is resized to fit 512x512 and re-encoded; max raw upload 5 MB.
+        Image is resized to fit 512x512 and re-encoded; max raw upload 5 MiB for Groundspeed servers or 8 MiB for Mach servers.
 
         Rate limit: 5 requests per minute.
 

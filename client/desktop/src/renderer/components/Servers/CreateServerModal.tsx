@@ -150,7 +150,7 @@ const CreateServerModal: React.FC<CreateServerModalProps> = ({ isOpen, onClose, 
           onRemove={banner.handleRemove}
           onFileChange={banner.handleChange}
           fileInputRef={banner.fileInputRef}
-          hint="PNG, JPEG, GIF, WebP — max 2MB. Optional."
+          hint="PNG, JPEG, GIF, WebP — max 5MB. Optional."
         />
 
         {/* Server Name */}
