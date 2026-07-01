@@ -23,7 +23,9 @@ export interface DMLastMessage {
   createdAt: string;
   /** In-memory preview for optimistic local sends; dmStore only persists activeConversationId. */
   plaintextPreview?: string;
-  /** Media type label when message has no text content (e.g. 'Photo', 'Video', 'File'). */
+  /** E2EE GIF slug metadata for local optimistic previews and server-enriched summaries. */
+  gifSlug?: string;
+  /** Media type label when message has no text content (e.g. 'photo', 'video', 'file'). */
   attachmentType?: string;
 }
 

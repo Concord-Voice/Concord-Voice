@@ -8,6 +8,7 @@ import { e2eeService } from '../../services/e2eeService';
 import { useDraftMessageStore } from '../../stores/draftMessageStore';
 import { errorMessage } from '../../utils/redactError';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { formatMessagePreview } from '../../utils/messagePreview';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 import CreateGroupModal from './CreateGroupModal';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
@@ -267,17 +268,16 @@ const ConversationList: React.FC<ConversationListProps> = ({
           const lastTime = conv.lastMessage?.createdAt || conv.createdAt;
           let preview = '';
           if (conv.lastMessage) {
-            // Use optimistic local plaintext first, otherwise decrypted preview if available.
-            preview =
-              conv.lastMessage.plaintextPreview ||
-              decryptedPreviews[conv.id]?.text ||
-              'Encrypted message';
-            // If no text content, show attachment type or generic fallback
-            if (!preview || preview === 'Encrypted message') {
-              if (conv.lastMessage.attachmentType) {
-                preview = conv.lastMessage.attachmentType;
-              }
-            }
+            const hasPlaintextPreview = conv.lastMessage.plaintextPreview !== undefined;
+            const previewContent = hasPlaintextPreview
+              ? conv.lastMessage.plaintextPreview
+              : (decryptedPreviews[conv.id]?.text ?? '');
+            preview = formatMessagePreview({
+              content: previewContent,
+              gifSlug: hasPlaintextPreview ? conv.lastMessage.gifSlug : undefined,
+              attachmentType: conv.lastMessage.attachmentType,
+              fallback: 'Encrypted message',
+            });
           }
 
           return (

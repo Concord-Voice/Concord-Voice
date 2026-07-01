@@ -102,6 +102,7 @@ export function sendDMMessage(
     userId: userId || 'unknown',
     username,
     createdAt: optimisticMessage.created_at,
+    ...(gifSlug ? { gifSlug } : {}),
     ...(opts?.attachments?.length
       ? { attachmentType: opts.attachments[0].file_type as string }
       : {}),

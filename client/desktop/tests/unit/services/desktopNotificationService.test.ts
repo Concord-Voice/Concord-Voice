@@ -280,6 +280,23 @@ describe('DesktopNotificationService', () => {
       expect(MockNotification.instances[0].body).toBe('');
     });
 
+    it('hides friendly media labels in sender_only mode', () => {
+      useNotificationStore.setState({ notificationContent: 'sender_only' });
+
+      desktopNotificationService.notify({
+        title: 'Alice',
+        senderDisplayName: 'Alice',
+        body: 'GIF',
+        targetType: 'dm',
+        targetId: 'dm-123',
+        senderId: 'user-1',
+      });
+
+      expect(MockNotification.instances).toHaveLength(1);
+      expect(MockNotification.instances[0].title).toBe('Alice');
+      expect(MockNotification.instances[0].body).toBe('');
+    });
+
     it('hides title and body content in minimal mode', () => {
       useNotificationStore.setState({ notificationContent: 'minimal' });
 

@@ -253,6 +253,33 @@ describe('ConversationList', () => {
     (e2eeService as any).isInitialized = false;
   });
 
+  it('shows a friendly GIF label for a decrypted GIF-only last message preview', async () => {
+    // regression for #1991
+    (e2eeService as any).isInitialized = true;
+    (e2eeService.decryptForChannel as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      '{"text":"","gif_slug":"night-sleep-18"}'
+    );
+    useDMStore.setState({
+      conversations: [
+        makeConversation({
+          lastMessage: {
+            content: 'encrypted-gif-envelope',
+            userId: 'user-2',
+            username: 'alice',
+            createdAt: '2025-01-01T12:00:00Z',
+          },
+        }),
+      ],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+
+    render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+    await waitFor(() => expect(screen.getByText('GIF')).toBeInTheDocument());
+    expect(screen.queryByText(/gif_slug/)).not.toBeInTheDocument();
+    (e2eeService as any).isInitialized = false;
+  });
+
   it('shows "Encrypted message" for encrypted last message', () => {
     useDMStore.setState({
       conversations: [
@@ -269,6 +296,28 @@ describe('ConversationList', () => {
     });
     render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
     expect(screen.getByText('Encrypted message')).toBeInTheDocument();
+  });
+
+  it('does not show GIF from undecrypted server gif_slug metadata', () => {
+    useDMStore.setState({
+      conversations: [
+        makeConversation({
+          lastMessage: {
+            content: 'encrypted-gif-envelope',
+            userId: 'user-2',
+            username: 'alice',
+            createdAt: '2025-01-01T12:00:00Z',
+            gifSlug: 'night-sleep-18',
+          },
+        }),
+      ],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+
+    render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+    expect(screen.getByText('Encrypted message')).toBeInTheDocument();
+    expect(screen.queryByText('GIF')).not.toBeInTheDocument();
   });
 
   it('prefers an optimistic plaintext preview over a stale decrypted cache', async () => {

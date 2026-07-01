@@ -115,6 +115,12 @@ function setupHandler(eventName: string) {
 beforeEach(() => {
   resetAllStores();
   vi.clearAllMocks();
+  mockDecryptForChannel.mockImplementation((_channelId: string, content: string) =>
+    Promise.resolve(content)
+  );
+  mockDecryptForChannelWithVersion.mockImplementation((_channelId: string, content: string) =>
+    Promise.resolve(content)
+  );
   useAuthStore.getState().setAccessToken('mock-token');
   useChannelStore.getState().addChannel(mockChannel);
   useChatStore.setState({ isConnected: true });
@@ -1680,7 +1686,7 @@ describe('useWebSocketMessages — coverage boost', () => {
   // ── Desktop notification wiring (#175) ────────────────────────────
 
   describe('desktop notifications for channel messages', () => {
-    it('fires desktop notification when shouldNotify returns true', () => {
+    it('fires desktop notification when shouldNotify returns true', async () => {
       mockShouldNotify.mockReturnValue(true);
 
       const { handler } = setupHandler('message');
@@ -1701,7 +1707,9 @@ describe('useWebSocketMessages — coverage boost', () => {
         });
       });
 
-      expect(mockShouldNotify).toHaveBeenCalledWith(expect.objectContaining({ type: 'message' }));
+      await vi.waitFor(() =>
+        expect(mockShouldNotify).toHaveBeenCalledWith(expect.objectContaining({ type: 'message' }))
+      );
       expect(mockNotify).toHaveBeenCalledWith(
         expect.objectContaining({
           targetType: 'channel',
@@ -1738,7 +1746,7 @@ describe('useWebSocketMessages — coverage boost', () => {
       expect(mockIncrementBadge).not.toHaveBeenCalled();
     });
 
-    it('passes mention type when data.mentioned is true', () => {
+    it('passes mention type when data.mentioned is true', async () => {
       mockShouldNotify.mockReturnValue(true);
 
       const { handler } = setupHandler('message');
@@ -1759,14 +1767,59 @@ describe('useWebSocketMessages — coverage boost', () => {
         });
       });
 
-      expect(mockShouldNotify).toHaveBeenCalledWith(expect.objectContaining({ type: 'mention' }));
+      await vi.waitFor(() =>
+        expect(mockShouldNotify).toHaveBeenCalledWith(expect.objectContaining({ type: 'mention' }))
+      );
 
+      mockShouldNotify.mockReturnValue(false);
+    });
+
+    it('snapshots desktop notification eligibility before decrypt resolves', async () => {
+      let resolveDecrypt!: (value: string) => void;
+      const decryptPromise = new Promise<string>((resolve) => {
+        resolveDecrypt = resolve;
+      });
+      mockDecryptForChannel.mockReturnValueOnce(decryptPromise);
+      mockShouldNotify.mockImplementation(
+        (options: { isActiveChannel: boolean }) => !options.isActiveChannel
+      );
+      useChannelStore.setState({ activeChannelId: 'other-channel' });
+
+      const { handler } = setupHandler('message');
+
+      act(() => {
+        handler({
+          type: 'message',
+          data: {
+            id: 'msg-notif-delayed',
+            channel_id: mockChannel.id,
+            server_id: 'server-1',
+            user_id: 'other-user',
+            username: 'otheruser',
+            content: 'encrypted-delayed',
+            created_at: new Date().toISOString(),
+          },
+        });
+      });
+
+      expect(mockShouldNotify).toHaveBeenCalledWith(
+        expect.objectContaining({ isActiveChannel: false })
+      );
+
+      useChannelStore.setState({ activeChannelId: mockChannel.id });
+      resolveDecrypt('arrived while away');
+
+      await vi.waitFor(() =>
+        expect(mockNotify).toHaveBeenCalledWith(
+          expect.objectContaining({ body: 'arrived while away' })
+        )
+      );
       mockShouldNotify.mockReturnValue(false);
     });
   });
 
   describe('desktop notifications for DM messages', () => {
-    it('fires desktop notification for DM when shouldNotify returns true', () => {
+    it('fires desktop notification for DM when shouldNotify returns true', async () => {
       mockShouldNotify.mockReturnValue(true);
 
       // Set up a DM conversation
@@ -1803,7 +1856,9 @@ describe('useWebSocketMessages — coverage boost', () => {
         });
       });
 
-      expect(mockShouldNotify).toHaveBeenCalledWith(expect.objectContaining({ type: 'dm' }));
+      await vi.waitFor(() =>
+        expect(mockShouldNotify).toHaveBeenCalledWith(expect.objectContaining({ type: 'dm' }))
+      );
       expect(mockNotify).toHaveBeenCalledWith(
         expect.objectContaining({
           targetType: 'dm',
@@ -1815,6 +1870,100 @@ describe('useWebSocketMessages — coverage boost', () => {
 
       mockShouldNotify.mockReturnValue(false);
     });
+  });
+
+  it('uses a friendly GIF label for decrypted GIF-only DM notifications', async () => {
+    // regression for #1991
+    mockShouldNotify.mockReturnValue(true);
+    mockDecryptForChannel.mockResolvedValue('{"text":"","gif_slug":"night-sleep-18"}');
+
+    useDMStore.setState({
+      conversations: [
+        {
+          id: 'dm-conv-1',
+          isGroup: false,
+          isPersonal: false,
+          name: null,
+          participants: [],
+          lastMessage: null,
+          unreadCount: 0,
+          createdAt: new Date().toISOString(),
+        },
+      ],
+      activeConversationId: null,
+    });
+
+    const { handler } = setupHandler('dm_message');
+
+    act(() => {
+      handler({
+        type: 'dm_message',
+        data: {
+          id: 'dm-msg-gif-1',
+          conversation_id: 'dm-conv-1',
+          user_id: 'other-user',
+          username: 'alice',
+          display_name: 'Alice',
+          content: 'encrypted-gif-envelope',
+          created_at: new Date().toISOString(),
+        },
+      });
+    });
+
+    await vi.waitFor(() =>
+      expect(mockNotify).toHaveBeenCalledWith(expect.objectContaining({ body: 'GIF' }))
+    );
+    expect(mockNotify).not.toHaveBeenCalledWith(
+      expect.objectContaining({ body: expect.stringContaining('gif_slug') })
+    );
+
+    mockShouldNotify.mockReturnValue(false);
+  });
+
+  it('does not label failed-decrypt DM notifications from clear gif_slug metadata', async () => {
+    mockShouldNotify.mockReturnValue(true);
+    mockDecryptForChannel.mockRejectedValue(new Error('missing key'));
+
+    useDMStore.setState({
+      conversations: [
+        {
+          id: 'dm-conv-1',
+          isGroup: false,
+          isPersonal: false,
+          name: null,
+          participants: [],
+          lastMessage: null,
+          unreadCount: 0,
+          createdAt: new Date().toISOString(),
+        },
+      ],
+      activeConversationId: null,
+    });
+
+    const { handler } = setupHandler('dm_message');
+
+    act(() => {
+      handler({
+        type: 'dm_message',
+        data: {
+          id: 'dm-msg-gif-failed',
+          conversation_id: 'dm-conv-1',
+          user_id: 'other-user',
+          username: 'alice',
+          display_name: 'Alice',
+          content: 'encrypted-gif-envelope',
+          gif_slug: 'night-sleep-18',
+          created_at: new Date().toISOString(),
+        },
+      });
+    });
+
+    await vi.waitFor(() =>
+      expect(mockNotify).toHaveBeenCalledWith(expect.objectContaining({ body: '' }))
+    );
+    expect(mockNotify).not.toHaveBeenCalledWith(expect.objectContaining({ body: 'GIF' }));
+
+    mockShouldNotify.mockReturnValue(false);
   });
 
   // ── Enforcement coverage gaps ─────────────────────────────────────────

@@ -55,11 +55,15 @@ function isDoNotDisturb(): boolean {
 }
 import { indexMessage } from '../services/searchService';
 import { unwrapGifEnvelope } from '../utils/gifEnvelope';
+import { formatMessagePreview } from '../utils/messagePreview';
 import { summarizeWsServerError } from '../utils/wsDiagnostics';
 import {
   desktopNotificationService,
   type NotificationType,
 } from '../services/desktopNotificationService';
+
+type ChannelMessagePayload = Extract<WebSocketEvent, { type: 'message' }>['data'];
+type DMMessagePayload = Extract<WebSocketEvent, { type: 'dm_message' }>['data'];
 
 // Debounce timers for re-fetching voice participants after join/leave events.
 // Coalesces rapid bursts (e.g. 10 users joining) into a single API call.
@@ -74,6 +78,97 @@ function speakIfVoiceLinked(text: string, channelId: string, senderId: string, s
   const voiceActiveId = useVoiceStore.getState().activeChannelId;
   if (voiceActiveId !== ch.linked_voice_channel_id) return;
   ttsSpeak(text, senderName);
+}
+
+function notificationPreviewBody(
+  content: string,
+  gifSlug: string | undefined,
+  data: Pick<ChannelMessagePayload | DMMessagePayload, 'attachments'>
+): string {
+  return formatMessagePreview({
+    content,
+    gifSlug,
+    attachments: data.attachments,
+    fallback: '',
+  });
+}
+
+function shouldSurfaceChannelNotification(data: ChannelMessagePayload, channelId: string): boolean {
+  const selfId = useUserStore.getState().user?.id;
+  return (
+    data.user_id !== selfId &&
+    !isChannelMuted(channelId, data.server_id ?? null) &&
+    !isDoNotDisturb()
+  );
+}
+
+function shouldSurfaceDMNotification(data: DMMessagePayload, conversationId: string): boolean {
+  const selfId = useUserStore.getState().user?.id;
+  return data.user_id !== selfId && !isDMMuted(conversationId) && !isDoNotDisturb();
+}
+
+function shouldShowChannelDesktopNotification(
+  data: ChannelMessagePayload,
+  channelId: string
+): boolean {
+  const notifType: NotificationType = data.mentioned === true ? 'mention' : 'message';
+  const activeChannelId = useChannelStore.getState().activeChannelId;
+
+  return desktopNotificationService.shouldNotify({
+    type: notifType,
+    isWindowFocused: document.hasFocus(),
+    isActiveChannel: channelId === activeChannelId,
+  });
+}
+
+function shouldShowDMDesktopNotification(conversationId: string): boolean {
+  return desktopNotificationService.shouldNotify({
+    type: 'dm',
+    isWindowFocused: document.hasFocus(),
+    isActiveChannel: conversationId === useDMStore.getState().activeConversationId,
+  });
+}
+
+function notifyChannelMessagePreview(
+  channelId: string,
+  data: ChannelMessagePayload,
+  content: string,
+  gifSlug: string | undefined,
+  shouldNotifyDesktop: boolean
+): void {
+  if (!shouldNotifyDesktop) return;
+
+  const channelName = useChannelStore.getState().channels.find((c) => c.id === channelId)?.name;
+  desktopNotificationService.notify({
+    title: `${data.username || 'Unknown'} in #${channelName || 'channel'}`,
+    senderDisplayName: data.username || 'Unknown',
+    body: notificationPreviewBody(content, gifSlug, data),
+    targetType: 'channel',
+    targetId: channelId,
+    serverId: data.server_id,
+    senderId: data.user_id,
+  });
+  desktopNotificationService.incrementBadge();
+}
+
+function notifyDMMessagePreview(
+  conversationId: string,
+  data: DMMessagePayload,
+  content: string,
+  gifSlug: string | undefined,
+  shouldNotifyDesktop: boolean
+): void {
+  if (!shouldNotifyDesktop) return;
+
+  desktopNotificationService.notify({
+    title: `DM from ${data.display_name || data.username || 'Unknown'}`,
+    senderDisplayName: data.display_name || data.username || 'Unknown',
+    body: notificationPreviewBody(content, gifSlug, data),
+    targetType: 'dm',
+    targetId: conversationId,
+    senderId: data.user_id,
+  });
+  desktopNotificationService.incrementBadge();
 }
 
 // ── Extracted handlers to reduce cognitive complexity ─────────────────────
@@ -398,10 +493,12 @@ function addEncryptedMessage(
   ciphertext: string,
   keyVersion: number | undefined,
   addMessage: (channelId: string, msg: MessageWithStatus) => void,
-  onPlaintext?: (text: string) => void
+  onPlaintext?: (text: string, gifSlug?: string) => void,
+  onDecryptFailed?: () => void
 ): void {
   if (!e2eeService.isInitialized) {
     addMessage(channelId, { ...baseMessage, content: '', decryptFailed: true });
+    onDecryptFailed?.();
     return;
   }
 
@@ -417,7 +514,7 @@ function addEncryptedMessage(
       addMessage(channelId, { ...baseMessage, content, gif_slug: gifSlug });
       // Passively index decrypted content for search
       indexMessage(baseMessage.id, content, channelId);
-      onPlaintext?.(content);
+      onPlaintext?.(content, gifSlug);
     })
     .catch((err) => {
       const isPending = isPendingKeyError(err);
@@ -427,6 +524,7 @@ function addEncryptedMessage(
         decryptFailed: !isPending,
         pendingKeys: isPending,
       });
+      onDecryptFailed?.();
     });
 }
 
@@ -505,7 +603,6 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
         display_name: data.display_name ?? undefined,
         avatar_url: data.avatar_url ?? undefined,
         key_version: keyVersion,
-        gif_slug: data.gif_slug || undefined,
         reply_to_id: data.reply_to_id || undefined,
         replied_to: data.replied_to
           ? {
@@ -518,6 +615,14 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
         updated_at: data.updated_at || new Date().toISOString(),
       };
 
+      const shouldSurfaceNotification = shouldSurfaceChannelNotification(data, channelId);
+      const shouldNotifyDesktop =
+        shouldSurfaceNotification && shouldShowChannelDesktopNotification(data, channelId);
+
+      if (shouldSurfaceNotification) {
+        notificationSoundService.play('message', { focused: true });
+      }
+
       const maybeSpeakTTS = (text: string) =>
         speakIfVoiceLinked(text, channelId, userId, data.display_name || data.username || '');
 
@@ -527,7 +632,11 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
         data.content ?? '',
         keyVersion,
         addMessage,
-        maybeSpeakTTS
+        (text, gifSlug) => {
+          maybeSpeakTTS(text);
+          notifyChannelMessagePreview(channelId, data, text, gifSlug, shouldNotifyDesktop);
+        },
+        () => notifyChannelMessagePreview(channelId, data, '', undefined, shouldNotifyDesktop)
       );
 
       // Decrypt replied_to content. `rt` is the normalized form from
@@ -554,43 +663,6 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       // NOTE: Unread tracking is handled exclusively by the 'unread_notify' handler
       // (server-level subscription). The 'message' event only arrives for the active
       // channel the user is subscribed to, so no unread increment is needed here.
-
-      // Notification sound for focused-channel messages (from other users)
-      const selfId = useUserStore.getState().user?.id;
-      // DND check first (broadest), then per-target mute. The user has the
-      // channel open but has explicitly muted it OR has DND on — either
-      // way, no sound and no desktop notification.
-      const muted = isChannelMuted(channelId, data.server_id ?? null);
-      if (data.user_id !== selfId && !muted && !isDoNotDisturb()) {
-        notificationSoundService.play('message', { focused: true });
-
-        // Desktop notification for channel messages (#175)
-        const isMentioned = data.mentioned === true;
-        const notifType: NotificationType = isMentioned ? 'mention' : 'message';
-        const activeChannelId = useChannelStore.getState().activeChannelId;
-
-        if (
-          desktopNotificationService.shouldNotify({
-            type: notifType,
-            isWindowFocused: document.hasFocus(),
-            isActiveChannel: channelId === activeChannelId,
-          })
-        ) {
-          const channelName = useChannelStore
-            .getState()
-            .channels.find((c) => c.id === channelId)?.name;
-          desktopNotificationService.notify({
-            title: `${data.username || 'Unknown'} in #${channelName || 'channel'}`,
-            senderDisplayName: data.username || 'Unknown',
-            body: data.content || '',
-            targetType: 'channel',
-            targetId: channelId,
-            serverId: data.server_id,
-            senderId: data.user_id,
-          });
-          desktopNotificationService.incrementBadge();
-        }
-      }
     });
 
     // Message update handler — msg.data narrowed to MessageUpdatePayload.
@@ -1182,7 +1254,6 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
         display_name: data.display_name ?? undefined,
         avatar_url: data.avatar_url ?? undefined,
         key_version: dmKeyVersion,
-        gif_slug: data.gif_slug || undefined,
         attachments: data.attachments || undefined,
         created_at: data.created_at || new Date().toISOString(),
         updated_at: data.updated_at || new Date().toISOString(),
@@ -1197,45 +1268,31 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
         ...(data.attachments?.length ? { attachmentType: data.attachments[0].file_type } : {}),
       };
 
+      const selfId = useUserStore.getState().user?.id;
+      const shouldSurfaceNotification = shouldSurfaceDMNotification(data, conversationId);
+      const shouldNotifyDesktop =
+        shouldSurfaceNotification && shouldShowDMDesktopNotification(conversationId);
+
+      if (shouldSurfaceNotification) {
+        notificationSoundService.play('dm', { focused: true });
+      }
+
       addEncryptedMessage(
         conversationId,
         baseMessage,
         data.content ?? '',
         dmKeyVersion,
-        addMessage
+        addMessage,
+        (text, gifSlug) =>
+          notifyDMMessagePreview(conversationId, data, text, gifSlug, shouldNotifyDesktop),
+        () => notifyDMMessagePreview(conversationId, data, '', undefined, shouldNotifyDesktop)
       );
 
       // Bump conversation to the top of the DM list with updated preview.
       // No-ops gracefully if the conversation isn't in state yet (initial-load race).
       // Only bump for messages from OTHER users — local sends already bumped optimistically.
-      const selfId = useUserStore.getState().user?.id;
       if (data.user_id !== selfId) {
         useDMStore.getState().bumpConversation(conversationId, lastMessagePreview);
-      }
-
-      // Notification sound for DM messages (from other users). DND wins
-      // over everything; the per-target DM mute is the secondary gate.
-      if (data.user_id !== selfId && !isDMMuted(conversationId) && !isDoNotDisturb()) {
-        notificationSoundService.play('dm', { focused: true });
-
-        // Desktop notification for DM messages (#175)
-        if (
-          desktopNotificationService.shouldNotify({
-            type: 'dm',
-            isWindowFocused: document.hasFocus(),
-            isActiveChannel: conversationId === useDMStore.getState().activeConversationId,
-          })
-        ) {
-          desktopNotificationService.notify({
-            title: `DM from ${data.display_name || data.username || 'Unknown'}`,
-            senderDisplayName: data.display_name || data.username || 'Unknown',
-            body: data.content || '',
-            targetType: 'dm',
-            targetId: conversationId,
-            senderId: data.user_id,
-          });
-          desktopNotificationService.incrementBadge();
-        }
       }
     });
 
