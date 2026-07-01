@@ -157,11 +157,28 @@ describe('MessageInput', () => {
     expect(hitTarget).toBeInTheDocument();
     expect(hitTarget.htmlFor).toBe(textarea.id);
     expect(hitTarget).toHaveTextContent('Message input');
-    expect(textareaDeclarations['align-self']).toBe('stretch');
+    expect(textareaDeclarations['align-self']).toBe('center');
     expect(textareaDeclarations.padding).toBe('calc(8px * var(--sp, 1)) 0');
     expect(textareaDeclarations.cursor).toBe('text');
     expect(childLayerDeclarations.position).toBe('relative');
     expect(childLayerDeclarations['z-index']).toBe('1');
+  });
+
+  it('keeps the compact user popover above the textarea layer when unpinned', () => {
+    render(<MessageInput onSendMessage={onSendMessage} channelName="general" />);
+
+    const userPanel = screen.getByTestId('user-panel').closest('.message-input-user-panel');
+    const userPanelLayerDeclarations = getCssDeclarations(
+      '.message-input-box > .message-input-user-panel'
+    );
+    const childLayerDeclarations = getCssDeclarations(
+      '.message-input-box > :not(.message-input-box-hit-target)'
+    );
+
+    expect(userPanel).toBeInTheDocument();
+    expect(Number(userPanelLayerDeclarations['z-index'])).toBeGreaterThan(
+      Number(childLayerDeclarations['z-index'])
+    );
   });
 
   it('links the visible input box hit target to the textarea', () => {

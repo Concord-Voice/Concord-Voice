@@ -58,6 +58,10 @@
   z-index: 1;
 }
 
+.message-input-box > .message-input-user-panel {
+  z-index: 2;
+}
+
 .message-input-box:focus-within {
   border-color: var(--accent-primary);
 }
@@ -65,7 +69,7 @@
 .message-input-textarea {
   flex: 1;
   min-width: 0;
-  align-self: stretch;
+  align-self: center;
   background: transparent;
   border: none;
   color: var(--text-primary);
