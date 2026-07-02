@@ -814,6 +814,187 @@ describe('VoiceService', () => {
     });
   });
 
+  // ===== Network-change recovery (#1790) =====
+
+  describe('network-change recovery (#1790)', () => {
+    it('re-establishes the media session after a transient disconnect + socket reconnect', async () => {
+      await joinVoiceChannel();
+      expect(useVoiceStore.getState().connectionState).toBe('connected');
+
+      // Any post-drop re-authorize must also succeed (joinVoiceChannel's
+      // mockResolvedValueOnce only covered the first join-authorize).
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      setupEmitResponses({
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        produce: { id: 'prod-mic-2' },
+        'resume-consumer': undefined,
+        'close-producer': undefined,
+        'pause-producer': undefined,
+        'resume-producer': undefined,
+        'leave-room': undefined,
+      });
+
+      const joinRoomEmits = () =>
+        mockSocket.emit.mock.calls.filter((c) => c[0] === 'join-room').length;
+      expect(joinRoomEmits()).toBe(1);
+
+      // VPN toggle / network-interface change: Socket.IO drops with
+      // 'transport close' (the ERR_NETWORK_CHANGED manifestation).
+      socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
+      expect(useVoiceStore.getState().connectionState).toBe('reconnecting');
+
+      // Socket.IO reconnects on the new network path.
+      mockSocket.connected = true;
+      socketListeners['connect']?.forEach((cb) => cb());
+
+      // The media-plane tore down our participant the moment the socket
+      // dropped (no server-side grace period), so a bare state flip back to
+      // 'connected' is a dead session — no server-side transports, producers,
+      // or consumers exist. The client MUST re-join the room and rebuild the
+      // media session for audio to flow again.
+      await vi.waitFor(() => {
+        expect(joinRoomEmits()).toBeGreaterThan(1);
+      });
+      expect(useVoiceStore.getState().connectionState).toBe('connected');
+      expect(useVoiceStore.getState().activeChannelId).toBe('channel-1');
+    });
+
+    it('re-applies self-mute and deafen after resume — a muted mic never transmits', async () => {
+      const { micProducer } = await joinVoiceChannel();
+      // User self-muted + deafened before the network drop; store state
+      // survives the resume (it is intentionally not reset).
+      useVoiceStore.getState().setMuted(true);
+      useVoiceStore.getState().setDeafened(true);
+
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      setupEmitResponses({
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        produce: { id: 'prod-mic' },
+        'resume-consumer': undefined,
+        'leave-room': undefined,
+      });
+
+      socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
+      mockSocket.connected = true;
+      socketListeners['connect']?.forEach((cb) => cb());
+
+      await vi.waitFor(() => {
+        expect(useVoiceStore.getState().connectionState).toBe('connected');
+      });
+      // The rebuilt mic producer must be paused before the session is
+      // declared connected — otherwise a muted user silently transmits.
+      expect(micProducer.pause).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith('pause-producer', {
+        producerId: 'prod-mic',
+      });
+      // Deafen state rebroadcast to the freshly-created server participant.
+      expect(mockSocket.emit).toHaveBeenCalledWith('set-deafen', { isDeafened: true });
+    });
+
+    it('runs only one resume for overlapping connect events (single-flight)', async () => {
+      await joinVoiceChannel();
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      setupEmitResponses({
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        produce: { id: 'prod-mic-2' },
+        'resume-consumer': undefined,
+        'leave-room': undefined,
+      });
+
+      socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
+      mockSocket.connected = true;
+      // Two connect events while the first resume is still in flight — the
+      // second must be swallowed by the resumeInFlight single-flight guard.
+      socketListeners['connect']?.forEach((cb) => cb());
+      socketListeners['connect']?.forEach((cb) => cb());
+
+      await vi.waitFor(() => {
+        expect(useVoiceStore.getState().connectionState).toBe('connected');
+      });
+      const authorizeCalls = mockApiFetch.mock.calls.filter((c) =>
+        String(c[0]).includes('/voice/join')
+      ).length;
+      // 1 original join + exactly 1 resume — never a doubled rejoin.
+      expect(authorizeCalls).toBe(2);
+    });
+
+    it('re-authorizes via the DM endpoint when resuming a DM call', async () => {
+      await joinVoiceChannel();
+      useVoiceStore.getState().setDMCall(true, 'channel-1');
+      mockApiFetch.mockClear();
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      setupEmitResponses({
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        produce: { id: 'prod-mic-2' },
+        'resume-consumer': undefined,
+        'leave-room': undefined,
+      });
+
+      socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
+      mockSocket.connected = true;
+      socketListeners['connect']?.forEach((cb) => cb());
+
+      await vi.waitFor(() => {
+        expect(mockApiFetch).toHaveBeenCalledWith(
+          '/api/v1/dm/conversations/channel-1/voice/join',
+          expect.objectContaining({ method: 'POST' })
+        );
+      });
+    });
+
+    it('tears down instead of stranding zombie reconnecting state without call context', async () => {
+      await joinVoiceChannel();
+      // Simulate a leave that raced the drop: store already reset when the
+      // socket-level reconnect fires.
+      useVoiceStore.getState().reset();
+      useVoiceStore.getState().setConnectionState('reconnecting');
+
+      socketListeners['connect']?.forEach((cb) => cb());
+
+      await vi.waitFor(() => {
+        expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+      });
+    });
+
+    it('falls into the bounded cleanup path when rejoin authorization fails', async () => {
+      await joinVoiceChannel();
+      socketListeners['disconnect']?.forEach((cb) => cb('transport close'));
+      expect(useVoiceStore.getState().connectionState).toBe('reconnecting');
+
+      // Control-plane refuses the re-authorize (e.g. access revoked mid-call):
+      // recovery must end in the user-visible disconnect path, never a
+      // zombie 'reconnecting' call.
+      mockApiFetch.mockResolvedValue({
+        ok: false,
+        status: 403,
+        json: vi.fn().mockResolvedValue({}),
+      });
+      mockSocket.connected = true;
+      socketListeners['connect']?.forEach((cb) => cb());
+
+      await vi.waitFor(() => {
+        expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+      });
+      expect(useVoiceStore.getState().activeChannelId).toBeNull();
+    });
+  });
+
   // ===== leaveChannel =====
 
   describe('leaveChannel', () => {

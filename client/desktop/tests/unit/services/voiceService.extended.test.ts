@@ -1258,11 +1258,27 @@ describe('VoiceService Extended', () => {
   });
 
   describe('socket listener: reconnect', () => {
-    it('transitions reconnecting to connected', async () => {
+    it('re-establishes the media session and returns to connected (#1790)', async () => {
       await joinVoiceChannel();
       useVoiceStore.getState().setConnectionState('reconnecting');
+
+      // The resume path re-runs the control-plane authorize + room join
+      // (the server tore down our participant on disconnect), so the
+      // second round of responses must be mocked too.
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+
       triggerSocketEvent('connect');
-      expect(useVoiceStore.getState().connectionState).toBe('connected');
+
+      await vi.waitFor(() => {
+        expect(useVoiceStore.getState().connectionState).toBe('connected');
+      });
+      // A bare state flip is not enough — the room must be re-joined.
+      expect(mockSocket.emit.mock.calls.filter((c) => c[0] === 'join-room').length).toBeGreaterThan(
+        1
+      );
     });
 
     it('does not change if not reconnecting', async () => {
