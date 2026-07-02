@@ -730,11 +730,15 @@ app.whenReady().then(async () => {
     return ['camera', 'microphone', 'speaker', 'hid'].includes(details.deviceType ?? '');
   });
 
-  // Update-feed TLS cert pinning (#658). Installs a hostname-gated verify proc
-  // on the default session: pinned SaaS hosts enforce SPKI SHA-256 matching
-  // against PIN_CONFIG; all other hosts defer to Chromium's default validation.
-  // Must be installed BEFORE initAutoUpdater below so the first update check
-  // is already armed. See:
+  // API-host TLS cert pinning (#658). Installs a hostname-gated verify proc
+  // on the DEFAULT session: pinned SaaS hosts (api.concordvoice.chat) enforce
+  // SPKI SHA-256 matching against PIN_CONFIG; all other hosts defer to
+  // Chromium's default validation. NOTE: electron-updater traffic rides its
+  // own 'electron-updater' session partition and is NOT covered by this
+  // proc; post-#1981 the update feed (github.com) is intentionally unpinned —
+  // the Windows update trust anchor is artifact-level Authenticode
+  // verification (publisherName + the #644 issuer-pin hook), not feed TLS
+  // (#2020). See:
   //   [internal]specs/2026-04-20-658-updater-feed-cert-pin-design.md
   //   [internal]
   session.defaultSession.setCertificateVerifyProc(createPinningVerifyProc(PIN_CONFIG, console));

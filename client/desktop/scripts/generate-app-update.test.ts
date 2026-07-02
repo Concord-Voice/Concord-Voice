@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { parse as parseYaml } from 'yaml';
 import { renderAppUpdateYaml } from './generate-app-update.mts';
 import { UPDATE_ENDPOINT_URL } from '../src/constants/updateEndpoint.mts';
+import { ALLOWED_WINDOWS_PUBLISHERS } from '../src/constants/allowedWindowsPublishers.mts';
 
 describe('UPDATE_ENDPOINT_URL', () => {
   it('uses HTTPS', () => {
@@ -46,10 +47,38 @@ describe('renderAppUpdateYaml', () => {
     expect(parsed.url).toBe(override);
   });
 
-  it('produces YAML with exactly the three expected keys', () => {
+  it('produces YAML with exactly the four expected keys', () => {
     const yaml = renderAppUpdateYaml();
     const parsed = parseYaml(yaml);
-    expect(Object.keys(parsed).sort()).toEqual(['provider', 'updaterCacheDirName', 'url']);
+    expect(Object.keys(parsed).sort()).toEqual([
+      'provider',
+      'publisherName',
+      'updaterCacheDirName',
+      'url',
+    ]);
+  });
+
+  it('emits the Windows publisher allow-list as a YAML sequence (#2020)', () => {
+    const parsed = parseYaml(renderAppUpdateYaml());
+    // electron-updater's NsisUpdater.verifySignature reads publisherName ONLY
+    // from this on-disk file (never from setFeedURL); presence here is what
+    // arms the Windows install-time Authenticode gate.
+    expect(parsed.publisherName).toEqual(['Concord Voice LLC']);
+  });
+
+  it('keeps the emitted allow-list in lockstep with the runtime constant', () => {
+    const parsed = parseYaml(renderAppUpdateYaml());
+    expect(parsed.publisherName).toEqual([...ALLOWED_WINDOWS_PUBLISHERS]);
+  });
+
+  it('emits only non-empty string publisher names', () => {
+    const parsed = parseYaml(renderAppUpdateYaml());
+    expect(Array.isArray(parsed.publisherName)).toBe(true);
+    expect(parsed.publisherName.length).toBeGreaterThan(0);
+    for (const name of parsed.publisherName) {
+      expect(typeof name).toBe('string');
+      expect(name.trim().length).toBeGreaterThan(0);
+    }
   });
 
   it('pins the updater cache dir to the spaceless ConcordVoice', () => {

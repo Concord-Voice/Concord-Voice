@@ -1,9 +1,13 @@
 import type { PinConfig } from './updatePinning';
 
-// ⚠ SECURITY-CRITICAL — TLS pin configuration for the update feed. ⚠
+// ⚠ SECURITY-CRITICAL — TLS pin configuration for the SaaS API host. ⚠
 //
-// This file is the sole source of truth for which TLS certs are trusted to
-// serve the Concord Voice electron-updater feed on api.concordvoice.chat.
+// This file is the sole source of truth for which TLS certs are trusted for
+// default-session HTTPS connections to api.concordvoice.chat. It does NOT
+// cover electron-updater traffic (which rides a separate 'electron-updater'
+// session partition); the post-#1981 update feed host (github.com) is
+// intentionally unpinned — artifact-level verification is the update trust
+// anchor (#2020).
 // Every change requires:
 //   1. PR description linking to [internal]
 //   2. Security reviewer sign-off (enforced via CODEOWNERS)

@@ -20,7 +20,7 @@ This document describes which of those properties each platform verifies, and ho
 **Shipped in PR #641.**
 
 - **Build-time:** artifacts are signed with an Apple Developer ID certificate and notarized by Apple's notary service. The stapled notarization ticket is embedded in the `.app` bundle.
-- **CI verification** (`.github/workflows/build-desktop.yml:243-275`): every build runs `codesign --verify --deep --strict`, `spctl --assess --type execute` (Gatekeeper simulation), and `xcrun stapler validate`. Any failure fails the workflow.
+- **CI verification** (`build-desktop.yml` — "Verify signature and notarization" step): every build runs `codesign --verify --deep --strict`, `spctl --assess --type execute` (Gatekeeper simulation), and `xcrun stapler validate`. Any failure fails the workflow.
 - **Install-time:** Gatekeeper re-verifies the signature and notarization before executing the updated app. Unsigned or tampered artifacts are rejected by the OS.
 
 **What the user is trusting:** Apple's Developer ID program + Apple's notary service.
@@ -30,9 +30,9 @@ This document describes which of those properties each platform verifies, and ho
 **Shipped in #404; runtime hardening added in #644.**
 
 - **Build-time:** artifacts are signed by Microsoft Azure Trusted Signing using OIDC federation (no long-lived keys in CI). Leaf certs are 72-hour short-lived, auto-renewed daily. All signatures are RFC 3161 timestamped, so they remain valid past leaf expiry.
-- **CI verification** (`.github/workflows/build-desktop.yml:302-339`): every build verifies Authenticode status, requires leaf CN `Concord Voice LLC`, requires RFC 3161 timestamp, and requires the issuer CN to match `^Microsoft ID Verified CS `.
-- **Install-time (electron-updater built-in):** verifies Authenticode signature validity and compares leaf CN against `ALLOWED_WINDOWS_PUBLISHERS` in [`client/desktop/src/main/updater.ts`](../../client/desktop/src/main/updater.ts) (currently `['Concord Voice LLC']`).
-- **Install-time (custom hook, added by #644):** `verifyUpdateCodeSignature` extracts the full cert chain and rejects the update unless the leaf was issued by a cert matching `^Microsoft ID Verified CS `. This defeats the CN-collision attack where a publicly-trusted cert with matching leaf CN is obtained from a different CA. See [`client/desktop/src/main/verifyWindowsSignature.ts`](../../client/desktop/src/main/verifyWindowsSignature.ts).
+- **CI verification** (`build-desktop.yml` — "Verify Windows signature" step): every build verifies Authenticode status, requires leaf CN `Concord Voice LLC`, requires RFC 3161 timestamp, and requires the issuer CN to match `^Microsoft ID Verified CS `.
+- **Install-time (electron-updater built-in):** verifies Authenticode signature validity and compares the leaf CN against the `publisherName` list in the packaged `app-update.yml`, generated from the shared `ALLOWED_WINDOWS_PUBLISHERS` constant ([`client/desktop/src/shared/allowedWindowsPublishers.ts`](../../client/desktop/src/shared/allowedWindowsPublishers.ts), currently `['Concord Voice LLC']`) by `scripts/generate-app-update.mts`. electron-updater reads the allow-list ONLY from this on-disk file — the key was absent before #2020, leaving both install-time checks dormant.
+- **Install-time (custom hook, added by #644, armed by #2020):** `verifyUpdateCodeSignature` extracts the full cert chain and rejects the update unless the leaf was issued by a cert matching `^Microsoft ID Verified CS `. This defeats the CN-collision attack where a publicly-trusted cert with matching leaf CN is obtained from a different CA. See [`client/desktop/src/main/verifyWindowsSignature.ts`](../../client/desktop/src/main/verifyWindowsSignature.ts).
 
 **What the user is trusting:** Microsoft Trusted Signing (which performs D-U-N-S-backed corporate verification before issuing to the allowed CN) + the Microsoft root of trust on Windows.
 

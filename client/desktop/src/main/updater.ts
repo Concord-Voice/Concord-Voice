@@ -8,6 +8,7 @@ import { app, net, type BrowserWindow } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { UPDATE_ENDPOINT_URL } from '../shared/updateEndpoint';
+import { ALLOWED_WINDOWS_PUBLISHERS } from '../shared/allowedWindowsPublishers';
 import { createUpdateLogger, type UpdateLogger } from './updateLogger';
 import { prepareForUpdate } from './updateSafety';
 import { updateSplashStatus, showSplashProgress, updateSplashError } from './splashWindow';
@@ -17,14 +18,6 @@ import { verifyLinuxArtifact, type LinuxVerifyResult } from './verifyLinuxSignat
 // Check every 4 hours; delay first check 10s so it doesn't block app startup
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const STARTUP_CHECK_DELAY_MS = 10_000;
-
-// Windows-only: electron-updater verifies the downloaded Setup.exe's
-// Authenticode signer subject against this list before running the
-// installer. Defeats MITM of the update feed on Windows. Ignored on
-// macOS and Linux. Array syntax supports multiple allowed publishers
-// (useful during cert-rotation transitions across LLC renames).
-// See issue #404 and spec [internal]specs/2026-04-15-404-*.md
-const ALLOWED_WINDOWS_PUBLISHERS: readonly string[] = Object.freeze(['Concord Voice LLC']);
 
 // Persisted preference for pre-release updates (same pattern as hw-accel.json)
 const prereleasePrefPath = path.join(app.getPath('userData'), 'update-prefs.json');
