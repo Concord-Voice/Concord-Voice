@@ -16,6 +16,7 @@ import { useChatStore } from '@/renderer/stores/chatStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
 import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/subscriptionStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
 import { mockServer } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 
@@ -93,20 +94,32 @@ describe('resetService', () => {
       expect(useServerStore.getState().servers).toHaveLength(0);
     });
 
-    it('removes ALL persisted localStorage keys', () => {
-      localStorage.setItem('concord-layout', 'data');
-      localStorage.setItem('concord-settings', 'data');
-      localStorage.setItem('concord:audio-advanced', 'data');
-      localStorage.setItem('concord:video-settings', 'data');
-      localStorage.setItem('concord:tts-settings', 'data');
+    it('preserves device-settings localStorage keys (#1603)', () => {
+      // Device-local preferences survive logout-class resets; the old
+      // wipe-everything contract reverted theme + A/V settings on every
+      // logout. Detailed per-store coverage lives in
+      // resetService.deviceSettings.test.ts.
+      localStorage.setItem('concord-settings', 'device-pref');
+      localStorage.setItem('concord:audio-advanced', 'device-pref');
+      localStorage.setItem('concord:video-settings', 'device-pref');
+      localStorage.setItem('concord:tts-settings', 'device-pref');
 
       nuclearReset();
 
-      expect(localStorage.getItem('concord-layout')).toBeNull();
-      expect(localStorage.getItem('concord-settings')).toBeNull();
-      expect(localStorage.getItem('concord:audio-advanced')).toBeNull();
-      expect(localStorage.getItem('concord:video-settings')).toBeNull();
-      expect(localStorage.getItem('concord:tts-settings')).toBeNull();
+      // The audio key is re-serialized by clearAllParticipantVolumes()'s
+      // persist write-back, so assert presence, not raw-string equality.
+      expect(localStorage.getItem('concord-settings')).toBe('device-pref');
+      expect(localStorage.getItem('concord:audio-advanced')).not.toBeNull();
+      expect(localStorage.getItem('concord:video-settings')).toBe('device-pref');
+      expect(localStorage.getItem('concord:tts-settings')).toBe('device-pref');
+    });
+
+    it('clears user-scoped per-participant volume overrides (#1233 discipline)', () => {
+      useAudioSettingsStore.getState().setParticipantVolume('other-user-id', 40);
+
+      nuclearReset();
+
+      expect(useAudioSettingsStore.getState().perParticipantVolume).toEqual({});
     });
 
     it('calls electron clearTokens', () => {

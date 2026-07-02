@@ -74,6 +74,7 @@ interface AudioSettingsState extends AudioSettings {
   setOutputVolume: (volume: number) => void;
   setParticipantVolume: (userId: string, volume: number) => void;
   clearParticipantVolume: (userId: string) => void;
+  clearAllParticipantVolumes: () => void;
   setQuietBoost: (enabled: boolean) => void;
   setQuietBoostThreshold: (threshold: number) => void;
   setNetworkType: (type: 'auto' | 'wifi' | 'wired') => void;
@@ -145,6 +146,11 @@ export const useAudioSettingsStore = wrapStore(
             delete next[userId];
             return { perParticipantVolume: next };
           }),
+        // Per-participant overrides are keyed by other users' IDs — user-scoped
+        // data inside an otherwise device-scoped store. Cleared on logout-class
+        // resets (#1603) so a prior account's contact IDs never persist for the
+        // next account on this device (#1233 cross-account discipline).
+        clearAllParticipantVolumes: () => set({ perParticipantVolume: {} }),
         setQuietBoost: (quietBoost) => set({ quietBoost }),
         setQuietBoostThreshold: (quietBoostThreshold) =>
           set({ quietBoostThreshold: Math.max(-50, Math.min(-20, quietBoostThreshold)) }),

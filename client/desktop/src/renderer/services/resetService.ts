@@ -6,9 +6,14 @@
  *   the client has issues but the session is valid.
  * - gracefulReset: Clears content stores, preserves device settings (theme, audio, etc.)
  *   Used when the user is being "remembered" but needs a fresh content slate.
- * - nuclearReset: Wipes everything. Used when the login screen appears — no ghost profiles.
+ * - nuclearReset: Wipes all user/content/auth state. Used when the login screen
+ *   appears — no ghost profiles. Device-LOCAL settings (theme/appearance, audio,
+ *   video, TTS, layout UI prefs) deliberately survive: wiping them reverted every
+ *   logout-class transition to defaults (#1603, public feedback #26). User-scoped
+ *   fields nested inside those stores (per-participant volumes) are still cleared.
  *
- * Core principle: if the login screen appears, go nuclear.
+ * Core principle: if the login screen appears, go nuclear — on identity and
+ * content, never on device preferences.
  */
 
 import { useAuthStore } from '../stores/authStore';
@@ -30,6 +35,7 @@ import { useSSOStore } from '../stores/ssoStore';
 import { useE2EEStore } from '../stores/e2eeStore';
 import { useRichPresenceStore } from '../stores/richPresenceStore';
 import { useSubscriptionStore } from '../stores/subscriptionStore';
+import { useAudioSettingsStore } from '../stores/audioSettingsStore';
 
 /**
  * Clears content stores while preserving device settings.
@@ -106,8 +112,16 @@ export function softRestart(): void {
 }
 
 /**
- * Wipes all state — in-memory stores, localStorage, and main process tokens.
- * Used when the login screen appears (any reason), ensuring zero ghost state.
+ * Wipes all user/content/auth state — in-memory stores, user-scoped
+ * localStorage, and main process tokens. Used when the login screen appears
+ * (any reason), ensuring zero ghost state.
+ *
+ * Device-local settings (concord-settings, concord:audio-advanced,
+ * concord:video-settings, concord:tts-settings, concord-layout) are NOT
+ * removed: they are machine preferences, not profile state, and removing
+ * them here silently reverted the user's theme and A/V settings on every
+ * logout / session-only 401 (#1603). Do not re-add removeItem calls for
+ * settings keys — clear user-scoped fields inside those stores instead.
  */
 export function nuclearReset(): void {
   // Start with everything gracefulReset does
@@ -116,12 +130,10 @@ export function nuclearReset(): void {
   // Additionally clear auth store
   useAuthStore.getState().clearAccessToken();
 
-  // Remove ALL persisted localStorage keys (settings + layout)
-  localStorage.removeItem('concord-layout');
-  localStorage.removeItem('concord-settings');
-  localStorage.removeItem('concord:audio-advanced');
-  localStorage.removeItem('concord:video-settings');
-  localStorage.removeItem('concord:tts-settings');
+  // Clear user-scoped data nested inside the (preserved) device-settings
+  // stores: per-participant volume overrides are keyed by other users' IDs
+  // (#1233 cross-account discipline).
+  useAudioSettingsStore.getState().clearAllParticipantVolumes();
 
   // Clear main process tokens (disk files + in-memory)
   globalThis.electron?.clearTokens?.();
