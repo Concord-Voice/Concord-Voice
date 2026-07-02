@@ -1,7 +1,9 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import {
   handleSetTestingStatus,
+  TESTING_STATUS_WINDOW_MS,
+  TESTING_STATUS_MAX_CHANGES,
   type SetTestingStatusRoomManager,
   type SetTestingStatusSocket,
 } from '../src/lib/setTestingStatus.js';
@@ -113,5 +115,86 @@ describe('handleSetTestingStatus (#1163)', () => {
     expect(result).toEqual({ error: 'Not in a room' });
     expect(setParticipantTestingStatus).not.toHaveBeenCalled();
     expect(to).not.toHaveBeenCalled();
+  });
+
+  describe('sliding-window rate limit (#2030 — #1163 §7.5 interim mitigation)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(1_000_000);
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /**
+     * Wire the fake like the real RoomManager: an accepted change flips the
+     * participant's isTesting, so alternating toggles are state-changing.
+     */
+    function makeStatefulFakes() {
+      const fakes = makeFakes();
+      const participant = { socketId: 'socket-1', isTesting: false };
+      fakes.getParticipant.mockReturnValue(participant);
+      fakes.setParticipantTestingStatus.mockImplementation(
+        (_room: string, _user: string, v: boolean) => {
+          participant.isTesting = v;
+        }
+      );
+      return { ...fakes, participant };
+    }
+
+    function toggle(fakes: ReturnType<typeof makeStatefulFakes>) {
+      return handleSetTestingStatus(fakes.roomManager, fakes.socket, 'room-1', 'user-1', {
+        isTesting: !fakes.participant.isTesting,
+      });
+    }
+
+    it('never rejects a legitimate fast test cycle (happy path)', () => {
+      const fakes = makeStatefulFakes();
+
+      // Two rapid start/stop cycles = 4 state changes, well under the budget.
+      for (let i = 0; i < 4; i++) {
+        expect(toggle(fakes)).toEqual({ success: true });
+      }
+      expect(fakes.emit).toHaveBeenCalledTimes(4);
+    });
+
+    it('rejects a toggle flood beyond the in-window budget with zero broadcasts', () => {
+      const fakes = makeStatefulFakes();
+
+      for (let i = 0; i < TESTING_STATUS_MAX_CHANGES; i++) {
+        expect(toggle(fakes)).toEqual({ success: true });
+      }
+      const flood = toggle(fakes);
+
+      expect(flood).toEqual({ error: 'rate_limited' });
+      expect(fakes.emit).toHaveBeenCalledTimes(TESTING_STATUS_MAX_CHANGES);
+      expect(fakes.setParticipantTestingStatus).toHaveBeenCalledTimes(TESTING_STATUS_MAX_CHANGES);
+    });
+
+    it('self-heals once the window slides past (no permanent lockout)', () => {
+      const fakes = makeStatefulFakes();
+
+      for (let i = 0; i < TESTING_STATUS_MAX_CHANGES; i++) toggle(fakes);
+      expect(toggle(fakes)).toEqual({ error: 'rate_limited' });
+
+      vi.setSystemTime(1_000_000 + TESTING_STATUS_WINDOW_MS + 1);
+
+      expect(toggle(fakes)).toEqual({ success: true });
+    });
+
+    it('does not count idempotent same-state calls against the budget', () => {
+      const fakes = makeStatefulFakes();
+
+      // Same-state calls no-op (no broadcast) and must not consume budget.
+      for (let i = 0; i < TESTING_STATUS_MAX_CHANGES * 2; i++) {
+        expect(
+          handleSetTestingStatus(fakes.roomManager, fakes.socket, 'room-1', 'user-1', {
+            isTesting: false,
+          })
+        ).toEqual({ success: true });
+      }
+      // A real state change is still allowed afterwards.
+      expect(toggle(fakes)).toEqual({ success: true });
+    });
   });
 });

@@ -70,6 +70,12 @@ export interface Participant {
   isDeafened: boolean;
   /** Audio-device test indicator (#1163). UI signal only; identity comes from socket auth. */
   isTesting: boolean;
+  /**
+   * State-change timestamps for the update-test-status sliding-window rate
+   * limit (#2030, see setTestingStatus.ts). Participant-scoped so the
+   * limiter state is freed on leave.
+   */
+  testingStatusChangeTimes?: number[];
   // ── Per-user media entitlement (#1300) ─────────────────────────────────
   /** Subscription tier label (debug/log/forward-compat only — caps below drive enforcement). */
   tier: string;
