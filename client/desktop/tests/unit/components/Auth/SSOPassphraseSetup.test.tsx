@@ -80,6 +80,12 @@ describe('SSOPassphraseSetup', () => {
     expect(screen.getByLabelText(/confirm passphrase/i)).toBeInTheDocument();
   });
 
+  it('shows username hint with identity', () => {
+    render(<SSOPassphraseSetup />);
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: 'newcomer' } });
+    expect(screen.getByText(/identity: @newcomer/)).toBeInTheDocument();
+  });
+
   it('disables submit until passphrases match and meet strength', () => {
     render(<SSOPassphraseSetup />);
     fireEvent.change(screen.getByLabelText(/username/i), { target: { value: 'newcomer' } });

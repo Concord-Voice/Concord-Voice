@@ -164,7 +164,7 @@ describe('Register', () => {
     const user = userEvent.setup();
     render(<Register onBack={onBack} onSuccess={onSuccess} onSwitchToLogin={onSwitchToLogin} />);
     await user.type(screen.getByPlaceholderText('your_username'), 'myname');
-    expect(screen.getByText(/myname@concordvoice\.chat/)).toBeInTheDocument();
+    expect(screen.getByText(/identity: @myname/)).toBeInTheDocument();
   });
 
   it('calls onBack when back button is clicked', async () => {
