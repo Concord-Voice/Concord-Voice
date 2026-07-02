@@ -114,11 +114,40 @@ vi.mock('@/renderer/services/gifProvider/klipyClient', () => ({
   },
 }));
 vi.mock('@/renderer/components/Settings/MFATierSelector', () => ({
-  default: () => <div data-testid="mfa-tier-selector">MFATierSelector</div>,
+  // Enhanced (#2017): expose the setup callbacks as buttons so tests can drive
+  // mfaSetupMethod into its email-sms / non-email branches (renderMfaSetupArea).
+  default: (props: {
+    onSetupTOTP: () => void;
+    onSetupEmailSms: () => void;
+    onSetupWebAuthn: (t: 'hardware' | 'platform') => void;
+  }) => (
+    <div data-testid="mfa-tier-selector">
+      MFATierSelector
+      <button data-testid="stub-setup-totp" onClick={() => props.onSetupTOTP()}>
+        setup totp
+      </button>
+      <button data-testid="stub-setup-emailsms" onClick={() => props.onSetupEmailSms()}>
+        setup email-sms
+      </button>
+      <button data-testid="stub-setup-webauthn" onClick={() => props.onSetupWebAuthn('hardware')}>
+        setup webauthn
+      </button>
+    </div>
+  ),
   WebAuthnCredential: {},
 }));
 vi.mock('@/renderer/components/Settings/MFASetup', () => ({
-  default: () => <div data-testid="mfa-setup">MFASetup</div>,
+  default: (props: { onComplete: () => void; onCancel: () => void }) => (
+    <div data-testid="mfa-setup">
+      MFASetup
+      <button data-testid="mfa-setup-complete" onClick={() => props.onComplete()}>
+        complete
+      </button>
+      <button data-testid="mfa-setup-cancel" onClick={() => props.onCancel()}>
+        cancel
+      </button>
+    </div>
+  ),
 }));
 vi.mock('@/renderer/components/Auth/MFAVerifyPrompt', () => ({
   default: ({
@@ -140,10 +169,27 @@ vi.mock('@/renderer/components/Auth/MFAVerifyPrompt', () => ({
   ),
 }));
 vi.mock('@/renderer/components/Settings/BackupCodeDisplay', () => ({
-  default: () => <div data-testid="backup-code-display">BackupCodeDisplay</div>,
+  default: (props: { onConfirm: () => void }) => (
+    <div data-testid="backup-code-display">
+      BackupCodeDisplay
+      <button data-testid="backup-code-confirm" onClick={() => props.onConfirm()}>
+        confirm
+      </button>
+    </div>
+  ),
 }));
 vi.mock('@/renderer/components/Settings/EmailSmsSetup', () => ({
-  default: () => <div data-testid="email-sms-setup">EmailSmsSetup</div>,
+  default: (props: { onComplete: () => void; onCancel: () => void }) => (
+    <div data-testid="email-sms-setup">
+      EmailSmsSetup
+      <button data-testid="email-sms-complete" onClick={() => props.onComplete()}>
+        complete
+      </button>
+      <button data-testid="email-sms-cancel" onClick={() => props.onCancel()}>
+        cancel
+      </button>
+    </div>
+  ),
 }));
 vi.mock('@/renderer/components/Auth/LoadingSpinner', () => ({
   default: ({ size }: { size?: string }) => (
@@ -677,6 +723,102 @@ describe('PrivacySecuritySection', () => {
   it('renders MFATierSelector when no setup method is active', async () => {
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByTestId('mfa-tier-selector')).toBeInTheDocument());
+  });
+
+  // ── MFA setup area + backup-reset modal ──────────────────────────────────
+  // Coverage for the #2017 render-helper extraction (renderMfaSetupArea /
+  // renderBackupResetModal). These MFA states were previously untested.
+
+  it('renders EmailSmsSetup when the email-sms setup method is selected', async () => {
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByTestId('mfa-tier-selector')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('stub-setup-emailsms'));
+    expect(screen.getByTestId('email-sms-setup')).toBeInTheDocument();
+    expect(screen.queryByTestId('mfa-tier-selector')).not.toBeInTheDocument();
+    // completing returns to the tier selector (covers the onComplete callback)
+    fireEvent.click(screen.getByTestId('email-sms-complete'));
+    expect(await screen.findByTestId('mfa-tier-selector')).toBeInTheDocument();
+  });
+
+  it('renders MFASetup when a non-email setup method is selected', async () => {
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByTestId('mfa-tier-selector')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('stub-setup-totp'));
+    expect(screen.getByTestId('mfa-setup')).toBeInTheDocument();
+    expect(screen.queryByTestId('mfa-tier-selector')).not.toBeInTheDocument();
+    // cancelling returns to the tier selector (covers the onCancel callback)
+    fireEvent.click(screen.getByTestId('mfa-setup-cancel'));
+    expect(await screen.findByTestId('mfa-tier-selector')).toBeInTheDocument();
+  });
+
+  it('renders MFASetup for a webauthn setup and completes it', async () => {
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() => expect(screen.getByTestId('mfa-tier-selector')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('stub-setup-webauthn'));
+    expect(screen.getByTestId('mfa-setup')).toBeInTheDocument();
+    // completing returns to the tier selector (covers the onComplete callback)
+    fireEvent.click(screen.getByTestId('mfa-setup-complete'));
+    expect(await screen.findByTestId('mfa-tier-selector')).toBeInTheDocument();
+  });
+
+  it('opens the backup-code reset modal and shows the verify form', async () => {
+    mockApiFetch
+      .mockReset()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ sessions: [], past_sessions: [], revocation_mode: 'secure' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          methods: ['totp'],
+          recovery_only_methods: [],
+          recovery_hardened: false,
+          backup_codes_remaining: 5,
+          backup_email: '',
+        }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+    render(<PrivacySecuritySection />);
+    const resetBtn = await screen.findByRole('button', { name: /reset\s*codes/i });
+    fireEvent.click(resetBtn);
+    expect(screen.getByText('Reset Backup Codes')).toBeInTheDocument();
+    expect(screen.getByLabelText('Password')).toBeInTheDocument();
+  });
+
+  it('regenerates backup codes and shows the code display', async () => {
+    mockApiFetch
+      .mockReset()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ sessions: [], past_sessions: [], revocation_mode: 'secure' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          methods: ['totp'],
+          recovery_only_methods: [],
+          recovery_hardened: false,
+          backup_codes_remaining: 5,
+          backup_email: '',
+        }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ credentials: [] }) });
+    render(<PrivacySecuritySection />);
+    fireEvent.click(await screen.findByRole('button', { name: /reset\s*codes/i }));
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByTestId('mfa-verify-btn'));
+    mockApiFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ backup_codes: ['aaaa-bbbb', 'cccc-dddd'] }),
+    });
+    fireEvent.click(screen.getByRole('button', { name: /regenerate codes/i }));
+    await vi.waitFor(() => expect(screen.getByTestId('backup-code-display')).toBeInTheDocument());
+    // confirming closes the modal (covers the BackupCodeDisplay onConfirm callback)
+    fireEvent.click(screen.getByTestId('backup-code-confirm'));
+    await vi.waitFor(() =>
+      expect(screen.queryByTestId('backup-code-display')).not.toBeInTheDocument()
+    );
   });
 
   // ── Permission status badges ─────────────────────────────────────────────

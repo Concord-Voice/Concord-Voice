@@ -1188,6 +1188,125 @@ const PrivacySecuritySection: React.FC = () => {
     }
   };
 
+  // MFA setup area — three-way branch extracted from the render tree so its
+  // conditionals do not inflate this component's cognitive complexity (S3776).
+  const renderMfaSetupArea = () => (
+    <>
+      {mfaSetupMethod === 'email-sms' && (
+        <EmailSmsSetup
+          mfaActive={mfaMethods.length > 0}
+          onComplete={() => {
+            setMfaSetupMethod(null);
+            fetchMFAStatus();
+          }}
+          onCancel={() => setMfaSetupMethod(null)}
+        />
+      )}
+      {mfaSetupMethod && mfaSetupMethod !== 'email-sms' && (
+        <MFASetup
+          method={mfaSetupMethod}
+          credentialType={mfaSetupMethod === 'webauthn' ? webauthnCredentialType : undefined}
+          mfaActive={mfaMethods.length > 0}
+          activeMethods={mfaMethods}
+          recoveryOnlyMethods={mfaRecoveryOnly}
+          onComplete={() => {
+            setMfaSetupMethod(null);
+            fetchMFAStatus();
+          }}
+          onCancel={() => setMfaSetupMethod(null)}
+        />
+      )}
+      {!mfaSetupMethod && (
+        <MFATierSelector
+          activeMethods={mfaMethods}
+          recoveryOnlyMethods={mfaRecoveryOnly}
+          recoveryHardened={mfaRecoveryHardened}
+          backupCodesRemaining={mfaBackupRemaining}
+          webauthnCredentials={mfaWebauthnCredentials}
+          backupEmail={mfaBackupEmail}
+          onSetupTOTP={() => setMfaSetupMethod('totp')}
+          onSetupWebAuthn={(credType) => {
+            setWebauthnCredentialType(credType);
+            setMfaSetupMethod('webauthn');
+          }}
+          onSetupEmailSms={() => setMfaSetupMethod('email-sms')}
+          onResetTOTP={handleResetTOTP}
+          onRevokeWebAuthnKey={handleRevokeWebAuthnKey}
+          onDisableEmailSms={handleDisableEmailSms}
+          onSetBackupEmail={handleSetBackupEmail}
+          onToggleRecoveryHardened={handleToggleRecoveryHardened}
+          onToggleRecoveryOnly={handleToggleRecoveryOnly}
+        />
+      )}
+    </>
+  );
+
+  // Backup-code reset modal — extracted so its nested conditional does not
+  // inflate this component's cognitive complexity (S3776).
+  const renderBackupResetModal = () =>
+    showBackupReset && (
+      <div className="mfa-modal-overlay">
+        <div className="mfa-modal">
+          <h3>Reset Backup Codes</h3>
+          <p className="mfa-modal-desc">
+            This will invalidate all existing backup codes and generate new ones.
+          </p>
+
+          {backupResetCodes ? (
+            <BackupCodeDisplay
+              codes={backupResetCodes}
+              onConfirm={() => {
+                setShowBackupReset(false);
+                setBackupResetCodes(null);
+              }}
+              disabled={false}
+            />
+          ) : (
+            <>
+              <div className="mfa-verify-field">
+                <label htmlFor="backup-reset-password">Password</label>
+                <input
+                  id="backup-reset-password"
+                  type="password"
+                  value={backupResetPassword}
+                  onChange={(e) => setBackupResetPassword(e.target.value)}
+                  placeholder="Enter your password"
+                  disabled={backupResetLoading}
+                />
+              </div>
+
+              <MFAVerifyPrompt
+                methods={mfaMethods}
+                recoveryOnlyMethods={mfaRecoveryOnly}
+                onVerify={(code) => setBackupResetMfaCode(code)}
+                disabled={backupResetLoading}
+                error={backupResetError || undefined}
+              />
+
+              <div className="mfa-setup-actions">
+                <button
+                  type="button"
+                  className="btn btn-sm btn-primary"
+                  onClick={handleBackupReset}
+                  disabled={backupResetLoading || !backupResetPassword || !backupResetMfaCode}
+                >
+                  {backupResetLoading ? 'Regenerating...' : 'Regenerate Codes'}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm btn-secondary"
+                  onClick={() => setShowBackupReset(false)}
+                  disabled={backupResetLoading}
+                >
+                  Cancel
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+
   return (
     <>
       <CollapsibleSection id="section-privacy-settings" title="Privacy">
@@ -1266,116 +1385,9 @@ const PrivacySecuritySection: React.FC = () => {
           </div>
         </div>
 
-        {mfaSetupMethod === 'email-sms' && (
-          <EmailSmsSetup
-            mfaActive={mfaMethods.length > 0}
-            onComplete={() => {
-              setMfaSetupMethod(null);
-              fetchMFAStatus();
-            }}
-            onCancel={() => setMfaSetupMethod(null)}
-          />
-        )}
-        {mfaSetupMethod && mfaSetupMethod !== 'email-sms' && (
-          <MFASetup
-            method={mfaSetupMethod}
-            credentialType={mfaSetupMethod === 'webauthn' ? webauthnCredentialType : undefined}
-            mfaActive={mfaMethods.length > 0}
-            activeMethods={mfaMethods}
-            recoveryOnlyMethods={mfaRecoveryOnly}
-            onComplete={() => {
-              setMfaSetupMethod(null);
-              fetchMFAStatus();
-            }}
-            onCancel={() => setMfaSetupMethod(null)}
-          />
-        )}
-        {!mfaSetupMethod && (
-          <MFATierSelector
-            activeMethods={mfaMethods}
-            recoveryOnlyMethods={mfaRecoveryOnly}
-            recoveryHardened={mfaRecoveryHardened}
-            backupCodesRemaining={mfaBackupRemaining}
-            webauthnCredentials={mfaWebauthnCredentials}
-            backupEmail={mfaBackupEmail}
-            onSetupTOTP={() => setMfaSetupMethod('totp')}
-            onSetupWebAuthn={(credType) => {
-              setWebauthnCredentialType(credType);
-              setMfaSetupMethod('webauthn');
-            }}
-            onSetupEmailSms={() => setMfaSetupMethod('email-sms')}
-            onResetTOTP={handleResetTOTP}
-            onRevokeWebAuthnKey={handleRevokeWebAuthnKey}
-            onDisableEmailSms={handleDisableEmailSms}
-            onSetBackupEmail={handleSetBackupEmail}
-            onToggleRecoveryHardened={handleToggleRecoveryHardened}
-            onToggleRecoveryOnly={handleToggleRecoveryOnly}
-          />
-        )}
+        {renderMfaSetupArea()}
 
-        {/* Backup code reset modal */}
-        {showBackupReset && (
-          <div className="mfa-modal-overlay">
-            <div className="mfa-modal">
-              <h3>Reset Backup Codes</h3>
-              <p className="mfa-modal-desc">
-                This will invalidate all existing backup codes and generate new ones.
-              </p>
-
-              {backupResetCodes ? (
-                <BackupCodeDisplay
-                  codes={backupResetCodes}
-                  onConfirm={() => {
-                    setShowBackupReset(false);
-                    setBackupResetCodes(null);
-                  }}
-                  disabled={false}
-                />
-              ) : (
-                <>
-                  <div className="mfa-verify-field">
-                    <label htmlFor="backup-reset-password">Password</label>
-                    <input
-                      id="backup-reset-password"
-                      type="password"
-                      value={backupResetPassword}
-                      onChange={(e) => setBackupResetPassword(e.target.value)}
-                      placeholder="Enter your password"
-                      disabled={backupResetLoading}
-                    />
-                  </div>
-
-                  <MFAVerifyPrompt
-                    methods={mfaMethods}
-                    recoveryOnlyMethods={mfaRecoveryOnly}
-                    onVerify={(code) => setBackupResetMfaCode(code)}
-                    disabled={backupResetLoading}
-                    error={backupResetError || undefined}
-                  />
-
-                  <div className="mfa-setup-actions">
-                    <button
-                      type="button"
-                      className="btn btn-sm btn-primary"
-                      onClick={handleBackupReset}
-                      disabled={backupResetLoading || !backupResetPassword || !backupResetMfaCode}
-                    >
-                      {backupResetLoading ? 'Regenerating...' : 'Regenerate Codes'}
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-sm btn-secondary"
-                      onClick={() => setShowBackupReset(false)}
-                      disabled={backupResetLoading}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-        )}
+        {renderBackupResetModal()}
       </CollapsibleSection>
 
       <CollapsibleSection id="section-sso-security" title="SSO Security">

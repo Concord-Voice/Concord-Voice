@@ -21,6 +21,10 @@ describe('runtimeServerBase', () => {
     expect(apiUrl('/api/v1/users/me')).toBe(`${API_BASE}/api/v1/users/me`);
   });
 
+  it('prepends a leading slash when the path lacks one', () => {
+    expect(apiUrl('api/v1/users/me')).toBe(`${API_BASE}/api/v1/users/me`);
+  });
+
   it('updates API and WebSocket bases from a validated HTTPS origin', () => {
     setRuntimeServerBase('https://homelab.lan:8443/setup');
 

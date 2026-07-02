@@ -1,3 +1,4 @@
+import { vi } from 'vitest';
 import { render, screen, fireEvent } from '../../../test-utils';
 import Message from '@/renderer/components/Chat/Message';
 import {
@@ -41,7 +42,6 @@ import { useMemberStore } from '@/renderer/stores/memberStore';
 import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
 import { usePermissionStore } from '@/renderer/stores/permissionStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { vi } from 'vitest';
 import userEvent from '@testing-library/user-event';
 
 describe('Message', () => {

@@ -2313,12 +2313,7 @@ describe('RoomManager', () => {
         await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
           username: 'alice',
         });
-        const { producer, info: producerInfo } = await setupProducer(
-          manager,
-          mockRouter,
-          'room-1',
-          'u-1'
-        );
+        const { info: producerInfo } = await setupProducer(manager, mockRouter, 'room-1', 'u-1');
 
         // u-2 joins, produces audio, and consumes u-1's audio
         await joinRoomWithSupportedCrypto(

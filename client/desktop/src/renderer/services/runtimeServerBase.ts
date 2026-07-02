@@ -26,7 +26,8 @@ export function getWsBase(): string {
 }
 
 export function apiUrl(path: string): string {
-  return `${runtimeApiBase}${path.startsWith('/') ? path : `/${path}`}`;
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return `${runtimeApiBase}${normalizedPath}`;
 }
 
 export function mediaUrl(url?: string | null): string | undefined {
