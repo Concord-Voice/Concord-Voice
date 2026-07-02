@@ -112,7 +112,7 @@ func publishBinaryBody(version, platform, certHash string) string {
 // ── PublishSPA ─────────────────────────────────────────────────────
 
 func TestPublishSPAHandler_HappyPath(t *testing.T) {
-	oidc := &fakeOIDC{acceptToken: "valid", subject: "repo:markdrogersjr/Concord:ref:refs/heads/main"}
+	oidc := &fakeOIDC{acceptToken: "valid", subject: "repo:Concord-Voice/Concord-Voice-Alpha:ref:refs/heads/main"}
 	h, cleanup := newPublishHandler(t, oidc)
 	defer cleanup()
 
@@ -247,7 +247,7 @@ func TestPublishSPAHandler_BadHashFormat_400(t *testing.T) {
 // ── PublishBinary ──────────────────────────────────────────────────
 
 func TestPublishBinaryHandler_HappyPath(t *testing.T) {
-	oidc := &fakeOIDC{acceptToken: "valid", subject: "repo:markdrogersjr/Concord:ref:refs/heads/main"}
+	oidc := &fakeOIDC{acceptToken: "valid", subject: "repo:Concord-Voice/Concord-Voice-Alpha:ref:refs/heads/main"}
 	h, cleanup := newPublishHandler(t, oidc)
 	defer cleanup()
 

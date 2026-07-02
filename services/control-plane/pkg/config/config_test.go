@@ -1063,7 +1063,7 @@ func validAttestationConfig() *Config {
 		RequireClientAttestation: true,
 		OIDCIssuer:               "https://token.actions.githubusercontent.com",
 		OIDCAudience:             "https://api.concordvoice.chat",
-		OIDCSubjectPrefix:        "repo:markdrogersjr/Concord:",
+		OIDCSubjectPrefix:        "repo:Concord-Voice/Concord-Voice-Alpha:",
 		OIDCSPAWorkflow:          "main-cd.yml",
 		OIDCSPARef:               "refs/heads/main",
 		OIDCBinaryWorkflow:       "build-desktop.yml",
@@ -1126,6 +1126,25 @@ func TestValidateAttestation_MissingBinaryRef(t *testing.T) {
 	cfg.OIDCBinaryRef = ""
 	err := cfg.validateAttestation()
 	require.ErrorContains(t, err, "ATTESTATION_OIDC_BINARY_REF")
+}
+
+// TestValidateAttestation_MissingSubjectPrefix covers the subject-prefix
+// presence guard (#2021 — the pre-org-move default was a silent
+// activation-blocker; empty must fail loud, not 401 at request time).
+func TestValidateAttestation_MissingSubjectPrefix(t *testing.T) {
+	cfg := validAttestationConfig()
+	cfg.OIDCSubjectPrefix = ""
+	err := cfg.validateAttestation()
+	require.ErrorContains(t, err, "ATTESTATION_OIDC_SUBJECT_PREFIX")
+}
+
+// TestValidateAttestation_MalformedSubjectPrefix covers the "repo:" shape
+// guard — a prefix that cannot match any GitHub OIDC sub claim.
+func TestValidateAttestation_MalformedSubjectPrefix(t *testing.T) {
+	cfg := validAttestationConfig()
+	cfg.OIDCSubjectPrefix = "Concord-Voice/Concord-Voice-Alpha"
+	err := cfg.validateAttestation()
+	require.ErrorContains(t, err, `must start with "repo:"`)
 }
 
 // TestValidate_WarnsOnBroadRFC1918Fallback verifies that production with

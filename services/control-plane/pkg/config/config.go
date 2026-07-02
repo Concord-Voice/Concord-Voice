@@ -238,7 +238,7 @@ type Config struct {
 	AttestationPruneInterval time.Duration // Cadence for retention pruning (release_binaries + release_spas); range 1h-24h
 	OIDCIssuer               string        // GitHub Actions OIDC issuer (typically token.actions.githubusercontent.com)
 	OIDCAudience             string        // Expected OIDC audience claim
-	OIDCSubjectPrefix        string        // Required OIDC sub prefix (e.g. "repo:markdrogersjr/Concord:")
+	OIDCSubjectPrefix        string        // Required OIDC sub prefix (e.g. "repo:Concord-Voice/Concord-Voice-Alpha:")
 	// Per-axis OIDC binding (W1, #677 reconciliation). The SPA publish path
 	// and binary publish path are issued from DIFFERENT GitHub Actions
 	// workflows (main-cd.yml vs build-desktop.yml). Each axis is bound to
@@ -370,11 +370,22 @@ func Load() (*Config, error) {
 		AttestationPruneInterval: parseAttestationPruneInterval(getEnv("ATTESTATION_PRUNE_INTERVAL", "6h")),
 		OIDCIssuer:               getEnv("ATTESTATION_OIDC_ISSUER", "https://token.actions.githubusercontent.com"),
 		OIDCAudience:             getEnv("ATTESTATION_OIDC_AUDIENCE", ""),
-		OIDCSubjectPrefix:        getEnv("ATTESTATION_OIDC_SUBJECT_PREFIX", "repo:markdrogersjr/Concord:"),
+		OIDCSubjectPrefix:        getEnv("ATTESTATION_OIDC_SUBJECT_PREFIX", "repo:Concord-Voice/Concord-Voice-Alpha:"),
 		OIDCSPAWorkflow:          getEnv("ATTESTATION_OIDC_SPA_WORKFLOW", "main-cd.yml"),
 		OIDCSPARef:               getEnv("ATTESTATION_OIDC_SPA_REF", "refs/heads/main"),
-		OIDCBinaryWorkflow:       getEnv("ATTESTATION_OIDC_BINARY_WORKFLOW", "build-desktop.yml"),
-		OIDCBinaryRef:            getEnv("ATTESTATION_OIDC_BINARY_REF", "refs/heads/main"),
+		// CAUTION (#2021 B3 deferral): this default predates the #1492
+		// main-ci.yml workflow_call orchestration. Under workflow_call the
+		// OIDC workflow_ref claim names the TOP-LEVEL CALLER (main-ci.yml),
+		// so matchWorkflow(workflow_ref, "build-desktop.yml") will NOT match
+		// tokens minted by the orchestrated push:main build. The candidate
+		// fix is matching the binary axis on job_workflow_ref (which carries
+		// the called reusable workflow per GitHub OIDC docs) — but per the
+		// #654 closure caveat it MUST be verified against a REAL token's
+		// claims before the binary axis is wired. The axis is dormant today
+		// (no binary publisher); validateAttestation() WARNs when attestation
+		// is enabled while this unverified default is still in place.
+		OIDCBinaryWorkflow: getEnv("ATTESTATION_OIDC_BINARY_WORKFLOW", "build-desktop.yml"),
+		OIDCBinaryRef:      getEnv("ATTESTATION_OIDC_BINARY_REF", "refs/heads/main"),
 	}
 
 	cidrs, err := computeTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"), cfg.Environment)
@@ -644,6 +655,12 @@ func (c *Config) validateAttestation() error {
 	if c.OIDCAudience == "" {
 		return fmt.Errorf("ATTESTATION_OIDC_AUDIENCE must be set when REQUIRE_CLIENT_ATTESTATION=true")
 	}
+	if c.OIDCSubjectPrefix == "" {
+		return fmt.Errorf("ATTESTATION_OIDC_SUBJECT_PREFIX must be set when REQUIRE_CLIENT_ATTESTATION=true")
+	}
+	if !strings.HasPrefix(c.OIDCSubjectPrefix, "repo:") {
+		return fmt.Errorf("ATTESTATION_OIDC_SUBJECT_PREFIX must start with %q (GitHub OIDC sub claim shape), got %q", "repo:", c.OIDCSubjectPrefix)
+	}
 	if c.Environment == "production" && c.OIDCIssuer != "https://token.actions.githubusercontent.com" {
 		return fmt.Errorf("ATTESTATION_OIDC_ISSUER must be the canonical GitHub issuer in production")
 	}
@@ -658,6 +675,12 @@ func (c *Config) validateAttestation() error {
 	}
 	if c.OIDCBinaryRef == "" {
 		return fmt.Errorf("ATTESTATION_OIDC_BINARY_REF must be set when REQUIRE_CLIENT_ATTESTATION=true")
+	}
+	if c.OIDCBinaryWorkflow == "build-desktop.yml" {
+		// Advisory only — the binary axis is dormant (no binary publisher is
+		// wired). See the OIDCBinaryWorkflow default in Load() for the #1492
+		// workflow_call identity mismatch this warns about (#2021 B3).
+		log.Printf("WARN: ATTESTATION_OIDC_BINARY_WORKFLOW=build-desktop.yml predates the #1492 main-ci.yml workflow_call orchestration; the binary-axis OIDC workflow_ref claim will NOT match until the axis binding is re-verified against a real token (see #2021)")
 	}
 	return nil
 }
