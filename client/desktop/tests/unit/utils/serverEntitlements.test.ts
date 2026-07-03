@@ -11,30 +11,35 @@ describe('serverEntitlementsFor', () => {
       maxStickers: 10,
       maxSoundboards: 15, // founder entitlement matrix baseline; public page omits the line item
       maxUploadBytes: 33_554_432,
+      allowAnimatedBanner: false, // animated GIF server banner is Mach 1+ (#1302)
     });
     expect(SERVER_TIER_ENTITLEMENTS.mach1).toEqual({
       maxCustomEmoji: 250,
       maxStickers: 75,
       maxSoundboards: 30,
       maxUploadBytes: 134_217_728,
+      allowAnimatedBanner: true,
     });
     expect(SERVER_TIER_ENTITLEMENTS.mach2).toEqual({
       maxCustomEmoji: 350,
       maxStickers: 100,
       maxSoundboards: 40,
       maxUploadBytes: 268_435_456,
+      allowAnimatedBanner: true,
     });
     expect(SERVER_TIER_ENTITLEMENTS.mach3).toEqual({
       maxCustomEmoji: 500,
       maxStickers: 150,
       maxSoundboards: 55,
       maxUploadBytes: 536_870_912,
+      allowAnimatedBanner: true,
     });
     expect(SERVER_TIER_ENTITLEMENTS.selfhost).toEqual({
       maxCustomEmoji: -1,
       maxStickers: -1,
       maxSoundboards: -1,
       maxUploadBytes: -1,
+      allowAnimatedBanner: true,
     });
   });
 

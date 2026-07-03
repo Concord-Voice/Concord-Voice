@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/gif"
 	"image/png"
 	"io"
 	"mime/multipart"
@@ -1138,3 +1139,175 @@ func (s tierStub) GetTier(context.Context, string) string { return s.tier }
 type serverTierStub struct{ tier string }
 
 func (s serverTierStub) GetServerTier(context.Context, string) string { return s.tier }
+
+// =====================================================================
+// Animated GIF uploads (#1302) — entitlement-gated animation preservation
+// =====================================================================
+
+// makeAnimatedGIFUpload builds a 3-frame animated GIF fixture (in-test, no
+// binary files) using the shared helpers from processing_gif_test.go.
+func makeAnimatedGIFUpload(t *testing.T) []byte {
+	t.Helper()
+	pal := gifTestPalette()
+	frames := []*image.Paletted{
+		solidPalettedFrame(t, image.Rect(0, 0, 64, 64), gifColRed, pal),
+		solidPalettedFrame(t, image.Rect(0, 0, 64, 64), gifColBlue, pal),
+		solidPalettedFrame(t, image.Rect(0, 0, 64, 64), gifColWhite, pal),
+	}
+	return encodeTestGIF(t, frames, []int{10, 20, 30},
+		[]byte{gif.DisposalNone, gif.DisposalNone, gif.DisposalNone}, 0, 64, 64)
+}
+
+// makeStaticGIFUpload builds a single-frame GIF fixture.
+func makeStaticGIFUpload(t *testing.T) []byte {
+	t.Helper()
+	pal := gifTestPalette()
+	frames := []*image.Paletted{solidPalettedFrame(t, image.Rect(0, 0, 64, 64), gifColRed, pal)}
+	return encodeTestGIF(t, frames, []int{0}, []byte{gif.DisposalNone}, 0, 64, 64)
+}
+
+// storedObject fetches a stored object's bytes + content type from the mock store.
+func (ts *testSetup) storedObject(t *testing.T, key string) ([]byte, string) {
+	t.Helper()
+	obj, contentType, err := ts.store.GetObject(context.Background(), key)
+	require.NoError(t, err)
+	defer func() { _ = obj.Close() }()
+	data, err := io.ReadAll(obj)
+	require.NoError(t, err)
+	return data, contentType
+}
+
+func TestUploadAvatarAnimatedGIF_PremiumPreservesAnimation(t *testing.T) {
+	ts := setupMediaTest(t)
+	ts.handler.tiers = tierStub{entitlements.TierPremium}
+	userID := ts.createTestUser(t, "premiumanimgif")
+
+	body, ct := multipartBody(t, "file", "avatar.gif", makeAnimatedGIFUpload(t), nil)
+	w := ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct)
+
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+	data, contentType := ts.storedObject(t, fmt.Sprintf("avatars/%s", userID))
+	assert.Equal(t, "image/gif", contentType, "animated output keeps the gif content type")
+
+	out, err := gif.DecodeAll(bytes.NewReader(data))
+	require.NoError(t, err)
+	assert.Len(t, out.Image, 3, "animation preserved")
+	assert.Equal(t, []int{10, 20, 30}, out.Delay, "delays preserved")
+}
+
+func TestUploadAvatarAnimatedGIF_FreeRejectedWithUpsellCode(t *testing.T) {
+	ts := setupMediaTest(t) // freeTierStub
+	userID := ts.createTestUser(t, "freeanimgif")
+
+	body, ct := multipartBody(t, "file", "avatar.gif", makeAnimatedGIFUpload(t), nil)
+	w := ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct)
+
+	require.Equal(t, http.StatusForbidden, w.Code)
+	resp := parseBody(t, w)
+	assert.Equal(t, "animated_profile_premium", resp["code"], "typed upsell code (#1522 pattern)")
+	assert.False(t, ts.store.hasObject(fmt.Sprintf("avatars/%s", userID)), "nothing stored on reject")
+}
+
+// Behavior lock: a STATIC (single-frame) GIF keeps today's flatten path for
+// every tier — for avatars that is the PNG static pipeline (banners flatten
+// to JPEG), unchanged by #1302.
+func TestUploadAvatarStaticGIF_FreeFlattensUnchanged(t *testing.T) {
+	ts := setupMediaTest(t) // freeTierStub
+	userID := ts.createTestUser(t, "freestaticgif")
+
+	body, ct := multipartBody(t, "file", "avatar.gif", makeStaticGIFUpload(t), nil)
+	w := ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct)
+
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+	_, contentType := ts.storedObject(t, fmt.Sprintf("avatars/%s", userID))
+	assert.Equal(t, "image/png", contentType, "static gif avatar flattens via the static path")
+}
+
+func TestUploadServerBannerAnimatedGIF_GroundspeedRejected(t *testing.T) {
+	ts := setupMediaTest(t) // serverTiers nil → ResolveServerTier → groundspeed
+	owner := ts.createTestUser(t, "gsbannerowner")
+	serverID := ts.createTestServer(t, owner, "Groundspeed Banner Server")
+
+	body, ct := multipartBody(t, "file", "banner.gif", makeAnimatedGIFUpload(t),
+		map[string]string{keyServerID: serverID})
+	w := ts.doMultipart(ts.handler.UploadServerBanner, "POST", "/api/v1/media/upload/server-banner", owner, body, ct)
+
+	require.Equal(t, http.StatusForbidden, w.Code)
+	resp := parseBody(t, w)
+	assert.Equal(t, "animated_server_banner_mach", resp["code"])
+	assert.False(t, ts.store.hasObject(fmt.Sprintf("server-banners/%s", serverID)))
+}
+
+func TestUploadServerBannerAnimatedGIF_SelfhostPreserved(t *testing.T) {
+	ts := setupMediaTest(t)
+	// selfhost is the tier GetServerTier resolves on INSTANCE_TYPE=self-hosted
+	// (ServerCache short-circuit); the stub injects it at the same seam.
+	ts.handler.serverTiers = serverTierStub{entitlements.TierSelfHost}
+	owner := ts.createTestUser(t, "shbannerowner")
+	serverID := ts.createTestServer(t, owner, "Selfhost Banner Server")
+
+	body, ct := multipartBody(t, "file", "banner.gif", makeAnimatedGIFUpload(t),
+		map[string]string{keyServerID: serverID})
+	w := ts.doMultipart(ts.handler.UploadServerBanner, "POST", "/api/v1/media/upload/server-banner", owner, body, ct)
+
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+	data, contentType := ts.storedObject(t, fmt.Sprintf("server-banners/%s", serverID))
+	assert.Equal(t, "image/gif", contentType)
+
+	out, err := gif.DecodeAll(bytes.NewReader(data))
+	require.NoError(t, err)
+	assert.Len(t, out.Image, 3, "animation preserved")
+}
+
+func TestUploadServerIconAnimatedGIF_RejectedUnsupported(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "animiconowner")
+	serverID := ts.createTestServer(t, owner, "Anim Icon Server")
+
+	body, ct := multipartBody(t, "file", "icon.gif", makeAnimatedGIFUpload(t),
+		map[string]string{keyServerID: serverID})
+	w := ts.doMultipart(ts.handler.UploadServerIcon, "POST", pathUploadServerIcon, owner, body, ct)
+
+	require.Equal(t, http.StatusForbidden, w.Code)
+	resp := parseBody(t, w)
+	assert.Equal(t, "animated_not_supported", resp["code"], "server icons stay static at every tier")
+}
+
+func TestUploadDMIconAnimatedGIF_RejectedUnsupported(t *testing.T) {
+	ts := setupMediaTest(t)
+	admin := ts.createTestUser(t, "animdmadmin")
+	member := ts.createTestUser(t, "animdmmember")
+	convID := ts.createTestGroupDM(t, admin, member)
+
+	body, ct := multipartBody(t, "file", "icon.gif", makeAnimatedGIFUpload(t),
+		map[string]string{keyConversationID: convID})
+	w := ts.doMultipart(ts.handler.UploadDMIcon, "POST", pathUploadDMIcon, admin, body, ct)
+
+	require.Equal(t, http.StatusForbidden, w.Code)
+	resp := parseBody(t, w)
+	assert.Equal(t, "animated_not_supported", resp["code"], "dm icons stay static at every tier")
+}
+
+// Bomb guards surface as a clean 400 through the upload path — the guard
+// rejection happens during animation detection, before any entitlement gate.
+func TestUploadAvatarAnimatedGIF_BombGuardRejects400(t *testing.T) {
+	ts := setupMediaTest(t)
+	ts.handler.tiers = tierStub{entitlements.TierPremium}
+	userID := ts.createTestUser(t, "bombgif")
+
+	pal := gifTestPalette()
+	frames := make([]*image.Paletted, maxGifFrames+1)
+	delays := make([]int, maxGifFrames+1)
+	disposal := make([]byte, maxGifFrames+1)
+	for i := range frames {
+		frames[i] = solidPalettedFrame(t, image.Rect(0, 0, 1, 1), gifColRed, pal)
+		disposal[i] = gif.DisposalNone
+	}
+	raw := encodeTestGIF(t, frames, delays, disposal, 0, 1, 1)
+
+	body, ct := multipartBody(t, "file", "bomb.gif", raw, nil)
+	w := ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+	assert.False(t, ts.store.hasObject(fmt.Sprintf("avatars/%s", userID)))
+}

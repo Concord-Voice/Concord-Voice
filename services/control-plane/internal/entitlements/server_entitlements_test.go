@@ -12,21 +12,22 @@ import (
 // these tests — do not "fix" a mismatch here without checking the pricing pages.
 func TestForServer_LadderValues(t *testing.T) {
 	cases := []struct {
-		tier        string
-		emoji       int
-		stickers    int
-		soundboards int
-		uploadBytes int64
-		iconBytes   int64
-		floorH      int
-		floorFps    int
-		audioUnlock bool
+		tier           string
+		emoji          int
+		stickers       int
+		soundboards    int
+		uploadBytes    int64
+		iconBytes      int64
+		floorH         int
+		floorFps       int
+		audioUnlock    bool
+		animatedBanner bool
 	}{
-		{entitlements.TierGroundspeed, 75, 10, 15, 33_554_432, 5_242_880, 0, 0, false},
-		{entitlements.TierMach1, 250, 75, 30, 134_217_728, 8_388_608, 1080, 60, true},
-		{entitlements.TierMach2, 350, 100, 40, 268_435_456, 8_388_608, 1440, 60, true},
-		{entitlements.TierMach3, 500, 150, 55, 536_870_912, 8_388_608, 2160, 60, true},
-		{entitlements.TierSelfHost, -1, -1, -1, -1, 8_388_608, 2160, 60, true},
+		{entitlements.TierGroundspeed, 75, 10, 15, 33_554_432, 5_242_880, 0, 0, false, false},
+		{entitlements.TierMach1, 250, 75, 30, 134_217_728, 8_388_608, 1080, 60, true, true},
+		{entitlements.TierMach2, 350, 100, 40, 268_435_456, 8_388_608, 1440, 60, true, true},
+		{entitlements.TierMach3, 500, 150, 55, 536_870_912, 8_388_608, 2160, 60, true, true},
+		{entitlements.TierSelfHost, -1, -1, -1, -1, 8_388_608, 2160, 60, true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tier, func(t *testing.T) {
@@ -43,6 +44,8 @@ func TestForServer_LadderValues(t *testing.T) {
 			assert.Equal(t, int64(tc.floorH)*int64(tc.floorH)*16/9*int64(tc.floorFps), e.ServerVideoFloorPixelRate,
 				"pixel rate = width(16:9)*height*fps")
 			assert.Equal(t, tc.audioUnlock, e.UnlockServerAudioQualityCaps)
+			assert.Equal(t, tc.animatedBanner, e.AllowAnimatedServerBanner,
+				"animated GIF server banner is a Mach 1+ / selfhost perk (#1302)")
 			// Storage pool stays the #1523 sentinel on every SaaS row; selfhost is unlimited.
 			if tc.tier == entitlements.TierSelfHost {
 				assert.Equal(t, int64(entitlements.ServerLimitUnlimited), e.MaxServerStoragePoolBytes)

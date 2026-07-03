@@ -39,9 +39,12 @@ const (
 	errMsgFailedVerifyPerms  = "Failed to verify permissions"
 	errMsgInternalServer     = "Internal server error"
 	errMsgStorageUnavailable = "Object storage unavailable"
+	purposeAvatar            = "avatar"
+	purposeBanner            = "banner"
 	purposeDMIcon            = "dm-icon"
 	purposeServerIcon        = "server-icon"
 	purposeServerBanner      = "server-banner"
+	errMsgInvalidImage       = "Failed to process image. Ensure the file is a valid image."
 	mimeOctetStream          = "application/octet-stream"
 	headerContentType        = "Content-Type"
 	headerCacheControl       = "Cache-Control"
@@ -156,7 +159,7 @@ func (h *Handler) requireObjectStore(c *gin.Context) (ObjectStore, bool) {
 func (h *Handler) UploadAvatar(c *gin.Context) {
 	userID := c.GetString("user_id")
 	ent := entitlements.For(h.tiers.GetTier(c.Request.Context(), userID))
-	h.handleTier1Upload(c, userID, "avatar", ent.MaxAvatarBytes, AvatarMaxDim, AvatarMaxDim)
+	h.handleTier1Upload(c, userID, purposeAvatar, ent.MaxAvatarBytes, AvatarMaxDim, AvatarMaxDim)
 }
 
 // UploadBanner handles banner/header image uploads.
@@ -164,7 +167,7 @@ func (h *Handler) UploadAvatar(c *gin.Context) {
 func (h *Handler) UploadBanner(c *gin.Context) {
 	userID := c.GetString("user_id")
 	ent := entitlements.For(h.tiers.GetTier(c.Request.Context(), userID))
-	h.handleTier1Upload(c, userID, "banner", ent.MaxBannerBytes, BannerMaxW, BannerMaxH)
+	h.handleTier1Upload(c, userID, purposeBanner, ent.MaxBannerBytes, BannerMaxW, BannerMaxH)
 }
 
 // UploadServerIcon handles server icon uploads.
@@ -526,15 +529,21 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 		return
 	}
 
-	if !validateImageType(c, file, header) {
+	contentType, ok := validateImageType(c, file, header)
+	if !ok {
 		return
 	}
 
-	processed, err := processImage(file, purpose, maxW, maxH)
-	if err != nil {
-		h.log.Error("Failed to process image", "error", err, "user_id", userID, "purpose", purpose)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to process image. Ensure the file is a valid image."})
-		return
+	processed, ok := h.processTier1Image(c, file, tier1ImageJob{
+		userID:      userID,
+		purpose:     purpose,
+		serverID:    serverID,
+		contentType: contentType,
+		maxW:        maxW,
+		maxH:        maxH,
+	})
+	if !ok {
+		return // response already sent
 	}
 
 	storageKey := tier1StorageKey(purpose, userID, serverID, conversationID)
@@ -654,47 +663,160 @@ func validateTier1Context(c *gin.Context, h *Handler, userID, purpose string) (s
 	return serverID, conversationID, true
 }
 
-func validateImageType(c *gin.Context, file multipart.File, header *multipart.FileHeader) bool {
+// validateImageType checks the upload against the Tier 1 image allowlist and
+// returns the resolved content type (declared, or sniffed when the declared
+// type is absent/unrecognized).
+func validateImageType(c *gin.Context, file multipart.File, header *multipart.FileHeader) (string, bool) {
 	contentType := header.Header.Get(headerContentType)
 	if contentType == "" || !allowedImageTypes[contentType] {
 		buf := make([]byte, 512)
 		n, readErr := file.Read(buf)
 		if readErr != nil && readErr != io.EOF {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read file"})
-			return false
+			return "", false
 		}
 		if n == 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Empty file"})
-			return false
+			return "", false
 		}
 		contentType = http.DetectContentType(buf[:n])
 		if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process file"})
-			return false
+			return "", false
 		}
 	}
 	if !allowedImageTypes[contentType] {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":         "Invalid image type. Allowed: JPEG, PNG, GIF, WebP",
-			"allowed_types": []string{"image/jpeg", "image/png", "image/gif", "image/webp"},
+			"allowed_types": []string{"image/jpeg", "image/png", mimeGIF, "image/webp"},
+		})
+		return "", false
+	}
+	return contentType, true
+}
+
+func processImage(file io.Reader, purpose string, maxW, maxH int) (*ProcessedImage, error) {
+	if purpose == purposeBanner || purpose == purposeServerBanner {
+		return ProcessImage(file, maxW, maxH)
+	}
+	return ProcessImagePNG(file, maxW, maxH)
+}
+
+// tier1ImageJob carries the routing and entitlement inputs for one validated
+// Tier 1 upload through the processing helpers below (folded from positional
+// parameters so the pipeline signatures stay small).
+type tier1ImageJob struct {
+	userID      string
+	purpose     string
+	serverID    string
+	contentType string
+	maxW        int
+	maxH        int
+}
+
+// processTier1Image routes a validated upload through the static flatten
+// pipeline or, for GIF uploads, the animated-aware path (#1302). On failure it
+// writes the HTTP error response itself and returns ok=false.
+func (h *Handler) processTier1Image(c *gin.Context, file multipart.File, job tier1ImageJob) (*ProcessedImage, bool) {
+	if job.contentType != mimeGIF {
+		return h.processStaticTier1Image(c, file, job)
+	}
+	return h.processGIFTier1Image(c, file, job)
+}
+
+func (h *Handler) processStaticTier1Image(c *gin.Context, file io.Reader, job tier1ImageJob) (*ProcessedImage, bool) {
+	processed, err := processImage(file, job.purpose, job.maxW, job.maxH)
+	if err != nil {
+		h.log.Error("Failed to process image", "error", err, "user_id", job.userID, "purpose", job.purpose)
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidImage})
+		return nil, false
+	}
+	return processed, true
+}
+
+// processGIFTier1Image is the #1302 animated-aware branch. The GIF is decoded
+// ONCE through safeDecodeGIF — the decompression-bomb guards run during
+// animation detection, before any entitlement gate — and the frame count
+// selects the path:
+//
+//   - single frame → today's static flatten path, every tier (decision 5);
+//   - multi frame  → entitlement gate per purpose, then animation-preserving
+//     re-encode (uploads are never stored verbatim — decision 1).
+//
+// Routing keys on the declared/sniffed content type. Mislabeling cannot
+// escalate: an animated GIF declared as another image type falls through to
+// the static path and is flattened to its first frame, never preserved.
+func (h *Handler) processGIFTier1Image(c *gin.Context, file multipart.File, job tier1ImageJob) (*ProcessedImage, bool) {
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		h.log.Error("Failed to read gif upload", "error", err, "user_id", job.userID, "purpose", job.purpose)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read file"})
+		return nil, false
+	}
+	g, err := safeDecodeGIF(bytes.NewReader(raw))
+	if err != nil {
+		// Includes the bomb-guard rejections (frame count / total pixels /
+		// screen dims) — the guard errors are PII-safe, bounds and counts only.
+		h.log.Error("Failed to decode gif upload", "error", err, "user_id", job.userID, "purpose", job.purpose)
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidImage})
+		return nil, false
+	}
+	if len(g.Image) <= 1 {
+		// Static GIF keeps the flatten path for every tier (#1302 decision 5).
+		return h.processStaticTier1Image(c, bytes.NewReader(raw), job)
+	}
+	if !h.authorizeAnimatedUpload(c, job.userID, job.purpose, job.serverID) {
+		return nil, false
+	}
+	processed, err := processDecodedGIF(g, job.maxW, job.maxH)
+	if err != nil {
+		h.log.Error("Failed to process animated gif", "error", err, "user_id", job.userID, "purpose", job.purpose)
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidImage})
+		return nil, false
+	}
+	return processed, true
+}
+
+// authorizeAnimatedUpload enforces the animated-media entitlements (#1302):
+// user axis (AllowAnimatedProfile) for avatar/banner, server axis
+// (AllowAnimatedServerBanner) for server banners, rejected for every other
+// purpose. Typed codes let the client render the upsell affordance (#1522
+// pattern). On rejection the 403 response is written and false returned.
+func (h *Handler) authorizeAnimatedUpload(c *gin.Context, userID, purpose, serverID string) bool {
+	switch purpose {
+	case purposeAvatar, purposeBanner:
+		ent := entitlements.For(h.tiers.GetTier(c.Request.Context(), userID))
+		if !ent.AllowAnimatedProfile {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "Animated avatars and banners require a premium subscription",
+				"code":  "animated_profile_premium",
+			})
+			return false
+		}
+	case purposeServerBanner:
+		serverEnt := entitlements.ForServer(h.serverTier(c.Request.Context(), serverID))
+		if !serverEnt.AllowAnimatedServerBanner {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "Animated server banners require a Mach server boost",
+				"code":  "animated_server_banner_mach",
+			})
+			return false
+		}
+	default:
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "Animated images are not supported for this upload type",
+			"code":  "animated_not_supported",
 		})
 		return false
 	}
 	return true
 }
 
-func processImage(file io.Reader, purpose string, maxW, maxH int) (*ProcessedImage, error) {
-	if purpose == "banner" || purpose == purposeServerBanner {
-		return ProcessImage(file, maxW, maxH)
-	}
-	return ProcessImagePNG(file, maxW, maxH)
-}
-
 func tier1StorageKey(purpose, userID, serverID, conversationID string) string {
 	switch purpose {
-	case "avatar":
+	case purposeAvatar:
 		return fmt.Sprintf("avatars/%s", userID)
-	case "banner":
+	case purposeBanner:
 		return fmt.Sprintf("banners/%s", userID)
 	case purposeServerIcon:
 		return fmt.Sprintf("server-icons/%s", serverID)
