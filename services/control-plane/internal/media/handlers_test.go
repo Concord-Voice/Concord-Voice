@@ -441,7 +441,7 @@ func TestEnforceTier1UploadLimit_GroundspeedServerImagesRejectOverFiveMiB(t *tes
 func TestEnforceTier1UploadLimit_MachServerImagesAllowFiveMiBPlusOne(t *testing.T) {
 	for _, purpose := range []string{purposeServerIcon, purposeServerBanner} {
 		t.Run(purpose, func(t *testing.T) {
-			h := &Handler{serverTiers: serverTierStub{entitlements.TierMach}}
+			h := &Handler{serverTiers: serverTierStub{entitlements.TierMach1}}
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 			c.Request = httptest.NewRequest("POST", "/", nil)
@@ -1068,27 +1068,27 @@ func doAttachmentUpload(t *testing.T, h *Handler, body *bytes.Buffer, ct string)
 }
 
 // TestUploadAttachment_PremiumAllowsLargerThanFree confirms a premium user can
-// upload 30 MiB (> free 25 MiB, < premium 512 MiB) — should NOT get 413.
+// upload 40 MiB (> free 32 MiB, < premium 256 MiB) — should NOT get 413.
 func TestUploadAttachment_PremiumAllowsLargerThanFree(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 	cfg := &config.Config{UploadMaxSize: 25 * 1024 * 1024}
 	premium := NewHandler(db, nil, logger.New("test"), cfg, nil, tierStub{entitlements.TierPremium})
-	body, ct := makeMultipartFile(t, 30*1024*1024) // 30 MiB
+	body, ct := makeMultipartFile(t, 40*1024*1024) // 40 MiB
 	w := doAttachmentUpload(t, premium, body, ct)
-	assert.NotEqual(t, http.StatusRequestEntityTooLarge, w.Code, "premium accepts 30 MiB")
+	assert.NotEqual(t, http.StatusRequestEntityTooLarge, w.Code, "premium accepts 40 MiB")
 }
 
-// TestUploadAttachment_FreeRejectsOverLimit confirms a free user uploading 30 MiB
-// (> free 25 MiB) gets 413 Request Entity Too Large.
+// TestUploadAttachment_FreeRejectsOverLimit confirms a free user uploading 40 MiB
+// (> free 32 MiB) gets 413 Request Entity Too Large.
 func TestUploadAttachment_FreeRejectsOverLimit(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 	cfg := &config.Config{UploadMaxSize: 25 * 1024 * 1024}
 	free := NewHandler(db, nil, logger.New("test"), cfg, nil, tierStub{entitlements.TierFree})
-	body, ct := makeMultipartFile(t, 30*1024*1024) // 30 MiB > free 25 MiB
+	body, ct := makeMultipartFile(t, 40*1024*1024) // 40 MiB > free 32 MiB
 	w := doAttachmentUpload(t, free, body, ct)
-	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code, "free rejects 30 MiB")
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code, "free rejects 40 MiB")
 }
 
 // =====================================================================

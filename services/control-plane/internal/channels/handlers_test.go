@@ -839,7 +839,7 @@ func TestUpdateChannel_AcceptsMachAudioTierFromServerTierCache(t *testing.T) {
 	serverID := ts.CreateTestServer(t, owner.ID, "Mach Ceiling Server")
 	channelID := ts.CreateVoiceChannel(t, serverID, "voice-ceiling-mach")
 	require.NoError(t, entitlements.NewServerCache(ts.Redis, ts.DB).
-		SetServerTier(context.Background(), serverID, entitlements.TierMach))
+		SetServerTier(context.Background(), serverID, entitlements.TierMach1))
 
 	w := ts.DoRequest("PATCH", pathChannelsPrefix+channelID, map[string]interface{}{
 		"name":               "voice-ceiling-mach",

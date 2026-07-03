@@ -195,7 +195,11 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 	userID := c.GetString("user_id")
 	ent := entitlements.For(h.tiers.GetTier(c.Request.Context(), userID))
 
-	// Cap request body size before multipart parsing to prevent memory/disk DoS
+	// Cap request body size before multipart parsing to prevent memory/disk DoS.
+	// User-axis cap only: the server-wide uplift (entitlements.EffectiveAttachmentBytes)
+	// cannot apply here because channel_id arrives IN the multipart body — #1556
+	// wires the composed limit alongside the query-param wire change (spec
+	// 2026-07-03-1522 §S3).
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, ent.MaxAttachmentBytes+4096) // +4KB for multipart headers
 
 	file, header, err := parseAttachmentFile(c, ent.MaxAttachmentBytes)

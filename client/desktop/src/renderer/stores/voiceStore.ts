@@ -65,13 +65,7 @@ export type DMCallerRole = 'admin' | 'member' | null;
 // Audio quality tiers (must match server-side AUDIO_QUALITY_TIERS)
 // ---------------------------------------------------------------------------
 export type AudioQualityTier =
-  | 'minimum'
-  | 'low'
-  | 'moderate'
-  | 'standard'
-  | 'high'
-  | 'hifi'
-  | 'studio';
+  'minimum' | 'low' | 'moderate' | 'standard' | 'high' | 'hifi' | 'studio';
 
 export interface AudioQualityTierConfig {
   label: string;
@@ -169,12 +163,18 @@ export const AUDIO_TIER_ORDER: AudioQualityTier[] = [
   'studio',
 ];
 
-/** Highest audio tier a channel admin may set, by server tier. Binary mirror of
+/**
+ * Highest audio tier a channel admin may set, by server tier. Client mirror of
+ * the server-axis audio ceiling — binary over the ladder:
  *  Go entitlements.ServerAudioCeilingTier: groundspeed → 'standard' (≤96 kbps),
- *  any Mach → 'studio' (≤510 kbps). Fails closed to 'standard'. UX gating only —
- *  the control-plane is authoritative (see [internal]rules/media-plane.md). */
+ *  any Mach level (mach1/mach2/mach3) or selfhost → 'studio' (≤510 kbps).
+ *  Fail-closed to 'standard' for unknown/absent/retired ('mach') tiers.
+ *  UX gating only — the control-plane is authoritative (see [internal]rules/media-plane.md).
+ *  SOURCE OF TRUTH: services/control-plane/internal/entitlements/audio_tiers.go (ADR-0028).
+ */
+const STUDIO_CEILING_TIERS = new Set(['mach1', 'mach2', 'mach3', 'selfhost']);
 export function serverAudioCeilingTier(serverTier?: string): AudioQualityTier {
-  return serverTier === 'mach' ? 'studio' : 'standard';
+  return serverTier && STUDIO_CEILING_TIERS.has(serverTier) ? 'studio' : 'standard';
 }
 
 // ---------------------------------------------------------------------------
@@ -243,11 +243,7 @@ export function channelVoiceMemberFromApi(p: ApiVoiceParticipant): ChannelVoiceM
 // Connection state
 // ---------------------------------------------------------------------------
 export type VoiceConnectionState =
-  | 'disconnected'
-  | 'connecting'
-  | 'connected'
-  | 'reconnecting'
-  | 'error';
+  'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'error';
 
 /** Decoder budget profiling health zone (IGNIS). */
 export type DecoderHealth = 'green' | 'yellow' | 'red';

@@ -10,7 +10,8 @@ type Server struct {
 	IconURL   *string `json:"icon_url,omitempty" db:"icon_url"`
 	BannerURL *string `json:"banner_url,omitempty" db:"banner_url"`
 	OwnerID   string  `json:"owner_id" db:"owner_id"`
-	// ServerTier is the server-axis subscription tier ("groundspeed"|"mach"),
+	// ServerTier is the server-axis subscription tier — the ADR-0028 ladder
+	// ("groundspeed"|"mach1"|"mach2"|"mach3"|"selfhost"),
 	// RESOLVED (not a DB column) via entitlements.ResolveServerTier — db:"-" so
 	// struct scanners skip it. Client gates server-scoped UX (e.g. the #179
 	// channel audio slider ceiling, #1522 cosmetics) on it.

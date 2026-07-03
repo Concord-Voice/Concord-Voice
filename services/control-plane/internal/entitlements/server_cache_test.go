@@ -26,10 +26,10 @@ func TestServerCache_GetServerTier_MissReadsThroughGroundspeed(t *testing.T) {
 	assert.True(t, ttl > 0 && ttl <= 5*time.Minute, "populated key carries the 5-min TTL")
 }
 
-func TestServerCache_GetServerTier_SelfHostedReturnsMachWithoutDBOrRedis(t *testing.T) {
+func TestServerCache_GetServerTier_SelfHostedReturnsSelfHostWithoutDBOrRedis(t *testing.T) {
 	cache := entitlements.NewServerCacheForInstance(nil, nil, " self-hosted ")
 
-	assert.Equal(t, entitlements.TierMach, cache.GetServerTier(context.Background(), uuid.New().String()))
+	assert.Equal(t, entitlements.TierSelfHost, cache.GetServerTier(context.Background(), uuid.New().String()))
 }
 
 // A cache hit is honored verbatim — GetServerTier must not re-resolve when a
@@ -40,8 +40,8 @@ func TestServerCache_HitHonorsCachedValue(t *testing.T) {
 	sid := uuid.New().String()
 	ctx := context.Background()
 
-	require.NoError(t, cache.SetServerTier(ctx, sid, entitlements.TierMach))
-	assert.Equal(t, entitlements.TierMach, cache.GetServerTier(ctx, sid))
+	require.NoError(t, cache.SetServerTier(ctx, sid, entitlements.TierMach1))
+	assert.Equal(t, entitlements.TierMach1, cache.GetServerTier(ctx, sid))
 }
 
 // Invalidate clears the key so the next read re-resolves (fail-closed to free).
@@ -51,7 +51,7 @@ func TestServerCache_InvalidateForcesReResolve(t *testing.T) {
 	sid := uuid.New().String()
 	ctx := context.Background()
 
-	require.NoError(t, cache.SetServerTier(ctx, sid, entitlements.TierMach))
+	require.NoError(t, cache.SetServerTier(ctx, sid, entitlements.TierMach1))
 	require.NoError(t, cache.Invalidate(ctx, sid))
 	assert.Equal(t, entitlements.TierGroundspeed, cache.GetServerTier(ctx, sid))
 }

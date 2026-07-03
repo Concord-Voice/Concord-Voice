@@ -61,10 +61,17 @@ describe('ChannelAudioQualitySlider', () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it('on a Mach server, Studio is selectable', () => {
+  it('on a Mach-ladder server, Studio is selectable', () => {
+    const onChange = vi.fn();
+    render(<ChannelAudioQualitySlider value={null} onChange={onChange} serverTier="mach1" />);
+    fireEvent.click(screen.getByText('Studio'));
+    expect(onChange).toHaveBeenCalledWith('studio');
+  });
+
+  it('on a server still reporting the retired pre-ladder "mach" string, Studio stays locked (ADR-0028 fail-closed)', () => {
     const onChange = vi.fn();
     render(<ChannelAudioQualitySlider value={null} onChange={onChange} serverTier="mach" />);
     fireEvent.click(screen.getByText('Studio'));
-    expect(onChange).toHaveBeenCalledWith('studio');
+    expect(onChange).not.toHaveBeenCalled();
   });
 });

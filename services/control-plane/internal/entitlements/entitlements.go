@@ -71,7 +71,7 @@ var (
 		MaxWebcamPublishers:      8,
 		MaxScreensharePublishers: 1,
 		MaxMessageChars:          5120,
-		MaxAttachmentBytes:       26_214_400, // 25 MiB — matches current UPLOAD_MAX_SIZE
+		MaxAttachmentBytes:       33_554_432, // 32 MiB — mirrors the public Groundspeed per-file baseline
 		MaxAvatarBytes:           5_242_880,  // 5 MiB
 		MaxBannerBytes:           5_242_880,  // 5 MiB
 		AllowAnimatedProfile:     false,
@@ -92,7 +92,7 @@ var (
 		MaxWebcamPublishers:      25,
 		MaxScreensharePublishers: 3,
 		MaxMessageChars:          10240,
-		MaxAttachmentBytes:       536_870_912, // 512 MiB
+		MaxAttachmentBytes:       268_435_456, // 256 MiB — Supersonic's pinned 256 MB (512 MB is Mach 3 server-wide)
 		MaxAvatarBytes:           8_388_608,   // 8 MiB
 		MaxBannerBytes:           8_388_608,   // 8 MiB
 		AllowAnimatedProfile:     true,
@@ -144,4 +144,28 @@ func MediaFor(tier string) MediaEntitlements {
 		MinPtimeMs:          e.MinPtimeMs,
 		MaxManualBitrateBps: e.MaxManualBitrateBps,
 	}
+}
+
+// EffectiveAttachmentBytes composes the per-file upload limit for an upload
+// into a server channel: the better of the user's personal allowance and the
+// server-wide grant ("512 MB per-file uploads, server-wide" lifts every
+// member). Negative server values mean unlimited (selfhost) and win outright.
+// DM uploads stay user-axis only — do not call this without a server context.
+//
+// Handler adoption is DEFERRED to #1556 (see spec 2026-07-03-1522 §S3):
+// UploadAttachment's DoS body cap is set before the multipart parse, but
+// channel_id arrives in the multipart body, so the server tier is unknowable
+// at cap time. Structural no-op until Mach tiers are purchasable.
+//
+// CALLER CONTRACT (#1556 wiring): a negative return is the unlimited sentinel,
+// never a byte count — translate it (e.g. to a config ceiling) before handing
+// it to http.MaxBytesReader or any size comparison.
+func EffectiveAttachmentBytes(user Entitlement, server ServerEntitlement) int64 {
+	if server.MaxServerUploadBytes < 0 {
+		return ServerLimitUnlimited
+	}
+	if server.MaxServerUploadBytes > user.MaxAttachmentBytes {
+		return server.MaxServerUploadBytes
+	}
+	return user.MaxAttachmentBytes
 }

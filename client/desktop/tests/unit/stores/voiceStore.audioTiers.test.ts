@@ -14,9 +14,13 @@ describe('audio tier helpers', () => {
     ]);
   });
 
-  it('serverAudioCeilingTier mirrors Go: groundspeed→standard, mach→studio', () => {
+  it('serverAudioCeilingTier mirrors Go: groundspeed→standard, any Mach ladder level→studio', () => {
     expect(serverAudioCeilingTier('groundspeed')).toBe('standard');
-    expect(serverAudioCeilingTier('mach')).toBe('studio');
+    expect(serverAudioCeilingTier('mach1')).toBe('studio');
+    expect(serverAudioCeilingTier('mach2')).toBe('studio');
+    expect(serverAudioCeilingTier('mach3')).toBe('studio');
+    expect(serverAudioCeilingTier('selfhost')).toBe('studio');
+    expect(serverAudioCeilingTier('mach')).toBe('standard'); // retired pre-ladder binary string (ADR-0028)
     expect(serverAudioCeilingTier(undefined)).toBe('standard'); // fail-closed
     expect(serverAudioCeilingTier('garbage')).toBe('standard');
   });

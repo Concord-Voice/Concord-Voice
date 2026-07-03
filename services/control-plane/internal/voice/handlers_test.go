@@ -776,7 +776,7 @@ func TestAuthorizeJoin_MachChannelStandardUsesServerTierCache(t *testing.T) {
 	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
 	channelID := ts.CreateVoiceChannel(t, serverID, "voice-ch-mach")
 	require.NoError(t, entitlements.NewServerCache(ts.Redis, ts.DB).
-		SetServerTier(context.Background(), serverID, entitlements.TierMach))
+		SetServerTier(context.Background(), serverID, entitlements.TierMach1))
 
 	_, err := ts.DB.Exec("UPDATE channels SET audio_quality_tier=$1 WHERE id=$2", "studio", channelID)
 	require.NoError(t, err)

@@ -397,7 +397,7 @@ func TestUpdateServerMachTierStillRejectsGroundspeedInlineDataURL(t *testing.T) 
 	var tierBody map[string]interface{}
 	testhelpers.ParseJSON(t, tierResp, &tierBody)
 	server := tierBody["server"].(map[string]interface{})
-	require.Equal(t, entitlements.TierMach, server["server_tier"])
+	require.Equal(t, entitlements.TierSelfHost, server["server_tier"])
 
 	iconResp := ts.DoRequest("PATCH", pathServersSlash+serverID, map[string]interface{}{
 		"name":     "Mach Inline Server",

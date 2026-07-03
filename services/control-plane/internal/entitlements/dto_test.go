@@ -17,7 +17,7 @@ func TestToDTO_FreeTier_MapsAllFieldsAndDurationToSeconds(t *testing.T) {
 	assert.Equal(t, 20, dto.MinPtimeMs)
 	assert.Equal(t, 8, dto.MaxAudioLastN)
 	assert.Equal(t, 5120, dto.MaxMessageChars)
-	assert.Equal(t, int64(26214400), dto.MaxAttachmentBytes)
+	assert.Equal(t, int64(33554432), dto.MaxAttachmentBytes)
 	// 365 days in seconds
 	assert.Equal(t, int64(31536000), dto.UsernameChangeIntervalSeconds)
 }
@@ -27,7 +27,7 @@ func TestToDTO_PremiumTier(t *testing.T) {
 	assert.Equal(t, "premium", dto.Tier)
 	assert.True(t, dto.AllowMusicMode)
 	assert.Equal(t, 16, dto.MaxAudioLastN)
-	assert.Equal(t, int64(536870912), dto.MaxAttachmentBytes)
+	assert.Equal(t, int64(268435456), dto.MaxAttachmentBytes)
 	assert.Equal(t, int64(91*24*3600), dto.UsernameChangeIntervalSeconds)
 }
 

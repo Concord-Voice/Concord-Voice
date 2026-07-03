@@ -26,12 +26,16 @@ func TestGetServerEntitlements_MemberGetsGroundspeed(t *testing.T) {
 	assert.Equal(t, "groundspeed", ent["Tier"])
 	assert.Equal(t, float64(75), ent["MaxServerCustomEmoji"])
 	assert.Equal(t, float64(10), ent["MaxServerStickers"])
+	assert.Equal(t, float64(15), ent["MaxServerSoundboards"], "founder entitlement matrix baseline")
+	assert.Equal(t, float64(33_554_432), ent["MaxServerUploadBytes"], "Groundspeed public 32 MB per-file baseline")
 	assert.Equal(t, float64(-1), ent["MaxServerStoragePoolBytes"], "storage sentinel (A11-pending)")
 	assert.Equal(t, false, ent["UnlockServerAudioQualityCaps"])
-	assert.Equal(t, false, ent["UnlockServerVideoQualityCaps"])
+	assert.Equal(t, float64(0), ent["ServerVideoFloorHeight"], "no server video floor on Groundspeed")
 }
 
-func TestGetServerEntitlements_SelfHostedMemberGetsMach(t *testing.T) {
+// Self-hosted deployments resolve to the dedicated selfhost row (ADR-0028):
+// uncapped cosmetics/uploads (marketing: hardware-limited), audio unlocked.
+func TestGetServerEntitlements_SelfHostedMemberGetsSelfHost(t *testing.T) {
 	t.Setenv("INSTANCE_TYPE", "self-hosted")
 	ts := testhelpers.SetupTestServer(t)
 	owner := ts.CreateTestUser(t, "serventselfhost")
@@ -44,8 +48,10 @@ func TestGetServerEntitlements_SelfHostedMemberGetsMach(t *testing.T) {
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
 	ent := body["entitlement"].(map[string]interface{})
-	assert.Equal(t, "mach", ent["Tier"])
+	assert.Equal(t, "selfhost", ent["Tier"])
 	assert.Equal(t, true, ent["UnlockServerAudioQualityCaps"])
+	assert.Equal(t, float64(-1), ent["MaxServerCustomEmoji"], "selfhost is uncapped")
+	assert.Equal(t, float64(-1), ent["MaxServerUploadBytes"], "selfhost is uncapped")
 }
 
 // A non-member is forbidden — the endpoint mirrors GetServer's membership gate.

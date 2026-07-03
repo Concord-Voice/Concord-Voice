@@ -49,11 +49,13 @@ describe('image upload limit resolution', () => {
     expect(result.current.showCrop).toBe(false);
   });
 
-  it('resolves Mach server image limits to 8 MiB for the upload hook', () => {
-    expect(maxServerIconSizeForTier('mach')).toBe(MACH_ICON_SIZE);
-    expect(maxServerBannerSizeForTier('mach')).toBe(MACH_BANNER_SIZE);
+  it('resolves Mach-ladder server image limits to 8 MiB for the upload hook', () => {
+    for (const tier of ['mach1', 'mach2', 'mach3', 'selfhost'] as const) {
+      expect(maxServerIconSizeForTier(tier)).toBe(MACH_ICON_SIZE);
+      expect(maxServerBannerSizeForTier(tier)).toBe(MACH_BANNER_SIZE);
+    }
 
-    const { result, onError } = uploadImageWithLimit(7 * mib, maxServerIconSizeForTier('mach'));
+    const { result, onError } = uploadImageWithLimit(7 * mib, maxServerIconSizeForTier('mach1'));
 
     expect(onError).toHaveBeenCalledWith(undefined);
     expect(result.current.showCrop).toBe(true);
@@ -65,6 +67,11 @@ describe('image upload limit resolution', () => {
 
     expect(maxIconBytes).toBe(5 * mib);
     expect(maxBannerBytes).toBe(5 * mib);
+
+    // Retired pre-ladder binary string fails closed to the Groundspeed sizes (ADR-0028).
+    const retiredMach = 'mach' as Parameters<typeof maxServerIconSizeForTier>[0];
+    expect(maxServerIconSizeForTier(retiredMach)).toBe(5 * mib);
+    expect(maxServerBannerSizeForTier(retiredMach)).toBe(5 * mib);
 
     const { result, onError } = uploadImageWithLimit(6 * mib, maxIconBytes);
 
