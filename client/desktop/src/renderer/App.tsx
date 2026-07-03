@@ -19,6 +19,7 @@ import { AudioOutputs } from './components/Voice/ParticipantGrid';
 import { useUpdateErrorListener } from './hooks/useUpdateErrorListener';
 import MFAChallengeModal from './components/Auth/MFAChallengeModal';
 import AttestationFailedModalHost from './components/AttestationFailedModal';
+import ChangelogModalHost from './components/ChangelogModal/ChangelogModal';
 import JoinServerModal from './components/Servers/JoinServerModal';
 import SSOEagerUnlock from './components/Auth/SSOEagerUnlock';
 import { useAuthStore } from './stores/authStore';
@@ -469,6 +470,7 @@ function App() {
           <ForceUpdateOverlay />
           <MFAChallengeModal />
           <AttestationFailedModalHost />
+          <ChangelogModalHost />
           <JoinServerModal
             isOpen={!!deepLinkInviteCode && isDeepLinkInviteOpen && !!accessToken && emailVerified}
             initialCode={deepLinkInviteCode}

@@ -4,6 +4,276 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.22] — 2026-07-02
+
+### Added
+
+- **Post-update changelog modal** ([#2034](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2034)) — after a desktop update installs and the app restarts, a once-per-version "What's new" dialog summarizes the releases since the version previously installed on that machine. Dismissible, keyboard-accessible, works offline, and never blocks startup.
+- **Changelog discipline** ([#2034](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2034)) — this file is now the canonical public change record: entries backfilled for every release since Beta, and a CI gate ensures every future version bump ships with a matching entry.
+
+## [0.2.21] — 2026-07-02
+
+### Added
+
+- **Higher profile and server image upload limits for subscribers** ([#2010](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2010)) — avatar, banner, and server-icon upload size caps now scale with subscription tier.
+
+### Changed
+
+- **Internal tooling, CI, code-quality, and documentation maintenance** ([#2016](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2016), [#2017](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2017), [#2019](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2019), [#2025](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2025)).
+
+### Fixed
+
+- **Server message pinning restored** ([#2011](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2011)) — pinning works again in server channels, and pinned media no longer overflows its panel.
+- **Chat scrolling no longer jumps from stale scroll restores** ([#2008](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2008)) — switching channels quickly no longer snaps the view to an outdated position.
+- **DM and notification previews show friendly media labels** ([#2015](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2015)) — image and attachment previews read as "Photo"-style labels instead of raw placeholders.
+- **Message composer polish** ([#2014](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2014)) — the composer menu now renders above the placeholder text instead of behind it.
+- **Fewer unnecessary permission requests** ([#1990](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1990), [#2009](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2009)) — the client no longer issues forbidden channel-override fetches or speculative mention-permission checks it isn't entitled to.
+- **Unified desktop update checks** ([#2013](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2013)) — the app's UI and binary update checks now go through one consistent path.
+- **Cleaner account-creation identity hint** ([#2018](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2018)) — the suggested identity during sign-up no longer carries an unwanted "@concordvoice.chat" suffix.
+
+### Security
+
+- **Windows install-time update verification armed** ([#2023](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2023)) — the update manifest now carries the expected publisher name, so Windows verifies the code signature of downloaded updates before installing.
+- **Public release attestations for mirrored desktop assets** ([#1988](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1988)) — every publicly mirrored desktop release asset now carries verifiable build provenance.
+- **Client-attestation activation blockers cleared** ([#2024](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2024)) — corrected the attestation verification default and added a fail-loud guard so misconfiguration cannot pass silently.
+
+## [0.2.20] — 2026-06-30
+
+### Added
+
+- **Self-hosted servers now unlock full entitlements** ([#1985](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1985)) — operators running their own Concord Voice instance get premium-tier media and feature entitlements out of the box, without a subscription.
+- **Legal documents in the About page** ([#1987](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1987)) — license, terms, and other legal notices are now viewable directly from Settings ▸ About.
+
+## [0.2.19] — 2026-06-30
+
+### Added
+
+- **Self-hosted desktop login routing** ([#1982](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1982)) — first slice of self-hosted server support: the desktop login flow can route authentication to an operator-run Concord Voice server instead of the managed service.
+
+### Fixed
+
+- **Desktop update recovery via the public feed** ([#1984](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1984)) — the app now checks the public release feed for updates, so clients stranded on an older version can recover and receive new releases reliably.
+
+### Changed
+
+- **Internal tooling, CI, and deployment configuration maintenance.**
+
+## [0.2.18] — 2026-06-29
+
+### Security
+
+- **Restored Cloudflare certificate pinning** ([#1983](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1983)) — the desktop client's certificate pinning for Cloudflare-fronted connections had lapsed; this release recovers it so connections to Concord services are again verified against the expected certificates.
+
+## [0.2.17] — 2026-06-29
+
+### Added
+
+- **Reactions on direct messages** ([#1976](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1976)) — you can now react to DM messages with emoji, matching the reactions already available in server channels.
+
+### Changed
+
+- **Internal tooling, CI, and dependency maintenance** ([#1979](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1979)).
+
+### Fixed
+
+- **More reliable connection at startup** ([#1978](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1978)) — eliminated a race in the WebSocket authentication handshake that could leave the client disconnected right after launch.
+- **Restored connectivity after server certificate rotation** ([#1980](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1980)) — the client now trusts the rotated production API certificate pin, fixing failed connections for clients that enforced the old pin.
+
+## [0.2.16] — 2026-06-29
+
+### Added
+
+- **Notification content privacy preference** ([#1970](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1970)) — new setting to control how much message content appears in desktop notifications, so previews can be hidden on shared or public screens.
+- **Custom themes are now free** ([#1974](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1974)) — custom theme creation is available to all users, no subscription required.
+
+### Fixed
+
+- **Voice audio no longer drops when navigating to DMs** ([#1972](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1972)) — the voice audio pipeline stays mounted while browsing direct messages, so call audio keeps playing during navigation.
+- **macOS app now relaunches after installing an update** ([#1973](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1973)) — "Restart to update" previously quit the app without reopening it on macOS; the update-install restart path now brings the app back up.
+
+### Changed
+
+- **Internal tooling, CI, and supply-chain maintenance** ([#1968](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1968), [#1969](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1969)) — retired a legacy automation credential and automated the supply-chain indicator-list refresh guard; no user-facing impact.
+
+## [0.2.15] — 2026-06-29
+
+### Added
+
+- **Member timeout moderation** ([#1967](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1967)) — moderators can now temporarily time out server members, restricting their participation for a set duration.
+- **macOS Applications-folder move prompt** ([#1966](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1966)) — on first launch outside /Applications, the app offers to move itself to the Applications folder for a cleaner install and reliable updates.
+
+### Changed
+
+- **Internal tooling, CI, and deployment maintenance.**
+
+### Security
+
+- **Stricter passkey registration requirements** ([#1963](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1963)) — WebAuthn registration now requires passkey-grade platform authenticator options, ensuring new passkeys meet the intended security bar.
+- **Access token revoked on account erasure** ([#1965](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1965)) — erasing an account now immediately invalidates the current access token, so no authenticated session survives the deletion.
+
+## [0.2.14] — 2026-06-28
+
+### Added
+
+- **Per-channel audio quality standard** ([#1946](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1946)) — voice channels can now set a shared audio quality tier that applies to every member, bounded by the server's tier, with a new slider in channel settings.
+- **SVC / Simulcast casting toggles** ([#1929](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1929)) — advanced video controls in Settings ▸ Audio & Video let you choose which layered-video codec modes your client will publish with.
+- **Self-hosted TLS certificate provisioning** ([#1919](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1919)) — self-hosted operators can provision an origin certificate via self-signed, Let's Encrypt, or bring-your-own modes with one script.
+
+### Changed
+
+- **My Profile moved into Settings ▸ Account** ([#1930](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1930)) — profile editing now lives in Settings; the old quick-link deep-links to the same place. SSO controls on the Security page were also polished ([#1951](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1951)).
+- **Internal tooling, CI, and dependency maintenance** — supply-chain threat-list refreshes, deploy-summary and mirror-sync fixes, and dev-environment upkeep.
+
+### Fixed
+
+- **Username case-handling consistency** ([#1936](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1936)) — usernames are now case-insensitive everywhere, fixing an SSO mixed-case profile-edit lockout, duplicate accounts differing only by case, and case-sensitive friend-add lookups.
+- **macOS notification permission status** ([#1960](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1960)) — the app now correctly reconciles its notification settings with the actual macOS permission state.
+- **Self-hosted TLS failures no longer silent** ([#1964](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1964)) — local certificate provisioning errors are now surfaced to the operator instead of being swallowed.
+
+### Security
+
+- **Hardened email MFA setup for production** ([#1961](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1961)) — tightened the email-based multi-factor enrollment flow.
+- **Cached-UI origin allowlisted ahead of activation** ([#1928](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1928)) — the signed offline UI cache's origin was added to server allowlists so passkey login and voice keep working when that fallback activates.
+
+## [0.2.13] — 2026-06-28
+
+### Fixed
+
+- **Send-to-a-Friend invite bubbles now show the correct sender** ([#1909](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1909)) — invite messages in chat were attributed to the wrong user; they now display the person who actually sent the invite.
+- **System Permissions settings are clearer and easier to find** ([#1910](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1910)) — improved wording and navigation discoverability for the System Permissions section in Settings.
+
+### Security
+
+- **Linux updates are now signature-verified before install** ([#1923](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1923)) — AppImage, deb, and rpm update artifacts carry detached Ed25519 signatures that the client verifies against a bundled public key; an update that fails verification is refused.
+- **Signed offline UI cache activated** ([#1907](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1907), [#1908](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1908)) — the desktop client can now fall back to a cryptographically verified last-known-good copy of the app UI, checked against an embedded public key before use.
+
+### Changed
+
+- **Internal tooling, CI, and configuration maintenance** ([#1918](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1918), [#1920](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1920)) — cleanup of a retired sign-in configuration value across internal checks and documentation.
+
+## [0.2.12] — 2026-06-27
+
+### Fixed
+
+- **Camera and screen share no longer cut out when video quality layers switch** ([#1903](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1903)) — re-negotiating video layers mid-call could stop the underlying capture track, killing every camera in the room; producers now keep the track alive across the switch.
+- **Age-verification status now restores correctly after a reload** ([#1904](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1904)) — verified state is re-fetched from the server on startup, so already-verified users are no longer re-prompted.
+
+### Changed
+
+- **Internal tooling, configuration, and code-quality maintenance** ([#1900](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1900), [#1901](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1901), [#1906](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1906)) — engineering plan write-ups, a storage-configuration rename groundwork change, and static-analysis cleanup; no user-facing behavior changes.
+
+## [0.2.11] — 2026-06-26
+
+### Fixed
+
+- **Hardware video encoding now uses your GPU's actual capabilities** ([#1879](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1879)) — the client now queries the system's supported hardware encode profiles instead of assuming a fixed codec set, so camera and screen-share encoding picks codecs your GPU can genuinely accelerate.
+
+## [0.2.10] — 2026-06-26
+
+### Added
+
+- **Self-hosted installer and lifecycle CLI** ([#1892](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1892)) — a guided installer for running your own Concord Voice instance, plus a `concord-selfhost` command for starting, stopping, monitoring, and checking the health of the stack.
+
+### Fixed
+
+- **AV1 video black screens in end-to-end-encrypted calls** ([#1896](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1896)) — AV1 camera and screen-share video could fail to decrypt and render as a black screen; per-frame media encryption was reworked (frame crypto v4) so AV1 streams now decrypt reliably.
+
+### Changed
+
+- **Internal tooling, CI, and dependency maintenance** ([#1877](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1877), [#1894](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1894)) — refreshed supply-chain threat indicators and made macOS release builds retry a transient DMG packaging flake.
+
+## [0.2.9] — 2026-06-24
+
+### Added
+
+- **Signed offline UI cache** ([#1880](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1880)) — the desktop app now keeps a cryptographically signed last-known-good copy of the latest UI, so it can start with the current interface even when the update server is briefly unreachable.
+- **Server capabilities discovery endpoint** ([#1883](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1883)) — new `GET /api/v1/server/capabilities` lets clients discover what a (self-hosted) server supports before connecting.
+
+### Fixed
+
+- **Video no longer black-screens after a mid-call key rotation** ([#1885](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1885)) — encrypted video frames now carry their channel-key version, so receivers pick the right decryption key after an end-to-end-encryption key rotation instead of dropping to a black screen.
+- **Public release mirroring now triggers only on real releases** ([#1887](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1887)) — corrected the condition that publishes signed builds to the public downloads page.
+
+### Security
+
+- **Stricter validation of the API server address in packaged builds** ([#1882](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1882)) — the app now only accepts the official service address or a self-hosted server that passed the app's own verification probe, hardening against a compromised UI redirecting the client.
+
+### Changed
+
+- **Internal tooling and engineering-workflow maintenance** ([#1884](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1884), [#1888](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1888)).
+
+## [0.2.8] — 2026-06-24
+
+### Changed
+
+- **Refreshed invite landing page** ([#1869](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1869)) — restyled the page shown when opening a server invite link.
+- **Internal tooling, CI, and test maintenance** ([#1864](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1864), [#1871](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1871), [#1875](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1875)) — including expanded automated color-contrast (WCAG) checks.
+
+### Fixed
+
+- **App UI updates arrive reliably, and sessions survive a soft reload** ([#1872](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1872)) — the client now retries fetching the latest UI after a cold-start network hiccup, checks for newer UI automatically (deferring while you're in a call), and keeps session-only ("Remember Me" off) sign-in and encryption keys across an in-app reload without ever writing them to disk.
+- **Encrypted video stays in sync with layered/simulcast streams** ([#1865](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1865)) — hardened media end-to-end-encryption key epochs so camera and screen-share video no longer desyncs or black-screens with layered video.
+- **Live audio device switching** ([#1866](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1866)) — changing your microphone or speaker during a call now retargets the active audio streams correctly.
+- **DM voice calls open the call view and play remote audio** ([#1876](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1876)) — answering a direct-message call now reliably brings up the voice view with the other person audible.
+- **Older DM image and file attachments decrypt correctly** ([#1867](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1867)) — attachments in DM history now use the right key context after key rotations.
+- **DM list shows accurate online status** ([#1874](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1874)) — presence in DM rows now stays in sync with your friends list.
+- **Image lightbox polish** ([#1868](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1868)) — enlarged images are properly centered and no longer show a magnifier cursor.
+
+## [0.2.7] — 2026-06-23
+
+> Versions 0.2.4-0.2.6 were version bumps that never produced a public release (release pipeline iterations); their changes ship in this release.
+
+### Added
+
+- **Image lightbox viewer** ([#1813](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1813)) — click any image attachment to open a full-size viewer with zoom and a native Save As dialog.
+- **Public invite links** ([#1821](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1821)) — shareable server invite links that open a landing page and route new members into the app.
+- **Smarter camera quality in group calls** ([#1831](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1831)) — SVC-first camera layer selection lets the server deliver each viewer the video resolution they actually need, saving bandwidth in larger calls.
+
+### Fixed
+
+- **Video recovers after encryption key catch-up** ([#1784](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1784)) — end-to-end-encrypted video no longer black-screens after a key epoch desync; the stream now recovers automatically.
+- **Audio output device changes apply mid-call** ([#1823](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1823)) — switching your speaker/headset in settings now retargets live call audio immediately.
+- **Large batch of chat and UI polish** ([#1798](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1798)–[#1836](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1836)) — DM conversation avatars, DM unread badge and notification suppression while a conversation is open, self-sent DM previews, GIF embeds in DMs, self-mention highlighting, ordered-list numbering, inline code wrapping, bigger click targets for the message composer and user popovers, context-menu and screen-share-picker layering fixes, notification-sound and TTS preview feedback, theme-correct self profile card, friend category manager styling, voice participant frame overlap, active server restored after reload, and blocked partially-uploaded attachment sends.
+- **Linux packaging hardening** ([#1801](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1801), [#1825](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1825), [#1863](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1863)) — more reliable launch on Linux desktops, correct menu icons across desktop environments, and preserved sandbox permissions in RPM packages.
+- **Media uploads report clearly when unavailable** ([#1826](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1826)) — the server now returns a proper "service unavailable" response instead of a confusing error when media storage is disabled.
+
+### Security
+
+- **Closed a WebSocket channel permission bypass** ([#1811](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1811)) — channel access rules (roles and channel-level permissions) are now enforced consistently on the real-time WebSocket path, not just the REST API.
+
+### Changed
+
+- **Internal tooling, CI, and dependency maintenance** — routine dependency updates (including Electron 42.4.1 and mediasoup 3.20.9), release-pipeline and deployment reliability work, and infrastructure housekeeping.
+
+## [0.2.3] — 2026-06-22
+
+### Added
+
+- **Live message character-limit counter with overflow handling** ([#1709](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1709)) — the message composer now shows a character counter driven by your account's message limit and clearly flags over-limit text before you send.
+
+### Changed
+
+- **Internal tooling, CI, and documentation maintenance** ([#1780](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1780), [#1781](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1781), [#1764](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1764), [#1783](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1783)) — build-pipeline and security-scanning upkeep, documentation cleanups, and a routine supply-chain threat-list refresh; no user-facing behavior changes.
+
+## [0.2.2] — 2026-06-22
+
+### Added
+
+- **Premium lock UI + redemption codes** ([#1724](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1724), [#1730](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1730), [#1737](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1737)) — subscription groundwork: lock badges and gates on premium features, a universal redemption-code system, and server-side per-tier audio/video quality limits applied when joining voice.
+- **Public Known Issues list** ([#1736](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1736), [#1769](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1769)) — a pinned, always-current Known Issues tracker in the public feedback repo, linked directly from the in-app feedback dialog so you can check for your issue before filing.
+- **"Load latest UI" recovery** ([#1779](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1779)) — a Settings ▸ About button (plus an automatic launch-time retry) that reloads the newest app UI without a restart when a slow network start left you on the built-in fallback.
+- **Admin/ops console authentication** ([#1703](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1703)) — operator console sign-in with password plus WebAuthn hardware-key second factor.
+- **GIFs load automatically by default** ([#1774](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1774)) — new accounts now start with "Load GIFs from KLIPY automatically" turned on; existing accounts keep their choice.
+
+### Fixed
+
+- **Voice audio crackle and garbling** ([#1765](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1765), [#1777](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1777)) — small calls no longer suffer clipped word starts from unnecessary speaker-limit churn, and silent (DTX) audio frames pass through correctly, fixing garbled audio at the start of speech.
+- **Reconnect after server deploys** ([#1770](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1770)) — the app now reliably auto-reconnects after a brief server-side disconnect instead of getting stuck "Reconnecting", and a transient sign-in hiccup no longer wipes a "Remember Me" session.
+
+### Changed
+
+- **Internal tooling, CI, documentation, and dependency maintenance** ([#1731](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1731), [#1733](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1733), [#1762](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1762), [#1771](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1771), [#1772](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1772), [#1775](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1775), [#1776](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1776)) — feedback-triage automation, release-mirror pipeline fixes, security-list refresh, doc cleanups, and opt-in (off by default) audio diagnostics.
+
 ## [0.2.1] — 2026-06-20 (macOS DMG installer delivery)
 
 > Patch release. v0.2.0-Beta shipped the macOS client as a `.zip` only — the
@@ -60,7 +330,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Docker network segmentation** ([#442](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/442)) — service isolation, request-ID propagation, Redis auth bans.
 - **CI/CD pipeline** ([#128](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/128), [#130](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/130)) — GitHub Actions `build.yml` with parallel test, coverage, and SonarQube; later hardened with Semgrep SAST in [#457](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/457).
 - **Shai-Hulud 2.0 supply-chain IOC scanner** ([#722](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/722)) — closes #715; IOC list refreshed in [#781](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/781).
-- **AI governance framework** ([#454](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/454)–[#458](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/458), [#500](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/500)–[#522](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/522)) — AI-generated code policy, CODEOWNERS, agentic controls, Semgrep SAST, path-scoped [internal] rules, Claude Code skills, custom agents, Copilot prompt templates, MCP project config.
+- **AI governance framework** ([#454](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/454)–[#458](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/458), [#500](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/500)–[#522](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/522)) — AI-generated code policy, CODEOWNERS, agentic controls, Semgrep SAST, path-scoped internal AI-assistant rules, Claude Code skills, custom agents, Copilot prompt templates, MCP project config.
 
 ### Changed
 
@@ -74,7 +344,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **E2EE password-derived key** — PBKDF2 → Argon2id client-side ([#117](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/117)).
 - **macOS notarization** switched to App Store Connect API key ([#826](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/826)).
 - **Cognitive complexity reduction** across Go control-plane handlers and TypeScript frontend / media-plane ([#418](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/418), [#419](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/419), [#498](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/498), [#505](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/505), [#550](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/550)–[#553](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/553)).
-- **Documentation audit** completed for the v0.2.0-Beta release gate ([#214](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/214)) — drift inventory at `[internal]2026-05-01-214-doc-audit-drift-inventory.md`; PR-1 verification merged in [#823](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/823).
+- **Documentation audit** completed for the v0.2.0-Beta release gate ([#214](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/214)) — drift inventory tracked internally; PR-1 verification merged in [#823](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/823).
 - **MCP server deployment refactored into per-host configs** ([#838](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/838)) — closes #778. Splits into `.mcp.json` (Claude Code CLI / App via `launchctl setenv`) and `.vscode/mcp.json` (VS Code native MCP via `${input:VAR}` → secret store). Eliminates `launchctl setenv` exposure for VS Code native MCP — OWASP A02 (Security Misconfiguration) win. Policy doc (`docs/policies/mcp-server-policy.md`) rewritten with the three-surface credential taxonomy.
 
 ### Removed
@@ -147,7 +417,7 @@ Tracking at time of v0.2.0-Beta release. For the full open-issue list, see [issu
 **Automatic migrations applied on first connection / first server run:**
 
 - Database schema additions (migrations 000054–000061): server mute/deafen state, Klipy GIF customer IDs, DM message pinning index, pending registrations TTL, account-deletion cascade, removed `sentry_delete_attempted` column, and SSO identities (`is_relay_email` for Apple privacy-relay handling).
-- Refresh-token cascade (migration 000059): `refresh_tokens.user_id` becomes `ON DELETE CASCADE`, which strengthens the atomic-revocation invariant for account erasure (per `[internal]rules/backend.md`).
+- Refresh-token cascade (migration 000059): `refresh_tokens.user_id` becomes `ON DELETE CASCADE`, which strengthens the atomic-revocation invariant for account erasure.
 - E2EE key derivation: PBKDF2 → Argon2id ([#117](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/117)) migrates transparently on next login — legacy keys are unwrapped with PBKDF2, re-wrapped with Argon2id, and uploaded to the server. No user action required; migration 000034 adds `key_derivation_alg` tracking.
 - Renderer migrations: existing local data migrates client-side via the standard Zustand `persist` migration path on first launch; no user-visible state loss.
 
@@ -178,14 +448,14 @@ Tracking at time of v0.2.0-Beta release. For the full open-issue list, see [issu
 
 ### Changed
 
-- **IPC surface widened** — 4 new `window:*` channels (`setClientBehavior`, `quit`, `setTitleBarOverlayColor`, `getVersionString`) + 1 new send-only event (`spa:versionChanged`). All 4 handlers carry runtime input validators at the IPC trust boundary; sender-frame validation is intentionally omitted per the new "Low-stakes UI-state IPC" exception class codified in [`[internal]rules/electron.md`]([internal]rules/electron.md).
+- **IPC surface widened** — 4 new `window:*` channels (`setClientBehavior`, `quit`, `setTitleBarOverlayColor`, `getVersionString`) + 1 new send-only event (`spa:versionChanged`). All 4 handlers carry runtime input validators at the IPC trust boundary; sender-frame validation is intentionally omitted per the new "Low-stakes UI-state IPC" exception class codified in the internal Electron security rules.
 - **PiP windows opt out of OS-drawn shadow** — `hasShadow: false` on PiP `BrowserWindow` construction for the lightweight floating-glass aesthetic. macOS drops the standard window shadow; no-op on Wayland/X11/Windows.
 - **Theme-color sync** — settingsStore subscribes to `appearance.theme` and IPC-pushes resolved overlay colors via `window:setTitleBarOverlayColor` on every theme change, including the OS-driven `prefers-color-scheme` listener for `theme: 'system'`. macOS ignores the IPC (uses native traffic lights); other platforms get the dark / light overlay treatment.
 
 ### Documentation
 
-- **Developer handoff spec** for the Client Behavior section landed at `[internal]handoffs/2026-05-20-806-client-behavior-section-handoff.md` — first entry in a new `handoffs/` directory paralleling `specs/`, `plans/`, `reports/`.
-- **`[internal]rules/electron.md`** documents the low-stakes-IPC sender-frame exception class with conditions, current accepted-exception handlers, and an explicit list of categories that MUST validate.
+- **Developer handoff spec** for the Client Behavior section landed in the internal docs tree.
+- **Internal Electron security rules** now document the low-stakes-IPC sender-frame exception class with conditions, current accepted-exception handlers, and an explicit list of categories that MUST validate.
 
 ### Deferred / follow-up
 
@@ -203,7 +473,7 @@ Tracking at time of v0.2.0-Beta release. For the full open-issue list, see [issu
 
 ### Fixed
 
-- **Linux build no longer fails at `@reforged/maker-appimage` packaging** — commit [21accce5](https://github.com/Concord-Voice/Concord-Voice-Alpha/commit/21accce5) ("Change company name to 'Concord Voice LLC'") silently bundled an unrelated `packagerConfig.executableName` rename from `'concord-voice'` to `'Concord Voice'` alongside its legitimate company-name updates. With executableName changed to `'Concord Voice'`, the packaged Linux binary became `Concord-Voice-linux-<arch>/Concord Voice` (with a space), but the Linux makers' `bin: 'concord-voice'` option still performed a literal-string file lookup for `concord-voice`, failing with `"Could not find executable 'concord-voice' in packaged application"` ([run 26148494680](https://github.com/Concord-Voice/Concord-Voice-Alpha/actions/runs/26148494680)). The bug sat latent on `main` for ~6 hours while the cascade-skip regression (since-fixed by [#1077](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1077)) was still suppressing the build matrix, and surfaced on the first `push:main` after the cascade-skip fix shipped — exactly the verification path documented in [ADR-0004]([internal]0004-desktop-release-contract.md) Invariant 3. Fixed by making `executableName` per-platform: Linux falls back to kebab-case `'concord-voice'` (matching the maker `bin:` lookup and debian-policy §5.6.7), while macOS / Windows retain the proper-name format `'Concord Voice'` (visible in Activity Monitor, Task Manager, and crash reports).
+- **Linux build no longer fails at `@reforged/maker-appimage` packaging** — commit [21accce5](https://github.com/Concord-Voice/Concord-Voice-Alpha/commit/21accce5) ("Change company name to 'Concord Voice LLC'") silently bundled an unrelated `packagerConfig.executableName` rename from `'concord-voice'` to `'Concord Voice'` alongside its legitimate company-name updates. With executableName changed to `'Concord Voice'`, the packaged Linux binary became `Concord-Voice-linux-<arch>/Concord Voice` (with a space), but the Linux makers' `bin: 'concord-voice'` option still performed a literal-string file lookup for `concord-voice`, failing with `"Could not find executable 'concord-voice' in packaged application"` ([run 26148494680](https://github.com/Concord-Voice/Concord-Voice-Alpha/actions/runs/26148494680)). The bug sat latent on `main` for ~6 hours while the cascade-skip regression (since-fixed by [#1077](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1077)) was still suppressing the build matrix, and surfaced on the first `push:main` after the cascade-skip fix shipped — exactly the verification path documented in ADR-0004 (desktop release contract) Invariant 3. Fixed by making `executableName` per-platform: Linux falls back to kebab-case `'concord-voice'` (matching the maker `bin:` lookup and debian-policy §5.6.7), while macOS / Windows retain the proper-name format `'Concord Voice'` (visible in Activity Monitor, Task Manager, and crash reports).
 
 ### Changed
 
@@ -259,7 +529,7 @@ Tracking at time of v0.2.0-Beta release. For the full open-issue list, see [issu
 
 ### Added
 
-- **[internal] counts automation** — `./scripts/update-claude-md-counts.sh` for keeping project stats in sync (#581)
+- **Project-stats counts automation** — a maintenance script that keeps internal project statistics in sync (#581)
 
 ### Changed
 
@@ -342,7 +612,7 @@ Tracking at time of v0.2.0-Beta release. For the full open-issue list, see [issu
 - **Global context menu** — Unified context menu system with clipboard support and role assignment (#446)
 - **SPA deployment pipeline** — File server, versioning, and GitHub Actions workflow for hot-update SPA bundles (#429)
 - **Docker network segmentation** — Service isolation, request ID propagation, Redis auth bans (#442)
-- **AI governance framework** — AI-generated code policy, CODEOWNERS, agentic controls, Semgrep SAST, path-scoped [internal] rules, Claude Code skills, custom agents, Copilot prompt templates, MCP project config (#454–#458, #500–#504, #507–#518, #522)
+- **AI governance framework** — AI-generated code policy, CODEOWNERS, agentic controls, Semgrep SAST, path-scoped internal AI-assistant rules, Claude Code skills, custom agents, Copilot prompt templates, MCP project config (#454–#458, #500–#504, #507–#518, #522)
 
 ### Changed
 

@@ -1,0 +1,56 @@
+.changelog-modal {
+  max-width: 560px;
+  width: calc(100vw - 48px);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  padding: 24px;
+}
+
+.changelog-modal::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.changelog-modal h2 {
+  margin: 0 0 8px;
+}
+
+.changelog-modal__notes {
+  max-height: 50vh;
+  overflow-y: auto;
+  margin: 12px 0;
+  padding-right: 8px;
+}
+
+.changelog-modal__section h3 {
+  margin: 16px 0 4px;
+}
+
+/* Keep-a-Changelog category headings (### Added/Changed/Fixed) render as h3
+   inside the Markdown body — step them down so version headers stay dominant. */
+.changelog-modal__section .changelog-modal__section-body h3,
+.changelog-modal__section h4 {
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  margin: 12px 0 2px;
+}
+
+.changelog-modal__date {
+  font-weight: normal;
+  color: var(--text-secondary);
+}
+
+.changelog-modal__earlier {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.changelog-modal__actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 16px;
+}

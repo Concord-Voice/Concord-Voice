@@ -17,3 +17,8 @@ declare module 'virtual:concord-legal/terms-of-service' {
   const content: string;
   export default content;
 }
+
+declare module 'virtual:concord-changelog' {
+  const content: string;
+  export default content;
+}

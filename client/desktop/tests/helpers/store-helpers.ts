@@ -21,6 +21,7 @@ import { usePendingRegistrationStore } from '../../src/renderer/stores/pendingRe
 import { useNotificationPrefsStore } from '../../src/renderer/stores/notificationPrefsStore';
 import { useAttestationFailureStore } from '../../src/renderer/stores/attestationFailureStore';
 import { useRichPresenceStore } from '../../src/renderer/stores/richPresenceStore';
+import { useChangelogStore } from '../../src/renderer/stores/changelogStore';
 
 /**
  * Resets all Zustand stores to their initial state.
@@ -53,6 +54,7 @@ export function resetAllStores(): void {
   useNotificationPrefsStore.getState().clearAll();
   useAttestationFailureStore.getState().dismiss();
   useRichPresenceStore.getState().reset();
+  useChangelogStore.setState({ lastSeenVersion: null });
 
   // Clear persisted state from localStorage AND sessionStorage
   // (pendingRegistrationStore persists to sessionStorage)

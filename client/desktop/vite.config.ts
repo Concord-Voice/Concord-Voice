@@ -13,6 +13,11 @@ const legalDocumentModules = new Map([
     'virtual:concord-legal/terms-of-service',
     path.resolve(__dirname, '../../docs/legal/terms-of-service.md'),
   ],
+  // Not a legal document — reuses the same transform-time inlining plugin so the
+  // post-update changelog modal (#1857) can bundle the repo-root CHANGELOG.md
+  // (works in dev, prod build, packaged bundled-fallback, and Vitest without
+  // widening server.fs.allow).
+  ['virtual:concord-changelog', path.resolve(__dirname, '../../CHANGELOG.md')],
 ]);
 
 function legalDocumentPlugin(): Plugin {
