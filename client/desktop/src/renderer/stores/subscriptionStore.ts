@@ -32,7 +32,7 @@ export const FREE_ENTITLEMENT: Entitlement = {
   maxWebcamPublishers: 8,
   maxScreensharePublishers: 1,
   maxMessageChars: 5120,
-  maxAttachmentBytes: 26214400,
+  maxAttachmentBytes: 33554432, // 32 MiB — matches Go free floor (entitlements.go, post-#1522)
   maxAvatarBytes: 5242880,
   maxBannerBytes: 5242880,
   allowAnimatedProfile: false,

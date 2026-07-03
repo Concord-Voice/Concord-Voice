@@ -1,5 +1,6 @@
 import CollapsibleSection from './CollapsibleSection';
 import NsfwContentGate from './NsfwContentGate';
+import SubscriptionSection from './subscription/SubscriptionSection';
 import ProfileInfoForm from '../Profile/ProfileInfoForm';
 import PasswordChangeForm from '../Profile/PasswordChangeForm';
 // Form/avatar/header/links/section styling for the relocated profile editor (#1773).
@@ -14,6 +15,9 @@ const AccountSection: React.FC = () => (
     <CollapsibleSection id="section-profile" title="My Profile" defaultOpen>
       <ProfileInfoForm />
       <PasswordChangeForm />
+    </CollapsibleSection>
+    <CollapsibleSection id="section-subscription" title="Subscription" defaultOpen>
+      <SubscriptionSection />
     </CollapsibleSection>
     <CollapsibleSection id="section-nsfw-content" title="NSFW Content Access" defaultOpen>
       <NsfwContentGate />

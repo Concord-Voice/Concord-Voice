@@ -31,6 +31,7 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/servercapabilities"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/servers"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/sessions"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/subscriptions"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/updates"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/users"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/voice"
@@ -269,6 +270,12 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	// Entitlement capability set handler (#1297). Owns its own read-through Cache
 	// (NOT borrowed from auth.Handler — internal/auth is a protected path).
 	entitlementsHandler := entitlements.NewHTTPHandlerForInstance(db, redis, log, cfg.InstanceType)
+
+	// Subscription-status read handler (#1304). Read-only companion to the
+	// entitlement set: exposes the live subscription's status/source/expiry that
+	// the Settings subscription page renders. Fails closed to the free default on
+	// any DB error (never a fabricated premium).
+	subscriptionsHandler := subscriptions.NewHandler(db, log)
 
 	// Redemption engine + issuer (#1303). The first LIVE caller of the
 	// entitlements.OnTierChange convergence point: a premium code grant
@@ -584,6 +591,15 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 			// Entitlement capability set (client UX source; #1297). Auth-required;
 			// fails closed to the free set on any resolve error.
 			authRequired.GET("/entitlements", entitlementsHandler.Get)
+
+			// Subscription status (Settings subscription page; #1304). Read-only,
+			// auth-required, pending-OK (mirrors /entitlements so the page renders
+			// before email verification). Always 200; fails closed to the free
+			// default on any DB error.
+			authRequired.GET("/subscriptions/me",
+				middleware.RateLimitByUser(redis, 30, 1*time.Minute),
+				subscriptionsHandler.GetMe,
+			)
 
 			// Privacy endpoints — GDPR Article 17 erasure.
 			// Mounted in the pending-OK tier so users can erase their data

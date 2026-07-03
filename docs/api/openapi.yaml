@@ -9239,6 +9239,40 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /subscriptions/me:
+    get:
+      tags:
+      - Platform
+      summary: Get the current user's subscription status
+      description: 'Returns the authenticated user''s live subscription status
+        (tier / status / source / expiry) for the Settings subscription page (#1304).
+        The entitlement set (`GET /entitlements`) carries only the resolved tier;
+        this read adds the grant''s status, source (`kickstarter` | `stripe` |
+        `code`), and optional period end. Server-authoritative from the JWT user_id
+        — never client-supplied.
+
+
+        When the user has no live subscription row the free-default shape is returned
+        (`{tier: "free", status: "none"}`). Fails closed to that same free default on
+        any DB error (never a fabricated premium), so this endpoint always returns 200
+        with a valid shape.
+
+
+        Rate limit: 30 requests per minute.
+
+        '
+      operationId: getSubscriptionStatus
+      security:
+      - BearerAuth: []
+      responses:
+        '200':
+          description: The authenticated user's subscription status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionStatus'
+        '429':
+          $ref: '#/components/responses/RateLimited'
   /servers/{id}/audit-log:
     get:
       tags:
@@ -12520,6 +12554,43 @@ components:
           type: string
       required:
       - message
+    SubscriptionStatus:
+      type: object
+      description: The current user's live subscription status (#1304). Read-only;
+        server-authoritative from the JWT user_id.
+      required:
+      - tier
+      - status
+      properties:
+        tier:
+          type: string
+          description: The resolved tier — `free` or `premium` (the schema stores
+            tier as an extensible VARCHAR; unknown tiers fail closed to free).
+          example: premium
+        status:
+          type: string
+          description: The subscription status. `none` when there is no live row
+            (the free-default shape); otherwise the live DB status.
+          enum:
+          - none
+          - active
+          - trialing
+          - past_due
+          example: active
+        source:
+          type: string
+          description: Where the grant came from. Absent in the free-default shape.
+          enum:
+          - kickstarter
+          - stripe
+          - code
+          example: code
+        current_period_end:
+          type: string
+          format: date-time
+          description: When the current subscription period ends (RFC 3339, UTC).
+            Absent for kickstarter/code-sourced Beta grants (no fixed period) and
+            for the free-default shape.
     RegisterRequest:
       type: object
       required:

@@ -117,6 +117,7 @@
 [data-scheme='pride'] .feature-request-submit,
 [data-scheme='pride'] .connection-lost-btn.primary,
 [data-scheme='pride'] .force-update-btn.primary,
+[data-scheme='pride'] .subscription-redeem-submit,
 [data-scheme='pride'] .update-banner__btn.primary {
   text-shadow:
     0 0 2px rgba(0, 0, 0, 0.85),
