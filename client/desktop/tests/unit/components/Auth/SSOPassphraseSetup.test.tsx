@@ -52,6 +52,15 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
+// Mock useSSOFlow so the re-initiate affordance (added for #2045) is assertable:
+// clicking "Sign in with Google again" must call begin(provider) to mint a FRESH
+// sso_token, rather than leaving the user re-submitting an expired one. The mock
+// returns a resolved promise so an awaited-or-.catch'd onClick never rejects.
+const mockBegin = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+vi.mock('@/renderer/hooks/useSSOFlow', () => ({
+  useSSOFlow: () => ({ begin: mockBegin }),
+}));
+
 beforeEach(() => {
   vi.clearAllMocks();
   e2eeState.initialized = false;
@@ -285,5 +294,70 @@ describe('SSOPassphraseSetup', () => {
     expect(storeE2EEKeysMock).toHaveBeenCalled();
     // The persistence failure must leave the in-memory session intact.
     expect(e2eeService.clearKeys).not.toHaveBeenCalled();
+  });
+
+  // --- Expired sso_token recovery (#2045) ---
+
+  it('surfaces an expired sso_token (401) with an actionable message and a working re-initiate affordance (regression #2045)', async () => {
+    // The sso_token has a server-side TTL; a user who dwells on this screen past it
+    // gets 401 sso_token_invalid on complete-registration. The old behavior mapped
+    // that to the generic "Registration failed. Please try again." and left the user
+    // re-submitting the same dead token — a permanent dead-end. It must instead show
+    // an actionable expiry message AND a one-click path to restart sign-in.
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      headers: new Headers({ 'Content-Type': 'application/json' }),
+      json: async () => ({ error_code: 'sso_token_invalid' }),
+      text: async () => JSON.stringify({ error_code: 'sso_token_invalid' }),
+    });
+
+    render(<SSOPassphraseSetup />);
+    fillAndSubmit();
+
+    // Actionable expiry copy — NOT the generic dead-end.
+    await waitFor(() => {
+      expect(screen.getByText(/session expired/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/registration failed\. please try again/i)).not.toBeInTheDocument();
+
+    // A re-initiate affordance that restarts the Google flow (fresh token) instead
+    // of re-submitting the expired one. getByRole scopes to the button, so it does
+    // not collide with the same phrase inside the alert message.
+    const restart = screen.getByRole('button', { name: /sign in with google again/i });
+    fireEvent.click(restart);
+    expect(mockBegin).toHaveBeenCalledWith('google');
+  });
+
+  it('names the correct provider (Apple) in the expiry recovery copy — not hardcoded Google (regression #2045)', async () => {
+    // The same screen serves Apple SSO; the recovery copy, intro, and button must
+    // say "Apple", and the re-initiate must restart the APPLE flow.
+    useSSOStore.getState().setState({
+      phase: 'register_required',
+      provider: 'apple',
+      ssoToken: 'tok-fake',
+      email: 'new@example.test',
+      name: 'New User',
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      headers: new Headers({ 'Content-Type': 'application/json' }),
+      json: async () => ({ error_code: 'sso_token_invalid' }),
+      text: async () => JSON.stringify({ error_code: 'sso_token_invalid' }),
+    });
+
+    render(<SSOPassphraseSetup />);
+    fillAndSubmit();
+
+    await waitFor(() => {
+      expect(screen.getByText(/session expired/i)).toBeInTheDocument();
+    });
+    // Provider-aware re-initiate button, and NO "Google" leaks anywhere on the
+    // Apple screen (intro + message + button are all provider-derived).
+    const restart = screen.getByRole('button', { name: /sign in with apple again/i });
+    expect(screen.queryByText(/google/i)).toBeNull();
+    fireEvent.click(restart);
+    expect(mockBegin).toHaveBeenCalledWith('apple');
   });
 });

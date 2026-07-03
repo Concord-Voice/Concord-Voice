@@ -27,6 +27,7 @@ import LoadingSpinner from './LoadingSpinner';
 import { useSSOStore } from '../../stores/ssoStore';
 import { useAuthStore } from '../../stores/authStore';
 import { completeSSORegistration, SSOServiceError } from '../../services/ssoService';
+import { useSSOFlow } from '../../hooks/useSSOFlow';
 import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
 import { e2eeService } from '../../services/e2eeService';
 import { errorMessage } from '../../utils/redactError';
@@ -43,7 +44,11 @@ interface CompleteRegistrationErrorBody {
  * handles 409 conflict cases (username/email already taken) so users see
  * actionable copy instead of a generic "registration failed."
  */
-function mapServerErrorToMessage(status: number, body: CompleteRegistrationErrorBody): string {
+function mapServerErrorToMessage(
+  status: number,
+  body: CompleteRegistrationErrorBody,
+  providerName: string
+): string {
   if (status === 409) {
     switch (body.error_code) {
       case 'username_taken':
@@ -59,6 +64,13 @@ function mapServerErrorToMessage(status: number, body: CompleteRegistrationError
       return body.detail ?? 'The username or passphrase is invalid.';
     }
   }
+  if (status === 401 && body.error_code === 'sso_token_invalid') {
+    // The short-lived sso_token expired (or was otherwise consumed) before the
+    // user finished this screen. Actionable copy + a re-initiate affordance
+    // (see the component) replace the old generic dead-end (#2045). Provider-aware
+    // so an Apple registrant is not told to "sign in with Google."
+    return `Your sign-in session expired. Please sign in with ${providerName} again.`;
+  }
   return body.error ?? body.detail ?? 'Registration failed. Please try again.';
 }
 
@@ -66,12 +78,16 @@ const SSOPassphraseSetup: React.FC = () => {
   const state = useSSOStore((s) => s.state);
   const setSSOState = useSSOStore((s) => s.setState);
   const setAccessToken = useAuthStore((s) => s.setAccessToken);
+  // begin(provider) re-mints a fresh sso_token via the full OAuth round-trip —
+  // the recovery path when the current token has expired (#2045).
+  const { begin } = useSSOFlow();
 
   const [username, setUsername] = useState('');
   const [passphrase, setPassphrase] = useState('');
   const [confirm, setConfirm] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [tokenExpired, setTokenExpired] = useState(false);
 
   // Defensive: only render in the register_required phase. Routing into this
   // component happens in AuthFlow (Task 21); a wrong-state render would imply
@@ -79,6 +95,11 @@ const SSOPassphraseSetup: React.FC = () => {
   if (state.phase !== 'register_required') {
     return null;
   }
+
+  // Display name for the expiry copy + re-initiate button + intro line. This
+  // screen serves BOTH Google and Apple SSO (SSOProvider = 'google' | 'apple'),
+  // so the recovery/intro copy must not hardcode a provider (#2045 review).
+  const providerName = state.provider === 'apple' ? 'Apple' : 'Google';
 
   const passphraseStrong = passphrase.length >= 12;
   const matches = passphrase === confirm && passphrase.length > 0;
@@ -92,6 +113,7 @@ const SSOPassphraseSetup: React.FC = () => {
     }
     setSubmitting(true);
     setError(null);
+    setTokenExpired(false);
 
     try {
       // Generate E2EE key material from the user's passphrase.
@@ -168,7 +190,13 @@ const SSOPassphraseSetup: React.FC = () => {
         // surface a coherent message rather than going silent.
         if (err instanceof SSOServiceError) {
           const body = (err.body ?? {}) as CompleteRegistrationErrorBody;
-          setError(mapServerErrorToMessage(err.status, body));
+          setError(mapServerErrorToMessage(err.status, body, providerName));
+          // An expired/invalid sso_token cannot be retried — flip to the
+          // re-initiate affordance instead of leaving the user re-submitting a
+          // dead token against the same form (#2045).
+          if (err.status === 401 && body.error_code === 'sso_token_invalid') {
+            setTokenExpired(true);
+          }
         } else {
           setError('Registration failed. Please try again.');
         }
@@ -191,8 +219,8 @@ const SSOPassphraseSetup: React.FC = () => {
         </h2>
         <p className="sso-passphrase-setup__intro">
           Signing in as <strong>{state.email}</strong>. Create a passphrase to protect your
-          encrypted messages — even we can&apos;t read them without it. You can still sign in with
-          Google anytime.
+          encrypted messages — even we can&apos;t read them without it. You can still sign in with{' '}
+          {providerName} anytime.
         </p>
 
         <div className="sso-passphrase-setup__field">
@@ -259,20 +287,32 @@ const SSOPassphraseSetup: React.FC = () => {
           </div>
         )}
 
-        <button
-          type="submit"
-          className="sso-passphrase-setup__submit"
-          disabled={!valid || submitting}
-        >
-          {submitting ? (
-            <>
-              Creating account…
-              <LoadingSpinner size="small" inline />
-            </>
-          ) : (
-            'Create account'
-          )}
-        </button>
+        {tokenExpired ? (
+          <button
+            type="button"
+            className="sso-passphrase-setup__submit"
+            onClick={() => {
+              void begin(state.provider);
+            }}
+          >
+            Sign in with {providerName} again
+          </button>
+        ) : (
+          <button
+            type="submit"
+            className="sso-passphrase-setup__submit"
+            disabled={!valid || submitting}
+          >
+            {submitting ? (
+              <>
+                Creating account…
+                <LoadingSpinner size="small" inline />
+              </>
+            ) : (
+              'Create account'
+            )}
+          </button>
+        )}
       </form>
     </div>
   );

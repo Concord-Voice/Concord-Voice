@@ -340,7 +340,7 @@ func TestCompleteRegistration_HappyPath(t *testing.T) {
 	}
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 15*time.Minute).Err())
 
 	body := map[string]any{
 		"sso_token":           ssoToken,
@@ -401,7 +401,7 @@ func TestCompleteRegistration_NormalizesUsername(t *testing.T) {
 	}
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 15*time.Minute).Err())
 
 	body := map[string]any{
 		"sso_token":           ssoToken,
@@ -498,7 +498,7 @@ func TestCompleteRegistration_BranchMismatch_Rejected(t *testing.T) {
 	}
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 15*time.Minute).Err())
 
 	body := map[string]any{
 		"sso_token":           ssoToken,
@@ -546,7 +546,7 @@ func TestCompleteRegistration_InvalidKeyMaterial(t *testing.T) {
 	}
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 15*time.Minute).Err())
 
 	body := map[string]any{
 		"sso_token":           ssoToken,
@@ -589,7 +589,7 @@ func TestCompleteRegistration_EmailTaken_409(t *testing.T) {
 	}
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 15*time.Minute).Err())
 
 	body := map[string]any{
 		"sso_token":           ssoToken,
@@ -630,7 +630,7 @@ func TestCompleteRegistration_UsernameTaken_409(t *testing.T) {
 	}
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 15*time.Minute).Err())
 
 	body := map[string]any{
 		"sso_token":           ssoToken,
@@ -675,7 +675,7 @@ func TestCompleteRegistration_UsernameTaken_CaseVariant_409(t *testing.T) {
 	}
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 15*time.Minute).Err())
 
 	body := map[string]any{
 		"sso_token":           ssoToken,
@@ -715,7 +715,7 @@ func TestCompleteRegistration_TokenIssuanceFails(t *testing.T) {
 	}
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 15*time.Minute).Err())
 
 	body := map[string]any{
 		"sso_token":           ssoToken,
@@ -766,7 +766,7 @@ func TestCompleteRegistration_HashFails(t *testing.T) {
 	}
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 15*time.Minute).Err())
 
 	body := map[string]any{
 		"sso_token":           ssoToken,
@@ -807,7 +807,7 @@ func TestCompleteRegistration_MalformedRedisJSON(t *testing.T) {
 	ssoToken := "sso-token-bad-redis" //nolint:gosec // test fixture, not a real secret
 	// Seed a non-JSON byte string deliberately.
 	require.NoError(t, rig.Redis.Set(context.Background(),
-		"sso_token:"+ssoToken, "not-json-payload", 5*time.Minute).Err())
+		"sso_token:"+ssoToken, "not-json-payload", 15*time.Minute).Err())
 
 	body := map[string]any{
 		"sso_token":           ssoToken,
@@ -849,7 +849,7 @@ func TestCompleteRegistration_InvalidUsername(t *testing.T) {
 	}
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 15*time.Minute).Err())
 
 	body := map[string]any{
 		"sso_token":           ssoToken,
@@ -904,7 +904,7 @@ func TestCompleteRegistration_InvalidPassword(t *testing.T) {
 	}
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 5*time.Minute).Err())
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 15*time.Minute).Err())
 
 	body := map[string]any{
 		"sso_token": ssoToken,
@@ -968,7 +968,7 @@ func TestCompleteLink_HappyPath(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, rig.Redis.Set(context.Background(),
-		"sso_token:"+ssoToken, payload, 5*time.Minute).Err())
+		"sso_token:"+ssoToken, payload, 15*time.Minute).Err())
 
 	body, err := json.Marshal(map[string]string{
 		"sso_token": ssoToken,
@@ -1029,7 +1029,7 @@ func TestCompleteLink_WrongPassword(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, rig.Redis.Set(context.Background(),
-		"sso_token:"+ssoToken, payload, 5*time.Minute).Err())
+		"sso_token:"+ssoToken, payload, 15*time.Minute).Err())
 
 	body, err := json.Marshal(map[string]string{
 		"sso_token": ssoToken,
@@ -1068,7 +1068,7 @@ func TestCompleteLink_AccountLocked(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, rig.Redis.Set(context.Background(),
-		"sso_token:"+ssoToken, payload, 5*time.Minute).Err())
+		"sso_token:"+ssoToken, payload, 15*time.Minute).Err())
 
 	body, err := json.Marshal(map[string]string{
 		"sso_token": ssoToken,
@@ -1115,7 +1115,7 @@ func TestCompleteLink_NewUserBranch_Rejected(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, rig.Redis.Set(context.Background(),
-		"sso_token:"+ssoToken, payload, 5*time.Minute).Err())
+		"sso_token:"+ssoToken, payload, 15*time.Minute).Err())
 
 	body, err := json.Marshal(map[string]string{
 		"sso_token": ssoToken,

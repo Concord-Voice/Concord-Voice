@@ -114,8 +114,13 @@ const (
 	ssoTokenKeyPrefix = "sso_token:" // #nosec G101 -- key prefix, not a credential
 	// stateTTL bounds how long an in-flight Initiate->Session can take.
 	stateTTL = 10 * time.Minute
-	// ssoTokenTTL bounds the link-or-complete window after callback.
-	ssoTokenTTL = 5 * time.Minute
+	// ssoTokenTTL bounds the link-or-complete window after callback. It must
+	// outlast the HUMAN step it gates — choosing a username and creating an E2EE
+	// passphrase — so it matches auth.PendingRegistrationTTL (15m), the
+	// email-verification analogue, NOT the machine-speed stateTTL (10m). 5m was
+	// too tight and dead-ended slow registrants with 401 sso_token_invalid
+	// (#2045). Guarded by TestSSOTokenTTL_HumanePassphraseWindow.
+	ssoTokenTTL = 15 * time.Minute
 	// entropyBytes is 256 bits — exceeds OAuth state/nonce minimums and the
 	// PKCE RFC 7636 recommendation (32 bytes after base64url encoding).
 	entropyBytes = 32
