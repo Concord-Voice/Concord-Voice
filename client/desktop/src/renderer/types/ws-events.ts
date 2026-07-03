@@ -1263,6 +1263,8 @@ export const EntitlementsChangedSchema = z.object({
     maxBannerBytes: z.number().int(),
     allowAnimatedProfile: z.boolean(),
     usernameChangeIntervalSeconds: z.number().int(),
+    maxServersCreated: z.number().int(),
+    messageHistorySearchDays: z.number().int(),
   }),
 });
 

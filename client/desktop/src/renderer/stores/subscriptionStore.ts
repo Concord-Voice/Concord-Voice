@@ -33,6 +33,8 @@ export const FREE_ENTITLEMENT: Entitlement = {
   maxBannerBytes: 5242880,
   allowAnimatedProfile: false,
   usernameChangeIntervalSeconds: 31536000,
+  maxServersCreated: 5,
+  messageHistorySearchDays: 90,
 };
 
 interface SubscriptionState {

@@ -37,17 +37,19 @@ type Handler struct {
 	log         *logger.Logger
 	hub         *websocket.Hub
 	resolver    *rbac.Resolver
+	tiers       entitlements.TierResolver       // user-axis tier resolution (#1555 server-creation cap)
 	serverTiers entitlements.ServerTierResolver // server-axis tier resolution (#1521)
 	store       media.ObjectDeleter             // nil when object storage is not configured
 }
 
 // NewHandler creates a new server handler
-func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, serverTiers entitlements.ServerTierResolver) *Handler {
+func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, tiers entitlements.TierResolver, serverTiers entitlements.ServerTierResolver) *Handler {
 	return &Handler{
 		db:          db,
 		log:         log,
 		hub:         hub,
 		resolver:    resolver,
+		tiers:       tiers,
 		serverTiers: serverTiers,
 	}
 }
@@ -217,6 +219,11 @@ func (h *Handler) CreateServer(c *gin.Context) {
 		return
 	}
 
+	// #1555 server-creation cap: resolve the user's tier before opening the
+	// transaction (the resolver may touch Redis/DB; keep the tx short).
+	// Fail-closed: unknown tier resolves to the free set (cap 5).
+	ent := entitlements.For(h.tiers.GetTier(c.Request.Context(), userID))
+
 	tx, err := h.db.Begin()
 	if err != nil {
 		h.log.Error("Failed to start transaction", "error", err)
@@ -228,6 +235,27 @@ func (h *Handler) CreateServer(c *gin.Context) {
 			h.log.Error("Failed to rollback transaction", "error", rbErr)
 		}
 	}()
+
+	// The cap counts servers currently OWNED (deleting one frees a slot);
+	// negative = unlimited (premium). Count + INSERT run in the same
+	// transaction; the residual concurrent-create race is accepted — the cap
+	// is a product boundary, not a security invariant (#1555 spec).
+	if ent.MaxServersCreated >= 0 {
+		var owned int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM servers WHERE owner_id = $1`, userID).Scan(&owned); err != nil {
+			h.log.Error("Failed to count owned servers", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreate})
+			return
+		}
+		if owned >= ent.MaxServersCreated {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "Server limit reached",
+				"code":  "server_cap_reached",
+				"limit": ent.MaxServersCreated,
+			})
+			return
+		}
+	}
 
 	serverID := uuid.New().String()
 	server := models.Server{

@@ -1216,6 +1216,8 @@ const validEntitlements = {
     maxBannerBytes: 5242880,
     allowAnimatedProfile: false,
     usernameChangeIntervalSeconds: 31536000,
+    maxServersCreated: 5,
+    messageHistorySearchDays: 90,
   },
 };
 
@@ -1232,6 +1234,11 @@ describe('EntitlementsChangedSchema', () => {
     expect(
       EntitlementsChangedSchema.safeParse({ ...validEntitlements, type: 'nope' }).success
     ).toBe(false);
+  });
+  it('rejects when the #1555 gate fields are missing (DTO lockstep)', () => {
+    const { maxServersCreated, messageHistorySearchDays, ...rest } = validEntitlements.data;
+    const bad = { type: 'entitlements_changed', data: rest };
+    expect(EntitlementsChangedSchema.safeParse(bad).success).toBe(false);
   });
 });
 

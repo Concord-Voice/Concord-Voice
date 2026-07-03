@@ -206,10 +206,10 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	serverEntCache := entitlements.NewServerCacheForInstance(redis, db, cfg.InstanceType)
 	sessionsHandler := sessions.NewHandler(db, redis, log, hub, mfaHandler)
 	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache)
-	serversHandler := servers.NewHandler(db, log, hub, rbacResolver, serverEntCache)
+	serversHandler := servers.NewHandler(db, log, hub, rbacResolver, entCache, serverEntCache)
 	channelsHandler := channels.NewHandler(db, log, hub, rbacResolver, redis, serverEntCache)
 	membersHandler := members.NewHandler(db, log, redis, hub, rbacResolver, auditWriter)
-	messagesHandler := messages.NewHandler(db, log, hub, rbacResolver)
+	messagesHandler := messages.NewHandler(db, log, hub, rbacResolver, entCache)
 	invitesHandler := invites.NewHandler(db, log, hub, rbacResolver)
 	voiceHandler := voice.NewHandler(voice.HandlerDeps{
 		DB:          db,

@@ -31,6 +31,8 @@ type EntitlementDTO struct {
 	MaxBannerBytes                int64    `json:"maxBannerBytes"`
 	AllowAnimatedProfile          bool     `json:"allowAnimatedProfile"`
 	UsernameChangeIntervalSeconds int64    `json:"usernameChangeIntervalSeconds"`
+	MaxServersCreated             int      `json:"maxServersCreated"`
+	MessageHistorySearchDays      int      `json:"messageHistorySearchDays"`
 }
 
 // ToDTO maps the internal capability set to its wire shape. Pure (no I/O).
@@ -54,6 +56,8 @@ func ToDTO(e Entitlement) EntitlementDTO {
 		MaxBannerBytes:                e.MaxBannerBytes,
 		AllowAnimatedProfile:          e.AllowAnimatedProfile,
 		UsernameChangeIntervalSeconds: int64(e.UsernameChangeInterval / time.Second),
+		MaxServersCreated:             e.MaxServersCreated,
+		MessageHistorySearchDays:      e.MessageHistorySearchDays,
 	}
 }
 

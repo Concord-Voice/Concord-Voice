@@ -28,7 +28,7 @@ func newReactionHelperHandler(t *testing.T) *Handler {
 	require.NoError(t, db.Ping())
 	t.Cleanup(func() { _ = db.Close() })
 
-	return NewHandler(db, logger.New("test"), nil, nil)
+	return NewHandler(db, logger.New("test"), nil, nil, nil)
 }
 
 func TestReactionHelpersHandleDatabaseErrors(t *testing.T) {

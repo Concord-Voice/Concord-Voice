@@ -18,6 +18,8 @@ func TestToDTO_FreeTier_MapsAllFieldsAndDurationToSeconds(t *testing.T) {
 	assert.Equal(t, 8, dto.MaxAudioLastN)
 	assert.Equal(t, 5120, dto.MaxMessageChars)
 	assert.Equal(t, int64(33554432), dto.MaxAttachmentBytes)
+	assert.Equal(t, 5, dto.MaxServersCreated)
+	assert.Equal(t, 90, dto.MessageHistorySearchDays)
 	// 365 days in seconds
 	assert.Equal(t, int64(31536000), dto.UsernameChangeIntervalSeconds)
 }
@@ -28,6 +30,8 @@ func TestToDTO_PremiumTier(t *testing.T) {
 	assert.True(t, dto.AllowMusicMode)
 	assert.Equal(t, 16, dto.MaxAudioLastN)
 	assert.Equal(t, int64(268435456), dto.MaxAttachmentBytes)
+	assert.Equal(t, entitlements.ServerLimitUnlimited, dto.MaxServersCreated, "Supersonic: no cap on server creation")
+	assert.Equal(t, 180, dto.MessageHistorySearchDays)
 	assert.Equal(t, int64(91*24*3600), dto.UsernameChangeIntervalSeconds)
 }
 
@@ -41,16 +45,17 @@ func TestToDTO_JSONUsesCamelCaseKeys(t *testing.T) {
 		"maxAudioLastN", "maxVideoHeight", "maxVideoFps", "maxVideoPixelRate", "maxManualBitrateBps",
 		"maxWebcamPublishers", "maxScreensharePublishers", "maxMessageChars", "maxAttachmentBytes",
 		"maxAvatarBytes", "maxBannerBytes", "allowAnimatedProfile", "usernameChangeIntervalSeconds",
+		"maxServersCreated", "messageHistorySearchDays",
 	} {
 		_, ok := m[k]
 		assert.Truef(t, ok, "missing wire key %q", k)
 	}
-	assert.Len(t, m, 18, "DTO must serialize exactly 18 keys")
+	assert.Len(t, m, 20, "DTO must serialize exactly 20 keys")
 }
 
 func TestDTOToMap_RoundTripsKeys(t *testing.T) {
 	m, err := entitlements.DTOToMap(entitlements.ToDTO(entitlements.For(entitlements.TierPremium)))
 	require.NoError(t, err)
 	assert.Equal(t, "premium", m["tier"])
-	assert.Len(t, m, 18)
+	assert.Len(t, m, 20)
 }

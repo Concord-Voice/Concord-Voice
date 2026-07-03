@@ -84,6 +84,18 @@ func TestUploadValues_PricingConformance(t *testing.T) {
 	assert.Equal(t, int64(268_435_456), entitlements.For(entitlements.TierPremium).MaxAttachmentBytes)
 }
 
+// #1555 gates: server-creation cap + search-depth. Pricing-pinned (Sonic "up to
+// five servers" / Supersonic "no cap"); free search depth 90d is the founder
+// decision of 2026-07-03, premium 180d is page-pinned.
+func TestServerCapAndSearchDepthValues(t *testing.T) {
+	free := entitlements.For(entitlements.TierFree)
+	premium := entitlements.For(entitlements.TierPremium)
+	assert.Equal(t, 5, free.MaxServersCreated)
+	assert.Equal(t, entitlements.ServerLimitUnlimited, premium.MaxServersCreated, "Supersonic: no cap on server creation")
+	assert.Equal(t, 90, free.MessageHistorySearchDays)
+	assert.Equal(t, 180, premium.MessageHistorySearchDays)
+}
+
 func TestEffectiveAttachmentBytes(t *testing.T) {
 	free := entitlements.For(entitlements.TierFree)
 	premium := entitlements.For(entitlements.TierPremium)

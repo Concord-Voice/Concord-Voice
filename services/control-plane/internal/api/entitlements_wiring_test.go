@@ -35,7 +35,7 @@ func (r *recordingBroadcaster) BroadcastToUser(id uuid.UUID, msg websocket.Outgo
 
 // TestEntitlementNotifier_BroadcastEntitlements locks the live-update wire
 // contract: the literal "entitlements_changed" type string (the discriminator
-// the client's EntitlementsChangedSchema keys on) and the full 18-key camelCase
+// the client's EntitlementsChangedSchema keys on) and the full 20-key camelCase
 // DTO payload. A typo in the type string or wrong Data wrapping would silently
 // break the entire live-update path with no other test catching it.
 func TestEntitlementNotifier_BroadcastEntitlements(t *testing.T) {
@@ -50,8 +50,8 @@ func TestEntitlementNotifier_BroadcastEntitlements(t *testing.T) {
 	assert.Equal(t, uid, b.userID)
 	// The literal discriminator the client zod schema matches on.
 	assert.Equal(t, "entitlements_changed", b.msg.Type)
-	// The full EntitlementDTO is forwarded as the WS payload (18 camelCase keys).
-	require.Len(t, b.msg.Data, 18)
+	// The full EntitlementDTO is forwarded as the WS payload (20 camelCase keys).
+	require.Len(t, b.msg.Data, 20)
 	assert.Equal(t, "premium", b.msg.Data["tier"])
 	assert.Contains(t, b.msg.Data, "maxMessageChars")
 	assert.Contains(t, b.msg.Data, "usernameChangeIntervalSeconds")

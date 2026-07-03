@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/klipy"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
@@ -56,15 +57,17 @@ type Handler struct {
 	log      *logger.Logger
 	hub      *websocket.Hub
 	resolver *rbac.Resolver
+	tiers    entitlements.TierResolver // user-axis tier resolution (#1555 search-depth gate)
 }
 
 // NewHandler creates a new message handler
-func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver) *Handler {
+func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, tiers entitlements.TierResolver) *Handler {
 	return &Handler{
 		db:       db,
 		log:      log,
 		hub:      hub,
 		resolver: resolver,
+		tiers:    tiers,
 	}
 }
 
@@ -182,7 +185,18 @@ func (h *Handler) GetMessagesBulk(c *gin.Context) {
 		return
 	}
 
-	messages, err := h.queryMessages(channelID, before, limit)
+	// #1555 search-depth gate: bound the backfill window by the requesting
+	// user's entitlement (free 90d / premium 180d; negative = unlimited).
+	// This bounds ONLY the bulk backfill path — history ACCESS (GetMessages)
+	// is never gated (privacy stance; E2EE search is client-side).
+	ent := entitlements.For(h.tiers.GetTier(c.Request.Context(), userID))
+	var cutoff *time.Time
+	if d := ent.MessageHistorySearchDays; d >= 0 {
+		t := time.Now().UTC().AddDate(0, 0, -d)
+		cutoff = &t
+	}
+
+	messages, err := h.queryMessagesBounded(channelID, before, limit, cutoff)
 	if err != nil {
 		h.log.Error("Failed to query messages (bulk)", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchMessages})
@@ -191,10 +205,16 @@ func (h *Handler) GetMessagesBulk(c *gin.Context) {
 
 	h.enrichMessages(messages, userID)
 
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"messages": messages,
 		"count":    len(messages),
-	})
+	}
+	if cutoff != nil {
+		// Self-describing contract: tell the client how deep the backfill
+		// reached so search UX can surface the bound. Omitted when unlimited.
+		resp["search_depth_days"] = ent.MessageHistorySearchDays
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // enrichMessages batch-loads reactions and replied-to summaries onto messages (non-fatal on failure).
@@ -289,37 +309,47 @@ func (h *Handler) GetMessages(c *gin.Context) {
 	})
 }
 
-// queryMessages fetches messages for a channel with optional cursor-based pagination.
+// queryMessages fetches messages for a channel with optional cursor-based
+// pagination. It delegates to queryMessagesBounded with no time bound, so the
+// non-bulk history paths (GetMessages — never depth-gated, privacy stance) are
+// provably unchanged by the #1555 search-depth gate.
 func (h *Handler) queryMessages(channelID, before string, limit int) ([]models.MessageWithUser, error) {
-	var query string
-	var args []interface{}
+	return h.queryMessagesBounded(channelID, before, limit, nil)
+}
 
-	if before != "" {
-		query = `
-			SELECT m.id, m.channel_id, m.user_id, m.content, COALESCE(m.key_version, 1),
-			       m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.created_at, m.updated_at,
-			       u.username, u.display_name, u.avatar_url
-			FROM messages m
-			INNER JOIN users u ON m.user_id = u.id
-			WHERE m.channel_id = $1
-			  AND m.created_at < (SELECT created_at FROM messages WHERE id = $2)
-			ORDER BY m.created_at DESC
-			LIMIT $3
-		`
-		args = []interface{}{channelID, before, limit}
-	} else {
-		query = `
-			SELECT m.id, m.channel_id, m.user_id, m.content, COALESCE(m.key_version, 1),
-			       m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.created_at, m.updated_at,
-			       u.username, u.display_name, u.avatar_url
-			FROM messages m
-			INNER JOIN users u ON m.user_id = u.id
-			WHERE m.channel_id = $1
-			ORDER BY m.created_at DESC
-			LIMIT $2
-		`
-		args = []interface{}{channelID, limit}
+// queryMessagesBounded fetches messages for a channel with optional
+// cursor-based pagination and an optional lower created_at bound (inclusive).
+// A nil cutoff means unbounded. Placeholders are fixed literals ($1 channel,
+// $2 limit, $3/$4 the optional arms in args order) — every operand is a
+// constant string, every value is parameterized (no interpolation).
+func (h *Handler) queryMessagesBounded(channelID, before string, limit int, cutoff *time.Time) ([]models.MessageWithUser, error) {
+	query := `
+		SELECT m.id, m.channel_id, m.user_id, m.content, COALESCE(m.key_version, 1),
+		       m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.created_at, m.updated_at,
+		       u.username, u.display_name, u.avatar_url
+		FROM messages m
+		INNER JOIN users u ON m.user_id = u.id
+		WHERE m.channel_id = $1`
+	args := []interface{}{channelID, limit}
+
+	switch {
+	case before != "" && cutoff != nil:
+		query += `
+		  AND m.created_at < (SELECT created_at FROM messages WHERE id = $3)
+		  AND m.created_at >= $4`
+		args = append(args, before, *cutoff)
+	case before != "":
+		query += `
+		  AND m.created_at < (SELECT created_at FROM messages WHERE id = $3)`
+		args = append(args, before)
+	case cutoff != nil:
+		query += `
+		  AND m.created_at >= $3`
+		args = append(args, *cutoff)
 	}
+	query += `
+		ORDER BY m.created_at DESC
+		LIMIT $2`
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {

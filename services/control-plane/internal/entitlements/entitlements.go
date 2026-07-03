@@ -53,6 +53,14 @@ type Entitlement struct {
 
 	// Account (Class 1 — server-enforced).
 	UsernameChangeInterval time.Duration
+	// MaxServersCreated caps servers currently OWNED (deleting one frees a
+	// slot). Negative = unlimited (ServerLimitUnlimited). Enforced at
+	// CreateServer (#1555).
+	MaxServersCreated int
+	// MessageHistorySearchDays bounds the search-BACKFILL window (bulk fetch
+	// path only — GET /channels/:id/messages/bulk). History ACCESS is never
+	// gated (privacy stance; E2EE search is client-side). Negative = unlimited.
+	MessageHistorySearchDays int
 }
 
 // freeEntitlement and premiumEntitlement are the ONE definition of the limits.
@@ -76,6 +84,8 @@ var (
 		MaxBannerBytes:           5_242_880,  // 5 MiB
 		AllowAnimatedProfile:     false,
 		UsernameChangeInterval:   365 * 24 * time.Hour,
+		MaxServersCreated:        5,
+		MessageHistorySearchDays: 90,
 	}
 
 	premiumEntitlement = Entitlement{
@@ -97,6 +107,8 @@ var (
 		MaxBannerBytes:           8_388_608,   // 8 MiB
 		AllowAnimatedProfile:     true,
 		UsernameChangeInterval:   91 * 24 * time.Hour,
+		MaxServersCreated:        ServerLimitUnlimited,
+		MessageHistorySearchDays: 180,
 	}
 )
 
