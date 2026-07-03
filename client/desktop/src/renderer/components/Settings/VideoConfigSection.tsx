@@ -19,6 +19,7 @@ import { useDraftVideoSetting, setDraftVideoSetting } from '../../hooks/useDraft
 import { useEntitlement } from '../../hooks/useEntitlement';
 import { useGateActivation } from '../../hooks/useGateActivation';
 import { nativeExceedsFree } from '../../utils/nativeExceedsFree';
+import { videoLimitsFromEntitlement, type VideoAxisLimit } from '../../utils/videoLimits';
 import PremiumChip from '../common/PremiumChip';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
@@ -178,13 +179,6 @@ function isEfficientCodec(codec: string): boolean {
   return EFFICIENT_CODEC_TOKENS.some((token) => codec.includes(token));
 }
 
-/** The free-tier video ceilings consumed by the L2 preset-lock helpers. */
-interface FreeVideoCaps {
-  maxVideoHeight: number;
-  maxVideoFps: number;
-  maxVideoPixelRate: number;
-}
-
 /** Resolve the pixel dimensions for a screen-share resolution selection. Accepts
  *  either a literal `WIDTHxHEIGHT` string or a named preset key. */
 function resolveScreenResolution(
@@ -223,28 +217,23 @@ function computeRecommendedBitrate(args: {
   return Math.round(bps / 100_000) * 100_000;
 }
 
-/** Does a camera preset exceed any free video ceiling (height/fps/pixel-rate)?
+/** Does a camera preset exceed the CAMERA-axis video ceiling (height/fps, #1602)?
  *  System Default (0/0) and unknown presets never exceed. Pure over caps. */
-function presetExceedsFreeCaps(key: string, caps: FreeVideoCaps): boolean {
+function presetExceedsFreeCaps(key: string, camera: VideoAxisLimit): boolean {
   const preset = VIDEO_QUALITY_PRESETS[key];
   if (!preset) return false;
-  const pixelRate = preset.width * preset.height * preset.frameRate;
-  return (
-    preset.height > caps.maxVideoHeight ||
-    preset.frameRate > caps.maxVideoFps ||
-    pixelRate > caps.maxVideoPixelRate
-  );
+  return preset.height > camera.height || preset.frameRate > camera.fps;
 }
 
-/** Highest free camera preset (largest pixel-count within caps), falling back to
- *  System Default. Pure over caps; mirrors clampToFreeTier's resolver. */
-function resolveHighestFreeCameraPreset(caps: FreeVideoCaps): string {
+/** Highest free camera preset (largest pixel-count within the CAMERA axis),
+ *  falling back to System Default. Pure over caps; mirrors clampToFreeTier's resolver. */
+function resolveHighestFreeCameraPreset(camera: VideoAxisLimit): string {
   let best = 'system';
   let bestScore = -1;
   for (const [key, preset] of Object.entries(VIDEO_QUALITY_PRESETS)) {
     // Reuse the lock predicate so the snap-back can never land on a preset the
-    // lock marks premium (e.g. 1080p60, which exceeds the free pixel-rate cap).
-    if (presetExceedsFreeCaps(key, caps)) continue;
+    // lock marks premium (e.g. 1080p60, which exceeds the free camera height).
+    if (presetExceedsFreeCaps(key, camera)) continue;
     const score = preset.height * preset.width * preset.frameRate;
     if (score > bestScore) {
       bestScore = score;
@@ -322,6 +311,22 @@ function buildFrameRateOptions(args: {
   ];
 }
 
+/** Resolve a manual-bitrate slider's UI ceiling from an axis bitrate cap (bps).
+ *  A native/uncapped axis (Infinity ceiling) uses the absolute UI max rather than
+ *  a ∞ slider. `isCapped` (whether to show the premium upsell ghost-zone) is
+ *  driven by tier, NOT by the axis value — a premium user at their finite axis
+ *  ceiling must NOT see an upsell. Pure — mirrors the L5 spec (#1602). */
+function deriveBitrateSlider(
+  axisBitrateBps: number,
+  absoluteMaxMbps: number,
+  isTopTier: boolean
+): { maxMbps: number; isCapped: boolean } {
+  const axisMbps = axisBitrateBps / 1_000_000;
+  const maxMbps = Math.min(axisMbps, absoluteMaxMbps);
+  // Show the ghost-zone only for a non-top tier whose axis sits below the UI max.
+  return { maxMbps, isCapped: !isTopTier && axisMbps < absoluteMaxMbps };
+}
+
 // ─── Video Configuration Section ────────────────────────────────────────────
 
 const VideoConfigSection: React.FC = () => {
@@ -334,6 +339,7 @@ const VideoConfigSection: React.FC = () => {
   const systemHdr = useVideoSettingsStore((s) => s.systemHdr);
 
   const cameraPreset = useDraftVideoSetting('cameraPreset');
+  const cameraBitrate = useDraftVideoSetting('cameraBitrate');
   const screenResolution = useDraftVideoSetting('screenResolution');
   const screenFrameRate = useDraftVideoSetting('screenFrameRate');
   const screenContentType = useDraftVideoSetting('screenContentType');
@@ -347,16 +353,24 @@ const VideoConfigSection: React.FC = () => {
   const supportSvc = useDraftVideoSetting('supportSvc');
   const supportSimulcast = useDraftVideoSetting('supportSimulcast');
 
-  // Premium entitlement caps (#1301):
-  //  - L2: camera-preset resolution/fps options above the free ceilings carry a
-  //    🔒 marker and snap back to the highest free preset.
-  //  - L5: the manual screen-share bitrate slider is fenced at the free cap.
-  //  - L6: device-derived resolution/fps option lists are clamped to the free
-  //    ceiling, with a "your device supports more" note when native exceeds it.
+  // Premium entitlement caps (#1301 / split axes #1602):
+  //  - L2: camera-preset resolution/fps options above the CAMERA-axis ceiling
+  //    carry a 🔒 marker and snap back to the highest free preset.
+  //  - L5: the manual screen-share bitrate slider is fenced at the STREAM-axis
+  //    ceiling; the manual camera bitrate slider at the CAMERA-axis ceiling.
+  //  - L6: device-derived screen-share resolution/fps option lists are clamped to
+  //    the STREAM axis, with a "your device supports more" note when native exceeds.
+  // All ceilings derive from the entitlement (no hardcoded tier numbers); see the
+  // #1602 matrix in [internal]specs/2026-07-03-1602-av-settings-gating-design.md.
   const entitlement = useEntitlement((e) => e);
-  const { maxVideoHeight, maxVideoFps, maxVideoPixelRate, maxManualBitrateBps } = entitlement;
+  // Server video floor (#1522) is not surfaced client-side yet; the stream axis is
+  // the personal ceiling only and the media-plane enforces the floor regardless.
+  const videoLimits = useMemo(() => videoLimitsFromEntitlement(entitlement), [entitlement]);
+  const streamLimit = videoLimits.stream;
+  const cameraLimit = videoLimits.camera;
   const cameraPresetGate = useGateActivation('video-quality');
   const bitrateGate = useGateActivation('manual-bitrate');
+  const cameraBitrateGate = useGateActivation('manual-bitrate');
   const [cameraPresetLockHinted, setCameraPresetLockHinted] = useState(false);
 
   const [displayInfo, setDisplayInfo] = useState<
@@ -428,54 +442,58 @@ const VideoConfigSection: React.FC = () => {
 
   const clampedRecommended = Math.max(1_500_000, Math.min(30_000_000, recommendedBitrate));
 
-  // ── L2: camera-preset resolution/fps lock ──────────────────────────────
-  // The free caps drive both the lock predicate and the snap-back resolver; the
-  // pure helpers (presetExceedsFreeCaps / resolveHighestFreeCameraPreset) close
-  // over this object so the component body stays flat.
-  const freeVideoCaps = useMemo<FreeVideoCaps>(
-    () => ({ maxVideoHeight, maxVideoFps, maxVideoPixelRate }),
-    [maxVideoHeight, maxVideoFps, maxVideoPixelRate]
-  );
-
+  // ── L2: camera-preset resolution/fps lock (CAMERA axis, #1602) ──────────
+  // The camera-axis ceiling drives both the lock predicate and the snap-back
+  // resolver; the pure helpers close over `cameraLimit` so the body stays flat.
   const presetExceedsFree = useCallback(
-    (key: string): boolean => presetExceedsFreeCaps(key, freeVideoCaps),
-    [freeVideoCaps]
+    (key: string): boolean => presetExceedsFreeCaps(key, cameraLimit),
+    [cameraLimit]
   );
 
   const handleCameraPresetChange = useCallback(
     (key: string): void => {
-      if (presetExceedsFreeCaps(key, freeVideoCaps)) {
+      if (presetExceedsFreeCaps(key, cameraLimit)) {
         // L2 snap-back: a locked preset never reaches the store. Clamp to the
         // highest free preset and reveal the chip (no mid-action modal).
-        setDraftVideoSetting('cameraPreset', resolveHighestFreeCameraPreset(freeVideoCaps));
+        setDraftVideoSetting('cameraPreset', resolveHighestFreeCameraPreset(cameraLimit));
         setCameraPresetLockHinted(true);
         return;
       }
       setCameraPresetLockHinted(false);
       setDraftVideoSetting('cameraPreset', key);
     },
-    [freeVideoCaps]
+    [cameraLimit]
   );
 
   // ── L6: device-derived resolution / frame-rate native-exceeds guard ─────
   // The screen-share Resolution + Frame Rate option lists are derived from the
-  // detected display. Clamp the offered ceiling to the free caps and surface a
-  // "your device supports more" note when the device genuinely exceeds free.
+  // detected display. Clamp the offered ceiling to the STREAM axis and surface a
+  // "your device supports more" note when the device genuinely exceeds it.
   const nativeGuard = nativeExceedsFree(
     { nativeHeight: bestDisplay.height, nativeFps: maxRefreshRate },
-    entitlement
+    streamLimit
   );
 
-  // ── L5: manual screen-share bitrate clamp ──────────────────────────────
-  const FREE_BITRATE_CAP_MBPS = maxManualBitrateBps / 1_000_000; // 5.0 for free
+  // ── L5: manual bitrate clamps — STREAM (screen-share) + CAMERA sliders ──
+  // Each slider fences its live value at its axis ceiling. A native/uncapped
+  // premium axis (Infinity) uses the absolute UI max instead of a ∞ slider.
   const ABSOLUTE_BITRATE_MAX_MBPS = 30;
-  // The slider's effective ceiling: the free cap when not entitled (i.e. when
-  // the free cap is below the absolute max), else the absolute max.
-  const bitrateSliderMaxMbps = Math.min(FREE_BITRATE_CAP_MBPS, ABSOLUTE_BITRATE_MAX_MBPS);
-  const bitrateIsCapped = FREE_BITRATE_CAP_MBPS < ABSOLUTE_BITRATE_MAX_MBPS;
-  // When toggling automatic OFF, seed the manual cap at the recommended value
-  // but never above the free ceiling (so a free user starts within range).
-  const initialManualBitrate = Math.min(clampedRecommended, maxManualBitrateBps);
+  const isTopTier = entitlement.tier === 'premium';
+  const streamBitrate = deriveBitrateSlider(
+    streamLimit.bitrate,
+    ABSOLUTE_BITRATE_MAX_MBPS,
+    isTopTier
+  );
+  const cameraBitrateSlider = deriveBitrateSlider(
+    cameraLimit.bitrate,
+    ABSOLUTE_BITRATE_MAX_MBPS,
+    isTopTier
+  );
+  // When toggling automatic OFF, seed the manual cap at the recommended value but
+  // never above the axis ceiling (so a user starts within the live range).
+  const initialManualBitrate = Math.min(clampedRecommended, streamLimit.bitrate);
+  // Camera has no per-resolution recommendation heuristic; seed at its ceiling.
+  const initialCameraBitrate = cameraLimit.bitrate;
 
   return (
     <CollapsibleSection id="section-video-screen" title="Video Configuration">
@@ -535,7 +553,7 @@ const VideoConfigSection: React.FC = () => {
         </div>
         <CustomSelect
           className="settings-select"
-          // L2: premium presets (above the free height/fps/pixel-rate ceilings)
+          // L2: premium presets (above the CAMERA-axis height/fps ceiling, #1602)
           // carry a trailing \ud83d\udd12 + "Premium" marker; the select stays usable and
           // selecting one snaps back to the highest free preset. The per-option
           // marker logic lives in the pure buildCameraPresetOptions helper.
@@ -544,6 +562,80 @@ const VideoConfigSection: React.FC = () => {
           onChange={handleCameraPresetChange}
         />
       </div>
+
+      {/* ── Camera Bitrate (split camera axis, #1602) ── */}
+      <div className="settings-row">
+        <div className="settings-row-info">
+          <span className="settings-row-label">Automatic Camera Bitrate</span>
+          <span className="settings-row-hint">
+            {cameraBitrate === 0
+              ? 'Enabled. Concord Voice adjusts your camera bitrate based on resolution, frame rate, and codec.'
+              : `Disabled. Using a fixed ${(cameraBitrate / 1_000_000).toFixed(1)} Mbps camera cap.`}
+          </span>
+        </div>
+        <ToggleSwitch
+          checked={cameraBitrate === 0}
+          onChange={(v) =>
+            // Seed the manual camera cap at the camera-axis ceiling when disabling
+            // automatic, so a user starts inside the live range.
+            setDraftVideoSetting('cameraBitrate', v ? 0 : initialCameraBitrate)
+          }
+        />
+      </div>
+      {cameraBitrate !== 0 && (
+        <div className="settings-volume-row">
+          <div className="settings-row-info">
+            <span className="settings-volume-label">Camera Cap</span>
+            <span className="settings-row-hint">
+              Sets the maximum bitrate cap for your camera (the camera axis). Right (
+              {cameraBitrateSlider.maxMbps} Mbps) for high-motion video.
+            </span>
+          </div>
+          <div className="settings-slider-wrapper">
+            <span className="settings-slider-value">
+              {(cameraBitrate / 1_000_000).toFixed(1)} Mbps
+            </span>
+            {/* L5: the camera slider stays LIVE up to the camera cap; a capped axis
+                shows the premium ghost-zone, and `max` fences the live value. */}
+            <div
+              className={`settings-bitrate-slider-wrap${cameraBitrateSlider.isCapped ? ' capped' : ''}`}
+            >
+              <input
+                type="range"
+                className="settings-volume-slider"
+                min={0.5}
+                max={cameraBitrateSlider.maxMbps}
+                step={0.5}
+                value={Math.min(cameraBitrate / 1_000_000, cameraBitrateSlider.maxMbps)}
+                onChange={(e) =>
+                  setDraftVideoSetting(
+                    'cameraBitrate',
+                    Math.round(
+                      Math.min(Number(e.target.value), cameraBitrateSlider.maxMbps) * 1_000_000
+                    )
+                  )
+                }
+              />
+              {cameraBitrateSlider.isCapped && (
+                <button
+                  type="button"
+                  className="settings-bitrate-ghost-zone"
+                  onClick={cameraBitrateGate.onActivate}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') cameraBitrateGate.onActivate(e);
+                  }}
+                >
+                  <span aria-hidden="true" className="settings-bitrate-ghost-gradient" />
+                  <PremiumChip
+                    label={`beyond ${cameraBitrateSlider.maxMbps} Mbps →`}
+                    id={cameraBitrateGate.describedById}
+                  />
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Screen Share ── */}
       <h3 className="settings-subsection-title">Screen Share</h3>
@@ -1077,37 +1169,39 @@ const VideoConfigSection: React.FC = () => {
           {screenShareBitrate !== 0 && (
             <div className="settings-volume-row">
               <div className="settings-row-info">
-                <span className="settings-volume-label">Cap</span>
+                <span className="settings-volume-label">Screen Share Cap</span>
                 <span className="settings-row-hint">
-                  Sets the maximum bitrate cap for screen sharing. Left (1.5 Mbps) for simple
-                  content. Right ({bitrateSliderMaxMbps} Mbps) for high-motion content.
+                  Sets the maximum bitrate cap for screen sharing (the stream axis). Left (1.5 Mbps)
+                  for simple content. Right ({streamBitrate.maxMbps} Mbps) for high-motion content.
                 </span>
               </div>
               <div className="settings-slider-wrapper">
                 <span className="settings-slider-value">
                   {(screenShareBitrate / 1_000_000).toFixed(1)} Mbps
                 </span>
-                {/* L5: the slider stays LIVE up to the free cap. When capped, a
+                {/* L5: the slider stays LIVE up to the stream cap. When capped, a
                     decorative ghost-zone past the thumb advertises the premium
                     range; the slider's `max` fences the live value at the cap. */}
-                <div className={`settings-bitrate-slider-wrap${bitrateIsCapped ? ' capped' : ''}`}>
+                <div
+                  className={`settings-bitrate-slider-wrap${streamBitrate.isCapped ? ' capped' : ''}`}
+                >
                   <input
                     type="range"
                     className="settings-volume-slider"
                     min={1.5}
-                    max={bitrateSliderMaxMbps}
+                    max={streamBitrate.maxMbps}
                     step={0.5}
-                    value={Math.min(screenShareBitrate / 1_000_000, bitrateSliderMaxMbps)}
+                    value={Math.min(screenShareBitrate / 1_000_000, streamBitrate.maxMbps)}
                     onChange={(e) =>
                       setDraftVideoSetting(
                         'screenShareBitrate',
                         Math.round(
-                          Math.min(Number(e.target.value), bitrateSliderMaxMbps) * 1_000_000
+                          Math.min(Number(e.target.value), streamBitrate.maxMbps) * 1_000_000
                         )
                       )
                     }
                   />
-                  {bitrateIsCapped && (
+                  {streamBitrate.isCapped && (
                     <button
                       type="button"
                       className="settings-bitrate-ghost-zone"
@@ -1118,7 +1212,7 @@ const VideoConfigSection: React.FC = () => {
                     >
                       <span aria-hidden="true" className="settings-bitrate-ghost-gradient" />
                       <PremiumChip
-                        label={`beyond ${bitrateSliderMaxMbps} Mbps →`}
+                        label={`beyond ${streamBitrate.maxMbps} Mbps →`}
                         id={bitrateGate.describedById}
                       />
                     </button>

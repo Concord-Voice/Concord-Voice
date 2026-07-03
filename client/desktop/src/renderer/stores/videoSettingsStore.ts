@@ -79,6 +79,7 @@ export interface VideoSettings {
 
   // Camera
   cameraPreset: string; // Key into VIDEO_QUALITY_PRESETS
+  cameraBitrate: number; // bps, 0 = auto (codec/preset-dependent). Gated on the camera axis (#1602).
   preferredVideoCodec: string | null; // mimeType e.g. "video/VP9"
   cameraPriority: VideoPriority; // DSCP priority for camera traffic
 
@@ -111,6 +112,7 @@ export interface VideoSettings {
 
 interface VideoSettingsState extends VideoSettings {
   setCameraPreset: (preset: string) => void;
+  setCameraBitrate: (bitrate: number) => void;
   setPreferredVideoCodec: (codec: string | null) => void;
   setCameraPriority: (priority: VideoPriority) => void;
   setScreenResolution: (res: string) => void;
@@ -132,6 +134,7 @@ interface VideoSettingsState extends VideoSettings {
 const defaults: VideoSettings = {
   videoAdvancedMode: false,
   cameraPreset: 'system',
+  cameraBitrate: 0, // Auto
   preferredVideoCodec: null,
   cameraPriority: 'medium',
   screenResolution: 'source',
@@ -158,6 +161,7 @@ export const useVideoSettingsStore = wrapStore(
 
         setVideoAdvancedMode: (videoAdvancedMode) => set({ videoAdvancedMode }),
         setCameraPreset: (cameraPreset) => set({ cameraPreset }),
+        setCameraBitrate: (cameraBitrate) => set({ cameraBitrate }),
         setPreferredVideoCodec: (preferredVideoCodec) => set({ preferredVideoCodec }),
         setCameraPriority: (cameraPriority) => set({ cameraPriority }),
         setScreenResolution: (screenResolution) => set({ screenResolution }),

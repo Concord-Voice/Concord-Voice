@@ -12417,14 +12417,24 @@ components:
         maxAudioLastN:
           type: integer
           description: Per-room audio last-N active-speaker forwarding cap (room-owner-scoped)
-        maxVideoHeight:
+        streamMaxHeight:
           type: integer
-        maxVideoFps:
+          description: Screen-share max height in pixels; negative = native/uncapped (premium).
+        streamMaxFps:
           type: integer
-        maxVideoPixelRate:
+          description: Screen-share max frame rate; negative = native/uncapped.
+        streamMaxBitrate:
           type: integer
-          format: int64
-          description: width*height*fps ceiling
+          description: Screen-share max bitrate in bps (free 5000000 / premium 20000000).
+        cameraMaxHeight:
+          type: integer
+          description: Webcam max height in pixels; negative = native/uncapped (premium).
+        cameraMaxFps:
+          type: integer
+          description: Webcam max frame rate; negative = native/uncapped.
+        cameraMaxBitrate:
+          type: integer
+          description: Webcam max bitrate in bps (free 2500000 / premium 6000000).
         maxManualBitrateBps:
           type: integer
         maxWebcamPublishers:
@@ -12450,6 +12460,12 @@ components:
           type: integer
           format: int64
           description: Minimum interval between username changes, in seconds
+        maxServersCreated:
+          type: integer
+          description: Max servers a user may own; negative = unlimited (premium).
+        messageHistorySearchDays:
+          type: integer
+          description: Search-backfill window in days (free 90 / premium 180).
       required:
       - tier
       - allowCustomScheme
@@ -12457,9 +12473,12 @@ components:
       - minPtimeMs
       - allowMusicMode
       - maxAudioLastN
-      - maxVideoHeight
-      - maxVideoFps
-      - maxVideoPixelRate
+      - streamMaxHeight
+      - streamMaxFps
+      - streamMaxBitrate
+      - cameraMaxHeight
+      - cameraMaxFps
+      - cameraMaxBitrate
       - maxManualBitrateBps
       - maxWebcamPublishers
       - maxScreensharePublishers
@@ -12469,6 +12488,8 @@ components:
       - maxBannerBytes
       - allowAnimatedProfile
       - usernameChangeIntervalSeconds
+      - maxServersCreated
+      - messageHistorySearchDays
     Error:
       type: object
       properties:

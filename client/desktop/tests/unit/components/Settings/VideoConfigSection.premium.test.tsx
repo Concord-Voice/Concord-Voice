@@ -3,6 +3,7 @@ import { vi } from 'vitest';
 // ─── Default draft video settings ───────────────────────────────────────────
 const defaultVideoSettings: Record<string, unknown> = {
   cameraPreset: 'system',
+  cameraBitrate: 0,
   screenResolution: 'source',
   screenFrameRate: 0,
   screenContentType: 'auto',
@@ -41,11 +42,13 @@ vi.mock('@/renderer/stores/videoSettingsStore', () => ({
     { getState: vi.fn(() => ({ setVideoAdvancedMode: vi.fn() })) }
   ),
   // Real-shaped presets with height/width/frameRate so the L2 cap predicate
-  // works. Free floor: maxVideoPixelRate 62208000 (= 1920×1080×30), so 1080p30
-  // is the highest free preset; 1080p60 exceeds the pixel-rate cap and is paid.
+  // works. Free CAMERA axis (#1602): 720p60, so 720p60 is the highest free camera
+  // preset; 720p30 is free; 1080p30/1080p60/1440p/4K all exceed the camera height
+  // (720) and are paid.
   VIDEO_QUALITY_PRESETS: {
     system: { label: 'System Default', width: 0, height: 0, frameRate: 0 },
     '720p30': { label: '720p 30fps', width: 1280, height: 720, frameRate: 30 },
+    '720p60': { label: '720p 60fps', width: 1280, height: 720, frameRate: 60 },
     '1080p30': { label: '1080p 30fps', width: 1920, height: 1080, frameRate: 30 },
     '1080p60': { label: '1080p 60fps', width: 1920, height: 1080, frameRate: 60 },
     '1440p60': { label: '1440p 60fps', width: 2560, height: 1440, frameRate: 60 },
@@ -73,14 +76,17 @@ vi.mock('@/renderer/services/mediaCapabilities', () => ({
 
 // Real CustomSelect (native <select>) so option labels + onChange are testable.
 
-// FREE entitlement floor: 1080p / 60fps / 5 Mbps.
+// FREE entitlement floor (split axes, #1602): stream 1080p30/≤5M, camera 720p60/≤2.5M.
 const entitlementOverrides: Record<string, unknown> = {};
 function freeEntitlement() {
   return {
     tier: 'free',
-    maxVideoHeight: 1080,
-    maxVideoFps: 60,
-    maxVideoPixelRate: 62208000,
+    streamMaxHeight: 1080,
+    streamMaxFps: 30,
+    streamMaxBitrate: 5000000,
+    cameraMaxHeight: 720,
+    cameraMaxFps: 60,
+    cameraMaxBitrate: 2500000,
     maxManualBitrateBps: 5000000,
     ...entitlementOverrides,
   };
@@ -118,6 +124,7 @@ beforeEach(() => {
   // Reset draft snapshot to baseline.
   Object.assign(defaultVideoSettings, {
     cameraPreset: 'system',
+    cameraBitrate: 0,
     screenResolution: 'source',
     screenFrameRate: 0,
     screenShareBitrate: 0,
@@ -140,31 +147,28 @@ function cameraPresetSelect(): HTMLSelectElement {
 
 // ─── L2: camera-preset resolution/fps option lock ───────────────────────────
 
-describe('VideoConfigSection — L2 camera-preset lock', () => {
-  it('locked (free): presets above 1080p (1440p/4K) carry the lock marker', () => {
+describe('VideoConfigSection — L2 camera-preset lock (camera axis 720p60, #1602)', () => {
+  it('locked (free): presets above the camera axis (1080p/1440p/4K) carry the lock marker', () => {
     render(<VideoConfigSection />);
     openDetails();
-    expect(
-      (screen.getByRole('option', { name: /1440p/ }) as HTMLOptionElement).textContent
-    ).toContain('Premium');
-    expect((screen.getByRole('option', { name: /4K/ }) as HTMLOptionElement).textContent).toContain(
-      'Premium'
-    );
-  });
-
-  it('locked (free): 1080p30 / 720p / System Default presets are NOT marked premium', () => {
-    render(<VideoConfigSection />);
-    openDetails();
-    // Scope to the Camera Preset select to avoid matching the screen-resolution
-    // "1080p (1920×1080)" option which also contains "1080p".
     const presetOptions = Array.from(cameraPresetSelect().options);
     const findOpt = (re: RegExp) => presetOptions.find((o) => re.test(o.textContent ?? ''))!;
-    expect(findOpt(/1080p 30fps/).textContent).not.toContain('Premium');
-    expect(findOpt(/720p/).textContent).not.toContain('Premium');
+    expect(findOpt(/1080p 30fps/).textContent).toContain('Premium');
+    expect(findOpt(/1440p/).textContent).toContain('Premium');
+    expect(findOpt(/4K/).textContent).toContain('Premium');
+  });
+
+  it('locked (free): 720p30 / 720p60 / System Default presets are NOT marked premium', () => {
+    render(<VideoConfigSection />);
+    openDetails();
+    const presetOptions = Array.from(cameraPresetSelect().options);
+    const findOpt = (re: RegExp) => presetOptions.find((o) => re.test(o.textContent ?? ''))!;
+    expect(findOpt(/720p 30fps/).textContent).not.toContain('Premium');
+    expect(findOpt(/720p 60fps/).textContent).not.toContain('Premium');
     expect(findOpt(/System Default/).textContent).not.toContain('Premium');
   });
 
-  it('locked (free): 1080p60 exceeds the free pixel-rate cap → marked premium', () => {
+  it('locked (free): 1080p60 exceeds the camera height (720) → marked premium', () => {
     render(<VideoConfigSection />);
     openDetails();
     const opt = Array.from(cameraPresetSelect().options).find((o) =>
@@ -173,29 +177,25 @@ describe('VideoConfigSection — L2 camera-preset lock', () => {
     expect(opt.textContent).toContain('Premium');
   });
 
-  it('locked (free): selecting a premium preset snaps back to the highest free preset + chip', () => {
+  it('locked (free): selecting a premium preset snaps back to the highest free camera preset + chip', () => {
     render(<VideoConfigSection />);
     openDetails();
     fireEvent.change(cameraPresetSelect(), { target: { value: '4K60' } });
-    // Highest free preset is 1080p30 (1080p60 exceeds the pixel-rate cap).
-    expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('cameraPreset', '1080p30');
+    // Highest free camera preset is 720p60 (the camera axis is 720p60).
+    expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('cameraPreset', '720p60');
     expect(mockSetDraftVideoSetting).not.toHaveBeenCalledWith('cameraPreset', '4K60');
     expect(screen.getByRole('button', { name: /Premium/ })).toBeInTheDocument();
   });
 
-  it('locked (free): selecting a FREE preset passes through unchanged', () => {
+  it('locked (free): selecting a FREE camera preset passes through unchanged', () => {
     render(<VideoConfigSection />);
     openDetails();
     fireEvent.change(cameraPresetSelect(), { target: { value: '720p30' } });
     expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('cameraPreset', '720p30');
   });
 
-  it('entitled (premium caps): no preset is locked; 4K passes through', () => {
-    setEntitlement({
-      maxVideoHeight: 4320,
-      maxVideoFps: 240,
-      maxVideoPixelRate: Number.MAX_SAFE_INTEGER,
-    });
+  it('entitled (native camera caps): no preset is locked; 4K passes through', () => {
+    setEntitlement({ cameraMaxHeight: -1, cameraMaxFps: -1 });
     render(<VideoConfigSection />);
     openDetails();
     expect(
@@ -241,8 +241,8 @@ describe('VideoConfigSection — L6 native-exceeds guard', () => {
     expect(screen.getByRole('option', { name: '60 FPS' })).toBeInTheDocument();
   });
 
-  it('entitled (premium caps): native-exceeds note hidden; 4K / 120 FPS offered', async () => {
-    setEntitlement({ maxVideoHeight: 4320, maxVideoFps: 240 });
+  it('entitled (native stream caps): native-exceeds note hidden; 4K / 120 FPS offered', async () => {
+    setEntitlement({ streamMaxHeight: -1, streamMaxFps: -1 });
     render(<VideoConfigSection />);
     openDetails();
     await waitFor(() =>
@@ -253,15 +253,15 @@ describe('VideoConfigSection — L6 native-exceeds guard', () => {
   });
 });
 
-// ─── L5: manual screen-share bitrate clamp ──────────────────────────────────
+// ─── L5: manual screen-share (stream) bitrate clamp ─────────────────────────
 
-describe('VideoConfigSection — L5 manual bitrate clamp', () => {
+describe('VideoConfigSection — L5 manual STREAM bitrate clamp', () => {
   beforeEach(() => {
-    videoAdvancedMode = true; // the bitrate slider lives in the advanced section
+    videoAdvancedMode = true; // the screen-share bitrate slider lives in the advanced section
     mockDraft({ screenShareBitrate: 4_000_000 }); // manual cap, within free range
   });
 
-  it('locked (free): the bitrate slider max is fenced at the free cap (5 Mbps)', () => {
+  it('locked (free): the stream bitrate slider max is fenced at the free stream cap (5 Mbps)', () => {
     render(<VideoConfigSection />);
     openDetails();
     const slider = document.querySelector('.settings-volume-slider') as HTMLInputElement;
@@ -272,9 +272,13 @@ describe('VideoConfigSection — L5 manual bitrate clamp', () => {
   it('locked (free): renders the "beyond 5 Mbps" ghost-zone with the lock chip', () => {
     render(<VideoConfigSection />);
     openDetails();
-    expect(document.querySelector('.settings-bitrate-ghost-zone')).toBeInTheDocument();
+    const ghostZone = document.querySelector('.settings-bitrate-ghost-zone') as HTMLElement;
+    expect(ghostZone).toBeInTheDocument();
     expect(screen.getByText(/beyond 5 Mbps/)).toBeInTheDocument();
-    expect(screen.getByLabelText('Premium feature')).toBeInTheDocument();
+    // Scope the lock-glyph check to the ghost-zone: the screen-share Resolution
+    // row also carries a "device supports more" premium chip (native-exceeds L6),
+    // so a document-wide getByLabelText would be ambiguous.
+    expect(ghostZone.querySelector('[aria-label="Premium feature"]')).toBeInTheDocument();
   });
 
   it('locked (free): the slider stays LIVE within range — a free value passes through', () => {
@@ -303,12 +307,55 @@ describe('VideoConfigSection — L5 manual bitrate clamp', () => {
     });
   });
 
-  it('entitled (premium bitrate): the slider max is the absolute 30 Mbps, no ghost-zone', () => {
-    setEntitlement({ maxManualBitrateBps: 30_000_000 });
+  it('entitled (premium tier): the slider max is the premium stream cap (20 Mbps), no ghost-zone', () => {
+    // Premium: tier drives the ghost-zone (not the axis value), so a premium user
+    // at their finite 20 Mbps stream ceiling sees no upsell.
+    setEntitlement({ tier: 'premium', streamMaxBitrate: 20_000_000 });
     render(<VideoConfigSection />);
     openDetails();
     const slider = document.querySelector('.settings-volume-slider') as HTMLInputElement;
-    expect(slider.max).toBe('30');
+    expect(slider.max).toBe('20');
+    expect(document.querySelector('.settings-bitrate-ghost-zone')).not.toBeInTheDocument();
+  });
+});
+
+// ─── L5b: manual CAMERA bitrate clamp (split camera axis, #1602) ─────────────
+
+describe('VideoConfigSection — L5 manual CAMERA bitrate clamp', () => {
+  beforeEach(() => {
+    // The camera bitrate control lives in the (always-visible) Camera section.
+    mockDraft({ cameraBitrate: 2_000_000 }); // manual cap, within free camera range
+  });
+
+  it('locked (free): the camera bitrate slider max is fenced at the free camera cap (2.5 Mbps)', () => {
+    render(<VideoConfigSection />);
+    openDetails();
+    const slider = document.querySelector('.settings-volume-slider') as HTMLInputElement;
+    expect(slider).toBeInTheDocument();
+    expect(slider.max).toBe('2.5');
+  });
+
+  it('locked (free): renders the "beyond 2.5 Mbps" camera ghost-zone with the lock chip', () => {
+    render(<VideoConfigSection />);
+    openDetails();
+    expect(document.querySelector('.settings-bitrate-ghost-zone')).toBeInTheDocument();
+    expect(screen.getByText(/beyond 2.5 Mbps/)).toBeInTheDocument();
+  });
+
+  it('locked (free): a camera value above the cap clamps to the free camera cap', () => {
+    render(<VideoConfigSection />);
+    openDetails();
+    const slider = document.querySelector('.settings-volume-slider') as HTMLInputElement;
+    fireEvent.change(slider, { target: { value: '2.5' } });
+    expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('cameraBitrate', 2_500_000);
+  });
+
+  it('entitled (premium tier): the camera slider max is 6 Mbps, no ghost-zone', () => {
+    setEntitlement({ tier: 'premium', cameraMaxBitrate: 6_000_000 });
+    render(<VideoConfigSection />);
+    openDetails();
+    const slider = document.querySelector('.settings-volume-slider') as HTMLInputElement;
+    expect(slider.max).toBe('6');
     expect(document.querySelector('.settings-bitrate-ghost-zone')).not.toBeInTheDocument();
   });
 });

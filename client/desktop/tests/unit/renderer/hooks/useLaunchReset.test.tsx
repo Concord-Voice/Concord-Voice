@@ -17,9 +17,13 @@ const PREMIUM_ENTITLEMENT: Entitlement = {
   allowCustomScheme: true,
   allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
   allowMusicMode: true,
-  maxVideoHeight: 2160,
-  maxVideoFps: 120,
-  maxManualBitrateBps: 30_000_000,
+  streamMaxHeight: -1,
+  streamMaxFps: -1,
+  streamMaxBitrate: 20_000_000,
+  cameraMaxHeight: -1,
+  cameraMaxFps: -1,
+  cameraMaxBitrate: 6_000_000,
+  maxManualBitrateBps: 20_000_000,
 };
 
 /** Put stores into a custom-theme plus premium-only over-cap state. */

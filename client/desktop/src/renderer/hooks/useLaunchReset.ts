@@ -58,6 +58,7 @@ export function useLaunchReset(): { showResetModal: boolean; acknowledge: () => 
       qualityTier: voice.qualityTier,
       cameraPreset: video.cameraPreset,
       screenShareBitrate: video.screenShareBitrate,
+      cameraBitrate: video.cameraBitrate,
       musicMode: audio.musicMode,
     };
 
@@ -77,6 +78,9 @@ export function useLaunchReset(): { showResetModal: boolean; acknowledge: () => 
     }
     if (clamped.screenShareBitrate !== current.screenShareBitrate) {
       useVideoSettingsStore.getState().setScreenShareBitrate(clamped.screenShareBitrate);
+    }
+    if (clamped.cameraBitrate !== current.cameraBitrate) {
+      useVideoSettingsStore.getState().setCameraBitrate(clamped.cameraBitrate);
     }
     if (clamped.musicMode !== current.musicMode) {
       useAudioSettingsStore.getState().setMusicMode(clamped.musicMode);

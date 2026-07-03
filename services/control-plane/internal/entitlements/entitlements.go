@@ -34,10 +34,22 @@ type Entitlement struct {
 	AllowMusicMode    bool
 	MaxAudioLastN     int // room-owner-scoped; matches media-plane resolveAudioLastN
 
-	// Video (Class 3 — client-enforced + bitrate-backstopped).
-	MaxVideoHeight           int
-	MaxVideoFps              int
-	MaxVideoPixelRate        int64 // width*height*fps ceiling; separates 1080p30/720p60 (free) from 1080p60 (premium)
+	// Video (Class 3 — client-enforced + bitrate-backstopped). The screen-share
+	// (stream) and webcam (camera) axes are split so each carries its own
+	// resolution/fps/bitrate ceiling (see the #1602 matrix). A negative height/fps
+	// is the native/uncapped sentinel (mirrors ServerLimitUnlimited): the client
+	// treats it as "no ceiling". Screen-share may be lifted by the server floor
+	// (#1522, max(personal, ServerVideoFloor)); webcam is personal-tier only.
+	StreamMaxHeight  int // free 1080; premium -1 (native)
+	StreamMaxFps     int // free 30;   premium -1
+	StreamMaxBitrate int // free 5_000_000; premium 20_000_000
+	CameraMaxHeight  int // free 720;  premium -1 (native)
+	CameraMaxFps     int // free 60;   premium -1
+	CameraMaxBitrate int // free 2_500_000; premium 6_000_000
+	// MaxManualBitrateBps is #1300's media_entitlements advisory cap the
+	// media-plane parses at createTransport. It is set to the stream ceiling
+	// (max stream/camera bitrate) so the SFU's single advisory cap never wrongly
+	// clamps a legitimate 20 Mbps screen-share. Kept for wire stability (#1300).
 	MaxManualBitrateBps      int
 	MaxWebcamPublishers      int // room-owner-scoped; matches media-plane resolveVideoPublisherCap
 	MaxScreensharePublishers int // room-owner-scoped; media-plane enforcement shipped with #1542 (resolveScreenProducerCap)
@@ -72,10 +84,13 @@ var (
 		MinPtimeMs:               20,
 		AllowMusicMode:           false,
 		MaxAudioLastN:            8,
-		MaxVideoHeight:           1080,
-		MaxVideoFps:              60,
-		MaxVideoPixelRate:        62_208_000, // 1920*1080*30 (admits 720p60 = 55,296,000)
-		MaxManualBitrateBps:      5_000_000,
+		StreamMaxHeight:          1080,
+		StreamMaxFps:             30,
+		StreamMaxBitrate:         5_000_000,
+		CameraMaxHeight:          720,
+		CameraMaxFps:             60,
+		CameraMaxBitrate:         2_500_000,
+		MaxManualBitrateBps:      5_000_000, // = max(StreamMaxBitrate, CameraMaxBitrate)
 		MaxWebcamPublishers:      8,
 		MaxScreensharePublishers: 1,
 		MaxMessageChars:          5120,
@@ -95,10 +110,13 @@ var (
 		MinPtimeMs:               10,
 		AllowMusicMode:           true,
 		MaxAudioLastN:            16,
-		MaxVideoHeight:           1080,
-		MaxVideoFps:              60,
-		MaxVideoPixelRate:        124_416_000, // 1920*1080*60
-		MaxManualBitrateBps:      10_000_000,
+		StreamMaxHeight:          ServerLimitUnlimited, // native (uncapped)
+		StreamMaxFps:             ServerLimitUnlimited,
+		StreamMaxBitrate:         20_000_000,
+		CameraMaxHeight:          ServerLimitUnlimited, // native (uncapped)
+		CameraMaxFps:             ServerLimitUnlimited,
+		CameraMaxBitrate:         6_000_000,
+		MaxManualBitrateBps:      20_000_000, // = max(StreamMaxBitrate, CameraMaxBitrate)
 		MaxWebcamPublishers:      25,
 		MaxScreensharePublishers: 3,
 		MaxMessageChars:          10240,

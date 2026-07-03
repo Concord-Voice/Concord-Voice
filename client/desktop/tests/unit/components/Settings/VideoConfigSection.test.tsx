@@ -3,6 +3,7 @@ import { vi } from 'vitest';
 // ─── Default draft video settings ───────────────────────────────────────────
 const defaultVideoSettings: Record<string, unknown> = {
   cameraPreset: 'system',
+  cameraBitrate: 0,
   screenResolution: 'source',
   screenFrameRate: 0,
   screenContentType: 'auto',
@@ -50,15 +51,18 @@ vi.mock('@/renderer/hooks/useDraftSettings', () => ({
 }));
 
 // These existing tests exercise device-derived resolution/fps/bitrate behaviour,
-// so grant unbounded premium video caps (#1301) — the lock variants (L2/L5/L6)
-// must not clamp the option lists here. Lock behaviour is covered in
-// VideoConfigSection.premium.test.tsx.
+// so grant unbounded (native, -1) premium video caps (#1301 / split axes #1602) —
+// the lock variants (L2/L5/L6) must not clamp the option lists here. Lock
+// behaviour is covered in VideoConfigSection.premium.test.tsx.
 vi.mock('@/renderer/hooks/useEntitlement', () => ({
   useEntitlement: vi.fn((selector: (e: Record<string, unknown>) => unknown) =>
     selector({
-      maxVideoHeight: 4320,
-      maxVideoFps: 240,
-      maxVideoPixelRate: Number.MAX_SAFE_INTEGER,
+      streamMaxHeight: -1,
+      streamMaxFps: -1,
+      streamMaxBitrate: 30_000_000,
+      cameraMaxHeight: -1,
+      cameraMaxFps: -1,
+      cameraMaxBitrate: 30_000_000,
       maxManualBitrateBps: 30_000_000,
     })
   ),

@@ -1204,9 +1204,12 @@ const validEntitlements = {
     minPtimeMs: 20,
     allowMusicMode: false,
     maxAudioLastN: 8,
-    maxVideoHeight: 1080,
-    maxVideoFps: 60,
-    maxVideoPixelRate: 62208000,
+    streamMaxHeight: 1080,
+    streamMaxFps: 30,
+    streamMaxBitrate: 5000000,
+    cameraMaxHeight: 720,
+    cameraMaxFps: 60,
+    cameraMaxBitrate: 2500000,
     maxManualBitrateBps: 5000000,
     maxWebcamPublishers: 8,
     maxScreensharePublishers: 1,
@@ -1237,6 +1240,19 @@ describe('EntitlementsChangedSchema', () => {
   });
   it('rejects when the #1555 gate fields are missing (DTO lockstep)', () => {
     const { maxServersCreated, messageHistorySearchDays, ...rest } = validEntitlements.data;
+    const bad = { type: 'entitlements_changed', data: rest };
+    expect(EntitlementsChangedSchema.safeParse(bad).success).toBe(false);
+  });
+  it('rejects when the #1602 split video-axis fields are missing (DTO lockstep)', () => {
+    const {
+      streamMaxHeight,
+      streamMaxFps,
+      streamMaxBitrate,
+      cameraMaxHeight,
+      cameraMaxFps,
+      cameraMaxBitrate,
+      ...rest
+    } = validEntitlements.data;
     const bad = { type: 'entitlements_changed', data: rest };
     expect(EntitlementsChangedSchema.safeParse(bad).success).toBe(false);
   });

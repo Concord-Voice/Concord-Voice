@@ -1251,9 +1251,15 @@ export const EntitlementsChangedSchema = z.object({
     minPtimeMs: z.number().int(),
     allowMusicMode: z.boolean(),
     maxAudioLastN: z.number().int(),
-    maxVideoHeight: z.number().int(),
-    maxVideoFps: z.number().int(),
-    maxVideoPixelRate: z.number().int(),
+    // Split video axes (#1602): screen-share (stream) vs webcam (camera), each
+    // res/fps/bitrate. A negative height/fps is the native/uncapped sentinel.
+    // Keep in lockstep with EntitlementDTO (dto.go) — 23 wire keys total.
+    streamMaxHeight: z.number().int(),
+    streamMaxFps: z.number().int(),
+    streamMaxBitrate: z.number().int(),
+    cameraMaxHeight: z.number().int(),
+    cameraMaxFps: z.number().int(),
+    cameraMaxBitrate: z.number().int(),
     maxManualBitrateBps: z.number().int(),
     maxWebcamPublishers: z.number().int(),
     maxScreensharePublishers: z.number().int(),

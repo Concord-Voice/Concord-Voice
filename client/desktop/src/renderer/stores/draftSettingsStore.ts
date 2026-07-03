@@ -52,6 +52,7 @@ const AUDIO_DRAFTABLE_KEYS: (keyof DraftableAudioSettings)[] = [
 
 const VIDEO_DRAFTABLE_KEYS: (keyof DraftableVideoSettings)[] = [
   'cameraPreset',
+  'cameraBitrate',
   'preferredVideoCodec',
   'cameraPriority',
   'screenResolution',

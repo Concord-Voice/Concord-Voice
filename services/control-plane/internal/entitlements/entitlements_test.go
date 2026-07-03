@@ -16,10 +16,14 @@ func TestFor_Free(t *testing.T) {
 	assert.Equal(t, 20, e.MinPtimeMs)
 	assert.False(t, e.AllowMusicMode)
 	assert.Equal(t, 8, e.MaxAudioLastN)
-	assert.Equal(t, 1080, e.MaxVideoHeight)
-	assert.Equal(t, 60, e.MaxVideoFps)
-	assert.Equal(t, int64(62_208_000), e.MaxVideoPixelRate)
-	assert.Equal(t, 5_000_000, e.MaxManualBitrateBps)
+	// Split video axes (#1602): screen-share (stream) 1080p30/≤5M, webcam (camera) 720p60/≤2.5M.
+	assert.Equal(t, 1080, e.StreamMaxHeight)
+	assert.Equal(t, 30, e.StreamMaxFps)
+	assert.Equal(t, 5_000_000, e.StreamMaxBitrate)
+	assert.Equal(t, 720, e.CameraMaxHeight)
+	assert.Equal(t, 60, e.CameraMaxFps)
+	assert.Equal(t, 2_500_000, e.CameraMaxBitrate)
+	assert.Equal(t, 5_000_000, e.MaxManualBitrateBps) // = max(stream, camera) bitrate
 	assert.Equal(t, 8, e.MaxWebcamPublishers)
 	assert.Equal(t, 1, e.MaxScreensharePublishers)
 	assert.Equal(t, 5120, e.MaxMessageChars)
@@ -38,10 +42,14 @@ func TestFor_Premium(t *testing.T) {
 	assert.Equal(t, 10, e.MinPtimeMs)
 	assert.True(t, e.AllowMusicMode)
 	assert.Equal(t, 16, e.MaxAudioLastN)
-	assert.Equal(t, 1080, e.MaxVideoHeight)
-	assert.Equal(t, 60, e.MaxVideoFps)
-	assert.Equal(t, int64(124_416_000), e.MaxVideoPixelRate)
-	assert.Equal(t, 10_000_000, e.MaxManualBitrateBps)
+	// Split video axes (#1602): both native (uncapped) resolution/fps; stream ≤20M, camera ≤6M.
+	assert.Equal(t, entitlements.ServerLimitUnlimited, e.StreamMaxHeight)
+	assert.Equal(t, entitlements.ServerLimitUnlimited, e.StreamMaxFps)
+	assert.Equal(t, 20_000_000, e.StreamMaxBitrate)
+	assert.Equal(t, entitlements.ServerLimitUnlimited, e.CameraMaxHeight)
+	assert.Equal(t, entitlements.ServerLimitUnlimited, e.CameraMaxFps)
+	assert.Equal(t, 6_000_000, e.CameraMaxBitrate)
+	assert.Equal(t, 20_000_000, e.MaxManualBitrateBps) // = max(stream, camera) bitrate
 	assert.Equal(t, 25, e.MaxWebcamPublishers)
 	assert.Equal(t, 3, e.MaxScreensharePublishers)
 	assert.Equal(t, 10240, e.MaxMessageChars)
@@ -59,6 +67,16 @@ func TestFor_UnknownTierFailsClosedToFree(t *testing.T) {
 			assert.Equal(t, free, entitlements.For(tier))
 		})
 	}
+}
+
+// TestMediaFor_ManualBitrateIsStreamCeiling locks the #1300 media-plane contract:
+// the single advisory MaxManualBitrateBps the SFU parses at createTransport equals
+// the STREAM bitrate ceiling (max of the split axes), so a legitimate 20 Mbps
+// screen-share is never wrongly clamped. Splitting the video entitlement (#1602)
+// must keep this wire value byte-stable — free 5M / premium 20M.
+func TestMediaFor_ManualBitrateIsStreamCeiling(t *testing.T) {
+	assert.Equal(t, 5_000_000, entitlements.MediaFor(entitlements.TierFree).MaxManualBitrateBps)
+	assert.Equal(t, 20_000_000, entitlements.MediaFor(entitlements.TierPremium).MaxManualBitrateBps)
 }
 
 func TestFor_ReturnsDefensiveSliceCopy(t *testing.T) {

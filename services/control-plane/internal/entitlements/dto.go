@@ -19,9 +19,12 @@ type EntitlementDTO struct {
 	MinPtimeMs                    int      `json:"minPtimeMs"`
 	AllowMusicMode                bool     `json:"allowMusicMode"`
 	MaxAudioLastN                 int      `json:"maxAudioLastN"`
-	MaxVideoHeight                int      `json:"maxVideoHeight"`
-	MaxVideoFps                   int      `json:"maxVideoFps"`
-	MaxVideoPixelRate             int64    `json:"maxVideoPixelRate"`
+	StreamMaxHeight               int      `json:"streamMaxHeight"`
+	StreamMaxFps                  int      `json:"streamMaxFps"`
+	StreamMaxBitrate              int      `json:"streamMaxBitrate"`
+	CameraMaxHeight               int      `json:"cameraMaxHeight"`
+	CameraMaxFps                  int      `json:"cameraMaxFps"`
+	CameraMaxBitrate              int      `json:"cameraMaxBitrate"`
 	MaxManualBitrateBps           int      `json:"maxManualBitrateBps"`
 	MaxWebcamPublishers           int      `json:"maxWebcamPublishers"`
 	MaxScreensharePublishers      int      `json:"maxScreensharePublishers"`
@@ -44,9 +47,12 @@ func ToDTO(e Entitlement) EntitlementDTO {
 		MinPtimeMs:                    e.MinPtimeMs,
 		AllowMusicMode:                e.AllowMusicMode,
 		MaxAudioLastN:                 e.MaxAudioLastN,
-		MaxVideoHeight:                e.MaxVideoHeight,
-		MaxVideoFps:                   e.MaxVideoFps,
-		MaxVideoPixelRate:             e.MaxVideoPixelRate,
+		StreamMaxHeight:               e.StreamMaxHeight,
+		StreamMaxFps:                  e.StreamMaxFps,
+		StreamMaxBitrate:              e.StreamMaxBitrate,
+		CameraMaxHeight:               e.CameraMaxHeight,
+		CameraMaxFps:                  e.CameraMaxFps,
+		CameraMaxBitrate:              e.CameraMaxBitrate,
 		MaxManualBitrateBps:           e.MaxManualBitrateBps,
 		MaxWebcamPublishers:           e.MaxWebcamPublishers,
 		MaxScreensharePublishers:      e.MaxScreensharePublishers,

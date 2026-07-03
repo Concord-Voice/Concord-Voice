@@ -4291,7 +4291,7 @@ func TestAuthorizeVoiceJoin_MediaEntitlements_Premium(t *testing.T) {
 	me := body["media_entitlements"].(map[string]interface{})
 	assert.Equal(t, "premium", me["tier"])
 	assert.EqualValues(t, 10, me["min_ptime_ms"])
-	assert.EqualValues(t, 10000000, me["max_manual_bitrate_bps"])
+	assert.EqualValues(t, 20000000, me["max_manual_bitrate_bps"]) // premium stream ceiling (#1602: 10M->20M matching matrix "<=20 Mbps stream")
 }
 
 // A DM peer with no active subscription gets the free floor (fail-closed). Here

@@ -2,17 +2,21 @@ import { describe, it, expect } from 'vitest';
 import { clampToFreeTier, type ClampableSettings } from '@/renderer/utils/clampToFreeTier';
 import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/subscriptionStore';
 
-/** A premium entitlement that allows everything the free floor blocks. */
+/** A premium entitlement that allows everything the free floor blocks. Both video
+ *  axes are native (uncapped, -1 sentinel) with premium bitrate ceilings (#1602). */
 const PREMIUM_ENTITLEMENT: Entitlement = {
   ...FREE_ENTITLEMENT,
   tier: 'premium',
   allowCustomScheme: true,
   allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
   allowMusicMode: true,
-  maxVideoHeight: 2160,
-  maxVideoFps: 120,
-  maxVideoPixelRate: 3840 * 2160 * 120,
-  maxManualBitrateBps: 30_000_000,
+  streamMaxHeight: -1,
+  streamMaxFps: -1,
+  streamMaxBitrate: 20_000_000,
+  cameraMaxHeight: -1,
+  cameraMaxFps: -1,
+  cameraMaxBitrate: 6_000_000,
+  maxManualBitrateBps: 20_000_000,
 };
 
 /** A settings snapshot that exceeds every free cap. */
@@ -21,6 +25,7 @@ const OVER_CAP_SETTINGS: ClampableSettings = {
   qualityTier: 'studio',
   cameraPreset: '4K60',
   screenShareBitrate: 16_000_000,
+  cameraBitrate: 5_000_000,
   musicMode: true,
 };
 
@@ -30,6 +35,7 @@ const FREE_SETTINGS: ClampableSettings = {
   qualityTier: 'standard',
   cameraPreset: '720p30',
   screenShareBitrate: 0,
+  cameraBitrate: 0,
   musicMode: false,
 };
 
@@ -40,9 +46,11 @@ describe('clampToFreeTier — free user clamps', () => {
     expect(settings.colorScheme).toBe('custom');
     expect(settings.qualityTier).toBe('standard');
     expect(settings.musicMode).toBe(false);
-    // 16 Mbps → 5 Mbps free cap
-    expect(settings.screenShareBitrate).toBe(FREE_ENTITLEMENT.maxManualBitrateBps);
-    // 4K60 exceeds 1080/60 → clamped to highest free preset (≤1080, ≤60fps)
+    // 16 Mbps → 5 Mbps free STREAM cap
+    expect(settings.screenShareBitrate).toBe(FREE_ENTITLEMENT.streamMaxBitrate);
+    // 5 Mbps → 2.5 Mbps free CAMERA cap
+    expect(settings.cameraBitrate).toBe(FREE_ENTITLEMENT.cameraMaxBitrate);
+    // 4K60 exceeds the camera axis (720p60) → clamped to highest free camera preset
     expect(settings.cameraPreset).not.toBe('4K60');
   });
 
@@ -64,7 +72,7 @@ describe('clampToFreeTier — free user clamps', () => {
     expect(settings.qualityTier).toBe('standard');
   });
 
-  it('clamps a manual bitrate over 5 Mbps down to the free cap', () => {
+  it('clamps a screen-share bitrate over 5 Mbps down to the free STREAM cap', () => {
     const { settings, changed } = clampToFreeTier(
       { ...FREE_SETTINGS, screenShareBitrate: 12_000_000 },
       FREE_ENTITLEMENT
@@ -73,24 +81,42 @@ describe('clampToFreeTier — free user clamps', () => {
     expect(settings.screenShareBitrate).toBe(5_000_000);
   });
 
-  it('does NOT clamp auto (0) bitrate', () => {
+  it('clamps a camera bitrate over 2.5 Mbps down to the free CAMERA cap', () => {
     const { settings, changed } = clampToFreeTier(
-      { ...FREE_SETTINGS, screenShareBitrate: 0 },
+      { ...FREE_SETTINGS, cameraBitrate: 6_000_000 },
+      FREE_ENTITLEMENT
+    );
+    expect(changed).toBe(true);
+    expect(settings.cameraBitrate).toBe(2_500_000);
+  });
+
+  it('does NOT clamp auto (0) screen-share or camera bitrate', () => {
+    const { settings, changed } = clampToFreeTier(
+      { ...FREE_SETTINGS, screenShareBitrate: 0, cameraBitrate: 0 },
       FREE_ENTITLEMENT
     );
     expect(changed).toBe(false);
     expect(settings.screenShareBitrate).toBe(0);
+    expect(settings.cameraBitrate).toBe(0);
   });
 
-  it('clamps an over-cap camera preset to a free-fitting preset', () => {
+  it('clamps an over-cap camera preset to a free-fitting preset (camera axis 720p60)', () => {
     const { settings } = clampToFreeTier(
       { ...FREE_SETTINGS, cameraPreset: '1440p60' },
       FREE_ENTITLEMENT
     );
-    // The clamped preset must be within 1080p / 60fps free caps.
-    expect(['system', '360p30', '480p30', '720p30', '720p60', '1080p30', '1080p60']).toContain(
-      settings.cameraPreset
+    // The clamped preset must be within the free CAMERA axis (720p / 60fps).
+    expect(['system', '360p30', '480p30', '720p30', '720p60']).toContain(settings.cameraPreset);
+  });
+
+  it('clamps a 1080p30 camera preset (now over the camera axis) down', () => {
+    // 1080p30 fit the OLD conflated free cap but exceeds the split camera axis (720p).
+    const { settings, changed } = clampToFreeTier(
+      { ...FREE_SETTINGS, cameraPreset: '1080p30' },
+      FREE_ENTITLEMENT
     );
+    expect(changed).toBe(true);
+    expect(['system', '360p30', '480p30', '720p30', '720p60']).toContain(settings.cameraPreset);
   });
 });
 

@@ -810,7 +810,12 @@ class VoiceService {
         maxBitrate = Math.max(maxBitrate, bitrate);
       }
     }
-    return maxBitrate || 2_500_000;
+    const target = maxBitrate || 2_500_000;
+    // User manual camera-bitrate cap (#1602): 0 = auto (no override). When set, it
+    // lowers the encoder start-bitrate hint only — the SFU is advisory for video
+    // bitrate (media-plane.md), so this never fights simulcast/SVC layer bitrates.
+    const userCap = useVideoSettingsStore.getState().cameraBitrate;
+    return userCap > 0 ? Math.min(target, userCap) : target;
   }
 
   /**
