@@ -300,6 +300,10 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
       await (await getVoiceService()).toggleScreenShare(sourceId, options);
     } catch (err) {
       console.error('Failed to start screen share:', errorMessage(err));
+      // Surface cap-exceeded (and other start failures) as a slot toast — parity
+      // with the camera path's setVideoSlotError (#1542). errorMessage() returns
+      // the server message ("Screen share limit reached (max N)").
+      setVideoSlotError(errorMessage(err));
     }
   };
 

@@ -173,16 +173,17 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 		return
 	}
 
-	// Fetch channel details + verify membership in one query
-	var channelName, channelType, serverID string
+	// Fetch channel details + verify membership + the server owner in one query
+	var channelName, channelType, serverID, ownerID string
 	var audioQualityTier *string
 	var timedOutUntil sql.NullTime
 	err := h.db.QueryRow(`
-		SELECT c.id, c.name, c.type, c.server_id, c.audio_quality_tier, sm.timed_out_until
+		SELECT c.id, c.name, c.type, c.server_id, c.audio_quality_tier, sm.timed_out_until, s.owner_id
 		FROM channels c
+		INNER JOIN servers s ON s.id = c.server_id
 		INNER JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = $2
 		WHERE c.id = $1
-	`, channelID, userID).Scan(&channelID, &channelName, &channelType, &serverID, &audioQualityTier, &timedOutUntil)
+	`, channelID, userID).Scan(&channelID, &channelName, &channelType, &serverID, &audioQualityTier, &timedOutUntil, &ownerID)
 
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Channel not found or access denied"})
@@ -252,6 +253,13 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 		channelTier,
 	)
 
+	// Room-scoped producer caps (#1542) follow the SERVER OWNER's tier — the owner
+	// provisions the channel's egress capacity; a premium member's presence must NOT
+	// raise a (large/public) channel's cap. GetTier fails closed to free on any
+	// resolution failure. DMs do NOT carry this field (see dm/handlers.go) — there
+	// the media-plane derives the cap from the max present-participant tier.
+	roomOwnerTier := h.entCache.GetTier(c.Request.Context(), ownerID)
+
 	h.log.Info("Voice join authorized", "user_id", userID, "channel_id", channelID, "server_id", serverID, "media_tier", mediaEnt.Tier)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -262,6 +270,7 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 		"server_muted":       serverMuted,
 		"server_deafened":    serverDeafened,
 		"media_entitlements": mediaEnt,
+		"room_owner_tier":    roomOwnerTier,
 		"channel": gin.H{
 			"id":                 channelID,
 			"name":               channelName,

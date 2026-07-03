@@ -1589,6 +1589,10 @@ func (h *Handler) AuthorizeVoiceJoin(c *gin.Context) {
 	// premium (#1300 §3/§5).
 	mediaEnt := entitlements.MediaFor(h.entCache.GetTier(c.Request.Context(), userID))
 
+	// NOTE (#1542): DM voice/join intentionally omits room_owner_tier. DMs have no
+	// owner; the media-plane resolves the per-room cap from the MAX tier among present
+	// participants (each Participant.tier arrives via the per-user media_entitlements).
+
 	h.log.Info("DM voice join authorized", "user_id", userID, "conversation_id", convID, "media_tier", mediaEnt.Tier)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -2751,9 +2755,14 @@ func (h *Handler) CancelDMCall(c *gin.Context) {
 // boundary that closes the G7 gap (media-plane previously had no DM-aware
 // auth path and effectively trusted the renderer's join response unchecked).
 //
-// Returns 200 + {authorized: true, is_group: bool} for members; 403 for
-// non-members. The minimal metadata helps the media-plane decide whether
-// to enable group-call-specific features (deferred to #1219).
+// Returns 200 + {authorized: true, is_group: bool, media_entitlements: {...}}
+// for members; 403 for non-members. The minimal metadata helps the
+// media-plane decide whether to enable group-call-specific features
+// (deferred to #1219). media_entitlements (#1542 review reconciliation)
+// carries the requesting user's server-authoritative per-user media caps —
+// this endpoint, not the renderer-facing AuthorizeVoiceJoin, is what the
+// media-plane actually parses at the SFU boundary, so Participant.tier (the
+// DM room-cap input per ADR-0029) is sourced from here.
 func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 	userID := c.GetString("user_id")
 	convID := c.Param("id")
@@ -2779,9 +2788,22 @@ func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 		return
 	}
 
+	// Resolve the requesting user's media entitlements server-side from the
+	// AUTHENTICATED user_id (never a client value), mirroring AuthorizeVoiceJoin
+	// above. DMs have no channel/server tier, so this is the plain per-user
+	// MediaFor — no ChannelAudioUplift. GetTier fails closed to free, so a
+	// resolution failure degrades to the free floor, never grants premium.
+	//
+	// NOTE (#1542): this response intentionally omits room_owner_tier. DMs have
+	// no owner; the media-plane resolves the per-room cap from the MAX tier among
+	// present participants, each threaded from this media_entitlements object
+	// onto Participant.tier (ADR-0029).
+	mediaEnt := entitlements.MediaFor(h.entCache.GetTier(c.Request.Context(), userID))
+
 	c.JSON(http.StatusOK, gin.H{
-		"authorized": true,
-		"is_group":   isGroup,
+		"authorized":         true,
+		"is_group":           isGroup,
+		"media_entitlements": mediaEnt,
 	})
 }
 

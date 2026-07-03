@@ -3907,6 +3907,71 @@ func TestAuthorizeDMVoiceForMediaPlane_InvalidConvID_Returns400(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
+// The SFU-boundary authorize response carries the requesting user's
+// media_entitlements (#1542 review reconciliation): this endpoint — not the
+// renderer-facing /voice/join — is what the media-plane parses, so without the
+// field every DM participant floored to 'free' and the DM premium room-cap
+// path (ADR-0029 max-participant-tier) was structurally dead.
+func TestAuthorizeDMVoiceForMediaPlane_MediaEntitlements_Free(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+
+	user := ts.CreateTestUser(t, "g7_me_free")
+	other := ts.CreateTestUser(t, "g7_me_free2")
+	convID := ts.CreateDMConversation(t, user.ID, other.ID)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize, nil, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, true, body["authorized"])
+	assertDMMediaEntitlements(t, body, entitlements.TierFree)
+}
+
+func TestAuthorizeDMVoiceForMediaPlane_MediaEntitlements_Premium(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+
+	user := ts.CreateTestUser(t, "g7_me_prem")
+	other := ts.CreateTestUser(t, "g7_me_prem2")
+	convID := ts.CreateDMConversation(t, user.ID, other.ID)
+
+	insertDMSubscription(t, ts, user.ID, entitlements.TierPremium)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize, nil, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, true, body["authorized"])
+	assertDMMediaEntitlements(t, body, entitlements.TierPremium)
+
+	// Tier resolves from the requesting user's own subscription — the premium
+	// value here is what the media-plane threads onto Participant.tier for the
+	// ADR-0029 DM max-participant-tier room-cap resolution.
+	me := body["media_entitlements"].(map[string]interface{})
+	assert.Equal(t, "premium", me["tier"])
+}
+
+// A free participant in the same conversation as a premium one still gets the
+// free floor from their own authorize call — per-user resolution, no
+// inheritance (the room-level max-tier aggregation happens SFU-side).
+func TestAuthorizeDMVoiceForMediaPlane_MediaEntitlements_PerUser(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+
+	premiumUser := ts.CreateTestUser(t, "g7_me_pu_prem")
+	freeUser := ts.CreateTestUser(t, "g7_me_pu_free")
+	convID := ts.CreateDMConversation(t, premiumUser.ID, freeUser.ID)
+
+	insertDMSubscription(t, ts, premiumUser.ID, entitlements.TierPremium)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize, nil, testhelpers.AuthHeaders(freeUser.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assertDMMediaEntitlements(t, body, entitlements.TierFree)
+}
+
 // ─── HandleUserDisconnect tests (#1209, plan Task B7 Part 2) ─────────────
 
 func TestHandleUserDisconnect_CancelsCallerInitiatedRings(t *testing.T) {

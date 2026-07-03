@@ -706,6 +706,69 @@ func TestAuthorizeJoin_MediaEntitlements(t *testing.T) {
 	})
 }
 
+// --- AuthorizeJoin room_owner_tier Tests (#1542) ---
+
+func TestAuthorizeJoin_RoomOwnerTier(t *testing.T) {
+	t.Run("PremiumOwnerYieldsPremiumRoomOwnerTier", func(t *testing.T) {
+		// The cap tier follows the server OWNER, not the joining member: a free
+		// member joining a premium-owned server sees room_owner_tier=premium.
+		ts := setupTS(t)
+		owner := ts.CreateTestUser(t, "rot_prem_owner")
+		member := ts.CreateTestUser(t, "rot_prem_member")
+		serverID := ts.CreateTestServer(t, owner.ID, "ROT Premium Server")
+		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-rot-prem")
+
+		insertSubscription(t, ts, owner.ID, entitlements.TierPremium)
+
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, "premium", body["room_owner_tier"], "cap tier follows the OWNER, not the joining member")
+		// The joining member's per-user entitlements stay free — orthogonal axes.
+		assertMediaEntitlements(t, body, entitlements.TierFree)
+	})
+
+	t.Run("FreeOwnerYieldsFreeRoomOwnerTier", func(t *testing.T) {
+		// No subscription row for the owner → GetTier fails closed to free.
+		ts := setupTS(t)
+		owner := ts.CreateTestUser(t, "rot_free_owner")
+		serverID := ts.CreateTestServer(t, owner.ID, "ROT Free Server")
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-rot-free")
+
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(owner.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, "free", body["room_owner_tier"])
+	})
+
+	t.Run("PremiumMemberDoesNotRaiseFreeOwnerRoom", func(t *testing.T) {
+		// A premium MEMBER joining a free-owned server must NOT unlock the
+		// premium room cap (the public-channel abuse vector, spec §6.5).
+		ts := setupTS(t)
+		owner := ts.CreateTestUser(t, "rot_mix_owner")
+		member := ts.CreateTestUser(t, "rot_mix_member")
+		serverID := ts.CreateTestServer(t, owner.ID, "ROT Mixed Server")
+		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-rot-mix")
+
+		insertSubscription(t, ts, member.ID, entitlements.TierPremium)
+
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, "free", body["room_owner_tier"], "a premium member must not raise the room cap tier")
+		// The member's own per-user entitlements are still premium.
+		assertMediaEntitlements(t, body, entitlements.TierPremium)
+	})
+}
+
 func TestAuthorizeJoin_ChannelStandard_ShapesMediaEntitlements(t *testing.T) {
 	// A free member joins a voice channel whose audio_quality_tier='standard'
 	// on a Groundspeed (default) server. The channel standard uplifts the member

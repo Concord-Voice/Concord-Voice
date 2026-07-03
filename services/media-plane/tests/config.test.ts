@@ -177,6 +177,25 @@ describe('config', () => {
     });
   });
 
+  // ── freeScreenProducerCap (#1542) ───────────────────────────────────
+
+  describe('freeScreenProducerCap (#1542)', () => {
+    it('defaults to 1 when env unset', async () => {
+      const { config } = await loadConfig();
+      expect(config.freeScreenProducerCap).toBe(1);
+    });
+
+    it('reads a valid positive integer from FREE_SCREEN_PRODUCER_CAP', async () => {
+      const { config } = await loadConfig({ FREE_SCREEN_PRODUCER_CAP: '2' });
+      expect(config.freeScreenProducerCap).toBe(2);
+    });
+
+    it.each([['abc'], ['0'], ['-5'], ['']])('falls back to 1 for invalid value %j', async (raw) => {
+      const { config } = await loadConfig({ FREE_SCREEN_PRODUCER_CAP: raw });
+      expect(config.freeScreenProducerCap).toBe(1);
+    });
+  });
+
   // ── audio last-N config (#1544) ─────────────────────────────────────
 
   describe('audio last-N config (#1544)', () => {

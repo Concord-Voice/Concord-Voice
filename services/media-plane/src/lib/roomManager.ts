@@ -77,7 +77,12 @@ export interface Participant {
    */
   testingStatusChangeTimes?: number[];
   // ── Per-user media entitlement (#1300) ─────────────────────────────────
-  /** Subscription tier label (debug/log/forward-compat only — caps below drive enforcement). */
+  /**
+   * Subscription tier label — server-authoritative (#1300, never
+   * socket.handshake.auth). Enforcement input for the DM per-room cap tier
+   * (#1542, resolveRoomCapTier); the per-user caps below drive per-user
+   * enforcement.
+   */
   tier: string;
   /** Aggregate send-bitrate ceiling (bps) applied to this peer's PRODUCING transport. */
   maxManualBitrateBps: number;
@@ -152,6 +157,10 @@ export interface Room {
   lastNPausedConsumers: Set<string>;
   /** Mic-producer IDs (last-N managed set; screen-audio excluded). */
   micProducerIds: Set<string>;
+  /** Room kind (#1542) — selects the cap-tier resolution strategy (channel=owner, dm=max-participant). */
+  roomKind: 'channel' | 'dm';
+  /** Channel rooms only (#1542): the server-owner cap tier from join-authorize. Undefined for DMs. */
+  ownerTier?: string;
   /** Last accepted keyframe request timestamp by sender user ID. */
   keyframeRequestCooldowns: Map<string, number>;
   /** Raw client camera layer demand, parsed and stored by consumer ID. */
@@ -170,8 +179,37 @@ export interface ProducerInfo {
 /** Absolute per-room camera-producer ceiling — hard upper bound, not tier-tunable. */
 export const ABSOLUTE_VIDEO_PUBLISHER_CEILING = 25;
 
-/** Per-room concurrent screen-share producer cap (unchanged from the original hardcoded 5). */
-export const SCREEN_PRODUCER_CAP = 5;
+/** Absolute per-room screenshare-producer ceiling — hard upper bound, not tier-tunable. */
+export const ABSOLUTE_SCREEN_PRODUCER_CEILING = 3;
+
+/**
+ * Premium per-room caps (#1542) — mirror the Go entitlements source of truth
+ * (`entitlements.go` MaxWebcamPublishers 25 / MaxScreensharePublishers 3).
+ * Free values come from config (`freeVideoPublisherCap` / `freeScreenProducerCap`).
+ */
+export const PREMIUM_VIDEO_PUBLISHER_CAP = 25;
+export const PREMIUM_SCREEN_PRODUCER_CAP = 3;
+
+/**
+ * Resolve a room's cap tier (#1542). Channels follow the server OWNER's tier
+ * (the owner provisions the room's egress capacity — a premium member's
+ * presence must NOT raise a large/public channel's cap); DMs follow the MAX
+ * tier among present participants (presence-provisioned — a premium
+ * participant's entitlement extends to their DMs). Both inputs are
+ * server-authoritative (#1300/#1542 join-authorize), never
+ * socket.handshake.auth. Fail-closed to 'free' for an unknown/absent tier or
+ * an empty room. Pure + synchronous (no await) → safe to call inside the
+ * #1539 TOCTOU reservation.
+ */
+export function resolveRoomCapTier(room: Room): 'free' | 'premium' {
+  if (room.roomKind === 'dm') {
+    for (const p of room.participants.values()) {
+      if (p.tier === 'premium') return 'premium';
+    }
+    return 'free';
+  }
+  return room.ownerTier === 'premium' ? 'premium' : 'free';
+}
 
 /** Per-sender keyframe request cooldown; mirrors the client-side E2EE recovery cooldown. */
 export const KEYFRAME_REQUEST_COOLDOWN_MS = 5000;
@@ -241,22 +279,51 @@ export function parseMediaFrameCryptoVersion(value: unknown): number {
 /**
  * Resolve the per-room concurrent camera-producer cap.
  *
- * Tier-seam (#1294): when the entitlement resolver (#1521) + /voice/join tier
- * plumbing (#1300) land, read the room/owner subscription tier here and return
- * the paid value for paid rooms. Until then every room resolves to the free
- * default, which is correct for the Beta window (no paid users exist pre-Beta).
+ * Tier-aware (#1542, realizing the #1294 seam): reads `resolveRoomCapTier(room)`
+ * — free rooms get the config free default (8), premium rooms get
+ * PREMIUM_VIDEO_PUBLISHER_CAP (25). Evaluated at produce-time inside the #1539
+ * synchronous reservation, so cap changes from membership churn apply to NEW
+ * produces only (grandfather-on-downgrade, ADR — see [internal]rules/media-plane.md).
  *
  * Clamped at BOTH ends: the upper bound is ABSOLUTE_VIDEO_PUBLISHER_CEILING, so
- * the free cap can only ever be a stricter floor and never raise the global
- * ceiling; the lower bound is 1, so a future #1294 tier value of 0/negative —
- * which does NOT flow through config's fail-safe parsePositiveIntEnv — can never
- * disable the cap (Math.min(0, 25) = 0 would reject every camera produce, a DoS).
+ * a tier value can never raise the global ceiling; the lower bound is 1, so a
+ * 0/negative tier value — which does NOT flow through config's fail-safe
+ * parsePositiveIntEnv — can never disable the cap (Math.min(0, 25) = 0 would
+ * reject every camera produce, a DoS).
  */
 export function resolveVideoPublisherCap(
-  _room: Room,
+  room: Room,
   freeCap: number = config.freeVideoPublisherCap
 ): number {
-  return Math.max(1, Math.min(freeCap, ABSOLUTE_VIDEO_PUBLISHER_CEILING));
+  const cap = resolveRoomCapTier(room) === 'premium' ? PREMIUM_VIDEO_PUBLISHER_CAP : freeCap;
+  return Math.max(1, Math.min(cap, ABSOLUTE_VIDEO_PUBLISHER_CEILING));
+}
+
+/**
+ * Resolve the per-room concurrent screenshare-producer cap (#1542): free 1
+ * (config `freeScreenProducerCap`) / premium 3 (PREMIUM_SCREEN_PRODUCER_CAP).
+ * Same clamp-both-ends discipline and same produce-time/grandfather semantics
+ * as resolveVideoPublisherCap above.
+ */
+export function resolveScreenProducerCap(
+  room: Room,
+  freeCap: number = config.freeScreenProducerCap
+): number {
+  const cap = resolveRoomCapTier(room) === 'premium' ? PREMIUM_SCREEN_PRODUCER_CAP : freeCap;
+  return Math.max(1, Math.min(cap, ABSOLUTE_SCREEN_PRODUCER_CEILING));
+}
+
+/**
+ * mediasoup consumer priority (1-255, higher = preferred when the transport's
+ * estimated downlink bandwidth cannot fit every consumer). Ordered
+ * audio > screenshare > webcam (#1542) so video degrades before audio and
+ * webcam degrades before screenshare. Operates at the transport/BWE layer →
+ * E2EE-safe (independent of payload encryption).
+ */
+export function consumerPriorityForSource(source: MediaSource): number {
+  if (source === 'mic') return 255;
+  if (source === 'screen' || source === 'screen-audio') return 128;
+  return 1; // camera
 }
 
 /** Absolute per-room audio last-N ceiling — hard upper bound, not tier-tunable. */
@@ -265,10 +332,13 @@ export const ABSOLUTE_AUDIO_LAST_N_CEILING = 16;
 /**
  * Resolve the per-room audio last-N forwarded-speaker cap.
  *
- * TODO(#1294): when the entitlement resolver (#1521) + /voice/join tier plumbing
- * (#1300) land, read room/owner tier here and return the paid value (16). Until
- * then every room resolves to the free default — correct for Beta (no paid users
- * pre-Beta), mirroring resolveVideoPublisherCap.
+ * TODO(#1294): the prerequisites HAVE landed — the entitlement resolver (#1521),
+ * the /voice/join tier plumbing (#1300), and the tier-aware room-cap read
+ * (#1542, resolveRoomCapTier). Wiring audio last-N to that same tier read
+ * (paid value 16) remains DELIBERATELY deferred to the #1294 tier-seam
+ * follow-up (it must also resize the AudioLevelObserver, which is created
+ * before the Room exists — see the param note below). Until then every room
+ * resolves to the free default.
  *
  * `room` is optional because the cap is resolved at room-creation time, BEFORE
  * the Room object exists (the observer must be sized first). It is unused today
@@ -287,6 +357,14 @@ export interface TransportOptions {
   iceParameters: unknown;
   iceCandidates: unknown;
   dtlsParameters: unknown;
+}
+
+/** Trailing options for {@link RoomManager.joinRoom} (parameter-object per S107). */
+export interface JoinRoomOptions {
+  entitlement?: MediaEntitlement;
+  /** unparsed — validated by parseMediaFrameCryptoVersion at the admission gate */
+  mediaFrameCryptoVersion: unknown;
+  roomContext?: { roomKind: 'channel' | 'dm'; ownerTier?: string };
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +471,10 @@ export class RoomManager {
   // ─── Room lifecycle ──────────────────────────────────────────────────
 
   /** Get or create a room for the given channel ID */
-  private async getOrCreateRoom(roomId: string): Promise<Room> {
+  private async getOrCreateRoom(
+    roomId: string,
+    roomContext?: { roomKind: 'channel' | 'dm'; ownerTier?: string }
+  ): Promise<Room> {
     let room = this.rooms.get(roomId);
     if (room) {
       // Defensive: if the router was closed (e.g. race between leave and rejoin),
@@ -405,6 +486,13 @@ export class RoomManager {
         this.rooms.delete(roomId);
         room = undefined;
       } else {
+        // NOTE (#1542): this early return means `room.roomKind` is intentionally
+        // FIRST-JOINER-STABLE for the room's lifetime (unlike `ownerTier`, which
+        // joinRoom refreshes on every channel join). Safe: channel and DM ID
+        // namespaces are disjoint (channel UUIDs vs conversation UUIDs from
+        // different tables), and every join is independently authorized against
+        // the endpoint matching its declared kind — a later joiner cannot
+        // reclassify the room to switch its cap-tier resolution strategy.
         return room;
       }
     }
@@ -442,6 +530,8 @@ export class RoomManager {
       activeSpeakers: new ActiveSpeakerSet(lastN, config.audioLastNHoldMs),
       lastNPausedConsumers: new Set(),
       micProducerIds: new Set(),
+      roomKind: roomContext?.roomKind ?? 'channel',
+      ownerTier: roomContext?.ownerTier,
       keyframeRequestCooldowns: new Map(),
       cameraLayerDemands: new Map(),
       cameraLayeringGateEnabled: false,
@@ -526,8 +616,7 @@ export class RoomManager {
     socketId: string,
     identity: { username: string; displayName?: string; avatarUrl?: string },
     rtpCapabilities: RtpCapabilities | undefined,
-    entitlement: MediaEntitlement | undefined,
-    mediaFrameCryptoVersion: unknown
+    options: JoinRoomOptions
   ): Promise<{
     rtpCapabilities: RtpCapabilities;
     mediaFrameCryptoVersion: number;
@@ -541,9 +630,10 @@ export class RoomManager {
     }>;
     e2eeEpoch: number;
   }> {
+    const { entitlement, mediaFrameCryptoVersion, roomContext } = options;
     const parsedMediaFrameCryptoVersion = parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
     const { username, displayName, avatarUrl } = identity;
-    let room = await this.getOrCreateRoom(roomId);
+    let room = await this.getOrCreateRoom(roomId, roomContext);
 
     // Check if user is already in this room (reconnect scenario)
     const existing = room.participants.get(userId);
@@ -556,12 +646,19 @@ export class RoomManager {
       });
       await this.leaveRoom(roomId, userId);
       // Room may have been closed if user was the only participant — re-create
-      room = await this.getOrCreateRoom(roomId);
+      room = await this.getOrCreateRoom(roomId, roomContext);
       // NOTE: the crypto-version gate below runs AFTER this teardown. A reconnect
       // that DOWNGRADES the user's crypto version (lower than the room's) is
       // rejected at the gate — so the user's stale session is fully cleaned up
       // here (no leak) and they are then ejected+rejected. That is intentional:
       // a downgraded client must update to rejoin (the gate is the authority).
+    }
+
+    // Refresh the channel owner cap tier on each join (#1542) so a mid-call
+    // owner subscription change is honored for NEW produces (existing ones
+    // grandfather). Idempotent for a stable owner; DM rooms carry no ownerTier.
+    if (roomContext?.roomKind === 'channel') {
+      room.ownerTier = roomContext.ownerTier;
     }
 
     // Media-frame crypto-version admission gate (#1878, OQ-1: higher-version-wins).
@@ -974,8 +1071,8 @@ export class RoomManager {
       this.enforceAudioTierGate(participant, rtpParameters, source);
     }
 
-    // Enforce per-room concurrent-producer caps (camera: tier-resolved free
-    // default 8; screen: SCREEN_PRODUCER_CAP). TOCTOU-safe (#1539 review): the
+    // Enforce per-room concurrent-producer caps (#1542 tier-resolved: camera
+    // free 8 / premium 25; screen free 1 / premium 3). TOCTOU-safe (#1539): the
     // check + slot reservation run synchronously with no intervening await, so
     // concurrent invocations observe each other's reservations. The reservation
     // is released once the producer is recorded or if produce() fails.
@@ -1243,6 +1340,19 @@ export class RoomManager {
     });
 
     consumer.consumers.set(newConsumer.id, newConsumer);
+
+    // Per-consumer priority (#1542): audio > screenshare > webcam so the SFU
+    // sheds the cheapest-value stream first under BWE congestion. Non-fatal:
+    // priority is a BWE hint — log PII-safe and continue on a worker error.
+    try {
+      await newConsumer.setPriority(consumerPriorityForSource(producerEntry.source));
+    } catch {
+      logger.warn('Failed to set consumer priority', {
+        consumerId: newConsumer.id,
+        producerId,
+        source: producerEntry.source,
+      });
+    }
 
     // Audio last-N (#1544): if this is a MIC audio consumer whose producer is not
     // currently in the top-N, start it last-N-paused (it was created paused:true)
@@ -1923,7 +2033,7 @@ export class RoomManager {
   /** Per-room concurrent-producer cap for a capped source, or null if uncapped. */
   private resolveProducerCap(room: Room, source: MediaSource): number | null {
     if (source === 'camera') return resolveVideoPublisherCap(room);
-    if (source === 'screen') return SCREEN_PRODUCER_CAP;
+    if (source === 'screen') return resolveScreenProducerCap(room);
     return null; // mic, screen-audio — no count cap
   }
 

@@ -18,6 +18,7 @@ vi.mock('mediasoup', () => ({
 vi.mock('@/config/index.js', () => ({
   config: {
     freeVideoPublisherCap: 8,
+    freeScreenProducerCap: 1,
     freeAudioLastN: 8,
     audioLastNHoldMs: 2500,
     mediasoup: {
@@ -42,12 +43,19 @@ import {
   RoomManager,
   resolveVideoPublisherCap,
   ABSOLUTE_VIDEO_PUBLISHER_CEILING,
+  resolveRoomCapTier,
+  resolveScreenProducerCap,
+  ABSOLUTE_SCREEN_PRODUCER_CEILING,
+  PREMIUM_VIDEO_PUBLISHER_CAP,
+  PREMIUM_SCREEN_PRODUCER_CAP,
+  consumerPriorityForSource,
   resolveAudioLastN,
   ABSOLUTE_AUDIO_LAST_N_CEILING,
   SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
   parseMediaFrameCryptoVersion,
   CryptoVersionMismatchError,
 } from '../src/lib/roomManager.js';
+import type { Room, Participant } from '../src/lib/roomManager.js';
 // `./mocks/logger.js` (imported above) replaces @/lib/logger with vi.fn() spies;
 // importing it here gives us the SAME mocked object to assert on.
 import { logger } from '../src/lib/logger.js';
@@ -70,17 +78,14 @@ function joinRoomWithSupportedCrypto(
   socketId: string,
   identity: { username: string; displayName?: string; avatarUrl?: string },
   rtpCapabilities?: any,
-  entitlement?: any
+  entitlement?: any,
+  roomContext?: { roomKind: 'channel' | 'dm'; ownerTier?: string }
 ) {
-  return manager.joinRoom(
-    roomId,
-    userId,
-    socketId,
-    identity,
-    rtpCapabilities,
+  return manager.joinRoom(roomId, userId, socketId, identity, rtpCapabilities, {
     entitlement,
-    SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION
-  );
+    mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+    roomContext,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -194,15 +199,9 @@ describe('RoomManager', () => {
       const epochBefore = room.e2eeEpoch;
 
       await expect(
-        manager.joinRoom(
-          'room-1',
-          'u-legacy',
-          'sock-legacy',
-          { username: 'legacy' },
-          undefined,
-          undefined,
-          1
-        )
+        manager.joinRoom('room-1', 'u-legacy', 'sock-legacy', { username: 'legacy' }, undefined, {
+          mediaFrameCryptoVersion: 1,
+        })
       ).rejects.toThrow('Unsupported media frame crypto version 1');
 
       expect(room.participants.has('u-legacy')).toBe(false);
@@ -221,8 +220,9 @@ describe('RoomManager', () => {
           'sock-missing',
           { username: 'missing' },
           undefined,
-          undefined,
-          undefined
+          {
+            mediaFrameCryptoVersion: undefined,
+          }
         )
       ).rejects.toThrow('Unsupported media frame crypto version missing');
 
@@ -238,15 +238,9 @@ describe('RoomManager', () => {
       const epochBefore = room.e2eeEpoch;
 
       await expect(
-        manager.joinRoom(
-          'room-1',
-          'u-1',
-          'sock-legacy',
-          { username: 'legacy' },
-          undefined,
-          undefined,
-          1
-        )
+        manager.joinRoom('room-1', 'u-1', 'sock-legacy', { username: 'legacy' }, undefined, {
+          mediaFrameCryptoVersion: 1,
+        })
       ).rejects.toThrow('Unsupported media frame crypto version 1');
 
       expect(room.participants.get('u-1')?.socketId).toBe('sock-original');
@@ -295,43 +289,39 @@ describe('RoomManager', () => {
     });
 
     it('raises the room from v3 to v4 when a v4 participant joins (higher-version-wins)', async () => {
-      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, undefined, 3);
-      const res = await manager.joinRoom(
-        'r',
-        'u2',
-        's2',
-        { username: 'b' },
-        undefined,
-        undefined,
-        4
-      );
+      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, {
+        mediaFrameCryptoVersion: 3,
+      });
+      const res = await manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
+        mediaFrameCryptoVersion: 4,
+      });
 
       expect(res.mediaFrameCryptoVersion).toBe(4);
       expect(manager.getRoom('r')?.mediaFrameCryptoVersion).toBe(4);
     });
 
     it('keeps the room version when an equal-version participant joins', async () => {
-      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, undefined, 4);
-      const res = await manager.joinRoom(
-        'r',
-        'u2',
-        's2',
-        { username: 'b' },
-        undefined,
-        undefined,
-        4
-      );
+      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, {
+        mediaFrameCryptoVersion: 4,
+      });
+      const res = await manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
+        mediaFrameCryptoVersion: 4,
+      });
 
       expect(res.mediaFrameCryptoVersion).toBe(4);
       expect(manager.getRoom('r')?.mediaFrameCryptoVersion).toBe(4);
     });
 
     it('rejects a v3 joiner into a v4 room with a typed mismatch', async () => {
-      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, undefined, 4);
+      await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, {
+        mediaFrameCryptoVersion: 4,
+      });
       const room = manager.getRoom('r')!;
       const epochBefore = room.e2eeEpoch;
 
-      const promise = manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, undefined, 3);
+      const promise = manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
+        mediaFrameCryptoVersion: 3,
+      });
       await expect(promise).rejects.toMatchObject({
         code: 'crypto_version_mismatch',
         roomVersion: 4,
@@ -854,7 +844,7 @@ describe('RoomManager', () => {
           'camera'
         );
       }
-      // ... a screen producer still succeeds (separate limit of 5).
+      // ... a screen producer still succeeds (separate tier-resolved screen cap).
       transport.produce.mockResolvedValueOnce(createMockProducer({ kind: 'video', id: 'scr-0' }));
       const info = await manager.produce(
         'room-1',
@@ -930,19 +920,18 @@ describe('RoomManager', () => {
       ).rejects.toThrow('Invalid media source for producer kind');
     });
 
-    it('enforces screen share limit (max 5)', async () => {
-      for (let i = 0; i < 5; i++) {
-        const uid = `u-scr-${i}`;
-        await joinRoomWithSupportedCrypto(manager, 'room-1', uid, `sock-${i + 200}`, {
-          username: `user${i}`,
-        });
-        const t = createMockTransport();
-        mockRouter.createWebRtcTransport.mockResolvedValueOnce(t);
-        await manager.createTransport('room-1', uid, 'send');
-        const p = createMockProducer({ kind: 'video' });
-        t.produce.mockResolvedValueOnce(p);
-        await manager.produce('room-1', uid, t.id, 'video', createRtpParameters() as any, 'screen');
-      }
+    it('enforces the free screen share cap (tier-resolved, max 1 — #1542)', async () => {
+      // room-1 is a channel room with no ownerTier → fail-closed free → cap 1.
+      const uid = 'u-scr-0';
+      await joinRoomWithSupportedCrypto(manager, 'room-1', uid, 'sock-200', {
+        username: 'screener',
+      });
+      const t = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(t);
+      await manager.createTransport('room-1', uid, 'send');
+      const p0 = createMockProducer({ kind: 'video' });
+      t.produce.mockResolvedValueOnce(p0);
+      await manager.produce('room-1', uid, t.id, 'video', createRtpParameters() as any, 'screen');
 
       const p = createMockProducer({ kind: 'video' });
       transport.produce.mockResolvedValueOnce(p);
@@ -955,7 +944,34 @@ describe('RoomManager', () => {
           createRtpParameters() as any,
           'screen'
         )
-      ).rejects.toThrow('Screen share limit reached (max 5)');
+      ).rejects.toThrow('Screen share limit reached (max 1)');
+    });
+
+    it('enforces the screen cap under a concurrent produce burst (TOCTOU-safe, #1542)', async () => {
+      // Screen-cap analogue of the #1539 camera burst test: fire cap+2 concurrent
+      // screen produces WITHOUT awaiting individually so the synchronous
+      // reservation sections interleave. Exactly the free cap (1) is admitted.
+      let pid = 0;
+      transport.produce.mockImplementation(async () =>
+        createMockProducer({ kind: 'video', id: `burst-scr-${pid++}` })
+      );
+      const results = await Promise.allSettled(
+        Array.from({ length: 3 }, () =>
+          manager.produce(
+            'room-1',
+            'u-1',
+            transport.id,
+            'video',
+            createRtpParameters() as any,
+            'screen'
+          )
+        )
+      );
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+      expect(fulfilled.length).toBe(1);
+      expect(rejected.length).toBe(2);
+      expect(rejected[0].reason.message).toContain('Screen share limit reached (max 1)');
     });
 
     it('rejects screen-audio when kind is not audio', async () => {
@@ -1419,6 +1435,32 @@ describe('RoomManager', () => {
           },
         })
       );
+    });
+
+    it('sets consumer priority from the producer source (audio = highest, #1542)', async () => {
+      const mockConsumer = createMockConsumer({
+        producerId: producerInfo.producerId,
+        kind: 'audio',
+      });
+      recvTransport.consume.mockResolvedValueOnce(mockConsumer);
+
+      await manager.consume('room-1', 'u-2', producerInfo.producerId);
+
+      expect(mockConsumer.setPriority).toHaveBeenCalledWith(consumerPriorityForSource('mic'));
+    });
+
+    it('consume still succeeds when setPriority fails (priority is a BWE hint)', async () => {
+      const mockConsumer = createMockConsumer({
+        producerId: producerInfo.producerId,
+        kind: 'audio',
+        setPriority: vi.fn(() => Promise.reject(new Error('worker error'))),
+      });
+      recvTransport.consume.mockResolvedValueOnce(mockConsumer);
+
+      const result = await manager.consume('room-1', 'u-2', producerInfo.producerId);
+
+      expect(result).not.toBeNull();
+      expect(result!.producerUserId).toBe('u-1');
     });
   });
 
@@ -2963,5 +3005,288 @@ describe('resolveAudioLastN (#1544)', () => {
   it('floors at 1 (a 0/negative tier value cannot disable the cap)', () => {
     expect(resolveAudioLastN(undefined, 0)).toBe(1);
     expect(resolveAudioLastN(undefined, -5)).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tier-aware per-room cap resolution (#1542)
+// ---------------------------------------------------------------------------
+
+const mkRoom = (over: Partial<Room>): Room => ({
+  id: 'r',
+  router: {} as any,
+  audioLevelObserver: null,
+  participants: new Map(),
+  createdAt: new Date(),
+  e2eeEpoch: 0,
+  mediaFrameCryptoVersion: null,
+  pendingProducerCounts: new Map(),
+  activeSpeakers: {} as any,
+  lastNPausedConsumers: new Set(),
+  micProducerIds: new Set(),
+  roomKind: 'channel',
+  keyframeRequestCooldowns: new Map(),
+  cameraLayerDemands: new Map(),
+  cameraLayeringGateEnabled: false,
+  ...over,
+});
+
+const withParticipants = (room: Room, ...tiers: string[]): Room => {
+  tiers.forEach((t, i) => room.participants.set(`u${i}`, { tier: t } as Participant));
+  return room;
+};
+
+describe('resolveRoomCapTier (#1542)', () => {
+  it('channel → owner tier', () => {
+    expect(resolveRoomCapTier(mkRoom({ roomKind: 'channel', ownerTier: 'premium' }))).toBe(
+      'premium'
+    );
+  });
+
+  it('channel fail-closes to free on absent/garbage owner tier', () => {
+    expect(resolveRoomCapTier(mkRoom({ roomKind: 'channel', ownerTier: undefined }))).toBe('free');
+    expect(resolveRoomCapTier(mkRoom({ roomKind: 'channel', ownerTier: 'garbage' }))).toBe('free');
+  });
+
+  it('channel ignores present participant tiers (no public-channel premium-unlock)', () => {
+    const room = withParticipants(
+      mkRoom({ roomKind: 'channel', ownerTier: undefined }),
+      'premium',
+      'free'
+    );
+    expect(resolveRoomCapTier(room)).toBe('free');
+  });
+
+  it('dm → max present-participant tier', () => {
+    expect(resolveRoomCapTier(withParticipants(mkRoom({ roomKind: 'dm' }), 'free', 'free'))).toBe(
+      'free'
+    );
+    expect(
+      resolveRoomCapTier(withParticipants(mkRoom({ roomKind: 'dm' }), 'free', 'premium'))
+    ).toBe('premium');
+  });
+
+  it('dm fail-closes to free for an empty room or unknown tiers', () => {
+    expect(resolveRoomCapTier(mkRoom({ roomKind: 'dm' }))).toBe('free');
+    expect(
+      resolveRoomCapTier(withParticipants(mkRoom({ roomKind: 'dm' }), 'garbage', 'unknown'))
+    ).toBe('free');
+  });
+
+  it('dm ignores ownerTier (defense-in-depth: DMs never carry one)', () => {
+    expect(
+      resolveRoomCapTier(withParticipants(mkRoom({ roomKind: 'dm', ownerTier: 'premium' }), 'free'))
+    ).toBe('free');
+  });
+});
+
+describe('resolveScreenProducerCap (#1542)', () => {
+  it('resolves free 1 / premium 3', () => {
+    expect(resolveScreenProducerCap(mkRoom({ roomKind: 'channel', ownerTier: 'free' }))).toBe(1);
+    expect(resolveScreenProducerCap(mkRoom({ roomKind: 'channel', ownerTier: 'premium' }))).toBe(3);
+    expect(PREMIUM_SCREEN_PRODUCER_CAP).toBe(3);
+  });
+
+  it('premium cap respects the absolute ceiling', () => {
+    expect(
+      resolveScreenProducerCap(mkRoom({ roomKind: 'channel', ownerTier: 'premium' }))
+    ).toBeLessThanOrEqual(ABSOLUTE_SCREEN_PRODUCER_CEILING);
+    expect(ABSOLUTE_SCREEN_PRODUCER_CEILING).toBe(3);
+  });
+
+  it('clamps a config free cap above the ceiling down, and a 0/negative up to 1', () => {
+    expect(resolveScreenProducerCap(mkRoom({ roomKind: 'channel' }), 99)).toBe(
+      ABSOLUTE_SCREEN_PRODUCER_CEILING
+    );
+    expect(resolveScreenProducerCap(mkRoom({ roomKind: 'channel' }), 0)).toBe(1);
+    expect(resolveScreenProducerCap(mkRoom({ roomKind: 'channel' }), -5)).toBe(1);
+  });
+
+  it('DM with a present premium participant resolves the premium cap', () => {
+    expect(
+      resolveScreenProducerCap(withParticipants(mkRoom({ roomKind: 'dm' }), 'free', 'premium'))
+    ).toBe(3);
+  });
+});
+
+describe('resolveVideoPublisherCap is tier-aware (#1542)', () => {
+  it('resolves free 8 / premium 25', () => {
+    expect(resolveVideoPublisherCap(mkRoom({ roomKind: 'channel', ownerTier: 'free' }))).toBe(8);
+    expect(resolveVideoPublisherCap(mkRoom({ roomKind: 'channel', ownerTier: 'premium' }))).toBe(
+      25
+    );
+    expect(PREMIUM_VIDEO_PUBLISHER_CAP).toBe(25);
+  });
+
+  it('DM with a present premium participant resolves the premium cap', () => {
+    expect(
+      resolveVideoPublisherCap(withParticipants(mkRoom({ roomKind: 'dm' }), 'free', 'premium'))
+    ).toBe(25);
+  });
+});
+
+describe('consumer priority (#1542)', () => {
+  it('orders audio > screenshare > webcam', () => {
+    expect(consumerPriorityForSource('mic')).toBeGreaterThan(consumerPriorityForSource('screen'));
+    expect(consumerPriorityForSource('screen')).toBeGreaterThan(
+      consumerPriorityForSource('camera')
+    );
+    expect(consumerPriorityForSource('screen-audio')).toBe(consumerPriorityForSource('screen'));
+  });
+
+  it('stays within the mediasoup priority range (1-255)', () => {
+    for (const source of ['mic', 'screen', 'screen-audio', 'camera'] as const) {
+      expect(consumerPriorityForSource(source)).toBeGreaterThanOrEqual(1);
+      expect(consumerPriorityForSource(source)).toBeLessThanOrEqual(255);
+    }
+  });
+});
+
+describe('tier-aware cap enforcement (#1542)', () => {
+  let manager: RoomManager;
+  let mockRouter: ReturnType<typeof createMockRouter>;
+
+  const FREE_ENT = {
+    tier: 'free',
+    allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
+    minPtimeMs: 20,
+    maxManualBitrateBps: 5_000_000,
+  };
+  const PREMIUM_ENT = {
+    tier: 'premium',
+    allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+    minPtimeMs: 10,
+    maxManualBitrateBps: 10_000_000,
+  };
+
+  beforeEach(() => {
+    mockRouter = createMockRouter();
+    manager = new RoomManager(createMockMediasoupService(mockRouter) as any);
+  });
+
+  /** Join a user and give them a send transport; returns the transport mock. */
+  async function joinWithTransport(
+    roomId: string,
+    userId: string,
+    entitlement: typeof FREE_ENT,
+    roomContext: { roomKind: 'channel' | 'dm'; ownerTier?: string }
+  ) {
+    await joinRoomWithSupportedCrypto(
+      manager,
+      roomId,
+      userId,
+      `sock-${userId}`,
+      { username: userId },
+      undefined,
+      entitlement,
+      roomContext
+    );
+    const t = createMockTransport();
+    mockRouter.createWebRtcTransport.mockResolvedValueOnce(t);
+    await manager.createTransport(roomId, userId, 'send');
+    return t;
+  }
+
+  async function produceScreen(roomId: string, userId: string, t: any, id: string) {
+    t.produce.mockResolvedValueOnce(createMockProducer({ kind: 'video', id }));
+    return manager.produce(roomId, userId, t.id, 'video', createRtpParameters() as any, 'screen');
+  }
+
+  it('premium-owner channel room allows up to 3 screenshares, rejects the 4th', async () => {
+    const ctx = { roomKind: 'channel' as const, ownerTier: 'premium' };
+    for (let i = 0; i < 3; i++) {
+      const t = await joinWithTransport('room-prem', `u-${i}`, FREE_ENT, ctx);
+      await produceScreen('room-prem', `u-${i}`, t, `scr-${i}`);
+    }
+    const t4 = await joinWithTransport('room-prem', 'u-4', FREE_ENT, ctx);
+    await expect(produceScreen('room-prem', 'u-4', t4, 'scr-4')).rejects.toThrow(
+      'Screen share limit reached (max 3)'
+    );
+  });
+
+  it('a premium participant raises a DM room to the premium screen cap', async () => {
+    const ctx = { roomKind: 'dm' as const };
+    const tFree = await joinWithTransport('dm-room', 'u-free', FREE_ENT, ctx);
+    const tPrem = await joinWithTransport('dm-room', 'u-prem', PREMIUM_ENT, ctx);
+    // Free cap would be 1 — the present premium participant raises it to 3.
+    await produceScreen('dm-room', 'u-free', tFree, 'scr-a');
+    await produceScreen('dm-room', 'u-prem', tPrem, 'scr-b');
+    const info = await produceScreen('dm-room', 'u-free', tFree, 'scr-c');
+    expect(info.source).toBe('screen');
+  });
+
+  it('downgrade grandfathers existing producers (no force-pause), caps NEW produces', async () => {
+    const ctx = { roomKind: 'dm' as const };
+    const tFree1 = await joinWithTransport('dm-down', 'u-free1', FREE_ENT, ctx);
+    const tFree2 = await joinWithTransport('dm-down', 'u-free2', FREE_ENT, ctx);
+    await joinWithTransport('dm-down', 'u-prem', PREMIUM_ENT, ctx);
+
+    // Two screenshares admitted under the premium DM cap (3).
+    const p1 = createMockProducer({ kind: 'video', id: 'scr-1' });
+    tFree1.produce.mockResolvedValueOnce(p1);
+    await manager.produce(
+      'dm-down',
+      'u-free1',
+      tFree1.id,
+      'video',
+      createRtpParameters() as any,
+      'screen'
+    );
+    const p2 = createMockProducer({ kind: 'video', id: 'scr-2' });
+    tFree2.produce.mockResolvedValueOnce(p2);
+    await manager.produce(
+      'dm-down',
+      'u-free2',
+      tFree2.id,
+      'video',
+      createRtpParameters() as any,
+      'screen'
+    );
+
+    // The premium participant leaves → next produce resolves the free cap (1).
+    await manager.leaveRoom('dm-down', 'u-prem');
+
+    // Existing producers are grandfathered: never paused or closed by the downgrade.
+    expect(p1.pause).not.toHaveBeenCalled();
+    expect(p1.close).not.toHaveBeenCalled();
+    expect(p2.pause).not.toHaveBeenCalled();
+    expect(p2.close).not.toHaveBeenCalled();
+
+    // A NEW screen produce is rejected (count 2 >= cap 1).
+    await expect(produceScreen('dm-down', 'u-free1', tFree1, 'scr-3')).rejects.toThrow(
+      'Screen share limit reached (max 1)'
+    );
+  });
+
+  it('premium participant joining a free DM raises the cap for the NEXT produce', async () => {
+    const ctx = { roomKind: 'dm' as const };
+    const tFree = await joinWithTransport('dm-up', 'u-free', FREE_ENT, ctx);
+    await produceScreen('dm-up', 'u-free', tFree, 'scr-1');
+    // Free cap (1) reached — a second produce rejects.
+    await expect(produceScreen('dm-up', 'u-free', tFree, 'scr-2')).rejects.toThrow(
+      'Screen share limit reached (max 1)'
+    );
+    // A premium participant joins → produce-time resolution now sees premium (3).
+    await joinWithTransport('dm-up', 'u-prem', PREMIUM_ENT, ctx);
+    const info = await produceScreen('dm-up', 'u-free', tFree, 'scr-3');
+    expect(info.source).toBe('screen');
+  });
+
+  it('premium-owner channel raises the camera cap to 25 for a free member', async () => {
+    const ctx = { roomKind: 'channel' as const, ownerTier: 'premium' };
+    const t = await joinWithTransport('room-cam', 'u-0', FREE_ENT, ctx);
+    // Produce 9 cameras — above the free cap (8), below premium (25).
+    for (let i = 0; i < 9; i++) {
+      t.produce.mockResolvedValueOnce(createMockProducer({ kind: 'video', id: `cam-${i}` }));
+      const info = await manager.produce(
+        'room-cam',
+        'u-0',
+        t.id,
+        'video',
+        createRtpParameters() as any,
+        'camera'
+      );
+      expect(info.source).toBe('camera');
+    }
   });
 });

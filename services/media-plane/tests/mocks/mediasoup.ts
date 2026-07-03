@@ -57,6 +57,7 @@ export function createMockConsumer(overrides: Record<string, unknown> = {}) {
     pause: vi.fn(() => Promise.resolve()),
     resume: vi.fn(() => Promise.resolve()),
     setPreferredLayers: vi.fn(() => Promise.resolve()),
+    setPriority: vi.fn(() => Promise.resolve()),
     close: vi.fn(),
     on: emitter.on,
     _emit: emitter.emit,

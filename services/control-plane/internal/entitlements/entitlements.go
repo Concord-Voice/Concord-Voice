@@ -40,7 +40,7 @@ type Entitlement struct {
 	MaxVideoPixelRate        int64 // width*height*fps ceiling; separates 1080p30/720p60 (free) from 1080p60 (premium)
 	MaxManualBitrateBps      int
 	MaxWebcamPublishers      int // room-owner-scoped; matches media-plane resolveVideoPublisherCap
-	MaxScreensharePublishers int // room-owner-scoped; media-plane enforcement is #1542 (flat cap today)
+	MaxScreensharePublishers int // room-owner-scoped; media-plane enforcement shipped with #1542 (resolveScreenProducerCap)
 
 	// Messaging (Class 2 — client-enforced char count).
 	MaxMessageChars int
@@ -123,7 +123,9 @@ func For(tier string) Entitlement {
 // pixel dimensions). Tier and max manual bitrate stay per-user; fixed channel
 // audio standards may widen AllowedAudioTiers/MinPtimeMs only, marked by
 // ChannelAudioUplift. The room-owner-scoped caps (MaxWebcamPublishers etc.) are
-// #1542's seam and are intentionally NOT carried here.
+// intentionally NOT carried here — #1542 shipped them via the separate
+// room_owner_tier join-authorize field (channels) and Participant.tier (DMs);
+// see ADR-0029.
 type MediaEntitlements struct {
 	Tier                string   `json:"tier"`
 	AllowedAudioTiers   []string `json:"allowed_audio_tiers"`

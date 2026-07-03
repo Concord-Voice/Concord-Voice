@@ -477,6 +477,32 @@ describe('VoiceControls', () => {
     globalThis.electron = origElectron;
   });
 
+  it('surfaces a screenshare cap error as a video-slot toast (#1542)', async () => {
+    const origElectron = globalThis.electron;
+    globalThis.electron = {
+      ...globalThis.electron,
+      getDesktopSources: vi.fn().mockResolvedValue([]),
+    } as unknown as typeof globalThis.electron;
+
+    const mockSetError = vi.fn();
+    mockToggleScreenShare.mockRejectedValueOnce(new Error('Screen share limit reached (max 1)'));
+    setVoiceState({ isScreenSharing: false, setVideoSlotError: mockSetError });
+    render(<VoiceControls />);
+
+    // Open picker, then select a source — the produce fails with the cap error.
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('Share Screen'));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Select Source'));
+    });
+
+    // Camera-path parity: the failure surfaces via setVideoSlotError, not just console.
+    expect(mockSetError).toHaveBeenCalledWith('Screen share limit reached (max 1)');
+
+    globalThis.electron = origElectron;
+  });
+
   it('closes screen share picker on cancel', async () => {
     const origElectron = globalThis.electron;
     globalThis.electron = {

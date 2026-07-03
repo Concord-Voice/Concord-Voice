@@ -146,6 +146,13 @@ export interface ChannelAccessResult {
   allowedAudioTiers: string[];
   minPtimeMs: number;
   maxManualBitrateBps: number;
+  /**
+   * Room-scoped cap tier (#1542) — the server OWNER's tier for channel rooms,
+   * parsed from the join-authorize `room_owner_tier` field, fail-closed to 'free'.
+   * `undefined` for DM rooms (the media-plane uses max present-participant tier)
+   * and on denial paths.
+   */
+  roomOwnerTier?: string;
   error?: string;
 }
 
@@ -385,6 +392,7 @@ export async function validateChannelAccess(
         name: string;
       };
       media_entitlements?: unknown;
+      room_owner_tier?: unknown;
     };
 
     const channel = responseData.channel;
@@ -393,6 +401,12 @@ export async function validateChannelAccess(
     // media_entitlements object, FAIL-CLOSED to the free floor if absent /
     // malformed. The tier is never taken from socket.handshake.auth.
     const ent = parseMediaEntitlements(responseData.media_entitlements);
+
+    // Room-owner cap tier (#1542): only the explicit 'premium' string grants
+    // premium room caps; anything else (incl. absent/garbage) fails closed to
+    // 'free'. Server-authoritative — resolved by the control-plane from the
+    // server owner's subscription, never from socket.handshake.auth.
+    const roomOwnerTier = responseData.room_owner_tier === 'premium' ? 'premium' : 'free';
 
     // The voice join endpoint validates channel type, membership, and permissions.
     // If we got a 200 with allowed=true, the user has access.
@@ -407,6 +421,7 @@ export async function validateChannelAccess(
       allowedAudioTiers: ent.allowedAudioTiers,
       minPtimeMs: ent.minPtimeMs,
       maxManualBitrateBps: ent.maxManualBitrateBps,
+      roomOwnerTier,
     };
   } catch (err) {
     logger.error('Failed to validate channel access', {

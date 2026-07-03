@@ -479,6 +479,11 @@ describe('validateChannelAccess', () => {
     expect(result.maxManualBitrateBps).toBe(10_000_000);
   });
 
+  // This parse path went LIVE with the #1542 review reconciliation: the DM
+  // authorize endpoint (POST /dm/conversations/:id/voice/authorize) now emits
+  // media_entitlements, so the premium userTier asserted here is what feeds
+  // Participant.tier for the ADR-0029 DM max-participant-tier room-cap
+  // resolution. Regression-lock: do not weaken these assertions.
   it('parses media_entitlements from the DM authorize response (room-kind-independent)', async () => {
     mockFetch().mockResolvedValueOnce({
       ok: true,
@@ -494,6 +499,8 @@ describe('validateChannelAccess', () => {
 
     expect(result.allowed).toBe(true);
     expect(result.userTier).toBe('premium');
+    expect(result.allowedAudioTiers).toContain('studio');
+    expect(result.minPtimeMs).toBe(10);
     expect(result.maxManualBitrateBps).toBe(10_000_000);
   });
 
@@ -587,7 +594,15 @@ describe('validateChannelAccess', () => {
           channel: { id: 'ch-1', server_id: 's', name: 'n' },
           media_entitlements: {
             tier: 'free',
-            allowed_audio_tiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+            allowed_audio_tiers: [
+              'minimum',
+              'low',
+              'moderate',
+              'standard',
+              'high',
+              'hifi',
+              'studio',
+            ],
             min_ptime_ms: 10, // premium-shaped (lower) → must clamp UP to 20
             max_manual_bitrate_bps: 10_000_000, // premium-shaped → must clamp DOWN to 5M
           },
@@ -614,7 +629,15 @@ describe('validateChannelAccess', () => {
           media_entitlements: {
             tier: 'free',
             channel_audio_uplift: true,
-            allowed_audio_tiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+            allowed_audio_tiers: [
+              'minimum',
+              'low',
+              'moderate',
+              'standard',
+              'high',
+              'hifi',
+              'studio',
+            ],
             min_ptime_ms: 10,
             max_manual_bitrate_bps: 10_000_000,
           },
@@ -638,5 +661,79 @@ describe('validateChannelAccess', () => {
     expect(result.userTier).toBe(FREE_MEDIA_ENTITLEMENT.tier);
     expect(result.maxManualBitrateBps).toBe(FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps);
     expect(result.minPtimeMs).toBe(FREE_MEDIA_ENTITLEMENT.minPtimeMs);
+  });
+
+  // ── Room-owner cap tier (#1542) ────────────────────────────────────────
+
+  it('parses room_owner_tier=premium from a channel join-authorize', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 'srv-1', name: 'v' },
+          room_owner_tier: 'premium',
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.roomOwnerTier).toBe('premium');
+  });
+
+  it('fail-closes room_owner_tier to "free" when the field is absent', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 'srv-1', name: 'v' },
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.roomOwnerTier).toBe('free');
+  });
+
+  it('fail-closes room_owner_tier to "free" on a malformed (non-tier) value', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 'srv-1', name: 'v' },
+          room_owner_tier: { sneaky: 'premium' },
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.roomOwnerTier).toBe('free');
+  });
+
+  it('leaves roomOwnerTier undefined for DM rooms', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ authorized: true, is_group: true }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'conv-1', 'token', 'dm');
+
+    expect(result.roomOwnerTier).toBeUndefined();
+  });
+
+  it('leaves roomOwnerTier undefined on the denial path', async () => {
+    mockFetch().mockResolvedValueOnce({ ok: false, status: 403 });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.roomOwnerTier).toBeUndefined();
   });
 });

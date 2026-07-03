@@ -277,9 +277,15 @@ export const config = {
 
   // Free-tier per-room concurrent camera-producer cap (#1539). P0 capacity
   // guardrail: bounds SFU egress fan-out so one free user can't saturate a box.
-  // TODO(#1294): paid tier raises this to the absolute ceiling once the
-  // entitlement resolver lands; until then all rooms use this free default.
+  // Tier-aware since #1542: premium rooms resolve to PREMIUM_VIDEO_PUBLISHER_CAP
+  // in roomManager; this is the free-room value.
   freeVideoPublisherCap: parsePositiveIntEnv(process.env.FREE_VIDEO_PUBLISHER_CAP, 8),
+
+  // Free per-room concurrent screenshare-producer cap (#1542). The premium
+  // value (3) is a code constant in roomManager (PREMIUM_SCREEN_PRODUCER_CAP),
+  // resolved per room tier by resolveScreenProducerCap — same shape as the
+  // camera cap above.
+  freeScreenProducerCap: parsePositiveIntEnv(process.env.FREE_SCREEN_PRODUCER_CAP, 1),
 
   // Audio last-N (#1544): free default forwarded-speaker cap. Tier-aware paid
   // value (16) deferred behind the #1294 seam, exactly like freeVideoPublisherCap.

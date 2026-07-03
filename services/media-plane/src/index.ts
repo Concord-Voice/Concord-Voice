@@ -335,12 +335,18 @@ async function main() {
             },
             rtpCapabilities,
             {
-              tier: access.userTier,
-              allowedAudioTiers: access.allowedAudioTiers,
-              minPtimeMs: access.minPtimeMs,
-              maxManualBitrateBps: access.maxManualBitrateBps,
-            },
-            parsedMediaFrameCryptoVersion
+              entitlement: {
+                tier: access.userTier,
+                allowedAudioTiers: access.allowedAudioTiers,
+                minPtimeMs: access.minPtimeMs,
+                maxManualBitrateBps: access.maxManualBitrateBps,
+              },
+              mediaFrameCryptoVersion: parsedMediaFrameCryptoVersion,
+              // Room-scoped cap context (#1542): roomKind selects the cap-tier
+              // resolution strategy; ownerTier is the server-authoritative
+              // room_owner_tier from the channel join-authorize (undefined for DMs).
+              roomContext: { roomKind, ownerTier: access.roomOwnerTier },
+            }
           );
 
           // Apply server enforcement if the joining user has active enforcement
