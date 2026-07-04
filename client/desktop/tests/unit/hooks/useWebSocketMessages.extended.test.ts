@@ -822,6 +822,32 @@ describe('useWebSocketMessages — extended handlers', () => {
       expect(notificationSoundService.play).toHaveBeenCalledWith('friend-request');
     });
 
+    // regression for #1955 — the server does not emit to_user_id/to_username
+    // yet (#981), so the received handler drops the record from the request
+    // list. The friend-request SOUND must still play: the event was routed to
+    // this authenticated user, so a request did arrive. Before the fix the
+    // to_* guard returned before play('friend-request') was reached, silencing
+    // every real-world friend request.
+    it('plays the friend-request sound even when to_* fields are absent (#1955)', () => {
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+
+      const handler = ws.handlers.get('friend_request_received')!;
+      act(() => {
+        handler({
+          type: 'friend_request_received',
+          data: {
+            id: 'req-2',
+            from_user_id: 'user-2',
+            from_username: 'alice',
+            created_at: '2025-01-01T00:00:00Z',
+          },
+        });
+      });
+
+      expect(notificationSoundService.play).toHaveBeenCalledWith('friend-request');
+    });
+
     it('handles friend_request_accepted with flat payload', () => {
       const ws = createMockWsService();
       renderHook(() => useWebSocketMessages(ws as never));

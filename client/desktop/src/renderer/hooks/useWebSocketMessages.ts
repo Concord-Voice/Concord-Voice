@@ -1499,6 +1499,15 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // to_* fields), tighten the schema to required and remove this guard.
     const unsubFriendRequestReceived = wsService.on('friend_request_received', (msg) => {
       const data = msg.data;
+
+      // Play the friend-request sound up front (#1955). The event is delivered
+      // over this authenticated user's socket, so a request genuinely arrived —
+      // the sound must not depend on the to_* fields the server doesn't emit yet
+      // (#981). The to_* guard below only suppresses the one-sided LIST record,
+      // not the notification; keeping the sound here means it fires even while
+      // the record is dropped.
+      notificationSoundService.play('friend-request');
+
       if (!data.to_user_id || !data.to_username) {
         // PII-minimization (CWE-532): never log the full payload — it carries
         // from_username / from_display_name / from_avatar_url. Emit only the
@@ -1524,9 +1533,6 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
         direction: 'received',
         createdAt: data.created_at,
       });
-
-      // Notification sound for friend request
-      notificationSoundService.play('friend-request');
     });
 
     // msg.data narrowed to FriendRequestAcceptedPayload. Schema is permissive
