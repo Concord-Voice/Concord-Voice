@@ -554,7 +554,8 @@ async function handle401Recovery(
   path: string,
   init: RequestInit | undefined,
   response: Response,
-  mid: string | null
+  mid: string | null,
+  authoritative: boolean
 ): Promise<Response> {
   // If auth already cleared, return original 401
   if (!useAuthStore.getState().accessToken) return response;
@@ -573,7 +574,14 @@ async function handle401Recovery(
       // session's encrypted disk token survived this ≤10s cooldown window
       // un-wiped — the userStore 401 handlers used to mask the gap before #1768
       // centralized the disk-token decision here (#1768 review, finding #6).
-      await handleRefreshFailure();
+      //
+      // …but only an AUTHORITATIVE request (a real Concord API call) may act on
+      // that revocation signal and tear down the session. A non-authoritative
+      // content-proxy 401 — the KLIPY GIF proxy (#1957) — is NOT proof the
+      // session is dead; tearing it down logged out a valid session on the next
+      // Ctrl+R (`no_session`). Return the raw 401 so the caller degrades
+      // gracefully; genuine expiry is still caught by the next authoritative call.
+      if (authoritative) await handleRefreshFailure();
       return response;
     }
     lastRefreshTimestamp = now;
@@ -581,7 +589,11 @@ async function handle401Recovery(
   }
 
   if (!newToken) {
-    await handleRefreshFailure();
+    // Refresh failed. Same authority rule as the cooldown branch above: only an
+    // authoritative Concord API call may tear down the session on a 401. A
+    // non-authoritative content-proxy 401 (KLIPY GIF proxy, #1957) returns the
+    // raw 401 and the caller shows a load error — it never logs the user out.
+    if (authoritative) await handleRefreshFailure();
     return response;
   }
 
@@ -606,7 +618,18 @@ async function handle401Recovery(
   return apiFetchRaw(path, init, retryHeaders);
 }
 
-export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+/**
+ * @param opts.authoritative Whether a 401 from this request may tear down the
+ *   session (default `true`). Real Concord API calls are authoritative. Pass
+ *   `false` for non-authoritative third-party content proxies (e.g. the KLIPY
+ *   GIF proxy, #1957) whose 401 is not proof the Concord session is dead — those
+ *   still attempt one refresh+retry but never call handleRefreshFailure.
+ */
+export async function apiFetch(
+  path: string,
+  init?: RequestInit,
+  opts?: { authoritative?: boolean }
+): Promise<Response> {
   const token = useAuthStore.getState().accessToken;
 
   const headers = new Headers(init?.headers);
@@ -646,5 +669,5 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
     return response;
   }
 
-  return handle401Recovery(path, init, response, mid);
+  return handle401Recovery(path, init, response, mid, opts?.authoritative ?? true);
 }

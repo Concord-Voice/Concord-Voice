@@ -496,6 +496,80 @@ describe('apiClient', () => {
       expect(useAuthStore.getState().accessToken).toBeNull();
     });
 
+    // #1957 — a non-authoritative request (a third-party content proxy such as
+    // the KLIPY GIF proxy) must NEVER tear down the session on a 401. Its 401 is
+    // not proof the Concord session is dead; genuine expiry is still caught by
+    // authoritative API calls (the tests above, which keep today's behavior).
+    it('does NOT tear down the session on a non-authoritative 401 when refresh fails (#1957)', async () => {
+      useAuthStore.getState().setAccessToken('valid-token');
+      useAuthStore.getState().setRememberMe(false); // worst case — a teardown here would clearTokens
+
+      globalThis.electron = {
+        refreshToken: vi.fn().mockResolvedValue({ status: 'error' }),
+        clearTokens: vi.fn(),
+      } as any;
+
+      mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+
+      const response = await apiFetch('/api/v1/klipy/gifs/items', undefined, {
+        authoritative: false,
+      });
+
+      expect(response.status).toBe(401);
+      expect(mockNuclearReset).not.toHaveBeenCalled();
+      expect(mockGracefulReset).not.toHaveBeenCalled();
+      expect(useAuthStore.getState().accessToken).toBe('valid-token');
+    });
+
+    it('does NOT tear down the session on a non-authoritative 401 inside the refresh cooldown (#1957)', async () => {
+      useAuthStore.getState().setAccessToken('valid-token');
+      useAuthStore.getState().setRememberMe(false);
+
+      globalThis.electron = {
+        refreshToken: vi.fn().mockResolvedValue({ status: 'ok', accessToken: 'refreshed-token' }),
+        clearTokens: vi.fn(),
+      } as any;
+
+      // Prime lastRefreshTimestamp with a real authoritative refresh so the next
+      // 401 lands inside the ≤10s cooldown "assume revocation" branch.
+      mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+      mockFetch.mockResolvedValueOnce(new Response('{"ok":true}', { status: 200 }));
+      await apiFetch('/api/v1/messages');
+
+      // A non-authoritative content-proxy 401 within the cooldown window.
+      mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+      const response = await apiFetch('/api/v1/klipy/gifs/items', undefined, {
+        authoritative: false,
+      });
+
+      expect(response.status).toBe(401);
+      expect(mockNuclearReset).not.toHaveBeenCalled();
+      expect(mockGracefulReset).not.toHaveBeenCalled();
+      expect(useAuthStore.getState().accessToken).not.toBeNull();
+    });
+
+    it('still refreshes and retries a non-authoritative 401 when the token is merely stale (#1957)', async () => {
+      useAuthStore.getState().setAccessToken('stale-token');
+
+      globalThis.electron = {
+        refreshToken: vi.fn().mockResolvedValue({ status: 'ok', accessToken: 'fresh-token' }),
+      } as any;
+
+      mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+      mockFetch.mockResolvedValueOnce(new Response('{"gif":true}', { status: 200 }));
+
+      const response = await apiFetch('/api/v1/klipy/gifs/items', undefined, {
+        authoritative: false,
+      });
+
+      // Opportunistic refresh+retry still works — a merely-expired access token
+      // transparently recovers the GIF, no teardown.
+      expect(response.status).toBe(200);
+      expect(globalThis.electron!.refreshToken).toHaveBeenCalledTimes(1);
+      expect(mockNuclearReset).not.toHaveBeenCalled();
+      expect(mockGracefulReset).not.toHaveBeenCalled();
+    });
+
     it('piggybacks on in-flight refresh when concurrent 401s occur', async () => {
       useAuthStore.getState().setAccessToken('old-token');
 

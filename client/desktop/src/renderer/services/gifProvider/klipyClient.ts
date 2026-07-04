@@ -247,9 +247,17 @@ class KlipyClient {
     }
   }
 
-  /** All KLIPY requests go through the authenticated control-plane proxy. */
+  /**
+   * All KLIPY requests go through the authenticated control-plane proxy.
+   *
+   * `authoritative: false` (#1957): a 401 from the third-party GIF proxy is NOT
+   * proof the Concord session is dead, so it must never tear down auth. A GIF
+   * that fails to load surfaces as a load error (getBySlug → null → embed error
+   * placeholder), never a logout. Genuine session expiry is still caught by the
+   * next real Concord API call, which is authoritative.
+   */
   private async doFetch(path: string, init?: RequestInit): Promise<Response> {
-    return apiFetch(`${KLIPY_PROXY_BASE}${path}`, init);
+    return apiFetch(`${KLIPY_PROXY_BASE}${path}`, init, { authoritative: false });
   }
 
   /** Append the customer_id query param. Always included (required by KLIPY).
