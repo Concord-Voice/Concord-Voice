@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, act } from '../../../test-utils';
 import { useFriendStore } from '@/renderer/stores/friendStore';
 import { usePrivacyStore } from '@/renderer/stores/privacyStore';
 import { vi } from 'vitest';
@@ -174,26 +174,86 @@ describe('AddFriendModal', () => {
   it('renders search input', () => {
     render(<AddFriendModal isOpen={true} onClose={mockOnClose} />);
     expect(
-      screen.getByPlaceholderText('Search by username (3+ characters)...')
+      screen.getByPlaceholderText('Search by name or username (2+ characters)...')
     ).toBeInTheDocument();
   });
 
-  it('does not search for queries less than 3 characters', () => {
+  it('does not search for queries less than 2 characters', () => {
     const mockSearch = vi.fn();
     useFriendStore.setState({ searchUsers: mockSearch });
     render(<AddFriendModal isOpen={true} onClose={mockOnClose} />);
-    const input = screen.getByPlaceholderText('Search by username (3+ characters)...');
-    fireEvent.change(input, { target: { value: 'ab' } });
+    const input = screen.getByPlaceholderText('Search by name or username (2+ characters)...');
+    fireEvent.change(input, { target: { value: 'a' } });
     expect(mockSearch).not.toHaveBeenCalled();
+    expect(screen.queryByText('No users found')).not.toBeInTheDocument();
   });
 
-  it('shows search results after typing 3+ characters', async () => {
+  it('searches for 2-character names', async () => {
+    const mockSearch = vi
+      .fn()
+      .mockResolvedValue([{ id: 'u1', username: 'edie', displayName: 'Ed' }]);
+    useFriendStore.setState({ searchUsers: mockSearch });
+    render(<AddFriendModal isOpen={true} onClose={mockOnClose} />);
+    const input = screen.getByPlaceholderText('Search by name or username (2+ characters)...');
+    fireEvent.change(input, { target: { value: 'ed' } });
+    await vi.waitFor(() => {
+      expect(mockSearch).toHaveBeenCalledWith('ed');
+      expect(screen.getByText('Ed')).toBeInTheDocument();
+    });
+  });
+
+  it('ignores stale search responses', async () => {
+    const resolvers: Record<
+      string,
+      (results: Array<{ id: string; username: string; displayName: string }>) => void
+    > = {};
+    const mockSearch = vi.fn(
+      (query: string) =>
+        new Promise((resolve) => {
+          resolvers[query] = resolve;
+        })
+    );
+    useFriendStore.setState({ searchUsers: mockSearch });
+    render(<AddFriendModal isOpen={true} onClose={mockOnClose} />);
+    const input = screen.getByPlaceholderText('Search by name or username (2+ characters)...');
+
+    fireEvent.change(input, { target: { value: 'ed' } });
+    await vi.waitFor(() => expect(mockSearch).toHaveBeenCalledWith('ed'));
+
+    fireEvent.change(input, { target: { value: 'edi' } });
+    await vi.waitFor(() => expect(mockSearch).toHaveBeenCalledWith('edi'));
+
+    await act(async () => {
+      resolvers.edi([{ id: 'u2', username: 'edie', displayName: 'Edie' }]);
+    });
+    expect(screen.getByText('Edie')).toBeInTheDocument();
+
+    await act(async () => {
+      resolvers.ed([]);
+    });
+    expect(screen.getByText('Edie')).toBeInTheDocument();
+    expect(screen.queryByText('No users found')).not.toBeInTheDocument();
+  });
+
+  it('shows no-match state after a completed search with no results', async () => {
+    const mockSearch = vi.fn().mockResolvedValue([]);
+    useFriendStore.setState({ searchUsers: mockSearch });
+    render(<AddFriendModal isOpen={true} onClose={mockOnClose} />);
+    const input = screen.getByPlaceholderText('Search by name or username (2+ characters)...');
+    fireEvent.change(input, { target: { value: 'zz' } });
+    await vi.waitFor(() => {
+      expect(mockSearch).toHaveBeenCalledWith('zz');
+      expect(screen.getByText('No users found')).toBeInTheDocument();
+    });
+  });
+
+  it('shows search results after typing 2+ characters', async () => {
     const mockSearch = vi
       .fn()
       .mockResolvedValue([{ id: 'u1', username: 'charlie', displayName: 'Charlie' }]);
     useFriendStore.setState({ searchUsers: mockSearch });
     render(<AddFriendModal isOpen={true} onClose={mockOnClose} />);
-    const input = screen.getByPlaceholderText('Search by username (3+ characters)...');
+    const input = screen.getByPlaceholderText('Search by name or username (2+ characters)...');
     fireEvent.change(input, { target: { value: 'cha' } });
     await vi.waitFor(() => {
       expect(screen.getByText('Charlie')).toBeInTheDocument();
@@ -388,7 +448,7 @@ describe('AddFriendModal', () => {
     const mockSendRequest = vi.fn().mockResolvedValue(undefined);
     useFriendStore.setState({ searchUsers: mockSearch, sendRequest: mockSendRequest });
     render(<AddFriendModal isOpen={true} onClose={mockOnClose} />);
-    const input = screen.getByPlaceholderText('Search by username (3+ characters)...');
+    const input = screen.getByPlaceholderText('Search by name or username (2+ characters)...');
     fireEvent.change(input, { target: { value: 'dia' } });
     await vi.waitFor(() => {
       expect(screen.getByText('Diana')).toBeInTheDocument();

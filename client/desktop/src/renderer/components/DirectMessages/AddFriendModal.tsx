@@ -32,6 +32,8 @@ const MAX_USES_OPTIONS = [
   { label: '10 uses', value: 10 },
 ];
 
+const USER_SEARCH_MIN_CHARS = 2;
+
 const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose }) => {
   // Friend code claim
   const [codeInput, setCodeInput] = useState('');
@@ -44,8 +46,10 @@ const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searchError, setSearchError] = useState('');
+  const [hasSearchedUsers, setHasSearchedUsers] = useState(false);
   const [sendingTo, setSendingTo] = useState<string | null>(null);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestSearchQueryRef = useRef('');
 
   // Code generation
   const [expiresIn, setExpiresIn] = useState(3600);
@@ -139,20 +143,25 @@ const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose }) => {
     (value: string) => {
       setSearchQuery(value);
       setSearchError('');
+      setHasSearchedUsers(false);
 
       if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
 
-      if (value.trim().length < 3) {
+      const trimmed = value.trim();
+      latestSearchQueryRef.current = trimmed;
+      if (trimmed.length < USER_SEARCH_MIN_CHARS) {
         setSearchResults([]);
         return;
       }
 
       searchTimerRef.current = setTimeout(async () => {
         try {
-          const results = await searchUsers(value.trim());
+          const results = await searchUsers(trimmed);
+          if (latestSearchQueryRef.current !== trimmed) return;
           setSearchResults(results.slice(0, 8));
+          setHasSearchedUsers(true);
         } catch {
-          setSearchError('Search failed');
+          if (latestSearchQueryRef.current === trimmed) setSearchError('Search failed');
         }
       }, 300);
     },
@@ -262,11 +271,14 @@ const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose }) => {
           <input
             type="text"
             className="add-friend-input"
-            placeholder="Search by username (3+ characters)..."
+            placeholder="Search by name or username (2+ characters)..."
             value={searchQuery}
             onChange={(e) => handleSearch(e.target.value)}
           />
           {searchError && <div className="add-friend-error">{searchError}</div>}
+          {hasSearchedUsers && !searchError && searchResults.length === 0 && (
+            <div className="add-friend-empty">No users found</div>
+          )}
 
           {searchResults.map((user) => (
             <div key={user.id} className="search-result-item">

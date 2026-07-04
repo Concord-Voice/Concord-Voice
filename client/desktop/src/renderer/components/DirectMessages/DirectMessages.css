@@ -663,6 +663,12 @@
   padding: calc(4px * var(--sp, 1)) 0;
 }
 
+.add-friend-empty {
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+  padding: calc(4px * var(--sp, 1)) 0;
+}
+
 /* Friend code preview card */
 .friend-code-preview,
 .search-result-item {
