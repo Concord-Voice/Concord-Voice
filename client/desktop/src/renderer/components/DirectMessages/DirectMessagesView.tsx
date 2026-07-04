@@ -25,7 +25,12 @@ const DirectMessagesView: React.FC = () => {
   const channelPanelPinned = useLayoutStore((s) => s.channelPanelPinned);
   const voiceActiveChannelId = useVoiceStore((s) => s.activeChannelId);
   const voiceConnectionState = useVoiceStore((s) => s.connectionState);
+  const voiceIsDMCall = useVoiceStore((s) => s.isDMCall);
+  const voiceDMConversationId = useVoiceStore((s) => s.dmConversationId);
   const isInVoice = !!(voiceActiveChannelId && voiceConnectionState === 'connected');
+  const isViewingOwnDMCall =
+    !!activeConversationId && voiceIsDMCall && voiceDMConversationId === activeConversationId;
+  const showPersistentVoiceBar = isInVoice && !isViewingOwnDMCall;
 
   // Show floating avatar when channel panel is unpinned and no conversation is active
   // (when a conversation IS active, MessageInput provides the UserPanel)
@@ -88,9 +93,12 @@ const DirectMessagesView: React.FC = () => {
           </ChannelPanel>
         }
         chatArea={
-          <div className="main-content" data-has-persistent-bar={isInVoice || undefined}>
+          <div
+            className="main-content"
+            data-has-persistent-bar={showPersistentVoiceBar || undefined}
+          >
             <DMChatArea selectedThreadId={activeConversationId} />
-            {isInVoice && <PersistentVoiceBar />}
+            {showPersistentVoiceBar && <PersistentVoiceBar />}
             {showFloatingAvatar && (
               <div className="floating-user-avatar">
                 <UserPanel compact />

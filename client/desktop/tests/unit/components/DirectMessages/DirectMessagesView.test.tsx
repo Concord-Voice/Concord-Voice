@@ -231,6 +231,18 @@ describe('DirectMessagesView', () => {
     expect(screen.getByTestId('persistent-voice-bar')).toBeInTheDocument();
   });
 
+  it('does not render PersistentVoiceBar for the selected direct call (#1913)', () => {
+    useDMStore.setState({ activeConversationId: 'conv-1' });
+    useVoiceStore.setState({
+      activeChannelId: 'conv-1',
+      connectionState: 'connected',
+      isDMCall: true,
+      dmConversationId: 'conv-1',
+    });
+    render(<DirectMessagesView />);
+    expect(screen.queryByTestId('persistent-voice-bar')).not.toBeInTheDocument();
+  });
+
   // --- Floating Avatar ---
 
   it('shows floating UserPanel when channel panel is unpinned and no active conversation', () => {
