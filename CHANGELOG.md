@@ -4,6 +4,23 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.23] — 2026-07-04
+
+### Added
+
+- **Manage your subscription in the app** ([#2043](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2043)) — a new Settings ▸ Subscription page lets you redeem a code and see your current plan and status at a glance.
+- **Audio and video quality that follows your plan** ([#2042](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2042), [#2039](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2039), [#2038](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2038)) — call quality, per-room camera and screenshare limits, and server capabilities now track your tier. When bandwidth gets tight, the app sheds webcam before screenshare before audio, so voice stays clear.
+- **Higher limits for subscribers** ([#2040](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2040)) — how many servers you can create and how deep you can search now scale with your subscription.
+- **Smoother GIFs, safely** ([#2041](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2041)) — the GIF pipeline preserves animation while guarding against maliciously oversized files.
+
+### Fixed
+
+- **Single sign-on no longer times out mid-signup** ([#2047](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2047)) — SSO registration now gets a proper 15-minute token window and recovers gracefully if it expires, instead of stranding you partway through.
+
+### Changed
+
+- **Behind-the-scenes CI, supply-chain hardening, and dependency upkeep** ([#2049](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2049), [#2046](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2046), [#2036](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2036), [#2035](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2035)) — tighter least-privilege on the release workflows, a security-patched build toolchain, and routine dependency refreshes.
+
 ## [0.2.22] — 2026-07-02
 
 ### Added
