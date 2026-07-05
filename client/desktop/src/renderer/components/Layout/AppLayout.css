@@ -15,6 +15,23 @@
   position: relative;
 }
 
+/* #1041: ambient encryption identity — a subtle 1px accent hairline across the
+   top of the app chrome, present at all times. Subliminal, not conscious; the
+   per-theme --accent-primary recolors it automatically. No animation, so it's
+   inert under reduced-motion. */
+.app-layout::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  pointer-events: none;
+  z-index: 1000;
+  background: linear-gradient(90deg, transparent 0%, var(--accent-primary) 50%, transparent 100%);
+  opacity: 0.3;
+}
+
 /* Channel pinned = show column; unpinned = collapse to 0 */
 .app-layout[data-channel-pinned='false'] {
   grid-template-columns: 0 1fr auto;

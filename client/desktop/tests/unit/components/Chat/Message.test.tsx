@@ -671,9 +671,9 @@ describe('Message', () => {
     expect(screen.queryByTitle('End-to-end encrypted')).toBeNull();
   });
 
-  it('still renders <Lock> on decrypt-failed messages', () => {
-    // Assertion B — regression guard for #795: the legitimate error-state lock icon must
-    // remain after the decorative badge is removed.
+  it('renders the LockKeyhole glyph on decrypt-failed messages', () => {
+    // Regression guard for #795 (legitimate error-state icon must remain) +
+    // #1041 (terminal decrypt-failure uses the locked-out glyph, distinct from pending).
     render(
       <Message
         message={{ ...mockMessage, decryptFailed: true }}
@@ -691,12 +691,12 @@ describe('Message', () => {
     // is null, and `.not.toBeNull()` passes on undefined. toBeTruthy fails on
     // both null and undefined, so the assertion can't false-pass on a
     // regression that broke the antecedent.
-    expect(failedSpan?.querySelector('svg')).toBeTruthy();
+    expect(failedSpan?.querySelector('svg.lucide-lock-keyhole')).toBeTruthy();
   });
 
-  it('still renders <Lock> on pending-keys messages', () => {
-    // Assertion C — regression guard for #795: the legitimate pending-keys lock icon must
-    // remain after the decorative badge is removed.
+  it('renders the KeyRound glyph on pending-keys messages', () => {
+    // Regression guard for #795 (legitimate pending-keys icon must remain) +
+    // #1041 (transient pending state uses the key-arriving glyph, distinct from terminal).
     render(
       <Message
         message={{ ...mockMessage, pendingKeys: true }}
@@ -711,7 +711,42 @@ describe('Message', () => {
     expect(pendingSpan).not.toBeNull();
     // See comment in decrypt-failed test above: toBeTruthy prevents false-pass
     // when the antecedent .closest() returns null.
-    expect(pendingSpan?.querySelector('svg')).toBeTruthy();
+    expect(pendingSpan?.querySelector('svg.lucide-key-round')).toBeTruthy();
+  });
+
+  // ── decrypted-reveal animation (#1041) ──
+
+  it('plays decrypted-reveal when a pending-keys message resolves', () => {
+    const { container, rerender } = render(
+      <Message
+        message={{ ...mockMessage, pendingKeys: true }}
+        currentUserId="user-2"
+        showAvatar={true}
+      />
+    );
+    // While pending, the resolved content wrapper with the reveal class is not present.
+    expect(container.querySelector('.message-text.decrypted-reveal')).toBeNull();
+
+    // Key arrives: pendingKeys flips false, content decrypts.
+    rerender(
+      <Message
+        message={{ ...mockMessage, pendingKeys: false }}
+        currentUserId="user-2"
+        showAvatar={true}
+      />
+    );
+    expect(container.querySelector('.message-text.decrypted-reveal')).not.toBeNull();
+    // The class intentionally persists — the CSS animation is a single non-looping
+    // run, so a lingering class can't re-trigger it, and on remount the reveal flag
+    // re-initializes false. (No onAnimationEnd cleanup to assert; jsdom has no
+    // AnimationEvent and React 19's delegated onAnimationEnd is unreachable here.)
+  });
+
+  it('does not play decrypted-reveal for a message that was never pending', () => {
+    const { container } = render(
+      <Message message={mockMessage} currentUserId="user-2" showAvatar={true} />
+    );
+    expect(container.querySelector('.message-text.decrypted-reveal')).toBeNull();
   });
 
   // ── Avatar profile card ──

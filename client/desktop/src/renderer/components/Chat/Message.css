@@ -178,18 +178,44 @@
   line-height: 1.35;
 }
 
+/* #1041: elevated decrypt-failed visual language — bordered tinted surface.
+   Ambient encryption identity now lives at the chrome/system level, so the
+   only encryption UI a user sees (the failure state) reads as a deliberate
+   surface rather than muted italic text. */
 .decrypt-failed {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  padding: 4px 8px;
+  border-radius: var(--radius-base);
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 15%, transparent);
+  background: color-mix(in srgb, var(--accent-primary) 5%, transparent);
   color: var(--text-muted);
-  font-style: italic;
-  opacity: 0.8;
+  font-style: normal;
 }
 
 .decrypt-failed.pending-keys {
   color: var(--state-encryption-pending);
-  opacity: 0.9;
+  border-color: color-mix(in srgb, var(--state-encryption-pending) 25%, transparent);
+  background: color-mix(in srgb, var(--state-encryption-pending) 10%, transparent);
+}
+
+/* #1041: one-shot fade-in when a pending-keys message decrypts. Driven by
+   animation-duration so the global [data-reduce-animations='true'] kill-switch
+   in styles/index.css zeroes it with no per-rule override. */
+@keyframes decrypted-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.message-text.decrypted-reveal {
+  animation: decrypted-reveal var(--motion-duration-base) ease-out;
 }
 
 /* Own message styling */

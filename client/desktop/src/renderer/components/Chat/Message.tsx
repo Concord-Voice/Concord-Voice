@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Lock } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { LockKeyhole, KeyRound } from 'lucide-react';
 import { MessageWithStatus, type ChatContextType } from '../../types/chat';
 import { useMemberStore } from '../../stores/memberStore';
 import { usePermissionStore } from '../../stores/permissionStore';
@@ -370,18 +370,34 @@ function MessageTextContent({
     !message.pendingKeys && !message.decryptFailed ? getEmojiOnlyCount(message.content) : 0;
   const emojiClass = getEmojiSizeClass(emojiCount);
 
+  // #1041: one-shot reveal when a pending-keys message resolves (key arrives →
+  // pendingKeys flips false and content decrypts). The CSS animation is a single
+  // non-looping run; the flag stays set and the class lingers harmlessly at the
+  // rest state (a finished animation can't re-trigger from an unchanged class),
+  // and re-initializes false on remount, so the reveal never replays. There is
+  // deliberately no onAnimationEnd cleanup: it would only clear an already-inert
+  // class, and jsdom has no AnimationEvent to test such a handler against anyway.
+  const wasPendingRef = useRef(message.pendingKeys);
+  const [revealing, setRevealing] = useState(false);
+  useEffect(() => {
+    if (wasPendingRef.current && !message.pendingKeys && !message.decryptFailed) {
+      setRevealing(true);
+    }
+    wasPendingRef.current = message.pendingKeys;
+  }, [message.pendingKeys, message.decryptFailed]);
+
   let contentNode: React.ReactNode;
   if (message.pendingKeys) {
     contentNode = (
       <span className="decrypt-failed pending-keys">
-        <Lock size={14} />
+        <KeyRound size={14} />
         Waiting for encryption keys...
       </span>
     );
   } else if (message.decryptFailed) {
     contentNode = (
       <span className="decrypt-failed">
-        <Lock size={14} />
+        <LockKeyhole size={14} />
         Unable to decrypt this message
       </span>
     );
@@ -403,7 +419,13 @@ function MessageTextContent({
   }
 
   return (
-    <div className={'message-text' + (emojiClass ? ' ' + emojiClass : '')}>
+    <div
+      className={
+        'message-text' +
+        (emojiClass ? ' ' + emojiClass : '') +
+        (revealing ? ' decrypted-reveal' : '')
+      }
+    >
       {contentNode}
       {!showAvatar && message.edited_at && <span className="message-edited-inline">(edited)</span>}
     </div>
