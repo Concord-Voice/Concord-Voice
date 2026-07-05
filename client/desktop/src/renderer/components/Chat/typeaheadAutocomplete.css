@@ -1,0 +1,35 @@
+/* Shared typeahead popover styling for the mention (@) and emoji (:) composer
+   autocompletes. Component CSS files layer their option internals on top of
+   these base classes; each option/container element carries both its
+   component-specific marker class and the shared class below. */
+.typeahead-autocomplete {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  margin-bottom: 4px;
+  padding: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  z-index: 100;
+}
+
+.typeahead-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.typeahead-option:hover,
+.typeahead-option.selected {
+  background: var(--bg-hover);
+}

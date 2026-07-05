@@ -2,6 +2,8 @@ import React, { useState, useRef, useEffect, useCallback, useId } from 'react';
 import { Smile, ImagePlay, Paperclip, Lock, UserPlus } from 'lucide-react';
 import MessageInputContextMenu from './MessageInputContextMenu';
 import MentionAutocomplete, { type MentionAutocompleteHandle } from './MentionAutocomplete';
+import EmojiAutocomplete, { type EmojiAutocompleteHandle } from './EmojiAutocomplete';
+import { extractTriggerToken } from './typeaheadAutocomplete';
 import EmojiPicker, { preloadEmojiPicker } from '../EmojiPicker/LazyEmojiPicker';
 import LazyGifPicker, { preloadGifPicker } from '../GifPicker/LazyGifPicker';
 import UserPanel from '../User/UserPanel';
@@ -217,6 +219,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
   );
   const canViewChannelOverrides = hasPermission(serverPerms, Permissions.MANAGE_CHANNELS);
   const [showMentions, setShowMentions] = useState(false);
+  const [showEmojiAutocomplete, setShowEmojiAutocomplete] = useState(false);
   const textareaId = useId();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const emojiBtnRef = useRef<HTMLButtonElement>(null);
@@ -227,6 +230,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
   // Track mentions selected via autocomplete (for building the addendum)
   const selectedMentionsRef = useRef<ParsedMention[]>([]);
   const mentionAutocompleteRef = useRef<MentionAutocompleteHandle | null>(null);
+  const emojiAutocompleteRef = useRef<EmojiAutocompleteHandle | null>(null);
 
   // Auto-focus textarea when replyingTo changes
   useEffect(() => {
@@ -508,26 +512,46 @@ const MessageInput: React.FC<MessageInputProps> = ({
   // express — so this is an intentional set-state-in-effect, not the anti-pattern.
   /* eslint-disable @eslint-react/set-state-in-effect -- intentional centralized derivation; see comment above */
   useEffect(() => {
-    if (!content) {
-      setShowMentions(false);
-      return;
-    }
-    // Check if there's an active @query at cursor position
-    let i = cursorPos - 1;
-    while (i >= 0 && content[i] !== '@' && content[i] !== ' ' && content[i] !== '\n') {
-      i--;
-    }
-    if (
-      i >= 0 &&
-      content[i] === '@' &&
-      (i === 0 || content[i - 1] === ' ' || content[i - 1] === '\n')
-    ) {
-      setShowMentions(true);
-    } else {
-      setShowMentions(false);
-    }
+    setShowMentions(extractTriggerToken(content, cursorPos, '@') !== null);
   }, [content, cursorPos]);
   /* eslint-enable @eslint-react/set-state-in-effect -- re-enable after the intentional centralized-derivation effect above */
+
+  // #1754: detect an active `:query` shortcode token for the emoji typeahead.
+  // Same centralized-derivation rationale as the @-mention effect above. The `:`
+  // must be at start-of-input or preceded by whitespace, so `3:30` / `http://` /
+  // a completed `:smile:` never (re)trigger the popover. `@` and `:` are distinct
+  // triggers each requiring a whitespace/start boundary, so at most one popover
+  // is active for a given cursor position (EmojiAutocomplete renders null when the
+  // token has no matching shortcodes).
+  /* eslint-disable @eslint-react/set-state-in-effect -- intentional centralized derivation; see the @-mention effect above */
+  useEffect(() => {
+    setShowEmojiAutocomplete(extractTriggerToken(content, cursorPos, ':') !== null);
+  }, [content, cursorPos]);
+  /* eslint-enable @eslint-react/set-state-in-effect -- re-enable after the intentional centralized-derivation effect above */
+
+  const handleEmojiShortcodeSelect = useCallback(
+    (replacementText: string, startIndex: number) => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+
+      const before = content.slice(0, startIndex);
+      const after = content.slice(cursorPos);
+      const newContent = before + replacementText + after;
+
+      setContent(newContent);
+      setShowEmojiAutocomplete(false);
+
+      // Move cursor after the inserted emoji glyph + space.
+      requestAnimationFrame(() => {
+        const newCursor = startIndex + replacementText.length;
+        textarea.selectionStart = newCursor;
+        textarea.selectionEnd = newCursor;
+        setCursorPos(newCursor);
+        textarea.focus();
+      });
+    },
+    [content, cursorPos]
+  );
 
   const handleMentionSelect = useCallback(
     (mention: ParsedMention, replacementText: string) => {
@@ -721,12 +745,20 @@ const MessageInput: React.FC<MessageInputProps> = ({
     else setUploadError(null);
   };
 
+  // Route nav keys to whichever composer typeahead is open. Mentions (@) and
+  // emoji shortcodes (:) share the same nav-key contract (Arrows/Enter/Tab/
+  // Escape consumed when open). At most one popover is active for a given cursor
+  // (distinct triggers, each requiring a whitespace/start boundary), so ordering
+  // is not load-bearing. Returns true when the key was consumed.
+  const routeAutocompleteKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>): boolean => {
+    if (showMentions && mentionAutocompleteRef.current?.handleKeyDown(e)) return true;
+    if (showEmojiAutocomplete && emojiAutocompleteRef.current?.handleKeyDown(e)) return true;
+    return false;
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // Let mention autocomplete handle keyboard events first
-    if (showMentions && mentionAutocompleteRef.current) {
-      const handled = mentionAutocompleteRef.current.handleKeyDown(e);
-      if (handled) return;
-    }
+    // Open typeaheads consume their nav keys first.
+    if (routeAutocompleteKeyDown(e)) return;
 
     // #1953: Ctrl+E / Ctrl+G open the emoji / GIF picker from the composer.
     // After the mention-autocomplete guard (an open typeahead consumes its keys
@@ -852,6 +884,17 @@ const MessageInput: React.FC<MessageInputProps> = ({
             conversationId={conversationId}
             onSelect={handleMentionSelect}
             onClose={() => setShowMentions(false)}
+            anchorRef={textareaRef}
+          />
+        )}
+
+        {showEmojiAutocomplete && (
+          <EmojiAutocomplete
+            ref={emojiAutocompleteRef}
+            text={content}
+            cursorPosition={cursorPos}
+            onSelect={handleEmojiShortcodeSelect}
+            onClose={() => setShowEmojiAutocomplete(false)}
             anchorRef={textareaRef}
           />
         )}

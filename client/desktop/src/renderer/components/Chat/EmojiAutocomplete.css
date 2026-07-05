@@ -1,0 +1,22 @@
+/* Emoji-specific option internals. The popover container (.emoji-autocomplete)
+   and option row (.emoji-option) styling comes from the shared
+   .typeahead-autocomplete / .typeahead-option classes in
+   typeaheadAutocomplete.css; the elements carry both classes. */
+.emoji-option-glyph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.emoji-option-code {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-secondary);
+}

@@ -41,7 +41,7 @@ const CONSTRUCTS: Construct[] = [
   { source: '||spoiler||', rendered: '(click to reveal)' },
   { source: '# H1 / ## H2 / ### H3', rendered: 'Heading text' },
   { source: '---', rendered: '(horizontal rule)' },
-  { source: ':smile:', rendered: '😄' },
+  { source: ':smile:', rendered: '😄 — type : in the composer to autocomplete' },
 ];
 
 interface Props {

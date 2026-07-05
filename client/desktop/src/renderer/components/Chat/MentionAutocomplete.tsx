@@ -19,6 +19,8 @@ import {
   MENTION_ROLES,
 } from '../../utils/permissions';
 import type { ParsedMention } from '../../utils/mentions';
+import { extractTriggerToken, handleTypeaheadKeyDown } from './typeaheadAutocomplete';
+import './typeaheadAutocomplete.css';
 import './MentionAutocomplete.css';
 
 export interface MentionAutocompleteProps {
@@ -156,21 +158,12 @@ const MentionAutocomplete = forwardRef<MentionAutocompleteHandle, MentionAutocom
     const serverRoles = usePermissionStore((s) => s.serverRoles);
     const channelPermissions = usePermissionStore((s) => s.channelPermissions);
 
-    // Extract the @query from text at cursor position
-    const query = useMemo(() => {
-      // Walk backwards from cursor to find the @ trigger
-      let i = cursorPosition - 1;
-      while (i >= 0 && text[i] !== '@' && text[i] !== ' ' && text[i] !== '\n') {
-        i--;
-      }
-      if (i < 0 || text[i] !== '@') return null;
-      // Ensure @ is at start of line or preceded by whitespace
-      if (i > 0 && text[i - 1] !== ' ' && text[i - 1] !== '\n') return null;
-      return {
-        text: text.slice(i + 1, cursorPosition).toLowerCase(),
-        startIndex: i,
-      };
-    }, [text, cursorPosition]);
+    // Extract the active @query token at the cursor (start-of-input or
+    // whitespace-preceded @, stopping at whitespace).
+    const query = useMemo(() => extractTriggerToken(text, cursorPosition, '@'), [
+      text,
+      cursorPosition,
+    ]);
 
     // Compute effective permissions (server base + channel SBAC overrides)
     const permissions = useMemo(() => {
@@ -262,31 +255,15 @@ const MentionAutocomplete = forwardRef<MentionAutocompleteHandle, MentionAutocom
 
     // Keyboard navigation (called from MessageInput's onKeyDown)
     const handleKeyDown = useCallback(
-      (e: React.KeyboardEvent) => {
-        if (options.length === 0) return false;
-
-        switch (e.key) {
-          case 'ArrowDown':
-            e.preventDefault();
-            setSelectedIndex((i) => (i + 1) % options.length);
-            return true;
-          case 'ArrowUp':
-            e.preventDefault();
-            setSelectedIndex((i) => (i - 1 + options.length) % options.length);
-            return true;
-          case 'Enter':
-          case 'Tab':
-            e.preventDefault();
-            handleSelect(options[selectedIndex]);
-            return true;
-          case 'Escape':
-            e.preventDefault();
-            onClose();
-            return true;
-          default:
-            return false;
-        }
-      },
+      (e: React.KeyboardEvent) =>
+        handleTypeaheadKeyDown(
+          e,
+          options.length,
+          selectedIndex,
+          setSelectedIndex,
+          (i) => handleSelect(options[i]),
+          onClose
+        ),
       [options, selectedIndex, handleSelect, onClose]
     );
 
@@ -297,7 +274,7 @@ const MentionAutocomplete = forwardRef<MentionAutocompleteHandle, MentionAutocom
 
     return (
       <div
-        className="mention-autocomplete"
+        className="mention-autocomplete typeahead-autocomplete"
         role="listbox"
         aria-label="Mention suggestions"
         aria-activedescendant={options[selectedIndex] ? `mention-opt-${selectedIndex}` : undefined}
@@ -308,7 +285,7 @@ const MentionAutocomplete = forwardRef<MentionAutocompleteHandle, MentionAutocom
           <div
             key={`${option.type}-${option.id || option.label}`}
             id={`mention-opt-${i}`}
-            className={`mention-option ${i === selectedIndex ? 'selected' : ''}`}
+            className={`mention-option typeahead-option ${i === selectedIndex ? 'selected' : ''}`}
             role="option"
             tabIndex={-1}
             aria-selected={i === selectedIndex}

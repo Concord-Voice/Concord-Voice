@@ -1,35 +1,7 @@
-.mention-autocomplete {
-  position: absolute;
-  bottom: 100%;
-  left: 0;
-  right: 0;
-  max-height: 240px;
-  overflow-y: auto;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  margin-bottom: 4px;
-  padding: 4px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-  z-index: 100;
-}
-
-.mention-option {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 14px;
-  color: var(--text-primary);
-}
-
-.mention-option:hover,
-.mention-option.selected {
-  background: var(--bg-hover);
-}
-
+/* The popover container (.mention-autocomplete) and option row (.mention-option)
+   styling comes from the shared .typeahead-autocomplete / .typeahead-option
+   classes in typeaheadAutocomplete.css; the elements carry both classes. Only
+   the mention-specific option internals live here. */
 .mention-option-icon {
   display: flex;
   align-items: center;
