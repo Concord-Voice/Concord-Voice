@@ -47,9 +47,11 @@ vi.mock('@/renderer/components/Chat/AttachmentUploadPreview', () => ({
 }));
 vi.mock('@/renderer/components/EmojiPicker/LazyEmojiPicker', () => ({
   default: () => null,
+  preloadEmojiPicker: () => {}, // #2071: MessageInput preloads this on mount
 }));
 vi.mock('@/renderer/components/GifPicker/LazyGifPicker', () => ({
   default: () => null,
+  preloadGifPicker: () => {}, // #2071: MessageInput preloads this on mount
 }));
 vi.mock('@/renderer/components/Markdown/SyntaxHelpModal', () => ({
   default: () => null,

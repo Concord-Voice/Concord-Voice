@@ -2,8 +2,8 @@ import React, { useState, useRef, useEffect, useCallback, useId } from 'react';
 import { Smile, ImagePlay, Paperclip, Lock, UserPlus } from 'lucide-react';
 import MessageInputContextMenu from './MessageInputContextMenu';
 import MentionAutocomplete, { type MentionAutocompleteHandle } from './MentionAutocomplete';
-import EmojiPicker from '../EmojiPicker/LazyEmojiPicker';
-import LazyGifPicker from '../GifPicker/LazyGifPicker';
+import EmojiPicker, { preloadEmojiPicker } from '../EmojiPicker/LazyEmojiPicker';
+import LazyGifPicker, { preloadGifPicker } from '../GifPicker/LazyGifPicker';
 import UserPanel from '../User/UserPanel';
 import SyntaxHelpModal from '../Markdown/SyntaxHelpModal';
 import { InviteServerPicker } from './InviteServerPicker';
@@ -234,6 +234,15 @@ const MessageInput: React.FC<MessageInputProps> = ({
       textareaRef.current.focus();
     }
   }, [replyingTo]);
+
+  // #2071: warm the lazy emoji/GIF picker chunks after the composer mounts so the
+  // FIRST open doesn't trigger a chunk download/parse reflow of the input region
+  // (the reported one-off "expand then snap back" jump — first-open-only because
+  // later opens hit the module cache). Runs post-paint, so it never blocks render.
+  useEffect(() => {
+    preloadEmojiPicker();
+    preloadGifPicker();
+  }, []);
 
   // Restore draft content and reply context when channel/conversation changes
   useEffect(() => {

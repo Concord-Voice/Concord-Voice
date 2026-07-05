@@ -42,6 +42,7 @@ vi.mock('@/renderer/stores/layoutStore', () => ({
 
 vi.mock('@/renderer/components/EmojiPicker/LazyEmojiPicker', () => ({
   default: () => null,
+  preloadEmojiPicker: () => {}, // #2071: MessageInput preloads this on mount
 }));
 
 vi.mock('@/renderer/components/Chat/MentionAutocomplete', () => ({
