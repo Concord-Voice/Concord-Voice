@@ -5,11 +5,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/api"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
+	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
+	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -39,6 +45,67 @@ func seedRecoveryCode(t *testing.T, ts *testhelpers.TestServer, email, code, use
 	key := recoveryCodeKeyPrefix + email
 	err = ts.Redis.Set(context.Background(), key, data, 10*time.Minute).Err()
 	require.NoError(t, err)
+}
+
+func setupRecoverySMTPFailureTS(t *testing.T, closeDelay time.Duration) *testhelpers.TestServer {
+	t.Helper()
+	t.Setenv("CONCORD_ENV", "test")
+
+	db, dbCleanup := testhelpers.SetupTestDB(t)
+	redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr == nil {
+			time.Sleep(closeDelay)
+			_ = conn.Close()
+		}
+	}()
+
+	host, portText, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
+	port, err := strconv.Atoi(portText)
+	require.NoError(t, err)
+
+	cfg := &config.Config{
+		Environment:       "test",
+		Port:              "0",
+		JWTSecret:         testhelpers.TestJWTSecret,
+		AllowedOrigins:    []string{"*"},
+		SMTPHost:          host,
+		SMTPPort:          port,
+		SMTPFrom:          "Concord Voice <noreply@test.concord.chat>",
+		MFAEncryptionKey:  "0000000000000000000000000000000000000000000000000000000000000000",
+		WebAuthnRPID:      "localhost",
+		WebAuthnRPOrigins: []string{"http://localhost:3001"},
+	}
+
+	router, hub, natsClient := api.NewRouter(
+		db,
+		redisClient,
+		nil,
+		cfg,
+		nil,
+		logger.NewWithWriter(io.Discard),
+	)
+	if natsClient != nil {
+		t.Cleanup(func() { natsClient.Close() })
+	}
+	t.Cleanup(func() { hub.Shutdown() })
+	t.Cleanup(func() {
+		redisCleanup()
+		dbCleanup()
+	})
+
+	return &testhelpers.TestServer{
+		Router: router,
+		Hub:    hub,
+		DB:     db,
+		Redis:  redisClient,
+	}
 }
 
 // --- RecoveryBegin Tests ---
@@ -90,6 +157,33 @@ func TestRecoveryBeginStoresCodeInRedis(t *testing.T) {
 	assert.NotEmpty(t, record["code_hash"])
 	assert.Equal(t, user.ID, record["user_id"])
 	assert.Equal(t, float64(0), record["attempts"])
+}
+
+func TestRecoveryBeginSMTPFailureKeepsGenericResponseAndClearsCode(t *testing.T) {
+	ts := setupRecoverySMTPFailureTS(t, 6*time.Second)
+	user := ts.CreateTestUser(t, "recoverysmtpfail")
+
+	w := ts.DoRequest("POST", pathRecoveryBegin, map[string]interface{}{
+		"email": user.Email,
+	}, nil)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Contains(t, body["message"], "If an account exists")
+
+	exists, err := ts.Redis.Exists(context.Background(), recoveryCodeKeyPrefix+user.Email).Result()
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), exists)
+
+	missing := ts.DoRequest("POST", pathRecoveryBegin, map[string]interface{}{
+		"email": "smtp-missing@test.concord.chat",
+	}, nil)
+	assert.Equal(t, w.Code, missing.Code)
+
+	var missingBody map[string]interface{}
+	testhelpers.ParseJSON(t, missing, &missingBody)
+	assert.Equal(t, body["message"], missingBody["message"])
 }
 
 // --- RecoveryVerifyCode Tests ---

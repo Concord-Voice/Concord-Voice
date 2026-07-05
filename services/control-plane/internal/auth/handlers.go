@@ -1863,7 +1863,13 @@ func (h *Handler) RecoveryBegin(c *gin.Context) {
 	// Send code via email
 	if err := h.emailSvc.SendRecoveryCode(email, code); err != nil {
 		h.log.Error("Failed to send recovery code email", "error", err, "email", email)
-		// Still return success to prevent enumeration — the code is in Redis for retry
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		if delErr := h.redis.Del(cleanupCtx, recoveryRedisKey(email)).Err(); delErr != nil {
+			h.log.Warn("Failed to clear unsent recovery code", "error", delErr)
+		}
+		c.JSON(http.StatusOK, successMsg)
+		return
 	}
 
 	h.log.Info("Recovery code sent", "email", email)
