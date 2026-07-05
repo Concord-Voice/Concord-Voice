@@ -419,7 +419,7 @@ describe('MessageInput', () => {
 
   it('renders emoji button', () => {
     render(<MessageInput onSendMessage={onSendMessage} />);
-    const emojiBtn = screen.getByTitle('Emoji');
+    const emojiBtn = screen.getByTitle('Emoji (Ctrl+E)');
     expect(emojiBtn).toBeInTheDocument();
   });
 
@@ -427,7 +427,7 @@ describe('MessageInput', () => {
 
   it('renders disabled GIF button', () => {
     render(<MessageInput onSendMessage={onSendMessage} />);
-    const gifBtn = screen.getByTitle('GIF');
+    const gifBtn = screen.getByTitle('GIF (Ctrl+G)');
     expect(gifBtn).toBeDisabled();
   });
 

@@ -728,6 +728,26 @@ const MessageInput: React.FC<MessageInputProps> = ({
       if (handled) return;
     }
 
+    // #1953: Ctrl+E / Ctrl+G open the emoji / GIF picker from the composer.
+    // After the mention-autocomplete guard (an open typeahead consumes its keys
+    // first) and before Enter-to-send. Exact-modifier match (Ctrl only, no
+    // Meta/Alt/Shift) — this intentionally overrides the macOS readline Ctrl+E
+    // ("move to end of line") in favor of the picker; End / Cmd+→ remain
+    // available. Ctrl+G respects the gifsEnabled flag, mirroring the GIF button.
+    if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+      const shortcut = e.key.toLowerCase();
+      if (shortcut === 'e') {
+        e.preventDefault();
+        toggleEmojiPicker();
+        return;
+      }
+      if (shortcut === 'g' && gifsEnabled) {
+        e.preventDefault();
+        toggleGifPicker();
+        return;
+      }
+    }
+
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -957,7 +977,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
             <button
               ref={emojiBtnRef}
               className={`media-btn ${showEmojiPicker ? 'active' : ''}`}
-              title="Emoji"
+              title="Emoji (Ctrl+E)"
               onClick={toggleEmojiPicker}
             >
               <Smile size={18} />
@@ -965,7 +985,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
             <button
               ref={gifBtnRef}
               className={`media-btn ${showGifPicker ? 'active' : ''}`}
-              title="GIF"
+              title="GIF (Ctrl+G)"
               disabled={!gifsEnabled}
               onClick={toggleGifPicker}
             >
