@@ -17,6 +17,8 @@ import {
   getEmojiOnlyCount,
   getEmojiSizeClass,
   renderEmoji,
+  expandShortcodes,
+  hasIndentedCodeBlock,
   type MentionLookup,
 } from './messageUtils';
 import MarkdownContent from '../Markdown/MarkdownContent';
@@ -366,9 +368,26 @@ function MessageTextContent({
   currentUserId: string;
   currentUserRoleIds?: ReadonlySet<string>;
 }>) {
-  const emojiCount =
-    !message.pendingKeys && !message.decryptFailed ? getEmojiOnlyCount(message.content) : 0;
-  const emojiClass = getEmojiSizeClass(emojiCount);
+  // #2070: run the emoji-only / jumbo decision on shortcode-EXPANDED text so a
+  // `:smile:`-only message scales identically to a literal 😄 (and picker emoji).
+  // Expanded once here and reused by the renderEmoji path below.
+  //
+  // Guard: an indented code block (`    :smile:`) is a `code` node that
+  // remarkEmojiShortcodes skips, so markdown renders the LITERAL `:smile:`. Keep
+  // such content off the emoji-only fast path so the jumbo decision matches the
+  // markdown render instead of diverging into a jumbo 😄 (#2070).
+  //
+  // Memoized so the derivation (incl. the expandShortcodes regex pass) only
+  // re-runs when content or key/decrypt state changes, not on every unrelated
+  // re-render of a colon-bearing message (code-reviewer note on PR #2073).
+  const { emojiSource, emojiCount, emojiClass } = useMemo(() => {
+    const src =
+      !message.pendingKeys && !message.decryptFailed && !hasIndentedCodeBlock(message.content)
+        ? expandShortcodes(message.content)
+        : '';
+    const count = getEmojiOnlyCount(src);
+    return { emojiSource: src, emojiCount: count, emojiClass: getEmojiSizeClass(count) };
+  }, [message.content, message.pendingKeys, message.decryptFailed]);
 
   // #1041: one-shot reveal when a pending-keys message resolves (key arrives →
   // pendingKeys flips false and content decrypts). The CSS animation is a single
@@ -402,8 +421,9 @@ function MessageTextContent({
       </span>
     );
   } else if (emojiCount > 0) {
-    // Emoji-only path — keeps jumbo sizing via the pre-existing renderEmoji helper
-    contentNode = renderEmoji(message.content);
+    // Emoji-only path — keeps jumbo sizing via the pre-existing renderEmoji helper.
+    // Uses the shortcode-EXPANDED source so `:smile:` renders the 😄 glyph (#2070).
+    contentNode = renderEmoji(emojiSource);
   } else {
     // Normal markdown rendering with real message fields for memo keying
     contentNode = (

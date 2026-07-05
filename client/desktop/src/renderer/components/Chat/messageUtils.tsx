@@ -1,5 +1,6 @@
 import React from 'react';
 import MarkdownContent from '../Markdown/MarkdownContent';
+import { lookupShortcode } from '../EmojiPicker/shortcodeIndex';
 import type { MentionLookup } from '../Markdown/mentionTypes';
 
 // Mention resolution moved to the Markdown/mentionTypes leaf module to break an
@@ -33,9 +34,66 @@ export const EMOJI_REGEX = new RegExp(
 );
 
 /**
+ * Matches a `:shortcode:` token. Mirrors `SHORTCODE_RE` in
+ * `Markdown/plugins/remarkEmojiShortcodes.ts` so the jumbo-sizing DECISION here
+ * agrees with what the markdown pipeline actually RENDERS for a given message.
+ */
+const SHORTCODE_RE = /:([a-z0-9_+-]+):/gi;
+
+/**
+ * Expand known `:shortcode:` tokens to their unicode glyph; leave unknown codes
+ * verbatim so a plain-text `:notareal:` can't be mistaken for an emoji-only
+ * message. Mirrors `remarkEmojiShortcodes` exactly (same regex, lowercased code,
+ * first-index-wins lookup), so the emoji-only/jumbo detection can run on the
+ * expanded text and reach parity with picker-inserted emoji (#2070).
+ */
+export function expandShortcodes(text: string): string {
+  // Optional chain also short-circuits null/undefined (SonarQube S6582); an
+  // empty string still returns early via `''.includes(':') === false`.
+  if (!text?.includes(':')) return text;
+  return text.replaceAll(
+    SHORTCODE_RE,
+    (whole, code: string) => lookupShortcode(code.toLowerCase()) ?? whole
+  );
+}
+
+/**
+ * Matches a line that markdown parses as an indented code block: >=4 leading
+ * spaces or a leading tab, on any line (multiline `^`).
+ */
+const INDENTED_CODE_RE = /^(?: {4}|\t)/m;
+
+/**
+ * True when `text` contains a markdown indented-code-block line. Such a line is
+ * a `code` node, which `remarkEmojiShortcodes` explicitly skips, so the markdown
+ * pipeline renders the LITERAL `:smile:` text, never the 😄 glyph.
+ *
+ * `expandShortcodes` has no markdown-context awareness and `getEmojiOnlyCount`
+ * strips leading whitespace, so `    :smile:` would otherwise expand to `    😄`,
+ * count as one emoji, and jumbo-render, diverging from what markdown actually
+ * shows. That is the exact class of jumbo/markdown divergence #2070 set out to
+ * eliminate, so callers use this to keep indented-code content OFF the emoji-only
+ * fast path and route it through the markdown pipeline instead.
+ *
+ * Deliberately a conservative heuristic, not a full CommonMark parser: falling
+ * through to markdown always renders correctly, so over-matching costs at most a
+ * jumbo-sizing opportunity, whereas under-matching would reintroduce the
+ * divergence (literal shortcode text mis-rendered as a jumbo emoji).
+ */
+export function hasIndentedCodeBlock(text: string): boolean {
+  // Non-global regex: `.test()` is stateless (no lastIndex advance) so this is
+  // safe to reuse across calls.
+  return INDENTED_CODE_RE.test(text);
+}
+
+/**
  * Detect emoji-only messages and return the count.
  * Returns 0 if the message contains any non-emoji text.
  * Uses Unicode emoji properties to match all standard emoji sequences.
+ *
+ * NB: this runs on the caller's supplied string. For jumbo-sizing parity between
+ * literal emoji and `:shortcode:` emoji, callers must pass shortcode-EXPANDED
+ * text (see `expandShortcodes`) — the Message.tsx decision point does so (#2070).
  */
 export function getEmojiOnlyCount(text: string): number {
   if (!text || text.length === 0) return 0;

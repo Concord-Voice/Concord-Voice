@@ -5,8 +5,12 @@ import {
   resolveMentionDisplay,
   renderEmoji,
   renderContent,
+  expandShortcodes,
+  hasIndentedCodeBlock,
   type MentionLookup,
 } from '@/renderer/components/Chat/messageUtils';
+import { indexCategory } from '@/renderer/components/EmojiPicker/shortcodeIndex';
+import smileys from '@/renderer/data/emoji/smileys.json';
 
 describe('messageUtils', () => {
   describe('getEmojiOnlyCount', () => {
@@ -221,6 +225,86 @@ describe('messageUtils', () => {
       const { container } = render(<>{result}</>);
 
       expect(container.textContent).toBe('@Test User is here');
+    });
+  });
+
+  describe('expandShortcodes (#2070)', () => {
+    beforeEach(() => {
+      // Idempotent — the module seeds smileys at import; assert :smile: resolves.
+      indexCategory('smileys', smileys);
+    });
+
+    it('expands a known shortcode to its unicode glyph', () => {
+      expect(expandShortcodes(':smile:')).toBe('😄');
+    });
+
+    it('expands adjacent known shortcodes', () => {
+      expect(expandShortcodes(':smile::smile:')).toBe('😄😄');
+    });
+
+    it('leaves an unknown shortcode verbatim', () => {
+      expect(expandShortcodes(':definitelynotareal:')).toBe(':definitelynotareal:');
+    });
+
+    it('leaves surrounding text intact (mixed content)', () => {
+      expect(expandShortcodes(':smile: hi')).toBe('😄 hi');
+    });
+
+    it('is a no-op for text with no colon', () => {
+      expect(expandShortcodes('hello world')).toBe('hello world');
+    });
+
+    it('is a no-op for empty input', () => {
+      expect(expandShortcodes('')).toBe('');
+    });
+
+    // The parity contract that fixes #2070: emoji-only detection on EXPANDED text.
+    it('makes :smile: count as one emoji (jumbo-1 parity with a literal 😄)', () => {
+      expect(getEmojiOnlyCount(expandShortcodes(':smile:'))).toBe(1);
+      expect(getEmojiOnlyCount(expandShortcodes(':smile::smile:'))).toBe(2);
+    });
+
+    it('keeps mixed / unknown-shortcode content off the emoji-only path', () => {
+      expect(getEmojiOnlyCount(expandShortcodes(':smile: hi'))).toBe(0);
+      expect(getEmojiOnlyCount(expandShortcodes(':definitelynotareal:'))).toBe(0);
+    });
+  });
+
+  // #2070 follow-up: an indented code block is a markdown `code` node that
+  // remarkEmojiShortcodes skips, so it renders literal `:smile:`. The emoji-only
+  // fast path must recognize this and defer to markdown (guarded via
+  // hasIndentedCodeBlock) instead of expanding + jumbo-rendering the glyph.
+  describe('hasIndentedCodeBlock (#2070)', () => {
+    it('detects a 4-space indented line', () => {
+      expect(hasIndentedCodeBlock('    :smile:')).toBe(true);
+    });
+
+    it('detects a tab-indented line', () => {
+      expect(hasIndentedCodeBlock('\t:smile:')).toBe(true);
+    });
+
+    it('detects an indented line anywhere in multiline content', () => {
+      expect(hasIndentedCodeBlock('intro\n\n    code')).toBe(true);
+    });
+
+    it('is false for un-indented content', () => {
+      expect(hasIndentedCodeBlock(':smile:')).toBe(false);
+      expect(hasIndentedCodeBlock('😄')).toBe(false);
+    });
+
+    it('is false for fewer than 4 leading spaces', () => {
+      expect(hasIndentedCodeBlock('   :smile:')).toBe(false);
+    });
+
+    it('is false for empty input', () => {
+      expect(hasIndentedCodeBlock('')).toBe(false);
+    });
+
+    // The divergence this guard closes: without it, `    :smile:` would expand and
+    // count as one emoji even though markdown renders it as a code block.
+    it('flags content that would otherwise be mis-counted as emoji-only', () => {
+      expect(getEmojiOnlyCount(expandShortcodes('    :smile:'))).toBe(1);
+      expect(hasIndentedCodeBlock('    :smile:')).toBe(true);
     });
   });
 });
