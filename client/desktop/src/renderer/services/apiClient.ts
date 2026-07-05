@@ -575,12 +575,12 @@ async function handle401Recovery(
       // un-wiped — the userStore 401 handlers used to mask the gap before #1768
       // centralized the disk-token decision here (#1768 review, finding #6).
       //
-      // …but only an AUTHORITATIVE request (a real Concord API call) may act on
-      // that revocation signal and tear down the session. A non-authoritative
-      // content-proxy 401 — the KLIPY GIF proxy (#1957) — is NOT proof the
-      // session is dead; tearing it down logged out a valid session on the next
-      // Ctrl+R (`no_session`). Return the raw 401 so the caller degrades
-      // gracefully; genuine expiry is still caught by the next authoritative call.
+      // …but only an AUTHORITATIVE request may act on that revocation signal
+      // and tear down the session. Non-authoritative surfaces (content proxies
+      // like KLIPY #1957, plus best-effort encrypted preferences sync #1956)
+      // are NOT proof the session is dead; tearing them down logged out valid
+      // sessions. Return the raw 401 so callers degrade gracefully; genuine
+      // expiry is still caught by the next authoritative call.
       if (authoritative) await handleRefreshFailure();
       return response;
     }
@@ -590,9 +590,9 @@ async function handle401Recovery(
 
   if (!newToken) {
     // Refresh failed. Same authority rule as the cooldown branch above: only an
-    // authoritative Concord API call may tear down the session on a 401. A
-    // non-authoritative content-proxy 401 (KLIPY GIF proxy, #1957) returns the
-    // raw 401 and the caller shows a load error — it never logs the user out.
+    // authoritative Concord API call may tear down the session on a 401.
+    // Non-authoritative surfaces (content proxies #1957, encrypted preferences
+    // sync #1956) return the raw 401 and never log the user out.
     if (authoritative) await handleRefreshFailure();
     return response;
   }
@@ -620,10 +620,11 @@ async function handle401Recovery(
 
 /**
  * @param opts.authoritative Whether a 401 from this request may tear down the
- *   session (default `true`). Real Concord API calls are authoritative. Pass
- *   `false` for non-authoritative third-party content proxies (e.g. the KLIPY
- *   GIF proxy, #1957) whose 401 is not proof the Concord session is dead — those
- *   still attempt one refresh+retry but never call handleRefreshFailure.
+ *   session (default `true`). User-action Concord API calls are authoritative.
+ *   Pass `false` for non-authoritative surfaces whose 401 is not proof the
+ *   session is dead: third-party content proxies (KLIPY, #1957) and best-effort
+ *   background first-party sync (encrypted preferences, #1956). These still
+ *   attempt one refresh+retry but never call handleRefreshFailure.
  */
 export async function apiFetch(
   path: string,

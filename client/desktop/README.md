@@ -53,7 +53,7 @@ desktop/
 │   └── renderer/      # React application
 │       ├── components/ # React components
 │       ├── hooks/     # Custom React hooks
-│       ├── stores/    # State management (41 Zustand stores)
+│       ├── stores/    # State management (Zustand)
 │       ├── utils/     # Utility functions
 │       ├── styles/    # CSS styles
 │       ├── App.tsx    # Main app component
@@ -178,7 +178,7 @@ without the value produces an inert Google SSO (empty secret), not a failure.
 - Channel groups with drag-and-drop ordering
 - Custom context menus
 - Profile popovers
-- **41 Zustand stores** (Zustand 5.0.12) for state management — see [STATE_MANAGEMENT.md](docs/STATE_MANAGEMENT.md) and [internal] for authoritative counts
+- **Zustand stores** (Zustand 5.0.12) for state management — see [STATE_MANAGEMENT.md](docs/STATE_MANAGEMENT.md) and `src/renderer/stores/` for the current set
 
 ### Security ✅
 

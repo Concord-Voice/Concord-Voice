@@ -170,7 +170,9 @@ class PreferencesSyncService {
     const deps = this.requireDeps();
 
     try {
-      const res = await apiFetch('/api/v1/users/me/preferences');
+      const res = await apiFetch('/api/v1/users/me/preferences', undefined, {
+        authoritative: false,
+      });
       if (!res.ok) {
         if (res.status === 401 && attempt < PreferencesSyncService.MAX_AUTH_RETRIES) {
           // Transient startup auth race — retry a bounded number of times after
@@ -372,11 +374,15 @@ class PreferencesSyncService {
 
       const encrypted = await e2eeService.encryptPreferences(blob);
 
-      const res = await apiFetch('/api/v1/users/me/preferences', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ encrypted_data: encrypted }),
-      });
+      const res = await apiFetch(
+        '/api/v1/users/me/preferences',
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ encrypted_data: encrypted }),
+        },
+        { authoritative: false }
+      );
 
       if (res.ok) {
         const data = await res.json();

@@ -1,6 +1,6 @@
 # Concord Voice Product Overview
 
-> Summary for AI assistants. For roadmap details and current counts (routes, migrations, stores), see [[internal]](.[internal]).
+> Summary for AI assistants. For public roadmap details, see [ROADMAP.md](./ROADMAP.md) and GitHub milestones.
 
 ## What Is Concord Voice?
 

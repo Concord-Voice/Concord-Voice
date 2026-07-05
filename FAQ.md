@@ -491,7 +491,7 @@ cd client/desktop
 npm test
 ```
 
-> SonarQube enforces ≥ 80% coverage on new code as a mandatory Quality Gate; see [[internal]](.[internal]) for current test-file counts.
+> SonarQube enforces ≥ 80% coverage on new code as a mandatory Quality Gate; current coverage and test status are reported by CI.
 
 ---
 
@@ -747,7 +747,7 @@ lsof -ti:5173 | xargs kill -9
 
 ### Database migrations aren't running
 
-The migration system uses `golang-migrate/v4` and runs automatically on server startup. See [[internal]](.[internal]) § Key Counts for the current migration count.
+The migration system uses `golang-migrate/v4` and runs automatically on server startup. Use `make migrate-version` to inspect the current local schema version.
 
 **Check migration status:**
 
@@ -875,7 +875,6 @@ npm run dev
 - **Security:** [.github/SECURITY.md](./.github/SECURITY.md) - Security policy
 - **Architecture:** [docs/architecture.md](./docs/architecture.md) - System design
 - **Getting Started:** [docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md) - Setup guide
-- **AI Context:** [[internal]](.[internal]) - For AI assistants
 
 ---
 

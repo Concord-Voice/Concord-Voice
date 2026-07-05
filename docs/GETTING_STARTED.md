@@ -232,8 +232,8 @@ docker exec -it concord-redis redis-cli ping
 - Presence system (online/offline, typing indicators)
 - Server invites, session management, unread tracking
 - Browser-inspired UI layout (server bar, folder bar, channel panel)
-- Custom context menus, ~41 Zustand stores (see `[internal]` for current count)
-- Frontend and backend test coverage tracked in `[internal]` Key Counts
+- Custom context menus and Zustand stores for desktop state management
+- Frontend and backend test coverage tracked by CI and docs checks
 
 ### ✅ Phase 1C Complete (Voice & Media)
 
@@ -261,7 +261,7 @@ docker exec -it concord-redis redis-cli ping
 - Video/screen sharing backend integration
 - Server mute/deafen and DM message pinning
 
-> For current issue counts and phase breakdown, see `[internal]`.
+> For current issue counts and phase breakdown, check the GitHub issue tracker.
 
 **You can now test the full platform end-to-end — auth, text chat, voice channels, and DMs!**
 
@@ -339,7 +339,7 @@ All core features are implemented. Good starting points:
 - **Auth flow:** `services/control-plane/internal/auth/` — Argon2id, JWT, E2EE key storage
 - **WebSocket:** `services/control-plane/internal/websocket/` — Hub, ticket-based auth, channel subscriptions
 - **Voice:** `services/media-plane/src/lib/roomManager.ts` — mediasoup SFU, WebRTC transport management
-- **Frontend stores:** `client/desktop/src/renderer/stores/` — ~41 Zustand stores (see `[internal]` for current count)
+- **Frontend stores:** `client/desktop/src/renderer/stores/` — Zustand state modules
 
 ### 3. Run the Tests
 
@@ -353,7 +353,7 @@ cd client/desktop && npx vitest run
 
 ### 4. Pick an Issue
 
-Check [GitHub Issues](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues) for open Phase 2 items. See `[internal]` for the full project status and ground truth.
+Check [GitHub Issues](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues) for open Phase 2 items and current project status.
 
 ## Common Issues
 
@@ -447,8 +447,8 @@ You're ready to start building! Here are the immediate priorities:
 - [x] WebSocket real-time messaging with E2EE
 - [x] Presence system (online/offline, typing)
 - [x] Server invites, unread tracking, session management
-- [x] Browser-inspired UI layout with ~41 Zustand stores (see `[internal]`)
-- [x] Frontend and backend test coverage tracked in `[internal]` Key Counts
+- [x] Browser-inspired UI layout with Zustand state management
+- [x] Frontend and backend test coverage tracked by CI
 
 **Phase 1C: Voice & Media** ✅ COMPLETE
 

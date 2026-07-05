@@ -62,8 +62,8 @@ control-plane/
 ├── pkg/
 │   ├── config/           # Configuration management
 │   └── logger/           # Structured logging
-├── migrations/           # SQL migration pairs (count: [internal] Key Counts)
-├── tests/                # Integration test docs (backend count: [internal] Key Counts)
+├── migrations/           # SQL migration pairs
+├── tests/                # Integration test docs
 ├── Dockerfile
 ├── go.mod
 └── go.sum
@@ -216,7 +216,7 @@ GET/POST /api/v1/channels/:id/keys
 POST /api/v1/channels/:id/keys/rotate
 ```
 
-**API routes:** the canonical count lives in [[internal]](../..[internal]) Key Counts. See `docs/api/openapi.yaml` for the OpenAPI spec (covers partial routes; Phase 2A additions pending spec update).
+**API routes:** See `docs/api/openapi.yaml` for the OpenAPI spec (covers partial routes; Phase 2A additions pending spec update).
 
 ### Testing
 
@@ -347,7 +347,7 @@ For detailed migration documentation, see [migrations/README.md](migrations/READ
 ### Additional Tables ✅
 - user_keys, server_invites, channel_keys, channel_key_recipients, channel_read_states, voice_participants, user_preferences, friend_codes, privacy_settings
 
-See `migrations/` for the full schema; the current migration total lives in [[internal]](../..[internal]) "Key Counts" (single source of truth — not duplicated here to avoid drift).
+See `migrations/` for the full schema; use `make migrate-version` to inspect the current local schema version.
 
 ## Current Status
 

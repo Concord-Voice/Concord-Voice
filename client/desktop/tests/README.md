@@ -2,7 +2,7 @@
 
 Test suite for the Concord Voice Desktop Client (Electron/React/TypeScript).
 
-Test files span unit, component, hook, service, shared, and E2E categories. See [[internal]](../..[internal]) for the current count.
+Test files span unit, component, hook, service, shared, and E2E categories. Current test status and coverage are reported by CI.
 
 ## Structure
 
@@ -11,7 +11,7 @@ tests/
 ├── setup.ts                        # Global test setup (jest-dom, crypto polyfill, window.electron mock)
 ├── test-utils.tsx                  # Custom render() with BrowserRouter, re-exports Testing Library
 ├── helpers/
-│   ├── store-helpers.ts            # resetAllStores() for all 41 Zustand stores
+│   ├── store-helpers.ts            # resetAllStores() for all Zustand stores
 │   └── crypto-helpers.ts           # mockE2EEService() stubs
 ├── mocks/
 │   ├── fixtures.ts                 # Typed mock data: mockUser, mockServer, mockChannel, mockMessage, mockMember

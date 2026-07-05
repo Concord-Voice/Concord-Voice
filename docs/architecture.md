@@ -13,13 +13,13 @@ Concord Voice is a distributed real-time communications platform with three serv
 ```text
 ┌──────────────────────────────────────────────────────────────────┐
 │  Desktop Client (Electron + React + TypeScript)                  │
-│  - 41 Zustand stores, E2EE via WebCrypto, safeStorage tokens    │
+│  - Zustand stores, E2EE via WebCrypto, safeStorage tokens       │
 └──────┬────────────────────────────────┬──────────────────────────┘
        │ HTTP/WebSocket :8080           │ Socket.IO + WebRTC :3000
        ▼                                ▼
 ┌──────────────────────┐    ┌─────────────────────────────────────┐
 │  Control Plane (Go)  │    │  Media Plane (Node.js + mediasoup)  │
-│  Gin 1.12, 234 routes│    │  WebRTC SFU, Socket.IO signaling    │
+│  Gin 1.12 API        │    │  WebRTC SFU, Socket.IO signaling    │
 │  Auth, RBAC, chat,   │    │  Voice/video routing, RoomManager   │
 │  WebSocket hub       │    │  1 router per room, transport/user  │
 └──────┬───────┬───────┘    └──────┬──────────────────────────────┘
@@ -27,8 +27,8 @@ Concord Voice is a distributed real-time communications platform with three serv
        ▼       ▼                   ▼
 ┌──────────┐ ┌───────┐      ┌───────┐
 │PostgreSQL│ │ Redis │      │ Redis │
-│ 16 (79   │ │ 7     │      │ 7     │
-│ migr's)  │ │       │      │       │
+│ 16       │ │ 7     │      │ 7     │
+│          │ │       │      │       │
 └──────────┘ └───┬───┘      └───┬───┘
                  │              │
                  └──── NATS ────┘
@@ -59,7 +59,7 @@ Concord Voice is a distributed real-time communications platform with three serv
 - Secure IPC via preload bridge (contextIsolation ON, nodeIntegration OFF)
 - E2EE: AES-256-GCM message encryption, RSA-OAEP 4096-bit key wrapping
 - Token storage via Electron safeStorage (OS keychain)
-- 41 Zustand stores for state management
+- Zustand stores for state management
 - Adaptive renderer load: remote SPA (Cloudflare Pages) with bundled `app://` fallback
 
 ### Data Flow
@@ -147,7 +147,7 @@ The desktop client is the only shipping client. Source: `client/desktop/`.
 - **Process layout** (`client/desktop/src/` has five top-level source dirs):
   - `main/` — Electron main process: packaged-macOS `/Applications` placement gate before `BrowserWindow` creation (`applicationsFolderGate.ts`); `BrowserWindow` creation, `app://` scheme registration, IPC dispatch, updater wiring, quit lifecycle (`main.ts`); secure token persistence (`tokenManager.ts`); adaptive renderer loading (`spaLoader.ts`); the `app://` resolver (`appProtocol.ts`); device fingerprint (`machineId.ts`); userData path pinning (`pinUserDataPath.ts`); auto-update trust chain (`updater.ts`, `updateSafety.ts`, `verifyWindowsSignature.ts`).
   - `preload/preload.ts` — the single `contextBridge` bridge exposing a minimal typed `window.electron` API.
-  - `renderer/` — the React SPA: `stores/` (41 Zustand stores), `services/` (singletons incl. `e2eeService.ts`, `mediaEncryption.ts`, `searchService.ts`, WebSocket, API client, voice), `components/`, `hooks/`, `types/ws-events.ts` (zod WS schema).
+  - `renderer/` — the React SPA: `stores/` (Zustand stores), `services/` (singletons incl. `e2eeService.ts`, `mediaEncryption.ts`, `searchService.ts`, WebSocket, API client, voice), `components/`, `hooks/`, `types/ws-events.ts` (zod WS schema).
   - `shared/` — three cross-process modules: `clientBehavior.ts` (window close/minimize routing), `spaIpcTypes.ts` (self-heal IPC contract), `spaUrlPattern.ts` (the shared SPA chunk-URL regex; the legacy `SPA_URL_PATTERN` was removed by #1657 in favor of runtime base-dir matching).
   - `constants/` — typed constants + build-time generators (e.g. `updateEndpoint.mts`), included in the Istanbul coverage set.
 - **Responsibilities:** browser-inspired UI (server bar, channel panel), WebRTC media handling (Opus, 7 quality tiers), voice controls (mute/deafen/PTT, device selection, per-user volume), screen sharing, video calls, E2EE encrypt/decrypt via `e2eeService` (`encryptForChannel` / `decryptForChannel`), secure token storage via `safeStorage`. _(This list is non-exhaustive — the renderer also carries TTS (`ttsService.ts`), keyboard-shortcut customization, OS-permission management (`permissionManager.ts`, macOS screen-recording/mic TCC), and a startup splash window.)_

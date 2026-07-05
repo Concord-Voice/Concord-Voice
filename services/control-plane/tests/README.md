@@ -108,7 +108,7 @@ pkg/
     └── logger_test.go              # Logger tests
 ```
 
-**Backend test file count:** see [[internal]](../../..[internal]) Key Counts.
+**Backend test status:** current results are reported by CI.
 
 ## Running Tests
 
