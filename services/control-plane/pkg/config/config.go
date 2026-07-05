@@ -614,6 +614,18 @@ func (c *Config) validate() error {
 		// require ≥32 chars when present. Generate with: openssl rand -hex 32.
 		{c.RedemptionAdminToken != "" && len(c.RedemptionAdminToken) < 32,
 			"REDEMPTION_ADMIN_TOKEN must be ≥32 chars when set (it gates the admin code-generation endpoint). Generate with: openssl rand -hex 32. Leave it unset to disable the HTTP generation endpoint (CLI issuance still works)."},
+		// #1283 — env-integrity invariant. CONCORD_ENV=test enables two
+		// test-only backdoors: auth.isTestEnv() writes the plaintext
+		// `test_only:` verification code, and isE2ETestEnv() (#1277) relaxes
+		// the per-IP auth rate limits on /register, /register/confirm, /login.
+		// Neither may ever be live in production. Guard only evaluates on the
+		// production branch (validate() early-returns otherwise), so CI — which
+		// sets CONCORD_ENV=test with a non-production ENVIRONMENT — is
+		// unaffected. Read via os.Getenv, NOT a Config field: CONCORD_ENV is
+		// forbidden-in-production, so it must not be added to any writer
+		// surface / canonical-consumer path.
+		{os.Getenv("CONCORD_ENV") == "test",
+			"CONCORD_ENV=test is forbidden when ENVIRONMENT=production (would relax auth rate limits and leak verification codes)."},
 	}
 
 	for _, g := range guards {
