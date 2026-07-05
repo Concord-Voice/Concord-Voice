@@ -81,8 +81,8 @@ func TestVerificationRecordStructure(t *testing.T) {
 }
 
 func TestVerifyCodeTTLConstant(t *testing.T) {
-	// VerifyCodeTTLNew (from pending.go) is 2 minutes (#621).
-	assert.Equal(t, 2, int(VerifyCodeTTLNew.Minutes()))
+	// Regression for #1914: the verification email promises a 10-minute entry window.
+	assert.Equal(t, 10, int(VerifyCodeTTLNew.Minutes()))
 }
 
 func TestVerifyMaxAttemptsConstant(t *testing.T) {

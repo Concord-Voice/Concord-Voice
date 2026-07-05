@@ -36,6 +36,10 @@ func redisKey(pendingID string) string {
 	return fmt.Sprintf("email_verify:%s", pendingID)
 }
 
+func verificationAttemptsKey(pendingID string) string {
+	return fmt.Sprintf("email_verify_attempts:%s", pendingID)
+}
+
 func sanitizeVerificationCode(raw string) string {
 	return strings.TrimSpace(strings.ReplaceAll(raw, "-", ""))
 }

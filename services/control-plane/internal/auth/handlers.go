@@ -353,6 +353,26 @@ func isTestEnv() bool {
 	return os.Getenv("CONCORD_ENV") == "test"
 }
 
+func (h *Handler) extendPendingExpiryForCode(ctx context.Context, pendingID string, requestedCodeExpires time.Time) (time.Time, error) {
+	var codeExpires time.Time
+	err := h.db.QueryRowContext(ctx,
+		`UPDATE pending_registrations
+		    SET expires_at = GREATEST(expires_at, LEAST($2, created_at + ($3 * INTERVAL '1 second')))
+		  WHERE id = $1
+		    AND expires_at > NOW()
+		    AND created_at + ($3 * INTERVAL '1 second') > NOW()
+		  RETURNING LEAST($2, created_at + ($3 * INTERVAL '1 second'))`,
+		pendingID, requestedCodeExpires, int(PendingRegistrationTTL/time.Second),
+	).Scan(&codeExpires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, ErrPendingExpired
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("extend pending expiry: %w", err)
+	}
+	return codeExpires, nil
+}
+
 // sendInitialCode generates a fresh 6-digit code, writes the hash to Redis
 // under email_verify:<pending_id>, and emails it via the verification
 // handler's email service. Returns the code's expiry.
@@ -363,6 +383,18 @@ func isTestEnv() bool {
 func (h *Handler) sendInitialCode(ctx context.Context, pendingID, userEmail string) (time.Time, error) {
 	if h.emailSvc == nil {
 		return time.Time{}, fmt.Errorf("email service not configured")
+	}
+
+	requestedCodeExpires := time.Now().Add(VerifyCodeTTLNew)
+	codeExpires, err := h.extendPendingExpiryForCode(ctx, pendingID, requestedCodeExpires)
+	if err != nil {
+		return time.Time{}, err
+	}
+	codeTTL := time.Until(codeExpires)
+	// The email template promises VerifyCodeTTLNew. If the absolute pending
+	// lifetime cannot honor that full window, make the user restart instead.
+	if codeTTL <= 0 || codeTTL < VerifyCodeTTLNew-time.Second {
+		return time.Time{}, ErrPendingExpired
 	}
 
 	code, err := generateCode()
@@ -380,28 +412,28 @@ func (h *Handler) sendInitialCode(ctx context.Context, pendingID, userEmail stri
 		return time.Time{}, fmt.Errorf("marshal verification record: %w", err)
 	}
 
-	if err := h.redis.Set(ctx, redisKey(pendingID), raw, VerifyCodeTTLNew).Err(); err != nil {
+	if err := h.redis.Del(ctx, verificationAttemptsKey(pendingID)).Err(); err != nil {
+		return time.Time{}, fmt.Errorf("reset verification attempts: %w", err)
+	}
+	if err := h.redis.Set(ctx, redisKey(pendingID), raw, codeTTL).Err(); err != nil {
 		return time.Time{}, fmt.Errorf("store code in Redis: %w", err)
 	}
 
 	// Test-only: expose plaintext code for integration tests. Guarded by the
 	// CONCORD_ENV=test env var so this never fires in production.
 	if isTestEnv() {
-		if err := h.redis.Set(ctx, redisKeyTestOnly+pendingID, code, VerifyCodeTTLNew).Err(); err != nil {
+		if err := h.redis.Set(ctx, redisKeyTestOnly+pendingID, code, codeTTL).Err(); err != nil {
 			h.log.Warn("Failed to write test_only code", "error", err)
 		}
 	}
 
 	if err := h.emailSvc.SendVerificationCode(userEmail, code); err != nil {
 		// Best-effort cleanup so a retry starts fresh.
-		_ = h.redis.Del(ctx, redisKey(pendingID)).Err()
-		if isTestEnv() {
-			_ = h.redis.Del(ctx, redisKeyTestOnly+pendingID).Err()
-		}
+		h.clearVerificationCode(ctx, pendingID)
 		return time.Time{}, fmt.Errorf("send email: %w", err)
 	}
 
-	return time.Now().Add(VerifyCodeTTLNew), nil
+	return codeExpires, nil
 }
 
 const (
@@ -412,6 +444,23 @@ const (
 	// errMsgInternalError is the generic internal error message returned to clients.
 	errMsgInternalError = "Internal error"
 )
+
+const reserveVerificationAttemptLua = `
+local code = redis.call("GET", KEYS[1])
+if not code then
+  return {0, 0, ""}
+end
+local attempts = redis.call("INCR", KEYS[2])
+if redis.call("PTTL", KEYS[2]) < 0 then
+  local code_ttl = redis.call("PTTL", KEYS[1])
+  if code_ttl > 0 then
+    redis.call("PEXPIRE", KEYS[2], code_ttl)
+  else
+    redis.call("PEXPIRE", KEYS[2], ARGV[1])
+  end
+end
+return {1, attempts, code}
+`
 
 // ConfirmRegistrationRequest is the JSON body for the register/confirm endpoint.
 type ConfirmRegistrationRequest struct {
@@ -442,12 +491,7 @@ func (h *Handler) ConfirmRegistration(c *gin.Context) {
 		return
 	}
 
-	rec, err := h.fetchVerificationRecord(ctx, c, req.PendingID)
-	if err != nil {
-		return
-	}
-
-	if !h.attemptsGuard(ctx, c, req.PendingID, rec, sanitized) {
+	if !h.attemptsGuard(ctx, c, req.PendingID, sanitized) {
 		return
 	}
 
@@ -467,8 +511,7 @@ func (h *Handler) ConfirmRegistration(c *gin.Context) {
 		return
 	}
 
-	_ = h.redis.Del(ctx, redisKey(req.PendingID)).Err()
-	_ = h.redis.Del(ctx, redisKeyTestOnly+req.PendingID).Err()
+	h.clearVerificationCode(ctx, req.PendingID)
 
 	email, username, err := h.loadPromotedUser(ctx, userID)
 	if err != nil {
@@ -506,58 +549,96 @@ func (h *Handler) validateConfirmRequest(c *gin.Context) (*ConfirmRegistrationRe
 	return &req, sanitized, true
 }
 
-// fetchVerificationRecord retrieves and unmarshals the verification record from
-// Redis. On redis.Nil it writes a 410 code_expired response and returns a non-nil
-// error so the caller can return immediately. Other errors write a 500.
-func (h *Handler) fetchVerificationRecord(ctx context.Context, c *gin.Context, pendingID string) (*verificationRecord, error) {
-	raw, err := h.redis.Get(ctx, redisKey(pendingID)).Result()
-	if errors.Is(err, redis.Nil) {
-		c.JSON(http.StatusGone, gin.H{"code": "code_expired"})
-		return nil, err
-	}
-	if err != nil {
-		h.log.Error("confirm: redis get failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalError})
-		return nil, err
-	}
-	var rec verificationRecord
-	if err := json.Unmarshal([]byte(raw), &rec); err != nil {
-		h.log.Error("confirm: record unmarshal failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalError})
-		return nil, err
-	}
-	return &rec, nil
-}
-
-// attemptsGuard enforces the attempt limit and validates the code in one step.
-// Fix 4: the limit is checked BEFORE incrementing so attempts_remaining is accurate.
-// Fix 5: TTL is guarded against zero/negative so the Redis key always has an expiry.
+// attemptsGuard reserves an attempt atomically before comparing the code.
+// It fetches the verification record after reservation so resend/change-email
+// cannot leave a stale code eligible for promotion.
 // Returns true if the code matched and the caller should proceed; false if a response
 // has already been written (too_many_attempts or invalid_code).
-func (h *Handler) attemptsGuard(ctx context.Context, c *gin.Context, pendingID string, rec *verificationRecord, sanitized string) bool {
-	if rec.Attempts >= MaxCodeAttempts {
-		_ = h.redis.Del(ctx, redisKey(pendingID)).Err()
-		_ = h.redis.Del(ctx, redisKeyTestOnly+pendingID).Err()
+func (h *Handler) attemptsGuard(ctx context.Context, c *gin.Context, pendingID string, sanitized string) bool {
+	rec, attempts, err := h.reserveVerificationAttempt(ctx, pendingID)
+	if errors.Is(err, redis.Nil) {
+		h.clearVerificationCode(ctx, pendingID)
+		c.JSON(http.StatusGone, gin.H{"code": "code_expired"})
+		return false
+	}
+	if err != nil {
+		h.log.Error("confirm: attempts reservation failed", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalError})
+		return false
+	}
+	if attempts > MaxCodeAttempts {
+		h.exhaustVerificationCode(ctx, pendingID)
 		c.JSON(http.StatusTooManyRequests, gin.H{"code": "too_many_attempts"})
 		return false
 	}
-	rec.Attempts++
 
-	if subtle.ConstantTimeCompare([]byte(hashCode(sanitized)), []byte(rec.CodeHash)) != 1 {
-		newRaw, _ := json.Marshal(rec)
-		// Fix 5: guard against zero/negative TTL so the key always has an expiry.
-		ttl := h.redis.TTL(ctx, redisKey(pendingID)).Val()
-		if ttl <= 0 {
-			ttl = VerifyCodeTTLNew
-		}
-		_ = h.redis.Set(ctx, redisKey(pendingID), newRaw, ttl).Err()
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"code":               "invalid_code",
-			"attempts_remaining": MaxCodeAttempts - rec.Attempts,
-		})
-		return false
+	if subtle.ConstantTimeCompare([]byte(hashCode(sanitized)), []byte(rec.CodeHash)) == 1 {
+		return true
 	}
-	return true
+
+	remaining := MaxCodeAttempts - attempts
+	if remaining < 0 {
+		remaining = 0
+	}
+	c.JSON(http.StatusUnauthorized, gin.H{
+		"code":               "invalid_code",
+		"attempts_remaining": remaining,
+	})
+	return false
+}
+
+func (h *Handler) reserveVerificationAttempt(ctx context.Context, pendingID string) (*verificationRecord, int, error) {
+	result, err := h.redis.Eval(ctx, reserveVerificationAttemptLua,
+		[]string{redisKey(pendingID), verificationAttemptsKey(pendingID)},
+		int64(VerifyCodeTTLNew/time.Millisecond),
+	).Result()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	values, ok := result.([]interface{})
+	if !ok || len(values) != 3 {
+		return nil, 0, fmt.Errorf("unexpected verification attempt script result: %T", result)
+	}
+	found, ok := values[0].(int64)
+	if !ok {
+		return nil, 0, fmt.Errorf("unexpected verification attempt found flag: %T", values[0])
+	}
+	if found == 0 {
+		return nil, 0, redis.Nil
+	}
+	attemptsRaw, ok := values[1].(int64)
+	if !ok {
+		return nil, 0, fmt.Errorf("unexpected verification attempt count: %T", values[1])
+	}
+	raw, ok := values[2].(string)
+	if !ok {
+		return nil, 0, fmt.Errorf("unexpected verification record payload: %T", values[2])
+	}
+
+	var rec verificationRecord
+	if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+		return nil, 0, fmt.Errorf("unmarshal verification record: %w", err)
+	}
+	return &rec, int(attemptsRaw), nil
+}
+
+func (h *Handler) verificationCodeTTL(ctx context.Context, pendingID string) time.Duration {
+	ttl := h.redis.TTL(ctx, redisKey(pendingID)).Val()
+	if ttl <= 0 {
+		return VerifyCodeTTLNew
+	}
+	return ttl
+}
+
+func (h *Handler) clearVerificationCode(ctx context.Context, pendingID string) {
+	_ = h.redis.Del(ctx, redisKey(pendingID), redisKeyTestOnly+pendingID, verificationAttemptsKey(pendingID)).Err()
+}
+
+func (h *Handler) exhaustVerificationCode(ctx context.Context, pendingID string) {
+	ttl := h.verificationCodeTTL(ctx, pendingID)
+	_ = h.redis.Set(ctx, verificationAttemptsKey(pendingID), MaxCodeAttempts, ttl).Err()
+	_ = h.redis.Del(ctx, redisKey(pendingID), redisKeyTestOnly+pendingID).Err()
 }
 
 // issueSessionTokens generates an access+refresh token pair and sets the refresh
@@ -645,10 +726,14 @@ func (h *Handler) ResendRegistrationCode(c *gin.Context) {
 		return
 	}
 
-	_ = h.redis.Del(ctx, redisKey(pending.ID)).Err()
+	h.clearVerificationCode(ctx, pending.ID)
 	codeExpires, err := h.sendInitialCode(ctx, pending.ID, pending.Email)
 	if err != nil {
 		_ = h.pending.RevertResend(ctx, pending.ID)
+		if errors.Is(err, ErrPendingExpired) {
+			c.JSON(http.StatusGone, gin.H{"code": "pending_expired"})
+			return
+		}
 		h.log.Error("resend: email send failed", "error", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"error": "Failed to send verification code; please retry",
@@ -695,10 +780,14 @@ func (h *Handler) ChangeRegistrationEmail(c *gin.Context) {
 		return
 	}
 
-	_ = h.redis.Del(ctx, redisKey(req.PendingID)).Err()
+	h.clearVerificationCode(ctx, req.PendingID)
 	newEmailLower := strings.ToLower(strings.TrimSpace(req.NewEmail))
 	codeExpires, err := h.sendInitialCode(ctx, req.PendingID, newEmailLower)
 	if err != nil {
+		if errors.Is(err, ErrPendingExpired) {
+			c.JSON(http.StatusGone, gin.H{"code": "pending_expired"})
+			return
+		}
 		h.log.Error("change-email: send failed", "error", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"error": "Failed to send verification code to new email",
@@ -728,8 +817,7 @@ func (h *Handler) AbandonRegistration(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalError})
 		return
 	}
-	_ = h.redis.Del(ctx, redisKey(pendingID)).Err()
-	_ = h.redis.Del(ctx, redisKeyTestOnly+pendingID).Err()
+	h.clearVerificationCode(ctx, pendingID)
 
 	if !deleted {
 		c.Status(http.StatusNotFound)

@@ -827,6 +827,80 @@ func TestResendRegistrationCode(t *testing.T) {
 	require.NotEqual(t, firstCode, secondCode)
 }
 
+func TestResendRegistrationCodeExtendsPendingExpiryToCodeExpiry(t *testing.T) {
+	ts := setupTS(t)
+	w := ts.DoRequest("POST", "/api/v1/auth/register", registerPayload(), nil)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var reg struct {
+		PendingID string `json:"pending_id"`
+	}
+	testhelpers.ParseJSON(t, w, &reg)
+
+	_, err := ts.DB.Exec(
+		`UPDATE pending_registrations SET expires_at = NOW() + INTERVAL '1 minute' WHERE id = $1`,
+		reg.PendingID)
+	require.NoError(t, err)
+
+	w2 := ts.DoRequest("POST", "/api/v1/auth/register/resend",
+		map[string]string{"pending_id": reg.PendingID}, nil)
+	require.Equal(t, http.StatusOK, w2.Code)
+
+	var body struct {
+		CodeExpiresAt string `json:"code_expires_at"`
+	}
+	testhelpers.ParseJSON(t, w2, &body)
+	codeExpiresAt, err := time.Parse(time.RFC3339, body.CodeExpiresAt)
+	require.NoError(t, err)
+
+	var pendingExpiresAt time.Time
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT expires_at FROM pending_registrations WHERE id = $1`,
+		reg.PendingID,
+	).Scan(&pendingExpiresAt))
+	require.False(t, pendingExpiresAt.Before(codeExpiresAt),
+		"pending registration must not expire before returned code_expires_at")
+}
+
+func TestResendRegistrationCode_PendingExpiredAfterIncrement(t *testing.T) {
+	ts := setupTS(t)
+	w := ts.DoRequest("POST", "/api/v1/auth/register", registerPayload(), nil)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var reg struct {
+		PendingID string `json:"pending_id"`
+	}
+	testhelpers.ParseJSON(t, w, &reg)
+
+	_, err := ts.DB.Exec(`DROP TRIGGER IF EXISTS test_expire_pending_on_resend_1914 ON pending_registrations;
+DROP FUNCTION IF EXISTS test_expire_pending_on_resend_1914()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = ts.DB.Exec(`DROP TRIGGER IF EXISTS test_expire_pending_on_resend_1914 ON pending_registrations;
+DROP FUNCTION IF EXISTS test_expire_pending_on_resend_1914()`)
+	})
+	_, err = ts.DB.Exec(`CREATE FUNCTION test_expire_pending_on_resend_1914()
+RETURNS trigger AS $$
+BEGIN
+	IF NEW.resend_count > OLD.resend_count THEN
+		NEW.expires_at = NOW() - make_interval(secs => 1);
+	END IF;
+	RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER test_expire_pending_on_resend_1914
+BEFORE UPDATE ON pending_registrations
+FOR EACH ROW EXECUTE FUNCTION test_expire_pending_on_resend_1914()`)
+	require.NoError(t, err)
+
+	w2 := ts.DoRequest("POST", "/api/v1/auth/register/resend",
+		map[string]string{"pending_id": reg.PendingID}, nil)
+	require.Equal(t, http.StatusGone, w2.Code)
+	var body struct {
+		Code string `json:"code"`
+	}
+	testhelpers.ParseJSON(t, w2, &body)
+	assert.Equal(t, "pending_expired", body.Code)
+}
+
 func TestResendCooldown(t *testing.T) {
 	ts := setupTS(t)
 	w := ts.DoRequest("POST", "/api/v1/auth/register", registerPayload(), nil)
@@ -879,6 +953,33 @@ func TestChangeEmailMidRegistration(t *testing.T) {
 		reg.PendingID).Scan(&count)
 	require.NoError(t, err)
 	require.Equal(t, 0, count)
+}
+
+func TestChangeRegistrationEmailRefusesFreshCodeInsideAdvertisedWindow(t *testing.T) {
+	ts := setupTS(t)
+	w := ts.DoRequest("POST", "/api/v1/auth/register", registerPayload(), nil)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var reg struct {
+		PendingID string `json:"pending_id"`
+	}
+	testhelpers.ParseJSON(t, w, &reg)
+
+	_, err := ts.DB.Exec(
+		`UPDATE pending_registrations
+		    SET created_at = NOW() - INTERVAL '14 minutes',
+		        expires_at = NOW() + INTERVAL '1 minute'
+		  WHERE id = $1`,
+		reg.PendingID)
+	require.NoError(t, err)
+
+	w2 := ts.DoRequest("POST", "/api/v1/auth/register/change-email",
+		map[string]string{"pending_id": reg.PendingID, "new_email": "absolute-cap@example.com"}, nil)
+	require.Equal(t, http.StatusGone, w2.Code)
+	var body struct {
+		Code string `json:"code"`
+	}
+	testhelpers.ParseJSON(t, w2, &body)
+	require.Equal(t, "pending_expired", body.Code)
 }
 
 // --- Abandon Registration Tests ---
@@ -1112,6 +1213,46 @@ func TestChangeRegistrationEmail_PendingNotFound(t *testing.T) {
 	}
 	testhelpers.ParseJSON(t, w, &body)
 	assert.Equal(t, "pending_not_found", body.Code)
+}
+
+func TestChangeRegistrationEmail_PendingExpiredAfterEmailUpdate(t *testing.T) {
+	ts := setupTS(t)
+	w := ts.DoRequest("POST", "/api/v1/auth/register", registerPayload(), nil)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var reg struct {
+		PendingID string `json:"pending_id"`
+	}
+	testhelpers.ParseJSON(t, w, &reg)
+
+	_, err := ts.DB.Exec(`DROP TRIGGER IF EXISTS test_expire_pending_on_email_1914 ON pending_registrations;
+DROP FUNCTION IF EXISTS test_expire_pending_on_email_1914()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = ts.DB.Exec(`DROP TRIGGER IF EXISTS test_expire_pending_on_email_1914 ON pending_registrations;
+DROP FUNCTION IF EXISTS test_expire_pending_on_email_1914()`)
+	})
+	_, err = ts.DB.Exec(`CREATE FUNCTION test_expire_pending_on_email_1914()
+RETURNS trigger AS $$
+BEGIN
+	IF NEW.email IS DISTINCT FROM OLD.email THEN
+		NEW.expires_at = NOW() - make_interval(secs => 1);
+	END IF;
+	RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER test_expire_pending_on_email_1914
+BEFORE UPDATE ON pending_registrations
+FOR EACH ROW EXECUTE FUNCTION test_expire_pending_on_email_1914()`)
+	require.NoError(t, err)
+
+	w2 := ts.DoRequest("POST", "/api/v1/auth/register/change-email",
+		map[string]string{"pending_id": reg.PendingID, "new_email": "changeexpiry@example.com"}, nil)
+	require.Equal(t, http.StatusGone, w2.Code)
+	var body struct {
+		Code string `json:"code"`
+	}
+	testhelpers.ParseJSON(t, w2, &body)
+	assert.Equal(t, "pending_expired", body.Code)
 }
 
 func TestChangeRegistrationEmail_EmailAlreadyRegistered(t *testing.T) {

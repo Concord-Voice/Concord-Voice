@@ -16,7 +16,7 @@ const (
 	PendingCleanupInterval = 2 * time.Minute
 	MaxResends             = 4
 	ResendCooldown         = 2 * time.Minute
-	VerifyCodeTTLNew       = 2 * time.Minute
+	VerifyCodeTTLNew       = 10 * time.Minute
 	MaxCodeAttempts        = 4
 )
 
