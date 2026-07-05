@@ -8,7 +8,12 @@
   align-items: center;
   align-content: center;
   gap: 4px;
-  padding: calc(12px * var(--sp, 1));
+  /* Padding must be >= the active-speaker glow radius (24px, ParticipantTile.css
+     `.participant-tile--active-speaker`) so the outset glow on edge tiles has room
+     to radiate inside this container's `overflow: hidden` clip box instead of being
+     truncated on the outer side (#1040, Gitar review of PR #2059). overflow:hidden
+     stays — it is the "no scrollbars, tiles shrink to fit" mechanism below. */
+  padding: calc(24px * var(--sp, 1));
   overflow: hidden; /* No scrollbars — tiles shrink to fit */
   min-height: 0;
 }

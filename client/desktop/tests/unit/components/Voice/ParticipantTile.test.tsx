@@ -396,4 +396,22 @@ describe('ParticipantTile', () => {
     // Same menu content as right-click — verifies onClick → setCtxMenu wiring
     expect(screen.getByLabelText('Participant volume')).toBeInTheDocument();
   });
+
+  // ── Active-speaker dominance styling (#1040) ──
+
+  it('applies active-speaker class when activeSpeaker prop is true', () => {
+    const { container } = render(<ParticipantTile participant={makeParticipant()} activeSpeaker />);
+    expect(container.querySelector('.participant-tile--active-speaker')).toBeInTheDocument();
+  });
+
+  it('applies inactive class when dimmed prop is true', () => {
+    const { container } = render(<ParticipantTile participant={makeParticipant()} dimmed />);
+    expect(container.querySelector('.participant-tile--inactive')).toBeInTheDocument();
+  });
+
+  it('applies neither dominance class by default', () => {
+    const { container } = render(<ParticipantTile participant={makeParticipant()} />);
+    expect(container.querySelector('.participant-tile--active-speaker')).not.toBeInTheDocument();
+    expect(container.querySelector('.participant-tile--inactive')).not.toBeInTheDocument();
+  });
 });

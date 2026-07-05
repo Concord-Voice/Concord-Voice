@@ -365,6 +365,11 @@ export const UserFrameGrid: React.FC = () => {
   const localUserId = useUserStore((s) => s.user?.id);
   const participantList = Object.values(participants);
   const scales = useVoiceMagnification(participants);
+  // Active-speaker dominance (#1040): only meaningful with >1 tile (a lone tile
+  // glowing looks broken), and inactive-desaturation only kicks in while someone
+  // is actually speaking (so a silent room does not dim every tile).
+  const dominanceActive = participantList.length > 1;
+  const anySpeaking = participantList.some((p) => p.isSpeaking);
   const gridRef = useRef<HTMLDivElement>(null);
   const hasAnyVideo = participantList.some((p) => p.isVideoOn);
   const reservedScale = VOICE_MAX_SCALE;
@@ -397,6 +402,8 @@ export const UserFrameGrid: React.FC = () => {
               participant={p}
               isLocal={p.userId === localUserId}
               magnificationScale={scale}
+              activeSpeaker={dominanceActive && p.isSpeaking}
+              dimmed={dominanceActive && anySpeaking && !p.isSpeaking}
             />
           </div>
         );

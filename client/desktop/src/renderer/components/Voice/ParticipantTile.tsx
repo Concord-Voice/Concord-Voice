@@ -14,6 +14,10 @@ interface ParticipantTileProps {
   isLocal?: boolean;
   compact?: boolean;
   magnificationScale?: number;
+  /** This tile's user is the/an active speaker — gains the accent glow (#1040). */
+  activeSpeaker?: boolean;
+  /** Someone else is speaking and this user is not — desaturate to recede (#1040). */
+  dimmed?: boolean;
 }
 
 /**
@@ -220,6 +224,8 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
   isLocal = false,
   compact = false,
   magnificationScale = 1,
+  activeSpeaker = false,
+  dimmed = false,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const tileRef = useRef<HTMLDivElement>(null);
@@ -375,7 +381,7 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
   return (
     <div
       ref={tileRef}
-      className={`participant-tile${hasVideo ? ' participant-tile--video' : ''}${compact ? ' participant-tile--compact' : ''}`}
+      className={`participant-tile${hasVideo ? ' participant-tile--video' : ''}${compact ? ' participant-tile--compact' : ''}${activeSpeaker ? ' participant-tile--active-speaker' : ''}${dimmed ? ' participant-tile--inactive' : ''}`}
       {...scopeProps}
       style={{ ...scopeProps.style, ...scaleStyle }}
       onContextMenu={handleContextMenu}

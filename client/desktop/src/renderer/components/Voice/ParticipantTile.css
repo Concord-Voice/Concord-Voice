@@ -8,10 +8,30 @@
   background-color: var(--bg-tertiary);
   display: flex;
   flex-direction: column;
-  /* Magnification animation — fast attack, slower release */
-  transition: transform 120ms ease-out;
+  /* Magnification animation — fast attack, slower release. The added filter +
+     box-shadow easing drive the active-speaker/inactive contrast (#1040); the
+     global [data-reduce-animations] rule zeroes all three durations. */
+  transition:
+    transform 120ms ease-out,
+    filter var(--motion-duration-base) var(--motion-curve-decel),
+    box-shadow var(--motion-duration-base) var(--motion-curve-base);
   /* Padding reserve for magnification overflow */
   margin: 6px;
+}
+
+/* ─── Active-speaker dominance (#1040) ─────────────────────────── */
+
+/* Speaking tile — accent glow. Scale is owned by JS magnification
+   (useVoiceMagnification), NOT here, so we never double-apply a transform. The
+   glow uses the user-scoped --accent-primary, so it matches the speaker's color. */
+.participant-tile--active-speaker {
+  box-shadow: 0 0 24px color-mix(in srgb, var(--accent-primary) 30%, transparent);
+  z-index: 2;
+}
+
+/* Non-speaking tile while someone else speaks — desaturate to recede. */
+.participant-tile--inactive {
+  filter: saturate(0.7) brightness(0.9);
 }
 
 /* Video active — use 16:9 aspect ratio for video content */

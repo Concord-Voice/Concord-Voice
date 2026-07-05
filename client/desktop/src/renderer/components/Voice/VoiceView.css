@@ -85,6 +85,32 @@
   flex-direction: column;
   overflow: hidden;
   min-height: 200px;
+  position: relative; /* anchor the encryption-ring overlay (#1040) */
+}
+
+/* Encryption-as-ring (#1040): a subtle inset accent ring frames the connected
+   voice stage. Unconditional — post-#201 every voice channel is E2EE, so there
+   is no encryption-status branch. The voice-area only mounts once connected, so
+   the ring is structurally "present once connected." An ::after overlay (not a
+   bare box-shadow) paints above the grid and gives a clean opacity fade; the
+   global [data-reduce-animations] rule zeroes the fade duration. */
+.voice-view__voice-area::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-primary) 30%, transparent);
+  animation: voice-ring-fade-in var(--motion-duration-slow) var(--motion-curve-decel);
+}
+
+@keyframes voice-ring-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .voice-view__content--vertical .voice-view__voice-area {
@@ -161,6 +187,42 @@
   align-items: center;
   justify-content: center;
   gap: calc(12px * var(--sp, 1));
+  position: relative;
+  overflow: hidden; /* clip the oversized drifting backdrop (#1040) */
+}
+
+/* Pre-join atmospheric backdrop (#1040): a slow-drifting radial glow themed off
+   the accent color. inset:-50% oversizes the layer so rotation leaves no corner
+   gaps; the gradient is intentionally OFF-center (at 35% 30%) because a centered
+   radial gradient is rotationally symmetric — rotating it would be invisible.
+   The global [data-reduce-animations] rule zeroes the 60s drift. */
+.voice-view__join::before {
+  content: '';
+  position: absolute;
+  inset: -50%;
+  z-index: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse 80% 80% at 35% 30%,
+    color-mix(in srgb, var(--accent-primary) 18%, transparent) 0%,
+    transparent 55%
+  );
+  animation: voice-join-drift 60s linear infinite;
+}
+
+/* Keep the join content (icon, title, subtitle, button) above the backdrop. */
+.voice-view__join > * {
+  position: relative;
+  z-index: 1;
+}
+
+@keyframes voice-join-drift {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .voice-view__join-icon {

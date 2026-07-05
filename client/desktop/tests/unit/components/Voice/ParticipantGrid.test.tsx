@@ -8,8 +8,22 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 
 // ── Child component mocks ──────────────────────────────────────────────────────
 vi.mock('@/renderer/components/Voice/ParticipantTile', () => ({
-  default: ({ participant }: { participant: { userId: string; username: string } }) => (
-    <div data-testid={`participant-tile-${participant.userId}`}>{participant.username}</div>
+  default: ({
+    participant,
+    activeSpeaker,
+    dimmed,
+  }: {
+    participant: { userId: string; username: string };
+    activeSpeaker?: boolean;
+    dimmed?: boolean;
+  }) => (
+    <div
+      data-testid={`participant-tile-${participant.userId}`}
+      data-active-speaker={activeSpeaker ? 'true' : 'false'}
+      data-dimmed={dimmed ? 'true' : 'false'}
+    >
+      {participant.username}
+    </div>
   ),
 }));
 
@@ -701,5 +715,91 @@ describe('UserFrameGrid', () => {
     // Verify useGridLayout was called with aspectRatio: 16/9
     const lastCall = mockUseGridLayout.mock.calls[mockUseGridLayout.mock.calls.length - 1];
     expect(lastCall[2]).toEqual(expect.objectContaining({ aspectRatio: 16 / 9 }));
+  });
+
+  // ── Active-speaker dominance derivation (#1040) ──
+
+  it('applies no dominance treatment to a single speaking participant', () => {
+    useVoiceStore.setState({
+      participants: {
+        u1: {
+          userId: 'u1',
+          username: 'alice',
+          isMuted: false,
+          isDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: false,
+          isSpeaking: true,
+        },
+      },
+    });
+    render(<UserFrameGrid />);
+    const tile = screen.getByTestId('participant-tile-u1');
+    expect(tile).toHaveAttribute('data-active-speaker', 'false');
+    expect(tile).toHaveAttribute('data-dimmed', 'false');
+  });
+
+  it('marks the speaker active and the silent peer dimmed when >1 participant', () => {
+    useVoiceStore.setState({
+      participants: {
+        u1: {
+          userId: 'u1',
+          username: 'alice',
+          isMuted: false,
+          isDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: false,
+          isSpeaking: true,
+        },
+        u2: {
+          userId: 'u2',
+          username: 'bob',
+          isMuted: false,
+          isDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: false,
+          isSpeaking: false,
+        },
+      },
+    });
+    render(<UserFrameGrid />);
+    expect(screen.getByTestId('participant-tile-u1')).toHaveAttribute(
+      'data-active-speaker',
+      'true'
+    );
+    expect(screen.getByTestId('participant-tile-u1')).toHaveAttribute('data-dimmed', 'false');
+    expect(screen.getByTestId('participant-tile-u2')).toHaveAttribute(
+      'data-active-speaker',
+      'false'
+    );
+    expect(screen.getByTestId('participant-tile-u2')).toHaveAttribute('data-dimmed', 'true');
+  });
+
+  it('dims nobody when >1 participant but none are speaking', () => {
+    useVoiceStore.setState({
+      participants: {
+        u1: {
+          userId: 'u1',
+          username: 'alice',
+          isMuted: false,
+          isDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: false,
+          isSpeaking: false,
+        },
+        u2: {
+          userId: 'u2',
+          username: 'bob',
+          isMuted: false,
+          isDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: false,
+          isSpeaking: false,
+        },
+      },
+    });
+    render(<UserFrameGrid />);
+    expect(screen.getByTestId('participant-tile-u1')).toHaveAttribute('data-dimmed', 'false');
+    expect(screen.getByTestId('participant-tile-u2')).toHaveAttribute('data-dimmed', 'false');
   });
 });
