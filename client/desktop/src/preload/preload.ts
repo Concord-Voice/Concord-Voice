@@ -21,11 +21,7 @@ export interface DesktopSource {
 export type UpdateErrorSubtype = 'cert-pin-failure' | 'publisher-failure' | 'signature-failure';
 
 export type PermissionStatus =
-  | 'granted'
-  | 'denied'
-  | 'not-determined'
-  | 'restricted'
-  | 'unavailable';
+  'granted' | 'denied' | 'not-determined' | 'restricted' | 'unavailable';
 
 contextBridge.exposeInMainWorld('electron', {
   // App info
@@ -147,12 +143,14 @@ contextBridge.exposeInMainWorld('electron', {
       ipcRenderer.invoke('selfHosted:probeServer', url),
   },
 
-  // E2EE key persistence (safeStorage via main process)
+  // E2EE key persistence (safeStorage via main process). Resolves true when the
+  // keys were persisted or intentionally skipped, false on a genuine write
+  // failure (#1288) — the renderer surfaces a non-blocking warning on false.
   storeE2EEKeys: (data: {
     wrappingKeyBase64: string;
     preferencesKeyBase64: string;
     wrappedPrivateKeyBase64: string;
-  }) => ipcRenderer.invoke('auth:storeE2EEKeys', data),
+  }): Promise<boolean | { status: 'rejected' }> => ipcRenderer.invoke('auth:storeE2EEKeys', data),
 
   // Proactive token refresh event (#254): main process pushes new access token
   // when its timer or sleep/wake handler refreshes proactively.
@@ -518,12 +516,14 @@ export interface ElectronAPI {
     probeServer: (url: string) => Promise<SelfHostedProbeResult>;
   };
 
-  // E2EE key persistence
+  // E2EE key persistence. Resolves true when the keys were persisted or
+  // intentionally skipped (session-only / no safeStorage); false on a genuine
+  // keychain/disk write failure (#1288).
   storeE2EEKeys: (data: {
     wrappingKeyBase64: string;
     preferencesKeyBase64: string;
     wrappedPrivateKeyBase64: string;
-  }) => Promise<void>;
+  }) => Promise<boolean | { status: 'rejected' }>;
 
   // Proactive token refresh event (#254)
   onTokenRefreshed: (

@@ -31,6 +31,7 @@ import { useSSOFlow } from '../../hooks/useSSOFlow';
 import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
 import { e2eeService } from '../../services/e2eeService';
 import { errorMessage } from '../../utils/redactError';
+import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import './SSOPassphraseSetup.css';
 
 interface CompleteRegistrationErrorBody {
@@ -163,22 +164,11 @@ const SSOPassphraseSetup: React.FC = () => {
           );
         }
 
-        //   2. storeE2EEKeys() failure → warn only, NO clearKeys. Persisting to the
-        //      OS keychain lets E2EE survive an app restart (App.tsx session-restore
-        //      rehydrates only from stored keys). A persistence failure must NOT
-        //      destroy the valid in-memory session from (1). (If (1) failed,
-        //      getSessionKeys returns null after clearKeys, so this block no-ops.)
-        try {
-          const sessionKeys = e2eeService.getSessionKeys();
-          if (sessionKeys && globalThis.electron?.storeE2EEKeys) {
-            await globalThis.electron.storeE2EEKeys(sessionKeys);
-          }
-        } catch (storeError) {
-          console.warn(
-            'Failed to persist E2EE session keys to keychain (E2EE active for this session only):',
-            errorMessage(storeError)
-          );
-        }
+        //   2. Persist E2EE keys for restart-survival. Failure warns only and
+        //      NEVER clears the valid in-memory session from (1) (#1278/#1288 —
+        //      rationale lives in persistE2EESessionKeys). No-op if (1) failed
+        //      (getSessionKeys returns null after clearKeys).
+        await persistE2EESessionKeys(e2eeService.getSessionKeys());
 
         // Returning to phase 'idle' lets AuthFlow re-evaluate based on the
         // new accessToken in authStore (the user is now logged in).

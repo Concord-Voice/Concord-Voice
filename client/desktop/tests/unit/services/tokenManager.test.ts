@@ -71,6 +71,9 @@ import {
   getCachedAccessToken,
   _resetForTesting,
 } from '@/main/tokenManager';
+// Mocked via vi.mock('electron') above — imported here so the persist-failure
+// tests (#1288) can spy encryptString to simulate a locked keychain.
+import { safeStorage } from 'electron';
 
 // ─── JWT Test Helper ────────────────────────────────────────────────
 // Creates a minimal JWT with a given exp claim (seconds since epoch).
@@ -421,6 +424,58 @@ describe('tokenManager', () => {
         throw new Error('ENOENT');
       };
       expect(restoreE2EEKeys()).toBeNull();
+    });
+  });
+
+  // ─── E2EE persist-failure signalling (regression #1288) ─────────────
+  // storeE2EEKeys used to swallow keychain/disk write failures and return
+  // void, so the IPC handler always resolved and the renderer persist-catch
+  // (Register / SSOPassphraseSetup / Login) was dead code for a genuine
+  // keychain-locked write. Contract now: return `true` when persistence is in
+  // its expected state (written, or intentionally skipped for session-only /
+  // no-safeStorage), `false` ONLY when a disk write was attempted and failed.
+  // In-memory key custody is preserved regardless (the #1278 invariant).
+  describe('storeE2EEKeys persist-failure signalling (#1288)', () => {
+    const keys = {
+      wrappingKeyBase64: 'wk',
+      preferencesKeyBase64: 'pk',
+      wrappedPrivateKeyBase64: 'wpk',
+    };
+
+    it('returns false when the keychain write genuinely fails', () => {
+      storeRefreshToken({ refreshToken: 'tk', rememberMe: true, apiBase: 'http://localhost:8080' });
+      // Keychain locked → safeStorage.encryptString throws (the #1288 failure
+      // mode). Spy AFTER storeRefreshToken so its own token-encrypt succeeds and
+      // only the storeE2EEKeys encrypt hits the throw.
+      vi.spyOn(safeStorage, 'encryptString').mockImplementationOnce(() => {
+        throw new Error('keychain locked');
+      });
+
+      expect(storeE2EEKeys(keys)).toBe(false);
+      // #1278 invariant: a persistence failure must NEVER drop the in-memory
+      // session — keys stay usable in-session; only restart-survival is lost.
+      expect(restoreE2EEKeys()).toEqual(keys);
+    });
+
+    it('returns true on a successful disk persist', () => {
+      storeRefreshToken({ refreshToken: 'tk', rememberMe: true, apiBase: 'http://localhost:8080' });
+      fsWriteCalls.length = 0;
+
+      expect(storeE2EEKeys(keys)).toBe(true);
+      expect(fsWriteCalls.length).toBeGreaterThan(0);
+    });
+
+    it('returns true when disk persist is intentionally skipped (session-only)', () => {
+      storeRefreshToken({
+        refreshToken: 'tk',
+        rememberMe: false,
+        apiBase: 'http://localhost:8080',
+      });
+      fsWriteCalls.length = 0;
+
+      // Session-only skip is not a failure — the renderer must not warn.
+      expect(storeE2EEKeys(keys)).toBe(true);
+      expect(fsWriteCalls.length).toBe(0);
     });
   });
 

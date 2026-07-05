@@ -2,6 +2,7 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { unwrapLoginKeys, generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
 import { e2eeService } from '../../services/e2eeService';
 import { errorMessage } from '../../utils/redactError';
+import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import { hydratePostLogin } from '../../services/postLoginHydration';
 import { useAuthStore } from '../../stores/authStore';
 import { useClientConfigStore } from '../../stores/clientConfigStore';
@@ -480,10 +481,9 @@ const Login: React.FC<LoginProps> = ({
     useAuthStore.getState().setAccessToken(data.access_token);
     if (data.session_id) useAuthStore.getState().setSessionId(data.session_id);
 
-    const sessionKeys = e2eeService.getSessionKeys();
-    if (sessionKeys && globalThis.electron?.storeE2EEKeys) {
-      await globalThis.electron.storeE2EEKeys(sessionKeys);
-    }
+    // Persist E2EE keys for restart-survival; failure warns only and never
+    // clears the valid in-session keys (#1278/#1288 — see persistE2EESessionKeys).
+    await persistE2EESessionKeys(e2eeService.getSessionKeys());
 
     // Hydrate all post-login user state — preferences, saved GIFs, notification
     // mute prefs, and the entitlement capability set. Extracted to the shared

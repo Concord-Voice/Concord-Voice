@@ -25,6 +25,11 @@ import {
 
 // ─── Module State (never leaves this process) ────────────────────────
 
+// Main-process-local shape of the persisted E2EE key material. Structural mirror
+// of the renderer's `E2EESessionKeys` (renderer/services/e2eeService.ts); the two
+// meet at the `auth:storeE2EEKeys` IPC boundary by structural (JSON) compatibility,
+// so the type is intentionally NOT shared — keeping main and renderer type domains
+// decoupled. Keep the two shapes in sync if either gains a field.
 type E2EEKeyMaterial = {
   wrappingKeyBase64: string;
   preferencesKeyBase64: string;
@@ -575,8 +580,16 @@ export function clearTokens(): void {
 /**
  * Store E2EE session keys encrypted via safeStorage.
  * Called after login/registration when E2EE service has been initialized.
+ *
+ * Returns `true` when disk persistence is in its expected state — either the
+ * write succeeded, or it was intentionally skipped (session-only / no
+ * safeStorage). Returns `false` ONLY when a disk write was attempted and
+ * genuinely failed (keychain locked, disk full). The renderer uses this to
+ * decide whether restart-survival was actually set up; a `false` is the signal
+ * that used to be swallowed (#1288). In-memory key custody is preserved in all
+ * cases — a persistence failure never drops the usable in-session keys (#1278).
  */
-export function storeE2EEKeys(data: E2EEKeyMaterial): void {
+export function storeE2EEKeys(data: E2EEKeyMaterial): boolean {
   // Always hold the key material in main-process memory, regardless of
   // rememberMe, so a session-only user's E2EE keys survive a renderer soft
   // reload. This is memory only — the disk write below stays gated on
@@ -584,7 +597,7 @@ export function storeE2EEKeys(data: E2EEKeyMaterial): void {
   inMemoryE2EEKeys = data;
 
   if (!canPersist() || !inMemoryRememberMe) {
-    return; // Only persist to disk if safeStorage available and rememberMe is on
+    return true; // Intentional skip (session-only / no safeStorage) is not a failure.
   }
 
   try {
@@ -593,8 +606,10 @@ export function storeE2EEKeys(data: E2EEKeyMaterial): void {
     const paths = activePaths();
     ensureParentDir(paths.e2eeFile);
     fs.writeFileSync(paths.e2eeFile, encrypted);
+    return true;
   } catch (err) {
     console.error('[TokenManager] Failed to encrypt/write E2EE keys:', (err as Error).message);
+    return false; // Signal the genuine keychain/disk write failure to the renderer (#1288).
   }
 }
 

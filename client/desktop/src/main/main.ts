@@ -1372,8 +1372,9 @@ ipcMain.handle('auth:storeE2EEKeys', (event, data: unknown) => {
     return rejectInvalidAuthPayload('auth:storeE2EEKeys');
   }
 
-  storeE2EEKeys(data);
-  return undefined;
+  // Surface persistence success/failure to the renderer (#1288) — a genuine
+  // keychain/disk write failure returns false rather than being swallowed.
+  return storeE2EEKeys(data);
 });
 
 ipcMain.handle('auth:refreshToken', async (event) => {

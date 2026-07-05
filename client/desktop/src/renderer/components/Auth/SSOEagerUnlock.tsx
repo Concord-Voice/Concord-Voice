@@ -32,6 +32,7 @@ import React, { useState } from 'react';
 import { apiFetch, safeJson } from '../../services/apiClient';
 import { type KeyDerivationAlgorithm } from '../../utils/crypto';
 import { e2eeService } from '../../services/e2eeService';
+import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import LoadingSpinner from './LoadingSpinner';
 import './SSOEagerUnlock.css';
 
@@ -123,17 +124,10 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
       return;
     }
 
-    // Best-effort persist; failure leaves us with in-memory keys (this session
-    // works, next launch will re-prompt). Do NOT count toward the lockout.
-    try {
-      const sessionKeys = e2eeService.getSessionKeys();
-      if (sessionKeys && globalThis.electron?.storeE2EEKeys) {
-        await globalThis.electron.storeE2EEKeys(sessionKeys);
-      }
-    } catch {
-      // intentionally swallowed: in-memory keys make this session work; the
-      // user will be asked to unlock again on the next launch.
-    }
+    // Best-effort persist for restart-survival; the shared helper warns only on
+    // failure and never clears the valid in-session keys (#1278/#1288). This does
+    // NOT count toward the lockout, and is a no-op if getSessionKeys() is null.
+    await persistE2EESessionKeys(e2eeService.getSessionKeys());
 
     onUnlock();
   };

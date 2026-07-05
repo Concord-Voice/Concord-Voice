@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.24] — 2026-07-05
+
+### Fixed
+
+- **A clearer signal when your encryption keys can't be saved** ([#2068](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2068)) — if your device keychain is locked or full when Concord saves your encryption keys for next launch, the app now notices instead of failing silently. Your current session keeps working either way; if saving didn't succeed, signing in again on the next launch restores it.
+
 ## [0.2.23] — 2026-07-04
 
 ### Added

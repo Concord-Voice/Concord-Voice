@@ -9,6 +9,7 @@ import { ensureMachineId } from '../../services/apiClient';
 import { apiUrl } from '../../services/runtimeServerBase';
 import { e2eeService } from '../../services/e2eeService';
 import { errorMessage } from '../../utils/redactError';
+import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import { useClientConfigStore } from '../../stores/clientConfigStore';
 import {
   usePendingRegistrationStore,
@@ -210,23 +211,11 @@ const Register: React.FC<RegisterProps> = ({ onBack, onSuccess, onSwitchToLogin 
         );
       }
 
-      //   2. storeE2EEKeys() failure → warn only, NO clearKeys. Persisting to the
-      //      OS keychain lets E2EE survive an app restart (App.tsx session-restore
-      //      rehydrates only from stored keys). A persistence failure must NOT
-      //      destroy the valid in-memory session from (1) — the current session
-      //      still works; only restart-survival is lost. (If (1) failed, getSessionKeys
-      //      returns null after clearKeys, so this block no-ops.)
-      try {
-        const sessionKeys = e2eeService.getSessionKeys();
-        if (sessionKeys && globalThis.electron?.storeE2EEKeys) {
-          await globalThis.electron.storeE2EEKeys(sessionKeys);
-        }
-      } catch (storeError) {
-        console.warn(
-          'Failed to persist E2EE session keys to keychain (E2EE active for this session only):',
-          errorMessage(storeError)
-        );
-      }
+      //   2. Persist E2EE keys for restart-survival. Failure warns only and
+      //      NEVER clears the valid in-memory session from (1) (#1278/#1288 —
+      //      the warn/never-clear rationale lives in persistE2EESessionKeys).
+      //      No-op if (1) failed (getSessionKeys returns null after clearKeys).
+      await persistE2EESessionKeys(e2eeService.getSessionKeys());
 
       usePendingRegistrationStore.getState().setPending(data);
       onSuccess({ pendingId: data.pending_id, email: data.email });
