@@ -20,6 +20,7 @@ import LoadingSpinner from './LoadingSpinner';
 import { SSOButton } from './SSOButton';
 import { useSSOFlow } from '../../hooks/useSSOFlow';
 import KeyRecoveryPrompt from './KeyRecoveryPrompt';
+import { Eye, EyeOff } from 'lucide-react';
 import './Login.css';
 import './TOTPInput.css';
 
@@ -90,6 +91,55 @@ interface FormErrors {
 }
 
 const EMPTY_OAUTH_PROVIDERS: string[] = [];
+
+interface PasswordFieldProps {
+  value: string;
+  onChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  disabled: boolean;
+  error?: string;
+}
+
+// Login password field with an accessible show/hide toggle (#1917). Extracted
+// as a focused presentational component so the visibility ternaries live here
+// instead of inflating Login's cognitive complexity (SonarQube S3776). Owns its
+// own default-hidden `showPassword` state, which resets on unmount — a revealed
+// password never persists across the MFA/SSO/success transitions or to disk.
+// Only the input `type` is driven by state; `value`/`onChange` are untouched, so
+// the submitted credential is byte-identical whether shown or hidden.
+const PasswordField: React.FC<PasswordFieldProps> = ({ value, onChange, disabled, error }) => {
+  const [showPassword, setShowPassword] = useState(false);
+  const toggleLabel = showPassword ? 'Hide password' : 'Show password';
+  return (
+    <div className="form-group">
+      <label htmlFor="login-password" className="form-label">
+        Password
+      </label>
+      <div className="password-input-wrapper">
+        <input
+          id="login-password"
+          type={showPassword ? 'text' : 'password'}
+          className={`form-input ${error ? 'error' : ''}`}
+          placeholder="Enter your password"
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+        />
+        <button
+          type="button"
+          className="password-toggle-btn"
+          onClick={() => setShowPassword((v) => !v)}
+          aria-label={toggleLabel}
+          aria-pressed={showPassword}
+          title={toggleLabel}
+          disabled={disabled}
+        >
+          {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+        </button>
+      </div>
+      {error && <span className="form-error">{error}</span>}
+    </div>
+  );
+};
 
 const Login: React.FC<LoginProps> = ({
   onBack,
@@ -792,21 +842,12 @@ const Login: React.FC<LoginProps> = ({
           </div>
 
           {/* Password */}
-          <div className="form-group">
-            <label htmlFor="login-password" className="form-label">
-              Password
-            </label>
-            <input
-              id="login-password"
-              type="password"
-              className={`form-input ${errors.password ? 'error' : ''}`}
-              placeholder="Enter your password"
-              value={formData.password}
-              onChange={handleChange('password')}
-              disabled={isSubmitting}
-            />
-            {errors.password && <span className="form-error">{errors.password}</span>}
-          </div>
+          <PasswordField
+            value={formData.password}
+            onChange={handleChange('password')}
+            disabled={isSubmitting}
+            error={errors.password}
+          />
 
           {/* Remember Me & Forgot Password */}
           <div className="login-options">

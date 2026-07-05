@@ -238,3 +238,45 @@
   flex-direction: column;
   gap: 12px;
 }
+
+/* Password visibility toggle (#1917). The wrapper anchors the overlaid eye
+   button; the input reserves right padding so its value never runs under the
+   icon. The button is a native <button> for free keyboard focus + Enter/Space
+   activation (Sonar S6819) and carries an action-reflecting aria-label. */
+.password-input-wrapper {
+  position: relative;
+}
+
+.password-input-wrapper .form-input {
+  padding-right: 44px;
+}
+
+.password-toggle-btn {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.password-toggle-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+.password-toggle-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.password-toggle-btn:focus-visible {
+  outline: 2px solid var(--state-focused);
+  outline-offset: 2px;
+}

@@ -144,6 +144,51 @@ describe('Login', () => {
     expect(screen.getByAltText('Concord Voice')).toBeInTheDocument();
   });
 
+  // ── Password visibility toggle (#1917) ──────────────────────────────────
+
+  it('renders the password field hidden by default', () => {
+    render(<Login {...defaultProps} />);
+    expect(screen.getByPlaceholderText('Enter your password')).toHaveAttribute('type', 'password');
+  });
+
+  it('renders a reveal toggle (aria-pressed=false) by default', () => {
+    render(<Login {...defaultProps} />);
+    expect(screen.getByRole('button', { name: /show password/i })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    );
+  });
+
+  it('reveals then re-hides the password when the toggle is clicked', async () => {
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    const input = screen.getByPlaceholderText('Enter your password');
+    expect(input).toHaveAttribute('type', 'password');
+
+    await user.click(screen.getByRole('button', { name: /show password/i }));
+    expect(input).toHaveAttribute('type', 'text');
+    expect(screen.getByRole('button', { name: /hide password/i })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+
+    await user.click(screen.getByRole('button', { name: /hide password/i }));
+    expect(input).toHaveAttribute('type', 'password');
+  });
+
+  it('preserves the typed password value across a visibility toggle', async () => {
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    const input = screen.getByPlaceholderText('Enter your password');
+    await user.type(input, 'MySecret123!');
+    expect(input).toHaveValue('MySecret123!');
+
+    await user.click(screen.getByRole('button', { name: /show password/i }));
+    expect(input).toHaveValue('MySecret123!');
+    await user.click(screen.getByRole('button', { name: /hide password/i }));
+    expect(input).toHaveValue('MySecret123!');
+  });
+
   // ── Form Validation ────────────────────────────────────────────────────
 
   it('shows email validation error for empty email', async () => {
