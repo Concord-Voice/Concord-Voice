@@ -103,6 +103,18 @@ describe('SettingsOverlayHost', () => {
     expect(useSettingsOverlayStore.getState().open).toBeNull();
   });
 
+  it('closes the store when Escape is pressed while open', async () => {
+    render(<SettingsOverlayHost />);
+    act(() => {
+      useSettingsOverlayStore.getState().openSettings('app');
+    });
+    await screen.findByTestId('mock-settings-page');
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(useSettingsOverlayStore.getState().open).toBeNull();
+  });
+
   it('closes when the dialog backdrop is clicked', async () => {
     render(<SettingsOverlayHost />);
     act(() => {

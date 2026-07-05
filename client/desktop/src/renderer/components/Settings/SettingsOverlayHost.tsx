@@ -6,6 +6,14 @@ import './SettingsOverlayHost.css';
 const SettingsPage = lazy(() => import('./SettingsPage'));
 const ServerSettingsPage = lazy(() => import('../Servers/ServerSettingsPage'));
 
+// Mirror SyntaxHelpModal's probe: jsdom does not fire native dialog cancel/close
+// on Escape, while Electron/Chrome do. Keep the fallback out of production so
+// nested settings modals own their Escape handling.
+const dialogCancelsOnEscape = (() => {
+  if (typeof document === 'undefined') return true;
+  return globalThis.navigator !== undefined && !/jsdom/i.test(globalThis.navigator.userAgent ?? '');
+})();
+
 /**
  * SettingsOverlayHost
  *
@@ -50,6 +58,16 @@ const SettingsOverlayHost: React.FC = () => {
       document.body.style.overflow = prev;
     };
   }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    if (dialogCancelsOnEscape) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') close();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [open, close]);
 
   // Native <dialog> fires a 'close' event on ESC; bridge it to the store.
   // Backdrop clicks land on the dialog element itself (not on the inner

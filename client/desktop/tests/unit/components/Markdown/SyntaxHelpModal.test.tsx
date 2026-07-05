@@ -41,6 +41,28 @@ describe('SyntaxHelpModal', () => {
     expect(onClose).toHaveBeenCalled();
   });
 
+  it('calls onClose when the dialog backdrop is pressed', () => {
+    const onClose = vi.fn();
+    const { container } = render(<SyntaxHelpModal open onClose={onClose} />);
+    const dialog = container.querySelector('dialog');
+    expect(dialog).toBeInstanceOf(HTMLDialogElement);
+
+    fireEvent.mouseDown(dialog as HTMLDialogElement);
+
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it('does not close when pressing inside the help content', () => {
+    const onClose = vi.fn();
+    const { container } = render(<SyntaxHelpModal open onClose={onClose} />);
+    const content = container.querySelector('.syntax-help-modal');
+    expect(content).toBeInstanceOf(HTMLElement);
+
+    fireEvent.mouseDown(content as HTMLElement);
+
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it('shows the multi-line fenced-code-block tip (#807)', () => {
     render(<SyntaxHelpModal open onClose={vi.fn()} />);
     expect(

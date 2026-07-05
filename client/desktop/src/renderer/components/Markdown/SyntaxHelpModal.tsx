@@ -73,6 +73,19 @@ const SyntaxHelpModal: React.FC<Props> = ({ open, onClose }) => {
     };
   }, [open, onClose]);
 
+  useEffect(() => {
+    if (!open) return;
+    const el = dialogRef.current;
+    if (!el) return;
+    const handleMouseDown = (e: MouseEvent): void => {
+      if (e.target === el) onClose();
+    };
+    el.addEventListener('mousedown', handleMouseDown);
+    return () => {
+      el.removeEventListener('mousedown', handleMouseDown);
+    };
+  }, [open, onClose]);
+
   // Sync the imperative <dialog> open state with the React-controlled `open` prop.
   // showModal()/close() also moves focus into / out of the dialog for screen readers.
   useEffect(() => {
@@ -96,17 +109,10 @@ const SyntaxHelpModal: React.FC<Props> = ({ open, onClose }) => {
 
   if (!open) return null;
 
-  // Close paths (two independent, both accessible):
-  //   1. Escape key — in production, handled by <dialog> showModal()'s
-  //      native cancel → close event (which fires React's onClose). Under
-  //      jsdom the dialog doesn't wire those events, so the fallback
-  //      globalThis keydown listener above installs (gated on
-  //      `dialogCancelsOnEscape`) to cover that environment.
-  //   2. Explicit X button in the header (below).
-  // Backdrop-click-to-close is intentionally NOT provided: attaching an
-  // onClick handler to the <dialog> trips jsx-a11y's rule that treats
-  // <dialog> as non-interactive. The two close paths above cover the UX
-  // without needing a click listener on the dialog element itself.
+  // Close paths:
+  //   1. Escape key — native dialog close in Electron/Chrome, jsdom fallback above.
+  //   2. Backdrop/click-away via the imperative dialog mousedown listener above.
+  //   3. Explicit X button in the header.
 
   return (
     <dialog
