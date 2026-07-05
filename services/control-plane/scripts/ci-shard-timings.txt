@@ -1,0 +1,48 @@
+# ci-shard-timings.txt — advisory per-package `go test -race` run-times used by
+# ci-shard-packages.sh to balance the control-plane test matrix (greedy LPT).
+#
+# Format:  <module-relative-package>  <seconds>
+#
+# ADVISORY ONLY. Correctness (a complete, disjoint partition covering every
+# package) comes from `go list ./...` at run time, never this file. Packages
+# missing here get CI_SHARD_DEFAULT_WEIGHT; stale entries for removed packages
+# are ignored. Refresh periodically from a real run's per-package `ok <pkg> Ns`
+# lines when balance drifts (e.g. `blacksmith jobs logs <job> --step "Run tests
+# with coverage (shard 1/2)"`). Values below captured 2026-07-04 from
+# "build / Control Plane / Test + Coverage" (job 85183497421).
+#
+# Only packages with test files appear; no-test packages run in ~0s and fall
+# through to the default weight, which is fine (they add negligible imbalance).
+internal/auth               57.7
+internal/mfa                35.3
+internal/rbac               26.9
+internal/dm                 22.5
+internal/users              22.3
+internal/voice              18.4
+internal/websocket          16.6
+internal/admin              16.2
+internal/ownership          14.8
+internal/attestation        14.0
+internal/channels           13.5
+internal/messages           13.3
+internal/servers            10.8
+internal/friends            10.8
+internal/middleware         10.2
+internal/members             9.8
+internal/oauth               7.9
+internal/media               7.9
+internal/age                 6.8
+internal/sessions            6.7
+internal/entitlements        6.5
+internal/invites             5.4
+internal/redemption          3.7
+internal/notifications       2.8
+internal/presence            2.2
+internal/api                 2.0
+internal/clientconfig        1.7
+internal/privacy             1.7
+internal/testhelpers         1.7
+internal/database            1.7
+internal/subscriptions       1.6
+internal/keyrotation         1.6
+internal/servercapabilities  1.2
