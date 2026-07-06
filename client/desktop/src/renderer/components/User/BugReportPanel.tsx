@@ -1,6 +1,7 @@
 import React, { useCallback, useId, useRef, useState } from 'react';
 import { collect as collectSystemInfo } from '../../services/systemInfoService';
 import { formatEntries, getEntries } from '../../services/logBufferService';
+import { pseudonymizeLogUuids } from '../../utils/pseudonymizeLogUuids';
 import { type FeedbackDiagnostics, type FeedbackSubmission } from './feedbackTypes';
 import './BugReportPanel.css';
 
@@ -47,8 +48,10 @@ const DIAGNOSTICS_DISCLOSURE =
   'Includes your anonymous machine ID (first 8 characters), app version, OS, ' +
   'GPU info, display resolution, current connection state, and recent application ' +
   'logs. All personally identifiable information (emails, usernames, IPs, tokens) ' +
-  'is automatically stripped. No message content, friend lists, or account details ' +
-  'are ever included.';
+  'is automatically stripped. Identifiers (channel, message, and account IDs) are ' +
+  'replaced with per-report placeholders like <id:1> — consistent within this ' +
+  'report, meaningless outside it. No message content, friend lists, or account ' +
+  'details are ever included.';
 
 interface BugReportPanelProps {
   /**
@@ -75,7 +78,12 @@ async function buildDiagnostics(): Promise<FeedbackDiagnostics> {
     gpu: info.gpu,
     display: info.display,
     connectionPhase: info.connectionPhase,
-    logs: formatEntries(getEntries()),
+    // Submit-time UUID pseudonymization: replace every UUID with a per-report
+    // ordinal (`<id:1>`, `<id:2>`, …) — consistent within THIS report (triage
+    // correlation) but fresh per report (no cross-report linkability). Kept in
+    // lockstep with the DIAGNOSTICS_DISCLOSURE copy below. Capture-time secret
+    // scrubbing in logBufferService is unchanged; this is an additional pass.
+    logs: pseudonymizeLogUuids(formatEntries(getEntries())),
   };
 }
 

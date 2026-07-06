@@ -48,6 +48,13 @@ var scrubPatterns = []scrubPattern{
 	{regexp.MustCompile(`\b[0-9a-fA-F]{32,}\b`), "<hex>"},
 	// Long base64 / url-safe-base64 strings (keys, encrypted blobs) — 40+ chars.
 	{regexp.MustCompile(`\b[A-Za-z0-9+/=_-]{40,}\b`), "<base64>"},
+	// Raw UUID strip backstop (defense-in-depth for a compromised client that
+	// bypassed the renderer-side ordinal pseudonymizer). Fixed-width → RE2-safe.
+	// The honest client already replaced UUIDs with <id:N> ordinals, so this
+	// only fires on raw UUIDs that slipped through. NOT parity-matched to a
+	// client PATTERN — the client's pseudonym is a fidelity feature, this is a
+	// fail-safe.
+	{regexp.MustCompile(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`), "<uuid>"},
 }
 
 // Sanitize runs every scrubPattern across the input and returns the redacted

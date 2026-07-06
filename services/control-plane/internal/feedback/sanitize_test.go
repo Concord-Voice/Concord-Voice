@@ -114,3 +114,18 @@ func TestSanitize_DoesNotMatchShortVersionStrings(t *testing.T) {
 	out := Sanitize(in)
 	assert.Equal(t, in, out)
 }
+
+// Server raw-UUID strip backstop (#2074). This is NOT parity-matched to a
+// client PATTERN — the honest client already replaces UUIDs with <id:N>
+// ordinals via pseudonymizeLogUuids; this fires only on raw UUIDs from a
+// compromised client that bypassed that pass.
+func TestSanitize_StripsRawUUID(t *testing.T) {
+	in := "channel 550e8400-e29b-41d4-a716-446655440000 ok"
+	assert.Equal(t, "channel <uuid> ok", Sanitize(in))
+}
+
+// The client ordinal pseudonyms (<id:N>) must pass through untouched — the
+// backstop targets raw UUIDs only, not the honest client's placeholders.
+func TestSanitize_LeavesPseudonymTokensUntouched(t *testing.T) {
+	assert.Equal(t, "channel <id:1> ok", Sanitize("channel <id:1> ok"))
+}

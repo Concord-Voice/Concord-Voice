@@ -104,14 +104,17 @@ type GitHubIssueCreator interface {
 // stub-in-dev / hard-fail-in-prod posture — config.go's production guard
 // fatal-exits before we ever construct a nil-github Handler in production.
 type Handler struct {
-	log    *logger.Logger
-	github GitHubIssueCreator
+	log     *logger.Logger
+	github  GitHubIssueCreator
+	corrKey []byte // HKDF-derived correlation key (see buildFeedbackHandler)
 }
 
 // NewHandler builds a Handler. Pass `nil` for `github` in dev to enable the
-// log-and-skip stub.
-func NewHandler(log *logger.Logger, github GitHubIssueCreator) *Handler {
-	return &Handler{log: log, github: github}
+// log-and-skip stub. `corrKey` is the HKDF-derived correlation key (see
+// buildFeedbackHandler), used to derive the non-reversible reporter correlation
+// token (see DeriveCorrelationToken).
+func NewHandler(log *logger.Logger, github GitHubIssueCreator, corrKey []byte) *Handler {
+	return &Handler{log: log, github: github, corrKey: corrKey}
 }
 
 // Submit handles POST /api/v1/feedback. Requires the AuthRequired
@@ -171,7 +174,11 @@ func (h *Handler) Submit(c *gin.Context) {
 		req.Diagnostics.Logs = Sanitize(req.Diagnostics.Logs)
 	}
 
-	title, body, labels := buildIssue(&req, userID)
+	// De-identify the reporter: the (public-ish) issue body carries a
+	// non-reversible HMAC correlation token, never the raw internal UUID.
+	// The token is stable across a user's reports so triage can dedup.
+	reporterToken := DeriveCorrelationToken(h.corrKey, userID)
+	title, body, labels := buildIssue(&req, reporterToken)
 
 	// Dev stub: log the body and return success without calling GitHub.
 	if h.github == nil {
@@ -388,11 +395,10 @@ func inlineCode(s string) string {
 //
 // The body is rendered with explicit section headers so triagers reading
 // the GitHub issue have a consistent layout regardless of which mode the
-// user picked. The "Reported by" / "Requested by" line carries the user's
-// internal ID for follow-up correlation — it never reaches the public
-// issue body's user-visible content (GitHub issues are public-ish; the body
-// IS visible to anyone with repo read access, hence the dedicated feedback
-// repo per the architectural decision recorded in the PR body).
+// user picked. The "Reported by" / "Requested by" line carries a
+// non-reversible HMAC correlation token (DeriveCorrelationToken) — NOT the
+// raw internal UUID — so triage can tie a user's multiple reports together
+// without exposing the internal ID in the (public-ish) feedback repo body.
 //
 // User-supplied free text reaches a PUBLIC repo, so every user field is
 // rendered INERT — no masked link `[t](u)`, raw HTML `<a>`/`<img>`, or bare
@@ -410,14 +416,14 @@ func inlineCode(s string) string {
 // rune-boundary-aware head-keep (header + the start of the Description block),
 // dropping the remainder. The truncation is marked inline so triagers know it
 // happened.
-func buildIssue(req *submitRequest, userID string) (title, body string, labels []string) {
+func buildIssue(req *submitRequest, reporterToken string) (title, body string, labels []string) {
 	var b strings.Builder
 
 	switch req.Type {
 	case reportTypeBug:
 		title = "[Bug Report] " + neutralizeAutolinks(req.Title)
 		labels = []string{"type: bug"}
-		fmt.Fprintf(&b, "**Reported by:** user `%s` (internal ID)\n", userID)
+		fmt.Fprintf(&b, "**Reported by:** report `%s`\n", reporterToken)
 		if req.Diagnostics != nil {
 			fmt.Fprintf(&b, "**App Version:** %s\n", inlineCode(req.Diagnostics.AppVersion))
 			fmt.Fprintf(&b, "**Platform:** %s\n", inlineCode(req.Diagnostics.Platform))
@@ -431,7 +437,7 @@ func buildIssue(req *submitRequest, userID string) (title, body string, labels [
 	case reportTypeFeature:
 		title = "[Feature Request] " + neutralizeAutolinks(req.Title)
 		labels = []string{"type: feature"}
-		fmt.Fprintf(&b, "**Requested by:** user `%s` (internal ID)\n", userID)
+		fmt.Fprintf(&b, "**Requested by:** report `%s`\n", reporterToken)
 		if req.Category != "" {
 			fmt.Fprintf(&b, "**Category:** %s\n", inlineCode(req.Category))
 		}

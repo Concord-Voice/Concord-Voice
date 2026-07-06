@@ -1,16 +1,24 @@
 /**
  * Ring-buffer log capture for bug reports (#158).
  *
- * `install()` monkey-patches `console.log`, `console.warn`, and `console.error`
- * to ALSO push a sanitized snapshot of the call into an in-memory ring buffer.
+ * `install()` monkey-patches `console.log`, `console.warn`, `console.error`,
+ * `console.debug`, and `console.info` to ALSO push a sanitized snapshot of the
+ * call into an in-memory ring buffer.
  * The original console methods still fire (so DevTools and Electron log forwarding
  * are unaffected); we just shadow-record their args.
  *
- * The buffer is capped at MAX_ENTRIES (500). On overflow the oldest entry is
- * dropped. Snapshots are PII-scrubbed at capture time, not at read time — this
- * means we never hold the raw payload in memory, so any future feature that
- * reads the buffer (bug-report submit, in-app log viewer, crash dump) gets the
- * sanitized form by construction.
+ * Capture is split into two independent ring buffers by priority so a burst of
+ * high-volume `debug`/`info` right before a crash cannot evict the triage-critical
+ * `warn`/`error` lines (which, in a single shared FIFO, they otherwise would):
+ *   - priority buffer — `warn`, `error` — capped at MAX_PRIORITY_ENTRIES
+ *   - general buffer  — `log`, `debug`, `info` — capped at MAX_GENERAL_ENTRIES
+ * Each segment drops its own oldest entry on overflow; `getEntries()` merges the
+ * two back into a single chronological view (ties broken by capture order).
+ *
+ * Snapshots are PII-scrubbed at capture time, not at read time — this means we
+ * never hold the raw payload in memory, so any future feature that reads the
+ * buffer (bug-report submit, in-app log viewer, crash dump) gets the sanitized
+ * form by construction.
  *
  * **Why client-side scrub matters:** even though the server re-sanitizes as
  * defense-in-depth, the buffer is process-resident on the user's machine until
@@ -18,9 +26,17 @@
  * future telemetry) inherits the scrub.
  */
 
-const MAX_ENTRIES = 500;
+// General levels (`log`/`debug`/`info`) keep the historical 500-entry window.
+// `warn`/`error` get a separate reserved window so a high-volume debug/info
+// burst can never push them out; the reserve is additive, not carved out of the
+// general capacity, so common-case log retention is unchanged.
+const MAX_GENERAL_ENTRIES = 500;
+const MAX_PRIORITY_ENTRIES = 250;
 
-export type LogLevel = 'log' | 'warn' | 'error';
+export type LogLevel = 'log' | 'warn' | 'error' | 'debug' | 'info';
+
+// Levels that must survive a debug/info flood for triage.
+const PRIORITY_LEVELS: ReadonlySet<LogLevel> = new Set<LogLevel>(['warn', 'error']);
 
 export interface LogEntry {
   ts: number;
@@ -28,13 +44,24 @@ export interface LogEntry {
   message: string;
 }
 
+// Stored form carries a monotonic sequence number so the merged, chronological
+// view in getEntries() preserves true capture order even for entries that share
+// a millisecond timestamp. `seq` is internal and never exposed via LogEntry.
+interface StoredEntry extends LogEntry {
+  seq: number;
+}
+
 interface OriginalConsole {
   log: typeof console.log;
   warn: typeof console.warn;
   error: typeof console.error;
+  debug: typeof console.debug;
+  info: typeof console.info;
 }
 
-let buffer: LogEntry[] = [];
+let generalBuffer: StoredEntry[] = [];
+let priorityBuffer: StoredEntry[] = [];
+let seqCounter = 0;
 let installed = false;
 let original: OriginalConsole | null = null;
 
@@ -136,9 +163,17 @@ function stringifyArg(value: unknown): string {
 
 function record(level: LogLevel, args: unknown[]): void {
   const message = sanitize(args.map(stringifyArg).join(' '));
-  buffer.push({ ts: Date.now(), level, message });
-  if (buffer.length > MAX_ENTRIES) {
-    buffer.splice(0, buffer.length - MAX_ENTRIES);
+  const entry: StoredEntry = { ts: Date.now(), level, message, seq: seqCounter++ };
+  if (PRIORITY_LEVELS.has(level)) {
+    priorityBuffer.push(entry);
+    if (priorityBuffer.length > MAX_PRIORITY_ENTRIES) {
+      priorityBuffer.splice(0, priorityBuffer.length - MAX_PRIORITY_ENTRIES);
+    }
+  } else {
+    generalBuffer.push(entry);
+    if (generalBuffer.length > MAX_GENERAL_ENTRIES) {
+      generalBuffer.splice(0, generalBuffer.length - MAX_GENERAL_ENTRIES);
+    }
   }
 }
 
@@ -159,8 +194,10 @@ export function install(): void {
     log: c.log.bind(console),
     warn: c.warn.bind(console),
     error: c.error.bind(console),
+    debug: c.debug.bind(console),
+    info: c.info.bind(console),
   };
-  const levels: LogLevel[] = ['log', 'warn', 'error'];
+  const levels: LogLevel[] = ['log', 'warn', 'error', 'debug', 'info'];
   for (const level of levels) {
     const orig = original[level];
     c[level] = (...args: unknown[]) => {
@@ -184,6 +221,8 @@ export function uninstall(): void {
   c.log = original.log;
   c.warn = original.warn;
   c.error = original.error;
+  c.debug = original.debug;
+  c.info = original.info;
   installed = false;
   original = null;
 }
@@ -194,7 +233,9 @@ export function uninstall(): void {
  * or `install()` was never called.
  */
 export function getEntries(): LogEntry[] {
-  return buffer.slice();
+  return [...priorityBuffer, ...generalBuffer]
+    .sort((a, b) => a.ts - b.ts || a.seq - b.seq)
+    .map(({ ts, level, message }) => ({ ts, level, message }));
 }
 
 /**
@@ -212,5 +253,7 @@ export function formatEntries(entries: LogEntry[] = getEntries()): string {
  * Clear the buffer. Test-only — production code does not call this.
  */
 export function _resetForTest(): void {
-  buffer = [];
+  generalBuffer = [];
+  priorityBuffer = [];
+  seqCounter = 0;
 }

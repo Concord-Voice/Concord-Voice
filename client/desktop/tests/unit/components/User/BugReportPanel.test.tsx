@@ -189,6 +189,23 @@ describe('BugReportPanel', () => {
       expect(mockCollect).toHaveBeenCalledTimes(1);
     });
 
+    it('pseudonymizes UUIDs in the logs field before submitting (#2074)', async () => {
+      const uuid = '550e8400-e29b-41d4-a716-446655440000';
+      mockFormatEntries.mockReturnValue(`for channel ${uuid} again ${uuid}`);
+      const onSubmit = vi.fn().mockResolvedValue(undefined);
+      render(<BugReportPanel onSubmit={onSubmit} isSubmitting={false} />);
+      fillForm('Crash on send', 'It crashed.');
+      fireEvent.click(screen.getByLabelText('Include diagnostic logs'));
+      fireEvent.click(screen.getByRole('button', { name: 'Submit Bug Report' }));
+
+      await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+      const logs = onSubmit.mock.calls[0][0].diagnostics.logs;
+      expect(logs).toContain('<id:1>');
+      expect(logs).not.toContain(uuid);
+      // The same UUID maps to the same ordinal within the report.
+      expect(logs).toBe('for channel <id:1> again <id:1>');
+    });
+
     it('trims title and description in the submitted payload', async () => {
       const onSubmit = vi.fn().mockResolvedValue(undefined);
       render(<BugReportPanel onSubmit={onSubmit} isSubmitting={false} />);

@@ -64,8 +64,12 @@ func doPost(t *testing.T, r *gin.Engine, payload interface{}) *httptest.Response
 	return w
 }
 
+// testCorrKey is the fixed HKDF-derived-shaped correlation key the test handler
+// uses so reporter tokens are deterministic across a test run.
+var testCorrKey = []byte("test-corr-key-0000000000000000000") // pragma: allowlist secret -- test fixture
+
 func newTestHandler(github GitHubIssueCreator) *Handler {
-	return NewHandler(logger.New("test"), github)
+	return NewHandler(logger.New("test"), github, testCorrKey)
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────
@@ -183,7 +187,9 @@ func TestSubmit_BugReport_AssemblesIssueShape(t *testing.T) {
 	call := gh.calls[0]
 	assert.Equal(t, "[Bug Report] Crash on send", call.Title)
 	assert.Equal(t, []string{"type: bug"}, call.Labels)
-	assert.Contains(t, call.Body, "user `user-42`")
+	// The body carries the non-reversible reporter token, never the raw ID.
+	assert.NotContains(t, call.Body, "user-42", "raw user ID must not appear in the body")
+	assert.Contains(t, call.Body, "**Reported by:** report `"+DeriveCorrelationToken(testCorrKey, "user-42")+"`")
 	// Metadata values are wrapped in inline code spans (post-#1547 Fix 2/4/5).
 	assert.Contains(t, call.Body, "**App Version:** `0.1.60`")
 	assert.Contains(t, call.Body, "**Platform:** `darwin`")
@@ -213,7 +219,9 @@ func TestSubmit_FeatureRequest_AssemblesIssueShape(t *testing.T) {
 	call := gh.calls[0]
 	assert.Equal(t, "[Feature Request] Add dark high-contrast preset", call.Title)
 	assert.Equal(t, []string{"type: feature"}, call.Labels)
-	assert.Contains(t, call.Body, "user `user-9`")
+	// The body carries the non-reversible reporter token, never the raw ID.
+	assert.NotContains(t, call.Body, "user-9", "raw user ID must not appear in the body")
+	assert.Contains(t, call.Body, "**Requested by:** report `"+DeriveCorrelationToken(testCorrKey, "user-9")+"`")
 	assert.Contains(t, call.Body, "**Category:** `Improvement to Existing Feature`")
 	assert.NotContains(t, call.Body, "## Diagnostics", "feature requests must not emit diagnostics section")
 }
@@ -725,6 +733,17 @@ func TestTruncateBody_RuneBoundary(t *testing.T) {
 		assert.True(t, utf8.ValidString(out), "must be valid UTF-8 after rune-boundary walk-back")
 		assert.True(t, strings.HasSuffix(out, "..._\n"))
 	})
+}
+
+func TestBuildIssue_NoRawUserID(t *testing.T) {
+	req := &submitRequest{Type: reportTypeBug, Title: "x", Description: "y"}
+	const uid = "550e8400-e29b-41d4-a716-446655440000"
+	token := DeriveCorrelationToken([]byte("s"), uid)
+
+	_, body, _ := buildIssue(req, token)
+
+	assert.NotContains(t, body, uid, "raw UUID must never appear in the issue body")
+	assert.Contains(t, body, "**Reported by:** report `"+token+"`")
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────

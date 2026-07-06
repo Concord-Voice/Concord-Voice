@@ -37,6 +37,18 @@ describe('logBufferService', () => {
       expect(entries.map((e) => e.level)).toEqual(['warn', 'error']);
     });
 
+    it('captures console.debug and console.info with correct level tags', () => {
+      install();
+      // eslint-disable-next-line no-console
+      console.debug('dbg-line');
+      // eslint-disable-next-line no-console
+      console.info('inf-line');
+      const entries = getEntries();
+      expect(entries.find((e) => e.message.includes('dbg-line'))?.level).toBe('debug');
+      expect(entries.find((e) => e.message.includes('inf-line'))?.level).toBe('info');
+      uninstall();
+    });
+
     it('is idempotent — install twice is a no-op', () => {
       install();
       install();
@@ -65,7 +77,7 @@ describe('logBufferService', () => {
   });
 
   describe('ring buffer cap', () => {
-    it('caps the buffer at MAX_ENTRIES (500), dropping the oldest', () => {
+    it('caps the general buffer at MAX_GENERAL_ENTRIES (500), dropping the oldest', () => {
       install();
       for (let i = 0; i < 600; i++) {
         // eslint-disable-next-line no-console
@@ -76,6 +88,30 @@ describe('logBufferService', () => {
       // First entry should be the (600 - 500)th = msg-100
       expect(entries[0].message).toBe('msg-100');
       expect(entries[entries.length - 1].message).toBe('msg-599');
+    });
+
+    it('retains warn/error through a debug/info flood that exceeds the general cap', () => {
+      install();
+      // eslint-disable-next-line no-console
+      console.error('critical-before');
+      // A burst large enough to fully cycle the general buffer several times.
+      for (let i = 0; i < 2000; i++) {
+        // eslint-disable-next-line no-console
+        console.debug(`noise-${i}`);
+      }
+      // eslint-disable-next-line no-console
+      console.warn('critical-after');
+
+      const entries = getEntries();
+      const messages = entries.map((e) => e.message);
+
+      // The triage-critical lines survive despite the flood...
+      expect(messages).toContain('critical-before');
+      expect(messages).toContain('critical-after');
+      // ...the high-volume general segment is still capped...
+      expect(entries.filter((e) => e.level === 'debug')).toHaveLength(500);
+      // ...and chronological order is preserved across the two segments.
+      expect(messages.indexOf('critical-before')).toBeLessThan(messages.indexOf('critical-after'));
     });
   });
 
