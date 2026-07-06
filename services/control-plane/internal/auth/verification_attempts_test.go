@@ -95,6 +95,35 @@ func TestAttemptsGuardCountsStaleConcurrentInvalidAttemptsAtomically(t *testing.
 	require.GreaterOrEqual(t, attempts, MaxCodeAttempts)
 }
 
+// regression for #2083
+func TestAttemptsGuardReturnsTooManyWhenCodeAlreadyExhausted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	client := setupAuthAttemptRedis(t)
+	h := &Handler{redis: client}
+	pendingID := "550e8400-e29b-41d4-a716-446655440002"
+	record := verificationRecord{
+		CodeHash: hashCode("123456"),
+		Email:    "exhausted@example.com",
+		Attempts: 0,
+	}
+	raw, err := json.Marshal(record)
+	require.NoError(t, err)
+	require.NoError(t, client.Set(ctx, redisKey(pendingID), raw, VerifyCodeTTLNew).Err())
+
+	h.exhaustVerificationCode(ctx, pendingID)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	ok := h.attemptsGuard(ctx, c, pendingID, "000000") //nolint:gosec // test value, not a credential
+	require.False(t, ok)
+	require.Equal(t, http.StatusTooManyRequests, w.Code)
+
+	var body map[string]string
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Equal(t, "too_many_attempts", body["code"])
+}
+
 func TestAttemptsGuardRearmsMissingAttemptTTL(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()

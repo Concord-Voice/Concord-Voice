@@ -557,6 +557,10 @@ func (h *Handler) validateConfirmRequest(c *gin.Context) (*ConfirmRegistrationRe
 func (h *Handler) attemptsGuard(ctx context.Context, c *gin.Context, pendingID string, sanitized string) bool {
 	rec, attempts, err := h.reserveVerificationAttempt(ctx, pendingID)
 	if errors.Is(err, redis.Nil) {
+		if h.isVerificationExhausted(ctx, pendingID) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"code": "too_many_attempts"})
+			return false
+		}
 		h.clearVerificationCode(ctx, pendingID)
 		c.JSON(http.StatusGone, gin.H{"code": "code_expired"})
 		return false
@@ -621,6 +625,11 @@ func (h *Handler) reserveVerificationAttempt(ctx context.Context, pendingID stri
 		return nil, 0, fmt.Errorf("unmarshal verification record: %w", err)
 	}
 	return &rec, int(attemptsRaw), nil
+}
+
+func (h *Handler) isVerificationExhausted(ctx context.Context, pendingID string) bool {
+	attempts, err := h.redis.Get(ctx, verificationAttemptsKey(pendingID)).Int()
+	return err == nil && attempts >= MaxCodeAttempts
 }
 
 func (h *Handler) verificationCodeTTL(ctx context.Context, pendingID string) time.Duration {
