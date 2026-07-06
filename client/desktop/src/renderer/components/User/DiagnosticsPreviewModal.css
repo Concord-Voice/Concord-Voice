@@ -1,0 +1,59 @@
+/* ─── Diagnostics preview modal (#2078) ──────────────────────────────────────
+ *
+ * Read-only preview of the exact diagnostics bundle a bug report would carry.
+ * Renders inside the shared `ui/Modal` chrome; styles the consent header, the
+ * field list, and the monospace log block. Token names + fallbacks mirror
+ * BugReportPanel.css / FeedbackModal.css so it themes natively.
+ */
+
+.diagnostics-preview-consent {
+  margin: 0 0 12px;
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.5;
+  color: var(--text-muted, #6b7280);
+}
+
+.diagnostics-preview-status {
+  font-size: calc(14px * var(--font-scale, 1));
+  color: var(--text-muted, #6b7280);
+}
+
+.diagnostics-preview-fields {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  margin: 0 0 12px;
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+.diagnostics-preview-fields dt {
+  font-weight: 600;
+  color: var(--text-muted, #6b7280);
+}
+
+.diagnostics-preview-fields dd {
+  margin: 0;
+  color: var(--text-primary, #111827);
+  overflow-wrap: anywhere;
+}
+
+.diagnostics-preview-logs-heading {
+  margin: 8px 0 4px;
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-primary, #111827);
+}
+
+.diagnostics-preview-logs {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  padding: 8px;
+  background: var(--bg-tertiary, #f3f4f6);
+  border: 1px solid var(--border-color, #e5e7eb);
+  border-radius: 6px;
+  font-family: 'SourceCodePro', 'Courier New', monospace;
+  font-size: calc(12px * var(--font-scale, 1));
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

@@ -234,6 +234,68 @@ describe('BugReportPanel', () => {
     });
   });
 
+  describe('logs preview (#2078)', () => {
+    it('opens the preview modal showing the exact buildDiagnostics logs', async () => {
+      // The preview calls the SAME buildDiagnostics() the submit path uses, so
+      // the pseudonymized log line (UUID → <id:1>) proves preview == payload.
+      const uuid = '550e8400-e29b-41d4-a716-446655440000';
+      mockFormatEntries.mockReturnValue(`for channel ${uuid}`);
+      render(<BugReportPanel onSubmit={vi.fn()} isSubmitting={false} />);
+
+      fireEvent.click(screen.getByRole('button', { name: /what's in the logs/i }));
+
+      expect(await screen.findByText(/for channel <id:1>/)).toBeInTheDocument();
+      expect(screen.queryByText(/550e8400-/)).toBeNull();
+    });
+
+    it('opening/closing the preview does not change the include-logs checkbox', async () => {
+      render(<BugReportPanel onSubmit={vi.fn()} isSubmitting={false} />);
+      const checkbox = screen.getByLabelText('Include diagnostic logs');
+      expect(checkbox).not.toBeChecked();
+
+      fireEvent.click(screen.getByRole('button', { name: /what's in the logs/i }));
+      await screen.findByRole('heading', { name: /what's in the logs/i });
+
+      // Topmost modal is the preview → Escape closes it; the panel stays.
+      fireEvent.keyDown(document, { key: 'Escape' });
+
+      await waitFor(() =>
+        expect(screen.queryByRole('heading', { name: /what's in the logs/i })).toBeNull()
+      );
+      expect(checkbox).not.toBeChecked();
+    });
+
+    it('surfaces a graceful error state when diagnostics collection fails', async () => {
+      mockCollect.mockRejectedValueOnce(new Error('probe failed'));
+      render(<BugReportPanel onSubmit={vi.fn()} isSubmitting={false} />);
+
+      fireEvent.click(screen.getByRole('button', { name: /what's in the logs/i }));
+
+      expect(await screen.findByText(/couldn't collect diagnostics/i)).toBeInTheDocument();
+    });
+
+    it('closing the preview with X does NOT submit the bug report (Gitar HIGH, #2086)', async () => {
+      // Regression lock: `ui/Modal` renders inline (no portal) and its close (X)
+      // button has no explicit `type`, so if the modal were a descendant of the
+      // <form> the default `type="submit"` X-click would submit the report. The
+      // modal is now a form sibling; clicking X must only close it. The existing
+      // ESC-close test above did NOT cover this button-click submit path.
+      const onSubmit = vi.fn().mockResolvedValue(undefined);
+      render(<BugReportPanel onSubmit={onSubmit} isSubmitting={false} />);
+
+      fireEvent.click(screen.getByRole('button', { name: /what's in the logs/i }));
+      await screen.findByRole('heading', { name: /what's in the logs/i });
+
+      fireEvent.click(screen.getByRole('button', { name: /close/i }));
+
+      await waitFor(() =>
+        expect(screen.queryByRole('heading', { name: /what's in the logs/i })).toBeNull()
+      );
+      // The X close must not have submitted the form.
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+  });
+
   describe('submitting state', () => {
     it('disables the fields and button while isSubmitting', () => {
       render(<BugReportPanel onSubmit={vi.fn()} isSubmitting={true} />);

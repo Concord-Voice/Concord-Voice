@@ -107,6 +107,30 @@
   padding: 10px 12px;
 }
 
+/* ─── "What's in the logs?" preview link (#2078) ────────────────────────── */
+
+.bug-report-preview-link {
+  align-self: flex-start;
+  margin-top: 6px;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--accent-primary, #2563eb);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(13px * var(--font-scale, 1));
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.bug-report-preview-link:hover {
+  color: var(--accent-hover, #1d4ed8);
+}
+
+.bug-report-preview-link:focus-visible {
+  outline: 2px solid var(--accent-primary, #2563eb);
+  outline-offset: 2px;
+}
+
 /* ─── Submit ────────────────────────────────────────────────────────────── */
 
 .bug-report-actions {

@@ -3,6 +3,7 @@ import { collect as collectSystemInfo } from '../../services/systemInfoService';
 import { formatEntries, getEntries } from '../../services/logBufferService';
 import { pseudonymizeLogUuids } from '../../utils/pseudonymizeLogUuids';
 import { type FeedbackDiagnostics, type FeedbackSubmission } from './feedbackTypes';
+import DiagnosticsPreviewModal from './DiagnosticsPreviewModal';
 import './BugReportPanel.css';
 
 /**
@@ -92,6 +93,15 @@ const BugReportPanel: React.FC<BugReportPanelProps> = ({ onSubmit, isSubmitting 
   const [description, setDescription] = useState('');
   const [includeLogs, setIncludeLogs] = useState(false);
 
+  // "What's in the logs?" preview (#2078). The preview renders the EXACT bundle
+  // `buildDiagnostics()` would submit — one code path, so the preview cannot
+  // drift from the payload. Preview state is fully independent of the submit
+  // form: opening/closing it never touches `includeLogs` or the submit path.
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewData, setPreviewData] = useState<FeedbackDiagnostics | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState(false);
+
   const titleId = useId();
   const descriptionId = useId();
   const includeLogsId = useId();
@@ -141,75 +151,112 @@ const BugReportPanel: React.FC<BugReportPanelProps> = ({ onSubmit, isSubmitting 
     [title, description, includeLogs, titleValid, descriptionValid, isSubmitting, onSubmit]
   );
 
+  const handleOpenPreview = useCallback(async () => {
+    setPreviewOpen(true);
+    setPreviewLoading(true);
+    setPreviewError(false);
+    setPreviewData(null);
+    try {
+      // The SAME function the submit path calls — the preview cannot drift
+      // from what is actually sent.
+      const d = await buildDiagnostics();
+      setPreviewData(d);
+    } catch {
+      setPreviewError(true);
+    } finally {
+      setPreviewLoading(false);
+    }
+  }, []);
+
   return (
-    <form className="bug-report-panel" onSubmit={handleSubmit} noValidate>
-      {/* Title */}
-      <div className="bug-report-field">
-        <label className="bug-report-label" htmlFor={titleId}>
-          Title <span className="bug-report-required">*</span>
-        </label>
-        <input
-          id={titleId}
-          type="text"
-          className="bug-report-input"
-          value={title}
-          maxLength={TITLE_MAX}
-          placeholder="Short summary of the bug"
-          disabled={isSubmitting}
-          onChange={(e) => setTitle(e.target.value)}
-          required
-        />
-        <div className="bug-report-counter" aria-hidden="true">
-          {title.length}/{TITLE_MAX}
-        </div>
-      </div>
-
-      {/* Description */}
-      <div className="bug-report-field">
-        <label className="bug-report-label" htmlFor={descriptionId}>
-          Description <span className="bug-report-required">*</span>
-        </label>
-        <textarea
-          id={descriptionId}
-          className="bug-report-textarea"
-          value={description}
-          maxLength={DESCRIPTION_MAX}
-          placeholder={DESCRIPTION_PLACEHOLDER}
-          rows={8}
-          disabled={isSubmitting}
-          onChange={(e) => setDescription(e.target.value)}
-          required
-        />
-        <div className="bug-report-counter" aria-hidden="true">
-          {description.length}/{DESCRIPTION_MAX}
-        </div>
-      </div>
-
-      {/* Include diagnostic logs */}
-      <div className="bug-report-field bug-report-diagnostics">
-        <label className="bug-report-checkbox-label" htmlFor={includeLogsId}>
+    <>
+      <form className="bug-report-panel" onSubmit={handleSubmit} noValidate>
+        {/* Title */}
+        <div className="bug-report-field">
+          <label className="bug-report-label" htmlFor={titleId}>
+            Title <span className="bug-report-required">*</span>
+          </label>
           <input
-            id={includeLogsId}
-            type="checkbox"
-            checked={includeLogs}
+            id={titleId}
+            type="text"
+            className="bug-report-input"
+            value={title}
+            maxLength={TITLE_MAX}
+            placeholder="Short summary of the bug"
             disabled={isSubmitting}
-            aria-describedby={disclosureId}
-            onChange={(e) => setIncludeLogs(e.target.checked)}
+            onChange={(e) => setTitle(e.target.value)}
+            required
           />
-          <span>Include diagnostic logs</span>
-        </label>
-        <p id={disclosureId} className="bug-report-disclosure">
-          {DIAGNOSTICS_DISCLOSURE}
-        </p>
-      </div>
+          <div className="bug-report-counter" aria-hidden="true">
+            {title.length}/{TITLE_MAX}
+          </div>
+        </div>
 
-      {/* Submit */}
-      <div className="bug-report-actions">
-        <button type="submit" className="bug-report-submit" disabled={!canSubmit}>
-          {isSubmitting ? 'Submitting…' : 'Submit Bug Report'}
-        </button>
-      </div>
-    </form>
+        {/* Description */}
+        <div className="bug-report-field">
+          <label className="bug-report-label" htmlFor={descriptionId}>
+            Description <span className="bug-report-required">*</span>
+          </label>
+          <textarea
+            id={descriptionId}
+            className="bug-report-textarea"
+            value={description}
+            maxLength={DESCRIPTION_MAX}
+            placeholder={DESCRIPTION_PLACEHOLDER}
+            rows={8}
+            disabled={isSubmitting}
+            onChange={(e) => setDescription(e.target.value)}
+            required
+          />
+          <div className="bug-report-counter" aria-hidden="true">
+            {description.length}/{DESCRIPTION_MAX}
+          </div>
+        </div>
+
+        {/* Include diagnostic logs */}
+        <div className="bug-report-field bug-report-diagnostics">
+          <label className="bug-report-checkbox-label" htmlFor={includeLogsId}>
+            <input
+              id={includeLogsId}
+              type="checkbox"
+              checked={includeLogs}
+              disabled={isSubmitting}
+              aria-describedby={disclosureId}
+              onChange={(e) => setIncludeLogs(e.target.checked)}
+            />
+            <span>Include diagnostic logs</span>
+          </label>
+          <p id={disclosureId} className="bug-report-disclosure">
+            {DIAGNOSTICS_DISCLOSURE}
+          </p>
+          <button type="button" className="bug-report-preview-link" onClick={handleOpenPreview}>
+            What&apos;s in the logs?
+          </button>
+        </div>
+
+        {/* Submit */}
+        <div className="bug-report-actions">
+          <button type="submit" className="bug-report-submit" disabled={!canSubmit}>
+            {isSubmitting ? 'Submitting…' : 'Submit Bug Report'}
+          </button>
+        </div>
+      </form>
+
+      {/*
+       * The preview modal MUST be a SIBLING of <form>, not a descendant. The
+       * shared `ui/Modal` renders inline (no portal) and its close (X) button has
+       * no explicit `type`, so inside a <form> it defaults to `type="submit"` and
+       * clicking X would submit the bug report (Gitar HIGH, #2086 review). Kept
+       * outside the form, the X can only close the modal.
+       */}
+      <DiagnosticsPreviewModal
+        isOpen={previewOpen}
+        onClose={() => setPreviewOpen(false)}
+        diagnostics={previewData}
+        loading={previewLoading}
+        error={previewError}
+      />
+    </>
   );
 };
 
