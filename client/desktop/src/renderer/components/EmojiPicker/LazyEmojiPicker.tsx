@@ -22,7 +22,12 @@ export function preloadEmojiPicker(): void {
  * (behind showEmojiPicker state), so the chunk loads on first open.
  */
 const LazyEmojiPicker: React.FC<EmojiPickerProps> = (props) => (
-  <Suspense fallback={<div className="emoji-picker-loading" />}>
+  // ponytail: fallback MUST be null. The picker is a position:fixed popover, but
+  // the Suspense fallback renders in the composer's normal flow — a sized
+  // `.emoji-picker-loading` box (height:280px) there inflates the message area
+  // for the one frame React.lazy always commits the fallback (even with the
+  // chunk preloaded), causing the reported expand-then-snap jump (#2071).
+  <Suspense fallback={null}>
     <EmojiPickerLazy {...props} />
   </Suspense>
 );

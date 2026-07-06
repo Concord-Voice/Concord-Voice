@@ -23,7 +23,12 @@ interface LazyGifPickerProps {
 }
 
 const LazyGifPicker: React.FC<LazyGifPickerProps> = (props) => (
-  <Suspense fallback={<div className="gif-picker-loading" />}>
+  // ponytail: fallback MUST be null. The picker is a position:fixed popover, but
+  // the Suspense fallback renders in the composer's normal flow — a sized
+  // `.gif-picker-loading` box (height:160px) there inflates the message area for
+  // the one frame React.lazy always commits the fallback (even with the chunk
+  // preloaded), causing the reported expand-then-snap jump (#2071).
+  <Suspense fallback={null}>
     <GifPickerLazy {...props} />
   </Suspense>
 );
