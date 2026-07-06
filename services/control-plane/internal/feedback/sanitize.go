@@ -1,6 +1,6 @@
 // Package feedback implements the user-feedback bug-report / feature-request
 // pipeline (#158). Submissions arrive over POST /api/v1/feedback,
-// authenticated, rate-limited (3/hour/user via existing middleware), and are
+// authenticated, rate-limited (10/hour/user via existing middleware), and are
 // posted to a dedicated feedback repo on GitHub via the REST issues API.
 //
 // This file implements server-side PII re-sanitization. The client also
