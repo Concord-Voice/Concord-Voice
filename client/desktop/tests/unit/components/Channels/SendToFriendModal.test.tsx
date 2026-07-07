@@ -90,10 +90,9 @@ describe('SendToFriendModal', () => {
 
   it('renders an avatar image when the friend has an avatar URL', () => {
     setFriends([{ ...alice, avatarUrl: '/api/v1/media/avatars/alice.png' }]);
-    const { container } = render(
-      <SendToFriendModal serverId="s-1" serverName="Acme" open onClose={onClose} />
-    );
-    const img = container.querySelector('img.send-to-friend-modal__avatar');
+    render(<SendToFriendModal serverId="s-1" serverName="Acme" open onClose={onClose} />);
+    // Modal content portals to document.body (#2087), so query document-scoped.
+    const img = document.querySelector('img.send-to-friend-modal__avatar');
     expect(img).not.toBeNull();
     expect(img?.getAttribute('src')).toContain('/api/v1/media/avatars/alice.png');
   });

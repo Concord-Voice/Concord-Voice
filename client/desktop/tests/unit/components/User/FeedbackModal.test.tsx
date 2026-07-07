@@ -156,8 +156,9 @@ describe('FeedbackModal', () => {
     });
 
     it('exposes a polite live region for the submit status surface', () => {
-      const { container } = render(<FeedbackModal isOpen={true} onClose={vi.fn()} />);
-      expect(container.querySelector('[aria-live="polite"]')).toBeInTheDocument();
+      render(<FeedbackModal isOpen={true} onClose={vi.fn()} />);
+      // FeedbackModal content portals to document.body (#2087) — query document-scoped.
+      expect(document.querySelector('[aria-live="polite"]')).toBeInTheDocument();
     });
   });
 

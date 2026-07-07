@@ -222,9 +222,11 @@ describe('ImageCropEditor', () => {
       }
     } as unknown as typeof Image;
 
-    const { container } = render(<ImageCropEditor {...defaultProps} />);
+    render(<ImageCropEditor {...defaultProps} />);
     await screen.findByText('Cancel');
-    const canvas = container.querySelector('canvas');
+    // ImageCropEditor renders inside a Modal, which portals to document.body
+    // (#2087) — query document-scoped rather than the render container.
+    const canvas = document.querySelector('canvas');
     expect(canvas).toBeInTheDocument();
     // Canvas is a child of the interactive crop button — no aria-hidden needed
     expect(canvas?.closest('button')).toBeInTheDocument();
