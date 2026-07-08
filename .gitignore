@@ -261,3 +261,10 @@ snapshots/
 /reports/
 # Python bytecode from the .zap/ DAST helpers (#1465)
 .zap/__pycache__/
+.ds-sync/
+ds-bundle/
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules
+client/desktop/.ds-entry.tsx
+client/desktop/src/renderer/styles/.ds-index.css

@@ -1,10 +1,10 @@
 # Build stage
-# Patch-pinned to 1.26.4 (not the floating 1.26-alpine tag) so the SHIPPED
-# binary is compiled with the Go stdlib CVE fixes (GO-2026-5037/5038/5039),
-# deterministically — not reliant on Docker Hub tag-float + a GOTOOLCHAIN
-# build-time download. Keep in lockstep with services/control-plane/go.mod's
-# `go` directive.
-FROM golang:1.26.4-alpine AS builder
+# Patch-pinned to 1.26.5 (not the floating 1.26-alpine tag) so the SHIPPED
+# binary is compiled with the Go stdlib CVE fixes (GO-2026-5037/5038/5039
+# plus GO-2026-5856/GO-2026-4970), deterministically, not reliant on Docker
+# Hub tag-float + a GOTOOLCHAIN build-time download. Keep in lockstep with
+# services/control-plane/go.mod's `go` directive.
+FROM golang:1.26.5-alpine AS builder
 
 WORKDIR /app
 
