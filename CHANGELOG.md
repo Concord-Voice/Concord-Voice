@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.25] — 2026-07-09
+
+### Security
+
+- **Archive handling hardened against malicious files** ([#2142](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2142)) — updated the tar library used by our desktop build tooling and the voice server's installer so maliciously crafted archives (compression bombs and malformed headers) can no longer hang or crash those steps. Routine hygiene — no user action needed.
+
 ## [0.2.24] — 2026-07-05
 
 ### Fixed
