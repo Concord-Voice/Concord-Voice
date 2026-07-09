@@ -2107,6 +2107,20 @@ func (h *Hub) handleBroadcast(msg BroadcastMessage) {
 		return
 	}
 
+	// Resolve the channel's server + view permission in the run loop for
+	// authorized broadcasts (CV-CAN-021..026). deliveryAuthForChannel touches the
+	// subscription maps, so this MUST run here and not in the HTTP-handler-called
+	// BroadcastToChannelAuthorized. A gone channel / unresolvable view perm prunes
+	// subscriptions and drops the broadcast.
+	if msg.RequireViewAuth {
+		serverID, viewPerm, authOK := h.deliveryAuthForChannel(msg.ChannelID)
+		if !authOK {
+			return
+		}
+		msg.ServerID = serverID
+		msg.ViewPermission = viewPerm
+	}
+
 	messageData, err := json.Marshal(msg.Data)
 	if err != nil {
 		log.Printf("Failed to marshal broadcast message: %v", err)
@@ -2135,11 +2149,34 @@ func (h *Hub) handleBroadcast(msg BroadcastMessage) {
 	})
 }
 
-// BroadcastToChannel broadcasts a message to all subscribers of a channel
+// BroadcastToChannel broadcasts a message to all subscribers of a channel.
+//
+// It leaves ServerID and ViewPermission zero, which dispatchChannelDelivery
+// treats as allow-all (no per-recipient view recheck). Use it only for events
+// that are safe for every current subscriber, or for DM channels (where server
+// view permission does not apply). For REST-triggered server-channel mutation
+// events (edit / delete / embed-suppress / reaction / pin / unpin), use
+// BroadcastToChannelAuthorized so a stale subscriber that has lost channel view
+// access is filtered out.
 func (h *Hub) BroadcastToChannel(channelID uuid.UUID, message OutgoingMessage) {
 	h.broadcast <- BroadcastMessage{
 		ChannelID: channelID,
 		Data:      message,
+	}
+}
+
+// BroadcastToChannelAuthorized broadcasts a channel-scoped message with a
+// per-recipient view-permission recheck: the hub resolves the channel's server
+// and required view permission in the run loop and filters each recipient by it,
+// so a subscriber that lost channel view access since subscribing does not
+// receive the message (CV-CAN-021..026). Callers set only the RequireViewAuth
+// flag; ServerID/ViewPermission are resolved in handleBroadcast. This mirrors
+// the authorization the send-message and typing broadcasts already perform.
+func (h *Hub) BroadcastToChannelAuthorized(channelID uuid.UUID, message OutgoingMessage) {
+	h.broadcast <- BroadcastMessage{
+		ChannelID:       channelID,
+		Data:            message,
+		RequireViewAuth: true,
 	}
 }
 

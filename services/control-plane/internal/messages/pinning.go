@@ -91,8 +91,8 @@ func (h *Handler) PinMessage(c *gin.Context) {
 		return
 	}
 
-	// Broadcast to channel
-	broadcastPin(h.hub, channelID, messageID, pinnedAt, pinnedBy)
+	// Broadcast to channel (server channel: recheck per-recipient view access).
+	broadcastPin(h.hub, channelID, messageID, pinnedAt, pinnedBy, true)
 
 	c.JSON(http.StatusOK, gin.H{"message_id": messageID, "pinned_at": pinnedAt, "pinned_by": pinnedBy})
 }
@@ -134,8 +134,10 @@ func (h *Handler) pinDMMessage(c *gin.Context, messageID, userID, conversationID
 
 	// Best-effort DM broadcast: reuse the channel broadcast keyed by the
 	// conversation id (the WS hub treats DM conversations as "channels" on
-	// the wire for purposes of pin events).
-	broadcastPin(h.hub, conversationID, messageID, pinnedAt, pinnedBy)
+	// the wire for purposes of pin events). DM conversations have no server
+	// view permission, so use the plain allow-all path (authorized=false) to
+	// mirror unpinDMMessage; the authorized path would drop the event.
+	broadcastPin(h.hub, conversationID, messageID, pinnedAt, pinnedBy, false)
 
 	c.JSON(http.StatusOK, gin.H{"message_id": messageID, "pinned_at": pinnedAt, "pinned_by": pinnedBy, "conversation_id": conversationID})
 }
@@ -197,7 +199,7 @@ func (h *Handler) UnpinMessage(c *gin.Context) {
 	// Broadcast to channel
 	channelUUID, parseErr := uuid.Parse(channelID)
 	if parseErr == nil {
-		h.hub.BroadcastToChannel(channelUUID, websocket.OutgoingMessage{
+		h.hub.BroadcastToChannelAuthorized(channelUUID, websocket.OutgoingMessage{
 			Type: "message_unpinned",
 			Data: map[string]interface{}{
 				"message_id": messageID,
@@ -393,12 +395,16 @@ func (h *Handler) getDMConversationPins(c *gin.Context, conversationID, userID s
 }
 
 // broadcastPin sends a message_pinned event to all channel subscribers.
-func broadcastPin(hub *websocket.Hub, channelID, messageID string, pinnedAt time.Time, pinnedBy string) {
+// authorized=true applies the per-recipient view-permission recheck used for
+// server channels (CV-CAN-021..026). DM conversations must pass false: they
+// have no server view permission and deliveryAuthForChannel queries the
+// channels table, so the authorized path would drop the event entirely.
+func broadcastPin(hub *websocket.Hub, channelID, messageID string, pinnedAt time.Time, pinnedBy string, authorized bool) {
 	channelUUID, err := uuid.Parse(channelID)
 	if err != nil {
 		return
 	}
-	hub.BroadcastToChannel(channelUUID, websocket.OutgoingMessage{
+	msg := websocket.OutgoingMessage{
 		Type: "message_pinned",
 		Data: map[string]interface{}{
 			"message_id": messageID,
@@ -406,5 +412,10 @@ func broadcastPin(hub *websocket.Hub, channelID, messageID string, pinnedAt time
 			"pinned_at":  pinnedAt,
 			"pinned_by":  pinnedBy,
 		},
-	})
+	}
+	if authorized {
+		hub.BroadcastToChannelAuthorized(channelUUID, msg)
+	} else {
+		hub.BroadcastToChannel(channelUUID, msg)
+	}
 }

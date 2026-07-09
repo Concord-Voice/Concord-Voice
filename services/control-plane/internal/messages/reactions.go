@@ -487,7 +487,7 @@ func (h *Handler) broadcastReaction(channelID, messageID, emoji, userID, action 
 	}
 	eventType, eventData := reactionEvent(messageID, emoji, userID, action, summary)
 	eventData["channel_id"] = channelID
-	h.hub.BroadcastToChannel(channelUUID, websocket.OutgoingMessage{Type: eventType, Data: eventData})
+	h.hub.BroadcastToChannelAuthorized(channelUUID, websocket.OutgoingMessage{Type: eventType, Data: eventData})
 }
 
 func (h *Handler) broadcastDMReaction(conversationID, messageID, emoji, userID, action string, summary *models.ReactionSummary) {

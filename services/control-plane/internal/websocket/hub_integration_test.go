@@ -596,6 +596,89 @@ func TestHandleMessageBroadcastToOtherSubscribers(t *testing.T) {
 	}
 }
 
+// TestBroadcastToChannelAuthorized_FiltersStaleSubscriber covers CV-CAN-021..026:
+// a REST-triggered channel-mutation broadcast (edit / delete / embed-suppress /
+// reaction / pin / unpin) routed through BroadcastToChannelAuthorized must be
+// filtered by per-recipient view permission, so a stale subscriber that has lost
+// channel view access does not receive it — unlike the plain BroadcastToChannel
+// path, whose zero ServerID/ViewPermission is treated as allow-all.
+func TestBroadcastToChannelAuthorized_FiltersStaleSubscriber(t *testing.T) {
+	setup := setupMessageTest(t)
+	channelUUID, err := uuid.Parse(setup.convID)
+	require.NoError(t, err)
+
+	// A member who subscribed earlier but has since been denied channel view.
+	member := addHubMemberClient(t, setup, "hubbcastdeny")
+	member.Channels[channelUUID] = true
+	setup.hub.channelSubscriptions[channelUUID][member.ID] = true
+	denyDefaultRolePermission(t, setup, testPermViewTextChannels)
+
+	// A message_delete event, as DeleteMessage now emits it via the authorized fanout.
+	setup.hub.handleBroadcast(BroadcastMessage{
+		ChannelID: channelUUID,
+		Data: OutgoingMessage{
+			Type: "message_delete",
+			Data: map[string]interface{}{keyChannelID: setup.convID},
+		},
+		RequireViewAuth: true,
+	})
+
+	select {
+	case result := <-setup.hub.channelDeliveryResults:
+		allowedByClient := make(map[uuid.UUID]bool)
+		for _, d := range result.decisions {
+			allowedByClient[d.clientID] = d.allowed
+		}
+		assert.True(t, allowedByClient[setup.client.ID], "server owner must still receive the event")
+		assert.False(t, allowedByClient[member.ID], "view-denied stale subscriber must be filtered out")
+	case <-time.After(time.Second):
+		t.Fatal("expected an async channel delivery result")
+	}
+}
+
+// TestBroadcastToChannelAuthorized_DropsWhenChannelGone covers the authorized
+// broadcast's `!authOK` branch: when the channel no longer resolves (deleted),
+// deliveryAuthForChannel prunes its subscriptions and returns authOK=false, and
+// handleBroadcast drops the message before any delivery — no delivery result is
+// emitted.
+func TestBroadcastToChannelAuthorized_DropsWhenChannelGone(t *testing.T) {
+	setup := setupMessageTest(t)
+	goneChannel := uuid.New() // never inserted -> fetchChannelContextForAuth ErrNoRows
+
+	// Seed a stale subscriber for the gone channel. Without a subscription
+	// entry, handleBroadcast returns at its "no subscribers" guard before it
+	// ever evaluates RequireViewAuth, so the !authOK branch would go
+	// unexercised (the test would pass even if deliveryAuthForChannel stopped
+	// dropping/pruning deleted channels). With the subscriber present,
+	// resolution must reach deliveryAuthForChannel, hit ErrNoRows, prune the
+	// subscription, and drop the broadcast.
+	stale := addHubMemberClient(t, setup, "hubgonechan")
+	stale.Channels[goneChannel] = true
+	setup.hub.channelSubscriptions[goneChannel] = map[uuid.UUID]bool{stale.ID: true}
+
+	setup.hub.handleBroadcast(BroadcastMessage{
+		ChannelID: goneChannel,
+		Data: OutgoingMessage{
+			Type: "message_delete",
+			Data: map[string]interface{}{keyChannelID: goneChannel.String()},
+		},
+		RequireViewAuth: true,
+	})
+
+	select {
+	case <-setup.hub.channelDeliveryResults:
+		t.Fatal("a gone channel must drop the authorized broadcast (no delivery result)")
+	case <-time.After(300 * time.Millisecond):
+		// expected: authOK=false short-circuited handleBroadcast before delivery.
+	}
+
+	// deliveryAuthForChannel must have pruned the stale subscription on ErrNoRows.
+	assert.Empty(t, setup.hub.channelSubscriptions[goneChannel],
+		"gone-channel resolution must prune the stale channel subscription")
+	assert.False(t, stale.Channels[goneChannel],
+		"gone-channel resolution must clear the client's channel membership")
+}
+
 // --- handleSubscribe integration tests ---
 
 func TestHandleSubscribeSuccess(t *testing.T) {

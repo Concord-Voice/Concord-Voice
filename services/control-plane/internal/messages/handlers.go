@@ -659,7 +659,7 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 	// Broadcast update to channel subscribers via WebSocket
 	channelUUID, err := uuid.Parse(message.ChannelID)
 	if err == nil {
-		h.hub.BroadcastToChannel(channelUUID, websocket.OutgoingMessage{
+		h.hub.BroadcastToChannelAuthorized(channelUUID, websocket.OutgoingMessage{
 			Type: "message_update",
 			Data: map[string]interface{}{
 				"id":                messageID,
@@ -748,7 +748,7 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 	// Broadcast deletion to channel subscribers via WebSocket
 	channelUUID, err := uuid.Parse(channelID)
 	if err == nil {
-		h.hub.BroadcastToChannel(channelUUID, websocket.OutgoingMessage{
+		h.hub.BroadcastToChannelAuthorized(channelUUID, websocket.OutgoingMessage{
 			Type: "message_delete",
 			Data: map[string]interface{}{
 				"id":         messageID,
@@ -827,7 +827,7 @@ func (h *Handler) SuppressEmbeds(c *gin.Context) {
 	// Broadcast update to channel subscribers so clients hide the embeds
 	channelUUID, parseErr := uuid.Parse(channelID)
 	if parseErr == nil {
-		h.hub.BroadcastToChannel(channelUUID, websocket.OutgoingMessage{
+		h.hub.BroadcastToChannelAuthorized(channelUUID, websocket.OutgoingMessage{
 			Type: "message_update",
 			Data: map[string]interface{}{
 				"id":                messageID,

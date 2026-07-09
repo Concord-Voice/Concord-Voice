@@ -39,6 +39,15 @@ type BroadcastMessage struct {
 
 	// Optional: exclude this user from receiving the message
 	ExcludeUser *uuid.UUID
+
+	// RequireViewAuth requests that the hub resolve the channel's server + view
+	// permission in the run loop and filter each recipient by it. Set by
+	// BroadcastToChannelAuthorized for REST-triggered channel-mutation events so
+	// a stale/unauthorized subscriber does not receive them (CV-CAN-021..026).
+	// Resolution must run in the hub loop (deliveryAuthForChannel mutates
+	// subscription maps), so callers only set the flag — never ServerID /
+	// ViewPermission directly for this path.
+	RequireViewAuth bool
 }
 
 // UserBroadcastMessage represents a message to be sent to all clients of a specific user

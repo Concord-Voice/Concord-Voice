@@ -1914,6 +1914,26 @@ func TestBroadcastToChannelQueuesMessage(t *testing.T) {
 	}
 }
 
+// CV-CAN-021..026: BroadcastToChannelAuthorized queues the message with the
+// RequireViewAuth flag set, so handleBroadcast performs the per-recipient view
+// recheck in the run loop.
+func TestBroadcastToChannelAuthorizedQueuesMessage(t *testing.T) {
+	hub := newMinimalHub()
+	channelID := uuid.New()
+	msg := OutgoingMessage{Type: "message_delete", Data: map[string]interface{}{}}
+
+	hub.BroadcastToChannelAuthorized(channelID, msg)
+
+	select {
+	case bMsg := <-hub.broadcast:
+		assert.Equal(t, channelID, bMsg.ChannelID)
+		assert.Equal(t, "message_delete", bMsg.Data.Type)
+		assert.True(t, bMsg.RequireViewAuth, "authorized broadcast must set RequireViewAuth")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected message on broadcast channel")
+	}
+}
+
 func TestBroadcastToAllQueuesMessage(t *testing.T) {
 	hub := newMinimalHub()
 	msg := OutgoingMessage{Type: "global_test", Data: map[string]interface{}{}}

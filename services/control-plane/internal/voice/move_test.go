@@ -30,6 +30,20 @@ func hideVoiceChannel(t *testing.T, ts *testhelpers.TestServer, serverID, channe
 	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewVoiceChannels|rbac.PermJoinVoice))
 }
 
+// denyViewVoiceForAll denies ONLY VIEW_VOICE for the @all role, leaving JoinVoice
+// intact from base perms. This is the CV-CAN-006 dual-bit scenario: the target
+// inherits JoinVoice but cannot SEE the channel, so AuthorizeJoin (which now
+// requires both bits) would reject the moved client unless the move pregrant
+// notices the missing ViewVoice bit and issues a temp grant.
+func denyViewVoiceForAll(t *testing.T, ts *testhelpers.TestServer, serverID, channelID string) {
+	t.Helper()
+	var allRoleID string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID,
+	).Scan(&allRoleID))
+	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewVoiceChannels))
+}
+
 func moveTempOverrideExists(t *testing.T, ts *testhelpers.TestServer, channelID, userID string) bool {
 	t.Helper()
 	var exists bool
@@ -94,6 +108,73 @@ func TestServerMove_WithPermission_HiddenChannel_GrantsTemp(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.True(t, moveTempOverrideExists(t, ts, to, target.ID), "temp grant inserted when target lacked access")
 	assert.Equal(t, 0, auditMoveCount(t, ts, serverID, target.ID), "no audit for a downward move")
+}
+
+// TestServerMove_JoinInheritedViewDenied_GrantsTemp: the CV-CAN-006 dual-bit
+// regression. A MOVE_MEMBERS holder moves a member who inherits JoinVoice but is
+// denied ViewVoice on the destination. Because AuthorizeJoin now requires BOTH
+// bits, the pregrant check must also use the ViewVoice+JoinVoice predicate — so a
+// temp grant IS inserted even though JoinVoice alone is present. (Checking
+// JoinVoice alone would skip the grant and AuthorizeJoin would then reject the
+// moved client.)
+func TestServerMove_JoinInheritedViewDenied_GrantsTemp(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "mv_viewdenied_owner")
+	mover := ts.CreateTestUser(t, "mv_viewdenied_mover")
+	target := ts.CreateTestUser(t, "mv_viewdenied_target")
+	serverID := ts.CreateTestServer(t, owner.ID, "Move ViewDenied")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+
+	// Mover (pos 5) has MOVE_MEMBERS; target stays base member (inherits JoinVoice).
+	moverRole := ts.CreateTestRole(t, serverID, "Organizer", 5, int64(rbac.PermMoveMembers))
+	ts.AssignRoleToUser(t, serverID, mover.ID, moverRole)
+
+	from := ts.CreateVoiceChannel(t, serverID, "voice-viewdenied-from")
+	to := ts.CreateVoiceChannel(t, serverID, "voice-viewdenied-to")
+	denyViewVoiceForAll(t, ts, serverID, to) // target keeps JoinVoice, loses ViewVoice
+	joinVoice(t, ts, from, target.ID)
+
+	w := ts.DoRequest("POST", voiceEnforcePath(serverID, target.ID, pathMove),
+		map[string]interface{}{"target_channel_id": to}, testhelpers.AuthHeaders(mover.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, moveTempOverrideExists(t, ts, to, target.ID),
+		"temp grant must be inserted when target inherits JoinVoice but is denied ViewVoice")
+	assert.Equal(t, 0, auditMoveCount(t, ts, serverID, target.ID), "no audit for a downward move")
+}
+
+// TestServerMove_PermanentViewDeny_RejectsBeforeSignal: the grant-integrity edge
+// of the CV-CAN-006 dual-bit gate. The target has a PERMANENT (non-temporary)
+// user override denying ViewVoice while still inheriting JoinVoice from base
+// perms. The dual-bit predicate makes canJoin false, but
+// grantTemporaryChannelAccess must NOT mask a permanent override (§6.3), so it
+// no-ops. The move must therefore REJECT (409) instead of signaling a success the
+// media-plane AuthorizeJoin would refuse, and no temp grant is inserted.
+func TestServerMove_PermanentViewDeny_RejectsBeforeSignal(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "mv_permdeny_owner")
+	mover := ts.CreateTestUser(t, "mv_permdeny_mover")
+	target := ts.CreateTestUser(t, "mv_permdeny_target")
+	serverID := ts.CreateTestServer(t, owner.ID, "Move PermDeny")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+
+	moverRole := ts.CreateTestRole(t, serverID, "Organizer", 5, int64(rbac.PermMoveMembers))
+	ts.AssignRoleToUser(t, serverID, mover.ID, moverRole)
+
+	from := ts.CreateVoiceChannel(t, serverID, "voice-permdeny-from")
+	to := ts.CreateVoiceChannel(t, serverID, "voice-permdeny-to")
+	// PERMANENT (is_temporary defaults to FALSE) user override denying ONLY
+	// ViewVoice; JoinVoice stays inherited from base perms.
+	ts.CreateChannelOverride(t, to, "user", target.ID, 0, int64(rbac.PermViewVoiceChannels))
+	joinVoice(t, ts, from, target.ID)
+
+	w := ts.DoRequest("POST", voiceEnforcePath(serverID, target.ID, pathMove),
+		map[string]interface{}{"target_channel_id": to}, testhelpers.AuthHeaders(mover.AccessToken))
+	assert.Equal(t, http.StatusConflict, w.Code,
+		"a permanent ViewVoice deny must reject the move, not signal a false success")
+	assert.False(t, moveTempOverrideExists(t, ts, to, target.ID),
+		"grant must not insert a temp override on top of a permanent one")
 }
 
 // TestServerMove_HierarchyBypass_AuditsCrossing: a MOVE_MEMBERS holder moving a

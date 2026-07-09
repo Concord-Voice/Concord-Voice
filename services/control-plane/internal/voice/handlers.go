@@ -120,6 +120,21 @@ func (h *Handler) GetParticipants(c *gin.Context) {
 		return
 	}
 
+	// CV-CAN-008: listing voice participants requires ViewVoice — otherwise any
+	// server member could enumerate hidden voice room occupancy (usernames,
+	// mute/deafen/video/screen-share state) by channel UUID. Server membership
+	// alone is insufficient; the WS subscribe path already enforces ViewVoice.
+	canView, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermViewVoiceChannels)
+	if permErr != nil {
+		h.log.Error("Failed to check voice view permission", "error", permErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFetchParticipants})
+		return
+	}
+	if !canView {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
+		return
+	}
+
 	// Fetch voice participants with user details and server enforcement flags
 	rows, err := h.db.Query(`
 		SELECT vp.user_id, u.username, COALESCE(u.display_name, ''), COALESCE(u.avatar_url, ''),
@@ -199,14 +214,21 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 		return
 	}
 
-	// Check PermJoinVoice permission (with channelID for SBAC overrides)
-	hasPerm, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermJoinVoice)
+	// CV-CAN-006: voice access requires BOTH ViewVoice (see the channel) and
+	// JoinVoice. Previously only JoinVoice was checked, so a member granted
+	// JoinVoice but denied ViewVoice could join a hidden voice room by UUID.
+	// The WS subscribe gate and temp-grant mask already treat ViewVoice as part
+	// of voice visibility. Resolve effective permissions once (reused below for
+	// the media-plane bitfield) and gate on both bits — HasPermission and
+	// GetEffectivePermissions share the same computation, so this preserves the
+	// prior JoinVoice semantics (incl. the owner bypass).
+	effectivePerms, permErr := h.resolver.GetEffectivePermissions(c.Request.Context(), serverID, userID, channelID)
 	if permErr != nil {
-		h.log.Error("Failed to check voice permissions", "error", permErr)
+		h.log.Error("Failed to resolve effective voice permissions", "error", permErr, "user_id", sanitizeLogValue(userID), "channel_id", sanitizeLogValue(channelID), "server_id", sanitizeLogValue(serverID))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
 		return
 	}
-	if !hasPerm {
+	if !effectivePerms.Has(rbac.PermViewVoiceChannels) || !effectivePerms.Has(rbac.PermJoinVoice) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
 		return
 	}
@@ -219,20 +241,15 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 		return
 	}
 
-	// Get effective permissions for this channel (media plane uses this to enforce
-	// PermSpeak, PermScreenShare, PermMuteMembers, PermDeafenMembers, PermMoveMembers)
-	effectivePerms, permResolveErr := h.resolver.GetEffectivePermissions(c.Request.Context(), serverID, userID, channelID)
-	if permResolveErr != nil {
-		h.log.Error("Failed to resolve effective voice permissions", "error", permResolveErr, "user_id", userID, "channel_id", channelID, "server_id", serverID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return
-	}
+	// effectivePerms was resolved above (CV-CAN-006 dual-bit gate) and is reused
+	// here for the media-plane bitfield — the media plane enforces PermSpeak,
+	// PermScreenShare, PermMuteMembers, PermDeafenMembers, PermMoveMembers from it.
 
 	// Query server-enforced mute/deafen flags for this member
 	var serverMuted, serverDeafened bool
 	if err := h.db.QueryRow(`SELECT server_muted, server_deafened FROM server_members WHERE server_id = $1 AND user_id = $2`,
 		serverID, userID).Scan(&serverMuted, &serverDeafened); err != nil {
-		h.log.Error("Failed to query server enforcement flags", "error", err, "user_id", userID, "server_id", serverID)
+		h.log.Error("Failed to query server enforcement flags", "error", err, "user_id", sanitizeLogValue(userID), "server_id", sanitizeLogValue(serverID))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
 		return
 	}
@@ -260,7 +277,7 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 	// the media-plane derives the cap from the max present-participant tier.
 	roomOwnerTier := h.entCache.GetTier(c.Request.Context(), ownerID)
 
-	h.log.Info("Voice join authorized", "user_id", userID, "channel_id", channelID, "server_id", serverID, "media_tier", mediaEnt.Tier)
+	h.log.Info("Voice join authorized", "user_id", sanitizeLogValue(userID), "channel_id", sanitizeLogValue(channelID), "server_id", sanitizeLogValue(serverID), "media_tier", mediaEnt.Tier)
 
 	c.JSON(http.StatusOK, gin.H{
 		"allowed":            true,
@@ -787,6 +804,7 @@ const (
 	errMsgTargetNotVoiceInSrv  = "target is not a voice channel in this server"
 	errMsgAlreadyInTarget      = "user is already in the target channel"
 	errMsgMovePrep             = "Failed to prepare move"
+	errMsgMoveTargetBlocked    = "target cannot access the destination channel due to a permanent permission override"
 	auditActionVoiceMoved      = "voice_member_moved"
 )
 
@@ -924,25 +942,50 @@ func (h *Handler) resolveMoveSource(c *gin.Context, serverID, targetID, targetCh
 // prepareModeratedMove performs the moderated-move side effects before signaling:
 // audit a hierarchy-crossing move and grant temporary destination access if the
 // target cannot already join. It writes the error response and returns false on a
-// failed join-permission check or grant. Self-moves never reach here.
+// failed permission check, a failed grant, or when a permanent override prevents
+// the grant from conferring both required voice bits. Self-moves never reach here.
 func (h *Handler) prepareModeratedMove(c *gin.Context, serverID, actorID, targetID, fromChannelID, targetChannelID string) bool {
 	reqCtx := c.Request.Context()
 
 	// GRANT BEFORE SIGNAL (ordering load-bearing — the client's subsequent
-	// AuthorizeJoin checks PermJoinVoice). Only grant if the target cannot
-	// already join the destination (avoids polluting overrides for users who
-	// already have role-based access). grantTemporaryChannelAccess never
-	// downgrades a permanent grant.
-	canJoin, joinErr := h.resolver.HasPermission(reqCtx, serverID, targetID, targetChannelID, rbac.PermJoinVoice)
-	if joinErr != nil {
-		h.log.Error("move: target join-permission check", "error", joinErr, "target_id", targetID, "target_channel_id", targetChannelID)
+	// AuthorizeJoin requires BOTH PermViewVoiceChannels and PermJoinVoice per the
+	// CV-CAN-006 dual-bit gate). Only grant if the target cannot already join the
+	// destination with BOTH bits (avoids polluting overrides for users who already
+	// have role-based access). Checking JoinVoice alone would skip the grant for a
+	// target who inherits JoinVoice but is denied ViewVoice, then AuthorizeJoin
+	// would reject the moved client. grantTemporaryChannelAccess never downgrades a
+	// permanent grant, and the temp mask (tempGrantAllow) supplies both required
+	// bits (VIEW|CONNECT|SPEAK).
+	perms, permErr := h.resolver.GetEffectivePermissions(reqCtx, serverID, targetID, targetChannelID)
+	if permErr != nil {
+		h.log.Error("move: target join-permission check", "error", permErr, "target_id", sanitizeLogValue(targetID), "target_channel_id", sanitizeLogValue(targetChannelID))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
 		return false
 	}
+	canJoin := perms.Has(rbac.PermViewVoiceChannels) && perms.Has(rbac.PermJoinVoice)
 	if !canJoin {
 		if grantErr := h.tempGrant.grantTemporaryChannelAccess(reqCtx, serverID, targetChannelID, targetID); grantErr != nil {
-			h.log.Error("move: temp grant", "error", grantErr, "target_id", targetID, "target_channel_id", targetChannelID)
+			h.log.Error("move: temp grant", "error", grantErr, "target_id", sanitizeLogValue(targetID), "target_channel_id", sanitizeLogValue(targetChannelID))
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
+			return false
+		}
+
+		// grantTemporaryChannelAccess intentionally NO-OPs when a PERMANENT
+		// (non-temporary) user override already governs (channel, user): it must
+		// never mask or downgrade a permanent grant (grant integrity, §6.3). So a
+		// permanent DENY of ViewVoice (while JoinVoice is inherited from a role)
+		// survives the grant, leaving the target still short a required bit. Re-resolve
+		// and confirm BOTH bits are now present; if not, the move cannot complete —
+		// reject here rather than signal a false success that AuthorizeJoin would then
+		// refuse, which would 200 the moderator for a move that never lands.
+		postPerms, recheckErr := h.resolver.GetEffectivePermissions(reqCtx, serverID, targetID, targetChannelID)
+		if recheckErr != nil {
+			h.log.Error("move: post-grant permission recheck", "error", recheckErr, "target_id", sanitizeLogValue(targetID), "target_channel_id", sanitizeLogValue(targetChannelID))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMovePrep})
+			return false
+		}
+		if !postPerms.Has(rbac.PermViewVoiceChannels) || !postPerms.Has(rbac.PermJoinVoice) {
+			c.JSON(http.StatusConflict, gin.H{"error": errMsgMoveTargetBlocked})
 			return false
 		}
 	}

@@ -3,14 +3,40 @@ package voice_test
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/voice"
+	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
+	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// brokenResolverHandler builds a voice.Handler with a working DB (so
+// pre-permission queries succeed) but a resolver whose DB is closed (so the
+// effective-permission computation errors), plus a gin router that injects the
+// given userID as the authenticated principal. Used to cover the defensive
+// `permErr != nil` HTTP 500 branches the full-router tests cannot reach.
+func brokenResolverHandler(t *testing.T, ts *testhelpers.TestServer, userID string) *gin.Engine {
+	t.Helper()
+	h := voice.NewHandler(voice.HandlerDeps{
+		DB:       ts.DB,
+		Log:      logger.New("test"),
+		Hub:      ts.Hub,
+		Cfg:      &config.Config{},
+		Resolver: testhelpers.BrokenResolver(t, ts.Redis),
+	})
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("user_id", userID); c.Next() })
+	router.GET("/api/v1/channels/:id/voice/participants", h.GetParticipants)
+	router.POST("/api/v1/channels/:id/voice/join", h.AuthorizeJoin)
+	return router
+}
 
 const (
 	pathChannelsPrefix       = "/api/v1/channels/"
@@ -63,6 +89,26 @@ func TestGetParticipants(t *testing.T) {
 		w := ts.DoRequest("GET", "/api/v1/channels/not-a-uuid/voice/participants", nil, testhelpers.AuthHeaders(user.AccessToken))
 		assert.Equal(t, http.StatusBadRequest, w.Code)
 	})
+
+	t.Run("NoViewVoicePermission", func(t *testing.T) {
+		// CV-CAN-008: a server member denied ViewVoice must not enumerate hidden
+		// voice room occupancy by channel UUID — server membership is insufficient.
+		ts := setupTS(t)
+		owner := ts.CreateTestUser(t, "vpowner3")
+		member := ts.CreateTestUser(t, "vpnoview")
+		serverID := ts.CreateTestServer(t, owner.ID, "Voice NoView Server")
+		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-hidden-list")
+
+		var allRoleID string
+		err := ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID)
+		require.NoError(t, err)
+		// Deny ViewVoice for the @all role; JoinVoice stays granted from base perms.
+		ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewVoiceChannels))
+
+		w := ts.DoRequest("GET", pathChannelsPrefix+channelID+pathVoiceParticipants, nil, testhelpers.AuthHeaders(member.AccessToken))
+		assert.Equal(t, http.StatusForbidden, w.Code)
+	})
 }
 
 // --- AuthorizeJoin Tests ---
@@ -112,6 +158,27 @@ func TestAuthorizeJoin(t *testing.T) {
 		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
 		assert.Equal(t, http.StatusForbidden, w.Code)
 	})
+
+	t.Run("NoViewVoicePermission", func(t *testing.T) {
+		// CV-CAN-006: JoinVoice granted but ViewVoice denied must NOT admit the
+		// member to a hidden voice room by UUID — the media plane treats a 200
+		// here as authoritative access success.
+		ts := setupTS(t)
+		owner := ts.CreateTestUser(t, "vjowner4")
+		member := ts.CreateTestUser(t, "vjnoview")
+		serverID := ts.CreateTestServer(t, owner.ID, "VoiceJoin NoView")
+		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-hidden")
+
+		var allRoleID string
+		err := ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID)
+		require.NoError(t, err)
+		// Deny only ViewVoice; JoinVoice remains granted from base perms.
+		ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewVoiceChannels))
+
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+		assert.Equal(t, http.StatusForbidden, w.Code)
+	})
 }
 
 func TestAuthorizeJoinTimedOutMemberForbidden(t *testing.T) {
@@ -132,6 +199,42 @@ func TestAuthorizeJoinTimedOutMemberForbidden(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	assert.Equal(t, "member_timed_out", body["code"])
 	assert.NotEmpty(t, body["timed_out_until"])
+}
+
+// CV-CAN-008: GetParticipants returns 500 (not 403) when the ViewVoice
+// permission check itself errors — the defensive `permErr != nil` branch.
+func TestGetParticipants_ResolverError_500(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "vp_rerr_owner")
+	member := ts.CreateTestUser(t, "vp_rerr_member")
+	serverID := ts.CreateTestServer(t, owner.ID, "Voice ResolverErr List")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-rerr-list")
+
+	router := brokenResolverHandler(t, ts, member.ID)
+	req := httptest.NewRequest(http.MethodGet, pathChannelsPrefix+channelID+pathVoiceParticipants, nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
+}
+
+// CV-CAN-006: AuthorizeJoin returns 500 when the effective-permission
+// resolution errors — the defensive `permErr != nil` branch.
+func TestAuthorizeJoin_ResolverError_500(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "vj_rerr_owner")
+	member := ts.CreateTestUser(t, "vj_rerr_member")
+	serverID := ts.CreateTestServer(t, owner.ID, "VoiceJoin ResolverErr")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-rerr-join")
+
+	router := brokenResolverHandler(t, ts, member.ID)
+	req := httptest.NewRequest(http.MethodPost, pathChannelsPrefix+channelID+pathVoiceJoin, nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
 }
 
 // --- AuthorizeVoiceAction Tests (table-driven to reduce duplication) ---
