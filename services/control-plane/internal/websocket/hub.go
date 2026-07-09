@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/presence"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -120,6 +123,18 @@ type Hub struct {
 	// sends and subscription pruning so hub maps remain single-owner.
 	channelDeliveryResults chan channelDeliveryResult
 
+	// Results from off-loop voice-count queries issued on subscribe_server. The
+	// query runs on a worker goroutine so a burst of subscriptions cannot stall
+	// the Run loop on per-subscribe DB round-trips; the Run goroutine applies the
+	// scoped send. See dispatchSubscribedVoiceCounts / CV-CAN-030.
+	voiceCountCatchupResults chan voiceCountCatchup
+
+	// Coalesces the on-subscribe voice-count catch-up query. The aggregation is
+	// global (identical for every subscriber), so a reconnect storm's concurrent
+	// dispatches share a single in-flight query instead of each running its own
+	// full-table scan. See dispatchSubscribedVoiceCounts / CV-CAN-030.
+	voiceCountSF singleflight.Group
+
 	// Shutdown signal
 	done chan struct{}
 
@@ -158,6 +173,15 @@ type DMRingCanceller func(userID uuid.UUID)
 type channelRevalidation struct {
 	serverID  uuid.UUID
 	channelID uuid.UUID
+}
+
+// voiceCountCatchup carries an off-loop voice-count query result back to the Run
+// goroutine for the on-subscribe catch-up (CV-CAN-030). clientID identifies the
+// subscriber to deliver to; the Run loop re-derives that client's subscribed set
+// (which it owns) and performs the send, so the DB query stays off the loop.
+type voiceCountCatchup struct {
+	clientID uuid.UUID
+	counts   map[string]int
 }
 
 type channelDeliveryKind uint8
@@ -201,32 +225,33 @@ type channelDeliveryResult struct {
 // NewHub creates a new Hub
 func NewHub(db *sql.DB, redisClient *redis.Client) *Hub {
 	return &Hub{
-		db:                     db,
-		redis:                  redisClient,
-		clients:                make(map[uuid.UUID]*Client),
-		userClients:            make(map[uuid.UUID]map[uuid.UUID]bool),
-		channelSubscriptions:   make(map[uuid.UUID]map[uuid.UUID]bool),
-		usernames:              make(map[uuid.UUID]string),
-		serverSubscriptions:    make(map[uuid.UUID]map[uuid.UUID]bool),
-		dmSubscriptions:        make(map[uuid.UUID]map[uuid.UUID]bool),
-		register:               make(chan *Client),
-		unregister:             make(chan *Client),
-		incoming:               make(chan IncomingMessage, 256),
-		broadcast:              make(chan BroadcastMessage, 256),
-		globalBroadcast:        make(chan OutgoingMessage, 256),
-		userBroadcast:          make(chan UserBroadcastMessage, 256),
-		serverBroadcast:        make(chan ServerBroadcastMessage, 256),
-		evictBroadcast:         make(chan ServerBroadcastMessage, 16),
-		dmBroadcast:            make(chan DMBroadcastMessage, 256),
-		disconnectUser:         make(chan uuid.UUID, 16),
-		disconnectSession:      make(chan string, 16),
-		voiceCountSignal:       make(chan struct{}, 1),
-		revalidateChannel:      make(chan channelRevalidation, 256),
-		revalidateServer:       make(chan uuid.UUID, 16),
-		channelDeliveryResults: make(chan channelDeliveryResult, 256),
-		done:                   make(chan struct{}),
-		stopped:                make(chan struct{}),
-		onlineCountPending:     make(map[uuid.UUID]bool),
+		db:                       db,
+		redis:                    redisClient,
+		clients:                  make(map[uuid.UUID]*Client),
+		userClients:              make(map[uuid.UUID]map[uuid.UUID]bool),
+		channelSubscriptions:     make(map[uuid.UUID]map[uuid.UUID]bool),
+		usernames:                make(map[uuid.UUID]string),
+		serverSubscriptions:      make(map[uuid.UUID]map[uuid.UUID]bool),
+		dmSubscriptions:          make(map[uuid.UUID]map[uuid.UUID]bool),
+		register:                 make(chan *Client),
+		unregister:               make(chan *Client),
+		incoming:                 make(chan IncomingMessage, 256),
+		broadcast:                make(chan BroadcastMessage, 256),
+		globalBroadcast:          make(chan OutgoingMessage, 256),
+		userBroadcast:            make(chan UserBroadcastMessage, 256),
+		serverBroadcast:          make(chan ServerBroadcastMessage, 256),
+		evictBroadcast:           make(chan ServerBroadcastMessage, 16),
+		dmBroadcast:              make(chan DMBroadcastMessage, 256),
+		disconnectUser:           make(chan uuid.UUID, 16),
+		disconnectSession:        make(chan string, 16),
+		voiceCountSignal:         make(chan struct{}, 1),
+		revalidateChannel:        make(chan channelRevalidation, 256),
+		revalidateServer:         make(chan uuid.UUID, 16),
+		channelDeliveryResults:   make(chan channelDeliveryResult, 256),
+		voiceCountCatchupResults: make(chan voiceCountCatchup, 256),
+		done:                     make(chan struct{}),
+		stopped:                  make(chan struct{}),
+		onlineCountPending:       make(map[uuid.UUID]bool),
 	}
 }
 
@@ -344,6 +369,9 @@ func (h *Hub) Run() {
 
 		case result := <-h.channelDeliveryResults:
 			h.handleChannelDeliveryResult(result)
+
+		case c := <-h.voiceCountCatchupResults:
+			h.applyVoiceCountCatchup(c)
 
 		case <-h.done:
 			// Graceful shutdown: cancel async work, wait for completion, close connections
@@ -551,12 +579,19 @@ func (h *Hub) sendPresenceSnapshot(client *Client) {
 }
 
 func (h *Hub) sendVoiceCountsSnapshot(ctx context.Context, client *Client) {
+	// CV-CAN-030: scope the initial voice-count snapshot to the servers this
+	// client's user is a member of — a client must not learn voice activity for
+	// servers it does not belong to. This runs off the Run goroutine (registration
+	// goroutine), so it filters via SQL membership rather than the in-memory
+	// serverSubscriptions map (which the client has not populated yet at register
+	// and which is owned by the Run goroutine).
 	rows, err := h.db.QueryContext(ctx, `
 		SELECT c.server_id, COUNT(vp.id)
 		FROM voice_participants vp
 		JOIN channels c ON c.id = vp.channel_id
+		JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = $1
 		GROUP BY c.server_id
-	`)
+	`, client.UserID)
 	if err != nil {
 		if ctx.Err() != nil {
 			return
@@ -1152,12 +1187,108 @@ func (h *Hub) handleSubscribeServer(msg IncomingMessage) {
 	}
 
 	// Add to server subscriptions
-	if _, ok := h.serverSubscriptions[serverUUID]; !ok {
-		h.serverSubscriptions[serverUUID] = make(map[uuid.UUID]bool)
+	subs, ok := h.serverSubscriptions[serverUUID]
+	if !ok {
+		subs = make(map[uuid.UUID]bool)
+		h.serverSubscriptions[serverUUID] = subs
 	}
-	h.serverSubscriptions[serverUUID][client.ID] = true
+	alreadySubscribed := subs[client.ID]
+	subs[client.ID] = true
 
 	log.Printf("Client %s subscribed to server %s notifications", client.ID, serverUUID)
+
+	// CV-CAN-030: deliver a fresh voice-count snapshot immediately on subscribe.
+	// The scoped broadcast only reaches already-subscribed clients, so any voice
+	// join/leave that landed between this client's initial snapshot and this
+	// subscription would otherwise be missed, leaving a stale count until the
+	// next voice event. This catch-up closes that window. The DB query runs off
+	// the Run loop so a burst of subscriptions cannot stall the hub.
+	//
+	// Only dispatch when the client was newly added: a duplicate subscribe_server
+	// for a server the client already tracks opens no new staleness window, and
+	// firing the catch-up anyway would let an authenticated client spam duplicate
+	// frames to force repeated full voice_participants aggregations (singleflight
+	// only collapses concurrent in-flight queries, not sequential ones).
+	if !alreadySubscribed {
+		h.dispatchSubscribedVoiceCounts(client.ID)
+	}
+}
+
+// voiceCountSFKey is the singleflight key for the on-subscribe catch-up query.
+// The aggregation is global, so a single constant key collapses all concurrent
+// dispatches onto one in-flight query.
+const voiceCountSFKey = "voice-counts"
+
+// dispatchSubscribedVoiceCounts queries current voice counts off the Run
+// goroutine and hands the result back via voiceCountCatchupResults, so a burst
+// of subscribe_server messages (e.g. a reconnect storm) cannot stall the single
+// Run loop on per-subscribe DB round-trips. Mirrors dispatchChannelDelivery. The
+// query touches no hub maps (h.db is safe for concurrent use); the scoping to the
+// client's subscribed set and the actual send happen on the Run loop in
+// applyVoiceCountCatchup, which owns serverSubscriptions and the send lifecycle.
+//
+// The catch-up aggregation is global and identical for every subscriber, so the
+// query is run through singleflight: concurrent dispatches during a reconnect
+// storm share one in-flight query instead of each issuing its own full-table
+// scan, bounding DB load rather than amplifying it. The shared result is a
+// per-server count map that callers only read, so sharing it across callers is
+// safe (each caller filters to its own subscribed set on the Run loop).
+func (h *Hub) dispatchSubscribedVoiceCounts(clientID uuid.UUID) {
+	results := h.voiceCountCatchupResults
+	if results == nil {
+		return
+	}
+	done := h.done
+	go func() {
+		v, err, _ := h.voiceCountSF.Do(voiceCountSFKey, func() (interface{}, error) {
+			return h.queryServerVoiceCounts()
+		})
+		if err != nil {
+			log.Printf("Failed to query voice counts on subscribe: %v", err)
+			return
+		}
+		counts, _ := v.(map[string]int)
+		select {
+		case results <- voiceCountCatchup{clientID: clientID, counts: counts}:
+		case <-done:
+		}
+	}()
+}
+
+// applyVoiceCountCatchup delivers the freshly queried voice-count snapshot to the
+// subscribing client, scoped to the servers it is currently subscribed to. The
+// frontend replaces (does not merge) its voice-count map on each
+// server_voice_counts message, so the payload carries the client's complete
+// subscribed set, mirroring broadcastServerVoiceCounts. Runs on the Run goroutine,
+// which owns serverSubscriptions and the client's Send channel (CV-CAN-030).
+func (h *Hub) applyVoiceCountCatchup(c voiceCountCatchup) {
+	client, ok := h.clients[c.clientID]
+	if !ok {
+		return // client disconnected before the query returned
+	}
+
+	// Report every subscribed server, defaulting to 0 when it has no voice
+	// participants (matches the broadcast contract so a drop-to-zero is explicit).
+	counts := make(map[string]int)
+	for serverID, subs := range h.serverSubscriptions {
+		if subs[c.clientID] {
+			counts[serverID.String()] = c.counts[serverID.String()]
+		}
+	}
+	if len(counts) == 0 {
+		return
+	}
+
+	msg := OutgoingMessage{
+		Type: "server_voice_counts",
+		Data: map[string]interface{}{keyCounts: counts},
+	}
+	if data, err := json.Marshal(msg); err == nil {
+		select {
+		case client.Send <- data:
+		default:
+		}
+	}
 }
 
 // handleUnsubscribeServer unsubscribes a client from server-level notifications
@@ -3369,9 +3500,10 @@ func (h *Hub) computeServerCounts(serverMembers map[string][]uuid.UUID, visibleO
 	return counts
 }
 
-// broadcastServerVoiceCounts queries voice_participants to compute per-server
-// voice user counts and broadcasts them to all connected clients.
-func (h *Hub) broadcastServerVoiceCounts() {
+// queryServerVoiceCounts returns the current voice participant count per server,
+// keyed by server ID string. Shared by the periodic broadcast and the on-subscribe
+// catch-up so both compute counts identically.
+func (h *Hub) queryServerVoiceCounts() (map[string]int, error) {
 	rows, err := h.db.Query(`
 		SELECT c.server_id, COUNT(vp.id)
 		FROM voice_participants vp
@@ -3379,8 +3511,7 @@ func (h *Hub) broadcastServerVoiceCounts() {
 		GROUP BY c.server_id
 	`)
 	if err != nil {
-		log.Printf("Failed to query server voice counts: %v", err)
-		return
+		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -3392,13 +3523,87 @@ func (h *Hub) broadcastServerVoiceCounts() {
 			counts[serverID] = count
 		}
 	}
+	return counts, nil
+}
 
-	h.handleGlobalBroadcast(OutgoingMessage{
-		Type: "server_voice_counts",
-		Data: map[string]interface{}{
-			keyCounts: counts,
-		},
-	})
+// broadcastServerVoiceCounts queries voice_participants to compute per-server
+// voice user counts and broadcasts them to all connected clients.
+func (h *Hub) broadcastServerVoiceCounts() {
+	counts, err := h.queryServerVoiceCounts()
+	if err != nil {
+		log.Printf("Failed to query server voice counts: %v", err)
+		return
+	}
+
+	// CV-CAN-030: send each client only the counts for servers it is subscribed
+	// to (a subset of its memberships), instead of the full cross-server map to
+	// every client. Runs on the Run goroutine, which owns serverSubscriptions.
+	// Each subscribed server is reported with its current count (0 when it has no
+	// voice participants) so a drop-to-zero still reaches the client.
+	perClient := make(map[uuid.UUID]map[string]int)
+	for serverUUID, subs := range h.serverSubscriptions {
+		count := counts[serverUUID.String()]
+		for clientID := range subs {
+			m := perClient[clientID]
+			if m == nil {
+				m = make(map[string]int)
+				perClient[clientID] = m
+			}
+			m[serverUUID.String()] = count
+		}
+	}
+	// Scoping forces a distinct payload per subscribed-server set rather than one
+	// shared marshal for everyone, but many clients share the same set (e.g. every
+	// client viewing the same server), yielding byte-identical payloads. Marshal
+	// once per distinct set and reuse the bytes, so this hot path on the single Run
+	// goroutine does not re-marshal the same map for every client under voice
+	// churn. Sharing an immutable []byte across Send channels is the same pattern
+	// handleGlobalBroadcast/handleServerBroadcast already use.
+	payloadCache := make(map[string][]byte, len(perClient))
+	for clientID, filtered := range perClient {
+		client, ok := h.clients[clientID]
+		if !ok {
+			continue
+		}
+		key := voiceCountPayloadKey(filtered)
+		data, cached := payloadCache[key]
+		if !cached {
+			var err error
+			data, err = json.Marshal(OutgoingMessage{
+				Type: "server_voice_counts",
+				Data: map[string]interface{}{keyCounts: filtered},
+			})
+			if err != nil {
+				continue
+			}
+			payloadCache[key] = data
+		}
+		select {
+		case client.Send <- data:
+		default:
+		}
+	}
+}
+
+// voiceCountPayloadKey builds a canonical, collision-free signature of a per-client
+// voice-count map so broadcastServerVoiceCounts can memoize identical marshaled
+// payloads within a single broadcast. Server IDs are UUIDs (no '=' or ';'), so the
+// sorted "id=count;" encoding is injective. json.Marshal sorts map keys too, so any
+// two maps with this signature marshal to identical bytes.
+func voiceCountPayloadKey(counts map[string]int) string {
+	ids := make([]string, 0, len(counts))
+	for id := range counts {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	buf := make([]byte, 0, len(ids)*40)
+	for _, id := range ids {
+		buf = append(buf, id...)
+		buf = append(buf, '=')
+		buf = strconv.AppendInt(buf, int64(counts[id]), 10)
+		buf = append(buf, ';')
+	}
+	return string(buf)
 }
 
 // BroadcastServerVoiceCounts triggers a recompute and broadcast of per-server

@@ -1944,11 +1944,22 @@ func TestBroadcastServerVoiceCountsEmptyResult(t *testing.T) {
 	client := newTestClient(hub, userID)
 	hub.clients[client.ID] = client
 
+	// CV-CAN-030: broadcasts are scoped to a client's server subscriptions.
+	// Subscribe the client to a server that has no voice participants; the empty
+	// voice state must still reach the subscribed client as a 0 count (a
+	// drop-to-zero is delivered). Unsubscribed clients receive nothing — that is
+	// the scoping this fix introduces.
+	serverID := uuid.New()
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{client.ID: true}
+
 	hub.broadcastServerVoiceCounts()
 
-	// Should receive server_voice_counts with empty counts
 	resp := readClientMsg(t, client)
 	assert.Equal(t, "server_voice_counts", resp["type"])
+	data, _ := resp["data"].(map[string]interface{})
+	counts, _ := data["counts"].(map[string]interface{})
+	assert.Equal(t, float64(0), counts[serverID.String()],
+		"empty voice state reports 0 for the subscribed server")
 }
 
 // --- sendVoiceCountsSnapshot integration tests ---
@@ -1966,6 +1977,290 @@ func TestSendVoiceCountsSnapshotSuccess(t *testing.T) {
 	// Should receive server_voice_counts message
 	resp := readClientMsg(t, client)
 	assert.Equal(t, "server_voice_counts", resp["type"])
+}
+
+// seedVoiceServer creates a server (owned by owner) with a voice channel that has
+// one voice participant, and returns the server ID.
+func seedVoiceServer(t *testing.T, db *sql.DB, owner uuid.UUID, name string) uuid.UUID {
+	t.Helper()
+	serverID := uuid.New()
+	_, err := db.Exec(`INSERT INTO servers (id, name, owner_id, allow_embedded_content) VALUES ($1, $2, $3, true)`,
+		serverID.String(), name, owner.String())
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner')`, serverID.String(), owner.String())
+	require.NoError(t, err)
+	channelID := uuid.New()
+	_, err = db.Exec(`INSERT INTO channels (id, server_id, name, type) VALUES ($1, $2, 'voice', 'voice')`, channelID.String(), serverID.String())
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO voice_participants (channel_id, user_id) VALUES ($1, $2)`, channelID.String(), owner.String())
+	require.NoError(t, err)
+	return serverID
+}
+
+func seedVoiceTestUser(t *testing.T, db *sql.DB, name string) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	hash := "$argon2id$v=19$m=65536,t=3,p=4$3pE9STD1TqLPoZQ2/BTLCg$8SKTCjsZh8Q7pAulEqAIEzJQK9eeOb5ipWhPz4REdCY" //nolint:gosec
+	// Email is derived from the parameterized $2 in SQL (|| ), so no Go-side
+	// string is composed into the query — fully parameterized.
+	_, err := db.Exec(`INSERT INTO users (id, email, username, password_hash, age_verified, email_verified)
+		VALUES ($1, $2 || '@test.concord.chat', $2, $3, true, true)`,
+		id.String(), name, hash)
+	require.NoError(t, err)
+	return id
+}
+
+// TestSendVoiceCountsSnapshot_ExcludesNonMemberServers covers CV-CAN-030: the
+// initial snapshot must not report voice activity for servers the user does not
+// belong to.
+func TestSendVoiceCountsSnapshot_ExcludesNonMemberServers(t *testing.T) {
+	db := setupHubTestDB(t)
+	hub := NewHub(db, nil)
+
+	owner := seedVoiceTestUser(t, db, "vcsnapowner")
+	member := seedVoiceTestUser(t, db, "vcsnapmember")
+	serverA := seedVoiceServer(t, db, owner, "Snap A")
+	serverB := seedVoiceServer(t, db, owner, "Snap B")
+	// member belongs only to serverA.
+	_, err := db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')`, serverA.String(), member.String())
+	require.NoError(t, err)
+
+	client := newTestClient(hub, member)
+	hub.clients[client.ID] = client
+	hub.sendVoiceCountsSnapshot(context.Background(), client)
+
+	resp := readClientMsg(t, client)
+	require.Equal(t, "server_voice_counts", resp["type"])
+	counts := resp["data"].(map[string]interface{})[keyCounts].(map[string]interface{})
+	assert.Contains(t, counts, serverA.String(), "member's server must be present")
+	assert.NotContains(t, counts, serverB.String(), "non-member server must be absent")
+}
+
+// TestBroadcastServerVoiceCounts_ScopedToSubscribedServers covers CV-CAN-030: the
+// periodic broadcast must send each client only the counts for servers it is
+// subscribed to, not the full cross-server map.
+func TestBroadcastServerVoiceCounts_ScopedToSubscribedServers(t *testing.T) {
+	db := setupHubTestDB(t)
+	hub := NewHub(db, nil)
+
+	owner := seedVoiceTestUser(t, db, "vcbcowner")
+	serverA := seedVoiceServer(t, db, owner, "BC A")
+	serverB := seedVoiceServer(t, db, owner, "BC B")
+
+	clientA := newTestClient(hub, seedVoiceTestUser(t, db, "vcbca"))
+	clientB := newTestClient(hub, seedVoiceTestUser(t, db, "vcbcb"))
+	hub.clients[clientA.ID] = clientA
+	hub.clients[clientB.ID] = clientB
+	hub.serverSubscriptions[serverA] = map[uuid.UUID]bool{clientA.ID: true}
+	hub.serverSubscriptions[serverB] = map[uuid.UUID]bool{clientB.ID: true}
+
+	hub.broadcastServerVoiceCounts()
+
+	respA := readClientMsg(t, clientA)
+	countsA := respA["data"].(map[string]interface{})[keyCounts].(map[string]interface{})
+	assert.Contains(t, countsA, serverA.String())
+	assert.NotContains(t, countsA, serverB.String(), "clientA must not see serverB's voice count")
+
+	respB := readClientMsg(t, clientB)
+	countsB := respB["data"].(map[string]interface{})[keyCounts].(map[string]interface{})
+	assert.Contains(t, countsB, serverB.String())
+	assert.NotContains(t, countsB, serverA.String(), "clientB must not see serverA's voice count")
+}
+
+// TestBroadcastServerVoiceCounts_SharedAndDistinctPayloads guards the per-broadcast
+// payload memoization: two clients with an identical subscribed-server set must
+// each receive the same full, correct counts (they share one marshaled payload via
+// the cache), while a client with a different set must receive its own distinct
+// counts (no cross-client payload bleed from the cache).
+func TestBroadcastServerVoiceCounts_SharedAndDistinctPayloads(t *testing.T) {
+	db := setupHubTestDB(t)
+	hub := NewHub(db, nil)
+
+	owner := seedVoiceTestUser(t, db, "vcshareowner")
+	serverA := seedVoiceServer(t, db, owner, "Share A") // count = 1
+	serverB := seedVoiceServer(t, db, owner, "Share B") // count = 1
+
+	// share1 and share2 subscribe to the same set {A, B}; solo subscribes to {A}.
+	share1 := newTestClient(hub, seedVoiceTestUser(t, db, "vcshare1"))
+	share2 := newTestClient(hub, seedVoiceTestUser(t, db, "vcshare2"))
+	solo := newTestClient(hub, seedVoiceTestUser(t, db, "vcsolo"))
+	hub.clients[share1.ID] = share1
+	hub.clients[share2.ID] = share2
+	hub.clients[solo.ID] = solo
+	hub.serverSubscriptions[serverA] = map[uuid.UUID]bool{share1.ID: true, share2.ID: true, solo.ID: true}
+	hub.serverSubscriptions[serverB] = map[uuid.UUID]bool{share1.ID: true, share2.ID: true}
+
+	hub.broadcastServerVoiceCounts()
+
+	// Both shared-set clients get identical full counts for {A, B}.
+	for _, c := range []*Client{share1, share2} {
+		resp := readClientMsg(t, c)
+		counts := resp["data"].(map[string]interface{})[keyCounts].(map[string]interface{})
+		assert.Equal(t, float64(1), counts[serverA.String()])
+		assert.Equal(t, float64(1), counts[serverB.String()])
+		assert.Len(t, counts, 2, "shared-set client must see exactly its two subscribed servers")
+	}
+
+	// The distinct-set client must not receive the shared payload from the cache.
+	resp := readClientMsg(t, solo)
+	counts := resp["data"].(map[string]interface{})[keyCounts].(map[string]interface{})
+	assert.Equal(t, float64(1), counts[serverA.String()])
+	assert.NotContains(t, counts, serverB.String(), "solo client must not see serverB from a cached shared payload")
+	assert.Len(t, counts, 1, "distinct-set client must see only its one subscribed server")
+}
+
+// TestHandleSubscribeServer_SendsSubscribedVoiceCounts covers CV-CAN-030:
+// subscribing to a server must immediately deliver a voice-count snapshot so a
+// client that subscribes after its initial snapshot cannot be left with a stale
+// count for an event missed in the window before the subscription was recorded.
+// The frontend replaces its voice-count map, so the catch-up must carry the
+// client's full subscribed set, not just the newly added server. The count query
+// runs off the Run loop and is handed back via voiceCountCatchupResults; this test
+// applies that result the way Run() would.
+func TestHandleSubscribeServer_SendsSubscribedVoiceCounts(t *testing.T) {
+	db := setupHubTestDB(t)
+	hub := NewHub(db, nil)
+
+	owner := seedVoiceTestUser(t, db, "vcsubowner")
+	serverA := seedVoiceServer(t, db, owner, "Sub A") // owner is a member + 1 voice participant
+	serverB := seedVoiceServer(t, db, owner, "Sub B") // owner is a member + 1 voice participant
+
+	client := newTestClient(hub, owner)
+	hub.clients[client.ID] = client
+	// Already subscribed to serverB before subscribing to serverA.
+	hub.serverSubscriptions[serverB] = map[uuid.UUID]bool{client.ID: true}
+
+	hub.handleSubscribeServer(IncomingMessage{
+		Type:     "subscribe_server",
+		UserID:   owner,
+		ClientID: client.ID,
+		Data:     map[string]interface{}{keyServerID: serverA.String()},
+	})
+
+	require.True(t, hub.serverSubscriptions[serverA][client.ID], "client must be subscribed to serverA")
+
+	// The catch-up query is dispatched off the Run loop; apply its result on this
+	// goroutine as Run() would, then assert the delivered snapshot.
+	select {
+	case c := <-hub.voiceCountCatchupResults:
+		hub.applyVoiceCountCatchup(c)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected an off-loop voice-count catch-up result after subscribe")
+	}
+
+	resp := readClientMsg(t, client)
+	require.Equal(t, "server_voice_counts", resp["type"])
+	counts := resp["data"].(map[string]interface{})[keyCounts].(map[string]interface{})
+	// The catch-up carries the full subscribed set (client replaces its map), so
+	// both servers must be present, not just the newly subscribed one.
+	assert.Equal(t, float64(1), counts[serverA.String()], "newly subscribed server's count present")
+	assert.Equal(t, float64(1), counts[serverB.String()], "already-subscribed server's count retained")
+}
+
+// TestHandleSubscribeServer_SkipsCatchupForDuplicateSubscription covers CV-CAN-030
+// hardening: a duplicate subscribe_server for a server the client already tracks
+// opens no new staleness window, so it must not dispatch another voice-count
+// catch-up. Otherwise an authenticated client could spam duplicate frames to force
+// repeated full voice_participants aggregations (singleflight only collapses
+// concurrent in-flight queries, not sequential ones).
+func TestHandleSubscribeServer_SkipsCatchupForDuplicateSubscription(t *testing.T) {
+	db := setupHubTestDB(t)
+	hub := NewHub(db, nil)
+
+	owner := seedVoiceTestUser(t, db, "vcdupowner")
+	serverA := seedVoiceServer(t, db, owner, "Dup A")
+
+	client := newTestClient(hub, owner)
+	hub.clients[client.ID] = client
+	// Client is already subscribed to serverA.
+	hub.serverSubscriptions[serverA] = map[uuid.UUID]bool{client.ID: true}
+
+	hub.handleSubscribeServer(IncomingMessage{
+		Type:     "subscribe_server",
+		UserID:   owner,
+		ClientID: client.ID,
+		Data:     map[string]interface{}{keyServerID: serverA.String()},
+	})
+
+	require.True(t, hub.serverSubscriptions[serverA][client.ID],
+		"client must remain subscribed to serverA")
+
+	// No catch-up must be dispatched for the duplicate subscription. The dispatch
+	// path is skipped entirely, so nothing lands on voiceCountCatchupResults.
+	select {
+	case <-hub.voiceCountCatchupResults:
+		t.Fatal("duplicate subscribe_server must not dispatch a voice-count catch-up")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// TestApplyVoiceCountCatchup_SkipsDisconnectedClient covers the race the off-loop
+// dispatch introduces: if the client disconnects between subscribing and the
+// query returning, applying the catch-up must be a no-op rather than panic or
+// resurrect state.
+func TestApplyVoiceCountCatchup_SkipsDisconnectedClient(t *testing.T) {
+	db := setupHubTestDB(t)
+	hub := NewHub(db, nil)
+
+	owner := seedVoiceTestUser(t, db, "vccatchupgone")
+	serverA := seedVoiceServer(t, db, owner, "Catchup A")
+
+	client := newTestClient(hub, owner)
+	// Client is NOT registered in hub.clients (simulates disconnect before the
+	// off-loop query returned).
+	hub.serverSubscriptions[serverA] = map[uuid.UUID]bool{client.ID: true}
+
+	hub.applyVoiceCountCatchup(voiceCountCatchup{
+		clientID: client.ID,
+		counts:   map[string]int{serverA.String(): 1},
+	})
+
+	assert.Equal(t, 0, len(client.Send), "no snapshot should be sent to a disconnected client")
+}
+
+// TestEvictServerSubscriber_StopsVoiceCountFanout covers CV-CAN-030: once a
+// member is removed/banned, evicting their server subscription (via the
+// CV-CAN-027/028 BroadcastToServerAndPrune path) must stop the scoped
+// voice-count fanout from reaching their still-connected client, without
+// disturbing other subscribers.
+func TestEvictServerSubscriber_StopsVoiceCountFanout(t *testing.T) {
+	db := setupHubTestDB(t)
+	hub := NewHub(db, nil)
+
+	owner := seedVoiceTestUser(t, db, "vcrevowner")
+	serverA := seedVoiceServer(t, db, owner, "Rev A") // owner is a voice participant (count=1)
+
+	removedUser := seedVoiceTestUser(t, db, "vcrevremoved")
+	removedClient := newTestClient(hub, removedUser)
+	stayClient := newTestClient(hub, owner)
+	hub.clients[removedClient.ID] = removedClient
+	hub.clients[stayClient.ID] = stayClient
+	hub.userClients[removedUser] = map[uuid.UUID]bool{removedClient.ID: true}
+	hub.userClients[owner] = map[uuid.UUID]bool{stayClient.ID: true}
+	hub.serverSubscriptions[serverA] = map[uuid.UUID]bool{
+		removedClient.ID: true,
+		stayClient.ID:    true,
+	}
+
+	// Simulate what member removal/ban triggers server-side: BroadcastToServerAndPrune
+	// evicts the removed member from serverSubscriptions after delivering member_removed.
+	hub.evictServerSubscriber(serverA, removedUser)
+
+	assert.False(t, hub.serverSubscriptions[serverA][removedClient.ID],
+		"removed user's connection must be dropped from the subscription set")
+	assert.True(t, hub.serverSubscriptions[serverA][stayClient.ID],
+		"other members' subscriptions must be untouched")
+
+	// The next scoped broadcast skips the removed client but still reaches the
+	// remaining subscriber.
+	hub.broadcastServerVoiceCounts()
+	assert.Equal(t, 0, len(removedClient.Send),
+		"removed client must not receive voice counts for a server it left")
+
+	resp := readClientMsg(t, stayClient)
+	counts := resp["data"].(map[string]interface{})[keyCounts].(map[string]interface{})
+	assert.Equal(t, float64(1), counts[serverA.String()],
+		"remaining subscriber still receives the server's voice count")
 }
 
 // --- handleDisconnectUser integration tests ---

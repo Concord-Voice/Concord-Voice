@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2145,6 +2146,56 @@ func TestBroadcastServerVoiceCountsCoalescesMultipleSignals(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 		// Expected
 	}
+}
+
+// TestVoiceCountCatchup_CoalescesConcurrentQueries covers the CV-CAN-030 perf
+// hardening: the on-subscribe catch-up runs its global voice-count aggregation
+// through the hub's singleflight group, so a reconnect storm of concurrent
+// dispatches shares one in-flight query instead of fanning out to one full-table
+// scan per subscribe. It drives voiceCountSF with the same key the dispatch path
+// uses and asserts the underlying query executes exactly once while another
+// caller joins while the first is in flight.
+//
+// The synchronization is deterministic (no timing sleeps): DoChan registers the
+// call under the group's lock before returning, so once the first query has
+// signalled that it is executing (inflight), any subsequent DoChan for the same
+// key is guaranteed to coalesce onto it rather than start a second query.
+func TestVoiceCountCatchup_CoalescesConcurrentQueries(t *testing.T) {
+	hub := NewHub(nil, nil)
+
+	var calls int32
+	inflight := make(chan struct{}) // closed once the first query is executing
+	release := make(chan struct{})  // unblocks the in-flight query
+
+	// First caller occupies the singleflight slot. DoChan returns immediately and
+	// runs fn on its own goroutine, so the call is registered before we join.
+	first := hub.voiceCountSF.DoChan(voiceCountSFKey, func() (interface{}, error) {
+		atomic.AddInt32(&calls, 1)
+		close(inflight)
+		<-release // hold the query in-flight so the second caller must coalesce
+		return map[string]int{}, nil
+	})
+
+	// Ensure the first query is registered and executing before the second joins.
+	<-inflight
+
+	// Second caller coalesces onto the in-flight call. Its fn must never run.
+	second := hub.voiceCountSF.DoChan(voiceCountSFKey, func() (interface{}, error) {
+		atomic.AddInt32(&calls, 1) // must not execute
+		return map[string]int{}, nil
+	})
+
+	// Let the shared query finish and both callers observe the result.
+	close(release)
+	res1 := <-first
+	res2 := <-second
+
+	require.NoError(t, res1.Err)
+	require.NoError(t, res2.Err)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&calls),
+		"concurrent catch-up dispatches must coalesce to a single voice-count query")
+	assert.True(t, res2.Shared,
+		"the joining caller must share the first caller's in-flight result")
 }
 
 // --- scheduleOnlineCountBroadcast tests ---
