@@ -28,6 +28,11 @@ func (h *Handler) EnrollPage(c *gin.Context) {
 	// to its own origin. No external resources, no framing.
 	c.Header("Content-Security-Policy",
 		"default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+	// CV-CAN-019: the single-use enrollment token arrives in the URL query string
+	// (?token=...). Suppress any Referer that could carry it off-origin (defence
+	// in depth — the same-origin/no-subresource CSP already limits Referer leakage;
+	// the inline script also strips the token from the address bar after prefill).
+	c.Header("Referrer-Policy", "no-referrer")
 	c.String(http.StatusOK, enrollPageHTML)
 }
 
@@ -95,6 +100,11 @@ complete this within the one-hour token window. Register a backup key too.</p>
   var params = new URLSearchParams(window.location.search);
   if (params.get("username")) { document.getElementById("username").value = params.get("username"); }
   if (params.get("token")) { document.getElementById("token").value = params.get("token"); }
+  // CV-CAN-019: strip username/token from the address bar (and forward history)
+  // once prefilled, so the single-use token does not linger in browser history.
+  if (params.get("token") || params.get("username")) {
+    history.replaceState(null, "", location.pathname);
+  }
 
   function setStatus(msg) { document.getElementById("status").textContent = msg; }
 

@@ -198,6 +198,10 @@ func TestEnrollPage_ServesFunctionalHTML(t *testing.T) {
 	assert.Contains(t, body, "/admin/api/v1/enroll/finish")
 	// Root-relative API URLs only (no SPA-origin-relative or external hosts).
 	assert.NotContains(t, body, "http://")
+	// CV-CAN-019: the URL-carried enrollment token must not leak via Referer, and
+	// the inline script strips it from the address bar after prefill.
+	assert.Equal(t, "no-referrer", rec.Header().Get("Referrer-Policy"))
+	assert.Contains(t, body, "history.replaceState")
 }
 
 // --- admin-create endpoint (behind AdminAuthRequired) ---
