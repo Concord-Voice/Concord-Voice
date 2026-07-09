@@ -4037,6 +4037,52 @@ func TestAuthorizeDMVoiceForMediaPlane_Member_Returns200(t *testing.T) {
 	assert.Equal(t, false, body["is_group"], "DM 1:1 = not group")
 }
 
+// CV-CAN-017: the DM media-plane authorize response must carry the requesting
+// member's server-authoritative display identity, resolved from the
+// authenticated user_id — the media-plane uses these instead of client-supplied
+// socket.handshake.auth values.
+func TestAuthorizeDMVoiceForMediaPlane_ReturnsAuthoritativeIdentity(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+
+	user := ts.CreateTestUser(t, "g7_id_member")
+	other := ts.CreateTestUser(t, "g7_id_other")
+	convID := ts.CreateDMConversation(t, user.ID, other.ID)
+
+	_, err := ts.DB.Exec(
+		`UPDATE users SET display_name = $2, avatar_url = $3 WHERE id = $1`,
+		user.ID, "DM Real Name", "/api/v1/media/avatars/dm.png")
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize, nil, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "g7_id_member", body["username"])
+	assert.Equal(t, "DM Real Name", body["display_name"])
+	assert.Equal(t, "/api/v1/media/avatars/dm.png", body["avatar_url"])
+}
+
+// A DM member with no display_name/avatar_url (the common fresh-user state) gets
+// empty strings, never a missing field — the NULL->empty-string path via
+// sql.NullString.String, symmetric to the channel handler's coverage.
+func TestAuthorizeDMVoiceForMediaPlane_ReturnsEmptyIdentityFieldsWhenUnset(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+
+	user := ts.CreateTestUser(t, "g7_id_bare")
+	other := ts.CreateTestUser(t, "g7_id_bare_other")
+	convID := ts.CreateDMConversation(t, user.ID, other.ID)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize, nil, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "g7_id_bare", body["username"])
+	assert.Equal(t, "", body["display_name"])
+	assert.Equal(t, "", body["avatar_url"])
+}
+
 func TestAuthorizeDMVoiceForMediaPlane_NonMember_Returns403(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 

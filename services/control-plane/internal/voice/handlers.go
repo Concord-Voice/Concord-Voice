@@ -245,10 +245,23 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 	// here for the media-plane bitfield — the media plane enforces PermSpeak,
 	// PermScreenShare, PermMuteMembers, PermDeafenMembers, PermMoveMembers from it.
 
-	// Query server-enforced mute/deafen flags for this member
+	// Query server-enforced mute/deafen flags for this member AND the member's
+	// authoritative display identity (CV-CAN-017). The media-plane previously
+	// took username/display_name/avatar_url from client-supplied
+	// socket.handshake.auth and rebroadcast them as authoritative — letting an
+	// in-room member spoof its display identity to peers. We resolve them here
+	// from the AUTHENTICATED user_id (folded into this existing per-member query,
+	// so no extra round-trip) and return them in the response for the media-plane
+	// to use instead of the handshake values.
 	var serverMuted, serverDeafened bool
-	if err := h.db.QueryRow(`SELECT server_muted, server_deafened FROM server_members WHERE server_id = $1 AND user_id = $2`,
-		serverID, userID).Scan(&serverMuted, &serverDeafened); err != nil {
+	var username string
+	var displayName, avatarURL sql.NullString
+	if err := h.db.QueryRow(`
+		SELECT sm.server_muted, sm.server_deafened, u.username, u.display_name, u.avatar_url
+		FROM server_members sm
+		JOIN users u ON u.id = sm.user_id
+		WHERE sm.server_id = $1 AND sm.user_id = $2`,
+		serverID, userID).Scan(&serverMuted, &serverDeafened, &username, &displayName, &avatarURL); err != nil {
 		h.log.Error("Failed to query server enforcement flags", "error", err, "user_id", sanitizeLogValue(userID), "server_id", sanitizeLogValue(serverID))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
 		return
@@ -288,6 +301,13 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 		"server_deafened":    serverDeafened,
 		"media_entitlements": mediaEnt,
 		"room_owner_tier":    roomOwnerTier,
+		// CV-CAN-017: server-authoritative display identity, resolved from the
+		// authenticated user_id. The media-plane uses these in place of the
+		// client-supplied handshake values so a member cannot spoof its display
+		// identity to peers. display_name/avatar_url are empty strings when unset.
+		"username":     username,
+		"display_name": displayName.String,
+		"avatar_url":   avatarURL.String,
 		"channel": gin.H{
 			"id":                 channelID,
 			"name":               channelName,

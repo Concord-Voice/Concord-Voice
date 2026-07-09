@@ -15,6 +15,7 @@ const TEST_SIGNING_KEY = ['vitest', 'mock', 'jwt'].join('-'); // NOSONAR — tes
 import {
   createAuthMiddleware,
   validateChannelAccess,
+  resolveParticipantIdentity,
   FREE_MEDIA_ENTITLEMENT,
 } from '../src/middleware/auth.js';
 
@@ -381,6 +382,115 @@ describe('validateChannelAccess', () => {
     );
   });
 
+  // ── CV-CAN-017: server-authoritative display identity ─────────────────
+  it('parses server-authoritative identity from a channel response', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 'srv-1', name: 'General' },
+          username: 'realuser',
+          display_name: 'Real User',
+          avatar_url: '/api/v1/media/avatars/real.png',
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    expect(result.authUsername).toBe('realuser');
+    expect(result.authDisplayName).toBe('Real User');
+    expect(result.authAvatarUrl).toBe('/api/v1/media/avatars/real.png');
+  });
+
+  it('treats empty display_name/avatar_url as undefined but keeps authUsername', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 'srv-1', name: 'General' },
+          username: 'realuser',
+          display_name: '',
+          avatar_url: '',
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    // authUsername present ⇒ the control-plane IS identity-aware; the join
+    // handler will therefore NOT fall back to the handshake display_name/avatar.
+    expect(result.authUsername).toBe('realuser');
+    expect(result.authDisplayName).toBeUndefined();
+    expect(result.authAvatarUrl).toBeUndefined();
+  });
+
+  it('leaves authUsername undefined for a pre-CV-CAN-017 response (handshake fallback)', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 'srv-1', name: 'General' },
+          // no username/display_name/avatar_url — old control-plane build
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    expect(result.authUsername).toBeUndefined();
+    expect(result.authDisplayName).toBeUndefined();
+    expect(result.authAvatarUrl).toBeUndefined();
+  });
+
+  it('parses server-authoritative identity from a DM response', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          authorized: true,
+          is_group: false,
+          username: 'dmuser',
+          display_name: 'DM User',
+          avatar_url: '/api/v1/media/avatars/dm.png',
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'conv-1', 'token', 'dm');
+
+    expect(result.authUsername).toBe('dmuser');
+    expect(result.authDisplayName).toBe('DM User');
+    expect(result.authAvatarUrl).toBe('/api/v1/media/avatars/dm.png');
+  });
+
+  it('ignores non-string identity fields (fails closed to undefined)', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 'srv-1', name: 'General' },
+          username: 42,
+          display_name: { nested: 'object' },
+          avatar_url: ['array'],
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    expect(result.authUsername).toBeUndefined();
+    expect(result.authDisplayName).toBeUndefined();
+    expect(result.authAvatarUrl).toBeUndefined();
+  });
+
   it('routes to server-channel endpoint when roomKind omitted (backward compat)', async () => {
     mockFetch().mockResolvedValueOnce({
       ok: true,
@@ -735,5 +845,59 @@ describe('validateChannelAccess', () => {
     const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
 
     expect(result.roomOwnerTier).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveParticipantIdentity (CV-CAN-017)
+// The load-bearing security decision: prefer server-authoritative identity,
+// fall back to the client-supplied handshake identity ONLY when the
+// control-plane did not supply it (pre-CV-CAN-017 build).
+// ---------------------------------------------------------------------------
+
+describe('resolveParticipantIdentity', () => {
+  const spoofedHandshake = {
+    username: 'spoofed',
+    displayName: 'Spoofed Admin',
+    avatarUrl: '/api/v1/media/avatars/spoof.png',
+  };
+
+  it('uses server-authoritative identity and ignores the handshake when authUsername is present', () => {
+    const result = resolveParticipantIdentity(
+      {
+        authUsername: 'realuser',
+        authDisplayName: 'Real User',
+        authAvatarUrl: '/api/v1/media/avatars/real.png',
+      },
+      spoofedHandshake
+    );
+
+    expect(result).toEqual({
+      username: 'realuser',
+      displayName: 'Real User',
+      avatarUrl: '/api/v1/media/avatars/real.png',
+    });
+  });
+
+  it('does NOT fall back to handshake display/avatar when authUsername is present but they are undefined', () => {
+    // A user with no display name / avatar: authUsername present, the other two
+    // undefined. The spoofable handshake values must NOT leak in.
+    const result = resolveParticipantIdentity(
+      { authUsername: 'realuser', authDisplayName: undefined, authAvatarUrl: undefined },
+      spoofedHandshake
+    );
+
+    expect(result.username).toBe('realuser');
+    expect(result.displayName).toBeUndefined();
+    expect(result.avatarUrl).toBeUndefined();
+  });
+
+  it('falls back to ALL handshake fields when authUsername is undefined (pre-CV-CAN-017 control-plane)', () => {
+    const result = resolveParticipantIdentity(
+      { authUsername: undefined, authDisplayName: undefined, authAvatarUrl: undefined },
+      spoofedHandshake
+    );
+
+    expect(result).toEqual(spoofedHandshake);
   });
 });

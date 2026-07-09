@@ -11,7 +11,11 @@ import {
 } from './lib/roomManager.js';
 import type { MediaSource } from './lib/roomManager.js';
 import { MediaMetrics } from './lib/mediaMetrics.js';
-import { createAuthMiddleware, validateChannelAccess } from './middleware/auth.js';
+import {
+  createAuthMiddleware,
+  validateChannelAccess,
+  resolveParticipantIdentity,
+} from './middleware/auth.js';
 import type { AuthenticatedSocketData } from './middleware/auth.js';
 import { NatsService } from './lib/nats.js';
 import { RedisService } from './lib/redis.js';
@@ -320,19 +324,27 @@ async function main() {
             userId: data.userId,
           });
 
+          // CV-CAN-017: prefer the server-authoritative display identity from the
+          // join-authorize response over the client-supplied socket.handshake.auth
+          // values, so a member cannot spoof its display identity to peers. The
+          // load-bearing decision (and its handshake fallback for a pre-CV-CAN-017
+          // control-plane) lives in the pure, unit-tested resolveParticipantIdentity.
+          const identity = resolveParticipantIdentity(access, {
+            username: data.username,
+            displayName: data.displayName,
+            avatarUrl: data.avatarUrl,
+          });
+
           // Join the room via RoomManager. Thread the server-authoritative per-user
           // media entitlement (#1300) parsed from the join-authorize response into
           // the Participant — it caps THIS user's own send transport + mic produce
-          // (never sourced from socket.handshake.auth).
+          // (never sourced from socket.handshake.auth). Identity is likewise
+          // server-authoritative (CV-CAN-017), not from socket.handshake.auth.
           const result = await roomManager.joinRoom(
             roomId,
             data.userId,
             socket.id,
-            {
-              username: data.username,
-              displayName: data.displayName,
-              avatarUrl: data.avatarUrl,
-            },
+            identity,
             rtpCapabilities,
             {
               entitlement: {
@@ -366,12 +378,14 @@ async function main() {
           socket.join(roomId);
           data.roomId = roomId;
 
-          // Notify others in the room
+          // Notify others in the room. Identity is server-authoritative
+          // (CV-CAN-017) — the same values stored on the Participant, never the
+          // client-supplied socket.handshake.auth fields.
           socket.to(roomId).emit('user-joined', {
             userId: data.userId,
-            username: data.username,
-            displayName: data.displayName,
-            avatarUrl: data.avatarUrl,
+            username: identity.username,
+            displayName: identity.displayName,
+            avatarUrl: identity.avatarUrl,
             e2eeEpoch: result.e2eeEpoch,
           });
 

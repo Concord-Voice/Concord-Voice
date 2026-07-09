@@ -2797,13 +2797,21 @@ func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 		return
 	}
 
+	// Fetch is_group AND the requesting member's authoritative display identity
+	// (CV-CAN-017), folded into this existing membership query so no extra
+	// round-trip. The media-plane uses username/display_name/avatar_url from here
+	// instead of the client-supplied socket.handshake.auth values, closing the
+	// display-identity spoof for DM voice rooms (mirrors the server-channel path).
 	var isGroup bool
+	var username string
+	var displayName, avatarURL sql.NullString
 	err := h.db.QueryRow(`
-		SELECT dc.is_group
+		SELECT dc.is_group, u.username, u.display_name, u.avatar_url
 		FROM dm_conversations dc
 		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
+		JOIN users u ON u.id = dp.user_id
 		WHERE dc.id = $1
-	`, convID, userID).Scan(&isGroup)
+	`, convID, userID).Scan(&isGroup, &username, &displayName, &avatarURL)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusForbidden, gin.H{"authorized": false, "error": errMsgNotParticipant})
 		return
@@ -2829,6 +2837,10 @@ func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 		"authorized":         true,
 		"is_group":           isGroup,
 		"media_entitlements": mediaEnt,
+		// CV-CAN-017: server-authoritative display identity (see query above).
+		"username":     username,
+		"display_name": displayName.String,
+		"avatar_url":   avatarURL.String,
 	})
 }
 

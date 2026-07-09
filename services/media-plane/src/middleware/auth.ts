@@ -153,7 +153,75 @@ export interface ChannelAccessResult {
    * and on denial paths.
    */
   roomOwnerTier?: string;
+  /**
+   * Server-authoritative display identity, resolved by the control-plane from
+   * the authenticated user_id and returned on BOTH the channel and DM
+   * join-authorize responses (CV-CAN-017). The join handler prefers these over
+   * the client-supplied socket.handshake.auth values so a member cannot spoof
+   * its display identity to peers. `authUsername` present ⇒ the control-plane is
+   * identity-aware; `undefined` ⇒ a pre-CV-CAN-017 control-plane (handshake
+   * fallback). `authDisplayName`/`authAvatarUrl` are `undefined` when the user
+   * genuinely has none (empty string from the server) — NOT re-opened to the
+   * handshake value, which is keyed on `authUsername` presence instead.
+   */
+  authUsername?: string;
+  authDisplayName?: string;
+  authAvatarUrl?: string;
   error?: string;
+}
+
+/**
+ * Parse server-authoritative display identity from a join-authorize response
+ * (CV-CAN-017). Non-string / empty / absent values become `undefined` so an
+ * empty display_name/avatar_url from the server reads as "genuinely none".
+ */
+function parseAuthoritativeIdentity(resp: {
+  username?: unknown;
+  display_name?: unknown;
+  avatar_url?: unknown;
+}): { authUsername?: string; authDisplayName?: string; authAvatarUrl?: string } {
+  const nonEmpty = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.length > 0 ? v : undefined;
+  return {
+    authUsername: nonEmpty(resp.username),
+    authDisplayName: nonEmpty(resp.display_name),
+    authAvatarUrl: nonEmpty(resp.avatar_url),
+  };
+}
+
+/** A voice participant's display identity as stored + broadcast. */
+export interface ParticipantIdentity {
+  username: string;
+  displayName?: string;
+  avatarUrl?: string;
+}
+
+/**
+ * Resolve the identity to store on the Participant and broadcast to peers
+ * (CV-CAN-017). This is the load-bearing security decision: prefer the
+ * server-authoritative identity from the join-authorize response, and fall back
+ * to the client-supplied handshake identity ONLY when the control-plane did not
+ * supply it (a pre-CV-CAN-017 control-plane, detected by an absent `authUsername`).
+ * The discriminator is `authUsername` presence — NOT per-field — so a genuinely
+ * empty server display_name/avatar (parsed to `undefined`) is never re-opened to
+ * the spoofable handshake value.
+ */
+export function resolveParticipantIdentity(
+  access: Pick<ChannelAccessResult, 'authUsername' | 'authDisplayName' | 'authAvatarUrl'>,
+  handshake: ParticipantIdentity
+): ParticipantIdentity {
+  if (access.authUsername !== undefined) {
+    return {
+      username: access.authUsername,
+      displayName: access.authDisplayName,
+      avatarUrl: access.authAvatarUrl,
+    };
+  }
+  return {
+    username: handshake.username,
+    displayName: handshake.displayName,
+    avatarUrl: handshake.avatarUrl,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -355,11 +423,16 @@ export async function validateChannelAccess(
         authorized: boolean;
         is_group: boolean;
         media_entitlements?: unknown;
+        username?: unknown;
+        display_name?: unknown;
+        avatar_url?: unknown;
       };
       const allowed = dmResponse.authorized === true;
       // Per-user media caps are room-kind-independent (spec §3): the DM
       // authorize response carries media_entitlements too. Parse fail-closed.
       const ent = parseMediaEntitlements(dmResponse.media_entitlements);
+      // CV-CAN-017: server-authoritative display identity for DM voice.
+      const identity = parseAuthoritativeIdentity(dmResponse);
       return {
         allowed,
         channelId,
@@ -371,6 +444,7 @@ export async function validateChannelAccess(
         allowedAudioTiers: ent.allowedAudioTiers,
         minPtimeMs: ent.minPtimeMs,
         maxManualBitrateBps: ent.maxManualBitrateBps,
+        ...identity,
         // Surface a specific reason when the control-plane returned 200
         // with authorized=false (rare — the 401/403/404 branches above
         // are the usual failure path). Without this the join-room handler
@@ -393,6 +467,9 @@ export async function validateChannelAccess(
       };
       media_entitlements?: unknown;
       room_owner_tier?: unknown;
+      username?: unknown;
+      display_name?: unknown;
+      avatar_url?: unknown;
     };
 
     const channel = responseData.channel;
@@ -408,6 +485,9 @@ export async function validateChannelAccess(
     // server owner's subscription, never from socket.handshake.auth.
     const roomOwnerTier = responseData.room_owner_tier === 'premium' ? 'premium' : 'free';
 
+    // CV-CAN-017: server-authoritative display identity for channel voice.
+    const identity = parseAuthoritativeIdentity(responseData);
+
     // The voice join endpoint validates channel type, membership, and permissions.
     // If we got a 200 with allowed=true, the user has access.
     return {
@@ -422,6 +502,7 @@ export async function validateChannelAccess(
       minPtimeMs: ent.minPtimeMs,
       maxManualBitrateBps: ent.maxManualBitrateBps,
       roomOwnerTier,
+      ...identity,
     };
   } catch (err) {
     logger.error('Failed to validate channel access', {

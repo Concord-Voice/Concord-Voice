@@ -179,6 +179,54 @@ func TestAuthorizeJoin(t *testing.T) {
 		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
 		assert.Equal(t, http.StatusForbidden, w.Code)
 	})
+
+	// CV-CAN-017: the response must carry the joining member's server-authoritative
+	// display identity, resolved from the authenticated user_id — the media-plane
+	// uses these instead of client-supplied socket.handshake.auth values.
+	t.Run("ReturnsAuthoritativeIdentity", func(t *testing.T) {
+		ts := setupTS(t)
+		owner := ts.CreateTestUser(t, "vjidowner")
+		member := ts.CreateTestUser(t, "vjidmember")
+		serverID := ts.CreateTestServer(t, owner.ID, "VoiceJoin Identity")
+		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-identity")
+
+		// Set a display_name + avatar_url on the member (both default NULL).
+		_, err := ts.DB.Exec(
+			`UPDATE users SET display_name = $2, avatar_url = $3 WHERE id = $1`,
+			member.ID, "Real Member", "/api/v1/media/avatars/real.png")
+		require.NoError(t, err)
+
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, "vjidmember", body["username"])
+		assert.Equal(t, "Real Member", body["display_name"])
+		assert.Equal(t, "/api/v1/media/avatars/real.png", body["avatar_url"])
+	})
+
+	// A member with no display_name/avatar_url gets empty strings (genuinely none),
+	// never a missing field — so the media-plane can distinguish "server said none"
+	// from "pre-CV-CAN-017 server didn't supply identity".
+	t.Run("ReturnsEmptyIdentityFieldsWhenUnset", func(t *testing.T) {
+		ts := setupTS(t)
+		owner := ts.CreateTestUser(t, "vjidowner2")
+		member := ts.CreateTestUser(t, "vjidbare")
+		serverID := ts.CreateTestServer(t, owner.ID, "VoiceJoin Identity Bare")
+		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-identity-bare")
+
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, "vjidbare", body["username"])
+		assert.Equal(t, "", body["display_name"])
+		assert.Equal(t, "", body["avatar_url"])
+	})
 }
 
 func TestAuthorizeJoinTimedOutMemberForbidden(t *testing.T) {
