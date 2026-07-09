@@ -192,8 +192,9 @@ type ssoTokenPayload struct {
 	Branch         string `json:"branch"`
 }
 
-// consumeSSOToken performs the GET-then-DEL single-use Redis dance, unmarshals
-// the payload, and validates that the branch matches the caller's expectation.
+// consumeSSOToken performs the atomic GET+DEL single-use Redis consume,
+// unmarshals the payload, and validates that the branch matches the caller's
+// expectation.
 //
 // Returns sentinel error errSSOTokenInvalid for any of the four failure modes
 // (Redis miss, JSON unmarshal failure, branch mismatch, missing TargetUserID
@@ -205,13 +206,13 @@ type ssoTokenPayload struct {
 // seen by an attacker.
 func (h *Handler) consumeSSOToken(ctx context.Context, token, expectedBranch string) (*ssoTokenPayload, error) {
 	tokenKey := ssoTokenKeyPrefix + token
-	raw, err := h.deps.Redis.Get(ctx, tokenKey).Bytes()
+	// Atomic GET+DEL consume so two concurrent requests cannot both observe the
+	// token before it is deleted (CV-CAN-016). GetDel is a single round-trip; a
+	// missing key (already consumed or expired) returns an error → invalid.
+	raw, err := h.deps.Redis.GetDel(ctx, tokenKey).Bytes()
 	if err != nil {
 		return nil, errSSOTokenInvalid
 	}
-	// Best-effort delete: token has been read so a delete failure does not
-	// enable replay within this request.
-	_, _ = h.deps.Redis.Del(ctx, tokenKey).Result()
 
 	var info ssoTokenPayload
 	if err := json.Unmarshal(raw, &info); err != nil {

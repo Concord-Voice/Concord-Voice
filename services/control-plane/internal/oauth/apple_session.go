@@ -32,9 +32,9 @@ type appleSessionRequest struct {
 //  1. Provider gate: apple|google only (404 for unknown providers, broker
 //     parity). Type-switch on the concrete provider type gates per-provider
 //     id_token verification without adding a new interface method.
-//  2. State validation — error class `invalid_state` (401): record lookup,
-//     GET-then-DEL one-shot (Callback parity; GETDEL is the tracked
-//     hardening), constant-time compare against the record-embedded copy
+//  2. State validation — error class `invalid_state` (401): record lookup via
+//     atomic GET+DEL one-shot consume (CV-CAN-015), constant-time compare
+//     against the record-embedded copy
 //     (#972 / CWE-385; pre-#972 records decode State as "" and fail closed),
 //     provider binding. Runs AFTER the broker consumed its sibling one-shot
 //     key earlier in the flow — independent keys, compatible orderings.
@@ -69,14 +69,14 @@ func (h *Handler) ProviderSession(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	stateKey := stateKeyPrefix + req.State
-	raw, err := h.deps.Redis.Get(ctx, stateKey).Bytes()
+	// Atomic GET+DEL consume so two concurrent requests cannot both observe the
+	// state before it is deleted (CV-CAN-015). GetDel is a single round-trip; a
+	// missing key (already consumed or expired) returns an error → invalid_state.
+	raw, err := h.deps.Redis.GetDel(ctx, stateKey).Bytes()
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error_code": "invalid_state"})
 		return
 	}
-	// Best-effort delete: the record is already read, so a delete failure
-	// cannot enable replay within this request (Callback parity).
-	_, _ = h.deps.Redis.Del(ctx, stateKey).Result()
 
 	var rec ssoStateRecord
 	if err := json.Unmarshal(raw, &rec); err != nil {

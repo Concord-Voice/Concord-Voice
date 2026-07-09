@@ -382,6 +382,56 @@ func TestCompleteRegistration_HappyPath(t *testing.T) {
 	require.Error(t, err, "sso_token must be deleted after consumption")
 }
 
+// TestCompleteRegistration_ConsumedTokenNotReusable locks the single-use
+// property backing the atomic GET+DEL consume (CV-CAN-016): once a token is
+// consumed by a successful registration it cannot be replayed, so a second
+// request with the same token is rejected before any second account is created.
+func TestCompleteRegistration_ConsumedTokenNotReusable(t *testing.T) {
+	rig := newSSOCallbackTestRig(t, "http://unused")
+	rig.Engine.POST("/api/v1/auth/sso/:provider/complete-registration",
+		rig.Handler.CompleteRegistration)
+
+	ssoToken := "sso-token-reuse-1" //nolint:gosec // test fixture, not a real secret
+	payload := map[string]any{
+		"provider":         "google",
+		"provider_user_id": "google-sub-reuse",
+		"provider_email":   "reuse@example.test",
+		"name":             "Reuse Test",
+		"branch":           "new_user",
+		"created_at":       time.Now().UTC().Format(time.RFC3339),
+	}
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.NoError(t, rig.Redis.Set(context.Background(), "sso_token:"+ssoToken, raw, 15*time.Minute).Err())
+
+	body := map[string]any{
+		"sso_token":           ssoToken,
+		"username":            "reuseuser",
+		"password":            "TestPassphrase!12345", // pragma: allowlist secret
+		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("wrapped-priv-key-bytes")),
+		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("salt-bytes-xxxxxxx")),
+		"public_key":          base64.StdEncoding.EncodeToString([]byte("public-key-bytes")),
+	}
+	bodyJSON, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	doReq := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost,
+			"/api/v1/auth/sso/google/complete-registration", bytes.NewReader(bodyJSON))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		rig.Engine.ServeHTTP(w, req)
+		return w
+	}
+
+	// First consume succeeds and atomically deletes the token.
+	require.Equal(t, http.StatusCreated, doReq().Code)
+	// Replay with the same (now-consumed) token is rejected — no second account.
+	second := doReq()
+	require.Equal(t, http.StatusUnauthorized, second.Code)
+	assert.Contains(t, second.Body.String(), "sso_token_invalid")
+}
+
 // TestCompleteRegistration_NormalizesUsername locks the #1931 SSO half: the
 // username is stored normalized (lowercase) so the SSO path matches the password
 // path. A mixed-case submission must persist lowercase in users.username.
