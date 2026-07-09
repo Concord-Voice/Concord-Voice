@@ -300,6 +300,22 @@ func TestReorderChannelsSuccess(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
+// TestReorderChannelsForeignGroupRejected covers CV-CAN-012: a bulk reorder must
+// not assign a channel to a category owned by another server.
+func TestReorderChannelsForeignGroupRejected(t *testing.T) {
+	ts, user, serverID := setupWithServer(t)
+	channelID := ts.CreateTestChannel(t, serverID, "reorder-foreign")
+	otherServerID := ts.CreateTestServer(t, user.ID, "Reorder Other Server")
+	foreignGroupID := createGroup(t, ts, otherServerID, "Foreign Group", user.AccessToken)
+
+	w := ts.DoRequest("PUT", reorderPath(serverID), map[string]interface{}{
+		"channels": []map[string]interface{}{
+			{"channel_id": channelID, "group_id": foreignGroupID, "position": 0},
+		},
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
 func TestReorderChannelsNotAdmin(t *testing.T) {
 	ts, _, serverID := setupWithServer(t)
 	member := ts.CreateTestUser(t, "reordermember")

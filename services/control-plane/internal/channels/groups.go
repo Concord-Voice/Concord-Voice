@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
@@ -306,6 +307,86 @@ func (h *Handler) DeleteChannelGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Channel group deleted"})
 }
 
+// closeRows closes a result set, logging any close error. Callers defer it so
+// the "check every error" rule is honored without adding a conditional (and its
+// cognitive complexity) to a deferred closure at each call site. The what arg
+// labels the originating query in the log line.
+func (h *Handler) closeRows(rows *sql.Rows, what string) {
+	if err := rows.Close(); err != nil {
+		h.log.Error("Failed to close rows", "query", what, "error", err)
+	}
+}
+
+// validateReorderGroupOwnership verifies every target group_id in the reorder
+// request belongs to serverID (CV-CAN-012). On a lookup error it writes a 500;
+// on a missing, malformed, or cross-server group it writes a 400. The distinct
+// non-null group_ids are resolved in a single round-trip so a bulk drag-and-drop
+// that moves many channels (often into the same category) does not fan out into
+// N sequential lookups.
+func (h *Handler) validateReorderGroupOwnership(c *gin.Context, req ReorderChannelsRequest, serverID string) bool {
+	// Collect the distinct target group_ids. nil/empty is uncategorized and
+	// always allowed (mirrors groupBelongsToServer); dedupe so moving several
+	// channels into the same category costs one lookup, not one per channel.
+	wanted := make(map[string]struct{})
+	for _, cp := range req.Channels {
+		if cp.GroupID == nil || *cp.GroupID == "" {
+			continue
+		}
+		// A malformed (non-UUID) group_id is a client input error, not a server
+		// fault: reject it as a bad binding (400) before it reaches the
+		// uuid-typed query, which would otherwise fail as a 500.
+		if _, err := uuid.Parse(*cp.GroupID); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsgForeignGroup})
+			return false
+		}
+		wanted[*cp.GroupID] = struct{}{}
+	}
+	if len(wanted) == 0 {
+		return true
+	}
+
+	ids := make([]string, 0, len(wanted))
+	for id := range wanted {
+		ids = append(ids, id)
+	}
+
+	rows, err := h.db.QueryContext(c.Request.Context(),
+		`SELECT id::text FROM channel_groups WHERE id = ANY($1::uuid[]) AND server_id = $2`,
+		pq.Array(ids), serverID,
+	)
+	if err != nil {
+		h.log.Error("Failed to validate reorder group ownership", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedReorderChannels})
+		return false
+	}
+	defer h.closeRows(rows, "reorder group ownership")
+
+	// id is the primary key, so each distinct requested id matches at most one
+	// row, and the server_id predicate means every returned row is same-server.
+	found := 0
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			h.log.Error("Failed to scan reorder group ownership", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedReorderChannels})
+			return false
+		}
+		found++
+	}
+	if err := rows.Err(); err != nil {
+		h.log.Error("Failed to read reorder group ownership", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedReorderChannels})
+		return false
+	}
+
+	// A shortfall means at least one requested group is missing or cross-server.
+	if found != len(wanted) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgForeignGroup})
+		return false
+	}
+	return true
+}
+
 // ReorderChannels bulk-updates channel positions and group assignments.
 // Used for drag-and-drop reordering between groups.
 func (h *Handler) ReorderChannels(c *gin.Context) {
@@ -331,6 +412,13 @@ func (h *Handler) ReorderChannels(c *gin.Context) {
 	}
 	if !hasPerm {
 		c.JSON(http.StatusForbidden, gin.H{"error": errInsufficientPerms})
+		return
+	}
+
+	// CV-CAN-012: every non-null target group_id must belong to this server — a
+	// bulk reorder must not assign a channel to a category from another server
+	// (the permission-sync cascade keys on group_id with no server predicate).
+	if !h.validateReorderGroupOwnership(c, req, serverID) {
 		return
 	}
 
@@ -367,17 +455,26 @@ func (h *Handler) ReorderChannels(c *gin.Context) {
 
 	h.log.Info("Channels reordered", "server_id", serverID, "user_id", userID, "count", len(req.Channels))
 
-	if h.hub != nil {
-		if serverUUID, err := uuid.Parse(serverID); err == nil {
-			h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
-				Type: "channels_reordered",
-				Data: map[string]interface{}{
-					"server_id": serverID,
-					"channels":  req.Channels,
-				},
-			})
-		}
-	}
+	h.broadcastChannelsReordered(serverID, req.Channels)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Channels reordered"})
+}
+
+// broadcastChannelsReordered emits a channels_reordered event to the server's
+// subscribers (best-effort; no-op when the hub is unset or serverID is unparseable).
+func (h *Handler) broadcastChannelsReordered(serverID string, channels []ChannelPosition) {
+	if h.hub == nil {
+		return
+	}
+	serverUUID, err := uuid.Parse(serverID)
+	if err != nil {
+		return
+	}
+	h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
+		Type: "channels_reordered",
+		Data: map[string]interface{}{
+			"server_id": serverID,
+			"channels":  channels,
+		},
+	})
 }

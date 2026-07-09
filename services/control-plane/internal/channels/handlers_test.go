@@ -86,6 +86,53 @@ func TestCreateChannelSuccess(t *testing.T) {
 	assert.Equal(t, "new-channel", channel["name"])
 }
 
+// TestCreateChannel_ForeignGroupRejected covers CV-CAN-010: a new channel must
+// not be bound to a category (channel_groups) owned by another server, which
+// the permission-sync cascade would treat as the source of overrides.
+func TestCreateChannel_ForeignGroupRejected(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "cfgroupuser")
+	serverID := ts.CreateTestServer(t, user.ID, "CFG Server A")
+	otherServerID := ts.CreateTestServer(t, user.ID, "CFG Server B")
+	foreignGroupID := createGroup(t, ts, otherServerID, "Foreign Group", user.AccessToken)
+
+	w := ts.DoRequest("POST", pathChannels, map[string]interface{}{
+		keyServerID: serverID,
+		"name":      "foreign-bound",
+		"type":      "text",
+		"group_id":  foreignGroupID,
+		keyWrappedKeys: map[string]string{
+			user.ID: testhelpers.ValidCiphertext(),
+		},
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// TestUpdateChannel_ForeignGroupRejected covers CV-CAN-011: an existing channel
+// must not be moved under a category owned by another server.
+func TestUpdateChannel_ForeignGroupRejected(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "ufgroupuser")
+	serverID := ts.CreateTestServer(t, user.ID, "UFG Server A")
+	channelID := ts.CreateTestChannel(t, serverID, "ufg-chan")
+	otherServerID := ts.CreateTestServer(t, user.ID, "UFG Server B")
+	foreignGroupID := createGroup(t, ts, otherServerID, "Foreign Group", user.AccessToken)
+
+	// name/type are required by UpdateChannelRequest binding; include valid
+	// values so the request binds and the foreign-group guard (not the binding
+	// validator) is what rejects it.
+	w := ts.DoRequest("PATCH", pathChannelsPrefix+channelID, map[string]interface{}{
+		"name":     "ufg-chan",
+		"type":     "text",
+		"group_id": foreignGroupID,
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "group_id does not belong to this server", body["error"])
+}
+
 func TestCreateChannelNotAdmin(t *testing.T) {
 	ts := setupTS(t)
 	owner := ts.CreateTestUser(t, "chanowner2")

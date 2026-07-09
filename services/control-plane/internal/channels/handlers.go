@@ -26,6 +26,7 @@ const (
 	errMsgInvalidChannelID        = "Invalid channel ID"
 	errMsgInvalidRequestBody      = "Invalid request body"
 	errMsgInsufficientPerms       = "insufficient permissions"
+	errMsgForeignGroup            = "group_id does not belong to this server"
 	errMsgNotMemberOfServer       = "Not a member of this server"
 	errMsgChannelNotFound         = "Channel not found"
 	errMsgChannelNotFoundOrDenied = "Channel not found or access denied"
@@ -258,6 +259,20 @@ func (h *Handler) CreateChannel(c *gin.Context) {
 	}
 	if !hasPerm {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return
+	}
+
+	// CV-CAN-010: reject a group_id that belongs to another server. Binding a
+	// new channel to a foreign category lets the later permission-sync cascade
+	// copy that server's category overrides into this channel by group_id.
+	groupOK, groupErr := h.groupBelongsToServer(c.Request.Context(), req.GroupID, req.ServerID)
+	if groupErr != nil {
+		h.log.Error("Failed to validate channel group ownership", "error", groupErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		return
+	}
+	if !groupOK {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgForeignGroup})
 		return
 	}
 
@@ -562,6 +577,23 @@ func (h *Handler) GetChannel(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"channel": channel})
 }
 
+// validateUpdateChannelGroupOwnership verifies req's target group_id belongs to
+// serverID (CV-CAN-011). On a lookup error or a foreign group it writes the HTTP
+// error response and returns false.
+func (h *Handler) validateUpdateChannelGroupOwnership(c *gin.Context, req UpdateChannelRequest, serverID string) bool {
+	groupOK, groupErr := h.groupBelongsToServer(c.Request.Context(), req.GroupID, serverID)
+	if groupErr != nil {
+		h.log.Error("Failed to validate channel group ownership", "error", groupErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateChannel})
+		return false
+	}
+	if !groupOK {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgForeignGroup})
+		return false
+	}
+	return true
+}
+
 // UpdateChannel updates a channel's details
 func (h *Handler) UpdateChannel(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -596,6 +628,12 @@ func (h *Handler) UpdateChannel(c *gin.Context) {
 	}
 	if !hasPerm {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return
+	}
+
+	// CV-CAN-011: reject moving this channel under a category owned by another
+	// server before permission sync treats it as the source of overrides.
+	if !h.validateUpdateChannelGroupOwnership(c, req, serverID) {
 		return
 	}
 
@@ -637,6 +675,41 @@ func (h *Handler) lookupChannelServerID(channelID string) (string, error) {
 		h.log.Error("Failed to look up channel", "error", err)
 	}
 	return serverID, err
+}
+
+// groupBelongsToServer reports whether a channel's group_id is safe to set on a
+// channel in serverID. A nil/empty group_id (uncategorized) is always allowed;
+// otherwise the referenced channel_groups row MUST belong to the same server.
+// This blocks binding or moving a channel under a category owned by ANOTHER
+// server — the permission-sync cascade keys on group_id with no server
+// predicate, so a cross-server binding would copy the foreign category's
+// overrides into this channel (CV-CAN-010/011/012). Returns (false, nil) when
+// the group is missing, malformed, or cross-server, (true, nil) when allowed,
+// and a non-nil error only on a DB failure. The composite (group_id, server_id)
+// FK added in migration 000082 is the structural backstop for this check.
+func (h *Handler) groupBelongsToServer(ctx context.Context, groupID *string, serverID string) (bool, error) {
+	if groupID == nil || *groupID == "" {
+		return true, nil
+	}
+	// A malformed (non-UUID) group_id is a client input error, not a server
+	// fault. Reject it as a bad binding (400 at the caller) instead of letting
+	// the Postgres uuid cast fail the query and surface as a 500.
+	if _, err := uuid.Parse(*groupID); err != nil {
+		return false, nil
+	}
+	// Match server ownership inside Postgres so both ids are compared as
+	// canonical uuid values. Comparing the DB's canonical server_id against the
+	// raw request string in Go would falsely reject an equivalent but
+	// differently-cased serverID (e.g. uppercase from the client).
+	var sameServer bool
+	err := h.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM channel_groups WHERE id = $1 AND server_id = $2)`,
+		*groupID, serverID,
+	).Scan(&sameServer)
+	if err != nil {
+		return false, err
+	}
+	return sameServer, nil
 }
 
 func resolveGroupIDParam(groupID *string) interface{} {
