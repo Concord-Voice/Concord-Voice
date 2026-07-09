@@ -1014,6 +1014,10 @@ var renameTableStmts = map[string]struct {
 		rename: `ALTER TABLE dm_key_revocations RENAME TO dm_key_revocations_hidden_for_test`,
 		revert: `ALTER TABLE dm_key_revocations_hidden_for_test RENAME TO dm_key_revocations`,
 	},
+	"roles": {
+		rename: `ALTER TABLE roles RENAME TO roles_hidden_for_test`,
+		revert: `ALTER TABLE roles_hidden_for_test RENAME TO roles`,
+	},
 }
 
 // withRenamedTable temporarily renames a PostgreSQL table so the handler's
@@ -1275,6 +1279,29 @@ func TestGetUnifiedKeys_DM_DBError_Check(t *testing.T) {
 	// CodeInternalError on generic DB failure; client treats as retryable.
 	assert.Equal(t, e2eekeys.CodeInternalError, body.Code)
 	assert.False(t, body.Pending, "DB errors never set pending:true")
+}
+
+// TestGetUnifiedKeys_ChannelCheckDBError covers CV-CAN-005: the channel
+// VIEW/membership check in GetUnifiedKeys must fail CLOSED with a 500
+// (channel_check_db_error) when channelKeyAccess errors, rather than falling
+// through to the DM branch (which would yield a not-found oracle on a real DB
+// blip). Renaming channels makes channelKeyAccess error before the fallthrough.
+func TestGetUnifiedKeys_ChannelCheckDBError(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "gukchkerr1")
+	ctxID := uuid.NewString()
+
+	withRenamedTable(t, ts, "channels", func() {
+		w := ts.DoRequest("GET", pathE2EEKeys+ctxID, nil, testhelpers.AuthHeaders(user.AccessToken))
+		require.Equal(t, http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
+
+		var body e2eekeys.ErrorResponse
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, e2eekeys.KindUnknown, body.Kind,
+			"channel_check_db_error must envelope Kind=unknown, not leak DB state")
+		assert.Equal(t, e2eekeys.CodeInternalError, body.Code)
+		assert.False(t, body.Pending, "DB errors never set pending:true")
+	})
 }
 
 // TestGetUnifiedKeys_DM_DBError_KeyFetch covers the dm_key_fetch_db_error

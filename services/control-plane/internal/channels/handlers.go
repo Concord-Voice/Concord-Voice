@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -48,6 +49,7 @@ const (
 	errMsgFailedProcessRewrap     = "Failed to process rewrap request"
 	errMsgFailedEnrollRewrap      = "Failed to enroll rewrap request"
 	errMsgContextNotFound         = "Context not found"
+	errMsgContextNotFoundOrDenied = "Context not found or access denied"
 	errMsgNotMemberOrParticipant  = "Not a member or participant"
 	logMsgFailedCheckPermissions  = "Failed to check permissions"
 )
@@ -1124,6 +1126,59 @@ func (h *Handler) MarkServerRead(c *gin.Context) {
 }
 
 // GetChannelKeys returns the caller's wrapped channel key for an E2EE channel.
+// channelKeyAccess reports whether channelID is a channel the user is a member
+// of (isMember) and, if so, whether they hold the type-appropriate channel VIEW
+// permission (canView). It is the authorization primitive for E2EE channel-key
+// access (CV-CAN-005): server membership alone must not grant retrieval of a
+// hidden channel's wrapped key material, enroll the member for its key
+// distribution, or push a rotated key to them. When no RBAC resolver is
+// configured (tests) it falls back to membership-only (canView == isMember).
+// Returns isMember == false when channelID is not a channel or the user is not a
+// member (callers treat that as "route to the DM branch / deny").
+// sanitizeID strips CR/LF and other control characters from an id/label before
+// it is logged (CWE-117 log-forging defense). Applied uniformly to logged
+// user-derived strings — even structurally-safe uuids — per observability.md /
+// #1645. Package-local to avoid importing the websocket helper.
+func sanitizeID(s string) string {
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\r", "")
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func (h *Handler) channelKeyAccess(ctx context.Context, channelID, userID string) (isMember, canView bool, err error) {
+	var serverID, channelType string
+	qErr := h.db.QueryRowContext(ctx, `
+		SELECT c.server_id, c.type FROM channels c
+		INNER JOIN server_members sm ON c.server_id = sm.server_id AND sm.user_id = $2
+		WHERE c.id = $1
+	`, channelID, userID).Scan(&serverID, &channelType)
+	if qErr == sql.ErrNoRows {
+		return false, false, nil
+	}
+	if qErr != nil {
+		return false, false, qErr
+	}
+	if h.resolver == nil {
+		return true, true, nil
+	}
+	viewPerm := rbac.PermViewTextChannels
+	if channelType == "voice" {
+		viewPerm = rbac.PermViewVoiceChannels
+	}
+	allowed, permErr := h.resolver.HasPermission(ctx, serverID, userID, channelID, viewPerm)
+	if permErr != nil {
+		return true, false, permErr
+	}
+	return true, allowed, nil
+}
+
+// GetChannelKeys returns the caller's own wrapped channel key (optionally a
+// specific ?version=N) for an E2EE channel they can view.
 func (h *Handler) GetChannelKeys(c *gin.Context) {
 	userID := c.GetString("user_id")
 	channelID := c.Param("id")
@@ -1133,22 +1188,16 @@ func (h *Handler) GetChannelKeys(c *gin.Context) {
 		return
 	}
 
-	// Check membership (all channels are encrypted under E2EE-everywhere #201).
-	var isMember bool
-	err := h.db.QueryRow(
-		`SELECT EXISTS(
-			SELECT 1 FROM channels c
-			INNER JOIN server_members sm ON c.server_id = sm.server_id
-			WHERE c.id = $1 AND sm.user_id = $2
-		)`,
-		channelID, userID,
-	).Scan(&isMember)
+	// CV-CAN-005: channel-key fetch requires channel VIEW, not just server
+	// membership — a hidden-channel member must not retrieve wrapped CSK material.
+	// A non-member and a no-view member get the same 403 (no existence oracle).
+	isMember, canView, err := h.channelKeyAccess(c.Request.Context(), channelID, userID)
 	if err != nil {
 		h.log.Error("Failed to check channel access", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch channel keys"})
 		return
 	}
-	if !isMember {
+	if !isMember || !canView {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Not a member of this channel's server"})
 		return
 	}
@@ -1213,7 +1262,7 @@ func (h *Handler) DistributeChannelKeys(c *gin.Context) {
 		return
 	}
 
-	if err := h.verifyChannelEncrypted(channelID, userID); err != nil {
+	if err := h.verifyChannelEncrypted(c.Request.Context(), channelID, userID); err != nil {
 		h.respondKeyDistError(c, err)
 		return
 	}
@@ -1225,15 +1274,37 @@ func (h *Handler) DistributeChannelKeys(c *gin.Context) {
 
 	targetKeyVersion := h.resolveTargetKeyVersion(channelID, req.KeyVersion)
 
-	distributed, duplicates := h.distributeChannelKeysToMembers(channelID, req.WrappedKeys, targetKeyVersion)
+	distributed, duplicates, skippedErrors := h.distributeChannelKeysToMembers(channelID, req.WrappedKeys, targetKeyVersion)
 
 	h.log.Info("Channel keys distributed",
 		"channel_id", channelID, "by_user", userID,
-		"distributed", distributed, "duplicates", duplicates)
+		"distributed", distributed, "duplicates", duplicates, "skipped", skippedErrors)
+
+	// CV-CAN-005: distribution fails CLOSED — a channelKeyAccess resolver error
+	// skips the target rather than leaking a key. Skipped targets are enrolled
+	// into pending_key_requests for peer retry, but returning 200 here would let
+	// the caller (e.g. rotateChannelKey, which only checks res.ok and then
+	// invalidates its cache) treat a degraded rotation as fully successful and
+	// leave skipped members on a stale epoch with no synchronous signal. Return
+	// 503 so res.ok is false and the caller can retry the rotation; the counts
+	// stay in the body for observability.
+	if skippedErrors > 0 {
+		h.log.Warn("key distribution: targets skipped due to view-check errors (degraded rotation)",
+			"channel_id", sanitizeID(channelID), "by_user", sanitizeID(userID),
+			"skipped_errors", skippedErrors, "distributed", distributed)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":       "Some targets could not be verified and were skipped; retry",
+			"distributed": distributed,
+			"duplicates":  duplicates,
+			"skipped":     skippedErrors,
+		})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"distributed": distributed,
 		"duplicates":  duplicates,
+		"skipped":     skippedErrors,
 	})
 }
 
@@ -1244,22 +1315,20 @@ type keyDistError struct {
 
 func (e *keyDistError) Error() string { return e.message }
 
-func (h *Handler) verifyChannelEncrypted(channelID, userID string) error {
-	// All channels are encrypted under E2EE-everywhere (#201); only membership check remains.
-	var exists bool
-	err := h.db.QueryRow(
-		`SELECT EXISTS(
-			SELECT 1 FROM channels c
-			INNER JOIN server_members sm ON c.server_id = sm.server_id
-			WHERE c.id = $1 AND sm.user_id = $2
-		)`,
-		channelID, userID,
-	).Scan(&exists)
+func (h *Handler) verifyChannelEncrypted(ctx context.Context, channelID, userID string) error {
+	// All channels are encrypted under E2EE-everywhere (#201). CV-CAN-005: the
+	// distributor must currently hold channel VIEW, not merely server membership
+	// plus a (possibly stale) key. Without this a hidden-channel member who kept
+	// an old key row could still POST wraps/rotations for visible targets (and
+	// DistributeUnifiedKeys delegates here after a membership-only probe, so the
+	// same gap applies there). Fail closed on a resolver error — do not fall back
+	// to membership-only on the write path.
+	isMember, canView, err := h.channelKeyAccess(ctx, channelID, userID)
 	if err != nil {
 		h.log.Error(logMsgFailedCheckPermissions, "error", err)
 		return &keyDistError{http.StatusInternalServerError, errMsgFailedDistributeKeys}
 	}
-	if !exists {
+	if !isMember || !canView {
 		return &keyDistError{http.StatusForbidden, "Not a member of this channel's server"}
 	}
 	return nil
@@ -1294,9 +1363,39 @@ func (h *Handler) resolveTargetKeyVersion(channelID string, explicitVersion *int
 	return v
 }
 
-func (h *Handler) distributeChannelKeysToMembers(channelID string, wrappedKeys map[string]string, keyVersion int) (distributed, duplicates int) {
+func (h *Handler) distributeChannelKeysToMembers(channelID string, wrappedKeys map[string]string, keyVersion int) (distributed, duplicates, skippedErrors int) {
+	ctx := context.Background()
 	for memberUserID, wrappedKey := range wrappedKeys {
 		if _, parseErr := uuid.Parse(memberUserID); parseErr != nil {
+			continue
+		}
+
+		// CV-CAN-005: do not distribute a channel key to a target lacking channel
+		// VIEW (or that is not a member). Fail CLOSED — skip on a definite deny
+		// AND on a resolver error. A persistent resolver failure must not silently
+		// degrade this security gate back to membership-only and re-open the hole
+		// this change closes. Distribution is retryable and eventually consistent
+		// (the pending_key_requests row survives), so a skipped target is picked
+		// up on a later attempt once the resolver recovers, rather than being
+		// stranded.
+		_, canView, vErr := h.channelKeyAccess(ctx, channelID, memberUserID)
+		if vErr != nil {
+			// Fail CLOSED: skip rather than leak. A target skipped on a transient
+			// error during a rotation has no channel_keys row at the new epoch and
+			// (unlike a pending-fulfillment target) no pending_key_requests row, so
+			// nothing would ever retry it — leaving a legitimate member stranded.
+			// Enroll it into the peer-fulfillment queue (idempotent) so a viewer
+			// re-delivers the key once the resolver recovers. Fulfillment re-checks
+			// VIEW, so this cannot re-open CV-CAN-005 for a genuinely no-view user.
+			if _, enrollErr := h.enrollPending("channel", channelID, memberUserID); enrollErr != nil {
+				h.log.Error("key distribution: failed to enroll skipped target for retry",
+					"error", enrollErr, "channel_id", sanitizeID(channelID), "user_id", sanitizeID(memberUserID))
+			}
+			h.log.Error("key distribution: view check failed; skipping target (fail closed, enrolled for retry)", "error", vErr, "user_id", sanitizeID(memberUserID))
+			skippedErrors++
+			continue
+		}
+		if !canView {
 			continue
 		}
 
@@ -1324,7 +1423,7 @@ func (h *Handler) distributeChannelKeysToMembers(channelID string, wrappedKeys m
 		h.notifyKeyDelivered(channelID, memberUserID)
 		distributed++
 	}
-	return distributed, duplicates
+	return distributed, duplicates, skippedErrors
 }
 
 func (h *Handler) notifyKeyDelivered(contextID, memberUserID string) {
@@ -1345,6 +1444,15 @@ func (h *Handler) notifyKeyDelivered(contextID, memberUserID string) {
 }
 
 // GetPendingKeyRequests returns pending key requests for channels the caller can service.
+// pendingKeyRequest is a single pending E2EE key request row (channel or DM)
+// returned by GetPendingKeyRequests.
+type pendingKeyRequest struct {
+	ID        string `json:"id"`
+	ChannelID string `json:"channel_id"`
+	UserID    string `json:"user_id"`
+	CreatedAt string `json:"created_at"`
+}
+
 func (h *Handler) GetPendingKeyRequests(c *gin.Context) {
 	userID := c.GetString("user_id")
 
@@ -1362,30 +1470,67 @@ func (h *Handler) GetPendingKeyRequests(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch pending key requests"})
 		return
 	}
-	defer func() { _ = rows.Close() }()
-
-	type pendingRequest struct {
-		ID        string `json:"id"`
-		ChannelID string `json:"channel_id"`
-		UserID    string `json:"user_id"`
-		CreatedAt string `json:"created_at"`
-	}
-	requests := []pendingRequest{}
+	// Drain the cursor fully before running the per-request VIEW filter below.
+	// The filter calls channelKeyAccess (a DB query + RBAC resolver lookup) per
+	// row, so filtering inline would hold this cursor's pooled connection open
+	// for the duration of N round-trips (CV-CAN-005 review). Collect first, then
+	// close, then filter.
+	candidates := make([]pendingKeyRequest, 0)
 	for rows.Next() {
-		var req pendingRequest
+		var req pendingKeyRequest
 		if err := rows.Scan(&req.ID, &req.ChannelID, &req.UserID, &req.CreatedAt); err != nil {
 			h.log.Error("Failed to scan pending request", "error", err)
 			continue
 		}
-		requests = append(requests, req)
+		candidates = append(candidates, req)
 	}
-	if err := rows.Err(); err != nil {
-		h.log.Error("Error iterating pending requests", "error", err)
+	rowsErr := rows.Err()
+	_ = rows.Close()
+	if rowsErr != nil {
+		h.log.Error("Error iterating pending requests", "error", rowsErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch pending key requests"})
 		return
 	}
 
-	// Also fetch DM pending key requests
+	requests := h.filterVisiblePendingRequests(c.Request.Context(), userID, candidates)
+	requests = h.appendDMPendingRequests(userID, requests)
+
+	c.JSON(http.StatusOK, gin.H{"pending_requests": requests})
+}
+
+// filterVisiblePendingRequests drops channel pending requests the caller may no
+// longer VIEW. The source query selected channels solely because the CALLER
+// holds a channel_keys row; CV-CAN-005 requires that a caller who received a key
+// and was later denied VIEW is neither shown nor prompted to fulfill a hidden
+// channel's pending queue. Gate the caller's own VIEW per channel (memoised —
+// many pending requests share a channel), then also drop requests whose
+// requester no longer holds VIEW (defence in depth). Fail CLOSED on a resolver
+// error so a persistent failure cannot re-expose a hidden channel's queue.
+func (h *Handler) filterVisiblePendingRequests(ctx context.Context, callerID string, candidates []pendingKeyRequest) []pendingKeyRequest {
+	requests := []pendingKeyRequest{}
+	callerCanView := make(map[string]bool, len(candidates))
+	for _, req := range candidates {
+		canView, known := callerCanView[req.ChannelID]
+		if !known {
+			_, cv, vErr := h.channelKeyAccess(ctx, req.ChannelID, callerID)
+			canView = vErr == nil && cv
+			callerCanView[req.ChannelID] = canView
+		}
+		if !canView {
+			continue
+		}
+		if _, cv, vErr := h.channelKeyAccess(ctx, req.ChannelID, req.UserID); vErr != nil || !cv {
+			continue
+		}
+		requests = append(requests, req)
+	}
+	return requests
+}
+
+// appendDMPendingRequests appends the caller's DM pending key requests to
+// requests. DM membership is scoped by the dm_channel_keys join, so no extra
+// VIEW gate applies here.
+func (h *Handler) appendDMPendingRequests(userID string, requests []pendingKeyRequest) []pendingKeyRequest {
 	dmQuery := `
 		SELECT dpkr.id, dpkr.conversation_id, dpkr.user_id, dpkr.created_at
 		FROM dm_pending_key_requests dpkr
@@ -1394,18 +1539,18 @@ func (h *Handler) GetPendingKeyRequests(c *gin.Context) {
 		ORDER BY dpkr.created_at ASC
 	`
 	dmRows, dmErr := h.db.Query(dmQuery, userID)
-	if dmErr == nil {
-		defer func() { _ = dmRows.Close() }()
-		for dmRows.Next() {
-			var req pendingRequest
-			if err := dmRows.Scan(&req.ID, &req.ChannelID, &req.UserID, &req.CreatedAt); err != nil {
-				continue
-			}
-			requests = append(requests, req)
-		}
+	if dmErr != nil {
+		return requests
 	}
-
-	c.JSON(http.StatusOK, gin.H{"pending_requests": requests})
+	defer func() { _ = dmRows.Close() }()
+	for dmRows.Next() {
+		var req pendingKeyRequest
+		if err := dmRows.Scan(&req.ID, &req.ChannelID, &req.UserID, &req.CreatedAt); err != nil {
+			continue
+		}
+		requests = append(requests, req)
+	}
+	return requests
 }
 
 // GetUnifiedKeys resolves a context_id to either a server channel or DM conversation
@@ -1429,16 +1574,11 @@ func (h *Handler) GetUnifiedKeys(c *gin.Context) {
 		return
 	}
 
-	// Under E2EE-everywhere (#201) all channels are encrypted; only existence + membership matters.
-	var channelExists bool
-	err := h.db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM channels c
-			INNER JOIN server_members sm ON c.server_id = sm.server_id AND sm.user_id = $2
-			WHERE c.id = $1
-		)
-	`, contextID, userID).Scan(&channelExists)
-
+	// Under E2EE-everywhere (#201) all channels are encrypted; membership +
+	// channel VIEW (CV-CAN-005) gate channel-key access. A member without VIEW is
+	// routed to the DM branch, which returns not-found — so a hidden channel is
+	// indistinguishable from a non-existent context (no existence oracle).
+	isMember, canView, err := h.channelKeyAccess(c.Request.Context(), contextID, userID)
 	if err != nil {
 		h.log.Error("e2ee key fetch: channel check failed",
 			"kind", "channel_check_db_error",
@@ -1452,7 +1592,7 @@ func (h *Handler) GetUnifiedKeys(c *gin.Context) {
 		})
 		return
 	}
-	if channelExists {
+	if isMember && canView {
 		h.getChannelKeyResponse(c, contextID, userID)
 		return
 	}
@@ -1521,15 +1661,11 @@ func (h *Handler) RequestRewrap(c *gin.Context) {
 		return
 	}
 
-	// Resolve channel vs DM
-	var isChannel bool
-	err := h.db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM channels c
-			INNER JOIN server_members sm ON c.server_id = sm.server_id AND sm.user_id = $2
-			WHERE c.id = $1
-		)
-	`, contextID, userID).Scan(&isChannel)
+	// Resolve channel vs DM. CV-CAN-005: channel-key rewrap enrollment requires
+	// channel VIEW, not just membership — a hidden-channel member must not enroll
+	// for its key distribution. A no-view member routes to the DM branch, which
+	// returns not-found (no existence oracle).
+	isChannel, canView, err := h.channelKeyAccess(c.Request.Context(), contextID, userID)
 	if err != nil {
 		h.log.Error("re_wrap_request: channel check failed",
 			"kind", "re_wrap_check_db_error",
@@ -1540,8 +1676,22 @@ func (h *Handler) RequestRewrap(c *gin.Context) {
 		return
 	}
 
-	if isChannel {
+	if isChannel && canView {
 		h.enrollChannelRewrap(c, contextID, userID)
+		return
+	}
+
+	// CV-CAN-005: a member without channel VIEW must be indistinguishable from a
+	// caller probing a non-existent context. Falling through to enrollDMRewrap
+	// would reach respondNotMemberOrUnknown, which returns 403 for an existing
+	// (hidden) channel but 404 for an unknown context — an existence oracle. Emit
+	// the same 404 an unknown context yields instead of leaking existence via 403.
+	if isChannel {
+		h.log.Info("re_wrap_request: no-view channel member",
+			"kind", "re_wrap_no_view",
+			"context_id", sanitizeID(contextID),
+			"user_id", sanitizeID(userID))
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgContextNotFound})
 		return
 	}
 
@@ -1800,7 +1950,7 @@ func (h *Handler) getDMKeyResponse(c *gin.Context, contextID, userID string) {
 			"context_id", contextID,
 			"user_id", userID)
 		c.JSON(http.StatusNotFound, e2eekeys.ErrorResponse{
-			Error: "Context not found or access denied",
+			Error: errMsgContextNotFoundOrDenied,
 			Code:  e2eekeys.CodeNotMember,
 			Kind:  e2eekeys.KindUnknown,
 		})
@@ -1919,23 +2069,39 @@ func (h *Handler) DistributeUnifiedKeys(c *gin.Context) {
 	// DistributeChannelKeys will parse the body itself; parsing here would
 	// consume the one-shot io.ReadCloser, causing a double-read 400 on delegation.
 
-	var isChannel bool
-	err := h.db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM channels c
-			INNER JOIN server_members sm ON c.server_id = sm.server_id AND sm.user_id = $2
-			WHERE c.id = $1
-		)
-	`, contextID, userID).Scan(&isChannel)
+	// CV-CAN-005: gate the channel branch on channel VIEW, not mere server
+	// membership. Delegating to DistributeChannelKeys for a member who lacks VIEW
+	// would return 403, while an unknown context falls through to the DM branch
+	// below and returns 404 — a hidden-channel existence oracle. Mirror the
+	// unified GET/rewrap paths: a no-view member gets the same 404 as an unknown
+	// context. channelKeyAccess fails closed on a resolver error (returns err),
+	// matching the 500 those paths emit.
+	isMember, canView, err := h.channelKeyAccess(c.Request.Context(), contextID, userID)
 	if err != nil {
-		h.log.Error("Failed to check channel", "error", err)
+		h.log.Error("unified key distribution: channel check failed",
+			"kind", "distribute_channel_check_db_error",
+			"context_id", sanitizeID(contextID),
+			"user_id", sanitizeID(userID),
+			"error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDistributeKeys})
 		return
 	}
 
-	if isChannel {
+	if isMember && canView {
 		c.Params = append(c.Params, gin.Param{Key: "id", Value: contextID})
 		h.DistributeChannelKeys(c)
+		return
+	}
+
+	if isMember {
+		// Server member without channel VIEW: do not reveal the hidden channel's
+		// existence via a 403. Emit the same not-found the DM branch yields for an
+		// unknown context.
+		h.log.Info("unified key distribution: no-view channel member",
+			"kind", "distribute_no_view",
+			"context_id", sanitizeID(contextID),
+			"user_id", sanitizeID(userID))
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgContextNotFoundOrDenied})
 		return
 	}
 
@@ -1948,7 +2114,7 @@ func (h *Handler) DistributeUnifiedKeys(c *gin.Context) {
 		)
 	`, contextID, userID).Scan(&isDM)
 	if err != nil || !isDM {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Context not found or access denied"})
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgContextNotFoundOrDenied})
 		return
 	}
 

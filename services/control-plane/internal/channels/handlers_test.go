@@ -417,6 +417,312 @@ func TestGetChannelKeysNotMember(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
+// TestGetChannelKeys_HiddenChannelDeniedToMember covers CV-CAN-005: a member
+// denied channel view must not retrieve wrapped channel-key material, even if a
+// key row was previously stored for them.
+func TestGetChannelKeys_HiddenChannelDeniedToMember(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	member := ts.CreateTestUser(t, "keynoview")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+
+	// Owner distributes a key to the member while they still have view.
+	distRec := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{member.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, distRec.Code)
+
+	// Now deny view on the channel for the default role.
+	var allRoleID string
+	require.NoError(t, ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID))
+	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+	// The key distribution above cached the member's (then-allowed) view
+	// permission. The direct-DB CreateChannelOverride helper does not invalidate
+	// the RBAC permission cache the way the production override handler does
+	// (internal/rbac/handlers.go), so invalidate it here to reflect the deny —
+	// otherwise the stale cache entry masks the CV-CAN-005 gate.
+	require.NoError(t, rbac.NewPermissionCache(ts.Redis).InvalidateServer(context.Background(), serverID))
+
+	w := ts.DoRequest("GET", pathChannelsPrefix+channelID+pathKeys, nil, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code, "view-denied member must not fetch channel keys")
+}
+
+// TestDistributeChannelKeys_SkipsNoViewTarget covers CV-CAN-005: key distribution
+// must skip a target lacking channel view (they must not be enrolled for a hidden
+// channel's key distribution).
+func TestDistributeChannelKeys_SkipsNoViewTarget(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	member := ts.CreateTestUser(t, "distnoview")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+
+	var allRoleID string
+	require.NoError(t, ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID))
+	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{member.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, float64(0), body["distributed"], "no-view target must be skipped by distribution")
+}
+
+// TestDistributeChannelKeys_CallerDeniedViewForbidden covers CV-CAN-005: the
+// distributor (caller) is gated on channel VIEW, not just membership + a stored
+// key. A member who received a key and was later denied VIEW must not be able to
+// push wraps/rotations for a hidden channel.
+func TestDistributeChannelKeys_CallerDeniedViewForbidden(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	member := ts.CreateTestUser(t, "distcallernoview")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+
+	// Owner gives the member a key while they still have view, so callerHasChannelKey
+	// would pass — isolating the new VIEW gate as the reason for the 403.
+	distRec := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{member.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, distRec.Code)
+
+	// Deny view for the default role and invalidate the RBAC cache.
+	var allRoleID string
+	require.NoError(t, ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID))
+	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+	require.NoError(t, rbac.NewPermissionCache(ts.Redis).InvalidateServer(context.Background(), serverID))
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{owner.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code, "view-denied distributor must be blocked")
+}
+
+// TestRequestRewrap_HiddenChannelDeniedMemberNoOracle covers CV-CAN-005: a
+// member denied channel view who POSTs /rewrap must get the SAME not-found
+// response an unknown context yields (404), not the 403 that would leak the
+// hidden channel's existence, and must not be enrolled for key distribution.
+func TestRequestRewrap_HiddenChannelDeniedMemberNoOracle(t *testing.T) {
+	ts, _, serverID, channelID := setupEncryptedChannel(t)
+	member := ts.CreateTestUser(t, "rewrapnoview")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+
+	var allRoleID string
+	require.NoError(t, ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID))
+	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+	require.NoError(t, rbac.NewPermissionCache(ts.Redis).InvalidateServer(context.Background(), serverID))
+
+	hidden := ts.DoRequest("POST", "/api/v1/e2ee/keys/"+channelID+"/rewrap", nil, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusNotFound, hidden.Code, "hidden channel must not be distinguishable via 403")
+
+	unknown := ts.DoRequest("POST", "/api/v1/e2ee/keys/00000000-0000-0000-0000-000000000000/rewrap", nil, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusNotFound, unknown.Code, "unknown context yields the same 404")
+
+	var count int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`,
+		channelID, member.ID,
+	).Scan(&count))
+	assert.Equal(t, 0, count, "no-view member must not be enrolled")
+}
+
+// TestDistributeUnifiedKeys_HiddenChannelNoViewNoOracle covers CV-CAN-005: a
+// server member denied channel VIEW who POSTs to the unified distribute route
+// (POST /api/v1/e2ee/keys/:context_id) must get the SAME not-found (404) an
+// unknown context yields — not the 403 that delegating to DistributeChannelKeys
+// would leak — otherwise the endpoint is a hidden-channel existence oracle.
+func TestDistributeUnifiedKeys_HiddenChannelNoViewNoOracle(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	member := ts.CreateTestUser(t, "duknoview")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+
+	// Give the member a key while they still have view so callerHasChannelKey
+	// would pass — isolating the VIEW gate (not the has-key gate) as the reason
+	// the hidden channel stays indistinguishable from an unknown context.
+	distRec := ts.DoRequest("POST", pathE2EEKeys+channelID, map[string]interface{}{
+		keyWrappedKeys: map[string]string{member.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, distRec.Code)
+
+	// Deny view for the member via a user override, then invalidate RBAC cache.
+	ts.CreateChannelOverride(t, channelID, "user", member.ID, 0, int64(rbac.PermViewTextChannels))
+	require.NoError(t, rbac.NewPermissionCache(ts.Redis).InvalidateServer(context.Background(), serverID))
+
+	hidden := ts.DoRequest("POST", pathE2EEKeys+channelID, map[string]interface{}{
+		keyWrappedKeys: map[string]string{owner.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusNotFound, hidden.Code, "hidden channel must not be distinguishable via 403; body: %s", hidden.Body.String())
+
+	unknown := ts.DoRequest("POST", pathE2EEKeys+"00000000-0000-0000-0000-000000000000", map[string]interface{}{
+		keyWrappedKeys: map[string]string{owner.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusNotFound, unknown.Code, "unknown context must yield the same 404")
+
+	assert.JSONEq(t, hidden.Body.String(), unknown.Body.String(), "no-view and unknown-context responses must be byte-identical (no oracle)")
+}
+
+// TestDistributeUnifiedKeys_ChannelCheckDBErrorFailsClosed covers CV-CAN-005:
+// when the channel VIEW/membership check errors on the unified distribute route,
+// the endpoint must fail CLOSED with a 500 rather than fall through to the DM
+// branch or delegate. Renaming channels makes channelKeyAccess error.
+func TestDistributeUnifiedKeys_ChannelCheckDBErrorFailsClosed(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "dukdberr")
+	channelID := uuid.NewString()
+
+	withRenamedTable(t, ts, "channels", func() {
+		w := ts.DoRequest("POST", pathE2EEKeys+channelID, map[string]interface{}{
+			keyWrappedKeys: map[string]string{user.ID: testhelpers.ValidCiphertext()},
+		}, testhelpers.AuthHeaders(user.AccessToken))
+		require.Equal(t, http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, "Failed to distribute keys", body["error"])
+	})
+}
+
+// TestGetPendingKeyRequests_CallerDeniedViewHidesQueue covers CV-CAN-005: the
+// pending-keys endpoint must not surface a channel's queue to a caller who holds
+// a (stale) key but has since been denied channel view — otherwise a hidden
+// channel's queue is exposed and the no-view caller is prompted to fulfill it.
+func TestGetPendingKeyRequests_CallerDeniedViewHidesQueue(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	caller := ts.CreateTestUser(t, "pendcallernoview")
+	ts.AddMemberToServer(t, serverID, caller.ID, roleMember)
+	requester := ts.CreateTestUser(t, "pendrequester")
+	ts.AddMemberToServer(t, serverID, requester.ID, roleMember)
+
+	// Caller receives a key, so they appear as a servicer in the outer query.
+	distRec := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{caller.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, distRec.Code)
+
+	// Requester (still has view) enrolls a pending request for the channel.
+	enroll := ts.DoRequest("POST", "/api/v1/e2ee/keys/"+channelID+"/rewrap", nil, testhelpers.AuthHeaders(requester.AccessToken))
+	require.Equal(t, http.StatusAccepted, enroll.Code)
+
+	// Deny view for the caller only (user override → priority over the default role),
+	// leaving the requester's view intact so this isolates the caller-side gate.
+	ts.CreateChannelOverride(t, channelID, "user", caller.ID, 0, int64(rbac.PermViewTextChannels))
+	require.NoError(t, rbac.NewPermissionCache(ts.Redis).InvalidateServer(context.Background(), serverID))
+
+	w := ts.DoRequest("GET", "/api/v1/e2ee/pending-keys", nil, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	requests := body["pending_requests"].([]interface{})
+	assert.Empty(t, requests, "view-denied caller must not be shown a hidden channel's pending queue")
+}
+
+// TestGetChannelKeys_ChannelAccessDBError covers CV-CAN-005: when the channel
+// VIEW/membership check itself errors (DB failure inside channelKeyAccess),
+// GetChannelKeys must fail CLOSED with a 500 rather than leak key material or
+// degrade to allow. Renaming channels makes the access query error.
+func TestGetChannelKeys_ChannelAccessDBError(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "gckdberr1")
+	channelID := uuid.NewString()
+
+	withRenamedTable(t, ts, "channels", func() {
+		w := ts.DoRequest("GET", pathChannelsPrefix+channelID+pathKeys, nil, testhelpers.AuthHeaders(user.AccessToken))
+		assert.Equal(t, http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, "Failed to fetch channel keys", body["error"])
+	})
+}
+
+// TestDistributeChannelKeys_VerifyDBError covers CV-CAN-005: verifyChannelEncrypted
+// must fail CLOSED with a 500 when the distributor's VIEW check errors, rather
+// than falling back to membership-only and allowing a write. Renaming channels
+// makes channelKeyAccess error before the caller-has-key check runs.
+func TestDistributeChannelKeys_VerifyDBError(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "dckdberr1")
+	channelID := uuid.NewString()
+
+	withRenamedTable(t, ts, "channels", func() {
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+			keyWrappedKeys: map[string]string{user.ID: testhelpers.ValidCiphertext()},
+		}, testhelpers.AuthHeaders(user.AccessToken))
+		assert.Equal(t, http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, "Failed to distribute keys", body["error"])
+	})
+}
+
+// TestDistributeChannelKeys_SkippedOnResolverError surfaces the CV-CAN-005
+// fail-closed observability contract: when a target's VIEW check ERRORS (not a
+// definite deny), the target is skipped, counted in the response `skipped`
+// field, enrolled into pending_key_requests for peer retry, and the endpoint
+// returns 503 (not a silent 200/distributed:0) so a rotation caller can retry
+// instead of treating the degraded rotation as success. The owner-caller still
+// passes because server owners short-circuit RBAC before the roles lookup;
+// renaming roles makes only the non-owner target's resolver lookup error,
+// isolating the skipped-on-error branch.
+func TestDistributeChannelKeys_SkippedOnResolverError(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	target := ts.CreateTestUser(t, "distskiperr")
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+
+	// Force a fresh compute path for the target (owner bypasses roles via
+	// ownership, so its check is unaffected by the rename below).
+	require.NoError(t, rbac.NewPermissionCache(ts.Redis).InvalidateServer(context.Background(), serverID))
+
+	withRenamedTable(t, ts, "roles", func() {
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+			keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		}, testhelpers.AuthHeaders(owner.AccessToken))
+
+		require.Equal(t, http.StatusServiceUnavailable, w.Code, "degraded rotation must not report success; body: %s", w.Body.String())
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, float64(0), body["distributed"], "resolver-errored target must not receive a key (fail closed)")
+		assert.Equal(t, float64(1), body["skipped"], "resolver-errored target must be counted in skipped")
+	})
+
+	// Self-heal: the skipped target is enrolled into the peer-fulfillment queue
+	// so it recovers once the resolver is healthy, instead of being stranded with
+	// no pending request to retry.
+	var count int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`,
+		channelID, target.ID,
+	).Scan(&count))
+	assert.Equal(t, 1, count, "skipped-on-error target must be enrolled for retry")
+}
+
+// TestGetPendingKeyRequests_CallerViewDBErrorFailsClosed covers CV-CAN-005: when
+// the caller's per-channel VIEW check errors, the pending-keys endpoint must fail
+// CLOSED (drop the request) rather than surface a hidden channel's queue. The
+// outer pkr⋈channel_keys query does not touch channels, so renaming channels
+// makes only channelKeyAccess error — isolating the fail-closed error branch.
+func TestGetPendingKeyRequests_CallerViewDBErrorFailsClosed(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	caller := ts.CreateTestUser(t, "pendcallerdberr")
+	ts.AddMemberToServer(t, serverID, caller.ID, roleMember)
+	requester := ts.CreateTestUser(t, "pendrequesterdberr")
+	ts.AddMemberToServer(t, serverID, requester.ID, roleMember)
+
+	distRec := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{caller.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, distRec.Code)
+
+	enroll := ts.DoRequest("POST", "/api/v1/e2ee/keys/"+channelID+"/rewrap", nil, testhelpers.AuthHeaders(requester.AccessToken))
+	require.Equal(t, http.StatusAccepted, enroll.Code)
+
+	// The outer pkr⋈channel_keys query does not touch channels, so renaming
+	// channels makes only the per-candidate channelKeyAccess error.
+	withRenamedTable(t, ts, "channels", func() {
+		w := ts.DoRequest("GET", "/api/v1/e2ee/pending-keys", nil, testhelpers.AuthHeaders(caller.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		requests := body["pending_requests"].([]interface{})
+		assert.Empty(t, requests, "caller VIEW-check DB error must fail closed (hide the queue)")
+	})
+}
+
 func TestGetChannelKeysInvalidChannelID(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "badchid")
