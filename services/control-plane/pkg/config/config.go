@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -626,6 +627,16 @@ func (c *Config) validate() error {
 		// surface / canonical-consumer path.
 		{os.Getenv("CONCORD_ENV") == "test",
 			"CONCORD_ENV=test is forbidden when ENVIRONMENT=production (would relax auth rate limits and leak verification codes)."},
+		// CV-CAN-014 — a wildcard ALLOWED_ORIGINS is a CWE-942 credentialed
+		// cross-origin hijack: middleware/cors.go reflects the request Origin
+		// AND sets Access-Control-Allow-Credentials: true when the allowlist
+		// contains "*", and the WebSocket upgrader (websocket/handler.go)
+		// treats "*" as allow-all. The media-plane config loader already
+		// fatal-exits on this; mirror it here. The runtime "*" parity branch in
+		// cors.go / handler.go stays for dev/staging operators — validate()
+		// early-returns for non-production, so only production is guarded.
+		{slices.Contains(c.AllowedOrigins, "*"),
+			"ALLOWED_ORIGINS may not contain '*' in production. CORS sets Access-Control-Allow-Credentials: true (and the WebSocket upgrader treats '*' as allow-all); a wildcard credentialed origin is CWE-942 cross-origin hijack. Set an explicit comma-separated allowlist."},
 	}
 
 	for _, g := range guards {
