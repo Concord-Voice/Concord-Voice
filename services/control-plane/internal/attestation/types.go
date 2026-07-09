@@ -3,6 +3,8 @@
 package attestation
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
@@ -204,6 +206,32 @@ type TokenRecord struct {
 	Version    string    `json:"version"`
 	SpaVersion string    `json:"spa_version"`
 	IssuedAt   time.Time `json:"issued_at"`
+	// UserID binds the token to the authenticated user that minted it
+	// (CV-CAN-013), so a token issued for one user cannot satisfy enforcement
+	// for another. It stores HashUserID(user_id), a SHA-256 digest rather than
+	// the raw user_id, so this Redis-resident (short-TTL) record carries no
+	// direct user identifier, matching the PII-free posture of the attestation
+	// subsystem (ADR-0010 D7) and sparing GDPR Article 17 erasure from having
+	// to chase down attestation:* keys. Empty on legacy records minted before
+	// this field existed: the middleware treats an empty UserID as unbound
+	// (accept) for rolling deploys; newly minted records always carry it.
+	UserID string `json:"user_id,omitempty"`
+}
+
+// HashUserID derives the value stored in TokenRecord.UserID for the CV-CAN-013
+// ownership binding: a hex-encoded SHA-256 digest of the authenticated user_id
+// rather than the raw identifier. Storing a digest keeps the token record free
+// of a direct user identifier (ADR-0010 D7 PII-free posture) while preserving
+// the binding property: the digest is deterministic, so mint and enforcement
+// compare identically. user_id is a high-entropy UUID, so the unsalted digest
+// is not practically reversible or enumerable. Empty in ⇒ empty out, so legacy
+// unbound records stay unbound.
+func HashUserID(userID string) string {
+	if userID == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(userID))
+	return hex.EncodeToString(sum[:])
 }
 
 // DownloadHelpURLDefault is the user-facing download page URL surfaced

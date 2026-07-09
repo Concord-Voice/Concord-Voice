@@ -65,3 +65,21 @@ func TestParsePlatform_ErrorIs(t *testing.T) {
 	assert.True(t, errors.Is(err, attestation.ErrInvalidPlatform),
 		"ParsePlatform error must wrap ErrInvalidPlatform")
 }
+
+// TestHashUserID covers the CV-CAN-013 ownership-binding digest: empty in →
+// empty out (legacy unbound records stay unbound), the output is deterministic
+// and non-raw (no direct identifier persisted), and distinct users produce
+// distinct digests (the binding actually discriminates).
+func TestHashUserID(t *testing.T) {
+	assert.Equal(t, "", attestation.HashUserID(""),
+		"empty user_id must stay empty so legacy records remain unbound")
+
+	const userA = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+	digest := attestation.HashUserID(userA)
+	assert.NotEmpty(t, digest)
+	assert.NotEqual(t, userA, digest, "raw user_id must never be the stored value")
+	assert.Equal(t, digest, attestation.HashUserID(userA), "digest must be deterministic")
+	assert.Len(t, digest, 64, "hex-encoded SHA-256 is 64 chars")
+	assert.NotEqual(t, digest, attestation.HashUserID("00000000-0000-0000-0000-000000000000"),
+		"distinct users must produce distinct digests")
+}

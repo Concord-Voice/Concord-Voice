@@ -130,6 +130,22 @@ func loadAndAuthenticateToken(
 		rejectAtt(c, log, rdb, attestation.ErrInvalid)
 		return attestation.TokenRecord{}, false
 	}
+	// CV-CAN-013: reject a token whose bound minting user does not match the
+	// authenticated caller, so a token issued for one user cannot satisfy
+	// enforcement for another. rec.UserID stores HashUserID(user_id), so the
+	// caller's id is hashed the same way before comparison. Legacy records
+	// (empty UserID, minted before the binding existed) are treated as unbound
+	// (accept) so a rolling deploy does not invalidate in-flight tokens.
+	//
+	// This is a post-load path: the token has already been authenticated
+	// (constant-time match above), so rec.Version is a trustworthy attribution
+	// and we reject via rejectAttForVersion (mirroring the revoked path) so
+	// the attestation.rejected log retains the release attribution operators
+	// need for CV-CAN-013 investigations.
+	if rec.UserID != "" && rec.UserID != attestation.HashUserID(c.GetString("user_id")) {
+		rejectAttForVersion(c, log, rdb, attestation.ErrInvalid, rec.Version)
+		return attestation.TokenRecord{}, false
+	}
 	return rec, true
 }
 

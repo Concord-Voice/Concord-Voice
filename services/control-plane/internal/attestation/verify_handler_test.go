@@ -245,6 +245,11 @@ func TestVerifyHandler_StoresTokenInRedis(t *testing.T) {
 	require.Equal(t, "0.2.7", rec.Version)
 	require.Equal(t, "a1b2c3d", rec.SpaVersion)
 	require.NotEmpty(t, rec.Token)
+	// CV-CAN-013: the token is bound to the minting user, stored as a SHA-256
+	// digest (never the raw user_id), so the Redis record carries no direct
+	// user identifier.
+	require.Equal(t, attestation.HashUserID("user-1"), rec.UserID)
+	require.NotEqual(t, "user-1", rec.UserID)
 }
 
 // TestVerifyHandler_MalformedJSON_400 covers the c.ShouldBindJSON error

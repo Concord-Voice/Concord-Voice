@@ -119,6 +119,10 @@ func (h *Handler) issueToken(ctx context.Context, c *gin.Context, sessionID stri
 		Version:    p.Version,
 		SpaVersion: p.SpaVersion,
 		IssuedAt:   time.Now(),
+		// CV-CAN-013: bind the token to the authenticated minting user. Stored
+		// as a SHA-256 digest (HashUserID), never the raw user_id, so the
+		// Redis record holds no direct user identifier.
+		UserID: HashUserID(c.GetString("user_id")),
 	}
 	bs, err := json.Marshal(record)
 	if err != nil {
