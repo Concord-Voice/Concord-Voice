@@ -23,6 +23,7 @@ import { useUpdateStatusStore } from '../stores/updateStatusStore';
 import {
   useVoiceStore,
   AUDIO_QUALITY_TIERS,
+  MAX_TUNED_SCREEN_SHARES,
   type AudioQualityTier,
   type VoiceParticipant,
 } from '../stores/voiceStore';
@@ -186,6 +187,10 @@ function handleScreenCaptureNotAllowed(captureErr: unknown): boolean {
   return false;
 }
 
+/** Sentinel consumerId marking the LOCAL user's own screen share in
+ *  tunedInScreenShares — there is no real consumer for your own stream. */
+const LOCAL_SCREEN_CONSUMER_ID = 'local-screen';
+
 /** Update voice/user stores when screen sharing starts. */
 function updateStoreForScreenShare(producerId: string, screenStream: MediaStream | null): void {
   const store = useVoiceStore.getState();
@@ -197,7 +202,17 @@ function updateStoreForScreenShare(producerId: string, screenStream: MediaStream
       isScreenSharing: true,
     });
   }
-  store.tuneIn(producerId, 'local-screen');
+  if (localUserId) {
+    const localParticipant = store.participants[localUserId];
+    store.registerActiveScreenShare({
+      producerId,
+      userId: localUserId,
+      username: localParticipant?.username ?? 'You',
+      displayName: localParticipant?.displayName,
+      isLocal: true,
+    });
+  }
+  store.tuneIn(producerId, LOCAL_SCREEN_CONSUMER_ID);
   if (!store.dominantScreenShareId) {
     store.setDominantScreenShare(producerId);
   }
@@ -324,6 +339,9 @@ class VoiceService {
   // Pending screen-audio producers from remote users (userId → producerId)
   // Consumed when the local user tunes into the corresponding screen share
   private readonly pendingScreenAudioProducers: Map<string, string> = new Map();
+
+  /** producerIds with a tune-in currently in flight — dedupe guard (#2088). */
+  private readonly tuneInsInFlight = new Set<string>();
 
   // Original router RTP capabilities from the SFU (stored for PiP Device.load())
   private routerRtpCapabilities: mediasoupTypes.RtpCapabilities | null = null;
@@ -1015,6 +1033,10 @@ class VoiceService {
   ): void {
     this.applyCameraSettingsChange(state, prev);
     this.applyScreenShareSettingsChange(state, prev);
+    // Auto-tune receive policy flipped ON mid-call (#2088) — sweep what's available.
+    if (state.autoTuneInScreenShares && !prev.autoTuneInScreenShares) {
+      void this.autoTuneSweep();
+    }
   }
 
   /** Camera instant parameter updates — extracted for complexity reduction. */
@@ -1406,6 +1428,16 @@ class VoiceService {
 
     const oldProducerId = oldProducer.id;
 
+    // Snapshot pre-swap consumption/metadata state BEFORE any await: the
+    // close-producer self-echo (producer-closed via the media-plane room
+    // bridge reaches the sender too) can land mid-swap and prune these
+    // entries, which would otherwise drop the local share's tuned-in state
+    // and dock row on codec swaps (#2088).
+    const storePre = useVoiceStore.getState();
+    const wasTunedIn = Boolean(storePre.tunedInScreenShares[oldProducerId]);
+    const wasDominant = storePre.dominantScreenShareId === oldProducerId;
+    const oldShareMeta = storePre.activeScreenShares[oldProducerId];
+
     // Close old producer. The track is reused below, so it MUST survive close():
     // producers are created with stopTracks:false (the track is owned by
     // localScreenStream), so close() does not stop it. (Without that, mediasoup
@@ -1440,13 +1472,39 @@ class VoiceService {
       this.closeProducer('screen');
     };
 
-    // Update tuned-in mapping since producer ID changed
+    // Update tuned-in mapping since producer ID changed. Keyed off the
+    // pre-swap snapshot — the producer-closed self-echo may already have
+    // pruned the old entries during the awaits above (#2088).
     const store = useVoiceStore.getState();
-    if (store.tunedInScreenShares[oldProducerId]) {
-      store.tuneOut(oldProducerId);
-      store.tuneIn(newProducer.id, 'local-screen');
+    if (wasTunedIn) {
+      store.tuneOut(oldProducerId); // no-op if the echo already pruned it
+      store.tuneIn(newProducer.id, LOCAL_SCREEN_CONSUMER_ID);
     }
-    if (store.dominantScreenShareId === oldProducerId) {
+    // Carry the owner metadata to the new producerId (#2088) — re-register
+    // unconditionally from the snapshot/local identity so an echo-pruned
+    // entry cannot leave the live share without a dock row.
+    store.unregisterActiveScreenShare(oldProducerId);
+    const localUserId = useUserStore.getState().user?.id;
+    const shareOwnerId = oldShareMeta?.userId ?? localUserId;
+    if (shareOwnerId) {
+      const localParticipant = store.participants[shareOwnerId];
+      store.registerActiveScreenShare({
+        producerId: newProducer.id,
+        userId: shareOwnerId,
+        username: oldShareMeta?.username ?? localParticipant?.username ?? 'You',
+        displayName: oldShareMeta?.displayName ?? localParticipant?.displayName,
+        isLocal: true,
+      });
+    }
+    // The self-echo may also have cleared the local participant's screen
+    // state mid-swap; re-assert it while the capture stream is live.
+    if (localUserId && this.localScreenStream) {
+      store.updateParticipant(localUserId, {
+        screenStream: this.localScreenStream,
+        isScreenSharing: true,
+      });
+    }
+    if (wasDominant || (wasTunedIn && useVoiceStore.getState().dominantScreenShareId === null)) {
       store.setDominantScreenShare(newProducer.id);
     }
 
@@ -1664,6 +1722,13 @@ class VoiceService {
           username: participant?.username || 'Unknown',
           displayName: participant?.displayName,
         });
+        store.registerActiveScreenShare({
+          producerId: producer.producerId,
+          userId: producer.userId,
+          username: participant?.username || 'Unknown',
+          displayName: participant?.displayName,
+          isLocal: false,
+        });
       } else if (producer.source === 'screen-audio') {
         this.pendingScreenAudioProducers.set(producer.userId, producer.producerId);
       } else {
@@ -1674,6 +1739,10 @@ class VoiceService {
         );
       }
     }
+    // Join trigger (#2088): the setting check lives inside the sweep.
+    // Fire-and-forget — the sweep's per-share key/consume round trips must
+    // not delay the join reaching 'connected' (mirrors the toggle trigger).
+    void this.autoTuneSweep();
   }
 
   /** Apply permissions, enforcement flags, and DM state from the join response. */
@@ -2138,6 +2207,15 @@ class VoiceService {
       this.consumeQueueAudio = Promise.resolve();
       this.consumeQueueVideo = Promise.resolve();
       store.clearAvailableScreenShares();
+      // #2088: the rebuilt session re-discovers screen shares from scratch —
+      // drop stale consumption/metadata/suppression state (the consumers were
+      // torn down above, and producer-closed events missed during the drop
+      // could never prune these maps).
+      store.resetScreenShareConsumption();
+      // A consume that never settled (socket died mid-flight) would strand its
+      // producerId in the in-flight guard forever; remote producer ids survive
+      // OUR reconnect, so clear the guard with the rest of the tune state.
+      this.tuneInsInFlight.clear();
       // Local camera/screen producers did not survive the network change;
       // reflect that honestly instead of showing a dead camera as live.
       store.setVideoOn(false);
@@ -3213,91 +3291,213 @@ class VoiceService {
   /** Opt-in to consume a remote screen share ("Tune In" model) — up to 5 concurrent */
   async tuneInToScreenShare(producerId: string, userId: string): Promise<void> {
     const store = useVoiceStore.getState();
+    // Bind to the call we start in (#2088): the store mutations after the
+    // awaits below must not land on a store that leaveChannel()/reconnect has
+    // reset out from under us (see the stale-context guard before store.tuneIn).
+    const startChannelId = store.activeChannelId;
 
-    // Enforce 5-stream limit
-    if (Object.keys(store.tunedInScreenShares).length >= 5) {
-      store.setVideoSlotError('Maximum 5 screen shares reached. Tune out of one first.');
+    // Idempotency + in-flight guard (#2088): the dock, Tune In All, and the
+    // auto-tune engine can race on the same producer; a second consume would
+    // orphan a duplicate SFU consumer that keeps forwarding RTP.
+    if (producerId in store.tunedInScreenShares || this.tuneInsInFlight.has(producerId)) {
       return;
     }
+    this.tuneInsInFlight.add(producerId);
+    try {
+      // Manual re-tune clears any auto-tune suppression for this producer
+      // (spec §3.3; no-op for the auto path, which pre-filters suppressed ids).
+      store.clearAutoTuneSuppression(producerId);
 
-    // Ensure decrypt key is ready for E2EE screen share
-    if (this.mediaEncryption) {
-      const channelId = store.activeChannelId;
-      if (channelId) await this.addDecryptKeyForUser(channelId, userId);
-    }
-
-    // Remove from available list and consume the producer
-    store.removeAvailableScreenShare(producerId);
-    await this.consumeProducer(producerId, userId, 'video');
-
-    // Find the consumer that was just created for this producer
-    let consumerId = '';
-    for (const [cid, consumer] of this.consumers) {
-      if (consumer.producerId === producerId) {
-        consumerId = cid;
-        break;
+      // Reserve a slot against the cap synchronously (#2088). Auto-tune fires
+      // one tuneInToScreenShare per new-producer announce, so a burst races
+      // through here; counting only committed tune-ins lets them all pass this
+      // guard before any of them reaches store.tuneIn(), overshooting the cap
+      // and dragging maxVideoSlots below budget. Count committed tune-ins AND
+      // in-flight reservations (this producer is already in tuneInsInFlight);
+      // the Set de-dupes the brief window where a producer is both tuned-in and
+      // still in-flight (the paired-audio await after store.tuneIn()).
+      const reservedCount = new Set<string>([
+        ...Object.keys(store.tunedInScreenShares),
+        ...this.tuneInsInFlight,
+      ]).size;
+      if (reservedCount > MAX_TUNED_SCREEN_SHARES) {
+        store.setVideoSlotError('Maximum 5 screen shares reached. Tune out of one first.');
+        return;
       }
-    }
 
-    // Track in store
-    store.tuneIn(producerId, consumerId);
+      // Ensure decrypt key is ready for E2EE screen share
+      if (this.mediaEncryption && startChannelId) {
+        await this.addDecryptKeyForUser(startChannelId, userId);
+      }
 
-    // Set as dominant if first tuned-in share
-    if (!store.dominantScreenShareId) {
-      store.setDominantScreenShare(producerId);
-    }
+      // Remove from available list and consume the producer
+      store.removeAvailableScreenShare(producerId);
+      await this.consumeProducer(producerId, userId, 'video');
 
-    store.updateParticipant(userId, { isScreenSharing: true });
+      // Find the consumer that was just created for this producer
+      let consumerId = '';
+      for (const [cid, consumer] of this.consumers) {
+        if (consumer.producerId === producerId) {
+          consumerId = cid;
+          break;
+        }
+      }
 
-    // Consume paired screen audio if available (keep mapping for re-tune)
-    const audioProducerId = this.pendingScreenAudioProducers.get(userId);
-    if (audioProducerId) {
-      await this.consumeProducer(audioProducerId, userId, 'audio');
+      // Stale-context guard (#2088): leaveChannel()/reconnect can reset the store
+      // and tear down transports while we await key setup + consume. Recording
+      // tune-in state now would re-add stale tunedInScreenShares and lower
+      // maxVideoSlots for a call the user already left. Close the consumer we
+      // just created (idempotent — no-op if teardown already cleared it) so the
+      // SFU stops forwarding, then bail before touching the store.
+      if (useVoiceStore.getState().activeChannelId !== startChannelId) {
+        if (consumerId) this.closeConsumerAndNotify(consumerId);
+        return;
+      }
+
+      // Track in store
+      store.tuneIn(producerId, consumerId);
+
+      // Set as dominant if first tuned-in share
+      if (!store.dominantScreenShareId) {
+        store.setDominantScreenShare(producerId);
+      }
+
+      store.updateParticipant(userId, { isScreenSharing: true });
+
+      // Consume paired screen audio if available (keep mapping for re-tune)
+      const audioProducerId = this.pendingScreenAudioProducers.get(userId);
+      if (audioProducerId) {
+        await this.consumeProducer(audioProducerId, userId, 'audio');
+      }
+    } finally {
+      this.tuneInsInFlight.delete(producerId);
     }
   }
 
-  /** Opt-out of a tuned-in screen share */
-  async tuneOutOfScreenShare(producerId: string): Promise<void> {
+  /** Opt-out of a tuned-in screen share. `suppressAutoTune` marks a MANUAL
+   *  tune-out so the auto-tune engine (#2088) won't immediately re-consume. */
+  async tuneOutOfScreenShare(
+    producerId: string,
+    opts?: { suppressAutoTune?: boolean }
+  ): Promise<void> {
     const store = useVoiceStore.getState();
     const consumerId = store.tunedInScreenShares[producerId];
+    const shareMeta = store.activeScreenShares[producerId];
+    const isLocal = shareMeta?.isLocal === true || consumerId === LOCAL_SCREEN_CONSUMER_ID;
 
-    // Identify the producing user from the video consumer's metadata
-    const videoMeta = consumerId ? this.consumerMeta.get(consumerId) : undefined;
-    const screenOwnerUserId = videoMeta?.producerUserId;
+    if (!isLocal) {
+      // Identify the producing user: metadata seam first, consumerMeta fallback
+      const videoMeta = consumerId ? this.consumerMeta.get(consumerId) : undefined;
+      const screenOwnerUserId = shareMeta?.userId ?? videoMeta?.producerUserId;
 
-    // Close the screen video consumer
-    if (consumerId) {
-      const consumer = this.consumers.get(consumerId);
-      if (consumer) {
-        consumer.close();
-        this.consumers.delete(consumerId);
-        this.consumerMeta.delete(consumerId);
-        this.lastPreferredLayerKeyByConsumer.delete(consumerId);
-        this.pauseCoordinator.clearConsumer(consumerId);
+      // Close the screen video consumer locally AND free the SFU side (#2088 fix)
+      if (consumerId) {
+        this.closeConsumerAndNotify(consumerId);
+      }
+
+      // Close the paired screen-audio consumer for this specific user
+      if (screenOwnerUserId) {
+        this.closeScreenAudioConsumerForUser(screenOwnerUserId, store);
+      }
+
+      // Add back to available shares (remote shares only — never offer the
+      // user a Tune In to their own stream)
+      const producerUserId = screenOwnerUserId ?? this.findScreenShareOwner(store);
+      if (producerUserId) {
+        const participant = store.participants[producerUserId];
+        store.addAvailableScreenShare({
+          producerId,
+          userId: producerUserId,
+          username: shareMeta?.username ?? participant?.username ?? 'Unknown',
+          displayName: shareMeta?.displayName ?? participant?.displayName,
+        });
+      }
+
+      // Manual tune-out while auto-tune is ON → suppress auto re-tune for this
+      // producer lifetime (cleared on producer close / manual re-tune / rejoin)
+      if (opts?.suppressAutoTune && useVideoSettingsStore.getState().autoTuneInScreenShares) {
+        store.suppressAutoTune(producerId);
       }
     }
 
-    // Close the paired screen-audio consumer for this specific user
-    if (screenOwnerUserId) {
-      this.closeScreenAudioConsumerForUser(screenOwnerUserId, store);
-    }
-
-    // Find the producing user to update their participant state
-    const producerUserId = screenOwnerUserId ?? this.findScreenShareOwner(store);
-
-    // Add back to available shares
-    if (producerUserId) {
-      const participant = store.participants[producerUserId];
-      store.addAvailableScreenShare({
-        producerId,
-        userId: producerUserId,
-        username: participant?.username || 'Unknown',
-        displayName: participant?.displayName,
-      });
-    }
-
-    // Remove from tuned-in (this also handles dominant swap & slot recalculation)
+    // Remove from tuned-in (handles dominant swap & slot recalculation).
+    // For the LOCAL share this only hides the preview — production continues.
     store.tuneOut(producerId);
+  }
+
+  /** Auto-tune engine (#2088): consume every available, unsuppressed remote
+   *  screen share while the autoTuneInScreenShares setting is ON. Reuses the
+   *  manual tune-in path so E2EE key setup, paired audio, dominant selection,
+   *  and the cap guard (incl. the existing videoSlotError copy) stay identical. */
+  private async autoTuneSweep(): Promise<void> {
+    if (!useVideoSettingsStore.getState().autoTuneInScreenShares) return;
+    // Bind the sweep to the call it started in (#2088). The join trigger fires
+    // it fire-and-forget, so capture the channel now and re-check it each
+    // iteration: if the user leaves or switches calls mid-sweep we stop instead
+    // of consuming shares (and lowering maxVideoSlots) for a room they left.
+    const startChannelId = useVoiceStore.getState().activeChannelId;
+    const shares = [...useVoiceStore.getState().availableScreenShares]; // snapshot
+    for (const share of shares) {
+      // Re-read the live preference + call context every iteration (#2088): the
+      // user can flip auto-tune OFF or leave the call while an earlier share's
+      // E2EE/consume round trip is still pending. Checking only once before the
+      // loop would keep auto-consuming the original snapshot after the toggle is
+      // off or the call is gone.
+      if (!useVideoSettingsStore.getState().autoTuneInScreenShares) return;
+      if (useVoiceStore.getState().activeChannelId !== startChannelId) return;
+      if (useVoiceStore.getState().autoTuneSuppressedProducers[share.producerId]) continue;
+      // Isolate per-share failures (#2088): a rejected E2EE key fetch or consume
+      // for one share must neither abort the remaining shares nor escape the
+      // fire-and-forget `void autoTuneSweep()` call sites as an unhandled
+      // rejection. Mirrors the try/catch on the manual dock/global handlers.
+      try {
+        await this.tuneInToScreenShare(share.producerId, share.userId);
+      } catch (err) {
+        console.error('auto-tune sweep failed for', share.producerId, errorMessage(err));
+      }
+    }
+  }
+
+  /** Tune in to every currently available screen share, up to the cap.
+   *  Explicit user intent — clears any auto-tune suppressions on the way. */
+  async tuneInAllScreenShares(): Promise<void> {
+    const store = useVoiceStore.getState();
+    const shares = [...store.availableScreenShares]; // snapshot
+    for (const share of shares) {
+      store.clearAutoTuneSuppression(share.producerId);
+      // Sequential on purpose: the cap guard inside tuneInToScreenShare reads
+      // live state; parallel awaits could race past the limit. Over-cap calls
+      // no-op and set the existing videoSlotError copy.
+      await this.tuneInToScreenShare(share.producerId, share.userId);
+    }
+  }
+
+  /** Tune out of every tuned-in REMOTE screen share. Snapshots ids first so
+   *  mid-iteration store mutations can't skip entries. Never touches the
+   *  local user's own share (the local-screen sentinel). */
+  async tuneOutAllScreenShares(): Promise<void> {
+    const store = useVoiceStore.getState();
+    const producerIds = Object.entries(store.tunedInScreenShares)
+      .filter(([, consumerId]) => consumerId !== LOCAL_SCREEN_CONSUMER_ID)
+      .map(([producerId]) => producerId); // snapshot
+    for (const producerId of producerIds) {
+      await this.tuneOutOfScreenShare(producerId, { suppressAutoTune: true });
+    }
+  }
+
+  /** Close a consumer locally (maps + pause/layer bookkeeping) and ask the SFU
+   *  to close its side. Client-initiated closes ONLY — server-initiated close
+   *  paths (producer-closed / consumer-closed / transportclose) must NOT emit
+   *  back at the server. No-ops for unknown ids and the local-screen sentinel. */
+  private closeConsumerAndNotify(consumerId: string): void {
+    const consumer = this.consumers.get(consumerId);
+    if (!consumer) return;
+    consumer.close();
+    this.consumers.delete(consumerId);
+    this.consumerMeta.delete(consumerId);
+    this.lastPreferredLayerKeyByConsumer.delete(consumerId);
+    this.pauseCoordinator.clearConsumer(consumerId);
+    this.socket?.emit('close-consumer', { consumerId });
   }
 
   /** Close the screen-audio consumer for a specific user. */
@@ -3307,15 +3507,7 @@ class VoiceService {
   ): void {
     for (const [cid, meta] of this.consumerMeta) {
       if (meta.source === 'screen-audio' && meta.producerUserId === userId) {
-        const consumer = this.consumers.get(cid);
-        if (consumer) {
-          consumer.close();
-          this.consumers.delete(cid);
-          this.consumerMeta.delete(cid);
-          this.lastPreferredLayerKeyByConsumer.delete(cid);
-          this.pauseCoordinator.clearConsumer(cid);
-          this.socket?.emit('close-consumer', { consumerId: cid });
-        }
+        this.closeConsumerAndNotify(cid);
         store.updateParticipant(userId, { screenAudioStream: undefined });
         break;
       }
@@ -3784,6 +3976,15 @@ class VoiceService {
     const store = useVoiceStore.getState();
     store.setScreenSharing(false);
     store.setActiveScreenCodec(null);
+    // #2088: deterministic local-share cleanup (spec §3.1 removal point) —
+    // don't rely solely on the media-plane's producer-closed self-echo.
+    const localShare = Object.values(store.activeScreenShares).find((s) => s.isLocal);
+    if (localShare) {
+      store.unregisterActiveScreenShare(localShare.producerId);
+      if (store.tunedInScreenShares[localShare.producerId]) {
+        store.tuneOut(localShare.producerId);
+      }
+    }
     const localUserId = useUserStore.getState().user?.id;
     if (localUserId) {
       store.updateParticipant(localUserId, {
@@ -4219,6 +4420,44 @@ class VoiceService {
     );
   }
 
+  /** Register a newly announced opt-in screen share and auto-tune when the
+   *  receive policy is ON (#2088). Extracted from handleNewProducer (S3776). */
+  private async handleOptInScreenAnnounce(
+    producerId: string,
+    userId: string,
+    store: ReturnType<typeof useVoiceStore.getState>
+  ): Promise<void> {
+    const participant = store.participants[userId];
+    store.addAvailableScreenShare({
+      producerId,
+      userId,
+      username: participant?.username || 'Unknown',
+      displayName: participant?.displayName,
+    });
+    store.registerActiveScreenShare({
+      producerId,
+      userId,
+      username: participant?.username || 'Unknown',
+      displayName: participant?.displayName,
+      isLocal: false,
+    });
+    store.updateParticipant(userId, { isScreenSharing: true });
+    // New-share trigger (#2088). The cap guard inside tuneInToScreenShare
+    // surfaces the existing max-stream error when capacity is exhausted.
+    if (
+      useVideoSettingsStore.getState().autoTuneInScreenShares &&
+      !store.autoTuneSuppressedProducers[producerId]
+    ) {
+      // The new-producer socket handler discards this promise — isolate
+      // failures the same way autoTuneSweep does (no unhandled rejection).
+      try {
+        await this.tuneInToScreenShare(producerId, userId);
+      } catch (err) {
+        console.error('Auto-tune failed for producer', producerId, errorMessage(err));
+      }
+    }
+  }
+
   /** Handle a new-producer socket event — dispatches opt-in, E2EE, slot enforcement. */
   private async handleNewProducer(event: {
     producerId: string;
@@ -4231,14 +4470,7 @@ class VoiceService {
     const store = useVoiceStore.getState();
 
     if (requiresOptIn && source === 'screen') {
-      const participant = store.participants[userId];
-      store.addAvailableScreenShare({
-        producerId,
-        userId,
-        username: participant?.username || 'Unknown',
-        displayName: participant?.displayName,
-      });
-      store.updateParticipant(userId, { isScreenSharing: true });
+      await this.handleOptInScreenAnnounce(producerId, userId, store);
       return;
     }
 
@@ -4323,6 +4555,8 @@ class VoiceService {
       else if (source === 'screen') {
         store.updateParticipant(userId, { isScreenSharing: false, screenStream: undefined });
         store.removeAvailableScreenShare(producerId);
+        store.unregisterActiveScreenShare(producerId);
+        store.clearAutoTuneSuppression(producerId);
         // Clean up tunedInScreenShares so UI collapses back to user frame grid
         if (producerId in store.tunedInScreenShares) {
           store.tuneOut(producerId);

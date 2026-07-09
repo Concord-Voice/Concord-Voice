@@ -99,6 +99,14 @@ describe('VoiceStage', () => {
         'user-1': mockParticipant({ displayName: 'Alice' }),
       },
     });
+    // Owner metadata always accompanies availability/tune-in in production (#2088)
+    useVoiceStore.getState().registerActiveScreenShare({
+      producerId: 'producer-1',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: false,
+    });
     render(<VoiceStage />);
     expect(screen.getByText(/Alice\u2019s screen/)).toBeInTheDocument();
   });
@@ -136,6 +144,14 @@ describe('VoiceStage', () => {
       participants: {
         'user-1': mockParticipant({ displayName: 'Alice' }),
       },
+    });
+    // Owner metadata always accompanies availability/tune-in in production (#2088)
+    useVoiceStore.getState().registerActiveScreenShare({
+      producerId: 'producer-1',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: false,
     });
     render(<VoiceStage />);
     // The overlay shows "Name's screen"
@@ -224,6 +240,14 @@ describe('VoiceStage', () => {
       },
       localStreamPaused: true,
     });
+    // Local-share metadata carries isLocal — the paused branch keys on it (#2088)
+    useVoiceStore.getState().registerActiveScreenShare({
+      producerId: 'producer-1',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: true,
+    });
     render(<VoiceStage />);
     expect(screen.getByText('Your Screen Is Still Streaming')).toBeInTheDocument();
   });
@@ -239,5 +263,37 @@ describe('VoiceStage', () => {
     });
     render(<VoiceStage />);
     expect(screen.getByText(/Unknown/)).toBeInTheDocument();
+  });
+
+  // ── Multi-sharer owner labels (#2088) ────────────────────────────────────
+
+  it('labels each stream with its own owner when two users share (#2088)', () => {
+    setStageState({
+      stageLayout: 'equal',
+      tunedInScreenShares: { pa: 'ca', pb: 'cb' },
+      participants: {
+        'user-1': mockParticipant(),
+        'user-2': mockParticipant({ userId: 'user-2', username: 'bob', displayName: 'Bob' }),
+      },
+    });
+    const store = useVoiceStore.getState();
+    store.registerActiveScreenShare({
+      producerId: 'pa',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: false,
+    });
+    store.registerActiveScreenShare({
+      producerId: 'pb',
+      userId: 'user-2',
+      username: 'bob',
+      displayName: 'Bob',
+      isLocal: false,
+    });
+    render(<VoiceStage />);
+    // Equal layout: each cell labeled with its own producer's owner.
+    expect(screen.getByText(/Alice’s screen/)).toBeInTheDocument();
+    expect(screen.getByText(/Bob’s screen/)).toBeInTheDocument();
   });
 });

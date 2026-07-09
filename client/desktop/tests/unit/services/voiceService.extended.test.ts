@@ -3423,3 +3423,198 @@ describe('VoiceService Extended', () => {
     });
   });
 });
+
+describe('auto-tune-in engine (#2088)', () => {
+  const flip = (over: Partial<ReturnType<typeof useVideoSettingsStore.getState>>) =>
+    ({ ...useVideoSettingsStore.getState(), ...over }) as ReturnType<
+      typeof useVideoSettingsStore.getState
+    >;
+
+  it('toggle flip OFF→ON mid-call sweeps available shares', () => {
+    const svc = voiceService as any;
+    const sweep = vi.spyOn(svc, 'autoTuneSweep').mockResolvedValue(undefined);
+    svc.handleVideoSettingsChange(
+      flip({ autoTuneInScreenShares: true }),
+      flip({ autoTuneInScreenShares: false })
+    );
+    expect(sweep).toHaveBeenCalledTimes(1);
+    sweep.mockRestore();
+  });
+
+  it('does not sweep when the toggle is unchanged or flips ON→OFF', () => {
+    const svc = voiceService as any;
+    const sweep = vi.spyOn(svc, 'autoTuneSweep').mockResolvedValue(undefined);
+    svc.handleVideoSettingsChange(
+      flip({ autoTuneInScreenShares: false }),
+      flip({ autoTuneInScreenShares: false })
+    );
+    svc.handleVideoSettingsChange(
+      flip({ autoTuneInScreenShares: false }),
+      flip({ autoTuneInScreenShares: true })
+    );
+    expect(sweep).not.toHaveBeenCalled();
+    sweep.mockRestore();
+  });
+
+  it('autoTuneSweep tunes into available shares, honoring suppressions', async () => {
+    const svc = voiceService as any;
+    const tuneIn = vi.spyOn(voiceService, 'tuneInToScreenShare').mockResolvedValue(undefined);
+    useVideoSettingsStore.getState().setAutoTuneInScreenShares(true);
+    const store = useVoiceStore.getState();
+    store.addAvailableScreenShare({ producerId: 'p1', userId: 'u1', username: 'a' });
+    store.addAvailableScreenShare({ producerId: 'p2', userId: 'u2', username: 'b' });
+    store.suppressAutoTune('p2');
+
+    await svc.autoTuneSweep();
+
+    expect(tuneIn).toHaveBeenCalledWith('p1', 'u1');
+    expect(tuneIn).not.toHaveBeenCalledWith('p2', 'u2');
+    tuneIn.mockRestore();
+  });
+
+  it('autoTuneSweep isolates a per-share failure: one rejection neither aborts the sweep nor escapes (#2088)', async () => {
+    const svc = voiceService as any;
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // First share's E2EE key fetch / consume rejects; second must still be attempted.
+    const tuneIn = vi
+      .spyOn(voiceService, 'tuneInToScreenShare')
+      .mockRejectedValueOnce(new Error('E2EE key fetch failed'))
+      .mockResolvedValueOnce(undefined);
+    useVideoSettingsStore.getState().setAutoTuneInScreenShares(true);
+    useVoiceStore.setState({
+      availableScreenShares: [
+        { producerId: 'p-fail', userId: 'u1', username: 'a' },
+        { producerId: 'p-ok', userId: 'u2', username: 'b' },
+      ],
+      autoTuneSuppressedProducers: {},
+    });
+
+    // Resolves cleanly (no unhandled rejection) despite the first share rejecting.
+    await expect(svc.autoTuneSweep()).resolves.toBeUndefined();
+
+    // Failure is isolated: the sweep still attempts the remaining share and logs.
+    expect(tuneIn).toHaveBeenCalledWith('p-fail', 'u1');
+    expect(tuneIn).toHaveBeenCalledWith('p-ok', 'u2');
+    expect(errSpy).toHaveBeenCalledWith(
+      'auto-tune sweep failed for',
+      'p-fail',
+      expect.any(String)
+    );
+
+    tuneIn.mockRestore();
+    errSpy.mockRestore();
+  });
+
+  it('autoTuneSweep is a no-op when the setting is OFF', async () => {
+    const svc = voiceService as any;
+    const tuneIn = vi.spyOn(voiceService, 'tuneInToScreenShare').mockResolvedValue(undefined);
+    useVideoSettingsStore.getState().setAutoTuneInScreenShares(false);
+    useVoiceStore.getState().addAvailableScreenShare({
+      producerId: 'p1',
+      userId: 'u1',
+      username: 'a',
+    });
+    await svc.autoTuneSweep();
+    expect(tuneIn).not.toHaveBeenCalled();
+    tuneIn.mockRestore();
+  });
+
+  it('autoTuneSweep re-checks the live preference each iteration and stops when toggled OFF mid-sweep (#2088)', async () => {
+    const svc = voiceService as any;
+    // The user flips auto-tune OFF while the first share's consume is pending;
+    // the sweep must not keep consuming the rest of the original snapshot.
+    const tuneIn = vi.spyOn(voiceService, 'tuneInToScreenShare').mockImplementation(async () => {
+      useVideoSettingsStore.getState().setAutoTuneInScreenShares(false);
+    });
+    useVideoSettingsStore.getState().setAutoTuneInScreenShares(true);
+    useVoiceStore.setState({
+      availableScreenShares: [
+        { producerId: 'p1', userId: 'u1', username: 'a' },
+        { producerId: 'p2', userId: 'u2', username: 'b' },
+        { producerId: 'p3', userId: 'u3', username: 'c' },
+      ],
+      autoTuneSuppressedProducers: {},
+    });
+
+    await svc.autoTuneSweep();
+
+    expect(tuneIn).toHaveBeenCalledTimes(1);
+    expect(tuneIn).toHaveBeenCalledWith('p1', 'u1');
+    tuneIn.mockRestore();
+  });
+
+  it('autoTuneSweep bails when the call is torn down / switched mid-sweep (#2088)', async () => {
+    const svc = voiceService as any;
+    // A leaveChannel()/reset (activeChannelId cleared) races the sweep after
+    // the first consume; the remaining shares must not be consumed for a room
+    // the user has already left.
+    const tuneIn = vi.spyOn(voiceService, 'tuneInToScreenShare').mockImplementation(async () => {
+      useVoiceStore.setState({ activeChannelId: null });
+    });
+    useVideoSettingsStore.getState().setAutoTuneInScreenShares(true);
+    useVoiceStore.setState({
+      activeChannelId: 'channel-1',
+      availableScreenShares: [
+        { producerId: 'p1', userId: 'u1', username: 'a' },
+        { producerId: 'p2', userId: 'u2', username: 'b' },
+      ],
+      autoTuneSuppressedProducers: {},
+    });
+
+    await svc.autoTuneSweep();
+
+    expect(tuneIn).toHaveBeenCalledTimes(1);
+    expect(tuneIn).toHaveBeenCalledWith('p1', 'u1');
+    tuneIn.mockRestore();
+  });
+
+  it('consumeExistingProducers triggers the sweep when the setting is ON (join trigger)', async () => {
+    const svc = voiceService as any;
+    const sweep = vi.spyOn(svc, 'autoTuneSweep').mockResolvedValue(undefined);
+    useVideoSettingsStore.getState().setAutoTuneInScreenShares(true);
+    await svc.consumeExistingProducers([
+      { producerId: 'p1', userId: 'u1', kind: 'video', source: 'screen' },
+    ]);
+    expect(sweep).toHaveBeenCalledTimes(1);
+    sweep.mockRestore();
+  });
+
+  it('handleNewProducer auto-tunes a newly announced share when ON and unsuppressed', async () => {
+    const svc = voiceService as any;
+    const tuneIn = vi.spyOn(voiceService, 'tuneInToScreenShare').mockResolvedValue(undefined);
+    useVideoSettingsStore.getState().setAutoTuneInScreenShares(true);
+    await svc.handleNewProducer({
+      producerId: 'p-new',
+      userId: 'u1',
+      kind: 'video',
+      source: 'screen',
+      requiresOptIn: true,
+    });
+    expect(tuneIn).toHaveBeenCalledWith('p-new', 'u1');
+    tuneIn.mockRestore();
+  });
+
+  it('handleNewProducer does NOT auto-tune when OFF or when suppressed', async () => {
+    const svc = voiceService as any;
+    const tuneIn = vi.spyOn(voiceService, 'tuneInToScreenShare').mockResolvedValue(undefined);
+    useVideoSettingsStore.getState().setAutoTuneInScreenShares(false);
+    await svc.handleNewProducer({
+      producerId: 'p-off',
+      userId: 'u1',
+      kind: 'video',
+      source: 'screen',
+      requiresOptIn: true,
+    });
+    useVideoSettingsStore.getState().setAutoTuneInScreenShares(true);
+    useVoiceStore.getState().suppressAutoTune('p-sup');
+    await svc.handleNewProducer({
+      producerId: 'p-sup',
+      userId: 'u1',
+      kind: 'video',
+      source: 'screen',
+      requiresOptIn: true,
+    });
+    expect(tuneIn).not.toHaveBeenCalled();
+    tuneIn.mockRestore();
+  });
+});

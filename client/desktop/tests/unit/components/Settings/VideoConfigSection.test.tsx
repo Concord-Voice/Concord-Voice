@@ -14,6 +14,7 @@ const defaultVideoSettings: Record<string, unknown> = {
   degradationPreference: 'balanced',
   hardwareAcceleration: true,
   hdrEncoding: false,
+  autoTuneInScreenShares: false,
 };
 
 // ─── Hoisted mocks (available inside vi.mock factories) ─────────────────────
@@ -1405,5 +1406,23 @@ describe('VideoConfigSection', () => {
       expect(svcToggle).toBeTruthy();
       expect((svcToggle as HTMLInputElement).disabled).toBe(false);
     });
+  });
+});
+
+describe('auto-tune-in toggle (#2088)', () => {
+  it('renders in the Screen Share section, default OFF', () => {
+    renderComponent();
+    const toggle = screen.getByRole('checkbox', {
+      name: /Automatically tune in to screen shares/i,
+    });
+    expect(toggle).not.toBeChecked();
+  });
+
+  it('writes the draft on change', () => {
+    renderComponent();
+    fireEvent.click(
+      screen.getByRole('checkbox', { name: /Automatically tune in to screen shares/i })
+    );
+    expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('autoTuneInScreenShares', true);
   });
 });

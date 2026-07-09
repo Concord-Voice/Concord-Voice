@@ -352,6 +352,7 @@ const VideoConfigSection: React.FC = () => {
   const hdrEncoding = useDraftVideoSetting('hdrEncoding');
   const supportSvc = useDraftVideoSetting('supportSvc');
   const supportSimulcast = useDraftVideoSetting('supportSimulcast');
+  const autoTuneInScreenShares = useDraftVideoSetting('autoTuneInScreenShares');
 
   // Premium entitlement caps (#1301 / split axes #1602):
   //  - L2: camera-preset resolution/fps options above the CAMERA-axis ceiling
@@ -723,6 +724,25 @@ const VideoConfigSection: React.FC = () => {
           ]}
           value={screenContentType}
           onChange={(v) => setDraftVideoSetting('screenContentType', v as ScreenContentType)}
+        />
+      </div>
+
+      <div className="settings-row">
+        <div className="settings-row-info">
+          <span className="settings-row-label" id="auto-tune-shares-label">
+            Automatically tune in to screen shares
+          </span>
+          <span className="settings-row-hint" id="auto-tune-shares-hint">
+            When enabled, Concord tunes in to screen shares in voice calls you join. You can still
+            tune out of any stream manually.
+          </span>
+        </div>
+        <ToggleSwitch
+          id="auto-tune-shares"
+          ariaLabelledBy="auto-tune-shares-label"
+          aria-describedby="auto-tune-shares-hint"
+          checked={autoTuneInScreenShares}
+          onChange={(v) => setDraftVideoSetting('autoTuneInScreenShares', v)}
         />
       </div>
 

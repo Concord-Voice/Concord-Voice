@@ -18,8 +18,8 @@ vi.mock('@/renderer/components/Voice/VoiceStage', () => ({
 vi.mock('@/renderer/components/Voice/StreamBar', () => ({
   default: () => <div data-testid="stream-bar" />,
 }));
-vi.mock('@/renderer/components/Voice/TuneInButton', () => ({
-  TuneInOverlay: () => <div data-testid="tune-in-overlay" />,
+vi.mock('@/renderer/components/Voice/ScreenShareControls', () => ({
+  default: () => <div data-testid="screen-share-controls" />,
 }));
 vi.mock('@/renderer/components/Voice/VoiceControls', () => ({
   default: () => <div data-testid="voice-controls" />,
@@ -291,20 +291,10 @@ describe('VoiceView', () => {
     expect(screen.queryByTestId('user-frame-bar')).not.toBeInTheDocument();
   });
 
-  it('shows TuneInOverlay when availableScreenShares is non-empty', () => {
-    setConnectedState({
-      availableScreenShares: [
-        { producerId: 'p1', userId: 'u1', username: 'alice', displayName: 'Alice' },
-      ],
-    });
+  it('mounts the ScreenShareControls dock unconditionally (#2088 — it self-nulls when empty)', () => {
+    setConnectedState();
     render(<VoiceView channelId={VOICE_CHANNEL_ID} channelName="General" />);
-    expect(screen.getByTestId('tune-in-overlay')).toBeInTheDocument();
-  });
-
-  it('does not show TuneInOverlay when availableScreenShares is empty', () => {
-    setConnectedState({ availableScreenShares: [] });
-    render(<VoiceView channelId={VOICE_CHANNEL_ID} channelName="General" />);
-    expect(screen.queryByTestId('tune-in-overlay')).not.toBeInTheDocument();
+    expect(screen.getByTestId('screen-share-controls')).toBeInTheDocument();
   });
 
   // ── Text chat ────────────────────────────────────────────────────────────────

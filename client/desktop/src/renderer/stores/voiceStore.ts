@@ -187,6 +187,20 @@ export interface AvailableScreenShare {
   displayName?: string;
 }
 
+/** Cap on concurrently tuned-in screen shares (incl. the local one). NOT the
+ *  `50 - 5*count` slot-cost multiplier — that 5 is a different constant. */
+export const MAX_TUNED_SCREEN_SHARES = 5;
+
+/** Owner metadata for every ACTIVE screen-share producer (available AND
+ *  tuned-in, local AND remote) — the producerId→owner seam (#2088). */
+export interface ActiveScreenShare {
+  producerId: string;
+  userId: string;
+  username: string;
+  displayName?: string;
+  isLocal: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Channel voice members (sidebar display — who's in each voice channel)
 // ---------------------------------------------------------------------------
@@ -288,6 +302,13 @@ interface VoiceState {
   // Available screen shares (opt-in "Tune In" model — not auto-consumed)
   availableScreenShares: AvailableScreenShare[];
 
+  // Active screen-share metadata — producerId → owner (available + tuned-in) (#2088)
+  activeScreenShares: Record<string, ActiveScreenShare>;
+
+  // Producers the user manually tuned out of while auto-tune is ON (#2088).
+  // Session-scoped: cleared by reset(), producer close, or manual re-tune.
+  autoTuneSuppressedProducers: Record<string, true>;
+
   // Channel voice members (sidebar — all voice channels, not just the one we're in)
   channelVoiceMembers: Record<string, ChannelVoiceMember[]>;
 
@@ -388,6 +409,15 @@ interface VoiceState {
   addAvailableScreenShare: (share: AvailableScreenShare) => void;
   removeAvailableScreenShare: (producerId: string) => void;
   clearAvailableScreenShares: () => void;
+
+  // Active screen-share metadata + auto-tune suppression (#2088)
+  registerActiveScreenShare: (share: ActiveScreenShare) => void;
+  unregisterActiveScreenShare: (producerId: string) => void;
+  suppressAutoTune: (producerId: string) => void;
+  clearAutoTuneSuppression: (producerId: string) => void;
+  /** Drop ALL screen-share consumption/metadata/suppression state — used by
+   *  the reconnect rebuild, which re-discovers shares from scratch (#2088). */
+  resetScreenShareConsumption: () => void;
 
   // Participant management
   addParticipant: (participant: VoiceParticipant) => void;
@@ -552,6 +582,8 @@ const initialState = {
     return 350;
   })(),
   serverVoiceCounts: {} as Record<string, number>,
+  activeScreenShares: {} as Record<string, ActiveScreenShare>,
+  autoTuneSuppressedProducers: {} as Record<string, true>,
   tunedInScreenShares: {} as Record<string, string>,
   dominantScreenShareId: null as string | null,
   maxVideoSlots: 50,
@@ -661,6 +693,36 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
       availableScreenShares: state.availableScreenShares.filter((s) => s.producerId !== producerId),
     })),
   clearAvailableScreenShares: () => set({ availableScreenShares: [] }),
+
+  registerActiveScreenShare: (share) =>
+    set((state) => ({
+      activeScreenShares: { ...state.activeScreenShares, [share.producerId]: share },
+    })),
+  unregisterActiveScreenShare: (producerId) =>
+    set((state) => {
+      if (!(producerId in state.activeScreenShares)) return state;
+      const { [producerId]: _, ...rest } = state.activeScreenShares;
+      return { activeScreenShares: rest };
+    }),
+  suppressAutoTune: (producerId) =>
+    set((state) => ({
+      autoTuneSuppressedProducers: { ...state.autoTuneSuppressedProducers, [producerId]: true },
+    })),
+  clearAutoTuneSuppression: (producerId) =>
+    set((state) => {
+      if (!(producerId in state.autoTuneSuppressedProducers)) return state;
+      const { [producerId]: _, ...rest } = state.autoTuneSuppressedProducers;
+      return { autoTuneSuppressedProducers: rest };
+    }),
+  resetScreenShareConsumption: () =>
+    set({
+      activeScreenShares: {},
+      autoTuneSuppressedProducers: {},
+      tunedInScreenShares: {},
+      dominantScreenShareId: null,
+      maxVideoSlots: 50,
+      videoSlotError: null,
+    }),
 
   addParticipant: (participant) =>
     set((state) => ({

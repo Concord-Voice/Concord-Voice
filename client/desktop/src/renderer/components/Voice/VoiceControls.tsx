@@ -20,7 +20,7 @@ import {
   PinOff,
   ExternalLink,
 } from 'lucide-react';
-import { useVoiceStore } from '../../stores/voiceStore';
+import { useVoiceStore, type ActiveScreenShare } from '../../stores/voiceStore';
 import { useUserStore } from '../../stores/userStore';
 import { useChannelStore } from '../../stores/channelStore';
 import { useOsPermissionStore } from '../../stores/osPermissionStore';
@@ -145,10 +145,7 @@ interface PipMenuProps {
   pipMenuRef: React.RefObject<HTMLDivElement | null>;
   style: React.CSSProperties;
   tunedInIds: string[];
-  participants: Record<
-    string,
-    { isScreenSharing?: boolean; displayName?: string; username?: string }
-  >;
+  activeScreenShares: Record<string, ActiveScreenShare>;
   onOpenPip: (mode: 'frames' | 'screen', producerId?: string) => void;
 }
 
@@ -157,7 +154,7 @@ const PipMenu: React.FC<PipMenuProps> = ({
   pipMenuRef,
   style,
   tunedInIds,
-  participants,
+  activeScreenShares,
   onOpenPip,
 }) => (
   <div ref={pipMenuRef} className="voice-controls__pip-menu" style={style}>
@@ -165,8 +162,9 @@ const PipMenu: React.FC<PipMenuProps> = ({
       Pop Out User Frames
     </button>
     {tunedInIds.map((producerId) => {
-      const sharer = Object.values(participants).find((p) => p.isScreenSharing);
-      const name = sharer?.displayName || sharer?.username || 'User';
+      // Resolve the owner via the producerId → owner metadata seam (#2088)
+      const meta = activeScreenShares[producerId];
+      const name = meta?.displayName || meta?.username || 'User';
       return (
         <button
           key={producerId}
@@ -234,7 +232,7 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
   const isScreenSharing = useVoiceStore((s) => s.isScreenSharing);
   const showVoiceTextChat = useVoiceStore((s) => s.showVoiceTextChat);
   const toggleVoiceTextChat = useVoiceStore((s) => s.toggleVoiceTextChat);
-  const participants = useVoiceStore((s) => s.participants);
+  const activeScreenShares = useVoiceStore((s) => s.activeScreenShares);
   const videoSlotError = useVoiceStore((s) => s.videoSlotError);
   const setVideoSlotError = useVoiceStore((s) => s.setVideoSlotError);
   const tunedInScreenShares = useVoiceStore((s) => s.tunedInScreenShares);
@@ -455,7 +453,11 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
       {/* Portaled slot error — escapes overflow:hidden ancestors */}
       {videoSlotError &&
         createPortal(
-          <div className="voice-controls__slot-error" style={getPortalStyle(controlsRef)}>
+          <div
+            className="voice-controls__slot-error"
+            role="alert"
+            style={getPortalStyle(controlsRef)}
+          >
             {videoSlotError}
           </div>,
           document.body
@@ -468,7 +470,7 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
             pipMenuRef={pipMenuRef}
             style={getPortalStyle(pipWrapRef)}
             tunedInIds={tunedInIds}
-            participants={participants}
+            activeScreenShares={activeScreenShares}
             onOpenPip={handleOpenPip}
           />,
           document.body

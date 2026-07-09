@@ -1,7 +1,6 @@
 import React, { useRef, useEffect } from 'react';
 import { X } from 'lucide-react';
 import { useVoiceStore } from '../../stores/voiceStore';
-import { useUserStore } from '../../stores/userStore';
 import './StreamBar.css';
 
 /**
@@ -74,7 +73,7 @@ const StreamBar: React.FC<{ height: number }> = ({ height }) => {
   const participants = useVoiceStore((s) => s.participants);
   const setDominantScreenShare = useVoiceStore((s) => s.setDominantScreenShare);
   const localStreamPaused = useVoiceStore((s) => s.localStreamPaused);
-  const localUserId = useUserStore((s) => s.user?.id);
+  const activeScreenShares = useVoiceStore((s) => s.activeScreenShares);
 
   // Get non-dominant tuned-in shares
   const nonDominantIds = Object.keys(tunedInScreenShares).filter(
@@ -87,25 +86,23 @@ const StreamBar: React.FC<{ height: number }> = ({ height }) => {
     <div className="stream-bar" style={{ height }}>
       <div className="stream-bar__scroll">
         {nonDominantIds.map((producerId) => {
-          // Find the participant who owns this screen share
-          const sharer = Object.values(participants).find(
-            (p) => p.isScreenSharing && p.screenStream
-          );
-          const sharerName = sharer?.displayName || sharer?.username || 'Unknown';
-
-          const isLocalSharer = sharer?.userId === localUserId;
+          // Resolve the owner via the producerId → owner metadata seam (#2088)
+          const meta = activeScreenShares[producerId];
+          const owner = meta ? participants[meta.userId] : undefined;
+          const sharerName = meta?.displayName || meta?.username || 'Unknown';
+          const isLocalSharer = meta?.isLocal ?? false;
           return (
             <StreamThumbnail
               key={producerId}
               producerId={producerId}
-              stream={isLocalSharer && localStreamPaused ? undefined : sharer?.screenStream}
+              stream={isLocalSharer && localStreamPaused ? undefined : owner?.screenStream}
               sharerName={sharerName}
               isPaused={isLocalSharer && localStreamPaused}
               onSelect={() => setDominantScreenShare(producerId)}
               onTuneOut={() => {
                 // Import voiceService lazily to avoid circular dependency
                 import('../../services/voiceService').then(({ voiceService }) => {
-                  voiceService.tuneOutOfScreenShare(producerId);
+                  voiceService.tuneOutOfScreenShare(producerId, { suppressAutoTune: true });
                 });
               }}
             />

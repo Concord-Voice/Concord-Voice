@@ -80,3 +80,21 @@ describe('videoSettingsStore casting toggles (#1921)', () => {
     expect(useVideoSettingsStore.getState().supportSimulcast).toBe(false);
   });
 });
+
+describe('autoTuneInScreenShares (#2088)', () => {
+  it('defaults to false (off-by-default receive policy)', () => {
+    expect(useVideoSettingsStore.getState().autoTuneInScreenShares).toBe(false);
+  });
+
+  it('setAutoTuneInScreenShares updates the value', () => {
+    useVideoSettingsStore.getState().setAutoTuneInScreenShares(true);
+    expect(useVideoSettingsStore.getState().autoTuneInScreenShares).toBe(true);
+  });
+
+  it('is included in the persisted partialize payload', () => {
+    useVideoSettingsStore.getState().setAutoTuneInScreenShares(true);
+    const raw = localStorage.getItem('concord:video-settings');
+    expect(raw).not.toBeNull();
+    expect(JSON.parse(raw as string).state.autoTuneInScreenShares).toBe(true);
+  });
+});

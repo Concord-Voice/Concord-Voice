@@ -1,4 +1,5 @@
 import { useDraftSettingsStore } from '@/renderer/stores/draftSettingsStore';
+import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
 import { useSettingsStore } from '@/renderer/stores/settingsStore';
 import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
 import { useTTSSettingsStore } from '@/renderer/stores/ttsSettingsStore';
@@ -606,5 +607,25 @@ describe('draftSettingsStore', () => {
       // The last call should re-enable suppression
       expect(calls[calls.length - 1]).toBe(true);
     });
+  });
+});
+
+describe('autoTuneInScreenShares draft flow (#2088)', () => {
+  it('drafts and applies to videoSettingsStore', () => {
+    useDraftSettingsStore.getState().initialize();
+    useDraftSettingsStore.getState().setVideoDraft('autoTuneInScreenShares', true);
+    expect(useDraftSettingsStore.getState().drafts.video.autoTuneInScreenShares).toBe(true);
+
+    useDraftSettingsStore.getState().apply();
+    expect(useVideoSettingsStore.getState().autoTuneInScreenShares).toBe(true);
+  });
+
+  it('revert discards an un-applied draft', () => {
+    useVideoSettingsStore.getState().setAutoTuneInScreenShares(false);
+    useDraftSettingsStore.getState().initialize();
+    useDraftSettingsStore.getState().setVideoDraft('autoTuneInScreenShares', true);
+    useDraftSettingsStore.getState().revert();
+    expect(useVideoSettingsStore.getState().autoTuneInScreenShares).toBe(false);
+    expect(useDraftSettingsStore.getState().drafts.video.autoTuneInScreenShares).toBeUndefined();
   });
 });

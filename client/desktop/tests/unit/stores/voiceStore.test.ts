@@ -1,4 +1,8 @@
-import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voiceStore';
+import {
+  useVoiceStore,
+  MAX_TUNED_SCREEN_SHARES,
+  type VoiceParticipant,
+} from '@/renderer/stores/voiceStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {
@@ -747,5 +751,85 @@ describe('voiceStore', () => {
       useVoiceStore.getState().reset();
       expect(useVoiceStore.getState().activeDMCalls).toEqual({});
     });
+  });
+});
+
+describe('active screen-share metadata seam (#2088)', () => {
+  const share = {
+    producerId: 'prod-1',
+    userId: 'user-1',
+    username: 'alice',
+    displayName: 'Alice',
+    isLocal: false,
+  };
+
+  it('exports MAX_TUNED_SCREEN_SHARES = 5', () => {
+    expect(MAX_TUNED_SCREEN_SHARES).toBe(5);
+  });
+
+  it('registers an active screen share keyed by producerId', () => {
+    useVoiceStore.getState().registerActiveScreenShare(share);
+    expect(useVoiceStore.getState().activeScreenShares['prod-1']).toEqual(share);
+  });
+
+  it('overwrites an existing registration for the same producerId', () => {
+    useVoiceStore.getState().registerActiveScreenShare(share);
+    useVoiceStore.getState().registerActiveScreenShare({ ...share, username: 'alice2' });
+    expect(useVoiceStore.getState().activeScreenShares['prod-1'].username).toBe('alice2');
+  });
+
+  it('unregisters by producerId and no-ops on unknown ids', () => {
+    useVoiceStore.getState().registerActiveScreenShare(share);
+    useVoiceStore.getState().unregisterActiveScreenShare('prod-1');
+    useVoiceStore.getState().unregisterActiveScreenShare('prod-unknown');
+    expect(useVoiceStore.getState().activeScreenShares).toEqual({});
+  });
+
+  it('reset() clears activeScreenShares and autoTuneSuppressedProducers', () => {
+    useVoiceStore.getState().registerActiveScreenShare(share);
+    useVoiceStore.getState().suppressAutoTune('prod-1');
+    useVoiceStore.getState().reset();
+    expect(useVoiceStore.getState().activeScreenShares).toEqual({});
+    expect(useVoiceStore.getState().autoTuneSuppressedProducers).toEqual({});
+  });
+});
+
+describe('auto-tune suppression set (#2088)', () => {
+  it('suppressAutoTune records the producerId', () => {
+    useVoiceStore.getState().suppressAutoTune('prod-9');
+    expect(useVoiceStore.getState().autoTuneSuppressedProducers['prod-9']).toBe(true);
+  });
+
+  it('clearAutoTuneSuppression removes it and no-ops when absent', () => {
+    useVoiceStore.getState().suppressAutoTune('prod-9');
+    useVoiceStore.getState().clearAutoTuneSuppression('prod-9');
+    useVoiceStore.getState().clearAutoTuneSuppression('prod-9');
+    expect(useVoiceStore.getState().autoTuneSuppressedProducers).toEqual({});
+  });
+});
+
+describe('resetScreenShareConsumption (#2088)', () => {
+  it('drops consumption, metadata, suppression, dominant, slot, and error state', () => {
+    const s = useVoiceStore.getState();
+    s.registerActiveScreenShare({
+      producerId: 'p1',
+      userId: 'u1',
+      username: 'alice',
+      isLocal: false,
+    });
+    s.suppressAutoTune('p2');
+    s.tuneIn('p1', 'c1');
+    s.setDominantScreenShare('p1');
+    s.setVideoSlotError('Maximum 5 screen shares reached. Tune out of one first.');
+
+    s.resetScreenShareConsumption();
+
+    const after = useVoiceStore.getState();
+    expect(after.activeScreenShares).toEqual({});
+    expect(after.autoTuneSuppressedProducers).toEqual({});
+    expect(after.tunedInScreenShares).toEqual({});
+    expect(after.dominantScreenShareId).toBeNull();
+    expect(after.maxVideoSlots).toBe(50);
+    expect(after.videoSlotError).toBeNull();
   });
 });

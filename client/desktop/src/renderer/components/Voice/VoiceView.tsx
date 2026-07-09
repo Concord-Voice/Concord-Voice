@@ -8,7 +8,7 @@ import { UserFrameGrid } from './ParticipantGrid';
 import UserFrameBar from './UserFrameBar';
 import VoiceStage from './VoiceStage';
 import StreamBar from './StreamBar';
-import { TuneInOverlay } from './TuneInButton';
+import ScreenShareControls from './ScreenShareControls';
 import VoiceControls from './VoiceControls';
 import VoiceTextChat from './VoiceTextChat';
 import './VoiceView.css';
@@ -201,7 +201,6 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
   const voiceTextChatWidth = useVoiceStore((s) => s.voiceTextChatWidth);
   const setVoiceTextChatWidth = useVoiceStore((s) => s.setVoiceTextChatWidth);
   const tunedInScreenShares = useVoiceStore((s) => s.tunedInScreenShares);
-  const availableScreenShares = useVoiceStore((s) => s.availableScreenShares);
   const showUserFrameBar = useVoiceStore((s) => s.showUserFrameBar);
   const showStreamBar = useVoiceStore((s) => s.showStreamBar);
   const userFrameBarHeight = useVoiceStore((s) => s.userFrameBarHeight);
@@ -454,8 +453,8 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
             <UserFrameGrid />
           )}
 
-          {/* Available screen shares — Tune In buttons */}
-          {availableScreenShares.length > 0 && <TuneInOverlay />}
+          {/* Screen-share control dock — per-stream + global Tune In/Out (#2088) */}
+          <ScreenShareControls />
         </div>
 
         {/* Text chat panel — vertical (side-by-side) layout only */}

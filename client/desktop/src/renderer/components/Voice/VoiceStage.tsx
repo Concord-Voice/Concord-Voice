@@ -1,7 +1,6 @@
 import React, { useRef, useEffect, useCallback } from 'react';
 import { ChevronLeft, ChevronRight, PictureInPicture2, LayoutGrid, Focus } from 'lucide-react';
 import { useVoiceStore } from '../../stores/voiceStore';
-import { useUserStore } from '../../stores/userStore';
 import './VoiceStage.css';
 
 /**
@@ -70,23 +69,28 @@ const VoiceStage: React.FC = () => {
   const stageLayout = useVoiceStore((s) => s.stageLayout);
   const toggleStageLayout = useVoiceStore((s) => s.toggleStageLayout);
   const localStreamPaused = useVoiceStore((s) => s.localStreamPaused);
-  const localUserId = useUserStore((s) => s.user?.id);
+  const activeScreenShares = useVoiceStore((s) => s.activeScreenShares);
 
   const tunedInIds = Object.keys(tunedInScreenShares);
   const hasMultiple = tunedInIds.length > 1;
 
-  // Helper: find participant who owns a given producerId.
-  // For now, each participant has a single screenStream, so we match via
-  // the isScreenSharing flag. With multiple sharers this will need a
-  // producerId → userId lookup (future enhancement).
-  const findSharer = useCallback(
-    (_producerId: string) =>
-      Object.values(participants).find((p) => p.isScreenSharing && p.screenStream),
-    [participants]
+  // Resolve a producerId to its owner via the metadata seam (#2088) —
+  // finally honors the producerId (multi-sharer correct).
+  const resolveShare = useCallback(
+    (producerId: string) => {
+      const meta = activeScreenShares[producerId];
+      const participant = meta ? participants[meta.userId] : undefined;
+      return {
+        name: meta?.displayName || meta?.username || 'Unknown',
+        stream: participant?.screenStream,
+        isLocal: meta?.isLocal ?? false,
+      };
+    },
+    [activeScreenShares, participants]
   );
 
   // ── Focus mode helpers ──────────────────────────────────────────────
-  const dominantSharer = dominantScreenShareId ? findSharer(dominantScreenShareId) : null;
+  const dominant = dominantScreenShareId ? resolveShare(dominantScreenShareId) : null;
 
   const cycle = useCallback(
     (direction: 1 | -1) => {
@@ -118,7 +122,7 @@ const VoiceStage: React.FC = () => {
     );
   }
 
-  const dominantSharerName = dominantSharer?.displayName || dominantSharer?.username || 'Unknown';
+  const dominantSharerName = dominant?.name ?? 'Unknown';
 
   // ── Equal mode: grid of all tuned-in streams ────────────────────────
   if (stageLayout === 'equal') {
@@ -137,15 +141,13 @@ const VoiceStage: React.FC = () => {
 
         <div className="voice-stage__grid" data-count={tunedInIds.length}>
           {tunedInIds.map((producerId) => {
-            const sharer = findSharer(producerId);
-            const name = sharer?.displayName || sharer?.username || 'Unknown';
-            const isLocalSharer = sharer?.userId === localUserId;
+            const { name, stream, isLocal } = resolveShare(producerId);
             return (
               <StageVideo
                 key={producerId}
-                stream={isLocalSharer && localStreamPaused ? undefined : sharer?.screenStream}
+                stream={isLocal && localStreamPaused ? undefined : stream}
                 sharerName={name}
-                isPaused={isLocalSharer && localStreamPaused}
+                isPaused={isLocal && localStreamPaused}
               />
             );
           })}
@@ -155,11 +157,11 @@ const VoiceStage: React.FC = () => {
   }
 
   // ── Focus mode: single dominant stream ──────────────────────────────
-  const isDominantLocal = dominantSharer?.userId === localUserId;
+  const isDominantLocal = dominant?.isLocal ?? false;
   return (
     <div className="voice-stage">
       <StageVideo
-        stream={isDominantLocal && localStreamPaused ? undefined : dominantSharer?.screenStream}
+        stream={isDominantLocal && localStreamPaused ? undefined : dominant?.stream}
         sharerName={dominantSharerName}
         showOverlay={false}
         isPaused={isDominantLocal && localStreamPaused}

@@ -2407,6 +2407,170 @@ describe('VoiceService', () => {
       await voiceService.tuneOutOfScreenShare('nonexistent-producer');
       expect(useVoiceStore.getState().connectionState).toBe('connected');
     });
+
+    const remoteParticipant = (userId: string, username: string) => ({
+      userId,
+      username,
+      isMuted: false,
+      isDeafened: false,
+      isSpeaking: false,
+      isVideoOn: false,
+      isScreenSharing: true,
+    });
+
+    it('emits close-consumer for the screen-video consumer on tune-out (#2088)', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const videoConsumer = createMockConsumer('cons-v1', 'video', 'prod-1');
+      svc.consumers.set('cons-v1', videoConsumer);
+      svc.consumerMeta.set('cons-v1', {
+        source: 'screen',
+        producerUserId: 'user-1',
+        producerId: 'prod-1',
+      });
+      const store = useVoiceStore.getState();
+      store.registerActiveScreenShare({
+        producerId: 'prod-1',
+        userId: 'user-1',
+        username: 'alice',
+        isLocal: false,
+      });
+      store.tuneIn('prod-1', 'cons-v1');
+      mockSocket.emit.mockClear();
+
+      await voiceService.tuneOutOfScreenShare('prod-1');
+
+      expect(videoConsumer.close).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith('close-consumer', { consumerId: 'cons-v1' });
+    });
+
+    it('still closes and emits for the paired screen-audio consumer (#2088)', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const videoConsumer = createMockConsumer('cons-v1', 'video', 'prod-1');
+      const audioConsumer = createMockConsumer('cons-a1', 'audio', 'prod-a1');
+      svc.consumers.set('cons-v1', videoConsumer);
+      svc.consumerMeta.set('cons-v1', {
+        source: 'screen',
+        producerUserId: 'user-1',
+        producerId: 'prod-1',
+      });
+      svc.consumers.set('cons-a1', audioConsumer);
+      svc.consumerMeta.set('cons-a1', {
+        source: 'screen-audio',
+        producerUserId: 'user-1',
+        producerId: 'prod-a1',
+      });
+      const store = useVoiceStore.getState();
+      store.registerActiveScreenShare({
+        producerId: 'prod-1',
+        userId: 'user-1',
+        username: 'alice',
+        isLocal: false,
+      });
+      store.tuneIn('prod-1', 'cons-v1');
+      mockSocket.emit.mockClear();
+
+      await voiceService.tuneOutOfScreenShare('prod-1');
+
+      expect(audioConsumer.close).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith('close-consumer', { consumerId: 'cons-v1' });
+      expect(mockSocket.emit).toHaveBeenCalledWith('close-consumer', { consumerId: 'cons-a1' });
+    });
+
+    it('local share tune-out emits nothing and is not re-added to availableScreenShares (#2088)', async () => {
+      await joinVoiceChannel();
+      const store = useVoiceStore.getState();
+      store.registerActiveScreenShare({
+        producerId: 'prod-local',
+        userId: 'local-user',
+        username: 'me',
+        isLocal: true,
+      });
+      store.tuneIn('prod-local', 'local-screen');
+      mockSocket.emit.mockClear();
+
+      await voiceService.tuneOutOfScreenShare('prod-local');
+
+      expect(mockSocket.emit).not.toHaveBeenCalledWith(
+        'close-consumer',
+        expect.anything(),
+        expect.anything()
+      );
+      expect(mockSocket.emit).not.toHaveBeenCalledWith('close-consumer', expect.anything());
+      expect(
+        useVoiceStore.getState().availableScreenShares.find((s) => s.producerId === 'prod-local')
+      ).toBeUndefined();
+      expect(useVoiceStore.getState().tunedInScreenShares['prod-local']).toBeUndefined();
+    });
+
+    it('records auto-tune suppression only when opted and the setting is ON (#2088)', async () => {
+      await joinVoiceChannel();
+      const store = useVoiceStore.getState();
+      store.addParticipant(remoteParticipant('user-1', 'alice'));
+      store.registerActiveScreenShare({
+        producerId: 'prod-1',
+        userId: 'user-1',
+        username: 'alice',
+        isLocal: false,
+      });
+      store.tuneIn('prod-1', 'cons-missing');
+      useVideoSettingsStore.getState().setAutoTuneInScreenShares(true);
+
+      await voiceService.tuneOutOfScreenShare('prod-1', { suppressAutoTune: true });
+
+      expect(useVoiceStore.getState().autoTuneSuppressedProducers['prod-1']).toBe(true);
+    });
+
+    it('does NOT record suppression when the setting is OFF (#2088)', async () => {
+      await joinVoiceChannel();
+      useVideoSettingsStore.getState().setAutoTuneInScreenShares(false);
+      const store = useVoiceStore.getState();
+      store.addParticipant(remoteParticipant('user-1', 'alice'));
+      store.registerActiveScreenShare({
+        producerId: 'prod-1',
+        userId: 'user-1',
+        username: 'alice',
+        isLocal: false,
+      });
+      store.tuneIn('prod-1', 'cons-missing');
+
+      await voiceService.tuneOutOfScreenShare('prod-1', { suppressAutoTune: true });
+
+      expect(useVoiceStore.getState().autoTuneSuppressedProducers).toEqual({});
+    });
+
+    it('re-adds the available entry with the metadata owner (multi-sharer correct) (#2088)', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const videoConsumer = createMockConsumer('cons-v2', 'video', 'prod-2');
+      svc.consumers.set('cons-v2', videoConsumer);
+      svc.consumerMeta.set('cons-v2', {
+        source: 'screen',
+        producerUserId: 'user-2',
+        producerId: 'prod-2',
+      });
+      const store = useVoiceStore.getState();
+      store.addParticipant(remoteParticipant('user-1', 'alice'));
+      store.addParticipant(remoteParticipant('user-2', 'bob'));
+      store.registerActiveScreenShare({
+        producerId: 'prod-2',
+        userId: 'user-2',
+        username: 'bob',
+        displayName: 'Bob',
+        isLocal: false,
+      });
+      store.tuneIn('prod-2', 'cons-v2');
+
+      await voiceService.tuneOutOfScreenShare('prod-2');
+
+      const readded = useVoiceStore
+        .getState()
+        .availableScreenShares.find((s) => s.producerId === 'prod-2');
+      expect(readded?.userId).toBe('user-2');
+      expect(readded?.username).toBe('bob');
+      expect(readded?.displayName).toBe('Bob');
+    });
   });
 
   // ===== Socket Listeners =====
@@ -3558,5 +3722,256 @@ describe('VoiceService', () => {
 
       expect(consumer.pause).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('active screen-share metadata registration (#2088)', () => {
+  beforeEach(async () => {
+    await joinVoiceChannel();
+  });
+
+  it('consumeExistingProducers registers remote screen metadata', async () => {
+    const svc = voiceService as any;
+    useVoiceStore.getState().addParticipant({
+      userId: 'user-7',
+      username: 'alice',
+      displayName: 'Alice',
+      isMuted: false,
+      isDeafened: false,
+      isSpeaking: false,
+      isVideoOn: false,
+      isScreenSharing: false,
+    });
+    await svc.consumeExistingProducers([
+      { producerId: 'prod-e1', userId: 'user-7', kind: 'video', source: 'screen' },
+    ]);
+    expect(useVoiceStore.getState().activeScreenShares['prod-e1']).toEqual({
+      producerId: 'prod-e1',
+      userId: 'user-7',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: false,
+    });
+  });
+
+  it('handleNewProducer registers remote screen metadata on requiresOptIn announce', async () => {
+    const svc = voiceService as any;
+    await svc.handleNewProducer({
+      producerId: 'prod-n1',
+      userId: 'user-8',
+      kind: 'video',
+      source: 'screen',
+      requiresOptIn: true,
+    });
+    expect(useVoiceStore.getState().activeScreenShares['prod-n1']?.isLocal).toBe(false);
+    expect(useVoiceStore.getState().activeScreenShares['prod-n1']?.userId).toBe('user-8');
+  });
+
+  it('producer-closed unregisters metadata and clears suppression', () => {
+    const store = useVoiceStore.getState();
+    store.registerActiveScreenShare({
+      producerId: 'prod-3',
+      userId: 'user-1',
+      username: 'alice',
+      isLocal: false,
+    });
+    store.suppressAutoTune('prod-3');
+    const handler = socketListeners['producer-closed']?.[0];
+    expect(handler).toBeDefined();
+    handler?.({ producerId: 'prod-3', userId: 'user-1', source: 'screen' });
+    expect(useVoiceStore.getState().activeScreenShares['prod-3']).toBeUndefined();
+    expect(useVoiceStore.getState().autoTuneSuppressedProducers['prod-3']).toBeUndefined();
+  });
+});
+
+describe('global tune actions (#2088)', () => {
+  beforeEach(async () => {
+    await joinVoiceChannel();
+  });
+
+  it('tuneInAllScreenShares tunes into every available share and clears suppressions', async () => {
+    const spy = vi.spyOn(voiceService, 'tuneInToScreenShare').mockResolvedValue(undefined);
+    const store = useVoiceStore.getState();
+    store.addAvailableScreenShare({ producerId: 'p1', userId: 'u1', username: 'a' });
+    store.addAvailableScreenShare({ producerId: 'p2', userId: 'u2', username: 'b' });
+    store.suppressAutoTune('p1');
+
+    await voiceService.tuneInAllScreenShares();
+
+    expect(spy).toHaveBeenCalledWith('p1', 'u1');
+    expect(spy).toHaveBeenCalledWith('p2', 'u2');
+    expect(useVoiceStore.getState().autoTuneSuppressedProducers).toEqual({});
+    spy.mockRestore();
+  });
+
+  it('tuneInAllScreenShares at capacity surfaces the existing max-stream error', async () => {
+    // Do NOT mock tuneInToScreenShare here — its real cap guard must fire.
+    const store = useVoiceStore.getState();
+    for (let i = 0; i < 5; i++) store.tuneIn(`tuned-${i}`, `cons-${i}`);
+    store.addAvailableScreenShare({ producerId: 'p-over', userId: 'u9', username: 'z' });
+
+    await voiceService.tuneInAllScreenShares();
+
+    expect(useVoiceStore.getState().videoSlotError).toBe(
+      'Maximum 5 screen shares reached. Tune out of one first.'
+    );
+    expect(useVoiceStore.getState().tunedInScreenShares['p-over']).toBeUndefined();
+  });
+
+  it('tuneOutAllScreenShares snapshots ids before mutating (no skips)', async () => {
+    const seen: string[] = [];
+    const spy = vi
+      .spyOn(voiceService, 'tuneOutOfScreenShare')
+      .mockImplementation(async (producerId: string) => {
+        seen.push(producerId);
+        useVoiceStore.getState().tuneOut(producerId); // mutate mid-iteration
+      });
+    const store = useVoiceStore.getState();
+    store.tuneIn('r1', 'c1');
+    store.tuneIn('r2', 'c2');
+    store.tuneIn('r3', 'c3');
+
+    await voiceService.tuneOutAllScreenShares();
+
+    expect(seen.sort()).toEqual(['r1', 'r2', 'r3']);
+    spy.mockRestore();
+  });
+
+  it('tuneOutAllScreenShares skips the local-screen sentinel and passes suppressAutoTune', async () => {
+    const spy = vi.spyOn(voiceService, 'tuneOutOfScreenShare').mockResolvedValue(undefined);
+    const store = useVoiceStore.getState();
+    store.tuneIn('local-prod', 'local-screen');
+    store.tuneIn('r1', 'c1');
+
+    await voiceService.tuneOutAllScreenShares();
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith('r1', { suppressAutoTune: true });
+    spy.mockRestore();
+  });
+});
+
+describe('tune-in hardening (#2088 review fixes)', () => {
+  beforeEach(async () => {
+    await joinVoiceChannel();
+  });
+
+  it('manual tuneInToScreenShare clears auto-tune suppression for that producer', async () => {
+    const svc = voiceService as any;
+    vi.spyOn(svc, 'consumeProducer').mockResolvedValue(undefined);
+    vi.spyOn(svc, 'addDecryptKeyForUser').mockResolvedValue(undefined);
+    useVoiceStore.getState().suppressAutoTune('p1');
+
+    await voiceService.tuneInToScreenShare('p1', 'u1');
+
+    expect(useVoiceStore.getState().autoTuneSuppressedProducers['p1']).toBeUndefined();
+  });
+
+  it('is idempotent for an already-tuned producer (no second consume)', async () => {
+    const svc = voiceService as any;
+    // spyOn an already-spied singleton method returns the SAME spy with
+    // accumulated calls — clear before asserting call counts.
+    const consume = vi.spyOn(svc, 'consumeProducer').mockResolvedValue(undefined);
+    consume.mockClear();
+    useVoiceStore.getState().tuneIn('p1', 'c1');
+
+    await voiceService.tuneInToScreenShare('p1', 'u1');
+
+    expect(consume).not.toHaveBeenCalled();
+  });
+
+  it('concurrent tune-ins for the same producer consume once (in-flight guard)', async () => {
+    const svc = voiceService as any;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const consume = vi.spyOn(svc, 'consumeProducer').mockImplementation(async () => {
+      await gate;
+    });
+    consume.mockClear();
+    vi.spyOn(svc, 'addDecryptKeyForUser').mockResolvedValue(undefined);
+
+    const first = voiceService.tuneInToScreenShare('p1', 'u1');
+    const second = voiceService.tuneInToScreenShare('p1', 'u1');
+    release();
+    await Promise.all([first, second]);
+
+    expect(consume).toHaveBeenCalledTimes(1);
+  });
+
+  it('producer-closed (server-initiated) performs local-only cleanup — no close-consumer emit', () => {
+    const svc = voiceService as any;
+    const consumer = createMockConsumer('cons-sv', 'video', 'prod-sv');
+    svc.consumers.set('cons-sv', consumer);
+    svc.consumerMeta.set('cons-sv', {
+      source: 'screen',
+      producerUserId: 'user-2',
+      producerId: 'prod-sv',
+    });
+    mockSocket.emit.mockClear();
+
+    const handler = socketListeners['producer-closed']?.[0];
+    expect(handler).toBeDefined();
+    handler?.({ producerId: 'prod-sv', userId: 'user-2', source: 'screen' });
+
+    expect(consumer.close).toHaveBeenCalled();
+    expect(mockSocket.emit).not.toHaveBeenCalledWith('close-consumer', expect.anything());
+  });
+
+  it('reserves cap slots synchronously: concurrent tune-ins for different producers cannot exceed the cap (#2088)', async () => {
+    const svc = voiceService as any;
+    vi.spyOn(svc, 'addDecryptKeyForUser').mockResolvedValue(undefined);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const consume = vi.spyOn(svc, 'consumeProducer').mockImplementation(async () => {
+      await gate;
+    });
+    consume.mockClear();
+
+    const store = useVoiceStore.getState();
+    // Four slots already taken — exactly one free under the cap of five.
+    for (let i = 0; i < 4; i++) store.tuneIn(`tuned-${i}`, `cons-${i}`);
+
+    // Two new-producer announces race for the single remaining slot. Before the
+    // fix both passed the cap guard (each read the same committed count of four)
+    // and consumed, overshooting the cap to six.
+    const a = voiceService.tuneInToScreenShare('p-a', 'u-a');
+    const b = voiceService.tuneInToScreenShare('p-b', 'u-b');
+    release();
+    await Promise.all([a, b]);
+
+    const tuned = useVoiceStore.getState().tunedInScreenShares;
+    const newlyTuned = ['p-a', 'p-b'].filter((id) => id in tuned);
+    expect(newlyTuned).toHaveLength(1); // only one won the last slot
+    expect(Object.keys(tuned)).toHaveLength(5); // cap respected
+    expect(useVoiceStore.getState().videoSlotError).toBe(
+      'Maximum 5 screen shares reached. Tune out of one first.'
+    );
+    consume.mockRestore();
+  });
+
+  it('tuneInToScreenShare bails without recording state when the call is torn down mid-consume (#2088)', async () => {
+    const svc = voiceService as any;
+    vi.spyOn(svc, 'addDecryptKeyForUser').mockResolvedValue(undefined);
+    const consumer = createMockConsumer('cons-late', 'video', 'prod-late');
+    vi.spyOn(svc, 'consumeProducer').mockImplementation(async () => {
+      // consumeProducer registered the consumer, but a leaveChannel() reset
+      // raced our awaits and cleared the active call.
+      svc.consumers.set('cons-late', consumer);
+      useVoiceStore.setState({ activeChannelId: null });
+    });
+    mockSocket.emit.mockClear();
+
+    await voiceService.tuneInToScreenShare('prod-late', 'user-2');
+
+    // No stale tune-in state recorded for the room the user left…
+    expect(useVoiceStore.getState().tunedInScreenShares['prod-late']).toBeUndefined();
+    // …and the orphaned consumer is closed + the SFU told to stop forwarding.
+    expect(consumer.close).toHaveBeenCalled();
+    expect(mockSocket.emit).toHaveBeenCalledWith('close-consumer', { consumerId: 'cons-late' });
+    expect(svc.consumers.has('cons-late')).toBe(false);
   });
 });

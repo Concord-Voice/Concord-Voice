@@ -98,6 +98,9 @@ export interface VideoSettings {
   supportSvc: boolean; // AV1/VP9 may publish layered SVC
   supportSimulcast: boolean; // H264/VP8 may publish simulcast
 
+  /** Automatically tune in to screen shares in joined voice calls (#2088). Off by default. */
+  autoTuneInScreenShares: boolean;
+
   // Hardware
   hardwareAcceleration: boolean;
 
@@ -124,6 +127,7 @@ interface VideoSettingsState extends VideoSettings {
   setScalabilityMode: (mode: 'auto' | 'L1T3' | 'L2T3' | 'L3T3') => void;
   setSupportSvc: (enabled: boolean) => void;
   setSupportSimulcast: (enabled: boolean) => void;
+  setAutoTuneInScreenShares: (enabled: boolean) => void;
   setHardwareAcceleration: (enabled: boolean) => void;
   setHdrEncoding: (enabled: boolean) => void;
   setVideoAdvancedMode: (enabled: boolean) => void;
@@ -146,6 +150,7 @@ const defaults: VideoSettings = {
   scalabilityMode: 'auto', // Auto = L3T3 for SVC codecs
   supportSvc: true,
   supportSimulcast: true,
+  autoTuneInScreenShares: false,
   hardwareAcceleration: true,
   hdrEncoding: false,
   systemHdr: false,
@@ -173,6 +178,7 @@ export const useVideoSettingsStore = wrapStore(
         setScalabilityMode: (scalabilityMode) => set({ scalabilityMode }),
         setSupportSvc: (supportSvc) => set({ supportSvc }),
         setSupportSimulcast: (supportSimulcast) => set({ supportSimulcast }),
+        setAutoTuneInScreenShares: (autoTuneInScreenShares) => set({ autoTuneInScreenShares }),
         setHardwareAcceleration: (hardwareAcceleration) => set({ hardwareAcceleration }),
         setHdrEncoding: (hdrEncoding) => set({ hdrEncoding }),
         setCodecCapabilities: (codecCapabilities) => set({ codecCapabilities }),

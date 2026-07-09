@@ -139,7 +139,8 @@ describe('StreamBar', () => {
     await act(async () => {
       fireEvent.click(screen.getByTitle('Tune out'));
     });
-    expect(mockTuneOut).toHaveBeenCalledWith('p2');
+    // Manual tune-out from the bar suppresses auto re-tune (#2088)
+    expect(mockTuneOut).toHaveBeenCalledWith('p2', { suppressAutoTune: true });
   });
 
   // ── Sharer name ──────────────────────────────────────────────────────────
@@ -151,6 +152,14 @@ describe('StreamBar', () => {
       participants: {
         'user-1': mockParticipant({ displayName: 'Alice' }),
       },
+    });
+    // Owner metadata always accompanies availability/tune-in in production (#2088)
+    useVoiceStore.getState().registerActiveScreenShare({
+      producerId: 'p2',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: false,
     });
     render(<StreamBar height={120} />);
     expect(screen.getByText('Alice')).toBeInTheDocument();
@@ -193,7 +202,48 @@ describe('StreamBar', () => {
       },
       localStreamPaused: true,
     });
+    // Local-share metadata carries isLocal — the paused branch keys on it (#2088)
+    useVoiceStore.getState().registerActiveScreenShare({
+      producerId: 'p2',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: true,
+    });
     render(<StreamBar height={120} />);
     expect(screen.getByText('Paused')).toBeInTheDocument();
+  });
+
+  // ── Multi-sharer owner labels (#2088) ────────────────────────────────────
+
+  it('labels each stream with its own owner when two users share (#2088)', () => {
+    setStreamBarState({
+      tunedInScreenShares: { pa: 'ca', pb: 'cb' },
+      dominantScreenShareId: 'pa',
+      participants: {
+        'user-1': mockParticipant(),
+        'user-2': mockParticipant({ userId: 'user-2', username: 'bob', displayName: 'Bob' }),
+      },
+    });
+    const store = useVoiceStore.getState();
+    store.registerActiveScreenShare({
+      producerId: 'pa',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: false,
+    });
+    store.registerActiveScreenShare({
+      producerId: 'pb',
+      userId: 'user-2',
+      username: 'bob',
+      displayName: 'Bob',
+      isLocal: false,
+    });
+    render(<StreamBar height={120} />);
+    // Only the non-dominant share (Bob's) renders in the bar — labeled with ITS
+    // owner, not the first sharer found in participants.
+    expect(screen.getByText('Bob')).toBeInTheDocument();
+    expect(screen.queryByText('Alice')).not.toBeInTheDocument();
   });
 });

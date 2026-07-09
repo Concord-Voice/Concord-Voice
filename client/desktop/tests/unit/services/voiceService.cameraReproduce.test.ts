@@ -27,6 +27,8 @@
  */
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
+import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useUserStore } from '@/renderer/stores/userStore';
 
 // ---------------------------------------------------------------------------
 // Mock external dependencies BEFORE importing voiceService
@@ -317,6 +319,36 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     expect(reproduced, 'screen producer must survive the codec-floor re-produce').toBeDefined();
     expect(reproduced.id).not.toBe(original.id);
     expect(screenTrack.readyState, 'reused screen track must stay live').toBe('live');
+  });
+
+  it('screen re-produce carries the activeScreenShares metadata to the new producerId (#2088)', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    // updateStoreForScreenShare keys the local registration on the auth user
+    useUserStore.setState({ user: { id: 'local-user', username: 'me' } } as never);
+
+    const screenTrack = makeVideoTrack('screen-track');
+    const screenStream = new MockMediaStream([screenTrack]);
+    svc.captureScreen = vi.fn().mockResolvedValue(screenStream);
+
+    await svc.produceScreen('window:1:0');
+    const original = svc.producers.get('screen');
+    const store = useVoiceStore.getState();
+    // updateStoreForScreenShare registered the local share under the old id
+    expect(store.activeScreenShares[original.id]?.isLocal).toBe(true);
+
+    // Simulate the producer-closed self-echo pruning state MID-swap by
+    // removing the old entries before the swap block runs — the snapshot
+    // taken before the first await must still restore the new state.
+    await svc.fastReproduceScreen();
+
+    const reproduced = svc.producers.get('screen');
+    const after = useVoiceStore.getState();
+    expect(after.activeScreenShares[original.id]).toBeUndefined();
+    expect(after.activeScreenShares[reproduced.id]?.isLocal).toBe(true);
+    expect(after.tunedInScreenShares[reproduced.id]).toBe('local-screen');
+    expect(after.tunedInScreenShares[original.id]).toBeUndefined();
+    expect(after.dominantScreenShareId).toBe(reproduced.id);
   });
 
   // failClosedEncryptTransform must stop the OWNING capture stream itself, since

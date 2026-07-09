@@ -277,10 +277,12 @@ describe('VoiceControls', () => {
 
   // ── Video slot error ─────────────────────────────────────────────────────
 
-  it('renders video slot error when present', () => {
+  it('renders video slot error when present, announced as an alert (#2088 a11y)', () => {
     setVoiceState({ videoSlotError: 'Camera access denied.' });
     render(<VoiceControls />);
-    expect(screen.getByText('Camera access denied.')).toBeInTheDocument();
+    const toast = screen.getByText('Camera access denied.');
+    expect(toast).toBeInTheDocument();
+    expect(toast).toHaveAttribute('role', 'alert');
   });
 
   it('does not render video slot error when null', () => {
@@ -597,6 +599,14 @@ describe('VoiceControls', () => {
         u1: { isScreenSharing: true, displayName: 'Alice', username: 'alice' },
       },
     });
+    // Owner metadata always accompanies availability/tune-in in production (#2088)
+    useVoiceStore.getState().registerActiveScreenShare({
+      producerId: 'producer-1',
+      userId: 'u1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: false,
+    });
     render(<VoiceControls />);
 
     await act(async () => {
@@ -649,6 +659,14 @@ describe('VoiceControls', () => {
       participants: {
         u1: { isScreenSharing: true, displayName: 'Bob', username: 'bob' },
       },
+    });
+    // Owner metadata always accompanies availability/tune-in in production (#2088)
+    useVoiceStore.getState().registerActiveScreenShare({
+      producerId: 'producer-1',
+      userId: 'u1',
+      username: 'bob',
+      displayName: 'Bob',
+      isLocal: false,
     });
     render(<VoiceControls />);
 
@@ -744,6 +762,50 @@ describe('VoiceControls', () => {
 
     expect(consoleSpy).toHaveBeenCalledWith('Failed to toggle screen share:', expect.any(String));
     consoleSpy.mockRestore();
+  });
+
+  // ── Multi-sharer owner labels (#2088) ───────────────────────────────────
+
+  it('lists each tuned-in share with its own owner in the PiP menu when two users share (#2088)', async () => {
+    const origElectron = globalThis.electron;
+    globalThis.electron = {
+      ...globalThis.electron,
+      openPipWindow: vi.fn(),
+    } as unknown as typeof globalThis.electron;
+
+    setVoiceState({
+      tunedInScreenShares: { pa: 'ca', pb: 'cb' },
+      participants: {
+        'user-1': { isScreenSharing: true, displayName: 'Alice', username: 'alice' },
+        'user-2': { isScreenSharing: true, displayName: 'Bob', username: 'bob' },
+      },
+    });
+    const store = useVoiceStore.getState();
+    store.registerActiveScreenShare({
+      producerId: 'pa',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: false,
+    });
+    store.registerActiveScreenShare({
+      producerId: 'pb',
+      userId: 'user-2',
+      username: 'bob',
+      displayName: 'Bob',
+      isLocal: false,
+    });
+    render(<VoiceControls />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('Picture-in-Picture'));
+    });
+
+    // Each menu item labeled with its own producer's owner, not the first sharer.
+    expect(screen.getByText(/Pop Out Alice.s Screen/)).toBeInTheDocument();
+    expect(screen.getByText(/Pop Out Bob.s Screen/)).toBeInTheDocument();
+
+    globalThis.electron = origElectron;
   });
 
   // ── Screen permission restricted ────────────────────────────────────────
