@@ -69,6 +69,14 @@ type ServerBroadcastMessage struct {
 
 	// Message to send
 	Data OutgoingMessage
+
+	// PruneUserAfter, when non-nil, makes handleServerBroadcast remove this user's
+	// clients from the server subscription set AFTER delivering Data, within the same
+	// serialized hub operation. This evicts a removed/banned member so they still
+	// receive their own member_removed event but no later server fanout, while keeping
+	// the eviction ordered relative to other server broadcasts on this channel
+	// (e.g. a subsequent key_revocation). CV-CAN-027/028.
+	PruneUserAfter *uuid.UUID
 }
 
 // PresenceUpdate represents a user presence change

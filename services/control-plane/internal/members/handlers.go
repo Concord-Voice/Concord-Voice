@@ -783,13 +783,25 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	h.log.Info("Member "+action, "server_id", serverID, "target_user", targetUserID, "by_user", userID)
 
 	serverUUID, _ := uuid.Parse(serverID)
-	h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
+	memberRemoved := websocket.OutgoingMessage{
 		Type: "member_removed",
 		Data: map[string]interface{}{
 			"server_id": serverID,
 			"user_id":   targetUserID,
 		},
-	})
+	}
+
+	// CV-CAN-027: deliver member_removed and then evict the removed member from the
+	// server-level WS subscription set in the SAME serialized hub operation. This
+	// orders the eviction AFTER the member_removed delivery (so they still receive
+	// their own removal event) and BEFORE the key-revocation fanout below (a later
+	// broadcast on the same channel), so they no longer receive key_revocation or any
+	// later server broadcast. Membership is already deleted at this point.
+	if targetUUID, parseErr := uuid.Parse(targetUserID); parseErr == nil {
+		h.hub.BroadcastToServerAndPrune(serverUUID, memberRemoved, targetUUID)
+	} else {
+		h.hub.BroadcastToServer(serverUUID, memberRemoved)
+	}
 
 	h.triggerKeyRevocationsForServer(serverID, targetUserID, userID)
 
@@ -910,14 +922,25 @@ func (h *Handler) BanMember(c *gin.Context) {
 	}
 
 	serverUUID, _ := uuid.Parse(serverID)
-	h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
+	memberRemoved := websocket.OutgoingMessage{
 		Type: "member_removed",
 		Data: map[string]interface{}{
 			"server_id": serverID,
 			"user_id":   targetUserID,
 			"reason":    "banned",
 		},
-	})
+	}
+
+	// CV-CAN-028: deliver member_removed and then evict the banned member from the
+	// server-level WS subscription set in the SAME serialized hub operation, ordering
+	// the eviction AFTER the member_removed delivery and BEFORE the key-revocation
+	// fanout below, so a banned user no longer receives that server's WebSocket
+	// messages. Membership is already deleted by execBanTx above.
+	if targetUUID, parseErr := uuid.Parse(targetUserID); parseErr == nil {
+		h.hub.BroadcastToServerAndPrune(serverUUID, memberRemoved, targetUUID)
+	} else {
+		h.hub.BroadcastToServer(serverUUID, memberRemoved)
+	}
 
 	h.triggerKeyRevocationsForServer(serverID, targetUserID, userID)
 

@@ -92,6 +92,13 @@ type Hub struct {
 	// Server-scoped broadcast messages (sent to all clients subscribed to a server)
 	serverBroadcast chan ServerBroadcastMessage
 
+	// Server-scoped eviction broadcasts (member_removed/banned + attached prune).
+	// Kept on a dedicated, priority-drained channel so a removed/banned member is
+	// evicted from serverSubscriptions BEFORE any other server fanout (e.g.
+	// server_updated from handleServerUpdate, key_revocation) can leak to them,
+	// regardless of what is queued on serverBroadcast. CV-CAN-027/028.
+	evictBroadcast chan ServerBroadcastMessage
+
 	// DM-scoped broadcast messages (sent to all clients subscribed to a DM conversation)
 	dmBroadcast chan DMBroadcastMessage
 
@@ -209,6 +216,7 @@ func NewHub(db *sql.DB, redisClient *redis.Client) *Hub {
 		globalBroadcast:        make(chan OutgoingMessage, 256),
 		userBroadcast:          make(chan UserBroadcastMessage, 256),
 		serverBroadcast:        make(chan ServerBroadcastMessage, 256),
+		evictBroadcast:         make(chan ServerBroadcastMessage, 16),
 		dmBroadcast:            make(chan DMBroadcastMessage, 256),
 		disconnectUser:         make(chan uuid.UUID, 16),
 		disconnectSession:      make(chan string, 16),
@@ -276,7 +284,22 @@ func (h *Hub) Run() {
 			onlineCountC = h.onlineCountTimer.C
 		}
 
+		// Priority drain: process any pending eviction broadcast before other work.
+		// A removed/banned member must be evicted from serverSubscriptions before a
+		// concurrently-queued server fanout (e.g. server_updated, key_revocation) can
+		// leak to them. evictBroadcast is low-traffic, so this cannot starve the loop.
+		// CV-CAN-027/028.
 		select {
+		case message := <-h.evictBroadcast:
+			h.handleServerBroadcast(message)
+			continue
+		default:
+		}
+
+		select {
+		case message := <-h.evictBroadcast:
+			h.handleServerBroadcast(message)
+
 		case client := <-h.register:
 			h.handleRegister(client)
 
@@ -2243,6 +2266,14 @@ func (h *Hub) BroadcastToAll(msg OutgoingMessage) {
 
 // handleServerBroadcast sends a message to all clients subscribed to a server.
 func (h *Hub) handleServerBroadcast(msg ServerBroadcastMessage) {
+	// A prune attached to this broadcast (CV-CAN-027/028) must run AFTER delivery and
+	// regardless of the delivery outcome, so the security eviction is never skipped by
+	// an early return. Deferring keeps it in this same serialized hub operation, which
+	// guarantees it runs before any later server broadcast (e.g. key_revocation).
+	if msg.PruneUserAfter != nil {
+		defer h.evictServerSubscriber(msg.ServerID, *msg.PruneUserAfter)
+	}
+
 	subscribers, ok := h.serverSubscriptions[msg.ServerID]
 	if !ok {
 		return
@@ -2271,6 +2302,30 @@ func (h *Hub) BroadcastToServer(serverID uuid.UUID, msg OutgoingMessage) {
 	h.serverBroadcast <- ServerBroadcastMessage{
 		ServerID: serverID,
 		Data:     msg,
+	}
+}
+
+// BroadcastToServerAndPrune sends msg to all of serverID's current subscribers and
+// then, in the SAME serialized hub operation, removes pruneUserID's clients from the
+// server subscription set. Delivery and eviction happen in one handleServerBroadcast
+// call on the Run goroutine, so a removed/banned member still receives their own
+// member_removed event and is then unsubscribed before any subsequent server fanout.
+//
+// The message is queued on the dedicated evictBroadcast channel, which the Run loop
+// drains at higher priority than serverBroadcast. This guarantees the eviction runs
+// before server broadcasts that originate on OTHER code paths (e.g. server_updated
+// via handleServerUpdate, or unread_notify), not just those queued behind it on
+// serverBroadcast. This closes the window where such a fanout could leak to a member
+// who has already been removed. The send is blocking, so the eviction cannot be silently
+// dropped; the caller is an HTTP handler (not the Run goroutine), so this cannot
+// self-deadlock. This is the ordered, guaranteed-delivery mechanism for evicting
+// removed/banned members. CV-CAN-027/028.
+func (h *Hub) BroadcastToServerAndPrune(serverID uuid.UUID, msg OutgoingMessage, pruneUserID uuid.UUID) {
+	uid := pruneUserID
+	h.evictBroadcast <- ServerBroadcastMessage{
+		ServerID:       serverID,
+		Data:           msg,
+		PruneUserAfter: &uid,
 	}
 }
 
@@ -2980,6 +3035,30 @@ func (h *Hub) handleDisconnectSession(sessionID string) {
 // client to disconnect itself — this is the authoritative enforcement.
 func (h *Hub) DisconnectUser(userID uuid.UUID) {
 	h.disconnectUser <- userID
+}
+
+// evictServerSubscriber removes every client of userID from serverID's server-level
+// subscription set, so a member removed from the server (kicked, self-removed, or
+// banned) stops receiving that server's WebSocket fanout (member events,
+// key_revocation, server updates). It does NOT disconnect the client, since the user
+// may still belong to other servers. Must run on the Run goroutine, which owns
+// serverSubscriptions; callers reach it via BroadcastToServerAndPrune so the eviction
+// is ordered relative to server broadcasts. CV-CAN-027/028.
+func (h *Hub) evictServerSubscriber(serverID, userID uuid.UUID) {
+	subscribers, ok := h.serverSubscriptions[serverID]
+	if !ok {
+		return
+	}
+	clientIDs, ok := h.userClients[userID]
+	if !ok {
+		return
+	}
+	for clientID := range clientIDs {
+		delete(subscribers, clientID)
+	}
+	if len(subscribers) == 0 {
+		delete(h.serverSubscriptions, serverID)
+	}
 }
 
 // DisconnectSession forces a specific session's WebSocket connections to close (thread-safe).

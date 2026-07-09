@@ -45,6 +45,7 @@ func TestNewHubInitializesMaps(t *testing.T) {
 	assert.NotNil(t, hub.globalBroadcast)
 	assert.NotNil(t, hub.userBroadcast)
 	assert.NotNil(t, hub.serverBroadcast)
+	assert.NotNil(t, hub.evictBroadcast)
 	assert.NotNil(t, hub.dmBroadcast)
 	assert.NotNil(t, hub.disconnectUser)
 	assert.NotNil(t, hub.disconnectSession)
@@ -66,6 +67,118 @@ func TestNewHubInitializesRevalidationQueues(t *testing.T) {
 
 	assert.NotNil(t, hub.revalidateChannel)
 	assert.NotNil(t, hub.revalidateServer)
+}
+
+// CV-CAN-027/028: a member removed/banned from a server must be evicted from the
+// server-level subscription set so they stop receiving that server's WS fanout. The
+// eviction rides on the member_removed broadcast via the dedicated, priority-drained
+// evictBroadcast channel (BroadcastToServerAndPrune) so it is ordered AFTER that
+// delivery and BEFORE any later server fanout, including fanouts that originate on
+// other code paths (e.g. server_updated, key_revocation).
+
+func TestEvictServerSubscriberRemovesUsersClients(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	removedUser := uuid.New()
+	removedClient := uuid.New()
+	removedClient2 := uuid.New()
+	stayClient := uuid.New()
+
+	hub.userClients[removedUser] = map[uuid.UUID]bool{removedClient: true, removedClient2: true}
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{
+		removedClient:  true,
+		removedClient2: true,
+		stayClient:     true,
+	}
+
+	hub.evictServerSubscriber(serverID, removedUser)
+
+	subs := hub.serverSubscriptions[serverID]
+	assert.NotContains(t, subs, removedClient, "removed user's client must be evicted")
+	assert.NotContains(t, subs, removedClient2, "removed user's second client must be evicted")
+	assert.Contains(t, subs, stayClient, "other members stay subscribed")
+}
+
+func TestEvictServerSubscriberDeletesEmptyServerEntry(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	user := uuid.New()
+	clientID := uuid.New()
+	hub.userClients[user] = map[uuid.UUID]bool{clientID: true}
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{clientID: true}
+
+	hub.evictServerSubscriber(serverID, user)
+
+	_, ok := hub.serverSubscriptions[serverID]
+	assert.False(t, ok, "empty server subscription entry is cleaned up")
+}
+
+func TestBroadcastToServerAndPruneQueuesOrderedMessage(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	userID := uuid.New()
+
+	hub.BroadcastToServerAndPrune(serverID, OutgoingMessage{Type: "member_removed"}, userID)
+
+	// The prune must ride on the dedicated evictBroadcast channel (not serverBroadcast)
+	// so the Run loop drains it at priority and applies delivery + eviction in a single,
+	// ordered operation ahead of any other queued server fanout.
+	select {
+	case msg := <-hub.evictBroadcast:
+		assert.Equal(t, serverID, msg.ServerID)
+		assert.Equal(t, "member_removed", msg.Data.Type)
+		if assert.NotNil(t, msg.PruneUserAfter, "prune must ride on the member_removed broadcast") {
+			assert.Equal(t, userID, *msg.PruneUserAfter)
+		}
+	default:
+		t.Fatal("expected an eviction broadcast to be queued")
+	}
+
+	// Nothing should have been queued on the general serverBroadcast channel.
+	select {
+	case <-hub.serverBroadcast:
+		t.Fatal("prune must not be queued on serverBroadcast")
+	default:
+	}
+}
+
+// handleServerBroadcast must deliver the message to the pruned user BEFORE evicting
+// them (so they receive their own member_removed) and evict them afterward (so they
+// miss any later server broadcast queued on the same channel, e.g. key_revocation).
+func TestHandleServerBroadcastPruneDeliversThenEvicts(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	removedUser := uuid.New()
+
+	removedClient := newTestClient(hub, removedUser)
+	stayClient := newTestClient(hub, uuid.New())
+	hub.clients[removedClient.ID] = removedClient
+	hub.clients[stayClient.ID] = stayClient
+	hub.userClients[removedUser] = map[uuid.UUID]bool{removedClient.ID: true}
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{
+		removedClient.ID: true,
+		stayClient.ID:    true,
+	}
+
+	uid := removedUser
+	hub.handleServerBroadcast(ServerBroadcastMessage{
+		ServerID:       serverID,
+		Data:           OutgoingMessage{Type: "member_removed"},
+		PruneUserAfter: &uid,
+	})
+
+	// Delivered before eviction: the removed user still got their own event.
+	select {
+	case <-removedClient.Send:
+	default:
+		t.Fatal("removed user's client must receive member_removed before being evicted")
+	}
+
+	// Evicted after delivery: no longer subscribed, so later broadcasts skip them.
+	assert.NotContains(t, hub.serverSubscriptions[serverID], removedClient.ID,
+		"removed user's client must be evicted after delivery")
+	assert.Contains(t, hub.serverSubscriptions[serverID], stayClient.ID,
+		"other members stay subscribed")
 }
 
 func TestSetChannelPermissionChecker(t *testing.T) {
@@ -171,6 +284,7 @@ func newMinimalHub() *Hub {
 		globalBroadcast:        make(chan OutgoingMessage, 256),
 		userBroadcast:          make(chan UserBroadcastMessage, 256),
 		serverBroadcast:        make(chan ServerBroadcastMessage, 256),
+		evictBroadcast:         make(chan ServerBroadcastMessage, 16),
 		dmBroadcast:            make(chan DMBroadcastMessage, 256),
 		channelDeliveryResults: make(chan channelDeliveryResult, 256),
 		onlineCountPending:     make(map[uuid.UUID]bool),
