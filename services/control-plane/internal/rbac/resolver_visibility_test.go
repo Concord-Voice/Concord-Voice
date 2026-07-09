@@ -414,6 +414,240 @@ func TestGetVisibleChannelIDsAdminIgnoresDenyOverrides(t *testing.T) {
 	assert.Contains(t, ids, ch2)
 }
 
+// --- GetAllVisibleChannelIDs Tests ---
+//
+// GetAllVisibleChannelIDs is the single-query, cross-server counterpart to
+// GetVisibleChannelIDs. These tests verify it produces the same visibility
+// decisions (owner/admin fast paths, per-channel SBAC allow/deny, type-aware
+// view bits) while aggregating across every server the user belongs to.
+
+func TestGetAllVisibleChannelIDsAggregatesAcrossServers(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	user := ts.CreateTestUser(t, "allvisuser1")
+	otherOwner := ts.CreateTestUser(t, "allvisother1")
+
+	// Server A: user is owner.
+	serverA := ts.CreateTestServer(t, user.ID, "AllVis Server A")
+	a1 := ts.CreateTestChannel(t, serverA, "a-text")
+	a2 := ts.CreateVoiceChannel(t, serverA, "a-voice")
+
+	// Server B: user is a plain member.
+	serverB := ts.CreateTestServer(t, otherOwner.ID, "AllVis Server B")
+	ts.AddMemberToServer(t, serverB, user.ID, "member")
+	b1 := ts.CreateTestChannel(t, serverB, "b-text")
+
+	// Server C: user is NOT a member.
+	serverC := ts.CreateTestServer(t, otherOwner.ID, "AllVis Server C")
+	c1 := ts.CreateTestChannel(t, serverC, "c-text")
+
+	ids, err := resolver.GetAllVisibleChannelIDs(ctx, user.ID)
+	require.NoError(t, err)
+	assert.Contains(t, ids, a1)
+	assert.Contains(t, ids, a2)
+	assert.Contains(t, ids, b1)
+	assert.NotContains(t, ids, c1, "channels in a server the user does not belong to must be excluded")
+	assert.Len(t, ids, 3)
+}
+
+func TestGetAllVisibleChannelIDsEmptyForNonMember(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	outsider := ts.CreateTestUser(t, "allvisoutsider2")
+	owner := ts.CreateTestUser(t, "allvisowner2")
+	serverID := ts.CreateTestServer(t, owner.ID, "AllVis Server 2")
+	ts.CreateTestChannel(t, serverID, "lonely")
+
+	ids, err := resolver.GetAllVisibleChannelIDs(ctx, outsider.ID)
+	require.NoError(t, err)
+	assert.Empty(t, ids)
+	assert.Equal(t, []string{}, ids, "should return empty slice, not nil")
+}
+
+func TestGetAllVisibleChannelIDsRespectsDenyOverride(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "allvisowner3")
+	member := ts.CreateTestUser(t, "allvismember3")
+	serverID := ts.CreateTestServer(t, owner.ID, "AllVis Server 3")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	chVisible := ts.CreateTestChannel(t, serverID, "visible-3")
+	chHidden := ts.CreateTestChannel(t, serverID, "hidden-3")
+
+	var allRoleID string
+	err := ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID)
+	require.NoError(t, err)
+	ts.CreateChannelOverride(t, chHidden, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+
+	ids, err := resolver.GetAllVisibleChannelIDs(ctx, member.ID)
+	require.NoError(t, err)
+	assert.Contains(t, ids, chVisible)
+	assert.NotContains(t, ids, chHidden, "role-deny of the view bit must hide the channel")
+}
+
+func TestGetAllVisibleChannelIDsAdminSeesAllDespiteDeny(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "allvisowner4")
+	admin := ts.CreateTestUser(t, "allvisadmin4")
+	serverID := ts.CreateTestServer(t, owner.ID, "AllVis Server 4")
+	ts.AddMemberToServer(t, serverID, admin.ID, "member")
+	adminRoleID := ts.CreateTestRole(t, serverID, "Admin-av4", 10, int64(rbac.PermAdministrator))
+	ts.AssignRoleToUser(t, serverID, admin.ID, adminRoleID)
+
+	ch1 := ts.CreateTestChannel(t, serverID, "text-av4")
+	ch2 := ts.CreateVoiceChannel(t, serverID, "voice-av4")
+
+	var allRoleID string
+	err := ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID)
+	require.NoError(t, err)
+	ts.CreateChannelOverride(t, ch1, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+	ts.CreateChannelOverride(t, ch2, "role", allRoleID, 0, int64(rbac.PermViewVoiceChannels))
+	ts.CreateChannelOverride(t, ch1, "user", admin.ID, 0, int64(rbac.PermViewTextChannels))
+
+	ids, err := resolver.GetAllVisibleChannelIDs(ctx, admin.ID)
+	require.NoError(t, err)
+	assert.Contains(t, ids, ch1)
+	assert.Contains(t, ids, ch2)
+	assert.Len(t, ids, 2, "administrator sees all channels; SBAC cannot restrict them")
+}
+
+func TestGetAllVisibleChannelIDsTypeAware(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "allvisowner5")
+	member := ts.CreateTestUser(t, "allvismember5")
+	serverID := ts.CreateTestServer(t, owner.ID, "AllVis Server 5")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	chText := ts.CreateTestChannel(t, serverID, "text-av5")
+	chVoice := ts.CreateVoiceChannel(t, serverID, "voice-av5")
+
+	var allRoleID string
+	err := ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID)
+	require.NoError(t, err)
+	// Deny only the voice view bit — the text channel stays visible.
+	ts.CreateChannelOverride(t, chVoice, "role", allRoleID, 0, int64(rbac.PermViewVoiceChannels))
+
+	ids, err := resolver.GetAllVisibleChannelIDs(ctx, member.ID)
+	require.NoError(t, err)
+	assert.Contains(t, ids, chText)
+	assert.NotContains(t, ids, chVoice, "voice-view deny must not hide via the text bit")
+}
+
+func TestGetAllVisibleChannelIDsUserAllowOverridesRoleDeny(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "allvisowner6")
+	member := ts.CreateTestUser(t, "allvismember6")
+	serverID := ts.CreateTestServer(t, owner.ID, "AllVis Server 6")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	ch := ts.CreateTestChannel(t, serverID, "restricted-av6")
+
+	var allRoleID string
+	err := ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID)
+	require.NoError(t, err)
+	ts.CreateChannelOverride(t, ch, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+	ts.CreateChannelOverride(t, ch, "user", member.ID, int64(rbac.PermViewTextChannels), 0)
+
+	ids, err := resolver.GetAllVisibleChannelIDs(ctx, member.ID)
+	require.NoError(t, err)
+	assert.Contains(t, ids, ch, "user-allow should override role-deny for visibility")
+}
+
+// TestGetAllVisibleChannelIDsMatchesPerServer asserts parity with the per-server
+// resolver across a mixed multi-server setup: the aggregate result must equal the
+// union of GetVisibleChannelIDs over each of the user's servers.
+func TestGetAllVisibleChannelIDsMatchesPerServer(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "allvisowner7")
+	member := ts.CreateTestUser(t, "allvismember7")
+
+	// Server 1: member with a hidden channel.
+	server1 := ts.CreateTestServer(t, owner.ID, "AllVis Parity 1")
+	ts.AddMemberToServer(t, server1, member.ID, "member")
+	ts.CreateTestChannel(t, server1, "p1-visible")
+	p1Hidden := ts.CreateTestChannel(t, server1, "p1-hidden")
+	var role1 string
+	require.NoError(t, ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, server1).Scan(&role1))
+	ts.CreateChannelOverride(t, p1Hidden, "role", role1, 0, int64(rbac.PermViewTextChannels))
+
+	// Server 2: member is the owner (sees all).
+	server2 := ts.CreateTestServer(t, member.ID, "AllVis Parity 2")
+	ts.CreateTestChannel(t, server2, "p2-text")
+	ts.CreateVoiceChannel(t, server2, "p2-voice")
+
+	// Server 3: member is not part of it — must contribute nothing.
+	server3 := ts.CreateTestServer(t, owner.ID, "AllVis Parity 3")
+	ts.CreateTestChannel(t, server3, "p3-text")
+
+	expected := map[string]bool{}
+	for _, sid := range []string{server1, server2} {
+		perServer, err := resolver.GetVisibleChannelIDs(ctx, sid, member.ID)
+		require.NoError(t, err)
+		for _, id := range perServer {
+			expected[id] = true
+		}
+	}
+
+	all, err := resolver.GetAllVisibleChannelIDs(ctx, member.ID)
+	require.NoError(t, err)
+
+	got := map[string]bool{}
+	for _, id := range all {
+		got[id] = true
+	}
+	assert.Equal(t, expected, got, "aggregate must equal the union of per-server visibility")
+}
+
+// TestGetAllVisibleChannelIDsScopesRoleOverridesByServer verifies that a channel
+// override targeting a role the user holds in a DIFFERENT server does not leak into
+// the cross-server resolver. user_roles spans every server the user belongs to, so
+// without server-scoping the role match, a role from server B could satisfy an
+// override on a channel in server A (target_id is only UUID-validated) and make
+// GetAllVisibleChannelIDs disagree with the per-server GetVisibleChannelIDs.
+func TestGetAllVisibleChannelIDsScopesRoleOverridesByServer(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "allvisowner8")
+	member := ts.CreateTestUser(t, "allvismember8")
+
+	// Server A: member sees chA via base @all permissions.
+	serverA := ts.CreateTestServer(t, owner.ID, "AllVis CrossRole A")
+	ts.AddMemberToServer(t, serverA, member.ID, "member")
+	chA := ts.CreateTestChannel(t, serverA, "a-text-8")
+
+	// Server B: member holds server B's @all role.
+	serverB := ts.CreateTestServer(t, owner.ID, "AllVis CrossRole B")
+	ts.AddMemberToServer(t, serverB, member.ID, "member")
+	var roleBAll string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverB).Scan(&roleBAll))
+
+	// Cross-server override: deny text-view on chA (server A) via a role that lives
+	// in server B. The per-server resolver ignores it (roleBAll is not a server-A
+	// role); the cross-server resolver must ignore it too.
+	ts.CreateChannelOverride(t, chA, "role", roleBAll, 0, int64(rbac.PermViewTextChannels))
+
+	// Per-server visibility is unaffected: chA stays visible in server A.
+	perServer, err := resolver.GetVisibleChannelIDs(ctx, serverA, member.ID)
+	require.NoError(t, err)
+	assert.Contains(t, perServer, chA, "cross-server role override must not hide the channel per-server")
+
+	// Cross-server visibility must agree: chA remains visible.
+	all, err := resolver.GetAllVisibleChannelIDs(ctx, member.ID)
+	require.NoError(t, err)
+	assert.Contains(t, all, chA, "a role override targeting another server's role must not hide the channel")
+}
+
 // --- GetEffectivePermissions Additional Tests ---
 
 func TestGetEffectivePermissionsCacheHit(t *testing.T) {

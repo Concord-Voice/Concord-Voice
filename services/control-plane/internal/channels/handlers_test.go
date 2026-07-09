@@ -2,12 +2,14 @@ package channels_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -130,6 +132,93 @@ func TestGetChannelSuccess(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
+// TestGetChannel_HiddenChannelDeniedToMember covers CV-CAN-001: a server member
+// denied channel view must not read hidden channel metadata by UUID; the owner
+// (view-bypass) still sees it.
+func TestGetChannel_HiddenChannelDeniedToMember(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "gcowner")
+	member := ts.CreateTestUser(t, "gcmember")
+	serverID := ts.CreateTestServer(t, owner.ID, "GetChannel Hidden")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	channelID := ts.CreateTestChannel(t, serverID, "hidden-general")
+
+	var allRoleID string
+	err := ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID)
+	require.NoError(t, err)
+	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+
+	w := ts.DoRequest("GET", pathChannelsPrefix+channelID, nil, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusNotFound, w.Code, "view-denied member gets not-found (no existence oracle)")
+
+	w = ts.DoRequest("GET", pathChannelsPrefix+channelID, nil, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code, "owner still sees the channel")
+}
+
+// TestGetUnreadCounts_ExcludesHiddenChannel covers CV-CAN-002: unread counts must
+// not enumerate channel IDs the caller cannot view.
+func TestGetUnreadCounts_ExcludesHiddenChannel(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "ucowner")
+	member := ts.CreateTestUser(t, "ucmember")
+	serverID := ts.CreateTestServer(t, owner.ID, "Unread Hidden")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	visibleChan := ts.CreateTestChannel(t, serverID, "visible-chan")
+	hiddenChan := ts.CreateTestChannel(t, serverID, "hidden-chan")
+
+	var allRoleID string
+	err := ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID)
+	require.NoError(t, err)
+	ts.CreateChannelOverride(t, hiddenChan, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+
+	w := ts.DoRequest("GET", pathServersPrefix+serverID+"/unread", nil, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body struct {
+		Unreads []struct {
+			ChannelID string `json:"channel_id"`
+		} `json:"unreads"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	ids := make(map[string]bool)
+	for _, u := range body.Unreads {
+		ids[u.ChannelID] = true
+	}
+	assert.True(t, ids[visibleChan], "visible channel must be present in unread counts")
+	assert.False(t, ids[hiddenChan], "hidden channel must be excluded from unread counts")
+}
+
+// TestGetUnreadCounts_AllChannelsHiddenReturnsEmpty covers CV-CAN-002: a member
+// denied view on every channel gets an empty unread list (200), and the count
+// aggregation is never run over hidden channels (the SQL is scoped to visible
+// channel IDs, so hidden-channel message history cannot be forced to be scanned).
+func TestGetUnreadCounts_AllChannelsHiddenReturnsEmpty(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "uchidallowner")
+	member := ts.CreateTestUser(t, "uchidallmember")
+	serverID := ts.CreateTestServer(t, owner.ID, "Unread All Hidden")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	hidden1 := ts.CreateTestChannel(t, serverID, "hidden-1")
+	hidden2 := ts.CreateTestChannel(t, serverID, "hidden-2")
+
+	var allRoleID string
+	err := ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID)
+	require.NoError(t, err)
+	ts.CreateChannelOverride(t, hidden1, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+	ts.CreateChannelOverride(t, hidden2, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+
+	w := ts.DoRequest("GET", pathServersPrefix+serverID+"/unread", nil, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body struct {
+		Unreads []struct {
+			ChannelID string `json:"channel_id"`
+		} `json:"unreads"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Empty(t, body.Unreads, "member who can view no channels must get an empty unread list")
+}
+
 // --- Update Channel ---
 
 func TestUpdateChannelSuccess(t *testing.T) {
@@ -174,6 +263,40 @@ func TestMarkChannelReadSuccess(t *testing.T) {
 	ts, user, _, channelID := setupWithChannel(t)
 
 	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+"/read", nil, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// TestMarkChannelRead_ViewDeniedMemberBlocked covers CV-CAN-002: a member denied
+// view on a channel must not be able to write read state for it via the
+// per-channel endpoint. The response must match the non-member response so a
+// hidden channel cannot be distinguished, and no channel_read_states row is written.
+func TestMarkChannelRead_ViewDeniedMemberBlocked(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "mcrhidowner")
+	member := ts.CreateTestUser(t, "mcrhidmember")
+	serverID := ts.CreateTestServer(t, owner.ID, "MarkRead Hidden")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	hiddenChan := ts.CreateTestChannel(t, serverID, "hidden-mcr")
+
+	var allRoleID string
+	err := ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID)
+	require.NoError(t, err)
+	ts.CreateChannelOverride(t, hiddenChan, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+
+	// View-denied member is blocked with the same response as a non-member.
+	w := ts.DoRequest("POST", pathChannelsPrefix+hiddenChan+"/read", nil, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+
+	// No read state was written for the hidden channel.
+	var exists bool
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM channel_read_states WHERE user_id = $1 AND channel_id = $2)`,
+		member.ID, hiddenChan,
+	).Scan(&exists))
+	assert.False(t, exists, "no read state must be written for a hidden channel")
+
+	// The owner (bypasses view) can still mark the channel read.
+	w = ts.DoRequest("POST", pathChannelsPrefix+hiddenChan+"/read", nil, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 

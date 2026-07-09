@@ -226,6 +226,23 @@ func (r *Resolver) InvalidateChannel(ctx context.Context, serverID, channelID st
 	return r.cache.InvalidateChannel(ctx, serverID, channelID)
 }
 
+// sbacChannelOverrideColumns is the SELECT column list, shared verbatim by the
+// channel_overrides CTE in GetVisibleChannelIDs and GetAllVisibleChannelIDs, that
+// aggregates the SBAC role/user allow/deny bitfields for a channel. Both callers
+// then derive effective visibility from these four columns using the identical
+// formula ((base | role_allow) & ~role_deny | user_allow) & ~user_deny, so the
+// aggregation must stay byte-for-byte identical between them; keeping it in one
+// constant guarantees the two queries can never silently drift apart.
+//
+// It is a compile-time string constant concatenated into each query (no fmt.Sprintf
+// and no concatenation of runtime values), so it adds no dynamic-SQL surface and is
+// not flagged by gosec G201/G202 or the concord-go-sql-sprintf semgrep rule.
+const sbacChannelOverrideColumns = `
+				COALESCE(BIT_OR(cpo.allow) FILTER (WHERE cpo.target_type = 'role'), 0) AS role_allow,
+				COALESCE(BIT_OR(cpo.deny)  FILTER (WHERE cpo.target_type = 'role'), 0) AS role_deny,
+				COALESCE(BIT_OR(cpo.allow) FILTER (WHERE cpo.target_type = 'user'), 0) AS user_allow,
+				COALESCE(BIT_OR(cpo.deny)  FILTER (WHERE cpo.target_type = 'user'), 0) AS user_deny`
+
 // GetVisibleChannelIDs returns a list of channel IDs that the user can view.
 // Visibility is type-aware: text/bulletin channels require PermViewTextChannels,
 // voice channels require PermViewVoiceChannels. This allows RBAC roles (and SBAC
@@ -289,11 +306,7 @@ func (r *Resolver) GetVisibleChannelIDs(ctx context.Context, serverID, userID st
 		),
 		channel_overrides AS (
 			SELECT
-				cpo.channel_id,
-				COALESCE(BIT_OR(cpo.allow) FILTER (WHERE cpo.target_type = 'role'), 0) AS role_allow,
-				COALESCE(BIT_OR(cpo.deny)  FILTER (WHERE cpo.target_type = 'role'), 0) AS role_deny,
-				COALESCE(BIT_OR(cpo.allow) FILTER (WHERE cpo.target_type = 'user'), 0) AS user_allow,
-				COALESCE(BIT_OR(cpo.deny)  FILTER (WHERE cpo.target_type = 'user'), 0) AS user_deny
+				cpo.channel_id,` + sbacChannelOverrideColumns + `
 			FROM channel_permission_overrides cpo
 			WHERE cpo.channel_id IN (SELECT id FROM channels WHERE server_id = $1)
 			  AND (
@@ -320,36 +333,120 @@ func (r *Resolver) GetVisibleChannelIDs(ctx context.Context, serverID, userID st
 		  )
 	`
 
-	rows, err := r.db.QueryContext(ctx, query, serverID, userID, basePerms,
-		int64(PermViewTextChannels), int64(PermViewVoiceChannels))
-	if err != nil {
-		return nil, fmt.Errorf("failed to query visible channels: %w", err)
-	}
-	defer rows.Close() //nolint:errcheck
+	return r.queryChannelIDs(ctx, "failed to query visible channels", query,
+		serverID, userID, basePerms, int64(PermViewTextChannels), int64(PermViewVoiceChannels))
+}
 
-	var visibleIDs []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		visibleIDs = append(visibleIDs, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
+// GetAllVisibleChannelIDs returns every channel ID the user can view across all
+// servers they belong to, resolving visibility in a single SQL round-trip.
+//
+// This is the cross-server counterpart to GetVisibleChannelIDs. Calling
+// GetVisibleChannelIDs once per server issues 1+N queries (and up to ~4 per
+// server internally), which regresses hot paths like GetServerUnreadStatus for
+// users in many servers. This query folds membership, the owner/administrator
+// fast paths, and the per-channel SBAC bitfield math into one statement, using
+// the exact same resolution rules:
+//
+//	effective = ((base | role_allow) & ~role_deny | user_allow) & ~user_deny
+//
+// A channel is visible when the caller owns the server, is an administrator of
+// it, or the effective permissions include the type-appropriate view bit
+// (PermViewTextChannels for text/bulletin, PermViewVoiceChannels for voice).
+func (r *Resolver) GetAllVisibleChannelIDs(ctx context.Context, userID string) ([]string, error) {
+	// One statement across every server the user is a member of:
+	//   - memberships: gates results to the user's servers (non-members see nothing)
+	//   - base_perms:  BIT_OR of the user's role permissions per server (owner/admin fast paths)
+	//   - user_roles / channel_overrides: SBAC allow/deny bitfields for the user's roles + user,
+	//     with role overrides scoped to the channel's server (a role the user holds in one server
+	//     must not satisfy an override on a channel in another server)
+	// The final predicate mirrors GetVisibleChannelIDs: owner OR administrator OR
+	// the SBAC effective permissions include the type-appropriate view bit.
+	query := `
+		WITH memberships AS (
+			SELECT server_id
+			FROM server_members
+			WHERE user_id = $1
+		),
+		user_roles AS (
+			SELECT mr.role_id, mr.server_id
+			FROM member_roles mr
+			WHERE mr.user_id = $1
+		),
+		base_perms AS (
+			SELECT mr.server_id,
+				COALESCE(BIT_OR(r.permissions), 0) AS perms
+			FROM member_roles mr
+			INNER JOIN roles r ON mr.role_id = r.id
+			WHERE mr.user_id = $1
+			GROUP BY mr.server_id
+		),
+		channel_overrides AS (
+			SELECT
+				cpo.channel_id,` + sbacChannelOverrideColumns + `
+			FROM channel_permission_overrides cpo
+			JOIN channels ch ON ch.id = cpo.channel_id
+			WHERE (
+				-- Role overrides apply only when the targeted role belongs to the same
+				-- server as the channel. user_roles spans every server the user is in,
+				-- so without this server scoping a role the user holds in server X could
+				-- satisfy an override on a channel in server Y (target_id is only
+				-- UUID-validated), diverging from the per-server resolver which scopes
+				-- role overrides to the channel's server.
+				(cpo.target_type = 'role' AND cpo.target_id IN (
+					SELECT ur.role_id FROM user_roles ur WHERE ur.server_id = ch.server_id
+				))
+				OR (cpo.target_type = 'user' AND cpo.target_id = $1)
+			)
+			GROUP BY cpo.channel_id
+		)
+		SELECT c.id
+		FROM channels c
+		INNER JOIN memberships m ON m.server_id = c.server_id
+		INNER JOIN servers s ON s.id = c.server_id
+		LEFT JOIN base_perms bp ON bp.server_id = c.server_id
+		LEFT JOIN channel_overrides co ON co.channel_id = c.id
+		WHERE
+			-- Owner fast path: owner sees every channel
+			s.owner_id = $1
+			-- Administrator fast path: SBAC cannot restrict administrators
+			OR (COALESCE(bp.perms, 0) & $2::bigint) != 0
+			-- Otherwise: per-channel SBAC bitfield math against the view bit
+			OR (
+				(
+					(
+						(COALESCE(bp.perms, 0) | COALESCE(co.role_allow, 0)) & ~COALESCE(co.role_deny, 0)
+						| COALESCE(co.user_allow, 0)
+					) & ~COALESCE(co.user_deny, 0)
+				) &
+				CASE WHEN c.type = 'voice' THEN $4::bigint ELSE $3::bigint END
+				!= 0
+			)
+	`
 
-	if visibleIDs == nil {
-		visibleIDs = []string{}
-	}
-	return visibleIDs, nil
+	return r.queryChannelIDs(ctx, "failed to query all visible channels", query,
+		userID, int64(PermAdministrator), int64(PermViewTextChannels), int64(PermViewVoiceChannels))
 }
 
 // getAllChannelIDs returns all channel IDs for a server (used for owner/admin fast path)
 func (r *Resolver) getAllChannelIDs(ctx context.Context, serverID string) ([]string, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT id FROM channels WHERE server_id = $1`, serverID)
+	return r.queryChannelIDs(ctx, "failed to query channels",
+		`SELECT id FROM channels WHERE server_id = $1`, serverID)
+}
+
+// queryChannelIDs runs a query whose rows each carry a single channel-id column and
+// collects them into a slice, wrapping any query error with wrapMsg. A nil result is
+// normalized to a non-nil empty slice so callers can return it directly. The channel
+// visibility resolvers (GetVisibleChannelIDs, GetAllVisibleChannelIDs) and the
+// owner/admin fast path (getAllChannelIDs) share this so the row-scan/collect
+// boilerplate lives in exactly one place.
+//
+// query is always a caller-supplied constant SQL string with values bound as
+// positional parameters (never interpolated), so this introduces no dynamic-SQL
+// surface for gosec G201/G202.
+func (r *Resolver) queryChannelIDs(ctx context.Context, wrapMsg, query string, args ...interface{}) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query channels: %w", err)
+		return nil, fmt.Errorf("%s: %w", wrapMsg, err)
 	}
 	defer rows.Close() //nolint:errcheck
 
