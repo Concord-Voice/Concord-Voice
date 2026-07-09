@@ -531,6 +531,26 @@ func TestOpenConversation_PrivacyBlocked_DMDisabled(t *testing.T) {
 	assert.Equal(t, "dm_disabled", body["error"])
 }
 
+// dm_privacy_level 0 ("No One" / "Nobody can DM you") must block even accepted
+// friends — the friend short-circuit does not override a full DM opt-out.
+func TestOpenConversation_FriendButDMsDisabled_Blocked(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "openfrienddis1")
+	user2 := ts.CreateTestUser(t, "openfrienddis2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	// Accepted friends, but the target has disabled all DMs (level 0).
+	setDMPrivacy(t, ts, user2.ID, 0, false)
+
+	w := ts.DoRequest("POST", pathDMConversations, map[string]interface{}{
+		"user_id": user2.ID,
+	}, testhelpers.AuthHeaders(user1.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "dm_disabled", body["error"])
+}
+
 func TestOpenConversation_PrivacyBlocked_FriendsOnly(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "openprivfr1")
@@ -832,6 +852,10 @@ func TestCreateGroup_Success(t *testing.T) {
 	user1 := ts.CreateTestUser(t, "grp1")
 	user2 := ts.CreateTestUser(t, "grp2")
 	user3 := ts.CreateTestUser(t, "grp3")
+	// Group creation honors DM privacy (CV-CAN-029); befriend the targets so this
+	// happy-path setup is a legitimate group under default (friends+server) privacy.
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	ts.CreateFriendship(t, user1.ID, user3.ID, statusAccepted)
 
 	groupName := "Test Group"
 	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
@@ -855,6 +879,7 @@ func TestCreateGroup_NoName(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "grpnoname1")
 	user2 := ts.CreateTestUser(t, "grpnoname2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted) // CV-CAN-029: valid target
 
 	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
 		"user_ids": []string{user2.ID},
@@ -939,6 +964,7 @@ func TestCreateGroup_MaxParticipants(t *testing.T) {
 	for i := 0; i < 9; i++ {
 		u := ts.CreateTestUser(t, fmt.Sprintf("grpmax%d", i))
 		userIDs[i] = u.ID
+		ts.CreateFriendship(t, creator.ID, u.ID, statusAccepted) // CV-CAN-029: valid targets
 	}
 
 	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
@@ -957,6 +983,126 @@ func TestCreateGroup_Unauthorized(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
+// CV-CAN-029: group DM creation must honor each target's DM privacy settings,
+// mirroring the 1:1 OpenConversation boundary — a caller cannot pull a user who
+// has DMs disabled or restricted into a group DM.
+
+func TestCreateGroup_TargetDMsDisabled_Blocked(t *testing.T) {
+	ts := setupTS(t)
+	creator := ts.CreateTestUser(t, "grpprivdis1")
+	friend := ts.CreateTestUser(t, "grpprivdis2")
+	blocked := ts.CreateTestUser(t, "grpprivdis3")
+	ts.CreateFriendship(t, creator.ID, friend.ID, statusAccepted)
+	// `blocked` has DMs disabled (level 0) and is not a friend of the creator.
+	setDMPrivacy(t, ts, blocked.ID, 0, false)
+
+	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
+		"user_ids": []string{friend.ID, blocked.ID},
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "dm_disabled", body["error"])
+}
+
+// A friend who has fully disabled DMs (level 0) must not be pullable into a
+// group DM either — the friend relationship does not bypass "No One" (the
+// friend-bypass gap flagged on CV-CAN-029).
+func TestCreateGroup_FriendTargetDMsDisabled_Blocked(t *testing.T) {
+	ts := setupTS(t)
+	creator := ts.CreateTestUser(t, "grpfrienddis1")
+	friend := ts.CreateTestUser(t, "grpfrienddis2")
+	ts.CreateFriendship(t, creator.ID, friend.ID, statusAccepted)
+	// The target is an accepted friend but has disabled all DMs (level 0).
+	setDMPrivacy(t, ts, friend.ID, 0, false)
+
+	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
+		"user_ids": []string{friend.ID},
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "dm_disabled", body["error"])
+}
+
+func TestCreateGroup_TargetFriendsOnly_NonFriend_Blocked(t *testing.T) {
+	ts := setupTS(t)
+	creator := ts.CreateTestUser(t, "grpprivfr1")
+	stranger := ts.CreateTestUser(t, "grpprivfr2")
+	// `stranger` accepts DMs from friends only (level 1); the creator is not a friend
+	// and shares no server, so group inclusion must be blocked.
+	setDMPrivacy(t, ts, stranger.ID, 1, false)
+
+	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
+		"user_ids": []string{stranger.ID},
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "privacy_blocked", body["error"])
+}
+
+func TestCreateGroup_TargetNotFound(t *testing.T) {
+	ts := setupTS(t)
+	creator := ts.CreateTestUser(t, "grpghosttarget")
+	friend := ts.CreateTestUser(t, "grpghostfriend")
+	ts.CreateFriendship(t, creator.ID, friend.ID, statusAccepted)
+
+	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
+		"user_ids": []string{friend.ID, uuid.New().String()},
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// One blocked target rejects the whole group — the privacy gate is all-or-nothing,
+// so a valid friend alongside a privacy-blocked target does not create a partial group.
+func TestCreateGroup_OneBlockedTarget_RejectsWholeGroup(t *testing.T) {
+	ts := setupTS(t)
+	creator := ts.CreateTestUser(t, "grpmixok")
+	friend := ts.CreateTestUser(t, "grpmixfriend")
+	stranger := ts.CreateTestUser(t, "grpmixstranger")
+	ts.CreateFriendship(t, creator.ID, friend.ID, statusAccepted)
+	setDMPrivacy(t, ts, stranger.ID, 1, false) // friends-only, creator is not a friend
+
+	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
+		"user_ids": []string{friend.ID, stranger.ID},
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+// A DB error while verifying a target exists must fail-CLOSED with 500 (not be
+// silently collapsed into a 404 "user not found"), matching enforceDMPrivacy's
+// error handling. Fault-injected by renaming the users table so the existence
+// EXISTS query returns a non-nil error.
+func TestCreateGroup_TargetExistenceQueryError_FailsClosed(t *testing.T) {
+	ts := setupTS(t)
+	creator := ts.CreateTestUser(t, "grptargeterr1")
+	target := ts.CreateTestUser(t, "grptargeterr2")
+
+	_, err := ts.DB.Exec("ALTER TABLE users RENAME TO users_dberrtest")
+	require.NoError(t, err, "failed to rename users table for fault injection")
+	t.Cleanup(func() {
+		// Surface rename-back failures explicitly — leaving the table renamed
+		// would break every subsequent test in the package run.
+		if _, err := ts.DB.Exec("ALTER TABLE users_dberrtest RENAME TO users"); err != nil {
+			t.Errorf("cleanup: failed to rename users back to original: %v", err)
+		}
+	})
+
+	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
+		"user_ids": []string{target.ID},
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	assert.Equal(t, http.StatusInternalServerError, w.Code,
+		"target-existence query error must fail-CLOSED with 500, not a 404")
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Failed to create group", body["error"])
+}
+
 // ============================================================================
 // UpdateConversation Tests
 // ============================================================================
@@ -966,6 +1112,8 @@ func TestUpdateConversation_RenameGroup(t *testing.T) {
 	user1 := ts.CreateTestUser(t, "upconv1")
 	user2 := ts.CreateTestUser(t, "upconv2")
 	user3 := ts.CreateTestUser(t, "upconv3")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted) // CV-CAN-029: valid targets
+	ts.CreateFriendship(t, user1.ID, user3.ID, statusAccepted)
 
 	// Create a group DM via API
 	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
@@ -1007,6 +1155,7 @@ func TestUpdateConversation_NotParticipant(t *testing.T) {
 	user1 := ts.CreateTestUser(t, "upconvnp1")
 	user2 := ts.CreateTestUser(t, "upconvnp2")
 	outsider := ts.CreateTestUser(t, "upconvnp3")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted) // CV-CAN-029: valid target
 
 	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
 		"user_ids": []string{user2.ID},
@@ -1038,6 +1187,7 @@ func TestUpdateConversation_InvalidBody(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "upconvbadbody1")
 	user2 := ts.CreateTestUser(t, "upconvbadbody2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted) // CV-CAN-029: valid target
 
 	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
 		"user_ids": []string{user2.ID},
@@ -1057,6 +1207,7 @@ func TestUpdateConversation_ClearName(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "upconvclear1")
 	user2 := ts.CreateTestUser(t, "upconvclear2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted) // CV-CAN-029: valid target
 
 	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
 		"user_ids": []string{user2.ID},
@@ -2360,6 +2511,10 @@ func createTestGroup(t *testing.T, ts *testhelpers.TestServer, creator testhelpe
 	userIDs := make([]string, len(members))
 	for i, m := range members {
 		userIDs[i] = m.ID
+		// Group creation now honors each target's DM privacy (CV-CAN-029); befriend
+		// the members so this setup helper produces a valid group under default
+		// (friends+server) privacy.
+		ts.CreateFriendship(t, creator.ID, m.ID, statusAccepted)
 	}
 	w := ts.DoRequest("POST", pathDMConversations+pathGroup, map[string]interface{}{
 		"user_ids": userIDs,

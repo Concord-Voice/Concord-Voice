@@ -30,6 +30,7 @@ const (
 	errMsgInvalidRequestBody         = "Invalid request body"
 	errMsgFailedOpenConversation     = "Failed to open conversation"
 	errMsgFailedCreateGroup          = "Failed to create group"
+	errMsgUserNotFound               = "User not found"
 	errMsgFailedCreatePersonalThread = "Failed to create personal thread"
 	errMsgFailedUpdateConversation   = "Failed to update conversation"
 	errMsgFailedUpdateMessage        = "Failed to update message"
@@ -337,7 +338,7 @@ func (h *Handler) OpenConversation(c *gin.Context) {
 	// Verify target user exists
 	var exists bool
 	if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)`, req.UserID).Scan(&exists); err != nil || !exists {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotFound})
 		return
 	}
 
@@ -379,10 +380,6 @@ func (h *Handler) enforceDMPrivacy(c *gin.Context, senderID, targetID string) bo
 		return true
 	}
 
-	if areFriends {
-		return false
-	}
-
 	dmPrivacyLevel, dmFriendsOfFriends, err := h.fetchDMPrivacySettings(targetID)
 	if err != nil {
 		h.log.Error("Failed to check privacy settings", "error", err)
@@ -390,9 +387,17 @@ func (h *Handler) enforceDMPrivacy(c *gin.Context, senderID, targetID string) bo
 		return true
 	}
 
+	// Level 0 ("No One") means nobody can DM the target — not even accepted
+	// friends. Enforce it ahead of the friend short-circuit so the product's
+	// "Nobody can DM you" contract holds on every DM entry point, including
+	// group DM creation (CV-CAN-029).
 	if dmPrivacyLevel == dmPrivacyOff {
 		c.JSON(http.StatusForbidden, gin.H{"error": "dm_disabled"})
 		return true
+	}
+
+	if areFriends {
+		return false
 	}
 
 	if dmPrivacyLevel >= dmPrivacyOpenToAll {
@@ -576,6 +581,26 @@ func (h *Handler) CreateGroup(c *gin.Context) {
 	if errMsg := validateGroupMembers(req.UserIDs, userID); errMsg != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
 		return
+	}
+
+	// Group DM creation must honor each target's DM privacy settings — otherwise a
+	// caller can pull a user who has DMs disabled (or restricted to friends/FoF/
+	// shared-server) into a group DM, bypassing the 1:1 privacy boundary that
+	// OpenConversation and AddMember already enforce (CV-CAN-029). Reuse the shared
+	// existence check + enforceDMPrivacy gate per target.
+	for _, targetID := range req.UserIDs {
+		var exists bool
+		if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)`, targetID).Scan(&exists); err != nil {
+			h.log.Error("Failed to verify target user exists", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateGroup})
+			return
+		} else if !exists {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotFound})
+			return
+		}
+		if h.enforceDMPrivacy(c, userID, targetID) {
+			return // enforceDMPrivacy already wrote the 403/500 response
+		}
 	}
 
 	allUserIDs := append([]string{userID}, req.UserIDs...)
@@ -832,7 +857,7 @@ func (h *Handler) AddMember(c *gin.Context) {
 		return
 	}
 	if !exists {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "User not found"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgUserNotFound})
 		return
 	}
 
