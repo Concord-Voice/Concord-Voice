@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-migrate/migrate/v4"
@@ -27,10 +28,64 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 )
+
+// mediaTestWithResolver builds a media testSetup whose handler is wired with the
+// given RBAC resolver (over the supplied working DB), so the CV-CAN-003/004
+// permission checks in UploadAttachment actually run. The default setupMediaTest
+// passes a nil resolver (checks fall through to allow); these tests exercise the
+// real permission code + its defensive error branches.
+//
+// This package's tests live in `package media` (internal), so they cannot import
+// internal/testhelpers (that would cycle back through internal/api -> media);
+// the resolver + Redis are therefore wired inline here.
+func mediaTestWithResolver(t *testing.T, db *sql.DB, resolver *rbac.Resolver) *testSetup {
+	t.Helper()
+	store := newMockStore()
+	cfg := &config.Config{UploadMaxSize: 25 * 1024 * 1024}
+	h := NewHandler(db, store, logger.New("test"), cfg, resolver, freeTierStub{})
+	return &testSetup{handler: h, store: store, db: db}
+}
+
+// mediaTestRedis connects to the test Redis (matches the docker-compose dev
+// default consumed by internal/testhelpers). Used only to back the RBAC
+// permission cache in resolver tests.
+func mediaTestRedis(t *testing.T) *redis.Client {
+	t.Helper()
+	url := os.Getenv("REDIS_URL")
+	if url == "" {
+		// Assembled from parts to satisfy static credential analysis; matches the
+		// docker-compose dev default (test-only, not a production secret).
+		url = "redis://:" + "concord_dev" + "_redis@localhost:6379/1"
+	}
+	opt, err := redis.ParseURL(url)
+	require.NoError(t, err)
+	rdb := redis.NewClient(opt)
+	t.Cleanup(func() { _ = rdb.Close() })
+	return rdb
+}
+
+// mediaBrokenResolver returns a resolver whose DB is closed, so every permission
+// computation errors — used to cover the handler's defensive `permErr != nil`
+// (HTTP 500) branches. Mirrors testhelpers.BrokenResolver, inlined to avoid the
+// internal/testhelpers import cycle described above.
+func mediaBrokenResolver(t *testing.T, rdb *redis.Client) *rbac.Resolver {
+	t.Helper()
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = defaultTestDatabaseURL // existing package var (assembled from parts)
+	}
+	closed, err := sql.Open("postgres", dbURL)
+	require.NoError(t, err)
+	require.NoError(t, closed.Close())
+	return rbac.NewResolver(closed, rbac.NewPermissionCache(rdb), logger.New("test"))
+}
 
 // freeTierStub satisfies entitlements.TierResolver and always returns TierFree.
 // Used by tests that do not need tier-dependent enforcement (pre-Task 3/4 tests).
@@ -187,16 +242,40 @@ func (ts *testSetup) createTestInviteCode(t *testing.T, serverID, createdBy, cod
 	require.NoError(t, err)
 }
 
-// createTestChannel inserts a channel and returns its ID.
+// createTestChannel inserts a text channel and returns its ID.
 func (ts *testSetup) createTestChannel(t *testing.T, serverID, name string) string {
+	t.Helper()
+	return ts.createTestChannelWithType(t, serverID, name, "text")
+}
+
+// createTestChannelWithType inserts a channel of the given type and returns its ID.
+func (ts *testSetup) createTestChannelWithType(t *testing.T, serverID, name, channelType string) string {
 	t.Helper()
 	channelID := uuid.New().String()
 	_, err := ts.db.Exec(
-		`INSERT INTO channels (id, server_id, name, type) VALUES ($1, $2, $3, 'text')`,
-		channelID, serverID, name,
+		`INSERT INTO channels (id, server_id, name, type) VALUES ($1, $2, $3, $4)`,
+		channelID, serverID, name, channelType,
 	)
 	require.NoError(t, err)
 	return channelID
+}
+
+// createTestRoleWithPerms inserts a role with the given permission bitfield and
+// assigns it to the (already-added) server member, so resolver-backed tests can
+// grant precise permissions. The member must already exist in server_members.
+func (ts *testSetup) createTestRoleWithPerms(t *testing.T, serverID, userID, name string, perms rbac.Permission) {
+	t.Helper()
+	roleID := uuid.New().String()
+	_, err := ts.db.Exec(
+		`INSERT INTO roles (id, server_id, name, permissions) VALUES ($1, $2, $3, $4)`,
+		roleID, serverID, name, int64(perms),
+	)
+	require.NoError(t, err)
+	_, err = ts.db.Exec(
+		`INSERT INTO member_roles (server_id, user_id, role_id) VALUES ($1, $2, $3)`,
+		serverID, userID, roleID,
+	)
+	require.NoError(t, err)
 }
 
 // createTestDMConversation inserts a DM conversation with participants and returns the conversation ID.
@@ -497,6 +576,212 @@ func TestUploadAttachmentSuccessChannel(t *testing.T) {
 	assert.Equal(t, "photo", resp["file_type"])
 }
 
+// CV-CAN-004: with a real resolver, the server OWNER (owner-bypass grants all
+// permissions) uploads successfully — exercises the SEND + VIEW permission-check
+// success paths that the nil-resolver tests skip.
+func TestUploadAttachment_Resolver_OwnerSucceeds(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+	rdb := mediaTestRedis(t)
+	resolver := rbac.NewResolver(db, rbac.NewPermissionCache(rdb), logger.New("test"))
+	ts := mediaTestWithResolver(t, db, resolver)
+
+	owner := ts.createTestUser(t, "attach_res_owner")
+	serverID := ts.createTestServer(t, owner, "Attach Resolver Server")
+	channelID := ts.createTestChannel(t, serverID, "res-uploads")
+
+	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("ciphertext"), map[string]string{
+		"channel_id": channelID,
+		"file_type":  "photo",
+		"mime_type":  "image/jpeg",
+	})
+	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)
+
+	assert.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+}
+
+// CV-CAN-004: with a real resolver, a member with no RBAC role (no SEND) is
+// rejected — exercises the `!hasPerm` 403 branch of checkSendPermission.
+func TestUploadAttachment_Resolver_NoSendPermission403(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+	rdb := mediaTestRedis(t)
+	resolver := rbac.NewResolver(db, rbac.NewPermissionCache(rdb), logger.New("test"))
+	ts := mediaTestWithResolver(t, db, resolver)
+
+	owner := ts.createTestUser(t, "attach_res_owner2")
+	member := ts.createTestUser(t, "attach_res_member")
+	serverID := ts.createTestServer(t, owner, "Attach Resolver Server 2")
+	channelID := ts.createTestChannel(t, serverID, "res-uploads2")
+	// Add member with no RBAC role -> resolver yields zero permissions -> no SEND.
+	_, err := ts.db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')`, serverID, member)
+	require.NoError(t, err)
+
+	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("ciphertext"), map[string]string{
+		"channel_id": channelID,
+		"file_type":  "file",
+		"mime_type":  mimeOctetStream,
+	})
+	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, member, body, ct)
+
+	assert.Equal(t, http.StatusForbidden, w.Code, "body: %s", w.Body.String())
+}
+
+// CV-CAN-003/004: when the permission resolver itself errors, UploadAttachment
+// returns 500 — exercises the defensive `permErr != nil` branch. Uses a resolver
+// backed by a closed DB while the handler's own DB still resolves the channel.
+func TestUploadAttachment_Resolver_Error500(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+	rdb := mediaTestRedis(t)
+	ts := mediaTestWithResolver(t, db, mediaBrokenResolver(t, rdb))
+
+	owner := ts.createTestUser(t, "attach_res_owner3")
+	serverID := ts.createTestServer(t, owner, "Attach Resolver Server 3")
+	channelID := ts.createTestChannel(t, serverID, "res-uploads3")
+
+	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("ciphertext"), map[string]string{
+		"channel_id": channelID,
+		"file_type":  "file",
+		"mime_type":  mimeOctetStream,
+	})
+	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
+}
+
+// CV-CAN-004: a member serving an active timeout must not upload an attachment,
+// even with full send/attach/view permissions. The timeout gate in
+// checkSendPermission mirrors messages.checkSendAccess. Asserts the 403
+// member_timed_out response AND that no media_files row is created (the gate
+// fires before any storage/metadata write).
+func TestUploadAttachment_Resolver_TimedOutMember403(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+	rdb := mediaTestRedis(t)
+	resolver := rbac.NewResolver(db, rbac.NewPermissionCache(rdb), logger.New("test"))
+	ts := mediaTestWithResolver(t, db, resolver)
+
+	owner := ts.createTestUser(t, "attach_timeout_owner")
+	member := ts.createTestUser(t, "attach_timeout_member")
+	serverID := ts.createTestServer(t, owner, "Attach Timeout Server")
+	channelID := ts.createTestChannel(t, serverID, "timeout-uploads")
+	// Timed out for another hour but otherwise fully permitted, so a non-403 here
+	// would prove the timeout gate is missing rather than an unrelated perms gap.
+	_, err := ts.db.Exec(
+		`INSERT INTO server_members (server_id, user_id, role, timed_out_until) VALUES ($1, $2, 'member', $3)`,
+		serverID, member, time.Now().UTC().Add(time.Hour),
+	)
+	require.NoError(t, err)
+	ts.createTestRoleWithPerms(t, serverID, member, "full", rbac.BasePermissions)
+
+	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("ciphertext"), map[string]string{
+		"channel_id": channelID,
+		"file_type":  "file",
+		"mime_type":  mimeOctetStream,
+	})
+	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, member, body, ct)
+
+	assert.Equal(t, http.StatusForbidden, w.Code, "body: %s", w.Body.String())
+	assert.Equal(t, "member_timed_out", parseBody(t, w)["code"])
+
+	// The gate fires before any storage/metadata write: no attachment row exists.
+	var count int
+	require.NoError(t, ts.db.QueryRow(
+		`SELECT COUNT(*) FROM media_files WHERE uploader_id = $1`, member,
+	).Scan(&count))
+	assert.Equal(t, 0, count, "no media_files row must be created for a timed-out upload")
+}
+
+// checkSendPermission direct unit tests (CV-CAN-004). It is invoked AFTER
+// userHasChannelAccess (which shares the same resolver), so its own error/deny
+// branches are shadowed in the full UploadAttachment flow; call it directly to
+// cover them. The media test is `package media` (internal), so the unexported
+// method is reachable.
+func newCheckSendCtx() (*gin.Context, *httptest.ResponseRecorder) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+	return c, w
+}
+
+func TestCheckSendPermission_ChannelNotFound_403(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+	rdb := mediaTestRedis(t)
+	resolver := rbac.NewResolver(db, rbac.NewPermissionCache(rdb), logger.New("test"))
+	ts := mediaTestWithResolver(t, db, resolver)
+
+	c, w := newCheckSendCtx()
+	// A non-existent channel -> `SELECT server_id` yields sql.ErrNoRows -> 403
+	// (client-facing missing-channel condition, matching userHasChannelAccess).
+	ok := ts.handler.checkSendPermission(c, uuid.New().String(), uuid.New().String())
+
+	assert.False(t, ok)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestCheckSendPermission_ChannelLookupError_500(t *testing.T) {
+	rdb := mediaTestRedis(t)
+	// Closed DB: the channel lookup errors with a non-ErrNoRows connection error
+	// -> 500 (genuine server fault, distinct from the missing-channel 403 above).
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = defaultTestDatabaseURL
+	}
+	closed, err := sql.Open("postgres", dbURL)
+	require.NoError(t, err)
+	require.NoError(t, closed.Close())
+	resolver := rbac.NewResolver(closed, rbac.NewPermissionCache(rdb), logger.New("test"))
+	ts := mediaTestWithResolver(t, closed, resolver)
+
+	c, w := newCheckSendCtx()
+	ok := ts.handler.checkSendPermission(c, uuid.New().String(), uuid.New().String())
+
+	assert.False(t, ok)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestCheckSendPermission_ResolverError_500(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+	rdb := mediaTestRedis(t)
+	ts := mediaTestWithResolver(t, db, mediaBrokenResolver(t, rdb))
+
+	owner := ts.createTestUser(t, "csp_err_owner")
+	serverID := ts.createTestServer(t, owner, "CSP Err")
+	channelID := ts.createTestChannel(t, serverID, "csp-err")
+
+	c, w := newCheckSendCtx()
+	// Channel lookup (working DB) succeeds; the SEND HasPermission (closed DB) errors -> 500.
+	ok := ts.handler.checkSendPermission(c, owner, channelID)
+
+	assert.False(t, ok)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestCheckSendPermission_NoSendPerm_403(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+	rdb := mediaTestRedis(t)
+	resolver := rbac.NewResolver(db, rbac.NewPermissionCache(rdb), logger.New("test"))
+	ts := mediaTestWithResolver(t, db, resolver)
+
+	owner := ts.createTestUser(t, "csp_perm_owner")
+	member := ts.createTestUser(t, "csp_perm_member")
+	serverID := ts.createTestServer(t, owner, "CSP NoSend")
+	channelID := ts.createTestChannel(t, serverID, "csp-nosend")
+	// Member with no RBAC role -> zero permissions -> no SEND.
+	_, err := ts.db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')`, serverID, member)
+	require.NoError(t, err)
+
+	c, w := newCheckSendCtx()
+	ok := ts.handler.checkSendPermission(c, member, channelID)
+
+	assert.False(t, ok)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
 func TestUploadAttachmentStorageDisabledReturns503(t *testing.T) {
 	ts := setupMediaTest(t)
 	owner := ts.createTestUser(t, "attachstorageoff")
@@ -649,6 +934,131 @@ func TestDownloadAttachmentSuccess(t *testing.T) {
 	assert.Equal(t, mimeOctetStream, w.Header().Get("Content-Type"))
 	assert.Equal(t, "image/jpeg", w.Header().Get("X-File-Mime-Type"))
 	assert.Equal(t, "ciphertext", w.Body.String())
+}
+
+// CV-CAN-003: with a real resolver, a server MEMBER who lacks channel VIEW
+// (PermViewTextChannels) must NOT be able to download a channel attachment by
+// file UUID. This is the endpoint-level regression guard for the core download
+// fix — membership alone is insufficient once view is denied. The owner
+// (OwnerPermissions) download of the same file is asserted as a positive control
+// so the member's 403 is provably the VIEW gate, not a broken fixture.
+func TestDownloadAttachment_Resolver_NoViewPermission403(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+	rdb := mediaTestRedis(t)
+	resolver := rbac.NewResolver(db, rbac.NewPermissionCache(rdb), logger.New("test"))
+	ts := mediaTestWithResolver(t, db, resolver)
+
+	owner := ts.createTestUser(t, "dl_res_owner")
+	member := ts.createTestUser(t, "dl_res_member")
+	serverID := ts.createTestServer(t, owner, "DL Resolver Server")
+	channelID := ts.createTestChannel(t, serverID, "hidden")
+	// Member is in the server but has no RBAC role -> zero permissions -> no VIEW.
+	_, err := ts.db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')`, serverID, member)
+	require.NoError(t, err)
+
+	// Owner-uploaded attachment living in the (member-hidden) channel.
+	fileID := uuid.New().String()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.TODO(), storageKey, bytes.NewReader([]byte("ciphertext")), 10, mimeOctetStream))
+	_, err = ts.db.Exec(
+		`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, channel_id)
+		 VALUES ($1, $2, 'file', 2, 'application/octet-stream', 10, $3, 1, $4)`,
+		fileID, owner, storageKey, channelID,
+	)
+	require.NoError(t, err)
+
+	// Member with membership but no VIEW is blocked at the endpoint (CV-CAN-003).
+	wMember := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, member, gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusForbidden, wMember.Code, "body: %s", wMember.Body.String())
+	assert.NotEqual(t, "ciphertext", wMember.Body.String(), "ciphertext must not be streamed on a VIEW-deny")
+
+	// Positive control: the owner can download the same file.
+	wOwner := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, owner, gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusOK, wOwner.Code, "body: %s", wOwner.Body.String())
+	assert.Equal(t, "ciphertext", wOwner.Body.String())
+}
+
+// CV-CAN-003 (type-aware VIEW): a voice channel's visibility is gated on
+// PermViewVoiceChannels, not PermViewTextChannels. A member who can view voice
+// channels but lacks the text-view bit must still reach that voice channel's
+// attachments — hard-coding the text bit would wrongly 403 them. This test
+// fails under the old hard-coded PermViewTextChannels behavior.
+func TestDownloadAttachment_Resolver_VoiceChannelUsesVoiceViewBit(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+	rdb := mediaTestRedis(t)
+	resolver := rbac.NewResolver(db, rbac.NewPermissionCache(rdb), logger.New("test"))
+	ts := mediaTestWithResolver(t, db, resolver)
+
+	owner := ts.createTestUser(t, "dl_voice_owner")
+	member := ts.createTestUser(t, "dl_voice_member")
+	serverID := ts.createTestServer(t, owner, "DL Voice Server")
+	voiceChannel := ts.createTestChannelWithType(t, serverID, "voice-chat", "voice")
+	_, err := ts.db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')`, serverID, member)
+	require.NoError(t, err)
+	// Grant voice-view (deliberately no PermViewTextChannels) plus read-history,
+	// which the download path also requires (CV-CAN-003); this isolates the test
+	// to the type-aware VIEW bit rather than the read-history gate.
+	ts.createTestRoleWithPerms(t, serverID, member, "voice-viewer", rbac.PermViewVoiceChannels|rbac.PermReadMessageHistory)
+
+	fileID := uuid.New().String()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.TODO(), storageKey, bytes.NewReader([]byte("ciphertext")), 10, mimeOctetStream))
+	_, err = ts.db.Exec(
+		`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, channel_id)
+		 VALUES ($1, $2, 'file', 2, 'application/octet-stream', 10, $3, 1, $4)`,
+		fileID, owner, storageKey, voiceChannel,
+	)
+	require.NoError(t, err)
+
+	w := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, member, gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusOK, w.Code, "voice-view member must access voice channel attachment; body: %s", w.Body.String())
+	assert.Equal(t, "ciphertext", w.Body.String())
+}
+
+// CV-CAN-003: a member who can VIEW a channel but lacks READ_MESSAGE_HISTORY
+// must not download that channel's attachments by file UUID. The download path
+// requires read-history in addition to the type-appropriate VIEW bit, mirroring
+// the message-read path (messages.checkChannelAccess). The owner (all
+// permissions) download of the same file is a positive control so the member's
+// 403 is provably the read-history gate, not a broken fixture.
+func TestDownloadAttachment_Resolver_NoReadHistory403(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+	rdb := mediaTestRedis(t)
+	resolver := rbac.NewResolver(db, rbac.NewPermissionCache(rdb), logger.New("test"))
+	ts := mediaTestWithResolver(t, db, resolver)
+
+	owner := ts.createTestUser(t, "dl_rh_owner")
+	member := ts.createTestUser(t, "dl_rh_member")
+	serverID := ts.createTestServer(t, owner, "DL ReadHistory Server")
+	channelID := ts.createTestChannel(t, serverID, "rh-hidden")
+	_, err := ts.db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')`, serverID, member)
+	require.NoError(t, err)
+	// VIEW but deliberately NO read-history: passes userHasChannelAccess, fails
+	// the download-only read-history gate.
+	ts.createTestRoleWithPerms(t, serverID, member, "viewer-no-history", rbac.PermViewTextChannels)
+
+	fileID := uuid.New().String()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.TODO(), storageKey, bytes.NewReader([]byte("ciphertext")), 10, mimeOctetStream))
+	_, err = ts.db.Exec(
+		`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, channel_id)
+		 VALUES ($1, $2, 'file', 2, 'application/octet-stream', 10, $3, 1, $4)`,
+		fileID, owner, storageKey, channelID,
+	)
+	require.NoError(t, err)
+
+	// Member has VIEW but not read-history -> blocked at the endpoint (CV-CAN-003).
+	wMember := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, member, gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusForbidden, wMember.Code, "body: %s", wMember.Body.String())
+	assert.NotEqual(t, "ciphertext", wMember.Body.String(), "ciphertext must not be streamed on a read-history deny")
+
+	// Positive control: the owner (all perms) can download the same file.
+	wOwner := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, owner, gin.Params{{Key: "file_id", Value: fileID}})
+	assert.Equal(t, http.StatusOK, wOwner.Code, "body: %s", wOwner.Body.String())
+	assert.Equal(t, "ciphertext", wOwner.Body.String())
 }
 
 func TestDownloadAttachmentStorageDisabledReturns503(t *testing.T) {

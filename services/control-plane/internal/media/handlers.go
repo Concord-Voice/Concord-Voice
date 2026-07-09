@@ -34,23 +34,24 @@ import (
 )
 
 const (
-	errMsgAccessDenied       = "Access denied"
-	errMsgFailedVerifyAccess = "Failed to verify access"
-	errMsgFailedVerifyPerms  = "Failed to verify permissions"
-	errMsgInternalServer     = "Internal server error"
-	errMsgStorageUnavailable = "Object storage unavailable"
-	purposeAvatar            = "avatar"
-	purposeBanner            = "banner"
-	purposeDMIcon            = "dm-icon"
-	purposeServerIcon        = "server-icon"
-	purposeServerBanner      = "server-banner"
-	errMsgInvalidImage       = "Failed to process image. Ensure the file is a valid image."
-	mimeOctetStream          = "application/octet-stream"
-	headerContentType        = "Content-Type"
-	headerCacheControl       = "Cache-Control"
-	cacheControlPublic       = "public, max-age=3600, must-revalidate"
-	cacheControlPublicShort  = "public, max-age=60, must-revalidate"
-	cacheControlPrivate      = "private, max-age=3600, must-revalidate"
+	errMsgAccessDenied        = "Access denied"
+	logMsgChannelServerLookup = "Failed to look up channel server"
+	errMsgFailedVerifyAccess  = "Failed to verify access"
+	errMsgFailedVerifyPerms   = "Failed to verify permissions"
+	errMsgInternalServer      = "Internal server error"
+	errMsgStorageUnavailable  = "Object storage unavailable"
+	purposeAvatar             = "avatar"
+	purposeBanner             = "banner"
+	purposeDMIcon             = "dm-icon"
+	purposeServerIcon         = "server-icon"
+	purposeServerBanner       = "server-banner"
+	errMsgInvalidImage        = "Failed to process image. Ensure the file is a valid image."
+	mimeOctetStream           = "application/octet-stream"
+	headerContentType         = "Content-Type"
+	headerCacheControl        = "Cache-Control"
+	cacheControlPublic        = "public, max-age=3600, must-revalidate"
+	cacheControlPublicShort   = "public, max-age=60, must-revalidate"
+	cacheControlPrivate       = "private, max-age=3600, must-revalidate"
 )
 
 // ObjectStore defines the storage operations required by the media handler.
@@ -329,7 +330,12 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 func (h *Handler) userCanDownloadAttachment(c *gin.Context, userID string, channelID, conversationID *string) bool {
 	switch {
 	case channelID != nil:
-		return h.userHasChannelAccess(c, userID, *channelID)
+		// CV-CAN-003: downloading a channel attachment requires both the
+		// type-appropriate VIEW bit (userHasChannelAccess) and the ability to
+		// READ HISTORY in the channel, matching messages.checkChannelAccess. The
+		// short-circuit ensures only one error response is written on denial.
+		return h.userHasChannelAccess(c, userID, *channelID) &&
+			h.checkReadHistoryPermission(c, userID, *channelID)
 	case conversationID != nil:
 		return h.userHasDMAccess(c, userID, *conversationID)
 	default:
@@ -948,6 +954,11 @@ func validateChannelAttachment(c *gin.Context, h *Handler, userID, channelID str
 	if !h.userHasChannelAccess(c, userID, channelID) {
 		return false
 	}
+	// CV-CAN-004: uploading an attachment requires the ability to SEND in the
+	// channel, not just ATTACH_FILES held independently of send/view.
+	if !h.checkSendPermission(c, userID, channelID) {
+		return false
+	}
 	return h.checkAttachPermission(c, userID, channelID)
 }
 
@@ -1059,22 +1070,161 @@ func serveInviteIconFallback(c *gin.Context) {
 	c.Data(http.StatusOK, "image/svg+xml; charset=utf-8", []byte(invitecodes.PublicInviteIconSVG))
 }
 
-// userHasChannelAccess checks if a user is a member of the server that owns a channel.
+// userHasChannelAccess checks that a user can view the channel that owns an
+// attachment: server membership AND the channel's type-appropriate VIEW
+// permission (CV-CAN-003/004). Falls back to membership-only when no RBAC
+// resolver is configured (tests).
 func (h *Handler) userHasChannelAccess(c *gin.Context, userID, channelID string) bool {
-	query := `
-		SELECT EXISTS(
-			SELECT 1 FROM channels ch
-			JOIN server_members sm ON sm.server_id = ch.server_id
-			WHERE ch.id = $1 AND sm.user_id = $2
-		)
-	`
-	var hasAccess bool
-	if err := h.db.QueryRow(query, channelID, userID).Scan(&hasAccess); err != nil {
+	// Membership check (resolves the channel's server + type; a non-member yields no row).
+	var serverID, channelType string
+	err := h.db.QueryRow(`
+		SELECT ch.server_id, ch.type FROM channels ch
+		JOIN server_members sm ON sm.server_id = ch.server_id AND sm.user_id = $2
+		WHERE ch.id = $1
+	`, channelID, userID).Scan(&serverID, &channelType)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
+		return false
+	}
+	if err != nil {
 		h.log.Error("Failed to check channel access", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyAccess})
 		return false
 	}
-	if !hasAccess {
+
+	if h.resolver == nil {
+		return true
+	}
+	// Require the channel's type-appropriate VIEW bit, matching the websocket
+	// channel/message auth path (channelContext.viewPermission): text/bulletin
+	// use PermViewTextChannels, voice uses PermViewVoiceChannels. A member denied
+	// visibility must not read (download) or write (upload) a hidden channel's
+	// attachments by UUID; a voice member without the text-view bit must not be
+	// wrongly blocked from that voice channel's attachments.
+	viewPerm, ok := channelViewPermission(channelType)
+	if !ok {
+		// Unknown / non-viewable channel type: deny, mirroring viewPermission().
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
+		return false
+	}
+	canView, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, viewPerm)
+	if permErr != nil {
+		h.log.Error("Failed to check channel view permission", "error", permErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyAccess})
+		return false
+	}
+	if !canView {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
+		return false
+	}
+	return true
+}
+
+// channelViewPermission maps a channel type to the RBAC "view" permission bit
+// that gates its visibility, mirroring the websocket channel auth path
+// (channelContext.viewPermission): text/bulletin use PermViewTextChannels,
+// voice uses PermViewVoiceChannels. Returns ok=false for types with no view
+// gate, which callers treat as not viewable.
+func channelViewPermission(channelType string) (rbac.Permission, bool) {
+	switch channelType {
+	case "text", "bulletin":
+		return rbac.PermViewTextChannels, true
+	case "voice":
+		return rbac.PermViewVoiceChannels, true
+	default:
+		return 0, false
+	}
+}
+
+// checkSendPermission requires the SEND_MESSAGES RBAC permission for a channel
+// and rejects members serving an active timeout. Used to gate attachment UPLOAD
+// (CV-CAN-004): a member must be able to send in the channel, not merely hold
+// ATTACH_FILES independently, and a timed-out member must not upload at all.
+// Falls back to the SEND check being skipped (membership already verified
+// upstream) when no RBAC resolver is configured, but the timeout gate always
+// applies, mirroring messages.checkSendAccess.
+func (h *Handler) checkSendPermission(c *gin.Context, userID, channelID string) bool {
+	// Resolve the channel's server and the member's timeout state together. The
+	// join to server_members yields timed_out_until; membership itself is already
+	// verified upstream (userHasChannelAccess). A missing row (unknown channel or
+	// non-member) is a client-facing condition, not a server fault.
+	var serverID string
+	var timedOutUntil sql.NullTime
+	err := h.db.QueryRowContext(c.Request.Context(), `
+		SELECT ch.server_id, sm.timed_out_until FROM channels ch
+		JOIN server_members sm ON sm.server_id = ch.server_id AND sm.user_id = $2
+		WHERE ch.id = $1
+	`, channelID, userID).Scan(&serverID, &timedOutUntil)
+	if err == sql.ErrNoRows {
+		// Report 403 (matching userHasChannelAccess) and avoid leaking existence.
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
+		return false
+	}
+	if err != nil {
+		h.log.Error(logMsgChannelServerLookup, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyPerms})
+		return false
+	}
+
+	// A member serving an active timeout cannot upload, mirroring the send-message
+	// path (messages.checkSendAccess). Enforced regardless of resolver config.
+	if timedOutUntil.Valid && timedOutUntil.Time.After(time.Now().UTC()) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":           "Member is timed out",
+			"code":            "member_timed_out",
+			"timed_out_until": timedOutUntil.Time,
+		})
+		return false
+	}
+
+	if h.resolver == nil {
+		return true
+	}
+	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermSendMessages)
+	if err != nil {
+		h.log.Error("Failed to check send permission", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyPerms})
+		return false
+	}
+	if !hasPerm {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You don't have permission to send messages in this channel"})
+		return false
+	}
+	return true
+}
+
+// checkReadHistoryPermission requires the READ_MESSAGE_HISTORY RBAC permission
+// for a channel. Used to gate attachment DOWNLOAD (CV-CAN-003): a member who can
+// see a channel but cannot read its history must not fetch that channel's
+// attachments by file UUID, mirroring the message-read path
+// (messages.checkChannelAccess). Applied only on the download path (not upload),
+// after userHasChannelAccess has verified membership and the type-appropriate
+// VIEW bit. Falls back to allow when no RBAC resolver is configured (tests).
+func (h *Handler) checkReadHistoryPermission(c *gin.Context, userID, channelID string) bool {
+	if h.resolver == nil {
+		return true
+	}
+	var serverID string
+	if err := h.db.QueryRowContext(c.Request.Context(),
+		`SELECT server_id FROM channels WHERE id = $1`, channelID,
+	).Scan(&serverID); err != nil {
+		// A missing channel is a client-facing condition, not a server fault;
+		// report 403 (matching userHasChannelAccess) and avoid leaking existence.
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
+			return false
+		}
+		h.log.Error(logMsgChannelServerLookup, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyPerms})
+		return false
+	}
+	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermReadMessageHistory)
+	if err != nil {
+		h.log.Error("Failed to check read history permission", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyPerms})
+		return false
+	}
+	if !hasPerm {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
 		return false
 	}
@@ -1146,7 +1296,7 @@ func (h *Handler) checkAttachPermission(c *gin.Context, userID, channelID string
 		`SELECT server_id FROM channels WHERE id = $1`, channelID,
 	).Scan(&serverID)
 	if err != nil {
-		h.log.Error("Failed to look up channel server", "error", err)
+		h.log.Error(logMsgChannelServerLookup, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyPerms})
 		return false
 	}
