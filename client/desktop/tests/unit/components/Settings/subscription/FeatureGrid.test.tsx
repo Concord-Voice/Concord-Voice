@@ -19,7 +19,6 @@ const PREMIUM_ENTITLEMENT: Entitlement = {
   allowAnimatedProfile: true,
   messageHistorySearchDays: 180,
   maxServersCreated: -1,
-  allowCustomScheme: true,
 };
 
 describe('FeatureGrid (#1304)', () => {

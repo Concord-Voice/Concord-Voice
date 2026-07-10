@@ -4,9 +4,11 @@ import type { Entitlement } from '../../../stores/subscriptionStore';
 
 // The Supersonic (premium) feature list — entitlement-backed premium
 // capabilities, anchored on the entitlement matrix §1 "User axis"
-// (docs/design/entitlements/entitlement-matrix.md) plus other server-enforced
-// premium entitlement fields (e.g. custom colour schemes via allowCustomScheme,
-// which the matrix cosmetics section does not enumerate). Content is a static
+// (docs/design/entitlements/entitlement-matrix.md) plus other premium
+// entitlement fields the server enforces. Custom colour schemes are NOT listed
+// here: #1971 made them free for all users, so they are no longer a Supersonic
+// upsell (do not re-add an allowCustomScheme-gated row; see the matrix §5
+// "Custom colour schemes" note). Content is a static
 // list cited here — NOT duplicated; each row's ✓/lock is computed live
 // from the current entitlement set via a predicate over the SAME fields the
 // server enforces, so the grid can never claim a capability the user lacks.
@@ -47,10 +49,6 @@ const FEATURES: readonly FeatureRow[] = [
   {
     label: 'No cap on server creation',
     granted: (e) => e.maxServersCreated < 0,
-  },
-  {
-    label: 'Custom colour schemes',
-    granted: (e) => e.allowCustomScheme,
   },
 ];
 
