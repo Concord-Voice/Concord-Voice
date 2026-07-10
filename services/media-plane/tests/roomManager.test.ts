@@ -18,6 +18,9 @@ vi.mock('mediasoup', () => ({
 vi.mock('@/config/index.js', () => ({
   config: {
     freeVideoPublisherCap: 8,
+    // Intentionally tighter than the shipped default (8) so cap-behavior tests
+    // (TOCTOU burst, downgrade grandfather, DM tier-raise) stay small; the
+    // shipped default is asserted in config.test.ts.
     freeScreenProducerCap: 1,
     freeAudioLastN: 8,
     audioLastNHoldMs: 2500,
@@ -1097,7 +1100,14 @@ describe('RoomManager', () => {
       await joinChannelWithPerms('u-nospeak', 'sock-1', 0n);
       const transport = await transportFor('room-1', 'u-nospeak');
       await expect(
-        manager.produce('room-1', 'u-nospeak', transport.id, 'audio', createRtpParameters() as any, 'mic')
+        manager.produce(
+          'room-1',
+          'u-nospeak',
+          transport.id,
+          'audio',
+          createRtpParameters() as any,
+          'mic'
+        )
       ).rejects.toThrow('publish permission denied');
     });
 
@@ -1105,7 +1115,14 @@ describe('RoomManager', () => {
       await joinChannelWithPerms('u-novideo', 'sock-2', PERM_SPEAK | PERM_VOICE);
       const transport = await transportFor('room-1', 'u-novideo');
       await expect(
-        manager.produce('room-1', 'u-novideo', transport.id, 'video', createRtpParameters() as any, 'camera')
+        manager.produce(
+          'room-1',
+          'u-novideo',
+          transport.id,
+          'video',
+          createRtpParameters() as any,
+          'camera'
+        )
       ).rejects.toThrow('publish permission denied');
     });
 
@@ -1113,7 +1130,14 @@ describe('RoomManager', () => {
       await joinChannelWithPerms('u-noscreen', 'sock-3', PERM_SPEAK | PERM_VIDEO | PERM_VOICE);
       const transport = await transportFor('room-1', 'u-noscreen');
       await expect(
-        manager.produce('room-1', 'u-noscreen', transport.id, 'video', createRtpParameters() as any, 'screen')
+        manager.produce(
+          'room-1',
+          'u-noscreen',
+          transport.id,
+          'video',
+          createRtpParameters() as any,
+          'screen'
+        )
       ).rejects.toThrow('publish permission denied');
     });
 
@@ -1126,35 +1150,75 @@ describe('RoomManager', () => {
       await joinChannelWithPerms('u-video-only', 'sock-vo', PERM_SPEAK | PERM_VIDEO | PERM_VOICE);
       const transport = await transportFor('room-1', 'u-video-only');
       await expect(
-        manager.produce('room-1', 'u-video-only', transport.id, 'video', createRtpParameters() as any, 'camera')
+        manager.produce(
+          'room-1',
+          'u-video-only',
+          transport.id,
+          'video',
+          createRtpParameters() as any,
+          'camera'
+        )
       ).rejects.toThrow('publish permission denied');
     });
 
     it('rejects screen produce with ScreenShare but not Video (cannot prove track is not camera)', async () => {
-      await joinChannelWithPerms('u-screen-only', 'sock-so', PERM_SPEAK | PERM_SCREENSHARE | PERM_VOICE);
+      await joinChannelWithPerms(
+        'u-screen-only',
+        'sock-so',
+        PERM_SPEAK | PERM_SCREENSHARE | PERM_VOICE
+      );
       const transport = await transportFor('room-1', 'u-screen-only');
       await expect(
-        manager.produce('room-1', 'u-screen-only', transport.id, 'video', createRtpParameters() as any, 'screen')
+        manager.produce(
+          'room-1',
+          'u-screen-only',
+          transport.id,
+          'video',
+          createRtpParameters() as any,
+          'screen'
+        )
       ).rejects.toThrow('publish permission denied');
     });
 
     it('allows camera produce when both Video and ScreenShare are held', async () => {
-      await joinChannelWithPerms('u-both-cam', 'sock-bc', PERM_VIDEO | PERM_SCREENSHARE | PERM_VOICE);
+      await joinChannelWithPerms(
+        'u-both-cam',
+        'sock-bc',
+        PERM_VIDEO | PERM_SCREENSHARE | PERM_VOICE
+      );
       const transport = await transportFor('room-1', 'u-both-cam');
       const producer = createMockProducer({ kind: 'video' });
       transport.produce.mockResolvedValueOnce(producer);
       await expect(
-        manager.produce('room-1', 'u-both-cam', transport.id, 'video', createRtpParameters() as any, 'camera')
+        manager.produce(
+          'room-1',
+          'u-both-cam',
+          transport.id,
+          'video',
+          createRtpParameters() as any,
+          'camera'
+        )
       ).resolves.toBeDefined();
     });
 
     it('allows screen produce when both Video and ScreenShare are held', async () => {
-      await joinChannelWithPerms('u-both-scr', 'sock-bs', PERM_VIDEO | PERM_SCREENSHARE | PERM_VOICE);
+      await joinChannelWithPerms(
+        'u-both-scr',
+        'sock-bs',
+        PERM_VIDEO | PERM_SCREENSHARE | PERM_VOICE
+      );
       const transport = await transportFor('room-1', 'u-both-scr');
       const producer = createMockProducer({ kind: 'video' });
       transport.produce.mockResolvedValueOnce(producer);
       await expect(
-        manager.produce('room-1', 'u-both-scr', transport.id, 'video', createRtpParameters() as any, 'screen')
+        manager.produce(
+          'room-1',
+          'u-both-scr',
+          transport.id,
+          'video',
+          createRtpParameters() as any,
+          'screen'
+        )
       ).resolves.toBeDefined();
     });
 
@@ -1164,25 +1228,61 @@ describe('RoomManager', () => {
     // but lost Speak must not inject microphone audio by declaring
     // source: 'screen-audio', so every audio publish requires Speak.
     it('rejects screen-audio produce without Speak even with an active screen producer', async () => {
-      await joinChannelWithPerms('u-nospeak-scr', 'sock-nss', PERM_VIDEO | PERM_SCREENSHARE | PERM_VOICE);
+      await joinChannelWithPerms(
+        'u-nospeak-scr',
+        'sock-nss',
+        PERM_VIDEO | PERM_SCREENSHARE | PERM_VOICE
+      );
       const transport = await transportFor('room-1', 'u-nospeak-scr');
       // Establish the prerequisite screen producer (allowed: holds Video+ScreenShare).
       transport.produce.mockResolvedValueOnce(createMockProducer({ kind: 'video' }));
-      await manager.produce('room-1', 'u-nospeak-scr', transport.id, 'video', createRtpParameters() as any, 'screen');
+      await manager.produce(
+        'room-1',
+        'u-nospeak-scr',
+        transport.id,
+        'video',
+        createRtpParameters() as any,
+        'screen'
+      );
       // The spoofable screen-audio publish must fail closed (no Speak).
       await expect(
-        manager.produce('room-1', 'u-nospeak-scr', transport.id, 'audio', createRtpParameters() as any, 'screen-audio')
+        manager.produce(
+          'room-1',
+          'u-nospeak-scr',
+          transport.id,
+          'audio',
+          createRtpParameters() as any,
+          'screen-audio'
+        )
       ).rejects.toThrow('publish permission denied');
     });
 
     it('allows screen-audio produce with Speak, ScreenShare, and an active screen producer', async () => {
-      await joinChannelWithPerms('u-scr-audio', 'sock-sa', PERM_SPEAK | PERM_VIDEO | PERM_SCREENSHARE | PERM_VOICE);
+      await joinChannelWithPerms(
+        'u-scr-audio',
+        'sock-sa',
+        PERM_SPEAK | PERM_VIDEO | PERM_SCREENSHARE | PERM_VOICE
+      );
       const transport = await transportFor('room-1', 'u-scr-audio');
       transport.produce.mockResolvedValueOnce(createMockProducer({ kind: 'video' }));
-      await manager.produce('room-1', 'u-scr-audio', transport.id, 'video', createRtpParameters() as any, 'screen');
+      await manager.produce(
+        'room-1',
+        'u-scr-audio',
+        transport.id,
+        'video',
+        createRtpParameters() as any,
+        'screen'
+      );
       transport.produce.mockResolvedValueOnce(createMockProducer({ kind: 'audio' }));
       await expect(
-        manager.produce('room-1', 'u-scr-audio', transport.id, 'audio', createRtpParameters() as any, 'screen-audio')
+        manager.produce(
+          'room-1',
+          'u-scr-audio',
+          transport.id,
+          'audio',
+          createRtpParameters() as any,
+          'screen-audio'
+        )
       ).resolves.toBeDefined();
     });
 
@@ -1192,7 +1292,14 @@ describe('RoomManager', () => {
       const producer = createMockProducer({ kind: 'audio' });
       transport.produce.mockResolvedValueOnce(producer);
       await expect(
-        manager.produce('room-1', 'u-speak', transport.id, 'audio', createRtpParameters() as any, 'mic')
+        manager.produce(
+          'room-1',
+          'u-speak',
+          transport.id,
+          'audio',
+          createRtpParameters() as any,
+          'mic'
+        )
       ).resolves.toBeDefined();
     });
 
@@ -1205,15 +1312,33 @@ describe('RoomManager', () => {
       await joinChannelWithPerms('u-nojoin', 'sock-nj', PERM_SPEAK | PERM_VIEW_VOICE);
       const transport = await transportFor('room-1', 'u-nojoin');
       await expect(
-        manager.produce('room-1', 'u-nojoin', transport.id, 'audio', createRtpParameters() as any, 'mic')
+        manager.produce(
+          'room-1',
+          'u-nojoin',
+          transport.id,
+          'audio',
+          createRtpParameters() as any,
+          'mic'
+        )
       ).rejects.toThrow('publish permission denied');
     });
 
     it('rejects camera produce when ViewVoiceChannels is absent even with both video bits', async () => {
-      await joinChannelWithPerms('u-noview', 'sock-nv', PERM_VIDEO | PERM_SCREENSHARE | PERM_JOIN_VOICE);
+      await joinChannelWithPerms(
+        'u-noview',
+        'sock-nv',
+        PERM_VIDEO | PERM_SCREENSHARE | PERM_JOIN_VOICE
+      );
       const transport = await transportFor('room-1', 'u-noview');
       await expect(
-        manager.produce('room-1', 'u-noview', transport.id, 'video', createRtpParameters() as any, 'camera')
+        manager.produce(
+          'room-1',
+          'u-noview',
+          transport.id,
+          'video',
+          createRtpParameters() as any,
+          'camera'
+        )
       ).rejects.toThrow('publish permission denied');
     });
 
@@ -1226,7 +1351,14 @@ describe('RoomManager', () => {
       const producer = createMockProducer({ kind: 'video' });
       transport.produce.mockResolvedValueOnce(producer);
       await expect(
-        manager.produce('room-1', 'u-admin', transport.id, 'video', createRtpParameters() as any, 'camera')
+        manager.produce(
+          'room-1',
+          'u-admin',
+          transport.id,
+          'video',
+          createRtpParameters() as any,
+          'camera'
+        )
       ).resolves.toBeDefined();
     });
 
@@ -1239,7 +1371,14 @@ describe('RoomManager', () => {
       const producer = createMockProducer({ kind: 'audio' });
       transport.produce.mockResolvedValueOnce(producer);
       await expect(
-        manager.produce('room-dm', 'u-dm', transport.id, 'audio', createRtpParameters() as any, 'mic')
+        manager.produce(
+          'room-dm',
+          'u-dm',
+          transport.id,
+          'audio',
+          createRtpParameters() as any,
+          'mic'
+        )
       ).resolves.toBeDefined();
     });
   });
@@ -1294,7 +1433,14 @@ describe('RoomManager', () => {
 
       // The revoked snapshot binds immediately: a fresh mic produce is rejected.
       await expect(
-        manager.produce('room-1', 'u-live', transport.id, 'audio', createRtpParameters() as any, 'mic')
+        manager.produce(
+          'room-1',
+          'u-live',
+          transport.id,
+          'audio',
+          createRtpParameters() as any,
+          'mic'
+        )
       ).rejects.toThrow('publish permission denied');
     });
 
@@ -1316,12 +1462,23 @@ describe('RoomManager', () => {
       const producer = createMockProducer({ kind: 'audio' });
       transport.produce.mockResolvedValueOnce(producer);
       await expect(
-        manager.produce('room-dm2', 'u-dm2', transport.id, 'audio', createRtpParameters() as any, 'mic')
+        manager.produce(
+          'room-dm2',
+          'u-dm2',
+          transport.id,
+          'audio',
+          createRtpParameters() as any,
+          'mic'
+        )
       ).resolves.toBeDefined();
     });
 
     it('closeForbiddenProducers closes only the sources whose bit was revoked', async () => {
-      await joinChannelWithPerms('u-revoke', 'sock-revoke', PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE);
+      await joinChannelWithPerms(
+        'u-revoke',
+        'sock-revoke',
+        PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE
+      );
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-revoke', 'send');
@@ -1345,7 +1502,11 @@ describe('RoomManager', () => {
       // publish bits survive) means the peer is no longer entitled to be in the
       // voice channel at all, so both mic and camera must close — not just the
       // sources whose own publish bit changed.
-      await joinChannelWithPerms('u-noaccess', 'sock-noaccess', PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE);
+      await joinChannelWithPerms(
+        'u-noaccess',
+        'sock-noaccess',
+        PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE
+      );
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-noaccess', 'send');
@@ -1414,20 +1575,42 @@ describe('RoomManager', () => {
       // Video revoked while Speak+ScreenShare remain: the kind-keyed model forbids
       // the `screen` video producer but still permits `screen-audio`, which would
       // be left orphaned (validateScreenAudioSource requires an active screen).
-      await joinChannelWithPerms('u-scrorph', 'sock-scrorph', PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE);
+      await joinChannelWithPerms(
+        'u-scrorph',
+        'sock-scrorph',
+        PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE
+      );
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-scrorph', 'send');
 
       const screen = createMockProducer({ kind: 'video' });
       transport.produce.mockResolvedValueOnce(screen);
-      await manager.produce('room-1', 'u-scrorph', transport.id, 'video', createRtpParameters() as any, 'screen');
+      await manager.produce(
+        'room-1',
+        'u-scrorph',
+        transport.id,
+        'video',
+        createRtpParameters() as any,
+        'screen'
+      );
 
       const screenAudio = createMockProducer({ kind: 'audio' });
       transport.produce.mockResolvedValueOnce(screenAudio);
-      await manager.produce('room-1', 'u-scrorph', transport.id, 'audio', createRtpParameters() as any, 'screen-audio');
+      await manager.produce(
+        'room-1',
+        'u-scrorph',
+        transport.id,
+        'audio',
+        createRtpParameters() as any,
+        'screen-audio'
+      );
 
-      manager.updateParticipantPermissions('room-1', 'u-scrorph', PERM_SPEAK | PERM_SCREENSHARE | PERM_VOICE);
+      manager.updateParticipantPermissions(
+        'room-1',
+        'u-scrorph',
+        PERM_SPEAK | PERM_SCREENSHARE | PERM_VOICE
+      );
       const closed = await manager.closeForbiddenProducers('room-1', 'u-scrorph');
 
       expect(closed.sort()).toEqual(['screen', 'screen-audio']);
@@ -1439,18 +1622,36 @@ describe('RoomManager', () => {
     it('closeForbiddenProducers keeps screen-audio when its screen producer survives', async () => {
       // Only Speak is revoked (screen-audio itself becomes forbidden); the screen
       // video producer stays, so the orphan sweep must NOT fire on the survivor.
-      await joinChannelWithPerms('u-scrkeep', 'sock-scrkeep', PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE);
+      await joinChannelWithPerms(
+        'u-scrkeep',
+        'sock-scrkeep',
+        PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE
+      );
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
       await manager.createTransport('room-1', 'u-scrkeep', 'send');
 
       const screen = createMockProducer({ kind: 'video' });
       transport.produce.mockResolvedValueOnce(screen);
-      await manager.produce('room-1', 'u-scrkeep', transport.id, 'video', createRtpParameters() as any, 'screen');
+      await manager.produce(
+        'room-1',
+        'u-scrkeep',
+        transport.id,
+        'video',
+        createRtpParameters() as any,
+        'screen'
+      );
 
       const screenAudio = createMockProducer({ kind: 'audio' });
       transport.produce.mockResolvedValueOnce(screenAudio);
-      await manager.produce('room-1', 'u-scrkeep', transport.id, 'audio', createRtpParameters() as any, 'screen-audio');
+      await manager.produce(
+        'room-1',
+        'u-scrkeep',
+        transport.id,
+        'audio',
+        createRtpParameters() as any,
+        'screen-audio'
+      );
 
       // Revoke Speak only: screen-audio (needs Speak) closes, screen video stays.
       manager.updateParticipantPermissions('room-1', 'u-scrkeep', PERM_ALL_VIDEO | PERM_VOICE);
@@ -1481,7 +1682,14 @@ describe('RoomManager', () => {
       });
 
       await expect(
-        manager.produce('room-1', 'u-race2', transport.id, 'audio', createRtpParameters() as any, 'mic')
+        manager.produce(
+          'room-1',
+          'u-race2',
+          transport.id,
+          'audio',
+          createRtpParameters() as any,
+          'mic'
+        )
       ).rejects.toThrow('publish permission denied');
 
       expect(producer.close).toHaveBeenCalled();
@@ -3514,17 +3722,21 @@ describe('resolveRoomCapTier (#1542)', () => {
 });
 
 describe('resolveScreenProducerCap (#1542)', () => {
-  it('resolves free 1 / premium 3', () => {
+  it('resolves free from config / premium 16', () => {
+    // Free reads the (intentionally tight) mocked config value; the shipped
+    // free default (8) is asserted in config.test.ts.
     expect(resolveScreenProducerCap(mkRoom({ roomKind: 'channel', ownerTier: 'free' }))).toBe(1);
-    expect(resolveScreenProducerCap(mkRoom({ roomKind: 'channel', ownerTier: 'premium' }))).toBe(3);
-    expect(PREMIUM_SCREEN_PRODUCER_CAP).toBe(3);
+    expect(resolveScreenProducerCap(mkRoom({ roomKind: 'channel', ownerTier: 'premium' }))).toBe(
+      16
+    );
+    expect(PREMIUM_SCREEN_PRODUCER_CAP).toBe(16);
   });
 
   it('premium cap respects the absolute ceiling', () => {
     expect(
       resolveScreenProducerCap(mkRoom({ roomKind: 'channel', ownerTier: 'premium' }))
     ).toBeLessThanOrEqual(ABSOLUTE_SCREEN_PRODUCER_CEILING);
-    expect(ABSOLUTE_SCREEN_PRODUCER_CEILING).toBe(3);
+    expect(ABSOLUTE_SCREEN_PRODUCER_CEILING).toBe(16);
   });
 
   it('clamps a config free cap above the ceiling down, and a 0/negative up to 1', () => {
@@ -3538,7 +3750,7 @@ describe('resolveScreenProducerCap (#1542)', () => {
   it('DM with a present premium participant resolves the premium cap', () => {
     expect(
       resolveScreenProducerCap(withParticipants(mkRoom({ roomKind: 'dm' }), 'free', 'premium'))
-    ).toBe(3);
+    ).toBe(16);
   });
 });
 
@@ -3625,15 +3837,15 @@ describe('tier-aware cap enforcement (#1542)', () => {
     return manager.produce(roomId, userId, t.id, 'video', createRtpParameters() as any, 'screen');
   }
 
-  it('premium-owner channel room allows up to 3 screenshares, rejects the 4th', async () => {
+  it('premium-owner channel room allows up to 16 screenshares, rejects the 17th', async () => {
     const ctx = { roomKind: 'channel' as const, ownerTier: 'premium' };
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 16; i++) {
       const t = await joinWithTransport('room-prem', `u-${i}`, FREE_ENT, ctx);
       await produceScreen('room-prem', `u-${i}`, t, `scr-${i}`);
     }
-    const t4 = await joinWithTransport('room-prem', 'u-4', FREE_ENT, ctx);
-    await expect(produceScreen('room-prem', 'u-4', t4, 'scr-4')).rejects.toThrow(
-      'Screen share limit reached (max 3)'
+    const tExtra = await joinWithTransport('room-prem', 'u-extra', FREE_ENT, ctx);
+    await expect(produceScreen('room-prem', 'u-extra', tExtra, 'scr-extra')).rejects.toThrow(
+      'Screen share limit reached (max 16)'
     );
   });
 
@@ -3641,7 +3853,7 @@ describe('tier-aware cap enforcement (#1542)', () => {
     const ctx = { roomKind: 'dm' as const };
     const tFree = await joinWithTransport('dm-room', 'u-free', FREE_ENT, ctx);
     const tPrem = await joinWithTransport('dm-room', 'u-prem', PREMIUM_ENT, ctx);
-    // Free cap would be 1 — the present premium participant raises it to 3.
+    // Free cap would be 1 (mocked config) — the present premium participant raises it to 16.
     await produceScreen('dm-room', 'u-free', tFree, 'scr-a');
     await produceScreen('dm-room', 'u-prem', tPrem, 'scr-b');
     const info = await produceScreen('dm-room', 'u-free', tFree, 'scr-c');
@@ -3654,7 +3866,7 @@ describe('tier-aware cap enforcement (#1542)', () => {
     const tFree2 = await joinWithTransport('dm-down', 'u-free2', FREE_ENT, ctx);
     await joinWithTransport('dm-down', 'u-prem', PREMIUM_ENT, ctx);
 
-    // Two screenshares admitted under the premium DM cap (3).
+    // Two screenshares admitted under the premium DM cap (16).
     const p1 = createMockProducer({ kind: 'video', id: 'scr-1' });
     tFree1.produce.mockResolvedValueOnce(p1);
     await manager.produce(
@@ -3699,7 +3911,7 @@ describe('tier-aware cap enforcement (#1542)', () => {
     await expect(produceScreen('dm-up', 'u-free', tFree, 'scr-2')).rejects.toThrow(
       'Screen share limit reached (max 1)'
     );
-    // A premium participant joins → produce-time resolution now sees premium (3).
+    // A premium participant joins → produce-time resolution now sees premium (16).
     await joinWithTransport('dm-up', 'u-prem', PREMIUM_ENT, ctx);
     const info = await produceScreen('dm-up', 'u-free', tFree, 'scr-3');
     expect(info.source).toBe('screen');

@@ -1,12 +1,43 @@
-import React, { useRef, useEffect, useCallback } from 'react';
-import { useVoiceStore } from '../../stores/voiceStore';
+import React, { useRef, useEffect, useCallback, useMemo } from 'react';
+import {
+  useVoiceStore,
+  type ActiveScreenShare,
+  MAX_TUNED_SCREEN_SHARES,
+} from '../../stores/voiceStore';
 import { useUserStore } from '../../stores/userStore';
 import { useAudioSettingsStore } from '../../stores/audioSettingsStore';
+import { useSettingsStore, type AppearanceSettings } from '../../stores/settingsStore';
 import ParticipantTile from './ParticipantTile';
+import ShareTunePill from './ShareTunePill';
 import { VOICE_MAX_SCALE, useVoiceMagnification } from './useVoiceMagnification';
 import { useGridLayout } from '../../hooks/useGridLayout';
 import { errorMessage } from '../../utils/redactError';
 import './ParticipantGrid.css';
+
+/** Base vertical px reserved below each grid slot for the Tune In/Out pill row. */
+const PILL_SPACE_BASE = 24;
+
+/** Discrete font-size buckets, mirrored from the `[data-fontsize]` rules in
+ *  styles/index.css. The effective `--font-scale` the pill band tracks is this
+ *  discrete value times the continuous `--ui-scale` (uiScale). Keeping this map
+ *  in sync with that CSS lets us derive the band from settings-store state
+ *  instead of a synchronous getComputedStyle read on every voice re-render. */
+const FONT_SCALE_DISCRETE: Record<AppearanceSettings['fontSize'], number> = {
+  small: 0.825,
+  default: 1,
+  large: 1.175,
+};
+
+/** The pill's height tracks --font-scale (accessibility font sizes); keep the
+ *  reserved band in sync so a scaled pill is never clipped or overlapped by
+ *  the magnified active-speaker frame. `fontScale` is the effective
+ *  `--font-scale` (discrete bucket × uiScale) derived from the settings store,
+ *  so this stays a pure calc off already-reactive state rather than reading
+ *  computed styles inline during render. */
+function pillSpacePx(fontScale: number): number {
+  const scale = Number.isFinite(fontScale) && fontScale > 0 ? fontScale : 1;
+  return Math.ceil(PILL_SPACE_BASE * scale);
+}
 
 /** Maximum boost gain: +18 dB ≈ 8x linear. Prevents extreme noise amplification. */
 const MAX_BOOST_LINEAR = Math.pow(10, 18 / 20); // ~7.94
@@ -357,12 +388,81 @@ export const AudioOutputs: React.FC = () => {
 };
 
 /**
+ * Screen-share tile for the Tile view: a tuned-in stream rendered as a grid
+ * sibling of the user frames (Discord-style). Clicking it switches to the
+ * Front 'n Center view focused on that stream.
+ */
+const StreamGridTile: React.FC<{
+  producerId: string;
+  name: string;
+  stream?: MediaStream;
+  /** Local share detached by Auto-Pause — show the placeholder, not a blank tile. */
+  isPaused?: boolean;
+  onFocus: (producerId: string) => void;
+}> = ({ producerId, name, stream, isPaused = false, onFocus }) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    if (stream) {
+      el.srcObject = stream;
+      el.play().catch(() => {});
+    } else {
+      el.srcObject = null;
+    }
+    return () => {
+      el.srcObject = null;
+    };
+  }, [stream]);
+
+  return (
+    <button
+      type="button"
+      className="stream-grid-tile"
+      onClick={() => onFocus(producerId)}
+      title="Show front 'n center"
+      aria-label={`Focus ${name}'s screen`}
+    >
+      {isPaused ? (
+        <div className="stream-grid-tile__paused">
+          <span className="stream-grid-tile__paused-title">Your Screen Is Still Streaming</span>
+        </div>
+      ) : (
+        <video ref={videoRef} className="stream-grid-tile__video" autoPlay playsInline muted />
+      )}
+      <span className="stream-grid-tile__name">{`${name}’s screen`}</span>
+    </button>
+  );
+};
+
+interface UserFrameGridProps {
+  /** Tile view: render tuned-in screen shares as grid tiles alongside frames. */
+  includeStreamTiles?: boolean;
+}
+
+/**
  * Mode A layout: centered user frames grid with no scrollbars.
  * Tiles scale dynamically to fit the viewport.
+ *
+ * With `includeStreamTiles` (the Tile view while streams are tuned in),
+ * tuned-in screen shares render as sibling 16:9 tiles ahead of the frames.
+ * Participants producing a stream get a Tune In/Out pill below their frame.
  */
-export const UserFrameGrid: React.FC = () => {
+export const UserFrameGrid: React.FC<UserFrameGridProps> = ({ includeStreamTiles = false }) => {
   const participants = useVoiceStore((s) => s.participants);
   const localUserId = useUserStore((s) => s.user?.id);
+  const tunedInScreenShares = useVoiceStore((s) => s.tunedInScreenShares);
+  const activeScreenShares = useVoiceStore((s) => s.activeScreenShares);
+  const setDominantScreenShare = useVoiceStore((s) => s.setDominantScreenShare);
+  const setVoiceViewMode = useVoiceStore((s) => s.setVoiceViewMode);
+  const setStageLayout = useVoiceStore((s) => s.setStageLayout);
+  const localStreamPaused = useVoiceStore((s) => s.localStreamPaused);
+  // Effective --font-scale inputs (discrete bucket × continuous uiScale). Read
+  // from the store so the pill band recomputes only when the accessibility font
+  // setting actually changes, not on every speaking-state toggle.
+  const fontSize = useSettingsStore((s) => s.appearance.fontSize);
+  const uiScale = useSettingsStore((s) => s.appearance.uiScale);
   const participantList = Object.values(participants);
   const scales = useVoiceMagnification(participants);
   // Active-speaker dominance (#1040): only meaningful with >1 tile (a lone tile
@@ -371,15 +471,65 @@ export const UserFrameGrid: React.FC = () => {
   const dominanceActive = participantList.length > 1;
   const anySpeaking = participantList.some((p) => p.isSpeaking);
   const gridRef = useRef<HTMLDivElement>(null);
-  const hasAnyVideo = participantList.some((p) => p.isVideoOn);
+
+  // Tile view: one tile per tuned-in share, owner resolved via the #2088 seam.
+  const streamTiles = includeStreamTiles
+    ? Object.keys(tunedInScreenShares).map((producerId) => {
+        const meta = activeScreenShares[producerId];
+        const isLocal = meta?.isLocal ?? false;
+        const stream = meta ? participants[meta.userId]?.screenStream : undefined;
+        const paused = isLocal && localStreamPaused;
+        return {
+          producerId,
+          name: meta?.displayName || meta?.username || 'Unknown',
+          // Honor Auto-Pause for the local preview: when the window blurs,
+          // VoiceView sets localStreamPaused and the stage/stream-bar paths drop
+          // the local stream. Do the same here so the Tile view does not keep the
+          // local capture attached and rendering while unfocused.
+          stream: paused ? undefined : stream,
+          paused,
+        };
+      })
+    : [];
+
+  // First announced remote share per producer user → Tune In/Out pill below
+  // their frame (relocated from the retired ScreenShareControls dock).
+  const shareByUser: Record<string, ActiveScreenShare> = {};
+  for (const share of Object.values(activeScreenShares)) {
+    if (!share.isLocal && !(share.userId in shareByUser)) shareByUser[share.userId] = share;
+  }
+  const atCap = Object.keys(tunedInScreenShares).length >= MAX_TUNED_SCREEN_SHARES;
+  const hasPills = participantList.some((p) => shareByUser[p.userId]);
+  const pillSpace = useMemo(
+    () => (hasPills ? pillSpacePx((FONT_SCALE_DISCRETE[fontSize] ?? 1) * uiScale) : 0),
+    [hasPills, fontSize, uiScale]
+  );
+
+  const hasAnyVideo = participantList.some((p) => p.isVideoOn) || streamTiles.length > 0;
   const reservedScale = VOICE_MAX_SCALE;
-  const { tileWidth, tileHeight } = useGridLayout(gridRef, participantList.length, {
-    aspectRatio: hasAnyVideo ? 16 / 9 : 1,
-    maxTileWidth: 320,
-    scale: reservedScale,
-  });
+  const { tileWidth, tileHeight } = useGridLayout(
+    gridRef,
+    participantList.length + streamTiles.length,
+    {
+      aspectRatio: hasAnyVideo ? 16 / 9 : 1,
+      maxTileWidth: 320,
+      scale: reservedScale,
+      extraTileHeight: pillSpace,
+    }
+  );
   const tileSlotWidth = tileWidth * reservedScale;
   const tileSlotHeight = tileHeight * reservedScale;
+
+  const handleFocusStream = useCallback(
+    (producerId: string) => {
+      setDominantScreenShare(producerId);
+      // The dominant id is only honored by the stage's 'focus' sub-layout —
+      // a persisted 'equal' preference would silently ignore the click.
+      setStageLayout('focus');
+      setVoiceViewMode('front-center');
+    },
+    [setDominantScreenShare, setStageLayout, setVoiceViewMode]
+  );
 
   return (
     <div
@@ -391,11 +541,24 @@ export const UserFrameGrid: React.FC = () => {
           '--tile-slot-h': `${tileSlotHeight}px`,
           '--tile-w': `${tileWidth}px`,
           '--tile-h': `${tileHeight}px`,
+          '--pill-space': `${pillSpace}px`,
         } as React.CSSProperties
       }
     >
+      {streamTiles.map((tile) => (
+        <div key={`stream-${tile.producerId}`} className="user-frame-grid__slot">
+          <StreamGridTile
+            producerId={tile.producerId}
+            name={tile.name}
+            stream={tile.stream}
+            isPaused={tile.paused}
+            onFocus={handleFocusStream}
+          />
+        </div>
+      ))}
       {participantList.map((p) => {
         const scale = scales[p.userId] ?? 1;
+        const share = shareByUser[p.userId];
         return (
           <div key={p.userId} className="user-frame-grid__slot">
             <ParticipantTile
@@ -405,6 +568,13 @@ export const UserFrameGrid: React.FC = () => {
               activeSpeaker={dominanceActive && p.isSpeaking}
               dimmed={dominanceActive && anySpeaking && !p.isSpeaking}
             />
+            {share && (
+              <ShareTunePill
+                share={share}
+                tunedIn={share.producerId in tunedInScreenShares}
+                atCap={atCap}
+              />
+            )}
           </div>
         );
       })}

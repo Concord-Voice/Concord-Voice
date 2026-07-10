@@ -191,6 +191,11 @@ export interface AvailableScreenShare {
  *  `50 - 5*count` slot-cost multiplier — that 5 is a different constant. */
 export const MAX_TUNED_SCREEN_SHARES = 5;
 
+/** Voice view mode while streams are tuned in:
+ *  'front-center' = user-frame strip above a dominant stream stage (Zoom-style);
+ *  'tile' = streams + user frames as sibling tiles in one grid (Discord-style). */
+export type VoiceViewMode = 'tile' | 'front-center';
+
 /** Owner metadata for every ACTIVE screen-share producer (available AND
  *  tuned-in, local AND remote) — the producerId→owner seam (#2088). */
 export interface ActiveScreenShare {
@@ -339,6 +344,10 @@ interface VoiceState {
   //               'focus' = one dominant stream + others in bottom StreamBar
   stageLayout: 'equal' | 'focus';
 
+  // Voice view mode while streams are tuned in: 'front-center' (Zoom-style
+  // dominant stage) vs 'tile' (Discord-style uniform grid of streams + frames)
+  voiceViewMode: VoiceViewMode;
+
   // PiP state
   pipWindows: string[];
 
@@ -473,6 +482,8 @@ interface VoiceState {
   setStreamBarHeight: (height: number) => void;
   setStageLayout: (layout: 'equal' | 'focus') => void;
   toggleStageLayout: () => void;
+  setVoiceViewMode: (mode: VoiceViewMode) => void;
+  toggleVoiceViewMode: () => void;
 
   // PiP
   addPipWindow: (id: string) => void;
@@ -593,6 +604,7 @@ const initialState = {
   userFrameBarHeight: 120,
   streamBarHeight: 120,
   stageLayout: 'focus' as 'equal' | 'focus',
+  voiceViewMode: 'front-center' as VoiceViewMode,
   pipWindows: [] as string[],
   keepActiveWhileUnfocused: (() => {
     try {
@@ -874,12 +886,29 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
   // Multi-stream screen share
   tuneIn: (producerId, consumerId) =>
     set((state) => {
+      const wasEmpty = Object.keys(state.tunedInScreenShares).length === 0;
       const next = { ...state.tunedInScreenShares, [producerId]: consumerId };
       const count = Object.keys(next).length;
-      return {
+      const patch = {
         tunedInScreenShares: next,
         maxVideoSlots: 50 - 5 * count,
       };
+      // The first tune-in while Front 'n Center is the active view enters the
+      // dominant-stream stage directly (via a ShareTunePill, auto-tune, or a
+      // preserved/default 'front-center' mode) without passing through
+      // toggleVoiceViewMode or handleFocusStream, the paths that normally
+      // establish the stage invariant. Without repairing here, a persisted
+      // 'equal' stageLayout or a null/dangling dominant would render Front 'n
+      // Center as an equal grid with no dominant / no ←→ cycling. Force focus +
+      // a valid dominant (the freshly tuned-in share) on that entry.
+      if (wasEmpty && state.voiceViewMode === 'front-center') {
+        return {
+          ...patch,
+          stageLayout: 'focus' as const,
+          dominantScreenShareId: producerId,
+        };
+      }
+      return patch;
     }),
   tuneOut: (producerId) =>
     set((state) => {
@@ -895,7 +924,15 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
         maxVideoSlots: 50 - 5 * count,
       };
     }),
-  setDominantScreenShare: (dominantScreenShareId) => set({ dominantScreenShareId }),
+  // No-op unless the id is null or currently tuned in: an in-flight focus
+  // click can race a producer-close that already reassigned the dominant id —
+  // reinstating the closed producer would render a dead black stage cell.
+  setDominantScreenShare: (dominantScreenShareId) =>
+    set((state) =>
+      dominantScreenShareId === null || dominantScreenShareId in state.tunedInScreenShares
+        ? { dominantScreenShareId }
+        : {}
+    ),
   recalculateMaxVideoSlots: () =>
     set((state) => ({
       maxVideoSlots: 50 - 5 * Object.keys(state.tunedInScreenShares).length,
@@ -910,6 +947,28 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
   setStageLayout: (stageLayout) => set({ stageLayout }),
   toggleStageLayout: () =>
     set((state) => ({ stageLayout: state.stageLayout === 'equal' ? 'focus' : 'equal' })),
+  setVoiceViewMode: (voiceViewMode) => set({ voiceViewMode }),
+  toggleVoiceViewMode: () =>
+    set((state) => {
+      const next = state.voiceViewMode === 'tile' ? 'front-center' : 'tile';
+      if (next !== 'front-center') return { voiceViewMode: next };
+      // Entering Front 'n Center: the view promises a dominant-stream stage with
+      // ←/→ cycling. A persisted 'equal' stageLayout (or a null/dangling
+      // dominant from tuning in via pills without ever focusing a stream) would
+      // otherwise render an equal grid with no dominant or cycling, contradicting
+      // the control. Force focus + a valid dominant, mirroring the stream-tile
+      // click path in ParticipantGrid (handleFocusStream).
+      const dominantValid =
+        state.dominantScreenShareId != null &&
+        state.dominantScreenShareId in state.tunedInScreenShares;
+      return {
+        voiceViewMode: next,
+        stageLayout: 'focus',
+        dominantScreenShareId: dominantValid
+          ? state.dominantScreenShareId
+          : (Object.keys(state.tunedInScreenShares)[0] ?? null),
+      };
+    }),
 
   // PiP
   addPipWindow: (id) =>
@@ -1018,6 +1077,7 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
       userFrameBarHeight: state.userFrameBarHeight,
       streamBarHeight: state.streamBarHeight,
       stageLayout: state.stageLayout,
+      voiceViewMode: state.voiceViewMode,
       // Preserve stream focus preference
       keepActiveWhileUnfocused: state.keepActiveWhileUnfocused,
       // Preserve persistent bar text chat height

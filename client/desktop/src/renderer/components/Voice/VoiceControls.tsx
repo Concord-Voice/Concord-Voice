@@ -19,8 +19,15 @@ import {
   Pin,
   PinOff,
   ExternalLink,
+  Tv,
+  LayoutGrid,
+  Focus,
 } from 'lucide-react';
-import { useVoiceStore, type ActiveScreenShare } from '../../stores/voiceStore';
+import {
+  useVoiceStore,
+  type ActiveScreenShare,
+  MAX_TUNED_SCREEN_SHARES,
+} from '../../stores/voiceStore';
 import { useUserStore } from '../../stores/userStore';
 import { useChannelStore } from '../../stores/channelStore';
 import { useOsPermissionStore } from '../../stores/osPermissionStore';
@@ -216,6 +223,93 @@ const MediaButton: React.FC<MediaButtonProps> = ({
   );
 };
 
+/**
+ * Tune Everywhere toggle + Tile / Front 'n Center view switch (voiceView
+ * context only). File-private extraction keeps VoiceControls under the
+ * S3776 cognitive-complexity gate.
+ *
+ * Offer tune-in while it is legal; otherwise offer tune-out whenever any
+ * remote stream is tuned in — never a dead disabled control (the retired
+ * dock kept Tune Out All reachable in every mixed/at-cap state).
+ */
+const StreamControls: React.FC<{ context: 'voiceView' | 'persistent' }> = ({ context }) => {
+  const activeScreenShares = useVoiceStore((s) => s.activeScreenShares);
+  const tunedInScreenShares = useVoiceStore((s) => s.tunedInScreenShares);
+  const voiceViewMode = useVoiceStore((s) => s.voiceViewMode);
+  const toggleVoiceViewMode = useVoiceStore((s) => s.toggleVoiceViewMode);
+
+  const remoteShares = Object.values(activeScreenShares).filter((s) => !s.isLocal);
+  const remoteUntuned = remoteShares.filter((s) => !(s.producerId in tunedInScreenShares));
+  const remoteTuned = remoteShares.filter((s) => s.producerId in tunedInScreenShares);
+  const tunedInCount = Object.keys(tunedInScreenShares).length;
+  const atShareCap = tunedInCount >= MAX_TUNED_SCREEN_SHARES;
+  const canTuneInMore = remoteUntuned.length > 0 && !atShareCap;
+  const offerTuneOut = !canTuneInMore && remoteTuned.length > 0;
+  // Degenerate only (cap reached with zero remote tune-ins): unreachable with
+  // MAX_TUNED_SCREEN_SHARES > 1 since the local sentinel is a single entry.
+  const tuneEverywhereLocked = !canTuneInMore && !offerTuneOut;
+
+  const handleTuneEverywhere = useCallback(async () => {
+    try {
+      const { voiceService } = await import('../../services/voiceService');
+      if (canTuneInMore) {
+        await voiceService.tuneInAllScreenShares();
+      } else {
+        await voiceService.tuneOutAllScreenShares();
+      }
+    } catch (err) {
+      console.error('Tune Everywhere failed:', errorMessage(err));
+    }
+  }, [canTuneInMore]);
+
+  if (context !== 'voiceView') return null;
+
+  const tuneEverywhereTitle = (() => {
+    if (tuneEverywhereLocked) return `Maximum ${MAX_TUNED_SCREEN_SHARES} screen shares`;
+    if (!offerTuneOut) return 'Tune in to every stream';
+    return remoteUntuned.length > 0
+      ? `Maximum ${MAX_TUNED_SCREEN_SHARES} screen shares — tune out of every stream`
+      : 'Tune out of every stream';
+  })();
+
+  return (
+    <>
+      {/* Tune Everywhere — global stream tune toggle (replaces the old
+          Tune In All / Tune Out All dock buttons) */}
+      {remoteShares.length > 0 && (
+        <MediaButton
+          isActive={offerTuneOut}
+          onClick={handleTuneEverywhere}
+          title={tuneEverywhereTitle}
+          activeIcon={<Tv size={18} />}
+          inactiveIcon={<Tv size={18} />}
+          activeLabel="Tune Out Everywhere"
+          inactiveLabel="Tune In Everywhere"
+          locked={tuneEverywhereLocked}
+        />
+      )}
+
+      {/* Tile ↔ Front 'n Center layout switch — only while a stream is
+          tuned in (Front 'n Center is stream-only) */}
+      {tunedInCount > 0 && (
+        <MediaButton
+          isActive={voiceViewMode === 'front-center'}
+          onClick={toggleVoiceViewMode}
+          title={
+            voiceViewMode === 'front-center'
+              ? 'Switch to tile view'
+              : "Switch to front 'n center view"
+          }
+          activeIcon={<LayoutGrid size={18} />}
+          inactiveIcon={<Focus size={18} />}
+          activeLabel="Tile View"
+          inactiveLabel="Front 'n Center"
+        />
+      )}
+    </>
+  );
+};
+
 interface VoiceControlsProps {
   /** 'voiceView' = inside VoiceView, 'persistent' = navigated-away bar */
   context?: 'voiceView' | 'persistent';
@@ -390,6 +484,9 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
             activeLabel="Stop"
             inactiveLabel="Screen"
           />
+
+          {/* Tune Everywhere + view-mode switch (voiceView context only) */}
+          <StreamControls context={context} />
 
           {hasLinkedText && (
             <button

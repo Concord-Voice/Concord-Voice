@@ -1,14 +1,14 @@
 import React, { useEffect, useRef, useCallback, useMemo } from 'react';
 import { Lock, Users, ChevronUp, ChevronDown } from 'lucide-react';
 import { createResizeKeyHandler } from '../../utils/resizeKeyboard';
-import { useVoiceStore } from '../../stores/voiceStore';
+import { useVoiceStore, MAX_TUNED_SCREEN_SHARES } from '../../stores/voiceStore';
 import { useChannelStore } from '../../stores/channelStore';
 // voiceService is loaded on-demand via dynamic import() — see voiceService.ts
 import { UserFrameGrid } from './ParticipantGrid';
 import UserFrameBar from './UserFrameBar';
+import ShareTunePill from './ShareTunePill';
 import VoiceStage from './VoiceStage';
 import StreamBar from './StreamBar';
-import ScreenShareControls from './ScreenShareControls';
 import VoiceControls from './VoiceControls';
 import VoiceTextChat from './VoiceTextChat';
 import './VoiceView.css';
@@ -125,6 +125,33 @@ interface ScreenShareLayoutProps {
   showStreamBar: boolean;
 }
 
+/**
+ * Slim fallback strip of per-share tune pills, shown in Front 'n Center when
+ * the user-frame bar (the pills' normal home) is collapsed — per-share tune
+ * in/out must stay reachable in every layout state.
+ */
+const SharePillStrip: React.FC = () => {
+  const activeScreenShares = useVoiceStore((s) => s.activeScreenShares);
+  const tunedInScreenShares = useVoiceStore((s) => s.tunedInScreenShares);
+  const remoteShares = Object.values(activeScreenShares).filter((s) => !s.isLocal);
+  if (remoteShares.length === 0) return null;
+  const atCap = Object.keys(tunedInScreenShares).length >= MAX_TUNED_SCREEN_SHARES;
+  return (
+    <div className="voice-view__share-pill-strip">
+      {remoteShares.map((share) => (
+        <ShareTunePill
+          key={share.producerId}
+          share={share}
+          tunedIn={share.producerId in tunedInScreenShares}
+          atCap={atCap}
+          compact
+          showName
+        />
+      ))}
+    </div>
+  );
+};
+
 /** Three-section layout when screen shares are active (user frames, stage, stream bar). */
 const ScreenShareLayout: React.FC<ScreenShareLayoutProps> = ({
   showUserFrameBar,
@@ -140,7 +167,7 @@ const ScreenShareLayout: React.FC<ScreenShareLayoutProps> = ({
   showStreamBar,
 }) => (
   <>
-    {showUserFrameBar && <UserFrameBar height={userFrameBarHeight} />}
+    {showUserFrameBar ? <UserFrameBar height={userFrameBarHeight} /> : <SharePillStrip />}
 
     <div className="voice-view__section-handle">
       <button
@@ -210,6 +237,7 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
   const toggleUserFrameBar = useVoiceStore((s) => s.toggleUserFrameBar);
   const toggleStreamBar = useVoiceStore((s) => s.toggleStreamBar);
   const stageLayout = useVoiceStore((s) => s.stageLayout);
+  const voiceViewMode = useVoiceStore((s) => s.voiceViewMode);
   const isScreenSharing = useVoiceStore((s) => s.isScreenSharing);
   const keepActiveWhileUnfocused = useVoiceStore((s) => s.keepActiveWhileUnfocused);
 
@@ -242,6 +270,21 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
   useEffect(() => {
     hasJoinedRef.current = isConnected;
   }, [channelId, isConnected]);
+
+  // A tune action can swap the whole layout branch (grid ↔ stage), unmounting
+  // the control that had keyboard focus. When focus fell back to <body>, land
+  // it on the voice area so keyboard/screen-reader users resume from the
+  // voice UI instead of the app root.
+  const voiceAreaRef = useRef<HTMLDivElement>(null);
+  const layoutBranch = hasScreenShares && voiceViewMode === 'front-center' ? 'stage' : 'grid';
+  const prevLayoutBranchRef = useRef(layoutBranch);
+  useEffect(() => {
+    if (prevLayoutBranchRef.current === layoutBranch) return;
+    prevLayoutBranchRef.current = layoutBranch;
+    if (document.activeElement === document.body) {
+      voiceAreaRef.current?.focus();
+    }
+  }, [layoutBranch]);
 
   // Auto-pause: hide local stream previews when window loses focus to save
   // GPU/decode resources. The producer keeps running — other participants
@@ -425,9 +468,12 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
       <div
         className={`voice-view__content ${isVerticalLayout ? 'voice-view__content--vertical' : 'voice-view__content--horizontal'}`}
       >
-        {/* Voice area — one resizable entity vs text chat */}
-        <div className="voice-view__voice-area">
-          {hasScreenShares ? (
+        {/* Voice area — one resizable entity vs text chat.
+            With tuned-in streams: 'front-center' = strip + dominant stage
+            (Zoom-style); 'tile' = streams as grid tiles beside the user
+            frames (Discord-style). */}
+        <div className="voice-view__voice-area" ref={voiceAreaRef} tabIndex={-1}>
+          {hasScreenShares && voiceViewMode === 'front-center' ? (
             <ScreenShareLayout
               showUserFrameBar={showUserFrameBar}
               userFrameBarHeight={userFrameBarHeight}
@@ -450,11 +496,8 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
               showStreamBar={showStreamBar}
             />
           ) : (
-            <UserFrameGrid />
+            <UserFrameGrid includeStreamTiles={hasScreenShares} />
           )}
-
-          {/* Screen-share control dock — per-stream + global Tune In/Out (#2088) */}
-          <ScreenShareControls />
         </div>
 
         {/* Text chat panel — vertical (side-by-side) layout only */}

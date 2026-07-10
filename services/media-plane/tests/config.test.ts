@@ -180,9 +180,9 @@ describe('config', () => {
   // ── freeScreenProducerCap (#1542) ───────────────────────────────────
 
   describe('freeScreenProducerCap (#1542)', () => {
-    it('defaults to 1 when env unset', async () => {
+    it('defaults to 8 when env unset', async () => {
       const { config } = await loadConfig();
-      expect(config.freeScreenProducerCap).toBe(1);
+      expect(config.freeScreenProducerCap).toBe(8);
     });
 
     it('reads a valid positive integer from FREE_SCREEN_PRODUCER_CAP', async () => {
@@ -190,9 +190,9 @@ describe('config', () => {
       expect(config.freeScreenProducerCap).toBe(2);
     });
 
-    it.each([['abc'], ['0'], ['-5'], ['']])('falls back to 1 for invalid value %j', async (raw) => {
+    it.each([['abc'], ['0'], ['-5'], ['']])('falls back to 8 for invalid value %j', async (raw) => {
       const { config } = await loadConfig({ FREE_SCREEN_PRODUCER_CAP: raw });
-      expect(config.freeScreenProducerCap).toBe(1);
+      expect(config.freeScreenProducerCap).toBe(8);
     });
   });
 

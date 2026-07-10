@@ -92,7 +92,7 @@ var (
 		CameraMaxBitrate:         2_500_000,
 		MaxManualBitrateBps:      5_000_000, // = max(StreamMaxBitrate, CameraMaxBitrate)
 		MaxWebcamPublishers:      8,
-		MaxScreensharePublishers: 1,
+		MaxScreensharePublishers: 8, // raised 1→8 for Discord parity (Discord caps stream quality, not concurrency)
 		MaxMessageChars:          5120,
 		MaxAttachmentBytes:       33_554_432, // 32 MiB — mirrors the public Groundspeed per-file baseline
 		MaxAvatarBytes:           5_242_880,  // 5 MiB
@@ -118,7 +118,7 @@ var (
 		CameraMaxBitrate:         6_000_000,
 		MaxManualBitrateBps:      20_000_000, // = max(StreamMaxBitrate, CameraMaxBitrate)
 		MaxWebcamPublishers:      25,
-		MaxScreensharePublishers: 3,
+		MaxScreensharePublishers: 16, // 2× the free cap (raised 3→16 alongside the free 1→8 Discord-parity bump)
 		MaxMessageChars:          10240,
 		MaxAttachmentBytes:       268_435_456, // 256 MiB — Supersonic's pinned 256 MB (512 MB is Mach 3 server-wide)
 		MaxAvatarBytes:           8_388_608,   // 8 MiB

@@ -19,10 +19,14 @@
 }
 
 /* Dynamic tile sizing: dimensions set by useGridLayout hook via CSS vars.
-   Slots reserve speaking-scale growth so transformed tiles do not overlap. */
+   Slots reserve speaking-scale growth so transformed tiles do not overlap.
+   --pill-space reserves a fixed band below the frame for the per-stream
+   Tune In/Out pill (matched by useGridLayout's extraTileHeight). */
 .user-frame-grid__slot {
+  position: relative;
   width: var(--tile-slot-w, var(--tile-w, 200px));
-  height: var(--tile-slot-h, var(--tile-h, 112px));
+  height: calc(var(--tile-slot-h, var(--tile-h, 112px)) + var(--pill-space, 0px));
+  padding-bottom: var(--pill-space, 0px);
   flex-shrink: 0;
   flex-grow: 0;
   display: flex;
@@ -32,11 +36,80 @@
   min-height: 0;
 }
 
+/* Tune In/Out pill anchored in the reserved band below the frame */
+.user-frame-grid__slot .share-tune-pill {
+  position: absolute;
+  bottom: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 100%;
+}
+
+/* Height-only sizing: each tile's own aspect-ratio resolves its width (1:1
+   avatar frames, 16:9 video tiles — ParticipantTile.css). Fixing BOTH axes
+   here was the bug that forced avatar-only frames into the video aspect
+   whenever any participant had video: with explicit width AND height, the
+   per-tile aspect-ratio declarations are ignored per the CSS spec. */
 .user-frame-grid .participant-tile {
-  width: var(--tile-w, 200px);
   height: var(--tile-h, 112px);
+  width: auto;
+  max-width: var(--tile-w, 200px);
   flex-shrink: 0;
   flex-grow: 0;
   margin: 0;
   transform-origin: center;
+}
+
+/* ─── Screen-share tile (Tile view) ─────────────────────────── */
+
+.stream-grid-tile {
+  position: relative;
+  height: var(--tile-h, 112px);
+  aspect-ratio: 16 / 9;
+  max-width: var(--tile-w, 200px);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+  padding: 0;
+  cursor: pointer;
+}
+
+.stream-grid-tile__video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.stream-grid-tile__name {
+  position: absolute;
+  bottom: 4px;
+  left: 4px;
+  max-width: calc(100% - 8px);
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: calc(11px * var(--font-scale, 1));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Auto-Pause placeholder — local share detached while unfocused (parity with
+   the VoiceStage/StreamBar paused placeholders, just condensed for the tile). */
+.stream-grid-tile__paused {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  padding: 4px;
+  text-align: center;
+}
+
+.stream-grid-tile__paused-title {
+  color: var(--text-secondary);
+  font-size: calc(11px * var(--font-scale, 1));
 }

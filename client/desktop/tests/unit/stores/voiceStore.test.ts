@@ -295,6 +295,52 @@ describe('voiceStore', () => {
       expect(useVoiceStore.getState().maxVideoSlots).toBe(45); // 50 - 5
     });
 
+    it('first tuneIn while front-center enters the stage with focus + a valid dominant', () => {
+      // Pills / auto-tune / a preserved default 'front-center' mode reach the
+      // stage without toggleVoiceViewMode or handleFocusStream. A persisted
+      // 'equal' stageLayout (or null dominant) would otherwise render an equal
+      // grid with no dominant / no ←→ cycling.
+      useVoiceStore.setState({
+        voiceViewMode: 'front-center',
+        stageLayout: 'equal',
+        dominantScreenShareId: null,
+      });
+
+      useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
+
+      const s = useVoiceStore.getState();
+      expect(s.stageLayout).toBe('focus');
+      expect(s.dominantScreenShareId).toBe('prod-1');
+    });
+
+    it('first tuneIn while in tile view leaves stage layout + dominant untouched', () => {
+      useVoiceStore.setState({
+        voiceViewMode: 'tile',
+        stageLayout: 'equal',
+        dominantScreenShareId: null,
+      });
+
+      useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
+
+      const s = useVoiceStore.getState();
+      expect(s.stageLayout).toBe('equal');
+      expect(s.dominantScreenShareId).toBeNull();
+    });
+
+    it('subsequent tuneIns preserve a user-chosen equal stage layout', () => {
+      useVoiceStore.setState({ voiceViewMode: 'front-center' });
+      useVoiceStore.getState().tuneIn('prod-1', 'cons-1'); // enters stage -> focus
+      // User switches to the equal sub-layout once a second share exists.
+      useVoiceStore.getState().tuneIn('prod-2', 'cons-2');
+      useVoiceStore.setState({ stageLayout: 'equal' });
+
+      useVoiceStore.getState().tuneIn('prod-3', 'cons-3');
+
+      const s = useVoiceStore.getState();
+      expect(s.stageLayout).toBe('equal'); // not clobbered by a non-entry tuneIn
+      expect(s.dominantScreenShareId).toBe('prod-1'); // unchanged
+    });
+
     it('tuneOut removes mapping', () => {
       useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
       useVoiceStore.getState().tuneOut('prod-1');
@@ -312,7 +358,8 @@ describe('voiceStore', () => {
       expect(useVoiceStore.getState().dominantScreenShareId).toBe('prod-2');
     });
 
-    it('setDominantScreenShare', () => {
+    it('setDominantScreenShare accepts a tuned-in id', () => {
+      useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
       useVoiceStore.getState().setDominantScreenShare('prod-1');
       expect(useVoiceStore.getState().dominantScreenShareId).toBe('prod-1');
     });
@@ -356,6 +403,78 @@ describe('voiceStore', () => {
 
       useVoiceStore.getState().toggleStageLayout();
       expect(useVoiceStore.getState().stageLayout).toBe('equal');
+    });
+
+    it('sets and toggles voice view mode', () => {
+      useVoiceStore.getState().setVoiceViewMode('front-center');
+      useVoiceStore.getState().toggleVoiceViewMode();
+      expect(useVoiceStore.getState().voiceViewMode).toBe('tile');
+
+      useVoiceStore.getState().toggleVoiceViewMode();
+      expect(useVoiceStore.getState().voiceViewMode).toBe('front-center');
+    });
+
+    it('toggling into front-center forces focus layout + a valid dominant', () => {
+      // Streams tuned in via pills (no explicit focus) with a persisted 'equal'
+      // layout must not leave the front-center view rendering an equal grid with
+      // no dominant / no ←→ cycling.
+      useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
+      useVoiceStore.getState().tuneIn('prod-2', 'cons-2');
+      useVoiceStore.setState({
+        voiceViewMode: 'tile',
+        stageLayout: 'equal',
+        dominantScreenShareId: null,
+      });
+
+      useVoiceStore.getState().toggleVoiceViewMode();
+
+      const s = useVoiceStore.getState();
+      expect(s.voiceViewMode).toBe('front-center');
+      expect(s.stageLayout).toBe('focus');
+      expect(s.dominantScreenShareId).toBe('prod-1'); // first tuned-in share
+    });
+
+    it('toggling into front-center preserves an already-valid dominant', () => {
+      useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
+      useVoiceStore.getState().tuneIn('prod-2', 'cons-2');
+      useVoiceStore.getState().setDominantScreenShare('prod-2');
+      useVoiceStore.setState({ voiceViewMode: 'tile', stageLayout: 'equal' });
+
+      useVoiceStore.getState().toggleVoiceViewMode();
+
+      const s = useVoiceStore.getState();
+      expect(s.voiceViewMode).toBe('front-center');
+      expect(s.stageLayout).toBe('focus');
+      expect(s.dominantScreenShareId).toBe('prod-2');
+    });
+
+    it('toggling to tile view leaves the stage layout untouched', () => {
+      useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
+      useVoiceStore.setState({ voiceViewMode: 'front-center', stageLayout: 'equal' });
+
+      useVoiceStore.getState().toggleVoiceViewMode();
+
+      const s = useVoiceStore.getState();
+      expect(s.voiceViewMode).toBe('tile');
+      expect(s.stageLayout).toBe('equal');
+    });
+
+    it('preserves voiceViewMode across reset (layout preference)', () => {
+      useVoiceStore.getState().setVoiceViewMode('tile');
+      useVoiceStore.getState().reset();
+      expect(useVoiceStore.getState().voiceViewMode).toBe('tile');
+      // Restore the default so state does not leak into later tests
+      useVoiceStore.getState().setVoiceViewMode('front-center');
+    });
+
+    it('setDominantScreenShare ignores ids that are not tuned in (producer-close race)', () => {
+      useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
+      useVoiceStore.getState().setDominantScreenShare('prod-1');
+      // A stale focus click for an already-closed producer must not stick.
+      useVoiceStore.getState().setDominantScreenShare('prod-ghost');
+      expect(useVoiceStore.getState().dominantScreenShareId).toBe('prod-1');
+      useVoiceStore.getState().setDominantScreenShare(null);
+      expect(useVoiceStore.getState().dominantScreenShareId).toBeNull();
     });
   });
 

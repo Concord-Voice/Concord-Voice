@@ -59,6 +59,74 @@ describe('UserFrameBar', () => {
     expect(bar?.getAttribute('style')).toContain('height: 120px');
   });
 
+  it('renders a tune pill below the frame of a remote sharer (and none for non-sharers)', () => {
+    useVoiceStore.setState({
+      participants: {
+        u1: {
+          userId: 'u1',
+          username: 'alice',
+          isMuted: false,
+          isDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: true,
+          isSpeaking: false,
+        },
+        u2: {
+          userId: 'u2',
+          username: 'bob',
+          isMuted: false,
+          isDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: false,
+          isSpeaking: false,
+        },
+      },
+      activeScreenShares: {
+        'prod-1': { producerId: 'prod-1', userId: 'u1', username: 'alice', isLocal: false },
+      },
+      tunedInScreenShares: {},
+    });
+    const { container } = render(<UserFrameBar height={120} />);
+    // Pill wrapped in the same item as the sharer's tile
+    const pillItem = container.querySelector('.user-frame-bar__item--pill');
+    expect(pillItem).toBeInTheDocument();
+    expect(pillItem?.querySelector('[data-testid="tile-u1"]')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: "Tune in to alice's screen" })).toBeInTheDocument();
+    // Non-sharer item carries no pill modifier
+    const items = container.querySelectorAll('.user-frame-bar__item');
+    expect(items.length).toBe(2);
+    expect(container.querySelectorAll('.user-frame-bar__item--pill').length).toBe(1);
+  });
+
+  it('drives the pill at-cap block from the store (5 tuned in → aria-disabled)', () => {
+    useVoiceStore.setState({
+      participants: {
+        u1: {
+          userId: 'u1',
+          username: 'alice',
+          isMuted: false,
+          isDeafened: false,
+          isVideoOn: false,
+          isScreenSharing: true,
+          isSpeaking: false,
+        },
+      },
+      activeScreenShares: {
+        'prod-9': { producerId: 'prod-9', userId: 'u1', username: 'alice', isLocal: false },
+      },
+      tunedInScreenShares: {
+        't-0': 'c-0',
+        't-1': 'c-1',
+        't-2': 'c-2',
+        't-3': 'c-3',
+        't-4': 'c-4',
+      },
+    });
+    render(<UserFrameBar height={120} />);
+    const btn = screen.getByRole('button', { name: "Tune in to alice's screen" });
+    expect(btn).toHaveAttribute('aria-disabled', 'true');
+  });
+
   it('renders a compact ParticipantTile for each participant', () => {
     useVoiceStore.setState({
       participants: {

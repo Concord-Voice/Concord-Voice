@@ -30,7 +30,7 @@ export const FREE_ENTITLEMENT: Entitlement = {
   cameraMaxBitrate: 2500000,
   maxManualBitrateBps: 5000000,
   maxWebcamPublishers: 8,
-  maxScreensharePublishers: 1,
+  maxScreensharePublishers: 8, // raised 1→8 for Discord parity — mirrors the Go free floor
   maxMessageChars: 5120,
   maxAttachmentBytes: 33554432, // 32 MiB — matches Go free floor (entitlements.go, post-#1522)
   maxAvatarBytes: 5242880,

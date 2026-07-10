@@ -6,7 +6,9 @@ import { useChannelStore } from '@/renderer/stores/channelStore';
 
 // ── Child component mocks ──────────────────────────────────────────────────────
 vi.mock('@/renderer/components/Voice/ParticipantGrid', () => ({
-  UserFrameGrid: () => <div data-testid="user-frame-grid" />,
+  UserFrameGrid: ({ includeStreamTiles }: { includeStreamTiles?: boolean }) => (
+    <div data-testid="user-frame-grid" data-include-streams={String(!!includeStreamTiles)} />
+  ),
   AudioOutputs: () => <div data-testid="audio-outputs" />,
 }));
 vi.mock('@/renderer/components/Voice/UserFrameBar', () => ({
@@ -17,9 +19,6 @@ vi.mock('@/renderer/components/Voice/VoiceStage', () => ({
 }));
 vi.mock('@/renderer/components/Voice/StreamBar', () => ({
   default: () => <div data-testid="stream-bar" />,
-}));
-vi.mock('@/renderer/components/Voice/ScreenShareControls', () => ({
-  default: () => <div data-testid="screen-share-controls" />,
 }));
 vi.mock('@/renderer/components/Voice/VoiceControls', () => ({
   default: () => <div data-testid="voice-controls" />,
@@ -50,6 +49,7 @@ function setConnectedState(overrides: Record<string, unknown> = {}) {
     effectiveQualityTier: 'standard',
     decoderHealth: 'green',
     tunedInScreenShares: {},
+    activeScreenShares: {},
     availableScreenShares: [],
     showVoiceTextChat: false,
     showUserFrameBar: true,
@@ -57,6 +57,7 @@ function setConnectedState(overrides: Record<string, unknown> = {}) {
     userFrameBarHeight: 120,
     streamBarHeight: 120,
     stageLayout: 'focus',
+    voiceViewMode: 'front-center',
     isScreenSharing: false,
     keepActiveWhileUnfocused: false,
     voiceTextChatLayout: 'horizontal',
@@ -82,12 +83,14 @@ describe('VoiceView', () => {
       effectiveQualityTier: 'standard',
       decoderHealth: 'green',
       tunedInScreenShares: {},
+      activeScreenShares: {},
       availableScreenShares: [],
       showUserFrameBar: true,
       showStreamBar: true,
       userFrameBarHeight: 120,
       streamBarHeight: 120,
       stageLayout: 'focus',
+      voiceViewMode: 'front-center',
       showVoiceTextChat: false,
       voiceTextChatLayout: 'horizontal',
       voiceTextChatHeight: 300,
@@ -258,19 +261,32 @@ describe('VoiceView', () => {
 
   // ── Layout modes ─────────────────────────────────────────────────────────────
 
-  it('renders Mode A (UserFrameGrid) when no screen shares are tuned in', () => {
+  it('renders Mode A (UserFrameGrid, no stream tiles) when no screen shares are tuned in', () => {
     setConnectedState({ tunedInScreenShares: {} });
     render(<VoiceView channelId={VOICE_CHANNEL_ID} channelName="General" />);
     expect(screen.getByTestId('user-frame-grid')).toBeInTheDocument();
+    expect(screen.getByTestId('user-frame-grid')).toHaveAttribute('data-include-streams', 'false');
   });
 
-  it('renders Mode B (VoiceStage) when screen shares are tuned in', () => {
+  it("renders Front 'n Center (VoiceStage) when screen shares are tuned in", () => {
     setConnectedState({
       tunedInScreenShares: { 'producer-1': 'consumer-1' },
+      voiceViewMode: 'front-center',
     });
     render(<VoiceView channelId={VOICE_CHANNEL_ID} channelName="General" />);
     expect(screen.getByTestId('voice-stage')).toBeInTheDocument();
     expect(screen.queryByTestId('user-frame-grid')).not.toBeInTheDocument();
+  });
+
+  it('renders Tile view (UserFrameGrid with stream tiles) when tuned in and voiceViewMode is tile', () => {
+    setConnectedState({
+      tunedInScreenShares: { 'producer-1': 'consumer-1' },
+      voiceViewMode: 'tile',
+    });
+    render(<VoiceView channelId={VOICE_CHANNEL_ID} channelName="General" />);
+    expect(screen.getByTestId('user-frame-grid')).toBeInTheDocument();
+    expect(screen.getByTestId('user-frame-grid')).toHaveAttribute('data-include-streams', 'true');
+    expect(screen.queryByTestId('voice-stage')).not.toBeInTheDocument();
   });
 
   it('shows UserFrameBar in Mode B when showUserFrameBar is true', () => {
@@ -291,10 +307,31 @@ describe('VoiceView', () => {
     expect(screen.queryByTestId('user-frame-bar')).not.toBeInTheDocument();
   });
 
-  it('mounts the ScreenShareControls dock unconditionally (#2088 — it self-nulls when empty)', () => {
-    setConnectedState();
+  it('renders the fallback share pill strip when the user-frame bar is collapsed', () => {
+    setConnectedState({
+      tunedInScreenShares: { 'producer-1': 'consumer-1' },
+      voiceViewMode: 'front-center',
+      showUserFrameBar: false,
+      activeScreenShares: {
+        'producer-2': { producerId: 'producer-2', userId: 'u2', username: 'alice', isLocal: false },
+      },
+    });
     render(<VoiceView channelId={VOICE_CHANNEL_ID} channelName="General" />);
-    expect(screen.getByTestId('screen-share-controls')).toBeInTheDocument();
+    // Per-share tune in/out stays reachable without the user-frame bar.
+    expect(screen.getByRole('button', { name: "Tune in to alice's screen" })).toBeInTheDocument();
+  });
+
+  it('moves focus to the voice area when a tune action swaps the layout branch', () => {
+    setConnectedState({
+      tunedInScreenShares: { 'producer-1': 'consumer-1' },
+      voiceViewMode: 'front-center',
+    });
+    const { container } = render(<VoiceView channelId={VOICE_CHANNEL_ID} channelName="General" />);
+    // Tuning out of the last stream swaps stage → grid; focus fell to <body>.
+    act(() => {
+      useVoiceStore.setState({ tunedInScreenShares: {} });
+    });
+    expect(document.activeElement).toBe(container.querySelector('.voice-view__voice-area'));
   });
 
   // ── Text chat ────────────────────────────────────────────────────────────────

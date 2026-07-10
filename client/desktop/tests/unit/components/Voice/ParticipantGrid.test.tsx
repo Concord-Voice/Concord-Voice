@@ -4,6 +4,7 @@ import { render, screen } from '../../../test-utils';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
+import { useSettingsStore } from '@/renderer/stores/settingsStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // ── Child component mocks ──────────────────────────────────────────────────────
@@ -715,6 +716,178 @@ describe('UserFrameGrid', () => {
     // Verify useGridLayout was called with aspectRatio: 16/9
     const lastCall = mockUseGridLayout.mock.calls[mockUseGridLayout.mock.calls.length - 1];
     expect(lastCall[2]).toEqual(expect.objectContaining({ aspectRatio: 16 / 9 }));
+  });
+
+  // ── Tile view: stream tiles + per-frame tune pills ──
+
+  describe('Tile view (includeStreamTiles) and tune pills', () => {
+    const makeP = (userId: string, username: string, overrides: Record<string, unknown> = {}) => ({
+      userId,
+      username,
+      isMuted: false,
+      isDeafened: false,
+      isVideoOn: false,
+      isScreenSharing: false,
+      isSpeaking: false,
+      ...overrides,
+    });
+
+    beforeEach(() => {
+      HTMLVideoElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+      useVoiceStore.setState({
+        participants: {
+          u1: makeP('u1', 'alice', {
+            isScreenSharing: true,
+            screenStream: { id: 'stream-1' } as unknown as MediaStream,
+          }),
+          u2: makeP('u2', 'bob'),
+        },
+        activeScreenShares: {
+          'prod-1': { producerId: 'prod-1', userId: 'u1', username: 'alice', isLocal: false },
+        },
+        tunedInScreenShares: { 'prod-1': 'cons-1' },
+        voiceViewMode: 'tile',
+        dominantScreenShareId: null,
+      });
+    });
+
+    it('renders a stream tile per tuned-in share when includeStreamTiles is set', () => {
+      const { container } = render(<UserFrameGrid includeStreamTiles />);
+      expect(screen.getByRole('button', { name: "Focus alice's screen" })).toBeInTheDocument();
+      expect(container.querySelector('.stream-grid-tile__video')).toBeInTheDocument();
+    });
+
+    it('ignores tuned-in shares without includeStreamTiles (Mode A unchanged)', () => {
+      const { container } = render(<UserFrameGrid />);
+      expect(container.querySelector('.stream-grid-tile')).not.toBeInTheDocument();
+    });
+
+    it('counts stream tiles into the grid layout and forces 16:9 without any webcam', () => {
+      render(<UserFrameGrid includeStreamTiles />);
+      const lastCall = mockUseGridLayout.mock.calls[mockUseGridLayout.mock.calls.length - 1];
+      // 2 participants + 1 stream tile
+      expect(lastCall[1]).toBe(3);
+      expect(lastCall[2]).toEqual(expect.objectContaining({ aspectRatio: 16 / 9 }));
+    });
+
+    it('renders a Tune Out pill below the producing frame and reserves pill space', () => {
+      const { container } = render(<UserFrameGrid includeStreamTiles />);
+      expect(
+        screen.getByRole('button', { name: "Tune out of alice's screen" })
+      ).toBeInTheDocument();
+      const grid = container.querySelector('.user-frame-grid') as HTMLElement;
+      expect(grid.style.getPropertyValue('--pill-space')).toBe('24px');
+      const lastCall = mockUseGridLayout.mock.calls[mockUseGridLayout.mock.calls.length - 1];
+      expect(lastCall[2]).toEqual(expect.objectContaining({ extraTileHeight: 24 }));
+    });
+
+    it('scales the reserved pill band with the accessibility font-size setting', () => {
+      // Effective --font-scale = discrete bucket × uiScale. Large = 1.175 and a
+      // 1.2x UI scale compound: ceil(24 × 1.175 × 1.2) = ceil(33.84) = 34px.
+      // Derived from store state, so no getComputedStyle read in the render path.
+      useSettingsStore.setState((s) => ({
+        appearance: { ...s.appearance, fontSize: 'large', uiScale: 1.2 },
+      }));
+      try {
+        const { container } = render(<UserFrameGrid includeStreamTiles />);
+        const grid = container.querySelector('.user-frame-grid') as HTMLElement;
+        expect(grid.style.getPropertyValue('--pill-space')).toBe('34px');
+        const lastCall = mockUseGridLayout.mock.calls[mockUseGridLayout.mock.calls.length - 1];
+        expect(lastCall[2]).toEqual(expect.objectContaining({ extraTileHeight: 34 }));
+      } finally {
+        // settingsStore is not covered by resetAllStores; restore defaults so
+        // later tests keep the 24px baseline.
+        useSettingsStore.setState((s) => ({
+          appearance: { ...s.appearance, fontSize: 'default', uiScale: 1 },
+        }));
+      }
+    });
+
+    it('renders a Tune In pill (untuned share) even without includeStreamTiles', () => {
+      useVoiceStore.setState({ tunedInScreenShares: {} });
+      render(<UserFrameGrid />);
+      expect(screen.getByRole('button', { name: "Tune in to alice's screen" })).toBeInTheDocument();
+    });
+
+    it('renders no pill and reserves no space for a local share', () => {
+      useVoiceStore.setState({
+        activeScreenShares: {
+          'prod-1': { producerId: 'prod-1', userId: 'u1', username: 'alice', isLocal: true },
+        },
+      });
+      const { container } = render(<UserFrameGrid includeStreamTiles />);
+      expect(screen.queryByRole('button', { name: /Tune (in to|out of)/ })).not.toBeInTheDocument();
+      const grid = container.querySelector('.user-frame-grid') as HTMLElement;
+      expect(grid.style.getPropertyValue('--pill-space')).toBe('0px');
+      const lastCall = mockUseGridLayout.mock.calls[mockUseGridLayout.mock.calls.length - 1];
+      expect(lastCall[2]).toEqual(expect.objectContaining({ extraTileHeight: 0 }));
+    });
+
+    it("clicking a stream tile focuses it front 'n center (forcing the focus stage layout)", () => {
+      // A persisted 'equal' stage layout would silently ignore the dominant id.
+      useVoiceStore.setState({ stageLayout: 'equal' });
+      render(<UserFrameGrid includeStreamTiles />);
+      act(() => {
+        screen.getByRole('button', { name: "Focus alice's screen" }).click();
+      });
+      expect(useVoiceStore.getState().dominantScreenShareId).toBe('prod-1');
+      expect(useVoiceStore.getState().voiceViewMode).toBe('front-center');
+      expect(useVoiceStore.getState().stageLayout).toBe('focus');
+    });
+
+    it('shows the paused placeholder (not the video) in Tile view when Auto-Pause fires', () => {
+      // Parity with the stage/stream-bar paths: a paused local capture must not
+      // stay attached and rendering while the window is unfocused — and the tile
+      // shows the "still streaming" placeholder instead of a blank video element.
+      useVoiceStore.setState({
+        activeScreenShares: {
+          'prod-1': { producerId: 'prod-1', userId: 'u1', username: 'alice', isLocal: true },
+        },
+        localStreamPaused: true,
+      });
+      const { container } = render(<UserFrameGrid includeStreamTiles />);
+      expect(container.querySelector('.stream-grid-tile__video')).toBeNull();
+      expect(screen.getByText('Your Screen Is Still Streaming')).toBeInTheDocument();
+    });
+
+    it('keeps the local preview stream attached in Tile view when not paused', () => {
+      useVoiceStore.setState({
+        activeScreenShares: {
+          'prod-1': { producerId: 'prod-1', userId: 'u1', username: 'alice', isLocal: true },
+        },
+        localStreamPaused: false,
+      });
+      const { container } = render(<UserFrameGrid includeStreamTiles />);
+      const video = container.querySelector('.stream-grid-tile__video') as HTMLVideoElement;
+      expect(video.srcObject).toEqual({ id: 'stream-1' });
+    });
+
+    it("renders an 'Unknown' stream tile with no stream when share metadata is gone (producer-close race)", () => {
+      useVoiceStore.setState({
+        activeScreenShares: {},
+        tunedInScreenShares: { 'prod-1': 'cons-1' },
+      });
+      const { container } = render(<UserFrameGrid includeStreamTiles />);
+      expect(screen.getByRole('button', { name: "Focus Unknown's screen" })).toBeInTheDocument();
+      const video = container.querySelector('.stream-grid-tile__video') as HTMLVideoElement;
+      expect(video.srcObject).toBeNull();
+    });
+
+    it('drives the pill at-cap block from the store (5 tuned in → aria-disabled)', () => {
+      useVoiceStore.setState({
+        tunedInScreenShares: {
+          't-0': 'c-0',
+          't-1': 'c-1',
+          't-2': 'c-2',
+          't-3': 'c-3',
+          't-4': 'c-4',
+        },
+      });
+      render(<UserFrameGrid />);
+      // alice's announced share (prod-1) is untuned while the cap is full.
+      const btn = screen.getByRole('button', { name: "Tune in to alice's screen" });
+      expect(btn).toHaveAttribute('aria-disabled', 'true');
+    });
   });
 
   // ── Active-speaker dominance derivation (#1040) ──

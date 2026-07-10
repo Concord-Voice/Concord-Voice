@@ -50,6 +50,17 @@
   background-color: rgba(255, 255, 255, 0.25);
 }
 
+/* Item wrapper: frame + optional Tune In/Out pill below it */
+.user-frame-bar__item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  height: 100%;
+  flex-shrink: 0;
+}
+
 /* Compact tiles in the bar */
 .user-frame-bar .participant-tile {
   width: 80px;
@@ -59,4 +70,18 @@
 .user-frame-bar .participant-tile--video {
   width: auto;
   height: calc(100% - 8px);
+}
+
+/* When a pill renders below a tile, shrink the tile so the pair still fits
+   the fixed bar height — for BOTH shapes. The avatar tile derives its width
+   from the reduced height via its 1:1 aspect-ratio (capped at the normal
+   80px), so the pill stays visible even at the minimum bar height. */
+.user-frame-bar__item--pill .participant-tile--video {
+  height: calc(100% - 26px);
+}
+
+.user-frame-bar__item--pill .participant-tile:not(.participant-tile--video) {
+  width: auto;
+  height: calc(100% - 26px);
+  max-height: 80px;
 }

@@ -88,6 +88,25 @@
   position: relative; /* anchor the encryption-ring overlay (#1040) */
 }
 
+/* Programmatic focus target after a layout-branch swap destroys the focused
+   control (tabIndex=-1) — a region, not an interactive element, so no ring. */
+.voice-view__voice-area:focus {
+  outline: none;
+}
+
+/* Fallback per-share tune-pill strip (Front 'n Center with the user-frame
+   bar collapsed — the pills' normal home is hidden) */
+.voice-view__share-pill-strip {
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: center;
+  padding: 4px 8px;
+  background-color: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+
 /* Encryption-as-ring (#1040): a subtle inset accent ring frames the connected
    voice stage. Unconditional — post-#201 every voice channel is E2EE, so there
    is no encryption-status branch. The voice-area only mounts once connected, so

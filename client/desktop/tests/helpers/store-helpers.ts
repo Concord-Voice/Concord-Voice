@@ -46,7 +46,13 @@ export function resetAllStores(): void {
   useSavedGifsStore.setState({ gifs: [] });
   useChannelScrollStore.setState({ positions: {}, latestMessageIds: {} });
   useVoiceStore.getState().reset();
-  useVoiceStore.setState({ channelVoiceMembers: {}, serverVoiceCounts: {} });
+  // reset() intentionally preserves layout prefs (incl. voiceViewMode) — pin
+  // the view-mode default here so tests never order-depend on a prior toggle.
+  useVoiceStore.setState({
+    channelVoiceMembers: {},
+    serverVoiceCounts: {},
+    voiceViewMode: 'front-center',
+  });
   useUpdateStatusStore.getState().reset();
   useSSOStore.getState().reset();
   useE2EEStore.getState().reset();

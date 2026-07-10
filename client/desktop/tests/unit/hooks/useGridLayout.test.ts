@@ -244,6 +244,49 @@ describe('computeGridLayout', () => {
     expect(result.tileWidth).toBeLessThanOrEqual(320);
     expect(result.tileHeight).toBeLessThanOrEqual(320);
   });
+
+  it('reserves extraTileHeight below each slot (tiles shrink to keep fitting)', () => {
+    const base = computeGridLayout(800, 600, 4, { aspectRatio: 16 / 9 });
+    const withExtra = computeGridLayout(800, 600, 4, {
+      aspectRatio: 16 / 9,
+      extraTileHeight: 24,
+    });
+    const rows = Math.ceil(4 / withExtra.columns);
+    // rows * (tileH + extra) must still fit the available height
+    expect((withExtra.tileHeight + 24) * rows).toBeLessThanOrEqual(600 + 1e-6);
+    expect(withExtra.tileHeight).toBeLessThanOrEqual(base.tileHeight);
+  });
+
+  it('extraTileHeight defaults to 0 and leaves the layout unchanged', () => {
+    const a = computeGridLayout(800, 600, 4, { aspectRatio: 16 / 9 });
+    const b = computeGridLayout(800, 600, 4, { aspectRatio: 16 / 9, extraTileHeight: 0 });
+    expect(b).toEqual(a);
+  });
+
+  it('fallback layout height-constrains tiles when the pill band makes the stack overflow', () => {
+    // 150px wide forces the sub-minTileWidth fallback path (single column).
+    const result = computeGridLayout(150, 200, 4, {
+      aspectRatio: 16 / 9,
+      gap: 4,
+      padding: 0,
+      extraTileHeight: 24,
+    });
+    expect(result.columns).toBe(1);
+    const availH = 200 - 3 * 4; // 3 gaps between 4 rows
+    expect((result.tileHeight + 24) * 4).toBeLessThanOrEqual(availH + 1e-6);
+    expect(result.tileHeight).toBeGreaterThan(0);
+  });
+
+  it('fallback clamps tile height at 0 when the pill band exceeds the row budget (no negatives)', () => {
+    const result = computeGridLayout(150, 50, 4, {
+      aspectRatio: 16 / 9,
+      gap: 4,
+      padding: 0,
+      extraTileHeight: 24,
+    });
+    expect(result.tileHeight).toBeGreaterThanOrEqual(0);
+    expect(result.tileWidth).toBeGreaterThanOrEqual(0);
+  });
 });
 
 // ── useGridLayout (hook) ───────────────────────────────────────────────────────

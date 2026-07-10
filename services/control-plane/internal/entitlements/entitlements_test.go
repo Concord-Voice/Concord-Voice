@@ -25,7 +25,7 @@ func TestFor_Free(t *testing.T) {
 	assert.Equal(t, 2_500_000, e.CameraMaxBitrate)
 	assert.Equal(t, 5_000_000, e.MaxManualBitrateBps) // = max(stream, camera) bitrate
 	assert.Equal(t, 8, e.MaxWebcamPublishers)
-	assert.Equal(t, 1, e.MaxScreensharePublishers)
+	assert.Equal(t, 8, e.MaxScreensharePublishers)
 	assert.Equal(t, 5120, e.MaxMessageChars)
 	assert.Equal(t, int64(33_554_432), e.MaxAttachmentBytes)
 	assert.Equal(t, int64(5_242_880), e.MaxAvatarBytes)
@@ -51,7 +51,7 @@ func TestFor_Premium(t *testing.T) {
 	assert.Equal(t, 6_000_000, e.CameraMaxBitrate)
 	assert.Equal(t, 20_000_000, e.MaxManualBitrateBps) // = max(stream, camera) bitrate
 	assert.Equal(t, 25, e.MaxWebcamPublishers)
-	assert.Equal(t, 3, e.MaxScreensharePublishers)
+	assert.Equal(t, 16, e.MaxScreensharePublishers)
 	assert.Equal(t, 10240, e.MaxMessageChars)
 	assert.Equal(t, int64(268_435_456), e.MaxAttachmentBytes)
 	assert.Equal(t, int64(8_388_608), e.MaxAvatarBytes)

@@ -12,6 +12,8 @@ const mockToggleDeafen = vi.fn();
 const mockToggleVideo = vi.fn().mockResolvedValue(undefined);
 const mockToggleScreenShare = vi.fn().mockResolvedValue(undefined);
 const mockLeaveChannel = vi.fn().mockResolvedValue(undefined);
+const mockTuneInAll = vi.fn().mockResolvedValue(undefined);
+const mockTuneOutAll = vi.fn().mockResolvedValue(undefined);
 
 vi.mock('@/renderer/services/voiceService', () => ({
   voiceService: {
@@ -20,6 +22,8 @@ vi.mock('@/renderer/services/voiceService', () => ({
     toggleVideo: mockToggleVideo,
     toggleScreenShare: mockToggleScreenShare,
     leaveChannel: mockLeaveChannel,
+    tuneInAllScreenShares: (...args: unknown[]) => mockTuneInAll(...args),
+    tuneOutAllScreenShares: (...args: unknown[]) => mockTuneOutAll(...args),
   },
 }));
 
@@ -65,6 +69,8 @@ function setVoiceState(overrides: Record<string, unknown> = {}) {
     participants: {},
     videoSlotError: null,
     tunedInScreenShares: {},
+    activeScreenShares: {},
+    voiceViewMode: 'front-center',
     keepActiveWhileUnfocused: false,
     voiceControlsPinned: false,
     ...overrides,
@@ -819,5 +825,143 @@ describe('VoiceControls', () => {
     });
     expect(mockToggleScreenShare).not.toHaveBeenCalled();
     expect(mockOpenSettings).toHaveBeenCalledWith('screen');
+  });
+
+  // ── Tune Everywhere (global stream toggle, ex Tune In All / Tune Out All) ──
+
+  const remoteShare = (n: number) => ({
+    producerId: `prod-${n}`,
+    userId: `user-${n}`,
+    username: `user${n}`,
+    displayName: `User ${n}`,
+    isLocal: false,
+  });
+
+  describe('Tune Everywhere', () => {
+    it('is hidden when no remote screen shares are announced', () => {
+      setVoiceState({ activeScreenShares: {} });
+      render(<VoiceControls />);
+      expect(screen.queryByText('Tune In Everywhere')).not.toBeInTheDocument();
+      expect(screen.queryByText('Tune Out Everywhere')).not.toBeInTheDocument();
+    });
+
+    it('is hidden when only the local share is active', () => {
+      setVoiceState({
+        activeScreenShares: { 'prod-local': { ...remoteShare(0), isLocal: true } },
+      });
+      render(<VoiceControls />);
+      expect(screen.queryByText('Tune In Everywhere')).not.toBeInTheDocument();
+    });
+
+    it('shows Tune In Everywhere and dispatches tuneInAllScreenShares while untuned shares exist', async () => {
+      setVoiceState({
+        activeScreenShares: { 'prod-1': remoteShare(1), 'prod-2': remoteShare(2) },
+        tunedInScreenShares: { 'prod-1': 'cons-1' },
+      });
+      render(<VoiceControls />);
+      await act(async () => {
+        fireEvent.click(screen.getByText('Tune In Everywhere'));
+      });
+      expect(mockTuneInAll).toHaveBeenCalled();
+      expect(mockTuneOutAll).not.toHaveBeenCalled();
+    });
+
+    it('shows Tune Out Everywhere and dispatches tuneOutAllScreenShares once all are tuned in', async () => {
+      setVoiceState({
+        activeScreenShares: { 'prod-1': remoteShare(1) },
+        tunedInScreenShares: { 'prod-1': 'cons-1' },
+      });
+      render(<VoiceControls />);
+      await act(async () => {
+        fireEvent.click(screen.getByText('Tune Out Everywhere'));
+      });
+      expect(mockTuneOutAll).toHaveBeenCalled();
+      expect(mockTuneInAll).not.toHaveBeenCalled();
+    });
+
+    it('offers ENABLED Tune Out Everywhere at the cap while untuned shares remain (never a dead control)', async () => {
+      setVoiceState({
+        activeScreenShares: {
+          'prod-1': remoteShare(1),
+          'prod-2': remoteShare(2),
+          'prod-3': remoteShare(3),
+          'prod-4': remoteShare(4),
+          'prod-5': remoteShare(5),
+          'prod-6': remoteShare(6),
+        },
+        tunedInScreenShares: {
+          'prod-1': 'cons-1',
+          'prod-2': 'cons-2',
+          'prod-3': 'cons-3',
+          'prod-4': 'cons-4',
+          'prod-5': 'cons-5',
+        },
+      });
+      render(<VoiceControls />);
+      // Tune-in is illegal at the cap, so the still-legal mass tune-out is
+      // offered instead (the retired dock kept Tune Out All reachable here).
+      const btn = screen.getByTitle('Maximum 5 screen shares — tune out of every stream');
+      expect(btn).toBeEnabled();
+      expect(btn).toHaveTextContent('Tune Out Everywhere');
+      await act(async () => {
+        fireEvent.click(btn);
+      });
+      expect(mockTuneOutAll).toHaveBeenCalled();
+      expect(mockTuneInAll).not.toHaveBeenCalled();
+    });
+
+    it('logs a scrubbed message and does not throw when tune-in-all rejects', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      mockTuneInAll.mockRejectedValueOnce(new Error('boom'));
+      setVoiceState({
+        activeScreenShares: { 'prod-1': remoteShare(1) },
+        tunedInScreenShares: {},
+      });
+      render(<VoiceControls />);
+      await act(async () => {
+        fireEvent.click(screen.getByText('Tune In Everywhere'));
+      });
+      expect(errSpy).toHaveBeenCalledWith('Tune Everywhere failed:', expect.any(String));
+      errSpy.mockRestore();
+    });
+
+    it('does not render in the persistent context', () => {
+      setVoiceState({
+        activeScreenShares: { 'prod-1': remoteShare(1) },
+      });
+      render(<VoiceControls context="persistent" />);
+      expect(screen.queryByText('Tune In Everywhere')).not.toBeInTheDocument();
+    });
+  });
+
+  // ── Tile / Front 'n Center view toggle ────────────────────────────────────
+
+  describe('voice view mode toggle', () => {
+    it('is hidden when no streams are tuned in', () => {
+      setVoiceState({ tunedInScreenShares: {} });
+      render(<VoiceControls />);
+      expect(screen.queryByText('Tile View')).not.toBeInTheDocument();
+      expect(screen.queryByText("Front 'n Center")).not.toBeInTheDocument();
+    });
+
+    it("offers Tile View while in front 'n center and toggles the store on click", () => {
+      setVoiceState({
+        tunedInScreenShares: { 'prod-1': 'cons-1' },
+        voiceViewMode: 'front-center',
+      });
+      render(<VoiceControls />);
+      fireEvent.click(screen.getByText('Tile View'));
+      expect(useVoiceStore.getState().voiceViewMode).toBe('tile');
+    });
+
+    it("offers Front 'n Center while in tile view and toggles back", () => {
+      setVoiceState({
+        tunedInScreenShares: { 'prod-1': 'cons-1' },
+        voiceViewMode: 'tile',
+      });
+      render(<VoiceControls />);
+      fireEvent.click(screen.getByText("Front 'n Center"));
+      expect(useVoiceStore.getState().voiceViewMode).toBe('front-center');
+    });
   });
 });

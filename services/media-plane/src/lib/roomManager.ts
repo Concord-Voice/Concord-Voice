@@ -316,15 +316,18 @@ export interface ProducerInfo {
 export const ABSOLUTE_VIDEO_PUBLISHER_CEILING = 25;
 
 /** Absolute per-room screenshare-producer ceiling — hard upper bound, not tier-tunable. */
-export const ABSOLUTE_SCREEN_PRODUCER_CEILING = 3;
+export const ABSOLUTE_SCREEN_PRODUCER_CEILING = 16;
 
 /**
  * Premium per-room caps (#1542) — mirror the Go entitlements source of truth
- * (`entitlements.go` MaxWebcamPublishers 25 / MaxScreensharePublishers 3).
+ * (`entitlements.go` MaxWebcamPublishers 25 / MaxScreensharePublishers 16).
  * Free values come from config (`freeVideoPublisherCap` / `freeScreenProducerCap`).
+ * Screenshare raised free 1→8 / premium 3→16 for competitive parity: Discord
+ * caps stream QUALITY, not concurrency (every voice-channel participant can
+ * Go Live simultaneously), so a 1-stream free room was a visible product gap.
  */
 export const PREMIUM_VIDEO_PUBLISHER_CAP = 25;
-export const PREMIUM_SCREEN_PRODUCER_CAP = 3;
+export const PREMIUM_SCREEN_PRODUCER_CAP = 16;
 
 /**
  * Resolve a room's cap tier (#1542). Channels follow the server OWNER's tier
@@ -436,8 +439,8 @@ export function resolveVideoPublisherCap(
 }
 
 /**
- * Resolve the per-room concurrent screenshare-producer cap (#1542): free 1
- * (config `freeScreenProducerCap`) / premium 3 (PREMIUM_SCREEN_PRODUCER_CAP).
+ * Resolve the per-room concurrent screenshare-producer cap (#1542): free 8
+ * (config `freeScreenProducerCap`) / premium 16 (PREMIUM_SCREEN_PRODUCER_CAP).
  * Same clamp-both-ends discipline and same produce-time/grandfather semantics
  * as resolveVideoPublisherCap above.
  */

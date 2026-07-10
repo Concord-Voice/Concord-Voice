@@ -1433,7 +1433,7 @@ class VoiceService {
     // close-producer self-echo (producer-closed via the media-plane room
     // bridge reaches the sender too) can land mid-swap and prune these
     // entries, which would otherwise drop the local share's tuned-in state
-    // and dock row on codec swaps (#2088).
+    // and its ShareTunePill/StreamBar row on codec swaps (#2088).
     const storePre = useVoiceStore.getState();
     const wasTunedIn = Boolean(storePre.tunedInScreenShares[oldProducerId]);
     const wasDominant = storePre.dominantScreenShareId === oldProducerId;
@@ -1483,7 +1483,7 @@ class VoiceService {
     }
     // Carry the owner metadata to the new producerId (#2088) — re-register
     // unconditionally from the snapshot/local identity so an echo-pruned
-    // entry cannot leave the live share without a dock row.
+    // entry cannot leave the live share without its ShareTunePill/StreamBar row.
     store.unregisterActiveScreenShare(oldProducerId);
     const localUserId = useUserStore.getState().user?.id;
     const shareOwnerId = oldShareMeta?.userId ?? localUserId;
@@ -3348,7 +3348,8 @@ class VoiceService {
     // reset out from under us (see the stale-context guard before store.tuneIn).
     const startChannelId = store.activeChannelId;
 
-    // Idempotency + in-flight guard (#2088): the dock, Tune In All, and the
+    // Idempotency + in-flight guard (#2088): the ShareTunePill, the Tune In
+    // Everywhere control, and the
     // auto-tune engine can race on the same producer; a second consume would
     // orphan a duplicate SFU consumer that keeps forwarding RTP.
     if (producerId in store.tunedInScreenShares || this.tuneInsInFlight.has(producerId)) {
@@ -3501,7 +3502,7 @@ class VoiceService {
       // Isolate per-share failures (#2088): a rejected E2EE key fetch or consume
       // for one share must neither abort the remaining shares nor escape the
       // fire-and-forget `void autoTuneSweep()` call sites as an unhandled
-      // rejection. Mirrors the try/catch on the manual dock/global handlers.
+      // rejection. Mirrors the try/catch on the manual pill/Tune-Everywhere handlers.
       try {
         await this.tuneInToScreenShare(share.producerId, share.userId);
       } catch (err) {
