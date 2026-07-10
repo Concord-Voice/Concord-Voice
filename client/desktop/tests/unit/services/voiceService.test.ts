@@ -2006,6 +2006,83 @@ describe('VoiceService', () => {
     });
   });
 
+  // ===== Screen-audio scope (#2161) =====
+  // System loopback audio (chromeMediaSource: 'desktop') captures the WHOLE
+  // desktop and ignores chromeMediaSourceId, so it must only be requested for
+  // entire-screen ('screen:') shares. A window/app ('window:') share that asks
+  // for it broadcasts all system audio to the channel — the privacy leak in #2161.
+
+  describe('screen-audio scope (#2161)', () => {
+    type CaptureFn = (
+      id: string | undefined,
+      res: { w: number; h: number },
+      fps: number
+    ) => Promise<unknown>;
+
+    function captureElectron(id: string | undefined): Promise<unknown> {
+      const svc = voiceService as unknown as { captureScreenElectron: CaptureFn };
+      return svc.captureScreenElectron(id, { w: 1280, h: 720 }, 30);
+    }
+
+    let origElectron: typeof globalThis.electron;
+    beforeEach(() => {
+      origElectron = globalThis.electron;
+      (globalThis as any).electron = { getDesktopSources: vi.fn() };
+    });
+    afterEach(() => {
+      globalThis.electron = origElectron;
+    });
+
+    it('window: source captures video-only — no system-audio leak', async () => {
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'video' }]));
+      await captureElectron('window:42:0');
+
+      expect(mockGetUserMedia).toHaveBeenCalledTimes(1);
+      const constraints = mockGetUserMedia.mock.calls[0][0] as { audio: unknown; video: unknown };
+      expect(constraints.audio).toBe(false);
+      expect(constraints.video).toBeTruthy();
+    });
+
+    it('screen: source attempts system audio', async () => {
+      mockGetUserMedia.mockResolvedValue(
+        createMockMediaStream([{ kind: 'video' }, { kind: 'audio' }])
+      );
+      await captureElectron('screen:0:0');
+
+      const constraints = mockGetUserMedia.mock.calls[0][0] as { audio: unknown; video: unknown };
+      expect(constraints.audio).not.toBe(false);
+      expect(constraints.audio).toBeTruthy();
+    });
+
+    // No sourceId → auto-select branch: a screen: source is preferred and gets
+    // audio; a window-only source list falls back to sources[0] (a window:) and
+    // must stay video-only (no leak via the fallback path).
+    it('auto-selects a screen: source and attempts audio when no sourceId is given', async () => {
+      (globalThis as any).electron.getDesktopSources.mockResolvedValue([
+        { id: 'window:9:0', name: 'W', thumbnailDataURL: '' },
+        { id: 'screen:0:0', name: 'S', thumbnailDataURL: '' },
+      ]);
+      mockGetUserMedia.mockResolvedValue(
+        createMockMediaStream([{ kind: 'video' }, { kind: 'audio' }])
+      );
+      await captureElectron(undefined);
+
+      const constraints = mockGetUserMedia.mock.calls[0][0] as { audio: unknown };
+      expect(constraints.audio).not.toBe(false);
+    });
+
+    it('auto-selects video-only when only window sources exist (no fallback leak)', async () => {
+      (globalThis as any).electron.getDesktopSources.mockResolvedValue([
+        { id: 'window:9:0', name: 'W', thumbnailDataURL: '' },
+      ]);
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'video' }]));
+      await captureElectron(undefined);
+
+      const constraints = mockGetUserMedia.mock.calls[0][0] as { audio: unknown };
+      expect(constraints.audio).toBe(false);
+    });
+  });
+
   // ===== OS permission =====
 
   describe('OS permission', () => {

@@ -2743,6 +2743,11 @@ class VoiceService {
       return this.captureScreenElectron(sourceId, screenRes, screenFps);
     }
     console.debug('produceScreen: using getDisplayMedia fallback');
+    // Non-Electron path only (dev/web) — packaged builds always take the
+    // getDesktopSources branch above. getDisplayMedia is the W3C OS-mediated
+    // picker, so `audio: true` captures only the user-selected surface's audio
+    // with explicit consent — NOT chromeMediaSource:'desktop' whole-desktop
+    // loopback, so this is not the #2161 leak path.
     return navigator.mediaDevices.getDisplayMedia({
       video: {
         width: { ideal: screenRes.w },
@@ -2779,6 +2784,15 @@ class VoiceService {
         maxFrameRate: screenFps,
       },
     } as unknown as MediaTrackConstraints;
+
+    // System loopback audio (chromeMediaSource: 'desktop') captures the ENTIRE
+    // desktop and ignores chromeMediaSourceId — Electron has no per-window
+    // loopback. Request it only for entire-screen ('screen:') shares; a
+    // window/app ('window:') share must be video-only or it leaks all system
+    // audio to the channel (#2161).
+    if (!chosenId.startsWith('screen:')) {
+      return navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
+    }
 
     try {
       return await navigator.mediaDevices.getUserMedia({
