@@ -192,6 +192,14 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	go hub.Run()
 	auditWriter := rbac.NewAuditWriter(db, log)
 	rbacHandler := rbac.NewHandler(db, log, redis, hub, rbacResolver, permCache, auditWriter)
+	// Mid-session voice permission push (CV-CAN-007 review P1): permission
+	// mutations re-resolve and publish voice.enforce.permissions for
+	// voice-connected members. One shared enforcer instance backs the RBAC
+	// handler, the ownership handler, and the voice.joined bridge — its
+	// internal publish serialization only holds within one instance. Safe with
+	// a nil natsClient (the enforcer no-ops without NATS).
+	voicePermEnforcer := voice.NewPermissionEnforcer(db, log, rbacResolver, natsClient)
+	rbacHandler.SetVoiceEnforcer(voicePermEnforcer)
 
 	// Initialize email service
 	emailSvc := email.NewService(cfg, log)
@@ -210,6 +218,9 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	serversHandler := servers.NewHandler(db, log, hub, rbacResolver, entCache, serverEntCache)
 	channelsHandler := channels.NewHandler(db, log, hub, rbacResolver, redis, serverEntCache)
 	membersHandler := members.NewHandler(db, log, redis, hub, rbacResolver, auditWriter)
+	// A kick/leave/ban deletes membership but leaves any voice participant on its
+	// join-time snapshot — recheck evicts them from the room (CV-CAN-007 P1).
+	membersHandler.SetVoiceEnforcer(voicePermEnforcer)
 	messagesHandler := messages.NewHandler(db, log, hub, rbacResolver, entCache)
 	invitesHandler := invites.NewHandler(db, log, hub, rbacResolver)
 	voiceHandler := voice.NewHandler(voice.HandlerDeps{
@@ -241,6 +252,9 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 		EmailSvc:    emailSvc,
 		MFAVerifier: mfaHandler,
 	})
+	// Ownership changes are the largest single permission delta (owner
+	// short-circuit) — they must push voice rechecks too (CV-CAN-007 P1).
+	ownershipHandler.SetVoiceEnforcer(voicePermEnforcer)
 	var mediaHandler *media.Handler
 	if store != nil {
 		mediaHandler = media.NewHandler(db, store, log, cfg, rbacResolver, entCache, serverEntCache)
@@ -289,6 +303,9 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	// Start NATS voice event subscriber
 	if natsClient != nil {
 		voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, rbacResolver)
+		// Close the join-vs-mutation race: re-push fresh permissions when a
+		// voice.joined lands (CV-CAN-007 P1).
+		voiceSub.SetPermissionEnforcer(voicePermEnforcer)
 		if subErr := voiceSub.Subscribe(); subErr != nil {
 			log.Error("Failed to subscribe to voice NATS events", "error", subErr)
 		}

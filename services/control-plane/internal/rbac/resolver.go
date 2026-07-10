@@ -86,6 +86,23 @@ func (r *Resolver) GetEffectivePermissions(ctx context.Context, serverID, userID
 	return effectivePerm, nil
 }
 
+// ResolveEffectivePermissionsFresh recomputes effective permissions directly
+// from the database, bypassing the cache READ (it still refreshes the cache
+// with the fresh value). Used by the voice PermissionEnforcer (CV-CAN-007 P1):
+// an enforcement push must reflect committed DB state, never a cache entry
+// that a concurrently in-flight pre-mutation compute may have repopulated
+// after the mutation's invalidation.
+func (r *Resolver) ResolveEffectivePermissionsFresh(ctx context.Context, serverID, userID, channelID string) (Permission, error) {
+	perms, err := r.computeEffectivePermissions(ctx, serverID, userID, channelID)
+	if err != nil {
+		return 0, err
+	}
+	if r.cache != nil {
+		_ = r.cache.Set(ctx, serverID, userID, channelID, perms)
+	}
+	return perms, nil
+}
+
 // computeEffectivePermissions implements the two-layer permission resolution model:
 // 1. RBAC: OR together permissions from all user's roles
 // 2. SBAC: Apply channel-specific overrides (deny > allow)

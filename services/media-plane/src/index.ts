@@ -22,6 +22,7 @@ import { RedisService } from './lib/redis.js';
 import { createExpressErrorHandler } from './lib/expressErrorHandler.js';
 import { createOriginGate } from './lib/originGate.js';
 import { handleForceDisconnect } from './lib/forceDisconnect.js';
+import { handleEnforcePermissionsMessage } from './lib/enforcePermissions.js';
 import { handleSetDeafen } from './lib/setDeafen.js';
 import { handleSetTestingStatus } from './lib/setTestingStatus.js';
 
@@ -271,6 +272,21 @@ async function main() {
     }
   });
 
+  // ── Mid-session permission push (CV-CAN-007 review P1) ────────────────
+  // Control plane publishes voice.enforce.permissions {channelId, userId,
+  // permissions} after an RBAC mutation touching a voice-connected member. The
+  // bitfield rides the same decimal-string wire format as join-authorize and
+  // goes through the same strict fail-closed parser; a malformed payload is
+  // ignored (the join-time snapshot stays — enforcement never fails open, and
+  // a bad message never strips a legitimate peer).
+  natsService.subscribe('voice.enforce.permissions', async (natsData) => {
+    try {
+      await handleEnforcePermissionsMessage(roomManager, io, natsData);
+    } catch (err) {
+      logger.error('Failed to handle voice.enforce.permissions', { error: err });
+    }
+  });
+
   // ─── Socket.IO connection handling ───────────────────────────────────
 
   io.on('connection', (socket) => {
@@ -358,6 +374,9 @@ async function main() {
               // resolution strategy; ownerTier is the server-authoritative
               // room_owner_tier from the channel join-authorize (undefined for DMs).
               roomContext: { roomKind, ownerTier: access.roomOwnerTier },
+              // CV-CAN-007: the joining user's effective publish-permission bitfield
+              // (bigint for channel joins, undefined for DMs) — enforced at produce.
+              permissions: access.permissions,
             }
           );
 

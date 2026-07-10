@@ -319,7 +319,7 @@ function setupAuth() {
   });
 }
 
-function makeJoinResponse(co?: Record<string, unknown>) {
+function makeJoinResponse(co?: Record<string, unknown>, top?: Record<string, unknown>) {
   return {
     allowed: true,
     media_server_url: 'http://localhost:3000',
@@ -331,6 +331,8 @@ function makeJoinResponse(co?: Record<string, unknown>) {
       audio_quality_tier: null,
       ...(co || {}),
     },
+    // Top-level JoinResponse fields (e.g. `permissions` from AuthorizeJoin).
+    ...(top || {}),
   };
 }
 
@@ -445,11 +447,11 @@ function makeRecvTransport(id = 'recv-1') {
   return { id, closed: false, close: vi.fn(), consume: vi.fn(), on: vi.fn() };
 }
 
-async function joinVoiceChannel(co?: Record<string, unknown>) {
+async function joinVoiceChannel(co?: Record<string, unknown>, top?: Record<string, unknown>) {
   setupAuth();
   mockApiFetch.mockResolvedValueOnce({
     ok: true,
-    json: vi.fn().mockResolvedValue(makeJoinResponse(co)),
+    json: vi.fn().mockResolvedValue(makeJoinResponse(co, top)),
   });
   mockSocket.connected = true;
 
@@ -588,6 +590,49 @@ describe('VoiceService Extended', () => {
       svc.inputVolumeUnsub = null;
       svc.stopInputVolume();
       expect(svc.inputVolumeCtx).toBeNull();
+    });
+  });
+
+  // ===== listen-only join (CV-CAN-007 P1) =====
+
+  describe('listen-only join (Speak absent)', () => {
+    const VIEW_VOICE = 1n << 9n;
+    const JOIN_VOICE = 1n << 16n;
+    const SPEAK = 1n << 17n;
+
+    it('skips mic auto-produce and joins muted when the join grants no Speak', async () => {
+      // ViewVoiceChannels | JoinVoice but NOT Speak: AuthorizeJoin admits the
+      // member, but the mic publish would be rejected by the produce() gate.
+      const listenOnly = (VIEW_VOICE | JOIN_VOICE).toString();
+      const { sendTransport } = await joinVoiceChannel(undefined, { permissions: listenOnly });
+
+      expect(sendTransport.produce).not.toHaveBeenCalled();
+      const svc = voiceService as any;
+      expect(svc.producers.has('mic')).toBe(false);
+      expect(useVoiceStore.getState().isMuted).toBe(true);
+    });
+
+    it('does not attempt mic capture for a listen-only join (no permission prompt)', async () => {
+      // Regression: the pre-acquire getUserMedia is skipped entirely when the
+      // join grants no Speak, so a listen-only member is never blocked behind
+      // an unnecessary mic permission prompt or slow device acquisition for a
+      // capability they cannot use (the produce() gate would reject it anyway).
+      const listenOnly = (VIEW_VOICE | JOIN_VOICE).toString();
+      await joinVoiceChannel(undefined, { permissions: listenOnly });
+
+      expect(mockEnsureOsPermission).not.toHaveBeenCalledWith('microphone');
+      expect(mockGetUserMedia).not.toHaveBeenCalled();
+    });
+
+    it('auto-produces mic when the join grants Speak', async () => {
+      const withSpeak = (VIEW_VOICE | JOIN_VOICE | SPEAK).toString();
+      const { sendTransport } = await joinVoiceChannel(undefined, { permissions: withSpeak });
+
+      expect(sendTransport.produce).toHaveBeenCalled();
+      // The Speak path pre-acquires the mic stream (getUserMedia) as before.
+      expect(mockGetUserMedia).toHaveBeenCalled();
+      const svc = voiceService as any;
+      expect(svc.producers.has('mic')).toBe(true);
     });
   });
 
@@ -1243,6 +1288,77 @@ describe('VoiceService Extended', () => {
     });
   });
 
+  describe('socket listener: permissions-changed (CV-CAN-007 P1)', () => {
+    // closeProducer is a method on the voiceService singleton; the global
+    // beforeEach only clears (not restores) mocks, so restore this spy after each
+    // test or it leaks a no-op impl into later closeProducer tests.
+    let closeSpy: ReturnType<typeof vi.spyOn> | undefined;
+    afterEach(() => {
+      closeSpy?.mockRestore();
+      closeSpy = undefined;
+    });
+
+    it('stops local capture for every server-closed source via closeProducer', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      closeSpy = vi.spyOn(svc, 'closeProducer').mockResolvedValue(undefined);
+
+      const handler = socketListeners['permissions-changed']?.[0];
+      expect(handler).toBeDefined();
+      await handler?.({ channelId: 'chan-1', permissions: '0', closedSources: ['camera', 'mic'] });
+
+      expect(closeSpy).toHaveBeenCalledWith('camera');
+      expect(closeSpy).toHaveBeenCalledWith('mic');
+      expect(closeSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it('is a no-op when no sources were closed (grant / non-publish revocation)', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      closeSpy = vi.spyOn(svc, 'closeProducer').mockResolvedValue(undefined);
+
+      const handler = socketListeners['permissions-changed']?.[0];
+      await handler?.({ channelId: 'chan-1', permissions: '131072', closedSources: [] });
+
+      expect(closeSpy).not.toHaveBeenCalled();
+    });
+
+    it('ignores a malformed payload without a closedSources array', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      closeSpy = vi.spyOn(svc, 'closeProducer').mockResolvedValue(undefined);
+
+      const handler = socketListeners['permissions-changed']?.[0];
+      await handler?.({ channelId: 'chan-1', permissions: '0' });
+
+      expect(closeSpy).not.toHaveBeenCalled();
+    });
+
+    it('marks the client muted when the mic is among the closed sources', async () => {
+      await joinVoiceChannel();
+      useVoiceStore.setState({ isMuted: false });
+      const svc = voiceService as any;
+      closeSpy = vi.spyOn(svc, 'closeProducer').mockResolvedValue(undefined);
+
+      const handler = socketListeners['permissions-changed']?.[0];
+      await handler?.({ channelId: 'chan-1', permissions: '0', closedSources: ['mic'] });
+
+      expect(useVoiceStore.getState().isMuted).toBe(true);
+    });
+
+    it('does not force mute when only non-mic sources are closed', async () => {
+      await joinVoiceChannel();
+      useVoiceStore.setState({ isMuted: false });
+      const svc = voiceService as any;
+      closeSpy = vi.spyOn(svc, 'closeProducer').mockResolvedValue(undefined);
+
+      const handler = socketListeners['permissions-changed']?.[0];
+      await handler?.({ channelId: 'chan-1', permissions: '0', closedSources: ['camera', 'screen'] });
+
+      expect(useVoiceStore.getState().isMuted).toBe(false);
+    });
+  });
+
   describe('socket listener: disconnect', () => {
     it('triggers emergency cleanup on server disconnect', async () => {
       await joinVoiceChannel();
@@ -1749,6 +1865,33 @@ describe('VoiceService Extended', () => {
 
       expect(useVoiceStore.getState().isVideoOn).toBe(false);
       expect(svc.localCameraStream).toBeNull();
+    });
+
+    it('stops the system-audio track but keeps screen video on a screen-audio close', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+
+      // localScreenStream carries BOTH the screen video and the system-audio
+      // track (screen-audio is produced with stopTracks:false).
+      const audioTrack = { kind: 'audio', id: 'sysaudio', stop: vi.fn() };
+      const videoTrack = { kind: 'video', id: 'screenvid', stop: vi.fn() };
+      const screenStream = createMockMediaStream();
+      (screenStream.getAudioTracks as any).mockReturnValue([audioTrack]);
+      (screenStream.getVideoTracks as any).mockReturnValue([videoTrack]);
+      (screenStream.getTracks as any).mockReturnValue([audioTrack, videoTrack]);
+      svc.localScreenStream = screenStream;
+      svc.producers.set('screen-audio', createMockProducer('sa-1', 'screen-audio'));
+
+      // Speak revoked while ScreenShare (screen video) stays permitted.
+      await svc.closeProducer('screen-audio');
+
+      // The system-audio track is stopped and detached...
+      expect(audioTrack.stop).toHaveBeenCalled();
+      expect(screenStream.removeTrack).toHaveBeenCalledWith(audioTrack);
+      // ...but the screen VIDEO keeps running and the stream is NOT torn down.
+      expect(videoTrack.stop).not.toHaveBeenCalled();
+      expect(svc.localScreenStream).toBe(screenStream);
+      expect(svc.producers.has('screen-audio')).toBe(false);
     });
   });
 

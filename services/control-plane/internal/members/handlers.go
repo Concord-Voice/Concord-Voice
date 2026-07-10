@@ -47,6 +47,41 @@ type Handler struct {
 	resolver *rbac.Resolver
 	audit    *rbac.AuditWriter
 	rotator  *keyrotation.Rotator
+	// voiceEnforcer pushes recomputed permissions to voice-connected members
+	// after a membership change (CV-CAN-007 review P1). A kick/leave/ban deletes
+	// server_members but leaves the media-plane participant holding its join-time
+	// snapshot, so it could keep publishing until it voluntarily left. Wired via
+	// SetVoiceEnforcer; nil means no push (the pre-push, join-snapshot behavior).
+	voiceEnforcer rbac.VoiceEnforcer
+}
+
+// SetVoiceEnforcer wires the mid-session voice permission push. Called once at
+// router construction, before the handler serves traffic.
+func (h *Handler) SetVoiceEnforcer(e rbac.VoiceEnforcer) {
+	h.voiceEnforcer = e
+}
+
+// recheckVoiceUser re-pushes permissions for a member who may be sitting in a
+// voice channel right now. After a membership deletion the enforcer's fresh
+// resolve returns ErrNotMember and publishes voice.enforce.disconnect, evicting
+// the removed member from the room. Nil-safe: a no-op without an enforcer.
+func (h *Handler) recheckVoiceUser(serverID, userID string) {
+	if h.voiceEnforcer == nil {
+		return
+	}
+	h.voiceEnforcer.RecheckUser(serverID, userID)
+}
+
+// disconnectVoiceUser force-disconnects a member from any voice channel they are
+// currently in. Used by the timeout path: a timed-out member is barred from
+// voice by AuthorizeJoin via timed_out_until, a gate independent of the
+// permission bitfield, so a recheck would re-push their unchanged bits and never
+// evict them. Nil-safe: a no-op without an enforcer.
+func (h *Handler) disconnectVoiceUser(serverID, userID string) {
+	if h.voiceEnforcer == nil {
+		return
+	}
+	h.voiceEnforcer.DisconnectUser(serverID, userID)
 }
 
 // NewHandler creates a new member handler
@@ -600,6 +635,13 @@ func (h *Handler) TimeoutMember(c *gin.Context) {
 
 	h.broadcastTimeout(serverID, targetUserID, &storedUntil)
 
+	// A timeout bars the member from voice (AuthorizeJoin rejects an active
+	// timed_out_until), so a member already sitting in a voice channel must be
+	// evicted now — otherwise their media-plane session survives until they
+	// leave. Fire-and-forget; degrades to the pre-push behavior without an
+	// enforcer (CV-CAN-007 review P1).
+	h.disconnectVoiceUser(serverID, targetUserID)
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":         "Member timed out",
 		"server_id":       serverID,
@@ -775,6 +817,12 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		return
 	}
 
+	// CV-CAN-007 (review P1): membership is now deleted — recheck the removed
+	// member's voice presence so the media plane evicts them (the fresh resolve
+	// returns ErrNotMember -> voice.enforce.disconnect) instead of letting them
+	// publish on the stale join-time snapshot until they voluntarily leave.
+	h.recheckVoiceUser(serverID, targetUserID)
+
 	action := "removed"
 	if auth.isSelfRemoval {
 		action = "left"
@@ -915,6 +963,12 @@ func (h *Handler) BanMember(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedBanMember})
 		return
 	}
+
+	// CV-CAN-007 (review P1): membership is now deleted — recheck the banned
+	// member's voice presence so the media plane evicts them (the fresh resolve
+	// returns ErrNotMember -> voice.enforce.disconnect) instead of letting them
+	// publish on the stale join-time snapshot until they voluntarily leave.
+	h.recheckVoiceUser(serverID, targetUserID)
 
 	if h.audit != nil {
 		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "member_banned", "member", &targetUserID, //nolint:errcheck

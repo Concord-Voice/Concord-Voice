@@ -3,6 +3,28 @@ import type { Socket, ExtendedError } from 'socket.io';
 import { config } from '../config/index.js';
 import { logger } from '../lib/logger.js';
 
+// CV-CAN-007: upper bound of a valid effective-permission bitfield. The
+// control-plane serializes it via strconv.FormatInt(int64(perms), 10) where
+// rbac.Permission is an int64, so any legitimate non-negative value is at most
+// the max positive int64 (2^63 - 1). A larger decimal (e.g. "18446744073709551615")
+// cannot come from a valid rbac.Permission, so it is treated as malformed and
+// fails closed rather than having its low Speak/Video/ScreenShare bits honored.
+const MAX_PERMISSION_BITFIELD = (1n << 63n) - 1n;
+
+/**
+ * Strict fail-closed parser for the server-authoritative permission bitfield
+ * wire format (decimal string, non-negative, at most max int64). Returns
+ * undefined for anything else — hex, arrays, numbers, negatives, and
+ * out-of-range decimals all fail closed. Shared by the join-authorize response
+ * parse below and the voice.enforce.permissions NATS consumer (CV-CAN-007).
+ */
+export function parsePermissionBitfield(raw: unknown): bigint | undefined {
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) return undefined;
+  const parsed = BigInt(raw);
+  if (parsed > MAX_PERMISSION_BITFIELD) return undefined;
+  return parsed;
+}
+
 // ---------------------------------------------------------------------------
 // JWT claims — mirrors the Go control plane's auth.Claims struct.
 // The control plane signs JWTs with HS256 using the shared jwtSecret.
@@ -167,6 +189,17 @@ export interface ChannelAccessResult {
   authUsername?: string;
   authDisplayName?: string;
   authAvatarUrl?: string;
+  /**
+   * The joining user's effective voice permission bitfield, resolved
+   * server-side by the control-plane and returned in the channel join-authorize
+   * response (CV-CAN-007). A `bigint` because the full permission field uses
+   * bits beyond JS Number precision. Present (fail-closed to 0n) for CHANNEL
+   * joins; `undefined` for DM joins, which have no server permission model.
+   * Consumed at the participant's own produce boundary in RoomManager to reject
+   * publishing without Speak / Video / ScreenShare — never from
+   * socket.handshake.auth.
+   */
+  permissions?: bigint;
   error?: string;
 }
 
@@ -457,7 +490,7 @@ export async function validateChannelAccess(
     const responseData = (await channelRes.json()) as {
       allowed: boolean;
       media_server_url: string;
-      permissions: string;
+      permissions?: unknown;
       server_muted: boolean;
       server_deafened: boolean;
       channel: {
@@ -488,6 +521,18 @@ export async function validateChannelAccess(
     // CV-CAN-017: server-authoritative display identity for channel voice.
     const identity = parseAuthoritativeIdentity(responseData);
 
+    // CV-CAN-007: parse the server-authoritative effective-permission bitfield.
+    // bigint because the full field uses bits beyond JS Number precision.
+    // Fail-closed to 0n (deny all publish) unless the value is a plain decimal
+    // string within the control-plane's int64 permission domain. BigInt() is
+    // dangerously coercive at a security boundary: it turns non-decimal strings
+    // ("0x20000"), single-element arrays (["131072"]), and numbers into a real
+    // bitfield, and negative strings ("-1") into an all-bits-set two's-complement
+    // value; every one of those fails open. It also parses out-of-range decimals
+    // ("18446744073709551615") whose low bits would grant publish rights. A strict
+    // decimal-only guard plus the int64 upper bound rejects all of them.
+    const permissions: bigint = parsePermissionBitfield(responseData.permissions) ?? 0n;
+
     // The voice join endpoint validates channel type, membership, and permissions.
     // If we got a 200 with allowed=true, the user has access.
     return {
@@ -503,6 +548,7 @@ export async function validateChannelAccess(
       maxManualBitrateBps: ent.maxManualBitrateBps,
       roomOwnerTier,
       ...identity,
+      permissions,
     };
   } catch (err) {
     logger.error('Failed to validate channel access', {

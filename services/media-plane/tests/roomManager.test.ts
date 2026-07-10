@@ -1065,6 +1065,439 @@ describe('RoomManager', () => {
   });
 
   // ── Per-user audio tier gating (#1300) ────────────────────────────────
+  describe('produce — publish permission enforcement (CV-CAN-007)', () => {
+    const PERM_SPEAK = 1n << 17n;
+    const PERM_SCREENSHARE = 1n << 21n;
+    const PERM_VIDEO = 1n << 28n;
+    const PERM_ADMINISTRATOR = 1n << 62n;
+    // Voice-channel access bits (CV-CAN-006). Every participant that legitimately
+    // joined a voice channel holds BOTH, so realistic grants OR in PERM_VOICE on
+    // top of the publish bit under test; the negative cases below deliberately
+    // omit one to prove publishing also requires voice access.
+    const PERM_VIEW_VOICE = 1n << 9n;
+    const PERM_JOIN_VOICE = 1n << 16n;
+    const PERM_VOICE = PERM_VIEW_VOICE | PERM_JOIN_VOICE;
+
+    async function joinChannelWithPerms(userId: string, socketId: string, permissions: bigint) {
+      return manager.joinRoom('room-1', userId, socketId, { username: userId }, undefined, {
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel' },
+        permissions,
+      });
+    }
+
+    async function transportFor(roomId: string, userId: string) {
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport(roomId, userId, 'send');
+      return transport;
+    }
+
+    it('rejects mic produce without Speak', async () => {
+      await joinChannelWithPerms('u-nospeak', 'sock-1', 0n);
+      const transport = await transportFor('room-1', 'u-nospeak');
+      await expect(
+        manager.produce('room-1', 'u-nospeak', transport.id, 'audio', createRtpParameters() as any, 'mic')
+      ).rejects.toThrow('publish permission denied');
+    });
+
+    it('rejects camera produce without Video', async () => {
+      await joinChannelWithPerms('u-novideo', 'sock-2', PERM_SPEAK | PERM_VOICE);
+      const transport = await transportFor('room-1', 'u-novideo');
+      await expect(
+        manager.produce('room-1', 'u-novideo', transport.id, 'video', createRtpParameters() as any, 'camera')
+      ).rejects.toThrow('publish permission denied');
+    });
+
+    it('rejects screen produce without ScreenShare', async () => {
+      await joinChannelWithPerms('u-noscreen', 'sock-3', PERM_SPEAK | PERM_VIDEO | PERM_VOICE);
+      const transport = await transportFor('room-1', 'u-noscreen');
+      await expect(
+        manager.produce('room-1', 'u-noscreen', transport.id, 'video', createRtpParameters() as any, 'screen')
+      ).rejects.toThrow('publish permission denied');
+    });
+
+    // Same-kind source bypass (CV-CAN-007 follow-up): mediasoup only proves the
+    // track `kind`, so a member holding one video bit but not the other could
+    // relabel a screen track as 'camera' (or a camera track as 'screen') to
+    // dodge the missing bit. A video produce therefore fails closed unless BOTH
+    // PERM_VIDEO and PERM_SCREENSHARE are held, regardless of the claimed source.
+    it('rejects camera produce with Video but not ScreenShare (cannot prove track is not screen)', async () => {
+      await joinChannelWithPerms('u-video-only', 'sock-vo', PERM_SPEAK | PERM_VIDEO | PERM_VOICE);
+      const transport = await transportFor('room-1', 'u-video-only');
+      await expect(
+        manager.produce('room-1', 'u-video-only', transport.id, 'video', createRtpParameters() as any, 'camera')
+      ).rejects.toThrow('publish permission denied');
+    });
+
+    it('rejects screen produce with ScreenShare but not Video (cannot prove track is not camera)', async () => {
+      await joinChannelWithPerms('u-screen-only', 'sock-so', PERM_SPEAK | PERM_SCREENSHARE | PERM_VOICE);
+      const transport = await transportFor('room-1', 'u-screen-only');
+      await expect(
+        manager.produce('room-1', 'u-screen-only', transport.id, 'video', createRtpParameters() as any, 'screen')
+      ).rejects.toThrow('publish permission denied');
+    });
+
+    it('allows camera produce when both Video and ScreenShare are held', async () => {
+      await joinChannelWithPerms('u-both-cam', 'sock-bc', PERM_VIDEO | PERM_SCREENSHARE | PERM_VOICE);
+      const transport = await transportFor('room-1', 'u-both-cam');
+      const producer = createMockProducer({ kind: 'video' });
+      transport.produce.mockResolvedValueOnce(producer);
+      await expect(
+        manager.produce('room-1', 'u-both-cam', transport.id, 'video', createRtpParameters() as any, 'camera')
+      ).resolves.toBeDefined();
+    });
+
+    it('allows screen produce when both Video and ScreenShare are held', async () => {
+      await joinChannelWithPerms('u-both-scr', 'sock-bs', PERM_VIDEO | PERM_SCREENSHARE | PERM_VOICE);
+      const transport = await transportFor('room-1', 'u-both-scr');
+      const producer = createMockProducer({ kind: 'video' });
+      transport.produce.mockResolvedValueOnce(producer);
+      await expect(
+        manager.produce('room-1', 'u-both-scr', transport.id, 'video', createRtpParameters() as any, 'screen')
+      ).resolves.toBeDefined();
+    });
+
+    // Spoofable screen-audio (CV-CAN-007 follow-up): mediasoup proves only kind
+    // 'audio', and the active-screen gate proves only that a screen producer
+    // exists — not that the track is system audio. A member who keeps ScreenShare
+    // but lost Speak must not inject microphone audio by declaring
+    // source: 'screen-audio', so every audio publish requires Speak.
+    it('rejects screen-audio produce without Speak even with an active screen producer', async () => {
+      await joinChannelWithPerms('u-nospeak-scr', 'sock-nss', PERM_VIDEO | PERM_SCREENSHARE | PERM_VOICE);
+      const transport = await transportFor('room-1', 'u-nospeak-scr');
+      // Establish the prerequisite screen producer (allowed: holds Video+ScreenShare).
+      transport.produce.mockResolvedValueOnce(createMockProducer({ kind: 'video' }));
+      await manager.produce('room-1', 'u-nospeak-scr', transport.id, 'video', createRtpParameters() as any, 'screen');
+      // The spoofable screen-audio publish must fail closed (no Speak).
+      await expect(
+        manager.produce('room-1', 'u-nospeak-scr', transport.id, 'audio', createRtpParameters() as any, 'screen-audio')
+      ).rejects.toThrow('publish permission denied');
+    });
+
+    it('allows screen-audio produce with Speak, ScreenShare, and an active screen producer', async () => {
+      await joinChannelWithPerms('u-scr-audio', 'sock-sa', PERM_SPEAK | PERM_VIDEO | PERM_SCREENSHARE | PERM_VOICE);
+      const transport = await transportFor('room-1', 'u-scr-audio');
+      transport.produce.mockResolvedValueOnce(createMockProducer({ kind: 'video' }));
+      await manager.produce('room-1', 'u-scr-audio', transport.id, 'video', createRtpParameters() as any, 'screen');
+      transport.produce.mockResolvedValueOnce(createMockProducer({ kind: 'audio' }));
+      await expect(
+        manager.produce('room-1', 'u-scr-audio', transport.id, 'audio', createRtpParameters() as any, 'screen-audio')
+      ).resolves.toBeDefined();
+    });
+
+    it('allows mic produce with Speak', async () => {
+      await joinChannelWithPerms('u-speak', 'sock-4', PERM_SPEAK | PERM_VOICE);
+      const transport = await transportFor('room-1', 'u-speak');
+      const producer = createMockProducer({ kind: 'audio' });
+      transport.produce.mockResolvedValueOnce(producer);
+      await expect(
+        manager.produce('room-1', 'u-speak', transport.id, 'audio', createRtpParameters() as any, 'mic')
+      ).resolves.toBeDefined();
+    });
+
+    // Voice-channel access (CV-CAN-006): AuthorizeJoin admits a user only with
+    // BOTH ViewVoiceChannels and JoinVoice, and the mid-session enforcer keeps a
+    // peer connected (pushing the recomputed bitfield) when only those bits are
+    // revoked. So a publish bit alone must not authorize publishing — losing
+    // either access bit revokes the right to be publishing at all.
+    it('rejects mic produce when JoinVoice is absent even with Speak', async () => {
+      await joinChannelWithPerms('u-nojoin', 'sock-nj', PERM_SPEAK | PERM_VIEW_VOICE);
+      const transport = await transportFor('room-1', 'u-nojoin');
+      await expect(
+        manager.produce('room-1', 'u-nojoin', transport.id, 'audio', createRtpParameters() as any, 'mic')
+      ).rejects.toThrow('publish permission denied');
+    });
+
+    it('rejects camera produce when ViewVoiceChannels is absent even with both video bits', async () => {
+      await joinChannelWithPerms('u-noview', 'sock-nv', PERM_VIDEO | PERM_SCREENSHARE | PERM_JOIN_VOICE);
+      const transport = await transportFor('room-1', 'u-noview');
+      await expect(
+        manager.produce('room-1', 'u-noview', transport.id, 'video', createRtpParameters() as any, 'camera')
+      ).rejects.toThrow('publish permission denied');
+    });
+
+    it('allows produce for an admin-only bitfield (Administrator bypasses publish bits)', async () => {
+      // Control-plane rbac.Permission.Has short-circuits on PermAdministrator, so a
+      // member whose effective bitfield is admin-only authorizes camera even without
+      // the concrete Video bit.
+      await joinChannelWithPerms('u-admin', 'sock-admin', PERM_ADMINISTRATOR);
+      const transport = await transportFor('room-1', 'u-admin');
+      const producer = createMockProducer({ kind: 'video' });
+      transport.produce.mockResolvedValueOnce(producer);
+      await expect(
+        manager.produce('room-1', 'u-admin', transport.id, 'video', createRtpParameters() as any, 'camera')
+      ).resolves.toBeDefined();
+    });
+
+    it('does not enforce publish permissions for DM rooms (permissions undefined)', async () => {
+      await manager.joinRoom('room-dm', 'u-dm', 'sock-5', { username: 'dm' }, undefined, {
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'dm' },
+      });
+      const transport = await transportFor('room-dm', 'u-dm');
+      const producer = createMockProducer({ kind: 'audio' });
+      transport.produce.mockResolvedValueOnce(producer);
+      await expect(
+        manager.produce('room-dm', 'u-dm', transport.id, 'audio', createRtpParameters() as any, 'mic')
+      ).resolves.toBeDefined();
+    });
+  });
+
+  // ── Mid-session permission enforcement (CV-CAN-007 review P1) ─────────
+  describe('mid-session permission enforcement (CV-CAN-007 P1)', () => {
+    const PERM_SPEAK = 1n << 17n;
+    const PERM_SCREENSHARE = 1n << 21n;
+    const PERM_VIDEO = 1n << 28n;
+    const PERM_ADMINISTRATOR = 1n << 62n;
+    // Kind-keyed model: any video produce requires BOTH video bits.
+    const PERM_ALL_VIDEO = PERM_VIDEO | PERM_SCREENSHARE;
+    // Voice-channel access bits (CV-CAN-006) — every publish requires both.
+    const PERM_VIEW_VOICE = 1n << 9n;
+    const PERM_JOIN_VOICE = 1n << 16n;
+    const PERM_VOICE = PERM_VIEW_VOICE | PERM_JOIN_VOICE;
+
+    async function joinChannelWithPerms(userId: string, socketId: string, permissions: bigint) {
+      return manager.joinRoom('room-1', userId, socketId, { username: userId }, undefined, {
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel' },
+        permissions,
+      });
+    }
+
+    async function produceSource(
+      userId: string,
+      transport: ReturnType<typeof createMockTransport>,
+      kind: 'audio' | 'video',
+      source: 'mic' | 'camera' | 'screen'
+    ) {
+      const producer = createMockProducer({ kind });
+      transport.produce.mockResolvedValueOnce(producer);
+      const result = await manager.produce(
+        'room-1',
+        userId,
+        transport.id,
+        kind,
+        createRtpParameters() as any,
+        source
+      );
+      return { producer, producerId: result.producerId };
+    }
+
+    it('updateParticipantPermissions replaces the snapshot so produce uses the new bitfield', async () => {
+      await joinChannelWithPerms('u-live', 'sock-live', PERM_SPEAK);
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-1', 'u-live', 'send');
+
+      expect(manager.updateParticipantPermissions('room-1', 'u-live', 0n)).toBe(true);
+
+      // The revoked snapshot binds immediately: a fresh mic produce is rejected.
+      await expect(
+        manager.produce('room-1', 'u-live', transport.id, 'audio', createRtpParameters() as any, 'mic')
+      ).rejects.toThrow('publish permission denied');
+    });
+
+    it('updateParticipantPermissions returns false for an absent participant', () => {
+      expect(manager.updateParticipantPermissions('room-1', 'u-ghost', PERM_SPEAK)).toBe(false);
+    });
+
+    it('updateParticipantPermissions never bolts a permission model onto a DM room', async () => {
+      await manager.joinRoom('room-dm2', 'u-dm2', 'sock-dm2', { username: 'dm2' }, undefined, {
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'dm' },
+      });
+      expect(manager.updateParticipantPermissions('room-dm2', 'u-dm2', 0n)).toBe(false);
+
+      // DM publish stays ungated after the attempted update.
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-dm2', 'u-dm2', 'send');
+      const producer = createMockProducer({ kind: 'audio' });
+      transport.produce.mockResolvedValueOnce(producer);
+      await expect(
+        manager.produce('room-dm2', 'u-dm2', transport.id, 'audio', createRtpParameters() as any, 'mic')
+      ).resolves.toBeDefined();
+    });
+
+    it('closeForbiddenProducers closes only the sources whose bit was revoked', async () => {
+      await joinChannelWithPerms('u-revoke', 'sock-revoke', PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE);
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-1', 'u-revoke', 'send');
+      const mic = await produceSource('u-revoke', transport, 'audio', 'mic');
+      const camera = await produceSource('u-revoke', transport, 'video', 'camera');
+
+      // Revoke the video bits, keep Speak and voice-channel access.
+      manager.updateParticipantPermissions('room-1', 'u-revoke', PERM_SPEAK | PERM_VOICE);
+      const closed = await manager.closeForbiddenProducers('room-1', 'u-revoke');
+
+      expect(closed).toEqual(['camera']);
+      expect(camera.producer.close).toHaveBeenCalled();
+      expect(mic.producer.close).not.toHaveBeenCalled();
+      const participant = manager.getParticipant('room-1', 'u-revoke');
+      expect(participant?.producers.has(camera.producerId)).toBe(false);
+      expect(participant?.producers.has(mic.producerId)).toBe(true);
+    });
+
+    it('closeForbiddenProducers closes EVERY producer when voice-channel access is revoked (Speak retained)', async () => {
+      // CV-CAN-006/007: dropping ViewVoiceChannels/JoinVoice mid-session (while the
+      // publish bits survive) means the peer is no longer entitled to be in the
+      // voice channel at all, so both mic and camera must close — not just the
+      // sources whose own publish bit changed.
+      await joinChannelWithPerms('u-noaccess', 'sock-noaccess', PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE);
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-1', 'u-noaccess', 'send');
+      const mic = await produceSource('u-noaccess', transport, 'audio', 'mic');
+      const camera = await produceSource('u-noaccess', transport, 'video', 'camera');
+
+      // Revoke voice-channel access only; keep every publish bit.
+      manager.updateParticipantPermissions('room-1', 'u-noaccess', PERM_SPEAK | PERM_ALL_VIDEO);
+      const closed = await manager.closeForbiddenProducers('room-1', 'u-noaccess');
+
+      expect(closed.sort()).toEqual(['camera', 'mic']);
+      expect(mic.producer.close).toHaveBeenCalled();
+      expect(camera.producer.close).toHaveBeenCalled();
+      expect(manager.getParticipant('room-1', 'u-noaccess')?.producers.size).toBe(0);
+    });
+
+    it('closeForbiddenProducers closes nothing for an admin-only bitfield', async () => {
+      await joinChannelWithPerms('u-adm2', 'sock-adm2', PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE);
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-1', 'u-adm2', 'send');
+      const mic = await produceSource('u-adm2', transport, 'audio', 'mic');
+
+      manager.updateParticipantPermissions('room-1', 'u-adm2', PERM_ADMINISTRATOR);
+      const closed = await manager.closeForbiddenProducers('room-1', 'u-adm2');
+
+      expect(closed).toEqual([]);
+      expect(mic.producer.close).not.toHaveBeenCalled();
+    });
+
+    it('unwinds an in-flight produce whose permission was revoked during the await (TOCTOU)', async () => {
+      await joinChannelWithPerms('u-race', 'sock-race', PERM_SPEAK | PERM_VOICE);
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-1', 'u-race', 'send');
+
+      // Hold the mediasoup produce() open so the revocation lands mid-await.
+      const producer = createMockProducer({ kind: 'audio' });
+      let releaseProduce: (p: unknown) => void = () => {};
+      transport.produce.mockReturnValueOnce(
+        new Promise((resolve) => {
+          releaseProduce = resolve;
+        })
+      );
+
+      const producePromise = manager.produce(
+        'room-1',
+        'u-race',
+        transport.id,
+        'audio',
+        createRtpParameters() as any,
+        'mic'
+      );
+      // Revocation arrives while produce() is awaiting the transport.
+      manager.updateParticipantPermissions('room-1', 'u-race', 0n);
+      await manager.closeForbiddenProducers('room-1', 'u-race'); // sees nothing yet
+      releaseProduce(producer);
+
+      await expect(producePromise).rejects.toThrow('publish permission denied');
+      // The racing producer was closed and deregistered, not left live.
+      expect(producer.close).toHaveBeenCalled();
+      expect(manager.getParticipant('room-1', 'u-race')?.producers.size).toBe(0);
+    });
+
+    it('closeForbiddenProducers also closes the orphaned screen-audio when its screen producer is revoked', async () => {
+      // Video revoked while Speak+ScreenShare remain: the kind-keyed model forbids
+      // the `screen` video producer but still permits `screen-audio`, which would
+      // be left orphaned (validateScreenAudioSource requires an active screen).
+      await joinChannelWithPerms('u-scrorph', 'sock-scrorph', PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE);
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-1', 'u-scrorph', 'send');
+
+      const screen = createMockProducer({ kind: 'video' });
+      transport.produce.mockResolvedValueOnce(screen);
+      await manager.produce('room-1', 'u-scrorph', transport.id, 'video', createRtpParameters() as any, 'screen');
+
+      const screenAudio = createMockProducer({ kind: 'audio' });
+      transport.produce.mockResolvedValueOnce(screenAudio);
+      await manager.produce('room-1', 'u-scrorph', transport.id, 'audio', createRtpParameters() as any, 'screen-audio');
+
+      manager.updateParticipantPermissions('room-1', 'u-scrorph', PERM_SPEAK | PERM_SCREENSHARE | PERM_VOICE);
+      const closed = await manager.closeForbiddenProducers('room-1', 'u-scrorph');
+
+      expect(closed.sort()).toEqual(['screen', 'screen-audio']);
+      expect(screen.close).toHaveBeenCalled();
+      expect(screenAudio.close).toHaveBeenCalled();
+      expect(manager.getParticipant('room-1', 'u-scrorph')?.producers.size).toBe(0);
+    });
+
+    it('closeForbiddenProducers keeps screen-audio when its screen producer survives', async () => {
+      // Only Speak is revoked (screen-audio itself becomes forbidden); the screen
+      // video producer stays, so the orphan sweep must NOT fire on the survivor.
+      await joinChannelWithPerms('u-scrkeep', 'sock-scrkeep', PERM_SPEAK | PERM_ALL_VIDEO | PERM_VOICE);
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-1', 'u-scrkeep', 'send');
+
+      const screen = createMockProducer({ kind: 'video' });
+      transport.produce.mockResolvedValueOnce(screen);
+      await manager.produce('room-1', 'u-scrkeep', transport.id, 'video', createRtpParameters() as any, 'screen');
+
+      const screenAudio = createMockProducer({ kind: 'audio' });
+      transport.produce.mockResolvedValueOnce(screenAudio);
+      await manager.produce('room-1', 'u-scrkeep', transport.id, 'audio', createRtpParameters() as any, 'screen-audio');
+
+      // Revoke Speak only: screen-audio (needs Speak) closes, screen video stays.
+      manager.updateParticipantPermissions('room-1', 'u-scrkeep', PERM_ALL_VIDEO | PERM_VOICE);
+      const closed = await manager.closeForbiddenProducers('room-1', 'u-scrkeep');
+
+      expect(closed).toEqual(['screen-audio']);
+      expect(screenAudio.close).toHaveBeenCalled();
+      expect(screen.close).not.toHaveBeenCalled();
+      expect(manager.getParticipant('room-1', 'u-scrkeep')?.producers.size).toBe(1);
+    });
+
+    it('unwinds a mic produce whose permission was revoked during the audioLevelObserver await (TOCTOU #2)', async () => {
+      await joinChannelWithPerms('u-race2', 'sock-race2', PERM_SPEAK | PERM_VOICE);
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-1', 'u-race2', 'send');
+
+      const producer = createMockProducer({ kind: 'audio' });
+      transport.produce.mockResolvedValueOnce(producer);
+
+      // The second revocation window is the AudioLevelObserver.addProducer await
+      // (after recheck #1). Drive the revocation from inside it: the producer is
+      // already registered, so closeForbiddenProducers closes and deregisters it,
+      // and the produce path must not then announce the torn-down producer.
+      mockRouter._audioLevelObserver.addProducer.mockImplementationOnce(async () => {
+        manager.updateParticipantPermissions('room-1', 'u-race2', 0n);
+        await manager.closeForbiddenProducers('room-1', 'u-race2');
+      });
+
+      await expect(
+        manager.produce('room-1', 'u-race2', transport.id, 'audio', createRtpParameters() as any, 'mic')
+      ).rejects.toThrow('publish permission denied');
+
+      expect(producer.close).toHaveBeenCalled();
+      expect(manager.getParticipant('room-1', 'u-race2')?.producers.size).toBe(0);
+    });
+
+    it('closeForbiddenProducers returns empty for DM rooms and absent participants', async () => {
+      await manager.joinRoom('room-dm3', 'u-dm3', 'sock-dm3', { username: 'dm3' }, undefined, {
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'dm' },
+      });
+      await expect(manager.closeForbiddenProducers('room-dm3', 'u-dm3')).resolves.toEqual([]);
+      await expect(manager.closeForbiddenProducers('room-1', 'u-nobody')).resolves.toEqual([]);
+    });
+  });
+
   describe('produce — per-user audio tier gating (#1300)', () => {
     // u-1 (free floor: minPtime 20, standard opus ceiling 96 kbps) is joined by
     // the parent produce beforeEach. Add a premium peer with their own transport.

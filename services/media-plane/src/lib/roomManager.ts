@@ -46,6 +46,134 @@ export interface MediaEntitlement {
   maxManualBitrateBps: number;
 }
 
+// Voice publish-permission bits (CV-CAN-007), mirroring the control-plane
+// rbac.Permission constants (PermSpeak / PermScreenShare / PermVideo). bigint
+// because the full permission bitfield uses bits beyond JS Number precision.
+const PERM_SPEAK = 1n << 17n;
+const PERM_SCREENSHARE = 1n << 21n;
+const PERM_VIDEO = 1n << 28n;
+// Voice-channel access bits (CV-CAN-006 dual-bit gate). The control-plane's
+// AuthorizeJoin admits a user to a voice channel only when BOTH are present, and
+// the mid-session enforcer keeps pushing the full effective bitfield rather than
+// force-disconnecting on their loss (it disconnects only on server-membership
+// loss, ErrNotMember). So publishing must require both too: revoking either one
+// mid-session — while a publish bit like Speak survives — must not leave an
+// already-connected peer able to restart mic/camera. Mirrors
+// rbac.PermViewVoiceChannels / rbac.PermJoinVoice.
+const PERM_VIEW_VOICE_CHANNELS = 1n << 9n;
+const PERM_JOIN_VOICE = 1n << 16n;
+const PERM_VOICE_ACCESS = PERM_VIEW_VOICE_CHANNELS | PERM_JOIN_VOICE;
+// PermAdministrator is a superuser grant: the control-plane's rbac.Permission.Has
+// short-circuits to true whenever this bit is set, so an admin-only role satisfies
+// every publish check even without a concrete Speak/Video/ScreenShare bit.
+const PERM_ADMINISTRATOR = 1n << 62n;
+
+/**
+ * Compute the publish-permission bits a produce() must satisfy, keyed off the
+ * mediasoup-verified `kind` and NOT the client-declared `source` alone.
+ *
+ * mediasoup only proves a track's `kind` (audio/video); `source` (camera vs
+ * screen, mic vs screen-audio) is client-declared appData and is spoofable
+ * within a kind. Authorizing on `source` alone is bypassable: a member could
+ * relabel a track as the same-kind source whose bit they hold while sending
+ * the one they lack.
+ *
+ * Video: camera (PERM_VIDEO) and screen (PERM_SCREENSHARE) share kind 'video'
+ * and are not server-distinguishable, so a video produce must satisfy BOTH
+ * bits (see the fail-closed tradeoff note on assertPublishPermitted).
+ *
+ * Audio: Speak governs transmitting audio into the channel, and microphone vs
+ * system audio is likewise not server-distinguishable within kind 'audio' — the
+ * active-screen gate on screen-audio (validateScreenAudioSource) only proves a
+ * screen producer exists, not that the track is system audio. So EVERY audio
+ * produce requires PERM_SPEAK: a member who lost Speak while keeping ScreenShare
+ * cannot inject microphone audio by declaring `source: 'screen-audio'`.
+ * screen-audio additionally requires PERM_SCREENSHARE, being the audio track of
+ * a screen share.
+ *
+ * On top of the kind-specific bits, EVERY publish also requires voice-channel
+ * access (PERM_VOICE_ACCESS = ViewVoiceChannels | JoinVoice). A fresh join needs
+ * both (CV-CAN-006), and the mid-session enforcer pushes the recomputed bitfield
+ * without disconnecting when only those access bits are revoked. Folding them in
+ * here means such a revocation closes live producers (closeForbiddenProducers)
+ * and blocks new ones even when the kind-specific bit (e.g. Speak) survives.
+ */
+function requiredPublishBits(kind: MediaKind, source: MediaSource): bigint {
+  let kindBits: bigint;
+  if (kind === 'video') {
+    kindBits = PERM_VIDEO | PERM_SCREENSHARE;
+  } else if (source === 'screen-audio') {
+    kindBits = PERM_SPEAK | PERM_SCREENSHARE;
+  } else {
+    kindBits = PERM_SPEAK;
+  }
+  return PERM_VOICE_ACCESS | kindBits;
+}
+
+/**
+ * Boolean form of the publish gate, shared by the produce()-time assert, the
+ * post-await TOCTOU re-check, and the mid-session audit
+ * (closeForbiddenProducers). Keyed on the mediasoup-verified `kind` per
+ * requiredPublishBits — ALL required bits must be present. Administrator
+ * bypasses all permission checks (mirrors rbac.Permission.Has).
+ */
+function publishPermitted(permissions: bigint, kind: MediaKind, source: MediaSource): boolean {
+  if ((permissions & PERM_ADMINISTRATOR) !== 0n) return true;
+  const required = requiredPublishBits(kind, source);
+  return (permissions & required) === required;
+}
+
+/**
+ * Whether a bitfield still satisfies voice-channel access (the CV-CAN-006
+ * dual-bit join gate: ViewVoiceChannels | JoinVoice). A fresh AuthorizeJoin
+ * requires BOTH, so losing either one mid-session means the peer has no right to
+ * remain in the room — not merely to publish. Administrator bypasses all
+ * permission checks (mirrors publishPermitted / rbac.Permission.Has). Exported
+ * for the mid-session enforcer (enforcePermissions.ts), which force-disconnects
+ * a peer whose pushed bitfield no longer clears this gate.
+ */
+export function hasVoiceAccess(permissions: bigint): boolean {
+  if ((permissions & PERM_ADMINISTRATOR) !== 0n) return true;
+  return (permissions & PERM_VOICE_ACCESS) === PERM_VOICE_ACCESS;
+}
+
+/**
+ * CV-CAN-007: enforce the joining user's server-authoritative publish permission
+ * for a produce(). Channel rooms carry a bigint bitfield (0n = deny all,
+ * fail-closed); DM rooms have `permissions === undefined` (no server permission
+ * model — publish freely). Throws 'publish permission denied' on rejection.
+ * Static log — never interpolate the client-supplied source (CWE-117).
+ *
+ * Fail-closed tradeoff: because the media plane cannot distinguish sources
+ * within a `kind` (camera vs screen; microphone vs system audio; the source
+ * label is client-declared), enforcement is per-kind. A video produce requires
+ * BOTH PERM_VIDEO and PERM_SCREENSHARE; every audio produce requires PERM_SPEAK
+ * (screen-audio also PERM_SCREENSHARE). A member granted only one same-kind bit
+ * is denied that whole kind rather than allowed to relabel past the missing
+ * one. Enforcing the finer source distinction would need a trustworthy
+ * server-side source signal, which is not available today.
+ *
+ * Independent of kind, every publish also requires voice-channel access
+ * (ViewVoiceChannels | JoinVoice, the CV-CAN-006 join gate): losing either bit
+ * mid-session revokes the right to be publishing at all.
+ */
+function assertPublishPermitted(
+  participant: { permissions?: bigint; userId: string },
+  kind: MediaKind,
+  source: MediaSource
+): void {
+  if (participant.permissions === undefined) return;
+  if (!publishPermitted(participant.permissions, kind, source)) {
+    logger.warn('produce rejected: missing publish permission', {
+      userId: participant.userId,
+      kind,
+      source,
+      reason: 'permission_denied',
+    });
+    throw new Error('publish permission denied');
+  }
+}
+
 export interface Participant {
   userId: string;
   socketId: string;
@@ -90,6 +218,14 @@ export interface Participant {
   allowedAudioTiers: string[];
   /** Minimum opus ptime (ms) this user may produce at (free 20, premium 10). */
   minPtimeMs: number;
+  /**
+   * Effective voice permission bitfield (CV-CAN-007), server-authoritative from
+   * the control-plane channel join-authorize. bigint (the full field uses bits
+   * beyond JS Number precision). Present (fail-closed 0n) for channel rooms;
+   * undefined for DM rooms (no server permission model). produce() rejects a
+   * publish whose required bit (Speak / Video / ScreenShare) is absent.
+   */
+  permissions?: bigint;
   /** Media E2EE frame crypto format this participant joined with. */
   mediaFrameCryptoVersion: number;
 }
@@ -365,6 +501,13 @@ export interface JoinRoomOptions {
   /** unparsed — validated by parseMediaFrameCryptoVersion at the admission gate */
   mediaFrameCryptoVersion: unknown;
   roomContext?: { roomKind: 'channel' | 'dm'; ownerTier?: string };
+  /**
+   * The joining user's effective voice permission bitfield (CV-CAN-007), from
+   * the control-plane channel join-authorize. Present (fail-closed to 0n) for
+   * channel rooms; undefined for DM rooms (no server permission model). Enforced
+   * at produce() to reject publishing without Speak / Video / ScreenShare.
+   */
+  permissions?: bigint;
 }
 
 // ---------------------------------------------------------------------------
@@ -630,7 +773,7 @@ export class RoomManager {
     }>;
     e2eeEpoch: number;
   }> {
-    const { entitlement, mediaFrameCryptoVersion, roomContext } = options;
+    const { entitlement, mediaFrameCryptoVersion, roomContext, permissions } = options;
     const parsedMediaFrameCryptoVersion = parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
     const { username, displayName, avatarUrl } = identity;
     let room = await this.getOrCreateRoom(roomId, roomContext);
@@ -708,6 +851,7 @@ export class RoomManager {
       maxManualBitrateBps: ent.maxManualBitrateBps,
       allowedAudioTiers: [...ent.allowedAudioTiers],
       minPtimeMs: ent.minPtimeMs,
+      permissions,
       mediaFrameCryptoVersion: parsedMediaFrameCryptoVersion,
     };
 
@@ -1020,6 +1164,94 @@ export class RoomManager {
   // ─── Producer management ─────────────────────────────────────────────
 
   /** Create a producer on the participant's send transport */
+
+  /**
+   * Post-registration enforcement + bookkeeping for a freshly produced
+   * producer (extracted from produce() for cognitive-complexity budget; the
+   * behavior is exactly the inline sequence it replaces).
+   *
+   * Two TOCTOU windows are closed here (CV-CAN-007 P1): a
+   * voice.enforce.permissions revocation can land during the
+   * sendTransport.produce() await (the snapshot audit cannot see an
+   * unregistered producer, and the client controls produce() timing) and
+   * again during the AudioLevelObserver.addProducer() await. Both re-check
+   * the CURRENT snapshot and unwind via closeProducer, throwing
+   * 'publish permission denied' so the caller's ack fails.
+   */
+  private async enforceAndTrackRegisteredProducer(
+    room: Room,
+    participant: Participant,
+    roomId: string,
+    userId: string,
+    producer: Producer,
+    kind: MediaKind,
+    source: MediaSource
+  ): Promise<void> {
+    // TOCTOU re-check (CV-CAN-007 P1): a voice.enforce.permissions revocation
+    // landing during the await above misses this producer — the snapshot audit
+    // in closeForbiddenProducers cannot see an unregistered producer, and the
+    // client controls produce() timing (it could keep produces perpetually in
+    // flight to ride out revocations). Now that the producer is registered,
+    // re-evaluate against the CURRENT snapshot and unwind if it was revoked.
+    if (participant.permissions !== undefined && !publishPermitted(participant.permissions, kind, source)) {
+      await this.closeProducer(roomId, userId, producer.id);
+      logger.warn('produce rejected: permission revoked mid-produce', {
+        userId,
+        kind,
+        source,
+        reason: 'permission_revoked_in_flight',
+      });
+      throw new Error('publish permission denied');
+    }
+
+    if (source === 'camera') this.recomputeCameraLayeringGate(room);
+
+    // Add mic audio producers to the AudioLevelObserver (skip screen-audio to
+    // avoid false active-speaker detection from system audio)
+    if (
+      kind === 'audio' &&
+      source !== 'screen-audio' &&
+      room.audioLevelObserver &&
+      !room.audioLevelObserver.closed
+    ) {
+      // Audio last-N (#1544): track this as a last-N-managed mic producer so the
+      // observed set matches exactly the producers driving the active-speaker set.
+      room.micProducerIds.add(producer.id);
+      try {
+        await room.audioLevelObserver.addProducer({ producerId: producer.id });
+      } catch (err) {
+        logger.warn('Failed to add producer to AudioLevelObserver', {
+          producerId: producer.id,
+          error: err,
+        });
+      }
+
+      // TOCTOU re-check #2 (CV-CAN-007 P1): the addProducer await above is a
+      // second revocation window after the recheck below `sendTransport.produce`.
+      // A voice.enforce.permissions revocation landing during it runs
+      // closeForbiddenProducers, which closes and removes this now-registered
+      // producer. Re-verify it is still present and permitted before announcing
+      // it. Otherwise we would emit `producer-added` and ack the caller for a
+      // producer the server already tore down.
+      if (
+        producer.closed ||
+        !participant.producers.has(producer.id) ||
+        (participant.permissions !== undefined &&
+          !publishPermitted(participant.permissions, kind, source))
+      ) {
+        await this.closeProducer(roomId, userId, producer.id);
+        logger.warn('produce rejected: permission revoked mid-produce', {
+          userId,
+          kind,
+          source,
+          reason: 'permission_revoked_after_observer',
+        });
+        throw new Error('publish permission denied');
+      }
+    }
+
+  }
+
   async produce(
     roomId: string,
     userId: string,
@@ -1071,6 +1303,10 @@ export class RoomManager {
       this.enforceAudioTierGate(participant, rtpParameters, source);
     }
 
+    // CV-CAN-007: enforce the joining user's server-authoritative publish
+    // permissions before reserving a producer slot (throws on denial).
+    assertPublishPermitted(participant, kind, source);
+
     // Enforce per-room concurrent-producer caps (#1542 tier-resolved: camera
     // free 8 / premium 25; screen free 1 / premium 3). TOCTOU-safe (#1539): the
     // check + slot reservation run synchronously with no intervening await, so
@@ -1093,28 +1329,8 @@ export class RoomManager {
     participant.producers.set(producer.id, { producer, source, kind });
     // Release the reservation: the producer is now counted via participant.producers.
     this.releaseProducerReservation(room, source, producerCap);
-    if (source === 'camera') this.recomputeCameraLayeringGate(room);
 
-    // Add mic audio producers to the AudioLevelObserver (skip screen-audio to
-    // avoid false active-speaker detection from system audio)
-    if (
-      kind === 'audio' &&
-      source !== 'screen-audio' &&
-      room.audioLevelObserver &&
-      !room.audioLevelObserver.closed
-    ) {
-      // Audio last-N (#1544): track this as a last-N-managed mic producer so the
-      // observed set matches exactly the producers driving the active-speaker set.
-      room.micProducerIds.add(producer.id);
-      try {
-        await room.audioLevelObserver.addProducer({ producerId: producer.id });
-      } catch (err) {
-        logger.warn('Failed to add producer to AudioLevelObserver', {
-          producerId: producer.id,
-          error: err,
-        });
-      }
-    }
+    await this.enforceAndTrackRegisteredProducer(room, participant, roomId, userId, producer, kind, source);
 
     // Clean up when producer closes
     producer.on('transportclose', () => {
@@ -1734,6 +1950,73 @@ export class RoomManager {
     const mimeSets = capableParts.map(extractVideoMimeTypes);
     const floor = intersectMimeSets(mimeSets);
     return Array.from(floor);
+  }
+
+  /**
+   * Replace a channel-room participant's permission snapshot with a freshly
+   * resolved server-authoritative bitfield (voice.enforce.permissions,
+   * CV-CAN-007 review P1). Returns false — and changes nothing — when the
+   * participant is absent (already left) or the room carries no server
+   * permission model (`permissions === undefined`, i.e. a DM room): the
+   * enforcement subject only ever targets server channels, and a DM room must
+   * never have a permission model bolted on mid-session.
+   */
+  updateParticipantPermissions(roomId: string, userId: string, permissions: bigint): boolean {
+    const participant = this.getParticipant(roomId, userId);
+    if (participant?.permissions === undefined) return false;
+    participant.permissions = permissions;
+    return true;
+  }
+
+  /**
+   * Close every producer the participant is no longer permitted to publish
+   * (post-snapshot-update audit for mid-session revocation). Reuses
+   * closeProducer, so each close emits `producer-removed` -> the Socket.IO
+   * bridge fans out `producer-closed` to the room, and mic bookkeeping /
+   * camera-gate recomputation run exactly as on a client-initiated close.
+   * Returns the closed sources (empty for DM rooms — no permission model).
+   */
+  async closeForbiddenProducers(roomId: string, userId: string): Promise<MediaSource[]> {
+    const participant = this.getParticipant(roomId, userId);
+    if (participant?.permissions === undefined) return [];
+    const permissions = participant.permissions;
+    // Snapshot IDs first: closeProducer mutates participant.producers.
+    const forbidden: string[] = [];
+    for (const [producerId, entry] of participant.producers) {
+      if (!publishPermitted(permissions, entry.kind, entry.source)) forbidden.push(producerId);
+    }
+    const closed: MediaSource[] = [];
+    for (const producerId of forbidden) {
+      const source = await this.closeProducer(roomId, userId, producerId);
+      if (source !== null) closed.push(source);
+    }
+
+    // Screen-audio is only valid alongside an active screen video producer
+    // (validateScreenAudioSource). The kind-keyed model can revoke Video (which
+    // forbids the `screen` producer) while Speak+ScreenShare still permit
+    // `screen-audio`, so the loop above closes the screen producer but leaves
+    // its paired screen-audio orphaned. When closing a screen producer for
+    // permission reasons drops the last screen producer, also close any
+    // remaining screen-audio to preserve that invariant (CV-CAN-007 review P2).
+    if (closed.includes('screen') && !this.hasProducerOfSource(participant, 'screen')) {
+      const orphanedScreenAudio = [...participant.producers.entries()]
+        .filter(([, entry]) => entry.source === 'screen-audio')
+        .map(([producerId]) => producerId);
+      for (const producerId of orphanedScreenAudio) {
+        const source = await this.closeProducer(roomId, userId, producerId);
+        if (source !== null) closed.push(source);
+      }
+    }
+
+    return closed;
+  }
+
+  /** True when the participant has at least one producer of the given source. */
+  private hasProducerOfSource(participant: Participant, source: MediaSource): boolean {
+    for (const entry of participant.producers.values()) {
+      if (entry.source === source) return true;
+    }
+    return false;
   }
 
   getParticipant(roomId: string, userId: string): Participant | undefined {

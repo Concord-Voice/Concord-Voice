@@ -55,6 +55,27 @@ type Handler struct {
 	audit       *rbac.AuditWriter
 	emailSvc    *email.Service
 	mfaVerifier mfa.Verifier
+	// voiceEnforcer pushes recomputed permissions to voice-connected members
+	// after an ownership change (CV-CAN-007 review P1) — the largest single
+	// permission delta in the system (the resolver short-circuits the owner to
+	// OwnerPermissions). Wired via SetVoiceEnforcer; nil means no push.
+	voiceEnforcer rbac.VoiceEnforcer
+}
+
+// SetVoiceEnforcer wires the mid-session voice permission push. Called once at
+// router construction, before the handler serves traffic.
+func (h *Handler) SetVoiceEnforcer(e rbac.VoiceEnforcer) {
+	h.voiceEnforcer = e
+}
+
+// recheckVoiceBothParties re-pushes permissions for the two sides of an
+// ownership change who may be sitting in a voice channel right now.
+func (h *Handler) recheckVoiceBothParties(serverID, fromUserID, toUserID string) {
+	if h.voiceEnforcer == nil {
+		return
+	}
+	h.voiceEnforcer.RecheckUser(serverID, fromUserID)
+	h.voiceEnforcer.RecheckUser(serverID, toUserID)
 }
 
 // HandlerDeps groups the dependencies required to construct a Handler.
@@ -417,6 +438,7 @@ func (h *Handler) ReverseTransfer(c *gin.Context) {
 	bgCtx := context.Background()
 	_ = h.cache.Invalidate(bgCtx, rec.serverID, rec.fromUserID)
 	_ = h.cache.Invalidate(bgCtx, rec.serverID, rec.toUserID)
+	h.recheckVoiceBothParties(rec.serverID, rec.fromUserID, rec.toUserID)
 
 	if serverUUID, err := uuid.Parse(rec.serverID); err == nil {
 		h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
@@ -666,6 +688,7 @@ func (h *Handler) executeTransfer(ctx context.Context, serverID, transferID, fro
 	bgCtx := context.Background()
 	_ = h.cache.Invalidate(bgCtx, serverID, fromUserID)
 	_ = h.cache.Invalidate(bgCtx, serverID, toUserID)
+	h.recheckVoiceBothParties(serverID, fromUserID, toUserID)
 
 	// Broadcast
 	if serverUUID, err := uuid.Parse(serverID); err == nil {

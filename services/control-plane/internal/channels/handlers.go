@@ -697,7 +697,7 @@ func (h *Handler) groupBelongsToServer(ctx context.Context, groupID *string, ser
 	// fault. Reject it as a bad binding (400 at the caller) instead of letting
 	// the Postgres uuid cast fail the query and surface as a 500.
 	if _, err := uuid.Parse(*groupID); err != nil {
-		return false, nil
+		return false, nil //nolint:nilerr // malformed group_id is a client input error (400 at caller), not a server fault
 	}
 	// Match server ownership inside Postgres so both ids are compared as
 	// canonical uuid values. Comparing the DB's canonical server_id against the
@@ -1453,6 +1453,10 @@ type pendingKeyRequest struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// GetPendingKeyRequests lists pending channel-key requests the caller may
+// service, filtered fail-closed to channels the caller can view and requesters
+// who still hold view permission (CV-CAN-005).
+// GET /api/v1/e2ee/pending-keys
 func (h *Handler) GetPendingKeyRequests(c *gin.Context) {
 	userID := c.GetString("user_id")
 

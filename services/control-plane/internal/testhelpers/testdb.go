@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -180,7 +181,29 @@ func closeTestDatabaseLockDB(t *testing.T, db *sql.DB) {
 }
 
 // TruncateAllTables removes all data from application tables.
+// TruncateAllTables resets the shared test database between tests. The single
+// multi-table TRUNCATE takes ACCESS EXCLUSIVE locks progressively, so it can
+// lose a lock-order deadlock (SQLSTATE 40P01) against a lingering background
+// worker from the previous test — e.g. the voice PermissionEnforcer's
+// fire-and-forget recheck goroutines (CV-CAN-007 P1), whose resolver SELECTs
+// span several of these tables. That interleaving is correct in production
+// (long-lived process) and transient here: the worker finishes within its own
+// bounded context, so a short retry always converges.
 func TruncateAllTables(db *sql.DB) error {
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if err = truncateAllTablesOnce(db); err == nil {
+			return nil
+		}
+		if !strings.Contains(err.Error(), "40P01") && !strings.Contains(err.Error(), "deadlock detected") {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	return err
+}
+
+func truncateAllTablesOnce(db *sql.DB) error {
 	_, err := db.Exec(`TRUNCATE
 		account_deletions,
 		age_verification_records,

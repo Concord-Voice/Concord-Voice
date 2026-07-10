@@ -846,6 +846,98 @@ describe('validateChannelAccess', () => {
 
     expect(result.roomOwnerTier).toBeUndefined();
   });
+
+  // ── Publish permission bitfield (CV-CAN-007) ───────────────────────────
+
+  const channelJoin = (permissions?: unknown) => ({
+    ok: true,
+    json: () =>
+      Promise.resolve({
+        allowed: true,
+        server_muted: false,
+        server_deafened: false,
+        channel: { id: 'ch-1', server_id: 'srv-1', name: 'v' },
+        ...(permissions === undefined ? {} : { permissions }),
+      }),
+  });
+
+  it('parses a decimal permissions string into a bigint bitfield', async () => {
+    mockFetch().mockResolvedValueOnce(channelJoin('131072')); // 1<<17 (Speak)
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.permissions).toBe(1n << 17n);
+  });
+
+  it('fail-closes permissions to 0n when the field is absent', async () => {
+    mockFetch().mockResolvedValueOnce(channelJoin(undefined));
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.permissions).toBe(0n);
+  });
+
+  // BigInt() is coercive: without a strict decimal-string guard these inputs
+  // would each parse to a real bitfield (or all-bits-set) and grant publish
+  // rights, contradicting the fail-closed contract.
+  it('fail-closes permissions to 0n on a hex string ("0x20000")', async () => {
+    mockFetch().mockResolvedValueOnce(channelJoin('0x20000')); // == 131072
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.permissions).toBe(0n);
+  });
+
+  it('fail-closes permissions to 0n on an array value (["131072"])', async () => {
+    mockFetch().mockResolvedValueOnce(channelJoin(['131072']));
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.permissions).toBe(0n);
+  });
+
+  it('fail-closes permissions to 0n on a numeric value (131072)', async () => {
+    mockFetch().mockResolvedValueOnce(channelJoin(131072));
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.permissions).toBe(0n);
+  });
+
+  it('fail-closes permissions to 0n on a negative string ("-1")', async () => {
+    mockFetch().mockResolvedValueOnce(channelJoin('-1'));
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.permissions).toBe(0n);
+  });
+
+  // The control-plane serializes an int64, so a value above 2^63-1 cannot be a
+  // valid rbac.Permission. Fail closed rather than honoring its low publish bits.
+  it('fail-closes permissions to 0n on an out-of-int64-range decimal ("18446744073709551615")', async () => {
+    mockFetch().mockResolvedValueOnce(channelJoin('18446744073709551615')); // 2^64-1
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.permissions).toBe(0n);
+  });
+
+  it('accepts the max non-negative int64 permissions value (boundary)', async () => {
+    const maxInt64 = ((1n << 63n) - 1n).toString(); // 9223372036854775807
+    mockFetch().mockResolvedValueOnce(channelJoin(maxInt64));
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.permissions).toBe((1n << 63n) - 1n);
+  });
+
+  it('accepts the Administrator bit (1<<62), within the int64 domain', async () => {
+    mockFetch().mockResolvedValueOnce(channelJoin((1n << 62n).toString()));
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token', 'channel');
+
+    expect(result.permissions).toBe(1n << 62n);
+  });
 });
 
 // ---------------------------------------------------------------------------

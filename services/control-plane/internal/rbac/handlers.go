@@ -56,6 +56,10 @@ type Handler struct {
 	resolver *Resolver
 	cache    *PermissionCache
 	audit    *AuditWriter
+	// voiceEnforcer pushes recomputed permissions to voice-connected members
+	// after a mutation (CV-CAN-007 review P1). Wired via SetVoiceEnforcer;
+	// nil (dev/test default) means no push — join-snapshot behavior.
+	voiceEnforcer VoiceEnforcer
 }
 
 // NewHandler creates a new RBAC handler
@@ -330,6 +334,7 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 	}
 
 	_ = h.cache.InvalidateServer(c.Request.Context(), serverID)
+	h.recheckVoiceServer(serverID)
 	h.revalidateServerSubscribers(serverID)
 	h.auditRoleUpdate(c, serverID, userID, roleID, req)
 	h.broadcastRoleUpdated(serverID, roleID, role)
@@ -565,6 +570,7 @@ func (h *Handler) DeleteRole(c *gin.Context) {
 
 	// Invalidate cache
 	_ = h.cache.InvalidateServer(c.Request.Context(), serverID)
+	h.recheckVoiceServer(serverID)
 	h.revalidateServerSubscribers(serverID)
 
 	// Audit log
@@ -807,6 +813,7 @@ func (h *Handler) AssignRole(c *gin.Context) {
 
 	// Invalidate cache
 	_ = h.cache.Invalidate(c.Request.Context(), serverID, targetUserID)
+	h.recheckVoiceUser(serverID, targetUserID)
 	h.revalidateServerSubscribers(serverID)
 
 	// Audit log
@@ -909,6 +916,7 @@ func (h *Handler) UnassignRole(c *gin.Context) {
 
 	// Invalidate cache
 	_ = h.cache.Invalidate(c.Request.Context(), serverID, targetUserID)
+	h.recheckVoiceUser(serverID, targetUserID)
 	h.revalidateServerSubscribers(serverID)
 
 	// Audit log
@@ -1163,6 +1171,7 @@ func (h *Handler) UpsertChannelOverride(c *gin.Context) {
 
 	// Invalidate cache for affected channel
 	_ = h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID)
+	h.recheckVoiceChannel(serverID, channelID)
 	h.revalidateChannelSubscribers(serverID, channelID)
 
 	// Audit log — xmax=0 means INSERT (new row), otherwise UPDATE (conflict)
@@ -1242,6 +1251,7 @@ func (h *Handler) DeleteChannelOverride(c *gin.Context) {
 
 	// Invalidate cache
 	_ = h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID)
+	h.recheckVoiceChannel(serverID, channelID)
 	h.revalidateChannelSubscribers(serverID, channelID)
 
 	// Audit log
@@ -1646,6 +1656,7 @@ func (h *Handler) SetChannelPermissionSync(c *gin.Context) {
 			return
 		}
 		_ = h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID)
+		h.recheckVoiceChannel(serverID, channelID)
 		h.revalidateChannelSubscribers(serverID, channelID)
 	}
 
@@ -1753,6 +1764,7 @@ func (h *Handler) invalidateSyncedChannelCaches(ctx context.Context, serverID, c
 		var chID string
 		if err := rows.Scan(&chID); err == nil {
 			_ = h.cache.InvalidateChannel(ctx, serverID, chID)
+			h.recheckVoiceChannel(serverID, chID)
 			h.revalidateChannelSubscribers(serverID, chID)
 		}
 	}

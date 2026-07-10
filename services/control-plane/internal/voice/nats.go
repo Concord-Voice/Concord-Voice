@@ -21,6 +21,17 @@ type NATSSubscriber struct {
 	hub       *websocket.Hub
 	nats      *natsclient.Client
 	tempGrant *tempGrantManager
+	// permEnforcer re-pushes fresh permissions when a join lands (CV-CAN-007
+	// review P1 join-race): a join-authorize resolved before a mutation whose
+	// recheck sweep ran before this voice_participants row existed would
+	// otherwise hold a stale snapshot no push covers. Optional (nil = no-op).
+	permEnforcer *PermissionEnforcer
+}
+
+// SetPermissionEnforcer wires the mid-session permission push into the
+// voice.joined bridge. Called once at router construction.
+func (s *NATSSubscriber) SetPermissionEnforcer(e *PermissionEnforcer) {
+	s.permEnforcer = e
 }
 
 // NewNATSSubscriber creates a new NATS subscriber for voice events. The resolver is
@@ -169,6 +180,13 @@ func (s *NATSSubscriber) handleJoined(data []byte) {
 		if err != nil {
 			s.log.Error("Failed to insert voice participant", "error", err, "channel_id", event.ChannelID, "user_id", event.UserID)
 			return
+		}
+
+		// Close the join-vs-mutation race: re-push freshly resolved permissions
+		// now that presence is recorded, so a mutation whose sweep ran before
+		// this row existed cannot leave a stale join-time snapshot.
+		if s.permEnforcer != nil {
+			s.permEnforcer.RecheckParticipant(event.ChannelID, event.UserID)
 		}
 
 		s.hub.BroadcastToServer(ctx.serverUUID, websocket.OutgoingMessage{

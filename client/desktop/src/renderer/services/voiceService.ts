@@ -67,6 +67,7 @@ import {
   type InsertableStreamsReceiver,
 } from './voiceE2eeTransforms';
 import { errorMessage } from '../utils/redactError';
+import { hasPermission, SPEAK } from '../utils/permissions';
 
 // Toggle for verbose E2EE/SDP diagnostics — set to true when debugging
 // frame drops, BUNDLE collisions, or key rotation issues. When false,
@@ -1893,7 +1894,13 @@ class VoiceService {
       // Pre-acquire mic stream in parallel with socket connection + room join.
       // getUserMedia can take 500ms+ (device enumeration, permission prompt).
       // Starting it now overlaps that latency with the network handshake below.
-      const micPromise = this.acquireMicStream();
+      // Skip it entirely for a listen-only join (Speak not granted): the
+      // media-plane produce() gate would reject the mic publish anyway, and
+      // starting getUserMedia would pop an unnecessary permission prompt and
+      // block the join behind slow device acquisition for a user who is not
+      // allowed to speak. establishMediaSession then takes its listen-only
+      // branch with a null mic promise (releasePreAcquiredMic(null) no-ops).
+      const micPromise = this.joinPermitsSpeak(joinData) ? this.acquireMicStream() : null;
 
       // Step 2: Connect Socket.IO to media plane
       // Fail fast when unauthenticated; the socket's auth callback below
@@ -2160,9 +2167,21 @@ class VoiceService {
     // Apply enforcement flags after participants are populated
     this.applyEnforcementToParticipant(store, joinData);
 
-    // Produce audio (using the pre-acquired mic stream when provided)
-    const preAcquiredStream = micStreamPromise ? await micStreamPromise : null;
-    await this.produceAudio(undefined, preAcquiredStream);
+    // Produce audio (using the pre-acquired mic stream when provided) — unless
+    // the server denies Speak. A listen-only member (ViewVoiceChannels|JoinVoice
+    // without Speak, e.g. a listen-only role or channel override) is admitted by
+    // AuthorizeJoin, but the media-plane produce() gate would reject the mic
+    // publish and handleJoinFailure would tear the whole session down. Skip
+    // auto-produce and join with mic off so the stock client can listen.
+    if (this.joinPermitsSpeak(joinData)) {
+      const preAcquiredStream = micStreamPromise ? await micStreamPromise : null;
+      await this.produceAudio(undefined, preAcquiredStream);
+    } else {
+      // Release any pre-acquired mic so no capture device stays open (no stray
+      // mic light), and reflect the mic-off state in the UI.
+      await this.releasePreAcquiredMic(micStreamPromise);
+      store.setMuted(true);
+    }
     this.setupLiveSubscriptions();
 
     // Consume existing producers
@@ -2354,6 +2373,39 @@ class VoiceService {
   }
 
   // ─── Audio Producer ────────────────────────────────────────────────
+
+  /**
+   * Whether the join response grants Speak (permission to publish a mic
+   * producer). Channel rooms carry a server-authoritative decimal bitfield; a
+   * listen-only member is admitted to the channel but must NOT auto-produce mic
+   * (the media-plane produce() gate would reject it). DM rooms have no server
+   * permission model (`permissions` undefined) so Speak is always allowed. A
+   * malformed bitfield fails closed to listen-only. Administrator bypasses
+   * (hasPermission short-circuits), mirroring the control-plane resolver.
+   */
+  private joinPermitsSpeak(joinData: JoinResponse): boolean {
+    if (joinData.permissions === undefined) return true;
+    let bits: bigint;
+    try {
+      bits = BigInt(joinData.permissions);
+    } catch {
+      return false;
+    }
+    return hasPermission(bits, SPEAK);
+  }
+
+  /**
+   * Stop any pre-acquired mic stream (from acquireMicStream's latency overlap)
+   * that a listen-only join will not produce, so the capture device is released
+   * and no mic indicator lingers. Safe when the promise is null or resolved null.
+   */
+  private async releasePreAcquiredMic(
+    micStreamPromise: Promise<MediaStream | null> | null
+  ): Promise<void> {
+    if (!micStreamPromise) return;
+    const stream = await micStreamPromise;
+    stream?.getTracks().forEach((track) => track.stop());
+  }
 
   /**
    * Pre-acquire the mic stream so getUserMedia latency overlaps with
@@ -3933,6 +3985,7 @@ class VoiceService {
     if (source === 'mic') this.cleanupMicState();
     else if (source === 'camera') this.cleanupCameraState();
     else if (source === 'screen') await this.cleanupScreenState();
+    else if (source === 'screen-audio') this.cleanupScreenAudioState();
   }
 
   private cleanupMicState(): void {
@@ -3956,6 +4009,29 @@ class VoiceService {
     const localUserId = useUserStore.getState().user?.id;
     if (localUserId) {
       store.updateParticipant(localUserId, { videoStream: undefined, isVideoOn: false });
+    }
+  }
+
+  /**
+   * Clean up local system-audio capture after a standalone `screen-audio` close
+   * (e.g. a permission push revokes Speak while ScreenShare — and thus the screen
+   * VIDEO track — is still allowed). The screen-audio producer is created with
+   * `stopTracks: false` and shares `localScreenStream` with the screen video, so
+   * closing the producer alone leaves the system-audio track live. Stop and
+   * detach ONLY the audio track(s), leaving the video track (and the stream
+   * itself) running so the still-permitted screen share continues. Contrast
+   * cleanupScreenState, which tears the whole stream down when `screen` closes.
+   */
+  private cleanupScreenAudioState(): void {
+    if (this.localScreenStream) {
+      for (const t of this.localScreenStream.getAudioTracks()) {
+        t.stop();
+        this.localScreenStream.removeTrack(t);
+      }
+    }
+    const localUserId = useUserStore.getState().user?.id;
+    if (localUserId) {
+      useVoiceStore.getState().updateParticipant(localUserId, { screenAudioStream: undefined });
     }
   }
 
@@ -4569,6 +4645,43 @@ class VoiceService {
       // Notify PiP proxy so open PiP windows can close their consumers
       this.onProducerClosed?.(producerId, userId);
     });
+
+    // permissions-changed (CV-CAN-007 P1): the control plane revoked this peer's
+    // mid-session voice permissions and the media plane already closed the listed
+    // producers server-side, so forwarding has stopped. But that server-side close
+    // does NOT stop THIS client's local capture — the producer-closed self-echo
+    // above only tears down consumers/store state — so the camera/mic hardware
+    // (and its indicator light) would keep running after the revocation. Close each
+    // revoked source through the normal local-cleanup path (closeProducer stops the
+    // underlying tracks and resets store state). Awaited sequentially so the paired
+    // screen / screen-audio cleanup cannot race. Idempotent: the server producer is
+    // already gone, so the redundant close-producer emit is a server-side no-op.
+    this.socket.on(
+      'permissions-changed',
+      async ({
+        closedSources,
+      }: {
+        channelId: string;
+        permissions: string;
+        closedSources: string[];
+      }) => {
+        if (!Array.isArray(closedSources)) return;
+        for (const source of closedSources) {
+          await this.closeProducer(source);
+        }
+        // closeProducer('mic') stops the local mic tracks/VAD via cleanupMicState
+        // but never touches mute state, and the producer-closed self-echo has no
+        // mic branch. Left alone the UI would still show the user as unmuted after
+        // the server revoked their mic, and toggleMute() would early-return because
+        // there is no mic producer to resume. Reflect the forced mic-off in the
+        // store and channel sidebar so local state matches the SFU.
+        if (closedSources.includes('mic')) {
+          const store = useVoiceStore.getState();
+          store.setMuted(true);
+          this.applyOptimisticMute(store, true);
+        }
+      }
+    );
 
     this.socket.on(
       'user-joined',
