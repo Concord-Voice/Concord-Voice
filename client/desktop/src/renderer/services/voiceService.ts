@@ -3410,7 +3410,7 @@ class VoiceService {
       store.tuneIn(producerId, consumerId);
 
       // Set as dominant if first tuned-in share
-      if (!store.dominantScreenShareId) {
+      if (!useVoiceStore.getState().dominantScreenShareId) {
         store.setDominantScreenShare(producerId);
       }
 

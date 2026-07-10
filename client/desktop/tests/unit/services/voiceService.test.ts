@@ -3953,6 +3953,38 @@ describe('tune-in hardening (#2088 review fixes)', () => {
     consume.mockRestore();
   });
 
+  it('keeps the first dominant screen when concurrent tune-ins finish later (#2155)', async () => {
+    const svc = voiceService as any;
+    vi.spyOn(svc, 'addDecryptKeyForUser').mockResolvedValue(undefined);
+    const releases = new Map<string, () => void>();
+    const consume = vi
+      .spyOn(svc, 'consumeProducer')
+      .mockImplementation(async (producerId: string) => {
+        await new Promise<void>((resolve) => {
+          releases.set(producerId, resolve);
+        });
+      });
+    consume.mockClear();
+
+    const first = voiceService.tuneInToScreenShare('p-first', 'u-first');
+    const second = voiceService.tuneInToScreenShare('p-second', 'u-second');
+
+    await vi.waitFor(() => {
+      expect(releases.has('p-first')).toBe(true);
+      expect(releases.has('p-second')).toBe(true);
+    });
+
+    releases.get('p-first')?.();
+    await first;
+    expect(useVoiceStore.getState().dominantScreenShareId).toBe('p-first');
+
+    releases.get('p-second')?.();
+    await second;
+
+    expect(useVoiceStore.getState().dominantScreenShareId).toBe('p-first');
+    consume.mockRestore();
+  });
+
   it('tuneInToScreenShare bails without recording state when the call is torn down mid-consume (#2088)', async () => {
     const svc = voiceService as any;
     vi.spyOn(svc, 'addDecryptKeyForUser').mockResolvedValue(undefined);
