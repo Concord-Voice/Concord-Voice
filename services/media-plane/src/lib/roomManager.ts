@@ -1045,7 +1045,7 @@ export class RoomManager {
     // arrives — so this bounds real-world / cooperative cost, it does not
     // hard-stop a deliberately misbehaving peer. Hard policing against a
     // non-cooperative client is FUTURE work (server-side getStats() sampling +
-    // the #1542 voice.enforce.disconnect path), explicitly out of #1300 scope.
+    // the #2153 voice.enforce.disconnect path), explicitly out of #1300 scope.
     const incomingBitrateCap =
       direction === 'send'
         ? participant.maxManualBitrateBps
@@ -2197,7 +2197,7 @@ export class RoomManager {
    * here — screen-audio is intentionally ungated, bounded only by the advisory
    * transport bitrate cap). This is a produce-time TRIPWIRE on declared intent,
    * not a hard policer. Hard enforcement against a non-cooperative client is
-   * FUTURE work (server-side getStats() sampling + the #1542
+   * FUTURE work (server-side getStats() sampling + the #2153
    * voice.enforce.disconnect path), explicitly out of #1300 scope. Mirrors the
    * honest "NOT a pixel/fps limit" framing on createTransport — and like there,
    * this gates AUDIO quality only, never video pixel/fps (client-enforced +
