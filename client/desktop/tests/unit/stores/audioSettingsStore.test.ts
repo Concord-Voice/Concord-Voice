@@ -23,6 +23,7 @@ beforeEach(() => {
     inputVolume: 100,
     outputVolume: 100,
     perParticipantVolume: {},
+    perScreenShareVolume: {},
     quietBoost: false,
     quietBoostThreshold: -40,
     networkType: 'auto',
@@ -156,6 +157,36 @@ describe('audioSettingsStore', () => {
       useAudioSettingsStore.getState().setParticipantVolume('user-1', 75);
       useAudioSettingsStore.getState().clearParticipantVolume('user-nonexistent');
       expect(useAudioSettingsStore.getState().perParticipantVolume).toEqual({ 'user-1': 75 });
+    });
+  });
+
+  describe('perScreenShareVolume (#2162)', () => {
+    it('sets and clamps screenshare volume independently of participant volume', () => {
+      const s = useAudioSettingsStore.getState();
+      s.setParticipantVolume('user-1', 50);
+      s.setScreenShareVolume('user-1', 175);
+      expect(useAudioSettingsStore.getState().perScreenShareVolume['user-1']).toBe(175);
+      expect(useAudioSettingsStore.getState().perParticipantVolume['user-1']).toBe(50);
+      s.setScreenShareVolume('user-1', 999);
+      expect(useAudioSettingsStore.getState().perScreenShareVolume['user-1']).toBe(200);
+      s.setScreenShareVolume('user-1', -10);
+      expect(useAudioSettingsStore.getState().perScreenShareVolume['user-1']).toBe(0);
+    });
+
+    it('clears one and all screenshare volumes', () => {
+      const s = useAudioSettingsStore.getState();
+      s.setScreenShareVolume('a', 120);
+      s.setScreenShareVolume('b', 80);
+      s.clearScreenShareVolume('a');
+      expect('a' in useAudioSettingsStore.getState().perScreenShareVolume).toBe(false);
+      s.clearAllScreenShareVolumes();
+      expect(useAudioSettingsStore.getState().perScreenShareVolume).toEqual({});
+    });
+
+    it('clearScreenShareVolume on a missing key is a no-op', () => {
+      useAudioSettingsStore.getState().setScreenShareVolume('user-1', 75);
+      useAudioSettingsStore.getState().clearScreenShareVolume('user-nonexistent');
+      expect(useAudioSettingsStore.getState().perScreenShareVolume).toEqual({ 'user-1': 75 });
     });
   });
 });

@@ -1,5 +1,5 @@
 /** A reason a remote consumer may be paused. Each maps to a scope below. */
-export type PauseReason = 'visibility' | 'ignis' | 'manual';
+export type PauseReason = 'visibility' | 'ignis' | 'manual' | 'stream-mute';
 
 /**
  * Reason scope:
@@ -12,6 +12,7 @@ export type PauseReason = 'visibility' | 'ignis' | 'manual';
 const REASON_SCOPE: Record<PauseReason, 'both' | 'local'> = {
   visibility: 'both',
   manual: 'both',
+  'stream-mute': 'both',
   ignis: 'local',
 };
 

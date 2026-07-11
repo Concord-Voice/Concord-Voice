@@ -951,4 +951,17 @@ describe('resetScreenShareConsumption (#2088)', () => {
     expect(after.maxVideoSlots).toBe(50);
     expect(after.videoSlotError).toBeNull();
   });
+
+  describe('screenShareMuted intent (#2162)', () => {
+    it('toggles per-sharer mute and clears on reset', () => {
+      const s = useVoiceStore.getState();
+      s.setScreenShareMuted('sharer-1', true);
+      expect(useVoiceStore.getState().screenShareMuted['sharer-1']).toBe(true);
+      s.setScreenShareMuted('sharer-1', false);
+      expect(useVoiceStore.getState().screenShareMuted['sharer-1']).toBe(false);
+      s.setScreenShareMuted('sharer-2', true);
+      useVoiceStore.getState().reset();
+      expect(useVoiceStore.getState().screenShareMuted).toEqual({});
+    });
+  });
 });

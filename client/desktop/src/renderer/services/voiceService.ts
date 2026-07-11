@@ -3241,6 +3241,9 @@ class VoiceService {
         if (newDeafened) {
           consumer.pause();
         } else if (!this.shouldKeepConsumerSuspendedForTest(consumerId)) {
+          // #2162: don't locally resume a screenshare consumer the viewer has muted;
+          // the coordinator owns its paused state (server forwarding is already stopped).
+          if (this.pauseCoordinator.hasReason(consumerId, 'stream-mute')) continue;
           this.resumeServerIfHeldForAudioOutput(consumerId);
           consumer.resume();
         }
@@ -3599,6 +3602,92 @@ class VoiceService {
   /** Release an explicit external pause; the consumer resumes unless another reason holds. */
   resumeConsumer(consumerId: string): void {
     this.pauseCoordinator.removeReason(consumerId, 'manual');
+  }
+
+  // ─── Per-stream screenshare audio mute (#2162) ─────────────────────
+
+  /**
+   * Resolve the live `screen-audio` consumer for a sharer via consumerMeta.
+   * Returns undefined when the sharer has no active screen audio (intent still holds).
+   */
+  private screenAudioConsumerIdFor(sharerUserId: string): string | undefined {
+    for (const [cid, meta] of this.consumerMeta) {
+      if (meta.source === 'screen-audio' && meta.producerUserId === sharerUserId) return cid;
+    }
+    return undefined;
+  }
+
+  /** Mute a sharer's screenshare audio: pause the server-side screen-audio consumer. */
+  muteScreenShare(sharerUserId: string): void {
+    useVoiceStore.getState().setScreenShareMuted(sharerUserId, true);
+    const consumerId = this.screenAudioConsumerIdFor(sharerUserId);
+    if (consumerId) this.pauseCoordinator.addReason(consumerId, 'stream-mute');
+  }
+
+  /** True when local audio output is silenced by self- or server-deafen. */
+  private isLocalAudioOutputDeafened(): boolean {
+    const store = useVoiceStore.getState();
+    if (store.isDeafened) return true;
+    const localUserId = useUserStore.getState().user?.id;
+    return !!localUserId && store.participants[localUserId]?.serverDeafened === true;
+  }
+
+  /** Unmute a sharer's screenshare audio: resume server forwarding + local decode. */
+  unmuteScreenShare(sharerUserId: string): void {
+    useVoiceStore.getState().setScreenShareMuted(sharerUserId, false);
+    const consumerId = this.screenAudioConsumerIdFor(sharerUserId);
+    if (!consumerId) return;
+    this.pauseCoordinator.removeReason(consumerId, 'stream-mute');
+    // Deafen is authoritative over per-stream unmute. Removing the last
+    // 'stream-mute' reason above makes the coordinator resume local decode, but
+    // if the local user is (self- or server-) deafened the stream must stay
+    // silent until they undeafen — so re-assert the deafen pause on local
+    // decode. Mirrors toggleDeafen's 'stream-mute' skip (the symmetric
+    // ordering); once the mute reason is gone, toggleDeafen's undeafen loop
+    // resumes this consumer normally (#2162).
+    if (this.isLocalAudioOutputDeafened()) {
+      this.consumers.get(consumerId)?.pause();
+    }
+  }
+
+  /**
+   * True when a freshly-created consumer already carries a persisted screenshare
+   * mute intent, so it must stay server-paused rather than be resumed then
+   * re-paused. Callers use this to skip the unconditional consume-time resume and
+   * avoid a resume→pause audio/bandwidth blip on reconnect / stream restart (#2162).
+   */
+  private startsPausedByScreenMute(source: string, producerUserId: string): boolean {
+    return (
+      source === 'screen-audio' &&
+      useVoiceStore.getState().screenShareMuted[producerUserId] === true
+    );
+  }
+
+  /**
+   * On a newly-created `screen-audio` consumer, re-apply the viewer's persisted mute
+   * intent (survives reconnect / stream restart, which mint a fresh consumerId).
+   */
+  private applyInitialScreenMuteReason(consumerId: string, sharerUserId: string): void {
+    if (useVoiceStore.getState().screenShareMuted[sharerUserId]) {
+      this.pauseCoordinator.addReason(consumerId, 'stream-mute');
+    }
+  }
+
+  /**
+   * Re-apply per-source initial pause intent to a freshly-created consumer,
+   * dispatched by media source. Called AFTER the consume-time resume so it is
+   * not clobbered (#1541 visibility for camera, #2162 mute for screen-audio).
+   */
+  private applyInitialConsumerPauseReasons(
+    consumerId: string,
+    source: string,
+    producerUserId: string
+  ): void {
+    if (source === 'camera') {
+      this.applyInitialVisibilityReason(consumerId, producerUserId);
+    } else if (source === 'screen-audio') {
+      this.applyInitialScreenMuteReason(consumerId, producerUserId);
+    }
   }
 
   // ─── Visibility-pause (#1541) ──────────────────────────────────────
@@ -4478,6 +4567,17 @@ class VoiceService {
         console.debug('[consume] consumer held during test suspension', {
           consumerId: consumer.id,
         });
+      } else if (this.startsPausedByScreenMute(result.source, result.producerUserId)) {
+        // A screen-audio consumer the viewer has already muted is created paused
+        // on the server. Unconditionally resuming it here only to re-pause it in
+        // applyInitialConsumerPauseReasons() below would open a resume→pause
+        // window where the SFU forwards audio for a stream the viewer explicitly
+        // muted — wasted bandwidth plus a brief audible blip on reconnect / stream
+        // restart. Detect that persisted mute intent up front and skip the resume,
+        // leaving the consumer server-paused for the coordinator to own (#2162).
+        console.debug('[consume] consumer left server-paused (persisted screenshare mute)', {
+          consumerId: consumer.id,
+        });
       } else {
         // Resume the consumer (was created paused on server)
         await this.emitAsync('resume-consumer', { consumerId: consumer.id });
@@ -4488,9 +4588,11 @@ class VoiceService {
       // initially-hidden tile's pause-consumer must run after the unconditional
       // resume that starts the server-paused consumer — otherwise the resume
       // clobbers the pause and the off-screen tile keeps forwarding (Gitar review).
-      if (result.source === 'camera') {
-        this.applyInitialVisibilityReason(consumer.id, result.producerUserId);
-      }
+      // #1541 + #2162: re-apply per-source initial pause intent AFTER the
+      // unconditional resume above (else the resume clobbers an initially-hidden
+      // camera tile or a muted screenshare). Dispatched by source in a helper to
+      // keep consume()'s cognitive complexity within budget.
+      this.applyInitialConsumerPauseReasons(consumer.id, result.source, result.producerUserId);
     } catch (err) {
       console.error('[consume] Failed to consume producer:', producerId, errorMessage(err));
     }

@@ -126,4 +126,28 @@ describe('ConsumerPauseCoordinator', () => {
     expect(effects.resumeServerForwarding).not.toHaveBeenCalled();
     expect(coord.hasReason('c1', 'visibility')).toBe(true); // still held
   });
+
+  // #2162 — per-stream screenshare audio mute.
+  it('stream-mute (both-scope) pauses server forwarding AND local decode', () => {
+    coord.addReason('c1', 'stream-mute');
+    expect(effects.pauseServerForwarding).toHaveBeenCalledWith('c1');
+    expect(effects.pauseLocalDecode).toHaveBeenCalledWith('c1');
+  });
+
+  it('removing stream-mute resumes both server forwarding and local decode', () => {
+    coord.addReason('c1', 'stream-mute');
+    coord.removeReason('c1', 'stream-mute');
+    expect(effects.resumeServerForwarding).toHaveBeenCalledWith('c1');
+    expect(effects.resumeLocalDecode).toHaveBeenCalledWith('c1');
+  });
+
+  it('server stays paused while either stream-mute or visibility holds', () => {
+    coord.addReason('c1', 'stream-mute');
+    coord.addReason('c1', 'visibility');
+    effects.resumeServerForwarding.mockClear();
+    coord.removeReason('c1', 'stream-mute'); // visibility still holds
+    expect(effects.resumeServerForwarding).not.toHaveBeenCalled();
+    coord.removeReason('c1', 'visibility');
+    expect(effects.resumeServerForwarding).toHaveBeenCalledWith('c1');
+  });
 });

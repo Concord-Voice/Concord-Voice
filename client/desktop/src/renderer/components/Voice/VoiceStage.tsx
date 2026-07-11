@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useCallback } from 'react';
 import { ChevronLeft, ChevronRight, PictureInPicture2, LayoutGrid, Focus } from 'lucide-react';
 import { useVoiceStore } from '../../stores/voiceStore';
+import { ScreenShareAudioControls } from './ScreenShareAudioControls';
 import './VoiceStage.css';
 
 /**
@@ -12,7 +13,14 @@ const StageVideo: React.FC<{
   showOverlay?: boolean;
   label?: string;
   isPaused?: boolean;
-}> = ({ stream, sharerName, showOverlay = true, label, isPaused = false }) => {
+  /**
+   * Sharer userId whose per-stream audio controls (volume + mute) should render
+   * in this cell's overlay. Set for a remote sharer with live screen audio so
+   * every equal-weight tile is independently controllable, not just the dominant
+   * one (#2162). Undefined = no control (local share, or no screen audio).
+   */
+  audioControlUserId?: string;
+}> = ({ stream, sharerName, showOverlay = true, label, isPaused = false, audioControlUserId }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
@@ -48,6 +56,7 @@ const StageVideo: React.FC<{
       {showOverlay && (
         <div className="voice-stage__cell-overlay">
           <span className="voice-stage__sharer-name">{label || `${sharerName}\u2019s screen`}</span>
+          {audioControlUserId && <ScreenShareAudioControls sharerUserId={audioControlUserId} />}
         </div>
       )}
     </div>
@@ -84,6 +93,8 @@ const VoiceStage: React.FC = () => {
         name: meta?.displayName || meta?.username || 'Unknown',
         stream: participant?.screenStream,
         isLocal: meta?.isLocal ?? false,
+        userId: meta?.userId,
+        hasScreenAudio: !!participant?.screenAudioStream,
       };
     },
     [activeScreenShares, participants]
@@ -141,13 +152,14 @@ const VoiceStage: React.FC = () => {
 
         <div className="voice-stage__grid" data-count={tunedInIds.length}>
           {tunedInIds.map((producerId) => {
-            const { name, stream, isLocal } = resolveShare(producerId);
+            const { name, stream, isLocal, userId, hasScreenAudio } = resolveShare(producerId);
             return (
               <StageVideo
                 key={producerId}
                 stream={isLocal && localStreamPaused ? undefined : stream}
                 sharerName={name}
                 isPaused={isLocal && localStreamPaused}
+                audioControlUserId={!isLocal && hasScreenAudio && userId ? userId : undefined}
               />
             );
           })}
@@ -174,6 +186,9 @@ const VoiceStage: React.FC = () => {
           <span className="voice-stage__count">
             {tunedInIds.indexOf(dominantScreenShareId ?? '') + 1} / {tunedInIds.length}
           </span>
+        )}
+        {!isDominantLocal && dominant?.userId && dominant.hasScreenAudio && (
+          <ScreenShareAudioControls sharerUserId={dominant.userId} />
         )}
       </div>
 

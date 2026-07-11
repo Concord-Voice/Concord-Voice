@@ -3292,6 +3292,36 @@ describe('resumeConsumer last-N guard (#1544)', () => {
     expect(consumer.resume).not.toHaveBeenCalled(); // guard held
   });
 
+  // #2162 — a per-stream screenshare unmute emits resume-consumer; it must not
+  // let a moderator-deafened viewer re-forward audio (moderation-bypass).
+  describe('moderation (serverDeafened) guard (#2162)', () => {
+    it('refuses to resume an AUDIO consumer for a server-deafened participant', async () => {
+      const { rm, room, userId, consumer } = await setupRoomWithAudioConsumer();
+      room.lastNPausedConsumers.delete('c-audio'); // isolate: only the deafen guard can refuse
+      room.participants.get(userId)!.serverDeafened = true;
+      consumer.resume.mockClear();
+      await rm.resumeConsumer(room.id, userId, 'c-audio');
+      expect(consumer.resume).not.toHaveBeenCalled();
+    });
+
+    it('still resumes a VIDEO consumer for a server-deafened participant', async () => {
+      const { rm, room, userId } = await setupRoomWithAudioConsumer();
+      const video = createMockConsumer({ id: 'c-video', kind: 'video' });
+      room.participants.get(userId)!.consumers.set('c-video', video as any);
+      room.participants.get(userId)!.serverDeafened = true;
+      await rm.resumeConsumer(room.id, userId, 'c-video');
+      expect(video.resume).toHaveBeenCalled();
+    });
+
+    it('resumes an audio consumer normally when NOT server-deafened', async () => {
+      const { rm, room, userId, consumer } = await setupRoomWithAudioConsumer();
+      room.lastNPausedConsumers.delete('c-audio');
+      consumer.resume.mockClear();
+      await rm.resumeConsumer(room.id, userId, 'c-audio');
+      expect(consumer.resume).toHaveBeenCalled();
+    });
+  });
+
   it('honors resume for a consumer whose speaker IS in the top-N (not in the last-N set)', async () => {
     const { rm, room, userId, consumer } = await setupRoomWithAudioConsumer();
     // Consume-time init starts a non-top-N mic consumer last-N-paused. Admit the

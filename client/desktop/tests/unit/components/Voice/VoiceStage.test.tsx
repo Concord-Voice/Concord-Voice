@@ -296,4 +296,140 @@ describe('VoiceStage', () => {
     expect(screen.getByText(/Alice’s screen/)).toBeInTheDocument();
     expect(screen.getByText(/Bob’s screen/)).toBeInTheDocument();
   });
+
+  // ── #2162 per-stream screenshare audio controls ──────────────────────────
+  it('renders screenshare audio controls for a remote dominant share with screen audio', () => {
+    setStageState({
+      stageLayout: 'focus',
+      dominantScreenShareId: 'producer-1',
+      tunedInScreenShares: { 'producer-1': 'consumer-1' },
+      participants: {
+        'user-1': mockParticipant({
+          screenAudioStream: new MockMediaStream() as unknown as MediaStream,
+        }),
+      },
+    });
+    useVoiceStore.getState().registerActiveScreenShare({
+      producerId: 'producer-1',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: false,
+    });
+    render(<VoiceStage />);
+    expect(screen.getByLabelText('Screen share volume')).toBeInTheDocument();
+  });
+
+  it('does NOT render controls when the dominant share has no screen audio', () => {
+    setStageState({
+      stageLayout: 'focus',
+      dominantScreenShareId: 'producer-1',
+      tunedInScreenShares: { 'producer-1': 'consumer-1' },
+      participants: { 'user-1': mockParticipant() }, // no screenAudioStream
+    });
+    useVoiceStore.getState().registerActiveScreenShare({
+      producerId: 'producer-1',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: false,
+    });
+    render(<VoiceStage />);
+    expect(screen.queryByLabelText('Screen share volume')).not.toBeInTheDocument();
+  });
+
+  it('does NOT render controls for the local user’s own share', () => {
+    setStageState({
+      stageLayout: 'focus',
+      dominantScreenShareId: 'producer-1',
+      tunedInScreenShares: { 'producer-1': 'consumer-1' },
+      participants: {
+        'user-1': mockParticipant({
+          screenAudioStream: new MockMediaStream() as unknown as MediaStream,
+        }),
+      },
+    });
+    useVoiceStore.getState().registerActiveScreenShare({
+      producerId: 'producer-1',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: true, // local share → no remote-audio control
+    });
+    render(<VoiceStage />);
+    expect(screen.queryByLabelText('Screen share volume')).not.toBeInTheDocument();
+  });
+
+  // Equal mode treats every tuned-in stream as a peer and plays all their audio,
+  // so each remote share with screen audio must be independently controllable —
+  // not just the focus-mode dominant one (#2162).
+  it('renders a control on every equal-mode cell whose remote share has screen audio', () => {
+    setStageState({
+      stageLayout: 'equal',
+      tunedInScreenShares: { pa: 'ca', pb: 'cb' },
+      participants: {
+        'user-1': mockParticipant({
+          screenAudioStream: new MockMediaStream() as unknown as MediaStream,
+        }),
+        'user-2': mockParticipant({
+          userId: 'user-2',
+          username: 'bob',
+          displayName: 'Bob',
+          screenAudioStream: new MockMediaStream() as unknown as MediaStream,
+        }),
+      },
+    });
+    const store = useVoiceStore.getState();
+    store.registerActiveScreenShare({
+      producerId: 'pa',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: false,
+    });
+    store.registerActiveScreenShare({
+      producerId: 'pb',
+      userId: 'user-2',
+      username: 'bob',
+      displayName: 'Bob',
+      isLocal: false,
+    });
+    render(<VoiceStage />);
+    expect(screen.getAllByLabelText('Screen share volume')).toHaveLength(2);
+  });
+
+  it('equal mode omits the control for a local share and a share without screen audio', () => {
+    setStageState({
+      stageLayout: 'equal',
+      tunedInScreenShares: { pa: 'ca', pb: 'cb' },
+      participants: {
+        // Remote, but no screen audio → no control.
+        'user-1': mockParticipant(),
+        // Local share → no remote-audio control.
+        'user-2': mockParticipant({
+          userId: 'user-2',
+          username: 'bob',
+          displayName: 'Bob',
+          screenAudioStream: new MockMediaStream() as unknown as MediaStream,
+        }),
+      },
+    });
+    const store = useVoiceStore.getState();
+    store.registerActiveScreenShare({
+      producerId: 'pa',
+      userId: 'user-1',
+      username: 'alice',
+      displayName: 'Alice',
+      isLocal: false,
+    });
+    store.registerActiveScreenShare({
+      producerId: 'pb',
+      userId: 'user-2',
+      username: 'bob',
+      displayName: 'Bob',
+      isLocal: true,
+    });
+    render(<VoiceStage />);
+    expect(screen.queryByLabelText('Screen share volume')).not.toBeInTheDocument();
+  });
 });

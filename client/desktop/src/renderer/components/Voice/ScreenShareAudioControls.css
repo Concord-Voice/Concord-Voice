@@ -1,0 +1,53 @@
+.screenshare-audio-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: var(--surface-overlay, rgba(0, 0, 0, 0.55));
+  color: var(--text-on-overlay, #fff);
+  /* The parent .voice-stage__overlay is pointer-events: none (its text labels
+     must not intercept stage clicks); opt this interactive subtree back in so
+     the mute button and slider are actually clickable/draggable. */
+  pointer-events: auto;
+}
+
+.screenshare-audio-controls__mute {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.screenshare-audio-controls__mute:hover:not(:disabled) {
+  background: var(--surface-overlay-hover, rgba(255, 255, 255, 0.12));
+}
+
+.screenshare-audio-controls__mute:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.screenshare-audio-controls__mute[aria-pressed='true'] {
+  color: var(--danger, #f04747);
+}
+
+.screenshare-audio-controls__slider {
+  width: 96px;
+}
+
+.screenshare-audio-controls__slider:disabled {
+  opacity: 0.5;
+}
+
+.screenshare-audio-controls__value {
+  min-width: 44px;
+  font-size: 12px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}

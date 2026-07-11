@@ -526,6 +526,10 @@ interface VoiceState {
   setActiveCameraCodec: (codec: string | null) => void;
   setActiveScreenCodec: (codec: string | null) => void;
 
+  /** Per-sharer screenshare-audio mute intent (userId → muted). Session-scoped (#2162). */
+  screenShareMuted: Record<string, boolean>;
+  setScreenShareMuted: (userId: string, muted: boolean) => void;
+
   // Full reset (on disconnect)
   reset: () => void;
 }
@@ -544,6 +548,7 @@ const initialState = {
   isScreenSharing: false,
   localIsTesting: false,
   participants: {} as Record<string, VoiceParticipant>,
+  screenShareMuted: {} as Record<string, boolean>,
   activeSpeakerId: null as string | null,
   audioInputDeviceId: persisted.audioInputDeviceId ?? null,
   audioOutputDeviceId: persisted.audioOutputDeviceId ?? null,
@@ -780,6 +785,11 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
       participants: Object.fromEntries(participants.map((p) => [p.userId, p])),
     }),
   clearParticipants: () => set({ participants: {} }),
+
+  setScreenShareMuted: (userId, muted) =>
+    set((state) => ({
+      screenShareMuted: { ...state.screenShareMuted, [userId]: muted },
+    })),
 
   // Channel voice members (sidebar)
   setChannelVoiceMembers: (channelId, members) =>

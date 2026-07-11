@@ -44,6 +44,13 @@ export interface AudioSettings {
    * to 100 (treated as unity — no adjustment relative to master).
    */
   perParticipantVolume: Record<string, number>;
+  /**
+   * Per-screenshare audio volume overrides, keyed by the SHARER's userId (percent,
+   * 0–200). Independent of `perParticipantVolume` (which governs that user's voice/mic
+   * audio) so a viewer can tune a screenshare's audio without touching the sharer's
+   * voice level. Multiplied with master `outputVolume` at playback time.
+   */
+  perScreenShareVolume: Record<string, number>;
 
   // Quiet boost (receiver-side upward compressor)
   quietBoost: boolean; // Dynamically amplify quiet participants
@@ -75,6 +82,9 @@ interface AudioSettingsState extends AudioSettings {
   setParticipantVolume: (userId: string, volume: number) => void;
   clearParticipantVolume: (userId: string) => void;
   clearAllParticipantVolumes: () => void;
+  setScreenShareVolume: (userId: string, volume: number) => void;
+  clearScreenShareVolume: (userId: string) => void;
+  clearAllScreenShareVolumes: () => void;
   setQuietBoost: (enabled: boolean) => void;
   setQuietBoostThreshold: (threshold: number) => void;
   setNetworkType: (type: 'auto' | 'wifi' | 'wired') => void;
@@ -100,6 +110,7 @@ const defaults: AudioSettings = {
   inputVolume: 100,
   outputVolume: 100,
   perParticipantVolume: {},
+  perScreenShareVolume: {},
   quietBoost: false,
   quietBoostThreshold: -35,
   networkType: 'auto',
@@ -151,6 +162,23 @@ export const useAudioSettingsStore = wrapStore(
         // resets (#1603) so a prior account's contact IDs never persist for the
         // next account on this device (#1233 cross-account discipline).
         clearAllParticipantVolumes: () => set({ perParticipantVolume: {} }),
+        setScreenShareVolume: (userId, volume) =>
+          set((state) => ({
+            perScreenShareVolume: {
+              ...state.perScreenShareVolume,
+              [userId]: Math.max(0, Math.min(200, volume)),
+            },
+          })),
+        clearScreenShareVolume: (userId) =>
+          set((state) => {
+            if (!(userId in state.perScreenShareVolume)) return state;
+            const next = { ...state.perScreenShareVolume };
+            delete next[userId];
+            return { perScreenShareVolume: next };
+          }),
+        // Keyed by other users' IDs — cleared on logout-class resets (#1603) like
+        // perParticipantVolume so a prior account's contact IDs never persist (#1233).
+        clearAllScreenShareVolumes: () => set({ perScreenShareVolume: {} }),
         setQuietBoost: (quietBoost) => set({ quietBoost }),
         setQuietBoostThreshold: (quietBoostThreshold) =>
           set({ quietBoostThreshold: Math.max(-50, Math.min(-20, quietBoostThreshold)) }),

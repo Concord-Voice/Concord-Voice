@@ -1648,6 +1648,20 @@ export class RoomManager {
       });
       return;
     }
+
+    // Moderation boundary (#2162): a server-deafened participant must not re-forward
+    // audio. serverDeafenUser pauses all audio consumers; without this guard a client
+    // resume-consumer (e.g. a per-stream screenshare unmute) would bypass it. Audio-only
+    // — a deafened viewer may still resume VIDEO consumers (deafen silences incoming
+    // audio, it does not blind them). Mirrors the lastNPausedConsumers guard shape.
+    if (consumer.kind === 'audio' && participant.serverDeafened) {
+      logger.debug('Refusing client resume of audio consumer for server-deafened participant', {
+        consumerId,
+        roomId,
+        userId,
+      });
+      return;
+    }
     await consumer.resume();
     logger.debug('Consumer resumed', { consumerId, roomId, userId });
   }

@@ -82,7 +82,8 @@ export const AudioOutput: React.FC<{
   stream: MediaStream;
   outputDeviceId?: string;
   userId?: string;
-}> = ({ stream, outputDeviceId, userId }) => {
+  volumeKind?: 'voice' | 'screen';
+}> = ({ stream, outputDeviceId, userId, volumeKind = 'voice' }) => {
   const ctxRef = useRef<AudioContext | null>(null);
   const volumeGainRef = useRef<GainNode | null>(null);
   const boostGainRef = useRef<GainNode | null>(null);
@@ -103,9 +104,11 @@ export const AudioOutput: React.FC<{
   const outputVolume = useAudioSettingsStore((s) => s.outputVolume);
   const quietBoost = useAudioSettingsStore((s) => s.quietBoost);
   const quietBoostThreshold = useAudioSettingsStore((s) => s.quietBoostThreshold);
-  const participantVolume = useAudioSettingsStore((s) =>
-    userId ? (s.perParticipantVolume[userId] ?? 100) : 100
-  );
+  const participantVolume = useAudioSettingsStore((s) => {
+    if (!userId) return 100;
+    const map = volumeKind === 'screen' ? s.perScreenShareVolume : s.perParticipantVolume;
+    return map[userId] ?? 100;
+  });
 
   const retargetOutputDevice = useCallback((selectedOutputDeviceId?: string) => {
     const ctx = ctxRef.current;
@@ -211,7 +214,9 @@ export const AudioOutput: React.FC<{
     {
       const state = useAudioSettingsStore.getState();
       const master = state.outputVolume / 100;
-      const perParticipant = userId ? (state.perParticipantVolume[userId] ?? 100) / 100 : 1;
+      const volumeMap =
+        volumeKind === 'screen' ? state.perScreenShareVolume : state.perParticipantVolume;
+      const perParticipant = userId ? (volumeMap[userId] ?? 100) / 100 : 1;
       volumeGain.gain.value = master * perParticipant;
     }
 
@@ -259,7 +264,7 @@ export const AudioOutput: React.FC<{
     };
     // `userId` is stable for a given AudioOutput instance (the parent keys by
     // userId), but ESLint needs it listed since we read it during setup.
-  }, [stream, userId, retargetOutputDevice]);
+  }, [stream, userId, volumeKind, retargetOutputDevice]);
 
   // Retarget the active output device without rebuilding the audio graph.
   useEffect(() => {
@@ -380,6 +385,7 @@ export const AudioOutputs: React.FC = () => {
             stream={p.screenAudioStream}
             outputDeviceId={audioOutputDeviceId || undefined}
             userId={p.userId}
+            volumeKind="screen"
           />,
         ];
       })}

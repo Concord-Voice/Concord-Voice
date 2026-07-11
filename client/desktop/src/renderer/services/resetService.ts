@@ -134,6 +134,7 @@ export function nuclearReset(): void {
   // stores: per-participant volume overrides are keyed by other users' IDs
   // (#1233 cross-account discipline).
   useAudioSettingsStore.getState().clearAllParticipantVolumes();
+  useAudioSettingsStore.getState().clearAllScreenShareVolumes();
 
   // Clear main process tokens (disk files + in-memory)
   globalThis.electron?.clearTokens?.();
