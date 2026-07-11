@@ -12,6 +12,7 @@ const PREMIUM_ENTITLEMENT: Entitlement = {
   allowMusicMode: true,
   streamMaxHeight: -1,
   streamMaxFps: -1,
+  streamMaxPixelRate: -1,
   streamMaxBitrate: 20_000_000,
   cameraMaxHeight: -1,
   cameraMaxFps: -1,
@@ -27,6 +28,8 @@ const OVER_CAP_SETTINGS: ClampableSettings = {
   screenShareBitrate: 16_000_000,
   cameraBitrate: 5_000_000,
   musicMode: true,
+  screenResolution: '4K',
+  screenFrameRate: 60,
 };
 
 /** A settings snapshot already at/below the free floor. */
@@ -37,6 +40,8 @@ const FREE_SETTINGS: ClampableSettings = {
   screenShareBitrate: 0,
   cameraBitrate: 0,
   musicMode: false,
+  screenResolution: '1080p',
+  screenFrameRate: 30,
 };
 
 describe('clampToFreeTier — free user clamps', () => {
@@ -154,5 +159,104 @@ describe('clampToFreeTier — idempotence & premium passthrough', () => {
       FREE_ENTITLEMENT
     );
     expect(changed).toBe(false);
+  });
+});
+
+describe('clampToFreeTier — #2163 screenshare res/fps tiered clamp', () => {
+  it('admits 1080p30 unchanged', () => {
+    const { settings, changed } = clampToFreeTier(
+      { ...FREE_SETTINGS, screenResolution: '1080p', screenFrameRate: 30 },
+      FREE_ENTITLEMENT
+    );
+    expect(changed).toBe(false);
+    expect(settings.screenResolution).toBe('1080p');
+    expect(settings.screenFrameRate).toBe(30);
+  });
+
+  it('admits 720p60 unchanged (60fps reserved for 720p and below)', () => {
+    const { changed } = clampToFreeTier(
+      { ...FREE_SETTINGS, screenResolution: '720p', screenFrameRate: 60 },
+      FREE_ENTITLEMENT
+    );
+    expect(changed).toBe(false);
+  });
+
+  it('clamps 1080p60 fps to 30 (resolution stays 1080p)', () => {
+    const { settings, changed } = clampToFreeTier(
+      { ...FREE_SETTINGS, screenResolution: '1080p', screenFrameRate: 60 },
+      FREE_ENTITLEMENT
+    );
+    expect(changed).toBe(true);
+    expect(settings.screenResolution).toBe('1080p');
+    expect(settings.screenFrameRate).toBe(30);
+  });
+
+  it('clamps 1440p60 to 1080p and fps to 30', () => {
+    const { settings, changed } = clampToFreeTier(
+      { ...FREE_SETTINGS, screenResolution: '1440p', screenFrameRate: 60 },
+      FREE_ENTITLEMENT
+    );
+    expect(changed).toBe(true);
+    expect(settings.screenResolution).toBe('1080p');
+    expect(settings.screenFrameRate).toBe(30);
+  });
+
+  it('clamps 4K resolution to 1080p', () => {
+    const { settings, changed } = clampToFreeTier(
+      { ...FREE_SETTINGS, screenResolution: '4K', screenFrameRate: 30 },
+      FREE_ENTITLEMENT
+    );
+    expect(changed).toBe(true);
+    expect(settings.screenResolution).toBe('1080p');
+  });
+
+  it('leaves source + native (0) fps for the produce boundary', () => {
+    const { settings, changed } = clampToFreeTier(
+      { ...FREE_SETTINGS, screenResolution: 'source', screenFrameRate: 0 },
+      FREE_ENTITLEMENT
+    );
+    expect(changed).toBe(false);
+    expect(settings.screenResolution).toBe('source');
+    expect(settings.screenFrameRate).toBe(0);
+  });
+
+  it('clamps a custom WxH over the height ceiling to 1080p (dims encoded in value)', () => {
+    const { settings, changed } = clampToFreeTier(
+      { ...FREE_SETTINGS, screenResolution: '2560x1440', screenFrameRate: 60 },
+      FREE_ENTITLEMENT
+    );
+    expect(changed).toBe(true);
+    expect(settings.screenResolution).toBe('1080p');
+    expect(settings.screenFrameRate).toBe(30);
+  });
+
+  it('tiers a custom ultrawide fps that fits the height ceiling but not the budget', () => {
+    // 2560x1080 fits the 1080 height ceiling, so the resolution is kept, but the
+    // pixel-rate budget (62.2 Mpx/s / 2,764,800 px) admits only 22fps.
+    const { settings, changed } = clampToFreeTier(
+      { ...FREE_SETTINGS, screenResolution: '2560x1080', screenFrameRate: 60 },
+      FREE_ENTITLEMENT
+    );
+    expect(changed).toBe(true);
+    expect(settings.screenResolution).toBe('2560x1080');
+    expect(settings.screenFrameRate).toBe(22);
+  });
+
+  it('admits a custom WxH that fits both height and budget unchanged', () => {
+    const { changed } = clampToFreeTier(
+      { ...FREE_SETTINGS, screenResolution: '1280x720', screenFrameRate: 60 },
+      FREE_ENTITLEMENT
+    );
+    expect(changed).toBe(false);
+  });
+
+  it('is a no-op for a premium (native) entitlement', () => {
+    const { settings, changed } = clampToFreeTier(
+      { ...FREE_SETTINGS, screenResolution: '4K', screenFrameRate: 60 },
+      PREMIUM_ENTITLEMENT
+    );
+    expect(changed).toBe(false);
+    expect(settings.screenResolution).toBe('4K');
+    expect(settings.screenFrameRate).toBe(60);
   });
 });

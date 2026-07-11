@@ -17,9 +17,17 @@ import { humanizeProfileLabel, getCodecMetadata } from './codecMetadata';
 import { castingCopy } from './castingCopy';
 import { useDraftVideoSetting, setDraftVideoSetting } from '../../hooks/useDraftSettings';
 import { useEntitlement } from '../../hooks/useEntitlement';
+import { useSubscriptionStore } from '../../stores/subscriptionStore';
 import { useGateActivation } from '../../hooks/useGateActivation';
 import { nativeExceedsFree } from '../../utils/nativeExceedsFree';
-import { videoLimitsFromEntitlement, type VideoAxisLimit } from '../../utils/videoLimits';
+import {
+  videoLimitsFromEntitlement,
+  clampScreenCapture,
+  effectiveStreamAxis,
+  shouldEnforceForSubscription,
+  type VideoAxisLimit,
+} from '../../utils/videoLimits';
+import { SCREEN_RES_DIMS } from '../../utils/screenResolution';
 import PremiumChip from '../common/PremiumChip';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
@@ -186,10 +194,7 @@ function resolveScreenResolution(
   bestDisplay: { width: number; height: number }
 ): { w: number; h: number } {
   const resMap: Record<string, { w: number; h: number }> = {
-    '720p': { w: 1280, h: 720 },
-    '1080p': { w: 1920, h: 1080 },
-    '1440p': { w: 2560, h: 1440 },
-    '4K': { w: 3840, h: 2160 },
+    ...SCREEN_RES_DIMS,
     source: { w: bestDisplay.width, h: bestDisplay.height },
   };
   const parsed = /^(\d+)x(\d+)$/.exec(screenResolution);
@@ -290,25 +295,63 @@ function buildResolutionOptions(args: {
 }
 
 /** Build the screen-share Frame Rate select options, clamped to the free fps
- *  ceiling (`clampedFps`) per L6. Pure — the high-refresh `&&` ladder lives here. */
+ *  ceiling (`clampedFps`) per L6. Pure — the high-refresh `&&` ladder lives here.
+ *  The persisted explicit fps (`selectedFps`, >0) is always represented: a value
+ *  above the tiered ceiling (e.g. a downgraded free user's `screenResolution:
+ *  'source'` + 60fps, which the launch-reset clamp leaves for the produce
+ *  boundary, #2163) is injected as a 🔒 Premium option. Otherwise the <select>'s
+ *  value has no matching <option> and renders a blank/inconsistent selection.
+ *  Mirrors buildCameraPresetOptions' "keep + mark premium" pattern; display-only,
+ *  so it never mutates the persisted setting (the produce boundary still clamps
+ *  the actual capture). */
 function buildFrameRateOptions(args: {
   maxRefreshRate: number;
   clampedFps: number;
+  selectedFps: number;
 }): SelectOption[] {
-  const { maxRefreshRate, clampedFps } = args;
+  const { maxRefreshRate, clampedFps, selectedFps } = args;
   const offer = (hz: number): boolean => maxRefreshRate >= hz && clampedFps >= hz;
-  return [
-    { value: '0', label: `Native (${maxRefreshRate} Hz)`, group: 'Common' },
-    { value: '60', label: '60 FPS', group: 'Common' },
-    { value: '30', label: '30 FPS', group: 'Common' },
+  // Native (0) resolves to the display refresh rate at produce time, then the
+  // boundary clamps it to the tiered ceiling (#2163). When the display exceeds
+  // that ceiling (e.g. free 1080p on a 60Hz+ display captures at 30), mark Native
+  // premium so its label matches what is actually captured, mirroring the discrete
+  // over-cap fps options and the "your device supports more" resolution note.
+  const nativeLabel =
+    maxRefreshRate > clampedFps
+      ? `Native (${maxRefreshRate} Hz) \u{1F512} Premium`
+      : `Native (${maxRefreshRate} Hz)`;
+  const options: SelectOption[] = [
+    { value: '0', label: nativeLabel, group: 'Common' },
+    // 60/30 are gated by the tiered stream fps ceiling (#2163): free 1080p offers
+    // no 60, free 720p offers 60. Premium (Infinity ceiling) always offers both.
+    ...(offer(60) ? [{ value: '60', label: '60 FPS', group: 'Common' }] : []),
+    ...(offer(30) ? [{ value: '30', label: '30 FPS', group: 'Common' }] : []),
     ...(offer(120) ? [{ value: '120', label: '120 FPS', group: 'Additional' }] : []),
     ...(offer(100) ? [{ value: '100', label: '100 FPS', group: 'Additional' }] : []),
     ...(offer(90) ? [{ value: '90', label: '90 FPS', group: 'Additional' }] : []),
     ...(offer(75) ? [{ value: '75', label: '75 FPS', group: 'Additional' }] : []),
-    { value: '24', label: '24 FPS (Cinematic)', group: 'Additional' },
-    { value: '15', label: '15 FPS', group: 'Additional' },
-    { value: '5', label: '5 FPS (Slideshow)', group: 'Additional' },
+    // Every fixed fps is gated by the tiered ceiling, not just the high-refresh
+    // ones: on an ultrawide (e.g. free 2560x1080 → pixel-rate admits 22fps) even
+    // 24 exceeds the budget, so it must be omitted rather than silently clamped
+    // at the produce boundary (#2163).
+    ...(offer(24) ? [{ value: '24', label: '24 FPS (Cinematic)', group: 'Additional' }] : []),
+    ...(offer(15) ? [{ value: '15', label: '15 FPS', group: 'Additional' }] : []),
+    ...(offer(5) ? [{ value: '5', label: '5 FPS (Slideshow)', group: 'Additional' }] : []),
   ];
+  // Native (0) is always present; only a positive value absent from the list needs
+  // injecting to avoid a blank select. Mark it Premium ONLY when it exceeds the tier
+  // ceiling — an in-tier value the clamp just selected (e.g. an ultrawide 22fps
+  // ceiling) is allowed and must not carry a paywall marker (#2172 Codex). Keeps a
+  // genuine over-cap persisted value intact for a later upgrade.
+  if (selectedFps > 0 && !options.some((o) => o.value === String(selectedFps))) {
+    options.push({
+      value: String(selectedFps),
+      label:
+        selectedFps > clampedFps ? `${selectedFps} FPS \u{1F512} Premium` : `${selectedFps} FPS`,
+      group: 'Common',
+    });
+  }
+  return options;
 }
 
 /** Resolve a manual-bitrate slider's UI ceiling from an axis bitrate cap (bps).
@@ -364,15 +407,43 @@ const VideoConfigSection: React.FC = () => {
   // All ceilings derive from the entitlement (no hardcoded tier numbers); see the
   // #1602 matrix in [internal]specs/2026-07-03-1602-av-settings-gating-design.md.
   const entitlement = useEntitlement((e) => e);
+  // Authoritative-entitlement flag: the destructive fps/preset snap-backs below gate on
+  // this so they never persist a downgrade computed from the pre-hydrate FREE default
+  // (#1301/#2172). Degraded is safe — the store preserves the last-known tier on reconnect.
+  const hydrated = useSubscriptionStore((s) => s.hydrated);
+  const degraded = useSubscriptionStore((s) => s.degraded);
   // Server video floor (#1522) is not surfaced client-side yet; the stream axis is
   // the personal ceiling only and the media-plane enforces the floor regardless.
   const videoLimits = useMemo(() => videoLimitsFromEntitlement(entitlement), [entitlement]);
   const streamLimit = videoLimits.stream;
   const cameraLimit = videoLimits.camera;
+  // The stream axis the DISPLAY seams enforce (fps tiering + the native-exceeds note).
+  // It fails OPEN through the shared effectiveStreamAxis gate exactly when the picker
+  // and produce boundary do (pre-hydrate, or a degraded premium), so Settings never
+  // strips a premium user's 60fps options or shows a spurious upsell computed from the
+  // pre-hydrate FREE default (#2172). The raw streamLimit above still fences the L5
+  // bitrate slider, which reads the authoritative entitlement axis directly.
+  const effectiveStream = useMemo(
+    () => effectiveStreamAxis({ hydrated, degraded, entitlement }),
+    [hydrated, degraded, entitlement]
+  );
+  // Whether the camera-preset snap-back below may ENFORCE. It shares the same fail-open
+  // gate as effectiveStream (shouldEnforceForSubscription): enforce when hydrated OR a
+  // degraded FREE floor, fail open pre-hydrate and for a degraded premium. Unlike the
+  // stream axis there is NO camera produce-boundary clamp (produceVideo captures the
+  // stored preset verbatim) and useLaunchReset is itself hydration-gated, so gating this
+  // on `hydrated` alone let a degraded-free user pick a premium preset that produceVideo
+  // then captured unclamped (#2172).
+  const enforceCameraCaps = useMemo(
+    () => shouldEnforceForSubscription({ hydrated, degraded, entitlement }),
+    [hydrated, degraded, entitlement]
+  );
   const cameraPresetGate = useGateActivation('video-quality');
   const bitrateGate = useGateActivation('manual-bitrate');
   const cameraBitrateGate = useGateActivation('manual-bitrate');
   const [cameraPresetLockHinted, setCameraPresetLockHinted] = useState(false);
+  const [screenFpsLockHinted, setScreenFpsLockHinted] = useState(false);
+  const screenFpsGate = useGateActivation('video-quality');
 
   const [displayInfo, setDisplayInfo] = useState<
     {
@@ -453,7 +524,13 @@ const VideoConfigSection: React.FC = () => {
 
   const handleCameraPresetChange = useCallback(
     (key: string): void => {
-      if (presetExceedsFreeCaps(key, cameraLimit)) {
+      // Snap a locked preset back only when the shared gate says the entitlement is
+      // authoritative enough to enforce (hydrated, or a degraded FREE floor). Camera has
+      // NO produce-boundary clamp (produceVideo captures the stored preset verbatim) and
+      // useLaunchReset is hydration-gated, so this snap-back is the sole enforcement seam.
+      // Failing open for pre-hydrate and degraded-premium preserves a premium user's
+      // preset (#1301/#2172); a degraded-free user is still clamped, closing the escape.
+      if (enforceCameraCaps && presetExceedsFreeCaps(key, cameraLimit)) {
         // L2 snap-back: a locked preset never reaches the store. Clamp to the
         // highest free preset and reveal the chip (no mid-action modal).
         setDraftVideoSetting('cameraPreset', resolveHighestFreeCameraPreset(cameraLimit));
@@ -463,16 +540,62 @@ const VideoConfigSection: React.FC = () => {
       setCameraPresetLockHinted(false);
       setDraftVideoSetting('cameraPreset', key);
     },
-    [cameraLimit]
+    [cameraLimit, enforceCameraCaps]
+  );
+
+  // #2163: the screen-share fps ceiling is resolution-dependent (tiered pixel-rate).
+  // It is derived from the resolution that will ACTUALLY be captured, i.e. the
+  // selected dims after the produce-boundary height clamp (a free 'source'/4K pick
+  // captures at 1080p, so 30fps, not the raw display). It tiers against effectiveStream
+  // (the shared fail-open gate), NOT the raw entitlement axis, so pre-hydrate (or for a
+  // degraded premium) the full fps ladder is offered instead of the FREE default, keeping
+  // the offered fps in lockstep with both the picker and the produce capture (#2172).
+  const streamFpsCeilingFor = useCallback(
+    (dims: { w: number; h: number }): number =>
+      clampScreenCapture(dims.w, dims.h, effectiveStream.fps, effectiveStream).fps,
+    [effectiveStream]
+  );
+  const streamFpsCeiling = useMemo(
+    () => streamFpsCeilingFor(resolveScreenResolution(screenResolution, bestDisplay)),
+    [streamFpsCeilingFor, screenResolution, bestDisplay]
   );
 
   // ── L6: device-derived resolution / frame-rate native-exceeds guard ─────
   // The screen-share Resolution + Frame Rate option lists are derived from the
-  // detected display. Clamp the offered ceiling to the STREAM axis and surface a
-  // "your device supports more" note when the device genuinely exceeds it.
+  // detected display. Clamp the offered ceiling to effectiveStream (the shared
+  // fail-open axis) and surface a "your device supports more" note when the device
+  // genuinely exceeds it. The fps arm uses the RESOLUTION-TIERED ceiling
+  // (streamFpsCeiling), NOT the raw axis fps: free streamMaxFps is 60 (the 720p
+  // ceiling), but 1080p is pixel-rate-capped to 30, so a free 1080p/60Hz device
+  // genuinely exceeds its tier and must show the upsell note, matching the fps
+  // dropdown. Because effectiveStream fails open pre-hydrate (or for a degraded
+  // premium), a premium user never sees a spurious upsell before hydration (#2163/#2172).
   const nativeGuard = nativeExceedsFree(
     { nativeHeight: bestDisplay.height, nativeFps: maxRefreshRate },
-    streamLimit
+    { ...effectiveStream, fps: streamFpsCeiling }
+  );
+
+  // Snap an over-cap fps down when the resolution changes (mirrors the camera-preset
+  // snap-back), revealing the premium chip. Native (0) is left for the produce clamp.
+  const handleScreenResolutionChange = useCallback(
+    (v: string): void => {
+      setDraftVideoSetting('screenResolution', v);
+      // Only snap the fps down when the entitlement is authoritative (hydrated). Pre-hydrate,
+      // streamFpsCeilingFor is derived from the FREE default, so snapping would persist a
+      // downgraded fps for a premium user that launch-reset never restores (#1301/#2172 Codex).
+      if (!hydrated) {
+        setScreenFpsLockHinted(false);
+        return;
+      }
+      const ceiling = streamFpsCeilingFor(resolveScreenResolution(v, bestDisplay));
+      if (screenFrameRate > 0 && screenFrameRate > ceiling) {
+        setDraftVideoSetting('screenFrameRate', ceiling);
+        setScreenFpsLockHinted(true);
+      } else {
+        setScreenFpsLockHinted(false);
+      }
+    },
+    [streamFpsCeilingFor, bestDisplay, screenFrameRate, hydrated]
   );
 
   // ── L5: manual bitrate clamps — STREAM (screen-share) + CAMERA sliders ──
@@ -674,7 +797,7 @@ const VideoConfigSection: React.FC = () => {
             uniqueDisplayResolutions,
           })}
           value={screenResolution}
-          onChange={(v) => setDraftVideoSetting('screenResolution', v)}
+          onChange={handleScreenResolutionChange}
         />
       </div>
 
@@ -686,16 +809,26 @@ const VideoConfigSection: React.FC = () => {
               ? `Default capture frame rate for screen sharing. Currently Native (${maxRefreshRate} Hz).`
               : `Default capture frame rate for screen sharing. Currently ${screenFrameRate} FPS.`}
           </span>
+          {screenFpsLockHinted && (
+            <span className="settings-row-premium-note">
+              <PremiumChip
+                label="higher frame rates"
+                onActivate={screenFpsGate.onActivate}
+                id={screenFpsGate.describedById}
+              />
+            </span>
+          )}
         </div>
         <CustomSelect
           className="settings-select"
-          // L6: high-refresh options are clamped to the free fps ceiling
-          // (nativeGuard.clampedFps) — frame rates above the free cap are not
-          // offered. The standard 60/30 and slow options always remain. The
-          // high-refresh option ladder lives in the pure buildFrameRateOptions helper.
+          // #2163: the fps option ceiling is the resolution-tiered stream max
+          // (streamFpsCeiling): free 1080p offers ≤30, free 720p offers ≤60. It is
+          // combined with the L6 device/native clamp. The option ladder lives in the
+          // pure buildFrameRateOptions helper.
           options={buildFrameRateOptions({
             maxRefreshRate,
-            clampedFps: nativeGuard.clampedFps,
+            clampedFps: Math.min(nativeGuard.clampedFps, streamFpsCeiling),
+            selectedFps: screenFrameRate,
           })}
           value={String(screenFrameRate)}
           onChange={(v) => setDraftVideoSetting('screenFrameRate', Number(v))}

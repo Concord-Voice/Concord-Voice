@@ -12457,6 +12457,12 @@ components:
         streamMaxFps:
           type: integer
           description: Screen-share max frame rate; negative = native/uncapped.
+        streamMaxPixelRate:
+          type: integer
+          description: >-
+            Screen-share tiered fps ceiling as a width*height*fps budget in px/s (free
+            62208000 = 1080p30, so 720p60 also admits and 1080p60 is rejected); negative =
+            native/uncapped (premium). Client-enforced (#2163); the SFU does not enforce it.
         streamMaxBitrate:
           type: integer
           description: Screen-share max bitrate in bps (free 5000000 / premium 20000000).
@@ -12509,6 +12515,7 @@ components:
       - maxAudioLastN
       - streamMaxHeight
       - streamMaxFps
+      - streamMaxPixelRate
       - streamMaxBitrate
       - cameraMaxHeight
       - cameraMaxFps

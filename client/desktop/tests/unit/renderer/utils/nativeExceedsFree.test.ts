@@ -3,8 +3,9 @@ import { nativeExceedsFree } from '@/renderer/utils/nativeExceedsFree';
 import { videoLimitsFromEntitlement } from '@/renderer/utils/videoLimits';
 import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/subscriptionStore';
 
-// The screen-share option lists gate on the STREAM axis (#1602). Free stream axis
-// is 1080p30; premium stream axis is native (uncapped).
+// The screen-share option lists gate on the STREAM axis (#1602). The free stream
+// axis raw ceilings are 1080p / 60fps post-#2163 (the pixel-rate cap tiers fps
+// separately — nativeExceedsFree only knows the raw axis); premium is native.
 const FREE_STREAM = videoLimitsFromEntitlement(FREE_ENTITLEMENT).stream;
 
 const PREMIUM_ENTITLEMENT: Entitlement = {
@@ -12,10 +13,11 @@ const PREMIUM_ENTITLEMENT: Entitlement = {
   tier: 'premium',
   streamMaxHeight: -1,
   streamMaxFps: -1,
+  streamMaxPixelRate: -1,
 };
 const PREMIUM_STREAM = videoLimitsFromEntitlement(PREMIUM_ENTITLEMENT).stream;
 
-describe('nativeExceedsFree — free user (stream axis 1080p30)', () => {
+describe('nativeExceedsFree — free user (stream axis 1080p, raw fps 60)', () => {
   it('reports exceeds when native height beats the free stream cap', () => {
     const r = nativeExceedsFree({ nativeHeight: 2160, nativeFps: 30 }, FREE_STREAM);
     expect(r.exceeds).toBe(true);
@@ -24,10 +26,10 @@ describe('nativeExceedsFree — free user (stream axis 1080p30)', () => {
   });
 
   it('reports exceeds when native fps beats the free stream cap', () => {
-    const r = nativeExceedsFree({ nativeHeight: 1080, nativeFps: 60 }, FREE_STREAM);
+    const r = nativeExceedsFree({ nativeHeight: 1080, nativeFps: 120 }, FREE_STREAM);
     expect(r.exceeds).toBe(true);
     expect(r.clampedHeight).toBe(1080);
-    expect(r.clampedFps).toBe(30); // free stream fps ceiling
+    expect(r.clampedFps).toBe(60); // free stream raw fps ceiling (pixel-rate tiers it separately)
   });
 
   it('does NOT report exceeds when the device is within the free stream caps', () => {
@@ -41,7 +43,7 @@ describe('nativeExceedsFree — free user (stream axis 1080p30)', () => {
     const r = nativeExceedsFree({ nativeHeight: 4320, nativeFps: 240 }, FREE_STREAM);
     expect(r.exceeds).toBe(true);
     expect(r.clampedHeight).toBe(1080);
-    expect(r.clampedFps).toBe(30);
+    expect(r.clampedFps).toBe(60); // raw fps ceiling
   });
 });
 

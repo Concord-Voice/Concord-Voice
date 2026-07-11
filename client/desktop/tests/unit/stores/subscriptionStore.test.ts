@@ -25,7 +25,13 @@ const premiumDTO = {
 describe('subscriptionStore', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    useSubscriptionStore.setState({ entitlement: FREE_ENTITLEMENT, degraded: false });
+    // Reset hydrated too — the #2172 reconnect-vs-first-load branch keys on it, so it
+    // must not leak across tests (a prior success sets it true).
+    useSubscriptionStore.setState({
+      entitlement: FREE_ENTITLEMENT,
+      degraded: false,
+      hydrated: false,
+    });
   });
 
   it('defaults to the FREE_ENTITLEMENT floor', () => {
@@ -41,8 +47,38 @@ describe('subscriptionStore', () => {
     expect(useSubscriptionStore.getState().degraded).toBe(false);
   });
 
-  it('hydrate() error stays FREE + sets degraded (fail-closed)', async () => {
-    useSubscriptionStore.setState({ entitlement: premiumDTO }); // prove it resets to free
+  it('hydrate() FIRST-LOAD error fails closed to FREE + degraded (never grant premium)', async () => {
+    // hydrated=false (beforeEach): a first-load failure has no authoritative prior value,
+    // so it fails closed to the free floor — a user who never authenticated as premium
+    // can never obtain it via a degraded state. Pre-set premium proves it resets to free.
+    useSubscriptionStore.setState({ entitlement: premiumDTO, hydrated: false });
+    mockApiFetch.mockRejectedValue(new Error('network'));
+    await useSubscriptionStore.getState().hydrate();
+    expect(useSubscriptionStore.getState().entitlement.tier).toBe('free');
+    expect(useSubscriptionStore.getState().degraded).toBe(true);
+    expect(useSubscriptionStore.getState().hydrated).toBe(false);
+  });
+
+  it('hydrate() RECONNECT error preserves the last-known PREMIUM entitlement (#2172)', async () => {
+    // A prior authoritative hydrate succeeded (hydrated=true) as premium. A transient
+    // reconnect failure must NOT clamp the user to free — preserve the last-known-good
+    // entitlement and only flip degraded, so their screen share / features hold.
+    useSubscriptionStore.setState({ entitlement: premiumDTO, hydrated: true, degraded: false });
+    mockApiFetch.mockRejectedValue(new Error('network'));
+    await useSubscriptionStore.getState().hydrate();
+    expect(useSubscriptionStore.getState().entitlement.tier).toBe('premium');
+    expect(useSubscriptionStore.getState().degraded).toBe(true);
+    expect(useSubscriptionStore.getState().hydrated).toBe(true);
+  });
+
+  it('hydrate() RECONNECT error on an authoritative FREE user keeps FREE (no escape) (#2172)', async () => {
+    // The preserve-last-known behaviour never escalates: a user authoritatively hydrated
+    // as free keeps free through a reconnect failure.
+    useSubscriptionStore.setState({
+      entitlement: FREE_ENTITLEMENT,
+      hydrated: true,
+      degraded: false,
+    });
     mockApiFetch.mockRejectedValue(new Error('network'));
     await useSubscriptionStore.getState().hydrate();
     expect(useSubscriptionStore.getState().entitlement.tier).toBe('free');

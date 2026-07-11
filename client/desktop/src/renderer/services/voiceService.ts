@@ -20,6 +20,7 @@ import { io, Socket } from 'socket.io-client';
 import { useAuthStore } from '../stores/authStore';
 import { useUserStore } from '../stores/userStore';
 import { useUpdateStatusStore } from '../stores/updateStatusStore';
+import { useSubscriptionStore } from '../stores/subscriptionStore';
 import {
   useVoiceStore,
   AUDIO_QUALITY_TIERS,
@@ -69,6 +70,8 @@ import {
 } from './voiceE2eeTransforms';
 import { errorMessage } from '../utils/redactError';
 import { hasPermission, SPEAK } from '../utils/permissions';
+import { clampScreenForSubscription } from '../utils/videoLimits';
+import { SCREEN_RES_DIMS, resolveScreenDims } from '../utils/screenResolution';
 
 // Toggle for verbose E2EE/SDP diagnostics — set to true when debugging
 // frame drops, BUNDLE collisions, or key rotation issues. When false,
@@ -879,10 +882,7 @@ class VoiceService {
     }
     const vs = useVideoSettingsStore.getState();
     const resMap: Record<string, { w: number; h: number }> = {
-      '720p': { w: 1280, h: 720 },
-      '1080p': { w: 1920, h: 1080 },
-      '1440p': { w: 2560, h: 1440 },
-      '4K': { w: 3840, h: 2160 },
+      ...SCREEN_RES_DIMS,
       source: { w: 3840, h: 2160 },
     };
     const parsed = vs.screenResolution.match(/^(\d+)x(\d+)$/);
@@ -902,7 +902,23 @@ class VoiceService {
     }
 
     const effectiveFps = vs.screenFrameRate === 0 ? 60 : vs.screenFrameRate;
-    return this.calculateRecommendedBitrate(res.w, res.h, effectiveFps, codecMime);
+    // #2163: clamp the estimate inputs to the free stream entitlement so the
+    // recommended bitrate matches the (clamped) capture. No-op for premium/native.
+    const clamped = this.clampScreenToEntitlement(res.w, res.h, effectiveFps);
+    return this.calculateRecommendedBitrate(clamped.width, clamped.height, clamped.fps, codecMime);
+  }
+
+  /**
+   * Clamp screen-capture (w, h, fps) to the stream entitlement (#2163). Reads the
+   * live subscription snapshot; premium/native and the pre-hydrate window are
+   * no-ops (fail-open premium safety, mirroring useLaunchReset).
+   */
+  private clampScreenToEntitlement(
+    w: number,
+    h: number,
+    fps: number
+  ): { width: number; height: number; fps: number } {
+    return clampScreenForSubscription(w, h, fps, useSubscriptionStore.getState());
   }
 
   /**
@@ -2829,19 +2845,49 @@ class VoiceService {
     }
   }
 
-  /** Parse a screen resolution string into width/height. */
-  private static parseScreenResolution(resolution: string): { w: number; h: number } {
-    const resMap: Record<string, { w: number; h: number }> = {
-      source: { w: 3840, h: 2160 },
-      '720p': { w: 1280, h: 720 },
-      '1080p': { w: 1920, h: 1080 },
-      '1440p': { w: 2560, h: 1440 },
-      '4K': { w: 3840, h: 2160 },
-    };
-    const customParsed = /^(\d+)x(\d+)$/.exec(resolution);
-    return customParsed
-      ? { w: Number(customParsed[1]), h: Number(customParsed[2]) }
-      : resMap[resolution] || resMap['source'];
+  /**
+   * Resolve a screen-share resolution selection to capture dimensions (#2163).
+   * 'source'/native resolves to the ACTUAL best-display size via getDisplayInfo so
+   * the entitlement clamp tiers fps against the REAL resolution — a free 720p Native
+   * share keeps 60fps — instead of a hard-coded 4K fallback that would over-clamp it
+   * to 1080p30 (Codex review #2172). Mirrors the Settings UI, which resolves 'source'
+   * via getDisplayInfo. Fixed presets and WxH parse via the shared resolveScreenDims;
+   * falls back to 4K when getDisplayInfo is unavailable (dev/web) — a safe over-clamp.
+   *
+   * Uses the largest-area display, NOT the specific shared `sourceId` (Gitar review
+   * #2172): on a multi-monitor setup, sharing a smaller secondary is conservatively
+   * over-clamped to the largest display's tier. This is intentional — it stays in
+   * lockstep with the Settings UI's `bestDisplay`, so the offered fps options and the
+   * actual capture never disagree. Per-sourceId fidelity is a deferred follow-up.
+   */
+  private async resolveCaptureDims(resolution: string): Promise<{ w: number; h: number }> {
+    let sourceDims = { w: 3840, h: 2160 };
+    if (resolution === 'source') {
+      try {
+        const displays = (await globalThis.electron?.getDisplayInfo?.()) ?? [];
+        if (displays.length > 0) {
+          // Seed reduce with displays[0]; never reduce an array without an initial
+          // value (throws on empty, and keeps the SonarQube reduce-init gate clean).
+          const best = displays.reduce(
+            (a, d) => (d.width * d.height > a.width * a.height ? d : a),
+            displays[0]
+          );
+          // Guard against a 0-sized / malformed display report (Gitar review #2172):
+          // a {0,0} source would feed resolveScreenDims → clampScreenToEntitlement a
+          // 0-pixel target, which trivially admits any fps. Fall back to 4K instead.
+          if (best.width > 0 && best.height > 0) {
+            sourceDims = { w: best.width, h: best.height };
+          }
+        }
+      } catch (err) {
+        // A rejected getDisplayInfo IPC must degrade to the conservative 4K
+        // fallback, NOT propagate out of produceScreen (Gitar review #2172): this
+        // call runs before the capture try block, so an unguarded rejection would
+        // break screen sharing entirely for ALL tiers, including premium.
+        console.debug('resolveCaptureDims: getDisplayInfo unavailable, using 4K fallback', err);
+      }
+    }
+    return resolveScreenDims(resolution, sourceDims);
   }
 
   /**
@@ -2967,11 +3013,17 @@ class VoiceService {
     const frameRate = options?.frameRate ?? screenSettings.screenFrameRate;
     const contentType = options?.contentType ?? screenSettings.screenContentType;
     const screenFps = frameRate === 0 ? 60 : frameRate;
-    const screenRes = VoiceService.parseScreenResolution(resolution);
+    // #2163: resolve 'source'/native to the REAL display dims (not a 4K fallback),
+    // then clamp res/fps to the free stream entitlement (tiered pixel-rate) so a
+    // sub-1080p Native share keeps its correct fps tier. Premium/native + pre-hydrate
+    // are structural no-ops.
+    const rawRes = await this.resolveCaptureDims(resolution);
+    const clampedCap = this.clampScreenToEntitlement(rawRes.w, rawRes.h, screenFps);
+    const screenRes = { w: clampedCap.width, h: clampedCap.height };
 
     let stream: MediaStream;
     try {
-      stream = await this.captureScreen(sourceId, screenRes, screenFps);
+      stream = await this.captureScreen(sourceId, screenRes, clampedCap.fps);
     } catch (captureErr) {
       if (handleScreenCaptureNotAllowed(captureErr)) return;
       throw captureErr;

@@ -2,7 +2,12 @@ import type { Entitlement } from '../stores/subscriptionStore';
 import type { AppearanceSettings } from '../stores/settingsStore';
 import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../stores/voiceStore';
 import { VIDEO_QUALITY_PRESETS } from '../stores/videoSettingsStore';
-import { videoLimitsFromEntitlement, type VideoAxisLimit } from './videoLimits';
+import {
+  videoLimitsFromEntitlement,
+  maxFpsForResolution,
+  type VideoAxisLimit,
+} from './videoLimits';
+import { SCREEN_RES_DIMS, highestFreeScreenResolution } from './screenResolution';
 
 /**
  * A pure snapshot of the client settings that the launch-reset clamp touches —
@@ -25,6 +30,8 @@ export interface ClampableSettings {
   screenShareBitrate: number;
   cameraBitrate: number;
   musicMode: boolean;
+  screenResolution: string; // videoSettingsStore.screenResolution (#2163)
+  screenFrameRate: number; // videoSettingsStore.screenFrameRate; 0 = native (#2163)
 }
 
 /** The highest free audio tier a premium tier is clamped down to. */
@@ -58,6 +65,21 @@ function cameraPresetExceedsCaps(cameraPreset: string, camera: VideoAxisLimit): 
   // Unknown / System Default presets never exceed — height/fps are 0 (driver decides).
   if (!preset) return false;
   return preset.height > camera.height || preset.frameRate > camera.fps;
+}
+
+/**
+ * Dims for a screen-share resolution the reset clamp can resolve WITHOUT a live
+ * display probe: a fixed preset (720p/1080p/…) or a custom `WxH` string (the dims
+ * are encoded in the value). 'source'/native returns undefined — it genuinely
+ * needs display dims this pure snapshot lacks, so it is left to the produce
+ * boundary (#2163).
+ */
+function fixedOrCustomScreenDims(res: string): { w: number; h: number } | undefined {
+  const fixed = SCREEN_RES_DIMS[res];
+  if (fixed) return fixed;
+  const custom = /^(\d+)x(\d+)$/.exec(res);
+  if (custom) return { w: Number(custom[1]), h: Number(custom[2]) };
+  return undefined;
 }
 
 /**
@@ -118,6 +140,29 @@ export function clampToFreeTier(
   if (settings.musicMode && !entitlement.allowMusicMode) {
     next.musicMode = false;
     changed = true;
+  }
+
+  // 6. Screen-share resolution over the STREAM-axis height ceiling -> highest
+  //    permitted fixed resolution (#2163). Fixed presets AND custom WxH picks are
+  //    clamped here (both encode their dims); only 'source'/native is left to the
+  //    produce boundary (it needs display dims this pure snapshot lacks).
+  const screenDims = fixedOrCustomScreenDims(settings.screenResolution);
+  if (screenDims && screenDims.h > limits.stream.height) {
+    next.screenResolution = highestFreeScreenResolution(limits.stream.height);
+    changed = true;
+  }
+
+  // 7. Screen-share frame rate over the tiered max for the (possibly just-clamped)
+  //    resolution -> tiered max (#2163). Only explicit fps (>0) is clamped; 0
+  //    (native) is enforced at the produce boundary. A custom WxH that fits the
+  //    height ceiling (e.g. an ultrawide 2560x1080) still tiers its fps here.
+  const effDims = fixedOrCustomScreenDims(next.screenResolution);
+  if (settings.screenFrameRate > 0 && effDims) {
+    const capped = maxFpsForResolution(effDims.w, effDims.h, limits.stream);
+    if (settings.screenFrameRate > capped) {
+      next.screenFrameRate = capped;
+      changed = true;
+    }
   }
 
   return { settings: next, changed };

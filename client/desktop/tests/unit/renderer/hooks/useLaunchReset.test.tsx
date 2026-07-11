@@ -19,6 +19,7 @@ const PREMIUM_ENTITLEMENT: Entitlement = {
   allowMusicMode: true,
   streamMaxHeight: -1,
   streamMaxFps: -1,
+  streamMaxPixelRate: -1,
   streamMaxBitrate: 20_000_000,
   cameraMaxHeight: -1,
   cameraMaxFps: -1,
@@ -44,6 +45,8 @@ beforeEach(() => {
   useVoiceStore.getState().setQualityTier('standard');
   useVideoSettingsStore.getState().setCameraPreset('system');
   useVideoSettingsStore.getState().setScreenShareBitrate(0);
+  useVideoSettingsStore.getState().setScreenResolution('1080p');
+  useVideoSettingsStore.getState().setScreenFrameRate(30);
   useAudioSettingsStore.getState().setMusicMode(false);
 });
 
@@ -65,6 +68,28 @@ describe('useLaunchReset — free user with over-cap settings', () => {
       FREE_ENTITLEMENT.maxManualBitrateBps
     );
     expect(useAudioSettingsStore.getState().musicMode).toBe(false);
+  });
+
+  it('#2163 clamps a persisted over-cap screenshare res/fps for a free user', () => {
+    useVideoSettingsStore.getState().setScreenResolution('4K');
+    useVideoSettingsStore.getState().setScreenFrameRate(60);
+    useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+
+    renderHook(() => useLaunchReset());
+
+    expect(useVideoSettingsStore.getState().screenResolution).toBe('1080p');
+    expect(useVideoSettingsStore.getState().screenFrameRate).toBe(30);
+  });
+
+  it("#2163 leaves a premium user's 4K/60 screenshare untouched", () => {
+    useVideoSettingsStore.getState().setScreenResolution('4K');
+    useVideoSettingsStore.getState().setScreenFrameRate(60);
+    useSubscriptionStore.getState().setEntitlement(PREMIUM_ENTITLEMENT);
+
+    renderHook(() => useLaunchReset());
+
+    expect(useVideoSettingsStore.getState().screenResolution).toBe('4K');
+    expect(useVideoSettingsStore.getState().screenFrameRate).toBe(60);
   });
 
   it('shows the reset modal once when settings were clamped', () => {

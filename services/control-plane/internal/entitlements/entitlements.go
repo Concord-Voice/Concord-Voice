@@ -45,11 +45,20 @@ type Entitlement struct {
 	// treats it as "no ceiling". Screen-share may be lifted by the server floor
 	// (#1522, max(personal, ServerVideoFloor)); webcam is personal-tier only.
 	StreamMaxHeight  int // free 1080; premium -1 (native)
-	StreamMaxFps     int // free 30;   premium -1
+	StreamMaxFps     int // free 60 (absolute ceiling; StreamMaxPixelRate tiers it, #2163); premium -1
 	StreamMaxBitrate int // free 5_000_000; premium 20_000_000
 	CameraMaxHeight  int // free 720;  premium -1 (native)
 	CameraMaxFps     int // free 60;   premium -1
 	CameraMaxBitrate int // free 2_500_000; premium 6_000_000
+	// StreamMaxPixelRate is the screen-share (stream) axis tiered fps ceiling: a
+	// (width*height*fps) budget in px/s, client-enforced (#2163). Composed with
+	// StreamMaxHeight (hard resolution ceiling) and StreamMaxFps (absolute fps
+	// ceiling), it expresses "1080p30 max, 60fps reserved for 720p and below":
+	// admit iff height<=StreamMaxHeight AND fps<=StreamMaxFps AND w*h*fps<=this.
+	// Free 62_208_000 (=1080p30); premium -1 (native). The CAMERA axis has no
+	// pixel-rate cap (free 720p60 is a single tier that fits trivially) — the
+	// client sets its axis pixelRate to Infinity.
+	StreamMaxPixelRate int
 	// MaxManualBitrateBps is #1300's media_entitlements advisory cap the
 	// media-plane parses at createTransport. It is set to the stream ceiling
 	// (max stream/camera bitrate) so the SFU's single advisory cap never wrongly
@@ -89,7 +98,8 @@ var (
 		AllowMusicMode:           false,
 		MaxAudioLastN:            8,
 		StreamMaxHeight:          1080,
-		StreamMaxFps:             30,
+		StreamMaxFps:             60,         // #2163: absolute ceiling; pixel-rate tiers it (720p60 ok, 1080p60 rejected)
+		StreamMaxPixelRate:       62_208_000, // #2163: = 1920*1080*30 (1080p30)
 		StreamMaxBitrate:         5_000_000,
 		CameraMaxHeight:          720,
 		CameraMaxFps:             60,
@@ -116,6 +126,7 @@ var (
 		MaxAudioLastN:            16,
 		StreamMaxHeight:          ServerLimitUnlimited, // native (uncapped)
 		StreamMaxFps:             ServerLimitUnlimited,
+		StreamMaxPixelRate:       ServerLimitUnlimited, // #2163: native (no pixel-rate cap)
 		StreamMaxBitrate:         20_000_000,
 		CameraMaxHeight:          ServerLimitUnlimited, // native (uncapped)
 		CameraMaxFps:             ServerLimitUnlimited,

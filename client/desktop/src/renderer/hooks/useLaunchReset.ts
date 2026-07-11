@@ -60,6 +60,8 @@ export function useLaunchReset(): { showResetModal: boolean; acknowledge: () => 
       screenShareBitrate: video.screenShareBitrate,
       cameraBitrate: video.cameraBitrate,
       musicMode: audio.musicMode,
+      screenResolution: video.screenResolution,
+      screenFrameRate: video.screenFrameRate,
     };
 
     const { settings: clamped, changed } = clampToFreeTier(current, entitlement);
@@ -84,6 +86,12 @@ export function useLaunchReset(): { showResetModal: boolean; acknowledge: () => 
     }
     if (clamped.musicMode !== current.musicMode) {
       useAudioSettingsStore.getState().setMusicMode(clamped.musicMode);
+    }
+    if (clamped.screenResolution !== current.screenResolution) {
+      useVideoSettingsStore.getState().setScreenResolution(clamped.screenResolution);
+    }
+    if (clamped.screenFrameRate !== current.screenFrameRate) {
+      useVideoSettingsStore.getState().setScreenFrameRate(clamped.screenFrameRate);
     }
 
     // Surface the one-time explainer only if it hasn't been acknowledged.

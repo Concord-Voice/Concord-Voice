@@ -22,8 +22,10 @@ export const FREE_ENTITLEMENT: Entitlement = {
   allowMusicMode: false,
   maxAudioLastN: 8,
   // Split video axes (#1602). Free floor: stream 1080p30/≤5M, camera 720p60/≤2.5M.
+  // streamMaxPixelRate (#2163) tiers stream fps: 1080p30 & 720p60 admit, 1080p60 rejected.
   streamMaxHeight: 1080,
-  streamMaxFps: 30,
+  streamMaxFps: 60,
+  streamMaxPixelRate: 62208000, // = 1920*1080*30 (1080p30); mirrors Go free floor
   streamMaxBitrate: 5000000,
   cameraMaxHeight: 720,
   cameraMaxFps: 60,
@@ -43,7 +45,9 @@ export const FREE_ENTITLEMENT: Entitlement = {
 
 interface SubscriptionState {
   entitlement: Entitlement;
-  degraded: boolean; // true when the last hydrate failed (showing the free floor)
+  // true when the last hydrate failed. On a FIRST-LOAD failure the entitlement is the
+  // free floor; on a RECONNECT failure the last-known-good entitlement is preserved (#2172).
+  degraded: boolean;
   /**
    * True once an AUTHORITATIVE entitlement has been received — a successful
    * `hydrate()` or an `entitlements_changed` WS push via `setEntitlement`. It is
@@ -83,10 +87,23 @@ export const useSubscriptionStore = createStore<SubscriptionState>()((set) => ({
       const dto = EntitlementsChangedSchema.shape.data.parse(raw);
       set({ entitlement: dto, degraded: false, hydrated: true });
     } catch {
-      // Fail closed: never grant premium on error — reset to the free floor.
-      // Do NOT set `hydrated`: a failed hydrate is not an authoritative result,
-      // so destructive tier-gated consumers must keep waiting (data-loss guard).
-      set({ entitlement: FREE_ENTITLEMENT, degraded: true });
+      // Distinguish a FIRST-LOAD failure from a RECONNECT failure (#2172):
+      //  - First load (`!hydrated`, never authoritatively hydrated): fail CLOSED to
+      //    the free floor. Premium is only ever reached via a successful server
+      //    fetch/push, so a user who never authenticated as premium can NEVER obtain
+      //    it via a degraded state — the monetization invariant.
+      //  - Reconnect (`hydrated`, a prior authoritative hydrate succeeded): PRESERVE
+      //    the last-known-good entitlement and only flip `degraded`. A premium user's
+      //    screen share / features are not clamped to free by a transient network blip.
+      //    (A genuine downgrade arrives via a SUCCESSFUL fetch/push, not a failure, so
+      //    the only residue is a just-expired user holding stale premium across sustained
+      //    fetch failures — bounded, self-limiting, and moot for anything server-gated.)
+      // `hydrated` is left untouched either way: on reconnect it stays true (still
+      // authoritative), on first load it stays false (destructive tier-gated consumers
+      // keep waiting — the #1301 data-loss guard).
+      set((s) =>
+        s.hydrated ? { degraded: true } : { entitlement: FREE_ENTITLEMENT, degraded: true }
+      );
     }
   },
   // Account-switch resets to un-hydrated free so the next user's launch-reset

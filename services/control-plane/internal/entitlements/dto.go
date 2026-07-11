@@ -21,6 +21,7 @@ type EntitlementDTO struct {
 	MaxAudioLastN                 int      `json:"maxAudioLastN"`
 	StreamMaxHeight               int      `json:"streamMaxHeight"`
 	StreamMaxFps                  int      `json:"streamMaxFps"`
+	StreamMaxPixelRate            int      `json:"streamMaxPixelRate"`
 	StreamMaxBitrate              int      `json:"streamMaxBitrate"`
 	CameraMaxHeight               int      `json:"cameraMaxHeight"`
 	CameraMaxFps                  int      `json:"cameraMaxFps"`
@@ -49,6 +50,7 @@ func ToDTO(e Entitlement) EntitlementDTO {
 		MaxAudioLastN:                 e.MaxAudioLastN,
 		StreamMaxHeight:               e.StreamMaxHeight,
 		StreamMaxFps:                  e.StreamMaxFps,
+		StreamMaxPixelRate:            e.StreamMaxPixelRate,
 		StreamMaxBitrate:              e.StreamMaxBitrate,
 		CameraMaxHeight:               e.CameraMaxHeight,
 		CameraMaxFps:                  e.CameraMaxFps,

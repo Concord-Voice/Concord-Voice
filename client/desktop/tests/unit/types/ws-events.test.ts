@@ -1205,7 +1205,8 @@ const validEntitlements = {
     allowMusicMode: false,
     maxAudioLastN: 8,
     streamMaxHeight: 1080,
-    streamMaxFps: 30,
+    streamMaxFps: 60,
+    streamMaxPixelRate: 62208000,
     streamMaxBitrate: 5000000,
     cameraMaxHeight: 720,
     cameraMaxFps: 60,
@@ -1247,6 +1248,7 @@ describe('EntitlementsChangedSchema', () => {
     const {
       streamMaxHeight,
       streamMaxFps,
+      streamMaxPixelRate,
       streamMaxBitrate,
       cameraMaxHeight,
       cameraMaxFps,

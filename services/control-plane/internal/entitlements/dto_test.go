@@ -42,7 +42,7 @@ func TestToDTO_JSONUsesCamelCaseKeys(t *testing.T) {
 	require.NoError(t, json.Unmarshal(b, &m))
 	for _, k := range []string{
 		"tier", "allowCustomScheme", "allowedAudioTiers", "minPtimeMs", "allowMusicMode",
-		"maxAudioLastN", "streamMaxHeight", "streamMaxFps", "streamMaxBitrate",
+		"maxAudioLastN", "streamMaxHeight", "streamMaxFps", "streamMaxPixelRate", "streamMaxBitrate",
 		"cameraMaxHeight", "cameraMaxFps", "cameraMaxBitrate", "maxManualBitrateBps",
 		"maxWebcamPublishers", "maxScreensharePublishers", "maxMessageChars", "maxAttachmentBytes",
 		"maxAvatarBytes", "maxBannerBytes", "allowAnimatedProfile", "usernameChangeIntervalSeconds",
@@ -51,13 +51,13 @@ func TestToDTO_JSONUsesCamelCaseKeys(t *testing.T) {
 		_, ok := m[k]
 		assert.Truef(t, ok, "missing wire key %q", k)
 	}
-	// 20 − 3 retired video fields + 6 split video fields = 23 (#1602).
-	assert.Len(t, m, 23, "DTO must serialize exactly 23 keys")
+	// 23 (#1602) + streamMaxPixelRate (#2163) = 24.
+	assert.Len(t, m, 24, "DTO must serialize exactly 24 keys")
 }
 
 func TestDTOToMap_RoundTripsKeys(t *testing.T) {
 	m, err := entitlements.DTOToMap(entitlements.ToDTO(entitlements.For(entitlements.TierPremium)))
 	require.NoError(t, err)
 	assert.Equal(t, "premium", m["tier"])
-	assert.Len(t, m, 23)
+	assert.Len(t, m, 24)
 }

@@ -18,7 +18,8 @@ func TestFor_Free(t *testing.T) {
 	assert.Equal(t, 8, e.MaxAudioLastN)
 	// Split video axes (#1602): screen-share (stream) 1080p30/≤5M, webcam (camera) 720p60/≤2.5M.
 	assert.Equal(t, 1080, e.StreamMaxHeight)
-	assert.Equal(t, 30, e.StreamMaxFps)
+	assert.Equal(t, 60, e.StreamMaxFps)               // #2163: raised 30→60 (absolute ceiling); pixel-rate tiers it
+	assert.Equal(t, 62_208_000, e.StreamMaxPixelRate) // #2163: = 1920*1080*30 (1080p30); admits 720p60, rejects 1080p60
 	assert.Equal(t, 5_000_000, e.StreamMaxBitrate)
 	assert.Equal(t, 720, e.CameraMaxHeight)
 	assert.Equal(t, 60, e.CameraMaxFps)
@@ -45,6 +46,7 @@ func TestFor_Premium(t *testing.T) {
 	// Split video axes (#1602): both native (uncapped) resolution/fps; stream ≤20M, camera ≤6M.
 	assert.Equal(t, entitlements.ServerLimitUnlimited, e.StreamMaxHeight)
 	assert.Equal(t, entitlements.ServerLimitUnlimited, e.StreamMaxFps)
+	assert.Equal(t, entitlements.ServerLimitUnlimited, e.StreamMaxPixelRate) // #2163: native (no pixel-rate cap)
 	assert.Equal(t, 20_000_000, e.StreamMaxBitrate)
 	assert.Equal(t, entitlements.ServerLimitUnlimited, e.CameraMaxHeight)
 	assert.Equal(t, entitlements.ServerLimitUnlimited, e.CameraMaxFps)

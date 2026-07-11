@@ -299,6 +299,20 @@ import { useUserStore } from '@/renderer/stores/userStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
 import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
+import {
+  useSubscriptionStore,
+  FREE_ENTITLEMENT,
+  type Entitlement,
+} from '@/renderer/stores/subscriptionStore';
+
+/** Premium entitlement with all three stream-axis native sentinels (#2163). */
+const PREMIUM_ENTITLEMENT_2163: Entitlement = {
+  ...FREE_ENTITLEMENT,
+  tier: 'premium',
+  streamMaxHeight: -1,
+  streamMaxFps: -1,
+  streamMaxPixelRate: -1,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1123,6 +1137,201 @@ describe('VoiceService Extended', () => {
       useVideoSettingsStore.getState().setScreenResolution('2560x1440');
       const bitrate = svc.calculateScreenBitrate('video/VP8');
       expect(bitrate).toBeGreaterThan(0);
+    });
+  });
+
+  // ===== #2163 screenshare res/fps entitlement clamp (produce boundary) =====
+
+  describe('#2163 screenshare entitlement clamp', () => {
+    // resetAllStores() does not cover subscriptionStore, and setEntitlement sets
+    // hydrated=true — reset it so the authoritative-entitlement state does not
+    // leak into later blocks (e.g. produceScreen edge cases) and activate the clamp.
+    afterEach(() => {
+      useSubscriptionStore.getState().reset();
+    });
+
+    it('clampScreenToEntitlement clamps 4K/60 to 1080p/30 for a free user', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+      expect(svc.clampScreenToEntitlement(3840, 2160, 60)).toEqual({
+        width: 1920,
+        height: 1080,
+        fps: 30,
+      });
+    });
+
+    it('clampScreenToEntitlement is a no-op for a premium user', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useSubscriptionStore.getState().setEntitlement(PREMIUM_ENTITLEMENT_2163);
+      expect(svc.clampScreenToEntitlement(3840, 2160, 60)).toEqual({
+        width: 3840,
+        height: 2160,
+        fps: 60,
+      });
+    });
+
+    it('produceScreen clamps capture dims for a free user', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+      useVideoSettingsStore.getState().setScreenResolution('4K');
+      useVideoSettingsStore.getState().setScreenFrameRate(60);
+      const mockTrack = {
+        contentHint: '',
+        readyState: 'live',
+        stop: vi.fn(),
+        getSettings: vi.fn().mockReturnValue({}),
+      };
+      const captureSpy = vi.spyOn(svc, 'captureScreen').mockResolvedValue({
+        getVideoTracks: () => [mockTrack],
+        getTracks: () => [mockTrack],
+        getAudioTracks: () => [],
+      });
+      // Downstream (codec pick / produce) may throw on the minimal mock — the
+      // captureScreen call has already been recorded with the clamped dims.
+      await svc.produceScreen('screen:1').catch(() => {});
+      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30);
+      // Restore the spy on the singleton — vi.clearAllMocks() (beforeEach) clears
+      // call history but not the mocked implementation, so it would otherwise leak.
+      captureSpy.mockRestore();
+    });
+
+    it("produceScreen resolves Native/'source' to the real display so a free 720p share keeps 60fps", async () => {
+      // Codex review regression: 'source' must NOT be treated as the 4K fallback,
+      // else a free user on a 720p display sharing Native is over-clamped to 720p30
+      // when the entitlement plainly admits 720p60 (55.3 Mpx/s < 62.2 Mpx/s).
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+      useVideoSettingsStore.getState().setScreenResolution('source');
+      useVideoSettingsStore.getState().setScreenFrameRate(0); // native → 60
+      const prevElectron = (globalThis as any).electron;
+      (globalThis as any).electron = {
+        ...prevElectron,
+        getDisplayInfo: vi
+          .fn()
+          .mockResolvedValue([
+            { width: 1280, height: 720, refreshRate: 60, scaleFactor: 1, isPrimary: true },
+          ]),
+      };
+      const mockTrack = {
+        contentHint: '',
+        readyState: 'live',
+        stop: vi.fn(),
+        getSettings: vi.fn().mockReturnValue({}),
+      };
+      const captureSpy = vi.spyOn(svc, 'captureScreen').mockResolvedValue({
+        getVideoTracks: () => [mockTrack],
+        getTracks: () => [mockTrack],
+        getAudioTracks: () => [],
+      });
+      await svc.produceScreen('screen:1').catch(() => {});
+      // 720p is within the stream height ceiling and admits 60fps — no degradation.
+      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1280, h: 720 }, 60);
+      captureSpy.mockRestore();
+      (globalThis as any).electron = prevElectron;
+    });
+
+    it("produceScreen falls back to 4K (clamped to free 1080p30) when getDisplayInfo returns no displays for a 'source' share", async () => {
+      // resolveCaptureDims('source') keeps its {3840,2160} fallback when getDisplayInfo
+      // returns an empty list. For a free user that clamps to 1080p30 — the conservative
+      // default. Error-path coverage for the 4K fallback branch (tests.md happy + error).
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+      useVideoSettingsStore.getState().setScreenResolution('source');
+      useVideoSettingsStore.getState().setScreenFrameRate(60);
+      const prevElectron = (globalThis as any).electron;
+      (globalThis as any).electron = {
+        ...prevElectron,
+        getDisplayInfo: vi.fn().mockResolvedValue([]),
+      };
+      const mockTrack = {
+        contentHint: '',
+        readyState: 'live',
+        stop: vi.fn(),
+        getSettings: vi.fn().mockReturnValue({}),
+      };
+      const captureSpy = vi.spyOn(svc, 'captureScreen').mockResolvedValue({
+        getVideoTracks: () => [mockTrack],
+        getTracks: () => [mockTrack],
+        getAudioTracks: () => [],
+      });
+      await svc.produceScreen('screen:1').catch(() => {});
+      // 4K fallback clamped to the free 1080p tier → 30fps.
+      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30);
+      captureSpy.mockRestore();
+      (globalThis as any).electron = prevElectron;
+    });
+
+    it('produceScreen falls back to 4K (not a rejection) when getDisplayInfo rejects (Gitar #2172)', async () => {
+      // Regression: resolveCaptureDims runs BEFORE the capture try block, so a
+      // rejected getDisplayInfo IPC must degrade to the 4K fallback rather than
+      // propagate out of produceScreen (which would break screen sharing for ALL
+      // tiers). A free user at 'source' then clamps that 4K fallback to 1080p30, so
+      // captureScreen being reached with the clamped dims proves no rejection escaped.
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+      useVideoSettingsStore.getState().setScreenResolution('source');
+      useVideoSettingsStore.getState().setScreenFrameRate(60);
+      const prevElectron = (globalThis as any).electron;
+      (globalThis as any).electron = {
+        ...prevElectron,
+        getDisplayInfo: vi.fn().mockRejectedValue(new Error('IPC unavailable')),
+      };
+      const mockTrack = {
+        contentHint: '',
+        readyState: 'live',
+        stop: vi.fn(),
+        getSettings: vi.fn().mockReturnValue({}),
+      };
+      const captureSpy = vi.spyOn(svc, 'captureScreen').mockResolvedValue({
+        getVideoTracks: () => [mockTrack],
+        getTracks: () => [mockTrack],
+        getAudioTracks: () => [],
+      });
+      await svc.produceScreen('screen:1').catch(() => {});
+      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30);
+      captureSpy.mockRestore();
+      (globalThis as any).electron = prevElectron;
+    });
+
+    it('produceScreen ignores a 0-sized display report and uses the 4K fallback (Gitar #2172)', async () => {
+      // Regression: a malformed {0,0} display must not feed a 0-pixel target into
+      // the entitlement clamp (a 0-pixel rate trivially admits any fps). The >0
+      // guard keeps the conservative 4K fallback, which a free user clamps to 1080p30.
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useSubscriptionStore.getState().setEntitlement(FREE_ENTITLEMENT);
+      useVideoSettingsStore.getState().setScreenResolution('source');
+      useVideoSettingsStore.getState().setScreenFrameRate(60);
+      const prevElectron = (globalThis as any).electron;
+      (globalThis as any).electron = {
+        ...prevElectron,
+        getDisplayInfo: vi
+          .fn()
+          .mockResolvedValue([
+            { width: 0, height: 0, refreshRate: 60, scaleFactor: 1, isPrimary: true },
+          ]),
+      };
+      const mockTrack = {
+        contentHint: '',
+        readyState: 'live',
+        stop: vi.fn(),
+        getSettings: vi.fn().mockReturnValue({}),
+      };
+      const captureSpy = vi.spyOn(svc, 'captureScreen').mockResolvedValue({
+        getVideoTracks: () => [mockTrack],
+        getTracks: () => [mockTrack],
+        getAudioTracks: () => [],
+      });
+      await svc.produceScreen('screen:1').catch(() => {});
+      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30);
+      captureSpy.mockRestore();
+      (globalThis as any).electron = prevElectron;
     });
   });
 
