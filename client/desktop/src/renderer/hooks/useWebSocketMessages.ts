@@ -37,7 +37,7 @@ import { useSubscriptionStore } from '../stores/subscriptionStore';
 import { useRichPresenceStore } from '../stores/richPresenceStore';
 import { speak as ttsSpeak } from '../services/ttsService';
 import { notificationSoundService } from '../services/notificationSoundService';
-import { isChannelMuted, isDMMuted } from '../stores/notificationPrefsStore';
+import { isChannelMuted, isDMMuted, hasChannelMuteOverride } from '../stores/notificationPrefsStore';
 
 /**
  * True if the user has Do Not Disturb on. DND suppresses ALL notification
@@ -194,10 +194,30 @@ function shouldSuppressLinkedTextNotification(channelId: string): boolean {
   return useVoiceStore.getState().activeChannelId !== channel.linked_voice_channel_id;
 }
 
-/** Mark a server and optionally its mention state as having unreads. */
-function markServerUnreadWithMention(serverId: string, isMentioned: boolean): void {
+/**
+ * Mark a server and optionally its mention state as having unreads.
+ *
+ * `precise` records whether this mark was mute-resolved. Pass true ONLY when a
+ * concrete channel gated the mark via `isChannelMuted` in `handleUnreadNotify`
+ * (channel-wins resolution ran, so it already means "has an unmuted unread").
+ * A `channel_id`-less `unread_notify` has had NO mute resolution — the guard at
+ * the top of `handleUnreadNotify` is skipped when `channelId` is falsy — so it
+ * must stay approximate and let ServerBar's server-level `!isMuted` gate apply.
+ * Marking such a notify precise would light the dot on a server the user muted
+ * at the server level (regression of the #84 / epic #1029 mute contract).
+ *
+ * `channelWins` records that the gating channel had its own mute override, so a
+ * background server's precise mark survives a later server mute (the demote
+ * sweep in useServerChannelSubscriptions skips channel-wins servers).
+ */
+function markServerUnreadWithMention(
+  serverId: string,
+  isMentioned: boolean,
+  precise: boolean,
+  channelWins = false
+): void {
   const unreadStore = useUnreadStore.getState();
-  unreadStore.markServerUnread(serverId);
+  unreadStore.markServerUnread(serverId, precise, channelWins);
   if (isMentioned) unreadStore.markServerMention(serverId);
 }
 
@@ -228,7 +248,17 @@ function handleUnreadNotify(msg: Extract<WebSocketEvent, { type: 'unread_notify'
   const activeServerId = useServerStore.getState().activeServerId;
 
   if (serverId && serverId !== activeServerId) {
-    markServerUnreadWithMention(serverId, isMentioned);
+    // Precise only when a concrete channel gated the mark above (the mute guard
+    // at line ~227 runs solely for a present `channelId`). A `channel_id`-less
+    // notify has had no mute resolution, so keep it approximate and let
+    // ServerBar's server-level `!isMuted` gate suppress muted servers.
+    //
+    // channelWins: when that concrete channel carries its own mute override, the
+    // not-muted verdict came from the channel-wins branch (not the server
+    // fallback), so this precise mark must outlive a later server mute; the
+    // background demote sweep leaves channel-wins servers alone.
+    const channelWins = channelId ? hasChannelMuteOverride(channelId) : false;
+    markServerUnreadWithMention(serverId, isMentioned, Boolean(channelId), channelWins);
     return;
   }
 
@@ -238,7 +268,9 @@ function handleUnreadNotify(msg: Extract<WebSocketEvent, { type: 'unread_notify'
 
   useUnreadStore.getState().incrementUnread(channelId);
   if (isMentioned) useUnreadStore.getState().incrementMention(channelId);
-  if (serverId) markServerUnreadWithMention(serverId, isMentioned);
+  // `channelId` is guaranteed present here (guarded above), so the mute
+  // resolution ran — this mark is precise.
+  if (serverId) markServerUnreadWithMention(serverId, isMentioned, true);
 
   // Notification sound for unfocused-channel messages
   if (isMentioned) {
@@ -1337,15 +1369,20 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       // suppression sits first.
       if (isDoNotDisturb()) return;
 
-      // Mute check for DMs: drop the notification entirely (badge + sound +
-      // last-message preview update). Skipping the preview update is the
-      // right call here — preview is a side effect of the notification UX,
-      // not of message storage; muting should make the conversation feel
-      // quiet, not advance its preview behind the user's back.
-      if (isDMMuted(conversationId)) return;
+      // Mute check for DMs (#84 / epic #1029 close audit): a muted DM still
+      // ACCUMULATES its hidden unread count so that unmuting later reveals
+      // messages that arrived while muted. The ConversationList badge and the
+      // ServerBar PM badge are render-gated on mute (nothing shows while muted),
+      // and there is no unmute-time refetch to recover a dropped count — so
+      // bailing here (the pre-audit behavior) permanently lost muted-window
+      // unreads. Only the VISIBLE affordances are suppressed: the notification
+      // sound, and the last-message preview advance (muting should make the
+      // conversation feel quiet, not surface new content behind the user's
+      // back — the original #84 intent).
+      const muted = isDMMuted(conversationId);
 
-      // Also update last message preview if provided
-      if (data.last_message) {
+      // Update last message preview if provided — skipped while muted per #84.
+      if (!muted && data.last_message) {
         useDMStore.getState().updateLastMessage(conversationId, {
           content: data.last_message.content || '',
           userId: data.last_message.user_id || data.user_id || '',
@@ -1365,8 +1402,10 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
         useUnreadStore.getState().incrementMention(conversationId);
       }
 
-      // Notification sound for unfocused DM messages
-      notificationSoundService.play('dm');
+      // Notification sound for unfocused DM messages — silenced while muted.
+      if (!muted) {
+        notificationSoundService.play('dm');
+      }
     });
 
     // DM conversation created — msg.data narrowed to DMConversationCreatedPayload.
@@ -1505,8 +1544,11 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       // the sound must not depend on the to_* fields the server doesn't emit yet
       // (#981). The to_* guard below only suppresses the one-sided LIST record,
       // not the notification; keeping the sound here means it fires even while
-      // the record is dropped.
-      notificationSoundService.play('friend-request');
+      // the record is dropped. It still honors presence DND (DND suppresses ALL
+      // notification surfacing — see isDoNotDisturb above).
+      if (!isDoNotDisturb()) {
+        notificationSoundService.play('friend-request');
+      }
 
       if (!data.to_user_id || !data.to_username) {
         // PII-minimization (CWE-532): never log the full payload — it carries

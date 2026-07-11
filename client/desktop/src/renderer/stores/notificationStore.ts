@@ -1,3 +1,21 @@
+/**
+ * Device-local notification preferences (epic #1029 — Desktop Notification
+ * Preferences & Controls).
+ *
+ * TWO-STORE SPLIT: this store holds DEVICE-LOCAL preferences, persisted to
+ * localStorage via zustand/persist. Per-target mute preferences (servers /
+ * channels / DMs) are SERVER-persisted and live in `notificationPrefsStore`
+ * (#84) — hydrated from GET /api/v1/notifications/preferences on login.
+ *
+ * Field ownership (epic #1029 AC — which preference belongs to which child):
+ * - `notificationContent` → #1030 (PR #1970), content-privacy mode.
+ * - Per-target mute state → #84 (PR #985), in `notificationPrefsStore`.
+ * - #1955 (PR #2054) added no fields here — it fixed the friend-request
+ *   sound dispatch path in `useWebSocketMessages.ts`.
+ * Pre-epic fields: chat sound toggles + `suppressWhenFocused` (PR #375),
+ * voice-event sounds (PR #394), per-category volumes (PR #743), desktop
+ * notification toggles + `doNotDisturb` + quiet hours (PR #478).
+ */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { wrapStore } from '../utils/createStore';
@@ -53,11 +71,17 @@ export interface NotificationSoundSettings {
   desktopNotifyMentions: boolean;
   /** Show desktop notification for all channel messages */
   desktopNotifyAllMessages: boolean;
-  /** Controls how much message detail OS-level desktop notifications show */
+  /** Controls how much message detail OS-level desktop notifications show (#1030) */
   notificationContent: NotificationContentMode;
-  /** Suppress all notifications when DND status is active */
+  /**
+   * Pause desktop notification popups and chat notification sounds
+   * (Settings ▸ "Pause Notifications"). Device-local toggle — DISTINCT from
+   * the presence "Do Not Disturb" STATUS (memberStore.selfStatus === 'dnd'),
+   * which additionally suppresses unread badges. The persisted key stays
+   * `doNotDisturb` for localStorage snapshot compatibility.
+   */
   doNotDisturb: boolean;
-  /** Enable quiet hours (time-based suppression) */
+  /** Enable quiet hours — pauses desktop popups + chat sounds in the window */
   quietHoursEnabled: boolean;
   /** Quiet hours start time (HH:MM format) */
   quietHoursStart: string;

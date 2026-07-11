@@ -1,6 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { MessageSquare, Users, BookOpen, UserPlus, PenLine } from 'lucide-react';
 import { useDMStore, type DMConversation, type DMParticipant } from '../../stores/dmStore';
+import {
+  useNotificationPrefsStore,
+  isEntryCurrentlyMuted,
+} from '../../stores/notificationPrefsStore';
 import { useUserStore } from '../../stores/userStore';
 import { useVoiceStore } from '../../stores/voiceStore';
 import { useFriendStore } from '../../stores/friendStore';
@@ -127,6 +131,9 @@ const ConversationList: React.FC<ConversationListProps> = ({
   const removeFriend = useFriendStore((s) => s.removeFriend);
   const friends = useFriendStore((s) => s.friends);
   const conversations = useDMStore((s) => s.conversations);
+  // Muted DMs (#84) suppress the unread indicator at render time — the count
+  // stays intact so un-muting reveals it instantly (epic #1029 close audit).
+  const mutedDMs = useNotificationPrefsStore((s) => s.mutedDMs);
   const fetchConversations = useDMStore((s) => s.fetchConversations);
   const openPersonalThread = useDMStore((s) => s.openPersonalThread);
   const currentUserId = useUserStore((s) => s.user?.id) || '';
@@ -266,6 +273,9 @@ const ConversationList: React.FC<ConversationListProps> = ({
           const participantStatus = other?.status;
           const status = friendStatus ?? participantStatus ?? 'offline';
           const lastTime = conv.lastMessage?.createdAt || conv.createdAt;
+          // A muted conversation shows no unread affordance (badge or row
+          // highlight); the count itself is preserved in the store.
+          const showUnread = conv.unreadCount > 0 && !isEntryCurrentlyMuted(mutedDMs.get(conv.id));
           let preview = '';
           if (conv.lastMessage) {
             const hasPlaintextPreview = conv.lastMessage.plaintextPreview !== undefined;
@@ -284,7 +294,7 @@ const ConversationList: React.FC<ConversationListProps> = ({
             <button
               type="button"
               key={conv.id}
-              className={`conversation-item${selectedThreadId === conv.id ? ' active' : ''}${conv.unreadCount > 0 ? ' unread' : ''}`}
+              className={`conversation-item${selectedThreadId === conv.id ? ' active' : ''}${showUnread ? ' unread' : ''}`}
               onClick={() => onSelectThread(conv.id)}
               onContextMenu={(e) => {
                 e.preventDefault();
@@ -352,7 +362,7 @@ const ConversationList: React.FC<ConversationListProps> = ({
                         <PenLine size={12} />
                       </span>
                     )}
-                    {conv.unreadCount > 0 && (
+                    {showUnread && (
                       <span className="conversation-unread-badge">
                         {conv.unreadCount > 99 ? '99+' : conv.unreadCount}
                       </span>

@@ -62,6 +62,9 @@ vi.mock('../../../src/renderer/stores/voiceStore', () => ({
 }));
 
 import { useKeyboardShortcuts } from '../../../src/renderer/hooks/useKeyboardShortcuts';
+// NOT mocked: unread navigation resolves mutes through the real prefs store,
+// so we drive it via setMute/clearAll to exercise the mute-aware skip.
+import { useNotificationPrefsStore } from '../../../src/renderer/stores/notificationPrefsStore';
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -87,11 +90,13 @@ describe('useKeyboardShortcuts', () => {
       channelSwitcherOpen: false,
     };
 
+    useNotificationPrefsStore.getState().clearAll();
+
     mockChannelStoreState = {
       channels: [
-        { id: 'ch-1', name: 'general', type: 'text' },
-        { id: 'ch-2', name: 'random', type: 'text' },
-        { id: 'ch-3', name: 'dev', type: 'text' },
+        { id: 'ch-1', server_id: 'srv-1', name: 'general', type: 'text' },
+        { id: 'ch-2', server_id: 'srv-1', name: 'random', type: 'text' },
+        { id: 'ch-3', server_id: 'srv-1', name: 'dev', type: 'text' },
       ],
       activeChannelId: 'ch-2',
       setActiveChannel: mockSetActiveChannel,
@@ -186,6 +191,15 @@ describe('useKeyboardShortcuts', () => {
     expect(mockSetActiveChannel).toHaveBeenCalledWith('ch-3');
   });
 
+  it('nav-unread-up skips a muted channel with no visible indicator', () => {
+    // ch-1 keeps its unread count in the store but is muted, so it renders no
+    // badge, so Prev Unread must skip it and wrap to the visible ch-3 (#84 P2).
+    useNotificationPrefsStore.getState().setMute('channel', 'ch-1', true, null);
+    renderHook(() => useKeyboardShortcuts());
+    getHandler('nav-unread-up')();
+    expect(mockSetActiveChannel).toHaveBeenCalledWith('ch-3');
+  });
+
   // ── Handler: nav-unread-down ───────────────────────────────────────
 
   it('nav-unread-down moves to next unread channel', () => {
@@ -201,6 +215,23 @@ describe('useKeyboardShortcuts', () => {
     getHandler('nav-unread-down')();
     // Active is ch-3 (idx 2), no unread after — wraps to ch-1 (idx 0)
     expect(mockSetActiveChannel).toHaveBeenCalledWith('ch-1');
+  });
+
+  it('nav-unread-down skips a muted channel with no visible indicator', () => {
+    // ch-3 is the only forward unread but it is muted (no badge), and the
+    // wrap-around ch-1 is also unread, so Next Unread must land on ch-1 (#84 P2).
+    useNotificationPrefsStore.getState().setMute('channel', 'ch-3', true, null);
+    renderHook(() => useKeyboardShortcuts());
+    getHandler('nav-unread-down')();
+    expect(mockSetActiveChannel).toHaveBeenCalledWith('ch-1');
+  });
+
+  it('nav-unread-down does nothing when the only unread channels are muted', () => {
+    useNotificationPrefsStore.getState().setMute('channel', 'ch-1', true, null);
+    useNotificationPrefsStore.getState().setMute('channel', 'ch-3', true, null);
+    renderHook(() => useKeyboardShortcuts());
+    getHandler('nav-unread-down')();
+    expect(mockSetActiveChannel).not.toHaveBeenCalled();
   });
 
   // ── Handler: close-modal ───────────────────────────────────────────

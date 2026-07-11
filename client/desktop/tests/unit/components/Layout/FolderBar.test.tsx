@@ -2,6 +2,7 @@ import { render, screen, fireEvent } from '../../../test-utils';
 import { useServerStore } from '@/renderer/stores/serverStore';
 import { useLayoutStore } from '@/renderer/stores/layoutStore';
 import { useUnreadStore } from '@/renderer/stores/unreadStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
 import { mockServer, mockServer2 } from '../../../mocks/fixtures';
 import FolderBar from '@/renderer/components/Layout/FolderBar';
 
@@ -18,7 +19,9 @@ describe('FolderBar', () => {
     });
     useUnreadStore.setState({
       serverUnreadSet: new Set(),
+      serverUnreadPreciseSet: new Set(),
     });
+    useNotificationPrefsStore.setState({ mutedServers: new Map() });
   });
 
   it('renders without crashing', () => {
@@ -244,6 +247,49 @@ describe('FolderBar', () => {
     useUnreadStore.setState({ serverUnreadSet: new Set(['server-1', 'server-2']) });
     const { container } = render(<FolderBar />);
     const badge = container.querySelector('.folder-chip-badge');
+    expect(badge).toBeInTheDocument();
+    expect(badge?.textContent).toBe('2');
+  });
+
+  // A folder's count must match the ServerBar dots: a muted server whose unread
+  // is only approximate (bulk seed) is excluded, matching its dark top-level
+  // icon (#84 / epic #1029 close audit, P2 follow-up).
+  it('excludes an approximate-unread muted server from the folder count', () => {
+    useLayoutStore.setState({
+      serverFolders: [
+        { id: 'folder-1', name: 'My Folder', serverIds: ['server-1', 'server-2'], collapsed: true },
+      ],
+    });
+    useServerStore.setState({ servers: [mockServer, mockServer2] });
+    useUnreadStore.setState({ serverUnreadSet: new Set(['server-1', 'server-2']) });
+    // server-2 is muted and its unread is approximate → not visible.
+    useNotificationPrefsStore.getState().setMute('server', 'server-2', true, null);
+
+    const { container } = render(<FolderBar />);
+    const badge = container.querySelector('.folder-chip-badge');
+    // Only server-1 counts.
+    expect(badge).toBeInTheDocument();
+    expect(badge?.textContent).toBe('1');
+  });
+
+  // Channel-wins: a muted server carrying a PRECISE unread (an explicitly
+  // unmuted channel) still counts, matching its lit top-level dot.
+  it('counts a muted server with a precise unread (channel-wins override)', () => {
+    useLayoutStore.setState({
+      serverFolders: [
+        { id: 'folder-1', name: 'My Folder', serverIds: ['server-1', 'server-2'], collapsed: true },
+      ],
+    });
+    useServerStore.setState({ servers: [mockServer, mockServer2] });
+    useUnreadStore.setState({
+      serverUnreadSet: new Set(['server-1', 'server-2']),
+      serverUnreadPreciseSet: new Set(['server-2']),
+    });
+    useNotificationPrefsStore.getState().setMute('server', 'server-2', true, null);
+
+    const { container } = render(<FolderBar />);
+    const badge = container.querySelector('.folder-chip-badge');
+    // Both count: server-1 (unmuted) and server-2 (muted but precise).
     expect(badge).toBeInTheDocument();
     expect(badge?.textContent).toBe('2');
   });

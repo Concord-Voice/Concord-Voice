@@ -3,6 +3,7 @@ import { useMemberStore } from '../stores/memberStore';
 import { useServerStore } from '../stores/serverStore';
 import { useChannelStore } from '../stores/channelStore';
 import { useUnreadStore } from '../stores/unreadStore';
+import { hasUnmutedChannel } from '../stores/notificationPrefsStore';
 import { apiFetch } from '../services/apiClient';
 import { errorMessage } from '../utils/redactError';
 
@@ -56,9 +57,15 @@ export function useDNDTransitionRefresh(): void {
               counts.set(entry.channel_id, entry.unread_count);
             }
           }
-          useUnreadStore.getState().setInitialUnreads(counts);
-          if (counts.size > 0) useUnreadStore.getState().markServerUnread(activeServerId);
-          else useUnreadStore.getState().clearServerUnread(activeServerId);
+          useUnreadStore.getState().setInitialUnreads(counts, activeServerId);
+          // A muted channel must not light the server dot (#84 acceptance
+          // criterion; epic #1029 close audit) — mark only when at least one
+          // fetched unread channel is not effectively muted.
+          if (hasUnmutedChannel(counts.keys(), activeServerId)) {
+            useUnreadStore.getState().markServerUnread(activeServerId, true);
+          } else {
+            useUnreadStore.getState().clearServerUnread(activeServerId);
+          }
         })
         .catch((err) => {
           console.warn('Failed to refresh unread counts after DND toggle-off:', errorMessage(err));

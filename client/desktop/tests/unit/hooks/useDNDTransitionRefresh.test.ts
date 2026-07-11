@@ -4,6 +4,7 @@ import { useMemberStore } from '@/renderer/stores/memberStore';
 import { useServerStore } from '@/renderer/stores/serverStore';
 import { useChannelStore } from '@/renderer/stores/channelStore';
 import { useUnreadStore } from '@/renderer/stores/unreadStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
 
 vi.mock('@/renderer/services/apiClient', () => ({
   apiFetch: vi.fn(),
@@ -117,6 +118,55 @@ describe('useDNDTransitionRefresh', () => {
 
     await waitFor(() => {
       expect(useUnreadStore.getState().serverUnreadSet.has(SERVER_ID)).toBe(false);
+    });
+  });
+
+  it('does not mark the server unread when every refetched unread channel is muted', async () => {
+    // #84 acceptance criterion (epic #1029 close audit): per-target mutes now
+    // govern the server dot. Pre-seed the flag so we can prove it gets CLEARED
+    // rather than merely never set.
+    useUnreadStore.getState().markServerUnread(SERVER_ID);
+    useNotificationPrefsStore.getState().setMute('channel', CHANNEL_A, true, null);
+    useNotificationPrefsStore.getState().setMute('channel', CHANNEL_B, true, null);
+    useMemberStore.setState({ selfStatus: 'dnd' });
+    renderHook(() => useDNDTransitionRefresh());
+
+    mockApiFetch.mockResolvedValueOnce(
+      mockUnreadResponse([
+        { channel_id: CHANNEL_A, unread_count: 4 },
+        { channel_id: CHANNEL_B, unread_count: 2 },
+      ])
+    );
+
+    act(() => {
+      useMemberStore.getState().setSelfStatus('online');
+    });
+
+    // Both channels are muted, so the server dot is cleared, not marked.
+    await waitFor(() => {
+      expect(useUnreadStore.getState().serverUnreadSet.has(SERVER_ID)).toBe(false);
+    });
+  });
+
+  it('marks the server unread when at least one refetched unread channel is unmuted', async () => {
+    // One muted + one unmuted — the unmuted channel still lights the server dot.
+    useNotificationPrefsStore.getState().setMute('channel', CHANNEL_A, true, null);
+    useMemberStore.setState({ selfStatus: 'dnd' });
+    renderHook(() => useDNDTransitionRefresh());
+
+    mockApiFetch.mockResolvedValueOnce(
+      mockUnreadResponse([
+        { channel_id: CHANNEL_A, unread_count: 4 },
+        { channel_id: CHANNEL_B, unread_count: 2 },
+      ])
+    );
+
+    act(() => {
+      useMemberStore.getState().setSelfStatus('online');
+    });
+
+    await waitFor(() => {
+      expect(useUnreadStore.getState().serverUnreadSet.has(SERVER_ID)).toBe(true);
     });
   });
 

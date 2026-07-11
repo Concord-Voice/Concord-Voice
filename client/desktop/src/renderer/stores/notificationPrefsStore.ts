@@ -1,3 +1,12 @@
+/**
+ * Server-persisted per-target mute preferences (#84, PR #985 — child of
+ * epic #1029, Desktop Notification Preferences & Controls).
+ *
+ * TWO-STORE SPLIT: this store holds the SERVER-persisted mute rows (servers /
+ * channels / DMs), hydrated from GET /api/v1/notifications/preferences on
+ * login and NOT persisted locally. Device-local preferences (sounds, desktop
+ * toggles, content privacy, quiet hours) live in `notificationStore`.
+ */
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
 import { wrapStore } from '../utils/createStore';
@@ -16,8 +25,9 @@ import { wrapStore } from '../utils/createStore';
  *
  * `mutedUntil` is the wall-clock instant the mute expires. The store treats
  * expired entries as "not currently muted" without mutating the map — a
- * background sweep prunes them periodically so the wire payload stays small
- * on the next hydration.
+ * background sweep prunes them periodically so the in-memory maps don't grow
+ * without bound. (The sweep is client-side only; the server keeps expired
+ * rows, so they reappear on the next hydration until overwritten.)
  */
 /**
  * The three kinds of mute targets the backend stores. Matches the CHECK
@@ -75,8 +85,9 @@ interface NotificationPrefsState {
 
   /**
    * Sweep all three maps and drop entries whose mute expired in the past.
-   * Triggered every 60s by a timer wired in main.tsx — keeps the maps from
-   * growing without bound for users who use short timed mutes.
+   * Triggered every 60s by `startExpirySweep()` in notificationPrefsService.ts,
+   * started on hydration (`tryHydrateNotificationPrefs` via postLoginHydration)
+   * — keeps the maps from growing without bound for short timed mutes.
    */
   clearExpiredMutes: () => void;
 
@@ -247,18 +258,90 @@ export const useNotificationPrefsStore = wrapStore(
  */
 export function isChannelMuted(channelId: string, serverId: string | null): boolean {
   const state = useNotificationPrefsStore.getState();
-  const channelEntry = state.mutedChannels.get(channelId);
+  return isChannelMutedInMaps(channelId, serverId, state.mutedChannels, state.mutedServers);
+}
+
+/**
+ * Pure variant of `isChannelMuted` operating on caller-supplied maps.
+ *
+ * Components that render unread badges subscribe to `mutedChannels` /
+ * `mutedServers` reactively (`useNotificationPrefsStore((s) => s.mutedChannels)`)
+ * and resolve through this helper, so a mute toggle re-renders the badge
+ * immediately. Keeps the channel-wins / server-fallback resolution order in
+ * exactly one place for both the event-handler path and the render path.
+ */
+export function isChannelMutedInMaps(
+  channelId: string,
+  serverId: string | null,
+  mutedChannels: Map<string, MuteEntry>,
+  mutedServers: Map<string, MuteEntry>
+): boolean {
+  const channelEntry = mutedChannels.get(channelId);
   if (channelEntry) {
     return isEntryCurrentlyMuted(channelEntry);
   }
   if (serverId) {
-    return isEntryCurrentlyMuted(state.mutedServers.get(serverId));
+    return isEntryCurrentlyMuted(mutedServers.get(serverId));
   }
   return false;
+}
+
+/**
+ * True if a server should show its unread affordance (the ServerBar dot, the
+ * FolderBar count badge, and the folder tooltip).
+ *
+ * A precise entry was set by a mute-AWARE source (unread_notify / per-channel
+ * fetch / recompute / DND refresh), so it already means "has an unmuted unread"
+ * with channel-wins resolution applied, so it is trusted outright: a channel
+ * explicitly unmuted under a muted server still lights up. An approximate
+ * entry (the mute-UNAWARE bulk seed) falls back to the server-level mute gate.
+ *
+ * Shared by ServerBar and FolderBar so the top-level server icon and the
+ * folder affordances agree; without this, a foldered muted server whose only
+ * unreads are muted still lights its folder badge even though its top-level
+ * icon is dark (#84 / epic #1029 close audit).
+ */
+export function isServerUnreadVisible(
+  serverId: string,
+  serverUnreadSet: Set<string>,
+  serverUnreadPreciseSet: Set<string>,
+  mutedServers: Map<string, MuteEntry>
+): boolean {
+  if (!serverUnreadSet.has(serverId)) return false;
+  if (serverUnreadPreciseSet.has(serverId)) return true;
+  return !isEntryCurrentlyMuted(mutedServers.get(serverId));
+}
+
+/**
+ * True if this channel carries its OWN mute preference row, so the
+ * channel-wins branch of isChannelMutedInMaps decides its state and the
+ * server-level pref is bypassed entirely (mute OR explicit-unmute; either way
+ * the channel's own opinion wins). The WS unread path uses this to tag a
+ * background server's precise unread as a channel-wins override, so a later
+ * server mute does not demote a dot isServerUnreadVisible is meant to honor
+ * (#84 / epic #1029 close audit, P2 review follow-up).
+ */
+export function hasChannelMuteOverride(channelId: string): boolean {
+  return useNotificationPrefsStore.getState().mutedChannels.has(channelId);
 }
 
 /** True if THIS DM conversation should be treated as muted right now. */
 export function isDMMuted(conversationId: string): boolean {
   const entry = useNotificationPrefsStore.getState().mutedDMs.get(conversationId);
   return isEntryCurrentlyMuted(entry);
+}
+
+/**
+ * True if at least one channel in `channelIds` is NOT effectively muted for
+ * `serverId`. The unread-hydration paths use this to decide whether to light a
+ * server dot — a server whose only unreads are muted channels must stay dark
+ * (#84 acceptance criterion; epic #1029 close audit). A named module-level
+ * helper (rather than an inline `.some`) keeps those event-context callbacks
+ * under the function-nesting-depth ceiling.
+ */
+export function hasUnmutedChannel(channelIds: Iterable<string>, serverId: string): boolean {
+  for (const channelId of channelIds) {
+    if (!isChannelMuted(channelId, serverId)) return true;
+  }
+  return false;
 }

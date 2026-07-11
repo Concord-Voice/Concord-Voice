@@ -13,6 +13,7 @@ import { useMessageFetch } from '../../hooks/useMessageFetch';
 import { useChatController } from '../../hooks/useChatController';
 import { useUnreadStore } from '../../stores/unreadStore';
 import { useServerStore } from '../../stores/serverStore';
+import { isChannelMuted } from '../../stores/notificationPrefsStore';
 import type { ChatContext, MessageWithStatus } from '../../types/chat';
 import './ChatView.css';
 
@@ -62,8 +63,13 @@ const ChatView: React.FC = () => {
       if (!channelId || count <= 0) return;
       useUnreadStore.getState().setUnreadCount(channelId, count);
       const serverId = useServerStore.getState().activeServerId;
-      if (serverId) {
-        useUnreadStore.getState().markServerUnread(serverId);
+      // This is a concrete per-channel count, so it is mute-resolved: light the
+      // server dot only when THIS channel is not effectively muted, and mark it
+      // precise so an explicit channel-unmute under a muted server still shows
+      // the dot (channel-wins). A muted channel's leftover unread must not light
+      // the server (#84 acceptance criterion; epic #1029 close audit, P2 review).
+      if (serverId && !isChannelMuted(channelId, serverId)) {
+        useUnreadStore.getState().markServerUnread(serverId, true);
       }
     },
     [activeChannelId]

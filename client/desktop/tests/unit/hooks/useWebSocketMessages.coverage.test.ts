@@ -21,6 +21,7 @@ import { useUserStore } from '@/renderer/stores/userStore';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { useMemberStore } from '@/renderer/stores/memberStore';
 import { useUnreadStore } from '@/renderer/stores/unreadStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useDMStore } from '@/renderer/stores/dmStore';
 import { useFriendStore } from '@/renderer/stores/friendStore';
@@ -1231,7 +1232,47 @@ describe('useWebSocketMessages — coverage boost', () => {
         });
       });
 
-      expect(markSpy).toHaveBeenCalledWith('server-2');
+      // Precise, but NOT channel-wins: ch-5 carries no mute override, so its
+      // not-muted verdict came from the server fallback and stays demotable.
+      expect(markSpy).toHaveBeenCalledWith('server-2', true, false);
+    });
+
+    it('marks a non-active server CHANNEL-WINS when the gating channel has its own override', () => {
+      // An explicitly-unmuted channel under a muted server produces a precise
+      // mark whose not-muted verdict came from the channel-wins branch, so it
+      // must be tagged channelWins=true to survive the background demote sweep.
+      useServerStore.getState().setActiveServer('server-1');
+      useNotificationPrefsStore.getState().setMute('channel', 'ch-5', false, null);
+      const { handler } = setupHandler('unread_notify');
+      const markSpy = vi.spyOn(useUnreadStore.getState(), 'markServerUnread');
+
+      act(() => {
+        handler({
+          type: 'unread_notify',
+          data: { server_id: 'server-2', channel_id: 'ch-5' },
+        });
+      });
+
+      expect(markSpy).toHaveBeenCalledWith('server-2', true, true);
+    });
+
+    it('marks a non-active server APPROXIMATE when the notify has no channel_id', () => {
+      // A channel_id-less unread_notify has had no mute resolution (the mute
+      // guard only runs for a present channel_id), so it must stay approximate
+      // — otherwise a server-level-muted server would light its dot.
+      useServerStore.getState().setActiveServer('server-1');
+      const { handler } = setupHandler('unread_notify');
+      const markSpy = vi.spyOn(useUnreadStore.getState(), 'markServerUnread');
+
+      act(() => {
+        handler({
+          type: 'unread_notify',
+          data: { server_id: 'server-2' },
+        });
+      });
+
+      // Approximate and never channel-wins: no channel to resolve an override.
+      expect(markSpy).toHaveBeenCalledWith('server-2', false, false);
     });
 
     it('marks server mention for non-active server with mention flag', () => {

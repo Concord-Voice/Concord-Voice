@@ -14,8 +14,10 @@ import { useConnectionStore } from '@/renderer/stores/connectionStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useFriendStore } from '@/renderer/stores/friendStore';
 import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
+import { useMemberStore } from '@/renderer/stores/memberStore';
 import { useDMStore } from '@/renderer/stores/dmStore';
 import { useUnreadStore } from '@/renderer/stores/unreadStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel } from '../../mocks/fixtures';
 
@@ -97,6 +99,9 @@ function addDMConversation(id: string, unreadCount = 0) {
 
 beforeEach(() => {
   resetAllStores();
+  // resetAllStores/clearMembers preserves presence state; pin selfStatus back
+  // to the default so the DND suppression test can't leak into later tests.
+  useMemberStore.setState({ selfStatus: 'online' });
   useAuthStore.getState().setAccessToken('mock-token');
   useChannelStore.getState().addChannel(mockChannel);
   useChatStore.setState({ isConnected: true });
@@ -394,6 +399,40 @@ describe('useWebSocketMessages — extended handlers', () => {
       expect(conversation?.lastMessage?.content).toBe('Still reading this thread');
       expect(useUnreadStore.getState().mentionCounts.get('conv-1')).toBeUndefined();
       expect(notificationSoundService.play).not.toHaveBeenCalled();
+    });
+
+    // Muted DM accumulation (#84 / epic #1029 close audit — Codex round-2 P2):
+    // a muted DM must still accumulate its hidden unread count so unmuting
+    // later reveals messages that arrived while muted; only the visible
+    // affordances (sound + preview advance) are suppressed.
+    it('accumulates the hidden unread count for a muted DM without sound or preview advance', () => {
+      const ws = createMockWsService();
+      addDMConversation('conv-1');
+      useNotificationPrefsStore.getState().setMute('dm', 'conv-1', true, null);
+      renderHook(() => useWebSocketMessages(ws as never));
+
+      const handler = ws.handlers.get('dm_unread_notify')!;
+      act(() => {
+        handler({
+          type: 'dm_unread_notify',
+          data: {
+            conversation_id: 'conv-1',
+            last_message: {
+              content: 'Message while muted',
+              user_id: 'user-2',
+              username: 'alice',
+              created_at: '2025-01-01T02:00:00Z',
+            },
+          },
+        });
+      });
+
+      const conversation = useDMStore.getState().conversations.find((c) => c.id === 'conv-1');
+      // Count accumulates (revealed on unmute via the render-time gate)...
+      expect(conversation?.unreadCount).toBe(1);
+      // ...but the DM stays quiet: no sound, and the preview is not advanced.
+      expect(notificationSoundService.play).not.toHaveBeenCalled();
+      expect(conversation?.lastMessage?.content).not.toBe('Message while muted');
     });
   });
 
@@ -846,6 +885,36 @@ describe('useWebSocketMessages — extended handlers', () => {
       });
 
       expect(notificationSoundService.play).toHaveBeenCalledWith('friend-request');
+    });
+
+    // DND contract (#84 / epic #1029 audit): DND suppresses ALL notification
+    // surfacing, so the friend-request sound is silenced while selfStatus is
+    // 'dnd' — but the request record still lands (the event arrived; only the
+    // attention-drawing surface is suppressed).
+    it('suppresses the friend-request sound under Do Not Disturb but still records the request', () => {
+      useMemberStore.setState({ selfStatus: 'dnd' });
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+
+      const handler = ws.handlers.get('friend_request_received')!;
+      act(() => {
+        handler({
+          type: 'friend_request_received',
+          data: {
+            id: 'req-3',
+            from_user_id: 'user-2',
+            from_username: 'alice',
+            to_user_id: 'user-1',
+            to_username: 'testuser',
+            created_at: '2025-01-01T00:00:00Z',
+          },
+        });
+      });
+
+      expect(notificationSoundService.play).not.toHaveBeenCalled();
+      expect(useFriendStore.getState().pendingRequests).toContainEqual(
+        expect.objectContaining({ id: 'req-3', direction: 'received' })
+      );
     });
 
     it('handles friend_request_accepted with flat payload', () => {

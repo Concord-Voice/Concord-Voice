@@ -4,6 +4,10 @@ import { createPortal } from 'react-dom';
 import { ChevronDown, FolderPlus, Pencil, Trash2 } from 'lucide-react';
 import { useServerStore } from '../../stores/serverStore';
 import { useUnreadStore } from '../../stores/unreadStore';
+import {
+  useNotificationPrefsStore,
+  isServerUnreadVisible,
+} from '../../stores/notificationPrefsStore';
 import { useVoiceStore } from '../../stores/voiceStore';
 import { useLayoutStore, ServerFolder } from '../../stores/layoutStore';
 import { useNavigate, useLocation } from 'react-router-dom';
@@ -24,6 +28,8 @@ const FolderBar: React.FC = () => {
   const servers = useServerStore((s) => s.servers);
   const setActiveServer = useServerStore((s) => s.setActiveServer);
   const serverUnreadSet = useUnreadStore((s) => s.serverUnreadSet);
+  const serverUnreadPreciseSet = useUnreadStore((s) => s.serverUnreadPreciseSet);
+  const mutedServers = useNotificationPrefsStore((s) => s.mutedServers);
   const serverVoiceCounts = useVoiceStore((s) => s.serverVoiceCounts);
 
   const serverFolders = useLayoutStore((s) => s.serverFolders);
@@ -160,7 +166,13 @@ const FolderBar: React.FC = () => {
   };
 
   const getFolderUnreadCount = (folder: ServerFolder): number => {
-    return folder.serverIds.filter((id) => serverUnreadSet.has(id)).length;
+    // Mute-aware, matching the ServerBar dot: a muted server counts only when
+    // its unread is precise (an explicitly-unmuted channel under channel-wins),
+    // so a foldered server whose only unreads are muted stays dark like its
+    // top-level icon (#84 / epic #1029 close audit).
+    return folder.serverIds.filter((id) =>
+      isServerUnreadVisible(id, serverUnreadSet, serverUnreadPreciseSet, mutedServers)
+    ).length;
   };
 
   // Context menu handlers
@@ -658,9 +670,12 @@ const FolderBar: React.FC = () => {
                 {serverVoiceCounts[hoveredServer.server.id] ?? 0} In Voice
               </span>
             </div>
-            {serverUnreadSet.has(hoveredServer.server.id) && (
-              <span className="server-bar-tooltip-unread">Unread notifications</span>
-            )}
+            {isServerUnreadVisible(
+              hoveredServer.server.id,
+              serverUnreadSet,
+              serverUnreadPreciseSet,
+              mutedServers
+            ) && <span className="server-bar-tooltip-unread">Unread notifications</span>}
           </div>,
           document.body
         )}

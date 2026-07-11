@@ -14,6 +14,12 @@ import { useChatStore } from '../stores/chatStore';
 import { useChannelStore } from '../stores/channelStore';
 import { useUnreadStore } from '../stores/unreadStore';
 import { getWebSocketService } from '../services/websocketService';
+import {
+  useNotificationPrefsStore,
+  hasUnmutedChannel,
+  isChannelMutedInMaps,
+  isEntryCurrentlyMuted,
+} from '../stores/notificationPrefsStore';
 import { apiFetch } from '../services/apiClient';
 import { errorMessage } from '../utils/redactError';
 
@@ -25,6 +31,12 @@ export function useServerChannelSubscriptions() {
   const setInitialServerUnreads = useUnreadStore((s) => s.setInitialServerUnreads);
   const markServerUnread = useUnreadStore((s) => s.markServerUnread);
   const clearServerUnread = useUnreadStore((s) => s.clearServerUnread);
+  const demoteServerPrecise = useUnreadStore((s) => s.demoteServerPrecise);
+  // Subscribe to the mute maps so the server-dot recompute below re-runs the
+  // instant a channel/server mute is toggled (#84 / epic #1029 close audit,
+  // P2 review follow-up). Map identity changes on every setMute/removeMute.
+  const mutedChannels = useNotificationPrefsStore((s) => s.mutedChannels);
+  const mutedServers = useNotificationPrefsStore((s) => s.mutedServers);
   const subscribedServersRef = useRef<Set<string>>(new Set());
 
   // Subscribe to ALL servers for unread notifications + fetch server-level unread status.
@@ -65,7 +77,32 @@ export function useServerChannelSubscriptions() {
           const res = await apiFetch('/api/v1/servers/unread-status');
           if (res.ok) {
             const data = await res.json();
+            // KNOWN CEILING (#84 / epic #1029 close audit): the bulk
+            // /servers/unread-status payload carries no per-channel detail and
+            // the server does not filter by mute, so a background server whose
+            // ONLY unreads are muted channels can still show a dot until its
+            // per-channel fetch runs. Upgrade path is server-side mute filtering.
             setInitialServerUnreads(data.server_ids || []);
+
+            // Reconcile the ACTIVE server against its own per-channel data.
+            // This bulk seed is mute-UNAWARE and races the active server's
+            // per-channel fetch: if that fetch already cleared a muted-only
+            // active server's dot, the seed can re-add it as an approximate
+            // unread, which isServerUnreadVisible then shows permanently (the
+            // server itself isn't muted) with no per-channel correction until a
+            // switch/reconnect (unreadFetchServerRef is latched). When the
+            // per-channel counts already belong to the active server, re-derive
+            // its dot from them so a mute-only server goes back dark
+            // (#84 / epic #1029 close audit, P2 review follow-up).
+            const activeId = useServerStore.getState().activeServerId;
+            const { unreadCounts, unreadCountsServerId } = useUnreadStore.getState();
+            if (activeId && unreadCountsServerId === activeId) {
+              if (hasUnmutedChannel(unreadCounts.keys(), activeId)) {
+                useUnreadStore.getState().markServerUnread(activeId, true);
+              } else {
+                useUnreadStore.getState().clearServerUnread(activeId);
+              }
+            }
           }
         } catch (err) {
           console.error('Failed to fetch server unread status:', errorMessage(err));
@@ -116,11 +153,15 @@ export function useServerChannelSubscriptions() {
               counts.set(entry.channel_id, entry.unread_count);
             }
           }
-          setInitialUnreads(counts);
+          setInitialUnreads(counts, activeServerId);
 
-          // Update server dot based on actual remaining unreads
-          if (counts.size > 0) {
-            markServerUnread(activeServerId);
+          // Update server dot based on remaining unreads — but a muted
+          // channel must NOT light the server dot (#84 acceptance criterion;
+          // epic #1029 close audit). Mark only when at least one unread
+          // channel is not effectively muted. Counts stay seeded so un-muting
+          // reveals the badge without a refetch.
+          if (hasUnmutedChannel(counts.keys(), activeServerId)) {
+            markServerUnread(activeServerId, true);
           } else {
             clearServerUnread(activeServerId);
           }
@@ -138,4 +179,67 @@ export function useServerChannelSubscriptions() {
       aborted = true;
     };
   }, [activeServerId, isConnected, setInitialUnreads, markServerUnread, clearServerUnread]);
+
+  // Recompute the active server's unread dot when a channel/server mute is
+  // TOGGLED — not just when unreads arrive or a per-channel fetch runs
+  // (#84 / epic #1029 close audit, P2 review follow-up). Without this, muting
+  // the last unmuted unread channel leaves the server icon lit, and un-muting
+  // a channel whose count is still seeded never brings the dot back.
+  //
+  // Per-channel unread data (unreadCounts) only exists for the ACTIVE server,
+  // which is also the only server whose channels the user can mute (channel
+  // mutes are issued from its channel list), so recomputing here covers the
+  // interactive path. We read unreadCounts/activeServerId via getState so this
+  // fires solely on mute-map changes (server switches + arrivals are already
+  // handled above); an empty count map is a no-op, so it never clobbers the
+  // fetch-seeded dot before per-channel data has loaded.
+  useEffect(() => {
+    const activeId = useServerStore.getState().activeServerId;
+    const { unreadCounts, unreadCountsServerId, serverUnreadPreciseSet, serverUnreadChannelWinsSet } =
+      useUnreadStore.getState();
+
+    // Reconcile BACKGROUND servers first. The active-server recompute below
+    // can only see the active server's per-channel unread data, so a non-active
+    // server that was marked precise from a channel with NO mute override and is
+    // now server-muted would otherwise keep a stale precise dot forever. Demote
+    // those precise flags so they fall back to the server-level mute gate and
+    // go dark; a genuine unmuted-channel unread re-promotes them on the next
+    // unread_notify or when the server is opened. This trades a rare,
+    // self-correcting false-negative for not violating the mute contract with a
+    // persistent false-positive (#84 / epic #1029 close audit, P2 follow-up).
+    //
+    // Channel-wins precise marks are exempt: a precise flag that came from a
+    // channel explicitly unmuted under a muted server is exactly what
+    // isServerUnreadVisible is designed to honor, so muting the server (or, since
+    // this effect reruns on every mute toggle, any unrelated server) must NOT
+    // drop it. Only server-fallback precise marks are demotable here (P2 review
+    // follow-up 3562576306).
+    for (const serverId of serverUnreadPreciseSet) {
+      if (serverId === activeId) continue;
+      if (serverUnreadChannelWinsSet.has(serverId)) continue;
+      if (isEntryCurrentlyMuted(mutedServers.get(serverId))) {
+        demoteServerPrecise(serverId);
+      }
+    }
+
+    // Active server: recompute its dot from live per-channel unread data.
+    if (!activeId) return;
+    // Only recompute from counts that actually belong to the active server.
+    // On a server switch the global unreadCounts still holds the PREVIOUS
+    // server's data until /servers/{activeId}/unread lands; pairing those
+    // channel IDs with the newly opened server's mute state would mark or clear
+    // the wrong server's dot. Skipping until ownership catches up also means an
+    // empty map here is a genuine "active server has no unreads" (its fetch
+    // returned nothing), not "data not loaded yet" (#84 / epic #1029 close
+    // audit, P2 review follow-up).
+    if (unreadCountsServerId !== activeId) return;
+    const hasUnmutedUnread = [...unreadCounts.keys()].some(
+      (channelId) => !isChannelMutedInMaps(channelId, activeId, mutedChannels, mutedServers)
+    );
+    if (hasUnmutedUnread) {
+      markServerUnread(activeId, true);
+    } else {
+      clearServerUnread(activeId);
+    }
+  }, [mutedChannels, mutedServers, markServerUnread, clearServerUnread, demoteServerPrecise]);
 }

@@ -5,6 +5,20 @@ import { useKeyboardShortcutStore } from '../stores/keyboardShortcutStore';
 import { useChannelStore } from '../stores/channelStore';
 import { useUnreadStore } from '../stores/unreadStore';
 import { useVoiceStore } from '../stores/voiceStore';
+import { isChannelMuted } from '../stores/notificationPrefsStore';
+import type { Channel } from '../types/chat';
+
+/**
+ * Prev/Next Unread must honor mutes. A muted channel keeps its count in the
+ * unread store (so un-muting reveals the badge without a refetch) but renders
+ * no unread indicator, so unread navigation must skip it, mirroring the
+ * visibility gate ChannelList applies to badges (#84 / epic #1029 close audit,
+ * P2 review follow-up). Without this, Prev/Next Unread can jump to a muted
+ * channel that shows nothing.
+ */
+function channelHasVisibleUnread(channel: Channel, unreadCounts: Map<string, number>): boolean {
+  return (unreadCounts.get(channel.id) || 0) > 0 && !isChannelMuted(channel.id, channel.server_id);
+}
 
 /**
  * Registers all global keyboard shortcut handlers.
@@ -41,14 +55,14 @@ export function useKeyboardShortcuts(): void {
       const idx = textChannels.findIndex((c) => c.id === activeChannelId);
       // Search backwards for next unread
       for (let i = idx - 1; i >= 0; i--) {
-        if ((unreadCounts.get(textChannels[i].id) || 0) > 0) {
+        if (channelHasVisibleUnread(textChannels[i], unreadCounts)) {
           setActiveChannel(textChannels[i].id);
           return;
         }
       }
       // Wrap around from end
       for (let i = textChannels.length - 1; i > idx; i--) {
-        if ((unreadCounts.get(textChannels[i].id) || 0) > 0) {
+        if (channelHasVisibleUnread(textChannels[i], unreadCounts)) {
           setActiveChannel(textChannels[i].id);
           return;
         }
@@ -62,14 +76,14 @@ export function useKeyboardShortcuts(): void {
       const idx = textChannels.findIndex((c) => c.id === activeChannelId);
       // Search forward for next unread
       for (let i = idx + 1; i < textChannels.length; i++) {
-        if ((unreadCounts.get(textChannels[i].id) || 0) > 0) {
+        if (channelHasVisibleUnread(textChannels[i], unreadCounts)) {
           setActiveChannel(textChannels[i].id);
           return;
         }
       }
       // Wrap around from start
       for (let i = 0; i < idx; i++) {
-        if ((unreadCounts.get(textChannels[i].id) || 0) > 0) {
+        if (channelHasVisibleUnread(textChannels[i], unreadCounts)) {
           setActiveChannel(textChannels[i].id);
           return;
         }

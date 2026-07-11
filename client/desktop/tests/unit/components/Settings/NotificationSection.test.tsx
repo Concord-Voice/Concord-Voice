@@ -135,7 +135,7 @@ describe('NotificationSection', () => {
     expect(screen.getByText('Direct Messages')).toBeInTheDocument();
     expect(screen.getByText('@Mentions')).toBeInTheDocument();
     expect(screen.getByText('All Messages')).toBeInTheDocument();
-    expect(screen.getByText('Do Not Disturb')).toBeInTheDocument();
+    expect(screen.getByText('Pause Notifications')).toBeInTheDocument();
     expect(screen.getByText('Suppress when focused')).toBeInTheDocument();
   });
 
@@ -299,11 +299,11 @@ describe('NotificationSection', () => {
     expect(screen.queryByText('Desktop notifications require permission.')).not.toBeInTheDocument();
   });
 
-  // ── DND toggle ────────────────────────────────────────────────────
+  // ── Pause Notifications toggle ────────────────────────────────────
 
-  it('DND toggle calls setDoNotDisturb', () => {
+  it('Pause Notifications toggle calls setDoNotDisturb', () => {
     render(<NotificationSection />);
-    const row = screen.getByText('Do Not Disturb').closest('.settings-row');
+    const row = screen.getByText('Pause Notifications').closest('.settings-row');
     const checkbox = row?.querySelector('input[type="checkbox"]');
     expect(checkbox).toBeInTheDocument();
     fireEvent.click(checkbox!);
@@ -317,10 +317,8 @@ describe('NotificationSection', () => {
     render(<NotificationSection />);
     expect(screen.getByText('Start Time')).toBeInTheDocument();
     expect(screen.getByText('End Time')).toBeInTheDocument();
-    const timeInputs = document.querySelectorAll('input[type="time"]');
-    expect(timeInputs.length).toBe(2);
-    expect(timeInputs[0]).toHaveValue('22:00');
-    expect(timeInputs[1]).toHaveValue('08:00');
+    expect(screen.getByLabelText('Quiet hours start time')).toHaveValue('22:00');
+    expect(screen.getByLabelText('Quiet hours end time')).toHaveValue('08:00');
     // Reset for other tests
     mockNotificationState.quietHoursEnabled = false;
   });
@@ -374,10 +372,14 @@ describe('NotificationSection', () => {
     mockNotificationState.enabled = true;
   });
 
-  it('DND hint shows enabled text', () => {
+  it('Pause Notifications hint shows enabled text', () => {
     mockNotificationState.doNotDisturb = true;
     render(<NotificationSection />);
-    expect(screen.getByText('Enabled. All notifications are suppressed.')).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        'Enabled. Desktop notification popups and chat notification sounds are paused.'
+      )
+    ).toBeInTheDocument();
     // Reset for other tests
     mockNotificationState.doNotDisturb = false;
   });
@@ -386,7 +388,9 @@ describe('NotificationSection', () => {
     mockNotificationState.quietHoursEnabled = true;
     render(<NotificationSection />);
     expect(
-      screen.getByText('Enabled. Notifications are suppressed during the configured time window.')
+      screen.getByText(
+        'Enabled. Desktop notification popups and chat notification sounds are suppressed during the configured time window.'
+      )
     ).toBeInTheDocument();
     // Reset for other tests
     mockNotificationState.quietHoursEnabled = false;
@@ -404,11 +408,13 @@ describe('NotificationSection', () => {
   it('quiet hours time inputs call setters on change', () => {
     mockNotificationState.quietHoursEnabled = true;
     render(<NotificationSection />);
-    const timeInputs = document.querySelectorAll('input[type="time"]');
-    expect(timeInputs.length).toBe(2);
-    fireEvent.change(timeInputs[0], { target: { value: '23:00' } });
+    fireEvent.change(screen.getByLabelText('Quiet hours start time'), {
+      target: { value: '23:00' },
+    });
     expect(mockNotificationState.setQuietHoursStart).toHaveBeenCalledWith('23:00');
-    fireEvent.change(timeInputs[1], { target: { value: '07:00' } });
+    fireEvent.change(screen.getByLabelText('Quiet hours end time'), {
+      target: { value: '07:00' },
+    });
     expect(mockNotificationState.setQuietHoursEnd).toHaveBeenCalledWith('07:00');
     mockNotificationState.quietHoursEnabled = false;
   });

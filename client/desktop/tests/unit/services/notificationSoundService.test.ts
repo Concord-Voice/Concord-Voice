@@ -43,6 +43,10 @@ describe('NotificationSoundService', () => {
       voiceEventSounds: true,
       voiceEventVolume: 100,
       suppressWhenFocused: true,
+      doNotDisturb: false,
+      quietHoursEnabled: false,
+      quietHoursStart: '22:00',
+      quietHoursEnd: '08:00',
     });
 
     // Reset service internal state
@@ -50,6 +54,7 @@ describe('NotificationSoundService', () => {
     (notificationSoundService as Record<string, unknown>)['lastChatSoundTime'] = 0;
     (notificationSoundService as Record<string, unknown>)['sounds'] = new Map();
     ((notificationSoundService as Record<string, unknown>)['activeLoops'] as Set<string>).clear();
+    vi.useRealTimers();
   });
 
   it('initializes and preloads all sounds', () => {
@@ -299,6 +304,73 @@ describe('NotificationSoundService', () => {
     useNotificationStore.getState().setSuppressWhenFocused(true);
     notificationSoundService.play('message', { focused: true });
     expect(mockPlay).toHaveBeenCalledTimes(1);
+  });
+
+  // Pause toggle + quiet hours suppression (epic #1029 close audit)
+  describe('pause toggle and quiet hours', () => {
+    it('suppresses chat sounds when the pause toggle (doNotDisturb) is on', () => {
+      useNotificationStore.getState().setDoNotDisturb(true);
+      notificationSoundService.play('message');
+      expect(mockPlay).not.toHaveBeenCalled();
+    });
+
+    it('suppresses chat sounds inside the quiet-hours window', () => {
+      vi.useFakeTimers();
+      // 23:00 — inside 22:00-08:00
+      vi.setSystemTime(new Date(2026, 3, 2, 23, 0, 0));
+      useNotificationStore.setState({
+        quietHoursEnabled: true,
+        quietHoursStart: '22:00',
+        quietHoursEnd: '08:00',
+      });
+
+      notificationSoundService.play('message');
+      expect(mockPlay).not.toHaveBeenCalled();
+    });
+
+    it('plays chat sounds outside the quiet-hours window', () => {
+      vi.useFakeTimers();
+      // 12:00 — outside 22:00-08:00
+      vi.setSystemTime(new Date(2026, 3, 2, 12, 0, 0));
+      useNotificationStore.setState({
+        quietHoursEnabled: true,
+        quietHoursStart: '22:00',
+        quietHoursEnd: '08:00',
+      });
+
+      notificationSoundService.play('message');
+      expect(mockPlay).toHaveBeenCalledTimes(1);
+    });
+
+    it('voice sounds ignore the pause toggle and quiet hours (in-call feedback)', () => {
+      vi.useFakeTimers();
+      // 23:00 — inside 22:00-08:00
+      vi.setSystemTime(new Date(2026, 3, 2, 23, 0, 0));
+      useNotificationStore.setState({
+        doNotDisturb: true,
+        quietHoursEnabled: true,
+        quietHoursStart: '22:00',
+        quietHoursEnd: '08:00',
+      });
+
+      notificationSoundService.play('user-join');
+      expect(mockPlay).toHaveBeenCalledTimes(1);
+    });
+
+    it('playPreview bypasses the pause toggle and quiet hours', () => {
+      vi.useFakeTimers();
+      // 23:00 — inside 22:00-08:00
+      vi.setSystemTime(new Date(2026, 3, 2, 23, 0, 0));
+      useNotificationStore.setState({
+        doNotDisturb: true,
+        quietHoursEnabled: true,
+        quietHoursStart: '22:00',
+        quietHoursEnd: '08:00',
+      });
+
+      notificationSoundService.playPreview('message', 0.5);
+      expect(mockPlay).toHaveBeenCalledTimes(1);
+    });
   });
 
   // Voice event sound tests

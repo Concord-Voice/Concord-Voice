@@ -8,6 +8,7 @@ import { useUnreadStore } from '../../stores/unreadStore';
 import {
   useNotificationPrefsStore,
   isEntryCurrentlyMuted,
+  isServerUnreadVisible,
 } from '../../stores/notificationPrefsStore';
 import { useVoiceStore } from '../../stores/voiceStore';
 import { useLayoutStore } from '../../stores/layoutStore';
@@ -49,7 +50,17 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
   const fetchServers = useServerStore((s) => s.fetchServers);
   const setActiveServer = useServerStore((s) => s.setActiveServer);
   const serverUnreadSet = useUnreadStore((s) => s.serverUnreadSet);
-  const hasUnreadDMs = useDMStore((s) => s.conversations.some((c) => c.unreadCount > 0));
+  // Servers whose unread state was resolved by a mute-aware source; for these
+  // the dot is honored even under a server-level mute (channel-wins override).
+  const serverUnreadPreciseSet = useUnreadStore((s) => s.serverUnreadPreciseSet);
+  // Subscribe to the muted-DMs map so this boolean re-evaluates on mute
+  // toggle; a muted conversation must not light the DM unread badge (#84 /
+  // epic #1029 close audit). The closure re-runs on re-render and its boolean
+  // output keeps re-renders cheap.
+  const mutedDMs = useNotificationPrefsStore((s) => s.mutedDMs);
+  const hasUnreadDMs = useDMStore((s) =>
+    s.conversations.some((c) => c.unreadCount > 0 && !isEntryCurrentlyMuted(mutedDMs.get(c.id)))
+  );
   const serverVoiceCounts = useVoiceStore((s) => s.serverVoiceCounts);
   // Subscribe to the muted-servers map so this row re-renders when a mute
   // is toggled. We read entries inside the render closure (per-server) to
@@ -582,7 +593,16 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
 
           {/* Server icons */}
           {barServers.map((server) => {
-            const hasUnread = serverUnreadSet.has(server.id);
+            // Shared mute-aware unread gate (also used by FolderBar): a precise
+            // (mute-resolved) entry lights the dot even under a server mute
+            // (channel-wins), while an approximate bulk-seed entry falls back to
+            // the server-level mute check (#84 / epic #1029 close audit).
+            const showUnreadDot = isServerUnreadVisible(
+              server.id,
+              serverUnreadSet,
+              serverUnreadPreciseSet,
+              mutedServers
+            );
             // Inline mute-state check via the shared store helper so we
             // honor `mutedUntil` expiry without waiting for the 60s sweep.
             // A muted server gets a data-muted attribute and a corner icon;
@@ -656,7 +676,7 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
                     )}
                   </button>
 
-                  {hasUnread && <span className="server-bar-badge" />}
+                  {showUnreadDot && <span className="server-bar-badge" />}
                   {isMuted && (
                     // Small bell-with-slash overlay in the corner. The icon
                     // sits absolutely over the bottom-right; CSS handles
@@ -750,9 +770,12 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
                 {serverVoiceCounts[hoveredServer.server.id] ?? 0} In Voice
               </span>
             </div>
-            {serverUnreadSet.has(hoveredServer.server.id) && (
-              <span className="server-bar-tooltip-unread">Unread notifications</span>
-            )}
+            {isServerUnreadVisible(
+              hoveredServer.server.id,
+              serverUnreadSet,
+              serverUnreadPreciseSet,
+              mutedServers
+            ) && <span className="server-bar-tooltip-unread">Unread notifications</span>}
           </div>,
           document.body
         )}

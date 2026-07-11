@@ -4,6 +4,7 @@ import { useChatStore } from '@/renderer/stores/chatStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useServerStore } from '@/renderer/stores/serverStore';
 import { useUnreadStore } from '@/renderer/stores/unreadStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
 import { usePermissionStore } from '@/renderer/stores/permissionStore';
 import { PIN_MESSAGES } from '@/renderer/utils/permissions';
 import { mockUser, mockChannel, mockMessage, mockMessage2 } from '../../../mocks/fixtures';
@@ -399,7 +400,8 @@ describe('ChatView', () => {
 
   // ── handleUnseenOnLeave ──
 
-  it('handleUnseenOnLeave sets unread count and marks server unread', () => {
+  it('handleUnseenOnLeave sets unread count and marks an unmuted server unread (precise)', () => {
+    useNotificationPrefsStore.getState().clearAll();
     useChannelStore.setState({ activeChannelId: 'channel-1' });
     useServerStore.setState({ activeServerId: 'server-1' });
     render(<ChatView />);
@@ -414,8 +416,34 @@ describe('ChatView', () => {
     onUnseenOnLeave(5);
 
     expect(setUnreadCountSpy).toHaveBeenCalledWith('channel-1', 5);
-    expect(markServerUnreadSpy).toHaveBeenCalledWith('server-1');
+    // A concrete per-channel count is mute-resolved, so it marks the server
+    // PRECISE, so a channel-wins unmute under a muted server still lights the dot.
+    expect(markServerUnreadSpy).toHaveBeenCalledWith('server-1', true);
 
+    setUnreadCountSpy.mockRestore();
+    markServerUnreadSpy.mockRestore();
+  });
+
+  it('handleUnseenOnLeave does not light the server dot when the channel is muted', () => {
+    // A muted channel's leftover unread must not light the server (#84 P2).
+    useNotificationPrefsStore.getState().clearAll();
+    useNotificationPrefsStore.getState().setMute('channel', 'channel-1', true, null);
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    useServerStore.setState({ activeServerId: 'server-1' });
+    render(<ChatView />);
+
+    const onUnseenOnLeave = capturedMessageListProps.onUnseenOnLeave as (count: number) => void;
+    const setUnreadCountSpy = vi.spyOn(useUnreadStore.getState(), 'setUnreadCount');
+    const markServerUnreadSpy = vi.spyOn(useUnreadStore.getState(), 'markServerUnread');
+
+    onUnseenOnLeave(5);
+
+    // The per-channel badge is still recorded (revealed on un-mute)...
+    expect(setUnreadCountSpy).toHaveBeenCalledWith('channel-1', 5);
+    // ...but the server dot stays dark.
+    expect(markServerUnreadSpy).not.toHaveBeenCalled();
+
+    useNotificationPrefsStore.getState().clearAll();
     setUnreadCountSpy.mockRestore();
     markServerUnreadSpy.mockRestore();
   });

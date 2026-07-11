@@ -18,6 +18,29 @@ interface ShouldNotifyOptions {
   isActiveChannel: boolean;
 }
 
+/**
+ * Check if current time falls within quiet hours.
+ * Handles midnight wrap (e.g., 22:00 - 08:00).
+ * Shared with notificationSoundService so popups and chat sounds agree (#1029).
+ */
+export function isInQuietHours(start: string, end: string): boolean {
+  const now = new Date();
+  const currentMinutes = now.getHours() * 60 + now.getMinutes();
+
+  const [startH, startM] = start.split(':').map(Number);
+  const [endH, endM] = end.split(':').map(Number);
+  const startMinutes = startH * 60 + startM;
+  const endMinutes = endH * 60 + endM;
+
+  if (startMinutes <= endMinutes) {
+    // Same-day range (e.g., 08:00 - 22:00)
+    return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+  } else {
+    // Overnight range (e.g., 22:00 - 08:00)
+    return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+  }
+}
+
 export function applyContentPrivacy(options: NotifyOptions): { title: string; body: string } {
   const mode = useNotificationStore.getState().notificationContent;
 
@@ -122,21 +145,7 @@ class DesktopNotificationService {
    * Handles midnight wrap (e.g., 22:00 - 08:00).
    */
   isInQuietHours(start: string, end: string): boolean {
-    const now = new Date();
-    const currentMinutes = now.getHours() * 60 + now.getMinutes();
-
-    const [startH, startM] = start.split(':').map(Number);
-    const [endH, endM] = end.split(':').map(Number);
-    const startMinutes = startH * 60 + startM;
-    const endMinutes = endH * 60 + endM;
-
-    if (startMinutes <= endMinutes) {
-      // Same-day range (e.g., 08:00 - 22:00)
-      return currentMinutes >= startMinutes && currentMinutes < endMinutes;
-    } else {
-      // Overnight range (e.g., 22:00 - 08:00)
-      return currentMinutes >= startMinutes || currentMinutes < endMinutes;
-    }
+    return isInQuietHours(start, end);
   }
 
   /**

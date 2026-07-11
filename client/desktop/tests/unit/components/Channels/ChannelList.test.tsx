@@ -11,6 +11,7 @@ import { useServerStore } from '@/renderer/stores/serverStore';
 import { useUnreadStore } from '@/renderer/stores/unreadStore';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockChannel, mockEncryptedChannel } from '../../../mocks/fixtures';
 import { ADMIN_PERMISSIONS, MANAGE_CHANNELS } from '@/renderer/utils/permissions';
@@ -285,6 +286,108 @@ describe('ChannelList', () => {
     useUnreadStore.getState().setInitialUnreads(new Map([['channel-1', 5]]));
     renderChannelList();
     expect(screen.queryByText('5')).not.toBeInTheDocument();
+  });
+
+  // ── Mute-aware Unread Badges (#84 / epic #1029 close audit) ──
+
+  describe('mute-aware unread badges (#84 / epic #1029)', () => {
+    it('hides the unread badge for a muted channel', () => {
+      useServerStore.setState({ activeServerId: 'server-1' });
+      useChannelStore.setState({
+        channels: [mockChannel],
+        activeChannelId: null,
+        isLoading: false,
+        error: null,
+      });
+      useUnreadStore.getState().setInitialUnreads(new Map([['channel-1', 5]]));
+      useNotificationPrefsStore.getState().setMute('channel', 'channel-1', true, null);
+      renderChannelList();
+      expect(screen.queryByText('5')).not.toBeInTheDocument();
+    });
+
+    it('hides the unread badge for a channel under a muted server', () => {
+      useServerStore.setState({ activeServerId: 'server-1' });
+      useChannelStore.setState({
+        channels: [mockChannel],
+        activeChannelId: null,
+        isLoading: false,
+        error: null,
+      });
+      useUnreadStore.getState().setInitialUnreads(new Map([['channel-1', 5]]));
+      useNotificationPrefsStore.getState().setMute('server', 'server-1', true, null);
+      renderChannelList();
+      expect(screen.queryByText('5')).not.toBeInTheDocument();
+    });
+
+    it('shows the unread badge for a channel explicitly unmuted under a muted server', () => {
+      useServerStore.setState({ activeServerId: 'server-1' });
+      useChannelStore.setState({
+        channels: [mockChannel],
+        activeChannelId: null,
+        isLoading: false,
+        error: null,
+      });
+      useUnreadStore.getState().setInitialUnreads(new Map([['channel-1', 5]]));
+      useNotificationPrefsStore.getState().setMute('server', 'server-1', true, null);
+      useNotificationPrefsStore.getState().setMute('channel', 'channel-1', false, null);
+      renderChannelList();
+      expect(screen.getByText('5')).toBeInTheDocument();
+    });
+
+    // Reading the active channel clears the server dot only when no UNMUTED
+    // unread channel remains. A muted leftover must not keep the dot lit.
+    const mockChannel2: Channel = {
+      ...mockChannel,
+      id: 'channel-2',
+      name: 'random',
+      position: 1,
+    };
+
+    it('clears the server dot when the only remaining unread channel is muted', () => {
+      useServerStore.setState({ activeServerId: 'server-1' });
+      useChannelStore.setState({
+        channels: [mockChannel, mockChannel2],
+        activeChannelId: 'channel-1',
+        isLoading: false,
+        error: null,
+      });
+      useUnreadStore.getState().setInitialUnreads(
+        new Map([
+          ['channel-1', 5],
+          ['channel-2', 3],
+        ])
+      );
+      useUnreadStore.getState().markServerUnread('server-1');
+      useNotificationPrefsStore.getState().setMute('channel', 'channel-2', true, null);
+
+      renderChannelList();
+
+      // Reading channel-1 leaves only the muted channel-2 unread, so the
+      // server dot goes dark (a size===0 check would wrongly keep it lit).
+      expect(useUnreadStore.getState().serverUnreadSet.has('server-1')).toBe(false);
+    });
+
+    it('keeps the server dot when an unmuted unread channel remains', () => {
+      useServerStore.setState({ activeServerId: 'server-1' });
+      useChannelStore.setState({
+        channels: [mockChannel, mockChannel2],
+        activeChannelId: 'channel-1',
+        isLoading: false,
+        error: null,
+      });
+      useUnreadStore.getState().setInitialUnreads(
+        new Map([
+          ['channel-1', 5],
+          ['channel-2', 3],
+        ])
+      );
+      useUnreadStore.getState().markServerUnread('server-1');
+      // channel-2 stays unread and unmuted → the dot survives.
+
+      renderChannelList();
+
+      expect(useUnreadStore.getState().serverUnreadSet.has('server-1')).toBe(true);
+    });
   });
 
   // ── Category Collapsing ──

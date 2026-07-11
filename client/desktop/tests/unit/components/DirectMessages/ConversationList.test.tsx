@@ -3,6 +3,7 @@ import { useDMStore, type DMConversation, type DMLastMessage } from '@/renderer/
 import { useFriendStore } from '@/renderer/stores/friendStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
 import { API_BASE } from '@/renderer/config';
 import { vi } from 'vitest';
 
@@ -1157,6 +1158,46 @@ describe('ConversationList', () => {
         expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
       });
       expect(mockOnSelectThread).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── mute-aware DM unread (#84 / epic #1029 close audit) ──────────────
+
+  describe('mute-aware DM unread (#84 / epic #1029)', () => {
+    beforeEach(() => {
+      // The top-level beforeEach doesn't reset notificationPrefsStore, so
+      // clear its mute maps before this suite seeds per-target mutes.
+      useNotificationPrefsStore.getState().clearAll();
+    });
+
+    it('suppresses the unread badge and row class for a muted conversation', () => {
+      useDMStore.setState({
+        conversations: [makeConversation({ unreadCount: 5 })],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      useNotificationPrefsStore.getState().setMute('dm', 'conv-1', true, null);
+
+      const { container } = render(
+        <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+      );
+
+      expect(container.querySelector('.conversation-unread-badge')).not.toBeInTheDocument();
+      expect(container.querySelector('.conversation-item.unread')).not.toBeInTheDocument();
+    });
+
+    it('still shows the unread badge and row class for a non-muted conversation', () => {
+      useDMStore.setState({
+        conversations: [makeConversation({ unreadCount: 5 })],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+
+      const { container } = render(
+        <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+      );
+
+      expect(container.querySelector('.conversation-unread-badge')).toBeInTheDocument();
+      expect(screen.getByText('5')).toBeInTheDocument();
+      expect(container.querySelector('.conversation-item.unread')).toBeInTheDocument();
     });
   });
 });

@@ -1,4 +1,5 @@
 import { useNotificationStore } from '../stores/notificationStore';
+import { isInQuietHours } from './desktopNotificationService';
 
 /** Chat notification sound types */
 export type ChatSoundType = 'message' | 'mention' | 'dm' | 'friend-request';
@@ -149,6 +150,13 @@ class NotificationSoundService {
   ): boolean {
     if (focused && state.suppressWhenFocused && document.hasFocus()) return true;
     if (!state[CHAT_TOGGLE[type]]) return true;
+    // Chat notification sounds honor the device-local pause toggle (store field
+    // `doNotDisturb`, Settings label "Pause Notifications") and quiet hours,
+    // matching the Settings hint copy (epic #1029 close audit). Voice/call sounds
+    // are deliberately exempt — they are in-call feedback, not notifications.
+    if (state.doNotDisturb) return true;
+    if (state.quietHoursEnabled && isInQuietHours(state.quietHoursStart, state.quietHoursEnd))
+      return true;
     if (Date.now() - this.lastChatSoundTime < CHAT_DEBOUNCE_MS) return true;
     return false;
   }
@@ -199,6 +207,8 @@ class NotificationSoundService {
   /**
    * Play a user-initiated preview sound at a supplied effective volume.
    * Bypasses chat debounce and focus suppression, but still respects sound toggles.
+   * Also deliberately bypasses the pause toggle and quiet hours — a user-initiated
+   * preview while configuring must be audible.
    */
   playPreview(type: NotificationSoundType, volume: number): void {
     if (!this.initialized) this.init();

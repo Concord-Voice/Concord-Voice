@@ -283,16 +283,22 @@ const NotificationSection: React.FC = () => {
           </div>
         </fieldset>
 
+        {/* Device-local pause for popups + chat sounds — distinct from the Do Not
+         * Disturb presence STATUS, which also pauses badges (epic #1029 / #84). */}
         <div className="settings-row">
           <div className="settings-row-info">
-            <span className="settings-row-label">Do Not Disturb</span>
+            <span className="settings-row-label">Pause Notifications</span>
             <span className="settings-row-hint">
               {doNotDisturb
-                ? 'Enabled. All notifications are suppressed.'
+                ? 'Enabled. Desktop notification popups and chat notification sounds are paused.'
                 : 'Disabled. Notifications are delivered normally.'}
             </span>
           </div>
-          <ToggleSwitch checked={doNotDisturb} onChange={setDoNotDisturb} label="Do Not Disturb" />
+          <ToggleSwitch
+            checked={doNotDisturb}
+            onChange={setDoNotDisturb}
+            label="Pause Notifications"
+          />
         </div>
       </CollapsibleSection>
 
@@ -453,7 +459,7 @@ const NotificationSection: React.FC = () => {
             <span className="settings-row-label">Enable Quiet Hours</span>
             <span className="settings-row-hint">
               {quietHoursEnabled
-                ? 'Enabled. Notifications are suppressed during the configured time window.'
+                ? 'Enabled. Desktop notification popups and chat notification sounds are suppressed during the configured time window.'
                 : 'Disabled. Notifications are delivered at all hours.'}
             </span>
           </div>
@@ -475,6 +481,7 @@ const NotificationSection: React.FC = () => {
                 className="settings-time-input"
                 value={quietHoursStart}
                 onChange={(e) => setQuietHoursStart(e.target.value)}
+                aria-label="Quiet hours start time"
               />
             </div>
 
@@ -487,6 +494,7 @@ const NotificationSection: React.FC = () => {
                 className="settings-time-input"
                 value={quietHoursEnd}
                 onChange={(e) => setQuietHoursEnd(e.target.value)}
+                aria-label="Quiet hours end time"
               />
             </div>
           </>

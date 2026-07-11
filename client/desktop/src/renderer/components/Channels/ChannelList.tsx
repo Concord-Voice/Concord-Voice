@@ -5,6 +5,11 @@ import { useChannelStore } from '../../stores/channelStore';
 import { useServerStore } from '../../stores/serverStore';
 import { useUnreadStore } from '../../stores/unreadStore';
 import {
+  useNotificationPrefsStore,
+  isChannelMutedInMaps,
+  hasUnmutedChannel,
+} from '../../stores/notificationPrefsStore';
+import {
   useVoiceStore,
   type ChannelVoiceMember,
   channelVoiceMemberFromApi,
@@ -313,6 +318,13 @@ const ChannelList: React.FC<ChannelListProps> = ({
   const updateChannelGroup = useChannelStore((state) => state.updateChannelGroup);
   const unreadCounts = useUnreadStore((state) => state.unreadCounts);
   const clearUnread = useUnreadStore((state) => state.clearUnread);
+  // Per-target mutes (#84) govern unread badges at RENDER time so the
+  // underlying counts stay intact — un-muting reveals the badge instantly
+  // (epic #1029 close audit). Reactive subscriptions re-render on any mute
+  // change; isChannelMutedInMaps applies the channel-wins / server-fallback
+  // resolution order.
+  const mutedChannels = useNotificationPrefsStore((s) => s.mutedChannels);
+  const mutedServers = useNotificationPrefsStore((s) => s.mutedServers);
   const drafts = useDraftMessageStore((s) => s.drafts);
   const voiceChannelId = useVoiceStore((s) => s.activeChannelId);
   const voiceParticipants = useVoiceStore((s) => s.participants);
@@ -540,9 +552,12 @@ const ChannelList: React.FC<ChannelListProps> = ({
     clearUnread(activeChannelId);
     apiFetch(`/api/v1/channels/${activeChannelId}/read`, { method: 'POST' }).catch(() => {});
 
-    // If all channel unreads are now cleared, clear the server dot too
+    // If no UNMUTED channel unread remains, clear the server dot too. Checking
+    // `size === 0` alone would leave the dot lit when the only remaining
+    // unreads are muted channels, which must not light the server icon
+    // (#84 / epic #1029 close audit, P2 follow-up).
     const { unreadCounts: currentCounts } = useUnreadStore.getState();
-    if (currentCounts.size === 0 && activeServerId) {
+    if (activeServerId && !hasUnmutedChannel(currentCounts.keys(), activeServerId)) {
       useUnreadStore.getState().clearServerUnread(activeServerId);
     }
   }, [activeChannelId, activeServerId, clearUnread]);
@@ -916,13 +931,23 @@ const ChannelList: React.FC<ChannelListProps> = ({
   const renderChannelItem = useCallback(
     (channel: Channel, index: number, arr: Channel[], isGrouped: boolean) => {
       const isActive = channel.id === activeChannelId;
-      const unread = unreadCounts.get(channel.id) || 0;
+      const channelMuted = isChannelMutedInMaps(
+        channel.id,
+        channel.server_id,
+        mutedChannels,
+        mutedServers
+      );
+      const unread = channelMuted ? 0 : unreadCounts.get(channel.id) || 0;
       const isLastInGroup = isGrouped && index === arr.length - 1;
       const voiceMembers = getVoiceMembers(channel);
       const linkedText =
         channel.type === 'voice' ? (linkedTextByVoice.get(channel.id) ?? null) : null;
       const showLinkedText = !!(linkedText && voiceChannelId === channel.id);
-      const linkedTextUnread = linkedText ? unreadCounts.get(linkedText.id) || 0 : 0;
+      const linkedTextUnread =
+        linkedText &&
+        !isChannelMutedInMaps(linkedText.id, linkedText.server_id, mutedChannels, mutedServers)
+          ? unreadCounts.get(linkedText.id) || 0
+          : 0;
       const isLinkedTextActive = !!(showLinkedText && showVoiceTextChat);
 
       return (
@@ -967,6 +992,8 @@ const ChannelList: React.FC<ChannelListProps> = ({
     [
       activeChannelId,
       unreadCounts,
+      mutedChannels,
+      mutedServers,
       drafts,
       voiceChannelId,
       showVoiceTextChat,
@@ -1062,11 +1089,21 @@ const ChannelList: React.FC<ChannelListProps> = ({
               );
             }
 
-            // Count unreads in collapsed group (text channels only, exclude voice-linked text)
+            // Count unreads in collapsed group (text channels only, exclude
+            // voice-linked text). Muted channels contribute 0 so a collapsed
+            // group of muted channels shows no aggregate badge (#84 / epic
+            // #1029 close audit).
             const groupUnreadCount = isCollapsed
               ? groupChannels
                   .filter((c) => c.type !== 'voice' && !c.linked_voice_channel_id)
-                  .reduce((sum, c) => sum + (unreadCounts.get(c.id) || 0), 0)
+                  .reduce(
+                    (sum, c) =>
+                      sum +
+                      (isChannelMutedInMaps(c.id, c.server_id, mutedChannels, mutedServers)
+                        ? 0
+                        : unreadCounts.get(c.id) || 0),
+                    0
+                  )
               : 0;
 
             // Stacked voice user avatars when collapsed

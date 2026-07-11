@@ -198,6 +198,96 @@ describe('ServerBar', () => {
     });
   });
 
+  // ─── Per-target mutes gate the unread badges (#84 / epic #1029 close audit) ──
+  // A muted target must not light its unread indicator UNLESS the unread is
+  // precise (mute-resolved). The server dot renders when hasUnread &&
+  // (isUnreadPrecise || !isMuted): an approximate (bulk-seed) unread is
+  // suppressed under a server mute, but a precise unread — e.g. a channel
+  // explicitly unmuted under a muted server — still shows its dot. The DM
+  // aggregate badge selector skips conversations whose isEntryCurrentlyMuted is
+  // true.
+
+  describe('muted targets suppress unread badges', () => {
+    it('renders no unread dot for a muted server with an approximate unread but keeps the mute overlay', () => {
+      useServerStore.setState({
+        servers: [mockServer, mockServer2],
+        activeServerId: mockServer.id,
+        isLoading: false,
+      });
+      // Approximate (bulk-seed-style) mark: no channel-wins evidence.
+      useUnreadStore.getState().markServerUnread(mockServer2.id);
+      useNotificationPrefsStore.getState().setMute('server', mockServer2.id, true, null);
+
+      render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
+
+      const btn = screen.getByLabelText('Second Server server (muted)');
+      // The approximate unread dot is gated on !isMuted, so it is absent…
+      expect(btn.parentElement?.querySelector('.server-bar-badge')).not.toBeInTheDocument();
+      // …but the mute overlay still marks the server as muted.
+      expect(btn.parentElement?.querySelector('.server-bar-mute-overlay')).toBeInTheDocument();
+    });
+
+    it('renders the unread dot for a muted server with a PRECISE unread (channel-wins override)', () => {
+      useServerStore.setState({
+        servers: [mockServer, mockServer2],
+        activeServerId: mockServer.id,
+        isLoading: false,
+      });
+      // Precise mark: a mute-aware source already resolved channel-wins and
+      // found an unmuted unread channel under this server-level-muted server.
+      useUnreadStore.getState().markServerUnread(mockServer2.id, true);
+      useNotificationPrefsStore.getState().setMute('server', mockServer2.id, true, null);
+
+      render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
+
+      const btn = screen.getByLabelText('Second Server server (muted)');
+      // The dot shows because the unread is precise, honoring the explicit
+      // channel-level unmute even though the parent server is muted…
+      expect(btn.parentElement?.querySelector('.server-bar-badge')).toBeInTheDocument();
+      // …and the mute overlay still marks the server as muted.
+      expect(btn.parentElement?.querySelector('.server-bar-mute-overlay')).toBeInTheDocument();
+    });
+
+    it('renders the unread dot for an unread server that is not muted', () => {
+      useServerStore.setState({
+        servers: [mockServer, mockServer2],
+        activeServerId: mockServer.id,
+        isLoading: false,
+      });
+      useUnreadStore.getState().markServerUnread(mockServer2.id);
+      // No setMute — the unread dot must still light.
+
+      render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
+
+      const btn = screen.getByLabelText('Second Server server');
+      expect(btn.parentElement?.querySelector('.server-bar-badge')).toBeInTheDocument();
+    });
+
+    it('hides the PM aggregate badge when the only unread DM is muted', () => {
+      useDMStore.setState({
+        conversations: [{ ...mockDMConversation, unreadCount: 2 }],
+      });
+      useNotificationPrefsStore.getState().setMute('dm', mockDMConversation.id, true, null);
+
+      render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
+
+      const pmButton = screen.getByLabelText('Direct Messages');
+      expect(pmButton.querySelector('.server-bar-badge')).not.toBeInTheDocument();
+    });
+
+    it('shows the PM aggregate badge when an unread DM is not muted', () => {
+      useDMStore.setState({
+        conversations: [{ ...mockDMConversation, unreadCount: 2 }],
+      });
+      // No setMute — an unmuted unread DM still lights the aggregate badge.
+
+      render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
+
+      const pmButton = screen.getByLabelText('Direct Messages');
+      expect(pmButton.querySelector('.server-bar-badge')).toBeInTheDocument();
+    });
+  });
+
   // ── Pin state is NOT toggled by icon clicks (#188) ──────────────────────
   // Regression guard: clicking the active-server icon (or PM icon) while the
   // channel panel is pinned used to call toggleChannelPin() → surprising
