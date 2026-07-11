@@ -1353,7 +1353,11 @@ describe('VoiceService Extended', () => {
       closeSpy = vi.spyOn(svc, 'closeProducer').mockResolvedValue(undefined);
 
       const handler = socketListeners['permissions-changed']?.[0];
-      await handler?.({ channelId: 'chan-1', permissions: '0', closedSources: ['camera', 'screen'] });
+      await handler?.({
+        channelId: 'chan-1',
+        permissions: '0',
+        closedSources: ['camera', 'screen'],
+      });
 
       expect(useVoiceStore.getState().isMuted).toBe(false);
     });
@@ -1488,54 +1492,90 @@ describe('VoiceService Extended', () => {
   // ===== waitForConnect =====
 
   describe('waitForConnect', () => {
+    // Post-#2176 waitForConnect uses on/off + socket.active + socket.io.on/off
+    // (not once), so build a connect-capable mock rather than the old once map.
+    const makeConnectSocket = (active = true) => {
+      const listeners: Record<string, Array<(...a: unknown[]) => void>> = {};
+      const managerListeners: Record<string, Array<(...a: unknown[]) => void>> = {};
+      const socket = {
+        connected: false,
+        active,
+        once: vi.fn(),
+        on: vi.fn((ev: string, cb: (...a: unknown[]) => void) => {
+          (listeners[ev] ||= []).push(cb);
+        }),
+        off: vi.fn((ev: string, cb: (...a: unknown[]) => void) => {
+          listeners[ev] = (listeners[ev] || []).filter((f) => f !== cb);
+        }),
+        io: {
+          on: vi.fn((ev: string, cb: (...a: unknown[]) => void) => {
+            (managerListeners[ev] ||= []).push(cb);
+          }),
+          off: vi.fn((ev: string, cb: (...a: unknown[]) => void) => {
+            managerListeners[ev] = (managerListeners[ev] || []).filter((f) => f !== cb);
+          }),
+        },
+      };
+      return {
+        socket,
+        fire: (ev: string, ...a: unknown[]) => listeners[ev]?.forEach((cb) => cb(...a)),
+        fireManager: (ev: string, ...a: unknown[]) =>
+          managerListeners[ev]?.forEach((cb) => cb(...a)),
+      };
+    };
+
     it('resolves when already connected', async () => {
       const svc = voiceService as any;
-      svc.socket = { ...mockSocket, connected: true, once: vi.fn() };
+      svc.socket = { ...mockSocket, connected: true };
       await svc.waitForConnect();
       expect(svc.socket.connected).toBe(true);
     });
 
     it('resolves on connect event', async () => {
       const svc = voiceService as any;
-      const onceHandlers: Record<string, (...args: unknown[]) => void> = {};
-      svc.socket = {
-        connected: false,
-        once: vi.fn().mockImplementation((ev: string, cb: (...args: unknown[]) => void) => {
-          onceHandlers[ev] = cb;
-        }),
-      };
-
+      const { socket, fire } = makeConnectSocket();
+      svc.socket = socket;
       const promise = svc.waitForConnect();
-      // Trigger connect
-      onceHandlers['connect']?.();
-      await promise;
-      expect(svc.socket.once).toHaveBeenCalledWith('connect', expect.any(Function));
+      fire('connect');
+      await expect(promise).resolves.toBeUndefined();
     });
 
-    it('rejects on connect_error', async () => {
+    it('rides through a transient connect_error but rejects a server-denied one (active=false)', async () => {
       const svc = voiceService as any;
-      const onceHandlers: Record<string, (...args: unknown[]) => void> = {};
-      svc.socket = {
-        connected: false,
-        once: vi.fn().mockImplementation((ev: string, cb: (...args: unknown[]) => void) => {
-          onceHandlers[ev] = cb;
-        }),
-      };
-
+      const { socket, fire } = makeConnectSocket(true);
+      svc.socket = socket;
       const promise = svc.waitForConnect();
-      onceHandlers['connect_error']?.(new Error('refused'));
+      let settled = false;
+      promise.then(
+        () => (settled = true),
+        () => (settled = true)
+      );
+      // active still true => the Manager reconnects; must NOT settle
+      fire('connect_error', new Error('transient'));
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      // server denial => fail fast
+      socket.active = false;
+      fire('connect_error', new Error('refused'));
       await expect(promise).rejects.toThrow('refused');
+    });
+
+    it('rejects on reconnect_failed', async () => {
+      const svc = voiceService as any;
+      const { socket, fireManager } = makeConnectSocket();
+      svc.socket = socket;
+      const promise = svc.waitForConnect();
+      fireManager('reconnect_failed');
+      await expect(promise).rejects.toThrow('Socket reconnection failed');
     });
 
     it('rejects on timeout', async () => {
       const svc = voiceService as any;
-      svc.socket = {
-        connected: false,
-        once: vi.fn(),
-      };
+      const { socket } = makeConnectSocket();
+      svc.socket = socket;
 
       const promise = svc.waitForConnect().catch((e: Error) => e);
-      await vi.advanceTimersByTimeAsync(11_000);
+      await vi.advanceTimersByTimeAsync(31_000); // > VOICE_CONNECT_TIMEOUT_MS (30s)
       const err = await promise;
       expect(err).toBeInstanceOf(Error);
       expect((err as Error).message).toContain('timeout');
@@ -3638,11 +3678,7 @@ describe('auto-tune-in engine (#2088)', () => {
     // Failure is isolated: the sweep still attempts the remaining share and logs.
     expect(tuneIn).toHaveBeenCalledWith('p-fail', 'u1');
     expect(tuneIn).toHaveBeenCalledWith('p-ok', 'u2');
-    expect(errSpy).toHaveBeenCalledWith(
-      'auto-tune sweep failed for',
-      'p-fail',
-      expect.any(String)
-    );
+    expect(errSpy).toHaveBeenCalledWith('auto-tune sweep failed for', 'p-fail', expect.any(String));
 
     tuneIn.mockRestore();
     errSpy.mockRestore();

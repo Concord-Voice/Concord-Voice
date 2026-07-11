@@ -46,20 +46,48 @@ vi.mock('mediasoup-client', () => ({
 // --- socket.io-client ---
 const socketListeners: Record<string, Array<(...args: unknown[]) => void>> = {};
 const socketOnceListeners: Record<string, Array<(...args: unknown[]) => void>> = {};
+// Manager (socket.io) listeners — waitForConnect subscribes to 'reconnect_failed' (#2176).
+const managerListeners: Record<string, Array<(...args: unknown[]) => void>> = {};
+
+const removeMockListener = (
+  registry: Record<string, Array<(...args: unknown[]) => void>>,
+  event: string,
+  cb: (...args: unknown[]) => void
+) => {
+  if (registry[event]) registry[event] = registry[event].filter((f) => f !== cb);
+};
 
 const mockSocket = {
   connected: false,
+  // Socket.active: true = the Manager will auto-reconnect on a transient error;
+  // false = server denial / attempts exhausted. waitForConnect keys on this (#2176).
+  active: true,
   emit: vi.fn(),
   on: vi.fn().mockImplementation((event: string, cb: (...args: unknown[]) => void) => {
     if (!socketListeners[event]) socketListeners[event] = [];
     socketListeners[event].push(cb);
   }),
+  off: vi
+    .fn()
+    .mockImplementation((event: string, cb: (...args: unknown[]) => void) =>
+      removeMockListener(socketListeners, event, cb)
+    ),
   once: vi.fn().mockImplementation((event: string, cb: (...args: unknown[]) => void) => {
     if (!socketOnceListeners[event]) socketOnceListeners[event] = [];
     socketOnceListeners[event].push(cb);
   }),
   disconnect: vi.fn(),
-  io: { on: vi.fn() },
+  io: {
+    on: vi.fn().mockImplementation((event: string, cb: (...args: unknown[]) => void) => {
+      if (!managerListeners[event]) managerListeners[event] = [];
+      managerListeners[event].push(cb);
+    }),
+    off: vi
+      .fn()
+      .mockImplementation((event: string, cb: (...args: unknown[]) => void) =>
+        removeMockListener(managerListeners, event, cb)
+      ),
+  },
 };
 
 vi.mock('socket.io-client', () => ({
@@ -443,8 +471,10 @@ describe('VoiceService', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     resetAllStores();
     mockSocket.connected = false;
+    mockSocket.active = true;
     for (const k of Object.keys(socketListeners)) delete socketListeners[k];
     for (const k of Object.keys(socketOnceListeners)) delete socketOnceListeners[k];
+    for (const k of Object.keys(managerListeners)) delete managerListeners[k];
   });
 
   afterEach(() => {
@@ -454,6 +484,94 @@ describe('VoiceService', () => {
     } catch {
       /* ok */
     }
+  });
+
+  // ===== media-plane connect resilience (#2176) =====
+
+  describe('media-plane connect resilience (#2176)', () => {
+    it('io() is configured with a polling fallback (transports + tryAllTransports)', async () => {
+      await joinVoiceChannel();
+      // Dynamic import: a top-level `import { io }` would force the vi.mock factory
+      // (which references mockSocket) to evaluate before mockSocket is initialized.
+      const { io } = await import('socket.io-client');
+      expect(io).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          transports: ['websocket', 'polling'],
+          tryAllTransports: true,
+        })
+      );
+    });
+
+    describe('waitForConnect', () => {
+      // waitForConnect is private; drive it directly with the shared mockSocket.
+      const callWaitForConnect = (): Promise<void> => {
+        (voiceService as any).socket = mockSocket;
+        return (voiceService as any).waitForConnect();
+      };
+
+      it('resolves when the socket connects', async () => {
+        mockSocket.connected = false;
+        const p = callWaitForConnect();
+        socketListeners['connect']?.forEach((cb) => cb());
+        await expect(p).resolves.toBeUndefined();
+      });
+
+      it('rides through a transient connect_error (socket.active) instead of hard-failing', async () => {
+        mockSocket.connected = false;
+        mockSocket.active = true; // transient — the Manager will auto-reconnect
+        const p = callWaitForConnect();
+
+        let settled = false;
+        p.then(
+          () => (settled = true),
+          () => (settled = true)
+        );
+        // A transient connect_error must NOT settle the join — Socket.IO reconnects underneath.
+        socketListeners['connect_error']?.forEach((cb) => cb(new Error('transient')));
+        await Promise.resolve();
+        expect(settled).toBe(false);
+
+        // A later successful connect resolves it.
+        socketListeners['connect']?.forEach((cb) => cb());
+        await expect(p).resolves.toBeUndefined();
+      });
+
+      it('fails fast on a server-denied connect_error (socket.active === false)', async () => {
+        mockSocket.connected = false;
+        mockSocket.active = false; // server denial (e.g. auth) — will NOT reconnect
+        const p = callWaitForConnect();
+        socketListeners['connect_error']?.forEach((cb) => cb(new Error('Unauthorized')));
+        await expect(p).rejects.toThrow('Unauthorized');
+      });
+
+      it('rejects when reconnection is exhausted (reconnect_failed)', async () => {
+        mockSocket.connected = false;
+        mockSocket.active = true;
+        const p = callWaitForConnect();
+        managerListeners['reconnect_failed']?.forEach((cb) => cb());
+        await expect(p).rejects.toThrow('Socket reconnection failed');
+      });
+
+      it('rejects after the overall timeout so a down server does not hang forever', async () => {
+        mockSocket.connected = false;
+        mockSocket.active = true;
+        const p = callWaitForConnect();
+        p.catch(() => {}); // pre-attach a handler so the pending rejection is never unhandled
+        await vi.advanceTimersByTimeAsync(31_000); // > VOICE_CONNECT_TIMEOUT_MS (30s)
+        await expect(p).rejects.toThrow('Socket connection timeout');
+      });
+
+      it('removes its listeners once settled (no leak across attempts)', async () => {
+        mockSocket.connected = false;
+        const p = callWaitForConnect();
+        socketListeners['connect']?.forEach((cb) => cb());
+        await p;
+        expect(mockSocket.off).toHaveBeenCalledWith('connect', expect.any(Function));
+        expect(mockSocket.off).toHaveBeenCalledWith('connect_error', expect.any(Function));
+        expect(mockSocket.io.off).toHaveBeenCalledWith('reconnect_failed', expect.any(Function));
+      });
+    });
   });
 
   // ===== Singleton =====
@@ -2114,7 +2232,7 @@ describe('VoiceService', () => {
   // ===== Socket timeout =====
 
   describe('socket timeout', () => {
-    it('rejects after 10s', async () => {
+    it('rejects after the connect timeout when the socket never connects', async () => {
       setupAuth();
       mockApiFetch.mockResolvedValueOnce({
         ok: true,
@@ -2124,7 +2242,10 @@ describe('VoiceService', () => {
       const promise = voiceService.joinChannel('ch');
       // Attach no-op catch to prevent unhandled rejection before timers advance
       promise.catch(() => {});
-      await vi.advanceTimersByTimeAsync(11_000);
+      // > VOICE_CONNECT_TIMEOUT_MS (30s, raised from 10s in #2176 so a brief
+      // media-plane restart is survived); no connect/connect_error is fired here,
+      // so the overall timeout is the only thing that settles the join.
+      await vi.advanceTimersByTimeAsync(31_000);
       await expect(promise).rejects.toThrow('Socket connection timeout');
     });
   });

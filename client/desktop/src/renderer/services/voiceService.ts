@@ -75,6 +75,14 @@ import { hasPermission, SPEAK } from '../utils/permissions';
 const E2EE_VERBOSE = false;
 const MAX_REMOTE_VIDEO_DEVICE_PIXEL_RATIO = 8;
 
+// Overall budget for the media-plane Socket.IO connect during a voice join (#2176).
+// waitForConnect() rides through transient connect_errors (letting Socket.IO's
+// reconnection retry a briefly-unavailable single-node media-plane, e.g. during a
+// deploy container recreate) up to this cap, then fails the join. Longer than the
+// pre-#2176 flat 10s so a short restart is survived; bounded so a genuinely-down
+// server still surfaces promptly rather than hanging "connecting" forever.
+const VOICE_CONNECT_TIMEOUT_MS = 30_000;
+
 // Detect which Insertable Streams API is available at module load.
 //
 // Priority: createEncodedStreams (legacy) > RTCRtpScriptTransform (modern).
@@ -1935,7 +1943,17 @@ class VoiceService {
             room_kind: joinType === 'dm' ? 'dm' : 'channel',
           });
         },
-        transports: ['websocket'],
+        // Websocket-first for latency, with HTTP long-polling as a fallback so a
+        // transient WS-transport blip degrades instead of hard-failing the join.
+        // tryAllTransports is REQUIRED: with 'websocket' listed first, engine.io does
+        // NOT auto-try the next transport on a failed WS *open* unless this is set
+        // (default false since socket.io-client 4.7.0). It is consulted ONLY when the
+        // initial WS transport fails, so the normal (~30ms) WS path is unchanged. Safe
+        // here because the media-plane is single-instance and its Socket.IO server
+        // advertises polling (handshake 200 + upgrades:['websocket']) — no sticky
+        // session requirement. #2176.
+        transports: ['websocket', 'polling'],
+        tryAllTransports: true,
         reconnection: true,
         reconnectionAttempts: 10,
         reconnectionDelay: 1000,
@@ -5951,23 +5969,45 @@ class VoiceService {
 
   private waitForConnect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      if (!this.socket) return reject(new Error('No socket'));
+      const socket = this.socket;
+      if (!socket) return reject(new Error('No socket'));
 
-      if (this.socket.connected) return resolve();
+      if (socket.connected) return resolve();
 
-      const timeout = setTimeout(() => {
-        reject(new Error('Socket connection timeout'));
-      }, 10_000);
-
-      this.socket.once('connect', () => {
+      // Ride through a transient media-plane blip (e.g. a deploy recreating the
+      // single media-plane container) instead of hard-failing the join on the first
+      // connect_error. With reconnection:true, a transient failure leaves
+      // socket.active === true and the Manager auto-retries the connect; we only
+      // reject on a server-side denial (socket.active === false — e.g. auth), on
+      // reconnection exhaustion (reconnect_failed), or on the overall timeout. Use
+      // on()/off() (not once()) because connect_error fires once per failed attempt. #2176.
+      let settled = false;
+      const finish = (cb: () => void): void => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timeout);
-        resolve();
-      });
+        socket.off('connect', onConnect);
+        socket.off('connect_error', onConnectError);
+        socket.io.off('reconnect_failed', onReconnectFailed);
+        cb();
+      };
+      const onConnect = (): void => finish(() => resolve());
+      const onConnectError = (err: Error): void => {
+        // socket.active === false => the client will NOT auto-reconnect (server
+        // denial, or reconnection attempts exhausted) => fail fast. Otherwise it is a
+        // transient error the Manager is already retrying — keep waiting.
+        if (!socket.active) finish(() => reject(err));
+      };
+      const onReconnectFailed = (): void =>
+        finish(() => reject(new Error('Socket reconnection failed')));
+      const timeout = setTimeout(
+        () => finish(() => reject(new Error('Socket connection timeout'))),
+        VOICE_CONNECT_TIMEOUT_MS
+      );
 
-      this.socket.once('connect_error', (err) => {
-        clearTimeout(timeout);
-        reject(err);
-      });
+      socket.on('connect', onConnect);
+      socket.on('connect_error', onConnectError);
+      socket.io.on('reconnect_failed', onReconnectFailed);
     });
   }
 
