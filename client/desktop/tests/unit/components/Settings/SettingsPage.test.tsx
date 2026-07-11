@@ -57,7 +57,7 @@ describe('SettingsPage', () => {
     expect(screen.getByText('Appearance')).toBeInTheDocument();
     expect(screen.getByText('Privacy & Security')).toBeInTheDocument();
     expect(screen.getByText('Account')).toBeInTheDocument();
-    expect(screen.getByText('Sounds and Notifications')).toBeInTheDocument();
+    expect(screen.getByText('Notifications')).toBeInTheDocument();
     expect(screen.getByText('Audio & Video')).toBeInTheDocument();
     expect(screen.getByText('Accessibility')).toBeInTheDocument();
   });
@@ -513,7 +513,7 @@ describe('SettingsPage', () => {
 
   it('Notifications nav item is enabled', () => {
     render(<SettingsPage />);
-    const notifBtn = screen.getByText('Sounds and Notifications').closest('button');
+    const notifBtn = screen.getByText('Notifications').closest('button');
     expect(notifBtn).not.toBeDisabled();
   });
 
@@ -530,7 +530,7 @@ describe('SettingsPage', () => {
 
   it('navigating to Notifications section renders NotificationSection', () => {
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText('Sounds and Notifications'));
+    fireEvent.click(screen.getByText('Notifications'));
     // NotificationSection renders "Desktop Notifications" as a collapsible section title
     // and nav tree shows subsection labels
     const desktopNotifEls = screen.getAllByText('Desktop Notifications');
