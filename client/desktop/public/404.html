@@ -1,0 +1,101 @@
+<!doctype html>
+<!--
+  Cloudflare Pages not-found handler (issue #2173, Refs #1870).
+
+  This file is LOAD-BEARING, not decorative. Per Cloudflare Pages' documented
+  behavior, a project WITHOUT a top-level 404.html is treated as a single-page
+  application, so every unmatched path — including a missing /assets/<hash>.js —
+  is served /index.html with a 200 text/html status. Combined with the immutable
+  Cache-Control on /assets/* (see public/_headers), that poisoned the browser
+  cache with a wrong-MIME 200 during deploy-propagation windows, breaking every
+  ES-module load ("Expected a JavaScript-or-Wasm module script but the server
+  responded with a MIME type of text/html").
+
+  Presence of this file disables that implicit SPA fallback: a missing asset now
+  returns a genuine 404 (never executed as a module, never cached as an immutable
+  success). Real assets are still served directly (static files take priority),
+  and app navigation is unaffected because the renderer uses HashRouter — the
+  server only ever receives "/". DO NOT DELETE without restoring an equivalent
+  not-found guard. Self-contained by design (no external asset references) so it
+  can never itself trigger a request that recurses through the fallback.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Not found · Concord Voice</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f6f7f9;
+        --fg: #1c1e21;
+        --muted: #6b7280;
+        --accent: #5865f2;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #16171a;
+          --fg: #e8e9ec;
+          --muted: #9aa0a6;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--bg);
+        color: var(--fg);
+        font-family:
+          system-ui,
+          -apple-system,
+          'Segoe UI',
+          Roboto,
+          sans-serif;
+        line-height: 1.5;
+        padding: 1.5rem;
+      }
+      main {
+        text-align: center;
+        max-width: 28rem;
+      }
+      .code {
+        font-size: clamp(3.5rem, 12vw, 6rem);
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        margin: 0;
+      }
+      p {
+        color: var(--muted);
+        margin: 0.5rem 0 1.5rem;
+      }
+      a {
+        display: inline-block;
+        padding: 0.6rem 1.25rem;
+        border-radius: 0.5rem;
+        background: var(--accent);
+        color: #fff;
+        text-decoration: none;
+        font-weight: 600;
+      }
+      a:hover {
+        filter: brightness(1.08);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 class="code">404</h1>
+      <p>That page or file doesn&rsquo;t exist.</p>
+      <a href="/">Return to Concord Voice</a>
+    </main>
+  </body>
+</html>

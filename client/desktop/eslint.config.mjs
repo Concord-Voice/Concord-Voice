@@ -19,6 +19,11 @@ export default [
       '*.mts',
       'scripts/*.mjs',
       'scripts/*.mts',
+      // Cloudflare Pages Functions (Workers runtime, not the app TS project; #2173).
+      // Type-aware linting them would require adding them to a tsconfig + Workers
+      // globals; the /assets/* caching Function is regression-locked by
+      // tests/unit/functions/assetsCache.test.ts instead.
+      'functions/**',
     ],
   },
 
