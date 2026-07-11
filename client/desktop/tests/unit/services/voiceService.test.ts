@@ -470,6 +470,10 @@ describe('VoiceService', () => {
     vi.clearAllMocks();
     vi.useFakeTimers({ shouldAdvanceTime: true });
     resetAllStores();
+    // resetAllStores() does not cover videoSettingsStore; reset the fields these voice
+    // tests mutate (learned B-signal + codec preference) so no test leaks into the next
+    // (#2187 — the B-signal tests set both, and the codec-selection tests depend on defaults).
+    useVideoSettingsStore.setState({ preferredVideoCodec: null, webrtcHwByMime: {} });
     mockSocket.connected = false;
     mockSocket.active = true;
     for (const k of Object.keys(socketListeners)) delete socketListeners[k];
@@ -2391,6 +2395,202 @@ describe('VoiceService', () => {
       // Should not throw
       await vi.advanceTimersByTimeAsync(5500);
       expect(micProducer.getStats).toHaveBeenCalled();
+    });
+  });
+
+  describe('B-signal session-stats monitor lifecycle (#2187 item 1)', () => {
+    function videoStatsMap(mime = 'video/VP8', powerEfficient = true) {
+      const m = new Map<string, unknown>();
+      m.set('o1', {
+        type: 'outbound-rtp',
+        kind: 'video',
+        codecId: 'c1',
+        powerEfficientEncoder: powerEfficient,
+      });
+      m.set('c1', { type: 'codec', id: 'c1', mimeType: mime });
+      return m;
+    }
+
+    it('startPacketLossMonitor is idempotent — second call keeps the same timer', async () => {
+      await joinVoiceChannel(); // produceAudio started the monitor
+      const svc = voiceService as any;
+      const timer1 = svc.packetLossTimer;
+      expect(timer1).not.toBeNull();
+      svc.startPacketLossMonitor();
+      expect(svc.packetLossTimer).toBe(timer1);
+    });
+
+    it('learns B for the camera codec in a no-mic session', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+
+      // Simulate a no-mic (video-only) session: stop the mic-started monitor and drop the mic.
+      svc.stopPacketLossMonitor();
+      svc.producers.delete('mic');
+      expect(svc.packetLossTimer).toBeNull();
+
+      const cameraProducer = createMockProducer('prod-cam', 'camera');
+      cameraProducer.getStats = vi.fn().mockResolvedValue(videoStatsMap('video/VP8', true));
+      sendTransport.produce.mockResolvedValue(cameraProducer);
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream([{ kind: 'video', id: 'cam-1' }]));
+
+      await voiceService.produceVideo();
+      expect(svc.packetLossTimer).not.toBeNull(); // video path restarted the monitor
+
+      await vi.advanceTimersByTimeAsync(5500);
+      expect(useVideoSettingsStore.getState().webrtcHwByMime['video/vp8']).toBe(true);
+    });
+  });
+
+  describe('reProduceIfBetterCodec requireHwImprovement gate (#2187 item 2)', () => {
+    // The shared mock device has VP8/VP9/H264/AV1, so pin the cascade to VP8 via
+    // preferredVideoCodec (cascade step 1) for a deterministic pick, and mark VP8 SW-learned.
+    async function setupCameraOnCodec(activeMime: string) {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useVideoSettingsStore.setState({
+        preferredVideoCodec: 'video/VP8',
+        webrtcHwByMime: { 'video/vp8': false },
+      });
+      const cam = createMockProducer('prod-cam', 'camera');
+      cam.rtpSender.getParameters = vi.fn().mockReturnValue({ codecs: [{ mimeType: activeMime }] });
+      svc.producers.set('camera', cam);
+      svc.localCameraStream = createMockMediaStream([{ kind: 'video', id: 'cam-1' }]);
+      return svc;
+    }
+
+    it('does NOT switch when the better pick is software-encoded and requireHwImprovement is set', async () => {
+      const svc = await setupCameraOnCodec('video/AV1'); // active AV1 ≠ pick VP8, but VP8 is SW
+      // Override on the singleton (delete restores the prototype) — the file's convention.
+      // vi.spyOn would leak the mock across tests since beforeEach only clears, not restores.
+      let called = 0;
+      svc.fastReproduceCamera = async () => {
+        called++;
+      };
+      try {
+        await svc.reProduceIfBetterCodec('camera', { requireHwImprovement: true });
+        expect(called).toBe(0);
+      } finally {
+        delete svc.fastReproduceCamera;
+      }
+    });
+
+    it('switches (no requireHwImprovement) when a different codec is picked', async () => {
+      const svc = await setupCameraOnCodec('video/AV1');
+      let called = 0;
+      svc.fastReproduceCamera = async () => {
+        called++;
+      };
+      try {
+        await svc.reProduceIfBetterCodec('camera');
+        expect(called).toBe(1);
+      } finally {
+        delete svc.fastReproduceCamera;
+      }
+    });
+  });
+
+  describe('learnWebrtcHwSignal re-selection trigger (#2187 item 2)', () => {
+    function bFalseStats(mime = 'video/VP8') {
+      const m = new Map<string, unknown>();
+      m.set('o1', {
+        type: 'outbound-rtp',
+        kind: 'video',
+        codecId: 'c1',
+        powerEfficientEncoder: false,
+      });
+      m.set('c1', { type: 'codec', id: 'c1', mimeType: mime });
+      return m;
+    }
+
+    async function cameraOnVp8SoftwareStats() {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const cam = createMockProducer('prod-cam', 'camera');
+      cam.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      cam.getStats = vi.fn().mockResolvedValue(bFalseStats('video/VP8'));
+      svc.producers.set('camera', cam);
+      return svc;
+    }
+
+    it('triggers reProduceIfBetterCodec when the active codec transitions to SW', async () => {
+      const svc = await cameraOnVp8SoftwareStats();
+      // Override on the singleton (delete restores the prototype) — beforeEach only clears
+      // mock call history, not spies, so vi.spyOn on the singleton would leak into later tests.
+      const calls: unknown[][] = [];
+      svc.reProduceIfBetterCodec = async (...args: unknown[]) => {
+        calls.push(args);
+      };
+      try {
+        await svc.learnWebrtcHwSignal();
+        expect(calls).toEqual([['camera', { requireHwImprovement: true }]]);
+      } finally {
+        delete svc.reProduceIfBetterCodec;
+      }
+    });
+
+    it('does NOT re-trigger once B is already false (churn guard)', async () => {
+      const svc = await cameraOnVp8SoftwareStats();
+      useVideoSettingsStore.setState({ webrtcHwByMime: { 'video/vp8': false } });
+      const calls: unknown[][] = [];
+      svc.reProduceIfBetterCodec = async (...args: unknown[]) => {
+        calls.push(args);
+      };
+      try {
+        await svc.learnWebrtcHwSignal();
+        expect(calls).toEqual([]);
+      } finally {
+        delete svc.reProduceIfBetterCodec;
+      }
+    });
+
+    it('re-selects BOTH camera and screen when they share a software-encoded codec (#2189)', async () => {
+      // Two-pass previousHw capture: without it, camera's write flips previousHw to false for
+      // screen and its churn guard suppresses screen's re-selection (Codex review of #2189).
+      const svc = await cameraOnVp8SoftwareStats();
+      const scr = createMockProducer('prod-scr', 'screen');
+      scr.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      scr.getStats = vi.fn().mockResolvedValue(bFalseStats('video/VP8'));
+      svc.producers.set('screen', scr);
+
+      const calls: unknown[][] = [];
+      svc.reProduceIfBetterCodec = async (...args: unknown[]) => {
+        calls.push(args);
+      };
+      try {
+        await svc.learnWebrtcHwSignal();
+        expect(calls).toEqual([
+          ['camera', { requireHwImprovement: true }],
+          ['screen', { requireHwImprovement: true }],
+        ]);
+      } finally {
+        delete svc.reProduceIfBetterCodec;
+      }
+    });
+
+    it('swallows a rejection from the fire-and-forget re-selection (#2189)', async () => {
+      const svc = await cameraOnVp8SoftwareStats();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      svc.reProduceIfBetterCodec = async () => {
+        throw new Error('transport closed mid-swap');
+      };
+      try {
+        // learnWebrtcHwSignal must resolve (not reject) — the .catch swallows the rejection so
+        // it never surfaces as an unhandled promise rejection on the 5s monitor tick.
+        await expect(svc.learnWebrtcHwSignal()).resolves.toBeUndefined();
+        await Promise.resolve(); // let the detached .catch microtask run
+        expect(warn).toHaveBeenCalledWith(
+          '[codec-floor] HW re-selection failed:',
+          'transport closed mid-swap'
+        );
+      } finally {
+        delete svc.reProduceIfBetterCodec;
+        warn.mockRestore();
+      }
     });
   });
 

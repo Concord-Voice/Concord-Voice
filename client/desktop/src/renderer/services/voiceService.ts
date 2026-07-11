@@ -54,7 +54,7 @@ import {
 } from '../workers/e2eeProtocol';
 import { notificationSoundService } from './notificationSoundService';
 import { selectCodecFromCascade, type CodecLookup } from './voiceCodecSelection';
-import { extractWebrtcHwSignal } from './webrtcHwSignal';
+import { extractWebrtcHwSignal, shouldReselectForHwDowngrade } from './webrtcHwSignal';
 import { ConsumerPauseCoordinator } from './consumerPauseCoordinator';
 import { buildCameraEncodingPlan, castingKindForCodec, isCastingEligible } from './cameraLayering';
 import {
@@ -643,16 +643,61 @@ class VoiceService {
    * WebCodecs silicon capability (A) until a producer of that codec reports.
    */
   private async learnWebrtcHwSignal(): Promise<void> {
+    // Two-pass so camera and screen sharing the same codec each evaluate the re-selection
+    // trigger against the PRE-tick B value (#2187 item 2). If we wrote B mid-loop, the first
+    // source's write would flip previousHw to false for the second source and its churn guard
+    // would suppress re-selection — leaving the second source pinned on the CPU encoder
+    // (Codex review of #2189). Pass 1 captures previousHw before any write; pass 2 writes the
+    // learned B and then decides per source.
+    const observed: Array<{
+      source: 'camera' | 'screen';
+      signal: { mime: string; powerEfficient: boolean };
+      previousHw: boolean | undefined;
+      activeCodecMime: string | null;
+    }> = [];
     for (const source of ['camera', 'screen'] as const) {
       const producer = this.producers.get(source);
       if (!producer) continue;
       try {
         const signal = extractWebrtcHwSignal(await producer.getStats());
-        if (signal) {
-          useVideoSettingsStore.getState().setWebrtcHwForMime(signal.mime, signal.powerEfficient);
-        }
+        if (!signal) continue;
+        observed.push({
+          source,
+          signal,
+          previousHw: useVideoSettingsStore.getState().webrtcHwByMime[signal.mime],
+          activeCodecMime: this.getProducerCodecMimeType(source)?.split(':')[0] ?? null,
+        });
       } catch {
         // stats unavailable this tick — leave B unlearned for this codec
+      }
+    }
+
+    const store = useVideoSettingsStore.getState();
+    for (const o of observed) {
+      store.setWebrtcHwForMime(o.signal.mime, o.signal.powerEfficient);
+    }
+
+    // #2187 item 2: for each source whose ACTIVE codec just transitioned to software-encode,
+    // re-select toward a HW codec (once per SW transition; reProduceIfBetterCodec no-ops if no
+    // genuinely-better HW codec exists — including under camera-layering, where the SVC ladder
+    // owns codec choice and re-selection is intentionally a no-op).
+    for (const o of observed) {
+      if (
+        shouldReselectForHwDowngrade({
+          learnedHw: o.signal.powerEfficient,
+          previousHw: o.previousHw,
+          learnedMime: o.signal.mime,
+          activeCodecMime: o.activeCodecMime,
+        })
+      ) {
+        // Fire-and-forget with an explicit catch: the void detaches this promise from the
+        // caller, so a mid-swap reproduce rejection (transport/track race — fastReproduce* has
+        // already closed the old producer) must be swallowed here, not surface as an unhandled
+        // rejection. Best-effort: a failed reproduce leaves the current codec in place. Log
+        // .message only, never the raw error (observability.md § Console error logging).
+        void this.reProduceIfBetterCodec(o.source, { requireHwImprovement: true }).catch((err) =>
+          console.warn('[codec-floor] HW re-selection failed:', (err as Error).message)
+        );
       }
     }
   }
@@ -674,7 +719,11 @@ class VoiceService {
   }
 
   private startPacketLossMonitor(): void {
-    this.stopPacketLossMonitor();
+    // Idempotent: the first producer of ANY kind (mic, camera, or screen) starts the
+    // session-stats loop; later produce calls are no-ops (#2187 item 1). This loop drives
+    // both the per-tick B-signal learn (learnWebrtcHwSignal) and mic FEC headroom tuning,
+    // so it must run in no-mic (video/screen-only) sessions too.
+    if (this.packetLossTimer) return;
     this.lastPacketsLost = 0;
     this.lastPacketsSent = 0;
 
@@ -1622,7 +1671,10 @@ class VoiceService {
   }
 
   /** Re-produce a video source if the codec cascade now selects a different codec. */
-  private async reProduceIfBetterCodec(source: 'camera' | 'screen'): Promise<void> {
+  private async reProduceIfBetterCodec(
+    source: 'camera' | 'screen',
+    opts?: { requireHwImprovement?: boolean }
+  ): Promise<void> {
     const producer = this.producers.get(source);
     if (!producer) return;
 
@@ -1632,6 +1684,10 @@ class VoiceService {
     const bestPick = source === 'camera' ? this.pickCameraCodec() : this.pickScreenCodec();
     const bestMime = bestPick.codec?.mimeType?.toLowerCase() ?? null;
     if (!bestMime || bestMime === currentMime) return;
+
+    // #2187 item 2: a B=false-driven re-selection only switches toward a genuinely
+    // HW-accelerated codec — prevents SW→SW churn/oscillation.
+    if (opts?.requireHwImprovement && !this.isHwAccelerated(bestMime)) return;
 
     // Never switch to a HW codec if hardware acceleration is disabled
     const hwAccel = useVideoSettingsStore.getState().hardwareAcceleration;
@@ -2732,6 +2788,10 @@ class VoiceService {
       this.applyDegradationPreference(producer);
       this.producers.set('camera', producer);
 
+      // Start the session-stats monitor from the video path too, so the WebRTC HW
+      // B-signal is learned in no-mic (video/screen-only) sessions (#2187 item 1). Idempotent.
+      this.startPacketLossMonitor();
+
       if (this.mediaEncryption) {
         this.applyEncryptTransform(producer);
       }
@@ -2945,6 +3005,9 @@ class VoiceService {
 
       this.applyDegradationPreference(producer);
       this.producers.set('screen', producer);
+
+      // #2187 item 1: idempotent — learns the B-signal in screen-only (no-mic) sessions.
+      this.startPacketLossMonitor();
 
       if (this.mediaEncryption) {
         this.applyEncryptTransform(producer);

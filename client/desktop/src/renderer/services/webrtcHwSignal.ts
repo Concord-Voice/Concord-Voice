@@ -48,3 +48,23 @@ export function extractWebrtcHwSignal(
   if (!mime) return null;
   return { mime: mime.toLowerCase(), powerEfficient: outbound.powerEfficientEncoder === true };
 }
+
+/**
+ * Decide whether a just-learned B-signal warrants a mid-call codec re-selection (#2187 item 2).
+ * Fires only on a transition INTO software-encode (`previousHw !== false`) for the codec the
+ * producer is ACTIVELY using — so it triggers at most once per codec-goes-SW event (churn guard).
+ * The caller still gates the actual switch on a genuinely-better HW codec existing
+ * (`reProduceIfBetterCodec({ requireHwImprovement: true })`).
+ */
+export function shouldReselectForHwDowngrade(params: {
+  learnedHw: boolean;
+  previousHw: boolean | undefined;
+  learnedMime: string;
+  activeCodecMime: string | null;
+}): boolean {
+  return (
+    params.learnedHw === false &&
+    params.previousHw !== false &&
+    params.activeCodecMime === params.learnedMime
+  );
+}

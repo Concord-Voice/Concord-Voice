@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { extractWebrtcHwSignal } from '@/renderer/services/webrtcHwSignal';
+import {
+  extractWebrtcHwSignal,
+  shouldReselectForHwDowngrade,
+} from '@/renderer/services/webrtcHwSignal';
 
 /** Build a Map that satisfies the RTCStatsReport (ReadonlyMap) shape for the helper. */
 const report = (entries: Record<string, unknown>[]): RTCStatsReport =>
@@ -62,5 +65,38 @@ describe('extractWebrtcHwSignal', () => {
       { type: 'outbound-rtp', kind: 'video', codecId: 'missing', powerEfficientEncoder: true },
     ]);
     expect(extractWebrtcHwSignal(stats)).toBeNull();
+  });
+});
+
+describe('shouldReselectForHwDowngrade', () => {
+  const base = {
+    learnedHw: false,
+    previousHw: undefined as boolean | undefined,
+    learnedMime: 'video/av1',
+    activeCodecMime: 'video/av1' as string | null,
+  };
+
+  it('true on undefined→false transition for the active codec', () => {
+    expect(shouldReselectForHwDowngrade(base)).toBe(true);
+  });
+
+  it('true on true→false transition for the active codec', () => {
+    expect(shouldReselectForHwDowngrade({ ...base, previousHw: true })).toBe(true);
+  });
+
+  it('false when previousHw is already false (churn guard)', () => {
+    expect(shouldReselectForHwDowngrade({ ...base, previousHw: false })).toBe(false);
+  });
+
+  it('false when the learned signal is HW (B=true)', () => {
+    expect(shouldReselectForHwDowngrade({ ...base, learnedHw: true })).toBe(false);
+  });
+
+  it('false when the learned codec is not the active codec', () => {
+    expect(shouldReselectForHwDowngrade({ ...base, activeCodecMime: 'video/h264' })).toBe(false);
+  });
+
+  it('false when there is no active codec', () => {
+    expect(shouldReselectForHwDowngrade({ ...base, activeCodecMime: null })).toBe(false);
   });
 });
