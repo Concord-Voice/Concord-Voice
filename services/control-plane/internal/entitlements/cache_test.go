@@ -67,3 +67,15 @@ func TestCache_GetTier_SelfHostedReturnsPremiumWithoutDBOrRedis(t *testing.T) {
 
 	assert.Equal(t, entitlements.TierPremium, cache.GetTier(context.Background(), "user-1"))
 }
+
+// TestCache_IsSelfHosted reports the deployment-mode seam that callers resolving
+// a tier outside GetTier (e.g. the expiry sweeper) key off. It normalizes the
+// operator-authored instance-type string just like GetTier's own branch.
+func TestCache_IsSelfHosted(t *testing.T) {
+	assert.True(t, entitlements.NewCacheForInstance(nil, nil, " self-hosted ").IsSelfHosted(),
+		"self-hosted instance type must report self-hosted (whitespace-tolerant)")
+	assert.False(t, entitlements.NewCacheForInstance(nil, nil, "saas").IsSelfHosted(),
+		"saas instance type must not report self-hosted")
+	assert.False(t, entitlements.NewCache(nil, nil).IsSelfHosted(),
+		"default cache is SaaS")
+}

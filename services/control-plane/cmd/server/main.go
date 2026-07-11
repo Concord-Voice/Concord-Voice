@@ -20,9 +20,11 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/attestation"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/auth"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/database"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/storage"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/subscriptions"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/voice"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
@@ -125,6 +127,20 @@ func main() {
 	// leave and revoke). Its resolver shares the same Redis-backed permission cache.
 	sweepResolver := rbac.NewResolver(db, rbac.NewPermissionCache(redisClient), log)
 	voice.StartTempGrantSweepWorker(cleanupCtx, db, log, hub, sweepResolver, natsClient, voice.DefaultTempGrantSweepInterval)
+
+	// Start the subscription-expiry sweeper (#2158). Fixed-duration code grants
+	// (Kickstarter, Beta) lapse purely by the clock; without this the passive
+	// expiry never fires OnTierChange, so a client keeps premium UI affordances
+	// until it reconnects while the server already rejects them. The sweep flips
+	// each lapsed subscription to 'expired' and runs the SAME OnTierChange
+	// convergence point (cache invalidate + entitlements_changed push + downgrade
+	// disconnect) the redemption grant uses. Its cache + WS notifier are built
+	// fresh here, matching the temp-grant sweeper's own-deps pattern above (the
+	// entitlement Cache is Redis-backed and stateless, so a second instance is
+	// equivalent to the router's).
+	expiryEntCache := entitlements.NewCacheForInstance(redisClient, db, cfg.InstanceType)
+	expiryNotifier := api.NewEntitlementNotifier(hub, log)
+	subscriptions.StartExpirySweepWorker(cleanupCtx, db, log, expiryEntCache, expiryNotifier, subscriptions.DefaultExpirySweepInterval)
 
 	// Create HTTP server
 	srv := &http.Server{

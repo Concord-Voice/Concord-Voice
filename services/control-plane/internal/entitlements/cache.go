@@ -37,6 +37,15 @@ func NewCacheForInstance(redisClient *redis.Client, db *sql.DB, instanceType str
 
 func (c *Cache) key(userID string) string { return "ent:" + userID }
 
+// IsSelfHosted reports whether this cache resolves every user to the maximal
+// tier (self-hosted deployment mode). Callers that resolve a post-change tier
+// outside GetTier (e.g. the expiry sweeper) use this to mirror GetTier's
+// self-hosted short-circuit instead of a DB resolve, which would otherwise read
+// TierFree and manufacture a spurious downgrade on self-hosted instances.
+func (c *Cache) IsSelfHosted() bool {
+	return config.IsSelfHostedInstance(c.instanceType)
+}
+
 // GetTier returns the user's tier, reading through to the subscriptions table on
 // a cache miss and populating the cache. On a Redis error (other than a miss) it
 // degrades to a direct DB resolve rather than failing open.
