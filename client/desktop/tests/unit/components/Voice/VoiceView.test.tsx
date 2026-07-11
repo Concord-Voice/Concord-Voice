@@ -289,6 +289,22 @@ describe('VoiceView', () => {
     expect(screen.queryByTestId('voice-stage')).not.toBeInTheDocument();
   });
 
+  it('does not show the floating view-mode switch when no stream is tuned in', () => {
+    setConnectedState({ tunedInScreenShares: {} });
+    render(<VoiceView channelId={VOICE_CHANNEL_ID} channelName="General" />);
+    expect(screen.queryByRole('group', { name: 'Voice layout' })).not.toBeInTheDocument();
+  });
+
+  it('shows the floating view-mode switch when a stream is tuned in', () => {
+    setConnectedState({
+      tunedInScreenShares: { 'producer-1': 'consumer-1' },
+      voiceViewMode: 'tile',
+    });
+    render(<VoiceView channelId={VOICE_CHANNEL_ID} channelName="General" />);
+    expect(screen.getByRole('group', { name: 'Voice layout' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Tile view' })).toBeInTheDocument();
+  });
+
   it('shows UserFrameBar in Mode B when showUserFrameBar is true', () => {
     setConnectedState({
       tunedInScreenShares: { 'producer-1': 'consumer-1' },

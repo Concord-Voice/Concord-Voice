@@ -11,6 +11,7 @@ import VoiceStage from './VoiceStage';
 import StreamBar from './StreamBar';
 import VoiceControls from './VoiceControls';
 import VoiceTextChat from './VoiceTextChat';
+import VoiceViewSwitch from './VoiceViewSwitch';
 import './VoiceView.css';
 
 interface VoiceViewProps {
@@ -473,6 +474,10 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
             (Zoom-style); 'tile' = streams as grid tiles beside the user
             frames (Discord-style). */}
         <div className="voice-view__voice-area" ref={voiceAreaRef} tabIndex={-1}>
+          {/* Tile ↔ Front 'n Center switch — floats over the voice area, shown
+              only while a stream is tuned in (both modes exist). Relocated here
+              from the controls bar so it sits on the content it reorganizes. */}
+          {hasScreenShares && <VoiceViewSwitch />}
           {hasScreenShares && voiceViewMode === 'front-center' ? (
             <ScreenShareLayout
               showUserFrameBar={showUserFrameBar}

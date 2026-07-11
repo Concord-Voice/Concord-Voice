@@ -17,6 +17,14 @@ import './ParticipantGrid.css';
 /** Base vertical px reserved below each grid slot for the Tune In/Out pill row. */
 const PILL_SPACE_BASE = 24;
 
+/** Ceiling (px) for avatar-only frames. Their avatar is a fixed circle, so a
+ *  larger frame is just empty space around a small dot. In an all-avatar grid
+ *  this is applied as useGridLayout's `maxTileWidth`. In a mixed grid the JS
+ *  layout emits a single 16:9 tile size for every tile, so the per-tile CSS cap
+ *  keyed off this value (emitted as `--avatar-frame-cap`) does the capping the
+ *  uniform JS size cannot. Both paths share this one source of truth. */
+const AVATAR_FRAME_CAP_PX = 320;
+
 /** Discrete font-size buckets, mirrored from the `[data-fontsize]` rules in
  *  styles/index.css. The effective `--font-scale` the pill band tracks is this
  *  discrete value times the continuous `--ui-scale` (uiScale). Keeping this map
@@ -518,7 +526,16 @@ export const UserFrameGrid: React.FC<UserFrameGridProps> = ({ includeStreamTiles
     participantList.length + streamTiles.length,
     {
       aspectRatio: hasAnyVideo ? 16 / 9 : 1,
-      maxTileWidth: 320,
+      // Video/screen tiles fill the available voice-area space — computeGridLayout
+      // still bounds them by the container, so "uncapped" means "as big as fits."
+      // Avatar-only frames keep the cap: their avatar is a fixed 56px circle, so an
+      // oversized frame is just a huge empty rounded rect around a tiny dot. In a
+      // MIXED grid (hasAnyVideo) useGridLayout emits ONE uniform 16:9 size for every
+      // tile, so this JS cap can't single out avatar frames — the per-tile CSS cap
+      // (--avatar-frame-cap, ParticipantGrid.css) caps them there instead.
+      // ponytail: AVATAR_FRAME_CAP_PX is the ceiling; drop it (and the CSS rule) if
+      // avatar frames should grow too.
+      maxTileWidth: hasAnyVideo ? undefined : AVATAR_FRAME_CAP_PX,
       scale: reservedScale,
       extraTileHeight: pillSpace,
     }
@@ -548,6 +565,7 @@ export const UserFrameGrid: React.FC<UserFrameGridProps> = ({ includeStreamTiles
           '--tile-w': `${tileWidth}px`,
           '--tile-h': `${tileHeight}px`,
           '--pill-space': `${pillSpace}px`,
+          '--avatar-frame-cap': `${AVATAR_FRAME_CAP_PX}px`,
         } as React.CSSProperties
       }
     >

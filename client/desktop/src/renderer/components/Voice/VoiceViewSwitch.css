@@ -1,0 +1,81 @@
+/* Floating segmented Tile ↔ Front 'n Center switch, top-LEFT of the voice area
+   (.voice-view__voice-area is position:relative). Anchored left, not right,
+   because the right edge is a stacked column of interactive controls the
+   persistent switch would sit on top of and swallow clicks for when the stage
+   is flush to the top (Front 'n Center + collapsed user-frame bar + no remote
+   share, so the pill strip is empty): the frame-bar section-toggle chevron
+   (.voice-view__section-toggle, right:8px) and the stage PiP button
+   (.voice-stage__pip-btn, right:8px). The left edge only ever hosts the stage
+   layout-toggle (left:8px), which is hover-only, gated on multiple tuned-in
+   shares, and never coincides with a flush-to-top stage (any remote share
+   renders the pill strip, which pushes the stage below the switch).
+   The switch is painted before the content in DOM, so it must out-stack it:
+   z-index 5 clears the encryption-ring ::after (z-index 1) plus active-speaker
+   and magnified tiles (z-index 2), which would otherwise paint over the switch
+   and swallow its clicks in tile view. */
+.voice-view-switch {
+  position: absolute;
+  top: calc(12px * var(--sp, 1));
+  left: calc(12px * var(--sp, 1));
+  z-index: 5;
+  display: inline-flex;
+  gap: 2px;
+  /* fieldset resets: strip the default margin/min-inline-size so the segmented
+     visual is unchanged from the prior <div> (mirrors .presence-tier-segmented) */
+  margin: 0;
+  min-inline-size: auto;
+  padding: 3px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-secondary) 82%, transparent);
+  border: 1px solid var(--border-color);
+  /* legible when it sits over busy screen-share / camera content */
+  backdrop-filter: blur(4px);
+}
+
+/* Visually-hidden legend — the accessible group name, no layout impact. */
+.voice-view-switch__legend {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.voice-view-switch__seg {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(30px * var(--sp, 1));
+  height: calc(26px * var(--sp, 1));
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
+}
+
+.voice-view-switch__seg:hover {
+  color: var(--text-primary);
+  background: var(--bg-modifier-hover);
+}
+
+/* Active = accent (a "current selection" signal), deliberately NOT --danger:
+   a view mode is not an on/off/stop state like mute or screen-share. */
+.voice-view-switch__seg--active,
+.voice-view-switch__seg--active:hover {
+  background: var(--accent-primary);
+  color: #fff;
+}
+
+.voice-view-switch__seg:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}

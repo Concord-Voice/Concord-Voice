@@ -448,6 +448,69 @@ describe('voiceStore', () => {
       expect(s.dominantScreenShareId).toBe('prod-2');
     });
 
+    it('setVoiceViewMode into front-center forces focus + a valid dominant (VoiceViewSwitch path)', () => {
+      // The VoiceViewSwitch buttons call setVoiceViewMode directly, not
+      // toggleVoiceViewMode, so the front-center entry invariant must hold on
+      // this path too — otherwise clicking the switch renders an equal grid
+      // with no dominant / no ←→ cycling.
+      useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
+      useVoiceStore.getState().tuneIn('prod-2', 'cons-2');
+      useVoiceStore.setState({
+        voiceViewMode: 'tile',
+        stageLayout: 'equal',
+        dominantScreenShareId: null,
+      });
+
+      useVoiceStore.getState().setVoiceViewMode('front-center');
+
+      const s = useVoiceStore.getState();
+      expect(s.voiceViewMode).toBe('front-center');
+      expect(s.stageLayout).toBe('focus');
+      expect(s.dominantScreenShareId).toBe('prod-1'); // first tuned-in share
+    });
+
+    it('setVoiceViewMode into front-center preserves an already-valid dominant', () => {
+      useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
+      useVoiceStore.getState().tuneIn('prod-2', 'cons-2');
+      useVoiceStore.getState().setDominantScreenShare('prod-2');
+      useVoiceStore.setState({ voiceViewMode: 'tile', stageLayout: 'equal' });
+
+      useVoiceStore.getState().setVoiceViewMode('front-center');
+
+      const s = useVoiceStore.getState();
+      expect(s.voiceViewMode).toBe('front-center');
+      expect(s.stageLayout).toBe('focus');
+      expect(s.dominantScreenShareId).toBe('prod-2');
+    });
+
+    it('setVoiceViewMode to tile leaves the stage layout untouched', () => {
+      useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
+      useVoiceStore.setState({ voiceViewMode: 'front-center', stageLayout: 'equal' });
+
+      useVoiceStore.getState().setVoiceViewMode('tile');
+
+      const s = useVoiceStore.getState();
+      expect(s.voiceViewMode).toBe('tile');
+      expect(s.stageLayout).toBe('equal');
+    });
+
+    it('re-confirming the already-active front-center is idempotent (keeps an equal stage sublayout)', () => {
+      // In front-center the user can pick the 'equal' stage sublayout via the
+      // VoiceStage layout toggle. Re-clicking the already-active Front 'n Center
+      // segment must not run the entry repair and clobber that choice to 'focus'
+      // — the repair fires only on an actual transition into front-center.
+      useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
+      useVoiceStore.getState().setDominantScreenShare('prod-1');
+      useVoiceStore.setState({ voiceViewMode: 'front-center', stageLayout: 'equal' });
+
+      useVoiceStore.getState().setVoiceViewMode('front-center');
+
+      const s = useVoiceStore.getState();
+      expect(s.voiceViewMode).toBe('front-center');
+      expect(s.stageLayout).toBe('equal'); // preserved, not forced to 'focus'
+      expect(s.dominantScreenShareId).toBe('prod-1');
+    });
+
     it('toggling to tile view leaves the stage layout untouched', () => {
       useVoiceStore.getState().tuneIn('prod-1', 'cons-1');
       useVoiceStore.setState({ voiceViewMode: 'front-center', stageLayout: 'equal' });

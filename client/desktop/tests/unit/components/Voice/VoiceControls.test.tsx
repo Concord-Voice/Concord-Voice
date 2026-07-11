@@ -934,34 +934,20 @@ describe('VoiceControls', () => {
     });
   });
 
-  // ── Tile / Front 'n Center view toggle ────────────────────────────────────
+  // ── Tile / Front 'n Center view switch moved off the bar ──────────────────
+  // The switch now lives as a floating overlay in the voice area
+  // (VoiceViewSwitch, covered by its own suite). Guard that it does NOT return
+  // to the controls bar even while a stream is tuned in.
 
-  describe('voice view mode toggle', () => {
-    it('is hidden when no streams are tuned in', () => {
-      setVoiceState({ tunedInScreenShares: {} });
-      render(<VoiceControls />);
-      expect(screen.queryByText('Tile View')).not.toBeInTheDocument();
-      expect(screen.queryByText("Front 'n Center")).not.toBeInTheDocument();
-    });
-
-    it("offers Tile View while in front 'n center and toggles the store on click", () => {
+  describe('voice view mode switch is not on the bar', () => {
+    it('renders no view-mode switch on the bar even when a stream is tuned in', () => {
       setVoiceState({
         tunedInScreenShares: { 'prod-1': 'cons-1' },
         voiceViewMode: 'front-center',
       });
       render(<VoiceControls />);
-      fireEvent.click(screen.getByText('Tile View'));
-      expect(useVoiceStore.getState().voiceViewMode).toBe('tile');
-    });
-
-    it("offers Front 'n Center while in tile view and toggles back", () => {
-      setVoiceState({
-        tunedInScreenShares: { 'prod-1': 'cons-1' },
-        voiceViewMode: 'tile',
-      });
-      render(<VoiceControls />);
-      fireEvent.click(screen.getByText("Front 'n Center"));
-      expect(useVoiceStore.getState().voiceViewMode).toBe('front-center');
+      expect(screen.queryByRole('button', { name: 'Tile view' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: "Front 'n Center" })).not.toBeInTheDocument();
     });
   });
 });

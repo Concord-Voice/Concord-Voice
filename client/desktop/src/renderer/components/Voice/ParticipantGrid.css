@@ -60,6 +60,19 @@
   transform-origin: center;
 }
 
+/* Avatar-only frames keep a fixed ceiling even in a mixed grid. useGridLayout
+   caps the all-avatar grid via its maxTileWidth, but a mixed grid (any video or
+   screen share present) computes ONE uniform 16:9 tile size for every tile,
+   which would stretch a 1:1 avatar frame into a large empty square around its
+   fixed avatar. Cap height (the driving axis — width is auto off the 1:1
+   aspect) and width to --avatar-frame-cap, emitted by ParticipantGrid.tsx from
+   AVATAR_FRAME_CAP_PX so JS and CSS share one ceiling. No-op in the all-avatar
+   grid, where the JS cap already keeps --tile-h at or below this value. */
+.user-frame-grid .participant-tile:not(.participant-tile--video) {
+  max-height: var(--avatar-frame-cap, 320px);
+  max-width: var(--avatar-frame-cap, 320px);
+}
+
 /* ─── Screen-share tile (Tile view) ─────────────────────────── */
 
 .stream-grid-tile {

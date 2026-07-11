@@ -680,6 +680,9 @@ describe('UserFrameGrid', () => {
     // Verify useGridLayout was called with aspectRatio: 1 (square)
     const lastCall = mockUseGridLayout.mock.calls[mockUseGridLayout.mock.calls.length - 1];
     expect(lastCall[2]).toEqual(expect.objectContaining({ aspectRatio: 1 }));
+    // Avatar-only frames keep the 320px cap (a bigger frame is empty space around
+    // the fixed 56px avatar circle).
+    expect(lastCall[2].maxTileWidth).toBe(320);
 
     // Verify CSS variables reflect square tiles
     const grid = container.querySelector('.user-frame-grid') as HTMLElement;
@@ -716,6 +719,8 @@ describe('UserFrameGrid', () => {
     // Verify useGridLayout was called with aspectRatio: 16/9
     const lastCall = mockUseGridLayout.mock.calls[mockUseGridLayout.mock.calls.length - 1];
     expect(lastCall[2]).toEqual(expect.objectContaining({ aspectRatio: 16 / 9 }));
+    // Video/screen tiles are uncapped so they expand to fill the voice area.
+    expect(lastCall[2].maxTileWidth).toBeUndefined();
   });
 
   // ── Tile view: stream tiles + per-frame tune pills ──

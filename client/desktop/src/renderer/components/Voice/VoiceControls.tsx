@@ -20,8 +20,6 @@ import {
   PinOff,
   ExternalLink,
   Tv,
-  LayoutGrid,
-  Focus,
 } from 'lucide-react';
 import {
   useVoiceStore,
@@ -235,8 +233,6 @@ const MediaButton: React.FC<MediaButtonProps> = ({
 const StreamControls: React.FC<{ context: 'voiceView' | 'persistent' }> = ({ context }) => {
   const activeScreenShares = useVoiceStore((s) => s.activeScreenShares);
   const tunedInScreenShares = useVoiceStore((s) => s.tunedInScreenShares);
-  const voiceViewMode = useVoiceStore((s) => s.voiceViewMode);
-  const toggleVoiceViewMode = useVoiceStore((s) => s.toggleVoiceViewMode);
 
   const remoteShares = Object.values(activeScreenShares).filter((s) => !s.isLocal);
   const remoteUntuned = remoteShares.filter((s) => !(s.producerId in tunedInScreenShares));
@@ -288,24 +284,8 @@ const StreamControls: React.FC<{ context: 'voiceView' | 'persistent' }> = ({ con
           locked={tuneEverywhereLocked}
         />
       )}
-
-      {/* Tile ↔ Front 'n Center layout switch — only while a stream is
-          tuned in (Front 'n Center is stream-only) */}
-      {tunedInCount > 0 && (
-        <MediaButton
-          isActive={voiceViewMode === 'front-center'}
-          onClick={toggleVoiceViewMode}
-          title={
-            voiceViewMode === 'front-center'
-              ? 'Switch to tile view'
-              : "Switch to front 'n center view"
-          }
-          activeIcon={<LayoutGrid size={18} />}
-          inactiveIcon={<Focus size={18} />}
-          activeLabel="Tile View"
-          inactiveLabel="Front 'n Center"
-        />
-      )}
+      {/* The Tile ↔ Front 'n Center switch now lives as a floating overlay in
+          the voice area (VoiceViewSwitch), not on this bar. */}
     </>
   );
 };

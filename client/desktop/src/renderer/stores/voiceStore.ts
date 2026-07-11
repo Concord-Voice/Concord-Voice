@@ -636,6 +636,37 @@ const initialState = {
   activeScreenCodec: null as string | null,
 };
 
+// Entering Front 'n Center promises a dominant-stream stage with ←/→ cycling.
+// A persisted 'equal' stageLayout (or a null/dangling dominant from tuning in
+// via pills without ever focusing a stream) would otherwise render an equal
+// grid with no dominant or cycling, contradicting the control. This repair
+// forces focus + a valid dominant on entry, mirroring the stream-tile click
+// path in ParticipantGrid (handleFocusStream). It must run on every path that
+// switches the view mode — the VoiceViewSwitch buttons call setVoiceViewMode
+// directly, not toggleVoiceViewMode, so the invariant cannot live only in the
+// toggle.
+//
+// The repair fires only on an actual transition INTO front-center. Once the
+// user is already in front-center, they can deliberately pick the 'equal'
+// stage sublayout via the VoiceStage layout toggle; re-confirming the active
+// mode (e.g. clicking the already-active Front 'n Center segment) must be
+// idempotent and must NOT clobber that choice back to 'focus'.
+function enterViewModePatch(state: VoiceState, mode: VoiceViewMode): Partial<VoiceState> {
+  if (mode !== 'front-center' || state.voiceViewMode === 'front-center') {
+    return { voiceViewMode: mode };
+  }
+  const dominantValid =
+    state.dominantScreenShareId != null &&
+    state.dominantScreenShareId in state.tunedInScreenShares;
+  return {
+    voiceViewMode: mode,
+    stageLayout: 'focus',
+    dominantScreenShareId: dominantValid
+      ? state.dominantScreenShareId
+      : (Object.keys(state.tunedInScreenShares)[0] ?? null),
+  };
+}
+
 export const useVoiceStore = createStore<VoiceState>()((set) => ({
   ...initialState,
 
@@ -957,28 +988,11 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
   setStageLayout: (stageLayout) => set({ stageLayout }),
   toggleStageLayout: () =>
     set((state) => ({ stageLayout: state.stageLayout === 'equal' ? 'focus' : 'equal' })),
-  setVoiceViewMode: (voiceViewMode) => set({ voiceViewMode }),
+  setVoiceViewMode: (mode) => set((state) => enterViewModePatch(state, mode)),
   toggleVoiceViewMode: () =>
-    set((state) => {
-      const next = state.voiceViewMode === 'tile' ? 'front-center' : 'tile';
-      if (next !== 'front-center') return { voiceViewMode: next };
-      // Entering Front 'n Center: the view promises a dominant-stream stage with
-      // ←/→ cycling. A persisted 'equal' stageLayout (or a null/dangling
-      // dominant from tuning in via pills without ever focusing a stream) would
-      // otherwise render an equal grid with no dominant or cycling, contradicting
-      // the control. Force focus + a valid dominant, mirroring the stream-tile
-      // click path in ParticipantGrid (handleFocusStream).
-      const dominantValid =
-        state.dominantScreenShareId != null &&
-        state.dominantScreenShareId in state.tunedInScreenShares;
-      return {
-        voiceViewMode: next,
-        stageLayout: 'focus',
-        dominantScreenShareId: dominantValid
-          ? state.dominantScreenShareId
-          : (Object.keys(state.tunedInScreenShares)[0] ?? null),
-      };
-    }),
+    set((state) =>
+      enterViewModePatch(state, state.voiceViewMode === 'tile' ? 'front-center' : 'tile')
+    ),
 
   // PiP
   addPipWindow: (id) =>
