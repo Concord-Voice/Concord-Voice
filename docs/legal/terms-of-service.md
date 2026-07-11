@@ -4,10 +4,10 @@
 
 > **Source-of-truth note.** This document is the canonical Terms of Service
 > for Concord Voice, maintained in the project repository for review and
-> version control. The published Termly.io version at
+> version control. The published web version at
 > [www.concordvoice.com/terms](https://www.concordvoice.com/terms) should
 > mirror this document. If the two diverge, this document represents the
-> intended terms and the Termly version should be updated to match.
+> intended terms and the published web version should be updated to match.
 
 ---
 
@@ -758,9 +758,7 @@ right to:
   withdrawal.
 
 **15.4** To exercise any of these rights, contact us at
-[privacy@concordvoice.com](mailto:privacy@concordvoice.com), or use our
-self-serve data-subject-request portal at
-[https://app.termly.io/dsar/ca286c6c-69cc-471c-8d5b-0e52ce73b3ce](https://app.termly.io/dsar/ca286c6c-69cc-471c-8d5b-0e52ce73b3ce).
+[privacy@concordvoice.com](mailto:privacy@concordvoice.com).
 We will respond within 30 days. If we require additional time, we will
 notify you of the reason and extension period as permitted by law.
 
@@ -792,9 +790,7 @@ Consumer Privacy Act, as amended by the California Privacy Rights Act
 - limit the use of your sensitive personal information.
 
 To exercise any of these rights, contact us at
-[privacy@concordvoice.com](mailto:privacy@concordvoice.com) or use our
-self-serve data-subject-request portal at
-[https://app.termly.io/dsar/ca286c6c-69cc-471c-8d5b-0e52ce73b3ce](https://app.termly.io/dsar/ca286c6c-69cc-471c-8d5b-0e52ce73b3ce).
+[privacy@concordvoice.com](mailto:privacy@concordvoice.com).
 We will respond as required under applicable law.
 
 If any complaint with us is not satisfactorily resolved, you can contact

@@ -4,10 +4,10 @@
 
 > **Source-of-truth note.** This document is the canonical Privacy Policy
 > for Concord Voice, maintained in the project repository for review and
-> version control. The published Termly.io version at
+> version control. The published web version at
 > [www.concordvoice.com/privacy-policy](https://www.concordvoice.com/privacy-policy)
 > should mirror this document. If the two diverge, this document represents
-> the intended terms and the Termly version should be updated to match.
+> the intended terms and the published web version should be updated to match.
 
 ---
 
@@ -104,9 +104,11 @@ geographically, the applicable privacy law may mean you have certain
 rights regarding your personal information. See
 [Section 12](#12-what-are-your-privacy-rights).
 
-**How do you exercise your rights?** The easiest way is by submitting a
-[data subject access request](https://app.termly.io/dsar/6c18ae61-d3db-46b7-957f-73e31995238e),
-or by contacting us. We will consider and act upon any request in
+**How do you exercise your rights?** Email our general privacy team at
+[privacy+policy@concordvoice.com](mailto:privacy+policy@concordvoice.com)
+or our Data Protection Officer at
+[privacy+dpo@concordvoice.com](mailto:privacy+dpo@concordvoice.com).
+We will consider and act upon any request in
 accordance with applicable data protection laws.
 
 ---
@@ -909,7 +911,6 @@ right to object to the processing of your personal information.
 
 You can make such a request by:
 
-- **Submitting a [data subject access request](https://app.termly.io/dsar/6c18ae61-d3db-46b7-957f-73e31995238e)** via our self-serve portal, or
 - **Contacting our Data Protection Officer** at [privacy+dpo@concordvoice.com](mailto:privacy+dpo@concordvoice.com), or
 - **Contacting our general privacy team** at [privacy+policy@concordvoice.com](mailto:privacy+policy@concordvoice.com).
 
@@ -1161,7 +1162,6 @@ following rights:
 
 To exercise these rights, you can contact us by:
 
-- **Submitting a [data subject access request](https://app.termly.io/dsar/6c18ae61-d3db-46b7-957f-73e31995238e)**, or
 - **Emailing us** at [privacy+us@concordvoice.com](mailto:privacy+us@concordvoice.com), or
 - Referring to the contact details in [Section 20](#20-how-can-you-contact-us-about-this-notice).
 
@@ -1370,8 +1370,5 @@ information or withdraw your consent to our processing of your personal
 information. These rights may be limited in some circumstances by
 applicable law.
 
-To request to review, update, or delete your personal information,
-please:
-
-- Fill out and submit a [data subject access request](https://app.termly.io/dsar/6c18ae61-d3db-46b7-957f-73e31995238e), or
-- Email us at [privacy+policy@concordvoice.com](mailto:privacy+policy@concordvoice.com).
+To request to review, update, or delete your personal information, email
+us at [privacy+policy@concordvoice.com](mailto:privacy+policy@concordvoice.com).

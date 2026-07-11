@@ -1,8 +1,8 @@
 # MCP Server Security Policy
 
 **Effective Date:** 2026-04-03
-**Version:** 1.0
-**Review Cadence:** Quarterly (next review: 2026-07-03)
+**Version:** 1.1
+**Review Cadence:** Quarterly (last reviewed: 2026-07-11; next review: 2026-10-11)
 
 ---
 
@@ -27,7 +27,7 @@ This policy defines the approved MCP server allowlist, the vetting process for a
 | GitHub | Model Context Protocol | Approved | Repos, issues, PRs, code search, workflows, file contents | Yes -- api.github.com | GitHub Personal Access Token (PAT) | High | Broad repo access. Use fine-grained PATs with minimum scope (repo read, issues, PRs). Classic PATs auto-hide unauthorized tools. Open source, MIT. Package: `@modelcontextprotocol/server-github`. Repo: [modelcontextprotocol/servers](https://github.com/modelcontextprotocol/servers). Approved 2026-04-04. |
 | ~~PostgreSQL MCP~~ | — | **Removed** | — | — | — | — | Removed from inventory 2026-05-02 (#778, late-cycle scope addition). Was unused in practice — never loaded successfully in any verification matrix run, and `psql` CLI covers the dev-DB introspection use case. Re-vet via §4 if a future need arises. |
 | Stripe | Stripe, Inc. | Approved | Customers, products, payments, invoices, subscriptions | Yes -- api.stripe.com | Stripe API key (secret or restricted) | High | Financial and payment data. **Use restricted API keys (rk_*) with minimum permissions only.** Must never use production keys — test mode only. Open source, MIT. Repo: [stripe/agent-toolkit](https://github.com/stripe/agent-toolkit). Approved 2026-04-04. |
-| Terraform | HashiCorp | Approved | Terraform Registry, HCP Terraform workspaces, state, variables | Yes -- registry.terraform.io, HCP Terraform API | HCP Terraform API token (TFE_TOKEN, optional) | High | Infrastructure state and workspace management. **Must never hold production infrastructure tokens.** Registry lookups work without auth. Open source, MPL-2.0. Repo: [hashicorp/terraform-mcp-server](https://github.com/hashicorp/terraform-mcp-server). Approved 2026-04-04. |
+| ~~Terraform MCP~~ | — | **Removed** | — | — | — | — | Removed from inventory 2026-07-11 after Terraform and HCP Terraform were retired. The repository has no active Terraform manifests or HCP-backed deployment workflow. Re-vet via §4 if an infrastructure-as-code need returns. |
 | ~~Sentry MCP~~ | — | **Removed** | — | — | — | — | Removed from inventory 2026-04-28 (#778, coordinating with #760's Sentry strip sweep). The Sentry product integration is being unwound entirely; see project memory `Sentry — being removed`. The original 2026-04-09 approval and Sentry MCP package metadata are preserved in the prior commit history if archaeology is needed. |
 | ~~SonarQube (2nd instance)~~ | — | **Removed** | — | — | — | — | Confirmed as duplicate config entry of the approved SonarSource SonarQube MCP. Removed from inventory 2026-04-04. |
 
@@ -50,7 +50,6 @@ These files use only vetted server implementations from §2. Do not substitute a
 | SonarQube | `docker.io/mcp/sonarqube` (canonical SonarSource Docker image) | `latest` | `SONARQUBE_TOKEN` env var only (see §8 for inheritance). `SONARQUBE_ORG` (`concord-voice`) and `SONARQUBE_URL` (`https://sonarcloud.io`) are hardcoded in `.mcp.json` since they are non-secret public values; this also avoids `${VAR}` literal-passthrough when launchd env is unset |
 | Context7 | `@upstash/context7-mcp` (Upstash) | 2.1.6 | None (optional API key for rate limits) |
 | Playwright | `@playwright/mcp` (Microsoft) | 0.0.70 | None |
-| Terraform | `terraform-mcp-server` (HashiCorp) | 0.13.0 | `TFE_TOKEN` (optional — registry lookups work without auth) |
 | GitHub | `@modelcontextprotocol/server-github` | 2025.4.8 | `GITHUB_PERSONAL_ACCESS_TOKEN` — use fine-grained PAT with minimum scope (note: in `.mcp.json` this env var is read from `${ADMIN_PAT}` in the shell/launchd env — set `ADMIN_PAT`, not `GITHUB_PERSONAL_ACCESS_TOKEN`, via `export` for CLI or `launchctl setenv ADMIN_PAT ...` for App + extension) |
 | Stripe | `@stripe/mcp` (Stripe) | 0.3.3 | `STRIPE_SECRET_KEY` — **restricted test-mode keys only (`rk_test_*`)** |
 
@@ -61,7 +60,6 @@ These files use only vetted server implementations from §2. Do not substitute a
 | SonarQube | `docker.io/mcp/sonarqube` (Docker image) | `latest` | `${input:SONARQUBE_TOKEN}` / `${input:SONARQUBE_ORG}` / `${input:SONARQUBE_URL}` |
 | Context7 | `@upstash/context7-mcp` | 2.1.6 | `${input:CONTEXT7_API_KEY}` (optional) |
 | Playwright | `@playwright/mcp` | 0.0.70 | None |
-| Terraform | `terraform-mcp-server` | 0.13.0 | None for registry lookups (TFE token would be `${input}` prompt if added) |
 | GitHub | `@modelcontextprotocol/server-github` | 2025.4.8 | `${input:GITHUB_TOKEN}` — fine-grained PAT (note: prompt ID is short-form `GITHUB_TOKEN` for UX clarity; the underlying env var passed to the npm package is `GITHUB_PERSONAL_ACCESS_TOKEN`) |
 | **Stripe** | **HTTP `https://mcp.stripe.com`** (Stripe-operated hosted endpoint) | (server-managed, no client pin) | None client-side (auth handled by Stripe's hosted gateway) |
 
@@ -74,7 +72,6 @@ These files use only vetted server implementations from §2. Do not substitute a
 | SonarQube | `docker.io/mcp/sonarqube` (canonical SonarSource Docker image) | `latest` | `SONARQUBE_TOKEN` env var only. `SONARQUBE_ORG` (`concord-voice`) and `SONARQUBE_URL` (`https://sonarcloud.io`) are hardcoded since they are non-secret public values |
 | Context7 | `@upstash/context7-mcp` (Upstash) | 2.1.6 | None |
 | Playwright | `@playwright/mcp` (Microsoft) | 0.0.70 | None |
-| Terraform | `terraform-mcp-server` (HashiCorp) | 0.13.0 | None by default; registry lookups work without auth |
 | GitHub | `@modelcontextprotocol/server-github` | 2025.4.8 | `GITHUB_PERSONAL_ACCESS_TOKEN` — use a fine-grained PAT with minimum scope |
 | Stripe | `@stripe/mcp` (Stripe) | 0.3.3 | `STRIPE_SECRET_KEY` — **restricted test-mode keys only (`rk_test_*`)** |
 
