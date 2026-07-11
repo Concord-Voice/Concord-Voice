@@ -143,6 +143,74 @@ func TestBroadcastToServerAndPruneQueuesOrderedMessage(t *testing.T) {
 	}
 }
 
+// TestBroadcastToServerAndPruneBailsOnShutdown verifies the eviction send does not hang
+// forever once the hub is shutting down. After Run exits it no longer drains
+// evictBroadcast (buffered 16), so an unconditional send on a full buffer would leak the
+// calling HTTP handler goroutine. The send must bail on h.done instead. This is
+// regression coverage for the shutdown guard the removed RevokeServerSubscription used
+// to provide, now living on the surviving removal-path mechanism. CV-CAN-027/028.
+func TestBroadcastToServerAndPruneBailsOnShutdown(t *testing.T) {
+	hub := NewHub(nil, nil)
+
+	// Saturate the eviction buffer so the next send cannot enqueue.
+	for i := 0; i < cap(hub.evictBroadcast); i++ {
+		hub.evictBroadcast <- ServerBroadcastMessage{ServerID: uuid.New()}
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		hub.BroadcastToServerAndPrune(uuid.New(), OutgoingMessage{Type: "member_removed"}, uuid.New())
+		close(returned)
+	}()
+
+	// Buffer is full and nothing is draining, so the call must still be blocked.
+	select {
+	case <-returned:
+		t.Fatal("expected BroadcastToServerAndPrune to block on a full buffer")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Simulate hub shutdown: Run has exited and will never drain evictBroadcast again.
+	close(hub.done)
+
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("BroadcastToServerAndPrune did not bail out on shutdown")
+	}
+}
+
+// TestBroadcastToServerAndPruneEnqueuesWhenDoneClosedButBufferHasRoom verifies that a
+// prune is still queued (not dropped) when h.done is already closed but the eviction
+// buffer has capacity. Graceful shutdown closes h.done (via hub.Shutdown()) before
+// in-flight remove/ban handlers drain (srv.Shutdown()), so a handler can call this with
+// h.done closed while the Run loop is still alive and draining evictBroadcast at
+// priority. A single select over the send and <-h.done would let Go pick the done arm
+// at random and drop the prune, leaking one more fanout to the removed member. The
+// non-blocking send must win whenever the buffer has room. CV-CAN-027/028.
+func TestBroadcastToServerAndPruneEnqueuesWhenDoneClosedButBufferHasRoom(t *testing.T) {
+	hub := NewHub(nil, nil)
+	serverID := uuid.New()
+	userID := uuid.New()
+
+	// Hub is shutting down, but the buffer is empty (has room).
+	close(hub.done)
+
+	hub.BroadcastToServerAndPrune(serverID, OutgoingMessage{Type: "member_removed"}, userID)
+
+	// The prune must have been enqueued rather than dropped in favor of the done bail.
+	select {
+	case msg := <-hub.evictBroadcast:
+		assert.Equal(t, serverID, msg.ServerID)
+		assert.Equal(t, "member_removed", msg.Data.Type)
+		if assert.NotNil(t, msg.PruneUserAfter, "prune must ride on the member_removed broadcast") {
+			assert.Equal(t, userID, *msg.PruneUserAfter)
+		}
+	default:
+		t.Fatal("expected the prune to be enqueued while the buffer had room, even during shutdown")
+	}
+}
+
 // handleServerBroadcast must deliver the message to the pruned user BEFORE evicting
 // them (so they receive their own member_removed) and evict them afterward (so they
 // miss any later server broadcast queued on the same channel, e.g. key_revocation).

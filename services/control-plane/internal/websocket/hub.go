@@ -2447,16 +2447,44 @@ func (h *Hub) BroadcastToServer(serverID uuid.UUID, msg OutgoingMessage) {
 // before server broadcasts that originate on OTHER code paths (e.g. server_updated
 // via handleServerUpdate, or unread_notify), not just those queued behind it on
 // serverBroadcast. This closes the window where such a fanout could leak to a member
-// who has already been removed. The send is blocking, so the eviction cannot be silently
-// dropped; the caller is an HTTP handler (not the Run goroutine), so this cannot
-// self-deadlock. This is the ordered, guaranteed-delivery mechanism for evicting
-// removed/banned members. CV-CAN-027/028.
+// who has already been removed. The enqueue is attempted non-blockingly first so that
+// whenever the buffer has room the prune is always queued (never silently dropped), and
+// the caller is an HTTP handler (not the Run goroutine), so it cannot self-deadlock.
+// Only when the buffer (16) is full does it fall back to a blocking select that bails on
+// h.done: once the hub has finished shutting down the Run loop no longer drains
+// evictBroadcast, so without that guard a full buffer would hang the handler goroutine
+// forever; on shutdown every client connection is closed anyway, so no fanout can leak.
+// Trying the non-blocking send first also avoids Go's random select choice dropping a
+// queueable prune in favor of the done bail during graceful shutdown, when h.done is
+// closed before in-flight handlers drain. This is the ordered, guaranteed-delivery
+// mechanism for evicting removed/banned members. CV-CAN-027/028.
 func (h *Hub) BroadcastToServerAndPrune(serverID uuid.UUID, msg OutgoingMessage, pruneUserID uuid.UUID) {
 	uid := pruneUserID
-	h.evictBroadcast <- ServerBroadcastMessage{
+	sbm := ServerBroadcastMessage{
 		ServerID:       serverID,
 		Data:           msg,
 		PruneUserAfter: &uid,
+	}
+	// Prefer a non-blocking enqueue. Shutdown ordering (main.go closes h.done via
+	// hub.Shutdown() before srv.Shutdown() drains in-flight handlers) means a
+	// remove/ban handler can reach here with h.done already closed while the Run
+	// loop is still alive. A single select over both arms would let Go pick <-h.done
+	// even when the buffer has room, dropping the prune; the Run loop's priority
+	// drain empties evictBroadcast before it can take its own done case, so any prune
+	// we manage to enqueue in that window is still applied ahead of shutdown. Only
+	// fall back to the done bail when the buffer is genuinely full.
+	select {
+	case h.evictBroadcast <- sbm:
+		return
+	default:
+	}
+	select {
+	case h.evictBroadcast <- sbm:
+	case <-h.done:
+		// Buffer is full and the hub is shutting down: the Run loop has stopped
+		// draining evictBroadcast, so this send would hang forever. Every client
+		// connection is closed on shutdown anyway, so no fanout can leak; bail
+		// rather than hang the caller.
 	}
 }
 
