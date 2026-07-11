@@ -7,22 +7,42 @@ import { compactSpaHash } from '../../utils/clientVersion';
 import './AboutUpdateSection.css';
 
 type UpdateStatus =
-  | 'idle'
-  | 'checking'
-  | 'up-to-date'
-  | 'available'
-  | 'downloading'
-  | 'downloaded'
-  | 'error';
+  'idle' | 'checking' | 'up-to-date' | 'available' | 'downloading' | 'downloaded' | 'error';
 
 // SPA (UI) update axis — distinct from the electron-updater desktop-binary axis.
 type SpaCheckStatus =
-  | 'idle'
-  | 'checking'
-  | 'on-latest'
-  | 'newer-available'
-  | 'on-bundled'
-  | 'error';
+  'idle' | 'checking' | 'on-latest' | 'newer-available' | 'on-bundled' | 'error';
+
+export type SpaSignal = {
+  variant: 'up-to-date' | 'available' | 'error';
+  text: string;
+  showLoad: boolean;
+};
+
+// Pure derivation of the Interface (SPA/UI) status row. Extracted from the
+// component so AboutUpdateSection stays under the S3776 cognitive-complexity
+// ceiling (it already carries many render conditionals). Clean at rest: only a
+// genuinely-available UI update surfaces without a check; the up-to-date
+// confirmation and the neutral/offline/error states appear only after the user
+// checks. 'checking' returns null (the button conveys progress).
+export function resolveSpaSignal(spaStatus: SpaCheckStatus, spaChecked: boolean): SpaSignal | null {
+  if (spaStatus === 'newer-available') {
+    return { variant: 'available', text: 'Interface update available', showLoad: true };
+  }
+  if (spaChecked && spaStatus === 'on-latest') {
+    return { variant: 'up-to-date', text: 'Interface is up to date', showLoad: false };
+  }
+  if (spaChecked && spaStatus === 'on-bundled') {
+    return { variant: 'available', text: 'Offline fallback UI', showLoad: true };
+  }
+  if (spaChecked && spaStatus === 'error') {
+    return { variant: 'error', text: "Couldn't check the interface", showLoad: true };
+  }
+  if (spaChecked && spaStatus === 'idle') {
+    return { variant: 'available', text: 'Reload to refresh', showLoad: true };
+  }
+  return null;
+}
 
 interface DownloadProgress {
   percent: number;
@@ -71,6 +91,41 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+// Status-row icons, shared by the Interface and Client signals so the two lines
+// read as one system (the user's "two clean signals" ask).
+const CheckCircleIcon: React.FC = () => (
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="1.5" />
+    <path
+      d="M5 8l2 2 4-4"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
+
+const DownloadIcon: React.FC = () => (
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <path
+      d="M8 2v8M5 7l3 3 3-3"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <path d="M3 12h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+  </svg>
+);
+
+const AlertIcon: React.FC = () => (
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="1.5" />
+    <path d="M8 5v3M8 10.5v.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+  </svg>
+);
+
 const AboutUpdateSection: React.FC = () => {
   // Client info state
   const [appVersion, setAppVersion] = useState('');
@@ -87,6 +142,10 @@ const AboutUpdateSection: React.FC = () => {
   // SPA (UI) update axis state — bundled-vs-remote + a manual "Load latest UI".
   const [spaStatus, setSpaStatus] = useState<SpaCheckStatus>('idle');
   const [spaReloading, setSpaReloading] = useState(false);
+  // Has the user run an explicit check this session? Gates the "up to date"
+  // confirmation so the section stays clean at rest (a mount-time refresh
+  // populates the Client Info chip without showing a status row).
+  const [spaChecked, setSpaChecked] = useState(false);
 
   // Developer Mode (TEMPORARY — remove before BETA)
   const [developerMode, setDeveloperMode] = useState(false);
@@ -174,6 +233,7 @@ const AboutUpdateSection: React.FC = () => {
 
   const handleCheckForUpdates = useCallback(async () => {
     setUpdateStatus('checking');
+    setSpaChecked(true);
     setErrorMessage('');
     let desktopCheckFailed = false;
     const desktopCheck = (async () => {
@@ -248,6 +308,9 @@ const AboutUpdateSection: React.FC = () => {
     spaStatus === 'newer-available'
       ? { label: 'Update', ariaLabel: 'Interface update available' }
       : null;
+
+  // Interface (SPA/UI) signal — parallels the client signal below (see resolveSpaSignal).
+  const spaSignal = resolveSpaSignal(spaStatus, spaChecked);
 
   return (
     <>
@@ -409,69 +472,45 @@ const AboutUpdateSection: React.FC = () => {
           )}
         </div>
 
-        <div className="about-update-status about-update-status--interface">
-          <div className="about-update-status-row">
-            <span className="about-update-status-label">Interface</span>
-            <span className="about-update-status-text">
-              {spaStatus === 'checking' && 'Checking...'}
-              {spaStatus === 'on-latest' && '✓ Up to date'}
-              {spaStatus === 'newer-available' && 'Newer UI available'}
-              {spaStatus === 'on-bundled' && 'Offline fallback UI'}
-              {spaStatus === 'error' && "Couldn't check"}
-              {spaStatus === 'idle' && 'Reload to refresh'}
-            </span>
-            {(spaStatus === 'on-bundled' ||
-              spaStatus === 'newer-available' ||
-              spaStatus === 'error' ||
-              spaStatus === 'idle') && (
-              <button
-                className="about-update-action-btn"
-                disabled={spaReloading}
-                onClick={handleLoadLatestUi}
-                title="Reloads the interface to the latest version. Brief reconnect — you won't be logged out."
+        {/* Interface (SPA/UI) status */}
+        {spaSignal && (
+          <div className={`about-update-status about-update-status--${spaSignal.variant}`}>
+            <div className="about-update-status-row">
+              {spaSignal.variant === 'up-to-date' && <CheckCircleIcon />}
+              {spaSignal.variant === 'available' && <DownloadIcon />}
+              {spaSignal.variant === 'error' && <AlertIcon />}
+              <span
+                className={spaSignal.variant === 'error' ? 'about-update-error-text' : undefined}
               >
-                {spaReloading ? 'Loading...' : 'Load latest UI'}
-              </button>
-            )}
+                {spaSignal.text}
+              </span>
+              {spaSignal.showLoad && (
+                <button
+                  className="about-update-action-btn"
+                  disabled={spaReloading}
+                  onClick={handleLoadLatestUi}
+                  title="Reloads the interface to the latest version. Brief reconnect — you won't be logged out."
+                >
+                  {spaReloading ? 'Loading...' : 'Load latest UI'}
+                </button>
+              )}
+            </div>
           </div>
-        </div>
+        )}
 
-        {/* Update status */}
+        {/* Client (desktop app) status */}
         {updateStatus !== 'idle' && updateStatus !== 'checking' && (
           <div className={`about-update-status about-update-status--${updateStatus}`}>
             {updateStatus === 'up-to-date' && (
               <div className="about-update-status-row">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                  <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="1.5" />
-                  <path
-                    d="M5 8l2 2 4-4"
-                    stroke="currentColor"
-                    strokeWidth="1.5"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-                <span>You&apos;re up to date (v{appVersion})</span>
+                <CheckCircleIcon />
+                <span>Client is up to date (v{appVersion})</span>
               </div>
             )}
 
             {updateStatus === 'available' && (
               <div className="about-update-status-row">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                  <path
-                    d="M8 2v8M5 7l3 3 3-3"
-                    stroke="currentColor"
-                    strokeWidth="1.5"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                  <path
-                    d="M3 12h10"
-                    stroke="currentColor"
-                    strokeWidth="1.5"
-                    strokeLinecap="round"
-                  />
-                </svg>
+                <DownloadIcon />
                 <span>Update available: v{updateVersion}</span>
                 <button className="about-update-action-btn" onClick={handleDownload}>
                   Download
@@ -507,7 +546,7 @@ const AboutUpdateSection: React.FC = () => {
 
             {updateStatus === 'downloaded' && (
               <div className="about-update-status-row">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                   <path
                     d="M1 8a7 7 0 1114 0A7 7 0 011 8z"
                     stroke="currentColor"
@@ -533,15 +572,7 @@ const AboutUpdateSection: React.FC = () => {
 
             {updateStatus === 'error' && (
               <div className="about-update-status-row">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                  <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="1.5" />
-                  <path
-                    d="M8 5v3M8 10.5v.5"
-                    stroke="currentColor"
-                    strokeWidth="1.5"
-                    strokeLinecap="round"
-                  />
-                </svg>
+                <AlertIcon />
                 <span className="about-update-error-text">
                   Update error: {errorMessage || 'Unknown error'}
                 </span>

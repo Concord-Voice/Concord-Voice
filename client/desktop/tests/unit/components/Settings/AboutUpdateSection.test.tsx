@@ -77,7 +77,46 @@ beforeEach(() => {
   };
 });
 
-import AboutUpdateSection from '@/renderer/components/Settings/AboutUpdateSection';
+import AboutUpdateSection, {
+  resolveSpaSignal,
+} from '@/renderer/components/Settings/AboutUpdateSection';
+
+describe('resolveSpaSignal (pure Interface-signal derivation)', () => {
+  it('surfaces an available UI update at rest (no check needed)', () => {
+    expect(resolveSpaSignal('newer-available', false)).toEqual({
+      variant: 'available',
+      text: 'Interface update available',
+      showLoad: true,
+    });
+  });
+
+  it('stays clean at rest for every non-available state (returns null before a check)', () => {
+    for (const s of ['on-latest', 'on-bundled', 'error', 'idle', 'checking'] as const) {
+      expect(resolveSpaSignal(s, false)).toBeNull();
+    }
+  });
+
+  it('confirms up-to-date only after a check', () => {
+    expect(resolveSpaSignal('on-latest', true)).toEqual({
+      variant: 'up-to-date',
+      text: 'Interface is up to date',
+      showLoad: false,
+    });
+  });
+
+  it('maps offline/error/idle to actionable rows after a check', () => {
+    expect(resolveSpaSignal('on-bundled', true)).toMatchObject({
+      variant: 'available',
+      showLoad: true,
+    });
+    expect(resolveSpaSignal('error', true)).toMatchObject({ variant: 'error', showLoad: true });
+    expect(resolveSpaSignal('idle', true)).toMatchObject({ variant: 'available', showLoad: true });
+  });
+
+  it('never shows a row while a check is in flight', () => {
+    expect(resolveSpaSignal('checking', true)).toBeNull();
+  });
+});
 
 describe('AboutUpdateSection', () => {
   beforeEach(() => {
@@ -211,14 +250,33 @@ describe('AboutUpdateSection', () => {
     expect(screen.getByText('Check for Updates')).toBeInTheDocument();
   });
 
-  it('does not render the hidden Client Info interface update row', async () => {
+  it('stays clean at rest — no up-to-date status rows before an explicit check', async () => {
     render(<AboutUpdateSection />);
+    // Let the mount-time SPA refresh settle (it populates the Client Info chip,
+    // not a status row).
     await vi.waitFor(() => {
-      expect(screen.getByText('✓ Up to date')).toBeInTheDocument();
+      expect(screen.getByText('App Version')).toBeInTheDocument();
     });
+    expect(screen.queryByText('Interface is up to date')).toBeNull();
+    expect(screen.queryByText(/Client is up to date/)).toBeNull();
+    expect(screen.queryByRole('button', { name: /Load latest UI/ })).toBeNull();
     const clientInfo = screen.getByText('Client Info').closest('details') as HTMLElement;
     expect(within(clientInfo).queryByText('Interface')).toBeNull();
-    expect(screen.queryByRole('button', { name: /Load latest UI/ })).toBeNull();
+  });
+
+  it('shows two clean signals (Interface + Client) after an explicit check', async () => {
+    const user = userEvent.setup();
+    render(<AboutUpdateSection />);
+    await user.click(screen.getByText('Check for Updates'));
+    // Interface confirmation appears once the SPA check resolves.
+    await vi.waitFor(() => {
+      expect(screen.getByText('Interface is up to date')).toBeInTheDocument();
+    });
+    // Client confirmation arrives via the electron-updater not-available event.
+    eventCallbacks.updateNotAvailable();
+    await vi.waitFor(() => {
+      expect(screen.getByText(/Client is up to date/)).toBeInTheDocument();
+    });
   });
 
   it('shows pre-release enabled description when on', async () => {
@@ -437,22 +495,28 @@ describe('AboutUpdateSection', () => {
   });
 
   // ── SPA (UI) update axis ────────────────────────────────────────────────
-  it('shows "up to date" for a remote SPA with no newer bytes (default)', async () => {
+  it('shows "Interface is up to date" for a remote SPA with no newer bytes (after check)', async () => {
+    const user = userEvent.setup();
     render(<AboutUpdateSection />);
+    await user.click(screen.getByText('Check for Updates'));
     await vi.waitFor(() => {
-      expect(screen.getByText('✓ Up to date')).toBeInTheDocument();
+      expect(screen.getByText('Interface is up to date')).toBeInTheDocument();
     });
     expect(screen.queryByRole('button', { name: /Load latest UI/ })).toBeNull();
   });
 
-  it('shows the offline-fallback notice + a Load latest UI button when on bundled', async () => {
-    mockSpaCheckForUpdate.mockResolvedValueOnce({
+  it('shows the offline-fallback notice + a Load latest UI button when on bundled (after check)', async () => {
+    const bundled = {
       currentMode: 'bundled',
       remoteAvailable: true,
       newerBytesAvailable: null,
       reason: 'config fetch failed: timeout after 5000ms',
-    });
+    };
+    // Two resolutions: the mount refresh (hidden — no check yet) + the click.
+    mockSpaCheckForUpdate.mockResolvedValueOnce(bundled).mockResolvedValueOnce(bundled);
+    const user = userEvent.setup();
     render(<AboutUpdateSection />);
+    await user.click(screen.getByText('Check for Updates'));
     await vi.waitFor(() => {
       expect(screen.getByText('Offline fallback UI')).toBeInTheDocument();
     });
@@ -480,11 +544,12 @@ describe('AboutUpdateSection', () => {
   });
 
   it('clicking "Load latest UI" calls spaUpdate.reloadLatest', async () => {
+    // newer-available surfaces at rest, so the Load button is present without a check.
     mockSpaCheckForUpdate.mockResolvedValueOnce({
-      currentMode: 'bundled',
+      currentMode: 'remote',
       remoteAvailable: true,
-      newerBytesAvailable: null,
-      reason: 'config fetch failed: timeout after 5000ms',
+      newerBytesAvailable: true,
+      reason: 'remote SPA compatible',
     });
     render(<AboutUpdateSection />);
     const btn = await screen.findByRole('button', { name: /Load latest UI/ });
@@ -494,7 +559,7 @@ describe('AboutUpdateSection', () => {
     });
   });
 
-  it('shows "newer UI available" + button for a remote SPA with newer bytes', async () => {
+  it('surfaces an available UI update at rest (no check needed) + a Load button', async () => {
     mockSpaCheckForUpdate.mockResolvedValueOnce({
       currentMode: 'remote',
       remoteAvailable: true,
@@ -503,16 +568,21 @@ describe('AboutUpdateSection', () => {
     });
     render(<AboutUpdateSection />);
     await vi.waitFor(() => {
-      expect(screen.getByText('Newer UI available')).toBeInTheDocument();
+      expect(screen.getByText('Interface update available')).toBeInTheDocument();
     });
     expect(screen.getByRole('button', { name: /Load latest UI/ })).toBeInTheDocument();
   });
 
-  it('degrades to an actionable error state when the SPA check fails', async () => {
-    mockSpaCheckForUpdate.mockRejectedValueOnce(new Error('ipc failed'));
+  it('degrades to an actionable error state when the SPA check fails (after check)', async () => {
+    // Reject the mount refresh (hidden — no check yet) + the click's refresh.
+    mockSpaCheckForUpdate
+      .mockRejectedValueOnce(new Error('ipc failed'))
+      .mockRejectedValueOnce(new Error('ipc failed'));
+    const user = userEvent.setup();
     render(<AboutUpdateSection />);
+    await user.click(screen.getByText('Check for Updates'));
     await vi.waitFor(() => {
-      expect(screen.getByText("Couldn't check")).toBeInTheDocument();
+      expect(screen.getByText("Couldn't check the interface")).toBeInTheDocument();
     });
     expect(screen.getByRole('button', { name: /Load latest UI/ })).toBeInTheDocument();
   });

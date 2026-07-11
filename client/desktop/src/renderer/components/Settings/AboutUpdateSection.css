@@ -268,19 +268,6 @@
   color: var(--text-primary);
 }
 
-.about-update-status--interface {
-  margin-top: 0;
-}
-
-.about-update-status-label {
-  color: var(--text-secondary);
-  font-weight: 600;
-}
-
-.about-update-status-text {
-  min-width: 0;
-}
-
 .about-update-status-row svg {
   flex-shrink: 0;
 }
