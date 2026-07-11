@@ -176,15 +176,25 @@ export interface ChannelAccessResult {
    */
   roomOwnerTier?: string;
   /**
+   * Whether the control-plane join-authorize response carried a
+   * server-authoritative identity (CV-CAN-017): TRUE when the response included
+   * a string `username` field (even empty), FALSE for a pre-CV-CAN-017
+   * control-plane that omits it. This is the identity-awareness discriminator
+   * consumed by `resolveParticipantIdentity` — NOT the non-emptiness of
+   * `authUsername` — so an identity-aware control-plane that returns an empty
+   * username fails CLOSED to the authoritative (empty) identity instead of
+   * re-opening every field to the spoofable handshake values.
+   */
+  authIdentityPresent?: boolean;
+  /**
    * Server-authoritative display identity, resolved by the control-plane from
    * the authenticated user_id and returned on BOTH the channel and DM
    * join-authorize responses (CV-CAN-017). The join handler prefers these over
    * the client-supplied socket.handshake.auth values so a member cannot spoof
-   * its display identity to peers. `authUsername` present ⇒ the control-plane is
-   * identity-aware; `undefined` ⇒ a pre-CV-CAN-017 control-plane (handshake
-   * fallback). `authDisplayName`/`authAvatarUrl` are `undefined` when the user
-   * genuinely has none (empty string from the server) — NOT re-opened to the
-   * handshake value, which is keyed on `authUsername` presence instead.
+   * its display identity to peers. Each is `undefined` when the user genuinely
+   * has none (empty/absent from the server) — never re-opened to the handshake
+   * value. The handshake fallback is gated on `authIdentityPresent`, NOT on
+   * these individual fields being set.
    */
   authUsername?: string;
   authDisplayName?: string;
@@ -207,15 +217,25 @@ export interface ChannelAccessResult {
  * Parse server-authoritative display identity from a join-authorize response
  * (CV-CAN-017). Non-string / empty / absent values become `undefined` so an
  * empty display_name/avatar_url from the server reads as "genuinely none".
+ * `authIdentityPresent` reports whether the response carried a string
+ * `username` field at all (even empty) — the identity-awareness signal — so an
+ * identity-aware control-plane that returns an empty username still fails
+ * closed to the authoritative identity rather than the spoofable handshake.
  */
 function parseAuthoritativeIdentity(resp: {
   username?: unknown;
   display_name?: unknown;
   avatar_url?: unknown;
-}): { authUsername?: string; authDisplayName?: string; authAvatarUrl?: string } {
+}): {
+  authIdentityPresent: boolean;
+  authUsername?: string;
+  authDisplayName?: string;
+  authAvatarUrl?: string;
+} {
   const nonEmpty = (v: unknown): string | undefined =>
     typeof v === 'string' && v.length > 0 ? v : undefined;
   return {
+    authIdentityPresent: typeof resp.username === 'string',
     authUsername: nonEmpty(resp.username),
     authDisplayName: nonEmpty(resp.display_name),
     authAvatarUrl: nonEmpty(resp.avatar_url),
@@ -234,18 +254,23 @@ export interface ParticipantIdentity {
  * (CV-CAN-017). This is the load-bearing security decision: prefer the
  * server-authoritative identity from the join-authorize response, and fall back
  * to the client-supplied handshake identity ONLY when the control-plane did not
- * supply it (a pre-CV-CAN-017 control-plane, detected by an absent `authUsername`).
- * The discriminator is `authUsername` presence — NOT per-field — so a genuinely
- * empty server display_name/avatar (parsed to `undefined`) is never re-opened to
- * the spoofable handshake value.
+ * supply one (a pre-CV-CAN-017 control-plane, detected by `authIdentityPresent`
+ * being false). The discriminator is identity PRESENCE — NOT the non-emptiness
+ * of `authUsername` — so an identity-aware control-plane that returns an empty
+ * username fails closed to the authoritative (empty) identity, and a genuinely
+ * empty server display_name/avatar is never re-opened to the spoofable
+ * handshake value.
  */
 export function resolveParticipantIdentity(
-  access: Pick<ChannelAccessResult, 'authUsername' | 'authDisplayName' | 'authAvatarUrl'>,
+  access: Pick<
+    ChannelAccessResult,
+    'authIdentityPresent' | 'authUsername' | 'authDisplayName' | 'authAvatarUrl'
+  >,
   handshake: ParticipantIdentity
 ): ParticipantIdentity {
-  if (access.authUsername !== undefined) {
+  if (access.authIdentityPresent) {
     return {
-      username: access.authUsername,
+      username: access.authUsername ?? '',
       displayName: access.authDisplayName,
       avatarUrl: access.authAvatarUrl,
     };

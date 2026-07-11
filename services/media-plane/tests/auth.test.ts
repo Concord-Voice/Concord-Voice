@@ -400,6 +400,7 @@ describe('validateChannelAccess', () => {
 
     const result = await validateChannelAccess('u-1', 'ch-1', 'token');
 
+    expect(result.authIdentityPresent).toBe(true);
     expect(result.authUsername).toBe('realuser');
     expect(result.authDisplayName).toBe('Real User');
     expect(result.authAvatarUrl).toBe('/api/v1/media/avatars/real.png');
@@ -424,9 +425,36 @@ describe('validateChannelAccess', () => {
 
     // authUsername present ⇒ the control-plane IS identity-aware; the join
     // handler will therefore NOT fall back to the handshake display_name/avatar.
+    expect(result.authIdentityPresent).toBe(true);
     expect(result.authUsername).toBe('realuser');
     expect(result.authDisplayName).toBeUndefined();
     expect(result.authAvatarUrl).toBeUndefined();
+  });
+
+  it('reports identity present but username undefined for an empty server username (fails closed)', async () => {
+    // An identity-aware control-plane that returns an empty username: the
+    // response carries a string `username` field, so authIdentityPresent is
+    // true even though nonEmpty() maps the value to undefined. This is the
+    // signal resolveParticipantIdentity uses to fail CLOSED to the empty
+    // authoritative identity instead of the spoofable handshake.
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 'srv-1', name: 'General' },
+          username: '',
+          display_name: 'Ignored Display',
+          avatar_url: '',
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'ch-1', 'token');
+
+    expect(result.authIdentityPresent).toBe(true);
+    expect(result.authUsername).toBeUndefined();
   });
 
   it('leaves authUsername undefined for a pre-CV-CAN-017 response (handshake fallback)', async () => {
@@ -444,6 +472,7 @@ describe('validateChannelAccess', () => {
 
     const result = await validateChannelAccess('u-1', 'ch-1', 'token');
 
+    expect(result.authIdentityPresent).toBe(false);
     expect(result.authUsername).toBeUndefined();
     expect(result.authDisplayName).toBeUndefined();
     expect(result.authAvatarUrl).toBeUndefined();
@@ -464,6 +493,7 @@ describe('validateChannelAccess', () => {
 
     const result = await validateChannelAccess('u-1', 'conv-1', 'token', 'dm');
 
+    expect(result.authIdentityPresent).toBe(true);
     expect(result.authUsername).toBe('dmuser');
     expect(result.authDisplayName).toBe('DM User');
     expect(result.authAvatarUrl).toBe('/api/v1/media/avatars/dm.png');
@@ -486,6 +516,8 @@ describe('validateChannelAccess', () => {
 
     const result = await validateChannelAccess('u-1', 'ch-1', 'token');
 
+    // username: 42 is non-string ⇒ NOT identity-aware ⇒ handshake fallback.
+    expect(result.authIdentityPresent).toBe(false);
     expect(result.authUsername).toBeUndefined();
     expect(result.authDisplayName).toBeUndefined();
     expect(result.authAvatarUrl).toBeUndefined();
@@ -954,9 +986,10 @@ describe('resolveParticipantIdentity', () => {
     avatarUrl: '/api/v1/media/avatars/spoof.png',
   };
 
-  it('uses server-authoritative identity and ignores the handshake when authUsername is present', () => {
+  it('uses server-authoritative identity and ignores the handshake when identity is present', () => {
     const result = resolveParticipantIdentity(
       {
+        authIdentityPresent: true,
         authUsername: 'realuser',
         authDisplayName: 'Real User',
         authAvatarUrl: '/api/v1/media/avatars/real.png',
@@ -971,11 +1004,16 @@ describe('resolveParticipantIdentity', () => {
     });
   });
 
-  it('does NOT fall back to handshake display/avatar when authUsername is present but they are undefined', () => {
-    // A user with no display name / avatar: authUsername present, the other two
+  it('does NOT fall back to handshake display/avatar when identity is present but they are undefined', () => {
+    // A user with no display name / avatar: identity present, the other two
     // undefined. The spoofable handshake values must NOT leak in.
     const result = resolveParticipantIdentity(
-      { authUsername: 'realuser', authDisplayName: undefined, authAvatarUrl: undefined },
+      {
+        authIdentityPresent: true,
+        authUsername: 'realuser',
+        authDisplayName: undefined,
+        authAvatarUrl: undefined,
+      },
       spoofedHandshake
     );
 
@@ -984,9 +1022,33 @@ describe('resolveParticipantIdentity', () => {
     expect(result.avatarUrl).toBeUndefined();
   });
 
-  it('falls back to ALL handshake fields when authUsername is undefined (pre-CV-CAN-017 control-plane)', () => {
+  it('fails CLOSED to the empty authoritative username when identity is present but the username is empty', () => {
+    // An identity-aware control-plane (authIdentityPresent true) that returns an
+    // empty username must NOT re-open to the spoofable handshake — every field
+    // stays authoritative (empty username, no display/avatar leak).
     const result = resolveParticipantIdentity(
-      { authUsername: undefined, authDisplayName: undefined, authAvatarUrl: undefined },
+      {
+        authIdentityPresent: true,
+        authUsername: undefined,
+        authDisplayName: undefined,
+        authAvatarUrl: undefined,
+      },
+      spoofedHandshake
+    );
+
+    expect(result.username).toBe('');
+    expect(result.displayName).toBeUndefined();
+    expect(result.avatarUrl).toBeUndefined();
+  });
+
+  it('falls back to ALL handshake fields when identity is absent (pre-CV-CAN-017 control-plane)', () => {
+    const result = resolveParticipantIdentity(
+      {
+        authIdentityPresent: false,
+        authUsername: undefined,
+        authDisplayName: undefined,
+        authAvatarUrl: undefined,
+      },
       spoofedHandshake
     );
 
