@@ -3,6 +3,7 @@ import {
   codecKey,
   codecKeyMime,
   getCodecInfo,
+  buildWebCodecsCodecString,
   enumerateWebcamCapabilities,
   detectCodecCapabilities,
   clearCapabilitiesCache,
@@ -21,13 +22,13 @@ describe('mediaCapabilities', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    delete (globalThis as any).VideoEncoder;
   });
 
   describe('codecKey', () => {
     it('returns mimeType:profileId when profileId exists', () => {
       const cap: CodecCapability = {
         mimeType: 'video/H264',
-        powerEfficient: true,
         supported: true,
         profileId: '640034',
         profileLabel: 'High',
@@ -39,7 +40,6 @@ describe('mediaCapabilities', () => {
     it('returns just mimeType when no profileId', () => {
       const cap: CodecCapability = {
         mimeType: 'video/VP8',
-        powerEfficient: false,
         supported: true,
         profileId: null,
         profileLabel: null,
@@ -106,6 +106,37 @@ describe('mediaCapabilities', () => {
       const info = getCodecInfo('video/unknown');
       expect(info.name).toBe('unknown');
       expect(info.quality).toBe('Unknown');
+    });
+  });
+
+  describe('buildWebCodecsCodecString', () => {
+    it('maps VP8', () => {
+      expect(buildWebCodecsCodecString('video/VP8', null, false)).toBe('vp8');
+    });
+    it('maps VP9 profile 0 (SDR) and profile 2 (HDR)', () => {
+      expect(buildWebCodecsCodecString('video/VP9', '0', false)).toBe('vp09.00.31.08');
+      expect(buildWebCodecsCodecString('video/VP9', '2', true)).toBe('vp09.02.31.10');
+    });
+    it('maps AV1', () => {
+      expect(buildWebCodecsCodecString('video/AV1', null, false)).toBe('av01.0.05M.08');
+    });
+    it('maps H264 preserving profile/constraint bytes but pinning level to 3.1', () => {
+      // The SDP level byte (34 = level 5.2) is overridden to 1f (3.1) so the 720p
+      // probe never false-negatives on a HW encoder that caps below the advertised
+      // level; the profile+constraint bytes are preserved.
+      expect(buildWebCodecsCodecString('video/H264', '640034', false)).toBe('avc1.64001f');
+      expect(buildWebCodecsCodecString('video/H264', '42e01f', false)).toBe('avc1.42e01f');
+    });
+    it('falls back to a baseline H264 string when profileId is absent/malformed', () => {
+      expect(buildWebCodecsCodecString('video/H264', null, false)).toBe('avc1.42001f');
+      expect(buildWebCodecsCodecString('video/H264', 'zzz', false)).toBe('avc1.42001f');
+    });
+    it('maps HEVC (both video/H265 and video/HEVC spellings)', () => {
+      expect(buildWebCodecsCodecString('video/H265', null, false)).toBe('hev1.1.6.L93.B0');
+      expect(buildWebCodecsCodecString('video/HEVC', null, false)).toBe('hev1.1.6.L93.B0');
+    });
+    it('returns null for codecs we do not probe', () => {
+      expect(buildWebCodecsCodecString('video/rtx', null, false)).toBeNull();
     });
   });
 
@@ -300,115 +331,65 @@ describe('mediaCapabilities', () => {
       expect(caps1).toBe(caps2); // Same reference = cached
     });
 
-    it('detects hardware acceleration (powerEfficient)', async () => {
-      (globalThis as any).RTCRtpSender = {
-        getCapabilities: vi.fn(() => ({
-          codecs: [{ mimeType: 'video/VP8' }],
-        })),
-      };
-      Object.defineProperty(navigator, 'mediaCapabilities', {
-        value: {
-          encodingInfo: vi.fn().mockResolvedValue({
-            supported: true,
-            smooth: true,
-            powerEfficient: true,
-          }),
-        },
-        configurable: true,
-      });
-
-      clearCapabilitiesCache();
-      const caps = await detectCodecCapabilities();
-      expect(caps[0].powerEfficient).toBe(true);
-    });
-
-    it('uses system encode profiles when MediaCapabilities cannot confirm hardware', async () => {
+    it('marks a codec hardware-available when WebCodecs confirms a HW encoder', async () => {
       (globalThis as any).RTCRtpSender = {
         getCapabilities: vi.fn(() => ({
           codecs: [{ mimeType: 'video/H264', sdpFmtpLine: 'profile-level-id=640034' }],
         })),
       };
-      Object.defineProperty(navigator, 'mediaCapabilities', {
-        value: {
-          encodingInfo: vi.fn().mockResolvedValue({
-            supported: true,
-            smooth: true,
-            powerEfficient: false,
-          }),
-        },
-        configurable: true,
-      });
-      window.electron = {
-        ...window.electron,
-        getGPUInfo: vi.fn().mockResolvedValue({
-          vendor: 'NVIDIA',
-          device: 'RTX 5090',
-          encodeProfiles: ['video/H264'],
-        }),
-      } as typeof window.electron;
+      const isConfigSupported = vi.fn().mockResolvedValue({ supported: true });
+      (globalThis as any).VideoEncoder = { isConfigSupported };
 
       clearCapabilitiesCache();
       const caps = await detectCodecCapabilities();
       const h264 = caps.find((c) => c.mimeType === 'video/H264');
 
-      expect((h264 as any).hwAvailable).toBe(true);
+      expect(h264!.hwAvailable).toBe(true);
+      // Only the 'prefer-hardware' variant is diagnostic — assert we pass it.
+      expect(isConfigSupported).toHaveBeenCalledWith(
+        expect.objectContaining({ codec: 'avc1.64001f', hardwareAcceleration: 'prefer-hardware' })
+      );
+      // Minimal config: no scalabilityMode/bitrate (would cause false negatives).
+      const arg = isConfigSupported.mock.calls[0][0];
+      expect(arg).not.toHaveProperty('scalabilityMode');
+      expect(arg).not.toHaveProperty('bitrate');
     });
 
-    it('does not cache unknown hardware results from empty system profiles', async () => {
+    it('marks a codec hardware-unavailable when WebCodecs reports no HW encoder', async () => {
       (globalThis as any).RTCRtpSender = {
-        getCapabilities: vi.fn(() => ({
-          codecs: [{ mimeType: 'video/VP8' }],
-        })),
+        getCapabilities: vi.fn(() => ({ codecs: [{ mimeType: 'video/AV1' }] })),
       };
-      Object.defineProperty(navigator, 'mediaCapabilities', {
-        value: {
-          encodingInfo: vi.fn().mockResolvedValue({ powerEfficient: false }),
-        },
-        configurable: true,
-      });
-      window.electron = {
-        ...window.electron,
-        getGPUInfo: vi.fn().mockResolvedValue({
-          vendor: 'Apple',
-          device: 'M-series',
-          encodeProfiles: [],
-        }),
-      } as typeof window.electron;
-
-      clearCapabilitiesCache();
-      const caps1 = await detectCodecCapabilities();
-      const caps2 = await detectCodecCapabilities();
-
-      expect(caps1).not.toBe(caps2);
-      expect(caps1[0].hwAvailable).toBeUndefined();
-      expect(window.electron.getGPUInfo).toHaveBeenCalledTimes(2);
-    });
-
-    it('marks a codec false when populated system profiles exclude it', async () => {
-      (globalThis as any).RTCRtpSender = {
-        getCapabilities: vi.fn(() => ({
-          codecs: [{ mimeType: 'video/AV1' }],
-        })),
+      (globalThis as any).VideoEncoder = {
+        isConfigSupported: vi.fn().mockResolvedValue({ supported: false }),
       };
-      Object.defineProperty(navigator, 'mediaCapabilities', {
-        value: {
-          encodingInfo: vi.fn().mockResolvedValue({ powerEfficient: false }),
-        },
-        configurable: true,
-      });
-      window.electron = {
-        ...window.electron,
-        getGPUInfo: vi.fn().mockResolvedValue({
-          vendor: 'NVIDIA',
-          device: 'RTX 3090',
-          encodeProfiles: ['video/H264'],
-        }),
-      } as typeof window.electron;
 
       clearCapabilitiesCache();
       const caps = await detectCodecCapabilities();
-
       expect(caps[0].hwAvailable).toBe(false);
+    });
+
+    it('leaves hwAvailable undefined when WebCodecs is unavailable (no false "software")', async () => {
+      (globalThis as any).RTCRtpSender = {
+        getCapabilities: vi.fn(() => ({ codecs: [{ mimeType: 'video/VP8' }] })),
+      };
+      delete (globalThis as any).VideoEncoder;
+
+      clearCapabilitiesCache();
+      const caps = await detectCodecCapabilities();
+      expect(caps[0].hwAvailable).toBeUndefined();
+    });
+
+    it('leaves hwAvailable undefined when the probe throws', async () => {
+      (globalThis as any).RTCRtpSender = {
+        getCapabilities: vi.fn(() => ({ codecs: [{ mimeType: 'video/VP8' }] })),
+      };
+      (globalThis as any).VideoEncoder = {
+        isConfigSupported: vi.fn().mockRejectedValue(new Error('nope')),
+      };
+
+      clearCapabilitiesCache();
+      const caps = await detectCodecCapabilities();
+      expect(caps[0].hwAvailable).toBeUndefined();
     });
 
     it('deduplicates codecs by mimeType + profile', async () => {

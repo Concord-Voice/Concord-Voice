@@ -54,6 +54,7 @@ import {
 } from '../workers/e2eeProtocol';
 import { notificationSoundService } from './notificationSoundService';
 import { selectCodecFromCascade, type CodecLookup } from './voiceCodecSelection';
+import { extractWebrtcHwSignal } from './webrtcHwSignal';
 import { ConsumerPauseCoordinator } from './consumerPauseCoordinator';
 import { buildCameraEncodingPlan, castingKindForCodec, isCastingEligible } from './cameraLayering';
 import {
@@ -635,6 +636,27 @@ class VoiceService {
     return { packetsSent, packetsLost };
   }
 
+  /**
+   * Learn the runtime WebRTC hardware-encode signal (question B) from active video
+   * producers and cache it per codec in the video settings store. Fail-safe: a codec
+   * whose stats aren't ready yet stays unlearned, and isHwAccelerated falls back to the
+   * WebCodecs silicon capability (A) until a producer of that codec reports.
+   */
+  private async learnWebrtcHwSignal(): Promise<void> {
+    for (const source of ['camera', 'screen'] as const) {
+      const producer = this.producers.get(source);
+      if (!producer) continue;
+      try {
+        const signal = extractWebrtcHwSignal(await producer.getStats());
+        if (signal) {
+          useVideoSettingsStore.getState().setWebrtcHwForMime(signal.mime, signal.powerEfficient);
+        }
+      } catch {
+        // stats unavailable this tick — leave B unlearned for this codec
+      }
+    }
+  }
+
   /** Calculate FEC headroom bitrate multiplier based on loss % and tier. */
   private static calculateFecBitrate(
     lossPercent: number,
@@ -657,6 +679,11 @@ class VoiceService {
     this.lastPacketsSent = 0;
 
     this.packetLossTimer = setInterval(async () => {
+      // Learn the runtime WebRTC hardware-encode signal (question B) from video
+      // producers each tick. Independent of the mic packet-loss read below, and
+      // non-blocking (fire-and-forget) so a slow getStats never delays loss sampling.
+      void this.learnWebrtcHwSignal();
+
       const micProducer = this.producers.get('mic');
       if (!micProducer) return;
 
@@ -755,13 +782,22 @@ class VoiceService {
   }
 
   /**
-   * Check if a codec has hardware-accelerated encoding available.
-   * Extracts mimeType from codec key — HW detection is mimeType-level.
+   * Check whether a codec is hardware-accelerated for real WebRTC calls (question B).
+   * Prefers the runtime-observed WebRTC signal (`powerEfficientEncoder`, learned from a
+   * live producer) — it reflects what the CALL actually does. Until a codec has been
+   * observed in a live producer, falls back to the GPU silicon capability (question A,
+   * from the WebCodecs probe): A over-reports for codecs WebRTC software-encodes (e.g.
+   * AV1 via libaom), but it is the only pre-observation estimate, and the learned B value
+   * corrects it once a producer of that codec runs. Detection is mimeType-level.
    */
   private isHwAccelerated(key: string): boolean {
-    const caps = useVideoSettingsStore.getState().codecCapabilities;
+    const store = useVideoSettingsStore.getState();
     const mime = key.split(':')[0].toLowerCase();
-    return caps.some((c) => c.mimeType.toLowerCase() === mime && c.hwAvailable === true);
+    const learned = store.webrtcHwByMime[mime];
+    if (learned !== undefined) return learned;
+    return store.codecCapabilities.some(
+      (c) => c.mimeType.toLowerCase() === mime && c.hwAvailable === true
+    );
   }
 
   /**

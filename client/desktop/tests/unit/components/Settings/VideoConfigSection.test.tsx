@@ -126,12 +126,11 @@ import { getCodecInfo } from '@/renderer/services/mediaCapabilities';
 
 const makeCodec = (
   mimeType: string,
-  powerEfficient: boolean,
+  hwAvailable: boolean,
   opts: { sdpFmtpLine?: string; profileLabel?: string; isHdr?: boolean; hwAvailable?: boolean } = {}
 ) => ({
   mimeType,
-  powerEfficient,
-  hwAvailable: 'hwAvailable' in opts ? opts.hwAvailable : powerEfficient,
+  hwAvailable: 'hwAvailable' in opts ? opts.hwAvailable : hwAvailable,
   sdpFmtpLine: opts.sdpFmtpLine || 'default',
   profileLabel: opts.profileLabel || '',
   isHdr: opts.isHdr || false,
@@ -304,9 +303,9 @@ describe('VideoConfigSection', () => {
       mockVideoSettingsStore({ videoAdvancedMode: true, gpuInfo: { vendor, device: 'Test GPU' } });
       renderComponent();
       // The vendor name should appear in the gpu badge
-      expect(screen.getByText(new RegExp(vendor))).toBeInTheDocument();
+      expect(screen.getByText(vendor, { exact: false })).toBeInTheDocument();
       // SVG should be in the document
-      const badge = screen.getByText(new RegExp(vendor)).closest('.settings-gpu-badge');
+      const badge = screen.getByText(vendor, { exact: false }).closest('.settings-gpu-badge');
       expect(badge?.querySelector('svg')).toBeInTheDocument();
     });
 
@@ -465,9 +464,9 @@ describe('VideoConfigSection', () => {
       expect(screen.getByText('Software')).toBeInTheDocument();
     });
 
-    it('renders HW codecs that are powerEfficient', () => {
+    it('renders HW codecs that are hardware-available', () => {
       renderComponent();
-      // VP9, H264, AV1 are powerEfficient
+      // VP9, H264, AV1 are hardware-available
       const hwColumn = screen.getByText('Hardware').closest('.settings-codec-column');
       expect(hwColumn).toBeInTheDocument();
     });
@@ -970,7 +969,7 @@ describe('VideoConfigSection', () => {
         videoAdvancedMode: true,
         codecCapabilities: sampleCodecs,
       });
-      // VP8 is not powerEfficient in our sample data
+      // VP8 is not hardware-available in our sample data
       mockDraftSettings({
         preferredVideoCodec: 'video/VP8/default',
         hardwareAcceleration: true,
@@ -1291,7 +1290,7 @@ describe('VideoConfigSection', () => {
         codecCapabilities: [makeCodec('video/H265', false, { profileLabel: 'Main' })],
       });
       renderComponent();
-      // H265 is SW only (not powerEfficient), but appears in SW column
+      // H265 is SW only (not hardware-available), but appears in SW column
       const items = screen.getAllByText('HEVC (H.265) (Main)');
       expect(items.length).toBeGreaterThanOrEqual(1);
     });
@@ -1302,7 +1301,7 @@ describe('VideoConfigSection', () => {
         codecCapabilities: [makeCodec('video/VP8', false)],
       });
       renderComponent();
-      // VP8 appears in SW column (not powerEfficient), codec name in codec grid
+      // VP8 appears in SW column (not hardware-available), codec name in codec grid
       const items = document.querySelectorAll('.settings-codec-name');
       const vp8Items = Array.from(items).filter((el) => el.textContent === 'VP8');
       expect(vp8Items.length).toBeGreaterThanOrEqual(1);

@@ -111,6 +111,13 @@ export interface VideoSettings {
   // Cached capabilities (non-persisted in practice, but ok to persist for fast initial render)
   codecCapabilities: CodecCapability[];
   gpuInfo: GpuInfo | null;
+  // Runtime-observed WebRTC hardware-encode signal (RTCOutboundRtpStreamStats
+  // .powerEfficientEncoder) per codec mimeType, learned from live producers. This is
+  // question B ("will the CALL hardware-encode this codec") — distinct from
+  // codecCapabilities.hwAvailable which is question A ("can the GPU silicon encode it").
+  // Non-persisted (excluded via partialize): it reflects the current session's
+  // GPU/driver/WebRTC build, so it must be re-learned each session.
+  webrtcHwByMime: Record<string, boolean>;
 }
 
 interface VideoSettingsState extends VideoSettings {
@@ -133,6 +140,7 @@ interface VideoSettingsState extends VideoSettings {
   setVideoAdvancedMode: (enabled: boolean) => void;
   setCodecCapabilities: (caps: CodecCapability[]) => void;
   setGpuInfo: (info: GpuInfo | null) => void;
+  setWebrtcHwForMime: (mime: string, hw: boolean) => void;
 }
 
 const defaults: VideoSettings = {
@@ -156,6 +164,7 @@ const defaults: VideoSettings = {
   systemHdr: false,
   codecCapabilities: [],
   gpuInfo: null,
+  webrtcHwByMime: {},
 };
 
 export const useVideoSettingsStore = wrapStore(
@@ -183,12 +192,14 @@ export const useVideoSettingsStore = wrapStore(
         setHdrEncoding: (hdrEncoding) => set({ hdrEncoding }),
         setCodecCapabilities: (codecCapabilities) => set({ codecCapabilities }),
         setGpuInfo: (gpuInfo) => set({ gpuInfo }),
+        setWebrtcHwForMime: (mime, hw) =>
+          set((s) => ({ webrtcHwByMime: { ...s.webrtcHwByMime, [mime.toLowerCase()]: hw } })),
       }),
       {
         name: 'concord:video-settings',
         partialize: (state) => {
           // Exclude runtime-only fields from persistence
-          const { systemHdr: _, ...rest } = state;
+          const { systemHdr: _, webrtcHwByMime: __, ...rest } = state;
           return rest;
         },
       }

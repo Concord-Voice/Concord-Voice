@@ -19,8 +19,7 @@ export interface WebcamCapability {
 export interface CodecCapability {
   mimeType: string; // e.g. "video/VP9"
   sdpFmtpLine?: string;
-  powerEfficient: boolean; // raw MediaCapabilities hint; false means "not confirmed"
-  hwAvailable?: boolean; // true = confirmed HW, false = populated profiles exclude it, undefined = unknown
+  hwAvailable?: boolean; // true = GPU has a HW encoder, false = it does not, undefined = detection unavailable
   supported: boolean;
   profileId: string | null; // "640034" for H264 High, "2" for VP9 P2, null for VP8/AV1
   profileLabel: string | null; // "High", "Main", "Baseline", "HDR", null for no-profile codecs
@@ -76,6 +75,69 @@ function parseProfile(
   }
 
   return { id: null, label: null, isHdr: false };
+}
+
+/**
+ * Build a WebCodecs codec string for a HARDWARE-encode capability probe.
+ * Levels target ~720p (the probe resolution in probeHardwareEncode) so
+ * isConfigSupported's level check does not false-negative. Returns null for
+ * codecs we do not probe (rtx/red/ulpfec are already filtered upstream).
+ */
+export function buildWebCodecsCodecString(
+  mimeType: string,
+  profileId: string | null,
+  isHdr: boolean
+): string | null {
+  const mime = mimeType.toLowerCase();
+  if (mime === 'video/vp8') return 'vp8';
+  if (mime === 'video/vp9') return isHdr ? 'vp09.02.31.10' : 'vp09.00.31.08';
+  if (mime === 'video/av1') return 'av01.0.05M.08';
+  if (mime === 'video/h264') {
+    // Preserve the profile_idc + constraint-flags bytes from the SDP
+    // profile-level-id, but PIN the level to 3.1 (0x1f). The SDP level_idc can be
+    // higher than the 720p probe needs (e.g. 640034 = level 5.2), which would
+    // false-negative on a HW encoder that caps below the advertised level — the
+    // exact "false software" outcome this probe exists to avoid. Mirrors the fixed
+    // ~3.1 level used for the other codecs above.
+    const base =
+      profileId && /^[0-9a-fA-F]{6}$/.test(profileId)
+        ? profileId.toLowerCase().substring(0, 4)
+        : '4200';
+    return `avc1.${base}1f`;
+  }
+  if (mime === 'video/h265' || mime === 'video/hevc') return 'hev1.1.6.L93.B0';
+  return null;
+}
+
+// WebCodecs HW-encode probe. 1280x720 is the WebRTC default resolution and is
+// universally hardware-supported where the codec is supported at all; the codec
+// strings above carry levels that cover it.
+const HW_PROBE_WIDTH = 1280;
+const HW_PROBE_HEIGHT = 720;
+
+/**
+ * Probe whether the GPU exposes a genuine HARDWARE encoder for a codec string.
+ * `hardwareAcceleration: 'prefer-hardware'` is the ONLY diagnostic variant —
+ * Chromium's isConfigSupported filters out software codecs and forces a
+ * hardware-only probe (verified in third_party/blink/.../webcodecs/video_encoder.cc).
+ * Returns undefined when WebCodecs is unavailable or the probe throws — NEVER
+ * coerce that to false, which would falsely claim "software".
+ */
+async function probeHardwareEncode(codec: string): Promise<boolean | undefined> {
+  if (typeof VideoEncoder === 'undefined' || typeof VideoEncoder.isConfigSupported !== 'function') {
+    return undefined;
+  }
+  try {
+    const result = await VideoEncoder.isConfigSupported({
+      codec,
+      width: HW_PROBE_WIDTH,
+      height: HW_PROBE_HEIGHT,
+      hardwareAcceleration: 'prefer-hardware',
+    });
+    return result.supported === true;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Build a unique key like "video/H264:640034" or "video/VP8" */
@@ -195,36 +257,12 @@ const PROBE_RESOLUTIONS: { width: number; height: number; label: string }[] = [
 
 const PROBE_FRAMERATES = [60, 30, 15];
 
-// Multiple resolutions for HW acceleration probing — some GPU drivers only report
-// powerEfficient at certain resolutions. Try from most-commonly-accelerated to highest.
-const HW_PROBE_CONFIGS = [
-  { width: 1920, height: 1080, bitrate: 4_000_000, framerate: 30 },
-  { width: 1280, height: 720, bitrate: 2_000_000, framerate: 30 },
-  { width: 3840, height: 2160, bitrate: 10_000_000, framerate: 30 },
-];
-
 // ---------------------------------------------------------------------------
 // Cache
 // ---------------------------------------------------------------------------
 
 const cachedWebcamCaps: Map<string, WebcamCapability[]> = new Map();
 let cachedCodecCaps: CodecCapability[] | null = null;
-
-function mimeSet(values: string[] | undefined): Set<string> {
-  return new Set((values ?? []).map((value) => value.toLowerCase()));
-}
-
-function resolveHardwareAvailability(
-  mimeType: string,
-  encodeMimes: Set<string>,
-  powerEfficient: boolean,
-  profilesPopulated: boolean
-): boolean | undefined {
-  if (encodeMimes.has(mimeType.toLowerCase())) return true;
-  if (powerEfficient) return true;
-  if (profilesPopulated) return false;
-  return undefined;
-}
 
 /**
  * Enumerate supported resolutions and frame rates for a given webcam.
@@ -294,73 +332,38 @@ export async function detectCodecCapabilities(): Promise<CodecCapability[]> {
     return true;
   });
 
-  // Probe HW acceleration once per mimeType using multiple resolutions.
-  // navigator.mediaCapabilities.encodingInfo() only accepts mimeType-level contentType
-  // (not codec profiles), so per-mimeType is the correct granularity.
-  // Some GPU drivers only report powerEfficient at certain resolutions, so we probe
-  // at 1080p, 720p, and 4K — short-circuiting on the first positive result.
-  const hwByMime = new Map<string, boolean>();
-  const uniqueMimes = [...new Set(uniqueCodecs.map((c) => c.mimeType))];
+  // Probe hardware-encode capability per unique WebCodecs codec string.
+  // isConfigSupported({hardwareAcceleration:'prefer-hardware'}) is true ONLY when
+  // the GPU exposes a genuine hardware encoder for that codec — the reliable
+  // signal the old getGPUInfo VEA list and WebRTC powerEfficient hint both lacked.
+  const parsed = uniqueCodecs.map((codec) => {
+    const p = parseProfile(codec.mimeType, codec.sdpFmtpLine);
+    return { codec, ...p, codecString: buildWebCodecsCodecString(codec.mimeType, p.id, p.isHdr) };
+  });
+
+  const hwByCodecString = new Map<string, boolean | undefined>();
+  const uniqueStrings = [
+    ...new Set(parsed.map((x) => x.codecString).filter((s): s is string => s !== null)),
+  ];
   await Promise.all(
-    uniqueMimes.map(async (mime) => {
-      let powerEfficient = false;
-      if ('mediaCapabilities' in navigator) {
-        for (const probe of HW_PROBE_CONFIGS) {
-          try {
-            const info = await navigator.mediaCapabilities.encodingInfo({
-              type: 'webrtc',
-              video: {
-                contentType: mime,
-                width: probe.width,
-                height: probe.height,
-                bitrate: probe.bitrate,
-                framerate: probe.framerate,
-              },
-            });
-            if (info.powerEfficient) {
-              powerEfficient = true;
-              break; // HW confirmed — no need to probe further
-            }
-          } catch {
-            // MediaCapabilities may not support WebRTC type on all browsers
-          }
-        }
-      }
-      hwByMime.set(mime, powerEfficient);
+    uniqueStrings.map(async (codecString) => {
+      hwByCodecString.set(codecString, await probeHardwareEncode(codecString));
     })
   );
 
-  const gpuInfo = await globalThis.electron?.getGPUInfo?.().catch(() => null);
-  const profileSignalUnavailable = gpuInfo === undefined;
-  const encodeMimes = mimeSet(gpuInfo?.encodeProfiles);
-  const profilesPopulated = encodeMimes.size > 0;
+  const caps: CodecCapability[] = parsed.map(({ codec, id, label, isHdr, codecString }) => ({
+    mimeType: codec.mimeType,
+    sdpFmtpLine: codec.sdpFmtpLine,
+    hwAvailable: codecString === null ? undefined : hwByCodecString.get(codecString),
+    supported: true,
+    profileId: id,
+    profileLabel: label,
+    isHdr,
+  }));
 
-  const caps = uniqueCodecs.map((codec) => {
-    const { id, label, isHdr } = parseProfile(codec.mimeType, codec.sdpFmtpLine);
-    const powerEfficient = hwByMime.get(codec.mimeType) ?? false;
-    const hwAvailable = resolveHardwareAvailability(
-      codec.mimeType,
-      encodeMimes,
-      powerEfficient,
-      profilesPopulated
-    );
-    return {
-      mimeType: codec.mimeType,
-      sdpFmtpLine: codec.sdpFmtpLine,
-      powerEfficient,
-      hwAvailable,
-      supported: true,
-      profileId: id,
-      profileLabel: label,
-      isHdr,
-    };
-  });
-  if (
-    caps.length > 0 &&
-    (profileSignalUnavailable ||
-      profilesPopulated ||
-      caps.every((cap) => cap.hwAvailable === true && cap.powerEfficient))
-  ) {
+  // WebCodecs support is stable within a session, so cache once we have codecs
+  // (getCapabilities()===null still returns [] above without caching).
+  if (caps.length > 0) {
     cachedCodecCaps = caps;
   }
   return caps;

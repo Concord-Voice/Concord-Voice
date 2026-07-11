@@ -59,6 +59,19 @@ describe('videoSettingsStore', () => {
       encodeProfiles: ['video/H264'],
     });
   });
+
+  it('learns and merges the runtime WebRTC hardware signal per codec (case-insensitive)', () => {
+    const s = useVideoSettingsStore.getState();
+    s.setWebrtcHwForMime('video/AV1', false);
+    s.setWebrtcHwForMime('video/H264', true);
+    expect(useVideoSettingsStore.getState().webrtcHwByMime).toEqual({
+      'video/av1': false,
+      'video/h264': true,
+    });
+    // Last-write-wins overwrite (a codec's B-verdict can change as the encoder settles).
+    useVideoSettingsStore.getState().setWebrtcHwForMime('video/av1', true);
+    expect(useVideoSettingsStore.getState().webrtcHwByMime['video/av1']).toBe(true);
+  });
 });
 
 describe('videoSettingsStore casting toggles (#1921)', () => {

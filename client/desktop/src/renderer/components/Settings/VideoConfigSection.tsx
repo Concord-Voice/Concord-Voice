@@ -846,9 +846,12 @@ const VideoConfigSection: React.FC = () => {
                 codecCapabilities.filter((c) => c.hwAvailable === true).sort(sortByPriority)
               );
               const swCodecs = dedupe([...codecCapabilities].sort(sortByPriority));
-              const systemProfilesPopulated =
-                (gpuInfo?.encodeProfiles?.length ?? 0) > 0 ||
-                codecCapabilities.some((c) => c.hwAvailable === false);
+              // We have a definite HW verdict for at least one codec (WebCodecs probe
+              // returned true/false rather than undefined). Drives the "no supported HW
+              // codecs" fallback notice below.
+              const systemProfilesPopulated = codecCapabilities.some(
+                (c) => c.hwAvailable !== undefined
+              );
 
               // Which column is active
               const hwHasSupported = hwCodecs.some((c) => isSupported(c));
@@ -916,6 +919,7 @@ const VideoConfigSection: React.FC = () => {
                     <div className={`settings-codec-column${hwActive ? ' active' : ''}`}>
                       <span
                         className={`settings-codec-column-header${hwActive ? ' active' : ''}`}
+                        title="Codecs your GPU can hardware-encode. Whether a given call uses hardware depends on the negotiated codec."
                         {...(hwActive ? { 'data-tooltip': 'Preferred' } : {})}
                       >
                         Hardware
