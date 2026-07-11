@@ -330,15 +330,18 @@ export const PREMIUM_VIDEO_PUBLISHER_CAP = 25;
 export const PREMIUM_SCREEN_PRODUCER_CAP = 16;
 
 /**
- * Resolve a room's cap tier (#1542). Channels follow the server OWNER's tier
- * (the owner provisions the room's egress capacity — a premium member's
- * presence must NOT raise a large/public channel's cap); DMs follow the MAX
- * tier among present participants (presence-provisioned — a premium
- * participant's entitlement extends to their DMs). Both inputs are
- * server-authoritative (#1300/#1542 join-authorize), never
- * socket.handshake.auth. Fail-closed to 'free' for an unknown/absent tier or
- * an empty room. Pure + synchronous (no await) → safe to call inside the
- * #1539 TOCTOU reservation.
+ * Resolve a room's cap tier (#1542). Channels follow the SERVER's Mach tier
+ * (the server SUBSCRIPTION provisions the room's egress capacity — neither a
+ * premium member nor a premium owner on a free server may raise a large/public
+ * channel's cap; ADR-0029 amendment 2026-07-10). The control-plane collapses the
+ * server Mach ladder to this binary `room.ownerTier` string via
+ * RoomCapTierForServer; the field name is legacy and the wire is unchanged, so
+ * the media-plane consumes it identically. DMs follow the MAX tier among present
+ * participants (presence-provisioned — a premium participant's entitlement
+ * extends to their DMs). Both inputs are server-authoritative (#1300/#1542
+ * join-authorize), never socket.handshake.auth. Fail-closed to 'free' for an
+ * unknown/absent tier or an empty room. Pure + synchronous (no await) → safe to
+ * call inside the #1539 TOCTOU reservation.
  */
 export function resolveRoomCapTier(room: Room): 'free' | 'premium' {
   if (room.roomKind === 'dm') {
@@ -1196,7 +1199,10 @@ export class RoomManager {
     // client controls produce() timing (it could keep produces perpetually in
     // flight to ride out revocations). Now that the producer is registered,
     // re-evaluate against the CURRENT snapshot and unwind if it was revoked.
-    if (participant.permissions !== undefined && !publishPermitted(participant.permissions, kind, source)) {
+    if (
+      participant.permissions !== undefined &&
+      !publishPermitted(participant.permissions, kind, source)
+    ) {
       await this.closeProducer(roomId, userId, producer.id);
       logger.warn('produce rejected: permission revoked mid-produce', {
         userId,
@@ -1252,7 +1258,6 @@ export class RoomManager {
         throw new Error('publish permission denied');
       }
     }
-
   }
 
   async produce(
@@ -1333,7 +1338,15 @@ export class RoomManager {
     // Release the reservation: the producer is now counted via participant.producers.
     this.releaseProducerReservation(room, source, producerCap);
 
-    await this.enforceAndTrackRegisteredProducer(room, participant, roomId, userId, producer, kind, source);
+    await this.enforceAndTrackRegisteredProducer(
+      room,
+      participant,
+      roomId,
+      userId,
+      producer,
+      kind,
+      source
+    );
 
     // Clean up when producer closes
     producer.on('transportclose', () => {

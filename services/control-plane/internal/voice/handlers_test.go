@@ -857,19 +857,28 @@ func TestAuthorizeJoin_MediaEntitlements(t *testing.T) {
 	})
 }
 
-// --- AuthorizeJoin room_owner_tier Tests (#1542) ---
+// --- AuthorizeJoin room_owner_tier Tests (#1542, re-homed to the server axis 2026-07-10) ---
+//
+// room_owner_tier is now the SERVER's Mach tier (collapsed to binary free/premium
+// by RoomCapTierForServer), NOT any user's personal plan (ADR-0029 amendment). The
+// field name is retained for wire stability. These cases lock the axis flip: a
+// personal Supersonic sub — owner's OR member's — never raises a channel room cap;
+// only the server's own subscription does.
 
 func TestAuthorizeJoin_RoomOwnerTier(t *testing.T) {
-	t.Run("PremiumOwnerYieldsPremiumRoomOwnerTier", func(t *testing.T) {
-		// The cap tier follows the server OWNER, not the joining member: a free
-		// member joining a premium-owned server sees room_owner_tier=premium.
+	t.Run("SupersonicOwnerOfGroundspeedServerYieldsFree", func(t *testing.T) {
+		// The former bug: the owner's personal premium plan granted the premium
+		// room cap. Now the room cap follows the SERVER's Mach tier, which is
+		// Groundspeed (inert seam) regardless of the owner's personal sub → free.
 		ts := setupTS(t)
 		owner := ts.CreateTestUser(t, "rot_prem_owner")
 		member := ts.CreateTestUser(t, "rot_prem_member")
-		serverID := ts.CreateTestServer(t, owner.ID, "ROT Premium Server")
+		serverID := ts.CreateTestServer(t, owner.ID, "ROT Premium-Owner Server")
 		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
 		channelID := ts.CreateVoiceChannel(t, serverID, "voice-rot-prem")
 
+		// Owner holds a personal Supersonic (premium) subscription — must NOT leak
+		// into the server-scoped room cap.
 		insertSubscription(t, ts, owner.ID, entitlements.TierPremium)
 
 		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
@@ -877,29 +886,38 @@ func TestAuthorizeJoin_RoomOwnerTier(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		assert.Equal(t, "premium", body["room_owner_tier"], "cap tier follows the OWNER, not the joining member")
-		// The joining member's per-user entitlements stay free — orthogonal axes.
+		assert.Equal(t, "free", body["room_owner_tier"],
+			"a premium OWNER of a Groundspeed server must not raise the channel room cap")
 		assertMediaEntitlements(t, body, entitlements.TierFree)
 	})
 
-	t.Run("FreeOwnerYieldsFreeRoomOwnerTier", func(t *testing.T) {
-		// No subscription row for the owner → GetTier fails closed to free.
+	t.Run("MachServerYieldsPremium", func(t *testing.T) {
+		// A Mach-boosted server grants the premium room cap to every member,
+		// regardless of anyone's personal plan. Seed the server tier via the same
+		// ServerCache seam the channel-standard test uses.
 		ts := setupTS(t)
-		owner := ts.CreateTestUser(t, "rot_free_owner")
-		serverID := ts.CreateTestServer(t, owner.ID, "ROT Free Server")
-		channelID := ts.CreateVoiceChannel(t, serverID, "voice-rot-free")
+		owner := ts.CreateTestUser(t, "rot_mach_owner")
+		member := ts.CreateTestUser(t, "rot_mach_member")
+		serverID := ts.CreateTestServer(t, owner.ID, "ROT Mach Server")
+		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+		channelID := ts.CreateVoiceChannel(t, serverID, "voice-rot-mach")
+		require.NoError(t, entitlements.NewServerCache(ts.Redis, ts.DB).
+			SetServerTier(context.Background(), serverID, entitlements.TierMach1))
 
-		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(owner.AccessToken))
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathVoiceJoin, nil, testhelpers.AuthHeaders(member.AccessToken))
 		require.Equal(t, http.StatusOK, w.Code)
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		assert.Equal(t, "free", body["room_owner_tier"])
+		assert.Equal(t, "premium", body["room_owner_tier"],
+			"a Mach-boosted server grants the premium room cap")
+		// The joining member's per-user entitlements stay free — orthogonal axes.
+		assertMediaEntitlements(t, body, entitlements.TierFree)
 	})
 
-	t.Run("PremiumMemberDoesNotRaiseFreeOwnerRoom", func(t *testing.T) {
-		// A premium MEMBER joining a free-owned server must NOT unlock the
-		// premium room cap (the public-channel abuse vector, spec §6.5).
+	t.Run("PremiumMemberDoesNotRaiseGroundspeedServerRoom", func(t *testing.T) {
+		// The public-channel abuse vector (ADR-0029): a premium MEMBER joining a
+		// Groundspeed server must NOT unlock the premium room cap.
 		ts := setupTS(t)
 		owner := ts.CreateTestUser(t, "rot_mix_owner")
 		member := ts.CreateTestUser(t, "rot_mix_member")

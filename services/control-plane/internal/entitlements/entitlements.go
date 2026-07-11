@@ -19,9 +19,13 @@ const (
 
 // Entitlement is the capability set for one tier. Field subjects differ: most
 // fields are user-scoped (resolved from the acting user's tier), but
-// MaxWebcamPublishers, MaxScreensharePublishers, and MaxAudioLastN are ROOM-scoped
-// — resolved from the room owner's tier (see media-plane.md resolveVideoPublisherCap).
-// The consumer picks the subject; this struct is only the tier->values table.
+// MaxWebcamPublishers, MaxScreensharePublishers, and MaxAudioLastN are ROOM-scoped.
+// The room-scope resolution is asymmetric by room kind (ADR-0029): DM rooms take
+// the max present-participant tier, while CHANNEL rooms resolve from the SERVER's
+// Mach tier (via RoomCapTierForServer, not any personal/owner plan) — so these
+// user-tier publisher values are the DM-scoped table; channels read the
+// server-axis collapse. The consumer picks the subject; this struct is only the
+// tier->values table.
 type Entitlement struct {
 	Tier string
 
@@ -51,8 +55,8 @@ type Entitlement struct {
 	// (max stream/camera bitrate) so the SFU's single advisory cap never wrongly
 	// clamps a legitimate 20 Mbps screen-share. Kept for wire stability (#1300).
 	MaxManualBitrateBps      int
-	MaxWebcamPublishers      int // room-owner-scoped; matches media-plane resolveVideoPublisherCap
-	MaxScreensharePublishers int // room-owner-scoped; media-plane enforcement shipped with #1542 (resolveScreenProducerCap)
+	MaxWebcamPublishers      int // DM-scoped only; channels resolve the cap from the server Mach tier (ADR-0029). media-plane resolveVideoPublisherCap
+	MaxScreensharePublishers int // DM-scoped only; channels resolve from the server Mach tier (ADR-0029). media-plane resolveScreenProducerCap (#1542)
 
 	// Messaging (Class 2 — client-enforced char count).
 	MaxMessageChars int

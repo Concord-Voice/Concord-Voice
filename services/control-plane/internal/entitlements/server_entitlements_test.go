@@ -68,6 +68,28 @@ func TestForServer_UnknownTierFailsClosedToGroundspeed(t *testing.T) {
 	}
 }
 
+// RoomCapTierForServer collapses the server ladder to the media-plane's binary
+// channel room-cap tier (ADR-0029 amendment): Groundspeed → free, any Mach or
+// selfhost → premium, everything unknown/retired → free (least privilege).
+func TestRoomCapTierForServer(t *testing.T) {
+	premium := []string{
+		entitlements.TierMach1, entitlements.TierMach2, entitlements.TierMach3, entitlements.TierSelfHost,
+	}
+	for _, tier := range premium {
+		t.Run("premium/"+tier, func(t *testing.T) {
+			assert.Equal(t, entitlements.TierPremium, entitlements.RoomCapTierForServer(tier))
+		})
+	}
+	// Groundspeed AND every unknown/empty/mis-cased/retired tier fail closed to free —
+	// a stale/garbage server tier can never grant the premium room cap.
+	free := []string{entitlements.TierGroundspeed, "", "garbage", "MACH", "mach", "Mach1", "premium"}
+	for _, tier := range free {
+		t.Run("free/"+tier, func(t *testing.T) {
+			assert.Equal(t, entitlements.TierFree, entitlements.RoomCapTierForServer(tier))
+		})
+	}
+}
+
 func TestServerSentinels(t *testing.T) {
 	// Two DISTINCT sentinels: Unset = "no decision yet, do not enforce" (#1523);
 	// Unlimited = "explicitly no limit" (selfhost). Both negative, semantically different.

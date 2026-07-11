@@ -187,3 +187,24 @@ func ForServer(serverTier string) ServerEntitlement {
 		return groundspeedServerEntitlement
 	}
 }
+
+// RoomCapTierForServer collapses the server-axis Mach ladder to the media-plane's
+// binary per-room producer-cap tier (user-axis TierFree / TierPremium string).
+// CHANNEL voice rooms provision their egress capacity from the SERVER's
+// subscription — NOT any member's or the owner's personal plan (ADR-0029
+// amendment 2026-07-10): the server subscription is who pays for the room's
+// fan-out, so a premium *member* (or a premium *owner* on a free server) must not
+// raise a large/public channel's cap. Groundspeed → free caps; any Mach boost or
+// selfhost → premium caps. Fails closed to free on unknown/empty/retired tiers,
+// mirroring ForServer's least-privilege default. Pure (no I/O).
+//
+// DM rooms do NOT use this — they resolve the max present-participant tier
+// (ADR-0029 DM branch); only channels key off the server axis.
+func RoomCapTierForServer(serverTier string) string {
+	switch serverTier {
+	case TierMach1, TierMach2, TierMach3, TierSelfHost:
+		return TierPremium
+	default:
+		return TierFree
+	}
+}

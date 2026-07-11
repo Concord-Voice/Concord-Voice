@@ -188,17 +188,16 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 		return
 	}
 
-	// Fetch channel details + verify membership + the server owner in one query
-	var channelName, channelType, serverID, ownerID string
+	// Fetch channel details + verify membership in one query.
+	var channelName, channelType, serverID string
 	var audioQualityTier *string
 	var timedOutUntil sql.NullTime
 	err := h.db.QueryRow(`
-		SELECT c.id, c.name, c.type, c.server_id, c.audio_quality_tier, sm.timed_out_until, s.owner_id
+		SELECT c.id, c.name, c.type, c.server_id, c.audio_quality_tier, sm.timed_out_until
 		FROM channels c
-		INNER JOIN servers s ON s.id = c.server_id
 		INNER JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = $2
 		WHERE c.id = $1
-	`, channelID, userID).Scan(&channelID, &channelName, &channelType, &serverID, &audioQualityTier, &timedOutUntil, &ownerID)
+	`, channelID, userID).Scan(&channelID, &channelName, &channelType, &serverID, &audioQualityTier, &timedOutUntil)
 
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Channel not found or access denied"})
@@ -277,18 +276,29 @@ func (h *Handler) AuthorizeJoin(c *gin.Context) {
 	if audioQualityTier != nil {
 		channelTier = *audioQualityTier
 	}
+	// Resolve the server's Mach tier once and reuse it for both the media
+	// entitlement and the room-cap tier below: same serverID and request
+	// context, so the result is identical, and once #1556 makes serverTier a
+	// real (Redis read-through) resolution this avoids a redundant round-trip
+	// per channel join.
+	serverTier := h.serverTier(c.Request.Context(), serverID)
 	mediaEnt := entitlements.MediaForChannel(
 		h.entCache.GetTier(c.Request.Context(), userID),
-		h.serverTier(c.Request.Context(), serverID),
+		serverTier,
 		channelTier,
 	)
 
-	// Room-scoped producer caps (#1542) follow the SERVER OWNER's tier — the owner
-	// provisions the channel's egress capacity; a premium member's presence must NOT
-	// raise a (large/public) channel's cap. GetTier fails closed to free on any
-	// resolution failure. DMs do NOT carry this field (see dm/handlers.go) — there
+	// Room-scoped producer caps (#1542) follow the SERVER's Mach tier — the server
+	// SUBSCRIPTION provisions the channel's egress capacity, so neither a premium
+	// member nor a premium owner on a free server may raise a (large/public)
+	// channel's cap (ADR-0029 amendment 2026-07-10, superseding the former
+	// server-owner personal-tier resolution). serverTier is the #1556 seam
+	// (Groundspeed today; real Mach when server subscriptions ship) and
+	// RoomCapTierForServer collapses the ladder to the media-plane's binary
+	// free/premium wire, fail-closed to free. The field name stays room_owner_tier
+	// for wire stability. DMs do NOT carry this field (see dm/handlers.go) — there
 	// the media-plane derives the cap from the max present-participant tier.
-	roomOwnerTier := h.entCache.GetTier(c.Request.Context(), ownerID)
+	roomOwnerTier := entitlements.RoomCapTierForServer(serverTier)
 
 	h.log.Info("Voice join authorized", "user_id", sanitizeLogValue(userID), "channel_id", sanitizeLogValue(channelID), "server_id", sanitizeLogValue(serverID), "media_tier", mediaEnt.Tier)
 
