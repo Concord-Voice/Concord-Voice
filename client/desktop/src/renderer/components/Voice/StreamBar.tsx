@@ -1,6 +1,7 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useId } from 'react';
 import { X } from 'lucide-react';
 import { useVoiceStore } from '../../stores/voiceStore';
+import { useRenderStateReporter } from '../../hooks/useRenderStateReporter';
 import './StreamBar.css';
 
 /**
@@ -12,10 +13,37 @@ const StreamThumbnail: React.FC<{
   stream?: MediaStream;
   sharerName: string;
   isPaused?: boolean;
+  /**
+   * Producing user of a REMOTE screen share — set only for a remote share so this
+   * thumbnail's rendered size feeds receiver screen layer demand (#1924). A small
+   * thumbnail viewer is exactly the heterogeneity that lets the SFU forward a lower
+   * layer and, across clients, flip the screen-layering gate. Undefined for a local
+   * share (we never consume our own screen).
+   */
+  sharerUserId?: string;
   onSelect: () => void;
   onTuneOut: () => void;
-}> = ({ producerId: _producerId, stream, sharerName, isPaused = false, onSelect, onTuneOut }) => {
+}> = ({
+  producerId: _producerId,
+  stream,
+  sharerName,
+  isPaused = false,
+  sharerUserId,
+  onSelect,
+  onTuneOut,
+}) => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const tileId = useId();
+
+  // #1924: report this thumbnail's rendered size/visibility for the remote screen.
+  useRenderStateReporter({
+    userId: sharerUserId ?? '',
+    tileId,
+    source: 'screen',
+    elementRef: videoRef,
+    role: 'thumbnail',
+    enabled: !!sharerUserId && !!stream && !isPaused,
+  });
 
   useEffect(() => {
     const el = videoRef.current;
@@ -98,6 +126,7 @@ const StreamBar: React.FC<{ height: number }> = ({ height }) => {
               stream={isLocalSharer && localStreamPaused ? undefined : owner?.screenStream}
               sharerName={sharerName}
               isPaused={isLocalSharer && localStreamPaused}
+              sharerUserId={!isLocalSharer && meta?.userId ? meta.userId : undefined}
               onSelect={() => setDominantScreenShare(producerId)}
               onTuneOut={() => {
                 // Import voiceService lazily to avoid circular dependency

@@ -66,7 +66,8 @@ describe('ParticipantTile visibility-pause (#1541)', () => {
       expect(setRemoteVideoRenderState).toHaveBeenCalledWith(
         'user-A',
         expect.any(String),
-        expect.objectContaining({ visible: false })
+        expect.objectContaining({ visible: false }),
+        'camera'
       )
     );
 
@@ -81,7 +82,8 @@ describe('ParticipantTile visibility-pause (#1541)', () => {
           cssHeight: 360,
           role: 'grid',
           focusedWindow: true,
-        })
+        }),
+        'camera'
       )
     );
 
@@ -102,7 +104,8 @@ describe('ParticipantTile visibility-pause (#1541)', () => {
         expect.objectContaining({
           visible: true,
           role: 'thumbnail',
-        })
+        }),
+        'camera'
       )
     );
   });
@@ -122,7 +125,9 @@ describe('ParticipantTile visibility-pause (#1541)', () => {
     setRemoteVideoRenderState.mockClear();
 
     unmount();
-    await waitFor(() => expect(removeRemoteVideoTile).toHaveBeenCalledWith('user-A', tileKey));
+    await waitFor(() =>
+      expect(removeRemoteVideoTile).toHaveBeenCalledWith('user-A', tileKey, 'camera')
+    );
     ioCallback!([{ isIntersecting: false }]);
     // unmount must NOT report again, including for queued observer callbacks.
     expect(setRemoteVideoRenderState).not.toHaveBeenCalled();

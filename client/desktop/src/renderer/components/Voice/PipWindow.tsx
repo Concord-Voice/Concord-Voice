@@ -352,6 +352,77 @@ const FramesPipContent: React.FC<{
 // ── Screen PiP ──────────────────────────────────────────────────
 
 /**
+ * Report the PiP screen's receiver render-state demand to the SFU for the PiP's OWN
+ * consumer (#1924). Measures the video element's layout box and skips a not-yet-laid-out
+ * (0×0) element — the video is display:none until the stream mounts, so the ResizeObserver
+ * re-fires this with a real size once it is displayed. role:'focus' + focusedWindow:true +
+ * the large PiP size unsticks an H264/VP8 simulcast screen off spatial layer 0. Best-effort:
+ * a failure only costs a lower spatial layer, never a hard error.
+ */
+function reportPipScreenDemand(
+  client: PipVoiceClient,
+  consumerId: string,
+  el: HTMLVideoElement
+): void {
+  const rect = el.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1) return;
+  client
+    .reportPreferredLayers({
+      consumerId,
+      cssWidth: rect.width,
+      cssHeight: rect.height,
+      visible: true,
+      role: 'focus',
+      focusedWindow: true,
+    })
+    .catch((err) => console.error('[ScreenPip] demand report failed:', errorMessage(err)));
+}
+
+/** Trailing debounce for PiP resize-driven demand reports (#1924 review). A continuous
+ *  drag-resize fires the ResizeObserver many times; coalesce the burst into one report. */
+const PIP_SCREEN_DEMAND_DEBOUNCE_MS = 200;
+
+/** Handle returned by observePipScreenDemand: disconnects the ResizeObserver AND clears
+ *  any pending debounced report, so an unmount mid-drag never fires a late RPC (#1924). */
+interface PipScreenDemandHandle {
+  disconnect(): void;
+}
+
+/**
+ * Seed an initial demand report and observe the video element so the report re-fires
+ * once it lays out (display:none → block) and on later PiP resizes (#1924). Resize-driven
+ * reports are debounced (#1924 review) so a continuous drag-resize coalesces into a single
+ * trailing set-preferred-layers RPC over the BroadcastChannel instead of one per fire.
+ * Returns a handle (or null where ResizeObserver is unavailable) for effect cleanup.
+ */
+function observePipScreenDemand(
+  client: PipVoiceClient,
+  consumerId: string,
+  el: HTMLVideoElement
+): PipScreenDemandHandle | null {
+  reportPipScreenDemand(client, consumerId, el);
+  if (typeof ResizeObserver === 'undefined') return null;
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  const observer = new ResizeObserver(() => {
+    if (debounceTimer !== null) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null;
+      reportPipScreenDemand(client, consumerId, el);
+    }, PIP_SCREEN_DEMAND_DEBOUNCE_MS);
+  });
+  observer.observe(el);
+  return {
+    disconnect() {
+      if (debounceTimer !== null) {
+        clearTimeout(debounceTimer);
+        debounceTimer = null;
+      }
+      observer.disconnect();
+    },
+  };
+}
+
+/**
  * Screen Share PiP — single screen share video with real MediaStream
  * via PipVoiceClient's own mediasoup consumer.
  */
@@ -363,6 +434,7 @@ const ScreenPipContent: React.FC<{
 }> = ({ pipId, pinned, onTogglePin, onClose }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const clientRef = useRef<PipVoiceClient | null>(null);
+  const demandObserverRef = useRef<PipScreenDemandHandle | null>(null);
   const [sharerName, setSharerName] = useState('');
   const [loading, setLoading] = useState(true);
   const [hasStream, setHasStream] = useState(false);
@@ -415,6 +487,19 @@ const ScreenPipContent: React.FC<{
 
           // Signal ready — main window will pause its screen consumer
           await client.signalReady();
+
+          // #1924: report screen render-state demand for the PiP's OWN consumer so an
+          // H264/VP8 simulcast screen unsticks off spatial layer 0. The PiP has no
+          // socket; PipVoiceClient proxies the demand to the main window over RPC.
+          const screenConsumerId = client.getConsumerIdBySource('screen', screenProducer.userId);
+          const screenVideoEl = videoRef.current;
+          if (screenConsumerId && screenVideoEl) {
+            demandObserverRef.current = observePipScreenDemand(
+              client,
+              screenConsumerId,
+              screenVideoEl
+            );
+          }
         }
       } catch (err) {
         console.error('[ScreenPip] Init failed:', errorMessage(err));
@@ -428,6 +513,8 @@ const ScreenPipContent: React.FC<{
     const videoEl = videoRef.current;
     const clientEl = clientRef.current;
     return () => {
+      demandObserverRef.current?.disconnect();
+      demandObserverRef.current = null;
       if (videoEl) videoEl.srcObject = null;
       client.dispose().catch(console.error);
       if (clientEl === clientRef.current) clientRef.current = null;

@@ -256,6 +256,13 @@ function resetService(svc: any): void {
   svc.device = { rtpCapabilities: mockDeviceRtpCapabilities, loaded: true };
   svc.socket = mockSocket;
   svc.mediaEncryption = null;
+  // The layering re-produce serializer flags live on the singleton and are NOT
+  // reset by leaving/rejoining; clear them so an in-flight drain from a prior
+  // test never queues (pending) the next test's schedule.
+  svc.cameraLayeringReproduceInFlight = false;
+  svc.cameraLayeringReproducePending = false;
+  svc.screenLayeringReproduceInFlight = false;
+  svc.screenLayeringReproducePending = false;
   // Stub helpers that are incidental to the track-lifecycle bug.
   svc.ensureOsPermission = vi.fn().mockResolvedValue('granted');
   svc.applyDegradationPreference = vi.fn();
@@ -269,6 +276,18 @@ function resetService(svc: any): void {
     encodings: [{ maxBitrate: 1_500_000 }],
     effectiveBitrate: 1_500_000,
   });
+}
+
+/**
+ * Register the real socket handlers on the mock socket and return the callback
+ * bound to `event`. setupSocketListeners only registers callbacks (never invokes
+ * them), so it is safe against the mock socket.
+ */
+function getSocketHandler(svc: any, event: string): (payload: unknown) => void {
+  svc.setupSocketListeners();
+  const call = mockSocket.on.mock.calls.find((c: unknown[]) => c[0] === event);
+  if (!call) throw new Error(`no handler registered for ${event}`);
+  return call[1] as (payload: unknown) => void;
 }
 
 describe('voiceService camera/screen re-produce track lifecycle', () => {
@@ -428,5 +447,179 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
       expect.stringContaining('drain failed')
     );
     errSpy.mockRestore();
+  });
+
+  // ── #1924 server-gated simulcast screenshare ────────────────────────────────
+  // The media-plane's screen-layering-gate flips this.screenLayeringEnabled, which
+  // reproduces the local screen with new simulcast eligibility via fastReproduceScreen
+  // (stopTracks:false). A client can NEVER publish simulcast screen unilaterally.
+
+  it('screen-layering-gate {enabled:true} reproduces screen, keeping the reused track alive', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+
+    // The service is a singleton; pin the starting gate state (resetService does not).
+    svc.screenLayeringEnabled = false;
+
+    const screenTrack = makeVideoTrack('screen-track');
+    svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([screenTrack]));
+    await svc.produceScreen('window:1:0');
+    const original = svc.producers.get('screen');
+    expect(svc.screenLayeringEnabled).toBe(false);
+
+    const handler = getSocketHandler(svc, 'screen-layering-gate');
+    const reproSpy = vi.spyOn(svc, 'fastReproduceScreen');
+
+    handler({ enabled: true });
+    expect(svc.screenLayeringEnabled, 'gate flips the client flag on').toBe(true);
+    expect(reproSpy).toHaveBeenCalledTimes(1);
+    await reproSpy.mock.results[0].value;
+
+    const reproduced = svc.producers.get('screen');
+    expect(reproduced.id, 'screen producer swapped on gate flip').not.toBe(original.id);
+    expect(screenTrack.readyState, 'reused screen track survives (stopTracks:false)').toBe('live');
+
+    // Idempotent: a same-value gate event does NOT reproduce again.
+    handler({ enabled: true });
+    expect(reproSpy).toHaveBeenCalledTimes(1);
+    reproSpy.mockRestore();
+  });
+
+  it('screen-layering-gate {enabled:false} reproduces screen back toward a single encode', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+
+    const screenTrack = makeVideoTrack('screen-track');
+    svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([screenTrack]));
+    await svc.produceScreen('window:1:0');
+    const original = svc.producers.get('screen');
+    // Simulcast screen currently live (gate was on).
+    svc.screenLayeringEnabled = true;
+
+    const handler = getSocketHandler(svc, 'screen-layering-gate');
+    const reproSpy = vi.spyOn(svc, 'fastReproduceScreen');
+
+    handler({ enabled: false });
+    expect(svc.screenLayeringEnabled, 'gate-off clears the client flag').toBe(false);
+    expect(reproSpy).toHaveBeenCalledTimes(1);
+    await reproSpy.mock.results[0].value;
+
+    const reproduced = svc.producers.get('screen');
+    expect(reproduced.id).not.toBe(original.id);
+    expect(screenTrack.readyState, 'reused screen track survives').toBe('live');
+    reproSpy.mockRestore();
+  });
+
+  it('supportSimulcast toggle reproduces screen ONLY when the gate is enabled', () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    svc.producers.set(
+      'screen',
+      makeMockProducer({ track: makeVideoTrack('s'), stopTracks: false, source: 'screen' })
+    );
+    const reproSpy = vi.spyOn(svc, 'fastReproduceScreen').mockResolvedValue(undefined);
+
+    const prev = {
+      screenSharePriority: 'off',
+      screenShareBitrate: 0,
+      supportSvc: true,
+      supportSimulcast: false,
+    };
+    const next = { ...prev, supportSimulcast: true };
+
+    // Gate OFF → a supportSimulcast flip is a no-op for screen (no wasteful reproduce).
+    svc.screenLayeringEnabled = false;
+    svc.applyScreenShareSettingsChange(next, prev);
+    expect(reproSpy).not.toHaveBeenCalled();
+
+    // Gate ON → the supportSimulcast flip now governs screen and reproduces it.
+    svc.screenLayeringEnabled = true;
+    svc.applyScreenShareSettingsChange(next, prev);
+    expect(reproSpy).toHaveBeenCalledTimes(1);
+    reproSpy.mockRestore();
+  });
+
+  // The gate-flip reproduce goes through fastReproduceScreen (stopTracks:false), so the
+  // reproduced screen producer's close() no longer stops the capture track. An E2EE
+  // encrypt-transform failure on that producer MUST stop the owning screen capture
+  // stream itself (CWE-212), same as the parametrized failClosedCases('screen') above.
+  it('fail-closed E2EE on the gate-reproduced screen producer stops the screen capture (CWE-212)', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    // The service is a singleton; pin the starting gate state (resetService does not).
+    svc.screenLayeringEnabled = false;
+
+    const screenTrack = makeVideoTrack('screen-track');
+    svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([screenTrack]));
+    await svc.produceScreen('window:1:0');
+
+    const handler = getSocketHandler(svc, 'screen-layering-gate');
+    const reproSpy = vi.spyOn(svc, 'fastReproduceScreen');
+    handler({ enabled: true });
+    await reproSpy.mock.results[0].value;
+    reproSpy.mockRestore();
+    expect(svc.localScreenStream, 'capture stream survives the reproduce').not.toBeNull();
+
+    // A producer with no rtpSender forces failClosedEncryptTransform('no rtpSender').
+    const failing = makeMockProducer({
+      track: screenTrack,
+      stopTracks: false,
+      source: 'screen',
+      withRtpSender: false,
+    });
+    expect(() => svc.applyEncryptTransform(failing)).toThrow(/encrypt transform/);
+    expect(screenTrack.readyState, 'screen capture must be stopped on fail-closed').toBe('ended');
+    expect(svc.localScreenStream, 'localScreenStream released on fail-closed').toBeNull();
+  });
+
+  // Rapid gate edges (or a slow SDP/produce racing a demand edge / Support-Simulcast
+  // toggle) must NOT overlap two fastReproduceScreen calls — two concurrent reproduces
+  // both close the single 'screen' producer and produce() twice (duplicate producer /
+  // 'track ended'). The screen re-produce serializer (mirroring camera) coalesces the
+  // second edge into a single queued drain that runs AFTER the first completes.
+  it('serializes rapid screen-layering-gate edges into one queued drain (no overlap)', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    // The service is a singleton; pin the starting gate state (resetService does not).
+    svc.screenLayeringEnabled = false;
+
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const resolvers: Array<() => void> = [];
+    const reproSpy = vi.spyOn(svc, 'fastReproduceScreen').mockImplementation(() => {
+      concurrent++;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      return new Promise<void>((resolve) => {
+        resolvers.push(() => {
+          concurrent--;
+          resolve();
+        });
+      });
+    });
+
+    const handler = getSocketHandler(svc, 'screen-layering-gate');
+
+    // Edge 1 (false→true) starts a reproduce that is now in-flight.
+    handler({ enabled: true });
+    expect(reproSpy).toHaveBeenCalledTimes(1);
+
+    // Edge 2 (true→false) lands while the first reproduce is still in-flight: it must
+    // QUEUE behind it, NOT start a second concurrent fastReproduceScreen.
+    handler({ enabled: false });
+    expect(reproSpy, 'second edge queues behind the in-flight reproduce').toHaveBeenCalledTimes(1);
+
+    // Complete the first reproduce → the queued edge drains as a SECOND, serial call.
+    resolvers[0]();
+    await flush();
+    expect(reproSpy, 'queued edge drains after the first completes').toHaveBeenCalledTimes(2);
+
+    // Complete the second; the queue empties with no overlap ever observed.
+    resolvers[1]();
+    await flush();
+    expect(maxConcurrent, 'reproduces never overlapped').toBe(1);
+
+    reproSpy.mockRestore();
   });
 });

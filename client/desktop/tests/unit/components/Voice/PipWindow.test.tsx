@@ -20,6 +20,8 @@ const mockDispose = vi.fn().mockResolvedValue(undefined);
 const mockAction = vi.fn().mockResolvedValue(undefined);
 const mockConsume = vi.fn().mockResolvedValue(null);
 const mockSignalReady = vi.fn().mockResolvedValue(undefined);
+const mockGetConsumerIdBySource = vi.fn().mockReturnValue(null);
+const mockReportPreferredLayers = vi.fn().mockResolvedValue(undefined);
 let mockOnStateUpdate: ((msg: any) => void) | null = null;
 
 vi.mock('@/renderer/services/pipVoiceClient', () => ({
@@ -29,6 +31,8 @@ vi.mock('@/renderer/services/pipVoiceClient', () => ({
     this.action = mockAction;
     this.consume = mockConsume;
     this.signalReady = mockSignalReady;
+    this.getConsumerIdBySource = mockGetConsumerIdBySource;
+    this.reportPreferredLayers = mockReportPreferredLayers;
     this.getStreams = vi.fn().mockReturnValue(new Map());
     this.getStreamBySource = vi.fn().mockReturnValue(null);
     Object.defineProperty(this, 'onStateUpdate', {
@@ -544,6 +548,153 @@ describe('PipWindow', () => {
       });
 
       HTMLVideoElement.prototype.play = originalPlay;
+    });
+
+    it('reports focus-role screen demand for the PiP consumer once laid out (#1924)', async () => {
+      mockConsume.mockResolvedValue({ id: 'stream-1' });
+      mockGetConsumerIdBySource.mockReturnValue('pip-screen-c1');
+
+      const originalPlay = HTMLVideoElement.prototype.play;
+      HTMLVideoElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+      // jsdom returns a 0-size rect by default; simulate the laid-out focus tile so the
+      // demand carries a large size (spatial layer > 0), the whole point of the fix.
+      const originalRect = HTMLVideoElement.prototype.getBoundingClientRect;
+      HTMLVideoElement.prototype.getBoundingClientRect = vi.fn().mockReturnValue({
+        width: 1920,
+        height: 1080,
+        top: 0,
+        left: 0,
+        right: 1920,
+        bottom: 1080,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      } as DOMRect);
+
+      render(<PipWindow />);
+
+      await waitFor(() => {
+        expect(mockGetConsumerIdBySource).toHaveBeenCalledWith('screen', 'user-2');
+        expect(mockReportPreferredLayers).toHaveBeenCalledWith({
+          consumerId: 'pip-screen-c1',
+          cssWidth: 1920,
+          cssHeight: 1080,
+          visible: true,
+          role: 'focus',
+          focusedWindow: true,
+        });
+      });
+
+      HTMLVideoElement.prototype.play = originalPlay;
+      HTMLVideoElement.prototype.getBoundingClientRect = originalRect;
+    });
+
+    it('skips the screen demand report when no PiP consumer id resolves (#1924)', async () => {
+      mockConsume.mockResolvedValue({ id: 'stream-1' });
+      mockGetConsumerIdBySource.mockReturnValue(null);
+
+      const originalPlay = HTMLVideoElement.prototype.play;
+      HTMLVideoElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+
+      render(<PipWindow />);
+
+      await waitFor(() => {
+        expect(mockSignalReady).toHaveBeenCalled();
+      });
+      expect(mockReportPreferredLayers).not.toHaveBeenCalled();
+
+      HTMLVideoElement.prototype.play = originalPlay;
+    });
+
+    // FIX #5 — the ResizeObserver-driven demand report is debounced so a continuous
+    // drag-resize coalesces into a single trailing RPC (instead of one per RO fire).
+    describe('resize demand throttle (#1924 review)', () => {
+      let roCb: (() => void) | null;
+      let savedRO: typeof window.ResizeObserver;
+      let originalPlay: typeof HTMLVideoElement.prototype.play;
+      let originalRect: typeof HTMLVideoElement.prototype.getBoundingClientRect;
+
+      beforeEach(() => {
+        mockConsume.mockResolvedValue({ id: 'stream-1' });
+        mockGetConsumerIdBySource.mockReturnValue('pip-screen-c1');
+        originalPlay = HTMLVideoElement.prototype.play;
+        HTMLVideoElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+        originalRect = HTMLVideoElement.prototype.getBoundingClientRect;
+        HTMLVideoElement.prototype.getBoundingClientRect = vi.fn().mockReturnValue({
+          width: 1920,
+          height: 1080,
+          top: 0,
+          left: 0,
+          right: 1920,
+          bottom: 1080,
+          x: 0,
+          y: 0,
+          toJSON: () => ({}),
+        } as DOMRect);
+
+        roCb = null;
+        savedRO = window.ResizeObserver;
+        class CaptureRO {
+          constructor(cb: () => void) {
+            roCb = cb;
+          }
+          observe = vi.fn();
+          unobserve = vi.fn();
+          disconnect = vi.fn();
+        }
+        (window as unknown as { ResizeObserver: unknown }).ResizeObserver = CaptureRO;
+      });
+
+      afterEach(() => {
+        vi.useRealTimers();
+        (window as unknown as { ResizeObserver: unknown }).ResizeObserver = savedRO;
+        HTMLVideoElement.prototype.play = originalPlay;
+        HTMLVideoElement.prototype.getBoundingClientRect = originalRect;
+      });
+
+      it('coalesces a rapid drag-resize into a single trailing demand report', async () => {
+        render(<PipWindow />);
+
+        // The initial (non-debounced) report fires and the ResizeObserver is created.
+        await waitFor(() => {
+          expect(roCb).toBeTypeOf('function');
+          expect(mockReportPreferredLayers).toHaveBeenCalledTimes(1);
+        });
+
+        mockReportPreferredLayers.mockClear();
+        vi.useFakeTimers();
+
+        // A continuous drag fires the ResizeObserver many times in quick succession.
+        roCb?.();
+        roCb?.();
+        roCb?.();
+        roCb?.();
+        roCb?.();
+        // Nothing yet — the trailing debounce window has not elapsed.
+        expect(mockReportPreferredLayers).not.toHaveBeenCalled();
+
+        vi.advanceTimersByTime(250);
+        // The whole burst collapses to exactly one report at the trailing edge.
+        expect(mockReportPreferredLayers).toHaveBeenCalledTimes(1);
+      });
+
+      it('clears the pending resize debounce on unmount (no late RPC)', async () => {
+        const { unmount } = render(<PipWindow />);
+
+        await waitFor(() => {
+          expect(roCb).toBeTypeOf('function');
+          expect(mockReportPreferredLayers).toHaveBeenCalledTimes(1);
+        });
+
+        mockReportPreferredLayers.mockClear();
+        vi.useFakeTimers();
+
+        roCb?.(); // schedule a trailing report
+        unmount(); // effect cleanup disconnects the handle, clearing the pending timer
+        vi.advanceTimersByTime(250);
+
+        expect(mockReportPreferredLayers).not.toHaveBeenCalled();
+      });
     });
 
     it('closes on producer-closed broadcast for matching producerId', async () => {

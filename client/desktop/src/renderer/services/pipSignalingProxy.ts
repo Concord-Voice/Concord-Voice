@@ -31,6 +31,17 @@ import { useVoiceStore } from '../stores/voiceStore';
 import { useUserStore } from '../stores/userStore';
 import { errorMessage } from '../utils/redactError';
 import type { RtpCapabilities } from 'mediasoup-client/types';
+import type { RemoteVideoRole } from './remoteVideoLayerPolicy';
+
+/** Render-state demand for a specific consumer (#1924) — mirrors voiceService's
+ *  private RemoteVideoTileRenderState so the PiP proxy can forward it structurally. */
+interface PipConsumerRenderState {
+  visible: boolean;
+  cssWidth: number;
+  cssHeight: number;
+  role: RemoteVideoRole;
+  focusedWindow: boolean;
+}
 
 // Type for voiceService — imported lazily to avoid circular deps
 type VoiceService = {
@@ -40,6 +51,7 @@ type VoiceService = {
   getConsumerMeta(): Map<string, { source: string; producerUserId: string; producerId: string }>;
   pauseConsumer(consumerId: string): void;
   resumeConsumer(consumerId: string): void;
+  emitPreferredLayersForConsumer(consumerId: string, renderState: PipConsumerRenderState): void;
   toggleMute(): Promise<void>;
   toggleDeafen(): void;
   toggleVideo(): Promise<void>;
@@ -138,6 +150,9 @@ export class PipSignalingProxy {
           break;
         case 'pause-consumer':
           await this.handlePauseConsumer(req);
+          break;
+        case 'set-preferred-layers':
+          this.handleSetPreferredLayers(req);
           break;
         case 'action':
           await this.handleAction(req);
@@ -247,6 +262,34 @@ export class PipSignalingProxy {
     const params = (req as { params: { consumerId: string } }).params;
     await this.voiceService.forwardToServer('pause-consumer', {
       consumerId: params.consumerId,
+    });
+    this.respond(req.id, { success: true });
+  }
+
+  /**
+   * #1924: a PiP window reports render-state demand for its OWN consumer. Address that
+   * consumer id directly via the main window's socket — do NOT resolve by user, which
+   * would target the main window's now-PAUSED screen consumer (the wrong one).
+   */
+  private handleSetPreferredLayers(req: AnyPipRpcRequest): void {
+    const params = (
+      req as {
+        params: {
+          consumerId: string;
+          cssWidth: number;
+          cssHeight: number;
+          visible: boolean;
+          role: RemoteVideoRole;
+          focusedWindow: boolean;
+        };
+      }
+    ).params;
+    this.voiceService.emitPreferredLayersForConsumer(params.consumerId, {
+      visible: params.visible,
+      cssWidth: params.cssWidth,
+      cssHeight: params.cssHeight,
+      role: params.role,
+      focusedWindow: params.focusedWindow,
     });
     this.respond(req.id, { success: true });
   }

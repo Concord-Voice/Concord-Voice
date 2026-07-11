@@ -80,6 +80,7 @@ const defaultRpcResponses: Record<string, unknown> = {
   },
   'resume-consumer': { success: true },
   'pause-consumer': { success: true },
+  'set-preferred-layers': { success: true },
   action: { success: true },
   'pip-ready': { success: true, pausedCount: 0 },
   'pip-closing': { success: true },
@@ -382,6 +383,66 @@ describe('PipVoiceClient', () => {
     it('getStreamBySource returns null for no match', async () => {
       const stream = client.getStreamBySource('camera', 'user-1');
       expect(stream).toBeNull();
+    });
+  });
+
+  // ── getConsumerIdBySource & reportPreferredLayers (#1924) ────────────
+  describe('getConsumerIdBySource & reportPreferredLayers', () => {
+    beforeEach(async () => {
+      client = new PipVoiceClient('screen-prod-1');
+      setupAutoResponder();
+      await client.init();
+    });
+
+    it('getConsumerIdBySource returns the SFU consumer id for a matching source/user', async () => {
+      await client.consume('prod-1', 'screen', 'user-1');
+      expect(client.getConsumerIdBySource('screen', 'user-1')).toBe('consumer-1');
+    });
+
+    it('getConsumerIdBySource returns null for no match', async () => {
+      await client.consume('prod-1', 'screen', 'user-1');
+      expect(client.getConsumerIdBySource('screen', 'user-2')).toBeNull();
+      expect(client.getConsumerIdBySource('camera', 'user-1')).toBeNull();
+    });
+
+    it('reportPreferredLayers proxies a set-preferred-layers RPC with the consumer id + payload', async () => {
+      await client.consume('prod-1', 'screen', 'user-1');
+      await client.reportPreferredLayers({
+        consumerId: 'consumer-1',
+        cssWidth: 1920,
+        cssHeight: 1080,
+        visible: true,
+        role: 'focus',
+        focusedWindow: true,
+      });
+
+      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
+      const msg = ch?.posted.find(
+        (m: any) => m.kind === 'rpc-request' && m.method === 'set-preferred-layers'
+      ) as any;
+      expect(msg).toBeDefined();
+      expect(msg.params).toEqual({
+        consumerId: 'consumer-1',
+        cssWidth: 1920,
+        cssHeight: 1080,
+        visible: true,
+        role: 'focus',
+        focusedWindow: true,
+      });
+    });
+
+    it('reportPreferredLayers rejects when disposed (best-effort caller handles it)', async () => {
+      await client.dispose();
+      await expect(
+        client.reportPreferredLayers({
+          consumerId: 'consumer-1',
+          cssWidth: 1,
+          cssHeight: 1,
+          visible: true,
+          role: 'focus',
+          focusedWindow: true,
+        })
+      ).rejects.toThrow('PipVoiceClient disposed');
     });
   });
 

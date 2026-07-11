@@ -7,6 +7,7 @@ import { useVoiceStore, type VoiceParticipant } from '../../stores/voiceStore';
 import { useMemberStore } from '../../stores/memberStore';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 import { useUserThemeScope } from '../../hooks/useUserThemeScope';
+import { useRenderStateReporter } from '../../hooks/useRenderStateReporter';
 import './ParticipantTile.css';
 
 interface ParticipantTileProps {
@@ -253,70 +254,18 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
   // (grid + bar + PiP), so the voice service tracks visibility per tile, not per user.
   const tileId = useId();
 
-  // #1541 visibility-pause: report this remote camera tile's render state to the
-  // voice service, which pauses the SFU consumer (egress cut) when off-screen.
-  // Declared after `hasVideo` so the deps array does not hit its temporal dead zone.
-  useEffect(() => {
-    if (isLocal || !hasVideo) return;
-    const el = tileRef.current;
-    if (!el) return;
-    let disposed = false;
-    let svc: {
-      setRemoteVideoRenderState(
-        userId: string,
-        tileId: string,
-        state: {
-          visible: boolean;
-          cssWidth: number;
-          cssHeight: number;
-          role: 'thumbnail' | 'grid' | 'focus';
-          focusedWindow: boolean;
-        }
-      ): void;
-      removeRemoteVideoTile(userId: string, tileId: string): void;
-    } | null = null;
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (disposed || !svc) return;
-        const rect = el.getBoundingClientRect();
-        svc.setRemoteVideoRenderState(participant.userId, tileId, {
-          visible: entry.isIntersecting,
-          cssWidth: rect.width,
-          cssHeight: rect.height,
-          role: compact ? 'thumbnail' : 'grid',
-          focusedWindow: document.visibilityState !== 'hidden',
-        });
-      },
-      { threshold: 0 }
-    );
-    void import('../../services/voiceService')
-      .then((m) => {
-        if (disposed) return;
-        const candidate = m.voiceService as Partial<NonNullable<typeof svc>>;
-        if (
-          typeof candidate.setRemoteVideoRenderState !== 'function' ||
-          typeof candidate.removeRemoteVideoTile !== 'function'
-        ) {
-          return;
-        }
-        svc = {
-          setRemoteVideoRenderState: candidate.setRemoteVideoRenderState.bind(candidate),
-          removeRemoteVideoTile: candidate.removeRemoteVideoTile.bind(candidate),
-        };
-        observer.observe(el);
-      })
-      .catch((err: unknown) => {
-        // Tile visibility is an optimization; ignore late import teardown races.
-        if (!disposed) console.debug('Voice tile visibility reporter unavailable', err);
-      });
-    return () => {
-      disposed = true;
-      observer.disconnect();
-      // Deregister this tile (NOT "report hidden") so a closing tile doesn't freeze
-      // video still visible in another surface (grid / bar / PiP).
-      svc?.removeRemoteVideoTile(participant.userId, tileId);
-    };
-  }, [compact, isLocal, hasVideo, participant.userId, tileId]);
+  // #1541 visibility-pause / #1924 layer demand: report this remote camera tile's
+  // render state to the voice service, which pauses the SFU consumer (egress cut)
+  // when off-screen and drives receiver camera layer demand. The observer lives in
+  // the shared useRenderStateReporter hook (also serves the screen surfaces).
+  useRenderStateReporter({
+    userId: participant.userId,
+    tileId,
+    source: 'camera',
+    elementRef: tileRef,
+    role: compact ? 'thumbnail' : 'grid',
+    enabled: !isLocal && hasVideo,
+  });
   const memberColorScheme = useMemberStore((state) => {
     const member = state.members.find((m) => m.user_id === participant.userId);
     return member?.color_scheme;

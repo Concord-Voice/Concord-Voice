@@ -11,6 +11,7 @@
 
 import type { VoiceParticipant } from '../stores/voiceStore';
 import type { RtpCapabilities, RtpParameters, DtlsParameters } from 'mediasoup-client/types';
+import type { RemoteVideoRole } from './remoteVideoLayerPolicy';
 
 // ── RPC Request/Response ────────────────────────────────────────────
 
@@ -88,6 +89,25 @@ export type PauseConsumerRequest = PipRpcRequest<
   }
 >;
 
+/**
+ * Report receiver render-state demand for one of THIS PiP's own consumers (#1924).
+ * A PiP window has a socket-less voiceService, so it can't emit set-preferred-layers
+ * itself; it proxies this to the main window, which addresses the PiP's OWN consumer
+ * id on the SFU. Without it an H264/VP8 simulcast screen stays stuck at spatial
+ * layer 0 in the PiP.
+ */
+export type SetPreferredLayersRequest = PipRpcRequest<
+  'set-preferred-layers',
+  {
+    consumerId: string;
+    cssWidth: number;
+    cssHeight: number;
+    visible: boolean;
+    role: RemoteVideoRole;
+    focusedWindow: boolean;
+  }
+>;
+
 /** Request current voice state (participants, screen shares, etc.) */
 export type RequestStateRequest = PipRpcRequest<'request-state', Record<string, never>>;
 export interface VoiceStateResult {
@@ -131,6 +151,7 @@ export type AnyPipRpcRequest =
   | ConsumeRequest
   | ResumeConsumerRequest
   | PauseConsumerRequest
+  | SetPreferredLayersRequest
   | RequestStateRequest
   | ActionRequest
   | PipReadyRequest

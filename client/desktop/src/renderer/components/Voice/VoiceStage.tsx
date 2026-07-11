@@ -1,6 +1,8 @@
-import React, { useRef, useEffect, useCallback } from 'react';
+import React, { useRef, useEffect, useCallback, useId } from 'react';
 import { ChevronLeft, ChevronRight, PictureInPicture2, LayoutGrid, Focus } from 'lucide-react';
 import { useVoiceStore } from '../../stores/voiceStore';
+import { useRenderStateReporter } from '../../hooks/useRenderStateReporter';
+import type { RemoteVideoRole } from '../../services/remoteVideoLayerPolicy';
 import { ScreenShareAudioControls } from './ScreenShareAudioControls';
 import './VoiceStage.css';
 
@@ -20,8 +22,38 @@ const StageVideo: React.FC<{
    * one (#2162). Undefined = no control (local share, or no screen audio).
    */
   audioControlUserId?: string;
-}> = ({ stream, sharerName, showOverlay = true, label, isPaused = false, audioControlUserId }) => {
+  /**
+   * Producing user of a REMOTE screen share this cell renders — set only for a
+   * remote share so this cell's rendered size feeds receiver screen layer demand
+   * (#1924). Undefined for a local share (we never consume our own screen).
+   */
+  sharerUserId?: string;
+  /** Render-size role bucket for the screen demand report (#1924). */
+  renderRole?: RemoteVideoRole;
+}> = ({
+  stream,
+  sharerName,
+  showOverlay = true,
+  label,
+  isPaused = false,
+  audioControlUserId,
+  sharerUserId,
+  renderRole = 'focus',
+}) => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const tileId = useId();
+
+  // #1924: report this cell's rendered size/visibility for the remote screen so the
+  // SFU can forward each viewer its smallest-sufficient layer and flip the screen
+  // layering gate on heterogeneous demand. Inert for a local share (no sharerUserId).
+  useRenderStateReporter({
+    userId: sharerUserId ?? '',
+    tileId,
+    source: 'screen',
+    elementRef: videoRef,
+    role: renderRole,
+    enabled: !!sharerUserId && !!stream && !isPaused,
+  });
 
   useEffect(() => {
     const el = videoRef.current;
@@ -160,6 +192,11 @@ const VoiceStage: React.FC = () => {
                 sharerName={name}
                 isPaused={isLocal && localStreamPaused}
                 audioControlUserId={!isLocal && hasScreenAudio && userId ? userId : undefined}
+                sharerUserId={!isLocal && userId ? userId : undefined}
+                // A single equal-layout share fills the stage, so it should demand the
+                // focus layer (grid caps at layer 1); only ramp down to 'grid' once there
+                // are multiple equal-weight cells (#1924).
+                renderRole={hasMultiple ? 'grid' : 'focus'}
               />
             );
           })}
@@ -177,6 +214,8 @@ const VoiceStage: React.FC = () => {
         sharerName={dominantSharerName}
         showOverlay={false}
         isPaused={isDominantLocal && localStreamPaused}
+        sharerUserId={!isDominantLocal ? dominant?.userId : undefined}
+        renderRole="focus"
       />
 
       {/* Bottom overlay */}

@@ -127,6 +127,10 @@ interface RemoteVideoLayerPayload extends RemoteVideoTileRenderState, RemoteVide
 
 type CameraPressureLayerRequestResult = 'emitted' | 'handled' | 'fallback';
 
+/** Which layered video surface a render-state report / demand emit targets (#1924).
+ *  Camera and screen keep independent demand maps + server gates. */
+type RemoteVideoSource = 'camera' | 'screen';
+
 interface TestSuspensionRestorePolicy {
   keepAudioOutPaused: boolean;
   keepProducersPaused: boolean;
@@ -203,6 +207,15 @@ function handleScreenCaptureNotAllowed(captureErr: unknown): boolean {
 /** Sentinel consumerId marking the LOCAL user's own screen share in
  *  tunedInScreenShares — there is no real consumer for your own stream. */
 const LOCAL_SCREEN_CONSUMER_ID = 'local-screen';
+
+/** Window (ms) during which a screensharer's producer-close immediately followed by
+ *  a new screen announce is treated as a REPRODUCE (a fastReproduceScreen codec-floor
+ *  or screen-layering-gate swap that closes the old producer and re-announces a new
+ *  one) rather than a genuine stop. A viewer who was tuned into the closing producer
+ *  auto-re-tunes-in to the new producer within this window — bypassing the
+ *  autoTuneInScreenShares opt-in and preserving dominance — while a re-announce later
+ *  than the window falls back to the normal opt-in path (#1924 review fix A). */
+const SCREEN_REPRODUCE_RETUNE_WINDOW_MS = 3_000;
 
 /** Update voice/user stores when screen sharing starts. */
 function updateStoreForScreenShare(producerId: string, screenStream: MediaStream | null): void {
@@ -1016,11 +1029,15 @@ class VoiceService {
   }
 
   /**
-   * Pick the best codec for screen sharing. Screen honors the SVC half of the
-   * casting toggles only (#1921): AV1/VP9 screen → SVC (1 encoding, server-passive,
-   * cost-neutral), H264/VP8 → single. Simulcast is hard-forced off for screen in v1
-   * — there is no media-plane screen-layering gate yet, so full simulcast-screenshare
-   * parity is deferred to a follow-up issue. SVC is one stream → no server gate needed.
+   * Pick the best codec for screen sharing. Screen honors BOTH casting toggles,
+   * but simulcast is server-gated (#1924): AV1/VP9 screen → SVC (1 encoding,
+   * server-passive, cost-neutral, ungated); H264/VP8 screen → 3-RID simulcast ONLY
+   * when `supportSimulcast` AND the media-plane's `screen-layering-gate` are both on
+   * (`this.screenLayeringEnabled`), else a single encode. The gate is
+   * server-authoritative — a client can never publish simulcast screen unilaterally
+   * (the `risk: security` capacity guardrail). AV1+simulcast stays structurally
+   * unreachable via `castingKindForCodec` (AV1 → svc), so an AV1 screen is never
+   * simulcast regardless of the gate.
    *
    * Cascade: user pref → AV1 → HEVC → H264 High → VP9:2 (HDR) → H264 → VP9 → VP8
    * Two-pass: HW-accelerated first, then SW fallback.
@@ -1033,7 +1050,6 @@ class VoiceService {
     const vs = useVideoSettingsStore.getState();
     const prio = vs.screenSharePriority;
     const userBitrate = vs.screenShareBitrate; // 0 = auto
-    const bitrate = userBitrate || this.calculateScreenBitrate();
 
     const codec = selectCodecFromCascade({
       preferred: vs.preferredVideoCodec,
@@ -1045,19 +1061,65 @@ class VoiceService {
     const base: Partial<mediasoupTypes.RtpEncodingParameters> =
       prio === 'off' ? {} : { priority: prio, networkPriority: prio };
 
+    // #1924: pick from the SVC-first ladder instead of feeding the plain-cascade codec
+    // straight in. Without this, an AV1 cascade pick that is SVC-INELIGIBLE (Support SVC
+    // off) collapses to a single stream even when the gate wants simulcast; the ladder
+    // instead descends past AV1/VP9 to H264/VP8 → real simulcast.
+    const layeringCodec = this.pickScreenLayeringCodec(codec);
+
+    // #1924 review fix: derive the auto bitrate from the codec the ladder ACTUALLY
+    // publishes (layeringCodec), NOT the preferred/cascade codec. calculateScreenBitrate
+    // is codec-dependent (efficient codecs use 0.04 bits/px vs. 0.07 for H264/VP8), so
+    // computing it before the AV1→VP8 ladder swap under-budgeted a VP8/H264 screen. A
+    // non-zero user override is honored verbatim and never re-derived.
+    const bitrate = userBitrate || this.calculateScreenBitrate(layeringCodec?.mimeType ?? null);
+
     const plan = buildCameraEncodingPlan({
-      codec,
+      codec: layeringCodec,
       maxBitrate: bitrate,
       scalabilityMode: vs.scalabilityMode,
       priority: base,
-      eligibility: { svc: vs.supportSvc, simulcast: false },
+      // #1924: simulcast screen is server-gated. Both the user toggle AND the
+      // media-plane's screen-layering-gate (this.screenLayeringEnabled) must be
+      // on — a client can never publish simulcast screen unilaterally.
+      eligibility: {
+        svc: vs.supportSvc,
+        simulcast: vs.supportSimulcast && this.screenLayeringEnabled,
+      },
     });
 
     return {
-      codec,
+      codec: layeringCodec,
       encodings: plan.encodings,
       effectiveBitrate: bitrate,
     };
+  }
+
+  /**
+   * Screen counterpart of `pickCameraLayeringCodec`. Walks the same SVC-first ladder
+   * and returns the first codec whose casting kind is eligible under the SCREEN
+   * eligibility set — where simulcast is additionally gated on the media-plane's
+   * `screen-layering-gate` (`this.screenLayeringEnabled`). So when Support SVC is off
+   * and the gate wants simulcast, the ladder skips the SVC-only AV1/VP9 entries and
+   * lands on H264/VP8 → real simulcast, rather than collapsing to a single stream. User
+   * preference participates only through `fallbackCodec` (the plain-cascade pick).
+   */
+  private pickScreenLayeringCodec(
+    fallbackCodec?: mediasoupTypes.RtpCodecCapability
+  ): mediasoupTypes.RtpCodecCapability | undefined {
+    const vs = useVideoSettingsStore.getState();
+    const eligibility = {
+      svc: vs.supportSvc,
+      simulcast: vs.supportSimulcast && this.screenLayeringEnabled,
+    };
+    const candidates = ['video/AV1', 'video/VP9', 'video/H264:640034', 'video/H264', 'video/VP8'];
+    for (const key of candidates) {
+      if (!isCastingEligible(castingKindForCodec(key.split(':')[0]), eligibility)) continue;
+      if (!this.isInCodecFloor(key)) continue;
+      const codec = this.findSendCodec(key);
+      if (codec) return codec;
+    }
+    return fallbackCodec;
   }
 
   /**
@@ -1195,13 +1257,19 @@ class VoiceService {
     if (state.screenShareBitrate !== prev.screenShareBitrate) {
       this.liveUpdateScreenBitrate(screenProducer, state.screenShareBitrate);
     }
-    // SVC/Simulcast casting toggles (#1921): screenshare is SVC-only in v1
-    // (pickScreenCodec forces eligibility.simulcast=false), so only a supportSvc
-    // change can alter the screen plan — a supportSimulcast flip is a no-op for
-    // screen and must NOT trigger a wasteful reproduce. fastReproduceScreen rides
-    // the existing stopTracks:false (#1902) + fail-closed capture-stop (CWE-212) path.
-    if (state.supportSvc !== prev.supportSvc) {
-      this.fastReproduceScreen();
+    // SVC/Simulcast casting toggles: a supportSvc change always affects the screen
+    // plan (AV1/VP9 SVC eligibility). Post-#1924, a supportSimulcast change ALSO
+    // affects it — but only once the server screen-layering gate is enabled
+    // (this.screenLayeringEnabled), since simulcast screen is gated. When the gate
+    // is off a supportSimulcast flip is a no-op for screen and must NOT trigger a
+    // wasteful reproduce. Route through the screen re-produce serializer (not a bare
+    // fastReproduceScreen) so a toggle flip and a concurrent gate edge cannot overlap
+    // two reproduces; the serializer rides the existing stopTracks:false (#1902) +
+    // fail-closed capture-stop (CWE-212) path.
+    const svcChanged = state.supportSvc !== prev.supportSvc;
+    const simulcastChanged = state.supportSimulcast !== prev.supportSimulcast;
+    if (svcChanged || (simulcastChanged && this.screenLayeringEnabled)) {
+      this.scheduleScreenLayeringReproduce();
     }
     // Note: screen resolution/FPS/contentType changes cannot use replaceTrack
     // because getDisplayMedia requires a user gesture. Apply on next session.
@@ -1764,11 +1832,35 @@ class VoiceService {
   private cameraLayeringEnabled = false;
   private cameraLayeringReproduceInFlight = false;
   private cameraLayeringReproducePending = false;
+  /** Server-authoritative screen-layering gate (#1924). Only when the media-plane
+   *  flips `screen-layering-gate` on may the local publisher emit simulcast screen. */
+  private screenLayeringEnabled = false;
+  private screenLayeringReproduceInFlight = false;
+  private screenLayeringReproducePending = false;
   private readonly remoteVideoPressureByUser = new Map<string, boolean>();
   private readonly lastPreferredLayerKeyByConsumer = new Map<string, string>();
   private readonly remoteVideoRenderStateByUser = new Map<
     string,
     Map<string, RemoteVideoTileRenderState>
+  >();
+  /** Receiver-driven SCREEN render-state, keyed by producing userId → tileId (#1924).
+   *  Mirrors remoteVideoRenderStateByUser (camera) but feeds screen set-preferred-layers
+   *  demand. Kept separate so a user's screen demand never mixes with their camera demand. */
+  private readonly remoteScreenRenderStateByUser = new Map<
+    string,
+    Map<string, RemoteVideoTileRenderState>
+  >();
+  /** Per-sharer (userId → intent) marker recording that THIS viewer was tuned into
+   *  that sharer's screen when its producer just closed, so the NEXT screen announce
+   *  from the same sharer auto-re-tunes-in regardless of the autoTuneInScreenShares
+   *  opt-in (#1924 review fix A). Armed at producer-closed time (a reproduce closes
+   *  the old producer and re-announces a new one, and producer-closed generally lands
+   *  before the new-producer announce), consumed at new-producer time, and bounded by
+   *  a timer so a genuine stop-then-restart later than the reproduce window falls back
+   *  to the normal opt-in path. */
+  private readonly screenReproducePending = new Map<
+    string,
+    { wasDominant: boolean; timer: ReturnType<typeof setTimeout> }
   >();
   /** Whether the whole window is currently hidden (document.hidden). */
   private documentHidden = false;
@@ -3863,10 +3955,17 @@ class VoiceService {
 
   private resetRemoteVideoLayeringState(): void {
     this.cameraLayeringEnabled = false;
+    this.screenLayeringEnabled = false;
     this.cameraLayeringReproducePending = false;
+    this.screenLayeringReproducePending = false;
     this.remoteVideoPressureByUser.clear();
     this.lastPreferredLayerKeyByConsumer.clear();
     this.remoteVideoRenderStateByUser.clear();
+    this.remoteScreenRenderStateByUser.clear();
+    // Screen reproduce re-tune-in markers are per-call state; a leave/reset must drop
+    // them AND their timers so no stale marker forces a re-consume in a later call (#1924).
+    for (const { timer } of this.screenReproducePending.values()) clearTimeout(timer);
+    this.screenReproducePending.clear();
   }
 
   private scheduleCameraLayeringReproduce(): void {
@@ -3897,9 +3996,54 @@ class VoiceService {
     }
   }
 
+  /**
+   * Serialize screen re-produces (#1924). Rapid `screen-layering-gate` edges, or a
+   * Support-Simulcast toggle racing a gate edge, must not overlap two
+   * `fastReproduceScreen()` calls — each closes the single 'screen' producer and then
+   * `produce()`s, so two concurrent runs create a duplicate producer / 'track ended'.
+   * Mirrors the camera scheduler pair: while a drain is in flight, a further trigger
+   * only sets the pending flag; the drain loop picks it up as one coalesced re-run.
+   */
+  private scheduleScreenLayeringReproduce(): void {
+    if (this.screenLayeringReproduceInFlight) {
+      this.screenLayeringReproducePending = true;
+      return;
+    }
+
+    this.screenLayeringReproduceInFlight = true;
+    void this.drainScreenLayeringReproduceQueue();
+  }
+
+  private async drainScreenLayeringReproduceQueue(): Promise<void> {
+    try {
+      do {
+        this.screenLayeringReproducePending = false;
+        try {
+          await this.fastReproduceScreen();
+        } catch (err) {
+          console.warn(
+            '[screen-layering] failed to re-produce screen after gate change:',
+            errorMessage(err)
+          );
+        }
+      } while (this.screenLayeringReproducePending);
+    } finally {
+      this.screenLayeringReproduceInFlight = false;
+    }
+  }
+
   private findCameraConsumerIdForUser(userId: string): string | null {
     for (const [id, meta] of this.consumerMeta) {
       if (meta.source === 'camera' && meta.producerUserId === userId) return id;
+    }
+    return null;
+  }
+
+  /** First remote SCREEN consumer id for a producing user (#1924). Mirrors
+   *  findCameraConsumerIdForUser; feeds screen set-preferred-layers demand. */
+  private findScreenConsumerIdForUser(userId: string): string | null {
+    for (const [id, meta] of this.consumerMeta) {
+      if (meta.source === 'screen' && meta.producerUserId === userId) return id;
     }
     return null;
   }
@@ -3962,16 +4106,24 @@ class VoiceService {
 
   private computePreferredLayerPayloadForUser(
     userId: string,
-    pressureStepDown?: boolean
+    pressureStepDown?: boolean,
+    source: RemoteVideoSource = 'camera'
   ): RemoteVideoLayerPayload | null {
-    const states = this.remoteVideoRenderStateByUser.get(userId);
+    const stateMap =
+      source === 'screen' ? this.remoteScreenRenderStateByUser : this.remoteVideoRenderStateByUser;
+    const states = stateMap.get(userId);
     if (!states || states.size === 0) return null;
+
+    // Screen has no BWE pressure machinery in v1 — force pressureStepDown=false so a
+    // user's camera pressure can never bleed into their screen demand. Camera keeps
+    // the passed value (undefined → per-user pressure lookup in layerPayloadForTileState).
+    const effectivePressure = source === 'screen' ? false : pressureStepDown;
 
     let bestVisible: RemoteVideoLayerPayload | null = null;
     let hidden: RemoteVideoLayerPayload | null = null;
 
     for (const state of states.values()) {
-      const payload = this.layerPayloadForTileState(userId, state, pressureStepDown);
+      const payload = this.layerPayloadForTileState(userId, state, effectivePressure);
       if (!payload.visible) {
         hidden ??= payload;
         continue;
@@ -4025,13 +4177,35 @@ class VoiceService {
     });
   }
 
-  private emitPreferredLayersForUser(userId: string): void {
-    const consumerId = this.findCameraConsumerIdForUser(userId);
+  private emitPreferredLayersForUser(userId: string, source: RemoteVideoSource = 'camera'): void {
+    const consumerId =
+      source === 'screen'
+        ? this.findScreenConsumerIdForUser(userId)
+        : this.findCameraConsumerIdForUser(userId);
     if (!consumerId) return;
 
-    const payload = this.computePreferredLayerPayloadForUser(userId);
+    const payload = this.computePreferredLayerPayloadForUser(userId, undefined, source);
     if (!payload) return;
 
+    this.emitPreferredLayers(consumerId, payload);
+  }
+
+  /**
+   * Emit set-preferred-layers demand for an EXPLICIT consumer id (#1924, PiP screen).
+   * A PiP window runs a socket-less voiceService in a separate BrowserWindow, so it
+   * can't report render-state itself — it proxies an explicit RPC (via PipSignalingProxy)
+   * to THIS main window, which owns the socket the PiP's consumer was created on. Address
+   * the PiP's OWN consumer id passed in — deliberately NOT via emitPreferredLayersForUser /
+   * findScreenConsumerIdForUser, which resolve to the main window's now-PAUSED screen
+   * consumer (the wrong one, and paused, so its demand would never reach the SFU).
+   * Screen has no BWE pressure machinery in v1, so pressureStepDown is forced false and
+   * the userId arg to layerPayloadForTileState is inert.
+   */
+  emitPreferredLayersForConsumer(
+    consumerId: string,
+    renderState: RemoteVideoTileRenderState
+  ): void {
+    const payload = this.layerPayloadForTileState('', renderState, false);
     this.emitPreferredLayers(consumerId, payload);
   }
 
@@ -4114,11 +4288,12 @@ class VoiceService {
       cssHeight: number;
       role: RemoteVideoRole;
       focusedWindow: boolean;
-    }
+    },
+    source: RemoteVideoSource = 'camera'
   ): void {
-    const tiles =
-      this.remoteVideoRenderStateByUser.get(userId) ??
-      new Map<string, RemoteVideoTileRenderState>();
+    const stateMap =
+      source === 'screen' ? this.remoteScreenRenderStateByUser : this.remoteVideoRenderStateByUser;
+    const tiles = stateMap.get(userId) ?? new Map<string, RemoteVideoTileRenderState>();
     tiles.set(tileId, {
       visible: state.visible,
       cssWidth: state.cssWidth,
@@ -4126,10 +4301,15 @@ class VoiceService {
       role: state.role,
       focusedWindow: state.focusedWindow,
     });
-    this.remoteVideoRenderStateByUser.set(userId, tiles);
+    stateMap.set(userId, tiles);
 
-    this.setRemoteVideoVisibility(userId, state.visible, tileId);
-    this.emitPreferredLayersForUser(userId);
+    // Camera drives the per-consumer visibility-pause coordinator (#1541). Screen
+    // pause is window-hidden/tuned-out driven (handleDocumentVisibilityChange), so the
+    // screen reporter contributes ONLY layer demand — never a pause reason.
+    if (source === 'camera') {
+      this.setRemoteVideoVisibility(userId, state.visible, tileId);
+    }
+    this.emitPreferredLayersForUser(userId, source);
   }
 
   /**
@@ -4137,24 +4317,61 @@ class VoiceService {
    * doesn't freeze a still-visible grid tile. Prunes the user entry when empty so the map
    * never accumulates departed users (#1541 Gitar review).
    */
-  removeRemoteVideoTile(userId: string, tileId: string): void {
-    const tiles = this.tileVisibilityByUser.get(userId);
-    if (tiles) {
-      tiles.delete(tileId);
-      if (tiles.size === 0) this.tileVisibilityByUser.delete(userId);
-      for (const id of this.cameraConsumerIdsForUser(userId)) {
-        this.updateVisibilityReason(id, userId);
+  removeRemoteVideoTile(
+    userId: string,
+    tileId: string,
+    source: RemoteVideoSource = 'camera'
+  ): void {
+    // Camera-only: the visibility-pause coordinator (#1541) tracks camera tiles.
+    if (source === 'camera') {
+      const tiles = this.tileVisibilityByUser.get(userId);
+      if (tiles) {
+        tiles.delete(tileId);
+        if (tiles.size === 0) this.tileVisibilityByUser.delete(userId);
+        for (const id of this.cameraConsumerIdsForUser(userId)) {
+          this.updateVisibilityReason(id, userId);
+        }
       }
     }
 
-    const renderStates = this.remoteVideoRenderStateByUser.get(userId);
+    const stateMap =
+      source === 'screen' ? this.remoteScreenRenderStateByUser : this.remoteVideoRenderStateByUser;
+    const renderStates = stateMap.get(userId);
     if (!renderStates) return;
+    // #1924: snapshot the removed tile's state BEFORE the delete so a last-surface
+    // screen removal can tell the SFU the viewer stopped watching (visible:false),
+    // instead of dropping local demand silently — which would pin the layer/gate on
+    // the last visible demand until the consumer itself closes.
+    const removedState = renderStates.get(tileId);
     renderStates.delete(tileId);
     if (renderStates.size === 0) {
-      this.remoteVideoRenderStateByUser.delete(userId);
+      // Screen-only: the last visible screen surface for this sharer just unmounted —
+      // release the layer/gate (extracted to keep this function under the S3776 limit).
+      if (source === 'screen') this.releaseScreenDemandOnLastUnmount(userId, removedState);
+      stateMap.delete(userId);
       return;
     }
-    this.emitPreferredLayersForUser(userId);
+    this.emitPreferredLayersForUser(userId, source);
+  }
+
+  /**
+   * #1924: when the LAST screen render surface for a sharer unmounts, tell the SFU the
+   * viewer stopped watching (`visible:false`) so the layer/gate is released instead of
+   * pinned on the last visible demand until the consumer closes. Screen-only — camera
+   * routes hidden-ness through the pause coordinator, so its last-surface removal stays a
+   * silent drop (never emit a camera set-preferred-layers here).
+   */
+  private releaseScreenDemandOnLastUnmount(
+    userId: string,
+    removedState: RemoteVideoTileRenderState | undefined
+  ): void {
+    if (!removedState) return;
+    const consumerId = this.findScreenConsumerIdForUser(userId);
+    if (!consumerId) return;
+    this.emitPreferredLayers(consumerId, {
+      ...this.layerPayloadForTileState(userId, removedState),
+      visible: false,
+    });
   }
 
   /** Apply the current visibility intent to a freshly-routed camera consumer. */
@@ -4762,12 +4979,80 @@ class VoiceService {
       // camera tile or a muted screenshare). Dispatched by source in a helper to
       // keep consume()'s cognitive complexity within budget.
       this.applyInitialConsumerPauseReasons(consumer.id, result.source, result.producerUserId);
+
+      // #1924: a screen REPRODUCE / codec-swap keeps the render surface mounted (same
+      // userId/tileId), so the reporter's IntersectionObserver never re-fires — but the
+      // underlying screen consumer was just swapped for a fresh one seeded at spatial
+      // layer 0. Re-emit the stored render-state demand so the NEW consumer inherits the
+      // viewer's real size/visibility instead of stranding on layer 0.
+      this.reemitScreenDemandOnConsume(result.source, result.producerUserId);
     } catch (err) {
       console.error('[consume] Failed to consume producer:', producerId, errorMessage(err));
     }
   }
 
+  /**
+   * #1924: after a NEW screen consumer is recorded, re-send the sharer's persisted screen
+   * render-state demand so the fresh consumer picks up the right layer. Resolves the new
+   * consumer via findScreenConsumerIdForUser inside emitPreferredLayersForUser, and
+   * no-ops safely for non-screen sources and when no render-state was ever reported.
+   */
+  private reemitScreenDemandOnConsume(source: string, userId: string): void {
+    if (source !== 'screen') return;
+    this.emitPreferredLayersForUser(userId, 'screen');
+  }
+
   // ─── Socket Listeners ──────────────────────────────────────────────
+
+  /**
+   * producer-closed SCREEN branch (#1924). Purge the closed producer's available /
+   * active / tuned-in state, arm the reproduce re-tune-in marker (keyed by SHARER), and
+   * clear the participant-level screen flags. Extracted from the socket handler to keep
+   * it under the S3776 cognitive-complexity budget.
+   */
+  private handleScreenProducerClosed(
+    producerId: string,
+    userId: string,
+    store: ReturnType<typeof useVoiceStore.getState>
+  ): void {
+    store.removeAvailableScreenShare(producerId);
+    store.unregisterActiveScreenShare(producerId);
+    store.clearAutoTuneSuppression(producerId);
+    // Clean up tunedInScreenShares so UI collapses back to user frame grid
+    if (producerId in store.tunedInScreenShares) {
+      // Stash a re-tune-in intent keyed by the SHARER (userId) BEFORE tuneOut
+      // prunes the live tuned-in/dominant state (#1924 review fix A): if this
+      // sharer immediately re-announces a screen producer — a fastReproduceScreen
+      // codec-floor / screen-layering-gate swap closes the old producer and
+      // announces a new one — the new-producer handler re-consumes the new
+      // producerId for us, bypassing the autoTuneInScreenShares opt-in and
+      // restoring dominance. Bounded by a timer so a genuine stop (no re-announce
+      // within the window) falls back to the normal opt-in path. Re-arm cleanly
+      // if a marker for this sharer already exists.
+      const existing = this.screenReproducePending.get(userId);
+      if (existing) clearTimeout(existing.timer);
+      const wasDominant = store.dominantScreenShareId === producerId;
+      const timer = setTimeout(() => {
+        this.screenReproducePending.delete(userId);
+      }, SCREEN_REPRODUCE_RETUNE_WINDOW_MS);
+      this.screenReproducePending.set(userId, { wasDominant, timer });
+      store.tuneOut(producerId);
+    }
+
+    // Reverse-order clobber guard (#1924 review fix): a reproduce can deliver the NEW
+    // screen producer (already consumed + re-tuned by the reverse-order path in
+    // handleOptInScreenAnnounce) BEFORE this OLD producer-closed arrives. In that window
+    // a fresh screen consumer for this sharer is already live, so unconditionally
+    // clearing isScreenSharing:false / screenStream:undefined here would wipe the state
+    // the reverse-order re-consume just set up. Only clear the participant-level screen
+    // state when this viewer is NOT still tuned into a newer screen from the same sharer.
+    // Evaluated on FRESH store state AFTER the old producer's tuneOut above, and after the
+    // consumer-close loop deleted the old consumer's meta, so the just-closed producer
+    // never counts toward "still tuned in".
+    if (!this.isUserScreenTunedIn(userId, useVoiceStore.getState())) {
+      store.updateParticipant(userId, { isScreenSharing: false, screenStream: undefined });
+    }
+  }
 
   /** Check if we're already tuned into a screen share from a specific user. */
   private isUserScreenTunedIn(
@@ -4804,6 +5089,55 @@ class VoiceService {
       isLocal: false,
     });
     store.updateParticipant(userId, { isScreenSharing: true });
+
+    // Reproduce re-tune-in (#1924 review fix A). If this sharer's previous screen
+    // producer just closed while THIS viewer was tuned into it (a fastReproduceScreen
+    // codec-floor / screen-layering-gate swap), re-tune-in to the NEW producerId
+    // regardless of the autoTuneInScreenShares opt-in and restore dominance if the
+    // closed producer was dominant. Takes precedence over the opt-in branch below and
+    // returns, so a reproduce never double-consumes. The marker is one-shot: consuming
+    // it (or its bounding timer) clears it, so a genuine later restart falls through to
+    // the opt-in path on the next announce.
+    const reproduce = this.screenReproducePending.get(userId);
+    // Order-robustness (Gitar #1924 review): the marker is armed by producer-closed,
+    // which normally lands before this new-producer announce (the sharer emits
+    // close-producer, THEN produces, over an ordered per-socket transport). If that
+    // order is ever reversed, no marker exists yet but THIS viewer is still tuned into
+    // the sharer's OLD screen producer — and since a user has at most one screen, a new
+    // screen from a sharer we're already watching IS a reproduce. Detect that so Fix A
+    // does not depend on event ordering. Exactly one path fires per reproduce: the
+    // marker path in the normal order (reverseOrderReproduce is false when a marker
+    // exists); the reverse path otherwise, after which the later producer-closed arms a
+    // marker that simply expires. tuneInToScreenShare is idempotent, so even a double
+    // trigger cannot double-consume the same producerId.
+    const reverseOrderReproduce = !reproduce && this.isUserScreenTunedIn(userId, store);
+    if (reproduce || reverseOrderReproduce) {
+      if (reproduce) {
+        clearTimeout(reproduce.timer);
+        this.screenReproducePending.delete(userId);
+      }
+      // The new-producer socket handler discards this promise — isolate failures the
+      // same way autoTuneSweep does (no unhandled rejection).
+      try {
+        await this.tuneInToScreenShare(producerId, userId);
+        // setDominantScreenShare no-ops unless the id is currently tuned in, so a
+        // cap-exhausted / stale-context bail inside tuneInToScreenShare cannot point
+        // dominance at an un-consumed producer. In the reverse-order case dominance is
+        // preserved when the old producer-closed tunes out and reassigns dominant to a
+        // remaining tuned-in share (which includes this new one).
+        if (reproduce?.wasDominant) {
+          useVoiceStore.getState().setDominantScreenShare(producerId);
+        }
+      } catch (err) {
+        console.error(
+          'Screen reproduce re-tune-in failed for producer',
+          producerId,
+          errorMessage(err)
+        );
+      }
+      return;
+    }
+
     // New-share trigger (#2088). The cap guard inside tuneInToScreenShare
     // surfaces the existing max-stream error when capacity is exhausted.
     if (
@@ -4915,14 +5249,7 @@ class VoiceService {
       if (source === 'camera')
         store.updateParticipant(userId, { isVideoOn: false, videoStream: undefined });
       else if (source === 'screen') {
-        store.updateParticipant(userId, { isScreenSharing: false, screenStream: undefined });
-        store.removeAvailableScreenShare(producerId);
-        store.unregisterActiveScreenShare(producerId);
-        store.clearAutoTuneSuppression(producerId);
-        // Clean up tunedInScreenShares so UI collapses back to user frame grid
-        if (producerId in store.tunedInScreenShares) {
-          store.tuneOut(producerId);
-        }
+        this.handleScreenProducerClosed(producerId, userId, store);
       } else if (source === 'screen-audio') {
         store.updateParticipant(userId, { screenAudioStream: undefined });
         this.pendingScreenAudioProducers.delete(userId);
@@ -5076,6 +5403,19 @@ class VoiceService {
       if (this.cameraLayeringEnabled === nextEnabled) return;
       this.cameraLayeringEnabled = nextEnabled;
       this.scheduleCameraLayeringReproduce();
+    });
+
+    // #1924 server-authoritative screen-layering gate. Route through the screen
+    // re-produce serializer (mirroring camera) so rapid gate edges — or a gate edge
+    // racing a Support-Simulcast toggle — coalesce into one queued drain instead of
+    // overlapping two fastReproduceScreen() calls. fastReproduceScreen is internally
+    // guarded (no-ops without an active screen producer) and rides the existing
+    // stopTracks:false (#1902) + fail-closed capture-stop (CWE-212) path.
+    this.socket.on('screen-layering-gate', ({ enabled }: { enabled: boolean }) => {
+      const nextEnabled = enabled === true;
+      if (this.screenLayeringEnabled === nextEnabled) return;
+      this.screenLayeringEnabled = nextEnabled;
+      this.scheduleScreenLayeringReproduce();
     });
 
     this.socket.on('consumer-closed', ({ consumerId }) => {

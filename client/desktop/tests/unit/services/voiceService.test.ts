@@ -3738,6 +3738,62 @@ describe('VoiceService', () => {
       expect(p?.isScreenSharing).toBe(true);
     });
 
+    it('re-emits stored screen render-state demand to a freshly-consumed screen consumer (#1924 Fix)', async () => {
+      const { recvTransport } = await joinVoiceChannel();
+
+      useVoiceStore.getState().addParticipant({
+        userId: 'user-2',
+        username: 'other',
+        isMuted: false,
+        isDeafened: false,
+        isSpeaking: false,
+        isVideoOn: false,
+        isScreenSharing: false,
+      });
+
+      const svc = voiceService as any;
+      // The reporter previously stored this sharer's screen render-state; on a reproduce
+      // the tile stays mounted (reporter never re-fires) so the fresh consumer would
+      // strand at layer 0 without a re-emit. Seed the stored state (no consumer yet → the
+      // seed's own emit is a no-op).
+      svc.setRemoteVideoRenderState(
+        'user-2',
+        'screen-tile',
+        { visible: true, cssWidth: 1920, cssHeight: 1080, role: 'focus', focusedWindow: true },
+        'screen'
+      );
+
+      const consumer = createMockConsumer('cons-scr-new', 'video', 'prod-scr-new');
+      recvTransport.consume.mockResolvedValue(consumer);
+      setupEmitResponses({
+        consume: {
+          id: 'cons-scr-new',
+          producerId: 'prod-scr-new',
+          kind: 'video',
+          rtpParameters: {},
+          source: 'screen',
+          producerUserId: 'user-2',
+        },
+        'resume-consumer': undefined,
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        produce: { id: 'prod-mic' },
+        'close-producer': undefined,
+        'pause-producer': undefined,
+        'resume-producer': undefined,
+      });
+      mockSocket.emit.mockClear();
+
+      await svc.consumeProducer('prod-scr-new', 'user-2', 'video');
+
+      const spl = mockSocket.emit.mock.calls.filter(
+        (c: unknown[]) => c[0] === 'set-preferred-layers'
+      );
+      expect(spl.length).toBeGreaterThan(0);
+      expect((spl[spl.length - 1][1] as { consumerId: string }).consumerId).toBe('cons-scr-new');
+      expect((spl[spl.length - 1][1] as { visible: boolean }).visible).toBe(true);
+    });
+
     it('attaches screen-audio stream', async () => {
       const { recvTransport } = await joinVoiceChannel();
 

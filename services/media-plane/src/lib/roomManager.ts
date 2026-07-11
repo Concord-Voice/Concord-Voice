@@ -24,6 +24,7 @@ import {
   type LayerValue,
   type StoredCameraLayerDemand,
 } from './cameraLayerGovernor.js';
+import { computeScreenLayeringGate, type StoredScreenLayerDemand } from './screenLayerGovernor.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -303,6 +304,20 @@ export interface Room {
   cameraLayerDemands: Map<string, StoredCameraLayerDemand>;
   /** Current room-level camera layering gate state. */
   cameraLayeringGateEnabled: boolean;
+  /** Receiver-driven screen layer demand, keyed by consumerId (#1924). Values
+   *  carry the owning viewer userId (so the gate counts DISTINCT viewers, not
+   *  consumer entries — a single client can own multiple screen consumers of one
+   *  producer and would otherwise trip the gate alone) AND the watched screen's
+   *  owner sharerUserId (so the gate groups per stream, #1924 review fix "B"). */
+  screenLayerDemands: Map<string, StoredScreenLayerDemand>;
+  /** Server-authoritative per-SHARER screen-layering gate state, keyed by the
+   *  screen producer's owner userId (#1924 review fix "B"). A sharer simulcasts
+   *  only when its OWN viewers are heterogeneous — two viewers on two DIFFERENT
+   *  shares no longer flip a room-wide gate for every sharer. */
+  screenLayeringGateBySharer: Map<string, boolean>;
+  /** Pending gate-OFF debounce timers per sharer (#1924 review fix "B"). Absorbs
+   *  the reproduce re-consume gap where a sharer's viewers momentarily drop. */
+  screenGateOffTimers: Map<string, ReturnType<typeof setTimeout>>;
 }
 
 export interface ProducerInfo {
@@ -355,6 +370,16 @@ export function resolveRoomCapTier(room: Room): 'free' | 'premium' {
 
 /** Per-sender keyframe request cooldown; mirrors the client-side E2EE recovery cooldown. */
 export const KEYFRAME_REQUEST_COOLDOWN_MS = 5000;
+
+/**
+ * Per-sharer screen-layering gate OFF debounce (#1924 review fix "B"). When a
+ * sharer's gate turns OFF (its viewers become homogeneous / drop below the
+ * hysteresis floor), the OFF is delayed by this window so the transient gap
+ * where the sharer's viewers momentarily drop while re-consuming a reproduced
+ * (codec/layer-swapped) producer does not flap the gate OFF→ON→OFF. A gate ON
+ * (or a re-added heterogeneous viewer pair) cancels the pending OFF immediately.
+ */
+export const SCREEN_GATE_OFF_DEBOUNCE_MS = 1500;
 
 /**
  * AES-256-GCM media-frame format advertised by clients at join time.
@@ -548,6 +573,7 @@ export type RoomEvent =
       source: MediaSource;
     }
   | { type: 'camera-layering-gate'; roomId: string; enabled: boolean }
+  | { type: 'screen-layering-gate'; roomId: string; targetSocketId: string; enabled: boolean }
   | { type: 'active-speaker'; roomId: string; userId: string; volume: number };
 
 export type RoomEventHandler = (event: RoomEvent) => void;
@@ -684,6 +710,9 @@ export class RoomManager {
       keyframeRequestCooldowns: new Map(),
       cameraLayerDemands: new Map(),
       cameraLayeringGateEnabled: false,
+      screenLayerDemands: new Map(),
+      screenLayeringGateBySharer: new Map(),
+      screenGateOffTimers: new Map(),
     };
 
     // Wire up active speaker events
@@ -736,6 +765,13 @@ export class RoomManager {
   private async closeRoom(roomId: string): Promise<void> {
     const room = this.rooms.get(roomId);
     if (!room) return;
+
+    // Cancel any pending per-sharer screen gate-OFF debounce timers (#1924 fix
+    // "B") so a room teardown leaves no dangling setTimeout callbacks.
+    for (const timer of room.screenGateOffTimers.values()) {
+      clearTimeout(timer);
+    }
+    room.screenGateOffTimers.clear();
 
     // Close AudioLevelObserver
     if (room.audioLevelObserver && !room.audioLevelObserver.closed) {
@@ -928,6 +964,10 @@ export class RoomManager {
     if (!participant) return;
 
     this.clearParticipantCameraLayerDemands(room, participant);
+    this.clearParticipantScreenLayerDemands(room, participant);
+    // Clean up the leaver's own state as a SHARER (#1924 fix "B"): drop any
+    // pending gate-OFF timer + gate entry so they don't outlive the participant.
+    this.cleanupSharerScreenGate(room, participant.userId);
     this.closeParticipantConsumers(participant);
     const removedCameraProducer = this.closeParticipantProducers(room, participant, roomId, userId);
     room.keyframeRequestCooldowns.delete(userId);
@@ -1315,6 +1355,14 @@ export class RoomManager {
     // permissions before reserving a producer slot (throws on denial).
     assertPublishPermitted(participant, kind, source);
 
+    // Screen-video produce guards (#1924 review fixes A/B): one screen producer
+    // per participant, and simulcast requires the sharer's server-authoritative
+    // screen-layering gate. Synchronous, BEFORE the reservation + produce()
+    // await so a reject never leaks a slot or yields a briefly-existing producer.
+    if (kind === 'video' && source === 'screen') {
+      this.validateScreenVideoSource(room, participant, userId, rtpParameters);
+    }
+
     // Enforce per-room concurrent-producer caps (#1542 tier-resolved: camera
     // free 8 / premium 25; screen free 1 / premium 3). TOCTOU-safe (#1539): the
     // check + slot reservation run synchronously with no intervening await, so
@@ -1586,6 +1634,26 @@ export class RoomManager {
       });
     }
 
+    // #1924 anti-waste: seed a new simulcast SCREEN consumer at the lowest layer;
+    // it ramps up only when the viewer's render-size demand justifies it. SVC screen
+    // keeps mediasoup defaults (per-frame thinning is cost-neutral). Non-fatal: a
+    // setPreferredLayers worker error is logged PII-safe and consume proceeds, exactly
+    // like the setPriority hint above.
+    if (
+      producerEntry.source === 'screen' &&
+      (newConsumer as { type?: unknown }).type === 'simulcast'
+    ) {
+      try {
+        await newConsumer.setPreferredLayers({ spatialLayer: 0, temporalLayer: 0 });
+      } catch {
+        logger.warn('Failed to seed screen consumer preferred layers', {
+          consumerId: newConsumer.id,
+          producerId,
+          source: producerEntry.source,
+        });
+      }
+    }
+
     // Audio last-N (#1544): if this is a MIC audio consumer whose producer is not
     // currently in the top-N, start it last-N-paused (it was created paused:true)
     // so the client's unconditional resume is refused by the guard until the
@@ -1610,11 +1678,13 @@ export class RoomManager {
       consumer.consumers.delete(newConsumer.id);
       room.lastNPausedConsumers.delete(newConsumer.id);
       this.clearCameraLayerDemand(room, newConsumer.id);
+      this.clearScreenLayerDemand(room, newConsumer.id);
     });
     newConsumer.on('producerclose', () => {
       consumer.consumers.delete(newConsumer.id);
       room.lastNPausedConsumers.delete(newConsumer.id);
       this.clearCameraLayerDemand(room, newConsumer.id);
+      this.clearScreenLayerDemand(room, newConsumer.id);
     });
 
     logger.info('Consumer created with transport state', {
@@ -1694,35 +1764,97 @@ export class RoomManager {
     logger.debug('Consumer paused', { consumerId, roomId, userId });
   }
 
-  async setPreferredCameraLayers(
+  /**
+   * Validate + clamp a raw client layer-demand payload against an owned video
+   * consumer. Shared prefix for the source-routed setPreferredLayers dispatch:
+   * parse → ownership → video-kind → source-aware spatial cap → pixel-derived
+   * clamp. The caller still routes the stored demand by source; this reads
+   * appData.source ONLY to pick the spatial cap (#1924 fix "D").
+   */
+  private validateAndClampLayerDemand(
+    participant: Participant,
+    raw: unknown
+  ): {
+    consumer: Consumer;
+    stored: StoredCameraLayerDemand;
+    effectiveLayers: CameraLayerSelection;
+  } {
+    const parsed = parseCameraLayerDemand(raw);
+    if (!parsed.ok) throw new Error(parsed.error);
+
+    const consumer = participant.consumers.get(parsed.value.consumerId);
+    if (!consumer) throw new Error('Consumer not found');
+    if (consumer.kind !== 'video') throw new Error('Consumer is not video');
+
+    // #1924 fix "D": the spatial cap is source-aware. Camera keeps the per-user
+    // entitlement clamp (free → layer 1). Screen uses the full simulcast spatial
+    // range (layer 2, no free-tier clamp) — a free viewer watching a full-stage
+    // simulcast H.264/VP8 screen must not be pinned to layer 1. Screen
+    // resolution entitlement is a separate concern (#2163).
+    const source = (consumer.appData as { source?: unknown } | undefined)?.source;
+    const maxSpatialLayer: LayerValue =
+      source === 'screen' ? 2 : this.maxCameraSpatialLayerForParticipant(participant);
+    const effectiveLayers = clampCameraLayerDemand(parsed.value, maxSpatialLayer);
+    const stored = storedDemand(parsed.value, maxSpatialLayer);
+    return { consumer, stored, effectiveLayers };
+  }
+
+  /**
+   * Receiver-driven preferred-layer demand for an owned video consumer, routed
+   * by the consumer's server-set appData.source (#1924):
+   *   - camera → cameraLayerDemands + recomputeCameraLayeringGate
+   *   - screen → screenLayerDemands + recomputeScreenLayeringGate
+   *   - anything else → reject ('Consumer is not a layerable video source').
+   * The gate flips ONLY from stored receiver demand — server-authoritative; a
+   * client cannot force layering on. Camera behavior is preserved exactly.
+   */
+  async setPreferredLayers(
     roomId: string,
     userId: string,
     raw: unknown
   ): Promise<{
     effectiveLayers: CameraLayerSelection;
   }> {
-    const parsed = parseCameraLayerDemand(raw);
-    if (!parsed.ok) throw new Error(parsed.error);
-
     const room = this.rooms.get(roomId);
     if (!room) throw new Error('Room not found');
     const participant = room.participants.get(userId);
     if (!participant) throw new Error('Participant not found');
-    const consumer = participant.consumers.get(parsed.value.consumerId);
-    if (!consumer) throw new Error('Consumer not found');
-    if (consumer.kind !== 'video') throw new Error('Consumer is not video');
 
-    const appData = consumer.appData as { source?: unknown } | undefined;
-    if (appData?.source !== 'camera') throw new Error('Consumer is not camera');
-
-    const maxSpatialLayer = this.maxCameraSpatialLayerForParticipant(participant);
-    const effectiveLayers = clampCameraLayerDemand(parsed.value, maxSpatialLayer);
-    room.cameraLayerDemands.set(
-      parsed.value.consumerId,
-      storedDemand(parsed.value, maxSpatialLayer)
+    const { consumer, stored, effectiveLayers } = this.validateAndClampLayerDemand(
+      participant,
+      raw
     );
-    this.recomputeCameraLayeringGate(room);
+
     const consumerType = (consumer as { type?: unknown }).type;
+    const source = (consumer.appData as { source?: unknown } | undefined)?.source;
+    if (source === 'camera') {
+      room.cameraLayerDemands.set(stored.consumerId, stored);
+      this.recomputeCameraLayeringGate(room);
+    } else if (source === 'screen') {
+      // The watched screen producer's owner (server-set on consume, appData) is
+      // the per-sharer gate key (#1924 fix "B"). Server-authoritative — never a
+      // client-supplied value.
+      const sharerUserId = (consumer.appData as { producerUserId?: unknown } | undefined)
+        ?.producerUserId;
+      if (typeof sharerUserId !== 'string' || sharerUserId.length === 0) {
+        throw new Error('Screen consumer missing producer owner');
+      }
+      room.screenLayerDemands.set(stored.consumerId, { ...stored, userId, sharerUserId });
+      // #1924 fix "C": AV1/VP9 screens consume as `svc` and NEVER simulcast, so
+      // the H.264/VP8 simulcast gate is meaningless for them — recomputing it
+      // would emit screen-layering-gate and make the sharer do a pointless
+      // reproduce. Skip the gate recompute for SVC; the demand is still stored
+      // above and `setPreferredLayers` still runs below (SVC thins per-layer). A
+      // single-encode H.264/VP8 screen has type 'simple' (NOT 'svc') and MUST
+      // still recompute — that is how the gate turns ON. Gate on `!== 'svc'`,
+      // NOT `=== 'simulcast'`.
+      if (consumerType !== 'svc') {
+        this.recomputeScreenLayeringGate(room, sharerUserId);
+      }
+    } else {
+      throw new Error('Consumer is not a layerable video source');
+    }
+
     if (consumerType === 'simulcast' || consumerType === 'svc') {
       await consumer.setPreferredLayers(effectiveLayers);
     }
@@ -1746,6 +1878,7 @@ export class RoomManager {
     // handlers, so clean up the last-N guard set here too (else the entry leaks).
     room.lastNPausedConsumers.delete(consumerId);
     this.clearCameraLayerDemand(room, consumerId);
+    this.clearScreenLayerDemand(room, consumerId);
     logger.debug('Consumer closed', { consumerId, roomId, userId });
     return true;
   }
@@ -2434,6 +2567,112 @@ export class RoomManager {
     if (changed) this.recomputeCameraLayeringGate(room);
   }
 
+  /**
+   * Recompute ONE sharer's screen-layering gate (#1924 fix "B"). The gate is
+   * per-sharer: only the sharer's OWN viewers' demands count, so two viewers on
+   * two DIFFERENT shares can no longer flip a room-wide gate for every sharer.
+   * Gate-ON is immediate; gate-OFF is debounced (SCREEN_GATE_OFF_DEBOUNCE_MS) to
+   * absorb the reproduce re-consume gap, and cancelled the instant the sharer
+   * regains a heterogeneous viewer pair.
+   */
+  private recomputeScreenLayeringGate(room: Room, sharerUserId: string): void {
+    const demandsFor = (id: string): StoredScreenLayerDemand[] =>
+      Array.from(room.screenLayerDemands.values()).filter((d) => d.sharerUserId === id);
+
+    const previouslyEnabled = room.screenLayeringGateBySharer.get(sharerUserId) ?? false;
+    const enabled = computeScreenLayeringGate({
+      demands: demandsFor(sharerUserId),
+      previouslyEnabled,
+    });
+
+    if (enabled) {
+      // Viewers present / heterogeneous — cancel any pending OFF for this sharer.
+      const pending = room.screenGateOffTimers.get(sharerUserId);
+      if (pending) {
+        clearTimeout(pending);
+        room.screenGateOffTimers.delete(sharerUserId);
+      }
+    }
+
+    if (enabled === previouslyEnabled) return; // no transition
+
+    if (!enabled) {
+      // Turning OFF — debounce so a transient viewer drop (reproduce re-consume
+      // gap) doesn't flap the gate. One pending timer per sharer.
+      if (room.screenGateOffTimers.has(sharerUserId)) return;
+      const timer = setTimeout(() => {
+        room.screenGateOffTimers.delete(sharerUserId);
+        // Re-evaluate against LIVE demand: viewers may have re-consumed during
+        // the window (reproduce completed) → abort the OFF.
+        if (
+          computeScreenLayeringGate({ demands: demandsFor(sharerUserId), previouslyEnabled: true })
+        ) {
+          return;
+        }
+        if (room.screenLayeringGateBySharer.get(sharerUserId) !== true) return;
+        room.screenLayeringGateBySharer.delete(sharerUserId);
+        this.emitScreenGate(room, sharerUserId, false);
+      }, SCREEN_GATE_OFF_DEBOUNCE_MS);
+      room.screenGateOffTimers.set(sharerUserId, timer);
+      return;
+    }
+
+    // Turning ON — immediate (no debounce; simulcast should engage promptly).
+    room.screenLayeringGateBySharer.set(sharerUserId, true);
+    this.emitScreenGate(room, sharerUserId, true);
+  }
+
+  /**
+   * Emit a screen-layering-gate event TARGETED to the sharer's socket (#1924 fix
+   * "B") — the gate governs the sharer's own publish, so only the sharer needs
+   * it, never a room broadcast. If the sharer has left, there is nobody to
+   * notify.
+   */
+  private emitScreenGate(room: Room, sharerUserId: string, enabled: boolean): void {
+    const sharer = room.participants.get(sharerUserId);
+    if (!sharer) return;
+    this.emitEvent({
+      type: 'screen-layering-gate',
+      roomId: room.id,
+      targetSocketId: sharer.socketId,
+      enabled,
+    });
+  }
+
+  private clearScreenLayerDemand(room: Room, consumerId: string): void {
+    const demand = room.screenLayerDemands.get(consumerId);
+    if (!demand) return;
+    room.screenLayerDemands.delete(consumerId);
+    this.recomputeScreenLayeringGate(room, demand.sharerUserId);
+  }
+
+  private clearParticipantScreenLayerDemands(room: Room, participant: Participant): void {
+    const affectedSharers = new Set<string>();
+    for (const consumerId of participant.consumers.keys()) {
+      const demand = room.screenLayerDemands.get(consumerId);
+      if (demand && room.screenLayerDemands.delete(consumerId)) {
+        affectedSharers.add(demand.sharerUserId);
+      }
+    }
+    for (const sharerUserId of affectedSharers) {
+      this.recomputeScreenLayeringGate(room, sharerUserId);
+    }
+  }
+
+  /**
+   * Tear down a leaving participant's state AS A SHARER (#1924 fix "B"): cancel
+   * any pending gate-OFF timer and drop its gate entry so neither leaks past the
+   * participant lifecycle.
+   */
+  private cleanupSharerScreenGate(room: Room, sharerUserId: string): void {
+    const timer = room.screenGateOffTimers.get(sharerUserId);
+    if (timer) {
+      clearTimeout(timer);
+      room.screenGateOffTimers.delete(sharerUserId);
+    }
+    room.screenLayeringGateBySharer.delete(sharerUserId);
+  }
+
   private cameraLayeringCodecKind(room: Room): LayeredCodecKind {
     const floor = this.computeCodecFloor(room.id);
     if (!floor) return 'svc';
@@ -2449,6 +2688,44 @@ export class RoomManager {
       }
     }
     return count;
+  }
+
+  /**
+   * Screen-VIDEO produce guards (#1924 review fixes A + B). Runs synchronously
+   * BEFORE the cap reservation and the `sendTransport.produce()` await, so a
+   * reject never leaks a reserved slot or yields a briefly-existing producer
+   * (the same TOCTOU-safe discipline as the per-room caps).
+   *
+   *  - FIX "B": one active screen producer per participant. A patched client
+   *    cannot publish a 2nd `source: 'screen'` producer without closing the
+   *    first (composes with the per-room #1542 screen cap).
+   *  - FIX "A": simulcast screen publishing (more than one encoding) requires
+   *    the sharer's server-authoritative screen-layering gate to be ENABLED.
+   *    The gate only turns on once the sharer has a heterogeneous viewer pair —
+   *    exactly what triggers a legit client to reproduce its screen as 3-layer
+   *    simulcast — so a patched client publishing simulcast with the gate OFF is
+   *    rejected here. This makes the gate hold against a non-cooperative client
+   *    instead of being a mere client-side signal. A single-encoding screen
+   *    produce is ALWAYS allowed. Static message — never interpolate a
+   *    client-supplied value (CWE-117).
+   */
+  private validateScreenVideoSource(
+    room: Room,
+    participant: Participant,
+    userId: string,
+    rtpParameters: RtpParameters
+  ): void {
+    const hasActiveScreen = [...participant.producers.values()].some(
+      (info) => info.source === 'screen' && !info.producer.closed
+    );
+    if (hasActiveScreen) {
+      throw new Error('Participant already has an active screen producer');
+    }
+
+    const encodingCount = rtpParameters.encodings?.length ?? 0;
+    if (encodingCount > 1 && room.screenLayeringGateBySharer.get(userId) !== true) {
+      throw new Error('Screen simulcast not authorized (screen-layering-gate disabled)');
+    }
   }
 
   private validateScreenAudioSource(participant: Participant, kind: MediaKind): void {

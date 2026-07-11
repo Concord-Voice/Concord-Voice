@@ -223,6 +223,36 @@ export class PipVoiceClient {
   }
 
   /**
+   * Get the SFU consumer id for a specific source and userId — this PiP's OWN
+   * consumer, which the main window addresses to report render-state demand (#1924).
+   */
+  getConsumerIdBySource(source: string, userId: string): string | null {
+    for (const [consumerId, track] of this.consumers) {
+      if (track.source === source && track.producerUserId === userId) {
+        return consumerId;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Report receiver render-state demand for one of this PiP's OWN consumers (#1924).
+   * The PiP has no socket, so it proxies set-preferred-layers to the main window,
+   * which owns the socket the consumer was created on. Best-effort: a failure only
+   * means the stream may stay at a lower spatial layer, never a hard error.
+   */
+  async reportPreferredLayers(params: {
+    consumerId: string;
+    cssWidth: number;
+    cssHeight: number;
+    visible: boolean;
+    role: 'thumbnail' | 'grid' | 'focus';
+    focusedWindow: boolean;
+  }): Promise<void> {
+    await this.rpc('set-preferred-layers', params);
+  }
+
+  /**
    * Clean up: close all consumers, transport, notify main window.
    */
   async dispose(): Promise<void> {

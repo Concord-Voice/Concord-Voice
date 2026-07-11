@@ -212,3 +212,40 @@ describe('screenshare SVC-only plan (#1921)', () => {
     expect(p.kind).toBe('single');
   });
 });
+
+// Gated simulcast-screen (#1924): pickScreenCodec now passes
+// `simulcast: vs.supportSimulcast && this.screenLayeringEnabled`, so the shared
+// plan must yield 3-RID simulcast for H264/VP8 when simulcast is eligible, a
+// single encode when the gate is off, and — the E2EE structural invariant — SVC
+// (NEVER simulcast) for AV1 under ANY simulcast eligibility.
+describe('gated simulcast-screen plan (#1924)', () => {
+  it('H264 → simulcast (3 RID) when simulcast eligible (gate on + toggle on)', () => {
+    const p = buildCameraEncodingPlan({
+      ...planBase,
+      codec: codec('video/H264'),
+      eligibility: { svc: true, simulcast: true },
+    });
+    expect(p.kind).toBe('simulcast');
+    expect(p.encodings).toHaveLength(3);
+  });
+  it('H264 → single when simulcast NOT eligible (gate off)', () => {
+    const p = buildCameraEncodingPlan({
+      ...planBase,
+      codec: codec('video/H264'),
+      eligibility: { svc: true, simulcast: false },
+    });
+    expect(p.kind).toBe('single');
+    expect(p.encodings).toHaveLength(1);
+  });
+  it('AV1 → SVC regardless of simulcast eligibility (never simulcast — E2EE invariant)', () => {
+    for (const simulcast of [true, false]) {
+      const p = buildCameraEncodingPlan({
+        ...planBase,
+        codec: codec('video/AV1'),
+        eligibility: { svc: true, simulcast },
+      });
+      expect(p.kind).toBe('svc');
+      expect(p.encodings).toHaveLength(1);
+    }
+  });
+});

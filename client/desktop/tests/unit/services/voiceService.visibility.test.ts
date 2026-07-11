@@ -141,6 +141,32 @@ describe('voiceService visibility-pause (#1541)', () => {
     });
   });
 
+  it('emitPreferredLayersForConsumer targets an EXPLICIT consumer id with a focus payload (#1924 PiP)', () => {
+    // The PiP window's own consumer is NOT in the main window's consumers map, so this
+    // must address the passed consumer id directly — never resolve by user (which would
+    // hit the main window's now-PAUSED screen consumer). A large focus tile drives
+    // spatialLayer 2, unsticking an H264/VP8 simulcast screen off layer 0.
+    svc.emitPreferredLayersForConsumer('pip-screen-consumer', {
+      visible: true,
+      cssWidth: 1920,
+      cssHeight: 1080,
+      role: 'focus',
+      focusedWindow: true,
+    });
+    expect(emit).toHaveBeenCalledWith('set-preferred-layers', {
+      consumerId: 'pip-screen-consumer',
+      spatialLayer: 2,
+      temporalLayer: 2,
+      visible: true,
+      cssWidth: 1920,
+      cssHeight: 1080,
+      devicePixelRatio: 1,
+      role: 'focus',
+      focusedWindow: true,
+      pressureStepDown: false,
+    });
+  });
+
   it('caps emitted DPR to the media-plane validator ceiling', () => {
     (globalThis as any).devicePixelRatio = 16;
     seedCameraConsumer(svc, 'cam-1', 'user-A');

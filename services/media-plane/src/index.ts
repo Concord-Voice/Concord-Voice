@@ -397,6 +397,12 @@ async function main() {
           socket.join(roomId);
           data.roomId = roomId;
 
+          // #1924 fix "B": the per-SHARER screen-layering gate subsumes the old
+          // late-joiner emit. A sharer's gate is driven by its OWN viewers and
+          // targeted to the sharer's socket, so there is no room-wide gate state
+          // a joiner can miss — the joiner's arrival simply recomputes the gate of
+          // whatever share it consumes.
+
           // Notify others in the room. Identity is server-authoritative
           // (CV-CAN-017) — the same values stored on the Participant, never the
           // client-supplied socket.handshake.auth fields.
@@ -715,7 +721,7 @@ async function main() {
           return;
         }
 
-        const result = await roomManager.setPreferredCameraLayers(roomId, data.userId, payload);
+        const result = await roomManager.setPreferredLayers(roomId, data.userId, payload);
         callback?.({ success: true, effectiveLayers: result.effectiveLayers });
       } catch (error) {
         logger.warn('Set preferred layers rejected', {
@@ -974,6 +980,12 @@ async function main() {
 
     if (event.type === 'camera-layering-gate') {
       io.to(event.roomId).emit('camera-layering-gate', { enabled: event.enabled });
+    }
+
+    if (event.type === 'screen-layering-gate') {
+      // Targeted to the SHARER's socket (#1924 fix "B") — the gate governs that
+      // sharer's own publish, so it is never a room broadcast.
+      io.to(event.targetSocketId).emit('screen-layering-gate', { enabled: event.enabled });
     }
   });
 

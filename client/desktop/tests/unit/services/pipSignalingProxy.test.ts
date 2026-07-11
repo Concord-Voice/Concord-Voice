@@ -13,6 +13,7 @@ const mockVoiceService = {
   getConsumerMeta: vi.fn().mockReturnValue(new Map()),
   pauseConsumer: vi.fn(),
   resumeConsumer: vi.fn(),
+  emitPreferredLayersForConsumer: vi.fn(),
   toggleMute: vi.fn().mockResolvedValue(undefined),
   toggleDeafen: vi.fn(),
   toggleVideo: vi.fn().mockResolvedValue(undefined),
@@ -279,6 +280,32 @@ describe('PipSignalingProxy', () => {
       expect(mockVoiceService.forwardToServer).toHaveBeenCalledWith('pause-consumer', {
         consumerId: 'c1',
       });
+    });
+
+    // #1924: the PiP reports screen render-state demand for its OWN consumer id. The
+    // proxy forwards it to emitPreferredLayersForConsumer, which addresses that exact
+    // consumer on the main socket (NOT resolve-by-user, which would hit the paused one).
+    it('set-preferred-layers forwards the PiP consumer id + focus render-state', async () => {
+      const result = (await sendRpc(getChannel(), 'set-preferred-layers', {
+        consumerId: 'pip-screen-c1',
+        cssWidth: 1920,
+        cssHeight: 1080,
+        visible: true,
+        role: 'focus',
+        focusedWindow: true,
+      })) as any;
+
+      expect(mockVoiceService.emitPreferredLayersForConsumer).toHaveBeenCalledWith(
+        'pip-screen-c1',
+        {
+          visible: true,
+          cssWidth: 1920,
+          cssHeight: 1080,
+          role: 'focus',
+          focusedWindow: true,
+        }
+      );
+      expect(result.success).toBe(true);
     });
   });
 

@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useCallback, useMemo } from 'react';
+import React, { useRef, useEffect, useCallback, useMemo, useId } from 'react';
 import {
   useVoiceStore,
   type ActiveScreenShare,
@@ -11,6 +11,7 @@ import ParticipantTile from './ParticipantTile';
 import ShareTunePill from './ShareTunePill';
 import { VOICE_MAX_SCALE, useVoiceMagnification } from './useVoiceMagnification';
 import { useGridLayout } from '../../hooks/useGridLayout';
+import { useRenderStateReporter } from '../../hooks/useRenderStateReporter';
 import { errorMessage } from '../../utils/redactError';
 import './ParticipantGrid.css';
 
@@ -412,9 +413,30 @@ const StreamGridTile: React.FC<{
   stream?: MediaStream;
   /** Local share detached by Auto-Pause — show the placeholder, not a blank tile. */
   isPaused?: boolean;
+  /**
+   * Producing user of a REMOTE screen share this tile renders — set only for a remote
+   * share so this Tile-view surface feeds receiver screen layer demand (#1924). A screen
+   * watched ONLY in Tile view otherwise reports zero demand and stays pinned at spatial
+   * layer 0 (screen consumers seed at layer 0 and ramp up on reported render-size demand).
+   * Undefined for a local share (we never consume our own screen).
+   */
+  sharerUserId?: string;
   onFocus: (producerId: string) => void;
-}> = ({ producerId, name, stream, isPaused = false, onFocus }) => {
+}> = ({ producerId, name, stream, isPaused = false, sharerUserId, onFocus }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const tileId = useId();
+
+  // #1924: report this Tile-view cell's rendered size/visibility for the remote screen so
+  // the SFU can forward its smallest-sufficient layer and flip the screen-layering gate.
+  // role 'grid' — it is a grid sibling of the participant frames. Inert for a local share.
+  useRenderStateReporter({
+    userId: sharerUserId ?? '',
+    tileId,
+    source: 'screen',
+    elementRef: videoRef,
+    role: 'grid',
+    enabled: !!sharerUserId && !!stream && !isPaused,
+  });
 
   useEffect(() => {
     const el = videoRef.current;
@@ -496,6 +518,9 @@ export const UserFrameGrid: React.FC<UserFrameGridProps> = ({ includeStreamTiles
         return {
           producerId,
           name: meta?.displayName || meta?.username || 'Unknown',
+          // Remote sharer's userId feeds this tile's screen layer demand (#1924);
+          // undefined for a local share (we never consume our own screen).
+          sharerUserId: !isLocal && meta?.userId ? meta.userId : undefined,
           // Honor Auto-Pause for the local preview: when the window blurs,
           // VoiceView sets localStreamPaused and the stage/stream-bar paths drop
           // the local stream. Do the same here so the Tile view does not keep the
@@ -576,6 +601,7 @@ export const UserFrameGrid: React.FC<UserFrameGridProps> = ({ includeStreamTiles
             name={tile.name}
             stream={tile.stream}
             isPaused={tile.paused}
+            sharerUserId={tile.sharerUserId}
             onFocus={handleFocusStream}
           />
         </div>

@@ -57,6 +57,7 @@ import {
   SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
   parseMediaFrameCryptoVersion,
   CryptoVersionMismatchError,
+  SCREEN_GATE_OFF_DEBOUNCE_MS,
 } from '../src/lib/roomManager.js';
 import type { Room, Participant } from '../src/lib/roomManager.js';
 // `./mocks/logger.js` (imported above) replaces @/lib/logger with vi.fn() spies;
@@ -975,6 +976,95 @@ describe('RoomManager', () => {
       expect(fulfilled.length).toBe(1);
       expect(rejected.length).toBe(2);
       expect(rejected[0].reason.message).toContain('Screen share limit reached (max 1)');
+    });
+
+    // Video rtpParameters carrying `count` simulcast encodings (single-encode
+    // when count === 1). The #1924 fix A gate keys on encodings.length.
+    function videoRtpWithEncodings(count: number) {
+      return {
+        codecs: [{ mimeType: 'video/VP8', payloadType: 96, clockRate: 90000 }],
+        headerExtensions: [],
+        encodings: Array.from({ length: count }, (_, i) => ({ ssrc: 10_000 + i })),
+        rtcp: { cname: 'test', reducedSize: true },
+      };
+    }
+
+    describe('screen produce guards — simulcast gate + one-per-participant (#1924)', () => {
+      it('rejects a simulcast (>1 encoding) screen produce when the sharer gate is OFF', async () => {
+        const p = createMockProducer({ kind: 'video' });
+        transport.produce.mockResolvedValueOnce(p);
+        await expect(
+          manager.produce(
+            'room-1',
+            'u-1',
+            transport.id,
+            'video',
+            videoRtpWithEncodings(3) as any,
+            'screen'
+          )
+        ).rejects.toThrow('Screen simulcast not authorized (screen-layering-gate disabled)');
+        // Rejected BEFORE the produce() await — no producer was ever created.
+        expect(transport.produce).not.toHaveBeenCalled();
+      });
+
+      it('allows a simulcast screen produce when the sharer gate is ON', async () => {
+        manager.getRoom('room-1')!.screenLayeringGateBySharer.set('u-1', true);
+        const p = createMockProducer({ kind: 'video', id: 'scr-sim' });
+        transport.produce.mockResolvedValueOnce(p);
+        const info = await manager.produce(
+          'room-1',
+          'u-1',
+          transport.id,
+          'video',
+          videoRtpWithEncodings(3) as any,
+          'screen'
+        );
+        expect(info.source).toBe('screen');
+      });
+
+      it('always allows a single-encoding screen produce regardless of the gate (gate OFF)', async () => {
+        const p = createMockProducer({ kind: 'video', id: 'scr-single' });
+        transport.produce.mockResolvedValueOnce(p);
+        const info = await manager.produce(
+          'room-1',
+          'u-1',
+          transport.id,
+          'video',
+          videoRtpWithEncodings(1) as any,
+          'screen'
+        );
+        expect(info.source).toBe('screen');
+      });
+
+      it('rejects a SECOND screen producer for the same participant (one-per-participant)', async () => {
+        const p1 = createMockProducer({ kind: 'video', id: 'scr-1' });
+        transport.produce.mockResolvedValueOnce(p1);
+        await manager.produce(
+          'room-1',
+          'u-1',
+          transport.id,
+          'video',
+          videoRtpWithEncodings(1) as any,
+          'screen'
+        );
+
+        // The one-per-participant guard runs BEFORE the per-room cap, so this
+        // reports the participant-level reason, not the cap.
+        transport.produce.mockClear();
+        const p2 = createMockProducer({ kind: 'video', id: 'scr-2' });
+        transport.produce.mockResolvedValueOnce(p2);
+        await expect(
+          manager.produce(
+            'room-1',
+            'u-1',
+            transport.id,
+            'video',
+            videoRtpWithEncodings(1) as any,
+            'screen'
+          )
+        ).rejects.toThrow('Participant already has an active screen producer');
+        expect(transport.produce).not.toHaveBeenCalled();
+      });
     });
 
     it('rejects screen-audio when kind is not audio', async () => {
@@ -2169,18 +2259,14 @@ describe('RoomManager', () => {
       await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
 
       await expect(
-        manager.setPreferredCameraLayers('room-1', 'u-1', validLayerDemand('missing'))
+        manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('missing'))
       ).rejects.toThrow('Consumer not found');
     });
 
     it('clamps and applies preferred layers for an owned camera consumer', async () => {
       const { consumer } = await addCameraConsumer('u-1', 'c1');
 
-      const result = await manager.setPreferredCameraLayers(
-        'room-1',
-        'u-1',
-        validLayerDemand('c1')
-      );
+      const result = await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
 
       expect(consumer.setPreferredLayers).toHaveBeenCalledWith({
         spatialLayer: 1,
@@ -2192,7 +2278,7 @@ describe('RoomManager', () => {
     it('caps 1080p camera demand to the default free entitlement layer', async () => {
       const { consumer } = await addCameraConsumer('u-1', 'c1');
 
-      const result = await manager.setPreferredCameraLayers(
+      const result = await manager.setPreferredLayers(
         'room-1',
         'u-1',
         validLayerDemand('c1', { cssWidth: 1920, cssHeight: 1080 })
@@ -2209,7 +2295,7 @@ describe('RoomManager', () => {
       const { participant, consumer } = await addCameraConsumer('u-1', 'c1');
       participant.maxManualBitrateBps = 10_000_000;
 
-      const result = await manager.setPreferredCameraLayers(
+      const result = await manager.setPreferredLayers(
         'room-1',
         'u-1',
         validLayerDemand('c1', { cssWidth: 700, cssHeight: 400, devicePixelRatio: 2 })
@@ -2222,19 +2308,21 @@ describe('RoomManager', () => {
       expect(result.effectiveLayers).toEqual({ spatialLayer: 2, temporalLayer: 2 });
     });
 
-    it('rejects a video consumer that is not a camera source', async () => {
+    it('rejects a video consumer that is not a layerable source', async () => {
+      // Post-#1924: 'screen' is now a valid routed source, so a non-layerable
+      // source (neither camera nor screen) is the rejection case.
       await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const participant = manager.getParticipant('room-1', 'u-1')!;
       const consumer = createMockConsumer({
-        id: 'screen-c1',
+        id: 'other-c1',
         kind: 'video',
-        appData: { source: 'screen' },
+        appData: { source: 'mic' },
       });
-      participant.consumers.set('screen-c1', consumer as any);
+      participant.consumers.set('other-c1', consumer as any);
 
       await expect(
-        manager.setPreferredCameraLayers('room-1', 'u-1', validLayerDemand('screen-c1'))
-      ).rejects.toThrow('Consumer is not camera');
+        manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('other-c1'))
+      ).rejects.toThrow('Consumer is not a layerable video source');
     });
 
     it('records demand and recomputes the gate without calling setPreferredLayers on simple consumers', async () => {
@@ -2256,8 +2344,8 @@ describe('RoomManager', () => {
       consumer1.setPreferredLayers.mockRejectedValue(new Error('simple consumer'));
       participant.consumers.set('c2', consumer2 as any);
 
-      await manager.setPreferredCameraLayers('room-1', 'u-1', validLayerDemand('c1'));
-      await manager.setPreferredCameraLayers(
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+      await manager.setPreferredLayers(
         'room-1',
         'u-1',
         validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
@@ -2283,13 +2371,13 @@ describe('RoomManager', () => {
       });
       participant.consumers.set('c2', consumer2 as any);
 
-      await manager.setPreferredCameraLayers('room-1', 'u-1', validLayerDemand('c1'));
-      await manager.setPreferredCameraLayers(
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+      await manager.setPreferredLayers(
         'room-1',
         'u-1',
         validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
       );
-      await manager.setPreferredCameraLayers(
+      await manager.setPreferredLayers(
         'room-1',
         'u-1',
         validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
@@ -2312,8 +2400,8 @@ describe('RoomManager', () => {
       });
       participant.consumers.set('c2', consumer2 as any);
 
-      await manager.setPreferredCameraLayers('room-1', 'u-1', validLayerDemand('c1'));
-      await manager.setPreferredCameraLayers(
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+      await manager.setPreferredLayers(
         'room-1',
         'u-1',
         validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
@@ -2343,8 +2431,8 @@ describe('RoomManager', () => {
       await addCameraConsumer('u-1', 'c1');
       await addCameraConsumer('u-1', 'c2');
 
-      await manager.setPreferredCameraLayers('room-1', 'u-1', validLayerDemand('c1'));
-      await manager.setPreferredCameraLayers(
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+      await manager.setPreferredLayers(
         'room-1',
         'u-1',
         validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
@@ -2364,8 +2452,8 @@ describe('RoomManager', () => {
       await addCameraConsumer('u-1', 'c1');
       await addCameraConsumer('u-1', 'c2');
 
-      await manager.setPreferredCameraLayers('room-1', 'u-1', validLayerDemand('c1'));
-      await manager.setPreferredCameraLayers(
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+      await manager.setPreferredLayers(
         'room-1',
         'u-1',
         validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
@@ -2386,8 +2474,8 @@ describe('RoomManager', () => {
       await addCameraProducer('u-3', 'p3', fallbackCodecs);
       await addCameraConsumer('u-1', 'c1');
       await addCameraConsumer('u-1', 'c2');
-      await manager.setPreferredCameraLayers('room-1', 'u-1', validLayerDemand('c1'));
-      await manager.setPreferredCameraLayers(
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+      await manager.setPreferredLayers(
         'room-1',
         'u-1',
         validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
@@ -2418,8 +2506,8 @@ describe('RoomManager', () => {
       await addCameraConsumer('u-1', 'c1');
       await addCameraConsumer('u-1', 'c2');
 
-      await manager.setPreferredCameraLayers('room-1', 'u-1', validLayerDemand('c1'));
-      await manager.setPreferredCameraLayers(
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+      await manager.setPreferredLayers(
         'room-1',
         'u-1',
         validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
@@ -2429,6 +2517,587 @@ describe('RoomManager', () => {
       expect(gateEvents(handler)).toEqual([
         { type: 'camera-layering-gate', roomId: 'room-1', enabled: true },
       ]);
+    });
+  });
+
+  describe('setPreferredLayers — screen gate (#1924)', () => {
+    function validLayerDemand(consumerId: string, overrides: Record<string, unknown> = {}) {
+      return {
+        consumerId,
+        spatialLayer: 2,
+        temporalLayer: 2,
+        visible: true,
+        cssWidth: 1280,
+        cssHeight: 720,
+        devicePixelRatio: 1,
+        role: 'focus',
+        focusedWindow: true,
+        pressureStepDown: false,
+        ...overrides,
+      };
+    }
+
+    // A thumbnail-sized viewer resolves to spatial layer 0 (maxUsefulSpatialLayer 0);
+    // the default demand resolves to layer 1 — heterogeneity that engages the gate.
+    const thumbnailDemand = (consumerId: string) =>
+      validLayerDemand(consumerId, { role: 'thumbnail', cssWidth: 320, cssHeight: 180 });
+
+    async function ensureParticipant(userId: string) {
+      if (manager.getParticipant('room-1', userId)) return;
+      await joinRoomWithSupportedCrypto(manager, 'room-1', userId, `sock-${userId}`, {
+        username: userId,
+      });
+    }
+
+    // A screen consumer's watched-share owner rides its server-set appData
+    // (producerUserId) — the per-sharer gate key (#1924 fix "B"). The sharer is
+    // itself a room participant (it publishes the screen), so we join it too;
+    // its socketId is `sock-<producerUserId>` (see ensureParticipant), which the
+    // targeted gate emit addresses. Default sharer is 'sharer-A' so callers that
+    // don't care model a single share.
+    // Default consumer type is 'simple' — a single-encode H.264/VP8 screen, the
+    // realistic pre-simulcast state that ENGAGES the gate (#1924 fix C: an SVC
+    // screen must NOT engage it). Callers pass `type: 'svc'` to model AV1/VP9.
+    async function addVideoConsumer(
+      userId: string,
+      consumerId: string,
+      source: 'screen' | 'camera',
+      producerUserId = 'sharer-A',
+      type: 'svc' | 'simulcast' | 'simple' = 'simple'
+    ) {
+      await ensureParticipant(userId);
+      if (source === 'screen') await ensureParticipant(producerUserId);
+      const participant = manager.getParticipant('room-1', userId)!;
+      const consumer = createMockConsumer({
+        id: consumerId,
+        kind: 'video',
+        type,
+        appData: source === 'screen' ? { source, producerUserId } : { source },
+      });
+      participant.consumers.set(consumerId, consumer as any);
+      return { participant, consumer };
+    }
+
+    // Per-sharer gate state (#1924 fix "B"): the room no longer carries a single
+    // boolean — read the sharer's entry (absent = off).
+    const gateFor = (sharerUserId = 'sharer-A') =>
+      manager.getRoom('room-1')!.screenLayeringGateBySharer.get(sharerUserId) ?? false;
+
+    function screenGateEvents(handler: ReturnType<typeof vi.fn>) {
+      return handler.mock.calls
+        .map((call: any[]) => call[0])
+        .filter((event) => event.type === 'screen-layering-gate');
+    }
+
+    it("engages a sharer's gate at two DISTINCT visible heterogeneous viewers, TARGETED to the sharer's socket (one event)", async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      await addVideoConsumer('u-1', 's1', 'screen'); // watching sharer-A
+      await addVideoConsumer('u-2', 's2', 'screen'); // watching sharer-A
+
+      await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+      expect(gateFor('sharer-A')).toBe(false);
+
+      await manager.setPreferredLayers('room-1', 'u-2', validLayerDemand('s2'));
+
+      expect(gateFor('sharer-A')).toBe(true);
+      // The emit is TARGETED to the sharer's socket, not a room broadcast.
+      expect(screenGateEvents(handler)).toEqual([
+        {
+          type: 'screen-layering-gate',
+          roomId: 'room-1',
+          targetSocketId: 'sock-sharer-A',
+          enabled: true,
+        },
+      ]);
+    });
+
+    it('does NOT recompute the gate for SVC screens (AV1/VP9 never simulcast — #1924 fix C)', async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      // Two DISTINCT heterogeneous viewers — enough to engage a simulcast (type
+      // 'simple') screen — but on an SVC screen the gate must stay OFF and emit
+      // nothing, since SVC never simulcasts and a reproduce would be pointless.
+      const { consumer: c1 } = await addVideoConsumer('u-1', 's1', 'screen', 'sharer-A', 'svc');
+      const { consumer: c2 } = await addVideoConsumer('u-2', 's2', 'screen', 'sharer-A', 'svc');
+
+      await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+      await manager.setPreferredLayers('room-1', 'u-2', validLayerDemand('s2'));
+
+      expect(gateFor('sharer-A')).toBe(false);
+      expect(screenGateEvents(handler)).toEqual([]);
+      // Demand IS still stored, and setPreferredLayers IS still applied (SVC
+      // thins per-layer even though the gate never engages).
+      expect(manager.getRoom('room-1')!.screenLayerDemands.has('s1')).toBe(true);
+      expect(manager.getRoom('room-1')!.screenLayerDemands.has('s2')).toBe(true);
+      expect(c1.setPreferredLayers).toHaveBeenCalled();
+      expect(c2.setPreferredLayers).toHaveBeenCalled();
+    });
+
+    it("a single-encode H.264/VP8 (type 'simple') screen still engages the gate (#1924 fix C — gate on !== 'svc')", async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      await addVideoConsumer('u-1', 's1', 'screen', 'sharer-A', 'simple');
+      await addVideoConsumer('u-2', 's2', 'screen', 'sharer-A', 'simple');
+
+      await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+      await manager.setPreferredLayers('room-1', 'u-2', validLayerDemand('s2'));
+
+      expect(gateFor('sharer-A')).toBe(true);
+      expect(screenGateEvents(handler)).toEqual([
+        {
+          type: 'screen-layering-gate',
+          roomId: 'room-1',
+          targetSocketId: 'sock-sharer-A',
+          enabled: true,
+        },
+      ]);
+    });
+
+    it('does NOT engage when ONE client owns two visible screen consumers (single client cannot trip the gate — #1924 review fix)', async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      // Attacker consumes a victim's screen twice: two consumers, ONE userId.
+      // The gate counts distinct viewers, so this must NOT enable simulcast.
+      await addVideoConsumer('u-1', 's1', 'screen');
+      await addVideoConsumer('u-1', 's2', 'screen');
+
+      await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+      await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s2'));
+
+      expect(gateFor('sharer-A')).toBe(false);
+      expect(screenGateEvents(handler)).toEqual([]);
+    });
+
+    it("PER-STREAM: a third viewer on a DIFFERENT sharer's share does not affect the first sharer's gate (#1924 fix B — Codex finding)", async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      // Two heterogeneous viewers on sharer-A → sharer-A engages.
+      await addVideoConsumer('u-1', 's1', 'screen', 'sharer-A');
+      await addVideoConsumer('u-2', 's2', 'screen', 'sharer-A');
+      await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+      await manager.setPreferredLayers('room-1', 'u-2', validLayerDemand('s2'));
+      expect(gateFor('sharer-A')).toBe(true);
+
+      // A single viewer on sharer-B's DIFFERENT share must NOT engage sharer-B,
+      // and must NOT change sharer-A's gate.
+      await addVideoConsumer('u-3', 's3', 'screen', 'sharer-B');
+      await manager.setPreferredLayers('room-1', 'u-3', thumbnailDemand('s3'));
+      expect(gateFor('sharer-B')).toBe(false);
+      expect(gateFor('sharer-A')).toBe(true);
+      // Only sharer-A ever emitted ON.
+      expect(screenGateEvents(handler)).toEqual([
+        {
+          type: 'screen-layering-gate',
+          roomId: 'room-1',
+          targetSocketId: 'sock-sharer-A',
+          enabled: true,
+        },
+      ]);
+    });
+
+    it('PER-STREAM: two viewers split one-each across two different sharers flip NEITHER gate (the core room-global bug)', async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      // u-1 watches sharer-A; u-2 watches sharer-B. Two viewers in the room, but
+      // each share has only one viewer — under the OLD room-global gate this
+      // wrongly forced BOTH sharers into simulcast. Per-sharer: neither engages.
+      await addVideoConsumer('u-1', 's1', 'screen', 'sharer-A');
+      await addVideoConsumer('u-2', 's2', 'screen', 'sharer-B');
+
+      await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+      await manager.setPreferredLayers('room-1', 'u-2', thumbnailDemand('s2'));
+
+      expect(gateFor('sharer-A')).toBe(false);
+      expect(gateFor('sharer-B')).toBe(false);
+      expect(screenGateEvents(handler)).toEqual([]);
+    });
+
+    it('refuses client-forced layering — a single screen viewer never enables the gate', async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      await addVideoConsumer('u-1', 's1', 'screen');
+
+      await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+
+      expect(gateFor('sharer-A')).toBe(false);
+      expect(screenGateEvents(handler)).toEqual([]);
+    });
+
+    it("does NOT clamp a free viewer's SCREEN demand to layer 1 (full simulcast range — #1924 fix D)", async () => {
+      // A free participant (default entitlement) watching a full-stage simulcast
+      // H.264/VP8 screen. Camera clamps a free user to spatial layer 1; screen
+      // uses the full simulcast range (layer 2). Screen-resolution entitlement is
+      // a separate concern (#2163).
+      await addVideoConsumer('u-1', 's1', 'screen', 'sharer-A', 'simulcast');
+      const result = await manager.setPreferredLayers(
+        'room-1',
+        'u-1',
+        validLayerDemand('s1', { cssWidth: 1920, cssHeight: 1080 })
+      );
+      expect(result.effectiveLayers.spatialLayer).toBe(2);
+    });
+
+    it("DOES clamp a free viewer's CAMERA demand to layer 1 (entitlement cap unchanged — #1924 fix D)", async () => {
+      // Same free participant + same full-stage demand, but source 'camera' still
+      // clamps to the free entitlement spatial layer (1). FIX D changes screen
+      // only; camera clamping is untouched.
+      await addVideoConsumer('u-1', 'cam1', 'camera', 'sharer-A', 'simulcast');
+      const result = await manager.setPreferredLayers(
+        'room-1',
+        'u-1',
+        validLayerDemand('cam1', { cssWidth: 1920, cssHeight: 1080 })
+      );
+      expect(result.effectiveLayers.spatialLayer).toBe(1);
+    });
+
+    it('rejects a screen consumer missing its producer owner (server-set appData)', async () => {
+      await ensureParticipant('u-1');
+      const participant = manager.getParticipant('room-1', 'u-1')!;
+      const consumer = createMockConsumer({
+        id: 'screen-no-owner',
+        kind: 'video',
+        type: 'svc',
+        appData: { source: 'screen' }, // no producerUserId
+      });
+      participant.consumers.set('screen-no-owner', consumer as any);
+
+      await expect(
+        manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('screen-no-owner'))
+      ).rejects.toThrow('Screen consumer missing producer owner');
+    });
+
+    it('routes demand by source — screen → screenLayerDemands, camera → cameraLayerDemands, other map untouched', async () => {
+      await addVideoConsumer('u-1', 's1', 'screen');
+      await addVideoConsumer('u-1', 'cam1', 'camera');
+
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('s1'));
+      const room = manager.getRoom('room-1')!;
+      expect(room.screenLayerDemands.has('s1')).toBe(true);
+      expect(room.cameraLayerDemands.has('s1')).toBe(false);
+
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('cam1'));
+      expect(room.cameraLayerDemands.has('cam1')).toBe(true);
+      expect(room.screenLayerDemands.has('cam1')).toBe(false);
+      // The screen routing did not disturb the camera demand map and vice versa.
+      expect(room.screenLayerDemands.has('s1')).toBe(true);
+    });
+
+    it('rejects a non camera/screen video source', async () => {
+      await ensureParticipant('u-1');
+      const participant = manager.getParticipant('room-1', 'u-1')!;
+      const consumer = createMockConsumer({
+        id: 'mic-v',
+        kind: 'video',
+        appData: { source: 'mic' },
+      });
+      participant.consumers.set('mic-v', consumer as any);
+
+      await expect(
+        manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('mic-v'))
+      ).rejects.toThrow('Consumer is not a layerable video source');
+    });
+
+    it('clears screen demand on consumer close and DEBOUNCES the gate-off below the hysteresis floor', async () => {
+      vi.useFakeTimers();
+      try {
+        const handler = vi.fn();
+        manager.onEvent(handler);
+        await addVideoConsumer('u-1', 's1', 'screen');
+        await addVideoConsumer('u-2', 's2', 'screen');
+
+        await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+        await manager.setPreferredLayers('room-1', 'u-2', validLayerDemand('s2'));
+        expect(gateFor('sharer-A')).toBe(true);
+
+        // One distinct viewer remains (u-2/s2) → 1-viewer hysteresis floor keeps
+        // the gate on with NO transition (so no debounce timer either).
+        expect(manager.closeConsumer('room-1', 'u-1', 's1')).toBe(true);
+        expect(gateFor('sharer-A')).toBe(true);
+
+        // Last viewer closes → OFF is SCHEDULED, not immediate.
+        expect(manager.closeConsumer('room-1', 'u-2', 's2')).toBe(true);
+        expect(gateFor('sharer-A')).toBe(true); // still on — debounced
+        expect(manager.getRoom('room-1')!.screenLayerDemands.size).toBe(0);
+        expect(screenGateEvents(handler)).toEqual([
+          {
+            type: 'screen-layering-gate',
+            roomId: 'room-1',
+            targetSocketId: 'sock-sharer-A',
+            enabled: true,
+          },
+        ]);
+
+        // The window elapses with no re-consume → OFF fires.
+        await vi.advanceTimersByTimeAsync(SCREEN_GATE_OFF_DEBOUNCE_MS);
+        expect(gateFor('sharer-A')).toBe(false);
+        expect(screenGateEvents(handler)).toEqual([
+          {
+            type: 'screen-layering-gate',
+            roomId: 'room-1',
+            targetSocketId: 'sock-sharer-A',
+            enabled: true,
+          },
+          {
+            type: 'screen-layering-gate',
+            roomId: 'room-1',
+            targetSocketId: 'sock-sharer-A',
+            enabled: false,
+          },
+        ]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('CANCELS a pending gate-OFF when the sharer regains a heterogeneous viewer pair before the window (reproduce gap)', async () => {
+      vi.useFakeTimers();
+      try {
+        const handler = vi.fn();
+        manager.onEvent(handler);
+        await addVideoConsumer('u-1', 's1', 'screen');
+        await addVideoConsumer('u-2', 's2', 'screen');
+        await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+        await manager.setPreferredLayers('room-1', 'u-2', validLayerDemand('s2'));
+        expect(gateFor('sharer-A')).toBe(true);
+
+        // Both viewers drop (the sharer reproduced its screen producer) → OFF
+        // scheduled but not yet fired.
+        expect(manager.closeConsumer('room-1', 'u-1', 's1')).toBe(true);
+        expect(manager.closeConsumer('room-1', 'u-2', 's2')).toBe(true);
+        expect(gateFor('sharer-A')).toBe(true); // debounced
+
+        // Viewers re-consume the new producer before the window elapses.
+        await addVideoConsumer('u-1', 's1b', 'screen');
+        await addVideoConsumer('u-2', 's2b', 'screen');
+        await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1b'));
+        await manager.setPreferredLayers('room-1', 'u-2', validLayerDemand('s2b'));
+
+        // Advance well past the window: the OFF must NOT fire.
+        await vi.advanceTimersByTimeAsync(SCREEN_GATE_OFF_DEBOUNCE_MS * 2);
+        expect(gateFor('sharer-A')).toBe(true);
+        // Only the original ON ever emitted — no OFF, no re-ON churn.
+        expect(screenGateEvents(handler)).toEqual([
+          {
+            type: 'screen-layering-gate',
+            roomId: 'room-1',
+            targetSocketId: 'sock-sharer-A',
+            enabled: true,
+          },
+        ]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('the debounced OFF re-checks LIVE demand when it fires and aborts if the sharer is heterogeneous again (defensive)', async () => {
+      vi.useFakeTimers();
+      try {
+        const handler = vi.fn();
+        manager.onEvent(handler);
+        await addVideoConsumer('u-1', 's1', 'screen');
+        await addVideoConsumer('u-2', 's2', 'screen');
+        await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+        await manager.setPreferredLayers('room-1', 'u-2', validLayerDemand('s2'));
+        expect(gateFor('sharer-A')).toBe(true);
+
+        const room = manager.getRoom('room-1')!;
+        // Drop both viewers → OFF scheduled.
+        expect(manager.closeConsumer('room-1', 'u-1', 's1')).toBe(true);
+        expect(manager.closeConsumer('room-1', 'u-2', 's2')).toBe(true);
+        expect(room.screenGateOffTimers.has('sharer-A')).toBe(true);
+
+        // Seed a live heterogeneous pair for sharer-A DIRECTLY (bypassing the
+        // recompute cancel path) so the armed timer is still pending when it
+        // fires and must abort on its own LIVE re-check — the defensive branch.
+        room.screenLayerDemands.set('s1r', {
+          consumerId: 's1r',
+          userId: 'u-1',
+          sharerUserId: 'sharer-A',
+          visible: true,
+          maxUsefulSpatialLayer: 0,
+          pressureStepDown: false,
+        });
+        room.screenLayerDemands.set('s2r', {
+          consumerId: 's2r',
+          userId: 'u-2',
+          sharerUserId: 'sharer-A',
+          visible: true,
+          maxUsefulSpatialLayer: 2,
+          pressureStepDown: false,
+        });
+
+        await vi.advanceTimersByTimeAsync(SCREEN_GATE_OFF_DEBOUNCE_MS);
+        // Timer fired, saw live heterogeneity, aborted the OFF: gate stays ON,
+        // no OFF event, and the timer removed itself.
+        expect(gateFor('sharer-A')).toBe(true);
+        expect(room.screenGateOffTimers.has('sharer-A')).toBe(false);
+        expect(screenGateEvents(handler)).toEqual([
+          {
+            type: 'screen-layering-gate',
+            roomId: 'room-1',
+            targetSocketId: 'sock-sharer-A',
+            enabled: true,
+          },
+        ]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("clears all of a leaving participant's screen demands (only the leaver's)", async () => {
+      // u-1 owns two screen consumers; u-2 is a second distinct viewer so the
+      // gate engages. On u-1 leave, BOTH of u-1's demands clear, u-2's remains.
+      await addVideoConsumer('u-1', 's1', 'screen');
+      await addVideoConsumer('u-1', 's2', 'screen');
+      await addVideoConsumer('u-2', 's3', 'screen');
+
+      await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('s2'));
+      await manager.setPreferredLayers('room-1', 'u-2', thumbnailDemand('s3'));
+      expect(gateFor('sharer-A')).toBe(true);
+
+      await manager.leaveRoom('room-1', 'u-1');
+
+      const room = manager.getRoom('room-1')!;
+      expect(room.screenLayerDemands.has('s1')).toBe(false);
+      expect(room.screenLayerDemands.has('s2')).toBe(false);
+      expect(room.screenLayerDemands.has('s3')).toBe(true);
+      expect(room.screenLayerDemands.size).toBe(1);
+    });
+
+    it('cleans up a leaving SHARER: cancels its pending gate-OFF timer and drops its gate entry', async () => {
+      vi.useFakeTimers();
+      try {
+        // sharer-A joined via addVideoConsumer. Engage its gate, then drop its
+        // viewers to schedule an OFF, then have the SHARER leave.
+        await addVideoConsumer('u-1', 's1', 'screen', 'sharer-A');
+        await addVideoConsumer('u-2', 's2', 'screen', 'sharer-A');
+        await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+        await manager.setPreferredLayers('room-1', 'u-2', validLayerDemand('s2'));
+        expect(gateFor('sharer-A')).toBe(true);
+
+        expect(manager.closeConsumer('room-1', 'u-1', 's1')).toBe(true);
+        expect(manager.closeConsumer('room-1', 'u-2', 's2')).toBe(true);
+        const room = manager.getRoom('room-1')!;
+        expect(room.screenGateOffTimers.has('sharer-A')).toBe(true); // OFF pending
+
+        await manager.leaveRoom('room-1', 'sharer-A');
+
+        // The leaving sharer's timer + gate entry are gone; no dangling state.
+        expect(room.screenGateOffTimers.has('sharer-A')).toBe(false);
+        expect(room.screenLayeringGateBySharer.has('sharer-A')).toBe(false);
+
+        // Advancing past the window fires nothing (timer was cancelled).
+        await vi.advanceTimersByTimeAsync(SCREEN_GATE_OFF_DEBOUNCE_MS * 2);
+        expect(room.screenLayeringGateBySharer.has('sharer-A')).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('seeds a newly consumed simulcast screen consumer at the lowest layer (anti-waste)', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      const producer = createMockProducer({ id: 'screen-p1', kind: 'video' });
+      manager.getParticipant('room-1', 'u-1')!.producers.set('screen-p1', {
+        producer: producer as any,
+        source: 'screen',
+        kind: 'video',
+      });
+
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        createRtpCapabilities() as any
+      );
+      const recvTransport = createMockTransport();
+      const screenConsumer = createMockConsumer({
+        id: 'sc-1',
+        producerId: 'screen-p1',
+        kind: 'video',
+        type: 'simulcast',
+      });
+      recvTransport.consume.mockResolvedValue(screenConsumer);
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(recvTransport);
+      await manager.createTransport('room-1', 'u-2', 'recv');
+
+      await manager.consume('room-1', 'u-2', 'screen-p1');
+
+      expect(screenConsumer.setPreferredLayers).toHaveBeenCalledWith({
+        spatialLayer: 0,
+        temporalLayer: 0,
+      });
+    });
+
+    it('does NOT seed an SVC screen consumer (SVC thinning is cost-neutral)', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      const producer = createMockProducer({ id: 'screen-p1', kind: 'video' });
+      manager.getParticipant('room-1', 'u-1')!.producers.set('screen-p1', {
+        producer: producer as any,
+        source: 'screen',
+        kind: 'video',
+      });
+
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        createRtpCapabilities() as any
+      );
+      const recvTransport = createMockTransport();
+      const screenConsumer = createMockConsumer({
+        id: 'sc-1',
+        producerId: 'screen-p1',
+        kind: 'video',
+        type: 'svc',
+      });
+      recvTransport.consume.mockResolvedValue(screenConsumer);
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(recvTransport);
+      await manager.createTransport('room-1', 'u-2', 'recv');
+
+      await manager.consume('room-1', 'u-2', 'screen-p1');
+
+      expect(screenConsumer.setPreferredLayers).not.toHaveBeenCalled();
+    });
+
+    it('consume still succeeds when the screen seed setPreferredLayers throws (non-fatal)', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+      const producer = createMockProducer({ id: 'screen-p1', kind: 'video' });
+      manager.getParticipant('room-1', 'u-1')!.producers.set('screen-p1', {
+        producer: producer as any,
+        source: 'screen',
+        kind: 'video',
+      });
+
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        createRtpCapabilities() as any
+      );
+      const recvTransport = createMockTransport();
+      const screenConsumer = createMockConsumer({
+        id: 'sc-1',
+        producerId: 'screen-p1',
+        kind: 'video',
+        type: 'simulcast',
+        setPreferredLayers: vi.fn(() => Promise.reject(new Error('worker error'))),
+      });
+      recvTransport.consume.mockResolvedValue(screenConsumer);
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(recvTransport);
+      await manager.createTransport('room-1', 'u-2', 'recv');
+
+      const result = await manager.consume('room-1', 'u-2', 'screen-p1');
+
+      expect(result).not.toBeNull();
+      expect(result!.source).toBe('screen');
     });
   });
 
@@ -3883,10 +4552,13 @@ describe('tier-aware cap enforcement (#1542)', () => {
     const ctx = { roomKind: 'dm' as const };
     const tFree = await joinWithTransport('dm-room', 'u-free', FREE_ENT, ctx);
     const tPrem = await joinWithTransport('dm-room', 'u-prem', PREMIUM_ENT, ctx);
+    const tFree2 = await joinWithTransport('dm-room', 'u-free2', FREE_ENT, ctx);
     // Free cap would be 1 (mocked config) — the present premium participant raises it to 16.
+    // One screen per participant (#1924 fix B), so three distinct sharers prove
+    // the room admits > 1 screen (i.e. the cap was raised above the free 1).
     await produceScreen('dm-room', 'u-free', tFree, 'scr-a');
     await produceScreen('dm-room', 'u-prem', tPrem, 'scr-b');
-    const info = await produceScreen('dm-room', 'u-free', tFree, 'scr-c');
+    const info = await produceScreen('dm-room', 'u-free2', tFree2, 'scr-c');
     expect(info.source).toBe('screen');
   });
 
@@ -3894,6 +4566,7 @@ describe('tier-aware cap enforcement (#1542)', () => {
     const ctx = { roomKind: 'dm' as const };
     const tFree1 = await joinWithTransport('dm-down', 'u-free1', FREE_ENT, ctx);
     const tFree2 = await joinWithTransport('dm-down', 'u-free2', FREE_ENT, ctx);
+    const tFree3 = await joinWithTransport('dm-down', 'u-free3', FREE_ENT, ctx);
     await joinWithTransport('dm-down', 'u-prem', PREMIUM_ENT, ctx);
 
     // Two screenshares admitted under the premium DM cap (16).
@@ -3927,8 +4600,11 @@ describe('tier-aware cap enforcement (#1542)', () => {
     expect(p2.pause).not.toHaveBeenCalled();
     expect(p2.close).not.toHaveBeenCalled();
 
-    // A NEW screen produce is rejected (count 2 >= cap 1).
-    await expect(produceScreen('dm-down', 'u-free1', tFree1, 'scr-3')).rejects.toThrow(
+    // A NEW screen produce from a screenless participant is rejected (count 2 >=
+    // cap 1). One-per-participant (#1924 fix B) means the NEW produce must come
+    // from u-free3 (u-free1/u-free2 already have an active screen), which isolates
+    // the per-room cap from the per-participant guard.
+    await expect(produceScreen('dm-down', 'u-free3', tFree3, 'scr-3')).rejects.toThrow(
       'Screen share limit reached (max 1)'
     );
   });
@@ -3936,14 +4612,16 @@ describe('tier-aware cap enforcement (#1542)', () => {
   it('premium participant joining a free DM raises the cap for the NEXT produce', async () => {
     const ctx = { roomKind: 'dm' as const };
     const tFree = await joinWithTransport('dm-up', 'u-free', FREE_ENT, ctx);
+    const tFree2 = await joinWithTransport('dm-up', 'u-free2', FREE_ENT, ctx);
     await produceScreen('dm-up', 'u-free', tFree, 'scr-1');
-    // Free cap (1) reached — a second produce rejects.
-    await expect(produceScreen('dm-up', 'u-free', tFree, 'scr-2')).rejects.toThrow(
+    // Free cap (1) reached — a second sharer rejects (distinct participant, so
+    // the reject is the per-room cap, not the one-per-participant guard #1924/B).
+    await expect(produceScreen('dm-up', 'u-free2', tFree2, 'scr-2')).rejects.toThrow(
       'Screen share limit reached (max 1)'
     );
     // A premium participant joins → produce-time resolution now sees premium (16).
     await joinWithTransport('dm-up', 'u-prem', PREMIUM_ENT, ctx);
-    const info = await produceScreen('dm-up', 'u-free', tFree, 'scr-3');
+    const info = await produceScreen('dm-up', 'u-free2', tFree2, 'scr-3');
     expect(info.source).toBe('screen');
   });
 

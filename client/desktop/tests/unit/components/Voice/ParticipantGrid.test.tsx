@@ -1,5 +1,6 @@
 import React from 'react';
 import { act } from 'react';
+import { waitFor } from '@testing-library/react';
 import { render, screen } from '../../../test-utils';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { useUserStore } from '@/renderer/stores/userStore';
@@ -43,6 +44,16 @@ vi.mock('@/renderer/hooks/useGridLayout', () => ({
 }));
 
 vi.mock('@/renderer/components/Voice/ParticipantGrid.css', () => ({}));
+
+// #1924: the Tile-view screen tile reports render-size demand via useRenderStateReporter,
+// which lazily imports voiceService. Mock it so the report is observable and the real
+// singleton is never pulled into this render tree. Only StreamGridTile (Tile view) uses
+// it, so this is inert for the AudioOutputs / avatar-grid tests.
+const setRemoteVideoRenderState = vi.fn();
+const removeRemoteVideoTile = vi.fn();
+vi.mock('@/renderer/services/voiceService', () => ({
+  voiceService: { setRemoteVideoRenderState, removeRemoteVideoTile },
+}));
 
 // ── AudioContext mock objects ─────────────────────────────────────────────────
 // Defined at module scope so individual test assertions can reference them,
@@ -892,6 +903,79 @@ describe('UserFrameGrid', () => {
       // alice's announced share (prod-1) is untuned while the cap is full.
       const btn = screen.getByRole('button', { name: "Tune in to alice's screen" });
       expect(btn).toHaveAttribute('aria-disabled', 'true');
+    });
+
+    // ── #1924: a Tile-view screen tile must report render demand so a screen watched
+    //    ONLY in Tile view ramps up off spatial layer 0 (it seeds there and ramps on
+    //    reported render-size demand). Mirrors the ParticipantTile.visibility harness.
+    describe('screen layer demand reporting (#1924, Fix #4)', () => {
+      let ioCallback: ((entries: Array<{ isIntersecting: boolean }>) => void) | null = null;
+      let originalIO: typeof IntersectionObserver;
+      let gbcrSpy: ReturnType<typeof vi.spyOn> | null = null;
+
+      beforeEach(() => {
+        ioCallback = null;
+        originalIO = window.IntersectionObserver;
+        class CaptureIO {
+          constructor(cb: (e: Array<{ isIntersecting: boolean }>) => void) {
+            ioCallback = cb;
+          }
+          observe = vi.fn();
+          unobserve = vi.fn();
+          disconnect = vi.fn();
+        }
+        (window as unknown as { IntersectionObserver: unknown }).IntersectionObserver =
+          CaptureIO as unknown as typeof IntersectionObserver;
+        gbcrSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+          x: 0,
+          y: 0,
+          width: 1280,
+          height: 720,
+          top: 0,
+          right: 1280,
+          bottom: 720,
+          left: 0,
+          toJSON: () => ({}),
+        } as DOMRect);
+      });
+
+      afterEach(() => {
+        window.IntersectionObserver = originalIO;
+        gbcrSpy?.mockRestore();
+        gbcrSpy = null;
+      });
+
+      it("reports the Tile-view screen tile's demand (source 'screen', role 'grid')", async () => {
+        render(<UserFrameGrid includeStreamTiles />);
+        await waitFor(() => expect(ioCallback).not.toBeNull());
+
+        ioCallback!([{ isIntersecting: true }]);
+        await waitFor(() =>
+          expect(setRemoteVideoRenderState).toHaveBeenCalledWith(
+            'u1',
+            expect.any(String),
+            expect.objectContaining({
+              visible: true,
+              cssWidth: 1280,
+              cssHeight: 720,
+              role: 'grid',
+            }),
+            'screen'
+          )
+        );
+      });
+
+      it('reports no demand for a LOCAL share (no sharerUserId → reporter inert)', async () => {
+        useVoiceStore.setState({
+          activeScreenShares: {
+            'prod-1': { producerId: 'prod-1', userId: 'u1', username: 'alice', isLocal: true },
+          },
+        });
+        render(<UserFrameGrid includeStreamTiles />);
+        // enabled=false short-circuits the reporter effect before any observer is created.
+        await waitFor(() => expect(ioCallback).toBeNull());
+        expect(setRemoteVideoRenderState).not.toHaveBeenCalled();
+      });
     });
   });
 
