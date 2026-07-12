@@ -2,9 +2,34 @@ import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
 
-vi.mock('@/renderer/components/Settings/SettingsPage', () => ({
-  default: () => <div data-testid="mock-settings-page">SettingsPage</div>,
-}));
+vi.mock('@/renderer/components/Settings/SettingsPage', async () => {
+  const ReactModule = await import('react');
+  const { default: PresenceExceptionModal } =
+    await import('@/renderer/components/Settings/PresenceExceptionModal');
+
+  function SettingsPageHarness() {
+    const [childOpen, setChildOpen] = ReactModule.useState(false);
+    const triggerRef = ReactModule.useRef<HTMLButtonElement>(null);
+    return (
+      <div data-testid="mock-settings-page">
+        SettingsPage
+        <button ref={triggerRef} type="button" onClick={() => setChildOpen(true)}>
+          Open exception editor
+        </button>
+        {childOpen && (
+          <PresenceExceptionModal
+            returnFocusRef={triggerRef}
+            onDismiss={() => setChildOpen(false)}
+            onSaved={vi.fn()}
+            onOpenCategoryManager={vi.fn()}
+          />
+        )}
+      </div>
+    );
+  }
+
+  return { default: SettingsPageHarness };
+});
 
 vi.mock('@/renderer/components/Servers/ServerSettingsPage', () => ({
   default: ({ serverId }: { serverId: string }) => (
@@ -18,6 +43,7 @@ import SettingsOverlayHost from '@/renderer/components/Settings/SettingsOverlayH
 // to toggle the [open] attribute and dispatch 'close' on close().
 const originalShowModal = HTMLDialogElement.prototype.showModal;
 const originalClose = HTMLDialogElement.prototype.close;
+const showModalOrder: string[] = [];
 
 beforeAll(() => {
   const proto = HTMLDialogElement.prototype as unknown as {
@@ -26,6 +52,7 @@ beforeAll(() => {
     open: boolean;
   };
   proto.showModal = function () {
+    showModalOrder.push((this as unknown as HTMLDialogElement).className);
     (this as unknown as HTMLDialogElement).setAttribute('open', '');
   };
   proto.close = function () {
@@ -51,6 +78,7 @@ describe('SettingsOverlayHost', () => {
   beforeEach(() => {
     resetAllStores();
     document.body.style.overflow = '';
+    showModalOrder.length = 0;
   });
 
   it('dialog is closed when open is null', () => {
@@ -182,5 +210,19 @@ describe('SettingsOverlayHost', () => {
       useSettingsOverlayStore.getState().openSettings('app');
     });
     expect(getDialog().hasAttribute('open')).toBe(true);
+  });
+
+  it('opens the Settings host before its native child exception dialog', async () => {
+    render(<SettingsOverlayHost />);
+    act(() => {
+      useSettingsOverlayStore.getState().openSettings('app');
+    });
+    await screen.findByTestId('mock-settings-page');
+    fireEvent.click(screen.getByRole('button', { name: 'Open exception editor' }));
+
+    const child = await screen.findByRole('dialog', { name: 'Custom Status exceptions' });
+    expect(getDialog()).toHaveAttribute('open');
+    expect(child).toHaveAttribute('open');
+    expect(showModalOrder).toEqual(['settings-overlay-host', 'presence-exception-dialog']);
   });
 });

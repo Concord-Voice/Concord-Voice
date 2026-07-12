@@ -13,6 +13,11 @@ import { useUserStore } from '../stores/userStore';
 import { useVoiceStore } from '../stores/voiceStore';
 import { useMemberStore } from '../stores/memberStore';
 import { runRecoveryModule } from '../utils/runRecoveryModule';
+import { hydratePostLogin } from '../services/postLoginHydration';
+import {
+  beginPostLoginHydrationGuard,
+  isHydrationLifecycleCurrent,
+} from '../services/postLoginHydrationLifecycle';
 
 /** Run preflight diagnostics after grace period expires and route to the appropriate recovery path. */
 async function runPreflightDiagnostics(wsService: ReturnType<typeof getWebSocketService>) {
@@ -127,11 +132,16 @@ function handleReconnected(
     // surface as the Uncaught (in promise) seen in the origin-502-storm logs.
     runRecoveryModule(
       () => import('../services/resetService'),
-      (m) => m.gracefulReset(),
+      async (m) => {
+        m.gracefulReset();
+        const guard = beginPostLoginHydrationGuard();
+        await useUserStore.getState().fetchUser(guard);
+        if (!isHydrationLifecycleCurrent(guard)) return;
+        await hydratePostLogin(guard);
+      },
       'gracefulReset'
     );
     useConnectionStore.getState().reset();
-    useUserStore.getState().fetchUser();
     runRecoveryModule(
       () => import('../services/recoveryService'),
       (m) => m.clearCrashFlag(),

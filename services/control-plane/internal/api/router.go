@@ -984,6 +984,14 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
 					usersHandler.UpdatePresenceSettings,
 				)
+				userRoutes.GET("/me/presence-overrides/:category",
+					middleware.RateLimitByUser(redis, 30, 1*time.Minute),
+					usersHandler.GetPresenceOverrides,
+				)
+				userRoutes.PUT("/me/presence-overrides/:category",
+					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
+					usersHandler.ReplacePresenceOverrides,
+				)
 
 				// SSO settings (issue #270)
 				userRoutes.GET("/me/sso-identities",

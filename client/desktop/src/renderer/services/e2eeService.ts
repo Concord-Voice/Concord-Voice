@@ -73,6 +73,16 @@ export interface E2EESessionKeys {
   wrappedPrivateKeyBase64: string;
 }
 
+/** Prevent an async key derivation owned by an old account from committing globally. */
+export interface E2EEInitializationGuard {
+  signal: AbortSignal;
+  isCurrent: () => boolean;
+}
+
+function initializationIsCurrent(guard?: E2EEInitializationGuard): boolean {
+  return guard === undefined || (!guard.signal.aborted && guard.isCurrent());
+}
+
 class E2EEService {
   /**
    * Expected byte length of a wrapped channel key after base64 decode.
@@ -118,10 +128,12 @@ class E2EEService {
     password: string,
     wrappedPrivateKeyBase64: string,
     saltBase64: string,
-    _keyDerivationAlg: KeyDerivationAlgorithm = 'argon2id'
+    _keyDerivationAlg: KeyDerivationAlgorithm = 'argon2id',
+    guard?: E2EEInitializationGuard
   ): Promise<void> {
+    if (!initializationIsCurrent(guard)) return;
     const saltBytes = new Uint8Array(base64ToArrayBuffer(saltBase64));
-    await this.initializeWithArgon2id(password, wrappedPrivateKeyBase64, saltBytes);
+    await this.initializeWithArgon2id(password, wrappedPrivateKeyBase64, saltBytes, guard);
 
     // No periodic cleanup needed — session-scoped cache (keys stay until rotation or logout)
   }
@@ -132,12 +144,15 @@ class E2EEService {
   private async initializeWithArgon2id(
     password: string,
     wrappedPrivateKeyBase64: string,
-    salt: Uint8Array
+    salt: Uint8Array,
+    guard?: E2EEInitializationGuard
   ): Promise<void> {
     const exportableWrapping = await deriveKeyArgon2idExportable(password, salt);
+    if (!initializationIsCurrent(guard)) return;
     const exportablePrefs = await derivePreferencesKeyArgon2idExportable(password, salt);
+    if (!initializationIsCurrent(guard)) return;
 
-    await this.finalizeKeys(exportableWrapping, exportablePrefs, wrappedPrivateKeyBase64);
+    await this.finalizeKeys(exportableWrapping, exportablePrefs, wrappedPrivateKeyBase64, guard);
   }
 
   /**
@@ -146,35 +161,45 @@ class E2EEService {
   private async finalizeKeys(
     exportableWrapping: CryptoKey,
     exportablePrefs: CryptoKey,
-    wrappedPrivateKeyBase64: string
+    wrappedPrivateKeyBase64: string,
+    guard?: E2EEInitializationGuard
   ): Promise<void> {
     const wrappingRaw = await crypto.subtle.exportKey('raw', exportableWrapping);
+    if (!initializationIsCurrent(guard)) return;
     const prefsRaw = await crypto.subtle.exportKey('raw', exportablePrefs);
+    if (!initializationIsCurrent(guard)) return;
 
-    // Re-import as non-extractable for runtime use (XSS protection)
-    this.wrappingKey = await crypto.subtle.importKey(
+    // Re-import into locals first. No singleton field changes until every
+    // asynchronous step is complete and the initiating account is still current.
+    const wrappingKey = await crypto.subtle.importKey(
       'raw',
       wrappingRaw,
       { name: 'AES-GCM', length: 256 },
       false,
       ['wrapKey', 'unwrapKey']
     );
-    this.preferencesKey = await crypto.subtle.importKey(
+    if (!initializationIsCurrent(guard)) return;
+    const preferencesKey = await crypto.subtle.importKey(
       'raw',
       prefsRaw,
       { name: 'AES-GCM', length: 256 },
       false,
       ['encrypt', 'decrypt']
     );
+    if (!initializationIsCurrent(guard)) return;
 
-    this.wrappedPrivateKey = wrappedPrivateKeyBase64;
-
-    // Cache exported keys for safeStorage (base64 for JSON serialization)
-    this.sessionKeys = {
+    const sessionKeys: E2EESessionKeys = {
       wrappingKeyBase64: arrayBufferToBase64(wrappingRaw),
       preferencesKeyBase64: arrayBufferToBase64(prefsRaw),
       wrappedPrivateKeyBase64,
     };
+
+    // Commit the complete keyset synchronously so cancellation or an account
+    // switch can never expose a half-initialized singleton.
+    this.wrappingKey = wrappingKey;
+    this.preferencesKey = preferencesKey;
+    this.wrappedPrivateKey = wrappedPrivateKeyBase64;
+    this.sessionKeys = sessionKeys;
 
     // Mark the renderer-side E2EE store ready so the post-auth gate
     // (#270 Task 21b) can transition past SSOEagerUnlock. Source of truth

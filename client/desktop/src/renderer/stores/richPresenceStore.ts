@@ -41,6 +41,8 @@ interface RichPresenceState {
   setCustomText: (userId: string, status: CustomTextStatus) => void;
   /** Remove another user's custom-text status. */
   clearCustomText: (userId: string) => void;
+  /** Clear every other user's custom text while preserving self settings. */
+  clearAllCustomText: () => void;
   /** Read another user's custom-text status (undefined if none). */
   getCustomText: (userId: string) => CustomTextStatus | undefined;
   /** Patch the current user's own presence settings. */
@@ -71,6 +73,10 @@ export const useRichPresenceStore = wrapStore(
             delete next[userId];
             return { customTextByUser: next };
           });
+        },
+
+        clearAllCustomText: () => {
+          set({ customTextByUser: {} });
         },
 
         getCustomText: (userId) => get().customTextByUser[userId],

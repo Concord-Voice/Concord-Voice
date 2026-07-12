@@ -28,6 +28,7 @@ interface FriendOrgState {
   reorderSections: (order: string[]) => void;
   pruneFriends: (validFriendUserIds: string[]) => void;
   _hydrate: (blob: FriendOrgBlob) => void;
+  reset: () => void;
 }
 
 const newId = (): string => `cat_${crypto.randomUUID()}`;
@@ -97,4 +98,5 @@ export const useFriendOrgStore = createStore<FriendOrgState>()((set) => ({
   },
 
   _hydrate: (blob) => set({ categories: blob.categories, sectionOrder: blob.sectionOrder }),
+  reset: () => set({ categories: [], sectionOrder: [] }),
 }));

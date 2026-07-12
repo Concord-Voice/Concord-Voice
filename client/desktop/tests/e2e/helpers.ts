@@ -1,7 +1,8 @@
 import { Page, expect } from '@playwright/test';
 import Redis from 'ioredis';
 
-const API_BASE = 'http://localhost:8080';
+const E2E_API_PORT = process.env.E2E_API_PORT ?? process.env.VITE_API_PORT ?? '8080';
+const API_BASE = `http://localhost:${E2E_API_PORT}`;
 
 /**
  * Fetch a pending-registration's verification code from Redis.

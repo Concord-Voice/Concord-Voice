@@ -47,7 +47,18 @@ const REFRESH_BUFFER_SECONDS = 60; // Refresh 60s before expiry
 const MIN_REFRESH_INTERVAL_MS = 10_000; // Rate limit: max 1 refresh per 10s (#240-D)
 
 let proactiveRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-let lastRefreshTimestamp = 0;
+
+interface AuthLifecycleSnapshot {
+  accessToken: string | null;
+  sessionId: string | null;
+}
+
+interface RefreshCooldown {
+  lifecycle: AuthLifecycleSnapshot;
+  startedAt: number;
+}
+
+let refreshCooldown: RefreshCooldown | null = null;
 
 /**
  * Decode the `exp` claim from a JWT access token without a library.
@@ -117,11 +128,16 @@ function scheduleProactiveRefresh(token: string | null): void {
  * Prevents hammering the server if tokens are very short-lived or clock is skewed.
  */
 async function rateLimitedRefresh(): Promise<string | null> {
-  const now = Date.now();
-  if (now - lastRefreshTimestamp < MIN_REFRESH_INTERVAL_MS) {
+  const active = rendererRefreshOperation;
+  if (active !== null) {
+    // Proactive refresh never owns logout/reset behavior, so it is safe to
+    // observe any already-running refresh and let its normal timer reschedule.
+    return active.promise;
+  }
+  const lifecycle = captureAuthLifecycle();
+  if (refreshCooldownIsActive(lifecycle)) {
     return null;
   }
-  lastRefreshTimestamp = now;
   return refreshAccessToken();
 }
 
@@ -135,7 +151,7 @@ export function stopProactiveRefresh(): void {
 
 /** Reset rate limiter state (for tests only). */
 export function _resetRefreshState(): void {
-  lastRefreshTimestamp = 0;
+  refreshCooldown = null;
   cachedMachineIds.clear();
   stopProactiveRefresh();
 }
@@ -182,18 +198,85 @@ if (import.meta.hot) {
  *
  * This promise is shared: concurrent callers await the same in-flight refresh.
  */
-let rendererRefreshPromise: Promise<string | null> | null = null;
+interface RendererRefreshOperation {
+  lifecycle: AuthLifecycleSnapshot;
+  promise: Promise<string | null>;
+}
+
+let rendererRefreshOperation: RendererRefreshOperation | null = null;
+
+function captureAuthLifecycle(): AuthLifecycleSnapshot {
+  const { accessToken, sessionId } = useAuthStore.getState();
+  return { accessToken, sessionId };
+}
+
+function authLifecyclesMatch(left: AuthLifecycleSnapshot, right: AuthLifecycleSnapshot): boolean {
+  if (left.sessionId !== null || right.sessionId !== null) {
+    return left.sessionId !== null && left.sessionId === right.sessionId;
+  }
+  return left.accessToken === right.accessToken;
+}
+
+function refreshCooldownIsActive(lifecycle: AuthLifecycleSnapshot, now = Date.now()): boolean {
+  return (
+    refreshCooldown !== null &&
+    authLifecyclesMatch(refreshCooldown.lifecycle, lifecycle) &&
+    now - refreshCooldown.startedAt < MIN_REFRESH_INTERVAL_MS
+  );
+}
+
+function updateRefreshCooldownOwner(origin: AuthLifecycleSnapshot): void {
+  if (refreshCooldown === null || !authLifecyclesMatch(refreshCooldown.lifecycle, origin)) return;
+  refreshCooldown = { ...refreshCooldown, lifecycle: captureAuthLifecycle() };
+}
+
+function authLifecycleIsCurrent(snapshot: AuthLifecycleSnapshot): boolean {
+  const current = useAuthStore.getState();
+  if (snapshot.sessionId !== null) {
+    return current.accessToken !== null && current.sessionId === snapshot.sessionId;
+  }
+  return current.sessionId === null && current.accessToken === snapshot.accessToken;
+}
+
+function refreshedAuthLifecycleIsCurrent(
+  snapshot: AuthLifecycleSnapshot,
+  refreshedToken: string
+): boolean {
+  const current = useAuthStore.getState();
+  return (
+    current.accessToken === refreshedToken &&
+    (snapshot.sessionId === null || current.sessionId === snapshot.sessionId)
+  );
+}
+
+function requestLifecycleIsCurrent(
+  snapshot: AuthLifecycleSnapshot,
+  signal?: AbortSignal | null
+): boolean {
+  return signal?.aborted !== true && authLifecycleIsCurrent(snapshot);
+}
+
+function refreshedRequestLifecycleIsCurrent(
+  snapshot: AuthLifecycleSnapshot,
+  refreshedToken: string,
+  signal?: AbortSignal | null
+): boolean {
+  return signal?.aborted !== true && refreshedAuthLifecycleIsCurrent(snapshot, refreshedToken);
+}
 
 /**
  * Handle MFA challenge during token refresh if the server flags a suspicious session.
  * Returns the new access token if MFA verification + retry succeeds, null otherwise.
  */
 async function handleMfaChallengeIfNeeded(
-  result: import('../../main/ipcContract').RefreshResult
+  result: import('../../main/ipcContract').RefreshResult,
+  lifecycle: AuthLifecycleSnapshot
 ): Promise<string | null> {
   if (result.status !== 'mfa_required' || !result.mfaChallengeToken) return null;
+  if (!authLifecycleIsCurrent(lifecycle)) return null;
 
   const { useMFAChallengeStore } = await import('../stores/mfaChallengeStore');
+  if (!authLifecycleIsCurrent(lifecycle)) return null;
   const mfaResult = await useMFAChallengeStore
     .getState()
     .showChallenge(
@@ -202,7 +285,7 @@ async function handleMfaChallengeIfNeeded(
       'suspicious_refresh',
       result.mfaRecoveryOnlyMethods || []
     );
-  if (!mfaResult.verified) return null;
+  if (!mfaResult.verified || !authLifecycleIsCurrent(lifecycle)) return null;
 
   // MFA verified — retry the refresh. The cookie-path token from
   // electron.refreshToken() is authoritative (see spec §6.3 / §9). The
@@ -211,7 +294,15 @@ async function handleMfaChallengeIfNeeded(
   // IPC token regardless. Token VALUES are never logged — only the divergence
   // fact, per [internal]rules/observability.md.
   const retryResult = await globalThis.electron.refreshToken();
+  if (!authLifecycleIsCurrent(lifecycle)) return null;
   if (retryResult.status === 'ok' && retryResult.accessToken) {
+    if (
+      lifecycle.sessionId !== null &&
+      retryResult.sessionId !== undefined &&
+      retryResult.sessionId !== lifecycle.sessionId
+    ) {
+      return null;
+    }
     if (
       mfaResult.payload?.access_token &&
       mfaResult.payload.access_token !== retryResult.accessToken
@@ -230,30 +321,50 @@ async function handleMfaChallengeIfNeeded(
  * The main process holds the refresh token securely and makes the HTTP call.
  * Concurrent calls from the renderer are deduplicated.
  */
-export async function refreshAccessToken(): Promise<string | null> {
-  if (rendererRefreshPromise) {
-    return rendererRefreshPromise;
-  }
+async function performTokenRefresh(lifecycle: AuthLifecycleSnapshot): Promise<string | null> {
+  if (!globalThis.electron?.refreshToken) return null;
 
-  rendererRefreshPromise = (async () => {
-    if (!globalThis.electron?.refreshToken) return null;
-
-    const result = await globalThis.electron.refreshToken();
-    if (result.status === 'ok' && result.accessToken) {
-      useAuthStore.getState().setAccessToken(result.accessToken);
-      if (result.sessionId) useAuthStore.getState().setSessionId(result.sessionId);
-      return result.accessToken;
+  const result = await globalThis.electron.refreshToken();
+  if (!authLifecycleIsCurrent(lifecycle)) return null;
+  if (result.status === 'ok' && result.accessToken) {
+    if (
+      lifecycle.sessionId !== null &&
+      result.sessionId !== undefined &&
+      result.sessionId !== lifecycle.sessionId
+    ) {
+      return null;
     }
-
-    // Handle suspicious session MFA challenge
-    return handleMfaChallengeIfNeeded(result);
-  })();
-
-  try {
-    return await rendererRefreshPromise;
-  } finally {
-    rendererRefreshPromise = null;
+    useAuthStore.getState().setAccessToken(result.accessToken);
+    if (result.sessionId) useAuthStore.getState().setSessionId(result.sessionId);
+    return result.accessToken;
   }
+
+  // Handle suspicious session MFA challenge
+  return handleMfaChallengeIfNeeded(result, lifecycle);
+}
+
+export async function refreshAccessToken(): Promise<string | null> {
+  const lifecycle = captureAuthLifecycle();
+  const active = rendererRefreshOperation;
+  if (active !== null) {
+    if (authLifecyclesMatch(active.lifecycle, lifecycle)) return active.promise;
+    await active.promise;
+    if (!authLifecycleIsCurrent(lifecycle)) return null;
+    return refreshAccessToken();
+  }
+
+  const promise = performTokenRefresh(lifecycle)
+    .then((token) => {
+      if (token !== null) updateRefreshCooldownOwner(lifecycle);
+      return token;
+    })
+    .finally(() => {
+      if (rendererRefreshOperation?.promise === promise) rendererRefreshOperation = null;
+    });
+  const operation: RendererRefreshOperation = { lifecycle, promise };
+  rendererRefreshOperation = operation;
+  refreshCooldown = { lifecycle, startedAt: Date.now() };
+  return promise;
 }
 
 /**
@@ -290,18 +401,25 @@ export async function safeJson<T = unknown>(res: Response): Promise<T> {
  * Handle refresh failure by clearing auth state and optionally resetting stores.
  * Only triggers logout once — safe to call from concurrent 401 handlers.
  */
-async function handleRefreshFailure(): Promise<void> {
-  if (!useAuthStore.getState().accessToken) return;
+async function handleRefreshFailure(
+  lifecycle: AuthLifecycleSnapshot,
+  signal?: AbortSignal | null
+): Promise<void> {
+  if (!requestLifecycleIsCurrent(lifecycle, signal)) return;
 
   // If recovery system is already handling this disconnect, don't double-reset
   const { useConnectionStore } = await import('../stores/connectionStore');
+  if (!requestLifecycleIsCurrent(lifecycle, signal)) return;
   const phase = useConnectionStore.getState().phase;
   if (phase !== 'stable') {
-    useAuthStore.getState().clearAccessToken();
+    if (requestLifecycleIsCurrent(lifecycle, signal)) {
+      useAuthStore.getState().clearAccessToken();
+    }
     return;
   }
 
   const { gracefulReset, nuclearReset } = await import('./resetService');
+  if (!requestLifecycleIsCurrent(lifecycle, signal)) return;
   if (useAuthStore.getState().rememberMe) {
     gracefulReset();
     // DO NOT clear disk tokens — session can be restored on next launch
@@ -472,14 +590,17 @@ async function handleReattestPath(
   path: string,
   init: RequestInit | undefined,
   response: Response,
-  mid: string | null
+  mid: string | null,
+  lifecycle: AuthLifecycleSnapshot
 ): Promise<Response> {
+  if (!requestLifecycleIsCurrent(lifecycle, init?.signal)) return response;
   // Both IPC calls route through the *Safe wrappers so a frame-validation or
   // other IPC failure degrades to "no fresh token → original 403" rather than
   // throwing out of the recovery path (no-rot consistency with apiFetch, #1527).
   await clearAttestationTokenSafe();
+  if (!requestLifecycleIsCurrent(lifecycle, init?.signal)) return response;
   const fresh = await getAttestationTokenSafe();
-  if (!fresh) return response;
+  if (!fresh || !requestLifecycleIsCurrent(lifecycle, init?.signal)) return response;
 
   // Retry ONCE with the fresh attestation token. Raw fetch — no recursion.
   const retryHeaders = buildAttestationRetryHeaders(init, mid, fresh);
@@ -497,11 +618,16 @@ async function handleReattestPath(
 async function handleTerminalAttestationPath(
   code: TerminalAttestationCode,
   body: AttestationFailureBody,
-  response: Response
+  response: Response,
+  lifecycle: AuthLifecycleSnapshot,
+  signal?: AbortSignal | null
 ): Promise<Response> {
+  if (!requestLifecycleIsCurrent(lifecycle, signal)) return response;
   await globalThis.electron?.updater?.forceCheckForUpdates('attestation_required');
+  if (!requestLifecycleIsCurrent(lifecycle, signal)) return response;
 
   const { useAttestationFailureStore } = await import('../stores/attestationFailureStore');
+  if (!requestLifecycleIsCurrent(lifecycle, signal)) return response;
   useAttestationFailureStore.getState().showFailure({
     code,
     requiredMinVersion: body.requiredMinVersion,
@@ -529,21 +655,58 @@ async function handle403Attestation(
   path: string,
   init: RequestInit | undefined,
   response: Response,
-  mid: string | null
+  mid: string | null,
+  lifecycle: AuthLifecycleSnapshot
 ): Promise<Response> {
   const body = await parseAttestationBody(response);
+  if (!requestLifecycleIsCurrent(lifecycle, init?.signal)) return response;
 
   if (body.code !== null && ATTESTATION_REATTEST_CODES.has(body.code)) {
-    return handleReattestPath(path, init, response, mid);
+    return handleReattestPath(path, init, response, mid, lifecycle);
   }
 
   if (body.code !== null && isTerminalAttestationCode(body.code)) {
-    return handleTerminalAttestationPath(body.code, body, response);
+    return handleTerminalAttestationPath(body.code, body, response, lifecycle, init?.signal);
   }
 
   // Non-attestation 403 (RBAC denial, unknown code, non-JSON body, etc.).
   // Return untouched — existing callers depend on seeing the raw 403.
   return response;
+}
+
+interface TokenRefreshAttempt {
+  token: string | null;
+  rateLimited: boolean;
+}
+
+async function attempt401TokenRefresh(
+  lifecycle: AuthLifecycleSnapshot
+): Promise<TokenRefreshAttempt> {
+  const active = rendererRefreshOperation;
+  if (active !== null && authLifecyclesMatch(active.lifecycle, lifecycle)) {
+    return { token: await active.promise, rateLimited: false };
+  }
+
+  if (refreshCooldownIsActive(lifecycle)) {
+    return { token: null, rateLimited: true };
+  }
+
+  return { token: await refreshAccessToken(), rateLimited: false };
+}
+
+async function build401RetryHeaders(
+  init: RequestInit | undefined,
+  newToken: string,
+  mid: string | null
+): Promise<Headers> {
+  const headers = new Headers(init?.headers);
+  headers.set('Authorization', `Bearer ${newToken}`);
+  const sessionId = useAuthStore.getState().sessionId;
+  if (sessionId) headers.set('X-Session-ID', sessionId);
+  if (mid) headers.set('X-Machine-Id', mid);
+  const attToken = await getAttestationTokenSafe();
+  if (attToken) headers.set('X-Attestation-Token', attToken);
+  return headers;
 }
 
 /**
@@ -555,45 +718,36 @@ async function handle401Recovery(
   init: RequestInit | undefined,
   response: Response,
   mid: string | null,
-  authoritative: boolean
+  authoritative: boolean,
+  lifecycle: AuthLifecycleSnapshot
 ): Promise<Response> {
-  // If auth already cleared, return original 401
-  if (!useAuthStore.getState().accessToken) return response;
+  // The response and any recovery work belong to the auth lifecycle that
+  // issued the original request. Never let a held 401 adopt a later account.
+  if (lifecycle.accessToken === null) return response;
+  if (!requestLifecycleIsCurrent(lifecycle, init?.signal)) return response;
 
-  // Attempt token refresh (deduplicated + rate-limited)
-  let newToken: string | null = null;
-  if (rendererRefreshPromise) {
-    // Another 401 handler already started a refresh — piggyback on it
-    newToken = await rendererRefreshPromise;
-  } else {
-    const now = Date.now();
-    if (now - lastRefreshTimestamp < MIN_REFRESH_INTERVAL_MS) {
-      // Recently refreshed and no in-flight refresh — likely token revocation.
-      // Route through the single rememberMe-aware authority (handleRefreshFailure)
-      // rather than returning a bare 401. Without this, a revoked !rememberMe
-      // session's encrypted disk token survived this ≤10s cooldown window
-      // un-wiped — the userStore 401 handlers used to mask the gap before #1768
-      // centralized the disk-token decision here (#1768 review, finding #6).
-      //
-      // …but only an AUTHORITATIVE request may act on that revocation signal
-      // and tear down the session. Non-authoritative surfaces (content proxies
-      // like KLIPY #1957, plus best-effort encrypted preferences sync #1956)
-      // are NOT proof the session is dead; tearing them down logged out valid
-      // sessions. Return the raw 401 so callers degrade gracefully; genuine
-      // expiry is still caught by the next authoritative call.
-      if (authoritative) await handleRefreshFailure();
-      return response;
-    }
-    lastRefreshTimestamp = now;
-    newToken = await refreshAccessToken();
+  const refreshAttempt = await attempt401TokenRefresh(lifecycle);
+  if (refreshAttempt.rateLimited) {
+    // Recently refreshed and no in-flight refresh — likely token revocation.
+    // Only an authoritative request may act on that signal and tear down the
+    // session; background sync returns the original 401 and degrades quietly.
+    if (authoritative) await handleRefreshFailure(lifecycle, init?.signal);
+    return response;
   }
 
+  const newToken = refreshAttempt.token;
   if (!newToken) {
     // Refresh failed. Same authority rule as the cooldown branch above: only an
     // authoritative Concord API call may tear down the session on a 401.
     // Non-authoritative surfaces (content proxies #1957, encrypted preferences
     // sync #1956) return the raw 401 and never log the user out.
-    if (authoritative) await handleRefreshFailure();
+    if (authoritative && requestLifecycleIsCurrent(lifecycle, init?.signal)) {
+      await handleRefreshFailure(lifecycle, init?.signal);
+    }
+    return response;
+  }
+
+  if (!refreshedRequestLifecycleIsCurrent(lifecycle, newToken, init?.signal)) {
     return response;
   }
 
@@ -604,17 +758,12 @@ async function handle401Recovery(
   // request matches the original surface — otherwise an attestation-enabled
   // server will 403 the retry because it cannot locate the per-session token
   // record without X-Session-ID, and would also reject a missing X-Attestation-Token.
-  const retryHeaders = new Headers(init?.headers);
-  retryHeaders.set('Authorization', `Bearer ${newToken}`);
-  const sessionId = useAuthStore.getState().sessionId;
-  if (sessionId) retryHeaders.set('X-Session-ID', sessionId);
-  if (mid) retryHeaders.set('X-Machine-Id', mid);
-  // Pull the CURRENT cached attestation token; same source as apiFetch's initial
-  // injection. getAttestationTokenSafe never throws (web/test path → null, IPC
-  // failure → null+logged), so the 401-recovery retry can't be bricked by an
-  // optional header — no-rot consistency with apiFetch (#1527).
-  const attToken = await getAttestationTokenSafe();
-  if (attToken) retryHeaders.set('X-Attestation-Token', attToken);
+  // Pull the current cached attestation token and rebuild all transient auth
+  // headers. The lifecycle is checked again after this asynchronous lookup.
+  const retryHeaders = await build401RetryHeaders(init, newToken, mid);
+  if (!refreshedRequestLifecycleIsCurrent(lifecycle, newToken, init?.signal)) {
+    return response;
+  }
   return apiFetchRaw(path, init, retryHeaders);
 }
 
@@ -631,7 +780,8 @@ export async function apiFetch(
   init?: RequestInit,
   opts?: { authoritative?: boolean }
 ): Promise<Response> {
-  const token = useAuthStore.getState().accessToken;
+  const authLifecycle = captureAuthLifecycle();
+  const token = authLifecycle.accessToken;
 
   const headers = new Headers(init?.headers);
   if (token) {
@@ -641,7 +791,7 @@ export async function apiFetch(
   // per-session token record keyed by (session_id, machine_id). Omitting it
   // when attestation is enabled produces 403 ATTESTATION_MISSING / EXPIRED.
   // Read from authStore (populated by /auth/login and /auth/refresh responses).
-  const sessionId = useAuthStore.getState().sessionId;
+  const sessionId = authLifecycle.sessionId;
   if (sessionId) {
     headers.set('X-Session-ID', sessionId);
   }
@@ -662,7 +812,7 @@ export async function apiFetch(
 
   // Intercept 403 attestation failures before the 401 path.
   if (response.status === 403) {
-    return handle403Attestation(path, init, response, mid);
+    return handle403Attestation(path, init, response, mid, authLifecycle);
   }
 
   // If not 401, return as-is
@@ -670,5 +820,5 @@ export async function apiFetch(
     return response;
   }
 
-  return handle401Recovery(path, init, response, mid, opts?.authoritative ?? true);
+  return handle401Recovery(path, init, response, mid, opts?.authoritative ?? true, authLifecycle);
 }

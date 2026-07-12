@@ -55,6 +55,15 @@ type Hub struct {
 	// Mutex protecting maps accessed from outside the Run goroutine
 	mu sync.RWMutex
 
+	// Deterministic test seam invoked after a custom-text snapshot authorizes a
+	// viewer but before it enqueues the frame. Nil in production.
+	customTextSnapshotBeforeEnqueue func(senderID, viewerID uuid.UUID)
+	// Deterministic test seam invoked after the snapshot reads the sender's
+	// payload but before it computes the audience. Nil in production.
+	customTextSnapshotAfterStateRead func(senderID, viewerID uuid.UUID)
+	customTextDeliveryLocks          [customTextDeliveryLockStripes]sync.Mutex
+	customTextDeliveryCoordinator    customTextDeliveryCoordinator
+
 	// Registered clients (client ID -> Client)
 	clients map[uuid.UUID]*Client
 

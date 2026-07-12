@@ -7,6 +7,14 @@ import { http, HttpResponse } from 'msw';
 
 const API_BASE = 'http://localhost:8080';
 
+function deferred<T>() {
+  let resolve: (value: T | PromiseLike<T>) => void = () => {};
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
@@ -31,12 +39,8 @@ describe('friendOrgSyncService', () => {
     vi.mocked(e2eeService.encryptPreferences).mockClear().mockResolvedValue('encrypted-blob');
     vi.mocked(e2eeService.decryptPreferences).mockReset();
     (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
-    // fetchAndApply sets isApplyingRemote=true and only clears it via
-    // setTimeout(0); if a prior test exits before that microtask drains,
-    // the flag leaks here and silently disables schedulePush.
-    (friendOrgSyncService as unknown as { isApplyingRemote: boolean }).isApplyingRemote = false;
-    // friendOrgStore has no persist; reset to an empty blob explicitly.
-    useFriendOrgStore.getState()._hydrate({ v: 1, categories: [], sectionOrder: [] });
+    // friendOrgStore has no persist; reset decrypted state explicitly.
+    useFriendOrgStore.getState().reset();
   });
 
   describe('pushFriendOrg', () => {
@@ -65,9 +69,101 @@ describe('friendOrgSyncService', () => {
 
       expect(e2eeService.encryptPreferences).not.toHaveBeenCalled();
     });
+
+    it('does not send prior-account ciphertext after stop while encryption is pending', async () => {
+      const encryptionStarted = deferred<void>();
+      const releaseEncryption = deferred<void>();
+      vi.mocked(e2eeService.encryptPreferences).mockImplementationOnce(async () => {
+        encryptionStarted.resolve();
+        await releaseEncryption.promise;
+        return 'prior-account-ciphertext';
+      });
+
+      let putCount = 0;
+      server.use(
+        http.put(`${API_BASE}/api/v1/users/me/friend-organization`, () => {
+          putCount += 1;
+          return HttpResponse.json({ version: 1 });
+        })
+      );
+
+      useFriendOrgStore.getState().createCategory('Prior account', '', null);
+      const push = friendOrgSyncService.pushFriendOrg();
+      await encryptionStarted.promise;
+
+      friendOrgSyncService.stopWatching();
+      useAuthStore.getState().setAccessToken('next-account-token');
+      releaseEncryption.resolve();
+      await push;
+
+      expect(putCount).toBe(0);
+    });
   });
 
   describe('fetchAndApply', () => {
+    it('ignores a prior-account response released after stop and store reset', async () => {
+      const requestStarted = deferred<void>();
+      const releaseResponse = deferred<void>();
+      vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({
+        v: 1,
+        categories: [
+          {
+            id: 'cat_prior',
+            name: 'Prior account',
+            emoji: '',
+            color: null,
+            memberIds: ['prior-user'],
+          },
+        ],
+        sectionOrder: ['cat_prior'],
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/friend-organization`, async () => {
+          requestStarted.resolve();
+          await releaseResponse.promise;
+          return HttpResponse.json({
+            friend_organization: { encrypted_data: 'prior-ciphertext', version: 1 },
+          });
+        })
+      );
+
+      const fetch = friendOrgSyncService.fetchAndApply();
+      await requestStarted.promise;
+      friendOrgSyncService.stopWatching();
+      useFriendOrgStore.getState().reset();
+      releaseResponse.resolve();
+      await fetch;
+
+      expect(useFriendOrgStore.getState().categories).toEqual([]);
+      expect(useFriendOrgStore.getState().sectionOrder).toEqual([]);
+    });
+
+    it('does not bootstrap prior-account state after stop and store reset', async () => {
+      const requestStarted = deferred<void>();
+      const releaseResponse = deferred<void>();
+      let putCount = 0;
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/friend-organization`, async () => {
+          requestStarted.resolve();
+          await releaseResponse.promise;
+          return HttpResponse.json({ friend_organization: null });
+        }),
+        http.put(`${API_BASE}/api/v1/users/me/friend-organization`, () => {
+          putCount += 1;
+          return HttpResponse.json({ version: 1 });
+        })
+      );
+
+      const fetch = friendOrgSyncService.fetchAndApply();
+      await requestStarted.promise;
+      friendOrgSyncService.stopWatching();
+      useFriendOrgStore.getState().reset();
+      releaseResponse.resolve();
+      await fetch;
+
+      expect(putCount).toBe(0);
+    });
+
     it('decrypts and applies a remote blob (round-trip)', async () => {
       vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({
         v: 1,
@@ -138,7 +234,7 @@ describe('friendOrgSyncService', () => {
         )
       );
 
-      await expect(friendOrgSyncService.fetchAndApply()).resolves.toBeUndefined();
+      await expect(friendOrgSyncService.fetchAndApply()).resolves.toBe(true);
     });
   });
 
@@ -196,6 +292,47 @@ describe('friendOrgSyncService', () => {
         await vi.advanceTimersByTimeAsync(3500);
         // No push must have been scheduled from the apply (echo guard held).
         expect(e2eeService.encryptPreferences).not.toHaveBeenCalled();
+      } finally {
+        friendOrgSyncService.stopWatching();
+        vi.useRealTimers();
+      }
+    });
+
+    it('cancels the pending remote-apply timer and restarts from a non-applying state', async () => {
+      vi.useFakeTimers();
+      try {
+        vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({
+          v: 1,
+          categories: [{ id: 'cat_remote', name: 'Remote', emoji: '', color: null, memberIds: [] }],
+          sectionOrder: ['cat_remote'],
+        });
+        server.use(
+          http.get(`${API_BASE}/api/v1/users/me/friend-organization`, () =>
+            HttpResponse.json({
+              friend_organization: { encrypted_data: 'encrypted', version: 1 },
+            })
+          ),
+          http.put(`${API_BASE}/api/v1/users/me/friend-organization`, () =>
+            HttpResponse.json({ version: 2 })
+          )
+        );
+
+        friendOrgSyncService.startWatching();
+        await friendOrgSyncService.fetchAndApply();
+        expect(vi.getTimerCount()).toBe(1);
+
+        // A second remote apply replaces the owned reset timer instead of
+        // leaving an untracked prior-account callback behind.
+        await friendOrgSyncService.fetchAndApply();
+        expect(vi.getTimerCount()).toBe(1);
+
+        friendOrgSyncService.stopWatching();
+        expect(vi.getTimerCount()).toBe(0);
+
+        friendOrgSyncService.startWatching();
+        useFriendOrgStore.getState().createCategory('New account', '', null);
+        await vi.advanceTimersByTimeAsync(3500);
+        expect(e2eeService.encryptPreferences).toHaveBeenCalledOnce();
       } finally {
         friendOrgSyncService.stopWatching();
         vi.useRealTimers();

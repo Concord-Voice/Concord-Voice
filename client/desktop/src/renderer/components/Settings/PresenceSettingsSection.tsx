@@ -2,7 +2,9 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { apiFetch } from '../../services/apiClient';
 import { useAuthStore } from '../../stores/authStore';
 import { useRichPresenceStore } from '../../stores/richPresenceStore';
+import CategoryManagerPanel from '../DirectMessages/CategoryManagerPanel';
 import CollapsibleSection from './CollapsibleSection';
+import PresenceExceptions from './PresenceExceptions';
 import './PresenceSettingsSection.css';
 
 /**
@@ -26,6 +28,7 @@ const PresenceSettingsSection: React.FC = () => {
   const tier = useRichPresenceStore((s) => s.self.tier);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [categoryManagerOpen, setCategoryManagerOpen] = useState(false);
   // Once the user changes the tier (or a PATCH is in flight), a late-resolving
   // hydration GET must NOT clobber that intent. The ref flips on first mutation.
   const userHasMutatedRef = useRef(false);
@@ -122,6 +125,15 @@ const PresenceSettingsSection: React.FC = () => {
           ))}
         </fieldset>
       </div>
+
+      <PresenceExceptions
+        categoryManagerOpen={categoryManagerOpen}
+        onOpenCategoryManager={() => setCategoryManagerOpen(true)}
+      />
+
+      {categoryManagerOpen && (
+        <CategoryManagerPanel onClose={() => setCategoryManagerOpen(false)} />
+      )}
 
       {error && <div className="settings-error">{error}</div>}
     </CollapsibleSection>

@@ -81,6 +81,7 @@ describe('friendStore', () => {
       expect(state.pendingRequests).toEqual([]);
       expect(state.blockedUserIds).toEqual([]);
       expect(state.friendCodes).toEqual([]);
+      expect(state.friendsHydrated).toBe(false);
       expect(state.isLoading).toBe(false);
       expect(state.error).toBeNull();
     });
@@ -246,6 +247,7 @@ describe('friendStore', () => {
       expect(state.friends[0].userId).toBe('user-2');
       expect(state.friends[0].username).toBe('bob');
       expect(state.friends[0].status).toBe('online');
+      expect(state.friendsHydrated).toBe(true);
       expect(state.isLoading).toBe(false);
       expect(state.error).toBeNull();
     });
@@ -341,6 +343,7 @@ describe('friendStore', () => {
 
       await useFriendStore.getState().fetchFriends();
       expect(useFriendStore.getState().error).toBe('Forbidden');
+      expect(useFriendStore.getState().friendsHydrated).toBe(false);
       expect(useFriendStore.getState().isLoading).toBe(false);
     });
 
@@ -364,6 +367,7 @@ describe('friendStore', () => {
 
       await useFriendStore.getState().fetchFriends();
       expect(useFriendStore.getState().friends).toEqual([]);
+      expect(useFriendStore.getState().friendsHydrated).toBe(true);
       expect(useFriendStore.getState().isLoading).toBe(false);
     });
 
@@ -391,6 +395,33 @@ describe('friendStore', () => {
       useFriendStore.setState({ isLoading: true });
       await useFriendStore.getState().fetchFriends();
       expect(callCount).toBe(0);
+    });
+
+    it('does not apply a prior-account friend response after the store is cleared', async () => {
+      let releaseResponse = (): void => {};
+      const responseReady = new Promise<void>((resolve) => {
+        releaseResponse = resolve;
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/friends`, async () => {
+          await responseReady;
+          return HttpResponse.json({
+            friends: [{ id: 'f-old', user_id: 'user-old', username: 'old-account' }],
+          });
+        })
+      );
+
+      const pendingFetch = useFriendStore.getState().fetchFriends();
+      useFriendStore.getState().clearFriends();
+      releaseResponse();
+      await pendingFetch;
+
+      expect(useFriendStore.getState()).toMatchObject({
+        friends: [],
+        friendsHydrated: false,
+        isLoading: false,
+        error: null,
+      });
     });
   });
 
@@ -1052,7 +1083,11 @@ describe('friendStore', () => {
     it('resets all friend state', () => {
       useFriendStore.getState().addFriend(mockFriend);
       useFriendStore.getState().addRequest(mockRequest);
-      useFriendStore.setState({ blockedUserIds: ['user-99'], friendCodes: [mockFriendCode] });
+      useFriendStore.setState({
+        blockedUserIds: ['user-99'],
+        friendCodes: [mockFriendCode],
+        friendsHydrated: true,
+      });
 
       useFriendStore.getState().clearFriends();
 
@@ -1061,6 +1096,7 @@ describe('friendStore', () => {
       expect(state.pendingRequests).toHaveLength(0);
       expect(state.blockedUserIds).toHaveLength(0);
       expect(state.friendCodes).toHaveLength(0);
+      expect(state.friendsHydrated).toBe(false);
     });
   });
 });

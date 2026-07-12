@@ -11,6 +11,10 @@
 
 import { useSavedGifsStore, type SavedGif } from '../stores/savedGifsStore';
 import { fetchEncryptedBlob, pushEncryptedBlob } from './e2eeBlobTransport';
+import {
+  isHydrationLifecycleCurrent,
+  type HydrationLifecycleGuard,
+} from './postLoginHydrationLifecycle';
 
 const DEBOUNCE_MS = 3000;
 const ENDPOINT = '/api/v1/users/me/saved-gifs';
@@ -22,19 +26,31 @@ interface SavedGifsBlob {
 }
 
 class SavedGifsSyncService {
+  private generation = 0;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private unsubscribers: (() => void)[] = [];
+  private readonly activePushControllers = new Set<AbortController>();
   private isApplyingRemote = false;
 
   /**
    * Fetch saved GIFs from server, decrypt, and apply to local store.
    * If the server has no data yet, pushes current local state as initial sync.
    */
-  async fetchAndApply(): Promise<void> {
-    const { blob, pushBootstrap } = await fetchEncryptedBlob<SavedGifsBlob>(ENDPOINT, RESPONSE_KEY);
+  async fetchAndApply(guard?: HydrationLifecycleGuard): Promise<void> {
+    const generation = this.generation;
+    const isCurrent = (): boolean =>
+      generation === this.generation && isHydrationLifecycleCurrent(guard);
+    if (!isCurrent()) return;
+    const { blob, pushBootstrap } = await fetchEncryptedBlob<SavedGifsBlob>(
+      ENDPOINT,
+      RESPONSE_KEY,
+      guard?.signal,
+      isCurrent
+    );
+    if (!isCurrent()) return;
 
     if (pushBootstrap) {
-      await this.pushSavedGifs();
+      await this.pushSavedGifs(guard, generation);
       return;
     }
 
@@ -70,6 +86,7 @@ class SavedGifsSyncService {
    * Stop watching store and clear pending debounce.
    */
   stopWatching(): void {
+    this.generation += 1;
     for (const unsub of this.unsubscribers) {
       unsub();
     }
@@ -78,17 +95,49 @@ class SavedGifsSyncService {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
     }
+    for (const controller of this.activePushControllers) {
+      controller.abort();
+    }
+    this.activePushControllers.clear();
+    this.isApplyingRemote = false;
   }
 
   /**
    * Collect current state, encrypt, and push to server.
    */
-  async pushSavedGifs(): Promise<void> {
+  async pushSavedGifs(
+    guard?: HydrationLifecycleGuard,
+    generation = this.generation,
+    snapshot?: readonly SavedGif[]
+  ): Promise<void> {
+    if (generation !== this.generation || !isHydrationLifecycleCurrent(guard)) return;
+    const controller = new AbortController();
+    const abortPush = (): void => controller.abort();
+    guard?.signal.addEventListener('abort', abortPush, { once: true });
+    this.activePushControllers.add(controller);
+    const isCurrent = (): boolean =>
+      this.activePushControllers.has(controller) &&
+      !controller.signal.aborted &&
+      generation === this.generation &&
+      isHydrationLifecycleCurrent(guard);
     const blob: SavedGifsBlob = {
       v: 1,
-      gifs: useSavedGifsStore.getState().gifs,
+      gifs: (snapshot ?? useSavedGifsStore.getState().gifs).map((gif) => ({ ...gif })),
     };
-    await pushEncryptedBlob(ENDPOINT, blob);
+    try {
+      await pushEncryptedBlob(ENDPOINT, blob, controller.signal, isCurrent);
+    } finally {
+      guard?.signal.removeEventListener('abort', abortPush);
+      this.activePushControllers.delete(controller);
+    }
+  }
+
+  /** Re-encrypt a pre-rotation snapshot after the preferences key changes. */
+  async pushSavedGifsSnapshot(
+    snapshot: readonly SavedGif[],
+    guard: HydrationLifecycleGuard
+  ): Promise<void> {
+    await this.pushSavedGifs(guard, this.generation, snapshot);
   }
 
   private schedulePush(): void {
@@ -97,10 +146,13 @@ class SavedGifsSyncService {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
     }
-    this.debounceTimer = setTimeout(() => {
+    const generation = this.generation;
+    const timer = setTimeout(() => {
+      if (this.debounceTimer !== timer) return;
       this.debounceTimer = null;
-      this.pushSavedGifs();
+      this.pushSavedGifs(undefined, generation);
     }, DEBOUNCE_MS);
+    this.debounceTimer = timer;
   }
 }
 

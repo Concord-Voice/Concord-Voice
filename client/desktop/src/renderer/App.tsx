@@ -249,6 +249,12 @@ function AuthenticatedLayout() {
       // Clear the one-shot flag — `e2eeService.initialize` already flipped
       // `ready=true` via the store sync, so the next render falls through.
       useE2EEStore.getState().setNeedsSSOUnlock(false);
+      // SSO callbacks deliberately defer encrypted hydration until passphrase
+      // unlock. Run it now that E2EE is ready; its lifecycle guard prevents
+      // late work from crossing an account switch.
+      hydratePostLogin().catch((err) => {
+        console.warn('Post-login hydration failed after SSO unlock:', errorMessage(err));
+      });
     };
     const handleSocialRecovery = () => {
       // Drop the access token + reset E2EE state to return the user to the

@@ -14,29 +14,38 @@
 import { useFriendOrgStore, type FriendOrgBlob } from '../stores/friendOrgStore';
 import { fetchEncryptedBlob, pushEncryptedBlob } from './e2eeBlobTransport';
 import { validateFriendOrgBlob } from '../utils/friendOrgBlob';
+import {
+  isHydrationLifecycleCurrent,
+  type HydrationLifecycleGuard,
+} from './postLoginHydrationLifecycle';
 
 const DEBOUNCE_MS = 3000;
 const ENDPOINT = '/api/v1/users/me/friend-organization';
 const RESPONSE_KEY = 'friend_organization';
 
 class FriendOrgSyncService {
+  private generation = 0;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private remoteApplyResetTimer: ReturnType<typeof setTimeout> | null = null;
   private unsubscribers: (() => void)[] = [];
+  private readonly activePushControllers = new Set<AbortController>();
   private isApplyingRemote = false;
 
   /**
    * Fetch the encrypted blob, decrypt, structurally validate, and hydrate the store.
    * If the server has no blob yet, push current local state as the initial sync.
    */
-  async fetchAndApply(): Promise<void> {
+  async fetchAndApply(): Promise<boolean> {
+    const generation = this.generation;
     const { blob, pushBootstrap } = await fetchEncryptedBlob<unknown>(ENDPOINT, RESPONSE_KEY);
+    if (generation !== this.generation) return false;
 
     if (pushBootstrap) {
       await this.pushFriendOrg();
-      return;
+      return generation === this.generation;
     }
 
-    if (blob == null) return;
+    if (blob == null) return true;
 
     // Decrypt-time trust-boundary guard (NEW vs savedGifsSync/preferencesSync).
     const safe: FriendOrgBlob = validateFriendOrgBlob(blob);
@@ -45,10 +54,15 @@ class FriendOrgSyncService {
     try {
       useFriendOrgStore.getState()._hydrate(safe);
     } finally {
-      setTimeout(() => {
+      if (this.remoteApplyResetTimer) {
+        clearTimeout(this.remoteApplyResetTimer);
+      }
+      this.remoteApplyResetTimer = setTimeout(() => {
+        this.remoteApplyResetTimer = null;
         this.isApplyingRemote = false;
       }, 0);
     }
+    return generation === this.generation;
   }
 
   /**
@@ -72,10 +86,9 @@ class FriendOrgSyncService {
     this.unsubscribers.push(unsub);
   }
 
-  /**
-   * Stop watching the store and clear any pending debounce.
-   */
+  /** Stop watching the store and clear both owned timers. */
   stopWatching(): void {
+    this.generation += 1;
     for (const unsub of this.unsubscribers) {
       unsub();
     }
@@ -84,15 +97,52 @@ class FriendOrgSyncService {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
     }
+    if (this.remoteApplyResetTimer) {
+      clearTimeout(this.remoteApplyResetTimer);
+      this.remoteApplyResetTimer = null;
+    }
+    for (const controller of this.activePushControllers) {
+      controller.abort();
+    }
+    this.activePushControllers.clear();
+    this.isApplyingRemote = false;
   }
 
   /**
    * Encrypt the current blob and push it to the server.
    */
-  async pushFriendOrg(): Promise<void> {
-    const s = useFriendOrgStore.getState();
-    const blob: FriendOrgBlob = { v: 1, categories: s.categories, sectionOrder: s.sectionOrder };
-    await pushEncryptedBlob(ENDPOINT, blob);
+  async pushFriendOrg(snapshot?: FriendOrgBlob, guard?: HydrationLifecycleGuard): Promise<boolean> {
+    const generation = this.generation;
+    if (!isHydrationLifecycleCurrent(guard)) return false;
+    const controller = new AbortController();
+    const abortPush = (): void => controller.abort();
+    guard?.signal.addEventListener('abort', abortPush, { once: true });
+    this.activePushControllers.add(controller);
+    const isCurrent = (): boolean =>
+      generation === this.generation &&
+      !controller.signal.aborted &&
+      isHydrationLifecycleCurrent(guard);
+    const current = useFriendOrgStore.getState();
+    const blob: FriendOrgBlob = snapshot ?? {
+      v: 1,
+      categories: current.categories,
+      sectionOrder: current.sectionOrder,
+    };
+    try {
+      await pushEncryptedBlob(ENDPOINT, blob, controller.signal, isCurrent);
+      return isCurrent();
+    } finally {
+      guard?.signal.removeEventListener('abort', abortPush);
+      this.activePushControllers.delete(controller);
+    }
+  }
+
+  /** Re-encrypt a pre-rotation snapshot after the preferences key changes. */
+  async pushFriendOrgSnapshot(
+    snapshot: FriendOrgBlob,
+    guard: HydrationLifecycleGuard
+  ): Promise<boolean> {
+    return this.pushFriendOrg(snapshot, guard);
   }
 
   private schedulePush(): void {

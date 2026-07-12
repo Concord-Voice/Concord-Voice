@@ -1,35 +1,83 @@
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { setSyncSuppressed } from '@/renderer/stores/colorSyncSuppression';
-import { resetAllStores } from '../../helpers/store-helpers';
-import { mockUser } from '../../mocks/fixtures';
-import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
 
 const API_BASE = 'http://localhost:8080';
+const logoutOrder = vi.hoisted(() => [] as string[]);
 
 vi.mock('@/renderer/services/websocketService', () => ({
   getWebSocketService: () => ({
-    disconnect: vi.fn(),
+    disconnect: vi.fn(() => logoutOrder.push('websocket-disconnect')),
     sendProfileUpdate: vi.fn(),
   }),
   ConnectionState: { CONNECTED: 'connected', DISCONNECTED: 'disconnected' },
 }));
 
 vi.mock('@/renderer/services/e2eeService', () => ({
-  e2eeService: { clearKeys: vi.fn(), isInitialized: false, initialize: vi.fn() },
+  e2eeService: {
+    clearKeys: vi.fn(() => logoutOrder.push('e2ee-clear')),
+    isInitialized: false,
+    initialize: vi.fn(),
+  },
 }));
 
 vi.mock('@/renderer/services/preferencesSync', () => ({
-  preferencesSyncService: { stopWatching: vi.fn(), pushPreferences: vi.fn() },
+  preferencesSyncService: {
+    init: vi.fn(),
+    startWatching: vi.fn(),
+    stopWatching: vi.fn(() => logoutOrder.push('preferences-stop')),
+    fetchAndApply: vi.fn().mockResolvedValue(undefined),
+    pushPreferences: vi.fn(),
+  },
+}));
+
+vi.mock('@/renderer/services/savedGifsSync', () => ({
+  savedGifsSyncService: {
+    startWatching: vi.fn(),
+    stopWatching: vi.fn(() => logoutOrder.push('saved-gifs-stop')),
+    fetchAndApply: vi.fn().mockResolvedValue(undefined),
+  },
+}));
+
+vi.mock('@/renderer/services/friendOrgSync', () => ({
+  friendOrgSyncService: {
+    startWatching: vi.fn(),
+    stopWatching: vi.fn(() => logoutOrder.push('friend-org-stop')),
+    fetchAndApply: vi.fn().mockResolvedValue(true),
+  },
+}));
+
+vi.mock('@/renderer/services/presenceOverrideSync', () => ({
+  presenceOverrideSyncService: {
+    reset: vi.fn(() => logoutOrder.push('presence-override-reset')),
+    fetchAndApply: vi.fn().mockResolvedValue(true),
+  },
+}));
+
+vi.mock('@/renderer/services/resetService', () => ({
+  gracefulReset: vi.fn(),
+  nuclearReset: vi.fn(),
 }));
 
 // Spy on the color-sync suppression leaf so the regression test can assert the
 // reset fires SYNCHRONOUSLY during logout() (a dynamic import would defer it).
 vi.mock('@/renderer/stores/colorSyncSuppression', () => ({
-  setSyncSuppressed: vi.fn(),
+  setSyncSuppressed: vi.fn(() => logoutOrder.push('sync-suppression-reset')),
   isSyncSuppressed: vi.fn(() => false),
 }));
+
+import { useUserStore } from '@/renderer/stores/userStore';
+import { useAuthStore } from '@/renderer/stores/authStore';
+import { setSyncSuppressed } from '@/renderer/stores/colorSyncSuppression';
+import { e2eeService } from '@/renderer/services/e2eeService';
+import { preferencesSyncService } from '@/renderer/services/preferencesSync';
+import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';
+import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
+import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
+import { gracefulReset, nuclearReset } from '@/renderer/services/resetService';
+import { hydratePostLogin } from '@/renderer/services/postLoginHydration';
+import { beginPostLoginHydrationGuard } from '@/renderer/services/postLoginHydrationLifecycle';
+import { resetAllStores } from '../../helpers/store-helpers';
+import { mockUser } from '../../mocks/fixtures';
+import { server } from '../../mocks/server';
 
 beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
 afterAll(() => server.close());
@@ -38,6 +86,18 @@ afterEach(() => server.resetHandlers());
 describe('userStore', () => {
   beforeEach(() => {
     resetAllStores();
+    logoutOrder.length = 0;
+    vi.clearAllMocks();
+    vi.mocked(gracefulReset).mockImplementation(() => {
+      logoutOrder.push('graceful-reset');
+    });
+    vi.mocked(nuclearReset).mockImplementation(() => {
+      logoutOrder.push('nuclear-reset');
+      useUserStore.getState().clearUser();
+      useAuthStore.getState().clearAccessToken();
+      globalThis.electron?.clearTokens?.();
+    });
+    window.electron.logout = vi.fn().mockResolvedValue(undefined);
     useAuthStore.getState().setAccessToken('mock-token');
   });
 
@@ -144,6 +204,81 @@ describe('userStore', () => {
       await useUserStore.getState().fetchUser();
       expect(useUserStore.getState().error).toBe('Server error');
     });
+
+    it('does not apply a held response after the auth lifecycle switches accounts', async () => {
+      useAuthStore.getState().setSessionId('session-a');
+      let markRequestStarted: (() => void) | undefined;
+      const requestStarted = new Promise<void>((resolve) => {
+        markRequestStarted = resolve;
+      });
+      let releaseResponse: (() => void) | undefined;
+      const responseReleased = new Promise<void>((resolve) => {
+        releaseResponse = resolve;
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me`, async () => {
+          markRequestStarted?.();
+          await responseReleased;
+          return HttpResponse.json({
+            user: { id: 'stale-account', username: 'stale-account' },
+          });
+        })
+      );
+
+      const guard = beginPostLoginHydrationGuard();
+      const fetch = useUserStore.getState().fetchUser(guard);
+      await requestStarted;
+
+      useAuthStore.getState().setSessionId('session-b');
+      useUserStore.getState().setUser({ id: 'current-account', username: 'current-account' });
+      releaseResponse?.();
+      await fetch;
+
+      expect(guard.isCurrent()).toBe(false);
+      expect(useUserStore.getState().user?.id).toBe('current-account');
+    });
+
+    it('cancels an unguarded held profile fetch synchronously on logout', async () => {
+      let markRequestStarted: (() => void) | undefined;
+      const requestStarted = new Promise<void>((resolve) => {
+        markRequestStarted = resolve;
+      });
+      let releaseResponse: (() => void) | undefined;
+      const responseReleased = new Promise<void>((resolve) => {
+        releaseResponse = resolve;
+      });
+      let requestSignal: AbortSignal | undefined;
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me`, async ({ request }) => {
+          requestSignal = request.signal;
+          markRequestStarted?.();
+          await responseReleased;
+          return HttpResponse.json({
+            user: { id: 'logged-out-account', username: 'logged-out-account' },
+          });
+        })
+      );
+
+      let releaseLogout: (() => void) | undefined;
+      window.electron.logout = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseLogout = resolve;
+          })
+      );
+
+      const fetch = useUserStore.getState().fetchUser();
+      await requestStarted;
+      const logout = useUserStore.getState().logout();
+
+      expect(requestSignal?.aborted).toBe(true);
+      releaseResponse?.();
+      await fetch;
+      expect(useUserStore.getState().user).toBeNull();
+
+      releaseLogout?.();
+      await logout;
+    });
   });
 
   describe('updateProfile', () => {
@@ -182,6 +317,78 @@ describe('userStore', () => {
   });
 
   describe('logout', () => {
+    it('invalidates a held post-login hydration before awaiting main-process logout', async () => {
+      let releaseHydration: (() => void) | undefined;
+      vi.mocked(preferencesSyncService.fetchAndApply).mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseHydration = resolve;
+          })
+      );
+
+      let releaseLogout: (() => void) | undefined;
+      window.electron.logout = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseLogout = resolve;
+          })
+      );
+
+      const hydration = hydratePostLogin();
+      await vi.waitFor(() => expect(preferencesSyncService.fetchAndApply).toHaveBeenCalledOnce());
+      const guard = vi.mocked(preferencesSyncService.fetchAndApply).mock.calls[0]?.[0];
+      expect(guard?.isCurrent()).toBe(true);
+
+      const logout = useUserStore.getState().logout();
+
+      expect(window.electron.logout).toHaveBeenCalledOnce();
+      expect(guard?.isCurrent()).toBe(false);
+      expect(nuclearReset).not.toHaveBeenCalled();
+
+      releaseHydration?.();
+      await hydration;
+      expect(savedGifsSyncService.startWatching).not.toHaveBeenCalled();
+
+      releaseLogout?.();
+      await logout;
+    });
+
+    it('synchronously stops encrypted-social sync before clearing E2EE keys', async () => {
+      let releaseLogout: (() => void) | undefined;
+      window.electron.logout = vi.fn(() => {
+        logoutOrder.push('electron-logout');
+        return new Promise<void>((resolve) => {
+          releaseLogout = resolve;
+        });
+      });
+
+      const pending = useUserStore.getState().logout();
+      const e2eeClearIndex = logoutOrder.indexOf('e2ee-clear');
+
+      expect(preferencesSyncService.stopWatching).toHaveBeenCalledOnce();
+      expect(savedGifsSyncService.stopWatching).toHaveBeenCalledOnce();
+      expect(friendOrgSyncService.stopWatching).toHaveBeenCalledOnce();
+      expect(presenceOverrideSyncService.reset).toHaveBeenCalledOnce();
+      for (const cancellation of [
+        'preferences-stop',
+        'saved-gifs-stop',
+        'friend-org-stop',
+        'presence-override-reset',
+      ]) {
+        expect(logoutOrder.indexOf(cancellation)).toBeLessThan(e2eeClearIndex);
+      }
+      expect(setSyncSuppressed).toHaveBeenCalledWith(false);
+      expect(logoutOrder.indexOf('websocket-disconnect')).toBeGreaterThan(e2eeClearIndex);
+      expect(nuclearReset).not.toHaveBeenCalled();
+
+      releaseLogout?.();
+      await pending;
+
+      expect(nuclearReset).toHaveBeenCalledOnce();
+      expect(logoutOrder.at(-1)).toBe('nuclear-reset');
+      expect(e2eeService.clearKeys).toHaveBeenCalledOnce();
+    });
+
     it('clears user, auth, and calls cleanup', async () => {
       useUserStore.getState().setUser(mockUser);
       await useUserStore.getState().logout();

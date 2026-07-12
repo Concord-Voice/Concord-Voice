@@ -1,9 +1,40 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
+const resetOrder = vi.hoisted(() => [] as string[]);
+
 // Mock apiClient to prevent real HTTP calls
 vi.mock('@/renderer/services/apiClient', () => ({
   stopProactiveRefresh: vi.fn(),
   refreshAccessToken: vi.fn(),
+}));
+
+vi.mock('@/renderer/services/preferencesSync', () => ({
+  preferencesSyncService: {
+    stopWatching: vi.fn(() => resetOrder.push('preferences-sync-stop')),
+    pushPreferences: vi.fn(),
+  },
+}));
+
+vi.mock('@/renderer/services/savedGifsSync', () => ({
+  savedGifsSyncService: {
+    stopWatching: vi.fn(() => resetOrder.push('saved-gifs-sync-stop')),
+  },
+}));
+
+vi.mock('@/renderer/services/friendOrgSync', () => ({
+  friendOrgSyncService: {
+    stopWatching: vi.fn(() => resetOrder.push('friend-sync-stop')),
+  },
+}));
+
+vi.mock('@/renderer/services/presenceOverrideSync', () => ({
+  presenceOverrideSyncService: {
+    reset: vi.fn(),
+  },
+}));
+
+vi.mock('@/renderer/services/notificationPrefsService', () => ({
+  stopExpirySweep: vi.fn(() => resetOrder.push('notification-sweep-stop')),
 }));
 
 import { gracefulReset, nuclearReset } from '@/renderer/services/resetService';
@@ -17,11 +48,33 @@ import { useUserStore } from '@/renderer/stores/userStore';
 import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
 import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/subscriptionStore';
 import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
+import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
+import { usePresenceOverrideStore } from '@/renderer/stores/presenceOverrideStore';
+import { useSavedGifsStore } from '@/renderer/stores/savedGifsStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
+import { preferencesSyncService } from '@/renderer/services/preferencesSync';
+import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';
+import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
+import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
+import { stopExpirySweep } from '@/renderer/services/notificationPrefsService';
+import { stopProactiveRefresh } from '@/renderer/services/apiClient';
 import { mockServer } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {
   resetAllStores();
+  resetOrder.length = 0;
+  vi.mocked(friendOrgSyncService.stopWatching).mockClear();
+  vi.mocked(preferencesSyncService.stopWatching).mockClear();
+  vi.mocked(savedGifsSyncService.stopWatching).mockClear();
+  vi.mocked(stopExpirySweep).mockClear();
+  vi.mocked(stopProactiveRefresh).mockClear();
+  vi.mocked(presenceOverrideSyncService.reset)
+    .mockReset()
+    .mockImplementation(() => {
+      resetOrder.push('presence-sync-reset');
+      usePresenceOverrideStore.getState().reset();
+    });
   // Set up some state to verify it gets cleared
   useAuthStore.getState().setAccessToken('test-token');
   useServerStore.getState().addServer(mockServer);
@@ -32,6 +85,68 @@ beforeEach(() => {
 
 describe('resetService', () => {
   describe('gracefulReset', () => {
+    it('cancels encrypted-social sync before clearing either decrypted store', () => {
+      useFriendOrgStore.getState()._hydrate({
+        v: 1,
+        categories: [
+          {
+            id: 'cat_prior',
+            name: 'Prior account',
+            emoji: '',
+            color: null,
+            memberIds: ['prior-user'],
+          },
+        ],
+        sectionOrder: ['cat_prior'],
+      });
+      usePresenceOverrideStore.getState().apply(['11111111-1111-4111-8111-111111111111'], 7);
+      useSavedGifsStore.getState().saveGif('prior-account-gif');
+      useNotificationPrefsStore
+        .getState()
+        .setMute('server', '22222222-2222-4222-8222-222222222222', true, null);
+
+      const unsubscribeFriend = useFriendOrgStore.subscribe((state, previous) => {
+        if (previous.categories.length > 0 && state.categories.length === 0) {
+          resetOrder.push('friend-store-reset');
+        }
+      });
+      const unsubscribePresence = usePresenceOverrideStore.subscribe((state, previous) => {
+        if (previous.excludedUserIds.length > 0 && state.excludedUserIds.length === 0) {
+          resetOrder.push('presence-store-reset');
+        }
+      });
+
+      try {
+        gracefulReset();
+      } finally {
+        unsubscribeFriend();
+        unsubscribePresence();
+      }
+
+      expect(resetOrder).toEqual([
+        'preferences-sync-stop',
+        'saved-gifs-sync-stop',
+        'friend-sync-stop',
+        'notification-sweep-stop',
+        'presence-sync-reset',
+        'presence-store-reset',
+        'friend-store-reset',
+      ]);
+      expect(useFriendOrgStore.getState().categories).toEqual([]);
+      expect(useFriendOrgStore.getState().sectionOrder).toEqual([]);
+      expect(useSavedGifsStore.getState().gifs).toEqual([]);
+      expect(useNotificationPrefsStore.getState().mutedServers.size).toBe(0);
+      expect(usePresenceOverrideStore.getState()).toMatchObject({
+        excludedUserIds: [],
+        appliedVersion: 0,
+        loading: false,
+        saving: false,
+        conflict: false,
+        error: null,
+      });
+      expect(useAuthStore.getState().accessToken).toBe('test-token');
+    });
+
     it('clears content stores', () => {
       gracefulReset();
 
@@ -70,6 +185,12 @@ describe('resetService', () => {
       expect(useAuthStore.getState().accessToken).toBe('test-token');
     });
 
+    it('preserves proactive token refresh for a same-account reset', () => {
+      gracefulReset();
+
+      expect(stopProactiveRefresh).not.toHaveBeenCalled();
+    });
+
     it('removes specific localStorage keys', () => {
       localStorage.setItem('concord:dm-store', 'data');
       localStorage.setItem('concord-servers', 'data');
@@ -87,6 +208,33 @@ describe('resetService', () => {
   });
 
   describe('nuclearReset', () => {
+    it('inherits encrypted-social cancellation before clearing auth and tokens', () => {
+      useFriendOrgStore.getState()._hydrate({
+        v: 1,
+        categories: [
+          { id: 'cat_prior', name: 'Prior', emoji: '', color: null, memberIds: ['prior-user'] },
+        ],
+        sectionOrder: ['cat_prior'],
+      });
+      usePresenceOverrideStore.getState().apply(['11111111-1111-4111-8111-111111111111'], 3);
+      const clearTokens = vi.fn(() => resetOrder.push('token-clear'));
+      window.electron.clearTokens = clearTokens;
+
+      nuclearReset();
+
+      expect(resetOrder.slice(0, 5)).toEqual([
+        'preferences-sync-stop',
+        'saved-gifs-sync-stop',
+        'friend-sync-stop',
+        'notification-sweep-stop',
+        'presence-sync-reset',
+      ]);
+      expect(resetOrder.at(-1)).toBe('token-clear');
+      expect(useFriendOrgStore.getState().categories).toEqual([]);
+      expect(usePresenceOverrideStore.getState().excludedUserIds).toEqual([]);
+      expect(useAuthStore.getState().accessToken).toBeNull();
+    });
+
     it('clears everything including auth', () => {
       nuclearReset();
 

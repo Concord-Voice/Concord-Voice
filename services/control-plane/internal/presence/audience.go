@@ -12,6 +12,14 @@ import (
 	"github.com/google/uuid"
 )
 
+// DBTX is the query surface shared by *sql.DB and *sql.Tx. Audience reads use
+// this interface so callers can compute authorization decisions against the
+// same transaction that will persist a related settings change.
+type DBTX interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // ComputePresenceAudience returns the set of user IDs permitted to see senderID's
 // base presence: accepted friends, friends-of-friends when the sender has
 // dm_friends_of_friends enabled, and users sharing >=1 server with the sender.
@@ -22,7 +30,7 @@ import (
 // It is the union of the three reusable component sets (friendsOf,
 // friendsOfFriendsOf, serverPeersOf); the rich-presence per-category tier logic
 // composes those components selectively (see customtext.go, #1233).
-func ComputePresenceAudience(ctx context.Context, db *sql.DB, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
+func ComputePresenceAudience(ctx context.Context, db DBTX, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
 	friends, err := friendsOf(ctx, db, senderID)
 	if err != nil {
 		return nil, err
@@ -52,7 +60,7 @@ func ComputePresenceAudience(ctx context.Context, db *sql.DB, senderID uuid.UUID
 
 // friendsOf returns the sender's accepted friends (the CASE picks the other side
 // of each friendship row).
-func friendsOf(ctx context.Context, db *sql.DB, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
+func friendsOf(ctx context.Context, db DBTX, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
 	out := make(map[uuid.UUID]bool)
 	rows, err := db.QueryContext(ctx, `
 		SELECT CASE WHEN requester_id = $1 THEN addressee_id ELSE requester_id END AS friend_id
@@ -71,7 +79,7 @@ func friendsOf(ctx context.Context, db *sql.DB, senderID uuid.UUID) (map[uuid.UU
 // friendsOfFriendsOf returns friends-of-friends IDs ONLY when the sender enabled
 // dm_friends_of_friends; otherwise an empty set. This opt-in gate (spec §6.6) is
 // shared by base presence and the rich-presence Friends/Servers tiers.
-func friendsOfFriendsOf(ctx context.Context, db *sql.DB, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
+func friendsOfFriendsOf(ctx context.Context, db DBTX, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
 	out := make(map[uuid.UUID]bool)
 	enabled, err := friendsOfFriendsEnabled(ctx, db, senderID)
 	if err != nil {
@@ -102,7 +110,7 @@ func friendsOfFriendsOf(ctx context.Context, db *sql.DB, senderID uuid.UUID) (ma
 }
 
 // serverPeersOf returns users co-resident in >=1 server with the sender.
-func serverPeersOf(ctx context.Context, db *sql.DB, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
+func serverPeersOf(ctx context.Context, db DBTX, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
 	out := make(map[uuid.UUID]bool)
 	rows, err := db.QueryContext(ctx, `
 		SELECT DISTINCT sm2.user_id
@@ -121,7 +129,7 @@ func serverPeersOf(ctx context.Context, db *sql.DB, senderID uuid.UUID) (map[uui
 
 // friendsOfFriendsEnabled reads the sender's dm_friends_of_friends flag from
 // privacy_settings; a missing row defaults to false.
-func friendsOfFriendsEnabled(ctx context.Context, db *sql.DB, userID uuid.UUID) (bool, error) {
+func friendsOfFriendsEnabled(ctx context.Context, db DBTX, userID uuid.UUID) (bool, error) {
 	var enabled bool
 	err := db.QueryRowContext(ctx,
 		`SELECT COALESCE(dm_friends_of_friends, FALSE) FROM privacy_settings WHERE user_id = $1`,

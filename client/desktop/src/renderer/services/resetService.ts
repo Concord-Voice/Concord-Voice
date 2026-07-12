@@ -36,6 +36,15 @@ import { useE2EEStore } from '../stores/e2eeStore';
 import { useRichPresenceStore } from '../stores/richPresenceStore';
 import { useSubscriptionStore } from '../stores/subscriptionStore';
 import { useAudioSettingsStore } from '../stores/audioSettingsStore';
+import { preferencesSyncService } from './preferencesSync';
+import { savedGifsSyncService } from './savedGifsSync';
+import { friendOrgSyncService } from './friendOrgSync';
+import { presenceOverrideSyncService } from './presenceOverrideSync';
+import { stopExpirySweep } from './notificationPrefsService';
+import { useFriendOrgStore } from '../stores/friendOrgStore';
+import { useSavedGifsStore } from '../stores/savedGifsStore';
+import { useNotificationPrefsStore } from '../stores/notificationPrefsStore';
+import { resetPostLoginHydrationLifecycle } from './postLoginHydrationLifecycle';
 
 /**
  * Clears content stores while preserving device settings.
@@ -43,8 +52,19 @@ import { useAudioSettingsStore } from '../stores/audioSettingsStore';
  * but user-specific content must be wiped to prevent ghost artifacts.
  */
 export function gracefulReset(): void {
-  // Stop proactive token refresh timer (#240)
-  stopProactiveRefresh();
+  resetPostLoginHydrationLifecycle();
+
+  // Stop every account-bound watcher/timer before clearing its store. This also
+  // invalidates in-flight encrypt/decrypt work so a prior account cannot finish
+  // against the next account's token after a fast logout/login transition.
+  preferencesSyncService.stopWatching();
+  savedGifsSyncService.stopWatching();
+  friendOrgSyncService.stopWatching();
+  stopExpirySweep();
+  presenceOverrideSyncService.reset();
+  useFriendOrgStore.getState().reset();
+  useSavedGifsStore.getState().reset();
+  useNotificationPrefsStore.getState().clearAll();
 
   // Clear content stores (in-memory state)
   useServerStore.getState().clearServers();
@@ -124,6 +144,11 @@ export function softRestart(): void {
  * settings keys — clear user-scoped fields inside those stores instead.
  */
 export function nuclearReset(): void {
+  // Nuclear reset ends the authenticated lifecycle. A same-account graceful
+  // reset must keep this timer alive because its token value does not change and
+  // therefore cannot retrigger apiClient's auth-store subscription.
+  stopProactiveRefresh();
+
   // Start with everything gracefulReset does
   gracefulReset();
 

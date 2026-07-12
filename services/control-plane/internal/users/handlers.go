@@ -6,13 +6,16 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/auth"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/media"
@@ -22,39 +25,120 @@ import (
 )
 
 const (
-	errMsgUserNotFound         = "User not found"
-	errMsgUnauthorized         = "Unauthorized"
-	errMsgFailedUpdateProfile  = "Failed to update profile"
-	errMsgFailedChangePassword = "Failed to change password"
-	dataImagePrefix            = "data:image/"
+	errMsgUserNotFound          = "User not found"
+	errMsgUnauthorized          = "Unauthorized"
+	errMsgFailedUpdateProfile   = "Failed to update profile"
+	errMsgFailedChangePassword  = "Failed to change password"
+	errMsgMFAVerificationFailed = "MFA verification failed"
+	dataImagePrefix             = "data:image/"
+	customStatusLockStripes     = 256
 )
 
 // MFAVerifier checks MFA status and verifies codes for sensitive operations.
 type MFAVerifier interface {
-	IsEnabled(ctx context.Context, userID string) bool
-	VerifyCode(ctx context.Context, userID string, code string) (bool, error)
-	GetEnabledMethods(ctx context.Context, userID string) ([]string, error)
+	VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID string, code string) (bool, error)
+}
+
+type presenceOverrideBroadcaster interface {
+	BroadcastCustomText(uuid.UUID, int, *websocket.CustomTextPayload)
+	BroadcastToUser(uuid.UUID, websocket.OutgoingMessage)
+	BroadcastCustomTextAudienceDelta(
+		uuid.UUID,
+		map[uuid.UUID]bool,
+		map[uuid.UUID]bool,
+		*websocket.CustomTextPayload,
+	)
+}
+
+type customTextResetBroadcaster interface {
+	ClearCustomTextForPresenceAudience(uuid.UUID)
+}
+
+type sessionDisconnector interface {
+	DisconnectUser(uuid.UUID)
+}
+
+// customStatusCoordinator serializes Custom Status persistence and synchronous
+// fan-out for one sender. The production implementation remains the bounded
+// 256-stripe mutex coordinator; the interface is private so deterministic
+// handler-level concurrency tests can observe queueing without exposing a
+// production API.
+type customStatusCoordinator interface {
+	WithSender(uuid.UUID, func())
+}
+
+type stripedCustomStatusCoordinator struct {
+	locks *[customStatusLockStripes]sync.Mutex
+}
+
+func (c *stripedCustomStatusCoordinator) WithSender(senderID uuid.UUID, fn func()) {
+	lock := customStatusLock(c.locks, senderID)
+	lock.Lock()
+	defer lock.Unlock()
+	fn()
 }
 
 // Handler handles user-related requests including profile management and settings.
 type Handler struct {
-	db          *sql.DB
-	log         *logger.Logger
-	hub         *websocket.Hub
-	mfaVerifier MFAVerifier
-	tiers       entitlements.TierResolver // resolves the acting user's subscription tier (#1298)
-	store       media.ObjectDeleter       // nil when object storage is not configured
+	db                          *sql.DB
+	log                         *logger.Logger
+	hub                         *websocket.Hub
+	presenceOverrideBroadcaster presenceOverrideBroadcaster
+	customTextResetBroadcaster  customTextResetBroadcaster
+	sessionDisconnector         sessionDisconnector
+	customStatusLocks           [customStatusLockStripes]sync.Mutex
+	customStatusCoordinator     customStatusCoordinator
+	mfaVerifier                 MFAVerifier
+	tiers                       entitlements.TierResolver // resolves the acting user's subscription tier (#1298)
+	store                       media.ObjectDeleter       // nil when object storage is not configured
+}
+
+func (h *Handler) customStatusLock(senderID uuid.UUID) *sync.Mutex {
+	return customStatusLock(&h.customStatusLocks, senderID)
+}
+
+func customStatusLock(locks *[customStatusLockStripes]sync.Mutex, senderID uuid.UUID) *sync.Mutex {
+	const (
+		fnvOffset32 = uint32(2166136261)
+		fnvPrime32  = uint32(16777619)
+	)
+	hash := fnvOffset32
+	for _, part := range senderID {
+		hash ^= uint32(part)
+		hash *= fnvPrime32
+	}
+	return &locks[int(hash%customStatusLockStripes)]
+}
+
+func (h *Handler) withCustomStatusSender(senderID uuid.UUID, fn func()) {
+	if h.customStatusCoordinator != nil {
+		h.customStatusCoordinator.WithSender(senderID, fn)
+		return
+	}
+	// Preserve safe zero-value behavior for narrow unit tests that construct a
+	// Handler literal instead of going through NewHandler.
+	lock := h.customStatusLock(senderID)
+	lock.Lock()
+	defer lock.Unlock()
+	fn()
 }
 
 // NewHandler creates a new user handler.
 func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, mfaVerifier MFAVerifier, tiers entitlements.TierResolver) *Handler {
-	return &Handler{
+	h := &Handler{
 		db:          db,
 		log:         log,
 		hub:         hub,
 		mfaVerifier: mfaVerifier,
 		tiers:       tiers,
 	}
+	h.customStatusCoordinator = &stripedCustomStatusCoordinator{locks: &h.customStatusLocks}
+	if hub != nil {
+		h.presenceOverrideBroadcaster = hub
+		h.customTextResetBroadcaster = hub
+		h.sessionDisconnector = hub
+	}
+	return h
 }
 
 // SetMediaStore configures optional object storage for media cleanup on profile image removal.
@@ -231,16 +315,38 @@ func (h *Handler) ReplaceMyKeys(c *gin.Context) {
 		return
 	}
 
-	// Step-up re-authentication: this is a destructive, irreversible operation
-	// (it purges all of the user's wrapped channel/DM keys and rotates the
-	// public key). A valid access token + acknowledgment is not enough — require
-	// the current password and MFA when enabled, mirroring ChangePassword, so a
-	// stolen access token alone cannot destroy a victim's E2EE history (#1293).
-	if !h.verifyResetStepUp(c, userID, req.CurrentPassword, req.MFACode) {
+	uid, ok := userID.(string)
+	if !ok {
+		h.log.Error("user_id is not a string; refusing key reset", "type", fmt.Sprintf("%T", userID))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
 		return
 	}
+	senderID, err := uuid.Parse(uid)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgUnauthorized})
+		return
+	}
+	h.withCustomStatusSender(senderID, func() {
+		h.replaceMyKeysCoordinated(
+			c,
+			userID,
+			senderID,
+			req,
+			wrappedKeyBytes,
+			saltBytes,
+			publicKeyBytes,
+		)
+	})
+}
 
-	tx, err := h.db.Begin()
+func (h *Handler) replaceMyKeysCoordinated(
+	c *gin.Context,
+	userID interface{},
+	senderID uuid.UUID,
+	req ReplaceKeysRequest,
+	wrappedKeyBytes, saltBytes, publicKeyBytes []byte,
+) {
+	tx, err := h.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		h.log.Error("Failed to begin key replacement tx", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
@@ -255,6 +361,19 @@ func (h *Handler) ReplaceMyKeys(c *gin.Context) {
 		}
 	}()
 
+	if err := h.verifyStepUpWithLockedUser(
+		c.Request.Context(), tx, senderID, req.CurrentPassword, req.MFACode,
+	); err != nil {
+		var reauthErr *stepUpReauthenticationError
+		if errors.As(err, &reauthErr) {
+			c.JSON(reauthErr.status, reauthErr.body)
+			return
+		}
+		h.log.Error("Failed to re-authenticate key replacement", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
+		return
+	}
+
 	if err := replaceKeyMaterialTx(tx, userID, wrappedKeyBytes, saltBytes, req.KeyDerivationAlg, publicKeyBytes); err != nil {
 		h.log.Error("Failed to replace E2EE key material", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
@@ -262,14 +381,25 @@ func (h *Handler) ReplaceMyKeys(c *gin.Context) {
 	}
 
 	if err := tx.Commit(); err != nil {
+		h.clearCustomTextAndDisconnect(senderID)
 		h.log.Error("Failed to commit key replacement", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
 		return
 	}
 	committed = true
 
+	h.clearCustomTextAndDisconnect(senderID)
 	h.log.Info("E2EE keys replaced (atomic reset)", "user_id", userID, "alg", req.KeyDerivationAlg)
 	c.JSON(http.StatusOK, gin.H{"message": "Keys replaced successfully. Encrypted message history was reset."})
+}
+
+func (h *Handler) clearCustomTextAndDisconnect(userID uuid.UUID) {
+	if h.customTextResetBroadcaster != nil {
+		h.customTextResetBroadcaster.ClearCustomTextForPresenceAudience(userID)
+	}
+	if h.sessionDisconnector != nil {
+		h.sessionDisconnector.DisconnectUser(userID)
+	}
 }
 
 // parseReplaceKeysRequest binds and validates a ReplaceKeysRequest, writing the
@@ -306,31 +436,6 @@ func parseReplaceKeysRequest(c *gin.Context) (req ReplaceKeysRequest, wrapped, s
 		req.KeyDerivationAlg = "argon2id"
 	}
 	return req, wrapped, salt, publicKey, true
-}
-
-// verifyResetStepUp re-authenticates the caller for the destructive key reset:
-// current password + MFA when enabled, reusing the same helpers as
-// ChangePassword. It writes the appropriate response and returns false on any
-// failure. Defeats the stolen-access-token threat on this data-loss path (#1293).
-func (h *Handler) verifyResetStepUp(c *gin.Context, userID interface{}, currentPassword, mfaCode string) bool {
-	// Fail closed if user_id is not a string: otherwise the comma-ok form would
-	// yield "" and verifyMFAForPasswordChange would treat MFA as disabled,
-	// silently skipping the step-up on this destructive path (Gitar review).
-	uid, ok := userID.(string)
-	if !ok {
-		h.log.Error("user_id is not a string; refusing key reset", "type", fmt.Sprintf("%T", userID))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
-		return false
-	}
-	if _, status, errMsg := h.verifyCurrentPassword(uid, currentPassword); status != 0 {
-		c.JSON(status, gin.H{"error": errMsg})
-		return false
-	}
-	if status, body := h.verifyMFAForPasswordChange(c, uid, mfaCode); status != 0 {
-		c.JSON(status, body)
-		return false
-	}
-	return true
 }
 
 // UpdateProfileRequest represents a request to update profile fields
@@ -759,14 +864,39 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 	})
 }
 
-// ChangePasswordRequest represents a request to change password
+// changePasswordPresenceOverride carries the opaque replacement ciphertext
+// and CAS version that must rotate with a password-derived preferences key.
+type changePasswordPresenceOverride struct {
+	EncryptedData   string `json:"encrypted_data"`
+	ExpectedVersion int    `json:"expected_version"`
+}
+
+// ChangePasswordRequest represents a request to change password.
 type ChangePasswordRequest struct {
-	CurrentPassword   string `json:"current_password" binding:"required"`
-	NewPassword       string `json:"new_password" binding:"required"`
-	WrappedPrivateKey string `json:"wrapped_private_key" binding:"required"`
-	KeyDerivationSalt string `json:"key_derivation_salt" binding:"required"`
-	KeyDerivationAlg  string `json:"key_derivation_alg"` // "pbkdf2" or "argon2id"
-	MFACode           string `json:"mfa_code"`           // Required when MFA is enabled
+	CurrentPassword   string                          `json:"current_password" binding:"required"`
+	NewPassword       string                          `json:"new_password" binding:"required"`
+	WrappedPrivateKey string                          `json:"wrapped_private_key" binding:"required"`
+	KeyDerivationSalt string                          `json:"key_derivation_salt" binding:"required"`
+	KeyDerivationAlg  string                          `json:"key_derivation_alg"` // "pbkdf2" or "argon2id"
+	MFACode           string                          `json:"mfa_code"`           // Required when MFA is enabled
+	PresenceOverride  *changePasswordPresenceOverride `json:"presence_override"`
+}
+
+func validateChangePasswordPresenceOverride(rotation *changePasswordPresenceOverride) error {
+	if rotation == nil {
+		return nil
+	}
+	if rotation.EncryptedData == "" ||
+		len(rotation.EncryptedData) > presenceOverrideMaxEncryptedDataBytes {
+		return fmt.Errorf("presence_override.encrypted_data is invalid")
+	}
+	if _, err := base64.StdEncoding.DecodeString(rotation.EncryptedData); err != nil {
+		return fmt.Errorf("presence_override.encrypted_data must be valid base64")
+	}
+	if rotation.ExpectedVersion < 0 {
+		return fmt.Errorf("presence_override.expected_version must be nonnegative")
+	}
+	return nil
 }
 
 // verifyCurrentPassword fetches the user's password hash and checks it against the provided password.
@@ -796,29 +926,97 @@ func (h *Handler) verifyCurrentPassword(userID interface{}, currentPassword stri
 	return passwordHash, 0, ""
 }
 
-// verifyMFAForPasswordChange checks MFA if enabled. Returns an HTTP status + body on failure.
-func (h *Handler) verifyMFAForPasswordChange(c *gin.Context, uid, mfaCode string) (int, gin.H) {
-	ctx := c.Request.Context()
-	if h.mfaVerifier == nil || !h.mfaVerifier.IsEnabled(ctx, uid) {
+// verifyMFAForPasswordChange checks the locked user's MFA state and verifies a
+// code on the same transaction connection. Returns an HTTP status + body on
+// failure.
+func (h *Handler) verifyMFAForPasswordChange(
+	ctx context.Context,
+	tx *sql.Tx,
+	uid, mfaCode string,
+) (int, gin.H) {
+	var enabled bool
+	var methods []string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT mfa_enabled, mfa_methods FROM users WHERE id = $1`,
+		uid,
+	).Scan(&enabled, pq.Array(&methods)); err != nil {
+		h.log.Error("MFA state query failed during password change", "error", err)
+		return http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationFailed}
+	}
+	if !enabled {
 		return 0, nil
 	}
 	if mfaCode == "" {
-		methods, _ := h.mfaVerifier.GetEnabledMethods(ctx, uid)
 		return http.StatusForbidden, gin.H{
 			"error":   "mfa_required",
 			"message": "MFA verification required to change password",
 			"methods": methods,
 		}
 	}
-	valid, mfaErr := h.mfaVerifier.VerifyCode(ctx, uid, mfaCode)
+	if h.mfaVerifier == nil {
+		h.log.Error("MFA verifier is not configured for MFA-enabled user")
+		return http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationFailed}
+	}
+	valid, mfaErr := h.mfaVerifier.VerifyCodeTx(ctx, tx, uid, mfaCode)
 	if mfaErr != nil {
 		h.log.Error("MFA verification error during password change", "error", mfaErr)
-		return http.StatusInternalServerError, gin.H{"error": "MFA verification failed"}
+		return http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationFailed}
 	}
 	if !valid {
 		return http.StatusForbidden, gin.H{"error": "Invalid MFA code"}
 	}
 	return 0, nil
+}
+
+type stepUpReauthenticationError struct {
+	status int
+	body   gin.H
+}
+
+func (e *stepUpReauthenticationError) Error() string {
+	return fmt.Sprintf("step-up reauthentication failed with status %d", e.status)
+}
+
+// verifyStepUpWithLockedUser is the authoritative reauthentication checkpoint
+// for password-derived key rotations. Locking the user row before reading the
+// password and MFA state prevents a request verified with superseded
+// credentials from overwriting a concurrently recovered account.
+func (h *Handler) verifyStepUpWithLockedUser(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID uuid.UUID,
+	currentPassword, mfaCode string,
+) error {
+	var passwordHash string
+	err := tx.QueryRowContext(ctx,
+		`SELECT password_hash FROM users WHERE id = $1 FOR NO KEY UPDATE`,
+		userID,
+	).Scan(&passwordHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return &stepUpReauthenticationError{
+			status: http.StatusNotFound,
+			body:   gin.H{"error": errMsgUserNotFound},
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("lock user for reauthentication: %w", err)
+	}
+
+	match, err := auth.VerifyPassword(currentPassword, passwordHash)
+	if err != nil {
+		return fmt.Errorf("verify locked password: %w", err)
+	}
+	if !match {
+		return &stepUpReauthenticationError{
+			status: http.StatusUnauthorized,
+			body:   gin.H{"error": "Current password is incorrect"},
+		}
+	}
+
+	if status, body := h.verifyMFAForPasswordChange(ctx, tx, userID.String(), mfaCode); status != 0 {
+		return &stepUpReauthenticationError{status: status, body: body}
+	}
+	return nil
 }
 
 // validateNewPassword checks strength and ensures it differs from the current password.
@@ -842,11 +1040,66 @@ func (h *Handler) validateNewPassword(newPassword, currentHash string) (string, 
 	return newHash, 0, ""
 }
 
-// executePasswordChange runs the transactional password + key update + token revocation.
-func (h *Handler) executePasswordChange(userID interface{}, newHash string, wrappedKeyBytes, saltBytes []byte, kdAlg string) error {
-	tx, err := h.db.Begin()
+func rotatePasswordPresenceOverride(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID uuid.UUID,
+	rotation *changePasswordPresenceOverride,
+) (int, error) {
+	currentVersion, err := readPresenceOverrideVersion(
+		ctx, tx, userID, presenceOverrideCategoryCustomText, true,
+	)
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+		return 0, fmt.Errorf("read presence override version: %w", err)
+	}
+	if rotation == nil {
+		if currentVersion != 0 {
+			return 0, &presenceOverrideVersionConflictError{CurrentVersion: currentVersion}
+		}
+		return 0, nil
+	}
+	if rotation.ExpectedVersion != currentVersion {
+		return 0, &presenceOverrideVersionConflictError{CurrentVersion: currentVersion}
+	}
+	if currentVersion == 0 {
+		return 0, nil
+	}
+
+	var newVersion int
+	err = tx.QueryRowContext(ctx, `
+		UPDATE presence_override_preferences
+		SET encrypted_data = $1, version = version + 1, updated_at = NOW()
+		WHERE user_id = $2 AND category = $3 AND version = $4
+		RETURNING version
+	`,
+		rotation.EncryptedData,
+		userID,
+		presenceOverrideCategoryCustomText,
+		rotation.ExpectedVersion,
+	).Scan(&newVersion)
+	if err != nil {
+		return 0, fmt.Errorf("rotate presence override ciphertext: %w", err)
+	}
+	return newVersion, nil
+}
+
+type passwordChangeExecution struct {
+	userID          uuid.UUID
+	currentPassword string
+	mfaCode         string
+	newHash         string
+	wrappedKey      []byte
+	salt            []byte
+	kdAlg           string
+	rotation        *changePasswordPresenceOverride
+}
+
+// executePasswordChange atomically rotates password/key material and any
+// existing presence-override ciphertext before revoking refresh tokens.
+func (h *Handler) executePasswordChange(ctx context.Context, change passwordChangeExecution) (int, error) {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer func() {
 		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
@@ -854,23 +1107,43 @@ func (h *Handler) executePasswordChange(userID interface{}, newHash string, wrap
 		}
 	}()
 
-	if _, err := tx.Exec(`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`, newHash, userID); err != nil {
-		return fmt.Errorf("update password: %w", err)
+	if err := h.verifyStepUpWithLockedUser(
+		ctx, tx, change.userID, change.currentPassword, change.mfaCode,
+	); err != nil {
+		return 0, err
 	}
-	if _, err := tx.Exec(
+
+	presenceOverrideVersion, err := rotatePasswordPresenceOverride(
+		ctx, tx, change.userID, change.rotation,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
+		change.newHash,
+		change.userID,
+	); err != nil {
+		return 0, fmt.Errorf("update password: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE user_keys SET wrapped_private_key = $1, key_derivation_salt = $2,
 		 key_derivation_alg = $3, updated_at = NOW() WHERE user_id = $4`,
-		wrappedKeyBytes, saltBytes, kdAlg, userID,
+		change.wrappedKey, change.salt, change.kdAlg, change.userID,
 	); err != nil {
-		return fmt.Errorf("update E2EE keys: %w", err)
+		return 0, fmt.Errorf("update E2EE keys: %w", err)
 	}
-	if _, err := tx.Exec(
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`,
-		userID,
+		change.userID,
 	); err != nil {
-		return fmt.Errorf("revoke refresh tokens: %w", err)
+		return 0, fmt.Errorf("revoke refresh tokens: %w", err)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return presenceOverrideVersion, nil
 }
 
 // ChangePassword changes the current user's password and re-wraps E2EE keys
@@ -884,6 +1157,10 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 	var req ChangePasswordRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Current password, new password, and re-wrapped keys are required"})
+		return
+	}
+	if err := validateChangePasswordPresenceOverride(req.PresenceOverride); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid presence_override"})
 		return
 	}
 
@@ -905,11 +1182,11 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 	}
 
 	uid := userID.(string)
-	if mfaStatus, mfaBody := h.verifyMFAForPasswordChange(c, uid, req.MFACode); mfaStatus != 0 {
-		c.JSON(mfaStatus, mfaBody)
+	parsedUID, parseErr := uuid.Parse(uid)
+	if parseErr != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgUnauthorized})
 		return
 	}
-
 	newHash, status, msg := h.validateNewPassword(req.NewPassword, passwordHash)
 	if status != 0 {
 		c.JSON(status, gin.H{"error": msg})
@@ -921,19 +1198,45 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 		kdAlg = "argon2id"
 	}
 
-	if err := h.executePasswordChange(userID, newHash, wrappedKeyBytes, saltBytes, kdAlg); err != nil {
+	presenceOverrideVersion, err := h.executePasswordChange(c.Request.Context(), passwordChangeExecution{
+		userID:          parsedUID,
+		currentPassword: req.CurrentPassword,
+		mfaCode:         req.MFACode,
+		newHash:         newHash,
+		wrappedKey:      wrappedKeyBytes,
+		salt:            saltBytes,
+		kdAlg:           kdAlg,
+		rotation:        req.PresenceOverride,
+	})
+	if err != nil {
+		var reauthErr *stepUpReauthenticationError
+		if errors.As(err, &reauthErr) {
+			c.JSON(reauthErr.status, reauthErr.body)
+			return
+		}
+		var conflict *presenceOverrideVersionConflictError
+		if errors.As(err, &conflict) {
+			c.JSON(http.StatusConflict, gin.H{
+				"code":            "presence_override_version_conflict",
+				"current_version": conflict.CurrentVersion,
+			})
+			return
+		}
 		h.log.Error(errMsgFailedChangePassword, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedChangePassword})
 		return
 	}
 
 	// Force-close all WebSocket connections for this user.
-	if parsedUID, parseErr := uuid.Parse(uid); parseErr == nil {
-		h.hub.DisconnectUser(parsedUID)
+	if h.sessionDisconnector != nil {
+		h.sessionDisconnector.DisconnectUser(parsedUID)
 	}
 
 	h.log.Info("Password changed with key re-wrap", "user_id", userID)
-	c.JSON(http.StatusOK, gin.H{"message": "Password changed successfully"})
+	c.JSON(http.StatusOK, gin.H{
+		"message":                   "Password changed successfully",
+		"presence_override_version": presenceOverrideVersion,
+	})
 }
 
 // SearchUsers searches for users by username or display_name.

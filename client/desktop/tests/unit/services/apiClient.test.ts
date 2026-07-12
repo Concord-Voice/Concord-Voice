@@ -39,6 +39,7 @@ describe('apiClient', () => {
     resetAllStores();
     _resetRefreshState();
     vi.clearAllMocks();
+    mockFetch.mockReset();
     resetRuntimeServerBase();
     // Reset connection store to stable (default)
     useConnectionStore.getState().reset();
@@ -440,6 +441,7 @@ describe('apiClient', () => {
 
     it('rate-limits refresh initiation', async () => {
       useAuthStore.getState().setAccessToken('old-token');
+      useAuthStore.getState().setSessionId('same-session');
 
       globalThis.electron = {
         refreshToken: vi.fn().mockResolvedValue({ status: 'ok', accessToken: 'new-token' }),
@@ -568,6 +570,185 @@ describe('apiClient', () => {
       expect(globalThis.electron!.refreshToken).toHaveBeenCalledTimes(1);
       expect(mockNuclearReset).not.toHaveBeenCalled();
       expect(mockGracefulReset).not.toHaveBeenCalled();
+    });
+
+    it('does not adopt or retry a held 401 refresh after the auth lifecycle changes', async () => {
+      useAuthStore.getState().setAccessToken('old-account-token');
+      useAuthStore.getState().setSessionId('old-account-session');
+
+      let releaseRefresh: ((value: unknown) => void) | undefined;
+      const refreshToken = vi.fn(
+        () =>
+          new Promise((resolve) => {
+            releaseRefresh = resolve;
+          })
+      );
+      globalThis.electron = { refreshToken } as any;
+      mockFetch
+        .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+        .mockResolvedValueOnce(new Response('{"wrongAccount":true}', { status: 200 }));
+
+      const controller = new AbortController();
+      const request = apiFetch(
+        '/api/v1/users/me/preferences',
+        { method: 'PUT', signal: controller.signal },
+        { authoritative: false }
+      );
+      await vi.waitFor(() => expect(refreshToken).toHaveBeenCalledOnce());
+
+      controller.abort();
+      useAuthStore.getState().setAccessToken('new-account-token');
+      useAuthStore.getState().setSessionId('new-account-session');
+      releaseRefresh?.({
+        status: 'ok',
+        accessToken: 'refreshed-old-account-token',
+        sessionId: 'old-account-session',
+      });
+
+      const response = await request;
+      expect(response.status).toBe(401);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(useAuthStore.getState()).toMatchObject({
+        accessToken: 'new-account-token',
+        sessionId: 'new-account-session',
+      });
+    });
+
+    it('starts a new-account refresh after a held prior-account refresh settles', async () => {
+      useAuthStore.getState().setAccessToken('account-a-token');
+      useAuthStore.getState().setSessionId('account-a-session');
+
+      let releaseAccountA: ((value: unknown) => void) | undefined;
+      const refreshToken = vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              releaseAccountA = resolve;
+            })
+        )
+        .mockResolvedValueOnce({
+          status: 'ok',
+          accessToken: 'account-b-refreshed-token',
+          sessionId: 'account-b-session',
+        });
+      globalThis.electron = { refreshToken } as any;
+
+      const accountARefresh = refreshAccessToken();
+      await vi.waitFor(() => expect(refreshToken).toHaveBeenCalledTimes(1));
+
+      useAuthStore.getState().setAccessToken('account-b-token');
+      useAuthStore.getState().setSessionId('account-b-session');
+      mockFetch
+        .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+        .mockResolvedValueOnce(new Response('{"account":"b"}', { status: 200 }));
+
+      const accountBRequest = apiFetch('/api/v1/users/me');
+      await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      releaseAccountA?.({
+        status: 'ok',
+        accessToken: 'account-a-refreshed-token',
+        sessionId: 'account-a-session',
+      });
+
+      await expect(accountARefresh).resolves.toBeNull();
+      const response = await accountBRequest;
+      expect(response.status).toBe(200);
+      expect(refreshToken).toHaveBeenCalledTimes(2);
+      expect(mockNuclearReset).not.toHaveBeenCalled();
+      expect(mockGracefulReset).not.toHaveBeenCalled();
+      expect(useAuthStore.getState()).toMatchObject({
+        accessToken: 'account-b-refreshed-token',
+        sessionId: 'account-b-session',
+      });
+    });
+
+    it('does not apply a prior account refresh cooldown to the new account', async () => {
+      useAuthStore.getState().setAccessToken('account-a-token');
+      useAuthStore.getState().setSessionId('account-a-session');
+
+      const refreshToken = vi
+        .fn()
+        .mockResolvedValueOnce({
+          status: 'ok',
+          accessToken: 'account-a-refreshed-token',
+          sessionId: 'account-a-session',
+        })
+        .mockResolvedValueOnce({
+          status: 'ok',
+          accessToken: 'account-b-refreshed-token',
+          sessionId: 'account-b-session',
+        });
+      globalThis.electron = { refreshToken } as any;
+      mockFetch
+        .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+        .mockResolvedValueOnce(new Response('{"account":"a"}', { status: 200 }));
+      await expect(apiFetch('/api/v1/users/me')).resolves.toMatchObject({ status: 200 });
+
+      useAuthStore.getState().setAccessToken('account-b-token');
+      useAuthStore.getState().setSessionId('account-b-session');
+      mockFetch
+        .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+        .mockResolvedValueOnce(new Response('{"account":"b"}', { status: 200 }));
+
+      const response = await apiFetch('/api/v1/users/me');
+      expect(response.status).toBe(200);
+      expect(refreshToken).toHaveBeenCalledTimes(2);
+      expect(mockNuclearReset).not.toHaveBeenCalled();
+      expect(mockGracefulReset).not.toHaveBeenCalled();
+      expect(useAuthStore.getState()).toMatchObject({
+        accessToken: 'account-b-refreshed-token',
+        sessionId: 'account-b-session',
+      });
+    });
+
+    it('does not re-attest or retry a held 403 after the auth lifecycle changes', async () => {
+      useAuthStore.getState().setAccessToken('old-account-token');
+      useAuthStore.getState().setSessionId('old-account-session');
+
+      let releaseClear: (() => void) | undefined;
+      const clearToken = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseClear = resolve;
+          })
+      );
+      const getToken = vi
+        .fn()
+        .mockResolvedValueOnce('cached-old-account-attestation')
+        .mockResolvedValueOnce('fresh-old-account-attestation');
+      globalThis.electron = { attestation: { clearToken, getToken } } as any;
+      mockFetch
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ code: 'ATTESTATION_EXPIRED' }), {
+            status: 403,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        )
+        .mockResolvedValueOnce(new Response('{"wrongAccount":true}', { status: 200 }));
+
+      const controller = new AbortController();
+      const request = apiFetch('/api/v1/users/me/saved-gifs', {
+        method: 'PUT',
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(clearToken).toHaveBeenCalledOnce());
+
+      controller.abort();
+      useAuthStore.getState().setAccessToken('new-account-token');
+      useAuthStore.getState().setSessionId('new-account-session');
+      releaseClear?.();
+
+      const response = await request;
+      expect(response.status).toBe(403);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      // One lookup is expected for the original request. The lifecycle fence
+      // must prevent the second lookup that would mint credentials for a retry.
+      expect(getToken).toHaveBeenCalledTimes(1);
+      expect(useAuthStore.getState()).toMatchObject({
+        accessToken: 'new-account-token',
+        sessionId: 'new-account-session',
+      });
     });
 
     it('piggybacks on in-flight refresh when concurrent 401s occur', async () => {

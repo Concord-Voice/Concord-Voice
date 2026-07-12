@@ -150,6 +150,7 @@ interface FriendState {
   pendingRequests: FriendRequest[];
   blockedUserIds: string[];
   friendCodes: FriendCode[];
+  friendsHydrated: boolean;
   isLoading: boolean;
   error: string | null;
 
@@ -189,6 +190,8 @@ interface FriendState {
   clearFriends: () => void;
 }
 
+let friendFetchGeneration = 0;
+
 export const useFriendStore = wrapStore(
   create<FriendState>()(
     devtools(
@@ -197,11 +200,13 @@ export const useFriendStore = wrapStore(
         pendingRequests: [],
         blockedUserIds: [],
         friendCodes: [],
+        friendsHydrated: false,
         isLoading: false,
         error: null,
 
         fetchFriends: async () => {
           if (get().isLoading) return;
+          const generation = friendFetchGeneration;
           set({ isLoading: true, error: null });
 
           try {
@@ -212,6 +217,7 @@ export const useFriendStore = wrapStore(
             }
 
             const data = await safeJson<ApiFriendsListResponse>(response);
+            if (generation !== friendFetchGeneration) return;
             const currentStatusByUser = new Map(get().friends.map((f) => [f.userId, f.status]));
             const friends: Friend[] = (data.friends || []).map((f) => ({
               id: f.id,
@@ -224,8 +230,9 @@ export const useFriendStore = wrapStore(
               createdAt: f.created_at,
             }));
 
-            set({ friends, isLoading: false });
+            set({ friends, friendsHydrated: true, isLoading: false });
           } catch (error) {
+            if (generation !== friendFetchGeneration) return;
             set({
               error: error instanceof Error ? error.message : 'Failed to load friends',
               isLoading: false,
@@ -522,8 +529,18 @@ export const useFriendStore = wrapStore(
           get().fetchFriendCodes();
         },
 
-        clearFriends: () =>
-          set({ friends: [], pendingRequests: [], blockedUserIds: [], friendCodes: [] }),
+        clearFriends: () => {
+          friendFetchGeneration += 1;
+          set({
+            friends: [],
+            pendingRequests: [],
+            blockedUserIds: [],
+            friendCodes: [],
+            friendsHydrated: false,
+            isLoading: false,
+            error: null,
+          });
+        },
       }),
       { name: 'FriendStore' }
     )

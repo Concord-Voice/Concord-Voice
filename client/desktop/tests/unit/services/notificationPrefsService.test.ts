@@ -205,6 +205,44 @@ describe('tryHydrateNotificationPrefs', () => {
     stopExpirySweep();
   });
 
+  it('does not apply preferences or start the sweep after the lifecycle is reset', async () => {
+    vi.useFakeTimers();
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval');
+    let releaseFetch: ((response: Response) => void) | undefined;
+    mockApiFetch.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          releaseFetch = resolve;
+        })
+    );
+    let current = true;
+    const controller = new AbortController();
+
+    const hydration = tryHydrateNotificationPrefs({
+      signal: controller.signal,
+      isCurrent: () => current,
+    });
+    current = false;
+    controller.abort();
+    releaseFetch?.(
+      mockJsonResponse({
+        preferences: [
+          {
+            target_type: 'server',
+            target_id: SERVER_ID,
+            muted: true,
+            muted_until: null,
+            updated_at: new Date().toISOString(),
+          },
+        ],
+      })
+    );
+    await hydration;
+
+    expect(useNotificationPrefsStore.getState().mutedServers.size).toBe(0);
+    expect(setIntervalSpy).not.toHaveBeenCalled();
+  });
+
   it('swallows hydrate failures with a console.warn (Error case)', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     mockApiFetch.mockResolvedValueOnce(mockJsonResponse({}, false));

@@ -1,6 +1,10 @@
 import { createStore } from '../utils/createStore';
 import { apiFetch, safeJson } from '../services/apiClient';
 import { EntitlementsChangedSchema, type EntitlementsChangedPayload } from '../types/ws-events';
+import {
+  isHydrationLifecycleCurrent,
+  type HydrationLifecycleGuard,
+} from '../services/postLoginHydrationLifecycle';
 
 // The store holds the entitlement capability set. The wire type (validated at
 // the WS dispatch boundary) IS the store type — no transform needed.
@@ -43,6 +47,8 @@ export const FREE_ENTITLEMENT: Entitlement = {
   messageHistorySearchDays: 90,
 };
 
+let hydrationGeneration = 0;
+
 interface SubscriptionState {
   entitlement: Entitlement;
   // true when the last hydrate failed. On a FIRST-LOAD failure the entitlement is the
@@ -58,7 +64,7 @@ interface SubscriptionState {
    */
   hydrated: boolean;
   setEntitlement: (e: Entitlement) => void;
-  hydrate: () => Promise<void>;
+  hydrate: (guard?: HydrationLifecycleGuard) => Promise<void>;
   /**
    * Reset to the least-privilege free floor. Called on logout / account-switch
    * (resetService.gracefulReset) so a prior user's premium capability set can
@@ -72,11 +78,20 @@ export const useSubscriptionStore = createStore<SubscriptionState>()((set) => ({
   degraded: false,
   hydrated: false,
   setEntitlement: (e) => set({ entitlement: e, degraded: false, hydrated: true }),
-  hydrate: async () => {
+  hydrate: async (guard) => {
+    const generation = hydrationGeneration;
+    const isCurrent = (): boolean =>
+      generation === hydrationGeneration && isHydrationLifecycleCurrent(guard);
+    if (!isCurrent()) return;
     try {
-      const res = await apiFetch('/api/v1/entitlements');
+      const res = await apiFetch(
+        '/api/v1/entitlements',
+        guard ? { signal: guard.signal } : undefined
+      );
+      if (!isCurrent()) return;
       if (!res.ok) throw new Error(`entitlements fetch ${res.status}`);
       const raw = await safeJson<unknown>(res);
+      if (!isCurrent()) return;
       // Runtime-validate against the SAME zod schema the WS push is checked
       // with (safeJson only checks Content-Type + casts — no runtime check).
       // A drifted/partial 200 (missing fields, wrong types, proxy-injected
@@ -85,8 +100,10 @@ export const useSubscriptionStore = createStore<SubscriptionState>()((set) => ({
       // undefined fields. Keeps the fetch path symmetric with the
       // entitlements_changed dispatch boundary (#1297 / Gitar review).
       const dto = EntitlementsChangedSchema.shape.data.parse(raw);
+      if (!isCurrent()) return;
       set({ entitlement: dto, degraded: false, hydrated: true });
     } catch {
+      if (!isCurrent()) return;
       // Distinguish a FIRST-LOAD failure from a RECONNECT failure (#2172):
       //  - First load (`!hydrated`, never authoritatively hydrated): fail CLOSED to
       //    the free floor. Premium is only ever reached via a successful server
@@ -109,5 +126,8 @@ export const useSubscriptionStore = createStore<SubscriptionState>()((set) => ({
   // Account-switch resets to un-hydrated free so the next user's launch-reset
   // waits for THEIR authoritative entitlement rather than acting on the prior
   // session's (or the default) state.
-  reset: () => set({ entitlement: FREE_ENTITLEMENT, degraded: false, hydrated: false }),
+  reset: () => {
+    hydrationGeneration += 1;
+    set({ entitlement: FREE_ENTITLEMENT, degraded: false, hydrated: false });
+  },
 }));

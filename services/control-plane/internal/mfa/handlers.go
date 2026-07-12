@@ -96,6 +96,11 @@ func (h *Handler) SetEmailService(svc *email.Service) {
 
 // ── Verifier Interface Implementation ────────────────────────────────────────
 
+type codeVerificationStore interface {
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
 // IsEnabled returns true if the user has any active MFA method.
 func (h *Handler) IsEnabled(ctx context.Context, userID string) bool {
 	var enabled bool
@@ -105,6 +110,21 @@ func (h *Handler) IsEnabled(ctx context.Context, userID string) bool {
 
 // VerifyCode checks a TOTP code or backup code against the user's stored MFA secrets.
 func (h *Handler) VerifyCode(ctx context.Context, userID string, code string) (bool, error) {
+	return h.verifyCode(ctx, h.db, userID, code)
+}
+
+// VerifyCodeTx performs the same verification on the caller's transaction
+// connection. Sensitive rotations use this after locking the users row so they
+// neither re-authorize against superseded MFA state nor acquire a second pooled
+// database connection while holding the first.
+func (h *Handler) VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID string, code string) (bool, error) {
+	if tx == nil {
+		return false, fmt.Errorf("MFA verification transaction is required")
+	}
+	return h.verifyCode(ctx, tx, userID, code)
+}
+
+func (h *Handler) verifyCode(ctx context.Context, store codeVerificationStore, userID string, code string) (bool, error) {
 	// Check for WebAuthn inline verification token first (from WebAuthnVerifyInlineFinish)
 	if len(code) > 20 {
 		tokenKey := fmt.Sprintf("mfa_inline_token:%s:%s", userID, code)
@@ -117,7 +137,7 @@ func (h *Handler) VerifyCode(ctx context.Context, userID string, code string) (b
 	// Try TOTP
 	var secretEnc, secretNonce []byte
 	var totpEnabled, totpConfirmed bool
-	err := h.db.QueryRowContext(ctx,
+	err := store.QueryRowContext(ctx,
 		`SELECT totp_secret_enc, totp_secret_nonce, enabled, confirmed FROM user_mfa_totp WHERE user_id = $1`,
 		userID,
 	).Scan(&secretEnc, &secretNonce, &totpEnabled, &totpConfirmed)
@@ -135,7 +155,7 @@ func (h *Handler) VerifyCode(ctx context.Context, userID string, code string) (b
 		// Try as backup code
 		var hashes []string
 		var used []bool
-		_ = h.db.QueryRowContext(ctx,
+		_ = store.QueryRowContext(ctx,
 			`SELECT backup_codes_hash, backup_codes_used FROM user_mfa_totp WHERE user_id = $1`,
 			userID,
 		).Scan(pq.Array(&hashes), pq.Array(&used))
@@ -143,7 +163,7 @@ func (h *Handler) VerifyCode(ctx context.Context, userID string, code string) (b
 		if idx, matched := VerifyBackupCode(code, hashes, used); matched {
 			// Mark backup code as used
 			used[idx] = true
-			_, _ = h.db.ExecContext(ctx,
+			_, _ = store.ExecContext(ctx,
 				`UPDATE user_mfa_totp SET backup_codes_used = $1, updated_at = NOW() WHERE user_id = $2`,
 				pq.Array(used), userID,
 			)

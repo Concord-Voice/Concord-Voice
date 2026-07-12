@@ -36,6 +36,10 @@ type SessionDisconnector interface {
 	DisconnectUser(userID uuid.UUID)
 }
 
+type customTextResetBroadcaster interface {
+	ClearCustomTextForPresenceAudience(userID uuid.UUID)
+}
+
 // RecoveryClaims contains the user_id extracted from a validated recovery token.
 type RecoveryClaims struct {
 	UserID string
@@ -157,6 +161,16 @@ func NewHandlerForInstance(db *sql.DB, redisClient *redis.Client, log *logger.Lo
 		pending:   NewPendingRepo(db),
 		entCache:  entitlements.NewCacheForInstance(redisClient, db, instanceType),
 	}
+}
+
+func (h *Handler) clearCustomTextAndDisconnect(userID uuid.UUID) {
+	if h.hub == nil {
+		return
+	}
+	if broadcaster, ok := h.hub.(customTextResetBroadcaster); ok {
+		broadcaster.ClearCustomTextForPresenceAudience(userID)
+	}
+	h.hub.DisconnectUser(userID)
 }
 
 // SetEmailService sets the email service (called after initialization to avoid circular deps).
@@ -2211,8 +2225,53 @@ type recoveryTxOp struct {
 	desc  string // human-readable for error logging
 }
 
-// execRecoveryTx runs a series of SQL ops in a transaction. On failure it cleans up
-// the Redis used-key, writes the HTTP response, and returns an error.
+// recoveryCommitAmbiguousError means the database may have committed the
+// destructive recovery transaction even though the client did not receive an
+// acknowledgement. Callers must keep the recovery token consumed and perform
+// post-commit safety actions fail closed.
+type recoveryCommitAmbiguousError struct {
+	cause error
+}
+
+func (e *recoveryCommitAmbiguousError) Error() string {
+	return "recovery transaction commit state is ambiguous"
+}
+
+func (e *recoveryCommitAmbiguousError) Unwrap() error {
+	return e.cause
+}
+
+// recoveryPresenceOverrideResetOps discards preference ciphertext encrypted
+// under the pre-recovery password-derived key. Deleting the preference
+// cascades to its materialized exception rows. Visibility is forced Off in the
+// same transaction and stored text/emoji are erased so losing exclusions can
+// neither broaden the audience nor let a later tier-only update resurrect the
+// prior Custom Status.
+func recoveryPresenceOverrideResetOps(userID string) []recoveryTxOp {
+	return []recoveryTxOp{
+		{
+			`UPDATE user_presence_settings
+			 SET custom_text_tier = 0,
+			     custom_text = NULL,
+			     custom_text_emoji = NULL,
+			     updated_at = NOW()
+			 WHERE user_id = $1`,
+			[]interface{}{userID},
+			"Failed to reset Custom Status",
+		},
+		{
+			`DELETE FROM presence_override_preferences WHERE user_id = $1`,
+			[]interface{}{userID},
+			"Failed to reset presence override preferences",
+		},
+	}
+}
+
+// execRecoveryTx runs a series of SQL ops in a transaction. Begin and statement
+// failures are definitely uncommitted, so they release the Redis used-key for a
+// retry. A Commit error is ambiguous: the marker remains consumed and callers
+// receive recoveryCommitAmbiguousError so they can apply post-commit safety
+// actions fail closed. Every failure writes the HTTP response.
 func (h *Handler) execRecoveryTx(ctx context.Context, c *gin.Context, ops []recoveryTxOp, recoveryUsedKey, errMsg string) error {
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -2238,9 +2297,8 @@ func (h *Handler) execRecoveryTx(ctx context.Context, c *gin.Context, ops []reco
 
 	if err := tx.Commit(); err != nil {
 		h.log.Error(errFailedCommitTransaction, "error", err)
-		h.redis.Del(ctx, recoveryUsedKey)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
-		return err
+		return &recoveryCommitAmbiguousError{cause: err}
 	}
 	return nil
 }
@@ -2301,13 +2359,14 @@ func (h *Handler) RecoveryResetPassword(c *gin.Context) {
 		return
 	}
 
-	ops := []recoveryTxOp{
-		{`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
+	ops := make([]recoveryTxOp, 0, 5)
+	ops = append(ops,
+		recoveryTxOp{`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
 			[]interface{}{passwordHash, claims.UserID}, "Failed to update password"},
-		{`UPDATE user_keys SET wrapped_private_key = $1, key_derivation_salt = $2, key_derivation_alg = $3,
+		recoveryTxOp{`UPDATE user_keys SET wrapped_private_key = $1, key_derivation_salt = $2, key_derivation_alg = $3,
 		         key_version = key_version + 1, updated_at = NOW() WHERE user_id = $4`,
 			[]interface{}{wrappedKey, kdSalt, req.KeyDerivationAlg, claims.UserID}, "Failed to update user keys"},
-	}
+	)
 
 	// Optional recovery key upsert
 	if req.RecoveryWrappedPrivateKey != "" && req.RecoveryKeySalt != "" {
@@ -2330,15 +2389,20 @@ func (h *Handler) RecoveryResetPassword(c *gin.Context) {
 			[]interface{}{claims.UserID, recKey, recSalt, recPrefsKey, recPrefsSalt}, "Failed to upsert recovery key"})
 	}
 
+	ops = append(ops, recoveryPresenceOverrideResetOps(claims.UserID)...)
 	ops = append(ops, recoveryTxOp{
 		`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`,
 		[]interface{}{claims.UserID}, "Failed to revoke refresh tokens"})
 
 	if err := h.execRecoveryTx(ctx, c, ops, recoveryUsedKey, errFailedResetPwd); err != nil {
+		var ambiguousCommit *recoveryCommitAmbiguousError
+		if errors.As(err, &ambiguousCommit) {
+			h.clearCustomTextAndDisconnect(uuid.MustParse(claims.UserID))
+		}
 		return
 	}
 
-	h.hub.DisconnectUser(uuid.MustParse(claims.UserID))
+	h.clearCustomTextAndDisconnect(uuid.MustParse(claims.UserID))
 	middleware.ClearAuthFailures(ctx, h.redis, c.ClientIP())
 	h.log.Info("Password reset via recovery", "user_id", claims.UserID)
 	c.JSON(http.StatusOK, gin.H{"message": "Password reset successfully. Please sign in with your new password."})
@@ -2383,29 +2447,37 @@ func (h *Handler) RecoveryResetAccount(c *gin.Context) {
 		return
 	}
 
-	ops := []recoveryTxOp{
-		{`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
+	ops := make([]recoveryTxOp, 0, 9)
+	ops = append(ops,
+		recoveryTxOp{`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
 			[]interface{}{passwordHash, claims.UserID}, "Failed to update password"},
-		{`UPDATE user_keys SET wrapped_private_key = $1, key_derivation_salt = $2, key_derivation_alg = $3,
+		recoveryTxOp{`UPDATE user_keys SET wrapped_private_key = $1, key_derivation_salt = $2, key_derivation_alg = $3,
 		         key_version = key_version + 1, updated_at = NOW() WHERE user_id = $4`,
 			[]interface{}{wrappedKey, kdSalt, req.KeyDerivationAlg, claims.UserID}, "Failed to update user keys"},
-		{`UPDATE public_keys SET public_key = $1, key_version = key_version + 1, created_at = NOW() WHERE user_id = $2`,
+		recoveryTxOp{`UPDATE public_keys SET public_key = $1, key_version = key_version + 1, created_at = NOW() WHERE user_id = $2`,
 			[]interface{}{publicKey, claims.UserID}, "Failed to update public key"},
-		{`DELETE FROM user_recovery_keys WHERE user_id = $1`,
+		recoveryTxOp{`DELETE FROM user_recovery_keys WHERE user_id = $1`,
 			[]interface{}{claims.UserID}, "Failed to delete recovery keys"},
-		{`DELETE FROM channel_keys WHERE user_id = $1`,
+		recoveryTxOp{`DELETE FROM channel_keys WHERE user_id = $1`,
 			[]interface{}{claims.UserID}, "Failed to delete channel keys"},
-		{`DELETE FROM dm_channel_keys WHERE user_id = $1`,
+		recoveryTxOp{`DELETE FROM dm_channel_keys WHERE user_id = $1`,
 			[]interface{}{claims.UserID}, "Failed to delete DM channel keys"},
-		{`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`,
-			[]interface{}{claims.UserID}, "Failed to revoke refresh tokens"},
-	}
+	)
+	ops = append(ops, recoveryPresenceOverrideResetOps(claims.UserID)...)
+	ops = append(ops, recoveryTxOp{
+		`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`,
+		[]interface{}{claims.UserID}, "Failed to revoke refresh tokens",
+	})
 
 	if err := h.execRecoveryTx(ctx, c, ops, recoveryUsedKey, errFailedResetAccount); err != nil {
+		var ambiguousCommit *recoveryCommitAmbiguousError
+		if errors.As(err, &ambiguousCommit) {
+			h.clearCustomTextAndDisconnect(uuid.MustParse(claims.UserID))
+		}
 		return
 	}
 
-	h.hub.DisconnectUser(uuid.MustParse(claims.UserID))
+	h.clearCustomTextAndDisconnect(uuid.MustParse(claims.UserID))
 	h.log.Info("Account reset via recovery (data loss acknowledged)", "user_id", claims.UserID)
 	c.JSON(http.StatusOK, gin.H{"message": "Account reset successfully. All encrypted message history has been permanently lost. Please sign in with your new password."})
 }

@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, act } from '../../../test-utils';
+import { render, screen, fireEvent, act, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
 import { vi } from 'vitest';
@@ -191,6 +191,19 @@ describe('CategoryManagerPanel', () => {
     render(<CategoryManagerPanel onClose={onClose} />);
 
     fireEvent.click(screen.getByRole('button', { name: /close/i }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('focuses its close control and closes on Escape', async () => {
+    const onClose = vi.fn();
+    render(<CategoryManagerPanel onClose={onClose} />);
+
+    const close = screen.getByRole('button', { name: 'Close' });
+    await waitFor(() => expect(close).toHaveFocus());
+    fireEvent.keyDown(screen.getByRole('dialog', { name: 'Manage Categories' }), {
+      key: 'Escape',
+    });
+
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

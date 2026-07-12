@@ -83,6 +83,8 @@ tags:
   description: Shareable friend codes for easy connections
 - name: Privacy
   description: User privacy settings
+- name: Presence
+  description: Custom Status settings and server-enforced recipient exceptions
 - name: ChannelGroups
   description: Channel grouping and reordering within servers
 - name: WebSocket
@@ -712,7 +714,10 @@ paths:
       - Auth
       summary: Full account reset via recovery token
       description: 'Reset password AND E2EE key material (new public key, channel/DM keys deleted — all
-        encrypted history is lost).
+        encrypted history is lost). The same transaction forces Custom Status Off, deletes its encrypted
+        exception preference and materialized exclusions, and revokes every refresh token. After a successful
+        commit (or an ambiguous commit result), the server broadcasts a privacy clear and disconnects active
+        WebSockets fail closed.
 
         Requires acknowledge_data_loss=true. Rate limit: 3 requests per 15 minutes (IP-based).
 
@@ -727,7 +732,8 @@ paths:
               $ref: '#/components/schemas/RecoveryResetAccountRequest'
       responses:
         '200':
-          description: Account reset — encrypted history permanently lost, sign in again
+          description: Account reset — encrypted history lost, refresh sessions revoked, active WebSockets
+            disconnected; sign in again
           content:
             application/json:
               schema:
@@ -745,6 +751,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '500':
+          description: Account reset transaction failed or its commit result was ambiguous
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
   /auth/recovery/reset-password:
@@ -753,7 +765,9 @@ paths:
       - Auth
       summary: Reset password via recovery token
       description: 'Reset the password using a single-use recovery token, replacing the wrapped private
-        key and revoking all refresh tokens.
+        key and revoking all refresh tokens. The same transaction forces Custom Status Off and deletes its
+        encrypted exception preference and materialized exclusions. After a successful commit (or an ambiguous
+        commit result), the server broadcasts a privacy clear and disconnects active WebSockets fail closed.
 
         Rate limit: 5 requests per 15 minutes (IP-based).
 
@@ -768,7 +782,8 @@ paths:
               $ref: '#/components/schemas/RecoveryResetPasswordRequest'
       responses:
         '200':
-          description: Password reset — all sessions revoked, sign in again
+          description: Password reset — refresh sessions revoked and active WebSockets disconnected; sign
+            in again
           content:
             application/json:
               schema:
@@ -781,6 +796,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '401':
           description: Invalid, expired, or already-used recovery token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Password reset transaction failed or its commit result was ambiguous
           content:
             application/json:
               schema:
@@ -11454,7 +11475,11 @@ paths:
       tags:
       - Users
       summary: Replace E2EE keys
-      description: 'Replace wrapped private key and salt (for key recovery).
+      description: 'Destructively replace the wrapped private key, derivation salt, and public key after
+        current-password step-up (plus MFA when enabled) and explicit data-loss acknowledgement. The atomic
+        reset deletes wrapped channel/DM keys, forces Custom Status Off, and deletes the encrypted exception
+        preference plus materialized exclusions. After commit (or an ambiguous commit result), connected
+        clients receive a privacy clear and their WebSockets are disconnected fail closed.
 
         Rate limit: 3 requests per minute.
 
@@ -11476,12 +11501,32 @@ paths:
                 $ref: '#/components/schemas/SuccessMessage'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing authentication or incorrect current password
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: MFA is required or the supplied MFA code is invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Key replacement transaction failed or its commit result was ambiguous
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /users/me/password:
     post:
       tags:
       - Users
       summary: Change password
-      description: 'Change password and re-wrap E2EE private key atomically.
+      description: 'Change password, re-wrap the E2EE private key, and compare-and-swap
+        any existing Custom Status exception ciphertext atomically. A presence-override
+        version conflict rolls the complete password/key transaction back.
 
         Rate limit: 5 requests per minute.
 
@@ -11500,11 +11545,23 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessMessage'
+                $ref: '#/components/schemas/ChangePasswordResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
           description: Current password incorrect
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Presence-override version conflict; password and key material unchanged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresenceOverrideConflict'
+        '500':
+          description: Password/key transaction failed or its commit result was ambiguous
           content:
             application/json:
               schema:
@@ -11776,6 +11833,180 @@ paths:
         '400':
           description: Invalid tier (must be 0, 1, or 2), custom_text over 140 characters,
             or custom_text_emoji over 32 characters
+  /users/me/presence-overrides/{category}:
+    parameters:
+    - name: category
+      in: path
+      required: true
+      description: Rich-presence category. Recipient exceptions currently support Custom Status only.
+      schema:
+        type: string
+        enum:
+        - custom_text
+    get:
+      tags:
+      - Presence
+      summary: Get encrypted Custom Status recipient exceptions
+      operationId: getPresenceOverrides
+      description: 'Returns only the authenticated user''s opaque, client-encrypted
+        preference document and CAS version. The server never returns the materialized
+        recipient IDs it uses for enforcement. A missing preference is represented as
+        `{"preference": null}`.
+
+        Friend-category names, colors, and membership groupings remain in the separate
+        client-encrypted friend-organization blob and never enter this preference document.
+        The server sees this document''s ciphertext plus the explicitly materialized excluded
+        user IDs supplied on PUT.
+
+        Rate limit: 30 requests per minute (user-based).
+
+        '
+      security:
+      - BearerAuth: []
+      responses:
+        '200':
+          description: Encrypted preference, or null when no preference has been stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - preference
+                properties:
+                  preference:
+                    type: object
+                    nullable: true
+                    required:
+                    - encrypted_data
+                    - version
+                    - updated_at
+                    properties:
+                      encrypted_data:
+                        type: string
+                        format: byte
+                        description: Base64-encoded client ciphertext; never decrypted by the server
+                      version:
+                        type: integer
+                        minimum: 1
+                      updated_at:
+                        type: string
+                        format: date-time
+        '400':
+          description: Unsupported presence category
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Failed to fetch the encrypted preference
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      tags:
+      - Presence
+      summary: Replace Custom Status recipient exceptions
+      operationId: replacePresenceOverrides
+      description: 'Atomically replaces the authenticated user''s opaque encrypted preference
+        and the self-scoped recipient IDs materialized for server-side enforcement. IDs are
+        canonicalized (deduplicated and sorted), and at most 1,000 unique recipients are
+        accepted. `expected_version` provides compare-and-swap semantics: zero creates version
+        1 when no row exists; a stale value returns the stable 409 response below without a
+        partial write.
+
+        Exclusions are applied after the declared Custom Status tier for both live audience
+        deltas and reconnect snapshot delivery. Successful writes broadcast only `category`
+        and `version` in `presence_overrides_updated` to the sender''s connected clients; the
+        encrypted document and recipient IDs are not placed on that WebSocket event.
+
+        The request body is capped at 128 KiB; `encrypted_data` is capped at 65,536 bytes.
+
+        Rate limit: 10 requests per minute (user-based).
+
+        '
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - encrypted_data
+              - expected_version
+              - excluded_user_ids
+              properties:
+                encrypted_data:
+                  type: string
+                  format: byte
+                  minLength: 1
+                  maxLength: 65536
+                  description: Base64-encoded client ciphertext; never decrypted by the server
+                expected_version:
+                  type: integer
+                  minimum: 0
+                  description: Current version, or 0 for the first write
+                excluded_user_ids:
+                  type: array
+                  description: User UUIDs to subtract from the tier audience; duplicates are canonicalized
+                  items:
+                    type: string
+                    format: uuid
+      responses:
+        '200':
+          description: Preference and materialized enforcement rows replaced atomically
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - version
+                properties:
+                  version:
+                    type: integer
+                    minimum: 1
+        '400':
+          description: Invalid category, ciphertext, version, self-target, recipient UUID, or recipient count
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Compare-and-swap version conflict; no preference or enforcement rows were changed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresenceOverrideConflict'
+        '413':
+          description: Request body exceeds 128 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Atomic replacement or post-commit resolution failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /users/me/saved-gifs:
     get:
       tags:
@@ -12222,7 +12453,8 @@ paths:
 
         | `connected` | `client_id`, `user_id` | Connection established |
 
-        | `presence_snapshot` | `users[]` | All online users with statuses |
+        | `presence_snapshot` | `users[]` | All permitted online users with statuses. Audience-filtered
+        Custom Status snapshots follow as `rich_presence_update` frames. |
 
         | `subscribed` | `channel_id` | Channel subscription confirmed |
 
@@ -12247,6 +12479,16 @@ paths:
         | `profile_updated` | `user_id`, `username`, `display_name`, `avatar_url` | Profile changed |
 
         | `preferences_updated` | `version` | Preferences sync trigger |
+
+        | `presence_overrides_updated` | `category`, `version` | Metadata-only sync trigger sent
+        to the sender''s connected clients after a successful exception write. Clients refetch and
+        decrypt the preference; recipient IDs are never included. |
+
+        | `rich_presence_update` | `user_id`, `category`, `payload`, `updated_at` | Audience-filtered
+        Custom Status update, including reconnect snapshot delivery. |
+
+        | `rich_presence_clear` | `user_id`, `category` | Remove a Custom Status when the viewer
+        leaves the sender''s effective audience, including after an exception is added. |
 
         | `server_updated` | `server_id`, `name`, `icon_url` | Server modified |
 
@@ -12687,20 +12929,103 @@ components:
           minLength: 12
         wrapped_private_key:
           type: string
-          description: Re-wrapped with new PBKDF2-derived key
+          description: Re-wrapped with the selected password-derived key
         key_derivation_salt:
           type: string
-          description: New salt for PBKDF2 derivation
+          description: New salt for the selected key-derivation algorithm
+        key_derivation_alg:
+          type: string
+          enum:
+          - pbkdf2
+          - argon2id
+          default: argon2id
+        mfa_code:
+          type: string
+          description: Required when MFA is enabled
+        presence_override:
+          description: 'Required when a Custom Status exception preference exists.
+            Omitting this property asserts that no preference row exists; if one does,
+            the server returns the stable 409 conflict without changing the password
+            or key material.'
+          allOf:
+          - $ref: '#/components/schemas/ChangePasswordPresenceOverride'
+    ChangePasswordPresenceOverride:
+      type: object
+      required:
+      - encrypted_data
+      - expected_version
+      properties:
+        encrypted_data:
+          type: string
+          maxLength: 65536
+          description: Base64-encoded exception document encrypted with the new preferences key
+        expected_version:
+          type: integer
+          minimum: 0
+          description: Currently applied exception version; zero requires that no row exists
+    ChangePasswordResponse:
+      type: object
+      required:
+      - message
+      - presence_override_version
+      properties:
+        message:
+          type: string
+        presence_override_version:
+          type: integer
+          minimum: 0
+          description: Rotated exception version, or zero when no preference row exists
+    PresenceOverrideConflict:
+      type: object
+      required:
+      - code
+      - current_version
+      properties:
+        code:
+          type: string
+          enum:
+          - presence_override_version_conflict
+        current_version:
+          type: integer
+          minimum: 0
     ReplaceKeysRequest:
       type: object
       required:
       - wrapped_private_key
       - key_derivation_salt
+      - public_key
+      - current_password
+      - acknowledge_data_loss
       properties:
         wrapped_private_key:
           type: string
+          format: byte
+          description: Base64-encoded AES-GCM wrapped private key for the replacement identity
         key_derivation_salt:
           type: string
+          format: byte
+          description: Base64-encoded salt for the selected key-derivation algorithm
+        key_derivation_alg:
+          type: string
+          enum:
+          - pbkdf2
+          - argon2id
+          default: argon2id
+        public_key:
+          type: string
+          format: byte
+          description: Base64-encoded SPKI public key matching the replacement private key
+        current_password:
+          type: string
+          description: Current account password required for destructive step-up authentication
+        mfa_code:
+          type: string
+          description: Required when MFA is enabled
+        acknowledge_data_loss:
+          type: boolean
+          enum:
+          - true
+          description: Must be true because prior encrypted message history becomes unreadable
     UpdatePreferencesRequest:
       type: object
       required:
@@ -13805,6 +14130,7 @@ components:
       - key_derivation_salt
       - key_derivation_alg
       - public_key
+      - acknowledge_data_loss
       properties:
         recovery_token:
           type: string

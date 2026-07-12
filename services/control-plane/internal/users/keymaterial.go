@@ -14,7 +14,12 @@ import (
 // The public_keys UPDATE MUST affect exactly one row, else the transaction is
 // rolled back: the table has no UNIQUE(user_id) constraint (migration 000004),
 // so a 0-row UPDATE would silently re-create the orphaned-public-key bug this
-// helper exists to prevent.
+// helper exists to prevent. A new password-derived preferences key cannot
+// decrypt the prior Custom Status exception document, so destructive key
+// replacement also removes that ciphertext and its cascaded materialized
+// recipients while forcing Custom Status visibility Off and erasing the stored
+// text/emoji. These operations live in one transaction so a later tier-only
+// update cannot resurrect plaintext status without its prior exclusions.
 //
 // Callers MUST pass an open *sql.Tx and commit/rollback around this call.
 func replaceKeyMaterialTx(tx *sql.Tx, userID any, wrappedPriv, salt []byte, alg string, publicKey []byte) error {
@@ -51,6 +56,23 @@ func replaceKeyMaterialTx(tx *sql.Tx, userID any, wrappedPriv, salt []byte, alg 
 	}
 	if _, err := tx.Exec(`DELETE FROM dm_channel_keys WHERE user_id = $1`, userID); err != nil {
 		return fmt.Errorf("clear dm_channel_keys: %w", err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE user_presence_settings
+		 SET custom_text_tier = 0,
+		     custom_text = NULL,
+		     custom_text_emoji = NULL,
+		     updated_at = NOW()
+		 WHERE user_id = $1`,
+		userID,
+	); err != nil {
+		return fmt.Errorf("reset custom status: %w", err)
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM presence_override_preferences WHERE user_id = $1`,
+		userID,
+	); err != nil {
+		return fmt.Errorf("clear presence override preferences: %w", err)
 	}
 	return nil
 }

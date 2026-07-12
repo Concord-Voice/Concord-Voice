@@ -1,5 +1,10 @@
 import { defineConfig, devices } from '@playwright/test';
 
+const E2E_API_PORT = process.env.E2E_API_PORT ?? process.env.VITE_API_PORT ?? '8080';
+const E2E_UI_PORT = Number(process.env.E2E_UI_PORT ?? '3001');
+const E2E_UI_BASE = `http://localhost:${E2E_UI_PORT}`;
+const E2E_BROWSER_EXECUTABLE = process.env.E2E_BROWSER_EXECUTABLE;
+
 /**
  * Playwright E2E test configuration for Concord Voice Desktop.
  *
@@ -22,7 +27,8 @@ export default defineConfig({
   timeout: 60_000,
 
   use: {
-    baseURL: 'http://localhost:3001',
+    baseURL: E2E_UI_BASE,
+    launchOptions: E2E_BROWSER_EXECUTABLE ? { executablePath: E2E_BROWSER_EXECUTABLE } : undefined,
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
   },
@@ -35,8 +41,9 @@ export default defineConfig({
   ],
 
   webServer: {
-    command: 'npx vite --port 3001',
-    port: 3001,
+    command: `npx vite --port ${E2E_UI_PORT}`,
+    port: E2E_UI_PORT,
+    env: { VITE_API_PORT: E2E_API_PORT },
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,
   },

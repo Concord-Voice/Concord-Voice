@@ -12,7 +12,7 @@
  * arrives from the server), while `chat.ts` defines APPLICATION models (what
  * stores hold). Handlers in useWebSocketMessages.ts transform wire → app.
  *
- * 63 schemas total: 61 subscriber events (handled via wsService.on) + 2
+ * 66 schemas total: 64 subscriber events (handled via wsService.on) + 2
  * envelope-only events (connected, connection_ready) consumed internally
  * by wsService.handleMessage's switch — both must be in the union so that
  * the post-safeParse code accesses message.data fields without `as` casts.
@@ -1193,7 +1193,7 @@ export const KeyDeliveredSchema = z.object({
   }),
 });
 
-// ──────────── Preferences sync (2 events) — Task A10 ──────────────────
+// ──────────── Preferences sync (4 events) — Task A10 / #1234 ──────────
 
 /**
  * `preferences_updated` — server emits `{version: int}`; handler currently ignores
@@ -1228,6 +1228,19 @@ export const SavedGifsUpdatedSchema = z.object({
 export const FriendOrganizationUpdatedSchema = z.object({
   type: z.literal('friend_organization_updated'),
   data: z.object({
+    version: z.number().int().positive(),
+  }),
+});
+
+/**
+ * presence_overrides_updated — private cross-device metadata for the caller's
+ * encrypted custom-text recipient exceptions. Recipient IDs and ciphertext are
+ * deliberately absent; clients re-fetch the encrypted document over REST.
+ */
+export const PresenceOverridesUpdatedSchema = z.strictObject({
+  type: z.literal('presence_overrides_updated'),
+  data: z.strictObject({
+    category: z.literal('custom_text'),
     version: z.number().int().positive(),
   }),
 });
@@ -1346,7 +1359,7 @@ export const ConnectionReadySchema = z.object({
 });
 
 // ════════════════════════════════════════════════════════════════════════
-// 4. The discriminated union (63 schemas: 61 subscriber + 2 envelope)
+// 4. The discriminated union (66 schemas: 64 subscriber + 2 envelope)
 // ════════════════════════════════════════════════════════════════════════
 
 export const WebSocketEventSchema = z.discriminatedUnion('type', [
@@ -1422,10 +1435,11 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   KeyRevocationSchema,
   KeyDeliveredSchema,
 
-  // Preferences sync (3)
+  // Preferences sync (4)
   PreferencesUpdatedSchema,
   SavedGifsUpdatedSchema,
   FriendOrganizationUpdatedSchema,
+  PresenceOverridesUpdatedSchema,
 
   // Entitlements (1)
   EntitlementsChangedSchema,
@@ -1437,7 +1451,7 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   ConnectedSchema,
   ConnectionReadySchema,
 ]);
-// TOTAL: 63 schemas (60 base + rich_presence ×2 #1233 + entitlements_changed #1297)
+// TOTAL: 66 schemas (64 subscriber + 2 envelope-only)
 
 // ════════════════════════════════════════════════════════════════════════
 // 5. Derived types
@@ -1528,6 +1542,9 @@ export type PreferencesUpdatedPayload = z.infer<typeof PreferencesUpdatedSchema>
 export type SavedGifsUpdatedPayload = z.infer<typeof SavedGifsUpdatedSchema>['data'];
 export type FriendOrganizationUpdatedPayload = z.infer<
   typeof FriendOrganizationUpdatedSchema
+>['data'];
+export type PresenceOverridesUpdatedPayload = z.infer<
+  typeof PresenceOverridesUpdatedSchema
 >['data'];
 
 // Entitlements

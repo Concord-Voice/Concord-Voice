@@ -22,6 +22,8 @@ import { useNotificationPrefsStore } from '../../src/renderer/stores/notificatio
 import { useAttestationFailureStore } from '../../src/renderer/stores/attestationFailureStore';
 import { useRichPresenceStore } from '../../src/renderer/stores/richPresenceStore';
 import { useChangelogStore } from '../../src/renderer/stores/changelogStore';
+import { useFriendOrgStore } from '../../src/renderer/stores/friendOrgStore';
+import { usePresenceOverrideStore } from '../../src/renderer/stores/presenceOverrideStore';
 
 /**
  * Resets all Zustand stores to their initial state.
@@ -60,6 +62,8 @@ export function resetAllStores(): void {
   useNotificationPrefsStore.getState().clearAll();
   useAttestationFailureStore.getState().dismiss();
   useRichPresenceStore.getState().reset();
+  useFriendOrgStore.getState().reset();
+  usePresenceOverrideStore.getState().reset();
   useChangelogStore.setState({ lastSeenVersion: null });
 
   // Clear persisted state from localStorage AND sessionStorage

@@ -1,8 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
 
-const reset = () =>
-  useFriendOrgStore.getState()._hydrate({ v: 1, categories: [], sectionOrder: [] });
+const reset = () => useFriendOrgStore.getState().reset();
 
 describe('friendOrgStore', () => {
   beforeEach(reset);
@@ -55,5 +54,17 @@ describe('friendOrgStore', () => {
     useFriendOrgStore.getState().assignFriend('u2', a);
     useFriendOrgStore.getState().pruneFriends(['u1']); // u2 unfriended
     expect(useFriendOrgStore.getState().categories[0].memberIds).toEqual(['u1']);
+  });
+
+  it('reset clears decrypted categories, member IDs, and section order', () => {
+    const categoryId = useFriendOrgStore
+      .getState()
+      .createCategory('Private category', 'locked', '#123456');
+    useFriendOrgStore.getState().assignFriend('prior-account-user', categoryId);
+
+    useFriendOrgStore.getState().reset();
+
+    expect(useFriendOrgStore.getState().categories).toEqual([]);
+    expect(useFriendOrgStore.getState().sectionOrder).toEqual([]);
   });
 });

@@ -138,7 +138,8 @@ describe('preferencesSyncService', () => {
       serverOrder: [],
     });
     useAuthStore.getState().setAccessToken('mock-token');
-    vi.mocked(e2eeService.encryptPreferences).mockResolvedValue('encrypted-blob');
+    vi.mocked(e2eeService.encryptPreferences).mockClear().mockResolvedValue('encrypted-blob');
+    vi.mocked(e2eeService.decryptPreferences).mockReset();
     (e2eeService as any).isInitialized = true;
     initSyncServiceDeps();
   });
@@ -190,6 +191,62 @@ describe('preferencesSyncService', () => {
       expect(consoleSpy).toHaveBeenCalledWith('[PrefsSync] Push error:', expect.any(String));
       consoleSpy.mockRestore();
     });
+
+    it('does not send a push that finishes encrypting after stopWatching', async () => {
+      let releaseEncryption: ((ciphertext: string) => void) | undefined;
+      let putCount = 0;
+      vi.mocked(e2eeService.encryptPreferences).mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            releaseEncryption = resolve;
+          })
+      );
+      server.use(
+        http.put(`${API_BASE}/api/v1/users/me/preferences`, () => {
+          putCount += 1;
+          return HttpResponse.json({ version: 1 });
+        })
+      );
+
+      const push = preferencesSyncService.pushPreferences();
+      await vi.waitFor(() => expect(e2eeService.encryptPreferences).toHaveBeenCalledOnce());
+      preferencesSyncService.stopWatching();
+      releaseEncryption?.('encrypted-after-reset');
+      await push;
+
+      expect(putCount).toBe(0);
+    });
+
+    it('aborts an already-started preference PUT when watching stops', async () => {
+      let markPutStarted: (() => void) | undefined;
+      const putStarted = new Promise<void>((resolve) => {
+        markPutStarted = resolve;
+      });
+      let releasePut: (() => void) | undefined;
+      const putReleased = new Promise<void>((resolve) => {
+        releasePut = resolve;
+      });
+      let requestSignal: AbortSignal | undefined;
+      server.use(
+        http.put(`${API_BASE}/api/v1/users/me/preferences`, async ({ request }) => {
+          requestSignal = request.signal;
+          markPutStarted?.();
+          await putReleased;
+          return HttpResponse.json({ version: 1 });
+        })
+      );
+
+      const push = preferencesSyncService.pushPreferences();
+      await putStarted;
+
+      try {
+        preferencesSyncService.stopWatching();
+        expect(requestSignal?.aborted).toBe(true);
+      } finally {
+        releasePut?.();
+        await push;
+      }
+    });
   });
 
   describe('fetchAndApply', () => {
@@ -214,6 +271,25 @@ describe('preferencesSyncService', () => {
 
       // Should have pushed since preferences was null
       expect(e2eeService.encryptPreferences).toHaveBeenCalled();
+    });
+
+    it('does not bootstrap-push after the auth lifecycle becomes stale', async () => {
+      let current = true;
+      const controller = new AbortController();
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/preferences`, () => {
+          current = false;
+          controller.abort();
+          return HttpResponse.json({ preferences: null });
+        })
+      );
+
+      await preferencesSyncService.fetchAndApply({
+        signal: controller.signal,
+        isCurrent: () => current,
+      });
+
+      expect(e2eeService.encryptPreferences).not.toHaveBeenCalled();
     });
 
     it('decrypts and applies remote preferences', async () => {
@@ -255,6 +331,48 @@ describe('preferencesSyncService', () => {
       expect(useLayoutStore.getState().channelPanelWidth).toBe(300);
       expect(useLayoutStore.getState().memberPanelMode).toBe('collapsed');
       expect(useLayoutStore.getState().serverOrder).toEqual(['server-1']);
+    });
+
+    it('does not apply a response invalidated by stopWatching during decryption', async () => {
+      let releaseDecrypt: ((value: unknown) => void) | undefined;
+      vi.mocked(e2eeService.decryptPreferences).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseDecrypt = resolve;
+          })
+      );
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/preferences`, () =>
+          HttpResponse.json({ preferences: { encrypted_data: 'encrypted', version: 1 } })
+        )
+      );
+
+      const hydration = preferencesSyncService.fetchAndApply();
+      await vi.waitFor(() => expect(e2eeService.decryptPreferences).toHaveBeenCalledOnce());
+      preferencesSyncService.stopWatching();
+      releaseDecrypt?.({
+        v: 1,
+        settings: {
+          theme: 'light',
+          colorScheme: 'hacker',
+          fontSize: 'large',
+          compactMode: true,
+        },
+        layout: {
+          channelPanelPinned: false,
+          channelPanelWidth: 300,
+          memberPanelMode: 'collapsed',
+          memberPanelWidth: 200,
+          serverBarHeight: 50,
+          folderBarHeight: 40,
+          serverFolders: [],
+          serverOrder: ['prior-account-server'],
+        },
+      });
+      await hydration;
+
+      expect(useSettingsStore.getState().appearance.theme).toBe('dark');
+      expect(useLayoutStore.getState().serverOrder).toEqual([]);
     });
 
     it('ignores unknown preference versions', async () => {
@@ -339,6 +457,41 @@ describe('preferencesSyncService', () => {
         // Advance past the 3s debounce — push should now have run exactly once
         await vi.advanceTimersByTimeAsync(3500);
         expect(e2eeService.encryptPreferences).toHaveBeenCalledTimes(1);
+      } finally {
+        preferencesSyncService.stopWatching();
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not let an already-queued debounce callback adopt a post-reset generation', async () => {
+      vi.useFakeTimers();
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+      try {
+        vi.mocked(e2eeService.encryptPreferences).mockClear();
+        preferencesSyncService.startWatching();
+        await vi.advanceTimersByTimeAsync(0);
+
+        useSettingsStore.setState({
+          appearance: { ...useSettingsStore.getState().appearance, theme: 'light' },
+        });
+        const debounceCallback = setTimeoutSpy.mock.calls
+          .filter(([, delay]) => delay === 3000)
+          .at(-1)?.[0];
+        expect(typeof debounceCallback).toBe('function');
+
+        // Model the event-loop edge where the timer task is already queued, so
+        // clearTimeout cannot prevent its callback from starting after reset.
+        preferencesSyncService.stopWatching();
+        preferencesSyncService.startWatching();
+        await vi.advanceTimersByTimeAsync(0);
+        useSettingsStore.setState({
+          appearance: { ...useSettingsStore.getState().appearance, theme: 'dark' },
+        });
+
+        if (typeof debounceCallback === 'function') debounceCallback();
+        preferencesSyncService.stopWatching();
+        await vi.advanceTimersByTimeAsync(3500);
+        expect(e2eeService.encryptPreferences).not.toHaveBeenCalled();
       } finally {
         preferencesSyncService.stopWatching();
         vi.useRealTimers();

@@ -361,24 +361,39 @@ For end-to-end encrypted content (messages):
   key loss (for example, if you lose all devices holding key material
   without first having backed up your keys).
 
-### 2.4 What Concord Voice CAN See: Metadata
+### 2.4 What Concord Voice CAN See: Metadata and Server-Visible Presence
 
-Unencrypted metadata necessary for service operation may be collected
-and processed. This includes:
+Unencrypted metadata and server-visible presence information necessary
+for service operation may be collected and processed. This includes:
 
 - Account registration information (email address, username, date of
   account creation, hashed password, MFA configuration)
 - Timestamps of messages and other events
 - IP addresses and access logs
 - Server membership and channel membership
-- Presence status (online, away, offline)
+- Presence status (online, away, offline) and any optional Custom Status
+  text or emoji you choose to set
+- The account identifiers you explicitly exclude from seeing your Custom
+  Status, which are used to enforce your recipient choices
 - Aggregate counts (number of messages in a channel, etc.)
 - Payment records (handled by Stripe, see [Section 1](#payment-data))
 
-Metadata is processed under the legal bases described in
+Metadata and server-visible presence information are processed under the
+legal bases described in
 [Section 4](#4-what-legal-bases-do-we-rely-on-to-process-your-personal-information).
-Metadata retention is subject to the policies described in
+Retention of this information is subject to the policies described in
 [Section 10](#10-how-long-do-we-keep-your-information).
+
+Friend-category names, colors, and membership groupings used to select
+Custom Status exceptions remain client-encrypted. Concord Voice receives
+the individual excluded account identifiers needed for enforcement, but
+not the category labels or grouping structure that produced that selection.
+An ordinary password change re-encrypts that exception document atomically
+without changing the enforced recipient set. A destructive encryption-key or
+account recovery reset deletes the exception document, excluded-account
+identifiers, and stored Custom Status text/emoji; it turns visibility off and
+clears the prior status from connected users in the account's presence
+audience.
 
 ### 2.5 Limits of End-to-End Encryption
 
@@ -561,14 +576,14 @@ following categories of recipients in the following situations:
 We share information with service providers that perform specific
 functions on our behalf:
 
-| Service Provider | Purpose | Privacy Policy |
-|---|---|---|
-| **Stripe** | Payment processing for paid subscriptions | [stripe.com/privacy](https://stripe.com/privacy) |
-| **KLIPY** | GIF search and delivery via privacy proxy (we proxy your search to KLIPY to prevent direct contact between your device and KLIPY's servers) | _See KLIPY privacy policy_ |
-| **NVIDIA Broadcast** | Opt-in AI audio/video enhancement (RTX-Series GPU required); see [Section 7](#7-do-we-offer-artificial-intelligence-based-products) | [nvidia.com/en-us/about-nvidia/privacy-policy](https://www.nvidia.com/en-us/about-nvidia/privacy-policy/) |
-| **Google** | Single Sign-On (if you use Google to sign in); push notifications via FCM | [policies.google.com/privacy](https://policies.google.com/privacy) |
-| **Apple** | Single Sign-On (if you use Sign in with Apple); push notifications via APNs | [apple.com/legal/privacy](https://www.apple.com/legal/privacy/) |
-| **Resend** | Transactional email delivery (account verification, password reset, security alerts) | [resend.com/legal/privacy-policy](https://resend.com/legal/privacy-policy) |
+| Service Provider     | Purpose                                                                                                                                     | Privacy Policy                                                                                            |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| **Stripe**           | Payment processing for paid subscriptions                                                                                                   | [stripe.com/privacy](https://stripe.com/privacy)                                                          |
+| **KLIPY**            | GIF search and delivery via privacy proxy (we proxy your search to KLIPY to prevent direct contact between your device and KLIPY's servers) | _See KLIPY privacy policy_                                                                                |
+| **NVIDIA Broadcast** | Opt-in AI audio/video enhancement (RTX-Series GPU required); see [Section 7](#7-do-we-offer-artificial-intelligence-based-products)         | [nvidia.com/en-us/about-nvidia/privacy-policy](https://www.nvidia.com/en-us/about-nvidia/privacy-policy/) |
+| **Google**           | Single Sign-On (if you use Google to sign in); push notifications via FCM                                                                   | [policies.google.com/privacy](https://policies.google.com/privacy)                                        |
+| **Apple**            | Single Sign-On (if you use Sign in with Apple); push notifications via APNs                                                                 | [apple.com/legal/privacy](https://www.apple.com/legal/privacy/)                                           |
+| **Resend**           | Transactional email delivery (account verification, password reset, security alerts)                                                        | [resend.com/legal/privacy-policy](https://resend.com/legal/privacy-policy)                                |
 
 ### 5.2 Business Transfers
 
@@ -664,6 +679,7 @@ SDK is licensed under NVIDIA's terms; please review NVIDIA's privacy
 policy for details on any telemetry the SDK may transmit.
 
 We do **not**:
+
 - Train our own AI/ML models on your message content
 - Send your end-to-end encrypted content to any AI Service Provider for
   any purpose
@@ -731,8 +747,8 @@ those in your country.
 ### 9.1 Legal Basis for EEA / UK / Switzerland to United States Transfer
 
 Concord Voice LLC currently relies on **Article 49(1)(a) of the GDPR
-(and the equivalent UK GDPR provision)** — *explicit consent of the
-data subject* — as the legal basis for transferring personal data from
+(and the equivalent UK GDPR provision)** — _explicit consent of the
+data subject_ — as the legal basis for transferring personal data from
 the EEA, UK, or Switzerland to the United States.
 
 By creating an account on the hosted Concord Voice Service (operated
@@ -1051,20 +1067,20 @@ personal information we collect from you. For a comprehensive inventory
 of all personal information we process, please refer to
 [Section 1](#1-what-information-do-we-collect).
 
-| Category | Examples | Collected |
-|---|---|---|
-| **A. Identifiers** | Contact details, such as real name, alias, postal address, telephone or mobile contact number, unique personal identifier, online identifier, Internet Protocol address, email address, and account name | YES |
-| **B. Personal information as defined in the California Customer Records statute** | Name, contact information, education, employment, employment history, and financial information | YES |
-| **C. Protected classification characteristics under state or federal law** | Gender, age, date of birth, race and ethnicity, national origin, marital status, and other demographic data | YES (only date of birth for age verification) |
-| **D. Commercial information** | Transaction information, purchase history, financial details, and payment information | YES |
-| **E. Biometric information** | Fingerprints and voiceprints | NO |
-| **F. Internet or other similar network activity** | Browsing history, search history, online behavior, interest data, and interactions with our and other websites, applications, systems, and advertisements | YES |
-| **G. Geolocation data** | Device location (approximate, IP-based; not precise GPS) | YES |
-| **H. Audio, electronic, sensory, or similar information** | Images and audio, video or call recordings created in connection with our business activities | NO (we do not record calls; voice/video streams are transient) |
-| **I. Professional or employment-related information** | Business contact details in order to provide you our Services at a business level or job title, work history, and professional qualifications if you apply for a job with us | NO |
-| **J. Education Information** | Student records and directory information | NO |
-| **K. Inferences drawn from collected personal information** | Inferences drawn from any of the collected personal information listed above to create a profile or summary about, for example, an individual's preferences and characteristics | NO |
-| **L. Sensitive personal information** | Account login information; date of birth | YES |
+| Category                                                                          | Examples                                                                                                                                                                                                 | Collected                                                      |
+| --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| **A. Identifiers**                                                                | Contact details, such as real name, alias, postal address, telephone or mobile contact number, unique personal identifier, online identifier, Internet Protocol address, email address, and account name | YES                                                            |
+| **B. Personal information as defined in the California Customer Records statute** | Name, contact information, education, employment, employment history, and financial information                                                                                                          | YES                                                            |
+| **C. Protected classification characteristics under state or federal law**        | Gender, age, date of birth, race and ethnicity, national origin, marital status, and other demographic data                                                                                              | YES (only date of birth for age verification)                  |
+| **D. Commercial information**                                                     | Transaction information, purchase history, financial details, and payment information                                                                                                                    | YES                                                            |
+| **E. Biometric information**                                                      | Fingerprints and voiceprints                                                                                                                                                                             | NO                                                             |
+| **F. Internet or other similar network activity**                                 | Browsing history, search history, online behavior, interest data, and interactions with our and other websites, applications, systems, and advertisements                                                | YES                                                            |
+| **G. Geolocation data**                                                           | Device location (approximate, IP-based; not precise GPS)                                                                                                                                                 | YES                                                            |
+| **H. Audio, electronic, sensory, or similar information**                         | Images and audio, video or call recordings created in connection with our business activities                                                                                                            | NO (we do not record calls; voice/video streams are transient) |
+| **I. Professional or employment-related information**                             | Business contact details in order to provide you our Services at a business level or job title, work history, and professional qualifications if you apply for a job with us                             | NO                                                             |
+| **J. Education Information**                                                      | Student records and directory information                                                                                                                                                                | NO                                                             |
+| **K. Inferences drawn from collected personal information**                       | Inferences drawn from any of the collected personal information listed above to create a profile or summary about, for example, an individual's preferences and characteristics                          | NO                                                             |
+| **L. Sensitive personal information**                                             | Account login information; date of birth                                                                                                                                                                 | YES                                                            |
 
 We only collect sensitive personal information, as defined by applicable
 privacy laws or the purposes allowed by law or with your consent.
@@ -1257,7 +1273,8 @@ valid legal process includes, where available and applicable:
 - IP address logs and access timestamps
 - Server and channel membership
 - Payment records (if applicable)
-- Unencrypted metadata as described in [Section 2.4](#24-what-concord-voice-can-see-metadata)
+- Unencrypted metadata and server-visible presence information as described in
+  [Section 2.4](#24-what-concord-voice-can-see-metadata-and-server-visible-presence)
 
 We will **notify affected users of legal process requests** unless
 prohibited by law, gag order, or court order from doing so, or where

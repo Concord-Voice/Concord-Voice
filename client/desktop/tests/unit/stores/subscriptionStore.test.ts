@@ -47,6 +47,35 @@ describe('subscriptionStore', () => {
     expect(useSubscriptionStore.getState().degraded).toBe(false);
   });
 
+  it('does not restore a stale premium response after reset', async () => {
+    let releaseFetch: ((response: Response) => void) | undefined;
+    mockApiFetch.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          releaseFetch = resolve;
+        })
+    );
+    mockSafeJson.mockResolvedValue(premiumDTO);
+    let current = true;
+    const controller = new AbortController();
+
+    const hydration = useSubscriptionStore.getState().hydrate({
+      signal: controller.signal,
+      isCurrent: () => current,
+    });
+    useSubscriptionStore.getState().reset();
+    current = false;
+    controller.abort();
+    releaseFetch?.(new Response(JSON.stringify(premiumDTO), { status: 200 }));
+    await hydration;
+
+    expect(useSubscriptionStore.getState()).toMatchObject({
+      entitlement: FREE_ENTITLEMENT,
+      degraded: false,
+      hydrated: false,
+    });
+  });
+
   it('hydrate() FIRST-LOAD error fails closed to FREE + degraded (never grant premium)', async () => {
     // hydrated=false (beforeEach): a first-load failure has no authoritative prior value,
     // so it fails closed to the free floor — a user who never authenticated as premium

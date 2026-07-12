@@ -1,0 +1,336 @@
+.presence-exceptions {
+  border-top: 1px solid var(--border-color);
+}
+
+.presence-exceptions__details > summary {
+  padding: 14px 0;
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.presence-exceptions__details > summary:focus-visible,
+.presence-exception-button:focus-visible,
+.presence-exception-remove:focus-visible,
+.presence-exception-option input:focus-visible,
+.presence-exception-search input:focus-visible {
+  outline: 2px solid var(--state-focused, var(--accent-primary));
+  outline-offset: 2px;
+}
+
+.presence-exceptions__content {
+  padding: 0 0 14px 18px;
+}
+
+.presence-exceptions__hint,
+.presence-exceptions__state,
+.presence-exception-empty,
+.presence-exception-explanation,
+.presence-exception-unavailable,
+.presence-exceptions__live {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.5;
+}
+
+.presence-exceptions__list {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.presence-exceptions__list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 40px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+}
+
+.presence-exceptions__list li > span,
+.presence-exception-option > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.presence-exceptions__list strong,
+.presence-exception-option strong {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.presence-exceptions__list small,
+.presence-exception-option small {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: calc(11px * var(--font-scale, 1));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.presence-exceptions__actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+.presence-exceptions__live {
+  min-height: 18px;
+  padding-left: 18px;
+  color: var(--text-secondary);
+}
+
+.presence-exception-remove,
+.presence-exception-button {
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.presence-exception-remove {
+  padding: 6px 10px;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.presence-exception-remove:hover:not(:disabled) {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.presence-exception-button {
+  min-height: 34px;
+  padding: 7px 14px;
+}
+
+.presence-exception-button--secondary {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.presence-exception-button--secondary:hover:not(:disabled) {
+  border-color: var(--accent-primary);
+  background: var(--bg-hover);
+}
+
+.presence-exception-button--primary {
+  border-color: var(--accent-primary);
+  background: var(--accent-primary);
+  color: var(--bg-primary);
+}
+
+.presence-exception-button--primary:hover:not(:disabled) {
+  background: var(--accent-hover, var(--accent-primary));
+}
+
+.presence-exception-button:disabled,
+.presence-exception-remove:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.presence-exception-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  color: var(--danger);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+.presence-exception-dialog {
+  width: min(600px, calc(100vw - 32px));
+  max-width: none;
+  max-height: min(760px, calc(100vh - 32px));
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  box-shadow: var(--elevation-high, 0 12px 32px rgba(0, 0, 0, 0.45));
+  overflow: hidden;
+}
+
+.presence-exception-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.58);
+}
+
+.presence-exception-dialog__panel {
+  display: flex;
+  max-height: inherit;
+  flex-direction: column;
+}
+
+.presence-exception-dialog__header {
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.presence-exception-dialog__header h2 {
+  margin: 0;
+  font-size: calc(18px * var(--font-scale, 1));
+  font-weight: 700;
+}
+
+.presence-exception-dialog__header p {
+  margin: 5px 0 0;
+  color: var(--text-muted);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+.presence-exception-dialog__body {
+  display: grid;
+  gap: 14px;
+  min-height: 0;
+  padding: 16px 20px;
+  overflow-y: auto;
+}
+
+.presence-exception-search {
+  display: grid;
+  gap: 6px;
+  color: var(--text-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+}
+
+.presence-exception-search input {
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.presence-exception-group {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.presence-exception-group legend {
+  margin-bottom: 7px;
+  padding: 0;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 700;
+}
+
+.presence-exception-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.presence-exception-options--friends {
+  max-height: 230px;
+  overflow-y: auto;
+}
+
+.presence-exception-option {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  min-height: 42px;
+  padding: 7px 9px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  cursor: pointer;
+}
+
+.presence-exception-option:hover {
+  background: var(--bg-hover);
+}
+
+.presence-exception-option input {
+  flex: 0 0 auto;
+  accent-color: var(--accent-primary);
+}
+
+.presence-exception-empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.presence-exception-empty p {
+  margin: 0;
+}
+
+.presence-exception-explanation {
+  padding-left: 10px;
+  border-left: 2px solid var(--accent-primary);
+}
+
+.presence-exception-unavailable {
+  color: var(--text-secondary);
+}
+
+.presence-exception-dialog__actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--border-color);
+  color: var(--text-muted);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+.presence-exception-dialog__actions > div {
+  display: flex;
+  gap: 8px;
+}
+
+@media (max-width: 560px) {
+  .presence-exception-options {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .presence-exception-dialog__actions,
+  .presence-exception-empty {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .presence-exception-dialog__actions > div {
+    justify-content: flex-end;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .presence-exception-button,
+  .presence-exception-remove,
+  .presence-exception-option {
+    transition: none;
+  }
+}

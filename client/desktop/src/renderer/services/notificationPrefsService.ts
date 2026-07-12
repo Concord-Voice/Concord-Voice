@@ -5,6 +5,10 @@ import {
   type PreferenceWire,
 } from '../stores/notificationPrefsStore';
 import { errorMessage } from '../utils/redactError';
+import {
+  isHydrationLifecycleCurrent,
+  type HydrationLifecycleGuard,
+} from './postLoginHydrationLifecycle';
 
 // Re-export so existing service consumers (MuteContextMenuItem) keep working
 // without changing their import path. The canonical definition lives in the
@@ -26,12 +30,20 @@ interface MuteResponse {
  * main shell mounts. Safe to call again (e.g. on reconnect) — the store
  * replaces its state with the response.
  */
-export async function hydrateNotificationPreferences(): Promise<void> {
-  const res = await apiFetch('/api/v1/notifications/preferences');
+export async function hydrateNotificationPreferences(
+  guard?: HydrationLifecycleGuard
+): Promise<void> {
+  if (!isHydrationLifecycleCurrent(guard)) return;
+  const res = await apiFetch(
+    '/api/v1/notifications/preferences',
+    guard ? { signal: guard.signal } : undefined
+  );
+  if (!isHydrationLifecycleCurrent(guard)) return;
   if (!res.ok) {
     throw new Error('Failed to fetch notification preferences');
   }
   const data = await safeJson<PreferencesResponse>(res);
+  if (!isHydrationLifecycleCurrent(guard)) return;
   useNotificationPrefsStore.getState().setInitialPreferences(data.preferences);
 }
 
@@ -146,11 +158,14 @@ export function stopExpirySweep(): void {
  * try/catch and so the inner catch contributes 0 cognitive complexity to
  * the calling functions (App.tsx's restore() in particular was at 18/15).
  */
-export async function tryHydrateNotificationPrefs(): Promise<void> {
+export async function tryHydrateNotificationPrefs(guard?: HydrationLifecycleGuard): Promise<void> {
   try {
-    await hydrateNotificationPreferences();
+    if (!isHydrationLifecycleCurrent(guard)) return;
+    await hydrateNotificationPreferences(guard);
+    if (!isHydrationLifecycleCurrent(guard)) return;
     startExpirySweep();
   } catch (err) {
+    if (!isHydrationLifecycleCurrent(guard)) return;
     console.warn('Failed to hydrate notification preferences:', errorMessage(err));
   }
 }

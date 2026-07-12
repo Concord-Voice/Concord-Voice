@@ -27,6 +27,7 @@ import { isPendingKeyError } from '../services/e2eeErrors';
 import { preferencesSyncService } from '../services/preferencesSync';
 import { savedGifsSyncService } from '../services/savedGifsSync';
 import { friendOrgSyncService } from '../services/friendOrgSync';
+import { presenceOverrideSyncService } from '../services/presenceOverrideSync';
 import { apiFetch } from '../services/apiClient';
 import { useVoiceStore, channelVoiceMemberFromApi } from '../stores/voiceStore';
 import { useConnectionStore } from '../stores/connectionStore';
@@ -37,7 +38,11 @@ import { useSubscriptionStore } from '../stores/subscriptionStore';
 import { useRichPresenceStore } from '../stores/richPresenceStore';
 import { speak as ttsSpeak } from '../services/ttsService';
 import { notificationSoundService } from '../services/notificationSoundService';
-import { isChannelMuted, isDMMuted, hasChannelMuteOverride } from '../stores/notificationPrefsStore';
+import {
+  isChannelMuted,
+  isDMMuted,
+  hasChannelMuteOverride,
+} from '../stores/notificationPrefsStore';
 
 /**
  * True if the user has Do Not Disturb on. DND suppresses ALL notification
@@ -1127,6 +1132,12 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       friendOrgSyncService.fetchAndApply();
     });
 
+    const unsubPresenceOverridesUpdated = wsService.on('presence_overrides_updated', (msg) => {
+      void presenceOverrideSyncService.handleRemoteUpdate(msg.data.version).catch(() => {
+        console.warn('[PresenceOverrideSync] remote-update refetch failed');
+      });
+    });
+
     // Entitlements changed (#1297) — server pushes the full capability set on
     // any tier change. The wire payload is validated at the dispatch boundary,
     // so update the store directly — no re-fetch round-trip.
@@ -1157,6 +1168,13 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // Both `users` (enhanced) and `online_user_ids` (legacy back-compat)
     // are schema-optional; the handler prefers `users` when present.
     const unsubPresenceSnapshot = wsService.on('presence_snapshot', (msg) => {
+      // A snapshot begins a fresh authoritative stream. Drop all previously
+      // received custom text before the server replays the statuses this viewer
+      // is still allowed to see. Otherwise an override applied while this
+      // socket was being closed could leave revoked text cached indefinitely.
+      // Preserve the self slice, which is owned by the settings REST flow.
+      useRichPresenceStore.getState().clearAllCustomText();
+
       // #803: selfStatus is the source of truth MemberList/UserPopover read for
       // the self-user, but nothing reconciled it with the server — so a stale or
       // default value left the connected user showing Offline. The server's
@@ -1823,6 +1841,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       unsubPreferencesUpdated();
       unsubSavedGifsUpdated();
       unsubFriendOrgUpdated();
+      unsubPresenceOverridesUpdated();
       unsubEntitlements();
       unsubEntitlementsResync();
       unsubPresenceSnapshot();

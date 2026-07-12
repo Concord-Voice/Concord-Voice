@@ -31,6 +31,7 @@ const CategoryManagerPanel: React.FC<CategoryManagerPanelProps> = ({ onClose }) 
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const emojiPickerRef = useRef<HTMLDivElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
 
   const selected = categories.find((c) => c.id === selectedId) || null;
 
@@ -49,6 +50,10 @@ const CategoryManagerPanel: React.FC<CategoryManagerPanelProps> = ({ onClose }) 
     }
     // eslint-disable-next-line @eslint-react/exhaustive-deps -- keyed on selectedId (stable) NOT `selected` (a fresh categories.find() reference each render); re-running on a `categories` refresh would clobber the user's unsaved in-progress edits
   }, [selectedId]);
+
+  useEffect(() => {
+    closeButtonRef.current?.focus();
+  }, []);
 
   const handleCreate = useCallback(() => {
     const id = createCategory('New Category', '', null);
@@ -69,11 +74,22 @@ const CategoryManagerPanel: React.FC<CategoryManagerPanelProps> = ({ onClose }) 
   }, [selectedId, deleteCategory]);
 
   return (
-    <dialog className="category-manager-overlay" open aria-label="Manage Categories">
+    <dialog
+      className="category-manager-overlay"
+      open
+      aria-label="Manage Categories"
+      onKeyDown={(event) => {
+        if (event.key !== 'Escape') return;
+        event.preventDefault();
+        event.stopPropagation();
+        onClose();
+      }}
+    >
       <div className="category-manager">
         <div className="category-manager-header">
           <h3>Manage Categories</h3>
           <button
+            ref={closeButtonRef}
             type="button"
             className="category-manager-close-btn"
             aria-label="Close"

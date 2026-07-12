@@ -41,3 +41,42 @@ func TestUpdatePrivacySettingsDBError(t *testing.T) {
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
+
+func TestGetPresenceOverridesDBError(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	cleanup()
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("user_id", uuid.NewString())
+	c.Params = gin.Params{{Key: "category", Value: "custom_text"}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/users/me/presence-overrides/custom_text", nil)
+
+	h.GetPresenceOverrides(c)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestReplacePresenceOverridesDBError(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	cleanup()
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("user_id", uuid.NewString())
+	c.Params = gin.Params{{Key: "category", Value: "custom_text"}}
+	c.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/v1/users/me/presence-overrides/custom_text",
+		strings.NewReader(`{"encrypted_data":"YQ==","expected_version":0,"excluded_user_ids":[]}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.ReplacePresenceOverrides(c)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}

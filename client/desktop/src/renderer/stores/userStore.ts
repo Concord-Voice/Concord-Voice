@@ -8,12 +8,19 @@ import { getWebSocketService } from '../services/websocketService';
 import { e2eeService } from '../services/e2eeService';
 import { preferencesSyncService } from '../services/preferencesSync';
 import { savedGifsSyncService } from '../services/savedGifsSync';
+import { friendOrgSyncService } from '../services/friendOrgSync';
+import { presenceOverrideSyncService } from '../services/presenceOverrideSync';
 import { stopExpirySweep } from '../services/notificationPrefsService';
 import { useNotificationPrefsStore } from './notificationPrefsStore';
+import { usePresenceOverrideStore } from './presenceOverrideStore';
+import { useSavedGifsStore } from './savedGifsStore';
+import { useFriendOrgStore, type FriendOrgBlob } from './friendOrgStore';
 import { setSyncSuppressed } from './colorSyncSuppression';
 import {
   deriveKeyFromPassword,
   deriveKeyArgon2id,
+  derivePreferencesKeyArgon2id,
+  encryptBlob,
   unwrapPrivateKey,
   wrapPrivateKey,
   generateSalt,
@@ -21,6 +28,12 @@ import {
   arrayBufferToBase64,
   type KeyDerivationAlgorithm,
 } from '../utils/crypto';
+import { parsePresenceOverrides } from '../utils/presenceOverrides';
+import {
+  isHydrationLifecycleCurrent,
+  resetPostLoginHydrationLifecycle,
+  type HydrationLifecycleGuard,
+} from '../services/postLoginHydrationLifecycle';
 
 export interface UserProfile {
   id: string;
@@ -52,30 +65,156 @@ interface UserState {
   isLoading: boolean;
   error: string | null;
 
-  fetchUser: () => Promise<void>;
+  fetchUser: (guard?: HydrationLifecycleGuard) => Promise<void>;
   setUser: (user: UserProfile) => void;
   clearUser: () => void;
   logout: () => Promise<void>;
   updateProfile: (updates: UpdateProfileData) => Promise<void>;
-  changePassword: (
-    currentPassword: string,
-    newPassword: string
-  ) => Promise<{ success: boolean; error?: string }>;
+  changePassword: (currentPassword: string, newPassword: string) => Promise<PasswordChangeResult>;
+}
+
+interface PasswordChangeResult {
+  success: boolean;
+  error?: string;
+}
+
+interface PasswordChangeLifecycle {
+  controller: AbortController;
+  userId: string;
+  unsubscribeAuth: () => void;
+}
+
+interface UserFetchLifecycle {
+  controller: AbortController;
+  guard?: HydrationLifecycleGuard;
+  unsubscribeAuth: () => void;
+  detachGuardAbort: () => void;
+}
+
+const PASSWORD_CHANGE_CANCELLED = 'Password change was cancelled'; // pragma: allowlist secret
+let activePasswordChange: PasswordChangeLifecycle | null = null;
+let activeUserFetch: UserFetchLifecycle | null = null;
+
+function cancelActiveUserFetch(): void {
+  const lifecycle = activeUserFetch;
+  if (lifecycle === null) return;
+  activeUserFetch = null;
+  lifecycle.unsubscribeAuth();
+  lifecycle.detachGuardAbort();
+  lifecycle.controller.abort();
+}
+
+function beginUserFetch(guard?: HydrationLifecycleGuard): UserFetchLifecycle {
+  cancelActiveUserFetch();
+  const { accessToken, sessionId } = useAuthStore.getState();
+  const controller = new AbortController();
+  const lifecycle: UserFetchLifecycle = {
+    controller,
+    guard,
+    unsubscribeAuth: () => undefined,
+    detachGuardAbort: () => undefined,
+  };
+  activeUserFetch = lifecycle;
+  lifecycle.unsubscribeAuth = useAuthStore.subscribe((auth) => {
+    if (activeUserFetch !== lifecycle) return;
+    const sessionChanged =
+      sessionId === null ? auth.accessToken !== accessToken : auth.sessionId !== sessionId;
+    if (auth.accessToken === null || sessionChanged) cancelActiveUserFetch();
+  });
+  if (guard !== undefined) {
+    const cancelForGuard = (): void => {
+      if (activeUserFetch === lifecycle) cancelActiveUserFetch();
+    };
+    guard.signal.addEventListener('abort', cancelForGuard, { once: true });
+    lifecycle.detachGuardAbort = () => guard.signal.removeEventListener('abort', cancelForGuard);
+  }
+  return lifecycle;
+}
+
+function isUserFetchCurrent(lifecycle: UserFetchLifecycle): boolean {
+  return (
+    activeUserFetch === lifecycle &&
+    !lifecycle.controller.signal.aborted &&
+    isHydrationLifecycleCurrent(lifecycle.guard)
+  );
+}
+
+function finishUserFetch(lifecycle: UserFetchLifecycle): void {
+  if (activeUserFetch !== lifecycle) return;
+  activeUserFetch = null;
+  lifecycle.unsubscribeAuth();
+  lifecycle.detachGuardAbort();
+}
+
+function cancelActivePasswordChange(): void {
+  const lifecycle = activePasswordChange;
+  if (lifecycle === null) return;
+  activePasswordChange = null;
+  lifecycle.unsubscribeAuth();
+  lifecycle.controller.abort();
+}
+
+function cancelPasswordChangeForDifferentAccount(nextUserId: string): void {
+  if (activePasswordChange?.userId !== nextUserId) cancelActivePasswordChange();
+}
+
+function beginPasswordChange(userId: string): PasswordChangeLifecycle {
+  cancelActivePasswordChange();
+  const { accessToken, sessionId } = useAuthStore.getState();
+  const lifecycle: PasswordChangeLifecycle = {
+    controller: new AbortController(),
+    userId,
+    unsubscribeAuth: () => undefined,
+  };
+  activePasswordChange = lifecycle;
+  lifecycle.unsubscribeAuth = useAuthStore.subscribe((auth) => {
+    if (activePasswordChange !== lifecycle) return;
+    const sessionChanged =
+      sessionId === null ? auth.accessToken !== accessToken : auth.sessionId !== sessionId;
+    if (auth.accessToken === null || sessionChanged) {
+      cancelActivePasswordChange();
+    }
+  });
+  return lifecycle;
+}
+
+function finishPasswordChange(lifecycle: PasswordChangeLifecycle): void {
+  if (activePasswordChange !== lifecycle) return;
+  activePasswordChange = null;
+  lifecycle.unsubscribeAuth();
+}
+
+function assertPasswordChangeCurrent(isCurrent: () => boolean): void {
+  if (!isCurrent()) throw new Error(PASSWORD_CHANGE_CANCELLED);
+}
+
+function passwordChangeFailure(error: unknown, isCurrent: () => boolean): PasswordChangeResult {
+  if (!isCurrent()) return { success: false, error: PASSWORD_CHANGE_CANCELLED };
+  return {
+    success: false,
+    error: error instanceof Error ? error.message : 'Failed to change password',
+  };
 }
 
 export const useUserStore = wrapStore(
   create<UserState>()(
     devtools(
-      (set) => ({
+      (set, get) => ({
         user: null,
         isLoading: false,
         error: null,
 
-        fetchUser: async () => {
+        fetchUser: async (guard) => {
+          if (!isHydrationLifecycleCurrent(guard)) return;
+          const lifecycle = beginUserFetch(guard);
+          const isCurrent = (): boolean => isUserFetchCurrent(lifecycle);
           set({ isLoading: true, error: null });
 
           try {
-            const response = await apiFetch('/api/v1/users/me');
+            const response = await apiFetch('/api/v1/users/me', {
+              signal: lifecycle.controller.signal,
+            });
+            if (!isCurrent()) return;
 
             if (response.status === 401) {
               // Token expired and refresh failed. apiClient.handleRefreshFailure
@@ -89,10 +228,15 @@ export const useUserStore = wrapStore(
 
             if (!response.ok) {
               const data = await response.json();
+              if (!isCurrent()) return;
               throw new Error(data.error || 'Failed to fetch user');
             }
 
             const data = await response.json();
+            if (!isCurrent()) return;
+            if (typeof data.user?.id === 'string') {
+              cancelPasswordChangeForDifferentAccount(data.user.id);
+            }
             set({ user: data.user, isLoading: false });
 
             // Sync email_verified to authStore so route guards reflect DB state
@@ -100,25 +244,37 @@ export const useUserStore = wrapStore(
               useAuthStore.getState().setEmailVerified(data.user.email_verified);
             }
           } catch (error) {
+            if (!isCurrent()) return;
             set({
               error: error instanceof Error ? error.message : 'Failed to fetch user',
               isLoading: false,
             });
+          } finally {
+            finishUserFetch(lifecycle);
           }
         },
 
         setUser: (user: UserProfile) => {
+          cancelActiveUserFetch();
+          cancelPasswordChangeForDifferentAccount(user.id);
           set({ user, isLoading: false, error: null });
         },
 
         clearUser: () => {
+          cancelActiveUserFetch();
+          cancelActivePasswordChange();
           set({ user: null, isLoading: false, error: null });
         },
 
         logout: async () => {
+          resetPostLoginHydrationLifecycle();
+          cancelActiveUserFetch();
+          cancelActivePasswordChange();
           // Stop syncing preferences and saved GIFs before tearing down
           preferencesSyncService.stopWatching();
           savedGifsSyncService.stopWatching();
+          friendOrgSyncService.stopWatching();
+          presenceOverrideSyncService.reset();
           // Stop the mute-prefs expiry sweep timer and clear any in-memory
           // prefs so the next user's session doesn't inherit the previous
           // user's mute list.
@@ -188,16 +344,51 @@ export const useUserStore = wrapStore(
         },
 
         changePassword: async (currentPassword: string, newPassword: string) => {
+          const initiatingUserId = get().user?.id;
+          if (initiatingUserId === undefined || useAuthStore.getState().accessToken === null) {
+            return { success: false, error: 'Session expired' };
+          }
+
+          const lifecycle = beginPasswordChange(initiatingUserId);
+          const isCurrent = (): boolean =>
+            activePasswordChange === lifecycle &&
+            !lifecycle.controller.signal.aborted &&
+            get().user?.id === initiatingUserId;
+          const lifecycleGuard = {
+            signal: lifecycle.controller.signal,
+            isCurrent,
+          };
+          // Preserve non-empty local encrypted-domain state before the server
+          // disconnect can trigger a reconnect/reset. Full authoritative CAS
+          // rotation across every domain is tracked in #2200; these snapshots
+          // close the ordinary successful password-change path without ever
+          // bootstrapping an empty, potentially unhydrated store.
+          const savedGifsSnapshot = useSavedGifsStore.getState().gifs.map((gif) => ({ ...gif }));
+          const friendOrgState = useFriendOrgStore.getState();
+          const friendOrgSnapshot: FriendOrgBlob = {
+            v: 1,
+            categories: friendOrgState.categories.map((category) => ({
+              ...category,
+              memberIds: [...category.memberIds],
+            })),
+            sectionOrder: [...friendOrgState.sectionOrder],
+          };
+
           try {
             // Step 1: Fetch current E2EE keys from the server
-            const keysRes = await apiFetch('/api/v1/users/me/keys');
+            const keysRes = await apiFetch('/api/v1/users/me/keys', {
+              signal: lifecycle.controller.signal,
+            });
+            assertPasswordChangeCurrent(isCurrent);
 
             if (!keysRes.ok) {
               const keysData = await keysRes.json();
+              assertPasswordChangeCurrent(isCurrent);
               return { success: false, error: keysData.error || 'Failed to fetch encryption keys' };
             }
 
             const keysData = await keysRes.json();
+            assertPasswordChangeCurrent(isCurrent);
             const { wrapped_private_key, key_derivation_salt } = keysData.e2ee_keys;
             const currentAlg: KeyDerivationAlgorithm =
               keysData.e2ee_keys.key_derivation_alg || 'pbkdf2';
@@ -208,13 +399,34 @@ export const useUserStore = wrapStore(
               currentAlg === 'argon2id'
                 ? await deriveKeyArgon2id(currentPassword, currentSalt)
                 : await deriveKeyFromPassword(currentPassword, currentSalt);
+            assertPasswordChangeCurrent(isCurrent);
             const wrappedKeyBuffer = base64ToArrayBuffer(wrapped_private_key);
             const privateKey = await unwrapPrivateKey(wrappedKeyBuffer, currentWrappingKey);
+            assertPasswordChangeCurrent(isCurrent);
 
             // Step 3: Re-wrap private key with new password (always Argon2id)
             const newSalt = generateSalt();
             const newWrappingKey = await deriveKeyArgon2id(newPassword, newSalt);
+            assertPasswordChangeCurrent(isCurrent);
             const newWrappedKey = await wrapPrivateKey(privateKey, newWrappingKey);
+            assertPasswordChangeCurrent(isCurrent);
+            // Build the replacement override ciphertext with the NEW
+            // password-derived preferences key without mutating the live E2EE
+            // service. The server CASes this document in the same transaction
+            // as the password/key rotation, so success can never strand
+            // old-key ciphertext.
+            const overrideState = usePresenceOverrideStore.getState();
+            const presenceOverrideSnapshot = parsePresenceOverrides({
+              v: 1,
+              excludedUserIds: [...overrideState.excludedUserIds],
+            });
+            const newPreferencesKey = await derivePreferencesKeyArgon2id(newPassword, newSalt);
+            assertPasswordChangeCurrent(isCurrent);
+            const presenceOverrideEncryptedData = await encryptBlob(
+              presenceOverrideSnapshot,
+              newPreferencesKey
+            );
+            assertPasswordChangeCurrent(isCurrent);
 
             // Step 4: Send password change with re-wrapped keys
             const response = await apiFetch('/api/v1/users/me/password', {
@@ -226,11 +438,18 @@ export const useUserStore = wrapStore(
                 wrapped_private_key: arrayBufferToBase64(newWrappedKey),
                 key_derivation_salt: arrayBufferToBase64(newSalt.buffer as ArrayBuffer),
                 key_derivation_alg: 'argon2id',
+                presence_override: {
+                  encrypted_data: presenceOverrideEncryptedData,
+                  expected_version: overrideState.appliedVersion,
+                },
               }),
+              signal: lifecycle.controller.signal,
             });
+            assertPasswordChangeCurrent(isCurrent);
 
             if (response.status === 401) {
               const data = await response.json();
+              assertPasswordChangeCurrent(isCurrent);
               if (data.error === 'Current password is incorrect') {
                 return { success: false, error: data.error };
               }
@@ -242,9 +461,25 @@ export const useUserStore = wrapStore(
             }
 
             const data = await response.json();
+            assertPasswordChangeCurrent(isCurrent);
+
+            if (response.status === 409 && data.code === 'presence_override_version_conflict') {
+              await presenceOverrideSyncService.fetchAndApply();
+              assertPasswordChangeCurrent(isCurrent);
+              return {
+                success: false,
+                error:
+                  'Presence exceptions changed on another device. Please retry password change.',
+              };
+            }
 
             if (!response.ok) {
               return { success: false, error: data.error || 'Failed to change password' };
+            }
+
+            const presenceOverrideVersion = data.presence_override_version;
+            if (!Number.isInteger(presenceOverrideVersion) || presenceOverrideVersion < 0) {
+              throw new Error('Server returned an invalid presence override version');
             }
 
             // Re-initialize E2EE service with new password (always Argon2id after change)
@@ -252,18 +487,36 @@ export const useUserStore = wrapStore(
               newPassword,
               arrayBufferToBase64(newWrappedKey),
               arrayBufferToBase64(newSalt.buffer as ArrayBuffer),
-              'argon2id'
+              'argon2id',
+              lifecycleGuard
             );
+            assertPasswordChangeCurrent(isCurrent);
+
+            usePresenceOverrideStore
+              .getState()
+              .apply(presenceOverrideSnapshot.excludedUserIds, presenceOverrideVersion);
 
             // Re-encrypt and push preferences with the new key
-            await preferencesSyncService.pushPreferences();
+            await preferencesSyncService.pushPreferences(lifecycleGuard);
+            assertPasswordChangeCurrent(isCurrent);
+
+            if (savedGifsSnapshot.length > 0) {
+              await savedGifsSyncService.pushSavedGifsSnapshot(savedGifsSnapshot, lifecycleGuard);
+              assertPasswordChangeCurrent(isCurrent);
+            }
+            if (
+              friendOrgSnapshot.categories.length > 0 ||
+              friendOrgSnapshot.sectionOrder.length > 0
+            ) {
+              await friendOrgSyncService.pushFriendOrgSnapshot(friendOrgSnapshot, lifecycleGuard);
+              assertPasswordChangeCurrent(isCurrent);
+            }
 
             return { success: true };
           } catch (error) {
-            return {
-              success: false,
-              error: error instanceof Error ? error.message : 'Failed to change password',
-            };
+            return passwordChangeFailure(error, isCurrent);
+          } finally {
+            finishPasswordChange(lifecycle);
           }
         },
       }),

@@ -1,7 +1,7 @@
 /**
  * ws-events.test.ts — zod schema coverage for the WebSocket wire contract.
  *
- * 4 describe-blocks: happy path (57), rejection (17), discriminator (3), PII scrubber (4).
+ * Covers canonical payloads, rejection cases, discriminator behavior, and PII scrubbing.
  *
  * @see client/desktop/src/renderer/types/ws-events.ts
  * @see [internal]specs/2026-05-23-709-ws-discriminated-union-design.md §6
@@ -70,7 +70,7 @@ import {
   KeyNeededSchema,
   KeyRevocationSchema,
   KeyDeliveredSchema,
-  // Preferences sync (2)
+  // Preferences sync
   PreferencesUpdatedSchema,
   SavedGifsUpdatedSchema,
   FriendOrganizationUpdatedSchema,
@@ -96,7 +96,7 @@ const UUID_C = '33333333-3333-4333-8333-333333333333';
 const ISO_NOW = '2026-05-23T12:00:00.000Z';
 
 // ════════════════════════════════════════════════════════════════════════
-// 1. Happy path — 54 schemas, one canonical valid payload per schema
+// 1. Happy path — one canonical valid payload per directly imported schema
 // ════════════════════════════════════════════════════════════════════════
 
 describe('ws-events schemas — happy path (one per event)', () => {
@@ -784,7 +784,7 @@ describe('ws-events schemas — happy path (one per event)', () => {
     expect(result.success).toBe(true);
   });
 
-  // ──────────── Preferences sync (2) ───────────────────────────────────
+  // ──────────── Preferences sync ───────────────────────────────────────
 
   it('PreferencesUpdatedSchema accepts a canonical prefs-updated envelope', () => {
     const result = PreferencesUpdatedSchema.safeParse({
@@ -1349,5 +1349,53 @@ describe('Rich Presence — custom_text', () => {
       data: { user_id: UUID_A, category: 'custom_text' },
     });
     expect(result.success).toBe(true);
+  });
+});
+
+describe('Presence override metadata', () => {
+  it('accepts strict custom_text version metadata through the event union', () => {
+    expect(
+      WebSocketEventSchema.safeParse({
+        type: 'presence_overrides_updated',
+        data: { category: 'custom_text', version: 4 },
+      }).success
+    ).toBe(true);
+  });
+
+  it.each([
+    { category: 'activity', version: 4 },
+    { category: 'custom_text', version: 0 },
+    { category: 'custom_text', version: 1.5 },
+  ])('rejects invalid presence override metadata', (data) => {
+    expect(
+      WebSocketEventSchema.safeParse({
+        type: 'presence_overrides_updated',
+        data,
+      }).success
+    ).toBe(false);
+  });
+
+  it('rejects recipient or ciphertext fields inside the metadata', () => {
+    expect(
+      WebSocketEventSchema.safeParse({
+        type: 'presence_overrides_updated',
+        data: {
+          category: 'custom_text',
+          version: 4,
+          encrypted_data: 'sentinel-ciphertext',
+          excluded_user_ids: [UUID_A],
+        },
+      }).success
+    ).toBe(false);
+  });
+
+  it('rejects unknown envelope fields', () => {
+    expect(
+      WebSocketEventSchema.safeParse({
+        type: 'presence_overrides_updated',
+        data: { category: 'custom_text', version: 4 },
+        excluded_user_ids: [UUID_A],
+      }).success
+    ).toBe(false);
   });
 });

@@ -3,18 +3,24 @@
  *
  * Single home for the post-login user-state hydration cluster that was
  * previously duplicated inline in Login.completeLoginFromResponse and
- * App.tsx's session-restore path. Extracting it here lets EVERY login path —
- * password/MFA/WebAuthn, SSO (useSSOFlow), and session-restore — hydrate the
- * same set of state uniformly, so none can silently skip a step.
+ * App.tsx's session-restore path. Every login path uses this same cluster:
+ * password/MFA/WebAuthn and session restore invoke it directly, while SSO
+ * deliberately defers it until App's eager passphrase-unlock callback has
+ * initialized E2EE.
  */
 
 import { preferencesSyncService, type PreferencesSyncDeps } from './preferencesSync';
 import { savedGifsSyncService } from './savedGifsSync';
 import { friendOrgSyncService } from './friendOrgSync';
+import { presenceOverrideSyncService } from './presenceOverrideSync';
 import { tryHydrateNotificationPrefs } from './notificationPrefsService';
 import { useSubscriptionStore } from '../stores/subscriptionStore';
 import { useSettingsStore } from '../stores/settingsStore';
 import { useLayoutStore } from '../stores/layoutStore';
+import {
+  beginPostLoginHydrationGuard,
+  type HydrationLifecycleGuard,
+} from './postLoginHydrationLifecycle';
 
 /** Build the dependency bag for preferencesSyncService — extracted to reduce nesting depth. */
 export function buildPreferencesSyncDeps(): PreferencesSyncDeps {
@@ -41,19 +47,38 @@ export function buildPreferencesSyncDeps(): PreferencesSyncDeps {
 
 /**
  * Hydrate all post-login user state — preferences, saved GIFs, notification mute
- * prefs, and the entitlement capability set — in one place so EVERY login path
- * (password/MFA/WebAuthn via Login.completeLoginFromResponse, SSO via useSSOFlow,
- * and session-restore in App.tsx) hydrates uniformly and none can silently skip it.
+ * prefs, and the entitlement capability set — in one place so every login path
+ * hydrates the same state. Password/MFA/WebAuthn invoke it through
+ * Login.completeLoginFromResponse, session restore invokes it in App.tsx, and
+ * SSO invokes it from App only after SSOEagerUnlock initializes E2EE.
  * Extracted verbatim from the prior completeLoginFromResponse cluster (#1297).
  */
-export async function hydratePostLogin(): Promise<void> {
+export async function hydratePostLogin(existingGuard?: HydrationLifecycleGuard): Promise<void> {
+  const guard = existingGuard ?? beginPostLoginHydrationGuard();
+  const isCurrent = guard.isCurrent;
+
+  if (!isCurrent()) return;
   preferencesSyncService.init(buildPreferencesSyncDeps());
+  if (!isCurrent()) return;
   preferencesSyncService.startWatching();
-  await preferencesSyncService.fetchAndApply();
+  if (!isCurrent()) return;
+  await preferencesSyncService.fetchAndApply(guard);
+
+  if (!isCurrent()) return;
   savedGifsSyncService.startWatching();
-  await savedGifsSyncService.fetchAndApply();
+  if (!isCurrent()) return;
+  await savedGifsSyncService.fetchAndApply(guard);
+
+  if (!isCurrent()) return;
   friendOrgSyncService.startWatching();
-  await friendOrgSyncService.fetchAndApply();
-  await tryHydrateNotificationPrefs();
-  await useSubscriptionStore.getState().hydrate();
+  if (!isCurrent()) return;
+  const friendOrgHydrationIsCurrent = await friendOrgSyncService.fetchAndApply();
+  if (!isCurrent() || !friendOrgHydrationIsCurrent) return;
+
+  const presenceOverrideHydrationIsCurrent = await presenceOverrideSyncService.fetchAndApply();
+  if (!isCurrent() || !presenceOverrideHydrationIsCurrent) return;
+
+  await tryHydrateNotificationPrefs(guard);
+  if (!isCurrent()) return;
+  await useSubscriptionStore.getState().hydrate(guard);
 }

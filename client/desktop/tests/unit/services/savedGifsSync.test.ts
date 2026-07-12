@@ -84,6 +84,62 @@ describe('savedGifsSyncService', () => {
       // Should not throw when encryption rejects
       await expect(savedGifsSyncService.pushSavedGifs()).resolves.toBeUndefined();
     });
+
+    it('does not send a push that finishes encrypting after stopWatching', async () => {
+      let releaseEncryption: ((ciphertext: string) => void) | undefined;
+      let putCount = 0;
+      vi.mocked(e2eeService.encryptPreferences).mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            releaseEncryption = resolve;
+          })
+      );
+      server.use(
+        http.put(`${API_BASE}/api/v1/users/me/saved-gifs`, () => {
+          putCount += 1;
+          return HttpResponse.json({ version: 1 });
+        })
+      );
+
+      const push = savedGifsSyncService.pushSavedGifs();
+      await vi.waitFor(() => expect(e2eeService.encryptPreferences).toHaveBeenCalledOnce());
+      savedGifsSyncService.stopWatching();
+      releaseEncryption?.('encrypted-after-reset');
+      await push;
+
+      expect(putCount).toBe(0);
+    });
+
+    it('aborts an already-started saved-GIF PUT when watching stops', async () => {
+      let markPutStarted: (() => void) | undefined;
+      const putStarted = new Promise<void>((resolve) => {
+        markPutStarted = resolve;
+      });
+      let releasePut: (() => void) | undefined;
+      const putReleased = new Promise<void>((resolve) => {
+        releasePut = resolve;
+      });
+      let requestSignal: AbortSignal | undefined;
+      server.use(
+        http.put(`${API_BASE}/api/v1/users/me/saved-gifs`, async ({ request }) => {
+          requestSignal = request.signal;
+          markPutStarted?.();
+          await putReleased;
+          return HttpResponse.json({ version: 1 });
+        })
+      );
+
+      const push = savedGifsSyncService.pushSavedGifs();
+      await putStarted;
+
+      try {
+        savedGifsSyncService.stopWatching();
+        expect(requestSignal?.aborted).toBe(true);
+      } finally {
+        releasePut?.();
+        await push;
+      }
+    });
   });
 
   describe('fetchAndApply', () => {
@@ -107,6 +163,25 @@ describe('savedGifsSyncService', () => {
       await savedGifsSyncService.fetchAndApply();
 
       expect(e2eeService.encryptPreferences).toHaveBeenCalled();
+    });
+
+    it('does not bootstrap-push after the auth lifecycle becomes stale', async () => {
+      let current = true;
+      const controller = new AbortController();
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/saved-gifs`, () => {
+          current = false;
+          controller.abort();
+          return HttpResponse.json({ saved_gifs: null });
+        })
+      );
+
+      await savedGifsSyncService.fetchAndApply({
+        signal: controller.signal,
+        isCurrent: () => current,
+      });
+
+      expect(e2eeService.encryptPreferences).not.toHaveBeenCalled();
     });
 
     it('decrypts and applies remote saved GIFs', async () => {
@@ -134,6 +209,29 @@ describe('savedGifsSyncService', () => {
       expect(gifs[1].slug).toBe('def456');
     });
 
+    it('does not apply a response invalidated by stopWatching during decryption', async () => {
+      let releaseDecrypt: ((value: unknown) => void) | undefined;
+      vi.mocked(e2eeService.decryptPreferences).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseDecrypt = resolve;
+          })
+      );
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/saved-gifs`, () =>
+          HttpResponse.json({ saved_gifs: { encrypted_data: 'encrypted', version: 1 } })
+        )
+      );
+
+      const hydration = savedGifsSyncService.fetchAndApply();
+      await vi.waitFor(() => expect(e2eeService.decryptPreferences).toHaveBeenCalledOnce());
+      savedGifsSyncService.stopWatching();
+      releaseDecrypt?.({ v: 1, gifs: [{ slug: 'prior-account', savedAt: 1000 }] });
+      await hydration;
+
+      expect(useSavedGifsStore.getState().gifs).toEqual([]);
+    });
+
     it('ignores unknown blob versions', async () => {
       vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({
         v: 99,
@@ -153,7 +251,7 @@ describe('savedGifsSyncService', () => {
       expect(useSavedGifsStore.getState().gifs).toEqual([]);
     });
 
-    it('re-pushes local state when server data fails to decrypt', async () => {
+    it('fails closed without overwriting server data when ciphertext cannot decrypt', async () => {
       vi.mocked(e2eeService.decryptPreferences).mockRejectedValueOnce(new Error('decrypt fail'));
       useSavedGifsStore.getState().saveGif('local-only');
 
@@ -168,8 +266,10 @@ describe('savedGifsSyncService', () => {
 
       await savedGifsSyncService.fetchAndApply();
 
-      // Should have pushed local state to overwrite stale server data
-      expect(e2eeService.encryptPreferences).toHaveBeenCalled();
+      expect(e2eeService.encryptPreferences).not.toHaveBeenCalled();
+      expect(useSavedGifsStore.getState().gifs).toEqual([
+        expect.objectContaining({ slug: 'local-only' }),
+      ]);
     });
 
     it('handles fetch failure gracefully', async () => {
@@ -245,6 +345,33 @@ describe('savedGifsSyncService', () => {
         // Advance past the 3s debounce — the push should now have run once
         await vi.advanceTimersByTimeAsync(3500);
         expect(e2eeService.encryptPreferences).toHaveBeenCalledTimes(1);
+      } finally {
+        savedGifsSyncService.stopWatching();
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not let an already-queued debounce callback adopt a post-reset generation', async () => {
+      vi.useFakeTimers();
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+      try {
+        savedGifsSyncService.startWatching();
+        useSavedGifsStore.getState().saveGif('queued-before-reset');
+        const debounceCallback = setTimeoutSpy.mock.calls
+          .filter(([, delay]) => delay === 3000)
+          .at(-1)?.[0];
+        expect(typeof debounceCallback).toBe('function');
+
+        // Model the event-loop edge where the timer task is already queued, so
+        // clearTimeout cannot prevent its callback from starting after reset.
+        savedGifsSyncService.stopWatching();
+        savedGifsSyncService.startWatching();
+        useSavedGifsStore.getState().saveGif('new-generation-pending');
+
+        if (typeof debounceCallback === 'function') debounceCallback();
+        savedGifsSyncService.stopWatching();
+        await vi.advanceTimersByTimeAsync(3500);
+        expect(e2eeService.encryptPreferences).not.toHaveBeenCalled();
       } finally {
         savedGifsSyncService.stopWatching();
         vi.useRealTimers();

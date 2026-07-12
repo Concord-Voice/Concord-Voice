@@ -19,7 +19,6 @@ import { startSSOFlow, type SSOProvider } from '../services/ssoService';
 import { useAuthStore } from '../stores/authStore';
 import { useE2EEStore } from '../stores/e2eeStore';
 import { useMFAChallengeStore } from '../stores/mfaChallengeStore';
-import { hydratePostLogin } from '../services/postLoginHydration';
 
 export function useSSOFlow(): { begin: (provider: SSOProvider) => Promise<void> } {
   const setState = useSSOStore((s) => s.setState);
@@ -38,19 +37,6 @@ export function useSSOFlow(): { begin: (provider: SSOProvider) => Promise<void> 
             // that combine `needsSSOUnlock` and `ready` to gate MainApp.
             useE2EEStore.getState().setNeedsSSOUnlock(true);
             setState({ phase: 'idle' });
-            // Hydrate post-login user state (preferences, saved GIFs,
-            // notification prefs, entitlements) so SSO matches the password /
-            // session-restore paths (#1297). Guarded so a hydration blip never
-            // turns a successful SSO login into an error — the session is
-            // already valid at this point.
-            try {
-              await hydratePostLogin();
-            } catch (err) {
-              console.warn(
-                'SSO post-login hydration failed (non-fatal):',
-                err instanceof Error ? err.message : 'hydrate_failed'
-              );
-            }
             break;
           case 'mfa_required':
             // Bridge to the canonical MFA modal. The store records the SSO-side
@@ -83,17 +69,6 @@ export function useSSOFlow(): { begin: (provider: SSOProvider) => Promise<void> 
                   }
                   setState({ phase: 'idle' });
                   useE2EEStore.getState().setNeedsSSOUnlock(true);
-                  // Hydrate post-login user state so the SSO-MFA path matches
-                  // the password / session-restore paths (#1297). Guarded so a
-                  // hydration blip never turns a successful login into an error.
-                  try {
-                    await hydratePostLogin();
-                  } catch (err) {
-                    console.warn(
-                      'SSO post-login hydration failed (non-fatal):',
-                      err instanceof Error ? err.message : 'hydrate_failed'
-                    );
-                  }
                 } else if (mfaResult.verified) {
                   // verified:true but payload missing or access_token absent /
                   // empty. In production this should not happen — SSO

@@ -58,6 +58,46 @@ describe('e2eeService', () => {
       );
       expect(useE2EEStore.getState().ready).toBe(true);
     });
+
+    it('does not commit partially imported keys after its account lifecycle is cancelled', async () => {
+      const originalImportKey = crypto.subtle.importKey.bind(crypto.subtle);
+      let importCount = 0;
+      let releasePreferencesImport!: () => void;
+      const preferencesImportGate = new Promise<void>((resolve) => {
+        releasePreferencesImport = resolve;
+      });
+      const importKeySpy = vi.spyOn(crypto.subtle, 'importKey').mockImplementation((async (
+        ...args: Parameters<SubtleCrypto['importKey']>
+      ) => {
+        importCount += 1;
+        // Imports 1-2 create the exportable derived keys. Import 3 creates the
+        // runtime wrapping key; hold import 4 at the old partial-commit boundary.
+        if (importCount === 4) await preferencesImportGate;
+        return originalImportKey(...args);
+      }) as SubtleCrypto['importKey']);
+      const controller = new AbortController();
+
+      try {
+        const initialization = e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt,
+          'argon2id',
+          { signal: controller.signal, isCurrent: () => !controller.signal.aborted }
+        );
+        await vi.waitFor(() => expect(importCount).toBe(4));
+
+        controller.abort();
+        releasePreferencesImport();
+        await initialization;
+
+        expect(e2eeService.isInitialized).toBe(false);
+        expect(e2eeService.getSessionKeys()).toBeNull();
+        expect(useE2EEStore.getState().ready).toBe(false);
+      } finally {
+        importKeySpy.mockRestore();
+      }
+    });
   });
 
   describe('clearKeys', () => {

@@ -17,9 +17,7 @@ vi.mock('@/renderer/services/ssoService', async (importOriginal) => {
   };
 });
 
-// Mock the shared post-login hydration helper (#1297) so the SSO success paths
-// can be asserted to invoke it without exercising the real preferences / GIFs /
-// entitlements network calls.
+// SSO must defer the shared hydration helper until App's E2EE unlock boundary.
 vi.mock('@/renderer/services/postLoginHydration', () => ({
   hydratePostLogin: vi.fn().mockResolvedValue(undefined),
 }));
@@ -59,7 +57,7 @@ describe('useSSOFlow', () => {
     expect(mockedStartSSOFlow).toHaveBeenCalledWith('google');
   });
 
-  it('logged_in: hydrates post-login user state via the shared helper (#1297)', async () => {
+  it('logged_in: defers encrypted post-login hydration until SSO unlock', async () => {
     mockedStartSSOFlow.mockResolvedValueOnce({
       kind: 'logged_in',
       accessToken: 'jwt-token-abc',
@@ -70,28 +68,7 @@ describe('useSSOFlow', () => {
       await result.current.begin('google');
     });
 
-    expect(mockedHydratePostLogin).toHaveBeenCalledTimes(1);
-  });
-
-  it('logged_in: a hydration failure does NOT turn a successful login into an error', async () => {
-    mockedStartSSOFlow.mockResolvedValueOnce({
-      kind: 'logged_in',
-      accessToken: 'jwt-token-abc',
-    });
-    mockedHydratePostLogin.mockRejectedValueOnce(new Error('network'));
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    const { result } = renderHook(() => useSSOFlow());
-    await act(async () => {
-      await result.current.begin('google');
-    });
-
-    // The guarded try/catch in the hook means the session stays valid and the
-    // store rests at idle even though hydration threw.
-    expect(useAuthStore.getState().accessToken).toBe('jwt-token-abc');
-    expect(useSSOStore.getState().state).toEqual({ phase: 'idle' });
-    expect(warnSpy).toHaveBeenCalled();
-    warnSpy.mockRestore();
+    expect(mockedHydratePostLogin).not.toHaveBeenCalled();
   });
 
   it('logged_in: arms the SSO eager-unlock gate (#270 Task 21b)', async () => {
@@ -211,8 +188,8 @@ describe('useSSOFlow', () => {
     expect(useAuthStore.getState().sessionId).toBe('sess-after-sso-mfa');
     expect(useSSOStore.getState().state).toEqual({ phase: 'idle' });
     expect(useE2EEStore.getState().needsSSOUnlock).toBe(true);
-    // The SSO-MFA success path also runs the shared post-login hydration (#1297).
-    expect(mockedHydratePostLogin).toHaveBeenCalledTimes(1);
+    // E2EE is still locked; App's unlock boundary owns encrypted hydration.
+    expect(mockedHydratePostLogin).not.toHaveBeenCalled();
   });
 
   it('mfa_required: post-verify with payload missing session_id leaves sessionId unchanged', async () => {

@@ -9,6 +9,7 @@ import { useConnectionStore } from '@/renderer/stores/connectionStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { useMemberStore } from '@/renderer/stores/memberStore';
+import { useAuthStore } from '@/renderer/stores/authStore';
 
 // Mock dependencies
 const mockSetAggressiveReconnect = vi.fn();
@@ -46,6 +47,11 @@ vi.mock('@/renderer/services/resetService', () => ({
   gracefulReset: (...args: unknown[]) => mockGracefulReset(...args),
 }));
 
+const mockHydratePostLogin = vi.fn().mockResolvedValue(undefined);
+vi.mock('@/renderer/services/postLoginHydration', () => ({
+  hydratePostLogin: (...args: unknown[]) => mockHydratePostLogin(...args),
+}));
+
 const mockIsInitialized = { value: false };
 const mockProcessPendingKeyRequests = vi.fn().mockResolvedValue(undefined);
 vi.mock('@/renderer/services/e2eeService', () => ({
@@ -68,6 +74,9 @@ beforeEach(() => {
     connectionState: 'disconnected',
   });
   useUserStore.getState().clearUser();
+  useAuthStore.getState().clearAccessToken();
+  useAuthStore.getState().setAccessToken('recovery-token');
+  useAuthStore.getState().setSessionId('recovery-session');
   mockIsInitialized.value = false;
   mockRunPreflight.mockResolvedValue({
     internet: 'ok',
@@ -295,7 +304,7 @@ describe('useConnectionRecovery — extended', () => {
   });
 
   describe('CONNECTED during recovery_a', () => {
-    it('performs graceful reset and fetches user', () => {
+    it('performs graceful reset and fetches user', async () => {
       useConnectionStore.getState().enterRecoveryA();
 
       const validateEpochs = vi.fn().mockResolvedValue(undefined);
@@ -308,9 +317,10 @@ describe('useConnectionRecovery — extended', () => {
       expect(mockSetAggressiveReconnect).toHaveBeenCalledWith(false);
       // Phase should be reset
       expect(useConnectionStore.getState().phase).toBe('stable');
+      await vi.waitFor(() => expect(mockHydratePostLogin).toHaveBeenCalledOnce());
     });
 
-    it('validates E2EE epochs when initialized', () => {
+    it('validates E2EE epochs when initialized', async () => {
       useConnectionStore.getState().enterRecoveryA();
       mockIsInitialized.value = true;
 
@@ -322,11 +332,80 @@ describe('useConnectionRecovery — extended', () => {
       result.current('CONNECTED' as never);
 
       expect(validateEpochs).toHaveBeenCalled();
+      await vi.waitFor(() => expect(mockHydratePostLogin).toHaveBeenCalledOnce());
+    });
+
+    it('restores the user and then rehydrates account-bound sync after reset', async () => {
+      useConnectionStore.getState().enterRecoveryA();
+      const recoveryOrder: string[] = [];
+      mockGracefulReset.mockImplementationOnce(() => {
+        recoveryOrder.push('reset');
+        useUserStore.getState().clearUser();
+      });
+      const fetchUser = vi
+        .spyOn(useUserStore.getState(), 'fetchUser')
+        .mockImplementationOnce(async () => {
+          recoveryOrder.push('fetch-user');
+          useUserStore.setState({
+            user: { id: 'recovered-user', username: 'recovered' },
+            isLoading: false,
+            error: null,
+          });
+        });
+      mockHydratePostLogin.mockImplementationOnce(async () => {
+        recoveryOrder.push('hydrate');
+      });
+
+      try {
+        const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+        result.current('CONNECTED' as never);
+
+        await vi.waitFor(() => expect(mockHydratePostLogin).toHaveBeenCalledOnce());
+        expect(recoveryOrder).toEqual(['reset', 'fetch-user', 'hydrate']);
+        expect(useUserStore.getState().user?.id).toBe('recovered-user');
+      } finally {
+        fetchUser.mockRestore();
+      }
+    });
+
+    it('does not hydrate a new account after auth changes during a held user fetch', async () => {
+      useConnectionStore.getState().enterRecoveryA();
+      useAuthStore.getState().setAccessToken('recovery-token');
+      useAuthStore.getState().setSessionId('recovery-session');
+
+      let releaseFetch: (() => void) | undefined;
+      const fetchUser = vi.spyOn(useUserStore.getState(), 'fetchUser').mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseFetch = resolve;
+          })
+      );
+
+      try {
+        const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+        result.current('CONNECTED' as never);
+        await vi.waitFor(() => expect(fetchUser).toHaveBeenCalledOnce());
+
+        const fetchCalls = fetchUser.mock.calls as unknown[][];
+        const recoveryGuard = fetchCalls[0]?.[0] as
+          { signal: AbortSignal; isCurrent: () => boolean } | undefined;
+        expect(recoveryGuard).toBeDefined();
+
+        useAuthStore.getState().setSessionId('different-session');
+        releaseFetch?.();
+
+        await vi.waitFor(() => expect(recoveryGuard?.isCurrent()).toBe(false));
+        expect(mockHydratePostLogin).not.toHaveBeenCalled();
+      } finally {
+        fetchUser.mockRestore();
+      }
     });
   });
 
   describe('CONNECTED during preflight', () => {
-    it('performs graceful reset (same as recovery_a)', () => {
+    it('performs graceful reset (same as recovery_a)', async () => {
       useConnectionStore.getState().enterPreflight();
 
       const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
@@ -335,6 +414,7 @@ describe('useConnectionRecovery — extended', () => {
 
       expect(mockSetAggressiveReconnect).toHaveBeenCalledWith(false);
       expect(useConnectionStore.getState().phase).toBe('stable');
+      await vi.waitFor(() => expect(mockHydratePostLogin).toHaveBeenCalledOnce());
     });
   });
 

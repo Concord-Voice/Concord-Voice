@@ -10,6 +10,8 @@ interface SavedGifsState {
   saveGif: (gifSlug: string) => void;
   removeGif: (gifSlug: string) => void;
   isGifSaved: (gifSlug: string) => boolean;
+  /** Clear account-scoped state during logout/account switching. */
+  reset: () => void;
   /** Internal: called by sync service to replace local state with decrypted remote data. */
   _setGifs: (gifs: SavedGif[]) => void;
 }
@@ -29,6 +31,8 @@ export const useSavedGifsStore = createStore<SavedGifsState>()((set, get) => ({
     })),
 
   isGifSaved: (gifSlug) => get().gifs.some((g) => g.slug === gifSlug),
+
+  reset: () => set({ gifs: [] }),
 
   _setGifs: (gifs) => set({ gifs }),
 }));

@@ -205,6 +205,8 @@ func TruncateAllTables(db *sql.DB) error {
 
 func truncateAllTablesOnce(db *sql.DB) error {
 	_, err := db.Exec(`TRUNCATE
+		user_presence_overrides,
+		presence_override_preferences,
 		account_deletions,
 		age_verification_records,
 		user_sso_identities,

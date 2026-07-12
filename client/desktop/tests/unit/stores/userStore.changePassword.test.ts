@@ -26,12 +26,36 @@ vi.mock('@/renderer/services/preferencesSync', () => ({
   },
 }));
 
+vi.mock('@/renderer/services/savedGifsSync', () => ({
+  savedGifsSyncService: {
+    stopWatching: vi.fn(),
+    pushSavedGifsSnapshot: vi.fn().mockResolvedValue(undefined),
+  },
+}));
+
+vi.mock('@/renderer/services/friendOrgSync', () => ({
+  friendOrgSyncService: {
+    stopWatching: vi.fn(),
+    pushFriendOrgSnapshot: vi.fn().mockResolvedValue(true),
+  },
+}));
+
+vi.mock('@/renderer/services/presenceOverrideSync', () => ({
+  presenceOverrideSyncService: {
+    reset: vi.fn(),
+    fetchAndApply: vi.fn().mockResolvedValue(true),
+    save: vi.fn().mockResolvedValue(true),
+  },
+}));
+
 // Mock all crypto functions
 vi.mock('@/renderer/utils/crypto', () => ({
   deriveKeyFromPassword: vi.fn().mockResolvedValue({} as CryptoKey),
   deriveKeyArgon2id: vi.fn().mockResolvedValue({} as CryptoKey),
+  derivePreferencesKeyArgon2id: vi.fn().mockResolvedValue({} as CryptoKey),
   unwrapPrivateKey: vi.fn().mockResolvedValue({} as CryptoKey),
   wrapPrivateKey: vi.fn().mockResolvedValue(new ArrayBuffer(32)),
+  encryptBlob: vi.fn().mockResolvedValue('new-preference-key-ciphertext'),
   generateSalt: vi.fn().mockReturnValue(new Uint8Array(16)),
   base64ToArrayBuffer: vi.fn().mockReturnValue(new ArrayBuffer(32)),
   arrayBufferToBase64: vi.fn().mockReturnValue('mock-base64-string'),
@@ -40,20 +64,69 @@ vi.mock('@/renderer/utils/crypto', () => ({
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { apiFetch } from '@/renderer/services/apiClient';
-import { unwrapPrivateKey } from '@/renderer/utils/crypto';
+import { e2eeService } from '@/renderer/services/e2eeService';
+import { preferencesSyncService } from '@/renderer/services/preferencesSync';
+import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';
+import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
+import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
+import {
+  derivePreferencesKeyArgon2id,
+  encryptBlob,
+  unwrapPrivateKey,
+} from '@/renderer/utils/crypto';
+import { usePresenceOverrideStore } from '@/renderer/stores/presenceOverrideStore';
+import { useSavedGifsStore } from '@/renderer/stores/savedGifsStore';
+import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
 import { mockUser } from '../../mocks/fixtures';
 
 const mockApiFetch = vi.mocked(apiFetch);
+const mockDerivePreferencesKey = vi.mocked(derivePreferencesKeyArgon2id);
+const mockEncryptBlob = vi.mocked(encryptBlob);
 const mockUnwrapPrivateKey = vi.mocked(unwrapPrivateKey);
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 describe('userStore - changePassword', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useUserStore.setState({ user: mockUser as any, isLoading: false, error: null });
     useAuthStore.getState().setAccessToken('mock-access');
+    usePresenceOverrideStore.getState().reset();
+    useSavedGifsStore.getState().reset();
+    useFriendOrgStore.getState().reset();
+    vi.mocked(presenceOverrideSyncService.fetchAndApply).mockResolvedValue(true);
+    vi.mocked(presenceOverrideSyncService.save).mockResolvedValue(true);
   });
 
   it('successfully changes password with re-wrapped keys', async () => {
+    const excludedUserIds = ['11111111-1111-4111-8111-111111111111'];
+    usePresenceOverrideStore.getState().apply(excludedUserIds, 7);
+    const savedGifSnapshot = [{ slug: 'focus-cat', savedAt: 123 }];
+    useSavedGifsStore.getState()._setGifs(savedGifSnapshot);
+    const friendOrgSnapshot = {
+      v: 1 as const,
+      categories: [
+        {
+          id: 'cat_11111111-1111-4111-8111-111111111111',
+          name: 'Core team',
+          emoji: '🔒',
+          color: '#123456',
+          memberIds: ['22222222-2222-4222-8222-222222222222'],
+        },
+      ],
+      sectionOrder: ['cat_11111111-1111-4111-8111-111111111111'],
+    };
+    useFriendOrgStore.getState()._hydrate(friendOrgSnapshot);
+
     // Mock GET /api/v1/users/me/keys
     mockApiFetch.mockResolvedValueOnce({
       ok: true,
@@ -70,14 +143,21 @@ describe('userStore - changePassword', () => {
     mockApiFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
-      json: async () => ({ success: true }),
+      json: async () => ({
+        message: 'Password changed successfully',
+        presence_override_version: 8,
+      }),
     } as Response);
 
     const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
 
     expect(result).toEqual({ success: true });
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
-    expect(mockApiFetch).toHaveBeenNthCalledWith(1, '/api/v1/users/me/keys');
+    expect(mockApiFetch).toHaveBeenNthCalledWith(
+      1,
+      '/api/v1/users/me/keys',
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
     expect(mockApiFetch).toHaveBeenNthCalledWith(
       2,
       '/api/v1/users/me/password',
@@ -86,6 +166,243 @@ describe('userStore - changePassword', () => {
         headers: { 'Content-Type': 'application/json' },
       })
     );
+    const requestBody = JSON.parse(String(mockApiFetch.mock.calls[1]?.[1]?.body)) as Record<
+      string,
+      unknown
+    >;
+    expect(requestBody.presence_override).toEqual({
+      encrypted_data: 'new-preference-key-ciphertext',
+      expected_version: 7,
+    });
+    expect(mockDerivePreferencesKey).toHaveBeenCalledWith('newpass', expect.any(Uint8Array));
+    expect(mockEncryptBlob).toHaveBeenCalledWith({ v: 1, excludedUserIds }, expect.anything());
+    expect(usePresenceOverrideStore.getState().excludedUserIds).toEqual(excludedUserIds);
+    expect(usePresenceOverrideStore.getState().appliedVersion).toBe(8);
+    expect(presenceOverrideSyncService.save).not.toHaveBeenCalled();
+    expect(preferencesSyncService.pushPreferences).toHaveBeenCalledWith(
+      expect.objectContaining({ signal: expect.any(AbortSignal), isCurrent: expect.any(Function) })
+    );
+    expect(savedGifsSyncService.pushSavedGifsSnapshot).toHaveBeenCalledWith(
+      savedGifSnapshot,
+      expect.objectContaining({ signal: expect.any(AbortSignal), isCurrent: expect.any(Function) })
+    );
+    expect(friendOrgSyncService.pushFriendOrgSnapshot).toHaveBeenCalledWith(
+      friendOrgSnapshot,
+      expect.objectContaining({ signal: expect.any(AbortSignal), isCurrent: expect.any(Function) })
+    );
+  });
+
+  it('refreshes authoritative overrides after a conflict so an explicit retry can succeed', async () => {
+    const excludedUserIds = ['11111111-1111-4111-8111-111111111111'];
+    const authoritativeUserIds = ['22222222-2222-4222-8222-222222222222'];
+    usePresenceOverrideStore.getState().apply(excludedUserIds, 7);
+    vi.mocked(presenceOverrideSyncService.fetchAndApply).mockImplementationOnce(async () => {
+      usePresenceOverrideStore.getState().apply(authoritativeUserIds, 8);
+      return true;
+    });
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          e2ee_keys: {
+            wrapped_private_key: 'old-wrapped-key',
+            key_derivation_salt: 'old-salt',
+          },
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 409,
+        json: async () => ({
+          code: 'presence_override_version_conflict',
+          current_version: 8,
+        }),
+      } as Response);
+
+    const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
+
+    expect(result).toEqual({
+      success: false,
+      error: 'Presence exceptions changed on another device. Please retry password change.',
+    });
+    expect(e2eeService.initialize).not.toHaveBeenCalled();
+    expect(preferencesSyncService.pushPreferences).not.toHaveBeenCalled();
+    expect(presenceOverrideSyncService.save).not.toHaveBeenCalled();
+    expect(presenceOverrideSyncService.fetchAndApply).toHaveBeenCalledOnce();
+    expect(usePresenceOverrideStore.getState().excludedUserIds).toEqual(authoritativeUserIds);
+    expect(usePresenceOverrideStore.getState().appliedVersion).toBe(8);
+
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          e2ee_keys: {
+            wrapped_private_key: 'old-wrapped-key',
+            key_derivation_salt: 'old-salt',
+          },
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ presence_override_version: 9 }),
+      } as Response);
+
+    await expect(useUserStore.getState().changePassword('oldpass', 'newpass')).resolves.toEqual({
+      success: true,
+    });
+    const retryBody = JSON.parse(String(mockApiFetch.mock.calls[3]?.[1]?.body)) as {
+      presence_override?: { expected_version?: number };
+    };
+    expect(retryBody.presence_override?.expected_version).toBe(8);
+  });
+
+  it('sends version zero for an absent override preference and keeps it absent locally', async () => {
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          e2ee_keys: {
+            wrapped_private_key: 'old-wrapped-key',
+            key_derivation_salt: 'old-salt',
+          },
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          message: 'Password changed successfully',
+          presence_override_version: 0,
+        }),
+      } as Response);
+
+    const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
+
+    expect(result).toEqual({ success: true });
+    const requestBody = JSON.parse(String(mockApiFetch.mock.calls[1]?.[1]?.body)) as Record<
+      string,
+      { expected_version?: number }
+    >;
+    expect(requestBody.presence_override?.expected_version).toBe(0);
+    expect(usePresenceOverrideStore.getState().excludedUserIds).toEqual([]);
+    expect(usePresenceOverrideStore.getState().appliedVersion).toBe(0);
+    expect(presenceOverrideSyncService.save).not.toHaveBeenCalled();
+  });
+
+  it('cancels a held password POST when logout clears the initiating account', async () => {
+    const heldPost = deferred<Response>();
+    usePresenceOverrideStore.getState().apply(['11111111-1111-4111-8111-111111111111'], 7);
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          e2ee_keys: {
+            wrapped_private_key: 'old-wrapped-key',
+            key_derivation_salt: 'old-salt',
+          },
+        }),
+      } as Response)
+      .mockImplementationOnce(() => heldPost.promise);
+
+    const passwordChange = useUserStore.getState().changePassword('oldpass', 'newpass');
+    await vi.waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+
+    const postSignal = (mockApiFetch.mock.calls[1]?.[1] as RequestInit | undefined)?.signal;
+    useUserStore.getState().clearUser();
+
+    expect(postSignal?.aborted).toBe(true);
+    heldPost.resolve({
+      ok: true,
+      status: 200,
+      json: async () => ({ presence_override_version: 8 }),
+    } as Response);
+
+    await expect(passwordChange).resolves.toEqual({
+      success: false,
+      error: 'Password change was cancelled',
+    });
+    expect(e2eeService.initialize).not.toHaveBeenCalled();
+    expect(preferencesSyncService.pushPreferences).not.toHaveBeenCalled();
+    expect(usePresenceOverrideStore.getState().appliedVersion).toBe(7);
+  });
+
+  it('cancels a held password POST when a token-only auth lifecycle switches', async () => {
+    const heldPost = deferred<Response>();
+    useAuthStore.getState().setSessionId(null);
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          e2ee_keys: {
+            wrapped_private_key: 'old-wrapped-key',
+            key_derivation_salt: 'old-salt',
+          },
+        }),
+      } as Response)
+      .mockImplementationOnce(() => heldPost.promise);
+
+    const passwordChange = useUserStore.getState().changePassword('oldpass', 'newpass');
+    await vi.waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+    const postSignal = (mockApiFetch.mock.calls[1]?.[1] as RequestInit | undefined)?.signal;
+
+    useAuthStore.getState().setAccessToken('different-account-token');
+
+    expect(postSignal?.aborted).toBe(true);
+    heldPost.resolve({
+      ok: true,
+      status: 200,
+      json: async () => ({ presence_override_version: 8 }),
+    } as Response);
+    await expect(passwordChange).resolves.toEqual({
+      success: false,
+      error: 'Password change was cancelled',
+    });
+    expect(e2eeService.initialize).not.toHaveBeenCalled();
+  });
+
+  it('does not apply old-account state when the account switches during E2EE initialization', async () => {
+    const heldInitialize = deferred<void>();
+    const excludedUserIds = ['11111111-1111-4111-8111-111111111111'];
+    usePresenceOverrideStore.getState().apply(excludedUserIds, 7);
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          e2ee_keys: {
+            wrapped_private_key: 'old-wrapped-key',
+            key_derivation_salt: 'old-salt',
+          },
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ presence_override_version: 8 }),
+      } as Response);
+    vi.mocked(e2eeService.initialize).mockImplementationOnce(() => heldInitialize.promise);
+
+    const passwordChange = useUserStore.getState().changePassword('oldpass', 'newpass');
+    await vi.waitFor(() => expect(e2eeService.initialize).toHaveBeenCalledTimes(1));
+
+    useUserStore.getState().setUser({ ...mockUser, id: '22222222-2222-4222-8222-222222222222' });
+    const initializationGuard = vi.mocked(e2eeService.initialize).mock.calls[0]?.[4];
+    expect(initializationGuard?.signal.aborted).toBe(true);
+    heldInitialize.resolve();
+
+    await expect(passwordChange).resolves.toEqual({
+      success: false,
+      error: 'Password change was cancelled',
+    });
+    expect(preferencesSyncService.pushPreferences).not.toHaveBeenCalled();
+    expect(usePresenceOverrideStore.getState().excludedUserIds).toEqual(excludedUserIds);
+    expect(usePresenceOverrideStore.getState().appliedVersion).toBe(7);
   });
 
   it('returns error when current password is incorrect (401)', async () => {

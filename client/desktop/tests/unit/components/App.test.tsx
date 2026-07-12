@@ -502,18 +502,18 @@ describe('App', () => {
     expect(screen.getByTestId('dm-view')).toBeInTheDocument();
   });
 
-  it('handleUnlock clears needsSSOUnlock so the gate falls through next render', () => {
+  it('handleUnlock clears the gate and rehydrates encrypted state after SSO unlock', async () => {
     authenticateUser();
     useE2EEStore.getState().setNeedsSSOUnlock(true);
     render(<App />);
 
     expect(screen.getByTestId('sso-eager-unlock')).toBeInTheDocument();
-    // Click the mocked Unlock button — invokes the handleUnlock prop on
-    // SSOEagerUnlock, which calls setNeedsSSOUnlock(false).
-    act(() => {
+    mockHydratePostLogin.mockClear();
+    await act(async () => {
       screen.getByTestId('sso-eager-unlock-unlock').click();
     });
     expect(useE2EEStore.getState().needsSSOUnlock).toBe(false);
+    await waitFor(() => expect(mockHydratePostLogin).toHaveBeenCalledOnce());
   });
 
   it('handleSocialRecovery resets E2EE store and clears the access token', () => {

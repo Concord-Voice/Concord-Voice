@@ -14,6 +14,10 @@ import { apiFetch } from './apiClient';
 import { errorMessage } from '../utils/redactError';
 import type { AppearanceSettings } from '../stores/settingsStore';
 import type { MemberPanelMode, ServerFolder } from '../stores/layoutStore';
+import {
+  isHydrationLifecycleCurrent,
+  type HydrationLifecycleGuard,
+} from './postLoginHydrationLifecycle';
 
 const DEBOUNCE_MS = 3000;
 
@@ -39,6 +43,10 @@ interface PreferencesBlob {
   v: 1;
   settings: AppearanceSettings;
   layout: LayoutPersistedState;
+}
+
+interface PreferencesResponse {
+  preferences: { encrypted_data: string; version: number } | null;
 }
 
 /** Diff and apply remote appearance settings to the local settings store. */
@@ -135,6 +143,7 @@ class PreferencesSyncService {
   private isApplyingRemote = false;
   private deps: PreferencesSyncDeps | null = null;
   private watchGeneration = 0;
+  private readonly activePushControllers = new Set<AbortController>();
 
   init(deps: PreferencesSyncDeps): void {
     if (this.deps) return; // idempotent for HMR
@@ -154,8 +163,10 @@ class PreferencesSyncService {
    * Fetch preferences from server, decrypt, and apply to local stores.
    * If the server has no preferences yet, pushes current local state as initial sync.
    */
-  async fetchAndApply(attempt = 0): Promise<void> {
-    if (!e2eeService.isInitialized) return;
+  async fetchAndApply(guard?: HydrationLifecycleGuard, attempt = 0): Promise<void> {
+    const generation = this.watchGeneration;
+    const isCurrent = (): boolean => this.isOperationCurrent(generation, guard);
+    if (!e2eeService.isInitialized || !isCurrent()) return;
 
     // A fresh fetch supersedes any pending bounded auth-retry — clear it so a
     // stale retry can't fire after a newer trigger (e.g. a cross-device
@@ -166,59 +177,42 @@ class PreferencesSyncService {
       clearTimeout(this.authRetryTimer);
       this.authRetryTimer = null;
     }
-
     const deps = this.requireDeps();
 
     try {
-      const res = await apiFetch('/api/v1/users/me/preferences', undefined, {
-        authoritative: false,
-      });
+      const res = await apiFetch(
+        '/api/v1/users/me/preferences',
+        guard ? { signal: guard.signal } : undefined,
+        { authoritative: false }
+      );
+      if (!isCurrent()) return;
       if (!res.ok) {
-        if (res.status === 401 && attempt < PreferencesSyncService.MAX_AUTH_RETRIES) {
-          // Transient startup auth race — retry a bounded number of times after
-          // a short delay rather than abandoning the session's remote-pref sync.
-          // Constant format string (CWE-134); dynamic parts are separate args.
-          console.warn(
-            '[PrefsSync] preferences fetch 401 (auth not settled?); retrying',
-            attempt + 1,
-            'of',
-            PreferencesSyncService.MAX_AUTH_RETRIES
-          );
-          this.scheduleAuthRetry(attempt + 1);
-          return;
-        }
-        console.warn('[PrefsSync] Failed to fetch preferences:', res.status);
+        this.handleFetchFailure(res.status, attempt, guard, generation);
         return;
       }
 
-      const data = await res.json();
+      const data = (await res.json()) as PreferencesResponse;
+      if (!isCurrent()) return;
 
       if (!data.preferences) {
         // First login — push local state as bootstrap
         console.debug('[PrefsSync] No server preferences, pushing local state');
-        await this.pushPreferences();
+        await this.pushPreferences(guard, generation);
         return;
       }
 
-      let blob: PreferencesBlob;
-      try {
-        blob = await e2eeService.decryptPreferences<PreferencesBlob>(
-          data.preferences.encrypted_data
-        );
-      } catch {
-        // Preferences encrypted with a different key (e.g., after PBKDF2→Argon2id migration).
-        // Push current local state to overwrite stale server data.
-        console.warn(
-          '[PrefsSync] Cannot decrypt server preferences, re-encrypting with current key'
-        );
-        await this.pushPreferences();
-        return;
-      }
+      const blob = await this.decryptRemotePreferences(
+        data.preferences.encrypted_data,
+        guard,
+        generation
+      );
+      if (blob === null) return;
 
       if (blob.v !== 1) {
         console.warn('[PrefsSync] Unknown preferences version:', blob.v);
         return;
       }
+      if (!isCurrent()) return;
 
       // Apply remote preferences to stores with echo guard.
       // Batch all updates into single setState calls to avoid cascading re-renders.
@@ -235,7 +229,45 @@ class PreferencesSyncService {
 
       console.debug('[PrefsSync] Applied remote preferences v' + data.preferences.version);
     } catch (err) {
+      if (!isCurrent()) return;
       console.warn('[PrefsSync] Failed to fetch/apply preferences:', errorMessage(err));
+    }
+  }
+
+  private handleFetchFailure(
+    status: number,
+    attempt: number,
+    guard: HydrationLifecycleGuard | undefined,
+    generation: number
+  ): void {
+    if (status === 401 && attempt < PreferencesSyncService.MAX_AUTH_RETRIES) {
+      console.warn(
+        '[PrefsSync] preferences fetch 401 (auth not settled?); retrying',
+        attempt + 1,
+        'of',
+        PreferencesSyncService.MAX_AUTH_RETRIES
+      );
+      this.scheduleAuthRetry(attempt + 1, guard, generation);
+      return;
+    }
+    console.warn('[PrefsSync] Failed to fetch preferences: ' + status);
+  }
+
+  private async decryptRemotePreferences(
+    encryptedData: string,
+    guard: HydrationLifecycleGuard | undefined,
+    generation: number
+  ): Promise<PreferencesBlob | null> {
+    try {
+      const blob = await e2eeService.decryptPreferences<PreferencesBlob>(encryptedData);
+      return this.isOperationCurrent(generation, guard) ? blob : null;
+    } catch {
+      if (!this.isOperationCurrent(generation, guard)) return null;
+      // Preferences encrypted with a different key (e.g., after a KDF migration).
+      // Push current local state to overwrite stale server data.
+      console.warn('[PrefsSync] Cannot decrypt server preferences, re-encrypting with current key');
+      await this.pushPreferences(guard, generation);
+      return null;
     }
   }
 
@@ -243,11 +275,16 @@ class PreferencesSyncService {
    * Schedule a single bounded retry of fetchAndApply after AUTH_RETRY_DELAY_MS.
    * Replaces any pending retry so retries never stack; cleared by stopWatching.
    */
-  private scheduleAuthRetry(nextAttempt: number): void {
+  private scheduleAuthRetry(
+    nextAttempt: number,
+    guard: HydrationLifecycleGuard | undefined,
+    generation: number
+  ): void {
     if (this.authRetryTimer) clearTimeout(this.authRetryTimer);
     this.authRetryTimer = setTimeout(() => {
       this.authRetryTimer = null;
-      void this.fetchAndApply(nextAttempt);
+      if (!this.isOperationCurrent(generation, guard)) return;
+      void this.fetchAndApply(guard, nextAttempt);
     }, PreferencesSyncService.AUTH_RETRY_DELAY_MS);
   }
 
@@ -328,15 +365,30 @@ class PreferencesSyncService {
       clearTimeout(this.authRetryTimer);
       this.authRetryTimer = null;
     }
+    for (const controller of this.activePushControllers) {
+      controller.abort();
+    }
+    this.activePushControllers.clear();
   }
 
   /**
    * Collect current state, encrypt, and push to server.
    */
-  async pushPreferences(): Promise<void> {
-    if (!e2eeService.isInitialized) return;
+  async pushPreferences(
+    guard?: HydrationLifecycleGuard,
+    generation = this.watchGeneration
+  ): Promise<void> {
+    if (!e2eeService.isInitialized || !this.isOperationCurrent(generation, guard)) return;
 
     const deps = this.requireDeps();
+    const controller = new AbortController();
+    const abortPush = (): void => controller.abort();
+    guard?.signal.addEventListener('abort', abortPush, { once: true });
+    this.activePushControllers.add(controller);
+    const isCurrent = (): boolean =>
+      this.activePushControllers.has(controller) &&
+      !controller.signal.aborted &&
+      this.isOperationCurrent(generation, guard);
 
     try {
       const settings = deps.getAppearance();
@@ -373,6 +425,7 @@ class PreferencesSyncService {
       };
 
       const encrypted = await e2eeService.encryptPreferences(blob);
+      if (!isCurrent()) return;
 
       const res = await apiFetch(
         '/api/v1/users/me/preferences',
@@ -380,18 +433,25 @@ class PreferencesSyncService {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ encrypted_data: encrypted }),
+          signal: controller.signal,
         },
         { authoritative: false }
       );
+      if (!isCurrent()) return;
 
       if (res.ok) {
         const data = await res.json();
+        if (!isCurrent()) return;
         console.debug('[PrefsSync] Pushed preferences v' + data.version);
       } else {
         console.warn('[PrefsSync] Push failed:', res.status);
       }
     } catch (err) {
+      if (!isCurrent()) return;
       console.warn('[PrefsSync] Push error:', errorMessage(err));
+    } finally {
+      guard?.signal.removeEventListener('abort', abortPush);
+      this.activePushControllers.delete(controller);
     }
   }
 
@@ -401,10 +461,17 @@ class PreferencesSyncService {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
     }
-    this.debounceTimer = setTimeout(() => {
+    const generation = this.watchGeneration;
+    const timer = setTimeout(() => {
+      if (this.debounceTimer !== timer) return;
       this.debounceTimer = null;
-      this.pushPreferences();
+      this.pushPreferences(undefined, generation);
     }, DEBOUNCE_MS);
+    this.debounceTimer = timer;
+  }
+
+  private isOperationCurrent(generation: number, guard?: HydrationLifecycleGuard): boolean {
+    return generation === this.watchGeneration && isHydrationLifecycleCurrent(guard);
   }
 }
 
