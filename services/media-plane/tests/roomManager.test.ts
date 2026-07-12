@@ -2612,7 +2612,7 @@ describe('RoomManager', () => {
       ]);
     });
 
-    it('does NOT recompute the gate for SVC screens (AV1/VP9 never simulcast — #1924 fix C)', async () => {
+    it('does NOT persist or recompute gate demand for SVC screens (regression #2204)', async () => {
       const handler = vi.fn();
       manager.onEvent(handler);
       // Two DISTINCT heterogeneous viewers — enough to engage a simulcast (type
@@ -2626,10 +2626,10 @@ describe('RoomManager', () => {
 
       expect(gateFor('sharer-A')).toBe(false);
       expect(screenGateEvents(handler)).toEqual([]);
-      // Demand IS still stored, and setPreferredLayers IS still applied (SVC
-      // thins per-layer even though the gate never engages).
-      expect(manager.getRoom('room-1')!.screenLayerDemands.has('s1')).toBe(true);
-      expect(manager.getRoom('room-1')!.screenLayerDemands.has('s2')).toBe(true);
+      // SVC demand stays outside the simulcast-gate map, while
+      // setPreferredLayers still applies so the SVC consumer can thin per-layer.
+      expect(manager.getRoom('room-1')!.screenLayerDemands.has('s1')).toBe(false);
+      expect(manager.getRoom('room-1')!.screenLayerDemands.has('s2')).toBe(false);
       expect(c1.setPreferredLayers).toHaveBeenCalled();
       expect(c2.setPreferredLayers).toHaveBeenCalled();
     });
@@ -2845,6 +2845,40 @@ describe('RoomManager', () => {
             enabled: false,
           },
         ]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('turns a pending simulcast gate OFF when only SVC screen demand remains (regression #2204)', async () => {
+      vi.useFakeTimers();
+      try {
+        const handler = vi.fn();
+        manager.onEvent(handler);
+        await addVideoConsumer('u-1', 's1', 'screen');
+        await addVideoConsumer('u-2', 's2', 'screen');
+
+        await manager.setPreferredLayers('room-1', 'u-1', thumbnailDemand('s1'));
+        await manager.setPreferredLayers('room-1', 'u-2', validLayerDemand('s2'));
+        expect(gateFor('sharer-A')).toBe(true);
+
+        expect(manager.closeConsumer('room-1', 'u-1', 's1')).toBe(true);
+        expect(manager.closeConsumer('room-1', 'u-2', 's2')).toBe(true);
+        expect(manager.getRoom('room-1')!.screenGateOffTimers.has('sharer-A')).toBe(true);
+
+        const { consumer: svcConsumer } = await addVideoConsumer(
+          'u-3',
+          'svc1',
+          'screen',
+          'sharer-A',
+          'svc'
+        );
+        await manager.setPreferredLayers('room-1', 'u-3', thumbnailDemand('svc1'));
+        expect(svcConsumer.setPreferredLayers).toHaveBeenCalledOnce();
+
+        await vi.advanceTimersByTimeAsync(SCREEN_GATE_OFF_DEBOUNCE_MS);
+        expect(gateFor('sharer-A')).toBe(false);
+        expect(screenGateEvents(handler).at(-1)).toMatchObject({ enabled: false });
       } finally {
         vi.useRealTimers();
       }

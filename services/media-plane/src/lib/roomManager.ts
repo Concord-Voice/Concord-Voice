@@ -1803,10 +1803,12 @@ export class RoomManager {
    * Receiver-driven preferred-layer demand for an owned video consumer, routed
    * by the consumer's server-set appData.source (#1924):
    *   - camera → cameraLayerDemands + recomputeCameraLayeringGate
-   *   - screen → screenLayerDemands + recomputeScreenLayeringGate
+   *   - non-SVC screen → screenLayerDemands + recomputeScreenLayeringGate
+   *   - SVC screen → apply preferred layers without persistent gate demand
    *   - anything else → reject ('Consumer is not a layerable video source').
    * The gate flips ONLY from stored receiver demand — server-authoritative; a
-   * client cannot force layering on. Camera behavior is preserved exactly.
+   * client cannot force layering on. SVC screen demand never enters either
+   * gate path. Camera behavior is preserved exactly.
    */
   async setPreferredLayers(
     roomId: string,
@@ -1839,16 +1841,15 @@ export class RoomManager {
       if (typeof sharerUserId !== 'string' || sharerUserId.length === 0) {
         throw new Error('Screen consumer missing producer owner');
       }
-      room.screenLayerDemands.set(stored.consumerId, { ...stored, userId, sharerUserId });
       // #1924 fix "C": AV1/VP9 screens consume as `svc` and NEVER simulcast, so
-      // the H.264/VP8 simulcast gate is meaningless for them — recomputing it
-      // would emit screen-layering-gate and make the sharer do a pointless
-      // reproduce. Skip the gate recompute for SVC; the demand is still stored
-      // above and `setPreferredLayers` still runs below (SVC thins per-layer). A
-      // single-encode H.264/VP8 screen has type 'simple' (NOT 'svc') and MUST
-      // still recompute — that is how the gate turns ON. Gate on `!== 'svc'`,
-      // NOT `=== 'simulcast'`.
+      // the H.264/VP8 simulcast gate is meaningless for them. Keep SVC demand
+      // outside the persistent gate map so it cannot enable or preserve the
+      // gate during the debounced OFF re-check; `setPreferredLayers` still runs
+      // below so SVC can thin per-layer. A single-encode H.264/VP8 screen has
+      // type 'simple' (NOT 'svc') and MUST still recompute; that is how the
+      // gate turns ON. Gate on `!== 'svc'`, NOT `=== 'simulcast'`.
       if (consumerType !== 'svc') {
+        room.screenLayerDemands.set(stored.consumerId, { ...stored, userId, sharerUserId });
         this.recomputeScreenLayeringGate(room, sharerUserId);
       }
     } else {
