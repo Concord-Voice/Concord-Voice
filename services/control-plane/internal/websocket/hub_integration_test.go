@@ -1,14 +1,19 @@
 package websocket
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,6 +24,74 @@ const (
 	testPermSendMessages      int64 = 1 << 11
 	testBaseChannelPerms            = testPermViewVoiceChannels | testPermViewTextChannels | testPermSendMessages
 )
+
+type commandErrorHook struct {
+	failures map[string]error
+}
+
+type failOnceCommandHook struct {
+	command string
+	err     error
+	failed  atomic.Bool
+}
+
+func (h commandErrorHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (h commandErrorHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if err := h.failures[cmd.Name()]; err != nil {
+			return err
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h commandErrorHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		for _, cmd := range cmds {
+			if err := h.failures[cmd.Name()]; err != nil {
+				return err
+			}
+		}
+		return next(ctx, cmds)
+	}
+}
+
+func (h *failOnceCommandHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (h *failOnceCommandHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == h.command && h.failed.CompareAndSwap(false, true) {
+			return h.err
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h *failOnceCommandHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func captureHubLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	previousPrefix := log.Prefix()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+		log.SetPrefix(previousPrefix)
+	})
+	return &buf
+}
 
 // --- handleMessage integration tests (require DB) ---
 
@@ -150,7 +223,7 @@ func (c *testChannelPermissionChecker) HasChannelPermission(
 	ctx context.Context,
 	serverID, userID, channelID string,
 	permBit int64,
-) (bool, error) {
+) (allowed bool, err error) {
 	var isMember bool
 	if err := c.db.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`,
@@ -193,7 +266,9 @@ func (c *testChannelPermissionChecker) HasChannelPermission(
 	if err != nil {
 		return false, err
 	}
-	defer rows.Close() //nolint:errcheck
+	defer func() {
+		err = errors.Join(err, rows.Close())
+	}()
 
 	var userAllow, userDeny, roleAllow, roleDeny int64
 	for rows.Next() {
@@ -1250,6 +1325,40 @@ func TestHandleSetStatusInvisible(t *testing.T) {
 	}
 }
 
+func TestHandleSetStatusInvisibleRedisWriteFailureFailsClosedLocally(t *testing.T) {
+	db := setupHubTestDB(t)
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(db, redisClient)
+	logs := captureHubLog(t)
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.clients[client.ID] = client
+	hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
+	ctx := context.Background()
+	key := fmt.Sprintf(presenceKeyFmt, userID)
+	require.NoError(t, redisClient.Set(ctx, key, statusOnline, 120*time.Second).Err())
+	redisClient.AddHook(commandErrorHook{failures: map[string]error{"set": errors.New("redis SET failed")}})
+
+	hub.handleSetStatus(IncomingMessage{
+		UserID: userID,
+		Data:   map[string]interface{}{keyStatus: statusInvisible},
+	})
+
+	assert.Contains(t, logs.String(), "failed to persist presence status")
+	assert.Equal(t, statusOffline, hub.resolveVisibleStatus(ctx, userID, uuid.New()))
+	assert.Equal(t, statusInvisible, hub.resolveVisibleStatus(ctx, userID, userID))
+	assert.NotContains(t, hub.resolveVisibleOnline(map[uuid.UUID]bool{userID: true}), userID)
+	select {
+	case data := <-client.Send:
+		var outgoing OutgoingMessage
+		require.NoError(t, json.Unmarshal(data, &outgoing))
+		assert.Equal(t, "presence", outgoing.Type)
+		assert.Equal(t, statusOffline, outgoing.Data[keyStatus])
+	default:
+		t.Fatal("expected fail-closed offline broadcast")
+	}
+}
+
 // --- handleHeartbeat tests (requires Redis) ---
 
 func TestHandleHeartbeatRefreshesTTL(t *testing.T) {
@@ -1275,7 +1384,7 @@ func TestHandleHeartbeatRefreshesTTL(t *testing.T) {
 	assert.Greater(t, ttl, 100*time.Second)
 }
 
-func TestHandleHeartbeatMissingKeyResetsOnline(t *testing.T) {
+func TestHandleHeartbeatMissingKeyFailsClosed(t *testing.T) {
 	db := setupHubTestDB(t)
 	redisClient := setupHubTestRedis(t)
 	hub := NewHub(db, redisClient)
@@ -1291,9 +1400,389 @@ func TestHandleHeartbeatMissingKeyResetsOnline(t *testing.T) {
 	hub.handleHeartbeat(msg)
 
 	ctx := context.Background()
-	val, err := redisClient.Get(ctx, "presence:"+userID.String()).Result()
+	_, err := redisClient.Get(ctx, "presence:"+userID.String()).Result()
+	assert.ErrorIs(t, err, redis.Nil)
+	assert.Equal(t, statusOffline, hub.resolveVisibleStatus(ctx, userID, uuid.New()))
+}
+
+// Regression for #2202.
+func TestHandleHeartbeatRecoversLocallyHiddenOfflineAfterRedisRecovers(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	userID := uuid.New()
+	hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+	hub.setHiddenPresence(userID, statusOffline)
+
+	ctx := context.Background()
+	key := fmt.Sprintf(presenceKeyFmt, userID)
+	require.NoError(t, redisClient.Set(ctx, key, statusOnline, 60*time.Second).Err())
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	_, hidden := hub.hiddenPresence[userID]
+	assert.False(t, hidden, "a valid persisted status should clear the transient fail-closed override")
+	assert.Equal(t, statusOnline, hub.resolveVisibleStatus(ctx, userID, uuid.New()))
+	assert.Contains(t, hub.resolveVisibleOnline(map[uuid.UUID]bool{userID: true}), userID)
+	assert.Greater(t, redisClient.TTL(ctx, key).Val(), 100*time.Second)
+}
+
+func TestHandleHeartbeatRepairsInvisibleWhenRedisHasStaleVisibleStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		setFailure error
+		wantStored string
+		wantLog    string
+	}{
+		{name: "repair succeeds", wantStored: statusInvisible},
+		{
+			name:       "repair fails closed",
+			setFailure: errors.New("redis SET failed"),
+			wantStored: statusOnline,
+			wantLog:    "failed to repair invisible presence",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			redisClient := setupHubTestRedis(t)
+			hub := NewHub(nil, redisClient)
+			logs := captureHubLog(t)
+			userID := uuid.New()
+			hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+			hub.setHiddenPresence(userID, statusInvisible)
+
+			ctx := context.Background()
+			key := fmt.Sprintf(presenceKeyFmt, userID)
+			require.NoError(t, redisClient.Set(ctx, key, statusOnline, 60*time.Second).Err())
+			if tt.setFailure != nil {
+				redisClient.AddHook(commandErrorHook{failures: map[string]error{"set": tt.setFailure}})
+			}
+
+			hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+			stored, err := redisClient.Get(ctx, key).Result()
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantStored, stored)
+			assert.Equal(t, statusInvisible, hub.hiddenPresence[userID])
+			assert.Equal(t, statusOffline, hub.resolveVisibleStatus(ctx, userID, uuid.New()))
+			assert.NotContains(t, hub.resolveVisibleOnline(map[uuid.UUID]bool{userID: true}), userID)
+			if tt.wantLog != "" {
+				assert.Contains(t, logs.String(), tt.wantLog)
+			}
+		})
+	}
+}
+
+func TestHandleHeartbeatVisibleTTLRefreshFailureKeepsKnownVisibleState(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	logs := captureHubLog(t)
+	userID := uuid.New()
+	hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+
+	ctx := context.Background()
+	key := fmt.Sprintf(presenceKeyFmt, userID)
+	require.NoError(t, redisClient.Set(ctx, key, statusOnline, 60*time.Second).Err())
+	redisClient.AddHook(commandErrorHook{failures: map[string]error{"expire": errors.New("redis EXPIRE failed")}})
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	assert.Contains(t, logs.String(), "failed to refresh presence TTL")
+	_, hidden := hub.hiddenPresence[userID]
+	assert.False(t, hidden)
+	assert.Equal(t, statusOnline, hub.resolveVisibleStatus(ctx, userID, uuid.New()))
+	assert.Contains(t, hub.resolveVisibleOnline(map[uuid.UUID]bool{userID: true}), userID)
+}
+
+func TestHandleHeartbeatInvalidPersistedStatusFailsClosedOnce(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	userID := uuid.New()
+	hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+
+	ctx := context.Background()
+	key := fmt.Sprintf(presenceKeyFmt, userID)
+	require.NoError(t, redisClient.Set(ctx, key, "corrupt", 60*time.Second).Err())
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	assert.Equal(t, statusOffline, hub.hiddenPresence[userID])
+	assert.Equal(t, statusOffline, hub.resolveVisibleStatus(ctx, userID, uuid.New()))
+	assert.Contains(t, hub.onlineCountPending, userID)
+	clear(hub.onlineCountPending)
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	assert.NotContains(t, hub.onlineCountPending, userID, "an already-hidden user should not rebroadcast offline")
+}
+
+func TestHandleHeartbeatMissingKeyDisconnectedDoesNothing(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	userID := uuid.New()
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	_, hidden := hub.hiddenPresence[userID]
+	assert.False(t, hidden)
+	assert.NotContains(t, hub.onlineCountPending, userID)
+}
+
+func TestHandleHeartbeatRestoresOnlineAfterTransientInitialPersistenceFailure(t *testing.T) {
+	db := setupHubTestDB(t)
+	redisClient := setupHubTestRedis(t)
+	redisClient.AddHook(&failOnceCommandHook{command: "set", err: errors.New("redis SET failed")})
+	hub := NewHub(db, redisClient)
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.handleRegister(client)
+	t.Cleanup(func() {
+		if _, registered := hub.clients[client.ID]; registered {
+			hub.handleUnregister(client)
+		}
+	})
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	ctx := context.Background()
+	key := fmt.Sprintf(presenceKeyFmt, userID)
+	stored, err := redisClient.Get(ctx, key).Result()
 	require.NoError(t, err)
-	assert.Equal(t, "online", val)
+	assert.Equal(t, statusOnline, stored)
+	_, hidden := hub.hiddenPresence[userID]
+	assert.False(t, hidden)
+	assert.Equal(t, statusOnline, hub.resolveVisibleStatus(ctx, userID, uuid.New()))
+	assert.Contains(t, hub.onlineCountPending, userID)
+}
+
+func TestHandleHeartbeatInitialPresenceRestoreFailureStaysHidden(t *testing.T) {
+	db := setupHubTestDB(t)
+	redisClient := setupHubTestRedis(t)
+	redisClient.AddHook(&failOnceCommandHook{command: "set", err: errors.New("initial Redis SET failed")})
+	hub := NewHub(db, redisClient)
+	logs := captureHubLog(t)
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.handleRegister(client)
+	t.Cleanup(func() {
+		if _, registered := hub.clients[client.ID]; registered {
+			hub.handleUnregister(client)
+		}
+	})
+	redisClient.AddHook(commandErrorHook{failures: map[string]error{"set": errors.New("restore Redis SET failed")}})
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	ctx := context.Background()
+	stored, err := redisClient.Get(ctx, fmt.Sprintf(presenceKeyFmt, userID)).Result()
+	assert.ErrorIs(t, err, redis.Nil)
+	assert.Empty(t, stored)
+	assert.Equal(t, statusOffline, hub.hiddenPresence[userID])
+	assert.Contains(t, logs.String(), "failed to restore online presence")
+}
+
+func TestHandleHeartbeatRepeatedMissingKeyStaysFailClosed(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	userID := uuid.New()
+	hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+	clear(hub.onlineCountPending)
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	ctx := context.Background()
+	stored, err := redisClient.Get(ctx, fmt.Sprintf(presenceKeyFmt, userID)).Result()
+	assert.ErrorIs(t, err, redis.Nil)
+	assert.Empty(t, stored)
+	assert.Equal(t, statusOffline, hub.hiddenPresence[userID])
+	assert.NotContains(t, hub.onlineCountPending, userID)
+}
+
+func TestHandleHeartbeatInvalidStatusCancelsInitialOnlineRestore(t *testing.T) {
+	db := setupHubTestDB(t)
+	redisClient := setupHubTestRedis(t)
+	redisClient.AddHook(&failOnceCommandHook{command: "set", err: errors.New("initial Redis SET failed")})
+	hub := NewHub(db, redisClient)
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.handleRegister(client)
+	t.Cleanup(func() {
+		if _, registered := hub.clients[client.ID]; registered {
+			hub.handleUnregister(client)
+		}
+	})
+
+	ctx := context.Background()
+	key := fmt.Sprintf(presenceKeyFmt, userID)
+	require.NoError(t, redisClient.Set(ctx, key, "corrupt", 60*time.Second).Err())
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+	require.NoError(t, redisClient.Del(ctx, key).Err())
+	clear(hub.onlineCountPending)
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	stored, err := redisClient.Get(ctx, key).Result()
+	assert.ErrorIs(t, err, redis.Nil)
+	assert.Empty(t, stored)
+	assert.Equal(t, statusOffline, hub.hiddenPresence[userID])
+	assert.NotContains(t, hub.onlineCountPending, userID)
+}
+
+func TestHandleHeartbeatRedisReadErrorFailsClosedOnce(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	redisClient.AddHook(commandErrorHook{failures: map[string]error{"get": errors.New("redis GET failed")}})
+	hub := NewHub(nil, redisClient)
+	logs := captureHubLog(t)
+	userID := uuid.New()
+	hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	assert.Contains(t, logs.String(), "failed to read presence heartbeat state")
+	assert.Equal(t, statusOffline, hub.hiddenPresence[userID])
+	assert.Equal(t, statusOffline, hub.resolveVisibleStatus(context.Background(), userID, uuid.New()))
+	assert.Contains(t, hub.onlineCountPending, userID)
+	clear(hub.onlineCountPending)
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	assert.NotContains(t, hub.onlineCountPending, userID, "an already-hidden user should not rebroadcast offline")
+}
+
+func TestSetHiddenPresenceInitializesNilMap(t *testing.T) {
+	hub := newMinimalHub()
+	hub.hiddenPresence = nil
+	userID := uuid.New()
+
+	hub.setHiddenPresence(userID, statusOffline)
+
+	assert.Equal(t, statusOffline, hub.hiddenPresence[userID])
+}
+
+func TestHandleIncomingDropsSetStatusAfterUnregister(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.clients[client.ID] = client
+	hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
+
+	hub.handleUnregister(client)
+	hub.handleIncoming(IncomingMessage{
+		Type:     "set_status",
+		ClientID: client.ID,
+		UserID:   userID,
+		Data:     map[string]interface{}{keyStatus: statusOnline},
+	})
+
+	_, err := redisClient.Get(context.Background(), fmt.Sprintf(presenceKeyFmt, userID)).Result()
+	assert.ErrorIs(t, err, redis.Nil)
+}
+
+func TestHandleIncomingDropsHeartbeatAfterUnregister(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.clients[client.ID] = client
+	hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
+
+	ctx := context.Background()
+	key := fmt.Sprintf(presenceKeyFmt, userID)
+	require.NoError(t, redisClient.Set(ctx, key, statusOnline, 60*time.Second).Err())
+	redisClient.AddHook(commandErrorHook{failures: map[string]error{"del": errors.New("redis DEL failed")}})
+	hub.handleUnregister(client)
+
+	hub.handleIncoming(IncomingMessage{
+		Type:     "heartbeat",
+		ClientID: client.ID,
+		UserID:   userID,
+	})
+
+	assert.Less(t, redisClient.TTL(ctx, key).Val(), 100*time.Second)
+}
+
+func TestHandleIncomingRoutesPresenceForRegisteredClient(t *testing.T) {
+	t.Run("heartbeat", func(t *testing.T) {
+		redisClient := setupHubTestRedis(t)
+		hub := NewHub(nil, redisClient)
+		userID := uuid.New()
+		client := newTestClient(hub, userID)
+		hub.clients[client.ID] = client
+		hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
+
+		ctx := context.Background()
+		key := fmt.Sprintf(presenceKeyFmt, userID)
+		require.NoError(t, redisClient.Set(ctx, key, statusOnline, 60*time.Second).Err())
+
+		hub.handleIncoming(IncomingMessage{Type: "heartbeat", ClientID: client.ID, UserID: userID})
+
+		assert.Greater(t, redisClient.TTL(ctx, key).Val(), 100*time.Second)
+	})
+
+	t.Run("set status", func(t *testing.T) {
+		redisClient := setupHubTestRedis(t)
+		hub := NewHub(nil, redisClient)
+		userID := uuid.New()
+		client := newTestClient(hub, userID)
+		hub.clients[client.ID] = client
+		hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
+
+		hub.handleIncoming(IncomingMessage{
+			Type:     "set_status",
+			ClientID: client.ID,
+			UserID:   userID,
+			Data:     map[string]interface{}{keyStatus: "dnd"},
+		})
+
+		stored, err := redisClient.Get(context.Background(), fmt.Sprintf(presenceKeyFmt, userID)).Result()
+		require.NoError(t, err)
+		assert.Equal(t, "dnd", stored)
+	})
+}
+
+func TestHandleIncomingDropsMismatchedPresenceUser(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	client := newTestClient(hub, uuid.New())
+	hub.clients[client.ID] = client
+	hub.userClients[client.UserID] = map[uuid.UUID]bool{client.ID: true}
+	otherUserID := uuid.New()
+
+	hub.handleIncoming(IncomingMessage{
+		Type:     "set_status",
+		ClientID: client.ID,
+		UserID:   otherUserID,
+		Data:     map[string]interface{}{keyStatus: statusOnline},
+	})
+
+	_, err := redisClient.Get(context.Background(), fmt.Sprintf(presenceKeyFmt, otherUserID)).Result()
+	assert.ErrorIs(t, err, redis.Nil)
+}
+
+func TestHandleHeartbeatDoesNotExposeInvisibleUserAfterTTLRefreshFailure(t *testing.T) {
+	db := setupHubTestDB(t)
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(db, redisClient)
+	logs := captureHubLog(t)
+	userID := uuid.New()
+	hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+
+	ctx := context.Background()
+	key := fmt.Sprintf(presenceKeyFmt, userID)
+	require.NoError(t, redisClient.Set(ctx, key, statusInvisible, 120*time.Second).Err())
+	redisClient.AddHook(commandErrorHook{failures: map[string]error{"expire": errors.New("redis EXPIRE failed")}})
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+	assert.Contains(t, logs.String(), "failed to refresh presence TTL")
+	require.NoError(t, redisClient.Del(ctx, key).Err())
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+	value, err := redisClient.Get(ctx, key).Result()
+	require.NoError(t, err)
+	assert.Equal(t, statusInvisible, value)
+	assert.Equal(t, statusOffline, hub.resolveVisibleStatus(ctx, userID, uuid.New()))
 }
 
 func TestHandleHeartbeatDNDRefreshesWithoutChangingStatus(t *testing.T) {
@@ -1319,6 +1808,40 @@ func TestHandleHeartbeatDNDRefreshesWithoutChangingStatus(t *testing.T) {
 	val, err := redisClient.Get(ctx, key).Result()
 	require.NoError(t, err)
 	assert.Equal(t, "dnd", val)
+}
+
+func TestHandleHeartbeatLogsTTLRefreshFailure(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	userID := uuid.New()
+	ctx := context.Background()
+	key := fmt.Sprintf(presenceKeyFmt, userID)
+	require.NoError(t, redisClient.Set(ctx, key, statusInvisible, 120*time.Second).Err())
+	redisClient.AddHook(commandErrorHook{failures: map[string]error{"expire": errors.New("redis EXPIRE failed")}})
+	hub := NewHub(nil, redisClient)
+	logs := captureHubLog(t)
+
+	hub.handleHeartbeat(IncomingMessage{UserID: userID})
+
+	assert.Contains(t, logs.String(), "failed to refresh presence TTL")
+}
+
+func TestHandleHeartbeatLogsInvisibleRestoreFailure(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	userID := uuid.New()
+	hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+	ctx := context.Background()
+	key := fmt.Sprintf(presenceKeyFmt, userID)
+	require.NoError(t, redisClient.Set(ctx, key, statusInvisible, 120*time.Second).Err())
+	hub.handleHeartbeat(IncomingMessage{UserID: userID})
+	require.NoError(t, redisClient.Del(ctx, key).Err())
+	redisClient.AddHook(commandErrorHook{failures: map[string]error{"set": errors.New("redis SET failed")}})
+	logs := captureHubLog(t)
+
+	hub.handleHeartbeat(IncomingMessage{UserID: userID})
+
+	assert.Contains(t, logs.String(), "failed to restore invisible presence")
+	assert.Equal(t, statusOffline, hub.resolveVisibleStatus(ctx, userID, uuid.New()))
 }
 
 // --- handleProfileUpdate integration tests ---
@@ -1875,7 +2398,7 @@ func TestResolveVisibleOnlineConnectedOnline(t *testing.T) {
 
 	// Set status to online in Redis
 	ctx := context.Background()
-	redisClient.Set(ctx, fmt.Sprintf(presenceKeyFmt, uid), statusOnline, 120*time.Second)
+	require.NoError(t, redisClient.Set(ctx, fmt.Sprintf(presenceKeyFmt, uid), statusOnline, 120*time.Second).Err())
 
 	allMembers := map[uuid.UUID]bool{uid: true}
 	visible := hub.resolveVisibleOnline(allMembers)
@@ -1893,14 +2416,14 @@ func TestResolveVisibleOnlineInvisibleNotCounted(t *testing.T) {
 
 	// Set status to invisible in Redis
 	ctx := context.Background()
-	redisClient.Set(ctx, fmt.Sprintf(presenceKeyFmt, uid), statusInvisible, 120*time.Second)
+	require.NoError(t, redisClient.Set(ctx, fmt.Sprintf(presenceKeyFmt, uid), statusInvisible, 120*time.Second).Err())
 
 	allMembers := map[uuid.UUID]bool{uid: true}
 	visible := hub.resolveVisibleOnline(allMembers)
 	assert.False(t, visible[uid])
 }
 
-func TestResolveVisibleOnlineMissingRedisKey(t *testing.T) {
+func TestResolveVisibleOnlineMissingRedisKeyFailsClosed(t *testing.T) {
 	redisClient := setupHubTestRedis(t)
 	hub := NewHub(nil, redisClient)
 
@@ -1909,10 +2432,64 @@ func TestResolveVisibleOnlineMissingRedisKey(t *testing.T) {
 	hub.clients[client.ID] = client
 	hub.userClients[uid] = map[uuid.UUID]bool{client.ID: true}
 
-	// No Redis key — should treat as online
+	// No Redis key means the persisted status is unavailable; do not risk
+	// exposing a connected user whose invisible write or TTL refresh failed.
 	allMembers := map[uuid.UUID]bool{uid: true}
 	visible := hub.resolveVisibleOnline(allMembers)
-	assert.True(t, visible[uid])
+	assert.False(t, visible[uid])
+}
+
+func TestResolveVisibleStatusRedisErrorFailsClosedForOtherViewer(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	uid := uuid.New()
+	viewerID := uuid.New()
+
+	require.NoError(t, redisClient.Set(context.Background(), fmt.Sprintf(presenceKeyFmt, uid), statusInvisible, 120*time.Second).Err())
+	require.NoError(t, redisClient.Close())
+
+	assert.Equal(t, statusOffline, hub.resolveVisibleStatus(context.Background(), uid, viewerID))
+}
+
+func TestResolveVisibleStatusRedisErrorKeepsSelfOnline(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	uid := uuid.New()
+
+	require.NoError(t, redisClient.Close())
+
+	assert.Equal(t, statusOnline, hub.resolveVisibleStatus(context.Background(), uid, uid))
+}
+
+func TestResolveVisibleStatusMissingKeyFailsClosedForOtherViewer(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	uid := uuid.New()
+
+	assert.Equal(t, statusOffline, hub.resolveVisibleStatus(context.Background(), uid, uuid.New()))
+}
+
+func TestResolveVisibleStatusInvalidValueFailsClosedForOtherViewer(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	uid := uuid.New()
+	require.NoError(t, redisClient.Set(context.Background(), fmt.Sprintf(presenceKeyFmt, uid), "corrupt", 120*time.Second).Err())
+
+	assert.Equal(t, statusOffline, hub.resolveVisibleStatus(context.Background(), uid, uuid.New()))
+}
+
+func TestResolveVisibleOnlineRedisErrorFailsClosed(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	uid := uuid.New()
+	client := newTestClient(hub, uid)
+	hub.userClients[uid] = map[uuid.UUID]bool{client.ID: true}
+
+	require.NoError(t, redisClient.Set(context.Background(), fmt.Sprintf(presenceKeyFmt, uid), statusInvisible, 120*time.Second).Err())
+	require.NoError(t, redisClient.Close())
+
+	visible := hub.resolveVisibleOnline(map[uuid.UUID]bool{uid: true})
+	assert.False(t, visible[uid])
 }
 
 func TestResolveVisibleOnlineNotConnected(t *testing.T) {
@@ -2282,7 +2859,7 @@ func TestHandleDisconnectUserRemovesAllUserClients(t *testing.T) {
 
 	// Set presence so last-client unregister path works
 	ctx := context.Background()
-	redisClient.Set(ctx, fmt.Sprintf(presenceKeyFmt, userID), statusOnline, 120*time.Second)
+	require.NoError(t, redisClient.Set(ctx, fmt.Sprintf(presenceKeyFmt, userID), statusOnline, 120*time.Second).Err())
 
 	hub.handleDisconnectUser(userID)
 
@@ -2300,6 +2877,25 @@ func TestHandleDisconnectUserRemovesAllUserClients(t *testing.T) {
 			// Channel may be closed — that's also valid
 		}
 	}
+}
+
+func TestHandleUnregisterDoesNotRetainHiddenPresenceWhenRedisDeleteFails(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.clients[client.ID] = client
+	hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
+
+	hub.handleSetStatus(IncomingMessage{
+		UserID: userID,
+		Data:   map[string]interface{}{keyStatus: statusInvisible},
+	})
+	redisClient.AddHook(commandErrorHook{failures: map[string]error{"del": errors.New("redis DEL failed")}})
+
+	hub.handleUnregister(client)
+
+	assert.NotContains(t, hub.hiddenPresence, userID)
 }
 
 // --- flushOnlineCounts integration test ---
@@ -2332,7 +2928,7 @@ func TestFlushOnlineCountsFullPipeline(t *testing.T) {
 
 	// Set presence to online
 	ctx := context.Background()
-	redisClient.Set(ctx, fmt.Sprintf(presenceKeyFmt, userID), statusOnline, 120*time.Second)
+	require.NoError(t, redisClient.Set(ctx, fmt.Sprintf(presenceKeyFmt, userID), statusOnline, 120*time.Second).Err())
 
 	// Mark user as pending
 	hub.onlineCountPending[userID] = true

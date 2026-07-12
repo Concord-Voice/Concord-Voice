@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -177,19 +178,30 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Shut down WebSocket hub (close all client connections)
-	hub.Shutdown()
-
-	// Close NATS connection
-	if natsClient != nil {
-		natsClient.Close()
-	}
-
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatal("Server forced to shutdown", "error", err)
+	// Stop accepting and drain HTTP handlers before closing the dependencies they
+	// may still use. net/http does not wait for hijacked WebSocket connections;
+	// hub.Shutdown closes those after ordinary handlers finish (#2202).
+	shutdownErr := shutdownControlPlane(
+		func() error { return srv.Shutdown(ctx) },
+		func() { hub.Shutdown() },
+		func() {
+			if natsClient != nil {
+				natsClient.Close()
+			}
+		},
+	)
+	if shutdownErr != nil {
+		log.Fatal("Server forced to shutdown", "error", shutdownErr)
 	}
 
 	log.Info("Server exited")
+}
+
+func shutdownControlPlane(shutdownHTTP func() error, shutdownHub, closeNATS func()) error {
+	shutdownErr := shutdownHTTP()
+	shutdownHub()
+	closeNATS()
+	return shutdownErr
 }
 
 func initStorageClient(cfg *config.Config, log *logger.Logger) *storage.Client {
@@ -278,12 +290,24 @@ func runCleanup(ctx context.Context, db *sql.DB, redisClient *redis.Client, hub 
 	log.Debug("Cleanup completed")
 }
 
+type stalePresenceStore interface {
+	Scan(ctx context.Context, cursor uint64, match string, count int64) *redis.ScanCmd
+	Del(ctx context.Context, keys ...string) *redis.IntCmd
+}
+
 // cleanupStalePresence compares presence:* keys against the authoritative set
 // of connected users from the hub and removes stale entries.
-func cleanupStalePresence(ctx context.Context, redisClient *redis.Client, hub *websocket.Hub, log *logger.Logger) {
+func cleanupStalePresence(ctx context.Context, redisClient stalePresenceStore, hub *websocket.Hub, log *logger.Logger) {
 	connectedUsers := hub.GetConnectedUsers()
 	var staleCount int
 	var cursor uint64
+	deleteStaleKey := func(key string) {
+		if err := redisClient.Del(ctx, key).Err(); err != nil {
+			log.Error("Cleanup: failed to delete stale presence key", "error", err)
+			return
+		}
+		staleCount++
+	}
 	for {
 		keys, nextCursor, err := redisClient.Scan(ctx, cursor, "presence:*", 100).Result()
 		if err != nil {
@@ -294,13 +318,11 @@ func cleanupStalePresence(ctx context.Context, redisClient *redis.Client, hub *w
 			uidStr := strings.TrimPrefix(key, "presence:")
 			uid, parseErr := uuid.Parse(uidStr)
 			if parseErr != nil {
-				redisClient.Del(ctx, key)
-				staleCount++
+				deleteStaleKey(key)
 				continue
 			}
 			if !connectedUsers[uid] {
-				redisClient.Del(ctx, key)
-				staleCount++
+				deleteStaleKey(key)
 			}
 		}
 		cursor = nextCursor
@@ -325,7 +347,11 @@ func cleanupExpiredTransfers(ctx context.Context, db *sql.DB, redisClient *redis
 		log.Error("Cleanup: failed to query expired transfers", "error", err)
 		return
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Error("Cleanup: failed to close expired transfer rows", "error", closeErr)
+		}
+	}()
 
 	for rows.Next() {
 		var xfer pendingTransfer
@@ -373,12 +399,18 @@ func completeOwnershipTransfer(ctx context.Context, db *sql.DB, redisClient *red
 	return nil
 }
 
-func executeTransferTx(ctx context.Context, db *sql.DB, xfer pendingTransfer) (bool, error) {
+func executeTransferTx(ctx context.Context, db *sql.DB, xfer pendingTransfer) (completed bool, retErr error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("begin transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() {
+		rollbackErr := tx.Rollback()
+		if errors.Is(rollbackErr, sql.ErrTxDone) {
+			rollbackErr = nil
+		}
+		retErr = joinCleanupError("rollback transfer transaction", retErr, rollbackErr)
+	}()
 
 	res, err := tx.ExecContext(ctx, `
 		UPDATE ownership_transfers SET status = 'completed', completed_at = NOW()
@@ -387,7 +419,11 @@ func executeTransferTx(ctx context.Context, db *sql.DB, xfer pendingTransfer) (b
 	if err != nil {
 		return false, fmt.Errorf("mark transfer completed: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	n, err := checkedRowsAffected(res, "mark transfer completed")
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
 		return false, nil
 	}
 
@@ -409,17 +445,44 @@ func swapMemberRoles(ctx context.Context, tx *sql.Tx, xfer pendingTransfer) erro
 	if err != nil {
 		return fmt.Errorf("update from_user role: %w", err)
 	}
-	if n, _ := resFrom.RowsAffected(); n == 0 {
+	n, err := checkedRowsAffected(resFrom, "read from_user role update result")
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return fmt.Errorf("from_user %s is no longer a member", xfer.fromUserID)
 	}
 	resTo, err := tx.ExecContext(ctx, `UPDATE server_members SET role = 'owner' WHERE server_id = $1 AND user_id = $2`, xfer.serverID, xfer.toUserID)
 	if err != nil {
 		return fmt.Errorf("update to_user role: %w", err)
 	}
-	if n, _ := resTo.RowsAffected(); n == 0 {
+	n, err = checkedRowsAffected(resTo, "read to_user role update result")
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return fmt.Errorf("to_user %s is no longer a member", xfer.toUserID)
 	}
 	return nil
+}
+
+func checkedRowsAffected(result sql.Result, operation string) (int64, error) {
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("%s: rows affected: %w", operation, err)
+	}
+	return n, nil
+}
+
+func joinCleanupError(operation string, primaryErr, cleanupErr error) error {
+	if cleanupErr == nil {
+		return primaryErr
+	}
+	wrappedCleanupErr := fmt.Errorf("%s: %w", operation, cleanupErr)
+	if primaryErr == nil {
+		return wrappedCleanupErr
+	}
+	return errors.Join(primaryErr, wrappedCleanupErr)
 }
 
 func invalidatePermissionCache(ctx context.Context, redisClient *redis.Client, serverID, userID string) error {

@@ -182,12 +182,12 @@ func TestBroadcastToServerAndPruneBailsOnShutdown(t *testing.T) {
 
 // TestBroadcastToServerAndPruneEnqueuesWhenDoneClosedButBufferHasRoom verifies that a
 // prune is still queued (not dropped) when h.done is already closed but the eviction
-// buffer has capacity. Graceful shutdown closes h.done (via hub.Shutdown()) before
-// in-flight remove/ban handlers drain (srv.Shutdown()), so a handler can call this with
-// h.done closed while the Run loop is still alive and draining evictBroadcast at
-// priority. A single select over the send and <-h.done would let Go pick the done arm
-// at random and drop the prune, leaking one more fanout to the removed member. The
-// non-blocking send must win whenever the buffer has room. CV-CAN-027/028.
+// buffer has capacity. The control-plane entrypoint drains accepted HTTP handlers before
+// Hub.Shutdown (#2202), but direct Hub.Shutdown callers can still race an enqueue while
+// the Run loop drains evictBroadcast at priority. A single select over the send and
+// <-h.done could let Go pick the done arm at random and drop the prune, leaking one more
+// fanout to the removed member. The non-blocking send must win whenever the buffer has
+// room. CV-CAN-027/028.
 func TestBroadcastToServerAndPruneEnqueuesWhenDoneClosedButBufferHasRoom(t *testing.T) {
 	hub := NewHub(nil, nil)
 	serverID := uuid.New()
@@ -2378,11 +2378,11 @@ func TestIsVisibleStatus(t *testing.T) {
 		val  interface{}
 		want bool
 	}{
-		{"nil value (just connected)", nil, true},
+		{"nil value (status unavailable)", nil, false},
 		{"online status", "online", true},
-		{"offline status", "offline", true},
+		{"offline status", "offline", false},
 		{"invisible status", "invisible", false},
-		{"empty string", "", true},
+		{"empty string", "", false},
 		{"non-string type", 42, false},
 	}
 	for _, tt := range tests {

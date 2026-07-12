@@ -41,6 +41,7 @@ const (
 	statusOnline      = "online"
 	statusOffline     = "offline"
 	statusInvisible   = "invisible"
+	statusDND         = "dnd"
 	sessionRevoked    = "session_revoked"
 )
 
@@ -69,6 +70,16 @@ type Hub struct {
 
 	// User ID to client IDs mapping (for multi-device support)
 	userClients map[uuid.UUID]map[uuid.UUID]bool
+
+	// Hub-local fail-closed presence for connected users. Values are the status
+	// visible to the user themselves (invisible or offline); every other viewer
+	// sees offline. The Run goroutine owns this map alongside userClients.
+	hiddenPresence map[uuid.UUID]string
+
+	// Users whose first-connection online write failed may retry that exact
+	// default status on heartbeat. Generic missing Redis keys never set this
+	// marker and therefore remain fail closed.
+	pendingOnlineRestore map[uuid.UUID]bool
 
 	// Channel subscriptions (channel ID -> set of client IDs)
 	channelSubscriptions map[uuid.UUID]map[uuid.UUID]bool
@@ -238,6 +249,8 @@ func NewHub(db *sql.DB, redisClient *redis.Client) *Hub {
 		redis:                    redisClient,
 		clients:                  make(map[uuid.UUID]*Client),
 		userClients:              make(map[uuid.UUID]map[uuid.UUID]bool),
+		hiddenPresence:           make(map[uuid.UUID]string),
+		pendingOnlineRestore:     make(map[uuid.UUID]bool),
 		channelSubscriptions:     make(map[uuid.UUID]map[uuid.UUID]bool),
 		usernames:                make(map[uuid.UUID]string),
 		serverSubscriptions:      make(map[uuid.UUID]map[uuid.UUID]bool),
@@ -417,8 +430,16 @@ func (h *Hub) handleRegister(client *Client) {
 
 	if isFirstConnection {
 		ctx := context.Background()
-		h.redis.Set(ctx, fmt.Sprintf(presenceKeyFmt, client.UserID), statusOnline, 120*time.Second)
-		h.broadcastPresenceToAll(client.UserID, statusOnline, time.Now().Unix())
+		if err := h.redis.Set(ctx, fmt.Sprintf(presenceKeyFmt, client.UserID), statusOnline, 120*time.Second).Err(); err != nil {
+			log.Printf("[hub] failed to persist initial presence for user %s: %v", sanitizeLogValue(client.UserID.String()), err)
+			h.pendingOnlineRestore[client.UserID] = true
+			h.setHiddenPresence(client.UserID, statusOffline)
+			h.broadcastPresenceToAll(client.UserID, statusOffline, time.Now().Unix())
+		} else {
+			delete(h.pendingOnlineRestore, client.UserID)
+			h.clearHiddenPresence(client.UserID)
+			h.broadcastPresenceToAll(client.UserID, statusOnline, time.Now().Unix())
+		}
 	}
 
 	log.Printf("Client registered: user=%s client=%s total_clients=%d",
@@ -426,7 +447,7 @@ func (h *Hub) handleRegister(client *Client) {
 
 	h.sendConnectedConfirmation(client)
 	h.sendPresenceSnapshot(client)
-	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // cancel stored in client.asyncCancel, called on unregister (lines 210, 389)
+	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // cancel stored in client.asyncCancel, called by Run shutdown and handleUnregister
 	client.asyncCancel = cancel
 	client.asyncWg.Add(1)
 	go func() {
@@ -451,6 +472,8 @@ func (h *Hub) registerClient(client *Client) bool {
 		err := h.db.QueryRow("SELECT username FROM users WHERE id = $1", client.UserID).Scan(&username)
 		if err == nil {
 			h.usernames[client.UserID] = username
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("Failed to load username for connected user %s: %v", sanitizeLogValue(client.UserID.String()), err)
 		}
 	}
 
@@ -465,9 +488,12 @@ func (h *Hub) sendConnectedConfirmation(client *Client) {
 			keyUserID:   client.UserID,
 		},
 	}
-	if data, err := json.Marshal(confirmMsg); err == nil {
-		client.Send <- data
+	data, err := json.Marshal(confirmMsg)
+	if err != nil {
+		log.Printf("Failed to marshal connected confirmation: %v", err)
+		return
 	}
+	client.Send <- data
 }
 
 // handleConnectionReadyProbe acknowledges a client's subscribe barrier probe.
@@ -510,15 +536,18 @@ func (h *Hub) handleConnectionReadyProbe(msg IncomingMessage) {
 			"protocol_version":    2,
 		},
 	}
-	if data, err := json.Marshal(readyMsg); err == nil {
-		select {
-		case client.Send <- data:
-		default:
-			// Client send buffer full — log so operators can spot slow consumers.
-			// The client times out after 5s and proceeds best-effort, so this
-			// isn't fatal but is a monitoring signal worth surfacing.
-			log.Printf("[hub] connection_ready dropped for client %s: send buffer full; client will proceed best-effort after 5s timeout", msg.ClientID)
-		}
+	data, err := json.Marshal(readyMsg)
+	if err != nil {
+		log.Printf("Failed to marshal connection_ready message: %v", err)
+		return
+	}
+	select {
+	case client.Send <- data:
+	default:
+		// Client send buffer full — log so operators can spot slow consumers.
+		// The client times out after 5s and proceeds best-effort, so this
+		// isn't fatal but is a monitoring signal worth surfacing.
+		log.Printf("[hub] connection_ready dropped for client %s: send buffer full; client will proceed best-effort after 5s timeout", sanitizeLogValue(msg.ClientID.String()))
 	}
 }
 
@@ -528,14 +557,41 @@ type userPresenceInfo struct {
 }
 
 func (h *Hub) resolveVisibleStatus(ctx context.Context, uid, viewerID uuid.UUID) string {
-	status := statusOnline
-	if val, err := h.redis.Get(ctx, fmt.Sprintf(presenceKeyFmt, uid)).Result(); err == nil {
-		status = val
-	}
-	if status == statusInvisible && uid != viewerID {
+	if selfStatus, hidden := h.hiddenPresence[uid]; hidden {
+		if uid == viewerID {
+			return selfStatus
+		}
 		return statusOffline
 	}
-	return status
+
+	status, err := h.redis.Get(ctx, fmt.Sprintf(presenceKeyFmt, uid)).Result()
+	if errors.Is(err, redis.Nil) {
+		if uid != viewerID {
+			return statusOffline
+		}
+		status = statusOnline
+	} else if err != nil {
+		log.Printf("[hub] presence lookup failed for user %s; hiding status from other viewers: %v", sanitizeLogValue(uid.String()), err)
+		if uid != viewerID {
+			return statusOffline
+		}
+		status = statusOnline
+	}
+	switch status {
+	case statusOnline, statusDND:
+		return status
+	case statusInvisible:
+		if uid != viewerID {
+			return statusOffline
+		}
+		return statusInvisible
+	default:
+		log.Printf("[hub] invalid persisted presence status for user %s: %q", sanitizeLogValue(uid.String()), sanitizeLogValue(status))
+		if uid != viewerID {
+			return statusOffline
+		}
+		return statusOnline
+	}
 }
 
 func (h *Hub) sendPresenceSnapshot(client *Client) {
@@ -577,9 +633,12 @@ func (h *Hub) sendPresenceSnapshot(client *Client) {
 			"users":           users,
 		},
 	}
-	if data, err := json.Marshal(presenceSnapshot); err == nil {
-		client.Send <- data
+	data, err := json.Marshal(presenceSnapshot)
+	if err != nil {
+		log.Printf("Failed to marshal presence snapshot: %v", err)
+		return
 	}
+	client.Send <- data
 
 	// #1233 Task B4: also send the custom text of every user the connecting
 	// viewer is permitted to see (audience-filtered per each sender's tier).
@@ -608,15 +667,28 @@ func (h *Hub) sendVoiceCountsSnapshot(ctx context.Context, client *Client) {
 		log.Printf("Failed to query voice counts for new client: %v", err)
 		return
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Printf("Failed to close voice-count snapshot rows: %v", closeErr)
+		}
+	}()
 
 	counts := make(map[string]int)
 	for rows.Next() {
 		var serverID string
 		var count int
-		if err := rows.Scan(&serverID, &count); err == nil {
-			counts[serverID] = count
+		if err := rows.Scan(&serverID, &count); err != nil {
+			log.Printf("Failed to scan voice count for new client: %v", err)
+			return
 		}
+		counts[serverID] = count
+	}
+	if err := rows.Err(); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		log.Printf("Failed to iterate voice counts for new client: %v", err)
+		return
 	}
 
 	msg := OutgoingMessage{
@@ -625,11 +697,14 @@ func (h *Hub) sendVoiceCountsSnapshot(ctx context.Context, client *Client) {
 			keyCounts: counts,
 		},
 	}
-	if data, err := json.Marshal(msg); err == nil {
-		select {
-		case client.Send <- data:
-		default:
-		}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("Failed to marshal voice-count snapshot: %v", err)
+		return
+	}
+	select {
+	case client.Send <- data:
+	default:
 	}
 }
 
@@ -657,8 +732,16 @@ func (h *Hub) handleUnregister(client *Client) {
 	if isLastConnection {
 		now := time.Now().Unix()
 		ctx := context.Background()
-		h.redis.Del(ctx, fmt.Sprintf(presenceKeyFmt, client.UserID))
-		h.redis.Set(ctx, fmt.Sprintf("last_seen:%s", client.UserID), fmt.Sprintf("%d", now), 0)
+		if err := h.redis.Del(ctx, fmt.Sprintf(presenceKeyFmt, client.UserID)).Err(); err != nil {
+			log.Printf("[hub] failed to delete presence for user %s: %v", sanitizeLogValue(client.UserID.String()), err)
+		}
+		// The override is only meaningful while a local connection exists. A
+		// later first registration establishes a fresh fail-closed state.
+		delete(h.pendingOnlineRestore, client.UserID)
+		h.clearHiddenPresence(client.UserID)
+		if err := h.redis.Set(ctx, fmt.Sprintf("last_seen:%s", client.UserID), fmt.Sprintf("%d", now), 0).Err(); err != nil {
+			log.Printf("[hub] failed to persist last_seen for user %s: %v", sanitizeLogValue(client.UserID.String()), err)
+		}
 		h.broadcastPresenceToAll(client.UserID, statusOffline, now)
 
 		// Cancel any DM voice rings this user initiated (#1209 B7 Part 2).
@@ -728,10 +811,8 @@ func (h *Hub) handleIncoming(msg IncomingMessage) {
 		h.handleTyping(msg)
 	case "profile_update":
 		h.handleProfileUpdate(msg)
-	case "heartbeat":
-		h.handleHeartbeat(msg)
-	case "set_status":
-		h.handleSetStatus(msg)
+	case "heartbeat", "set_status":
+		h.handlePresenceIncoming(msg)
 	case "server_update":
 		h.handleServerUpdate(msg)
 	case "subscribe_dm":
@@ -747,6 +828,18 @@ func (h *Hub) handleIncoming(msg IncomingMessage) {
 	default:
 		log.Printf("Unknown message type: %s", sanitizeLogValue(msg.Type))
 	}
+}
+
+func (h *Hub) handlePresenceIncoming(msg IncomingMessage) {
+	client, registered := h.clients[msg.ClientID]
+	if !registered || client.UserID != msg.UserID {
+		return
+	}
+	if msg.Type == "heartbeat" {
+		h.handleHeartbeat(msg)
+		return
+	}
+	h.handleSetStatus(msg)
 }
 
 // ChannelPermissionChecker is the interface the Hub needs from the RBAC resolver
@@ -1133,9 +1226,12 @@ func (h *Hub) handleSubscribe(msg IncomingMessage) {
 			keyChannelID: channelUUID,
 		},
 	}
-	if data, err := json.Marshal(confirmMsg); err == nil {
-		client.Send <- data
+	data, err := json.Marshal(confirmMsg)
+	if err != nil {
+		log.Printf("Failed to marshal channel subscription confirmation: %v", err)
+		return
 	}
+	client.Send <- data
 }
 
 // handleUnsubscribe unsubscribes a client from a channel
@@ -1292,11 +1388,14 @@ func (h *Hub) applyVoiceCountCatchup(c voiceCountCatchup) {
 		Type: "server_voice_counts",
 		Data: map[string]interface{}{keyCounts: counts},
 	}
-	if data, err := json.Marshal(msg); err == nil {
-		select {
-		case client.Send <- data:
-		default:
-		}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("Failed to marshal server voice-count catch-up: %v", err)
+		return
+	}
+	select {
+	case client.Send <- data:
+	default:
 	}
 }
 
@@ -1339,11 +1438,14 @@ func (h *Hub) sendError(clientID uuid.UUID, message string) {
 			keyMessage: message,
 		},
 	}
-	if data, err := json.Marshal(errMsg); err == nil {
-		select {
-		case client.Send <- data:
-		default:
-		}
+	data, err := json.Marshal(errMsg)
+	if err != nil {
+		log.Printf("Failed to marshal WebSocket error message: %v", err)
+		return
+	}
+	select {
+	case client.Send <- data:
+	default:
 	}
 }
 
@@ -1365,11 +1467,14 @@ func (h *Hub) sendErrorWithData(clientID uuid.UUID, errorCode string, extra map[
 		Type: "error",
 		Data: data,
 	}
-	if raw, err := json.Marshal(errMsg); err == nil {
-		select {
-		case client.Send <- raw:
-		default:
-		}
+	raw, err := json.Marshal(errMsg)
+	if err != nil {
+		log.Printf("Failed to marshal structured WebSocket error: %v", err)
+		return
+	}
+	select {
+	case client.Send <- raw:
+	default:
 	}
 }
 
@@ -1439,7 +1544,9 @@ func (h *Hub) rejectEnvelope(msg IncomingMessage) {
 		return
 	}
 	closeMsg := websocket.FormatCloseMessage(4400, "missing_or_invalid_key_version")
-	_ = client.Conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(writeWait))
+	if err := client.Conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(writeWait)); err != nil {
+		log.Printf("Failed to write invalid-envelope close frame for user %s: %v", sanitizeLogValue(msg.UserID.String()), err)
+	}
 }
 
 // parseMessageInput extracts and validates content, key version, and mention
@@ -1619,7 +1726,11 @@ func (h *Hub) fetchServerChannelDeliveryAuth(serverID uuid.UUID) (map[uuid.UUID]
 	if err != nil {
 		return nil, nil, err
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Printf("Failed to close channel delivery-auth rows: %v", closeErr)
+		}
+	}()
 
 	authByChannel := make(map[uuid.UUID]int64)
 	var invalidChannels []uuid.UUID
@@ -1705,11 +1816,14 @@ func (h *Hub) sendMessageAck(ack messageAck) {
 		ackData["attachments"] = ack.Attachments
 	}
 	ackMsg := OutgoingMessage{Type: "message_ack", Data: ackData}
-	if data, err := json.Marshal(ackMsg); err == nil {
-		select {
-		case ack.Client.Send <- data:
-		default:
-		}
+	data, err := json.Marshal(ackMsg)
+	if err != nil {
+		log.Printf("Failed to marshal message acknowledgement: %v", err)
+		return
+	}
+	select {
+	case ack.Client.Send <- data:
+	default:
 	}
 }
 
@@ -1861,7 +1975,12 @@ func (h *Hub) validateReplyToID(msg IncomingMessage, channelID string) (*string,
 		h.sendError(msg.ClientID, "Failed to validate reply target")
 		return nil, false
 	}
-	parsedChannelID, _ := uuid.Parse(channelID)
+	parsedChannelID, parseErr := uuid.Parse(channelID)
+	if parseErr != nil {
+		log.Printf("Failed to parse validated reply channel ID: %v", parseErr)
+		h.sendError(msg.ClientID, "Invalid channel ID")
+		return nil, false
+	}
 	if replyChannelUUID != parsedChannelID {
 		h.sendError(msg.ClientID, "Reply target must be in the same channel")
 		return nil, false
@@ -2219,21 +2338,95 @@ func (h *Hub) handleTyping(msg IncomingMessage) {
 func (h *Hub) handleHeartbeat(msg IncomingMessage) {
 	ctx := context.Background()
 	key := fmt.Sprintf(presenceKeyFmt, msg.UserID)
-	// Refresh TTL for any user-set status (don't change the value, just extend the TTL)
+	// Refresh TTL for any user-set status without letting missing or stale Redis
+	// state expose a user whose Invisible write or prior refresh failed.
 	val, err := h.redis.Get(ctx, key).Result()
-	switch err {
-	case nil:
-		// Extend TTL for any valid status
-		switch val {
-		case statusOnline, "dnd", statusInvisible:
-			h.redis.Expire(ctx, key, 120*time.Second)
-		}
-	case redis.Nil:
-		// Key expired or missing — re-set to online if user is still connected
-		if _, ok := h.userClients[msg.UserID]; ok {
-			h.redis.Set(ctx, key, statusOnline, 120*time.Second)
-		}
+	if err == nil {
+		h.handlePersistedPresenceHeartbeat(ctx, key, msg.UserID, val)
+		return
 	}
+	if errors.Is(err, redis.Nil) {
+		h.handleMissingPresenceHeartbeat(ctx, key, msg.UserID)
+		return
+	}
+	log.Printf("[hub] failed to read presence heartbeat state for user %s: %v", sanitizeLogValue(msg.UserID.String()), err)
+	h.failClosedPresenceHeartbeat(msg.UserID)
+}
+
+func (h *Hub) handlePersistedPresenceHeartbeat(ctx context.Context, key string, userID uuid.UUID, status string) {
+	switch status {
+	case statusInvisible:
+		delete(h.pendingOnlineRestore, userID)
+		h.setHiddenPresence(userID, statusInvisible)
+		h.refreshPresenceTTL(ctx, key, userID)
+	case statusOnline, statusDND:
+		h.handleVisiblePresenceHeartbeat(ctx, key, userID, status)
+	default:
+		delete(h.pendingOnlineRestore, userID)
+		h.failClosedPresenceHeartbeat(userID)
+	}
+}
+
+func (h *Hub) handleVisiblePresenceHeartbeat(ctx context.Context, key string, userID uuid.UUID, status string) {
+	selfStatus, hidden := h.hiddenPresence[userID]
+	if !hidden {
+		h.refreshPresenceTTL(ctx, key, userID)
+		return
+	}
+	if selfStatus == statusInvisible {
+		if err := h.redis.Set(ctx, key, statusInvisible, 120*time.Second).Err(); err != nil {
+			log.Printf("[hub] failed to repair invisible presence for user %s: %v", sanitizeLogValue(userID.String()), err)
+		}
+		return
+	}
+
+	// Offline is a transient fail-closed marker, not a user-selected status.
+	// A valid persisted value proves Redis recovered, so make the user visible again.
+	delete(h.pendingOnlineRestore, userID)
+	h.clearHiddenPresence(userID)
+	h.refreshPresenceTTL(ctx, key, userID)
+	h.broadcastPresenceToAll(userID, status, time.Now().Unix())
+}
+
+func (h *Hub) handleMissingPresenceHeartbeat(ctx context.Context, key string, userID uuid.UUID) {
+	if _, connected := h.userClients[userID]; !connected {
+		return
+	}
+	selfStatus, hidden := h.hiddenPresence[userID]
+	if !hidden {
+		h.failClosedPresenceHeartbeat(userID)
+		return
+	}
+	if selfStatus == statusInvisible {
+		if err := h.redis.Set(ctx, key, statusInvisible, 120*time.Second).Err(); err != nil {
+			log.Printf("[hub] failed to restore invisible presence for user %s: %v", sanitizeLogValue(userID.String()), err)
+		}
+		return
+	}
+	if !h.pendingOnlineRestore[userID] {
+		return
+	}
+	if err := h.redis.Set(ctx, key, statusOnline, 120*time.Second).Err(); err != nil {
+		log.Printf("[hub] failed to restore online presence for user %s: %v", sanitizeLogValue(userID.String()), err)
+		return
+	}
+	delete(h.pendingOnlineRestore, userID)
+	h.clearHiddenPresence(userID)
+	h.broadcastPresenceToAll(userID, statusOnline, time.Now().Unix())
+}
+
+func (h *Hub) refreshPresenceTTL(ctx context.Context, key string, userID uuid.UUID) {
+	if err := h.redis.Expire(ctx, key, 120*time.Second).Err(); err != nil {
+		log.Printf("[hub] failed to refresh presence TTL for user %s: %v", sanitizeLogValue(userID.String()), err)
+	}
+}
+
+func (h *Hub) failClosedPresenceHeartbeat(userID uuid.UUID) {
+	if _, hidden := h.hiddenPresence[userID]; hidden {
+		return
+	}
+	h.setHiddenPresence(userID, statusOffline)
+	h.broadcastPresenceToAll(userID, statusOffline, time.Now().Unix())
 }
 
 // handleSetStatus allows users to manually set their status (online/dnd/invisible)
@@ -2245,20 +2438,34 @@ func (h *Hub) handleSetStatus(msg IncomingMessage) {
 
 	// Validate status
 	switch status {
-	case statusOnline, "dnd", statusInvisible:
+	case statusOnline, statusDND, statusInvisible:
 		// valid
 	default:
 		return
 	}
+	delete(h.pendingOnlineRestore, msg.UserID)
 
 	ctx := context.Background()
 	key := fmt.Sprintf(presenceKeyFmt, msg.UserID)
-	h.redis.Set(ctx, key, status, 120*time.Second)
+	if status == statusInvisible {
+		// Hide first so a failed Redis write cannot leave stale online state
+		// visible to snapshots or online-count recomputation.
+		h.setHiddenPresence(msg.UserID, statusInvisible)
+	}
+	if err := h.redis.Set(ctx, key, status, 120*time.Second).Err(); err != nil {
+		log.Printf("[hub] failed to persist presence status for user %s: %v", sanitizeLogValue(msg.UserID.String()), err)
+		if status == statusInvisible {
+			h.broadcastPresenceToAll(msg.UserID, statusOffline, time.Now().Unix())
+		}
+		return
+	}
 
 	// For invisible, broadcast as offline to other users (but store real status in Redis)
 	broadcastStatus := status
 	if status == statusInvisible {
 		broadcastStatus = statusOffline
+	} else {
+		h.clearHiddenPresence(msg.UserID)
 	}
 	h.broadcastPresenceToAll(msg.UserID, broadcastStatus, time.Now().Unix())
 }
@@ -2461,12 +2668,12 @@ func (h *Hub) BroadcastToServer(serverID uuid.UUID, msg OutgoingMessage) {
 // the caller is an HTTP handler (not the Run goroutine), so it cannot self-deadlock.
 // Only when the buffer (16) is full does it fall back to a blocking select that bails on
 // h.done: once the hub has finished shutting down the Run loop no longer drains
-// evictBroadcast, so without that guard a full buffer would hang the handler goroutine
-// forever; on shutdown every client connection is closed anyway, so no fanout can leak.
-// Trying the non-blocking send first also avoids Go's random select choice dropping a
-// queueable prune in favor of the done bail during graceful shutdown, when h.done is
-// closed before in-flight handlers drain. This is the ordered, guaranteed-delivery
-// mechanism for evicting removed/banned members. CV-CAN-027/028.
+// evictBroadcast, so without that guard a full buffer would hang the caller forever.
+// The control-plane entrypoint drains accepted HTTP handlers before closing h.done
+// (#2202); the bail remains defense in depth for direct Hub.Shutdown callers. Trying the
+// non-blocking send first also avoids Go's random select choice dropping a queueable
+// prune if an enqueue races such a direct shutdown. This is the ordered, guaranteed-
+// delivery mechanism for evicting removed/banned members. CV-CAN-027/028.
 func (h *Hub) BroadcastToServerAndPrune(serverID uuid.UUID, msg OutgoingMessage, pruneUserID uuid.UUID) {
 	uid := pruneUserID
 	sbm := ServerBroadcastMessage{
@@ -2474,14 +2681,12 @@ func (h *Hub) BroadcastToServerAndPrune(serverID uuid.UUID, msg OutgoingMessage,
 		Data:           msg,
 		PruneUserAfter: &uid,
 	}
-	// Prefer a non-blocking enqueue. Shutdown ordering (main.go closes h.done via
-	// hub.Shutdown() before srv.Shutdown() drains in-flight handlers) means a
-	// remove/ban handler can reach here with h.done already closed while the Run
-	// loop is still alive. A single select over both arms would let Go pick <-h.done
-	// even when the buffer has room, dropping the prune; the Run loop's priority
-	// drain empties evictBroadcast before it can take its own done case, so any prune
-	// we manage to enqueue in that window is still applied ahead of shutdown. Only
-	// fall back to the done bail when the buffer is genuinely full.
+	// Prefer a non-blocking enqueue. If a direct Hub.Shutdown races this call, a
+	// single select over the send and <-h.done could choose the done arm even when
+	// the buffer has room. The Run loop's priority drain still applies any queued
+	// prune ahead of shutdown. The control-plane drains accepted HTTP handlers
+	// before closing h.done (#2202); this guard covers other callers defensively.
+	// Only fall back to the done bail when the buffer is genuinely full.
 	select {
 	case h.evictBroadcast <- sbm:
 		return
@@ -2490,10 +2695,10 @@ func (h *Hub) BroadcastToServerAndPrune(serverID uuid.UUID, msg OutgoingMessage,
 	select {
 	case h.evictBroadcast <- sbm:
 	case <-h.done:
-		// Buffer is full and the hub is shutting down: the Run loop has stopped
-		// draining evictBroadcast, so this send would hang forever. Every client
-		// connection is closed on shutdown anyway, so no fanout can leak; bail
-		// rather than hang the caller.
+		// Buffer is full and the hub is shutting down: the Run loop may stop
+		// draining evictBroadcast at any time, so another drain is not guaranteed.
+		// Every client connection is closed on shutdown anyway, so no fanout can
+		// leak; bail rather than hang the caller.
 	}
 }
 
@@ -2585,9 +2790,12 @@ func (h *Hub) handleSubscribeDM(msg IncomingMessage) {
 			keyConversationID: convUUID,
 		},
 	}
-	if data, err := json.Marshal(confirmMsg); err == nil {
-		client.Send <- data
+	data, err := json.Marshal(confirmMsg)
+	if err != nil {
+		log.Printf("Failed to marshal DM subscription confirmation: %v", err)
+		return
 	}
+	client.Send <- data
 }
 
 // handleUnsubscribeDM unsubscribes a client from a DM conversation.
@@ -2970,19 +3178,26 @@ func (h *Hub) dmUnreadParticipants(conversationID uuid.UUID) ([]uuid.UUID, error
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Printf("Failed to close DM participant rows: %v", closeErr)
+		}
+	}()
 
 	var participants []uuid.UUID
 	for rows.Next() {
 		var uid string
 		if err := rows.Scan(&uid); err != nil {
-			continue
+			return nil, fmt.Errorf("scan DM participant: %w", err)
 		}
 		parsed, err := uuid.Parse(uid)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("parse DM participant %q: %w", sanitizeLogValue(uid), err)
 		}
 		participants = append(participants, parsed)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate DM participants: %w", err)
 	}
 	return participants, nil
 }
@@ -3145,10 +3360,14 @@ func (h *Hub) handleDisconnectUser(userID uuid.UUID) {
 	}
 
 	// Courtesy notification + forceful disconnect
-	revokedMsg, _ := json.Marshal(OutgoingMessage{
+	revokedMsg, err := json.Marshal(OutgoingMessage{
 		Type: sessionRevoked,
 		Data: map[string]interface{}{"reason": "session_terminated"},
 	})
+	if err != nil {
+		log.Printf("Failed to marshal user session-revoked message: %v", err)
+		revokedMsg = nil
+	}
 	for _, client := range clients {
 		// Best-effort courtesy message (non-blocking)
 		if revokedMsg != nil {
@@ -3173,10 +3392,14 @@ func (h *Hub) handleDisconnectSession(sessionID string) {
 		return
 	}
 
-	revokedMsg, _ := json.Marshal(OutgoingMessage{
+	revokedMsg, err := json.Marshal(OutgoingMessage{
 		Type: sessionRevoked,
 		Data: map[string]interface{}{"reason": sessionRevoked},
 	})
+	if err != nil {
+		log.Printf("Failed to marshal targeted session-revoked message: %v", err)
+		revokedMsg = nil
+	}
 
 	var count int
 	for _, client := range h.clients {
@@ -3462,17 +3685,25 @@ func (h *Hub) queryServerMemberships(params []interface{}) (map[string][]uuid.UU
 		log.Printf("Failed to query memberships for online counts: %v", err)
 		return nil, nil, err
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Printf("Failed to close membership rows for online counts: %v", closeErr)
+		}
+	}()
 
 	serverMembers := make(map[string][]uuid.UUID)
 	allMemberIDs := make(map[uuid.UUID]bool)
 	for rows.Next() {
 		var sid, uid uuid.UUID
-		if err := rows.Scan(&sid, &uid); err == nil {
-			sidStr := sid.String()
-			serverMembers[sidStr] = append(serverMembers[sidStr], uid)
-			allMemberIDs[uid] = true
+		if err := rows.Scan(&sid, &uid); err != nil {
+			return nil, nil, fmt.Errorf("scan membership for online counts: %w", err)
 		}
+		sidStr := sid.String()
+		serverMembers[sidStr] = append(serverMembers[sidStr], uid)
+		allMemberIDs[uid] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate memberships for online counts: %w", err)
 	}
 	return serverMembers, allMemberIDs, nil
 }
@@ -3483,7 +3714,8 @@ func (h *Hub) resolveVisibleOnline(allMemberIDs map[uuid.UUID]bool) map[uuid.UUI
 	connectedUIDs := make([]uuid.UUID, 0, len(allMemberIDs))
 	redisKeys := make([]string, 0, len(allMemberIDs))
 	for uid := range allMemberIDs {
-		if _, connected := h.userClients[uid]; connected {
+		_, hidden := h.hiddenPresence[uid]
+		if _, connected := h.userClients[uid]; connected && !hidden {
 			connectedUIDs = append(connectedUIDs, uid)
 			redisKeys = append(redisKeys, fmt.Sprintf(presenceKeyFmt, uid))
 		}
@@ -3496,10 +3728,9 @@ func (h *Hub) resolveVisibleOnline(allMemberIDs map[uuid.UUID]bool) map[uuid.UUI
 
 	statuses, err := h.redis.MGet(context.Background(), redisKeys...).Result()
 	if err != nil {
-		// Redis error — fall back to counting all connected as online
-		for _, uid := range connectedUIDs {
-			visibleOnline[uid] = true
-		}
+		// Status is privacy-sensitive: on Redis failure, do not expose connected
+		// users whose persisted state might be invisible.
+		log.Printf("[hub] presence status batch lookup failed; failing closed: %v", err)
 		return visibleOnline
 	}
 
@@ -3511,15 +3742,26 @@ func (h *Hub) resolveVisibleOnline(allMemberIDs map[uuid.UUID]bool) map[uuid.UUI
 	return visibleOnline
 }
 
-// isVisibleStatus returns true if a Redis presence value indicates
-// the user should be counted as visibly online (nil = online, any
-// non-invisible string = online).
+// isVisibleStatus returns true if a Redis presence value explicitly indicates
+// the user should be counted as visibly online. A missing value fails closed
+// because an invisible-status write or TTL refresh may have failed.
 func isVisibleStatus(val interface{}) bool {
 	if val == nil {
-		return true
+		return false
 	}
 	s, ok := val.(string)
-	return ok && s != statusInvisible
+	return ok && (s == statusOnline || s == statusDND)
+}
+
+func (h *Hub) setHiddenPresence(userID uuid.UUID, selfStatus string) {
+	if h.hiddenPresence == nil {
+		h.hiddenPresence = make(map[uuid.UUID]string)
+	}
+	h.hiddenPresence[userID] = selfStatus
+}
+
+func (h *Hub) clearHiddenPresence(userID uuid.UUID) {
+	delete(h.hiddenPresence, userID)
 }
 
 // computeServerCounts tallies the number of visibly-online members per server.
@@ -3550,15 +3792,23 @@ func (h *Hub) queryServerVoiceCounts() (map[string]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Printf("Failed to close server voice-count rows: %v", closeErr)
+		}
+	}()
 
 	counts := make(map[string]int)
 	for rows.Next() {
 		var serverID string
 		var count int
-		if err := rows.Scan(&serverID, &count); err == nil {
-			counts[serverID] = count
+		if err := rows.Scan(&serverID, &count); err != nil {
+			return nil, fmt.Errorf("scan server voice count: %w", err)
 		}
+		counts[serverID] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate server voice counts: %w", err)
 	}
 	return counts, nil
 }
