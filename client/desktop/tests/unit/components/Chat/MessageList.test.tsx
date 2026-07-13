@@ -1,4 +1,4 @@
-import { render, screen } from '../../../test-utils';
+import { fireEvent, render, screen } from '../../../test-utils';
 import MessageList from '@/renderer/components/Chat/MessageList';
 import { mockMessage, mockMessage2 } from '../../../mocks/fixtures';
 import { useChannelScrollStore } from '@/renderer/stores/channelScrollStore';
@@ -178,6 +178,101 @@ describe('MessageList', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (globalThis as any).ResizeObserver = OriginalRO;
     }
+  });
+
+  it('re-pins cold-loaded messages when late content grows (#2006)', () => {
+    const callbacks: ResizeObserverCallback[] = [];
+    class MockRO {
+      constructor(cb: ResizeObserverCallback) {
+        callbacks.push(cb);
+      }
+      observe = vi.fn();
+      disconnect = vi.fn();
+      unobserve = vi.fn();
+    }
+    const OriginalRO = globalThis.ResizeObserver;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).ResizeObserver = MockRO;
+    try {
+      const { rerender } = render(
+        <MessageList messages={[]} currentUserId="user-1" isLoading={true} />
+      );
+
+      rerender(<MessageList messages={[mockMessage]} currentUserId="user-1" isLoading={false} />);
+
+      const list = document.querySelector('.message-list') as HTMLElement;
+      Object.defineProperty(list, 'scrollHeight', { value: 600, writable: true });
+      Object.defineProperty(list, 'clientHeight', { value: 200, writable: true });
+      list.scrollTop = 0;
+
+      callbacks.forEach((callback) =>
+        callback([] as unknown as ResizeObserverEntry[], {} as ResizeObserver)
+      );
+
+      expect(list.scrollTop).toBe(600);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).ResizeObserver = OriginalRO;
+    }
+  });
+
+  it('keeps following latest when late content grows after Return to Latest (#2006)', () => {
+    let roCallback: ResizeObserverCallback | null = null;
+    class MockRO {
+      constructor(cb: ResizeObserverCallback) {
+        roCallback = cb;
+      }
+      observe = vi.fn();
+      disconnect = vi.fn();
+      unobserve = vi.fn();
+    }
+    const OriginalRO = globalThis.ResizeObserver;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).ResizeObserver = MockRO;
+    try {
+      render(<MessageList messages={[mockMessage]} currentUserId="user-1" />);
+      const list = document.querySelector('.message-list') as HTMLElement;
+      Object.defineProperty(list, 'scrollHeight', { value: 1000, writable: true });
+      Object.defineProperty(list, 'clientHeight', { value: 200, writable: true });
+      Object.defineProperty(list, 'scrollTo', {
+        configurable: true,
+        value: vi.fn((options: ScrollToOptions) => {
+          if (options.behavior === 'smooth') {
+            // Native smooth scrolling emits intermediate scroll events before
+            // it reaches the target. A late GIF resize can land in that window.
+            list.scrollTop = 400;
+            fireEvent.scroll(list);
+            return;
+          }
+          list.scrollTop = options.top ?? list.scrollTop;
+        }),
+      });
+      list.scrollTop = 100;
+      fireEvent.scroll(list);
+
+      fireEvent.click(screen.getByRole('button', { name: /return to latest/i }));
+      expect(list.scrollTop).toBe(1000);
+
+      Object.defineProperty(list, 'scrollHeight', { value: 1500, writable: true });
+      roCallback?.([] as unknown as ResizeObserverEntry[], {} as ResizeObserver);
+
+      expect(list.scrollTop).toBe(1500);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).ResizeObserver = OriginalRO;
+    }
+  });
+
+  it('offers Return to Latest whenever the list is no longer near bottom (#2006)', () => {
+    render(<MessageList messages={[mockMessage]} currentUserId="user-1" />);
+    const list = document.querySelector('.message-list') as HTMLElement;
+    Object.defineProperty(list, 'scrollHeight', { value: 1000, writable: true });
+    Object.defineProperty(list, 'clientHeight', { value: 200, writable: true });
+    list.scrollTop = 600;
+
+    fireEvent.scroll(list);
+
+    expect(screen.getByRole('button', { name: /return to latest/i })).toBeVisible();
   });
 
   // ---- Scroll position preservation (WS3 #7) ----

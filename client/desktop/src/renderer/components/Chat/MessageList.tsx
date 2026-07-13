@@ -44,7 +44,6 @@ export interface MessageListHandle {
 }
 
 const NEAR_BOTTOM_THRESHOLD = 150;
-const SHOW_BUTTON_THRESHOLD = 300;
 
 // eslint-disable-next-line @eslint-react/no-forward-ref -- forwardRef is intentional here; refactoring to prop-based ref would require updating all callers and is deferred
 const MessageList = forwardRef<MessageListHandle, MessageListProps>(
@@ -254,10 +253,12 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       });
       observer.observe(content);
       return () => observer.disconnect();
-    }, []);
+    }, [messages.length]);
 
     const scrollToBottom = useCallback((smooth = true) => {
       setNewMessageCount(0);
+      setShowScrollButton(false);
+      isNearBottomRef.current = true;
       if (listRef.current) {
         listRef.current.scrollTo({
           top: listRef.current.scrollHeight,
@@ -278,7 +279,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
         setNewMessageCount(0);
       }
 
-      const shouldShow = distanceFromBottom > SHOW_BUTTON_THRESHOLD;
+      const shouldShow = !isNearBottomRef.current;
       if (shouldShow !== showScrollButton) {
         setShowScrollButton(shouldShow);
       }
@@ -433,7 +434,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
         {showScrollButton && (
           <button
             className="scroll-to-bottom"
-            onClick={() => scrollToBottom(true)}
+            onClick={() => scrollToBottom(false)}
             aria-label="Return to latest"
           >
             {newMessageCount > 0 && (
