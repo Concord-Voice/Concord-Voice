@@ -155,3 +155,43 @@ func TestSendVoiceCountsSnapshotSuppressesPartialScanResult(t *testing.T) {
 	default:
 	}
 }
+
+func TestValidateReplyToIDReturnsErrorOnDatabaseFailure(t *testing.T) {
+	wantErr := errors.New("reply lookup failed")
+	db := openScriptedRowsDB(t, []string{"channel_id"}, nil, wantErr)
+	hub := NewHub(db, nil)
+	client := newTestClient(hub, uuid.New())
+	hub.clients[client.ID] = client
+	replyID := uuid.NewString()
+	logs := captureHubLog(t)
+
+	validated, ok := hub.validateReplyToID(IncomingMessage{
+		ClientID: client.ID,
+		Data: map[string]interface{}{
+			"reply_to_id": replyID,
+		},
+	}, uuid.NewString())
+
+	require.False(t, ok)
+	require.Nil(t, validated)
+	require.Contains(t, logs.String(), "Failed to validate reply_to_id "+replyID)
+	response := readClientMsg(t, client)
+	require.Equal(t, "Failed to validate reply target", response["data"].(map[string]interface{})[keyMessage])
+}
+
+func TestHandleProfileUpdateLeavesCacheUnchangedOnDatabaseFailure(t *testing.T) {
+	wantErr := errors.New("profile lookup failed")
+	db := openScriptedRowsDB(t, []string{"username", "display_name", "avatar_url"}, nil, wantErr)
+	hub := NewHub(db, nil)
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	client.Username = "before-error"
+	hub.clients[client.ID] = client
+	hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
+	logs := captureHubLog(t)
+
+	hub.handleProfileUpdate(IncomingMessage{ClientID: client.ID, UserID: userID})
+
+	require.Equal(t, "before-error", client.Username)
+	require.Contains(t, logs.String(), "Failed to refresh user info for "+userID.String())
+}

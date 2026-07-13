@@ -45,6 +45,11 @@ const (
 	sessionRevoked    = "session_revoked"
 )
 
+type presenceRecoveryState struct {
+	status  string
+	pending bool
+}
+
 // Hub maintains the set of active clients and broadcasts messages
 type Hub struct {
 	// Database connection for authorization checks
@@ -76,10 +81,10 @@ type Hub struct {
 	// sees offline. The Run goroutine owns this map alongside userClients.
 	hiddenPresence map[uuid.UUID]string
 
-	// Users whose first-connection online write failed may retry that exact
-	// default status on heartbeat. Generic missing Redis keys never set this
-	// marker and therefore remain fail closed.
-	pendingOnlineRestore map[uuid.UUID]bool
+	// Trusted visible status for connected users and whether fail-closed
+	// recovery is pending after a Redis write or read failure. Generic missing
+	// keys never set pending and therefore remain fail closed.
+	presenceRecovery map[uuid.UUID]presenceRecoveryState
 
 	// Channel subscriptions (channel ID -> set of client IDs)
 	channelSubscriptions map[uuid.UUID]map[uuid.UUID]bool
@@ -250,7 +255,7 @@ func NewHub(db *sql.DB, redisClient *redis.Client) *Hub {
 		clients:                  make(map[uuid.UUID]*Client),
 		userClients:              make(map[uuid.UUID]map[uuid.UUID]bool),
 		hiddenPresence:           make(map[uuid.UUID]string),
-		pendingOnlineRestore:     make(map[uuid.UUID]bool),
+		presenceRecovery:         make(map[uuid.UUID]presenceRecoveryState),
 		channelSubscriptions:     make(map[uuid.UUID]map[uuid.UUID]bool),
 		usernames:                make(map[uuid.UUID]string),
 		serverSubscriptions:      make(map[uuid.UUID]map[uuid.UUID]bool),
@@ -430,20 +435,22 @@ func (h *Hub) handleRegister(client *Client) {
 
 	if isFirstConnection {
 		ctx := context.Background()
+		recovery := presenceRecoveryState{status: statusOnline}
 		if err := h.redis.Set(ctx, fmt.Sprintf(presenceKeyFmt, client.UserID), statusOnline, 120*time.Second).Err(); err != nil {
 			log.Printf("[hub] failed to persist initial presence for user %s: %v", sanitizeLogValue(client.UserID.String()), err)
-			h.pendingOnlineRestore[client.UserID] = true
+			recovery.pending = true
+			h.presenceRecovery[client.UserID] = recovery
 			h.setHiddenPresence(client.UserID, statusOffline)
 			h.broadcastPresenceToAll(client.UserID, statusOffline, time.Now().Unix())
 		} else {
-			delete(h.pendingOnlineRestore, client.UserID)
+			h.presenceRecovery[client.UserID] = recovery
 			h.clearHiddenPresence(client.UserID)
 			h.broadcastPresenceToAll(client.UserID, statusOnline, time.Now().Unix())
 		}
 	}
 
 	log.Printf("Client registered: user=%s client=%s total_clients=%d",
-		client.UserID, client.ID, len(h.clients))
+		sanitizeLogValue(client.UserID.String()), sanitizeLogValue(client.ID.String()), len(h.clients))
 
 	h.sendConnectedConfirmation(client)
 	h.sendPresenceSnapshot(client)
@@ -737,7 +744,7 @@ func (h *Hub) handleUnregister(client *Client) {
 		}
 		// The override is only meaningful while a local connection exists. A
 		// later first registration establishes a fresh fail-closed state.
-		delete(h.pendingOnlineRestore, client.UserID)
+		delete(h.presenceRecovery, client.UserID)
 		h.clearHiddenPresence(client.UserID)
 		if err := h.redis.Set(ctx, fmt.Sprintf("last_seen:%s", client.UserID), fmt.Sprintf("%d", now), 0).Err(); err != nil {
 			log.Printf("[hub] failed to persist last_seen for user %s: %v", sanitizeLogValue(client.UserID.String()), err)
@@ -754,7 +761,7 @@ func (h *Hub) handleUnregister(client *Client) {
 	}
 
 	log.Printf("Client unregistered: user=%s client=%s remaining=%d",
-		client.UserID, client.ID, remaining)
+		sanitizeLogValue(client.UserID.String()), sanitizeLogValue(client.ID.String()), remaining)
 }
 
 func (h *Hub) removeUserClient(client *Client) bool {
@@ -1217,7 +1224,7 @@ func (h *Hub) handleSubscribe(msg IncomingMessage) {
 	}
 	h.channelSubscriptions[channelUUID][client.ID] = true
 
-	log.Printf("Client %s subscribed to channel %s", client.ID, channelUUID)
+	log.Printf("Client %s subscribed to channel %s", sanitizeLogValue(client.ID.String()), sanitizeLogValue(channelUUID.String()))
 
 	// Send confirmation
 	confirmMsg := OutgoingMessage{
@@ -1253,7 +1260,7 @@ func (h *Hub) handleUnsubscribe(msg IncomingMessage) {
 
 	h.removeChannelSubscription(channelUUID, client)
 
-	log.Printf("Client %s unsubscribed from channel %s", client.ID, channelUUID)
+	log.Printf("Client %s unsubscribed from channel %s", sanitizeLogValue(client.ID.String()), sanitizeLogValue(channelUUID.String()))
 }
 
 // handleSubscribeServer subscribes a client to server-level notifications (unread pings)
@@ -1300,7 +1307,7 @@ func (h *Hub) handleSubscribeServer(msg IncomingMessage) {
 	alreadySubscribed := subs[client.ID]
 	subs[client.ID] = true
 
-	log.Printf("Client %s subscribed to server %s notifications", client.ID, serverUUID)
+	log.Printf("Client %s subscribed to server %s notifications", sanitizeLogValue(client.ID.String()), sanitizeLogValue(serverUUID.String()))
 
 	// CV-CAN-030: deliver a fresh voice-count snapshot immediately on subscribe.
 	// The scoped broadcast only reaches already-subscribed clients, so any voice
@@ -1423,7 +1430,7 @@ func (h *Hub) handleUnsubscribeServer(msg IncomingMessage) {
 		}
 	}
 
-	log.Printf("Client %s unsubscribed from server %s notifications", client.ID, serverUUID)
+	log.Printf("Client %s unsubscribed from server %s notifications", sanitizeLogValue(client.ID.String()), sanitizeLogValue(serverUUID.String()))
 }
 
 // sendError sends an error message to a specific client
@@ -1532,7 +1539,7 @@ func (h *Hub) rejectEnvelope(msg IncomingMessage) {
 		rawKV = rawKV[:64] + "..."
 	}
 	log.Printf("ws envelope rejected user_id=%s reason=missing_or_invalid_key_version key_version=%q",
-		msg.UserID, rawKV)
+		sanitizeLogValue(msg.UserID.String()), rawKV)
 	client, ok := h.clients[msg.ClientID]
 	if !ok {
 		return
@@ -1773,7 +1780,7 @@ func (h *Hub) enforceWSEpoch(msg IncomingMessage, channelUUID uuid.UUID, channel
 			`SELECT COALESCE(MAX(key_version), 1) FROM channel_keys WHERE channel_id = $1`,
 			channelUUID,
 		).Scan(&currentEpoch); err != nil {
-			log.Printf("Failed to fetch current epoch for channel %s: %v", channelID, err)
+			log.Printf("Failed to fetch current epoch for channel %s: %v", sanitizeLogValue(channelID), err)
 		}
 		h.sendErrorWithData(msg.ClientID, "epoch_revoked", map[string]interface{}{
 			"current_epoch": currentEpoch,
@@ -1890,7 +1897,7 @@ func (h *Hub) validateAndLinkAttachment(ctx attachmentLinkCtx, fileID string, po
 
 	_, err = h.db.Exec(ctx.insertSQL, ctx.messageID, fileID, position)
 	if err != nil {
-		log.Printf("Failed to link attachment %s to message %s: %v", sanitizeLogValue(fileID), ctx.messageID, err)
+		log.Printf("Failed to link attachment %s to message %s: %v", sanitizeLogValue(fileID), sanitizeLogValue(ctx.messageID.String()), err)
 		return summary, false
 	}
 
@@ -1971,7 +1978,7 @@ func (h *Hub) validateReplyToID(msg IncomingMessage, channelID string) (*string,
 		return nil, false
 	}
 	if err != nil {
-		log.Printf("Failed to validate reply_to_id %s: %v", rtID, err)
+		log.Printf("Failed to validate reply_to_id %s: %v", sanitizeLogValue(rtID), err)
 		h.sendError(msg.ClientID, "Failed to validate reply target")
 		return nil, false
 	}
@@ -2350,19 +2357,25 @@ func (h *Hub) handleHeartbeat(msg IncomingMessage) {
 		return
 	}
 	log.Printf("[hub] failed to read presence heartbeat state for user %s: %v", sanitizeLogValue(msg.UserID.String()), err)
+	if _, hidden := h.hiddenPresence[msg.UserID]; !hidden {
+		if recovery, known := h.presenceRecovery[msg.UserID]; known && isVisibleStatus(recovery.status) {
+			recovery.pending = true
+			h.presenceRecovery[msg.UserID] = recovery
+		}
+	}
 	h.failClosedPresenceHeartbeat(msg.UserID)
 }
 
 func (h *Hub) handlePersistedPresenceHeartbeat(ctx context.Context, key string, userID uuid.UUID, status string) {
 	switch status {
 	case statusInvisible:
-		delete(h.pendingOnlineRestore, userID)
+		delete(h.presenceRecovery, userID)
 		h.setHiddenPresence(userID, statusInvisible)
 		h.refreshPresenceTTL(ctx, key, userID)
 	case statusOnline, statusDND:
 		h.handleVisiblePresenceHeartbeat(ctx, key, userID, status)
 	default:
-		delete(h.pendingOnlineRestore, userID)
+		delete(h.presenceRecovery, userID)
 		h.failClosedPresenceHeartbeat(userID)
 	}
 }
@@ -2370,10 +2383,13 @@ func (h *Hub) handlePersistedPresenceHeartbeat(ctx context.Context, key string, 
 func (h *Hub) handleVisiblePresenceHeartbeat(ctx context.Context, key string, userID uuid.UUID, status string) {
 	selfStatus, hidden := h.hiddenPresence[userID]
 	if !hidden {
-		h.refreshPresenceTTL(ctx, key, userID)
+		recovery := presenceRecoveryState{status: status}
+		recovery.pending = !h.refreshPresenceTTL(ctx, key, userID)
+		h.presenceRecovery[userID] = recovery
 		return
 	}
 	if selfStatus == statusInvisible {
+		delete(h.presenceRecovery, userID)
 		if err := h.redis.Set(ctx, key, statusInvisible, 120*time.Second).Err(); err != nil {
 			log.Printf("[hub] failed to repair invisible presence for user %s: %v", sanitizeLogValue(userID.String()), err)
 		}
@@ -2382,9 +2398,10 @@ func (h *Hub) handleVisiblePresenceHeartbeat(ctx context.Context, key string, us
 
 	// Offline is a transient fail-closed marker, not a user-selected status.
 	// A valid persisted value proves Redis recovered, so make the user visible again.
-	delete(h.pendingOnlineRestore, userID)
+	recovery := presenceRecoveryState{status: status}
+	recovery.pending = !h.refreshPresenceTTL(ctx, key, userID)
+	h.presenceRecovery[userID] = recovery
 	h.clearHiddenPresence(userID)
-	h.refreshPresenceTTL(ctx, key, userID)
 	h.broadcastPresenceToAll(userID, status, time.Now().Unix())
 }
 
@@ -2393,32 +2410,46 @@ func (h *Hub) handleMissingPresenceHeartbeat(ctx context.Context, key string, us
 		return
 	}
 	selfStatus, hidden := h.hiddenPresence[userID]
-	if !hidden {
+	recovery, known := h.presenceRecovery[userID]
+	canRestore := known && recovery.pending && isVisibleStatus(recovery.status)
+	if !hidden && !canRestore {
 		h.failClosedPresenceHeartbeat(userID)
 		return
 	}
-	if selfStatus == statusInvisible {
+	if hidden && selfStatus == statusInvisible {
+		delete(h.presenceRecovery, userID)
 		if err := h.redis.Set(ctx, key, statusInvisible, 120*time.Second).Err(); err != nil {
 			log.Printf("[hub] failed to restore invisible presence for user %s: %v", sanitizeLogValue(userID.String()), err)
 		}
 		return
 	}
-	if !h.pendingOnlineRestore[userID] {
+	if !canRestore {
 		return
 	}
-	if err := h.redis.Set(ctx, key, statusOnline, 120*time.Second).Err(); err != nil {
-		log.Printf("[hub] failed to restore online presence for user %s: %v", sanitizeLogValue(userID.String()), err)
+	if err := h.redis.Set(ctx, key, recovery.status, 120*time.Second).Err(); err != nil {
+		log.Printf("[hub] failed to restore visible presence for user %s: %v", sanitizeLogValue(userID.String()), err)
+		if !hidden {
+			h.failClosedPresenceHeartbeat(userID)
+		}
 		return
 	}
-	delete(h.pendingOnlineRestore, userID)
+	recovery.pending = false
+	h.presenceRecovery[userID] = recovery
 	h.clearHiddenPresence(userID)
-	h.broadcastPresenceToAll(userID, statusOnline, time.Now().Unix())
+	h.broadcastPresenceToAll(userID, recovery.status, time.Now().Unix())
 }
 
-func (h *Hub) refreshPresenceTTL(ctx context.Context, key string, userID uuid.UUID) {
-	if err := h.redis.Expire(ctx, key, 120*time.Second).Err(); err != nil {
+func (h *Hub) refreshPresenceTTL(ctx context.Context, key string, userID uuid.UUID) bool {
+	refreshed, err := h.redis.Expire(ctx, key, 120*time.Second).Result()
+	if err != nil {
 		log.Printf("[hub] failed to refresh presence TTL for user %s: %v", sanitizeLogValue(userID.String()), err)
+		return false
 	}
+	if !refreshed {
+		log.Printf("[hub] presence key missing during TTL refresh for user %s", sanitizeLogValue(userID.String()))
+		return false
+	}
+	return true
 }
 
 func (h *Hub) failClosedPresenceHeartbeat(userID uuid.UUID) {
@@ -2443,11 +2474,11 @@ func (h *Hub) handleSetStatus(msg IncomingMessage) {
 	default:
 		return
 	}
-	delete(h.pendingOnlineRestore, msg.UserID)
 
 	ctx := context.Background()
 	key := fmt.Sprintf(presenceKeyFmt, msg.UserID)
 	if status == statusInvisible {
+		delete(h.presenceRecovery, msg.UserID)
 		// Hide first so a failed Redis write cannot leave stale online state
 		// visible to snapshots or online-count recomputation.
 		h.setHiddenPresence(msg.UserID, statusInvisible)
@@ -2456,6 +2487,9 @@ func (h *Hub) handleSetStatus(msg IncomingMessage) {
 		log.Printf("[hub] failed to persist presence status for user %s: %v", sanitizeLogValue(msg.UserID.String()), err)
 		if status == statusInvisible {
 			h.broadcastPresenceToAll(msg.UserID, statusOffline, time.Now().Unix())
+		} else if recovery, known := h.presenceRecovery[msg.UserID]; known && isVisibleStatus(recovery.status) {
+			recovery.pending = true
+			h.presenceRecovery[msg.UserID] = recovery
 		}
 		return
 	}
@@ -2465,6 +2499,7 @@ func (h *Hub) handleSetStatus(msg IncomingMessage) {
 	if status == statusInvisible {
 		broadcastStatus = statusOffline
 	} else {
+		h.presenceRecovery[msg.UserID] = presenceRecoveryState{status: status}
 		h.clearHiddenPresence(msg.UserID)
 	}
 	h.broadcastPresenceToAll(msg.UserID, broadcastStatus, time.Now().Unix())
@@ -2781,7 +2816,7 @@ func (h *Hub) handleSubscribeDM(msg IncomingMessage) {
 	}
 	h.dmSubscriptions[convUUID][client.ID] = true
 
-	log.Printf("Client %s subscribed to DM %s", client.ID, convUUID)
+	log.Printf("Client %s subscribed to DM %s", sanitizeLogValue(client.ID.String()), sanitizeLogValue(convUUID.String()))
 
 	// Send confirmation
 	confirmMsg := OutgoingMessage{
@@ -2817,7 +2852,7 @@ func (h *Hub) handleUnsubscribeDM(msg IncomingMessage) {
 		}
 	}
 
-	log.Printf("Client %s unsubscribed from DM %s", msg.ClientID, convUUID)
+	log.Printf("Client %s unsubscribed from DM %s", sanitizeLogValue(msg.ClientID.String()), sanitizeLogValue(convUUID.String()))
 }
 
 // dmMessageInput holds the parsed and validated fields from an incoming DM WebSocket message.
@@ -2986,7 +3021,7 @@ func (h *Hub) enforceDMEpoch(msg IncomingMessage, convUUID uuid.UUID, keyVersion
 		`SELECT COALESCE(MAX(key_version), 1) FROM dm_channel_keys WHERE conversation_id = $1`,
 		convUUID,
 	).Scan(&currentEpoch); err != nil {
-		log.Printf("Failed to fetch current epoch for DM %s: %v", convUUID, err)
+		log.Printf("Failed to fetch current epoch for DM %s: %v", sanitizeLogValue(convUUID.String()), err)
 	}
 	convID := convUUID.String()
 	h.sendErrorWithData(msg.ClientID, "epoch_revoked", map[string]interface{}{
@@ -3381,7 +3416,7 @@ func (h *Hub) handleDisconnectUser(userID uuid.UUID) {
 	}
 
 	if len(clients) > 0 {
-		log.Printf("Force-disconnected %d client(s) for user %s", len(clients), userID)
+		log.Printf("Force-disconnected %d client(s) for user %s", len(clients), sanitizeLogValue(userID.String()))
 	}
 }
 
@@ -3476,7 +3511,7 @@ func (h *Hub) handleProfileUpdate(msg IncomingMessage) {
 		msg.UserID,
 	).Scan(&username, &displayName, &avatarURL)
 	if err != nil {
-		log.Printf("Failed to refresh user info for %s: %v", msg.UserID, err)
+		log.Printf("Failed to refresh user info for %s: %v", sanitizeLogValue(msg.UserID.String()), err)
 		return
 	}
 
@@ -3512,7 +3547,7 @@ func (h *Hub) handleServerUpdate(msg IncomingMessage) {
 		serverID,
 	).Scan(&name, &iconURL, &bannerURL)
 	if err != nil {
-		log.Printf("Failed to refresh server info for %s: %v", serverID, err)
+		log.Printf("Failed to refresh server info for %s: %v", sanitizeLogValue(serverID.String()), err)
 		return
 	}
 

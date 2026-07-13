@@ -82,7 +82,7 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	var displayName *string
 	var avatarURL *string
 	if err := h.db.QueryRow("SELECT username, display_name, avatar_url FROM users WHERE id = $1", userID).Scan(&username, &displayName, &avatarURL); err != nil {
-		log.Printf("Failed to look up username for user %s: %v", userID, err)
+		log.Printf("Failed to look up username for user %s: %v", sanitizeLogValue(userID.String()), err)
 		username = "Unknown"
 	}
 
