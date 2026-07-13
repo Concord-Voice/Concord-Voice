@@ -13,6 +13,7 @@ const { mockNc, mockConnect, mockEncode, mockDecode } = vi.hoisted(() => {
   const mockNc = {
     publish: vi.fn(),
     drain: vi.fn().mockResolvedValue(undefined),
+    isClosed: vi.fn(() => false),
     status: vi.fn(() => ({
       async *[Symbol.asyncIterator]() {
         yield { type: 'update', data: {} };
@@ -86,6 +87,41 @@ describe('NatsService', () => {
 
       // Should not throw
       expect(() => service.publish('voice.joined', {})).not.toThrow();
+    });
+
+    it('drops messages while disconnected and resumes only after reconnect', async () => {
+      let releaseReconnect!: () => void;
+      let disconnected!: () => void;
+      let reconnected!: () => void;
+      const reconnectGate = new Promise<void>((resolve) => {
+        releaseReconnect = resolve;
+      });
+      const disconnectedSeen = new Promise<void>((resolve) => {
+        disconnected = resolve;
+      });
+      const reconnectedSeen = new Promise<void>((resolve) => {
+        reconnected = resolve;
+      });
+      mockNc.status.mockReturnValueOnce({
+        async *[Symbol.asyncIterator]() {
+          yield { type: 'disconnect', data: 'nats://localhost:4222' };
+          disconnected();
+          await reconnectGate;
+          yield { type: 'reconnect', data: 'nats://localhost:4222' };
+          reconnected();
+        },
+      });
+
+      await service.connect();
+      await disconnectedSeen;
+      mockNc.publish.mockClear();
+      expect(service.publish('ops.metrics.media.v1', { sequence: 1 })).toBe(false);
+      expect(mockNc.publish).not.toHaveBeenCalled();
+
+      releaseReconnect();
+      await reconnectedSeen;
+      expect(service.publish('ops.metrics.media.v1', { sequence: 2 })).toBe(true);
+      expect(mockNc.publish).toHaveBeenCalledTimes(1);
     });
   });
 

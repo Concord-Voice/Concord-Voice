@@ -24,9 +24,22 @@ export interface MetricsSnapshot {
   egress: { cumulativeBytes: number; currentBps: number; peakBps: number };
 }
 
+export interface AggregateMediaMetrics {
+  readonly cameraPublishersCurrent: number;
+  readonly screenPublishersCurrent: number;
+  readonly peakVideoPublishersPerRoom: number;
+  readonly egressCurrentBps: number;
+  readonly egressPeakBps: number;
+  readonly egressCumulativeBytes: number;
+  readonly participantHoursAudio: number;
+  readonly participantHoursWebcam: number;
+  readonly participantHoursScreenshare: number;
+}
+
 /**
- * Pure accumulator for media-plane measurement counters (#1553). Fed a MetricsSample
- * each heartbeat tick by roomManager.collectMetricsSample(). No mediasoup/I/O — see
+ * Pure accumulator for media-plane measurement counters (#1553). Fed by exactly one
+ * active sampler: the room heartbeat when ops metrics is disabled, or the ops publisher
+ * when enabled. No mediasoup/I/O — see
  * [internal]specs/2026-06-16-1553-media-plane-metrics-design.md.
  */
 export class MediaMetrics {
@@ -80,6 +93,21 @@ export class MediaMetrics {
         currentBps: this.currentBps,
         peakBps: this.peakBps,
       },
+    };
+  }
+
+  getAggregateMetrics(): AggregateMediaMetrics {
+    const snapshot = this.getSnapshot();
+    return {
+      cameraPublishersCurrent: snapshot.concurrentVideoPublishers.camera,
+      screenPublishersCurrent: snapshot.concurrentVideoPublishers.screen,
+      peakVideoPublishersPerRoom: snapshot.peakConcurrentVideoPublishersPerRoom,
+      egressCurrentBps: snapshot.egress.currentBps,
+      egressPeakBps: snapshot.egress.peakBps,
+      egressCumulativeBytes: snapshot.egress.cumulativeBytes,
+      participantHoursAudio: snapshot.participantHoursByKind.audio,
+      participantHoursWebcam: snapshot.participantHoursByKind.webcam,
+      participantHoursScreenshare: snapshot.participantHoursByKind.screenshare,
     };
   }
 

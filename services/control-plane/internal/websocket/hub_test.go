@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
 	"github.com/lib/pq"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vmihailenco/msgpack/v5"
@@ -27,6 +28,26 @@ const (
 )
 
 const notAUUID = "not-a-uuid"
+
+type opsCounterSpy struct {
+	mu     sync.Mutex
+	counts map[opsmetrics.MetricKey]int
+}
+
+func (s *opsCounterSpy) Increment(key opsmetrics.MetricKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.counts == nil {
+		s.counts = make(map[opsmetrics.MetricKey]int)
+	}
+	s.counts[key]++
+}
+
+func (s *opsCounterSpy) count(key opsmetrics.MetricKey) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.counts[key]
+}
 
 // --- Hub construction tests ---
 
@@ -52,6 +73,94 @@ func TestNewHubInitializesMaps(t *testing.T) {
 	assert.NotNil(t, hub.disconnectSession)
 	assert.NotNil(t, hub.done)
 	assert.NotNil(t, hub.onlineCountPending)
+}
+
+func TestConnectionCountUsesReadLockedClientTotal(t *testing.T) {
+	hub := NewHub(nil, nil)
+	hub.mu.Lock()
+	hub.clients[uuid.New()] = &Client{}
+	hub.clients[uuid.New()] = &Client{}
+	hub.mu.Unlock()
+
+	require.Equal(t, 2, hub.ConnectionCount())
+}
+
+func TestOpsMessageCounterWebSocketChannelCountsOnlySuccessfulInsert(t *testing.T) {
+	setup := setupMessageTest(t)
+	counter := &opsCounterSpy{}
+	setup.hub.opsCounter = counter
+
+	setup.hub.handleMessage(IncomingMessage{
+		Type:     "message",
+		UserID:   setup.user1,
+		ClientID: setup.client.ID,
+		Data: map[string]interface{}{
+			keyChannelID:  setup.convID,
+			keyContent:    "successful message",
+			keyKeyVersion: float64(1),
+		},
+	})
+	require.Equal(t, 1, counter.count(opsmetrics.MetricChannelMessagesTotal))
+
+	_, err := setup.db.Exec(`
+		CREATE FUNCTION test_fail_ops_ws_message_insert() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'forced websocket message insert failure'; END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER test_fail_ops_ws_message_insert
+		BEFORE INSERT ON messages FOR EACH ROW EXECUTE FUNCTION test_fail_ops_ws_message_insert();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := setup.db.Exec(`
+			DROP TRIGGER IF EXISTS test_fail_ops_ws_message_insert ON messages;
+			DROP FUNCTION IF EXISTS test_fail_ops_ws_message_insert();
+		`)
+		require.NoError(t, cleanupErr)
+	})
+
+	setup.hub.handleMessage(IncomingMessage{
+		Type:     "message",
+		UserID:   setup.user1,
+		ClientID: setup.client.ID,
+		Data: map[string]interface{}{
+			keyChannelID:  setup.convID,
+			keyContent:    "failed message",
+			keyKeyVersion: float64(1),
+		},
+	})
+	require.Equal(t, 1, counter.count(opsmetrics.MetricChannelMessagesTotal))
+}
+
+func TestOpsMessageCounterWebSocketValidationFailureIsNoOp(t *testing.T) {
+	hub := newMinimalHub()
+	counter := &opsCounterSpy{}
+	hub.opsCounter = counter
+
+	hub.handleMessage(IncomingMessage{Type: "message", Data: map[string]interface{}{keyContent: "missing channel"}})
+
+	require.Zero(t, counter.count(opsmetrics.MetricChannelMessagesTotal))
+}
+
+func TestOpsMessageCounterWebSocketDMExcludesSystemCallEventRows(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	counter := &opsCounterSpy{}
+	setup.hub.opsCounter = counter
+
+	for _, messageType := range []string{"user", "system"} {
+		setup.hub.handleDMMessage(IncomingMessage{
+			Type:     "dm_message",
+			UserID:   setup.user1,
+			ClientID: setup.client.ID,
+			Data: map[string]interface{}{
+				keyConversationID: setup.convID,
+				keyContent:        messageType + " message",
+				keyKeyVersion:     float64(1),
+				"type":            messageType,
+			},
+		})
+	}
+
+	require.Equal(t, 1, counter.count(opsmetrics.MetricDMMessagesTotal))
 }
 
 func TestSetMentionChecker(t *testing.T) {

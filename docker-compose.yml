@@ -162,6 +162,38 @@ services:
     profiles:
       - tools
 
+  # Isolated aggregate host/container metrics collector. The Docker socket is
+  # root-equivalent even with :ro; this service receives no application data or
+  # credentials and exposes no inbound port.
+  ops-agent:
+    build:
+      context: ./services/control-plane
+      dockerfile: Dockerfile.ops-agent
+    container_name: concordvoice-ops-agent
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      NATS_URL: nats://nats:4222
+      OPS_METRICS_ENABLED: ${OPS_METRICS_ENABLED:-false}
+      OPS_METRICS_NODE_ID: ${OPS_METRICS_NODE_ID:-}
+      OPS_METRICS_SHARED_SECRET: ${OPS_METRICS_SHARED_SECRET:-}
+      OPS_METRICS_INTERVAL: ${OPS_METRICS_INTERVAL:-15s}
+      OPS_METRICS_ROLE: ${OPS_METRICS_ROLE:-local}
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks:
+      - concordvoice-services
+    profiles:
+      - services
+
   # Control Plane Service (Go)
   control-plane:
     build:
@@ -197,6 +229,11 @@ services:
       UPLOAD_MAX_SIZE: ${UPLOAD_MAX_SIZE:-26214400}
       KLIPY_API_KEY: ${KLIPY_API_KEY:-}
       TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.19.0.0/16}
+      OPS_METRICS_ENABLED: ${OPS_METRICS_ENABLED:-false}
+      OPS_METRICS_NODE_ID: ${OPS_METRICS_NODE_ID:-}
+      OPS_METRICS_SHARED_SECRET: ${OPS_METRICS_SHARED_SECRET:-}
+      OPS_METRICS_INTERVAL: ${OPS_METRICS_INTERVAL:-15s}
+      OPS_METRICS_ROLE: ${OPS_METRICS_ROLE:-local}
       PORT: 8080
     ports:
       - "8080:8080"
@@ -229,6 +266,11 @@ services:
       RTC_MIN_PORT: 40000
       RTC_MAX_PORT: 49999
       ANNOUNCED_IP: 127.0.0.1
+      OPS_METRICS_ENABLED: ${OPS_METRICS_ENABLED:-false}
+      OPS_METRICS_NODE_ID: ${OPS_METRICS_NODE_ID:-}
+      OPS_METRICS_SHARED_SECRET: ${OPS_METRICS_SHARED_SECRET:-}
+      OPS_METRICS_INTERVAL: ${OPS_METRICS_INTERVAL:-15s}
+      OPS_METRICS_ROLE: ${OPS_METRICS_ROLE:-local}
       PORT: 3000
     ports:
       - "3000:3000"

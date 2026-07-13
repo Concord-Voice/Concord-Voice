@@ -579,6 +579,13 @@ export type RoomEvent =
 export type RoomEventHandler = (event: RoomEvent) => void;
 type CameraLayerSelection = { spatialLayer: 0 | 1 | 2; temporalLayer: 0 | 1 | 2 };
 
+export interface AggregateRoomCounts {
+  readonly activeRooms: number;
+  readonly audioParticipants: number;
+  readonly webcamParticipants: number;
+  readonly screenshareParticipants: number;
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers (extracted to reduce cognitive complexity of computeCodecFloor)
 // ---------------------------------------------------------------------------
@@ -2251,6 +2258,36 @@ export class RoomManager {
     };
   }
 
+  /** Aggregate-only current room and participant counts for operations metrics. */
+  getAggregateCounts(): AggregateRoomCounts {
+    let audioParticipants = 0;
+    let webcamParticipants = 0;
+    let screenshareParticipants = 0;
+
+    for (const room of this.rooms.values()) {
+      for (const participant of room.participants.values()) {
+        let hasAudio = false;
+        let hasWebcam = false;
+        let hasScreenshare = false;
+        for (const entry of participant.producers.values()) {
+          hasAudio ||= entry.source === 'mic' || entry.source === 'screen-audio';
+          hasWebcam ||= entry.source === 'camera';
+          hasScreenshare ||= entry.source === 'screen';
+        }
+        if (hasAudio) audioParticipants++;
+        if (hasWebcam) webcamParticipants++;
+        if (hasScreenshare) screenshareParticipants++;
+      }
+    }
+
+    return {
+      activeRooms: this.rooms.size,
+      audioParticipants,
+      webcamParticipants,
+      screenshareParticipants,
+    };
+  }
+
   /**
    * Walk live rooms and gather one measurement sample (#1553). The impure mediasoup
    * boundary (producer counts + recv-transport egress bytes) — fed to MediaMetrics,
@@ -2295,24 +2332,30 @@ export class RoomManager {
     counts: { camera: number; screen: number; audio: number; webcam: number; screenshare: number }
   ): number {
     let video = 0;
+    let hasAudio = false;
+    let hasWebcam = false;
+    let hasScreenshare = false;
     for (const [, entry] of p.producers) {
       switch (entry.source) {
         case 'camera':
           counts.camera++;
-          counts.webcam++;
+          hasWebcam = true;
           video++;
           break;
         case 'screen':
           counts.screen++;
-          counts.screenshare++;
+          hasScreenshare = true;
           video++;
           break;
         case 'mic':
         case 'screen-audio':
-          counts.audio++;
+          hasAudio = true;
           break;
       }
     }
+    if (hasAudio) counts.audio++;
+    if (hasWebcam) counts.webcam++;
+    if (hasScreenshare) counts.screenshare++;
     return video;
   }
 

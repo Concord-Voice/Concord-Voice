@@ -271,6 +271,26 @@ function parsePositiveIntEnv(raw: string | undefined, fallback: number): number 
   return Number.isFinite(n) && n >= 1 ? n : fallback;
 }
 
+function parseOpsMetricsIntervalMs(raw: string | undefined): number {
+  const match = /^(\d+)(ms|s|m)$/.exec((raw || '15s').trim());
+  if (!match) return Number.NaN;
+  const value = Number.parseInt(match[1], 10);
+  const multiplier = match[2] === 'ms' ? 1 : match[2] === 's' ? 1000 : 60_000;
+  return value * multiplier;
+}
+
+const opsMetricsEnabled = process.env.OPS_METRICS_ENABLED?.trim().toLowerCase() === 'true';
+const opsMetricsNodeId = opsMetricsEnabled ? (process.env.OPS_METRICS_NODE_ID || '').trim() : '';
+const opsMetricsSharedSecret = opsMetricsEnabled
+  ? (process.env.OPS_METRICS_SHARED_SECRET || '').trim()
+  : '';
+const opsMetricsIntervalMs = opsMetricsEnabled
+  ? parseOpsMetricsIntervalMs(process.env.OPS_METRICS_INTERVAL)
+  : 15_000;
+const opsMetricsRole = opsMetricsEnabled
+  ? (process.env.OPS_METRICS_ROLE || 'local').trim().toLowerCase()
+  : 'local';
+
 export const config = {
   environment: process.env.ENVIRONMENT || 'development',
   port: Number.parseInt(process.env.PORT || '3000', 10),
@@ -304,6 +324,16 @@ export const config = {
 
   // NATS — inter-service messaging (control plane ↔ media plane)
   natsUrl: process.env.NATS_URL || 'nats://localhost:4222',
+
+  // Aggregate-only operations snapshots (#1689). Dormant unless explicitly
+  // enabled; publisher construction lives in index.ts.
+  opsMetrics: {
+    enabled: opsMetricsEnabled,
+    nodeId: opsMetricsNodeId,
+    sharedSecret: opsMetricsSharedSecret,
+    intervalMs: opsMetricsIntervalMs,
+    role: opsMetricsRole,
+  },
 
   // Control plane — authorization checks, voice join validation
   controlPlaneUrl: process.env.CONTROL_PLANE_URL || 'http://localhost:8080',
@@ -381,6 +411,32 @@ if (config.environment === 'production' && config.jwtSecret === DEV_JWT_SECRET) 
       'The default dev secret is not allowed.'
   );
   process.exit(1);
+}
+
+if (config.opsMetrics.enabled) {
+  const problems: string[] = [];
+  if (!/^cvn_[a-z2-7]{16}$/.test(config.opsMetrics.nodeId)) {
+    problems.push('OPS_METRICS_NODE_ID must be an opaque assigned cvn_ token');
+  }
+  if (Buffer.byteLength(config.opsMetrics.sharedSecret, 'utf8') < 32) {
+    problems.push('OPS_METRICS_SHARED_SECRET must be at least 32 bytes');
+  }
+  if (
+    !Number.isFinite(config.opsMetrics.intervalMs) ||
+    config.opsMetrics.intervalMs < 5000 ||
+    config.opsMetrics.intervalMs > 300_000
+  ) {
+    problems.push('OPS_METRICS_INTERVAL must be from 5s through 5m');
+  }
+  if (config.opsMetrics.role === 'aggregator') {
+    problems.push('OPS_METRICS_ROLE=aggregator is reserved until #1504');
+  } else if (config.opsMetrics.role !== 'local') {
+    problems.push('OPS_METRICS_ROLE must be local');
+  }
+  if (problems.length > 0) {
+    console.error(`FATAL: invalid operations metrics config: ${problems.join('; ')}`);
+    process.exit(1);
+  }
 }
 
 // Production safety guard — reject wildcard '*' in ALLOWED_ORIGINS when paired

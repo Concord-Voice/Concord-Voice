@@ -19,6 +19,7 @@ const jsonCodec = JSONCodec();
 
 export class NatsService {
   private nc: NatsConnection | null = null;
+  private connected = false;
   private readonly subscriptions: Array<{ unsubscribe(): void }> = [];
 
   async connect(): Promise<void> {
@@ -30,6 +31,7 @@ export class NatsService {
         maxReconnectAttempts: -1, // retry forever
         reconnectTimeWait: 2000,
       });
+      this.connected = true;
 
       logger.info('Connected to NATS', { server: config.natsUrl });
 
@@ -37,26 +39,34 @@ export class NatsService {
       (async () => {
         if (!this.nc) return;
         for await (const status of this.nc.status()) {
+          if (status.type === 'disconnect' || status.type === 'reconnecting') {
+            this.connected = false;
+          } else if (status.type === 'reconnect') {
+            this.connected = true;
+          }
           logger.info('NATS status', { type: status.type, data: status.data });
         }
       })().catch(() => {});
     } catch (err) {
+      this.connected = false;
       logger.error('Failed to connect to NATS', { error: err, server: config.natsUrl });
       throw err;
     }
   }
 
   /** Publish a JSON message to a NATS subject */
-  publish(subject: string, data: Record<string, unknown>): void {
-    if (!this.nc) {
+  publish(subject: string, data: Record<string, unknown>): boolean {
+    if (!this.nc || !this.connected || this.nc.isClosed()) {
       logger.warn('NATS not connected, dropping message', { subject });
-      return;
+      return false;
     }
 
     try {
       this.nc.publish(subject, jsonCodec.encode(data));
+      return true;
     } catch (err) {
       logger.error('Failed to publish NATS message', { subject, error: err });
+      return false;
     }
   }
 
@@ -159,8 +169,10 @@ export class NatsService {
     this.subscriptions.length = 0;
 
     if (this.nc) {
+      this.connected = false;
       await this.nc.drain();
       logger.info('NATS connection closed');
+      this.nc = null;
     }
   }
 }

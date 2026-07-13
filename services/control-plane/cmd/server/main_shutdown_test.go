@@ -9,7 +9,7 @@ import (
 func TestShutdownControlPlaneWaitsForHTTPDrain(t *testing.T) {
 	httpStarted := make(chan struct{})
 	releaseHTTP := make(chan struct{})
-	events := make(chan string, 3)
+	events := make(chan string, 4)
 	result := make(chan error, 1)
 
 	go func() {
@@ -21,6 +21,7 @@ func TestShutdownControlPlaneWaitsForHTTPDrain(t *testing.T) {
 				return nil
 			},
 			func() { events <- "hub" },
+			func() error { events <- "metrics"; return nil },
 			func() { events <- "nats" },
 		)
 	}()
@@ -37,8 +38,8 @@ func TestShutdownControlPlaneWaitsForHTTPDrain(t *testing.T) {
 		t.Fatalf("shutdownControlPlane returned error: %v", err)
 	}
 
-	got := []string{<-events, <-events, <-events}
-	want := []string{"http", "hub", "nats"}
+	got := []string{<-events, <-events, <-events, <-events}
+	want := []string{"http", "hub", "metrics", "nats"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("shutdown order = %v, want %v", got, want)
 	}
@@ -46,7 +47,7 @@ func TestShutdownControlPlaneWaitsForHTTPDrain(t *testing.T) {
 
 func TestShutdownControlPlaneCleansUpAfterHTTPError(t *testing.T) {
 	wantErr := errors.New("HTTP drain failed")
-	events := make([]string, 0, 3)
+	events := make([]string, 0, 4)
 
 	gotErr := shutdownControlPlane(
 		func() error {
@@ -54,13 +55,14 @@ func TestShutdownControlPlaneCleansUpAfterHTTPError(t *testing.T) {
 			return wantErr
 		},
 		func() { events = append(events, "hub") },
+		func() error { events = append(events, "metrics"); return nil },
 		func() { events = append(events, "nats") },
 	)
 
 	if !errors.Is(gotErr, wantErr) {
 		t.Fatalf("shutdownControlPlane error = %v, want %v", gotErr, wantErr)
 	}
-	wantEvents := []string{"http", "hub", "nats"}
+	wantEvents := []string{"http", "hub", "metrics", "nats"}
 	if !reflect.DeepEqual(events, wantEvents) {
 		t.Fatalf("shutdown order = %v, want %v", events, wantEvents)
 	}

@@ -1,0 +1,25 @@
+FROM golang:1.26.5-alpine AS builder
+
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/ops-agent ./cmd/ops-agent
+
+FROM scratch
+
+LABEL org.opencontainers.image.source="https://github.com/Concord-Voice/Concord-Voice-Alpha"
+LABEL org.opencontainers.image.description="Concord Voice isolated operations metrics agent"
+LABEL org.opencontainers.image.licenses="LicenseRef-CVSL-1.0"
+
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/ops-agent /ops-agent
+
+# Root is required for the isolated host Docker socket; Compose drops all capabilities.
+USER 0:0
+
+ENTRYPOINT ["/ops-agent"]

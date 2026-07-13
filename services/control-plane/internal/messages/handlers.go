@@ -16,6 +16,7 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/klipy"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
@@ -59,6 +60,12 @@ type Handler struct {
 	hub      *websocket.Hub
 	resolver *rbac.Resolver
 	tiers    entitlements.TierResolver // user-axis tier resolution (#1555 search-depth gate)
+	ops      OpsCounter
+}
+
+// OpsCounter is the optional aggregate counter sink used after committed writes.
+type OpsCounter interface {
+	Increment(opsmetrics.MetricKey)
 }
 
 type epochQueryRower interface {
@@ -66,14 +73,18 @@ type epochQueryRower interface {
 }
 
 // NewHandler creates a new message handler
-func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, tiers entitlements.TierResolver) *Handler {
-	return &Handler{
+func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, tiers entitlements.TierResolver, opsCounters ...OpsCounter) *Handler {
+	handler := &Handler{
 		db:       db,
 		log:      log,
 		hub:      hub,
 		resolver: resolver,
 		tiers:    tiers,
 	}
+	if len(opsCounters) > 0 {
+		handler.ops = opsCounters[0]
+	}
+	return handler
 }
 
 // SendMessageRequest represents a request to send a message.
@@ -591,6 +602,9 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		h.log.Error("Failed to create message", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendMessage})
 		return
+	}
+	if h.ops != nil {
+		h.ops.Increment(opsmetrics.MetricChannelMessagesTotal)
 	}
 
 	h.log.Info("Message sent", "message_id", messageID, "channel_id", req.ChannelID, "user_id", userID)

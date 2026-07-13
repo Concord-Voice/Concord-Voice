@@ -1,0 +1,155 @@
+-- Migration: ops_metrics (up)
+-- Purpose: Store aggregate-only operations samples and hourly rollups.
+
+CREATE TABLE ops_metric_samples (
+    node_id TEXT NOT NULL,
+    metric_key TEXT NOT NULL,
+    ts TIMESTAMPTZ NOT NULL,
+    value DOUBLE PRECISION NOT NULL,
+    CONSTRAINT ops_metric_samples_pkey PRIMARY KEY (node_id, metric_key, ts),
+    CONSTRAINT ops_metric_samples_node_id_check CHECK (node_id ~ '^cvn_[a-z2-7]{16}$'),
+    CONSTRAINT ops_metric_samples_metric_key_check CHECK (metric_key IN (
+        'host_cpu_percent',
+        'host_disk_percent',
+        'host_load_1m',
+        'host_memory_percent',
+        'service_control_plane_running',
+        'service_control_plane_healthy',
+        'service_control_plane_cpu_percent',
+        'service_control_plane_memory_bytes',
+        'service_media_plane_running',
+        'service_media_plane_healthy',
+        'service_media_plane_cpu_percent',
+        'service_media_plane_memory_bytes',
+        'service_postgres_running',
+        'service_postgres_healthy',
+        'service_postgres_cpu_percent',
+        'service_postgres_memory_bytes',
+        'service_redis_running',
+        'service_redis_healthy',
+        'service_redis_cpu_percent',
+        'service_redis_memory_bytes',
+        'service_nats_running',
+        'service_nats_healthy',
+        'service_nats_cpu_percent',
+        'service_nats_memory_bytes',
+        'service_minio_running',
+        'service_minio_healthy',
+        'service_minio_cpu_percent',
+        'service_minio_memory_bytes',
+        'service_coturn_running',
+        'service_coturn_healthy',
+        'service_coturn_cpu_percent',
+        'service_coturn_memory_bytes',
+        'http_requests_total',
+        'http_client_errors_total',
+        'http_server_errors_total',
+        'websocket_connections_current',
+        'channel_messages_total',
+        'dm_messages_total',
+        'ops_snapshot_rejections_total',
+        'media_rooms_current',
+        'media_participants_audio_current',
+        'media_participants_webcam_current',
+        'media_participants_screenshare_current',
+        'media_camera_publishers_current',
+        'media_screen_publishers_current',
+        'media_peak_video_publishers_per_room',
+        'media_egress_current_bps',
+        'media_egress_peak_bps',
+        'media_egress_cumulative_bytes',
+        'media_participant_hours_audio',
+        'media_participant_hours_webcam',
+        'media_participant_hours_screenshare'
+    )),
+    CONSTRAINT ops_metric_samples_value_finite_check CHECK (
+        value NOT IN (
+            'NaN'::DOUBLE PRECISION,
+            'Infinity'::DOUBLE PRECISION,
+            '-Infinity'::DOUBLE PRECISION
+        )
+    )
+);
+
+CREATE INDEX idx_ops_metric_samples_ts_brin
+    ON ops_metric_samples USING BRIN (ts);
+
+CREATE TABLE ops_metric_rollups (
+    node_id TEXT NOT NULL,
+    metric_key TEXT NOT NULL,
+    bucket_start TIMESTAMPTZ NOT NULL,
+    min_value DOUBLE PRECISION NOT NULL,
+    max_value DOUBLE PRECISION NOT NULL,
+    avg_value DOUBLE PRECISION NOT NULL,
+    last_value DOUBLE PRECISION NOT NULL,
+    sample_count INTEGER NOT NULL,
+    CONSTRAINT ops_metric_rollups_pkey PRIMARY KEY (node_id, metric_key, bucket_start),
+    CONSTRAINT ops_metric_rollups_node_id_check CHECK (node_id ~ '^cvn_[a-z2-7]{16}$'),
+    CONSTRAINT ops_metric_rollups_metric_key_check CHECK (metric_key IN (
+        'host_cpu_percent',
+        'host_disk_percent',
+        'host_load_1m',
+        'host_memory_percent',
+        'service_control_plane_running',
+        'service_control_plane_healthy',
+        'service_control_plane_cpu_percent',
+        'service_control_plane_memory_bytes',
+        'service_media_plane_running',
+        'service_media_plane_healthy',
+        'service_media_plane_cpu_percent',
+        'service_media_plane_memory_bytes',
+        'service_postgres_running',
+        'service_postgres_healthy',
+        'service_postgres_cpu_percent',
+        'service_postgres_memory_bytes',
+        'service_redis_running',
+        'service_redis_healthy',
+        'service_redis_cpu_percent',
+        'service_redis_memory_bytes',
+        'service_nats_running',
+        'service_nats_healthy',
+        'service_nats_cpu_percent',
+        'service_nats_memory_bytes',
+        'service_minio_running',
+        'service_minio_healthy',
+        'service_minio_cpu_percent',
+        'service_minio_memory_bytes',
+        'service_coturn_running',
+        'service_coturn_healthy',
+        'service_coturn_cpu_percent',
+        'service_coturn_memory_bytes',
+        'http_requests_total',
+        'http_client_errors_total',
+        'http_server_errors_total',
+        'websocket_connections_current',
+        'channel_messages_total',
+        'dm_messages_total',
+        'ops_snapshot_rejections_total',
+        'media_rooms_current',
+        'media_participants_audio_current',
+        'media_participants_webcam_current',
+        'media_participants_screenshare_current',
+        'media_camera_publishers_current',
+        'media_screen_publishers_current',
+        'media_peak_video_publishers_per_room',
+        'media_egress_current_bps',
+        'media_egress_peak_bps',
+        'media_egress_cumulative_bytes',
+        'media_participant_hours_audio',
+        'media_participant_hours_webcam',
+        'media_participant_hours_screenshare'
+    )),
+    CONSTRAINT ops_metric_rollups_bucket_start_check CHECK (
+        bucket_start = date_trunc('hour', bucket_start, 'UTC')
+    ),
+    CONSTRAINT ops_metric_rollups_values_finite_check CHECK (
+        min_value NOT IN ('NaN'::DOUBLE PRECISION, 'Infinity'::DOUBLE PRECISION, '-Infinity'::DOUBLE PRECISION)
+        AND max_value NOT IN ('NaN'::DOUBLE PRECISION, 'Infinity'::DOUBLE PRECISION, '-Infinity'::DOUBLE PRECISION)
+        AND avg_value NOT IN ('NaN'::DOUBLE PRECISION, 'Infinity'::DOUBLE PRECISION, '-Infinity'::DOUBLE PRECISION)
+        AND last_value NOT IN ('NaN'::DOUBLE PRECISION, 'Infinity'::DOUBLE PRECISION, '-Infinity'::DOUBLE PRECISION)
+    ),
+    CONSTRAINT ops_metric_rollups_value_order_check CHECK (
+        min_value <= avg_value AND avg_value <= max_value
+    ),
+    CONSTRAINT ops_metric_rollups_sample_count_check CHECK (sample_count > 0)
+);

@@ -83,7 +83,7 @@ func setupRecoverySMTPFailureTS(t *testing.T, closeDelay time.Duration) *testhel
 		WebAuthnRPOrigins: []string{"http://localhost:3001"},
 	}
 
-	router, hub, natsClient := api.NewRouter(
+	router, hub, natsClient, opsRuntime := api.NewRouter(
 		db,
 		redisClient,
 		nil,
@@ -94,6 +94,7 @@ func setupRecoverySMTPFailureTS(t *testing.T, closeDelay time.Duration) *testhel
 	if natsClient != nil {
 		t.Cleanup(func() { natsClient.Close() })
 	}
+	t.Cleanup(func() { require.NoError(t, opsRuntime.Stop(context.Background())) })
 	t.Cleanup(func() { hub.Shutdown() })
 	t.Cleanup(func() {
 		redisCleanup()

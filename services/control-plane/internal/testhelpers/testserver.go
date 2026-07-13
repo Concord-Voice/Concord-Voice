@@ -107,10 +107,15 @@ func SetupTestServer(t *testing.T) *TestServer {
 	logBuf := &SyncBuffer{}
 	log := logger.NewWithWriter(io.MultiWriter(os.Stdout, logBuf))
 
-	router, hub, natsClient := api.NewRouter(db, redisClient, nil, cfg, nil, log)
+	router, hub, natsClient, opsRuntime := api.NewRouter(db, redisClient, nil, cfg, nil, log)
 	if natsClient != nil {
 		t.Cleanup(func() { natsClient.Close() })
 	}
+	t.Cleanup(func() {
+		if err := opsRuntime.Stop(context.Background()); err != nil {
+			t.Errorf("stop operations metrics runtime: %v", err)
+		}
+	})
 
 	t.Cleanup(func() {
 		redisCleanup()

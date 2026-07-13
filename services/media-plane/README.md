@@ -1,5 +1,13 @@
 # Media Plane Service
 
+## Aggregate operations metrics
+
+When enabled, the media plane publishes a fixed scalar snapshot of aggregate
+room, participant, publisher, egress, and participant-hour counters. It sends no
+room/user/server IDs or arbitrary labels. Snapshots use the signed v1 envelope
+and fixed `ops.metrics.media.v1` NATS subject; failed publication drops one
+interval without buffering or blocking media traffic. See ADR-0030.
+
 **Status:** ✅ IMPLEMENTED (Phase 1C - Complete)
 
 WebRTC Selective Forwarding Unit (SFU) for routing voice and video media in Concord Voice.

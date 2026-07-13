@@ -18,6 +18,7 @@ import {
 } from './middleware/auth.js';
 import type { AuthenticatedSocketData } from './middleware/auth.js';
 import { NatsService } from './lib/nats.js';
+import { OpsMetricsPublisher } from './lib/opsMetricsPublisher.js';
 import { RedisService } from './lib/redis.js';
 import { createExpressErrorHandler } from './lib/expressErrorHandler.js';
 import { createOriginGate } from './lib/originGate.js';
@@ -127,6 +128,16 @@ async function main() {
   const roomManager = new RoomManager(mediasoupService);
   // #1553 measurement counters — accumulated from heartbeat samples, surfaced on /health.
   const mediaMetrics = new MediaMetrics();
+  const opsMetricsPublisher = new OpsMetricsPublisher({
+    enabled: config.opsMetrics.enabled,
+    nodeId: config.opsMetrics.nodeId,
+    secret: config.opsMetrics.sharedSecret,
+    intervalMs: config.opsMetrics.intervalMs,
+    natsService,
+    roomManager,
+    mediaMetrics,
+  });
+  opsMetricsPublisher.start();
 
   // Wire up room events
   roomManager.onEvent((event) => {
@@ -1037,12 +1048,15 @@ async function main() {
         timestamp: new Date().toISOString(),
       });
     }
-    // #1553 measurement: sample live rooms, accumulate, emit aggregate-only ops log
-    // (structural metadata only — no userIds/PII/keys, per the logging-discipline rule).
+    // #1553 measurement: sample here only when the ops publisher is disabled. When it is
+    // enabled, that publisher owns sampling so participant-hours and egress are not counted
+    // twice. The heartbeat still emits the latest aggregate-only ops log.
     // The try/catch keeps the async heartbeat from ever throwing into the timer (degrade,
     // don't crash); the metricsSampling guard skips a tick if the prior sampling is still
     // running so two ticks never interleave ingest() on shared state (#1553 review).
-    if (!metricsSampling) {
+    if (config.opsMetrics.enabled) {
+      logger.info('media-metrics', mediaMetrics.getSnapshot());
+    } else if (!metricsSampling) {
       metricsSampling = true;
       try {
         const sample = await roomManager.collectMetricsSample();
@@ -1070,6 +1084,7 @@ async function main() {
     logger.info('Shutting down gracefully');
     clearInterval(epochSyncInterval);
     clearInterval(roomHeartbeatInterval);
+    await opsMetricsPublisher.stop();
 
     // Close all rooms first (notifies participants, publishes NATS events)
     await roomManager.closeAll();

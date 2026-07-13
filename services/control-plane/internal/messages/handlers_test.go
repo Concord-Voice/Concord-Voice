@@ -1,17 +1,119 @@
 package messages_test
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/gin-gonic/gin"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/messages"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
+	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func setupTS(t *testing.T) *testhelpers.TestServer {
 	t.Helper()
 	return testhelpers.SetupTestServer(t)
+}
+
+type opsMessageCounterSpy struct {
+	mu     sync.Mutex
+	counts map[opsmetrics.MetricKey]int
+}
+
+func (s *opsMessageCounterSpy) Increment(key opsmetrics.MetricKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.counts == nil {
+		s.counts = make(map[opsmetrics.MetricKey]int)
+	}
+	s.counts[key]++
+}
+
+func (s *opsMessageCounterSpy) count(key opsmetrics.MetricKey) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.counts[key]
+}
+
+func exerciseOpsMessageHandler(t *testing.T, ts *testhelpers.TestServer, counter messages.OpsCounter, userID string, body map[string]interface{}) *httptest.ResponseRecorder {
+	t.Helper()
+	log := logger.New("test")
+	resolver := rbac.NewResolver(ts.DB, rbac.NewPermissionCache(ts.Redis), log)
+	handler := messages.NewHandler(ts.DB, log, ts.Hub, resolver, nil, counter)
+	router := gin.New()
+	router.POST("/messages", func(c *gin.Context) {
+		c.Set("user_id", userID)
+		handler.SendMessage(c)
+	})
+	payload, err := json.Marshal(body)
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodPost, "/messages", bytes.NewReader(payload))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
+
+func TestOpsMessageCounterRESTCountsOnlySuccessfulInsert(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "opscounterrest")
+	serverID := ts.CreateTestServer(t, user.ID, "Ops Counter REST")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	counter := &opsMessageCounterSpy{}
+
+	response := exerciseOpsMessageHandler(t, ts, counter, user.ID, map[string]interface{}{
+		"channel_id": channelID,
+		"content":    testhelpers.ValidCiphertext(),
+	})
+
+	require.Equal(t, http.StatusCreated, response.Code)
+	require.Equal(t, 1, counter.count(opsmetrics.MetricChannelMessagesTotal))
+}
+
+func TestOpsMessageCounterRESTSkipsValidationAndInsertFailures(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "opscounterrestfail")
+	serverID := ts.CreateTestServer(t, user.ID, "Ops Counter REST Failure")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	counter := &opsMessageCounterSpy{}
+
+	invalidResponse := exerciseOpsMessageHandler(t, ts, counter, user.ID, map[string]interface{}{
+		"channel_id": channelID,
+		"content":    "",
+	})
+	require.Equal(t, http.StatusBadRequest, invalidResponse.Code)
+
+	_, err := ts.DB.Exec(`
+		CREATE FUNCTION test_fail_ops_message_insert() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'forced message insert failure'; END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER test_fail_ops_message_insert
+		BEFORE INSERT ON messages FOR EACH ROW EXECUTE FUNCTION test_fail_ops_message_insert();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := ts.DB.Exec(`
+			DROP TRIGGER IF EXISTS test_fail_ops_message_insert ON messages;
+			DROP FUNCTION IF EXISTS test_fail_ops_message_insert();
+		`)
+		require.NoError(t, cleanupErr)
+	})
+
+	failedResponse := exerciseOpsMessageHandler(t, ts, counter, user.ID, map[string]interface{}{
+		"channel_id": channelID,
+		"content":    testhelpers.ValidCiphertext(),
+	})
+	require.Equal(t, http.StatusInternalServerError, failedResponse.Code)
+	require.Zero(t, counter.count(opsmetrics.MetricChannelMessagesTotal))
 }
 
 // Helper: create a full stack and send a message, return the message ID

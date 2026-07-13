@@ -37,6 +37,34 @@ describe('MediaMetrics', () => {
     expect(s.peakConcurrentVideoPublishersPerRoom).toBe(5);
   });
 
+  it('exposes existing measurements as an explicit scalar-only aggregate', () => {
+    m.ingest(
+      sample({
+        publishers: { camera: 4, screen: 1 },
+        activeByKind: { audio: 6, webcam: 4, screenshare: 1 },
+        egressBytesByTransport: new Map([['transport-private-id', 2_000]]),
+        perRoomVideoPublishers: [5],
+      }),
+      10
+    );
+
+    const aggregate = m.getAggregateMetrics();
+
+    expect(aggregate).toEqual({
+      cameraPublishersCurrent: 4,
+      screenPublishersCurrent: 1,
+      peakVideoPublishersPerRoom: 5,
+      egressCurrentBps: 1_600,
+      egressPeakBps: 1_600,
+      egressCumulativeBytes: 2_000,
+      participantHoursAudio: 1 / 60,
+      participantHoursWebcam: 1 / 90,
+      participantHoursScreenshare: 1 / 360,
+    });
+    expect(Object.values(aggregate).every((value) => typeof value === 'number')).toBe(true);
+    expect(JSON.stringify(aggregate)).not.toContain('transport-private-id');
+  });
+
   it('computes egress delta, cumulative bytes, bps and peak; ignores monotonic resets', () => {
     m.ingest(sample({ egressBytesByTransport: new Map([['t1', 1000]]) }), 10);
     expect(m.getSnapshot().egress.cumulativeBytes).toBe(1000);

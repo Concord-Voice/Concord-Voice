@@ -3565,6 +3565,57 @@ describe('RoomManager', () => {
       expect(stats.totalConsumers).toBe(0);
     });
 
+    it('getAggregateCounts returns scalar room and unique participant totals without IDs', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'private-room-1', 'private-user-1', 'sock-1', {
+        username: 'alice',
+      });
+      await joinRoomWithSupportedCrypto(manager, 'private-room-1', 'private-user-2', 'sock-2', {
+        username: 'bob',
+      });
+      await joinRoomWithSupportedCrypto(manager, 'private-room-2', 'private-user-3', 'sock-3', {
+        username: 'charlie',
+      });
+
+      const first = manager.getRoom('private-room-1')!.participants.get('private-user-1')!;
+      first.producers.set('private-mic-id', {
+        producer: createMockProducer({ kind: 'audio' }) as any,
+        source: 'mic',
+        kind: 'audio',
+      });
+      first.producers.set('private-screen-audio-id', {
+        producer: createMockProducer({ kind: 'audio' }) as any,
+        source: 'screen-audio',
+        kind: 'audio',
+      });
+      first.producers.set('private-camera-id', {
+        producer: createMockProducer({ kind: 'video' }) as any,
+        source: 'camera',
+        kind: 'video',
+      });
+      first.producers.set('private-screen-id', {
+        producer: createMockProducer({ kind: 'video' }) as any,
+        source: 'screen',
+        kind: 'video',
+      });
+      const second = manager.getRoom('private-room-1')!.participants.get('private-user-2')!;
+      second.producers.set('private-second-mic-id', {
+        producer: createMockProducer({ kind: 'audio' }) as any,
+        source: 'mic',
+        kind: 'audio',
+      });
+
+      const counts = manager.getAggregateCounts();
+
+      expect(counts).toEqual({
+        activeRooms: 2,
+        audioParticipants: 2,
+        webcamParticipants: 1,
+        screenshareParticipants: 1,
+      });
+      expect(Object.values(counts).every((value) => typeof value === 'number')).toBe(true);
+      expect(JSON.stringify(counts)).not.toMatch(/private-(room|user|mic|camera|screen)/);
+    });
+
     it('collectMetricsSample counts publishers by source and gathers recv-transport egress (#1553)', async () => {
       await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
       const p = manager.getRoom('room-1')!.participants.get('u-1')!;
@@ -3581,6 +3632,11 @@ describe('RoomManager', () => {
       p.producers.set('pm', {
         producer: createMockProducer({ kind: 'audio' }) as any,
         source: 'mic',
+        kind: 'audio',
+      });
+      p.producers.set('psa', {
+        producer: createMockProducer({ kind: 'audio' }) as any,
+        source: 'screen-audio',
         kind: 'audio',
       });
       p.recvTransports.set(

@@ -148,6 +148,7 @@ type Config struct {
 	RedisURL    string
 	JWTSecret   string // #nosec G117 -- False positive: config field name, actual secret loaded from env
 	NATSUrl     string
+	OpsMetrics  OpsMetricsConfig
 
 	// CORS settings
 	AllowedOrigins []string
@@ -306,6 +307,10 @@ type Config struct {
 func Load() (*Config, error) {
 	// Load .env file if it exists (development)
 	_ = godotenv.Load()
+	opsMetrics, err := LoadOpsMetricsConfig()
+	if err != nil {
+		return nil, err
+	}
 
 	cfg := &Config{
 		Environment:           getEnv("ENVIRONMENT", "development"),
@@ -314,6 +319,7 @@ func Load() (*Config, error) {
 		RedisURL:              getEnv("REDIS_URL", defaultDevRedisURL()),
 		JWTSecret:             getEnv("JWT_SECRET", devJWTSecret),
 		NATSUrl:               getEnv("NATS_URL", "nats://localhost:4222"),
+		OpsMetrics:            opsMetrics,
 		MediaPlaneURL:         getEnv("MEDIA_PLANE_URL", "http://localhost:3000"),
 		TURNServerHost:        getEnv("TURN_SERVER_HOST", ""),
 		TURNSecret:            getEnv("TURN_SECRET", ""),

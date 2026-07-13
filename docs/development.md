@@ -399,6 +399,16 @@ lsof -ti:5432 | xargs kill -9
 | `SERVER_VERSION` | `dev` | Advertised server version for capability discovery |
 | `NATS_URL` | `nats://localhost:4222` | NATS connection |
 
+### Operations Metrics (Control Plane, Media Plane, and Ops Agent)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPS_METRICS_ENABLED` | `false` | Enables the aggregate-only metrics pipeline |
+| `OPS_METRICS_NODE_ID` | (empty) | Opaque assigned `cvn_` node token; required when enabled |
+| `OPS_METRICS_SHARED_SECRET` | (empty) | Snapshot-signing secret of at least 32 bytes; required when enabled |
+| `OPS_METRICS_INTERVAL` | `15s` | Sampling interval from 5 seconds through 5 minutes |
+| `OPS_METRICS_ROLE` | `local` | Local storage role; `aggregator` is reserved for #1504 |
+
 ### Media Plane
 
 | Variable | Default | Description |

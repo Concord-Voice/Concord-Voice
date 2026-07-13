@@ -1,5 +1,14 @@
 # Control Plane Service
 
+## Aggregate operations metrics
+
+When `OPS_METRICS_ENABLED=true`, the control plane verifies signed host/media
+snapshots from fixed NATS subjects and stores only closed-catalog numeric values.
+Raw samples retain 24 hours and hourly rollups retain eight days. Startup or
+collection failure does not take down normal API traffic. Host and Docker reads
+belong to the separate `cmd/ops-agent` binary; the control plane must never mount
+the Docker socket. See ADR-0030.
+
 The control plane handles authentication, authorization, server/channel management, billing, and user presence for Concord Voice.
 
 ## Tech Stack

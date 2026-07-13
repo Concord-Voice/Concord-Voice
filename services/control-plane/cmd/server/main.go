@@ -102,7 +102,7 @@ func main() {
 	liveSpa := config.NewLiveSpaConfig(cfg, cfg.SpaConfigFile, 30*time.Second)
 
 	// Initialize router (starts hub, connects NATS, subscribes to voice events)
-	router, hub, natsClient := api.NewRouter(db, redisClient, storageClient, cfg, liveSpa, log)
+	router, hub, natsClient, opsMetricsRuntime := api.NewRouter(db, redisClient, storageClient, cfg, liveSpa, log)
 
 	// Start background cleanup job (reaps expired tokens, stale sessions, orphaned presence)
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
@@ -184,6 +184,7 @@ func main() {
 	shutdownErr := shutdownControlPlane(
 		func() error { return srv.Shutdown(ctx) },
 		func() { hub.Shutdown() },
+		func() error { return opsMetricsRuntime.Stop(ctx) },
 		func() {
 			if natsClient != nil {
 				natsClient.Close()
@@ -197,9 +198,10 @@ func main() {
 	log.Info("Server exited")
 }
 
-func shutdownControlPlane(shutdownHTTP func() error, shutdownHub, closeNATS func()) error {
+func shutdownControlPlane(shutdownHTTP func() error, shutdownHub func(), shutdownMetrics func() error, closeNATS func()) error {
 	shutdownErr := shutdownHTTP()
 	shutdownHub()
+	shutdownErr = errors.Join(shutdownErr, shutdownMetrics())
 	closeNATS()
 	return shutdownErr
 }

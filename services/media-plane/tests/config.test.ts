@@ -43,6 +43,11 @@ describe('config', () => {
     delete process.env.NUM_WORKERS;
     delete process.env.RTC_MIN_PORT;
     delete process.env.RTC_MAX_PORT;
+    delete process.env.OPS_METRICS_ENABLED;
+    delete process.env.OPS_METRICS_NODE_ID;
+    delete process.env.OPS_METRICS_SHARED_SECRET;
+    delete process.env.OPS_METRICS_INTERVAL;
+    delete process.env.OPS_METRICS_ROLE;
   });
 
   // ── Audio Quality Tiers ─────────────────────────────────────────────
@@ -131,6 +136,17 @@ describe('config', () => {
       const { config } = await loadConfig();
       expect(config.allowedOrigins).toEqual(['http://localhost:3001', 'http://localhost:3002']);
     });
+
+    it('keeps operations metrics dormant by default', async () => {
+      const { config } = await loadConfig();
+      expect(config.opsMetrics).toEqual({
+        enabled: false,
+        nodeId: '',
+        sharedSecret: '',
+        intervalMs: 15_000,
+        role: 'local',
+      });
+    });
   });
 
   // ── Env Overrides ───────────────────────────────────────────────────
@@ -155,6 +171,68 @@ describe('config', () => {
     it('applies NUM_WORKERS override', async () => {
       const { config } = await loadConfig({ NUM_WORKERS: '8' });
       expect(config.mediasoup.numWorkers).toBe(8);
+    });
+
+    it('loads enabled operations metrics settings', async () => {
+      const { config } = await loadConfig({
+        OPS_METRICS_ENABLED: 'true',
+        OPS_METRICS_NODE_ID: 'cvn_aaaaaaaaaaaaaaaa',
+        OPS_METRICS_SHARED_SECRET: '0123456789abcdef0123456789abcdef', // pragma: allowlist secret
+        OPS_METRICS_INTERVAL: '30s',
+      });
+      expect(config.opsMetrics).toEqual({
+        enabled: true,
+        nodeId: 'cvn_aaaaaaaaaaaaaaaa',
+        sharedSecret: '0123456789abcdef0123456789abcdef', // pragma: allowlist secret
+        intervalMs: 30_000,
+        role: 'local',
+      });
+    });
+  });
+
+  describe('operations metrics guard', () => {
+    it.each([
+      {
+        name: 'missing settings',
+        env: { OPS_METRICS_ENABLED: 'true' },
+      },
+      {
+        name: 'hostname node id',
+        env: {
+          OPS_METRICS_ENABLED: 'true',
+          OPS_METRICS_NODE_ID: 'media.concordvoice.chat',
+          OPS_METRICS_SHARED_SECRET: '0123456789abcdef0123456789abcdef', // pragma: allowlist secret
+        },
+      },
+      {
+        name: 'short secret',
+        env: {
+          OPS_METRICS_ENABLED: 'true',
+          OPS_METRICS_NODE_ID: 'cvn_aaaaaaaaaaaaaaaa',
+          OPS_METRICS_SHARED_SECRET: 'short', // pragma: allowlist secret
+        },
+      },
+      {
+        name: 'interval outside bounds',
+        env: {
+          OPS_METRICS_ENABLED: 'true',
+          OPS_METRICS_NODE_ID: 'cvn_aaaaaaaaaaaaaaaa',
+          OPS_METRICS_SHARED_SECRET: '0123456789abcdef0123456789abcdef', // pragma: allowlist secret
+          OPS_METRICS_INTERVAL: '4s',
+        },
+      },
+      {
+        name: 'reserved aggregator role',
+        env: {
+          OPS_METRICS_ENABLED: 'true',
+          OPS_METRICS_NODE_ID: 'cvn_aaaaaaaaaaaaaaaa',
+          OPS_METRICS_SHARED_SECRET: '0123456789abcdef0123456789abcdef', // pragma: allowlist secret
+          OPS_METRICS_ROLE: 'aggregator',
+        },
+      },
+    ])('fails closed for $name', async ({ env }) => {
+      await loadConfig(env);
+      expect(process.exit).toHaveBeenCalledWith(1);
     });
   });
 

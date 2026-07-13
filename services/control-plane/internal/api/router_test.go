@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -68,4 +69,22 @@ func TestHealthEndpoint(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfigureOpsMetricsAndRecoveryCountsRecoveredPanics(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	counters := configureOpsMetricsAndRecovery(router, true)
+	router.GET("/panic", func(*gin.Context) { panic("forced panic") })
+
+	response := httptest.NewRecorder()
+	require.NotPanics(t, func() {
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/panic", nil))
+	})
+
+	require.Equal(t, http.StatusInternalServerError, response.Code)
+	snapshot := counters.Snapshot()
+	require.Equal(t, 1.0, snapshot[opsmetrics.MetricHTTPRequestsTotal])
+	require.Equal(t, 1.0, snapshot[opsmetrics.MetricHTTPServerErrorsTotal])
+	require.Equal(t, uint64(1), counters.RouteSnapshot()["/panic"])
 }
