@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MockBroadcastChannel, createRpcResponder } from '../../helpers/broadcastChannelMock';
+import { resetAllStores } from '../../helpers/store-helpers';
 
 // ── mediasoup-client mock ───────────────────────────────────────────────
 
@@ -84,6 +85,8 @@ const defaultRpcResponses: Record<string, unknown> = {
   action: { success: true },
   'pip-ready': { success: true, pausedCount: 0 },
   'pip-closing': { success: true },
+  'close-consumer': { success: true },
+  'close-recv-transport': { success: true },
 };
 
 /** Set up auto-responder on the client's broadcast channel */
@@ -92,6 +95,84 @@ function setupAutoResponder(overrides: Record<string, unknown> = {}): void {
   if (ch) {
     ch.autoResponder = createRpcResponder({ ...defaultRpcResponses, ...overrides });
   }
+}
+
+interface CleanupResponderOptions {
+  consumerIds?: string[];
+  consumerErrors?: Set<string>;
+  consumerTimeouts?: Set<string>;
+  transportError?: string;
+}
+
+function setupCleanupResponder(options: CleanupResponderOptions = {}): MockBroadcastChannel {
+  const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
+  if (!ch) throw new Error('No PiP BroadcastChannel');
+
+  const consumerIds = options.consumerIds ?? ['consumer-1'];
+  let consumeIndex = 0;
+
+  ch.autoResponder = (data: unknown) => {
+    const msg = data as {
+      kind?: string;
+      id?: string;
+      method?: string;
+      params?: { consumerId?: string };
+    };
+    if (msg.kind !== 'rpc-request' || !msg.id || !msg.method) return undefined;
+
+    if (msg.method === 'consume') {
+      const consumerId = consumerIds[consumeIndex++] ?? consumerIds.at(-1) ?? 'consumer-1';
+      return {
+        kind: 'rpc-response',
+        id: msg.id,
+        result: {
+          consumerId,
+          producerId: 'producer-' + consumeIndex,
+          kind: 'audio',
+          rtpParameters: { codecs: [], headerExtensions: [], encodings: [] },
+        },
+      };
+    }
+
+    if (msg.method === 'close-consumer') {
+      const consumerId = msg.params?.consumerId ?? '';
+      if (options.consumerTimeouts?.has(consumerId)) return undefined;
+      if (options.consumerErrors?.has(consumerId)) {
+        return { kind: 'rpc-response', id: msg.id, error: 'consumer cleanup rejected' };
+      }
+    }
+
+    if (msg.method === 'close-recv-transport' && options.transportError) {
+      return { kind: 'rpc-response', id: msg.id, error: options.transportError };
+    }
+
+    const result = defaultRpcResponses[msg.method];
+    if (result === undefined) {
+      return { kind: 'rpc-response', id: msg.id, error: 'No mock for ' + msg.method };
+    }
+    return { kind: 'rpc-response', id: msg.id, result };
+  };
+
+  return ch;
+}
+
+function cleanupRequests(ch: MockBroadcastChannel): Array<{
+  method: string;
+  params: Record<string, string>;
+}> {
+  return ch.posted.filter(
+    (
+      message
+    ): message is { kind: 'rpc-request'; method: string; params: Record<string, string> } => {
+      const method = (message as { method?: string }).method;
+      return (
+        (message as { kind?: string }).kind === 'rpc-request' &&
+        (method === 'pip-closing' ||
+          method === 'close-consumer' ||
+          method === 'close-recv-transport')
+      );
+    }
+  );
 }
 
 // Mock MediaStream
@@ -113,11 +194,25 @@ describe('PipVoiceClient', () => {
   let savedMediaStream: unknown;
 
   beforeEach(() => {
+    resetAllStores();
     vi.useFakeTimers();
     MockBroadcastChannel.install();
     savedMediaStream = globalThis.MediaStream;
     (globalThis as any).MediaStream = MockMediaStream;
     vi.clearAllMocks();
+    mockTransportConsume
+      .mockReset()
+      .mockImplementation(
+        async ({ id, producerId, kind }: { id: string; producerId: string; kind: string }) => ({
+          id,
+          producerId,
+          kind,
+          track: { id: 'track-' + id, kind },
+          close: mockConsumerClose,
+          on: mockConsumerOn,
+        })
+      );
+    mockConsumerClose.mockReset();
   });
 
   afterEach(async () => {
@@ -449,6 +544,50 @@ describe('PipVoiceClient', () => {
   // ── dispose() ───────────────────────────────────────────────────────
 
   describe('dispose()', () => {
+    it('finalizes locally without cleanup RPC timeouts after voice ends', async () => {
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder();
+      await client.init();
+      await client.consume('prod-1', 'mic', 'user-1');
+
+      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip')!;
+      ch.autoResponder = null;
+      ch.simulateMessage({ kind: 'broadcast', type: 'voice-ended' });
+
+      const disposePromise = client.dispose();
+      const pendingTimers = vi.getTimerCount();
+      await vi.runAllTimersAsync();
+      await disposePromise;
+
+      expect(pendingTimers).toBe(0);
+      expect(cleanupRequests(ch)).toEqual([]);
+      expect(mockConsumerClose).toHaveBeenCalledOnce();
+      expect(mockTransportClose).toHaveBeenCalledOnce();
+    });
+
+    it('cancels an in-flight cleanup timeout when voice ends during disposal', async () => {
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder();
+      await client.init();
+      await client.consume('prod-1', 'mic', 'user-1');
+
+      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip')!;
+      ch.autoResponder = null;
+
+      const disposePromise = client.dispose();
+      expect(cleanupRequests(ch).map((request) => request.method)).toEqual(['pip-closing']);
+
+      ch.simulateMessage({ kind: 'broadcast', type: 'voice-ended' });
+      const pendingTimers = vi.getTimerCount();
+      await vi.runAllTimersAsync();
+      await disposePromise;
+
+      expect(pendingTimers).toBe(0);
+      expect(cleanupRequests(ch).map((request) => request.method)).toEqual(['pip-closing']);
+      expect(mockConsumerClose).toHaveBeenCalledOnce();
+      expect(mockTransportClose).toHaveBeenCalledOnce();
+    });
+
     it('sends pip-closing RPC', async () => {
       client = new PipVoiceClient('test-pip');
       setupAutoResponder();
@@ -462,6 +601,226 @@ describe('PipVoiceClient', () => {
         (m: any) => m.kind === 'rpc-request' && m.method === 'pip-closing'
       );
       expect(closingMsg).toBeDefined();
+    });
+
+    it('retains the server receive transport id and closes owned consumers before the transport', async () => {
+      client = new PipVoiceClient('test-pip');
+      const ch = setupCleanupResponder();
+      await client.init();
+      await client.consume('prod-1', 'mic', 'user-1');
+
+      await client.dispose();
+
+      expect(cleanupRequests(ch)).toEqual([
+        expect.objectContaining({ method: 'pip-closing' }),
+        {
+          kind: 'rpc-request',
+          id: expect.any(String),
+          pipId: 'test-pip',
+          method: 'close-consumer',
+          params: { consumerId: 'consumer-1' },
+        },
+        {
+          kind: 'rpc-request',
+          id: expect.any(String),
+          pipId: 'test-pip',
+          method: 'close-recv-transport',
+          params: { transportId: 'transport-1' },
+        },
+      ]);
+    });
+
+    it('closes a receive transport whose acknowledgement arrives after disposal starts', async () => {
+      client = new PipVoiceClient('test-pip');
+      const ch = MockBroadcastChannel.instances.find((instance) => instance.name === 'concord-pip');
+      if (!ch) throw new Error('No PiP BroadcastChannel');
+
+      ch.autoResponder = (data: unknown) => {
+        const msg = data as { kind?: string; id?: string; method?: string };
+        if (msg.kind !== 'rpc-request' || !msg.id || !msg.method) return undefined;
+        if (msg.method === 'create-recv-transport') return undefined;
+        return {
+          kind: 'rpc-response',
+          id: msg.id,
+          result: defaultRpcResponses[msg.method],
+        };
+      };
+
+      const initPromise = client.init().catch((err: Error) => err);
+      await vi.waitFor(() => {
+        expect(
+          ch.posted.some(
+            (message: any) =>
+              message.kind === 'rpc-request' && message.method === 'create-recv-transport'
+          )
+        ).toBe(true);
+      });
+      const createRequest = ch.posted.find(
+        (message: any) =>
+          message.kind === 'rpc-request' && message.method === 'create-recv-transport'
+      ) as { id: string };
+
+      const disposePromise = client.dispose();
+      ch.simulateMessage({
+        kind: 'rpc-response',
+        id: createRequest.id,
+        result: {
+          ...(defaultRpcResponses['create-recv-transport'] as object),
+          transportId: 'late-transport',
+        },
+      });
+
+      await disposePromise;
+
+      expect(cleanupRequests(ch)).toContainEqual(
+        expect.objectContaining({
+          method: 'close-recv-transport',
+          params: { transportId: 'late-transport' },
+        })
+      );
+      expect(mockCreateRecvTransport).not.toHaveBeenCalled();
+      await expect(initPromise).resolves.toBeInstanceOf(Error);
+    });
+
+    it('closes the server receive transport when no consumers were created', async () => {
+      client = new PipVoiceClient('test-pip');
+      const ch = setupCleanupResponder();
+      await client.init();
+
+      await client.dispose();
+
+      expect(cleanupRequests(ch).map((request) => request.method)).toEqual([
+        'pip-closing',
+        'close-recv-transport',
+      ]);
+    });
+
+    it('continues closing remaining consumers and the transport after a consumer close error', async () => {
+      client = new PipVoiceClient('test-pip');
+      const ch = setupCleanupResponder({
+        consumerIds: ['consumer-1', 'consumer-2'],
+        consumerErrors: new Set(['consumer-1']),
+      });
+      await client.init();
+      await client.consume('prod-1', 'mic', 'user-1');
+      await client.consume('prod-2', 'camera', 'user-2');
+
+      await client.dispose();
+
+      expect(cleanupRequests(ch).map((request) => [request.method, request.params])).toEqual([
+        ['pip-closing', {}],
+        ['close-consumer', { consumerId: 'consumer-1' }],
+        ['close-consumer', { consumerId: 'consumer-2' }],
+        ['close-recv-transport', { transportId: 'transport-1' }],
+      ]);
+    });
+
+    it('continues teardown after a consumer close timeout', async () => {
+      client = new PipVoiceClient('test-pip');
+      const ch = setupCleanupResponder({
+        consumerIds: ['consumer-1', 'consumer-2'],
+        consumerTimeouts: new Set(['consumer-1']),
+      });
+      await client.init();
+      await client.consume('prod-1', 'mic', 'user-1');
+      await client.consume('prod-2', 'camera', 'user-2');
+
+      const disposePromise = client.dispose();
+      await vi.advanceTimersByTimeAsync(10_100);
+      await disposePromise;
+
+      expect(cleanupRequests(ch).map((request) => [request.method, request.params])).toEqual([
+        ['pip-closing', {}],
+        ['close-consumer', { consumerId: 'consumer-1' }],
+        ['close-consumer', { consumerId: 'consumer-2' }],
+        ['close-recv-transport', { transportId: 'transport-1' }],
+      ]);
+    });
+
+    it('bounds consumer cleanup time by closing consumers concurrently before the transport', async () => {
+      client = new PipVoiceClient('test-pip');
+      const ch = setupCleanupResponder({
+        consumerIds: ['consumer-1', 'consumer-2'],
+        consumerTimeouts: new Set(['consumer-1', 'consumer-2']),
+      });
+      await client.init();
+      await client.consume('prod-1', 'mic', 'user-1');
+      await client.consume('prod-2', 'camera', 'user-2');
+
+      const disposePromise = client.dispose();
+      await vi.advanceTimersByTimeAsync(10_100);
+
+      expect(cleanupRequests(ch).map((request) => request.method)).toEqual([
+        'pip-closing',
+        'close-consumer',
+        'close-consumer',
+        'close-recv-transport',
+      ]);
+      await disposePromise;
+    });
+    it('completes local teardown when the server transport close fails', async () => {
+      client = new PipVoiceClient('test-pip');
+      const ch = setupCleanupResponder({ transportError: 'transport cleanup rejected' });
+      await client.init();
+      await client.consume('prod-1', 'mic', 'user-1');
+
+      await client.dispose();
+
+      expect(cleanupRequests(ch).some((request) => request.method === 'close-recv-transport')).toBe(
+        true
+      );
+      expect(mockConsumerClose).toHaveBeenCalledOnce();
+      expect(mockTransportClose).toHaveBeenCalledOnce();
+      expect(client.getStreams().size).toBe(0);
+    });
+
+    it('continues local finalization when a consumer close throws', async () => {
+      client = new PipVoiceClient('test-pip');
+      const ch = setupCleanupResponder({ consumerIds: ['consumer-1', 'consumer-2'] });
+      await client.init();
+      await client.consume('prod-1', 'mic', 'user-1');
+      await client.consume('prod-2', 'camera', 'user-2');
+      mockConsumerClose.mockImplementationOnce(() => {
+        throw new Error('local consumer close failed');
+      });
+
+      await client.dispose();
+
+      expect(mockConsumerClose).toHaveBeenCalledTimes(2);
+      expect(mockTransportClose).toHaveBeenCalledOnce();
+      expect(client.getStreams().size).toBe(0);
+      expect(MockBroadcastChannel.instances).not.toContain(ch);
+    });
+
+    it('emits one remote teardown sequence for concurrent and repeated dispose calls', async () => {
+      client = new PipVoiceClient('test-pip');
+      const ch = setupCleanupResponder();
+      await client.init();
+      await client.consume('prod-1', 'mic', 'user-1');
+
+      const first = client.dispose();
+      const second = client.dispose();
+
+      expect(second).toBe(first);
+      await Promise.all([first, second]);
+      expect(client.dispose()).toBe(first);
+      expect(cleanupRequests(ch).map((request) => request.method)).toEqual([
+        'pip-closing',
+        'close-consumer',
+        'close-recv-transport',
+      ]);
+    });
+
+    it('rejects pending RPCs when disposal starts without leaving them to time out', async () => {
+      client = new PipVoiceClient('test-pip');
+      const initPromise = client.init().catch((err: Error) => err);
+      await vi.advanceTimersByTimeAsync(100);
+
+      const disposePromise = client.dispose();
+      expect(await initPromise).toBeInstanceOf(Error);
+
+      await vi.advanceTimersByTimeAsync(10_100);
+      await disposePromise;
     });
 
     it('closes all consumers and transport', async () => {

@@ -151,6 +151,12 @@ export class PipSignalingProxy {
         case 'pause-consumer':
           await this.handlePauseConsumer(req);
           break;
+        case 'close-consumer':
+          await this.handleCloseConsumer(req);
+          break;
+        case 'close-recv-transport':
+          await this.handleCloseRecvTransport(req);
+          break;
         case 'set-preferred-layers':
           this.handleSetPreferredLayers(req);
           break;
@@ -220,11 +226,10 @@ export class PipSignalingProxy {
 
   private async handleCreateRecvTransport(req: AnyPipRpcRequest): Promise<void> {
     const params = (req as { params: { forceTcp?: boolean } }).params;
-    const result = await this.voiceService.forwardToServer<CreateRecvTransportResult>(
-      'create-transport',
-      { direction: 'recv', forceTcp: params?.forceTcp }
-    );
-    this.respond(req.id, result);
+    const { id, ...result } = await this.voiceService.forwardToServer<
+      Omit<CreateRecvTransportResult, 'transportId'> & { id: string }
+    >('create-transport', { direction: 'recv', forceTcp: params?.forceTcp });
+    this.respond(req.id, { ...result, transportId: id } satisfies CreateRecvTransportResult);
   }
 
   private async handleConnectTransport(req: AnyPipRpcRequest): Promise<void> {
@@ -260,8 +265,25 @@ export class PipSignalingProxy {
 
   private async handlePauseConsumer(req: AnyPipRpcRequest): Promise<void> {
     const params = (req as { params: { consumerId: string } }).params;
+
     await this.voiceService.forwardToServer('pause-consumer', {
       consumerId: params.consumerId,
+    });
+    this.respond(req.id, { success: true });
+  }
+
+  private async handleCloseConsumer(req: AnyPipRpcRequest): Promise<void> {
+    const params = (req as { params: { consumerId: string } }).params;
+    await this.voiceService.forwardToServer('close-consumer', {
+      consumerId: params.consumerId,
+    });
+    this.respond(req.id, { success: true });
+  }
+
+  private async handleCloseRecvTransport(req: AnyPipRpcRequest): Promise<void> {
+    const params = (req as { params: { transportId: string } }).params;
+    await this.voiceService.forwardToServer('close-recv-transport', {
+      transportId: params.transportId,
     });
     this.respond(req.id, { success: true });
   }

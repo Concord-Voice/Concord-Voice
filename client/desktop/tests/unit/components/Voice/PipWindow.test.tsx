@@ -1,6 +1,7 @@
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 // ── Mocks ───────────────────────────────────────────────────────────────
 
@@ -130,6 +131,7 @@ function mockElectron() {
 
 describe('PipWindow', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
     mockOnStateUpdate = null;
     mockElectron();
@@ -175,6 +177,74 @@ describe('PipWindow', () => {
       render(<PipWindow />);
       expect(screen.getByText('Unknown PiP type')).toBeInTheDocument();
     });
+  });
+
+  describe('cleanup rejection handling', () => {
+    it.each(['controls-main', 'frames-123', 'screen-prod1'])(
+      'observes a dispose rejection for %s on unmount',
+      async (pipId) => {
+        mockPipId = pipId;
+        const disposeError = new Error(`dispose failed for ${pipId}`);
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        mockDispose.mockRejectedValueOnce(disposeError);
+
+        const { unmount } = render(<PipWindow />);
+        await waitFor(() => {
+          expect(mockInit).toHaveBeenCalled();
+        });
+
+        unmount();
+
+        await waitFor(() => {
+          expect(consoleSpy).toHaveBeenCalledWith(disposeError);
+        });
+        consoleSpy.mockRestore();
+      }
+    );
+
+    it.each(['controls-main', 'frames-123', 'screen-prod1'])(
+      'delays native close for %s until disposal settles',
+      async (pipId) => {
+        mockPipId = pipId;
+        let resolveDispose: (() => void) | undefined;
+        mockDispose.mockReturnValueOnce(
+          new Promise<void>((resolve) => {
+            resolveDispose = resolve;
+          })
+        );
+
+        render(<PipWindow />);
+        await waitFor(() => {
+          expect(mockInit).toHaveBeenCalled();
+        });
+
+        const beforeUnload = new Event('beforeunload', { cancelable: true });
+        Object.defineProperty(beforeUnload, 'returnValue', {
+          configurable: true,
+          value: true,
+          writable: true,
+        });
+        act(() => {
+          globalThis.dispatchEvent(beforeUnload);
+        });
+
+        expect(beforeUnload.defaultPrevented).toBe(true);
+        expect(Reflect.get(beforeUnload, 'returnValue')).toBe(false);
+        expect(mockDispose).toHaveBeenCalledOnce();
+        expect(globalThis.electron?.closePipWindow).not.toHaveBeenCalled();
+
+        resolveDispose?.();
+        await waitFor(() => {
+          expect(globalThis.electron?.closePipWindow).toHaveBeenCalledWith(pipId);
+        });
+
+        const retriedUnload = new Event('beforeunload', { cancelable: true });
+        act(() => {
+          globalThis.dispatchEvent(retriedUnload);
+        });
+        expect(retriedUnload.defaultPrevented).toBe(false);
+      }
+    );
   });
 
   // ── PipHeader ───────────────────────────────────────────────────────

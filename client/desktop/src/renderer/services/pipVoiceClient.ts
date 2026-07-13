@@ -14,7 +14,8 @@
  *   3. Creates a recv transport via signaling proxy
  *   4. Consumes producers sequentially (no parallel SDP negotiations)
  *   5. Signals pip-ready → main window pauses its consumers (ownership transfer)
- *   6. On dispose → signals pip-closing → main window resumes its consumers
+ *   6. On dispose → pip-closing resumes main consumers, then closes owned server resources
+ *   7. Always finalizes local consumers, map, transport, pending RPCs, and BroadcastChannel
  */
 
 import { Device, types as mediasoupTypes } from 'mediasoup-client';
@@ -46,8 +47,13 @@ export class PipVoiceClient {
   private readonly bc: BroadcastChannel;
   private device: Device | null = null;
   private recvTransport: mediasoupTypes.Transport | null = null;
+  private recvTransportId: string | null = null;
+  private disposePromise: Promise<void> | null = null;
+  private recvTransportInfoPromise: Promise<CreateRecvTransportResult> | null = null;
   private readonly consumers: Map<string, ConsumedTrack> = new Map();
   private disposed = false;
+  /** False once the main-window proxy announces that the voice session has ended. */
+  private remoteCleanupAvailable = true;
 
   /** Pending RPC response callbacks keyed by request ID */
   private readonly pending: Map<
@@ -56,6 +62,7 @@ export class PipVoiceClient {
       resolve: (result: unknown) => void;
       reject: (err: Error) => void;
       timer: ReturnType<typeof setTimeout>;
+      preserveOnDispose: boolean;
     }
   > = new Map();
 
@@ -105,8 +112,18 @@ export class PipVoiceClient {
       routerRtpCapabilities: state.routerRtpCapabilities,
     });
 
-    // 3. Create recv transport
-    const transportInfo = await this.rpc<CreateRecvTransportResult>('create-recv-transport', {});
+    // 3. Create recv transport. Preserve this one RPC during disposal so a late
+    // acknowledgement still yields the server-owned ID that must be closed.
+    this.recvTransportInfoPromise = this.rpc<CreateRecvTransportResult>(
+      'create-recv-transport',
+      {},
+      RPC_TIMEOUT,
+      true
+    );
+    const transportInfo = await this.recvTransportInfoPromise;
+    this.recvTransportId = transportInfo.transportId;
+
+    if (this.disposed) throw new Error('PipVoiceClient disposed');
 
     this.recvTransport = this.device.createRecvTransport({
       id: transportInfo.transportId,
@@ -255,20 +272,59 @@ export class PipVoiceClient {
   /**
    * Clean up: close all consumers, transport, notify main window.
    */
-  async dispose(): Promise<void> {
-    if (this.disposed) return;
+  dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
 
-    // Signal pre-close so main window can start resuming (before setting
-    // disposed flag, since rpc() rejects when disposed is true)
-    try {
-      await this.rpc('pip-closing', {});
-    } catch {
-      /* best effort */
-    }
+    const consumerIds = [...this.consumers.keys()];
+    const transportId = this.recvTransportId;
+    const transportInfoPromise = this.recvTransportInfoPromise;
 
     this.disposed = true;
+    this.cancelPendingRpcs();
+    this.disposePromise = this.remoteCleanupAvailable
+      ? this.performDispose(consumerIds, transportId, transportInfoPromise)
+      : Promise.resolve().then(() => this.finalizeLocalResources());
+    return this.disposePromise;
+  }
 
-    // Close all consumers
+  private async performDispose(
+    consumerIds: string[],
+    transportId: string | null,
+    transportInfoPromise: Promise<CreateRecvTransportResult> | null
+  ): Promise<void> {
+    try {
+      try {
+        await this.sendRpc('pip-closing', {});
+      } catch {
+        /* best effort */
+      }
+
+      await Promise.allSettled(
+        consumerIds.map((consumerId) => this.sendRpc('close-consumer', { consumerId }))
+      );
+
+      let cleanupTransportId = transportId;
+      if (!cleanupTransportId && transportInfoPromise) {
+        try {
+          cleanupTransportId = (await transportInfoPromise).transportId;
+        } catch {
+          /* create failed or timed out */
+        }
+      }
+
+      if (cleanupTransportId) {
+        try {
+          await this.sendRpc('close-recv-transport', { transportId: cleanupTransportId });
+        } catch {
+          /* best effort */
+        }
+      }
+    } finally {
+      this.finalizeLocalResources();
+    }
+  }
+
+  private finalizeLocalResources(): void {
     for (const [, track] of this.consumers) {
       try {
         track.consumer.close();
@@ -278,22 +334,21 @@ export class PipVoiceClient {
     }
     this.consumers.clear();
 
-    // Close transport
     try {
       this.recvTransport?.close();
     } catch {
       /* ignore */
     }
     this.recvTransport = null;
+    this.recvTransportId = null;
+    this.recvTransportInfoPromise = null;
 
-    // Cancel pending RPCs
-    for (const [, p] of this.pending) {
-      clearTimeout(p.timer);
-      p.reject(new Error('PipVoiceClient disposed'));
+    this.cancelPendingRpcs(true);
+    try {
+      this.bc.close();
+    } catch {
+      /* ignore */
     }
-    this.pending.clear();
-
-    this.bc.close();
   }
 
   // ── BroadcastChannel message handling ───────────────────────────
@@ -319,18 +374,40 @@ export class PipVoiceClient {
 
     // Handle broadcasts from main window
     if (msg.kind === 'broadcast') {
+      if (msg.type === 'voice-ended') {
+        this.remoteCleanupAvailable = false;
+        this.cancelPendingRpcs(true);
+      }
       this.onStateUpdate?.(msg);
     }
   };
 
   // ── RPC helper ──────────────────────────────────────────────────
 
-  private rpc<T>(method: string, params: unknown, timeout = RPC_TIMEOUT): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      if (this.disposed) {
-        return reject(new Error('PipVoiceClient disposed'));
-      }
+  private rpc<T>(
+    method: string,
+    params: unknown,
+    timeout = RPC_TIMEOUT,
+    preserveOnDispose = false
+  ): Promise<T> {
+    if (this.disposed) {
+      return Promise.reject(new Error('PipVoiceClient disposed'));
+    }
 
+    return this.sendRpc<T>(method, params, timeout, preserveOnDispose);
+  }
+
+  private sendRpc<T>(
+    method: string,
+    params: unknown,
+    timeout = RPC_TIMEOUT,
+    preserveOnDispose = false
+  ): Promise<T> {
+    if (!this.remoteCleanupAvailable) {
+      return Promise.reject(new Error('PiP signaling proxy unavailable'));
+    }
+
+    return new Promise<T>((resolve, reject) => {
       const id = generateRequestId(this.pipId);
 
       const timer = setTimeout(() => {
@@ -342,6 +419,7 @@ export class PipVoiceClient {
         resolve: resolve as (result: unknown) => void,
         reject,
         timer,
+        preserveOnDispose,
       });
 
       this.bc.postMessage({
@@ -352,5 +430,14 @@ export class PipVoiceClient {
         params,
       });
     });
+  }
+
+  private cancelPendingRpcs(includePreserved = false): void {
+    for (const [id, pending] of this.pending) {
+      if (pending.preserveOnDispose && !includePreserved) continue;
+      clearTimeout(pending.timer);
+      pending.reject(new Error('PipVoiceClient disposed'));
+      this.pending.delete(id);
+    }
   }
 }

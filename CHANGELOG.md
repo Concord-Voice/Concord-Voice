@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.26] — 2026-07-12
+
+### Fixed
+
+- **Picture-in-picture windows close promptly when a call ends** ([#2215](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2215)) — leaving voice now releases each floating window's media immediately instead of leaving an always-on-top window visible while cleanup requests time out.
+
 ## [0.2.25] — 2026-07-09
 
 ### Security

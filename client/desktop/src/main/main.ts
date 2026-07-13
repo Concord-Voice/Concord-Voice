@@ -887,6 +887,7 @@ app.on('window-all-closed', () => {
 // event, so release the close-to-tray veto at the update-specific hook too (#1897).
 electronAutoUpdater.on('before-quit-for-update', () => {
   isQuitting = true;
+  destroyPipWindowsForQuit();
 });
 
 // Clean up scheduled update checks on quit; flush update log (#383)
@@ -894,6 +895,7 @@ app.on('before-quit', () => {
   // Release the [X] close intercept's veto so the window can actually close and
   // the quit can complete — without this, app.quit() deadlocks (#1383).
   isQuitting = true;
+  destroyPipWindowsForQuit();
   // Release the OS tray resource so no orphaned icon outlives the app (#1099).
   destroyTray();
   const ul = getUpdateLogger();
@@ -1429,6 +1431,13 @@ ipcMain.handle('auth:getMachineId', (event, apiBase?: unknown) => {
 
 // ─── PiP (Picture-in-Picture) Window Management ──────────────────────
 const pipWindows = new Map<string, BrowserWindow>();
+
+/** Force-close PiP children during full-app shutdown so renderer unload guards cannot veto quit. */
+function destroyPipWindowsForQuit(): void {
+  for (const pip of pipWindows.values()) {
+    if (!pip.isDestroyed()) pip.destroy();
+  }
+}
 
 ipcMain.handle(
   'pip:open',

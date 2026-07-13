@@ -18,6 +18,7 @@ const { mockMainWindow, mockWebContents, MockBrowserWindow } = vi.hoisted(() => 
     once: vi.fn(),
     on: vi.fn(),
     show: vi.fn(),
+    destroy: vi.fn(),
     close: vi.fn(),
     focus: vi.fn(),
     isMinimized: vi.fn(() => false),
@@ -1006,12 +1007,37 @@ describe('main.ts', () => {
   });
 
   describe('app lifecycle callbacks', () => {
-    it('before-quit stops auto-updater', async () => {
+    it('before-quit stops auto-updater and force-destroys PiP windows', async () => {
       const { stopAutoUpdater } = await import('../../../src/main/updater');
       const beforeQuit = appOnCallbacks.get('before-quit');
       expect(beforeQuit).toBeDefined();
+      await handlers.get('pip:open')!(
+        { senderFrame: { url: 'http://localhost:3001/' } },
+        { id: 'before-quit-pip' }
+      );
+      mockMainWindow.destroy.mockClear();
+
       beforeQuit!();
+
       expect(stopAutoUpdater).toHaveBeenCalled();
+      expect(mockMainWindow.destroy).toHaveBeenCalled();
+    });
+
+    it('before-quit-for-update force-destroys PiP windows', async () => {
+      const { autoUpdater } = await import('electron');
+      const beforeQuitForUpdate = (autoUpdater.on as Mock).mock.calls.find(
+        (call) => call[0] === 'before-quit-for-update'
+      )?.[1] as (() => void) | undefined;
+      expect(beforeQuitForUpdate).toBeDefined();
+      await handlers.get('pip:open')!(
+        { senderFrame: { url: 'http://localhost:3001/' } },
+        { id: 'before-update-quit-pip' }
+      );
+      mockMainWindow.destroy.mockClear();
+
+      beforeQuitForUpdate!();
+
+      expect(mockMainWindow.destroy).toHaveBeenCalled();
     });
 
     it('window-all-closed quits on non-macOS', async () => {

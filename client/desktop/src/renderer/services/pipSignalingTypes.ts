@@ -89,6 +89,22 @@ export type PauseConsumerRequest = PipRpcRequest<
   }
 >;
 
+/** Close one consumer owned by this PiP instance */
+export type CloseConsumerRequest = PipRpcRequest<
+  'close-consumer',
+  {
+    consumerId: string;
+  }
+>;
+
+/** Close the receive transport owned by this PiP instance */
+export type CloseRecvTransportRequest = PipRpcRequest<
+  'close-recv-transport',
+  {
+    transportId: string;
+  }
+>;
+
 /**
  * Report receiver render-state demand for one of THIS PiP's own consumers (#1924).
  * A PiP window has a socket-less voiceService, so it can't emit set-preferred-layers
@@ -151,6 +167,8 @@ export type AnyPipRpcRequest =
   | ConsumeRequest
   | ResumeConsumerRequest
   | PauseConsumerRequest
+  | CloseConsumerRequest
+  | CloseRecvTransportRequest
   | SetPreferredLayersRequest
   | RequestStateRequest
   | ActionRequest

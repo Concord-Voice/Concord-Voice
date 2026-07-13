@@ -84,6 +84,37 @@ const PipWindow: React.FC = () => {
   return <div className="pip-window">Unknown PiP type</div>;
 };
 
+/** Delay native PiP destruction until the acknowledged media cleanup settles. */
+function installPipCloseGuard(client: PipVoiceClient, pipId: string): () => void {
+  let closeRequested = false;
+  let allowClose = false;
+
+  const finishClose = () => {
+    allowClose = true;
+    const closePromise = globalThis.electron?.closePipWindow(pipId);
+    void closePromise?.catch(console.error);
+  };
+
+  const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+    if (allowClose) return;
+
+    event.preventDefault();
+    // Electron's renderer beforeunload veto still keys on the legacy returnValue signal.
+    // Reflect invokes the native setter without reintroducing deprecated lib.dom property access.
+    Reflect.set(event, 'returnValue', false);
+    if (closeRequested) return;
+    closeRequested = true;
+
+    void client.dispose().then(finishClose, (err) => {
+      console.error(err);
+      finishClose();
+    });
+  };
+
+  globalThis.addEventListener('beforeunload', handleBeforeUnload);
+  return () => globalThis.removeEventListener('beforeunload', handleBeforeUnload);
+}
+
 // ── Controls PiP ────────────────────────────────────────────────
 
 /**
@@ -114,6 +145,7 @@ const ControlsPipContent: React.FC<{
 
   useEffect(() => {
     const client = new PipVoiceClient(pipId);
+    const removeCloseGuard = installPipCloseGuard(client, pipId);
     clientRef.current = client;
 
     // Listen for state broadcasts to update button states
@@ -163,6 +195,7 @@ const ControlsPipContent: React.FC<{
       .catch(console.error);
 
     return () => {
+      removeCloseGuard();
       client.dispose().catch(console.error);
       clientRef.current = null;
     };
@@ -264,6 +297,7 @@ const FramesPipContent: React.FC<{
 
   useEffect(() => {
     const client = new PipVoiceClient(pipId);
+    const removeCloseGuard = installPipCloseGuard(client, pipId);
     clientRef.current = client;
     consumeQueueRef.current = Promise.resolve();
 
@@ -320,6 +354,7 @@ const FramesPipContent: React.FC<{
     setup();
 
     return () => {
+      removeCloseGuard();
       client.dispose().catch(console.error);
       clientRef.current = null;
     };
@@ -444,6 +479,7 @@ const ScreenPipContent: React.FC<{
 
   useEffect(() => {
     const client = new PipVoiceClient(pipId);
+    const removeCloseGuard = installPipCloseGuard(client, pipId);
     clientRef.current = client;
 
     client.onStateUpdate = (msg: AnyPipBroadcast) => {
@@ -513,6 +549,7 @@ const ScreenPipContent: React.FC<{
     const videoEl = videoRef.current;
     const clientEl = clientRef.current;
     return () => {
+      removeCloseGuard();
       demandObserverRef.current?.disconnect();
       demandObserverRef.current = null;
       if (videoEl) videoEl.srcObject = null;

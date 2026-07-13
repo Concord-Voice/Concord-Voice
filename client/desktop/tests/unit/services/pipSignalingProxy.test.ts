@@ -83,6 +83,7 @@ describe('PipSignalingProxy', () => {
     MockBroadcastChannel.install();
     resetAllStores();
     vi.clearAllMocks();
+    mockVoiceService.forwardToServer.mockReset().mockResolvedValue({});
 
     useUserStore.setState({ user: { id: 'local-user-123' } as any });
 
@@ -214,7 +215,7 @@ describe('PipSignalingProxy', () => {
   describe('transport & consume handlers', () => {
     it('create-recv-transport forwards to server with direction recv', async () => {
       mockVoiceService.forwardToServer.mockResolvedValueOnce({
-        transportId: 'tp-1',
+        id: 'tp-1',
         iceParameters: {},
         iceCandidates: [],
         dtlsParameters: {},
@@ -282,6 +283,27 @@ describe('PipSignalingProxy', () => {
       });
     });
 
+    it.each([
+      ['close-consumer', { consumerId: 'pip-consumer-1' }],
+      ['close-recv-transport', { transportId: 'pip-recv-1' }],
+    ])(
+      '%s forwards only the owned resource id and acknowledges success',
+      async (method, params) => {
+        mockVoiceService.forwardToServer.mockResolvedValueOnce({ success: true });
+
+        await expect(sendRpc(getChannel(), method, params)).resolves.toEqual({ success: true });
+        expect(mockVoiceService.forwardToServer).toHaveBeenCalledWith(method, params);
+      }
+    );
+
+    it.each([
+      ['close-consumer', { consumerId: 'pip-consumer-1' }],
+      ['close-recv-transport', { transportId: 'pip-recv-1' }],
+    ])('%s returns media-plane acknowledgement errors to PiP', async (method, params) => {
+      mockVoiceService.forwardToServer.mockRejectedValueOnce(new Error('cleanup rejected'));
+
+      await expect(sendRpc(getChannel(), method, params)).rejects.toThrow('cleanup rejected');
+    });
     // #1924: the PiP reports screen render-state demand for its OWN consumer id. The
     // proxy forwards it to emitPreferredLayersForConsumer, which addresses that exact
     // consumer on the main socket (NOT resolve-by-user, which would hit the paused one).
