@@ -1,6 +1,7 @@
 .changelog-modal {
-  max-width: 560px;
+  max-width: 640px;
   width: calc(100vw - 48px);
+  margin: auto;
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: var(--bg-primary);

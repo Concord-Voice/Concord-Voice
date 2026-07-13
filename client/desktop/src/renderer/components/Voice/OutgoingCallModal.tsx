@@ -1,8 +1,7 @@
-// OutgoingCallModal — caller-side centered modal showing outgoing-ring
-// state with peer name + Cancel button (#1209 plan task F2). Per spec
-// §7.8: deliberately asymmetric with IncomingCallBanner — caller initiated
-// the action and wants to see their call's progress; the centered modal
-// gives that visual weight.
+// OutgoingCallModal — caller-side bottom-right prompt showing outgoing-ring
+// state with peer name + Cancel button (#1209, placement corrected in #2223).
+// Keeping it in the same corner as IncomingCallBanner leaves the active DM
+// visible while the caller watches ring progress.
 //
 // DM 1:1 shows "Calling <peer> / Ringing…". Group (#1219 R3) shows the
 // group name + a per-decliner tally ("Ringing Charlie, Diana — Bob
@@ -27,7 +26,7 @@ export function OutgoingCallModal() {
   const callState = useVoiceStore((s) => s.callState);
   const myUserId = useUserStore((s) => s.user?.id);
 
-  // Subscribe to conversations array so the modal re-renders if the peer's
+  // Subscribe to conversations array so the prompt re-renders if the peer's
   // displayName updates mid-ring (rare but possible if a presence event
   // arrives during the outgoing ring window).
   const conversations = useDMStore((s) => s.conversations);
@@ -54,7 +53,7 @@ export function OutgoingCallModal() {
     );
 
     return (
-      <dialog className="outgoing-call-modal__backdrop" open aria-modal="true">
+      <dialog className="outgoing-call-modal__backdrop" open>
         <div className="outgoing-call-modal">
           <div className="outgoing-call-modal__avatar">
             <span className="outgoing-call-modal__initials" aria-hidden="true">
@@ -109,7 +108,7 @@ export function OutgoingCallModal() {
   const displayName = myUserId ? peerName(conversation.participants, myUserId) : 'Unknown';
 
   return (
-    <dialog className="outgoing-call-modal__backdrop" open aria-modal="true">
+    <dialog className="outgoing-call-modal__backdrop" open>
       <div className="outgoing-call-modal">
         <div className="outgoing-call-modal__avatar">
           <span className="outgoing-call-modal__initials" aria-hidden="true">

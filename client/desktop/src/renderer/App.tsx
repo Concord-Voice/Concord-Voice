@@ -468,8 +468,8 @@ function App() {
           <UpdateSecurityBanner />
           <UpdateBanner />
           {/* DM voice call ring UI (#1209). IncomingCallBanner: corner banner
-              for callee. OutgoingCallModal: centered modal for caller. Both
-              are render-nothing when voiceStore.callState.kind is idle. */}
+              for callee. OutgoingCallModal: bottom-right non-modal prompt for
+              caller. Both render nothing when voiceStore.callState.kind is idle. */}
           <IncomingCallBanner />
           <OutgoingCallModal />
 

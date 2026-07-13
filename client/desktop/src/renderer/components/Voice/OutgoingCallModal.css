@@ -1,15 +1,12 @@
-/* OutgoingCallModal — centered modal styling (#1209 plan task F2). */
+/* OutgoingCallModal — bottom-right caller prompt (#2223). */
 
 .outgoing-call-modal__backdrop {
   position: fixed;
-  inset: 0;
+  inset: auto 16px 16px auto;
   z-index: 999;
-  background: rgba(0, 0, 0, 0.55);
+  border: none;
+  background: transparent;
   display: flex;
-  align-items: center;
-  justify-content: center;
-  -webkit-backdrop-filter: blur(2px);
-  backdrop-filter: blur(2px);
 }
 
 .outgoing-call-modal {

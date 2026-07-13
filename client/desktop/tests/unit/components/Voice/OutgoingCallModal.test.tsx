@@ -1,4 +1,4 @@
-// Tests for OutgoingCallModal — caller-side centered modal during the
+// Tests for OutgoingCallModal — caller-side bottom-right non-modal prompt during the
 // outgoing ring (#1209 plan task F2). Covers render-gating, peer-name
 // resolution via the peerName helper, the missing-userId fallback,
 // missing-conversation defensive render, and the Cancel button →
@@ -108,10 +108,12 @@ describe('OutgoingCallModal', () => {
       expect(container.firstChild).toBeNull();
     });
 
-    it('renders modal when outgoing-ringing + conversation found', () => {
+    it('renders a non-modal prompt when outgoing-ringing + conversation found', () => {
       seedOutgoing();
       render(<OutgoingCallModal />);
-      expect(screen.getByRole('dialog')).toBeInTheDocument();
+      const prompt = screen.getByRole('dialog');
+      expect(prompt).toBeInTheDocument();
+      expect(prompt).not.toHaveAttribute('aria-modal');
     });
   });
 
