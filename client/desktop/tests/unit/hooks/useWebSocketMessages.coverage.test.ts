@@ -25,19 +25,24 @@ import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsSt
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useDMStore } from '@/renderer/stores/dmStore';
 import { useFriendStore } from '@/renderer/stores/friendStore';
+import { usePrivacyStore } from '@/renderer/stores/privacyStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel, mockServer } from '../../mocks/fixtures';
 
 // Mock services
 const mockInvalidateChannelKey = vi.fn();
+const mockRevokeChannelAccess = vi.fn();
 const mockProcessPendingKeyRequests = vi.fn().mockResolvedValue(undefined);
 const mockDecryptForChannel = vi.fn();
 const mockDecryptForChannelWithVersion = vi.fn();
+const mockIndexMessage = vi.fn();
+const mockRemoveMessage = vi.fn();
 
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
+    revokeChannelAccess: (...args: unknown[]) => mockRevokeChannelAccess(...args),
     processPendingKeyRequests: (...args: unknown[]) => mockProcessPendingKeyRequests(...args),
     decryptForChannel: (...args: unknown[]) => mockDecryptForChannel(...args),
     decryptForChannelWithVersion: (...args: unknown[]) => mockDecryptForChannelWithVersion(...args),
@@ -72,7 +77,9 @@ vi.mock('@/renderer/services/apiClient', () => ({
 }));
 
 vi.mock('@/renderer/services/searchService', () => ({
-  indexMessage: vi.fn(),
+  indexMessage: (...args: unknown[]) => mockIndexMessage(...args),
+  removeMessage: (...args: unknown[]) => mockRemoveMessage(...args),
+  removeScope: vi.fn(),
 }));
 
 const mockShouldNotify = vi.fn().mockReturnValue(false);
@@ -87,6 +94,9 @@ vi.mock('@/renderer/services/desktopNotificationService', () => ({
 }));
 
 import { useWebSocketMessages } from '@/renderer/hooks/useWebSocketMessages';
+import { speak as ttsSpeak } from '@/renderer/services/ttsService';
+
+const mockTtsSpeak = vi.mocked(ttsSpeak);
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyHandler = (...args: any[]) => void;
@@ -104,13 +114,39 @@ function createMockWsService() {
   };
 }
 
+function requireHandler(ws: ReturnType<typeof createMockWsService>, eventName: string): AnyHandler {
+  const handler = ws.handlers.get(eventName);
+  if (!handler) throw new Error(`missing ${eventName} handler`);
+  return handler;
+}
+
 /** Helper to render the hook and get a handler by event name. */
 function setupHandler(eventName: string) {
   const ws = createMockWsService();
-  renderHook(() => useWebSocketMessages(ws as never));
-  const handler = ws.handlers.get(eventName)!;
+  const { unmount } = renderHook(() => useWebSocketMessages(ws as never));
+  const handler = requireHandler(ws, eventName);
   expect(handler).toBeDefined();
-  return { ws, handler };
+  return { ws, handler, unmount };
+}
+
+function deferred<T>() {
+  let resolvePromise: ((value: T) => void) | undefined;
+  let rejectPromise: ((reason?: unknown) => void) | undefined;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return {
+    promise,
+    resolve(value: T) {
+      if (!resolvePromise) throw new Error('deferred promise was not initialized');
+      resolvePromise(value);
+    },
+    reject(reason?: unknown) {
+      if (!rejectPromise) throw new Error('deferred promise was not initialized');
+      rejectPromise(reason);
+    },
+  };
 }
 
 beforeEach(() => {
@@ -339,11 +375,141 @@ describe('useWebSocketMessages — coverage boost', () => {
   // ── Pre-existing uncovered handlers ────────────────────────────────
 
   describe('message_update handler', () => {
-    it('updates message content and edit timestamp', () => {
+    // Regression for #1741: edit broadcasts carry ciphertext and must follow
+    // the same decrypt/GIF-unwrapping/search-index path as new messages.
+    it('stores decrypted GIF-envelope plaintext from a versioned channel edit', async () => {
       const { handler } = setupHandler('message_update');
+      mockDecryptForChannelWithVersion.mockResolvedValue(
+        '{"text":"Edited content","gif_slug":"edited-gif"}'
+      );
 
       useChatStore.getState().addMessage('channel-1', {
         id: 'msg-edit-1',
+        channel_id: 'channel-1',
+        user_id: 'user-2',
+        content: 'Original content',
+        key_version: 1,
+        decryptFailed: true,
+        pendingKeys: true,
+        username: 'alice',
+        created_at: '2025-01-01T00:00:00Z',
+        updated_at: '2025-01-01T00:00:00Z',
+      });
+
+      await act(async () => {
+        handler({
+          type: 'message_update',
+          data: {
+            channel_id: 'channel-1',
+            id: 'msg-edit-1',
+            content: 'encrypted-edit',
+            key_version: 2,
+            edited_at: '2025-01-01T00:01:00Z',
+            updated_at: '2025-01-01T00:01:00Z',
+          },
+        });
+      });
+
+      const msgs = useChatStore.getState().messagesByChannel.get('channel-1');
+      expect(msgs![0].content).toBe('Edited content');
+      expect(msgs![0].content).not.toBe('encrypted-edit');
+      expect(msgs![0].gif_slug).toBe('edited-gif');
+      expect(msgs![0].key_version).toBe(2);
+      expect(msgs![0].decryptFailed).toBe(false);
+      expect(msgs![0].pendingKeys).toBe(false);
+      expect(mockDecryptForChannelWithVersion).toHaveBeenCalledWith(
+        'channel-1',
+        'encrypted-edit',
+        2
+      );
+      expect(mockIndexMessage).toHaveBeenCalledWith('msg-edit-1', 'Edited content', 'channel-1');
+    });
+
+    it('keeps the newest edit when two decryptions resolve in reverse order', async () => {
+      const { handler } = setupHandler('message_update');
+      const olderDecrypt = deferred<string>();
+      const newerDecrypt = deferred<string>();
+      mockDecryptForChannelWithVersion
+        .mockImplementationOnce(() => olderDecrypt.promise)
+        .mockImplementationOnce(() => newerDecrypt.promise);
+
+      useChatStore.getState().addMessage('channel-1', {
+        id: 'msg-edit-race',
+        channel_id: 'channel-1',
+        user_id: 'user-2',
+        content: 'Original content',
+        key_version: 1,
+        decryptFailed: true,
+        pendingKeys: true,
+        username: 'alice',
+        created_at: '2025-01-01T00:00:00Z',
+        updated_at: '2025-01-01T00:00:00Z',
+      });
+
+      act(() => {
+        handler({
+          type: 'message_update',
+          data: {
+            channel_id: 'channel-1',
+            id: 'msg-edit-race',
+            content: 'older-ciphertext',
+            key_version: 2,
+            edited_at: '2025-01-01T00:01:00Z',
+            updated_at: '2025-01-01T00:01:00Z',
+          },
+        });
+        handler({
+          type: 'message_update',
+          data: {
+            channel_id: 'channel-1',
+            id: 'msg-edit-race',
+            content: 'newer-ciphertext',
+            key_version: 3,
+            edited_at: '2025-01-01T00:02:00Z',
+            updated_at: '2025-01-01T00:02:00Z',
+          },
+        });
+      });
+
+      await act(async () => {
+        newerDecrypt.resolve('Newest plaintext');
+        await newerDecrypt.promise;
+      });
+      await act(async () => {
+        olderDecrypt.resolve('Older plaintext');
+        await olderDecrypt.promise;
+      });
+
+      const message = useChatStore
+        .getState()
+        .messagesByChannel.get('channel-1')
+        ?.find((candidate) => candidate.id === 'msg-edit-race');
+      expect(message).toMatchObject({
+        content: 'Newest plaintext',
+        key_version: 3,
+        decryptFailed: false,
+        pendingKeys: false,
+        edited_at: '2025-01-01T00:02:00Z',
+        updated_at: '2025-01-01T00:02:00Z',
+      });
+      expect(mockIndexMessage).toHaveBeenCalledTimes(1);
+      expect(mockIndexMessage).toHaveBeenLastCalledWith(
+        'msg-edit-race',
+        'Newest plaintext',
+        'channel-1'
+      );
+    });
+
+    it('does not let an older decrypt failure blank a newer successful edit', async () => {
+      const { handler } = setupHandler('message_update');
+      const olderDecrypt = deferred<string>();
+      const newerDecrypt = deferred<string>();
+      mockDecryptForChannelWithVersion
+        .mockImplementationOnce(() => olderDecrypt.promise)
+        .mockImplementationOnce(() => newerDecrypt.promise);
+
+      useChatStore.getState().addMessage('channel-1', {
+        id: 'msg-edit-stale-failure',
         channel_id: 'channel-1',
         user_id: 'user-2',
         content: 'Original content',
@@ -357,16 +523,225 @@ describe('useWebSocketMessages — coverage boost', () => {
           type: 'message_update',
           data: {
             channel_id: 'channel-1',
-            id: 'msg-edit-1',
-            content: 'Edited content',
+            id: 'msg-edit-stale-failure',
+            content: 'older-ciphertext',
+            key_version: 2,
             edited_at: '2025-01-01T00:01:00Z',
+            updated_at: '2025-01-01T00:01:00Z',
+          },
+        });
+        handler({
+          type: 'message_update',
+          data: {
+            channel_id: 'channel-1',
+            id: 'msg-edit-stale-failure',
+            content: 'newer-ciphertext',
+            key_version: 3,
+            edited_at: '2025-01-01T00:02:00Z',
+            updated_at: '2025-01-01T00:02:00Z',
+          },
+        });
+      });
+
+      await act(async () => {
+        newerDecrypt.resolve('Newest plaintext');
+        await newerDecrypt.promise;
+      });
+      await act(async () => {
+        olderDecrypt.reject(new Error('stale decrypt failed'));
+        await olderDecrypt.promise.catch(() => undefined);
+      });
+
+      const message = useChatStore
+        .getState()
+        .messagesByChannel.get('channel-1')
+        ?.find((candidate) => candidate.id === 'msg-edit-stale-failure');
+      expect(message).toMatchObject({
+        content: 'Newest plaintext',
+        key_version: 3,
+        decryptFailed: false,
+        pendingKeys: false,
+        edited_at: '2025-01-01T00:02:00Z',
+        updated_at: '2025-01-01T00:02:00Z',
+      });
+      expect(mockIndexMessage).toHaveBeenCalledTimes(1);
+      expect(mockIndexMessage).toHaveBeenLastCalledWith(
+        'msg-edit-stale-failure',
+        'Newest plaintext',
+        'channel-1'
+      );
+    });
+
+    it('preserves newer metadata-only state when an older content decrypt finishes later', async () => {
+      const { handler } = setupHandler('message_update');
+      const contentDecrypt = deferred<string>();
+      mockDecryptForChannelWithVersion.mockImplementationOnce(() => contentDecrypt.promise);
+      usePrivacyStore.setState({
+        settings: {
+          ...usePrivacyStore.getState().settings,
+          allowEmbeddedContent: true,
+        },
+      });
+
+      useChatStore.getState().addMessage('channel-1', {
+        id: 'msg-edit-metadata-race',
+        channel_id: 'channel-1',
+        user_id: 'user-2',
+        content: 'Original content',
+        key_version: 1,
+        embeds_suppressed: false,
+        username: 'alice',
+        created_at: '2025-01-01T00:00:00Z',
+        updated_at: '2025-01-01T00:00:00Z',
+      });
+
+      act(() => {
+        handler({
+          type: 'message_update',
+          data: {
+            channel_id: 'channel-1',
+            id: 'msg-edit-metadata-race',
+            content: 'encrypted-edit',
+            key_version: 2,
+            embeds_suppressed: false,
+            edited_at: '2025-01-01T00:01:00Z',
+            updated_at: '2025-01-01T00:01:00Z',
+          },
+        });
+        handler({
+          type: 'message_update',
+          data: {
+            channel_id: 'channel-1',
+            id: 'msg-edit-metadata-race',
+            embeds_suppressed: true,
+            updated_at: '2025-01-01T00:02:00Z',
+          },
+        });
+      });
+
+      await act(async () => {
+        contentDecrypt.resolve('Decrypted edit');
+        await contentDecrypt.promise;
+      });
+
+      const message = useChatStore
+        .getState()
+        .messagesByChannel.get('channel-1')
+        ?.find((candidate) => candidate.id === 'msg-edit-metadata-race');
+      expect(message).toMatchObject({
+        content: 'Decrypted edit',
+        key_version: 2,
+        decryptFailed: false,
+        pendingKeys: false,
+        edited_at: '2025-01-01T00:01:00Z',
+        embeds_suppressed: true,
+        updated_at: '2025-01-01T00:02:00Z',
+      });
+      expect(mockIndexMessage).toHaveBeenCalledOnce();
+      expect(mockIndexMessage).toHaveBeenCalledWith(
+        'msg-edit-metadata-race',
+        'Decrypted edit',
+        'channel-1'
+      );
+    });
+
+    it('blanks edited ciphertext and marks decrypt failure when channel decryption rejects', async () => {
+      const { handler } = setupHandler('message_update');
+      mockDecryptForChannel.mockRejectedValue(new Error('decrypt failed'));
+
+      useChatStore.getState().addMessage('channel-1', {
+        id: 'msg-edit-failed',
+        channel_id: 'channel-1',
+        user_id: 'user-2',
+        content: 'Original content',
+        username: 'alice',
+        created_at: '2025-01-01T00:00:00Z',
+        updated_at: '2025-01-01T00:00:00Z',
+      });
+
+      await act(async () => {
+        handler({
+          type: 'message_update',
+          data: {
+            channel_id: 'channel-1',
+            id: 'msg-edit-failed',
+            content: 'encrypted-edit',
+            key_version: 1,
+            edited_at: '2025-01-01T00:01:00Z',
+          },
+        });
+      });
+
+      const message = useChatStore
+        .getState()
+        .messagesByChannel.get('channel-1')
+        ?.find((candidate) => candidate.id === 'msg-edit-failed');
+      expect(message?.content).toBe('');
+      expect(message?.decryptFailed).toBe(true);
+      expect(message?.pendingKeys).toBe(false);
+      expect(message?.content).not.toBe('encrypted-edit');
+    });
+
+    it('does not index decrypted content for an edit whose message is not loaded', async () => {
+      const { handler } = setupHandler('message_update');
+      mockDecryptForChannelWithVersion.mockResolvedValue('Unloaded edited plaintext');
+
+      await act(async () => {
+        handler({
+          type: 'message_update',
+          data: {
+            channel_id: 'channel-1',
+            id: 'msg-unloaded-edit',
+            content: 'encrypted-unloaded-edit',
+            key_version: 2,
+            edited_at: '2025-01-01T00:01:00Z',
+          },
+        });
+      });
+
+      expect(
+        useChatStore
+          .getState()
+          .messagesByChannel.get('channel-1')
+          ?.some((message) => message.id === 'msg-unloaded-edit')
+      ).not.toBe(true);
+      expect(mockIndexMessage).not.toHaveBeenCalled();
+    });
+
+    it('applies metadata-only updates without erasing or decrypting message content', () => {
+      const { handler } = setupHandler('message_update');
+
+      useChatStore.getState().addMessage('channel-1', {
+        id: 'msg-metadata-only',
+        channel_id: 'channel-1',
+        user_id: 'user-2',
+        content: 'Keep this plaintext',
+        embeds_suppressed: false,
+        username: 'alice',
+        created_at: '2025-01-01T00:00:00Z',
+        updated_at: '2025-01-01T00:00:00Z',
+      });
+
+      act(() => {
+        handler({
+          type: 'message_update',
+          data: {
+            channel_id: 'channel-1',
+            id: 'msg-metadata-only',
+            embeds_suppressed: true,
             updated_at: '2025-01-01T00:01:00Z',
           },
         });
       });
 
-      const msgs = useChatStore.getState().messagesByChannel.get('channel-1');
-      expect(msgs![0].content).toBe('Edited content');
+      const message = useChatStore
+        .getState()
+        .messagesByChannel.get('channel-1')
+        ?.find((candidate) => candidate.id === 'msg-metadata-only');
+      expect(message?.content).toBe('Keep this plaintext');
+      expect(message?.embeds_suppressed).toBe(true);
+      expect(mockDecryptForChannel).not.toHaveBeenCalled();
+      expect(mockDecryptForChannelWithVersion).not.toHaveBeenCalled();
     });
 
     it('ignores update without channel_id', () => {
@@ -387,6 +762,664 @@ describe('useWebSocketMessages — coverage boost', () => {
       });
 
       // No crash
+    });
+  });
+
+  describe('message content operation lifecycle', () => {
+    it.each([
+      ['message_delete', 'channel_id', 'channel-delete-scope'],
+      ['dm_message_delete', 'conversation_id', 'dm-delete-scope'],
+    ] as const)('removes the search document on %s', (eventName, scopeField, scopeId) => {
+      const { handler } = setupHandler(eventName);
+
+      act(() => {
+        handler({
+          type: eventName,
+          data: { [scopeField]: scopeId, id: 'msg-search-delete' },
+        });
+      });
+
+      expect(mockRemoveMessage).toHaveBeenCalledOnce();
+      expect(mockRemoveMessage).toHaveBeenCalledWith('msg-search-delete');
+    });
+
+    it.each([
+      ['message_update', 'success', 'channel_id', 'channel-unloaded'],
+      ['message_update', 'failure', 'channel_id', 'channel-unloaded'],
+      ['dm_message_update', 'success', 'conversation_id', 'dm-unloaded'],
+      ['dm_message_update', 'failure', 'conversation_id', 'dm-unloaded'],
+    ] as const)(
+      'removes stale indexed plaintext for an unloaded %s decrypt %s',
+      async (eventName, settlement, scopeField, scopeId) => {
+        const { handler } = setupHandler(eventName);
+        if (settlement === 'success') {
+          mockDecryptForChannelWithVersion.mockResolvedValueOnce('updated plaintext');
+        } else {
+          mockDecryptForChannelWithVersion.mockRejectedValueOnce(new Error('decrypt failed'));
+        }
+
+        await act(async () => {
+          handler({
+            type: eventName,
+            data: {
+              [scopeField]: scopeId,
+              id: 'unloaded-edit',
+              content: 'edited-ciphertext',
+              key_version: 2,
+              edited_at: '2025-01-01T00:01:00Z',
+            },
+          });
+        });
+
+        expect(mockIndexMessage).not.toHaveBeenCalled();
+        expect(mockRemoveMessage).toHaveBeenCalledWith('unloaded-edit');
+      }
+    );
+
+    it('preserves a channel edit that decrypts before its pending message add', async () => {
+      const addDecrypt = deferred<string>();
+      const editDecrypt = deferred<string>();
+      mockDecryptForChannelWithVersion
+        .mockImplementationOnce(() => addDecrypt.promise)
+        .mockImplementationOnce(() => editDecrypt.promise);
+      mockShouldNotify.mockReturnValue(true);
+
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      const messageHandler = requireHandler(ws, 'message');
+      const updateHandler = requireHandler(ws, 'message_update');
+
+      act(() => {
+        messageHandler({
+          type: 'message',
+          data: {
+            id: 'msg-add-edit-race',
+            channel_id: 'channel-1',
+            server_id: 'server-1',
+            user_id: 'user-2',
+            username: 'alice',
+            content: 'original-channel-ciphertext',
+            key_version: 2,
+            created_at: '2025-01-01T00:00:00Z',
+            updated_at: '2025-01-01T00:00:00Z',
+          },
+        });
+        updateHandler({
+          type: 'message_update',
+          data: {
+            channel_id: 'channel-1',
+            id: 'msg-add-edit-race',
+            content: 'edited-channel-ciphertext',
+            key_version: 3,
+            edited_at: '2025-01-01T00:01:00Z',
+            updated_at: '2025-01-01T00:01:00Z',
+          },
+        });
+      });
+
+      await act(async () => {
+        editDecrypt.resolve('Edited channel plaintext');
+        await editDecrypt.promise;
+      });
+      await act(async () => {
+        addDecrypt.resolve('Original channel plaintext');
+        await addDecrypt.promise;
+      });
+
+      const message = useChatStore
+        .getState()
+        .messagesByChannel.get('channel-1')
+        ?.find((candidate) => candidate.id === 'msg-add-edit-race');
+      expect.soft(message).toBeDefined();
+      expect.soft(message).toMatchObject({
+        content: 'Edited channel plaintext',
+        key_version: 3,
+        edited_at: '2025-01-01T00:01:00Z',
+        updated_at: '2025-01-01T00:01:00Z',
+      });
+      expect.soft(message?.content).not.toBe('Original channel plaintext');
+      expect.soft(mockIndexMessage).toHaveBeenCalledTimes(1);
+      expect
+        .soft(mockIndexMessage)
+        .toHaveBeenCalledWith('msg-add-edit-race', 'Edited channel plaintext', 'channel-1');
+      expect
+        .soft(mockIndexMessage)
+        .not.toHaveBeenCalledWith('msg-add-edit-race', 'Original channel plaintext', 'channel-1');
+      expect.soft(mockNotify).not.toHaveBeenCalled();
+      expect.soft(mockIncrementBadge).not.toHaveBeenCalled();
+    });
+
+    it('preserves a DM edit that decrypts before its pending message add', async () => {
+      const addDecrypt = deferred<string>();
+      const editDecrypt = deferred<string>();
+      mockDecryptForChannelWithVersion
+        .mockImplementationOnce(() => addDecrypt.promise)
+        .mockImplementationOnce(() => editDecrypt.promise);
+      mockShouldNotify.mockReturnValue(true);
+
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      const messageHandler = requireHandler(ws, 'dm_message');
+      const updateHandler = requireHandler(ws, 'dm_message_update');
+
+      act(() => {
+        messageHandler({
+          type: 'dm_message',
+          data: {
+            id: 'dm-add-edit-race',
+            conversation_id: 'conv-add-edit-race',
+            user_id: 'user-2',
+            username: 'alice',
+            content: 'original-dm-ciphertext',
+            key_version: 2,
+            created_at: '2025-01-01T00:00:00Z',
+            updated_at: '2025-01-01T00:00:00Z',
+          },
+        });
+        updateHandler({
+          type: 'dm_message_update',
+          data: {
+            conversation_id: 'conv-add-edit-race',
+            id: 'dm-add-edit-race',
+            content: 'edited-dm-ciphertext',
+            key_version: 3,
+            edited_at: '2025-01-01T00:01:00Z',
+            updated_at: '2025-01-01T00:01:00Z',
+          },
+        });
+      });
+
+      await act(async () => {
+        editDecrypt.resolve('Edited DM plaintext');
+        await editDecrypt.promise;
+      });
+      await act(async () => {
+        addDecrypt.resolve('Original DM plaintext');
+        await addDecrypt.promise;
+      });
+
+      const message = useChatStore
+        .getState()
+        .messagesByChannel.get('conv-add-edit-race')
+        ?.find((candidate) => candidate.id === 'dm-add-edit-race');
+      expect.soft(message).toBeDefined();
+      expect.soft(message).toMatchObject({
+        content: 'Edited DM plaintext',
+        key_version: 3,
+        edited_at: '2025-01-01T00:01:00Z',
+        updated_at: '2025-01-01T00:01:00Z',
+      });
+      expect.soft(message?.content).not.toBe('Original DM plaintext');
+      expect.soft(mockIndexMessage).toHaveBeenCalledTimes(1);
+      expect
+        .soft(mockIndexMessage)
+        .toHaveBeenCalledWith('dm-add-edit-race', 'Edited DM plaintext', 'conv-add-edit-race');
+      expect
+        .soft(mockIndexMessage)
+        .not.toHaveBeenCalledWith(
+          'dm-add-edit-race',
+          'Original DM plaintext',
+          'conv-add-edit-race'
+        );
+      expect.soft(mockNotify).not.toHaveBeenCalled();
+      expect.soft(mockIncrementBadge).not.toHaveBeenCalled();
+    });
+
+    it.each(['success', 'failure'] as const)(
+      'cancels a pending channel edit after message_delete on late %s',
+      async (settlement) => {
+        const updateSpy = vi.spyOn(useChatStore.getState(), 'updateMessage');
+        const pendingDecrypt = deferred<string>();
+        mockDecryptForChannelWithVersion.mockImplementationOnce(() => pendingDecrypt.promise);
+        const ws = createMockWsService();
+        renderHook(() => useWebSocketMessages(ws as never));
+        const updateHandler = requireHandler(ws, 'message_update');
+        const deleteHandler = requireHandler(ws, 'message_delete');
+
+        useChatStore.getState().addMessage('channel-1', {
+          id: 'msg-delete-pending-edit',
+          channel_id: 'channel-1',
+          user_id: 'user-2',
+          content: 'Original content',
+          key_version: 1,
+          username: 'alice',
+          created_at: '2025-01-01T00:00:00Z',
+          updated_at: '2025-01-01T00:00:00Z',
+        });
+
+        act(() => {
+          updateHandler({
+            type: 'message_update',
+            data: {
+              channel_id: 'channel-1',
+              id: 'msg-delete-pending-edit',
+              content: 'pending-ciphertext',
+              key_version: 2,
+              edited_at: '2025-01-01T00:01:00Z',
+            },
+          });
+          deleteHandler({
+            type: 'message_delete',
+            data: { channel_id: 'channel-1', id: 'msg-delete-pending-edit' },
+          });
+        });
+
+        updateSpy.mockClear();
+        mockIndexMessage.mockClear();
+        await act(async () => {
+          if (settlement === 'success') {
+            pendingDecrypt.resolve('Late plaintext');
+            await pendingDecrypt.promise;
+          } else {
+            pendingDecrypt.reject(new Error('late decrypt failed'));
+            await pendingDecrypt.promise.catch(() => undefined);
+          }
+        });
+
+        expect(useChatStore.getState().messagesByChannel.get('channel-1')).toHaveLength(0);
+        expect(updateSpy).not.toHaveBeenCalled();
+        expect(mockIndexMessage).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each(['success', 'failure'] as const)(
+      'cancels a pending DM edit after dm_message_delete on late %s',
+      async (settlement) => {
+        const updateSpy = vi.spyOn(useChatStore.getState(), 'updateMessage');
+        const pendingDecrypt = deferred<string>();
+        mockDecryptForChannelWithVersion.mockImplementationOnce(() => pendingDecrypt.promise);
+        const ws = createMockWsService();
+        renderHook(() => useWebSocketMessages(ws as never));
+        const updateHandler = requireHandler(ws, 'dm_message_update');
+        const deleteHandler = requireHandler(ws, 'dm_message_delete');
+
+        useChatStore.getState().addMessage('conv-pending-delete', {
+          id: 'dm-delete-pending-edit',
+          channel_id: 'conv-pending-delete',
+          user_id: 'user-2',
+          content: 'Original DM',
+          key_version: 1,
+          username: 'alice',
+          created_at: '2025-01-01T00:00:00Z',
+          updated_at: '2025-01-01T00:00:00Z',
+        });
+
+        act(() => {
+          updateHandler({
+            type: 'dm_message_update',
+            data: {
+              conversation_id: 'conv-pending-delete',
+              id: 'dm-delete-pending-edit',
+              content: 'pending-dm-ciphertext',
+              key_version: 2,
+              edited_at: '2025-01-01T00:01:00Z',
+            },
+          });
+          deleteHandler({
+            type: 'dm_message_delete',
+            data: { conversation_id: 'conv-pending-delete', id: 'dm-delete-pending-edit' },
+          });
+        });
+
+        updateSpy.mockClear();
+        mockIndexMessage.mockClear();
+        await act(async () => {
+          if (settlement === 'success') {
+            pendingDecrypt.resolve('Late DM plaintext');
+            await pendingDecrypt.promise;
+          } else {
+            pendingDecrypt.reject(new Error('late DM decrypt failed'));
+            await pendingDecrypt.promise.catch(() => undefined);
+          }
+        });
+
+        expect(useChatStore.getState().messagesByChannel.get('conv-pending-delete')).toHaveLength(
+          0
+        );
+        expect(updateSpy).not.toHaveBeenCalled();
+        expect(mockIndexMessage).not.toHaveBeenCalled();
+      }
+    );
+
+    it('invalidates a pending edit when the WebSocket hook unmounts', async () => {
+      const updateSpy = vi.spyOn(useChatStore.getState(), 'updateMessage');
+      const pendingDecrypt = deferred<string>();
+      mockDecryptForChannelWithVersion.mockImplementationOnce(() => pendingDecrypt.promise);
+      const ws = createMockWsService();
+      const { unmount } = renderHook(() => useWebSocketMessages(ws as never));
+      const updateHandler = requireHandler(ws, 'message_update');
+
+      useChatStore.getState().addMessage('channel-1', {
+        id: 'msg-unmount-pending-edit',
+        channel_id: 'channel-1',
+        user_id: 'user-2',
+        content: 'Original content',
+        key_version: 1,
+        username: 'alice',
+        created_at: '2025-01-01T00:00:00Z',
+        updated_at: '2025-01-01T00:00:00Z',
+      });
+
+      act(() => {
+        updateHandler({
+          type: 'message_update',
+          data: {
+            channel_id: 'channel-1',
+            id: 'msg-unmount-pending-edit',
+            content: 'old-session-ciphertext',
+            key_version: 2,
+            edited_at: '2025-01-01T00:01:00Z',
+          },
+        });
+        unmount();
+      });
+
+      // Model a same-account rehydration after teardown. The old operation may
+      // not overwrite this newer lifecycle's content when it eventually settles.
+      useChatStore.getState().updateMessage('channel-1', 'msg-unmount-pending-edit', {
+        content: 'Rehydrated newer content',
+        key_version: 9,
+        updated_at: '2025-01-01T00:09:00Z',
+      });
+      updateSpy.mockClear();
+      mockIndexMessage.mockClear();
+
+      await act(async () => {
+        pendingDecrypt.resolve('Late old-session plaintext');
+        await pendingDecrypt.promise;
+      });
+
+      const message = useChatStore
+        .getState()
+        .messagesByChannel.get('channel-1')
+        ?.find((candidate) => candidate.id === 'msg-unmount-pending-edit');
+      expect(message).toMatchObject({
+        content: 'Rehydrated newer content',
+        key_version: 9,
+        updated_at: '2025-01-01T00:09:00Z',
+      });
+      expect(updateSpy).not.toHaveBeenCalled();
+      expect(mockIndexMessage).not.toHaveBeenCalled();
+    });
+
+    it.each(['success', 'failure'] as const)(
+      'cancels a pending ordinary channel message after message_delete on late %s',
+      async (settlement) => {
+        const addSpy = vi.spyOn(useChatStore.getState(), 'addMessage');
+        const pendingDecrypt = deferred<string>();
+        mockDecryptForChannelWithVersion.mockImplementationOnce(() => pendingDecrypt.promise);
+        mockShouldNotify.mockReturnValue(true);
+        useChannelStore
+          .getState()
+          .updateChannel('channel-1', { linked_voice_channel_id: 'voice-linked' });
+        useVoiceStore.getState().setActiveChannel('voice-linked');
+
+        const ws = createMockWsService();
+        renderHook(() => useWebSocketMessages(ws as never));
+        const messageHandler = requireHandler(ws, 'message');
+        const deleteHandler = requireHandler(ws, 'message_delete');
+
+        act(() => {
+          messageHandler({
+            type: 'message',
+            data: {
+              id: 'msg-new-delete-pending',
+              channel_id: 'channel-1',
+              server_id: 'server-1',
+              user_id: 'user-2',
+              username: 'alice',
+              content: 'pending-new-ciphertext',
+              key_version: 2,
+              created_at: '2025-01-01T00:00:00Z',
+              updated_at: '2025-01-01T00:00:00Z',
+            },
+          });
+          deleteHandler({
+            type: 'message_delete',
+            data: { channel_id: 'channel-1', id: 'msg-new-delete-pending' },
+          });
+        });
+
+        addSpy.mockClear();
+        mockIndexMessage.mockClear();
+        mockNotify.mockClear();
+        mockIncrementBadge.mockClear();
+        mockTtsSpeak.mockClear();
+        await act(async () => {
+          if (settlement === 'success') {
+            pendingDecrypt.resolve('Late ordinary plaintext');
+            await pendingDecrypt.promise;
+          } else {
+            pendingDecrypt.reject(new Error('late ordinary decrypt failed'));
+            await pendingDecrypt.promise.catch(() => undefined);
+          }
+        });
+
+        expect.soft(useChatStore.getState().messagesByChannel.get('channel-1')).toHaveLength(0);
+        expect.soft(addSpy).not.toHaveBeenCalled();
+        expect.soft(mockIndexMessage).not.toHaveBeenCalled();
+        expect.soft(mockNotify).not.toHaveBeenCalled();
+        expect.soft(mockIncrementBadge).not.toHaveBeenCalled();
+        expect.soft(mockTtsSpeak).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each(['success', 'failure'] as const)(
+      'cancels a pending ordinary DM after dm_message_delete on late %s',
+      async (settlement) => {
+        const addSpy = vi.spyOn(useChatStore.getState(), 'addMessage');
+        const pendingDecrypt = deferred<string>();
+        mockDecryptForChannelWithVersion.mockImplementationOnce(() => pendingDecrypt.promise);
+        mockShouldNotify.mockReturnValue(true);
+
+        const ws = createMockWsService();
+        renderHook(() => useWebSocketMessages(ws as never));
+        const messageHandler = requireHandler(ws, 'dm_message');
+        const deleteHandler = requireHandler(ws, 'dm_message_delete');
+
+        act(() => {
+          messageHandler({
+            type: 'dm_message',
+            data: {
+              id: 'dm-new-delete-pending',
+              conversation_id: 'conv-new-delete-pending',
+              user_id: 'user-2',
+              username: 'alice',
+              content: 'pending-new-dm-ciphertext',
+              key_version: 2,
+              created_at: '2025-01-01T00:00:00Z',
+              updated_at: '2025-01-01T00:00:00Z',
+            },
+          });
+          deleteHandler({
+            type: 'dm_message_delete',
+            data: {
+              conversation_id: 'conv-new-delete-pending',
+              id: 'dm-new-delete-pending',
+            },
+          });
+        });
+
+        addSpy.mockClear();
+        mockIndexMessage.mockClear();
+        mockNotify.mockClear();
+        mockIncrementBadge.mockClear();
+        await act(async () => {
+          if (settlement === 'success') {
+            pendingDecrypt.resolve('Late ordinary DM plaintext');
+            await pendingDecrypt.promise;
+          } else {
+            pendingDecrypt.reject(new Error('late ordinary DM decrypt failed'));
+            await pendingDecrypt.promise.catch(() => undefined);
+          }
+        });
+
+        expect
+          .soft(useChatStore.getState().messagesByChannel.get('conv-new-delete-pending'))
+          .toHaveLength(0);
+        expect.soft(addSpy).not.toHaveBeenCalled();
+        expect.soft(mockIndexMessage).not.toHaveBeenCalled();
+        expect.soft(mockNotify).not.toHaveBeenCalled();
+        expect.soft(mockIncrementBadge).not.toHaveBeenCalled();
+      }
+    );
+
+    it('suppresses late channel content and replied_to decrypts after unmount', async () => {
+      const addSpy = vi.spyOn(useChatStore.getState(), 'addMessage');
+      const updateSpy = vi.spyOn(useChatStore.getState(), 'updateMessage');
+      const contentDecrypt = deferred<string>();
+      const replyDecrypt = deferred<string>();
+      mockDecryptForChannelWithVersion
+        .mockImplementationOnce(() => contentDecrypt.promise)
+        .mockImplementationOnce(() => replyDecrypt.promise);
+      mockShouldNotify.mockReturnValue(true);
+      useChannelStore
+        .getState()
+        .updateChannel('channel-1', { linked_voice_channel_id: 'voice-linked' });
+      useVoiceStore.getState().setActiveChannel('voice-linked');
+
+      const ws = createMockWsService();
+      const { unmount } = renderHook(() => useWebSocketMessages(ws as never));
+      const messageHandler = requireHandler(ws, 'message');
+
+      act(() => {
+        messageHandler({
+          type: 'message',
+          data: {
+            id: 'msg-new-unmount-pending',
+            channel_id: 'channel-1',
+            server_id: 'server-1',
+            user_id: 'user-2',
+            username: 'alice',
+            content: 'pending-content-ciphertext',
+            key_version: 2,
+            replied_to: {
+              id: 'reply-target',
+              user_id: 'user-3',
+              username: 'bob',
+              content: 'pending-reply-ciphertext',
+              key_version: 3,
+            },
+            created_at: '2025-01-01T00:00:00Z',
+            updated_at: '2025-01-01T00:00:00Z',
+          },
+        });
+      });
+
+      const placeholder = useChatStore
+        .getState()
+        .messagesByChannel.get('channel-1')
+        ?.find((message) => message.id === 'msg-new-unmount-pending');
+      expect.soft(placeholder?.content).toBe('');
+      expect.soft(placeholder?.replied_to?.content).toBe('');
+
+      act(() => unmount());
+
+      addSpy.mockClear();
+      updateSpy.mockClear();
+      mockIndexMessage.mockClear();
+      mockNotify.mockClear();
+      mockIncrementBadge.mockClear();
+      mockTtsSpeak.mockClear();
+      await act(async () => {
+        contentDecrypt.resolve('Late content plaintext');
+        replyDecrypt.resolve('Late reply plaintext');
+        await Promise.all([contentDecrypt.promise, replyDecrypt.promise]);
+      });
+
+      expect.soft(useChatStore.getState().messagesByChannel.get('channel-1')).toBeUndefined();
+      expect.soft(addSpy).not.toHaveBeenCalled();
+      expect.soft(updateSpy).not.toHaveBeenCalled();
+      expect.soft(mockIndexMessage).not.toHaveBeenCalled();
+      expect.soft(mockNotify).not.toHaveBeenCalled();
+      expect.soft(mockIncrementBadge).not.toHaveBeenCalled();
+      expect.soft(mockTtsSpeak).not.toHaveBeenCalled();
+    });
+
+    it('suppresses a late ordinary DM decrypt after unmount', async () => {
+      const addSpy = vi.spyOn(useChatStore.getState(), 'addMessage');
+      const pendingDecrypt = deferred<string>();
+      mockDecryptForChannelWithVersion.mockImplementationOnce(() => pendingDecrypt.promise);
+      mockShouldNotify.mockReturnValue(true);
+
+      const ws = createMockWsService();
+      const { unmount } = renderHook(() => useWebSocketMessages(ws as never));
+      const messageHandler = requireHandler(ws, 'dm_message');
+
+      act(() => {
+        messageHandler({
+          type: 'dm_message',
+          data: {
+            id: 'dm-new-unmount-pending',
+            conversation_id: 'conv-new-unmount-pending',
+            user_id: 'user-2',
+            username: 'alice',
+            content: 'pending-unmount-dm-ciphertext',
+            key_version: 2,
+            created_at: '2025-01-01T00:00:00Z',
+            updated_at: '2025-01-01T00:00:00Z',
+          },
+        });
+        unmount();
+      });
+
+      addSpy.mockClear();
+      mockIndexMessage.mockClear();
+      mockNotify.mockClear();
+      mockIncrementBadge.mockClear();
+      await act(async () => {
+        pendingDecrypt.resolve('Late unmounted DM plaintext');
+        await pendingDecrypt.promise;
+      });
+
+      expect(
+        useChatStore.getState().messagesByChannel.get('conv-new-unmount-pending')
+      ).toBeUndefined();
+      expect.soft(addSpy).not.toHaveBeenCalled();
+      expect.soft(mockIndexMessage).not.toHaveBeenCalled();
+      expect.soft(mockNotify).not.toHaveBeenCalled();
+      expect.soft(mockIncrementBadge).not.toHaveBeenCalled();
+    });
+
+    it('suppresses a pending DM decrypt after the conversation is deleted', async () => {
+      const pendingDecrypt = deferred<string>();
+      mockDecryptForChannelWithVersion.mockImplementationOnce(() => pendingDecrypt.promise);
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      const messageHandler = requireHandler(ws, 'dm_message');
+      const groupDeletedHandler = requireHandler(ws, 'dm_group_deleted');
+
+      act(() => {
+        messageHandler({
+          type: 'dm_message',
+          data: {
+            id: 'dm-pending-access-loss',
+            conversation_id: 'conv-pending-access-loss',
+            user_id: 'user-2',
+            username: 'alice',
+            content: 'pending-ciphertext',
+            key_version: 2,
+            created_at: '2025-01-01T00:00:00Z',
+            updated_at: '2025-01-01T00:00:00Z',
+          },
+        });
+        groupDeletedHandler({
+          type: 'dm_group_deleted',
+          data: { conversation_id: 'conv-pending-access-loss' },
+        });
+      });
+
+      mockIndexMessage.mockClear();
+      await act(async () => {
+        pendingDecrypt.resolve('Late revoked plaintext');
+        await pendingDecrypt.promise;
+      });
+
+      expect(
+        useChatStore.getState().messagesByChannel.get('conv-pending-access-loss')
+      ).toBeUndefined();
+      expect(mockIndexMessage).not.toHaveBeenCalled();
+      expect(mockRevokeChannelAccess).toHaveBeenCalledWith('conv-pending-access-loss');
     });
   });
 

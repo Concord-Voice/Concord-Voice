@@ -60,6 +60,9 @@ export async function decryptPins(
     return msgs; // No decrypted flag set — PinContent will show "Encrypted message" placeholder
   }
 
+  const operationGuard = e2eeService.createChannelOperationGuard(contextId);
+  operationGuard.assertCurrent();
+
   // Pre-fetch channel key once
   let channelKey: CryptoKey | null = null;
   try {
@@ -84,7 +87,7 @@ export async function decryptPins(
     }
   }
 
-  return Promise.all(
+  const decryptedPins = await Promise.all(
     msgs.map(async (m) => {
       const message = { ...m, channel_id: m.channel_id || contextId };
       try {
@@ -93,11 +96,11 @@ export async function decryptPins(
         if (kv && kv > 1) {
           const vKey = versionedKeys.get(kv);
           plaintext = vKey
-            ? await e2eeService.decryptWithKey(message.content, vKey)
+            ? await e2eeService.decryptWithKey(message.content, vKey, operationGuard)
             : await e2eeService.decryptForChannelWithVersion(contextId, message.content, kv);
         } else {
           plaintext = channelKey
-            ? await e2eeService.decryptWithKey(message.content, channelKey)
+            ? await e2eeService.decryptWithKey(message.content, channelKey, operationGuard)
             : await e2eeService.decryptForChannel(contextId, message.content);
         }
         const { text, gifSlug } = unwrapGifEnvelope(plaintext);
@@ -112,4 +115,6 @@ export async function decryptPins(
       }
     })
   );
+  operationGuard.assertCurrent();
+  return decryptedPins;
 }

@@ -18,12 +18,15 @@ const mockDecryptWithKey = vi.fn();
 const mockDecryptForChannel = vi.fn();
 const mockDecryptForChannelWithVersion = vi.fn();
 const mockInvalidateChannelKey = vi.fn();
+const mockOperationGuard = { assertCurrent: vi.fn() };
+const mockCreateChannelOperationGuard = vi.fn(() => mockOperationGuard);
 
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     get isInitialized() {
       return true;
     },
+    createChannelOperationGuard: (...args: unknown[]) => mockCreateChannelOperationGuard(...args),
     getChannelKey: (...args: unknown[]) => mockGetChannelKey(...args),
     getChannelKeyByVersion: (...args: unknown[]) => mockGetChannelKeyByVersion(...args),
     decryptWithKey: (...args: unknown[]) => mockDecryptWithKey(...args),
@@ -33,7 +36,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { useMessageFetch } from '@/renderer/hooks/useMessageFetch';
+import { reconcileFetchedMessages, useMessageFetch } from '@/renderer/hooks/useMessageFetch';
 
 // Helper: build a mock API response
 function mockFetchResponse(messages: MessageWithStatus[], ok = true) {
@@ -49,12 +52,93 @@ function mockFetchResponse(messages: MessageWithStatus[], ok = true) {
 describe('useMessageFetch', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockOperationGuard.assertCurrent.mockImplementation(() => undefined);
     useChatStore.setState({
       messagesByChannel: new Map(),
     });
   });
 
   // --- Basic fetch ---
+
+  it('keeps a newer live edit using the latest of edited_at and updated_at', () => {
+    const fetched = {
+      ...mockMessage,
+      id: 'edited-message',
+      content: 'stale plaintext',
+      updated_at: '2025-01-01T12:00:00Z',
+      edited_at: '2025-01-01T12:01:00Z',
+    };
+    const live = {
+      ...fetched,
+      content: 'newer plaintext',
+      // DM edit responses may leave updated_at unchanged.
+      edited_at: '2025-01-01T12:02:00Z',
+    };
+
+    const reconciled = reconcileFetchedMessages([fetched], [live], new Set(['edited-message']));
+
+    expect(reconciled.fetched).toEqual([live]);
+  });
+
+  it('accepts a later REST edit despite a skewed synthetic live updated_at', () => {
+    const fetched = {
+      ...mockMessage,
+      id: 'clock-skewed-edit',
+      content: 'authoritative later edit',
+      edited_at: '2025-01-01T12:03:00Z',
+      updated_at: '2025-01-01T12:03:00Z',
+    };
+    const live = {
+      ...fetched,
+      content: 'stale earlier edit',
+      edited_at: '2025-01-01T12:02:00Z',
+      updated_at: '2099-01-01T00:00:00Z',
+    };
+
+    const reconciled = reconcileFetchedMessages([fetched], [live], new Set(['clock-skewed-edit']));
+
+    expect(reconciled.fetched).toEqual([fetched]);
+  });
+
+  it('keeps a loaded row invalidated by an equal-timestamp live edit', () => {
+    const fetched = {
+      ...mockMessage,
+      id: 'equal-timestamp-edit',
+      content: 'authoritative REST plaintext',
+      edited_at: '2025-01-01T12:04:00Z',
+    };
+    const live = {
+      ...fetched,
+      content: 'live decrypted plaintext',
+    };
+
+    const reconciled = reconcileFetchedMessages(
+      [fetched],
+      [live],
+      new Set(['equal-timestamp-edit']),
+      new Set(['equal-timestamp-edit'])
+    );
+
+    expect(reconciled.fetched).toEqual([fetched]);
+    expect(reconciled.preserved).toEqual([]);
+  });
+
+  it('drops an unloaded REST row invalidated by an edit or delete during decryption', () => {
+    const fetched = {
+      ...mockMessage,
+      id: 'unloaded-message',
+      content: 'stale plaintext',
+    };
+
+    const reconciled = reconcileFetchedMessages(
+      [fetched],
+      [],
+      new Set(),
+      new Set(['unloaded-message'])
+    );
+
+    expect(reconciled.fetched).toEqual([]);
+  });
 
   it('fetches messages on mount and stores them in chatStore', async () => {
     const msgs = [

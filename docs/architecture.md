@@ -228,7 +228,18 @@ Packaged clients fetch binary update manifests + signed installers from the publ
 
 **API:** REST handlers + the single `/ws` upgrade endpoint across 20+ route groups (`/auth`, `/auth/sso`, `/mfa`, `/users`, `/sessions`, `/servers`, `/channels`, `/categories`, `/e2ee`, `/messages`, `/dm/conversations`, `/friends`, `/invites`, `/voice`, `/media`, `/notifications`, `/privacy`, `/klipy`, `/updates`, `/ws`). The Klipy routes register only when `KLIPY_API_KEY` is set; some media routes register a 503 fallback when object storage is unconfigured. See [API Documentation](./api/README.md); generated route counts are checked by `scripts/update-claude-md-counts.sh`.
 
-**E2EE relay (zero-knowledge):** the server relays ciphertext and never decrypts. On the REST path, `messages` handlers (`internal/messages/handlers.go`) validate ciphertext structurally (`isValidCiphertext` — base64 + ≥28-byte decoded length) and enforce epoch revocation (`enforceE2EE`). On the WebSocket path, the hub validates the envelope (`validateEnvelope` — `key_version` present, length cap) and enforces epochs (`enforceWSEpoch` in `internal/websocket/hub.go`); it stores the `content` column verbatim. The E2EE-everywhere posture (#201) removed all per-row `is_encrypted` flags (migration 000062) — encryption is structural, not a runtime branch.
+**E2EE relay (zero-knowledge):** the server relays ciphertext and never decrypts. On the REST path, `messages` handlers (`internal/messages/handlers.go`) validate ciphertext structurally (`isValidCiphertext` — base64 + ≥28-byte decoded length) and enforce epoch revocation (`enforceE2EE`). Channel and DM edits require a positive `key_version`; channel edits require the author to retain `PermManageOwnMessages`, while DM edits require participant and author checks. Their handlers then validate the ciphertext and epoch and store `content` and `key_version` atomically.
+
+Migration 000085 serializes edits against revocation inserts on the stable channel
+or conversation row: the revocation trigger takes `FOR SHARE`, while the edit
+transaction takes `FOR NO KEY UPDATE` before a fresh ledger check and conditional
+update. Group-DM membership and deletion transactions follow the same parent-first
+lock order: add/remove take `FOR NO KEY UPDATE` on `dm_conversations` before touching
+`dm_participants`, while group deletion takes `FOR UPDATE` before deleting children.
+Taking a participant-row or foreign-key lock first can deadlock when PostgreSQL later
+upgrades the parent lock, so new child-table mutations must preserve this order.
+
+On the WebSocket path, the hub validates the envelope (`validateEnvelope` — `key_version` present, length cap) and enforces epochs (`enforceWSEpoch` in `internal/websocket/hub.go`); it stores the `content` column verbatim. The E2EE-everywhere posture (#201) removed all per-row `is_encrypted` flags (migration 000062) — encryption is structural, not a runtime branch.
 
 **Outbound SSRF egress guard:** the Klipy media proxy (`internal/klipy/handlers.go`) is the reference SSRF-hardened outbound surface. A cloned transport installs `net.Dialer.Control` running `isDeniedEgressIP` (post-DNS, pre-connect — defends redirect-SSRF + DNS-rebinding with no TOCTOU window; denies loopback / private / ULA / link-local / multicast / CGNAT / deprecated site-local, after `Unmap()`), and `http.Client.CheckRedirect` re-validates scheme + host against `allowedMediaHosts` on every hop.
 
@@ -533,9 +544,13 @@ sequenceDiagram
 
 > **Client-side dispatch validation (PR #1184, closes #709).** Every inbound envelope is validated by `WebSocketEventSchema` (a zod 4 discriminated union over `type`) before any per-handler dispatch in `client/desktop/src/renderer/services/websocketService.ts`. Failed envelopes are dropped with a PII-scrubbed structural log (`scrubZodIssues`) and `connectionStore.wireViolationCount` is incremented. Handlers in `useWebSocketMessages.ts` operate on already-narrowed payloads. The `isInitialized` guard on `e2eeService` makes decryption fail-closed (render-as-error) if keys aren't ready, never leaking ciphertext.
 
+Edited channel and DM content is encrypted with `encryptForChannelWithVersion`, which returns the ciphertext and the exact epoch selected before asynchronous WebCrypto work yields. The renderer sends that pair to the REST edit endpoint. A `409 epoch_revoked` response invalidates the cached channel key and permits one re-encryption attempt; missing, zero, or repeatedly revoked epochs fail closed. Incoming add and edit events share one per-message operation lane: a blank placeholder exists before add decryption, only the newest live operation may update the store/search index or emit notifications, and delete/unmount/account teardown suppresses stale continuations.
+
+Initial and paginated history fetches bind decryption and publication to a request-local E2EE guard plus a message-invalidation journal. Reconciliation preserves newer live edits, live arrivals, and optimistic rows while refusing to restore deleted rows; an equal-timestamp loaded row remains present until the authoritative fetch replaces its content. During an initial-history request, an edit or delete for a fetched-but-unloaded ID forces one fresh request; unrelated invalidations do not. During pagination, the same conflict retries the cursor once and leaves it retryable after a second conflict without publishing a partial page. Ordinary key rotation retries/refetches and access revocation is terminal. Pinned-message batches and DM preview decrypts also assert a current channel-operation guard immediately before publication; previews additionally verify that their conversation and ciphertext still match.
+
 ### Message Search (client-side, E2EE-native)
 
-Because the server holds only ciphertext, full-text **message search runs entirely in the renderer**. `searchService.ts` builds an in-memory MiniSearch index over _decrypted_ message content — no plaintext is written to disk or sent to the server. The client backfills the index by pulling ciphertext from a rate-limited bulk-fetch endpoint and decrypting locally; the index is memory-only, capped at ~50K messages / ~3MB with per-channel LRU eviction. (User-search and Klipy GIF-search, by contrast, are server-side.)
+Because the server holds only ciphertext, full-text **message search runs entirely in the renderer**. `searchService.ts` builds an in-memory MiniSearch index over _decrypted_ message content — no plaintext is written to disk or sent to the server. The client backfills the index by pulling ciphertext from a rate-limited bulk-fetch endpoint and decrypting locally; the index is memory-only, capped at ~50K messages / ~3MB with per-channel LRU eviction. Live content is indexed only after the current decrypt operation successfully updates an existing store row. Message deletion records its UUID for active backfill generations, preventing an in-flight decrypt from re-indexing or surfacing deleted plaintext; that auxiliary tracking is bounded, and overflow invalidates the affected backfill fail closed, while an ID-level signal removes plaintext already emitted into an open search result. Removing a channel or DM conversation invalidates its E2EE generation before purging that search scope; graceful account reset fences prior E2EE continuations before clearing the entire decrypted index. (User-search and Klipy GIF-search, by contrast, are server-side.)
 
 ### Encrypted Cross-Device Sync
 
@@ -555,7 +570,7 @@ Within one control-plane process, live Custom Status updates, audience deltas, d
 
 ### DM Message Pinning
 
-DM messages support pinning like channel messages: `dm_messages.pinned_by` (migration 000057) records the pinning user. Pin/unpin live in the **`messages`** package (`POST` / `DELETE /api/v1/messages/:id/pin`); the handler branches to `pinDMMessage` / `unpinDMMessage` for DM messages. Pinned-message decryption flows through the same `e2eeService` path (`pinnedMessageUtils.tsx`).
+DM messages support pinning like channel messages: `dm_messages.pinned_by` (migration 000057) records the pinning user. Pin/unpin live in the **`messages`** package (`POST` / `DELETE /api/v1/messages/:id/pin`); the handler branches to `pinDMMessage` / `unpinDMMessage` for DM messages. Pinned-message decryption flows through `pinnedMessageUtils.tsx` and binds the raw-key batch plus final publication to one current E2EE channel-operation guard.
 
 ### Klipy GIF Proxy
 

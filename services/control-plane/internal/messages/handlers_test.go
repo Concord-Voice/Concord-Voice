@@ -204,7 +204,8 @@ func TestUpdateMessageSuccess(t *testing.T) {
 
 	ciphertext := testhelpers.ValidCiphertext()
 	w := ts.DoRequest("PATCH", "/api/v1/messages/"+msgID, map[string]interface{}{
-		"content": ciphertext,
+		"content":     ciphertext,
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -222,7 +223,8 @@ func TestUpdateMessageNotAuthor(t *testing.T) {
 	ts.AddMemberToServer(t, serverID, other.ID, "member")
 
 	w := ts.DoRequest("PATCH", "/api/v1/messages/"+msgID, map[string]interface{}{
-		"content": "Unauthorized edit",
+		"content":     "Unauthorized edit",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(other.AccessToken))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)

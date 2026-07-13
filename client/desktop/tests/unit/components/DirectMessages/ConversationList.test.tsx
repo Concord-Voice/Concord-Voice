@@ -11,7 +11,10 @@ import { vi } from 'vitest';
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
+    createChannelOperationGuard: vi.fn(() => ({ assertCurrent: vi.fn() })),
     decryptForChannel: vi.fn().mockResolvedValue(null),
+    invalidateChannelKey: vi.fn(),
+    revokeChannelAccess: vi.fn(),
   },
 }));
 
@@ -50,6 +53,16 @@ describe('ConversationList', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    (e2eeService as any).isInitialized = false;
+    (e2eeService.createChannelOperationGuard as ReturnType<typeof vi.fn>).mockImplementation(
+      () => ({ assertCurrent: vi.fn() })
+    );
+    (e2eeService.invalidateChannelKey as ReturnType<typeof vi.fn>).mockImplementation(
+      () => undefined
+    );
+    (e2eeService.revokeChannelAccess as ReturnType<typeof vi.fn>).mockImplementation(
+      () => undefined
+    );
     useVoiceStore.getState().reset();
     useUserStore.setState({
       user: {
@@ -251,6 +264,57 @@ describe('ConversationList', () => {
     });
     render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
     await waitFor(() => expect(screen.getByText('Hey there!')).toBeInTheDocument());
+    (e2eeService as any).isInitialized = false;
+  });
+
+  it('does not retain an in-flight preview after remote conversation removal', async () => {
+    (e2eeService as any).isInitialized = true;
+    let generation = 0;
+    let resolveDecrypt!: (plaintext: string) => void;
+    const decryptPromise = new Promise<string>((resolve) => {
+      resolveDecrypt = resolve;
+    });
+    const decryptMock = e2eeService.decryptForChannel as ReturnType<typeof vi.fn>;
+    decryptMock
+      .mockReturnValueOnce(decryptPromise)
+      .mockRejectedValueOnce(new Error('new key unavailable'));
+    (e2eeService.createChannelOperationGuard as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      const capturedGeneration = generation;
+      return {
+        assertCurrent: () => {
+          if (capturedGeneration !== generation) throw new Error('stale preview generation');
+        },
+      };
+    });
+    (e2eeService.revokeChannelAccess as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      generation += 1;
+    });
+    const conversation = makeConversation({
+      lastMessage: {
+        content: 'removed-ciphertext',
+        userId: 'user-2',
+        username: 'alice',
+        createdAt: '2025-01-01T12:00:00Z',
+      },
+    });
+    useDMStore.setState({
+      conversations: [conversation],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+    render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+    await waitFor(() => expect(decryptMock).toHaveBeenCalledTimes(1));
+
+    act(() => useDMStore.getState().removeConversation(conversation.id));
+    resolveDecrypt('removed plaintext');
+    await act(async () => {
+      await decryptPromise;
+    });
+
+    act(() => useDMStore.setState({ conversations: [conversation] }));
+
+    await waitFor(() => expect(decryptMock).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText('removed plaintext')).not.toBeInTheDocument();
+    expect(screen.getByText('Encrypted message')).toBeInTheDocument();
     (e2eeService as any).isInitialized = false;
   });
 

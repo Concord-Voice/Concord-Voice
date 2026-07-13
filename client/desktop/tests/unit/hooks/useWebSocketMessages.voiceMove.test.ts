@@ -32,11 +32,13 @@ vi.mock('@/renderer/services/voiceService', () => ({
 }));
 
 const mockInvalidateChannelKey = vi.fn();
+const mockRevokeChannelAccess = vi.fn();
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     decryptMessage: vi.fn((content: string) => Promise.resolve(content)),
     hasKey: vi.fn().mockReturnValue(false),
     invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
+    revokeChannelAccess: (...args: unknown[]) => mockRevokeChannelAccess(...args),
     isInitialized: false,
     processPendingKeyRequests: vi.fn(),
   },
@@ -93,6 +95,7 @@ beforeEach(() => {
   mockLeaveChannel.mockClear().mockResolvedValue(undefined);
   mockJoinChannel.mockClear().mockResolvedValue(undefined);
   mockInvalidateChannelKey.mockClear();
+  mockRevokeChannelAccess.mockClear();
   useAuthStore.getState().setAccessToken('mock-token');
   useChannelStore.getState().addChannel(mockChannel);
   useChatStore.setState({ isConnected: true });
@@ -223,7 +226,8 @@ describe('useWebSocketMessages — channel_access_revoked handler (#487 P4)', ()
 
     expect(useChannelStore.getState().channels.some((c) => c.id === REVOKE_CHANNEL)).toBe(false);
     expect(useChatStore.getState().messagesByChannel.get(REVOKE_CHANNEL)).toBeUndefined();
-    expect(mockInvalidateChannelKey).toHaveBeenCalledWith(REVOKE_CHANNEL);
+    expect(mockRevokeChannelAccess).toHaveBeenCalledTimes(1);
+    expect(mockRevokeChannelAccess).toHaveBeenCalledWith(REVOKE_CHANNEL);
   });
 
   it('leaves voice when currently in the revoked channel', () => {

@@ -3496,7 +3496,9 @@ paths:
       summary: Edit a DM message
       description: 'Edit your own DM message. Content must be base64-encoded AES-256-GCM ciphertext
 
-        (all DMs are encrypted under the E2EE-everywhere posture, #201).
+        (all DMs are encrypted under the E2EE-everywhere posture, #201). The request must pair
+
+        the ciphertext with the positive key epoch that encrypted it.
 
         Rate limit: 10 requests per minute (user-based).
 
@@ -3527,10 +3529,17 @@ paths:
               type: object
               required:
               - content
+              - key_version
               properties:
                 content:
                   type: string
+                  minLength: 1
+                  maxLength: 65536
                   description: Base64-encoded ciphertext (decoded length must be at least 28 bytes)
+                key_version:
+                  type: integer
+                  minimum: 1
+                  description: Key epoch used to encrypt content; revoked epochs are rejected
       responses:
         '200':
           description: Message updated
@@ -3554,7 +3563,7 @@ paths:
                         type: string
                         format: date-time
         '400':
-          description: Invalid conversation/message ID, invalid request body, or invalid ciphertext format
+          description: Invalid conversation/message ID, request body, ciphertext, or key_version
           content:
             application/json:
               schema:
@@ -3571,6 +3580,30 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '409':
+          description: The supplied key epoch has been revoked; re-encrypt with current_epoch
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - error
+                - code
+                - current_epoch
+                - conversation_id
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                    - epoch_revoked
+                  current_epoch:
+                    type: integer
+                    minimum: 1
+                  conversation_id:
+                    type: string
+                    format: uuid
     delete:
       tags:
       - DM
@@ -6878,7 +6911,11 @@ paths:
       tags:
       - Messages
       summary: Edit a message
-      description: 'Edit a message. Only the author can edit.
+      description: 'Edit a message. The caller must be the author and hold PermManageOwnMessages
+
+        in the message channel. Content must be ciphertext paired with the positive key epoch
+
+        that encrypted it.
 
         Rate limit: 10 requests per minute.
 
@@ -6908,12 +6945,48 @@ paths:
                 properties:
                   message:
                     $ref: '#/components/schemas/Message'
-        '403':
-          description: Not the message author
+        '400':
+          description: Invalid request body, ciphertext, or key_version
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '403':
+          description: Not the message author or missing PermManageOwnMessages
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Message not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The supplied key epoch has been revoked; re-encrypt with current_epoch
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - error
+                - code
+                - current_epoch
+                - channel_id
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                    - epoch_revoked
+                  current_epoch:
+                    type: integer
+                    minimum: 1
+                  channel_id:
+                    type: string
+                    format: uuid
     delete:
       tags:
       - Messages
@@ -13136,18 +13209,23 @@ components:
         content:
           type: string
           minLength: 1
-          maxLength: 24000
+          maxLength: 65536
           description: 'Base64-encoded AES-256-GCM ciphertext (all channels are E2EE under the E2EE-everywhere
             posture, #201)'
     UpdateMessageRequest:
       type: object
       required:
       - content
+      - key_version
       properties:
         content:
           type: string
           minLength: 1
-          maxLength: 24000
+          maxLength: 65536
+        key_version:
+          type: integer
+          minimum: 1
+          description: Key epoch used to encrypt content; revoked epochs are rejected
     AddMemberRequest:
       type: object
       required:

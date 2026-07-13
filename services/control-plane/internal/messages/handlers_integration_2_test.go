@@ -3,8 +3,10 @@ package messages_test
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -270,7 +272,8 @@ func TestUpdateMessageNotFound(t *testing.T) {
 	fakeID := uuid.New().String()
 
 	w := ts.DoRequest("PATCH", pathAPIMsgSlash+fakeID, map[string]interface{}{
-		"content": "Edited content",
+		"content":     "Edited content",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
@@ -315,7 +318,8 @@ func TestUpdateMessageE2EEEnforcement(t *testing.T) {
 
 	// Try to update with plaintext — should fail
 	w = ts.DoRequest("PATCH", pathAPIMsgSlash+msgID, map[string]interface{}{
-		"content": "plaintext update",
+		"content":     "plaintext update",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -345,7 +349,8 @@ func TestUpdateMessageE2EESuccess(t *testing.T) {
 	// Update with valid ciphertext — should succeed
 	newCiphertext := testhelpers.ValidCiphertext()
 	w = ts.DoRequest("PATCH", pathAPIMsgSlash+msgID, map[string]interface{}{
-		"content": newCiphertext,
+		"content":     newCiphertext,
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -354,6 +359,219 @@ func TestUpdateMessageE2EESuccess(t *testing.T) {
 	updatedMsg := body["message"].(map[string]interface{})
 	assert.Equal(t, newCiphertext, updatedMsg["content"])
 	assert.NotNil(t, updatedMsg["edited_at"])
+}
+
+func TestUpdateMessage_StoresKeyVersion(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "updmsgkeyversion")
+	serverID := ts.CreateTestServer(t, user.ID, "Update Key Version Server")
+	channelID := ts.CreateTestChannel(t, serverID, "encrypted")
+	originalCiphertext := testhelpers.ValidCiphertext()
+	msgID := ts.CreateTestMessage(t, channelID, user, originalCiphertext)
+	editedCiphertext := testhelpers.ValidCiphertext()
+	require.NotEqual(t, originalCiphertext, editedCiphertext)
+
+	w := ts.DoRequest("PATCH", pathAPIMsgSlash+msgID, map[string]interface{}{
+		"content":     editedCiphertext,
+		"key_version": 2,
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	msg, ok := body["message"].(map[string]interface{})
+	require.True(t, ok, "response should contain a message object")
+	assert.Equal(t, editedCiphertext, msg["content"])
+	assert.Equal(t, float64(2), msg["key_version"])
+
+	var storedContent string
+	var storedKeyVersion int
+	err := ts.DB.QueryRow(
+		`SELECT content, key_version FROM messages WHERE id = $1`,
+		msgID,
+	).Scan(&storedContent, &storedKeyVersion)
+	require.NoError(t, err)
+	assert.Equal(t, editedCiphertext, storedContent)
+	assert.Equal(t, 2, storedKeyVersion)
+}
+
+func TestUpdateMessage_RequiresPositiveKeyVersion(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "updmsgrequiredkeyversion")
+	serverID := ts.CreateTestServer(t, user.ID, "Update Required Key Version Server")
+	channelID := ts.CreateTestChannel(t, serverID, "encrypted")
+	originalCiphertext := testhelpers.ValidCiphertext()
+	msgID := ts.CreateTestMessage(t, channelID, user, originalCiphertext)
+
+	tests := []struct {
+		name string
+		body map[string]interface{}
+	}{
+		{
+			name: "missing",
+			body: map[string]interface{}{"content": testhelpers.ValidCiphertext()},
+		},
+		{
+			name: "zero",
+			body: map[string]interface{}{
+				"content":     testhelpers.ValidCiphertext(),
+				"key_version": 0,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := ts.DoRequest(
+				"PATCH",
+				pathAPIMsgSlash+msgID,
+				tt.body,
+				testhelpers.AuthHeaders(user.AccessToken),
+			)
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+
+			var storedContent string
+			var storedKeyVersion int
+			err := ts.DB.QueryRow(
+				`SELECT content, key_version FROM messages WHERE id = $1`,
+				msgID,
+			).Scan(&storedContent, &storedKeyVersion)
+			require.NoError(t, err)
+			assert.Equal(t, originalCiphertext, storedContent)
+			assert.Equal(t, 1, storedKeyVersion)
+		})
+	}
+}
+
+func TestUpdateMessage_RequiresManageOwnMessages(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "updmsgpermowner")
+	author := ts.CreateTestUser(t, "updmsgpermauthor")
+	serverID := ts.CreateTestServer(t, owner.ID, "Update Permission Server")
+	channelID := ts.CreateTestChannel(t, serverID, "encrypted")
+	ts.AddMemberToServer(t, serverID, author.ID, "member")
+
+	originalCiphertext := testhelpers.ValidCiphertext()
+	msgID := ts.CreateTestMessage(t, channelID, author, originalCiphertext)
+	ts.CreateChannelOverride(
+		t,
+		channelID,
+		"user",
+		author.ID,
+		0,
+		int64(rbac.PermManageOwnMessages),
+	)
+
+	editedCiphertext := testhelpers.ValidCiphertext()
+	require.NotEqual(t, originalCiphertext, editedCiphertext)
+	w := ts.DoRequest("PATCH", pathAPIMsgSlash+msgID, map[string]interface{}{
+		"content":     editedCiphertext,
+		"key_version": 2,
+	}, testhelpers.AuthHeaders(author.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+
+	var storedContent string
+	var storedKeyVersion int
+	err := ts.DB.QueryRow(
+		`SELECT content, key_version FROM messages WHERE id = $1`,
+		msgID,
+	).Scan(&storedContent, &storedKeyVersion)
+	require.NoError(t, err)
+	assert.Equal(t, originalCiphertext, storedContent)
+	assert.Equal(t, 1, storedKeyVersion)
+}
+
+func TestUpdateMessage_RejectsRevokedEpoch(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "updmsgrevoked")
+	serverID := ts.CreateTestServer(t, user.ID, "Update Revoked Epoch Server")
+	channelID := ts.CreateTestChannel(t, serverID, "encrypted")
+	originalCiphertext := testhelpers.ValidCiphertext()
+	msgID := ts.CreateTestMessage(t, channelID, user, originalCiphertext)
+
+	_, err := ts.DB.Exec(
+		`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by)
+		 VALUES ($1, 2, 3, 'test', $2)`,
+		channelID, user.ID,
+	)
+	require.NoError(t, err)
+
+	editedCiphertext := testhelpers.ValidCiphertext()
+	require.NotEqual(t, originalCiphertext, editedCiphertext)
+	w := ts.DoRequest("PATCH", pathAPIMsgSlash+msgID, map[string]interface{}{
+		"content":     editedCiphertext,
+		"key_version": 2,
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusConflict, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "epoch_revoked", body["code"])
+	assert.Equal(t, float64(3), body["current_epoch"])
+
+	var storedContent string
+	var storedKeyVersion int
+	err = ts.DB.QueryRow(
+		`SELECT content, key_version FROM messages WHERE id = $1`,
+		msgID,
+	).Scan(&storedContent, &storedKeyVersion)
+	require.NoError(t, err)
+	assert.Equal(t, originalCiphertext, storedContent)
+	assert.Equal(t, 1, storedKeyVersion)
+}
+
+func TestUpdateMessage_SerializesWithConcurrentRevocation(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "updmsgconcurrent")
+	serverID := ts.CreateTestServer(t, user.ID, "Concurrent Revocation Server")
+	channelID := ts.CreateTestChannel(t, serverID, "encrypted")
+	originalCiphertext := testhelpers.ValidCiphertext()
+	msgID := ts.CreateTestMessage(t, channelID, user, originalCiphertext)
+
+	revocationTx, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = revocationTx.Rollback() }()
+	_, err = revocationTx.Exec(
+		`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by)
+		 VALUES ($1, 2, 3, 'concurrent test', $2)`,
+		channelID, user.ID,
+	)
+	require.NoError(t, err)
+
+	result := make(chan int, 1)
+	go func() {
+		w := ts.DoRequest("PATCH", pathAPIMsgSlash+msgID, map[string]interface{}{
+			"content":     testhelpers.ValidCiphertext(),
+			"key_version": 2,
+		}, testhelpers.AuthHeaders(user.AccessToken))
+		result <- w.Code
+	}()
+
+	require.Eventually(t, func() bool {
+		var waiting bool
+		queryErr := ts.DB.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE '%SELECT id FROM channels WHERE id = $1 FOR NO KEY UPDATE%'
+		)`).Scan(&waiting)
+		return queryErr == nil && waiting
+	}, time.Second, 10*time.Millisecond, "edit should wait on the channel epoch lock")
+
+	require.NoError(t, revocationTx.Commit())
+	select {
+	case status := <-result:
+		assert.Equal(t, http.StatusConflict, status)
+	case <-time.After(time.Second):
+		t.Fatal("edit did not resume after revocation commit")
+	}
+
+	var storedContent string
+	var storedKeyVersion int
+	err = ts.DB.QueryRow(`SELECT content, key_version FROM messages WHERE id = $1`, msgID).Scan(&storedContent, &storedKeyVersion)
+	require.NoError(t, err)
+	assert.Equal(t, originalCiphertext, storedContent)
+	assert.Equal(t, 1, storedKeyVersion)
 }
 
 // =====================================================================

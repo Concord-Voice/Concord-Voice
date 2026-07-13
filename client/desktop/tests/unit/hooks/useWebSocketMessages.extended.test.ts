@@ -20,6 +20,7 @@ import { useUnreadStore } from '@/renderer/stores/unreadStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel } from '../../mocks/fixtures';
+import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';
 
 // Mock services
 const mockInvalidateChannelKey = vi.fn();
@@ -31,6 +32,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
+    revokeChannelAccess: vi.fn(),
     processPendingKeyRequests: (...args: unknown[]) => mockProcessPendingKeyRequests(...args),
     decryptForChannel: (...args: unknown[]) => mockDecryptForChannel(...args),
     decryptForChannelWithVersion: (...args: unknown[]) => mockDecryptForChannelWithVersion(...args),
@@ -247,12 +249,62 @@ describe('useWebSocketMessages — extended handlers', () => {
   });
 
   describe('dm_message_update handler', () => {
-    it('updates DM message content', () => {
+    // Regression for #1741: DM edit broadcasts are encrypted just like new
+    // messages and must be decrypted before the store is updated.
+    it('stores decrypted plaintext from a versioned DM edit', async () => {
       const ws = createMockWsService();
       renderHook(() => useWebSocketMessages(ws as never));
+      mockDecryptForChannelWithVersion.mockResolvedValue('Edited DM');
 
       useChatStore.getState().addMessage('conv-1', {
         id: 'dm-edit-1',
+        channel_id: 'conv-1',
+        user_id: 'user-2',
+        content: 'Original DM',
+        key_version: 1,
+        decryptFailed: true,
+        pendingKeys: true,
+        username: 'alice',
+        created_at: '2025-01-01T00:00:00Z',
+        updated_at: '2025-01-01T00:00:00Z',
+      });
+
+      const handler = ws.handlers.get('dm_message_update')!;
+      await act(async () => {
+        handler({
+          type: 'dm_message_update',
+          data: {
+            conversation_id: 'conv-1',
+            id: 'dm-edit-1',
+            content: 'encrypted-dm-edit',
+            key_version: 3,
+            edited_at: '2025-01-01T00:01:00Z',
+          },
+        });
+      });
+
+      const msgs = useChatStore.getState().messagesByChannel.get('conv-1');
+      expect(msgs![0].content).toBe('Edited DM');
+      expect(msgs![0].content).not.toBe('encrypted-dm-edit');
+      expect(msgs![0].key_version).toBe(3);
+      expect(msgs![0].decryptFailed).toBe(false);
+      expect(msgs![0].pendingKeys).toBe(false);
+      expect(mockDecryptForChannelWithVersion).toHaveBeenCalledWith(
+        'conv-1',
+        'encrypted-dm-edit',
+        3
+      );
+    });
+
+    it('blanks edited DM ciphertext while the required key is pending', async () => {
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      mockDecryptForChannelWithVersion.mockRejectedValue(
+        new E2EEKeyUnavailableError('NO_KEY_YET', true)
+      );
+
+      useChatStore.getState().addMessage('conv-1', {
+        id: 'dm-edit-pending',
         channel_id: 'conv-1',
         user_id: 'user-2',
         content: 'Original DM',
@@ -262,20 +314,27 @@ describe('useWebSocketMessages — extended handlers', () => {
       });
 
       const handler = ws.handlers.get('dm_message_update')!;
-      act(() => {
+      await act(async () => {
         handler({
           type: 'dm_message_update',
           data: {
             conversation_id: 'conv-1',
-            id: 'dm-edit-1',
-            content: 'Edited DM',
+            id: 'dm-edit-pending',
+            content: 'encrypted-dm-edit',
+            key_version: 4,
             edited_at: '2025-01-01T00:01:00Z',
           },
         });
       });
 
-      const msgs = useChatStore.getState().messagesByChannel.get('conv-1');
-      expect(msgs![0].content).toBe('Edited DM');
+      const message = useChatStore
+        .getState()
+        .messagesByChannel.get('conv-1')
+        ?.find((candidate) => candidate.id === 'dm-edit-pending');
+      expect(message?.content).toBe('');
+      expect(message?.decryptFailed).toBe(false);
+      expect(message?.pendingKeys).toBe(true);
+      expect(message?.content).not.toBe('encrypted-dm-edit');
     });
   });
 

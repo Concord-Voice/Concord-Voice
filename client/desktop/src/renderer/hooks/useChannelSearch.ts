@@ -16,6 +16,11 @@ import {
   searchMessagesMultiScope,
   indexMessage,
   isIndexed,
+  beginSearchBackfill,
+  canIndexBackfillMessage,
+  subscribeSearchResultInvalidations,
+  subscribeSearchScopeInvalidations,
+  type SearchBackfillGuard,
 } from '../services/searchService';
 import type { MessageWithStatus, MessageWithUser } from '../types/chat';
 import { unwrapGifEnvelope } from '../utils/gifEnvelope';
@@ -38,13 +43,26 @@ export interface UseChannelSearchResult {
   cancel: () => void;
 }
 
+type SetSearchResults = React.Dispatch<React.SetStateAction<MessageWithStatus[]>>;
+
+interface BackfillScopeOptions {
+  scope: string;
+  query: string;
+  controller: AbortController;
+  allResultIds: Set<string>;
+  priorChecked: number;
+  backfillGuard: SearchBackfillGuard;
+  setResults: SetSearchResults;
+  setProgress: React.Dispatch<React.SetStateAction<SearchProgress | null>>;
+}
+
 /** Decrypt a single message, returning decrypted content or null on failure. */
 export async function decryptMessageContent(
   msg: MessageWithUser,
   scope: string
 ): Promise<string | null> {
   if (!e2eeService.isInitialized) {
-    return msg.content;
+    return null;
   }
   try {
     if (msg.key_version && msg.key_version > 1) {
@@ -73,17 +91,27 @@ export async function processBackfillMessage(
   scope: string,
   query: string,
   allResultIds: Set<string>,
+  backfillGuard: SearchBackfillGuard,
   onNewResult: (result: MessageWithStatus) => void
 ): Promise<void> {
-  if (isIndexed(msg.id)) return;
+  if (!backfillGuard.isCurrent(scope) || isIndexed(msg.id)) return;
 
   const decrypted = await decryptMessageContent(msg, scope);
-  if (decrypted === null) return;
+  if (
+    decrypted === null ||
+    !canIndexBackfillMessage(backfillGuard, msg.id, scope) ||
+    isIndexed(msg.id)
+  ) {
+    return;
+  }
 
   // Unwrap GIF envelope so the search index sees the user-facing text, not
   // the JSON wrapper.
   const { text: content, gifSlug } = unwrapGifEnvelope(decrypted);
   indexMessage(msg.id, content, scope);
+  // A delete may have tombstoned this ID while decryption was awaiting. Only
+  // expose plaintext if the guarded index write was accepted.
+  if (!canIndexBackfillMessage(backfillGuard, msg.id, scope) || !isIndexed(msg.id)) return;
 
   if (contentMatchesQuery(content, query) && !allResultIds.has(msg.id)) {
     allResultIds.add(msg.id);
@@ -110,6 +138,16 @@ export function resolveMessagesFromStore(messageIds: string[]): MessageWithStatu
     if (msg) resolved.push(msg);
   }
   return resolved;
+}
+
+function removeInvalidatedResult(messageId: string, setResults: SetSearchResults): void {
+  setResults((current) => current.filter((message) => message.id !== messageId));
+}
+
+function removeInvalidatedScope(scope: string | null, setResults: SetSearchResults): void {
+  setResults((current) =>
+    scope === null ? [] : current.filter((message) => message.channel_id !== scope)
+  );
 }
 
 /**
@@ -161,18 +199,25 @@ export function useChannelSearch(
       const searchScopes = scopes || [channelId];
       let totalChecked = 0;
       const allResultIds = new Set(indexHits);
+      const backfillGuard = beginSearchBackfill(searchScopes);
 
-      for (const scope of searchScopes) {
-        if (controller.signal.aborted) break;
-        totalChecked += await backfillScope(
-          scope,
-          query,
-          controller,
-          allResultIds,
-          totalChecked,
-          setResults,
-          setProgress
-        );
+      try {
+        for (const scope of searchScopes) {
+          if (controller.signal.aborted || !backfillGuard.isCurrent()) break;
+          if (!backfillGuard.isCurrent(scope)) continue;
+          totalChecked += await backfillScope({
+            scope,
+            query,
+            controller,
+            allResultIds,
+            priorChecked: totalChecked,
+            backfillGuard,
+            setResults,
+            setProgress,
+          });
+        }
+      } finally {
+        backfillGuard.close();
       }
 
       if (!controller.signal.aborted) {
@@ -193,6 +238,22 @@ export function useChannelSearch(
     [doSearch]
   );
 
+  useEffect(
+    () =>
+      subscribeSearchResultInvalidations((messageId) => {
+        removeInvalidatedResult(messageId, setResults);
+      }),
+    []
+  );
+
+  useEffect(
+    () =>
+      subscribeSearchScopeInvalidations((scope) => {
+        removeInvalidatedScope(scope, setResults);
+      }),
+    []
+  );
+
   useEffect(() => {
     return () => {
       cancel();
@@ -204,24 +265,29 @@ export function useChannelSearch(
 }
 
 /** Backfill a single scope: fetch, decrypt, index, and collect matches. Returns messages checked. */
-async function backfillScope(
-  scope: string,
-  query: string,
-  controller: AbortController,
-  allResultIds: Set<string>,
-  priorChecked: number,
-  setResults: React.Dispatch<React.SetStateAction<MessageWithStatus[]>>,
-  setProgress: React.Dispatch<React.SetStateAction<SearchProgress | null>>
-): Promise<number> {
+async function backfillScope({
+  scope,
+  query,
+  controller,
+  allResultIds,
+  priorChecked,
+  backfillGuard,
+  setResults,
+  setProgress,
+}: BackfillScopeOptions): Promise<number> {
   const loaded = useChatStore.getState().messagesByChannel.get(scope) || [];
   let cursor = loaded.length > 0 ? loaded[0].id : undefined;
   let scopeChecked = 0;
 
-  while (scopeChecked < MAX_BACKFILL_MESSAGES && !controller.signal.aborted) {
+  while (
+    scopeChecked < MAX_BACKFILL_MESSAGES &&
+    !controller.signal.aborted &&
+    backfillGuard.isCurrent(scope)
+  ) {
     const batch = await fetchBatch(scope, cursor, controller);
     if (!batch) break;
 
-    await processBatch(batch, scope, query, controller, allResultIds, setResults);
+    await processBatch(batch, scope, query, controller, allResultIds, backfillGuard, setResults);
 
     scopeChecked += batch.length;
     setProgress({ checked: priorChecked + scopeChecked, total: null });
@@ -259,11 +325,12 @@ async function processBatch(
   query: string,
   controller: AbortController,
   allResultIds: Set<string>,
-  setResults: React.Dispatch<React.SetStateAction<MessageWithStatus[]>>
+  backfillGuard: SearchBackfillGuard,
+  setResults: SetSearchResults
 ): Promise<void> {
   for (const msg of batch) {
-    if (controller.signal.aborted) break;
-    await processBackfillMessage(msg, scope, query, allResultIds, (result) => {
+    if (controller.signal.aborted || !backfillGuard.isCurrent(scope)) break;
+    await processBackfillMessage(msg, scope, query, allResultIds, backfillGuard, (result) => {
       setResults((prev) => [...prev, result]);
     });
   }

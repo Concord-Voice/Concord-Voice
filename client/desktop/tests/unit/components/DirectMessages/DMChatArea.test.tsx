@@ -156,12 +156,20 @@ vi.mock('@/renderer/services/pinService', () => ({
   getChannelPins: vi.fn().mockResolvedValue([]),
 }));
 
+const mockEncryptForChannelWithVersion = vi.fn().mockResolvedValue({
+  ciphertext: 'encrypted-edited',
+  keyVersion: 2,
+});
+
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
-    isInitialized: false,
+    isInitialized: true,
+    createChannelOperationGuard: vi.fn(() => ({ assertCurrent: vi.fn() })),
     decryptForChannel: vi.fn(),
     encryptForChannel: vi.fn(),
+    encryptForChannelWithVersion: (...args: unknown[]) => mockEncryptForChannelWithVersion(...args),
     getChannelKey: vi.fn(),
+    revokeChannelAccess: vi.fn(),
   },
 }));
 
@@ -1023,10 +1031,6 @@ describe('DMChatArea', () => {
   // --- Edit with E2EE ---
 
   it('encrypts content when editing an encrypted conversation message', async () => {
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
-    vi.mocked(e2eeService.encryptForChannel).mockResolvedValue('encrypted-edited');
-    Object.defineProperty(e2eeService, 'isInitialized', { value: true, writable: true });
-
     mockApiFetch.mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -1048,11 +1052,15 @@ describe('DMChatArea', () => {
     fireEvent.click(screen.getByTestId('trigger-edit'));
 
     await waitFor(() => {
-      expect(e2eeService.encryptForChannel).toHaveBeenCalledWith('conv-1', 'edited text');
+      expect(mockEncryptForChannelWithVersion).toHaveBeenCalledWith('conv-1', 'edited text');
+      const patchCall = mockApiFetch.mock.calls.find(
+        ([, options]) => (options as { method?: string } | undefined)?.method === 'PATCH'
+      );
+      expect(JSON.parse((patchCall?.[1] as { body: string }).body)).toEqual({
+        content: 'encrypted-edited',
+        key_version: 2,
+      });
     });
-
-    // Reset
-    Object.defineProperty(e2eeService, 'isInitialized', { value: false, writable: true });
   });
 
   // --- Reply support ---

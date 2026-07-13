@@ -34,6 +34,7 @@ const (
 	errMsgFailedCreatePersonalThread = "Failed to create personal thread"
 	errMsgFailedUpdateConversation   = "Failed to update conversation"
 	errMsgFailedUpdateMessage        = "Failed to update message"
+	errMsgMessageNotFound            = "Message not found"
 	errMsgFailedStartTransaction     = "Failed to start transaction"
 	errMsgFailedRollbackTransaction  = "Failed to rollback transaction"
 	errMsgFailedAddMember            = "Failed to add member"
@@ -80,6 +81,10 @@ type Handler struct {
 	nats     *natsclient.Client
 	redis    *redis.Client
 	entCache *entitlements.Cache
+}
+
+type epochQueryRower interface {
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
 }
 
 // NewHandler creates a new DM handler. entCache is the shared entitlement-tier
@@ -906,6 +911,13 @@ func (h *Handler) addMemberTx(convID, targetUserID, callerUserID string) (int, e
 		}
 	}()
 
+	var lockedConversationID string
+	if err := tx.QueryRow(
+		`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, convID,
+	).Scan(&lockedConversationID); err != nil {
+		return 0, err
+	}
+
 	if _, err := tx.Exec(`INSERT INTO dm_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')`, convID, targetUserID); err != nil {
 		return 0, err
 	}
@@ -1066,6 +1078,13 @@ func (h *Handler) removeMemberTx(convID, targetUserID, createdBy, callerUserID s
 		}
 	}()
 
+	var lockedConversationID string
+	if err := tx.QueryRow(
+		`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, convID,
+	).Scan(&lockedConversationID); err != nil {
+		return "", 0, err
+	}
+
 	var newCreatorID string
 
 	// If creator is leaving, transfer ownership
@@ -1142,8 +1161,7 @@ func (h *Handler) broadcastMemberRemoved(convID, targetUserID, callerUserID stri
 		return
 	}
 
-	// Notify remaining participants
-	h.broadcastToDMParticipants(convID, "", websocket.OutgoingMessage{
+	removedEvent := websocket.OutgoingMessage{
 		Type: "dm_participant_removed",
 		Data: map[string]interface{}{
 			"conversation_id": convID,
@@ -1151,7 +1169,13 @@ func (h *Handler) broadcastMemberRemoved(convID, targetUserID, callerUserID stri
 			"removed_by":      callerUserID,
 			"was_self_leave":  isSelfLeave,
 		},
-	})
+	}
+	// The target is no longer in dm_participants, so notify them directly before
+	// broadcasting the same event to the remaining participants.
+	if targetUUID, err := uuid.Parse(targetUserID); err == nil {
+		h.hub.BroadcastToUser(targetUUID, removedEvent)
+	}
+	h.broadcastToDMParticipants(convID, "", removedEvent)
 
 	// If admin was transferred, notify about role change
 	if newCreatorID != "" {
@@ -1828,6 +1852,138 @@ func (h *Handler) fetchConversationResponse(convID string) *conversationResponse
 	return &conv
 }
 
+// enforceDMMessageEpoch rejects revoked key versions and reports the latest
+// successor recorded by the authoritative DM revocation ledger.
+func (h *Handler) enforceDMMessageEpoch(c *gin.Context, q epochQueryRower, convID string, keyVersion int) bool {
+	var epochRevoked bool
+	var currentEpoch int
+	if err := q.QueryRowContext(c.Request.Context(),
+		`SELECT EXISTS(
+			SELECT 1 FROM dm_key_revocations
+			WHERE conversation_id = $1 AND revoked_epoch = $2
+		), COALESCE(MAX(successor_epoch), 1)
+		FROM dm_key_revocations
+		WHERE conversation_id = $1`,
+		convID, keyVersion,
+	).Scan(&epochRevoked, &currentEpoch); err != nil {
+		h.log.Error("Failed to check DM epoch revocation", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify key epoch"})
+		return false
+	}
+	if !epochRevoked {
+		return true
+	}
+
+	c.JSON(http.StatusConflict, gin.H{
+		"error":           "Key epoch has been revoked — re-encrypt with current epoch",
+		"code":            "epoch_revoked",
+		"current_epoch":   currentEpoch,
+		"conversation_id": convID,
+	})
+	return false
+}
+
+type updateDMMessageRequest struct {
+	// max=65536 = the single hard ciphertext ceiling (= the subscribed worst
+	// case), flat for everyone; matches messages/hub.go. Boy-scout fix (#1298).
+	Content    string `json:"content" binding:"required,max=65536"`
+	KeyVersion int    `json:"key_version" binding:"required,min=1"`
+}
+
+type updateDMMessageResult struct {
+	Content    string  `json:"content"`
+	KeyVersion int     `json:"key_version"`
+	EditedAt   *string `json:"edited_at"`
+	CreatedAt  string  `json:"created_at"`
+}
+
+// authorizeDMMessageUpdate verifies that the message exists in the requested
+// conversation and belongs to the caller. On failure it writes the response.
+func (h *Handler) authorizeDMMessageUpdate(c *gin.Context, convID, messageID, userID string) bool {
+	var authorID string
+	if err := h.db.QueryRow(`SELECT user_id FROM dm_messages WHERE id = $1 AND conversation_id = $2`, messageID, convID).Scan(&authorID); err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		return false
+	} else if err != nil {
+		h.log.Error("Failed to check DM message author", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return false
+	}
+
+	if authorID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only edit your own messages"})
+		return false
+	}
+
+	return true
+}
+
+// updateDMMessageCiphertext serializes the epoch check and ciphertext update.
+// On failure it writes the response and returns false.
+func (h *Handler) updateDMMessageCiphertext(
+	c *gin.Context,
+	convID, messageID string,
+	req updateDMMessageRequest,
+) (updateDMMessageResult, bool) {
+	// Serialize the ledger check and edit against every revocation insert.
+	// READ COMMITTED gives the check below a fresh snapshot after a lock wait.
+	tx, err := h.db.BeginTx(c.Request.Context(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		h.log.Error("Failed to begin DM message update", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return updateDMMessageResult{}, false
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+			h.log.Error(errMsgFailedRollbackTransaction, "error", rbErr)
+		}
+	}()
+
+	var lockedConversationID string
+	if err = tx.QueryRowContext(c.Request.Context(),
+		`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, convID,
+	).Scan(&lockedConversationID); err != nil {
+		h.log.Error("Failed to lock DM epoch", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return updateDMMessageResult{}, false
+	}
+	if !h.enforceDMMessageEpoch(c, tx, convID, req.KeyVersion) {
+		return updateDMMessageResult{}, false
+	}
+
+	// Update ciphertext and its matching epoch atomically. The server never decrypts content.
+	var result updateDMMessageResult
+	err = tx.QueryRowContext(c.Request.Context(), `
+		UPDATE dm_messages
+		SET content = $1, key_version = $2, edited_at = NOW(), updated_at = NOW()
+		WHERE id = $3 AND conversation_id = $4
+		  AND NOT EXISTS (
+		      SELECT 1 FROM dm_key_revocations
+		      WHERE conversation_id = $4 AND revoked_epoch = $2
+		  )
+		RETURNING COALESCE(key_version, 1), edited_at, created_at
+	`, req.Content, req.KeyVersion, messageID, convID).Scan(&result.KeyVersion, &result.EditedAt, &result.CreatedAt)
+	if err == sql.ErrNoRows {
+		if !h.enforceDMMessageEpoch(c, tx, convID, req.KeyVersion) {
+			return updateDMMessageResult{}, false
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		return updateDMMessageResult{}, false
+	} else if err != nil {
+		h.log.Error("Failed to update DM message", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return updateDMMessageResult{}, false
+	}
+	result.Content = req.Content
+	if err = tx.Commit(); err != nil {
+		h.log.Error("Failed to commit DM message update", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return updateDMMessageResult{}, false
+	}
+
+	return result, true
+}
+
 // UpdateMessage updates a DM message's content.
 func (h *Handler) UpdateMessage(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -1848,29 +2004,12 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 		return
 	}
 
-	var req struct {
-		// max=65536 = the single hard ciphertext ceiling (= the subscribed worst
-		// case), flat for everyone; matches messages/hub.go. Boy-scout fix (#1298).
-		Content string `json:"content" binding:"required,max=65536"`
-	}
+	var req updateDMMessageRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
 		return
 	}
-
-	// Check message exists and user is the author
-	var authorID string
-	if err := h.db.QueryRow(`SELECT user_id FROM dm_messages WHERE id = $1 AND conversation_id = $2`, messageID, convID).Scan(&authorID); err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Message not found"})
-		return
-	} else if err != nil {
-		h.log.Error("Failed to check DM message author", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
-		return
-	}
-
-	if authorID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "You can only edit your own messages"})
+	if !h.authorizeDMMessageUpdate(c, convID, messageID, userID) {
 		return
 	}
 
@@ -1881,26 +2020,10 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 		return
 	}
 
-	// Update message
-	type msgResult struct {
-		Content    string  `json:"content"`
-		KeyVersion int     `json:"key_version"`
-		EditedAt   *string `json:"edited_at"`
-		CreatedAt  string  `json:"created_at"`
-	}
-	var result msgResult
-	err = h.db.QueryRow(`
-		UPDATE dm_messages
-		SET content = $1, edited_at = NOW(), updated_at = NOW()
-		WHERE id = $2 AND conversation_id = $3
-		RETURNING COALESCE(key_version, 1), edited_at, created_at
-	`, req.Content, messageID, convID).Scan(&result.KeyVersion, &result.EditedAt, &result.CreatedAt)
-	if err != nil {
-		h.log.Error("Failed to update DM message", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+	result, updated := h.updateDMMessageCiphertext(c, convID, messageID, req)
+	if !updated {
 		return
 	}
-	result.Content = req.Content
 
 	// Broadcast to other participants
 	h.broadcastToDMParticipants(convID, userID, websocket.OutgoingMessage{
@@ -1940,7 +2063,7 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 	// Check message exists and user is the author
 	var authorID string
 	if err := h.db.QueryRow(`SELECT user_id FROM dm_messages WHERE id = $1 AND conversation_id = $2`, messageID, convID).Scan(&authorID); err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Message not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
 		return
 	} else if err != nil {
 		h.log.Error("Failed to check DM message author", "error", err)

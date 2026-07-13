@@ -59,6 +59,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
     processPendingKeyRequests: vi.fn().mockResolvedValue(undefined),
     decryptForChannel: vi.fn(),
     invalidateChannelKey: vi.fn(),
+    revokeChannelAccess: vi.fn(),
   },
 }));
 
@@ -225,7 +226,7 @@ describe('useWebSocket', () => {
   });
 
   describe('message_update handler', () => {
-    it('updates existing messages', () => {
+    it('fails closed on edited ciphertext before E2EE initialization', () => {
       useAuthStore.getState().setAccessToken('test-token');
       renderHook(() => useWebSocket());
 
@@ -247,14 +248,17 @@ describe('useWebSocket', () => {
           data: {
             channel_id: 'ch-1',
             id: 'msg-1',
-            content: 'Edited',
+            content: 'encrypted-edit',
             edited_at: '2025-01-01T00:01:00Z',
           },
         });
       });
 
       const msgs = useChatStore.getState().messagesByChannel.get('ch-1');
-      expect(msgs![0].content).toBe('Edited');
+      expect(msgs![0].content).toBe('');
+      expect(msgs![0].decryptFailed).toBe(true);
+      expect(msgs![0].pendingKeys).toBe(false);
+      expect(msgs![0].content).not.toBe('encrypted-edit');
     });
   });
 

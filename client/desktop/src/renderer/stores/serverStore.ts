@@ -4,7 +4,6 @@ import { wrapStore } from '../utils/createStore';
 import { ServerWithRole } from '../types/server';
 import { apiFetch } from '../services/apiClient';
 import { useChannelStore } from './channelStore';
-import { useChatStore } from './chatStore';
 import { useUnreadStore } from './unreadStore';
 
 interface ServerState {
@@ -22,6 +21,36 @@ interface ServerState {
   clearServers: () => void;
 }
 
+interface ServerFetchJournal {
+  removedIds: Set<string>;
+  cleared: boolean;
+}
+
+const serverFetchJournals = new Set<ServerFetchJournal>();
+const hasLiveServerFetch = () =>
+  Array.from(serverFetchJournals).some((journal) => !journal.cleared);
+
+function purgeMissingServerState(
+  currentServers: ServerWithRole[],
+  fetchedServers: ServerWithRole[]
+): void {
+  const fetchedServerIds = new Set(fetchedServers.map((server) => server.id));
+  for (const server of currentServers) {
+    if (fetchedServerIds.has(server.id)) continue;
+    useChannelStore.getState().removeServerChannels(server.id);
+    useUnreadStore.getState().clearServerUnread(server.id);
+  }
+}
+
+function retainActiveServerId(
+  activeServerId: string | null,
+  fetchedServers: ServerWithRole[]
+): string | null {
+  return activeServerId && fetchedServers.some((server) => server.id === activeServerId)
+    ? activeServerId
+    : null;
+}
+
 const serverStore = create<ServerState>()(
   devtools(
     persist(
@@ -32,38 +61,48 @@ const serverStore = create<ServerState>()(
         error: null,
 
         fetchServers: async () => {
-          if (!serverStore.persist.hasHydrated()) {
-            await serverStore.persist.rehydrate();
-          }
-
-          // Deduplicate concurrent fetches (e.g. multiple components mounting)
-          if (get().isLoading) return;
-          set({ isLoading: true, error: null });
+          const journal: ServerFetchJournal = { removedIds: new Set(), cleared: false };
+          serverFetchJournals.add(journal);
 
           try {
+            if (!serverStore.persist.hasHydrated()) {
+              await serverStore.persist.rehydrate();
+            }
+            if (journal.cleared) return;
+
+            // Deduplicate concurrent fetches (e.g. multiple components mounting)
+            if (get().isLoading) return;
+            set({ isLoading: true, error: null });
+
             const response = await apiFetch('/api/v1/servers');
 
             if (!response.ok) {
               const data = await response.json();
+              if (journal.cleared) return;
               throw new Error(data.error || 'Failed to load servers');
             }
 
             const data = await response.json();
-            const fetchedServers: ServerWithRole[] = data.servers || [];
+            if (journal.cleared) return;
+
+            const fetchedServers: ServerWithRole[] = (data.servers || []).filter(
+              (server: ServerWithRole) => !journal.removedIds.has(server.id)
+            );
+            purgeMissingServerState(get().servers, fetchedServers);
 
             // Validate persisted activeServerId still exists in fetched list
-            const currentActiveId = get().activeServerId;
-            const validActiveId =
-              currentActiveId && fetchedServers.some((s) => s.id === currentActiveId)
-                ? currentActiveId
-                : null;
+            const validActiveId = retainActiveServerId(get().activeServerId, fetchedServers);
 
-            set({ servers: fetchedServers, activeServerId: validActiveId, isLoading: false });
+            set({ servers: fetchedServers, activeServerId: validActiveId });
           } catch (error) {
-            set({
-              error: error instanceof Error ? error.message : 'Failed to load servers',
-              isLoading: false,
-            });
+            if (!journal.cleared) {
+              set({
+                error: error instanceof Error ? error.message : 'Failed to load servers',
+              });
+            }
+          } finally {
+            serverFetchJournals.delete(journal);
+            set({ isLoading: hasLiveServerFetch() });
           }
         },
 
@@ -86,27 +125,9 @@ const serverStore = create<ServerState>()(
         },
 
         removeServer: (serverId: string) => {
+          for (const journal of serverFetchJournals) journal.removedIds.add(serverId);
           const { activeServerId } = get();
-          const channelStore = useChannelStore.getState();
-
-          // Cascade: clear all channels belonging to this server
-          // (and their messages/unreads via removeChannel's own cascade)
-          if (channelStore.currentServerId === serverId) {
-            // Active server being deleted — clear messages for each channel, then wipe channel state
-            for (const ch of channelStore.channels) {
-              useChatStore.getState().clearMessages(ch.id);
-              useUnreadStore.getState().clearUnread(ch.id);
-            }
-            channelStore.clearChannels();
-          }
-
-          // Clean up lastChannelByServer for this server
-          const { lastChannelByServer } = channelStore;
-          if (lastChannelByServer[serverId]) {
-            const updated = { ...lastChannelByServer };
-            delete updated[serverId];
-            useChannelStore.setState({ lastChannelByServer: updated });
-          }
+          useChannelStore.getState().removeServerChannels(serverId);
 
           // Clear server-level unread
           useUnreadStore.getState().clearServerUnread(serverId);
@@ -114,6 +135,7 @@ const serverStore = create<ServerState>()(
           set((state) => ({
             servers: state.servers.filter((s) => s.id !== serverId),
             activeServerId: activeServerId === serverId ? null : activeServerId,
+            isLoading: hasLiveServerFetch(),
           }));
         },
 
@@ -122,6 +144,7 @@ const serverStore = create<ServerState>()(
         },
 
         clearServers: () => {
+          for (const journal of serverFetchJournals) journal.cleared = true;
           set({ servers: [], activeServerId: null, isLoading: false, error: null });
         },
       }),

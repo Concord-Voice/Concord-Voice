@@ -16,10 +16,12 @@ const mockGetChannelKeyByVersion = vi.fn();
 const mockDecryptWithKey = vi.fn();
 const mockDecryptForChannel = vi.fn();
 const mockDecryptForChannelWithVersion = vi.fn();
+const mockOperationGuard = { assertCurrent: vi.fn() };
 
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
+    createChannelOperationGuard: vi.fn(() => mockOperationGuard),
     getChannelKey: (...args: unknown[]) => mockGetChannelKey(...args),
     getChannelKeyByVersion: (...args: unknown[]) => mockGetChannelKeyByVersion(...args),
     decryptWithKey: (...args: unknown[]) => mockDecryptWithKey(...args),
@@ -218,7 +220,7 @@ describe('DMPinnedMessagesPanel', () => {
       render(<DMPinnedMessagesPanel {...defaultProps} />);
       await waitFor(() => expect(screen.getByText('Hello private world')).toBeInTheDocument());
       expect(mockGetChannelKey).toHaveBeenCalledWith('conv-1');
-      expect(mockDecryptWithKey).toHaveBeenCalledWith('ciphertext-abc', key);
+      expect(mockDecryptWithKey).toHaveBeenCalledWith('ciphertext-abc', key, mockOperationGuard);
     });
 
     it('falls back to decryptForChannel when channel key fetch fails', async () => {
@@ -256,7 +258,7 @@ describe('DMPinnedMessagesPanel', () => {
       render(<DMPinnedMessagesPanel {...defaultProps} />);
       await waitFor(() => expect(screen.getByText('Decrypted v3 message')).toBeInTheDocument());
       expect(mockGetChannelKeyByVersion).toHaveBeenCalledWith('conv-1', 3);
-      expect(mockDecryptWithKey).toHaveBeenCalledWith('ciphertext-v3', vKey);
+      expect(mockDecryptWithKey).toHaveBeenCalledWith('ciphertext-v3', vKey, mockOperationGuard);
     });
   });
 });

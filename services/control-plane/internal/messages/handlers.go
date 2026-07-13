@@ -2,6 +2,7 @@
 package messages
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"errors"
@@ -60,6 +61,10 @@ type Handler struct {
 	tiers    entitlements.TierResolver // user-axis tier resolution (#1555 search-depth gate)
 }
 
+type epochQueryRower interface {
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+}
+
 // NewHandler creates a new message handler
 func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, tiers entitlements.TierResolver) *Handler {
 	return &Handler{
@@ -87,7 +92,8 @@ type SendMessageRequest struct {
 // UpdateMessageRequest represents a request to update a message.
 // Max content length is 65536 bytes (64 KiB) — matches SendMessageRequest.
 type UpdateMessageRequest struct {
-	Content string `json:"content" binding:"required,min=1,max=65536"`
+	Content    string `json:"content" binding:"required,min=1,max=65536"`
+	KeyVersion int    `json:"key_version" binding:"required,min=1"`
 }
 
 // isFKViolation returns true if the error is a PostgreSQL foreign key violation (23503).
@@ -464,6 +470,36 @@ func (h *Handler) checkSendAccess(c *gin.Context, channelID, userID string) (str
 	return serverID, serverAllowEmbeds, true
 }
 
+// enforceChannelEpoch rejects revoked key versions and reports the latest
+// successor recorded by the authoritative revocation ledger.
+func (h *Handler) enforceChannelEpoch(c *gin.Context, q epochQueryRower, channelID string, keyVersion int) bool {
+	var epochRevoked bool
+	var currentEpoch int
+	if err := q.QueryRowContext(c.Request.Context(),
+		`SELECT EXISTS(
+			SELECT 1 FROM key_revocations WHERE channel_id = $1 AND revoked_epoch = $2
+		), COALESCE(MAX(successor_epoch), 1)
+		FROM key_revocations
+		WHERE channel_id = $1`,
+		channelID, keyVersion,
+	).Scan(&epochRevoked, &currentEpoch); err != nil {
+		h.log.Error("Failed to check epoch revocation", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify key epoch"})
+		return false
+	}
+	if epochRevoked {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":         "Key epoch has been revoked — re-encrypt with current epoch",
+			"code":          "epoch_revoked",
+			"current_epoch": currentEpoch,
+			"channel_id":    channelID,
+		})
+		return false
+	}
+
+	return true
+}
+
 // enforceE2EE validates ciphertext shape and epoch revocation for the channel.
 // All channels are encrypted under E2EE-everywhere (#201).
 // Returns (keyVersion, ok). On failure, writes the JSON error to c.
@@ -478,29 +514,7 @@ func (h *Handler) enforceE2EE(c *gin.Context, channelID string, content string, 
 		keyVersion = 1
 	}
 
-	var epochRevoked bool
-	if err := h.db.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM key_revocations WHERE channel_id = $1 AND revoked_epoch = $2)`,
-		channelID, keyVersion,
-	).Scan(&epochRevoked); err != nil {
-		h.log.Error("Failed to check epoch revocation", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify key epoch"})
-		return 0, false
-	}
-	if epochRevoked {
-		currentEpoch := 1
-		if err := h.db.QueryRow(
-			`SELECT COALESCE(MAX(key_version), 1) FROM channel_keys WHERE channel_id = $1`,
-			channelID,
-		).Scan(&currentEpoch); err != nil {
-			h.log.Error("Failed to fetch current epoch", "error", err, "channel_id", channelID)
-		}
-		c.JSON(http.StatusConflict, gin.H{
-			"error":         "Key epoch has been revoked — re-encrypt with current epoch",
-			"code":          "epoch_revoked",
-			"current_epoch": currentEpoch,
-			"channel_id":    channelID,
-		})
+	if !h.enforceChannelEpoch(c, h.db, channelID, keyVersion) {
 		return 0, false
 	}
 
@@ -584,6 +598,129 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"message": message})
 }
 
+// authorizeMessageUpdate resolves the message's channel and verifies that the
+// caller may edit their own message. On failure it writes the HTTP response.
+func (h *Handler) authorizeMessageUpdate(c *gin.Context, messageID, userID string) (string, bool) {
+	var authorID, channelID, serverID string
+	authorQuery := `
+		SELECT m.user_id, m.channel_id, c.server_id
+		FROM messages m
+		INNER JOIN channels c ON c.id = m.channel_id
+		WHERE m.id = $1`
+
+	err := h.db.QueryRow(authorQuery, messageID).Scan(&authorID, &channelID, &serverID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		return "", false
+	} else if err != nil {
+		h.log.Error("Failed to check message author", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return "", false
+	}
+
+	if authorID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only edit your own messages"})
+		return "", false
+	}
+
+	hasManageOwn, permErr := h.resolver.HasPermission(
+		c.Request.Context(), serverID, userID, channelID, rbac.PermManageOwnMessages,
+	)
+	if permErr != nil {
+		h.log.Error("Failed to check PermManageOwnMessages", "error", permErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCheckPerms})
+		return "", false
+	}
+	if !hasManageOwn {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPermsLower})
+		return "", false
+	}
+
+	return channelID, true
+}
+
+// updateMessageCiphertext serializes the epoch check and ciphertext update.
+// On failure it writes the HTTP response and returns false.
+func (h *Handler) updateMessageCiphertext(
+	c *gin.Context,
+	messageID, channelID, userID string,
+	req UpdateMessageRequest,
+) (models.Message, bool) {
+	// Serialize the ledger check and edit against every revocation insert.
+	// READ COMMITTED gives the check below a fresh snapshot after a lock wait.
+	tx, err := h.db.BeginTx(c.Request.Context(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		h.log.Error("Failed to begin message update", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return models.Message{}, false
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+			h.log.Error("Failed to rollback message update", "error", rbErr)
+		}
+	}()
+
+	var lockedChannelID string
+	if err = tx.QueryRowContext(c.Request.Context(),
+		`SELECT id FROM channels WHERE id = $1 FOR NO KEY UPDATE`, channelID,
+	).Scan(&lockedChannelID); err != nil {
+		h.log.Error("Failed to lock channel epoch", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return models.Message{}, false
+	}
+	if !h.enforceChannelEpoch(c, tx, channelID, req.KeyVersion) {
+		return models.Message{}, false
+	}
+
+	// Update message
+	updateQuery := `
+		UPDATE messages
+		SET content = $1, key_version = $2, edited_at = NOW(), updated_at = NOW()
+		WHERE id = $3 AND channel_id = $4
+		  AND NOT EXISTS (
+		      SELECT 1 FROM key_revocations
+		      WHERE channel_id = $4 AND revoked_epoch = $2
+		  )
+		RETURNING channel_id, key_version, embeds_suppressed, edited_at, created_at, updated_at
+	`
+
+	var message models.Message
+	message.ID = messageID
+	message.UserID = userID
+	message.Content = req.Content
+
+	err = tx.QueryRowContext(c.Request.Context(), updateQuery, req.Content, req.KeyVersion, messageID, channelID).Scan(
+		&message.ChannelID,
+		&message.KeyVersion,
+		&message.EmbedsSuppressed,
+		&message.EditedAt,
+		&message.CreatedAt,
+		&message.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		// Keep the conditional ledger guard as defense in depth. Re-read it to
+		// return the recovery contract; otherwise the message disappeared
+		// concurrently.
+		if !h.enforceChannelEpoch(c, tx, channelID, req.KeyVersion) {
+			return models.Message{}, false
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		return models.Message{}, false
+	} else if err != nil {
+		h.log.Error("Failed to update message", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return models.Message{}, false
+	}
+	if err = tx.Commit(); err != nil {
+		h.log.Error("Failed to commit message update", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return models.Message{}, false
+	}
+
+	return message, true
+}
+
 // UpdateMessage updates a message's content
 func (h *Handler) UpdateMessage(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -601,60 +738,25 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 		return
 	}
 
-	// Check if message exists and user is the author
-	var authorID string
-	authorQuery := `SELECT user_id FROM messages WHERE id = $1`
-
-	err := h.db.QueryRow(authorQuery, messageID).Scan(&authorID)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
-		return
-	} else if err != nil {
-		h.log.Error("Failed to check message author", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+	channelID, authorized := h.authorizeMessageUpdate(c, messageID, userID)
+	if !authorized {
 		return
 	}
-
-	if authorID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "You can only edit your own messages"})
-		return
-	}
-
-	// E2EE enforcement — all messages are encrypted under #201; require ciphertext shape unconditionally.
 	if !isValidCiphertext(req.Content) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidCiphertext})
 		return
 	}
 
-	// Update message
-	updateQuery := `
-		UPDATE messages
-		SET content = $1, edited_at = NOW(), updated_at = NOW()
-		WHERE id = $2
-		RETURNING channel_id, key_version, embeds_suppressed, edited_at, created_at, updated_at
-	`
-
-	var message models.Message
-	message.ID = messageID
-	message.UserID = userID
-	message.Content = req.Content
-
-	err = h.db.QueryRow(updateQuery, req.Content, messageID).Scan(
-		&message.ChannelID,
-		&message.KeyVersion,
-		&message.EmbedsSuppressed,
-		&message.EditedAt,
-		&message.CreatedAt,
-		&message.UpdatedAt,
-	)
-
-	if err != nil {
-		h.log.Error("Failed to update message", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+	message, updated := h.updateMessageCiphertext(c, messageID, channelID, userID, req)
+	if !updated {
 		return
 	}
 
-	h.log.Info("Message updated", "message_id", messageID, "user_id", userID)
+	h.log.Info(
+		"Message updated",
+		"message_id", sanitizeLogValue(messageID),
+		"user_id", sanitizeLogValue(userID),
+	)
 
 	// Broadcast update to channel subscribers via WebSocket
 	channelUUID, err := uuid.Parse(message.ChannelID)

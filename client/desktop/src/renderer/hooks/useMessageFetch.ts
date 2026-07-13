@@ -1,13 +1,14 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { apiFetch, safeJson } from '../services/apiClient';
-import { e2eeService } from '../services/e2eeService';
+import { e2eeService, type E2EEChannelOperationGuard } from '../services/e2eeService';
 import { isPendingKeyError } from '../services/e2eeErrors';
 import type { MessageWithStatus } from '../types/chat';
-import { indexMessages } from '../services/searchService';
+import { indexMessages, subscribeSearchResultInvalidations } from '../services/searchService';
 import { unwrapGifEnvelope } from '../utils/gifEnvelope';
 
 const DEFAULT_LIMIT = 50;
+const MAX_PAGINATION_RECONCILIATION_ATTEMPTS = 2;
 
 /** Index decrypted messages for search (passive, skips failed/pending). */
 function indexDecryptedMessages(channelId: string, msgs: MessageWithStatus[]) {
@@ -23,6 +24,72 @@ interface UseMessageFetchOptions {
   onFetchComplete?: () => void;
 }
 
+function timestampMillis(value: string | null | undefined): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+/** Prefer authoritative edit time; DM edit responses may omit updated_at. */
+export function messageFreshness(message: Pick<MessageWithStatus, 'edited_at' | 'updated_at'>) {
+  const editedAt = timestampMillis(message.edited_at);
+  return editedAt || timestampMillis(message.updated_at);
+}
+
+export function reconcileFetchedMessages(
+  fetched: MessageWithStatus[],
+  current: MessageWithStatus[],
+  idsAtRequestStart: ReadonlySet<string>,
+  invalidatedDuringRequest: ReadonlySet<string> = new Set()
+): {
+  fetched: MessageWithStatus[];
+  preserved: MessageWithStatus[];
+  needsAuthoritativeRefetch: boolean;
+} {
+  const currentById = new Map(current.map((message) => [message.id, message]));
+  let needsAuthoritativeRefetch = false;
+  const reconciledFetched = fetched.flatMap((fetchedMessage) => {
+    const currentMessage = currentById.get(fetchedMessage.id);
+    if (idsAtRequestStart.has(fetchedMessage.id) && !currentMessage) {
+      // The row was deleted while this request/decrypt pass was in flight.
+      return [];
+    }
+    if (currentMessage && messageFreshness(currentMessage) > messageFreshness(fetchedMessage)) {
+      return [currentMessage];
+    }
+    if (!currentMessage && invalidatedDuringRequest.has(fetchedMessage.id)) {
+      // Covers edit/delete events for rows that were not loaded when the REST
+      // snapshot began. Those events still invalidate search by ID.
+      needsAuthoritativeRefetch = true;
+      return [];
+    }
+    return [fetchedMessage];
+  });
+
+  const fetchedIds = new Set(reconciledFetched.map((message) => message.id));
+  const acknowledgedClientIds = new Set(
+    reconciledFetched
+      .map((message) => message.clientMessageId)
+      .filter((id): id is string => Boolean(id))
+  );
+  const preserved = current.filter((message) => {
+    if (
+      fetchedIds.has(message.id) ||
+      acknowledgedClientIds.has(message.id) ||
+      (message.clientMessageId && fetchedIds.has(message.clientMessageId))
+    ) {
+      return false;
+    }
+    const isOptimistic =
+      Boolean(message.clientMessageId) &&
+      (message.status === 'pending' || message.status === 'sent');
+    const arrivedDuringRequest = !idsAtRequestStart.has(message.id);
+    return isOptimistic || arrivedDuringRequest;
+  });
+
+  return { fetched: reconciledFetched, preserved, needsAuthoritativeRefetch };
+}
+
 /**
  * Decrypt a single ciphertext using the appropriate key version.
  * Prefers pre-fetched keys from the batch maps; falls back to on-demand fetch.
@@ -32,17 +99,23 @@ async function decryptContent(
   ciphertext: string,
   keyVersion: number | undefined,
   channelKey: CryptoKey | null,
-  versionedKeys: Map<number, CryptoKey>
+  versionedKeys: Map<number, CryptoKey>,
+  operationGuard: E2EEChannelOperationGuard
 ): Promise<string> {
+  operationGuard.assertCurrent();
+  let plaintext: string;
   if (keyVersion && keyVersion > 1) {
     const vKey = versionedKeys.get(keyVersion);
-    return vKey
-      ? e2eeService.decryptWithKey(ciphertext, vKey)
-      : e2eeService.decryptForChannelWithVersion(channelId, ciphertext, keyVersion);
+    plaintext = vKey
+      ? await e2eeService.decryptWithKey(ciphertext, vKey, operationGuard)
+      : await e2eeService.decryptForChannelWithVersion(channelId, ciphertext, keyVersion);
+  } else {
+    plaintext = channelKey
+      ? await e2eeService.decryptWithKey(ciphertext, channelKey, operationGuard)
+      : await e2eeService.decryptForChannel(channelId, ciphertext);
   }
-  return channelKey
-    ? e2eeService.decryptWithKey(ciphertext, channelKey)
-    : e2eeService.decryptForChannel(channelId, ciphertext);
+  operationGuard.assertCurrent();
+  return plaintext;
 }
 
 /**
@@ -51,8 +124,10 @@ async function decryptContent(
  */
 async function decryptMessages(
   channelId: string,
-  rawMsgs: MessageWithStatus[]
+  rawMsgs: MessageWithStatus[],
+  operationGuard: E2EEChannelOperationGuard
 ): Promise<MessageWithStatus[]> {
+  operationGuard.assertCurrent();
   // Fail-closed: if E2EE isn't initialized, blank content rather than
   // leaking ciphertext. Mark as pendingKeys so the UI shows the correct placeholder.
   if (!e2eeService.isInitialized) {
@@ -76,7 +151,7 @@ async function decryptMessages(
   }
 
   // Pre-fetch each unique historical key version ONCE to avoid N parallel
-  // getChannelKeyByVersion() calls (which lack pending-fetch deduplication).
+  // getChannelKeyByVersion() calls.
   const versionedKeys = new Map<number, CryptoKey>();
   const uniqueVersions = new Set<number>();
   for (const m of rawMsgs) {
@@ -98,8 +173,9 @@ async function decryptMessages(
       }
     })
   );
+  operationGuard.assertCurrent();
 
-  return Promise.all(
+  const decryptedMessages = await Promise.all(
     rawMsgs.map(async (m) => {
       // Call-event rows carry plaintext server metadata in call_event_payload
       // and empty content; bypass the E2EE decrypt pass (#1219) — decryptContent
@@ -111,8 +187,8 @@ async function decryptMessages(
       }
 
       // Decrypt replied_to content if the original replied-to message was encrypted
-      let decryptedRt = m.replied_to;
       const rt = m.replied_to;
+      let decryptedRt = rt ? { ...rt, content: '' } : rt;
       if (rt?.content) {
         try {
           const rtPlaintext = await decryptContent(
@@ -120,11 +196,12 @@ async function decryptMessages(
             rt.content,
             rt.key_version,
             channelKey,
-            versionedKeys
+            versionedKeys,
+            operationGuard
           );
           decryptedRt = { ...rt, content: rtPlaintext };
         } catch {
-          // Leave ciphertext as-is — matches WebSocket handler behavior
+          // Keep the reply preview fail-closed; never return its ciphertext.
         }
       }
 
@@ -135,7 +212,8 @@ async function decryptMessages(
           m.content,
           m.key_version,
           channelKey,
-          versionedKeys
+          versionedKeys,
+          operationGuard
         );
         // E2EE GIF messages encrypt a JSON envelope; unwrap so the renderer
         // sees the same shape it gets from the real-time WebSocket path.
@@ -143,10 +221,18 @@ async function decryptMessages(
         return { ...m, content, gif_slug: gifSlug ?? m.gif_slug, replied_to: decryptedRt };
       } catch (err) {
         const isPending = isPendingKeyError(err);
-        return { ...m, content: '', decryptFailed: !isPending, pendingKeys: isPending };
+        return {
+          ...m,
+          content: '',
+          decryptFailed: !isPending,
+          pendingKeys: isPending,
+          replied_to: decryptedRt,
+        };
       }
     })
   );
+  operationGuard.assertCurrent();
+  return decryptedMessages;
 }
 
 function buildEndpoint(type: 'channel' | 'dm', channelId: string, limit: number, before?: string) {
@@ -157,6 +243,101 @@ function buildEndpoint(type: 'channel' | 'dm', channelId: string, limit: number,
   const params = new URLSearchParams({ limit: String(limit) });
   if (before) params.set('before', before);
   return `${base}?${params}`;
+}
+
+async function readMessagePage(
+  res: Response,
+  channelId: string,
+  fallbackError: string
+): Promise<MessageWithStatus[]> {
+  if (!res.ok) {
+    const data = await safeJson<{ error?: string }>(res);
+    throw new Error(data.error || fallbackError);
+  }
+
+  const data = await safeJson<{ messages?: MessageWithStatus[] }>(res);
+  return (data.messages || []).map((message) => ({
+    ...message,
+    channel_id: message.channel_id || channelId,
+    status: 'delivered' as const,
+  }));
+}
+
+function handleFetchError(
+  err: unknown,
+  fallbackError: string,
+  retry: () => void,
+  setError: (error: string) => void
+) {
+  if (isPendingKeyError(err)) {
+    retry();
+    return;
+  }
+  setError(err instanceof Error ? err.message : fallbackError);
+}
+
+async function loadOlderMessagesAttempt({
+  type,
+  channelId,
+  limit,
+  before,
+  attempt,
+  isCurrent,
+  prependMessages,
+  setHasMore,
+}: {
+  type: 'channel' | 'dm';
+  channelId: string;
+  limit: number;
+  before: string;
+  attempt: number;
+  isCurrent: () => boolean;
+  prependMessages: (channelId: string, messages: MessageWithStatus[]) => void;
+  setHasMore: (hasMore: boolean) => void;
+}): Promise<'retry' | 'done'> {
+  const attemptMessages = useChatStore.getState().messagesByChannel.get(channelId) || [];
+  const idsAtRequestStart = new Set(attemptMessages.map((message) => message.id));
+  const invalidatedDuringRequest = new Set<string>();
+  const unsubscribeInvalidations = subscribeSearchResultInvalidations((messageId) => {
+    invalidatedDuringRequest.add(messageId);
+  });
+  const operationGuard = e2eeService.createChannelOperationGuard(channelId);
+
+  try {
+    const res = await apiFetch(buildEndpoint(type, channelId, limit, before));
+
+    // Channel changed while request was in flight — discard results.
+    if (!isCurrent()) return 'done';
+
+    const rawMsgs = await readMessagePage(res, channelId, 'Failed to load more messages');
+    const msgs = await decryptMessages(channelId, rawMsgs, operationGuard);
+    operationGuard.assertCurrent();
+
+    if (!isCurrent()) return 'done';
+
+    const currentMessages = useChatStore.getState().messagesByChannel.get(channelId) || [];
+    const reconciled = reconcileFetchedMessages(
+      msgs,
+      currentMessages,
+      idsAtRequestStart,
+      invalidatedDuringRequest
+    );
+    if (reconciled.needsAuthoritativeRefetch) {
+      if (attempt + 1 < MAX_PAGINATION_RECONCILIATION_ATTEMPTS) return 'retry';
+      // Keep the cursor retryable if this page changed twice in a row.
+      setHasMore(true);
+      return 'done';
+    }
+
+    // Server returns DESC; reverse to ASC so oldest-first prepends correctly.
+    reconciled.fetched.reverse();
+    operationGuard.assertCurrent();
+    prependMessages(channelId, reconciled.fetched);
+    setHasMore(rawMsgs.length === limit);
+    return 'done';
+  } finally {
+    unsubscribeInvalidations();
+  }
 }
 
 export function useMessageFetch(channelId: string | null, options: UseMessageFetchOptions) {
@@ -173,6 +354,9 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
   const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fetchTrigger, setFetchTrigger] = useState(0);
+  const retryFetch = useCallback(() => {
+    setFetchTrigger((prev) => prev + 1);
+  }, []);
 
   // Keep onFetchComplete in a ref to avoid stale closures without
   // including it in effect dependencies (which would cause re-fetches).
@@ -183,6 +367,16 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
   // when the channel has changed and skip stale state updates.
   const channelIdRef = useRef(channelId);
   channelIdRef.current = channelId;
+  useEffect(() => {
+    // React StrictMode replays effect setup/cleanup; restore the live value on
+    // each setup so its first cleanup cannot permanently null this guard.
+    channelIdRef.current = channelId;
+    return () => {
+      if (channelIdRef.current === channelId) {
+        channelIdRef.current = null;
+      }
+    };
+  }, [channelId]);
 
   // Listen for key delivery events to re-fetch and decrypt messages
   useEffect(() => {
@@ -226,50 +420,61 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
     const fetchMessages = async () => {
       setIsLoading(true);
       setError(null);
+      const idsAtRequestStart = new Set(
+        (useChatStore.getState().messagesByChannel.get(channelId) || []).map(
+          (message) => message.id
+        )
+      );
+      const invalidatedDuringRequest = new Set<string>();
+      const unsubscribeInvalidations = subscribeSearchResultInvalidations((messageId) => {
+        invalidatedDuringRequest.add(messageId);
+      });
 
       try {
+        const operationGuard = e2eeService.createChannelOperationGuard(channelId);
         const res = await apiFetch(buildEndpoint(type, channelId, limit));
         if (aborted) return;
 
-        if (!res.ok) {
-          const data = await safeJson<{ error?: string }>(res);
-          throw new Error(data.error || 'Failed to load messages');
-        }
-
-        const data = await safeJson<{ messages?: MessageWithStatus[] }>(res);
-        if (aborted) return;
-        const rawMsgs: MessageWithStatus[] = (data.messages || []).map((m: MessageWithStatus) => ({
-          ...m,
-          channel_id: m.channel_id || channelId,
-          status: 'delivered' as const,
-        }));
-
-        const msgs = await decryptMessages(channelId, rawMsgs);
+        const rawMsgs = await readMessagePage(res, channelId, 'Failed to load messages');
         if (aborted) return;
 
-        // Passively index decrypted messages for search
-        indexDecryptedMessages(channelId, msgs);
+        const msgs = await decryptMessages(channelId, rawMsgs, operationGuard);
+        operationGuard.assertCurrent();
+        if (aborted) return;
 
-        // Merge with any optimistic messages the user sent while the fetch
-        // was in flight (e.g. during React StrictMode double-mount or reconnect).
+        // Preserve live edits, deletes, arrivals, and optimistic rows that won
+        // while the REST snapshot was being fetched/decrypted.
         const existing = useChatStore.getState().messagesByChannel.get(channelId) || [];
-        const optimistic = existing.filter(
-          (m) => m.clientMessageId && (m.status === 'pending' || m.status === 'sent')
-        );
-        const fetchedIds = new Set(msgs.map((m) => m.id));
-        const kept = optimistic.filter(
-          (m) => !fetchedIds.has(m.id) && !fetchedIds.has(m.clientMessageId ?? '')
+        const reconciled = reconcileFetchedMessages(
+          msgs,
+          existing,
+          idsAtRequestStart,
+          invalidatedDuringRequest
         );
         // Server returns DESC (newest first); reverse to ASC for chronological display
-        msgs.reverse();
-        setMessages(channelId, kept.length > 0 ? [...msgs, ...kept] : msgs);
-        setHasMore(msgs.length === limit);
+        reconciled.fetched.reverse();
+        const merged = [...reconciled.fetched, ...reconciled.preserved];
+        operationGuard.assertCurrent();
+        unsubscribeInvalidations();
+        indexDecryptedMessages(channelId, merged);
+        setMessages(channelId, merged);
+        setHasMore(rawMsgs.length === limit);
         onFetchCompleteRef.current?.();
+        if (reconciled.needsAuthoritativeRefetch) {
+          // An edit/delete for an unloaded row can only tombstone this stale
+          // snapshot. Fetch once more so the authoritative post-event state
+          // (updated row or confirmed absence) is not missing until remount.
+          setFetchTrigger((prev) => prev + 1);
+        }
       } catch (err) {
         if (!aborted) {
-          setError(err instanceof Error ? err.message : 'Failed to load messages');
+          // A key rotation invalidated this batch after decryption. Start a
+          // fresh request with the new generation; access revocations use a
+          // terminal NOT_MEMBER fence and never enter this retry path.
+          handleFetchError(err, 'Failed to load messages', retryFetch, setError);
         }
       } finally {
+        unsubscribeInvalidations();
         if (!aborted) {
           setIsLoading(false);
         }
@@ -281,7 +486,7 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
     return () => {
       aborted = true;
     };
-  }, [channelId, setMessages, fetchTrigger, type, limit]);
+  }, [channelId, setMessages, fetchTrigger, retryFetch, type, limit]);
 
   // Load older messages (pagination)
   const handleLoadMore = useCallback(async () => {
@@ -295,41 +500,31 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
 
     setIsLoading(true);
     try {
-      const res = await apiFetch(buildEndpoint(type, requestChannelId, limit, oldestMessage.id));
-
-      // Channel changed while request was in flight — discard results
-      if (channelIdRef.current !== requestChannelId) return;
-
-      if (!res.ok) {
-        const data = await safeJson<{ error?: string }>(res);
-        throw new Error(data.error || 'Failed to load more messages');
+      for (let attempt = 0; attempt < MAX_PAGINATION_RECONCILIATION_ATTEMPTS; attempt += 1) {
+        const outcome = await loadOlderMessagesAttempt({
+          type,
+          channelId: requestChannelId,
+          limit,
+          before: oldestMessage.id,
+          attempt,
+          isCurrent: () => channelIdRef.current === requestChannelId,
+          prependMessages,
+          setHasMore,
+        });
+        if (outcome === 'done') return;
       }
-
-      const data = await safeJson<{ messages?: MessageWithStatus[] }>(res);
-      const rawMsgs: MessageWithStatus[] = (data.messages || []).map((m: MessageWithStatus) => ({
-        ...m,
-        channel_id: m.channel_id || requestChannelId,
-        status: 'delivered' as const,
-      }));
-
-      const msgs = await decryptMessages(requestChannelId, rawMsgs);
-
-      if (channelIdRef.current !== requestChannelId) return;
-
-      // Server returns DESC; reverse to ASC so oldest-first prepends correctly
-      msgs.reverse();
-      prependMessages(requestChannelId, msgs);
-      setHasMore(msgs.length === limit);
     } catch (err) {
       if (channelIdRef.current === requestChannelId) {
-        setError(err instanceof Error ? err.message : 'Failed to load more messages');
+        // Reconcile from a fresh initial snapshot after rotation. Retrying
+        // the same `before` cursor could be stale after live edits/deletes.
+        handleFetchError(err, 'Failed to load more messages', retryFetch, setError);
       }
     } finally {
       if (channelIdRef.current === requestChannelId) {
         setIsLoading(false);
       }
     }
-  }, [channelId, isLoading, hasMore, prependMessages, type, limit]);
+  }, [channelId, isLoading, hasMore, prependMessages, retryFetch, type, limit]);
 
   return { messages, isLoading, hasMore, error, handleLoadMore };
 }

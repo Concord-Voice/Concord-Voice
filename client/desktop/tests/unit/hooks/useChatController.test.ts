@@ -7,6 +7,12 @@ import { PIN_MESSAGES } from '@/renderer/utils/permissions';
 import { mockUser, mockMessage } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { ConnectionState } from '@/renderer/services/websocketService';
+import {
+  clearIndex,
+  indexMessage,
+  removeMessage,
+  searchMessages,
+} from '@/renderer/services/searchService';
 import type { ChatContext, MessageWithStatus } from '@/renderer/types/chat';
 
 // --- Mocks ---
@@ -63,13 +69,20 @@ vi.mock('@/renderer/services/apiClient', () => ({
 
 // E2EE service
 const mockEncryptForChannel = vi.fn();
+const mockEncryptForChannelWithVersion = vi.fn();
 const mockGetCurrentKeyVersion = vi.fn(() => 1);
+const mockInvalidateChannelKey = vi.fn();
+let mockE2EEIsInitialized = true;
 
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     encryptForChannel: (...args: unknown[]) => mockEncryptForChannel(...args),
+    encryptForChannelWithVersion: (...args: unknown[]) => mockEncryptForChannelWithVersion(...args),
     getCurrentKeyVersion: (...args: unknown[]) => mockGetCurrentKeyVersion(...args),
-    isInitialized: true,
+    invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
+    get isInitialized() {
+      return mockE2EEIsInitialized;
+    },
   },
 }));
 
@@ -127,14 +140,28 @@ const voiceCtx: ChatContext = {
   serverId: 'server-1',
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 // --- Tests ---
 
 describe('useChatController', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearIndex();
+    mockEncryptForChannelWithVersion.mockResolvedValue({
+      ciphertext: 'encrypted-content',
+      keyVersion: 1,
+    });
     resetAllStores();
     useUserStore.setState({ user: mockUser });
     mockWsGetState.mockReturnValue(ConnectionState.CONNECTED);
+    mockE2EEIsInitialized = true;
   });
 
   // ── Return shape ─────────────────────────────────────────────────
@@ -297,8 +324,12 @@ describe('useChatController', () => {
       );
     });
 
-    it('encrypts content when context is E2EE', async () => {
-      mockEncryptForChannel.mockResolvedValue('encrypted-content');
+    it('binds channel edit ciphertext and key version from one encryption result', async () => {
+      mockEncryptForChannel.mockResolvedValue('legacy-encrypted-content');
+      mockEncryptForChannelWithVersion.mockResolvedValue({
+        ciphertext: 'encrypted-content',
+        keyVersion: 7,
+      });
       mockApiFetch.mockResolvedValue({
         ok: true,
         json: () =>
@@ -316,21 +347,93 @@ describe('useChatController', () => {
         await result.current.editMessage('msg-1', 'plaintext edit');
       });
 
-      expect(mockEncryptForChannel).toHaveBeenCalledWith('channel-2', 'plaintext edit');
-      // Verify the body sent to server is encrypted
-      const callBody = JSON.parse(mockApiFetch.mock.calls[0][1].body);
-      expect(callBody.content).toBe('encrypted-content');
+      const channelRequest = mockApiFetch.mock.calls[0];
+      expect(channelRequest?.[0]).toBe('/api/v1/messages/msg-1');
+      const channelRequestOptions: unknown = channelRequest?.[1];
+      expect(channelRequestOptions).toEqual(expect.objectContaining({ method: 'PATCH' }));
+      if (
+        typeof channelRequestOptions !== 'object' ||
+        channelRequestOptions === null ||
+        !('body' in channelRequestOptions) ||
+        typeof channelRequestOptions.body !== 'string'
+      ) {
+        throw new Error('Expected channel edit request body to be a string');
+      }
+      const channelPayload: unknown = JSON.parse(channelRequestOptions.body);
+      expect(channelPayload).toEqual({ content: 'encrypted-content', key_version: 7 });
+      expect(mockEncryptForChannelWithVersion).toHaveBeenCalledWith('channel-2', 'plaintext edit');
     });
 
-    it('stores plaintext locally for E2EE edits', async () => {
-      mockEncryptForChannel.mockResolvedValue('encrypted-content');
+    it('binds DM edit ciphertext and key version from one encryption result', async () => {
+      mockEncryptForChannel.mockResolvedValue('legacy-encrypted-dm-content');
+      mockEncryptForChannelWithVersion.mockResolvedValue({
+        ciphertext: 'encrypted-dm-content',
+        keyVersion: 7,
+      });
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            message: {
+              content: 'encrypted-dm-content',
+              key_version: 7,
+              edited_at: '2025-01-01T13:00:00Z',
+            },
+          }),
+      });
+
+      const { result } = renderHook(() => useChatController(encryptedDMCtx));
+      await act(async () => {
+        await result.current.editMessage('msg-1', 'plaintext DM edit');
+      });
+
+      const dmRequest = mockApiFetch.mock.calls[0];
+      expect(dmRequest?.[0]).toBe('/api/v1/dm/conversations/conv-2/messages/msg-1');
+      const dmRequestOptions: unknown = dmRequest?.[1];
+      expect(dmRequestOptions).toEqual(expect.objectContaining({ method: 'PATCH' }));
+      if (
+        typeof dmRequestOptions !== 'object' ||
+        dmRequestOptions === null ||
+        !('body' in dmRequestOptions) ||
+        typeof dmRequestOptions.body !== 'string'
+      ) {
+        throw new Error('Expected DM edit request body to be a string');
+      }
+      const dmPayload: unknown = JSON.parse(dmRequestOptions.body);
+      expect(dmPayload).toEqual({ content: 'encrypted-dm-content', key_version: 7 });
+      expect(mockEncryptForChannelWithVersion).toHaveBeenCalledWith('conv-2', 'plaintext DM edit');
+    });
+
+    it('fails closed without issuing an edit request before E2EE initialization', async () => {
+      mockE2EEIsInitialized = false;
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            message: { content: 'plaintext edit', edited_at: '2025-01-01T13:00:00Z' },
+          }),
+      });
+
+      const { result } = renderHook(() => useChatController(encryptedChannelCtx));
+      await act(async () => {
+        await result.current.editMessage('msg-1', 'plaintext edit');
+      });
+
+      expect(mockApiFetch).not.toHaveBeenCalled();
+    });
+
+    it('stores plaintext and the encryption epoch while clearing stale decrypt state', async () => {
+      mockEncryptForChannel.mockResolvedValue('legacy-encrypted-content');
+      mockEncryptForChannelWithVersion.mockResolvedValue({
+        ciphertext: 'encrypted-content',
+        keyVersion: 7,
+      });
       mockApiFetch.mockResolvedValue({
         ok: true,
         json: () =>
           Promise.resolve({
             message: {
               content: 'encrypted-content',
-              key_version: 1,
               edited_at: '2025-01-01T13:00:00Z',
             },
           }),
@@ -341,6 +444,9 @@ describe('useChatController', () => {
         ...mockMessage,
         id: 'msg-1',
         channel_id: 'channel-2',
+        key_version: 2,
+        decryptFailed: true,
+        pendingKeys: true,
       });
 
       const { result } = renderHook(() => useChatController(encryptedChannelCtx));
@@ -354,7 +460,217 @@ describe('useChatController', () => {
         .messagesByChannel.get('channel-2')
         ?.find((m) => m.id === 'msg-1');
       expect(updatedMsg?.content).toBe('plaintext edit');
+      expect(updatedMsg?.key_version).toBe(7);
+      expect(updatedMsg?.decryptFailed).toBe(false);
+      expect(updatedMsg?.pendingKeys).toBe(false);
     });
+
+    it('preserves a GIF slug inside the canonical plaintext edit envelope', async () => {
+      mockEncryptForChannel.mockResolvedValue('legacy-encrypted-content');
+      mockEncryptForChannelWithVersion.mockResolvedValue({
+        ciphertext: 'encrypted-gif-envelope',
+        keyVersion: 7,
+      });
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            message: {
+              content: 'encrypted-gif-envelope',
+              key_version: 7,
+              edited_at: '2025-01-01T13:00:00Z',
+            },
+          }),
+      });
+      useChatStore.getState().addMessage('channel-2', {
+        ...mockMessage,
+        id: 'msg-1',
+        channel_id: 'channel-2',
+        gif_slug: 'happy-cat-7',
+      });
+
+      const { result } = renderHook(() => useChatController(encryptedChannelCtx));
+      await act(async () => {
+        await result.current.editMessage('msg-1', 'edited GIF caption');
+      });
+
+      expect(mockEncryptForChannelWithVersion).toHaveBeenCalledWith(
+        'channel-2',
+        '{"text":"edited GIF caption","gif_slug":"happy-cat-7"}'
+      );
+      const updatedMsg = useChatStore
+        .getState()
+        .messagesByChannel.get('channel-2')
+        ?.find((message) => message.id === 'msg-1');
+      expect(updatedMsg?.content).toBe('edited GIF caption');
+      expect(updatedMsg?.gif_slug).toBe('happy-cat-7');
+    });
+
+    it.each([
+      ['channel', encryptedChannelCtx, '/api/v1/messages/msg-epoch-race'],
+      ['DM', encryptedDMCtx, '/api/v1/dm/conversations/conv-2/messages/msg-epoch-race'],
+    ] as const)(
+      're-encrypts and retries a %s edit once after epoch revocation',
+      async (_, ctx, url) => {
+        mockEncryptForChannelWithVersion
+          .mockResolvedValueOnce({ ciphertext: 'stale-edit-ciphertext', keyVersion: 2 })
+          .mockResolvedValueOnce({ ciphertext: 'fresh-edit-ciphertext', keyVersion: 3 });
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: false,
+            status: 409,
+            json: () =>
+              Promise.resolve({
+                error: 'Key epoch has been revoked — re-encrypt with current epoch',
+                code: 'epoch_revoked',
+                current_epoch: 3,
+              }),
+          })
+          .mockResolvedValueOnce({
+            ok: true,
+            status: 200,
+            json: () =>
+              Promise.resolve({
+                message: {
+                  content: 'fresh-edit-ciphertext',
+                  key_version: 3,
+                  edited_at: '2025-01-01T13:00:00Z',
+                },
+              }),
+          });
+        useChatStore.getState().addMessage(ctx.id, {
+          ...mockMessage,
+          id: 'msg-epoch-race',
+          channel_id: ctx.id,
+        });
+
+        const { result } = renderHook(() => useChatController(ctx));
+        await act(async () => {
+          await result.current.editMessage('msg-epoch-race', 'fresh plaintext edit');
+        });
+
+        expect(mockInvalidateChannelKey).toHaveBeenCalledOnce();
+        expect(mockInvalidateChannelKey).toHaveBeenCalledWith(ctx.id);
+        expect(mockEncryptForChannelWithVersion).toHaveBeenNthCalledWith(
+          1,
+          ctx.id,
+          'fresh plaintext edit'
+        );
+        expect(mockEncryptForChannelWithVersion).toHaveBeenNthCalledWith(
+          2,
+          ctx.id,
+          'fresh plaintext edit'
+        );
+        expect(mockApiFetch).toHaveBeenCalledTimes(2);
+        expect(mockApiFetch).toHaveBeenNthCalledWith(
+          2,
+          url,
+          expect.objectContaining({
+            method: 'PATCH',
+            body: JSON.stringify({ content: 'fresh-edit-ciphertext', key_version: 3 }),
+          })
+        );
+        expect(
+          useChatStore
+            .getState()
+            .messagesByChannel.get(ctx.id)
+            ?.find((message) => message.id === 'msg-epoch-race')
+        ).toMatchObject({
+          content: 'fresh plaintext edit',
+          key_version: 3,
+          decryptFailed: false,
+          pendingKeys: false,
+        });
+      }
+    );
+
+    it.each([
+      ['channel', encryptedChannelCtx],
+      ['DM', encryptedDMCtx],
+    ] as const)('replaces the local search document after a successful %s edit', async (_, ctx) => {
+      const messageId = `msg-local-search-${ctx.type}`;
+      indexMessage(messageId, 'obsoletezebra', ctx.id);
+      mockEncryptForChannelWithVersion.mockResolvedValue({
+        ciphertext: 'fresh-edit-ciphertext',
+        keyVersion: 4,
+      });
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            message: {
+              content: 'fresh-edit-ciphertext',
+              key_version: 4,
+              edited_at: '2025-01-01T13:00:00Z',
+            },
+          }),
+      });
+      useChatStore.getState().addMessage(ctx.id, {
+        ...mockMessage,
+        id: messageId,
+        channel_id: ctx.id,
+        content: 'obsoletezebra',
+      });
+
+      const { result } = renderHook(() => useChatController(ctx));
+      await act(async () => {
+        await result.current.editMessage(messageId, 'freshwalrus');
+      });
+
+      expect(searchMessages('obsoletezebra', ctx.id)).not.toContain(messageId);
+      expect(searchMessages('freshwalrus', ctx.id)).toContain(messageId);
+    });
+
+    it.each([
+      ['channel', encryptedChannelCtx],
+      ['DM', encryptedDMCtx],
+    ] as const)(
+      'does not restore a deleted message when a successful %s edit response arrives late',
+      async (_, ctx) => {
+        const messageId = `msg-deleted-during-edit-${ctx.type}`;
+        const response = deferred<Response>();
+        indexMessage(messageId, 'obsoletezebra', ctx.id);
+        useChatStore.getState().addMessage(ctx.id, {
+          ...mockMessage,
+          id: messageId,
+          channel_id: ctx.id,
+          content: 'obsoletezebra',
+        });
+        mockApiFetch.mockReturnValueOnce(response.promise);
+
+        const { result } = renderHook(() => useChatController(ctx));
+        let editPromise!: Promise<void>;
+        await act(async () => {
+          editPromise = result.current.editMessage(messageId, 'freshwalrus');
+          await vi.waitFor(() => expect(mockApiFetch).toHaveBeenCalledOnce());
+        });
+
+        useChatStore.getState().deleteMessage(ctx.id, messageId);
+        removeMessage(messageId);
+        response.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              message: {
+                content: 'fresh-edit-ciphertext',
+                key_version: 4,
+                edited_at: '2025-01-01T13:00:00Z',
+              },
+            }),
+        } as Response);
+        await act(async () => editPromise);
+
+        expect(
+          useChatStore
+            .getState()
+            .messagesByChannel.get(ctx.id)
+            ?.some((message) => message.id === messageId)
+        ).toBe(false);
+        expect(searchMessages('freshwalrus', ctx.id)).not.toContain(messageId);
+      }
+    );
 
     it('handles edit failure gracefully', async () => {
       mockApiFetch.mockResolvedValue({
@@ -417,6 +733,25 @@ describe('useChatController', () => {
       const msgs = useChatStore.getState().messagesByChannel.get('channel-1');
       expect(msgs?.find((m) => m.id === 'msg-to-delete')).toBeUndefined();
     });
+
+    it.each([
+      ['channel', channelCtx],
+      ['DM', dmCtx],
+    ] as const)(
+      'removes the local search document after a successful %s delete',
+      async (_, ctx) => {
+        const messageId = `msg-local-delete-${ctx.type}`;
+        indexMessage(messageId, 'deletedlocalterm', ctx.id);
+        mockApiFetch.mockResolvedValue({ ok: true, json: () => Promise.resolve({}) });
+
+        const { result } = renderHook(() => useChatController(ctx));
+        await act(async () => {
+          await result.current.deleteMessage(messageId);
+        });
+
+        expect(searchMessages('deletedlocalterm', ctx.id)).not.toContain(messageId);
+      }
+    );
   });
 
   // ── Reply state ─────────────────────────────────────────────────

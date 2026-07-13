@@ -4,13 +4,21 @@ import { useChatStore } from '@/renderer/stores/chatStore';
 import { useChannelStore } from '@/renderer/stores/channelStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useUserStore } from '@/renderer/stores/userStore';
+import { e2eeService } from '@/renderer/services/e2eeService';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel } from '../../mocks/fixtures';
 
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
+    isInitialized: true,
     decryptMessage: vi.fn((content: string) => Promise.resolve(content)),
+    decryptForChannel: vi.fn((_channelId: string, content: string) => Promise.resolve(content)),
+    decryptForChannelWithVersion: vi.fn((_channelId: string, content: string) =>
+      Promise.resolve(content)
+    ),
     hasKey: vi.fn().mockReturnValue(false),
+    invalidateChannelKey: vi.fn(),
+    revokeChannelAccess: vi.fn(),
   },
 }));
 
@@ -54,6 +62,7 @@ function createMockWsService() {
 
 beforeEach(() => {
   resetAllStores();
+  (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
   useAuthStore.getState().setAccessToken('mock-token');
   useChannelStore.getState().addChannel(mockChannel);
   useChatStore.setState({ isConnected: true });
@@ -90,7 +99,7 @@ describe('useWebSocketMessages — reply passthrough', () => {
     expect(msg?.reply_to_id).toBe('msg-original');
   });
 
-  it('passes replied_to object through to stored message', () => {
+  it('decrypts and stores the replied_to object', async () => {
     const ws = createMockWsService();
     renderHook(() => useWebSocketMessages(ws as never));
 
@@ -104,7 +113,7 @@ describe('useWebSocketMessages — reply passthrough', () => {
     };
 
     const handler = ws.handlers.get('message')!;
-    act(() => {
+    await act(async () => {
       handler({
         type: 'message',
         data: {
@@ -126,6 +135,44 @@ describe('useWebSocketMessages — reply passthrough', () => {
     expect(msg?.replied_to).toBeDefined();
     expect(msg?.replied_to?.id).toBe('msg-original');
     expect(msg?.replied_to?.content).toBe('Original message');
+  });
+
+  it('fails closed for replied_to content while E2EE is unavailable', () => {
+    (e2eeService as unknown as { isInitialized: boolean }).isInitialized = false;
+    const ws = createMockWsService();
+    renderHook(() => useWebSocketMessages(ws as never));
+
+    const handler = ws.handlers.get('message')!;
+    act(() => {
+      handler({
+        type: 'message',
+        data: {
+          id: 'msg-reply-unavailable',
+          channel_id: 'channel-1',
+          user_id: 'user-2',
+          username: 'otheruser',
+          content: 'encrypted-message',
+          reply_to_id: 'msg-original',
+          replied_to: {
+            id: 'msg-original',
+            user_id: 'user-1',
+            username: 'testuser',
+            content: 'encrypted-reply',
+            key_version: 2,
+          },
+          created_at: '2025-01-01T12:00:00Z',
+          updated_at: '2025-01-01T12:00:00Z',
+        },
+      });
+    });
+
+    const message = useChatStore
+      .getState()
+      .messagesByChannel.get('channel-1')
+      ?.find((candidate) => candidate.id === 'msg-reply-unavailable');
+    expect(message?.content).toBe('');
+    expect(message?.replied_to?.content).toBe('');
+    expect(message?.decryptFailed).toBe(true);
   });
 
   it('stores message without reply fields when not a reply', () => {

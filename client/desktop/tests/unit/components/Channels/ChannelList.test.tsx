@@ -79,10 +79,10 @@ describe('ChannelList', () => {
   beforeEach(() => {
     resetAllStores();
     vi.clearAllMocks();
-    // Override fetchChannels and clearChannels to prevent useEffect from modifying state
+    // Override fetchChannels and clearChannelView to prevent useEffect from modifying state
     useChannelStore.setState({
       fetchChannels: vi.fn() as unknown as (serverId: string) => Promise<void>,
-      clearChannels: vi.fn() as unknown as () => void,
+      clearChannelView: vi.fn() as unknown as () => void,
     });
   });
 

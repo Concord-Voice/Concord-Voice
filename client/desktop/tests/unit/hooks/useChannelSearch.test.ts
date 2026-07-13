@@ -32,12 +32,29 @@ const mockSearchMessages = vi.fn().mockReturnValue([]);
 const mockSearchMessagesMultiScope = vi.fn().mockReturnValue([]);
 const mockIndexMessage = vi.fn();
 const mockIsIndexed = vi.fn().mockReturnValue(false);
+const mockBackfillGuard = {
+  isCurrent: vi.fn().mockReturnValue(true),
+  close: vi.fn(),
+};
+const mockBeginSearchBackfill = vi.fn((_scopes: readonly string[]) => mockBackfillGuard);
+const mockCanIndexBackfillMessage = vi.fn().mockReturnValue(true);
+const mockSubscribeMessageRemovals = vi.fn(() => vi.fn());
+let capturedScopeInvalidation: ((scope: string | null) => void) | undefined;
+const mockSubscribeScopeInvalidations = vi.fn((listener: (scope: string | null) => void) => {
+  capturedScopeInvalidation = listener;
+  return vi.fn();
+});
 
 vi.mock('@/renderer/services/searchService', () => ({
   searchMessages: (...args: unknown[]) => mockSearchMessages(...args),
   searchMessagesMultiScope: (...args: unknown[]) => mockSearchMessagesMultiScope(...args),
   indexMessage: (...args: unknown[]) => mockIndexMessage(...args),
   isIndexed: (...args: unknown[]) => mockIsIndexed(...args),
+  beginSearchBackfill: (...args: [readonly string[]]) => mockBeginSearchBackfill(...args),
+  canIndexBackfillMessage: (...args: unknown[]) => mockCanIndexBackfillMessage(...args),
+  subscribeSearchResultInvalidations: (...args: unknown[]) => mockSubscribeMessageRemovals(...args),
+  subscribeSearchScopeInvalidations: (...args: unknown[]) =>
+    mockSubscribeScopeInvalidations(...args),
 }));
 
 import {
@@ -78,6 +95,7 @@ describe('useChannelSearch helpers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockE2eeInitialized = true;
+    capturedScopeInvalidation = undefined;
   });
 
   // --- buildBulkUrl ---
@@ -123,11 +141,13 @@ describe('useChannelSearch helpers', () => {
       expect(result).toBe('plain text');
     });
 
-    it('returns plaintext content when e2ee not initialized', async () => {
+    it('fails closed when e2ee is not initialized', async () => {
       mockE2eeInitialized = false;
       const msg = makeMsg({ content: 'encrypted' });
       const result = await decryptMessageContent(msg, 'ch-1');
-      expect(result).toBe('encrypted');
+      expect(result).toBeNull();
+      expect(mockDecryptForChannel).not.toHaveBeenCalled();
+      expect(mockDecryptForChannelWithVersion).not.toHaveBeenCalled();
     });
 
     it('decrypts with decryptForChannel for version 1', async () => {
@@ -169,17 +189,24 @@ describe('useChannelSearch helpers', () => {
     it('skips already-indexed messages', async () => {
       mockIsIndexed.mockReturnValueOnce(true);
       const onNewResult = vi.fn();
-      await processBackfillMessage(makeMsg(), 'ch-1', 'test', new Set(), onNewResult);
+      await processBackfillMessage(
+        makeMsg(),
+        'ch-1',
+        'test',
+        new Set(),
+        mockBackfillGuard,
+        onNewResult
+      );
       expect(mockIndexMessage).not.toHaveBeenCalled();
       expect(onNewResult).not.toHaveBeenCalled();
     });
 
     it('indexes and emits matching message', async () => {
-      mockIsIndexed.mockReturnValueOnce(false);
+      mockIsIndexed.mockReturnValueOnce(false).mockReturnValueOnce(false).mockReturnValueOnce(true);
       mockDecryptForChannel.mockResolvedValueOnce('hello world');
       const onNewResult = vi.fn();
       const msg = makeMsg({ id: 'msg-match', content: 'hello world' });
-      await processBackfillMessage(msg, 'ch-1', 'hello', new Set(), onNewResult);
+      await processBackfillMessage(msg, 'ch-1', 'hello', new Set(), mockBackfillGuard, onNewResult);
       expect(mockIndexMessage).toHaveBeenCalledWith('msg-match', 'hello world', 'ch-1');
       expect(onNewResult).toHaveBeenCalledTimes(1);
       expect(onNewResult.mock.calls[0][0]).toMatchObject({
@@ -190,22 +217,67 @@ describe('useChannelSearch helpers', () => {
     });
 
     it('indexes but does not emit non-matching message', async () => {
-      mockIsIndexed.mockReturnValueOnce(false);
+      mockIsIndexed.mockReturnValueOnce(false).mockReturnValueOnce(false).mockReturnValueOnce(true);
       mockDecryptForChannel.mockResolvedValueOnce('goodbye world');
       const onNewResult = vi.fn();
       const msg = makeMsg({ id: 'msg-no', content: 'goodbye world' });
-      await processBackfillMessage(msg, 'ch-1', 'hello', new Set(), onNewResult);
+      await processBackfillMessage(msg, 'ch-1', 'hello', new Set(), mockBackfillGuard, onNewResult);
       expect(mockIndexMessage).toHaveBeenCalledWith('msg-no', 'goodbye world', 'ch-1');
       expect(onNewResult).not.toHaveBeenCalled();
     });
 
-    it('does not emit duplicate results', async () => {
+    it('does not emit plaintext when a concurrent delete blocks the index write', async () => {
       mockIsIndexed.mockReturnValueOnce(false);
+      mockCanIndexBackfillMessage.mockReturnValueOnce(false);
+      mockDecryptForChannel.mockResolvedValueOnce('deleted plaintext');
+      const onNewResult = vi.fn();
+      const msg = makeMsg({ id: 'msg-deleted', content: 'encrypted' });
+
+      await processBackfillMessage(
+        msg,
+        'ch-1',
+        'deleted',
+        new Set(),
+        mockBackfillGuard,
+        onNewResult
+      );
+
+      expect(mockIndexMessage).not.toHaveBeenCalled();
+      expect(onNewResult).not.toHaveBeenCalled();
+    });
+
+    it('does not overwrite an authoritative live edit indexed during decryption', async () => {
+      mockIsIndexed.mockReturnValueOnce(false).mockReturnValueOnce(true);
+      mockDecryptForChannel.mockResolvedValueOnce('stale backfill plaintext');
+      const onNewResult = vi.fn();
+
+      await processBackfillMessage(
+        makeMsg({ id: 'msg-edited', content: 'old ciphertext' }),
+        'ch-1',
+        'stale',
+        new Set(),
+        mockBackfillGuard,
+        onNewResult
+      );
+
+      expect(mockIndexMessage).not.toHaveBeenCalled();
+      expect(onNewResult).not.toHaveBeenCalled();
+    });
+
+    it('does not emit duplicate results', async () => {
+      mockIsIndexed.mockReturnValueOnce(false).mockReturnValueOnce(false).mockReturnValueOnce(true);
       mockDecryptForChannel.mockResolvedValueOnce('hello');
       const onNewResult = vi.fn();
       const allResultIds = new Set(['msg-dup']);
       const msg = makeMsg({ id: 'msg-dup', content: 'hello' });
-      await processBackfillMessage(msg, 'ch-1', 'hello', allResultIds, onNewResult);
+      await processBackfillMessage(
+        msg,
+        'ch-1',
+        'hello',
+        allResultIds,
+        mockBackfillGuard,
+        onNewResult
+      );
       expect(onNewResult).not.toHaveBeenCalled();
     });
 
@@ -214,7 +286,7 @@ describe('useChannelSearch helpers', () => {
       mockDecryptForChannel.mockRejectedValueOnce(new Error('fail'));
       const onNewResult = vi.fn();
       const msg = makeMsg({ key_version: 1, content: 'enc' });
-      await processBackfillMessage(msg, 'ch-1', 'test', new Set(), onNewResult);
+      await processBackfillMessage(msg, 'ch-1', 'test', new Set(), mockBackfillGuard, onNewResult);
       expect(mockIndexMessage).not.toHaveBeenCalled();
       expect(onNewResult).not.toHaveBeenCalled();
     });
@@ -260,6 +332,7 @@ describe('useChannelSearch hook', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockE2eeInitialized = true;
+    capturedScopeInvalidation = undefined;
     useChatStore.setState({
       messagesByChannel: new Map(),
     });
@@ -336,8 +409,25 @@ describe('useChannelSearch hook', () => {
     });
   });
 
+  it('removes copied result plaintext when its scope is invalidated', async () => {
+    mockSearchMessages.mockReturnValueOnce(['msg-1']);
+    useChatStore.setState({
+      messagesByChannel: new Map([['channel-1', [mockMessage]]]),
+    });
+    mockBulkResponse([]);
+
+    const { result } = renderHook(() => useChannelSearch('channel-1'));
+    act(() => result.current.search('Hello'));
+    await waitFor(() => expect(result.current.results).toHaveLength(1));
+
+    act(() => capturedScopeInvalidation?.('channel-1'));
+
+    expect(result.current.results).toEqual([]);
+  });
+
   it('finds matches during backfill', async () => {
     mockSearchMessages.mockReturnValueOnce([]);
+    mockIsIndexed.mockReturnValueOnce(false).mockReturnValueOnce(false).mockReturnValueOnce(true);
     mockDecryptForChannel.mockResolvedValueOnce('hello backfill');
     const backfillMsg = makeMsg({ id: 'bf-1', content: 'hello backfill' });
     mockBulkResponse([backfillMsg]);

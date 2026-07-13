@@ -7,7 +7,7 @@ import { resetAllStores } from '../helpers/store-helpers';
 import { mockUser } from '../mocks/fixtures';
 
 vi.mock('@/renderer/services/e2eeService', () => ({
-  e2eeService: { isInitialized: false },
+  e2eeService: { isInitialized: false, revokeChannelAccess: vi.fn() },
 }));
 vi.mock('@/renderer/services/ttsService', () => ({ speak: vi.fn() }));
 vi.mock('@/renderer/services/preferencesSync', () => ({
@@ -37,6 +37,7 @@ vi.mock('@/renderer/services/savedGifsSync', () => ({
 }));
 vi.mock('@/renderer/services/searchService', () => ({
   indexMessage: vi.fn(),
+  removeScope: vi.fn(),
 }));
 vi.mock('@/renderer/services/desktopNotificationService', () => ({
   desktopNotificationService: {

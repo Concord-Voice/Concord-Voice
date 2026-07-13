@@ -3,8 +3,34 @@ import { devtools, persist } from 'zustand/middleware';
 import { wrapStore } from '../utils/createStore';
 import { Channel, ChannelGroup } from '../types/chat';
 import { apiFetch } from '../services/apiClient';
+import { e2eeService } from '../services/e2eeService';
+import { removeScope } from '../services/searchService';
 import { useChatStore } from './chatStore';
 import { useUnreadStore } from './unreadStore';
+
+function invalidateChannelAccessState(channelId: string): void {
+  // Fence pending decrypts before purging searchable plaintext so a stale
+  // generation cannot recreate the search scope after channel access is lost.
+  e2eeService.revokeChannelAccess(channelId);
+  removeScope(channelId);
+}
+
+function purgeChannelAccessState(channelId: string): void {
+  invalidateChannelAccessState(channelId);
+  useChatStore.getState().clearMessages(channelId);
+  useUnreadStore.getState().clearUnread(channelId);
+}
+
+interface ChannelFetchJournal {
+  serverId: string;
+  removedChannelIds: Set<string>;
+  discarded: boolean;
+  viewDiscarded: boolean;
+}
+
+const channelFetchJournals = new Set<ChannelFetchJournal>();
+const hasLiveChannelFetch = () =>
+  Array.from(channelFetchJournals).some((journal) => !journal.discarded && !journal.viewDiscarded);
 
 interface ChannelState {
   channels: Channel[];
@@ -13,6 +39,7 @@ interface ChannelState {
   activeChannelId: string | null;
   currentServerId: string | null;
   lastChannelByServer: Record<string, string>;
+  channelIdsByServer: Record<string, string[]>;
   isLoading: boolean;
   error: string | null;
 
@@ -20,7 +47,9 @@ interface ChannelState {
   addChannel: (channel: Channel) => void;
   updateChannel: (channelId: string, updates: Partial<Channel>) => void;
   removeChannel: (channelId: string) => void;
+  removeServerChannels: (serverId: string) => void;
   setActiveChannel: (channelId: string | null) => void;
+  clearChannelView: () => void;
   clearChannels: () => void;
 
   // Channel group actions
@@ -36,6 +65,53 @@ interface ChannelState {
   getLinkedTextChannel: (voiceChannelId: string) => Channel | undefined;
 }
 
+function purgeMissingChannelAccessState(knownChannelIds: string[], channels: Channel[]): void {
+  const fetchedIds = new Set(channels.map((channel) => channel.id));
+  for (const channelId of knownChannelIds) {
+    if (!fetchedIds.has(channelId)) purgeChannelAccessState(channelId);
+  }
+}
+
+function selectActiveChannelId(channels: Channel[], lastChannelId?: string): string | null {
+  if (lastChannelId && channels.some((channel) => channel.id === lastChannelId)) {
+    return lastChannelId;
+  }
+  return channels.find((channel) => channel.type === 'text')?.id ?? null;
+}
+
+function buildFetchedChannelState(
+  journal: ChannelFetchJournal,
+  currentServerId: string | null,
+  requestedServerId: string,
+  channels: Channel[],
+  channelGroups: ChannelGroup[],
+  channelIdsByServer: Record<string, string[]>,
+  activeChannelId: string | null
+): Partial<ChannelState> {
+  if (journal.viewDiscarded || currentServerId !== requestedServerId) return { channelIdsByServer };
+  return { channels, channelGroups, channelIdsByServer, activeChannelId };
+}
+
+function canReportChannelFetchError(
+  journal: ChannelFetchJournal,
+  currentServerId: string | null,
+  requestedServerId: string
+): boolean {
+  return !journal.discarded && !journal.viewDiscarded && currentServerId === requestedServerId;
+}
+
+function removeChannelFromServerIndex(
+  channelIdsByServer: Record<string, string[]>,
+  channelId: string
+): Record<string, string[]> {
+  return Object.fromEntries(
+    Object.entries(channelIdsByServer).map(([serverId, channelIds]) => [
+      serverId,
+      channelIds.filter((id) => id !== channelId),
+    ])
+  );
+}
+
 export const useChannelStore = wrapStore(
   create<ChannelState>()(
     devtools(
@@ -47,10 +123,18 @@ export const useChannelStore = wrapStore(
           activeChannelId: null,
           currentServerId: null,
           lastChannelByServer: {},
+          channelIdsByServer: {},
           isLoading: false,
           error: null,
 
           fetchChannels: async (serverId: string) => {
+            const journal: ChannelFetchJournal = {
+              serverId,
+              removedChannelIds: new Set(),
+              discarded: false,
+              viewDiscarded: false,
+            };
+            channelFetchJournals.add(journal);
             const { activeChannelId, currentServerId, lastChannelByServer } = get();
 
             // Save current channel for the server we're leaving
@@ -74,40 +158,51 @@ export const useChannelStore = wrapStore(
 
             try {
               const response = await apiFetch(`/api/v1/servers/${serverId}/channels`);
+              if (journal.discarded) return;
 
               if (!response.ok) {
                 const data = await response.json();
+                if (journal.discarded) return;
                 throw new Error(data.error || 'Failed to load channels');
               }
 
               const data = await response.json();
-              const channels: Channel[] = data.channels || [];
+              if (journal.discarded) return;
+
+              const channels: Channel[] = (data.channels || []).filter(
+                (channel: Channel) => !journal.removedChannelIds.has(channel.id)
+              );
               const channelGroups: ChannelGroup[] = data.channel_groups || [];
 
+              purgeMissingChannelAccessState(get().channelIdsByServer[serverId] ?? [], channels);
+
               // Restore last-viewed channel for this server, or pick first text channel
-              const lastChannel = updatedLastChannel[serverId];
-              let nextChannelId: string | null = null;
+              const nextChannelId = selectActiveChannelId(channels, updatedLastChannel[serverId]);
 
-              if (lastChannel && channels.some((c) => c.id === lastChannel)) {
-                nextChannelId = lastChannel;
-              } else {
-                const firstText = channels.find((c) => c.type === 'text');
-                if (firstText) {
-                  nextChannelId = firstText.id;
-                }
-              }
-
-              set({
-                channels,
-                channelGroups,
-                activeChannelId: nextChannelId,
-                isLoading: false,
-              });
+              const channelIdsByServer = {
+                ...get().channelIdsByServer,
+                [serverId]: channels.map((channel) => channel.id),
+              };
+              set(
+                buildFetchedChannelState(
+                  journal,
+                  get().currentServerId,
+                  serverId,
+                  channels,
+                  channelGroups,
+                  channelIdsByServer,
+                  nextChannelId
+                )
+              );
             } catch (error) {
-              set({
-                error: error instanceof Error ? error.message : 'Failed to load channels',
-                isLoading: false,
-              });
+              if (canReportChannelFetchError(journal, get().currentServerId, serverId)) {
+                set({
+                  error: error instanceof Error ? error.message : 'Failed to load channels',
+                });
+              }
+            } finally {
+              channelFetchJournals.delete(journal);
+              set({ isLoading: hasLiveChannelFetch() });
             }
           },
 
@@ -115,7 +210,14 @@ export const useChannelStore = wrapStore(
             set((state) => {
               // Deduplicate: API response + WS broadcast can both call addChannel
               if (state.channels.some((c) => c.id === channel.id)) return state;
-              return { channels: [...state.channels, channel] };
+              const serverChannelIds = state.channelIdsByServer[channel.server_id] ?? [];
+              return {
+                channels: [...state.channels, channel],
+                channelIdsByServer: {
+                  ...state.channelIdsByServer,
+                  [channel.server_id]: [...serverChannelIds, channel.id],
+                },
+              };
             });
           },
 
@@ -126,7 +228,12 @@ export const useChannelStore = wrapStore(
           },
 
           removeChannel: (channelId: string) => {
+            for (const journal of channelFetchJournals) {
+              journal.removedChannelIds.add(channelId);
+            }
             const { activeChannelId, lastChannelByServer } = get();
+
+            purgeChannelAccessState(channelId);
 
             // Clean up lastChannelByServer references to this channel
             const updatedLastChannel = { ...lastChannelByServer };
@@ -136,13 +243,44 @@ export const useChannelStore = wrapStore(
 
             set((state) => ({
               channels: state.channels.filter((c) => c.id !== channelId),
+              channelIdsByServer: removeChannelFromServerIndex(state.channelIdsByServer, channelId),
               activeChannelId: activeChannelId === channelId ? null : activeChannelId,
               lastChannelByServer: updatedLastChannel,
+              isLoading: hasLiveChannelFetch(),
             }));
+          },
 
-            // Cascade: clear messages and unread count for this channel
-            useChatStore.getState().clearMessages(channelId);
-            useUnreadStore.getState().clearUnread(channelId);
+          removeServerChannels: (serverId: string) => {
+            for (const journal of channelFetchJournals) {
+              if (journal.serverId === serverId) journal.discarded = true;
+            }
+            const state = get();
+            const channelIds = new Set(state.channelIdsByServer[serverId] ?? []);
+            for (const channel of state.channels) {
+              if (channel.server_id === serverId) channelIds.add(channel.id);
+            }
+            for (const channelId of channelIds) purgeChannelAccessState(channelId);
+
+            const channelIdsByServer = { ...state.channelIdsByServer };
+            delete channelIdsByServer[serverId];
+            const lastChannelByServer = { ...state.lastChannelByServer };
+            delete lastChannelByServer[serverId];
+
+            set({
+              ...(state.currentServerId === serverId
+                ? {
+                    channels: [],
+                    channelGroups: [],
+                    activeChannelId: null,
+                    currentServerId: null,
+                    isLoading: false,
+                    error: null,
+                  }
+                : {}),
+              channelIdsByServer,
+              lastChannelByServer,
+              isLoading: hasLiveChannelFetch(),
+            });
           },
 
           setActiveChannel: (channelId: string | null) => {
@@ -160,10 +298,34 @@ export const useChannelStore = wrapStore(
             set(updates);
           },
 
-          clearChannels: () => {
+          clearChannelView: () => {
+            // No server is selected, but access to other known servers has not
+            // been revoked. Clear only the rendered server view and preserve
+            // per-server key/search/message/unread state.
+            for (const journal of channelFetchJournals) journal.viewDiscarded = true;
             set({
               channels: [],
               channelGroups: [],
+              activeChannelId: null,
+              currentServerId: null,
+              isLoading: false,
+              error: null,
+            });
+          },
+
+          clearChannels: () => {
+            for (const journal of channelFetchJournals) journal.discarded = true;
+            const state = get();
+            const channelIds = new Set([
+              ...state.channels.map((channel) => channel.id),
+              ...Object.values(state.channelIdsByServer).flat(),
+            ]);
+            for (const channelId of channelIds) purgeChannelAccessState(channelId);
+
+            set({
+              channels: [],
+              channelGroups: [],
+              channelIdsByServer: {},
               activeChannelId: null,
               currentServerId: null,
               isLoading: false,

@@ -9,6 +9,7 @@ import { useUserStore } from '../../stores/userStore';
 import { useVoiceStore } from '../../stores/voiceStore';
 import { useFriendStore } from '../../stores/friendStore';
 import { e2eeService } from '../../services/e2eeService';
+import { subscribeSearchScopeInvalidations } from '../../services/searchService';
 import { useDraftMessageStore } from '../../stores/draftMessageStore';
 import { errorMessage } from '../../utils/redactError';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
@@ -163,14 +164,41 @@ const ConversationList: React.FC<ConversationListProps> = ({
     fetchConversations();
   }, [fetchConversations]);
 
+  useEffect(
+    () =>
+      subscribeSearchScopeInvalidations((scope) => {
+        if (scope === null) {
+          decryptingRef.current.clear();
+          setDecryptedPreviews({});
+          return;
+        }
+        decryptingRef.current.delete(scope);
+        setDecryptedPreviews((current) => {
+          if (!(scope in current)) return current;
+          const next = { ...current };
+          delete next[scope];
+          return next;
+        });
+      }),
+    []
+  );
+
   // Decrypt last message previews for encrypted conversations
   const decryptPreview = useCallback(async (convId: string, ciphertext: string) => {
     if (decryptingRef.current.has(convId)) return;
     decryptingRef.current.add(convId);
     try {
       if (!e2eeService.isInitialized) return;
+      const operationGuard = e2eeService.createChannelOperationGuard(convId);
       const plaintext = await e2eeService.decryptForChannel(convId, ciphertext);
-      if (plaintext) {
+      operationGuard.assertCurrent();
+      const conversationStillOwnsCiphertext = useDMStore
+        .getState()
+        .conversations.some(
+          (conversation) =>
+            conversation.id === convId && conversation.lastMessage?.content === ciphertext
+        );
+      if (plaintext && conversationStillOwnsCiphertext) {
         setDecryptedPreviews((prev) => ({
           ...prev,
           [convId]: { text: plaintext, cipher: ciphertext },

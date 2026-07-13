@@ -45,6 +45,8 @@ import { useFriendOrgStore } from '../stores/friendOrgStore';
 import { useSavedGifsStore } from '../stores/savedGifsStore';
 import { useNotificationPrefsStore } from '../stores/notificationPrefsStore';
 import { resetPostLoginHydrationLifecycle } from './postLoginHydrationLifecycle';
+import { clearIndex } from './searchService';
+import { e2eeService } from './e2eeService';
 
 /**
  * Clears content stores while preserving device settings.
@@ -61,6 +63,9 @@ export function gracefulReset(): void {
   savedGifsSyncService.stopWatching();
   friendOrgSyncService.stopWatching();
   stopExpirySweep();
+  // Reject pre-reset decrypt continuations before clearing content while
+  // preserving key material needed by same-session recovery hydration.
+  e2eeService.fencePendingOperations();
   presenceOverrideSyncService.reset();
   useFriendOrgStore.getState().reset();
   useSavedGifsStore.getState().reset();
@@ -76,6 +81,9 @@ export function gracefulReset(): void {
   useUnreadStore.getState().clearAll();
   useVoiceStore.getState().reset();
   useChatStore.getState().reset();
+  // Search indexes decrypted message content outside the chat stores. Purge it
+  // explicitly so no plaintext survives an account lifecycle transition.
+  clearIndex();
   // Clear rich-presence (custom-text) cache — other users' statuses + self —
   // so signing into a different account never surfaces the prior user's
   // statuses (#1233/Gitar; risk: privacy cross-account leak).

@@ -4,7 +4,24 @@ import { wrapStore } from '../utils/createStore';
 import { apiFetch } from '../services/apiClient';
 import { e2eeService } from '../services/e2eeService';
 import { isPendingKeyError } from '../services/e2eeErrors';
+import { removeScope } from '../services/searchService';
 import { errorMessage } from '../utils/redactError';
+import { useChatStore } from './chatStore';
+
+function purgeConversationAccessState(conversationId: string): void {
+  e2eeService.revokeChannelAccess(conversationId);
+  useChatStore.getState().clearMessages(conversationId);
+  removeScope(conversationId);
+}
+
+interface ConversationFetchJournal {
+  removedIds: Set<string>;
+  cleared: boolean;
+}
+
+const conversationFetchJournals = new Set<ConversationFetchJournal>();
+const hasLiveConversationFetch = () =>
+  Array.from(conversationFetchJournals).some((journal) => !journal.cleared);
 
 export interface DMParticipant {
   userId: string;
@@ -203,6 +220,8 @@ export const useDMStore = wrapStore(
 
           fetchConversations: async () => {
             if (get().isLoading) return;
+            const journal: ConversationFetchJournal = { removedIds: new Set(), cleared: false };
+            conversationFetchJournals.add(journal);
             set({ isLoading: true, error: null });
 
             try {
@@ -213,9 +232,18 @@ export const useDMStore = wrapStore(
               }
 
               const data = await response.json();
-              const conversations: DMConversation[] = (data.conversations || []).map(
-                (c: Record<string, unknown>) => mapConversation(c)
-              );
+              if (journal.cleared) return;
+
+              const conversations: DMConversation[] = (data.conversations || [])
+                .map((c: Record<string, unknown>) => mapConversation(c))
+                .filter((conversation: DMConversation) => !journal.removedIds.has(conversation.id));
+              const fetchedIds = new Set(conversations.map((conversation) => conversation.id));
+
+              for (const conversation of get().conversations) {
+                if (!fetchedIds.has(conversation.id)) {
+                  purgeConversationAccessState(conversation.id);
+                }
+              }
 
               // Validate persisted activeConversationId still exists
               const currentActiveId = get().activeConversationId;
@@ -224,12 +252,16 @@ export const useDMStore = wrapStore(
                   ? currentActiveId
                   : null;
 
-              set({ conversations, activeConversationId: validActiveId, isLoading: false });
+              set({ conversations, activeConversationId: validActiveId });
             } catch (error) {
-              set({
-                error: error instanceof Error ? error.message : 'Failed to load conversations',
-                isLoading: false,
-              });
+              if (!journal.cleared) {
+                set({
+                  error: error instanceof Error ? error.message : 'Failed to load conversations',
+                });
+              }
+            } finally {
+              conversationFetchJournals.delete(journal);
+              set({ isLoading: hasLiveConversationFetch() });
             }
           },
 
@@ -339,12 +371,18 @@ export const useDMStore = wrapStore(
               ),
             })),
 
-          removeConversation: (id: string) =>
+          removeConversation: (id: string) => {
+            for (const journal of conversationFetchJournals) journal.removedIds.add(id);
+            // Fence pending decrypts first, then purge every plaintext-bearing
+            // in-memory representation for this conversation.
+            purgeConversationAccessState(id);
             set((state) => ({
               conversations: state.conversations.filter((c) => c.id !== id),
               activeConversationId:
                 state.activeConversationId === id ? null : state.activeConversationId,
-            })),
+              isLoading: hasLiveConversationFetch(),
+            }));
+          },
 
           updateParticipantProfile: (
             userId: string,
@@ -403,11 +441,17 @@ export const useDMStore = wrapStore(
               ),
             })),
 
-          clearDMs: () =>
+          clearDMs: () => {
+            for (const journal of conversationFetchJournals) journal.cleared = true;
+            for (const conversation of get().conversations) {
+              purgeConversationAccessState(conversation.id);
+            }
             set({
               conversations: [],
               activeConversationId: null,
-            }),
+              isLoading: false,
+            });
+          },
 
           addGroupMember: async (conversationId: string, userId: string) => {
             const response = await apiFetch(`/api/v1/dm/conversations/${conversationId}/members`, {
@@ -456,12 +500,7 @@ export const useDMStore = wrapStore(
               const data = await response.json();
               throw new Error(data.error || 'Failed to leave group');
             }
-            // Remove conversation from local state
-            set((state) => ({
-              conversations: state.conversations.filter((c) => c.id !== conversationId),
-              activeConversationId:
-                state.activeConversationId === conversationId ? null : state.activeConversationId,
-            }));
+            get().removeConversation(conversationId);
           },
 
           updateMemberRole: async (
@@ -502,11 +541,7 @@ export const useDMStore = wrapStore(
               const data = await response.json();
               throw new Error(data.error || 'Failed to delete group');
             }
-            set((state) => ({
-              conversations: state.conversations.filter((c) => c.id !== conversationId),
-              activeConversationId:
-                state.activeConversationId === conversationId ? null : state.activeConversationId,
-            }));
+            get().removeConversation(conversationId);
           },
         }),
         {

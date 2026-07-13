@@ -1,13 +1,18 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   indexMessage,
   indexMessages,
   searchMessages,
   searchMessagesMultiScope,
+  beginSearchBackfill,
+  canIndexBackfillMessage,
+  MAX_BACKFILL_TOMBSTONES,
+  removeMessage,
   removeScope,
   clearIndex,
   getIndexStats,
   isIndexed,
+  subscribeSearchScopeInvalidations,
 } from '@/renderer/services/searchService';
 
 describe('searchService', () => {
@@ -27,10 +32,22 @@ describe('searchService', () => {
       expect(isIndexed('msg-1')).toBe(false);
     });
 
-    it('is idempotent — re-indexing same ID is a no-op', () => {
+    it('replaces old search terms when the same message ID is re-indexed after an edit', () => {
       indexMessage('msg-1', 'hello world', 'channel-1');
       indexMessage('msg-1', 'different content', 'channel-1');
+      expect(searchMessages('hello', 'channel-1')).not.toContain('msg-1');
+      expect(searchMessages('different', 'channel-1')).toContain('msg-1');
       expect(getIndexStats().documentCount).toBe(1);
+    });
+
+    it('allows a failed-decryption cleanup to be retried later', () => {
+      indexMessage('msg-1', 'temporarily decrypted', 'channel-1');
+      indexMessage('msg-1', '', 'channel-1');
+
+      indexMessage('msg-1', 'recovered plaintext', 'channel-1');
+
+      expect(isIndexed('msg-1')).toBe(true);
+      expect(searchMessages('recovered', 'channel-1')).toContain('msg-1');
     });
   });
 
@@ -109,6 +126,16 @@ describe('searchService', () => {
   });
 
   describe('removeScope', () => {
+    it('invalidates only the removed scope of a multi-scope backfill', () => {
+      const guard = beginSearchBackfill(['channel-1', 'channel-2']);
+
+      removeScope('channel-2');
+
+      expect(guard.isCurrent('channel-1')).toBe(true);
+      expect(guard.isCurrent('channel-2')).toBe(false);
+      guard.close();
+    });
+
     it('removes all messages for a scope', () => {
       indexMessage('msg-1', 'hello', 'channel-1');
       indexMessage('msg-2', 'world', 'channel-1');
@@ -127,9 +154,78 @@ describe('searchService', () => {
       removeScope('channel-unknown');
       expect(getIndexStats().documentCount).toBe(1);
     });
+
+    it('invalidates open results even after scope tracking is already absent', () => {
+      const listener = vi.fn();
+      const unsubscribe = subscribeSearchScopeInvalidations(listener);
+
+      removeScope('channel-unknown');
+
+      expect(listener).toHaveBeenCalledWith('channel-unknown');
+      unsubscribe();
+    });
+  });
+
+  describe('removeMessage', () => {
+    it('removes only the targeted message and its tracking metadata', () => {
+      indexMessage('msg-1', 'deleted plaintext', 'channel-1');
+      indexMessage('msg-2', 'retained plaintext', 'channel-1');
+
+      removeMessage('msg-1');
+
+      expect(searchMessages('deleted', 'channel-1')).not.toContain('msg-1');
+      expect(isIndexed('msg-1')).toBe(false);
+      expect(isIndexed('msg-2')).toBe(true);
+      expect(getIndexStats()).toMatchObject({ documentCount: 1, scopeCount: 1 });
+    });
+
+    it('blocks a deleted message only for the active backfill generation', () => {
+      indexMessage('msg-1', 'retained plaintext', 'channel-1');
+      const guard = beginSearchBackfill(['channel-1']);
+
+      removeMessage('late-message');
+
+      expect(isIndexed('msg-1')).toBe(true);
+      expect(canIndexBackfillMessage(guard, 'late-message', 'channel-1')).toBe(false);
+      expect(getIndexStats().documentCount).toBe(1);
+
+      guard.close();
+      indexMessage('late-message', 'future authoritative plaintext', 'channel-1');
+      expect(isIndexed('late-message')).toBe(true);
+    });
+
+    it('invalidates active backfills if bounded deletion tracking fills up', () => {
+      const guard = beginSearchBackfill(['channel-1']);
+      for (let i = 0; i <= MAX_BACKFILL_TOMBSTONES; i += 1) {
+        removeMessage(`deleted-${i}`);
+      }
+
+      expect(guard.isCurrent()).toBe(false);
+      expect(canIndexBackfillMessage(guard, 'unrelated-message', 'channel-1')).toBe(false);
+      guard.close();
+    });
+
+    it('invalidates active backfills with the account-wide index reset', () => {
+      const guard = beginSearchBackfill(['channel-1']);
+
+      clearIndex();
+
+      expect(guard.isCurrent()).toBe(false);
+      guard.close();
+    });
   });
 
   describe('clearIndex', () => {
+    it('broadcasts an all-scopes invalidation', () => {
+      const listener = vi.fn();
+      const unsubscribe = subscribeSearchScopeInvalidations(listener);
+
+      clearIndex();
+
+      expect(listener).toHaveBeenCalledWith(null);
+      unsubscribe();
+    });
+
     it('removes all messages and resets stats', () => {
       indexMessages([
         { id: 'msg-1', content: 'hello', scope: 'channel-1' },

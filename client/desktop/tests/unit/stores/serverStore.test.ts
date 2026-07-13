@@ -17,9 +17,20 @@ import { http, HttpResponse } from 'msw';
 
 const API_BASE = 'http://localhost:8080';
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
 afterAll(() => server.close());
-afterEach(() => server.resetHandlers());
+afterEach(() => {
+  vi.restoreAllMocks();
+  server.resetHandlers();
+});
 
 describe('serverStore', () => {
   beforeEach(() => {
@@ -85,6 +96,48 @@ describe('serverStore', () => {
         hasHydratedSpy.mockRestore();
         rehydrateSpy.mockRestore();
       }
+    });
+
+    it('purges channels for servers missing from an authoritative re-fetch', async () => {
+      useServerStore.setState({ servers: [mockServer, mockServer2] });
+      useUnreadStore.getState().markServerUnread('server-1');
+      const removeServerChannelsSpy = vi.spyOn(useChannelStore.getState(), 'removeServerChannels');
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers`, () => HttpResponse.json({ servers: [mockServer2] }))
+      );
+
+      await useServerStore.getState().fetchServers();
+
+      expect(removeServerChannelsSpy).toHaveBeenCalledOnce();
+      expect(removeServerChannelsSpy).toHaveBeenCalledWith('server-1');
+      expect(useUnreadStore.getState().serverUnreadSet.has('server-1')).toBe(false);
+    });
+
+    it.each([
+      ['removeServer', () => useServerStore.getState().removeServer('server-1'), ['server-2']],
+      ['clearServers', () => useServerStore.getState().clearServers(), []],
+    ])('reconciles a stale response after %s', async (_name, revokeAccess, expectedIds) => {
+      const started = deferred();
+      const release = deferred();
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers`, async () => {
+          started.resolve();
+          await release.promise;
+          return HttpResponse.json({ servers: [mockServer, mockServer2] });
+        })
+      );
+
+      const fetchPromise = useServerStore.getState().fetchServers();
+      await started.promise;
+      revokeAccess();
+      release.resolve();
+      await fetchPromise;
+
+      expect(useServerStore.getState().servers.map((server) => server.id)).toEqual(expectedIds);
+      expect(useServerStore.getState().servers.some((server) => server.id === 'server-1')).toBe(
+        false
+      );
+      expect(useServerStore.getState().isLoading).toBe(false);
     });
   });
 
@@ -199,6 +252,25 @@ describe('serverStore', () => {
       useServerStore.getState().removeServer('server-1');
       expect(useChannelStore.getState().lastChannelByServer['server-1']).toBeUndefined();
       expect(useChannelStore.getState().lastChannelByServer['server-2']).toBe('channel-2');
+    });
+
+    it('purges tracked channels when removing a non-active server', () => {
+      useServerStore.getState().addServer(mockServer);
+      useChannelStore.setState({
+        channels: [{ ...mockChannel, id: 'server-2-channel', server_id: 'server-2' }],
+        currentServerId: 'server-2',
+        channelIdsByServer: {
+          'server-1': ['channel-1'],
+          'server-2': ['server-2-channel'],
+        },
+      });
+      useChatStore.getState().addMessage('channel-1', mockMessage);
+
+      useServerStore.getState().removeServer('server-1');
+
+      expect(useChatStore.getState().messagesByChannel.has('channel-1')).toBe(false);
+      expect(useChannelStore.getState().channels[0].id).toBe('server-2-channel');
+      expect(useChannelStore.getState().channelIdsByServer['server-1']).toBeUndefined();
     });
   });
 

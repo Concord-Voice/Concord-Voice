@@ -9,10 +9,13 @@ const mockGetChannelKeyByVersion = vi.fn();
 const mockDecryptWithKey = vi.fn();
 const mockDecryptForChannel = vi.fn();
 const mockDecryptForChannelWithVersion = vi.fn();
+const mockOperationGuard = { assertCurrent: vi.fn() };
+const mockCreateChannelOperationGuard = vi.fn(() => mockOperationGuard);
 
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
+    createChannelOperationGuard: (...args: unknown[]) => mockCreateChannelOperationGuard(...args),
     getChannelKey: (...args: unknown[]) => mockGetChannelKey(...args),
     getChannelKeyByVersion: (...args: unknown[]) => mockGetChannelKeyByVersion(...args),
     decryptWithKey: (...args: unknown[]) => mockDecryptWithKey(...args),
@@ -259,7 +262,7 @@ describe('decryptPins', () => {
 
     expect(result[0].content).toBe('versioned plaintext');
     expect(mockGetChannelKeyByVersion).toHaveBeenCalledWith('ctx-1', 3);
-    expect(mockDecryptWithKey).toHaveBeenCalledWith('ct-v3', vKey);
+    expect(mockDecryptWithKey).toHaveBeenCalledWith('ct-v3', vKey, mockOperationGuard);
   });
 
   it('falls back to decryptForChannelWithVersion when versioned key fetch fails', async () => {

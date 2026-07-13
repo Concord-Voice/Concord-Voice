@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000084)
+## Existing Migrations (000001–000085)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -194,6 +194,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000082 | channel_group_same_server | Composite `(group_id, server_id)` FK enforcing a channel's category is on the SAME server (CV-CAN-010/011/012) |
 | 000083 | subscription_expired_status | Adds `'expired'` to the `subscriptions.status` enum for the expiry sweeper's terminal/idempotency marker (#2158) |
 | 000084 | user_presence_overrides | Encrypted `custom_text` preference plus separately materialized recipient exclusions (#1234) |
+| 000085 | serialize_message_edits_with_key_revocations | Serializes channel/DM ciphertext edits with key-revocation ledger inserts on the stable parent row (#1741) |
 
 ## Troubleshooting
 

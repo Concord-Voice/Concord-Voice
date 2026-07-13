@@ -20,6 +20,8 @@ import { pinMessage, unpinMessage } from '../services/pinService';
 import { getWebSocketService, ConnectionState } from '../services/websocketService';
 import { apiFetch, safeJson } from '../services/apiClient';
 import { e2eeService } from '../services/e2eeService';
+import { indexMessage, removeMessage } from '../services/searchService';
+import { wrapContentWithGifSlug } from '../services/dmMessageSender';
 import type {
   ChatContext,
   ChatContextType,
@@ -33,6 +35,47 @@ export interface SendOpts {
   attachmentIds?: string[];
   attachments?: AttachmentSummary[];
   gifSlug?: string;
+}
+
+interface EncryptedEditResult {
+  keyVersion: number;
+  message: {
+    content: string;
+    edited_at: string;
+    updated_at?: string;
+  };
+}
+
+async function patchEncryptedMessage(
+  channelId: string,
+  url: string,
+  plaintext: string
+): Promise<EncryptedEditResult> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const { ciphertext, keyVersion } = await e2eeService.encryptForChannelWithVersion(
+      channelId,
+      plaintext
+    );
+    const res = await apiFetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: ciphertext, key_version: keyVersion }),
+    });
+
+    if (!res.ok) {
+      const errorData = await safeJson<{ error?: string; code?: string }>(res);
+      if (attempt === 0 && res.status === 409 && errorData.code === 'epoch_revoked') {
+        e2eeService.invalidateChannelKey(channelId);
+        continue;
+      }
+      throw new Error(errorData.error || 'Failed to edit message');
+    }
+
+    const data = await safeJson<{ message: EncryptedEditResult['message'] }>(res);
+    return { keyVersion, message: data.message };
+  }
+
+  throw new Error('Failed to edit message');
 }
 
 export function useChatController(ctx: ChatContext) {
@@ -87,45 +130,43 @@ export function useChatController(ctx: ChatContext) {
   // --- Edit ---
   const editMessage = useCallback(
     async (messageId: string, newContent: string) => {
-      if (!ctx.id) return;
+      if (!ctx.id || !e2eeService.isInitialized) return;
 
       try {
-        // Encrypt if context is E2EE
-        let sendContent = newContent;
-        if (e2eeService.isInitialized) {
-          sendContent = await e2eeService.encryptForChannel(ctx.id, newContent);
-        }
-
+        const existingMessage = useChatStore
+          .getState()
+          .messagesByChannel.get(ctx.id)
+          ?.find((message) => message.id === messageId);
+        const gifSlug = existingMessage?.gif_slug;
+        const plaintext = wrapContentWithGifSlug(newContent, gifSlug);
         const url = isDM
           ? `/api/v1/dm/conversations/${ctx.id}/messages/${messageId}`
           : `/api/v1/messages/${messageId}`;
 
-        const res = await apiFetch(url, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: sendContent }),
-        });
+        const { keyVersion, message } = await patchEncryptedMessage(ctx.id, url, plaintext);
 
-        if (!res.ok) {
-          const data = await safeJson<{ error?: string }>(res);
-          throw new Error(data.error || 'Failed to edit message');
-        }
-
-        const data = await safeJson<{
-          message: {
-            content: string;
-            key_version?: number;
-            edited_at: string;
-            updated_at?: string;
-          };
-        }>(res);
+        // A delete event may win while the edit request is awaiting. Keep
+        // both the store and plaintext search index deleted in that case.
+        const messageStillExists = useChatStore
+          .getState()
+          .messagesByChannel.get(ctx.id)
+          ?.some((candidate) => candidate.id === messageId);
+        if (!messageStillExists) return;
 
         updateMessage(ctx.id, messageId, {
           content: newContent,
-          key_version: data.message.key_version,
-          edited_at: data.message.edited_at,
-          ...(data.message.updated_at && { updated_at: data.message.updated_at }),
+          key_version: keyVersion,
+          decryptFailed: false,
+          pendingKeys: false,
+          ...(gifSlug !== undefined && { gif_slug: gifSlug }),
+          edited_at: message.edited_at,
+          ...(message.updated_at && { updated_at: message.updated_at }),
         });
+        if (newContent) {
+          indexMessage(messageId, newContent, ctx.id);
+        } else {
+          removeMessage(messageId);
+        }
       } catch (err) {
         if (isDM) {
           console.error('Failed to edit DM message:', (err as Error).message);
@@ -155,6 +196,7 @@ export function useChatController(ctx: ChatContext) {
         }
 
         storeDeleteMessage(ctx.id, messageId);
+        removeMessage(messageId);
       } catch (err) {
         if (isDM) {
           console.error('Failed to delete DM message:', (err as Error).message);

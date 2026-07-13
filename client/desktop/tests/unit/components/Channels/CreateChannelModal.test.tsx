@@ -14,6 +14,8 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     createChannelKeys: vi.fn(),
+    invalidateChannelKey: vi.fn(),
+    revokeChannelAccess: vi.fn(),
   },
 }));
 

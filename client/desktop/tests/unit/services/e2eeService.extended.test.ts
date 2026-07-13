@@ -31,6 +31,47 @@ describe('e2eeService — extended', () => {
   const testPassword = 'TestPassword123!';
   let regKeys: Awaited<ReturnType<typeof generateRegistrationKeys>>;
 
+  function deferred<T>() {
+    let resolvePromise: ((value: T) => void) | undefined;
+    let rejectPromise: ((reason?: unknown) => void) | undefined;
+    const promise = new Promise<T>((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    return {
+      promise,
+      resolve(value: T) {
+        if (!resolvePromise) throw new Error('deferred promise was not initialized');
+        resolvePromise(value);
+      },
+      reject(reason?: unknown) {
+        if (!rejectPromise) throw new Error('deferred promise was not initialized');
+        rejectPromise(reason);
+      },
+    };
+  }
+
+  type PromiseOutcome<T> =
+    { status: 'fulfilled'; value: T } | { status: 'rejected'; reason: unknown };
+
+  function observePromise<T>(promise: Promise<T>): Promise<PromiseOutcome<T>> {
+    return promise.then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (reason: unknown) => ({ status: 'rejected' as const, reason })
+    );
+  }
+
+  function keyResponse(wrappedKey: string, keyVersion: number): Response {
+    return {
+      ok: true,
+      json: () => Promise.resolve({ key: { wrapped_key: wrappedKey, key_version: keyVersion } }),
+    } as Response;
+  }
+
+  function channelGuard(channelId: string) {
+    return e2eeService.createChannelOperationGuard(channelId);
+  }
+
   beforeEach(async () => {
     e2eeService.clearKeys();
     // Reset rate limiter state (private field, not cleared by clearKeys)
@@ -152,6 +193,77 @@ describe('e2eeService — extended', () => {
     });
   });
 
+  describe('encryptForChannelWithVersion', () => {
+    it('rejects when the selected epoch is invalidated during key unwrap', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelId = 'channel-atomic-edit';
+      const epochTwoKey = await generateChannelKey();
+      const epochThreeKey = await generateChannelKey();
+      const wrappedEpochTwo = await wrapChannelKey(epochTwoKey, regKeys.publicKey);
+      const wrappedEpochThree = await wrapChannelKey(epochThreeKey, regKeys.publicKey);
+
+      mockApiFetch.mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ key: { wrapped_key: wrappedEpochTwo, key_version: 2 } }),
+      } as Response);
+      await e2eeService.getChannelKey(channelId);
+
+      type ServiceInternals = {
+        channelKeyCache: Map<
+          string,
+          {
+            wrappedKey: string;
+            keyVersion: number;
+            lastUsed: number;
+            refetchAfterMalformed: number;
+          }
+        >;
+        derivePrivateKey: () => Promise<CryptoKey>;
+      };
+      const internals = e2eeService as unknown as ServiceInternals;
+      const originalDerivePrivateKey = internals.derivePrivateKey.bind(e2eeService);
+      const privateKey = await originalDerivePrivateKey();
+
+      let releaseDerivation: ((key: CryptoKey) => void) | undefined;
+      const blockedDerivation = new Promise<CryptoKey>((resolve) => {
+        releaseDerivation = resolve;
+      });
+      internals.derivePrivateKey = () => blockedDerivation;
+
+      let outcome:
+        | PromiseOutcome<Awaited<ReturnType<typeof e2eeService.encryptForChannelWithVersion>>>
+        | undefined;
+      try {
+        const encryptionOutcome = observePromise(
+          e2eeService.encryptForChannelWithVersion(channelId, 'edited text')
+        );
+
+        // getChannelKey has selected epoch 2 and is now awaiting derivePrivateKey.
+        // Simulate a rotation invalidating/replacing the mutable main-cache slot.
+        e2eeService.invalidateChannelKey(channelId);
+        internals.channelKeyCache.set(channelId, {
+          wrappedKey: wrappedEpochThree,
+          keyVersion: 3,
+          lastUsed: Date.now(),
+          refetchAfterMalformed: 0,
+        });
+
+        if (!releaseDerivation) throw new Error('derivePrivateKey was not deferred');
+        releaseDerivation(privateKey);
+        outcome = await encryptionOutcome;
+      } finally {
+        internals.derivePrivateKey = originalDerivePrivateKey;
+      }
+
+      expect(outcome?.status).toBe('rejected');
+    });
+  });
+
   describe('decryptWithKey', () => {
     it('decrypts using a pre-fetched key', async () => {
       await e2eeService.initialize(
@@ -171,8 +283,54 @@ describe('e2eeService — extended', () => {
       // Get the key and use it directly
       const key = await e2eeService.getChannelKey('ch-direct');
       const encrypted = await encryptMessage('Direct decrypt', channelKey);
-      const decrypted = await e2eeService.decryptWithKey(encrypted, key);
+      const decrypted = await e2eeService.decryptWithKey(encrypted, key, channelGuard('ch-direct'));
       expect(decrypted).toBe('Direct decrypt');
+    });
+
+    it('rejects a retained pre-fetched key after its channel is invalidated', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelId = 'ch-retained-key';
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      mockApiFetch.mockResolvedValueOnce(keyResponse(wrappedForUser, 2));
+      const retainedKey = await e2eeService.getChannelKey(channelId);
+      const ciphertext = await encryptMessage('must stay fenced', channelKey);
+      const guard = channelGuard(channelId);
+
+      e2eeService.invalidateChannelKey(channelId);
+
+      await expect(e2eeService.decryptWithKey(ciphertext, retainedKey, guard)).rejects.toThrow(
+        'E2EE key unavailable: NO_KEY_YET'
+      );
+    });
+
+    it('distinguishes terminal access loss from retryable rotation generations', () => {
+      const channelId = 'ch-access-generation';
+      const beforeRevocation = channelGuard(channelId);
+
+      e2eeService.revokeChannelAccess(channelId);
+
+      expect(() => beforeRevocation.assertCurrent()).toThrow('E2EE key unavailable: NOT_MEMBER');
+
+      // A newly captured context can be used after access is re-established.
+      const afterRegain = channelGuard(channelId);
+      expect(() => afterRegain.assertCurrent()).not.toThrow();
+
+      // An ordinary rotation remains retryable for that live context.
+      e2eeService.invalidateChannelKey(channelId);
+      try {
+        afterRegain.assertCurrent();
+        throw new Error('expected the rotated generation to be fenced');
+      } catch (err) {
+        expect(err).toBeInstanceOf(E2EEKeyUnavailableError);
+        expect((err as E2EEKeyUnavailableError).code).toBe('NO_KEY_YET');
+        expect((err as E2EEKeyUnavailableError).pending).toBe(true);
+      }
     });
   });
 
@@ -597,6 +755,587 @@ describe('e2eeService — extended', () => {
 
       // Only one API call should have been made
       expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('async key lifecycle boundaries', () => {
+    it.each([
+      [
+        'current-version encryption',
+        (channelId: string) => e2eeService.encryptForChannel(channelId, 'revoked plaintext'),
+      ],
+      [
+        'version-bound encryption',
+        (channelId: string) =>
+          e2eeService.encryptForChannelWithVersion(channelId, 'revoked plaintext'),
+      ],
+    ])(
+      'rejects %s that crosses channel invalidation after key acquisition',
+      async (_name, encrypt) => {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+
+        const channelId = 'ch-encrypt-rotation-boundary';
+        const channelKey = await generateChannelKey();
+        const wrappedKey = await wrapChannelKey(channelKey, regKeys.publicKey);
+        mockApiFetch.mockResolvedValueOnce(keyResponse(wrappedKey, 4));
+        await e2eeService.getChannelKey(channelId);
+
+        const originalEncrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+        const encryptStarted = deferred<void>();
+        const blockedCiphertext = deferred<ArrayBuffer>();
+        const encryptSpy = vi
+          .spyOn(crypto.subtle, 'encrypt')
+          .mockImplementation(async (algorithm, key, data) => {
+            if (algorithm.name === 'AES-GCM') {
+              encryptStarted.resolve(undefined);
+              return blockedCiphertext.promise;
+            }
+            return originalEncrypt(algorithm, key, data);
+          });
+
+        let outcome: PromiseOutcome<unknown> | undefined;
+        try {
+          const outcomePromise = observePromise(encrypt(channelId));
+          await encryptStarted.promise;
+          e2eeService.invalidateChannelKey(channelId);
+          blockedCiphertext.resolve(new Uint8Array(32).buffer);
+          outcome = await outcomePromise;
+        } finally {
+          encryptSpy.mockRestore();
+        }
+
+        expect(outcome?.status).toBe('rejected');
+        if (outcome?.status === 'rejected') {
+          expect(outcome.reason).toBeInstanceOf(E2EEKeyUnavailableError);
+        }
+      }
+    );
+
+    it('rejects a current-key fetch invalidated by rotation without joining or overwriting the replacement fetch', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelId = 'ch-current-rotation-boundary';
+      const staleKey = await generateChannelKey();
+      const freshKey = await generateChannelKey();
+      const staleWrappedKey = await wrapChannelKey(staleKey, regKeys.publicKey);
+      const freshWrappedKey = await wrapChannelKey(freshKey, regKeys.publicKey);
+      const staleResponse = deferred<Response>();
+      const freshResponse = deferred<Response>();
+
+      mockApiFetch
+        .mockImplementationOnce(() => staleResponse.promise)
+        .mockImplementationOnce(() => freshResponse.promise);
+
+      const staleOutcomePromise = observePromise(e2eeService.getChannelKey(channelId));
+
+      e2eeService.invalidateChannelKey(channelId);
+      const freshFetch = e2eeService.getChannelKey(channelId);
+
+      staleResponse.resolve(keyResponse(staleWrappedKey, 2));
+      const staleOutcome = await staleOutcomePromise;
+
+      const joinedFreshFetch = e2eeService.getChannelKey(channelId);
+      const apiFetchCallCount = mockApiFetch.mock.calls.length;
+
+      freshResponse.resolve(keyResponse(freshWrappedKey, 3));
+      const [freshResult, joinedFreshResult] = await Promise.all([freshFetch, joinedFreshFetch]);
+      // A failing implementation may leave the second one-shot response unused.
+      // Reset it before assertions so this regression cannot poison later tests.
+      mockApiFetch.mockReset();
+      const freshCiphertext = await encryptMessage('fresh current key', freshKey);
+
+      expect.soft(apiFetchCallCount).toBe(2);
+      expect.soft(staleOutcome.status).toBe('rejected');
+      await expect(
+        e2eeService.decryptWithKey(freshCiphertext, freshResult, channelGuard(channelId))
+      ).resolves.toBe('fresh current key');
+      await expect(
+        e2eeService.decryptWithKey(freshCiphertext, joinedFreshResult, channelGuard(channelId))
+      ).resolves.toBe('fresh current key');
+      expect(e2eeService.getCurrentKeyVersion(channelId)).toBe(3);
+    });
+
+    it('rejects a versioned-key fetch invalidated by rotation without joining or overwriting the replacement fetch', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelId = 'ch-versioned-rotation-boundary';
+      const version = 7;
+      const staleKey = await generateChannelKey();
+      const freshKey = await generateChannelKey();
+      const staleWrappedKey = await wrapChannelKey(staleKey, regKeys.publicKey);
+      const freshWrappedKey = await wrapChannelKey(freshKey, regKeys.publicKey);
+      const staleResponse = deferred<Response>();
+      const freshResponse = deferred<Response>();
+
+      mockApiFetch
+        .mockImplementationOnce(() => staleResponse.promise)
+        .mockImplementationOnce(() => freshResponse.promise);
+
+      const staleOutcomePromise = observePromise(
+        e2eeService.getChannelKeyByVersion(channelId, version)
+      );
+
+      e2eeService.invalidateChannelKey(channelId);
+      const freshFetch = e2eeService.getChannelKeyByVersion(channelId, version);
+
+      staleResponse.resolve(keyResponse(staleWrappedKey, version));
+      const staleOutcome = await staleOutcomePromise;
+
+      const joinedFreshFetch = e2eeService.getChannelKeyByVersion(channelId, version);
+      const apiFetchCallCount = mockApiFetch.mock.calls.length;
+
+      freshResponse.resolve(keyResponse(freshWrappedKey, version));
+      const [freshResult, joinedFreshResult] = await Promise.all([freshFetch, joinedFreshFetch]);
+      // A failing implementation may leave the second one-shot response unused.
+      // Reset it before assertions so this regression cannot poison later tests.
+      mockApiFetch.mockReset();
+      const freshCiphertext = await encryptMessage('fresh versioned key', freshKey);
+
+      expect.soft(apiFetchCallCount).toBe(2);
+      expect.soft(staleOutcome.status).toBe('rejected');
+      await expect(
+        e2eeService.decryptWithKey(freshCiphertext, freshResult, channelGuard(channelId))
+      ).resolves.toBe('fresh versioned key');
+      await expect(
+        e2eeService.decryptWithKey(freshCiphertext, joinedFreshResult, channelGuard(channelId))
+      ).resolves.toBe('fresh versioned key');
+    });
+
+    it('rejects a current-key cache-hit unwrap that crosses channel invalidation', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelId = 'ch-cache-hit-rotation-boundary';
+      const channelKey = await generateChannelKey();
+      const wrappedKey = await wrapChannelKey(channelKey, regKeys.publicKey);
+      mockApiFetch.mockResolvedValueOnce(keyResponse(wrappedKey, 4));
+      await e2eeService.getChannelKey(channelId);
+
+      type ServiceInternals = {
+        derivePrivateKey: () => Promise<CryptoKey>;
+      };
+      const internals = e2eeService as unknown as ServiceInternals;
+      const originalDerivePrivateKey = internals.derivePrivateKey.bind(e2eeService);
+      const privateKey = await originalDerivePrivateKey();
+      const blockedDerivation = deferred<CryptoKey>();
+      internals.derivePrivateKey = () => blockedDerivation.promise;
+
+      let outcome: PromiseOutcome<CryptoKey> | undefined;
+      try {
+        const outcomePromise = observePromise(e2eeService.getChannelKey(channelId));
+        e2eeService.invalidateChannelKey(channelId);
+        blockedDerivation.resolve(privateKey);
+        outcome = await outcomePromise;
+      } finally {
+        internals.derivePrivateKey = originalDerivePrivateKey;
+      }
+
+      expect(outcome?.status).toBe('rejected');
+      expect(e2eeService.getCurrentKeyVersion(channelId)).toBe(1);
+    });
+
+    it('rejects a decrypt that crosses channel invalidation after key acquisition', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelId = 'ch-decrypt-rotation-boundary';
+      const channelKey = await generateChannelKey();
+      const wrappedKey = await wrapChannelKey(channelKey, regKeys.publicKey);
+      const ciphertext = await encryptMessage('revoked plaintext', channelKey);
+      mockApiFetch.mockResolvedValueOnce(keyResponse(wrappedKey, 4));
+      await e2eeService.getChannelKey(channelId);
+
+      const originalDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+      const decryptStarted = deferred<void>();
+      const blockedPlaintext = deferred<ArrayBuffer>();
+      const decryptSpy = vi
+        .spyOn(crypto.subtle, 'decrypt')
+        .mockImplementation(async (algorithm, key, data) => {
+          if (algorithm.name === 'AES-GCM') {
+            decryptStarted.resolve(undefined);
+            return blockedPlaintext.promise;
+          }
+          return originalDecrypt(algorithm, key, data);
+        });
+
+      let outcome: PromiseOutcome<string> | undefined;
+      try {
+        const outcomePromise = observePromise(e2eeService.decryptForChannel(channelId, ciphertext));
+        await decryptStarted.promise;
+        e2eeService.invalidateChannelKey(channelId);
+        blockedPlaintext.resolve(new TextEncoder().encode('revoked plaintext').buffer);
+        outcome = await outcomePromise;
+      } finally {
+        decryptSpy.mockRestore();
+      }
+
+      expect(outcome?.status).toBe('rejected');
+    });
+
+    it('rejects a fenced decrypt while retaining keys for the next decrypt', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelId = 'ch-decrypt-reset-boundary';
+      const channelKey = await generateChannelKey();
+      const wrappedKey = await wrapChannelKey(channelKey, regKeys.publicKey);
+      const ciphertext = await encryptMessage('retained plaintext', channelKey);
+      mockApiFetch.mockResolvedValueOnce(keyResponse(wrappedKey, 4));
+      await e2eeService.getChannelKey(channelId);
+
+      const originalDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+      const decryptStarted = deferred<void>();
+      const blockedPlaintext = deferred<ArrayBuffer>();
+      let blockFirstDecrypt = true;
+      const decryptSpy = vi
+        .spyOn(crypto.subtle, 'decrypt')
+        .mockImplementation(async (algorithm, key, data) => {
+          if (algorithm.name === 'AES-GCM' && blockFirstDecrypt) {
+            blockFirstDecrypt = false;
+            decryptStarted.resolve(undefined);
+            return blockedPlaintext.promise;
+          }
+          return originalDecrypt(algorithm, key, data);
+        });
+
+      let staleOutcome: PromiseOutcome<string> | undefined;
+      let freshPlaintext: string | undefined;
+      try {
+        const staleOutcomePromise = observePromise(
+          e2eeService.decryptForChannel(channelId, ciphertext)
+        );
+        await decryptStarted.promise;
+        e2eeService.fencePendingOperations();
+        blockedPlaintext.resolve(new TextEncoder().encode('retained plaintext').buffer);
+        staleOutcome = await staleOutcomePromise;
+        freshPlaintext = await e2eeService.decryptForChannel(channelId, ciphertext);
+      } finally {
+        decryptSpy.mockRestore();
+      }
+
+      expect.soft(staleOutcome?.status).toBe('rejected');
+      expect.soft(freshPlaintext).toBe('retained plaintext');
+      expect.soft(e2eeService.isInitialized).toBe(true);
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a prior-session current-key fetch without caching it or deleting the newer pending fetch', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelId = 'ch-current-session-boundary';
+      const priorSessionKey = await generateChannelKey();
+      const newerSessionKey = await generateChannelKey();
+      const priorWrappedKey = await wrapChannelKey(priorSessionKey, regKeys.publicKey);
+      const newerWrappedKey = await wrapChannelKey(newerSessionKey, regKeys.publicKey);
+      const priorResponse = deferred<Response>();
+      const newerResponse = deferred<Response>();
+
+      mockApiFetch
+        .mockImplementationOnce(() => priorResponse.promise)
+        .mockImplementationOnce(() => newerResponse.promise)
+        .mockResolvedValue(keyResponse(newerWrappedKey, 3));
+
+      const priorOutcomePromise = observePromise(e2eeService.getChannelKey(channelId));
+
+      e2eeService.clearKeys();
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+      const newerFetch = e2eeService.getChannelKey(channelId);
+
+      priorResponse.resolve(keyResponse(priorWrappedKey, 2));
+      const priorOutcome = await priorOutcomePromise;
+
+      expect.soft(priorOutcome.status).toBe('rejected');
+      expect.soft(e2eeService.getCurrentKeyVersion(channelId)).toBe(1);
+
+      // This call observes whether the old request's finally block incorrectly
+      // removed the newer pending promise.
+      const joinedFetch = e2eeService.getChannelKey(channelId);
+      expect.soft(mockApiFetch).toHaveBeenCalledTimes(2);
+
+      newerResponse.resolve(keyResponse(newerWrappedKey, 3));
+      const [newerKey, joinedKey] = await Promise.all([newerFetch, joinedFetch]);
+      const newerCiphertext = await encryptMessage('newer current key', newerSessionKey);
+
+      await expect(
+        e2eeService.decryptWithKey(newerCiphertext, newerKey, channelGuard(channelId))
+      ).resolves.toBe('newer current key');
+      await expect(
+        e2eeService.decryptWithKey(newerCiphertext, joinedKey, channelGuard(channelId))
+      ).resolves.toBe('newer current key');
+      expect(e2eeService.getCurrentKeyVersion(channelId)).toBe(3);
+    });
+
+    it('rejects a prior-session versioned fetch without caching it or deleting the newer pending fetch', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelId = 'ch-versioned-session-boundary';
+      const version = 7;
+      const priorSessionKey = await generateChannelKey();
+      const newerSessionKey = await generateChannelKey();
+      const priorWrappedKey = await wrapChannelKey(priorSessionKey, regKeys.publicKey);
+      const newerWrappedKey = await wrapChannelKey(newerSessionKey, regKeys.publicKey);
+      const priorResponse = deferred<Response>();
+      const newerResponse = deferred<Response>();
+
+      mockApiFetch
+        .mockImplementationOnce(() => priorResponse.promise)
+        .mockImplementationOnce(() => newerResponse.promise)
+        .mockResolvedValue(keyResponse(newerWrappedKey, version));
+
+      const priorOutcomePromise = observePromise(
+        e2eeService.getChannelKeyByVersion(channelId, version)
+      );
+
+      e2eeService.clearKeys();
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+      const newerFetch = e2eeService.getChannelKeyByVersion(channelId, version);
+
+      priorResponse.resolve(keyResponse(priorWrappedKey, version));
+      const priorOutcome = await priorOutcomePromise;
+      type VersionedCacheInternals = {
+        versionedKeyCache: Map<string, Map<number, unknown>>;
+      };
+      const internals = e2eeService as unknown as VersionedCacheInternals;
+
+      expect.soft(priorOutcome.status).toBe('rejected');
+      expect.soft(internals.versionedKeyCache.get(channelId)?.has(version) ?? false).toBe(false);
+
+      const joinedFetch = e2eeService.getChannelKeyByVersion(channelId, version);
+      expect.soft(mockApiFetch).toHaveBeenCalledTimes(2);
+
+      newerResponse.resolve(keyResponse(newerWrappedKey, version));
+      const [newerKey, joinedKey] = await Promise.all([newerFetch, joinedFetch]);
+      const newerCiphertext = await encryptMessage('newer versioned key', newerSessionKey);
+
+      await expect(
+        e2eeService.decryptWithKey(newerCiphertext, newerKey, channelGuard(channelId))
+      ).resolves.toBe('newer versioned key');
+      await expect(
+        e2eeService.decryptWithKey(newerCiphertext, joinedKey, channelGuard(channelId))
+      ).resolves.toBe('newer versioned key');
+    });
+
+    it('rejects a cache-hit unwrap that crosses clearKeys and reinitialization', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelId = 'ch-cache-hit-session-boundary';
+      const channelKey = await generateChannelKey();
+      const wrappedKey = await wrapChannelKey(channelKey, regKeys.publicKey);
+      mockApiFetch.mockResolvedValueOnce(keyResponse(wrappedKey, 4));
+      await e2eeService.getChannelKey(channelId);
+
+      type ServiceInternals = {
+        derivePrivateKey: () => Promise<CryptoKey>;
+      };
+      const internals = e2eeService as unknown as ServiceInternals;
+      const originalDerivePrivateKey = internals.derivePrivateKey.bind(e2eeService);
+      const privateKey = await originalDerivePrivateKey();
+      const blockedDerivation = deferred<CryptoKey>();
+      internals.derivePrivateKey = () => blockedDerivation.promise;
+
+      let outcome: PromiseOutcome<CryptoKey> | undefined;
+      try {
+        const outcomePromise = observePromise(e2eeService.getChannelKey(channelId));
+        e2eeService.clearKeys();
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        blockedDerivation.resolve(privateKey);
+        outcome = await outcomePromise;
+      } finally {
+        internals.derivePrivateKey = originalDerivePrivateKey;
+      }
+
+      expect(outcome?.status).toBe('rejected');
+    });
+
+    it('does not let a stale current-key error enroll rewrap after clearKeys', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelId = 'ch-current-stale-error';
+      const staleBody = deferred<unknown>();
+      const staleJson = vi.fn(() => staleBody.promise);
+      const newerResponse = deferred<Response>();
+      const newerSessionKey = await generateChannelKey();
+      const newerWrappedKey = await wrapChannelKey(newerSessionKey, regKeys.publicKey);
+      const requestRewrapSpy = vi.spyOn(e2eeService, 'requestRewrap').mockResolvedValue(undefined);
+
+      mockApiFetch
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 404,
+          headers: new Headers(),
+          json: staleJson,
+        } as unknown as Response)
+        .mockImplementationOnce(() => newerResponse.promise);
+
+      const staleOutcomePromise = observePromise(e2eeService.getChannelKey(channelId));
+      await Promise.resolve();
+      await Promise.resolve();
+      const staleJsonCalls = staleJson.mock.calls.length;
+
+      e2eeService.clearKeys();
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+      const newerFetch = e2eeService.getChannelKey(channelId);
+
+      staleBody.resolve({ code: 'NO_KEY_YET', pending: true });
+      const staleOutcome = await staleOutcomePromise;
+      const joinedFetch = e2eeService.getChannelKey(channelId);
+      const apiCallsBeforeResolution = mockApiFetch.mock.calls.length;
+
+      newerResponse.resolve(keyResponse(newerWrappedKey, 5));
+      const [newerKey, joinedKey] = await Promise.all([newerFetch, joinedFetch]);
+      const requestRewrapCalls = requestRewrapSpy.mock.calls.length;
+      requestRewrapSpy.mockRestore();
+
+      expect(staleJsonCalls).toBe(1);
+      expect(staleOutcome.status).toBe('rejected');
+      expect(requestRewrapCalls).toBe(0);
+      expect(apiCallsBeforeResolution).toBe(2);
+      expect(newerKey).toBeDefined();
+      expect(joinedKey).toBeDefined();
+    });
+
+    it('does not let a stale versioned-key error enroll rewrap after clearKeys', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelId = 'ch-versioned-stale-error';
+      const version = 8;
+      const staleBody = deferred<unknown>();
+      const staleJson = vi.fn(() => staleBody.promise);
+      const newerResponse = deferred<Response>();
+      const newerSessionKey = await generateChannelKey();
+      const newerWrappedKey = await wrapChannelKey(newerSessionKey, regKeys.publicKey);
+      const requestRewrapSpy = vi.spyOn(e2eeService, 'requestRewrap').mockResolvedValue(undefined);
+
+      mockApiFetch
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 404,
+          headers: new Headers(),
+          json: staleJson,
+        } as unknown as Response)
+        .mockImplementationOnce(() => newerResponse.promise);
+
+      const staleOutcomePromise = observePromise(
+        e2eeService.getChannelKeyByVersion(channelId, version)
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      const staleJsonCalls = staleJson.mock.calls.length;
+
+      e2eeService.clearKeys();
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+      const newerFetch = e2eeService.getChannelKeyByVersion(channelId, version);
+
+      staleBody.resolve({ code: 'NO_KEY_YET', pending: true });
+      const staleOutcome = await staleOutcomePromise;
+      const joinedFetch = e2eeService.getChannelKeyByVersion(channelId, version);
+      const apiCallsBeforeResolution = mockApiFetch.mock.calls.length;
+
+      newerResponse.resolve(keyResponse(newerWrappedKey, version));
+      const [newerKey, joinedKey] = await Promise.all([newerFetch, joinedFetch]);
+      const requestRewrapCalls = requestRewrapSpy.mock.calls.length;
+      requestRewrapSpy.mockRestore();
+
+      expect(staleJsonCalls).toBe(1);
+      expect(staleOutcome.status).toBe('rejected');
+      expect(requestRewrapCalls).toBe(0);
+      expect(apiCallsBeforeResolution).toBe(2);
+      expect(newerKey).toBeDefined();
+      expect(joinedKey).toBeDefined();
+    });
+
+    it('clears a prior-session 429 so the new session can fetch a key', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      mockApiFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        headers: new Headers({ 'Retry-After': '60' }),
+        json: () => Promise.resolve({ code: 'NO_KEY_YET', pending: false }),
+      } as unknown as Response);
+      await expect(e2eeService.getChannelKey('ch-prior-rate-limit')).rejects.toBeInstanceOf(
+        E2EEKeyUnavailableError
+      );
+
+      e2eeService.clearKeys();
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+      const newerSessionKey = await generateChannelKey();
+      const newerWrappedKey = await wrapChannelKey(newerSessionKey, regKeys.publicKey);
+      mockApiFetch.mockResolvedValueOnce(keyResponse(newerWrappedKey, 2));
+
+      await expect(
+        e2eeService.getChannelKey('ch-new-session-after-rate-limit')
+      ).resolves.toBeDefined();
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
     });
   });
 

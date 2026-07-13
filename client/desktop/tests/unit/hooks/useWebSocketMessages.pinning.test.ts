@@ -11,6 +11,8 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     decryptMessage: vi.fn((content: string) => Promise.resolve(content)),
     hasKey: vi.fn().mockReturnValue(false),
+    invalidateChannelKey: vi.fn(),
+    revokeChannelAccess: vi.fn(),
     isInitialized: false,
   },
 }));

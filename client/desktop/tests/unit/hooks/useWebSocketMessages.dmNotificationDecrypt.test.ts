@@ -32,6 +32,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     invalidateChannelKey: vi.fn(),
+    revokeChannelAccess: vi.fn(),
     processPendingKeyRequests: vi.fn().mockResolvedValue(undefined),
     decryptForChannel: (...args: unknown[]) => mockDecryptForChannel(...args),
     decryptForChannelWithVersion: (...args: unknown[]) => mockDecryptForChannelWithVersion(...args),

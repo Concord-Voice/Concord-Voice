@@ -313,7 +313,7 @@ const ChannelList: React.FC<ChannelListProps> = ({
   const error = useChannelStore((state) => state.error);
   const fetchChannels = useChannelStore((state) => state.fetchChannels);
   const setActiveChannel = useChannelStore((state) => state.setActiveChannel);
-  const clearChannels = useChannelStore((state) => state.clearChannels);
+  const clearChannelView = useChannelStore((state) => state.clearChannelView);
   const reorderChannels = useChannelStore((state) => state.reorderChannels);
   const updateChannelGroup = useChannelStore((state) => state.updateChannelGroup);
   const unreadCounts = useUnreadStore((state) => state.unreadCounts);
@@ -501,13 +501,13 @@ const ChannelList: React.FC<ChannelListProps> = ({
       }
     } else {
       channelFetchRef.current = null;
-      clearChannels();
+      clearChannelView();
     }
     return () => {
       // Allow refetch if effect re-runs with a different serverId
       // (but NOT on StrictMode unmount — ref persists across remounts)
     };
-  }, [activeServerId, fetchChannels, clearChannels]);
+  }, [activeServerId, fetchChannels, clearChannelView]);
 
   // Fetch voice participants for all voice channels when channel list loads
   useEffect(() => {

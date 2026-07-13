@@ -70,10 +70,15 @@ vi.mock('@/renderer/services/apiClient', () => ({
 
 const mockEncryptForChannel = vi.fn();
 const mockGetCurrentKeyVersion = vi.fn(() => 2);
+const mockEncryptForChannelWithVersion = vi.fn().mockResolvedValue({
+  ciphertext: 'encrypted-edited',
+  keyVersion: 2,
+});
 
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     encryptForChannel: (...args: unknown[]) => mockEncryptForChannel(...args),
+    encryptForChannelWithVersion: (...args: unknown[]) => mockEncryptForChannelWithVersion(...args),
     getCurrentKeyVersion: (...args: unknown[]) => mockGetCurrentKeyVersion(...args),
     isInitialized: true,
   },
@@ -187,6 +192,11 @@ describe('useChatController — cross-context security invariants (#496)', () =>
 
       const url = mockApiFetch.mock.calls[0][0] as string;
       expect(url).toBe('/api/v1/dm/conversations/conv-1/messages/msg-1');
+      const request = mockApiFetch.mock.calls[0][1] as { body: string };
+      expect(JSON.parse(request.body)).toEqual({
+        content: 'encrypted-edited',
+        key_version: 2,
+      });
     });
 
     it('6. channel delete URL vs DM delete URL are isolated', async () => {

@@ -37,6 +37,12 @@ vi.mock('@/renderer/services/notificationPrefsService', () => ({
   stopExpirySweep: vi.fn(() => resetOrder.push('notification-sweep-stop')),
 }));
 
+vi.mock('@/renderer/services/e2eeService', () => ({
+  e2eeService: {
+    fencePendingOperations: vi.fn(),
+  },
+}));
+
 import { gracefulReset, nuclearReset } from '@/renderer/services/resetService';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useServerStore } from '@/renderer/stores/serverStore';
@@ -58,17 +64,21 @@ import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
 import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
 import { stopExpirySweep } from '@/renderer/services/notificationPrefsService';
 import { stopProactiveRefresh } from '@/renderer/services/apiClient';
+import { e2eeService } from '@/renderer/services/e2eeService';
+import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/searchService';
 import { mockServer } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {
   resetAllStores();
+  clearIndex();
   resetOrder.length = 0;
   vi.mocked(friendOrgSyncService.stopWatching).mockClear();
   vi.mocked(preferencesSyncService.stopWatching).mockClear();
   vi.mocked(savedGifsSyncService.stopWatching).mockClear();
   vi.mocked(stopExpirySweep).mockClear();
   vi.mocked(stopProactiveRefresh).mockClear();
+  vi.mocked(e2eeService.fencePendingOperations).mockReset();
   vi.mocked(presenceOverrideSyncService.reset)
     .mockReset()
     .mockImplementation(() => {
@@ -155,6 +165,29 @@ describe('resetService', () => {
       expect(useDMStore.getState().conversations).toHaveLength(0);
       expect(useFriendStore.getState().friends).toHaveLength(0);
       expect(useChatStore.getState().messagesByChannel.size).toBe(0);
+    });
+
+    it('clears decrypted content from the in-memory search index', () => {
+      indexMessage('prior-account-message', 'prior account secret', 'channel-1');
+      expect(isIndexed('prior-account-message')).toBe(true);
+
+      gracefulReset();
+
+      expect(isIndexed('prior-account-message')).toBe(false);
+    });
+
+    it('fences in-flight E2EE work before clearing content or indexed plaintext', () => {
+      indexMessage('in-flight-message', 'prior account secret', 'channel-1');
+      vi.mocked(e2eeService.fencePendingOperations).mockImplementationOnce(() => {
+        expect(useServerStore.getState().servers).toHaveLength(1);
+        expect(isIndexed('in-flight-message')).toBe(true);
+      });
+
+      gracefulReset();
+
+      expect(e2eeService.fencePendingOperations).toHaveBeenCalledOnce();
+      expect(useServerStore.getState().servers).toHaveLength(0);
+      expect(isIndexed('in-flight-message')).toBe(false);
     });
 
     it('clears the rich-presence custom-text cache (#1233 cross-account leak fix)', () => {

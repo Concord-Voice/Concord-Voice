@@ -1,9 +1,14 @@
 import { useDMStore, type DMConversation, type DMLastMessage } from '@/renderer/stores/dmStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
+import { useChatStore } from '@/renderer/stores/chatStore';
 import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';
+import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/searchService';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
+import { mockMessage } from '../../mocks/fixtures';
 import { http, HttpResponse } from 'msw';
+
+const mockInvalidateChannelKey = vi.fn();
 
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
@@ -11,10 +16,20 @@ vi.mock('@/renderer/services/e2eeService', () => ({
     getChannelKey: vi.fn(),
     createChannelKeys: vi.fn(),
     clearKeys: vi.fn(),
+    invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
+    revokeChannelAccess: (...args: unknown[]) => mockInvalidateChannelKey(...args),
   },
 }));
 
 const API_BASE = 'http://localhost:8080';
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 const mockConversation: DMConversation = {
   id: 'conv-1',
@@ -62,6 +77,8 @@ afterEach(() => server.resetHandlers());
 
 beforeEach(() => {
   resetAllStores();
+  vi.clearAllMocks();
+  clearIndex();
   useAuthStore.getState().setAccessToken('mock-token');
 });
 
@@ -170,6 +187,33 @@ describe('dmStore', () => {
       useDMStore.getState().removeConversation('conv-1');
       expect(useDMStore.getState().conversations).toHaveLength(1);
       expect(useDMStore.getState().conversations[0].id).toBe('conv-2');
+    });
+
+    it('removes only the deleted conversation from the in-memory search index', () => {
+      useDMStore.getState().addConversation(mockConversation);
+      useDMStore.getState().addConversation(mockConversation2);
+      indexMessage('removed-dm-message', 'revoked DM plaintext', 'conv-1');
+      indexMessage('retained-dm-message', 'retained DM plaintext', 'conv-2');
+
+      useDMStore.getState().removeConversation('conv-1');
+
+      expect(isIndexed('removed-dm-message')).toBe(false);
+      expect(isIndexed('retained-dm-message')).toBe(true);
+    });
+
+    it('purges chat rows and cached key state for the removed conversation', () => {
+      useDMStore.getState().addConversation(mockConversation);
+      useChatStore.getState().addMessage('conv-1', {
+        ...mockMessage,
+        id: 'dm-access-revoked',
+        channel_id: 'conv-1',
+      });
+
+      useDMStore.getState().removeConversation('conv-1');
+
+      expect(useChatStore.getState().messagesByChannel.get('conv-1')).toBeUndefined();
+      expect(mockInvalidateChannelKey).toHaveBeenCalledOnce();
+      expect(mockInvalidateChannelKey).toHaveBeenCalledWith('conv-1');
     });
   });
 
@@ -554,6 +598,103 @@ describe('dmStore', () => {
       await useDMStore.getState().fetchConversations();
       expect(callCount).toBe(0);
     });
+
+    it('purges conversations missing from an authoritative re-fetch', async () => {
+      useDMStore.setState({ isLoading: false });
+      useDMStore.getState().addConversation(mockConversation);
+      useDMStore.getState().addConversation(mockConversation2);
+      useChatStore.getState().addMessage('conv-1', {
+        ...mockMessage,
+        id: 'removed-dm-message',
+        channel_id: 'conv-1',
+      });
+      useChatStore.getState().addMessage('conv-2', {
+        ...mockMessage,
+        id: 'retained-dm-message',
+        channel_id: 'conv-2',
+      });
+      indexMessage('removed-dm-message', 'revoked plaintext', 'conv-1');
+      indexMessage('retained-dm-message', 'retained plaintext', 'conv-2');
+      server.use(
+        http.get(`${API_BASE}/api/v1/dm/conversations`, () =>
+          HttpResponse.json({
+            conversations: [
+              {
+                id: 'conv-2',
+                is_group: true,
+                is_personal: false,
+                name: 'Group Chat',
+                participants: [],
+                last_message: null,
+                unread_count: 0,
+                created_at: '2025-01-02T00:00:00Z',
+              },
+            ],
+          })
+        )
+      );
+
+      await useDMStore.getState().fetchConversations();
+
+      expect(mockInvalidateChannelKey).toHaveBeenCalledOnce();
+      expect(mockInvalidateChannelKey).toHaveBeenCalledWith('conv-1');
+      expect(useChatStore.getState().messagesByChannel.has('conv-1')).toBe(false);
+      expect(useChatStore.getState().messagesByChannel.has('conv-2')).toBe(true);
+      expect(isIndexed('removed-dm-message')).toBe(false);
+      expect(isIndexed('retained-dm-message')).toBe(true);
+    });
+
+    it.each([
+      ['removeConversation', () => useDMStore.getState().removeConversation('conv-1'), ['conv-2']],
+      ['clearDMs', () => useDMStore.getState().clearDMs(), []],
+    ])('reconciles a stale response after %s', async (_name, revokeAccess, expectedIds) => {
+      const started = deferred();
+      const release = deferred();
+      server.use(
+        http.get(`${API_BASE}/api/v1/dm/conversations`, async () => {
+          started.resolve();
+          await release.promise;
+          return HttpResponse.json({
+            conversations: [
+              {
+                id: 'conv-1',
+                is_group: false,
+                is_personal: false,
+                name: null,
+                participants: [],
+                last_message: null,
+                unread_count: 0,
+                created_at: '2025-01-01T00:00:00Z',
+              },
+              {
+                id: 'conv-2',
+                is_group: true,
+                is_personal: false,
+                name: 'Retained group',
+                participants: [],
+                last_message: null,
+                unread_count: 0,
+                created_at: '2025-01-02T00:00:00Z',
+              },
+            ],
+          });
+        })
+      );
+
+      const fetchPromise = useDMStore.getState().fetchConversations();
+      await started.promise;
+      revokeAccess();
+      release.resolve();
+      await fetchPromise;
+
+      expect(useDMStore.getState().conversations.map((conversation) => conversation.id)).toEqual(
+        expectedIds
+      );
+      expect(
+        useDMStore.getState().conversations.some((conversation) => conversation.id === 'conv-1')
+      ).toBe(false);
+      expect(useDMStore.getState().isLoading).toBe(false);
+    });
   });
 
   // ── openDM ────────────────────────────────────────────────────────────
@@ -843,6 +984,23 @@ describe('dmStore', () => {
       // Removed in #1209: dmCallActive / dmCallConversationId assertions
       // (fields deleted; DM call state is on voiceStore now).
     });
+
+    it('purges access state for every conversation', () => {
+      useDMStore.getState().addConversation(mockConversation);
+      useDMStore.getState().addConversation(mockConversation2);
+      useChatStore.getState().addMessage('conv-1', mockMessage);
+      indexMessage('conv-1-message', 'first plaintext', 'conv-1');
+      indexMessage('conv-2-message', 'second plaintext', 'conv-2');
+
+      useDMStore.getState().clearDMs();
+
+      expect(mockInvalidateChannelKey).toHaveBeenCalledTimes(2);
+      expect(mockInvalidateChannelKey).toHaveBeenCalledWith('conv-1');
+      expect(mockInvalidateChannelKey).toHaveBeenCalledWith('conv-2');
+      expect(useChatStore.getState().messagesByChannel.has('conv-1')).toBe(false);
+      expect(isIndexed('conv-1-message')).toBe(false);
+      expect(isIndexed('conv-2-message')).toBe(false);
+    });
   });
 
   // ── mapConversation with new fields ───────────────────────────────
@@ -1006,6 +1164,12 @@ describe('dmStore', () => {
       it('removes conversation from local state', async () => {
         useDMStore.getState().addConversation(mockGroupConv);
         useDMStore.getState().setActiveConversation('group-1');
+        indexMessage('left-group-message', 'private group plaintext', 'group-1');
+        useChatStore.getState().addMessage('group-1', {
+          ...mockMessage,
+          id: 'left-group-message',
+          channel_id: 'group-1',
+        });
 
         // leaveGroup dynamically imports userStore — set user state
         const { useUserStore } = await import('@/renderer/stores/userStore');
@@ -1020,6 +1184,9 @@ describe('dmStore', () => {
         await useDMStore.getState().leaveGroup('group-1');
         expect(useDMStore.getState().conversations.find((c) => c.id === 'group-1')).toBeUndefined();
         expect(useDMStore.getState().activeConversationId).toBeNull();
+        expect(isIndexed('left-group-message')).toBe(false);
+        expect(useChatStore.getState().messagesByChannel.get('group-1')).toBeUndefined();
+        expect(mockInvalidateChannelKey).toHaveBeenCalledWith('group-1');
       });
     });
 
@@ -1066,6 +1233,7 @@ describe('dmStore', () => {
 
         await useDMStore.getState().deleteGroup('group-1');
         expect(useDMStore.getState().conversations.find((c) => c.id === 'group-1')).toBeUndefined();
+        expect(mockInvalidateChannelKey).toHaveBeenCalledWith('group-1');
       });
 
       it('clears activeConversationId if deleted group was active', async () => {

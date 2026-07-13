@@ -115,6 +115,7 @@ vi.mock('@/renderer/hooks/useMessaging', () => ({
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
+    createChannelOperationGuard: vi.fn(() => ({ assertCurrent: vi.fn() })),
     decryptForChannel: vi.fn(),
     getChannelKey: vi.fn(),
     invalidateChannelKey: vi.fn(),

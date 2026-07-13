@@ -224,6 +224,13 @@ func (h *Handler) deleteGroupData(convID string) error {
 		}
 	}()
 
+	var lockedConversationID string
+	if err := tx.QueryRow(
+		`SELECT id FROM dm_conversations WHERE id = $1 FOR UPDATE`, convID,
+	).Scan(&lockedConversationID); err != nil {
+		return fmt.Errorf("lock conversation: %w", err)
+	}
+
 	deletes := []struct{ query, label string }{
 		{"DELETE FROM dm_voice_participants WHERE conversation_id = $1", "voice participants"},
 		{"DELETE FROM dm_read_states WHERE conversation_id = $1", "read states"},

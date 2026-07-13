@@ -7,7 +7,7 @@
 
 import { useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
-import type { MessageWithStatus, Channel, ChannelGroup } from '../types/chat';
+import type { Channel, ChannelGroup } from '../types/chat';
 import { useChannelStore } from '../stores/channelStore';
 import { useServerStore } from '../stores/serverStore';
 import { useMemberStore } from '../stores/memberStore';
@@ -58,7 +58,7 @@ import {
 function isDoNotDisturb(): boolean {
   return useMemberStore.getState().selfStatus === 'dnd';
 }
-import { indexMessage } from '../services/searchService';
+import { indexMessage, removeMessage } from '../services/searchService';
 import { unwrapGifEnvelope } from '../utils/gifEnvelope';
 import { formatMessagePreview } from '../utils/messagePreview';
 import { summarizeWsServerError } from '../utils/wsDiagnostics';
@@ -476,15 +476,12 @@ function handleChannelAccessRevoked(
 ): void {
   const { channel_id: channelId } = msg.data;
 
-  // Remove the channel from the sidebar (channel_id + server_id + reason are
-  // all schema-required; no defensive presence checks needed).
+  // removeChannel also fences pending E2EE generations before purging the
+  // search scope. All payload fields are schema-required here.
   useChannelStore.getState().removeChannel(channelId);
 
   // Purge cached messages for the now-inaccessible channel.
   useChatStore.getState().clearMessages(channelId);
-
-  // Drop the cached channel key — the server has rotated the CSK epoch.
-  e2eeService.invalidateChannelKey(channelId);
 
   // If currently in this channel's voice, leave it (the server also
   // force-disconnects the live peer via voice.enforce.disconnect; this is the
@@ -524,17 +521,119 @@ function scheduleVoiceRefetch(
   );
 }
 
-function addEncryptedMessage(
+interface DecryptedMessageContent {
+  content: string;
+  gif_slug?: string;
+  key_version?: number;
+  decryptFailed: boolean;
+  pendingKeys: boolean;
+}
+
+interface MessageContentOperationOwner {
+  active: boolean;
+  nextToken: number;
+  latestOperations: Map<string, number>;
+}
+
+const MESSAGE_CONTENT_OPERATION_KINDS = ['message-content', 'reply-decrypt'] as const;
+type MessageContentOperationKind = (typeof MESSAGE_CONTENT_OPERATION_KINDS)[number];
+
+interface MessageContentOperation {
+  owner: MessageContentOperationOwner;
+  messageKey: string;
+  token: number;
+}
+
+function createMessageContentOperationOwner(): MessageContentOperationOwner {
+  return { active: true, nextToken: 0, latestOperations: new Map() };
+}
+
+function messageContentOperationKey(
   channelId: string,
-  baseMessage: Omit<MessageWithStatus, 'content'>,
-  ciphertext: string,
-  keyVersion: number | undefined,
-  addMessage: (channelId: string, msg: MessageWithStatus) => void,
-  onPlaintext?: (text: string, gifSlug?: string) => void,
-  onDecryptFailed?: () => void
+  messageId: string,
+  kind: MessageContentOperationKind
+): string {
+  return `${channelId}\u0000${messageId}\u0000${kind}`;
+}
+
+function messageContentPlaceholderKey(channelId: string, messageId: string): string {
+  return `${channelId}\u0000${messageId}`;
+}
+
+function beginMessageContentOperation(
+  owner: MessageContentOperationOwner,
+  channelId: string,
+  messageId: string,
+  kind: MessageContentOperationKind
+): MessageContentOperation {
+  const messageKey = messageContentOperationKey(channelId, messageId, kind);
+  const token = ++owner.nextToken;
+  owner.latestOperations.set(messageKey, token);
+  return { owner, messageKey, token };
+}
+
+function invalidateMessageContentOperation(
+  owner: MessageContentOperationOwner,
+  channelId: string,
+  messageId: string
 ): void {
+  for (const kind of MESSAGE_CONTENT_OPERATION_KINDS) {
+    owner.latestOperations.delete(messageContentOperationKey(channelId, messageId, kind));
+  }
+}
+
+function deactivateMessageContentOperationOwner(owner: MessageContentOperationOwner): void {
+  owner.active = false;
+  owner.latestOperations.clear();
+}
+
+function claimMessageContentOperation(operation?: MessageContentOperation): boolean {
+  if (!operation) return true;
+  if (!operation.owner.active) return false;
+  if (operation.owner.latestOperations.get(operation.messageKey) !== operation.token) return false;
+  operation.owner.latestOperations.delete(operation.messageKey);
+  return true;
+}
+
+interface DecryptAndStoreMessageContentOptions {
+  channelId: string;
+  messageId: string;
+  ciphertext: string;
+  keyVersion: number | undefined;
+  storeContent: (content: DecryptedMessageContent) => boolean;
+  operation?: MessageContentOperation;
+  onPlaintext?: (text: string, gifSlug?: string) => void;
+  onDecryptFailed?: () => void;
+  onSettled?: () => void;
+}
+
+function decryptAndStoreMessageContent({
+  channelId,
+  messageId,
+  ciphertext,
+  keyVersion,
+  storeContent,
+  operation,
+  onPlaintext,
+  onDecryptFailed,
+  onSettled,
+}: DecryptAndStoreMessageContentOptions): void {
   if (!e2eeService.isInitialized) {
-    addMessage(channelId, { ...baseMessage, content: '', decryptFailed: true });
+    if (!claimMessageContentOperation(operation)) return;
+    onSettled?.();
+    if (
+      !storeContent({
+        content: '',
+        gif_slug: undefined,
+        key_version: keyVersion,
+        decryptFailed: true,
+        pendingKeys: false,
+      })
+    ) {
+      removeMessage(messageId);
+      return;
+    }
+    removeMessage(messageId);
     onDecryptFailed?.();
     return;
   }
@@ -546,21 +645,47 @@ function addEncryptedMessage(
 
   decryptPromise
     .then((plaintext) => {
+      if (!claimMessageContentOperation(operation)) return;
+      onSettled?.();
       // E2EE GIF messages are encrypted as JSON: {"text":"...","gif_slug":"..."}
       const { text: content, gifSlug } = unwrapGifEnvelope(plaintext);
-      addMessage(channelId, { ...baseMessage, content, gif_slug: gifSlug });
+      if (
+        !storeContent({
+          content,
+          gif_slug: gifSlug,
+          key_version: keyVersion,
+          decryptFailed: false,
+          pendingKeys: false,
+        })
+      ) {
+        removeMessage(messageId);
+        return;
+      }
       // Passively index decrypted content for search
-      indexMessage(baseMessage.id, content, channelId);
+      if (content) {
+        indexMessage(messageId, content, channelId);
+      } else {
+        removeMessage(messageId);
+      }
       onPlaintext?.(content, gifSlug);
     })
     .catch((err) => {
+      if (!claimMessageContentOperation(operation)) return;
+      onSettled?.();
       const isPending = isPendingKeyError(err);
-      addMessage(channelId, {
-        ...baseMessage,
-        content: '',
-        decryptFailed: !isPending,
-        pendingKeys: isPending,
-      });
+      if (
+        !storeContent({
+          content: '',
+          gif_slug: undefined,
+          key_version: keyVersion,
+          decryptFailed: !isPending,
+          pendingKeys: isPending,
+        })
+      ) {
+        removeMessage(messageId);
+        return;
+      }
+      removeMessage(messageId);
       onDecryptFailed?.();
     });
 }
@@ -617,6 +742,24 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
   const setTyping = useChatStore((s) => s.setTyping);
 
   useEffect(() => {
+    const messageContentOperationOwner = createMessageContentOperationOwner();
+    const pendingMessagePlaceholders = new Map<string, { channelId: string; messageId: string }>();
+    const settleMessagePlaceholder = (channelId: string, messageId: string) =>
+      pendingMessagePlaceholders.delete(messageContentPlaceholderKey(channelId, messageId));
+    const storeMessageContent = (
+      channelId: string,
+      messageId: string,
+      content: DecryptedMessageContent
+    ): boolean => {
+      const messageExists = useChatStore
+        .getState()
+        .messagesByChannel.get(channelId)
+        ?.some((message) => message.id === messageId);
+      if (!messageExists) return false;
+      updateMessage(channelId, messageId, content);
+      return true;
+    };
+
     // Message handler
     const unsubMessage = wsService.on('message', (msg) => {
       // msg.data is narrowed to MessagePayload (validated at the dispatch
@@ -626,6 +769,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       const data = msg.data;
       const channelId = data.channel_id;
       const userId = data.user_id;
+      if (!channelId || !userId) return;
 
       const keyVersion = data.key_version;
       // Wire types allow `string | null` on nullable fields (e.g.
@@ -663,24 +807,59 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       const maybeSpeakTTS = (text: string) =>
         speakIfVoiceLinked(text, channelId, userId, data.display_name || data.username || '');
 
-      addEncryptedMessage(
+      // Insert a fail-closed row before decrypting so an edit received while the
+      // original decrypt is pending has an existing message to update.
+      const hasExistingMessage = useChatStore
+        .getState()
+        .messagesByChannel.get(channelId)
+        ?.some((message) => message.id === baseMessage.id);
+      if (!hasExistingMessage) {
+        addMessage(channelId, {
+          ...baseMessage,
+          content: '',
+          replied_to: baseMessage.replied_to
+            ? { ...baseMessage.replied_to, content: '' }
+            : undefined,
+          decryptFailed: false,
+          pendingKeys: false,
+        });
+        pendingMessagePlaceholders.set(messageContentPlaceholderKey(channelId, baseMessage.id), {
+          channelId,
+          messageId: baseMessage.id,
+        });
+      }
+      decryptAndStoreMessageContent({
         channelId,
-        baseMessage,
-        data.content ?? '',
+        messageId: baseMessage.id,
+        ciphertext: data.content ?? '',
         keyVersion,
-        addMessage,
-        (text, gifSlug) => {
+        storeContent: (content) => storeMessageContent(channelId, baseMessage.id, content),
+        operation: beginMessageContentOperation(
+          messageContentOperationOwner,
+          channelId,
+          baseMessage.id,
+          'message-content'
+        ),
+        onPlaintext: (text, gifSlug) => {
           maybeSpeakTTS(text);
           notifyChannelMessagePreview(channelId, data, text, gifSlug, shouldNotifyDesktop);
         },
-        () => notifyChannelMessagePreview(channelId, data, '', undefined, shouldNotifyDesktop)
-      );
+        onDecryptFailed: () =>
+          notifyChannelMessagePreview(channelId, data, '', undefined, shouldNotifyDesktop),
+        onSettled: () => settleMessagePlaceholder(channelId, baseMessage.id),
+      });
 
       // Decrypt replied_to content. `rt` is the normalized form from
       // baseMessage (display_name already coerced null → undefined), so
       // the spread below preserves the store-compatible shape.
       const rt = baseMessage.replied_to;
       if (rt?.content && e2eeService.isInitialized) {
+        const replyOperation = beginMessageContentOperation(
+          messageContentOperationOwner,
+          channelId,
+          baseMessage.id,
+          'reply-decrypt'
+        );
         const rtKv = rt.key_version;
         const decryptFn =
           rtKv && rtKv > 1
@@ -688,12 +867,14 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
             : e2eeService.decryptForChannel(channelId, rt.content);
         decryptFn
           .then((plaintext) => {
+            if (!claimMessageContentOperation(replyOperation)) return;
             updateMessage(channelId, baseMessage.id, {
               replied_to: { ...rt, content: plaintext },
             });
           })
           .catch(() => {
-            // Leave ciphertext — ReplyPreviewBar will show it as-is
+            claimMessageContentOperation(replyOperation);
+            // Keep the reply preview fail-closed and blank; never render ciphertext.
           });
       }
 
@@ -707,16 +888,42 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // wants `string | undefined`, so normalize at this boundary.
     const unsubUpdate = wsService.on('message_update', (msg) => {
       const data = msg.data;
-      updateMessage(data.channel_id, data.id, {
-        content: data.content,
-        edited_at: data.edited_at ?? undefined,
-        updated_at: data.updated_at || new Date().toISOString(),
+      const metadata = {
+        ...(data.edited_at !== undefined && { edited_at: data.edited_at ?? undefined }),
+        updated_at: data.updated_at || data.edited_at || new Date().toISOString(),
+        ...(data.embeds_suppressed !== undefined && {
+          embeds_suppressed: data.embeds_suppressed,
+        }),
+      };
+
+      updateMessage(data.channel_id, data.id, metadata);
+      if (data.content === undefined) return;
+
+      // An authoritative edit supersedes any indexed/backfilled plaintext
+      // immediately. A successful decrypt below will re-index the new content.
+      removeMessage(data.id);
+      decryptAndStoreMessageContent({
+        channelId: data.channel_id,
+        messageId: data.id,
+        ciphertext: data.content,
+        keyVersion: data.key_version,
+        storeContent: (content) => storeMessageContent(data.channel_id, data.id, content),
+        operation: beginMessageContentOperation(
+          messageContentOperationOwner,
+          data.channel_id,
+          data.id,
+          'message-content'
+        ),
+        onSettled: () => settleMessagePlaceholder(data.channel_id, data.id),
       });
     });
 
     // Message delete handler — msg.data narrowed to MessageDeletePayload.
     const unsubDelete = wsService.on('message_delete', (msg) => {
       const data = msg.data;
+      invalidateMessageContentOperation(messageContentOperationOwner, data.channel_id, data.id);
+      settleMessagePlaceholder(data.channel_id, data.id);
+      removeMessage(data.id);
       deleteMessage(data.channel_id, data.id);
     });
 
@@ -1294,6 +1501,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       // canonical key.
       const data = msg.data;
       const conversationId = data.conversation_id;
+      if (!conversationId) return;
 
       const dmKeyVersion = data.key_version;
       const baseMessage = {
@@ -1327,16 +1535,42 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
         notificationSoundService.play('dm', { focused: true });
       }
 
-      addEncryptedMessage(
-        conversationId,
-        baseMessage,
-        data.content ?? '',
-        dmKeyVersion,
-        addMessage,
-        (text, gifSlug) =>
+      // Keep the row present while decrypting so a newer edit can supersede
+      // this operation without being dropped by updateMessage.
+      const hasExistingMessage = useChatStore
+        .getState()
+        .messagesByChannel.get(conversationId)
+        ?.some((message) => message.id === baseMessage.id);
+      if (!hasExistingMessage) {
+        addMessage(conversationId, {
+          ...baseMessage,
+          content: '',
+          decryptFailed: false,
+          pendingKeys: false,
+        });
+        pendingMessagePlaceholders.set(
+          messageContentPlaceholderKey(conversationId, baseMessage.id),
+          { channelId: conversationId, messageId: baseMessage.id }
+        );
+      }
+      decryptAndStoreMessageContent({
+        channelId: conversationId,
+        messageId: baseMessage.id,
+        ciphertext: data.content ?? '',
+        keyVersion: dmKeyVersion,
+        storeContent: (content) => storeMessageContent(conversationId, baseMessage.id, content),
+        operation: beginMessageContentOperation(
+          messageContentOperationOwner,
+          conversationId,
+          baseMessage.id,
+          'message-content'
+        ),
+        onPlaintext: (text, gifSlug) =>
           notifyDMMessagePreview(conversationId, data, text, gifSlug, shouldNotifyDesktop),
-        () => notifyDMMessagePreview(conversationId, data, '', undefined, shouldNotifyDesktop)
-      );
+        onDecryptFailed: () =>
+          notifyDMMessagePreview(conversationId, data, '', undefined, shouldNotifyDesktop),
+        onSettled: () => settleMessagePlaceholder(conversationId, baseMessage.id),
+      });
 
       // Bump conversation to the top of the DM list with updated preview.
       // No-ops gracefully if the conversation isn't in state yet (initial-load race).
@@ -1356,16 +1590,40 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // DM message update handler — msg.data narrowed to DMMessageUpdatePayload.
     const unsubDMUpdate = wsService.on('dm_message_update', (msg) => {
       const data = msg.data;
-      updateMessage(data.conversation_id, data.id, {
-        content: data.content,
-        edited_at: data.edited_at,
-        updated_at: data.updated_at || new Date().toISOString(),
+      const metadata = {
+        ...(data.edited_at !== undefined && { edited_at: data.edited_at }),
+        updated_at: data.updated_at || data.edited_at || new Date().toISOString(),
+      };
+      updateMessage(data.conversation_id, data.id, metadata);
+      // Tombstone the prior plaintext before the asynchronous edit decrypt so
+      // an older backfill cannot publish stale content in the interim.
+      removeMessage(data.id);
+      decryptAndStoreMessageContent({
+        channelId: data.conversation_id,
+        messageId: data.id,
+        ciphertext: data.content,
+        keyVersion: data.key_version,
+        storeContent: (content) => storeMessageContent(data.conversation_id, data.id, content),
+        operation: beginMessageContentOperation(
+          messageContentOperationOwner,
+          data.conversation_id,
+          data.id,
+          'message-content'
+        ),
+        onSettled: () => settleMessagePlaceholder(data.conversation_id, data.id),
       });
     });
 
     // DM message delete handler — msg.data narrowed to DMMessageDeletePayload.
     const unsubDMDelete = wsService.on('dm_message_delete', (msg) => {
       const data = msg.data;
+      invalidateMessageContentOperation(
+        messageContentOperationOwner,
+        data.conversation_id,
+        data.id
+      );
+      settleMessagePlaceholder(data.conversation_id, data.id);
+      removeMessage(data.id);
       deleteMessage(data.conversation_id, data.id);
     });
 
@@ -1812,6 +2070,25 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
 
     // Cleanup handlers
     return () => {
+      deactivateMessageContentOperationOwner(messageContentOperationOwner);
+      for (const { channelId, messageId } of pendingMessagePlaceholders.values()) {
+        const placeholder = useChatStore
+          .getState()
+          .messagesByChannel.get(channelId)
+          ?.find((message) => message.id === messageId);
+        if (
+          placeholder?.content !== '' ||
+          placeholder.decryptFailed !== false ||
+          placeholder.pendingKeys !== false
+        ) {
+          continue;
+        }
+        deleteMessage(channelId, messageId);
+        if (useChatStore.getState().messagesByChannel.get(channelId)?.length === 0) {
+          useChatStore.getState().clearMessages(channelId);
+        }
+      }
+      pendingMessagePlaceholders.clear();
       unsubMessage();
       unsubUpdate();
       unsubDelete();

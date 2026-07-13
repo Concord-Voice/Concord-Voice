@@ -54,6 +54,11 @@ interface CachedWrappedKey {
   refetchAfterMalformed: number;
 }
 
+interface ChannelKeyMaterial {
+  channelKey: CryptoKey;
+  keyVersion: number;
+}
+
 interface ErrorResponseShape {
   error?: string;
   code?: E2EEKeyErrorCode;
@@ -79,6 +84,11 @@ export interface E2EEInitializationGuard {
   isCurrent: () => boolean;
 }
 
+/** Binds pre-fetched key work to one account session and channel-key generation. */
+export interface E2EEChannelOperationGuard {
+  assertCurrent: () => void;
+}
+
 function initializationIsCurrent(guard?: E2EEInitializationGuard): boolean {
   return guard === undefined || (!guard.signal.aborted && guard.isCurrent());
 }
@@ -99,7 +109,11 @@ class E2EEService {
   private wrappedPrivateKey: string = '';
   private readonly channelKeyCache: Map<string, CachedWrappedKey> = new Map();
   private readonly versionedKeyCache: Map<string, Map<number, CachedWrappedKey>> = new Map();
-  private readonly pendingKeyFetches: Map<string, Promise<CryptoKey>> = new Map();
+  private readonly pendingKeyFetches: Map<string, Promise<ChannelKeyMaterial>> = new Map();
+  private readonly pendingVersionedKeyFetches: Map<string, Promise<CryptoKey>> = new Map();
+  private readonly channelKeyGenerations: Map<string, number> = new Map();
+  private readonly channelAccessRevocationGenerations: Map<string, number> = new Map();
+  private keySessionGeneration: number = 0;
   private rateLimitedUntil: number = 0; // timestamp when rate limit expires
 
   // #1878: authoritative CSK-rotation signal. Fires when a strictly-higher
@@ -337,23 +351,29 @@ class E2EEService {
    * Shared by `fetchAndUnwrapChannelKey` and `getChannelKeyByVersion` so both
    * paths stay byte-identical in behavior.
    *
-   * When `contextId` is supplied and the server response is NO_KEY_YET + pending:true,
-   * fire-and-forget a peer-rewrap enrollment trigger (#1023). The server's
+   * When the server response is NO_KEY_YET + pending:true, fire-and-forget a
+   * peer-rewrap enrollment trigger for the channel (#1023). The server's
    * GetUnifiedKeys handler already auto-enrolls on 404; this explicit POST is
    * defense-in-depth and is idempotent on the server (ON CONFLICT DO NOTHING).
    */
-  private async throwKeyFetchError(res: Response, contextId?: string): Promise<never> {
+  private async throwKeyFetchError(
+    res: Response,
+    sessionGeneration: number,
+    channelId: string,
+    channelGeneration: number
+  ): Promise<never> {
+    const body = await safeJson<ErrorResponseShape>(res).catch((): ErrorResponseShape => ({}));
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
     if (res.status === 429) {
       const retryAfter = Number.parseInt(res.headers.get('Retry-After') || '30', 10);
       this.rateLimitedUntil = Date.now() + retryAfter * 1000;
     }
-    const body = await safeJson<ErrorResponseShape>(res).catch((): ErrorResponseShape => ({}));
     const code = body.code ?? 'NO_KEY_YET';
     const pending = body.pending ?? false;
 
     // Fire-and-forget rewrap enrollment for the pending:true missing-key case (#1023).
-    if (contextId && code === 'NO_KEY_YET' && pending) {
-      this.requestRewrap(contextId).catch(() => {
+    if (code === 'NO_KEY_YET' && pending) {
+      this.requestRewrap(channelId).catch(() => {
         // Intentionally swallowed — enrollment is best-effort; the existing
         // pending:true classifier (retryable=true) drives the actual retry loop.
       });
@@ -397,26 +417,83 @@ class E2EEService {
     return true;
   }
 
+  private assertCurrentKeySession(generation: number): void {
+    if (generation !== this.keySessionGeneration) {
+      throw new Error('E2EE key session changed');
+    }
+  }
+
+  private getChannelKeyGeneration(channelId: string): number {
+    return this.channelKeyGenerations.get(channelId) ?? 0;
+  }
+
+  private assertCurrentKeyContext(
+    sessionGeneration: number,
+    channelId: string,
+    channelGeneration: number
+  ): void {
+    this.assertCurrentKeySession(sessionGeneration);
+    const accessRevocationGeneration = this.channelAccessRevocationGenerations.get(channelId) ?? -1;
+    if (channelGeneration < accessRevocationGeneration) {
+      // Access loss is terminal for work captured before the revocation. Check
+      // this before the ordinary key-generation mismatch so callers never
+      // misclassify a removal as a retryable rotation.
+      throw new E2EEKeyUnavailableError('NOT_MEMBER', false);
+    }
+    if (channelGeneration !== this.getChannelKeyGeneration(channelId)) {
+      // Rotation/retry invalidation is transient for an otherwise-live
+      // account session. Surface the existing pending-key shape so callers
+      // retry instead of permanently marking messages undecryptable.
+      throw new E2EEKeyUnavailableError('NO_KEY_YET', true);
+    }
+  }
+
+  createChannelOperationGuard(channelId: string): E2EEChannelOperationGuard {
+    const sessionGeneration = this.keySessionGeneration;
+    const channelGeneration = this.getChannelKeyGeneration(channelId);
+    return {
+      assertCurrent: () =>
+        this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration),
+    };
+  }
+
   /**
    * Get the unwrapped channel key for a channel (JIT).
    * Fetches the wrapped key from cache or server, unwraps with private key.
    * Uses pendingKeyFetches to prevent cache stampeding (concurrent fetches for the same channel).
    */
   async getChannelKey(channelId: string): Promise<CryptoKey> {
+    const material = await this.getChannelKeyMaterial(channelId);
+    return material.channelKey;
+  }
+
+  /**
+   * Get the current channel key together with the exact epoch selected for it.
+   * The wrapped key and version are captured before any await so cache rotation
+   * cannot pair key material from one epoch with metadata from another.
+   */
+  private async getChannelKeyMaterial(channelId: string): Promise<ChannelKeyMaterial> {
     if (!channelId) {
       throw new E2EEKeyUnavailableError('INVALID_REQUEST', false);
     }
+    const sessionGeneration = this.keySessionGeneration;
+    const channelGeneration = this.getChannelKeyGeneration(channelId);
 
     // Check cache for wrapped key. Guard against refetch-marker slots whose
     // `wrappedKey` is empty (see fetchAndUnwrapChannelKey cache-poison path).
     const cached = this.channelKeyCache.get(channelId);
     if (cached?.wrappedKey && Date.now() - cached.lastUsed < CHANNEL_KEY_CACHE_TTL) {
+      const wrappedKey = cached.wrappedKey;
+      const keyVersion = cached.keyVersion;
       cached.lastUsed = Date.now();
       const privateKey = await this.derivePrivateKey();
+      this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
       // #1878: a cache hit re-observes the cached version (idempotent — only a
       // strictly-higher version fires the rotation emitter).
-      this.noteChannelVersion(channelId, cached.keyVersion);
-      return unwrapChannelKey(cached.wrappedKey, privateKey);
+      this.noteChannelVersion(channelId, keyVersion);
+      const channelKey = await unwrapChannelKey(wrappedKey, privateKey);
+      this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+      return { channelKey, keyVersion };
     }
 
     // If we're rate-limited, don't fire another request
@@ -430,25 +507,37 @@ class E2EEService {
       return pending;
     }
 
-    const fetchPromise = this.fetchAndUnwrapChannelKey(channelId);
+    const fetchPromise = this.fetchAndUnwrapChannelKey(
+      channelId,
+      sessionGeneration,
+      channelGeneration
+    );
     this.pendingKeyFetches.set(channelId, fetchPromise);
 
     try {
       return await fetchPromise;
     } finally {
-      this.pendingKeyFetches.delete(channelId);
+      if (this.pendingKeyFetches.get(channelId) === fetchPromise) {
+        this.pendingKeyFetches.delete(channelId);
+      }
     }
   }
 
   /**
    * Internal: fetch wrapped key from server, cache it, and unwrap.
    */
-  private async fetchAndUnwrapChannelKey(channelId: string): Promise<CryptoKey> {
+  private async fetchAndUnwrapChannelKey(
+    channelId: string,
+    sessionGeneration: number,
+    channelGeneration: number
+  ): Promise<ChannelKeyMaterial> {
     const res = await apiFetch(`/api/v1/e2ee/keys/${channelId}`);
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
     if (!res.ok) {
-      await this.throwKeyFetchError(res, channelId);
+      await this.throwKeyFetchError(res, sessionGeneration, channelId, channelGeneration);
     }
     const data = await safeJson<KeyResponseShape>(res);
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
     const wrappedKey: string = data.key.wrapped_key;
     const keyVersion: number = data.key.key_version || 1;
 
@@ -479,7 +568,7 @@ class E2EEService {
           lastUsed: 0,
           refetchAfterMalformed: 1,
         });
-        return this.fetchAndUnwrapChannelKey(channelId);
+        return this.fetchAndUnwrapChannelKey(channelId, sessionGeneration, channelGeneration);
       }
       throw err;
     }
@@ -498,7 +587,10 @@ class E2EEService {
 
     // JIT unwrap: derive private key, unwrap channel key, private key falls out of scope
     const privateKey = await this.derivePrivateKey();
-    return unwrapChannelKey(wrappedKey, privateKey);
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+    const channelKey = await unwrapChannelKey(wrappedKey, privateKey);
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+    return { channelKey, keyVersion };
   }
 
   /**
@@ -541,8 +633,29 @@ class E2EEService {
    * JIT: gets channel key, encrypts, key falls out of scope.
    */
   async encryptForChannel(channelId: string, plaintext: string): Promise<string> {
+    const operationGuard = this.createChannelOperationGuard(channelId);
     const channelKey = await this.getChannelKey(channelId);
-    return encryptMessage(plaintext, channelKey);
+    operationGuard.assertCurrent();
+    const ciphertext = await encryptMessage(plaintext, channelKey);
+    operationGuard.assertCurrent();
+    return ciphertext;
+  }
+
+  /**
+   * Encrypt a message and bind it to the version of the selected channel key.
+   * The version is captured before WebCrypto yields so a concurrent cache
+   * invalidation cannot stamp the ciphertext with a different key epoch.
+   */
+  async encryptForChannelWithVersion(
+    channelId: string,
+    plaintext: string
+  ): Promise<{ ciphertext: string; keyVersion: number }> {
+    const operationGuard = this.createChannelOperationGuard(channelId);
+    const { channelKey, keyVersion } = await this.getChannelKeyMaterial(channelId);
+    operationGuard.assertCurrent();
+    const ciphertext = await encryptMessage(plaintext, channelKey);
+    operationGuard.assertCurrent();
+    return { ciphertext, keyVersion };
   }
 
   /**
@@ -550,16 +663,28 @@ class E2EEService {
    * JIT: gets channel key, decrypts, key falls out of scope.
    */
   async decryptForChannel(channelId: string, ciphertext: string): Promise<string> {
+    const sessionGeneration = this.keySessionGeneration;
+    const channelGeneration = this.getChannelKeyGeneration(channelId);
     const channelKey = await this.getChannelKey(channelId);
-    return decryptMessage(ciphertext, channelKey);
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+    const plaintext = await decryptMessage(ciphertext, channelKey);
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+    return plaintext;
   }
 
   /**
    * Decrypt a message using a pre-fetched channel key.
    * Avoids redundant getChannelKey() calls when batch-decrypting.
    */
-  async decryptWithKey(ciphertext: string, channelKey: CryptoKey): Promise<string> {
-    return decryptMessage(ciphertext, channelKey);
+  async decryptWithKey(
+    ciphertext: string,
+    channelKey: CryptoKey,
+    operationGuard: E2EEChannelOperationGuard
+  ): Promise<string> {
+    operationGuard.assertCurrent();
+    const plaintext = await decryptMessage(ciphertext, channelKey);
+    operationGuard.assertCurrent();
+    return plaintext;
   }
 
   /**
@@ -714,32 +839,42 @@ class E2EEService {
    *
    * Cache hits return BEFORE allocating an in-flight dedup promise. Concurrent
    * cache-miss callers for the same `(channelId, version)` share one network
-   * fetch via `pendingKeyFetches` under a compound key `${channelId}:v${version}`
-   * — distinct from `getChannelKey`'s bare-`channelId` entries, so the two paths
-   * never collide (#1878).
+   * fetch via `pendingVersionedKeyFetches` under a compound key
+   * `${channelId}:v${version}` — isolated from the current-key material fetches,
+   * so the two paths never collide (#1878).
    */
   async getChannelKeyByVersion(channelId: string, version: number): Promise<CryptoKey> {
     if (!channelId) {
       throw new E2EEKeyUnavailableError('INVALID_REQUEST', false);
     }
+    const sessionGeneration = this.keySessionGeneration;
+    const channelGeneration = this.getChannelKeyGeneration(channelId);
 
     // Check if this is the current version — use main cache.
     // Guard against empty wrappedKey (cache-poison marker slot).
     const mainCached = this.channelKeyCache.get(channelId);
     if (mainCached?.wrappedKey && mainCached.keyVersion === version) {
+      const wrappedKey = mainCached.wrappedKey;
       mainCached.lastUsed = Date.now();
       const privateKey = await this.derivePrivateKey();
+      this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
       this.noteChannelVersion(channelId, version); // #1878
-      return unwrapChannelKey(mainCached.wrappedKey, privateKey);
+      const channelKey = await unwrapChannelKey(wrappedKey, privateKey);
+      this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+      return channelKey;
     }
 
     // Check versioned cache
     const versionCached = this.versionedKeyCache.get(channelId)?.get(version);
     if (versionCached?.wrappedKey && Date.now() - versionCached.lastUsed < CHANNEL_KEY_CACHE_TTL) {
+      const wrappedKey = versionCached.wrappedKey;
       versionCached.lastUsed = Date.now();
       const privateKey = await this.derivePrivateKey();
+      this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
       this.noteChannelVersion(channelId, version); // #1878
-      return unwrapChannelKey(versionCached.wrappedKey, privateKey);
+      const channelKey = await unwrapChannelKey(wrappedKey, privateKey);
+      this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+      return channelKey;
     }
 
     // If we're rate-limited, don't fire another request
@@ -747,20 +882,27 @@ class E2EEService {
       throw new E2EEKeyUnavailableError('NO_KEY_YET', false);
     }
 
-    // #1878: by-version in-flight dedup. Compound key cannot collide with the
-    // bare-channelId entries getChannelKey uses. Allocated only AFTER the cache
-    // misses above, so a cache hit never creates a pending promise.
+    // #1878: by-version in-flight dedup lives in a dedicated map isolated from
+    // current-key material fetches. Allocate only AFTER the cache misses above,
+    // so a cache hit never creates a pending promise.
     const dedupKey = `${channelId}:v${version}`;
-    const inflight = this.pendingKeyFetches.get(dedupKey);
+    const inflight = this.pendingVersionedKeyFetches.get(dedupKey);
     if (inflight) {
       return inflight;
     }
-    const fetchPromise = this.fetchChannelKeyByVersion(channelId, version);
-    this.pendingKeyFetches.set(dedupKey, fetchPromise);
+    const fetchPromise = this.fetchChannelKeyByVersion(
+      channelId,
+      version,
+      sessionGeneration,
+      channelGeneration
+    );
+    this.pendingVersionedKeyFetches.set(dedupKey, fetchPromise);
     try {
       return await fetchPromise;
     } finally {
-      this.pendingKeyFetches.delete(dedupKey);
+      if (this.pendingVersionedKeyFetches.get(dedupKey) === fetchPromise) {
+        this.pendingVersionedKeyFetches.delete(dedupKey);
+      }
     }
   }
 
@@ -772,13 +914,20 @@ class E2EEService {
    * the malformed-wrap retry recurses on the body (never re-allocating a dedup
    * promise). See #1878.
    */
-  private async fetchChannelKeyByVersion(channelId: string, version: number): Promise<CryptoKey> {
+  private async fetchChannelKeyByVersion(
+    channelId: string,
+    version: number,
+    sessionGeneration: number,
+    channelGeneration: number
+  ): Promise<CryptoKey> {
     // Fetch specific version from server
     const res = await apiFetch(`/api/v1/e2ee/keys/${channelId}?version=${version}`);
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
     if (!res.ok) {
-      await this.throwKeyFetchError(res, channelId);
+      await this.throwKeyFetchError(res, sessionGeneration, channelId, channelGeneration);
     }
     const data = await safeJson<KeyResponseShape>(res);
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
     const wrappedKey: string = data.key.wrapped_key;
 
     // Cache-poison defense: shares the refetch counter on the main cache so
@@ -791,7 +940,12 @@ class E2EEService {
       this.validateWrapShape(wrappedKey);
     } catch (err) {
       if (this.handleMalformedVersionedWrap(channelId, version, err)) {
-        return this.fetchChannelKeyByVersion(channelId, version);
+        return this.fetchChannelKeyByVersion(
+          channelId,
+          version,
+          sessionGeneration,
+          channelGeneration
+        );
       }
       throw err;
     }
@@ -820,7 +974,10 @@ class E2EEService {
     this.noteChannelVersion(channelId, version);
 
     const privateKey = await this.derivePrivateKey();
-    return unwrapChannelKey(wrappedKey, privateKey);
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+    const channelKey = await unwrapChannelKey(wrappedKey, privateKey);
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+    return channelKey;
   }
 
   /**
@@ -844,8 +1001,13 @@ class E2EEService {
     }
 
     // Fetch specific version
+    const sessionGeneration = this.keySessionGeneration;
+    const channelGeneration = this.getChannelKeyGeneration(channelId);
     const channelKey = await this.getChannelKeyByVersion(channelId, version);
-    return decryptMessage(ciphertext, channelKey);
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+    const plaintext = await decryptMessage(ciphertext, channelKey);
+    this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
+    return plaintext;
   }
 
   /**
@@ -916,16 +1078,29 @@ class E2EEService {
   }
 
   /**
+   * Invalidates in-flight key work without dropping initialized keys or caches.
+   * Same-session resets use this fence so late decrypts cannot outlive content cleanup.
+   */
+  fencePendingOperations(): void {
+    this.keySessionGeneration += 1;
+    this.pendingKeyFetches.clear();
+    this.pendingVersionedKeyFetches.clear();
+  }
+
+  /**
    * Clear all keys on logout.
    */
   clearKeys(): void {
+    this.fencePendingOperations();
+    this.rateLimitedUntil = 0;
     this.wrappingKey = null;
     this.preferencesKey = null;
     this.wrappedPrivateKey = '';
     this.sessionKeys = null;
     this.channelKeyCache.clear();
     this.versionedKeyCache.clear();
-    this.pendingKeyFetches.clear();
+    this.channelKeyGenerations.clear();
+    this.channelAccessRevocationGenerations.clear();
     // #1878: drop all rotation baselines on logout — a new session must not
     // inherit a stale highest-seen version. Listeners are NOT cleared here:
     // subscribers (voiceService) own their unsubscribe lifecycle.
@@ -942,8 +1117,16 @@ class E2EEService {
    * Also clears historical versioned keys for the channel.
    */
   invalidateChannelKey(channelId: string): void {
+    this.channelKeyGenerations.set(channelId, this.getChannelKeyGeneration(channelId) + 1);
     this.channelKeyCache.delete(channelId);
     this.versionedKeyCache.delete(channelId);
+    this.pendingKeyFetches.delete(channelId);
+    const versionedPrefix = `${channelId}:v`;
+    for (const dedupKey of this.pendingVersionedKeyFetches.keys()) {
+      if (dedupKey.startsWith(versionedPrefix)) {
+        this.pendingVersionedKeyFetches.delete(dedupKey);
+      }
+    }
     // #1878: DO NOT clear highestSeenVersion here. invalidateChannelKey is the
     // primary CSK-rotation trigger path (WS revocation / performKeyRotation,
     // requestRecovery self-heal, key_delivered, channel_access_revoked) — it
@@ -956,6 +1139,16 @@ class E2EEService {
     // only fires on a STRICTLY-higher version, so a cache-bust followed by a
     // same-version refetch produces no fire, while a genuine rotation (higher
     // version) correctly fires. Logout drops all baselines via clearKeys().
+  }
+
+  /**
+   * Fence work captured before authoritative channel/DM access loss.
+   * Unlike an ordinary key rotation, an access revocation is terminal and
+   * must not trigger history refetch retries that could republish stale data.
+   */
+  revokeChannelAccess(channelId: string): void {
+    this.invalidateChannelKey(channelId);
+    this.channelAccessRevocationGenerations.set(channelId, this.getChannelKeyGeneration(channelId));
   }
 
   /**
