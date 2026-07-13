@@ -10,6 +10,8 @@ beforeEach(() => {
     turn: { host: '', realm: '' },
     spaUrl: '',
     spaIpcContract: 0,
+    serverCapabilities: null,
+    activityHistoryCapability: { status: 'loading' },
     lastFetchedAt: null,
   });
 });
@@ -23,6 +25,8 @@ describe('clientConfigStore', () => {
     expect(state.turn).toEqual({ host: '', realm: '' });
     expect(state.spaUrl).toBe('');
     expect(state.spaIpcContract).toBe(0);
+    expect(state.serverCapabilities).toBeNull();
+    expect(state.activityHistoryCapability).toEqual({ status: 'loading' });
     expect(state.lastFetchedAt).toBeNull();
   });
 
@@ -60,5 +64,28 @@ describe('clientConfigStore', () => {
     });
 
     expect(useClientConfigStore.getState().lastFetchedAt).not.toBeNull();
+  });
+
+  it('updates and resets server capability state explicitly', () => {
+    useClientConfigStore.getState().setServerCapabilities({
+      auth: { oauthProviders: ['google'] },
+      features: { activityHistorySupported: true },
+    });
+    useClientConfigStore.getState().setActivityHistoryCapability({ status: 'supported' });
+
+    expect(useClientConfigStore.getState().serverCapabilities).toEqual({
+      auth: { oauthProviders: ['google'] },
+      features: { activityHistorySupported: true },
+    });
+    expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+      status: 'supported',
+    });
+
+    useClientConfigStore.getState().resetForRuntimeServer();
+
+    expect(useClientConfigStore.getState().serverCapabilities).toBeNull();
+    expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+      status: 'loading',
+    });
   });
 });

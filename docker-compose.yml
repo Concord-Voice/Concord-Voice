@@ -199,6 +199,7 @@ services:
     build:
       context: ./services/control-plane
       dockerfile: Dockerfile
+    image: "${CONTROL_PLANE_IMAGE:-concordvoice-control-plane:local}"
     container_name: concordvoice-control-plane
     env_file:
       - spa.env.example
@@ -229,6 +230,13 @@ services:
       UPLOAD_MAX_SIZE: ${UPLOAD_MAX_SIZE:-26214400}
       KLIPY_API_KEY: ${KLIPY_API_KEY:-}
       TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.19.0.0/16}
+      # Activity History is deployed dormant. First activation is performed only
+      # through the drained concord-ctl preflight; ordinary Compose starts must
+      # never infer activation from binary support.
+      ACTIVITY_HISTORY_CLUSTER_ENABLED: "${ACTIVITY_HISTORY_CLUSTER_ENABLED:-false}"
+      CONTROL_PLANE_REPLICA_COUNT: "${CONTROL_PLANE_REPLICA_COUNT:-1}"
+      ACTIVITY_HISTORY_OPERATOR_NAME: "${ACTIVITY_HISTORY_OPERATOR_NAME:-}"
+      ACTIVITY_HISTORY_PRIVACY_POLICY_URL: "${ACTIVITY_HISTORY_PRIVACY_POLICY_URL:-}"
       OPS_METRICS_ENABLED: ${OPS_METRICS_ENABLED:-false}
       OPS_METRICS_NODE_ID: ${OPS_METRICS_NODE_ID:-}
       OPS_METRICS_SHARED_SECRET: ${OPS_METRICS_SHARED_SECRET:-}

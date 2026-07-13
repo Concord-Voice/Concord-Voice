@@ -6,6 +6,7 @@
  * from the App root so minVersion enforcement works regardless of auth state.
  */
 
+import { z } from 'zod';
 import { apiFetch } from './apiClient';
 import { useClientConfigStore, type ServerCapabilities } from '../stores/clientConfigStore';
 import { useVoiceStore } from '../stores/voiceStore';
@@ -23,21 +24,21 @@ interface ServerConfigResponse {
   spaIpcContract?: number;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function normalizeServerCapabilities(value: unknown): ServerCapabilities {
-  const auth = isRecord(value) && isRecord(value.auth) ? value.auth : {};
-  const providers = Array.isArray(auth.oauthProviders)
-    ? auth.oauthProviders.filter((provider): provider is string => typeof provider === 'string')
-    : [];
-  return { auth: { oauthProviders: providers } };
-}
+const ServerCapabilitiesSchema = z.object({
+  auth: z.object({
+    oauthProviders: z.array(z.string()),
+  }),
+  features: z.object({
+    activityHistorySupported: z.boolean().optional(),
+  }),
+});
 
 class ClientConfigService {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private startupTimer: ReturnType<typeof setTimeout> | null = null;
+  private configAbortController: AbortController | null = null;
+  private capabilityAbortController: AbortController | null = null;
+  private runtimeServerGeneration = 0;
   private spaCheckPromise: Promise<boolean> | null = null;
   private lastSpaCheckAt = Number.NEGATIVE_INFINITY;
   private deferredSpaReload = false;
@@ -118,17 +119,31 @@ class ClientConfigService {
     return this.spaCheckPromise;
   }
 
-  /** Fetch config from server and apply to store. */
+  /** Fetch config and capabilities independently so either endpoint may recover alone. */
   async fetch(): Promise<void> {
+    const configFetch = this.fetchClientConfig();
+    const capabilityFetch = this.refreshServerCapabilities();
+    await Promise.all([configFetch, capabilityFetch]);
+  }
+
+  private async fetchClientConfig(): Promise<void> {
+    this.configAbortController?.abort();
+    const controller = new AbortController();
+    this.configAbortController = controller;
+    const generation = this.runtimeServerGeneration;
+
     try {
-      const res = await apiFetch('/api/v1/client/config');
+      const res = await apiFetch('/api/v1/client/config', {
+        signal: controller.signal,
+      });
+      if (!this.isCurrentConfigRequest(controller, generation)) return;
       if (!res.ok) {
         console.warn('[ClientConfig] Fetch failed');
         return;
       }
 
       const data: ServerConfigResponse = await res.json();
-      const serverCapabilities = await this.fetchServerCapabilities();
+      if (!this.isCurrentConfigRequest(controller, generation)) return;
       // Snapshot the previous config so we can decide whether to log a
       // change. Polling fires every 5 minutes; without this gate the
       // [ClientConfig] Updated config line spammed the console every poll
@@ -148,8 +163,7 @@ class ClientConfigService {
         prevState.mediaPlaneUrl !== data.mediaPlaneUrl ||
         prevState.spaIpcContract !== nextSpaIpcContract ||
         JSON.stringify(prevState.featureFlags) !== JSON.stringify(data.featureFlags) ||
-        JSON.stringify(prevState.turn) !== JSON.stringify(nextTurn) ||
-        JSON.stringify(prevState.serverCapabilities) !== JSON.stringify(serverCapabilities);
+        JSON.stringify(prevState.turn) !== JSON.stringify(nextTurn);
 
       useClientConfigStore.getState().setConfig({
         minVersion: data.minVersion,
@@ -158,7 +172,6 @@ class ClientConfigService {
         turn: nextTurn,
         spaUrl: nextSpaUrl,
         spaIpcContract: nextSpaIpcContract,
-        serverCapabilities,
       });
 
       // SPA updates are applied through main's spaUpdate bridge so the shell
@@ -179,18 +192,88 @@ class ClientConfigService {
         console.debug('[ClientConfig] Updated config');
       }
     } catch (err) {
-      console.warn('[ClientConfig] Fetch error:', err instanceof Error ? err.message : 'unknown');
+      if (this.isCurrentConfigRequest(controller, generation)) {
+        console.warn('[ClientConfig] Fetch error:', err instanceof Error ? err.message : 'unknown');
+      }
+    } finally {
+      if (this.configAbortController === controller) {
+        this.configAbortController = null;
+      }
     }
   }
 
-  private async fetchServerCapabilities(): Promise<ServerCapabilities | null> {
+  async refreshServerCapabilities(): Promise<void> {
+    this.capabilityAbortController?.abort();
+    const controller = new AbortController();
+    this.capabilityAbortController = controller;
+    const generation = this.runtimeServerGeneration;
+
     try {
-      const res = await apiFetch('/api/v1/server/capabilities');
-      if (!res.ok) return null;
-      return normalizeServerCapabilities(await res.json());
+      const res = await apiFetch('/api/v1/server/capabilities', {
+        signal: controller.signal,
+      });
+      if (!this.isCurrentCapabilityRequest(controller, generation)) return;
+      if (!res.ok) {
+        this.setCapabilityError();
+        return;
+      }
+
+      const parsed = ServerCapabilitiesSchema.safeParse(await res.json());
+      if (!this.isCurrentCapabilityRequest(controller, generation)) return;
+      if (!parsed.success) {
+        this.setCapabilityError();
+        return;
+      }
+
+      const capabilities: ServerCapabilities = parsed.data;
+      const store = useClientConfigStore.getState();
+      store.setServerCapabilities(capabilities);
+      store.setActivityHistoryCapability(
+        capabilities.features.activityHistorySupported === true
+          ? { status: 'supported' }
+          : { status: 'confirmed-unsupported' }
+      );
     } catch {
-      return null;
+      if (this.isCurrentCapabilityRequest(controller, generation)) {
+        this.setCapabilityError();
+      }
+    } finally {
+      if (this.capabilityAbortController === controller) {
+        this.capabilityAbortController = null;
+      }
     }
+  }
+
+  resetAndRefreshRuntimeServer(): Promise<void> {
+    this.configAbortController?.abort();
+    this.configAbortController = null;
+    this.capabilityAbortController?.abort();
+    this.capabilityAbortController = null;
+    this.runtimeServerGeneration += 1;
+    useClientConfigStore.getState().resetForRuntimeServer();
+    return this.fetch();
+  }
+
+  private isCurrentConfigRequest(controller: AbortController, generation: number): boolean {
+    return this.configAbortController === controller && this.runtimeServerGeneration === generation;
+  }
+
+  private isCurrentCapabilityRequest(controller: AbortController, generation: number): boolean {
+    return (
+      this.capabilityAbortController === controller && this.runtimeServerGeneration === generation
+    );
+  }
+
+  private setCapabilityError(): void {
+    const store = useClientConfigStore.getState();
+    const previous = store.activityHistoryCapability;
+    store.setServerCapabilities(null);
+    store.setActivityHistoryCapability({
+      status: 'error',
+      lastConfirmedSupported:
+        previous.status === 'supported' ||
+        (previous.status === 'error' && previous.lastConfirmedSupported),
+    });
   }
 
   /** Start polling. Safe to call multiple times — stops previous timers first. */
@@ -222,6 +305,10 @@ class ClientConfigService {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    this.configAbortController?.abort();
+    this.configAbortController = null;
+    this.capabilityAbortController?.abort();
+    this.capabilityAbortController = null;
     globalThis.removeEventListener?.('focus', this.focusListener);
     globalThis.document?.removeEventListener?.('visibilitychange', this.visibilityListener);
     this.lastSpaCheckAt = Number.NEGATIVE_INFINITY;

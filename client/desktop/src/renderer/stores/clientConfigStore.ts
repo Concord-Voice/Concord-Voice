@@ -21,21 +21,34 @@ export interface ServerCapabilities {
   auth: {
     oauthProviders: string[];
   };
+  features: {
+    activityHistorySupported?: boolean;
+  };
 }
 
-interface ClientConfigState {
+export type ActivityHistoryCapabilityState =
+  | { status: 'loading' }
+  | { status: 'supported' }
+  | { status: 'confirmed-unsupported' }
+  | { status: 'error'; lastConfirmedSupported: boolean };
+
+interface ClientConfig {
   minVersion: string;
   featureFlags: FeatureFlags;
   mediaPlaneUrl: string;
   turn: TURNConfig;
   spaUrl: string;
   spaIpcContract: number;
+}
+
+interface ClientConfigState extends ClientConfig {
   serverCapabilities: ServerCapabilities | null;
+  activityHistoryCapability: ActivityHistoryCapabilityState;
   lastFetchedAt: number | null;
-  setConfig: (
-    config: Omit<ClientConfigState, 'lastFetchedAt' | 'setConfig' | 'setServerCapabilities'>
-  ) => void;
+  setConfig: (config: ClientConfig) => void;
   setServerCapabilities: (capabilities: ServerCapabilities | null) => void;
+  setActivityHistoryCapability: (capability: ActivityHistoryCapabilityState) => void;
+  resetForRuntimeServer: () => void;
 }
 
 export const useClientConfigStore = createStore<ClientConfigState>()((set) => ({
@@ -46,7 +59,21 @@ export const useClientConfigStore = createStore<ClientConfigState>()((set) => ({
   spaUrl: '',
   spaIpcContract: 0,
   serverCapabilities: null,
+  activityHistoryCapability: { status: 'loading' },
   lastFetchedAt: null,
   setConfig: (config) => set({ ...config, lastFetchedAt: Date.now() }),
   setServerCapabilities: (serverCapabilities) => set({ serverCapabilities }),
+  setActivityHistoryCapability: (activityHistoryCapability) => set({ activityHistoryCapability }),
+  resetForRuntimeServer: () =>
+    set({
+      minVersion: '',
+      featureFlags: {},
+      mediaPlaneUrl: '',
+      turn: { host: '', realm: '' },
+      spaUrl: '',
+      spaIpcContract: 0,
+      serverCapabilities: null,
+      activityHistoryCapability: { status: 'loading' },
+      lastFetchedAt: null,
+    }),
 }));

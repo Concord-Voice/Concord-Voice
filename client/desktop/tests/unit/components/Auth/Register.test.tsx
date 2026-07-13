@@ -71,6 +71,7 @@ describe('Register', () => {
     resetAllStores();
     useClientConfigStore.getState().setServerCapabilities({
       auth: { oauthProviders: ['google', 'apple'] },
+      features: {},
     });
     usePendingRegistrationStore.getState().clearPending();
   });
@@ -439,6 +440,7 @@ describe('Register', () => {
   it('renders only SSO providers advertised by server capabilities', () => {
     useClientConfigStore.getState().setServerCapabilities({
       auth: { oauthProviders: ['apple'] },
+      features: {},
     });
 
     render(<Register onBack={onBack} onSuccess={onSuccess} onSwitchToLogin={onSwitchToLogin} />);

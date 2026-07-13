@@ -123,6 +123,63 @@ func TestGetCapabilities_EmptyArraysMarshalNotNull(t *testing.T) {
 	assert.Equal(t, "[]", string(auth["oauthProviders"]), "must be [] not null")
 }
 
+func TestGetCapabilities_ActivityHistorySupportedTrueOrOmitted(t *testing.T) {
+	tests := []struct {
+		name        string
+		cfg         *config.Config
+		wantPresent bool
+	}{
+		{
+			name: "validated single replica gate",
+			cfg: &config.Config{
+				ActivityHistoryClusterEnabled:    true,
+				ControlPlaneReplicaCount:         1,
+				ControlPlaneReplicaCountExplicit: true,
+			},
+			wantPresent: true,
+		},
+		{
+			name: "gate disabled",
+			cfg: &config.Config{
+				ControlPlaneReplicaCount:         1,
+				ControlPlaneReplicaCountExplicit: true,
+			},
+		},
+		{
+			name: "manual config missing explicit count",
+			cfg: &config.Config{
+				ActivityHistoryClusterEnabled: true,
+				ControlPlaneReplicaCount:      1,
+			},
+		},
+		{
+			name: "manual config has wrong count",
+			cfg: &config.Config{
+				ActivityHistoryClusterEnabled:    true,
+				ControlPlaneReplicaCount:         2,
+				ControlPlaneReplicaCountExplicit: true,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w, c := newTestContext()
+			servercapabilities.NewHandler(tc.cfg).GetCapabilities(c)
+
+			var raw struct {
+				Features map[string]json.RawMessage `json:"features"`
+			}
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+			value, present := raw.Features["activityHistorySupported"]
+			assert.Equal(t, tc.wantPresent, present)
+			if tc.wantPresent {
+				assert.JSONEq(t, "true", string(value))
+			}
+		})
+	}
+}
+
 // Route-level integration tests: prove the public route is registered on the
 // real router and that its shape does not depend on auth state (#662 AC).
 

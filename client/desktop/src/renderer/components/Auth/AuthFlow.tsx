@@ -5,7 +5,7 @@ import { useAuthStore } from '../../stores/authStore';
 import { useUserStore, UserProfile } from '../../stores/userStore';
 import { usePendingRegistrationStore } from '../../stores/pendingRegistrationStore';
 import { useSSOStore } from '../../stores/ssoStore';
-import { useClientConfigStore } from '../../stores/clientConfigStore';
+import { clientConfigService } from '../../services/clientConfigService';
 import { resetRuntimeServerBase, setRuntimeServerBase } from '../../services/runtimeServerBase';
 import ConnectionSelector from './ConnectionSelector';
 import ServerInput from './ServerInput';
@@ -117,12 +117,13 @@ const AuthFlow: React.FC = () => {
 
   const handleServerConnect = (url: string) => {
     setRuntimeServerBase(url);
-    useClientConfigStore.getState().setServerCapabilities(null);
+    void clientConfigService.resetAndRefreshRuntimeServer();
     setStep('hosted-login');
   };
 
   const handleBack = () => {
     resetRuntimeServerBase();
+    void clientConfigService.resetAndRefreshRuntimeServer();
     setStep('connection-select');
   };
 

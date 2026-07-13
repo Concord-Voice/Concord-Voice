@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/users"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
@@ -46,6 +47,11 @@ func TestGetPresenceOverridesDBError(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	cleanup()
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
+	if err := service.BindDelivery(immediatePresenceDelivery{}); err != nil {
+		t.Fatal(err)
+	}
+	h.SetPresenceHistory(service)
 
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
@@ -63,6 +69,11 @@ func TestReplacePresenceOverridesDBError(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	cleanup()
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
+	if err := service.BindDelivery(immediatePresenceDelivery{}); err != nil {
+		t.Fatal(err)
+	}
+	h.SetPresenceHistory(service)
 
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
@@ -77,6 +88,32 @@ func TestReplacePresenceOverridesDBError(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	h.ReplacePresenceOverrides(c)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestUpdatePresenceSettingsDBError(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	cleanup()
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
+	if err := service.BindDelivery(immediatePresenceDelivery{}); err != nil {
+		t.Fatal(err)
+	}
+	h.SetPresenceHistory(service)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("user_id", uuid.NewString())
+	c.Request = httptest.NewRequest(
+		http.MethodPatch,
+		"/api/v1/users/me/presence-settings",
+		strings.NewReader(`{"custom_text_tier":1,"custom_text":"must not commit"}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.UpdatePresenceSettings(c)
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }

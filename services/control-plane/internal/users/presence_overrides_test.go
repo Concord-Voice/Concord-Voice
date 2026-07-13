@@ -2,6 +2,7 @@ package users_test
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"io"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/users"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
@@ -30,8 +32,23 @@ type presenceOverridePUTBody struct {
 	ExcludedUserIDs []string `json:"excluded_user_ids"`
 }
 
+type immediatePresenceDelivery struct{}
+
+func (immediatePresenceDelivery) DeliverCustomText(
+	_ context.Context,
+	plan presencehistory.DeliveryPlan,
+) (presencehistory.DeliveryAck, error) {
+	return presencehistory.DeliveryAck{OperationID: plan.OperationID}, nil
+}
+
 func directPresenceOverrideHandler(db *sql.DB) *users.Handler {
-	return users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	handler := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
+	if err := service.BindDelivery(immediatePresenceDelivery{}); err != nil {
+		panic(err)
+	}
+	handler.SetPresenceHistory(service)
+	return handler
 }
 
 func invokePresenceOverridePUT(

@@ -19,6 +19,12 @@ vi.mock('@/renderer/hooks/useAgeStatus', () => ({
   useAgeStatus: () => ({ nsfwAuth: 'unknown' }),
 }));
 
+vi.mock('@/renderer/components/Profile/PresenceHistorySection', () => ({
+  default: ({ userId }: { userId: string | null }) => (
+    <section aria-label="Self Activity History" data-user-id={userId ?? ''} />
+  ),
+}));
+
 import AccountSection from '@/renderer/components/Settings/AccountSection';
 
 // Profile/password form behavior, exercised through their new host AccountSection ▸
@@ -42,6 +48,15 @@ describe('AccountSection ▸ My Profile', () => {
   it('renders the My Profile section title', () => {
     render(<AccountSection />);
     expect(screen.getByText('My Profile')).toBeInTheDocument();
+  });
+
+  it('keeps the self-history feed in My Profile and scopes it to the profile owner', () => {
+    render(<AccountSection />);
+
+    const history = screen.getByLabelText('Self Activity History');
+    const profileDetails = screen.getByText('My Profile').closest('details');
+    expect(history).toHaveAttribute('data-user-id', mockUser.id);
+    expect(profileDetails).toContainElement(history);
   });
 
   it('renders profile information section', () => {

@@ -1,6 +1,7 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { resetAllStores } from '../../helpers/store-helpers';
 
 // Mock apiFetch
 vi.mock('@/renderer/services/apiClient', () => ({
@@ -12,6 +13,42 @@ import { apiFetch } from '@/renderer/services/apiClient';
 const mockApiFetch = vi.mocked(apiFetch);
 const mockSpaCheckForUpdate = vi.fn();
 const mockSpaReloadLatest = vi.fn();
+const MISSING_ACTIVITY_HISTORY_CAPABILITY = Symbol('missing-activity-history-capability');
+
+function serverCapabilitiesPayload(
+  activityHistorySupported:
+    unknown | typeof MISSING_ACTIVITY_HISTORY_CAPABILITY = MISSING_ACTIVITY_HISTORY_CAPABILITY
+): unknown {
+  return {
+    server: { name: 'Concord Voice', version: 'test', instanceType: 'saas' },
+    auth: {
+      emailVerificationRequired: true,
+      oauthProviders: ['google'],
+    },
+    features: {
+      voiceTiersSupported: true,
+      ...(activityHistorySupported === MISSING_ACTIVITY_HISTORY_CAPABILITY
+        ? {}
+        : { activityHistorySupported }),
+    },
+    policyVersion: 'test',
+  };
+}
+
+function jsonResponse(payload: unknown): Response {
+  return {
+    ok: true,
+    json: () => Promise.resolve(payload),
+  } as Response;
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolvePromise: (value: T) => void = () => {};
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
+}
 
 async function flushFetchPath(): Promise<void> {
   for (let i = 0; i < 8; i += 1) {
@@ -26,6 +63,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
   clientConfigService.stop();
+  resetAllStores();
   useClientConfigStore.setState({
     minVersion: '',
     featureFlags: {},
@@ -34,6 +72,7 @@ beforeEach(() => {
     spaUrl: '',
     spaIpcContract: 0,
     serverCapabilities: null,
+    activityHistoryCapability: { status: 'loading' },
     lastFetchedAt: null,
   });
   useVoiceStore.setState({
@@ -97,21 +136,37 @@ describe('clientConfigService', () => {
         } as Response)
         .mockResolvedValueOnce({
           ok: true,
-          json: () => Promise.resolve({ auth: { oauthProviders: ['google'] } }),
+          json: () =>
+            Promise.resolve({
+              auth: { oauthProviders: ['google'] },
+              features: {},
+            }),
         } as Response);
 
       await clientConfigService.fetch();
 
-      expect(mockApiFetch).toHaveBeenNthCalledWith(1, '/api/v1/client/config');
-      expect(mockApiFetch).toHaveBeenNthCalledWith(2, '/api/v1/server/capabilities');
+      expect(mockApiFetch).toHaveBeenNthCalledWith(
+        1,
+        '/api/v1/client/config',
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      );
+      expect(mockApiFetch).toHaveBeenNthCalledWith(
+        2,
+        '/api/v1/server/capabilities',
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      );
       expect(useClientConfigStore.getState().serverCapabilities).toEqual({
         auth: { oauthProviders: ['google'] },
+        features: {},
       });
     });
 
     it('fails closed to null server capabilities when the capabilities request fails', async () => {
       useClientConfigStore.setState({
-        serverCapabilities: { auth: { oauthProviders: ['google', 'apple'] } },
+        serverCapabilities: {
+          auth: { oauthProviders: ['google', 'apple'] },
+          features: {},
+        },
       });
       mockApiFetch
         .mockResolvedValueOnce({
@@ -131,6 +186,233 @@ describe('clientConfigService', () => {
       await clientConfigService.fetch();
 
       expect(useClientConfigStore.getState().serverCapabilities).toBeNull();
+    });
+  });
+
+  describe('Activity History capability discovery', () => {
+    it('records a valid true capability as supported', async () => {
+      mockApiFetch.mockResolvedValueOnce(jsonResponse(serverCapabilitiesPayload(true)));
+
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'supported',
+      });
+      expect(useClientConfigStore.getState().serverCapabilities).toEqual({
+        auth: { oauthProviders: ['google'] },
+        features: { activityHistorySupported: true },
+      });
+    });
+
+    it.each([
+      ['missing', MISSING_ACTIVITY_HISTORY_CAPABILITY],
+      ['false', false],
+    ])('records a valid %s capability as confirmed unsupported', async (_name, value) => {
+      mockApiFetch.mockResolvedValueOnce(jsonResponse(serverCapabilitiesPayload(value)));
+
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'confirmed-unsupported',
+      });
+    });
+
+    it.each([
+      ['non-boolean value', serverCapabilitiesPayload('true')],
+      ['null root', null],
+      ['array root', []],
+      ['missing features object', { auth: { oauthProviders: [] } }],
+      ['array features value', { auth: { oauthProviders: [] }, features: [] }],
+    ])('rejects a malformed %s', async (_name, payload) => {
+      mockApiFetch.mockResolvedValueOnce(jsonResponse(payload));
+
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().serverCapabilities).toBeNull();
+      expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'error',
+        lastConfirmedSupported: false,
+      });
+    });
+
+    it('treats invalid JSON as an explicit capability error', async () => {
+      mockApiFetch.mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.reject(new SyntaxError('invalid JSON')),
+      } as Response);
+
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'error',
+        lastConfirmedSupported: false,
+      });
+    });
+
+    it('treats a non-2xx response as an explicit capability error', async () => {
+      mockApiFetch.mockResolvedValueOnce({ ok: false, status: 503 } as Response);
+
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'error',
+        lastConfirmedSupported: false,
+      });
+    });
+
+    it('treats a network failure as an explicit capability error', async () => {
+      mockApiFetch.mockRejectedValueOnce(new Error('network unavailable'));
+
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'error',
+        lastConfirmedSupported: false,
+      });
+    });
+
+    it('discovers capability support even when client config fails', async () => {
+      mockApiFetch
+        .mockRejectedValueOnce(new Error('client config unavailable'))
+        .mockResolvedValueOnce(jsonResponse(serverCapabilitiesPayload(true)));
+
+      await clientConfigService.fetch();
+
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+      expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'supported',
+      });
+    });
+
+    it('recovers from an error when an explicit retry succeeds', async () => {
+      mockApiFetch
+        .mockResolvedValueOnce({ ok: false, status: 503 } as Response)
+        .mockResolvedValueOnce(jsonResponse(serverCapabilitiesPayload(true)));
+
+      await clientConfigService.refreshServerCapabilities();
+      expect(useClientConfigStore.getState().activityHistoryCapability.status).toBe('error');
+
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'supported',
+      });
+    });
+
+    it('preserves last-confirmed support when a later refresh errors', async () => {
+      mockApiFetch
+        .mockResolvedValueOnce(jsonResponse(serverCapabilitiesPayload(true)))
+        .mockRejectedValueOnce(new Error('network unavailable'));
+
+      await clientConfigService.refreshServerCapabilities();
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'error',
+        lastConfirmedSupported: true,
+      });
+    });
+
+    it('does not flicker a confirmed state to loading during a background refresh', async () => {
+      useClientConfigStore.setState({
+        activityHistoryCapability: { status: 'supported' },
+      });
+      const pending = deferred<Response>();
+      mockApiFetch.mockReturnValueOnce(pending.promise);
+
+      const refresh = clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'supported',
+      });
+
+      pending.resolve(jsonResponse(serverCapabilitiesPayload(false)));
+      await refresh;
+      expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'confirmed-unsupported',
+      });
+    });
+
+    it('aborts stale config and capabilities and refreshes both after a server switch', async () => {
+      const oldConfig = deferred<Response>();
+      const oldCapabilities = deferred<Response>();
+      const newConfig = deferred<Response>();
+      const newCapabilities = deferred<Response>();
+      mockApiFetch
+        .mockReturnValueOnce(oldConfig.promise)
+        .mockReturnValueOnce(oldCapabilities.promise)
+        .mockReturnValueOnce(newConfig.promise)
+        .mockReturnValueOnce(newCapabilities.promise);
+
+      const oldFetch = clientConfigService.fetch();
+      const oldConfigSignal = (mockApiFetch.mock.calls[0]?.[1] as RequestInit | undefined)?.signal;
+      const oldCapabilitySignal = (mockApiFetch.mock.calls[1]?.[1] as RequestInit | undefined)
+        ?.signal;
+
+      useClientConfigStore.setState({
+        minVersion: '0.2.0',
+        featureFlags: { gifsEnabled: false },
+        mediaPlaneUrl: 'https://old-stored-media.test',
+        turn: { host: 'old-stored-turn.test', realm: 'old' },
+        spaUrl: 'https://old-spa.test',
+        spaIpcContract: 16,
+        lastFetchedAt: 1,
+      });
+
+      const switchedRefresh = clientConfigService.resetAndRefreshRuntimeServer();
+
+      expect(oldConfigSignal?.aborted).toBe(true);
+      expect(oldCapabilitySignal?.aborted).toBe(true);
+      expect(useClientConfigStore.getState()).toMatchObject({
+        minVersion: '',
+        featureFlags: {},
+        mediaPlaneUrl: '',
+        turn: { host: '', realm: '' },
+        spaUrl: '',
+        spaIpcContract: 0,
+        lastFetchedAt: null,
+      });
+      expect(mockApiFetch).toHaveBeenNthCalledWith(
+        3,
+        '/api/v1/client/config',
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      );
+      expect(mockApiFetch).toHaveBeenNthCalledWith(
+        4,
+        '/api/v1/server/capabilities',
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      );
+
+      newConfig.resolve(
+        jsonResponse({
+          minVersion: '0.3.0',
+          featureFlags: { gifsEnabled: true },
+          mediaPlaneUrl: 'https://new-media.test',
+          turn: { host: 'new-turn.test', realm: 'new' },
+          spaUrl: '',
+          spaIpcContract: 17,
+        })
+      );
+      newCapabilities.resolve(jsonResponse(serverCapabilitiesPayload(true)));
+      await switchedRefresh;
+
+      oldConfig.resolve(
+        jsonResponse({
+          minVersion: '0.2.0',
+          featureFlags: { gifsEnabled: false },
+          mediaPlaneUrl: 'https://old-media.test',
+          turn: { host: 'old-turn.test', realm: 'old' },
+          spaUrl: '',
+          spaIpcContract: 16,
+        })
+      );
+      oldCapabilities.resolve(jsonResponse(serverCapabilitiesPayload(false)));
+      await oldFetch;
+
+      expect(useClientConfigStore.getState().mediaPlaneUrl).toBe('https://new-media.test');
+      expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
+        status: 'supported',
+      });
     });
   });
 
@@ -307,8 +589,16 @@ describe('clientConfigService', () => {
       await vi.advanceTimersByTimeAsync(2_000);
       await flushFetchPath();
       expect(mockApiFetch).toHaveBeenCalledTimes(2);
-      expect(mockApiFetch).toHaveBeenNthCalledWith(1, '/api/v1/client/config');
-      expect(mockApiFetch).toHaveBeenNthCalledWith(2, '/api/v1/server/capabilities');
+      expect(mockApiFetch).toHaveBeenNthCalledWith(
+        1,
+        '/api/v1/client/config',
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      );
+      expect(mockApiFetch).toHaveBeenNthCalledWith(
+        2,
+        '/api/v1/server/capabilities',
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      );
       expect(mockSpaCheckForUpdate).toHaveBeenCalledTimes(1);
 
       await vi.advanceTimersByTimeAsync(5 * 60 * 1000);

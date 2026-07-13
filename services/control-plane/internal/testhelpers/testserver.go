@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/api"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/auth"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
@@ -67,10 +68,11 @@ func (s *SyncBuffer) Reset() {
 
 // TestServer wraps a fully-wired Gin router with a real DB and Redis for integration testing.
 type TestServer struct {
-	Router *gin.Engine
-	Hub    *websocket.Hub
-	DB     *sql.DB
-	Redis  *redis.Client
+	Router          *gin.Engine
+	Hub             *websocket.Hub
+	DB              *sql.DB
+	Redis           *redis.Client
+	PresenceHistory *presencehistory.Service
 
 	// logBuf captures all structured-log output emitted by handlers during the
 	// test. It is written alongside os.Stdout via an io.MultiWriter so human
@@ -91,14 +93,17 @@ func SetupTestServer(t *testing.T) *TestServer {
 	redisClient, redisCleanup := SetupTestRedis(t)
 
 	cfg := &config.Config{
-		Environment:       "test",
-		Port:              "0",
-		JWTSecret:         TestJWTSecret,
-		AllowedOrigins:    []string{"*"},
-		InstanceType:      os.Getenv("INSTANCE_TYPE"),
-		MFAEncryptionKey:  "0000000000000000000000000000000000000000000000000000000000000000",
-		WebAuthnRPID:      "localhost",
-		WebAuthnRPOrigins: []string{"http://localhost:3001"},
+		Environment:                      "test",
+		Port:                             "0",
+		JWTSecret:                        TestJWTSecret,
+		AllowedOrigins:                   []string{"*"},
+		InstanceType:                     os.Getenv("INSTANCE_TYPE"),
+		MFAEncryptionKey:                 "0000000000000000000000000000000000000000000000000000000000000000",
+		WebAuthnRPID:                     "localhost",
+		WebAuthnRPOrigins:                []string{"http://localhost:3001"},
+		ActivityHistoryClusterEnabled:    true,
+		ControlPlaneReplicaCount:         1,
+		ControlPlaneReplicaCountExplicit: true,
 	}
 
 	// Route logs through a MultiWriter: humans running `go test -v` still see
@@ -107,7 +112,21 @@ func SetupTestServer(t *testing.T) *TestServer {
 	logBuf := &SyncBuffer{}
 	log := logger.NewWithWriter(io.MultiWriter(os.Stdout, logBuf))
 
-	router, hub, natsClient, opsRuntime := api.NewRouter(db, redisClient, nil, cfg, nil, log)
+	disclosure := presencehistory.BuildDisclosure(presencehistory.DisclosureOptions{InstanceType: "saas"})
+	presenceHistoryService := presencehistory.NewService(db, disclosure, true)
+
+	// Register dependency cleanup first so LIFO execution closes Hub, then
+	// operations metrics and NATS, before Redis/DB.
+	t.Cleanup(func() {
+		redisCleanup()
+		dbCleanup()
+	})
+	router, hub, natsClient, opsRuntime, err := api.NewRouter(
+		db, redisClient, nil, cfg, nil, log, presenceHistoryService,
+	)
+	if err != nil {
+		t.Fatalf("testhelpers: initialize router: %v", err)
+	}
 	if natsClient != nil {
 		t.Cleanup(func() { natsClient.Close() })
 	}
@@ -117,21 +136,17 @@ func SetupTestServer(t *testing.T) *TestServer {
 		}
 	})
 
-	t.Cleanup(func() {
-		redisCleanup()
-		dbCleanup()
-	})
-
-	// Shut down the hub goroutine and wait for Run() to exit BEFORE Redis/DB
-	// are torn down. t.Cleanup runs in LIFO order, so registered-last runs first.
+	// Shut down the hub goroutine before operations metrics, NATS, Redis, and DB.
+	// t.Cleanup runs in LIFO order, so registered-last runs first.
 	t.Cleanup(func() { hub.Shutdown() })
 
 	return &TestServer{
-		Router: router,
-		Hub:    hub,
-		DB:     db,
-		Redis:  redisClient,
-		logBuf: logBuf,
+		Router:          router,
+		Hub:             hub,
+		DB:              db,
+		Redis:           redisClient,
+		PresenceHistory: presenceHistoryService,
+		logBuf:          logBuf,
 	}
 }
 

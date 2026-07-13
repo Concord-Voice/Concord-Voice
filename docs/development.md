@@ -398,6 +398,14 @@ lsof -ti:5432 | xargs kill -9
 | `INSTANCE_TYPE` | `saas` | Deployment/entitlement mode (`saas` or `self-hosted`) |
 | `SERVER_VERSION` | `dev` | Advertised server version for capability discovery |
 | `NATS_URL` | `nats://localhost:4222` | NATS connection |
+| `ACTIVITY_HISTORY_CLUSTER_ENABLED` | `false` | Global Activity History rollout gate; keep false for ordinary development unless testing the guarded single-replica path |
+| `CONTROL_PLANE_REPLICA_COUNT` | unset (Compose: `1`) | Explicit control-plane replica contract; Activity History requires the environment value to be explicitly set to exactly one when the gate is enabled |
+| `ACTIVITY_HISTORY_OPERATOR_NAME` | empty | Self-host disclosure operator; required before new Activity History opt-in is available (`Concord Voice LLC` is reserved for SaaS) |
+| `ACTIVITY_HISTORY_PRIVACY_POLICY_URL` | empty | Self-host disclosure URL; absolute HTTPS is required outside loopback development/test |
+
+Activity History stays off by default. For SaaS, the operator and privacy URL are
+fixed by the binary. For self-hosted development, invalid or missing disclosure
+keeps new opt-in unavailable without preventing existing history reads or deletion.
 
 ### Operations Metrics (Control Plane, Media Plane, and Ops Agent)
 
@@ -569,7 +577,7 @@ Recommended:
 
 ## Next Steps
 
-- Read [API Documentation](./api/) — OpenAPI 3.0 spec (partial: 88 operations documented; 269 routes implemented)
+- Read [API Documentation](./api/) — OpenAPI 3.0 specification with full live-route coverage enforced by `scripts/api/check-openapi-coverage.sh`
 - Review [Architecture](./architecture.md) — System diagrams, database ERD, message flows
 - Check [Contributing Guidelines](../.github/CONTRIBUTING.md)
 - Join the Discord for discussions

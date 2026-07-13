@@ -95,7 +95,12 @@ func TestIsSelfHostedInstance(t *testing.T) {
 
 func TestLoad(t *testing.T) {
 	// Save and unset all env vars to test defaults
-	envVars := []string{"ENVIRONMENT", "PORT", "DATABASE_URL", "REDIS_URL", "JWT_SECRET", "NATS_URL", "ALLOWED_ORIGINS", "TRUSTED_PROXY_CIDRS"}
+	envVars := []string{
+		"ENVIRONMENT", "PORT", "DATABASE_URL", "REDIS_URL", "JWT_SECRET", "NATS_URL",
+		"ALLOWED_ORIGINS", "TRUSTED_PROXY_CIDRS", "ACTIVITY_HISTORY_CLUSTER_ENABLED",
+		"CONTROL_PLANE_REPLICA_COUNT", "ACTIVITY_HISTORY_OPERATOR_NAME",
+		"ACTIVITY_HISTORY_PRIVACY_POLICY_URL",
+	}
 	saved := make(map[string]string)
 	for _, key := range envVars {
 		saved[key] = os.Getenv(key)

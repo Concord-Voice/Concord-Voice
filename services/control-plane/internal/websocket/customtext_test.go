@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	gorillaws "github.com/gorilla/websocket"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -98,6 +99,23 @@ func updateCustomText(t *testing.T, db *sql.DB, userID uuid.UUID, tier int, text
 	require.NoError(t, err)
 }
 
+func insertCustomTextPendingOperation(t *testing.T, db *sql.DB, senderID uuid.UUID) uuid.UUID {
+	t.Helper()
+	operationID := uuid.New()
+	_, err := db.Exec(`
+		INSERT INTO presence_settings_pending_operations (
+			user_id,
+			operation_id,
+			prior_settings_version,
+			created_at,
+			reconcile_after
+		)
+		VALUES ($1, $2, 0, clock_timestamp(), clock_timestamp() + INTERVAL '30 seconds')
+	`, senderID, operationID)
+	require.NoError(t, err)
+	return operationID
+}
+
 func excludeCustomTextViewer(t *testing.T, db *sql.DB, senderID, viewerID uuid.UUID) {
 	t.Helper()
 	_, err := db.Exec(`
@@ -151,295 +169,39 @@ func awaitCustomTextSignal[T any](t *testing.T, ch <-chan T) T {
 	}
 }
 
-type observingCustomTextDeliveryCoordinator struct {
-	mu       sync.Mutex
-	attempts chan uuid.UUID
-}
-
-func (c *observingCustomTextDeliveryCoordinator) WithSender(senderID uuid.UUID, fn func()) {
-	c.attempts <- senderID
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	fn()
-}
-
-type reorderingCustomTextDeliveryCoordinator struct {
-	callMu        sync.Mutex
-	calls         int
-	firstAttempt  chan struct{}
-	releaseFirst  chan struct{}
-	secondAttempt chan struct{}
-	releaseSecond chan struct{}
-	mu            sync.Mutex
-}
-
-func (c *reorderingCustomTextDeliveryCoordinator) WithSender(_ uuid.UUID, fn func()) {
-	c.callMu.Lock()
-	c.calls++
-	call := c.calls
-	c.callMu.Unlock()
-
-	switch call {
-	case 1:
-		close(c.firstAttempt)
-		<-c.releaseFirst
-	case 2:
-		close(c.secondAttempt)
-		<-c.releaseSecond
+func awaitClientMessageType(t *testing.T, client *Client, messageType string) map[string]interface{} {
+	t.Helper()
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case raw, ok := <-client.Send:
+			require.True(t, ok, "client queue closed before %s", messageType)
+			var message map[string]interface{}
+			require.NoError(t, json.Unmarshal(raw, &message))
+			if message["type"] == messageType {
+				return message
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for %s", messageType)
+			return nil
+		}
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	fn()
 }
 
 func setupCustomTextHub(t *testing.T) (*Hub, *sql.DB) {
 	t.Helper()
 	db := setupHubTestDB(t)
 	redisClient := setupHubTestRedis(t)
-	return NewHub(db, redisClient), db
+	hub := NewHub(db, redisClient)
+	hub.SetPresenceHistoryService(presencehistory.NewService(db, presencehistory.DisclosureState{}, false))
+	return hub, db
 }
 
 // TestBroadcastCustomText_FriendsTier_AudienceVsNonAudience is the core B3
 // privacy lock. Sender at Friends tier (1): a friend RECEIVES the update; a
 // shared-server-only peer (NOT a friend) does NOT (Friends tier excludes
 // server-only peers); a stranger does NOT.
-func TestBroadcastCustomText_FriendsTier_AudienceVsNonAudience(t *testing.T) {
-	hub, db := setupCustomTextHub(t)
-
-	sender := insertCTUser(t, db, "ctsender")
-	friend := insertCTUser(t, db, "ctfriend")
-	serverPeer := insertCTUser(t, db, "ctserverpeer")
-	stranger := insertCTUser(t, db, "ctstranger")
-
-	// sender is friends with `friend`, shares a server with `serverPeer`, has no
-	// relation to `stranger`. Tier 1 (Friends) ⇒ only friend (+ FoF) is audience.
-	makeFriends(t, db, sender, friend)
-	shareServer(t, db, sender, sender, serverPeer)
-	setCustomText(t, db, sender, 1, "focusing", "🎯")
-
-	friendClient := connectClient(hub, friend)
-	serverPeerClient := connectClient(hub, serverPeer)
-	strangerClient := connectClient(hub, stranger)
-
-	hub.BroadcastCustomText(sender, 1, &CustomTextPayload{Text: "focusing", Emoji: "🎯"})
-
-	// Audience member (friend) RECEIVES the update.
-	msg := readClientMsg(t, friendClient)
-	assert.Equal(t, "rich_presence_update", msg["type"])
-	data := msg["data"].(map[string]interface{})
-	assert.Equal(t, sender.String(), data["user_id"])
-	assert.Equal(t, "custom_text", data["category"])
-	payload := data["payload"].(map[string]interface{})
-	assert.Equal(t, "focusing", payload["text"])
-	assert.Equal(t, "🎯", payload["emoji"])
-
-	// PRIVACY LOCK: a shared-server-only peer is NOT in a Friends-tier audience.
-	assertNoMessage(t, serverPeerClient)
-	// PRIVACY LOCK: a stranger is NOT in the audience.
-	assertNoMessage(t, strangerClient)
-}
-
-// TestBroadcastCustomText_ServersTier_IncludesServerPeer verifies that at tier 2
-// (Servers) a shared-server peer DOES receive the update — proving the tier is
-// honored, not hardcoded to Friends. A stranger still does NOT.
-func TestBroadcastCustomText_ServersTier_IncludesServerPeer(t *testing.T) {
-	hub, db := setupCustomTextHub(t)
-
-	sender := insertCTUser(t, db, "ctsender2")
-	serverPeer := insertCTUser(t, db, "ctserverpeer2")
-	stranger := insertCTUser(t, db, "ctstranger2")
-
-	shareServer(t, db, sender, sender, serverPeer)
-	setCustomText(t, db, sender, 2, "in a meeting", "")
-
-	serverPeerClient := connectClient(hub, serverPeer)
-	strangerClient := connectClient(hub, stranger)
-
-	hub.BroadcastCustomText(sender, 2, &CustomTextPayload{Text: "in a meeting"})
-
-	msg := readClientMsg(t, serverPeerClient)
-	assert.Equal(t, "rich_presence_update", msg["type"])
-	data := msg["data"].(map[string]interface{})
-	payload := data["payload"].(map[string]interface{})
-	assert.Equal(t, "in a meeting", payload["text"])
-	_, hasEmoji := payload["emoji"]
-	assert.False(t, hasEmoji, "emoji omitted when empty (matches optional() zod field)")
-
-	// PRIVACY LOCK: stranger still excluded even at Servers tier.
-	assertNoMessage(t, strangerClient)
-}
-
-// TestBroadcastCustomText_Clear emits rich_presence_clear to the audience when
-// the payload is nil (user turned custom text off / cleared the text).
-func TestBroadcastCustomText_Clear(t *testing.T) {
-	hub, db := setupCustomTextHub(t)
-
-	sender := insertCTUser(t, db, "ctclearsender")
-	friend := insertCTUser(t, db, "ctclearfriend")
-	stranger := insertCTUser(t, db, "ctclearstranger")
-
-	makeFriends(t, db, sender, friend)
-	// Tier 1 keeps the friend in the audience for the clear frame.
-	setCustomText(t, db, sender, 1, "was here", "")
-
-	friendClient := connectClient(hub, friend)
-	strangerClient := connectClient(hub, stranger)
-
-	hub.BroadcastCustomText(sender, 1, nil) // nil ⇒ clear (sender was at tier 1)
-
-	msg := readClientMsg(t, friendClient)
-	assert.Equal(t, "rich_presence_clear", msg["type"])
-	data := msg["data"].(map[string]interface{})
-	assert.Equal(t, sender.String(), data["user_id"])
-	assert.Equal(t, "custom_text", data["category"])
-	_, hasPayload := data["payload"]
-	assert.False(t, hasPayload, "clear frame carries no payload")
-
-	// PRIVACY LOCK: a non-audience user gets no clear frame either.
-	assertNoMessage(t, strangerClient)
-}
-
-func TestBroadcastCustomText_ExcludedViewerReceivesNoRepeatedClear(t *testing.T) {
-	hub, db := setupCustomTextHub(t)
-	sender := insertCTUser(t, db, "ctexcludededitsender")
-	excluded := insertCTUser(t, db, "ctexcludededitviewer")
-	makeFriends(t, db, sender, excluded)
-	setCustomText(t, db, sender, 1, "old private status", "")
-	excludeCustomTextViewer(t, db, sender, excluded)
-	excludedClient := connectClient(hub, excluded)
-
-	newText := "new private status"
-	updateCustomText(t, db, sender, 1, &newText, nil)
-	hub.BroadcastCustomText(sender, 1, &CustomTextPayload{Text: newText})
-
-	assertNoMessage(t, excludedClient)
-}
-
-func TestBroadcastCustomText_ExcludedViewerReceivesNoClearWhenStatusClears(t *testing.T) {
-	hub, db := setupCustomTextHub(t)
-	sender := insertCTUser(t, db, "ctexcludedclearsender")
-	excluded := insertCTUser(t, db, "ctexcludedclearviewer")
-	makeFriends(t, db, sender, excluded)
-	setCustomText(t, db, sender, 1, "private status", "")
-	excludeCustomTextViewer(t, db, sender, excluded)
-	excludedClient := connectClient(hub, excluded)
-
-	updateCustomText(t, db, sender, 1, nil, nil)
-	hub.BroadcastCustomText(sender, 1, nil)
-
-	assertNoMessage(t, excludedClient)
-}
-
-// TestBroadcastCustomText_SenderSelfReceives confirms the sender's own connected
-// devices receive their status (self-sync), like broadcastPresenceToAll.
-func TestBroadcastCustomText_SenderSelfReceives(t *testing.T) {
-	hub, db := setupCustomTextHub(t)
-
-	sender := insertCTUser(t, db, "ctselfsender")
-	setCustomText(t, db, sender, 1, "solo status", "")
-
-	selfClient := connectClient(hub, sender)
-
-	hub.BroadcastCustomText(sender, 1, &CustomTextPayload{Text: "solo status"})
-
-	msg := readClientMsg(t, selfClient)
-	assert.Equal(t, "rich_presence_update", msg["type"])
-	data := msg["data"].(map[string]interface{})
-	assert.Equal(t, sender.String(), data["user_id"])
-}
-
-func TestBroadcastCustomTextAudienceDelta_SendsOnlySetDifferences(t *testing.T) {
-	hub := dbFreeHub()
-	sender := uuid.New()
-	removed := uuid.New()
-	unchanged := uuid.New()
-	added := uuid.New()
-
-	removedClient := connectClient(hub, removed)
-	unchangedClient := connectClient(hub, unchanged)
-	addedClient := connectClient(hub, added)
-	senderClient := connectClient(hub, sender)
-
-	oldAudience := map[uuid.UUID]bool{removed: true, unchanged: true, sender: true}
-	newAudience := map[uuid.UUID]bool{unchanged: true, added: true}
-	hub.BroadcastCustomTextAudienceDelta(sender, oldAudience, newAudience, &CustomTextPayload{Text: "current status"})
-
-	removedMessage := readClientMsg(t, removedClient)
-	require.Equal(t, "rich_presence_clear", removedMessage["type"])
-	removedData := removedMessage["data"].(map[string]interface{})
-	require.Equal(t, sender.String(), removedData["user_id"])
-	require.Equal(t, "custom_text", removedData["category"])
-
-	addedMessage := readClientMsg(t, addedClient)
-	require.Equal(t, "rich_presence_update", addedMessage["type"])
-	addedData := addedMessage["data"].(map[string]interface{})
-	require.Equal(t, sender.String(), addedData["user_id"])
-	payload := addedData["payload"].(map[string]interface{})
-	require.Equal(t, "current status", payload["text"])
-
-	assertNoMessage(t, unchangedClient)
-	assertNoMessage(t, senderClient)
-}
-
-func TestBroadcastCustomTextAudienceDelta_NilPayloadClearsOnlyRemovals(t *testing.T) {
-	hub := dbFreeHub()
-	sender := uuid.New()
-	removed := uuid.New()
-	added := uuid.New()
-
-	removedClient := connectClient(hub, removed)
-	addedClient := connectClient(hub, added)
-
-	hub.BroadcastCustomTextAudienceDelta(
-		sender,
-		map[uuid.UUID]bool{removed: true},
-		map[uuid.UUID]bool{added: true},
-		nil,
-	)
-
-	removedMessage := readClientMsg(t, removedClient)
-	require.Equal(t, "rich_presence_clear", removedMessage["type"])
-	assertNoMessage(t, addedClient)
-}
-
-func TestBroadcastCustomTextAudienceDelta_FullQueuePreservesQueuedFrame(t *testing.T) {
-	hub := dbFreeHub()
-	sender := uuid.New()
-	removed := uuid.New()
-	client := connectClient(hub, removed)
-	client.Send = make(chan []byte, 1)
-	queuedUpdate, err := marshalCustomTextFrame(sender, &CustomTextPayload{Text: "stale"})
-	require.NoError(t, err)
-	client.Send <- queuedUpdate
-
-	hub.BroadcastCustomTextAudienceDelta(
-		sender,
-		map[uuid.UUID]bool{removed: true},
-		map[uuid.UUID]bool{},
-		nil,
-	)
-
-	assert.Equal(t, queuedUpdate, <-client.Send)
-}
-
-func TestBroadcastCustomText_FullQueuePreservesQueuedFrame(t *testing.T) {
-	hub, db := setupCustomTextHub(t)
-	sender := insertCTUser(t, db, "ctprioritysender")
-	viewer := insertCTUser(t, db, "ctpriorityviewer")
-	makeFriends(t, db, sender, viewer)
-	setCustomText(t, db, sender, 1, "private", "")
-	client := connectClient(hub, viewer)
-	client.Send = make(chan []byte, 1)
-	queuedUpdate, err := marshalCustomTextFrame(sender, &CustomTextPayload{Text: "stale"})
-	require.NoError(t, err)
-	client.Send <- queuedUpdate
-
-	hub.BroadcastCustomText(sender, 1, nil)
-
-	assert.Equal(t, queuedUpdate, <-client.Send)
-}
-
 func TestEnqueuePrivacyCritical_FullQueueNeverDequeuesExistingFrame(t *testing.T) {
 	queuedUpdate, err := marshalCustomTextFrame(uuid.New(), &CustomTextPayload{Text: "stale"})
 	require.NoError(t, err)
@@ -561,56 +323,186 @@ done:
 	assert.NotContains(t, seen, senderB.String(), "viewer is NOT in senderB's audience and must NOT receive B's custom text")
 }
 
-func TestSendCustomTextSnapshot_CommittedRevocationCannotBeUndoneByStaleSnapshot(t *testing.T) {
+func TestCustomTextCandidates_PendingSenderIsAbsent(t *testing.T) {
 	hub, db := setupCustomTextHub(t)
-	viewer := insertCTUser(t, db, "ctsnapshotraceviewer")
-	sender := insertCTUser(t, db, "ctsnapshotracesender")
+	sender := insertCTUser(t, db, "ctpendingcandidate")
+	setCustomText(t, db, sender, 1, "quarantined", "")
+	insertCustomTextPendingOperation(t, db, sender)
+
+	candidates, err := hub.customTextCandidates(context.Background())
+
+	require.NoError(t, err)
+	assert.NotContains(t, candidates, sender)
+}
+
+func TestSendCustomTextSnapshot_FinalStateQuerySuppressesNewPendingSender(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	viewer := insertCTUser(t, db, "ctpendingfinalviewer")
+	sender := insertCTUser(t, db, "ctpendingfinalsender")
 	makeFriends(t, db, sender, viewer)
-	setCustomText(t, db, sender, 1, "must clear", "")
+	setCustomText(t, db, sender, 1, "candidate before quarantine", "")
 	viewerClient := connectClient(hub, viewer)
-	coordinator := &observingCustomTextDeliveryCoordinator{attempts: make(chan uuid.UUID, 2)}
-	hub.customTextDeliveryCoordinator = coordinator
-
-	snapshotAuthorized := make(chan struct{})
-	releaseSnapshot := make(chan struct{})
-	hub.customTextSnapshotBeforeEnqueue = func(candidateID, viewerID uuid.UUID) {
-		if candidateID != sender || viewerID != viewer {
-			return
-		}
-		close(snapshotAuthorized)
-		<-releaseSnapshot
+	candidatesRead := make(chan struct{})
+	releaseCandidates := make(chan struct{})
+	hub.customTextSnapshotAfterCandidates = func() {
+		close(candidatesRead)
+		<-releaseCandidates
 	}
-
 	snapshotDone := make(chan struct{})
 	go func() {
 		defer close(snapshotDone)
 		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
 	}()
-	assert.Equal(t, sender, awaitCustomTextSignal(t, coordinator.attempts))
-	awaitCustomTextSignal(t, snapshotAuthorized)
+	awaitCustomTextSignal(t, candidatesRead)
 
-	// Commit the exclusion after the snapshot authorized the viewer but before it
-	// can enqueue the stale update. The post-commit delta must be the final frame.
-	excludeCustomTextViewer(t, db, sender, viewer)
-	deltaDone := make(chan struct{})
-	go func() {
-		defer close(deltaDone)
-		hub.BroadcastCustomTextAudienceDelta(
-			sender,
-			map[uuid.UUID]bool{viewer: true},
-			map[uuid.UUID]bool{},
-			nil,
-		)
-	}()
-	assert.Equal(t, sender, awaitCustomTextSignal(t, coordinator.attempts))
-	close(releaseSnapshot)
+	insertCustomTextPendingOperation(t, db, sender)
+	close(releaseCandidates)
 	awaitCustomTextSignal(t, snapshotDone)
-	awaitCustomTextSignal(t, deltaDone)
 
-	first := readClientMsg(t, viewerClient)
-	second := readClientMsg(t, viewerClient)
-	assert.Equal(t, "rich_presence_update", first["type"])
-	assert.Equal(t, "rich_presence_clear", second["type"], "the committed revocation must be the final delivered state")
+	assertNoMessage(t, viewerClient)
+}
+
+func TestSendCustomTextSnapshot_CancellationImmediatelyBeforeEnqueueSuppressesFrame(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	viewer := insertCTUser(t, db, "ctsnapshotcancelviewer")
+	sender := insertCTUser(t, db, "ctsnapshotcancelsender")
+	makeFriends(t, db, sender, viewer)
+	setCustomText(t, db, sender, 1, "must be canceled", "")
+	viewerClient := connectClient(hub, viewer)
+	ctx, cancel := context.WithCancel(context.Background())
+	hub.customTextSnapshotBeforeEnqueue = func(candidateID, viewerID uuid.UUID) {
+		if candidateID == sender && viewerID == viewer {
+			cancel()
+		}
+	}
+
+	hub.sendCustomTextSnapshot(ctx, viewerClient)
+
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+	assertNoMessage(t, viewerClient)
+}
+
+func TestSendCustomTextSnapshot_TimeoutBeforeSharedGateCannotEnqueueLater(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
+	hub.SetPresenceHistoryService(service)
+	viewer := insertCTUser(t, db, "ctsnapshotgateviewer")
+	sender := insertCTUser(t, db, "ctsnapshotgatesender")
+	makeFriends(t, db, sender, viewer)
+	setCustomText(t, db, sender, 1, "must stay gated", "")
+	viewerClient := connectClient(hub, viewer)
+	gateHeld := make(chan struct{})
+	releaseGate := make(chan struct{})
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- service.WithSender(context.Background(), sender, func() error {
+			close(gateHeld)
+			<-releaseGate
+			return nil
+		})
+	}()
+	awaitCustomTextSignal(t, gateHeld)
+	candidatesRead := make(chan struct{})
+	hub.customTextSnapshotAfterCandidates = func() {
+		close(candidatesRead)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	snapshotDone := make(chan struct{})
+	go func() {
+		defer close(snapshotDone)
+		hub.sendCustomTextSnapshot(ctx, viewerClient)
+	}()
+	awaitCustomTextSignal(t, candidatesRead)
+	awaitCustomTextSignal(t, snapshotDone)
+	require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+
+	close(releaseGate)
+	require.NoError(t, awaitCustomTextSignal(t, holderDone))
+	assertNoMessage(t, viewerClient)
+}
+
+func TestHubRun_BlockedCustomTextSnapshotGateDoesNotBlockOtherEvents(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
+	hub.SetPresenceHistoryService(service)
+	sender := insertCTUser(t, db, "cthubloopsender")
+	viewer := insertCTUser(t, db, "cthubloopviewer")
+	otherUser := insertCTUser(t, db, "cthubloopother")
+	unregisterUser := insertCTUser(t, db, "cthubloopunregister")
+	makeFriends(t, db, sender, viewer)
+	makeFriends(t, db, sender, otherUser)
+	setCustomText(t, db, sender, 1, "snapshot waits off loop", "")
+
+	unregisterClient := connectClient(hub, unregisterUser)
+	unregisterClient.Send = make(chan []byte, 32)
+	gateHeld := make(chan struct{})
+	releaseGate := make(chan struct{})
+	var releaseOnce sync.Once
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- service.WithSender(context.Background(), sender, func() error {
+			close(gateHeld)
+			<-releaseGate
+			return nil
+		})
+	}()
+	awaitCustomTextSignal(t, gateHeld)
+
+	snapshotWaiting := make(chan struct{})
+	var snapshotOnce sync.Once
+	hub.customTextSnapshotAfterCandidates = func() {
+		snapshotOnce.Do(func() { close(snapshotWaiting) })
+	}
+	go hub.Run()
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseGate) })
+		hub.Shutdown()
+	})
+
+	viewerClient := &Client{
+		ID:       uuid.New(),
+		UserID:   viewer,
+		Send:     make(chan []byte, 32),
+		Hub:      hub,
+		Channels: make(map[uuid.UUID]bool),
+	}
+	hub.register <- viewerClient
+	awaitCustomTextSignal(t, snapshotWaiting)
+
+	otherClient := &Client{
+		ID:       uuid.New(),
+		UserID:   otherUser,
+		Send:     make(chan []byte, 32),
+		Hub:      hub,
+		Channels: make(map[uuid.UUID]bool),
+	}
+	hub.register <- otherClient
+	awaitClientMessageType(t, otherClient, "connected")
+
+	hub.BroadcastToAll(OutgoingMessage{
+		Type: "custom_text_hub_loop_probe",
+		Data: map[string]interface{}{"count": 1},
+	})
+	awaitClientMessageType(t, otherClient, "custom_text_hub_loop_probe")
+
+	hub.unregister <- unregisterClient
+	closeTimer := time.NewTimer(10 * time.Second)
+	defer closeTimer.Stop()
+	for {
+		select {
+		case _, ok := <-unregisterClient.Send:
+			if !ok {
+				goto unregistered
+			}
+		case <-closeTimer.C:
+			t.Fatal("unrelated unregister did not complete while snapshot waited on sender gate")
+		}
+	}
+
+unregistered:
+	releaseOnce.Do(func() { close(releaseGate) })
+	require.NoError(t, awaitCustomTextSignal(t, holderDone))
 }
 
 func TestSendCustomTextSnapshot_StateAndAudienceUseOneDatabaseSnapshot(t *testing.T) {
@@ -649,31 +541,123 @@ func TestSendCustomTextSnapshot_StateAndAudienceUseOneDatabaseSnapshot(t *testin
 	assertNoMessage(t, viewerClient)
 }
 
-func TestClearCustomTextForPresenceAudience_SenderCoordinatesScopedPrivacyClear(t *testing.T) {
+func TestSendCustomTextSnapshot_SharedGateOrdersOldSnapshotBeforeNewerClearUpdate(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
+	hub.SetPresenceHistoryService(service)
+	viewer := insertCTUser(t, db, "ctsnapshotorderedviewer")
+	sender := insertCTUser(t, db, "ctsnapshotorderedsender")
+	makeFriends(t, db, sender, viewer)
+	setCustomText(t, db, sender, 1, "old snapshot state", "")
+	viewerClient := connectClient(hub, viewer)
+	stateRead := make(chan struct{})
+	releaseSnapshot := make(chan struct{})
+	hub.customTextSnapshotAfterStateRead = func(candidateID, viewerID uuid.UUID) {
+		if candidateID == sender && viewerID == viewer {
+			close(stateRead)
+			<-releaseSnapshot
+		}
+	}
+	snapshotDone := make(chan struct{})
+	go func() {
+		defer close(snapshotDone)
+		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+	}()
+	awaitCustomTextSignal(t, stateRead)
+
+	operationID := uuid.New()
+	writerAttempted := make(chan struct{})
+	writerDone := make(chan error, 1)
+	go func() {
+		close(writerAttempted)
+		writerDone <- service.WithSender(context.Background(), sender, func() (returnErr error) {
+			tx, err := db.BeginTx(context.Background(), nil)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if rollbackErr := tx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone && returnErr == nil {
+					returnErr = rollbackErr
+				}
+			}()
+			if _, err := tx.Exec(`
+				UPDATE user_presence_settings
+				SET custom_text_tier = 1,
+				    custom_text = 'new committed state',
+				    custom_text_emoji = NULL,
+				    presence_settings_version = 1,
+				    presence_settings_operation_id = $2,
+				    updated_at = clock_timestamp()
+				WHERE user_id = $1
+			`, sender, operationID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`
+				INSERT INTO presence_settings_pending_operations (
+					user_id,
+					operation_id,
+					prior_settings_version,
+					created_at,
+					reconcile_after
+				)
+				VALUES ($1, $2, 0, clock_timestamp(), clock_timestamp() + INTERVAL '30 seconds')
+			`, sender, operationID); err != nil {
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			ack, err := hub.DeliverCustomText(context.Background(), presencehistory.DeliveryPlan{
+				Mode:             presencehistory.DeliveryExactDelta,
+				OperationID:      operationID,
+				SenderID:         sender,
+				ClearRecipients:  map[uuid.UUID]bool{viewer: true},
+				UpdateRecipients: map[uuid.UUID]bool{viewer: true},
+				Payload:          &presencehistory.CustomTextState{Text: "new committed state"},
+			})
+			if err != nil {
+				return err
+			}
+			if ack.OperationID != operationID {
+				return fmt.Errorf("delivery acknowledgement mismatch")
+			}
+			return nil
+		})
+	}()
+	awaitCustomTextSignal(t, writerAttempted)
+	close(releaseSnapshot)
+	awaitCustomTextSignal(t, snapshotDone)
+	require.NoError(t, awaitCustomTextSignal(t, writerDone))
+
+	oldUpdate := readClientMsg(t, viewerClient)
+	newClear := readClientMsg(t, viewerClient)
+	newUpdate := readClientMsg(t, viewerClient)
+	require.Equal(t, "rich_presence_update", oldUpdate["type"])
+	oldPayload := oldUpdate["data"].(map[string]interface{})["payload"].(map[string]interface{})
+	assert.Equal(t, "old snapshot state", oldPayload["text"])
+	assert.Equal(t, "rich_presence_clear", newClear["type"])
+	require.Equal(t, "rich_presence_update", newUpdate["type"])
+	newPayload := newUpdate["data"].(map[string]interface{})["payload"].(map[string]interface{})
+	assert.Equal(t, "new committed state", newPayload["text"])
+}
+
+func TestClearCustomTextForPresenceAudience_ScopesClearToBaseAudience(t *testing.T) {
 	hub, db := setupCustomTextHub(t)
 	sender := insertCTUser(t, db, "ctscopedclearsender")
-	viewerA := insertCTUser(t, db, "ctscopedclearviewera")
-	viewerB := insertCTUser(t, db, "ctscopedclearviewerb")
-	makeFriends(t, db, sender, viewerA)
-	senderClient := connectClient(hub, sender)
-	viewerAClient := connectClient(hub, viewerA)
-	viewerBClient := connectClient(hub, viewerB)
-	coordinator := &observingCustomTextDeliveryCoordinator{
-		attempts: make(chan uuid.UUID, 1),
-	}
-	hub.customTextDeliveryCoordinator = coordinator
+	viewer := insertCTUser(t, db, "ctscopedclearviewer")
+	unrelated := insertCTUser(t, db, "ctscopedclearunrelated")
+	makeFriends(t, db, sender, viewer)
+	viewerClient := connectClient(hub, viewer)
+	unrelatedClient := connectClient(hub, unrelated)
 
 	hub.ClearCustomTextForPresenceAudience(sender)
 
-	assert.Equal(t, sender, awaitCustomTextSignal(t, coordinator.attempts))
-	message := readClientMsg(t, viewerAClient)
+	message := readClientMsg(t, viewerClient)
 	assert.Equal(t, "rich_presence_clear", message["type"])
-	data, ok := message["data"].(map[string]interface{})
-	require.True(t, ok)
+	data := message["data"].(map[string]interface{})
 	assert.Equal(t, sender.String(), data["user_id"])
 	assert.Equal(t, "custom_text", data["category"])
-	assertNoMessage(t, senderClient)
-	assertNoMessage(t, viewerBClient)
+	assertNoMessage(t, unrelatedClient)
 }
 
 func TestClearCustomTextForPresenceAudience_DatabaseWaitIsBounded(t *testing.T) {
@@ -712,119 +696,6 @@ func TestClearCustomTextForPresenceAudience_DatabaseWaitIsBounded(t *testing.T) 
 	}
 	require.NoError(t, heldConnection.Close())
 	assertNoMessage(t, viewerClient)
-}
-
-func TestSendCustomTextSnapshot_LiveUpdateCoordinatesAndSnapshotRereadsCurrentPayload(t *testing.T) {
-	hub, db := setupCustomTextHub(t)
-	viewer := insertCTUser(t, db, "ctsnapshotupdateviewer")
-	sender := insertCTUser(t, db, "ctsnapshotupdatesender")
-	makeFriends(t, db, sender, viewer)
-	setCustomText(t, db, sender, 1, "old status", "")
-	viewerClient := connectClient(hub, viewer)
-	coordinator := &reorderingCustomTextDeliveryCoordinator{
-		firstAttempt:  make(chan struct{}),
-		releaseFirst:  make(chan struct{}),
-		secondAttempt: make(chan struct{}),
-		releaseSecond: make(chan struct{}),
-	}
-	hub.customTextDeliveryCoordinator = coordinator
-
-	snapshotDone := make(chan struct{})
-	go func() {
-		defer close(snapshotDone)
-		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
-	}()
-	awaitCustomTextSignal(t, coordinator.firstAttempt)
-
-	newText := "new status"
-	newEmoji := "✨"
-	updateCustomText(t, db, sender, 1, &newText, &newEmoji)
-	liveDone := make(chan struct{})
-	go func() {
-		defer close(liveDone)
-		hub.BroadcastCustomText(sender, 1, &CustomTextPayload{Text: newText, Emoji: newEmoji})
-	}()
-
-	coordinated := false
-	select {
-	case <-coordinator.secondAttempt:
-		coordinated = true
-		close(coordinator.releaseSecond)
-		awaitCustomTextSignal(t, liveDone)
-	case <-liveDone:
-		// The regression path: the live broadcast bypassed delivery coordination.
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for live custom-text update")
-	}
-	close(coordinator.releaseFirst)
-	awaitCustomTextSignal(t, snapshotDone)
-
-	first := readClientMsg(t, viewerClient)
-	second := readClientMsg(t, viewerClient)
-	assert.True(t, coordinated, "live custom-text updates must share sender delivery coordination with snapshots")
-	require.Equal(t, "rich_presence_update", first["type"])
-	require.Equal(t, "rich_presence_update", second["type"])
-	firstPayload := first["data"].(map[string]interface{})["payload"].(map[string]interface{})
-	secondPayload := second["data"].(map[string]interface{})["payload"].(map[string]interface{})
-	assert.Equal(t, newText, firstPayload["text"])
-	assert.Equal(t, newText, secondPayload["text"], "a delayed snapshot must re-read the sender's current text")
-	assert.Equal(t, newEmoji, secondPayload["emoji"])
-}
-
-func TestSendCustomTextSnapshot_LiveClearIsDeliveredAfterAuthorizedSnapshot(t *testing.T) {
-	hub, db := setupCustomTextHub(t)
-	viewer := insertCTUser(t, db, "ctsnapshotclearviewer")
-	sender := insertCTUser(t, db, "ctsnapshotclearsender")
-	makeFriends(t, db, sender, viewer)
-	setCustomText(t, db, sender, 1, "status to clear", "")
-	viewerClient := connectClient(hub, viewer)
-	coordinator := &observingCustomTextDeliveryCoordinator{attempts: make(chan uuid.UUID, 2)}
-	hub.customTextDeliveryCoordinator = coordinator
-
-	snapshotAuthorized := make(chan struct{})
-	releaseSnapshot := make(chan struct{})
-	hub.customTextSnapshotBeforeEnqueue = func(candidateID, viewerID uuid.UUID) {
-		if candidateID != sender || viewerID != viewer {
-			return
-		}
-		close(snapshotAuthorized)
-		<-releaseSnapshot
-	}
-
-	snapshotDone := make(chan struct{})
-	go func() {
-		defer close(snapshotDone)
-		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
-	}()
-	assert.Equal(t, sender, awaitCustomTextSignal(t, coordinator.attempts))
-	awaitCustomTextSignal(t, snapshotAuthorized)
-
-	updateCustomText(t, db, sender, 0, nil, nil)
-	clearDone := make(chan struct{})
-	go func() {
-		defer close(clearDone)
-		hub.BroadcastCustomText(sender, 1, nil)
-	}()
-
-	coordinated := false
-	select {
-	case attemptedSender := <-coordinator.attempts:
-		assert.Equal(t, sender, attemptedSender)
-		coordinated = true
-	case <-clearDone:
-		// The regression path: the clear bypassed delivery coordination.
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for live custom-text clear")
-	}
-	close(releaseSnapshot)
-	awaitCustomTextSignal(t, snapshotDone)
-	awaitCustomTextSignal(t, clearDone)
-
-	first := readClientMsg(t, viewerClient)
-	second := readClientMsg(t, viewerClient)
-	assert.True(t, coordinated, "live custom-text clears must share sender delivery coordination with snapshots")
-	assert.Equal(t, "rich_presence_update", first["type"])
-	assert.Equal(t, "rich_presence_clear", second["type"], "the committed clear must be the final delivered state")
 }
 
 func TestSendCustomTextSnapshot_RecipientOverrideExcludedThenRestored(t *testing.T) {
@@ -962,44 +833,13 @@ func closedDBHub(t *testing.T) (*Hub, uuid.UUID, uuid.UUID) {
 
 	redisClient := setupHubTestRedis(t)
 	hub := NewHub(db, redisClient)
+	hub.SetPresenceHistoryService(presencehistory.NewService(db, presencehistory.DisclosureState{}, false))
 	return hub, uuid.New(), uuid.New()
 }
 
 // TestBroadcastCustomText_NilDB_NoPanicNoSend covers the `h.db == nil` guard in
 // BroadcastCustomText (lines 53-58): a DB-free hub must return without panicking
 // and deliver nothing.
-func TestBroadcastCustomText_NilDB_NoPanicNoSend(t *testing.T) {
-	hub := dbFreeHub()
-	sender := uuid.New()
-	selfClient := connectClient(hub, sender)
-
-	// Must not panic; must send nothing (audience uncomputable ⇒ fail closed).
-	assert.NotPanics(t, func() {
-		hub.BroadcastCustomText(sender, 1, &CustomTextPayload{Text: "no db"})
-	})
-	assertNoMessage(t, selfClient)
-}
-
-// TestBroadcastCustomText_ClosedDB_FailsClosed covers the audience-computation
-// error branch (lines 61-67): when ComputeCustomTextAudience errors (closed DB),
-// the frame is fanned out to no one. No panic, no leak.
-func TestBroadcastCustomText_ClosedDB_FailsClosed(t *testing.T) {
-	hub, sender, viewer := closedDBHub(t)
-
-	viewerClient := connectClient(hub, viewer)
-	selfClient := connectClient(hub, sender)
-
-	assert.NotPanics(t, func() {
-		hub.BroadcastCustomText(sender, 2, &CustomTextPayload{Text: "should not leak"})
-	})
-
-	// PRIVACY LOCK: audience error ⇒ nobody receives, not even the sender's self.
-	assertNoMessage(t, viewerClient)
-	assertNoMessage(t, selfClient)
-}
-
-// TestSendCustomTextSnapshot_NilDB_NoPanicNoSend covers the `h.db == nil` guard
-// in sendCustomTextSnapshot (lines 134-136).
 func TestSendCustomTextSnapshot_NilDB_NoPanicNoSend(t *testing.T) {
 	hub := dbFreeHub()
 	viewer := uuid.New()
@@ -1094,61 +934,4 @@ func TestSendCustomTextSnapshot_SendBufferFull(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("sendCustomTextSnapshot blocked instead of taking the default drop branch")
 	}
-}
-
-// TestBroadcastCustomText_TierNarrowed_ClearsExcluded is the #1233/Gitar privacy
-// regression lock: narrowing Servers(2)->Friends(1) must send rich_presence_clear
-// to a viewer who was only a shared-server peer (in the OLD audience, not the
-// new), while the friend (in both) gets the update. Without the oldTier delta the
-// stale status would linger on the excluded peer until reconnect.
-func TestBroadcastCustomText_TierNarrowed_ClearsExcluded(t *testing.T) {
-	hub, db := setupCustomTextHub(t)
-
-	sender := insertCTUser(t, db, "ctnarrowsender")
-	friend := insertCTUser(t, db, "ctnarrowfriend")
-	serverPeer := insertCTUser(t, db, "ctnarrowpeer")
-
-	makeFriends(t, db, sender, friend)
-	shareServer(t, db, sender, sender, serverPeer)
-	// DB holds the NEW tier (Friends=1) + text; oldTier passed as 2 (Servers).
-	setCustomText(t, db, sender, 1, "narrowed", "")
-
-	friendClient := connectClient(hub, friend)
-	serverPeerClient := connectClient(hub, serverPeer)
-
-	hub.BroadcastCustomText(sender, 2, &CustomTextPayload{Text: "narrowed"})
-
-	// Friend (in both old and new audience) receives the update.
-	fm := readClientMsg(t, friendClient)
-	assert.Equal(t, "rich_presence_update", fm["type"])
-
-	// PRIVACY LOCK: the server-only peer left the audience (Servers->Friends) and
-	// MUST be cleared, not left showing the stale status.
-	pm := readClientMsg(t, serverPeerClient)
-	assert.Equal(t, "rich_presence_clear", pm["type"])
-	pdata := pm["data"].(map[string]interface{})
-	assert.Equal(t, sender.String(), pdata["user_id"])
-	assert.Equal(t, "custom_text", pdata["category"])
-}
-
-// TestBroadcastCustomText_TurnedOff_ClearsPriorAudience: turning custom text off
-// (new tier 0 => nil payload) must clear the PRIOR (oldTier) audience — #1233/Gitar.
-func TestBroadcastCustomText_TurnedOff_ClearsPriorAudience(t *testing.T) {
-	hub, db := setupCustomTextHub(t)
-
-	sender := insertCTUser(t, db, "ctoffsender")
-	friend := insertCTUser(t, db, "ctofffriend")
-
-	makeFriends(t, db, sender, friend)
-	// DB now holds tier 0 (off); oldTier passed as 1 (Friends).
-	setCustomText(t, db, sender, 0, "", "")
-
-	friendClient := connectClient(hub, friend)
-
-	hub.BroadcastCustomText(sender, 1, nil) // turned off => clear the prior audience
-
-	fm := readClientMsg(t, friendClient)
-	assert.Equal(t, "rich_presence_clear", fm["type"])
-	fdata := fm["data"].(map[string]interface{})
-	assert.Equal(t, sender.String(), fdata["user_id"])
 }

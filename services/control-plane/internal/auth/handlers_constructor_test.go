@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,4 +22,13 @@ func TestNewHandler_DefaultConstructorStillInitializes(t *testing.T) {
 	h := NewHandler(nil, nil, logger.New("test"), "test-secret", nil)
 	require.NotNil(t, h)
 	assert.NotNil(t, h.entCache)
+}
+
+func TestSetPresenceHistoryStoresConcreteSharedService(t *testing.T) {
+	h := NewHandler(nil, nil, logger.New("test"), "test-secret", nil)
+	service := presencehistory.NewService(nil, presencehistory.DisclosureState{}, false)
+
+	h.SetPresenceHistory(service)
+
+	assert.Same(t, service, h.presenceHistory)
 }

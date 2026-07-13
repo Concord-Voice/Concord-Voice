@@ -19,7 +19,11 @@ info:
 
     - All timestamps are ISO 8601 with timezone (TIMESTAMPTZ)
 
-    - Error responses use `{"error": "message"}` format
+    - Error envelopes are endpoint-specific. Most legacy routes use `{"error":
+      "message"}`; Activity History handler errors use a stable `{"code":"..."}`
+      envelope. Its bearer-token and rate-limit failures retain the existing
+      `error` envelope; global header validation, account state, email verification,
+      and client-attestation gates keep the distinct shapes documented per operation.
 
     - Rate limits are documented per-endpoint; exceeded limits return 429
 
@@ -84,7 +88,7 @@ tags:
 - name: Privacy
   description: User privacy settings
 - name: Presence
-  description: Custom Status settings and server-enforced recipient exceptions
+  description: Custom Status settings, server-enforced recipient exceptions, and self-only Activity History
 - name: ChannelGroups
   description: Channel grouping and reordering within servers
 - name: WebSocket
@@ -2834,6 +2838,16 @@ paths:
                         enum:
                         - saas
                         - self-hosted-unlocked
+                      activityHistorySupported:
+                        type: boolean
+                        description: >-
+                          Optional rollout capability. Present as true only when
+                          ACTIVITY_HISTORY_CLUSTER_ENABLED=true and
+                          CONTROL_PLANE_REPLICA_COUNT was explicitly set to 1;
+                          otherwise omitted. Clients treat schema-valid true as
+                          supported and missing/false as confirmed unsupported.
+                          Fetch, non-2xx, or schema failures are errors and must
+                          preserve the last confirmed support state.
                   policyVersion:
                     type: string
         '429':
@@ -11906,6 +11920,286 @@ paths:
         '400':
           description: Invalid tier (must be 0, 1, or 2), custom_text over 140 characters,
             or custom_text_emoji over 32 characters
+  /users/me/presence-history:
+    get:
+      tags:
+      - Presence
+      summary: List the authenticated user's Activity History
+      operationId: listActivityHistory
+      description: >-
+        Returns a self-only keyset page ordered by `(recorded_at DESC, id
+        DESC)`. The authenticated subject comes only from the bearer token;
+        there is no target-user parameter. Expired active-database rows are
+        deleted at the exact read cutoff before the page is returned. Only a
+        validated Custom Status (`custom_text`) payload version 1 is exposed;
+        unsupported categories, versions, or malformed stored payloads retain
+        metadata with `payload:null`, and raw stored JSON is never returned.
+        The nine-category taxonomy does not imply that every runtime adapter is
+        implemented. This response alone carries `Cache-Control: no-store`.
+        Rate limit: 30 requests per minute (user-based).
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        description: Page size; defaults to 50.
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 50
+      - name: before
+        in: query
+        required: false
+        description: >-
+          One opaque unpadded base64url keyset cursor, at most 512 encoded
+          bytes and 256 decoded bytes.
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 512
+          pattern: '^[A-Za-z0-9_-]+$'
+      responses:
+        '200':
+          description: One self-scoped Activity History page
+          headers:
+            Cache-Control:
+              description: Prevents caching of the history page
+              schema:
+                type: string
+                enum:
+                - no-store
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivityHistoryPage'
+        '400':
+          description: Invalid pagination query from the handler, or malformed global device headers
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/ActivityHistoryError'
+                - $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Account disabled, email unverified, or client attestation rejected
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/AccountDisabledError'
+                - $ref: '#/components/schemas/EmailVerificationError'
+                - $ref: '#/components/schemas/AttestationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Activity History could not be read (`activity_history_internal_error`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivityHistoryError'
+        '503':
+          description: Client-attestation registry unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+      - Presence
+      summary: Delete Activity History and withdraw consent
+      operationId: deleteActivityHistory
+      description: >-
+        Atomically disables Activity History, clears accepted consent and
+        reconsent state, and deletes the authenticated user's active-database
+        history. The operation is idempotent and prevents new recording until
+        a later explicit opt-in. It does not change the live Custom Status.
+        Rate limit: 10 requests per minute (user-based).
+      security:
+      - BearerAuth: []
+      responses:
+        '204':
+          description: Activity History disabled and active-database rows deleted
+        '400':
+          description: Malformed global device headers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Account disabled, email unverified, or client attestation rejected
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/AccountDisabledError'
+                - $ref: '#/components/schemas/EmailVerificationError'
+                - $ref: '#/components/schemas/AttestationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Activity History could not be disabled and deleted (`activity_history_internal_error`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivityHistoryError'
+        '503':
+          description: Client-attestation registry unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /users/me/presence-history/settings:
+    get:
+      tags:
+      - Presence
+      summary: Get Activity History settings and disclosure
+      operationId: getActivityHistorySettings
+      description: >-
+        Returns the authenticated user's self-only settings plus the current
+        operator disclosure when available. Reading an unset preference returns
+        Off with the 30-day default and creates no database row. A supported
+        server can still report `available:false` when its operator disclosure
+        is missing or invalid; this is distinct from the server capability.
+        Rate limit: 30 requests per minute (user-based).
+      security:
+      - BearerAuth: []
+      responses:
+        '200':
+          description: Activity History settings and current disclosure state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivityHistorySettings'
+        '400':
+          description: Malformed global device headers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Account disabled, email unverified, or client attestation rejected
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/AccountDisabledError'
+                - $ref: '#/components/schemas/EmailVerificationError'
+                - $ref: '#/components/schemas/AttestationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Activity History settings could not be read (`activity_history_internal_error`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivityHistoryError'
+        '503':
+          description: Client-attestation registry unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      tags:
+      - Presence
+      summary: Enable, disable, or change Activity History retention
+      operationId: updateActivityHistorySettings
+      description: >-
+        Applies exactly one strict mutation: enable with current explicit
+        consent, disable, or change retention. Enabling does not backfill and
+        recording begins with the next semantic Custom Status change. Bodies
+        over 16 KiB, empty bodies, unknown or duplicate fields, null values,
+        trailing JSON, and invalid field combinations are rejected. Reducing
+        retention recomputes expiry and deletes newly expired rows; increasing
+        retention while reconsent is required returns a conflict.
+        Rate limit: 10 requests per minute (user-based).
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActivityHistorySettingsUpdate'
+      responses:
+        '200':
+          description: Updated Activity History settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivityHistorySettings'
+        '400':
+          description: Invalid handler request, or malformed global device headers
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/ActivityHistoryError'
+                - $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Account disabled, email unverified, or client attestation rejected
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/AccountDisabledError'
+                - $ref: '#/components/schemas/EmailVerificationError'
+                - $ref: '#/components/schemas/AttestationError'
+        '409':
+          description: >-
+            Consent hash/version mismatch (`activity_history_consent_mismatch`,
+            with `required_consent`) or a forbidden retention increase while
+            paused (`activity_history_reconsent_required`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivityHistoryError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Activity History settings could not be updated (`activity_history_internal_error`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivityHistoryError'
+        '503':
+          description: >-
+            Cluster activation is unavailable
+            (`activity_history_activation_unavailable`) or operator disclosure
+            is unavailable (`activity_history_disclosure_unavailable`); the
+            client-attestation registry can also be unavailable.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/ActivityHistoryError'
+                - $ref: '#/components/schemas/Error'
   /users/me/presence-overrides/{category}:
     parameters:
     - name: category
@@ -12853,6 +13147,320 @@ components:
           type: string
       required:
       - error
+    AccountDisabledError:
+      type: object
+      additionalProperties: false
+      properties:
+        error_code:
+          type: string
+          enum:
+          - account_disabled
+      required:
+      - error_code
+    EmailVerificationError:
+      type: object
+      additionalProperties: false
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+          enum:
+          - EMAIL_NOT_VERIFIED
+      required:
+      - error
+      - code
+    ActivityHistoryRequiredConsent:
+      type: object
+      additionalProperties: false
+      required:
+      - version
+      - copy_hash
+      - operator_name
+      - required_text
+      - details
+      - privacy_policy_url
+      - acknowledgement_label
+      properties:
+        version:
+          type: integer
+          minimum: 1
+        copy_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: >-
+            Lowercase SHA-256 over decimal version, operator_name,
+            required_text, each details item in order, privacy_policy_url, and
+            acknowledgement_label, joined with NUL bytes.
+        operator_name:
+          type: string
+        required_text:
+          type: string
+        details:
+          type: array
+          minItems: 1
+          description: Ordered disclosure detail strings included in the copy hash.
+          items:
+            type: string
+        privacy_policy_url:
+          type: string
+          format: uri
+          description: Absolute operator privacy-policy URL.
+        acknowledgement_label:
+          type: string
+    ActivityHistorySettings:
+      type: object
+      additionalProperties: false
+      required:
+      - available
+      - enabled
+      - reconsent_required
+      - retention_days
+      - consent_version
+      - consent_copy_hash
+      - consented_at
+      properties:
+        available:
+          type: boolean
+          description: Whether the operator supplied a valid current disclosure.
+        enabled:
+          type: boolean
+        reconsent_required:
+          type: boolean
+        retention_days:
+          type: integer
+          enum:
+          - 7
+          - 30
+          - 90
+          - 365
+        consent_version:
+          type: integer
+          minimum: 1
+          nullable: true
+        consent_copy_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          nullable: true
+        consented_at:
+          type: string
+          format: date-time
+          nullable: true
+        required_consent:
+          $ref: '#/components/schemas/ActivityHistoryRequiredConsent'
+    ActivityHistorySettingsUpdate:
+      oneOf:
+      - title: Enable with current consent
+        type: object
+        additionalProperties: false
+        required:
+        - enabled
+        - retention_days
+        - acknowledged
+        - consent_version
+        - consent_copy_hash
+        properties:
+          enabled:
+            type: boolean
+            enum:
+            - true
+          retention_days:
+            type: integer
+            enum:
+            - 7
+            - 30
+            - 90
+            - 365
+          acknowledged:
+            type: boolean
+            enum:
+            - true
+          consent_version:
+            type: integer
+            minimum: 1
+          consent_copy_hash:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+      - title: Disable and delete
+        type: object
+        additionalProperties: false
+        required:
+        - enabled
+        properties:
+          enabled:
+            type: boolean
+            enum:
+            - false
+      - title: Change retention
+        type: object
+        additionalProperties: false
+        required:
+        - retention_days
+        properties:
+          retention_days:
+            type: integer
+            enum:
+            - 7
+            - 30
+            - 90
+            - 365
+    ActivityHistoryCustomTextPayload:
+      type: object
+      additionalProperties: false
+      required:
+      - text
+      properties:
+        text:
+          type: string
+          minLength: 1
+          maxLength: 140
+          description: Custom Status text measured in Unicode code points.
+        emoji:
+          type: string
+          maxLength: 32
+          description: Optional emoji measured in Unicode code points.
+    ActivityHistorySupportedCustomTextItem:
+      type: object
+      additionalProperties: false
+      required:
+      - status
+      - id
+      - category
+      - payload_version
+      - payload
+      - started_at
+      - ended_at
+      - recorded_at
+      - expires_at
+      properties:
+        status:
+          type: string
+          enum:
+          - supported
+        id:
+          type: string
+          format: uuid
+        category:
+          type: string
+          enum:
+          - custom_text
+        payload_version:
+          type: integer
+          enum:
+          - 1
+        payload:
+          $ref: '#/components/schemas/ActivityHistoryCustomTextPayload'
+        started_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: string
+          format: date-time
+          nullable: true
+        recorded_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+    ActivityHistoryUnsupportedItem:
+      type: object
+      additionalProperties: false
+      required:
+      - status
+      - id
+      - category
+      - payload_version
+      - payload
+      - started_at
+      - ended_at
+      - recorded_at
+      - expires_at
+      properties:
+        status:
+          type: string
+          enum:
+          - unsupported
+        id:
+          type: string
+          format: uuid
+        category:
+          type: string
+          enum:
+          - server_voice
+          - private_call
+          - games
+          - music
+          - streaming
+          - browser
+          - productivity
+          - creator
+          - custom_text
+        payload_version:
+          type: integer
+          minimum: 1
+        payload:
+          type: object
+          nullable: true
+          enum:
+          - null
+          description: Always null; raw unsupported stored JSON is never returned.
+        started_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: string
+          format: date-time
+          nullable: true
+        recorded_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+    ActivityHistoryItem:
+      oneOf:
+      - $ref: '#/components/schemas/ActivityHistorySupportedCustomTextItem'
+      - $ref: '#/components/schemas/ActivityHistoryUnsupportedItem'
+      discriminator:
+        propertyName: status
+        mapping:
+          supported: '#/components/schemas/ActivityHistorySupportedCustomTextItem'
+          unsupported: '#/components/schemas/ActivityHistoryUnsupportedItem'
+    ActivityHistoryPage:
+      type: object
+      additionalProperties: false
+      required:
+      - items
+      - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActivityHistoryItem'
+        next_cursor:
+          type: string
+          nullable: true
+          maxLength: 512
+          pattern: '^[A-Za-z0-9_-]+$'
+          description: Opaque unpadded base64url cursor, or null on the final page.
+    ActivityHistoryError:
+      type: object
+      additionalProperties: false
+      required:
+      - code
+      properties:
+        code:
+          type: string
+          enum:
+          - activity_history_invalid_request
+          - activity_history_consent_mismatch
+          - activity_history_reconsent_required
+          - activity_history_activation_unavailable
+          - activity_history_disclosure_unavailable
+          - activity_history_internal_error
+        required_consent:
+          $ref: '#/components/schemas/ActivityHistoryRequiredConsent'
     RateLimitError:
       type: object
       properties:

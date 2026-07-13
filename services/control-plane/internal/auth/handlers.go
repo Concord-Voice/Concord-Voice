@@ -26,6 +26,7 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 	"github.com/redis/go-redis/v9"
 )
@@ -34,10 +35,6 @@ import (
 // Defined as an interface to avoid an import cycle (websocket imports auth).
 type SessionDisconnector interface {
 	DisconnectUser(userID uuid.UUID)
-}
-
-type customTextResetBroadcaster interface {
-	ClearCustomTextForPresenceAudience(userID uuid.UUID)
 }
 
 // RecoveryClaims contains the user_id extracted from a validated recovery token.
@@ -133,15 +130,16 @@ func SetRefreshCookie(c *gin.Context, value string, maxAge int) {
 
 // Handler handles authentication-related requests including registration and login.
 type Handler struct {
-	db         *sql.DB
-	redis      *redis.Client
-	log        *logger.Logger
-	jwtSecret  string
-	hub        SessionDisconnector
-	mfaChecker MFAChecker
-	emailSvc   *email.Service
-	pending    *PendingRepo
-	entCache   *entitlements.Cache
+	db              *sql.DB
+	redis           *redis.Client
+	log             *logger.Logger
+	jwtSecret       string
+	hub             SessionDisconnector
+	presenceHistory *presencehistory.Service
+	mfaChecker      MFAChecker
+	emailSvc        *email.Service
+	pending         *PendingRepo
+	entCache        *entitlements.Cache
 }
 
 // NewHandler creates a new authentication handler.
@@ -163,14 +161,10 @@ func NewHandlerForInstance(db *sql.DB, redisClient *redis.Client, log *logger.Lo
 	}
 }
 
-func (h *Handler) clearCustomTextAndDisconnect(userID uuid.UUID) {
-	if h.hub == nil {
-		return
-	}
-	if broadcaster, ok := h.hub.(customTextResetBroadcaster); ok {
-		broadcaster.ClearCustomTextForPresenceAudience(userID)
-	}
-	h.hub.DisconnectUser(userID)
+// SetPresenceHistory injects the concrete service shared with users writers,
+// acknowledged delivery, reconciliation, and reconnect snapshots.
+func (h *Handler) SetPresenceHistory(service *presencehistory.Service) {
+	h.presenceHistory = service
 }
 
 // SetEmailService sets the email service (called after initialization to avoid circular deps).
@@ -2181,7 +2175,7 @@ func (h *Handler) validateAndConsumeRecoveryToken(c *gin.Context, tokenStr strin
 		return nil, ""
 	}
 	if err != nil {
-		h.log.Error("Failed to check recovery token usage", "error", err)
+		h.log.Error("Failed to check recovery token usage", "error_class", "token_usage_check")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process recovery"})
 		return nil, ""
 	}
@@ -2198,7 +2192,7 @@ func (h *Handler) prepareRecoveryPassword(ctx context.Context, c *gin.Context, p
 	}
 	passwordHash, err := HashPassword(password)
 	if err != nil {
-		h.log.Error("Failed to hash new password", "error", err)
+		h.log.Error("Failed to hash new password", "error_class", "password_hash")
 		h.redis.Del(ctx, recoveryUsedKey)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errFailedResetPwd})
 		return "", nil, nil, err
@@ -2225,40 +2219,19 @@ type recoveryTxOp struct {
 	desc  string // human-readable for error logging
 }
 
-// recoveryCommitAmbiguousError means the database may have committed the
-// destructive recovery transaction even though the client did not receive an
-// acknowledgement. Callers must keep the recovery token consumed and perform
-// post-commit safety actions fail closed.
-type recoveryCommitAmbiguousError struct {
-	cause error
+type recoveryPresenceResult struct {
+	Operation presencehistory.AudienceOperation
+	Plan      presencehistory.DeliveryPlan
 }
 
-func (e *recoveryCommitAmbiguousError) Error() string {
-	return "recovery transaction commit state is ambiguous"
-}
-
-func (e *recoveryCommitAmbiguousError) Unwrap() error {
-	return e.cause
-}
+type recoveryWork func(context.Context, *sql.Tx) (recoveryPresenceResult, error)
 
 // recoveryPresenceOverrideResetOps discards preference ciphertext encrypted
 // under the pre-recovery password-derived key. Deleting the preference
-// cascades to its materialized exception rows. Visibility is forced Off in the
-// same transaction and stored text/emoji are erased so losing exclusions can
-// neither broaden the audience nor let a later tier-only update resurrect the
-// prior Custom Status.
+// cascades to its materialized exception rows. The shared forced-clear helper
+// archives and erases Custom Status before this deletion in the same tx.
 func recoveryPresenceOverrideResetOps(userID string) []recoveryTxOp {
 	return []recoveryTxOp{
-		{
-			`UPDATE user_presence_settings
-			 SET custom_text_tier = 0,
-			     custom_text = NULL,
-			     custom_text_emoji = NULL,
-			     updated_at = NOW()
-			 WHERE user_id = $1`,
-			[]interface{}{userID},
-			"Failed to reset Custom Status",
-		},
 		{
 			`DELETE FROM presence_override_preferences WHERE user_id = $1`,
 			[]interface{}{userID},
@@ -2267,40 +2240,163 @@ func recoveryPresenceOverrideResetOps(userID string) []recoveryTxOp {
 	}
 }
 
-// execRecoveryTx runs a series of SQL ops in a transaction. Begin and statement
-// failures are definitely uncommitted, so they release the Redis used-key for a
-// retry. A Commit error is ambiguous: the marker remains consumed and callers
-// receive recoveryCommitAmbiguousError so they can apply post-commit safety
-// actions fail closed. Every failure writes the HTTP response.
-func (h *Handler) execRecoveryTx(ctx context.Context, c *gin.Context, ops []recoveryTxOp, recoveryUsedKey, errMsg string) error {
-	tx, err := h.db.BeginTx(ctx, nil)
-	if err != nil {
-		h.log.Error(errMsgFailedStartTransaction, "error", err)
+func (h *Handler) recoveryWork(senderID uuid.UUID, ops []recoveryTxOp) recoveryWork {
+	return func(ctx context.Context, tx *sql.Tx) (recoveryPresenceResult, error) {
+		forcedClear, err := h.presenceHistory.BeginForcedSecurityClear(ctx, tx, senderID)
+		if err != nil {
+			return recoveryPresenceResult{}, err
+		}
+		for _, op := range ops {
+			if _, err := tx.ExecContext(ctx, op.query, op.args...); err != nil {
+				return recoveryPresenceResult{}, fmt.Errorf("recovery statement %s: %w", op.desc, err)
+			}
+		}
+		return recoveryPresenceResult{
+			Operation: forcedClear.Operation,
+			Plan:      forcedClear.Plan,
+		}, nil
+	}
+}
+
+// execRecoveryTx owns the typed recovery callback and preserves token
+// semantics across definite rollback versus ambiguous commit classification.
+func (h *Handler) execRecoveryTx(
+	ctx context.Context,
+	c *gin.Context,
+	recoveryUsedKey string,
+	errMsg string,
+	work recoveryWork,
+) (result recoveryPresenceResult, returnErr error) {
+	tx, err := h.presenceHistory.BeginTx(ctx, nil)
+	if err != nil || tx == nil {
+		if err == nil {
+			err = errors.New("recovery transaction missing")
+		}
+		h.log.Error(errMsgFailedStartTransaction, "error_class", "begin")
 		h.redis.Del(ctx, recoveryUsedKey)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
-		return err
+		return result, err
 	}
+	defer tx.Rollback() //nolint:errcheck
 	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-			h.log.Error(errMsgFailedRollbackTx, "error", rbErr)
+		if rbErr := h.presenceHistory.RollbackTx(tx); rbErr != nil && rbErr != sql.ErrTxDone {
+			returnErr = errors.Join(returnErr, rbErr)
+			h.log.Error(errMsgFailedRollbackTx, "error_class", "rollback")
 		}
 	}()
 
-	for _, op := range ops {
-		if _, err := tx.Exec(op.query, op.args...); err != nil {
-			h.log.Error(op.desc, "error", err)
-			h.redis.Del(ctx, recoveryUsedKey)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
-			return err
+	result, err = work(ctx, tx)
+	if err != nil {
+		h.log.Error("Recovery transaction failed", "error_class", "statement")
+		h.redis.Del(ctx, recoveryUsedKey)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+		return result, err
+	}
+	completion := h.presenceHistory.CompleteForcedSecurityClear(
+		ctx,
+		tx,
+		presencehistory.ForcedClearResult{
+			Mode:      presencehistory.ForcedSecurityClear,
+			Operation: result.Operation,
+			Plan:      result.Plan,
+		},
+	)
+	if completion.RequiresDisconnect() && h.hub != nil {
+		h.hub.DisconnectUser(result.Operation.SenderID)
+	}
+	if completion.Err != nil {
+		h.respondRecoveryPresenceFailure(c, errMsg, completion)
+		return result, completion.Err
+	}
+	return result, nil
+}
+
+func (h *Handler) executeRecoveryTransaction(
+	c *gin.Context,
+	senderID uuid.UUID,
+	recoveryUsedKey string,
+	errMsg string,
+	ops []recoveryTxOp,
+) error {
+	if h.presenceHistory == nil {
+		h.redis.Del(c.Request.Context(), recoveryUsedKey)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsg})
+		return errors.New("recovery presence history unavailable")
+	}
+	workStarted := false
+	err := h.presenceHistory.WithReadySenderMode(
+		c.Request.Context(), senderID, presencehistory.ForcedSecurityClear, func() error {
+			workStarted = true
+			_, workErr := h.execRecoveryTx(
+				c.Request.Context(), c, recoveryUsedKey, errMsg, h.recoveryWork(senderID, ops),
+			)
+			return workErr
+		})
+	if err != nil && !workStarted {
+		h.redis.Del(c.Request.Context(), recoveryUsedKey)
+		h.respondRecoveryReadinessFailure(c, errMsg, err)
+	}
+	return err
+}
+
+func (h *Handler) respondRecoveryReadinessFailure(c *gin.Context, errMsg string, err error) {
+	status := http.StatusInternalServerError
+	var serviceErr *presencehistory.ServiceError
+	if errors.As(err, &serviceErr) {
+		status = serviceErr.Status
+		if serviceErr.RetryAfter > 0 {
+			seconds := int64(serviceErr.RetryAfter.Round(time.Second) / time.Second)
+			c.Header("Retry-After", strconv.FormatInt(seconds, 10))
 		}
 	}
+	h.log.Error("Recovery presence readiness failed", "error_class", "readiness")
+	c.JSON(status, gin.H{"error": errMsg})
+}
 
-	if err := tx.Commit(); err != nil {
-		h.log.Error(errFailedCommitTransaction, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
-		return &recoveryCommitAmbiguousError{cause: err}
+func (h *Handler) respondRecoveryPresenceFailure(
+	c *gin.Context,
+	errMsg string,
+	completion presencehistory.ForcedClearCompletion,
+) {
+	status := http.StatusInternalServerError
+	if completion.Outcome == presencehistory.ForcedClearQuarantined {
+		status = http.StatusServiceUnavailable
 	}
-	return nil
+	h.log.Error(
+		"Recovery forced Custom Status clear failed",
+		"error_class", recoveryForcedClearClass(completion.Outcome),
+	)
+	c.JSON(status, gin.H{"error": errMsg})
+}
+
+func recoveryForcedClearClass(outcome presencehistory.ForcedClearOutcome) string {
+	switch outcome {
+	case presencehistory.ForcedClearAcknowledged:
+		return "acknowledged"
+	case presencehistory.ForcedClearQuarantined:
+		return "quarantined"
+	case presencehistory.ForcedClearRolledBack:
+		return "rolled_back"
+	case presencehistory.ForcedClearSuperseded:
+		return "superseded"
+	default:
+		return "unresolved"
+	}
+}
+
+func (h *Handler) parseRecoverySenderID(
+	c *gin.Context,
+	claims *RecoveryClaims,
+	recoveryUsedKey string,
+) (uuid.UUID, bool) {
+	senderID, err := uuid.Parse(claims.UserID)
+	if err == nil {
+		return senderID, true
+	}
+	h.redis.Del(c.Request.Context(), recoveryUsedKey)
+	h.log.Error("Recovery identity validation failed", "error_class", "invalid_claim_identity")
+	c.JSON(http.StatusUnauthorized, gin.H{"error": errInvalidExpiredRecoveryToken})
+	return uuid.Nil, false
 }
 
 // decodeOptionalRecoveryKeys decodes optional recovery key fields from base64.
@@ -2352,6 +2448,10 @@ func (h *Handler) RecoveryResetPassword(c *gin.Context) {
 	if claims == nil {
 		return
 	}
+	senderID, ok := h.parseRecoverySenderID(c, claims, recoveryUsedKey)
+	if !ok {
+		return
+	}
 
 	ctx := c.Request.Context()
 	passwordHash, wrappedKey, kdSalt, err := h.prepareRecoveryPassword(ctx, c, req.NewPassword, req.WrappedPrivateKey, req.KeyDerivationSalt, recoveryUsedKey)
@@ -2394,17 +2494,14 @@ func (h *Handler) RecoveryResetPassword(c *gin.Context) {
 		`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`,
 		[]interface{}{claims.UserID}, "Failed to revoke refresh tokens"})
 
-	if err := h.execRecoveryTx(ctx, c, ops, recoveryUsedKey, errFailedResetPwd); err != nil {
-		var ambiguousCommit *recoveryCommitAmbiguousError
-		if errors.As(err, &ambiguousCommit) {
-			h.clearCustomTextAndDisconnect(uuid.MustParse(claims.UserID))
-		}
+	if err := h.executeRecoveryTransaction(
+		c, senderID, recoveryUsedKey, errFailedResetPwd, ops,
+	); err != nil {
 		return
 	}
 
-	h.clearCustomTextAndDisconnect(uuid.MustParse(claims.UserID))
 	middleware.ClearAuthFailures(ctx, h.redis, c.ClientIP())
-	h.log.Info("Password reset via recovery", "user_id", claims.UserID)
+	h.log.Info("Password reset via recovery", "operation", "forced_security_clear")
 	c.JSON(http.StatusOK, gin.H{"message": "Password reset successfully. Please sign in with your new password."})
 }
 
@@ -2431,6 +2528,10 @@ func (h *Handler) RecoveryResetAccount(c *gin.Context) {
 
 	claims, recoveryUsedKey := h.validateAndConsumeRecoveryToken(c, req.RecoveryToken, false)
 	if claims == nil {
+		return
+	}
+	senderID, ok := h.parseRecoverySenderID(c, claims, recoveryUsedKey)
+	if !ok {
 		return
 	}
 
@@ -2469,16 +2570,13 @@ func (h *Handler) RecoveryResetAccount(c *gin.Context) {
 		[]interface{}{claims.UserID}, "Failed to revoke refresh tokens",
 	})
 
-	if err := h.execRecoveryTx(ctx, c, ops, recoveryUsedKey, errFailedResetAccount); err != nil {
-		var ambiguousCommit *recoveryCommitAmbiguousError
-		if errors.As(err, &ambiguousCommit) {
-			h.clearCustomTextAndDisconnect(uuid.MustParse(claims.UserID))
-		}
+	if err := h.executeRecoveryTransaction(
+		c, senderID, recoveryUsedKey, errFailedResetAccount, ops,
+	); err != nil {
 		return
 	}
 
-	h.clearCustomTextAndDisconnect(uuid.MustParse(claims.UserID))
-	h.log.Info("Account reset via recovery (data loss acknowledged)", "user_id", claims.UserID)
+	h.log.Info("Account reset via recovery (data loss acknowledged)", "operation", "forced_security_clear")
 	c.JSON(http.StatusOK, gin.H{"message": "Account reset successfully. All encrypted message history has been permanently lost. Please sign in with your new password."})
 }
 

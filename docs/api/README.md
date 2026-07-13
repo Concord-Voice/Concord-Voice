@@ -6,7 +6,7 @@ OpenAPI 3.0 specification for the Concord Voice Control Plane API.
 
 - [openapi.yaml](./openapi.yaml) — OpenAPI spec with full live-route coverage (drift-gated)
 
-> **Drift gate (#822):** the spec is kept in lockstep with `services/control-plane/internal/api/router.go` by `scripts/api/check-openapi-coverage.sh` (pr-ci `verify-openapi-coverage` job) — CI fails when a route is added/removed without a matching spec edit, in either direction. Inventory tooling: `scripts/api/extract-routes.py` (`--list` / `--missing` / `--stale` / `--check`).
+> **Drift gate (#822):** the spec is kept in lockstep with `services/control-plane/internal/api/router.go` and the extractor's declared delegated registrars by `scripts/api/check-openapi-coverage.sh` (pr-ci `verify-openapi-coverage` job) — CI fails when a route is added/removed without a matching spec edit, in either direction. Unlisted delegated registrars fail extraction rather than silently dropping routes. Inventory tooling: `scripts/api/extract-routes.py` (`--list` / `--missing` / `--stale` / `--check`).
 
 ## Viewing the Spec
 
@@ -57,6 +57,7 @@ npx @redocly/cli lint docs/api/openapi.yaml
 | RBAC | `/servers/{id}/roles`, `/servers/{id}/roles/{roleId}` | Bearer |
 | DMs | `/dm/conversations`, `/dm/conversations/{id}/messages` | Bearer |
 | Friends | `/friends/codes` | Bearer |
+| Activity History | `/users/me/presence-history`, `/users/me/presence-history/settings` | Bearer; authenticated subject only |
 | Voice | `/voice/{join,leave,signal}` | Bearer |
 | Platform (public) | `/client/config`, `/server/capabilities` | Public (rate-limited) |
 
@@ -101,11 +102,23 @@ Do NOT pass raw JWT tokens in the URL.
 
 ### Error Responses
 
+There is no universal error envelope. Most legacy handlers and shared auth/rate-limit middleware use:
+
 ```json
 {
   "error": "Error message description"
 }
 ```
+
+Activity History handler errors instead use a stable code and may include the current disclosure for a consent mismatch:
+
+```json
+{
+  "code": "activity_history_invalid_request"
+}
+```
+
+Its bearer-token and rate-limit failures still use the existing `error` envelope. Global header validation, account state, email verification, and client-attestation gates retain their own documented shapes. See each OpenAPI operation for its exact response schema; the Activity History routes do not expose Custom Status delivery/quarantine error codes.
 
 Common status codes: `200 OK`, `201 Created`, `400 Bad Request`, `401 Unauthorized`, `403 Forbidden`, `404 Not Found`, `429 Too Many Requests`, `500 Internal Server Error`.
 

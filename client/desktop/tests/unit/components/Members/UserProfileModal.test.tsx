@@ -225,6 +225,26 @@ describe('UserProfileModal', () => {
     });
   });
 
+  it('never requests self-only Activity History for an other-user modal', async () => {
+    render(
+      <UserProfileModal
+        isOpen={true}
+        onClose={mockOnClose}
+        member={mockMember}
+        presenceStatus="online"
+      />
+    );
+
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/users/user-1/profile');
+    });
+    await screen.findByText('Links');
+    const historyRequest = mockApiFetch.mock.calls.find(
+      ([path]) => typeof path === 'string' && path.includes('/presence-history')
+    );
+    expect(historyRequest).toBeUndefined();
+  });
+
   it('displays links from profile data', async () => {
     render(
       <UserProfileModal

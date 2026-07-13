@@ -665,7 +665,7 @@ about your text plan or data plan, contact your wireless provider.
 SMS communications, you can email us at
 [contact-us@concordvoice.com](mailto:contact-us@concordvoice.com). If you
 have any questions regarding privacy, please read our Privacy Policy at
-[http://www.concordvoice.com/privacy-policy](http://www.concordvoice.com/privacy-policy).
+[https://concordvoice.com/privacy-policy](https://concordvoice.com/privacy-policy).
 
 ---
 
@@ -673,7 +673,7 @@ have any questions regarding privacy, please read our Privacy Policy at
 
 We care about data privacy and security. Please review our Privacy Policy
 at
-[http://www.concordvoice.com/privacy-policy](http://www.concordvoice.com/privacy-policy).
+[https://concordvoice.com/privacy-policy](https://concordvoice.com/privacy-policy).
 By using the Services, you agree to be bound by our Privacy Policy, which
 is incorporated into these Legal Terms.
 

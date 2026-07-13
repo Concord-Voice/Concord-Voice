@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/database"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/storage"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/subscriptions"
@@ -30,21 +32,51 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	natsclient "github.com/markdrogersjr/Concord/services/control-plane/pkg/nats"
 	"github.com/redis/go-redis/v9"
 )
 
 const (
-	logKeyCount    = "count"
-	logKeyServerID = "server_id"
+	logKeyCount                   = "count"
+	logKeyServerID                = "server_id"
+	activityHistoryStartupBatch   = 100
+	activityHistoryStartupTimeout = 30 * time.Second
 )
 
+type controlPlaneSubcommandRunners struct {
+	admin           func([]string) int
+	activityHistory func([]string) int
+}
+
+func dispatchControlPlaneSubcommand(args []string) (int, bool) {
+	return dispatchControlPlaneSubcommandWithRunners(args, controlPlaneSubcommandRunners{
+		admin:           admin.RunAdminCtl,
+		activityHistory: presencehistory.RunAdminCtl,
+	})
+}
+
+func dispatchControlPlaneSubcommandWithRunners(
+	args []string,
+	runners controlPlaneSubcommandRunners,
+) (int, bool) {
+	if len(args) < 2 {
+		return 0, false
+	}
+	switch args[1] {
+	case "admin":
+		return runners.admin(args[2:]), true
+	case "activity-history":
+		return runners.activityHistory(args[2:]), true
+	default:
+		return 0, false
+	}
+}
+
 func main() {
-	// Admin CLI subcommand dispatch (#1688): `control-plane admin <verb>` runs the
-	// adminctl provisioning tooling (bootstrap / enroll / reset-enrollment) instead
-	// of booting the server. Invoked out-of-band via `docker exec` for first-admin
-	// provisioning and break-glass recovery — see the admin-auth design spec.
-	if len(os.Args) > 1 && os.Args[1] == "admin" {
-		os.Exit(admin.RunAdminCtl(os.Args[2:]))
+	// Maintenance subcommands are dispatched before ordinary configuration or
+	// serving dependencies are initialized.
+	if code, handled := dispatchControlPlaneSubcommand(os.Args); handled {
+		os.Exit(code)
 	}
 
 	// Load configuration
@@ -61,27 +93,24 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to connect to database", "error", err)
 	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			log.Error("Error closing database", "error", err)
-		}
-	}()
+	defer closeDatabase(db, log)
 
 	// Run migrations
 	if err := database.RunMigrations(db); err != nil {
 		log.Fatal("Failed to run migrations", "error", err)
 	}
+	presenceHistoryService := presencehistory.NewService(
+		db,
+		buildActivityHistoryDisclosure(cfg),
+		cfg.ActivityHistoryClusterEnabled,
+	)
 
 	// Initialize Redis
 	redisClient, err := database.NewRedisClient(cfg.RedisURL)
 	if err != nil {
 		log.Fatal("Failed to connect to Redis", "error", err)
 	}
-	defer func() {
-		if err := redisClient.Close(); err != nil {
-			log.Error("Error closing Redis client", "error", err)
-		}
-	}()
+	defer closeRedisClient(redisClient, log)
 
 	// Repopulate the user-disabled denylist from the DB source of truth (#1623):
 	// closes the window after a Redis flush where the immediate-effect mid-session
@@ -101,12 +130,48 @@ func main() {
 	// Initialize hot-reloadable SPA config (reads mounted spa.env when SPA_CONFIG_FILE is set)
 	liveSpa := config.NewLiveSpaConfig(cfg, cfg.SpaConfigFile, 30*time.Second)
 
-	// Initialize router (starts hub, connects NATS, subscribes to voice events)
-	router, hub, natsClient, opsMetricsRuntime := api.NewRouter(db, redisClient, storageClient, cfg, liveSpa, log)
-
 	// Start background cleanup job (reaps expired tokens, stale sessions, orphaned presence)
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	defer cleanupCancel()
+	retentionWorker := presencehistory.NewRetentionWorker(db, log)
+	var opsMetricsRuntime *api.OpsMetricsRuntime
+	runtime, startupErr := startActivityHistoryRuntime(activityHistoryRuntimeDependencies{
+		startupContext:      context.Background(),
+		workerContext:       cleanupCtx,
+		reconcileDisclosure: presenceHistoryService.ReconcileStaleDisclosure,
+		bindRouter: func() (*gin.Engine, *websocket.Hub, *natsclient.Client, error) {
+			router, hub, natsClient, metricsRuntime, routerErr := api.NewRouter(
+				db,
+				redisClient,
+				storageClient,
+				cfg,
+				liveSpa,
+				log,
+				presenceHistoryService,
+			)
+			if routerErr != nil {
+				return nil, nil, nil, routerErr
+			}
+			opsMetricsRuntime = metricsRuntime
+			return router, hub, natsClient, nil
+		},
+		reconcilePending: presenceHistoryService.ReconcilePending,
+		pendingWorker:    presenceHistoryService.RunPendingReconciler,
+		retentionWorker:  retentionWorker.Run,
+	})
+	if startupErr != nil {
+		log.Fatal(
+			"Failed to initialize Activity History runtime",
+			"error_class",
+			"activity_history_startup",
+		)
+	}
+	log.Info("Activity History startup reconciliation complete", logKeyCount, runtime.paused)
+	router := runtime.router
+	hub := runtime.hub
+	natsClient := runtime.natsClient
+	waitActivityHistoryWorkers := runtime.waitWorkers
+
 	go runCleanupJob(cleanupCtx, db, redisClient, hub, log)
 
 	pendingRepo := auth.NewPendingRepo(db)
@@ -168,12 +233,6 @@ func main() {
 
 	log.Info("Shutting down server...")
 
-	// Stop background cleanup job
-	cleanupCancel()
-
-	// Stop SPA config file watcher
-	liveSpa.Stop()
-
 	// Graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -182,7 +241,12 @@ func main() {
 	// may still use. net/http does not wait for hijacked WebSocket connections;
 	// hub.Shutdown closes those after ordinary handlers finish (#2202).
 	shutdownErr := shutdownControlPlane(
+		func() {
+			cleanupCancel()
+			liveSpa.Stop()
+		},
 		func() error { return srv.Shutdown(ctx) },
+		waitActivityHistoryWorkers,
 		func() { hub.Shutdown() },
 		func() error { return opsMetricsRuntime.Stop(ctx) },
 		func() {
@@ -198,12 +262,150 @@ func main() {
 	log.Info("Server exited")
 }
 
-func shutdownControlPlane(shutdownHTTP func() error, shutdownHub func(), shutdownMetrics func() error, closeNATS func()) error {
+func shutdownControlPlane(
+	stopBackground func(),
+	shutdownHTTP func() error,
+	waitActivityWorkers, shutdownHub func(),
+	shutdownMetrics func() error,
+	closeNATS func(),
+) error {
+	stopBackground()
 	shutdownErr := shutdownHTTP()
+	waitActivityWorkers()
 	shutdownHub()
 	shutdownErr = errors.Join(shutdownErr, shutdownMetrics())
 	closeNATS()
 	return shutdownErr
+}
+
+type activityHistoryRuntimeDependencies struct {
+	startupContext      context.Context
+	workerContext       context.Context
+	reconcileDisclosure func(context.Context) (int64, error)
+	bindRouter          func() (*gin.Engine, *websocket.Hub, *natsclient.Client, error)
+	reconcilePending    func(context.Context, int) (presencehistory.ReconcileStats, error)
+	pendingWorker       func(context.Context)
+	retentionWorker     func(context.Context)
+}
+
+type activityHistoryRuntime struct {
+	router      *gin.Engine
+	hub         *websocket.Hub
+	natsClient  *natsclient.Client
+	waitWorkers func()
+	paused      int64
+}
+
+func startActivityHistoryRuntime(
+	dependencies activityHistoryRuntimeDependencies,
+) (activityHistoryRuntime, error) {
+	if dependencies.startupContext == nil || dependencies.workerContext == nil ||
+		dependencies.reconcileDisclosure == nil || dependencies.bindRouter == nil ||
+		dependencies.reconcilePending == nil || dependencies.pendingWorker == nil ||
+		dependencies.retentionWorker == nil {
+		return activityHistoryRuntime{}, errors.New("activity history runtime dependency unavailable")
+	}
+
+	runtime := activityHistoryRuntime{waitWorkers: func() {}}
+	paused, err := initializeActivityHistoryRuntime(
+		dependencies.startupContext,
+		activityHistoryStartupSteps{
+			reconcileDisclosure: dependencies.reconcileDisclosure,
+			bindRuntime: func() error {
+				var bindErr error
+				runtime.router, runtime.hub, runtime.natsClient, bindErr = dependencies.bindRouter()
+				return bindErr
+			},
+			reconcilePending: dependencies.reconcilePending,
+			startWorkers: func() {
+				runtime.waitWorkers = startActivityHistoryWorkers(
+					dependencies.workerContext,
+					dependencies.pendingWorker,
+					dependencies.retentionWorker,
+				)
+			},
+		},
+	)
+	if err != nil {
+		return activityHistoryRuntime{}, err
+	}
+	runtime.paused = paused
+	return runtime, nil
+}
+
+type activityHistoryStartupSteps struct {
+	reconcileDisclosure func(context.Context) (int64, error)
+	bindRuntime         func() error
+	reconcilePending    func(context.Context, int) (presencehistory.ReconcileStats, error)
+	startWorkers        func()
+}
+
+func initializeActivityHistoryRuntime(
+	ctx context.Context,
+	steps activityHistoryStartupSteps,
+) (int64, error) {
+	if steps.reconcileDisclosure == nil || steps.bindRuntime == nil ||
+		steps.reconcilePending == nil || steps.startWorkers == nil {
+		return 0, errors.New("activity history startup dependency unavailable")
+	}
+	startupCtx, cancel := context.WithTimeout(ctx, activityHistoryStartupTimeout)
+	defer cancel()
+
+	paused, err := steps.reconcileDisclosure(startupCtx)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile activity history disclosure: %w", err)
+	}
+	if err := steps.bindRuntime(); err != nil {
+		return 0, fmt.Errorf("bind activity history runtime: %w", err)
+	}
+	if _, err := steps.reconcilePending(startupCtx, activityHistoryStartupBatch); err != nil {
+		return 0, fmt.Errorf("reconcile pending activity history operations: %w", err)
+	}
+	steps.startWorkers()
+	return paused, nil
+}
+
+func buildActivityHistoryDisclosure(cfg *config.Config) presencehistory.DisclosureState {
+	if cfg == nil {
+		return presencehistory.DisclosureState{}
+	}
+	development := cfg.Environment == "development" || cfg.Environment == "test"
+	return presencehistory.BuildDisclosure(presencehistory.DisclosureOptions{
+		InstanceType:     cfg.InstanceType,
+		OperatorName:     cfg.ActivityHistoryOperatorName,
+		PrivacyPolicyURL: cfg.ActivityHistoryPrivacyPolicyURL,
+		Development:      development,
+	})
+}
+
+func startActivityHistoryWorkers(
+	ctx context.Context,
+	pendingWorker func(context.Context),
+	retentionWorker func(context.Context),
+) func() {
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		pendingWorker(ctx)
+	}()
+	go func() {
+		defer workers.Done()
+		retentionWorker(ctx)
+	}()
+	return workers.Wait
+}
+
+func closeDatabase(db *sql.DB, log *logger.Logger) {
+	if err := db.Close(); err != nil {
+		log.Error("Error closing database", "error", err)
+	}
+}
+
+func closeRedisClient(redisClient *redis.Client, log *logger.Logger) {
+	if err := redisClient.Close(); err != nil {
+		log.Error("Error closing Redis client", "error", err)
+	}
 }
 
 func initStorageClient(cfg *config.Config, log *logger.Logger) *storage.Client {

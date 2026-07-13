@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useTransition, useCallback } from '
 import { useDraftSettingsLifecycle, useDraftActions } from '../../hooks/useDraftSettings';
 import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
 import { useSettingsNavStore, type SettingsSection } from '../../stores/settingsNavStore';
+import { useClientConfigStore } from '../../stores/clientConfigStore';
 import AppearanceSection from './AppearanceSection';
 import PrivacySecuritySection from './PrivacySecuritySection';
 import VoiceAudioSection from './VoiceAudioSection';
@@ -19,6 +20,12 @@ interface NavItem {
   label: string;
   icon: React.ReactNode;
   enabled: boolean;
+}
+
+interface NavSubsection {
+  id: string;
+  label: string;
+  focusControlId?: string;
 }
 
 const navItems: NavItem[] = [
@@ -144,7 +151,7 @@ const navItems: NavItem[] = [
   },
 ];
 
-const NAV_SUBSECTIONS: Record<string, { id: string; label: string }[]> = {
+const NAV_SUBSECTIONS: Record<string, NavSubsection[]> = {
   appearance: [
     { id: 'color-scheme', label: 'Color Scheme' },
     { id: 'theme', label: 'Theme' },
@@ -159,6 +166,11 @@ const NAV_SUBSECTIONS: Record<string, { id: string; label: string }[]> = {
   ],
   account: [
     { id: 'profile', label: 'My Profile' },
+    {
+      id: 'presence-history',
+      label: 'Activity History',
+      focusControlId: 'presence-history-heading',
+    },
     { id: 'nsfw-content', label: 'NSFW Content Access' },
   ],
   notifications: [
@@ -185,6 +197,11 @@ const NAV_SUBSECTIONS: Record<string, { id: string; label: string }[]> = {
 
 const SettingsPage: React.FC = () => {
   const closeOverlay = useSettingsOverlayStore((s) => s.close);
+  const activityHistoryCapability = useClientConfigStore(
+    (state) => state.activityHistoryCapability
+  );
+  const hiddenSubsectionId =
+    activityHistoryCapability.status === 'confirmed-unsupported' ? 'presence-history' : null;
   const [activeSection, setActiveSection] = useState<SettingsSection>('appearance');
   const [isPending, startTransition] = useTransition();
   const [activeSubsection, setActiveSubsection] = useState<string | null>(null);
@@ -266,7 +283,12 @@ const SettingsPage: React.FC = () => {
   // pane first and defer the scroll until it mounts (same post-commit delay the
   // focusRequest effect uses); otherwise scroll immediately.
   const handleSubNavClick = useCallback(
-    (paneId: SettingsSection, subId: string) => {
+    (paneId: SettingsSection, subId: string, focusControlId?: string) => {
+      if (focusControlId) {
+        pendingScrollRef.current = null;
+        useSettingsNavStore.getState().requestFocus(paneId, focusControlId);
+        return;
+      }
       if (activeSection === paneId) {
         scrollToSection(subId);
         return;
@@ -387,7 +409,9 @@ const SettingsPage: React.FC = () => {
                   const isActive = activeSection === item.id;
                   // Render every pane's sub-tree so sub-sections (e.g. System
                   // Permissions) are reachable from the top-level nav (#1743).
-                  const subs = NAV_SUBSECTIONS[item.id];
+                  const subs = NAV_SUBSECTIONS[item.id]?.filter(
+                    (sub) => sub.id !== hiddenSubsectionId
+                  );
 
                   return (
                     <div key={item.id} className="settings-nav-group">
@@ -412,7 +436,9 @@ const SettingsPage: React.FC = () => {
                             >
                               <button
                                 className={`settings-nav-tree-item${activeSubsection === sub.id ? ' active' : ''}`}
-                                onClick={() => handleSubNavClick(item.id, sub.id)}
+                                onClick={() =>
+                                  handleSubNavClick(item.id, sub.id, sub.focusControlId)
+                                }
                               >
                                 {sub.label}
                               </button>

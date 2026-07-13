@@ -5,7 +5,7 @@
 > **Source-of-truth note.** This document is the canonical Privacy Policy
 > for Concord Voice, maintained in the project repository for review and
 > version control. The published web version at
-> [www.concordvoice.com/privacy-policy](https://www.concordvoice.com/privacy-policy)
+> [concordvoice.com/privacy-policy](https://concordvoice.com/privacy-policy)
 > should mirror this document. If the two diverge, this document represents
 > the intended terms and the published web version should be updated to match.
 
@@ -58,6 +58,13 @@ necessary to decrypt your end-to-end encrypted content, and we are
 technically unable to read, scan, analyze, moderate, or disclose the
 content of encrypted messages — even when compelled by legal process.
 See [Section 2](#2-end-to-end-encryption-and-content-inaccessibility).
+
+**Optional Activity History is server-readable.** Activity History is off by
+default and begins recording only after current, explicit consent. The hosted
+service can read the Custom Status text, emoji, and timestamps stored in this
+ledger. Access through the product API is limited to the account that owns the
+history. See [Sections 2.4](#24-what-concord-voice-can-see-metadata-and-server-visible-presence)
+and [10](#10-how-long-do-we-keep-your-information).
 
 **Do we process sensitive personal information?** Some of the information
 may be considered "special" or "sensitive" in certain jurisdictions, for
@@ -219,6 +226,12 @@ information if you choose to provide us with access or permission:
   your account or certain features of the application(s). If you wish
   to opt out from receiving these types of communications, you may
   turn them off in your device's settings.
+- **Activity History.** If you explicitly enable this optional feature, we
+  store a server-readable history of later semantic changes to your Custom
+  Status text and emoji, with activity and recording timestamps. Enabling does
+  not backfill a current or prior status. The category taxonomy can represent
+  other activity types, but Custom Status is the only currently functional
+  history adapter.
 
 This information is primarily needed to maintain the security and
 operation of our application(s), for troubleshooting, and for our
@@ -373,6 +386,8 @@ for service operation may be collected and processed. This includes:
 - Server membership and channel membership
 - Presence status (online, away, offline) and any optional Custom Status
   text or emoji you choose to set
+- If you opt in to Activity History, a server-readable ledger of later Custom
+  Status text/emoji changes and their activity, recording, and expiry timestamps
 - The account identifiers you explicitly exclude from seeing your Custom
   Status, which are used to enforce your recipient choices
 - Aggregate counts (number of messages in a channel, etc.)
@@ -394,6 +409,13 @@ account recovery reset deletes the exception document, excluded-account
 identifiers, and stored Custom Status text/emoji; it turns visibility off and
 clears the prior status from connected users in the account's presence
 audience.
+
+Activity History is distinct from live audience visibility and is not E2EE.
+When enabled, recording continues for later semantic Custom Status changes even
+if the live Custom Status visibility tier is Off; a tier-only change does not
+create a history interval. The authenticated history API contains no target-user
+identifier and returns only the caller's rows, but the service operator can read
+the underlying database.
 
 ### 2.5 Limits of End-to-End Encryption
 
@@ -451,6 +473,9 @@ on how you interact with our Services, including:
   presence) so that messages and calls are routed correctly. Message
   content itself is end-to-end encrypted (see
   [Section 2](#2-end-to-end-encryption-and-content-inaccessibility)).
+- **To provide optional Activity History.** After explicit opt-in, we store
+  later Custom Status changes so you can review your own recent activity. This
+  storage is not needed for live presence and stops when you withdraw consent.
 - **To protect our Services.** We may process your information as part
   of our efforts to keep our Services safe and secure, including fraud
   monitoring and prevention, rate-limiting, and abuse detection (based
@@ -498,7 +523,10 @@ to process your personal information:
 
 - **Consent.** We may process your information if you have given us
   permission to use your personal information for a specific purpose.
-  You can withdraw your consent at any time.
+  You can withdraw your consent at any time. Activity History requires a
+  current affirmative acknowledgement in the product before recording begins;
+  the appropriate legal basis for a particular jurisdiction remains subject to
+  applicable law and legal review.
 - **Performance of a Contract.** We may process your personal
   information when we believe it is necessary to fulfill our
   contractual obligations to you, including providing our Services or
@@ -861,6 +889,21 @@ content stored on our servers is also deleted within this window
 (though ciphertext is, by construction, not readable by us — only the
 deletion of the ciphertext copies is meaningful from our perspective).
 
+**Activity History has a user-selected 7, 30, 90, or 365 day retention
+period** (30 days by default). Each row expires from its recording time. Reads
+first delete rows at the exact expiry cutoff and never return an expired row.
+The cleanup worker runs at startup and daily; while the service and database are
+healthy, expired rows are normally physically deleted from the active database
+within 24 hours. Reducing retention recomputes expiry and deletes newly expired
+rows; increasing it does not restore deleted rows.
+
+Disabling or deleting Activity History atomically withdraws consent and deletes
+its rows from the active database. Account deletion also cascades to those rows.
+Backup retention, restoration, and any copy preserved under a valid legal hold
+follow the operator's separate backup and legal obligations; the feature does
+not promise deletion from every backup or legally retained copy on the active-
+database schedule.
+
 When we have no ongoing legitimate business need to process your
 personal information, we will either delete or anonymize such
 information, or, if this is not possible (for example, because your
@@ -956,6 +999,11 @@ However, please note that this will not affect the lawfulness of the
 processing before its withdrawal nor, when applicable law allows, will
 it affect the processing of your personal information conducted in
 reliance on lawful processing grounds other than consent.
+
+For Activity History, use **Delete history and turn off** in the Activity History
+settings. This idempotent action withdraws consent, deletes the active-database
+history, and prevents new recording until you opt in again. There is no Activity
+History export endpoint.
 
 ### Opting out of marketing and promotional communications
 
@@ -1275,6 +1323,8 @@ valid legal process includes, where available and applicable:
 - Payment records (if applicable)
 - Unencrypted metadata and server-visible presence information as described in
   [Section 2.4](#24-what-concord-voice-can-see-metadata-and-server-visible-presence)
+- Server-readable Activity History, if the account opted in and unexpired rows
+  remain available in the active database
 
 We will **notify affected users of legal process requests** unless
 prohibited by law, gag order, or court order from doing so, or where
@@ -1313,6 +1363,12 @@ organization or individual), then:
 - This Privacy Notice does **not** apply to data processed on
   self-hosted instances; you should consult the privacy policy of the
   organization operating that instance.
+- A self-hosted operator that offers Activity History must configure its own
+  operator name and absolute HTTPS privacy-policy URL. That operator is
+  responsible for its disclosure, lawful basis, retention operations, backups,
+  legal holds, and responses to legal process. Missing or invalid disclosure
+  configuration prevents new opt-in but does not prevent users from reading or
+  deleting history already stored on the instance.
 
 ### 18.2 When This Privacy Notice Applies to Self-Hosters
 

@@ -138,7 +138,9 @@ vi.mock('@/renderer/components/ui/Modal', () => ({
     isOpen ? <div data-testid="modal">{children}</div> : null,
 }));
 vi.mock('@/renderer/stores/clientConfigStore', () => ({
-  useClientConfigStore: vi.fn((s) => s({})),
+  useClientConfigStore: vi.fn((s) =>
+    s({ activityHistoryCapability: { status: 'confirmed-unsupported' } })
+  ),
 }));
 
 import PrivacySecuritySection from '@/renderer/components/Settings/PrivacySecuritySection';

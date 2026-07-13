@@ -2,9 +2,9 @@ package testhelpers
 
 import (
 	"database/sql"
-	"os"
 	"testing"
 
+	dbtest "github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers/testdb"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 
@@ -29,11 +29,7 @@ import (
 // otherwise short-circuit before the DB query).
 func BrokenResolver(t *testing.T, rdb *redis.Client) *rbac.Resolver {
 	t.Helper()
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = defaultTestDatabaseURL
-	}
-	closed, err := sql.Open("postgres", dbURL)
+	closed, err := sql.Open("postgres", dbtest.DatabaseURL())
 	require.NoError(t, err)
 	// Close immediately: every subsequent query returns "sql: database is closed".
 	require.NoError(t, closed.Close())

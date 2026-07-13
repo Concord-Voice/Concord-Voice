@@ -1,6 +1,6 @@
 import React, { useContext, useEffect, useId, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { ModalDepthContext, useModalStack } from './ModalContext';
+import { ModalDepthContext, ModalPortalHostContext, useModalStack } from './ModalContext';
 import './Modal.css';
 
 export interface ModalProps {
@@ -10,6 +10,7 @@ export interface ModalProps {
   children: React.ReactNode;
   width?: 'small' | 'medium' | 'large' | 'xlarge';
   dismissable?: boolean;
+  initialFocusRef?: React.RefObject<HTMLElement | null>;
 }
 
 // Focusable descendants of a modal container, in DOM order, for the Tab trap.
@@ -31,6 +32,7 @@ const Modal: React.FC<ModalProps> = ({
   children,
   width = 'medium',
   dismissable = true,
+  initialFocusRef,
 }) => {
   const overlayRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDialogElement>(null);
@@ -39,6 +41,8 @@ const Modal: React.FC<ModalProps> = ({
   const titleId = useId();
   // eslint-disable-next-line @eslint-react/no-use-context -- useContext is the appropriate API here; use() would change conditional-hook semantics for this depth read
   const depth = useContext(ModalDepthContext);
+  // eslint-disable-next-line @eslint-react/no-use-context -- useContext is the appropriate API for this optional portal-host read
+  const portalHost = useContext(ModalPortalHostContext);
   const { register, unregister, isTopmost } = useModalStack();
 
   useEffect(() => {
@@ -63,13 +67,18 @@ const Modal: React.FC<ModalProps> = ({
     if (!isOpen) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && dismissable && isTopmost(modalId)) {
-        e.stopImmediatePropagation();
-        onClose();
-      }
+      if (e.key !== 'Escape' || !isTopmost(modalId)) return;
+      // A child Modal may live inside a native showModal() host. Consume Escape
+      // in capture phase so neither that host's listener nor the browser's
+      // default cancel action can close the parent Settings surface. A
+      // non-dismissible child must consume it too; dismissable controls only
+      // whether this modal invokes onClose.
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (dismissable) onClose();
     };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => document.removeEventListener('keydown', handleKeyDown, true);
   }, [isOpen, onClose, modalId, isTopmost, dismissable]);
 
   // Move focus into the dialog on open, and restore it to the invoking element
@@ -81,11 +90,11 @@ const Modal: React.FC<ModalProps> = ({
     if (!isOpen || !isTopmost(modalId)) return;
     // The invoker was captured in the register effect above (before #root became
     // inert). Here we only move focus into the dialog; the cleanup restores it.
-    containerRef.current?.focus();
+    (initialFocusRef?.current ?? containerRef.current)?.focus();
     return () => {
       previousFocusRef.current?.focus?.();
     };
-  }, [isOpen, isTopmost, modalId]);
+  }, [isOpen, isTopmost, modalId, initialFocusRef]);
 
   // Contain Tab / Shift-Tab within the topmost modal. A document-level listener
   // (mirroring the Escape handler above) is used rather than an onKeyDown on the
@@ -168,15 +177,18 @@ const Modal: React.FC<ModalProps> = ({
       </dialog>
     </div>
   );
-  // Portal to document.body so the modal renders OUTSIDE #root (#2087). This is
-  // what lets ModalContext make #root `inert` while a modal is open without
-  // inert-ing the modal itself — impossible while rendering inline inside #root,
-  // since `inert` has no per-descendant escape. Context still flows through the
-  // portal (React tree is preserved), so nested modals keep their depth+1.
+  // Portal outside #root — normally to document.body, or to a designated native
+  // dialog host that itself lives beside #root (#2087). This lets ModalContext
+  // make #root `inert` without inert-ing the modal itself. Context still flows
+  // through the portal (React tree is preserved), so nested modals keep depth+1.
+  // A native dialog opened with showModal() lives in the browser top layer.
+  // Portaling a child modal to document.body would leave it underneath that
+  // dialog regardless of z-index, so designated hosts keep their child modal
+  // inside the same top-layer subtree (SettingsOverlayHost is one such host).
   return createPortal(
     // eslint-disable-next-line @eslint-react/no-context-provider -- Context.Provider pattern required for depth nesting; React 19 Context-as-JSX refactor deferred
     <ModalDepthContext.Provider value={depth + 1}>{content}</ModalDepthContext.Provider>,
-    document.body
+    portalHost ?? document.body
   );
 };
 

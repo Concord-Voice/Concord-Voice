@@ -7,8 +7,8 @@ desktop client connects to an older self-hosted server).
 
 - **Auth:** none required. The response is identical with or without an
   `Authorization` header — it carries no user-specific data.
-- **Caching:** `Cache-Control: public, max-age=300` (5-minute TTL; a config flag
-  flip propagates within the TTL).
+- **Caching:** `Cache-Control: public, max-age=300` (5-minute TTL; a rollout
+  configuration change propagates within the TTL).
 - **Rate limit:** 30 requests/minute/IP (matches the sibling `/client/config`).
   The descriptor is constant and auth-state-independent, so there is nothing to
   enumerate; the limit is abuse/DoS throttling. It is deliberately not tighter
@@ -33,7 +33,18 @@ desktop client connects to an older self-hosted server).
 | `features.e2eeEnforcedEverywhere` | boolean | Always `true` (E2EE-everywhere, #201). |
 | `features.maxMembersPerServer` | integer | Advisory ceiling. |
 | `features.entitlementMode` | string | `"saas"` or `"self-hosted-unlocked"` (derived from `instanceType`). On self-hosted, the control-plane entitlement resolver returns the maximal current entitlement set for every user. |
+| `features.activityHistorySupported` | boolean, optional | Emitted as `true` only when the cluster gate is enabled and the replica count was explicitly set to one. Otherwise omitted; the backend does not emit `false`. |
 | `policyVersion` | string | Bumped when the server policy set changes. |
+
+### Activity History support state
+
+The desktop treats a schema-valid `true` as supported and a schema-valid
+missing/`false` value as confirmed unsupported. A fetch failure, non-2xx
+response, or malformed payload is an error, not an unsupported result, and
+preserves the last confirmed support state. Capability `true` does not prove
+that operator disclosure is usable: `GET /users/me/presence-history/settings`
+can separately return `available:false`, which the client presents as an
+operator/disclosure-unavailable state.
 
 ## Additive-evolution contract
 
@@ -69,7 +80,8 @@ GET /api/v1/server/capabilities
     "voiceTiersSupported": true,
     "e2eeEnforcedEverywhere": true,
     "maxMembersPerServer": 500,
-    "entitlementMode": "saas"
+    "entitlementMode": "saas",
+    "activityHistorySupported": true
   },
   "policyVersion": "2026-06-01"
 }
@@ -104,7 +116,10 @@ GET /api/v1/server/capabilities
 |---|---|---|
 | `INSTANCE_TYPE` | `saas` | `saas` or `self-hosted`. The self-hosted deploy sets `self-hosted`; unknown values normalize to `saas` before capabilities and entitlement resolution. |
 | `SERVER_VERSION` | `dev` | Advertised server version. The SaaS deploy pipeline sets the release tag. |
+| `ACTIVITY_HISTORY_CLUSTER_ENABLED` | `false` | Activity History rollout gate. Support is advertised only when this is `true`. |
+| `CONTROL_PLANE_REPLICA_COUNT` | unset | Must be explicitly set to `1`, together with the enabled cluster gate, before Activity History support is advertised. |
 
-Both are non-secret, safe-defaulted, and provisioned through `provision-secrets.yml`
-(GitHub Actions `vars.*`). All other fields derive from existing server config
-(SMTP, SSO, WebAuthn presence).
+These values are non-secret and flow through the deployment configuration.
+Other fields derive from existing server config (SMTP, SSO, WebAuthn presence).
+Activity History operator disclosure has its own settings-level availability
+contract and is not collapsed into this capability bit.

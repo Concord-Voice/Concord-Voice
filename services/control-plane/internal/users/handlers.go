@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -20,6 +19,7 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/media"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 )
@@ -31,7 +31,6 @@ const (
 	errMsgFailedChangePassword  = "Failed to change password"
 	errMsgMFAVerificationFailed = "MFA verification failed"
 	dataImagePrefix             = "data:image/"
-	customStatusLockStripes     = 256
 )
 
 // MFAVerifier checks MFA status and verifies codes for sensitive operations.
@@ -39,88 +38,20 @@ type MFAVerifier interface {
 	VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID string, code string) (bool, error)
 }
 
-type presenceOverrideBroadcaster interface {
-	BroadcastCustomText(uuid.UUID, int, *websocket.CustomTextPayload)
-	BroadcastToUser(uuid.UUID, websocket.OutgoingMessage)
-	BroadcastCustomTextAudienceDelta(
-		uuid.UUID,
-		map[uuid.UUID]bool,
-		map[uuid.UUID]bool,
-		*websocket.CustomTextPayload,
-	)
-}
-
-type customTextResetBroadcaster interface {
-	ClearCustomTextForPresenceAudience(uuid.UUID)
-}
-
 type sessionDisconnector interface {
 	DisconnectUser(uuid.UUID)
 }
 
-// customStatusCoordinator serializes Custom Status persistence and synchronous
-// fan-out for one sender. The production implementation remains the bounded
-// 256-stripe mutex coordinator; the interface is private so deterministic
-// handler-level concurrency tests can observe queueing without exposing a
-// production API.
-type customStatusCoordinator interface {
-	WithSender(uuid.UUID, func())
-}
-
-type stripedCustomStatusCoordinator struct {
-	locks *[customStatusLockStripes]sync.Mutex
-}
-
-func (c *stripedCustomStatusCoordinator) WithSender(senderID uuid.UUID, fn func()) {
-	lock := customStatusLock(c.locks, senderID)
-	lock.Lock()
-	defer lock.Unlock()
-	fn()
-}
-
 // Handler handles user-related requests including profile management and settings.
 type Handler struct {
-	db                          *sql.DB
-	log                         *logger.Logger
-	hub                         *websocket.Hub
-	presenceOverrideBroadcaster presenceOverrideBroadcaster
-	customTextResetBroadcaster  customTextResetBroadcaster
-	sessionDisconnector         sessionDisconnector
-	customStatusLocks           [customStatusLockStripes]sync.Mutex
-	customStatusCoordinator     customStatusCoordinator
-	mfaVerifier                 MFAVerifier
-	tiers                       entitlements.TierResolver // resolves the acting user's subscription tier (#1298)
-	store                       media.ObjectDeleter       // nil when object storage is not configured
-}
-
-func (h *Handler) customStatusLock(senderID uuid.UUID) *sync.Mutex {
-	return customStatusLock(&h.customStatusLocks, senderID)
-}
-
-func customStatusLock(locks *[customStatusLockStripes]sync.Mutex, senderID uuid.UUID) *sync.Mutex {
-	const (
-		fnvOffset32 = uint32(2166136261)
-		fnvPrime32  = uint32(16777619)
-	)
-	hash := fnvOffset32
-	for _, part := range senderID {
-		hash ^= uint32(part)
-		hash *= fnvPrime32
-	}
-	return &locks[int(hash%customStatusLockStripes)]
-}
-
-func (h *Handler) withCustomStatusSender(senderID uuid.UUID, fn func()) {
-	if h.customStatusCoordinator != nil {
-		h.customStatusCoordinator.WithSender(senderID, fn)
-		return
-	}
-	// Preserve safe zero-value behavior for narrow unit tests that construct a
-	// Handler literal instead of going through NewHandler.
-	lock := h.customStatusLock(senderID)
-	lock.Lock()
-	defer lock.Unlock()
-	fn()
+	db                  *sql.DB
+	log                 *logger.Logger
+	hub                 *websocket.Hub
+	presenceHistory     *presencehistory.Service
+	sessionDisconnector sessionDisconnector
+	mfaVerifier         MFAVerifier
+	tiers               entitlements.TierResolver // resolves the acting user's subscription tier (#1298)
+	store               media.ObjectDeleter       // nil when object storage is not configured
 }
 
 // NewHandler creates a new user handler.
@@ -132,13 +63,16 @@ func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, mfaVerifier 
 		mfaVerifier: mfaVerifier,
 		tiers:       tiers,
 	}
-	h.customStatusCoordinator = &stripedCustomStatusCoordinator{locks: &h.customStatusLocks}
 	if hub != nil {
-		h.presenceOverrideBroadcaster = hub
-		h.customTextResetBroadcaster = hub
 		h.sessionDisconnector = hub
 	}
 	return h
+}
+
+// SetPresenceHistory injects the one concrete service shared by Custom Status
+// writers, acknowledged delivery, reconciliation, and reconnect snapshots.
+func (h *Handler) SetPresenceHistory(service *presencehistory.Service) {
+	h.presenceHistory = service
 }
 
 // SetMediaStore configures optional object storage for media cleanup on profile image removal.
@@ -317,7 +251,7 @@ func (h *Handler) ReplaceMyKeys(c *gin.Context) {
 
 	uid, ok := userID.(string)
 	if !ok {
-		h.log.Error("user_id is not a string; refusing key reset", "type", fmt.Sprintf("%T", userID))
+		h.log.Error("Invalid authenticated identity for key reset", "error_class", "identity_type")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
 		return
 	}
@@ -326,17 +260,26 @@ func (h *Handler) ReplaceMyKeys(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgUnauthorized})
 		return
 	}
-	h.withCustomStatusSender(senderID, func() {
-		h.replaceMyKeysCoordinated(
-			c,
-			userID,
-			senderID,
-			req,
-			wrappedKeyBytes,
-			saltBytes,
-			publicKeyBytes,
-		)
-	})
+	if h.presenceHistory == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedReplaceKeys})
+		return
+	}
+	err = h.presenceHistory.WithReadySenderMode(
+		c.Request.Context(), senderID, presencehistory.ForcedSecurityClear, func() error {
+			h.replaceMyKeysCoordinated(
+				c,
+				userID,
+				senderID,
+				req,
+				wrappedKeyBytes,
+				saltBytes,
+				publicKeyBytes,
+			)
+			return nil
+		})
+	if err != nil && !c.Writer.Written() {
+		h.respondPresenceWriterFailure(c, errMsgFailedReplaceKeys, err)
+	}
 }
 
 func (h *Handler) replaceMyKeysCoordinated(
@@ -346,59 +289,98 @@ func (h *Handler) replaceMyKeysCoordinated(
 	req ReplaceKeysRequest,
 	wrappedKeyBytes, saltBytes, publicKeyBytes []byte,
 ) {
-	tx, err := h.db.BeginTx(c.Request.Context(), nil)
-	if err != nil {
-		h.log.Error("Failed to begin key replacement tx", "error", err)
+	tx, err := h.presenceHistory.BeginTx(c.Request.Context(), nil)
+	if err != nil || tx == nil {
+		h.log.Error("Failed to begin key replacement tx", "error_class", "begin")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
 		return
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-				h.log.Error("Failed to roll back key replacement tx", "error", rbErr)
-			}
-		}
-	}()
+	defer tx.Rollback() //nolint:errcheck
+	defer h.rollbackKeyReplacement(tx)
 
 	if err := h.verifyStepUpWithLockedUser(
 		c.Request.Context(), tx, senderID, req.CurrentPassword, req.MFACode,
 	); err != nil {
-		var reauthErr *stepUpReauthenticationError
-		if errors.As(err, &reauthErr) {
-			c.JSON(reauthErr.status, reauthErr.body)
-			return
-		}
-		h.log.Error("Failed to re-authenticate key replacement", "error", err)
+		h.respondKeyReplacementReauthenticationFailure(c, err)
+		return
+	}
+	forcedClear, err := h.presenceHistory.BeginForcedSecurityClear(
+		c.Request.Context(), tx, senderID,
+	)
+	if err != nil {
+		h.log.Error("Failed to prepare forced Custom Status clear", "error_class", "prepare")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
 		return
 	}
 
 	if err := replaceKeyMaterialTx(tx, userID, wrappedKeyBytes, saltBytes, req.KeyDerivationAlg, publicKeyBytes); err != nil {
-		h.log.Error("Failed to replace E2EE key material", "error", err)
+		h.log.Error("Failed to replace E2EE key material", "error_class", "key_material")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
 		return
 	}
 
-	if err := tx.Commit(); err != nil {
-		h.clearCustomTextAndDisconnect(senderID)
-		h.log.Error("Failed to commit key replacement", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
+	if !h.completeKeyReplacementClear(c, tx, forcedClear) {
 		return
 	}
-	committed = true
 
-	h.clearCustomTextAndDisconnect(senderID)
-	h.log.Info("E2EE keys replaced (atomic reset)", "user_id", userID, "alg", req.KeyDerivationAlg)
+	h.log.Info("E2EE keys replaced (atomic reset)", "operation", "forced_security_clear")
 	c.JSON(http.StatusOK, gin.H{"message": "Keys replaced successfully. Encrypted message history was reset."})
 }
 
-func (h *Handler) clearCustomTextAndDisconnect(userID uuid.UUID) {
-	if h.customTextResetBroadcaster != nil {
-		h.customTextResetBroadcaster.ClearCustomTextForPresenceAudience(userID)
+func (h *Handler) rollbackKeyReplacement(tx *sql.Tx) {
+	if rbErr := h.presenceHistory.RollbackTx(tx); rbErr != nil && rbErr != sql.ErrTxDone {
+		h.log.Error("Failed to roll back key replacement tx", "error_class", "rollback")
 	}
-	if h.sessionDisconnector != nil {
-		h.sessionDisconnector.DisconnectUser(userID)
+}
+
+func (h *Handler) respondKeyReplacementReauthenticationFailure(c *gin.Context, err error) {
+	var reauthErr *stepUpReauthenticationError
+	if errors.As(err, &reauthErr) {
+		c.JSON(reauthErr.status, reauthErr.body)
+		return
+	}
+	h.log.Error("Failed to re-authenticate key replacement", "error_class", "reauthentication")
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
+}
+
+func (h *Handler) completeKeyReplacementClear(
+	c *gin.Context,
+	tx *sql.Tx,
+	forcedClear presencehistory.ForcedClearResult,
+) bool {
+	completion := h.presenceHistory.CompleteForcedSecurityClear(
+		c.Request.Context(), tx, forcedClear,
+	)
+	if completion.RequiresDisconnect() && h.sessionDisconnector != nil {
+		h.sessionDisconnector.DisconnectUser(forcedClear.Operation.SenderID)
+	}
+	if completion.Err == nil {
+		return true
+	}
+	status := http.StatusInternalServerError
+	if completion.Outcome == presencehistory.ForcedClearQuarantined {
+		status = http.StatusServiceUnavailable
+	}
+	h.log.Error(
+		"Failed to complete forced Custom Status clear",
+		"error_class", forcedClearOutcomeClass(completion.Outcome),
+	)
+	c.JSON(status, gin.H{"error": errMsgFailedReplaceKeys})
+	return false
+}
+
+func forcedClearOutcomeClass(outcome presencehistory.ForcedClearOutcome) string {
+	switch outcome {
+	case presencehistory.ForcedClearAcknowledged:
+		return "acknowledged"
+	case presencehistory.ForcedClearQuarantined:
+		return "quarantined"
+	case presencehistory.ForcedClearRolledBack:
+		return "rolled_back"
+	case presencehistory.ForcedClearSuperseded:
+		return "superseded"
+	default:
+		return "unresolved"
 	}
 }
 

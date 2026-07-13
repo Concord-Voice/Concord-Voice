@@ -48,10 +48,11 @@ type AuthInfo struct {
 
 // FeaturesInfo advertises the feature surface the client clamps to.
 type FeaturesInfo struct {
-	VoiceTiersSupported    bool   `json:"voiceTiersSupported"`
-	E2EEEnforcedEverywhere bool   `json:"e2eeEnforcedEverywhere"`
-	MaxMembersPerServer    int    `json:"maxMembersPerServer"`
-	EntitlementMode        string `json:"entitlementMode"`
+	VoiceTiersSupported      bool   `json:"voiceTiersSupported"`
+	E2EEEnforcedEverywhere   bool   `json:"e2eeEnforcedEverywhere"`
+	MaxMembersPerServer      int    `json:"maxMembersPerServer"`
+	EntitlementMode          string `json:"entitlementMode"`
+	ActivityHistorySupported *bool  `json:"activityHistorySupported,omitempty"`
 }
 
 // Response is the payload for GET /api/v1/server/capabilities. The schema is
@@ -114,14 +115,24 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			SAMLEnabled:               false,
 		},
 		Features: FeaturesInfo{
-			VoiceTiersSupported:    instanceType == config.InstanceTypeSaaS,
-			E2EEEnforcedEverywhere: true,
-			MaxMembersPerServer:    maxMembersPerServer,
-			EntitlementMode:        entitlementMode,
+			VoiceTiersSupported:      instanceType == config.InstanceTypeSaaS,
+			E2EEEnforcedEverywhere:   true,
+			MaxMembersPerServer:      maxMembersPerServer,
+			EntitlementMode:          entitlementMode,
+			ActivityHistorySupported: activityHistorySupported(h.cfg),
 		},
 		PolicyVersion: policyVersion,
 	}
 
 	c.Header("Cache-Control", "public, max-age=300")
 	c.JSON(http.StatusOK, resp)
+}
+
+func activityHistorySupported(cfg *config.Config) *bool {
+	if cfg == nil || !cfg.ActivityHistoryClusterEnabled ||
+		!cfg.ControlPlaneReplicaCountExplicit || cfg.ControlPlaneReplicaCount != 1 {
+		return nil
+	}
+	supported := true
+	return &supported
 }

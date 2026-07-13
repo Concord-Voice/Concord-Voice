@@ -1,6 +1,7 @@
-import React, { Suspense, lazy, useEffect, useRef } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
+import { ModalPortalHostContext } from '../ui/ModalContext';
 import './SettingsOverlayHost.css';
 
 const SettingsPage = lazy(() => import('./SettingsPage'));
@@ -35,6 +36,11 @@ const SettingsOverlayHost: React.FC = () => {
   const payload = useSettingsOverlayStore((s) => s.payload);
   const close = useSettingsOverlayStore((s) => s.close);
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const [portalHost, setPortalHost] = useState<HTMLDialogElement | null>(null);
+  const setDialogRef = useCallback((dialog: HTMLDialogElement | null) => {
+    dialogRef.current = dialog;
+    setPortalHost(dialog);
+  }, []);
 
   // Drive the native <dialog> open state from the store
   useEffect(() => {
@@ -98,10 +104,18 @@ const SettingsOverlayHost: React.FC = () => {
   }
 
   return createPortal(
-    <dialog ref={dialogRef} className="settings-overlay-host" aria-label="Settings">
-      <div className="settings-overlay-host__panel">
-        <Suspense fallback={null}>{open ? content : null}</Suspense>
-      </div>
+    <dialog
+      ref={setDialogRef}
+      className="settings-overlay-host"
+      aria-label="Settings"
+      data-modal-portal-host="true"
+    >
+      {/* eslint-disable-next-line @eslint-react/no-context-provider -- Context.Provider keeps this compatible with the repository's current React context style */}
+      <ModalPortalHostContext.Provider value={portalHost}>
+        <div className="settings-overlay-host__panel">
+          <Suspense fallback={null}>{open && portalHost ? content : null}</Suspense>
+        </div>
+      </ModalPortalHostContext.Provider>
     </dialog>,
     document.body
   );

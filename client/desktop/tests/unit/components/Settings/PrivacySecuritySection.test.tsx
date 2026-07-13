@@ -220,7 +220,9 @@ vi.mock('@/renderer/components/ui/Modal', () => ({
 }));
 
 vi.mock('@/renderer/stores/clientConfigStore', () => ({
-  useClientConfigStore: vi.fn((s) => s({})),
+  useClientConfigStore: vi.fn((s) =>
+    s({ activityHistoryCapability: { status: 'confirmed-unsupported' } })
+  ),
 }));
 
 import PrivacySecuritySection, {

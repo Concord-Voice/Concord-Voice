@@ -1,12 +1,18 @@
 package users
 
 import (
+	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"net/http"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/presence"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 )
 
@@ -117,24 +123,35 @@ func buildPresenceUpdate(req *updatePresenceRequest) (update presenceUpdate, sta
 }
 
 const updatePresenceSettingsQuery = `
-	INSERT INTO user_presence_settings (
-		user_id, custom_text_tier, custom_text, custom_text_emoji
-	) VALUES (
-		$1, COALESCE($2::smallint, 0), NULLIF($3::text, ''), NULLIF($4::text, '')
-	)
-	ON CONFLICT (user_id) DO UPDATE SET
-		custom_text_tier = COALESCE($2::smallint, user_presence_settings.custom_text_tier),
+	UPDATE user_presence_settings SET
+		custom_text_tier = COALESCE($2::smallint, custom_text_tier),
 		custom_text = CASE
-			WHEN $3::text IS NULL THEN user_presence_settings.custom_text
+			WHEN $3::text IS NULL THEN custom_text
 			ELSE NULLIF($3::text, '')
 		END,
 		custom_text_emoji = CASE
-			WHEN $4::text IS NULL THEN user_presence_settings.custom_text_emoji
+			WHEN $4::text IS NULL THEN custom_text_emoji
 			ELSE NULLIF($4::text, '')
 		END,
-		updated_at = NOW()
+		updated_at = clock_timestamp()
+	WHERE user_id = $1
 	RETURNING custom_text_tier, custom_text, custom_text_emoji
 `
+
+type presenceWriterFailure struct {
+	status int
+	class  string
+	cause  error
+}
+
+func (e *presenceWriterFailure) Error() string { return "presence writer " + e.class + " failed" }
+func (e *presenceWriterFailure) Unwrap() error { return e.cause }
+
+type presenceSettingsWrite struct {
+	response  presenceSettingsResponse
+	operation presencehistory.AudienceOperation
+	plan      presencehistory.DeliveryPlan
+}
 
 // UpdatePresenceSettings updates the caller's presence settings.
 // Accepts a partial JSON body — only provided fields are written. UPSERTs the
@@ -163,46 +180,201 @@ func (h *Handler) UpdatePresenceSettings(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgUnauthorized})
 		return
 	}
-	h.withCustomStatusSender(userUUID, func() {
-		// Read the PRIOR tier before the UPSERT so the fan-out can clear viewers who
-		// lose visibility when the tier narrows or custom text is turned off
-		// (#1233/Gitar; risk: privacy). No row ⇒ oldTier stays 0 (no prior audience).
-		// On a GENUINE read error we can't know the old tier, so fail SAFE to the
-		// widest tier (2): over-clearing the broadest prior audience never leaks,
-		// whereas defaulting to 0 would skip the clear and leave a stale status on a
-		// viewer who just lost permission (Gitar review on #1685).
-		var oldTier int
-		if tierErr := h.db.QueryRow(
-			`SELECT custom_text_tier FROM user_presence_settings WHERE user_id = $1`, userID,
-		).Scan(&oldTier); tierErr != nil && tierErr != sql.ErrNoRows {
-			h.log.Error("presence: read prior tier failed", "error", tierErr)
-			oldTier = 2 // fail-safe: clear the widest possible prior audience
-		}
-
-		var ps presenceSettingsResponse
-		err = h.db.QueryRow(
-			updatePresenceSettingsQuery,
-			userID,
-			update.customTextTier,
-			update.customText,
-			update.customTextEmoji,
-		).Scan(&ps.CustomTextTier, &ps.CustomText, &ps.CustomTextEmoji)
-		if err != nil {
-			// Metadata only — never log custom_text / custom_text_emoji (PII).
-			h.log.Error(errMsgFailedUpdatePresence, "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdatePresence})
-			return
-		}
-
-		// Respond BEFORE any audience fan-out.
-		c.JSON(http.StatusOK, ps)
-
-		// Keep persistence and fan-out ordered with override writes for this sender.
-		if h.presenceOverrideBroadcaster == nil {
-			return
-		}
-		h.presenceOverrideBroadcaster.BroadcastCustomText(userUUID, oldTier, customTextPayloadFromRow(ps))
+	if h.presenceHistory == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedUpdatePresence})
+		return
+	}
+	var write presenceSettingsWrite
+	err = h.presenceHistory.WithReadySender(c.Request.Context(), userUUID, func() error {
+		var writeErr error
+		write, writeErr = h.writePresenceSettings(c.Request.Context(), userUUID, update)
+		return writeErr
 	})
+	if err != nil {
+		h.respondPresenceWriterFailure(c, errMsgFailedUpdatePresence, err)
+		return
+	}
+	c.JSON(http.StatusOK, write.response)
+}
+
+func (h *Handler) writePresenceSettings(
+	ctx context.Context,
+	senderID uuid.UUID,
+	update presenceUpdate,
+) (result presenceSettingsWrite, returnErr error) {
+	tx, err := h.presenceHistory.BeginTx(ctx, nil)
+	if err != nil {
+		return result, &presenceWriterFailure{status: 500, class: "begin", cause: err}
+	}
+	if tx == nil {
+		return result, &presenceWriterFailure{status: 500, class: "begin", cause: errors.New("presence settings transaction missing")}
+	}
+	defer tx.Rollback() //nolint:errcheck
+	defer h.joinPresenceWriterRollback(tx, &returnErr)
+
+	operation, err := h.presenceHistory.BeginAudienceOperation(
+		ctx, tx, senderID, presencehistory.OrdinaryAudienceWrite,
+	)
+	if err != nil {
+		return result, err
+	}
+	var response presenceSettingsResponse
+	err = tx.QueryRowContext(
+		ctx, updatePresenceSettingsQuery, senderID,
+		update.customTextTier, update.customText, update.customTextEmoji,
+	).Scan(&response.CustomTextTier, &response.CustomText, &response.CustomTextEmoji)
+	if err != nil {
+		return result, &presenceWriterFailure{status: 500, class: "update", cause: err}
+	}
+	after := presencehistory.CustomTextState{}
+	if response.CustomText != nil {
+		after.Text = *response.CustomText
+	}
+	if response.CustomTextEmoji != nil {
+		after.Emoji = *response.CustomTextEmoji
+	}
+	if err := h.presenceHistory.RecordCustomTextTransition(
+		ctx, tx, senderID, operation.Before, after,
+	); err != nil {
+		return result, &presenceWriterFailure{status: 500, class: "history", cause: err}
+	}
+	plan, err := preparePresenceSettingsPlan(ctx, tx, operation, response)
+	if err != nil {
+		return result, &presenceWriterFailure{status: 500, class: "prepare", cause: err}
+	}
+	result = presenceSettingsWrite{response: response, operation: operation, plan: plan}
+	if err := h.commitAndClaimPresenceWriter(ctx, tx, operation, plan); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func preparePresenceSettingsPlan(
+	ctx context.Context,
+	tx *sql.Tx,
+	operation presencehistory.AudienceOperation,
+	after presenceSettingsResponse,
+) (presencehistory.DeliveryPlan, error) {
+	oldAudience := map[uuid.UUID]bool{}
+	if operation.BeforeTier > 0 && operation.Before.Text != "" {
+		var err error
+		oldAudience, err = presence.ComputeCustomTextAudienceForTier(
+			ctx, tx, operation.SenderID, operation.BeforeTier,
+		)
+		if err != nil {
+			return presencehistory.DeliveryPlan{}, err
+		}
+		oldAudience[operation.SenderID] = true
+	}
+	newAudience := map[uuid.UUID]bool{}
+	payload := customTextStateFromRow(after)
+	if payload != nil {
+		var err error
+		newAudience, err = presence.ComputeCustomTextAudience(ctx, tx, operation.SenderID)
+		if err != nil {
+			return presencehistory.DeliveryPlan{}, err
+		}
+		newAudience[operation.SenderID] = true
+	}
+	return presencehistory.DeliveryPlan{
+		Mode:             presencehistory.DeliveryExactDelta,
+		OperationID:      operation.ID,
+		SenderID:         operation.SenderID,
+		ClearRecipients:  audienceDifference(oldAudience, newAudience),
+		UpdateRecipients: newAudience,
+		Payload:          payload,
+	}, nil
+}
+
+func customTextStateFromRow(ps presenceSettingsResponse) *presencehistory.CustomTextState {
+	payload := customTextPayloadFromRow(ps)
+	if payload == nil {
+		return nil
+	}
+	return &presencehistory.CustomTextState{Text: payload.Text, Emoji: payload.Emoji}
+}
+
+func audienceDifference(left, right map[uuid.UUID]bool) map[uuid.UUID]bool {
+	difference := make(map[uuid.UUID]bool)
+	for id, included := range left {
+		if included && !right[id] {
+			difference[id] = true
+		}
+	}
+	return difference
+}
+
+func (h *Handler) commitAndClaimPresenceWriter(
+	ctx context.Context,
+	tx *sql.Tx,
+	operation presencehistory.AudienceOperation,
+	plan presencehistory.DeliveryPlan,
+) error {
+	commitErr := h.presenceHistory.CommitTx(tx)
+	var confirmedCommitErr error
+	if commitErr != nil {
+		rollbackErr := h.presenceHistory.RollbackTx(tx)
+		if rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			commitErr = errors.Join(commitErr, fmt.Errorf("rollback failed main presence write: %w", rollbackErr))
+		}
+		switch h.presenceHistory.ClassifyAudienceCommit(ctx, operation) {
+		case presencehistory.CommitConfirmed:
+			confirmedCommitErr = commitErr
+		case presencehistory.RollbackConfirmed:
+			return &presenceWriterFailure{status: 500, class: "commit_rollback", cause: commitErr}
+		case presencehistory.WriteSuperseded:
+			return &presenceWriterFailure{status: 500, class: "commit_superseded", cause: commitErr}
+		default:
+			resetErr := h.presenceHistory.EmergencyReset(context.WithoutCancel(ctx), plan)
+			return &presenceWriterFailure{
+				status: 500,
+				class:  "commit_unresolved",
+				cause:  errors.Join(commitErr, resetErr),
+			}
+		}
+	}
+	completion := h.presenceHistory.CompleteClaim(ctx, plan)
+	if completion.Err != nil {
+		return &presenceWriterFailure{
+			status: 503,
+			class:  "delivery",
+			cause:  errors.Join(confirmedCommitErr, completion.Err),
+		}
+	}
+	return nil
+}
+
+func (h *Handler) joinPresenceWriterRollback(tx *sql.Tx, returnErr *error) {
+	rollbackErr := h.presenceHistory.RollbackTx(tx)
+	if rollbackErr == nil || errors.Is(rollbackErr, sql.ErrTxDone) {
+		return
+	}
+	*returnErr = errors.Join(*returnErr, fmt.Errorf("presence writer rollback: %w", rollbackErr))
+}
+
+func (h *Handler) respondPresenceWriterFailure(c *gin.Context, message string, err error) {
+	status := http.StatusInternalServerError
+	errorClass := "unknown"
+	var serviceErr *presencehistory.ServiceError
+	if errors.As(err, &serviceErr) {
+		status = serviceErr.Status
+		errorClass = serviceErr.Code
+		if serviceErr.RetryAfter > 0 {
+			seconds := int64(serviceErr.RetryAfter.Round(time.Second) / time.Second)
+			c.Header("Retry-After", fmt.Sprintf("%d", seconds))
+		}
+	}
+	var writerErr *presenceWriterFailure
+	if errors.As(err, &writerErr) {
+		status = writerErr.status
+		errorClass = writerErr.class
+	}
+	var overrideErr *presenceOverrideOperationError
+	if errors.As(err, &overrideErr) {
+		errorClass = overrideErr.Operation
+	}
+	h.log.Error(message, "error_class", errorClass)
+	c.JSON(status, gin.H{"error": message})
 }
 
 // customTextPayloadFromRow derives the fan-out payload from the persisted row.

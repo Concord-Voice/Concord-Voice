@@ -108,6 +108,63 @@ func TestNoTokenFingerprintLogFields(t *testing.T) {
 	}
 }
 
+func TestRecoveryForcedClearLogPrivacy(t *testing.T) {
+	files := token.NewFileSet()
+	parsed, err := parser.ParseFile(files, "handlers.go", nil, parser.AllErrors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := map[string]bool{
+		"validateAndConsumeRecoveryToken": true,
+		"prepareRecoveryPassword":         true,
+		"recoveryWork":                    true,
+		"execRecoveryTx":                  true,
+		"executeRecoveryTransaction":      true,
+		"respondRecoveryReadinessFailure": true,
+		"respondRecoveryPresenceFailure":  true,
+		"parseRecoverySenderID":           true,
+		"RecoveryResetPassword":           true,
+		"RecoveryResetAccount":            true,
+	}
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || !targets[function.Name.Name] || function.Body == nil {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok || loggerMethod(call.Fun) == "" {
+				return true
+			}
+			for _, argument := range call.Args[1:] {
+				formatted := strings.ToLower(formatExpr(files, argument))
+				for _, forbidden := range []string{
+					"claims", "user_id", "userid", "senderid", "operationid",
+					"custom_text", "emoji", "payload", "ciphertext", "encrypted",
+					"updated_at", "created_at", "timestamp", "accountlinked",
+				} {
+					if strings.Contains(formatted, forbidden) {
+						t.Errorf("%s:%d recovery forced-clear log contains %q in %s",
+							files.Position(argument.Pos()).Filename,
+							files.Position(argument.Pos()).Line,
+							forbidden,
+							formatted,
+						)
+					}
+				}
+				if formatted == "err" || formatted == "cause" || strings.HasSuffix(formatted, ".err") {
+					t.Errorf("%s:%d recovery forced-clear log emits raw error %s",
+						files.Position(argument.Pos()).Filename,
+						files.Position(argument.Pos()).Line,
+						formatted,
+					)
+				}
+			}
+			return true
+		})
+	}
+}
+
 // loggerMethod returns "Info"/"Warn"/"Error"/"Debug"/"Fatal" if fun has the
 // shape <chain>.log.<Method>, else returns "". Matches the structured-logger
 // pattern used throughout services/control-plane, including nested-receiver

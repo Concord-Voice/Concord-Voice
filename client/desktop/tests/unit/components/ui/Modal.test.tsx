@@ -1,7 +1,8 @@
 import { render, screen, userEvent } from '../../../test-utils';
 import { fireEvent } from '@testing-library/react';
 import Modal from '@/renderer/components/ui/Modal';
-import { useState } from 'react';
+import { ModalPortalHostContext } from '@/renderer/components/ui/ModalContext';
+import { useRef, useState } from 'react';
 import { vi } from 'vitest';
 
 describe('Modal', () => {
@@ -102,6 +103,29 @@ describe('Modal', () => {
   });
 
   describe('focus management (a11y — #2087)', () => {
+    it('moves initial focus to an explicitly supplied disclosure heading', () => {
+      function Harness() {
+        const disclosureHeadingRef = useRef<HTMLHeadingElement>(null);
+        return (
+          <Modal
+            isOpen={true}
+            onClose={onClose}
+            title="Review Activity History terms"
+            initialFocusRef={disclosureHeadingRef}
+          >
+            <h4 ref={disclosureHeadingRef} tabIndex={-1}>
+              Activity History disclosure
+            </h4>
+            <button>Continue</button>
+          </Modal>
+        );
+      }
+
+      render(<Harness />);
+
+      expect(screen.getByRole('heading', { name: 'Activity History disclosure' })).toHaveFocus();
+    });
+
     it('moves focus into the dialog on open', () => {
       render(
         <Modal isOpen={true} onClose={onClose} title="Focus Me">
@@ -251,6 +275,43 @@ describe('Modal', () => {
   });
 
   describe('dismissable prop', () => {
+    it.each([
+      { dismissable: true, expectedCloseCalls: 1 },
+      { dismissable: false, expectedCloseCalls: 0 },
+    ])(
+      'consumes Escape above a native Settings host when dismissable=$dismissable',
+      ({ dismissable, expectedCloseCalls }) => {
+        const settingsHost = document.createElement('dialog');
+        settingsHost.setAttribute('open', '');
+        settingsHost.dataset.modalPortalHost = 'true';
+        document.body.appendChild(settingsHost);
+        const outerEscape = vi.fn();
+        document.addEventListener('keydown', outerEscape);
+
+        try {
+          render(
+            <Modal isOpen={true} onClose={onClose} title="Settings child" dismissable={dismissable}>
+              <p>Body</p>
+            </Modal>
+          );
+          const event = new KeyboardEvent('keydown', {
+            key: 'Escape',
+            bubbles: true,
+            cancelable: true,
+          });
+
+          document.dispatchEvent(event);
+
+          expect(event.defaultPrevented).toBe(true);
+          expect(outerEscape).not.toHaveBeenCalled();
+          expect(onClose).toHaveBeenCalledTimes(expectedCloseCalls);
+        } finally {
+          document.removeEventListener('keydown', outerEscape);
+          settingsHost.remove();
+        }
+      }
+    );
+
     it('dismissable={false} suppresses the close button', () => {
       render(
         <Modal isOpen={true} onClose={onClose} title="Test Modal" dismissable={false}>
@@ -448,6 +509,39 @@ describe('Modal', () => {
       rerender(<Nested innerOpen={false} />);
       expect(document.querySelectorAll('.modal-overlay').length).toBe(1);
       expect(outerOverlay()).not.toHaveAttribute('inert'); // parent now topmost — reachable
+    });
+
+    it('stays inside an open native Settings dialog and inerts its background panel', () => {
+      const settingsHost = document.createElement('dialog');
+      settingsHost.className = 'settings-overlay-host';
+      settingsHost.setAttribute('open', '');
+      settingsHost.dataset.modalPortalHost = 'true';
+      const settingsPanel = document.createElement('div');
+      settingsPanel.className = 'settings-overlay-host__panel';
+      settingsHost.appendChild(settingsPanel);
+      document.body.appendChild(settingsHost);
+
+      try {
+        const { unmount } = render(
+          <ModalPortalHostContext.Provider value={settingsHost}>
+            <Modal isOpen={true} onClose={onClose} title="Settings child">
+              <button>Continue</button>
+            </Modal>
+          </ModalPortalHostContext.Provider>
+        );
+        const overlay = screen
+          .getByRole('dialog', { name: 'Settings child' })
+          .closest('.modal-overlay');
+
+        expect(overlay?.parentElement).toBe(settingsHost);
+        expect(settingsPanel).toHaveAttribute('inert');
+        expect(overlay).not.toHaveAttribute('inert');
+
+        unmount();
+        expect(settingsPanel).not.toHaveAttribute('inert');
+      } finally {
+        settingsHost.remove();
+      }
     });
   });
 });

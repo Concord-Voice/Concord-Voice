@@ -95,6 +95,7 @@ describe('SettingsOverlayHost', () => {
     });
     expect(await screen.findByTestId('mock-settings-page')).toBeInTheDocument();
     expect(getDialog().hasAttribute('open')).toBe(true);
+    expect(getDialog()).toHaveAttribute('data-modal-portal-host', 'true');
   });
 
   it('renders ServerSettingsPage with serverId when open === "server"', async () => {

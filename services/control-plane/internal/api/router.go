@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"os"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/notifications"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/ownership"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/servercapabilities"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/servers"
@@ -140,6 +142,20 @@ func publicInviteIconHandler(invitesHandler *invites.Handler, mediaHandler *medi
 	return invitesHandler.GetPublicInviteIconFallback
 }
 
+func bindPresenceHistoryRuntime(
+	hub *websocket.Hub,
+	presenceHistoryService *presencehistory.Service,
+) error {
+	if presenceHistoryService == nil {
+		return fmt.Errorf("presence history service unavailable")
+	}
+	hub.SetPresenceHistoryService(presenceHistoryService)
+	if err := presenceHistoryService.BindDelivery(hub); err != nil {
+		return fmt.Errorf("bind presence history delivery: %w", err)
+	}
+	return nil
+}
+
 func configureOpsMetricsAndRecovery(router *gin.Engine, enabled bool) *opsmetrics.Counters {
 	var counters *opsmetrics.Counters
 	if enabled {
@@ -153,7 +169,15 @@ func configureOpsMetricsAndRecovery(router *gin.Engine, enabled bool) *opsmetric
 }
 
 // NewRouter creates a new API router and returns its background runtime dependencies.
-func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *config.Config, liveSpa *config.LiveSpaConfig, log *logger.Logger) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime) {
+func NewRouter(
+	db *sql.DB,
+	redis *redis.Client,
+	store media.ObjectStore,
+	cfg *config.Config,
+	liveSpa *config.LiveSpaConfig,
+	log *logger.Logger,
+	presenceHistoryService *presencehistory.Service,
+) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, error) {
 	router := gin.New()
 	configureTrustedProxies(router, cfg, log)
 
@@ -173,6 +197,9 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 
 	// Initialize WebSocket hub
 	hub := websocket.NewHub(db, redis, opsCounters)
+	if err := bindPresenceHistoryRuntime(hub, presenceHistoryService); err != nil {
+		return nil, nil, nil, nil, err
+	}
 
 	// Initialize NATS (inter-service messaging with media plane)
 	var natsClient *natsclient.Client
@@ -201,8 +228,6 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	hub.SetMentionChecker(permissionChecker)
 	hub.SetChannelPermissionChecker(permissionChecker)
 
-	// Start hub AFTER all dependencies are injected (avoids data races on checkers)
-	go hub.Run()
 	auditWriter := rbac.NewAuditWriter(db, log)
 	rbacHandler := rbac.NewHandler(db, log, redis, hub, rbacResolver, permCache, auditWriter)
 	// Mid-session voice permission push (CV-CAN-007 review P1): permission
@@ -219,6 +244,7 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 
 	// Initialize handlers
 	authHandler := auth.NewHandlerForInstance(db, redis, log, cfg.JWTSecret, hub, cfg.InstanceType)
+	authHandler.SetPresenceHistory(presenceHistoryService)
 	authHandler.SetEmailService(emailSvc)
 	// Wire cross-references (breaks circular init dependency)
 	authHandler.SetMFAChecker(mfaHandler)
@@ -228,6 +254,8 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	serverEntCache := entitlements.NewServerCacheForInstance(redis, db, cfg.InstanceType)
 	sessionsHandler := sessions.NewHandler(db, redis, log, hub, mfaHandler)
 	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache)
+	usersHandler.SetPresenceHistory(presenceHistoryService)
+	presenceHistoryHandler := presencehistory.NewHandler(presenceHistoryService)
 	serversHandler := servers.NewHandler(db, log, hub, rbacResolver, entCache, serverEntCache)
 	channelsHandler := channels.NewHandler(db, log, hub, rbacResolver, redis, serverEntCache)
 	membersHandler := members.NewHandler(db, log, redis, hub, rbacResolver, auditWriter)
@@ -323,8 +351,6 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 			log.Error("Failed to subscribe to voice NATS events", "error", subErr)
 		}
 	}
-	opsRuntime := wireOpsMetricsRuntime(db, natsClient, hub, opsCounters, cfg.OpsMetrics, log)
-
 	// API v1 routes
 	v1 := router.Group("/api/v1")
 	{
@@ -1005,6 +1031,11 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 				userRoutes.PUT("/me/presence-overrides/:category",
 					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
 					usersHandler.ReplacePresenceOverrides,
+				)
+				presenceHistoryHandler.RegisterRoutes(
+					userRoutes,
+					middleware.RateLimitByUser(redis, 30, 1*time.Minute),
+					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
 				)
 
 				// SSO settings (issue #270)
@@ -1931,7 +1962,10 @@ func NewRouter(db *sql.DB, redis *redis.Client, store media.ObjectStore, cfg *co
 	// Host/path gating of this surface is #1692/#1693.
 	wireAdminRoutes(router, db, redis, cfg, log)
 
-	return router, hub, natsClient, opsRuntime
+	// Start only after every dependency and route has been injected.
+	go hub.Run()
+	opsRuntime := wireOpsMetricsRuntime(db, natsClient, hub, opsCounters, cfg.OpsMetrics, log)
+	return router, hub, natsClient, opsRuntime, nil
 }
 
 // healthHandler responds with 200 + control-plane health JSON. Registered

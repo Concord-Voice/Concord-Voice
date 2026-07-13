@@ -177,6 +177,16 @@ type Config struct {
 	InstanceType  string // INSTANCE_TYPE: "saas" (default) | "self-hosted"
 	ServerVersion string // SERVER_VERSION: advertised server version; "dev" when unset
 
+	// Activity History remains dormant unless the cluster gate is explicitly
+	// enabled for exactly one configured control-plane replica. Operator
+	// disclosure fields are optional at startup; invalid self-host metadata
+	// makes the disclosure unavailable rather than weakening consent.
+	ActivityHistoryClusterEnabled    bool
+	ControlPlaneReplicaCount         int
+	ControlPlaneReplicaCountExplicit bool
+	ActivityHistoryOperatorName      string
+	ActivityHistoryPrivacyPolicyURL  string
+
 	// Desktop update assets — local directory populated by deploy.sh
 	ReleasesDir string // Path to directory containing release assets; empty disables update endpoint
 
@@ -395,6 +405,10 @@ func Load() (*Config, error) {
 		OIDCBinaryRef:      getEnv("ATTESTATION_OIDC_BINARY_REF", "refs/heads/main"),
 	}
 
+	if err := loadActivityHistoryConfig(cfg); err != nil {
+		return nil, err
+	}
+
 	cidrs, err := computeTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"), cfg.Environment)
 	if err != nil {
 		log.Fatalf("FATAL: %v", err)
@@ -434,6 +448,42 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func loadActivityHistoryConfig(cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("activity history configuration unavailable")
+	}
+
+	cfg.ActivityHistoryOperatorName = os.Getenv("ACTIVITY_HISTORY_OPERATOR_NAME")
+	cfg.ActivityHistoryPrivacyPolicyURL = os.Getenv("ACTIVITY_HISTORY_PRIVACY_POLICY_URL")
+	switch os.Getenv("ACTIVITY_HISTORY_CLUSTER_ENABLED") {
+	case "", "false":
+		cfg.ActivityHistoryClusterEnabled = false
+	case "true":
+		cfg.ActivityHistoryClusterEnabled = true
+	default:
+		return fmt.Errorf("ACTIVITY_HISTORY_CLUSTER_ENABLED must be exactly empty, false, or true")
+	}
+
+	rawCount, explicit := os.LookupEnv("CONTROL_PLANE_REPLICA_COUNT")
+	cfg.ControlPlaneReplicaCountExplicit = explicit
+	if explicit {
+		count, err := strconv.Atoi(rawCount)
+		if err != nil {
+			return fmt.Errorf("CONTROL_PLANE_REPLICA_COUNT must be an integer")
+		}
+		cfg.ControlPlaneReplicaCount = count
+	}
+	return cfg.validateActivityHistory()
+}
+
+func (c *Config) validateActivityHistory() error {
+	if c.ActivityHistoryClusterEnabled &&
+		(!c.ControlPlaneReplicaCountExplicit || c.ControlPlaneReplicaCount != 1) {
+		return fmt.Errorf("activity history requires CONTROL_PLANE_REPLICA_COUNT=1 to be explicitly configured")
+	}
+	return nil
 }
 
 // loadAppleSSOConfig populates cfg.AppleSSO from environment variables and
@@ -538,6 +588,13 @@ func loadCloudflareKVBridgeConfig(cfg *Config) error {
 // validate checks for dangerous configuration in production environments.
 // Returns an error if required secrets are missing or still set to dev defaults.
 func (c *Config) validate() error {
+	if err := c.validateActivityHistory(); err != nil {
+		return err
+	}
+	return c.validateProduction()
+}
+
+func (c *Config) validateProduction() error {
 	if c.Environment != "production" {
 		return nil
 	}

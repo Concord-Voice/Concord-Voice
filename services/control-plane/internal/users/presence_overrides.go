@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"slices"
 	"sort"
 	"time"
 
@@ -17,17 +16,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/presence"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 )
 
 const (
-	presenceOverrideCategoryCustomText      = "custom_text"
-	presenceOverrideMaxEncryptedDataBytes   = 65_536
-	presenceOverrideMaxRequestBodyBytes     = 128 * 1_024
-	presenceOverrideMaxTargets              = 1_000
-	presenceOverrideCommitResolutionTimeout = 2 * time.Second
-	presenceOverrideDeliveryTimeout         = 3 * time.Second
-	errMsgFailedReplacePresenceOverrides    = "Failed to replace presence overrides"
+	presenceOverrideCategoryCustomText    = "custom_text"
+	presenceOverrideMaxEncryptedDataBytes = 65_536
+	presenceOverrideMaxRequestBodyBytes   = 128 * 1_024
+	presenceOverrideMaxTargets            = 1_000
+	errMsgFailedReplacePresenceOverrides  = "Failed to replace presence overrides"
 )
 
 type presenceOverrideRequest struct {
@@ -42,12 +40,6 @@ type normalizedPresenceOverrideRequest struct {
 	ExcludedUserIDs []uuid.UUID
 }
 
-type persistedPresenceOverrideState struct {
-	Version         int
-	EncryptedData   string
-	ExcludedUserIDs []uuid.UUID
-}
-
 type presenceOverridePreferenceResponse struct {
 	EncryptedData string    `json:"encrypted_data"`
 	Version       int       `json:"version"`
@@ -59,15 +51,9 @@ type presenceOverrideResponse struct {
 }
 
 type presenceOverrideWriteResult struct {
-	Version               int
-	ExpectedVersion       int
-	MaterializedTargetIDs []uuid.UUID
-	OldAudience           map[uuid.UUID]bool
-	NewAudience           map[uuid.UUID]bool
-	Payload               *websocket.CustomTextPayload
-	DeliveryAudience      map[uuid.UUID]bool
-	DeliveryPayload       *websocket.CustomTextPayload
-	ReauthorizationErr    error
+	Version   int
+	Operation presencehistory.AudienceOperation
+	Plan      presencehistory.DeliveryPlan
 }
 
 type presenceOverrideAudienceFunc func(context.Context, presence.DBTX, uuid.UUID) (map[uuid.UUID]bool, error)
@@ -92,38 +78,6 @@ func (e *presenceOverrideOperationError) Error() string {
 }
 
 func (e *presenceOverrideOperationError) Unwrap() error {
-	return e.cause
-}
-
-type presenceOverrideCommitError struct {
-	cause error
-}
-
-type presenceOverrideConfirmedRollbackError struct{}
-
-func (e *presenceOverrideConfirmedRollbackError) Error() string {
-	return "presence override commit confirmed rolled back"
-}
-
-type presenceOverrideUnresolvedCommitError struct{}
-
-func (e *presenceOverrideUnresolvedCommitError) Error() string {
-	return "presence override commit state unresolved"
-}
-
-type presenceOverrideCommitResolution uint8
-
-const (
-	presenceOverrideCommitUnresolved presenceOverrideCommitResolution = iota
-	presenceOverrideCommitConfirmed
-	presenceOverrideRollbackConfirmed
-)
-
-func (e *presenceOverrideCommitError) Error() string {
-	return "presence override commit failed"
-}
-
-func (e *presenceOverrideCommitError) Unwrap() error {
 	return e.cause
 }
 
@@ -247,208 +201,116 @@ func (h *Handler) ReplacePresenceOverrides(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid presence override request"})
 		return
 	}
-	h.withCustomStatusSender(senderID, func() {
-		result, writeErr := replacePresenceOverride(
-			c.Request.Context(), h.db, senderID, c.Param("category"), normalized,
+	if h.presenceHistory == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedReplacePresenceOverrides})
+		return
+	}
+	var result presenceOverrideWriteResult
+	err = h.presenceHistory.WithReadySender(c.Request.Context(), senderID, func() error {
+		var writeErr error
+		result, writeErr = h.replacePresenceOverride(
+			c.Request.Context(), senderID, c.Param("category"), normalized,
 			presence.ComputeCustomTextAudience, prepareCurrentCustomTextPayload,
 		)
-		var commitErr *presenceOverrideCommitError
-		if errors.As(writeErr, &commitErr) {
-			resolutionCtx, cancelResolution := presenceOverrideCommitResolutionContext(c.Request.Context())
-			persistedState, exists, lookupErr := h.readPersistedPresenceOverrideState(
-				resolutionCtx, senderID, c.Param("category"),
-			)
-			cancelResolution()
-			switch classifyPresenceOverrideCommit(
-				normalized,
-				result.MaterializedTargetIDs,
-				result.Version,
-				persistedState,
-				exists,
-				lookupErr,
-			) {
-			case presenceOverrideCommitConfirmed:
-				writeErr = nil
-			case presenceOverrideRollbackConfirmed:
-				writeErr = &presenceOverrideConfirmedRollbackError{}
-			default:
-				writeErr = &presenceOverrideUnresolvedCommitError{}
-			}
-		}
-		if writeErr == nil {
-			result.DeliveryAudience, result.DeliveryPayload, result.ReauthorizationErr =
-				h.preparePresenceOverrideDelivery(c.Request.Context(), senderID)
-		}
-		h.respondPresenceOverrideWrite(c, senderID, c.Param("category"), result, writeErr)
+		return writeErr
 	})
-}
-
-func (h *Handler) respondPresenceOverrideWrite(
-	c *gin.Context,
-	senderID uuid.UUID,
-	category string,
-	result presenceOverrideWriteResult,
-	err error,
-) {
 	if err != nil {
-		h.respondPresenceOverrideWriteError(c, senderID, result, err)
+		var conflict *presenceOverrideVersionConflictError
+		if errors.As(err, &conflict) {
+			c.JSON(http.StatusConflict, gin.H{
+				"code":            "presence_override_version_conflict",
+				"current_version": conflict.CurrentVersion,
+			})
+			return
+		}
+		h.respondPresenceWriterFailure(c, errMsgFailedReplacePresenceOverrides, err)
 		return
 	}
-
 	c.JSON(http.StatusOK, gin.H{"version": result.Version})
-	if h.presenceOverrideBroadcaster == nil {
-		return
-	}
-	if result.ReauthorizationErr != nil {
-		h.log.Error("Failed to reauthorize presence override delivery", "error_class", "reauthorization")
-		h.presenceOverrideBroadcaster.BroadcastCustomTextAudienceDelta(
-			senderID,
-			result.OldAudience,
-			map[uuid.UUID]bool{},
-			nil,
-		)
-	} else {
-		oldAudience := result.OldAudience
-		// Suppress clears only when neither snapshot could have populated a
-		// viewer cache. If either snapshot has content, an overlapping write on
-		// another replica may have delivered it to the old audience.
-		if result.Payload == nil && result.DeliveryPayload == nil {
-			oldAudience = map[uuid.UUID]bool{}
-		}
-		h.presenceOverrideBroadcaster.BroadcastCustomTextAudienceDelta(
-			senderID,
-			oldAudience,
-			result.DeliveryAudience,
-			result.DeliveryPayload,
-		)
-	}
-	h.presenceOverrideBroadcaster.BroadcastToUser(senderID, websocket.OutgoingMessage{
-		Type: "presence_overrides_updated",
-		Data: map[string]interface{}{
-			"category": category,
-			"version":  result.Version,
-		},
-	})
 }
 
-func (h *Handler) respondPresenceOverrideWriteError(
-	c *gin.Context,
-	senderID uuid.UUID,
-	result presenceOverrideWriteResult,
-	err error,
-) {
-	var conflict *presenceOverrideVersionConflictError
-	if errors.As(err, &conflict) {
-		c.JSON(http.StatusConflict, gin.H{
-			"code":            "presence_override_version_conflict",
-			"current_version": conflict.CurrentVersion,
-		})
-		return
-	}
-	var confirmedRollback *presenceOverrideConfirmedRollbackError
-	if errors.As(err, &confirmedRollback) {
-		h.log.Error(errMsgFailedReplacePresenceOverrides, "error_class", "commit_confirmed_rollback")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplacePresenceOverrides})
-		return
-	}
-	var unresolvedCommit *presenceOverrideUnresolvedCommitError
-	var rawCommit *presenceOverrideCommitError
-	if errors.As(err, &unresolvedCommit) || errors.As(err, &rawCommit) {
-		h.log.Error(errMsgFailedReplacePresenceOverrides, "error_class", "commit_unresolved")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplacePresenceOverrides})
-		if h.presenceOverrideBroadcaster != nil {
-			h.presenceOverrideBroadcaster.BroadcastCustomTextAudienceDelta(
-				senderID,
-				result.OldAudience,
-				map[uuid.UUID]bool{},
-				nil,
-			)
-		}
-		return
-	}
-	h.log.Error(errMsgFailedReplacePresenceOverrides, "error_class", presenceOverrideErrorClass(err))
-	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplacePresenceOverrides})
-}
-
-func presenceOverrideErrorClass(err error) string {
-	var operationErr *presenceOverrideOperationError
-	if errors.As(err, &operationErr) {
-		return operationErr.Operation
-	}
-	var commitErr *presenceOverrideCommitError
-	if errors.As(err, &commitErr) {
-		return "commit"
-	}
-	return "unknown"
-}
-
-func replacePresenceOverride(
+func (h *Handler) replacePresenceOverride(
 	ctx context.Context,
-	db *sql.DB,
 	senderID uuid.UUID,
 	category string,
 	req normalizedPresenceOverrideRequest,
 	computeAudience presenceOverrideAudienceFunc,
 	preparePayload presenceOverridePayloadFunc,
 ) (result presenceOverrideWriteResult, err error) {
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := h.presenceHistory.BeginTx(ctx, nil)
 	if err != nil {
-		return presenceOverrideWriteResult{}, presenceOverrideOperation("begin", err)
+		return result, &presenceWriterFailure{status: 500, class: "begin", cause: err}
 	}
-	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			err = errors.Join(err, presenceOverrideOperation("rollback", rollbackErr))
-		}
-	}()
+	if tx == nil {
+		return result, &presenceWriterFailure{status: 500, class: "begin", cause: errors.New("presence override transaction missing")}
+	}
+	defer tx.Rollback() //nolint:errcheck
+	defer h.joinPresenceWriterRollback(tx, &err)
 
-	if err := lockPresenceOverrideSender(ctx, tx, senderID); err != nil {
-		return presenceOverrideWriteResult{}, rollbackPresenceOverride(tx, presenceOverrideOperation("lock_sender", err))
+	operation, err := h.presenceHistory.BeginAudienceOperation(
+		ctx, tx, senderID, presencehistory.OrdinaryAudienceWrite,
+	)
+	if err != nil {
+		return result, err
 	}
 	currentVersion, err := readPresenceOverrideVersion(ctx, tx, senderID, category, true)
 	if err != nil {
-		return presenceOverrideWriteResult{}, rollbackPresenceOverride(tx, presenceOverrideOperation("read_version", err))
+		return result, presenceOverrideOperation("read_version", err)
 	}
 	if currentVersion != req.ExpectedVersion {
-		return presenceOverrideWriteResult{}, rollbackPresenceOverride(tx, &presenceOverrideVersionConflictError{CurrentVersion: currentVersion})
+		return result, &presenceOverrideVersionConflictError{CurrentVersion: currentVersion}
 	}
 	materializedTargetIDs, err := selectExistingPresenceOverrideTargets(ctx, tx, req.ExcludedUserIDs)
 	if err != nil {
-		return presenceOverrideWriteResult{}, rollbackPresenceOverride(tx, err)
+		return result, err
 	}
 
 	oldAudience, err := computeAudience(ctx, tx, senderID)
 	if err != nil {
-		return presenceOverrideWriteResult{}, rollbackPresenceOverride(tx, presenceOverrideOperation("prepare_old_audience", err))
+		return result, presenceOverrideOperation("prepare_old_audience", err)
 	}
 	newVersion, err := upsertPresenceOverridePreference(
 		ctx, tx, senderID, category, req.EncryptedData, req.ExpectedVersion,
 	)
 	if err != nil {
-		return presenceOverrideWriteResult{}, rollbackPresenceOverride(tx, err)
+		return result, err
 	}
 	if err := replacePresenceOverrideTargets(ctx, tx, senderID, category, materializedTargetIDs); err != nil {
-		return presenceOverrideWriteResult{}, rollbackPresenceOverride(tx, err)
+		return result, err
 	}
 
 	newAudience, err := computeAudience(ctx, tx, senderID)
 	if err != nil {
-		return presenceOverrideWriteResult{}, rollbackPresenceOverride(tx, presenceOverrideOperation("prepare_new_audience", err))
+		return result, presenceOverrideOperation("prepare_new_audience", err)
 	}
 	payload, err := preparePayload(ctx, tx, senderID)
 	if err != nil {
-		return presenceOverrideWriteResult{}, rollbackPresenceOverride(tx, presenceOverrideOperation("prepare_payload", err))
+		return result, presenceOverrideOperation("prepare_payload", err)
 	}
 
-	result = presenceOverrideWriteResult{
-		Version:               newVersion,
-		ExpectedVersion:       req.ExpectedVersion,
-		MaterializedTargetIDs: materializedTargetIDs,
-		OldAudience:           oldAudience,
-		NewAudience:           newAudience,
-		Payload:               payload,
+	clearRecipients := map[uuid.UUID]bool{}
+	updateRecipients := map[uuid.UUID]bool{}
+	var deliveryPayload *presencehistory.CustomTextState
+	if payload != nil {
+		clearRecipients = audienceDifference(oldAudience, newAudience)
+		updateRecipients = audienceDifference(newAudience, oldAudience)
+		deliveryPayload = &presencehistory.CustomTextState{Text: payload.Text, Emoji: payload.Emoji}
 	}
-	if err := tx.Commit(); err != nil {
-		return result, &presenceOverrideCommitError{cause: err}
+	result = presenceOverrideWriteResult{
+		Version:   newVersion,
+		Operation: operation,
+		Plan: presencehistory.DeliveryPlan{
+			Mode:             presencehistory.DeliveryExactDelta,
+			OperationID:      operation.ID,
+			SenderID:         senderID,
+			ClearRecipients:  clearRecipients,
+			UpdateRecipients: updateRecipients,
+			Payload:          deliveryPayload,
+			OverrideVersion:  &newVersion,
+		},
+	}
+	if err := h.commitAndClaimPresenceWriter(ctx, tx, operation, result.Plan); err != nil {
+		return result, err
 	}
 	return result, nil
 }
@@ -476,114 +338,6 @@ func replacePresenceOverrideTargets(
 		FROM unnest($3::uuid[]) AS target_ids(target_id)
 	`, senderID, category, pq.Array(targets)); err != nil {
 		return presenceOverrideOperation("insert_targets", err)
-	}
-	return nil
-}
-
-func classifyPresenceOverrideCommit(
-	attempted normalizedPresenceOverrideRequest,
-	materializedTargetIDs []uuid.UUID,
-	newVersion int,
-	persisted persistedPresenceOverrideState,
-	exists bool,
-	lookupErr error,
-) presenceOverrideCommitResolution {
-	if lookupErr != nil {
-		return presenceOverrideCommitUnresolved
-	}
-	if !exists {
-		if attempted.ExpectedVersion == 0 {
-			return presenceOverrideRollbackConfirmed
-		}
-		return presenceOverrideCommitUnresolved
-	}
-	if persisted.Version == newVersion &&
-		persisted.EncryptedData == attempted.EncryptedData &&
-		slices.Equal(persisted.ExcludedUserIDs, materializedTargetIDs) {
-		return presenceOverrideCommitConfirmed
-	}
-	if persisted.Version == attempted.ExpectedVersion {
-		return presenceOverrideRollbackConfirmed
-	}
-	return presenceOverrideCommitUnresolved
-}
-
-func presenceOverrideCommitResolutionContext(requestCtx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(
-		context.WithoutCancel(requestCtx),
-		presenceOverrideCommitResolutionTimeout,
-	)
-}
-
-func (h *Handler) readPersistedPresenceOverrideState(
-	ctx context.Context,
-	senderID uuid.UUID,
-	category string,
-) (persistedPresenceOverrideState, bool, error) {
-	var state persistedPresenceOverrideState
-	var targetIDs []string
-	err := h.db.QueryRowContext(ctx, `
-		SELECT preference.version,
-		       preference.encrypted_data,
-		       COALESCE(
-		           ARRAY_AGG(target.target_user_id::text ORDER BY target.target_user_id)
-		               FILTER (WHERE target.target_user_id IS NOT NULL),
-		           ARRAY[]::text[]
-		       )
-		FROM presence_override_preferences AS preference
-		LEFT JOIN user_presence_overrides AS target
-		  ON target.sender_id = preference.user_id
-		 AND target.category = preference.category
-		WHERE preference.user_id = $1 AND preference.category = $2
-		GROUP BY preference.version, preference.encrypted_data
-	`, senderID, category).Scan(&state.Version, &state.EncryptedData, pq.Array(&targetIDs))
-	if err == sql.ErrNoRows {
-		return persistedPresenceOverrideState{}, false, nil
-	}
-	if err != nil {
-		return persistedPresenceOverrideState{}, false, err
-	}
-	state.ExcludedUserIDs = make([]uuid.UUID, 0, len(targetIDs))
-	for _, rawID := range targetIDs {
-		id, parseErr := uuid.Parse(rawID)
-		if parseErr != nil {
-			return persistedPresenceOverrideState{}, false, fmt.Errorf("parse persisted presence override target: %w", parseErr)
-		}
-		state.ExcludedUserIDs = append(state.ExcludedUserIDs, id)
-	}
-	sort.Slice(state.ExcludedUserIDs, func(i, j int) bool {
-		return state.ExcludedUserIDs[i].String() < state.ExcludedUserIDs[j].String()
-	})
-	return state, true, nil
-}
-
-func (h *Handler) preparePresenceOverrideDelivery(
-	requestCtx context.Context,
-	senderID uuid.UUID,
-) (map[uuid.UUID]bool, *websocket.CustomTextPayload, error) {
-	ctx, cancel := context.WithTimeout(
-		context.WithoutCancel(requestCtx),
-		presenceOverrideDeliveryTimeout,
-	)
-	defer cancel()
-
-	audience, err := presence.ComputeCustomTextAudience(ctx, h.db, senderID)
-	if err != nil {
-		return nil, nil, err
-	}
-	payload, err := prepareCurrentCustomTextPayload(ctx, h.db, senderID)
-	if err != nil {
-		return nil, nil, err
-	}
-	return audience, payload, nil
-}
-
-func lockPresenceOverrideSender(ctx context.Context, tx *sql.Tx, senderID uuid.UUID) error {
-	var lockedID uuid.UUID
-	if err := tx.QueryRowContext(ctx,
-		`SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, senderID,
-	).Scan(&lockedID); err != nil {
-		return err
 	}
 	return nil
 }
@@ -709,11 +463,4 @@ func uuidStrings(ids []uuid.UUID) []string {
 
 func presenceOverrideOperation(operation string, cause error) error {
 	return &presenceOverrideOperationError{Operation: operation, cause: cause}
-}
-
-func rollbackPresenceOverride(tx *sql.Tx, cause error) error {
-	if err := tx.Rollback(); err != nil {
-		return presenceOverrideOperation("rollback", err)
-	}
-	return cause
 }

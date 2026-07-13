@@ -1070,6 +1070,7 @@ describe('Login', () => {
   it('renders only SSO providers advertised by server capabilities', () => {
     useClientConfigStore.getState().setServerCapabilities({
       auth: { oauthProviders: ['google'] },
+      features: {},
     });
 
     render(<Login {...defaultProps} />);
