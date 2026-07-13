@@ -1,6 +1,7 @@
 # NOTICE — Third-Party Software Used by Concord Voice
 
 **Generated:** 2026-05-31
+**MinIO distribution addendum updated:** 2026-07-12
 **Concord Voice License:** [Concord Voice Source License 1.0 (CVSL 1.0)](./LICENSE) → AGPL-3.0-or-later on 2030-02-15
 **Audit reference:** [docs/legal/dependency-license-audit.md](docs/legal/dependency-license-audit.md)
 
@@ -11,8 +12,8 @@ contributions of these projects to the Concord Voice platform.
 
 ## Summary
 
-Concord Voice distributes 391 third-party software components across its
-artifacts:
+Concord Voice distributes 391 third-party software components across its three
+CVSL application artifact families:
 
 - **55** Go modules in the control-plane runtime binary
 - **187** npm packages in the desktop client production bundle (plus Electron and its bundled components)
@@ -21,9 +22,10 @@ artifacts:
 (Counts exclude Concord Voice's own private packages — `@concordvoice/desktop`,
 `@concordvoice/media-plane` — and the local stub override
 `node-domexception-stub`. Those are first-party components, not third-party
-attributions.)
+attributions. The separately distributed MinIO server image described below is
+also excluded from this linked/bundled application dependency count.)
 
-License distribution:
+Application-dependency license distribution:
 
 | License family | Approximate share | Compatible with CVSL 1.0 + AGPL-3.0 |
 |---|---|---|
@@ -35,8 +37,11 @@ License distribution:
 | Other permissive (BlueOak-1.0.0, 0BSD, Python-2.0, Unlicense, CC0-1.0, MIT-0) | <2% | ✓ |
 | CC-BY-3.0 / CC-BY-4.0 (build-data only) | <1% | ✓ (attribution required) |
 
-No GPL, AGPL, SSPL, BUSL, Elastic License, Commons Clause, or other
-copyleft / non-commercial licenses are used in any distributed artifact.
+No GPL, AGPL, SSPL, BUSL, Elastic License, Commons Clause, or other strong
+copyleft / non-commercial dependency is linked into or bundled with the three
+CVSL application artifact families counted above. Concord's separately
+distributed MinIO server image is an AGPL-3.0-or-later upstream program and is
+recorded separately below; it is not part of the 391-component count.
 
 ## License Texts
 
@@ -50,6 +55,7 @@ SPDX URLs:
 - **BSD-3-Clause** — [https://opensource.org/license/bsd-3-clause](https://opensource.org/license/bsd-3-clause)
 - **0BSD** — [https://opensource.org/license/0bsd](https://opensource.org/license/0bsd)
 - **MPL-2.0** — [https://www.mozilla.org/en-US/MPL/2.0/](https://www.mozilla.org/en-US/MPL/2.0/)
+- **AGPL-3.0-or-later** — [https://www.gnu.org/licenses/agpl-3.0.html](https://www.gnu.org/licenses/agpl-3.0.html)
 - **BlueOak-1.0.0** — [https://blueoakcouncil.org/license/1.0.0](https://blueoakcouncil.org/license/1.0.0)
 - **Unlicense** — [https://unlicense.org/](https://unlicense.org/)
 - **Python-2.0** — [https://docs.python.org/3/license.html](https://docs.python.org/3/license.html)
@@ -63,6 +69,36 @@ cache, Electron credits at `about:credits` in the application). For
 projects that ship their own NOTICE file (Apache-2.0 § 4 requirement),
 that content is included with the project in its `node_modules` directory
 or Go module cache and is not duplicated here.
+
+## Separately Distributed MinIO Server
+
+Concord builds and distributes an unchanged upstream MinIO server as a
+standalone container image. It is not linked into a Concord application binary
+and is not relicensed under CVSL 1.0.
+
+| Item | Recorded value |
+| --- | --- |
+| Upstream release | `RELEASE.2025-10-15T17-29-55Z` |
+| Upstream commit | `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a` |
+| Upstream license | AGPL-3.0-or-later |
+| Runtime package | `ghcr.io/concord-voice/minio:RELEASE.2025-10-15T17-29-55Z` |
+| Corresponding-source package | `ghcr.io/concord-voice/minio-source:RELEASE.2025-10-15T17-29-55Z` |
+
+The corresponding-source package contains the exact upstream source archive,
+its checksum, Concord's Dockerfile, and the reproducible build recipe. The
+public build materials are maintained at
+[Concord-Voice/Concord-Voice `infrastructure/docker/minio`](https://github.com/Concord-Voice/Concord-Voice/tree/main/infrastructure/docker/minio).
+The runtime image preserves upstream `LICENSE`, `NOTICE`, and `CREDITS`
+unchanged under `/licenses`.
+
+Immutable runtime and source digests are captured by the trusted publisher run;
+they are not represented by mutable placeholders in this NOTICE. On initial
+package creation, both packages remain private until Concord records legal
+approval of the attribution, corresponding-source contents, and public package
+presentation. Once public, GHCR package visibility cannot return to private, so
+later MinIO releases require that recorded legal approval before dispatch. This
+section is an engineering distribution record, not a legal conclusion about
+compliance or aggregation.
 
 ## Electron and Chromium
 
