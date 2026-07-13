@@ -24,6 +24,10 @@ import { createOriginGate } from './lib/originGate.js';
 import { handleForceDisconnect } from './lib/forceDisconnect.js';
 import { handleEnforcePermissionsMessage } from './lib/enforcePermissions.js';
 import { handleSetDeafen } from './lib/setDeafen.js';
+import {
+  acknowledgeCloseRecvTransport,
+  handleCloseRecvTransport,
+} from './lib/closeRecvTransport.js';
 import { handleSetTestingStatus } from './lib/setTestingStatus.js';
 
 const expectedKeyframeRequestErrors = new Set([
@@ -776,6 +780,23 @@ async function main() {
         logger.error('Error closing consumer', { error, userId: data.userId });
         if (callback) callback({ error: 'Failed to close consumer' });
       }
+    });
+
+    // ── close-recv-transport ────────────────────────────────────────
+    // PiP and other secondary receivers explicitly release only their own
+    // receive transport. Unknown/non-owned IDs are acknowledged identically.
+    socket.on('close-recv-transport', (payload: unknown, callback?: unknown) => {
+      let result: ReturnType<typeof handleCloseRecvTransport>;
+      try {
+        result = handleCloseRecvTransport(roomManager, data.roomId, data.userId, payload);
+      } catch (error) {
+        logger.error('Error closing receive transport', {
+          error: error instanceof Error ? error.message : 'unknown',
+          userId: data.userId,
+        });
+        result = { error: 'Failed to close receive transport' };
+      }
+      acknowledgeCloseRecvTransport(callback, result);
     });
 
     // ── pause-producer ───────────────────────────────────────────────

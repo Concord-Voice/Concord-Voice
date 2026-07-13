@@ -536,6 +536,100 @@ describe('RoomManager', () => {
       expect(participant?.recvTransports.has(transport.id)).toBe(true);
     });
 
+    it('closes and removes an owned recv transport (#2206)', async () => {
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-1', 'u-1', 'recv');
+
+      const participant = manager.getParticipant('room-1', 'u-1')!;
+      const closed = manager.closeRecvTransport('room-1', 'u-1', transport.id);
+      expect(closed).toBe(true);
+
+      expect(transport.close).toHaveBeenCalledOnce();
+      expect(participant.recvTransports.has(transport.id)).toBe(false);
+    });
+
+    it('does not close an owned recv transport twice (#2206)', async () => {
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-1', 'u-1', 'recv');
+
+      expect(manager.closeRecvTransport('room-1', 'u-1', transport.id)).toBe(true);
+      expect(manager.closeRecvTransport('room-1', 'u-1', transport.id)).toBe(false);
+      expect(transport.close).toHaveBeenCalledOnce();
+    });
+
+    it("cannot close another participant's recv transport or its own send transport (#2206)", async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', { username: 'bob' });
+      const foreignRecvTransport = createMockTransport();
+      const ownSendTransport = createMockTransport();
+      mockRouter.createWebRtcTransport
+        .mockResolvedValueOnce(foreignRecvTransport)
+        .mockResolvedValueOnce(ownSendTransport);
+      await manager.createTransport('room-1', 'u-2', 'recv');
+      await manager.createTransport('room-1', 'u-1', 'send');
+
+      expect(manager.closeRecvTransport('room-1', 'u-1', foreignRecvTransport.id)).toBe(false);
+      expect(manager.closeRecvTransport('room-1', 'u-1', ownSendTransport.id)).toBe(false);
+      expect(foreignRecvTransport.close).not.toHaveBeenCalled();
+      expect(ownSendTransport.close).not.toHaveBeenCalled();
+      expect(
+        manager.getParticipant('room-1', 'u-2')?.recvTransports.has(foreignRecvTransport.id)
+      ).toBe(true);
+      expect(manager.getParticipant('room-1', 'u-1')?.sendTransport?.id).toBe(ownSendTransport.id);
+    });
+
+    it('fails safely for an unknown room, participant, or transport (#2206)', () => {
+      expect(manager.closeRecvTransport('missing-room', 'u-1', 'transport-1')).toBe(false);
+      expect(manager.closeRecvTransport('room-1', 'missing-user', 'transport-1')).toBe(false);
+      expect(manager.closeRecvTransport('room-1', 'u-1', 'missing-transport')).toBe(false);
+    });
+
+    it('preserves transportclose consumer bookkeeping cleanup (#2206)', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', { username: 'bob' });
+      manager.updateRtpCapabilities('room-1', 'u-1', createRtpCapabilities() as any);
+
+      const producer = createMockProducer({ id: 'producer-camera', kind: 'video' });
+      manager.getParticipant('room-1', 'u-2')!.producers.set('producer-camera', {
+        producer: producer as any,
+        source: 'camera',
+        kind: 'video',
+      });
+
+      const consumer = createMockConsumer({ id: 'consumer-camera', kind: 'video' });
+      const transport = createMockTransport({
+        close: vi.fn(() => consumer._emit('transportclose')),
+      });
+      transport.consume.mockResolvedValueOnce(consumer);
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-1', 'u-1', 'recv');
+      await manager.consume('room-1', 'u-1', producer.id, transport.id);
+
+      const room = manager.getRoom('room-1')!;
+      const participant = manager.getParticipant('room-1', 'u-1')!;
+      room.lastNPausedConsumers.add(consumer.id);
+      room.cameraLayerDemands.set(consumer.id, {
+        consumerId: consumer.id,
+        visible: true,
+        maxUsefulSpatialLayer: 1,
+        pressureStepDown: false,
+      });
+      room.screenLayerDemands.set(consumer.id, {
+        consumerId: consumer.id,
+        userId: 'u-1',
+        sharerUserId: 'u-2',
+        visible: true,
+        maxUsefulSpatialLayer: 1,
+        pressureStepDown: false,
+      });
+
+      expect(manager.closeRecvTransport('room-1', 'u-1', transport.id)).toBe(true);
+      expect(participant.consumers.has(consumer.id)).toBe(false);
+      expect(room.lastNPausedConsumers.has(consumer.id)).toBe(false);
+      expect(room.cameraLayerDemands.has(consumer.id)).toBe(false);
+      expect(room.screenLayerDemands.has(consumer.id)).toBe(false);
+    });
+
     it('replaces old send transport if one exists', async () => {
       const oldTransport = createMockTransport();
       const newTransport = createMockTransport();

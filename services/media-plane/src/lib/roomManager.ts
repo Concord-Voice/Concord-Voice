@@ -1207,6 +1207,24 @@ export class RoomManager {
     logger.debug('Transport connected', { transportId, roomId, userId });
   }
 
+  /** Close and remove one receive transport owned by the authenticated participant. */
+  closeRecvTransport(roomId: string, userId: string, transportId: string): boolean {
+    const room = this.rooms.get(roomId);
+    if (!room) return false;
+
+    const participant = room.participants.get(userId);
+    if (!participant) return false;
+
+    const transport = participant.recvTransports.get(transportId);
+    if (!transport) return false;
+
+    // Delete first so a retry or re-entrant close cannot close the transport twice.
+    participant.recvTransports.delete(transportId);
+    if (!transport.closed) transport.close();
+    logger.debug('Receive transport closed', { transportId, roomId, userId });
+    return true;
+  }
+
   // ─── Producer management ─────────────────────────────────────────────
 
   /** Create a producer on the participant's send transport */
