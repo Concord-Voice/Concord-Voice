@@ -281,8 +281,8 @@ stop. Do not improvise destructive recovery.
 | Upstream commit | `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a` |
 | Runtime tag | `ghcr.io/concord-voice/minio:RELEASE.2025-10-15T17-29-55Z` |
 | Source tag | `ghcr.io/concord-voice/minio-source:RELEASE.2025-10-15T17-29-55Z` |
-| Runtime digest | Pending first default-branch publication |
-| Source digest | Pending first default-branch publication |
+| Runtime digest | `sha256:08e1ba1a7396036f40c57fed2dfabe687ca722d233576484a817a8908bee66c5` |
+| Source digest | `sha256:749db4d34817703406a32e6c416e262c632a7a43b0b106947387fbb3c9ed84bd` |
 
 Update this table only from a successful publisher workflow summary. The live
 server and shared Compose consumer remain unchanged until Phase 2 is separately
