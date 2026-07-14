@@ -1058,7 +1058,7 @@ describe('VoiceService Extended', () => {
       expect(svc.getProducerCodecMimeType('camera')).toBeNull();
     });
 
-    it('returns plain VP9 mime when profile-id is 0', async () => {
+    it('returns a profile-aware VP9 key when profile-id is 0', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
       const producer = createMockProducer('c', 'camera');
@@ -1066,7 +1066,21 @@ describe('VoiceService Extended', () => {
         codecs: [{ mimeType: 'video/VP9', sdpFmtpLine: 'profile-id=0' }],
       });
       svc.producers.set('camera', producer);
-      expect(svc.getProducerCodecMimeType('camera')).toBe('video/vp9');
+      expect(svc.getProducerCodecMimeType('camera')).toBe('video/vp9:0');
+    });
+
+    it('skips auxiliary codecs in the sender fallback list', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const producer = createMockProducer('c', 'camera');
+      producer.rtpSender.getParameters.mockReturnValue({
+        codecs: [
+          { mimeType: 'video/rtx' },
+          { mimeType: 'video/H264', sdpFmtpLine: 'profile-level-id=4d0032' },
+        ],
+      });
+      svc.producers.set('camera', producer);
+      expect(svc.getProducerCodecMimeType('camera')).toBe('video/h264:4d0032');
     });
   });
 
@@ -3611,20 +3625,19 @@ describe('VoiceService Extended', () => {
       expect(svc.findSendCodec('video/VP8')).toBeUndefined();
     });
 
-    it('matches H264 profile prefix', async () => {
+    it('matches a compatible lower H264 level in the same profile class', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const codec = svc.findSendCodec('video/H264:6400');
+      const codec = svc.findSendCodec('video/H264:64001f');
       expect(codec).toBeDefined();
       expect(codec.parameters['profile-level-id']).toBe('640034');
     });
 
-    it('returns last match (highest quality) without profile', async () => {
+    it('uses canonical High-first order without a profile', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
       const codec = svc.findSendCodec('video/H264');
       expect(codec).toBeDefined();
-      // Should return the last H264 codec (640034, not 42e01f)
       expect(codec.parameters['profile-level-id']).toBe('640034');
     });
   });

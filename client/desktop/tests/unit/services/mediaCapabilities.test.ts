@@ -80,15 +80,25 @@ describe('mediaCapabilities', () => {
       expect(info.hdr).toBe(true);
     });
 
-    it('returns H.264 High info', () => {
-      const info = getCodecInfo('video/h264:640034');
+    it('returns qualitative H.264 High info for a compatible lower client level', () => {
+      const info = getCodecInfo('video/h264:64001f');
       expect(info.name).toBe('H.264 (High)');
       expect(info.quality).toBe('Very Good');
+      expect(info.compressionRatio).toBe('Best H.264 efficiency');
+      expect(info.compressionRatio).not.toContain('%');
     });
 
-    it('returns H.264 Main info', () => {
-      const info = getCodecInfo('video/h264:4d0028');
+    it('returns qualitative H.264 Main info for a compatible constraint/level variant', () => {
+      const info = getCodecInfo('video/h264:4d401f');
       expect(info.name).toBe('H.264 (Main)');
+      expect(info.compressionRatio).toBe('Balanced H.264 efficiency');
+      expect(info.compressionRatio).not.toContain('%');
+    });
+
+    it.each(['42e01f', '4d801f'])('returns H.264 Constrained Baseline info for %s', (profile) => {
+      const info = getCodecInfo(`video/h264:${profile}`);
+      expect(info.name).toBe('H.264 (Constrained Baseline)');
+      expect(info.hdr).toBe(false);
     });
 
     it('returns H.264 Baseline info for unknown profile', () => {
@@ -299,17 +309,55 @@ describe('mediaCapabilities', () => {
       expect(h264High).toBeDefined();
       expect(h264High!.profileLabel).toBe('High');
 
-      // H264 Baseline
+      // H264 Constrained Baseline
       const h264Baseline = caps.find(
         (c) => c.mimeType === 'video/H264' && c.profileId === '42e034'
       );
       expect(h264Baseline).toBeDefined();
-      expect(h264Baseline!.profileLabel).toBe('Baseline');
+      expect(h264Baseline!.profileLabel).toBe('Constrained Baseline');
 
       // VP9 Profile 0
       const vp9 = caps.find((c) => c.mimeType === 'video/VP9');
       expect(vp9).toBeDefined();
       expect(vp9!.profileId).toBe('0');
+    });
+
+    it('classifies and preserves lower-level H.264 High and Main capabilities', async () => {
+      (globalThis as any).RTCRtpSender = {
+        getCapabilities: vi.fn(() => ({
+          codecs: [
+            { mimeType: 'video/H264', sdpFmtpLine: 'profile-level-id=64001f' },
+            { mimeType: 'video/H264', sdpFmtpLine: 'profile-level-id=4d401f' },
+            { mimeType: 'video/H264', sdpFmtpLine: 'profile-level-id=4d801f' },
+          ],
+        })),
+      };
+
+      clearCapabilitiesCache();
+      const caps = await detectCodecCapabilities();
+
+      expect(caps).toEqual([
+        expect.objectContaining({ profileId: '64001f', profileLabel: 'High', isHdr: false }),
+        expect.objectContaining({ profileId: '4d401f', profileLabel: 'Main', isHdr: false }),
+        expect.objectContaining({
+          profileId: '4d801f',
+          profileLabel: 'Constrained Baseline',
+          isHdr: false,
+        }),
+      ]);
+    });
+
+    it('normalizes fmtp-less VP9 to Profile 0', async () => {
+      (globalThis as any).RTCRtpSender = {
+        getCapabilities: vi.fn(() => ({ codecs: [{ mimeType: 'video/VP9' }] })),
+      };
+
+      clearCapabilitiesCache();
+      const caps = await detectCodecCapabilities();
+
+      expect(caps).toHaveLength(1);
+      expect(caps[0]).toMatchObject({ profileId: '0', isHdr: false });
+      expect(codecKey(caps[0])).toBe('video/VP9:0');
     });
 
     it('returns cached results on subsequent calls', async () => {

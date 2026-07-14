@@ -35,7 +35,13 @@ vi.mock('@/renderer/stores/voiceStore', () => ({
 vi.mock('@/renderer/stores/videoSettingsStore', () => ({
   useVideoSettingsStore: Object.assign(
     vi.fn((s: (state: Record<string, unknown>) => unknown) =>
-      s({ codecCapabilities: [], gpuInfo: null, videoAdvancedMode: false, systemHdr: false })
+      s({
+        codecCapabilities: [],
+        gpuInfo: null,
+        videoAdvancedMode: false,
+        systemHdr: false,
+        hardwareAcceleration: true,
+      })
     ),
     { getState: vi.fn(() => ({ setVideoAdvancedMode: mockSetVideoAdvancedMode })) }
   ),
@@ -70,10 +76,10 @@ vi.mock('@/renderer/hooks/useEntitlement', () => ({
 }));
 
 vi.mock('@/renderer/services/mediaCapabilities', () => ({
-  codecKey: vi.fn(
-    (c: { mimeType: string; sdpFmtpLine?: string }) => `${c.mimeType}/${c.sdpFmtpLine || 'default'}`
+  codecKey: vi.fn((c: { mimeType: string; profileId?: string | null }) =>
+    c.profileId ? `${c.mimeType}:${c.profileId}` : c.mimeType
   ),
-  codecKeyMime: vi.fn((key: string) => key.split('/').slice(0, 2).join('/')),
+  codecKeyMime: vi.fn((key: string) => key.split(':')[0]),
   getCodecInfo: vi.fn(() => ({
     name: 'VP8',
     quality: 'Good',
@@ -91,14 +97,17 @@ vi.mock('@/renderer/components/ui/CustomSelect', () => ({
     onChange,
     disabled,
     className,
+    id,
   }: {
-    options: { value: string; label: string }[];
+    options: { value: string; label: string; disabled?: boolean }[];
     value: string;
     onChange: (v: string) => void;
     disabled?: boolean;
     className?: string;
+    id?: string;
   }) => (
     <select
+      id={id}
       data-testid="custom-select"
       className={className}
       value={value}
@@ -106,7 +115,7 @@ vi.mock('@/renderer/components/ui/CustomSelect', () => ({
       disabled={disabled}
     >
       {options.map((o) => (
-        <option key={o.value} value={o.value}>
+        <option key={o.value} value={o.value} disabled={o.disabled}>
           {o.label}
         </option>
       ))}
@@ -127,21 +136,30 @@ import { getCodecInfo } from '@/renderer/services/mediaCapabilities';
 const makeCodec = (
   mimeType: string,
   hwAvailable: boolean,
-  opts: { sdpFmtpLine?: string; profileLabel?: string; isHdr?: boolean; hwAvailable?: boolean } = {}
+  opts: {
+    sdpFmtpLine?: string;
+    profileId?: string | null;
+    profileLabel?: string;
+    isHdr?: boolean;
+    hwAvailable?: boolean;
+  } = {}
 ) => ({
   mimeType,
   hwAvailable: 'hwAvailable' in opts ? opts.hwAvailable : hwAvailable,
   sdpFmtpLine: opts.sdpFmtpLine || 'default',
+  supported: true,
+  profileId: opts.profileId ?? null,
   profileLabel: opts.profileLabel || '',
   isHdr: opts.isHdr || false,
 });
 
 const sampleCodecs = [
   makeCodec('video/VP8', false),
-  makeCodec('video/VP9', true, { profileLabel: 'Profile 0' }),
+  makeCodec('video/VP9', true, { profileId: '0', profileLabel: 'Profile 0' }),
   makeCodec('video/H264', true, {
-    sdpFmtpLine: 'level-asymmetry-allowed=1',
-    profileLabel: 'Baseline',
+    sdpFmtpLine: 'level-asymmetry-allowed=1;profile-level-id=42e01f',
+    profileId: '42e01f',
+    profileLabel: 'Constrained Baseline',
   }),
   makeCodec('video/AV1', true),
   makeCodec('video/H265', false, { profileLabel: 'Main' }), // unsupported by router
@@ -150,6 +168,7 @@ const sampleCodecs = [
 const sampleCodecsWithHdr = [
   ...sampleCodecs,
   makeCodec('video/VP9', false, {
+    profileId: '2',
     profileLabel: 'Profile 2',
     isHdr: true,
     sdpFmtpLine: 'profile-id=2',
@@ -164,6 +183,7 @@ function mockVideoSettingsStore(overrides: Record<string, unknown>) {
     gpuInfo: null,
     videoAdvancedMode: false,
     systemHdr: false,
+    hardwareAcceleration: true,
   };
   (useVideoSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
     (s: (state: Record<string, unknown>) => unknown) => s({ ...defaults, ...overrides })
@@ -196,6 +216,18 @@ function renderComponent() {
   return result;
 }
 
+function getCodecSelect(): HTMLSelectElement {
+  const codecSelect = screen
+    .getAllByTestId('custom-select')
+    .find((select) =>
+      Array.from(select.querySelectorAll('option')).some(
+        (option) => option.value === '' && option.textContent === 'Auto'
+      )
+    );
+  expect(codecSelect).toBeTruthy();
+  return codecSelect as HTMLSelectElement;
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
@@ -207,7 +239,13 @@ beforeEach(() => {
   // Reset to defaults
   (useVideoSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
     (s: (state: Record<string, unknown>) => unknown) =>
-      s({ codecCapabilities: [], gpuInfo: null, videoAdvancedMode: false, systemHdr: false })
+      s({
+        codecCapabilities: [],
+        gpuInfo: null,
+        videoAdvancedMode: false,
+        systemHdr: false,
+        hardwareAcceleration: true,
+      })
   );
   (useDraftVideoSetting as unknown as ReturnType<typeof vi.fn>).mockImplementation(
     (key: string) => defaultVideoSettings[key] ?? false
@@ -437,14 +475,15 @@ describe('VideoConfigSection', () => {
       mockVideoSettingsStore({ videoAdvancedMode: true, systemHdr: true });
       mockDraftSettings({ hdrEncoding: true });
       renderComponent();
-      expect(screen.getByText(/Enabled\. HDR codec profiles/)).toBeInTheDocument();
+      expect(screen.getByText(/prefers HDR-capable codec profiles/)).toBeInTheDocument();
+      expect(screen.getByText(/does not guarantee a 10-bit or HDR stream/)).toBeInTheDocument();
     });
 
     it('shows disabled message when systemHdr=true and hdrEncoding=false', () => {
       mockVideoSettingsStore({ videoAdvancedMode: true, systemHdr: true });
       mockDraftSettings({ hdrEncoding: false });
       renderComponent();
-      expect(screen.getByText(/Disabled\. SDR codec profiles/)).toBeInTheDocument();
+      expect(screen.getByText(/prefers SDR codec profiles/)).toBeInTheDocument();
     });
   });
 
@@ -494,14 +533,14 @@ describe('VideoConfigSection', () => {
     });
 
     it('highlights in-use codec when activeCameraCodec is set', () => {
-      mockVoiceStore({ activeCameraCodec: 'video/VP9/default' });
+      mockVoiceStore({ activeCameraCodec: 'video/vp9' });
       renderComponent();
       const inUse = document.querySelectorAll('.settings-codec-item.in-use');
       expect(inUse.length).toBeGreaterThan(0);
     });
 
     it('highlights in-use codec when activeScreenCodec is set', () => {
-      mockVoiceStore({ activeScreenCodec: 'video/H264/level-asymmetry-allowed=1' });
+      mockVoiceStore({ activeScreenCodec: 'video/h264:42e01f' });
       renderComponent();
       const inUse = document.querySelectorAll('.settings-codec-item.in-use');
       expect(inUse.length).toBeGreaterThan(0);
@@ -557,6 +596,23 @@ describe('VideoConfigSection', () => {
       renderComponent();
       expect(document.querySelector('.settings-codec-grid')).toBeNull();
     });
+
+    it('does not mark either column Preferred when no routable codec exists', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/H265', true, { profileLabel: 'Main' }),
+          makeCodec('video/H264', false, { profileId: '42001f', profileLabel: 'Baseline' }),
+        ],
+      });
+      mockDraftSettings({ hardwareAcceleration: true, preferredVideoCodec: '' });
+
+      renderComponent();
+
+      expect(document.querySelectorAll('.settings-codec-column.active')).toHaveLength(0);
+      expect(document.querySelectorAll('.settings-codec-item.preferred')).toHaveLength(0);
+      expect(screen.getByText(/Auto — no routable local codec is available/)).toBeInTheDocument();
+    });
   });
 
   // ─── 9. Preferred video codec ─────────────────────────────────────────────
@@ -570,12 +626,13 @@ describe('VideoConfigSection', () => {
       mockDraftSettings({ preferredVideoCodec: '' });
       renderComponent();
       expect(
-        screen.getByText(/Currently Auto \u2014 Concord selects the best/)
+        screen.getByText(/Currently Auto — will try .* first using hardware/)
       ).toBeInTheDocument();
+      expect(screen.getByRole('combobox', { name: 'Video Codec' })).toBe(getCodecSelect());
     });
 
     it('shows specific codec name when preferred codec set', () => {
-      mockDraftSettings({ preferredVideoCodec: 'video/VP8/default' });
+      mockDraftSettings({ preferredVideoCodec: 'video/VP8' });
       (getCodecInfo as ReturnType<typeof vi.fn>).mockReturnValue({
         name: 'VP8',
         quality: 'Good',
@@ -588,16 +645,46 @@ describe('VideoConfigSection', () => {
       expect(screen.getByText(/Currently VP8/)).toBeInTheDocument();
     });
 
-    it('shows preference notice when preferred codec is set', () => {
-      mockDraftSettings({ preferredVideoCodec: 'video/VP8/default' });
+    it('keeps a manual preference while clearly naming the room-floor fallback', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/H264', true, { profileId: '640034', profileLabel: 'High' }),
+          makeCodec('video/VP8', false),
+        ],
+      });
+      mockVoiceStore({ codecFloor: ['video/vp8'] });
+      mockDraftSettings({ preferredVideoCodec: 'video/h264:640034' });
+      (getCodecInfo as ReturnType<typeof vi.fn>).mockImplementation((key: string) => ({
+        name: key.includes('h264') ? 'H.264 (High)' : 'VP8',
+        quality: 'Good',
+        efficiency: 'Moderate',
+        compressionRatio: 'Reference',
+        hdr: false,
+        notes: '',
+      }));
+
       renderComponent();
-      expect(screen.getByText(/Your client will prefer this codec/)).toBeInTheDocument();
+
+      expect(
+        screen.getByText(
+          /Selected H\.264 \(High\) cannot be used with the current room and settings\. Concord will try VP8 instead\./
+        )
+      ).toBeInTheDocument();
+      expect(document.querySelector('.settings-codec-item.preferred')).toHaveTextContent('VP8');
+      expect(mockSetDraftVideoSetting).not.toHaveBeenCalledWith('preferredVideoCodec', null);
     });
 
-    it('does not show preference notice when auto', () => {
+    it('shows preference notice when preferred codec is set', () => {
+      mockDraftSettings({ preferredVideoCodec: 'video/VP8' });
+      renderComponent();
+      expect(screen.getByText(/is the target Concord will try first/)).toBeInTheDocument();
+    });
+
+    it('explains Preferred versus In Use when auto', () => {
       mockDraftSettings({ preferredVideoCodec: '' });
       renderComponent();
-      expect(screen.queryByText(/Your client will prefer this codec/)).not.toBeInTheDocument();
+      expect(screen.getByText(/is the target Concord will try first/)).toBeInTheDocument();
     });
 
     it('renders structured codec metadata', () => {
@@ -623,6 +710,89 @@ describe('VideoConfigSection', () => {
       const badge = document.querySelector('.settings-codec-info-badge');
       expect(badge).toBeInTheDocument();
       expect(badge?.textContent).toContain('Yes');
+    });
+
+    it('keeps Auto details and bitrate aligned with the highlighted hardware codec (#2242)', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/AV1', false),
+          makeCodec('video/H264', true, {
+            profileId: '640034',
+            profileLabel: 'High',
+          }),
+        ],
+      });
+      mockDraftSettings({
+        preferredVideoCodec: '',
+        hardwareAcceleration: true,
+        hdrEncoding: false,
+        screenShareBitrate: 0,
+        screenResolution: '1080p',
+        screenFrameRate: 30,
+      });
+      (getCodecInfo as ReturnType<typeof vi.fn>).mockImplementation((key: string) => ({
+        name: key.toLowerCase().includes('h264') ? 'H.264 (High)' : 'AV1',
+        quality: 'Very Good',
+        efficiency: 'Good',
+        compressionRatio: '~25% better than Baseline',
+        hdr: false,
+        notes: 'Best H.264 compression available in Concord.',
+      }));
+
+      renderComponent();
+
+      const hardwareColumn = screen.getByText('Hardware').closest('.settings-codec-column');
+      const highlighted = Array.from(
+        hardwareColumn?.querySelectorAll('.settings-codec-item') ?? []
+      ).find((item) => item.textContent?.includes('AVC (H.264) (High 5.2)'));
+      expect(highlighted).toHaveClass('preferred');
+      expect(
+        screen.getByText(/Auto — will try H\.264 \(High\) first using hardware/)
+      ).toBeInTheDocument();
+      expect(document.querySelector('.settings-codec-info-badge')).toHaveTextContent(
+        'Quality:Very Good'
+      );
+      expect(screen.getByText('Estimated Bitrate: ~4.4 Mbps')).toBeInTheDocument();
+    });
+
+    it.each([
+      ['640034', 'Very Good', 'Good', 'Best H.264 efficiency'],
+      ['4d0032', 'Good', 'Moderate', 'Balanced H.264 efficiency'],
+      ['42e01f', 'Baseline', 'Moderate', 'Reference'],
+    ])(
+      'shows profile-specific H264 facts for %s without claiming HDR',
+      (profileId, quality, efficiency, compressionRatio) => {
+        mockVideoSettingsStore({
+          videoAdvancedMode: true,
+          codecCapabilities: [makeCodec('video/H264', true, { profileId })],
+        });
+        mockDraftSettings({ preferredVideoCodec: `video/H264:${profileId}` });
+        (getCodecInfo as ReturnType<typeof vi.fn>).mockReturnValue({
+          name: `H.264 (${profileId})`,
+          quality,
+          efficiency,
+          compressionRatio,
+          hdr: false,
+          notes: `Profile ${profileId}`,
+        });
+
+        renderComponent();
+
+        const badge = document.querySelector('.settings-codec-info-badge');
+        expect(badge).toHaveTextContent(`Quality:${quality}`);
+        expect(badge).toHaveTextContent(`Efficiency:${efficiency} (${compressionRatio})`);
+        expect(badge).toHaveTextContent('HDR Capable:No');
+        expect(badge).toHaveTextContent(`Description:Profile ${profileId}`);
+      }
+    );
+
+    it('opens the codec profile guide from an accessible text button', () => {
+      renderComponent();
+      const trigger = screen.getByRole('button', { name: 'What are codec profiles?' });
+      expect(trigger).toHaveAttribute('aria-haspopup', 'dialog');
+      fireEvent.click(trigger);
+      expect(screen.getByRole('dialog', { name: 'What are codec profiles?' })).toBeInTheDocument();
     });
   });
 
@@ -829,26 +999,33 @@ describe('VideoConfigSection', () => {
     });
 
     it('uses efficient bitrate for AV1 codec', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [makeCodec('video/AV1', false)],
+      });
       mockDraftSettings({
         screenShareBitrate: 0,
-        preferredVideoCodec: 'video/AV1/default',
+        preferredVideoCodec: 'video/AV1',
         screenResolution: '1080p',
         screenFrameRate: 30,
       });
       renderComponent();
-      // Just verify estimated bitrate is displayed (exact value depends on bpp)
-      expect(screen.getByText(/Estimated Bitrate/)).toBeInTheDocument();
+      expect(screen.getByText('Estimated Bitrate: ~2.5 Mbps')).toBeInTheDocument();
     });
 
     it('uses non-efficient bitrate for VP8 codec', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [makeCodec('video/VP8', false)],
+      });
       mockDraftSettings({
         screenShareBitrate: 0,
-        preferredVideoCodec: 'video/VP8/default',
+        preferredVideoCodec: 'video/VP8',
         screenResolution: '1080p',
         screenFrameRate: 30,
       });
       renderComponent();
-      expect(screen.getByText(/Estimated Bitrate/)).toBeInTheDocument();
+      expect(screen.getByText('Estimated Bitrate: ~4.4 Mbps')).toBeInTheDocument();
     });
 
     it('parses NxN resolution string', () => {
@@ -887,15 +1064,49 @@ describe('VideoConfigSection', () => {
     });
 
     it('uses activeScreenCodec over preferredVideoCodec for efficiency calc', () => {
-      mockVoiceStore({ activeScreenCodec: 'video/VP9/default' });
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/VP8', false),
+          makeCodec('video/VP9', false, { profileId: '0' }),
+        ],
+      });
+      mockVoiceStore({ activeScreenCodec: 'video/vp9:0' });
       mockDraftSettings({
         screenShareBitrate: 0,
-        preferredVideoCodec: 'video/VP8/default',
+        preferredVideoCodec: 'video/VP8',
         screenResolution: '1080p',
         screenFrameRate: 30,
       });
       renderComponent();
-      expect(screen.getByText(/Estimated Bitrate/)).toBeInTheDocument();
+      expect(screen.getByText('Estimated Bitrate: ~2.5 Mbps')).toBeInTheDocument();
+      expect(document.querySelector('.settings-codec-item.preferred')).toHaveTextContent('VP8');
+      expect(document.querySelector('.settings-codec-item.in-use')).toHaveTextContent(
+        'Screen In Use'
+      );
+    });
+
+    it('uses a live VP8 screen estimate even when Auto predicts AV1', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [makeCodec('video/AV1', false), makeCodec('video/VP8', false)],
+      });
+      mockVoiceStore({ activeScreenCodec: 'video/vp8' });
+      mockDraftSettings({
+        screenShareBitrate: 0,
+        preferredVideoCodec: '',
+        hardwareAcceleration: false,
+        screenResolution: '1080p',
+        screenFrameRate: 30,
+      });
+
+      renderComponent();
+
+      expect(screen.getByText('Estimated Bitrate: ~4.4 Mbps')).toBeInTheDocument();
+      expect(document.querySelector('.settings-codec-item.preferred')).toHaveTextContent('AV1');
+      expect(document.querySelector('.settings-codec-item.in-use')).toHaveTextContent(
+        'Screen In Use'
+      );
     });
   });
 
@@ -956,7 +1167,7 @@ describe('VideoConfigSection', () => {
         codecCapabilities: sampleCodecs,
       });
       mockDraftSettings({
-        preferredVideoCodec: 'video/H264/level-asymmetry-allowed=1',
+        preferredVideoCodec: 'video/H264:42e01f',
         hardwareAcceleration: true,
       });
       renderComponent();
@@ -971,7 +1182,7 @@ describe('VideoConfigSection', () => {
       });
       // VP8 is not hardware-available in our sample data
       mockDraftSettings({
-        preferredVideoCodec: 'video/VP8/default',
+        preferredVideoCodec: 'video/VP8',
         hardwareAcceleration: true,
       });
       renderComponent();
@@ -985,12 +1196,34 @@ describe('VideoConfigSection', () => {
         codecCapabilities: sampleCodecs,
       });
       mockDraftSettings({
-        preferredVideoCodec: 'video/H264/level-asymmetry-allowed=1',
+        preferredVideoCodec: 'video/H264:42e01f',
         hardwareAcceleration: false,
       });
       renderComponent();
       const swHeader = screen.getByText('Software');
       expect(swHeader.className).toContain('active');
+    });
+
+    it('uses learned WebRTC hardware for Preferred without erasing GPU capabilities', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/AV1', true),
+          makeCodec('video/H264', false, { profileId: '640034', profileLabel: 'High' }),
+        ],
+        webrtcHwByMime: { 'video/av1': false, 'video/h264': true },
+      });
+      mockDraftSettings({ hardwareAcceleration: true, preferredVideoCodec: '' });
+
+      renderComponent();
+
+      const hardwareColumn = screen.getByText('Hardware').closest('.settings-codec-column');
+      expect(hardwareColumn).toHaveClass('active');
+      expect(hardwareColumn).toHaveTextContent('AV1');
+      expect(hardwareColumn).toHaveTextContent('AVC (H.264) (High 5.2)');
+      expect(hardwareColumn?.querySelector('.settings-codec-item.preferred')).toHaveTextContent(
+        'AVC (H.264) (High 5.2)'
+      );
     });
   });
 
@@ -1007,27 +1240,22 @@ describe('VideoConfigSection', () => {
     it('renders HDR codec options when hdrEncoding is true', () => {
       mockDraftSettings({ hdrEncoding: true });
       renderComponent();
-      // HDR codec option should be selectable (not disabled prefix)
-      const selects = screen.getAllByTestId('custom-select');
-      const codecSelect = selects.find((s) => {
-        const opts = s.querySelectorAll('option');
-        return Array.from(opts).some((o) => o.value === '');
-      });
-      expect(codecSelect).toBeTruthy();
+      const hdrOption = Array.from(getCodecSelect().options).find(
+        (option) => option.value === 'video/vp9:2'
+      );
+      expect(hdrOption).toBeDefined();
+      expect(hdrOption).not.toBeDisabled();
+      expect(hdrOption).toHaveTextContent('VP9 (Profile 2 — HDR)');
     });
 
-    it('prefixes HDR codec values with __disabled_ when hdrEncoding is false', () => {
+    it('keeps the real VP9 Profile 2 value disabled when hdrEncoding is false', () => {
       mockDraftSettings({ hdrEncoding: false });
       renderComponent();
-      const selects = screen.getAllByTestId('custom-select');
-      // Find the codec select (has Auto option with empty value)
-      const codecSelect = selects.find((s) => {
-        const opts = s.querySelectorAll('option');
-        return Array.from(opts).some((o) => o.value === '');
-      });
-      const options = codecSelect?.querySelectorAll('option') || [];
-      const disabledOpts = Array.from(options).filter((o) => o.value.startsWith('__disabled_'));
-      expect(disabledOpts.length).toBeGreaterThan(0);
+      const hdrOption = Array.from(getCodecSelect().options).find(
+        (option) => option.value === 'video/vp9:2'
+      );
+      expect(hdrOption).toBeDisabled();
+      expect(hdrOption).toHaveTextContent('Requires HDR setting');
     });
   });
 
@@ -1141,15 +1369,12 @@ describe('VideoConfigSection', () => {
         return Array.from(opts).some((o) => o.value === '' && o.textContent === 'Auto');
       });
       expect(codecSelect).toBeTruthy();
-      fireEvent.change(codecSelect!, { target: { value: 'video/VP8/default' } });
-      expect(mockSetDraftVideoSetting).toHaveBeenCalledWith(
-        'preferredVideoCodec',
-        'video/VP8/default'
-      );
+      fireEvent.change(codecSelect!, { target: { value: 'video/vp8' } });
+      expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('preferredVideoCodec', 'video/vp8');
     });
 
     it('calls setDraftVideoSetting with null for preferredVideoCodec (Auto)', () => {
-      mockDraftSettings({ preferredVideoCodec: 'video/VP8/default' });
+      mockDraftSettings({ preferredVideoCodec: 'video/VP8' });
       renderComponent();
       const selects = screen.getAllByTestId('custom-select');
       // Codec select has an option with value="" and label "Auto"
@@ -1162,25 +1387,16 @@ describe('VideoConfigSection', () => {
       expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('preferredVideoCodec', null);
     });
 
-    it('ignores disabled HDR codec selection', () => {
+    it('clears a persisted VP9 Profile 2 preference when HDR is disabled', async () => {
       mockVideoSettingsStore({
         videoAdvancedMode: true,
         codecCapabilities: sampleCodecsWithHdr,
       });
-      mockDraftSettings({ hdrEncoding: false, preferredVideoCodec: 'video/VP8/default' });
+      mockDraftSettings({ hdrEncoding: false, preferredVideoCodec: 'video/VP9:2' });
       renderComponent();
-      const selects = screen.getAllByTestId('custom-select');
-      // Codec select has an option with value="" and label "Auto"
-      const codecSelect = selects.find((s) => {
-        const opts = s.querySelectorAll('option');
-        return Array.from(opts).some((o) => o.value === '' && o.textContent === 'Auto');
+      await vi.waitFor(() => {
+        expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('preferredVideoCodec', null);
       });
-      fireEvent.change(codecSelect!, { target: { value: '__disabled_video/VP9/profile-id=2' } });
-      // Should keep the current preferred codec, not the disabled one
-      expect(mockSetDraftVideoSetting).toHaveBeenCalledWith(
-        'preferredVideoCodec',
-        'video/VP8/default'
-      );
     });
 
     it('calls setDraftVideoSetting for cameraPriority', () => {
@@ -1218,22 +1434,22 @@ describe('VideoConfigSection', () => {
   // ─── 22. Codec grid tooltip branches ──────────────────────────────────────
 
   describe('codec item tooltips', () => {
-    it('shows "Preferred \u00b7 In Use" tooltip for preferred+in-use codec', () => {
+    it('shows "Preferred · Camera In Use" for preferred+in-use codec', () => {
       mockVideoSettingsStore({
         videoAdvancedMode: true,
         codecCapabilities: sampleCodecs,
       });
       // AV1 is first supported HW codec (highest priority), so it's preferred
       // Make it also in-use
-      mockVoiceStore({ activeCameraCodec: 'video/AV1/default' });
+      mockVoiceStore({ activeCameraCodec: 'video/av1' });
       mockDraftSettings({ hardwareAcceleration: true });
       renderComponent();
       const items = document.querySelectorAll('.settings-codec-item');
       const tooltips = Array.from(items).map((el) => el.getAttribute('data-tooltip'));
-      expect(tooltips).toContain('Preferred \u00b7 In Use');
+      expect(tooltips).toContain('Preferred · Camera In Use');
     });
 
-    it('shows "In Use" tooltip for non-preferred in-use codec', () => {
+    it('shows "Camera In Use" tooltip for non-preferred in-use codec', () => {
       mockVideoSettingsStore({
         videoAdvancedMode: true,
         codecCapabilities: sampleCodecs,
@@ -1244,10 +1460,28 @@ describe('VideoConfigSection', () => {
       renderComponent();
       const items = document.querySelectorAll('.settings-codec-item');
       const tooltips = Array.from(items).map((el) => el.getAttribute('data-tooltip'));
-      expect(tooltips).toContain('In Use');
+      expect(tooltips).toContain('Camera In Use');
     });
 
-    it('shows "Not supported" tooltip for unsupported codec', () => {
+    it('keeps In Use on the applied hardware path while the restart-only draft is off (#2242)', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        hardwareAcceleration: true,
+        codecCapabilities: [makeCodec('video/AV1', false)],
+        webrtcHwByMime: { 'video/av1': true },
+      });
+      mockDraftSettings({ hardwareAcceleration: false });
+      mockVoiceStore({ activeCameraCodec: 'video/av1' });
+
+      renderComponent();
+
+      const hardwareColumn = screen.getByText('Hardware').closest('.settings-codec-column');
+      expect(hardwareColumn?.querySelector('.settings-codec-item.in-use')).toHaveTextContent(
+        'Camera In Use'
+      );
+    });
+
+    it('shows "Unavailable in Concord" tooltip for unsupported codec', () => {
       mockVideoSettingsStore({
         videoAdvancedMode: true,
         codecCapabilities: sampleCodecs,
@@ -1255,7 +1489,8 @@ describe('VideoConfigSection', () => {
       renderComponent();
       const items = document.querySelectorAll('.settings-codec-item');
       const tooltips = Array.from(items).map((el) => el.getAttribute('data-tooltip'));
-      expect(tooltips).toContain('Not supported');
+      expect(tooltips).toContain('Unavailable in Concord');
+      expect(screen.getAllByText('Unavailable').length).toBeGreaterThan(0);
     });
 
     it('shows "Available" tooltip for supported non-preferred codec', () => {
@@ -1268,6 +1503,82 @@ describe('VideoConfigSection', () => {
       const tooltips = Array.from(items).map((el) => el.getAttribute('data-tooltip'));
       expect(tooltips).toContain('Available');
     });
+
+    it('marks only each exact H264 profile and one hardware column as in use', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/H264', true, { profileId: '640034', profileLabel: 'High' }),
+          makeCodec('video/H264', true, { profileId: '4d0032', profileLabel: 'Main' }),
+        ],
+      });
+      mockVoiceStore({
+        activeCameraCodec: 'video/h264:640034',
+        activeScreenCodec: 'video/h264:4d0032',
+      });
+      renderComponent();
+
+      const inUse = Array.from(document.querySelectorAll('.settings-codec-item.in-use'));
+      expect(inUse).toHaveLength(2);
+      expect(inUse.find((item) => item.textContent?.includes('High 5.2'))).toHaveTextContent(
+        'Camera In Use'
+      );
+      expect(inUse.find((item) => item.textContent?.includes('Main 5.0'))).toHaveTextContent(
+        'Screen In Use'
+      );
+    });
+
+    it('keeps the in-use marker when duplicate H264 levels collapse to one profile row', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/H264', true, { profileId: '640034', profileLabel: 'High 5.2' }),
+          makeCodec('video/H264', true, { profileId: '64001f', profileLabel: 'High 3.1' }),
+        ],
+      });
+      mockVoiceStore({ activeCameraCodec: 'video/h264:64001f' });
+
+      renderComponent();
+
+      const inUse = Array.from(document.querySelectorAll('.settings-codec-item.in-use'));
+      expect(inUse).toHaveLength(1);
+      expect(inUse[0]).toHaveTextContent('Camera In Use');
+      expect(inUse[0]).toHaveTextContent('High 5.2');
+    });
+
+    it('shows a bare active H264 key as unknown without guessing an in-use row', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/H264', true, { profileId: '640034', profileLabel: 'High' }),
+          makeCodec('video/H264', true, { profileId: '4d0032', profileLabel: 'Main' }),
+        ],
+      });
+      mockVoiceStore({ activeCameraCodec: 'video/h264' });
+
+      renderComponent();
+
+      const profileUnknown = document.querySelector('.settings-codec-active-unknown');
+      expect(profileUnknown?.tagName).toBe('OUTPUT');
+      expect(profileUnknown).toHaveTextContent('Camera in use: H.264 profile unknown');
+      expect(document.querySelectorAll('.settings-codec-item.in-use')).toHaveLength(0);
+    });
+
+    it('renders no In Use marker when there is no active producer', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: sampleCodecs,
+      });
+
+      renderComponent();
+
+      expect(document.querySelectorAll('.settings-codec-item.in-use')).toHaveLength(0);
+      const statuses = Array.from(document.querySelectorAll('.settings-codec-status')).map(
+        (status) => status.textContent
+      );
+      expect(statuses).not.toContain('Camera In Use');
+      expect(statuses).not.toContain('Screen In Use');
+    });
   });
 
   // ─── 23. Codec display names with profile labels ─────────────────────────
@@ -1276,12 +1587,81 @@ describe('VideoConfigSection', () => {
     it('renders codec with profile label', () => {
       mockVideoSettingsStore({
         videoAdvancedMode: true,
-        codecCapabilities: [makeCodec('video/H264', true, { profileLabel: 'High' })],
+        codecCapabilities: [
+          makeCodec('video/H264', true, { profileId: '640034', profileLabel: 'High' }),
+        ],
       });
       renderComponent();
       // H264 with profile appears in both HW and SW columns
-      const items = screen.getAllByText('AVC (H.264) (High)');
+      const items = screen.getAllByText('AVC (H.264) (High 5.2)');
       expect(items.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('maps a lower-level local H264 High capability to the configured router target', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/H264', true, { profileId: '64001f', profileLabel: 'High' }),
+        ],
+      });
+      mockDraftSettings({ preferredVideoCodec: '', hardwareAcceleration: true });
+
+      renderComponent();
+
+      const optionValues = Array.from(getCodecSelect().options).map((option) => option.value);
+      expect(optionValues).toContain('video/h264:640034');
+      expect(optionValues).not.toContain('video/H264:64001f');
+      expect(document.querySelector('.settings-codec-item.preferred')).toHaveTextContent(
+        'AVC (H.264) (High 3.1)'
+      );
+      expect(getCodecInfo).toHaveBeenCalledWith('video/h264:640034');
+    });
+
+    it('migrates a compatible local Main preference to the configured router key', async () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/H264', true, { profileId: '4d401f', profileLabel: 'Main' }),
+        ],
+      });
+      mockDraftSettings({ preferredVideoCodec: 'video/H264:4d401f' });
+
+      renderComponent();
+
+      await vi.waitFor(() => {
+        expect(mockSetDraftVideoSetting).toHaveBeenCalledWith(
+          'preferredVideoCodec',
+          'video/h264:4d0032'
+        );
+      });
+      expect(Array.from(getCodecSelect().options).map((option) => option.value)).toContain(
+        'video/h264:4d0032'
+      );
+    });
+
+    it('migrates a legacy family-only H264 preference to the best available profile', async () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/H264', true, {
+            profileId: '42e01f',
+            profileLabel: 'Constrained Baseline',
+          }),
+          makeCodec('video/H264', true, { profileId: '4d401f', profileLabel: 'Main' }),
+        ],
+      });
+      mockDraftSettings({ preferredVideoCodec: 'video/H264' });
+
+      renderComponent();
+
+      await vi.waitFor(() => {
+        expect(mockSetDraftVideoSetting).toHaveBeenCalledWith(
+          'preferredVideoCodec',
+          'video/h264:4d0032'
+        );
+      });
+      expect(mockSetDraftVideoSetting).not.toHaveBeenCalledWith('preferredVideoCodec', null);
+      expect(document.querySelector('.settings-codec-item.preferred')).toHaveTextContent('Main');
     });
 
     it('renders H265 as HEVC (H.265)', () => {
@@ -1305,6 +1685,56 @@ describe('VideoConfigSection', () => {
       const items = document.querySelectorAll('.settings-codec-name');
       const vp8Items = Array.from(items).filter((el) => el.textContent === 'VP8');
       expect(vp8Items.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('shows browser-only H264 profiles as unavailable and omits them from the selector', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/H264', true, {
+            profileId: '640034',
+            profileLabel: 'High',
+          }),
+          makeCodec('video/H264', true, {
+            profileId: '42001f',
+            profileLabel: 'Baseline',
+          }),
+          makeCodec('video/H264', false, {
+            profileId: 'f4000a',
+            profileLabel: 'Predictive High 4:4:4',
+          }),
+        ],
+      });
+
+      renderComponent();
+
+      const baselineRows = screen.getAllByText('AVC (H.264) (Baseline 3.1)');
+      expect(
+        baselineRows.every((row) =>
+          row.closest('.settings-codec-item')?.classList.contains('unsupported')
+        )
+      ).toBe(true);
+      expect(
+        baselineRows.every(
+          (row) =>
+            row.closest('.settings-codec-item')?.getAttribute('data-tooltip') ===
+            'Unavailable in Concord'
+        )
+      ).toBe(true);
+
+      const codecSelect = screen
+        .getAllByTestId('custom-select')
+        .find((select) =>
+          Array.from(select.querySelectorAll('option')).some(
+            (option) => option.value === '' && option.textContent === 'Auto'
+          )
+        );
+      const optionValues = Array.from(codecSelect?.querySelectorAll('option') ?? []).map(
+        (option) => option.value
+      );
+      expect(optionValues).toContain('video/h264:640034');
+      expect(optionValues).not.toContain('video/h264:42001f');
+      expect(optionValues).not.toContain('video/h264:f4000a');
     });
   });
 

@@ -13,7 +13,14 @@ import {
   getCodecInfo,
   type CodecCapability,
 } from '../../services/mediaCapabilities';
-import { humanizeProfileLabel, getCodecMetadata } from './codecMetadata';
+import { codecPriority, selectCodecFromCascade } from '../../services/voiceCodecSelection';
+import {
+  humanizeProfileLabel,
+  getCodecMetadata,
+  isRouterSupportedCodecProfile,
+  codecProfileMenuLabel,
+  canonicalRouterCodecKey,
+} from './codecMetadata';
 import { castingCopy } from './castingCopy';
 import { useDraftVideoSetting, setDraftVideoSetting } from '../../hooks/useDraftSettings';
 import { useEntitlement } from '../../hooks/useEntitlement';
@@ -32,6 +39,7 @@ import PremiumChip from '../common/PremiumChip';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
 import CustomSelect from '../ui/CustomSelect';
+import CodecProfilesModal from './CodecProfilesModal';
 
 // ─── GPU Vendor Icon ────────────────────────────────────────────────────────
 
@@ -209,18 +217,272 @@ function computeRecommendedBitrate(args: {
   res: { w: number; h: number };
   effectiveFps: number;
   activeScreenCodec: string | null;
-  preferredVideoCodec: string | null;
-  codecCapabilities: CodecCapability[];
+  targetCodec: string | null;
 }): number {
-  const { res, effectiveFps, activeScreenCodec, preferredVideoCodec, codecCapabilities } = args;
-  const effectiveCodec = activeScreenCodec ?? preferredVideoCodec;
-  const isEfficient = effectiveCodec
-    ? isEfficientCodec(effectiveCodec)
-    : codecCapabilities.some((c) => isEfficientCodec(c.mimeType));
+  const { res, effectiveFps, activeScreenCodec, targetCodec } = args;
+  const effectiveCodec = activeScreenCodec ?? targetCodec;
+  const isEfficient = effectiveCodec ? isEfficientCodec(effectiveCodec.toUpperCase()) : false;
   const bpp = isEfficient ? 0.04 : 0.07;
   const bps = res.w * res.h * effectiveFps * bpp;
   return Math.round(bps / 100_000) * 100_000;
 }
+
+function canonicalRequestedCodecKey(
+  key: string,
+  capabilities: CodecCapability[] = [],
+  hdrEncoding = false
+): string | null {
+  const [mime, requestedProfile] = key.toLowerCase().split(':');
+  // Migrate legacy family-only H.264 preferences to the best locally available
+  // router-supported profile. Keep High as the pre-detection fallback.
+  if (mime === 'video/h264' && requestedProfile === undefined) {
+    const available = capabilities
+      .map((capability) => canonicalRouterCodecKey(capability.mimeType, capability.profileId))
+      .filter((candidate): candidate is string => candidate?.startsWith('video/h264:') === true)
+      .sort((left, right) => codecPriority(left, hdrEncoding) - codecPriority(right, hdrEncoding));
+    return available[0] ?? canonicalRouterCodecKey(mime, '640034');
+  }
+  return canonicalRouterCodecKey(mime, requestedProfile);
+}
+
+function capabilityMatchesKey(capability: CodecCapability, key: string): boolean {
+  const requestedKey = canonicalRequestedCodecKey(key);
+  return (
+    requestedKey !== null &&
+    canonicalRouterCodecKey(capability.mimeType, capability.profileId) === requestedKey
+  );
+}
+
+function isCapabilityHardware(
+  capability: CodecCapability,
+  webrtcHwByMime: Record<string, boolean>
+): boolean {
+  const mime = capability.mimeType.toLowerCase();
+  return webrtcHwByMime[mime] ?? capability.hwAvailable === true;
+}
+
+/** Hardware-column membership answers whether the machine can hardware encode.
+ * A learned positive WebRTC signal can add a missed capability, while a learned
+ * software path must not erase a positive WebCodecs hardware capability. */
+function isHardwareEncodingAvailable(
+  capability: CodecCapability,
+  webrtcHwByMime: Record<string, boolean>
+): boolean {
+  return (
+    capability.hwAvailable === true || webrtcHwByMime[capability.mimeType.toLowerCase()] === true
+  );
+}
+
+function resolveCodecTarget(args: {
+  capabilities: CodecCapability[];
+  preferred: string | null;
+  hardwareAcceleration: boolean;
+  hdrEncoding: boolean;
+  codecFloor: string[] | null;
+  webrtcHwByMime: Record<string, boolean>;
+}): CodecCapability | undefined {
+  const supported = args.capabilities.filter((capability) =>
+    isRouterSupportedCodecProfile(capability.mimeType, capability.profileId)
+  );
+  const matching = (key: string) =>
+    supported.filter((capability) => capabilityMatchesKey(capability, key));
+  const find = (key: string) => {
+    const candidates = matching(key);
+    if (args.hardwareAcceleration) {
+      return (
+        candidates.find((capability) => isCapabilityHardware(capability, args.webrtcHwByMime)) ??
+        candidates[0]
+      );
+    }
+    return candidates[0];
+  };
+  const canonicalPreferred = args.preferred
+    ? canonicalRequestedCodecKey(args.preferred, args.capabilities, args.hdrEncoding)
+    : null;
+  const preferred = canonicalPreferred && find(canonicalPreferred) ? canonicalPreferred : null;
+
+  return selectCodecFromCascade<CodecCapability>({
+    preferred,
+    hwAccel: args.hardwareAcceleration,
+    hdrEncoding: args.hdrEncoding,
+    isInCodecFloor: (key) =>
+      !args.codecFloor || args.codecFloor.includes(codecKeyMime(key).toLowerCase()),
+    isHwAccelerated: (key) =>
+      matching(key).some((capability) => isCapabilityHardware(capability, args.webrtcHwByMime)),
+    findSendCodec: find,
+  });
+}
+
+function activeCodecMatches(capability: CodecCapability, activeKey: string | null): boolean {
+  if (!activeKey) return false;
+  const normalized = activeKey.toLowerCase();
+  if (normalized === codecKey(capability).toLowerCase()) return true;
+
+  // A family-only H.264 runtime key cannot truthfully identify a profile.
+  if (normalized === 'video/h264') return false;
+
+  // The grid deduplicates compatible H.264 levels into one canonical profile
+  // row, so bridge level-asymmetric runtime keys to that surviving row. The
+  // same normalization maps the legacy bare VP9 key to Profile 0.
+  const activeCanonical = canonicalRequestedCodecKey(normalized);
+  return (
+    activeCanonical !== null &&
+    canonicalRouterCodecKey(capability.mimeType, capability.profileId) === activeCanonical
+  );
+}
+
+type CodecColumnKey = 'hw' | 'sw';
+
+function preferredCodecColumn(
+  targetCodec: CodecCapability | undefined,
+  targetUsesHardware: boolean
+): CodecColumnKey | null {
+  if (!targetCodec) return null;
+  return targetUsesHardware ? 'hw' : 'sw';
+}
+
+function codecPreferenceHint(args: {
+  preferredVideoCodec: string | null;
+  selectedIsTarget: boolean;
+  effectiveKey: string | null;
+  selectedName: string | null;
+  targetName: string | null;
+  targetUsesHardware: boolean;
+}): string {
+  const { preferredVideoCodec, selectedIsTarget, effectiveKey, targetUsesHardware } = args;
+  const selectedName = args.selectedName ?? 'codec';
+  const targetName = args.targetName ?? 'the next eligible codec';
+  const prefix = 'Preferred codec for camera and screen share encoding.';
+
+  if (preferredVideoCodec) {
+    if (selectedIsTarget) {
+      return `${prefix} Currently ${args.targetName ?? 'unavailable'}. Concord falls back automatically if a peer cannot decode it.`;
+    }
+    if (effectiveKey) {
+      return `Selected ${selectedName} cannot be used with the current room and settings. Concord will try ${targetName} instead.`;
+    }
+    return `Selected ${selectedName} cannot be used, and no routable local fallback is available.`;
+  }
+
+  if (!effectiveKey) {
+    return `${prefix} Currently Auto — no routable local codec is available.`;
+  }
+  const encodingPath = targetUsesHardware ? 'hardware' : 'software';
+  return `${prefix} Currently Auto — will try ${targetName} first using ${encodingPath} with current settings.`;
+}
+
+function unknownH264ProfileMessage(cameraUnknown: boolean, screenUnknown: boolean): string {
+  if (cameraUnknown && screenUnknown) return 'Camera and Screen in use: H.264 profile unknown.';
+  if (cameraUnknown) return 'Camera in use: H.264 profile unknown.';
+  return 'Screen in use: H.264 profile unknown.';
+}
+
+function codecStatuses(args: {
+  supported: boolean;
+  preferred: boolean;
+  cameraInUse: boolean;
+  screenInUse: boolean;
+}): string[] {
+  if (!args.supported) return ['Unavailable'];
+  const statuses: string[] = [];
+  if (args.preferred) statuses.push('Preferred');
+  if (args.cameraInUse) statuses.push('Camera In Use');
+  if (args.screenInUse) statuses.push('Screen In Use');
+  return statuses;
+}
+
+function codecIsInUse(args: {
+  supported: boolean;
+  columnKey: CodecColumnKey;
+  observedColumn: CodecColumnKey;
+  capability: CodecCapability;
+  activeKey: string | null;
+}): boolean {
+  if (!args.supported || args.columnKey !== args.observedColumn) return false;
+  return activeCodecMatches(args.capability, args.activeKey);
+}
+
+function codecItemClassName(supported: boolean, preferred: boolean, inUse: boolean): string {
+  const classNames = ['settings-codec-item'];
+  if (preferred) classNames.push('preferred');
+  if (inUse) classNames.push('in-use');
+  if (!supported) classNames.push('unsupported');
+  return classNames.join(' ');
+}
+
+function codecItemTooltip(supported: boolean, statuses: string[]): string {
+  if (!supported) return 'Unavailable in Concord';
+  return statuses.join(' · ') || 'Available';
+}
+
+function codecNameClassName(supported: boolean): string {
+  return supported ? 'settings-codec-name' : 'settings-codec-name strikethrough';
+}
+
+function codecStatusClassName(status: string): string {
+  return status === 'Unavailable' ? 'settings-codec-status unavailable' : 'settings-codec-status';
+}
+
+interface CodecGridItemProps {
+  capability: CodecCapability;
+  columnKey: CodecColumnKey;
+  isActiveColumn: boolean;
+  preferredKey: string | null;
+  appliedHardwareAcceleration: boolean;
+  webrtcHwByMime: Record<string, boolean>;
+  activeCameraCodec: string | null;
+  activeScreenCodec: string | null;
+  label: string;
+}
+
+const CodecGridItem: React.FC<CodecGridItemProps> = ({
+  capability,
+  columnKey,
+  isActiveColumn,
+  preferredKey,
+  appliedHardwareAcceleration,
+  webrtcHwByMime,
+  activeCameraCodec,
+  activeScreenCodec,
+  label,
+}) => {
+  const supported = isRouterSupportedCodecProfile(capability.mimeType, capability.profileId);
+  const isPreferred =
+    isActiveColumn &&
+    supported &&
+    canonicalRouterCodecKey(capability.mimeType, capability.profileId) === preferredKey;
+  const observedColumn: CodecColumnKey =
+    appliedHardwareAcceleration && isCapabilityHardware(capability, webrtcHwByMime) ? 'hw' : 'sw';
+  const cameraInUse = codecIsInUse({
+    supported,
+    columnKey,
+    observedColumn,
+    capability,
+    activeKey: activeCameraCodec,
+  });
+  const screenInUse = codecIsInUse({
+    supported,
+    columnKey,
+    observedColumn,
+    capability,
+    activeKey: activeScreenCodec,
+  });
+  const isInUse = cameraInUse || screenInUse;
+  const statuses = codecStatuses({ supported, preferred: isPreferred, cameraInUse, screenInUse });
+  const tooltip = codecItemTooltip(supported, statuses);
+  const itemClassName = codecItemClassName(supported, isPreferred, isInUse);
+
+  return (
+    <div className={itemClassName} data-tooltip={tooltip}>
+      <span className={codecNameClassName(supported)}>{label}</span>
+      {statuses.map((status) => (
+        <span className={codecStatusClassName(status)} key={status}>
+          {status}
+        </span>
+      ))}
+    </div>
+  );
+};
 
 /** Does a camera preset exceed the CAMERA-axis video ceiling (height/fps, #1602)?
  *  System Default (0/0) and unknown presets never exceed. Pure over caps. */
@@ -253,6 +515,7 @@ interface SelectOption {
   value: string;
   label: string;
   group?: string;
+  disabled?: boolean;
 }
 
 /** Build the camera-preset select options, marking premium presets (above the
@@ -375,11 +638,14 @@ function deriveBitrateSlider(
 const VideoConfigSection: React.FC = () => {
   const activeCameraCodec = useVoiceStore((s) => s.activeCameraCodec);
   const activeScreenCodec = useVoiceStore((s) => s.activeScreenCodec);
+  const codecFloor = useVoiceStore((s) => s.codecFloor);
 
   const codecCapabilities = useVideoSettingsStore((s) => s.codecCapabilities);
   const gpuInfo = useVideoSettingsStore((s) => s.gpuInfo);
   const videoAdvancedMode = useVideoSettingsStore((s) => s.videoAdvancedMode);
   const systemHdr = useVideoSettingsStore((s) => s.systemHdr);
+  const webrtcHwByMime = useVideoSettingsStore((s) => s.webrtcHwByMime);
+  const appliedHardwareAcceleration = useVideoSettingsStore((s) => s.hardwareAcceleration);
 
   const cameraPreset = useDraftVideoSetting('cameraPreset');
   const cameraBitrate = useDraftVideoSetting('cameraBitrate');
@@ -443,7 +709,56 @@ const VideoConfigSection: React.FC = () => {
   const cameraBitrateGate = useGateActivation('manual-bitrate');
   const [cameraPresetLockHinted, setCameraPresetLockHinted] = useState(false);
   const [screenFpsLockHinted, setScreenFpsLockHinted] = useState(false);
+  const [codecProfilesOpen, setCodecProfilesOpen] = useState(false);
   const screenFpsGate = useGateActivation('video-quality');
+
+  const targetCodec = useMemo(
+    () =>
+      resolveCodecTarget({
+        capabilities: codecCapabilities,
+        preferred: preferredVideoCodec,
+        hardwareAcceleration,
+        hdrEncoding,
+        codecFloor,
+        webrtcHwByMime: webrtcHwByMime ?? {},
+      }),
+    [
+      codecCapabilities,
+      preferredVideoCodec,
+      hardwareAcceleration,
+      hdrEncoding,
+      codecFloor,
+      webrtcHwByMime,
+    ]
+  );
+  const targetCodecKey = targetCodec
+    ? canonicalRouterCodecKey(targetCodec.mimeType, targetCodec.profileId)
+    : null;
+  const targetUsesHardware =
+    targetCodec !== undefined &&
+    hardwareAcceleration &&
+    isCapabilityHardware(targetCodec, webrtcHwByMime ?? {});
+
+  useEffect(() => {
+    if (!preferredVideoCodec || codecCapabilities.length === 0) return;
+    const canonicalPreference = canonicalRequestedCodecKey(
+      preferredVideoCodec,
+      codecCapabilities,
+      hdrEncoding
+    );
+    const capability = canonicalPreference
+      ? codecCapabilities.find((candidate) => capabilityMatchesKey(candidate, canonicalPreference))
+      : undefined;
+    if (
+      !capability ||
+      !isRouterSupportedCodecProfile(capability.mimeType, capability.profileId) ||
+      (canonicalPreference === 'video/vp9:2' && !hdrEncoding)
+    ) {
+      setDraftVideoSetting('preferredVideoCodec', null);
+    } else if (preferredVideoCodec.toLowerCase() !== canonicalPreference) {
+      setDraftVideoSetting('preferredVideoCodec', canonicalPreference);
+    }
+  }, [preferredVideoCodec, codecCapabilities, hdrEncoding]);
 
   const [displayInfo, setDisplayInfo] = useState<
     {
@@ -499,15 +814,13 @@ const VideoConfigSection: React.FC = () => {
       res,
       effectiveFps,
       activeScreenCodec,
-      preferredVideoCodec,
-      codecCapabilities,
+      targetCodec: targetCodecKey,
     });
   }, [
     screenResolution,
     screenFrameRate,
-    preferredVideoCodec,
     activeScreenCodec,
-    codecCapabilities,
+    targetCodecKey,
     bestDisplay,
     maxRefreshRate,
   ]);
@@ -922,30 +1235,13 @@ const VideoConfigSection: React.FC = () => {
 
           {codecCapabilities.length > 0 &&
             (() => {
-              // Sort order matches codec cascade: AV1 → HEVC → H264 → VP9 → VP8
-              const codecPriority: Record<string, number> = {
-                AV1: 0,
-                H265: 1,
-                HEVC: 1,
-                H264: 2,
-                VP9: 3,
-                VP8: 4,
-              };
               const codecDisplayName: Record<string, string> = {
                 H264: 'AVC (H.264)',
                 H265: 'HEVC (H.265)',
                 HEVC: 'HEVC (H.265)',
               };
-              // Codecs the mediasoup router supports (H265 not yet supported)
-              const routerSupported = new Set([
-                'video/vp8',
-                'video/vp9',
-                'video/h264',
-                'video/av1',
-              ]);
               const sortByPriority = (a: CodecCapability, b: CodecCapability) =>
-                (codecPriority[a.mimeType.replace('video/', '')] ?? 99) -
-                (codecPriority[b.mimeType.replace('video/', '')] ?? 99);
+                codecPriority(codecKey(a), hdrEncoding) - codecPriority(codecKey(b), hdrEncoding);
               const humanProfile = (c: CodecCapability) =>
                 humanizeProfileLabel(c.profileId, c.profileLabel);
               const displayName = (c: CodecCapability) => {
@@ -955,7 +1251,7 @@ const VideoConfigSection: React.FC = () => {
                 return profile ? `${base} (${profile})` : base;
               };
               const isSupported = (c: CodecCapability) =>
-                routerSupported.has(c.mimeType.toLowerCase());
+                isRouterSupportedCodecProfile(c.mimeType, c.profileId);
 
               // Dedupe entries that resolve to the same (codec, human profile) pair.
               // Raw profile-level-id hex strings that collapse to the same label
@@ -965,7 +1261,9 @@ const VideoConfigSection: React.FC = () => {
                 const seen = new Set<string>();
                 const out: CodecCapability[] = [];
                 for (const c of list) {
-                  const key = `${c.mimeType.toLowerCase()}|${humanProfile(c) ?? ''}`;
+                  const key =
+                    canonicalRouterCodecKey(c.mimeType, c.profileId) ??
+                    `${c.mimeType.toLowerCase()}|${humanProfile(c) ?? ''}`;
                   if (seen.has(key)) continue;
                   seen.add(key);
                   out.push(c);
@@ -976,75 +1274,25 @@ const VideoConfigSection: React.FC = () => {
               // HW column: codecs with confirmed GPU acceleration
               // SW column: ALL codecs (every codec has a software encoder fallback)
               const hwCodecs = dedupe(
-                codecCapabilities.filter((c) => c.hwAvailable === true).sort(sortByPriority)
+                codecCapabilities
+                  .filter((c) => isHardwareEncodingAvailable(c, webrtcHwByMime ?? {}))
+                  .sort(sortByPriority)
               );
               const swCodecs = dedupe([...codecCapabilities].sort(sortByPriority));
               // We have a definite HW verdict for at least one codec (WebCodecs probe
               // returned true/false rather than undefined). Drives the "no supported HW
               // codecs" fallback notice below.
-              const systemProfilesPopulated = codecCapabilities.some(
-                (c) => c.hwAvailable !== undefined
-              );
+              const systemProfilesPopulated =
+                codecCapabilities.some((c) => c.hwAvailable !== undefined) ||
+                Object.values(webrtcHwByMime ?? {}).some((value) => value !== undefined);
 
-              // Which column is active
-              const hwHasSupported = hwCodecs.some((c) => isSupported(c));
-              const preferredMime = preferredVideoCodec ? codecKeyMime(preferredVideoCodec) : null;
-              const hwActive = preferredMime
-                ? // User picked a specific codec → active column is whichever contains its mimeType
-                  hardwareAcceleration &&
-                  hwCodecs.some(
-                    (c) =>
-                      c.mimeType.toLowerCase() === preferredMime.toLowerCase() && isSupported(c)
-                  )
-                : hardwareAcceleration && hwHasSupported;
-
-              // Determine preferred codec key for green highlight
-              const activeColumnCodecs = hwActive ? hwCodecs : swCodecs;
-              const preferredKey =
-                preferredVideoCodec &&
-                routerSupported.has(codecKeyMime(preferredVideoCodec).toLowerCase())
-                  ? preferredVideoCodec
-                  : (() => {
-                      const first = activeColumnCodecs.find((c) => isSupported(c));
-                      return first ? codecKey(first) : null;
-                    })();
-
-              // Active codecs currently in use (from voice producers — now profile-aware keys)
-              const inUseKeys = new Set<string>(
-                [activeCameraCodec, activeScreenCodec]
-                  .filter(Boolean)
-                  .map((k) => (k as string).toLowerCase())
-              );
-
-              const renderCodecItem = (
-                c: CodecCapability,
-                columnKey: string,
-                isActiveColumn: boolean
-              ) => {
-                const supported = isSupported(c);
-                const cKey = codecKey(c);
-                const isPreferred = isActiveColumn && supported && cKey === preferredKey;
-                const isInUse =
-                  supported &&
-                  (inUseKeys.has(cKey.toLowerCase()) || inUseKeys.has(c.mimeType.toLowerCase()));
-                let tooltip: string;
-                if (!supported) tooltip = 'Not supported';
-                else if (isPreferred && isInUse) tooltip = 'Preferred \u00b7 In Use';
-                else if (isInUse) tooltip = 'In Use';
-                else if (isPreferred) tooltip = 'Preferred';
-                else tooltip = 'Available';
-                return (
-                  <div
-                    key={`${columnKey}-${cKey}`}
-                    className={`settings-codec-item${isPreferred ? ' preferred' : ''}${isInUse ? ' in-use' : ''}${supported ? '' : ' unsupported'}`}
-                    data-tooltip={tooltip}
-                  >
-                    <span className={`settings-codec-name${supported ? '' : ' strikethrough'}`}>
-                      {displayName(c)}
-                    </span>
-                  </div>
-                );
-              };
+              const hwHasSupported = hwCodecs.some(isSupported);
+              const preferredColumn = preferredCodecColumn(targetCodec, targetUsesHardware);
+              const hwActive = preferredColumn === 'hw';
+              const swActive = preferredColumn === 'sw';
+              const preferredKey = targetCodecKey?.toLowerCase() ?? null;
+              const cameraProfileUnknown = activeCameraCodec?.toLowerCase() === 'video/h264';
+              const screenProfileUnknown = activeScreenCodec?.toLowerCase() === 'video/h264';
 
               return (
                 <>
@@ -1058,27 +1306,58 @@ const VideoConfigSection: React.FC = () => {
                         Hardware
                       </span>
                       <div className="settings-codec-column-items">
-                        {hwCodecs.map((c) => renderCodecItem(c, 'hw', hwActive))}
+                        {hwCodecs.map((capability) => (
+                          <CodecGridItem
+                            key={'hw-' + codecKey(capability)}
+                            capability={capability}
+                            columnKey="hw"
+                            isActiveColumn={hwActive}
+                            preferredKey={preferredKey}
+                            appliedHardwareAcceleration={appliedHardwareAcceleration}
+                            webrtcHwByMime={webrtcHwByMime ?? {}}
+                            activeCameraCodec={activeCameraCodec}
+                            activeScreenCodec={activeScreenCodec}
+                            label={displayName(capability)}
+                          />
+                        ))}
                         {hwCodecs.length === 0 && (
                           <span className="settings-codec-empty">None detected</span>
                         )}
                       </div>
                     </div>
-                    <div className={`settings-codec-column${hwActive ? '' : ' active'}`}>
+                    <div className={`settings-codec-column${swActive ? ' active' : ''}`}>
                       <span
-                        className={`settings-codec-column-header${hwActive ? '' : ' active'}`}
-                        {...(hwActive ? {} : { 'data-tooltip': 'Preferred' })}
+                        className={`settings-codec-column-header${swActive ? ' active' : ''}`}
+                        {...(swActive ? { 'data-tooltip': 'Preferred' } : {})}
                       >
                         Software
                       </span>
                       <div className="settings-codec-column-items">
-                        {swCodecs.map((c) => renderCodecItem(c, 'sw', !hwActive))}
+                        {swCodecs.map((capability) => (
+                          <CodecGridItem
+                            key={'sw-' + codecKey(capability)}
+                            capability={capability}
+                            columnKey="sw"
+                            isActiveColumn={swActive}
+                            preferredKey={preferredKey}
+                            appliedHardwareAcceleration={appliedHardwareAcceleration}
+                            webrtcHwByMime={webrtcHwByMime ?? {}}
+                            activeCameraCodec={activeCameraCodec}
+                            activeScreenCodec={activeScreenCodec}
+                            label={displayName(capability)}
+                          />
+                        ))}
                         {swCodecs.length === 0 && (
                           <span className="settings-codec-empty">None detected</span>
                         )}
                       </div>
                     </div>
                   </div>
+                  {(cameraProfileUnknown || screenProfileUnknown) && (
+                    <output className="settings-codec-active-unknown">
+                      {unknownH264ProfileMessage(cameraProfileUnknown, screenProfileUnknown)}
+                    </output>
+                  )}
                   {hardwareAcceleration && systemProfilesPopulated && !hwHasSupported && (
                     <div className="settings-hw-fallback-notice">
                       Hardware acceleration is enabled, but none of your GPU&apos;s codecs are
@@ -1097,8 +1376,8 @@ const VideoConfigSection: React.FC = () => {
                   if (!systemHdr)
                     return 'No HDR display detected. Connect an HDR-capable display to enable.';
                   if (hdrEncoding)
-                    return 'Enabled. HDR codec profiles (VP9 Profile 2) and HDR-capable variants of AV1 and H.264 High will be used when available.';
-                  return 'Disabled. SDR codec profiles are preferred. HDR-only profiles such as VP9 Profile 2 will not be selected.';
+                    return 'Enabled. Concord prefers HDR-capable codec profiles when available. This does not guarantee a 10-bit or HDR stream.';
+                  return 'Disabled. Concord prefers SDR codec profiles and will not select VP9 Profile 2.';
                 })()}
               </span>
             </div>
@@ -1110,79 +1389,82 @@ const VideoConfigSection: React.FC = () => {
           </div>
 
           {(() => {
-            const routerSupported = new Set(['video/vp8', 'video/vp9', 'video/h264', 'video/av1']);
-            // Sort order matches codec cascade: AV1 → HEVC → H264 → VP9 → VP8
-            const codecPriority: Record<string, number> = {
-              AV1: 0,
-              H265: 1,
-              HEVC: 1,
-              H264: 2,
-              VP9: 3,
-              VP8: 4,
-            };
             const sortByPriority = (a: CodecCapability, b: CodecCapability) =>
-              (codecPriority[a.mimeType.replace('video/', '')] ?? 99) -
-              (codecPriority[b.mimeType.replace('video/', '')] ?? 99);
-            const supported = codecCapabilities.filter((c) =>
-              routerSupported.has(c.mimeType.toLowerCase())
-            );
-            const sdrCodecs = supported.filter((c) => !c.isHdr).sort(sortByPriority);
-            const hdrCodecs = supported.filter((c) => c.isHdr).sort(sortByPriority);
-
-            // Resolve effective codec key for info badge
-            const firstSupported = sdrCodecs[0] || supported[0];
-            const effectiveKey =
-              preferredVideoCodec || (firstSupported ? codecKey(firstSupported) : null);
+              codecPriority(codecKey(a), hdrEncoding) - codecPriority(codecKey(b), hdrEncoding);
+            const seenRouterKeys = new Set<string>();
+            const supported = codecCapabilities
+              .filter((c) => isRouterSupportedCodecProfile(c.mimeType, c.profileId))
+              .sort(sortByPriority)
+              .filter((capability) => {
+                const key = canonicalRouterCodecKey(capability.mimeType, capability.profileId);
+                if (!key || seenRouterKeys.has(key)) return false;
+                seenRouterKeys.add(key);
+                return true;
+              });
+            const effectiveKey = targetCodecKey;
             const info = effectiveKey ? getCodecInfo(effectiveKey) : null;
-
+            const selectedKey = preferredVideoCodec
+              ? canonicalRequestedCodecKey(preferredVideoCodec, codecCapabilities, hdrEncoding)
+              : null;
+            const selectedInfo = selectedKey ? getCodecInfo(selectedKey) : null;
+            const selectedIsTarget = selectedKey !== null && selectedKey === effectiveKey;
+            const hint = codecPreferenceHint({
+              preferredVideoCodec,
+              selectedIsTarget,
+              effectiveKey,
+              selectedName: selectedInfo?.name ?? null,
+              targetName: info?.name ?? null,
+              targetUsesHardware,
+            });
             return (
               <>
-                <div className="settings-row">
+                <div className="settings-row settings-codec-select-row">
                   <div className="settings-row-info">
-                    <span className="settings-row-label">Video Codec</span>
-                    <span className="settings-row-hint">
-                      {preferredVideoCodec
-                        ? `Preferred codec for camera and screen share encoding. Currently ${getCodecInfo(preferredVideoCodec).name}. Concord falls back automatically if a peer cannot decode it.`
-                        : 'Preferred codec for camera and screen share encoding. Currently Auto \u2014 Concord selects the best available based on hardware and peer support.'}
-                    </span>
+                    <label className="settings-row-label" htmlFor="video-codec-select">
+                      Video Codec
+                    </label>
+                    <span className="settings-row-hint">{hint}</span>
+                    <button
+                      type="button"
+                      className="settings-codec-profile-help"
+                      aria-haspopup="dialog"
+                      onClick={() => setCodecProfilesOpen(true)}
+                    >
+                      What are codec profiles?
+                    </button>
                   </div>
                   <CustomSelect
+                    id="video-codec-select"
                     className="settings-select"
                     options={[
                       { value: '', label: 'Auto' },
-                      ...sdrCodecs.map((c) => {
-                        const key = codecKey(c);
-                        const name = c.mimeType.replace('video/', '');
-                        const profile = humanizeProfileLabel(c.profileId, c.profileLabel);
-                        return {
-                          value: key,
-                          label: profile ? `${name} (${profile})` : name,
-                        };
-                      }),
-                      ...hdrCodecs.map((c) => {
-                        const key = codecKey(c);
-                        const name = c.mimeType.replace('video/', '');
-                        const profile = humanizeProfileLabel(c.profileId, c.profileLabel);
-                        return {
-                          value: hdrEncoding ? key : `__disabled_${key}`,
-                          label: profile ? `${name} (${profile})` : name,
-                          group: hdrEncoding ? 'HDR' : 'Requires HDR',
-                        };
+                      ...supported.flatMap((c) => {
+                        const key = canonicalRouterCodecKey(c.mimeType, c.profileId);
+                        if (!key) return [];
+                        const requiresHdr = key === 'video/vp9:2' && !hdrEncoding;
+                        return [
+                          {
+                            value: key,
+                            label: `${codecProfileMenuLabel(c.mimeType, c.profileId)}${requiresHdr ? ' — Requires HDR setting' : ''}`,
+                            disabled: requiresHdr,
+                          },
+                        ];
                       }),
                     ]}
                     value={preferredVideoCodec ?? ''}
-                    onChange={(v) =>
-                      setDraftVideoSetting(
-                        'preferredVideoCodec',
-                        v.startsWith('__disabled_') ? preferredVideoCodec : v || null
-                      )
-                    }
+                    onChange={(v) => setDraftVideoSetting('preferredVideoCodec', v || null)}
                   />
                 </div>
 
                 {info &&
                   (() => {
-                    const meta = effectiveKey ? getCodecMetadata(effectiveKey) : null;
+                    // H.264 quality/efficiency varies materially by profile. Keep the
+                    // family-level fallback only for an unqualified/unknown H.264 key;
+                    // profile-qualified keys use getCodecInfo's profile-aware facts.
+                    const meta =
+                      effectiveKey && !/^video\/h264:[0-9a-f]{6}$/i.test(effectiveKey)
+                        ? getCodecMetadata(effectiveKey)
+                        : null;
                     const quality = meta?.quality ?? info.quality;
                     const efficiency = meta?.efficiency ?? info.efficiency;
                     const compression = meta?.compression ?? info.compressionRatio;
@@ -1212,36 +1494,25 @@ const VideoConfigSection: React.FC = () => {
                     );
                   })()}
 
-                {preferredVideoCodec && (
-                  <div className="settings-codec-preference-notice">
-                    Your client will prefer this codec, but will fall back to the next best option
-                    if another participant can&apos;t decode it. Active codecs are shown above with
-                    a{' '}
-                    <span
-                      className="settings-codec-item in-use"
-                      style={{
-                        display: 'inline-flex',
-                        padding: '1px 6px',
-                        margin: '0 3px',
-                        fontSize: 'inherit',
-                        verticalAlign: 'baseline',
-                      }}
-                    >
-                      highlight
-                    </span>{' '}
-                    .
-                  </div>
-                )}
+                <div className="settings-codec-preference-notice">
+                  <strong>Preferred</strong> is the target Concord will try first.{' '}
+                  <strong>Camera In Use</strong> and <strong>Screen In Use</strong> report what each
+                  active producer actually uses after room compatibility checks.
+                </div>
+                <CodecProfilesModal
+                  isOpen={codecProfilesOpen}
+                  onClose={() => setCodecProfilesOpen(false)}
+                />
               </>
             );
           })()}
 
-          {/* SVC / Simulcast casting toggles (#1921). Codec-eligibility allow-lists:
-              they only SUBTRACT eligibility — casting kind stays codec-derived. A
-              codec-inert toggle stays ON + interactive (never disabled). Helper copy
-              is a pure function of (preferredVideoCodec, supportSvc, supportSimulcast). */}
+          {/* SVC / Simulcast casting toggles (#1921). These gate codec-derived
+              layering modes, never codec selection. A codec-inert toggle stays ON +
+              interactive (never disabled). Helper copy follows the resolved target,
+              including when Auto or a floor fallback is active. */}
           {(() => {
-            const copy = castingCopy(preferredVideoCodec, supportSvc, supportSimulcast);
+            const copy = castingCopy(targetCodecKey, supportSvc, supportSimulcast);
             return (
               <>
                 <div className="settings-row">

@@ -1438,6 +1438,12 @@
   flex-shrink: 0;
 }
 
+.settings-codec-select-row .settings-select {
+  min-width: 0;
+  max-width: min(50%, 460px);
+  flex: 0 1 460px;
+}
+
 .settings-select:focus {
   border-color: var(--accent-primary);
 }
@@ -1496,7 +1502,7 @@
 /* Codec grid — two-column layout for HW vs SW */
 .settings-codec-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 12px;
 }
@@ -1538,6 +1544,7 @@
 
 .settings-codec-item {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   padding: 4px 10px;
@@ -1545,6 +1552,8 @@
   background: var(--bg-tertiary);
   font-size: calc(12px * var(--font-scale, 1));
   cursor: default;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .settings-codec-item.preferred {
@@ -1563,6 +1572,7 @@
 .settings-codec-name {
   color: var(--text-primary);
   font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
 .settings-codec-name.strikethrough {
@@ -1570,10 +1580,66 @@
   color: var(--text-muted);
 }
 
+.settings-codec-status {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: calc(9px * var(--font-scale, 1));
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.settings-codec-status.unavailable {
+  color: var(--text-muted);
+}
+
 .settings-codec-empty {
   font-size: calc(12px * var(--font-scale, 1));
   color: var(--text-muted);
   font-style: italic;
+}
+
+.settings-codec-active-unknown {
+  display: block;
+  margin: -4px 0 10px;
+  color: var(--text-muted);
+  font-size: calc(11px * var(--font-scale, 1));
+}
+
+.settings-codec-profile-help {
+  width: fit-content;
+  margin-top: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent-primary);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.settings-codec-profile-help:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+@media (max-width: 900px) {
+  .settings-codec-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-codec-select-row {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .settings-codec-select-row .settings-select {
+    width: 100%;
+    max-width: 100%;
+    flex-basis: 100%;
+  }
 }
 
 .settings-hw-fallback-notice {

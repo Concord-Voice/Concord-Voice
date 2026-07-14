@@ -5,6 +5,8 @@
  * codecs (with hardware acceleration status) for use in quality settings.
  */
 
+import { h264ProfileClass, type H264ProfileClass } from './voiceCodecSelection';
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -52,26 +54,30 @@ function parseProfile(
     return { id: null, label: null, isHdr: false };
   }
 
+  // VP9 omits profile-id for Profile 0. Normalize that default before the
+  // generic no-FMTP return so Settings/runtime never confuse P0 with P2.
+  if (mime === 'video/vp9') {
+    const match = /profile-id=(\d+)/.exec(sdpFmtpLine ?? '');
+    const pid = match?.[1] ?? '0';
+    return { id: pid, label: pid === '2' ? 'HDR' : null, isHdr: pid === '2' };
+  }
+
   if (!sdpFmtpLine) return { id: null, label: null, isHdr: false };
 
   if (mime === 'video/h264') {
     const match = /profile-level-id=([0-9a-fA-F]{6})/.exec(sdpFmtpLine);
     if (!match) return { id: null, label: null, isHdr: false };
     const plid = match[1].toLowerCase();
-    const profile = plid.substring(0, 4);
-    const labels: Record<string, string> = {
-      '42e0': 'Baseline',
-      '4d00': 'Main',
-      '6400': 'High',
+    const labels: Record<H264ProfileClass, string> = {
+      'constrained-baseline': 'Constrained Baseline',
+      baseline: 'Baseline',
+      main: 'Main',
+      'constrained-high': 'Constrained High',
+      high: 'High',
+      'predictive-high-444': 'Predictive High 4:4:4',
     };
-    return { id: plid, label: labels[profile] ?? plid, isHdr: false };
-  }
-
-  if (mime === 'video/vp9') {
-    const match = /profile-id=(\d+)/.exec(sdpFmtpLine);
-    if (!match) return { id: '0', label: null, isHdr: false };
-    const pid = match[1];
-    return { id: pid, label: pid === '2' ? 'HDR' : null, isHdr: pid === '2' };
+    const profileClass = h264ProfileClass(plid);
+    return { id: plid, label: profileClass ? labels[profileClass] : plid, isHdr: false };
   }
 
   return { id: null, label: null, isHdr: false };
@@ -196,23 +202,33 @@ export function getCodecInfo(key: string): CodecInfo {
     };
   }
   if (m === 'video/h264') {
-    if (profileId?.startsWith('6400'))
+    const profileClass = h264ProfileClass(profileId ?? '');
+    if (profileClass === 'high')
       return {
         name: 'H.264 (High)',
         quality: 'Very Good',
         efficiency: 'Good',
-        compressionRatio: '~25% better than Baseline',
+        compressionRatio: 'Best H.264 efficiency',
         hdr: false,
-        notes: '8x8 transforms, best H.264 compression. Ideal for high-res.',
+        notes: 'Most compression-efficient H.264 profile offered by Concord; 8-bit SDR.',
       };
-    if (profileId?.startsWith('4d00'))
+    if (profileClass === 'main')
       return {
         name: 'H.264 (Main)',
         quality: 'Good',
         efficiency: 'Moderate',
-        compressionRatio: '~15% better than Baseline',
+        compressionRatio: 'Balanced H.264 efficiency',
         hdr: false,
-        notes: 'B-frames & CABAC entropy coding. Good general-purpose profile.',
+        notes: 'Balances H.264 compression efficiency and compatibility; 8-bit SDR.',
+      };
+    if (profileClass === 'constrained-baseline')
+      return {
+        name: 'H.264 (Constrained Baseline)',
+        quality: 'Baseline',
+        efficiency: 'Moderate',
+        compressionRatio: 'Reference',
+        hdr: false,
+        notes: 'Maximum WebRTC compatibility and low latency. No B-frames.',
       };
     return {
       name: 'H.264 (Baseline)',

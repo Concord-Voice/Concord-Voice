@@ -4,6 +4,7 @@ interface SelectOption {
   value: string;
   label: string;
   group?: string;
+  disabled?: boolean;
 }
 
 interface CustomSelectProps {
@@ -39,7 +40,7 @@ const CustomSelect: React.FC<CustomSelectProps> = ({
         </option>
       )}
       {options.map((opt) => (
-        <option key={opt.value} value={opt.value}>
+        <option key={opt.value} value={opt.value} disabled={opt.disabled}>
           {opt.label}
         </option>
       ))}

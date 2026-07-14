@@ -80,7 +80,7 @@ export interface VideoSettings {
   // Camera
   cameraPreset: string; // Key into VIDEO_QUALITY_PRESETS
   cameraBitrate: number; // bps, 0 = auto (codec/preset-dependent). Gated on the camera axis (#1602).
-  preferredVideoCodec: string | null; // mimeType e.g. "video/VP9"
+  preferredVideoCodec: string | null; // canonical router key, e.g. "video/vp9:0" or "video/h264:640034"
   cameraPriority: VideoPriority; // DSCP priority for camera traffic
 
   // Screen share

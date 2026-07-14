@@ -1,0 +1,57 @@
+.codec-profiles-intro {
+  margin: 0 0 16px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.codec-profiles-table-wrap {
+  overflow-x: auto;
+}
+
+.codec-profiles-table {
+  width: 100%;
+  border-collapse: collapse;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+.codec-profiles-table caption {
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-align: left;
+}
+
+.codec-profiles-table th,
+.codec-profiles-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border-color);
+  text-align: left;
+  vertical-align: top;
+}
+
+.codec-profiles-table th {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.codec-profiles-table code {
+  display: inline-block;
+  margin-top: 3px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  background: var(--bg-tertiary);
+  font-family: var(--code-font, Menlo, Consolas, monospace);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+.codec-profiles-notes {
+  margin-top: 14px;
+  color: var(--text-muted);
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.5;
+}
+
+.codec-profiles-notes p {
+  margin: 8px 0 0;
+}

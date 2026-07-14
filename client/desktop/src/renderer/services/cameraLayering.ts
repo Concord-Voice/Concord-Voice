@@ -76,8 +76,9 @@ export function buildCameraEncodingPlan(input: BuildCameraEncodingPlanInput): Ca
   const mime = codecMime(input.codec);
   const base = { ...input.priority };
 
-  // Codec-derived casting kind, then collapse to single when the eligibility allow-list
-  // forbids it. This is the one chokepoint that makes AV1+simulcast unreachable (#1921).
+  // Derive the layering kind from the selected codec, then collapse that plan to
+  // single when its mode is disabled. These gates never replace the codec. This is
+  // the one chokepoint that makes AV1+simulcast unreachable (#1921).
   const kind = castingKindForCodec(mime);
   if (!isCastingEligible(kind, input.eligibility)) {
     return { kind: 'single', encodings: [{ ...base, maxBitrate: input.maxBitrate }] };

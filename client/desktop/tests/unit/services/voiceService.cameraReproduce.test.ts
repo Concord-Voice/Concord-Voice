@@ -154,6 +154,25 @@ const { voiceService } = await import('@/renderer/services/voiceService');
 let nextProducerId = 0;
 // Toggled by the fail-closed test to make the NEXT produced producer lack rtpSender.
 let produceWithRtpSender = true;
+let produceWithRtpParameters = true;
+let negotiatedVideoCodec: { mimeType: string; sdpFmtpLine?: string } = {
+  mimeType: 'video/VP8',
+};
+let senderVideoCodec: { mimeType: string; sdpFmtpLine?: string } | null = null;
+
+const requestedVp8Codec = {
+  mimeType: 'video/VP8',
+  kind: 'video',
+  clockRate: 90000,
+  parameters: {},
+};
+
+const requestedH264Codec = {
+  mimeType: 'video/H264',
+  kind: 'video',
+  clockRate: 90000,
+  parameters: {},
+};
 
 function makeVideoTrack(id = 'cam-track'): any {
   const t: any = {
@@ -204,10 +223,13 @@ function makeMockProducer(opts: {
     closed: false,
     paused: false,
     appData: { source },
-    rtpParameters: { codecs: [{ mimeType: 'video/VP8' }] },
+    rtpParameters: { codecs: produceWithRtpParameters ? [negotiatedVideoCodec] : [] },
     rtpSender: withRtpSender
       ? {
-          getParameters: () => ({ encodings: [{}], codecs: [{ mimeType: 'video/VP8' }] }),
+          getParameters: () => ({
+            encodings: [{}],
+            codecs: [senderVideoCodec ?? negotiatedVideoCodec],
+          }),
           setParameters: vi.fn().mockResolvedValue(undefined),
         }
       : undefined,
@@ -275,9 +297,9 @@ function resetService(svc: any): void {
   svc.buildCameraFallbackChain = vi.fn().mockReturnValue([]);
   svc.pickCameraCodec = vi
     .fn()
-    .mockReturnValue({ codec: undefined, encodings: [{ maxBitrate: 1_000_000 }] });
+    .mockReturnValue({ codec: requestedVp8Codec, encodings: [{ maxBitrate: 1_000_000 }] });
   svc.pickScreenCodec = vi.fn().mockReturnValue({
-    codec: undefined,
+    codec: requestedVp8Codec,
     encodings: [{ maxBitrate: 1_500_000 }],
     effectiveBitrate: 1_500_000,
   });
@@ -301,7 +323,289 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     vi.clearAllMocks();
     nextProducerId = 0;
     produceWithRtpSender = true;
+    produceWithRtpParameters = true;
+    negotiatedVideoCodec = { mimeType: 'video/VP8' };
+    senderVideoCodec = null;
   });
+
+  it('records the exact negotiated H264 profile for camera produce and re-produce (#2242)', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    negotiatedVideoCodec = {
+      mimeType: 'video/H264',
+      sdpFmtpLine: 'level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640034',
+    };
+    svc.pickCameraCodec.mockReturnValue({
+      codec: requestedH264Codec,
+      encodings: [{ maxBitrate: 1_000_000 }],
+    });
+
+    const camTrack = makeVideoTrack('cam-profile-track');
+    svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([camTrack]));
+
+    await svc.produceVideo();
+    expect(useVoiceStore.getState().activeCameraCodec).toBe('video/h264:640034');
+
+    await svc.fastReproduceCamera();
+    expect(useVoiceStore.getState().activeCameraCodec).toBe('video/h264:640034');
+  });
+
+  it('records the exact negotiated H264 profile for screen produce and re-produce (#2242)', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    negotiatedVideoCodec = {
+      mimeType: 'video/H264',
+      sdpFmtpLine: 'level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640034',
+    };
+    svc.pickScreenCodec.mockReturnValue({
+      codec: requestedH264Codec,
+      encodings: [{ maxBitrate: 1_500_000 }],
+      effectiveBitrate: 1_500_000,
+    });
+
+    const screenTrack = makeVideoTrack('screen-profile-track');
+    svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([screenTrack]));
+
+    await svc.produceScreen('window:1:0');
+    expect(useVoiceStore.getState().activeScreenCodec).toBe('video/h264:640034');
+
+    await svc.fastReproduceScreen();
+    expect(useVoiceStore.getState().activeScreenCodec).toBe('video/h264:640034');
+  });
+
+  it('uses authoritative producer RTP parameters when sender parameters are unavailable (#2242)', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    produceWithRtpSender = false;
+    svc.pickCameraCodec.mockReturnValue({
+      codec: requestedH264Codec,
+      encodings: [{ maxBitrate: 1_000_000 }],
+    });
+
+    const camTrack = makeVideoTrack('cam-fallback-track');
+    svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([camTrack]));
+
+    await svc.produceVideo();
+    expect(useVoiceStore.getState().activeCameraCodec).toBe('video/vp8');
+  });
+
+  it('prefers authoritative producer RTP parameters over the sender codec list (#2242)', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    negotiatedVideoCodec = {
+      mimeType: 'video/H264',
+      sdpFmtpLine: 'level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64001f',
+    };
+    senderVideoCodec = { mimeType: 'video/VP8' };
+    svc.pickCameraCodec.mockReturnValue({
+      codec: requestedH264Codec,
+      encodings: [{ maxBitrate: 1_000_000 }],
+    });
+
+    const camTrack = makeVideoTrack('cam-authoritative-producer-track');
+    svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([camTrack]));
+
+    await svc.produceVideo();
+    expect(useVoiceStore.getState().activeCameraCodec).toBe('video/h264:64001f');
+  });
+
+  it('falls back to the requested MIME only when producer and sender parameters are unavailable', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    produceWithRtpParameters = false;
+    produceWithRtpSender = false;
+    svc.pickCameraCodec.mockReturnValue({
+      codec: requestedH264Codec,
+      encodings: [{ maxBitrate: 1_000_000 }],
+    });
+
+    const camTrack = makeVideoTrack('cam-requested-fallback-track');
+    svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([camTrack]));
+
+    await svc.produceVideo();
+    expect(useVoiceStore.getState().activeCameraCodec).toBe('video/h264');
+  });
+
+  it('preserves the selected profile when producer and sender parameters are unavailable', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    produceWithRtpParameters = false;
+    produceWithRtpSender = false;
+    svc.pickCameraCodec.mockReturnValue({
+      codec: {
+        mimeType: 'video/VP9',
+        kind: 'video',
+        clockRate: 90000,
+        parameters: { 'profile-id': 2 },
+      },
+      encodings: [{ maxBitrate: 1_000_000 }],
+    });
+
+    const camTrack = makeVideoTrack('cam-selected-profile-fallback-track');
+    svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([camTrack]));
+
+    await svc.produceVideo();
+    expect(useVoiceStore.getState().activeCameraCodec).toBe('video/vp9:2');
+  });
+
+  it('normalizes an fmtp-less VP9 producer to Profile 0', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    negotiatedVideoCodec = { mimeType: 'video/VP9' };
+
+    const camTrack = makeVideoTrack('cam-vp9-profile-zero-track');
+    svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([camTrack]));
+
+    await svc.produceVideo();
+    expect(useVoiceStore.getState().activeCameraCodec).toBe('video/vp9:0');
+  });
+
+  it.each(['camera', 'screen'] as const)(
+    'fails closed without invoking mediasoup when $source has no eligible codec',
+    async (source) => {
+      const svc = voiceService as any;
+      resetService(svc);
+      const track = makeVideoTrack(`${source}-no-codec-track`);
+
+      if (source === 'camera') {
+        svc.pickCameraCodec.mockReturnValue({
+          codec: undefined,
+          encodings: [{ maxBitrate: 1_000_000 }],
+        });
+        svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([track]));
+        await svc.produceVideo();
+      } else {
+        svc.pickScreenCodec.mockReturnValue({
+          codec: undefined,
+          encodings: [{ maxBitrate: 1_500_000 }],
+          effectiveBitrate: 1_500_000,
+        });
+        svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([track]));
+        await expect(svc.produceScreen('window:no-codec:0')).rejects.toThrow(
+          /eligible screen codec/i
+        );
+      }
+
+      expect(svc.sendTransport.produce).not.toHaveBeenCalled();
+      expect(svc.producers.has(source)).toBe(false);
+      expect(track.readyState).toBe('ended');
+      expect(source === 'camera' ? svc.localCameraStream : svc.localScreenStream).toBeNull();
+      expect(
+        source === 'camera'
+          ? useVoiceStore.getState().activeCameraCodec
+          : useVoiceStore.getState().activeScreenCodec
+      ).toBeNull();
+    }
+  );
+
+  it.each(['camera', 'screen'] as const)(
+    'fails closed before mediasoup when fast $source re-produce has no eligible codec',
+    async (source) => {
+      const svc = voiceService as any;
+      resetService(svc);
+      const track = makeVideoTrack(`${source}-fast-no-codec-track`);
+
+      if (source === 'camera') {
+        svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([track]));
+        await svc.produceVideo();
+        svc.pickCameraCodec.mockReturnValue({
+          codec: undefined,
+          encodings: [{ maxBitrate: 1_000_000 }],
+        });
+      } else {
+        svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([track]));
+        await svc.produceScreen('window:fast-no-codec:0');
+        svc.pickScreenCodec.mockReturnValue({
+          codec: undefined,
+          encodings: [{ maxBitrate: 1_500_000 }],
+          effectiveBitrate: 1_500_000,
+        });
+      }
+      svc.sendTransport.produce.mockClear();
+
+      await expect(
+        source === 'camera' ? svc.fastReproduceCamera() : svc.fastReproduceScreen()
+      ).rejects.toThrow(new RegExp(`eligible ${source} codec`, 'i'));
+
+      expect(svc.sendTransport.produce).not.toHaveBeenCalled();
+      expect(svc.producers.has(source)).toBe(false);
+      expect(track.readyState).toBe('ended');
+      expect(source === 'camera' ? svc.localCameraStream : svc.localScreenStream).toBeNull();
+    }
+  );
+
+  it.each(['camera', 'screen'] as const)(
+    'cleans up $source state and capture when fast re-produce rejects',
+    async (source) => {
+      const svc = voiceService as any;
+      resetService(svc);
+      const track = makeVideoTrack(`${source}-reproduce-reject-track`);
+
+      if (source === 'camera') {
+        svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([track]));
+        await svc.produceVideo();
+      } else {
+        svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([track]));
+        await svc.produceScreen('window:reproduce-reject:0');
+      }
+
+      svc.sendTransport.produce.mockRejectedValueOnce(new Error('replacement produce failed'));
+
+      await expect(
+        source === 'camera' ? svc.fastReproduceCamera() : svc.fastReproduceScreen()
+      ).rejects.toThrow('replacement produce failed');
+
+      expect(svc.producers.has(source)).toBe(false);
+      expect(track.readyState).toBe('ended');
+      expect(source === 'camera' ? svc.localCameraStream : svc.localScreenStream).toBeNull();
+      const state = useVoiceStore.getState();
+      expect(source === 'camera' ? state.activeCameraCodec : state.activeScreenCodec).toBeNull();
+      expect(source === 'camera' ? state.isVideoOn : state.isScreenSharing).toBe(false);
+    }
+  );
+
+  it.each([
+    { source: 'camera', reproduce: false },
+    { source: 'camera', reproduce: true },
+    { source: 'screen', reproduce: false },
+    { source: 'screen', reproduce: true },
+  ] as const)(
+    'clears $source In Use state when its $reproduce transport closes',
+    async ({ source, reproduce }) => {
+      const svc = voiceService as any;
+      resetService(svc);
+
+      const track = makeVideoTrack(`${source}-transport-close`);
+      if (source === 'camera') {
+        svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([track]));
+        await svc.produceVideo();
+        if (reproduce) await svc.fastReproduceCamera();
+      } else {
+        svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([track]));
+        await svc.produceScreen('window:transport-close:0');
+        if (reproduce) await svc.fastReproduceScreen();
+      }
+
+      const producer = svc.producers.get(source);
+      const closeHandler = producer.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'transportclose'
+      )?.[1] as (() => void) | undefined;
+      expect(closeHandler).toBeTypeOf('function');
+      expect(
+        source === 'camera'
+          ? useVoiceStore.getState().activeCameraCodec
+          : useVoiceStore.getState().activeScreenCodec
+      ).not.toBeNull();
+
+      closeHandler?.();
+
+      expect(
+        source === 'camera'
+          ? useVoiceStore.getState().activeCameraCodec
+          : useVoiceStore.getState().activeScreenCodec
+      ).toBeNull();
+    }
+  );
 
   it('camera-layering re-produce keeps the camera alive (reused track survives close)', async () => {
     const svc = voiceService as any;

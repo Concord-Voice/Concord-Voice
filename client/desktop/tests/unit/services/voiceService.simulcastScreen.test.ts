@@ -6,10 +6,9 @@
  *   state silently (which pinned the layer/gate on the last visible demand). Camera is
  *   unchanged — hidden-ness routes through the pause coordinator, not a demand emit.
  *
- * Fix #6a — `pickScreenCodec` picks from the SVC-first ladder (`pickScreenLayeringCodec`)
- *   so an AV1 pick that is SVC-ineligible (Support SVC off) descends past AV1/VP9 to
- *   H264/VP8 → real simulcast, instead of collapsing to a single stream. Simulcast stays
- *   server-gated on `screenLayeringEnabled`.
+ * Codec intent remains stable when a layering toggle is disabled. The selected codec keeps
+ *   its priority; its encoding plan degrades from the codec's layered mode to a single stream.
+ *   Simulcast stays server-gated on `screenLayeringEnabled`.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { voiceService } from '@/renderer/services/voiceService';
@@ -104,12 +103,12 @@ describe('voiceService screen demand cleared on last-surface unmount (#1924 Fix 
   });
 });
 
-describe('voiceService.pickScreenCodec — SVC-first ladder for screen simulcast (#1924 Fix #6a)', () => {
+describe('voiceService.pickScreenCodec — preserve codec intent across layering fallbacks', () => {
   let svc: any;
 
   beforeEach(() => {
     svc = voiceService as any;
-    // A minimal send capability set: AV1 (SVC-kind) + VP8 (simulcast-kind).
+    // A minimal send capability set: AV1 (SVC-kind) + VP8 (simulcast-kind fallback codec).
     svc.device = {
       rtpCapabilities: {
         codecs: [
@@ -131,15 +130,15 @@ describe('voiceService.pickScreenCodec — SVC-first ladder for screen simulcast
     });
   });
 
-  it('AV1 preferred + Support SVC OFF + Simulcast ON + gate ON → descends to a real VP8 simulcast plan', () => {
+  it('keeps AV1 and falls back to a single stream when SVC is off (#2242)', () => {
     svc.screenLayeringEnabled = true;
     useVideoSettingsStore.setState({ supportSvc: false, supportSimulcast: true });
 
     const { codec, encodings } = svc.pickScreenCodec();
-    // AV1/VP9 are SVC-ineligible (Support SVC off) so the ladder skips them → VP8.
-    expect(codec?.mimeType?.toLowerCase()).toBe('video/vp8');
-    expect(encodings).toHaveLength(3);
-    expect(encodings.map((e: { rid?: string }) => e.rid)).toEqual(['q', 'h', 'f']);
+    expect(codec?.mimeType?.toLowerCase()).toBe('video/av1');
+    expect(encodings).toHaveLength(1);
+    expect(encodings[0].rid).toBeUndefined();
+    expect(encodings[0].scalabilityMode).toBeUndefined();
   });
 
   it('AV1 preferred + Support SVC ON → stays AV1 SVC (single encoding with a scalabilityMode)', () => {
@@ -157,16 +156,14 @@ describe('voiceService.pickScreenCodec — SVC-first ladder for screen simulcast
     svc.screenLayeringEnabled = false;
     useVideoSettingsStore.setState({ supportSvc: false, supportSimulcast: true });
 
-    const { encodings } = svc.pickScreenCodec();
+    const { codec, encodings } = svc.pickScreenCodec();
     // Simulcast is server-gated; with the gate off there is no layering fallback.
+    expect(codec?.mimeType?.toLowerCase()).toBe('video/av1');
     expect(encodings).toHaveLength(1);
     expect(encodings[0].rid).toBeUndefined();
   });
 
-  it('AUTO bitrate is derived from the ladder-chosen codec (VP8), not the AV1 preference (#1924 review)', () => {
-    // AV1 preferred but SVC-ineligible → the ladder publishes VP8. calculateScreenBitrate
-    // is codec-dependent (efficient codecs use 0.04 bits/px, VP8/H264 use 0.07). Computing
-    // it BEFORE the AV1→VP8 swap under-budgeted the VP8 encode; the fix computes it after.
+  it('AUTO bitrate follows the retained AV1 codec when SVC is off (#2242)', () => {
     svc.screenLayeringEnabled = true;
     useVoiceStore.setState({ activeScreenCodec: null });
     useVideoSettingsStore.setState({
@@ -178,12 +175,8 @@ describe('voiceService.pickScreenCodec — SVC-first ladder for screen simulcast
     });
 
     const { codec, effectiveBitrate } = svc.pickScreenCodec();
-    expect(codec?.mimeType?.toLowerCase()).toBe('video/vp8');
-    // VP8 (0.07 bpp): 1920*1080*30*0.07 ≈ 4.35 Mbps → rounded to 4.4 Mbps.
-    expect(effectiveBitrate).toBe(4_400_000);
-    // The AV1 (0.04 bpp) value would have been 2.5 Mbps — proving the bitrate follows the
-    // ACTUAL published codec, not the preference.
-    expect(effectiveBitrate).not.toBe(2_500_000);
+    expect(codec?.mimeType?.toLowerCase()).toBe('video/av1');
+    expect(effectiveBitrate).toBe(2_500_000);
   });
 
   it('AUTO bitrate uses AV1 (0.04 bpp) when the ladder keeps AV1 (SVC on) (#1924 review)', () => {
@@ -214,7 +207,7 @@ describe('voiceService.pickScreenCodec — SVC-first ladder for screen simulcast
     });
 
     const { codec, effectiveBitrate } = svc.pickScreenCodec();
-    expect(codec?.mimeType?.toLowerCase()).toBe('video/vp8');
+    expect(codec?.mimeType?.toLowerCase()).toBe('video/av1');
     expect(effectiveBitrate).toBe(3_333_000);
   });
 });

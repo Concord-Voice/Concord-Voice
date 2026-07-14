@@ -904,6 +904,131 @@ describe('VoiceService', () => {
       });
     });
 
+    it.each(['outgoing-ringing', 'incoming-ringing'] as const)(
+      'keeps a matching %s DM join owned while leaving an existing channel',
+      async (kind) => {
+        // Regression for #2242: leaveChannel() resets callState while switching
+        // from an active channel into a ring-backed DM media session.
+        await joinVoiceChannel();
+        const ringId = `${kind}-before-leave`;
+        if (kind === 'outgoing-ringing') {
+          useVoiceStore.getState().setCallState({
+            kind,
+            conversationId: 'channel-1',
+            ringId,
+            calleeUserIds: ['user-2'],
+            startedAt: Date.now(),
+            declinedUserIds: [],
+          });
+        } else {
+          useVoiceStore.getState().setCallState({
+            kind,
+            conversationId: 'channel-1',
+            ringId,
+            caller: { userId: 'user-2', username: 'caller' },
+            expiresAt: Date.now() + 45_000,
+            isGroup: false,
+          });
+        }
+
+        mockApiFetch.mockResolvedValueOnce({
+          ok: true,
+          json: vi.fn().mockResolvedValue({ ...makeJoinResponse(), call_id: 'call-2' }),
+        });
+        setupEmitResponses({
+          'join-room': makeRoomJoined(),
+          'create-transport': makeTransportOpts(),
+          produce: { id: 'prod-mic-2' },
+          'leave-room': undefined,
+        });
+
+        await voiceService.joinChannel('channel-1', 'dm');
+
+        expect(mockApiFetch).toHaveBeenLastCalledWith(
+          '/api/v1/dm/conversations/channel-1/voice/join',
+          expect.objectContaining({ body: JSON.stringify({ ring_id: ringId }) })
+        );
+        expect(useVoiceStore.getState().callState).toEqual({ kind: 'in-call' });
+      }
+    );
+
+    it('rejects a duplicate ring-backed DM join while authorization is in flight', async () => {
+      setupAuth();
+      useVoiceStore.getState().setCallState({
+        kind: 'joining',
+        conversationId: 'channel-1',
+        ringId: 'ring-in-flight',
+      });
+      let resolveAuthorization!: (response: Response) => void;
+      mockApiFetch
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            resolveAuthorization = resolve;
+          })
+        )
+        .mockResolvedValue({
+          ok: false,
+          status: 409,
+          json: vi.fn().mockResolvedValue({}),
+        });
+
+      const firstJoin = voiceService.joinChannel('channel-1', 'dm');
+      await vi.waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(1));
+
+      let duplicateError: unknown;
+      try {
+        await voiceService.joinChannel('channel-1', 'dm');
+      } catch (err) {
+        duplicateError = err;
+      }
+      resolveAuthorization({
+        ok: false,
+        status: 409,
+        json: vi.fn().mockResolvedValue({}),
+      } as unknown as Response);
+      await expect(firstJoin).rejects.toThrow('Voice join failed: 409');
+
+      const apiCallCount = mockApiFetch.mock.calls.length;
+      mockApiFetch.mockReset();
+      expect(duplicateError).toEqual(new Error('Another voice call is already in progress'));
+      expect(apiCallCount).toBe(1);
+    });
+
+    it('recovers and releases DM join ownership when active-channel cleanup throws', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      useVoiceStore.getState().setCallState({
+        kind: 'outgoing-ringing',
+        conversationId: 'channel-1',
+        ringId: 'ring-before-cleanup',
+        calleeUserIds: ['user-2'],
+        startedAt: Date.now(),
+        declinedUserIds: [],
+      });
+      sendTransport.close.mockImplementation(() => {
+        throw new Error('mock switch cleanup failure');
+      });
+      mockApiFetch.mockClear();
+
+      await expect(voiceService.joinChannel('channel-1', 'dm')).rejects.toThrow(
+        'mock switch cleanup failure'
+      );
+
+      expect(mockApiFetch).not.toHaveBeenCalled();
+      expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+      expect(useVoiceStore.getState().activeChannelId).toBeNull();
+      expect(useVoiceStore.getState().connectionState).toBe('error');
+
+      mockApiFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        json: vi.fn().mockResolvedValue({}),
+      });
+      await expect(voiceService.joinChannel('channel-1', 'dm')).rejects.toThrow(
+        'Voice join failed: 403'
+      );
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    });
+
     it('handles json parse failure on error response', async () => {
       setupAuth();
       mockApiFetch.mockResolvedValueOnce({
@@ -3530,6 +3655,7 @@ describe('VoiceService', () => {
     });
 
     it('pickCameraCodec uses AV1 SVC encoding when camera layering is enabled', async () => {
+      useVideoSettingsStore.setState({ supportSvc: true });
       await joinVoiceChannel();
       const svc = voiceService as any;
       svc.cameraLayeringEnabled = true;
@@ -3543,17 +3669,46 @@ describe('VoiceService', () => {
       }
     });
 
-    it('pickCameraCodec prefers VP9 SVC over H264 when layering is enabled and AV1 is excluded', async () => {
-      useVoiceStore.getState().setCodecFloor(['video/vp9', 'video/h264']);
-      useVideoSettingsStore.setState({ preferredVideoCodec: 'video/H264' });
+    it('pickCameraCodec keeps AV1 as a single stream when SVC is disabled (#2242)', async () => {
+      useVideoSettingsStore.setState({
+        preferredVideoCodec: 'video/AV1',
+        supportSvc: false,
+        supportSimulcast: true,
+      });
       await joinVoiceChannel();
       const svc = voiceService as any;
       svc.cameraLayeringEnabled = true;
       try {
         const result = svc.pickCameraCodec();
-        expect(result.codec?.mimeType).toBe('video/VP9');
+        expect(result.codec?.mimeType).toBe('video/AV1');
         expect(result.encodings).toHaveLength(1);
-        expect(result.encodings[0].scalabilityMode).toBe('L3T3_KEY');
+        expect(result.encodings[0].rid).toBeUndefined();
+        expect(result.encodings[0].scalabilityMode).toBeUndefined();
+      } finally {
+        svc.cameraLayeringEnabled = false;
+      }
+    });
+
+    it('pickCameraCodec preserves a floor-compatible manual H264 preference when layering is enabled', async () => {
+      useVoiceStore.getState().setCodecFloor(['video/vp9', 'video/h264']);
+      useVideoSettingsStore.setState({
+        preferredVideoCodec: 'video/H264',
+        supportSvc: true,
+        supportSimulcast: true,
+      });
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      svc.cameraLayeringEnabled = true;
+      try {
+        const result = svc.pickCameraCodec();
+        expect(result.codec?.mimeType).toBe('video/H264');
+        expect(result.codec?.parameters?.['profile-level-id']).toBe('640034');
+        expect(result.encodings).toHaveLength(3);
+        expect(result.encodings.map((encoding: { rid?: string }) => encoding.rid)).toEqual([
+          'q',
+          'h',
+          'f',
+        ]);
       } finally {
         svc.cameraLayeringEnabled = false;
       }
@@ -3580,6 +3735,121 @@ describe('VoiceService', () => {
       const codec = svc.findSendCodec('video/H264:640034');
       expect(codec).toBeDefined();
       expect(codec.parameters?.['profile-level-id']).toBe('640034');
+    });
+
+    it('matches H264 by profile class while preserving level asymmetry', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const constrainedHigh = {
+        mimeType: 'video/H264',
+        kind: 'video',
+        clockRate: 90000,
+        parameters: { 'profile-level-id': '640c1f' },
+      };
+      const lowerLevelHigh = {
+        mimeType: 'video/H264',
+        kind: 'video',
+        clockRate: 90000,
+        parameters: { 'profile-level-id': '64001f' },
+      };
+      const constrainedMain = {
+        mimeType: 'video/H264',
+        kind: 'video',
+        clockRate: 90000,
+        parameters: { 'profile-level-id': '4d401f' },
+      };
+      const constrainedBaselineFromMain = {
+        mimeType: 'video/H264',
+        kind: 'video',
+        clockRate: 90000,
+        parameters: { 'profile-level-id': '4d801f' },
+      };
+      const constrainedBaselineFromExtended = {
+        mimeType: 'video/H264',
+        kind: 'video',
+        clockRate: 90000,
+        parameters: { 'profile-level-id': '58c01f' },
+      };
+      svc.device = {
+        loaded: true,
+        rtpCapabilities: { codecs: [constrainedHigh, lowerLevelHigh, constrainedMain] },
+      };
+
+      expect(svc.findSendCodec('video/H264:640034')).toBe(lowerLevelHigh);
+      expect(svc.findSendCodec('video/H264:4d0032')).toBe(constrainedMain);
+      expect(svc.findSendCodec('video/H264:640c1f')).toBe(constrainedHigh);
+
+      svc.device.rtpCapabilities.codecs = [constrainedBaselineFromMain];
+      expect(svc.findSendCodec('video/H264:42e01f')).toBe(constrainedBaselineFromMain);
+      svc.device.rtpCapabilities.codecs = [constrainedBaselineFromExtended];
+      expect(svc.findSendCodec('video/H264:42e01f')).toBe(constrainedBaselineFromExtended);
+    });
+
+    it('resolves a legacy bare H264 preference by canonical profile order', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const codec = (profile: string) => ({
+        mimeType: 'video/H264',
+        kind: 'video',
+        clockRate: 90000,
+        parameters: { 'profile-level-id': profile },
+      });
+      const high = codec('64001f');
+      const main = codec('4d401f');
+      const constrainedBaseline = codec('58c01f');
+
+      svc.device = {
+        loaded: true,
+        rtpCapabilities: { codecs: [high, constrainedBaseline, main] },
+      };
+      expect(svc.findSendCodec('video/H264')).toBe(high);
+
+      svc.device.rtpCapabilities.codecs = [constrainedBaseline, main];
+      expect(svc.findSendCodec('video/H264')).toBe(main);
+
+      svc.device.rtpCapabilities.codecs = [constrainedBaseline];
+      expect(svc.findSendCodec('video/H264')).toBe(constrainedBaseline);
+    });
+
+    it('resolves a legacy bare VP9 preference to Profile 0', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const profile2 = {
+        mimeType: 'video/VP9',
+        kind: 'video',
+        clockRate: 90000,
+        parameters: { 'profile-id': '2' },
+      };
+      const profile0 = {
+        mimeType: 'video/VP9',
+        kind: 'video',
+        clockRate: 90000,
+        parameters: {},
+      };
+      svc.device = {
+        loaded: true,
+        rtpCapabilities: { codecs: [profile2, profile0] },
+      };
+
+      expect(svc.findSendCodec('video/VP9')).toBe(profile0);
+
+      svc.device.rtpCapabilities.codecs = [profile2];
+      expect(svc.findSendCodec('video/VP9')).toBeUndefined();
+    });
+
+    it('uses the exact codec profile for pre-observation hardware verdicts', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useVideoSettingsStore.setState({
+        webrtcHwByMime: {},
+        codecCapabilities: [
+          { mimeType: 'video/VP9', profileId: '0', hwAvailable: true },
+          { mimeType: 'video/VP9', profileId: '2', hwAvailable: false },
+        ],
+      } as never);
+
+      expect(svc.isHwAccelerated('video/VP9:0')).toBe(true);
+      expect(svc.isHwAccelerated('video/VP9:2')).toBe(false);
     });
 
     it('findSendCodec returns undefined for missing codec', async () => {
@@ -4374,6 +4644,66 @@ describe('VoiceService', () => {
       await svc.reProduceIfBetterCodec('camera');
       // Should not have called fastReproduceCamera
       expect(cameraProducer.close).not.toHaveBeenCalled();
+    });
+
+    it('does not churn an H264 producer when only the negotiated level differs', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const cameraProducer = createMockProducer('prod-cam-level', 'camera') as any;
+      cameraProducer.rtpParameters = {
+        codecs: [
+          {
+            mimeType: 'video/H264',
+            parameters: { 'profile-level-id': '64001f' },
+          },
+        ],
+      };
+      svc.producers.set('camera', cameraProducer);
+      svc.pickCameraCodec = () => ({
+        codec: {
+          mimeType: 'video/H264',
+          kind: 'video',
+          clockRate: 90000,
+          parameters: { 'profile-level-id': '640034' },
+        },
+        encodings: [{ maxBitrate: 2_000_000 }],
+      });
+      const reproduce = vi.fn().mockResolvedValue(undefined);
+      svc.fastReproduceCameraQueued = reproduce;
+
+      try {
+        await svc.reProduceIfBetterCodec('camera');
+        expect(reproduce).not.toHaveBeenCalled();
+      } finally {
+        delete svc.pickCameraCodec;
+        delete svc.fastReproduceCameraQueued;
+      }
+    });
+
+    it('closes an active producer when the policy has no eligible codec', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const cameraProducer = createMockProducer('prod-cam-no-codec', 'camera') as any;
+      cameraProducer.rtpParameters = { codecs: [{ mimeType: 'video/VP8', parameters: {} }] };
+      svc.producers.set('camera', cameraProducer);
+      svc.localCameraStream = createMockMediaStream([{ kind: 'video', id: 'cam-no-codec' }]);
+      useVoiceStore.getState().setVideoOn(true);
+      useVoiceStore.getState().setActiveCameraCodec('video/vp8');
+      svc.pickCameraCodec = () => ({
+        codec: undefined,
+        encodings: [{ maxBitrate: 2_000_000 }],
+      });
+
+      try {
+        await svc.reProduceIfBetterCodec('camera');
+        expect(cameraProducer.close).toHaveBeenCalled();
+        expect(svc.producers.has('camera')).toBe(false);
+        expect(svc.localCameraStream).toBeNull();
+        expect(useVoiceStore.getState().activeCameraCodec).toBeNull();
+        expect(useVoiceStore.getState().isVideoOn).toBe(false);
+      } finally {
+        delete svc.pickCameraCodec;
+      }
     });
 
     it('reProduceIfBetterCodec skips HW switch when hwAccel disabled', async () => {

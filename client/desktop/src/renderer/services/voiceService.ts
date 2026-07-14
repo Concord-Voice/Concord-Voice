@@ -54,10 +54,14 @@ import {
   type E2EETransformOptions,
 } from '../workers/e2eeProtocol';
 import { notificationSoundService } from './notificationSoundService';
-import { selectCodecFromCascade, type CodecLookup } from './voiceCodecSelection';
+import {
+  h264ProfilesCompatible,
+  selectCodecFromCascade,
+  type CodecLookup,
+} from './voiceCodecSelection';
 import { extractWebrtcHwSignal, shouldReselectForHwDowngrade } from './webrtcHwSignal';
 import { ConsumerPauseCoordinator } from './consumerPauseCoordinator';
-import { buildCameraEncodingPlan, castingKindForCodec, isCastingEligible } from './cameraLayering';
+import { buildCameraEncodingPlan } from './cameraLayering';
 import {
   computeRemoteVideoLayerRequest,
   type RemoteVideoLayerRequest,
@@ -376,6 +380,8 @@ class VoiceService {
   > = new Map();
   // Local media streams
   private localMicStream: MediaStream | null = null;
+  /** Single-flight guard for initial channel/DM joins. */
+  private joinInFlight = false;
   /** Single-flight guard for #1790 network-change media-session resume. */
   private resumeInFlight = false;
   private localCameraStream: MediaStream | null = null;
@@ -747,8 +753,7 @@ class VoiceService {
 
     // #2187 item 2: for each source whose ACTIVE codec just transitioned to software-encode,
     // re-select toward a HW codec (once per SW transition; reProduceIfBetterCodec no-ops if no
-    // genuinely-better HW codec exists — including under camera-layering, where the SVC ladder
-    // owns codec choice and re-selection is intentionally a no-op).
+    // genuinely-better HW codec exists).
     for (const o of currentObservations) {
       if (
         shouldReselectForHwDowngrade({
@@ -857,11 +862,46 @@ class VoiceService {
 
   // ─── Codec preference helpers ──────────────────────────────────────
 
+  /** Codec identity for re-selection: H.264 levels may differ under level asymmetry. */
+  private codecKeysEquivalent(left: string, right: string): boolean {
+    const [leftMime, leftProfile] = left.toLowerCase().split(':');
+    const [rightMime, rightProfile] = right.toLowerCase().split(':');
+    if (leftMime !== rightMime) return false;
+    if (leftMime === 'video/h264') {
+      return Boolean(
+        leftProfile && rightProfile && h264ProfilesCompatible(leftProfile, rightProfile)
+      );
+    }
+    if (leftMime === 'video/vp9') return (leftProfile ?? '0') === (rightProfile ?? '0');
+    return leftProfile === rightProfile;
+  }
+
+  private capabilityMatchesCodecKey(
+    capability: { mimeType: string; profileId?: string | null },
+    key: string
+  ): boolean {
+    const [mime, requestedProfile] = key.toLowerCase().split(':');
+    if (capability.mimeType.toLowerCase() !== mime) return false;
+    const capabilityProfile = capability.profileId?.toLowerCase();
+    if (mime === 'video/h264') {
+      return Boolean(
+        requestedProfile &&
+        capabilityProfile &&
+        h264ProfilesCompatible(requestedProfile, capabilityProfile)
+      );
+    }
+    if (mime === 'video/vp9') {
+      return (requestedProfile ?? '0') === (capabilityProfile ?? '0');
+    }
+    return requestedProfile === undefined;
+  }
+
   /**
    * Find a video codec from the loaded device's send capabilities.
    * Accepts a codec key like "video/H264:640034" or plain mimeType "video/VP9".
-   * When a profile is specified, matches exactly. When mimeType-only, returns
-   * the last match (highest quality — router lists profiles in ascending order).
+   * H.264 profile matches ignore the level byte when level asymmetry is allowed.
+   * A legacy mime-only VP9 preference resolves to Profile 0 so it cannot bypass
+   * the HDR preference gate. Bare H.264 follows Concord's canonical profile order.
    */
   private findSendCodec(key: string): mediasoupTypes.RtpCodecCapability | undefined {
     if (!this.device?.rtpCapabilities?.codecs) return undefined;
@@ -877,9 +917,7 @@ class VoiceService {
       return matches.find((c) => {
         const params = c.parameters ?? {};
         if (mimeLower === 'video/h264') {
-          return String(params['profile-level-id'] ?? '')
-            .toLowerCase()
-            .startsWith(profileId.toLowerCase().substring(0, 4));
+          return h264ProfilesCompatible(profileId, String(params['profile-level-id'] ?? ''));
         }
         if (mimeLower === 'video/vp9') {
           return String(params['profile-id'] ?? '0') === profileId;
@@ -888,8 +926,63 @@ class VoiceService {
       });
     }
 
-    // No profile specified — return best (last = highest quality in router order)
+    if (mimeLower === 'video/vp9') {
+      return matches.find((c) => String(c.parameters?.['profile-id'] ?? '0') === '0');
+    }
+
+    if (mimeLower === 'video/h264') {
+      for (const canonicalProfile of ['640034', '4d0032', '42e01f']) {
+        const match = matches.find((codec) =>
+          h264ProfilesCompatible(
+            canonicalProfile,
+            String(codec.parameters?.['profile-level-id'] ?? '')
+          )
+        );
+        if (match) return match;
+      }
+      return undefined;
+    }
+
+    // Unprofiled codecs have only one routable variant.
     return matches[matches.length - 1];
+  }
+
+  private codecKeyFromParameters(codec: {
+    mimeType: string;
+    parameters?: Record<string, unknown>;
+    sdpFmtpLine?: string;
+  }): string {
+    const mime = codec.mimeType.toLowerCase();
+    const parameters = codec.parameters ?? {};
+    if (mime === 'video/h264') {
+      const parameterProfile = parameters['profile-level-id'];
+      const profile =
+        typeof parameterProfile === 'string'
+          ? parameterProfile
+          : /profile-level-id=([0-9a-f]{6})/i.exec(codec.sdpFmtpLine ?? '')?.[1];
+      if (profile) return `${mime}:${profile.toLowerCase()}`;
+    }
+    if (mime === 'video/vp9') {
+      const parameterProfile = parameters['profile-id'];
+      const serializedProfile =
+        typeof parameterProfile === 'string' || typeof parameterProfile === 'number'
+          ? String(parameterProfile)
+          : null;
+      const profile =
+        serializedProfile ?? /profile-id=(\d+)/.exec(codec.sdpFmtpLine ?? '')?.[1] ?? '0';
+      return `${mime}:${profile}`;
+    }
+    return mime;
+  }
+
+  private requireSelectedVideoCodec(
+    codec: mediasoupTypes.RtpCodecCapability | undefined,
+    source: 'camera' | 'screen'
+  ): mediasoupTypes.RtpCodecCapability {
+    if (!codec) {
+      throw new Error(`No eligible ${source} codec is available for the current room codec floor`);
+    }
+    return codec;
   }
 
   /**
@@ -910,7 +1003,8 @@ class VoiceService {
    * observed in a live producer, falls back to the GPU silicon capability (question A,
    * from the WebCodecs probe): A over-reports for codecs WebRTC software-encodes (e.g.
    * AV1 via libaom), but it is the only pre-observation estimate, and the learned B value
-   * corrects it once a producer of that codec runs. Detection is mimeType-level.
+   * corrects it once a producer of that codec runs. Before that observation,
+   * capability matching remains profile-aware.
    */
   private isHwAccelerated(key: string): boolean {
     const store = useVideoSettingsStore.getState();
@@ -918,7 +1012,8 @@ class VoiceService {
     const learned = store.webrtcHwByMime[mime];
     if (learned !== undefined) return learned;
     return store.codecCapabilities.some(
-      (c) => c.mimeType.toLowerCase() === mime && c.hwAvailable === true
+      (capability) =>
+        capability.hwAvailable === true && this.capabilityMatchesCodecKey(capability, key)
     );
   }
 
@@ -1021,8 +1116,8 @@ class VoiceService {
    * when the room gate enables camera layering, buildCameraEncodingPlan supplies
    * SVC or simulcast encodings for compatible codecs.
    *
-   * Cascade: user pref → AV1 → HEVC → H264 High → VP9:2 (HDR) → H264 → VP9 → VP8
-   * Two-pass: HW-accelerated first, then SW fallback.
+   * Uses the shared hardware-first codec policy. Layering gates only decide whether
+   * the selected codec publishes layered or single-stream encodings.
    */
   /** Build a CodecLookup bound to this VoiceService instance. */
   private codecLookup(): CodecLookup {
@@ -1055,7 +1150,7 @@ class VoiceService {
       return { codec, encodings: [{ ...base, maxBitrate: preset.maxBitrate }] };
     }
 
-    const layeringCodec = this.pickCameraLayeringCodec(codec);
+    const layeringCodec = this.pickLayeringCodec();
     const plan = buildCameraEncodingPlan({
       codec: layeringCodec,
       maxBitrate: preset.maxBitrate,
@@ -1066,23 +1161,14 @@ class VoiceService {
     return { codec: layeringCodec, encodings: plan.encodings };
   }
 
-  private pickCameraLayeringCodec(
-    fallbackCodec?: mediasoupTypes.RtpCodecCapability
-  ): mediasoupTypes.RtpCodecCapability | undefined {
-    // Layering rooms use the approved SVC-first ladder; user preference only
-    // participates through the general-cascade fallback below. The SVC/Simulcast
-    // eligibility toggles (#1921) pre-filter the ladder so an ineligible casting
-    // kind's codec is skipped — keeping casting strictly codec-derived.
+  private pickLayeringCodec(): mediasoupTypes.RtpCodecCapability | undefined {
     const vs = useVideoSettingsStore.getState();
-    const eligibility = { svc: vs.supportSvc, simulcast: vs.supportSimulcast };
-    const candidates = ['video/AV1', 'video/VP9', 'video/H264:640034', 'video/H264', 'video/VP8'];
-    for (const key of candidates) {
-      if (!isCastingEligible(castingKindForCodec(key.split(':')[0]), eligibility)) continue;
-      if (!this.isInCodecFloor(key)) continue;
-      const codec = this.findSendCodec(key);
-      if (codec) return codec;
-    }
-    return fallbackCodec;
+    return selectCodecFromCascade({
+      preferred: vs.preferredVideoCodec,
+      hwAccel: vs.hardwareAcceleration,
+      hdrEncoding: vs.hdrEncoding,
+      ...this.codecLookup(),
+    });
   }
 
   /**
@@ -1096,8 +1182,8 @@ class VoiceService {
    * unreachable via `castingKindForCodec` (AV1 → svc), so an AV1 screen is never
    * simulcast regardless of the gate.
    *
-   * Cascade: user pref → AV1 → HEVC → H264 High → VP9:2 (HDR) → H264 → VP9 → VP8
-   * Two-pass: HW-accelerated first, then SW fallback.
+   * Uses the shared hardware-first codec policy. Layering toggles change only
+   * the encoding plan; they never replace the selected codec.
    */
   private pickScreenCodec(): {
     codec?: mediasoupTypes.RtpCodecCapability;
@@ -1108,27 +1194,14 @@ class VoiceService {
     const prio = vs.screenSharePriority;
     const userBitrate = vs.screenShareBitrate; // 0 = auto
 
-    const codec = selectCodecFromCascade({
-      preferred: vs.preferredVideoCodec,
-      hwAccel: vs.hardwareAcceleration,
-      hdrEncoding: vs.hdrEncoding,
-      ...this.codecLookup(),
-    });
-
     const base: Partial<mediasoupTypes.RtpEncodingParameters> =
       prio === 'off' ? {} : { priority: prio, networkPriority: prio };
 
-    // #1924: pick from the SVC-first ladder instead of feeding the plain-cascade codec
-    // straight in. Without this, an AV1 cascade pick that is SVC-INELIGIBLE (Support SVC
-    // off) collapses to a single stream even when the gate wants simulcast; the ladder
-    // instead descends past AV1/VP9 to H264/VP8 → real simulcast.
-    const layeringCodec = this.pickScreenLayeringCodec(codec);
+    const layeringCodec = this.pickLayeringCodec();
 
-    // #1924 review fix: derive the auto bitrate from the codec the ladder ACTUALLY
-    // publishes (layeringCodec), NOT the preferred/cascade codec. calculateScreenBitrate
-    // is codec-dependent (efficient codecs use 0.04 bits/px vs. 0.07 for H264/VP8), so
-    // computing it before the AV1→VP8 ladder swap under-budgeted a VP8/H264 screen. A
-    // non-zero user override is honored verbatim and never re-derived.
+    // Derive the auto bitrate from the codec actually published. Layering toggles
+    // may collapse its encoding plan, but do not replace the codec. A non-zero user
+    // override is honored verbatim and never re-derived.
     const bitrate = userBitrate || this.calculateScreenBitrate(layeringCodec?.mimeType ?? null);
 
     const plan = buildCameraEncodingPlan({
@@ -1150,33 +1223,6 @@ class VoiceService {
       encodings: plan.encodings,
       effectiveBitrate: bitrate,
     };
-  }
-
-  /**
-   * Screen counterpart of `pickCameraLayeringCodec`. Walks the same SVC-first ladder
-   * and returns the first codec whose casting kind is eligible under the SCREEN
-   * eligibility set — where simulcast is additionally gated on the media-plane's
-   * `screen-layering-gate` (`this.screenLayeringEnabled`). So when Support SVC is off
-   * and the gate wants simulcast, the ladder skips the SVC-only AV1/VP9 entries and
-   * lands on H264/VP8 → real simulcast, rather than collapsing to a single stream. User
-   * preference participates only through `fallbackCodec` (the plain-cascade pick).
-   */
-  private pickScreenLayeringCodec(
-    fallbackCodec?: mediasoupTypes.RtpCodecCapability
-  ): mediasoupTypes.RtpCodecCapability | undefined {
-    const vs = useVideoSettingsStore.getState();
-    const eligibility = {
-      svc: vs.supportSvc,
-      simulcast: vs.supportSimulcast && this.screenLayeringEnabled,
-    };
-    const candidates = ['video/AV1', 'video/VP9', 'video/H264:640034', 'video/H264', 'video/VP8'];
-    for (const key of candidates) {
-      if (!isCastingEligible(castingKindForCodec(key.split(':')[0]), eligibility)) continue;
-      if (!this.isInCodecFloor(key)) continue;
-      const codec = this.findSendCodec(key);
-      if (codec) return codec;
-    }
-    return fallbackCodec;
   }
 
   /**
@@ -1323,7 +1369,7 @@ class VoiceService {
       this.liveUpdateScreenBitrate(screenProducer, state.screenShareBitrate);
     }
     // SVC/Simulcast casting toggles: a supportSvc change always affects the screen
-    // plan (AV1/VP9 SVC eligibility). Post-#1924, a supportSimulcast change ALSO
+    // plan (AV1/VP9 SVC mode). Post-#1924, a supportSimulcast change ALSO
     // affects it — but only once the server screen-layering gate is enabled
     // (this.screenLayeringEnabled), since simulcast screen is gated. When the gate
     // is off a supportSimulcast flip is a no-op for screen and must NOT trigger a
@@ -1620,22 +1666,18 @@ class VoiceService {
    */
   private getProducerCodecMimeType(source: string): string | null {
     const producer = this.producers.get(source);
-    if (!producer?.rtpSender) return null;
-    const params = producer.rtpSender.getParameters();
-    const codec = params.codecs?.[0];
-    if (!codec) return null;
-    const mime = codec.mimeType.toLowerCase();
-    if (codec.sdpFmtpLine) {
-      if (mime === 'video/h264') {
-        const m = /profile-level-id=([0-9a-f]{6})/i.exec(codec.sdpFmtpLine);
-        if (m) return `${mime}:${m[1].toLowerCase()}`;
-      }
-      if (mime === 'video/vp9') {
-        const m = codec.sdpFmtpLine.match(/profile-id=(\d+)/);
-        if (m && m[1] !== '0') return `${mime}:${m[1]}`;
-      }
-    }
-    return mime;
+    if (!producer) return null;
+    const isPrimaryCodec = (codec: { mimeType: string }) =>
+      !/(\/rtx|\/red|\/ulpfec|\/flexfec|\/cn|\/telephone-event)$/i.test(codec.mimeType);
+
+    // mediasoup's Producer RTP parameters describe the codec actually published.
+    // Prefer them over RTCRtpSender.getParameters(), whose codec list is a
+    // preference/capability sequence rather than an active-codec observation.
+    const producerCodec = producer.rtpParameters?.codecs?.find(isPrimaryCodec);
+    if (producerCodec) return this.codecKeyFromParameters(producerCodec);
+
+    const senderCodec = producer.rtpSender?.getParameters().codecs?.find(isPrimaryCodec);
+    return senderCodec ? this.codecKeyFromParameters(senderCodec) : null;
   }
 
   /**
@@ -1678,15 +1720,15 @@ class VoiceService {
     this.producers.delete('camera');
     this.socket?.emit('close-producer', { producerId: producer.id });
 
-    // Pick new codec respecting the floor
-    const { codec, encodings } = this.pickCameraCodec();
-    const cameraBitrate = this.cameraStartBitrate(encodings);
-
+    let codec: mediasoupTypes.RtpCodecCapability;
     let newProducer: mediasoupTypes.Producer;
     try {
+      const selection = this.pickCameraCodec();
+      codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
+      const cameraBitrate = this.cameraStartBitrate(selection.encodings);
       newProducer = await transport.produce({
         track,
-        encodings,
+        encodings: selection.encodings,
         codec,
         codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(cameraBitrate) },
         stopTracks: false,
@@ -1728,16 +1770,20 @@ class VoiceService {
         this.localCameraStream = null;
       }
       const s = useVoiceStore.getState();
+      s.setActiveCameraCodec(null);
       s.setVideoOn(false);
       const uid = useUserStore.getState().user?.id;
       if (uid) s.updateParticipant(uid, { videoStream: undefined, isVideoOn: false });
     });
 
-    useVoiceStore.getState().setActiveCameraCodec(codec?.mimeType?.toLowerCase() ?? null);
-    const hwTag = codec?.mimeType && this.isHwAccelerated(codec.mimeType) ? 'HW' : 'SW';
-    console.debug(
-      `[codec-floor] Fast re-produced camera with ${codec?.mimeType ?? 'default'} (${hwTag})`
-    );
+    useVoiceStore
+      .getState()
+      .setActiveCameraCodec(
+        this.getProducerCodecMimeType('camera') ?? this.codecKeyFromParameters(codec)
+      );
+    const selectedCodecKey = this.codecKeyFromParameters(codec);
+    const hwTag = this.isHwAccelerated(selectedCodecKey) ? 'HW' : 'SW';
+    console.debug(`[codec-floor] Fast re-produced camera with ${selectedCodecKey} (${hwTag})`);
   }
 
   /**
@@ -1867,6 +1913,7 @@ class VoiceService {
         this.localScreenStream = null;
       }
       const s = useVoiceStore.getState();
+      s.setActiveScreenCodec(null);
       s.setScreenSharing(false);
       const uid = useUserStore.getState().user?.id;
       if (uid) s.updateParticipant(uid, { screenStream: undefined, isScreenSharing: false });
@@ -1880,11 +1927,14 @@ class VoiceService {
       return;
     }
 
-    useVoiceStore.getState().setActiveScreenCodec(codec?.mimeType?.toLowerCase() ?? null);
-    const hwTag = codec?.mimeType && this.isHwAccelerated(codec.mimeType) ? 'HW' : 'SW';
-    console.debug(
-      `[codec-floor] Fast re-produced screen with ${codec?.mimeType ?? 'default'} (${hwTag})`
-    );
+    useVoiceStore
+      .getState()
+      .setActiveScreenCodec(
+        this.getProducerCodecMimeType('screen') ?? this.codecKeyFromParameters(codec)
+      );
+    const selectedCodecKey = this.codecKeyFromParameters(codec);
+    const hwTag = this.isHwAccelerated(selectedCodecKey) ? 'HW' : 'SW';
+    console.debug(`[codec-floor] Fast re-produced screen with ${selectedCodecKey} (${hwTag})`);
   }
 
   private async produceScreenReplacement(
@@ -1895,17 +1945,20 @@ class VoiceService {
     socket: Socket | null
   ): Promise<{
     producer: mediasoupTypes.Producer;
-    codec?: mediasoupTypes.RtpCodecCapability;
+    codec: mediasoupTypes.RtpCodecCapability;
   } | null> {
-    const { codec, encodings, effectiveBitrate: screenBitrate } = this.pickScreenCodec();
-
+    let codec: mediasoupTypes.RtpCodecCapability;
     let producer: mediasoupTypes.Producer;
     try {
+      const selection = this.pickScreenCodec();
+      codec = this.requireSelectedVideoCodec(selection.codec, 'screen');
       producer = await transport.produce({
         track,
-        encodings,
+        encodings: selection.encodings,
         codec,
-        codecOptions: { videoGoogleStartBitrate: this.computeStartBitrate(screenBitrate) },
+        codecOptions: {
+          videoGoogleStartBitrate: this.computeStartBitrate(selection.effectiveBitrate),
+        },
         stopTracks: false,
         appData: { source: 'screen' },
       });
@@ -2132,8 +2185,12 @@ class VoiceService {
     if (!currentMime) return;
 
     const bestPick = source === 'camera' ? this.pickCameraCodec() : this.pickScreenCodec();
-    const bestMime = bestPick.codec?.mimeType?.toLowerCase() ?? null;
-    if (!bestMime || bestMime === currentMime) return;
+    if (!bestPick.codec) {
+      await this.closeProducer(source);
+      return;
+    }
+    const bestMime = this.codecKeyFromParameters(bestPick.codec);
+    if (this.codecKeysEquivalent(bestMime, currentMime)) return;
 
     // #2187 item 2: a B=false-driven re-selection only switches toward a genuinely
     // HW-accelerated codec — prevents SW→SW churn/oscillation.
@@ -2446,7 +2503,7 @@ class VoiceService {
 
     if (callState.kind !== 'idle') {
       if (!isMatchingRingJoin) throw new Error('Another voice call is already in progress');
-      return undefined;
+      if (callState.kind === 'joining') return undefined;
     }
 
     // Claim global ownership synchronously so a second click or a racing
@@ -2454,7 +2511,10 @@ class VoiceService {
     const joiningState: Extract<CallState, { kind: 'joining' }> = {
       kind: 'joining',
       conversationId: channelId,
-      ringId: '',
+      ringId:
+        callState.kind === 'outgoing-ringing' || callState.kind === 'incoming-ringing'
+          ? callState.ringId
+          : '',
     };
     store.setCallState(joiningState);
     return joiningState;
@@ -2497,15 +2557,19 @@ class VoiceService {
 
   /** Authorize and join a voice channel */
   async joinChannel(channelId: string, joinType: 'channel' | 'dm' = 'channel'): Promise<void> {
-    const store = useVoiceStore.getState();
-    const directDMJoiningState = this.claimDMJoinOwnership(channelId, joinType, store);
-    const callStateToPreserve = this.dmJoiningStateToPreserve(channelId, joinType);
-    const ringId = joinType === 'dm' ? this.currentDMRingID(channelId) : undefined;
-    await this.leaveActiveChannelBeforeJoin(store, callStateToPreserve);
-
-    store.setConnectionState('connecting');
-
+    if (this.joinInFlight) throw new Error('Another voice call is already in progress');
+    this.joinInFlight = true;
+    let shouldRecoverJoinFailure = false;
     try {
+      const store = useVoiceStore.getState();
+      const directDMJoiningState = this.claimDMJoinOwnership(channelId, joinType, store);
+      shouldRecoverJoinFailure = true;
+      const callStateToPreserve = this.dmJoiningStateToPreserve(channelId, joinType);
+      const ringId = joinType === 'dm' ? this.currentDMRingID(channelId) : undefined;
+      await this.leaveActiveChannelBeforeJoin(store, callStateToPreserve);
+
+      store.setConnectionState('connecting');
+
       // Step 1: Authorize via control plane (uses apiFetch for automatic token refresh)
       const joinData = await this.authorizeVoiceJoin(channelId, joinType, ringId);
 
@@ -2607,8 +2671,10 @@ class VoiceService {
       // Profiles decode performance and adjusts SVC layers to avoid queue buildup
       this.startDecoderBudgetProfiling();
     } catch (err) {
-      await this.handleJoinFailure(err);
+      if (shouldRecoverJoinFailure) await this.handleJoinFailure(err);
       throw err;
+    } finally {
+      this.joinInFlight = false;
     }
   }
 
@@ -3357,7 +3423,9 @@ class VoiceService {
       this.localCameraStream = acquiredStream;
       const track = acquiredStream.getVideoTracks()[0];
 
-      const { codec, encodings } = this.pickCameraCodec();
+      const selection = this.pickCameraCodec();
+      const codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
+      const { encodings } = selection;
       const cameraBitrate = this.cameraStartBitrate(encodings);
 
       const producer = await transport.produce({
@@ -3418,7 +3486,12 @@ class VoiceService {
       this.applyEncryptTransform(producer);
     }
 
-    useVoiceStore.getState().setActiveCameraCodec(codec?.mimeType?.toLowerCase() ?? null);
+    useVoiceStore
+      .getState()
+      .setActiveCameraCodec(
+        this.getProducerCodecMimeType('camera') ??
+          (codec ? this.codecKeyFromParameters(codec) : null)
+      );
 
     const store = useVoiceStore.getState();
     store.setVideoOn(true);
@@ -3442,6 +3515,7 @@ class VoiceService {
       this.localCameraStream = null;
     }
     const store = useVoiceStore.getState();
+    store.setActiveCameraCodec(null);
     store.setVideoOn(false);
     const localUserId = useUserStore.getState().user?.id;
     if (localUserId) {
@@ -3646,7 +3720,9 @@ class VoiceService {
     this.localScreenStream = stream;
 
     try {
-      const { codec, encodings, effectiveBitrate: screenBitrate } = this.pickScreenCodec();
+      const selection = this.pickScreenCodec();
+      const codec = this.requireSelectedVideoCodec(selection.codec, 'screen');
+      const { encodings, effectiveBitrate: screenBitrate } = selection;
 
       const producer = await this.sendTransport.produce({
         track,
@@ -3669,7 +3745,11 @@ class VoiceService {
         this.applyEncryptTransform(producer);
       }
 
-      useVoiceStore.getState().setActiveScreenCodec(codec?.mimeType?.toLowerCase() ?? null);
+      useVoiceStore
+        .getState()
+        .setActiveScreenCodec(
+          this.getProducerCodecMimeType('screen') ?? this.codecKeyFromParameters(codec)
+        );
 
       updateStoreForScreenShare(producer.id, this.localScreenStream);
 
@@ -3686,13 +3766,13 @@ class VoiceService {
           this.localScreenStream = null;
         }
         const s = useVoiceStore.getState();
+        s.setActiveScreenCodec(null);
         s.setScreenSharing(false);
         const uid = useUserStore.getState().user?.id;
         if (uid) s.updateParticipant(uid, { screenStream: undefined, isScreenSharing: false });
       });
     } catch (err) {
-      for (const t of stream.getTracks()) t.stop();
-      this.localScreenStream = null;
+      await this.cleanupScreenState();
       throw err;
     }
   }
