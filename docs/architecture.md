@@ -508,7 +508,7 @@ login-enabled role must be revoked successfully or startup fails closed.
 
 **Port**: 3000 · **RTC ports**: 40000–40099/UDP (dev), 40000–41999/UDP (production) · Source: `services/media-plane/`
 
-**Tech Stack:** Node.js 24, mediasoup 3.20, Socket.IO 4.8, NATS 2.x, `redis` (node-redis) client 6.x connecting to the shared Redis 7 server. The builder stage uses a custom GHCR base image (`ghcr.io/concord-voice/node-buildtools`, digest-pinned) that pre-bakes the mediasoup native-compile toolchain.
+**Tech Stack:** Node.js 24, mediasoup 3.21, Socket.IO 4.8, NATS 2.x, `redis` (node-redis) client 6.x connecting to the shared Redis 7 server. The builder stage uses a custom GHCR base image (`ghcr.io/concord-voice/node-buildtools`, digest-pinned) that pre-bakes the mediasoup native-compile toolchain.
 
 **Responsibilities:** WebRTC media routing (SFU — no mixing/transcoding); Opus audio with 7 quality tiers; per-room router management; transport/producer/consumer lifecycle; server-mute/deafen enforcement; NATS event publishing. The SFU forwards opaque, E2EE-encrypted RTP frames (see [Media E2EE](#media-e2ee-frame-encryption)).
 
@@ -851,7 +851,7 @@ Concord/
 | -------------- | --------------------------------------- | ------------------------------------------------------------------- |
 | Desktop client | Electron 42 + React 19 + TS 6           | Mature WebRTC, fast iteration, OS keychain access                   |
 | Control plane  | Go 1.26 + Gin                           | Fast, concurrent, single-binary deploy                              |
-| Media plane    | Node.js 24 + mediasoup 3.20             | Best-in-class WebRTC SFU                                            |
+| Media plane    | Node.js 24 + mediasoup 3.21             | Best-in-class WebRTC SFU                                            |
 | Database       | PostgreSQL 16                           | Relational + JSONB, mature, declarative partitioning available      |
 | Cache          | Redis 7 (server; node-redis 6.x client) | Sessions, presence, RBAC cache, rate limiting, voice room state     |
 | Messaging      | NATS 2.x                                | Lightweight inter-service voice events                              |
