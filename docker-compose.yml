@@ -111,7 +111,8 @@ services:
 
   # MinIO Object Storage (S3-compatible)
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: ghcr.io/concord-voice/minio:RELEASE.2025-10-15T17-29-55Z@sha256:08e1ba1a7396036f40c57fed2dfabe687ca722d233576484a817a8908bee66c5
+    pull_policy: missing
     container_name: concordvoice-minio
     command: server /data --console-address ":9001"
     environment:
