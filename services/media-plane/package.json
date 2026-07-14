@@ -44,7 +44,7 @@
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.62.1",
-    "vitest": "^4.1.9"
+    "vitest": "^4.1.10"
   },
   "//overrides_rationale": "node-domexception@1.0.0 is deprecated upstream and has no replacement version. fetch-blob@3.x and 4.x both still declare it as a hard dep. We override to a local stub that re-exports globalThis.DOMException (native in Node 18+). Remove this override + the stubs/ directory once mediasoup ships a release pulling node-fetch@^4 stable, OR fetch-blob ships a version that drops the polyfill dep entirely.",
   "//overrides_security": "ws@^8.21.0 closes GHSA-96hv-2xvq-fx4p (memory-exhaustion DoS; transitive via socket.io->engine.io->ws, vulnerable <8.21.0). @babel/core@^7.29.7 closes GHSA-4x5r-pxfx-6jf8 (arbitrary file read via sourceMappingURL; transitive via @vitest/coverage-istanbul). Both are forced because the intermediates pin older ranges. Drop each override once the parent pulls a patched version natively.",
