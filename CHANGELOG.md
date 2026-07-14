@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.27] — 2026-07-14
+
+### Security
+
+- **Safer desktop update checks** ([#2247](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2247)) — updated the parser used by Concord Voice's desktop updater to prevent specially crafted recovery-feed YAML from consuming excessive CPU during update checks. Routine security maintenance; no action needed.
+
 ## [0.2.26] — 2026-07-12
 
 ### Fixed

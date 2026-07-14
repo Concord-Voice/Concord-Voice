@@ -1,7 +1,7 @@
 {
   "name": "@concordvoice/desktop",
   "productName": "Concord Voice",
-  "version": "0.2.26",
+  "version": "0.2.27",
   "description": "Concord Voice Desktop Client - Privacy-first voice communication",
   "main": "dist/main/main.js",
   "author": "Concord Voice Team",
