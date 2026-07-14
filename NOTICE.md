@@ -1,6 +1,6 @@
 # NOTICE — Third-Party Software Used by Concord Voice
 
-**Generated:** 2026-05-31
+**Generated:** 2026-07-14
 **MinIO distribution addendum updated:** 2026-07-12
 **Concord Voice License:** [Concord Voice Source License 1.0 (CVSL 1.0)](./LICENSE) → AGPL-3.0-or-later on 2030-02-15
 **Audit reference:** [docs/legal/dependency-license-audit.md](docs/legal/dependency-license-audit.md)
@@ -12,10 +12,10 @@ contributions of these projects to the Concord Voice platform.
 
 ## Summary
 
-Concord Voice distributes 391 third-party software components across its three
+Concord Voice distributes 395 third-party software components across its three
 CVSL application artifact families:
 
-- **55** Go modules in the control-plane runtime binary
+- **59** Go modules in the control-plane runtime binary
 - **187** npm packages in the desktop client production bundle (plus Electron and its bundled components)
 - **149** npm packages in the media-plane production bundle
 
@@ -41,7 +41,7 @@ No GPL, AGPL, SSPL, BUSL, Elastic License, Commons Clause, or other strong
 copyleft / non-commercial dependency is linked into or bundled with the three
 CVSL application artifact families counted above. Concord's separately
 distributed MinIO server image is an AGPL-3.0-or-later upstream program and is
-recorded separately below; it is not part of the 391-component count.
+recorded separately below; it is not part of the 395-component count.
 
 ## License Texts
 
@@ -122,16 +122,18 @@ The following Go modules are linked into the control-plane runtime binary
 
 | Module | Version | License |
 |---|---|---|
-| github.com/boombuler/barcode | v1.0.1-0.20190219062509-6c824513bacc | MIT |
+| github.com/boombuler/barcode | v1.1.0 | MIT |
 | github.com/cespare/xxhash/v2 | v2.3.0 | MIT |
+| github.com/coreos/go-oidc/v3 | v3.20.0 | Apache-2.0 |
 | github.com/dustin/go-humanize | v1.0.1 | MIT |
 | github.com/fxamacker/cbor/v2 | v2.9.2 | MIT |
-| github.com/gabriel-vasile/mimetype | v1.4.12 | MIT |
-| github.com/gin-contrib/sse | v1.1.0 | MIT |
+| github.com/gabriel-vasile/mimetype | v1.4.13 | MIT |
+| github.com/gin-contrib/sse | v1.1.1 | MIT |
 | github.com/gin-gonic/gin | v1.12.0 | MIT |
+| github.com/go-jose/go-jose/v4 | v4.1.4 | Apache-2.0 |
 | github.com/go-playground/locales | v0.14.1 | MIT |
 | github.com/go-playground/universal-translator | v0.18.1 | MIT |
-| github.com/go-playground/validator/v10 | v10.30.1 | MIT |
+| github.com/go-playground/validator/v10 | v10.30.3 | MIT |
 | github.com/go-viper/mapstructure/v2 | v2.5.0 | MIT |
 | github.com/go-webauthn/webauthn | v0.17.4 | BSD-3-Clause |
 | github.com/go-webauthn/x | v0.2.6 | BSD-3-Clause |
@@ -142,24 +144,24 @@ The following Go modules are linked into the control-plane runtime binary
 | github.com/google/uuid | v1.6.0 | BSD-3-Clause |
 | github.com/gorilla/websocket | v1.5.3 | BSD-2-Clause |
 | github.com/joho/godotenv | v1.5.1 | MIT |
-| github.com/klauspost/compress | v1.18.6 | MIT |
-| github.com/klauspost/cpuid/v2 | v2.3.0 | MIT |
+| github.com/klauspost/compress | v1.19.0 | MIT |
+| github.com/klauspost/cpuid/v2 | v2.4.0 | MIT |
 | github.com/klauspost/crc32 | v1.3.0 | BSD-3-Clause |
 | github.com/leodido/go-urn | v1.4.0 | MIT |
 | github.com/lib/pq | v1.12.3 | MIT |
-| github.com/mattn/go-isatty | v0.0.20 | MIT |
+| github.com/mattn/go-isatty | v0.0.22 | MIT |
 | github.com/minio/crc64nvme | v1.1.1 | Apache-2.0 |
 | github.com/minio/md5-simd | v1.1.2 | Apache-2.0 |
-| github.com/minio/minio-go/v7 | v7.2.0 | Apache-2.0 |
+| github.com/minio/minio-go/v7 | v7.2.1 | Apache-2.0 |
 | github.com/nats-io/nats.go | v1.52.0 | Apache-2.0 |
-| github.com/nats-io/nkeys | v0.4.15 | Apache-2.0 |
+| github.com/nats-io/nkeys | v0.4.16 | Apache-2.0 |
 | github.com/nats-io/nuid | v1.0.1 | Apache-2.0 |
-| github.com/pelletier/go-toml/v2 | v2.3.1 | MIT |
+| github.com/pelletier/go-toml/v2 | v2.4.3 | MIT |
 | github.com/philhofer/fwd | v1.2.0 | MIT |
 | github.com/pquerna/otp | v1.5.0 | Apache-2.0 |
 | github.com/quic-go/qpack | v0.6.0 | MIT |
-| github.com/quic-go/quic-go | v0.59.0 | MIT |
-| github.com/redis/go-redis/v9 | v9.19.0 | BSD-2-Clause |
+| github.com/quic-go/quic-go | v0.60.0 | MIT |
+| github.com/redis/go-redis/v9 | v9.21.0 | BSD-2-Clause |
 | github.com/rs/xid | v1.6.0 | MIT |
 | github.com/tinylib/msgp | v1.6.4 | MIT |
 | github.com/ugorji/go/codec | v1.3.1 | MIT |
@@ -167,16 +169,18 @@ The following Go modules are linked into the control-plane runtime binary
 | github.com/vmihailenco/tagparser/v2 | v2.0.0 | BSD-2-Clause |
 | github.com/x448/float16 | v0.8.4 | MIT |
 | github.com/zeebo/xxh3 | v1.1.0 | BSD-2-Clause |
-| go.mongodb.org/mongo-driver/v2 | v2.5.0 | Apache-2.0 |
+| go.mongodb.org/mongo-driver/v2 | v2.8.0 | Apache-2.0 |
 | go.uber.org/atomic | v1.11.0 | MIT |
 | go.yaml.in/yaml/v3 | v3.0.4 | MIT |
-| golang.org/x/crypto | v0.52.0 | BSD-3-Clause |
-| golang.org/x/image | v0.41.0 | BSD-3-Clause |
-| golang.org/x/net | v0.54.0 | BSD-3-Clause |
-| golang.org/x/sys | v0.45.0 | BSD-3-Clause |
-| golang.org/x/text | v0.37.0 | BSD-3-Clause |
+| golang.org/x/crypto | v0.54.0 | BSD-3-Clause |
+| golang.org/x/image | v0.44.0 | BSD-3-Clause |
+| golang.org/x/net | v0.57.0 | BSD-3-Clause |
+| golang.org/x/oauth2 | v0.36.0 | BSD-3-Clause |
+| golang.org/x/sync | v0.22.0 | BSD-3-Clause |
+| golang.org/x/sys | v0.47.0 | BSD-3-Clause |
+| golang.org/x/text | v0.40.0 | BSD-3-Clause |
 | google.golang.org/protobuf | v1.36.11 | BSD-3-Clause |
-| gopkg.in/ini.v1 | v1.67.2 | Apache-2.0 |
+| gopkg.in/ini.v1 | v1.67.3 | Apache-2.0 |
 
 ---
 
