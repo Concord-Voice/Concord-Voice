@@ -2083,6 +2083,44 @@ describe('VoiceService', () => {
         delete svc.fastReproduceCamera;
       }
     });
+
+    it('does not let a stale camera-layering drain release a successor session latch', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      let releaseStale: (() => void) | undefined;
+      let releaseCurrent: (() => void) | undefined;
+      const stale = new Promise<void>((resolve) => {
+        releaseStale = resolve;
+      });
+      const current = new Promise<void>((resolve) => {
+        releaseCurrent = resolve;
+      });
+      const fastReproduceCamera = vi.fn().mockReturnValueOnce(stale).mockReturnValueOnce(current);
+      svc.fastReproduceCamera = fastReproduceCamera;
+
+      try {
+        svc.scheduleCameraLayeringReproduce();
+        expect(svc.cameraLayeringReproduceInFlight).toBe(true);
+
+        svc.invalidateVideoReproduces();
+        svc.resetRemoteVideoLayeringState();
+        svc.videoReproduceSessionActive = true;
+        svc.scheduleCameraLayeringReproduce();
+        expect(fastReproduceCamera).toHaveBeenCalledTimes(2);
+
+        releaseStale?.();
+        await stale;
+        await Promise.resolve();
+        expect(svc.cameraLayeringReproduceInFlight).toBe(true);
+
+        releaseCurrent?.();
+        await current;
+        await Promise.resolve();
+        expect(svc.cameraLayeringReproduceInFlight).toBe(false);
+      } finally {
+        delete svc.fastReproduceCamera;
+      }
+    });
   });
 
   // ===== Connection state =====
@@ -2464,28 +2502,28 @@ describe('VoiceService', () => {
       // Override on the singleton (delete restores the prototype) — the file's convention.
       // vi.spyOn would leak the mock across tests since beforeEach only clears, not restores.
       let called = 0;
-      svc.fastReproduceCamera = async () => {
+      svc.fastReproduceCameraQueued = async () => {
         called++;
       };
       try {
         await svc.reProduceIfBetterCodec('camera', { requireHwImprovement: true });
         expect(called).toBe(0);
       } finally {
-        delete svc.fastReproduceCamera;
+        delete svc.fastReproduceCameraQueued;
       }
     });
 
     it('switches (no requireHwImprovement) when a different codec is picked', async () => {
       const svc = await setupCameraOnCodec('video/AV1');
       let called = 0;
-      svc.fastReproduceCamera = async () => {
+      svc.fastReproduceCameraQueued = async () => {
         called++;
       };
       try {
         await svc.reProduceIfBetterCodec('camera');
         expect(called).toBe(1);
       } finally {
-        delete svc.fastReproduceCamera;
+        delete svc.fastReproduceCameraQueued;
       }
     });
   });
@@ -2525,7 +2563,7 @@ describe('VoiceService', () => {
       };
       try {
         await svc.learnWebrtcHwSignal();
-        expect(calls).toEqual([['camera', { requireHwImprovement: true }]]);
+        expect(calls).toEqual([['camera', { requireHwImprovement: true }, expect.any(Number)]]);
       } finally {
         delete svc.reProduceIfBetterCodec;
       }
@@ -2564,8 +2602,8 @@ describe('VoiceService', () => {
       try {
         await svc.learnWebrtcHwSignal();
         expect(calls).toEqual([
-          ['camera', { requireHwImprovement: true }],
-          ['screen', { requireHwImprovement: true }],
+          ['camera', { requireHwImprovement: true }, expect.any(Number)],
+          ['screen', { requireHwImprovement: true }, expect.any(Number)],
         ]);
       } finally {
         delete svc.reProduceIfBetterCodec;
@@ -2591,6 +2629,722 @@ describe('VoiceService', () => {
         delete svc.reProduceIfBetterCodec;
         warn.mockRestore();
       }
+    });
+
+    it.each([
+      {
+        source: 'camera' as const,
+        active: () => useVoiceStore.getState().isVideoOn,
+        setActive: () => useVoiceStore.getState().setVideoOn(true),
+        streamField: 'localCameraStream' as const,
+      },
+      {
+        source: 'screen' as const,
+        active: () => useVoiceStore.getState().isScreenSharing,
+        setActive: () => useVoiceStore.getState().setScreenSharing(true),
+        streamField: 'localScreenStream' as const,
+      },
+    ])(
+      'keeps $source UI and capture aligned with producer state when automatic B-signal re-selection fails (#2187)',
+      async ({ source, active, setActive, streamField }) => {
+        const { sendTransport } = await joinVoiceChannel();
+        const svc = voiceService as any;
+        const oldProducer = createMockProducer(`prod-${source}`, source);
+        oldProducer.rtpSender.getParameters = vi
+          .fn()
+          .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+        oldProducer.getStats = vi.fn().mockResolvedValue(bFalseStats('video/VP8'));
+
+        svc.cameraLayeringEnabled = false;
+        svc.producers.set(source, oldProducer);
+        svc[streamField] = createMockMediaStream([{ kind: 'video', id: `${source}-track` }]);
+        setActive();
+        useVideoSettingsStore.setState({
+          hardwareAcceleration: true,
+          preferredVideoCodec: null,
+          webrtcHwByMime: { 'video/av1': true },
+        });
+
+        sendTransport.produce.mockClear();
+        sendTransport.produce.mockRejectedValueOnce(new Error('replacement failed'));
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        try {
+          await svc.learnWebrtcHwSignal();
+          await vi.waitFor(() => {
+            expect(warn).toHaveBeenCalledWith(
+              '[codec-floor] HW re-selection failed:',
+              'replacement failed'
+            );
+          });
+
+          const mappedProducer = svc.producers.get(source);
+          const hasLiveProducer =
+            mappedProducer !== undefined && vi.mocked(mappedProducer.close).mock.calls.length === 0;
+          expect([active(), svc[streamField] !== null]).toEqual([hasLiveProducer, hasLiveProducer]);
+          expect(useVoiceStore.getState().videoSlotError).toContain(
+            source === 'camera' ? 'Camera stopped' : 'Screen share stopped'
+          );
+          await expect(svc.videoReproduceQueues[source]).resolves.toBeUndefined();
+        } finally {
+          warn.mockRestore();
+        }
+      }
+    );
+
+    it('does not leave a live orphan when codec re-selections overlap (#2187)', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldProducer = createMockProducer('prod-camera-old', 'camera');
+      oldProducer.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      svc.cameraLayeringEnabled = false;
+      svc.producers.set('camera', oldProducer);
+      svc.localCameraStream = createMockMediaStream([{ kind: 'video', id: 'camera-track' }]);
+      useVoiceStore.getState().setVideoOn(true);
+      useVideoSettingsStore.setState({
+        hardwareAcceleration: true,
+        preferredVideoCodec: null,
+        webrtcHwByMime: { 'video/vp8': false, 'video/av1': true },
+      });
+
+      let releaseDrain!: () => void;
+      const drainGate = new Promise<void>((resolve) => {
+        releaseDrain = resolve;
+      });
+      svc.drainSendTransportQueue = vi.fn(async () => drainGate);
+
+      const replacements = [
+        createMockProducer('prod-camera-replacement-a', 'camera'),
+        createMockProducer('prod-camera-replacement-b', 'camera'),
+      ];
+      const created: Array<(typeof replacements)[number]> = [];
+      sendTransport.produce.mockClear();
+      sendTransport.produce.mockImplementation(async () => {
+        const replacement = replacements[created.length];
+        created.push(replacement);
+        return replacement;
+      });
+
+      try {
+        const first = svc.reProduceIfBetterCodec('camera', { requireHwImprovement: true });
+        const second = svc.reProduceIfBetterCodec('camera', { requireHwImprovement: true });
+        releaseDrain();
+        await Promise.all([first, second]);
+
+        const activeProducer = svc.producers.get('camera');
+        const liveOrphanIds = created
+          .filter(
+            (producer) =>
+              producer !== activeProducer && vi.mocked(producer.close).mock.calls.length === 0
+          )
+          .map((producer) => producer.id);
+        expect(liveOrphanIds).toEqual([]);
+      } finally {
+        releaseDrain();
+        delete svc.drainSendTransportQueue;
+      }
+    });
+
+    it('serializes live camera re-produce with a codec-driven swap (#2187)', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldProducer = createMockProducer('prod-camera-old', 'camera');
+      oldProducer.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      const oldStream = createMockMediaStream([{ kind: 'video', id: 'camera-track-old' }]);
+      const freshStream = createMockMediaStream([{ kind: 'video', id: 'camera-track-fresh' }]);
+      svc.cameraLayeringEnabled = false;
+      svc.producers.set('camera', oldProducer);
+      svc.localCameraStream = oldStream;
+      useVoiceStore.getState().setVideoOn(true);
+      useVideoSettingsStore.setState({
+        hardwareAcceleration: true,
+        preferredVideoCodec: null,
+        webrtcHwByMime: { 'video/vp8': false, 'video/av1': true },
+      });
+
+      let releaseDrain!: () => void;
+      const drainGate = new Promise<void>((resolve) => {
+        releaseDrain = resolve;
+      });
+      svc.drainSendTransportQueue = vi.fn(async () => drainGate);
+      mockGetUserMedia.mockResolvedValue(freshStream);
+
+      const replacements = [
+        createMockProducer('prod-camera-fast', 'camera'),
+        createMockProducer('prod-camera-live', 'camera'),
+      ];
+      const created: Array<(typeof replacements)[number]> = [];
+      sendTransport.produce.mockClear();
+      sendTransport.produce.mockImplementation(async () => {
+        const replacement = replacements[created.length];
+        created.push(replacement);
+        return replacement;
+      });
+
+      try {
+        const fast = svc.reProduceIfBetterCodec('camera', { requireHwImprovement: true });
+        await vi.waitFor(() => expect(svc.drainSendTransportQueue).toHaveBeenCalledTimes(1));
+        const live = svc.liveReproduceCamera();
+        releaseDrain();
+        await Promise.all([fast, live]);
+
+        const activeProducer = svc.producers.get('camera');
+        expect(
+          created
+            .filter(
+              (producer) =>
+                producer !== activeProducer && vi.mocked(producer.close).mock.calls.length === 0
+            )
+            .map((producer) => producer.id)
+        ).toEqual([]);
+        expect(svc.localCameraStream).toBe(freshStream);
+      } finally {
+        releaseDrain();
+        delete svc.drainSendTransportQueue;
+      }
+    });
+
+    it('serializes camera track replacement with codec re-selection (#2187)', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldProducer = createMockProducer('prod-camera-track-replace', 'camera');
+      oldProducer.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      const oldStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-before-replace' },
+      ]);
+      const newStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-after-replace' },
+      ]);
+      const replacementProducer = createMockProducer('prod-camera-after-reselect', 'camera');
+      svc.cameraLayeringEnabled = false;
+      svc.producers.set('camera', oldProducer);
+      svc.localCameraStream = oldStream;
+      useVideoSettingsStore.setState({
+        hardwareAcceleration: true,
+        preferredVideoCodec: null,
+        webrtcHwByMime: { 'video/vp8': false, 'video/av1': true },
+      });
+
+      let releaseAcquire!: (stream: ReturnType<typeof createMockMediaStream>) => void;
+      mockGetUserMedia.mockClear();
+      mockGetUserMedia.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            releaseAcquire = resolve;
+          })
+      );
+      sendTransport.produce.mockClear();
+      sendTransport.produce.mockResolvedValue(replacementProducer);
+
+      const replaceTrack = svc.liveReplaceCameraTrack();
+      await vi.waitFor(() => expect(mockGetUserMedia).toHaveBeenCalledTimes(1));
+      const reselect = svc.reProduceIfBetterCodec('camera', { requireHwImprovement: true });
+      await Promise.resolve();
+      expect(oldProducer.close).not.toHaveBeenCalled();
+
+      releaseAcquire(newStream);
+      await Promise.all([replaceTrack, reselect]);
+
+      expect(oldProducer.replaceTrack).toHaveBeenCalledWith({
+        track: newStream.getVideoTracks()[0],
+      });
+      expect(oldProducer.close).toHaveBeenCalledTimes(1);
+      expect(oldStream.getTracks()[0].stop).toHaveBeenCalled();
+      expect(svc.localCameraStream).toBe(newStream);
+      expect(svc.producers.get('camera')).toBe(replacementProducer);
+    });
+
+    it('discards queued codec work when the media session is rebuilt (#2187)', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldProducer = createMockProducer('prod-camera-old-session', 'camera');
+      oldProducer.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      svc.producers.set('camera', oldProducer);
+      svc.localCameraStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-old-session' },
+      ]);
+
+      let releaseQueue!: () => void;
+      svc.videoReproduceQueues.camera = new Promise<void>((resolve) => {
+        releaseQueue = resolve;
+      });
+      const staleWork = svc.reProduceIfBetterCodec('camera', { requireHwImprovement: true });
+
+      svc.cleanupMediaAndTransports();
+
+      const successorTransport = makeSendTransport();
+      const successorProducer = createMockProducer('prod-camera-successor', 'camera');
+      successorProducer.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      const successorStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-successor' },
+      ]);
+      successorTransport.produce.mockResolvedValue(
+        createMockProducer('prod-camera-unexpected-replacement', 'camera')
+      );
+      svc.sendTransport = successorTransport;
+      svc.videoReproduceSessionActive = true;
+      svc.producers.set('camera', successorProducer);
+      svc.localCameraStream = successorStream;
+      useVoiceStore.getState().setVideoOn(true);
+      useVideoSettingsStore.setState({
+        hardwareAcceleration: true,
+        preferredVideoCodec: null,
+        webrtcHwByMime: { 'video/vp8': false, 'video/av1': true },
+      });
+
+      releaseQueue();
+      await staleWork;
+
+      expect(successorProducer.close).not.toHaveBeenCalled();
+      expect(successorTransport.produce).not.toHaveBeenCalled();
+      expect(svc.producers.get('camera')).toBe(successorProducer);
+      expect(svc.localCameraStream).toBe(successorStream);
+    });
+
+    it('does not let an in-flight old-session failure clean up the rebuilt call (#2187)', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldProducer = createMockProducer('prod-camera-in-flight-old', 'camera');
+      oldProducer.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      svc.producers.set('camera', oldProducer);
+      svc.localCameraStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-in-flight-old' },
+      ]);
+      useVideoSettingsStore.setState({
+        hardwareAcceleration: true,
+        preferredVideoCodec: null,
+        webrtcHwByMime: { 'video/vp8': false, 'video/av1': true },
+      });
+
+      let rejectReplacement!: (reason: Error) => void;
+      sendTransport.produce.mockClear();
+      sendTransport.produce.mockImplementation(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectReplacement = reject;
+          })
+      );
+      const staleWork = svc.reProduceIfBetterCodec('camera', { requireHwImprovement: true });
+      await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledTimes(1));
+
+      svc.cleanupMediaAndTransports();
+
+      const successorTransport = makeSendTransport();
+      const successorProducer = createMockProducer('prod-camera-in-flight-successor', 'camera');
+      const successorStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-in-flight-successor' },
+      ]);
+      svc.sendTransport = successorTransport;
+      svc.videoReproduceSessionActive = true;
+      svc.producers.set('camera', successorProducer);
+      svc.localCameraStream = successorStream;
+      useVoiceStore.setState({ isVideoOn: true, videoSlotError: null });
+
+      rejectReplacement(new Error('old-session replacement failed'));
+      await expect(staleWork).rejects.toThrow('old-session replacement failed');
+
+      expect(successorProducer.close).not.toHaveBeenCalled();
+      expect(successorTransport.produce).not.toHaveBeenCalled();
+      expect(svc.producers.get('camera')).toBe(successorProducer);
+      expect(svc.localCameraStream).toBe(successorStream);
+      expect(useVoiceStore.getState().isVideoOn).toBe(true);
+      expect(useVoiceStore.getState().videoSlotError).toBeNull();
+    });
+
+    it('discards an old-session producer that succeeds after rebuild (#2187)', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldProducer = createMockProducer('prod-camera-late-success-old', 'camera');
+      oldProducer.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      svc.producers.set('camera', oldProducer);
+      svc.localCameraStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-late-success-old' },
+      ]);
+      useVideoSettingsStore.setState({
+        hardwareAcceleration: true,
+        preferredVideoCodec: null,
+        webrtcHwByMime: { 'video/vp8': false, 'video/av1': true },
+      });
+
+      const lateProducer = createMockProducer('prod-camera-late-success-created', 'camera');
+      let releaseProduce!: (producer: typeof lateProducer) => void;
+      sendTransport.produce.mockClear();
+      sendTransport.produce.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            releaseProduce = resolve;
+          })
+      );
+      const staleWork = svc.reProduceIfBetterCodec('camera', { requireHwImprovement: true });
+      await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledTimes(1));
+
+      svc.cleanupMediaAndTransports();
+      const successorTransport = makeSendTransport();
+      const successorProducer = createMockProducer('prod-camera-late-success-successor', 'camera');
+      const successorStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-late-success-successor' },
+      ]);
+      svc.sendTransport = successorTransport;
+      svc.videoReproduceSessionActive = true;
+      svc.producers.set('camera', successorProducer);
+      svc.localCameraStream = successorStream;
+      useVoiceStore.setState({ isVideoOn: true, videoSlotError: null });
+
+      releaseProduce(lateProducer);
+      await staleWork;
+
+      expect(lateProducer.close).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith('close-producer', {
+        producerId: lateProducer.id,
+      });
+      expect(successorProducer.close).not.toHaveBeenCalled();
+      expect(svc.producers.get('camera')).toBe(successorProducer);
+      expect(svc.localCameraStream).toBe(successorStream);
+      expect(useVoiceStore.getState().isVideoOn).toBe(true);
+    });
+
+    it('discards a B-signal observation that resolves after session rebuild (#2187)', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldProducer = createMockProducer('prod-camera-stats-old', 'camera');
+      oldProducer.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      let releaseStats!: (stats: Map<string, unknown>) => void;
+      oldProducer.getStats = vi.fn(
+        () =>
+          new Promise((resolve) => {
+            releaseStats = resolve;
+          })
+      );
+      svc.producers.set('camera', oldProducer);
+      useVideoSettingsStore.setState({
+        hardwareAcceleration: true,
+        preferredVideoCodec: null,
+        webrtcHwByMime: { 'video/av1': true },
+      });
+
+      const calls: unknown[][] = [];
+      svc.reProduceIfBetterCodec = async (...args: unknown[]) => {
+        calls.push(args);
+      };
+      try {
+        const staleLearner = svc.learnWebrtcHwSignal();
+        await vi.waitFor(() => expect(oldProducer.getStats).toHaveBeenCalledTimes(1));
+
+        svc.cleanupMediaAndTransports();
+        svc.sendTransport = makeSendTransport();
+        svc.videoReproduceSessionActive = true;
+        svc.producers.set('camera', createMockProducer('prod-camera-stats-successor', 'camera'));
+
+        releaseStats(bFalseStats('video/VP8'));
+        await staleLearner;
+
+        expect(calls).toEqual([]);
+        expect(useVideoSettingsStore.getState().webrtcHwByMime['video/vp8']).toBeUndefined();
+      } finally {
+        delete svc.reProduceIfBetterCodec;
+      }
+    });
+
+    it('discards an observed B-signal when that source is reopened before the batch applies (#2187)', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldCamera = createMockProducer('prod-camera-stats-batch-old', 'camera');
+      oldCamera.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      oldCamera.getStats = vi.fn().mockResolvedValue(bFalseStats('video/VP8'));
+      const blockingScreen = createMockProducer('prod-screen-stats-batch', 'screen');
+      let releaseScreenStats!: (stats: Map<string, unknown>) => void;
+      blockingScreen.getStats = vi.fn(
+        () =>
+          new Promise((resolve) => {
+            releaseScreenStats = resolve;
+          })
+      );
+      svc.producers.set('camera', oldCamera);
+      svc.producers.set('screen', blockingScreen);
+      svc.localCameraStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-stats-batch-old' },
+      ]);
+      useVideoSettingsStore.setState({
+        hardwareAcceleration: true,
+        preferredVideoCodec: null,
+        webrtcHwByMime: { 'video/av1': true },
+      });
+
+      const calls: unknown[][] = [];
+      svc.reProduceIfBetterCodec = async (...args: unknown[]) => {
+        calls.push(args);
+      };
+      try {
+        const learner = svc.learnWebrtcHwSignal();
+        await vi.waitFor(() => expect(blockingScreen.getStats).toHaveBeenCalledTimes(1));
+
+        await svc.closeProducer('camera');
+        const successorCamera = createMockProducer('prod-camera-stats-batch-new', 'camera');
+        successorCamera.rtpSender.getParameters = vi
+          .fn()
+          .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+        svc.producers.set('camera', successorCamera);
+        svc.localCameraStream = createMockMediaStream([
+          { kind: 'video', id: 'camera-track-stats-batch-new' },
+        ]);
+        useVoiceStore.getState().setVideoOn(true);
+
+        releaseScreenStats(new Map());
+        await learner;
+
+        expect(calls).toEqual([]);
+        expect(useVideoSettingsStore.getState().webrtcHwByMime['video/vp8']).toBeUndefined();
+        expect(svc.producers.get('camera')).toBe(successorCamera);
+      } finally {
+        delete svc.reProduceIfBetterCodec;
+      }
+    });
+
+    it('discards B-signal stats that resolve while explicit close is draining (#2187)', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldCamera = createMockProducer('prod-camera-stats-close-drain', 'camera');
+      oldCamera.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      let releaseStats!: (stats: Map<string, unknown>) => void;
+      oldCamera.getStats = vi.fn(
+        () =>
+          new Promise((resolve) => {
+            releaseStats = resolve;
+          })
+      );
+      svc.producers.set('camera', oldCamera);
+      svc.localCameraStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-stats-close-drain' },
+      ]);
+      useVideoSettingsStore.setState({
+        hardwareAcceleration: true,
+        preferredVideoCodec: null,
+        webrtcHwByMime: { 'video/av1': true },
+      });
+
+      let releaseDrain!: () => void;
+      const drainGate = new Promise<void>((resolve) => {
+        releaseDrain = resolve;
+      });
+      svc.drainSendTransportQueue = vi.fn(async () => drainGate);
+      const calls: unknown[][] = [];
+      svc.reProduceIfBetterCodec = async (...args: unknown[]) => {
+        calls.push(args);
+      };
+      try {
+        const learner = svc.learnWebrtcHwSignal();
+        await vi.waitFor(() => expect(oldCamera.getStats).toHaveBeenCalledTimes(1));
+        const close = svc.closeProducer('camera');
+        await vi.waitFor(() => expect(svc.drainSendTransportQueue).toHaveBeenCalledTimes(1));
+
+        releaseStats(bFalseStats('video/VP8'));
+        await learner;
+
+        expect(calls).toEqual([]);
+        expect(useVideoSettingsStore.getState().webrtcHwByMime['video/vp8']).toBeUndefined();
+
+        releaseDrain();
+        await close;
+      } finally {
+        releaseDrain();
+        delete svc.drainSendTransportQueue;
+        delete svc.reProduceIfBetterCodec;
+      }
+    });
+
+    it('does not carry a floor-change loop into the rebuilt session (#2187)', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldCamera = createMockProducer('prod-floor-camera-old', 'camera');
+      const oldScreen = createMockProducer('prod-floor-screen-old', 'screen');
+      oldCamera.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      oldScreen.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      svc.producers.set('camera', oldCamera);
+      svc.producers.set('screen', oldScreen);
+      svc.localCameraStream = createMockMediaStream([{ kind: 'video', id: 'floor-camera-old' }]);
+      svc.localScreenStream = createMockMediaStream([{ kind: 'video', id: 'floor-screen-old' }]);
+
+      let releaseCameraQueue!: () => void;
+      svc.videoReproduceQueues.camera = new Promise<void>((resolve) => {
+        releaseCameraQueue = resolve;
+      });
+      const staleFloorChange = svc.handleCodecFloorChange(null, ['video/av1', 'video/vp8']);
+
+      svc.cleanupMediaAndTransports();
+
+      const successorTransport = makeSendTransport();
+      const successorScreen = createMockProducer('prod-floor-screen-successor', 'screen');
+      successorScreen.rtpSender.getParameters = vi
+        .fn()
+        .mockReturnValue({ codecs: [{ mimeType: 'video/VP8' }] });
+      const successorStream = createMockMediaStream([
+        { kind: 'video', id: 'floor-screen-successor' },
+      ]);
+      svc.sendTransport = successorTransport;
+      svc.videoReproduceSessionActive = true;
+      svc.producers.set('screen', successorScreen);
+      svc.localScreenStream = successorStream;
+      useVideoSettingsStore.setState({
+        hardwareAcceleration: true,
+        preferredVideoCodec: null,
+        webrtcHwByMime: { 'video/vp8': false, 'video/av1': true },
+      });
+
+      releaseCameraQueue();
+      await staleFloorChange;
+
+      expect(successorScreen.close).not.toHaveBeenCalled();
+      expect(successorTransport.produce).not.toHaveBeenCalled();
+      expect(svc.producers.get('screen')).toBe(successorScreen);
+      expect(svc.localScreenStream).toBe(successorStream);
+    });
+
+    it('cancels live camera reacquisition when the source is explicitly closed (#2187)', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldProducer = createMockProducer('prod-camera-close-during-acquire', 'camera');
+      const oldStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-close-during-acquire' },
+      ]);
+      const acquiredStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-cancelled-acquire' },
+      ]);
+      svc.producers.set('camera', oldProducer);
+      svc.localCameraStream = oldStream;
+      useVoiceStore.getState().setVideoOn(true);
+
+      let releaseAcquire!: (stream: ReturnType<typeof createMockMediaStream>) => void;
+      mockGetUserMedia.mockClear();
+      mockGetUserMedia.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            releaseAcquire = resolve;
+          })
+      );
+      sendTransport.produce.mockClear();
+
+      const reproduce = svc.liveReproduceCamera();
+      await vi.waitFor(() => expect(mockGetUserMedia).toHaveBeenCalledTimes(1));
+      await voiceService.toggleVideo();
+      releaseAcquire(acquiredStream);
+      await reproduce;
+
+      expect(acquiredStream.getTracks()[0].stop).toHaveBeenCalled();
+      expect(sendTransport.produce).not.toHaveBeenCalled();
+      expect(svc.producers.has('camera')).toBe(false);
+      expect(svc.localCameraStream).toBeNull();
+      expect(useVoiceStore.getState().isVideoOn).toBe(false);
+    });
+
+    it('does not try a camera fallback after explicit close cancels acquisition (#2187)', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      svc.producers.set(
+        'camera',
+        createMockProducer('prod-camera-close-before-fallback', 'camera')
+      );
+      svc.localCameraStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-close-before-fallback' },
+      ]);
+      useVoiceStore.getState().setVideoOn(true);
+
+      let rejectAcquire!: (reason: Error) => void;
+      mockGetUserMedia.mockClear();
+      mockGetUserMedia.mockImplementation(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectAcquire = reject;
+          })
+      );
+      sendTransport.produce.mockClear();
+
+      const reproduce = svc.liveReproduceCamera();
+      await vi.waitFor(() => expect(mockGetUserMedia).toHaveBeenCalledTimes(1));
+      await voiceService.toggleVideo();
+      rejectAcquire(new DOMException('constraints changed', 'OverconstrainedError'));
+      await reproduce;
+
+      expect(mockGetUserMedia).toHaveBeenCalledTimes(1);
+      expect(sendTransport.produce).not.toHaveBeenCalled();
+      expect(svc.producers.has('camera')).toBe(false);
+      expect(svc.localCameraStream).toBeNull();
+    });
+
+    it('orders a camera restart after stale local/server producer teardown (#2187)', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldProducer = createMockProducer('prod-camera-close-during-produce', 'camera');
+      const cancelledStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-close-during-produce' },
+      ]);
+      const successorStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-successor-produce' },
+      ]);
+      const cancelledProducer = createMockProducer('prod-camera-cancelled-new', 'camera');
+      const successorProducer = createMockProducer('prod-camera-successor-new', 'camera');
+      svc.producers.set('camera', oldProducer);
+      svc.localCameraStream = createMockMediaStream([
+        { kind: 'video', id: 'camera-track-before-produce' },
+      ]);
+      useVoiceStore.getState().setVideoOn(true);
+      mockGetUserMedia
+        .mockResolvedValueOnce(cancelledStream)
+        .mockResolvedValueOnce(successorStream);
+
+      let releaseProduce!: (producer: typeof cancelledProducer) => void;
+      sendTransport.produce.mockClear();
+      sendTransport.produce
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              releaseProduce = resolve;
+            })
+        )
+        .mockResolvedValueOnce(successorProducer);
+
+      const reproduce = svc.liveReproduceCamera();
+      await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledTimes(1));
+      await voiceService.toggleVideo();
+      const restart = voiceService.toggleVideo();
+      await Promise.resolve();
+      expect(sendTransport.produce).toHaveBeenCalledTimes(1);
+
+      releaseProduce(cancelledProducer);
+      await reproduce;
+      await restart;
+
+      expect(cancelledProducer.close).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith('close-producer', {
+        producerId: cancelledProducer.id,
+      });
+      expect(sendTransport.produce).toHaveBeenCalledTimes(2);
+      expect(svc.producers.get('camera')).toBe(successorProducer);
+      expect(svc.localCameraStream).toBe(successorStream);
+      expect(useVoiceStore.getState().isVideoOn).toBe(true);
     });
   });
 
@@ -3483,10 +4237,10 @@ describe('VoiceService', () => {
       // Override methods with flags to verify dispatch (delete restores prototype)
       let cameraCalled = false;
       let screenCalled = false;
-      svc.fastReproduceCamera = async () => {
+      svc.fastReproduceCameraQueued = async () => {
         cameraCalled = true;
       };
-      svc.fastReproduceScreen = async () => {
+      svc.fastReproduceScreenQueued = async () => {
         screenCalled = true;
       };
       svc.getProducerCodecMimeType = () => 'video/vp8';
@@ -3513,8 +4267,8 @@ describe('VoiceService', () => {
       expect(screenCalled).toBe(true);
 
       // Restore all overrides
-      delete svc.fastReproduceCamera;
-      delete svc.fastReproduceScreen;
+      delete svc.fastReproduceCameraQueued;
+      delete svc.fastReproduceScreenQueued;
       delete svc.getProducerCodecMimeType;
       delete svc.pickCameraCodec;
       delete svc.pickScreenCodec;

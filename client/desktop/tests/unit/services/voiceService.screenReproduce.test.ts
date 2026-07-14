@@ -257,8 +257,11 @@ describe('voiceService screen-reproduce auto-re-tune-in (#1924 fix A)', () => {
     useVoiceStore
       .getState()
       .upsertParticipant('sharer-x', { username: 'U', isScreenSharing: true });
-    // Viewer tuned into sharer-x's OLD screen.
+    // Viewer tuned into sharer-x's OLD dominant screen and another share. This makes
+    // tuneOut's fallback choose the unrelated share unless the new producer explicitly
+    // inherits dominance before the delayed old-producer close arrives.
     tuneViewerInto(svc, 'old-prod', 'sharer-x', 'consumer-old');
+    tuneViewerInto(svc, 'other-prod', 'sharer-y', 'consumer-other');
 
     const producerClosed = getSocketHandler(svc, 'producer-closed');
     const newProducer = getSocketHandler(svc, 'new-producer');
@@ -287,6 +290,7 @@ describe('voiceService screen-reproduce auto-re-tune-in (#1924 fix A)', () => {
     expect(after.participants['sharer-x']?.isScreenSharing).toBe(true);
     expect('new-prod' in after.tunedInScreenShares).toBe(true);
     expect('old-prod' in after.tunedInScreenShares).toBe(false);
+    expect(after.dominantScreenShareId).toBe('new-prod');
   });
 
   it('a genuine stop (viewer not re-tuned) DOES clear isScreenSharing (guard only spares a live newer screen)', () => {
