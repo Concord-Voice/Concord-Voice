@@ -1278,6 +1278,52 @@ describe('Rich Presence — custom_text', () => {
     expect(result.success).toBe(true);
   });
 
+  it.each<[string, string, boolean]>([
+    ['accepts ASCII text at 140 code points', 'x'.repeat(140), true],
+    ['rejects ASCII text at 141 code points', 'x'.repeat(141), false],
+    ['accepts BMP text at 140 code points', '界'.repeat(140), true],
+    ['rejects BMP text at 141 code points', '界'.repeat(141), false],
+    ['accepts astral text at 140 code points', '😀'.repeat(140), true],
+    ['rejects astral text at 141 code points', '😀'.repeat(141), false],
+    ['accepts combining text at 140 code points', 'e\u0301'.repeat(70), true],
+    ['rejects combining text at 141 code points', `${'e\u0301'.repeat(70)}e`, false],
+  ])('%s (#2239)', (_name, text, accepted) => {
+    expect(
+      WebSocketEventSchema.safeParse({
+        type: 'rich_presence_update',
+        data: {
+          user_id: UUID_A,
+          category: 'custom_text',
+          payload: { text },
+          updated_at: 1,
+        },
+      }).success
+    ).toBe(accepted);
+  });
+
+  it.each<[string, string, boolean]>([
+    ['accepts ASCII emoji at 32 code points', 'x'.repeat(32), true],
+    ['rejects ASCII emoji at 33 code points', 'x'.repeat(33), false],
+    ['accepts BMP emoji at 32 code points', '界'.repeat(32), true],
+    ['rejects BMP emoji at 33 code points', '界'.repeat(33), false],
+    ['accepts astral emoji at 32 code points', '😀'.repeat(32), true],
+    ['rejects astral emoji at 33 code points', '😀'.repeat(33), false],
+    ['accepts combining emoji at 32 code points', 'e\u0301'.repeat(16), true],
+    ['rejects combining emoji at 33 code points', `${'e\u0301'.repeat(16)}e`, false],
+  ])('%s (#2239)', (_name, emoji, accepted) => {
+    expect(
+      WebSocketEventSchema.safeParse({
+        type: 'rich_presence_update',
+        data: {
+          user_id: UUID_A,
+          category: 'custom_text',
+          payload: { emoji, text: 'Status' },
+          updated_at: 1,
+        },
+      }).success
+    ).toBe(accepted);
+  });
+
   it('accepts custom_text with no emoji (emoji optional)', () => {
     const result = WebSocketEventSchema.safeParse({
       type: 'rich_presence_update',
@@ -1291,19 +1337,6 @@ describe('Rich Presence — custom_text', () => {
     expect(result.success).toBe(true);
   });
 
-  it('rejects custom_text over 140 characters', () => {
-    const result = WebSocketEventSchema.safeParse({
-      type: 'rich_presence_update',
-      data: {
-        user_id: UUID_A,
-        category: 'custom_text',
-        payload: { text: 'x'.repeat(141) },
-        updated_at: 3,
-      },
-    });
-    expect(result.success).toBe(false);
-  });
-
   it('rejects an empty custom_text (min 1)', () => {
     const result = WebSocketEventSchema.safeParse({
       type: 'rich_presence_update',
@@ -1312,19 +1345,6 @@ describe('Rich Presence — custom_text', () => {
         category: 'custom_text',
         payload: { text: '' },
         updated_at: 4,
-      },
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it('rejects an emoji over 32 characters', () => {
-    const result = WebSocketEventSchema.safeParse({
-      type: 'rich_presence_update',
-      data: {
-        user_id: UUID_A,
-        category: 'custom_text',
-        payload: { text: 'hi', emoji: 'x'.repeat(33) },
-        updated_at: 5,
       },
     });
     expect(result.success).toBe(false);

@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from '../../../test-utils';
+import { render, screen, fireEvent, waitFor, userEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
@@ -132,28 +132,110 @@ describe('CustomStatusPopover', () => {
     expect(screen.queryByRole('button', { name: /remove emoji/i })).not.toBeInTheDocument();
   });
 
-  it('updates the remaining-char counter as the user types', () => {
+  it('updates the accessible remaining-code-point counter after input changes', () => {
     render(<CustomStatusPopover onClose={onClose} />);
 
     // Empty → 140 remaining
-    expect(screen.getByText('140')).toBeInTheDocument();
+    const input = getInput();
+    const counter = screen.getByText('140 code points remaining');
+    expect(input).toHaveAttribute('aria-describedby', 'custom-status-counter');
+    expect(counter).toHaveAttribute('id', 'custom-status-counter');
+    expect(counter).toHaveAttribute('aria-live', 'polite');
+    expect(counter).toHaveAttribute('aria-atomic', 'true');
 
-    fireEvent.change(getInput(), { target: { value: 'hello' } });
-    expect(screen.getByText('135')).toBeInTheDocument();
+    fireEvent.change(input, { target: { value: 'hello' } });
+    expect(screen.getByText('135 code points remaining')).toBeInTheDocument();
   });
 
-  it('marks the counter over-limit and disables Save when text exceeds 140 characters', () => {
-    // Seed an over-limit value via the store so the popover initializes its
-    // input above the cap (bypasses the <input maxLength> truncation a user
-    // would normally hit), then assert the over-limit guard.
-    useRichPresenceStore.getState().setSelfPresence({ customText: 'x'.repeat(141) });
+  it('allows and saves 140 typed astral code points (#2239)', async () => {
+    const text = '😀'.repeat(140);
+    let received: Record<string, unknown> | null = null;
+    mswServer.use(
+      http.patch(PRESENCE_PATH, async ({ request }) => {
+        received = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({
+          custom_text_tier: 0,
+          custom_text: text,
+          custom_text_emoji: '',
+        });
+      })
+    );
+    const user = userEvent.setup();
+
+    render(<CustomStatusPopover onClose={onClose} />);
+    const input = getInput();
+    const save = getSaveBtn();
+
+    await user.type(input, text);
+
+    expect(input).toHaveValue(text);
+    expect(input).toHaveAttribute('maxlength', '282');
+    expect(input).toHaveAttribute('aria-invalid', 'false');
+    expect(screen.getByText('0 code points remaining')).toBeInTheDocument();
+    expect(save).not.toBeDisabled();
+
+    await user.click(save);
+
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(received).toEqual({ custom_text: text, custom_text_emoji: '' });
+  });
+
+  it('marks 141 pasted astral code points invalid and disables Save (#2239)', async () => {
+    const text = '😀'.repeat(141);
+    const user = userEvent.setup();
+
+    render(<CustomStatusPopover onClose={onClose} />);
+    const input = getInput();
+    await user.click(input);
+    await user.paste(text);
+
+    expect(input).toHaveValue(text);
+    expect(input).toHaveAttribute('aria-invalid', 'true');
+    expect(screen.getByText('1 code point over limit')).toHaveClass('over-limit');
+    expect(getSaveBtn()).toBeDisabled();
+  });
+
+  it('bounds oversized pasted input without hiding the over-limit state (#2239)', async () => {
+    const user = userEvent.setup();
+
+    render(<CustomStatusPopover onClose={onClose} />);
+    const input = getInput();
+    await user.click(input);
+    await user.paste('x'.repeat(1_000));
+
+    expect(input).toHaveValue('x'.repeat(282));
+    expect(input).toHaveAttribute('aria-invalid', 'true');
+    expect(screen.getByText('142 code points over limit')).toHaveClass('over-limit');
+    expect(getSaveBtn()).toBeDisabled();
+  });
+
+  it('marks a hydrated 141-code-point value invalid and disables Save (#2239)', () => {
+    const text = '😀'.repeat(141);
+    useRichPresenceStore.getState().setSelfPresence({ customText: text });
 
     render(<CustomStatusPopover onClose={onClose} />);
 
+    expect(getInput()).toHaveValue(text);
+    expect(getInput()).toHaveAttribute('aria-invalid', 'true');
     expect(getSaveBtn()).toBeDisabled();
-    // remaining = 140 - 141 = -1, rendered with the over-limit class.
-    const counter = screen.getByText('-1');
+    const counter = screen.getByText('1 code point over limit');
     expect(counter).toHaveClass('over-limit');
+  });
+
+  it('counts combining sequences by code point, not grapheme cluster (#2239)', () => {
+    const atLimit = 'e\u0301'.repeat(70);
+    render(<CustomStatusPopover onClose={onClose} />);
+    const input = getInput();
+
+    fireEvent.change(input, { target: { value: atLimit } });
+    expect(screen.getByText('0 code points remaining')).toBeInTheDocument();
+    expect(input).toHaveAttribute('aria-invalid', 'false');
+    expect(getSaveBtn()).not.toBeDisabled();
+
+    fireEvent.change(input, { target: { value: `${atLimit}e` } });
+    expect(screen.getByText('1 code point over limit')).toHaveClass('over-limit');
+    expect(input).toHaveAttribute('aria-invalid', 'true');
+    expect(getSaveBtn()).toBeDisabled();
   });
 
   it('saves on Enter keydown in the input', async () => {

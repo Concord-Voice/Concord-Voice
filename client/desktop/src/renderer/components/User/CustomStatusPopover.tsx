@@ -5,6 +5,8 @@ import EmojiPicker from '../EmojiPicker/EmojiPicker';
 import './CustomStatusPopover.css';
 
 const MAX_LEN = 140;
+// Native maxLength counts UTF-16 units; preserve one all-astral over-limit value.
+const MAX_INPUT_CODE_UNITS = (MAX_LEN + 1) * 2;
 
 interface CustomStatusPopoverProps {
   /** Called to dismiss the popover (after save/clear or cancel). */
@@ -14,8 +16,9 @@ interface CustomStatusPopoverProps {
 /**
  * Set / clear custom-text status popover (#1233 B5).
  *
- * A text input (max 140 chars) with a live remaining-char counter, an optional
- * emoji via the shared EmojiPicker, and Save / Clear actions. On Save it PATCHes
+ * A text input (max 140 Unicode code points) with a live remaining-code-point
+ * counter, an optional emoji via the shared EmojiPicker, and Save / Clear
+ * actions. On Save it PATCHes
  * /users/me/presence-settings with { custom_text, custom_text_emoji } and mirrors
  * the result into useRichPresenceStore.self. An empty text + Save clears the
  * status (the server treats empty strings as a clear). Text is rendered as plain
@@ -32,8 +35,15 @@ const CustomStatusPopover: React.FC<CustomStatusPopoverProps> = ({ onClose }) =>
 
   const emojiBtnRef = useRef<HTMLButtonElement>(null);
 
-  const remaining = MAX_LEN - text.length;
-  const overLimit = text.length > MAX_LEN;
+  const textLength = [...text].length;
+  const remaining = MAX_LEN - textLength;
+  const overLimit = textLength > MAX_LEN;
+  const counterMagnitude = Math.abs(remaining);
+  const counterUnit = counterMagnitude === 1 ? 'point' : 'points';
+  const counterText =
+    remaining >= 0
+      ? `${remaining} code ${counterUnit} remaining`
+      : `${counterMagnitude} code ${counterUnit} over limit`;
   const trimmed = text.trim();
 
   // PATCH the presence-settings endpoint and mirror the applied values into the
@@ -132,7 +142,9 @@ const CustomStatusPopover: React.FC<CustomStatusPopoverProps> = ({ onClose }) =>
           type="text"
           className="custom-status-input"
           value={text}
-          maxLength={MAX_LEN}
+          maxLength={MAX_INPUT_CODE_UNITS}
+          aria-invalid={overLimit}
+          aria-describedby="custom-status-counter"
           placeholder="What's happening?"
           aria-label="Custom status text"
           onChange={(e) => setText(e.target.value)}
@@ -149,8 +161,13 @@ const CustomStatusPopover: React.FC<CustomStatusPopoverProps> = ({ onClose }) =>
             Remove emoji
           </button>
         )}
-        <span className={`custom-status-counter ${overLimit ? 'over-limit' : ''}`}>
-          {remaining}
+        <span
+          id="custom-status-counter"
+          className={`custom-status-counter ${overLimit ? 'over-limit' : ''}`}
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {counterText}
         </span>
       </div>
 

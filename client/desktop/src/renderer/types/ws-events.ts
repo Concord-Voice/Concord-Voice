@@ -933,8 +933,14 @@ export const RichPresenceCategorySchema = z.enum([
 ]);
 
 export const CustomTextPresencePayloadSchema = z.object({
-  emoji: z.string().max(32).optional(),
-  text: z.string().min(1).max(140),
+  emoji: z
+    .string()
+    .refine((value) => [...value].length <= 32)
+    .optional(),
+  text: z
+    .string()
+    .min(1)
+    .refine((value) => [...value].length <= 140),
 });
 
 export const RichPresenceUpdateSchema = z.object({
