@@ -282,7 +282,7 @@ func TestStartActivityHistoryWorkersStartsExactlyTwoAndWaitsForCancellation(t *t
 	}
 }
 
-func TestMainInitializesActivityHistoryBeforeTrafficAndLogsMetadataOnly(t *testing.T) {
+func TestRunControlPlaneInitializesActivityHistoryBeforeTrafficAndLogsMetadataOnly(t *testing.T) {
 	source, err := os.ReadFile("main.go") // #nosec G304 -- fixed test-only source path
 	if err != nil {
 		t.Fatalf("read main.go: %v", err)
@@ -296,7 +296,7 @@ func TestMainInitializesActivityHistoryBeforeTrafficAndLogsMetadataOnly(t *testi
 	var initializePosition, listenPosition token.Pos
 	for _, declaration := range parsed.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
-		if !ok || function.Name.Name != "main" || function.Body == nil {
+		if !ok || function.Name.Name != "runControlPlane" || function.Body == nil {
 			continue
 		}
 		ast.Inspect(function.Body, func(node ast.Node) bool {
@@ -341,6 +341,66 @@ func TestMainInitializesActivityHistoryBeforeTrafficAndLogsMetadataOnly(t *testi
 	if initializePosition >= listenPosition {
 		t.Fatalf("Activity History startup at %s must precede ListenAndServe at %s",
 			files.Position(initializePosition), files.Position(listenPosition))
+	}
+}
+
+func TestRunControlPlaneActivatesAdminReaderOnlyAfterSafeStartupBoundary(t *testing.T) {
+	source, err := os.ReadFile("main.go") // #nosec G304 -- fixed test-only source path
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	files := token.NewFileSet()
+	parsed, err := parser.ParseFile(files, "main.go", source, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+
+	var routerPosition, signalPosition, readerPosition, listenPosition token.Pos
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "runControlPlane" || function.Body == nil {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			switch activityHistoryCallName(call.Fun) {
+			case "startActivityHistoryRuntime":
+				routerPosition = call.Pos()
+			case "Notify":
+				signalPosition = call.Pos()
+			case "configureAdminOpsMetricsReader":
+				readerPosition = call.Pos()
+			case "ListenAndServe":
+				listenPosition = call.Pos()
+			case "Fatal", "Fatalf", "Exit":
+				t.Errorf("runControlPlane contains defer-skipping call %s at %s",
+					activityHistoryCallName(call.Fun), files.Position(call.Pos()))
+			}
+			return true
+		})
+	}
+
+	for name, position := range map[string]token.Pos{
+		"router": routerPosition,
+		"signal": signalPosition,
+		"reader": readerPosition,
+		"listen": listenPosition,
+	} {
+		if position == token.NoPos {
+			t.Fatalf("%s startup position is missing", name)
+		}
+	}
+	if routerPosition >= readerPosition || signalPosition >= readerPosition || readerPosition >= listenPosition {
+		t.Fatalf(
+			"unsafe startup order: router=%s signal=%s reader=%s listen=%s",
+			files.Position(routerPosition),
+			files.Position(signalPosition),
+			files.Position(readerPosition),
+			files.Position(listenPosition),
+		)
 	}
 }
 

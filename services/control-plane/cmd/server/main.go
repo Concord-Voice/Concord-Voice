@@ -24,6 +24,7 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/database"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/storage"
@@ -78,11 +79,17 @@ func main() {
 	if code, handled := dispatchControlPlaneSubcommand(os.Args); handled {
 		os.Exit(code)
 	}
+	if err := runControlPlane(); err != nil {
+		log.Printf("Control Plane failed: %v", err)
+		os.Exit(1)
+	}
+}
 
+func runControlPlane() (runErr error) {
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+		return fmt.Errorf("load configuration: %w", err)
 	}
 
 	// Initialize logger
@@ -91,13 +98,13 @@ func main() {
 	// Initialize database
 	db, err := database.New(cfg.DatabaseURL)
 	if err != nil {
-		log.Fatal("Failed to connect to database", "error", err)
+		return fmt.Errorf("connect to database: %w", err)
 	}
 	defer closeDatabase(db, log)
 
 	// Run migrations
 	if err := database.RunMigrations(db); err != nil {
-		log.Fatal("Failed to run migrations", "error", err)
+		return fmt.Errorf("run migrations: %w", err)
 	}
 	presenceHistoryService := presencehistory.NewService(
 		db,
@@ -105,10 +112,19 @@ func main() {
 		cfg.ActivityHistoryClusterEnabled,
 	)
 
+	// Revoke any credential left by an unclean prior exit before initializing
+	// dependencies that may still terminate the process during construction.
+	readerSetupCtx, readerSetupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	err = database.EnsureOpsMetricsReaderLoginDisabled(readerSetupCtx, db)
+	readerSetupCancel()
+	if err != nil {
+		return fmt.Errorf("reconcile restricted admin operations metrics reader: %w", err)
+	}
+
 	// Initialize Redis
 	redisClient, err := database.NewRedisClient(cfg.RedisURL)
 	if err != nil {
-		log.Fatal("Failed to connect to Redis", "error", err)
+		return fmt.Errorf("connect to Redis: %w", err)
 	}
 	defer closeRedisClient(redisClient, log)
 
@@ -120,7 +136,10 @@ func main() {
 		log.Error("Failed to rebuild user-disabled denylist", "error", rebuildErr)
 	}
 
-	storageClient := initStorageClient(cfg, log)
+	storageClient, err := initStorageClient(cfg, log)
+	if err != nil {
+		return err
+	}
 
 	// Set Gin mode
 	if cfg.Environment == "production" {
@@ -134,6 +153,12 @@ func main() {
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	defer cleanupCancel()
 	retentionWorker := presencehistory.NewRetentionWorker(db, log)
+	var deferredAdminMetricsReader *deferredAdminOpsMetricsReader
+	var adminMetricsRouterReader opsmetrics.Reader
+	if cfg.AdminConsoleEnabled && cfg.OpsMetrics.Enabled {
+		deferredAdminMetricsReader = &deferredAdminOpsMetricsReader{}
+		adminMetricsRouterReader = deferredAdminMetricsReader
+	}
 	var opsMetricsRuntime *api.OpsMetricsRuntime
 	runtime, startupErr := startActivityHistoryRuntime(activityHistoryRuntimeDependencies{
 		startupContext:      context.Background(),
@@ -147,7 +172,10 @@ func main() {
 				cfg,
 				liveSpa,
 				log,
-				presenceHistoryService,
+				api.RouterDependencies{
+					OpsMetricsReader: adminMetricsRouterReader,
+					PresenceHistory:  presenceHistoryService,
+				},
 			)
 			if routerErr != nil {
 				return nil, nil, nil, routerErr
@@ -160,11 +188,7 @@ func main() {
 		retentionWorker:  retentionWorker.Run,
 	})
 	if startupErr != nil {
-		log.Fatal(
-			"Failed to initialize Activity History runtime",
-			"error_class",
-			"activity_history_startup",
-		)
+		return fmt.Errorf("initialize Activity History runtime: %w", startupErr)
 	}
 	log.Info("Activity History startup reconciliation complete", logKeyCount, runtime.paused)
 	router := runtime.router
@@ -218,48 +242,109 @@ func main() {
 		MaxHeaderBytes: 1 << 20, // 1 MB
 	}
 
-	// Start server in a goroutine
-	go func() {
-		log.Info("Starting Control Plane server", "port", cfg.Port, "env", cfg.Environment)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal("Server failed to start", "error", err)
+	var adminMetricsReaderRuntime *adminOpsMetricsReaderRuntime
+	cleanupStarted := false
+	cleanupRuntime := func() error {
+		cleanupStarted = true
+		log.Info("Shutting down server...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// Stop accepting and drain HTTP handlers before closing the dependencies
+		// they may still use. net/http does not wait for hijacked WebSocket
+		// connections; hub.Shutdown closes those after ordinary handlers finish.
+		return shutdownControlPlane(
+			func() {
+				cleanupCancel()
+				liveSpa.Stop()
+			},
+			func() error { return srv.Shutdown(ctx) },
+			waitActivityHistoryWorkers,
+			func() { hub.Shutdown() },
+			func() error { return opsMetricsRuntime.Stop(ctx) },
+			func() error {
+				readerCleanupCtx, readerCleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer readerCleanupCancel()
+				return adminMetricsReaderRuntime.Stop(readerCleanupCtx)
+			},
+			func() {
+				if natsClient != nil {
+					natsClient.Close()
+				}
+			},
+		)
+	}
+	defer func() {
+		if !cleanupStarted {
+			runErr = errors.Join(runErr, cleanupRuntime())
 		}
 	}()
-
-	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	defer signal.Stop(quit)
 
-	log.Info("Shutting down server...")
-
-	// Graceful shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Stop accepting and drain HTTP handlers before closing the dependencies they
-	// may still use. net/http does not wait for hijacked WebSocket connections;
-	// hub.Shutdown closes those after ordinary handlers finish (#2202).
-	shutdownErr := shutdownControlPlane(
-		func() {
-			cleanupCancel()
-			liveSpa.Stop()
-		},
-		func() error { return srv.Shutdown(ctx) },
-		waitActivityHistoryWorkers,
-		func() { hub.Shutdown() },
-		func() error { return opsMetricsRuntime.Stop(ctx) },
-		func() {
-			if natsClient != nil {
-				natsClient.Close()
-			}
-		},
+	// Every constructor that can still fatal-exit has completed. Only now rotate
+	// the process-ephemeral reader credential, bind it into the already-built
+	// admin route surface, and make the listener reachable.
+	readerSetupCtx, readerSetupCancel = context.WithTimeout(context.Background(), 15*time.Second)
+	adminMetricsReaderRuntime, err = configureAdminOpsMetricsReader(
+		readerSetupCtx,
+		cfg,
+		db,
+		openAdminOpsMetricsReader,
+		database.EnsureOpsMetricsReaderLoginDisabled,
 	)
-	if shutdownErr != nil {
-		log.Fatal("Server forced to shutdown", "error", shutdownErr)
+	readerSetupCancel()
+	if err != nil {
+		return fmt.Errorf("configure restricted admin operations metrics reader: %w", err)
+	}
+	defer func() {
+		readerCleanupCtx, readerCleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer readerCleanupCancel()
+		if cleanupErr := adminMetricsReaderRuntime.Stop(readerCleanupCtx); cleanupErr != nil {
+			log.Error("Failed to clean up restricted admin operations metrics reader", "error", cleanupErr)
+		}
+	}()
+	if deferredAdminMetricsReader != nil {
+		if err := deferredAdminMetricsReader.Bind(adminMetricsReaderRuntime.Reader()); err != nil {
+			return fmt.Errorf("bind restricted admin operations metrics reader: %w", err)
+		}
 	}
 
+	log.Info("Starting Control Plane server", "port", cfg.Port, "env", cfg.Environment)
+	if err := runControlPlaneServer(func() error { return srv.ListenAndServe() }, quit, cleanupRuntime); err != nil {
+		return err
+	}
 	log.Info("Server exited")
+	return nil
+}
+
+func runControlPlaneServer(
+	serve func() error,
+	stop <-chan os.Signal,
+	shutdown func() error,
+) (runErr error) {
+	if serve == nil || stop == nil || shutdown == nil {
+		return errors.New("control plane server lifecycle is incomplete")
+	}
+	defer func() {
+		runErr = errors.Join(runErr, shutdown())
+	}()
+
+	serveResult := make(chan error, 1)
+	go func() { serveResult <- serve() }()
+	select {
+	case <-stop:
+		return nil
+	case err := <-serveResult:
+		if err == nil {
+			return errors.New("control plane server stopped unexpectedly")
+		}
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("serve control plane: %w", err)
+	}
 }
 
 func shutdownControlPlane(
@@ -267,6 +352,7 @@ func shutdownControlPlane(
 	shutdownHTTP func() error,
 	waitActivityWorkers, shutdownHub func(),
 	shutdownMetrics func() error,
+	shutdownAdminMetricsReader func() error,
 	closeNATS func(),
 ) error {
 	stopBackground()
@@ -274,6 +360,7 @@ func shutdownControlPlane(
 	waitActivityWorkers()
 	shutdownHub()
 	shutdownErr = errors.Join(shutdownErr, shutdownMetrics())
+	shutdownErr = errors.Join(shutdownErr, shutdownAdminMetricsReader())
 	closeNATS()
 	return shutdownErr
 }
@@ -408,10 +495,10 @@ func closeRedisClient(redisClient *redis.Client, log *logger.Logger) {
 	}
 }
 
-func initStorageClient(cfg *config.Config, log *logger.Logger) *storage.Client {
+func initStorageClient(cfg *config.Config, log *logger.Logger) (*storage.Client, error) {
 	if cfg.StorageEndpoint == "" {
 		log.Info("Object storage not configured (STORAGE_ENDPOINT/MINIO_ENDPOINT empty) — media endpoints disabled")
-		return nil
+		return nil, nil
 	}
 
 	const maxRetries = 5
@@ -420,7 +507,7 @@ func initStorageClient(cfg *config.Config, log *logger.Logger) *storage.Client {
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		client, err = storage.New(cfg, log)
 		if err == nil {
-			return client
+			return client, nil
 		}
 		if attempt < maxRetries {
 			backoff := time.Duration(attempt) * 2 * time.Second
@@ -429,11 +516,11 @@ func initStorageClient(cfg *config.Config, log *logger.Logger) *storage.Client {
 			continue
 		}
 		if cfg.Environment == "production" {
-			log.Fatal("Failed to connect to object storage after retries", "error", err, "attempts", maxRetries)
+			return nil, fmt.Errorf("connect to object storage after %d attempts: %w", maxRetries, err)
 		}
 		log.Warn("Object storage unavailable — media endpoints will return 503", "error", err)
 	}
-	return nil
+	return nil, nil
 }
 
 // runCleanupJob periodically purges expired tokens, stale sessions, and orphaned

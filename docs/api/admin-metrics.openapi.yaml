@@ -1,0 +1,666 @@
+openapi: 3.0.3
+info:
+  title: Concord Admin Metrics API
+  description: >-
+    Closed, read-only operations metrics surface. Hosted requests pass through
+    Cloudflare Access and then require an authenticated Concord admin session.
+  version: 1.0.0
+  contact:
+    name: Concord
+    url: https://github.com/Concord-Voice/Concord-Voice-Alpha
+  license:
+    name: CVSL 1.0
+    url: https://github.com/Concord-Voice/Concord-Voice-Alpha/blob/main/LICENSE
+servers:
+  - url: https://{adminHost}/admin/api/v1
+    description: Deployment-provided hosted admin endpoint
+    variables:
+      adminHost:
+        default: admin.example.invalid
+        description: Deployment-provided non-secret admin host placeholder
+  - url: http://localhost:8080/admin/api/v1
+    description: Local development
+security:
+  - CloudflareAccessAssertion: []
+    AdminSession: []
+tags:
+  - name: Admin Metrics
+    description: Aggregate, dimension-free operations metrics
+paths:
+  /health:
+    get:
+      tags:
+        - Admin Metrics
+      summary: Get service health
+      description: Returns all seven fixed services. No query parameters are accepted.
+      operationId: getAdminMetricsHealth
+      responses:
+        '200':
+          description: Current health of the fixed service allowlist
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminHealthResponse'
+        '400':
+          $ref: '#/components/responses/InvalidQuery'
+        '401':
+          $ref: '#/components/responses/AdminSessionUnauthorized'
+        '403':
+          $ref: '#/components/responses/CloudflareAccessForbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/MetricsUnavailable'
+  /metrics/current:
+    get:
+      tags:
+        - Admin Metrics
+      summary: Get current metrics
+      description: Returns fresh catalogued scalar points. No query parameters are accepted.
+      operationId: getAdminMetricsCurrent
+      responses:
+        '200':
+          description: Fresh scalar points sorted by metric key
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminCurrentResponse'
+        '400':
+          $ref: '#/components/responses/InvalidQuery'
+        '401':
+          $ref: '#/components/responses/AdminSessionUnauthorized'
+        '403':
+          $ref: '#/components/responses/CloudflareAccessForbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/MetricsUnavailable'
+  /metrics/series:
+    get:
+      tags:
+        - Admin Metrics
+      summary: Get one metric series
+      description: Returns a server-bounded UTC hourly series for one catalogued metric.
+      operationId: getAdminMetricsSeries
+      parameters:
+        - name: key
+          in: query
+          required: true
+          description: Catalogued metric key
+          schema:
+            $ref: '#/components/schemas/MetricKey'
+        - name: window
+          in: query
+          required: true
+          description: Server-derived lookback window
+          schema:
+            type: string
+            enum:
+              - 24h
+              - 7d
+        - name: node
+          in: query
+          required: false
+          description: Optional configured node assertion; it must match the local node
+          schema:
+            type: string
+            pattern: '^cvn_[a-z2-7]{16}$'
+      responses:
+        '200':
+          description: Hourly series for the requested metric and window
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminSeriesResponse'
+        '400':
+          $ref: '#/components/responses/InvalidQuery'
+        '401':
+          $ref: '#/components/responses/AdminSessionUnauthorized'
+        '403':
+          $ref: '#/components/responses/CloudflareAccessForbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/MetricsUnavailable'
+  /counters:
+    get:
+      tags:
+        - Admin Metrics
+      summary: Get current counters
+      description: Returns fresh process-lifetime counters. No query parameters are accepted.
+      operationId: getAdminMetricsCounters
+      responses:
+        '200':
+          description: Fresh counter points sorted by metric key
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminCountersResponse'
+        '400':
+          $ref: '#/components/responses/InvalidQuery'
+        '401':
+          $ref: '#/components/responses/AdminSessionUnauthorized'
+        '403':
+          $ref: '#/components/responses/CloudflareAccessForbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/MetricsUnavailable'
+components:
+  securitySchemes:
+    CloudflareAccessAssertion:
+      type: apiKey
+      in: header
+      name: Cf-Access-Jwt-Assertion
+      description: Cloudflare Access JWT injected by the trusted edge, not by API callers
+    AdminSession:
+      type: apiKey
+      in: cookie
+      name: __Host-cv_admin_sid
+      description: Secure, HttpOnly Concord admin session cookie
+  headers:
+    CacheControl:
+      description: Prevents storage of administrative metrics responses
+      schema:
+        type: string
+        enum:
+          - private, no-store
+    RateLimitLimit:
+      description: Per-IP request limit for the current window
+      schema:
+        type: integer
+        minimum: 1
+    RateLimitRemaining:
+      description: Requests remaining in the current window
+      schema:
+        type: integer
+        minimum: 0
+    RateLimitReset:
+      description: Unix timestamp when the current rate-limit window resets
+      schema:
+        type: integer
+        format: int64
+    RetryAfter:
+      description: Seconds until the caller may retry
+      schema:
+        type: integer
+        minimum: 0
+  responses:
+    InvalidQuery:
+      description: Invalid or unsupported query parameters
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/RateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/RateLimitReset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminInvalidQueryError'
+    AdminSessionUnauthorized:
+      description: Missing, invalid, or expired Concord admin session; response body is empty
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+    CloudflareAccessForbidden:
+      description: Missing or invalid Cloudflare Access assertion; response body is empty
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+    RateLimited:
+      description: Admin metrics request rate exceeded
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/RateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/RateLimitReset'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminRateLimitedError'
+    MetricsUnavailable:
+      description: Operations metrics collection, storage, or route rate-limit backend is unavailable
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/RateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/RateLimitReset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminMetricsUnavailableError'
+  schemas:
+    NodeId:
+      type: string
+      pattern: '^cvn_[a-z2-7]{16}$'
+    MetricKey:
+      type: string
+      enum:
+        - host_cpu_percent
+        - host_memory_percent
+        - host_disk_percent
+        - host_load_1m
+        - service_control_plane_running
+        - service_control_plane_healthy
+        - service_control_plane_cpu_percent
+        - service_control_plane_memory_bytes
+        - service_media_plane_running
+        - service_media_plane_healthy
+        - service_media_plane_cpu_percent
+        - service_media_plane_memory_bytes
+        - service_postgres_running
+        - service_postgres_healthy
+        - service_postgres_cpu_percent
+        - service_postgres_memory_bytes
+        - service_redis_running
+        - service_redis_healthy
+        - service_redis_cpu_percent
+        - service_redis_memory_bytes
+        - service_nats_running
+        - service_nats_healthy
+        - service_nats_cpu_percent
+        - service_nats_memory_bytes
+        - service_minio_running
+        - service_minio_healthy
+        - service_minio_cpu_percent
+        - service_minio_memory_bytes
+        - service_coturn_running
+        - service_coturn_healthy
+        - service_coturn_cpu_percent
+        - service_coturn_memory_bytes
+        - http_requests_total
+        - http_client_errors_total
+        - http_server_errors_total
+        - websocket_connections_current
+        - channel_messages_total
+        - dm_messages_total
+        - ops_snapshot_rejections_total
+        - media_rooms_current
+        - media_participants_audio_current
+        - media_participants_webcam_current
+        - media_participants_screenshare_current
+        - media_camera_publishers_current
+        - media_screen_publishers_current
+        - media_peak_video_publishers_per_room
+        - media_egress_current_bps
+        - media_egress_peak_bps
+        - media_egress_cumulative_bytes
+        - media_participant_hours_audio
+        - media_participant_hours_webcam
+        - media_participant_hours_screenshare
+    CounterMetricKey:
+      type: string
+      enum:
+        - http_requests_total
+        - http_client_errors_total
+        - http_server_errors_total
+        - channel_messages_total
+        - dm_messages_total
+        - ops_snapshot_rejections_total
+        - media_egress_cumulative_bytes
+        - media_participant_hours_audio
+        - media_participant_hours_webcam
+        - media_participant_hours_screenshare
+    MetricSource:
+      type: string
+      enum:
+        - host
+        - control
+        - media
+    MetricUnit:
+      type: string
+      enum:
+        - percent
+        - count
+        - bytes
+        - bits_per_second
+        - load
+        - hours
+    MetricKind:
+      type: string
+      enum:
+        - gauge
+        - counter
+    RollupMode:
+      type: string
+      enum:
+        - average
+        - last
+    AdminHealthService:
+      type: object
+      additionalProperties: false
+      required:
+        - service
+        - state
+        - running
+        - healthy
+        - sampled_at
+      properties:
+        service:
+          type: string
+          enum:
+            - control_plane
+            - media_plane
+            - postgres
+            - redis
+            - nats
+            - minio
+            - coturn
+        state:
+          type: string
+          enum:
+            - healthy
+            - degraded
+            - stopped
+            - unknown
+        running:
+          type: boolean
+          nullable: true
+        healthy:
+          type: boolean
+          nullable: true
+        sampled_at:
+          type: string
+          format: date-time
+          nullable: true
+    AdminHealthResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - node_id
+        - services
+      properties:
+        node_id:
+          $ref: '#/components/schemas/NodeId'
+        services:
+          type: array
+          minItems: 7
+          maxItems: 7
+          items:
+            $ref: '#/components/schemas/AdminHealthService'
+    AdminMetricPoint:
+      type: object
+      additionalProperties: false
+      required:
+        - metric_key
+        - source
+        - unit
+        - kind
+        - value
+        - sampled_at
+      properties:
+        metric_key:
+          $ref: '#/components/schemas/MetricKey'
+        source:
+          $ref: '#/components/schemas/MetricSource'
+        unit:
+          $ref: '#/components/schemas/MetricUnit'
+        kind:
+          $ref: '#/components/schemas/MetricKind'
+        value:
+          type: number
+          format: double
+        sampled_at:
+          type: string
+          format: date-time
+    AdminCurrentResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - node_id
+        - metrics
+      properties:
+        node_id:
+          $ref: '#/components/schemas/NodeId'
+        metrics:
+          type: array
+          maxItems: 52
+          items:
+            $ref: '#/components/schemas/AdminMetricPoint'
+    AdminCounterPoint:
+      type: object
+      additionalProperties: false
+      required:
+        - metric_key
+        - source
+        - unit
+        - kind
+        - value
+        - sampled_at
+      properties:
+        metric_key:
+          $ref: '#/components/schemas/CounterMetricKey'
+        source:
+          $ref: '#/components/schemas/MetricSource'
+        unit:
+          $ref: '#/components/schemas/MetricUnit'
+        kind:
+          type: string
+          enum:
+            - counter
+        value:
+          type: number
+          format: double
+        sampled_at:
+          type: string
+          format: date-time
+    AdminCountersResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - node_id
+        - counters
+      properties:
+        node_id:
+          $ref: '#/components/schemas/NodeId'
+        counters:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/AdminCounterPoint'
+    AdminSeriesMetric:
+      type: object
+      additionalProperties: false
+      required:
+        - metric_key
+        - source
+        - unit
+        - kind
+        - rollup
+      properties:
+        metric_key:
+          $ref: '#/components/schemas/MetricKey'
+        source:
+          $ref: '#/components/schemas/MetricSource'
+        unit:
+          $ref: '#/components/schemas/MetricUnit'
+        kind:
+          $ref: '#/components/schemas/MetricKind'
+        rollup:
+          $ref: '#/components/schemas/RollupMode'
+    AdminSeriesPoint:
+      type: object
+      additionalProperties: false
+      required:
+        - bucket_start
+        - value
+        - minimum
+        - maximum
+        - sample_count
+      properties:
+        bucket_start:
+          type: string
+          format: date-time
+        value:
+          type: number
+          format: double
+        minimum:
+          type: number
+          format: double
+        maximum:
+          type: number
+          format: double
+        sample_count:
+          type: integer
+          minimum: 1
+    AdminSeriesResponse:
+      oneOf:
+        - $ref: '#/components/schemas/AdminSeries24HourResponse'
+        - $ref: '#/components/schemas/AdminSeries7DayResponse'
+      discriminator:
+        propertyName: window
+        mapping:
+          24h: '#/components/schemas/AdminSeries24HourResponse'
+          7d: '#/components/schemas/AdminSeries7DayResponse'
+    AdminSeries24HourResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - node_id
+        - metric
+        - window
+        - bucket_seconds
+        - points
+      properties:
+        node_id:
+          $ref: '#/components/schemas/NodeId'
+        metric:
+          $ref: '#/components/schemas/AdminSeriesMetric'
+        window:
+          type: string
+          enum:
+            - 24h
+        bucket_seconds:
+          type: integer
+          enum:
+            - 3600
+        points:
+          type: array
+          maxItems: 25
+          items:
+            $ref: '#/components/schemas/AdminSeriesPoint'
+    AdminSeries7DayResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - node_id
+        - metric
+        - window
+        - bucket_seconds
+        - points
+      properties:
+        node_id:
+          $ref: '#/components/schemas/NodeId'
+        metric:
+          $ref: '#/components/schemas/AdminSeriesMetric'
+        window:
+          type: string
+          enum:
+            - 7d
+        bucket_seconds:
+          type: integer
+          enum:
+            - 3600
+        points:
+          type: array
+          maxItems: 169
+          items:
+            $ref: '#/components/schemas/AdminSeriesPoint'
+    AdminInvalidQueryError:
+      type: object
+      additionalProperties: false
+      required:
+        - node_id
+        - error
+      properties:
+        node_id:
+          type: string
+          nullable: true
+          pattern: '^cvn_[a-z2-7]{16}$'
+        error:
+          type: string
+          enum:
+            - invalid_query
+            - invalid_metric_key
+            - invalid_window
+            - invalid_node
+    AdminRateLimitedError:
+      type: object
+      additionalProperties: false
+      required:
+        - node_id
+        - error
+      properties:
+        node_id:
+          type: string
+          nullable: true
+          pattern: '^cvn_[a-z2-7]{16}$'
+        error:
+          type: string
+          enum:
+            - rate_limited
+    AdminMetricsUnavailableError:
+      type: object
+      additionalProperties: false
+      required:
+        - node_id
+        - error
+      properties:
+        node_id:
+          type: string
+          nullable: true
+          pattern: '^cvn_[a-z2-7]{16}$'
+        error:
+          type: string
+          enum:
+            - metrics_unavailable

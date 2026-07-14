@@ -168,6 +168,12 @@ func configureOpsMetricsAndRecovery(router *gin.Engine, enabled bool) *opsmetric
 	return counters
 }
 
+// RouterDependencies groups runtime services that are injected into NewRouter.
+type RouterDependencies struct {
+	OpsMetricsReader opsmetrics.Reader
+	PresenceHistory  *presencehistory.Service
+}
+
 // NewRouter creates a new API router and returns its background runtime dependencies.
 func NewRouter(
 	db *sql.DB,
@@ -176,8 +182,10 @@ func NewRouter(
 	cfg *config.Config,
 	liveSpa *config.LiveSpaConfig,
 	log *logger.Logger,
-	presenceHistoryService *presencehistory.Service,
+	dependencies RouterDependencies,
 ) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, error) {
+	metricsReader := dependencies.OpsMetricsReader
+	presenceHistoryService := dependencies.PresenceHistory
 	router := gin.New()
 	configureTrustedProxies(router, cfg, log)
 
@@ -1960,7 +1968,7 @@ func NewRouter(
 	// group, fully isolated from the user `/api/v1` JWT path (separate WebAuthn
 	// RP, opaque Redis sessions, append-only audit, AdminAuthRequired middleware).
 	// Host/path gating of this surface is #1692/#1693.
-	wireAdminRoutes(router, db, redis, cfg, log)
+	wireAdminRoutes(router, db, redis, metricsReader, cfg, log)
 
 	// Start only after every dependency and route has been injected.
 	go hub.Run()

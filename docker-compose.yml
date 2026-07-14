@@ -1,7 +1,10 @@
 services:
   # PostgreSQL Database
   postgres:
-    image: postgres:16-alpine
+    image: concordvoice-postgres:16-alpine
+    build:
+      context: ./infrastructure/docker/postgres
+      dockerfile: Dockerfile
     container_name: concordvoice-postgres
     environment:
       POSTGRES_USER: concord

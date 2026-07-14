@@ -12,14 +12,15 @@ import (
 
 // RateLimitConfig defines rate limiting parameters
 type RateLimitConfig struct {
-	Requests int                       // Number of requests allowed
-	Window   time.Duration             // Time window for the limit
-	KeyFunc  func(*gin.Context) string // Function to generate rate limit key
+	Requests            int                       // Number of requests allowed
+	Window              time.Duration             // Time window for the limit
+	KeyFunc             func(*gin.Context) string // Function to generate rate limit key
+	ExceededHandler     gin.HandlerFunc           // Optional fixed response for exceeded requests
+	BackendErrorHandler gin.HandlerFunc           // Optional fixed response for fail-closed backend errors
 	// FailClosed, when true, rejects the request (503) if the Redis backend
-	// errors, instead of failing open. Use for privileged-write routes where
-	// the limiter is the SOLE velocity control (e.g. feedback issue creation
-	// against a PUBLIC repo via a privileged PAT — #158). Default false
-	// preserves the fail-open posture for availability-first routes.
+	// errors, instead of failing open. Use for privileged routes where the
+	// limiter is a required security or privacy control. Default false preserves
+	// the fail-open posture for availability-first routes.
 	FailClosed bool
 }
 
@@ -44,6 +45,45 @@ func RateLimitByIP(redis *redis.Client, requests int, window time.Duration) gin.
 		Requests: requests,
 		Window:   window,
 		KeyFunc:  rateLimitIPKey,
+	}
+	return rateLimit(redis, config)
+}
+
+// RateLimitByIPWithExceededHandler preserves the standard IP key and headers
+// while delegating only the exceeded response. The supplied handler must emit a
+// fixed response and must not include request-derived data.
+func RateLimitByIPWithExceededHandler(
+	redis *redis.Client,
+	requests int,
+	window time.Duration,
+	exceededHandler gin.HandlerFunc,
+) gin.HandlerFunc {
+	config := RateLimitConfig{
+		Requests:        requests,
+		Window:          window,
+		KeyFunc:         rateLimitIPKey,
+		ExceededHandler: exceededHandler,
+	}
+	return rateLimit(redis, config)
+}
+
+// RateLimitByIPFailClosedWithHandlers preserves the standard IP key and
+// headers while rejecting Redis backend failures with a caller-owned fixed
+// response. Use for privileged routes whose limiter must not fail open.
+func RateLimitByIPFailClosedWithHandlers(
+	redis *redis.Client,
+	requests int,
+	window time.Duration,
+	exceededHandler gin.HandlerFunc,
+	backendErrorHandler gin.HandlerFunc,
+) gin.HandlerFunc {
+	config := RateLimitConfig{
+		Requests:            requests,
+		Window:              window,
+		KeyFunc:             rateLimitIPKey,
+		ExceededHandler:     exceededHandler,
+		BackendErrorHandler: backendErrorHandler,
+		FailClosed:          true,
 	}
 	return rateLimit(redis, config)
 }
@@ -90,34 +130,14 @@ func RateLimitByUserFailClosed(redis *redis.Client, requests int, window time.Du
 // rateLimit is the core rate limiting middleware
 func rateLimit(redis *redis.Client, config RateLimitConfig) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ctx := context.Background()
 		key := config.KeyFunc(c)
-
-		// Increment counter
-		count, err := redis.Incr(ctx, key).Result()
-		if err != nil {
-			if config.FailClosed {
-				// Privileged-write route: the limiter is the only velocity cap,
-				// so a Redis outage must NOT open the floodgate (#158). Reject.
-				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-					"error":   "service unavailable",
-					"message": "rate-limit backend unavailable; please retry shortly",
-				})
-				return
-			}
-			// Default: fail open (allow request) to prevent total outage
-			c.Next()
+		count, ok := incrementRateLimitCounter(c, redis, config, key)
+		if !ok {
 			return
 		}
-
-		// Set expiry on first request OR if key somehow lost its TTL
-		// This prevents keys from persisting indefinitely if Expire fails
-		ttl, err := redis.TTL(ctx, key).Result()
-		if err != nil || ttl == -1 || count == 1 {
-			// TTL is -1 when key exists but has no expiry
-			// Always set expiry to ensure window resets properly
-			redis.Expire(ctx, key, config.Window)
-			ttl = config.Window
+		ttl, ok := resolveRateLimitTTL(c, redis, config, key, count)
+		if !ok {
+			return
 		}
 
 		// Set rate limit headers
@@ -127,17 +147,80 @@ func rateLimit(redis *redis.Client, config RateLimitConfig) gin.HandlerFunc {
 
 		// Check if rate limit exceeded
 		if count > int64(config.Requests) {
-			c.Header("Retry-After", fmt.Sprintf("%d", int(ttl.Seconds())))
-			c.JSON(http.StatusTooManyRequests, gin.H{
-				"error":   "Rate limit exceeded",
-				"message": fmt.Sprintf("Too many requests. Please try again in %d seconds.", int(ttl.Seconds())),
-			})
-			c.Abort()
+			abortRateLimitExceeded(c, config, ttl)
 			return
 		}
 
 		c.Next()
 	}
+}
+
+func incrementRateLimitCounter(c *gin.Context, redis *redis.Client, config RateLimitConfig, key string) (int64, bool) {
+	count, err := redis.Incr(context.Background(), key).Result()
+	if err == nil {
+		return count, true
+	}
+	if abortOnRateLimitBackendError(c, config) {
+		return 0, false
+	}
+	// Default: fail open (allow request) to prevent total outage.
+	c.Next()
+	return 0, false
+}
+
+func resolveRateLimitTTL(
+	c *gin.Context,
+	redis *redis.Client,
+	config RateLimitConfig,
+	key string,
+	count int64,
+) (time.Duration, bool) {
+	ctx := context.Background()
+	ttl, ttlErr := redis.TTL(ctx, key).Result()
+	if ttlErr != nil && abortOnRateLimitBackendError(c, config) {
+		return 0, false
+	}
+
+	// Set expiry on the first request or if the key lost its TTL. A fail-open
+	// route still attempts repair after a TTL read error.
+	if ttlErr == nil && ttl != -1 && count != 1 {
+		return ttl, true
+	}
+	if expireErr := redis.Expire(ctx, key, config.Window).Err(); expireErr != nil && abortOnRateLimitBackendError(c, config) {
+		return 0, false
+	}
+	return config.Window, true
+}
+
+func abortRateLimitExceeded(c *gin.Context, config RateLimitConfig, ttl time.Duration) {
+	c.Header("Retry-After", fmt.Sprintf("%d", int(ttl.Seconds())))
+	if config.ExceededHandler != nil {
+		config.ExceededHandler(c)
+	} else {
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error":   "Rate limit exceeded",
+			"message": fmt.Sprintf("Too many requests. Please try again in %d seconds.", int(ttl.Seconds())),
+		})
+	}
+	c.Abort()
+}
+
+func abortOnRateLimitBackendError(c *gin.Context, config RateLimitConfig) bool {
+	if !config.FailClosed {
+		return false
+	}
+	if config.BackendErrorHandler != nil {
+		config.BackendErrorHandler(c)
+		c.Abort()
+		return true
+	}
+	// Privileged route: the limiter is a required control, so a Redis outage
+	// must not open the floodgate. Reject with the shared fixed response.
+	c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+		"error":   "service unavailable",
+		"message": "rate-limit backend unavailable; please retry shortly",
+	})
+	return true
 }
 
 func maxInt(a, b int) int {

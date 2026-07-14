@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000087)
+## Existing Migrations (000001–000088)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -197,6 +197,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000085 | serialize_message_edits_with_key_revocations | Serializes channel/DM ciphertext edits with key-revocation ledger inserts on the stable parent row (#1741) |
 | 000086 | ops_metrics | Aggregate-only operations samples and hourly rollups (#1689) |
 | 000087 | presence_history | Opt-in activity intervals, consent settings, and durable presence-write reconciliation markers (#1235) |
+| 000088 | ops_metrics_reader | Restricted admin metrics reader role (#1690) |
 
 ## Troubleshooting
 

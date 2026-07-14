@@ -1,6 +1,8 @@
 package middleware_test
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,27 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type rateLimitCommandErrorHook struct {
+	command string
+}
+
+func (hook rateLimitCommandErrorHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (hook rateLimitCommandErrorHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == hook.command {
+			return errors.New("forced rate-limit backend error")
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (hook rateLimitCommandErrorHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
 
 const (
 	pathRateTest       = "/rate-test"
@@ -111,6 +134,67 @@ func TestRateLimitByIP_RetryAfterHeader(t *testing.T) {
 	assert.Equal(t, http.StatusTooManyRequests, w.Code)
 	retryAfter := w.Header().Get("Retry-After")
 	assert.NotEmpty(t, retryAfter, "should include Retry-After header when rate limited")
+}
+
+func TestRateLimitByIPWithExceededHandlerUsesClosedResponse(t *testing.T) {
+	ts := setupTS(t)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET(
+		pathRateTest,
+		middleware.RateLimitByIPWithExceededHandler(ts.Redis, 1, time.Minute, func(c *gin.Context) {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, struct {
+				NodeID string `json:"node_id"`
+				Error  string `json:"error"`
+			}{NodeID: "cvn_aaaaaaaaaaaaaaaa", Error: "rate_limited"})
+		}),
+		func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) },
+	)
+
+	assert.Equal(t, http.StatusOK, doRateLimitRequest(router).Code)
+	response := doRateLimitRequest(router)
+	assert.Equal(t, http.StatusTooManyRequests, response.Code)
+	assert.NotEmpty(t, response.Header().Get("Retry-After"))
+
+	var body map[string]any
+	testhelpers.ParseJSON(t, response, &body)
+	assert.Equal(t, map[string]any{
+		"node_id": "cvn_aaaaaaaaaaaaaaaa",
+		"error":   "rate_limited",
+	}, body)
+	assert.NotContains(t, body, "message")
+}
+
+func TestRateLimitByIPFailClosedWithHandlersRejectsTTLAndExpireErrors(t *testing.T) {
+	for _, command := range []string{"ttl", "expire"} {
+		t.Run(command, func(t *testing.T) {
+			ts := setupTS(t)
+			ts.Redis.AddHook(rateLimitCommandErrorHook{command: command})
+
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			router.GET(
+				pathRateTest,
+				middleware.RateLimitByIPFailClosedWithHandlers(
+					ts.Redis,
+					10,
+					time.Minute,
+					func(c *gin.Context) {
+						c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "rate_limited"})
+					},
+					func(c *gin.Context) {
+						c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "metrics_unavailable"})
+					},
+				),
+				func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) },
+			)
+
+			response := doRateLimitRequest(router)
+			assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+			assert.JSONEq(t, `{"error":"metrics_unavailable"}`, response.Body.String())
+		})
+	}
 }
 
 func TestRateLimitByIP_DifferentIPsAreIndependent(t *testing.T) {

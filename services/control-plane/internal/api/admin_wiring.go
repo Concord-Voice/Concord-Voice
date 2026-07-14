@@ -3,12 +3,14 @@ package api
 
 import (
 	"database/sql"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/admin"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 )
@@ -33,7 +35,7 @@ import (
 // endpoints exist and the admin WebAuthn config is not required. The operator
 // flips ADMIN_CONSOLE_ENABLED=true once the console is ready (validate() then
 // requires a real RP config).
-func wireAdminRoutes(router *gin.Engine, db *sql.DB, rdb *redis.Client, cfg *config.Config, log *logger.Logger) {
+func wireAdminRoutes(router *gin.Engine, db *sql.DB, rdb *redis.Client, metricsReader opsmetrics.Reader, cfg *config.Config, log *logger.Logger) {
 	if !cfg.AdminConsoleEnabled {
 		log.Info("Admin console disabled (ADMIN_CONSOLE_ENABLED=false); /admin routes not mounted")
 		return
@@ -42,7 +44,21 @@ func wireAdminRoutes(router *gin.Engine, db *sql.DB, rdb *redis.Client, cfg *con
 	if err != nil {
 		log.Fatal("Failed to create admin auth handler", "error", err)
 	}
+	var metricsNodeID string
+	var metricsInterval time.Duration
+	if cfg.OpsMetrics.Enabled {
+		metricsNodeID = cfg.OpsMetrics.NodeID
+		metricsInterval = cfg.OpsMetrics.Interval
+	}
+	metricsHandler, err := opsmetrics.NewAdminHandler(metricsReader, metricsNodeID, metricsInterval, log)
+	if err != nil {
+		log.Fatal("Failed to create admin metrics handler", "error", err)
+	}
 	edgeGated := router.Group("")
+	edgeGated.Use(func(c *gin.Context) {
+		c.Header("Cache-Control", "private, no-store")
+		c.Next()
+	})
 	edgeGated.Use(middleware.RequireCloudflareAccessFromConfig(cfg, log.Logger))
-	admin.RegisterRoutes(edgeGated, handler, rdb)
+	admin.RegisterRoutes(edgeGated, handler, metricsHandler, rdb)
 }

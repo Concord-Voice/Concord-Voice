@@ -4,10 +4,24 @@
 
 When `OPS_METRICS_ENABLED=true`, the control plane verifies signed host/media
 snapshots from fixed NATS subjects and stores only closed-catalog numeric values.
-Raw samples retain 24 hours and hourly rollups retain eight days. Startup or
-collection failure does not take down normal API traffic. Host and Docker reads
-belong to the separate `cmd/ops-agent` binary; the control plane must never mount
-the Docker socket. See ADR-0030.
+Raw samples retain 24 hours and hourly rollups retain eight days. Collection and
+rollup failures do not take down normal API traffic. Host and Docker reads belong
+to the separate `cmd/ops-agent` binary; the control plane must never mount the
+Docker socket.
+
+When the admin console and metrics collection are both enabled, four read-only
+admin GET routes expose health, current values, hourly series, and counters. They
+remain behind Cloudflare Access and the separate admin session, use a dedicated
+two-connection, database-scoped PostgreSQL login with `SELECT` only on the
+metrics tables, and never fall back to the normal application pool. The
+temporary credential is generated and rotated in memory only after router setup;
+startup and shutdown commit `NOLOGIN PASSWORD NULL` before draining every
+cluster-wide reader session. Unowned role collisions, memberships, and effective
+privilege drift fail closed. If collection is disabled, startup accepts an absent
+or already-`NOLOGIN` reader role without privileged role SQL; a login-enabled role
+must be revoked successfully. The mounted metrics routes return a fixed 503 while
+collection is disabled or Redis cannot evaluate their route-local rate limit,
+and all admin responses are `private, no-store`. See ADR-0030.
 
 The control plane handles authentication, authorization, server/channel management, billing, and user presence for Concord Voice.
 
@@ -225,7 +239,7 @@ GET/POST /api/v1/channels/:id/keys
 POST /api/v1/channels/:id/keys/rotate
 ```
 
-**API routes:** See `docs/api/openapi.yaml` for the OpenAPI spec (covers partial routes; Phase 2A additions pending spec update).
+**OpenAPI-covered operations:** The two specs under `docs/api/` cover 260 public and 4 admin metrics operations. This is an explicit supported-contract inventory, not a count of every control-plane route registration.
 
 ### Testing
 

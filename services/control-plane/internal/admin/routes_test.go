@@ -2,35 +2,70 @@ package admin_test
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/admin"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 )
 
+type emptyAdminMetricsReader struct{}
+
+func (emptyAdminMetricsReader) Latest(context.Context, string, time.Time) ([]opsmetrics.Point, error) {
+	return []opsmetrics.Point{}, nil
+}
+
+func (emptyAdminMetricsReader) Series(context.Context, string, opsmetrics.MetricKey, time.Time, time.Time) ([]opsmetrics.Bucket, error) {
+	return []opsmetrics.Bucket{}, nil
+}
+
 // registerAdminEngine builds a real engine with the full admin route set mounted.
 func registerAdminEngine(t *testing.T) *gin.Engine {
+	t.Helper()
+	engine, _ := registerAdminEngineAndSessions(t)
+	return engine
+}
+
+func registerAdminEngineAndSessions(t *testing.T) (*gin.Engine, *admin.SessionStore) {
+	return registerAdminEngineAndSessionsWithLimiter(t, nil)
+}
+
+func registerAdminEngineAndSessionsWithLimiter(t *testing.T, limiterRedis *redis.Client) (*gin.Engine, *admin.SessionStore) {
 	t.Helper()
 	db, dbCleanup := testhelpers.SetupTestDB(t)
 	t.Cleanup(dbCleanup)
 	rdb, rCleanup := testhelpers.SetupTestRedis(t)
 	t.Cleanup(rCleanup)
+	if limiterRedis == nil {
+		limiterRedis = rdb
+	}
 
 	gin.SetMode(gin.TestMode)
-	h, err := admin.NewHandler(db, rdb, logger.NewWithWriter(&bytes.Buffer{}), authHandlerCfg())
+	log := logger.NewWithWriter(&bytes.Buffer{})
+	h, err := admin.NewHandler(db, rdb, log, authHandlerCfg())
+	require.NoError(t, err)
+	metricsHandler, err := opsmetrics.NewAdminHandler(
+		emptyAdminMetricsReader{},
+		"cvn_aaaaaaaaaaaaaaaa",
+		15*time.Second,
+		log,
+	)
 	require.NoError(t, err)
 
 	engine := gin.New()
-	admin.RegisterRoutes(&engine.RouterGroup, h, rdb)
-	return engine
+	admin.RegisterRoutes(&engine.RouterGroup, h, metricsHandler, limiterRedis)
+	return engine, admin.NewSessionStore(rdb, time.Now)
 }
 
 // TestAdminRoutes_DenyByDefault is the reflective gate test: it enumerates EVERY

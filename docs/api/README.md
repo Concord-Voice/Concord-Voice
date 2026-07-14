@@ -1,12 +1,19 @@
 # API Documentation
 
-OpenAPI 3.0 specification for the Concord Voice Control Plane API.
+OpenAPI 3.0 specifications for two supported Concord Voice control-plane
+surfaces. Coverage is precisely **260 public + 4 admin metrics** operations; it
+is not complete control-plane coverage.
 
 ## Files
 
-- [openapi.yaml](./openapi.yaml) — OpenAPI spec with full live-route coverage (drift-gated)
+- [openapi.yaml](./openapi.yaml) — 260 supported public `/api/v1` operations
+- [admin-metrics.openapi.yaml](./admin-metrics.openapi.yaml) — 4 supported admin metrics `/admin/api/v1` GET operations
 
-> **Drift gate (#822):** the spec is kept in lockstep with `services/control-plane/internal/api/router.go` and the extractor's declared delegated registrars by `scripts/api/check-openapi-coverage.sh` (pr-ci `verify-openapi-coverage` job) — CI fails when a route is added/removed without a matching spec edit, in either direction. Unlisted delegated registrars fail extraction rather than silently dropping routes. Inventory tooling: `scripts/api/extract-routes.py` (`--list` / `--missing` / `--stale` / `--check`).
+The specs intentionally exclude other control-plane surfaces, including admin
+authentication and enrollment. Explicit method-denial registrations on the four
+admin metrics paths are enforcement behavior, not supported operations.
+
+> **Drift gate (#822):** `scripts/api/check-openapi-coverage.sh` (pr-ci `verify-openapi-coverage` job) independently checks the public router against `openapi.yaml` and the supported admin metrics GET routes against `admin-metrics.openapi.yaml`, in both drift directions. Unlisted public delegated registrars fail extraction rather than silently dropping routes. Inventory tooling: `scripts/api/extract-routes.py` (`--list` / `--missing` / `--stale` / `--check`); `--list` prints the union of supported operations from both surfaces.
 
 ## Viewing the Spec
 
@@ -28,9 +35,10 @@ npx @redocly/cli preview-docs docs/api/openapi.yaml
 
 ```bash
 npx @redocly/cli lint docs/api/openapi.yaml
+npx @redocly/cli lint docs/api/admin-metrics.openapi.yaml
 ```
 
-## Authentication Flow
+## Public Authentication Flow
 
 1. **Register** or **Login** → receive JWT access token (15 min) + refresh token cookie (30 days)
 2. Pass `Authorization: Bearer <token>` on all protected endpoints
@@ -63,8 +71,17 @@ npx @redocly/cli lint docs/api/openapi.yaml
 
 ## Base URL
 
+Public API:
+
 ```text
 http://localhost:8080/api/v1
+```
+
+Admin metrics API:
+
+```text
+https://{adminHost}/admin/api/v1
+http://localhost:8080/admin/api/v1
 ```
 
 ## Quick Reference

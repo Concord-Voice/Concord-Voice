@@ -1,12 +1,14 @@
 package admin
 
 import (
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
 )
 
 // Admin auth rate-limit budgets (per IP). The password/webauthn/enroll steps are
@@ -14,10 +16,19 @@ import (
 // velocity control, and RateLimitByIP is the coarse outer cap that stops a flood
 // from ever reaching the lockout bookkeeping.
 const (
-	adminAuthRateLimit   = 20
-	adminAuthRateWindow  = 15 * time.Minute
-	adminEnrollRateLimit = 10
+	adminAuthRateLimit     = 20
+	adminAuthRateWindow    = 15 * time.Minute
+	adminEnrollRateLimit   = 10
+	adminMetricsRateLimit  = 60
+	adminMetricsRateWindow = time.Minute
 )
+
+var adminMetricsDeniedMethods = []string{
+	http.MethodPost,
+	http.MethodPut,
+	http.MethodPatch,
+	http.MethodDelete,
+}
 
 // RegisterRoutes mounts the admin auth surface under the given router group
 // (typically the bare engine, since admin lives at top-level `/admin`, NOT under
@@ -25,8 +36,9 @@ const (
 // limiting; everything else is gated by AdminAuthRequired (deny-by-default,
 // verified by the reflective routes_test).
 //
-// rdb is needed for the RateLimitByIP middleware; h.sessions backs AdminAuthRequired.
-func RegisterRoutes(rg *gin.RouterGroup, h *Handler, rdb *redis.Client) {
+// rdb is needed for the RateLimitByIP middleware; h.sessions backs
+// AdminAuthRequired; metrics owns only the closed read response surface.
+func RegisterRoutes(rg *gin.RouterGroup, h *Handler, metrics *opsmetrics.AdminHandler, rdb *redis.Client) {
 	grp := rg.Group("/admin")
 
 	// --- Pre-auth API routes (rate-limited; the token/password/key IS the auth) ---
@@ -52,7 +64,23 @@ func RegisterRoutes(rg *gin.RouterGroup, h *Handler, rdb *redis.Client) {
 		gated.Use(AdminAuthRequired(h.sessions))
 		{
 			gated.POST("/admins", h.CreateAdmin)
-			// Future read routes (#1690/#1692) mount here, behind the same gate.
+
+			metricsRoutes := gated.Group("")
+			metricsRoutes.Use(middleware.RateLimitByIPFailClosedWithHandlers(
+				rdb,
+				adminMetricsRateLimit,
+				adminMetricsRateWindow,
+				metrics.RateLimited,
+				metrics.ServiceUnavailable,
+			))
+			metricsRoutes.GET("/health", metrics.Health)
+			metricsRoutes.GET("/metrics/current", metrics.Current)
+			metricsRoutes.GET("/metrics/series", metrics.Series)
+			metricsRoutes.GET("/counters", metrics.Counters)
+
+			for _, path := range []string{"/health", "/metrics/current", "/metrics/series", "/counters"} {
+				metricsRoutes.Match(adminMetricsDeniedMethods, path, metrics.MethodNotAllowed)
+			}
 		}
 	}
 

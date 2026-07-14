@@ -26,6 +26,7 @@ const (
 var dockerContainerIDPattern = regexp.MustCompile(`^[a-f0-9]{12,64}$`)
 
 type concordService struct {
+	serviceID     string
 	containerName string
 	running       MetricKey
 	healthy       MetricKey
@@ -34,13 +35,13 @@ type concordService struct {
 }
 
 var concordServiceAllowlist = []concordService{
-	{containerName: "concordvoice-control-plane", running: MetricServiceControlPlaneRunning, healthy: MetricServiceControlPlaneHealthy, cpu: MetricServiceControlPlaneCPUPercent, memory: MetricServiceControlPlaneMemoryBytes},
-	{containerName: "concordvoice-media-plane", running: MetricServiceMediaPlaneRunning, healthy: MetricServiceMediaPlaneHealthy, cpu: MetricServiceMediaPlaneCPUPercent, memory: MetricServiceMediaPlaneMemoryBytes},
-	{containerName: "concordvoice-postgres", running: MetricServicePostgresRunning, healthy: MetricServicePostgresHealthy, cpu: MetricServicePostgresCPUPercent, memory: MetricServicePostgresMemoryBytes},
-	{containerName: "concordvoice-redis", running: MetricServiceRedisRunning, healthy: MetricServiceRedisHealthy, cpu: MetricServiceRedisCPUPercent, memory: MetricServiceRedisMemoryBytes},
-	{containerName: "concordvoice-nats", running: MetricServiceNATSRunning, healthy: MetricServiceNATSHealthy, cpu: MetricServiceNATSCPUPercent, memory: MetricServiceNATSMemoryBytes},
-	{containerName: "concordvoice-minio", running: MetricServiceMinIORunning, healthy: MetricServiceMinIOHealthy, cpu: MetricServiceMinIOCPUPercent, memory: MetricServiceMinIOMemoryBytes},
-	{containerName: "concordvoice-coturn", running: MetricServiceCoturnRunning, healthy: MetricServiceCoturnHealthy, cpu: MetricServiceCoturnCPUPercent, memory: MetricServiceCoturnMemoryBytes},
+	{serviceID: "control_plane", containerName: "concordvoice-control-plane", running: MetricServiceControlPlaneRunning, healthy: MetricServiceControlPlaneHealthy, cpu: MetricServiceControlPlaneCPUPercent, memory: MetricServiceControlPlaneMemoryBytes},
+	{serviceID: "media_plane", containerName: "concordvoice-media-plane", running: MetricServiceMediaPlaneRunning, healthy: MetricServiceMediaPlaneHealthy, cpu: MetricServiceMediaPlaneCPUPercent, memory: MetricServiceMediaPlaneMemoryBytes},
+	{serviceID: "postgres", containerName: "concordvoice-postgres", running: MetricServicePostgresRunning, healthy: MetricServicePostgresHealthy, cpu: MetricServicePostgresCPUPercent, memory: MetricServicePostgresMemoryBytes},
+	{serviceID: "redis", containerName: "concordvoice-redis", running: MetricServiceRedisRunning, healthy: MetricServiceRedisHealthy, cpu: MetricServiceRedisCPUPercent, memory: MetricServiceRedisMemoryBytes},
+	{serviceID: "nats", containerName: "concordvoice-nats", running: MetricServiceNATSRunning, healthy: MetricServiceNATSHealthy, cpu: MetricServiceNATSCPUPercent, memory: MetricServiceNATSMemoryBytes},
+	{serviceID: "minio", containerName: "concordvoice-minio", running: MetricServiceMinIORunning, healthy: MetricServiceMinIOHealthy, cpu: MetricServiceMinIOCPUPercent, memory: MetricServiceMinIOMemoryBytes},
+	{serviceID: "coturn", containerName: "concordvoice-coturn", running: MetricServiceCoturnRunning, healthy: MetricServiceCoturnHealthy, cpu: MetricServiceCoturnCPUPercent, memory: MetricServiceCoturnMemoryBytes},
 }
 
 type dockerContainerSummary struct {

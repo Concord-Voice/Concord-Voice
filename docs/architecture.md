@@ -7,7 +7,10 @@ socket owner. The agent and media plane publish HMAC-signed, scalar-only v1
 snapshots over fixed NATS subjects. The control plane validates and stores raw
 samples for 24 hours plus hourly rollups for eight days. No user, room, server,
 address, hostname, or free-form Docker metadata is persisted. Collection failure
-degrades only this signal path. See [ADR-0030](adr/0030-aggregate-operations-metrics-boundary.md).
+degrades only this signal path. The admin portal reads these aggregates through
+four Cloudflare- and admin-session-gated GET routes backed by a separate
+two-connection PostgreSQL role that can select only the metrics tables. See
+[ADR-0030](adr/0030-aggregate-operations-metrics-boundary.md).
 
 > **Last audited:** 2026-06-10 — counts and code references verified against `main` at this date via `scripts/update-claude-md-counts.sh` and a per-plane source sweep with adversarial claim-by-claim re-verification (issue #587). Cite file paths + symbol names rather than line numbers so this document resists drift.
 
@@ -450,7 +453,7 @@ erDiagram
 | Compliance           | `audit_log` (000035); `account_deletions` (000059)                                                                                                                                                                                                                                                            |
 | Attestation          | `release_binaries`, `release_spas` (000066)                                                                                                                                                                                                                                                                   |
 | Admin console        | `admin_users`, `admin_webauthn_credentials`, `admin_audit_log` (000077) — sessions are Redis-backed (opaque sids), not a table                                                                                                                                                                                |
-| Operations metrics   | `ops_metric_samples`, `ops_metric_rollups` (000086) — opaque node ID, fixed key, timestamp, and scalar values only                                                                                                                                                                                         |
+| Operations metrics   | `ops_metric_samples`, `ops_metric_rollups` (000086) — opaque node ID, fixed key, timestamp, and scalar values only; restricted reader role (000088)                                                                                                                                                        |
 
 > Notable schema history: group-DM admin roles added `dm_participants.role` (`admin`/`member`) + `dm_conversations.icon_url` (000053); `dm_messages` gained a `call_event` type + `call_event_payload` JSONB (000064), and the transient `kind` column was dropped in favor of `type` (000065); `account_deletions.sentry_delete_attempted` was dropped (000060) when Sentry was removed; `key_revocations.revoked_by` was changed to `ON DELETE SET NULL` (000059) so account erasure isn't blocked.
 
@@ -476,6 +479,28 @@ The admin console is a **separate identity domain** — it never shares state wi
 **Dormancy:** the entire surface is gated by `ADMIN_CONSOLE_ENABLED` (default `false`). All `/admin/*` routes return 404 when disabled. See the "Post-deploy: bootstrap the first admin (#1688)" section in the deploy runbook for provisioning.
 
 **Hosted edge-gating:** hosted admin traffic is wrapped by Cloudflare Access (identity allowlist + hardware-key requirement) before origin, then nginx serves the codename vhost with a Cloudflare Origin Certificate, and the Go `/admin` route group verifies `Cf-Access-Jwt-Assertion` against the Access JWKS/audience before any admin handler runs. The origin firewall helper restricts `:443` to Cloudflare IP ranges. The codename hostname is not the access control; app auth and CF Access both still gate known-host requests.
+
+**Read-only metrics API:** `GET /admin/api/v1/health`, `/metrics/current`,
+`/metrics/series`, and `/counters` run behind both gates above. They expose only
+fixed catalog metadata and scalar aggregates for the configured local node.
+Current/health freshness is two collection intervals; series are UTC hourly
+`24h` or `7d` windows capped at 25 or 169 buckets. Unknown parameters and
+mutating methods on these paths are rejected, and each path is limited to 60
+requests/minute/IP. That limiter fails closed with the same fixed
+`metrics_unavailable` 503 if Redis cannot evaluate the request. All admin
+responses are `private, no-store`. The handler uses a separate
+maximum-two-connection pool as the database-scoped role
+`concord_ops_metrics_reader_<md5(current_database())>`. Migration `000088`
+ownership-marks that role and grants `SELECT` only on the two operations-metrics
+tables; an unmarked name collision or any membership/effective privilege drift
+fails closed. Its 256-bit password exists only in process memory. Startup first
+commits `NOLOGIN PASSWORD NULL` and drains every cluster-wide session left by a
+prior process, then activates a replacement credential only after router
+construction succeeds. Shutdown repeats the revoke-and-drain sequence. If
+collection is disabled the routes return the fixed 503; active-mode reader setup
+failure stops startup instead of falling back to the application pool. An absent
+or already-`NOLOGIN` role requires no privileged role change, while a
+login-enabled role must be revoked successfully or startup fails closed.
 
 **Config env vars** (all `vars.*`, non-secret): `ADMIN_CONSOLE_ENABLED`, `ADMIN_WEBAUTHN_RP_ID`, `ADMIN_WEBAUTHN_RP_ORIGINS`, `ADMIN_WEBAUTHN_ALLOWED_AAGUIDS`, `CF_ACCESS_AUD`, `CF_ACCESS_TEAM_DOMAIN`.
 

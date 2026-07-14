@@ -103,7 +103,7 @@ func setupRecoverySMTPFailureTS(t *testing.T, closeDelay time.Duration) *testhel
 		cfg,
 		nil,
 		logger.NewWithWriter(io.Discard),
-		presenceHistoryService,
+		api.RouterDependencies{PresenceHistory: presenceHistoryService},
 	)
 	require.NoError(t, err)
 	if natsClient != nil {

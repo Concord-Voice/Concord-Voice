@@ -122,7 +122,13 @@ func SetupTestServer(t *testing.T) *TestServer {
 		dbCleanup()
 	})
 	router, hub, natsClient, opsRuntime, err := api.NewRouter(
-		db, redisClient, nil, cfg, nil, log, presenceHistoryService,
+		db,
+		redisClient,
+		nil,
+		cfg,
+		nil,
+		log,
+		api.RouterDependencies{PresenceHistory: presenceHistoryService},
 	)
 	if err != nil {
 		t.Fatalf("testhelpers: initialize router: %v", err)
