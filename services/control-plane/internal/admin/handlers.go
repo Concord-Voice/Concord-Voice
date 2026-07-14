@@ -322,6 +322,8 @@ func (h *Handler) Logout(c *gin.Context) {
 		}
 		if rerr := h.sessions.Revoke(ctx, sid); rerr != nil {
 			h.log.Warn("admin session revoke failed", "error", rerr)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": msgInternalError})
+			return
 		}
 		h.auditOK(ctx, adminID, "", EventLogout)
 	}

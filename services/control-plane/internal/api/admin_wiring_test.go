@@ -68,7 +68,9 @@ func TestWireAdminRoutes_MountsAdminSurface(t *testing.T) {
 	assert.Contains(t, adminRoutes, "POST /admin/api/v1/auth/password")
 	assert.Contains(t, adminRoutes, "POST /admin/api/v1/auth/webauthn")
 	assert.Contains(t, adminRoutes, "POST /admin/api/v1/admins")
+	assert.Contains(t, adminRoutes, "GET /admin/")
 	assert.Contains(t, adminRoutes, "GET /admin/enroll")
+	assert.Contains(t, adminRoutes, "GET /admin/assets/*filepath")
 	assert.Contains(t, adminRoutes, "GET /admin/api/v1/health")
 	assert.Contains(t, adminRoutes, "GET /admin/api/v1/metrics/current")
 	assert.Contains(t, adminRoutes, "GET /admin/api/v1/metrics/series")
@@ -92,14 +94,28 @@ func TestWireAdminRoutes_KnownHostWithoutCFAccessIsRejectedBeforeAdminHandler(t 
 
 	wireAdminRoutes(router, nil, rdb, nil, cfg, logger.New("test"))
 
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/admin/enroll", nil)
-	req.Host = "admin-codename.concordvoice.chat"
-	router.ServeHTTP(rec, req)
+	for _, tc := range []struct {
+		name   string
+		method string
+		target string
+	}{
+		{name: "index", method: http.MethodGet, target: "/admin/"},
+		{name: "enroll", method: http.MethodGet, target: "/admin/enroll"},
+		{name: "asset", method: http.MethodGet, target: "/admin/assets/app.abc123.js"},
+		{name: "auth", method: http.MethodPost, target: "/admin/api/v1/auth/password"},
+		{name: "metrics", method: http.MethodGet, target: "/admin/api/v1/health"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.method, tc.target, nil)
+			req.Host = "admin-codename.concordvoice.chat"
+			router.ServeHTTP(rec, req)
 
-	require.Equal(t, http.StatusForbidden, rec.Code)
-	assert.Equal(t, "private, no-store", rec.Header().Get("Cache-Control"))
-	assert.Empty(t, rec.Body.String(), "known host without CF Access must not reach enroll HTML")
+			require.Equal(t, http.StatusForbidden, rec.Code)
+			assert.Equal(t, "private, no-store", rec.Header().Get("Cache-Control"))
+			assert.Empty(t, rec.Body.String(), "known host without CF Access must not reach %s handler", tc.name)
+		})
+	}
 }
 
 func TestWireAdminRoutes_ValidCFAccessWithoutAdminSessionIsUnauthorized(t *testing.T) {

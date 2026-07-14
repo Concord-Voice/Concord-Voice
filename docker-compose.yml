@@ -203,6 +203,8 @@ services:
     build:
       context: ./services/control-plane
       dockerfile: Dockerfile
+      additional_contexts:
+        admin_ui: ./client/admin
     image: "${CONTROL_PLANE_IMAGE:-concordvoice-control-plane:local}"
     container_name: concordvoice-control-plane
     env_file:

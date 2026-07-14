@@ -1,0 +1,4 @@
+{
+  "//": "Tracked HIGH/CRITICAL npm-audit advisory exceptions for client/admin. Consumed by scripts/security/npm-audit-gate.{sh,mjs}. Prefer updating dependencies over accepting. Each entry requires id, reason with tracking link, and review_by date.",
+  "accepted": []
+}

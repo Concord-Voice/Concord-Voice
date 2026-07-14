@@ -388,6 +388,35 @@ func TestLogout_RevokesSessionAndClearsCookie(t *testing.T) {
 	assert.ErrorIs(t, err, admin.ErrSessionInvalid)
 }
 
+func TestLogout_RevokeFailurePreservesSessionAndCookie(t *testing.T) {
+	db, err := sql.Open("postgres", "postgres://127.0.0.1:1/postgres?sslmode=disable&connect_timeout=1")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	rdb, rCleanup := testhelpers.SetupTestRedis(t)
+	t.Cleanup(rCleanup)
+
+	store := admin.NewSessionStore(rdb, nil)
+	sid, err := store.Mint(context.Background(), "admin-revoke-retry")
+	require.NoError(t, err)
+	engine := adminAuthEngine(t, db, rdb)
+
+	redisOptions := *rdb.Options()
+	require.NoError(t, rdb.Close())
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/auth/logout", nil)
+	req.AddCookie(&http.Cookie{Name: "__Host-cv_admin_sid", Value: sid, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
+	engine.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+	assert.Empty(t, rec.Header().Values("Set-Cookie"), "failed revocation must leave the browser cookie intact")
+
+	verifier := redis.NewClient(&redisOptions)
+	t.Cleanup(func() { _ = verifier.Close() })
+	_, err = admin.NewSessionStore(verifier, nil).Get(context.Background(), sid)
+	require.NoError(t, err, "failed revocation must leave the server-side session retryable")
+}
+
 // sessionIDFromSetCookie extracts the __Host-cv_admin_sid value from a Set-Cookie
 // header.
 func sessionIDFromSetCookie(t *testing.T, setCookie string) string {

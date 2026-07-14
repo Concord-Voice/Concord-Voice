@@ -12,6 +12,29 @@ four Cloudflare- and admin-session-gated GET routes backed by a separate
 two-connection PostgreSQL role that can select only the metrics tables. See
 [ADR-0030](adr/0030-aggregate-operations-metrics-boundary.md).
 
+## Admin Portal
+
+The shipping React and TypeScript Admin Portal is a browser client served by the
+control plane at `/admin/`; its assets are built from `client/admin` into the
+production image, not committed as `dist`. The request and authorization path is
+deliberately layered:
+
+```text
+Operator browser
+  -> hosted edge gate (Cloudflare Access)
+    -> control-plane /admin/*
+      |-> SPA shell, assets, auth, and enrollment (no local session required)
+      `-> AdminAuthRequired -> protected admin and fixed aggregate metrics APIs
+```
+
+The local session, not a user JWT, authorizes the protected administration and
+metrics APIs. The portal validates closed catalog identifiers and finite scalar
+values before rendering, and its JavaScript does not persist fetched samples,
+counter baselines, node IDs, or health changes. Compose supplies `client/admin`
+as the named `admin_ui` build context while the primary control-plane context
+remains `services/control-plane`. See
+[ADR-0031](adr/0031-admin-portal-frontend.md).
+
 > **Last audited:** 2026-06-10 — counts and code references verified against `main` at this date via `scripts/update-claude-md-counts.sh` and a per-plane source sweep with adversarial claim-by-claim re-verification (issue #587). Cite file paths + symbol names rather than line numbers so this document resists drift.
 
 ## Quick Overview
@@ -66,7 +89,7 @@ Concord Voice is a distributed real-time communications platform with three serv
 - Frames are E2EE _above_ the SFU (see [Media E2EE](#media-e2ee-frame-encryption)); the SFU forwards opaque RTP
 - NATS integration for participant state events to control plane
 
-#### Desktop Client (Electron 42 + React 19)
+#### Desktop Client (Electron 43 + React 19)
 
 - Secure IPC via preload bridge (contextIsolation ON, nodeIntegration OFF)
 - E2EE: AES-256-GCM message encryption, RSA-OAEP 4096-bit key wrapping
@@ -461,14 +484,18 @@ erDiagram
 
 The admin console is a **separate identity domain** — it never shares state with end-user auth (no JWT, no `users` table, no refresh tokens).
 
-**Identity:** `admin_users` table (separate from `users`). Admins are created via the `adminctl bootstrap` CLI subcommand inside the running container (first admin only) or via an authenticated in-console `POST /admin/api/v1/admins` (subsequent admins).
+**Identity:** `admin_users` table (separate from `users`). The first admin is
+created with the `control-plane admin bootstrap` CLI subcommand inside the
+running container. An authenticated `POST /admin/api/v1/admins` creates each
+subsequent pending admin and returns its enrollment token once; the current
+Admin Portal does not expose that operation in its UI.
 
 **Auth flow (2FA mandatory):**
 
 1. `POST /admin/api/v1/auth/password` — constant-time password verify; returns a short-lived challenge handle + WebAuthn `BeginLogin` assertion. **Password alone never yields a session.**
 2. `POST /admin/api/v1/auth/webauthn` — `FinishLogin` with `userVerification: required`; on success mints an opaque Redis session.
 
-**Sessions:** 256-bit CSPRNG session id stored in Redis under `admin_session:{sid}`. Cookie `__Host-cv_admin_sid`: `Secure; HttpOnly; SameSite=Strict; Path=/`. Idle TTL 30 min (sliding); absolute cap 8 h. Logout `DEL`s the key (instant revocation). The `AdminAuthRequired` middleware validates the cookie → Redis → expiry on every `/admin` route.
+**Sessions:** 256-bit CSPRNG session id stored in Redis under `admin_session:{sid}`. Cookie `__Host-cv_admin_sid`: `Secure; HttpOnly; SameSite=Strict; Path=/`. Idle TTL 30 min (sliding); absolute cap 8 h. Logout `DEL`s the key (instant revocation). `AdminAuthRequired` validates the cookie → Redis → expiry only for protected administration and metrics routes. The SPA shell, assets, authentication, logout, and enrollment routes remain outside the local-session gate.
 
 **Hardware key requirement:** `attestation: direct` is enforced at enrollment; the AAGUID is checked against `ADMIN_WEBAUTHN_ALLOWED_AAGUIDS` (canonical YubiKey 5-series set). Only approved hardware keys can become admin credentials.
 
@@ -478,7 +505,7 @@ The admin console is a **separate identity domain** — it never shares state wi
 
 **Dormancy:** the entire surface is gated by `ADMIN_CONSOLE_ENABLED` (default `false`). All `/admin/*` routes return 404 when disabled. See the "Post-deploy: bootstrap the first admin (#1688)" section in the deploy runbook for provisioning.
 
-**Hosted edge-gating:** hosted admin traffic is wrapped by Cloudflare Access (identity allowlist + hardware-key requirement) before origin, then nginx serves the codename vhost with a Cloudflare Origin Certificate, and the Go `/admin` route group verifies `Cf-Access-Jwt-Assertion` against the Access JWKS/audience before any admin handler runs. The origin firewall helper restricts `:443` to Cloudflare IP ranges. The codename hostname is not the access control; app auth and CF Access both still gate known-host requests.
+**Hosted edge-gating:** hosted admin traffic is wrapped by Cloudflare Access (identity allowlist + hardware-key requirement) before origin, then nginx serves the codename vhost with a Cloudflare Origin Certificate, and the Go `/admin` route group verifies `Cf-Access-Jwt-Assertion` against the Access JWKS/audience before any admin handler runs. The origin firewall helper restricts `:443` to Cloudflare IP ranges. The codename hostname is not the access control. Protected administration and metrics requests pass both Cloudflare Access and local admin-session gates; the SPA shell, auth, and enrollment routes pass the hosted outer gate without requiring a local session.
 
 **Read-only metrics API:** `GET /admin/api/v1/health`, `/metrics/current`,
 `/metrics/series`, and `/counters` run behind both gates above. They expose only
@@ -849,7 +876,7 @@ Concord/
 
 | Component      | Technology                              | Rationale                                                           |
 | -------------- | --------------------------------------- | ------------------------------------------------------------------- |
-| Desktop client | Electron 42 + React 19 + TS 6           | Mature WebRTC, fast iteration, OS keychain access                   |
+| Desktop client | Electron 43 + React 19 + TS 6           | Mature WebRTC, fast iteration, OS keychain access                   |
 | Control plane  | Go 1.26 + Gin                           | Fast, concurrent, single-binary deploy                              |
 | Media plane    | Node.js 24 + mediasoup 3.21             | Best-in-class WebRTC SFU                                            |
 | Database       | PostgreSQL 16                           | Relational + JSONB, mature, declarative partitioning available      |

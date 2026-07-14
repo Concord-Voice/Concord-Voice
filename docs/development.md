@@ -15,7 +15,8 @@ See [SETUP_GITHUB.md](./SETUP_GITHUB.md) for full GitHub collaboration workflow.
 
 ### Required
 
-- **Node.js** 20+ and npm 10+
+- **Node.js** 24+ and npm 10+ for the desktop and media-plane workspaces;
+  **Node.js 24.x** for `client/admin` (Go-only work does not require Node.js)
 - **Go** 1.26.1+
 - **Docker** and **Docker Compose**
 - **Git**
@@ -125,6 +126,25 @@ npm run dev
 
 The Electron app should launch automatically.
 
+### 6. Set Up Admin Portal
+
+In a new terminal:
+
+```bash
+cd client/admin
+npm ci
+npm run test
+npm run build
+npx vite preview --host 127.0.0.1 --port 4181 --strictPort
+```
+
+Open `http://127.0.0.1:4181/admin/`. Vite has no API proxy: development and
+preview builds send `/admin/api/v1/*` requests to their own origin. Unit and
+browser tests intercept those requests; production serves the built assets and
+API from the control plane at the same origin. See
+[`client/admin/README.md`](../client/admin/README.md) for the full command set
+and named `admin_ui` Docker build context.
+
 ## Development Workflow
 
 ### Making Changes
@@ -144,6 +164,12 @@ The Electron app should launch automatically.
 - Hot reload is enabled via Vite
 - Changes apply automatically to renderer process
 - Main process changes require restart
+
+**Admin Portal**:
+- Edit files in `client/admin/src/`
+- `npm run dev` starts the frontend at `/admin/` with hot reload
+- There is no development API proxy; use tests for mocked API flows or the
+  control-plane production image for same-origin integration
 
 ### Database Migrations
 
@@ -565,7 +591,8 @@ Recommended:
 
 ### Node.js
 
-- Use Node.js 24+ for better performance
+- Use the Node.js version declared by each workspace's `package.json`; the Admin
+  Portal requires Node.js 24.x
 - Enable V8 flags: `--max-old-space-size=4096`
 - Profile with Chrome DevTools
 

@@ -38,8 +38,15 @@ var adminMetricsDeniedMethods = []string{
 //
 // rdb is needed for the RateLimitByIP middleware; h.sessions backs
 // AdminAuthRequired; metrics owns only the closed read response surface.
-func RegisterRoutes(rg *gin.RouterGroup, h *Handler, metrics *opsmetrics.AdminHandler, rdb *redis.Client) {
+func RegisterRoutes(rg *gin.RouterGroup, h *Handler, metrics *opsmetrics.AdminHandler, rdb *redis.Client, ui *UI) {
+	if ui == nil {
+		ui = NewUI(nil)
+	}
 	grp := rg.Group("/admin")
+
+	grp.GET("/", ui.Index)
+	grp.GET("/enroll", ui.Index)
+	grp.GET("/assets/*filepath", ui.Asset)
 
 	// --- Pre-auth API routes (rate-limited; the token/password/key IS the auth) ---
 	api := grp.Group("/api/v1")
@@ -84,12 +91,6 @@ func RegisterRoutes(rg *gin.RouterGroup, h *Handler, metrics *opsmetrics.AdminHa
 		}
 	}
 
-	// --- The enrollment HTML page (pre-auth; the JS ceremony calls the pre-auth
-	//     /enroll API). Rate-limited as a page fetch. ---
-	grp.GET("/enroll",
-		middleware.RateLimitByIP(rdb, adminEnrollRateLimit, adminAuthRateWindow),
-		h.EnrollPage,
-	)
 }
 
 // preAuthRoutePaths is the explicit allowlist of admin routes that are
@@ -97,12 +98,14 @@ func RegisterRoutes(rg *gin.RouterGroup, h *Handler, metrics *opsmetrics.AdminHa
 // test (routes_test.go) asserts every registered /admin route NOT in this set
 // rejects an unauthenticated request. Keep it in lockstep with RegisterRoutes.
 var preAuthRoutePaths = map[string]struct{}{
+	"/admin/":                     {},
+	"/admin/enroll":               {},
+	"/admin/assets/*filepath":     {},
 	"/admin/api/v1/auth/password": {},
 	"/admin/api/v1/auth/webauthn": {},
 	"/admin/api/v1/auth/logout":   {},
 	"/admin/api/v1/enroll/begin":  {},
 	"/admin/api/v1/enroll/finish": {},
-	"/admin/enroll":               {},
 }
 
 // IsPreAuthRoute reports whether the given route path is on the pre-auth

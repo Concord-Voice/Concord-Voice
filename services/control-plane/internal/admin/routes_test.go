@@ -33,8 +33,7 @@ func (emptyAdminMetricsReader) Series(context.Context, string, opsmetrics.Metric
 // registerAdminEngine builds a real engine with the full admin route set mounted.
 func registerAdminEngine(t *testing.T) *gin.Engine {
 	t.Helper()
-	engine, _ := registerAdminEngineAndSessions(t)
-	return engine
+	return registerAdminRouteOnlyEngine(t)
 }
 
 func registerAdminEngineAndSessions(t *testing.T) (*gin.Engine, *admin.SessionStore) {
@@ -42,6 +41,36 @@ func registerAdminEngineAndSessions(t *testing.T) (*gin.Engine, *admin.SessionSt
 }
 
 func registerAdminEngineAndSessionsWithLimiter(t *testing.T, limiterRedis *redis.Client) (*gin.Engine, *admin.SessionStore) {
+	return registerAdminEngineAndSessionsWithLimiterAndMiddleware(t, limiterRedis)
+}
+
+func registerAdminRouteOnlyEngine(t *testing.T, middlewares ...gin.HandlerFunc) *gin.Engine {
+	t.Helper()
+	rdb := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: time.Millisecond,
+		MaxRetries:  -1,
+	})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	gin.SetMode(gin.TestMode)
+	log := logger.NewWithWriter(&bytes.Buffer{})
+	h, err := admin.NewHandler(nil, rdb, log, authHandlerCfg())
+	require.NoError(t, err)
+	metricsHandler, err := opsmetrics.NewAdminHandler(nil, "", 0, log)
+	require.NoError(t, err)
+
+	engine := gin.New()
+	engine.Use(middlewares...)
+	admin.RegisterRoutes(&engine.RouterGroup, h, metricsHandler, rdb, admin.NewUI(adminUITestFS()))
+	return engine
+}
+
+func registerAdminEngineAndSessionsWithLimiterAndMiddleware(
+	t *testing.T,
+	limiterRedis *redis.Client,
+	middlewares ...gin.HandlerFunc,
+) (*gin.Engine, *admin.SessionStore) {
 	t.Helper()
 	db, dbCleanup := testhelpers.SetupTestDB(t)
 	t.Cleanup(dbCleanup)
@@ -64,7 +93,8 @@ func registerAdminEngineAndSessionsWithLimiter(t *testing.T, limiterRedis *redis
 	require.NoError(t, err)
 
 	engine := gin.New()
-	admin.RegisterRoutes(&engine.RouterGroup, h, metricsHandler, limiterRedis)
+	engine.Use(middlewares...)
+	admin.RegisterRoutes(&engine.RouterGroup, h, metricsHandler, limiterRedis, admin.NewUI(adminUITestFS()))
 	return engine, admin.NewSessionStore(rdb, time.Now)
 }
 
@@ -121,17 +151,51 @@ func TestAdminRoutes_PreAuthAllowlistMatchesRegistered(t *testing.T) {
 	}
 
 	for _, p := range []string{
+		"/admin/",
+		"/admin/enroll",
+		"/admin/assets/*filepath",
 		"/admin/api/v1/auth/password",
 		"/admin/api/v1/auth/webauthn",
 		"/admin/api/v1/auth/logout",
 		"/admin/api/v1/enroll/begin",
 		"/admin/api/v1/enroll/finish",
-		"/admin/enroll",
 	} {
 		assert.True(t, admin.IsPreAuthRoute(p), "%s should be on the pre-auth allowlist", p)
 		_, ok := registered[p]
 		assert.Truef(t, ok, "pre-auth allowlisted path %s must be a registered route (allowlist drift)", p)
 	}
+}
+
+func TestAdminRoutes_UIRoutesAreExplicitPreAuth(t *testing.T) {
+	engine := registerAdminEngine(t)
+
+	registered := make(map[string]string)
+	for _, r := range engine.Routes() {
+		registered[r.Path] = r.Method
+	}
+
+	for _, p := range []string{"/admin/", "/admin/enroll", "/admin/assets/*filepath"} {
+		assert.Equal(t, http.MethodGet, registered[p], p)
+		assert.True(t, admin.IsPreAuthRoute(p), p)
+	}
+}
+
+func TestAdminRoutes_AssetCacheCanReplaceAPINoStore(t *testing.T) {
+	engine := registerAdminRouteOnlyEngine(t, func(c *gin.Context) {
+		c.Header("Cache-Control", "private, no-store")
+		c.Next()
+	})
+
+	asset := httptest.NewRecorder()
+	engine.ServeHTTP(asset, httptest.NewRequest(http.MethodGet, "/admin/assets/app.abc123.js", nil))
+	require.Equal(t, http.StatusOK, asset.Code)
+	assert.Equal(t, "private, max-age=31536000, immutable", asset.Header().Get("Cache-Control"))
+
+	api := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/auth/password", strings.NewReader(`{`))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(api, req)
+	assert.Equal(t, "private, no-store", api.Header().Get("Cache-Control"))
 }
 
 // TestAdminRoutes_AdminsRouteIsGated is an explicit (non-reflective) confirmation

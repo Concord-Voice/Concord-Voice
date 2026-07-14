@@ -263,9 +263,17 @@ go build -o bin/control-plane cmd/server/main.go
 # Or use Make
 make build
 
-# Build Docker image
-docker build -t concord-control-plane .
+# Build the production Docker image from the repository root (recommended)
+cd ../..
+docker compose build control-plane
+
+# Or, from services/control-plane, provide the required named frontend context
+docker buildx build --build-context admin_ui=../../client/admin -t concord-control-plane .
 ```
+
+The control-plane image builds the Admin Portal from the named `admin_ui`
+context and copies its generated assets into the final image. Do not use a bare
+`docker build .`: it cannot supply that required context.
 
 ## Database Migrations
 

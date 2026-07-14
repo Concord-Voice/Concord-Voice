@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -54,7 +53,6 @@ func adminEnrollEngine(t *testing.T, db *sql.DB, rdb *redis.Client) (*gin.Engine
 	r := gin.New()
 	r.POST("/admin/api/v1/enroll/begin", h.EnrollBegin)
 	r.POST("/admin/api/v1/enroll/finish", h.EnrollFinish)
-	r.GET("/admin/enroll", h.EnrollPage)
 	return r, h
 }
 
@@ -176,32 +174,6 @@ func TestEnroll_TokenIsSingleUse(t *testing.T) {
 		"token":    token,
 	})
 	assert.Equal(t, http.StatusUnauthorized, second.Code, "a consumed token must not be reusable")
-}
-
-func TestEnrollPage_ServesFunctionalHTML(t *testing.T) {
-	db, dbCleanup := testhelpers.SetupTestDB(t)
-	t.Cleanup(dbCleanup)
-	rdb, rCleanup := testhelpers.SetupTestRedis(t)
-	t.Cleanup(rCleanup)
-
-	engine, _ := adminEnrollEngine(t, db, rdb)
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/admin/enroll", nil)
-	engine.ServeHTTP(rec, req)
-
-	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Contains(t, rec.Header().Get("Content-Type"), "text/html")
-	body := rec.Body.String()
-	assert.Contains(t, body, "navigator.credentials.create")
-	assert.Contains(t, body, "/admin/api/v1/enroll/begin")
-	assert.Contains(t, body, "/admin/api/v1/enroll/finish")
-	// Root-relative API URLs only (no SPA-origin-relative or external hosts).
-	assert.NotContains(t, body, "http://")
-	// CV-CAN-019: the URL-carried enrollment token must not leak via Referer, and
-	// the inline script strips it from the address bar after prefill.
-	assert.Equal(t, "no-referrer", rec.Header().Get("Referrer-Policy"))
-	assert.Contains(t, body, "history.replaceState")
 }
 
 // --- admin-create endpoint (behind AdminAuthRequired) ---

@@ -3,6 +3,7 @@ package api
 
 import (
 	"database/sql"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -60,5 +61,5 @@ func wireAdminRoutes(router *gin.Engine, db *sql.DB, rdb *redis.Client, metricsR
 		c.Next()
 	})
 	edgeGated.Use(middleware.RequireCloudflareAccessFromConfig(cfg, log.Logger))
-	admin.RegisterRoutes(edgeGated, handler, metricsHandler, rdb)
+	admin.RegisterRoutes(edgeGated, handler, metricsHandler, rdb, admin.NewUI(os.DirFS("/home/appuser/admin-ui")))
 }
