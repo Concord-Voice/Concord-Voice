@@ -42,6 +42,15 @@ func (c *Client) Subscribe(subject string, handler func(data []byte)) (*nats.Sub
 	})
 }
 
+// SubscribeWithSubject registers a handler that also receives the concrete
+// subject. Wildcard consumers can use one serialized subscription callback
+// when ordering across related subjects matters.
+func (c *Client) SubscribeWithSubject(subject string, handler func(subject string, data []byte)) (*nats.Subscription, error) {
+	return c.conn.Subscribe(subject, func(msg *nats.Msg) {
+		handler(msg.Subject, msg.Data)
+	})
+}
+
 // Publish sends a JSON-encoded message to the given subject.
 func (c *Client) Publish(subject string, data interface{}) error {
 	payload, err := json.Marshal(data)

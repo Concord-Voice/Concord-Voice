@@ -14,6 +14,7 @@
 
 import './CallEventMessage.css';
 import type { CallEventPayload } from '../../types/chat';
+import { formatCallEventPreview } from '../../utils/messagePreview';
 
 // Re-export the centralized types (#1219) via `export...from` so existing
 // importers (e.g. CallEventMessage.test.tsx) keep working off this module path
@@ -25,6 +26,8 @@ interface CallEventMessageProps {
   /** Render group-call wording ("Group voice call — M:SS") + joiner tooltip
    *  for completed calls. Defaults to the 1:1 wording. (#1219) */
   isGroup?: boolean;
+  /** Authenticated viewer, used to distinguish inbound and outbound calls. */
+  currentUserId?: string;
 }
 
 function formatDuration(seconds: number): string {
@@ -44,25 +47,17 @@ function formatTime(iso: string): string {
   return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
-export function CallEventMessage({ payload, isGroup }: Readonly<CallEventMessageProps>) {
+export function CallEventMessage({
+  payload,
+  isGroup,
+  currentUserId,
+}: Readonly<CallEventMessageProps>) {
   const { status, duration_seconds, started_at, participant_user_ids } = payload;
 
-  let text: string;
-  switch (status) {
-    case 'completed':
-      text = isGroup
-        ? `Group voice call — ${formatDuration(duration_seconds)}`
-        : `Voice call — ${formatDuration(duration_seconds)}`;
-      break;
-    case 'missed':
-      text = 'Missed voice call';
-      break;
-    case 'declined':
-      text = 'Voice call declined';
-      break;
-    case 'canceled':
-      text = 'Voice call canceled';
-      break;
+  let text = formatCallEventPreview(payload, currentUserId);
+  if (status === 'completed') {
+    const label = isGroup ? 'Group voice call' : text;
+    text = `${label} — ${formatDuration(duration_seconds)}`;
   }
 
   // Group joiner tooltip is sourced from participant_user_ids (a first-joiner

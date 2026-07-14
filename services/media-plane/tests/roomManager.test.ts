@@ -59,7 +59,7 @@ import {
   CryptoVersionMismatchError,
   SCREEN_GATE_OFF_DEBOUNCE_MS,
 } from '../src/lib/roomManager.js';
-import type { Room, Participant } from '../src/lib/roomManager.js';
+import type { Room, Participant, RoomEvent } from '../src/lib/roomManager.js';
 // `./mocks/logger.js` (imported above) replaces @/lib/logger with vi.fn() spies;
 // importing it here gives us the SAME mocked object to assert on.
 import { logger } from '../src/lib/logger.js';
@@ -83,7 +83,13 @@ function joinRoomWithSupportedCrypto(
   identity: { username: string; displayName?: string; avatarUrl?: string },
   rtpCapabilities?: any,
   entitlement?: any,
-  roomContext?: { roomKind: 'channel' | 'dm'; ownerTier?: string }
+  roomContext?: {
+    roomKind: 'channel' | 'dm';
+    ownerTier?: string;
+    callId?: string;
+    callRingId?: string;
+    callCallerUserId?: string;
+  }
 ) {
   return manager.joinRoom(roomId, userId, socketId, identity, rtpCapabilities, {
     entitlement,
@@ -129,6 +135,275 @@ describe('RoomManager', () => {
 
       expect(mockMediasoup.getOrCreateRouter).toHaveBeenCalledTimes(1);
       expect(result.participants).toHaveLength(2);
+    });
+
+    it('single-flights simultaneous first joins into one room', async () => {
+      let resolveRouter!: (router: typeof mockRouter) => void;
+      mockMediasoup.getOrCreateRouter.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveRouter = resolve;
+          })
+      );
+
+      const firstJoin = joinRoomWithSupportedCrypto(manager, 'room-concurrent', 'u-1', 'sock-1', {
+        username: 'alice',
+      });
+      const secondJoin = joinRoomWithSupportedCrypto(manager, 'room-concurrent', 'u-2', 'sock-2', {
+        username: 'bob',
+      });
+
+      expect(mockMediasoup.getOrCreateRouter).toHaveBeenCalledTimes(1);
+      resolveRouter(mockRouter);
+      await Promise.all([firstJoin, secondJoin]);
+
+      expect(mockMediasoup.getOrCreateRouter).toHaveBeenCalledTimes(1);
+      expect(Array.from(manager.getRoom('room-concurrent')?.participants.keys() ?? [])).toEqual(
+        expect.arrayContaining(['u-1', 'u-2'])
+      );
+      expect(manager.getRoom('room-concurrent')?.participants.size).toBe(2);
+    });
+
+    it('retries admission when the last leave closes the room during join', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-race', 'u-1', 'sock-1', {
+        username: 'alice',
+      });
+      const replacementRouter = createMockRouter();
+      mockMediasoup.getOrCreateRouter.mockResolvedValueOnce(replacementRouter);
+
+      const joining = joinRoomWithSupportedCrypto(manager, 'room-race', 'u-2', 'sock-2', {
+        username: 'bob',
+      });
+      await manager.leaveRoom('room-race', 'u-1');
+      const result = await joining;
+
+      expect(manager.getRoom('room-race')?.router).toBe(replacementRouter);
+      expect(manager.getRoom('room-race')?.participants.has('u-2')).toBe(true);
+      expect(result.participants).toEqual([expect.objectContaining({ userId: 'u-2' })]);
+      expect(mockMediasoup.getOrCreateRouter).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps one generated call ID for a direct DM room', async () => {
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => events.push(event));
+
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'dm-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        undefined,
+        undefined,
+        { roomKind: 'dm' }
+      );
+      const callId = manager.getRoom('dm-1')?.callId;
+      expect(callId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      );
+
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'dm-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        undefined,
+        undefined,
+        { roomKind: 'dm' }
+      );
+      expect(manager.getRoom('dm-1')?.callId).toBe(callId);
+      expect(events.filter((event) => event.type === 'user-joined')).toEqual([
+        expect.objectContaining({ callId }),
+        expect.objectContaining({ callId }),
+      ]);
+
+      await manager.leaveRoom('dm-1', 'u-1');
+      await manager.leaveRoom('dm-1', 'u-2');
+      expect(events.find((event) => event.type === 'room-empty')).toEqual(
+        expect.objectContaining({
+          callId,
+          callerUserId: 'u-1',
+          participantUserIds: ['u-1', 'u-2'],
+          startedAt: expect.any(String),
+        })
+      );
+    });
+
+    it('uses a validated DM call ID and rejects a conflicting active call', async () => {
+      const callId = '11111111-1111-4111-8111-111111111111';
+      const callRingId = callId;
+      const callCallerUserId = 'caller-1';
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => events.push(event));
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'dm-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        undefined,
+        undefined,
+        { roomKind: 'dm', callId, callRingId, callCallerUserId }
+      );
+
+      expect(manager.getRoom('dm-1')).toMatchObject({
+        callId,
+        callRingId,
+        callCallerUserId,
+        callStartedAt: expect.any(Date),
+      });
+
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'dm-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        undefined,
+        undefined,
+        {
+          roomKind: 'dm',
+          callId,
+          callRingId: 'replacement-ring',
+          callCallerUserId: 'replacement-caller',
+        }
+      );
+
+      await expect(
+        joinRoomWithSupportedCrypto(
+          manager,
+          'dm-1',
+          'u-3',
+          'sock-3',
+          { username: 'carol' },
+          undefined,
+          undefined,
+          { roomKind: 'dm', callId: '22222222-2222-4222-8222-222222222222' }
+        )
+      ).rejects.toThrow('DM call ID does not match the active room');
+      expect(manager.getRoom('dm-1')?.callId).toBe(callId);
+      expect(manager.getRoom('dm-1')?.callRingId).toBe(callRingId);
+      expect(manager.getRoom('dm-1')?.callCallerUserId).toBe(callCallerUserId);
+      expect(manager.getRoom('dm-1')?.participants.has('u-2')).toBe(true);
+      expect(manager.getRoom('dm-1')?.participants.has('u-3')).toBe(false);
+
+      await manager.leaveRoom('dm-1', 'u-1');
+      await manager.leaveRoom('dm-1', 'u-2');
+      expect(events.find((event) => event.type === 'room-empty')).toEqual(
+        expect.objectContaining({
+          callId,
+          ringId: callRingId,
+          callerUserId: callCallerUserId,
+          participantUserIds: ['u-1', 'u-2'],
+        })
+      );
+    });
+
+    it('discards only the exact empty unadmitted DM room without a terminal event', async () => {
+      const callId = '11111111-1111-4111-8111-111111111111';
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => events.push(event));
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'dm-aborted',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        undefined,
+        undefined,
+        { roomKind: 'dm', callId }
+      );
+      manager.getRoom('dm-aborted')?.participants.clear();
+      manager.getRoom('dm-aborted')?.callParticipantHistory.clear();
+
+      await expect(
+        manager.closeEmptyDMRoom('dm-aborted', 'different-call')
+      ).resolves.toBeUndefined();
+      await expect(manager.closeEmptyDMRoom('dm-aborted', callId)).resolves.toBe('discarded');
+
+      expect(manager.getRoom('dm-aborted')).toBeUndefined();
+      expect(mockRouter.close).toHaveBeenCalledOnce();
+      expect(mockMediasoup.removeRouter).toHaveBeenCalledWith('dm-aborted');
+      expect(events.filter((event) => event.type === 'room-empty')).toHaveLength(0);
+    });
+
+    it('removes only the exact socket and terminalizes its last admitted DM participant', async () => {
+      const callId = '22222222-2222-4222-8222-222222222222';
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => events.push(event));
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'dm-rollback',
+        'u-1',
+        'socket-current',
+        { username: 'alice' },
+        undefined,
+        undefined,
+        { roomKind: 'dm', callId }
+      );
+
+      expect(manager.removeParticipantIfSocketOwned('dm-rollback', 'u-1', 'socket-stale')).toBe(
+        false
+      );
+      expect(manager.getParticipant('dm-rollback', 'u-1')?.socketId).toBe('socket-current');
+      expect(manager.removeParticipantIfSocketOwned('dm-rollback', 'u-1', 'socket-current')).toBe(
+        true
+      );
+      await expect(manager.closeEmptyDMRoom('dm-rollback', callId)).resolves.toBe('terminal');
+      expect(events.filter((event) => event.type === 'room-empty')).toHaveLength(1);
+    });
+
+    it('closes an empty channel only when rollback still owns the participant socket', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'channel-rollback', 'u-1', 'socket-current', {
+        username: 'alice',
+      });
+
+      await expect(
+        manager.leaveRoomIfSocketOwned('channel-rollback', 'u-1', 'socket-stale')
+      ).resolves.toBe(false);
+      expect(manager.getRoom('channel-rollback')).toBeDefined();
+
+      await expect(
+        manager.leaveRoomIfSocketOwned('channel-rollback', 'u-1', 'socket-current')
+      ).resolves.toBe(true);
+      expect(manager.getRoom('channel-rollback')).toBeUndefined();
+      expect(mockRouter.close).toHaveBeenCalledOnce();
+      expect(mockMediasoup.removeRouter).toHaveBeenCalledWith('channel-rollback');
+    });
+
+    it('rejects a late join that reuses a completed DM call ID', async () => {
+      const callId = '11111111-1111-4111-8111-111111111111';
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => events.push(event));
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'dm-completed',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        undefined,
+        undefined,
+        { roomKind: 'dm', callId }
+      );
+      await manager.leaveRoom('dm-completed', 'u-1');
+
+      await expect(
+        joinRoomWithSupportedCrypto(
+          manager,
+          'dm-completed',
+          'u-2',
+          'sock-2',
+          { username: 'bob' },
+          undefined,
+          undefined,
+          { roomKind: 'dm', callId }
+        )
+      ).rejects.toThrow('DM call is no longer active');
+
+      expect(manager.getRoom('dm-completed')).toBeUndefined();
+      expect(mockMediasoup.getOrCreateRouter).toHaveBeenCalledTimes(1);
+      expect(events.filter((event) => event.type === 'room-empty')).toHaveLength(1);
     });
 
     it('discards stale room when router is closed', async () => {
@@ -413,6 +688,44 @@ describe('RoomManager', () => {
       expect(result.participants).toHaveLength(1);
       const participant = manager.getParticipant('room-1', 'u-1');
       expect(participant?.socketId).toBe('sock-new');
+    });
+
+    it('replaces a sole DM participant without completing or recreating the call', async () => {
+      const callId = '11111111-1111-4111-8111-111111111111';
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => events.push(event));
+
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'dm-reconnect',
+        'u-1',
+        'sock-old',
+        { username: 'alice' },
+        undefined,
+        undefined,
+        { roomKind: 'dm', callId, callCallerUserId: 'u-1' }
+      );
+      const originalRoom = manager.getRoom('dm-reconnect');
+      events.length = 0;
+
+      const result = await joinRoomWithSupportedCrypto(
+        manager,
+        'dm-reconnect',
+        'u-1',
+        'sock-new',
+        { username: 'alice' },
+        undefined,
+        undefined,
+        { roomKind: 'dm', callId, callCallerUserId: 'u-1' }
+      );
+
+      expect(manager.getRoom('dm-reconnect')).toBe(originalRoom);
+      expect(manager.getRoom('dm-reconnect')?.callId).toBe(callId);
+      expect(result.participants).toEqual([expect.objectContaining({ userId: 'u-1' })]);
+      expect(manager.getParticipant('dm-reconnect', 'u-1')?.socketId).toBe('sock-new');
+      expect(events.filter((event) => event.type === 'room-empty')).toHaveLength(0);
+      expect(mockRouter.close).not.toHaveBeenCalled();
+      expect(mockMediasoup.removeRouter).not.toHaveBeenCalled();
     });
   });
 
@@ -4549,6 +4862,7 @@ const mkRoom = (over: Partial<Room>): Room => ({
   lastNPausedConsumers: new Set(),
   micProducerIds: new Set(),
   roomKind: 'channel',
+  callParticipantHistory: new Map(),
   keyframeRequestCooldowns: new Map(),
   cameraLayerDemands: new Map(),
   cameraLayeringGateEnabled: false,

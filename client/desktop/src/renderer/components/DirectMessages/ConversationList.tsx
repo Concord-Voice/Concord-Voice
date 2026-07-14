@@ -314,6 +314,8 @@ const ConversationList: React.FC<ConversationListProps> = ({
               content: previewContent,
               gifSlug: hasPlaintextPreview ? conv.lastMessage.gifSlug : undefined,
               attachmentType: conv.lastMessage.attachmentType,
+              callEventPayload: conv.lastMessage.callEventPayload,
+              currentUserId,
               fallback: 'Encrypted message',
             });
           }

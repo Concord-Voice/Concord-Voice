@@ -48,6 +48,30 @@ describe('CallEventMessage', () => {
     });
   });
 
+  describe('call direction', () => {
+    it('labels an answered call from the caller perspective as outgoing', () => {
+      const props = {
+        payload: basePayload({
+          caller_user_id: 'user-1',
+          participant_user_ids: ['user-1', 'user-2'],
+          status: 'completed',
+        }),
+        currentUserId: 'user-1',
+      };
+      render(<CallEventMessage {...props} />);
+      expect(screen.getByText(/Outbound call answered — 1:30/)).toBeInTheDocument();
+    });
+
+    it('labels an unanswered call from the callee perspective as missed incoming', () => {
+      const props = {
+        payload: basePayload({ caller_user_id: 'user-2', status: 'missed' }),
+        currentUserId: 'user-1',
+      };
+      render(<CallEventMessage {...props} />);
+      expect(screen.getByText('Inbound call missed')).toBeInTheDocument();
+    });
+  });
+
   describe('formatDuration (exercised via completed-status rendering)', () => {
     it('renders 0:00 for zero duration', () => {
       render(
@@ -118,6 +142,7 @@ describe('CallEventMessage', () => {
       render(
         <CallEventMessage
           isGroup
+          currentUserId="a"
           payload={basePayload({
             status: 'completed',
             duration_seconds: 323,

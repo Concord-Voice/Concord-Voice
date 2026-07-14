@@ -26,6 +26,14 @@ interface DMChatAreaProps {
   selectedThreadId: string | null;
 }
 
+type VoiceJoinAvailability = 'available' | 'joining' | 'busy';
+
+function voiceJoinButtonTitle(availability: VoiceJoinAvailability): string {
+  if (availability === 'busy') return 'Another voice call is already in progress';
+  if (availability === 'joining') return 'Joining voice call';
+  return 'Join voice call';
+}
+
 const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
   const [showGroupInfo, setShowGroupInfo] = useState(false);
   const [showPinnedPanel, setShowPinnedPanel] = useState(false);
@@ -78,6 +86,13 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
   // affordance (you don't join a call you're in). Backed by the store's DM
   // call fields set on join.
   const isInThisCall = useVoiceStore((s) => s.isDMCall && s.dmConversationId === selectedThreadId);
+  const voiceJoinAvailability = useVoiceStore((s) => {
+    if (s.callState.kind === 'idle') return 'available';
+    if (s.callState.kind === 'joining' && s.callState.conversationId === selectedThreadId) {
+      return 'joining';
+    }
+    return 'busy';
+  });
 
   // Subscribe to active DM conversation for real-time messages
   useDMSubscription(selectedThreadId);
@@ -274,6 +289,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
             <button
               type="button"
               className="dm-chat-header-join-call-btn"
+              disabled={voiceJoinAvailability !== 'available'}
               onClick={() => {
                 if (!activeConv) return;
                 void voiceService.joinChannel(activeConv.id, 'dm').catch((err: unknown) => {
@@ -285,11 +301,13 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
                   );
                 });
               }}
-              aria-label="Join voice call"
-              title="Join voice call"
+              aria-label={
+                voiceJoinAvailability === 'joining' ? 'Joining voice call' : 'Join voice call'
+              }
+              title={voiceJoinButtonTitle(voiceJoinAvailability)}
             >
               <Phone size={16} />
-              <span>Join voice call</span>
+              <span>{voiceJoinAvailability === 'joining' ? 'Joining…' : 'Join voice call'}</span>
             </button>
           )}
           <button

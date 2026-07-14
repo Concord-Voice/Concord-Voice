@@ -72,6 +72,7 @@ import { errorMessage } from '../utils/redactError';
 import { hasPermission, SPEAK } from '../utils/permissions';
 import { clampScreenForSubscription } from '../utils/videoLimits';
 import { SCREEN_RES_DIMS, resolveScreenDims } from '../utils/screenResolution';
+import type { CallState } from './voiceService/callStateMachine';
 
 // Toggle for verbose E2EE/SDP diagnostics — set to true when debugging
 // frame drops, BUNDLE collisions, or key rotation issues. When false,
@@ -258,6 +259,7 @@ function buildPriorityParams(
 
 interface JoinResponse {
   allowed: boolean;
+  call_id?: string;
   media_server_url: string;
   ice_servers: Array<{ urls: string; username?: string; credential?: string }>;
   // Server-channel responses include `channel`; DM voice responses omit it
@@ -2427,18 +2429,85 @@ class VoiceService {
     return synthesizePeerName(conversation.participants, currentUserId);
   }
 
+  private claimDMJoinOwnership(
+    channelId: string,
+    joinType: 'channel' | 'dm',
+    store: ReturnType<typeof useVoiceStore.getState>
+  ): Extract<CallState, { kind: 'joining' }> | undefined {
+    if (joinType !== 'dm') return undefined;
+
+    const callState = store.callState;
+    const isMatchingRingJoin =
+      (callState.kind === 'outgoing-ringing' ||
+        callState.kind === 'incoming-ringing' ||
+        callState.kind === 'joining') &&
+      callState.conversationId === channelId &&
+      callState.ringId.length > 0;
+
+    if (callState.kind !== 'idle') {
+      if (!isMatchingRingJoin) throw new Error('Another voice call is already in progress');
+      return undefined;
+    }
+
+    // Claim global ownership synchronously so a second click or a racing
+    // invitation cannot start another session before the first await.
+    const joiningState: Extract<CallState, { kind: 'joining' }> = {
+      kind: 'joining',
+      conversationId: channelId,
+      ringId: '',
+    };
+    store.setCallState(joiningState);
+    return joiningState;
+  }
+
+  private dmJoiningStateToPreserve(
+    channelId: string,
+    joinType: 'channel' | 'dm'
+  ): Extract<CallState, { kind: 'joining' }> | undefined {
+    const callState = useVoiceStore.getState().callState;
+    if (
+      joinType === 'dm' &&
+      callState.kind === 'joining' &&
+      callState.conversationId === channelId
+    ) {
+      return callState;
+    }
+    return undefined;
+  }
+
+  private async leaveActiveChannelBeforeJoin(
+    store: ReturnType<typeof useVoiceStore.getState>,
+    callStateToPreserve: Extract<CallState, { kind: 'joining' }> | undefined
+  ): Promise<void> {
+    if (!store.activeChannelId) return;
+    await this.leaveChannel();
+    if (!callStateToPreserve || useVoiceStore.getState().callState.kind !== 'idle') return;
+    useVoiceStore.getState().setCallState(callStateToPreserve);
+  }
+
+  private async resolveAuthorizedJoinChannel(
+    joinData: JoinResponse,
+    channelId: string,
+    joinType: 'channel' | 'dm'
+  ): Promise<NonNullable<JoinResponse['channel']>> {
+    if (joinData.channel) return joinData.channel;
+    if (joinType === 'dm') return this.synthesizeDMChannel(channelId);
+    throw new Error('Voice join response missing channel info');
+  }
+
   /** Authorize and join a voice channel */
   async joinChannel(channelId: string, joinType: 'channel' | 'dm' = 'channel'): Promise<void> {
     const store = useVoiceStore.getState();
-    if (store.activeChannelId) {
-      await this.leaveChannel();
-    }
+    const directDMJoiningState = this.claimDMJoinOwnership(channelId, joinType, store);
+    const callStateToPreserve = this.dmJoiningStateToPreserve(channelId, joinType);
+    const ringId = joinType === 'dm' ? this.currentDMRingID(channelId) : undefined;
+    await this.leaveActiveChannelBeforeJoin(store, callStateToPreserve);
 
     store.setConnectionState('connecting');
 
     try {
       // Step 1: Authorize via control plane (uses apiFetch for automatic token refresh)
-      const joinData = await this.authorizeVoiceJoin(channelId, joinType);
+      const joinData = await this.authorizeVoiceJoin(channelId, joinType, ringId);
 
       const { media_server_url } = joinData;
       // For DM voice joins the response omits `channel` and includes
@@ -2447,12 +2516,7 @@ class VoiceService {
       // (#1209 plan task F4 — VoiceView channelName synthesis). Extracted
       // into synthesizeDMChannel to keep joinChannel's cognitive complexity
       // under the 15-statement bound (was 19 before extraction).
-      const channel =
-        joinData.channel ??
-        (joinType === 'dm' ? await this.synthesizeDMChannel(channelId) : undefined);
-      if (!channel) {
-        throw new Error('Voice join response missing channel info');
-      }
+      const channel = await this.resolveAuthorizedJoinChannel(joinData, channelId, joinType);
 
       store.setActiveChannel(channel.id, channel.name, channel.server_id);
 
@@ -2535,6 +2599,9 @@ class VoiceService {
       store.setConnectionState('connected');
       notificationSoundService.stopAllLoops();
       notificationSoundService.play(joinType === 'dm' ? 'call-connected' : 'voice-join');
+      if (directDMJoiningState && useVoiceStore.getState().callState === directDMJoiningState) {
+        store.setCallState({ kind: 'in-call' });
+      }
 
       // Step 10: Start decoder budget profiling (IGNIS insight)
       // Profiles decode performance and adjusts SVC layers to avoid queue buildup
@@ -2680,7 +2747,8 @@ class VoiceService {
    */
   private async authorizeVoiceJoin(
     channelId: string,
-    joinType: 'channel' | 'dm'
+    joinType: 'channel' | 'dm',
+    ringId?: string
   ): Promise<JoinResponse> {
     const endpoint =
       joinType === 'dm'
@@ -2689,6 +2757,7 @@ class VoiceService {
     const res = await apiFetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      ...(ringId ? { body: JSON.stringify({ ring_id: ringId }) } : {}),
     });
 
     if (!res.ok) {
@@ -2699,6 +2768,22 @@ class VoiceService {
     const joinData: JoinResponse = await res.json();
     if (!joinData.allowed) throw new Error('Not allowed to join this channel');
     return joinData;
+  }
+
+  /** Ring correlation is valid only while joining the conversation that owns it. */
+  private currentDMRingID(channelId: string): string | undefined {
+    const state = useVoiceStore.getState().callState;
+    if (
+      state.kind !== 'outgoing-ringing' &&
+      state.kind !== 'incoming-ringing' &&
+      state.kind !== 'joining'
+    ) {
+      return undefined;
+    }
+    if (state.conversationId !== channelId) {
+      return undefined;
+    }
+    return state.ringId || undefined;
   }
 
   /**
@@ -2721,6 +2806,7 @@ class VoiceService {
       roomId: channelId,
       rtpCapabilities: undefined, // Will be set after device.load
       mediaFrameCryptoVersion: MEDIA_E2EE_FRAME_CRYPTO_VERSION,
+      ...(joinData.call_id ? { callId: joinData.call_id } : {}),
     });
     if (roomJoined.mediaFrameCryptoVersion !== MEDIA_E2EE_FRAME_CRYPTO_VERSION) {
       throw new Error('Media frame crypto version mismatch');

@@ -18,7 +18,7 @@ export interface ChatContext {
 
 /** Status of a DM voice call as recorded in the dm_messages.call_event_payload
  *  JSONB column (plaintext server metadata; no client-side decryption). */
-export type CallEventStatus = 'completed' | 'missed' | 'declined' | 'canceled';
+export type CallEventStatus = 'completed' | 'missed' | 'declined' | 'canceled' | 'failed';
 
 /** Shape of dm_messages.call_event_payload for rows where type === 'call_event'.
  *  Centralized here (#1219) so the Message type, the CallEventMessage component,

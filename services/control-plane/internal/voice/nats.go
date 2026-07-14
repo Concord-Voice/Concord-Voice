@@ -4,13 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/dm"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 	natsclient "github.com/markdrogersjr/Concord/services/control-plane/pkg/nats"
+	"github.com/redis/go-redis/v9"
 )
 
 // NATSSubscriber listens for voice events from the media plane and
@@ -20,6 +25,7 @@ type NATSSubscriber struct {
 	log       *logger.Logger
 	hub       *websocket.Hub
 	nats      *natsclient.Client
+	redis     *redis.Client
 	tempGrant *tempGrantManager
 	// permEnforcer re-pushes fresh permissions when a join lands (CV-CAN-007
 	// review P1 join-race): a join-authorize resolved before a mutation whose
@@ -27,6 +33,15 @@ type NATSSubscriber struct {
 	// otherwise hold a stale snapshot no push covers. Optional (nil = no-op).
 	permEnforcer *PermissionEnforcer
 }
+
+var errInvalidDMVoiceCallLifecycle = errors.New("invalid DM voice call lifecycle identity")
+
+const (
+	dmRoomEmptyCleanupTimeout = 10 * time.Second
+	// ponytail: bounded retries cover transient DB errors; persistent failures
+	// fall back to the existing 90-second presence expiry.
+	dmRoomEmptyCleanupAttempts = 3
+)
 
 // SetPermissionEnforcer wires the mid-session permission push into the
 // voice.joined bridge. Called once at router construction.
@@ -37,12 +52,13 @@ func (s *NATSSubscriber) SetPermissionEnforcer(e *PermissionEnforcer) {
 // NewNATSSubscriber creates a new NATS subscriber for voice events. The resolver is
 // required so the subscriber can drive temporary-SBAC cleanup (#487 P1) on
 // voice.left / heartbeat stale-removal through the shared tempGrantManager.
-func NewNATSSubscriber(db *sql.DB, log *logger.Logger, hub *websocket.Hub, nats *natsclient.Client, resolver *rbac.Resolver) *NATSSubscriber {
+func NewNATSSubscriber(db *sql.DB, log *logger.Logger, hub *websocket.Hub, nats *natsclient.Client, redisClient *redis.Client, resolver *rbac.Resolver) *NATSSubscriber {
 	return &NATSSubscriber{
 		db:        db,
 		log:       log,
 		hub:       hub,
 		nats:      nats,
+		redis:     redisClient,
 		tempGrant: newTempGrantManager(db, log, hub, resolver, nats),
 	}
 }
@@ -50,6 +66,7 @@ func NewNATSSubscriber(db *sql.DB, log *logger.Logger, hub *websocket.Hub, nats 
 // voiceJoinedEvent matches the media plane's voice.joined NATS payload.
 type voiceJoinedEvent struct {
 	ChannelID   string `json:"channelId"`
+	CallID      string `json:"callId"`
 	UserID      string `json:"userId"`
 	Username    string `json:"username"`
 	DisplayName string `json:"displayName,omitempty"`
@@ -59,21 +76,86 @@ type voiceJoinedEvent struct {
 // voiceLeftEvent matches the media plane's voice.left NATS payload.
 type voiceLeftEvent struct {
 	ChannelID string `json:"channelId"`
+	CallID    string `json:"callId"`
 	UserID    string `json:"userId"`
 	Timestamp string `json:"timestamp"`
 }
 
 // voiceRoomEmptyEvent matches the media plane's voice.room_empty NATS payload.
 type voiceRoomEmptyEvent struct {
-	ChannelID string `json:"channelId"`
-	Timestamp string `json:"timestamp"`
+	ChannelID          string   `json:"channelId"`
+	CallID             string   `json:"callId"`
+	RingID             string   `json:"ringId"`
+	CallerUserID       string   `json:"callerUserId"`
+	ParticipantUserIDs []string `json:"participantUserIds"`
+	StartedAt          string   `json:"startedAt"`
+	Timestamp          string   `json:"timestamp"`
 }
 
 // voiceHeartbeatEvent is the per-room heartbeat from the media plane.
 type voiceHeartbeatEvent struct {
-	ChannelID string   `json:"channelId"`
-	UserIDs   []string `json:"userIds"`
-	Timestamp string   `json:"timestamp"`
+	ChannelID    string   `json:"channelId"`
+	CallID       string   `json:"callId"`
+	RingID       string   `json:"ringId"`
+	CallerUserID string   `json:"callerUserId"`
+	UserIDs      []string `json:"userIds"`
+	Timestamp    string   `json:"timestamp"`
+}
+
+func completedCallSummaryFromRoomEmpty(event voiceRoomEmptyEvent) (dm.CompletedCallSummary, bool, error) {
+	hasSummary := event.CallID != "" || event.CallerUserID != "" ||
+		len(event.ParticipantUserIDs) > 0 || event.StartedAt != ""
+	if !hasSummary {
+		return dm.CompletedCallSummary{}, false, nil
+	}
+
+	callID, err := uuid.Parse(event.CallID)
+	if err != nil {
+		return dm.CompletedCallSummary{}, true, fmt.Errorf("invalid callId: %w", err)
+	}
+	callerUserID, err := uuid.Parse(event.CallerUserID)
+	if err != nil {
+		return dm.CompletedCallSummary{}, true, fmt.Errorf("invalid callerUserId: %w", err)
+	}
+	startedAt, err := time.Parse(time.RFC3339, event.StartedAt)
+	if err != nil {
+		return dm.CompletedCallSummary{}, true, fmt.Errorf("invalid startedAt: %w", err)
+	}
+	endedAt, err := time.Parse(time.RFC3339, event.Timestamp)
+	if err != nil {
+		return dm.CompletedCallSummary{}, true, fmt.Errorf("invalid timestamp: %w", err)
+	}
+
+	participants := make([]uuid.UUID, 0, len(event.ParticipantUserIDs))
+	seen := make(map[uuid.UUID]struct{}, len(event.ParticipantUserIDs))
+	for _, rawUserID := range event.ParticipantUserIDs {
+		userID, parseErr := uuid.Parse(rawUserID)
+		if parseErr != nil {
+			return dm.CompletedCallSummary{}, true, fmt.Errorf("invalid participant user ID: %w", parseErr)
+		}
+		if _, duplicate := seen[userID]; duplicate {
+			continue
+		}
+		seen[userID] = struct{}{}
+		participants = append(participants, userID)
+	}
+
+	ringID := uuid.Nil
+	if event.RingID != "" {
+		ringID, err = uuid.Parse(event.RingID)
+		if err != nil {
+			return dm.CompletedCallSummary{}, true, fmt.Errorf("invalid ringId: %w", err)
+		}
+	}
+
+	return dm.CompletedCallSummary{
+		CallID:             callID,
+		RingID:             ringID,
+		CallerUserID:       callerUserID,
+		ParticipantUserIDs: participants,
+		StartedAt:          startedAt,
+		EndedAt:            endedAt,
+	}, true, nil
 }
 
 // roomContext holds the resolved context for a voice room.
@@ -113,23 +195,122 @@ func (s *NATSSubscriber) resolveRoom(channelID string) (*roomContext, error) {
 	return &roomContext{isDM: true, convUUID: convUUID}, nil
 }
 
-// Subscribe registers handlers for all voice NATS subjects.
+// Subscribe registers one wildcard lifecycle handler. nats.go serializes
+// callbacks per subscription, so a single subscription preserves one media
+// publisher's joined -> left -> room_empty order across distinct subjects. It
+// does not establish ordering between independent media-plane publishers.
 func (s *NATSSubscriber) Subscribe() error {
-	if _, err := s.nats.Subscribe(natsSubjectVoiceJoined, s.handleJoined); err != nil {
-		return err
-	}
-	if _, err := s.nats.Subscribe(natsSubjectVoiceLeft, s.handleLeft); err != nil {
-		return err
-	}
-	if _, err := s.nats.Subscribe(natsSubjectVoiceRoomEmpty, s.handleRoomEmpty); err != nil {
-		return err
-	}
-	if _, err := s.nats.Subscribe(natsSubjectVoiceHeartbeat, s.handleHeartbeat); err != nil {
+	if _, err := s.nats.SubscribeWithSubject(natsSubjectVoiceWildcard, s.handleVoiceLifecycleEvent); err != nil {
 		return err
 	}
 
 	s.log.Info("Subscribed to voice NATS events")
 	return nil
+}
+
+func (s *NATSSubscriber) handleVoiceLifecycleEvent(subject string, data []byte) {
+	switch subject {
+	case natsSubjectVoiceJoined:
+		s.handleJoined(data)
+	case natsSubjectVoiceLeft:
+		s.handleLeft(data)
+	case natsSubjectVoiceRoomEmpty:
+		s.handleRoomEmpty(data)
+	case natsSubjectVoiceHeartbeat:
+		s.handleHeartbeat(data)
+	}
+}
+
+func parseDMVoiceCallLifecycleID(rawID, label string) (uuid.UUID, error) {
+	id, err := uuid.Parse(rawID)
+	if err != nil || id == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("%w: invalid %s ID", errInvalidDMVoiceCallLifecycle, label)
+	}
+	return id, nil
+}
+
+func parseOptionalDMVoiceCallLifecycleID(rawID, label string) (uuid.UUID, error) {
+	if rawID == "" {
+		return uuid.Nil, nil
+	}
+	return parseDMVoiceCallLifecycleID(rawID, label)
+}
+
+func (s *NATSSubscriber) refreshDMVoiceCallLease(
+	ctx context.Context,
+	conversationID uuid.UUID,
+	rawCallID, rawRingID, rawCallerUserID string,
+	authoritativeMetadata bool,
+) error {
+	callID, err := parseDMVoiceCallLifecycleID(rawCallID, "call")
+	if err != nil {
+		return err
+	}
+	ringID, err := parseOptionalDMVoiceCallLifecycleID(rawRingID, "ring")
+	if err != nil {
+		return err
+	}
+	callerUserID, err := parseOptionalDMVoiceCallLifecycleID(rawCallerUserID, "caller")
+	if err != nil {
+		return err
+	}
+
+	existing, hasLease, lookupErr := dm.LookupDMVoiceCallLease(ctx, s.redis, conversationID)
+	if lookupErr != nil {
+		return lookupErr
+	}
+	// /ring and media lifecycle claims share LockDMCallLifecycle. Once /ring
+	// publishes a new pending ring, an old room whose lease expired must not be
+	// allowed to reclaim the empty shared slot on its next joined/heartbeat.
+	if !hasLease && dm.HasLocalPendingDMCall(conversationID) {
+		return fmt.Errorf("%w: pending ring owns conversation", errInvalidDMVoiceCallLifecycle)
+	}
+	if callerUserID == uuid.Nil && hasLease && existing.CallID == callID {
+		callerUserID = existing.CallerUserID
+		if ringID == uuid.Nil {
+			ringID = existing.RingID
+		}
+	}
+	if callerUserID == uuid.Nil {
+		return fmt.Errorf("%w: missing caller ID", errInvalidDMVoiceCallLifecycle)
+	}
+
+	return dm.RefreshDMVoiceCallLease(ctx, s.redis, dm.VoiceCallLease{
+		ConversationID: conversationID,
+		CallID:         callID,
+		RingID:         ringID,
+		CallerUserID:   callerUserID,
+	}, dm.DMVoiceCallLeaseTTL, authoritativeMetadata)
+}
+
+// dmCallEventMayMutateLiveState checks whether a left/room-empty event can
+// change conversation-wide live presence. Exact events are accepted when no
+// newer lease or pending ring exists, or when they match the current lease's
+// call ID. An ID-less legacy event is accepted only after the shared lease and
+// local pending ring are gone; otherwise there is no safe way to correlate it.
+//
+// Callers must hold dm.LockDMCallLifecycle for the conversation so a local
+// authorize/ring transition cannot appear between this check and DB/WS effects.
+func (s *NATSSubscriber) dmCallEventMayMutateLiveState(
+	ctx context.Context,
+	conversationID uuid.UUID,
+	rawCallID string,
+) (bool, error) {
+	lease, hasLease, err := dm.LookupDMVoiceCallLease(ctx, s.redis, conversationID)
+	if err != nil {
+		return false, err
+	}
+	if !hasLease && dm.HasLocalPendingDMCall(conversationID) {
+		return false, nil
+	}
+	if rawCallID == "" {
+		return !hasLease, nil
+	}
+	callID, err := uuid.Parse(rawCallID)
+	if err != nil || callID == uuid.Nil {
+		return false, fmt.Errorf("%w: invalid call ID", errInvalidDMVoiceCallLifecycle)
+	}
+	return !hasLease || lease.CallID == callID, nil
 }
 
 func (s *NATSSubscriber) handleJoined(data []byte) {
@@ -146,6 +327,22 @@ func (s *NATSSubscriber) handleJoined(data []byte) {
 	}
 
 	if ctx.isDM {
+		unlockLifecycle := dm.LockDMCallLifecycle(ctx.convUUID)
+		defer unlockLifecycle()
+
+		// Establish/renew the shared exact call identity before publishing live
+		// presence. For direct calls the first joined user is the caller; accepted
+		// rings already carry their server-authored caller in the lease.
+		if err := s.refreshDMVoiceCallLease(
+			context.Background(), ctx.convUUID, event.CallID, "", event.UserID, false,
+		); err != nil {
+			s.log.Error("Failed to refresh DM voice call lease from join", "error", err,
+				"conversation_id", event.ChannelID, "call_id", event.CallID)
+			// The lease is the exact-call fence. If Redis cannot prove ownership,
+			// fail closed before publishing presence for a potentially stale room.
+			return
+		}
+
 		// Insert into dm_voice_participants
 		_, err := s.db.Exec(`
 			INSERT INTO dm_voice_participants (conversation_id, user_id, joined_at)
@@ -157,7 +354,7 @@ func (s *NATSSubscriber) handleJoined(data []byte) {
 			return
 		}
 
-		s.hub.BroadcastToDM(ctx.convUUID, websocket.OutgoingMessage{
+		s.hub.BroadcastToDMParticipants(ctx.convUUID, websocket.OutgoingMessage{
 			Type: "dm_voice_state_update",
 			Data: map[string]interface{}{
 				"conversation_id": event.ChannelID,
@@ -226,13 +423,30 @@ func (s *NATSSubscriber) handleLeft(data []byte) {
 	}
 
 	if ctx.isDM {
+		unlockLifecycle := dm.LockDMCallLifecycle(ctx.convUUID)
+		defer unlockLifecycle()
+
+		mayMutate, ownershipErr := s.dmCallEventMayMutateLiveState(
+			context.Background(), ctx.convUUID, event.CallID,
+		)
+		if ownershipErr != nil {
+			s.log.Error("Failed to validate DM voice.left lifecycle", "error", ownershipErr,
+				"conversation_id", event.ChannelID, "call_id", event.CallID)
+			return
+		}
+		if !mayMutate {
+			s.log.Warn("Ignored stale or uncorrelated DM voice.left event",
+				"conversation_id", event.ChannelID, "call_id", event.CallID)
+			return
+		}
+
 		_, err := s.db.Exec(`DELETE FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2`, event.ChannelID, event.UserID)
 		if err != nil {
 			s.log.Error("Failed to delete DM voice participant", "error", err, "conversation_id", event.ChannelID, "user_id", event.UserID)
 			return
 		}
 
-		s.hub.BroadcastToDM(ctx.convUUID, websocket.OutgoingMessage{
+		s.hub.BroadcastToDMParticipants(ctx.convUUID, websocket.OutgoingMessage{
 			Type: "dm_voice_state_update",
 			Data: map[string]interface{}{
 				"conversation_id": event.ChannelID,
@@ -272,6 +486,276 @@ func (s *NATSSubscriber) handleLeft(data []byte) {
 	}
 }
 
+func (s *NATSSubscriber) persistDMRoomEmptySummary(
+	event voiceRoomEmptyEvent,
+	conversationID uuid.UUID,
+) (bool, error) {
+	summary, hasSummary, err := completedCallSummaryFromRoomEmpty(event)
+	switch {
+	case err != nil:
+		s.log.Error("Rejected malformed DM room-empty call summary",
+			"error", err, "conversation_id", event.ChannelID)
+	case hasSummary:
+		// Persist an exact old-call summary even when a newer call now owns
+		// live presence. The call ID makes this insert idempotent and distinct
+		// from the replacement lifecycle.
+		if insertErr := dm.InsertCompletedCallEvent(context.Background(), s.db, conversationID, summary); insertErr != nil {
+			s.log.Error("Failed to insert completed call_event row",
+				"error", insertErr, "conversation_id", event.ChannelID, "call_id", event.CallID)
+		}
+	default:
+		// Best-effort legacy fallback only. ID-less media events cannot renew or
+		// terminate an exact shared lease and therefore do not provide complete
+		// rolling-version compatibility. We run the live-presence fallback below
+		// only when no exact call currently owns the conversation.
+		s.log.Warn("Legacy DM room-empty event lacks terminal call summary",
+			"conversation_id", event.ChannelID)
+	}
+	return hasSummary, err
+}
+
+func parseDMRoomEmptyCallID(rawCallID string) (uuid.UUID, error) {
+	callID, err := uuid.Parse(rawCallID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if callID == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("%w: zero call ID", errInvalidDMVoiceCallLifecycle)
+	}
+	return callID, nil
+}
+
+func (s *NATSSubscriber) beginDMRoomEmptyCleanup(
+	event voiceRoomEmptyEvent,
+	conversationID uuid.UUID,
+) (func(), bool) {
+	if event.CallID == "" {
+		return func() {
+			// Legacy ID-less events do not acquire a distributed cleanup guard.
+		}, true
+	}
+	callID, err := parseDMRoomEmptyCallID(event.CallID)
+	if err != nil {
+		s.log.Error("Failed to begin malformed DM voice call cleanup", "error", err,
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return nil, false
+	}
+	acquired, err := dm.BeginDMVoiceCallCleanup(
+		context.Background(), s.redis, conversationID, callID,
+	)
+	if err != nil {
+		s.log.Error("Failed to begin terminal DM voice call cleanup", "error", err,
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return nil, false
+	}
+	if !acquired {
+		s.log.Warn("Ignored stale or concurrent DM voice call cleanup",
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return nil, false
+	}
+
+	release := func() {
+		if err := dm.EndDMVoiceCallCleanup(
+			context.Background(), s.redis, conversationID, callID,
+		); err != nil {
+			s.log.Error("Failed to release terminal DM voice call cleanup guard", "error", err,
+				"conversation_id", event.ChannelID, "call_id", event.CallID)
+		}
+	}
+	return release, true
+}
+
+func (s *NATSSubscriber) handleDMRoomEmpty(event voiceRoomEmptyEvent, conversationID uuid.UUID) bool {
+	hasSummary, summaryErr := s.persistDMRoomEmptySummary(event, conversationID)
+	releaseCleanup, acquired := s.beginDMRoomEmptyCleanup(event, conversationID)
+	if !acquired {
+		return false
+	}
+	defer releaseCleanup()
+	cleanupCtx, cancelCleanup := context.WithTimeout(
+		context.Background(), dmRoomEmptyCleanupTimeout,
+	)
+	defer cancelCleanup()
+
+	mayMutate, err := s.dmCallEventMayMutateLiveState(
+		cleanupCtx, conversationID, event.CallID,
+	)
+	if err != nil {
+		s.log.Error("Failed to validate DM room-empty lifecycle", "error", err,
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return false
+	}
+	if !mayMutate {
+		s.log.Warn("Ignored stale or uncorrelated DM room-empty live-state cleanup",
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return false
+	}
+
+	return s.finishDMRoomEmptyLiveState(
+		cleanupCtx, event, conversationID, !hasSummary && summaryErr == nil,
+	)
+}
+
+func (s *NATSSubscriber) finishDMRoomEmptyLiveState(
+	ctx context.Context,
+	event voiceRoomEmptyEvent,
+	conversationID uuid.UUID,
+	persistFallback bool,
+) bool {
+	if persistFallback {
+		s.persistDMRoomEmptyFallback(ctx, event, conversationID)
+	}
+
+	if err := s.clearDMVoiceParticipants(ctx, event.ChannelID); err != nil {
+		s.log.Error("Failed to clear DM voice participants", "error", err, "conversation_id", event.ChannelID)
+		return false
+	}
+
+	s.hub.BroadcastToDMParticipants(conversationID, websocket.OutgoingMessage{
+		Type: "dm_voice_state_update",
+		Data: map[string]interface{}{
+			"conversation_id": event.ChannelID,
+			"action":          "room_empty",
+		},
+	})
+	return true
+}
+
+func (s *NATSSubscriber) clearDMVoiceParticipants(ctx context.Context, conversationID string) error {
+	var err error
+	for attempt := 0; attempt < dmRoomEmptyCleanupAttempts; attempt++ {
+		_, err = s.db.ExecContext(
+			ctx, `DELETE FROM dm_voice_participants WHERE conversation_id = $1`, conversationID,
+		)
+		if err == nil || ctx.Err() != nil {
+			return err
+		}
+		if attempt+1 < dmRoomEmptyCleanupAttempts {
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
+	return err
+}
+
+func (s *NATSSubscriber) persistDMRoomEmptyFallback(
+	ctx context.Context,
+	event voiceRoomEmptyEvent,
+	conversationID uuid.UUID,
+) {
+	if event.CallID == "" {
+		if err := dm.InsertCompletedCallEventForDMRoom(
+			ctx, s.db, conversationID,
+		); err != nil {
+			s.log.Error("Failed to insert legacy completed call_event row",
+				"error", err, "conversation_id", event.ChannelID)
+		}
+		return
+	}
+
+	callID, err := parseDMRoomEmptyCallID(event.CallID)
+	if err != nil {
+		s.log.Error("Failed to parse heartbeat fallback call ID", "error", err,
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return
+	}
+	callerUserID, err := uuid.Parse(event.CallerUserID)
+	if err != nil || callerUserID == uuid.Nil {
+		s.log.Error("Failed to parse heartbeat fallback caller ID", "error", err,
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return
+	}
+	ringID, err := parseOptionalDMVoiceCallLifecycleID(event.RingID, "ring")
+	if err != nil {
+		s.log.Error("Failed to parse heartbeat fallback ring ID", "error", err,
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return
+	}
+	endedAt, err := time.Parse(time.RFC3339, event.Timestamp)
+	if err != nil {
+		s.log.Error("Failed to parse heartbeat fallback timestamp", "error", err,
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return
+	}
+	if err := dm.InsertCompletedCallEventForDMHeartbeat(
+		ctx, s.db, conversationID, callID, ringID, callerUserID, endedAt,
+	); err != nil {
+		s.log.Error("Failed to insert exact heartbeat completed call_event row",
+			"error", err, "conversation_id", event.ChannelID, "call_id", event.CallID)
+	}
+}
+
+func (s *NATSSubscriber) handleEmptyDMHeartbeat(
+	event voiceHeartbeatEvent,
+	conversationID uuid.UUID,
+) bool {
+	// An empty heartbeat is an exact terminal reconciliation signal. Fence it
+	// against a replacement call before deleting the matching lease/tombstoning
+	// its ID, then preserve the presence-derived fallback while rows still exist.
+	callID, err := parseDMRoomEmptyCallID(event.CallID)
+	if err != nil {
+		s.log.Error("Rejected empty DM heartbeat without an exact call ID", "error", err,
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return false
+	}
+	terminal := voiceRoomEmptyEvent{
+		ChannelID:    event.ChannelID,
+		CallID:       event.CallID,
+		RingID:       event.RingID,
+		CallerUserID: event.CallerUserID,
+		Timestamp:    event.Timestamp,
+	}
+	lease, hasLease, err := dm.LookupDMVoiceCallLease(
+		context.Background(), s.redis, conversationID,
+	)
+	if err != nil {
+		s.log.Error("Failed to resolve empty DM heartbeat lease metadata", "error", err,
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return false
+	}
+	if hasLease && lease.CallID == callID {
+		if terminal.CallerUserID == "" {
+			terminal.CallerUserID = lease.CallerUserID.String()
+		}
+		if terminal.RingID == "" && lease.RingID != uuid.Nil {
+			terminal.RingID = lease.RingID.String()
+		}
+	}
+
+	releaseCleanup, acquired := s.beginDMRoomEmptyCleanup(terminal, conversationID)
+	if !acquired {
+		return false
+	}
+	defer releaseCleanup()
+	cleanupCtx, cancelCleanup := context.WithTimeout(
+		context.Background(), dmRoomEmptyCleanupTimeout,
+	)
+	defer cancelCleanup()
+
+	// Re-check after the exact Redis delete. A replacement call claimed on
+	// another replica before the cleanup guard was acquired is preserved. While
+	// the guard is held, no replacement can claim the lease until the DB cleanup
+	// and room-empty broadcast have completed.
+	mayMutate, err := s.dmCallEventMayMutateLiveState(
+		cleanupCtx, conversationID, event.CallID,
+	)
+	if err != nil {
+		s.log.Error("Failed to validate empty DM heartbeat lifecycle", "error", err,
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return false
+	}
+	if !mayMutate {
+		s.log.Warn("Ignored stale or uncorrelated empty DM heartbeat",
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		return false
+	}
+
+	return s.finishDMRoomEmptyLiveState(cleanupCtx, terminal, conversationID, true)
+}
+
 func (s *NATSSubscriber) handleRoomEmpty(data []byte) {
 	var event voiceRoomEmptyEvent
 	if err := json.Unmarshal(data, &event); err != nil {
@@ -286,28 +770,11 @@ func (s *NATSSubscriber) handleRoomEmpty(data []byte) {
 	}
 
 	if ctx.isDM {
-		// Insert the completed call_event row BEFORE the DELETE so the
-		// helper can read the in-flight dm_voice_participants. Per spec
-		// section 6.1 edge case "Call-event insert on hang-up failure":
-		// best-effort; failure logged, doesn't block the room-cleanup.
-		// #1209 plan task B7 Part 1.
-		if err := dm.InsertCompletedCallEventForDMRoom(context.Background(), s.db, ctx.convUUID); err != nil {
-			s.log.Error("Failed to insert completed call_event row",
-				"error", err, "conversation_id", event.ChannelID)
+		unlockLifecycle := dm.LockDMCallLifecycle(ctx.convUUID)
+		defer unlockLifecycle()
+		if !s.handleDMRoomEmpty(event, ctx.convUUID) {
+			return
 		}
-
-		_, err := s.db.Exec(`DELETE FROM dm_voice_participants WHERE conversation_id = $1`, event.ChannelID)
-		if err != nil {
-			s.log.Error("Failed to clear DM voice participants", "error", err, "conversation_id", event.ChannelID)
-		}
-
-		s.hub.BroadcastToDM(ctx.convUUID, websocket.OutgoingMessage{
-			Type: "dm_voice_state_update",
-			Data: map[string]interface{}{
-				"conversation_id": event.ChannelID,
-				"action":          "room_empty",
-			},
-		})
 	} else {
 		_, err := s.db.Exec(`DELETE FROM voice_participants WHERE channel_id = $1`, event.ChannelID)
 		if err != nil {
@@ -331,6 +798,29 @@ func (s *NATSSubscriber) handleRoomEmpty(data []byte) {
 	}
 }
 
+func (s *NATSSubscriber) refreshDMHeartbeat(event voiceHeartbeatEvent, conversationID uuid.UUID) bool {
+	if err := s.refreshDMVoiceCallLease(
+		context.Background(), conversationID, event.CallID, event.RingID, event.CallerUserID, true,
+	); err != nil {
+		s.log.Error("Failed to refresh DM voice call lease from heartbeat", "error", err,
+			"conversation_id", event.ChannelID, "call_id", event.CallID)
+		// Reconciliation can delete a replacement call's participants, so a
+		// Redis error must fail closed just like an explicit ID conflict.
+		return false
+	}
+	if _, err := s.db.Exec(`
+		INSERT INTO dm_voice_participants (conversation_id, user_id, joined_at)
+		SELECT $1, user_id, NOW()
+		FROM unnest($2::uuid[]) AS users(user_id)
+		ON CONFLICT (conversation_id, user_id)
+		DO UPDATE SET joined_at = NOW()
+	`, event.ChannelID, pq.Array(event.UserIDs)); err != nil {
+		s.log.Error("Failed to refresh DM voice presence lease", "error", err,
+			"conversation_id", event.ChannelID)
+	}
+	return true
+}
+
 // handleHeartbeat reconciles voice_participants against the media plane's
 // ground-truth room state. Any DB entries not present in the heartbeat are
 // stale (client crashed / network dropped) and get cleaned up.
@@ -345,6 +835,18 @@ func (s *NATSSubscriber) handleHeartbeat(data []byte) {
 	if err != nil {
 		s.log.Error("Failed to resolve room for voice.heartbeat", "error", err, "channel_id", event.ChannelID)
 		return
+	}
+	if ctx.isDM {
+		unlockLifecycle := dm.LockDMCallLifecycle(ctx.convUUID)
+		defer unlockLifecycle()
+
+		if len(event.UserIDs) == 0 {
+			_ = s.handleEmptyDMHeartbeat(event, ctx.convUUID)
+			return
+		}
+		if !s.refreshDMHeartbeat(event, ctx.convUUID) {
+			return
+		}
 	}
 
 	dbUsers, err := s.collectDBParticipants(event.ChannelID, ctx.isDM)
@@ -412,7 +914,7 @@ func (s *NATSSubscriber) reconcileVoiceParticipants(channelID string, ctx *roomC
 func (s *NATSSubscriber) removeStaleParticipant(channelID, userID string, ctx *roomContext) {
 	if ctx.isDM {
 		_, _ = s.db.Exec(`DELETE FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2`, channelID, userID)
-		s.hub.BroadcastToDM(ctx.convUUID, websocket.OutgoingMessage{
+		s.hub.BroadcastToDMParticipants(ctx.convUUID, websocket.OutgoingMessage{
 			Type: "dm_voice_state_update",
 			Data: map[string]interface{}{
 				"conversation_id": channelID,
@@ -480,7 +982,7 @@ func (s *NATSSubscriber) revokeTempGrantIfHeld(serverID, channelID, userID strin
 
 func (s *NATSSubscriber) broadcastRoomEmpty(channelID string, ctx *roomContext) {
 	if ctx.isDM {
-		s.hub.BroadcastToDM(ctx.convUUID, websocket.OutgoingMessage{
+		s.hub.BroadcastToDMParticipants(ctx.convUUID, websocket.OutgoingMessage{
 			Type: "dm_voice_state_update",
 			Data: map[string]interface{}{
 				"conversation_id": channelID,
@@ -504,6 +1006,7 @@ const (
 	natsSubjectEnforceDeafen     = "voice.enforce.deafen"
 	natsSubjectEnforceDisconnect = "voice.enforce.disconnect"
 
+	natsSubjectVoiceWildcard  = "voice.*"
 	natsSubjectVoiceJoined    = "voice.joined"
 	natsSubjectVoiceLeft      = "voice.left"
 	natsSubjectVoiceRoomEmpty = "voice.room_empty"

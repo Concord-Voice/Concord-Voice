@@ -690,47 +690,116 @@ function decryptAndStoreMessageContent({
     });
 }
 
-/** Handle DM call sound notifications based on voice state changes */
+type DMCallSoundState = { backgroundRingtoneConversationId: string | null };
+
+interface DMCallSoundContext {
+  conversationId: string;
+  userId: string | undefined;
+  soundState: DMCallSoundState;
+  voiceState: ReturnType<typeof useVoiceStore.getState>;
+  isInThisCall: boolean;
+  isMatchingCall: boolean;
+  ownsBackgroundRingtone: boolean;
+  ownsAudibleBackgroundRingtone: boolean;
+}
+
+function handleJoinedDMCallSound(context: DMCallSoundContext): void {
+  const { conversationId, soundState, voiceState, isInThisCall } = context;
+  if (isInThisCall) {
+    // Other party answered our call — stop ringback, play connected.
+    notificationSoundService.stopAllLoops();
+    notificationSoundService.play('call-connected');
+    soundState.backgroundRingtoneConversationId = null;
+    return;
+  }
+  if (voiceState.callState.kind !== 'idle') return;
+
+  // Only ring for the initial join. This runs before applyDMVoiceState, so a
+  // non-empty roster means the group call was already active.
+  const alreadyActive = (voiceState.activeDMCalls[conversationId]?.participantIds.length ?? 0) > 0;
+  if (alreadyActive || soundState.backgroundRingtoneConversationId !== null) return;
+  soundState.backgroundRingtoneConversationId = conversationId;
+  notificationSoundService.playLoop('call-ringing');
+}
+
+function handleLeftDMCallSound(context: DMCallSoundContext): void {
+  const {
+    conversationId,
+    userId,
+    soundState,
+    voiceState,
+    isMatchingCall,
+    ownsBackgroundRingtone,
+    ownsAudibleBackgroundRingtone,
+  } = context;
+  // This handler runs before applyDMVoiceState mutates the roster. A member
+  // leaving a group call is not terminal while anyone else remains.
+  const participantIds = voiceState.activeDMCalls[conversationId]?.participantIds ?? [];
+  const hasRemainingParticipant =
+    userId !== undefined && participantIds.some((participantId) => participantId !== userId);
+  if (hasRemainingParticipant) return;
+
+  if (
+    (isMatchingCall || ownsAudibleBackgroundRingtone) &&
+    notificationSoundService.isLooping('call-ringing')
+  ) {
+    notificationSoundService.stopLoop('call-ringing');
+    notificationSoundService.play('call-declined');
+  }
+  if (ownsBackgroundRingtone) soundState.backgroundRingtoneConversationId = null;
+}
+
+function handleEmptyDMCallSound(context: DMCallSoundContext): void {
+  const { soundState, isMatchingCall, ownsBackgroundRingtone, ownsAudibleBackgroundRingtone } =
+    context;
+  // A background call ending must not silence another conversation's ring.
+  if (isMatchingCall) {
+    notificationSoundService.stopAllLoops();
+  } else if (ownsAudibleBackgroundRingtone) {
+    notificationSoundService.stopLoop('call-ringing');
+  }
+  if (ownsBackgroundRingtone) soundState.backgroundRingtoneConversationId = null;
+}
+
+/** Handle DM call sound notifications based on voice state changes. */
 function handleDMCallSounds(
   conversationId: string,
   action: string,
-  userId: string | undefined
+  userId: string | undefined,
+  soundState: DMCallSoundState
 ): void {
   const voiceState = useVoiceStore.getState();
-  const selfId = useUserStore.getState().user?.id;
-  const isFromSelf = userId === selfId;
-
-  if (isFromSelf) return;
+  if (userId === useUserStore.getState().user?.id) return;
 
   const isInThisCall = voiceState.isDMCall && voiceState.dmConversationId === conversationId;
+  const callState = voiceState.callState;
+  const isMatchingRingingConversation =
+    (callState.kind === 'outgoing-ringing' ||
+      callState.kind === 'incoming-ringing' ||
+      callState.kind === 'joining') &&
+    callState.conversationId === conversationId;
+  const ownsBackgroundRingtone = soundState.backgroundRingtoneConversationId === conversationId;
+  const context: DMCallSoundContext = {
+    conversationId,
+    userId,
+    soundState,
+    voiceState,
+    isInThisCall,
+    isMatchingCall: isInThisCall || isMatchingRingingConversation,
+    ownsBackgroundRingtone,
+    ownsAudibleBackgroundRingtone: ownsBackgroundRingtone && callState.kind === 'idle',
+  };
 
-  if (action === 'joined') {
-    if (isInThisCall) {
-      // Other party answered our call — stop ringback, play connected
-      notificationSoundService.stopAllLoops();
-      notificationSoundService.play('call-connected');
-    } else {
-      // Someone joined a call in a DM we're not in. Only ring for the INITIAL
-      // join — a group call rings once, not on every subsequent member's join
-      // (#1219 R9). The roster is read PRE-update (this handler runs before
-      // applyDMVoiceState mutates activeDMCalls), so a non-empty roster means
-      // the call is already active and this is a join, not the first ring.
-      const alreadyActive =
-        (voiceState.activeDMCalls[conversationId]?.participantIds.length ?? 0) > 0;
-      if (!alreadyActive) {
-        notificationSoundService.playLoop('call-ringing');
-      }
-    }
-  } else if (action === 'left') {
-    if (notificationSoundService.isLooping('call-ringing')) {
-      // Caller hung up before we answered — treat as declined/missed
-      notificationSoundService.stopLoop('call-ringing');
-      notificationSoundService.play('call-declined');
-    }
-  } else if (action === 'room_empty') {
-    // Everyone left — stop any ringing
-    notificationSoundService.stopAllLoops();
-  }
+  if (action === 'joined') handleJoinedDMCallSound(context);
+  if (action === 'left') handleLeftDMCallSound(context);
+  if (action === 'room_empty') handleEmptyDMCallSound(context);
+}
+
+function refreshDMConversationPreviews(): void {
+  useDMStore
+    .getState()
+    .fetchConversations()
+    .catch(() => console.error('[DM] Unexpected conversation-preview refresh failure'));
 }
 
 export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketService>) {
@@ -742,6 +811,23 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
   const setTyping = useChatStore((s) => s.setTyping);
 
   useEffect(() => {
+    const dmCallSoundState: { backgroundRingtoneConversationId: string | null } = {
+      backgroundRingtoneConversationId: null,
+    };
+    const unsubscribeDMCallSoundState = useVoiceStore.subscribe((state) => {
+      const owner = dmCallSoundState.backgroundRingtoneConversationId;
+      const callState = state.callState;
+      if (owner === null || callState.kind === 'idle') return;
+      const callOwnsBackgroundRingtone =
+        (callState.kind === 'outgoing-ringing' ||
+          callState.kind === 'incoming-ringing' ||
+          callState.kind === 'joining') &&
+        callState.conversationId === owner;
+      if (callOwnsBackgroundRingtone) return;
+
+      notificationSoundService.stopLoop('call-ringing');
+      dmCallSoundState.backgroundRingtoneConversationId = null;
+    });
     const messageContentOperationOwner = createMessageContentOperationOwner();
     const pendingMessagePlaceholders = new Map<string, { channelId: string; messageId: string }>();
     const settleMessagePlaceholder = (channelId: string, messageId: string) =>
@@ -1983,7 +2069,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       // the R9 ringtone-suppression gate reads the PRE-update activeDMCalls
       // roster to distinguish the initial ring (empty roster) from a
       // subsequent group join (#1219 R9).
-      handleDMCallSounds(conversationId, action, userId);
+      handleDMCallSounds(conversationId, action, userId, dmCallSoundState);
 
       // Active DM-call roster reducer (#1219 R4). Feeds the "Join voice call"
       // header affordance (R5) and the "N of M in call" list indicator (R6).
@@ -1992,6 +2078,12 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       useVoiceStore
         .getState()
         .applyDMVoiceState(conversationId, action, userId, conv?.participants.length ?? 0);
+
+      // room_empty is broadcast only after the completed call-event row is
+      // persisted, so this refetch safely advances the sidebar preview.
+      if (action === 'room_empty') {
+        refreshDMConversationPreviews();
+      }
     });
 
     // Subscribed confirmation handler
@@ -2049,12 +2141,16 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     });
     const unsubDMVoiceCallCanceled = wsService.on('dm_voice_call_canceled', (msg) => {
       handleCallCanceled(msg.data);
+      if (msg.data.canceled_by !== 'someone_accepted') {
+        refreshDMConversationPreviews();
+      }
     });
     const unsubDMVoiceCallDeclined = wsService.on('dm_voice_call_declined', (msg) => {
       handleCallDeclined(msg.data);
     });
     const unsubDMVoiceCallTimedOut = wsService.on('dm_voice_call_timed_out', (msg) => {
       handleCallTimedOut(msg.data);
+      refreshDMConversationPreviews();
     });
 
     // ── Rich presence — custom text status (#1233) ──────────────────────
@@ -2070,6 +2166,18 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
 
     // Cleanup handlers
     return () => {
+      const callState = useVoiceStore.getState().callState;
+      const backgroundRingtoneIsStillOwned =
+        dmCallSoundState.backgroundRingtoneConversationId !== null &&
+        (callState.kind === 'idle' ||
+          ((callState.kind === 'outgoing-ringing' ||
+            callState.kind === 'incoming-ringing' ||
+            callState.kind === 'joining') &&
+            callState.conversationId === dmCallSoundState.backgroundRingtoneConversationId));
+      if (backgroundRingtoneIsStillOwned) {
+        notificationSoundService.stopLoop('call-ringing');
+      }
+      unsubscribeDMCallSoundState();
       deactivateMessageContentOperationOwner(messageContentOperationOwner);
       for (const { channelId, messageId } of pendingMessagePlaceholders.values()) {
         const placeholder = useChatStore

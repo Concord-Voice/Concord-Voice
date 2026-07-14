@@ -351,7 +351,7 @@ func NewRouter(
 
 	// Start NATS voice event subscriber
 	if natsClient != nil {
-		voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, rbacResolver)
+		voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver)
 		// Close the join-vs-mutation race: re-push fresh permissions when a
 		// voice.joined lands (CV-CAN-007 P1).
 		voiceSub.SetPermissionEnforcer(voicePermEnforcer)
@@ -1762,14 +1762,18 @@ func NewRouter(
 					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
 					dmHandler.CancelDMCall,
 				)
-				// G7 defense-in-depth: media-plane calls this to re-check
-				// DM auth at the SFU boundary. Higher rate limit (60/min)
+				// G7 defense-in-depth: media-plane calls this with a service
+				// HMAC proof to re-check DM auth at the SFU boundary. Higher rate limit (60/min)
 				// because the media-plane calls it on every SFU
 				// reconnection (transport renegotiation, ICE restart, etc.)
 				// and a single legitimate call can produce several reconnects.
 				dmRoutes.POST("/:id/voice/authorize",
 					middleware.RateLimitByUser(redis, 60, 1*time.Minute),
 					dmHandler.AuthorizeDMVoiceForMediaPlane,
+				)
+				dmRoutes.DELETE("/:id/voice/authorize",
+					middleware.RateLimitByUser(redis, 60, 1*time.Minute),
+					dmHandler.AbortDMVoiceMediaAuthorization,
 				)
 				dmRoutes.GET("/:id/voice/participants",
 					middleware.RateLimitByUser(redis, 30, 1*time.Minute),

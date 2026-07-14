@@ -485,6 +485,48 @@ describe('dmStore', () => {
       expect(conv.unreadCount).toBe(3);
     });
 
+    it('maps call-event metadata from the last message', async () => {
+      server.use(
+        http.get(`${API_BASE}/api/v1/dm/conversations`, () =>
+          HttpResponse.json({
+            conversations: [
+              {
+                id: 'conv-api-1',
+                is_group: false,
+                is_personal: false,
+                name: null,
+                participants: [],
+                last_message: {
+                  content: '',
+                  user_id: 'user-1',
+                  created_at: '2026-07-13T12:00:00Z',
+                  type: 'call_event',
+                  call_event_payload: {
+                    caller_user_id: 'user-1',
+                    started_at: '2026-07-13T12:00:00Z',
+                    status: 'missed',
+                    duration_seconds: 0,
+                  },
+                },
+                unread_count: 0,
+                created_at: '2025-01-01T00:00:00Z',
+              },
+            ],
+          })
+        )
+      );
+
+      await useDMStore.getState().fetchConversations();
+
+      expect(useDMStore.getState().conversations[0].lastMessage).toMatchObject({
+        type: 'call_event',
+        callEventPayload: {
+          caller_user_id: 'user-1',
+          status: 'missed',
+        },
+      });
+    });
+
     it('sets error on API failure', async () => {
       server.use(
         http.get(`${API_BASE}/api/v1/dm/conversations`, () => {
@@ -599,6 +641,62 @@ describe('dmStore', () => {
       expect(callCount).toBe(0);
     });
 
+    it('queues one authoritative refetch when requested during an active fetch', async () => {
+      const firstStarted = deferred();
+      const releaseFirst = deferred();
+      let callCount = 0;
+      server.use(
+        http.get(`${API_BASE}/api/v1/dm/conversations`, async () => {
+          callCount++;
+          if (callCount === 1) {
+            firstStarted.resolve();
+            await releaseFirst.promise;
+          }
+          return HttpResponse.json({
+            conversations: [
+              {
+                id: 'conv-api-1',
+                is_group: false,
+                is_personal: false,
+                name: null,
+                participants: [],
+                last_message:
+                  callCount === 1
+                    ? null
+                    : {
+                        content: '',
+                        user_id: 'user-1',
+                        created_at: '2026-07-13T12:00:00Z',
+                        type: 'call_event',
+                        call_event_payload: {
+                          caller_user_id: 'user-1',
+                          started_at: '2026-07-13T12:00:00Z',
+                          status: 'missed',
+                          duration_seconds: 0,
+                        },
+                      },
+                unread_count: 0,
+                created_at: '2025-01-01T00:00:00Z',
+              },
+            ],
+          });
+        })
+      );
+
+      const firstFetch = useDMStore.getState().fetchConversations();
+      await firstStarted.promise;
+      await useDMStore.getState().fetchConversations();
+      expect(callCount).toBe(1);
+
+      releaseFirst.resolve();
+      await firstFetch;
+
+      await vi.waitFor(() => expect(callCount).toBe(2));
+      await vi.waitFor(() =>
+        expect(useDMStore.getState().conversations[0].lastMessage?.type).toBe('call_event')
+      );
+    });
+
     it('purges conversations missing from an authoritative re-fetch', async () => {
       useDMStore.setState({ isLoading: false });
       useDMStore.getState().addConversation(mockConversation);
@@ -642,6 +740,206 @@ describe('dmStore', () => {
       expect(useChatStore.getState().messagesByChannel.has('conv-2')).toBe(true);
       expect(isIndexed('removed-dm-message')).toBe(false);
       expect(isIndexed('retained-dm-message')).toBe(true);
+    });
+
+    it('preserves newer message and unread updates while a stale response is in flight', async () => {
+      const started = deferred();
+      const release = deferred();
+      useDMStore.getState().addConversation({ ...mockConversation, unreadCount: 5 });
+      useDMStore.getState().addConversation(mockConversation2);
+      server.use(
+        http.get(`${API_BASE}/api/v1/dm/conversations`, async () => {
+          started.resolve();
+          await release.promise;
+          return HttpResponse.json({
+            conversations: [
+              {
+                id: 'conv-2',
+                is_group: true,
+                is_personal: false,
+                name: 'Group Chat',
+                participants: [],
+                last_message: null,
+                unread_count: 0,
+                created_at: '2025-01-02T00:00:00Z',
+              },
+              {
+                id: 'conv-1',
+                is_group: false,
+                is_personal: false,
+                name: null,
+                participants: [],
+                last_message: {
+                  content: 'stale preview',
+                  user_id: 'user-2',
+                  username: 'bob',
+                  created_at: '2025-01-01T12:00:00Z',
+                },
+                unread_count: 9,
+                created_at: '2025-01-01T00:00:00Z',
+              },
+            ],
+          });
+        })
+      );
+
+      const fetchPromise = useDMStore.getState().fetchConversations();
+      await started.promise;
+      useDMStore.getState().updateLastMessage('conv-1', {
+        content: 'new WebSocket preview',
+        userId: 'user-1',
+        username: 'alice',
+        createdAt: '2026-01-01T00:00:00Z',
+      });
+      useDMStore.getState().clearUnread('conv-1');
+      release.resolve();
+      await fetchPromise;
+
+      const conversations = useDMStore.getState().conversations;
+      expect(conversations.map((conversation) => conversation.id)).toEqual(['conv-1', 'conv-2']);
+      expect(conversations[0].lastMessage?.content).toBe('new WebSocket preview');
+      expect(conversations[0].unreadCount).toBe(0);
+    });
+
+    it('preserves participant, role, profile, presence, and name updates during a stale fetch', async () => {
+      const started = deferred();
+      const release = deferred();
+      useDMStore.getState().addConversation({
+        ...mockConversation2,
+        name: 'Original group',
+        participants: mockConversation2.participants.map((participant) => ({
+          ...participant,
+          role: participant.userId === 'user-1' ? 'admin' : 'member',
+          status: 'offline',
+        })),
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/dm/conversations`, async () => {
+          started.resolve();
+          await release.promise;
+          return HttpResponse.json({
+            conversations: [
+              {
+                id: 'conv-2',
+                is_group: true,
+                is_personal: false,
+                name: 'Original group',
+                participants: [
+                  { user_id: 'user-1', username: 'alice', role: 'admin', status: 'offline' },
+                  {
+                    user_id: 'user-2',
+                    username: 'bob',
+                    display_name: 'Stale Bob',
+                    avatar_url: 'stale.png',
+                    color_scheme: 'stale',
+                    role: 'member',
+                    status: 'offline',
+                  },
+                  { user_id: 'user-3', username: 'charlie', role: 'member', status: 'offline' },
+                ],
+                last_message: null,
+                unread_count: 0,
+                created_at: '2025-01-02T00:00:00Z',
+              },
+            ],
+          });
+        })
+      );
+
+      const fetchPromise = useDMStore.getState().fetchConversations();
+      await started.promise;
+
+      const beforeMembershipUpdate = useDMStore.getState().conversations[0];
+      useDMStore.getState().updateConversation('conv-2', {
+        participants: [
+          ...beforeMembershipUpdate.participants,
+          { userId: 'user-4', username: 'dana', role: 'member', status: 'online' },
+        ],
+      });
+      const beforeRoleUpdate = useDMStore.getState().conversations[0];
+      useDMStore.getState().updateConversation('conv-2', {
+        participants: beforeRoleUpdate.participants.map((participant) =>
+          participant.userId === 'user-2' ? { ...participant, role: 'admin' } : participant
+        ),
+      });
+      useDMStore.getState().updateParticipantProfile('user-2', {
+        username: 'robert',
+        displayName: 'Robert',
+        avatarUrl: 'fresh.png',
+        colorScheme: 'fresh',
+        status: 'online',
+      });
+      useDMStore.getState().updateConversation('conv-2', { name: 'Renamed live' });
+
+      release.resolve();
+      await fetchPromise;
+
+      const conversation = useDMStore.getState().conversations[0];
+      expect(conversation.name).toBe('Renamed live');
+      expect(conversation.participants.map((participant) => participant.userId)).toEqual([
+        'user-1',
+        'user-2',
+        'user-3',
+        'user-4',
+      ]);
+      expect(
+        conversation.participants.find((participant) => participant.userId === 'user-2')
+      ).toMatchObject({
+        username: 'robert',
+        displayName: 'Robert',
+        avatarUrl: 'fresh.png',
+        colorScheme: 'fresh',
+        status: 'online',
+        role: 'admin',
+      });
+    });
+
+    it('keeps conversations added after fetch start without purging their access state', async () => {
+      const started = deferred();
+      const release = deferred();
+      useDMStore.getState().addConversation(mockConversation);
+      server.use(
+        http.get(`${API_BASE}/api/v1/dm/conversations`, async () => {
+          started.resolve();
+          await release.promise;
+          return HttpResponse.json({
+            conversations: [
+              {
+                id: 'conv-1',
+                is_group: false,
+                is_personal: false,
+                name: null,
+                participants: [],
+                last_message: null,
+                unread_count: 0,
+                created_at: '2025-01-01T00:00:00Z',
+              },
+            ],
+          });
+        })
+      );
+
+      const fetchPromise = useDMStore.getState().fetchConversations();
+      await started.promise;
+      useDMStore.getState().addConversation(mockConversation2);
+      useDMStore.getState().setActiveConversation('conv-2');
+      useChatStore.getState().addMessage('conv-2', {
+        ...mockMessage,
+        id: 'new-dm-message',
+        channel_id: 'conv-2',
+      });
+      indexMessage('new-dm-message', 'new DM plaintext', 'conv-2');
+      release.resolve();
+      await fetchPromise;
+
+      expect(useDMStore.getState().conversations.map((conversation) => conversation.id)).toEqual([
+        'conv-2',
+        'conv-1',
+      ]);
+      expect(useDMStore.getState().activeConversationId).toBe('conv-2');
+      expect(mockInvalidateChannelKey).not.toHaveBeenCalledWith('conv-2');
+      expect(useChatStore.getState().messagesByChannel.has('conv-2')).toBe(true);
+      expect(isIndexed('new-dm-message')).toBe(true);
     });
 
     it.each([

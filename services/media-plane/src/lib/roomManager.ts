@@ -9,6 +9,7 @@ import type {
   AudioLevelObserver,
   MediaKind,
 } from 'mediasoup/types';
+import { randomUUID } from 'node:crypto';
 import { config } from '../config/index.js';
 import { logger } from './logger.js';
 import { MediasoupService } from './mediasoup.js';
@@ -296,6 +297,16 @@ export interface Room {
   micProducerIds: Set<string>;
   /** Room kind (#1542) — selects the cap-tier resolution strategy (channel=owner, dm=max-participant). */
   roomKind: 'channel' | 'dm';
+  /** Stable call instance ID for DM rooms; absent for server channels. */
+  callId?: string;
+  /** Accepted ring that originated this call, locked on first DM admission. */
+  callRingId?: string;
+  /** Original caller, or the first participant for a direct DM call. */
+  callCallerUserId?: string;
+  /** First successful DM admission time. */
+  callStartedAt?: Date;
+  /** Every participant admitted to this DM call, retained after they leave. */
+  callParticipantHistory: Map<string, Date>;
   /** Channel rooms only (#1542): the server-owner cap tier from join-authorize. Undefined for DMs. */
   ownerTier?: string;
   /** Last accepted keyframe request timestamp by sender user ID. */
@@ -380,6 +391,9 @@ export const KEYFRAME_REQUEST_COOLDOWN_MS = 5000;
  * (or a re-added heterogeneous viewer pair) cancels the pending OFF immediately.
  */
 export const SCREEN_GATE_OFF_DEBOUNCE_MS = 1500;
+
+/** Keep a completed DM call ID closed long enough to reject delayed join retries. */
+const DM_CALL_ID_TOMBSTONE_MS = 60_000;
 
 /**
  * AES-256-GCM media-frame format advertised by clients at join time.
@@ -531,7 +545,13 @@ export interface JoinRoomOptions {
   entitlement?: MediaEntitlement;
   /** unparsed — validated by parseMediaFrameCryptoVersion at the admission gate */
   mediaFrameCryptoVersion: unknown;
-  roomContext?: { roomKind: 'channel' | 'dm'; ownerTier?: string };
+  roomContext?: {
+    roomKind: 'channel' | 'dm';
+    ownerTier?: string;
+    callId?: string;
+    callRingId?: string;
+    callCallerUserId?: string;
+  };
   /**
    * The joining user's effective voice permission bitfield (CV-CAN-007), from
    * the control-plane channel join-authorize. Present (fail-closed to 0n) for
@@ -540,6 +560,8 @@ export interface JoinRoomOptions {
    */
   permissions?: bigint;
 }
+
+type RoomContext = NonNullable<JoinRoomOptions['roomContext']>;
 
 // ---------------------------------------------------------------------------
 // Events emitted by RoomManager for NATS/Redis integration (A5-A7)
@@ -553,9 +575,25 @@ export type RoomEvent =
       username: string;
       displayName?: string;
       e2eeEpoch: number;
+      callId?: string;
     }
-  | { type: 'user-left'; roomId: string; userId: string; socketId: string; e2eeEpoch: number }
-  | { type: 'room-empty'; roomId: string }
+  | {
+      type: 'user-left';
+      roomId: string;
+      userId: string;
+      socketId: string;
+      e2eeEpoch: number;
+      callId?: string;
+    }
+  | {
+      type: 'room-empty';
+      roomId: string;
+      callId?: string;
+      ringId?: string;
+      callerUserId?: string;
+      participantUserIds?: string[];
+      startedAt?: string;
+    }
   | {
       type: 'producer-added';
       roomId: string;
@@ -611,6 +649,66 @@ function intersectMimeSets(sets: Set<string>[]): Set<string> {
   return result;
 }
 
+/** Apply the higher-version-wins media-frame admission rule before membership mutation. */
+function admitMediaFrameCryptoVersion(room: Room, joinerVersion: number): number {
+  if (room.mediaFrameCryptoVersion === null || joinerVersion > room.mediaFrameCryptoVersion) {
+    room.mediaFrameCryptoVersion = joinerVersion;
+    return joinerVersion;
+  }
+  if (joinerVersion < room.mediaFrameCryptoVersion) {
+    throw new CryptoVersionMismatchError(room.mediaFrameCryptoVersion, joinerVersion);
+  }
+  return room.mediaFrameCryptoVersion;
+}
+
+/** Lock or validate the call identity once an authorized DM join reaches an active room. */
+function applyDMCallContext(
+  room: Room,
+  roomContext: RoomContext | undefined,
+  userId: string,
+  joinedAt: Date
+): void {
+  if (room.roomKind !== 'dm') return;
+  if (room.callId && roomContext?.callId && roomContext.callId !== room.callId) {
+    throw new Error('DM call ID does not match the active room');
+  }
+  if (room.callId) return;
+
+  room.callId = roomContext?.callId ?? randomUUID();
+  room.callRingId = roomContext?.callRingId;
+  room.callCallerUserId = roomContext?.callCallerUserId ?? userId;
+  room.callStartedAt = joinedAt;
+}
+
+/** Snapshot producer metadata without retaining participant or mediasoup objects. */
+function existingProducerInfo(room: Room, joiningUserId: string): ProducerInfo[] {
+  const existingProducers: ProducerInfo[] = [];
+  for (const participant of room.participants.values()) {
+    if (participant.userId === joiningUserId) continue;
+    for (const entry of participant.producers.values()) {
+      existingProducers.push({
+        producerId: entry.producer.id,
+        userId: participant.userId,
+        kind: entry.kind,
+        source: entry.source,
+      });
+    }
+  }
+  return existingProducers;
+}
+
+/** Snapshot public participant fields returned by joinRoom. */
+function participantInfo(room: Room) {
+  return Array.from(room.participants.values()).map((participant) => ({
+    userId: participant.userId,
+    username: participant.username,
+    displayName: participant.displayName,
+    avatarUrl: participant.avatarUrl,
+    isDeafened: participant.isDeafened,
+    isTesting: participant.isTesting,
+  }));
+}
+
 // ---------------------------------------------------------------------------
 // RoomManager
 //
@@ -625,6 +723,8 @@ function intersectMimeSets(sets: Set<string>[]): Set<string> {
 
 export class RoomManager {
   private readonly rooms: Map<string, Room> = new Map();
+  private readonly roomCreationGates: Map<string, Promise<void>> = new Map();
+  private readonly closedDMCallIds: Map<string, number> = new Map();
   private readonly mediasoup: MediasoupService;
   private readonly eventHandlers: RoomEventHandler[] = [];
 
@@ -650,14 +750,34 @@ export class RoomManager {
     }
   }
 
+  private isClosedDMCall(callId: string): boolean {
+    const expiresAt = this.closedDMCallIds.get(callId);
+    if (expiresAt === undefined) return false;
+    if (expiresAt > Date.now()) return true;
+    this.closedDMCallIds.delete(callId);
+    return false;
+  }
+
+  private rememberClosedDMCall(callId: string): void {
+    const now = Date.now();
+    for (const [closedCallId, expiresAt] of this.closedDMCallIds) {
+      if (expiresAt <= now) this.closedDMCallIds.delete(closedCallId);
+    }
+    this.closedDMCallIds.set(callId, now + DM_CALL_ID_TOMBSTONE_MS);
+  }
+
+  private assertDMCallOpen(roomContext?: RoomContext): void {
+    if (roomContext?.roomKind !== 'dm' || !roomContext.callId) return;
+    if (this.isClosedDMCall(roomContext.callId)) {
+      throw new Error('DM call is no longer active');
+    }
+  }
+
   // ─── Room lifecycle ──────────────────────────────────────────────────
 
   /** Get or create a room for the given channel ID */
-  private async getOrCreateRoom(
-    roomId: string,
-    roomContext?: { roomKind: 'channel' | 'dm'; ownerTier?: string }
-  ): Promise<Room> {
-    let room = this.rooms.get(roomId);
+  private async getOrCreateRoom(roomId: string, roomContext?: RoomContext): Promise<Room> {
+    const room = this.rooms.get(roomId);
     if (room) {
       // Defensive: if the router was closed (e.g. race between leave and rejoin),
       // discard the stale room and recreate it below.
@@ -666,8 +786,15 @@ export class RoomManager {
           roomId,
         });
         this.rooms.delete(roomId);
-        room = undefined;
       } else {
+        if (
+          room.roomKind === 'dm' &&
+          room.callId &&
+          roomContext?.callId &&
+          roomContext.callId !== room.callId
+        ) {
+          throw new Error('DM call ID does not match the active room');
+        }
         // NOTE (#1542): this early return means `room.roomKind` is intentionally
         // FIRST-JOINER-STABLE for the room's lifetime (unlike `ownerTier`, which
         // joinRoom refreshes on every channel join). Safe: channel and DM ID
@@ -679,99 +806,130 @@ export class RoomManager {
       }
     }
 
-    const router = await this.mediasoup.getOrCreateRouter(roomId);
-
-    // Audio last-N (#1544): resolve the forwarded-speaker cap (free 8 for Beta;
-    // tier deferred). The observer is sized to N so `volumes` surfaces the top-N.
-    const lastN = resolveAudioLastN();
-
-    // Create AudioLevelObserver for active speaker detection
-    let audioLevelObserver: AudioLevelObserver | null = null;
-    try {
-      audioLevelObserver = await router.createAudioLevelObserver({
-        maxEntries: lastN,
-        threshold: config.audioLevelObserver.threshold,
-        interval: config.audioLevelObserver.interval,
-      });
-    } catch (err) {
-      logger.warn('Failed to create AudioLevelObserver', {
-        roomId,
-        error: err,
-      });
+    const creationInFlight = this.roomCreationGates.get(roomId);
+    if (creationInFlight) {
+      await creationInFlight;
+      return this.getOrCreateRoom(roomId, roomContext);
     }
 
-    room = {
-      id: roomId,
-      router,
-      audioLevelObserver,
-      participants: new Map(),
-      createdAt: new Date(),
-      e2eeEpoch: 0,
-      mediaFrameCryptoVersion: null,
-      pendingProducerCounts: new Map(),
-      activeSpeakers: new ActiveSpeakerSet(lastN, config.audioLastNHoldMs),
-      lastNPausedConsumers: new Set(),
-      micProducerIds: new Set(),
-      roomKind: roomContext?.roomKind ?? 'channel',
-      ownerTier: roomContext?.ownerTier,
-      keyframeRequestCooldowns: new Map(),
-      cameraLayerDemands: new Map(),
-      cameraLayeringGateEnabled: false,
-      screenLayerDemands: new Map(),
-      screenLayeringGateBySharer: new Map(),
-      screenGateOffTimers: new Map(),
-    };
+    let releaseCreation!: () => void;
+    const creationGate = new Promise<void>((resolve) => {
+      releaseCreation = resolve;
+    });
+    this.roomCreationGates.set(roomId, creationGate);
 
-    // Wire up active speaker events
-    if (audioLevelObserver) {
-      audioLevelObserver.on('volumes', (volumes: Array<{ producer: Producer; volume: number }>) => {
-        // Preserve the single-speaker UI broadcast (loudest = volumes[0]).
-        if (volumes.length > 0) {
-          const { producer, volume } = volumes[0];
-          // Find the participant who owns this producer
-          for (const [, participant] of room.participants) {
-            for (const [, entry] of participant.producers) {
-              if (entry.producer.id === producer.id) {
-                this.emitEvent({
-                  type: 'active-speaker',
-                  roomId,
-                  userId: participant.userId,
-                  volume,
-                });
-                break;
+    try {
+      const router = await this.mediasoup.getOrCreateRouter(roomId);
+
+      // Audio last-N (#1544): resolve the forwarded-speaker cap (free 8 for Beta;
+      // tier deferred). The observer is sized to N so `volumes` surfaces the top-N.
+      const lastN = resolveAudioLastN();
+
+      // Create AudioLevelObserver for active speaker detection
+      let audioLevelObserver: AudioLevelObserver | null = null;
+      try {
+        audioLevelObserver = await router.createAudioLevelObserver({
+          maxEntries: lastN,
+          threshold: config.audioLevelObserver.threshold,
+          interval: config.audioLevelObserver.interval,
+        });
+      } catch (err) {
+        logger.warn('Failed to create AudioLevelObserver', {
+          roomId,
+          error: err,
+        });
+      }
+
+      const createdRoom: Room = {
+        id: roomId,
+        router,
+        audioLevelObserver,
+        participants: new Map(),
+        createdAt: new Date(),
+        e2eeEpoch: 0,
+        mediaFrameCryptoVersion: null,
+        pendingProducerCounts: new Map(),
+        activeSpeakers: new ActiveSpeakerSet(lastN, config.audioLastNHoldMs),
+        lastNPausedConsumers: new Set(),
+        micProducerIds: new Set(),
+        roomKind: roomContext?.roomKind ?? 'channel',
+        callParticipantHistory: new Map(),
+        ownerTier: roomContext?.ownerTier,
+        keyframeRequestCooldowns: new Map(),
+        cameraLayerDemands: new Map(),
+        cameraLayeringGateEnabled: false,
+        screenLayerDemands: new Map(),
+        screenLayeringGateBySharer: new Map(),
+        screenGateOffTimers: new Map(),
+      };
+
+      // Wire up active speaker events
+      if (audioLevelObserver) {
+        audioLevelObserver.on(
+          'volumes',
+          (volumes: Array<{ producer: Producer; volume: number }>) => {
+            // Preserve the single-speaker UI broadcast (loudest = volumes[0]).
+            if (volumes.length > 0) {
+              const { producer, volume } = volumes[0];
+              // Find the participant who owns this producer
+              for (const [, participant] of createdRoom.participants) {
+                for (const [, entry] of participant.producers) {
+                  if (entry.producer.id === producer.id) {
+                    this.emitEvent({
+                      type: 'active-speaker',
+                      roomId,
+                      userId: participant.userId,
+                      volume,
+                    });
+                    break;
+                  }
+                }
               }
             }
+            // Drive last-N from the full ranked top-N.
+            const ranked = volumes.map((v) => v.producer.id);
+            const delta = createdRoom.activeSpeakers.update(ranked, Date.now());
+            this.applyLastNDelta(createdRoom, delta);
           }
-        }
-        // Drive last-N from the full ranked top-N.
-        const ranked = volumes.map((v) => v.producer.id);
-        const delta = room.activeSpeakers.update(ranked, Date.now());
-        this.applyLastNDelta(room, delta);
-      });
+        );
 
-      // Clear active speaker when everyone stops talking
-      audioLevelObserver.on('silence', () => {
-        this.emitEvent({
-          type: 'active-speaker',
-          roomId,
-          userId: '',
-          volume: -Infinity,
+        // Clear active speaker when everyone stops talking
+        audioLevelObserver.on('silence', () => {
+          this.emitEvent({
+            type: 'active-speaker',
+            roomId,
+            userId: '',
+            volume: -Infinity,
+          });
+          const delta = createdRoom.activeSpeakers.update([], Date.now());
+          this.applyLastNDelta(createdRoom, delta);
         });
-        const delta = room.activeSpeakers.update([], Date.now());
-        this.applyLastNDelta(room, delta);
-      });
+      }
+
+      this.rooms.set(roomId, createdRoom);
+
+      logger.info('Room created', { roomId });
+      return createdRoom;
+    } finally {
+      if (this.roomCreationGates.get(roomId) === creationGate) {
+        this.roomCreationGates.delete(roomId);
+      }
+      releaseCreation();
     }
-
-    this.rooms.set(roomId, room);
-
-    logger.info('Room created', { roomId });
-    return room;
   }
 
   /** Close and remove a room (called when last participant leaves) */
-  private async closeRoom(roomId: string): Promise<void> {
+  private async closeRoom(
+    roomId: string,
+    expectedRoom?: Room,
+    emitTerminalEvent = true
+  ): Promise<void> {
     const room = this.rooms.get(roomId);
-    if (!room) return;
+    if (!room || (expectedRoom && room !== expectedRoom)) return;
+
+    if (room.roomKind === 'dm' && room.callId) {
+      this.rememberClosedDMCall(room.callId);
+    }
 
     // Cancel any pending per-sharer screen gate-OFF debounce timers (#1924 fix
     // "B") so a room teardown leaves no dangling setTimeout callbacks.
@@ -790,13 +948,23 @@ export class RoomManager {
       room.router.close();
     }
 
+    if (this.rooms.get(roomId) !== room) return;
     this.rooms.delete(roomId);
 
     // Remove the stale router from the mediasoup cache so rejoin creates a fresh one
     this.mediasoup.removeRouter(roomId);
 
     logger.info('Room closed', { roomId });
-    this.emitEvent({ type: 'room-empty', roomId });
+    if (!emitTerminalEvent) return;
+    this.emitEvent({
+      type: 'room-empty',
+      roomId,
+      callId: room.callId,
+      ringId: room.callRingId,
+      callerUserId: room.callCallerUserId,
+      participantUserIds: room.callId ? Array.from(room.callParticipantHistory.keys()) : undefined,
+      startedAt: room.callStartedAt?.toISOString(),
+    });
   }
 
   // ─── Participant management ──────────────────────────────────────────
@@ -823,27 +991,13 @@ export class RoomManager {
     e2eeEpoch: number;
   }> {
     const { entitlement, mediaFrameCryptoVersion, roomContext, permissions } = options;
+    this.assertDMCallOpen(roomContext);
     const parsedMediaFrameCryptoVersion = parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
     const { username, displayName, avatarUrl } = identity;
-    let room = await this.getOrCreateRoom(roomId, roomContext);
-
-    // Check if user is already in this room (reconnect scenario)
-    const existing = room.participants.get(userId);
-    if (existing) {
-      logger.warn('User already in room, cleaning up old session', {
-        roomId,
-        userId,
-        oldSocketId: existing.socketId,
-        newSocketId: socketId,
-      });
-      await this.leaveRoom(roomId, userId);
-      // Room may have been closed if user was the only participant — re-create
-      room = await this.getOrCreateRoom(roomId, roomContext);
-      // NOTE: the crypto-version gate below runs AFTER this teardown. A reconnect
-      // that DOWNGRADES the user's crypto version (lower than the room's) is
-      // rejected at the gate — so the user's stale session is fully cleaned up
-      // here (no leak) and they are then ejected+rejected. That is intentional:
-      // a downgraded client must update to rejoin (the gate is the authority).
+    const room = await this.getOrCreateRoom(roomId, roomContext);
+    // An existing-room lookup still yields; the last leave can close it meanwhile.
+    if (this.rooms.get(roomId) !== room || room.router.closed) {
+      return this.joinRoom(roomId, userId, socketId, identity, rtpCapabilities, options);
     }
 
     // Refresh the channel owner cap tier on each join (#1542) so a mid-call
@@ -863,17 +1017,27 @@ export class RoomManager {
     //   - joiner == room → allow.
     // This runs BEFORE participant storage and the e2eeEpoch++ below — do NOT
     // move it past either (see [internal]rules/media-plane.md admission-gate rule).
-    if (room.mediaFrameCryptoVersion === null) {
-      room.mediaFrameCryptoVersion = parsedMediaFrameCryptoVersion;
-    } else if (parsedMediaFrameCryptoVersion > room.mediaFrameCryptoVersion) {
-      room.mediaFrameCryptoVersion = parsedMediaFrameCryptoVersion;
-    } else if (parsedMediaFrameCryptoVersion < room.mediaFrameCryptoVersion) {
-      throw new CryptoVersionMismatchError(
-        room.mediaFrameCryptoVersion,
-        parsedMediaFrameCryptoVersion
-      );
+    const activeMediaFrameCryptoVersion = admitMediaFrameCryptoVersion(
+      room,
+      parsedMediaFrameCryptoVersion
+    );
+
+    // Replace a stale socket session in-place. Calling leaveRoom here would
+    // close a sole-participant DM room, tombstone its call ID, emit a terminal
+    // room-empty event, and then recreate a different room for the same call.
+    // Keep the room/call instance alive while still performing the complete
+    // per-participant cleanup and membership epoch transition. Admission runs
+    // first so an incompatible reconnect cannot evict the valid old session.
+    const existing = room.participants.get(userId);
+    if (existing) {
+      logger.warn('User already in room, cleaning up old session', {
+        roomId,
+        userId,
+        oldSocketId: existing.socketId,
+        newSocketId: socketId,
+      });
+      this.removeParticipantSession(room, roomId, userId);
     }
-    // equal → allow (fall through)
 
     // Per-user media caps (#1300): from the parsed control-plane entitlement,
     // or the fail-closed free floor for pre-#1300 callers. Copy the tiers array
@@ -904,7 +1068,14 @@ export class RoomManager {
       mediaFrameCryptoVersion: parsedMediaFrameCryptoVersion,
     };
 
+    // Re-check after the async room lookup/admission path. Two DM joins can
+    // observe an unlocked room before either continuation records its call ID.
+    applyDMCallContext(room, roomContext, userId, participant.joinedAt);
+
     room.participants.set(userId, participant);
+    if (room.roomKind === 'dm') {
+      room.callParticipantHistory.set(userId, participant.joinedAt);
+    }
 
     // E2EE media-epoch (keyId) sync nudge — incremented on every join so
     // receivers ratchet their per-frame keyId in lockstep. NOT a forward-secrecy
@@ -927,37 +1098,15 @@ export class RoomManager {
       username,
       displayName,
       e2eeEpoch: room.e2eeEpoch,
+      callId: room.callId,
     });
 
     // Collect existing producers for the new joiner to consume
-    const existingProducers: ProducerInfo[] = [];
-    for (const [, p] of room.participants) {
-      if (p.userId === userId) continue;
-      for (const [, entry] of p.producers) {
-        existingProducers.push({
-          producerId: entry.producer.id,
-          userId: p.userId,
-          kind: entry.kind,
-          source: entry.source,
-        });
-      }
-    }
-
-    // Collect participant list
-    const participants = Array.from(room.participants.values()).map((p) => ({
-      userId: p.userId,
-      username: p.username,
-      displayName: p.displayName,
-      avatarUrl: p.avatarUrl,
-      isDeafened: p.isDeafened,
-      isTesting: p.isTesting,
-    }));
-
     return {
       rtpCapabilities: room.router.rtpCapabilities,
-      mediaFrameCryptoVersion: room.mediaFrameCryptoVersion,
-      existingProducers,
-      participants,
+      mediaFrameCryptoVersion: activeMediaFrameCryptoVersion,
+      existingProducers: existingProducerInfo(room, userId),
+      participants: participantInfo(room),
       e2eeEpoch: room.e2eeEpoch,
     };
   }
@@ -967,8 +1116,54 @@ export class RoomManager {
     const room = this.rooms.get(roomId);
     if (!room) return;
 
+    if (!this.removeParticipantSession(room, roomId, userId)) return;
+
+    // Tear down room if empty
+    if (room.participants.size === 0) {
+      await this.closeRoom(roomId, room);
+    }
+  }
+
+  /** Remove only the participant session still owned by one exact socket. */
+  removeParticipantIfSocketOwned(roomId: string, userId: string, socketId: string): boolean {
+    const room = this.rooms.get(roomId);
+    const participant = room?.participants.get(userId);
+    if (!room || participant?.socketId !== socketId) return false;
+    return this.removeParticipantSession(room, roomId, userId);
+  }
+
+  /** Exact-socket rollback for channel admission, including normal empty-room closure. */
+  async leaveRoomIfSocketOwned(roomId: string, userId: string, socketId: string): Promise<boolean> {
+    const room = this.rooms.get(roomId);
+    const participant = room?.participants.get(userId);
+    if (!room || participant?.socketId !== socketId) return false;
+    if (!this.removeParticipantSession(room, roomId, userId)) return false;
+    if (room.participants.size === 0) await this.closeRoom(roomId, room);
+    return true;
+  }
+
+  /** Close an exact empty DM room, emitting a terminal event only after admission. */
+  async closeEmptyDMRoom(
+    roomId: string,
+    expectedCallId: string
+  ): Promise<'terminal' | 'discarded' | undefined> {
+    const room = this.rooms.get(roomId);
+    if (room?.roomKind !== 'dm' || room.callId !== expectedCallId || room.participants.size !== 0) {
+      return undefined;
+    }
+    const result = room.callParticipantHistory.size > 0 ? 'terminal' : 'discarded';
+    await this.closeRoom(roomId, room, result === 'terminal');
+    return result;
+  }
+
+  /**
+   * Remove one participant without deciding the room's lifecycle. Reconnects
+   * use this seam to atomically replace a stale socket while preserving the
+   * active DM call; explicit leaves close an empty room after this returns.
+   */
+  private removeParticipantSession(room: Room, roomId: string, userId: string): boolean {
     const participant = room.participants.get(userId);
-    if (!participant) return;
+    if (!participant) return false;
 
     this.clearParticipantCameraLayerDemands(room, participant);
     this.clearParticipantScreenLayerDemands(room, participant);
@@ -1004,12 +1199,10 @@ export class RoomManager {
       userId,
       socketId: participant.socketId,
       e2eeEpoch: room.e2eeEpoch,
+      callId: room.callId,
     });
 
-    // Tear down room if empty
-    if (room.participants.size === 0) {
-      await this.closeRoom(roomId);
-    }
+    return true;
   }
 
   private closeParticipantConsumers(participant: Participant): void {

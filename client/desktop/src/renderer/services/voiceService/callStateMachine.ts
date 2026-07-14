@@ -55,11 +55,12 @@ export interface CallerInfo {
 
 /**
  * CallState is a discriminated union describing the renderer-side DM
- * voice call state machine. Five terminal/transient states per spec §5.2.
+ * voice call state machine. Six terminal/transient states per spec §5.2.
  *
  *   idle              → no call activity
  *   outgoing-ringing  → caller is awaiting accept/decline/timeout
  *   incoming-ringing  → callee sees IncomingCallBanner, ringtone looping
+ *   joining           → accepted ring is establishing the media session
  *   in-call           → both sides have completed POST /voice/join
  *   ending            → hang-up initiated, brief fade-out before idle
  *
@@ -100,8 +101,214 @@ export type CallState =
        */
       isGroup: boolean;
     }
+  | { kind: 'joining'; conversationId: string; ringId: string }
   | { kind: 'in-call' }
   | { kind: 'ending' };
+
+type OutgoingRingingState = Extract<CallState, { kind: 'outgoing-ringing' }>;
+
+// The control plane expires unanswered rings after 45 seconds. A renderer
+// request that never settles must not own the global call slot longer than
+// the ring it attempted to create. The request itself remains alive so a
+// later response can still be cleaned up by its exact server-issued ring ID.
+const RING_REQUEST_OWNERSHIP_TIMEOUT_MS = 45_000;
+
+interface PendingRingOperation {
+  state: OutgoingRingingState;
+  cancelRequested: boolean;
+  ownershipRevision: number;
+  ownershipTimer: ReturnType<typeof setTimeout> | null;
+  reconcileLateEvents: boolean;
+  queuedEvents: Array<{
+    ringId: string;
+    replay: () => void;
+    reconcilesFailedCancel: boolean;
+  }>;
+}
+
+interface RingResponsePayload {
+  ring_id: string;
+  ring_started_at: string;
+  ringing_user_ids: string[];
+}
+
+function queueEventForUnresolvedRing(
+  conversationId: string,
+  ringId: string,
+  replay: () => void,
+  reconcilesFailedCancel = false
+): boolean {
+  const operations = unresolvedRingOperations.get(conversationId);
+  if (!operations) return false;
+
+  for (const operation of operations) {
+    operation.queuedEvents.push({ ringId, replay, reconcilesFailedCancel });
+  }
+  return operations.size > 0;
+}
+
+const pendingRingOperations = new Map<string, PendingRingOperation>();
+const unresolvedRingOperations = new Map<string, Set<PendingRingOperation>>();
+let callOwnershipRevision = 0;
+
+function trackUnresolvedRingOperation(
+  conversationId: string,
+  operation: PendingRingOperation
+): void {
+  const operations = unresolvedRingOperations.get(conversationId) ?? new Set();
+  operations.add(operation);
+  unresolvedRingOperations.set(conversationId, operations);
+}
+
+function finishUnresolvedRingOperation(
+  conversationId: string,
+  operation: PendingRingOperation
+): void {
+  const operations = unresolvedRingOperations.get(conversationId);
+  if (!operations) return;
+  operations.delete(operation);
+  if (operations.size === 0) unresolvedRingOperations.delete(conversationId);
+}
+
+function finishPendingRingOperation(conversationId: string, operation: PendingRingOperation): void {
+  if (operation.ownershipTimer !== null) {
+    clearTimeout(operation.ownershipTimer);
+    operation.ownershipTimer = null;
+  }
+  if (pendingRingOperations.get(conversationId) === operation) {
+    pendingRingOperations.delete(conversationId);
+  }
+}
+
+function expirePendingRingOwnership(conversationId: string, operation: PendingRingOperation): void {
+  if (pendingRingOperations.get(conversationId) !== operation) return;
+
+  // Retire only local ownership. The still-running request keeps this
+  // operation in its closure and will exact-cancel the returned ring ID.
+  operation.cancelRequested = true;
+  finishPendingRingOperation(conversationId, operation);
+  if (useVoiceStore.getState().callState === operation.state) {
+    notificationSoundService.stopLoop('call-outgoing');
+    useVoiceStore.getState().setCallState({ kind: 'idle' });
+  }
+}
+
+useVoiceStore.subscribe((state, previousState) => {
+  const previousCall = previousState.callState;
+  if (previousCall.kind === 'idle' && state.callState.kind !== 'idle') {
+    callOwnershipRevision += 1;
+  }
+  if (state.callState.kind !== 'idle' || previousCall.kind !== 'outgoing-ringing') return;
+
+  const operation = pendingRingOperations.get(previousCall.conversationId);
+  if (operation?.state !== previousCall || operation.cancelRequested) return;
+
+  // A store/account reset must not leave a hung /ring request owning every
+  // future call. Mark it for exact cleanup if a response arrives, then release
+  // local ownership immediately.
+  operation.cancelRequested = true;
+  operation.reconcileLateEvents = false;
+  finishPendingRingOperation(previousCall.conversationId, operation);
+});
+
+function ringRequestBody(ringId: string): { body?: string } {
+  return ringId ? { body: JSON.stringify({ ring_id: ringId }) } : {};
+}
+
+async function cancelRingRequest(conversationId: string, ringId: string): Promise<Response> {
+  return apiFetch(`/api/v1/dm/conversations/${conversationId}/voice/cancel`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    ...ringRequestBody(ringId),
+  });
+}
+
+function resolvedOutgoingState(
+  conversationId: string,
+  data: RingResponsePayload
+): OutgoingRingingState {
+  return {
+    kind: 'outgoing-ringing',
+    conversationId,
+    ringId: data.ring_id,
+    calleeUserIds: data.ringing_user_ids,
+    startedAt: Date.parse(data.ring_started_at),
+    declinedUserIds: [],
+  };
+}
+
+function rollbackPendingRing(
+  conversationId: string,
+  operation: PendingRingOperation,
+  optimisticState: OutgoingRingingState
+): void {
+  finishUnresolvedRingOperation(conversationId, operation);
+  finishPendingRingOperation(conversationId, operation);
+  if (useVoiceStore.getState().callState !== optimisticState) return;
+  notificationSoundService.stopLoop('call-outgoing');
+  useVoiceStore.getState().setCallState({ kind: 'idle' });
+}
+
+async function reconcileCanceledRingResponse(
+  conversationId: string,
+  operation: PendingRingOperation,
+  data: RingResponsePayload
+): Promise<void> {
+  let cancelResponse: Response | undefined;
+  try {
+    cancelResponse = await cancelRingRequest(conversationId, data.ring_id);
+  } catch (err) {
+    console.error('Late DM voice cancel POST failed:', sanitizeErrForLog(err));
+  }
+
+  const queuedEvents = operation.queuedEvents.filter(
+    (event) => event.ringId === data.ring_id && event.reconcilesFailedCancel
+  );
+  const canReconcileAuthoritativeEvent =
+    cancelResponse !== undefined &&
+    !cancelResponse.ok &&
+    operation.reconcileLateEvents &&
+    callOwnershipRevision === operation.ownershipRevision &&
+    useVoiceStore.getState().callState.kind === 'idle' &&
+    queuedEvents.length > 0;
+
+  finishUnresolvedRingOperation(conversationId, operation);
+  finishPendingRingOperation(conversationId, operation);
+  if (!canReconcileAuthoritativeEvent) return;
+
+  // The exact cancel lost because the server already completed this ring.
+  // Restore correlated state long enough to replay the authoritative event.
+  useVoiceStore.getState().setCallState(resolvedOutgoingState(conversationId, data));
+  for (const event of queuedEvents) event.replay();
+}
+
+async function cancelSupersededRingResponse(
+  conversationId: string,
+  operation: PendingRingOperation,
+  ringId: string
+): Promise<void> {
+  try {
+    await cancelRingRequest(conversationId, ringId);
+  } catch (err) {
+    console.error('Superseded DM voice cancel POST failed:', sanitizeErrForLog(err));
+  } finally {
+    finishUnresolvedRingOperation(conversationId, operation);
+    finishPendingRingOperation(conversationId, operation);
+  }
+}
+
+function settleResolvedRing(
+  conversationId: string,
+  operation: PendingRingOperation,
+  data: RingResponsePayload
+): void {
+  finishUnresolvedRingOperation(conversationId, operation);
+  finishPendingRingOperation(conversationId, operation);
+  useVoiceStore.getState().setCallState(resolvedOutgoingState(conversationId, data));
+  for (const event of operation.queuedEvents) {
+    if (event.ringId === data.ring_id) event.replay();
+  }
+}
 
 // ── Public caller-side methods (Task E1 implements) ────────────────────
 
@@ -114,25 +321,45 @@ export type CallState =
  * On failure, roll callState back to idle and rethrow so the UI can
  * surface the error.
  *
- * Throws if the conversation isn't loaded in dmStore (shouldn't happen
- * at the call site — DMConversationContextMenu only renders the Voice
- * Call item from a conversation row).
+ * Throws if another call owns the global renderer call state, or if the
+ * conversation isn't loaded in dmStore (shouldn't happen at the call site —
+ * DMConversationContextMenu only renders the Voice Call item from a row).
  */
 export async function initiateDMCall(conversationId: string): Promise<void> {
+  if (useVoiceStore.getState().callState.kind !== 'idle' || pendingRingOperations.size !== 0) {
+    throw new Error('Another voice call is already in progress');
+  }
+
   const dmState = useDMStore.getState();
   if (!dmState.conversations.some((c) => c.id === conversationId)) {
     throw new Error(`Conversation ${conversationId} not found in dmStore`);
   }
 
   // Optimistic state transition — UI surfaces OutgoingCallModal at this point
-  useVoiceStore.getState().setCallState({
+  const optimisticState: OutgoingRingingState = {
     kind: 'outgoing-ringing',
     conversationId,
     ringId: '',
     calleeUserIds: [],
     startedAt: Date.now(),
     declinedUserIds: [],
-  });
+  };
+  const operation: PendingRingOperation = {
+    state: optimisticState,
+    cancelRequested: false,
+    ownershipRevision: 0,
+    ownershipTimer: null,
+    reconcileLateEvents: true,
+    queuedEvents: [],
+  };
+  pendingRingOperations.set(conversationId, operation);
+  trackUnresolvedRingOperation(conversationId, operation);
+  useVoiceStore.getState().setCallState(optimisticState);
+  operation.ownershipRevision = callOwnershipRevision;
+  operation.ownershipTimer = setTimeout(
+    () => expirePendingRingOwnership(conversationId, operation),
+    RING_REQUEST_OWNERSHIP_TIMEOUT_MS
+  );
 
   // Start ringback audio
   notificationSoundService.playLoop('call-outgoing');
@@ -144,59 +371,69 @@ export async function initiateDMCall(conversationId: string): Promise<void> {
       headers: { 'Content-Type': 'application/json' },
     });
   } catch (err) {
-    notificationSoundService.stopLoop('call-outgoing');
-    useVoiceStore.getState().setCallState({ kind: 'idle' });
+    rollbackPendingRing(conversationId, operation, optimisticState);
     throw err;
   }
 
   if (!response.ok) {
-    notificationSoundService.stopLoop('call-outgoing');
-    useVoiceStore.getState().setCallState({ kind: 'idle' });
+    rollbackPendingRing(conversationId, operation, optimisticState);
     const errBody = await response.text().catch(() => '');
     throw new Error(`Failed to ring (HTTP ${response.status}): ${errBody}`);
   }
 
-  const data = (await response.json()) as {
-    ring_id: string;
-    ring_started_at: string;
-    ringing_user_ids: string[];
-  };
+  let data: RingResponsePayload;
+  try {
+    data = (await response.json()) as typeof data;
+  } catch (err) {
+    rollbackPendingRing(conversationId, operation, optimisticState);
+    throw err;
+  }
 
-  // Update state with server-issued ring_id + callee set
-  useVoiceStore.getState().setCallState({
-    kind: 'outgoing-ringing',
-    conversationId,
-    ringId: data.ring_id,
-    calleeUserIds: data.ringing_user_ids,
-    startedAt: Date.parse(data.ring_started_at),
-    declinedUserIds: [],
-  });
+  if (operation.cancelRequested) {
+    await reconcileCanceledRingResponse(conversationId, operation, data);
+    return;
+  }
+
+  const currentState = useVoiceStore.getState().callState;
+  if (currentState !== optimisticState) {
+    await cancelSupersededRingResponse(conversationId, operation, data.ring_id);
+    return;
+  }
+
+  settleResolvedRing(conversationId, operation, data);
 }
 
 /**
  * cancelOutgoingCall lets the caller cancel their own ring before any
  * callee accepts. POSTs /voice/cancel; stops ringback; transitions to idle.
  *
- * Idempotent: if callState isn't outgoing-ringing (e.g., already canceled
- * via a server event), the state mutation + audio cleanup still runs as
- * a defensive no-op. The /cancel POST is skipped if there's no ring to
- * cancel (callState !== outgoing-ringing).
+ * Idempotent: if callState isn't outgoing-ringing, the /cancel POST is
+ * skipped. An idle state still gets defensive ringback cleanup; joining and
+ * in-call states keep ownership because the accepted ring is no longer
+ * cancelable through this endpoint.
  */
 export async function cancelOutgoingCall(): Promise<void> {
   const state = useVoiceStore.getState().callState;
   if (state.kind !== 'outgoing-ringing') {
-    // No active outgoing ring — defensive cleanup only.
-    notificationSoundService.stopLoop('call-outgoing');
-    useVoiceStore.getState().setCallState({ kind: 'idle' });
+    // Joining/in-call are deliberately non-cancelable through the ring endpoint.
+    if (state.kind === 'idle') notificationSoundService.stopLoop('call-outgoing');
     return;
   }
 
-  const { conversationId } = state;
+  const { conversationId, ringId } = state;
+  const pendingOperation = pendingRingOperations.get(conversationId);
+  if (pendingOperation?.state === state) {
+    pendingOperation.cancelRequested = true;
+    // Release global call ownership immediately. The operation remains in
+    // unresolvedRingOperations so its eventual response can still be canceled
+    // by exact ring ID without blocking a successor call in the meantime.
+    finishPendingRingOperation(conversationId, pendingOperation);
+  }
   try {
-    await apiFetch(`/api/v1/dm/conversations/${conversationId}/voice/cancel`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-    });
+    // A blank ID means the /ring request has not resolved. Sending the legacy
+    // wildcard cancel could hit a successor ring; the request owner issues an
+    // exact-ID cancel as soon as its response arrives instead.
+    if (ringId) await cancelRingRequest(conversationId, ringId);
   } catch (err) {
     // POST failure is observable but doesn't block local cleanup. The
     // server may continue ringing callees until the 45s timeout, but the
@@ -205,8 +442,10 @@ export async function cancelOutgoingCall(): Promise<void> {
     // without `catch` made the POST error invisible).
     console.error('DM voice cancel POST failed:', sanitizeErrForLog(err));
   } finally {
-    notificationSoundService.stopLoop('call-outgoing');
-    useVoiceStore.getState().setCallState({ kind: 'idle' });
+    if (useVoiceStore.getState().callState === state) {
+      notificationSoundService.stopLoop('call-outgoing');
+      useVoiceStore.getState().setCallState({ kind: 'idle' });
+    }
   }
 }
 
@@ -228,17 +467,27 @@ export async function acceptIncomingCall(): Promise<void> {
     return;
   }
   const { conversationId } = state;
+  const joiningState: CallState = {
+    kind: 'joining',
+    conversationId,
+    ringId: state.ringId,
+  };
+  useVoiceStore.getState().setCallState(joiningState);
   notificationSoundService.stopLoop('call-ringing');
   try {
     await voiceService.joinChannel(conversationId, 'dm');
-    useVoiceStore.getState().setCallState({ kind: 'in-call' });
+    if (useVoiceStore.getState().callState === joiningState) {
+      useVoiceStore.getState().setCallState({ kind: 'in-call' });
+    }
   } catch (err) {
     // joinChannel failure (mediasoup error, network drop, server 500): reset
     // to idle so the UI doesn't lock the callee in incoming-ringing with no
     // way out (silent-failure-hunter #1231 finding). The error is rethrown
     // so the caller (click handler in IncomingCallBanner) can surface it.
     console.error('DM voice accept failed:', sanitizeErrForLog(err));
-    useVoiceStore.getState().setCallState({ kind: 'idle' });
+    if (useVoiceStore.getState().callState === joiningState) {
+      useVoiceStore.getState().setCallState({ kind: 'idle' });
+    }
     throw err;
   }
 }
@@ -251,15 +500,15 @@ export async function acceptIncomingCall(): Promise<void> {
 export async function declineIncomingCall(): Promise<void> {
   const state = useVoiceStore.getState().callState;
   if (state.kind !== 'incoming-ringing') {
-    notificationSoundService.stopLoop('call-ringing');
-    useVoiceStore.getState().setCallState({ kind: 'idle' });
+    if (state.kind === 'idle') notificationSoundService.stopLoop('call-ringing');
     return;
   }
-  const { conversationId } = state;
+  const { conversationId, ringId } = state;
   try {
     await apiFetch(`/api/v1/dm/conversations/${conversationId}/voice/decline`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      ...ringRequestBody(ringId),
     });
   } catch (err) {
     // Same posture as cancelOutgoingCall: observable POST error but local
@@ -267,8 +516,10 @@ export async function declineIncomingCall(): Promise<void> {
     // (silent-failure-hunter #1231 finding).
     console.error('DM voice decline POST failed:', sanitizeErrForLog(err));
   } finally {
-    notificationSoundService.stopLoop('call-ringing');
-    useVoiceStore.getState().setCallState({ kind: 'idle' });
+    if (useVoiceStore.getState().callState === state) {
+      notificationSoundService.stopLoop('call-ringing');
+      useVoiceStore.getState().setCallState({ kind: 'idle' });
+    }
   }
 }
 
@@ -320,6 +571,12 @@ export function handleCallInvited(payload: DMVoiceCallInvitedPayload): void {
  * or callee receiving any cancel), stop audio + transition to idle.
  */
 export function handleCallCanceled(payload: DMVoiceCallCanceledPayload): void {
+  const queuedForUnresolvedRing = queueEventForUnresolvedRing(
+    payload.conversation_id,
+    payload.ring_id,
+    () => handleCallCanceled(payload),
+    true
+  );
   const store = useVoiceStore.getState();
   const state = store.callState;
   if (state.kind !== 'outgoing-ringing' && state.kind !== 'incoming-ringing') {
@@ -328,19 +585,37 @@ export function handleCallCanceled(payload: DMVoiceCallCanceledPayload): void {
   if (state.conversationId !== payload.conversation_id) {
     return;
   }
+  if (state.kind === 'outgoing-ringing' && state.ringId === '' && queuedForUnresolvedRing) {
+    return;
+  }
+  if (state.ringId !== payload.ring_id) {
+    return;
+  }
 
   // Caller flow: someone-accepted is the cue to actually join
   if (state.kind === 'outgoing-ringing' && payload.canceled_by === 'someone_accepted') {
     notificationSoundService.stopLoop('call-outgoing');
     const { conversationId } = state;
+    const joiningState: CallState = {
+      kind: 'joining',
+      conversationId,
+      ringId: state.ringId,
+    };
+    store.setCallState(joiningState);
     // Fire-and-forget joinChannel. The voiceService internally manages
     // state transitions during/after join; on success it'll be in-call.
     void voiceService.joinChannel(conversationId, 'dm').then(
-      () => store.setCallState({ kind: 'in-call' }),
+      () => {
+        if (useVoiceStore.getState().callState === joiningState) {
+          store.setCallState({ kind: 'in-call' });
+        }
+      },
       (err) => {
         // Join failed; revert to idle. The caller's UI can surface this.
         console.error('Failed to join DM voice call after accept:', sanitizeErrForLog(err));
-        store.setCallState({ kind: 'idle' });
+        if (useVoiceStore.getState().callState === joiningState) {
+          store.setCallState({ kind: 'idle' });
+        }
       }
     );
     return;
@@ -369,12 +644,23 @@ export function handleCallCanceled(payload: DMVoiceCallCanceledPayload): void {
  * conversation in dmStore (matching DMConversationContextMenu.tsx).
  */
 export function handleCallDeclined(payload: DMVoiceCallDeclinedPayload): void {
+  const queuedForUnresolvedRing = queueEventForUnresolvedRing(
+    payload.conversation_id,
+    payload.ring_id,
+    () => handleCallDeclined(payload)
+  );
   const store = useVoiceStore.getState();
   const state = store.callState;
   if (state.kind !== 'outgoing-ringing') {
     return;
   }
   if (state.conversationId !== payload.conversation_id) {
+    return;
+  }
+  if (state.ringId === '' && queuedForUnresolvedRing) {
+    return;
+  }
+  if (state.ringId !== payload.ring_id) {
     return;
   }
 
@@ -402,12 +688,24 @@ export function handleCallDeclined(payload: DMVoiceCallDeclinedPayload): void {
  * depending on caller vs callee perspective) and transitions to idle.
  */
 export function handleCallTimedOut(payload: DMVoiceCallTimedOutPayload): void {
+  const queuedForUnresolvedRing = queueEventForUnresolvedRing(
+    payload.conversation_id,
+    payload.ring_id,
+    () => handleCallTimedOut(payload),
+    true
+  );
   const store = useVoiceStore.getState();
   const state = store.callState;
   if (state.kind !== 'outgoing-ringing' && state.kind !== 'incoming-ringing') {
     return;
   }
   if (state.conversationId !== payload.conversation_id) {
+    return;
+  }
+  if (state.kind === 'outgoing-ringing' && state.ringId === '' && queuedForUnresolvedRing) {
+    return;
+  }
+  if (state.ringId !== payload.ring_id) {
     return;
   }
   notificationSoundService.stopLoop('call-outgoing');

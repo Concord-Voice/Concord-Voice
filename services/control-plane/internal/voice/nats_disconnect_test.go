@@ -39,7 +39,7 @@ func TestPublishForceDisconnect_PublishesPayload(t *testing.T) {
 	t.Cleanup(obsClient.Close)
 
 	ts := testhelpers.SetupTestServer(t)
-	sub := voice.NewNATSSubscriber(ts.DB, logger.New("test"), ts.Hub, pubClient, nil)
+	sub := voice.NewNATSSubscriber(ts.DB, logger.New("test"), ts.Hub, pubClient, ts.Redis, nil)
 
 	received := make(chan []byte, 1)
 	natsSub, err := obsClient.Subscribe("voice.enforce.disconnect", func(data []byte) {
@@ -73,7 +73,7 @@ func TestPublishForceDisconnect_PublishesPayload(t *testing.T) {
 // publishEnforcementFlags nil guard.
 func TestPublishForceDisconnect_NilNATSNoop(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
-	sub := voice.NewNATSSubscriber(ts.DB, logger.New("test"), ts.Hub, nil, nil)
+	sub := voice.NewNATSSubscriber(ts.DB, logger.New("test"), ts.Hub, nil, ts.Redis, nil)
 	// Must not panic when nats is nil.
 	sub.PublishForceDisconnect("chan", "user")
 }

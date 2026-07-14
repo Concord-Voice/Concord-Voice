@@ -7,11 +7,14 @@
 package dm
 
 import (
+	"context"
+	"database/sql"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	_ "github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -160,4 +163,43 @@ func TestCallEventDeclined_GroupListsAllDecliners(t *testing.T) {
 	assert.Equal(t, CallEventDeclined, p.Status)
 	require.Len(t, p.ParticipantUserIDs, 4, "caller + 3 decliners")
 	assert.ElementsMatch(t, []uuid.UUID{caller, d1, d2, d3}, p.ParticipantUserIDs)
+}
+
+func TestInsertCompletedCallEvent_ForgetsAcceptedCorrelationOnInsertFailure(t *testing.T) {
+	convID := uuid.New()
+	ring := newPendingCall(convID, uuid.New(), []uuid.UUID{uuid.New()}, time.Second)
+	rememberAcceptedDMCall(ring, time.Minute)
+	t.Cleanup(func() { forgetAcceptedDMCall(convID, ring.RingID) })
+
+	db, err := sql.Open("postgres", "postgres://invalid")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	err = InsertCompletedCallEvent(context.Background(), db, convID, CompletedCallSummary{
+		CallID:             ring.RingID,
+		RingID:             ring.RingID,
+		CallerUserID:       ring.CallerUserID,
+		ParticipantUserIDs: []uuid.UUID{ring.CallerUserID},
+		StartedAt:          time.Now().Add(-time.Second),
+		EndedAt:            time.Now(),
+	})
+	require.Error(t, err)
+	_, ok := lookupAcceptedDMCall(convID, ring.RingID)
+	assert.False(t, ok, "terminal room cleanup must not depend on history persistence")
+}
+
+func TestInsertCompletedCallEventForDMRoom_ForgetsAcceptedCorrelationOnFallbackFailure(t *testing.T) {
+	convID := uuid.New()
+	ring := newPendingCall(convID, uuid.New(), []uuid.UUID{uuid.New()}, time.Second)
+	rememberAcceptedDMCall(ring, time.Minute)
+	t.Cleanup(func() { forgetAcceptedDMCall(convID, ring.RingID) })
+
+	db, err := sql.Open("postgres", "postgres://invalid")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	err = InsertCompletedCallEventForDMRoom(context.Background(), db, convID)
+	require.Error(t, err)
+	_, ok := lookupAcceptedDMCall(convID, ring.RingID)
+	assert.False(t, ok, "legacy terminal cleanup must not depend on live presence or history persistence")
 }

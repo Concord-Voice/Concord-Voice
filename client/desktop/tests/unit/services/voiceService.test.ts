@@ -281,6 +281,7 @@ function createMockMediaStream(tracks?: Array<{ kind: string; id?: string }>) {
 // Import voiceService AFTER all mocks
 // ---------------------------------------------------------------------------
 const { voiceService } = await import('@/renderer/services/voiceService');
+const { handleCallInvited } = await import('@/renderer/services/voiceService/callStateMachine');
 
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { useUserStore } from '@/renderer/stores/userStore';
@@ -430,11 +431,15 @@ function makeRecvTransport() {
   return { id: 'recv-1', closed: false, close: vi.fn(), consume: vi.fn(), on: vi.fn() };
 }
 
-async function joinVoiceChannel(co?: Record<string, unknown>) {
+async function joinVoiceChannel(
+  co?: Record<string, unknown>,
+  joinType: 'channel' | 'dm' = 'channel',
+  response?: Record<string, unknown>
+) {
   setupAuth();
   mockApiFetch.mockResolvedValueOnce({
     ok: true,
-    json: vi.fn().mockResolvedValue(makeJoinResponse(co)),
+    json: vi.fn().mockResolvedValue({ ...makeJoinResponse(co), ...response }),
   });
   mockSocket.connected = true;
 
@@ -457,7 +462,7 @@ async function joinVoiceChannel(co?: Record<string, unknown>) {
   const micProducer = createMockProducer('prod-mic', 'mic');
   sendTransport.produce.mockResolvedValue(micProducer);
 
-  await voiceService.joinChannel('channel-1');
+  await voiceService.joinChannel('channel-1', joinType);
   return { sendTransport, recvTransport, micProducer };
 }
 
@@ -743,8 +748,160 @@ describe('VoiceService', () => {
       await voiceService.joinChannel('dm-ch', 'dm');
       expect(mockApiFetch).toHaveBeenCalledWith(
         '/api/v1/dm/conversations/dm-ch/voice/join',
-        expect.any(Object)
+        expect.not.objectContaining({ body: expect.anything() })
       );
+      expect(useVoiceStore.getState().callState).toEqual({ kind: 'in-call' });
+    });
+
+    it('claims a direct DM join before awaiting and rejects duplicate joins or invites', async () => {
+      setupAuth();
+      let resolveAuthorization!: (response: Response) => void;
+      mockApiFetch.mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveAuthorization = resolve;
+        })
+      );
+      mockSocket.connected = true;
+      const st = makeSendTransport();
+      const rt = makeRecvTransport();
+      mockCreateSendTransport.mockReturnValue(st);
+      mockCreateRecvTransport.mockReturnValue(rt);
+      setupEmitResponses({
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        produce: { id: 'p1' },
+      });
+      mockGetUserMedia.mockResolvedValue(createMockMediaStream());
+      st.produce.mockResolvedValue(createMockProducer());
+
+      const joining = voiceService.joinChannel('dm-ch', 'dm');
+      expect(useVoiceStore.getState().callState).toEqual({
+        kind: 'joining',
+        conversationId: 'dm-ch',
+        ringId: '',
+      });
+
+      await expect(voiceService.joinChannel('dm-ch', 'dm')).rejects.toThrow(
+        'Another voice call is already in progress'
+      );
+      handleCallInvited({
+        conversation_id: 'dm-other',
+        is_group: false,
+        ring_id: 'ring-other',
+        caller: { user_id: 'user-2', username: 'caller' },
+        ring_started_at: new Date().toISOString(),
+        ring_timeout_seconds: 45,
+      });
+      expect(useVoiceStore.getState().callState).toEqual({
+        kind: 'joining',
+        conversationId: 'dm-ch',
+        ringId: '',
+      });
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+
+      resolveAuthorization({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      } as unknown as Response);
+      await joining;
+
+      expect(useVoiceStore.getState().callState).toEqual({ kind: 'in-call' });
+      handleCallInvited({
+        conversation_id: 'dm-other',
+        is_group: false,
+        ring_id: 'ring-other',
+        caller: { user_id: 'user-2', username: 'caller' },
+        ring_started_at: new Date().toISOString(),
+        ring_timeout_seconds: 45,
+      });
+      expect(useVoiceStore.getState().callState).toEqual({ kind: 'in-call' });
+    });
+
+    it('rejects a DM join while another conversation owns the call state', async () => {
+      useVoiceStore.getState().setCallState({
+        kind: 'incoming-ringing',
+        conversationId: 'dm-owned',
+        ringId: 'ring-owned',
+        caller: { userId: 'user-2', username: 'caller' },
+        expiresAt: Date.now() + 45_000,
+        isGroup: false,
+      });
+
+      await expect(voiceService.joinChannel('dm-other', 'dm')).rejects.toThrow(
+        'Another voice call is already in progress'
+      );
+      expect(mockApiFetch).not.toHaveBeenCalled();
+    });
+
+    it.each(['outgoing-ringing', 'incoming-ringing'] as const)(
+      'sends the %s ring ID and forwards the authoritative call ID to the media plane',
+      async (kind) => {
+        const conversationId = 'channel-1';
+        const ringId = `${kind}-ring`;
+        if (kind === 'outgoing-ringing') {
+          useVoiceStore.getState().setCallState({
+            kind,
+            conversationId,
+            ringId,
+            calleeUserIds: ['user-2'],
+            startedAt: Date.now(),
+            declinedUserIds: [],
+          });
+        } else {
+          useVoiceStore.getState().setCallState({
+            kind,
+            conversationId,
+            ringId,
+            caller: { userId: 'user-2', username: 'caller' },
+            expiresAt: Date.now() + 45_000,
+            isGroup: false,
+          });
+        }
+
+        await joinVoiceChannel(undefined, 'dm', { call_id: 'call-1' });
+
+        expect(mockApiFetch).toHaveBeenCalledWith(
+          '/api/v1/dm/conversations/channel-1/voice/join',
+          expect.objectContaining({ body: JSON.stringify({ ring_id: ringId }) })
+        );
+        expect(mockSocket.emit).toHaveBeenCalledWith(
+          'join-room',
+          expect.objectContaining({ roomId: conversationId, callId: 'call-1' }),
+          expect.any(Function)
+        );
+      }
+    );
+
+    it('captures a DM ring ID before leaving an existing channel', async () => {
+      await joinVoiceChannel();
+      useVoiceStore.getState().setCallState({
+        kind: 'joining',
+        conversationId: 'channel-1',
+        ringId: 'ring-before-leave',
+      });
+
+      mockApiFetch.mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue({ ...makeJoinResponse(), call_id: 'call-2' }),
+      });
+      setupEmitResponses({
+        'join-room': makeRoomJoined(),
+        'create-transport': makeTransportOpts(),
+        produce: { id: 'prod-mic-2' },
+        'leave-room': undefined,
+      });
+
+      await voiceService.joinChannel('channel-1', 'dm');
+
+      expect(mockApiFetch).toHaveBeenLastCalledWith(
+        '/api/v1/dm/conversations/channel-1/voice/join',
+        expect.objectContaining({ body: JSON.stringify({ ring_id: 'ring-before-leave' }) })
+      );
+      expect(useVoiceStore.getState().callState).toEqual({
+        kind: 'joining',
+        conversationId: 'channel-1',
+        ringId: 'ring-before-leave',
+      });
     });
 
     it('handles json parse failure on error response', async () => {
@@ -1053,12 +1210,20 @@ describe('VoiceService', () => {
     });
 
     it('re-authorizes via the DM endpoint when resuming a DM call', async () => {
-      await joinVoiceChannel();
-      useVoiceStore.getState().setDMCall(true, 'channel-1');
+      useVoiceStore.getState().setCallState({
+        kind: 'outgoing-ringing',
+        conversationId: 'channel-1',
+        ringId: 'initial-ring',
+        calleeUserIds: ['user-2'],
+        startedAt: Date.now(),
+        declinedUserIds: [],
+      });
+      await joinVoiceChannel(undefined, 'dm', { call_id: 'call-1' });
+      useVoiceStore.getState().setCallState({ kind: 'in-call' });
       mockApiFetch.mockClear();
       mockApiFetch.mockResolvedValue({
         ok: true,
-        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+        json: vi.fn().mockResolvedValue({ ...makeJoinResponse(), call_id: 'call-1' }),
       });
       setupEmitResponses({
         'join-room': makeRoomJoined(),
@@ -1075,8 +1240,10 @@ describe('VoiceService', () => {
       await vi.waitFor(() => {
         expect(mockApiFetch).toHaveBeenCalledWith(
           '/api/v1/dm/conversations/channel-1/voice/join',
-          expect.objectContaining({ method: 'POST' })
+          expect.not.objectContaining({ body: expect.anything() })
         );
+        const joinRoomCalls = mockSocket.emit.mock.calls.filter((call) => call[0] === 'join-room');
+        expect(joinRoomCalls.at(-1)?.[1]).toEqual(expect.objectContaining({ callId: 'call-1' }));
       });
     });
 

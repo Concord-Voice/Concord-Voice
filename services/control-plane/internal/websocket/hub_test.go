@@ -2289,6 +2289,22 @@ func TestBroadcastToDMQueuesMessage(t *testing.T) {
 	}
 }
 
+func TestBroadcastToDMParticipantsFallsBackWithoutDatabase(t *testing.T) {
+	hub := newMinimalHub()
+	convID := uuid.New()
+	msg := OutgoingMessage{Type: "dm_terminal_test", Data: map[string]interface{}{}}
+
+	hub.BroadcastToDMParticipants(convID, msg)
+
+	select {
+	case dmMsg := <-hub.dmBroadcast:
+		assert.Equal(t, convID, dmMsg.ConversationID)
+		assert.Equal(t, "dm_terminal_test", dmMsg.Data.Type)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected fallback message on dmBroadcast channel")
+	}
+}
+
 func TestBroadcastServerVoiceCountsQueuesSignal(t *testing.T) {
 	hub := NewHub(nil, nil)
 

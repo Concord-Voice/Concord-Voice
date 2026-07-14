@@ -392,6 +392,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
                     key={message.id}
                     payload={message.call_event_payload}
                     isGroup={isGroupConversation}
+                    currentUserId={currentUserId}
                   />
                 );
               }

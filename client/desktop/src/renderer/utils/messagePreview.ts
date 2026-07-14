@@ -1,4 +1,5 @@
 import { unwrapGifEnvelope } from './gifEnvelope';
+import type { CallEventPayload } from '../types/chat';
 
 interface PreviewAttachment {
   readonly file_type?: string | null;
@@ -9,7 +10,42 @@ interface MessagePreviewOptions {
   readonly gifSlug?: string | null;
   readonly attachmentType?: string | null;
   readonly attachments?: readonly PreviewAttachment[] | null;
+  readonly callEventPayload?: CallEventPayload;
+  readonly currentUserId?: string;
   readonly fallback?: string;
+}
+
+function genericCallLabel(payload: CallEventPayload): string {
+  switch (payload.status) {
+    case 'completed':
+      return 'Voice call';
+    case 'missed':
+      return 'Missed voice call';
+    case 'declined':
+      return 'Voice call declined';
+    case 'canceled':
+      return 'Voice call canceled';
+    case 'failed':
+      return 'Voice call failed';
+    default:
+      return 'Voice call failed';
+  }
+}
+
+export function formatCallEventPreview(payload: CallEventPayload, currentUserId?: string): string {
+  const callerUserId = payload.caller_user_id;
+  if (!callerUserId || !currentUserId) return genericCallLabel(payload);
+
+  if (payload.status === 'completed') {
+    if (callerUserId === currentUserId) return 'Outbound call answered';
+    return 'Inbound call answered';
+  }
+
+  if (payload.status === 'missed') {
+    return callerUserId === currentUserId ? 'Outbound call — no answer' : 'Inbound call missed';
+  }
+
+  return genericCallLabel(payload);
 }
 
 function mediaLabel(type: string | null | undefined): string | null {
@@ -26,6 +62,10 @@ function mediaLabel(type: string | null | undefined): string | null {
 }
 
 export function formatMessagePreview(options: MessagePreviewOptions): string {
+  if (options.callEventPayload) {
+    return formatCallEventPreview(options.callEventPayload, options.currentUserId);
+  }
+
   const { text, gifSlug: envelopeGifSlug } = unwrapGifEnvelope(options.content ?? '');
   if (text.trim()) return text;
   if (options.gifSlug || envelopeGifSlug) return 'GIF';

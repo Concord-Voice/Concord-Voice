@@ -2,13 +2,17 @@ package dm_test
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -311,6 +315,34 @@ func TestListConversations_WithLastMessage(t *testing.T) {
 	lm := conv["last_message"].(map[string]interface{})
 	assert.Equal(t, "hello there", lm["content"])
 	assert.Equal(t, user1.ID, lm["user_id"])
+}
+
+func TestListConversations_WithLastCallEvent(t *testing.T) {
+	ts := setupTS(t)
+	caller := ts.CreateTestUser(t, "listcallcaller")
+	callee := ts.CreateTestUser(t, "listcallcallee")
+	ts.CreateFriendship(t, caller.ID, callee.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+
+	payload := `{"caller_user_id":"` + caller.ID + `","started_at":"2026-07-13T12:00:00Z","status":"missed","duration_seconds":0}`
+	_, err := ts.DB.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, call_event_payload)
+		VALUES (gen_random_uuid(), $1, $2, '', 'call_event', $3)`, convID, caller.ID, payload)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("GET", pathDMConversations, nil, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	conversations := body["conversations"].([]interface{})
+	require.Len(t, conversations, 1)
+
+	lm := conversations[0].(map[string]interface{})["last_message"].(map[string]interface{})
+	require.Equal(t, "call_event", lm["type"])
+	payloadResponse, ok := lm["call_event_payload"].(map[string]interface{})
+	require.True(t, ok, "call_event_payload is returned as an object")
+	assert.Equal(t, caller.ID, payloadResponse["caller_user_id"])
+	assert.Equal(t, "missed", payloadResponse["status"])
 }
 
 func TestListConversations_UnreadCount(t *testing.T) {
@@ -4240,6 +4272,68 @@ func TestRingDMCall_AlreadyRinging_Returns409(t *testing.T) {
 	assert.NotEmpty(t, existing["ring_started_at"])
 }
 
+func TestRingDMCall_RejectsConversationWithLiveMediaRoom(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	caller := ts.CreateTestUser(t, "ring_active_room_caller")
+	callee := ts.CreateTestUser(t, "ring_active_room_callee")
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+	_, err := ts.DB.Exec(`
+		INSERT INTO dm_voice_participants (conversation_id, user_id, joined_at)
+		VALUES ($1, $2, NOW())
+	`, convID, caller.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceRing, nil, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code, "active room must reject a second ring; body: %s", w.Body.String())
+	assert.False(t, dm.PendingDMCallExistsForTest(uuid.MustParse(convID)))
+}
+
+func TestRingDMCall_ExpiresStaleMediaPresenceBeforeRinging(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	caller := ts.CreateTestUser(t, "ring_stale_room_caller")
+	callee := ts.CreateTestUser(t, "ring_stale_room_callee")
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+	_, err := ts.DB.Exec(`
+		INSERT INTO dm_voice_participants (conversation_id, user_id, joined_at)
+		VALUES ($1, $2, NOW() - INTERVAL '10 minutes')
+	`, convID, caller.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceRing, nil,
+		testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code,
+		"dropped terminal events must not block the conversation forever: %s", w.Body.String())
+	assert.True(t, dm.PendingDMCallExistsForTest(uuid.MustParse(convID)))
+
+	var staleRows int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM dm_voice_participants WHERE conversation_id = $1`, convID,
+	).Scan(&staleRows))
+	assert.Zero(t, staleRows)
+}
+
+func TestRingDMCall_RejectsAcceptedCallBeforeMediaPresenceArrives(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	caller := ts.CreateTestUser(t, "ring_accepted_caller")
+	callee := ts.CreateTestUser(t, "ring_accepted_callee")
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+	ringID := ringForTest(t, ts, caller, convID)
+
+	accepted := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", map[string]interface{}{
+		"ring_id": ringID,
+	}, testhelpers.AuthHeaders(callee.AccessToken))
+	require.Equal(t, http.StatusOK, accepted.Code, "accept ring: %s", accepted.Body.String())
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceRing, nil, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code, "accepted call must reject a second ring; body: %s", w.Body.String())
+}
+
 func TestRingDMCall_InvalidConvID_Returns400(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	t.Cleanup(dm.ResetPendingDMCallsForTest)
@@ -4298,12 +4392,18 @@ func TestRingDMCall_Group_AllOffline_Returns400(t *testing.T) {
 const pathVoiceDecline = "/voice/decline"
 
 // ringForTest is a small test helper that POSTs /voice/ring as the given
-// user and asserts 200. Returns the convID for chaining into subsequent
-// decline/cancel requests.
-func ringForTest(t *testing.T, ts *testhelpers.TestServer, caller testhelpers.TestUser, convID string) {
+// user and asserts 200. Returns the server-issued ring ID for callers that
+// need to exercise accepted-call correlation.
+func ringForTest(t *testing.T, ts *testhelpers.TestServer, caller testhelpers.TestUser, convID string) string {
 	t.Helper()
 	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceRing, nil, testhelpers.AuthHeaders(caller.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code, "ring setup failed; body: %s", w.Body.String())
+	var body struct {
+		RingID string `json:"ring_id"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.NotEmpty(t, body.RingID)
+	return body.RingID
 }
 
 func TestDeclineDMCall_DM1on1_EndsCallAndClearsRing(t *testing.T) {
@@ -4385,6 +4485,38 @@ func TestDeclineDMCall_NoActiveRing_Returns404(t *testing.T) {
 	// No ring started — decline should 404
 	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceDecline, nil, testhelpers.AuthHeaders(other.AccessToken))
 	assert.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
+}
+
+func TestDeclineDMCall_StaleRingCannotDeclineReplacement(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	caller := ts.CreateTestUser(t, "decl_stale_caller")
+	callee := ts.CreateTestUser(t, "decl_stale_callee")
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+	convUUID := uuid.MustParse(convID)
+	callerUUID := uuid.MustParse(caller.ID)
+	calleeUUID := uuid.MustParse(callee.ID)
+	stale := dm.NewPendingCallForTest(convUUID, callerUUID, []uuid.UUID{calleeUUID})
+	replacement := dm.NewPendingCallForTest(convUUID, callerUUID, []uuid.UUID{calleeUUID})
+	dm.StoreRingForTest(convUUID, replacement)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceDecline, map[string]interface{}{
+		"ring_id": uuid.Nil.String(),
+	}, testhelpers.AuthHeaders(callee.AccessToken))
+	require.Equal(t, http.StatusBadRequest, w.Code, "zero ring ID is explicit and invalid")
+
+	w = ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceDecline, map[string]interface{}{
+		"ring_id": stale.RingID.String(),
+	}, testhelpers.AuthHeaders(callee.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code, "stale decline must fail; body: %s", w.Body.String())
+	assert.True(t, dm.PendingDMCallExistsForTest(convUUID))
+
+	w = ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceDecline, map[string]interface{}{
+		"ring_id": replacement.RingID.String(),
+	}, testhelpers.AuthHeaders(callee.AccessToken))
+	require.Equal(t, http.StatusNoContent, w.Code, "replacement decline succeeds; body: %s", w.Body.String())
+	assert.False(t, dm.PendingDMCallExistsForTest(convUUID))
 }
 
 func TestDeclineDMCall_CallerCannotDeclineOwnRing(t *testing.T) {
@@ -4513,9 +4645,125 @@ func TestCancelDMCall_NoRing_Returns404(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
 }
 
+func TestCancelDMCall_StaleRingCannotCancelReplacement(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	caller := ts.CreateTestUser(t, "cancel_stale_caller")
+	callee := ts.CreateTestUser(t, "cancel_stale_callee")
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+	convUUID := uuid.MustParse(convID)
+	callerUUID := uuid.MustParse(caller.ID)
+	calleeUUID := uuid.MustParse(callee.ID)
+	stale := dm.NewPendingCallForTest(convUUID, callerUUID, []uuid.UUID{calleeUUID})
+	replacement := dm.NewPendingCallForTest(convUUID, callerUUID, []uuid.UUID{calleeUUID})
+	dm.StoreRingForTest(convUUID, replacement)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/cancel", map[string]interface{}{
+		"ring_id": uuid.Nil.String(),
+	}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusBadRequest, w.Code, "zero ring ID is explicit and invalid")
+
+	w = ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/cancel", map[string]interface{}{
+		"ring_id": stale.RingID.String(),
+	}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code, "stale cancel must fail; body: %s", w.Body.String())
+	assert.True(t, dm.PendingDMCallExistsForTest(convUUID))
+
+	w = ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/cancel", map[string]interface{}{
+		"ring_id": replacement.RingID.String(),
+	}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusNoContent, w.Code, "replacement cancel succeeds; body: %s", w.Body.String())
+	assert.False(t, dm.PendingDMCallExistsForTest(convUUID))
+}
+
 // ─── AuthorizeDMVoiceForMediaPlane tests (#1209, plan Task B6 / G7) ──────
 
 const pathVoiceAuthorize = "/voice/authorize"
+
+func dmVoiceMediaAuthorizationHeaders(
+	accessToken, convID, requestedCallID string,
+) http.Header {
+	return dmVoiceMediaAuthorizationHeadersAt(
+		accessToken, convID, requestedCallID, "POST", time.Now(),
+	)
+}
+
+func dmVoiceMediaAuthorizationHeadersAt(
+	accessToken, convID, requestedCallID string,
+	method string,
+	proofTime time.Time,
+) http.Header {
+	timestamp := strconv.FormatInt(proofTime.Unix(), 10)
+	tokenDigest := sha256.Sum256([]byte(accessToken))
+	payload := strings.Join([]string{
+		"v1",
+		timestamp,
+		method,
+		convID,
+		requestedCallID,
+		hex.EncodeToString(tokenDigest[:]),
+	}, "\n")
+	keyMAC := hmac.New(sha256.New, []byte(testhelpers.TestJWTSecret))
+	_, _ = keyMAC.Write([]byte("concord/dm-voice-media-authorization/v1"))
+	proofMAC := hmac.New(sha256.New, keyMAC.Sum(nil))
+	_, _ = proofMAC.Write([]byte(payload))
+
+	headers := testhelpers.AuthHeaders(accessToken)
+	headers.Set("X-Concord-Media-Timestamp", timestamp)
+	headers.Set("X-Concord-Media-Proof", hex.EncodeToString(proofMAC.Sum(nil)))
+	return headers
+}
+
+func dmVoiceMediaReleaseHeaders(accessToken, convID, callID string) http.Header {
+	return dmVoiceMediaAuthorizationHeadersAt(accessToken, convID, callID, "DELETE", time.Now())
+}
+
+func authorizeDMVoiceForMediaPlaneAfterJoin(
+	t *testing.T,
+	ts *testhelpers.TestServer,
+	convID string,
+	user testhelpers.TestUser,
+) (*httptest.ResponseRecorder, string) {
+	t.Helper()
+	joined := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", nil,
+		testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, joined.Code, "join voice: %s", joined.Body.String())
+	var joinBody map[string]interface{}
+	require.NoError(t, json.Unmarshal(joined.Body.Bytes(), &joinBody))
+	callID, ok := joinBody["call_id"].(string)
+	require.True(t, ok, "direct /voice/join returns a call_id")
+	require.NotEqual(t, uuid.Nil, uuid.MustParse(callID))
+
+	authorized := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize,
+		map[string]interface{}{"call_id": callID},
+		dmVoiceMediaAuthorizationHeaders(user.AccessToken, convID, callID))
+	return authorized, callID
+}
+
+func TestAuthorizeDMVoiceForMediaPlane_RequiresPriorJoinReservation(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	user := ts.CreateTestUser(t, "g7_unbound_member")
+	other := ts.CreateTestUser(t, "g7_unbound_other")
+	convID := ts.CreateDMConversation(t, user.ID, other.ID)
+	convUUID := uuid.MustParse(convID)
+
+	authorized := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize, nil,
+		testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusConflict, authorized.Code,
+		"media authorization must not create a call lease without /voice/join")
+
+	_, hasLease, err := dm.LookupDMVoiceCallLease(context.Background(), ts.Redis, convUUID)
+	require.NoError(t, err)
+	assert.False(t, hasLease, "an unbound authorize request must not reserve the conversation")
+
+	ring := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceRing, nil,
+		testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, ring.Code,
+		"unbound authorization must not block a legitimate ring: %s", ring.Body.String())
+}
 
 func TestAuthorizeDMVoiceForMediaPlane_Member_Returns200(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
@@ -4524,13 +4772,188 @@ func TestAuthorizeDMVoiceForMediaPlane_Member_Returns200(t *testing.T) {
 	other := ts.CreateTestUser(t, "g7_other")
 	convID := ts.CreateDMConversation(t, user.ID, other.ID)
 
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize, nil, testhelpers.AuthHeaders(user.AccessToken))
+	w, callID := authorizeDMVoiceForMediaPlaneAfterJoin(t, ts, convID, user)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	var body map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
 	assert.Equal(t, true, body["authorized"])
 	assert.Equal(t, false, body["is_group"], "DM 1:1 = not group")
+	assert.Equal(t, callID, body["call_id"])
+	assert.Equal(t, user.ID, body["call_caller_user_id"])
+	lease, hasLease, err := dm.LookupDMVoiceCallLease(context.Background(), ts.Redis, uuid.MustParse(convID))
+	require.NoError(t, err)
+	require.True(t, hasLease)
+	assert.Equal(t, uuid.MustParse(callID), lease.CallID)
+	assert.Equal(t, uuid.MustParse(user.ID), lease.CallerUserID)
+	reservationTTL, err := ts.Redis.PTTL(context.Background(), "dm_voice_call_lease:"+convID).Result()
+	require.NoError(t, err)
+	assert.Positive(t, reservationTTL)
+	assert.LessOrEqual(t, reservationTTL, dm.DMVoiceCallReservationTTL)
+
+	// Released clients do not yet forward call_id. Their own /voice/join must
+	// bind the legacy omission to this exact existing lease before authorization.
+	legacyJoin := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", nil,
+		testhelpers.AuthHeaders(other.AccessToken))
+	require.Equal(t, http.StatusOK, legacyJoin.Code, "legacy join: %s", legacyJoin.Body.String())
+	var legacyJoinBody map[string]interface{}
+	require.NoError(t, json.Unmarshal(legacyJoin.Body.Bytes(), &legacyJoinBody))
+	assert.Equal(t, callID, legacyJoinBody["call_id"])
+	reconnect := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize,
+		map[string]interface{}{},
+		dmVoiceMediaAuthorizationHeaders(other.AccessToken, convID, ""))
+	require.Equal(t, http.StatusOK, reconnect.Code, "body: %s", reconnect.Body.String())
+	body = nil
+	require.NoError(t, json.Unmarshal(reconnect.Body.Bytes(), &body))
+	assert.Equal(t, callID, body["call_id"])
+	assert.Equal(t, user.ID, body["call_caller_user_id"])
+
+	ring := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceRing, nil,
+		testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusConflict, ring.Code,
+		"a media-authorized direct handoff must remain protected until joined or expired: %s",
+		ring.Body.String())
+}
+
+func TestAuthorizeDMVoiceForMediaPlane_OmittedCallIDRejectsStaleJoinAdmission(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	joiningUser := ts.CreateTestUser(t, "g7_stale_admission_joiner")
+	caller := ts.CreateTestUser(t, "g7_stale_admission_caller")
+	convID := ts.CreateDMConversation(t, joiningUser.ID, caller.ID)
+	convUUID := uuid.MustParse(convID)
+	joiningUserUUID := uuid.MustParse(joiningUser.ID)
+
+	oldJoin := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", nil,
+		testhelpers.AuthHeaders(joiningUser.AccessToken))
+	require.Equal(t, http.StatusOK, oldJoin.Code, "reserve old direct join: %s", oldJoin.Body.String())
+	var oldJoinBody map[string]interface{}
+	require.NoError(t, json.Unmarshal(oldJoin.Body.Bytes(), &oldJoinBody))
+	oldCallID := uuid.MustParse(oldJoinBody["call_id"].(string))
+
+	ring := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceRing, nil,
+		testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusOK, ring.Code, "replacement ring: %s", ring.Body.String())
+
+	accepted := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", nil,
+		testhelpers.AuthHeaders(joiningUser.AccessToken))
+	require.Equal(t, http.StatusOK, accepted.Code, "accept replacement ring: %s", accepted.Body.String())
+	var acceptedBody map[string]interface{}
+	require.NoError(t, json.Unmarshal(accepted.Body.Bytes(), &acceptedBody))
+	replacementCallID := uuid.MustParse(acceptedBody["call_id"].(string))
+	require.NotEqual(t, oldCallID, replacementCallID)
+
+	// Model a delayed legacy media authorization for call A arriving after the
+	// same member has already joined replacement call B. Omission may consume
+	// only the member's currently admitted call, never whichever lease happens
+	// to own the conversation.
+	require.NoError(t, ts.Redis.Set(
+		context.Background(),
+		"dm_voice_join_admission:"+convUUID.String()+":"+joiningUserUUID.String(),
+		oldCallID.String(), dm.DMVoiceCallReservationTTL,
+	).Err())
+	authorized := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize,
+		map[string]interface{}{}, testhelpers.AuthHeaders(joiningUser.AccessToken))
+	require.Equal(t, http.StatusConflict, authorized.Code,
+		"stale omitted-ID admission must not attach call A to replacement B: %s",
+		authorized.Body.String())
+}
+
+func TestRingDMCall_SupersedesUnpromotedDirectJoinReservation(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	joiningUser := ts.CreateTestUser(t, "direct_reservation_joiner")
+	caller := ts.CreateTestUser(t, "direct_reservation_ringer")
+	convID := ts.CreateDMConversation(t, joiningUser.ID, caller.ID)
+
+	joined := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", nil,
+		testhelpers.AuthHeaders(joiningUser.AccessToken))
+	require.Equal(t, http.StatusOK, joined.Code, "reserve direct join: %s", joined.Body.String())
+	var joinedBody map[string]interface{}
+	require.NoError(t, json.Unmarshal(joined.Body.Bytes(), &joinedBody))
+	joinedCallID, ok := joinedBody["call_id"].(string)
+	require.True(t, ok)
+	untrustedAuthorize := ts.DoRequest(
+		"POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize,
+		map[string]interface{}{"call_id": joinedCallID},
+		testhelpers.AuthHeaders(joiningUser.AccessToken),
+	)
+	require.Equal(t, http.StatusForbidden, untrustedAuthorize.Code,
+		"a member cannot forge the media-plane admission proof: %s",
+		untrustedAuthorize.Body.String())
+	forgedHeaders := dmVoiceMediaAuthorizationHeaders(
+		joiningUser.AccessToken, convID, joinedCallID,
+	)
+	forgedHeaders.Set("X-Concord-Media-Proof", strings.Repeat("0", sha256.Size*2))
+	forgedAuthorize := ts.DoRequest(
+		"POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize,
+		map[string]interface{}{"call_id": joinedCallID}, forgedHeaders,
+	)
+	require.Equal(t, http.StatusForbidden, forgedAuthorize.Code,
+		"a forged media-plane proof cannot protect the reservation: %s",
+		forgedAuthorize.Body.String())
+	staleHeaders := dmVoiceMediaAuthorizationHeadersAt(
+		joiningUser.AccessToken, convID, joinedCallID, "POST", time.Now().Add(-time.Minute),
+	)
+	staleAuthorize := ts.DoRequest(
+		"POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize,
+		map[string]interface{}{"call_id": joinedCallID}, staleHeaders,
+	)
+	require.Equal(t, http.StatusForbidden, staleAuthorize.Code,
+		"an otherwise valid stale media-plane proof cannot protect the reservation: %s",
+		staleAuthorize.Body.String())
+	omittedBindingHeaders := dmVoiceMediaAuthorizationHeaders(
+		joiningUser.AccessToken, convID, "",
+	)
+	wrongBindingAuthorize := ts.DoRequest(
+		"POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize,
+		map[string]interface{}{"call_id": joinedCallID}, omittedBindingHeaders,
+	)
+	require.Equal(t, http.StatusForbidden, wrongBindingAuthorize.Code,
+		"a proof bound to omitted call_id cannot authorize an exact call_id: %s",
+		wrongBindingAuthorize.Body.String())
+
+	ring := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceRing, nil,
+		testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusOK, ring.Code,
+		"an unpromoted reservation with no media presence must not silently block ringing: %s",
+		ring.Body.String())
+}
+
+func TestAbortDMVoiceMediaAuthorization_RequiresDeleteBoundProof(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+
+	user := ts.CreateTestUser(t, "g7_abort_member")
+	other := ts.CreateTestUser(t, "g7_abort_other")
+	convID := ts.CreateDMConversation(t, user.ID, other.ID)
+	convUUID := uuid.MustParse(convID)
+
+	authorized, callID := authorizeDMVoiceForMediaPlaneAfterJoin(t, ts, convID, user)
+	require.Equal(t, http.StatusOK, authorized.Code, "authorize media: %s", authorized.Body.String())
+
+	wrongMethodProof := ts.DoRequest(
+		"DELETE", pathDMConversationsPrefix+convID+pathVoiceAuthorize,
+		map[string]interface{}{"call_id": callID},
+		dmVoiceMediaAuthorizationHeaders(user.AccessToken, convID, callID),
+	)
+	require.Equal(t, http.StatusForbidden, wrongMethodProof.Code,
+		"a POST-bound proof cannot abort the handoff: %s", wrongMethodProof.Body.String())
+	lease, found, err := dm.LookupDMVoiceCallLease(context.Background(), ts.Redis, convUUID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.True(t, lease.MediaAuthorized)
+
+	aborted := ts.DoRequest(
+		"DELETE", pathDMConversationsPrefix+convID+pathVoiceAuthorize,
+		map[string]interface{}{"call_id": callID},
+		dmVoiceMediaReleaseHeaders(user.AccessToken, convID, callID),
+	)
+	require.Equal(t, http.StatusNoContent, aborted.Code, "abort media handoff: %s", aborted.Body.String())
+	_, found, err = dm.LookupDMVoiceCallLease(context.Background(), ts.Redis, convUUID)
+	require.NoError(t, err)
+	assert.False(t, found)
 }
 
 // CV-CAN-017: the DM media-plane authorize response must carry the requesting
@@ -4549,7 +4972,7 @@ func TestAuthorizeDMVoiceForMediaPlane_ReturnsAuthoritativeIdentity(t *testing.T
 		user.ID, "DM Real Name", "/api/v1/media/avatars/dm.png")
 	require.NoError(t, err)
 
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize, nil, testhelpers.AuthHeaders(user.AccessToken))
+	w, _ := authorizeDMVoiceForMediaPlaneAfterJoin(t, ts, convID, user)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	var body map[string]interface{}
@@ -4569,7 +4992,7 @@ func TestAuthorizeDMVoiceForMediaPlane_ReturnsEmptyIdentityFieldsWhenUnset(t *te
 	other := ts.CreateTestUser(t, "g7_id_bare_other")
 	convID := ts.CreateDMConversation(t, user.ID, other.ID)
 
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize, nil, testhelpers.AuthHeaders(user.AccessToken))
+	w, _ := authorizeDMVoiceForMediaPlaneAfterJoin(t, ts, convID, user)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	var body map[string]interface{}
@@ -4616,7 +5039,7 @@ func TestAuthorizeDMVoiceForMediaPlane_MediaEntitlements_Free(t *testing.T) {
 	other := ts.CreateTestUser(t, "g7_me_free2")
 	convID := ts.CreateDMConversation(t, user.ID, other.ID)
 
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize, nil, testhelpers.AuthHeaders(user.AccessToken))
+	w, _ := authorizeDMVoiceForMediaPlaneAfterJoin(t, ts, convID, user)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	var body map[string]interface{}
@@ -4634,7 +5057,7 @@ func TestAuthorizeDMVoiceForMediaPlane_MediaEntitlements_Premium(t *testing.T) {
 
 	insertDMSubscription(t, ts, user.ID, entitlements.TierPremium)
 
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize, nil, testhelpers.AuthHeaders(user.AccessToken))
+	w, _ := authorizeDMVoiceForMediaPlaneAfterJoin(t, ts, convID, user)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	var body map[string]interface{}
@@ -4661,7 +5084,7 @@ func TestAuthorizeDMVoiceForMediaPlane_MediaEntitlements_PerUser(t *testing.T) {
 
 	insertDMSubscription(t, ts, premiumUser.ID, entitlements.TierPremium)
 
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceAuthorize, nil, testhelpers.AuthHeaders(freeUser.AccessToken))
+	w, _ := authorizeDMVoiceForMediaPlaneAfterJoin(t, ts, convID, freeUser)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	var body map[string]interface{}
@@ -4759,6 +5182,39 @@ func TestInsertCompletedCallEventForDMRoom_HappyPath(t *testing.T) {
 	assert.Len(t, participants, 2)
 }
 
+func TestInsertCompletedCallEventForDMRoom_FutureJoinClampsDuration(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+
+	caller := ts.CreateTestUser(t, "comp_future_caller")
+	callee := ts.CreateTestUser(t, "comp_future_callee")
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+
+	// A future-dated joined_at can occur when database and application clocks
+	// disagree. The legacy fallback must not persist a negative duration.
+	_, err := ts.DB.Exec(`
+		INSERT INTO dm_voice_participants (conversation_id, user_id, joined_at)
+		VALUES ($1, $2, NOW() + INTERVAL '30 seconds')
+	`, convID, caller.ID)
+	require.NoError(t, err)
+
+	err = dm.InsertCompletedCallEventForDMRoom(
+		context.Background(),
+		ts.DB,
+		uuid.MustParse(convID),
+	)
+	require.NoError(t, err)
+
+	_, payload, found := fetchLatestCallEvent(t, ts, convID)
+	require.True(t, found, "call_event row inserted despite clock skew")
+	assert.Equal(t, float64(0), payload["duration_seconds"])
+	assert.Equal(t, payload["started_at"], payload["ended_at"])
+	endedAtRaw, ok := payload["ended_at"].(string)
+	require.True(t, ok, "ended_at is a timestamp string; got %T", payload["ended_at"])
+	endedAt, err := time.Parse(time.RFC3339Nano, endedAtRaw)
+	require.NoError(t, err)
+	assert.WithinDuration(t, time.Now(), endedAt, 5*time.Second)
+}
+
 func TestInsertCompletedCallEventForDMRoom_NoParticipants_NoOp(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 
@@ -4825,15 +5281,143 @@ func TestAuthorizeVoiceJoin_CalleeAccept_ClearsRing(t *testing.T) {
 	callee := ts.CreateTestUser(t, "auth_accept_callee")
 	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
 
-	ringForTest(t, ts, caller, convID)
+	ringID := ringForTest(t, ts, caller, convID)
 	convUUID := uuid.MustParse(convID)
 	require.True(t, dm.PendingDMCallExistsForTest(convUUID), "ring exists before accept")
 
 	// Callee POSTs /voice/join — the accept-path branch should clear the ring.
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", nil, testhelpers.AuthHeaders(callee.AccessToken))
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", map[string]interface{}{
+		"ring_id": ringID,
+	}, testhelpers.AuthHeaders(callee.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code, "callee auth succeeds; body: %s", w.Body.String())
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, ringID, body["call_id"])
 
 	assert.False(t, dm.PendingDMCallExistsForTest(convUUID), "ring cleared after callee accept")
+}
+
+func TestAuthorizeVoiceJoin_StaleRingCannotAcceptReplacement(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	caller := ts.CreateTestUser(t, "auth_stale_ring_caller")
+	callee := ts.CreateTestUser(t, "auth_stale_ring_callee")
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+	convUUID := uuid.MustParse(convID)
+	callerUUID := uuid.MustParse(caller.ID)
+	calleeUUID := uuid.MustParse(callee.ID)
+
+	stale := dm.NewPendingCallForTest(convUUID, callerUUID, []uuid.UUID{calleeUUID})
+	replacement := dm.NewPendingCallForTest(convUUID, callerUUID, []uuid.UUID{calleeUUID})
+	dm.StoreRingForTest(convUUID, replacement)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", map[string]interface{}{
+		"ring_id": uuid.Nil.String(),
+	}, testhelpers.AuthHeaders(callee.AccessToken))
+	require.Equal(t, http.StatusBadRequest, w.Code, "zero ring ID is explicit and invalid")
+
+	w = ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", map[string]interface{}{
+		"ring_id": stale.RingID.String(),
+	}, testhelpers.AuthHeaders(callee.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code, "stale accept must fail; body: %s", w.Body.String())
+	assert.True(t, dm.PendingDMCallExistsForTest(convUUID), "replacement ring remains pending")
+
+	w = ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", map[string]interface{}{
+		"ring_id": replacement.RingID.String(),
+	}, testhelpers.AuthHeaders(callee.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, "replacement accept succeeds; body: %s", w.Body.String())
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, replacement.RingID.String(), body["call_id"])
+	assert.False(t, dm.PendingDMCallExistsForTest(convUUID), "replacement ring clears after exact accept")
+}
+
+func TestAuthorizeVoiceJoin_CanceledRingCannotFallThroughToDirectCall(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	caller := ts.CreateTestUser(t, "auth_canceled_ring_caller")
+	callee := ts.CreateTestUser(t, "auth_canceled_ring_callee")
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+	ringID := ringForTest(t, ts, caller, convID)
+
+	canceled := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/cancel", nil, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusNoContent, canceled.Code, "cancel ring: %s", canceled.Body.String())
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", map[string]interface{}{
+		"ring_id": ringID,
+	}, testhelpers.AuthHeaders(callee.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code, "expired ring must not become a direct call; body: %s", w.Body.String())
+}
+
+func TestAuthorizeDMVoiceForMediaPlane_CorrelatesOnlyExactAcceptedRing(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	caller := ts.CreateTestUser(t, "auth_media_call_caller")
+	callee := ts.CreateTestUser(t, "auth_media_call_callee")
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+	ringID := ringForTest(t, ts, caller, convID)
+
+	accepted := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join", map[string]interface{}{
+		"ring_id": ringID,
+	}, testhelpers.AuthHeaders(callee.AccessToken))
+	require.Equal(t, http.StatusOK, accepted.Code, "accept ring: %s", accepted.Body.String())
+
+	authorized := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/authorize", map[string]interface{}{
+		"call_id": ringID,
+	}, dmVoiceMediaAuthorizationHeaders(caller.AccessToken, convID, ringID))
+	require.Equal(t, http.StatusOK, authorized.Code, "authorize media: %s", authorized.Body.String())
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(authorized.Body.Bytes(), &body))
+	assert.Equal(t, ringID, body["call_id"])
+	assert.Equal(t, ringID, body["call_ring_id"])
+	assert.Equal(t, caller.ID, body["call_caller_user_id"])
+
+	uncorrelated := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/authorize", map[string]interface{}{
+		"call_id": uuid.New().String(),
+	}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusConflict, uncorrelated.Code,
+		"unmatched exact call ID must fail closed: %s", uncorrelated.Body.String())
+
+	legacyJoin := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/join",
+		map[string]interface{}{"ring_id": ringID}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusOK, legacyJoin.Code, "legacy join binding: %s", legacyJoin.Body.String())
+	withoutID := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/authorize",
+		map[string]interface{}{}, dmVoiceMediaAuthorizationHeaders(caller.AccessToken, convID, ""))
+	require.Equal(t, http.StatusOK, withoutID.Code,
+		"a legacy client may resolve an existing accepted lease: %s", withoutID.Body.String())
+	body = nil
+	require.NoError(t, json.Unmarshal(withoutID.Body.Bytes(), &body))
+	assert.Equal(t, ringID, body["call_id"])
+	assert.Equal(t, ringID, body["call_ring_id"])
+	assert.Equal(t, caller.ID, body["call_caller_user_id"])
+
+	malformed := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/authorize", map[string]interface{}{
+		"call_id": "not-a-uuid",
+	}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusBadRequest, malformed.Code)
+
+	zero := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/authorize", map[string]interface{}{
+		"call_id": uuid.Nil.String(),
+	}, testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusBadRequest, zero.Code)
+}
+
+func TestAuthorizeDMVoiceForMediaPlane_RejectsUnacceptedPendingRing(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	caller := ts.CreateTestUser(t, "auth_media_pending_caller")
+	callee := ts.CreateTestUser(t, "auth_media_pending_callee")
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+	ringForTest(t, ts, caller, convID)
+
+	authorized := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/voice/authorize", nil,
+		testhelpers.AuthHeaders(callee.AccessToken))
+	require.Equal(t, http.StatusConflict, authorized.Code,
+		"an absent call ID must not preempt an unresolved ring: %s", authorized.Body.String())
 }
 
 // TestAuthorizeVoiceJoin_CallerSelf_DoesNotClearRing verifies the

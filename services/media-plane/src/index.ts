@@ -13,6 +13,7 @@ import type { MediaSource } from './lib/roomManager.js';
 import { MediaMetrics } from './lib/mediaMetrics.js';
 import {
   createAuthMiddleware,
+  releaseDMVoiceAuthorization,
   validateChannelAccess,
   resolveParticipantIdentity,
 } from './middleware/auth.js';
@@ -30,6 +31,14 @@ import {
   handleCloseRecvTransport,
 } from './lib/closeRecvTransport.js';
 import { handleSetTestingStatus } from './lib/setTestingStatus.js';
+import {
+  cleanupEmptyDMJoin,
+  KeyedJoinFence,
+  rollbackSocketRoomJoin,
+  SocketRoomClaim,
+  runSocketBoundJoin,
+  withKeyedJoinFence,
+} from './lib/socketJoinLifecycle.js';
 
 const expectedKeyframeRequestErrors = new Set([
   'Room not found',
@@ -90,6 +99,251 @@ function getExpectedKeyframeRequestError(error: unknown): string | undefined {
   }
 
   return expectedKeyframeRequestErrors.has(error.message) ? error.message : undefined;
+}
+
+async function rollbackRegisteredRoomJoin({
+  roomManager,
+  cleanupDMJoin,
+  roomId,
+  userId,
+  socketId,
+  roomKind,
+  callId,
+}: {
+  roomManager: RoomManager;
+  cleanupDMJoin: (authorizedCallId?: string) => Promise<void>;
+  roomId: string;
+  userId: string;
+  socketId: string;
+  roomKind: 'channel' | 'dm';
+  callId?: string;
+}): Promise<void> {
+  await rollbackSocketRoomJoin({
+    cleanupDMJoin: () => cleanupDMJoin(callId),
+    leaveChannelIfOwned: () => roomManager.leaveRoomIfSocketOwned(roomId, userId, socketId),
+    removeDMParticipant: () => roomManager.removeParticipantIfSocketOwned(roomId, userId, socketId),
+    roomKind,
+  });
+}
+
+function registerJoinRoomHandler(
+  socket: Socket,
+  data: AuthenticatedSocketData,
+  roomManager: RoomManager,
+  dmJoinFence: KeyedJoinFence
+): void {
+  const socketRoomClaim = new SocketRoomClaim();
+
+  // Client sends: { roomId, rtpCapabilities, mediaFrameCryptoVersion, callId? }
+  // Server responds with: room-joined event containing router caps, existing producers, participants
+  socket.on(
+    'join-room',
+    async ({ roomId, rtpCapabilities, mediaFrameCryptoVersion, callId }, callback?) => {
+      // Claim before the first await: socket.data can name only one room, so a
+      // concurrent or subsequent admission must not create an untracked ghost.
+      const releaseSocketRoomClaim = socketRoomClaim.claim(data.roomId, roomId);
+      if (!releaseSocketRoomClaim) {
+        const error = { error: 'Socket is already joining or joined to a voice room' };
+        if (callback) callback(error);
+        else socket.emit('error', error);
+        return;
+      }
+
+      const roomKind: 'channel' | 'dm' =
+        socket.handshake.auth.room_kind === 'dm' ? 'dm' : 'channel';
+      const token = socket.handshake.auth.token;
+      const inputCallId = typeof callId === 'string' ? callId : undefined;
+      const cleanupDMJoin = async (authorizedCallId?: string) => {
+        if (roomKind !== 'dm') return;
+        const room = roomManager.getRoom(roomId);
+        await cleanupEmptyDMJoin({
+          authorizedCallId,
+          closeEmptyRoom: (expectedCallId) => roomManager.closeEmptyDMRoom(roomId, expectedCallId),
+          queuedJoinCount: dmJoinFence.pending(roomId),
+          releaseAuthorization: (releaseCallId) =>
+            releaseDMVoiceAuthorization(roomId, token, releaseCallId),
+          room: room
+            ? { callId: room.callId, participantCount: room.participants.size }
+            : undefined,
+        });
+      };
+      const executeJoin = async () => {
+        try {
+          if (!socket.connected) {
+            await cleanupDMJoin(inputCallId);
+            return;
+          }
+          const parsedMediaFrameCryptoVersion =
+            parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
+          // room_kind is only a routing hint: every endpoint independently
+          // authorizes the JWT-derived user before any room mutation.
+
+          const outcome = await runSocketBoundJoin({
+            authorize: () => validateChannelAccess(data.userId, roomId, token, roomKind, callId),
+            isAllowed: (access) => access.allowed,
+            isConnected: () => socket.connected,
+            join: async (access) => {
+              logger.debug('Channel access validated', { roomId, userId: data.userId });
+              // Prefer the server-authoritative identity returned by the
+              // control plane over client-supplied display fields (CV-CAN-017).
+              const identity = resolveParticipantIdentity(access, {
+                username: data.username,
+                displayName: data.displayName,
+                avatarUrl: data.avatarUrl,
+              });
+              // Thread the server-authoritative entitlement and permissions
+              // into the participant; neither comes from the handshake.
+              const result = await roomManager.joinRoom(
+                roomId,
+                data.userId,
+                socket.id,
+                identity,
+                rtpCapabilities,
+                {
+                  entitlement: {
+                    tier: access.userTier,
+                    allowedAudioTiers: access.allowedAudioTiers,
+                    minPtimeMs: access.minPtimeMs,
+                    maxManualBitrateBps: access.maxManualBitrateBps,
+                  },
+                  mediaFrameCryptoVersion: parsedMediaFrameCryptoVersion,
+                  // Room kind selects the cap strategy; owner tier is absent for DMs.
+                  roomContext: {
+                    roomKind,
+                    ownerTier: access.roomOwnerTier,
+                    callId: access.callId,
+                    callRingId: access.callRingId,
+                    callCallerUserId: access.callCallerUserId,
+                  },
+                  // Effective publish permissions apply only to channel joins.
+                  permissions: access.permissions,
+                }
+              );
+
+              if (access.serverMuted) {
+                await roomManager.serverMuteUser(roomId, data.userId);
+                logger.info('Applied server-mute enforcement on join', {
+                  roomId,
+                  userId: data.userId,
+                });
+              }
+              if (access.serverDeafened) {
+                await roomManager.serverDeafenUser(roomId, data.userId);
+                logger.info('Applied server-deafen enforcement on join', {
+                  roomId,
+                  userId: data.userId,
+                });
+              }
+              return { identity, result };
+            },
+            rollback: (access) =>
+              rollbackRegisteredRoomJoin({
+                roomManager,
+                cleanupDMJoin,
+                roomId,
+                userId: data.userId,
+                socketId: socket.id,
+                roomKind,
+                callId: access.callId,
+              }),
+          });
+
+          if (outcome.status === 'denied') {
+            try {
+              await cleanupDMJoin(inputCallId);
+            } catch (error) {
+              logger.error('Failed to clean up a queued DM room join', { error, roomId });
+            }
+            logger.warn('Channel access denied', {
+              userId: data.userId,
+              roomId,
+              error: outcome.access.error,
+            });
+            const error = { error: outcome.access.error || 'Access denied' };
+            if (callback) callback(error);
+            else socket.emit('error', error);
+            return;
+          }
+          if (outcome.status === 'canceled') {
+            logger.info('Canceled room join for disconnected socket', {
+              roomId,
+              userId: data.userId,
+              socketId: socket.id,
+            });
+            return;
+          }
+
+          const { access, value } = outcome;
+          const { identity, result } = value;
+          socket.join(roomId);
+          data.roomId = roomId;
+
+          // The per-sharer screen-layering gate has no room-wide late-join state.
+          // A join simply recomputes each share it consumes (#1924).
+
+          // Broadcast only the same server-authoritative identity stored above.
+          socket.to(roomId).emit('user-joined', {
+            userId: data.userId,
+            username: identity.username,
+            displayName: identity.displayName,
+            avatarUrl: identity.avatarUrl,
+            e2eeEpoch: result.e2eeEpoch,
+          });
+
+          // Respond to the joining client.
+          const response = {
+            rtpCapabilities: result.rtpCapabilities,
+            mediaFrameCryptoVersion: result.mediaFrameCryptoVersion,
+            existingProducers: result.existingProducers,
+            participants: result.participants,
+            channelName: access.channelName,
+            e2eeEpoch: result.e2eeEpoch,
+          };
+
+          logger.info('Room join response', {
+            roomId,
+            userId: data.userId,
+            existingProducerCount: result.existingProducers.length,
+            participantCount: result.participants.length,
+          });
+
+          logger.debug('Room join existing producers', {
+            roomId,
+            userId: data.userId,
+            existingProducers: result.existingProducers.map((p) => ({
+              producerId: p.producerId,
+              userId: p.userId,
+              kind: p.kind,
+              source: p.source,
+            })),
+          });
+
+          if (callback) {
+            callback(response);
+          } else {
+            socket.emit('room-joined', response);
+          }
+        } catch (error) {
+          try {
+            await cleanupDMJoin(inputCallId);
+          } catch (cleanupError) {
+            logger.error('Failed to clean up an errored DM room join', {
+              error: cleanupError,
+              roomId,
+            });
+          }
+          emitJoinError(socket, roomId, data.userId, error, callback);
+        }
+      };
+
+      try {
+        if (roomKind === 'dm') await withKeyedJoinFence(dmJoinFence, roomId, executeJoin);
+        else await executeJoin();
+      } finally {
+        releaseSocketRoomClaim();
+      }
+    }
+  );
 }
 
 async function main() {
@@ -304,6 +558,10 @@ async function main() {
 
   // ─── Socket.IO connection handling ───────────────────────────────────
 
+  // ponytail: process-local serialization matches single-node room ownership;
+  // use a distributed admission ID before one DM room can span media nodes.
+  const dmJoinFence = new KeyedJoinFence();
+
   io.on('connection', (socket) => {
     const data = socket.data as AuthenticatedSocketData;
     logger.info('Client connected', {
@@ -313,160 +571,7 @@ async function main() {
     });
 
     // ── join-room ────────────────────────────────────────────────────
-    // Client sends: { roomId, rtpCapabilities, mediaFrameCryptoVersion }
-    // Server responds with: room-joined event containing router caps, existing producers, participants
-    socket.on(
-      'join-room',
-      async ({ roomId, rtpCapabilities, mediaFrameCryptoVersion }, callback?) => {
-        try {
-          const parsedMediaFrameCryptoVersion =
-            parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
-
-          // Validate channel access via control plane. Room kind is a
-          // routing hint from the renderer's Socket.IO handshake (per
-          // #1209 plan C1 + spec §6.5): 'channel' hits the server-channel
-          // voice-join endpoint; 'dm' hits the DM authorize endpoint
-          // (G7 defense-in-depth). Only the userId in `data` comes from
-          // the verified JWT (see createAuthMiddleware); the display
-          // fields (username/displayName/avatarUrl) currently flow from
-          // socket.handshake.auth and are a known client-supplied gap.
-          // room_kind is the same shape: a client-supplied routing hint
-          // that doesn't grant any privilege beyond which control-plane
-          // endpoint is consulted for authorization.
-          const token = socket.handshake.auth.token;
-          const roomKind: 'channel' | 'dm' =
-            socket.handshake.auth.room_kind === 'dm' ? 'dm' : 'channel';
-          const access = await validateChannelAccess(data.userId, roomId, token, roomKind);
-
-          if (!access.allowed) {
-            logger.warn('Channel access denied', {
-              userId: data.userId,
-              roomId,
-              error: access.error,
-            });
-            const errPayload = { error: access.error || 'Access denied' };
-            if (callback) return callback(errPayload);
-            socket.emit('error', errPayload);
-            return;
-          }
-
-          logger.debug('Channel access validated', {
-            roomId,
-            userId: data.userId,
-          });
-
-          // CV-CAN-017: prefer the server-authoritative display identity from the
-          // join-authorize response over the client-supplied socket.handshake.auth
-          // values, so a member cannot spoof its display identity to peers. The
-          // load-bearing decision (and its handshake fallback for a pre-CV-CAN-017
-          // control-plane) lives in the pure, unit-tested resolveParticipantIdentity.
-          const identity = resolveParticipantIdentity(access, {
-            username: data.username,
-            displayName: data.displayName,
-            avatarUrl: data.avatarUrl,
-          });
-
-          // Join the room via RoomManager. Thread the server-authoritative per-user
-          // media entitlement (#1300) parsed from the join-authorize response into
-          // the Participant — it caps THIS user's own send transport + mic produce
-          // (never sourced from socket.handshake.auth). Identity is likewise
-          // server-authoritative (CV-CAN-017), not from socket.handshake.auth.
-          const result = await roomManager.joinRoom(
-            roomId,
-            data.userId,
-            socket.id,
-            identity,
-            rtpCapabilities,
-            {
-              entitlement: {
-                tier: access.userTier,
-                allowedAudioTiers: access.allowedAudioTiers,
-                minPtimeMs: access.minPtimeMs,
-                maxManualBitrateBps: access.maxManualBitrateBps,
-              },
-              mediaFrameCryptoVersion: parsedMediaFrameCryptoVersion,
-              // Room-scoped cap context (#1542): roomKind selects the cap-tier
-              // resolution strategy; ownerTier is the server-authoritative
-              // room_owner_tier from the channel join-authorize (undefined for DMs).
-              roomContext: { roomKind, ownerTier: access.roomOwnerTier },
-              // CV-CAN-007: the joining user's effective publish-permission bitfield
-              // (bigint for channel joins, undefined for DMs) — enforced at produce.
-              permissions: access.permissions,
-            }
-          );
-
-          // Apply server enforcement if the joining user has active enforcement
-          if (access.serverMuted) {
-            await roomManager.serverMuteUser(roomId, data.userId);
-            logger.info('Applied server-mute enforcement on join', { roomId, userId: data.userId });
-          }
-          if (access.serverDeafened) {
-            await roomManager.serverDeafenUser(roomId, data.userId);
-            logger.info('Applied server-deafen enforcement on join', {
-              roomId,
-              userId: data.userId,
-            });
-          }
-
-          // Join Socket.IO room for broadcasting
-          socket.join(roomId);
-          data.roomId = roomId;
-
-          // #1924 fix "B": the per-SHARER screen-layering gate subsumes the old
-          // late-joiner emit. A sharer's gate is driven by its OWN viewers and
-          // targeted to the sharer's socket, so there is no room-wide gate state
-          // a joiner can miss — the joiner's arrival simply recomputes the gate of
-          // whatever share it consumes.
-
-          // Notify others in the room. Identity is server-authoritative
-          // (CV-CAN-017) — the same values stored on the Participant, never the
-          // client-supplied socket.handshake.auth fields.
-          socket.to(roomId).emit('user-joined', {
-            userId: data.userId,
-            username: identity.username,
-            displayName: identity.displayName,
-            avatarUrl: identity.avatarUrl,
-            e2eeEpoch: result.e2eeEpoch,
-          });
-
-          // Respond to the joining client
-          const response = {
-            rtpCapabilities: result.rtpCapabilities,
-            mediaFrameCryptoVersion: result.mediaFrameCryptoVersion,
-            existingProducers: result.existingProducers,
-            participants: result.participants,
-            channelName: access.channelName,
-            e2eeEpoch: result.e2eeEpoch,
-          };
-
-          logger.info('Room join response', {
-            roomId,
-            userId: data.userId,
-            existingProducerCount: result.existingProducers.length,
-            participantCount: result.participants.length,
-          });
-
-          logger.debug('Room join existing producers', {
-            roomId,
-            userId: data.userId,
-            existingProducers: result.existingProducers.map((p) => ({
-              producerId: p.producerId,
-              userId: p.userId,
-              kind: p.kind,
-              source: p.source,
-            })),
-          });
-
-          if (callback) {
-            callback(response);
-          } else {
-            socket.emit('room-joined', response);
-          }
-        } catch (error) {
-          emitJoinError(socket, roomId, data.userId, error, callback);
-        }
-      }
-    );
+    registerJoinRoomHandler(socket, data, roomManager, dmJoinFence);
 
     // ── update-rtp-capabilities ─────────────────────────────────────
     // Client sends this after device.load() to provide its actual RTP capabilities
@@ -1045,6 +1150,9 @@ async function main() {
       natsService.publish('voice.heartbeat', {
         channelId: roomId,
         userIds: Array.from(room.participants.keys()),
+        callId: room.callId,
+        ringId: room.callRingId,
+        callerUserId: room.callCallerUserId,
         timestamp: new Date().toISOString(),
       });
     }

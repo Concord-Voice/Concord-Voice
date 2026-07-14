@@ -267,6 +267,34 @@ describe('ConversationList', () => {
     (e2eeService as any).isInitialized = false;
   });
 
+  it('shows call context instead of the encrypted-message fallback', () => {
+    useDMStore.setState({
+      conversations: [
+        makeConversation({
+          lastMessage: {
+            content: '',
+            userId: 'user-1',
+            username: 'me',
+            createdAt: '2026-07-13T12:00:00Z',
+            type: 'call_event',
+            callEventPayload: {
+              caller_user_id: 'user-1',
+              started_at: '2026-07-13T12:00:00Z',
+              status: 'missed',
+              duration_seconds: 0,
+            },
+          } as DMLastMessage,
+        }),
+      ],
+      fetchConversations: vi.fn().mockResolvedValue(undefined),
+    });
+
+    render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+    expect(screen.getByText('Outbound call — no answer')).toBeInTheDocument();
+    expect(screen.queryByText('Encrypted message')).not.toBeInTheDocument();
+  });
+
   it('does not retain an in-flight preview after remote conversation removal', async () => {
     (e2eeService as any).isInitialized = true;
     let generation = 0;

@@ -7,6 +7,7 @@ import { isPendingKeyError } from '../services/e2eeErrors';
 import { removeScope } from '../services/searchService';
 import { errorMessage } from '../utils/redactError';
 import { useChatStore } from './chatStore';
+import type { CallEventPayload } from '../types/chat';
 
 function purgeConversationAccessState(conversationId: string): void {
   e2eeService.revokeChannelAccess(conversationId);
@@ -15,13 +16,31 @@ function purgeConversationAccessState(conversationId: string): void {
 }
 
 interface ConversationFetchJournal {
+  baselineIds: Set<string>;
   removedIds: Set<string>;
+  changedFieldsById: Map<string, Set<MutableConversationField>>;
   cleared: boolean;
 }
 
 const conversationFetchJournals = new Set<ConversationFetchJournal>();
+let conversationRefetchQueued = false;
 const hasLiveConversationFetch = () =>
   Array.from(conversationFetchJournals).some((journal) => !journal.cleared);
+
+function markConversationFetchMutation(
+  conversationId: string,
+  ...fields: MutableConversationField[]
+): void {
+  for (const journal of conversationFetchJournals) {
+    if (journal.cleared) continue;
+    let changedFields = journal.changedFieldsById.get(conversationId);
+    if (!changedFields) {
+      changedFields = new Set();
+      journal.changedFieldsById.set(conversationId, changedFields);
+    }
+    for (const field of fields) changedFields.add(field);
+  }
+}
 
 export interface DMParticipant {
   userId: string;
@@ -38,6 +57,9 @@ export interface DMLastMessage {
   userId: string;
   username: string;
   createdAt: string;
+  /** Server-authored metadata for plaintext voice-call history rows. */
+  type?: string;
+  callEventPayload?: CallEventPayload;
   /** In-memory preview for optimistic local sends; dmStore only persists activeConversationId. */
   plaintextPreview?: string;
   /** E2EE GIF slug metadata for local optimistic previews and server-enriched summaries. */
@@ -57,6 +79,43 @@ export interface DMConversation {
   lastMessage: DMLastMessage | null;
   unreadCount: number;
   createdAt: string;
+}
+
+type MutableConversationField = Exclude<keyof DMConversation, 'id'>;
+
+function markConversationFetchUpdate(
+  conversationId: string,
+  updates: Partial<DMConversation>
+): void {
+  const fields = (Object.keys(updates) as (keyof DMConversation)[]).filter(
+    (field): field is MutableConversationField => field !== 'id'
+  );
+  markConversationFetchMutation(conversationId, ...fields);
+}
+
+function sortConversationsByActivity(conversations: DMConversation[]): DMConversation[] {
+  return conversations.sort((a, b) => {
+    const aTime = a.lastMessage?.createdAt || a.createdAt;
+    const bTime = b.lastMessage?.createdAt || b.createdAt;
+    return new Date(bTime).getTime() - new Date(aTime).getTime();
+  });
+}
+
+function updateParticipantProfileInConversation(
+  conversation: DMConversation,
+  userId: string,
+  updates: Partial<Omit<DMParticipant, 'userId'>>
+): DMConversation {
+  if (!conversation.participants.some((participant) => participant.userId === userId)) {
+    return conversation;
+  }
+  markConversationFetchMutation(conversation.id, 'participants');
+  return {
+    ...conversation,
+    participants: conversation.participants.map((participant) =>
+      participant.userId === userId ? { ...participant, ...updates } : participant
+    ),
+  };
 }
 
 /**
@@ -208,6 +267,78 @@ interface DMState {
   deleteGroup: (conversationId: string) => Promise<void>;
 }
 
+function queueConversationRefetchIfLoading(isLoading: boolean): boolean {
+  if (!isLoading) return false;
+  if (hasLiveConversationFetch()) conversationRefetchQueued = true;
+  return true;
+}
+
+function reconcileConversationResponse(
+  data: { conversations?: Record<string, unknown>[] },
+  journal: ConversationFetchJournal,
+  currentState: Pick<DMState, 'conversations' | 'activeConversationId'>
+): Pick<DMState, 'conversations' | 'activeConversationId'> {
+  const currentById = new Map(
+    currentState.conversations.map((conversation) => [conversation.id, conversation])
+  );
+  const conversations = (data.conversations || [])
+    .map((conversation) => mapConversation(conversation))
+    .filter((conversation) => !journal.removedIds.has(conversation.id))
+    .map((fetched) => {
+      const current = currentById.get(fetched.id);
+      if (!current) return fetched;
+      const addedAfterFetchStarted = !journal.baselineIds.has(fetched.id);
+      if (addedAfterFetchStarted) return current;
+
+      const changedFields = journal.changedFieldsById.get(fetched.id);
+      if (!changedFields) return fetched;
+      return Array.from(changedFields).reduce<DMConversation>(
+        (conversation, field) => ({ ...conversation, [field]: current[field] }),
+        fetched
+      );
+    });
+  const fetchedIds = new Set(conversations.map((conversation) => conversation.id));
+
+  for (const conversation of currentState.conversations) {
+    if (fetchedIds.has(conversation.id)) continue;
+    if (!journal.baselineIds.has(conversation.id) && !journal.removedIds.has(conversation.id)) {
+      conversations.push(conversation);
+      continue;
+    }
+    purgeConversationAccessState(conversation.id);
+  }
+
+  const hasPostFetchAddition = currentState.conversations.some(
+    (conversation) =>
+      !journal.baselineIds.has(conversation.id) && !journal.removedIds.has(conversation.id)
+  );
+  const hasChangedLastMessage = Array.from(journal.changedFieldsById.values()).some((fields) =>
+    fields.has('lastMessage')
+  );
+  if (hasChangedLastMessage || hasPostFetchAddition) {
+    sortConversationsByActivity(conversations);
+  }
+
+  const activeConversationId =
+    currentState.activeConversationId &&
+    conversations.some((conversation) => conversation.id === currentState.activeConversationId)
+      ? currentState.activeConversationId
+      : null;
+
+  return { conversations, activeConversationId };
+}
+
+function finishConversationFetch(journal: ConversationFetchJournal): {
+  isLoading: boolean;
+  shouldRefetch: boolean;
+} {
+  conversationFetchJournals.delete(journal);
+  const isLoading = hasLiveConversationFetch();
+  const shouldRefetch = !isLoading && conversationRefetchQueued;
+  if (shouldRefetch) conversationRefetchQueued = false;
+  return { isLoading, shouldRefetch };
+}
+
 export const useDMStore = wrapStore(
   create<DMState>()(
     devtools(
@@ -219,8 +350,13 @@ export const useDMStore = wrapStore(
           error: null,
 
           fetchConversations: async () => {
-            if (get().isLoading) return;
-            const journal: ConversationFetchJournal = { removedIds: new Set(), cleared: false };
+            if (queueConversationRefetchIfLoading(get().isLoading)) return;
+            const journal: ConversationFetchJournal = {
+              baselineIds: new Set(get().conversations.map((conversation) => conversation.id)),
+              removedIds: new Set(),
+              changedFieldsById: new Map(),
+              cleared: false,
+            };
             conversationFetchJournals.add(journal);
             set({ isLoading: true, error: null });
 
@@ -233,26 +369,7 @@ export const useDMStore = wrapStore(
 
               const data = await response.json();
               if (journal.cleared) return;
-
-              const conversations: DMConversation[] = (data.conversations || [])
-                .map((c: Record<string, unknown>) => mapConversation(c))
-                .filter((conversation: DMConversation) => !journal.removedIds.has(conversation.id));
-              const fetchedIds = new Set(conversations.map((conversation) => conversation.id));
-
-              for (const conversation of get().conversations) {
-                if (!fetchedIds.has(conversation.id)) {
-                  purgeConversationAccessState(conversation.id);
-                }
-              }
-
-              // Validate persisted activeConversationId still exists
-              const currentActiveId = get().activeConversationId;
-              const validActiveId =
-                currentActiveId && conversations.some((c) => c.id === currentActiveId)
-                  ? currentActiveId
-                  : null;
-
-              set({ conversations, activeConversationId: validActiveId });
+              set(reconcileConversationResponse(data, journal, get()));
             } catch (error) {
               if (!journal.cleared) {
                 set({
@@ -260,8 +377,9 @@ export const useDMStore = wrapStore(
                 });
               }
             } finally {
-              conversationFetchJournals.delete(journal);
-              set({ isLoading: hasLiveConversationFetch() });
+              const { isLoading, shouldRefetch } = finishConversationFetch(journal);
+              set({ isLoading });
+              if (shouldRefetch) await get().fetchConversations();
             }
           },
 
@@ -364,12 +482,14 @@ export const useDMStore = wrapStore(
               return { conversations: [conv, ...state.conversations] };
             }),
 
-          updateConversation: (id: string, updates: Partial<DMConversation>) =>
+          updateConversation: (id: string, updates: Partial<DMConversation>) => {
+            markConversationFetchUpdate(id, updates);
             set((state) => ({
               conversations: state.conversations.map((c) =>
                 c.id === id ? { ...c, ...updates } : c
               ),
-            })),
+            }));
+          },
 
           removeConversation: (id: string) => {
             for (const journal of conversationFetchJournals) journal.removedIds.add(id);
@@ -387,61 +507,54 @@ export const useDMStore = wrapStore(
           updateParticipantProfile: (
             userId: string,
             updates: Partial<Omit<DMParticipant, 'userId'>>
-          ) => {
-            const applyUpdate = (p: DMParticipant) =>
-              p.userId === userId ? { ...p, ...updates } : p;
+          ) =>
             set((state) => ({
-              conversations: state.conversations.map((c) => ({
-                ...c,
-                participants: c.participants.map(applyUpdate),
-              })),
-            }));
-          },
+              conversations: state.conversations.map((conversation) =>
+                updateParticipantProfileInConversation(conversation, userId, updates)
+              ),
+            })),
 
-          updateLastMessage: (convId: string, message: DMLastMessage) =>
+          updateLastMessage: (convId: string, message: DMLastMessage) => {
+            markConversationFetchMutation(convId, 'lastMessage');
             set((state) => {
               const updated = state.conversations.map((c) =>
                 c.id === convId ? { ...c, lastMessage: message } : c
               );
-              // Re-sort: most recent message first
-              updated.sort((a, b) => {
-                const aTime = a.lastMessage?.createdAt || a.createdAt;
-                const bTime = b.lastMessage?.createdAt || b.createdAt;
-                return new Date(bTime).getTime() - new Date(aTime).getTime();
-              });
-              return { conversations: updated };
-            }),
+              return { conversations: sortConversationsByActivity(updated) };
+            });
+          },
 
           bumpConversation: (conversationId: string, message: DMLastMessage | null) =>
             set((state) => {
               const exists = state.conversations.some((c) => c.id === conversationId);
               if (!exists) return state;
+              markConversationFetchMutation(conversationId, 'lastMessage');
               const updated = state.conversations.map((c) =>
                 c.id === conversationId ? { ...c, lastMessage: message } : c
               );
-              updated.sort((a, b) => {
-                const aTime = a.lastMessage?.createdAt || a.createdAt;
-                const bTime = b.lastMessage?.createdAt || b.createdAt;
-                return new Date(bTime).getTime() - new Date(aTime).getTime();
-              });
-              return { conversations: updated };
+              return { conversations: sortConversationsByActivity(updated) };
             }),
 
-          incrementUnread: (convId: string) =>
+          incrementUnread: (convId: string) => {
+            markConversationFetchMutation(convId, 'unreadCount');
             set((state) => ({
               conversations: state.conversations.map((c) =>
                 c.id === convId ? { ...c, unreadCount: c.unreadCount + 1 } : c
               ),
-            })),
+            }));
+          },
 
-          clearUnread: (convId: string) =>
+          clearUnread: (convId: string) => {
+            markConversationFetchMutation(convId, 'unreadCount');
             set((state) => ({
               conversations: state.conversations.map((c) =>
                 c.id === convId ? { ...c, unreadCount: 0 } : c
               ),
-            })),
+            }));
+          },
 
           clearDMs: () => {
+            conversationRefetchQueued = false;
             for (const journal of conversationFetchJournals) journal.cleared = true;
             for (const conversation of get().conversations) {
               purgeConversationAccessState(conversation.id);
@@ -466,6 +579,7 @@ export const useDMStore = wrapStore(
             const data = await response.json();
             if (data.conversation) {
               const conv = mapConversation(data.conversation);
+              markConversationFetchUpdate(conv.id, conv);
               set((state) => ({
                 conversations: state.conversations.map((c) => (c.id === conv.id ? conv : c)),
               }));
@@ -521,6 +635,7 @@ export const useDMStore = wrapStore(
               throw new Error(data.error || 'Failed to update role');
             }
             // Optimistically update the participant's role
+            markConversationFetchMutation(conversationId, 'participants');
             const updateRole = (conv: DMConversation) =>
               conv.id === conversationId
                 ? {
@@ -586,6 +701,8 @@ function mapConversation(c: Record<string, unknown>): DMConversation {
           userId: lastMsg.user_id as string,
           username: lastMsg.username as string,
           createdAt: lastMsg.created_at as string,
+          type: lastMsg.type as string | undefined,
+          callEventPayload: lastMsg.call_event_payload as CallEventPayload | undefined,
         }
       : null,
     unreadCount: (c.unread_count as number) || 0,

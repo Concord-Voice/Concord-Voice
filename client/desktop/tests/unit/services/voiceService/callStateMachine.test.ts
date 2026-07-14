@@ -67,6 +67,7 @@ const mockJoinChannel = vi.mocked(voiceService.joinChannel);
 
 const CONVERSATION_ID = '11111111-1111-1111-1111-111111111111';
 const RING_ID = '22222222-2222-2222-2222-222222222222';
+const SUCCESSOR_RING_ID = '33333333-3333-3333-3333-333333333333';
 const RING_STARTED_AT = '2026-05-28T13:00:00.000Z';
 const RING_TIMEOUT_SECONDS = 30;
 const OTHER_CONVERSATION_ID = '99999999-9999-9999-9999-999999999999';
@@ -104,12 +105,12 @@ function seedConversation(): void {
   });
 }
 
-function ringResponse(): Response {
+function ringResponse(ringId = RING_ID): Response {
   return {
     ok: true,
     status: 200,
     json: async () => ({
-      ring_id: RING_ID,
+      ring_id: ringId,
       ring_started_at: RING_STARTED_AT,
       ringing_user_ids: ['callee-id'],
     }),
@@ -126,7 +127,18 @@ function errorResponse(status: number, body: string): Response {
   } as Response;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 beforeEach(() => {
+  vi.useRealTimers();
   resetAllStores();
   mockApiFetch.mockReset();
   mockPlayLoop.mockReset();
@@ -160,6 +172,65 @@ describe('initiateDMCall', () => {
       expect(final.calleeUserIds).toEqual(['callee-id']);
       expect(final.startedAt).toBe(Date.parse(RING_STARTED_AT));
     }
+  });
+
+  it('rejects a second call while any call state is active', async () => {
+    seedConversation();
+    useVoiceStore.getState().setCallState({ kind: 'in-call' });
+
+    await expect(initiateDMCall(CONVERSATION_ID)).rejects.toThrow(
+      'Another voice call is already in progress'
+    );
+
+    expect(mockApiFetch).not.toHaveBeenCalled();
+  });
+
+  it('replays only a lifecycle event matching the server-returned ring ID', async () => {
+    seedConversation();
+    const response = deferred<Response>();
+    mockApiFetch.mockReturnValueOnce(response.promise);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    handleCallCanceled({
+      conversation_id: CONVERSATION_ID,
+      ring_id: 'stale-ring-id',
+      canceled_by: 'caller',
+    } as never);
+    response.resolve(ringResponse());
+    await initiation;
+
+    const state = useVoiceStore.getState().callState;
+    expect(state.kind).toBe('outgoing-ringing');
+    if (state.kind === 'outgoing-ringing') expect(state.ringId).toBe(RING_ID);
+  });
+
+  it('replays an exact someone-accepted event after the ring response resolves', async () => {
+    seedConversation();
+    const response = deferred<Response>();
+    const join = deferred<void>();
+    mockApiFetch.mockReturnValueOnce(response.promise);
+    mockJoinChannel.mockReturnValueOnce(join.promise as never);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    handleCallCanceled({
+      conversation_id: CONVERSATION_ID,
+      ring_id: RING_ID,
+      canceled_by: 'someone_accepted',
+    } as never);
+    expect(mockJoinChannel).not.toHaveBeenCalled();
+
+    response.resolve(ringResponse());
+    await initiation;
+
+    expect(mockJoinChannel).toHaveBeenCalledWith(CONVERSATION_ID, 'dm');
+    expect(useVoiceStore.getState().callState).toEqual({
+      kind: 'joining',
+      conversationId: CONVERSATION_ID,
+      ringId: RING_ID,
+    });
+
+    join.resolve(undefined);
+    await vi.waitFor(() => expect(useVoiceStore.getState().callState).toEqual({ kind: 'in-call' }));
   });
 
   it('rolls back to idle and stops ringback when apiFetch throws (network error)', async () => {
@@ -226,10 +297,253 @@ describe('cancelOutgoingCall', () => {
 
     expect(mockApiFetch).toHaveBeenCalledWith(
       `/api/v1/dm/conversations/${CONVERSATION_ID}/voice/cancel`,
-      expect.objectContaining({ method: 'POST' })
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ ring_id: RING_ID }),
+      })
     );
     expect(mockStopLoop).toHaveBeenCalledWith('call-outgoing');
     expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+  });
+
+  it('releases unresolved cancel ownership while retaining exact late-response cleanup', async () => {
+    seedConversation();
+    const conversation = useDMStore.getState().conversations[0];
+    useDMStore.setState({
+      conversations: [
+        conversation,
+        { ...conversation, id: OTHER_CONVERSATION_ID } as DMConversation,
+      ],
+    });
+    const response = deferred<Response>();
+    mockApiFetch
+      .mockReturnValueOnce(response.promise)
+      .mockResolvedValueOnce(ringResponse(SUCCESSOR_RING_ID))
+      .mockResolvedValueOnce({ ok: true } as Response);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    await cancelOutgoingCall();
+
+    expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    await expect(initiateDMCall(OTHER_CONVERSATION_ID)).resolves.toBeUndefined();
+    expect(useVoiceStore.getState().callState).toEqual(
+      expect.objectContaining({
+        kind: 'outgoing-ringing',
+        conversationId: OTHER_CONVERSATION_ID,
+        ringId: SUCCESSOR_RING_ID,
+      })
+    );
+
+    response.resolve(ringResponse());
+    await initiation;
+
+    expect(mockApiFetch).toHaveBeenLastCalledWith(
+      `/api/v1/dm/conversations/${CONVERSATION_ID}/voice/cancel`,
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ ring_id: RING_ID }),
+      })
+    );
+    expect(useVoiceStore.getState().callState).toEqual(
+      expect.objectContaining({
+        kind: 'outgoing-ringing',
+        conversationId: OTHER_CONVERSATION_ID,
+        ringId: SUCCESSOR_RING_ID,
+      })
+    );
+  });
+
+  it('joins when an exact late cancel loses to a queued acceptance', async () => {
+    seedConversation();
+    const response = deferred<Response>();
+    const join = deferred<void>();
+    mockApiFetch.mockReturnValueOnce(response.promise);
+    mockApiFetch.mockResolvedValueOnce(errorResponse(409, 'call already accepted'));
+    mockJoinChannel.mockReturnValueOnce(join.promise as never);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    handleCallCanceled({
+      conversation_id: CONVERSATION_ID,
+      ring_id: RING_ID,
+      canceled_by: 'someone_accepted',
+    } as never);
+    await cancelOutgoingCall();
+
+    response.resolve(ringResponse());
+    await initiation;
+
+    expect(mockJoinChannel).toHaveBeenCalledWith(CONVERSATION_ID, 'dm');
+    expect(useVoiceStore.getState().callState).toEqual({
+      kind: 'joining',
+      conversationId: CONVERSATION_ID,
+      ringId: RING_ID,
+    });
+
+    join.resolve(undefined);
+    await vi.waitFor(() => expect(useVoiceStore.getState().callState).toEqual({ kind: 'in-call' }));
+  });
+
+  it('does not resurrect a canceled group ring for a queued non-terminal decline', async () => {
+    seedConversation();
+    const conversation = useDMStore.getState().conversations[0];
+    useDMStore.setState({
+      conversations: [{ ...conversation, isGroup: true }],
+    });
+    const response = deferred<Response>();
+    mockApiFetch.mockReturnValueOnce(response.promise);
+    mockApiFetch.mockResolvedValueOnce(errorResponse(409, 'ring changed'));
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    handleCallDeclined({
+      conversation_id: CONVERSATION_ID,
+      ring_id: RING_ID,
+      decliner_user_id: 'callee-id',
+    } as never);
+    await cancelOutgoingCall();
+
+    response.resolve(ringResponse());
+    await initiation;
+
+    expect(mockJoinChannel).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+  });
+
+  it('releases global call ownership when the ring request exceeds the server timeout', async () => {
+    vi.useFakeTimers();
+    seedConversation();
+    const hungResponse = deferred<Response>();
+    mockApiFetch.mockReturnValueOnce(hungResponse.promise);
+
+    const expiredInitiation = initiateDMCall(CONVERSATION_ID);
+    await vi.advanceTimersByTimeAsync(45_000);
+
+    expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+
+    mockApiFetch.mockResolvedValueOnce(ringResponse(SUCCESSOR_RING_ID));
+    await expect(initiateDMCall(CONVERSATION_ID)).resolves.toBeUndefined();
+    expect(useVoiceStore.getState().callState).toEqual(
+      expect.objectContaining({
+        kind: 'outgoing-ringing',
+        ringId: SUCCESSOR_RING_ID,
+      })
+    );
+
+    mockApiFetch.mockResolvedValueOnce({ ok: true } as Response);
+    hungResponse.resolve(ringResponse());
+    await expiredInitiation;
+  });
+
+  it('exact-cancels a late ring response after local ownership expires', async () => {
+    vi.useFakeTimers();
+    seedConversation();
+    const response = deferred<Response>();
+    mockApiFetch.mockReturnValueOnce(response.promise);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    await vi.advanceTimersByTimeAsync(45_000);
+    mockApiFetch.mockResolvedValueOnce({ ok: true } as Response);
+
+    response.resolve(ringResponse());
+    await initiation;
+
+    expect(mockApiFetch).toHaveBeenLastCalledWith(
+      `/api/v1/dm/conversations/${CONVERSATION_ID}/voice/cancel`,
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ ring_id: RING_ID }),
+      })
+    );
+    expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+  });
+
+  it('does not replay an expired accepted event into a successor ring', async () => {
+    vi.useFakeTimers();
+    seedConversation();
+    const oldResponse = deferred<Response>();
+    mockApiFetch.mockReturnValueOnce(oldResponse.promise);
+
+    const oldInitiation = initiateDMCall(CONVERSATION_ID);
+    await vi.advanceTimersByTimeAsync(45_000);
+
+    mockApiFetch.mockResolvedValueOnce(ringResponse(SUCCESSOR_RING_ID));
+    await initiateDMCall(CONVERSATION_ID);
+    handleCallCanceled({
+      conversation_id: CONVERSATION_ID,
+      ring_id: RING_ID,
+      canceled_by: 'someone_accepted',
+    } as never);
+    mockApiFetch.mockResolvedValueOnce(errorResponse(409, 'old call already accepted'));
+
+    oldResponse.resolve(ringResponse());
+    await oldInitiation;
+
+    expect(mockApiFetch).toHaveBeenLastCalledWith(
+      `/api/v1/dm/conversations/${CONVERSATION_ID}/voice/cancel`,
+      expect.objectContaining({ body: JSON.stringify({ ring_id: RING_ID }) })
+    );
+    expect(mockJoinChannel).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().callState).toEqual(
+      expect.objectContaining({
+        kind: 'outgoing-ringing',
+        ringId: SUCCESSOR_RING_ID,
+      })
+    );
+  });
+
+  it('replays an accepted event after ownership expiry when no successor claimed the call', async () => {
+    vi.useFakeTimers();
+    seedConversation();
+    const response = deferred<Response>();
+    const join = deferred<void>();
+    mockApiFetch.mockReturnValueOnce(response.promise);
+    mockJoinChannel.mockReturnValueOnce(join.promise as never);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+    handleCallCanceled({
+      conversation_id: CONVERSATION_ID,
+      ring_id: RING_ID,
+      canceled_by: 'someone_accepted',
+    } as never);
+    expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+    mockApiFetch.mockResolvedValueOnce(errorResponse(409, 'call already accepted'));
+
+    response.resolve(ringResponse());
+    await initiation;
+
+    expect(mockJoinChannel).toHaveBeenCalledWith(CONVERSATION_ID, 'dm');
+    expect(useVoiceStore.getState().callState).toEqual({
+      kind: 'joining',
+      conversationId: CONVERSATION_ID,
+      ringId: RING_ID,
+    });
+
+    join.resolve(undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(useVoiceStore.getState().callState).toEqual({ kind: 'in-call' });
+  });
+
+  it('releases local ownership on a store reset and exact-cancels a late response', async () => {
+    seedConversation();
+    const response = deferred<Response>();
+    mockApiFetch
+      .mockReturnValueOnce(response.promise)
+      .mockResolvedValueOnce(errorResponse(409, 'successor probe'))
+      .mockResolvedValueOnce({ ok: true } as Response);
+
+    const initiation = initiateDMCall(CONVERSATION_ID);
+    useVoiceStore.getState().reset();
+
+    await expect(initiateDMCall(CONVERSATION_ID)).rejects.toThrow('successor probe');
+    response.resolve(ringResponse());
+    await initiation;
+
+    expect(mockApiFetch).toHaveBeenLastCalledWith(
+      `/api/v1/dm/conversations/${CONVERSATION_ID}/voice/cancel`,
+      expect.objectContaining({ body: JSON.stringify({ ring_id: RING_ID }) })
+    );
   });
 
   it('swallows POST errors but still cleans up via finally block', async () => {
@@ -284,6 +598,37 @@ describe('acceptIncomingCall', () => {
     expect(mockJoinChannel).toHaveBeenCalledWith(CONVERSATION_ID, 'dm');
     expect(useVoiceStore.getState().callState).toEqual({ kind: 'in-call' });
   });
+
+  it('owns the joining state while accepting and ignores its own accepted fanout', async () => {
+    const join = deferred<void>();
+    useVoiceStore.getState().setCallState({
+      kind: 'incoming-ringing',
+      conversationId: CONVERSATION_ID,
+      ringId: RING_ID,
+      caller: { userId: 'caller-id', username: 'caller' },
+      expiresAt: Date.now() + 30000,
+      isGroup: false,
+    });
+    mockJoinChannel.mockReturnValueOnce(join.promise as never);
+
+    const accepting = acceptIncomingCall();
+    expect(useVoiceStore.getState().callState).toEqual({
+      kind: 'joining',
+      conversationId: CONVERSATION_ID,
+      ringId: RING_ID,
+    });
+
+    handleCallCanceled({
+      conversation_id: CONVERSATION_ID,
+      ring_id: RING_ID,
+      canceled_by: 'someone_accepted',
+    } as never);
+    expect(mockJoinChannel).toHaveBeenCalledTimes(1);
+
+    join.resolve(undefined);
+    await accepting;
+    expect(useVoiceStore.getState().callState).toEqual({ kind: 'in-call' });
+  });
 });
 
 // ── declineIncomingCall ───────────────────────────────────────────────────
@@ -311,7 +656,10 @@ describe('declineIncomingCall', () => {
 
     expect(mockApiFetch).toHaveBeenCalledWith(
       `/api/v1/dm/conversations/${CONVERSATION_ID}/voice/decline`,
-      expect.objectContaining({ method: 'POST' })
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ ring_id: RING_ID }),
+      })
     );
     expect(mockStopLoop).toHaveBeenCalledWith('call-ringing');
     expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
@@ -471,6 +819,19 @@ describe('handleCallCanceled', () => {
     handleCallCanceled(canceledPayload('someone_accepted'));
     expect(mockStopLoop).toHaveBeenCalledWith('call-outgoing');
     expect(mockJoinChannel).toHaveBeenCalledWith(CONVERSATION_ID, 'dm');
+    expect(useVoiceStore.getState().callState).toEqual({
+      kind: 'joining',
+      conversationId: CONVERSATION_ID,
+      ringId: RING_ID,
+    });
+
+    await cancelOutgoingCall();
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().callState).toEqual({
+      kind: 'joining',
+      conversationId: CONVERSATION_ID,
+      ringId: RING_ID,
+    });
 
     resolveJoin();
     await new Promise((r) => setTimeout(r, 0));
@@ -513,6 +874,26 @@ describe('handleCallCanceled', () => {
     expect(mockStopLoop).toHaveBeenCalledWith('call-outgoing');
     expect(mockStopLoop).toHaveBeenCalledWith('call-ringing');
     expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+  });
+
+  it('ignores a cancellation for a stale ring ID', () => {
+    useVoiceStore.getState().setCallState({
+      kind: 'outgoing-ringing',
+      conversationId: CONVERSATION_ID,
+      ringId: RING_ID,
+      calleeUserIds: ['callee-id'],
+      startedAt: 1000,
+      declinedUserIds: [],
+    });
+
+    handleCallCanceled({
+      conversation_id: CONVERSATION_ID,
+      ring_id: 'stale-ring-id',
+      canceled_by: 'caller',
+    } as never);
+
+    expect(useVoiceStore.getState().callState.kind).toBe('outgoing-ringing');
+    expect(mockStopLoop).not.toHaveBeenCalled();
   });
 
   it('callee path: incoming-ringing receives any cancel → cleanup + idle', () => {
@@ -569,6 +950,26 @@ describe('handleCallDeclined', () => {
     handleCallDeclined(declinedPayload());
     expect(mockStopLoop).toHaveBeenCalledWith('call-outgoing');
     expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+  });
+
+  it('ignores a decline for a stale ring ID', () => {
+    useVoiceStore.getState().setCallState({
+      kind: 'outgoing-ringing',
+      conversationId: CONVERSATION_ID,
+      ringId: RING_ID,
+      calleeUserIds: ['callee-id'],
+      startedAt: 1000,
+      declinedUserIds: [],
+    });
+
+    handleCallDeclined({
+      conversation_id: CONVERSATION_ID,
+      ring_id: 'stale-ring-id',
+      decliner_user_id: 'callee-id',
+    } as never);
+
+    expect(useVoiceStore.getState().callState.kind).toBe('outgoing-ringing');
+    expect(mockStopLoop).not.toHaveBeenCalled();
   });
 
   // ── Group decline tally (#1219 R2) ──────────────────────────────────────
@@ -700,6 +1101,25 @@ describe('handleCallTimedOut', () => {
     expect(mockStopLoop).toHaveBeenCalledWith('call-outgoing');
     expect(mockStopLoop).toHaveBeenCalledWith('call-ringing');
     expect(useVoiceStore.getState().callState).toEqual({ kind: 'idle' });
+  });
+
+  it('ignores a timeout for a stale ring ID', () => {
+    useVoiceStore.getState().setCallState({
+      kind: 'outgoing-ringing',
+      conversationId: CONVERSATION_ID,
+      ringId: RING_ID,
+      calleeUserIds: ['callee-id'],
+      startedAt: 1000,
+      declinedUserIds: [],
+    });
+
+    handleCallTimedOut({
+      conversation_id: CONVERSATION_ID,
+      ring_id: 'stale-ring-id',
+    } as never);
+
+    expect(useVoiceStore.getState().callState.kind).toBe('outgoing-ringing');
+    expect(mockStopLoop).not.toHaveBeenCalled();
   });
 
   it('incoming-ringing → stops both audios + idle', () => {

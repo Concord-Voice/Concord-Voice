@@ -3432,6 +3432,26 @@ func (h *Hub) BroadcastToDM(conversationID uuid.UUID, msg OutgoingMessage) {
 	}
 }
 
+// BroadcastToDMParticipants sends to every connected client owned by a current
+// participant, regardless of which DM that client has selected. Terminal call
+// events use this path so background conversations update their previews and
+// ringing state. If participant resolution is unavailable, retain the legacy
+// subscription-scoped broadcast as a graceful fallback.
+func (h *Hub) BroadcastToDMParticipants(conversationID uuid.UUID, msg OutgoingMessage) {
+	if h.db == nil {
+		h.BroadcastToDM(conversationID, msg)
+		return
+	}
+	participants := h.resolveDMParticipants(conversationID)
+	if len(participants) == 0 {
+		h.BroadcastToDM(conversationID, msg)
+		return
+	}
+	for userID := range participants {
+		h.BroadcastToUser(userID, msg)
+	}
+}
+
 // --- Force-disconnect handlers (server-side session termination) ---
 
 // handleDisconnectUser disconnects ALL WebSocket clients for a user.

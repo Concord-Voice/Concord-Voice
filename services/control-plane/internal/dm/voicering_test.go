@@ -5,6 +5,7 @@
 package dm
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -95,6 +96,121 @@ func TestPendingCall_Lifecycle(t *testing.T) {
 	})
 }
 
+func TestPendingCall_TransitionsSerializeDeclineAndAccept(t *testing.T) {
+	convID := uuid.New()
+	caller := uuid.New()
+	decliner := uuid.New()
+	acceptor := uuid.New()
+	ring := newPendingCall(convID, caller, []uuid.UUID{decliner, acceptor}, time.Second)
+	pendingDMCalls.Store(convID, ring)
+	t.Cleanup(func() {
+		ring.finalizeTerminal()
+		pendingDMCalls.Delete(convID)
+	})
+
+	declineEnqueued := make(chan struct{})
+	releaseDecline := make(chan struct{})
+	declineResult := make(chan declineTransition, 1)
+	go func() {
+		declineResult <- ring.tryDecline(decliner, func() {
+			close(declineEnqueued)
+			<-releaseDecline
+		})
+	}()
+	<-declineEnqueued
+
+	type acceptTransitionResult struct {
+		accepted bool
+		err      error
+	}
+	acceptResult := make(chan acceptTransitionResult, 1)
+	go func() {
+		accepted, err := ring.tryAccept(acceptor, nil)
+		acceptResult <- acceptTransitionResult{accepted: accepted, err: err}
+	}()
+	select {
+	case <-acceptResult:
+		t.Fatal("accept overtook the in-flight decline notification")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseDecline)
+	assert.Equal(t, declineTransitionPending, <-declineResult)
+	result := <-acceptResult
+	require.NoError(t, result.err)
+	require.True(t, result.accepted)
+	assert.True(t, ring.terminalOwned)
+	assert.True(t, ring.isCurrentLockedForTest())
+
+	ring.finalizeTerminal()
+	_, loaded := pendingDMCalls.Load(convID)
+	assert.False(t, loaded)
+}
+
+func TestPendingCall_AcceptCallbackFailureRollsBackTransition(t *testing.T) {
+	convID := uuid.New()
+	caller := uuid.New()
+	acceptor := uuid.New()
+	ring := newPendingCall(convID, caller, []uuid.UUID{acceptor}, time.Second)
+	pendingDMCalls.Store(convID, ring)
+	t.Cleanup(func() { pendingDMCalls.Delete(convID) })
+
+	wantErr := errors.New("lease unavailable")
+	accepted, err := ring.tryAccept(acceptor, func() error { return wantErr })
+	require.ErrorIs(t, err, wantErr)
+	assert.False(t, accepted)
+	assert.False(t, ring.terminalOwned)
+	assert.Contains(t, ring.RingingUserIDs, acceptor)
+	assert.NotContains(t, ring.AcceptedUserIDs, acceptor)
+	assert.True(t, ring.isCurrentLockedForTest())
+
+	accepted, err = ring.tryAccept(acceptor, nil)
+	require.NoError(t, err)
+	assert.True(t, accepted)
+}
+
+func TestPendingCall_InitializationPrecedesTerminalTransition(t *testing.T) {
+	convID := uuid.New()
+	ring := newPendingCall(convID, uuid.New(), []uuid.UUID{uuid.New()}, time.Second)
+	t.Cleanup(func() {
+		ring.finalizeTerminal()
+		pendingDMCalls.Delete(convID)
+	})
+
+	initializing := make(chan struct{})
+	releaseInitialization := make(chan struct{})
+	claimResult := make(chan bool, 1)
+	go func() {
+		_, loaded := loadOrStoreInitializedPendingCall(ring, func() {
+			close(initializing)
+			<-releaseInitialization
+		})
+		claimResult <- loaded
+	}()
+	<-initializing
+
+	terminalResult := make(chan bool, 1)
+	go func() { terminalResult <- ring.tryTerminate() }()
+	select {
+	case <-terminalResult:
+		t.Fatal("terminal transition overtook ring initialization")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseInitialization)
+	assert.False(t, <-claimResult)
+	require.True(t, <-terminalResult)
+	ring.finalizeTerminal()
+	_, loaded := pendingDMCalls.Load(convID)
+	assert.False(t, loaded)
+}
+
+func (p *PendingCall) isCurrentLockedForTest() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.isCurrentLocked()
+}
+
 func TestPendingCall_TimerLifecycle(t *testing.T) {
 	t.Run("StartTimer fires the callback after the duration", func(t *testing.T) {
 		ring := newPendingCall(uuid.New(), uuid.New(), []uuid.UUID{uuid.New()}, 100*time.Millisecond)
@@ -144,6 +260,43 @@ func TestPendingCall_TimerLifecycle(t *testing.T) {
 	})
 }
 
+func TestAcceptedDMCallCorrelationExpiresAndReplacementSurvivesOldTimer(t *testing.T) {
+	convID := uuid.New()
+	first := newPendingCall(convID, uuid.New(), []uuid.UUID{uuid.New()}, time.Second)
+	rememberAcceptedDMCall(first, 20*time.Millisecond)
+
+	record, ok := lookupAcceptedDMCall(convID, first.RingID)
+	require.True(t, ok)
+	assert.Equal(t, first.CallerUserID, record.CallerUserID)
+
+	replacement := newPendingCall(convID, uuid.New(), []uuid.UUID{uuid.New()}, time.Second)
+	time.Sleep(5 * time.Millisecond)
+	rememberAcceptedDMCall(replacement, time.Second)
+	t.Cleanup(func() { forgetAcceptedDMCall(convID, replacement.RingID) })
+
+	time.Sleep(30 * time.Millisecond)
+	_, oldFound := lookupAcceptedDMCall(convID, first.RingID)
+	assert.False(t, oldFound, "replaced ring cannot be resolved")
+	current, currentFound := lookupAcceptedDMCall(convID, replacement.RingID)
+	require.True(t, currentFound, "old timer must not delete the replacement")
+	assert.Equal(t, replacement.CallerUserID, current.CallerUserID)
+
+	forgetAcceptedDMCall(convID, replacement.RingID)
+	_, foundAfterForget := lookupAcceptedDMCall(convID, replacement.RingID)
+	assert.False(t, foundAfterForget)
+}
+
+func TestAcceptedDMCallCorrelationExpiresWithoutMediaJoin(t *testing.T) {
+	ring := newPendingCall(uuid.New(), uuid.New(), []uuid.UUID{uuid.New()}, time.Second)
+	rememberAcceptedDMCall(ring, 10*time.Millisecond)
+	t.Cleanup(func() { forgetAcceptedDMCall(ring.ConversationID, ring.RingID) })
+
+	require.Eventually(t, func() bool {
+		_, ok := lookupAcceptedDMCall(ring.ConversationID, ring.RingID)
+		return !ok
+	}, 200*time.Millisecond, 5*time.Millisecond)
+}
+
 func TestDMVoiceInvitedData_IsGroup(t *testing.T) {
 	caller := map[string]interface{}{"user_id": uuid.New().String(), "username": "alice"}
 	ring := &PendingCall{RingID: uuid.New(), RingStartedAt: time.Now()}
@@ -158,4 +311,24 @@ func TestDMVoiceInvitedData_IsGroup(t *testing.T) {
 
 	oneToOne := dmVoiceInvitedData(convID, false, caller, ring, 45)
 	assert.Equal(t, false, oneToOne["is_group"])
+}
+
+func TestSanitizeLogValue(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "plain", input: "conversation-123", want: "conversation-123"},
+		{name: "empty", input: "", want: ""},
+		{name: "crlf", input: "id\r\nforged-entry", want: "idforged-entry"},
+		{name: "c0_and_del", input: "a\t\x00\x01\x1f\x7fb", want: "ab"},
+		{name: "unicode", input: "café-🎉-Ω", want: "café-🎉-Ω"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, sanitizeLogValue(test.input))
+		})
+	}
 }

@@ -86,6 +86,7 @@ export class NatsService {
             userId: event.userId,
             username: event.username,
             displayName: event.displayName,
+            callId: event.callId,
             timestamp,
           });
           break;
@@ -94,6 +95,7 @@ export class NatsService {
           this.publish('voice.left', {
             channelId: event.roomId,
             userId: event.userId,
+            callId: event.callId,
             timestamp,
           });
           break;
@@ -101,6 +103,11 @@ export class NatsService {
         case 'room-empty':
           this.publish('voice.room_empty', {
             channelId: event.roomId,
+            callId: event.callId,
+            ringId: event.ringId,
+            callerUserId: event.callerUserId,
+            participantUserIds: event.participantUserIds,
+            startedAt: event.startedAt,
             timestamp,
           });
           break;

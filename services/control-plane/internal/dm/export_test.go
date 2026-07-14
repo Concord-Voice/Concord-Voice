@@ -19,6 +19,14 @@ func ResetPendingDMCallsForTest() {
 		}
 		return true
 	})
+	acceptedDMCalls.Range(func(key, value interface{}) bool {
+		if record, ok := value.(*acceptedDMCall); ok {
+			forgetAcceptedDMCall(record.ConversationID, record.RingID)
+		} else {
+			acceptedDMCalls.Delete(key)
+		}
+		return true
+	})
 }
 
 // PendingDMCallExistsForTest returns true iff pendingDMCalls has an entry

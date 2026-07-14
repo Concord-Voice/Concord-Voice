@@ -1,4 +1,5 @@
 import jwt from 'jsonwebtoken';
+import { createHash, createHmac } from 'node:crypto';
 import type { Socket, ExtendedError } from 'socket.io';
 import { config } from '../config/index.js';
 import { logger } from '../lib/logger.js';
@@ -168,6 +169,12 @@ export interface ChannelAccessResult {
   allowedAudioTiers: string[];
   minPtimeMs: number;
   maxManualBitrateBps: number;
+  /** Server-validated DM call instance ID; undefined only for server channels. */
+  callId?: string;
+  /** Server-validated ring that originated the DM call, when one exists. */
+  callRingId?: string;
+  /** Server-validated caller (ring initiator or direct /voice/join reserver). */
+  callCallerUserId?: string;
   /**
    * Room-scoped cap tier (#1542) — the server OWNER's tier for channel rooms,
    * parsed from the join-authorize `room_owner_tier` field, fail-closed to 'free'.
@@ -419,15 +426,40 @@ function parseMediaEntitlements(raw: unknown): {
  */
 export type RoomKind = 'channel' | 'dm';
 
-export async function validateChannelAccess(
-  userId: string,
-  channelId: string,
-  token: string,
-  roomKind: RoomKind = 'channel'
-): Promise<ChannelAccessResult> {
-  // Denial-path results carry the fail-closed free floor for the per-user media
-  // caps (#1300) — a denied join never grants a media entitlement above free.
-  const deniedResult = (error: string): ChannelAccessResult => ({
+interface DmVoiceAuthorizationResponse {
+  authorized: boolean;
+  is_group: boolean;
+  media_entitlements?: unknown;
+  username?: unknown;
+  display_name?: unknown;
+  avatar_url?: unknown;
+  call_id?: unknown;
+  call_ring_id?: unknown;
+  call_caller_user_id?: unknown;
+}
+
+interface ChannelJoinAuthorizationResponse {
+  allowed: boolean;
+  media_server_url: string;
+  permissions?: unknown;
+  server_muted: boolean;
+  server_deafened: boolean;
+  channel: {
+    id: string;
+    server_id: string;
+    name: string;
+  };
+  media_entitlements?: unknown;
+  room_owner_tier?: unknown;
+  username?: unknown;
+  display_name?: unknown;
+  avatar_url?: unknown;
+}
+
+const DM_VOICE_CONTROL_PLANE_TIMEOUT_MS = 5_000;
+
+function deniedChannelAccess(channelId: string, error: string): ChannelAccessResult {
+  return {
     allowed: false,
     channelId,
     serverId: '',
@@ -439,35 +471,157 @@ export async function validateChannelAccess(
     minPtimeMs: FREE_MEDIA_ENTITLEMENT.minPtimeMs,
     maxManualBitrateBps: FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps,
     error,
-  });
+  };
+}
 
+function channelAccessDenial(status: number): string {
+  if (status === 401 || status === 403) return 'Not authorized to access this channel';
+  if (status === 404) return 'Channel not found';
+  return `Control plane returned ${status}`;
+}
+
+function dmVoiceMediaRequest(
+  method: 'POST' | 'DELETE',
+  channelId: string,
+  token: string,
+  callId?: string
+): RequestInit {
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const tokenDigest = createHash('sha256').update(token).digest('hex');
+  const payload = ['v1', timestamp, method, channelId, callId ?? '', tokenDigest].join('\n');
+  const proofKey = createHmac('sha256', config.jwtSecret)
+    .update('concord/dm-voice-media-authorization/v1')
+    .digest();
+  return {
+    method,
+    // Both admission and rollback run under a per-room fence. Bound either
+    // network hop so a stalled control plane cannot head-of-line block the room.
+    signal: AbortSignal.timeout(DM_VOICE_CONTROL_PLANE_TIMEOUT_MS),
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      'X-Concord-Media-Timestamp': timestamp,
+      'X-Concord-Media-Proof': createHmac('sha256', proofKey).update(payload).digest('hex'),
+    },
+    body: JSON.stringify({ call_id: callId }),
+  };
+}
+
+function channelAccessRequest(
+  channelId: string,
+  token: string,
+  roomKind: RoomKind,
+  requestedCallId?: string
+): { endpoint: string; request: RequestInit } {
+  const endpoint =
+    roomKind === 'dm'
+      ? `${config.controlPlaneUrl}/api/v1/dm/conversations/${channelId}/voice/authorize`
+      : `${config.controlPlaneUrl}/api/v1/channels/${channelId}/voice/join`;
+  if (roomKind === 'dm') {
+    return {
+      endpoint,
+      request: dmVoiceMediaRequest('POST', channelId, token, requestedCallId),
+    };
+  }
+  return {
+    endpoint,
+    request: {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+    },
+  };
+}
+
+export async function releaseDMVoiceAuthorization(
+  conversationId: string,
+  token: string,
+  callId: string
+): Promise<void> {
+  const response = await fetch(
+    `${config.controlPlaneUrl}/api/v1/dm/conversations/${conversationId}/voice/authorize`,
+    dmVoiceMediaRequest('DELETE', conversationId, token, callId)
+  );
+  if (!response.ok) {
+    throw new Error(`Control plane rejected DM voice authorization release (${response.status})`);
+  }
+}
+
+function nonEmptyResponseString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function dmChannelAccessResult(
+  channelId: string,
+  response: DmVoiceAuthorizationResponse
+): ChannelAccessResult {
+  const allowed = response.authorized === true;
+  const ent = parseMediaEntitlements(response.media_entitlements);
+  const identity = parseAuthoritativeIdentity(response);
+  return {
+    allowed,
+    channelId,
+    serverId: '',
+    channelName: '',
+    serverMuted: false,
+    serverDeafened: false,
+    userTier: ent.userTier,
+    allowedAudioTiers: ent.allowedAudioTiers,
+    minPtimeMs: ent.minPtimeMs,
+    maxManualBitrateBps: ent.maxManualBitrateBps,
+    callId: nonEmptyResponseString(response.call_id),
+    callRingId: nonEmptyResponseString(response.call_ring_id),
+    callCallerUserId: nonEmptyResponseString(response.call_caller_user_id),
+    ...identity,
+    // A 200 with authorized=false is rare; preserve a specific denial reason
+    // instead of making the join handler fall back to generic "Access denied".
+    ...(allowed ? {} : { error: 'DM voice join not authorized' }),
+  };
+}
+
+function serverChannelAccessResult(
+  response: ChannelJoinAuthorizationResponse
+): ChannelAccessResult {
+  const ent = parseMediaEntitlements(response.media_entitlements);
+  const identity = parseAuthoritativeIdentity(response);
+  const permissions = parsePermissionBitfield(response.permissions) ?? 0n;
+  return {
+    allowed: true,
+    channelId: response.channel.id,
+    serverId: response.channel.server_id,
+    channelName: response.channel.name,
+    serverMuted: response.server_muted ?? false,
+    serverDeafened: response.server_deafened ?? false,
+    userTier: ent.userTier,
+    allowedAudioTiers: ent.allowedAudioTiers,
+    minPtimeMs: ent.minPtimeMs,
+    maxManualBitrateBps: ent.maxManualBitrateBps,
+    roomOwnerTier: response.room_owner_tier === 'premium' ? 'premium' : 'free',
+    ...identity,
+    permissions,
+  };
+}
+
+export async function validateChannelAccess(
+  userId: string,
+  channelId: string,
+  token: string,
+  roomKind: RoomKind = 'channel',
+  requestedCallId?: string
+): Promise<ChannelAccessResult> {
   try {
     // Route to the appropriate control-plane endpoint based on room kind.
     // The two endpoints have different response shapes (server-channel
     // join returns full channel + enforcement state; DM authorize returns
     // only { authorized, is_group }). Both serve the same purpose:
     // defense-in-depth re-validation of the user's access to the room.
-    const endpoint =
-      roomKind === 'dm'
-        ? `${config.controlPlaneUrl}/api/v1/dm/conversations/${channelId}/voice/authorize`
-        : `${config.controlPlaneUrl}/api/v1/channels/${channelId}/voice/join`;
-
-    const channelRes = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-    });
+    const { endpoint, request } = channelAccessRequest(channelId, token, roomKind, requestedCallId);
+    const channelRes = await fetch(endpoint, request);
 
     if (!channelRes.ok) {
-      if (channelRes.status === 401 || channelRes.status === 403) {
-        return deniedResult('Not authorized to access this channel');
-      }
-      if (channelRes.status === 404) {
-        return deniedResult('Channel not found');
-      }
-      return deniedResult(`Control plane returned ${channelRes.status}`);
+      return deniedChannelAccess(channelId, channelAccessDenial(channelRes.status));
     }
 
     // Response shape differs by room kind:
@@ -477,110 +631,19 @@ export async function validateChannelAccess(
     // metadata (serverId, channelName, enforcement flags). For DM rooms those fields
     // default to empty/false in the returned ChannelAccessResult.
     if (roomKind === 'dm') {
-      const dmResponse = (await channelRes.json()) as {
-        authorized: boolean;
-        is_group: boolean;
-        media_entitlements?: unknown;
-        username?: unknown;
-        display_name?: unknown;
-        avatar_url?: unknown;
-      };
-      const allowed = dmResponse.authorized === true;
-      // Per-user media caps are room-kind-independent (spec §3): the DM
-      // authorize response carries media_entitlements too. Parse fail-closed.
-      const ent = parseMediaEntitlements(dmResponse.media_entitlements);
-      // CV-CAN-017: server-authoritative display identity for DM voice.
-      const identity = parseAuthoritativeIdentity(dmResponse);
-      return {
-        allowed,
+      return dmChannelAccessResult(
         channelId,
-        serverId: '',
-        channelName: '',
-        serverMuted: false,
-        serverDeafened: false,
-        userTier: ent.userTier,
-        allowedAudioTiers: ent.allowedAudioTiers,
-        minPtimeMs: ent.minPtimeMs,
-        maxManualBitrateBps: ent.maxManualBitrateBps,
-        ...identity,
-        // Surface a specific reason when the control-plane returned 200
-        // with authorized=false (rare — the 401/403/404 branches above
-        // are the usual failure path). Without this the join-room handler
-        // falls back to a generic 'Access denied' and the failure cause
-        // is obscured (Copilot #1231 cycle-4 finding).
-        ...(allowed ? {} : { error: 'DM voice join not authorized' }),
-      };
+        (await channelRes.json()) as DmVoiceAuthorizationResponse
+      );
     }
 
-    const responseData = (await channelRes.json()) as {
-      allowed: boolean;
-      media_server_url: string;
-      permissions?: unknown;
-      server_muted: boolean;
-      server_deafened: boolean;
-      channel: {
-        id: string;
-        server_id: string;
-        name: string;
-      };
-      media_entitlements?: unknown;
-      room_owner_tier?: unknown;
-      username?: unknown;
-      display_name?: unknown;
-      avatar_url?: unknown;
-    };
-
-    const channel = responseData.channel;
-
-    // Per-user media caps (#1300): parse the server-authoritative
-    // media_entitlements object, FAIL-CLOSED to the free floor if absent /
-    // malformed. The tier is never taken from socket.handshake.auth.
-    const ent = parseMediaEntitlements(responseData.media_entitlements);
-
-    // Room-owner cap tier (#1542): only the explicit 'premium' string grants
-    // premium room caps; anything else (incl. absent/garbage) fails closed to
-    // 'free'. Server-authoritative — resolved by the control-plane from the
-    // server owner's subscription, never from socket.handshake.auth.
-    const roomOwnerTier = responseData.room_owner_tier === 'premium' ? 'premium' : 'free';
-
-    // CV-CAN-017: server-authoritative display identity for channel voice.
-    const identity = parseAuthoritativeIdentity(responseData);
-
-    // CV-CAN-007: parse the server-authoritative effective-permission bitfield.
-    // bigint because the full field uses bits beyond JS Number precision.
-    // Fail-closed to 0n (deny all publish) unless the value is a plain decimal
-    // string within the control-plane's int64 permission domain. BigInt() is
-    // dangerously coercive at a security boundary: it turns non-decimal strings
-    // ("0x20000"), single-element arrays (["131072"]), and numbers into a real
-    // bitfield, and negative strings ("-1") into an all-bits-set two's-complement
-    // value; every one of those fails open. It also parses out-of-range decimals
-    // ("18446744073709551615") whose low bits would grant publish rights. A strict
-    // decimal-only guard plus the int64 upper bound rejects all of them.
-    const permissions: bigint = parsePermissionBitfield(responseData.permissions) ?? 0n;
-
-    // The voice join endpoint validates channel type, membership, and permissions.
-    // If we got a 200 with allowed=true, the user has access.
-    return {
-      allowed: true,
-      channelId: channel.id,
-      serverId: channel.server_id,
-      channelName: channel.name,
-      serverMuted: responseData.server_muted ?? false,
-      serverDeafened: responseData.server_deafened ?? false,
-      userTier: ent.userTier,
-      allowedAudioTiers: ent.allowedAudioTiers,
-      minPtimeMs: ent.minPtimeMs,
-      maxManualBitrateBps: ent.maxManualBitrateBps,
-      roomOwnerTier,
-      ...identity,
-      permissions,
-    };
+    return serverChannelAccessResult((await channelRes.json()) as ChannelJoinAuthorizationResponse);
   } catch (err) {
     logger.error('Failed to validate channel access', {
       userId,
       channelId,
       error: err,
     });
-    return deniedResult('Failed to validate channel access');
+    return deniedChannelAccess(channelId, 'Failed to validate channel access');
   }
 }

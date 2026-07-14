@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { createHash, createHmac } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import './mocks/logger.js';
 
@@ -14,6 +15,7 @@ const TEST_SIGNING_KEY = ['vitest', 'mock', 'jwt'].join('-'); // NOSONAR — tes
 
 import {
   createAuthMiddleware,
+  releaseDMVoiceAuthorization,
   validateChannelAccess,
   resolveParticipantIdentity,
   FREE_MEDIA_ENTITLEMENT,
@@ -359,15 +361,28 @@ describe('validateChannelAccess', () => {
   // ── DM-path tests (#1209, plan task C1 / G7 fix) ──────────────────────
 
   it('routes to DM authorize endpoint when roomKind=dm', async () => {
+    const callId = '11111111-1111-4111-8111-111111111111';
+    const ringId = callId;
+    const callerUserId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
     mockFetch().mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve({ authorized: true, is_group: false }),
+      json: () =>
+        Promise.resolve({
+          authorized: true,
+          is_group: false,
+          call_id: callId,
+          call_ring_id: ringId,
+          call_caller_user_id: callerUserId,
+        }),
     });
 
-    const result = await validateChannelAccess('u-1', 'conv-1', 'jwt-token', 'dm');
+    const result = await validateChannelAccess('u-1', 'conv-1', 'jwt-token', 'dm', callId);
 
     expect(result.allowed).toBe(true);
     expect(result.channelId).toBe('conv-1');
+    expect(result.callId).toBe(callId);
+    expect(result.callRingId).toBe(ringId);
+    expect(result.callCallerUserId).toBe(callerUserId);
     // DM rooms don't carry server-channel metadata
     expect(result.serverId).toBe('');
     expect(result.channelName).toBe('');
@@ -378,8 +393,45 @@ describe('validateChannelAccess', () => {
         headers: expect.objectContaining({
           Authorization: 'Bearer jwt-token',
         }),
+        body: JSON.stringify({ call_id: callId }),
       })
     );
+    const request = mockFetch().mock.calls[0][1] as RequestInit;
+    expect(request.signal).toBeInstanceOf(AbortSignal);
+    const headers = request.headers as Record<string, string>;
+    const timestamp = headers['X-Concord-Media-Timestamp'];
+    expect(timestamp).toMatch(/^\d+$/);
+    const tokenDigest = createHash('sha256').update('jwt-token').digest('hex');
+    const proofKey = createHmac('sha256', TEST_SIGNING_KEY)
+      .update('concord/dm-voice-media-authorization/v1')
+      .digest();
+    const expectedProof = createHmac('sha256', proofKey)
+      .update(['v1', timestamp, 'POST', 'conv-1', callId, tokenDigest].join('\n'))
+      .digest('hex');
+    expect(headers['X-Concord-Media-Proof']).toBe(expectedProof);
+  });
+
+  it('binds a DM media-authorization release proof to DELETE', async () => {
+    const callId = '11111111-1111-4111-8111-111111111111';
+    mockFetch().mockResolvedValueOnce({ ok: true });
+
+    await releaseDMVoiceAuthorization('conv-1', 'jwt-token', callId);
+
+    const [endpoint, request] = mockFetch().mock.calls[0] as [string, RequestInit];
+    expect(endpoint).toBe('http://localhost:8080/api/v1/dm/conversations/conv-1/voice/authorize');
+    expect(request.method).toBe('DELETE');
+    expect(request.signal).toBeInstanceOf(AbortSignal);
+    expect(request.body).toBe(JSON.stringify({ call_id: callId }));
+    const headers = request.headers as Record<string, string>;
+    const timestamp = headers['X-Concord-Media-Timestamp'];
+    const tokenDigest = createHash('sha256').update('jwt-token').digest('hex');
+    const proofKey = createHmac('sha256', TEST_SIGNING_KEY)
+      .update('concord/dm-voice-media-authorization/v1')
+      .digest();
+    const expectedProof = createHmac('sha256', proofKey)
+      .update(['v1', timestamp, 'DELETE', 'conv-1', callId, tokenDigest].join('\n'))
+      .digest('hex');
+    expect(headers['X-Concord-Media-Proof']).toBe(expectedProof);
   });
 
   // ── CV-CAN-017: server-authoritative display identity ─────────────────

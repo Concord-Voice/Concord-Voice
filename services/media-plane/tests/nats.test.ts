@@ -135,20 +135,22 @@ describe('NatsService', () => {
 
       handler({
         type: 'user-joined',
-        roomId: 'ch-1',
+        roomId: 'conv-1',
         userId: 'u-1',
         username: 'alice',
         displayName: 'Alice',
         e2eeEpoch: 1,
+        callId: 'call-1',
       });
 
       expect(mockNc.publish).toHaveBeenCalled();
       const encodedData = mockEncode.mock.calls.at(-1)?.[0];
       expect(encodedData).toMatchObject({
-        channelId: 'ch-1',
+        channelId: 'conv-1',
         userId: 'u-1',
         username: 'alice',
         displayName: 'Alice',
+        callId: 'call-1',
       });
       expect(encodedData).toHaveProperty('timestamp');
     });
@@ -158,23 +160,40 @@ describe('NatsService', () => {
 
       handler({
         type: 'user-left',
-        roomId: 'ch-1',
+        roomId: 'conv-1',
         userId: 'u-1',
         socketId: 'sock-1',
         e2eeEpoch: 3,
+        callId: 'call-1',
       });
 
       const subject = mockNc.publish.mock.calls.at(-1)?.[0];
       expect(subject).toBe('voice.left');
+      expect(mockEncode.mock.calls.at(-1)?.[0]).toMatchObject({ callId: 'call-1' });
     });
 
     it('maps room-empty to voice.room_empty', () => {
       const handler = service.createRoomEventHandler();
 
-      handler({ type: 'room-empty', roomId: 'ch-1' });
+      handler({
+        type: 'room-empty',
+        roomId: 'conv-1',
+        callId: 'call-1',
+        ringId: 'call-1',
+        callerUserId: 'u-1',
+        participantUserIds: ['u-1', 'u-2'],
+        startedAt: '2026-07-14T12:00:00.000Z',
+      });
 
       const subject = mockNc.publish.mock.calls.at(-1)?.[0];
       expect(subject).toBe('voice.room_empty');
+      expect(mockEncode.mock.calls.at(-1)?.[0]).toMatchObject({
+        callId: 'call-1',
+        ringId: 'call-1',
+        callerUserId: 'u-1',
+        participantUserIds: ['u-1', 'u-2'],
+        startedAt: '2026-07-14T12:00:00.000Z',
+      });
     });
 
     it('maps producer-added to voice.producer_added', () => {
