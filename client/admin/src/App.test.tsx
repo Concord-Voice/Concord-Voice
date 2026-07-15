@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -65,7 +65,9 @@ describe("App", () => {
       screen.getByRole("heading", { name: "Host Overview" }),
     ).toBeVisible();
     expect(screen.queryByText(/sovereign portal/i)).not.toBeInTheDocument();
-    expect(requests).toBe(2);
+    // The portal poll is dispatched from an effect after the commit that renders
+    // node_id, so the second request may not be counted yet — wait for it.
+    await waitFor(() => expect(requests).toBe(2));
     expect(screen.getAllByRole("main")).toHaveLength(1);
   });
 
@@ -85,7 +87,12 @@ describe("App", () => {
     render(<App reload={reload} />);
 
     await vi.waitFor(() => expect(reload).toHaveBeenCalledOnce());
-    expect(screen.queryByText(healthFixture().node_id)).not.toBeInTheDocument();
+    // The 403 path schedules the terminal re-render and calls reload() in the same
+    // tick, so the portal DOM can still be mounted here. node_id renders twice, and
+    // queryByText throws on multiple matches — wait on the DOM with queryAllByText.
+    await waitFor(() =>
+      expect(screen.queryAllByText(healthFixture().node_id)).toHaveLength(0),
+    );
   });
 
   it("clears local data and reloads the document when Access returns 403", async () => {
