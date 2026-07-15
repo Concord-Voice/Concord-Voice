@@ -2126,6 +2126,60 @@ paths:
                   duplicates:
                     type: integer
   /channels/{id}/messages:
+    delete:
+      tags:
+      - Messages
+      summary: Purge messages in a channel
+      description: 'Bulk-delete messages in a channel, scoped by a recent-ward time
+        range and an optional target author (#1352). Irreversible.
+
+
+        Authorization: `Manage All Messages` permits purging any/all authors. An actor
+        holding only `Manage Own Messages` is forced to their own messages regardless
+        of `target_user_id`. Neither → 403 with nothing deleted and no audit row.
+
+
+        Deletion is batched internally; the batch size is not a cap on how many
+        messages are removed. Every purge writes a privacy-safe audit row (counts and
+        context only, never content) and broadcasts `channel_purged`.
+
+
+        Rate limit: fail-closed per-actor (a rate-limiter outage denies rather than
+        allows).'
+      operationId: purgeChannelMessages
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ChannelId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PurgeMessagesRequest'
+      responses:
+        '200':
+          description: Purge completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PurgeMessagesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Insufficient permissions to purge this channel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Channel not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
     get:
       tags:
       - Messages
@@ -3453,6 +3507,67 @@ paths:
             application/json:
               schema: *id001
   /dm/conversations/{id}/messages:
+    delete:
+      tags:
+      - DM
+      summary: Purge messages in a DM or group conversation
+      description: 'Bulk-delete messages in a 1:1 or group DM, scoped by a recent-ward
+        time range (#1352). Irreversible.
+
+
+        Semantics: the actor''s own messages are deleted for both parties. Messages the
+        actor cannot delete for everyone (the other party''s) are instead persistently
+        HIDDEN from the actor''s own view — the peer is unaffected. A group admin
+        deletes all participants'' messages for everyone. Non-participants → 403.
+
+
+        Step-up auth: when the actor''s `require_auth_before_purge` privacy setting is
+        enabled (the default, and the fail-closed value when unset), `current_password`
+        — plus `mfa_code` when MFA is enabled — must be supplied and is verified before
+        any mutation. SSO/passwordless accounts step up with their MFA method. Failed
+        step-up → 403 with nothing deleted and no audit row.
+
+
+        Emits `dm_purged` to the conversation and to the actor''s other sessions. Hides
+        are view-local and are not broadcast to peers.
+
+
+        Rate limit: fail-closed per-actor (a rate-limiter outage denies rather than
+        allows).'
+      operationId: purgeDMConversationMessages
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Conversation UUID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PurgeDMMessagesRequest'
+      responses:
+        '200':
+          description: Purge completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PurgeMessagesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Not a participant, or step-up verification required/failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
     get:
       tags:
       - DM
@@ -9372,6 +9487,55 @@ paths:
                     items:
                       type: string
                       format: uuid
+  /servers/{id}/messages:
+    delete:
+      tags:
+      - Messages
+      summary: Purge messages across a server
+      description: 'Bulk-delete messages across every channel of a server, scoped by
+        a recent-ward time range and an optional target author (#1352). Irreversible.
+
+
+        Authorization is re-resolved PER CHANNEL: channels where the actor lacks
+        `Manage All Messages` (or is denied it by a channel permission override) are
+        skipped rather than purged, and an actor holding only `Manage Own Messages` in
+        a channel purges only their own messages there. If no channel is purgeable the
+        request returns 403 with nothing deleted and no audit row.
+
+
+        Emits one `channel_purged` event per affected channel.
+
+
+        Rate limit: fail-closed per-actor (a rate-limiter outage denies rather than
+        allows).'
+      operationId: purgeServerMessages
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ServerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PurgeMessagesRequest'
+      responses:
+        '200':
+          description: Purge completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PurgeMessagesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Insufficient permissions to purge this server
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
   /servers/{id}:
     get:
       tags:
@@ -14095,6 +14259,83 @@ components:
             type: string
           description: 'Map of user_id → base64 wrapped CSK (required for all channels — every channel
             is E2EE under the E2EE-everywhere posture, #201)'
+    PurgeMessagesRequest:
+      type: object
+      description: Bulk message-purge parameters for server-channel contexts (#1352).
+      required:
+      - range
+      properties:
+        range:
+          type: string
+          description: 'Recent-ward window to purge: messages created within the last
+            N are removed. `all` purges the whole context (no time predicate).'
+          enum:
+          - 1h
+          - 6h
+          - 12h
+          - 1d
+          - 7d
+          - 15d
+          - 30d
+          - 90d
+          - all
+          example: 7d
+        target_user_id:
+          type: string
+          format: uuid
+          description: 'Restrict the purge to one author. Requires `Manage All Messages`;
+            an actor holding only `Manage Own Messages` is forced to their own messages
+            and this field is ignored. Omit to purge all authors.'
+    PurgeDMMessagesRequest:
+      type: object
+      description: Bulk message-purge parameters for DM/group contexts, including the
+        step-up factors (#1352).
+      required:
+      - range
+      properties:
+        range:
+          type: string
+          description: 'Recent-ward window to purge: messages created within the last
+            N are removed. `all` purges the whole conversation (no time predicate).'
+          enum:
+          - 1h
+          - 6h
+          - 12h
+          - 1d
+          - 7d
+          - 15d
+          - 30d
+          - 90d
+          - all
+          example: all
+        current_password:
+          type: string
+          format: password
+          description: Required when the actor's `require_auth_before_purge` privacy
+            setting is enabled (the default). Omitted for passwordless/SSO accounts,
+            which step up with MFA instead.
+        mfa_code:
+          type: string
+          description: TOTP or backup code. Required when the actor has MFA enabled and
+            step-up is in effect.
+    PurgeMessagesResponse:
+      type: object
+      description: Result counts for a completed purge (#1352).
+      required:
+      - deleted_count
+      - hidden_count
+      properties:
+        deleted_count:
+          type: integer
+          minimum: 0
+          description: Messages hard-deleted for all parties.
+          example: 42
+        hidden_count:
+          type: integer
+          minimum: 0
+          description: 'Messages hidden from the actor''s own view only (DM/group
+            receiver-hide). Structurally 0 for channel and server purges.'
+          example: 7
     UpdateChannelRequest:
       type: object
       required:

@@ -128,6 +128,11 @@ func TestLoad(t *testing.T) {
 		assert.Contains(t, cfg.NATSUrl, "nats://")
 		assert.NotEmpty(t, cfg.AllowedOrigins)
 		assert.Equal(t, []string{"172.16.0.0/12"}, cfg.TrustedProxyCIDRs)
+
+		// Message-purge tunables (#1352) default to the lightweight compose values.
+		assert.Equal(t, 5000, cfg.PurgeMaxBatch)
+		assert.Equal(t, 5, cfg.PurgeRateLimit)
+		assert.Equal(t, 3600, cfg.PurgeRateWindowSec)
 	})
 
 	t.Run("env overrides", func(t *testing.T) {

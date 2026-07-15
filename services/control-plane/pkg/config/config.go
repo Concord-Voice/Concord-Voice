@@ -237,6 +237,12 @@ type Config struct {
 	StorageBucket    string // Bucket name for media storage (e.g. "concord-media")
 	UploadMaxSize    int64  // Global max upload size in bytes (default 25 MB)
 
+	// Message-purge engine (#1352). Lightweight compose-only tunables — NOT in
+	// validate()/provision-secrets.yml (won't fatal-exit, won't trip Class-1 drift).
+	PurgeMaxBatch      int // Internal batched-delete stride (default 5000). NOT a cap on total messages.
+	PurgeRateLimit     int // Purge requests per actor per window (default 5)
+	PurgeRateWindowSec int // Purge rate-limit window in seconds (default 3600)
+
 	// KLIPY GIF integration (optional — empty key disables the feature).
 	// SECURITY: this key is server-side ONLY. It is never delivered to clients.
 	// All KLIPY traffic — API calls and GIF media — is proxied through
@@ -368,6 +374,9 @@ func Load() (*Config, error) {
 		StorageUseSSL:               getEnvAlias("STORAGE_USE_SSL", "MINIO_USE_SSL", "false") == "true",
 		StorageBucket:               getEnvAlias("STORAGE_BUCKET", "MINIO_BUCKET", "concord-media"),
 		UploadMaxSize:               getEnvInt64("UPLOAD_MAX_SIZE", 25*1024*1024), // 25 MB default
+		PurgeMaxBatch:               getEnvInt("PURGE_MAX_BATCH", 5000),
+		PurgeRateLimit:              getEnvInt("PURGE_RATE_LIMIT", 5),
+		PurgeRateWindowSec:          getEnvInt("PURGE_RATE_WINDOW_SEC", 3600),
 		KlipyAPIKey:                 getEnv("KLIPY_API_KEY", ""),
 		GitHubFeedback: GitHubFeedbackConfig{
 			// TrimSpace both fields: a trailing newline on the PAT (the common

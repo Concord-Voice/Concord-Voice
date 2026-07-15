@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/purge"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 )
@@ -356,6 +357,12 @@ func (h *Handler) getDMConversationPins(c *gin.Context, conversationID, userID s
 		return
 	}
 
+	// purge.HiddenRangeFilter excludes pins the requester purged-from-view
+	// (#1352 receiver-hide) — a hidden message must not resurface via the pin
+	// list. Concatenated fragment is a compile-time constant; values are
+	// parameterized.
+	//nolint:gosec // G202: concatenated fragment is a compile-time constant; all values parameterized
+	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 	rows, err := h.db.Query(`
 		SELECT dm.id, dm.conversation_id, dm.user_id, dm.content, dm.type,
 		       dm.pinned_at, dm.pinned_by, dm.edited_at, dm.created_at, dm.updated_at,
@@ -363,8 +370,9 @@ func (h *Handler) getDMConversationPins(c *gin.Context, conversationID, userID s
 		FROM dm_messages dm
 		INNER JOIN users u ON dm.user_id = u.id
 		WHERE dm.conversation_id = $1 AND dm.pinned_at IS NOT NULL
+		`+purge.HiddenRangeFilter("dm", 2)+`
 		ORDER BY dm.pinned_at DESC
-	`, conversationID)
+	`, conversationID, userID)
 	if err != nil {
 		h.log.Error(errMsgFetchPinsFailed, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFetchPinsFailed})

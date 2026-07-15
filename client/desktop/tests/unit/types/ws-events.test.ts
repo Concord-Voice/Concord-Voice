@@ -80,6 +80,9 @@ import {
   SessionRevokedSchema,
   ConnectedSchema,
   ConnectionReadySchema,
+  // Message purge (#1352) (2)
+  ChannelPurgedSchema,
+  DmPurgedSchema,
   // Union + scrubber
   WebSocketEventSchema,
   EntitlementsChangedSchema,
@@ -851,6 +854,34 @@ describe('ws-events schemas — happy path (one per event)', () => {
     });
     expect(result.success).toBe(true);
   });
+
+  // ──────────── Message purge (#1352) (2) ──────────────────────────────
+
+  it('ChannelPurgedSchema accepts a canonical channel_purged envelope', () => {
+    const result = WebSocketEventSchema.safeParse({
+      type: 'channel_purged',
+      data: {
+        channel_id: UUID_A,
+        purged_by: UUID_B,
+        deleted_count: 3,
+        range: '7d',
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('DmPurgedSchema accepts a canonical dm_purged envelope', () => {
+    const result = WebSocketEventSchema.safeParse({
+      type: 'dm_purged',
+      data: {
+        conversation_id: UUID_A,
+        purged_by: UUID_B,
+        deleted_count: 0,
+        range: 'all',
+      },
+    });
+    expect(result.success).toBe(true);
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1064,6 +1095,32 @@ describe('ws-events schemas — rejection cases', () => {
     const result = SessionRevokedSchema.safeParse({
       type: 'session_revoked',
       // no data
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('ChannelPurgedSchema rejects a negative deleted_count', () => {
+    const result = ChannelPurgedSchema.safeParse({
+      type: 'channel_purged',
+      data: {
+        channel_id: UUID_A,
+        purged_by: UUID_B,
+        deleted_count: -1,
+        range: '7d',
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('DmPurgedSchema rejects a negative deleted_count', () => {
+    const result = DmPurgedSchema.safeParse({
+      type: 'dm_purged',
+      data: {
+        conversation_id: UUID_A,
+        purged_by: UUID_B,
+        deleted_count: -1,
+        range: 'all',
+      },
     });
     expect(result.success).toBe(false);
   });

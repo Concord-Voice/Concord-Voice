@@ -5109,7 +5109,13 @@ func TestHandleUserDisconnect_CancelsCallerInitiatedRings(t *testing.T) {
 	// router init; we test the HandleUserDisconnect path directly with
 	// a freshly-constructed Handler (the test ts.Hub + ts.DB are the
 	// authoritative path that production wires).
-	h := dm.NewHandler(ts.DB, logger.New("test"), ts.Hub, nil, nil, ts.Redis, entitlements.NewCache(ts.Redis, ts.DB))
+	h := dm.NewHandler(dm.HandlerDeps{
+		DB:       ts.DB,
+		Log:      logger.New("test"),
+		Hub:      ts.Hub,
+		Redis:    ts.Redis,
+		EntCache: entitlements.NewCache(ts.Redis, ts.DB),
+	})
 
 	callerUUID := uuid.MustParse(caller.ID)
 	h.HandleUserDisconnect(callerUUID)
@@ -5135,7 +5141,13 @@ func TestHandleUserDisconnect_IgnoresNonCallerDisconnects(t *testing.T) {
 
 	ringForTest(t, ts, caller, convID)
 
-	h := dm.NewHandler(ts.DB, logger.New("test"), ts.Hub, nil, nil, ts.Redis, entitlements.NewCache(ts.Redis, ts.DB))
+	h := dm.NewHandler(dm.HandlerDeps{
+		DB:       ts.DB,
+		Log:      logger.New("test"),
+		Hub:      ts.Hub,
+		Redis:    ts.Redis,
+		EntCache: entitlements.NewCache(ts.Redis, ts.DB),
+	})
 
 	// Simulate the CALLEE disconnecting — should NOT cancel the ring
 	calleeUUID := uuid.MustParse(callee.ID)
@@ -5459,7 +5471,13 @@ func TestOnRingTimeout_BroadcastsAndInsertsMissedEvent(t *testing.T) {
 	ring := dm.NewPendingCallForTest(convUUID, callerUUID, []uuid.UUID{calleeUUID})
 	dm.StoreRingForTest(convUUID, ring)
 
-	h := dm.NewHandler(ts.DB, logger.New("test"), ts.Hub, nil, nil, ts.Redis, entitlements.NewCache(ts.Redis, ts.DB))
+	h := dm.NewHandler(dm.HandlerDeps{
+		DB:       ts.DB,
+		Log:      logger.New("test"),
+		Hub:      ts.Hub,
+		Redis:    ts.Redis,
+		EntCache: entitlements.NewCache(ts.Redis, ts.DB),
+	})
 	dm.HandlerOnRingTimeoutForTest(h, convUUID, ring)
 
 	assert.False(t, dm.PendingDMCallExistsForTest(convUUID), "ring cleared after timeout")
@@ -5492,7 +5510,13 @@ func TestOnRingTimeout_OrphanedTimer_NoOp(t *testing.T) {
 	activeRing := dm.NewPendingCallForTest(convUUID, callerUUID, []uuid.UUID{calleeUUID})
 	dm.StoreRingForTest(convUUID, activeRing)
 
-	h := dm.NewHandler(ts.DB, logger.New("test"), ts.Hub, nil, nil, ts.Redis, entitlements.NewCache(ts.Redis, ts.DB))
+	h := dm.NewHandler(dm.HandlerDeps{
+		DB:       ts.DB,
+		Log:      logger.New("test"),
+		Hub:      ts.Hub,
+		Redis:    ts.Redis,
+		EntCache: entitlements.NewCache(ts.Redis, ts.DB),
+	})
 	dm.HandlerOnRingTimeoutForTest(h, convUUID, staleRing)
 
 	// Active ring still present (orphaned timer should not have deleted it).

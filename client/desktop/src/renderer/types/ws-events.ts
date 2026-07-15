@@ -12,7 +12,7 @@
  * arrives from the server), while `chat.ts` defines APPLICATION models (what
  * stores hold). Handlers in useWebSocketMessages.ts transform wire → app.
  *
- * 66 schemas total: 64 subscriber events (handled via wsService.on) + 2
+ * 68 schemas total: 66 subscriber events (handled via wsService.on) + 2
  * envelope-only events (connected, connection_ready) consumed internally
  * by wsService.handleMessage's switch — both must be in the union so that
  * the post-safeParse code accesses message.data fields without `as` casts.
@@ -1364,8 +1364,42 @@ export const ConnectionReadySchema = z.object({
   data: z.object({}),
 });
 
+// ──────────── Message purge (#1352) — 2 events ───────────────────────────
+
+/**
+ * `channel_purged` — bulk message deletion completed for a channel.
+ * Server emitter: `services/control-plane/internal/messages/handlers.go`
+ * (`emitChannelPurged` → `channel_purged`, one event per affected channel).
+ * Carries counts + range only — NO message content.
+ */
+export const ChannelPurgedSchema = z.object({
+  type: z.literal('channel_purged'),
+  data: z.object({
+    channel_id: UUID,
+    purged_by: UUID,
+    deleted_count: z.number().int().nonnegative(),
+    range: z.string(), // "1h".."90d" | "all"
+  }),
+});
+
+/**
+ * `dm_purged` — bulk message deletion completed for a DM/group conversation.
+ * Server emitter: `services/control-plane/internal/dm/handlers.go`
+ * (`emitDMPurged` → `dm_purged`; broadcast to participants + actor's own
+ * sessions for multi-device). Carries counts + range only — NO message content.
+ */
+export const DmPurgedSchema = z.object({
+  type: z.literal('dm_purged'),
+  data: z.object({
+    conversation_id: UUID,
+    purged_by: UUID,
+    deleted_count: z.number().int().nonnegative(),
+    range: z.string(), // "1h".."90d" | "all"
+  }),
+});
+
 // ════════════════════════════════════════════════════════════════════════
-// 4. The discriminated union (66 schemas: 64 subscriber + 2 envelope)
+// 4. The discriminated union (68 schemas: 66 subscriber + 2 envelope)
 // ════════════════════════════════════════════════════════════════════════
 
 export const WebSocketEventSchema = z.discriminatedUnion('type', [
@@ -1450,6 +1484,10 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   // Entitlements (1)
   EntitlementsChangedSchema,
 
+  // Message purge (#1352) (2)
+  ChannelPurgedSchema,
+  DmPurgedSchema,
+
   // System + envelope (5: 3 subscriber + 2 envelope-only)
   SubscribedSchema,
   ErrorSchema,
@@ -1457,7 +1495,7 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   ConnectedSchema,
   ConnectionReadySchema,
 ]);
-// TOTAL: 66 schemas (64 subscriber + 2 envelope-only)
+// TOTAL: 68 schemas (66 subscriber + 2 envelope-only; +channel_purged/dm_purged #1352)
 
 // ════════════════════════════════════════════════════════════════════════
 // 5. Derived types
@@ -1555,6 +1593,10 @@ export type PresenceOverridesUpdatedPayload = z.infer<
 
 // Entitlements
 export type EntitlementsChangedPayload = z.infer<typeof EntitlementsChangedSchema>['data'];
+
+// Message purge (#1352)
+export type ChannelPurgedPayload = z.infer<typeof ChannelPurgedSchema>['data'];
+export type DmPurgedPayload = z.infer<typeof DmPurgedSchema>['data'];
 
 // System + envelope
 export type SubscribedPayload = z.infer<typeof SubscribedSchema>['data'];

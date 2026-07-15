@@ -17,6 +17,7 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/klipy"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/purge"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
@@ -55,12 +56,13 @@ func isValidCiphertext(content string) bool {
 
 // Handler handles message-related requests
 type Handler struct {
-	db       *sql.DB
-	log      *logger.Logger
-	hub      *websocket.Hub
-	resolver *rbac.Resolver
-	tiers    entitlements.TierResolver // user-axis tier resolution (#1555 search-depth gate)
-	ops      OpsCounter
+	db          *sql.DB
+	log         *logger.Logger
+	hub         *websocket.Hub
+	resolver    *rbac.Resolver
+	tiers       entitlements.TierResolver // user-axis tier resolution (#1555 search-depth gate)
+	purgeEngine *purge.Engine             // bulk message purge (#1352)
+	ops         OpsCounter
 }
 
 // OpsCounter is the optional aggregate counter sink used after committed writes.
@@ -72,14 +74,17 @@ type epochQueryRower interface {
 	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
 }
 
-// NewHandler creates a new message handler
-func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, tiers entitlements.TierResolver, opsCounters ...OpsCounter) *Handler {
+// NewHandler creates a new message handler. purgeEngine backs the bulk-purge
+// endpoints (#1352); opsCounters stays variadic (main's #1689 shape) so it
+// remains optional for callers that do not report aggregate metrics.
+func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rbac.Resolver, tiers entitlements.TierResolver, purgeEngine *purge.Engine, opsCounters ...OpsCounter) *Handler {
 	handler := &Handler{
-		db:       db,
-		log:      log,
-		hub:      hub,
-		resolver: resolver,
-		tiers:    tiers,
+		db:          db,
+		log:         log,
+		hub:         hub,
+		resolver:    resolver,
+		tiers:       tiers,
+		purgeEngine: purgeEngine,
 	}
 	if len(opsCounters) > 0 {
 		handler.ops = opsCounters[0]

@@ -30,6 +30,7 @@ import (
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/ownership"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/purge"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/servercapabilities"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/servers"
@@ -101,6 +102,40 @@ func configureTrustedProxies(router *gin.Engine, cfg *config.Config, log *logger
 // — while staying bounded (not unlimited) to retain a sanity ceiling against a
 // runaway test loop.
 const testEnvAuthFlowCap = 10000
+
+// Fallback purge rate-limit values (#1352), matching the config.Load() defaults for
+// PURGE_RATE_LIMIT / PURGE_RATE_WINDOW_SEC. Applied when a hand-built Config leaves
+// them at Go's zero value, which RateLimitByUserFailClosed would otherwise read as
+// "allow 0 requests" and reject every purge with 429.
+const (
+	defaultPurgeRateLimit  = 5
+	defaultPurgeRateWindow = time.Hour
+)
+
+// NOTE: the ":id"-scoped "/:id/messages" sub-path is registered as a repeated string
+// literal under the server, channel, and DM groups rather than extracted to a shared
+// constant. scripts/api/check-openapi-coverage.sh parses route registrations
+// textually and cannot resolve a path constant — extracting one makes the scanner
+// report every affected route (including the pre-existing GETs) as missing from the
+// router, breaking the OpenAPI coverage gate. The duplication is required by that
+// tooling; do not "fix" it. See the SonarQube FP register (go:S1192, router.go).
+
+// resolvePurgeRateLimit returns the per-actor purge rate limit and window, falling
+// back to the Load() defaults when the Config was hand-built without them (tests,
+// embedders). A zero limit or window is NOT "unlimited" — the fail-closed limiter
+// reads it as "allow 0 requests" and rejects every purge with 429, bricking the
+// endpoints. Mirrors the purge.NewEngine maxBatch guard.
+func resolvePurgeRateLimit(cfg *config.Config) (int, time.Duration) {
+	limit := cfg.PurgeRateLimit
+	if limit <= 0 {
+		limit = defaultPurgeRateLimit
+	}
+	window := time.Duration(cfg.PurgeRateWindowSec) * time.Second
+	if window <= 0 {
+		window = defaultPurgeRateWindow
+	}
+	return limit, window
+}
 
 // authFlowTestRateLimit returns the per-IP request cap for an auth-flow route
 // (POST /register, /register/confirm, /login). Under CONCORD_ENV=test it relaxes
@@ -270,7 +305,16 @@ func NewRouter(
 	// A kick/leave/ban deletes membership but leaves any voice participant on its
 	// join-time snapshot — recheck evicts them from the room (CV-CAN-007 P1).
 	membersHandler.SetVoiceEnforcer(voicePermEnforcer)
-	messagesHandler := messages.NewHandler(db, log, hub, rbacResolver, entCache, opsCounters)
+	// Message-purge engine (#1352): batched bulk delete + attachment reaper.
+	// The reaper's worker + straggler sweeper are process-lifetime background
+	// loops, started here like hub.Run above.
+	purgeReaper := purge.NewReaper(db, log, store)
+	purgeEngine := purge.NewEngine(db, log, purgeReaper, cfg.PurgeMaxBatch)
+	go purgeReaper.StartWorker(context.Background())
+	go purgeReaper.SweepStragglers(context.Background())
+
+	purgeRateLimit, purgeRateWindow := resolvePurgeRateLimit(cfg)
+	messagesHandler := messages.NewHandler(db, log, hub, rbacResolver, entCache, purgeEngine, opsCounters)
 	invitesHandler := invites.NewHandler(db, log, hub, rbacResolver)
 	voiceHandler := voice.NewHandler(voice.HandlerDeps{
 		DB:          db,
@@ -283,7 +327,18 @@ func NewRouter(
 		EntCache:    entCache,
 		ServerTiers: serverEntCache,
 	})
-	dmHandler := dm.NewHandler(db, log, hub, cfg, natsClient, redis, entCache)
+	// mfaHandler implements mfa.Verifier — the DM purge step-up gate (#1352).
+	dmHandler := dm.NewHandler(dm.HandlerDeps{
+		DB:          db,
+		Log:         log,
+		Hub:         hub,
+		Cfg:         cfg,
+		NATS:        natsClient,
+		Redis:       redis,
+		EntCache:    entCache,
+		PurgeEngine: purgeEngine,
+		MFAVerifier: mfaHandler,
+	})
 	// Wire DM voice ring cleanup-on-disconnect (#1209 plan task B7 Part 2).
 	// When a user's last WS connection drops, the hub invokes
 	// HandleUserDisconnect to cancel any rings they initiated.
@@ -1102,6 +1157,14 @@ func NewRouter(
 					serversHandler.ListServers,
 				)
 
+				// Server-wide bulk message purge (#1352) — destructive; fail-CLOSED
+				// rate limit. Authorization is re-resolved per channel inside the
+				// handler (channel-scoped denies are honored — review finding M1).
+				serverRoutes.DELETE("/:id/messages",
+					middleware.RateLimitByUserFailClosed(redis, purgeRateLimit, purgeRateWindow),
+					messagesHandler.PurgeServer,
+				)
+
 				// Get unread status across all user's servers (30 requests per minute)
 				serverRoutes.GET("/unread-status",
 					middleware.RateLimitByUser(redis, 30, 1*time.Minute),
@@ -1387,6 +1450,13 @@ func NewRouter(
 					channelsHandler.CreateChannel,
 				)
 
+				// Bulk message purge (#1352) — destructive; fail-CLOSED rate limit
+				// (Redis error denies rather than allows).
+				channelRoutes.DELETE("/:id/messages",
+					middleware.RateLimitByUserFailClosed(redis, purgeRateLimit, purgeRateWindow),
+					messagesHandler.PurgeChannel,
+				)
+
 				// Get specific channel (30 requests per minute)
 				channelRoutes.GET("/:id",
 					middleware.RateLimitByUser(redis, 30, 1*time.Minute),
@@ -1648,6 +1718,14 @@ func NewRouter(
 				dmRoutes.GET("",
 					middleware.RateLimitByUser(redis, 30, 1*time.Minute),
 					dmHandler.ListConversations,
+				)
+
+				// Bulk DM/group purge (#1352) — destructive; fail-CLOSED rate limit.
+				// Step-up auth (password/MFA) enforced in-handler per the actor's
+				// require_auth_before_purge privacy setting.
+				dmRoutes.DELETE("/:id/messages",
+					middleware.RateLimitByUserFailClosed(redis, purgeRateLimit, purgeRateWindow),
+					dmHandler.PurgeConversation,
 				)
 
 				// Open/get-or-create 1:1 DM conversation (10 requests per minute)

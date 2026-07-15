@@ -48,7 +48,7 @@ func exerciseOpsMessageHandler(t *testing.T, ts *testhelpers.TestServer, counter
 	t.Helper()
 	log := logger.New("test")
 	resolver := rbac.NewResolver(ts.DB, rbac.NewPermissionCache(ts.Redis), log)
-	handler := messages.NewHandler(ts.DB, log, ts.Hub, resolver, nil, counter)
+	handler := messages.NewHandler(ts.DB, log, ts.Hub, resolver, nil, nil, counter)
 	router := gin.New()
 	router.POST("/messages", func(c *gin.Context) {
 		c.Set("user_id", userID)

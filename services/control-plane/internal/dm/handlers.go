@@ -16,8 +16,10 @@ import (
 	"github.com/lib/pq"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 	messagehandlers "github.com/markdrogersjr/Concord/services/control-plane/internal/messages"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/mfa"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/purge"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
 	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
@@ -78,32 +80,54 @@ const (
 
 // Handler handles DM-related requests.
 type Handler struct {
-	db       *sql.DB
-	log      *logger.Logger
-	hub      *websocket.Hub
-	cfg      *config.Config
-	nats     *natsclient.Client
-	redis    *redis.Client
-	entCache *entitlements.Cache
+	db          *sql.DB
+	log         *logger.Logger
+	hub         *websocket.Hub
+	cfg         *config.Config
+	nats        *natsclient.Client
+	redis       *redis.Client
+	entCache    *entitlements.Cache
+	purgeEngine *purge.Engine // bulk message purge (#1352)
+	mfaVerifier mfa.Verifier  // step-up auth for DM/group purge (#1352)
 }
 
 type epochQueryRower interface {
 	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
 }
 
-// NewHandler creates a new DM handler. entCache is the shared entitlement-tier
-// cache (#1296) used to resolve the joining user's media entitlements for DM
-// voice joins (#1300); production wiring passes the same instance the auth and
-// voice handlers receive.
-func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, cfg *config.Config, nats *natsclient.Client, redis *redis.Client, entCache *entitlements.Cache) *Handler {
+// HandlerDeps bundles the DM handler's dependencies. Mirrors the voice/ownership
+// HandlerDeps convention: the dependency list outgrew a positional signature when
+// the bulk-purge engine and its step-up verifier were added (#1352).
+type HandlerDeps struct {
+	DB  *sql.DB
+	Log *logger.Logger
+	Hub *websocket.Hub
+	Cfg *config.Config
+	// NATS may be nil in tests.
+	NATS  *natsclient.Client
+	Redis *redis.Client
+	// EntCache is the shared entitlement-tier cache (#1296) used to resolve the
+	// joining user's media entitlements for DM voice joins (#1300); production
+	// wiring passes the same instance the auth and voice handlers receive.
+	EntCache *entitlements.Cache
+	// PurgeEngine + MFAVerifier back the DM/group bulk purge and its step-up
+	// gate (#1352). Both may be nil in tests that do not exercise purge.
+	PurgeEngine *purge.Engine
+	MFAVerifier mfa.Verifier
+}
+
+// NewHandler creates a new DM handler from its dependency bundle.
+func NewHandler(deps HandlerDeps) *Handler {
 	return &Handler{
-		db:       db,
-		log:      log,
-		hub:      hub,
-		cfg:      cfg,
-		nats:     nats,
-		redis:    redis,
-		entCache: entCache,
+		db:          deps.DB,
+		log:         deps.Log,
+		hub:         deps.Hub,
+		cfg:         deps.Cfg,
+		nats:        deps.NATS,
+		redis:       deps.Redis,
+		entCache:    deps.EntCache,
+		purgeEngine: deps.PurgeEngine,
+		mfaVerifier: deps.MFAVerifier,
 	}
 }
 
@@ -219,20 +243,29 @@ func (h *Handler) ListConversations(c *gin.Context) {
 }
 
 func (h *Handler) queryConversations(userID string) ([]conversationResponse, []string, error) {
+	// Both dm_messages subqueries carry hiddenRangeFilter so a receiver-hidden
+	// message (#1352) neither surfaces as the list preview nor inflates the
+	// unread badge for the user who hid it. The concatenated fragment is a
+	// compile-time constant (hardcoded alias + integer placeholder position);
+	// all VALUES are parameterized.
+	//nolint:gosec // G202: concatenated fragment is a compile-time constant (hardcoded alias + integer placeholder); all values parameterized
+	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 	query := `
 		SELECT dc.id, dc.is_group, dc.is_personal, dc.name, dc.icon_url, dc.created_by, dc.created_at,
 		       dm.content, dm.created_at, dm.user_id, dm.type, dm.call_event_payload,
-		       (SELECT COUNT(*) FROM dm_messages
-		        WHERE conversation_id = dc.id
-		          AND created_at > COALESCE(drs.last_read_at, '1970-01-01')
-		          AND user_id != $1
+		       (SELECT COUNT(*) FROM dm_messages m
+		        WHERE m.conversation_id = dc.id
+		          AND m.created_at > COALESCE(drs.last_read_at, '1970-01-01')
+		          AND m.user_id != $1
+		        ` + hiddenRangeFilter(1) + `
 		       ) AS unread_count
 		FROM dm_conversations dc
 		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $1
 		LEFT JOIN dm_read_states drs ON drs.conversation_id = dc.id AND drs.user_id = $1
 		LEFT JOIN LATERAL (
-		    SELECT content, created_at, user_id, type, call_event_payload FROM dm_messages
-		    WHERE conversation_id = dc.id ORDER BY created_at DESC LIMIT 1
+		    SELECT m.content, m.created_at, m.user_id, m.type, m.call_event_payload FROM dm_messages m
+		    WHERE m.conversation_id = dc.id ` + hiddenRangeFilter(1) + `
+		    ORDER BY m.created_at DESC LIMIT 1
 		) dm ON TRUE
 		ORDER BY COALESCE(dm.created_at, dc.created_at) DESC
 	`
@@ -374,7 +407,7 @@ func (h *Handler) OpenConversation(c *gin.Context) {
 	h.log.Info("DM conversation created", "conversation_id", convID, "user_id", userID, "target", req.UserID)
 	h.notifyDMCreated(convID, req.UserID)
 
-	conv := h.fetchConversationResponse(convID)
+	conv := h.fetchConversationResponse(convID, userID)
 	c.JSON(http.StatusCreated, gin.H{"conversation": conv})
 }
 
@@ -510,7 +543,7 @@ func (h *Handler) returnExistingConversation(c *gin.Context, userID, targetUserI
 	`, userID, targetUserID).Scan(&existingID)
 
 	if err == nil {
-		conv := h.fetchConversationResponse(existingID)
+		conv := h.fetchConversationResponse(existingID, userID)
 		if conv != nil {
 			c.JSON(http.StatusOK, gin.H{"conversation": conv})
 			return true
@@ -565,7 +598,7 @@ func (h *Handler) notifyDMCreated(convID, targetUserID string) {
 	if parseErr != nil {
 		return
 	}
-	conv := h.fetchConversationResponse(convID)
+	conv := h.fetchConversationResponse(convID, targetUserID)
 	if conv == nil {
 		return
 	}
@@ -629,7 +662,7 @@ func (h *Handler) CreateGroup(c *gin.Context) {
 	h.log.Info("Group DM created", "conversation_id", convID, "user_id", userID, "members", len(allUserIDs))
 	h.notifyGroupCreated(convID, req.UserIDs)
 
-	conv := h.fetchConversationResponse(convID)
+	conv := h.fetchConversationResponse(convID, userID)
 	c.JSON(http.StatusCreated, gin.H{"conversation": conv})
 }
 
@@ -704,7 +737,7 @@ func (h *Handler) notifyGroupCreated(convID string, memberIDs []string) {
 		if parseErr != nil {
 			continue
 		}
-		conv := h.fetchConversationResponse(convID)
+		conv := h.fetchConversationResponse(convID, uid)
 		if conv == nil {
 			continue
 		}
@@ -734,7 +767,7 @@ func (h *Handler) GetConversation(c *gin.Context) {
 		return
 	}
 
-	conv := h.fetchConversationResponse(convID)
+	conv := h.fetchConversationResponse(convID, userID)
 	if conv == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Conversation not found"})
 		return
@@ -903,7 +936,7 @@ func (h *Handler) AddMember(c *gin.Context) {
 	// Broadcast events
 	h.broadcastMemberAdded(convID, req.UserID, userID, maxVersion)
 
-	conv := h.fetchConversationResponse(convID)
+	conv := h.fetchConversationResponse(convID, userID)
 	c.JSON(http.StatusOK, gin.H{"conversation": conv})
 }
 
@@ -970,7 +1003,7 @@ func (h *Handler) broadcastMemberAdded(convID, targetUserID, callerUserID string
 
 	// Notify the new member with the full conversation
 	if targetUUID, parseErr := uuid.Parse(targetUserID); parseErr == nil {
-		conv := h.fetchConversationResponse(convID)
+		conv := h.fetchConversationResponse(convID, targetUserID)
 		if conv != nil {
 			h.hub.BroadcastToUser(targetUUID, websocket.OutgoingMessage{
 				Type: "dm_conversation_created",
@@ -1252,6 +1285,11 @@ func (h *Handler) GetMessages(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid cursor"})
 			return
 		}
+		// hiddenRangeFilter excludes messages this user purged-from-view (#1352
+		// receiver-hide). The concatenated fragment is a compile-time constant;
+		// all VALUES are parameterized.
+		//nolint:gosec // G202: concatenated fragment is a compile-time constant; all values parameterized
+		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 		rows, err = h.db.Query(`
 			SELECT m.id, m.conversation_id, m.user_id, m.content, m.type, m.call_event_payload, COALESCE(m.key_version, 1),
 			       m.edited_at, m.created_at,
@@ -1260,10 +1298,13 @@ func (h *Handler) GetMessages(c *gin.Context) {
 			INNER JOIN users u ON u.id = m.user_id
 			WHERE m.conversation_id = $1
 			  AND m.created_at < (SELECT created_at FROM dm_messages WHERE id = $2)
+			`+hiddenRangeFilter(4)+`
 			ORDER BY m.created_at DESC
 			LIMIT $3
-		`, convID, cursor, limit)
+		`, convID, cursor, limit, userID)
 	} else {
+		//nolint:gosec // G202: concatenated fragment is a compile-time constant; all values parameterized
+		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 		rows, err = h.db.Query(`
 			SELECT m.id, m.conversation_id, m.user_id, m.content, m.type, m.call_event_payload, COALESCE(m.key_version, 1),
 			       m.edited_at, m.created_at,
@@ -1271,9 +1312,10 @@ func (h *Handler) GetMessages(c *gin.Context) {
 			FROM dm_messages m
 			INNER JOIN users u ON u.id = m.user_id
 			WHERE m.conversation_id = $1
+			`+hiddenRangeFilter(3)+`
 			ORDER BY m.created_at DESC
 			LIMIT $2
-		`, convID, limit)
+		`, convID, limit, userID)
 	}
 	if err != nil {
 		h.log.Error("Failed to query DM messages", "error", err)
@@ -1924,7 +1966,7 @@ func (h *Handler) GetOrCreatePersonalThread(c *gin.Context) {
 	`, userID).Scan(&existingID)
 
 	if err == nil {
-		conv := h.fetchConversationResponse(existingID)
+		conv := h.fetchConversationResponse(existingID, userID)
 		if conv != nil {
 			c.JSON(http.StatusOK, gin.H{"conversation": conv})
 			return
@@ -1975,7 +2017,7 @@ func (h *Handler) GetOrCreatePersonalThread(c *gin.Context) {
 
 	h.log.Info("Personal thread created", "conversation_id", convID, "user_id", userID)
 
-	conv := h.fetchConversationResponse(convID)
+	conv := h.fetchConversationResponse(convID, userID)
 	c.JSON(http.StatusCreated, gin.H{"conversation": conv})
 }
 
@@ -1991,7 +2033,12 @@ func (h *Handler) isParticipant(convID, userID string) bool {
 }
 
 // fetchConversationResponse builds a full conversation response with participants.
-func (h *Handler) fetchConversationResponse(convID string) *conversationResponse {
+// viewerID scopes the last-message preview through the receiver-hide filter (#1352):
+// a message the viewer purged-from-view must not resurface as the preview. Call
+// sites pass the acting user; recipients of any broadcast copy re-fetch through
+// their own filtered reads.
+// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
+func (h *Handler) fetchConversationResponse(convID, viewerID string) *conversationResponse {
 	var conv conversationResponse
 	var lmContent, lmCreatedAt, lmUserID, lmType sql.NullString
 	var lmCallEventPayload []byte
@@ -2000,11 +2047,12 @@ func (h *Handler) fetchConversationResponse(convID string) *conversationResponse
 		       dm.content, dm.created_at, dm.user_id, dm.type, dm.call_event_payload
 		FROM dm_conversations dc
 		LEFT JOIN LATERAL (
-		    SELECT content, created_at, user_id, type, call_event_payload FROM dm_messages
-		    WHERE conversation_id = dc.id ORDER BY created_at DESC LIMIT 1
+		    SELECT m.content, m.created_at, m.user_id, m.type, m.call_event_payload FROM dm_messages m
+		    WHERE m.conversation_id = dc.id `+hiddenRangeFilter(2)+`
+		    ORDER BY m.created_at DESC LIMIT 1
 		) dm ON TRUE
 		WHERE dc.id = $1
-	`, convID).Scan(
+	`, convID, viewerID).Scan(
 		&conv.ID, &conv.IsGroup, &conv.IsPersonal, &conv.Name, &conv.IconURL, &conv.CreatedBy, &conv.CreatedAt,
 		&lmContent, &lmCreatedAt, &lmUserID, &lmType, &lmCallEventPayload,
 	)
