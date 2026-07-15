@@ -164,6 +164,65 @@ func TestBeginForcedSecurityClearAfterAcknowledgedOperationUsesMappedAudience(t 
 	assert.True(t, result.Plan.ClearRecipients[viewerID])
 }
 
+func TestPrepareForcedClearAudience_MasterAlreadyOffSkipsAudienceLookup(t *testing.T) {
+	recipients, err := prepareForcedClearAudience(context.Background(), nil, AudienceOperation{
+		SenderID:            uuid.New(),
+		BeforeMasterEnabled: false,
+		BeforeTier:          2,
+		Before:              CustomTextState{Text: "saved but disabled"},
+	})
+
+	require.NoError(t, err)
+	assert.NotNil(t, recipients)
+	assert.Empty(t, recipients)
+}
+
+func TestBeginForcedSecurityClear_MasterAlreadyOffStillDestroysSavedStatus(t *testing.T) {
+	ts := setupPresenceHistoryTestServer(t)
+	senderID := uuid.MustParse(ts.CreateTestUser(t, "forcedmasteroff").ID)
+	disclosure := BuildDisclosure(DisclosureOptions{InstanceType: "saas"})
+	enableHistory(t, ts.DB, senderID, disclosure, 30)
+	_, err := ts.DB.Exec(`
+		UPDATE user_presence_settings
+		SET master_enabled = FALSE,
+		    custom_text_tier = 2,
+		    custom_text = 'saved but compromised',
+		    custom_text_emoji = 'lock'
+		WHERE user_id = $1
+	`, senderID)
+	require.NoError(t, err)
+	require.NoError(t, recordAndCommit(
+		t, NewRepository(ts.DB, disclosure), senderID,
+		CustomTextState{}, CustomTextState{Text: "saved but compromised", Emoji: "lock"},
+	))
+	assert.Equal(t, 1, openHistoryRowCount(t, ts.DB, senderID))
+	service := NewService(ts.DB, disclosure, true)
+	tx, err := service.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+
+	result, err := service.BeginForcedSecurityClear(context.Background(), tx, senderID)
+	require.NoError(t, err)
+	require.NoError(t, service.CommitTx(tx))
+	assert.False(t, result.Operation.BeforeMasterEnabled)
+	assert.NotNil(t, result.Plan.ClearRecipients)
+	assert.Empty(t, result.Plan.ClearRecipients)
+	assert.NotNil(t, result.Plan.UpdateRecipients)
+	assert.Empty(t, result.Plan.UpdateRecipients)
+	var master bool
+	var tier int
+	var text, emoji sql.NullString
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT master_enabled, custom_text_tier, custom_text, custom_text_emoji
+		FROM user_presence_settings WHERE user_id = $1
+	`, senderID).Scan(&master, &tier, &text, &emoji))
+	assert.False(t, master)
+	assert.Zero(t, tier)
+	assert.False(t, text.Valid)
+	assert.False(t, emoji.Valid)
+	assert.Equal(t, 1, historyRowCount(t, ts.DB, senderID))
+	assert.Zero(t, openHistoryRowCount(t, ts.DB, senderID), "destructive recovery must archive the open status")
+}
+
 func TestWithReadySenderModeAllowsForcedSupersessionOfUnexpiredMarker(t *testing.T) {
 	ts := setupPresenceHistoryTestServer(t)
 	senderID := uuid.MustParse(ts.CreateTestUser(t, "forcedready").ID)

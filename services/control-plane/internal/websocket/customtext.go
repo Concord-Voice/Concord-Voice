@@ -452,8 +452,8 @@ func marshalCustomTextFrame(senderID uuid.UUID, payload *CustomTextPayload) ([]b
 //
 // Called from the client's tracked async registration lifecycle, never the Hub
 // Run goroutine. Each candidate's final authorization read + enqueue holds the
-// same concrete presencehistory.Service sender gate as writers, so a stale
-// snapshot update cannot follow a newer committed delivery.
+// local sender gate and a shared settings-row lock, so a stale snapshot update
+// cannot follow a newer committed delivery from this or another service.
 func (h *Hub) sendCustomTextSnapshot(ctx context.Context, client *Client) {
 	if h.db == nil || h.presenceHistoryService == nil {
 		return // DB-free unit hub: nothing to snapshot, fail-safe
@@ -510,7 +510,6 @@ func (h *Hub) sendCustomTextSnapshotCandidate(
 ) (returnErr error) {
 	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelRepeatableRead,
-		ReadOnly:  true,
 	})
 	if err != nil {
 		return fmt.Errorf("begin Custom Status snapshot transaction: %w", err)
@@ -525,10 +524,13 @@ func (h *Hub) sendCustomTextSnapshotCandidate(
 	if !authorized {
 		return nil
 	}
+	if err := h.enqueueCustomTextSnapshot(ctx, client, senderID, payload); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit Custom Status snapshot transaction: %w", err)
 	}
-	return h.enqueueCustomTextSnapshot(ctx, client, senderID, payload)
+	return nil
 }
 
 func mergeCustomTextSnapshotRollback(tx *sql.Tx, returnErr *error) {
@@ -547,10 +549,12 @@ func (h *Hub) readCustomTextSnapshotCandidate(
 	viewerID uuid.UUID,
 	senderID uuid.UUID,
 ) (*CustomTextPayload, bool, error) {
+	var masterEnabled bool
 	var tier int
 	var text, emoji sql.NullString
 	err := tx.QueryRowContext(ctx, `
-		SELECT settings.custom_text_tier,
+		SELECT settings.master_enabled,
+		       settings.custom_text_tier,
 		       settings.custom_text,
 		       settings.custom_text_emoji
 		FROM user_presence_settings AS settings
@@ -560,12 +564,16 @@ func (h *Hub) readCustomTextSnapshotCandidate(
 		      FROM presence_settings_pending_operations AS pending
 		      WHERE pending.user_id = settings.user_id
 		  )
-	`, senderID).Scan(&tier, &text, &emoji)
+		FOR SHARE OF settings
+	`, senderID).Scan(&masterEnabled, &tier, &text, &emoji)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("read Custom Status snapshot state: %w", err)
+	}
+	if !masterEnabled {
+		return nil, false, nil
 	}
 	if h.customTextSnapshotAfterStateRead != nil {
 		h.customTextSnapshotAfterStateRead(senderID, viewerID)
@@ -627,7 +635,8 @@ func (h *Hub) customTextCandidates(
 	rows, err := h.db.QueryContext(ctx, `
 		SELECT settings.user_id
 		FROM user_presence_settings AS settings
-		WHERE settings.custom_text_tier > 0
+		WHERE settings.master_enabled
+		  AND settings.custom_text_tier > 0
 		  AND settings.custom_text IS NOT NULL
 		  AND NOT EXISTS (
 		      SELECT 1

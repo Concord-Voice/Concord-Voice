@@ -124,6 +124,112 @@ func TestPresenceWritersSerializeAcrossServicesThroughClaimAcknowledgement(t *te
 	}
 }
 
+func TestPresenceWritersSerializeMasterOffAcrossServices(t *testing.T) {
+	db, _ := testhelpers.SetupTestDB(t)
+	senderID := testhelpers.CreateUser(t, db)
+	viewerID := testhelpers.CreateUser(t, db)
+	testhelpers.AddFriendship(t, db, senderID, viewerID)
+	_, err := db.Exec(`
+		INSERT INTO user_presence_settings (user_id, custom_text_tier, custom_text)
+		VALUES ($1, 1, 'visible before concurrent updates')
+	`, senderID)
+	require.NoError(t, err)
+
+	firstDelivery := &gatedPresenceDelivery{
+		entered: make(chan presencehistory.DeliveryPlan, 1),
+		release: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	releaseFirstDelivery := func() {
+		releaseOnce.Do(func() { close(firstDelivery.release) })
+	}
+	t.Cleanup(releaseFirstDelivery)
+	firstPIDs := make(chan int, 8)
+	secondPIDs := make(chan int, 8)
+	firstHandler, firstService := newConcurrencyHandler(t, db, firstDelivery)
+	finalDelivery := &task9Delivery{}
+	secondHandler, secondService := newConcurrencyHandler(t, db, finalDelivery)
+	restoreFirst := firstService.SetTransactionTestHooks(presencehistory.TransactionTestHooks{
+		Begin: beginConcurrencyTxWithPID(db, firstPIDs),
+	})
+	defer restoreFirst()
+	restoreSecond := secondService.SetTransactionTestHooks(presencehistory.TransactionTestHooks{
+		Begin: beginConcurrencyTxWithPID(db, secondPIDs),
+	})
+	defer restoreSecond()
+
+	firstDone := make(chan int, 1)
+	go func() {
+		firstDone <- invokePresenceSettingsPATCH(firstHandler, senderID, map[string]interface{}{
+			"custom_text": "ordinary write before master-off",
+		}).Code
+	}()
+
+	var firstPlan presencehistory.DeliveryPlan
+	select {
+	case firstPlan = <-firstDelivery.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("ordinary writer never reached acknowledged delivery")
+	}
+	assert.Equal(t, presencehistory.DeliveryExactDelta, firstPlan.Mode)
+	firstClaimPID := latestConcurrencyBackendPID(t, firstPIDs)
+
+	var firstVersion int64
+	var firstOperationID uuid.UUID
+	var pending int
+	require.NoError(t, db.QueryRow(`
+		SELECT presence_settings_version, presence_settings_operation_id
+		FROM user_presence_settings WHERE user_id = $1
+	`, senderID).Scan(&firstVersion, &firstOperationID))
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM presence_settings_pending_operations WHERE user_id = $1`, senderID,
+	).Scan(&pending))
+	assert.Equal(t, int64(1), firstVersion)
+	assert.Equal(t, firstPlan.OperationID, firstOperationID)
+	assert.Equal(t, 1, pending)
+
+	secondDone := make(chan int, 1)
+	go func() {
+		secondDone <- invokePresenceSettingsPATCH(secondHandler, senderID, map[string]interface{}{
+			"master_enabled": false,
+		}).Code
+	}()
+	secondPID := waitForConcurrencyBackendPID(t, secondPIDs)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	blockedPID := waitForBlockedConcurrencyBackend(ctx, t, db, firstClaimPID)
+	require.Equal(t, secondPID, blockedPID, "master-off writer must wait on the first delivery claim")
+	assertWriterStillBlocked(t, secondDone, "master-off escaped sender serialization")
+
+	releaseFirstDelivery()
+	assertWriterStatus(t, firstDone, http.StatusOK)
+	assertWriterStatus(t, secondDone, http.StatusOK)
+
+	var masterEnabled bool
+	var finalVersion int64
+	var finalOperationID uuid.UUID
+	require.NoError(t, db.QueryRow(`
+		SELECT master_enabled, presence_settings_version, presence_settings_operation_id
+		FROM user_presence_settings WHERE user_id = $1
+	`, senderID).Scan(&masterEnabled, &finalVersion, &finalOperationID))
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM presence_settings_pending_operations WHERE user_id = $1`, senderID,
+	).Scan(&pending))
+	assert.False(t, masterEnabled)
+	assert.Equal(t, firstVersion+1, finalVersion)
+	assert.NotEqual(t, firstOperationID, finalOperationID)
+	assert.Zero(t, pending)
+
+	plans := finalDelivery.snapshot()
+	require.Len(t, plans, 1)
+	assert.Equal(t, finalOperationID, plans[0].OperationID)
+	assert.Equal(t, presencehistory.DeliveryExactDelta, plans[0].Mode)
+	assert.True(t, plans[0].ClearRecipients[senderID])
+	assert.True(t, plans[0].ClearRecipients[viewerID])
+	assert.Empty(t, plans[0].UpdateRecipients)
+	assert.Nil(t, plans[0].Payload)
+}
+
 func TestPresenceWriterAndHistoryDisableConvergeInBothLockOrders(t *testing.T) {
 	t.Run("writer first", testPresenceWriterBeforeHistoryDisable)
 	t.Run("disable first", testHistoryDisableBeforePresenceWriter)
@@ -328,6 +434,49 @@ func concurrencyBackendPID(ctx context.Context, t *testing.T, tx *sql.Tx) int {
 	var pid int
 	require.NoError(t, tx.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&pid))
 	return pid
+}
+
+func beginConcurrencyTxWithPID(
+	db *sql.DB,
+	pids chan<- int,
+) func(context.Context, *sql.TxOptions) (*sql.Tx, error) {
+	return func(ctx context.Context, options *sql.TxOptions) (*sql.Tx, error) {
+		tx, err := db.BeginTx(ctx, options)
+		if err != nil {
+			return nil, err
+		}
+		var pid int
+		if err := tx.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+			_ = tx.Rollback()
+			return nil, err
+		}
+		pids <- pid
+		return tx, nil
+	}
+}
+
+func latestConcurrencyBackendPID(t *testing.T, pids <-chan int) int {
+	t.Helper()
+	latest := 0
+	for {
+		select {
+		case latest = <-pids:
+		default:
+			require.NotZero(t, latest, "transaction backend PID was not captured")
+			return latest
+		}
+	}
+}
+
+func waitForConcurrencyBackendPID(t *testing.T, pids <-chan int) int {
+	t.Helper()
+	select {
+	case pid := <-pids:
+		return pid
+	case <-time.After(10 * time.Second):
+		t.Fatal("transaction backend PID was not captured")
+		return 0
+	}
 }
 
 func waitForBlockedConcurrencyBackend(

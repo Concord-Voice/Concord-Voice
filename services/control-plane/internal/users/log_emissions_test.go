@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -15,7 +16,7 @@ import (
 )
 
 var presenceWriterSensitiveLogValue = regexp.MustCompile(
-	`(?i)(sender|target|recipient|viewer|user.?id|account|operation.?id|custom.?text|emoji|payload|ciphertext|encrypted|excluded|updated.?at|created.?at|timestamp)`)
+	`(?i)(sender|target|recipient|viewer|user.?id|account|operation.?id|custom.?text|emoji|payload|ciphertext|encrypted|excluded|updated.?at|created.?at|timestamp|raw.?body|request.?body|(^|_)(raw|body)($|_))`)
 
 func TestPresenceWriterLogEmissionsExcludeContentIdentifiersAndAccountTimestamps(t *testing.T) {
 	for _, filename := range []string{"presence_settings.go", "presence_overrides.go"} {
@@ -76,6 +77,12 @@ func TestPresenceWriterLogGuardPositiveAndNegativeControls(t *testing.T) {
 			func example() { h.log.With("recipient_id", recipientID).Error("failed") }`),
 		"fatal viewer": []byte(`package users
 			func example() { h.log.Fatal("failed", "viewer_id", viewerID) }`),
+		"raw label": []byte(`package users
+				func example() { h.log.Error("failed", "raw", safeValue) }`),
+		"body label": []byte(`package users
+				func example() { h.log.Error("failed", "body", safeValue) }`),
+		"request body label": []byte(`package users
+				func example() { h.log.Error("failed", "request_body", safeValue) }`),
 	} {
 		t.Run(name, func(t *testing.T) {
 			violations, err := presenceWriterLogViolations("bad.go", bad)
@@ -138,7 +145,16 @@ func presenceWriterLogViolations(filename string, source []byte) ([]string, erro
 					))
 				}
 				literal, ok := value.(*ast.BasicLit)
-				if ok && presenceWriterSensitiveLogValue.MatchString(literal.Value) {
+				literalValue := ""
+				if ok {
+					literalValue = literal.Value
+					if literal.Kind == token.STRING {
+						if unquoted, unquoteErr := strconv.Unquote(literal.Value); unquoteErr == nil {
+							literalValue = unquoted
+						}
+					}
+				}
+				if ok && presenceWriterSensitiveLogValue.MatchString(literalValue) {
 					violations = append(violations, fmt.Sprintf(
 						"%s:%d sensitive logger label", position.Filename, position.Line,
 					))

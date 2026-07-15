@@ -101,3 +101,26 @@ func TestComputeCustomTextAudience(t *testing.T) {
 		require.False(t, aud[sender], "sender must never be in their own audience")
 	})
 }
+
+func TestComputeCustomTextAudience_MasterOffKeepsCapturedPriorTierIndependent(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	sender := testhelpers.CreateUser(t, db)
+	friend := testhelpers.CreateUser(t, db)
+	testhelpers.AddFriendship(t, db, sender, friend)
+	testhelpers.SetCustomTextTier(t, db, sender, 2)
+	_, err := db.Exec(
+		`UPDATE user_presence_settings SET master_enabled = FALSE WHERE user_id = $1`,
+		sender,
+	)
+	require.NoError(t, err)
+
+	current, err := presence.ComputeCustomTextAudience(ctx, db, sender)
+	require.NoError(t, err)
+	require.Empty(t, current, "master off must suppress the current Custom Status audience")
+
+	prior, err := presence.ComputeCustomTextAudienceForTier(ctx, db, sender, 2)
+	require.NoError(t, err)
+	require.True(t, prior[friend], "captured prior-tier reconstruction remains master agnostic")
+}

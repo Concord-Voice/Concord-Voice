@@ -46,15 +46,20 @@ const (
 // AudienceOperation is the complete durable evidence needed to classify the
 // main transaction and perform acknowledged delivery.
 type AudienceOperation struct {
-	ID                uuid.UUID
-	SenderID          uuid.UUID
-	PriorVersion      int64
-	Version           int64
-	PriorOperationID  *uuid.UUID
-	SupersededPending bool
-	ReconcileAfter    time.Time
-	Before            CustomTextState
-	BeforeTier        int
+	ID                           uuid.UUID
+	SenderID                     uuid.UUID
+	PriorVersion                 int64
+	Version                      int64
+	PriorOperationID             *uuid.UUID
+	SupersededPending            bool
+	ReconcileAfter               time.Time
+	Before                       CustomTextState
+	BeforeTier                   int
+	BeforeMasterEnabled          bool
+	BeforeServerVoiceTier        int
+	BeforeServerVoiceShowDetails bool
+	BeforePrivateCallTier        int
+	BeforePrivateCallShowDetails bool
 }
 
 // DeliveryPlan contains prepared, non-locking delivery inputs.
@@ -186,7 +191,12 @@ func (s *Service) BeginAudienceOperation(
 			Text:  nullableString(prior.text),
 			Emoji: nullableString(prior.emoji),
 		}),
-		BeforeTier: prior.tier,
+		BeforeTier:                   prior.tier,
+		BeforeMasterEnabled:          prior.masterEnabled,
+		BeforeServerVoiceTier:        prior.serverVoiceTier,
+		BeforeServerVoiceShowDetails: prior.serverVoiceShowDetails,
+		BeforePrivateCallTier:        prior.privateCallTier,
+		BeforePrivateCallShowDetails: prior.privateCallShowDetails,
 	}
 	if prior.marker.Valid {
 		value := prior.marker.UUID
@@ -196,11 +206,16 @@ func (s *Service) BeginAudienceOperation(
 }
 
 type audienceOperationPrior struct {
-	version int64
-	marker  uuid.NullUUID
-	tier    int
-	text    sql.NullString
-	emoji   sql.NullString
+	version                int64
+	marker                 uuid.NullUUID
+	masterEnabled          bool
+	serverVoiceTier        int
+	serverVoiceShowDetails bool
+	privateCallTier        int
+	privateCallShowDetails bool
+	tier                   int
+	text                   sql.NullString
+	emoji                  sql.NullString
 }
 
 func lockAudienceOperationPrior(
@@ -222,13 +237,29 @@ func lockAudienceOperationPrior(
 	err := tx.QueryRowContext(ctx, `
 		SELECT presence_settings_version,
 		       presence_settings_operation_id,
+		       master_enabled,
+		       server_voice_tier,
+		       server_voice_show_details,
+		       private_call_tier,
+		       private_call_show_details,
 		       custom_text_tier,
 		       custom_text,
 		       custom_text_emoji
 		FROM user_presence_settings
 		WHERE user_id = $1
 		FOR UPDATE
-	`, senderID).Scan(&prior.version, &prior.marker, &prior.tier, &prior.text, &prior.emoji)
+	`, senderID).Scan(
+		&prior.version,
+		&prior.marker,
+		&prior.masterEnabled,
+		&prior.serverVoiceTier,
+		&prior.serverVoiceShowDetails,
+		&prior.privateCallTier,
+		&prior.privateCallShowDetails,
+		&prior.tier,
+		&prior.text,
+		&prior.emoji,
+	)
 	if err != nil {
 		return audienceOperationPrior{}, fmt.Errorf("lock audience operation settings: %w", err)
 	}
@@ -385,6 +416,11 @@ type audienceCommitState struct {
 	OperationID            *uuid.UUID
 	Before                 CustomTextState
 	BeforeTier             int
+	MasterEnabled          bool
+	ServerVoiceTier        int
+	ServerVoiceShowDetails bool
+	PrivateCallTier        int
+	PrivateCallShowDetails bool
 	PendingOperationID     *uuid.UUID
 	PendingPriorVersion    int64
 	PendingPriorVersionSet bool
@@ -414,21 +450,31 @@ func (s *Service) readAudienceCommitState(
 	senderID uuid.UUID,
 ) (audienceCommitState, error) {
 	var (
-		lockedID     uuid.UUID
-		settings     bool
-		version      int64
-		operationID  uuid.NullUUID
-		tier         int
-		text         sql.NullString
-		emoji        sql.NullString
-		pendingID    uuid.NullUUID
-		pendingPrior sql.NullInt64
+		lockedID      uuid.UUID
+		settings      bool
+		version       int64
+		operationID   uuid.NullUUID
+		master        bool
+		serverTier    int
+		serverDetail  bool
+		privateTier   int
+		privateDetail bool
+		tier          int
+		text          sql.NullString
+		emoji         sql.NullString
+		pendingID     uuid.NullUUID
+		pendingPrior  sql.NullInt64
 	)
 	err := s.db.QueryRowContext(ctx, `
 		SELECT owners.id,
 		       settings.user_id IS NOT NULL,
 		       COALESCE(settings.presence_settings_version, 0),
 		       settings.presence_settings_operation_id,
+		       COALESCE(settings.master_enabled, TRUE),
+		       COALESCE(settings.server_voice_tier, 1),
+		       COALESCE(settings.server_voice_show_details, TRUE),
+		       COALESCE(settings.private_call_tier, 0),
+		       COALESCE(settings.private_call_show_details, FALSE),
 		       COALESCE(settings.custom_text_tier, 0),
 		       settings.custom_text,
 		       settings.custom_text_emoji,
@@ -445,6 +491,11 @@ func (s *Service) readAudienceCommitState(
 		&settings,
 		&version,
 		&operationID,
+		&master,
+		&serverTier,
+		&serverDetail,
+		&privateTier,
+		&privateDetail,
 		&tier,
 		&text,
 		&emoji,
@@ -463,6 +514,11 @@ func (s *Service) readAudienceCommitState(
 		Version:                version,
 		Before:                 normalizeCustomTextState(CustomTextState{Text: nullableString(text), Emoji: nullableString(emoji)}),
 		BeforeTier:             tier,
+		MasterEnabled:          master,
+		ServerVoiceTier:        serverTier,
+		ServerVoiceShowDetails: serverDetail,
+		PrivateCallTier:        privateTier,
+		PrivateCallShowDetails: privateDetail,
 		PendingPriorVersion:    pendingPrior.Int64,
 		PendingPriorVersionSet: pendingPrior.Valid,
 	}
@@ -510,12 +566,22 @@ func rollbackStateMatches(operation AudienceOperation, state audienceCommitState
 	if !state.SettingsExists {
 		return operation.PriorVersion == 0 && operation.PriorOperationID == nil &&
 			normalizeCustomTextState(operation.Before) == (CustomTextState{}) && operation.BeforeTier == 0 &&
+			state.MasterEnabled == operation.BeforeMasterEnabled &&
+			state.ServerVoiceTier == operation.BeforeServerVoiceTier &&
+			state.ServerVoiceShowDetails == operation.BeforeServerVoiceShowDetails &&
+			state.PrivateCallTier == operation.BeforePrivateCallTier &&
+			state.PrivateCallShowDetails == operation.BeforePrivateCallShowDetails &&
 			state.PendingOperationID == nil
 	}
 	return state.Version == operation.PriorVersion &&
 		uuidPointerEqual(state.OperationID, operation.PriorOperationID) &&
 		normalizeCustomTextState(state.Before) == normalizeCustomTextState(operation.Before) &&
-		state.BeforeTier == operation.BeforeTier
+		state.BeforeTier == operation.BeforeTier &&
+		state.MasterEnabled == operation.BeforeMasterEnabled &&
+		state.ServerVoiceTier == operation.BeforeServerVoiceTier &&
+		state.ServerVoiceShowDetails == operation.BeforeServerVoiceShowDetails &&
+		state.PrivateCallTier == operation.BeforePrivateCallTier &&
+		state.PrivateCallShowDetails == operation.BeforePrivateCallShowDetails
 }
 
 func uuidPointerEqual(left, right *uuid.UUID) bool {

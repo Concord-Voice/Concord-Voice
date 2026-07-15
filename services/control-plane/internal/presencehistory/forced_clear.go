@@ -116,7 +116,7 @@ func prepareForcedClearAudience(
 	if operation.SupersededPending {
 		return nil, nil
 	}
-	if operation.BeforeTier <= 0 || operation.Before.Text == "" {
+	if !operation.BeforeMasterEnabled || operation.BeforeTier <= 0 || operation.Before.Text == "" {
 		return map[uuid.UUID]bool{}, nil
 	}
 	return presence.ComputeCustomTextAudienceForTier(

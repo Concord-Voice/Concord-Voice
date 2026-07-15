@@ -1007,11 +1007,120 @@ func TestReconcilePendingCompensatesLiveMarkerThenClaimsDelivery(t *testing.T) {
 	assert.Equal(t, 0, tier)
 	assert.False(t, text.Valid)
 	assert.False(t, emoji.Valid)
+	var master bool
+	require.NoError(t, db.QueryRow(
+		`SELECT master_enabled FROM user_presence_settings WHERE user_id = $1`, senderID,
+	).Scan(&master))
+	assert.False(t, master, "true compensation must disable the category master")
 	plans := delivery.snapshot()
 	require.Len(t, plans, 1)
 	assert.Equal(t, DeliveryConservativeReset, plans[0].Mode)
 	assert.Equal(t, marker, plans[0].OperationID)
 	assert.Nil(t, plans[0].ClearRecipients, "crash recovery must force all-local disconnect")
+}
+
+func TestReconcilePending_MasterOffClaimsConservativeResetWithoutErasingSavedStatus(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	senderID := testhelpers.CreateUser(t, db)
+	operationID := uuid.New()
+	seedTask8Pending(t, db, senderID, operationID, operationID, 3, true, CustomTextState{
+		Text: "saved while master is off", Emoji: "lock",
+	})
+	_, err := db.Exec(`
+		UPDATE user_presence_settings
+		SET master_enabled = FALSE,
+		    server_voice_tier = 2,
+		    server_voice_show_details = FALSE,
+		    private_call_tier = 1,
+		    private_call_show_details = TRUE
+		WHERE user_id = $1
+	`, senderID)
+	require.NoError(t, err)
+	delivery := &task8Delivery{}
+	service := NewService(db, DisclosureState{}, false)
+	require.NoError(t, service.BindDelivery(delivery))
+
+	stats, err := service.ReconcilePending(context.Background(), 10)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.ResolvedCount)
+	assert.Zero(t, stats.CompensatedCount)
+	assert.Equal(t, 0, task8PendingCount(t, db, senderID))
+	version, marker, tier, text, emoji := task8SettingsState(t, db, senderID)
+	assert.Equal(t, int64(4), version)
+	assert.Equal(t, operationID, marker)
+	assert.Equal(t, 2, tier)
+	assert.Equal(t, "saved while master is off", text.String)
+	assert.Equal(t, "lock", emoji.String)
+	var serverTier, privateTier int
+	var serverDetails, privateDetails bool
+	require.NoError(t, db.QueryRow(`
+		SELECT server_voice_tier, server_voice_show_details,
+		       private_call_tier, private_call_show_details
+		FROM user_presence_settings WHERE user_id = $1
+	`, senderID).Scan(&serverTier, &serverDetails, &privateTier, &privateDetails))
+	assert.Equal(t, 2, serverTier)
+	assert.False(t, serverDetails)
+	assert.Equal(t, 1, privateTier)
+	assert.True(t, privateDetails)
+	plans := delivery.snapshot()
+	require.Len(t, plans, 1)
+	assert.Equal(t, DeliveryConservativeReset, plans[0].Mode)
+	assert.Equal(t, operationID, plans[0].OperationID)
+	assert.Nil(t, plans[0].ClearRecipients)
+	assert.Nil(t, plans[0].UpdateRecipients)
+}
+
+func TestReconcilePending_MasterOffDeliveryFailureRetainsMarkerAndSavedStatus(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	senderID := testhelpers.CreateUser(t, db)
+	operationID := uuid.New()
+	seedTask8Pending(t, db, senderID, operationID, operationID, 2, true, CustomTextState{
+		Text: "still quarantined", Emoji: "lock",
+	})
+	_, err := db.Exec(
+		`UPDATE user_presence_settings SET master_enabled = FALSE WHERE user_id = $1`,
+		senderID,
+	)
+	require.NoError(t, err)
+	delivery := &task8Delivery{deliver: func(context.Context, DeliveryPlan) error {
+		return errTestDelivery
+	}}
+	service := NewService(db, DisclosureState{}, false)
+	require.NoError(t, service.BindDelivery(delivery))
+
+	stats, err := service.ReconcilePending(context.Background(), 10)
+
+	require.ErrorIs(t, err, errTestDelivery)
+	assert.Equal(t, 1, stats.RetainedCount)
+	assert.Equal(t, 1, task8PendingCount(t, db, senderID))
+	assert.Equal(t, operationID, task8PendingMarker(t, db, senderID))
+	_, marker, tier, text, emoji := task8SettingsState(t, db, senderID)
+	assert.Equal(t, operationID, marker)
+	assert.Equal(t, 2, tier)
+	assert.Equal(t, "still quarantined", text.String)
+	assert.Equal(t, "lock", emoji.String)
+}
+
+func TestAuthoritativeSupersedingClear_MasterOffOrLegacyClearShape(t *testing.T) {
+	oldPlan := uuid.New()
+	pending := pendingOperationRow{ID: uuid.New(), PriorVersion: 8}
+
+	assert.True(t, isAuthoritativeSupersedingClear(lockedPresenceSettings{
+		Version:       9,
+		OperationID:   uuid.NullUUID{UUID: pending.ID, Valid: true},
+		MasterEnabled: false,
+		Tier:          2,
+		Text:          sql.NullString{String: "saved", Valid: true},
+	}, pending, oldPlan))
+	assert.True(t, isAuthoritativeSupersedingClear(lockedPresenceSettings{
+		Version:       9,
+		OperationID:   uuid.NullUUID{UUID: pending.ID, Valid: true},
+		MasterEnabled: true,
+		Tier:          0,
+	}, pending, oldPlan))
 }
 
 func TestReconcilePendingTierOffPreservesHiddenStatus(t *testing.T) {
@@ -1119,6 +1228,65 @@ func TestReconcilePendingRecorderAndCommitFailuresRetainQuarantine(t *testing.T)
 			assert.Equal(t, "live", text.String)
 		})
 	}
+}
+
+func TestReconcilePendingCompensationCommitRollbackPreservesAllPriorSettingsAndProvesRollback(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	senderID := testhelpers.CreateUser(t, db)
+	operationID := uuid.New()
+	seedTask8Pending(t, db, senderID, operationID, operationID, 4, true, CustomTextState{
+		Text: "prior status", Emoji: "shield",
+	})
+	_, err := db.Exec(`
+		UPDATE user_presence_settings
+		SET master_enabled = TRUE,
+		    server_voice_tier = 1,
+		    server_voice_show_details = TRUE,
+		    private_call_tier = 2,
+		    private_call_show_details = TRUE
+		WHERE user_id = $1
+	`, senderID)
+	require.NoError(t, err)
+	service := NewService(db, DisclosureState{}, false)
+	delivery := &task8Delivery{}
+	require.NoError(t, service.BindDelivery(delivery))
+	commitCause := errors.New("compensation commit acknowledgement failed after rollback")
+	restore := service.SetTransactionTestHooks(TransactionTestHooks{
+		Commit: func(tx *sql.Tx) error {
+			require.NoError(t, tx.Rollback(), "test must make the failed compensation transaction truly roll back")
+			return commitCause
+		},
+	})
+	defer restore()
+
+	stats, err := service.ReconcilePending(context.Background(), 10)
+
+	require.ErrorIs(t, err, commitCause)
+	assert.Equal(t, 1, stats.RetainedCount)
+	assert.Empty(t, delivery.snapshot())
+	proofTx, err := service.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	settings, err := lockPresenceSettings(context.Background(), proofTx, senderID)
+	require.NoError(t, err)
+	require.NoError(t, service.RollbackTx(proofTx))
+	assert.Equal(t, int64(5), settings.Version)
+	require.True(t, settings.OperationID.Valid)
+	assert.Equal(t, operationID, settings.OperationID.UUID)
+	assert.True(t, settings.MasterEnabled)
+	assert.Equal(t, 1, settings.ServerVoiceTier, "default Server Voice tier is rollback evidence")
+	assert.True(t, settings.ServerVoiceShowDetails, "default Server Voice detail flag is rollback evidence")
+	assert.Equal(t, 2, settings.PrivateCallTier)
+	assert.True(t, settings.PrivateCallShowDetails)
+	assert.Equal(t, 2, settings.Tier)
+	assert.Equal(t, "prior status", settings.Text.String)
+	assert.Equal(t, "shield", settings.Emoji.String)
+
+	compensationID := uuid.New()
+	operation := compensationAudienceOperation(
+		senderID, compensationID, settings, pendingOperationRow{ID: operationID},
+	)
+	assert.Equal(t, RollbackConfirmed, service.ClassifyAudienceCommit(context.Background(), operation))
 }
 
 func TestReconcilePendingProvesAmbiguousCompensationCommitBeforeClaim(t *testing.T) {

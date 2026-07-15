@@ -468,7 +468,7 @@ erDiagram
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Auth / registration  | `pending_registrations` (000058)                                                                                                                                                                                                                                                                              |
 | MFA / recovery       | `user_mfa_totp`, `user_mfa_webauthn` (000029); `user_recovery_keys` (000043); `trusted_recovery_devices`, `recovery_requests` (000044); `recovery_circles`, `recovery_circle_shares`, `recovery_circle_requests`, `recovery_circle_responses` (000045)                                                        |
-| Profile / prefs      | `user_preferences` (000016); `privacy_settings` (000027); `username_history` (000046); `saved_gifs` (000055); `notification_preferences` (000063, polymorphic target); `user_presence_settings` (000074, eight Activity History fields added by 000087); `friend_organization` (000075); `presence_override_preferences`, `user_presence_overrides` (000084); `presence_settings_pending_operations` (000087) |
+| Profile / prefs      | `user_preferences` (000016); `privacy_settings` (000027); `username_history` (000046); `saved_gifs` (000055); `notification_preferences` (000063, polymorphic target); `user_presence_settings` (000074, eight Activity History fields added by 000087 and five category controls by 000089); `friend_organization` (000075); `presence_override_preferences`, `user_presence_overrides` (000084); `presence_settings_pending_operations` (000087) |
 | Activity history    | `presence_history` (000087, category-neutral self-owned interval ledger)                                                                                                                                                                                                                                     |
 | Voice                | `voice_participants` (000020); `dm_voice_participants` (000026)                                                                                                                                                                                                                                               |
 | Media                | `media_files` (000042)                                                                                                                                                                                                                                                                                        |
@@ -622,6 +622,21 @@ Because the server holds only ciphertext, full-text **message search runs entire
 User **preferences**, **saved GIFs**, and **friend organization** sync across devices as opaque E2EE blobs — the server stores ciphertext here too, not just for messages. The control-plane `users` package exposes encrypted-blob surfaces (`GET`/`PUT /api/v1/users/me/preferences`, `/me/saved-gifs`, and `/me/friend-organization`) storing an `encrypted_data` column with a monotonically increasing sync version and a metadata-only WebSocket broadcast on change. These generic blob writes are last-writer-wins; the version tells clients when to refetch but is not a compare-and-swap precondition. The client encrypts/decrypts via `e2eeService` through `e2eeBlobTransport.ts` (`preferencesSync.ts`, `savedGifsSync.ts`, and `friendOrgSync.ts`). Friend-category names, colors, and membership groupings therefore remain invisible to the server.
 
 Post-login sync is bound to one authenticated renderer lifecycle. Password, MFA, WebAuthn, and restored sessions start hydration after E2EE is ready; SSO deliberately defers the same encrypted hydration chain until `SSOEagerUnlock` initializes E2EE and App reruns it. A shared generation guard and `AbortSignal` directly cover preferences, saved GIFs, notification preferences, and entitlement hydration. Friend organization and presence exceptions use service-local generations/controllers, and the shared hydration chain verifies their current-generation result before continuing. Logout or account switching invalidates the shared guard before stopping each service and invalidating its local work, so a prior account's delayed decrypt, bootstrap push, entitlement response, or notification sweep cannot mutate state or issue a write with the next account's credentials.
+
+### Rich Presence Settings
+
+Migration 000089 additively extends the `user_presence_settings` table created
+by 000074. `master_enabled` defaults to true and is the global disclosure gate;
+false suppresses every category, including Private Call participants, without
+erasing saved values. `server_voice_tier` defaults to 1 (Friends in the active
+server) and `server_voice_show_details` defaults to true. `private_call_tier`
+defaults to 0 (call participants only while the master gate is enabled) and
+`private_call_show_details` defaults to false. Both tiers accept 0..2. The four
+category-specific fields persist policy inputs for later Server Voice and
+Private Call runtime delivery; #2229 does not add category payload generation,
+fan-out, or detail minimization. The shipped Custom Status path immediately
+consumes `master_enabled` as its global gate. The migration adds no table,
+index, trigger, or speculative category columns.
 
 ### Custom Status Recipient Exceptions
 

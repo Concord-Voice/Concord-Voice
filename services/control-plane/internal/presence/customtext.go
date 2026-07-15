@@ -9,8 +9,8 @@ import (
 )
 
 // ComputeCustomTextAudience returns the set of user IDs permitted to see
-// senderID's custom-text status, cut by the sender's custom_text_tier and then
-// by the sender's materialized recipient exclusions:
+// senderID's custom-text status, cut by the category master, the sender's
+// custom_text_tier, and then the sender's materialized recipient exclusions:
 //
 //	0 (Off)     -> empty set
 //	1 (Friends) -> friends + friends-of-friends (when dm_friends_of_friends is on)
@@ -23,13 +23,18 @@ import (
 // discretionary filter; a failure to read them returns an error rather than an
 // unfiltered tier audience.
 func ComputeCustomTextAudience(ctx context.Context, db DBTX, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
+	var masterEnabled bool
 	var tier int
 	err := db.QueryRowContext(ctx,
-		`SELECT custom_text_tier FROM user_presence_settings WHERE user_id = $1`, senderID).Scan(&tier)
+		`SELECT master_enabled, custom_text_tier FROM user_presence_settings WHERE user_id = $1`, senderID,
+	).Scan(&masterEnabled, &tier)
 	if err == sql.ErrNoRows {
 		tier = 0 // no row => Off; still run the final fail-closed filter
 	} else if err != nil {
-		return nil, fmt.Errorf("custom-text audience: read tier: %w", err)
+		return nil, fmt.Errorf("custom-text audience: read settings: %w", err)
+	}
+	if !masterEnabled {
+		tier = 0 // master off => empty base; still run the final fail-closed filter
 	}
 
 	base, err := computeCustomTextBaseAudienceForTier(ctx, db, senderID, tier)

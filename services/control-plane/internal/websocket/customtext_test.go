@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -86,19 +87,6 @@ func setCustomText(t *testing.T, db *sql.DB, userID uuid.UUID, tier int, text, e
 	require.NoError(t, err)
 }
 
-func updateCustomText(t *testing.T, db *sql.DB, userID uuid.UUID, tier int, text, emoji *string) {
-	t.Helper()
-	_, err := db.Exec(`
-		UPDATE user_presence_settings
-		SET custom_text_tier = $2,
-		    custom_text = $3,
-		    custom_text_emoji = $4,
-		    updated_at = NOW()
-		WHERE user_id = $1
-	`, userID.String(), tier, text, emoji)
-	require.NoError(t, err)
-}
-
 func insertCustomTextPendingOperation(t *testing.T, db *sql.DB, senderID uuid.UUID) uuid.UUID {
 	t.Helper()
 	operationID := uuid.New()
@@ -167,6 +155,115 @@ func awaitCustomTextSignal[T any](t *testing.T, ch <-chan T) T {
 		var zero T
 		return zero
 	}
+}
+
+func requireCustomTextDatabaseWriterBlocked(
+	t *testing.T,
+	db *sql.DB,
+	writerBackendPID int,
+	writerFinished <-chan struct{},
+	stage string,
+) {
+	t.Helper()
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-writerFinished:
+			t.Fatalf("database writer completed before %s", stage)
+		default:
+		}
+
+		var blockerCount int
+		err := db.QueryRow(`
+			SELECT cardinality(pg_blocking_pids($1))
+		`, writerBackendPID).Scan(&blockerCount)
+		require.NoError(t, err)
+		if blockerCount > 0 {
+			return
+		}
+
+		select {
+		case <-writerFinished:
+			t.Fatalf("database writer completed before %s", stage)
+		case <-timer.C:
+			t.Fatalf("timed out proving database writer was blocked during %s", stage)
+		default:
+		}
+	}
+}
+
+func runCustomTextMasterOffWriter(
+	ctx context.Context,
+	service *presencehistory.Service,
+	senderID uuid.UUID,
+	viewerID uuid.UUID,
+) error {
+	return service.WithSender(
+		ctx,
+		senderID,
+		func() (returnErr error) {
+			tx, err := service.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				rollbackErr := service.RollbackTx(tx)
+				if rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+					returnErr = errors.Join(returnErr, rollbackErr)
+				}
+			}()
+
+			operation, err := service.BeginAudienceOperation(
+				ctx,
+				tx,
+				senderID,
+				presencehistory.ForcedSecurityClear,
+			)
+			if err != nil {
+				return err
+			}
+			result, err := tx.ExecContext(ctx, `
+				UPDATE user_presence_settings
+				SET master_enabled = FALSE,
+				    updated_at = clock_timestamp()
+				WHERE user_id = $1
+			`, senderID)
+			if err != nil {
+				return err
+			}
+			affected, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if affected != 1 {
+				return fmt.Errorf("master-off writer affected %d settings rows", affected)
+			}
+			if err := service.RecordCustomTextTransition(
+				ctx,
+				tx,
+				senderID,
+				operation.Before,
+				presencehistory.CustomTextState{},
+			); err != nil {
+				return err
+			}
+			if err := service.CommitTx(tx); err != nil {
+				return err
+			}
+
+			completion := service.CompleteClaim(ctx, presencehistory.DeliveryPlan{
+				Mode:        presencehistory.DeliveryExactDelta,
+				OperationID: operation.ID,
+				SenderID:    senderID,
+				ClearRecipients: map[uuid.UUID]bool{
+					senderID: true,
+					viewerID: true,
+				},
+			})
+			return completion.Err
+		},
+	)
 }
 
 func awaitClientMessageType(t *testing.T, client *Client, messageType string) map[string]interface{} {
@@ -333,6 +430,62 @@ func TestCustomTextCandidates_PendingSenderIsAbsent(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.NotContains(t, candidates, sender)
+}
+
+func TestCustomTextCandidates_MasterOffSenderIsAbsent(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	sender := insertCTUser(t, db, "ctmasteroffcandidate")
+	setCustomText(t, db, sender, 2, "saved but disabled", "")
+	_, err := db.Exec(
+		`UPDATE user_presence_settings SET master_enabled = FALSE WHERE user_id = $1`,
+		sender,
+	)
+	require.NoError(t, err)
+
+	candidates, err := hub.customTextCandidates(context.Background())
+
+	require.NoError(t, err)
+	assert.NotContains(t, candidates, sender)
+}
+
+func TestSendCustomTextSnapshot_FinalStateQuerySuppressesNewMasterOffSender(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	viewer := insertCTUser(t, db, "ctmasterofffinalviewer")
+	sender := insertCTUser(t, db, "ctmasterofffinalsender")
+	makeFriends(t, db, sender, viewer)
+	setCustomText(t, db, sender, 1, "candidate before master off", "")
+	viewerClient := connectClient(hub, viewer)
+	candidatesRead := make(chan struct{})
+	releaseCandidates := make(chan struct{})
+	audienceBoundaryReached := make(chan struct{}, 1)
+	hub.customTextSnapshotAfterCandidates = func() {
+		close(candidatesRead)
+		<-releaseCandidates
+	}
+	hub.customTextSnapshotAfterStateRead = func(_, _ uuid.UUID) {
+		audienceBoundaryReached <- struct{}{}
+	}
+	snapshotDone := make(chan struct{})
+	go func() {
+		defer close(snapshotDone)
+		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+	}()
+	awaitCustomTextSignal(t, candidatesRead)
+
+	_, err := db.Exec(
+		`UPDATE user_presence_settings SET master_enabled = FALSE WHERE user_id = $1`,
+		sender,
+	)
+	require.NoError(t, err)
+	close(releaseCandidates)
+	awaitCustomTextSignal(t, snapshotDone)
+
+	select {
+	case <-audienceBoundaryReached:
+		t.Fatal("master-off final read reached the pre-audience hook")
+	default:
+	}
+	assertNoMessage(t, viewerClient)
 }
 
 func TestSendCustomTextSnapshot_FinalStateQuerySuppressesNewPendingSender(t *testing.T) {
@@ -515,6 +668,11 @@ func TestSendCustomTextSnapshot_StateAndAudienceUseOneDatabaseSnapshot(t *testin
 
 	stateRead := make(chan struct{})
 	releaseSnapshot := make(chan struct{})
+	var releaseSnapshotOnce sync.Once
+	releaseSnapshotRead := func() {
+		releaseSnapshotOnce.Do(func() { close(releaseSnapshot) })
+	}
+	t.Cleanup(releaseSnapshotRead)
 	hub.customTextSnapshotAfterStateRead = func(candidateID, viewerID uuid.UUID) {
 		if candidateID != sender || viewerID != viewer {
 			return
@@ -530,13 +688,28 @@ func TestSendCustomTextSnapshot_StateAndAudienceUseOneDatabaseSnapshot(t *testin
 	}()
 	awaitCustomTextSignal(t, stateRead)
 
-	// The viewer is not authorized for the old Friends-tier payload. Expanding
-	// the tier and replacing the text between the snapshot's state and audience
-	// reads must never authorize delivery of that old private payload.
+	// The viewer is not authorized for the old Friends-tier payload. A writer
+	// that tries to expand the tier and replace the text after the final state
+	// read must wait for the snapshot authorization and enqueue boundary.
 	newText := "new server-visible status"
-	updateCustomText(t, db, sender, 2, &newText, nil)
-	close(releaseSnapshot)
+	updateAttempted := make(chan struct{})
+	updateDone := make(chan error, 1)
+	go func() {
+		close(updateAttempted)
+		_, err := db.Exec(`
+			UPDATE user_presence_settings
+			SET custom_text_tier = 2,
+			    custom_text = $2,
+			    custom_text_emoji = NULL,
+			    updated_at = NOW()
+			WHERE user_id = $1
+		`, sender, newText)
+		updateDone <- err
+	}()
+	awaitCustomTextSignal(t, updateAttempted)
+	releaseSnapshotRead()
 	awaitCustomTextSignal(t, snapshotDone)
+	require.NoError(t, awaitCustomTextSignal(t, updateDone))
 
 	assertNoMessage(t, viewerClient)
 }
@@ -639,6 +812,142 @@ func TestSendCustomTextSnapshot_SharedGateOrdersOldSnapshotBeforeNewerClearUpdat
 	require.Equal(t, "rich_presence_update", newUpdate["type"])
 	newPayload := newUpdate["data"].(map[string]interface{})["payload"].(map[string]interface{})
 	assert.Equal(t, "new committed state", newPayload["text"])
+}
+
+func TestSendCustomTextSnapshot_CrossServiceMasterOffWaitsThroughSnapshotEnqueue(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	snapshotService := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
+	writerService := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
+	hub.SetPresenceHistoryService(snapshotService)
+	require.NoError(t, writerService.BindDelivery(hub))
+
+	viewer := insertCTUser(t, db, "ctsnapshotcrossserviceviewer")
+	sender := insertCTUser(t, db, "ctsnapshotcrossservicesender")
+	makeFriends(t, db, sender, viewer)
+	setCustomText(t, db, sender, 1, "old cross-service snapshot", "")
+	viewerClient := connectClient(hub, viewer)
+
+	stateRead := make(chan struct{})
+	releaseStateRead := make(chan struct{})
+	enqueueStarted := make(chan struct{})
+	releaseEnqueue := make(chan struct{})
+	snapshotDone := make(chan struct{})
+	writerFinished := make(chan struct{})
+	writerResult := make(chan error, 1)
+	var releaseStateReadOnce sync.Once
+	var releaseEnqueueOnce sync.Once
+	var stateReadOnce sync.Once
+	var enqueueStartedOnce sync.Once
+	writerStarted := false
+	releaseSnapshotState := func() {
+		releaseStateReadOnce.Do(func() { close(releaseStateRead) })
+	}
+	releaseSnapshotEnqueue := func() {
+		releaseEnqueueOnce.Do(func() { close(releaseEnqueue) })
+	}
+	t.Cleanup(func() {
+		releaseSnapshotState()
+		releaseSnapshotEnqueue()
+		select {
+		case <-snapshotDone:
+		case <-time.After(10 * time.Second):
+		}
+		if writerStarted {
+			select {
+			case <-writerFinished:
+			case <-time.After(10 * time.Second):
+			}
+		}
+	})
+
+	hub.customTextSnapshotAfterStateRead = func(candidateID, viewerID uuid.UUID) {
+		if candidateID != sender || viewerID != viewer {
+			return
+		}
+		stateReadOnce.Do(func() { close(stateRead) })
+		<-releaseStateRead
+	}
+	hub.customTextFrameMarshaler = func(
+		senderID uuid.UUID,
+		payload *CustomTextPayload,
+	) ([]byte, error) {
+		if senderID == sender && payload != nil && payload.Text == "old cross-service snapshot" {
+			enqueueStartedOnce.Do(func() { close(enqueueStarted) })
+			<-releaseEnqueue
+		}
+		return marshalCustomTextFrame(senderID, payload)
+	}
+
+	go func() {
+		defer close(snapshotDone)
+		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+	}()
+	awaitCustomTextSignal(t, stateRead)
+
+	writerBackendPIDs := make(chan int, 8)
+	restoreWriterHooks := writerService.SetTransactionTestHooks(
+		presencehistory.TransactionTestHooks{
+			Begin: func(ctx context.Context, options *sql.TxOptions) (*sql.Tx, error) {
+				tx, err := db.BeginTx(ctx, options)
+				if err != nil {
+					return nil, err
+				}
+				var backendPID int
+				if err := tx.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&backendPID); err != nil {
+					_ = tx.Rollback()
+					return nil, err
+				}
+				writerBackendPIDs <- backendPID
+				return tx, nil
+			},
+		},
+	)
+	t.Cleanup(restoreWriterHooks)
+	writerStarted = true
+	go func() {
+		defer close(writerFinished)
+		writerResult <- runCustomTextMasterOffWriter(
+			context.Background(),
+			writerService,
+			sender,
+			viewer,
+		)
+	}()
+
+	writerBackendPID := awaitCustomTextSignal(t, writerBackendPIDs)
+	requireCustomTextDatabaseWriterBlocked(
+		t,
+		db,
+		writerBackendPID,
+		writerFinished,
+		"snapshot final-state authorization",
+	)
+	releaseSnapshotState()
+	awaitCustomTextSignal(t, enqueueStarted)
+	requireCustomTextDatabaseWriterBlocked(
+		t,
+		db,
+		writerBackendPID,
+		writerFinished,
+		"snapshot enqueue",
+	)
+	releaseSnapshotEnqueue()
+
+	awaitCustomTextSignal(t, snapshotDone)
+	awaitCustomTextSignal(t, writerFinished)
+	require.NoError(t, awaitCustomTextSignal(t, writerResult))
+
+	oldUpdate := readClientMsg(t, viewerClient)
+	newClear := readClientMsg(t, viewerClient)
+	require.Equal(t, "rich_presence_update", oldUpdate["type"])
+	oldPayload := oldUpdate["data"].(map[string]interface{})["payload"].(map[string]interface{})
+	assert.Equal(t, "old cross-service snapshot", oldPayload["text"])
+	require.Equal(t, "rich_presence_clear", newClear["type"])
+	select {
+	case trailing := <-viewerClient.Send:
+		t.Fatalf("unexpected trailing custom-text frame after master-off clear: %s", trailing)
+	default:
+	}
 }
 
 func TestClearCustomTextForPresenceAudience_ScopesClearToBaseAudience(t *testing.T) {

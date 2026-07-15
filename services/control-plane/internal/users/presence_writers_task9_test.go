@@ -421,6 +421,258 @@ func TestUpdatePresenceSettingsPreservesTierAudienceSemantics(t *testing.T) {
 	assert.Nil(t, plans[3].Payload)
 }
 
+func TestUpdatePresenceSettings_MasterOffClearsAudienceAndPreservesSavedStatusAndHistory(t *testing.T) {
+	db, _ := testhelpers.SetupTestDB(t)
+	ts := &testhelpers.TestServer{DB: db}
+	senderID := testhelpers.CreateUser(t, db)
+	viewerID := testhelpers.CreateUser(t, db)
+	testhelpers.AddFriendship(t, db, senderID, viewerID)
+	_, err := db.Exec(`
+		INSERT INTO user_presence_settings (
+			user_id, activity_history_enabled, activity_history_retention_days,
+			activity_history_consent_version, activity_history_consent_copy_hash,
+			activity_history_consented_at
+		) VALUES ($1, TRUE, 30, 1, $2, clock_timestamp())
+	`, senderID, task9ConsentHash)
+	require.NoError(t, err)
+	delivery := &task9Delivery{}
+	h := newTask9Handler(t, ts, delivery)
+
+	set := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
+		"custom_text_tier":  1,
+		"custom_text":       "saved through master toggles",
+		"custom_text_emoji": "lock",
+	})
+	require.Equal(t, http.StatusOK, set.Code, set.Body.String())
+	var originalHistoryID uuid.UUID
+	require.NoError(t, db.QueryRow(`
+		SELECT id FROM presence_history
+		WHERE sender_id = $1 AND ended_at IS NULL
+	`, senderID).Scan(&originalHistoryID))
+
+	off := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{"master_enabled": false})
+	require.Equal(t, http.StatusOK, off.Code, off.Body.String())
+	plans := delivery.snapshot()
+	require.Len(t, plans, 2)
+	plan := plans[1]
+	assert.Equal(t, presencehistory.DeliveryExactDelta, plan.Mode)
+	assert.True(t, plan.ClearRecipients[senderID])
+	assert.True(t, plan.ClearRecipients[viewerID])
+	assert.Empty(t, plan.UpdateRecipients)
+	assert.Nil(t, plan.Payload)
+
+	var master bool
+	var tier int
+	var text, emoji string
+	require.NoError(t, db.QueryRow(`
+		SELECT master_enabled, custom_text_tier, custom_text, custom_text_emoji
+		FROM user_presence_settings WHERE user_id = $1
+	`, senderID).Scan(&master, &tier, &text, &emoji))
+	assert.False(t, master)
+	assert.Equal(t, 1, tier)
+	assert.Equal(t, "saved through master toggles", text)
+	assert.Equal(t, "lock", emoji)
+	var historyID uuid.UUID
+	require.NoError(t, db.QueryRow(`
+		SELECT id FROM presence_history
+		WHERE sender_id = $1 AND ended_at IS NULL
+	`, senderID).Scan(&historyID))
+	assert.Equal(t, originalHistoryID, historyID, "master-only off must not close Custom Status history")
+
+	on := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{"master_enabled": true})
+	require.Equal(t, http.StatusOK, on.Code, on.Body.String())
+	require.NoError(t, db.QueryRow(`
+		SELECT id FROM presence_history
+		WHERE sender_id = $1 AND ended_at IS NULL
+	`, senderID).Scan(&historyID))
+	assert.Equal(t, originalHistoryID, historyID, "master-only on must not reopen Custom Status history")
+}
+
+func TestUpdatePresenceSettings_MasterOnRecomputesCurrentAudience(t *testing.T) {
+	db, _ := testhelpers.SetupTestDB(t)
+	ts := &testhelpers.TestServer{DB: db}
+	senderID := testhelpers.CreateUser(t, db)
+	formerFriendID := testhelpers.CreateUser(t, db)
+	currentFriendID := testhelpers.CreateUser(t, db)
+	testhelpers.AddFriendship(t, db, senderID, formerFriendID)
+	_, err := db.Exec(`
+		INSERT INTO user_presence_settings (
+			user_id, master_enabled, custom_text_tier, custom_text
+		) VALUES ($1, FALSE, 1, 'saved while master is off')
+	`, senderID)
+	require.NoError(t, err)
+	_, err = db.Exec(
+		`DELETE FROM friendships WHERE requester_id = $1 AND addressee_id = $2`,
+		senderID, formerFriendID,
+	)
+	require.NoError(t, err)
+	testhelpers.AddFriendship(t, db, senderID, currentFriendID)
+	delivery := &task9Delivery{}
+	h := newTask9Handler(t, ts, delivery)
+
+	w := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{"master_enabled": true})
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	plans := delivery.snapshot()
+	require.Len(t, plans, 1)
+	assert.False(t, plans[0].UpdateRecipients[formerFriendID])
+	assert.True(t, plans[0].UpdateRecipients[currentFriendID])
+	assert.True(t, plans[0].UpdateRecipients[senderID])
+	assert.Empty(t, plans[0].ClearRecipients)
+	require.NotNil(t, plans[0].Payload)
+	assert.Equal(t, "saved while master is off", plans[0].Payload.Text)
+}
+
+func TestUpdatePresenceSettings_MasterOffSupersedesUnexpiredOrdinaryPendingConservatively(t *testing.T) {
+	db, _ := testhelpers.SetupTestDB(t)
+	senderID := testhelpers.CreateUser(t, db)
+	viewerID := testhelpers.CreateUser(t, db)
+	testhelpers.AddFriendship(t, db, senderID, viewerID)
+	_, err := db.Exec(`
+		INSERT INTO user_presence_settings (
+			user_id, master_enabled, custom_text_tier, custom_text
+		) VALUES ($1, TRUE, 1, 'saved across supersession')
+	`, senderID)
+	require.NoError(t, err)
+	delivery := &task9Delivery{}
+	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
+	require.NoError(t, service.BindDelivery(delivery))
+	ordinaryTx, err := service.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	_, err = service.BeginAudienceOperation(
+		context.Background(), ordinaryTx, senderID, presencehistory.OrdinaryAudienceWrite,
+	)
+	require.NoError(t, err)
+	require.NoError(t, service.CommitTx(ordinaryTx))
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h.SetPresenceHistory(service)
+
+	w := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{"master_enabled": false})
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	plans := delivery.snapshot()
+	require.Len(t, plans, 1)
+	assert.Equal(t, presencehistory.DeliveryConservativeReset, plans[0].Mode)
+	assert.Nil(t, plans[0].ClearRecipients)
+	assert.Nil(t, plans[0].UpdateRecipients)
+	assert.Nil(t, plans[0].Payload)
+	var master bool
+	var tier int
+	var text string
+	require.NoError(t, db.QueryRow(`
+		SELECT master_enabled, custom_text_tier, custom_text
+		FROM user_presence_settings WHERE user_id = $1
+	`, senderID).Scan(&master, &tier, &text))
+	assert.False(t, master)
+	assert.Equal(t, 1, tier)
+	assert.Equal(t, "saved across supersession", text)
+}
+
+func TestUpdatePresenceSettings_MasterOffSupersedesEligiblePendingWhenDeliveryFails(t *testing.T) {
+	db, _ := testhelpers.SetupTestDB(t)
+	senderID := testhelpers.CreateUser(t, db)
+	oldOperationID := uuid.New()
+	_, err := db.Exec(`
+		INSERT INTO user_presence_settings (
+			user_id,
+			master_enabled,
+			custom_text_tier,
+			custom_text,
+			presence_settings_version,
+			presence_settings_operation_id
+		) VALUES ($1, TRUE, 0, 'saved while tier is off', 1, $2)
+	`, senderID, oldOperationID)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO presence_settings_pending_operations (
+			user_id,
+			operation_id,
+			prior_settings_version,
+			created_at,
+			reconcile_after
+		) VALUES ($1, $2, 0, clock_timestamp() - INTERVAL '1 minute', clock_timestamp() - INTERVAL '1 second')
+	`, senderID, oldOperationID)
+	require.NoError(t, err)
+	delivery := &task9Delivery{err: errors.New("delivery unavailable")}
+	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
+	require.NoError(t, service.BindDelivery(delivery))
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h.SetPresenceHistory(service)
+
+	w := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{"master_enabled": false})
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	plans := delivery.snapshot()
+	require.Len(t, plans, 1)
+	assert.Equal(t, presencehistory.DeliveryConservativeReset, plans[0].Mode)
+	assert.NotEqual(t, oldOperationID, plans[0].OperationID)
+	var master bool
+	var tier int
+	var text string
+	var version, priorVersion int64
+	var settingsOperationID, pendingOperationID uuid.UUID
+	require.NoError(t, db.QueryRow(`
+		SELECT settings.master_enabled,
+		       settings.custom_text_tier,
+		       settings.custom_text,
+		       settings.presence_settings_version,
+		       settings.presence_settings_operation_id,
+		       pending.operation_id,
+		       pending.prior_settings_version
+		FROM user_presence_settings AS settings
+		JOIN presence_settings_pending_operations AS pending ON pending.user_id = settings.user_id
+		WHERE settings.user_id = $1
+	`, senderID).Scan(
+		&master,
+		&tier,
+		&text,
+		&version,
+		&settingsOperationID,
+		&pendingOperationID,
+		&priorVersion,
+	))
+	assert.False(t, master, "forced master-off must close the durable gate before returning")
+	assert.Equal(t, 0, tier)
+	assert.Equal(t, "saved while tier is off", text)
+	assert.Equal(t, int64(2), version)
+	assert.NotEqual(t, oldOperationID, settingsOperationID)
+	assert.Equal(t, settingsOperationID, pendingOperationID)
+	assert.Equal(t, plans[0].OperationID, pendingOperationID)
+	assert.Equal(t, int64(1), priorVersion)
+}
+
+func TestUpdatePresenceSettings_MasterOffDeliveryFailureReturns503AndRetainsQuarantine(t *testing.T) {
+	db, _ := testhelpers.SetupTestDB(t)
+	senderID := testhelpers.CreateUser(t, db)
+	_, err := db.Exec(`
+		INSERT INTO user_presence_settings (
+			user_id, master_enabled, custom_text_tier, custom_text
+		) VALUES ($1, TRUE, 1, 'saved despite delivery failure')
+	`, senderID)
+	require.NoError(t, err)
+	delivery := &task9Delivery{err: errors.New("master-off delivery failed")}
+	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
+	require.NoError(t, service.BindDelivery(delivery))
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h.SetPresenceHistory(service)
+
+	w := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{"master_enabled": false})
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	var pending int
+	var master bool
+	var text string
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM presence_settings_pending_operations WHERE user_id = $1`, senderID,
+	).Scan(&pending))
+	require.NoError(t, db.QueryRow(`
+		SELECT master_enabled, custom_text FROM user_presence_settings WHERE user_id = $1
+	`, senderID).Scan(&master, &text))
+	assert.Equal(t, 1, pending)
+	assert.False(t, master)
+	assert.Equal(t, "saved despite delivery failure", text)
+}
+
 func TestUpdatePresenceSettingsHistorySemanticTransitionsAndNoOps(t *testing.T) {
 	db, _ := testhelpers.SetupTestDB(t)
 	ts := &testhelpers.TestServer{DB: db}

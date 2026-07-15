@@ -12023,9 +12023,10 @@ paths:
     get:
       tags:
       - Presence
-      summary: Get presence (custom status) settings
-      description: 'Get the authenticated user''s rich-presence settings (custom-text
-        status tier + value). Returns defaults (tier 0, null text/emoji) if unset.
+      summary: Get rich-presence settings
+      description: 'Get the authenticated user''s flat rich-presence settings.
+        If no settings row exists, the response contains the documented defaults
+        without creating a row.
 
         Rate limit: 30 requests per minute (user-based).
 
@@ -12039,29 +12040,79 @@ paths:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
+                required:
+                - master_enabled
+                - server_voice_tier
+                - server_voice_show_details
+                - private_call_tier
+                - private_call_show_details
+                - custom_text_tier
+                - custom_text
+                - custom_text_emoji
                 properties:
+                  master_enabled:
+                    type: boolean
+                    default: true
+                    description: Global Rich Presence authorization switch. False
+                      suppresses every category, including Private Call participants,
+                      without erasing saved category settings.
+                  server_voice_tier:
+                    type: integer
+                    minimum: 0
+                    maximum: 2
+                    default: 1
+                    description: 'Persisted policy input for the later Server Voice
+                      runtime: 0=Off, 1=Friends (and opted-in friends-of-friends)
+                      in the active server, 2=all members of the active server. This
+                      change does not implement Server Voice fan-out.'
+                  server_voice_show_details:
+                    type: boolean
+                    default: true
+                    description: Persisted policy input controlling whether the later
+                      Server Voice runtime may expose detailed rather than coarse presence;
+                      this change does not implement that runtime.
+                  private_call_tier:
+                    type: integer
+                    minimum: 0
+                    maximum: 2
+                    default: 0
+                    description: 'Persisted policy input for the later Private Call
+                      runtime: 0=call participants only, 1=participants plus friends
+                      and opted-in friends-of-friends, 2=those viewers plus shared-server
+                      peers. master_enabled=false overrides every tier. This change
+                      does not implement Private Call fan-out.'
+                  private_call_show_details:
+                    type: boolean
+                    default: false
+                    description: Persisted policy input controlling whether the later
+                      Private Call runtime may expose detailed rather than coarse presence;
+                      this change does not implement that runtime.
                   custom_text_tier:
                     type: integer
-                    enum:
-                    - 0
-                    - 1
-                    - 2
-                    description: 0=Off, 1=Friends, 2=Servers
+                    minimum: 0
+                    maximum: 2
+                    default: 0
+                    description: 0=Off, 1=Friends (and opted-in friends-of-friends),
+                      2=those viewers plus shared-server peers.
                   custom_text:
                     type: string
                     nullable: true
                     maxLength: 140
+                    default: null
                   custom_text_emoji:
                     type: string
                     nullable: true
                     maxLength: 32
+                    default: null
     patch:
       tags:
       - Presence
-      summary: Update presence (custom status) settings
-      description: 'Update the custom-text status tier and/or value. Only provided
-        fields are changed; an empty custom_text or custom_text_emoji clears it (stored
-        NULL). The server fans the change out to the permitted tier audience.
+      summary: Update rich-presence settings
+      description: 'Update one or more flat rich-presence settings. Omitted fields
+        preserve their stored values; an empty custom_text or custom_text_emoji clears
+        that value (stored NULL). HTTP 200 follows the matching durable delivery-claim
+        acknowledgement.
 
         Rate limit: 10 requests per minute (user-based).
 
@@ -12074,19 +12125,55 @@ paths:
           application/json:
             schema:
               type: object
+              minProperties: 1
+              additionalProperties: false
               properties:
+                master_enabled:
+                  type: boolean
+                  description: Global Rich Presence authorization switch. False
+                    suppresses every category, including Private Call participants,
+                    without erasing saved category settings.
+                server_voice_tier:
+                  type: integer
+                  minimum: 0
+                  maximum: 2
+                  description: 'Persisted policy input for the later Server Voice
+                    runtime: 0=Off, 1=Friends (and opted-in friends-of-friends)
+                    in the active server, 2=all members of the active server. This
+                    change does not implement Server Voice fan-out.'
+                server_voice_show_details:
+                  type: boolean
+                  description: Persisted policy input controlling whether the later
+                    Server Voice runtime may expose detailed rather than coarse presence;
+                    this change does not implement that runtime.
+                private_call_tier:
+                  type: integer
+                  minimum: 0
+                  maximum: 2
+                  description: 'Persisted policy input for the later Private Call
+                    runtime: 0=call participants only, 1=participants plus friends
+                    and opted-in friends-of-friends, 2=those viewers plus shared-server
+                    peers. master_enabled=false overrides every tier. This change
+                    does not implement Private Call fan-out.'
+                private_call_show_details:
+                  type: boolean
+                  description: Persisted policy input controlling whether the later
+                    Private Call runtime may expose detailed rather than coarse presence;
+                    this change does not implement that runtime.
                 custom_text_tier:
                   type: integer
-                  enum:
-                  - 0
-                  - 1
-                  - 2
+                  minimum: 0
+                  maximum: 2
+                  description: 0=Off, 1=Friends (and opted-in friends-of-friends),
+                    2=those viewers plus shared-server peers.
                 custom_text:
                   type: string
                   maxLength: 140
+                  description: Empty string clears the saved text.
                 custom_text_emoji:
                   type: string
                   maxLength: 32
+                  description: Empty string clears the saved emoji.
       responses:
         '200':
           description: Updated presence settings
@@ -12094,18 +12181,69 @@ paths:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
+                required:
+                - master_enabled
+                - server_voice_tier
+                - server_voice_show_details
+                - private_call_tier
+                - private_call_show_details
+                - custom_text_tier
+                - custom_text
+                - custom_text_emoji
                 properties:
+                  master_enabled:
+                    type: boolean
+                    default: true
+                    description: Global Rich Presence authorization switch. False
+                      suppresses every category, including Private Call participants,
+                      without erasing saved category settings.
+                  server_voice_tier:
+                    type: integer
+                    minimum: 0
+                    maximum: 2
+                    default: 1
+                    description: 0=Off, 1=Friends (and opted-in friends-of-friends)
+                      in the active server, 2=all members of the active server.
+                  server_voice_show_details:
+                    type: boolean
+                    default: true
+                    description: Whether authorized Server Voice viewers receive
+                      detailed rather than coarse presence.
+                  private_call_tier:
+                    type: integer
+                    minimum: 0
+                    maximum: 2
+                    default: 0
+                    description: 0=call participants only, 1=participants plus friends
+                      and opted-in friends-of-friends, 2=those viewers plus shared-server
+                      peers. master_enabled=false overrides every tier.
+                  private_call_show_details:
+                    type: boolean
+                    default: false
+                    description: Whether authorized Private Call viewers receive
+                      detailed rather than coarse presence.
                   custom_text_tier:
                     type: integer
+                    minimum: 0
+                    maximum: 2
+                    default: 0
+                    description: 0=Off, 1=Friends (and opted-in friends-of-friends),
+                      2=those viewers plus shared-server peers.
                   custom_text:
                     type: string
                     nullable: true
+                    maxLength: 140
+                    default: null
                   custom_text_emoji:
                     type: string
                     nullable: true
+                    maxLength: 32
+                    default: null
         '400':
-          description: Invalid tier (must be 0, 1, or 2), custom_text over 140 characters,
-            or custom_text_emoji over 32 characters
+          description: Empty or malformed JSON object; null, duplicate, or unknown
+            fields; wrong field types; a tier outside 0..2; custom_text over 140
+            Unicode code points; or custom_text_emoji over 32 Unicode code points
   /users/me/presence-history:
     get:
       tags:

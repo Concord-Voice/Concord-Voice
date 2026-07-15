@@ -121,6 +121,47 @@ func readOverridePreference(t *testing.T, db *sql.DB, senderID uuid.UUID) (strin
 	return ciphertext, version, targets
 }
 
+func TestReplacePresenceOverrides_MasterOffNeverEmitsCustomTextUpdate(t *testing.T) {
+	db, _ := testhelpers.SetupTestDB(t)
+	ts := &testhelpers.TestServer{DB: db}
+	senderID := testhelpers.CreateUser(t, db)
+	viewerID := testhelpers.CreateUser(t, db)
+	testhelpers.AddFriendship(t, db, senderID, viewerID)
+	_, err := db.Exec(`
+		INSERT INTO user_presence_settings (
+			user_id, master_enabled, custom_text_tier, custom_text, custom_text_emoji
+		) VALUES ($1, FALSE, 2, 'saved while disabled', 'lock')
+	`, senderID)
+	require.NoError(t, err)
+	delivery := &task9Delivery{}
+	h := newTask9Handler(t, ts, delivery)
+
+	w := invokePresenceOverridePUT(t, h, senderID, presenceOverridePUTBody{
+		EncryptedData:   "bmV3",
+		ExpectedVersion: 0,
+		ExcludedUserIDs: []string{viewerID.String()},
+	})
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	plans := delivery.snapshot()
+	require.Len(t, plans, 1)
+	require.NotNil(t, plans[0].OverrideVersion)
+	assert.Equal(t, 1, *plans[0].OverrideVersion)
+	assert.Empty(t, plans[0].ClearRecipients)
+	assert.Empty(t, plans[0].UpdateRecipients)
+	assert.Nil(t, plans[0].Payload)
+	var master bool
+	var tier int
+	var text string
+	require.NoError(t, db.QueryRow(`
+		SELECT master_enabled, custom_text_tier, custom_text
+		FROM user_presence_settings WHERE user_id = $1
+	`, senderID).Scan(&master, &tier, &text))
+	assert.False(t, master)
+	assert.Equal(t, 2, tier)
+	assert.Equal(t, "saved while disabled", text)
+}
+
 func TestReplacePresenceOverrides_AtomicWrites(t *testing.T) {
 	t.Run("first write", func(t *testing.T) {
 		db, _ := testhelpers.SetupTestDB(t)

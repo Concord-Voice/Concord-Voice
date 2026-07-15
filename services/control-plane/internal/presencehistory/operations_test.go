@@ -131,9 +131,12 @@ func TestBeginAudienceOperationCapturesPriorStateAndCommitsMarker(t *testing.T) 
 	priorOperationID := uuid.New()
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO user_presence_settings (
-			user_id, custom_text_tier, custom_text, custom_text_emoji,
+			user_id, master_enabled,
+			server_voice_tier, server_voice_show_details,
+			private_call_tier, private_call_show_details,
+			custom_text_tier, custom_text, custom_text_emoji,
 			presence_settings_version, presence_settings_operation_id
-		) VALUES ($1, 2, 'before', '🔒', 7, $2)
+		) VALUES ($1, FALSE, 2, FALSE, 1, TRUE, 2, 'before', '🔒', 7, $2)
 	`, senderID, priorOperationID)
 	require.NoError(t, err)
 
@@ -148,6 +151,11 @@ func TestBeginAudienceOperationCapturesPriorStateAndCommitsMarker(t *testing.T) 
 	assert.Equal(t, priorOperationID, *operation.PriorOperationID)
 	assert.Equal(t, CustomTextState{Text: "before", Emoji: "🔒"}, operation.Before)
 	assert.Equal(t, 2, operation.BeforeTier)
+	assert.False(t, operation.BeforeMasterEnabled)
+	assert.Equal(t, 2, operation.BeforeServerVoiceTier)
+	assert.False(t, operation.BeforeServerVoiceShowDetails)
+	assert.Equal(t, 1, operation.BeforePrivateCallTier)
+	assert.True(t, operation.BeforePrivateCallShowDetails)
 
 	var (
 		version        int64
@@ -314,13 +322,18 @@ func TestAudienceCommitClassificationRequiresExactEvidence(t *testing.T) {
 	priorID := uuid.MustParse("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 	laterID := uuid.MustParse("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 	attempted := AudienceOperation{
-		ID:               attemptedID,
-		SenderID:         uuid.New(),
-		PriorVersion:     5,
-		Version:          6,
-		PriorOperationID: &priorID,
-		Before:           CustomTextState{Text: "before", Emoji: "🔒"},
-		BeforeTier:       2,
+		ID:                           attemptedID,
+		SenderID:                     uuid.New(),
+		PriorVersion:                 5,
+		Version:                      6,
+		PriorOperationID:             &priorID,
+		Before:                       CustomTextState{Text: "before", Emoji: "🔒"},
+		BeforeTier:                   2,
+		BeforeMasterEnabled:          false,
+		BeforeServerVoiceTier:        2,
+		BeforeServerVoiceShowDetails: false,
+		BeforePrivateCallTier:        1,
+		BeforePrivateCallShowDetails: true,
 	}
 
 	for _, tc := range []struct {
@@ -344,25 +357,35 @@ func TestAudienceCommitClassificationRequiresExactEvidence(t *testing.T) {
 		{
 			name: "confirmed rollback",
 			state: audienceCommitState{
-				UserExists:     true,
-				SettingsExists: true,
-				Version:        5,
-				OperationID:    &priorID,
-				Before:         CustomTextState{Text: "before", Emoji: "🔒"},
-				BeforeTier:     2,
+				UserExists:             true,
+				SettingsExists:         true,
+				Version:                5,
+				OperationID:            &priorID,
+				Before:                 CustomTextState{Text: "before", Emoji: "🔒"},
+				BeforeTier:             2,
+				MasterEnabled:          false,
+				ServerVoiceTier:        2,
+				ServerVoiceShowDetails: false,
+				PrivateCallTier:        1,
+				PrivateCallShowDetails: true,
 			},
 			want: RollbackConfirmed,
 		},
 		{
 			name: "confirmed forced rollback preserves prior pending marker",
 			state: audienceCommitState{
-				UserExists:         true,
-				SettingsExists:     true,
-				Version:            5,
-				OperationID:        &priorID,
-				Before:             CustomTextState{Text: "before", Emoji: "🔒"},
-				BeforeTier:         2,
-				PendingOperationID: &priorID,
+				UserExists:             true,
+				SettingsExists:         true,
+				Version:                5,
+				OperationID:            &priorID,
+				Before:                 CustomTextState{Text: "before", Emoji: "🔒"},
+				BeforeTier:             2,
+				MasterEnabled:          false,
+				ServerVoiceTier:        2,
+				ServerVoiceShowDetails: false,
+				PrivateCallTier:        1,
+				PrivateCallShowDetails: true,
+				PendingOperationID:     &priorID,
 			},
 			want: RollbackConfirmed,
 		},
@@ -432,9 +455,55 @@ func TestAudienceCommitClassificationRequiresExactEvidence(t *testing.T) {
 		})
 	}
 
-	firstWrite := AudienceOperation{ID: attemptedID, SenderID: uuid.New(), Version: 1}
+	rollbackState := func() audienceCommitState {
+		return audienceCommitState{
+			UserExists:             true,
+			SettingsExists:         true,
+			Version:                attempted.PriorVersion,
+			OperationID:            attempted.PriorOperationID,
+			Before:                 attempted.Before,
+			BeforeTier:             attempted.BeforeTier,
+			MasterEnabled:          attempted.BeforeMasterEnabled,
+			ServerVoiceTier:        attempted.BeforeServerVoiceTier,
+			ServerVoiceShowDetails: attempted.BeforeServerVoiceShowDetails,
+			PrivateCallTier:        attempted.BeforePrivateCallTier,
+			PrivateCallShowDetails: attempted.BeforePrivateCallShowDetails,
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*audienceCommitState)
+	}{
+		{name: "master enabled", change: func(state *audienceCommitState) { state.MasterEnabled = true }},
+		{name: "server voice tier", change: func(state *audienceCommitState) { state.ServerVoiceTier = 1 }},
+		{name: "server voice details", change: func(state *audienceCommitState) { state.ServerVoiceShowDetails = true }},
+		{name: "private call tier", change: func(state *audienceCommitState) { state.PrivateCallTier = 2 }},
+		{name: "private call details", change: func(state *audienceCommitState) { state.PrivateCallShowDetails = false }},
+	} {
+		t.Run("changed prior "+tc.name+" is unresolved", func(t *testing.T) {
+			state := rollbackState()
+			tc.change(&state)
+			assert.Equal(t, CommitUnresolved, classifyAudienceCommitState(attempted, state))
+		})
+	}
+
+	firstWrite := AudienceOperation{
+		ID:                           attemptedID,
+		SenderID:                     uuid.New(),
+		Version:                      1,
+		BeforeMasterEnabled:          true,
+		BeforeServerVoiceTier:        1,
+		BeforeServerVoiceShowDetails: true,
+		BeforePrivateCallTier:        0,
+		BeforePrivateCallShowDetails: false,
+	}
 	assert.Equal(t, RollbackConfirmed, classifyAudienceCommitState(firstWrite, audienceCommitState{
-		UserExists: true,
+		UserExists:             true,
+		MasterEnabled:          true,
+		ServerVoiceTier:        1,
+		ServerVoiceShowDetails: true,
+		PrivateCallTier:        0,
+		PrivateCallShowDetails: false,
 	}))
 }
 
@@ -499,14 +568,22 @@ func TestClassifyAudienceCommitReadsPrimaryDatabaseEvidence(t *testing.T) {
 		priorID := uuid.New()
 		_, err := db.ExecContext(ctx, `
 			INSERT INTO user_presence_settings (
-				user_id, custom_text_tier, custom_text, custom_text_emoji,
+				user_id, master_enabled,
+				server_voice_tier, server_voice_show_details,
+				private_call_tier, private_call_show_details,
+				custom_text_tier, custom_text, custom_text_emoji,
 				presence_settings_version, presence_settings_operation_id
-			) VALUES ($1, 2, 'prior', '🛡️', 9, $2)
+			) VALUES ($1, FALSE, 2, FALSE, 1, TRUE, 2, 'prior', '🛡️', 9, $2)
 		`, senderID, priorID)
 		require.NoError(t, err)
 		tx := operationBeginTx(ctx, t, db)
 		operation, err := service.BeginAudienceOperation(ctx, tx, senderID, OrdinaryAudienceWrite)
 		require.NoError(t, err)
+		assert.False(t, operation.BeforeMasterEnabled)
+		assert.Equal(t, 2, operation.BeforeServerVoiceTier)
+		assert.False(t, operation.BeforeServerVoiceShowDetails)
+		assert.Equal(t, 1, operation.BeforePrivateCallTier)
+		assert.True(t, operation.BeforePrivateCallShowDetails)
 		require.NoError(t, tx.Rollback())
 		assert.Equal(t, RollbackConfirmed, service.ClassifyAudienceCommit(ctx, operation))
 	})

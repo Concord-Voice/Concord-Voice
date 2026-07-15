@@ -1,10 +1,13 @@
 package users
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 	"unicode/utf8"
@@ -22,41 +25,63 @@ import (
 const (
 	customTextMaxRunes      = 140
 	customTextEmojiMaxRunes = 32
-	customTextTierMin       = 0
-	customTextTierMax       = 2
+	presenceTierMin         = 0
+	presenceTierMax         = 2
+	maxPresenceSettingsBody = 16 * 1024
 
 	errMsgFailedFetchPresence  = "Failed to fetch presence settings"
 	errMsgFailedUpdatePresence = "Failed to update presence settings"
 )
 
+var errInvalidPresenceSettingsBody = errors.New("invalid presence settings body")
+
 // presenceSettingsResponse is the wire shape for GET/PATCH presence-settings.
 // custom_text / custom_text_emoji are nullable (SQL NULL ⇒ JSON null) — they
 // carry user content and are NEVER logged.
 type presenceSettingsResponse struct {
-	CustomTextTier  int     `json:"custom_text_tier"`
-	CustomText      *string `json:"custom_text"`
-	CustomTextEmoji *string `json:"custom_text_emoji"`
+	MasterEnabled          bool    `json:"master_enabled"`
+	ServerVoiceTier        int     `json:"server_voice_tier"`
+	ServerVoiceShowDetails bool    `json:"server_voice_show_details"`
+	PrivateCallTier        int     `json:"private_call_tier"`
+	PrivateCallShowDetails bool    `json:"private_call_show_details"`
+	CustomTextTier         int     `json:"custom_text_tier"`
+	CustomText             *string `json:"custom_text"`
+	CustomTextEmoji        *string `json:"custom_text_emoji"`
+}
+
+func defaultPresenceSettingsResponse() presenceSettingsResponse {
+	return presenceSettingsResponse{
+		MasterEnabled:          true,
+		ServerVoiceTier:        1,
+		ServerVoiceShowDetails: true,
+	}
 }
 
 // GetPresenceSettings returns the caller's own presence settings.
-// Returns defaults ({0, null, null}) if no row exists yet.
+// Returns virtual schema defaults if no row exists yet.
 // GET /users/me/presence-settings
 func (h *Handler) GetPresenceSettings(c *gin.Context) {
 	userID := c.GetString("user_id")
 
-	var ps presenceSettingsResponse
+	ps := defaultPresenceSettingsResponse()
 	err := h.db.QueryRow(`
-		SELECT custom_text_tier, custom_text, custom_text_emoji
+		SELECT master_enabled, server_voice_tier, server_voice_show_details,
+		       private_call_tier, private_call_show_details,
+		       custom_text_tier, custom_text, custom_text_emoji
 		FROM user_presence_settings
 		WHERE user_id = $1
-	`, userID).Scan(&ps.CustomTextTier, &ps.CustomText, &ps.CustomTextEmoji)
+	`, userID).Scan(
+		&ps.MasterEnabled,
+		&ps.ServerVoiceTier,
+		&ps.ServerVoiceShowDetails,
+		&ps.PrivateCallTier,
+		&ps.PrivateCallShowDetails,
+		&ps.CustomTextTier,
+		&ps.CustomText,
+		&ps.CustomTextEmoji,
+	)
 	if err == sql.ErrNoRows {
-		// No row yet — return schema defaults (tier Off, no text/emoji).
-		c.JSON(http.StatusOK, presenceSettingsResponse{
-			CustomTextTier:  0,
-			CustomText:      nil,
-			CustomTextEmoji: nil,
-		})
+		c.JSON(http.StatusOK, defaultPresenceSettingsResponse())
 		return
 	}
 	if err != nil {
@@ -72,34 +97,142 @@ func (h *Handler) GetPresenceSettings(c *gin.Context) {
 // updatePresenceRequest is a partial update to presence settings. Pointer fields
 // distinguish "not supplied" from "supplied as empty/zero".
 type updatePresenceRequest struct {
-	CustomTextTier  *int    `json:"custom_text_tier"`
-	CustomText      *string `json:"custom_text"`
-	CustomTextEmoji *string `json:"custom_text_emoji"`
+	MasterEnabled          *bool   `json:"master_enabled"`
+	ServerVoiceTier        *int    `json:"server_voice_tier"`
+	ServerVoiceShowDetails *bool   `json:"server_voice_show_details"`
+	PrivateCallTier        *int    `json:"private_call_tier"`
+	PrivateCallShowDetails *bool   `json:"private_call_show_details"`
+	CustomTextTier         *int    `json:"custom_text_tier"`
+	CustomText             *string `json:"custom_text"`
+	CustomTextEmoji        *string `json:"custom_text_emoji"`
+}
+
+func readExactPresenceSettingsBody(reader io.Reader) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(reader, maxPresenceSettingsBody+1))
+	if err != nil || len(raw) == 0 || len(raw) > maxPresenceSettingsBody {
+		return nil, errInvalidPresenceSettingsBody
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return nil, errInvalidPresenceSettingsBody
+	}
+	fieldCount, err := readPresenceSettingsMembers(decoder)
+	if err != nil {
+		return nil, err
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') || fieldCount == 0 {
+		return nil, errInvalidPresenceSettingsBody
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return nil, errInvalidPresenceSettingsBody
+	}
+	return raw, nil
+}
+
+func readPresenceSettingsMembers(decoder *json.Decoder) (int, error) {
+	seen := make(map[string]struct{}, 8)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return 0, errInvalidPresenceSettingsBody
+		}
+		key, ok := token.(string)
+		if !ok {
+			return 0, errInvalidPresenceSettingsBody
+		}
+		switch key {
+		case "master_enabled",
+			"server_voice_tier",
+			"server_voice_show_details",
+			"private_call_tier",
+			"private_call_show_details",
+			"custom_text_tier",
+			"custom_text",
+			"custom_text_emoji":
+		default:
+			return 0, errInvalidPresenceSettingsBody
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return 0, errInvalidPresenceSettingsBody
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return 0, errInvalidPresenceSettingsBody
+		}
+		seen[key] = struct{}{}
+	}
+	return len(seen), nil
 }
 
 // presenceUpdate holds validated nullable bind values for the static partial
 // UPSERT. Invalid values represent omitted fields; valid empty strings retain
 // the API's clear-to-NULL semantics through NULLIF in the query.
 type presenceUpdate struct {
-	customTextTier  sql.NullInt64
-	customText      sql.NullString
-	customTextEmoji sql.NullString
-	fieldCount      int
+	masterEnabled          sql.NullBool
+	serverVoiceTier        sql.NullInt64
+	serverVoiceShowDetails sql.NullBool
+	privateCallTier        sql.NullInt64
+	privateCallShowDetails sql.NullBool
+	customTextTier         sql.NullInt64
+	customText             sql.NullString
+	customTextEmoji        sql.NullString
+	fieldCount             int
+}
+
+func validPresenceTier(tier int) bool {
+	return tier >= presenceTierMin && tier <= presenceTierMax
+}
+
+func presenceTierValue(tier *int, field string) (sql.NullInt64, int, string) {
+	if tier == nil {
+		return sql.NullInt64{}, 0, ""
+	}
+	if !validPresenceTier(*tier) {
+		return sql.NullInt64{}, 0, field + " must be 0, 1, or 2"
+	}
+	return sql.NullInt64{Int64: int64(*tier), Valid: true}, 1, ""
 }
 
 // buildPresenceUpdate validates the request and constructs its bound values.
 // Returns an HTTP status + error message on validation failure, or 0/"" on
 // success.
 func buildPresenceUpdate(req *updatePresenceRequest) (update presenceUpdate, status int, msg string) {
-
-	if req.CustomTextTier != nil {
-		tier := *req.CustomTextTier
-		if tier < customTextTierMin || tier > customTextTierMax {
-			return presenceUpdate{}, http.StatusBadRequest, "custom_text_tier must be 0, 1, or 2"
-		}
-		update.customTextTier = sql.NullInt64{Int64: int64(tier), Valid: true}
+	if req.MasterEnabled != nil {
+		update.masterEnabled = sql.NullBool{Bool: *req.MasterEnabled, Valid: true}
 		update.fieldCount++
 	}
+
+	var count int
+	update.serverVoiceTier, count, msg = presenceTierValue(req.ServerVoiceTier, "server_voice_tier")
+	if msg != "" {
+		return presenceUpdate{}, http.StatusBadRequest, msg
+	}
+	update.fieldCount += count
+
+	if req.ServerVoiceShowDetails != nil {
+		update.serverVoiceShowDetails = sql.NullBool{Bool: *req.ServerVoiceShowDetails, Valid: true}
+		update.fieldCount++
+	}
+
+	update.privateCallTier, count, msg = presenceTierValue(req.PrivateCallTier, "private_call_tier")
+	if msg != "" {
+		return presenceUpdate{}, http.StatusBadRequest, msg
+	}
+	update.fieldCount += count
+
+	if req.PrivateCallShowDetails != nil {
+		update.privateCallShowDetails = sql.NullBool{Bool: *req.PrivateCallShowDetails, Valid: true}
+		update.fieldCount++
+	}
+
+	update.customTextTier, count, msg = presenceTierValue(req.CustomTextTier, "custom_text_tier")
+	if msg != "" {
+		return presenceUpdate{}, http.StatusBadRequest, msg
+	}
+	update.fieldCount += count
 
 	if req.CustomText != nil {
 		text := *req.CustomText
@@ -124,18 +257,25 @@ func buildPresenceUpdate(req *updatePresenceRequest) (update presenceUpdate, sta
 
 const updatePresenceSettingsQuery = `
 	UPDATE user_presence_settings SET
-		custom_text_tier = COALESCE($2::smallint, custom_text_tier),
+		master_enabled = COALESCE($2::boolean, master_enabled),
+		server_voice_tier = COALESCE($3::smallint, server_voice_tier),
+		server_voice_show_details = COALESCE($4::boolean, server_voice_show_details),
+		private_call_tier = COALESCE($5::smallint, private_call_tier),
+		private_call_show_details = COALESCE($6::boolean, private_call_show_details),
+		custom_text_tier = COALESCE($7::smallint, custom_text_tier),
 		custom_text = CASE
-			WHEN $3::text IS NULL THEN custom_text
-			ELSE NULLIF($3::text, '')
+			WHEN $8::text IS NULL THEN custom_text
+			ELSE NULLIF($8::text, '')
 		END,
 		custom_text_emoji = CASE
-			WHEN $4::text IS NULL THEN custom_text_emoji
-			ELSE NULLIF($4::text, '')
+			WHEN $9::text IS NULL THEN custom_text_emoji
+			ELSE NULLIF($9::text, '')
 		END,
 		updated_at = clock_timestamp()
 	WHERE user_id = $1
-	RETURNING custom_text_tier, custom_text, custom_text_emoji
+	RETURNING master_enabled, server_voice_tier, server_voice_show_details,
+	          private_call_tier, private_call_show_details,
+	          custom_text_tier, custom_text, custom_text_emoji
 `
 
 type presenceWriterFailure struct {
@@ -160,6 +300,12 @@ type presenceSettingsWrite struct {
 func (h *Handler) UpdatePresenceSettings(c *gin.Context) {
 	userID := c.GetString("user_id")
 
+	raw, err := readExactPresenceSettingsBody(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
 	var req updatePresenceRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
@@ -184,10 +330,14 @@ func (h *Handler) UpdatePresenceSettings(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedUpdatePresence})
 		return
 	}
+	mode := presencehistory.OrdinaryAudienceWrite
+	if update.masterEnabled.Valid && !update.masterEnabled.Bool {
+		mode = presencehistory.ForcedSecurityClear
+	}
 	var write presenceSettingsWrite
-	err = h.presenceHistory.WithReadySender(c.Request.Context(), userUUID, func() error {
+	err = h.presenceHistory.WithReadySenderMode(c.Request.Context(), userUUID, mode, func() error {
 		var writeErr error
-		write, writeErr = h.writePresenceSettings(c.Request.Context(), userUUID, update)
+		write, writeErr = h.writePresenceSettings(c.Request.Context(), userUUID, update, mode)
 		return writeErr
 	})
 	if err != nil {
@@ -201,6 +351,7 @@ func (h *Handler) writePresenceSettings(
 	ctx context.Context,
 	senderID uuid.UUID,
 	update presenceUpdate,
+	mode presencehistory.OperationMode,
 ) (result presenceSettingsWrite, returnErr error) {
 	tx, err := h.presenceHistory.BeginTx(ctx, nil)
 	if err != nil {
@@ -213,7 +364,7 @@ func (h *Handler) writePresenceSettings(
 	defer h.joinPresenceWriterRollback(tx, &returnErr)
 
 	operation, err := h.presenceHistory.BeginAudienceOperation(
-		ctx, tx, senderID, presencehistory.OrdinaryAudienceWrite,
+		ctx, tx, senderID, mode,
 	)
 	if err != nil {
 		return result, err
@@ -221,8 +372,24 @@ func (h *Handler) writePresenceSettings(
 	var response presenceSettingsResponse
 	err = tx.QueryRowContext(
 		ctx, updatePresenceSettingsQuery, senderID,
-		update.customTextTier, update.customText, update.customTextEmoji,
-	).Scan(&response.CustomTextTier, &response.CustomText, &response.CustomTextEmoji)
+		update.masterEnabled,
+		update.serverVoiceTier,
+		update.serverVoiceShowDetails,
+		update.privateCallTier,
+		update.privateCallShowDetails,
+		update.customTextTier,
+		update.customText,
+		update.customTextEmoji,
+	).Scan(
+		&response.MasterEnabled,
+		&response.ServerVoiceTier,
+		&response.ServerVoiceShowDetails,
+		&response.PrivateCallTier,
+		&response.PrivateCallShowDetails,
+		&response.CustomTextTier,
+		&response.CustomText,
+		&response.CustomTextEmoji,
+	)
 	if err != nil {
 		return result, &presenceWriterFailure{status: 500, class: "update", cause: err}
 	}
@@ -255,8 +422,15 @@ func preparePresenceSettingsPlan(
 	operation presencehistory.AudienceOperation,
 	after presenceSettingsResponse,
 ) (presencehistory.DeliveryPlan, error) {
+	if operation.SupersededPending {
+		return presencehistory.DeliveryPlan{
+			Mode:        presencehistory.DeliveryConservativeReset,
+			OperationID: operation.ID,
+			SenderID:    operation.SenderID,
+		}, nil
+	}
 	oldAudience := map[uuid.UUID]bool{}
-	if operation.BeforeTier > 0 && operation.Before.Text != "" {
+	if operation.BeforeMasterEnabled && operation.BeforeTier > 0 && operation.Before.Text != "" {
 		var err error
 		oldAudience, err = presence.ComputeCustomTextAudienceForTier(
 			ctx, tx, operation.SenderID, operation.BeforeTier,
@@ -378,13 +552,13 @@ func (h *Handler) respondPresenceWriterFailure(c *gin.Context, message string, e
 }
 
 // customTextPayloadFromRow derives the fan-out payload from the persisted row.
-// A nil result means CLEAR (rich_presence_clear): the user is Off (tier 0) or has
-// no visible custom_text. A non-nil result is an UPDATE carrying the text and the
-// optional emoji. This mirrors the audience semantics of
-// presence.ComputeCustomTextAudience (tier 0 ⇒ empty audience) while ensuring the
-// client also drops any previously-shown status on a clear.
+// A nil result means CLEAR (rich_presence_clear): the master is disabled, the
+// user is Off (tier 0), or no visible custom_text exists. A non-nil result is an
+// UPDATE carrying the text and optional emoji. This mirrors the audience
+// semantics of presence.ComputeCustomTextAudience while ensuring the client also
+// drops any previously-shown status on a clear.
 func customTextPayloadFromRow(ps presenceSettingsResponse) *websocket.CustomTextPayload {
-	if ps.CustomTextTier == 0 || ps.CustomText == nil || *ps.CustomText == "" {
+	if !ps.MasterEnabled || ps.CustomTextTier == 0 || ps.CustomText == nil || *ps.CustomText == "" {
 		return nil // clear
 	}
 	payload := &websocket.CustomTextPayload{Text: *ps.CustomText}

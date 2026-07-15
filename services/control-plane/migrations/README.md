@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000088)
+## Existing Migrations (000001–000089)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -198,6 +198,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000086 | ops_metrics | Aggregate-only operations samples and hourly rollups (#1689) |
 | 000087 | presence_history | Opt-in activity intervals, consent settings, and durable presence-write reconciliation markers (#1235) |
 | 000088 | ops_metrics_reader | Restricted admin metrics reader role (#1690) |
+| 000089 | add_presence_category_settings | Master, Server Voice, and Private Call persisted privacy controls (#2229) |
 
 ## Troubleshooting
 
@@ -208,7 +209,6 @@ If a migration fails mid-execution, the database may be in a "dirty" state:
 ```bash
 # Check if dirty
 make migrate-version
-
 # To fix, manually correct the database and force version
 # OR rollback to previous version and reapply
 ```

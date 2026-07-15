@@ -440,10 +440,10 @@ func prepareCurrentCustomTextPayload(
 ) (*websocket.CustomTextPayload, error) {
 	var ps presenceSettingsResponse
 	err := db.QueryRowContext(ctx, `
-		SELECT custom_text_tier, custom_text, custom_text_emoji
+		SELECT master_enabled, custom_text_tier, custom_text, custom_text_emoji
 		FROM user_presence_settings
 		WHERE user_id = $1
-	`, senderID).Scan(&ps.CustomTextTier, &ps.CustomText, &ps.CustomTextEmoji)
+	`, senderID).Scan(&ps.MasterEnabled, &ps.CustomTextTier, &ps.CustomText, &ps.CustomTextEmoji)
 	if err == sql.ErrNoRows {
 		return customTextPayloadFromRow(presenceSettingsResponse{}), nil
 	}

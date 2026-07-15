@@ -32,11 +32,16 @@ type pendingOperationRow struct {
 }
 
 type lockedPresenceSettings struct {
-	Version     int64
-	OperationID uuid.NullUUID
-	Tier        int
-	Text        sql.NullString
-	Emoji       sql.NullString
+	Version                int64
+	OperationID            uuid.NullUUID
+	MasterEnabled          bool
+	ServerVoiceTier        int
+	ServerVoiceShowDetails bool
+	PrivateCallTier        int
+	PrivateCallShowDetails bool
+	Tier                   int
+	Text                   sql.NullString
+	Emoji                  sql.NullString
 }
 
 type reconcileResult struct {
@@ -129,7 +134,7 @@ func (s *Service) WithReadySender(ctx context.Context, senderID uuid.UUID, work 
 }
 
 // WithReadySenderMode retains the same single sender gate while allowing a
-// forced privacy-narrowing clear to supersede an unexpired ordinary marker.
+// forced privacy-narrowing clear to supersede any ordinary marker.
 func (s *Service) WithReadySenderMode(
 	ctx context.Context,
 	senderID uuid.UUID,
@@ -146,7 +151,7 @@ func (s *Service) WithReadySenderMode(
 		return err
 	}
 	return s.WithSender(ctx, senderID, func() error {
-		if _, err := s.reconcileSenderAlreadyGated(ctx, senderID); err != nil {
+		if _, err := s.reconcileSenderAlreadyGated(ctx, senderID, mode); err != nil {
 			var pending *ServiceError
 			if mode != ForcedSecurityClear || !errors.As(err, &pending) ||
 				err != pending || pending.Code != "presence_operation_pending" {
@@ -332,7 +337,9 @@ func isAuthoritativeSupersedingClear(
 ) bool {
 	return pending.ID != planOperationID &&
 		pending.PriorVersion != math.MaxInt64 && settings.Version == pending.PriorVersion+1 &&
-		settings.Tier == 0 && !settings.Text.Valid && !settings.Emoji.Valid
+		settings.OperationID.Valid && settings.OperationID.UUID == pending.ID &&
+		(!settings.MasterEnabled ||
+			(settings.Tier == 0 && !settings.Text.Valid && !settings.Emoji.Valid))
 }
 
 func (s *Service) recoverAllLocalClaim(
@@ -631,7 +638,7 @@ func (s *Service) reconcileOne(ctx context.Context, senderID uuid.UUID) (reconci
 	var result reconcileResult
 	err := s.WithSender(ctx, senderID, func() error {
 		var err error
-		result, err = s.reconcileSenderAlreadyGated(ctx, senderID)
+		result, err = s.reconcileSenderAlreadyGated(ctx, senderID, OrdinaryAudienceWrite)
 		return err
 	})
 	if err != nil && result == (reconcileResult{}) {
@@ -697,6 +704,7 @@ func (s *Service) RunPendingReconciler(ctx context.Context) {
 func (s *Service) reconcileSenderAlreadyGated(
 	ctx context.Context,
 	senderID uuid.UUID,
+	mode OperationMode,
 ) (result reconcileResult, returnErr error) {
 	tx, err := s.BeginTx(ctx, nil)
 	if err != nil {
@@ -718,6 +726,9 @@ func (s *Service) reconcileSenderAlreadyGated(
 	var now time.Time
 	if err := tx.QueryRowContext(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
 		return reconcileResult{retained: true}, fmt.Errorf("read presence reconciliation clock: %w", err)
+	}
+	if mode == ForcedSecurityClear {
+		return reconcileResult{retained: true}, pendingOperationError(pending, now)
 	}
 	if pending.ReconcileAfter.After(now) {
 		return reconcileResult{retained: true}, pendingOperationError(pending, now)
@@ -775,7 +786,7 @@ func (s *Service) reconcileLockedPending(
 	if settings.Version == math.MaxInt64 {
 		return reconcileResult{retained: true}, errors.New("presence settings version exhausted")
 	}
-	if settings.Tier == 0 {
+	if !settings.MasterEnabled || settings.Tier == 0 {
 		if err := s.RollbackTx(tx); err != nil && !errors.Is(err, sql.ErrTxDone) {
 			return reconcileResult{retained: true}, fmt.Errorf("release presence reconciliation locks: %w", err)
 		}
@@ -801,6 +812,11 @@ func lockPresenceSettings(
 	err := tx.QueryRowContext(ctx, `
 		SELECT presence_settings_version,
 		       presence_settings_operation_id,
+		       master_enabled,
+		       server_voice_tier,
+		       server_voice_show_details,
+		       private_call_tier,
+		       private_call_show_details,
 		       custom_text_tier,
 		       custom_text,
 		       custom_text_emoji
@@ -810,6 +826,11 @@ func lockPresenceSettings(
 	`, senderID).Scan(
 		&settings.Version,
 		&settings.OperationID,
+		&settings.MasterEnabled,
+		&settings.ServerVoiceTier,
+		&settings.ServerVoiceShowDetails,
+		&settings.PrivateCallTier,
+		&settings.PrivateCallShowDetails,
 		&settings.Tier,
 		&settings.Text,
 		&settings.Emoji,
@@ -896,7 +917,8 @@ func (s *Service) compensateAndClaim(
 	}
 	result, err = tx.ExecContext(ctx, `
 		UPDATE user_presence_settings
-		SET custom_text_tier = 0,
+		SET master_enabled = FALSE,
+		    custom_text_tier = 0,
 		    custom_text = NULL,
 		    custom_text_emoji = NULL,
 		    presence_settings_version = $2,
@@ -917,16 +939,7 @@ func (s *Service) compensateAndClaim(
 	if err := s.RecordCustomTextTransition(ctx, tx, senderID, before, CustomTextState{}); err != nil {
 		return reconcileResult{retained: true}, fmt.Errorf("record compensated presence reset: %w", err)
 	}
-	priorID := pending.ID
-	operation := AudienceOperation{
-		ID:               operationID,
-		SenderID:         senderID,
-		PriorVersion:     settings.Version,
-		Version:          settings.Version + 1,
-		PriorOperationID: &priorID,
-		Before:           before,
-		BeforeTier:       settings.Tier,
-	}
+	operation := compensationAudienceOperation(senderID, operationID, settings, pending)
 	if err := s.CommitTx(tx); err != nil {
 		rollbackErr := s.RollbackTx(tx)
 		if rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
@@ -948,6 +961,29 @@ func (s *Service) compensateAndClaim(
 		return reconcileResult{compensated: true, retained: true}, claimErr
 	}
 	return reconcileResult{resolved: true, compensated: true}, nil
+}
+
+func compensationAudienceOperation(
+	senderID uuid.UUID,
+	operationID uuid.UUID,
+	settings lockedPresenceSettings,
+	pending pendingOperationRow,
+) AudienceOperation {
+	priorID := pending.ID
+	return AudienceOperation{
+		ID:                           operationID,
+		SenderID:                     senderID,
+		PriorVersion:                 settings.Version,
+		Version:                      settings.Version + 1,
+		PriorOperationID:             &priorID,
+		Before:                       normalizeCustomTextState(CustomTextState{Text: nullableString(settings.Text), Emoji: nullableString(settings.Emoji)}),
+		BeforeTier:                   settings.Tier,
+		BeforeMasterEnabled:          settings.MasterEnabled,
+		BeforeServerVoiceTier:        settings.ServerVoiceTier,
+		BeforeServerVoiceShowDetails: settings.ServerVoiceShowDetails,
+		BeforePrivateCallTier:        settings.PrivateCallTier,
+		BeforePrivateCallShowDetails: settings.PrivateCallShowDetails,
+	}
 }
 
 func (s *Service) effectiveReconcileInterval() time.Duration {
