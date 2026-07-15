@@ -2,8 +2,14 @@ package rbac_test
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"io"
+	"slices"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -412,6 +418,276 @@ func TestGetVisibleChannelIDsAdminIgnoresDenyOverrides(t *testing.T) {
 	assert.Len(t, ids, 2, "admin should see all channels despite deny overrides")
 	assert.Contains(t, ids, ch1)
 	assert.Contains(t, ids, ch2)
+}
+
+func TestFilterVisibleUserIDsForChannelFreshMatchesPerViewerVisibility(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "channelviewowner")
+	visible := ts.CreateTestUser(t, "channelviewvisible")
+	admin := ts.CreateTestUser(t, "channelviewadmin")
+	denied := ts.CreateTestUser(t, "channelviewdenied")
+	overrideAdmin := ts.CreateTestUser(t, "channelviewoverrideadmin")
+	temporary := ts.CreateTestUser(t, "channelviewtemporary")
+	outsider := ts.CreateTestUser(t, "channelviewoutsider")
+	serverID := ts.CreateTestServer(t, owner.ID, "Channel Viewer Server")
+	for _, userID := range []string{visible.ID, admin.ID, denied.ID, overrideAdmin.ID, temporary.ID} {
+		ts.AddMemberToServer(t, serverID, userID, "member")
+	}
+
+	adminRoleID := ts.CreateTestRole(t, serverID, "Channel Viewer Admin", 10, int64(rbac.PermAdministrator))
+	ts.AssignRoleToUser(t, serverID, admin.ID, adminRoleID)
+	channelID := ts.CreateVoiceChannel(t, serverID, "Channel Viewer Voice")
+	viewVoice := int64(rbac.PermViewVoiceChannels)
+	ts.CreateChannelOverride(t, channelID, "user", denied.ID, 0, viewVoice)
+	ts.CreateChannelOverride(t, channelID, "user", outsider.ID, viewVoice, 0)
+	ts.CreateChannelOverride(
+		t,
+		channelID,
+		"user",
+		overrideAdmin.ID,
+		int64(rbac.PermAdministrator|rbac.PermViewTextChannels|rbac.PermJoinVoice|rbac.PermSpeak),
+		viewVoice,
+	)
+	temporaryDeniedRole := ts.CreateTestRole(t, serverID, "Temporary Viewer Deny", 2, 0)
+	ts.AssignRoleToUser(t, serverID, temporary.ID, temporaryDeniedRole)
+	ts.CreateChannelOverride(t, channelID, "role", temporaryDeniedRole, 0, viewVoice)
+
+	candidates := []string{
+		owner.ID,
+		visible.ID,
+		admin.ID,
+		denied.ID,
+		overrideAdmin.ID,
+		temporary.ID,
+		outsider.ID,
+		visible.ID,
+	}
+	bulk, err := resolver.FilterVisibleUserIDsForChannelFresh(ctx, serverID, channelID, candidates)
+	require.NoError(t, err)
+
+	expected := make([]string, 0, len(candidates))
+	seen := make(map[string]bool)
+	for _, candidateID := range candidates {
+		if seen[candidateID] {
+			continue
+		}
+		seen[candidateID] = true
+		visibleChannelIDs, resolveErr := resolver.GetVisibleChannelIDs(ctx, serverID, candidateID)
+		require.NoError(t, resolveErr)
+		if slices.Contains(visibleChannelIDs, channelID) {
+			expected = append(expected, candidateID)
+		}
+	}
+	require.ElementsMatch(t, expected, bulk)
+	require.NotContains(t, bulk, denied.ID)
+	require.NotContains(t, bulk, overrideAdmin.ID, "SBAC-granted administrator is not a bypass")
+	require.NotContains(t, bulk, temporary.ID)
+	require.NotContains(t, bulk, outsider.ID)
+
+	ts.CreateChannelOverride(t, channelID, "user", temporary.ID, viewVoice, 0)
+	_, err = ts.DB.Exec(`
+		UPDATE channel_permission_overrides
+		SET is_temporary = TRUE, temporary_reason = 'move_granted', granted_at = NOW()
+		WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2
+	`, channelID, temporary.ID)
+	require.NoError(t, err)
+	temporaryViewers, err := resolver.FilterVisibleUserIDsForChannelFresh(ctx, serverID, channelID, []string{temporary.ID})
+	require.NoError(t, err)
+	require.Equal(t, []string{temporary.ID}, temporaryViewers, "fresh temporary allow overrides role deny")
+	_, err = ts.DB.Exec(
+		`DELETE FROM channel_permission_overrides
+		 WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2 AND is_temporary = TRUE`,
+		channelID,
+		temporary.ID,
+	)
+	require.NoError(t, err)
+	temporaryViewers, err = resolver.FilterVisibleUserIDsForChannelFresh(ctx, serverID, channelID, []string{temporary.ID})
+	require.NoError(t, err)
+	require.Empty(t, temporaryViewers, "revoked temporary access disappears without a cache read")
+
+	_, err = ts.DB.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, owner.ID)
+	require.NoError(t, err)
+	staleOwner, err := resolver.FilterVisibleUserIDsForChannelFresh(ctx, serverID, channelID, []string{owner.ID})
+	require.NoError(t, err)
+	require.Empty(t, staleOwner, "owner bypass still requires current membership")
+
+	empty, err := resolver.FilterVisibleUserIDsForChannelFresh(ctx, serverID, channelID, nil)
+	require.NoError(t, err)
+	require.Equal(t, []string{}, empty)
+
+	otherOwner := ts.CreateTestUser(t, "channelviewotherowner")
+	otherServerID := ts.CreateTestServer(t, otherOwner.ID, "Other Channel Viewer Server")
+	otherChannelID := ts.CreateVoiceChannel(t, otherServerID, "Other Channel Viewer Voice")
+	wrongScope, err := resolver.FilterVisibleUserIDsForChannelFresh(ctx, serverID, otherChannelID, candidates)
+	require.NoError(t, err)
+	require.Empty(t, wrongScope)
+
+	invalid, err := resolver.FilterVisibleUserIDsForChannelFresh(
+		ctx,
+		serverID,
+		channelID,
+		[]string{visible.ID, "not-a-uuid"},
+	)
+	require.Error(t, err)
+	require.Nil(t, invalid, "one malformed candidate must fail the whole fresh decision")
+}
+
+func TestFilterVisibleUserIDsForChannelFreshIgnoresCrossServerRoleMapping(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	ownerA := ts.CreateTestUser(t, "channelviewcrossownera")
+	member := ts.CreateTestUser(t, "channelviewcrossmember")
+	serverA := ts.CreateTestServer(t, ownerA.ID, "Channel Viewer Cross A")
+	ts.AddMemberToServer(t, serverA, member.ID, "member")
+	channelA := ts.CreateVoiceChannel(t, serverA, "Channel Viewer Cross Voice")
+
+	var defaultRoleA string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverA,
+	).Scan(&defaultRoleA))
+	viewVoice := int64(rbac.PermViewVoiceChannels)
+	_, err := ts.DB.Exec(
+		`UPDATE roles SET permissions = permissions & ~$1::bigint WHERE id = $2`,
+		viewVoice,
+		defaultRoleA,
+	)
+	require.NoError(t, err)
+
+	ownerB := ts.CreateTestUser(t, "channelviewcrossownerb")
+	serverB := ts.CreateTestServer(t, ownerB.ID, "Channel Viewer Cross B")
+	foreignRole := ts.CreateTestRole(t, serverB, "Foreign Viewer", 2, 0)
+	_, err = ts.DB.Exec(
+		`INSERT INTO member_roles (server_id, user_id, role_id) VALUES ($1, $2, $3)`,
+		serverA,
+		member.ID,
+		foreignRole,
+	)
+	require.NoError(t, err, "schema permits the malformed cross-server role mapping fixture")
+	ts.CreateChannelOverride(t, channelA, "role", foreignRole, viewVoice, 0)
+
+	viewers, err := resolver.FilterVisibleUserIDsForChannelFresh(ctx, serverA, channelA, []string{member.ID})
+	require.NoError(t, err)
+	require.Empty(t, viewers, "a foreign role allow must not authorize this server")
+
+	_, err = ts.DB.Exec(
+		`UPDATE roles SET permissions = permissions | $1::bigint WHERE id = $2`,
+		viewVoice,
+		defaultRoleA,
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`UPDATE channel_permission_overrides SET allow = 0, deny = $1
+		 WHERE channel_id = $2 AND target_type = 'role' AND target_id = $3`,
+		viewVoice,
+		channelA,
+		foreignRole,
+	)
+	require.NoError(t, err)
+
+	viewers, err = resolver.FilterVisibleUserIDsForChannelFresh(ctx, serverA, channelA, []string{member.ID})
+	require.NoError(t, err)
+	require.Equal(t, []string{member.ID}, viewers, "a foreign role deny must not hide this server")
+}
+
+func TestFilterVisibleUserIDsForChannelFreshUsesOneQueryForCandidateSet(t *testing.T) {
+	candidates := make([]string, 1000)
+	for i := range candidates {
+		candidates[i] = uuid.NewString()
+	}
+	connection := &channelViewerCountingConnection{resultIDs: []string{candidates[999]}}
+	db := sql.OpenDB(&channelViewerCountingConnector{connection: connection})
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	resolver := rbac.NewResolver(db, nil, nil)
+
+	viewers, err := resolver.FilterVisibleUserIDsForChannelFresh(
+		context.Background(),
+		uuid.NewString(),
+		uuid.NewString(),
+		candidates,
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{candidates[999]}, viewers)
+	require.Equal(t, 1, connection.queryCount)
+	require.Contains(t, connection.query, "unnest($3::uuid[])")
+	require.Len(t, connection.args, 6)
+
+	viewers, err = resolver.FilterVisibleUserIDsForChannelFresh(
+		context.Background(),
+		uuid.NewString(),
+		uuid.NewString(),
+		nil,
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{}, viewers)
+	require.Equal(t, 1, connection.queryCount, "an empty candidate set must not query")
+}
+
+type channelViewerCountingConnector struct {
+	connection *channelViewerCountingConnection
+}
+
+func (connector *channelViewerCountingConnector) Connect(context.Context) (driver.Conn, error) {
+	return connector.connection, nil
+}
+
+func (connector *channelViewerCountingConnector) Driver() driver.Driver {
+	return channelViewerCountingDriver{}
+}
+
+type channelViewerCountingDriver struct{}
+
+func (channelViewerCountingDriver) Open(string) (driver.Conn, error) {
+	return nil, errors.New("channel viewer test driver requires Connector")
+}
+
+type channelViewerCountingConnection struct {
+	queryCount int
+	query      string
+	args       []driver.NamedValue
+	resultIDs  []string
+}
+
+func (*channelViewerCountingConnection) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("unexpected prepare")
+}
+
+func (*channelViewerCountingConnection) Close() error { return nil }
+
+func (*channelViewerCountingConnection) Begin() (driver.Tx, error) {
+	return nil, errors.New("unexpected transaction")
+}
+
+func (connection *channelViewerCountingConnection) QueryContext(
+	_ context.Context,
+	query string,
+	args []driver.NamedValue,
+) (driver.Rows, error) {
+	connection.queryCount++
+	connection.query = query
+	connection.args = append([]driver.NamedValue(nil), args...)
+	return &channelViewerCountingRows{ids: append([]string(nil), connection.resultIDs...)}, nil
+}
+
+type channelViewerCountingRows struct {
+	ids   []string
+	index int
+}
+
+func (*channelViewerCountingRows) Columns() []string { return []string{"user_id"} }
+
+func (*channelViewerCountingRows) Close() error { return nil }
+
+func (rows *channelViewerCountingRows) Next(values []driver.Value) error {
+	if rows.index >= len(rows.ids) {
+		return io.EOF
+	}
+	values[0] = rows.ids[rows.index]
+	rows.index++
+	return nil
 }
 
 // --- GetAllVisibleChannelIDs Tests ---

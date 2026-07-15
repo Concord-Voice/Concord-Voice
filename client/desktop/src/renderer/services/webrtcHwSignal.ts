@@ -33,10 +33,10 @@ export function extractWebrtcHwSignal(
       // that actually reports the HW bit rather than blindly keeping the last-iterated
       // one — otherwise a trailing inactive layer would defeat the whole B-signal.
       const candidate = report as typeof outbound;
-      if (candidate?.powerEfficientEncoder !== undefined) {
-        outbound = candidate;
-      } else {
+      if (candidate?.powerEfficientEncoder === undefined) {
         outbound ??= candidate;
+      } else {
+        outbound = candidate;
       }
     } else if (r.type === 'codec' && r.id && r.mimeType) {
       codecMimes.set(r.id, r.mimeType);

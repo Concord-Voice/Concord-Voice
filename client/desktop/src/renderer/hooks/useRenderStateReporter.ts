@@ -109,13 +109,13 @@ export function useRenderStateReporter({
     // SFU layer picker keys on. Mirror the PiP fix: a ResizeObserver re-reports through
     // the same report() path on box changes. Skip a sub-1px (not-yet-laid-out) box.
     const resizeObserver =
-      typeof ResizeObserver !== 'undefined'
-        ? new ResizeObserver(() => {
+      typeof ResizeObserver === 'undefined'
+        ? null
+        : new ResizeObserver(() => {
             const rect = el.getBoundingClientRect();
             if (rect.width < 1 || rect.height < 1) return;
             report();
-          })
-        : null;
+          });
     resizeObserver?.observe(el);
     void import('../services/voiceService')
       .then((m) => {

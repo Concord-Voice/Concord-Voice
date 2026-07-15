@@ -214,7 +214,7 @@ const VoiceStage: React.FC = () => {
         sharerName={dominantSharerName}
         showOverlay={false}
         isPaused={isDominantLocal && localStreamPaused}
-        sharerUserId={!isDominantLocal ? dominant?.userId : undefined}
+        sharerUserId={isDominantLocal ? undefined : dominant?.userId}
         renderRole="focus"
       />
 

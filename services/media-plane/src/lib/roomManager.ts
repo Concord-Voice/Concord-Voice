@@ -513,13 +513,13 @@ export const ABSOLUTE_AUDIO_LAST_N_CEILING = 16;
 /**
  * Resolve the per-room audio last-N forwarded-speaker cap.
  *
- * TODO(#1294): the prerequisites HAVE landed — the entitlement resolver (#1521),
- * the /voice/join tier plumbing (#1300), and the tier-aware room-cap read
- * (#1542, resolveRoomCapTier). Wiring audio last-N to that same tier read
- * (paid value 16) remains DELIBERATELY deferred to the #1294 tier-seam
- * follow-up (it must also resize the AudioLevelObserver, which is created
- * before the Room exists — see the param note below). Until then every room
- * resolves to the free default.
+ * Deferred to #2288 (successor to the closed #1294 epic): the prerequisites
+ * HAVE landed — the entitlement resolver (#1521), the /voice/join tier
+ * plumbing (#1300), and the tier-aware room-cap read (#1542,
+ * resolveRoomCapTier). Wiring audio last-N to that same tier read (paid
+ * value 16) remains DELIBERATELY deferred to #2288 (it must also account for
+ * the AudioLevelObserver sizing, which happens before the Room exists — see
+ * the param note below). Until then every room resolves to the free default.
  *
  * `room` is optional because the cap is resolved at room-creation time, BEFORE
  * the Room object exists (the observer must be sized first). It is unused today

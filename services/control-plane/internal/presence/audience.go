@@ -127,6 +127,22 @@ func serverPeersOf(ctx context.Context, db DBTX, senderID uuid.UUID) (map[uuid.U
 	return out, nil
 }
 
+// serverMembersOf returns the members of one exact server, excluding senderID.
+func serverMembersOf(ctx context.Context, db DBTX, serverID, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
+	out := make(map[uuid.UUID]bool)
+	rows, err := db.QueryContext(ctx,
+		`SELECT user_id FROM server_members WHERE server_id = $1 AND user_id <> $2`,
+		serverID, senderID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("presence audience: query server members: %w", err)
+	}
+	if err := scanIDs(rows, out); err != nil {
+		return nil, fmt.Errorf("presence audience: scan server members: %w", err)
+	}
+	return out, nil
+}
+
 // friendsOfFriendsEnabled reads the sender's dm_friends_of_friends flag from
 // privacy_settings; a missing row defaults to false.
 func friendsOfFriendsEnabled(ctx context.Context, db DBTX, userID uuid.UUID) (bool, error) {
