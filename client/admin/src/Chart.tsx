@@ -1,9 +1,10 @@
 import type {
   AdminSeriesResponse,
   MetricKey,
-  MetricUnit,
+  RollupMode,
   SeriesWindow,
 } from "./contracts";
+import { formatScalar } from "./formatMetric";
 
 const WIDTH = 800;
 const HEIGHT = 240;
@@ -69,18 +70,16 @@ const WINDOW_LABELS: Record<SeriesWindow, string> = {
   "7d": "7 days",
 };
 
-const UNIT_SUFFIXES: Record<MetricUnit, string> = {
-  percent: "%",
-  count: "",
-  bytes: " bytes",
-  bits_per_second: " bps",
-  load: "",
-  hours: " hours",
+const ROLLUP_LABELS: Record<RollupMode, { summary: string; column: string }> = {
+  average: {
+    summary: "Latest hourly average",
+    column: "Hourly average",
+  },
+  last: {
+    summary: "Latest hourly value",
+    column: "Hourly value",
+  },
 };
-
-function formatValue(value: number, unit: MetricUnit): string {
-  return `${String(value)}${UNIT_SUFFIXES[unit]}`;
-}
 
 function polylinePoints(response: AdminSeriesResponse): string {
   const values = response.points.map(({ value }) => value);
@@ -122,10 +121,11 @@ export function SeriesChart({
   }
 
   const chartTitle = `${label} over ${WINDOW_LABELS[response.window]}`;
+  const rollupLabels = ROLLUP_LABELS[response.metric.rollup];
   const latest = latestPoint.value;
   const minimum = Math.min(...response.points.map((point) => point.minimum));
   const maximum = Math.max(...response.points.map((point) => point.maximum));
-  const summary = `Latest: ${formatValue(latest, response.metric.unit)}; minimum: ${formatValue(minimum, response.metric.unit)}; maximum: ${formatValue(maximum, response.metric.unit)}.`;
+  const summary = `${rollupLabels.summary}: ${formatScalar(latest, response.metric.unit)}; minimum: ${formatScalar(minimum, response.metric.unit)}; maximum: ${formatScalar(maximum, response.metric.unit)}.`;
 
   return (
     <section className="chart-wrap">
@@ -155,7 +155,7 @@ export function SeriesChart({
           <thead>
             <tr>
               <th scope="col">Bucket time</th>
-              <th scope="col">Value</th>
+              <th scope="col">{rollupLabels.column}</th>
               <th scope="col">Minimum</th>
               <th scope="col">Maximum</th>
               <th scope="col">Sample count</th>
@@ -169,10 +169,10 @@ export function SeriesChart({
                     {point.bucket_start}
                   </time>
                 </td>
-                <td>{point.value}</td>
-                <td>{point.minimum}</td>
-                <td>{point.maximum}</td>
-                <td>{point.sample_count}</td>
+                <td>{formatScalar(point.value, response.metric.unit)}</td>
+                <td>{formatScalar(point.minimum, response.metric.unit)}</td>
+                <td>{formatScalar(point.maximum, response.metric.unit)}</td>
+                <td>{formatScalar(point.sample_count, "count")}</td>
               </tr>
             ))}
           </tbody>

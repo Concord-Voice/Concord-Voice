@@ -36,9 +36,9 @@ describe("SeriesChart", () => {
   it("renders an accessible chart, text summary, and every point in a semantic table", () => {
     const response = seriesFixture();
     response.points = [
-      point("2026-07-14T10:00:00Z", 12.5, 10, 15, 3),
-      point("2026-07-14T11:00:00Z", 18, 11, 20, 4),
-      point("2026-07-14T12:00:00Z", 14, 12, 16, 5),
+      point("2026-07-14T10:00:00Z", 12.3456, 10.126, 15.678, 3),
+      point("2026-07-14T11:00:00Z", 18.234, 11.111, 20.999, 4),
+      point("2026-07-14T12:00:00Z", 14.126, 12.555, 16.444, 5),
     ];
 
     render(<SeriesChart response={response} />);
@@ -51,7 +51,9 @@ describe("SeriesChart", () => {
       "Host CPU over 24 hours",
     );
     expect(
-      screen.getByText("Latest: 14%; minimum: 10%; maximum: 20%."),
+      screen.getByText(
+        "Latest hourly average: 14.13%; minimum: 10.13%; maximum: 21%.",
+      ),
     ).toBeVisible();
     expect(screen.queryByText("host_cpu_percent")).not.toBeInTheDocument();
 
@@ -66,23 +68,128 @@ describe("SeriesChart", () => {
       within(table)
         .getAllByRole("columnheader")
         .map((header) => header.textContent),
-    ).toEqual(["Bucket time", "Value", "Minimum", "Maximum", "Sample count"]);
+    ).toEqual([
+      "Bucket time",
+      "Hourly average",
+      "Minimum",
+      "Maximum",
+      "Sample count",
+    ]);
     expect(
       within(within(table).getAllByRole("row")[1])
         .getAllByRole("cell")
         .map((cell) => cell.textContent),
-    ).toEqual(["2026-07-14T10:00:00Z", "12.5", "10", "15", "3"]);
+    ).toEqual(["2026-07-14T10:00:00Z", "12.35%", "10.13%", "15.68%", "3"]);
     expect(
       within(within(table).getAllByRole("row")[2])
         .getAllByRole("cell")
         .map((cell) => cell.textContent),
-    ).toEqual(["2026-07-14T11:00:00Z", "18", "11", "20", "4"]);
+    ).toEqual(["2026-07-14T11:00:00Z", "18.23%", "11.11%", "21%", "4"]);
     expect(
       within(within(table).getAllByRole("row")[3])
         .getAllByRole("cell")
         .map((cell) => cell.textContent),
-    ).toEqual(["2026-07-14T12:00:00Z", "14", "12", "16", "5"]);
+    ).toEqual(["2026-07-14T12:00:00Z", "14.13%", "12.56%", "16.44%", "5"]);
   });
+
+  it("labels and formats last-value rollups honestly", () => {
+    const response = seriesFixture();
+    response.metric = {
+      metric_key: "http_requests_total",
+      source: "control",
+      unit: "count",
+      kind: "counter",
+      rollup: "last",
+    };
+    response.points = [
+      point("2026-07-14T12:00:00Z", 1234.567, 1000, 1250, 240),
+    ];
+
+    render(<SeriesChart response={response} />);
+
+    expect(
+      screen.getByText(
+        "Latest hourly value: 1,234.57; minimum: 1,000; maximum: 1,250.",
+      ),
+    ).toBeVisible();
+    fireEvent.click(screen.getByText("View accessible data table"));
+    const table = screen.getByRole("table", {
+      name: "HTTP requests series data",
+    });
+    expect(
+      within(table)
+        .getAllByRole("columnheader")
+        .map((header) => header.textContent),
+    ).toEqual([
+      "Bucket time",
+      "Hourly value",
+      "Minimum",
+      "Maximum",
+      "Sample count",
+    ]);
+    expect(
+      within(within(table).getAllByRole("row")[1])
+        .getAllByRole("cell")
+        .map((cell) => cell.textContent),
+    ).toEqual(["2026-07-14T12:00:00Z", "1,234.57", "1,000", "1,250", "240"]);
+  });
+
+  it.each([
+    {
+      expected: "1 GB",
+      kind: "gauge",
+      metricKey: "service_control_plane_memory_bytes",
+      rollup: "average",
+      source: "host",
+      unit: "bytes",
+      value: 1024 ** 3,
+    },
+    {
+      expected: "2.5 Mb/s",
+      kind: "gauge",
+      metricKey: "media_egress_current_bps",
+      rollup: "average",
+      source: "media",
+      unit: "bits_per_second",
+      value: 2_500_000,
+    },
+    {
+      expected: "12.5 h",
+      kind: "counter",
+      metricKey: "media_participant_hours_audio",
+      rollup: "last",
+      source: "media",
+      unit: "hours",
+      value: 12.5,
+    },
+  ] as const)(
+    "formats $unit series values with the portal unit scale",
+    ({ expected, kind, metricKey, rollup, source, unit, value }) => {
+      const response = seriesFixture();
+      response.metric = {
+        metric_key: metricKey,
+        source,
+        unit,
+        kind,
+        rollup,
+      };
+      response.points = [point("2026-07-14T12:00:00Z", value)];
+
+      render(<SeriesChart response={response} />);
+
+      const summaryLabel =
+        rollup === "average" ? "Latest hourly average" : "Latest hourly value";
+      expect(
+        screen.getByText(
+          `${summaryLabel}: ${expected}; minimum: ${expected}; maximum: ${expected}.`,
+        ),
+      ).toBeVisible();
+      fireEvent.click(screen.getByText("View accessible data table"));
+      expect(
+        within(screen.getByRole("table")).getAllByText(expected),
+      ).toHaveLength(3);
+    },
+  );
 
   it.each([
     ["a single flat point", [42]],
