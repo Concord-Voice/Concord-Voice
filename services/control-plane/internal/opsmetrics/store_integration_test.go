@@ -19,6 +19,8 @@ import (
 
 const storeIntegrationDatabaseURL = "OPS_METRICS_TEST_DATABASE_URL"
 
+const floatingPointRollupSample = "0.008333333333333333"
+
 func TestPostgresStoreIntegrationConcurrentWrites(t *testing.T) {
 	db := setupOpsMetricsIntegrationDB(t)
 	store := newOpsMetricsIntegrationStore(t, db)
@@ -106,6 +108,30 @@ func TestPostgresStoreIntegrationRollupIdempotencyAndPrune(t *testing.T) {
 	))
 	assert.Equal(t, 0, opsMetricsIntegrationRowCount(t, db, `SELECT COUNT(*) FROM ops_metric_samples`))
 	assert.Equal(t, 1, opsMetricsIntegrationRowCount(t, db, `SELECT COUNT(*) FROM ops_metric_rollups`))
+}
+
+func TestPostgresStoreIntegrationMaintainOrdersFloatingPointRollup(t *testing.T) {
+	// Regression for #2283.
+	db := setupOpsMetricsIntegrationDB(t)
+	store := newOpsMetricsIntegrationStore(t, db)
+	ctx := context.Background()
+	bucketStart := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+
+	insertIdenticalOpsMetricsIntegrationSamples(t, db, store.nodeID, MetricHostCPUPercent, bucketStart)
+	require.NoError(t, store.Maintain(ctx, bucketStart.Add(2*time.Hour)))
+
+	var minimum, maximum, average float64
+	var sampleCount int
+	require.NoError(t, db.QueryRowContext(ctx, `
+		SELECT min_value, max_value, avg_value, sample_count
+		FROM ops_metric_rollups
+		WHERE node_id = $1 AND metric_key = $2 AND bucket_start = $3
+	`, store.nodeID, MetricHostCPUPercent, bucketStart).Scan(
+		&minimum, &maximum, &average, &sampleCount,
+	))
+	assert.LessOrEqual(t, minimum, average)
+	assert.LessOrEqual(t, average, maximum)
+	assert.Equal(t, 240, sampleCount)
 }
 
 func TestPostgresStoreIntegrationRollupBucketsAreUTCIndependentOfSessionTimezone(t *testing.T) {
@@ -217,6 +243,23 @@ func writeOpsMetricsIntegrationSample(t *testing.T, store *PostgresStore, timest
 	require.NoError(t, store.WriteSamples(context.Background(), []Sample{{
 		Key: MetricHostCPUPercent, Value: value, Source: SourceHost,
 	}}))
+}
+
+func insertIdenticalOpsMetricsIntegrationSamples(
+	t *testing.T,
+	db *sql.DB,
+	nodeID string,
+	key MetricKey,
+	bucketStart time.Time,
+) {
+	t.Helper()
+	_, err := db.Exec(`
+		INSERT INTO ops_metric_samples (node_id, metric_key, ts, value)
+		SELECT $1, $2, $3::TIMESTAMPTZ + sample_number * INTERVAL '1 second',
+		       $4::DOUBLE PRECISION
+		FROM generate_series(1, 240) AS sample_number
+	`, nodeID, key, bucketStart, floatingPointRollupSample)
+	require.NoError(t, err)
 }
 
 func opsMetricsIntegrationRowCount(t *testing.T, db *sql.DB, query string) int {

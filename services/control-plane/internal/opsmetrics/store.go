@@ -52,7 +52,7 @@ const rollupSQL = `
 		date_trunc('hour', ts, 'UTC') AS bucket_start,
 		MIN(value) AS min_value,
 		MAX(value) AS max_value,
-		AVG(value) AS avg_value,
+		GREATEST(MIN(value), LEAST(MAX(value), AVG(value))) AS avg_value,
 		(ARRAY_AGG(value ORDER BY ts DESC))[1] AS last_value,
 		COUNT(*)::INTEGER AS sample_count
 	FROM ops_metric_samples

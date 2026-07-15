@@ -81,6 +81,24 @@ func TestPostgresReaderSeriesPrefersRollupsAndFillsRawBuckets(t *testing.T) {
 	}, buckets)
 }
 
+func TestPostgresReaderSeriesOrdersFloatingPointRawAverage(t *testing.T) {
+	// Regression for #2283.
+	db := setupOpsMetricsIntegrationDB(t)
+	reader, err := NewPostgresReader(db)
+	require.NoError(t, err)
+	ctx := context.Background()
+	nodeID := "cvn_aaaaaaaaaaaaaaaa"
+	bucketStart := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+
+	insertIdenticalOpsMetricsIntegrationSamples(t, db, nodeID, MetricHostCPUPercent, bucketStart)
+	buckets, err := reader.Series(ctx, nodeID, MetricHostCPUPercent, bucketStart, bucketStart.Add(time.Hour))
+	require.NoError(t, err)
+	require.Len(t, buckets, 1)
+	assert.LessOrEqual(t, buckets[0].Minimum, buckets[0].Average)
+	assert.LessOrEqual(t, buckets[0].Average, buckets[0].Maximum)
+	assert.Equal(t, 240, buckets[0].SampleCount)
+}
+
 func TestPostgresReaderRejectsInvalidBoundsBeforeQuery(t *testing.T) {
 	db := setupOpsMetricsIntegrationDB(t)
 	reader, err := NewPostgresReader(db)
