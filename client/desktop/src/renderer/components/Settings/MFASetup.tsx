@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import QRCode from 'qrcode';
 import { apiFetch } from '../../services/apiClient';
 import { errorMessage } from '../../utils/redactError';
+import { base64urlToBuffer, bufferToBase64url } from '../../utils/base64url';
 import TOTPInput from '../Auth/TOTPInput';
 import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
 import BackupCodeDisplay from './BackupCodeDisplay';
@@ -316,13 +317,19 @@ const MFASetup: React.FC<MFASetupProps> = ({
 
   // ── Render helpers (reduce cognitive complexity) ────────────────────
 
-  const renderTOTPPasswordStep = () => (
+  // Shared password + MFA-verify step used by both the TOTP and WebAuthn
+  // flows — they differ only in copy, an optional extra field, and the
+  // submit action.
+  const renderPasswordVerifyStep = (opts: {
+    intro: string;
+    activeIntro: string;
+    submitLabel: string;
+    busyLabel: string;
+    onSubmit: () => void;
+    extraFields?: React.ReactNode;
+  }) => (
     <div className="mfa-setup-step">
-      <p>
-        {mfaActive
-          ? 'Verify your identity to add another method.'
-          : 'Enter your password to begin setup.'}
-      </p>
+      <p>{mfaActive ? opts.activeIntro : opts.intro}</p>
       <input
         type="password"
         className={`form-input ${errorField === 'password' ? 'error' : ''}`}
@@ -342,14 +349,15 @@ const MFASetup: React.FC<MFASetupProps> = ({
           excludeBackupCodes
         />
       )}
+      {opts.extraFields}
       <ErrorBanner error={error} errorField={errorField} />
       <div className="mfa-setup-actions">
         <button
           className="btn btn-primary"
-          onClick={handleTOTPSetup}
+          onClick={opts.onSubmit}
           disabled={loading || !password || (mfaActive && !mfaCode)}
         >
-          {loading ? 'Setting up...' : 'Continue'}
+          {loading ? opts.busyLabel : opts.submitLabel}
         </button>
         <button className="btn btn-secondary" onClick={onCancel}>
           Cancel
@@ -358,59 +366,37 @@ const MFASetup: React.FC<MFASetupProps> = ({
     </div>
   );
 
-  const renderWebAuthnPasswordStep = () => (
-    <div className="mfa-setup-step">
-      <p>
-        {mfaActive
-          ? 'Verify your identity and name your key.'
-          : 'Enter your password and name your key.'}
-      </p>
-      <input
-        type="password"
-        className={`form-input ${errorField === 'password' ? 'error' : ''}`}
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-        placeholder="Your password"
-        disabled={loading}
-        autoFocus
-      />
-      {mfaActive && (
-        <MFAVerifyPrompt
-          methods={activeMethods}
-          recoveryOnlyMethods={recoveryOnlyMethods}
-          onVerify={(code) => setMfaCode(code)}
+  const renderTOTPPasswordStep = () =>
+    renderPasswordVerifyStep({
+      intro: 'Enter your password to begin setup.',
+      activeIntro: 'Verify your identity to add another method.',
+      submitLabel: 'Continue',
+      busyLabel: 'Setting up...',
+      onSubmit: handleTOTPSetup,
+    });
+
+  const renderWebAuthnPasswordStep = () =>
+    renderPasswordVerifyStep({
+      intro: 'Enter your password and name your key.',
+      activeIntro: 'Verify your identity and name your key.',
+      submitLabel: 'Register Key',
+      busyLabel: 'Registering...',
+      onSubmit: handleWebAuthnRegister,
+      extraFields: (
+        <input
+          type="text"
+          className="form-input"
+          value={credentialName}
+          onChange={(e) => setCredentialName(e.target.value)}
+          placeholder={
+            credentialType === 'platform'
+              ? 'Key name (e.g. MacBook Touch ID, Windows Hello)'
+              : 'Key name (e.g. YubiKey 5, Google Titan)'
+          }
           disabled={loading}
-          error={errorField === 'mfa' ? error : undefined}
-          excludeBackupCodes
         />
-      )}
-      <input
-        type="text"
-        className="form-input"
-        value={credentialName}
-        onChange={(e) => setCredentialName(e.target.value)}
-        placeholder={
-          credentialType === 'platform'
-            ? 'Key name (e.g. MacBook Touch ID, Windows Hello)'
-            : 'Key name (e.g. YubiKey 5, Google Titan)'
-        }
-        disabled={loading}
-      />
-      <ErrorBanner error={error} errorField={errorField} />
-      <div className="mfa-setup-actions">
-        <button
-          className="btn btn-primary"
-          onClick={handleWebAuthnRegister}
-          disabled={loading || !password || (mfaActive && !mfaCode)}
-        >
-          {loading ? 'Registering...' : 'Register Key'}
-        </button>
-        <button className="btn btn-secondary" onClick={onCancel}>
-          Cancel
-        </button>
-      </div>
-    </div>
-  );
+      ),
+    });
 
   const handleResetToPassword = () => {
     setWebauthnStep('password');
@@ -618,27 +604,5 @@ const QRCodeCanvas: React.FC<{ data: string }> = ({ data }) => {
     </div>
   );
 };
-
-// ── base64url helpers ──────────────────────────────────────────────────
-
-function base64urlToBuffer(base64url: string): ArrayBuffer {
-  const base64 = base64url.replaceAll('-', '+').replaceAll('_', '/');
-  const pad = base64.length % 4 === 0 ? '' : '='.repeat(4 - (base64.length % 4));
-  const binary = atob(base64 + pad);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.codePointAt(i) ?? 0;
-  }
-  return bytes.buffer;
-}
-
-function bufferToBase64url(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  for (const byte of bytes) {
-    binary += String.fromCodePoint(byte);
-  }
-  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll(/=+$/g, '');
-}
 
 export default MFASetup;

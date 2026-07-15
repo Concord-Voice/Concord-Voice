@@ -2,6 +2,7 @@ import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react'
 import TOTPInput from './TOTPInput';
 import BackupCodeInput from './BackupCodeInput';
 import { apiFetch } from '../../services/apiClient';
+import { base64urlToBuffer, bufferToBase64url } from '../../utils/base64url';
 import {
   getAvailableCategories,
   getDefaultMethod,
@@ -291,27 +292,5 @@ const MFAVerifyPrompt: React.FC<MFAVerifyPromptProps> = ({
     </div>
   );
 };
-
-// ── base64url helpers ──────────────────────────────────────────────────
-
-function base64urlToBuffer(base64url: string): ArrayBuffer {
-  const base64 = base64url.replaceAll('-', '+').replaceAll('_', '/');
-  const pad = base64.length % 4 === 0 ? '' : '='.repeat(4 - (base64.length % 4));
-  const binary = atob(base64 + pad);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.codePointAt(i) ?? 0;
-  }
-  return bytes.buffer;
-}
-
-function bufferToBase64url(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  for (const byte of bytes) {
-    binary += String.fromCodePoint(byte);
-  }
-  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll(/=+$/g, '');
-}
 
 export default MFAVerifyPrompt;

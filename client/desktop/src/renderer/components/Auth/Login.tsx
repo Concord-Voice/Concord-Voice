@@ -22,19 +22,9 @@ import { SSOButton } from './SSOButton';
 import { useSSOFlow } from '../../hooks/useSSOFlow';
 import KeyRecoveryPrompt from './KeyRecoveryPrompt';
 import { Eye, EyeOff } from 'lucide-react';
+import { base64urlToBuffer } from '../../utils/base64url';
 import './Login.css';
 import './TOTPInput.css';
-
-// Convert base64url-encoded WebAuthn options from the server into ArrayBuffer format
-// that navigator.credentials.get() expects.
-function base64urlToBuffer(base64url: string): ArrayBuffer {
-  const base64 = base64url.replaceAll('-', '+').replaceAll('_', '/');
-  const pad = base64.length % 4 === 0 ? '' : '='.repeat(4 - (base64.length % 4));
-  const binary = atob(base64 + pad);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.codePointAt(i) ?? 0;
-  return bytes.buffer;
-}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- server options arrive as JSON with base64url-encoded buffers; the whole purpose of this helper is to decode those into typed `PublicKeyCredentialRequestOptions` — accepting `any` at the boundary and narrowing field-by-field is the right discipline
 function parseWebAuthnOptions(serverOptions: any): PublicKeyCredentialRequestOptions {
