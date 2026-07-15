@@ -83,9 +83,12 @@ download a MinIO binary or modify the source.
 
 Run the repository contract:
 
+The release gate requires Docker Compose v2 and `jq`. It renders configuration
+locally and does not contact the Docker daemon or network.
+
 ```bash
 bash scripts/tests/test-check-oci-tag.sh
-bash scripts/tests/test-publish-minio-image.sh
+bash scripts/tests/test-publish-minio-image.sh --require-compose
 actionlint -config-file=.actionlint.yaml \
   .github/workflows/publish-minio-image.yml
 git diff --check
