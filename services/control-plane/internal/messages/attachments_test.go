@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/markdrogersjr/Concord/services/control-plane/internal/messages"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
 	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
@@ -192,4 +193,18 @@ func TestGetMessagesSoftDeletedAttachmentsExcluded(t *testing.T) {
 		}
 	}
 	t.Fatal("Message not found")
+}
+
+// TestScanAttachmentSummariesScanError exercises the fail-closed scan-error
+// branch of the shared scan loop: a row shape that cannot scan into
+// (message_id, AttachmentSummary) must surface the error and yield no map.
+func TestScanAttachmentSummariesScanError(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+
+	rows, err := ts.DB.Query(`SELECT 1`)
+	require.NoError(t, err)
+
+	result, scanErr := messages.ScanAttachmentSummaries(rows)
+	require.Error(t, scanErr)
+	assert.Nil(t, result)
 }

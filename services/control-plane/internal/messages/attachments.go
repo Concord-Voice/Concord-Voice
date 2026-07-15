@@ -25,6 +25,17 @@ func loadAttachmentsForMessages(db *sql.DB, messageIDs []string) (map[string][]m
 	if err != nil {
 		return nil, err
 	}
+	return ScanAttachmentSummaries(rows)
+}
+
+// ScanAttachmentSummaries consumes rows of
+// (message_id, file id, file_type, mime_type, file_size) and groups the
+// summaries by message ID, closing rows before returning. Shared by the
+// channel-message loader above and the DM loader in internal/dm, whose
+// queries differ only by attachment table (message_attachments vs
+// dm_message_attachments) — the SQL stays a per-package literal so no
+// query text is ever built dynamically.
+func ScanAttachmentSummaries(rows *sql.Rows) (map[string][]models.AttachmentSummary, error) {
 	defer func() { _ = rows.Close() }()
 
 	result := make(map[string][]models.AttachmentSummary)

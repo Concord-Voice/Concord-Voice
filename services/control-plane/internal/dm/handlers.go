@@ -47,6 +47,8 @@ const (
 	errMsgNotGroupConversation       = "This action is only available for group conversations"
 	errMsgInvalidUserID              = "Invalid user ID"
 	errMsgInvalidCallerID            = "Invalid caller ID"
+	errMsgInvalidVoiceJoinRequest    = "Invalid voice join request"
+	errMsgInvalidVoiceCallRequest    = "Invalid voice call request"
 	errMsgAlreadyRinging             = "already ringing"
 	errMsgVoiceCallRingChanged       = "Voice call ring has changed"
 	errMsgVoiceCallNoLongerActive    = "Voice call is no longer active"
@@ -1638,28 +1640,6 @@ func parseDMVoiceIDs(c *gin.Context, convID, userID string) (uuid.UUID, uuid.UUI
 	return convUUID, userUUID, true
 }
 
-func parseVoiceJoinRingID(c *gin.Context) (uuid.UUID, bool) {
-	if c.Request.ContentLength == 0 {
-		return uuid.Nil, true
-	}
-	var request struct {
-		RingID string `json:"ring_id"`
-	}
-	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid voice join request"})
-		return uuid.Nil, false
-	}
-	if request.RingID == "" {
-		return uuid.Nil, true
-	}
-	ringID, err := uuid.Parse(request.RingID)
-	if err != nil || ringID == uuid.Nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ring ID"})
-		return uuid.Nil, false
-	}
-	return ringID, true
-}
-
 func (h *Handler) loadVoiceJoinState(c *gin.Context, convID, userID string) (voiceJoinState, bool) {
 	var state voiceJoinState
 	err := h.db.QueryRow(`
@@ -1813,7 +1793,7 @@ func (h *Handler) AuthorizeVoiceJoin(c *gin.Context) {
 	if !validIDs {
 		return
 	}
-	requestedRingID, validRequest := parseVoiceJoinRingID(c)
+	requestedRingID, validRequest := parseOptionalVoiceRingID(c, errMsgInvalidVoiceJoinRequest)
 	if !validRequest {
 		return
 	}
@@ -2225,23 +2205,35 @@ func (h *Handler) updateDMMessageCiphertext(
 	return result, true
 }
 
-// UpdateMessage updates a DM message's content.
-func (h *Handler) UpdateMessage(c *gin.Context) {
-	userID := c.GetString("user_id")
-	convID := c.Param("id")
-	messageID := c.Param("message_id")
+// resolveDMMessageRequest runs the shared Update/DeleteMessage prologue:
+// validate the conversation and message ID params and require the caller to
+// be a conversation participant. On failure the HTTP error has already been
+// written and ok is false.
+func (h *Handler) resolveDMMessageRequest(c *gin.Context) (convID, messageID, userID string, ok bool) {
+	userID = c.GetString("user_id")
+	convID = c.Param("id")
+	messageID = c.Param("message_id")
 
 	if _, err := uuid.Parse(convID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
-		return
+		return "", "", "", false
 	}
 	if _, err := uuid.Parse(messageID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid message ID"})
-		return
+		return "", "", "", false
 	}
 
 	if !h.isParticipant(convID, userID) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
+		return "", "", "", false
+	}
+	return convID, messageID, userID, true
+}
+
+// UpdateMessage updates a DM message's content.
+func (h *Handler) UpdateMessage(c *gin.Context) {
+	convID, messageID, userID, ok := h.resolveDMMessageRequest(c)
+	if !ok {
 		return
 	}
 
@@ -2283,21 +2275,8 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 
 // DeleteMessage deletes a DM message.
 func (h *Handler) DeleteMessage(c *gin.Context) {
-	userID := c.GetString("user_id")
-	convID := c.Param("id")
-	messageID := c.Param("message_id")
-
-	if _, err := uuid.Parse(convID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
-		return
-	}
-	if _, err := uuid.Parse(messageID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid message ID"})
-		return
-	}
-
-	if !h.isParticipant(convID, userID) {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
+	convID, messageID, userID, ok := h.resolveDMMessageRequest(c)
+	if !ok {
 		return
 	}
 
@@ -2371,23 +2350,7 @@ func (h *Handler) loadDMAttachments(messageIDs []string) (map[string][]models.At
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-
-	result := make(map[string][]models.AttachmentSummary)
-	for rows.Next() {
-		var msgID string
-		var a models.AttachmentSummary
-		if err := rows.Scan(&msgID, &a.ID, &a.FileType, &a.MimeType, &a.FileSize); err != nil {
-			return nil, err
-		}
-		result[msgID] = append(result[msgID], a)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return result, nil
+	return messagehandlers.ScanAttachmentSummaries(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -2528,6 +2491,40 @@ func (h *Handler) DMUserMute(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
+// dmVoiceEnforcementChange describes one hard mute/deafen state transition:
+// the enforcement flag UPDATE plus the NATS command and WS broadcast that
+// announce it. updateSQL values are compile-time constants — never build
+// them dynamically.
+type dmVoiceEnforcementChange struct {
+	updateSQL      string
+	failLog        string
+	failErrMsg     string
+	subject        string
+	action         string
+	broadcastState string
+}
+
+// applyDMVoiceEnforcement runs the shared tail of the four DM hard-mute/deafen
+// handlers. RowsAffected 0 MUST stay a 404 — it is what stops an enforcement
+// call against a non-participant from fabricating success.
+func (h *Handler) applyDMVoiceEnforcement(c *gin.Context, convID, targetID string, change dmVoiceEnforcementChange) {
+	result, err := h.db.Exec(change.updateSQL, convID, targetID)
+	if err != nil {
+		h.log.Error(change.failLog, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": change.failErrMsg})
+		return
+	}
+	if ra, _ := result.RowsAffected(); ra == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgTargetNotParticipant})
+		return
+	}
+
+	h.dmPublishEnforcement(convID, targetID, change.subject, change.action)
+	h.dmBroadcastVoiceState(convID, targetID, change.broadcastState)
+
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
 // DMHardMute server-mutes a participant in a group DM (admin only, user cannot undo).
 // POST /dm/conversations/:id/voice/:userId/mute
 func (h *Handler) DMHardMute(c *gin.Context) {
@@ -2536,23 +2533,14 @@ func (h *Handler) DMHardMute(c *gin.Context) {
 		return
 	}
 
-	// Update enforcement flag
-	result, err := h.db.Exec(`UPDATE dm_participants SET server_muted = true WHERE conversation_id = $1 AND user_id = $2`,
-		convID, targetID)
-	if err != nil {
-		h.log.Error("Failed to set DM server_muted", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedApplyEnforcement})
-		return
-	}
-	if ra, _ := result.RowsAffected(); ra == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgTargetNotParticipant})
-		return
-	}
-
-	h.dmPublishEnforcement(convID, targetID, "voice.enforce.mute", "mute")
-	h.dmBroadcastVoiceState(convID, targetID, "server_muted")
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	h.applyDMVoiceEnforcement(c, convID, targetID, dmVoiceEnforcementChange{
+		updateSQL:      `UPDATE dm_participants SET server_muted = true WHERE conversation_id = $1 AND user_id = $2`,
+		failLog:        "Failed to set DM server_muted",
+		failErrMsg:     errMsgFailedApplyEnforcement,
+		subject:        "voice.enforce.mute",
+		action:         "mute",
+		broadcastState: "server_muted",
+	})
 }
 
 // DMHardUnmute removes server-mute from a group DM participant (admin only).
@@ -2580,22 +2568,14 @@ func (h *Handler) DMHardUnmute(c *gin.Context) {
 		return
 	}
 
-	result, execErr := h.db.Exec(`UPDATE dm_participants SET server_muted = false WHERE conversation_id = $1 AND user_id = $2`,
-		convID, targetID)
-	if execErr != nil {
-		h.log.Error("Failed to clear DM server_muted", "error", execErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveEnforcement})
-		return
-	}
-	if ra, _ := result.RowsAffected(); ra == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgTargetNotParticipant})
-		return
-	}
-
-	h.dmPublishEnforcement(convID, targetID, "voice.enforce.mute", "unmute")
-	h.dmBroadcastVoiceState(convID, targetID, "server_unmuted")
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	h.applyDMVoiceEnforcement(c, convID, targetID, dmVoiceEnforcementChange{
+		updateSQL:      `UPDATE dm_participants SET server_muted = false WHERE conversation_id = $1 AND user_id = $2`,
+		failLog:        "Failed to clear DM server_muted",
+		failErrMsg:     errMsgFailedRemoveEnforcement,
+		subject:        "voice.enforce.mute",
+		action:         "unmute",
+		broadcastState: "server_unmuted",
+	})
 }
 
 // DMHardDeafen server-deafens a participant in a group DM (admin only).
@@ -2606,22 +2586,14 @@ func (h *Handler) DMHardDeafen(c *gin.Context) {
 		return
 	}
 
-	result, err := h.db.Exec(`UPDATE dm_participants SET server_muted = true, server_deafened = true WHERE conversation_id = $1 AND user_id = $2`,
-		convID, targetID)
-	if err != nil {
-		h.log.Error("Failed to set DM server_deafened", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedApplyEnforcement})
-		return
-	}
-	if ra, _ := result.RowsAffected(); ra == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgTargetNotParticipant})
-		return
-	}
-
-	h.dmPublishEnforcement(convID, targetID, "voice.enforce.deafen", "deafen")
-	h.dmBroadcastVoiceState(convID, targetID, "server_deafened")
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	h.applyDMVoiceEnforcement(c, convID, targetID, dmVoiceEnforcementChange{
+		updateSQL:      `UPDATE dm_participants SET server_muted = true, server_deafened = true WHERE conversation_id = $1 AND user_id = $2`,
+		failLog:        "Failed to set DM server_deafened",
+		failErrMsg:     errMsgFailedApplyEnforcement,
+		subject:        "voice.enforce.deafen",
+		action:         "deafen",
+		broadcastState: "server_deafened",
+	})
 }
 
 // DMHardUndeafen removes server-deafen from a group DM participant (admin only).
@@ -2632,22 +2604,14 @@ func (h *Handler) DMHardUndeafen(c *gin.Context) {
 		return
 	}
 
-	result, err := h.db.Exec(`UPDATE dm_participants SET server_muted = false, server_deafened = false WHERE conversation_id = $1 AND user_id = $2`,
-		convID, targetID)
-	if err != nil {
-		h.log.Error("Failed to clear DM server_deafened", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveEnforcement})
-		return
-	}
-	if ra, _ := result.RowsAffected(); ra == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgTargetNotParticipant})
-		return
-	}
-
-	h.dmPublishEnforcement(convID, targetID, "voice.enforce.deafen", "undeafen")
-	h.dmBroadcastVoiceState(convID, targetID, "server_undeafened")
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	h.applyDMVoiceEnforcement(c, convID, targetID, dmVoiceEnforcementChange{
+		updateSQL:      `UPDATE dm_participants SET server_muted = false, server_deafened = false WHERE conversation_id = $1 AND user_id = $2`,
+		failLog:        "Failed to clear DM server_deafened",
+		failErrMsg:     errMsgFailedRemoveEnforcement,
+		subject:        "voice.enforce.deafen",
+		action:         "undeafen",
+		broadcastState: "server_undeafened",
+	})
 }
 
 // ─── DM voice call ring (#1209) ──────────────────────────────────────────
@@ -2775,7 +2739,10 @@ func uuidsToStrings(ids []uuid.UUID) []string {
 	return out
 }
 
-func parseOptionalVoiceRingID(c *gin.Context) (uuid.UUID, bool) {
+// parseOptionalVoiceRingID binds the optional ring_id from the request body.
+// bindErrMsg preserves the historical per-endpoint bad-request copy (voice
+// join vs voice call) now that the former twin parsers are unified.
+func parseOptionalVoiceRingID(c *gin.Context, bindErrMsg string) (uuid.UUID, bool) {
 	if c.Request.ContentLength == 0 {
 		return uuid.Nil, true
 	}
@@ -2783,7 +2750,7 @@ func parseOptionalVoiceRingID(c *gin.Context) (uuid.UUID, bool) {
 		RingID string `json:"ring_id"`
 	}
 	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid voice call request"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": bindErrMsg})
 		return uuid.Nil, false
 	}
 	if request.RingID == "" {
@@ -3069,6 +3036,51 @@ func (h *Handler) onRingTimeout(convUUID uuid.UUID, ring *PendingCall) {
 	)
 }
 
+// resolvePendingDMRing runs the shared Decline/Cancel prologue: parse the
+// conversation and acting-user IDs, bind the optional ring_id, and resolve
+// the in-flight ring for the conversation, rejecting a stale ring_id with
+// 409. On failure the HTTP error has already been written and ok is false.
+func (h *Handler) resolvePendingDMRing(c *gin.Context) (ring *PendingCall, convUUID, actorUUID uuid.UUID, ok bool) {
+	actorIDStr := c.GetString("user_id")
+	convIDStr := c.Param("id")
+
+	convUUID, err := uuid.Parse(convIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
+		return nil, uuid.Nil, uuid.Nil, false
+	}
+	actorUUID, err = uuid.Parse(actorIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidCallerID})
+		return nil, uuid.Nil, uuid.Nil, false
+	}
+	requestedRingID, validRequest := parseOptionalVoiceRingID(c, errMsgInvalidVoiceCallRequest)
+	if !validRequest {
+		return nil, uuid.Nil, uuid.Nil, false
+	}
+
+	storedAny, loaded := pendingDMCalls.Load(convUUID)
+	if !loaded {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no active ring for this conversation"})
+		return nil, uuid.Nil, uuid.Nil, false
+	}
+	pending, castOK := storedAny.(*PendingCall)
+	if !castOK {
+		// Defensive: pendingDMCalls is only ever written with *PendingCall
+		// values (RingDMCall is the sole writer). Match the RingDMCall
+		// posture so a future sentinel-using code path doesn't crash these
+		// handlers via ring.mu.Lock / ring.CallerUserID on a nil interface
+		// (Copilot #1231 cycle-4 finding).
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return nil, uuid.Nil, uuid.Nil, false
+	}
+	if requestedRingID != uuid.Nil && requestedRingID != pending.RingID {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingChanged})
+		return nil, uuid.Nil, uuid.Nil, false
+	}
+	return pending, convUUID, actorUUID, true
+}
+
 // DeclineDMCall handles a callee declining a DM voice call ring.
 // POST /api/v1/dm/conversations/:id/voice/decline.
 //
@@ -3089,41 +3101,8 @@ func (h *Handler) onRingTimeout(convUUID uuid.UUID, ring *PendingCall) {
 // removes that decliner's ring; ring continues for others. Group-call tally
 // progress event (dm_voice_call_decline_progress) is deferred to #1219.
 func (h *Handler) DeclineDMCall(c *gin.Context) {
-	declinerIDStr := c.GetString("user_id")
-	convIDStr := c.Param("id")
-
-	convUUID, err := uuid.Parse(convIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
-		return
-	}
-	declinerUUID, err := uuid.Parse(declinerIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidCallerID})
-		return
-	}
-	requestedRingID, validRequest := parseOptionalVoiceRingID(c)
-	if !validRequest {
-		return
-	}
-
-	storedAny, loaded := pendingDMCalls.Load(convUUID)
-	if !loaded {
-		c.JSON(http.StatusNotFound, gin.H{"error": "no active ring for this conversation"})
-		return
-	}
-	ring, ok := storedAny.(*PendingCall)
+	ring, convUUID, declinerUUID, ok := h.resolvePendingDMRing(c)
 	if !ok {
-		// Defensive: pendingDMCalls is only ever written with *PendingCall
-		// values (RingDMCall is the sole writer). Match the RingDMCall
-		// posture so a future sentinel-using code path doesn't crash this
-		// handler via ring.mu.Lock on a nil interface (Copilot #1231
-		// cycle-4 finding).
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return
-	}
-	if requestedRingID != uuid.Nil && requestedRingID != ring.RingID {
-		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingChanged})
 		return
 	}
 
@@ -3191,38 +3170,8 @@ func (h *Handler) DeclineDMCall(c *gin.Context) {
 // conversation, clears pendingDMCalls, and inserts a canceled-status
 // call_event row.
 func (h *Handler) CancelDMCall(c *gin.Context) {
-	callerIDStr := c.GetString("user_id")
-	convIDStr := c.Param("id")
-
-	convUUID, err := uuid.Parse(convIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
-		return
-	}
-	callerUUID, err := uuid.Parse(callerIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidCallerID})
-		return
-	}
-	requestedRingID, validRequest := parseOptionalVoiceRingID(c)
-	if !validRequest {
-		return
-	}
-
-	storedAny, loaded := pendingDMCalls.Load(convUUID)
-	if !loaded {
-		c.JSON(http.StatusNotFound, gin.H{"error": "no active ring for this conversation"})
-		return
-	}
-	ring, ok := storedAny.(*PendingCall)
+	ring, convUUID, callerUUID, ok := h.resolvePendingDMRing(c)
 	if !ok {
-		// Defensive — same posture as DeclineDMCall above (Copilot #1231
-		// cycle-4 finding). Prevents nil-deref panic on ring.CallerUserID.
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
-		return
-	}
-	if requestedRingID != uuid.Nil && requestedRingID != ring.RingID {
-		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingChanged})
 		return
 	}
 
@@ -3256,7 +3205,7 @@ func (h *Handler) CancelDMCall(c *gin.Context) {
 	h.log.Info("DM voice call ring canceled by caller",
 		"conversation_id", convUUID.String(),
 		"ring_id", ring.RingID.String(),
-		"caller_user_id", callerIDStr,
+		"caller_user_id", callerUUID.String(),
 	)
 
 	c.Status(http.StatusNoContent)

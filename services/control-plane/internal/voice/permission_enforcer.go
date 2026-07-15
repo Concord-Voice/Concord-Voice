@@ -76,16 +76,30 @@ func (e *PermissionEnforcer) RecheckUser(serverID, userID string) {
 	e.dispatch(func(ctx context.Context) { e.recheckUserSync(ctx, serverID, userID) })
 }
 
-// recheckUserSync is the synchronous body of RecheckUser (direct-called by tests).
+// recheckUserSync is the synchronous body of RecheckUser, kept separate from the
+// async dispatch wrapper.
 func (e *PermissionEnforcer) recheckUserSync(ctx context.Context, serverID, userID string) {
+	channelIDs := e.voicePresenceChannelIDs(ctx, serverID, userID,
+		"Failed to query voice presence for permission recheck")
+	for _, channelID := range channelIDs {
+		e.recheckOne(serverID, channelID, userID)
+	}
+}
+
+// voicePresenceChannelIDs returns the channel IDs within serverID where
+// userID is currently a voice participant. Any query/scan/iteration error is
+// logged (query failures with the caller-supplied context message) and yields
+// nil — callers treat nil as nothing-to-do, preserving the pre-extraction
+// fail-safe posture where a mid-scan error performs NO per-channel actions.
+func (e *PermissionEnforcer) voicePresenceChannelIDs(ctx context.Context, serverID, userID, queryErrMsg string) []string {
 	rows, err := e.db.QueryContext(ctx, `
 		SELECT vp.channel_id FROM voice_participants vp
 		JOIN channels c ON c.id = vp.channel_id
 		WHERE c.server_id = $1 AND vp.user_id = $2`, serverID, userID)
 	if err != nil {
-		e.log.Error("Failed to query voice presence for permission recheck", "error", err,
+		e.log.Error(queryErrMsg, "error", err,
 			"server_id", sanitizeLogValue(serverID), "user_id", sanitizeLogValue(userID))
-		return
+		return nil
 	}
 	defer rows.Close() //nolint:errcheck
 	var channelIDs []string
@@ -93,17 +107,15 @@ func (e *PermissionEnforcer) recheckUserSync(ctx context.Context, serverID, user
 		var channelID string
 		if err := rows.Scan(&channelID); err != nil {
 			e.log.Error("Failed to scan voice presence row", "error", err)
-			return
+			return nil
 		}
 		channelIDs = append(channelIDs, channelID)
 	}
 	if err := rows.Err(); err != nil {
 		e.log.Error("Failed to iterate voice presence rows", "error", err)
-		return
+		return nil
 	}
-	for _, channelID := range channelIDs {
-		e.recheckOne(serverID, channelID, userID)
-	}
+	return channelIDs
 }
 
 // RecheckParticipant re-resolves and pushes permissions for one member in one
@@ -157,7 +169,8 @@ func (e *PermissionEnforcer) RecheckChannel(serverID, channelID string) {
 	e.dispatch(func(ctx context.Context) { e.recheckChannelSync(ctx, serverID, channelID) })
 }
 
-// recheckChannelSync is the synchronous body of RecheckChannel (direct-called by tests).
+// recheckChannelSync is the synchronous body of RecheckChannel, kept separate from
+// the async dispatch wrapper.
 func (e *PermissionEnforcer) recheckChannelSync(ctx context.Context, serverID, channelID string) {
 	rows, err := e.db.QueryContext(ctx,
 		`SELECT user_id FROM voice_participants WHERE channel_id = $1`, channelID)
@@ -194,7 +207,8 @@ func (e *PermissionEnforcer) RecheckServer(serverID string) {
 	e.dispatch(func(ctx context.Context) { e.recheckServerSync(ctx, serverID) })
 }
 
-// recheckServerSync is the synchronous body of RecheckServer (direct-called by tests).
+// recheckServerSync is the synchronous body of RecheckServer, kept separate from
+// the async dispatch wrapper.
 func (e *PermissionEnforcer) recheckServerSync(ctx context.Context, serverID string) {
 	rows, err := e.db.QueryContext(ctx, `
 		SELECT vp.channel_id, vp.user_id FROM voice_participants vp
@@ -307,31 +321,11 @@ func (e *PermissionEnforcer) DisconnectUser(serverID, userID string) {
 	e.dispatch(func(ctx context.Context) { e.disconnectUserSync(ctx, serverID, userID) })
 }
 
-// disconnectUserSync is the synchronous body of DisconnectUser (direct-called by tests).
+// disconnectUserSync is the synchronous body of DisconnectUser, kept separate from
+// the async dispatch wrapper.
 func (e *PermissionEnforcer) disconnectUserSync(ctx context.Context, serverID, userID string) {
-	rows, err := e.db.QueryContext(ctx, `
-		SELECT vp.channel_id FROM voice_participants vp
-		JOIN channels c ON c.id = vp.channel_id
-		WHERE c.server_id = $1 AND vp.user_id = $2`, serverID, userID)
-	if err != nil {
-		e.log.Error("Failed to query voice presence for timeout disconnect", "error", err,
-			"server_id", sanitizeLogValue(serverID), "user_id", sanitizeLogValue(userID))
-		return
-	}
-	defer rows.Close() //nolint:errcheck
-	var channelIDs []string
-	for rows.Next() {
-		var channelID string
-		if err := rows.Scan(&channelID); err != nil {
-			e.log.Error("Failed to scan voice presence row", "error", err)
-			return
-		}
-		channelIDs = append(channelIDs, channelID)
-	}
-	if err := rows.Err(); err != nil {
-		e.log.Error("Failed to iterate voice presence rows", "error", err)
-		return
-	}
+	channelIDs := e.voicePresenceChannelIDs(ctx, serverID, userID,
+		"Failed to query voice presence for timeout disconnect")
 	for _, channelID := range channelIDs {
 		e.publishDisconnect(channelID, userID)
 	}

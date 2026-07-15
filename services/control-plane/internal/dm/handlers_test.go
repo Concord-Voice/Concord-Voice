@@ -3911,6 +3911,25 @@ func TestDMHardMute(t *testing.T) {
 		w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceSlash+member.ID+pathMute, nil, testhelpers.AuthHeaders(outsider.AccessToken))
 		assert.Equal(t, http.StatusForbidden, w.Code)
 	})
+
+	t.Run("TargetNotParticipant", func(t *testing.T) {
+		ts := setupTS(t)
+		admin := ts.CreateTestUser(t, "hardmutetnp1")
+		member := ts.CreateTestUser(t, "hardmutetnp2")
+		outsider := ts.CreateTestUser(t, "hardmutetnp3")
+
+		convID := createTestGroup(t, ts, admin, member)
+
+		// A valid group admin targeting a user who is NOT a participant must
+		// get 404 from the zero-RowsAffected guard in applyDMVoiceEnforcement —
+		// never a fabricated success.
+		w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceSlash+outsider.ID+pathMute, nil, testhelpers.AuthHeaders(admin.AccessToken))
+		assert.Equal(t, http.StatusNotFound, w.Code)
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, "Target is not a participant", body["error"])
+	})
 }
 
 // ============================================================================
