@@ -8,14 +8,15 @@ import MemberListPanel from './MemberListPanel';
 import IconUploadArea from './IconUploadArea';
 import BannerUploadArea from './BannerUploadArea';
 import { useImageUpload } from '../../hooks/useImageUpload';
+import { useSectionObserver } from '../../hooks/useSectionObserver';
 import {
   maxServerIconSizeForTier,
   maxServerBannerSizeForTier,
   ALLOWED_TYPES,
-  NAME_MIN,
-  NAME_MAX,
+  validateServerName,
   type ServerFormErrors,
 } from './serverConstants';
+import { ServerNameField, ServerFormBanners } from './ServerNameField';
 import { useServerStore } from '../../stores/serverStore';
 import { useInviteStore } from '../../stores/inviteStore';
 import { usePermissionStore } from '../../stores/permissionStore';
@@ -257,51 +258,8 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
     }
   }, [activeSection, canAssignRoles, serverId, fetchMembers, fetchRoles]);
 
-  // IntersectionObserver for subsection tracking
-  const visibleSectionsRef = useRef<Map<string, IntersectionObserverEntry>>(new Map());
-
-  useEffect(() => {
-    visibleSectionsRef.current.clear();
-    const root = contentRef.current?.closest('.settings-page-content') as HTMLElement | null;
-    if (!root) return;
-
-    // Held in this effect-scoped variable so the cleanup disconnects it
-    // directly (no DOM expando — #483).
-    let observer: IntersectionObserver | null = null;
-
-    const timer = setTimeout(() => {
-      observer = new IntersectionObserver(
-        (entries) => {
-          for (const entry of entries) {
-            const id = entry.target.id;
-            if (entry.isIntersecting) {
-              visibleSectionsRef.current.set(id, entry);
-            } else {
-              visibleSectionsRef.current.delete(id);
-            }
-          }
-          let best: IntersectionObserverEntry | null = null;
-          for (const entry of visibleSectionsRef.current.values()) {
-            if (!best || entry.boundingClientRect.top < best.boundingClientRect.top) {
-              best = entry;
-            }
-          }
-          if (best) {
-            setActiveSubsection(best.target.id.replace('section-', ''));
-          }
-        },
-        { root, threshold: [0, 0.1, 0.25, 0.5], rootMargin: '-10% 0px -50% 0px' }
-      );
-
-      const sections = root.querySelectorAll('[id^="section-"]');
-      for (const el of sections) observer.observe(el);
-    }, 50);
-
-    return () => {
-      clearTimeout(timer);
-      observer?.disconnect();
-    };
-  }, [activeSection]);
+  // Scroll-spy for subsection tracking (#483).
+  useSectionObserver(contentRef, activeSection, setActiveSubsection);
 
   const scrollToSection = useCallback((sectionId: string) => {
     const el = document.getElementById(`section-${sectionId}`);
@@ -327,15 +285,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
   // ─── Form handlers ───
 
   const validateForm = (): boolean => {
-    const newErrors: ServerFormErrors = {};
-    const trimmed = name.trim();
-    if (!trimmed) {
-      newErrors.name = 'Server name is required';
-    } else if (trimmed.length < NAME_MIN) {
-      newErrors.name = `Server name must be at least ${NAME_MIN} characters`;
-    } else if (trimmed.length > NAME_MAX) {
-      newErrors.name = `Server name must be at most ${NAME_MAX} characters`;
-    }
+    const newErrors = validateServerName(name);
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
@@ -470,43 +420,18 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
           hint={`PNG, JPEG, GIF, WebP — max ${formatFileSize(maxServerBannerBytes)}. Optional.`}
         />
 
-        {/* Server Name */}
-        <div className="form-group">
-          <label htmlFor="server-settings-name" className="form-label">
-            Server Name
-          </label>
-          <input
-            id="server-settings-name"
-            type="text"
-            className={`form-input ${errors.name ? 'error' : ''}`}
-            placeholder="My Awesome Server"
-            value={name}
-            onChange={(e) => {
-              setName(e.target.value);
-              if (errors.name) setErrors((prev) => ({ ...prev, name: undefined }));
-            }}
-            disabled={isSubmitting}
-            maxLength={NAME_MAX}
-          />
-          {errors.name && <span className="form-error">{errors.name}</span>}
-          <span className="form-hint">
-            {name.trim().length}/{NAME_MAX} characters
-          </span>
-        </div>
+        <ServerNameField
+          inputId="server-settings-name"
+          name={name}
+          error={errors.name}
+          disabled={isSubmitting}
+          onChange={(value) => {
+            setName(value);
+            if (errors.name) setErrors((prev) => ({ ...prev, name: undefined }));
+          }}
+        />
 
-        {/* General Error */}
-        {errors.general && (
-          <div className="form-error-banner">
-            <span>{errors.general}</span>
-          </div>
-        )}
-
-        {/* Success Message */}
-        {successMessage && (
-          <div className="form-success-banner">
-            <span>{successMessage}</span>
-          </div>
-        )}
+        <ServerFormBanners generalError={errors.general} successMessage={successMessage} />
 
         {/* Save button */}
         <div className="server-settings-actions">

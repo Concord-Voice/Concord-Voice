@@ -1,6 +1,7 @@
 import React, { useRef, useState, useCallback, useEffect, useMemo } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { createPortal } from 'react-dom';
+import ServerHoverTooltip from './ServerHoverTooltip';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { MessageSquare, Plus, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useServerStore } from '../../stores/serverStore';
@@ -746,39 +747,20 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
       </div>
 
       {/* Portal tooltip — rendered outside overflow:hidden containers */}
-      {hoveredServer &&
-        createPortal(
-          <div
-            className="server-bar-tooltip-fixed"
-            style={{
-              position: 'fixed',
-              top: hoveredServer.rect.bottom + 8,
-              left: hoveredServer.rect.left + hoveredServer.rect.width / 2,
-              transform: 'translateX(-50%)',
-            }}
-          >
-            <span className="server-bar-tooltip-name">{hoveredServer.server.name}</span>
-            <div className="server-bar-tooltip-stats">
-              <span>{hoveredServer.server.member_count ?? 0} Members</span>
-              <span className="server-bar-tooltip-dot" />
-              <span>{hoveredServer.server.online_count ?? 0} Online</span>
-            </div>
-            <div className="server-bar-tooltip-stats">
-              <span
-                className={`server-bar-tooltip-voice${(serverVoiceCounts[hoveredServer.server.id] ?? 0) > 0 ? ' server-bar-tooltip-voice--active' : ''}`}
-              >
-                {serverVoiceCounts[hoveredServer.server.id] ?? 0} In Voice
-              </span>
-            </div>
-            {isServerUnreadVisible(
-              hoveredServer.server.id,
-              serverUnreadSet,
-              serverUnreadPreciseSet,
-              mutedServers
-            ) && <span className="server-bar-tooltip-unread">Unread notifications</span>}
-          </div>,
-          document.body
-        )}
+      {hoveredServer && (
+        <ServerHoverTooltip
+          server={hoveredServer.server}
+          rect={hoveredServer.rect}
+          voiceCount={serverVoiceCounts[hoveredServer.server.id] ?? 0}
+          showUnread={isServerUnreadVisible(
+            hoveredServer.server.id,
+            serverUnreadSet,
+            serverUnreadPreciseSet,
+            mutedServers
+          )}
+          placement="below"
+        />
+      )}
 
       {/* "Add Server" tooltip — portaled to body to escape overflow:hidden */}
       {addBtnTooltipPos &&

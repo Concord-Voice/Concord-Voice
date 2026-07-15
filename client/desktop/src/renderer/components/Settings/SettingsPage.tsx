@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useTransition, useCallback } from 'react';
 import { useDraftSettingsLifecycle, useDraftActions } from '../../hooks/useDraftSettings';
+import { useSectionObserver } from '../../hooks/useSectionObserver';
 import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
 import { useSettingsNavStore, type SettingsSection } from '../../stores/settingsNavStore';
 import { useClientConfigStore } from '../../stores/clientConfigStore';
@@ -217,56 +218,8 @@ const SettingsPage: React.FC = () => {
   const [blobBouncing, setBlobBouncing] = useState(false);
   const [blobFading, setBlobFading] = useState(false);
 
-  // IntersectionObserver: track which section is in view and highlight tree nav
-  // We keep a persistent map of all currently-intersecting sections so the callback
-  // (which only receives *changed* entries) can always pick the topmost visible one.
-  const visibleSectionsRef = useRef<Map<string, IntersectionObserverEntry>>(new Map());
-
-  useEffect(() => {
-    visibleSectionsRef.current.clear();
-    const root = contentRef.current?.closest('.settings-page-content') as HTMLElement | null;
-    if (!root) return;
-
-    // Created inside the post-render delay below; held in this effect-scoped
-    // variable so the cleanup disconnects it directly (no DOM expando — #484).
-    let observer: IntersectionObserver | null = null;
-
-    // Small delay to let sections render after tab switch
-    const timer = setTimeout(() => {
-      observer = new IntersectionObserver(
-        (entries) => {
-          for (const entry of entries) {
-            const id = entry.target.id;
-            if (entry.isIntersecting) {
-              visibleSectionsRef.current.set(id, entry);
-            } else {
-              visibleSectionsRef.current.delete(id);
-            }
-          }
-
-          // Pick the topmost visible section (smallest boundingClientRect.top)
-          let best: IntersectionObserverEntry | null = null;
-          for (const entry of visibleSectionsRef.current.values()) {
-            if (!best || entry.boundingClientRect.top < best.boundingClientRect.top) {
-              best = entry;
-            }
-          }
-          if (best) {
-            setActiveSubsection(best.target.id.replace('section-', ''));
-          }
-        },
-        { root, threshold: [0, 0.1, 0.25, 0.5], rootMargin: '-10% 0px -50% 0px' }
-      );
-
-      const sections = root.querySelectorAll('[id^="section-"]');
-      for (const el of sections) observer.observe(el);
-    }, 50);
-
-    return () => {
-      clearTimeout(timer);
-      observer?.disconnect();
-    };
-  }, [activeSection]);
+  // Scroll-spy: track which section is in view and highlight tree nav (#484).
+  useSectionObserver(contentRef, activeSection, setActiveSubsection);
 
   const scrollToSection = useCallback((sectionId: string) => {
     const el = document.getElementById(`section-${sectionId}`);

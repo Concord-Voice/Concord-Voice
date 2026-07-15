@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { useEntitlement } from '../../hooks/useEntitlement';
+import { useDialogSync } from '../../hooks/useDialogSync';
 import { clampMessageCharsForTier } from '../../utils/entitlementLimits';
 import './SyntaxHelpModal.css';
 
@@ -87,25 +88,7 @@ const SyntaxHelpModal: React.FC<Props> = ({ open, onClose }) => {
   }, [open, onClose]);
 
   // Sync the imperative <dialog> open state with the React-controlled `open` prop.
-  // showModal()/close() also moves focus into / out of the dialog for screen readers.
-  useEffect(() => {
-    const el = dialogRef.current;
-    if (!el) return;
-    if (open && !el.open) {
-      // jsdom and some older renderers don't implement showModal — fall back to .show()
-      if (typeof el.showModal === 'function') {
-        try {
-          el.showModal();
-        } catch {
-          el.setAttribute('open', '');
-        }
-      } else {
-        el.setAttribute('open', '');
-      }
-    } else if (!open && el.open) {
-      el.close();
-    }
-  }, [open]);
+  useDialogSync(dialogRef, open);
 
   if (!open) return null;
 

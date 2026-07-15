@@ -29,3 +29,20 @@ export interface ServerFormErrors {
   banner?: string;
   general?: string;
 }
+
+/**
+ * Validate the server-name field. Shared by CreateServerModal and
+ * ServerSettingsPage so the two forms cannot drift on the name rules.
+ */
+export function validateServerName(name: string): ServerFormErrors {
+  const errors: ServerFormErrors = {};
+  const trimmed = name.trim();
+  if (!trimmed) {
+    errors.name = 'Server name is required';
+  } else if (trimmed.length < NAME_MIN) {
+    errors.name = `Server name must be at least ${NAME_MIN} characters`;
+  } else if (trimmed.length > NAME_MAX) {
+    errors.name = `Server name must be at most ${NAME_MAX} characters`;
+  }
+  return errors;
+}

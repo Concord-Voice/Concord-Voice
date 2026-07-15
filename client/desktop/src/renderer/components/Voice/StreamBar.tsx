@@ -1,7 +1,7 @@
-import React, { useRef, useEffect, useId } from 'react';
+import React from 'react';
 import { X } from 'lucide-react';
 import { useVoiceStore } from '../../stores/voiceStore';
-import { useRenderStateReporter } from '../../hooks/useRenderStateReporter';
+import { useScreenTileVideo } from '../../hooks/useScreenTileVideo';
 import './StreamBar.css';
 
 /**
@@ -32,34 +32,9 @@ const StreamThumbnail: React.FC<{
   onSelect,
   onTuneOut,
 }) => {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const tileId = useId();
-
-  // #1924: report this thumbnail's rendered size/visibility for the remote screen.
-  useRenderStateReporter({
-    userId: sharerUserId ?? '',
-    tileId,
-    source: 'screen',
-    elementRef: videoRef,
-    role: 'thumbnail',
-    enabled: !!sharerUserId && !!stream && !isPaused,
-  });
-
-  useEffect(() => {
-    const el = videoRef.current;
-    if (!el) return;
-    if (stream) {
-      el.srcObject = stream;
-      el.play().catch(() => {});
-    } else {
-      el.srcObject = null;
-    }
-    return () => {
-      // Copy ref to local so cleanup acts on the element captured at setup,
-      // not whatever videoRef.current might point at by the time cleanup runs.
-      el.srcObject = null;
-    };
-  }, [stream]);
+  // #1924: reports this thumbnail's rendered size/visibility for the remote
+  // screen and owns the srcObject lifecycle (shared tile wiring).
+  const videoRef = useScreenTileVideo({ sharerUserId, stream, isPaused, role: 'thumbnail' });
 
   return (
     <div className="stream-thumbnail">

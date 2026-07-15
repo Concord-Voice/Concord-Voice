@@ -13,10 +13,10 @@ import {
   MAX_ICON_SIZE,
   MAX_BANNER_SIZE,
   ALLOWED_TYPES,
-  NAME_MIN,
-  NAME_MAX,
+  validateServerName,
   type ServerFormErrors,
 } from './serverConstants';
+import { ServerNameField, ServerFormBanners } from './ServerNameField';
 import './CreateServerModal.css';
 
 interface CreateServerModalProps {
@@ -64,17 +64,7 @@ const CreateServerModal: React.FC<CreateServerModalProps> = ({ isOpen, onClose, 
   };
 
   const validateForm = (): boolean => {
-    const newErrors: ServerFormErrors = {};
-    const trimmed = name.trim();
-
-    if (!trimmed) {
-      newErrors.name = 'Server name is required';
-    } else if (trimmed.length < NAME_MIN) {
-      newErrors.name = `Server name must be at least ${NAME_MIN} characters`;
-    } else if (trimmed.length > NAME_MAX) {
-      newErrors.name = `Server name must be at most ${NAME_MAX} characters`;
-    }
-
+    const newErrors = validateServerName(name);
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
@@ -153,44 +143,19 @@ const CreateServerModal: React.FC<CreateServerModalProps> = ({ isOpen, onClose, 
           hint="PNG, JPEG, GIF, WebP — max 5MB. Optional."
         />
 
-        {/* Server Name */}
-        <div className="form-group">
-          <label htmlFor="create-server-name" className="form-label">
-            Server Name
-          </label>
-          <input
-            id="create-server-name"
-            type="text"
-            className={`form-input ${errors.name ? 'error' : ''}`}
-            placeholder="My Awesome Server"
-            value={name}
-            onChange={(e) => {
-              setName(e.target.value);
-              if (errors.name) setErrors((prev) => ({ ...prev, name: undefined }));
-            }}
-            disabled={isSubmitting}
-            autoFocus
-            maxLength={NAME_MAX}
-          />
-          {errors.name && <span className="form-error">{errors.name}</span>}
-          <span className="form-hint">
-            {name.trim().length}/{NAME_MAX} characters
-          </span>
-        </div>
+        <ServerNameField
+          inputId="create-server-name"
+          name={name}
+          error={errors.name}
+          disabled={isSubmitting}
+          autoFocus
+          onChange={(value) => {
+            setName(value);
+            if (errors.name) setErrors((prev) => ({ ...prev, name: undefined }));
+          }}
+        />
 
-        {/* General Error */}
-        {errors.general && (
-          <div className="form-error-banner">
-            <span>{errors.general}</span>
-          </div>
-        )}
-
-        {/* Success Message */}
-        {successMessage && (
-          <div className="form-success-banner">
-            <span>{successMessage}</span>
-          </div>
-        )}
+        <ServerFormBanners generalError={errors.general} successMessage={successMessage} />
 
         {/* Buttons */}
         <div className="create-server-actions">

@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useCallback, useMemo, useId } from 'react';
+import React, { useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   useVoiceStore,
   type ActiveScreenShare,
@@ -11,7 +11,7 @@ import ParticipantTile from './ParticipantTile';
 import ShareTunePill from './ShareTunePill';
 import { VOICE_MAX_SCALE, useVoiceMagnification } from './useVoiceMagnification';
 import { useGridLayout } from '../../hooks/useGridLayout';
-import { useRenderStateReporter } from '../../hooks/useRenderStateReporter';
+import { useScreenTileVideo } from '../../hooks/useScreenTileVideo';
 import { errorMessage } from '../../utils/redactError';
 import './ParticipantGrid.css';
 
@@ -423,34 +423,12 @@ const StreamGridTile: React.FC<{
   sharerUserId?: string;
   onFocus: (producerId: string) => void;
 }> = ({ producerId, name, stream, isPaused = false, sharerUserId, onFocus }) => {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const tileId = useId();
-
-  // #1924: report this Tile-view cell's rendered size/visibility for the remote screen so
-  // the SFU can forward its smallest-sufficient layer and flip the screen-layering gate.
-  // role 'grid' — it is a grid sibling of the participant frames. Inert for a local share.
-  useRenderStateReporter({
-    userId: sharerUserId ?? '',
-    tileId,
-    source: 'screen',
-    elementRef: videoRef,
-    role: 'grid',
-    enabled: !!sharerUserId && !!stream && !isPaused,
-  });
-
-  useEffect(() => {
-    const el = videoRef.current;
-    if (!el) return;
-    if (stream) {
-      el.srcObject = stream;
-      el.play().catch(() => {});
-    } else {
-      el.srcObject = null;
-    }
-    return () => {
-      el.srcObject = null;
-    };
-  }, [stream]);
+  // #1924: reports this Tile-view cell's rendered size/visibility for the remote
+  // screen so the SFU can forward its smallest-sufficient layer and flip the
+  // screen-layering gate, and owns the srcObject lifecycle (shared tile wiring).
+  // role 'grid' — it is a grid sibling of the participant frames. Inert for a
+  // local share.
+  const videoRef = useScreenTileVideo({ sharerUserId, stream, isPaused, role: 'grid' });
 
   return (
     <button

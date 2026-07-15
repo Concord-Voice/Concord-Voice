@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { openSubscriptionPage } from '../../utils/openSubscriptionPage';
+import { useDialogSync } from '../../hooks/useDialogSync';
 import './SubscriptionResetModal.css';
 
 // Mirror SyntaxHelpModal's environment probe: jsdom implements <dialog> but does
@@ -44,24 +45,7 @@ const SubscriptionResetModal: React.FC<SubscriptionResetModalProps> = ({ open, o
   }, [open, onAcknowledge]);
 
   // Sync imperative <dialog> open state with the React-controlled prop.
-  // .showModal()/.close() move focus into / back out of the dialog for AT.
-  useEffect(() => {
-    const el = dialogRef.current;
-    if (!el) return;
-    if (open && !el.open) {
-      if (typeof el.showModal === 'function') {
-        try {
-          el.showModal();
-        } catch {
-          el.setAttribute('open', '');
-        }
-      } else {
-        el.setAttribute('open', '');
-      }
-    } else if (!open && el.open) {
-      el.close();
-    }
-  }, [open]);
+  useDialogSync(dialogRef, open);
 
   if (!open) return null;
 
