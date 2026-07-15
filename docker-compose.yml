@@ -189,6 +189,14 @@ services:
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
+      # statfs needs only an empty directory on the host root filesystem. Avoid
+      # exposing / or traversing /proc/1/root, which requires SYS_PTRACE.
+      - type: bind
+        source: /.concord-ops-rootfs-probe
+        target: /host/rootfs-probe
+        read_only: true
+        bind:
+          create_host_path: true
       - /var/run/docker.sock:/var/run/docker.sock:ro
     depends_on:
       nats:

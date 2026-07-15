@@ -17,7 +17,7 @@ import (
 const (
 	defaultNATSURL  = "nats://localhost:4222"
 	hostProcRoot    = "/host/proc"
-	hostDiskPath    = "/host/proc/1/root"
+	hostDiskPath    = "/host/rootfs-probe"
 	dockerSocketURL = "unix:///var/run/docker.sock"
 )
 
