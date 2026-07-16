@@ -672,6 +672,15 @@ func (c *Config) validateProduction() error {
 		// brick enrollment — guard it loudly at startup instead (Gitar #1703).
 		{c.AdminConsoleEnabled && (c.AdminWebAuthnRPID == "" || c.AdminWebAuthnRPID == "localhost"),
 			"ADMIN_WEBAUTHN_RP_ID must be set to a real admin host in production when ADMIN_CONSOLE_ENABLED=true (not the 'localhost' dev default). The admin console's WebAuthn relying party must not share the user-facing WEBAUTHN_RP_ID."},
+		// #2306 — Apple SSO authorization uses the fixed Worker-bridge
+		// callback (the registered Apple Services ID Return URL). Without
+		// the KV bridge, the Worker cannot relay Apple's form_post back to
+		// the desktop loopback, so every Apple login dead-ends after
+		// credential entry. Initiate also fails closed at runtime
+		// (bridge_unavailable); this guard surfaces the misconfiguration at
+		// deploy time instead of at the first user's login attempt.
+		{c.appleSSOWithoutBridge(),
+			"APPLE_SSO_ENABLED=true requires CLOUDFLARE_KV_BRIDGE_ENABLED=true in production. Apple SSO authorization uses the Worker bridge callback; without the KV bridge every Apple login dead-ends at the Worker."},
 		{c.AdminConsoleEnabled && len(c.AdminWebAuthnRPOrigins) == 0,
 			"ADMIN_WEBAUTHN_RP_ORIGINS must be set in production when ADMIN_CONSOLE_ENABLED=true. Without it the admin WebAuthn ceremony rejects every origin. Example: 'https://admin.concordvoice.chat'."},
 		{c.AdminConsoleEnabled && len(c.AdminWebAuthnAllowedAAGUIDs) == 0,
@@ -778,6 +787,13 @@ func (c *Config) validateAttestation() error {
 		log.Printf("WARN: ATTESTATION_OIDC_BINARY_WORKFLOW=build-desktop.yml predates the #1492 main-ci.yml workflow_call orchestration; the binary-axis OIDC workflow_ref claim will NOT match until the axis binding is re-verified against a real token (see #2021)")
 	}
 	return nil
+}
+
+// appleSSOWithoutBridge reports the #2306 production misconfiguration:
+// Apple SSO enabled without the Workers KV bridge that its Worker-callback
+// authorization flow depends on (see the validateProduction guard row).
+func (c *Config) appleSSOWithoutBridge() bool {
+	return c.AppleSSO.Enabled && !c.CloudflareKVBridge.Enabled
 }
 
 // mediaPlaneURLIsRoot returns true when the given MediaPlaneURL resolves

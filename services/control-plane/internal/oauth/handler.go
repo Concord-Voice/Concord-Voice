@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,8 +33,10 @@ type HandlerDeps struct {
 	// pulling in the full *auth.Handler dependency graph.
 	AuthHandler AuthAdapter
 	// CFKV publishes state→loopback-port mappings to the apple-sso-bridge
-	// Workers KV namespace (#973). Nil when the bridge is disabled — the
-	// write is skipped and Apple SSO continues on its pre-bridge path.
+	// Workers KV namespace (#973). Nil when the bridge is disabled; Apple
+	// initiation FAILS CLOSED on a nil bridge (#2306) — apple authorization
+	// URLs carry the Worker callback, which cannot relay without the KV
+	// mapping. Google never uses the bridge.
 	CFKV StatePortPutter
 	// Log receives structured SSO audit events (apple_client_secret_minted).
 	// Nil-safe: audit emission is skipped when unset (test rigs); production
@@ -379,7 +382,19 @@ func (h *Handler) Initiate(c *gin.Context) {
 	verifier := ""
 	challenge := clientChallenge
 
-	authURL := buildAuthURLWithRedirect(provider, state, nonce, challenge, redirectURI)
+	// Provider-facing authorization redirect (#2306): Apple uses the fixed
+	// Worker-bridge callback already embedded by AppleProvider.AuthorizationURL —
+	// Apple's Services ID accepts only the registered HTTPS Return URL, and the
+	// Worker relays the form_post back to the desktop loopback via the
+	// state→port KV mapping (#973). Every other provider keeps the RFC 8252
+	// request-time loopback override so concurrent attempts on different
+	// ephemeral ports coexist.
+	var authURL string
+	if providerName == "apple" {
+		authURL = provider.AuthorizationURL(state, nonce, challenge)
+	} else {
+		authURL = buildAuthURLWithRedirect(provider, state, nonce, challenge, redirectURI)
+	}
 
 	rec := ssoStateRecord{
 		Provider:     providerName,
@@ -401,17 +416,9 @@ func (h *Handler) Initiate(c *gin.Context) {
 	}
 
 	// Publish state→loopback-port for the apple-sso-bridge Worker (#973).
-	// Apple-only: Google's loopback redirect works without a bridge. The
-	// port was validated and captured before the state record was written
-	// (see the bridge precondition above). Fail loud — a missing mapping
-	// would otherwise surface minutes later as a dead "session expired"
-	// page after the user typed their Apple credentials (spec F3). Runs
-	// before the apple response below so a bridge failure surfaces here.
-	if providerName == "apple" && h.deps.CFKV != nil {
-		if err := h.deps.CFKV.Put(c.Request.Context(), state, bridgePort, bridgeStateTTLSeconds); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error_code": "bridge_unavailable"})
-			return
-		}
+	// Apple-only: Google's loopback redirect works without a bridge.
+	if providerName == "apple" && !h.publishAppleBridgeMapping(c, state, bridgePort) {
+		return
 	}
 
 	// All client-driven providers (apple, google after #974/#975) return the
@@ -436,22 +443,77 @@ func (h *Handler) initiateClientChallenge(c *gin.Context, _ string) (string, boo
 	return clientChallenge, true
 }
 
+// publishAppleBridgeMapping writes the state→loopback-port mapping the
+// apple-sso-bridge Worker relays through (#973). The port was validated and
+// captured before the state record was written (see initiateBridgePort).
+// Fail loud — a missing mapping would otherwise surface minutes later as a
+// dead "session expired" page after the user typed their Apple credentials
+// (spec F3). CFKV non-nil is guaranteed by the initiateBridgePort fail-closed
+// precondition (#2306); the nil check here is defense in depth only.
+// On a write failure it writes the 500 response and returns false.
+func (h *Handler) publishAppleBridgeMapping(c *gin.Context, state, bridgePort string) bool {
+	if h.deps.CFKV == nil {
+		return true
+	}
+	if err := h.deps.CFKV.Put(c.Request.Context(), state, bridgePort, bridgeStateTTLSeconds); err != nil {
+		// #2306: the state record was already written by Initiate — delete
+		// it so a failed initiation leaves no orphaned sso_state entry.
+		// Best-effort: on a Del failure the 10-minute stateTTL bounds the
+		// residue. Mirrors the broker's one-shot-key cleanup pattern
+		// (apple_secret_broker.go). Never log the state value.
+		// WithoutCancel is load-bearing: a client abort mid-KV-write is
+		// itself a likely CAUSE of the Put failure, and a Del on the
+		// canceled request context would fail in exactly the case this
+		// cleanup exists for (same discipline as purge/engine.go).
+		cleanupCtx := context.WithoutCancel(c.Request.Context())
+		if delErr := h.deps.Redis.Del(cleanupCtx, stateKeyPrefix+state).Err(); delErr != nil && h.deps.Log != nil {
+			h.deps.Log.Warn("sso initiate: sso_state cleanup after bridge write failure failed; record expires at TTL",
+				"error", delErr.Error(),
+			)
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "bridge_unavailable"})
+		return false
+	}
+	return true
+}
+
 // initiateBridgePort validates the bridge precondition (#973):
 // validateLoopbackRedirect guarantees scheme/host/path but not an explicit
 // port, and the apple-sso-bridge cannot relay without one. Initiate calls this
 // BEFORE the state record is written so a rejected redirect leaves no orphan
-// sso_state entry in Redis. Non-apple providers (and a nil CFKV) pass through
-// with an empty port. On violation it writes the 400 response and returns
-// ok=false.
+// sso_state entry in Redis. Non-apple providers pass through with an empty
+// port; apple with a nil bridge FAILS CLOSED (#2306). On violation it writes
+// the error response and returns ok=false.
 func (h *Handler) initiateBridgePort(c *gin.Context, providerName, redirectURI string) (string, bool) {
-	if providerName != "apple" || h.deps.CFKV == nil {
+	if providerName != "apple" {
 		return "", true
+	}
+	// #2306 fail-closed: Apple's authorization URL carries the Worker-bridge
+	// callback, which can only relay Apple's form_post back to the desktop
+	// via the state→port KV mapping. Without a bridge client there is no
+	// mapping and every Apple login dead-ends after credential entry —
+	// refuse initiation instead of returning a doomed authorization URL.
+	if h.deps.CFKV == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "bridge_unavailable"})
+		return "", false
 	}
 	parsed, err := url.Parse(redirectURI)
 	if err != nil || parsed.Port() == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error_code": "invalid_redirect_uri",
 			"detail":     "explicit loopback port required for apple",
+		})
+		return "", false
+	}
+	// #2306 review: mirror the Worker's relay-side port validation
+	// (apple-sso-bridge stub.ts isValidPort, 1024–65535). An out-of-range
+	// port would pass initiation but the Worker would refuse the relay —
+	// reject at initiate rather than after the user typed their credentials.
+	port, convErr := strconv.Atoi(parsed.Port())
+	if convErr != nil || port < 1024 || port > 65535 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error_code": "invalid_redirect_uri",
+			"detail":     "loopback port must be in 1024-65535",
 		})
 		return "", false
 	}
@@ -503,6 +565,8 @@ var codeChallengePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{43,128}$`)
 // concurrent OAuth attempts from different ephemeral loopback ports do not
 // share a single provider-config value. The provider builds the canonical
 // authorization URL; we mutate only redirect_uri.
+// Not used for Apple (#2306): its provider-facing redirect is the fixed
+// Worker-bridge callback emitted by AppleProvider.AuthorizationURL.
 func buildAuthURLWithRedirect(p Provider, state, nonce, challenge, redirectURI string) string {
 	base := p.AuthorizationURL(state, nonce, challenge)
 	parsed, err := url.Parse(base)

@@ -14,9 +14,12 @@ import {
 import { AppleFlowError } from '@/main/oauth/apple/errors';
 import type { LoopbackHandle, LoopbackResult } from '@/main/ssoLoopback';
 
+// redirect_uri models the server-built value post-#2306: the registered
+// Worker-bridge callback, never the desktop loopback.
+const WORKER_CALLBACK = 'https://api.concordvoice.chat/auth/sso/apple/callback';
 const AUTH_URL =
   'https://appleid.apple.com/auth/authorize?client_id=chat.concordvoice.signin' +
-  '&redirect_uri=http%3A%2F%2F127.0.0.1%3A51620%2Foauth%2Fcallback' +
+  `&redirect_uri=${encodeURIComponent(WORKER_CALLBACK)}` +
   '&response_type=code&state=state-1&nonce=nonce-1&code_challenge=x&code_challenge_method=S256';
 
 interface FakeLoopback {
@@ -124,7 +127,9 @@ describe('runAppleSignIn — happy path', () => {
     // loopback code, and a verifier whose S256 equals the sent challenge
     const tokenArgs = (deps.appleTokenCall as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(tokenArgs.clientId).toBe('chat.concordvoice.signin');
-    expect(tokenArgs.redirectUri).toBe('http://127.0.0.1:51620/oauth/callback');
+    // Byte-for-byte replay of the Worker redirect Apple saw at /authorize
+    // (RFC 6749 §4.1.3) — parsed from auth_url, NOT the local loopback.
+    expect(tokenArgs.redirectUri).toBe(WORKER_CALLBACK);
     expect(tokenArgs.code).toBe('code-1');
     expect(tokenArgs.clientSecret).toBe('broker-jwt');
 

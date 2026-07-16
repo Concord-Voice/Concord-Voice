@@ -20,7 +20,7 @@ const baseArgs = {
   codeVerifier: 'verifier-1',
   clientId: 'chat.concordvoice.signin',
   clientSecret: 'broker-jwt',
-  redirectUri: 'http://127.0.0.1:51620/oauth/callback',
+  redirectUri: 'https://api.concordvoice.chat/auth/sso/apple/callback',
 };
 
 function call(fetchFn: typeof fetch) {
@@ -50,7 +50,9 @@ describe('appleTokenCall', () => {
       expect(form.get('code_verifier')).toBe('verifier-1');
       expect(form.get('client_id')).toBe('chat.concordvoice.signin');
       expect(form.get('client_secret')).toBe('broker-jwt');
-      expect(form.get('redirect_uri')).toBe('http://127.0.0.1:51620/oauth/callback');
+      expect(form.get('redirect_uri')).toBe(
+        'https://api.concordvoice.chat/auth/sso/apple/callback'
+      );
       return jsonResponse(200, { id_token: 'idt-1', access_token: 'dropped' });
     }) as unknown as typeof fetch;
 

@@ -29,17 +29,26 @@ const (
 	appleAuthEndpoint    = "https://appleid.apple.com/auth/authorize"
 	appleJWKSEndpoint    = "https://appleid.apple.com/auth/keys"
 	applePrivateRelayDom = "privaterelay.appleid.com"
+
+	// appleBridgeCallbackURL is Apple's provider-facing redirect_uri — the
+	// HTTPS Return URL registered on the Apple Services ID, served by the
+	// apple-sso-bridge Worker (#973), which relays Apple's form_post callback
+	// to the desktop's loopback listener via the state→port KV mapping.
+	// A constant, not config, on purpose (#2306): no runtime input — caller-
+	// or config-controlled — can alter the provider-facing redirect. The
+	// desktop loopback URI is private relay metadata only (kept in the Redis
+	// state record; its port published to the bridge KV).
+	appleBridgeCallbackURL = "https://api.concordvoice.chat/auth/sso/apple/callback"
 )
 
 // AppleConfig is the constructor input for AppleProvider. Mirrored on
 // pkg/config/AppleSSOConfig but kept package-local so callers pass exactly
 // what AppleProvider needs and nothing more.
 type AppleConfig struct {
-	ClientID    string // Apple Services ID, e.g. "chat.concordvoice.signin"
-	TeamID      string // 10-char Apple Developer Team ID
-	KeyID       string // 10-char Apple Sign-In Key ID
-	PrivateKey  []byte // #nosec G117 G101 -- False positive: config field name, actual key loaded from env (.p8 PEM bytes)
-	RedirectURI string // per-request loopback URI supplied at Initiate time
+	ClientID   string // Apple Services ID, e.g. "chat.concordvoice.signin"
+	TeamID     string // 10-char Apple Developer Team ID
+	KeyID      string // 10-char Apple Sign-In Key ID
+	PrivateKey []byte // #nosec G117 G101 -- False positive: config field name, actual key loaded from env (.p8 PEM bytes)
 
 	// Endpoint overrides default to Apple's production URLs when empty.
 	// Tests point these at httptest.Server.
@@ -87,10 +96,6 @@ func NewAppleProvider(cfg AppleConfig) (*AppleProvider, error) {
 	if len(cfg.PrivateKey) == 0 {
 		return nil, fmt.Errorf("oauth/apple: PrivateKey is required")
 	}
-	if cfg.RedirectURI == "" {
-		return nil, fmt.Errorf("oauth/apple: RedirectURI is required")
-	}
-
 	priv, err := parseApplePrivateKey(cfg.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("oauth/apple: parse PrivateKey: %w", err)
@@ -152,10 +157,12 @@ func (a *AppleProvider) Name() string { return "apple" }
 // Apple requires response_mode=form_post when scope=name email is requested,
 // so the redirect_uri receives the callback as a POST body rather than a GET
 // query.
+// The redirect_uri is ALWAYS the registered Worker-bridge callback (#2306);
+// the desktop's loopback URI never appears in Apple-facing URLs.
 func (a *AppleProvider) AuthorizationURL(state, nonce, codeChallenge string) string {
 	q := url.Values{}
 	q.Set("client_id", a.cfg.ClientID)
-	q.Set("redirect_uri", a.cfg.RedirectURI)
+	q.Set("redirect_uri", appleBridgeCallbackURL)
 	q.Set("response_type", "code")
 	q.Set("scope", "name email")
 	q.Set("response_mode", "form_post")

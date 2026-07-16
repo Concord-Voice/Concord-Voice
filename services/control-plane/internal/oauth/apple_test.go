@@ -20,7 +20,6 @@ const (
 	testAppleClientID = "chat.concordvoice.signin"
 	testAppleTeamID   = "TEAM123ABC"
 	testAppleKeyID    = "KEYID12345"
-	testAppleRedirect = "http://127.0.0.1:54321/oauth/callback"
 )
 
 // generateP256PEM returns a freshly-generated P-256 ECDSA private key encoded as
@@ -59,11 +58,10 @@ func generateRSAPEM(t *testing.T) []byte {
 func newTestAppleProvider(t *testing.T) *oauth.AppleProvider {
 	t.Helper()
 	p, err := oauth.NewAppleProvider(oauth.AppleConfig{
-		ClientID:    testAppleClientID,
-		TeamID:      testAppleTeamID,
-		KeyID:       testAppleKeyID,
-		PrivateKey:  generateP256PEM(t),
-		RedirectURI: testAppleRedirect,
+		ClientID:   testAppleClientID,
+		TeamID:     testAppleTeamID,
+		KeyID:      testAppleKeyID,
+		PrivateKey: generateP256PEM(t),
 	})
 	require.NoError(t, err)
 	return p
@@ -73,11 +71,10 @@ func newTestAppleProvider(t *testing.T) *oauth.AppleProvider {
 
 func TestNewAppleProvider_RequiresClientID(t *testing.T) {
 	_, err := oauth.NewAppleProvider(oauth.AppleConfig{
-		ClientID:    "",
-		TeamID:      testAppleTeamID,
-		KeyID:       testAppleKeyID,
-		PrivateKey:  generateP256PEM(t),
-		RedirectURI: testAppleRedirect,
+		ClientID:   "",
+		TeamID:     testAppleTeamID,
+		KeyID:      testAppleKeyID,
+		PrivateKey: generateP256PEM(t),
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "ClientID")
@@ -85,11 +82,10 @@ func TestNewAppleProvider_RequiresClientID(t *testing.T) {
 
 func TestNewAppleProvider_RequiresTeamID(t *testing.T) {
 	_, err := oauth.NewAppleProvider(oauth.AppleConfig{
-		ClientID:    testAppleClientID,
-		TeamID:      "",
-		KeyID:       testAppleKeyID,
-		PrivateKey:  generateP256PEM(t),
-		RedirectURI: testAppleRedirect,
+		ClientID:   testAppleClientID,
+		TeamID:     "",
+		KeyID:      testAppleKeyID,
+		PrivateKey: generateP256PEM(t),
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "TeamID")
@@ -97,11 +93,10 @@ func TestNewAppleProvider_RequiresTeamID(t *testing.T) {
 
 func TestNewAppleProvider_RequiresKeyID(t *testing.T) {
 	_, err := oauth.NewAppleProvider(oauth.AppleConfig{
-		ClientID:    testAppleClientID,
-		TeamID:      testAppleTeamID,
-		KeyID:       "",
-		PrivateKey:  generateP256PEM(t),
-		RedirectURI: testAppleRedirect,
+		ClientID:   testAppleClientID,
+		TeamID:     testAppleTeamID,
+		KeyID:      "",
+		PrivateKey: generateP256PEM(t),
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "KeyID")
@@ -109,46 +104,31 @@ func TestNewAppleProvider_RequiresKeyID(t *testing.T) {
 
 func TestNewAppleProvider_RequiresPrivateKey(t *testing.T) {
 	_, err := oauth.NewAppleProvider(oauth.AppleConfig{
-		ClientID:    testAppleClientID,
-		TeamID:      testAppleTeamID,
-		KeyID:       testAppleKeyID,
-		PrivateKey:  nil,
-		RedirectURI: testAppleRedirect,
+		ClientID:   testAppleClientID,
+		TeamID:     testAppleTeamID,
+		KeyID:      testAppleKeyID,
+		PrivateKey: nil,
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "PrivateKey")
 }
 
-func TestNewAppleProvider_RequiresRedirectURI(t *testing.T) {
-	_, err := oauth.NewAppleProvider(oauth.AppleConfig{
-		ClientID:    testAppleClientID,
-		TeamID:      testAppleTeamID,
-		KeyID:       testAppleKeyID,
-		PrivateKey:  generateP256PEM(t),
-		RedirectURI: "",
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "RedirectURI")
-}
-
 func TestNewAppleProvider_RejectsMalformedPrivateKey(t *testing.T) {
 	_, err := oauth.NewAppleProvider(oauth.AppleConfig{
-		ClientID:    testAppleClientID,
-		TeamID:      testAppleTeamID,
-		KeyID:       testAppleKeyID,
-		PrivateKey:  []byte("not a pem block"),
-		RedirectURI: testAppleRedirect,
+		ClientID:   testAppleClientID,
+		TeamID:     testAppleTeamID,
+		KeyID:      testAppleKeyID,
+		PrivateKey: []byte("not a pem block"),
 	})
 	require.Error(t, err)
 }
 
 func TestNewAppleProvider_RejectsRSAPrivateKey(t *testing.T) {
 	_, err := oauth.NewAppleProvider(oauth.AppleConfig{
-		ClientID:    testAppleClientID,
-		TeamID:      testAppleTeamID,
-		KeyID:       testAppleKeyID,
-		PrivateKey:  generateRSAPEM(t),
-		RedirectURI: testAppleRedirect,
+		ClientID:   testAppleClientID,
+		TeamID:     testAppleTeamID,
+		KeyID:      testAppleKeyID,
+		PrivateKey: generateRSAPEM(t),
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "P-256")
@@ -156,11 +136,10 @@ func TestNewAppleProvider_RejectsRSAPrivateKey(t *testing.T) {
 
 func TestNewAppleProvider_RejectsP384Curve(t *testing.T) {
 	_, err := oauth.NewAppleProvider(oauth.AppleConfig{
-		ClientID:    testAppleClientID,
-		TeamID:      testAppleTeamID,
-		KeyID:       testAppleKeyID,
-		PrivateKey:  generateP384PEM(t),
-		RedirectURI: testAppleRedirect,
+		ClientID:   testAppleClientID,
+		TeamID:     testAppleTeamID,
+		KeyID:      testAppleKeyID,
+		PrivateKey: generateP384PEM(t),
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "P-256")
@@ -185,7 +164,9 @@ func TestAppleProvider_AuthorizationURL_Shape(t *testing.T) {
 
 	q := parsed.Query()
 	assert.Equal(t, testAppleClientID, q.Get("client_id"))
-	assert.Equal(t, testAppleRedirect, q.Get("redirect_uri"))
+	// Literal, not a shared constant: the registered Return URL must not
+	// drift silently (#2306).
+	assert.Equal(t, "https://api.concordvoice.chat/auth/sso/apple/callback", q.Get("redirect_uri"))
 	assert.Equal(t, "code", q.Get("response_type"))
 	assert.Equal(t, "name email", q.Get("scope"))
 	assert.Equal(t, "form_post", q.Get("response_mode"))

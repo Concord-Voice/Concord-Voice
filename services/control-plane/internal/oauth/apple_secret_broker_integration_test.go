@@ -53,11 +53,10 @@ func newBrokerRig(t *testing.T, withRateLimit bool) *brokerRig {
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
 
 	provider, err := oauth.NewAppleProvider(oauth.AppleConfig{
-		ClientID:    "com.example.concord",
-		TeamID:      "TEAM123ABC",
-		KeyID:       "KEYID12345",
-		PrivateKey:  pemBytes,
-		RedirectURI: "http://127.0.0.1:0/oauth/callback",
+		ClientID:   "com.example.concord",
+		TeamID:     "TEAM123ABC",
+		KeyID:      "KEYID12345",
+		PrivateKey: pemBytes,
 	})
 	require.NoError(t, err)
 

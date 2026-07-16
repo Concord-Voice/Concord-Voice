@@ -28,11 +28,13 @@ import (
 // (Enabled=false). A NewGoogleProvider failure here is fatal because it
 // means a previously-validated config has somehow regressed — keep loud.
 //
-// The seed RedirectURI is a fallback — each /sso/:provider initiate request
+// Google's seed RedirectURI is a fallback — each /sso/google initiate request
 // supplies the real loopback URI (via redirect_uri query param), stored in the
-// sso_state record and included in the auth URL per RFC 6749 §4.1.3. This
-// lets concurrent OAuth attempts on different ephemeral loopback ports coexist
-// without server-side reconfiguration.
+// sso_state record and included in the auth URL per RFC 6749 §4.1.3, letting
+// concurrent OAuth attempts on different ephemeral loopback ports coexist.
+// Apple takes no redirect config at all (#2306): its provider-facing redirect
+// is the fixed Worker-bridge callback registered on the Apple Services ID; the
+// desktop loopback is private relay metadata (Redis state + KV port) only.
 func buildOAuthHandler(
 	db *sql.DB,
 	redisClient *redis.Client,
@@ -64,11 +66,6 @@ func buildOAuthHandler(
 			TeamID:     cfg.AppleSSO.TeamID,
 			KeyID:      cfg.AppleSSO.KeyID,
 			PrivateKey: cfg.AppleSSO.PrivateKey,
-			// Fallback only — same rationale as Google above. Each /sso/apple
-			// initiate request supplies the real loopback URI via the
-			// redirect_uri query param, stored in sso_state, replayed at
-			// exchange time per RFC 6749 §4.1.3.
-			RedirectURI: "http://127.0.0.1:0/oauth/callback",
 		})
 		if err != nil {
 			log.Fatal("Failed to construct Apple OAuth provider", "error", err)

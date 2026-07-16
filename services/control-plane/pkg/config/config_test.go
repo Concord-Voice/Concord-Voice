@@ -1376,3 +1376,24 @@ func TestStorageConfig_Precedence(t *testing.T) {
 		assert.True(t, cfg.StorageUseSSL)
 	})
 }
+
+// TestValidateProductionRejectsAppleWithoutBridge pins the #2306 startup
+// guard: apple authorization URLs carry the Worker-bridge callback, so an
+// Apple-enabled production deploy without the KV bridge would dead-end every
+// Apple login at runtime. Catch it at deploy time instead.
+func TestValidateProductionRejectsAppleWithoutBridge(t *testing.T) {
+	cfg := validProductionConfig()
+	cfg.AppleSSO.Enabled = true
+	cfg.CloudflareKVBridge.Enabled = false
+
+	err := cfg.validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CLOUDFLARE_KV_BRIDGE_ENABLED")
+
+	cfg.CloudflareKVBridge.Enabled = true
+	assert.NoError(t, cfg.validate(), "apple + bridge enabled must pass")
+
+	cfg.AppleSSO.Enabled = false
+	cfg.CloudflareKVBridge.Enabled = false
+	assert.NoError(t, cfg.validate(), "apple disabled needs no bridge")
+}

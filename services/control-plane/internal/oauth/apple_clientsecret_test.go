@@ -214,11 +214,10 @@ func newTestAppleProviderWithKey(t *testing.T, key *ecdsa.PrivateKey) *AppleProv
 	require.NoError(t, err)
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
 	provider, err := NewAppleProvider(AppleConfig{
-		ClientID:    testClientID,
-		TeamID:      testTeamID,
-		KeyID:       testKeyID,
-		PrivateKey:  pemBytes,
-		RedirectURI: "http://127.0.0.1:0/oauth/callback",
+		ClientID:   testClientID,
+		TeamID:     testTeamID,
+		KeyID:      testKeyID,
+		PrivateKey: pemBytes,
 	})
 	require.NoError(t, err)
 	return provider

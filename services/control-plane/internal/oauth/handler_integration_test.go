@@ -1332,9 +1332,49 @@ func TestInitiate_BridgeFailureIsLoud(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "bridge_unavailable")
 }
 
-func TestInitiate_NilBridgeIsNoop(t *testing.T) {
-	rig, _ := newSSOTestRigWithCFKV(t, nil)
+// TestInitiate_Apple_KVFailureCleansUpState pins the #2306 no-orphaned-state
+// contract: when the bridge KV write fails AFTER the sso_state record was
+// written, Initiate deletes the record before responding 500 — otherwise the
+// dead record lingers for the full 10-minute stateTTL.
+func TestInitiate_Apple_KVFailureCleansUpState(t *testing.T) {
+	putter := &recordingPutter{err: fmt.Errorf("cf down")}
+	rig, rdb := newSSOTestRigWithCFKV(t, putter)
+
 	w := initiateRequest(t, rig, "apple", "http://127.0.0.1:51620/oauth/callback")
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Contains(t, w.Body.String(), "bridge_unavailable")
+
+	keys, err := rdb.Keys(context.Background(), "sso_state:*").Result()
+	require.NoError(t, err)
+	assert.Empty(t, keys, "a failed bridge write must not orphan the sso_state record")
+}
+
+// TestInitiate_Apple_NilBridgeFailsClosed pins the #2306 fail-closed
+// contract: Apple's authorization URL carries the Worker-bridge callback,
+// which can only relay via the state→port KV mapping. With no bridge client
+// the mapping cannot exist, so initiation must refuse up front — never hand
+// out an authorization URL that dead-ends after the user has typed their
+// Apple credentials. (Replaces TestInitiate_NilBridgeIsNoop: the pre-#2306
+// nil-bridge pass-through was only safe while apple auth URLs used the
+// loopback.)
+func TestInitiate_Apple_NilBridgeFailsClosed(t *testing.T) {
+	rig, rdb := newSSOTestRigWithCFKV(t, nil)
+	w := initiateRequest(t, rig, "apple", "http://127.0.0.1:51620/oauth/callback")
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Contains(t, w.Body.String(), "bridge_unavailable")
+
+	// Rejected at the bridge-precondition stage, BEFORE state generation —
+	// no orphaned sso_state record (the rig's Redis is a flushed test DB).
+	keys, err := rdb.Keys(context.Background(), "sso_state:*").Result()
+	require.NoError(t, err)
+	assert.Empty(t, keys, "nil-bridge rejection must not orphan an sso_state record")
+}
+
+// TestInitiate_Google_NilBridgeStillNoop: Google is loopback-based
+// (RFC 8252) and never uses the bridge — a nil CFKV must not affect it.
+func TestInitiate_Google_NilBridgeStillNoop(t *testing.T) {
+	rig, _ := newSSOTestRigWithCFKV(t, nil)
+	w := initiateRequest(t, rig, "google", "http://127.0.0.1:51620/oauth/callback")
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
@@ -1386,4 +1426,106 @@ func TestInitiate_EmbedsStateInRecord(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(raw, &rec))
 	assert.Equal(t, resp.State, rec.State, "record must embed its own state value")
+}
+
+// TestInitiate_Apple_OutOfRangePortRejected mirrors the Worker's relay-side
+// port validation (apple-sso-bridge stub.ts isValidPort, 1024-65535) at the
+// initiate boundary (#2306 review): an out-of-range loopback port would pass
+// initiation but the Worker would refuse the relay, dead-ending the user
+// AFTER Apple credential entry. Fail fast at initiate instead.
+func TestInitiate_Apple_OutOfRangePortRejected(t *testing.T) {
+	putter := &recordingPutter{}
+	rig, rdb := newSSOTestRigWithCFKV(t, putter)
+
+	for name, uri := range map[string]string{
+		"port_zero":     "http://127.0.0.1:0/oauth/callback",
+		"privileged":    "http://127.0.0.1:80/oauth/callback",
+		"above_ceiling": "http://127.0.0.1:99999/oauth/callback",
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := initiateRequest(t, rig, "apple", uri)
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Contains(t, w.Body.String(), "invalid_redirect_uri")
+			// The range branch, not the portless branch, must reject these
+			// (both emit the same error_code; the detail disambiguates).
+			assert.Contains(t, w.Body.String(), "loopback port must be in 1024-65535")
+		})
+	}
+	assert.Empty(t, putter.calls, "no KV write may happen for a rejected port")
+	keys, err := rdb.Keys(context.Background(), "sso_state:*").Result()
+	require.NoError(t, err)
+	assert.Empty(t, keys, "rejected ports must not orphan sso_state records")
+}
+
+// cancelingPutter simulates a client abort landing during the KV write: it
+// cancels the request context and fails with the canceled context's error —
+// the realistic failure mode where the abort that kills the Put would also
+// kill a cleanup Del sharing the request context.
+type cancelingPutter struct{ cancel context.CancelFunc }
+
+func (p *cancelingPutter) Put(ctx context.Context, _, _ string, _ int) error {
+	p.cancel()
+	return ctx.Err()
+}
+
+// TestInitiate_Apple_KVFailureCleanupSurvivesClientAbort pins the #2306
+// review fix: the cleanup Del runs on a context detached from request
+// cancellation (context.WithoutCancel). A client abort mid-KV-write is
+// itself a likely CAUSE of the Put failure — a Del on the canceled request
+// context would fail in exactly the case the cleanup exists for (same
+// discipline as the WithoutCancel note in internal/purge/engine.go).
+func TestInitiate_Apple_KVFailureCleanupSurvivesClientAbort(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	putter := &cancelingPutter{cancel: cancel}
+	rig, rdb := newSSOTestRigWithCFKV(t, putter)
+
+	target := "/api/v1/auth/sso/apple?redirect_uri=" + url.QueryEscape("http://127.0.0.1:51620/oauth/callback") +
+		"&code_challenge=" + strings.Repeat("c", 43)
+	req := httptest.NewRequest(http.MethodGet, target, nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+	rig.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Contains(t, w.Body.String(), "bridge_unavailable")
+
+	keys, err := rdb.Keys(context.Background(), "sso_state:*").Result()
+	require.NoError(t, err)
+	assert.Empty(t, keys, "cleanup must survive the client abort that caused the KV failure")
+}
+
+// failingDelRedis wraps the live test client but fails every Del — the
+// Del-failure sub-branch of the KV-failure cleanup (#2306 review): a failed
+// cleanup must still surface 500 bridge_unavailable (TTL bounds the residue)
+// and must not panic on the rig's nil Log.
+type failingDelRedis struct {
+	redis.Cmdable
+	delErr error
+}
+
+func (f *failingDelRedis) Del(ctx context.Context, _ ...string) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx)
+	cmd.SetErr(f.delErr)
+	return cmd
+}
+
+func TestInitiate_Apple_KVFailureDelFailureStill500(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rdb, cleanup := testhelpers.SetupTestRedis(t)
+	t.Cleanup(cleanup)
+
+	registry := oauth.NewRegistry()
+	registry.Register(&fakeProvider{name: "apple"})
+
+	putter := &recordingPutter{err: fmt.Errorf("cf down")}
+	h := oauth.NewHandler(oauth.HandlerDeps{
+		Registry: registry,
+		Redis:    &failingDelRedis{Cmdable: rdb, delErr: fmt.Errorf("redis del down")},
+		CFKV:     putter,
+	})
+	r := gin.New()
+	r.GET("/api/v1/auth/sso/:provider", h.Initiate)
+
+	w := initiateRequest(t, r, "apple", "http://127.0.0.1:51620/oauth/callback")
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Contains(t, w.Body.String(), "bridge_unavailable")
 }

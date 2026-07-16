@@ -143,7 +143,6 @@ func newAppleSessionRig(t *testing.T, withRateLimit bool) *appleSessionRig {
 		TeamID:       testAppleTeamID,
 		KeyID:        testAppleKeyID,
 		PrivateKey:   generateP256PEM(t),
-		RedirectURI:  "http://127.0.0.1:0/oauth/callback",
 		JWKSEndpoint: jwks.Server.URL + "/auth/keys",
 		Issuer:       "https://appleid.apple.com",
 	})
