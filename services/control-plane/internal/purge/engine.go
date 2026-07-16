@@ -18,7 +18,7 @@ import (
 
 	"github.com/lib/pq"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 // ContextType is the audited purge context.

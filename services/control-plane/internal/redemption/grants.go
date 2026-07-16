@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/google/uuid"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
 )
 
 // GrantResult is what a grant-effect produces: a human-facing description the

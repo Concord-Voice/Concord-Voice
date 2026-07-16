@@ -7,8 +7,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 )
 
 // Admin auth rate-limit budgets (per IP). The password/webauthn/enroll steps are

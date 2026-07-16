@@ -9,8 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/auth"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 )
 
 // TestEraseAccount_Integration_HappyPath performs a full end-to-end erasure:

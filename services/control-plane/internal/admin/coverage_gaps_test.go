@@ -22,11 +22,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/admin"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/auth"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/admin"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────

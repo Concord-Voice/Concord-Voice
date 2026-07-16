@@ -9,8 +9,8 @@ import (
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/google/uuid"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/mfa"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 )
 
 // adminWebAuthnRPDisplayName is the fixed Relying Party display name for the

@@ -6,9 +6,9 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/privacy"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/users"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/privacy"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 // buildPrivacyHandler constructs the privacy handler wired to the

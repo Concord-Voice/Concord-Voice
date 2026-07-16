@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 // ObjectDeleter is the subset of ObjectStore needed for media cleanup.

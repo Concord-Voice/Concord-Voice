@@ -34,8 +34,8 @@ import (
 	_ "github.com/joho/godotenv/autoload" // auto-load .env into process environment on import
 	_ "github.com/lib/pq"                 // register postgres driver for database/sql
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/media"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 )
 
 type migrationStats struct {

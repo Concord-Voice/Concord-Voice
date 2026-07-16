@@ -10,14 +10,14 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
-	natsclient "github.com/markdrogersjr/Concord/services/control-plane/pkg/nats"
 )
 
 // Handler handles voice-related requests.

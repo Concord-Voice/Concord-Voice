@@ -6,11 +6,11 @@ import (
 	"database/sql"
 	"io"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/auth"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/cfkv"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/oauth"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/cfkv"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/oauth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/hkdf"
 )

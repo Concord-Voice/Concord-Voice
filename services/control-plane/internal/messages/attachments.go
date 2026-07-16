@@ -3,8 +3,8 @@ package messages
 import (
 	"database/sql"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/lib/pq"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
 )
 
 // loadAttachmentsForMessages batch-loads attachment summaries for a set of messages.

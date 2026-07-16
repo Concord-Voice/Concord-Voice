@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"testing"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/google/uuid"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
 	"github.com/stretchr/testify/require"
 )
 

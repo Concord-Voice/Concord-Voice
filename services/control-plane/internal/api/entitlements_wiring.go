@@ -2,10 +2,10 @@
 package api
 
 import (
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 )
 
 // entitlementBroadcaster is the subset of *websocket.Hub the notifier needs.

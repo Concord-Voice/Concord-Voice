@@ -4,7 +4,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/stretchr/testify/require"
 )
 

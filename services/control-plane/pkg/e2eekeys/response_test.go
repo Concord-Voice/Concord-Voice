@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/e2eekeys"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/e2eekeys"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

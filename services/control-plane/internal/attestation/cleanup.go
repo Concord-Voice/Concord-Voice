@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 // retentionPruner is the subset of *Repository that Cleanup needs.

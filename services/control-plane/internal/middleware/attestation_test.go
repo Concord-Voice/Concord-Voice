@@ -13,10 +13,10 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/attestation"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/middleware"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 func setupRouter(t *testing.T, enabled bool, rdb *redis.Client) (*gin.Engine, *bool) {

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/klipy"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/klipy"
 	"github.com/stretchr/testify/assert"
 )
 

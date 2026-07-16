@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/redemption"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/redemption"
 )
 
 // fakeIssuer is a test double for codeIssuer. It records the spec it was called

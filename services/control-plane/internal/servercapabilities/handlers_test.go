@@ -6,10 +6,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/servercapabilities"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/gin-gonic/gin"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/servercapabilities"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

@@ -1,4 +1,4 @@
-module github.com/markdrogersjr/Concord/services/control-plane
+module github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane
 
 go 1.26.5
 

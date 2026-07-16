@@ -13,8 +13,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/lib/pq"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"fmt"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 	"github.com/google/uuid"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/keyrotation"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
-	natsclient "github.com/markdrogersjr/Concord/services/control-plane/pkg/nats"
 )
 
 // tempGrantAllow is the EXACT permission bitmask granted to a user moved into a

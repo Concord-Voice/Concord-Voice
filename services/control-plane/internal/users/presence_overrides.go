@@ -12,12 +12,12 @@ import (
 	"sort"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/presence"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
 )
 
 const (

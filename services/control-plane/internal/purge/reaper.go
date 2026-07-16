@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/media"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 const (

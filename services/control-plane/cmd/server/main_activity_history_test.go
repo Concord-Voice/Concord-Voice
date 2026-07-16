@@ -14,11 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
+	controlwebsocket "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
+	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 	"github.com/gin-gonic/gin"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
-	controlwebsocket "github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
-	natsclient "github.com/markdrogersjr/Concord/services/control-plane/pkg/nats"
 )
 
 func TestBuildActivityHistoryDisclosureUsesOnlyDevelopmentAndTestForLoopbackHTTP(t *testing.T) {

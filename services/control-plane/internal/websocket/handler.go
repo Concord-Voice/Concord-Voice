@@ -9,11 +9,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/auth"
 	"github.com/redis/go-redis/v9"
 )
 

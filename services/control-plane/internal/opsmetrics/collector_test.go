@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/stretchr/testify/require"
 )
 

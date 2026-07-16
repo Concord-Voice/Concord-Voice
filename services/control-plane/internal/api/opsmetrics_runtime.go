@@ -6,11 +6,11 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/websocket"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
-	natsclient "github.com/markdrogersjr/Concord/services/control-plane/pkg/nats"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 )
 
 // OpsMetricsRuntime owns the collector goroutine started by NewRouter.

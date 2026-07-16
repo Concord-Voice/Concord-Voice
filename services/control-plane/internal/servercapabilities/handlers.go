@@ -7,8 +7,8 @@ package servercapabilities
 import (
 	"net/http"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/gin-gonic/gin"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
 )
 
 const (

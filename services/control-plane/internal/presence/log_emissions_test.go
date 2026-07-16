@@ -22,7 +22,7 @@ var bannedPolicyLogMethods = map[string]bool{
 var bannedPolicyLogImports = map[string]bool{
 	"log":      true,
 	"log/slog": true,
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger": true,
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger": true,
 }
 
 func policyLogFindings(filename string, source []byte) ([]string, error) {

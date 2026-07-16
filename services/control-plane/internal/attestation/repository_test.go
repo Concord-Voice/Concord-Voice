@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/attestation"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/require"
 )
 

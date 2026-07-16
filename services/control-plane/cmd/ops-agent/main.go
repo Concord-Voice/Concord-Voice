@@ -9,9 +9,9 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
-	concordnats "github.com/markdrogersjr/Concord/services/control-plane/pkg/nats"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
+	concordnats "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 )
 
 const (

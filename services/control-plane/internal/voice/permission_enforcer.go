@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
-	natsclient "github.com/markdrogersjr/Concord/services/control-plane/pkg/nats"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 )
 
 // natsSubjectEnforcePermissions carries a recomputed effective-permission

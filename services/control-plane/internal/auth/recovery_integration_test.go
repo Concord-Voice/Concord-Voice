@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/api"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/presencehistory"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/api"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

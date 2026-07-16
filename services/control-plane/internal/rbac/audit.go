@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
 )
 
 // AuditWriter logs permission-related administrative actions to the audit_log table

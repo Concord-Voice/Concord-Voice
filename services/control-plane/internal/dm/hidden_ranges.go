@@ -7,7 +7,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/purge"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 )
 
 // Range is a [From, To) hidden window for the DM receiver-hide (#1352). A participant who

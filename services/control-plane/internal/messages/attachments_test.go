@@ -5,9 +5,9 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/messages"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/models"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/messages"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

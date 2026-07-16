@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/redis/go-redis/v9"
 )
 

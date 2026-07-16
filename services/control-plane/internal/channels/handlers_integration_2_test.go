@@ -9,9 +9,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/e2eekeys"
 	"github.com/google/uuid"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/e2eekeys"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/database"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/opsmetrics"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/config"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/database"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 )
 
 type openAdminOpsMetricsReaderFunc func(

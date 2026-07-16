@@ -4,12 +4,12 @@ import (
 	"database/sql"
 	"testing"
 
-	dbtest "github.com/markdrogersjr/Concord/services/control-plane/internal/testhelpers/testdb"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/rbac"
-	"github.com/markdrogersjr/Concord/services/control-plane/pkg/logger"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 // BrokenResolver returns a *rbac.Resolver whose backing database is closed, so

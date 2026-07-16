@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/stretchr/testify/assert"
 )
 

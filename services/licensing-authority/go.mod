@@ -1,3 +1,3 @@
-module github.com/concord/licensing-authority
+module github.com/Concord-Voice/Concord-Voice-Alpha/services/licensing-authority
 
 go 1.26.4

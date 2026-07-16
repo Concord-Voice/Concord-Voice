@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/google/uuid"
-	"github.com/markdrogersjr/Concord/services/control-plane/internal/presence"
 )
 
 // ForcedClearResult is the complete transaction and delivery evidence for a

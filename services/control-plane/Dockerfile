@@ -35,7 +35,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o migrate-media ./c
 # Final stage
 FROM alpine:3.21
 
-LABEL org.opencontainers.image.source="https://github.com/markdrogersjr/Concord"
+LABEL org.opencontainers.image.source="https://github.com/Concord-Voice/Concord-Voice-Alpha"
 LABEL org.opencontainers.image.description="Concord Voice control-plane service"
 LABEL org.opencontainers.image.licenses="LicenseRef-CVSL-1.0"
 
