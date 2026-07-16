@@ -7,6 +7,10 @@ import { useVoiceStore } from '@/renderer/stores/voiceStore';
 const mockSetAggressiveReconnect = vi.fn();
 const mockGetState = vi.fn().mockReturnValue('DISCONNECTED');
 
+// handleReconnected calls `validateEpochsOnReconnect().catch(...)`, so this must
+// return a promise. A bare vi.fn() returns undefined and throws on `.catch`.
+const validateEpochs = vi.fn().mockResolvedValue(undefined);
+
 const mockWsService = {
   setAggressiveReconnect: mockSetAggressiveReconnect,
   getState: mockGetState,
@@ -23,7 +27,24 @@ vi.mock('@/renderer/services/websocketService', () => ({
 }));
 
 vi.mock('@/renderer/services/e2eeService', () => ({
-  e2eeService: { validateEpochs: vi.fn() },
+  e2eeService: {
+    validateEpochs: vi.fn(),
+    isInitialized: true,
+    processPendingKeyRequests: vi.fn().mockResolvedValue(undefined),
+  },
+}));
+
+vi.mock('@/renderer/services/postLoginHydration', () => ({
+  hydratePostLogin: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('@/renderer/services/postLoginHydrationLifecycle', () => ({
+  beginPostLoginHydrationGuard: vi.fn(() => ({
+    signal: new AbortController().signal,
+    isCurrent: () => true,
+  })),
+  isHydrationLifecycleCurrent: vi.fn(() => true),
+  resetPostLoginHydrationLifecycle: vi.fn(),
 }));
 
 vi.mock('@/renderer/services/voiceService', () => ({
@@ -42,10 +63,14 @@ vi.mock('@/renderer/services/recoveryService', () => ({
 
 vi.mock('@/renderer/services/resetService', () => ({
   gracefulReset: vi.fn(),
+  recoveryReset: vi.fn(),
   softRestart: vi.fn(),
 }));
 
 import { useConnectionRecovery } from '@/renderer/hooks/useConnectionRecovery';
+import { gracefulReset, recoveryReset } from '@/renderer/services/resetService';
+import { hydratePostLogin } from '@/renderer/services/postLoginHydration';
+import { useUserStore } from '@/renderer/stores/userStore';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -54,6 +79,8 @@ beforeEach(() => {
     activeChannelId: null,
     connectionState: 'disconnected',
   });
+  // The recovery_a/preflight branch awaits fetchUser before hydrating.
+  useUserStore.setState({ fetchUser: vi.fn().mockResolvedValue(undefined) } as never);
 });
 
 afterEach(() => {
@@ -62,7 +89,9 @@ afterEach(() => {
 
 describe('useConnectionRecovery', () => {
   it('starts grace period on RECONNECTING from stable', () => {
-    const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+    const { result } = renderHook(() =>
+      useConnectionRecovery(mockWsService as never, validateEpochs)
+    );
 
     result.current('RECONNECTING' as never);
 
@@ -76,7 +105,9 @@ describe('useConnectionRecovery', () => {
       connectionState: 'connected',
     });
 
-    const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+    const { result } = renderHook(() =>
+      useConnectionRecovery(mockWsService as never, validateEpochs)
+    );
 
     result.current('RECONNECTING' as never);
 
@@ -86,7 +117,9 @@ describe('useConnectionRecovery', () => {
   it('does not start grace period if already in recovery', () => {
     useConnectionStore.getState().enterRecoveryA();
 
-    const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+    const { result } = renderHook(() =>
+      useConnectionRecovery(mockWsService as never, validateEpochs)
+    );
 
     result.current('RECONNECTING' as never);
 
@@ -97,10 +130,61 @@ describe('useConnectionRecovery', () => {
   it('resets on CONNECTED during grace_period', () => {
     useConnectionStore.getState().startGracePeriod();
 
-    const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+    const { result } = renderHook(() =>
+      useConnectionRecovery(mockWsService as never, validateEpochs)
+    );
 
     result.current('CONNECTED' as never);
 
     expect(mockSetAggressiveReconnect).toHaveBeenCalledWith(false);
+  });
+
+  describe('recovery_a -> CONNECTED (#2199)', () => {
+    it('calls recoveryReset, never gracefulReset', async () => {
+      useConnectionStore.getState().enterRecoveryA();
+      const { result } = renderHook(() =>
+        useConnectionRecovery(mockWsService as never, validateEpochs)
+      );
+
+      result.current('CONNECTED' as never);
+
+      await vi.waitFor(() => expect(recoveryReset).toHaveBeenCalledTimes(1));
+      expect(gracefulReset).not.toHaveBeenCalled();
+    });
+
+    it('still hydrates the account after fencing', async () => {
+      useConnectionStore.getState().enterRecoveryA();
+      const { result } = renderHook(() =>
+        useConnectionRecovery(mockWsService as never, validateEpochs)
+      );
+
+      result.current('CONNECTED' as never);
+
+      await vi.waitFor(() => expect(hydratePostLogin).toHaveBeenCalledTimes(1));
+    });
+
+    it('returns the phase to stable', () => {
+      useConnectionStore.getState().enterRecoveryA();
+      const { result } = renderHook(() =>
+        useConnectionRecovery(mockWsService as never, validateEpochs)
+      );
+
+      result.current('CONNECTED' as never);
+
+      expect(useConnectionStore.getState().phase).toBe('stable');
+    });
+
+    it('takes the same path from preflight', async () => {
+      useConnectionStore.getState().startGracePeriod();
+      useConnectionStore.getState().enterPreflight();
+      const { result } = renderHook(() =>
+        useConnectionRecovery(mockWsService as never, validateEpochs)
+      );
+
+      result.current('CONNECTED' as never);
+
+      await vi.waitFor(() => expect(recoveryReset).toHaveBeenCalledTimes(1));
+      expect(gracefulReset).not.toHaveBeenCalled();
+    });
   });
 });

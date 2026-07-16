@@ -42,9 +42,11 @@ vi.mock('@/renderer/services/recoveryService', () => ({
 
 const mockSoftRestart = vi.fn();
 const mockGracefulReset = vi.fn();
+const mockRecoveryReset = vi.fn();
 vi.mock('@/renderer/services/resetService', () => ({
   softRestart: (...args: unknown[]) => mockSoftRestart(...args),
   gracefulReset: (...args: unknown[]) => mockGracefulReset(...args),
+  recoveryReset: (...args: unknown[]) => mockRecoveryReset(...args),
 }));
 
 const mockHydratePostLogin = vi.fn().mockResolvedValue(undefined);
@@ -304,7 +306,7 @@ describe('useConnectionRecovery — extended', () => {
   });
 
   describe('CONNECTED during recovery_a', () => {
-    it('performs graceful reset and fetches user', async () => {
+    it('performs recovery reset and fetches user', async () => {
       useConnectionStore.getState().enterRecoveryA();
 
       const validateEpochs = vi.fn().mockResolvedValue(undefined);
@@ -318,6 +320,20 @@ describe('useConnectionRecovery — extended', () => {
       // Phase should be reset
       expect(useConnectionStore.getState().phase).toBe('stable');
       await vi.waitFor(() => expect(mockHydratePostLogin).toHaveBeenCalledOnce());
+    });
+
+    it('never runs the logout-class gracefulReset on a same-account recovery (#2199)', async () => {
+      useConnectionStore.getState().enterRecoveryA();
+
+      const validateEpochs = vi.fn().mockResolvedValue(undefined);
+      const { result } = renderHook(() =>
+        useConnectionRecovery(mockWsService as never, validateEpochs)
+      );
+
+      result.current('CONNECTED' as never);
+
+      await vi.waitFor(() => expect(mockRecoveryReset).toHaveBeenCalledOnce());
+      expect(mockGracefulReset).not.toHaveBeenCalled();
     });
 
     it('validates E2EE epochs when initialized', async () => {
@@ -338,7 +354,7 @@ describe('useConnectionRecovery — extended', () => {
     it('restores the user and then rehydrates account-bound sync after reset', async () => {
       useConnectionStore.getState().enterRecoveryA();
       const recoveryOrder: string[] = [];
-      mockGracefulReset.mockImplementationOnce(() => {
+      mockRecoveryReset.mockImplementationOnce(() => {
         recoveryOrder.push('reset');
         useUserStore.getState().clearUser();
       });
@@ -405,7 +421,7 @@ describe('useConnectionRecovery — extended', () => {
   });
 
   describe('CONNECTED during preflight', () => {
-    it('performs graceful reset (same as recovery_a)', async () => {
+    it('performs recovery reset (same as recovery_a)', async () => {
       useConnectionStore.getState().enterPreflight();
 
       const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));

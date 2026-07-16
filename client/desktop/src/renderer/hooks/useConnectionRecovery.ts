@@ -133,13 +133,27 @@ function handleReconnected(
     runRecoveryModule(
       () => import('../services/resetService'),
       async (m) => {
-        m.gracefulReset();
+        // Same account, same token — fence in-flight E2EE work and clear NOTHING.
+        // gracefulReset() here destroyed drafts, the outbound MessageQueue, and the
+        // user's activeServerId on every transient blip; hydratePostLogin restores
+        // none of those, and the first two have no server copy to restore from
+        // (#2199). Do NOT reintroduce a logout-class reset on this path.
+        m.recoveryReset();
         const guard = beginPostLoginHydrationGuard();
         await useUserStore.getState().fetchUser(guard);
         if (!isHydrationLifecycleCurrent(guard)) return;
         await hydratePostLogin(guard);
+        // NOTE: authoritative membership refresh + message backfill are NOT done
+        // here. A WS reconnect replays only subscriptions + a presence snapshot,
+        // so member_removed / channel_access_revoked and messages missed during
+        // the outage are not redelivered — a revoked server/channel stays visible
+        // until reload. Doing that refresh session-safely needs the hydration
+        // guard threaded through the store fetch actions themselves; it is tracked
+        // as #2329 (Recovery-A authoritative refresh). Do NOT bolt an unguarded
+        // refetch on here — an in-flight fetchRequests/fetchServers can clobber a
+        // newer session (see #2329).
       },
-      'gracefulReset'
+      'recoveryReset'
     );
     useConnectionStore.getState().reset();
     runRecoveryModule(

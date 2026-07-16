@@ -40,10 +40,15 @@ vi.mock('@/renderer/services/notificationPrefsService', () => ({
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     fencePendingOperations: vi.fn(),
+    clearKeys: vi.fn(),
+    // channelStore.clearChannels() purges per-channel access state for each seeded
+    // channel, which routes through e2eeService.revokeChannelAccess. Suites that
+    // seed channels reach it via resetAllStores() in beforeEach.
+    revokeChannelAccess: vi.fn(),
   },
 }));
 
-import { gracefulReset, nuclearReset } from '@/renderer/services/resetService';
+import { gracefulReset, nuclearReset, recoveryReset } from '@/renderer/services/resetService';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useServerStore } from '@/renderer/stores/serverStore';
 import { useChannelStore } from '@/renderer/stores/channelStore';
@@ -66,6 +71,8 @@ import { stopExpirySweep } from '@/renderer/services/notificationPrefsService';
 import { stopProactiveRefresh } from '@/renderer/services/apiClient';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/searchService';
+import { useDraftMessageStore } from '@/renderer/stores/draftMessageStore';
+import { useE2EEStore } from '@/renderer/stores/e2eeStore';
 import { mockServer } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 
@@ -79,6 +86,8 @@ beforeEach(() => {
   vi.mocked(stopExpirySweep).mockClear();
   vi.mocked(stopProactiveRefresh).mockClear();
   vi.mocked(e2eeService.fencePendingOperations).mockReset();
+  vi.mocked(e2eeService.clearKeys).mockReset();
+  vi.mocked(e2eeService.revokeChannelAccess).mockReset();
   vi.mocked(presenceOverrideSyncService.reset)
     .mockReset()
     .mockImplementation(() => {
@@ -176,16 +185,18 @@ describe('resetService', () => {
       expect(isIndexed('prior-account-message')).toBe(false);
     });
 
-    it('fences in-flight E2EE work before clearing content or indexed plaintext', () => {
+    it('clears E2EE keys before clearing content or indexed plaintext', () => {
+      // gracefulReset clears renderer key custody (clearKeys fences internally),
+      // and must do so BEFORE wiping content stores / the plaintext search index.
       indexMessage('in-flight-message', 'prior account secret', 'channel-1');
-      vi.mocked(e2eeService.fencePendingOperations).mockImplementationOnce(() => {
+      vi.mocked(e2eeService.clearKeys).mockImplementationOnce(() => {
         expect(useServerStore.getState().servers).toHaveLength(1);
         expect(isIndexed('in-flight-message')).toBe(true);
       });
 
       gracefulReset();
 
-      expect(e2eeService.fencePendingOperations).toHaveBeenCalledOnce();
+      expect(e2eeService.clearKeys).toHaveBeenCalledOnce();
       expect(useServerStore.getState().servers).toHaveLength(0);
       expect(isIndexed('in-flight-message')).toBe(false);
     });
@@ -310,6 +321,112 @@ describe('resetService', () => {
       nuclearReset();
 
       expect(clearTokens).toHaveBeenCalled();
+    });
+  });
+
+  describe('recoveryReset (#2199)', () => {
+    it('fences in-flight E2EE work', () => {
+      recoveryReset();
+
+      expect(e2eeService.fencePendingOperations).toHaveBeenCalledTimes(1);
+    });
+
+    it('never clears E2EE key material — handleReconnected gates on isInitialized', () => {
+      recoveryReset();
+
+      expect(e2eeService.clearKeys).not.toHaveBeenCalled();
+    });
+
+    it('retains client-authored state that no hydrator can restore', () => {
+      useDraftMessageStore.getState().setDraft('channel-1', {
+        text: 'unsent text',
+        updatedAt: 1,
+      });
+
+      recoveryReset();
+
+      expect(useDraftMessageStore.getState().getDraft('channel-1')?.text).toBe('unsent text');
+    });
+
+    it('retains the active server so the user is not bounced out of their channel', () => {
+      useServerStore.getState().setActiveServer(mockServer.id);
+
+      recoveryReset();
+
+      expect(useServerStore.getState().servers).toHaveLength(1);
+      expect(useServerStore.getState().activeServerId).toBe(mockServer.id);
+    });
+
+    it('retains content stores that gracefulReset clears', () => {
+      useChannelStore.setState({ channels: [{ id: 'c1' }] as never });
+      useDMStore.setState({ conversations: [{ id: 'd1' }] as never });
+      useFriendStore.setState({ friends: [{ id: 'f1' }] as never });
+
+      recoveryReset();
+
+      expect(useChannelStore.getState().channels).toHaveLength(1);
+      expect(useDMStore.getState().conversations).toHaveLength(1);
+      expect(useFriendStore.getState().friends).toHaveLength(1);
+    });
+
+    it('retains the authenticated user — the account did not change', () => {
+      recoveryReset();
+
+      expect(useUserStore.getState().user).not.toBeNull();
+      expect(useAuthStore.getState().accessToken).toBe('test-token');
+    });
+
+    it('leaves E2EE readiness agreeing with the service (AC #3)', () => {
+      useE2EEStore.getState().setReady(true);
+
+      recoveryReset();
+
+      expect(useE2EEStore.getState().ready).toBe(true);
+    });
+
+    it('does not stop proactive refresh — the token is unchanged (AC #5)', () => {
+      recoveryReset();
+
+      expect(stopProactiveRefresh).not.toHaveBeenCalled();
+    });
+
+    it('does not stop account-bound watchers — hydratePostLogin re-arms them idempotently', () => {
+      recoveryReset();
+
+      expect(preferencesSyncService.stopWatching).not.toHaveBeenCalled();
+      expect(savedGifsSyncService.stopWatching).not.toHaveBeenCalled();
+      expect(friendOrgSyncService.stopWatching).not.toHaveBeenCalled();
+      expect(stopExpirySweep).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('nuclearReset E2EE key custody (#2199, CWE-212)', () => {
+    it('clears renderer key material — the login screen is about to appear', () => {
+      nuclearReset();
+
+      expect(e2eeService.clearKeys).toHaveBeenCalledTimes(1);
+    });
+
+    it('clears keys without depending on userStore.logout as the caller', () => {
+      // apiClient's rememberMe=false 401 path calls nuclearReset() directly and
+      // lands on the login screen without passing through userStore.logout, which
+      // was the only clearKeys() caller before #2199.
+      nuclearReset();
+
+      expect(e2eeService.clearKeys).toHaveBeenCalled();
+      expect(useAuthStore.getState().accessToken).toBeNull();
+    });
+
+    it('gracefulReset ALSO clears keys — all its callers reach the login screen or a reload', () => {
+      // Codex #2327 review: the CWE-212 fix was incomplete when clearKeys lived only
+      // in nuclearReset — apiClient's rememberMe=true refresh-failure path uses
+      // gracefulReset and still lands on the login screen. Post-recoveryReset-split,
+      // no gracefulReset caller is a live same-session continuation, so it clears
+      // renderer keys too. (recoveryReset — the same-session path — still does NOT;
+      // see its suite above.)
+      gracefulReset();
+
+      expect(e2eeService.clearKeys).toHaveBeenCalledTimes(1);
     });
   });
 });

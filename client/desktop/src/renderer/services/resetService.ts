@@ -1,19 +1,26 @@
 /**
  * Reset Service — Centralized state cleanup for auth lifecycle events
  *
- * Three tiers:
+ * Four tiers, ordered narrowest to widest:
+ * - recoveryReset: Same-account transport recovery. Fences in-flight E2EE work and
+ *   clears NOTHING. Recovery-A reconnects the same session with the same access
+ *   token — it is a refresh, not a reset (#2199).
  * - softRestart: Page reload preserving auth tokens. Used by Recovery B when
  *   the client has issues but the session is valid.
  * - gracefulReset: Clears content stores, preserves device settings (theme, audio, etc.)
  *   Used when the user is being "remembered" but needs a fresh content slate.
- * - nuclearReset: Wipes all user/content/auth state. Used when the login screen
- *   appears — no ghost profiles. Device-LOCAL settings (theme/appearance, audio,
- *   video, TTS, layout UI prefs) deliberately survive: wiping them reverted every
- *   logout-class transition to defaults (#1603, public feedback #26). User-scoped
- *   fields nested inside those stores (per-participant volumes) are still cleared.
+ * - nuclearReset: Wipes all user/content/auth state, including renderer E2EE key
+ *   custody. Used when the login screen appears — no ghost profiles. Device-LOCAL
+ *   settings (theme/appearance, audio, video, TTS, layout UI prefs) deliberately
+ *   survive: wiping them reverted every logout-class transition to defaults (#1603,
+ *   public feedback #26). User-scoped fields nested inside those stores
+ *   (per-participant volumes) are still cleared.
  *
- * Core principle: if the login screen appears, go nuclear — on identity and
- * content, never on device preferences.
+ * Core principles:
+ * - If the login screen appears, go nuclear — on identity and content, never on
+ *   device preferences.
+ * - If the account did not change, do not use a primitive that clears
+ *   account-scoped state (#2199).
  */
 
 import { useAuthStore } from '../stores/authStore';
@@ -49,9 +56,39 @@ import { clearIndex } from './searchService';
 import { e2eeService } from './e2eeService';
 
 /**
+ * Same-account recovery fence — the narrowest tier.
+ *
+ * Recovery-A reconnects the SAME session with the SAME access token; only the
+ * transport blipped. It must NOT clear account-scoped state: no store is stale
+ * merely because the socket dropped, and `draftMessageStore` / MessageQueue hold
+ * client-authored state with no server copy to restore from. Using gracefulReset
+ * here destroyed drafts, the outbound queue, and the user's activeServerId on
+ * every transient blip — hydratePostLogin restores none of them, and the nine
+ * renderer effects that hydrate off `accessToken` never re-fire because Recovery-A's
+ * defining property is that the token does not change (#2199).
+ *
+ * The only genuine need is rejecting in-flight decrypt continuations that belong
+ * to the pre-drop key generation. Key material is preserved deliberately:
+ * `handleReconnected` gates `validateEpochsOnReconnect` and
+ * `processPendingKeyRequests` on `e2eeService.isInitialized`, and clearing it
+ * would force a full key re-derivation on every reconnect.
+ *
+ * `resetPostLoginHydrationLifecycle()` is deliberately NOT called here — the
+ * caller's `beginPostLoginHydrationGuard()` already invokes it, and a second call
+ * would abort the guard it is about to create.
+ *
+ * Do NOT call gracefulReset() from a same-account recovery path.
+ */
+export function recoveryReset(): void {
+  e2eeService.fencePendingOperations();
+}
+
+/**
  * Clears content stores while preserving device settings.
  * Appropriate when rememberMe=true and the session can be restored,
  * but user-specific content must be wiped to prevent ghost artifacts.
+ *
+ * NOT for same-account transport recovery — see recoveryReset() (#2199).
  */
 export function gracefulReset(): void {
   resetPostLoginHydrationLifecycle();
@@ -63,9 +100,22 @@ export function gracefulReset(): void {
   savedGifsSyncService.stopWatching();
   friendOrgSyncService.stopWatching();
   stopExpirySweep();
-  // Reject pre-reset decrypt continuations before clearing content while
-  // preserving key material needed by same-session recovery hydration.
-  e2eeService.fencePendingOperations();
+  // Clear renderer E2EE key custody. EVERY gracefulReset caller reaches the login
+  // screen (rememberMe=true refresh failure → apiClient.ts; session-restore failure
+  // → App.tsx) or a full renderer reload (softRestart), and nuclearReset calls this
+  // too — none is a live same-session continuation. So the prior account's
+  // wrappingKey / raw sessionKeys must NOT stay resident (CWE-212, #2199). This is
+  // renderer-only: it does not touch the safeStorage secure-e2ee.dat or the
+  // main-process in-memory copy, so a rememberMe=true next-launch restore and a
+  // softRestart soft-reload both re-derive keys normally. clearKeys() fences
+  // pending decrypts internally.
+  //
+  // Same-account transport recovery does NOT flow through here — it uses
+  // recoveryReset(), which fences WITHOUT clearing keys precisely because that path
+  // continues the SAME session and must keep decrypting. Do NOT call gracefulReset()
+  // from a same-account recovery path (that was the #2199 bug), and do NOT downgrade
+  // this back to a bare fencePendingOperations() — that re-opens the CWE-212 leak.
+  e2eeService.clearKeys();
   presenceOverrideSyncService.reset();
   useFriendOrgStore.getState().reset();
   useSavedGifsStore.getState().reset();
@@ -157,7 +207,11 @@ export function nuclearReset(): void {
   // therefore cannot retrigger apiClient's auth-store subscription.
   stopProactiveRefresh();
 
-  // Start with everything gracefulReset does
+  // Renderer E2EE key custody is cleared by gracefulReset() below (every
+  // login-screen path clears keys since #2199); no separate clearKeys() call is
+  // needed here. tokenManager.clearTokens() at the end wipes the main-process +
+  // disk halves. Together: a login-screen transition leaves NO renderer, main, or
+  // disk key material for the prior account (CWE-212).
   gracefulReset();
 
   // Additionally clear auth store
