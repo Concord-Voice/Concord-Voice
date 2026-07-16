@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.29] — 2026-07-15
+
+### Security
+
+- **Desktop release signing is isolated from pull requests** ([#2296](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2296)) — pull-request packages now run unsigned without signing secrets or OIDC, while signed releases rebuild protected `main` with environment-scoped credentials and same-run artifacts.
+
 ## [0.2.28] — 2026-07-14
 
 ### Changed

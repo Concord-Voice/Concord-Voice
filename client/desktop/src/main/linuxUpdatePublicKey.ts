@@ -3,8 +3,9 @@
  *
  * Public half of the Ed25519 keypair whose private half signs every Linux
  * release artifact (.AppImage / .deb / .rpm) in `.github/workflows/build-desktop.yml`
- * (CI secret `LINUX_UPDATE_SIGNING_KEY`, repo scope — like the Apple/Azure
- * code-signing secrets). Public keys are safe to commit and bake into the binary.
+ * (the `desktop-release` environment secret `LINUX_UPDATE_SIGNING_KEY`, consumed
+ * only by the trusted release job). Public keys are safe to commit and bake into
+ * the binary.
  *
  * This is the SOLE trust anchor for Linux auto-update authenticity:
  * `verifyLinuxArtifact()` checks the downloaded AppImage's detached signature
