@@ -104,6 +104,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn().mockResolvedValue(null),
+    getChannelKeyMaterial: vi.fn().mockResolvedValue({ channelKey: null, keyVersion: 0 }),
     invalidateChannelKey: vi.fn(),
     // #1878: version binding + sender re-base surface.
     getChannelKeyVersion: vi.fn().mockReturnValue(0),
@@ -114,10 +115,9 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 
 // --- mediaEncryption ---
 vi.mock('@/renderer/services/mediaEncryption', () => ({
-  // The client now negotiates v3 (#1878 Task 6); the mock mirrors the live
-  // constant so the join-version assertion (sender advertises === ack confirms)
-  // stays self-consistent. The media-plane gate accepts {2,3} during rollout.
-  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 3,
+  // The mock mirrors the live constant so the join-version assertion
+  // (sender advertises === ack confirms) stays self-consistent.
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
   MediaEncryption: class MockMediaEncryption {
     init = vi.fn().mockResolvedValue(undefined);
     initFromKey = vi.fn();
@@ -232,6 +232,7 @@ Object.defineProperty(globalThis, 'MediaStream', {
 
 // Mock RTCRtpSender constructor; producer doubles below model createEncodedStreams.
 function MockRTCRtpSender() {}
+Object.defineProperty(MockRTCRtpSender.prototype, 'createEncodedStreams', { value: vi.fn() });
 Object.defineProperty(globalThis, 'RTCRtpSender', {
   value: MockRTCRtpSender,
   writable: true,
@@ -327,7 +328,7 @@ function makeJoinResponse(co?: Record<string, unknown>) {
 function makeRoomJoined(ov?: Record<string, unknown>) {
   return {
     rtpCapabilities: mockDeviceRtpCapabilities,
-    mediaFrameCryptoVersion: 3,
+    mediaFrameCryptoVersion: 5,
     existingProducers: [],
     participants: [{ userId: 'user-1', username: 'testuser', displayName: 'Test User' }],
     channelName: 'General',
@@ -675,7 +676,7 @@ describe('VoiceService', () => {
         'join-room',
         expect.objectContaining({
           roomId: 'channel-1',
-          mediaFrameCryptoVersion: 3,
+          mediaFrameCryptoVersion: 5,
         }),
         expect.any(Function)
       );
@@ -703,14 +704,13 @@ describe('VoiceService', () => {
         json: vi.fn().mockResolvedValue(makeJoinResponse()),
       });
       mockSocket.connected = true;
-      // Media-plane returns the typed ack: the room is at a higher version and
-      // this (lower-version) client must update to rejoin (#1878).
+      // Media-plane returns the same typed ack for either mismatch direction.
       setupEmitResponses({
         'join-room': {
-          error: 'Media frame crypto version mismatch: room=3, join=2',
+          error: 'Media frame crypto version mismatch: room=4, join=5',
           code: 'crypto_version_mismatch',
-          roomVersion: 3,
-          joinVersion: 2,
+          roomVersion: 4,
+          joinVersion: 5,
         },
       });
 
@@ -719,6 +719,7 @@ describe('VoiceService', () => {
 
       const critical = useUpdateStatusStore.getState().criticalError;
       expect(critical?.subtype).toBe('media-crypto-version');
+      expect(critical?.message).toBe('This voice call requires the same media-security version.');
     });
 
     it('falls back to personal tier when channel tier invalid', async () => {
@@ -1369,6 +1370,9 @@ describe('VoiceService', () => {
         );
         const joinRoomCalls = mockSocket.emit.mock.calls.filter((call) => call[0] === 'join-room');
         expect(joinRoomCalls.at(-1)?.[1]).toEqual(expect.objectContaining({ callId: 'call-1' }));
+      });
+      await vi.waitFor(() => {
+        expect(useVoiceStore.getState().connectionState).toBe('connected');
       });
     });
 
@@ -2780,6 +2784,7 @@ describe('VoiceService', () => {
       const svc = voiceService as any;
       useVideoSettingsStore.setState({
         preferredVideoCodec: 'video/VP8',
+        hardwareAcceleration: false,
         webrtcHwByMime: { 'video/vp8': false },
       });
       const cam = createMockProducer('prod-cam', 'camera');
@@ -2874,6 +2879,70 @@ describe('VoiceService', () => {
       } finally {
         delete svc.reProduceIfBetterCodec;
       }
+    });
+
+    it('demotes every qualified AV1 HW target and Auto reselects to verified H264 HW', async () => {
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      const oldCamera = createMockProducer('prod-camera-av1-sw', 'camera') as any;
+      oldCamera.rtpParameters = {
+        codecs: [{ mimeType: 'video/AV1', parameters: {} }],
+      };
+      oldCamera.getStats = vi.fn().mockResolvedValue(bFalseStats('video/AV1'));
+      svc.producers.set('camera', oldCamera);
+      svc.localCameraStream = createMockMediaStream([{ kind: 'video', id: 'camera-av1-track' }]);
+      useVoiceStore.getState().setVideoOn(true);
+      useVideoSettingsStore.setState({
+        hardwareAcceleration: true,
+        hdrEncoding: false, // SDR fallback is allowed by policy.
+        preferredVideoCodec: null,
+        webrtcHwByMime: {},
+        codecCapabilities: [
+          {
+            mimeType: 'video/AV1',
+            supported: true,
+            profileId: 'hdr',
+            profileLabel: '10-bit HDR target',
+            isHdr: true,
+            hwAvailable: true,
+          },
+          {
+            mimeType: 'video/AV1',
+            supported: true,
+            profileId: 'sdr',
+            profileLabel: '8-bit SDR target',
+            isHdr: false,
+            hwAvailable: true,
+          },
+          {
+            mimeType: 'video/H264',
+            supported: true,
+            profileId: '640034',
+            profileLabel: 'High',
+            isHdr: false,
+            hwAvailable: true,
+          },
+        ],
+      });
+
+      const replacement = createMockProducer('prod-camera-h264-hw', 'camera') as any;
+      replacement.rtpParameters = {
+        codecs: [{ mimeType: 'video/H264', parameters: { 'profile-level-id': '640034' } }],
+      };
+      sendTransport.produce.mockClear();
+      sendTransport.produce.mockResolvedValue(replacement);
+
+      await svc.learnWebrtcHwSignal();
+      await vi.waitFor(() => expect(sendTransport.produce).toHaveBeenCalledTimes(1));
+      await svc.videoReproduceQueues.camera;
+
+      expect(useVideoSettingsStore.getState().webrtcHwByMime['video/av1']).toBe(false);
+      expect(oldCamera.close).toHaveBeenCalledTimes(1);
+      expect(sendTransport.produce.mock.calls[0][0].codec).toMatchObject({
+        mimeType: 'video/H264',
+        parameters: { 'profile-level-id': '640034' },
+      });
+      expect(svc.producers.get('camera')).toBe(replacement);
     });
 
     it('re-selects BOTH camera and screen when they share a software-encoded codec (#2189)', async () => {
@@ -3690,9 +3759,10 @@ describe('VoiceService', () => {
     });
 
     it('pickCameraCodec preserves a floor-compatible manual H264 preference when layering is enabled', async () => {
-      useVoiceStore.getState().setCodecFloor(['video/vp9', 'video/h264']);
+      useVoiceStore.getState().setCodecFloor(['video/vp9:0', 'video/h264:640034']);
       useVideoSettingsStore.setState({
         preferredVideoCodec: 'video/H264',
+        hardwareAcceleration: false,
         supportSvc: true,
         supportSimulcast: true,
       });
@@ -3735,6 +3805,47 @@ describe('VoiceService', () => {
       const codec = svc.findSendCodec('video/H264:640034');
       expect(codec).toBeDefined();
       expect(codec.parameters?.['profile-level-id']).toBe('640034');
+    });
+
+    it('maps both AV1 color targets to base RTP AV1 with target-specific HW evidence', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+
+      expect(svc.findSendCodec('video/AV1:hdr')?.mimeType).toBe('video/AV1');
+      expect(svc.findSendCodec('video/AV1:sdr')?.mimeType).toBe('video/AV1');
+
+      useVideoSettingsStore.setState({
+        webrtcHwByMime: { 'video/av1': true },
+        codecCapabilities: [
+          { mimeType: 'video/AV1', profileId: 'hdr', hwAvailable: false },
+          { mimeType: 'video/AV1', profileId: 'sdr', hwAvailable: true },
+        ],
+      } as never);
+      expect(svc.isHwAccelerated('video/AV1:hdr')).toBe(false);
+      expect(svc.isHwAccelerated('video/AV1:sdr')).toBe(true);
+      expect(svc.isHwAccelerated('video/AV1')).toBe(true);
+
+      useVideoSettingsStore.setState({
+        webrtcHwByMime: { 'video/av1': false },
+        codecCapabilities: [
+          { mimeType: 'video/AV1', profileId: 'hdr', hwAvailable: true },
+          { mimeType: 'video/AV1', profileId: 'sdr', hwAvailable: false },
+        ],
+      } as never);
+      expect(svc.isHwAccelerated('video/AV1:hdr')).toBe(false);
+      expect(svc.isHwAccelerated('video/AV1:sdr')).toBe(false);
+      expect(svc.isHwAccelerated('video/AV1')).toBe(false);
+    });
+
+    it('treats a supported H264 profile as hardware evidence for a legacy bare preference', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useVideoSettingsStore.setState({
+        webrtcHwByMime: {},
+        codecCapabilities: [{ mimeType: 'video/H264', profileId: '4d0032', hwAvailable: true }],
+      } as never);
+
+      expect(svc.isHwAccelerated('video/H264')).toBe(true);
     });
 
     it('matches H264 by profile class while preserving level asymmetry', async () => {
@@ -3870,7 +3981,10 @@ describe('VoiceService', () => {
     });
 
     it('respects user codec preference', async () => {
-      useVideoSettingsStore.setState({ preferredVideoCodec: 'video/VP8' });
+      useVideoSettingsStore.setState({
+        preferredVideoCodec: 'video/VP8',
+        hardwareAcceleration: false,
+      });
       await joinVoiceChannel();
       const svc = voiceService as any;
       const result = svc.pickCameraCodec();
@@ -4521,24 +4635,27 @@ describe('VoiceService', () => {
 
   describe('E2EE initEncryption', () => {
     it('retries on failure with backoff', async () => {
-      // Make getChannelKey fail a few times then succeed
+      // Make the atomic key-material fetch fail a few times then succeed.
       const { e2eeService: mockE2ee } = await import('@/renderer/services/e2eeService');
-      vi.mocked(mockE2ee.getChannelKey)
+      vi.mocked(mockE2ee.getChannelKeyMaterial)
         .mockRejectedValueOnce(new E2EEKeyUnavailableError('NO_KEY_YET', true))
         .mockRejectedValueOnce(new E2EEKeyUnavailableError('NO_KEY_YET', true))
-        .mockResolvedValueOnce(new Uint8Array(32));
+        .mockResolvedValueOnce({
+          channelKey: new Uint8Array(32) as unknown as CryptoKey,
+          keyVersion: 1,
+        });
 
       // Join a channel to trigger the encryption init path (always encrypted)
       await joinVoiceChannel();
 
-      expect(vi.mocked(mockE2ee.getChannelKey)).toHaveBeenCalled();
+      expect(vi.mocked(mockE2ee.getChannelKeyMaterial)).toHaveBeenCalled();
     });
 
     it('fail-closed: sets mediaEncryption to null after all retries', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
 
-      // Since e2eeService.getChannelKey returns null, encryption init fails
+      // The focused mock uses null key material; this assertion only verifies cleanup shape.
       // The service should handle this gracefully
       expect(svc.mediaEncryption).toBeDefined(); // May be null (fail-closed) or initialized
     });

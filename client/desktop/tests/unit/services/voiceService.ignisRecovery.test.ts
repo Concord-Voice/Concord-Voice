@@ -1,11 +1,4 @@
-/**
- * regression for #1540
- *
- * IGNIS decoder-overload recovery path: once a consumer is paused by
- * pauseLowestPriorityConsumer, it must be resumed after IGNIS_RECOVERY_GREEN_INTERVALS
- * consecutive green profileDecoders() cycles.  Before the fix, there was NO recovery
- * arm — paused consumers stayed paused forever.
- */
+/** IGNIS interval decoder-budget, overload intervention, and recovery regressions. */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
 
@@ -60,6 +53,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn().mockResolvedValue(null),
+    getChannelKeyMaterial: vi.fn().mockResolvedValue({ channelKey: null, keyVersion: 0 }),
     invalidateChannelKey: vi.fn(),
     // #1878: version binding + sender re-base surface.
     getChannelKeyVersion: vi.fn().mockReturnValue(0),
@@ -70,10 +64,8 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 
 // --- mediaEncryption ---
 vi.mock('@/renderer/services/mediaEncryption', () => ({
-  // #1878 Task 6: the client negotiates v3. Mirror the live constant so the mock
-  // doesn't drift from production (these suites don't drive the join handshake,
-  // but keeping the value accurate avoids a misleading pin).
-  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 3,
+  // Mirror the live wire version so this focused suite cannot silently pin stale crypto.
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
   MediaEncryption: class MockMediaEncryption {
     init = vi.fn().mockResolvedValue(undefined);
     initFromKey = vi.fn();
@@ -202,35 +194,108 @@ Object.defineProperty(navigator, 'mediaDevices', {
 const { voiceService } = await import('@/renderer/services/voiceService');
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useUserStore } from '@/renderer/stores/userStore';
+import { useVoiceStore } from '@/renderer/stores/voiceStore';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** RED zone stats: totalDecodeTime=2.06, framesDecoded=100, fps=30 → rho ≈ 0.927 (>= 0.925) */
-function makeRedStatsMap(): Map<string, unknown> {
-  const m = new Map<string, unknown>();
-  m.set('inbound', {
-    type: 'inbound-rtp',
-    kind: 'video',
-    totalDecodeTime: 2.06,
-    framesDecoded: 100,
-    framesPerSecond: 30,
-  });
-  return m;
+interface DecoderCursor {
+  reportId: string;
+  ssrc: number;
+  totalDecodeTime: number;
+  framesDecoded: number;
+  timestamp: number;
+  framesPerSecond: number;
+  active?: boolean;
 }
 
-/** GREEN zone stats: totalDecodeTime=1.0, framesDecoded=100, fps=30 → rho = 0.45 (< 0.67) */
-function makeGreenStatsMap(): Map<string, unknown> {
-  const m = new Map<string, unknown>();
-  m.set('inbound', {
-    type: 'inbound-rtp',
-    kind: 'video',
-    totalDecodeTime: 1.0,
-    framesDecoded: 100,
-    framesPerSecond: 30,
-  });
-  return m;
+function rtcNow(): number {
+  return performance.timeOrigin + performance.now();
+}
+
+function makeCursor(reportId: string, ssrc: number, framesPerSecond = 30): DecoderCursor {
+  return {
+    reportId,
+    ssrc,
+    totalDecodeTime: 0,
+    framesDecoded: 0,
+    timestamp: rtcNow(),
+    framesPerSecond,
+    active: true,
+  };
+}
+
+function addInterval(
+  cursor: DecoderCursor,
+  timestamp: number,
+  decodeMsPerFrame: number,
+  frames = 30
+): void {
+  cursor.totalDecodeTime += (decodeMsPerFrame * frames) / 1_000;
+  cursor.framesDecoded += frames;
+  cursor.timestamp = timestamp;
+}
+
+function elapse(ms = 1_000): number {
+  vi.advanceTimersByTime(ms);
+  return rtcNow();
+}
+
+function statsMap(...cursors: DecoderCursor[]): Map<string, unknown> {
+  return new Map(
+    cursors.map((cursor) => [
+      cursor.reportId,
+      {
+        id: cursor.reportId,
+        type: 'inbound-rtp',
+        kind: 'video',
+        ssrc: cursor.ssrc,
+        totalDecodeTime: cursor.totalDecodeTime,
+        framesDecoded: cursor.framesDecoded,
+        framesPerSecond: cursor.framesPerSecond,
+        timestamp: cursor.timestamp,
+        active: cursor.active,
+      },
+    ])
+  );
+}
+
+function makeVideoConsumer(
+  id: string,
+  getStats: () => Map<string, unknown>,
+  options: {
+    producerId?: string;
+    negotiatedSsrc?: number;
+    currentLayers?: { spatialLayer: number; temporalLayer: number };
+  } = {}
+) {
+  const state = { paused: false };
+  return {
+    id,
+    kind: 'video' as const,
+    get paused() {
+      return state.paused;
+    },
+    closed: false,
+    producerId: options.producerId ?? `producer-${id}`,
+    track: { id: `track-${id}`, kind: 'video', readyState: 'live', enabled: true, stop: vi.fn() },
+    close: vi.fn(),
+    pause: vi.fn().mockImplementation(() => {
+      state.paused = true;
+    }),
+    resume: vi.fn().mockImplementation(() => {
+      state.paused = false;
+    }),
+    on: vi.fn(),
+    getStats: vi.fn().mockImplementation(async () => getStats()),
+    rtpReceiver: { transform: null },
+    rtpParameters: {
+      encodings: options.negotiatedSsrc === undefined ? [] : [{ ssrc: options.negotiatedSsrc }],
+    },
+    currentLayers: options.currentLayers,
+    setPreferredLayers: vi.fn(),
+  };
 }
 
 function setupAuth() {
@@ -258,59 +323,271 @@ describe('IGNIS decoder recovery (#1540)', () => {
     resetAllStores();
     vi.clearAllMocks();
     setupAuth();
+    const svc = voiceService as any;
+    svc.consumers.clear();
+    svc.consumerMeta.clear();
+    svc.pauseCoordinator.reset();
+    svc.decoderBudgetSampler?.clear();
+    if (svc.decoderProfilingTimer) clearInterval(svc.decoderProfilingTimer);
+    svc.decoderProfilingTimer = null;
+    svc.decoderProfilingInFlight = false;
+    svc.consecutiveGreenIntervals = 0;
   });
 
   afterEach(() => {
+    const svc = voiceService as any;
+    svc.consumers.clear();
+    svc.consumerMeta.clear();
+    svc.pauseCoordinator.reset();
+    svc.decoderBudgetSampler?.clear();
+    if (svc.decoderProfilingTimer) clearInterval(svc.decoderProfilingTimer);
+    svc.decoderProfilingTimer = null;
+    svc.decoderProfilingInFlight = false;
+    svc.consecutiveGreenIntervals = 0;
     vi.useRealTimers();
   });
 
-  it('resumes a paused consumer after IGNIS_RECOVERY_GREEN_INTERVALS consecutive green cycles', async () => {
+  it('observes paused video synchronously without yielding the consumer pass', async () => {
     const svc = voiceService as any;
+    const paused = makeVideoConsumer('paused-camera', () => new Map());
+    paused.pause();
+    svc.consumers.set(paused.id, paused);
+    const observeSpy = vi.spyOn(svc.decoderBudgetSampler, 'observe');
 
-    // Build a video consumer whose pause/resume spies also flip the paused field.
-    // We use a state object captured by closure so the vi.fn() spies remain intact.
-    const state = { paused: false };
-    const consumer = {
-      id: 'cons-ignis',
-      kind: 'video' as const,
-      get paused() {
-        return state.paused;
-      },
-      closed: false,
-      producerId: 'prod-ignis',
-      track: { id: 'track-ignis', kind: 'video', readyState: 'live', enabled: true, stop: vi.fn() },
-      close: vi.fn(),
-      pause: vi.fn().mockImplementation(() => {
-        state.paused = true;
-      }),
-      resume: vi.fn().mockImplementation(() => {
-        state.paused = false;
-      }),
-      on: vi.fn(),
-      getStats: vi.fn().mockResolvedValue(makeRedStatsMap()),
-      rtpReceiver: { transform: null },
-      // single-layer stream: currentLayers is undefined — RED falls straight to pause
-      currentLayers: undefined,
-      setPreferredLayers: vi.fn(),
-    };
+    const profiling = svc.profileDecoders();
 
-    svc.consumers.set('cons-ignis', consumer);
+    expect(observeSpy).toHaveBeenCalledTimes(1);
+    expect(paused.getStats).not.toHaveBeenCalled();
+    await profiling;
+  });
 
-    // ── Phase A: trigger RED zone → consumer must be paused ──────────────
+  it('uses another active green consumer to recover an IGNIS-paused consumer', async () => {
+    const svc = voiceService as any;
+    const pausedCursor = makeCursor('paused-report', 10);
+    const greenCursor = makeCursor('green-report', 20);
+    const paused = makeVideoConsumer('paused-camera', () => statsMap(pausedCursor), {
+      negotiatedSsrc: 10,
+    });
+    const active = makeVideoConsumer('active-camera', () => statsMap(greenCursor), {
+      negotiatedSsrc: 20,
+    });
+    svc.consumers.set(paused.id, paused);
+    svc.consumers.set(active.id, active);
+    svc.pauseLowestPriorityConsumer(paused);
+
+    await svc.profileDecoders(); // active consumer baseline; paused consumer is unknown
+    expect(paused.paused).toBe(true);
+    expect(svc.consecutiveGreenIntervals).toBe(0);
+
+    for (let greenCycle = 0; greenCycle < 3; greenCycle++) {
+      addInterval(greenCursor, elapse(), 5);
+      await svc.profileDecoders();
+    }
+
+    expect(active.pause).not.toHaveBeenCalled();
+    expect(paused.resume).toHaveBeenCalledTimes(1);
+    expect(paused.paused).toBe(false);
+  });
+
+  it('keeps the sole active video consumer decoding when RED at its lowest layers', async () => {
+    const svc = voiceService as any;
+    const cursor = makeCursor('sole-red-report', 25);
+    const consumer = makeVideoConsumer('sole-camera', () => statsMap(cursor), {
+      negotiatedSsrc: 25,
+      currentLayers: { spatialLayer: 0, temporalLayer: 0 },
+    });
+    svc.consumers.set(consumer.id, consumer);
+
+    await svc.profileDecoders();
+    addInterval(cursor, elapse(), 40);
     await svc.profileDecoders();
 
-    expect(consumer.pause).toHaveBeenCalledTimes(1);
-    expect(consumer.paused).toBe(true);
+    expect(useVoiceStore.getState().decoderHealth).toBe('red');
+    expect(consumer.pause).not.toHaveBeenCalled();
+    expect(consumer.paused).toBe(false);
+    expect(svc.pauseCoordinator.hasReason(consumer.id, 'ignis')).toBe(false);
+  });
 
-    // ── Phase B: switch to GREEN and drive 3 consecutive cycles ──────────
-    // (IGNIS_RECOVERY_GREEN_INTERVALS = 3)
-    consumer.getStats.mockResolvedValue(makeGreenStatsMap());
+  it('runs only one interval-triggered decoder profile while getStats is pending', async () => {
+    const svc = voiceService as any;
+    const cursor = makeCursor('deferred-report', 26);
+    let releaseStats!: () => void;
+    const statsPending = new Promise<void>((resolve) => {
+      releaseStats = resolve;
+    });
+    const consumer = makeVideoConsumer('deferred-camera', () => statsMap(cursor), {
+      negotiatedSsrc: 26,
+    });
+    consumer.getStats.mockImplementation(async () => {
+      await statsPending;
+      return statsMap(cursor);
+    });
+    svc.consumers.set(consumer.id, consumer);
 
-    await svc.profileDecoders(); // green cycle 1
-    await svc.profileDecoders(); // green cycle 2
-    await svc.profileDecoders(); // green cycle 3 — must trigger recovery
+    try {
+      svc.startDecoderBudgetProfiling();
+      vi.advanceTimersByTime(5_000);
+      await Promise.resolve();
+      expect(consumer.getStats).toHaveBeenCalledTimes(1);
 
-    // The recovery arm must have called resume() exactly once
-    expect(consumer.resume).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(5_000);
+      await Promise.resolve();
+      expect(consumer.getStats).toHaveBeenCalledTimes(1);
+
+      releaseStats();
+      for (let turn = 0; turn < 5; turn++) await Promise.resolve();
+      expect(svc.decoderProfilingInFlight).toBe(false);
+
+      vi.advanceTimersByTime(5_000);
+      await Promise.resolve();
+      expect(consumer.getStats).toHaveBeenCalledTimes(2);
+    } finally {
+      releaseStats();
+      if (svc.decoderProfilingTimer) clearInterval(svc.decoderProfilingTimer);
+      svc.decoderProfilingTimer = null;
+    }
+  });
+
+  it('does not report green or advance recovery when every video sample is unknown', async () => {
+    const svc = voiceService as any;
+    const malformed = makeVideoConsumer(
+      'malformed-camera',
+      () =>
+        new Map([
+          [
+            'malformed-active',
+            {
+              id: 'malformed-active',
+              type: 'inbound-rtp',
+              kind: 'video',
+              active: true,
+              ssrc: 30,
+              totalDecodeTime: Number.NaN,
+              framesDecoded: 10,
+              framesPerSecond: 30,
+              timestamp: rtcNow(),
+            },
+          ],
+          [
+            'valid-inactive',
+            {
+              id: 'valid-inactive',
+              type: 'inbound-rtp',
+              kind: 'video',
+              active: false,
+              ssrc: 30,
+              totalDecodeTime: 1,
+              framesDecoded: 100,
+              framesPerSecond: 30,
+              timestamp: rtcNow(),
+            },
+          ],
+        ]),
+      { negotiatedSsrc: 30 }
+    );
+    svc.consumers.set(malformed.id, malformed);
+    useVoiceStore.getState().setDecoderHealth('red');
+    svc.consecutiveGreenIntervals = 2;
+
+    await svc.profileDecoders();
+
+    expect(useVoiceStore.getState().decoderHealth).toBe('red');
+    expect(svc.consecutiveGreenIntervals).toBe(2);
+  });
+
+  it('selects one active report by negotiated SSRC before FPS, timestamp, and stable id', async () => {
+    const svc = voiceService as any;
+    const staleRed = makeCursor('a-stale-red', 41);
+    const selectedGreen = makeCursor('z-negotiated-green', 42);
+    staleRed.totalDecodeTime = 4;
+    staleRed.framesDecoded = 100;
+    staleRed.timestamp += 1;
+    const consumer = makeVideoConsumer('rollover-camera', () => statsMap(staleRed, selectedGreen), {
+      negotiatedSsrc: 42,
+    });
+    svc.consumers.set(consumer.id, consumer);
+
+    await svc.profileDecoders();
+    const timestamp = elapse();
+    addInterval(staleRed, timestamp, 40);
+    addInterval(selectedGreen, timestamp, 5);
+    await svc.profileDecoders();
+
+    expect(consumer.pause).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().decoderHealth).toBe('green');
+  });
+
+  it('aggregates screen and camera consumers using the worst usable interval', async () => {
+    const svc = voiceService as any;
+    const screenCursor = makeCursor('screen-report', 51);
+    const cameraCursor = makeCursor('camera-report', 52);
+    const screen = makeVideoConsumer('screen-consumer', () => statsMap(screenCursor), {
+      producerId: 'screen-producer',
+      negotiatedSsrc: 51,
+    });
+    const camera = makeVideoConsumer('camera-consumer', () => statsMap(cameraCursor), {
+      negotiatedSsrc: 52,
+    });
+    svc.consumers.set(screen.id, screen);
+    svc.consumers.set(camera.id, camera);
+    useVoiceStore.getState().tuneIn('screen-producer', screen.id);
+
+    await svc.profileDecoders();
+    const timestamp = elapse();
+    addInterval(screenCursor, timestamp, 5);
+    addInterval(cameraCursor, timestamp, 40);
+    await svc.profileDecoders();
+
+    expect(useVoiceStore.getState().decoderHealth).toBe('red');
+    expect(camera.pause).toHaveBeenCalledTimes(1);
+    expect(screen.pause).not.toHaveBeenCalled();
+  });
+
+  it('starts a fresh sampling segment after a layer intervention', async () => {
+    const svc = voiceService as any;
+    const cursor = makeCursor('layered-report', 60);
+    const consumer = makeVideoConsumer('layered-camera', () => statsMap(cursor), {
+      negotiatedSsrc: 60,
+      currentLayers: { spatialLayer: 1, temporalLayer: 0 },
+    });
+    svc.consumers.set(consumer.id, consumer);
+
+    await svc.profileDecoders();
+    addInterval(cursor, elapse(), 40);
+    await svc.profileDecoders();
+    expect(consumer.setPreferredLayers).toHaveBeenCalledTimes(1);
+
+    addInterval(cursor, elapse(), 5);
+    await svc.profileDecoders(); // fresh baseline: stale RED history must not fire again
+    expect(consumer.setPreferredLayers).toHaveBeenCalledTimes(1);
+    expect(useVoiceStore.getState().decoderHealth).toBe('red');
+
+    addInterval(cursor, elapse(), 5);
+    await svc.profileDecoders();
+    expect(consumer.setPreferredLayers).toHaveBeenCalledTimes(1);
+    expect(useVoiceStore.getState().decoderHealth).toBe('green');
+  });
+
+  it('clears sampler and single-flight state during session cleanup', async () => {
+    const svc = voiceService as any;
+    const cursor = makeCursor('cleanup-report', 70);
+    const consumer = makeVideoConsumer('cleanup-camera', () => statsMap(cursor), {
+      negotiatedSsrc: 70,
+    });
+    svc.consumers.set(consumer.id, consumer);
+    const deleteSpy = vi.spyOn(svc.decoderBudgetSampler, 'deleteConsumer');
+    const clearSpy = vi.spyOn(svc.decoderBudgetSampler, 'clear');
+
+    svc.closeConsumerAndNotify(consumer.id);
+    expect(deleteSpy).toHaveBeenCalledWith(consumer.id);
+
+    svc.decoderProfilingInFlight = true;
+    svc.cleanupTimersAndE2EE();
+    expect(svc.decoderProfilingInFlight).toBe(false);
+
+    svc.decoderProfilingInFlight = true;
+    await svc.cleanup();
+    expect(clearSpy).toHaveBeenCalled();
+    expect(svc.decoderProfilingInFlight).toBe(false);
   });
 });

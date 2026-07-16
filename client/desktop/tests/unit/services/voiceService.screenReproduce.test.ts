@@ -66,6 +66,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn().mockResolvedValue(null),
+    getChannelKeyMaterial: vi.fn().mockResolvedValue({ channelKey: null, keyVersion: 0 }),
     invalidateChannelKey: vi.fn(),
     getChannelKeyVersion: vi.fn().mockReturnValue(0),
     getChannelKeyByVersion: vi.fn().mockResolvedValue(null),
@@ -74,7 +75,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 }));
 
 vi.mock('@/renderer/services/mediaEncryption', () => ({
-  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 3,
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
   MediaEncryption: class MockMediaEncryption {
     init = vi.fn().mockResolvedValue(undefined);
     destroy = vi.fn();
@@ -176,6 +177,35 @@ describe('voiceService screen-reproduce auto-re-tune-in (#1924 fix A)', () => {
     vi.clearAllMocks();
     // Opt-in OFF by default — the whole point is re-tune-in works WITHOUT it.
     useVideoSettingsStore.setState({ autoTuneInScreenShares: false });
+  });
+
+  it('fails E2EE initialization closed when no encoded transform API is available', async () => {
+    const svc = voiceService as any;
+    await expect(svc.initEncryptionCore('channel-1', 0)).rejects.toThrow(
+      'E2EE: no encoded transform API available'
+    );
+  });
+
+  it('rejects the sender before publication when no encoded transform API is available', () => {
+    const svc = voiceService as any;
+    resetService(svc);
+
+    expect(() => svc.applyEncryptTransform({}, 'vp8', 'screen')).toThrow(
+      'E2EE: failed to attach encrypt transform (encoded transform API unavailable)'
+    );
+  });
+
+  it('rejects a consumer instead of decrypting when no encoded transform API is available', () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    const consumer = {
+      rtpReceiver: {},
+      rtpParameters: { codecs: [{ mimeType: 'video/VP8' }] },
+    };
+
+    expect(() => svc.applyDecryptTransform(consumer, 'sender-1')).toThrow(
+      'E2EE: failed to attach decrypt transform (encoded transform unavailable)'
+    );
   });
 
   it('re-tunes-in to the NEW producer with autoTuneInScreenShares OFF, restoring dominance', async () => {

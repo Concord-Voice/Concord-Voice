@@ -127,8 +127,10 @@ describe('mediaCapabilities', () => {
       expect(buildWebCodecsCodecString('video/VP9', '0', false)).toBe('vp09.00.31.08');
       expect(buildWebCodecsCodecString('video/VP9', '2', true)).toBe('vp09.02.31.10');
     });
-    it('maps AV1', () => {
+    it('maps AV1 SDR and HDR application targets to 8-bit and 10-bit probes', () => {
       expect(buildWebCodecsCodecString('video/AV1', null, false)).toBe('av01.0.05M.08');
+      expect(buildWebCodecsCodecString('video/AV1', 'sdr', false)).toBe('av01.0.05M.08');
+      expect(buildWebCodecsCodecString('video/AV1', 'hdr', true)).toBe('av01.0.05M.10');
     });
     it('maps H264 preserving profile/constraint bytes but pinning level to 3.1', () => {
       // The SDP level byte (34 = level 5.2) is overridden to 1f (3.1) so the 720p
@@ -379,13 +381,16 @@ describe('mediaCapabilities', () => {
       expect(caps1).toBe(caps2); // Same reference = cached
     });
 
-    it('marks a codec hardware-available when WebCodecs confirms a HW encoder', async () => {
+    it('probes exact hardware and software encoder support independently', async () => {
       (globalThis as any).RTCRtpSender = {
         getCapabilities: vi.fn(() => ({
           codecs: [{ mimeType: 'video/H264', sdpFmtpLine: 'profile-level-id=640034' }],
         })),
       };
-      const isConfigSupported = vi.fn().mockResolvedValue({ supported: true });
+      const isConfigSupported = vi.fn(
+        ({ hardwareAcceleration }: { hardwareAcceleration: string }) =>
+          Promise.resolve({ supported: hardwareAcceleration === 'prefer-hardware' })
+      );
       (globalThis as any).VideoEncoder = { isConfigSupported };
 
       clearCapabilitiesCache();
@@ -393,9 +398,12 @@ describe('mediaCapabilities', () => {
       const h264 = caps.find((c) => c.mimeType === 'video/H264');
 
       expect(h264!.hwAvailable).toBe(true);
-      // Only the 'prefer-hardware' variant is diagnostic — assert we pass it.
+      expect(h264!.swAvailable).toBe(false);
       expect(isConfigSupported).toHaveBeenCalledWith(
         expect.objectContaining({ codec: 'avc1.64001f', hardwareAcceleration: 'prefer-hardware' })
+      );
+      expect(isConfigSupported).toHaveBeenCalledWith(
+        expect.objectContaining({ codec: 'avc1.64001f', hardwareAcceleration: 'prefer-software' })
       );
       // Minimal config: no scalabilityMode/bitrate (would cause false negatives).
       const arg = isConfigSupported.mock.calls[0][0];
@@ -416,6 +424,55 @@ describe('mediaCapabilities', () => {
       expect(caps[0].hwAvailable).toBe(false);
     });
 
+    it('exposes AV1 HDR and SDR targets with independent hardware probes', async () => {
+      (globalThis as any).RTCRtpSender = {
+        getCapabilities: vi.fn(() => ({ codecs: [{ mimeType: 'video/AV1' }] })),
+      };
+      const isConfigSupported = vi.fn(
+        ({ codec, hardwareAcceleration }: { codec: string; hardwareAcceleration: string }) =>
+          Promise.resolve({
+            supported:
+              hardwareAcceleration === 'prefer-hardware'
+                ? codec.endsWith('.10')
+                : codec.endsWith('.08'),
+          })
+      );
+      (globalThis as any).VideoEncoder = { isConfigSupported };
+
+      const caps = await detectCodecCapabilities();
+
+      expect(caps).toEqual([
+        expect.objectContaining({
+          mimeType: 'video/AV1',
+          profileId: 'hdr',
+          profileLabel: '10-bit HDR target',
+          isHdr: true,
+          hwAvailable: true,
+          swAvailable: false,
+        }),
+        expect.objectContaining({
+          mimeType: 'video/AV1',
+          profileId: 'sdr',
+          profileLabel: '8-bit SDR target',
+          isHdr: false,
+          hwAvailable: false,
+          swAvailable: true,
+        }),
+      ]);
+      expect(isConfigSupported).toHaveBeenCalledWith(
+        expect.objectContaining({ codec: 'av01.0.05M.10', hardwareAcceleration: 'prefer-hardware' })
+      );
+      expect(isConfigSupported).toHaveBeenCalledWith(
+        expect.objectContaining({ codec: 'av01.0.05M.08', hardwareAcceleration: 'prefer-hardware' })
+      );
+      expect(isConfigSupported).toHaveBeenCalledWith(
+        expect.objectContaining({ codec: 'av01.0.05M.10', hardwareAcceleration: 'prefer-software' })
+      );
+      expect(isConfigSupported).toHaveBeenCalledWith(
+        expect.objectContaining({ codec: 'av01.0.05M.08', hardwareAcceleration: 'prefer-software' })
+      );
+    });
+
     it('leaves hwAvailable undefined when WebCodecs is unavailable (no false "software")', async () => {
       (globalThis as any).RTCRtpSender = {
         getCapabilities: vi.fn(() => ({ codecs: [{ mimeType: 'video/VP8' }] })),
@@ -425,6 +482,7 @@ describe('mediaCapabilities', () => {
       clearCapabilitiesCache();
       const caps = await detectCodecCapabilities();
       expect(caps[0].hwAvailable).toBeUndefined();
+      expect(caps[0].swAvailable).toBeUndefined();
     });
 
     it('leaves hwAvailable undefined when the probe throws', async () => {
@@ -438,6 +496,7 @@ describe('mediaCapabilities', () => {
       clearCapabilitiesCache();
       const caps = await detectCodecCapabilities();
       expect(caps[0].hwAvailable).toBeUndefined();
+      expect(caps[0].swAvailable).toBeUndefined();
     });
 
     it('deduplicates codecs by mimeType + profile', async () => {

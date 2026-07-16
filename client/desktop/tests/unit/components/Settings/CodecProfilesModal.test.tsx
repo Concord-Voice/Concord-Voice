@@ -19,6 +19,8 @@ describe('CodecProfilesModal', () => {
     const renderedLabels = rowHeaders.map((header) => header.textContent);
     expect(renderedLabels).toEqual(CODEC_PROFILE_GUIDE.map((profile) => profile.label));
     expect(renderedLabels).toEqual([
+      'AV1 (10-bit HDR target)',
+      'AV1 (8-bit SDR target)',
       'AV1',
       'VP9 (Profile 2 — HDR)',
       'VP9 (Profile 0 — SVC)',

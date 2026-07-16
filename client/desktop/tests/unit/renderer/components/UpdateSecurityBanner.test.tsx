@@ -33,6 +33,22 @@ describe('UpdateSecurityBanner (#658)', () => {
     expect(screen.getByText(/installer failed publisher verification/i)).toBeInTheDocument();
   });
 
+  it('renders direction-neutral media-version guidance without an update CTA', () => {
+    useUpdateStatusStore
+      .getState()
+      .setSecurityError('media-crypto-version', 'media security versions differ');
+    render(<UpdateSecurityBanner />);
+
+    expect(
+      screen.getByText(/all participants must use the same media-security version/i)
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/update or rejoin after the active call is compatible/i)
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/out of date|newer encryption format/i)).toBeNull();
+    expect(screen.queryByRole('link', { name: /download the latest/i })).toBeNull();
+  });
+
   it('CTA link points to GitHub releases latest', () => {
     useUpdateStatusStore.getState().setSecurityError('cert-pin-failure', 'x');
     render(<UpdateSecurityBanner />);

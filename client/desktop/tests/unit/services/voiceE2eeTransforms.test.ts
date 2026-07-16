@@ -188,7 +188,7 @@ describe('applyLegacyDecryptPipeline', () => {
     expect(callbacks.addDecryptKeyForUser).toHaveBeenCalledWith('channel-1', 'user-1');
   });
 
-  it('logs verbose frame diagnostics when verbose=true', async () => {
+  it('logs verbose metadata without dumping trailer or IV bytes', async () => {
     applyLegacyDecryptPipeline(
       mockReceiver(),
       'user-1',
@@ -206,8 +206,12 @@ describe('applyLegacyDecryptPipeline', () => {
       expect.stringContaining('E2EE: dropping frame for sender'),
       'user-1',
       expect.any(Number),
-      expect.objectContaining({ trailerHex: expect.any(String), hasMagic: expect.any(Boolean) })
+      expect.objectContaining({ hasMagic: expect.any(Boolean), frameSize: 100 })
     );
+    const diagnostics = vi.mocked(console.warn).mock.calls.at(-1)?.[3];
+    expect(diagnostics).not.toHaveProperty('trailerHex');
+    expect(diagnostics).not.toHaveProperty('iv');
+    expect(diagnostics).not.toHaveProperty('keyId');
   });
 
   it('logs persistent failure at 500 drops', async () => {
@@ -335,9 +339,9 @@ describe('applyLegacyDecryptPipeline', () => {
   // ─── #1895 regression: v3 key-version provisioning on the legacy path ──
 
   it('provisions the exact key version on a typed FrameKeyMiss (regression #1895)', async () => {
-    // The legacy createEncodedStreams decrypt path is the path all current
-    // Electron builds run (USE_SCRIPT_TRANSFORM=false, #295). Under mid-session
-    // CSK rotation, decryptFrame throws a typed FrameKeyMissError carrying the
+    // The legacy createEncodedStreams decrypt path remains the fallback when
+    // RTCRtpScriptTransform is unavailable. Under mid-session CSK rotation,
+    // decryptFrame throws a typed FrameKeyMissError carrying the
     // frame's (senderUserId, keyVersion, keyId). The Worker path routes that to
     // on-demand provisioning (e2eeWorker.ts requestFrameKeyOnce); the legacy
     // path must do the same via a requestFrameKey callback — otherwise it
@@ -388,8 +392,8 @@ describe('applyLegacyDecryptPipeline', () => {
 // TransformStream mock) and real MediaEncryption so the decrypt path is
 // exercised end-to-end — not through a captured callback. This is the
 // regression lock for #1885: wiring v3/v4 provisioning into the Worker path
-// only, never applyLegacyDecryptPipeline, caused black-screen video for all
-// current Electron builds (USE_SCRIPT_TRANSFORM=false, #295).
+// only, never applyLegacyDecryptPipeline, caused black-screen video on the
+// legacy fallback path.
 
 /** Identity-streams fake receiver: readable yields the queued frames; writable collects them. */
 function fakeReceiver(
@@ -425,7 +429,7 @@ function makeCallbacks(): DecryptRecoveryCallbacks {
 }
 
 describe('applyLegacyDecryptPipeline — both schemes wired (#1885 lock)', () => {
-  it('decrypts a VP9 v4 whole-frame on the legacy path', async () => {
+  it('decrypts a VP9 v5 whole-frame on the legacy path', async () => {
     const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, [
       'encrypt',
       'decrypt',
@@ -453,7 +457,7 @@ describe('applyLegacyDecryptPipeline — both schemes wired (#1885 lock)', () =>
     expect(new Uint8Array(sink[0].data)).toEqual(original);
   });
 
-  it('decrypts an AV1 v4 per-OBU frame on the legacy path (regression lock)', async () => {
+  it('decrypts an AV1 v5 per-OBU frame on the legacy path (regression lock)', async () => {
     const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, [
       'encrypt',
       'decrypt',
@@ -490,6 +494,39 @@ describe('applyLegacyDecryptPipeline — both schemes wired (#1885 lock)', () =>
     );
     await new Promise((r) => setTimeout(r, 20));
     expect(new Uint8Array(sink[0].data)).toEqual(original); // black-screen regression lock
+  });
+
+  it('passes h264 to the shared v5 NAL-aware implementation on the legacy path', async () => {
+    const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, [
+      'encrypt',
+      'decrypt',
+    ]);
+    const sender = new MediaEncryptionClass();
+    const receiver = new MediaEncryptionClass();
+    await sender.init(key, 'sender');
+    await receiver.init(key, 'me');
+    await receiver.addDecryptKey(key, 'sender');
+
+    const frame = {
+      data: new Uint8Array([
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x80, 0x00, 0x00, 0x01, 0x65, 0xb8, 0x91, 0xa2, 0xb3,
+      ]).buffer,
+      type: 'key',
+    };
+    const original = new Uint8Array(frame.data).slice();
+    await sender.encryptFrame(frame as never, 'h264');
+
+    const sink: Array<{ data: ArrayBuffer }> = [];
+    applyLegacyDecryptPipeline(
+      fakeReceiver([frame], sink) as never,
+      'sender',
+      receiver,
+      makeCallbacks(),
+      false,
+      'h264'
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(new Uint8Array(sink[0].data)).toEqual(original);
   });
 });
 

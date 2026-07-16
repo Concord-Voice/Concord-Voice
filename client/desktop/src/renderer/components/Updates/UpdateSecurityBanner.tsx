@@ -30,8 +30,9 @@ const COPY_BY_SUBTYPE: Record<UpdateCriticalErrorSubtype, { headline: string; co
   },
   'media-crypto-version': {
     headline:
-      'Your app is out of date — this voice call uses a newer encryption format your version cannot join. Update to rejoin.',
-    confirm: 'I understand I must update Concord to join encrypted voice calls.',
+      'Media-security version mismatch — all participants must use the same media-security version of the Concord app. Update or rejoin after the active call is compatible with your app.',
+    confirm:
+      'I understand all participants must use compatible Concord versions to join this encrypted voice call.',
   },
   'signature-failure': {
     headline:
@@ -70,11 +71,11 @@ function handleCtaClick(e: MouseEvent<HTMLAnchorElement>): void {
 }
 
 /**
- * Persistent banner shown when the updater encountered a critical security
- * failure (cert-pin miss or signature verification failure). Dismiss is a
- * two-step consenting action: first click surfaces an explicit acknowledgement
- * prompt, second click dismisses for the current session only. Next launch
- * re-renders if the underlying condition is unresolved. Issue #658.
+ * Persistent banner shown for critical update-channel security failures and
+ * incompatible media-security versions. Dismiss is a two-step consenting
+ * action: first click surfaces an explicit acknowledgement prompt, second
+ * click dismisses for the current session only. Next launch re-renders if the
+ * underlying condition is unresolved. Issue #658.
  */
 export const UpdateSecurityBanner: React.FC = () => {
   const criticalError = useUpdateStatusStore((s) => s.criticalError);
@@ -100,22 +101,28 @@ export const UpdateSecurityBanner: React.FC = () => {
   }
 
   const copy = COPY_BY_SUBTYPE[criticalError.subtype] ?? COPY_BY_SUBTYPE['cert-pin-failure'];
+  const showDownloadCta = criticalError.subtype !== 'media-crypto-version';
 
   return (
     <div className="update-security-banner" role="alert" aria-live="assertive">
       <AlertTriangle className="update-security-banner__icon" aria-hidden="true" />
       <span className="update-security-banner__message">
-        {copy.headline}{' '}
-        <a
-          href={DOWNLOAD_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="update-security-banner__cta"
-          onClick={handleCtaClick}
-        >
-          Download the latest
-          <ExternalLink size={14} aria-hidden="true" />
-        </a>
+        {copy.headline}
+        {showDownloadCta && (
+          <>
+            {' '}
+            <a
+              href={DOWNLOAD_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="update-security-banner__cta"
+              onClick={handleCtaClick}
+            >
+              Download the latest
+              <ExternalLink size={14} aria-hidden="true" />
+            </a>
+          </>
+        )}
       </span>
       {showConfirm ? (
         <span className="update-security-banner__confirm-row">

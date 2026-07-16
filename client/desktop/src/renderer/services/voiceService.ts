@@ -42,24 +42,34 @@ import {
   deriveFrameKey,
 } from './mediaEncryption';
 import { e2eeService } from './e2eeService';
-import { isPendingKeyError } from './e2eeErrors';
+import { E2EEKeyUnavailableError, isPendingKeyError } from './e2eeErrors';
 import {
   useOsPermissionStore,
   ensureOsPermission as ensureOsPermissionShared,
 } from '../stores/osPermissionStore';
 import {
+  codecFamilyFromMimeType,
   codecFamilyFromRtpParameters,
+  type CodecFamily,
   type E2EEWorkerMessage,
   type E2EEMainMessage,
   type E2EETransformOptions,
 } from '../workers/e2eeProtocol';
 import { notificationSoundService } from './notificationSoundService';
 import {
+  h264ProfileClass,
   h264ProfilesCompatible,
+  isCodecKeyInFloor,
   selectCodecFromCascade,
   type CodecLookup,
 } from './voiceCodecSelection';
 import { extractWebrtcHwSignal, shouldReselectForHwDowngrade } from './webrtcHwSignal';
+import { resolveEncodedTransformSupport } from './encodedTransformSupport';
+import {
+  DecoderBudgetSampler,
+  selectInboundVideoDecoderReport,
+  type SelectedDecoderStatsReport,
+} from './decoderBudgetSampler';
 import { ConsumerPauseCoordinator } from './consumerPauseCoordinator';
 import { buildCameraEncodingPlan } from './cameraLayering';
 import {
@@ -92,16 +102,8 @@ const MAX_REMOTE_VIDEO_DEVICE_PIXEL_RATIO = 8;
 // server still surfaces promptly rather than hanging "connecting" forever.
 const VOICE_CONNECT_TIMEOUT_MS = 30_000;
 
-// Detect which Insertable Streams API is available at module load.
-//
-// Priority: createEncodedStreams (legacy) > RTCRtpScriptTransform (modern).
-//
-// Reason: encodedInsertableStreams + RTCRtpScriptTransform CONFLICT in Chromium 135 —
-// the internal pipeline created by encodedInsertableStreams blocks the decoder output
-// even when RTCRtpScriptTransform processes frames in the Worker, producing silence.
-// RTCRtpScriptTransform WITHOUT encodedInsertableStreams receives no frames at all.
-// createEncodedStreams + encodedInsertableStreams is the proven path (#295).
-//
+// Resolve one E2EE transform path at module load. Modern Worker transforms do not
+// use the legacy encodedInsertableStreams transport option.
 interface RtpSenderWithEncodedStreams extends RTCRtpSender {
   createEncodedStreams?: () => { readable: ReadableStream; writable: WritableStream };
 }
@@ -125,6 +127,53 @@ interface RemoteVideoTileRenderState {
   focusedWindow: boolean;
 }
 
+interface E2EEInitContext {
+  generation: number;
+  channelId: string;
+  userId: string;
+  expectedMediaEncryption: MediaEncryption | null;
+  expectedWorker: Worker | null;
+  highestBufferedVersion: number;
+  rotationOff: (() => void) | null;
+  ownsSharedRotationSubscription: boolean;
+  committed: boolean;
+  liveRotations: boolean;
+}
+
+interface E2EEInitFlight {
+  context: E2EEInitContext;
+  promise: Promise<void>;
+}
+
+interface EncryptRebaseContext {
+  channelId: string;
+  keyVersion: number;
+  userId: string;
+  mediaEncryption: MediaEncryption;
+  e2eeWorker: Worker | null;
+}
+
+type E2EEInitAttemptResult = { succeeded: true } | { succeeded: false; error: unknown };
+
+interface DecryptKeyRequestContext {
+  channelId: string;
+  userId: string;
+  targetEpoch: number | undefined;
+  localUserId: string;
+  mediaEncryption: MediaEncryption;
+  e2eeWorker: Worker | null;
+}
+
+type DecryptKeyAttemptResult =
+  { status: 'success' } | { status: 'stale' } | { status: 'retry' | 'failed'; error: unknown };
+
+class E2EEInitializationSupersededError extends Error {
+  constructor() {
+    super('E2EE initialization superseded by a newer media session');
+    this.name = 'E2EEInitializationSupersededError';
+  }
+}
+
 interface RemoteVideoLayerPayload extends RemoteVideoTileRenderState, RemoteVideoLayerRequest {
   devicePixelRatio: number;
   pressureStepDown: boolean;
@@ -141,21 +190,20 @@ interface TestSuspensionRestorePolicy {
   keepProducersPaused: boolean;
   keepMicPaused: boolean;
 }
-const HAS_ENCODED_STREAMS =
-  typeof RTCRtpSender !== 'undefined' &&
-  typeof (RTCRtpSender.prototype as RtpSenderWithEncodedStreams).createEncodedStreams ===
-    'function';
-const USE_SCRIPT_TRANSFORM = !HAS_ENCODED_STREAMS && typeof RTCRtpScriptTransform !== 'undefined';
+const ENCODED_TRANSFORM_APIS = {
+  scriptTransform: typeof RTCRtpScriptTransform === 'undefined' ? undefined : RTCRtpScriptTransform,
+  createEncodedStreams:
+    typeof RTCRtpSender === 'undefined'
+      ? undefined
+      : (RTCRtpSender.prototype as RtpSenderWithEncodedStreams).createEncodedStreams,
+};
+const ENCODED_TRANSFORM_PATH = resolveEncodedTransformSupport(ENCODED_TRANSFORM_APIS);
 
 if (E2EE_VERBOSE) {
   console.debug('E2EE API detection:', {
-    hasEncodedStreams: HAS_ENCODED_STREAMS,
-    hasScriptTransform: typeof RTCRtpScriptTransform !== 'undefined',
-    selectedPath: (() => {
-      if (HAS_ENCODED_STREAMS) return 'createEncodedStreams (legacy)';
-      if (USE_SCRIPT_TRANSFORM) return 'RTCRtpScriptTransform (Worker)';
-      return 'NONE — E2EE unavailable';
-    })(),
+    hasEncodedStreams: typeof ENCODED_TRANSFORM_APIS.createEncodedStreams === 'function',
+    hasScriptTransform: typeof ENCODED_TRANSFORM_APIS.scriptTransform === 'function',
+    selectedPath: ENCODED_TRANSFORM_PATH,
   });
 }
 
@@ -192,6 +240,12 @@ type RtpPriority = 'low' | 'medium' | 'high' | 'very-low';
 /** Compute retry delay: double the base delay for pending E2EE key errors. */
 function retryDelayForError(err: unknown, baseDelay: number): number {
   return isPendingKeyError(err) ? baseDelay * 2 : baseDelay;
+}
+
+/** Retry transient re-base failures; known access/payload failures are terminal. */
+function isRetryableEncryptRebaseError(err: unknown): boolean {
+  if (!(err instanceof E2EEKeyUnavailableError)) return true;
+  return err.code === 'NO_KEY_YET' || err.code === 'INTERNAL_ERROR';
 }
 
 /** Handle screen capture NotAllowedError — show error and open OS settings. Returns true if handled. */
@@ -408,6 +462,15 @@ class VoiceService {
   // #1878: unsubscribe handle for the e2eeService key-rotation subscription
   // (sender re-base trigger). Cleared in cleanupTimersAndE2EE.
   private keyRotationOff: (() => void) | null = null;
+  // Highest CSK version requested for the current encryption instance. Async
+  // fetches may resolve out of order, but only this version may install.
+  private latestRequestedEncryptKeyVersion = 0;
+  // Monotonic owner for asynchronous media-E2EE initialization. Cleanup and a
+  // successor init advance this before any await, making every older
+  // continuation incapable of publishing Worker/key/subscription state.
+  private e2eeInitGeneration = 0;
+  private pendingE2EEInitContext: E2EEInitContext | null = null;
+  private e2eeInitInFlight: E2EEInitFlight | null = null;
   // Debounced rotation state (extracted from MediaEncryption for Worker path)
   private rotationTimer: ReturnType<typeof setTimeout> | null = null;
   private rotationPending = false;
@@ -884,14 +947,30 @@ class VoiceService {
     if (capability.mimeType.toLowerCase() !== mime) return false;
     const capabilityProfile = capability.profileId?.toLowerCase();
     if (mime === 'video/h264') {
+      if (requestedProfile === undefined) {
+        const profileClass = capabilityProfile ? h264ProfileClass(capabilityProfile) : null;
+        return (
+          profileClass === 'high' ||
+          profileClass === 'main' ||
+          profileClass === 'constrained-baseline'
+        );
+      }
       return Boolean(
-        requestedProfile &&
-        capabilityProfile &&
-        h264ProfilesCompatible(requestedProfile, capabilityProfile)
+        capabilityProfile && h264ProfilesCompatible(requestedProfile, capabilityProfile)
       );
     }
     if (mime === 'video/vp9') {
       return (requestedProfile ?? '0') === (capabilityProfile ?? '0');
+    }
+    if (mime === 'video/av1') {
+      if (requestedProfile === 'hdr') return capabilityProfile === 'hdr';
+      if (requestedProfile === 'sdr')
+        return capabilityProfile === 'sdr' || capabilityProfile == null;
+      return (
+        capabilityProfile === undefined ||
+        capabilityProfile === 'hdr' ||
+        capabilityProfile === 'sdr'
+      );
     }
     return requestedProfile === undefined;
   }
@@ -985,32 +1064,24 @@ class VoiceService {
     return codec;
   }
 
-  /**
-   * Check if a codec is compatible with the current room codec floor.
-   * Extracts mimeType from codec key — floor operates at mimeType level.
-   */
+  /** Check if an application codec target is compatible with the RTP codec floor. */
   private isInCodecFloor(key: string): boolean {
-    const floor = useVoiceStore.getState().codecFloor;
-    if (!floor) return true;
-    const mime = key.split(':')[0].toLowerCase();
-    return floor.includes(mime);
+    return isCodecKeyInFloor(key, useVoiceStore.getState().codecFloor);
   }
 
   /**
-   * Check whether a codec is hardware-accelerated for real WebRTC calls (question B).
-   * Prefers the runtime-observed WebRTC signal (`powerEfficientEncoder`, learned from a
-   * live producer) — it reflects what the CALL actually does. Until a codec has been
-   * observed in a live producer, falls back to the GPU silicon capability (question A,
-   * from the WebCodecs probe): A over-reports for codecs WebRTC software-encodes (e.g.
-   * AV1 via libaom), but it is the only pre-observation estimate, and the learned B value
-   * corrects it once a producer of that codec runs. Before that observation,
-   * capability matching remains profile-aware.
+   * Resolve hardware evidence without confusing an active MIME-wide observation with
+   * target/profile capability. A live false verdict conservatively demotes every
+   * qualified hardware target of that MIME for this session. A live true verdict can
+   * affirm only the unqualified MIME; qualified AV1/VP9/H.264 targets still require an
+   * affirmative exact WebCodecs probe.
    */
   private isHwAccelerated(key: string): boolean {
     const store = useVideoSettingsStore.getState();
-    const mime = key.split(':')[0].toLowerCase();
+    const [mime, requestedProfile] = key.toLowerCase().split(':');
     const learned = store.webrtcHwByMime[mime];
-    if (learned !== undefined) return learned;
+    if (learned === false) return false;
+    if (requestedProfile === undefined && learned === true) return true;
     return store.codecCapabilities.some(
       (capability) =>
         capability.hwAvailable === true && this.capabilityMatchesCodecKey(capability, key)
@@ -1333,21 +1404,16 @@ class VoiceService {
         console.warn('[video-settings] Camera track replacement failed:', errorMessage(err))
       );
     }
-    if (state.preferredVideoCodec !== prev.preferredVideoCodec) {
-      void this.liveReproduceCamera().catch((err) =>
-        console.warn('[video-settings] Camera re-produce failed:', errorMessage(err))
-      );
-      if (this.producers.get('screen')) {
-        void this.fastReproduceScreen().catch((err) =>
-          console.warn('[video-settings] Screen re-produce failed:', errorMessage(err))
-        );
-      }
-    }
     // SVC/Simulcast casting toggles (#1921): a shape-only change does not alter the
     // codec MIME, so reProduceIfBetterCodec early-returns — reproduce explicitly.
     // liveReproduceCamera rides the existing stopTracks:false (#1902) + fail-closed
     // capture-stop (CWE-212) path; do NOT call sendTransport.produce directly.
-    if (state.supportSvc !== prev.supportSvc || state.supportSimulcast !== prev.supportSimulcast) {
+    const codecPlanChanged =
+      state.preferredVideoCodec !== prev.preferredVideoCodec ||
+      state.hdrEncoding !== prev.hdrEncoding;
+    const layeringChanged =
+      state.supportSvc !== prev.supportSvc || state.supportSimulcast !== prev.supportSimulcast;
+    if (codecPlanChanged || layeringChanged) {
       void this.liveReproduceCamera().catch((err) =>
         console.warn('[video-settings] Camera re-produce failed:', errorMessage(err))
       );
@@ -1377,9 +1443,16 @@ class VoiceService {
     // fastReproduceScreen) so a toggle flip and a concurrent gate edge cannot overlap
     // two reproduces; the serializer rides the existing stopTracks:false (#1902) +
     // fail-closed capture-stop (CWE-212) path.
+    const codecPlanChanged =
+      state.preferredVideoCodec !== prev.preferredVideoCodec ||
+      state.hdrEncoding !== prev.hdrEncoding;
     const svcChanged = state.supportSvc !== prev.supportSvc;
     const simulcastChanged = state.supportSimulcast !== prev.supportSimulcast;
-    if (svcChanged || (simulcastChanged && this.screenLayeringEnabled)) {
+    if (codecPlanChanged) {
+      void this.fastReproduceScreen().catch((err) =>
+        console.warn('[video-settings] Screen re-produce failed:', errorMessage(err))
+      );
+    } else if (svcChanged || (simulcastChanged && this.screenLayeringEnabled)) {
       this.scheduleScreenLayeringReproduce();
     }
     // Note: screen resolution/FPS/contentType changes cannot use replaceTrack
@@ -1726,7 +1799,7 @@ class VoiceService {
       const selection = this.pickCameraCodec();
       codec = this.requireSelectedVideoCodec(selection.codec, 'camera');
       const cameraBitrate = this.cameraStartBitrate(selection.encodings);
-      newProducer = await transport.produce({
+      newProducer = await this.produceEncrypted(transport, {
         track,
         encodings: selection.encodings,
         codec,
@@ -1757,10 +1830,6 @@ class VoiceService {
 
     this.applyDegradationPreference(newProducer);
     this.producers.set('camera', newProducer);
-
-    if (this.mediaEncryption) {
-      this.applyEncryptTransform(newProducer);
-    }
 
     newProducer.on('transportclose', () => {
       if (this.producers.get('camera') !== newProducer) return;
@@ -1850,10 +1919,6 @@ class VoiceService {
 
     this.applyDegradationPreference(newProducer);
     this.producers.set('screen', newProducer);
-
-    if (this.mediaEncryption) {
-      this.applyEncryptTransform(newProducer);
-    }
 
     // Re-wire track ended handler
     track.onended = () => {
@@ -1952,7 +2017,7 @@ class VoiceService {
     try {
       const selection = this.pickScreenCodec();
       codec = this.requireSelectedVideoCodec(selection.codec, 'screen');
-      producer = await transport.produce({
+      producer = await this.produceEncrypted(transport, {
         track,
         encodings: selection.encodings,
         codec,
@@ -2021,7 +2086,7 @@ class VoiceService {
     this.socket?.emit('close-producer', { producerId: oldAudioId });
 
     try {
-      const newAudioProducer = await transport.produce({
+      const newAudioProducer = await this.produceEncrypted(transport, {
         track: audioTrack,
         codecOptions: { opusStereo: true, opusDtx: false },
         stopTracks: false,
@@ -2036,9 +2101,6 @@ class VoiceService {
         return;
       }
       this.producers.set('screen-audio', newAudioProducer);
-      if (this.mediaEncryption) {
-        this.applyEncryptTransform(newAudioProducer);
-      }
       newAudioProducer.on('transportclose', () => {
         if (this.producers.get('screen-audio') !== newAudioProducer) return;
         this.producers.delete('screen-audio');
@@ -2219,6 +2281,8 @@ class VoiceService {
 
   // Decoder budget profiling (IGNIS)
   private decoderProfilingTimer: ReturnType<typeof setInterval> | null = null;
+  private decoderProfilingInFlight = false;
+  private readonly decoderBudgetSampler = new DecoderBudgetSampler();
 
   /** Number of consecutive green profileDecoders() cycles required before recovering a paused consumer. */
   private static readonly IGNIS_RECOVERY_GREEN_INTERVALS = 3;
@@ -2715,17 +2779,15 @@ class VoiceService {
     // Sanitized error for log sink — strips control chars + bounds length
     // (Sonar S4790 / [internal]rules/observability.md "Console error logging").
     console.error('Failed to join voice channel:', this.sanitizeErrForLog(err));
-    // #1878: a typed `crypto_version_mismatch` ack means the room negotiated a
-    // newer media-frame crypto version than this client speaks — the client is
-    // too old to join and must update. Surface the persistent "update required"
-    // banner (same path as updater cert/publisher failures) instead of leaving
-    // the user with a generic, non-actionable join failure.
+    // A typed `crypto_version_mismatch` ack means this client and the active room
+    // use incompatible media-security formats. Either side may be newer, so keep
+    // the persistent banner copy direction-neutral.
     if (this.isCryptoVersionMismatch(err)) {
       useUpdateStatusStore
         .getState()
         .setSecurityError(
           'media-crypto-version',
-          'This voice call requires a newer app version to join.'
+          'This voice call requires the same media-security version.'
         );
     }
     notificationSoundService.stopAllLoops();
@@ -3064,6 +3126,7 @@ class VoiceService {
       }
     }
     this.consumers.clear();
+    this.decoderBudgetSampler.clear();
     this.consumerMeta.clear();
     this.pendingScreenAudioProducers.clear();
     this.resetRemoteVideoLayeringState();
@@ -3080,20 +3143,8 @@ class VoiceService {
     this.recvTransportVideo = null;
   }
 
-  /** Stop timers, subscriptions, and E2EE state. */
-  private cleanupTimersAndE2EE(): void {
-    this.stopLocalVAD();
-    this.stopPacketLossMonitor();
-    this.teardownLiveSubscriptions();
-    if (this.decoderProfilingTimer) {
-      clearInterval(this.decoderProfilingTimer);
-      this.decoderProfilingTimer = null;
-    }
-    this.unregisterDocumentVisibilityListener();
-    this.pauseCoordinator.reset();
-    this.consecutiveGreenIntervals = 0;
-    // #1878: drop the CSK key-rotation subscription so a torn-down session can't
-    // re-base a destroyed encryption instance.
+  /** Tear down already-invalidated shared E2EE state synchronously. */
+  private teardownSharedE2EEState(): void {
     this.keyRotationOff?.();
     this.keyRotationOff = null;
     this.terminateE2EEWorker();
@@ -3105,6 +3156,26 @@ class VoiceService {
     this.rotationDeadline = 0;
     this.mediaEncryption?.destroy();
     this.mediaEncryption = null;
+    this.latestRequestedEncryptKeyVersion = 0;
+  }
+
+  /** Stop timers, subscriptions, and E2EE state. */
+  private cleanupTimersAndE2EE(): void {
+    // Must precede every other teardown operation: a key-fetch/derivation
+    // continuation may otherwise publish a fresh Worker after cleanup began.
+    this.invalidatePendingE2EEInit();
+    this.teardownSharedE2EEState();
+    this.stopLocalVAD();
+    this.stopPacketLossMonitor();
+    this.teardownLiveSubscriptions();
+    if (this.decoderProfilingTimer) {
+      clearInterval(this.decoderProfilingTimer);
+      this.decoderProfilingTimer = null;
+    }
+    this.decoderProfilingInFlight = false;
+    this.unregisterDocumentVisibilityListener();
+    this.pauseCoordinator.reset();
+    this.consecutiveGreenIntervals = 0;
   }
 
   // ─── Audio Producer ────────────────────────────────────────────────
@@ -3243,7 +3314,7 @@ class VoiceService {
     );
     const audioPrioParams = buildPriorityParams(adv.audioPriority);
 
-    const producer = await this.sendTransport.produce({
+    const producer = await this.produceEncrypted(this.sendTransport, {
       track,
       encodings: [
         {
@@ -3280,11 +3351,6 @@ class VoiceService {
 
     // Start packet loss monitor for dynamic FEC
     this.startPacketLossMonitor();
-
-    // Apply E2EE encrypt transform if encrypted
-    if (this.mediaEncryption) {
-      this.applyEncryptTransform(producer);
-    }
 
     producer.on('transportclose', () => {
       this.producers.delete('mic');
@@ -3428,7 +3494,7 @@ class VoiceService {
       const { encodings } = selection;
       const cameraBitrate = this.cameraStartBitrate(encodings);
 
-      const producer = await transport.produce({
+      const producer = await this.produceEncrypted(transport, {
         track,
         encodings,
         codec,
@@ -3481,10 +3547,6 @@ class VoiceService {
     // Start the session-stats monitor from the video path too, so the WebRTC HW
     // B-signal is learned in no-mic (video/screen-only) sessions (#2187 item 1). Idempotent.
     this.startPacketLossMonitor();
-
-    if (this.mediaEncryption) {
-      this.applyEncryptTransform(producer);
-    }
 
     useVoiceStore
       .getState()
@@ -3654,7 +3716,7 @@ class VoiceService {
     if (audioTracks.length === 0 || !this.sendTransport) return;
 
     try {
-      const audioProducer = await this.sendTransport.produce({
+      const audioProducer = await this.produceEncrypted(this.sendTransport, {
         track: audioTracks[0],
         codecOptions: { opusStereo: true, opusDtx: false },
         // Track owned by localScreenStream and reused across re-produces
@@ -3664,10 +3726,6 @@ class VoiceService {
       });
 
       this.producers.set('screen-audio', audioProducer);
-
-      if (this.mediaEncryption) {
-        this.applyEncryptTransform(audioProducer);
-      }
 
       audioProducer.on('transportclose', () => {
         this.producers.delete('screen-audio');
@@ -3724,7 +3782,7 @@ class VoiceService {
       const codec = this.requireSelectedVideoCodec(selection.codec, 'screen');
       const { encodings, effectiveBitrate: screenBitrate } = selection;
 
-      const producer = await this.sendTransport.produce({
+      const producer = await this.produceEncrypted(this.sendTransport, {
         track,
         encodings,
         codec,
@@ -3740,10 +3798,6 @@ class VoiceService {
 
       // #2187 item 1: idempotent — learns the B-signal in screen-only (no-mic) sessions.
       this.startPacketLossMonitor();
-
-      if (this.mediaEncryption) {
-        this.applyEncryptTransform(producer);
-      }
 
       useVoiceStore
         .getState()
@@ -4417,6 +4471,7 @@ class VoiceService {
     if (!consumer) return;
     consumer.close();
     this.consumers.delete(consumerId);
+    this.decoderBudgetSampler.deleteConsumer(consumerId);
     this.consumerMeta.delete(consumerId);
     this.lastPreferredLayerKeyByConsumer.delete(consumerId);
     this.pauseCoordinator.clearConsumer(consumerId);
@@ -5222,7 +5277,7 @@ class VoiceService {
       // E2EE (legacy path): encodedInsertableStreams enables createEncodedStreams().
       // NOT set for RTCRtpScriptTransform — the two mechanisms conflict (#295).
       // All channels are always encrypted, so this is unconditionally applied when supported.
-      ...(HAS_ENCODED_STREAMS && {
+      ...(ENCODED_TRANSFORM_PATH === 'encoded-streams' && {
         additionalSettings: {
           encodedInsertableStreams: true,
         } as unknown as Partial<RTCConfiguration>,
@@ -5291,7 +5346,7 @@ class VoiceService {
       iceCandidates: options.iceCandidates,
       dtlsParameters: options.dtlsParameters,
       // E2EE (legacy path only) — see send transport comment (#295)
-      ...(HAS_ENCODED_STREAMS && {
+      ...(ENCODED_TRANSFORM_PATH === 'encoded-streams' && {
         additionalSettings: {
           encodedInsertableStreams: true,
         } as unknown as Partial<RTCConfiguration>,
@@ -5570,6 +5625,7 @@ class VoiceService {
       consumer.on('transportclose', () => {
         console.debug('[consume] transport closed for consumer', consumer.id);
         this.consumers.delete(consumer.id);
+        this.decoderBudgetSampler.deleteConsumer(consumer.id);
         this.consumerMeta.delete(consumer.id);
         this.lastPreferredLayerKeyByConsumer.delete(consumer.id);
         this.pauseCoordinator.clearConsumer(consumer.id);
@@ -5880,6 +5936,7 @@ class VoiceService {
         if (consumer.producerId === producerId) {
           consumer.close();
           this.consumers.delete(consumerId);
+          this.decoderBudgetSampler.deleteConsumer(consumerId);
           this.consumerMeta.delete(consumerId);
           this.lastPreferredLayerKeyByConsumer.delete(consumerId);
           this.pauseCoordinator.clearConsumer(consumerId);
@@ -6074,6 +6131,7 @@ class VoiceService {
 
         consumer.close();
         this.consumers.delete(consumerId);
+        this.decoderBudgetSampler.deleteConsumer(consumerId);
         this.consumerMeta.delete(consumerId);
         this.lastPreferredLayerKeyByConsumer.delete(consumerId);
         this.pauseCoordinator.clearConsumer(consumerId);
@@ -6180,25 +6238,40 @@ class VoiceService {
     let probeCount = 0;
     const maxInitialProbes = 6; // 6 × 5s = 30s initial period
 
-    this.decoderProfilingTimer = setInterval(async () => {
+    this.decoderProfilingTimer = setInterval(() => {
       probeCount++;
 
       // Switch to slower interval after initial profiling
       if (probeCount === maxInitialProbes + 1 && this.decoderProfilingTimer) {
         clearInterval(this.decoderProfilingTimer);
-        this.decoderProfilingTimer = setInterval(() => this.profileDecoders(), 30_000);
+        this.decoderProfilingTimer = setInterval(() => {
+          void this.runDecoderProfilingTick();
+        }, 30_000);
       }
 
-      await this.profileDecoders();
+      void this.runDecoderProfilingTick();
     }, 5_000);
+  }
+
+  /** Run at most one timer-triggered stats pass at a time. */
+  private async runDecoderProfilingTick(): Promise<void> {
+    if (this.decoderProfilingInFlight) return;
+    this.decoderProfilingInFlight = true;
+    try {
+      await this.profileDecoders();
+    } catch (err) {
+      console.warn('IGNIS decoder profiling failed:', errorMessage(err));
+    } finally {
+      this.decoderProfilingInFlight = false;
+    }
   }
 
   /**
    * Full IGNIS decoder budget profiling.
    *
    * Zone thresholds:
-   *   Green:  rho < 0.67  (decode time < 67% of frame interval)
-   *   Yellow: rho < 0.80  (approaching limit)
+   *   Green:  rho < 0.80  (inside the safe decoder budget)
+   *   Yellow: 0.80 <= rho < 0.925 (approaching limit)
    *   Red:    rho >= 0.925 (near-critical, 92.5% capacity)
    *
    * Formulas:
@@ -6233,6 +6306,7 @@ class VoiceService {
           'fps:',
           currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
         );
+        this.decoderBudgetSampler.deleteConsumer(consumer.id);
         return;
       }
       if (pressureResult === 'handled') return;
@@ -6250,6 +6324,7 @@ class VoiceService {
         'fps:',
         currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
       );
+      this.decoderBudgetSampler.deleteConsumer(consumer.id);
       return;
     }
 
@@ -6262,6 +6337,7 @@ class VoiceService {
           'rho:',
           rho.toFixed(2)
         );
+        this.decoderBudgetSampler.deleteConsumer(consumer.id);
         return;
       }
       if (pressureResult === 'handled') return;
@@ -6275,22 +6351,38 @@ class VoiceService {
         'rho:',
         rho.toFixed(2)
       );
+      this.decoderBudgetSampler.deleteConsumer(consumer.id);
       return;
     }
 
-    // Already at lowest layers — pause lowest-priority consumer
-    this.pauseLowestPriorityConsumer(consumer);
+    // Already at lowest layers — pause lowest-priority consumer when another
+    // active video remains available to supply recovery evidence.
+    if (this.pauseLowestPriorityConsumer(consumer)) {
+      this.decoderBudgetSampler.deleteConsumer(consumer.id);
+    }
   }
 
   /** Pause a consumer for decoder relief, preferring to pause camera over screen share */
-  private pauseLowestPriorityConsumer(consumer: mediasoupTypes.Consumer): void {
+  private pauseLowestPriorityConsumer(consumer: mediasoupTypes.Consumer): boolean {
+    const hasAnotherActiveVideo = [...this.consumers.values()].some(
+      (candidate) =>
+        candidate.id !== consumer.id &&
+        candidate.kind === 'video' &&
+        !candidate.closed &&
+        !candidate.paused
+    );
+    if (!hasAnotherActiveVideo) {
+      console.warn(`IGNIS RED: keeping sole video consumer ${consumer.id} active at lowest layers`);
+      return false;
+    }
+
     const tunedIn = useVoiceStore.getState().tunedInScreenShares;
     const isScreenShare = Object.values(tunedIn).includes(consumer.id);
 
     if (!isScreenShare) {
       this.pauseCoordinator.addReason(consumer.id, 'ignis');
       console.warn(`IGNIS RED: pausing camera consumer ${consumer.id} — no layers to reduce`);
-      return;
+      return true;
     }
 
     // Try to find a still-decoding camera consumer to pause instead of the screen share
@@ -6300,28 +6392,13 @@ class VoiceService {
         console.warn(
           `IGNIS RED: pausing camera consumer ${c.id} instead of screen share ${consumer.id}`
         );
-        return;
+        return true;
       }
     }
 
     this.pauseCoordinator.addReason(consumer.id, 'ignis');
     console.warn(`IGNIS RED: pausing screen share consumer ${consumer.id} — no camera to demote`);
-  }
-
-  /** Extract video decoder stats from a stats report. Returns null if insufficient data. */
-  private static extractDecoderStats(
-    report: Record<string, unknown>
-  ): { rho: number; p95DecodeMs: number; currentFps: number } | null {
-    const totalDecodeTime = report.totalDecodeTime as number | undefined;
-    const framesDecoded = report.framesDecoded as number | undefined;
-    const currentFps = report.framesPerSecond as number | undefined;
-
-    if (!totalDecodeTime || !framesDecoded || framesDecoded === 0 || !currentFps) return null;
-
-    const avgDecodeMs = (totalDecodeTime / framesDecoded) * 1000;
-    const p95DecodeMs = avgDecodeMs * 1.5;
-    const rho = (p95DecodeMs * currentFps) / 1000;
-    return { rho, p95DecodeMs, currentFps };
+    return true;
   }
 
   /** Classify decoder load into a health zone and apply layer adjustments. */
@@ -6378,6 +6455,7 @@ class VoiceService {
         'fps:',
         currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
       );
+      this.decoderBudgetSampler.deleteConsumer(consumer.id);
       return VoiceService.mergeDecoderZones(worstZone, 'yellow');
     }
     if (pressureResult === 'handled') return VoiceService.mergeDecoderZones(worstZone, 'yellow');
@@ -6396,6 +6474,7 @@ class VoiceService {
       'fps:',
       currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
     );
+    this.decoderBudgetSampler.deleteConsumer(consumer.id);
     return VoiceService.mergeDecoderZones(worstZone, 'yellow');
   }
 
@@ -6408,31 +6487,56 @@ class VoiceService {
     return 'green';
   }
 
-  private async profileDecoders(): Promise<void> {
-    let worstZone: DecoderHealthZone = 'green';
+  private async selectDecoderReport(
+    consumer: mediasoupTypes.Consumer
+  ): Promise<SelectedDecoderStatsReport | null> {
+    try {
+      const stats = await consumer.getStats();
+      const negotiatedSsrcs = new Set<number>();
+      for (const encoding of consumer.rtpParameters.encodings ?? []) {
+        if (typeof encoding.ssrc === 'number') negotiatedSsrcs.add(encoding.ssrc);
+      }
+      return selectInboundVideoDecoderReport(stats.entries(), negotiatedSsrcs);
+    } catch {
+      return null;
+    }
+  }
 
-    for (const [, consumer] of this.consumers) {
+  private observeDecoderConsumer(
+    consumer: mediasoupTypes.Consumer,
+    selected: SelectedDecoderStatsReport | null,
+    worstZone: DecoderHealthZone | null
+  ): DecoderHealthZone | null {
+    const decoded = this.decoderBudgetSampler.observe({
+      consumerId: consumer.id,
+      reportId: selected?.reportId ?? consumer.id,
+      paused: consumer.paused,
+      report: selected?.report,
+      observedAtMs: performance.timeOrigin + performance.now(),
+    });
+    if (!decoded.usable) return worstZone;
+
+    return this.classifyAndHandleDecoderZone(
+      consumer,
+      decoded.rho,
+      decoded.p95DecodeMs,
+      decoded.currentFps,
+      worstZone ?? 'green'
+    );
+  }
+
+  private async profileDecoders(): Promise<void> {
+    let worstZone: DecoderHealthZone | null = null;
+
+    for (const consumer of this.consumers.values()) {
       if (consumer.kind !== 'video') continue;
 
-      try {
-        const stats = await consumer.getStats();
-        for (const report of stats.values()) {
-          if (report.type !== 'inbound-rtp' || report.kind !== 'video') continue;
-          const decoded = VoiceService.extractDecoderStats(report as Record<string, unknown>);
-          if (!decoded) continue;
-          worstZone = this.classifyAndHandleDecoderZone(
-            consumer,
-            decoded.rho,
-            decoded.p95DecodeMs,
-            decoded.currentFps,
-            worstZone
-          );
-        }
-      } catch {
-        // Stats not available — skip
-      }
+      let selected: SelectedDecoderStatsReport | null = null;
+      if (!consumer.paused) selected = await this.selectDecoderReport(consumer);
+      worstZone = this.observeDecoderConsumer(consumer, selected, worstZone);
     }
 
+    if (!worstZone) return;
     useVoiceStore.getState().setDecoderHealth(worstZone);
 
     this.updateDecoderRecoveryState(worstZone);
@@ -6466,6 +6570,7 @@ class VoiceService {
       const consumer = this.consumers.get(id);
       if (!consumer) {
         this.pauseCoordinator.clearConsumer(id); // gone — prune
+        this.decoderBudgetSampler.deleteConsumer(id);
         continue;
       }
       // Release IGNIS's hold. The consumer resumes locally unless another reason
@@ -6478,136 +6583,373 @@ class VoiceService {
 
   // ─── E2EE ─────────────────────────────────────────────────────
 
-  /** Initialize media encryption for an encrypted channel (fail-closed with retry) */
-  /** Core encryption setup: derive key, create Worker or legacy MediaEncryption */
-  private async initEncryptionCore(channelId: string, attempt: number): Promise<void> {
-    const channelCSK = await e2eeService.getChannelKey(channelId);
-    const userId = useUserStore.getState().user?.id;
-    if (!userId) throw new Error('No local userId for E2EE init');
+  /** Highest version observed by either current-key or history-key fetches. */
+  private highestSeenE2EEKeyVersion(channelId: string): number {
+    // Tolerate older test harnesses while all production implementations expose
+    // the read-only reconciliation surface.
+    if (typeof e2eeService.getHighestSeenKeyVersion !== 'function') return 0;
+    return e2eeService.getHighestSeenKeyVersion(channelId);
+  }
 
-    const encryptKey = await deriveFrameKey(channelCSK, userId);
-    // #1878: bind the encrypt key to the channel's authoritative CSK version so
-    // every outgoing v3 frame stamps it. getChannelKey above has already cached
-    // the version, so this is the value the SFU and every remote sender share.
-    // Never leave the encrypt version at a stale 0 when the channel is higher.
-    const keyVersion = e2eeService.getChannelKeyVersion(channelId);
+  /** True only while this exact channel/user/init still owns the shared slots. */
+  private isCurrentE2EEInit(context: E2EEInitContext): boolean {
+    return (
+      context.generation === this.e2eeInitGeneration &&
+      context.channelId === useVoiceStore.getState().activeChannelId &&
+      context.userId === useUserStore.getState().user?.id &&
+      context.expectedMediaEncryption === this.mediaEncryption &&
+      context.expectedWorker === this.e2eeWorker
+    );
+  }
 
-    if (USE_SCRIPT_TRANSFORM) {
-      this.initE2EEWorker();
-      if (!this.e2eeWorker) throw new Error('E2EE Worker failed to initialize');
-      this.e2eeWorker.postMessage({
-        type: 'init',
-        encryptKey,
-        currentKeyId: 0,
-        keyVersion,
-      } satisfies E2EEWorkerMessage);
-      this.mediaEncryption = new MediaEncryption();
-      this.mediaEncryption.initFromKey(encryptKey, 0);
-      this.mediaEncryption.setKeyVersion(keyVersion);
-    } else {
-      this.mediaEncryption = new MediaEncryption();
-      await this.mediaEncryption.init(channelCSK, userId);
-      this.mediaEncryption.setKeyVersion(keyVersion);
+  private assertCurrentE2EEInit(context: E2EEInitContext): void {
+    if (!this.isCurrentE2EEInit(context)) {
+      throw new E2EEInitializationSupersededError();
     }
-
-    // #1878: subscribe to authoritative CSK rotations so the sender re-bases its
-    // encrypt key onto the new version after a confirmed fetch (see
-    // subscribeKeyRotation). Re-subscribe per init (the prior sub is cleared in
-    // cleanupTimersAndE2EE); a no-op if onKeyRotation is unavailable.
-    this.subscribeKeyRotation();
-
-    console.debug('E2EE: encryption initialized', {
-      channelId,
-      userId,
-      keyVersion,
-      attempt: attempt + 1,
-      useScriptTransform: USE_SCRIPT_TRANSFORM,
-    });
   }
 
   /**
-   * #1878 (the crux): subscribe to authoritative CSK rotations so the sender
-   * re-bases its encrypt key onto the new version. The ordering IS the
-   * rewrap-window seam: keep stamping the OLD version until the NEW CSK fetch is
-   * CONFIRMED, then derive + install the new encrypt key and advance the stamped
-   * version atomically. On fetch failure: no-op (stay on the old version; the
-   * next rotation or epoch-sync retries). Stores the unsubscribe handle; cleared
-   * in cleanupTimersAndE2EE.
+   * Invalidate pending initializers before cleanup or a successor initializer
+   * can yield. A provisional (not-yet-committed) listener is request-owned and
+   * is removed here; a committed listener remains live until the shared
+   * subscription is synchronously replaced or explicitly torn down.
    */
-  private subscribeKeyRotation(): void {
-    // Replace any prior subscription (re-init / reconnect).
-    this.keyRotationOff?.();
-    this.keyRotationOff = null;
-    // Tolerate test/legacy harnesses where onKeyRotation is unavailable.
-    if (typeof e2eeService.onKeyRotation !== 'function') return;
-    this.keyRotationOff = e2eeService.onKeyRotation(({ channelId, keyVersion }) => {
-      // Only the ACTIVE channel's rotation re-bases the live encrypt key.
-      if (channelId !== useVoiceStore.getState().activeChannelId) return;
-      void this.rebaseEncryptKey(channelId, keyVersion);
-    });
+  private invalidatePendingE2EEInit(): void {
+    this.e2eeInitGeneration++;
+    const pending = this.pendingE2EEInitContext;
+    if (pending && !pending.ownsSharedRotationSubscription) {
+      pending.rotationOff?.();
+      pending.rotationOff = null;
+    }
+    this.pendingE2EEInitContext = null;
+    this.e2eeInitInFlight = null;
+  }
+
+  /** Subscribe before the first key fetch so edge-triggered rotations are buffered. */
+  private beginE2EEInit(channelId: string): E2EEInitContext {
+    const userId = useUserStore.getState().user?.id;
+    if (!userId) throw new Error('No local userId for E2EE init');
+    if (useVoiceStore.getState().activeChannelId !== channelId) {
+      throw new E2EEInitializationSupersededError();
+    }
+
+    this.invalidatePendingE2EEInit();
+    const context: E2EEInitContext = {
+      generation: this.e2eeInitGeneration,
+      channelId,
+      userId,
+      expectedMediaEncryption: this.mediaEncryption,
+      expectedWorker: this.e2eeWorker,
+      highestBufferedVersion: 0,
+      rotationOff: null,
+      ownsSharedRotationSubscription: false,
+      committed: false,
+      liveRotations: false,
+    };
+    this.pendingE2EEInitContext = context;
+
+    if (typeof e2eeService.onKeyRotation === 'function') {
+      context.rotationOff = e2eeService.onKeyRotation((event) => {
+        if (event.channelId !== channelId || !this.isCurrentE2EEInit(context)) return;
+        context.highestBufferedVersion = Math.max(context.highestBufferedVersion, event.keyVersion);
+        if (context.liveRotations) {
+          void this.rebaseEncryptKey(channelId, event.keyVersion);
+        }
+      });
+    }
+    // Subscribe-before-read closes the event/read race. A by-version fetch may
+    // have advanced highestSeen while the current-key cache still reports less.
+    context.highestBufferedVersion = Math.max(
+      context.highestBufferedVersion,
+      this.highestSeenE2EEKeyVersion(channelId)
+    );
+    return context;
+  }
+
+  private finishE2EEInit(context: E2EEInitContext): void {
+    if (this.pendingE2EEInitContext === context) {
+      this.pendingE2EEInitContext = null;
+    }
+    if (!context.ownsSharedRotationSubscription) {
+      context.rotationOff?.();
+      context.rotationOff = null;
+    }
+  }
+
+  /** Publish locally-built crypto state in one synchronous, fenced commit. */
+  private commitE2EEInit(
+    context: E2EEInitContext,
+    mediaEncryption: MediaEncryption,
+    worker: Worker | null,
+    keyVersion: number
+  ): void {
+    this.assertCurrentE2EEInit(context);
+    const previousMediaEncryption = this.mediaEncryption;
+    const previousWorker = this.e2eeWorker;
+    const previousRotationOff = this.keyRotationOff;
+
+    this.mediaEncryption = mediaEncryption;
+    this.e2eeWorker = worker;
+    this.latestRequestedEncryptKeyVersion = keyVersion;
+    this.keyRotationOff = context.rotationOff;
+    context.expectedMediaEncryption = mediaEncryption;
+    context.expectedWorker = worker;
+    context.committed = true;
+    context.ownsSharedRotationSubscription = true;
+
+    if (previousRotationOff && previousRotationOff !== context.rotationOff) {
+      previousRotationOff();
+    }
+    if (previousMediaEncryption && previousMediaEncryption !== mediaEncryption) {
+      try {
+        previousMediaEncryption.destroy();
+      } catch {
+        /* replacement is already atomically committed */
+      }
+    }
+    if (previousWorker && previousWorker !== worker) {
+      this.destroyE2EEWorkerInstance(previousWorker);
+    }
+  }
+
+  /** Reconcile all rotations buffered before the new subscription goes live. */
+  private async reconcileE2EEInit(context: E2EEInitContext): Promise<void> {
+    while (true) {
+      this.assertCurrentE2EEInit(context);
+      context.highestBufferedVersion = Math.max(
+        context.highestBufferedVersion,
+        this.highestSeenE2EEKeyVersion(context.channelId)
+      );
+      const installedVersion = context.expectedMediaEncryption?.getKeyVersion() ?? 0;
+      if (context.highestBufferedVersion <= installedVersion) {
+        // No await exists between the final read and enabling the listener, so
+        // a later event is necessarily handled by the live branch.
+        context.liveRotations = true;
+        return;
+      }
+
+      const targetVersion = context.highestBufferedVersion;
+      await this.rebaseEncryptKey(context.channelId, targetVersion);
+      this.assertCurrentE2EEInit(context);
+      if ((context.expectedMediaEncryption?.getKeyVersion() ?? 0) < targetVersion) {
+        throw new Error('E2EE: failed to reconcile the initialized sender key version');
+      }
+    }
+  }
+
+  /** Core encryption setup: derive locally, then atomically publish if still current. */
+  private async initEncryptionCore(
+    channelId: string,
+    attempt: number,
+    initContext?: E2EEInitContext
+  ): Promise<void> {
+    if (ENCODED_TRANSFORM_PATH === 'unavailable') {
+      throw new Error('E2EE: no encoded transform API available');
+    }
+    const ownsContext = initContext === undefined;
+    const context = initContext ?? this.beginE2EEInit(channelId);
+    let candidateMediaEncryption: MediaEncryption | null = null;
+    let candidateWorker: Worker | null = null;
+    let committed = false;
+
+    try {
+      const { channelKey: channelCSK, keyVersion } =
+        await e2eeService.getChannelKeyMaterial(channelId);
+      this.assertCurrentE2EEInit(context);
+
+      const encryptKey = await deriveFrameKey(channelCSK, context.userId);
+      this.assertCurrentE2EEInit(context);
+      // channelCSK and keyVersion are one atomic key-service snapshot, so a
+      // rotation during derivation cannot stamp old material as a new version.
+
+      candidateMediaEncryption = new MediaEncryption();
+      candidateMediaEncryption.initFromKey(encryptKey, 0);
+      candidateMediaEncryption.setKeyVersion(keyVersion);
+      if (ENCODED_TRANSFORM_PATH === 'script-transform') {
+        candidateWorker = this.createE2EEWorker();
+        candidateWorker.postMessage({
+          type: 'init',
+          encryptKey,
+          currentKeyId: 0,
+          keyVersion,
+        } satisfies E2EEWorkerMessage);
+      }
+
+      // This is the last check before the synchronous shared-state commit.
+      this.assertCurrentE2EEInit(context);
+      this.commitE2EEInit(context, candidateMediaEncryption, candidateWorker, keyVersion);
+      committed = true;
+      await this.reconcileE2EEInit(context);
+      this.assertCurrentE2EEInit(context);
+
+      console.debug('E2EE: encryption initialized', {
+        channelId,
+        userId: context.userId,
+        keyVersion: context.expectedMediaEncryption?.getKeyVersion() ?? keyVersion,
+        attempt: attempt + 1,
+        useScriptTransform: ENCODED_TRANSFORM_PATH === 'script-transform',
+        transformPath: ENCODED_TRANSFORM_PATH,
+      });
+    } finally {
+      if (!committed) {
+        candidateMediaEncryption?.destroy();
+        if (candidateWorker) this.destroyE2EEWorkerInstance(candidateWorker);
+      }
+      if (ownsContext) this.finishE2EEInit(context);
+    }
   }
 
   /**
    * #1878: re-base the sender's encrypt key onto a rotated CSK after a CONFIRMED
    * fetch. Until the fetch resolves, outgoing frames still stamp the old version
    * (the encrypt key is untouched), so there is no window where the sender
-   * stamps a version it can't back with a key.
+   * stamps a version it can't back with a key. Captured session identities and
+   * the monotonic requested version prevent stale async results from rolling back
+   * or mutating a replacement session.
    */
-  private async rebaseEncryptKey(channelId: string, keyVersion: number): Promise<void> {
+  private beginEncryptRebase(channelId: string, keyVersion: number): EncryptRebaseContext | null {
+    if (channelId !== useVoiceStore.getState().activeChannelId) return null;
+    const mediaEncryption = this.mediaEncryption;
+    const e2eeWorker = this.e2eeWorker;
+    const userId = useUserStore.getState().user?.id;
+    if (!mediaEncryption || !userId) return null;
+    if (
+      keyVersion <= this.latestRequestedEncryptKeyVersion ||
+      keyVersion <= mediaEncryption.getKeyVersion()
+    ) {
+      return null;
+    }
+    this.latestRequestedEncryptKeyVersion = keyVersion;
+    return { channelId, keyVersion, userId, mediaEncryption, e2eeWorker };
+  }
+
+  private isCurrentEncryptRebase(context: EncryptRebaseContext): boolean {
+    return (
+      context.channelId === useVoiceStore.getState().activeChannelId &&
+      context.userId === useUserStore.getState().user?.id &&
+      this.mediaEncryption === context.mediaEncryption &&
+      this.e2eeWorker === context.e2eeWorker &&
+      this.latestRequestedEncryptKeyVersion === context.keyVersion
+    );
+  }
+
+  private failEncryptRebase(context: EncryptRebaseContext, attempt: number, err: unknown): void {
+    console.error('E2EE: sender key re-base failed closed', {
+      channelId: context.channelId,
+      keyVersion: context.keyVersion,
+      attempt: attempt + 1,
+      error: errorMessage(err),
+    });
+    if (this.isCurrentEncryptRebase(context)) this.emergencyCleanup();
+  }
+
+  private async tryEncryptRebase(
+    context: EncryptRebaseContext,
+    attempt: number,
+    finalAttempt: number
+  ): Promise<'retry' | 'stop'> {
+    if (!this.isCurrentEncryptRebase(context)) return 'stop';
+
     try {
-      const newCsk = await e2eeService.getChannelKeyByVersion(channelId, keyVersion);
-      // Re-check the active channel after the await (it may have changed).
-      if (channelId !== useVoiceStore.getState().activeChannelId) return;
-      const userId = useUserStore.getState().user?.id;
-      if (!userId || !this.mediaEncryption) return;
-      const newEncryptKey = await deriveFrameKey(newCsk, userId);
-      if (channelId !== useVoiceStore.getState().activeChannelId || !this.mediaEncryption) return;
+      const newCsk = await e2eeService.getChannelKeyByVersion(
+        context.channelId,
+        context.keyVersion
+      );
+      if (!this.isCurrentEncryptRebase(context)) return 'stop';
+      const newEncryptKey = await deriveFrameKey(newCsk, context.userId);
+      if (!this.isCurrentEncryptRebase(context)) return 'stop';
+
       // Advance the local encrypt key + stamped version together.
-      this.mediaEncryption.initFromKey(newEncryptKey, 0);
-      this.mediaEncryption.setKeyVersion(keyVersion);
-      this.e2eeWorker?.postMessage({
+      context.mediaEncryption.initFromKey(newEncryptKey, 0);
+      context.mediaEncryption.setKeyVersion(context.keyVersion);
+      context.e2eeWorker?.postMessage({
         type: 'init',
         encryptKey: newEncryptKey,
         currentKeyId: 0,
-        keyVersion,
+        keyVersion: context.keyVersion,
       } satisfies E2EEWorkerMessage);
       console.debug('E2EE: sender re-based encrypt key on CSK rotation', {
-        channelId,
-        keyVersion,
+        channelId: context.channelId,
+        keyVersion: context.keyVersion,
       });
-    } catch {
-      // Confirmed-fetch failed → stay on the old version. The next rotation or
-      // epoch-sync retries; receivers self-heal via requestFrameKey meanwhile.
+      return 'stop';
+    } catch (err) {
+      if (!this.isCurrentEncryptRebase(context)) return 'stop';
+      if (attempt < finalAttempt && isRetryableEncryptRebaseError(err)) return 'retry';
+      this.failEncryptRebase(context, attempt, err);
+      return 'stop';
     }
   }
 
-  /** Initialize media encryption for an encrypted channel (fail-closed with retry) */
-  private async initEncryption(channelId: string): Promise<void> {
+  private async rebaseEncryptKey(channelId: string, keyVersion: number): Promise<void> {
+    const context = this.beginEncryptRebase(channelId, keyVersion);
+    if (!context) return;
+
     const retryDelays = [500, 1000, 2000];
-    let lastError: unknown;
-
     for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
-      try {
-        await this.initEncryptionCore(channelId, attempt);
-        return;
-      } catch (err) {
-        lastError = err;
-        console.warn('E2EE: initEncryption attempt failed', {
-          channelId,
-          attempt: attempt + 1,
-          error: err instanceof Error ? err.message : err,
-        });
-
-        if (attempt < retryDelays.length) {
-          const delay = retryDelayForError(err, retryDelays[attempt]);
-          await new Promise((r) => setTimeout(r, delay));
-        }
-      }
+      const result = await this.tryEncryptRebase(context, attempt, retryDelays.length);
+      if (result === 'stop') return;
+      await new Promise((resolve) => setTimeout(resolve, retryDelays[attempt]));
+      if (!this.isCurrentEncryptRebase(context)) return;
     }
+  }
 
-    // All retries exhausted — fail-closed
-    this.mediaEncryption = null;
-    this.terminateE2EEWorker();
+  /** Destroy only state synchronously committed by this still-current request. */
+  private failCurrentE2EEInit(context: E2EEInitContext): void {
+    if (!this.isCurrentE2EEInit(context)) return;
+    const committed = context.committed;
+    const rotationOff = context.rotationOff;
+    this.invalidatePendingE2EEInit();
+
+    if (!committed) return;
+    if (this.keyRotationOff === rotationOff) {
+      rotationOff?.();
+      this.keyRotationOff = null;
+    }
+    if (this.mediaEncryption === context.expectedMediaEncryption) {
+      this.mediaEncryption?.destroy();
+      this.mediaEncryption = null;
+    }
+    if (this.e2eeWorker === context.expectedWorker) {
+      this.terminateE2EEWorker();
+    }
+    this.latestRequestedEncryptKeyVersion = 0;
+    context.rotationOff = null;
+    context.ownsSharedRotationSubscription = false;
+  }
+
+  private async runE2EEInitAttempt(
+    context: E2EEInitContext,
+    attempt: number,
+    retryDelay: number | undefined
+  ): Promise<E2EEInitAttemptResult> {
+    try {
+      await this.initEncryptionCore(context.channelId, attempt, context);
+      return { succeeded: true };
+    } catch (err) {
+      if (!this.isCurrentE2EEInit(context)) {
+        throw new E2EEInitializationSupersededError();
+      }
+      console.warn('E2EE: initEncryption attempt failed', {
+        channelId: context.channelId,
+        attempt: attempt + 1,
+        error: err instanceof Error ? err.message : err,
+      });
+
+      if (retryDelay !== undefined) {
+        const delay = retryDelayForError(err, retryDelay);
+        await new Promise((r) => setTimeout(r, delay));
+        this.assertCurrentE2EEInit(context);
+      }
+      return { succeeded: false, error: err };
+    }
+  }
+
+  private throwE2EEInitFailure(context: E2EEInitContext, lastError: unknown): never {
+    // All retries exhausted — fail closed only if this exact request still owns
+    // the shared slots. A stale loop cannot terminate a replacement session.
+    this.assertCurrentE2EEInit(context);
+    this.failCurrentE2EEInit(context);
     if (lastError instanceof Error) throw lastError;
     let stringified = String(lastError);
     if (typeof lastError === 'object' && lastError !== null) {
@@ -6621,27 +6963,82 @@ class VoiceService {
     throw new Error(`E2EE: failed to initialize encryption after retries${detail}`);
   }
 
-  /** Create the E2EE Worker for RTCRtpScriptTransform */
-  private initE2EEWorker(): void {
-    if (this.e2eeWorker) return;
-    this.e2eeWorker = new Worker(new URL('../workers/e2eeWorker.ts', import.meta.url), {
+  /** Bounded retry loop owned by one immutable channel/user/init context. */
+  private async runE2EEInitWithRetry(context: E2EEInitContext): Promise<void> {
+    const retryDelays = [500, 1000, 2000];
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+      const result = await this.runE2EEInitAttempt(context, attempt, retryDelays[attempt]);
+      if (result.succeeded) return;
+      lastError = result.error;
+    }
+
+    this.throwE2EEInitFailure(context, lastError);
+  }
+
+  /** Initialize media encryption (single-flight for one channel/user session). */
+  private async initEncryption(channelId: string): Promise<void> {
+    const userId = useUserStore.getState().user?.id;
+    const inFlight = this.e2eeInitInFlight;
+    if (
+      userId &&
+      inFlight?.context.generation === this.e2eeInitGeneration &&
+      inFlight.context.channelId === channelId &&
+      inFlight.context.userId === userId &&
+      useVoiceStore.getState().activeChannelId === channelId
+    ) {
+      return inFlight.promise;
+    }
+
+    const context = this.beginE2EEInit(channelId);
+    const promise = this.runE2EEInitWithRetry(context);
+    const flight: E2EEInitFlight = { context, promise };
+    this.e2eeInitInFlight = flight;
+    try {
+      await promise;
+    } finally {
+      if (this.e2eeInitInFlight === flight) this.e2eeInitInFlight = null;
+      this.finishE2EEInit(context);
+    }
+  }
+
+  /** Build an unshared E2EE Worker candidate for RTCRtpScriptTransform. */
+  private createE2EEWorker(): Worker {
+    const worker = new Worker(new URL('../workers/e2eeWorker.ts', import.meta.url), {
       type: 'module',
     });
-    this.e2eeWorker.onmessage = (event: MessageEvent<E2EEMainMessage>) => {
+    worker.onmessage = (event: MessageEvent<E2EEMainMessage>) => {
+      if (this.e2eeWorker !== worker) return;
       this.handleWorkerMessage(event.data);
     };
-    this.e2eeWorker.onerror = (err) => {
+    worker.onerror = (err) => {
+      if (this.e2eeWorker !== worker) return;
       console.error('E2EE Worker error:', errorMessage(err));
     };
+    return worker;
+  }
+
+  /** Destroy one Worker without consulting or mutating the shared Worker slot. */
+  private destroyE2EEWorkerInstance(worker: Worker): void {
+    try {
+      worker.postMessage({ type: 'destroy' } satisfies E2EEWorkerMessage);
+    } catch {
+      /* still terminate a failed Worker */
+    }
+    try {
+      worker.terminate();
+    } catch {
+      /* idempotent teardown */
+    }
   }
 
   /** Terminate and clean up the E2EE Worker */
   private terminateE2EEWorker(): void {
-    if (this.e2eeWorker) {
-      this.e2eeWorker.postMessage({ type: 'destroy' } satisfies E2EEWorkerMessage);
-      this.e2eeWorker.terminate();
-      this.e2eeWorker = null;
-    }
+    const worker = this.e2eeWorker;
+    if (!worker) return;
+    this.e2eeWorker = null;
+    this.destroyE2EEWorkerInstance(worker);
   }
 
   /** Handle messages from the E2EE Worker */
@@ -6743,7 +7140,7 @@ class VoiceService {
    * For legacy path: delegates to MediaEncryption.debouncedRotateKeys().
    */
   private debouncedRotateE2EEKeys(): void {
-    if (!USE_SCRIPT_TRANSFORM) {
+    if (ENCODED_TRANSFORM_PATH === 'encoded-streams') {
       // Legacy path: MediaEncryption handles its own debounce
       this.mediaEncryption?.debouncedRotateKeys();
       return;
@@ -6771,6 +7168,31 @@ class VoiceService {
   }
 
   /** Add a decryption key for a remote user, pre-ratcheted to current epoch (with retry) */
+  private isCurrentDecryptKeyContext(
+    channelId: string,
+    localUserId: string,
+    mediaEncryption: MediaEncryption,
+    e2eeWorker: Worker | null
+  ): boolean {
+    return (
+      useVoiceStore.getState().activeChannelId === channelId &&
+      useUserStore.getState().user?.id === localUserId &&
+      this.mediaEncryption === mediaEncryption &&
+      this.e2eeWorker === e2eeWorker
+    );
+  }
+
+  private assertCurrentDecryptKeyContext(
+    channelId: string,
+    localUserId: string,
+    mediaEncryption: MediaEncryption,
+    e2eeWorker: Worker | null
+  ): void {
+    if (!this.isCurrentDecryptKeyContext(channelId, localUserId, mediaEncryption, e2eeWorker)) {
+      throw new Error('E2EE session changed during decrypt-key provisioning');
+    }
+  }
+
   /** Derive and install a decrypt key for a single user at the current epoch */
   private async deriveAndInstallDecryptKey(
     channelId: string,
@@ -6778,26 +7200,30 @@ class VoiceService {
     attempt: number,
     targetEpoch?: number
   ): Promise<void> {
-    if (!this.mediaEncryption) throw new Error('mediaEncryption destroyed');
-    const channelCSK = await e2eeService.getChannelKey(channelId);
-    if (!this.mediaEncryption) throw new Error('mediaEncryption destroyed');
-    const keyId = targetEpoch ?? this.mediaEncryption.getCurrentKeyId();
+    const mediaEncryption = this.mediaEncryption;
+    const e2eeWorker = this.e2eeWorker;
+    const localUserId = useUserStore.getState().user?.id;
+    if (!mediaEncryption) throw new Error('mediaEncryption destroyed');
+    if (!localUserId) throw new Error('E2EE session changed during decrypt-key provisioning');
+    this.assertCurrentDecryptKeyContext(channelId, localUserId, mediaEncryption, e2eeWorker);
+
+    const { channelKey, keyVersion } = await e2eeService.getChannelKeyMaterial(channelId);
+    this.assertCurrentDecryptKeyContext(channelId, localUserId, mediaEncryption, e2eeWorker);
+    const keyId = targetEpoch ?? mediaEncryption.getCurrentKeyId();
 
     if (keyId > 100) {
       throw new Error(`E2EE: epoch ${keyId} exceeds ratchet limit (100), rejoin required`);
     }
 
-    const key = await this.mediaEncryption.addDecryptKeyAtEpoch(channelCSK, userId, keyId);
+    this.assertCurrentDecryptKeyContext(channelId, localUserId, mediaEncryption, e2eeWorker);
+    const key = await mediaEncryption.addDecryptKeyAtVersion(channelKey, userId, keyVersion, keyId);
+    this.assertCurrentDecryptKeyContext(channelId, localUserId, mediaEncryption, e2eeWorker);
 
-    if (this.e2eeWorker) {
-      // #1878: stamp the bound CSK version so the worker keys its decrypt map by
-      // senderId:keyVersion:keyId (matches what addDecryptKeyAtEpoch registered
-      // on the main-thread instance via its currentKeyVersion). Task 5 makes the
-      // sender re-base advance this version authoritatively.
-      this.e2eeWorker.postMessage({
+    if (e2eeWorker) {
+      e2eeWorker.postMessage({
         type: 'addDecryptKey',
         senderUserId: userId,
-        keyVersion: this.mediaEncryption.getKeyVersion(),
+        keyVersion,
         keyId,
         key,
       } satisfies E2EEWorkerMessage);
@@ -6806,10 +7232,68 @@ class VoiceService {
     console.debug('E2EE: decrypt key added', {
       channelId,
       targetUserId: userId,
-      currentEpoch: this.mediaEncryption.getCurrentKeyId(),
+      currentEpoch: mediaEncryption.getCurrentKeyId(),
       keyId,
       attempt: attempt + 1,
     });
+  }
+
+  private beginDecryptKeyRequest(
+    channelId: string,
+    userId: string,
+    targetEpoch: number | undefined
+  ): DecryptKeyRequestContext | null {
+    const mediaEncryption = this.mediaEncryption;
+    const e2eeWorker = this.e2eeWorker;
+    const localUserId = useUserStore.getState().user?.id;
+    if (!mediaEncryption || !localUserId) return null;
+
+    const context = {
+      channelId,
+      userId,
+      targetEpoch,
+      localUserId,
+      mediaEncryption,
+      e2eeWorker,
+    };
+    if (!this.isCurrentDecryptKeyRequest(context)) return null;
+    return context;
+  }
+
+  private isCurrentDecryptKeyRequest(context: DecryptKeyRequestContext): boolean {
+    return this.isCurrentDecryptKeyContext(
+      context.channelId,
+      context.localUserId,
+      context.mediaEncryption,
+      context.e2eeWorker
+    );
+  }
+
+  private async tryAddDecryptKey(
+    context: DecryptKeyRequestContext,
+    attempt: number,
+    retryDelay: number | undefined
+  ): Promise<DecryptKeyAttemptResult> {
+    if (!this.isCurrentDecryptKeyRequest(context)) return { status: 'stale' };
+
+    try {
+      await this.deriveAndInstallDecryptKey(
+        context.channelId,
+        context.userId,
+        attempt,
+        context.targetEpoch
+      );
+      if (!this.isCurrentDecryptKeyRequest(context)) return { status: 'stale' };
+      return { status: 'success' };
+    } catch (err) {
+      if (!this.isCurrentDecryptKeyRequest(context)) return { status: 'stale' };
+      if (retryDelay === undefined) return { status: 'failed', error: err };
+
+      const delay = isPendingKeyError(err) ? retryDelay * 2 : retryDelay;
+      await new Promise((r) => setTimeout(r, delay));
+      if (!this.isCurrentDecryptKeyRequest(context)) return { status: 'stale' };
+      return { status: 'retry', error: err };
+    }
   }
 
   /** Add a decryption key for a remote user, pre-ratcheted to current epoch (with retry) */
@@ -6818,28 +7302,22 @@ class VoiceService {
     userId: string,
     targetEpoch?: number
   ): Promise<boolean> {
-    if (!this.mediaEncryption) return false;
+    const context = this.beginDecryptKeyRequest(channelId, userId, targetEpoch);
+    if (!context) return false;
 
     const retryDelays = [500, 1000, 2000];
     let lastError: unknown;
 
     for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
-      try {
-        await this.deriveAndInstallDecryptKey(channelId, userId, attempt, targetEpoch);
-        return true;
-      } catch (err) {
-        lastError = err;
-        if (attempt < retryDelays.length) {
-          const isPending = isPendingKeyError(err);
-          const delay = isPending ? retryDelays[attempt] * 2 : retryDelays[attempt];
-          await new Promise((r) => setTimeout(r, delay));
-        }
-      }
+      const result = await this.tryAddDecryptKey(context, attempt, retryDelays[attempt]);
+      if (result.status === 'success') return true;
+      if (result.status === 'stale') return false;
+      lastError = result.error;
     }
 
     console.error('E2EE: failed to add decrypt key after retries', {
-      channelId,
-      targetUserId: userId,
+      channelId: context.channelId,
+      targetUserId: context.userId,
       error: lastError instanceof Error ? lastError.message : lastError,
     });
     return false;
@@ -6859,35 +7337,72 @@ class VoiceService {
   }
 
   /**
-   * Apply E2EE encrypt transform to a producer.
+   * Produce only after mediasoup creates the sender and this callback installs E2EE.
+   * onRtpSender runs synchronously before createOffer() and before the server-side
+   * produce event, so an attachment failure cannot publish a plaintext frame.
+   */
+  private produceEncrypted(
+    transport: mediasoupTypes.Transport,
+    options: mediasoupTypes.ProducerOptions
+  ): Promise<mediasoupTypes.Producer> {
+    const source = typeof options.appData?.source === 'string' ? options.appData.source : undefined;
+    const codecFamily =
+      options.track?.kind === 'audio' ? 'opus' : codecFamilyFromMimeType(options.codec?.mimeType);
+
+    return transport.produce({
+      ...options,
+      onRtpSender: (sender) => {
+        try {
+          this.applyEncryptTransform(sender, codecFamily, source);
+        } catch (err) {
+          // mediasoup invokes this before createOffer(), but does not roll back the
+          // just-created transceiver when the callback throws. Detach the track and
+          // close the transport so a failed sender cannot survive into a later offer.
+          try {
+            sender.replaceTrack(null).catch(() => undefined);
+          } catch {
+            // Best effort; closing the transport below is authoritative.
+          }
+          transport.close();
+          throw err;
+        }
+      },
+    });
+  }
+
+  /**
+   * Apply E2EE to a sender before publication.
    * Modern path: RTCRtpScriptTransform (Chromium 129+, Worker-based).
    * Legacy path: createEncodedStreams (Chromium 86-130, main-thread).
    */
-  private applyEncryptTransform(producer: mediasoupTypes.Producer): void {
-    const sender = producer.rtpSender;
-    if (!sender) {
-      this.failClosedEncryptTransform(producer, 'no rtpSender on producer');
-    }
-
-    // #1895: resolve LOCAL send codec to drive per-codec encrypt dispatch (AV1 per-OBU vs whole-frame)
-    const codecFamily = codecFamilyFromRtpParameters(producer.rtpParameters);
-
+  private applyEncryptTransform(
+    sender: RTCRtpSender,
+    codecFamily?: CodecFamily,
+    source?: string
+  ): void {
     // Modern path: RTCRtpScriptTransform (Chromium 129+)
-    if (USE_SCRIPT_TRANSFORM && this.e2eeWorker) {
+    if (ENCODED_TRANSFORM_PATH === 'script-transform') {
+      if (!this.e2eeWorker) {
+        this.failClosedEncryptTransform(source, 'E2EE Worker is not initialized');
+      }
       try {
         const options: E2EETransformOptions = { role: 'encrypt', codecFamily };
         sender.transform = new RTCRtpScriptTransform(this.e2eeWorker, options);
         console.debug('E2EE: encrypt transform applied (RTCRtpScriptTransform)');
       } catch (err) {
         console.error('E2EE: RTCRtpScriptTransform failed on sender:', errorMessage(err));
-        this.failClosedEncryptTransform(producer, 'RTCRtpScriptTransform failed');
+        this.failClosedEncryptTransform(source, 'RTCRtpScriptTransform failed');
       }
       return;
     }
 
+    if (ENCODED_TRANSFORM_PATH === 'unavailable') {
+      this.failClosedEncryptTransform(source, 'encoded transform API unavailable');
+    }
+
     // Legacy path: createEncodedStreams (Chromium 86-130)
     if (!this.mediaEncryption) {
-      this.failClosedEncryptTransform(producer, 'media encryption is not initialized');
+      this.failClosedEncryptTransform(source, 'media encryption is not initialized');
     }
     const encryption = this.mediaEncryption;
     const legacySender = sender as RtpSenderWithEncodedStreams;
@@ -6933,24 +7448,17 @@ class VoiceService {
         console.debug('E2EE: encrypt transform applied (createEncodedStreams)');
       } catch (err) {
         console.error('E2EE: createEncodedStreams failed on sender:', errorMessage(err));
-        this.failClosedEncryptTransform(producer, 'createEncodedStreams failed');
+        this.failClosedEncryptTransform(source, 'createEncodedStreams failed');
       }
     } else {
       console.warn('E2EE: no Insertable Streams API available — frames will not be encrypted');
-      this.failClosedEncryptTransform(producer, 'Insertable Streams API unavailable');
+      this.failClosedEncryptTransform(source, 'Insertable Streams API unavailable');
     }
   }
 
-  private failClosedEncryptTransform(producer: mediasoupTypes.Producer, reason: string): never {
-    const source =
-      typeof producer.appData?.source === 'string' ? producer.appData.source : undefined;
-    producer.close();
-    if (source) this.producers.delete(source);
-    this.socket?.emit('close-producer', { producerId: producer.id });
-    // Producers are created with stopTracks:false, so producer.close() above does
-    // NOT stop the capture track. Tear down the owning capture stream explicitly so
-    // a fail-closed E2EE path never leaves the camera/mic hardware capture light on
-    // (CWE-212). Same cleanup helpers the toggle-off / leave-call paths use.
+  private failClosedEncryptTransform(source: string | undefined, reason: string): never {
+    // Pre-publication failures have no Producer to close. Always tear down the
+    // owning capture stream so fail-closed E2EE cannot leave hardware active.
     if (source === 'camera') this.cleanupCameraState();
     else if (source === 'mic') this.cleanupMicState();
     else if (source === 'screen' || source === 'screen-audio')
@@ -6988,18 +7496,24 @@ class VoiceService {
     keyId: number
   ): void {
     const mediaEncryption = this.mediaEncryption;
-    if (!mediaEncryption) return;
-    e2eeService
-      .getChannelKeyByVersion(channelId, keyVersion)
-      .then(async (csk) => {
+    const e2eeWorker = this.e2eeWorker;
+    const localUserId = useUserStore.getState().user?.id;
+    if (!mediaEncryption || !localUserId) return;
+
+    void (async () => {
+      try {
+        this.assertCurrentDecryptKeyContext(channelId, localUserId, mediaEncryption, e2eeWorker);
+        const csk = await e2eeService.getChannelKeyByVersion(channelId, keyVersion);
+        this.assertCurrentDecryptKeyContext(channelId, localUserId, mediaEncryption, e2eeWorker);
         const key = await mediaEncryption.addDecryptKeyAtVersion(
           csk,
           senderUserId,
           keyVersion,
           keyId
         );
-        if (USE_SCRIPT_TRANSFORM) {
-          this.e2eeWorker?.postMessage({
+        this.assertCurrentDecryptKeyContext(channelId, localUserId, mediaEncryption, e2eeWorker);
+        if (ENCODED_TRANSFORM_PATH === 'script-transform' && e2eeWorker) {
+          e2eeWorker.postMessage({
             type: 'addDecryptKey',
             senderUserId,
             keyVersion,
@@ -7007,10 +7521,10 @@ class VoiceService {
             key,
           } satisfies E2EEWorkerMessage);
         }
-      })
-      .catch(() => {
+      } catch {
         /* fail-closed: getChannelKeyByVersion rate-limits; worker caps retries */
-      });
+      }
+    })();
   }
 
   /** Build DecryptRecoveryCallbacks bound to this VoiceService instance. */
@@ -7043,11 +7557,14 @@ class VoiceService {
 
     // #1895: resolve SENDER's codec from consumer.rtpParameters (populated before this is called —
     // consumeProducerImpl creates the consumer from result.rtpParameters then calls applyDecryptTransform,
-    // so there is no race — OQ-8). Drives per-codec decrypt dispatch (AV1 per-OBU vs whole-frame).
+    // so there is no race — OQ-8). Drives H.264 NAL-aware / AV1 per-OBU / whole-frame dispatch.
     const codecFamily = codecFamilyFromRtpParameters(consumer.rtpParameters);
 
     // Modern path: RTCRtpScriptTransform (Chromium 129+)
-    if (USE_SCRIPT_TRANSFORM && this.e2eeWorker) {
+    if (ENCODED_TRANSFORM_PATH === 'script-transform') {
+      if (!this.e2eeWorker) {
+        throw new Error('E2EE: failed to attach decrypt transform (Worker is not initialized)');
+      }
       try {
         const options: E2EETransformOptions = { role: 'decrypt', senderUserId, codecFamily };
         receiver.transform = new RTCRtpScriptTransform(this.e2eeWorker, options);
@@ -7061,6 +7578,10 @@ class VoiceService {
         );
       }
       return;
+    }
+
+    if (ENCODED_TRANSFORM_PATH === 'unavailable') {
+      throw new Error('E2EE: failed to attach decrypt transform (encoded transform unavailable)');
     }
 
     // Legacy path: createEncodedStreams (Chromium 86-130)
@@ -7090,6 +7611,7 @@ class VoiceService {
     });
     if (!consumer.closed) consumer.close();
     this.consumers.delete(consumer.id);
+    this.decoderBudgetSampler.deleteConsumer(consumer.id);
     this.consumerMeta.delete(consumer.id);
     this.lastPreferredLayerKeyByConsumer.delete(consumer.id);
     this.pauseCoordinator.clearConsumer(consumer.id);
@@ -7171,6 +7693,10 @@ class VoiceService {
   }
 
   private async cleanup(): Promise<void> {
+    // Invalidate asynchronous crypto work and drop the live rotation listener
+    // before closeProducer reaches the first await.
+    this.invalidatePendingE2EEInit();
+    this.teardownSharedE2EEState();
     this.invalidateVideoReproduces();
     // Clear solo bandwidth saving state
     if (this.soloNotificationTimer) {
@@ -7200,6 +7726,7 @@ class VoiceService {
       consumer.close();
     }
     this.consumers.clear();
+    this.decoderBudgetSampler.clear();
     this.consumerMeta.clear();
     this.testSuspensionDepth = 0;
     this.testSuspendedProducerIds.clear();
@@ -7239,15 +7766,7 @@ class VoiceService {
       clearInterval(this.decoderProfilingTimer);
       this.decoderProfilingTimer = null;
     }
-
-    // Destroy E2EE
-    this.terminateE2EEWorker();
-    if (this.rotationTimer) {
-      clearTimeout(this.rotationTimer);
-      this.rotationTimer = null;
-    }
-    this.mediaEncryption?.destroy();
-    this.mediaEncryption = null;
+    this.decoderProfilingInFlight = false;
 
     // Clear screen share opt-in list
     useVoiceStore.getState().clearAvailableScreenShares();

@@ -3,7 +3,8 @@
  * cognitive complexity. Pure functions — no VoiceService `this` dependency.
  *
  * Canonical codec order shared by runtime selection and Settings prediction.
- * Two-pass: HW-accelerated first, then SW fallback.
+ * HDR targets lead SDR targets even when that crosses the hardware/software
+ * boundary.
  */
 
 import type { types as mediasoupTypes } from 'mediasoup-client';
@@ -30,6 +31,20 @@ export interface CodecCascadeConfig<T = mediasoupTypes.RtpCodecCapability> exten
   preferred: string | null;
   hwAccel: boolean;
   hdrEncoding: boolean;
+}
+
+export type CodecBackendTarget = 'hardware' | 'software';
+export type CodecColorTarget = 'hdr' | 'sdr';
+
+export interface CodecCandidate {
+  key: string;
+  backend: CodecBackendTarget;
+  colorTarget: CodecColorTarget;
+}
+
+export interface SelectedCodecCandidate<T> {
+  codec: T;
+  candidate: CodecCandidate;
 }
 
 export type H264ProfileClass =
@@ -105,6 +120,29 @@ export function h264ProfileClass(profileLevelId: string): H264ProfileClass | nul
 export function h264ProfilesCompatible(left: string, right: string): boolean {
   const leftClass = h264ProfileClass(left);
   return leftClass !== null && leftClass === h264ProfileClass(right);
+}
+
+/** Compare an application codec target with the room's RTP codec floor. */
+export function isCodecKeyInFloor(key: string, floor: string[] | null): boolean {
+  if (!floor) return true;
+  const [mime, rawProfile] = key.toLowerCase().split(':');
+  const profile = mime === 'video/vp9' ? (rawProfile ?? '0') : rawProfile;
+
+  return floor.some((entry) => {
+    const [floorMime, floorProfile] = entry.toLowerCase().split(':');
+    if (floorMime !== mime) return false;
+    if (mime === 'video/av1') return true;
+    if (floorProfile === undefined) {
+      if (mime === 'video/vp9') return profile === '0';
+      if (mime === 'video/h264') return rawProfile === undefined;
+      return true;
+    }
+    if (mime === 'video/vp9') return profile === floorProfile;
+    if (mime === 'video/h264') {
+      return profile !== undefined && h264ProfilesCompatible(profile, floorProfile);
+    }
+    return profile === floorProfile;
+  });
 }
 
 // ─── Cascade Construction ────────────────────────────────────────────
@@ -206,6 +244,93 @@ export function findFirstFloorCompatibleCodec<T>(
   return undefined;
 }
 
+const HDR_CODEC_KEYS = ['video/AV1:hdr', 'video/VP9:2'] as const;
+const H264_CODEC_KEYS = ['video/H264:640034', 'video/H264:4d0032', 'video/H264:42e01f'] as const;
+const SDR_CODEC_KEYS = ['video/AV1:sdr', 'video/VP9:0', ...H264_CODEC_KEYS, 'video/VP8'] as const;
+
+function candidates(
+  keys: readonly string[],
+  backend: CodecBackendTarget,
+  colorTarget: CodecColorTarget
+): CodecCandidate[] {
+  return keys.map((key) => ({ key, backend, colorTarget }));
+}
+
+/** Exact Auto policy. Hardware candidates are absent when acceleration is off. */
+export function buildCodecCandidates(hdrEncoding: boolean, hwAccel: boolean): CodecCandidate[] {
+  const result: CodecCandidate[] = [];
+  if (hdrEncoding) {
+    if (hwAccel) result.push(...candidates(HDR_CODEC_KEYS, 'hardware', 'hdr'));
+    result.push(...candidates(HDR_CODEC_KEYS, 'software', 'hdr'));
+  }
+  if (hwAccel) result.push(...candidates(SDR_CODEC_KEYS, 'hardware', 'sdr'));
+  result.push(...candidates(SDR_CODEC_KEYS, 'software', 'sdr'));
+  return result;
+}
+
+/** Normalize legacy family-only preferences without changing their stored type. */
+export function normalizeCodecTargetKey(key: string, hdrEncoding: boolean): string {
+  const [mime, profile] = key.split(':');
+  const normalizedMime = mime.toLowerCase();
+  if (normalizedMime === 'video/av1') {
+    let target = profile?.toLowerCase();
+    if (target !== 'hdr' && target !== 'sdr') target = hdrEncoding ? 'hdr' : 'sdr';
+    return `video/AV1:${target}`;
+  }
+  if (normalizedMime === 'video/vp9' && profile === undefined) return 'video/VP9:0';
+  return key;
+}
+
+function candidateColorTarget(key: string): CodecColorTarget {
+  const normalized = key.toLowerCase();
+  return normalized === 'video/av1:hdr' || normalized === 'video/vp9:2' ? 'hdr' : 'sdr';
+}
+
+function codecAllowedAsPreference(key: string, hdrEncoding: boolean): boolean {
+  const [mime, profile] = key.toLowerCase().split(':');
+  if (mime === 'video/h265' || mime === 'video/hevc') return false;
+  if (candidateColorTarget(key) === 'hdr' && !hdrEncoding) return false;
+  if (mime !== 'video/h264' || profile === undefined) return true;
+  const profileClass = h264ProfileClass(profile);
+  return (
+    profileClass === 'high' || profileClass === 'main' || profileClass === 'constrained-baseline'
+  );
+}
+
+function findCandidate<T>(
+  candidate: CodecCandidate,
+  lookup: CodecLookup<T>
+): SelectedCodecCandidate<T> | undefined {
+  if (candidate.backend === 'hardware' && !lookup.isHwAccelerated(candidate.key)) return undefined;
+  if (!lookup.isInCodecFloor(candidate.key)) return undefined;
+  if (lookup.isEligible && !lookup.isEligible(candidate.key)) return undefined;
+  const codec = lookup.findSendCodec(candidate.key);
+  return codec ? { codec, candidate } : undefined;
+}
+
+function findPreferredCandidate<T>(
+  preferred: string,
+  hwAccel: boolean,
+  hdrEncoding: boolean,
+  lookup: CodecLookup<T>
+): SelectedCodecCandidate<T> | undefined {
+  const normalized = normalizeCodecTargetKey(preferred, hdrEncoding);
+  const preferredKeys = normalized.toLowerCase() === 'video/h264' ? H264_CODEC_KEYS : [normalized];
+  for (const key of preferredKeys) {
+    if (!codecAllowedAsPreference(key, hdrEncoding)) continue;
+    const selected = findCandidate(
+      {
+        key,
+        backend: hwAccel ? 'hardware' : 'software',
+        colorTarget: candidateColorTarget(key),
+      },
+      lookup
+    );
+    if (selected) return selected;
+  }
+  return undefined;
+}
+
 // ─── Public API ──────────────────────────────────────────────────────
 
 /**
@@ -216,47 +341,26 @@ export function findFirstFloorCompatibleCodec<T>(
  *   2. HW-accelerated codec from cascade (if HW accel enabled)
  *   3. Any codec from cascade (SW fallback)
  */
+export function selectCodecCandidate<T = mediasoupTypes.RtpCodecCapability>(
+  config: CodecCascadeConfig<T>
+): SelectedCodecCandidate<T> | undefined {
+  const { preferred, hwAccel, hdrEncoding, ...lookup } = config;
+
+  if (preferred) {
+    const selected = findPreferredCandidate(preferred, hwAccel, hdrEncoding, lookup);
+    if (selected) return selected;
+  }
+
+  for (const candidate of buildCodecCandidates(hdrEncoding, hwAccel)) {
+    const selected = findCandidate(candidate, lookup);
+    if (selected) return selected;
+  }
+
+  return undefined;
+}
+
 export function selectCodecFromCascade<T = mediasoupTypes.RtpCodecCapability>(
   config: CodecCascadeConfig<T>
 ): T | undefined {
-  const { preferred, hwAccel, hdrEncoding, ...lookup } = config;
-
-  // 1. User preference
-  const preferredProfile = preferred?.split(':')[1];
-  const preferredMime = preferred?.split(':')[0].toLowerCase();
-  const preferredH264Class = preferredProfile ? h264ProfileClass(preferredProfile) : null;
-  const h264ProfileAllowed =
-    preferredMime !== 'video/h264' ||
-    preferredProfile === undefined ||
-    preferredH264Class === 'high' ||
-    preferredH264Class === 'main' ||
-    preferredH264Class === 'constrained-baseline';
-  const preferredAllowed =
-    h264ProfileAllowed &&
-    preferredMime !== 'video/h265' &&
-    preferredMime !== 'video/hevc' &&
-    (hdrEncoding || !(preferredMime === 'video/vp9' && preferredProfile === '2'));
-  if (
-    preferred &&
-    preferredAllowed &&
-    lookup.isInCodecFloor(preferred) &&
-    (!lookup.isEligible || lookup.isEligible(preferred))
-  ) {
-    const codec = lookup.findSendCodec(preferred);
-    if (codec) return codec;
-  }
-
-  const cascade = buildCodecCascade(hdrEncoding);
-
-  // 2. HW-accelerated pass
-  if (hwAccel) {
-    const hwCodec = findFirstFloorCompatibleCodec(cascade, lookup, true);
-    if (hwCodec) return hwCodec;
-  }
-
-  // 3. SW fallback pass
-  const swCodec = findFirstFloorCompatibleCodec(cascade, lookup, false);
-  if (swCodec) return swCodec;
-
-  return undefined;
+  return selectCodecCandidate(config)?.codec;
 }

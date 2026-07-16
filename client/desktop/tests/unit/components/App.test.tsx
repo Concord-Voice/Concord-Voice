@@ -8,6 +8,7 @@ import { usePendingRegistrationStore } from '@/renderer/stores/pendingRegistrati
 import { useE2EEStore } from '@/renderer/stores/e2eeStore';
 import { useInviteStore } from '@/renderer/stores/inviteStore';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
 
 const mockDirectMessagesView = vi.hoisted(() => ({ shouldThrow: false }));
 // Mock child components to prevent complex rendering
@@ -136,11 +137,13 @@ describe('App', () => {
     usePendingRegistrationStore.getState().clearPending();
     useE2EEStore.getState().reset();
     useVoiceStore.getState().reset();
+    useVideoSettingsStore.setState({ hdrEncoding: false, systemHdr: false });
     __resetRestoreSessionCalledForTesting();
     Object.assign(globalThis.electron ?? {}, {
       restoreSession: undefined,
       onInviteReceived: undefined,
       inviteRendererReady: undefined,
+      getDisplayInfo: undefined,
     });
   });
 
@@ -378,6 +381,19 @@ describe('App', () => {
       },
     });
   }
+
+  it('preserves disabled HDR encoding when startup detects an HDR display', async () => {
+    authenticateUser();
+    useVideoSettingsStore.getState().setHdrEncoding(false);
+    Object.assign(globalThis.electron ?? {}, {
+      getDisplayInfo: vi.fn().mockResolvedValue([{ colorDepth: 30, colorSpace: 'display-p3' }]),
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(useVideoSettingsStore.getState().systemHdr).toBe(true));
+    expect(useVideoSettingsStore.getState().hdrEncoding).toBe(false);
+  });
 
   it('navigates to channel on notification click', () => {
     authenticateUser();

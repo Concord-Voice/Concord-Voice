@@ -50,7 +50,7 @@ const PERSISTENT_FAILURE_THRESHOLD = 500;
 
 // ─── Decrypt Error Logging ───────────────────────────────────────────
 
-/** Log a decrypt failure — verbose mode includes frame trailer hex dump. */
+/** Log a decrypt failure without exposing IVs or encrypted trailer bytes. */
 function logDecryptFailure(
   senderUserId: string,
   dropCount: number,
@@ -66,20 +66,12 @@ function logDecryptFailure(
 
   if (verbose) {
     const fd = new Uint8Array(frame.data);
-    const trailerHex =
-      fd.length >= 16
-        ? Array.from(fd.slice(-16))
-            .map((b) => b.toString(16).padStart(2, '0'))
-            .join(' ')
-        : 'too-small';
     const hasMagic = fd.length >= 2 && fd.at(-2) === 0xde && fd.at(-1) === 0xad;
     console.warn('E2EE: dropping frame for sender (dropped count):', senderUserId, dropCount, {
       error: errMsg,
       frameSize: fd.length,
       localEpoch: encryption.getCurrentKeyId(),
       hasMagic,
-      keyId: hasMagic && fd.length >= 15 ? fd.at(-15) : -1,
-      trailerHex,
     });
   } else {
     console.warn(

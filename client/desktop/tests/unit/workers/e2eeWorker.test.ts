@@ -1,22 +1,35 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { selectCryptoScheme } from '@/renderer/workers/e2eeProtocol';
 
-const { mockDecryptFrame } = vi.hoisted(() => ({
+const { mockDecryptFrame, mockEncryptFrame } = vi.hoisted(() => ({
   mockDecryptFrame: vi.fn(),
+  mockEncryptFrame: vi.fn(),
 }));
 
 vi.mock('@/renderer/services/mediaEncryption', () => ({
-  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 2,
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
   MediaEncryption: class {
     initFromKey = vi.fn();
     addDecryptKeyDirect = vi.fn();
     rotateKeys = vi.fn().mockResolvedValue(undefined);
     catchUpToEpoch = vi.fn().mockResolvedValue(undefined);
     getCurrentKeyId = vi.fn().mockReturnValue(0);
-    encryptFrame = vi.fn().mockResolvedValue(undefined);
+    encryptFrame = mockEncryptFrame;
     decryptFrame = mockDecryptFrame;
     destroy = vi.fn();
   },
 }));
+
+describe('e2eeWorker codec dispatch', () => {
+  it('selects H.264 nal-aware, AV1 per-OBU, and whole-frame for every other codec', () => {
+    expect(selectCryptoScheme('h264')).toBe('nal-aware');
+    expect(selectCryptoScheme('av1')).toBe('per-obu');
+    expect(selectCryptoScheme('vp8')).toBe('whole-frame');
+    expect(selectCryptoScheme('vp9')).toBe('whole-frame');
+    expect(selectCryptoScheme('opus')).toBe('whole-frame');
+    expect(selectCryptoScheme(undefined)).toBe('whole-frame');
+  });
+});
 
 describe('e2eeWorker keyframe recovery', () => {
   let postMessage: ReturnType<typeof vi.fn>;
@@ -25,6 +38,8 @@ describe('e2eeWorker keyframe recovery', () => {
   beforeEach(async () => {
     vi.resetModules();
     vi.clearAllMocks();
+    mockEncryptFrame.mockResolvedValue(undefined);
+    mockDecryptFrame.mockResolvedValue(undefined);
     postMessage = vi.fn();
     rtctransformListener = undefined;
     vi.stubGlobal('self', {
@@ -37,6 +52,64 @@ describe('e2eeWorker keyframe recovery', () => {
       }),
     });
     await import('@/renderer/workers/e2eeWorker');
+  });
+
+  it('passes h264 to the shared MediaEncryption encrypt implementation', async () => {
+    const frame = { type: 'key', data: new ArrayBuffer(8) } as RTCEncodedVideoFrame;
+    const written: unknown[] = [];
+    const readable = new ReadableStream<RTCEncodedVideoFrame>({
+      start(controller) {
+        controller.enqueue(frame);
+        controller.close();
+      },
+    });
+    const writable = new WritableStream<RTCEncodedVideoFrame>({
+      write(chunk) {
+        written.push(chunk);
+      },
+    });
+
+    expect(rtctransformListener).toBeTypeOf('function');
+    rtctransformListener!({
+      transformer: {
+        options: { role: 'encrypt', codecFamily: 'h264' },
+        readable,
+        writable,
+      },
+    });
+
+    await vi.waitFor(() => expect(mockEncryptFrame).toHaveBeenCalledWith(frame, 'h264'));
+    await vi.waitFor(() => expect(written).toEqual([frame]));
+  });
+
+  it('passes h264 to the shared MediaEncryption decrypt implementation', async () => {
+    const frame = { type: 'key', data: new ArrayBuffer(8) } as RTCEncodedVideoFrame;
+    const written: unknown[] = [];
+    const readable = new ReadableStream<RTCEncodedVideoFrame>({
+      start(controller) {
+        controller.enqueue(frame);
+        controller.close();
+      },
+    });
+    const writable = new WritableStream<RTCEncodedVideoFrame>({
+      write(chunk) {
+        written.push(chunk);
+      },
+    });
+
+    expect(rtctransformListener).toBeTypeOf('function');
+    rtctransformListener!({
+      transformer: {
+        options: { role: 'decrypt', senderUserId: 'sender-1', codecFamily: 'h264' },
+        readable,
+        writable,
+      },
+    });
+
+    await vi.waitFor(() =>
+      expect(mockDecryptFrame).toHaveBeenCalledWith(frame, 'sender-1', 'h264')
+    );
+    await vi.waitFor(() => expect(written).toEqual([frame]));
   });
 
   it('posts requestKeyframe when video decrypt recovers after dropped frames', async () => {

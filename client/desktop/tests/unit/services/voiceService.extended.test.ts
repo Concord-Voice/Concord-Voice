@@ -94,6 +94,10 @@ const mockOnKeyRotation = vi.fn().mockReturnValue(() => {});
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     getChannelKey: (...args: unknown[]) => mockGetChannelKey(...args),
+    getChannelKeyMaterial: async (...args: unknown[]) => ({
+      channelKey: await mockGetChannelKey(...args),
+      keyVersion: mockGetChannelKeyVersion(...args),
+    }),
     invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
     // #1878: version binding + sender re-base surface.
     getChannelKeyVersion: (...args: unknown[]) => mockGetChannelKeyVersion(...args),
@@ -110,14 +114,14 @@ const mockGetCurrentKeyId = vi.fn().mockReturnValue(0);
 const mockSetCurrentKeyId = vi.fn();
 const mockAddDecryptKeyDirect = vi.fn();
 const mockAddDecryptKeyAtEpoch = vi.fn().mockResolvedValue(undefined);
+const mockAddDecryptKeyAtVersion = vi.fn().mockResolvedValue(undefined);
 const mockDebouncedRotateKeys = vi.fn();
 const mockCatchUpToEpoch = vi.fn().mockResolvedValue(undefined);
 
 vi.mock('@/renderer/services/mediaEncryption', () => ({
-  // #1878 Task 6: the client now negotiates v3. The mock mirrors the live
-  // constant so the join-version self-check (advertise === ack) stays
-  // consistent; the media-plane gate accepts {2,3} during the rollout window.
-  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 3,
+  // Mirror the live media-frame crypto version so the join-version self-check
+  // (advertise === ack) stays consistent with production.
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
   MediaEncryption: class MockMediaEncryption {
     init = mockMediaEncryptionInit;
     initFromKey = mockMediaEncryptionInitFromKey;
@@ -134,7 +138,7 @@ vi.mock('@/renderer/services/mediaEncryption', () => ({
     addDecryptKeyDirect = mockAddDecryptKeyDirect;
     addDecryptKeyDirectV3 = vi.fn();
     addDecryptKeyAtEpoch = mockAddDecryptKeyAtEpoch;
-    addDecryptKeyAtVersion = vi.fn().mockResolvedValue(undefined);
+    addDecryptKeyAtVersion = mockAddDecryptKeyAtVersion;
     debouncedRotateKeys = mockDebouncedRotateKeys;
     catchUpToEpoch = mockCatchUpToEpoch;
   },
@@ -236,6 +240,7 @@ Object.defineProperty(globalThis, 'MediaStream', {
 
 // Mock RTCRtpSender constructor; producer doubles below model createEncodedStreams.
 function MockRTCRtpSender() {}
+Object.defineProperty(MockRTCRtpSender.prototype, 'createEncodedStreams', { value: vi.fn() });
 Object.defineProperty(globalThis, 'RTCRtpSender', {
   value: MockRTCRtpSender,
   writable: true,
@@ -353,7 +358,7 @@ function makeJoinResponse(co?: Record<string, unknown>, top?: Record<string, unk
 function makeRoomJoined(ov?: Record<string, unknown>) {
   return {
     rtpCapabilities: mockDeviceRtpCapabilities,
-    mediaFrameCryptoVersion: 3,
+    mediaFrameCryptoVersion: 5,
     existingProducers: [],
     participants: [{ userId: 'user-1', username: 'testuser', displayName: 'Test User' }],
     channelName: 'General',
@@ -427,11 +432,35 @@ function createMockConsumer(id = 'cons-1', kind: 'audio' | 'video' = 'audio', pr
     resume: vi.fn(),
     on: vi.fn(),
     getStats: vi.fn().mockResolvedValue(new Map()),
+    rtpParameters: { encodings: [] },
     rtpReceiver: {
       transform: null,
       createEncodedStreams: vi.fn().mockImplementation(createEncodedStreamPair),
     },
   };
+}
+
+function mockIntervalDecoderStats(
+  consumer: ReturnType<typeof createMockConsumer>,
+  decodeMsPerFrame: number,
+  fps = 30
+): void {
+  let sampleIndex = 0;
+  const framesPerInterval = fps * 5;
+  consumer.getStats.mockImplementation(() => {
+    const framesDecoded = sampleIndex * framesPerInterval;
+    const report = {
+      id: 'inbound',
+      type: 'inbound-rtp',
+      kind: 'video',
+      totalDecodeTime: (framesDecoded * decodeMsPerFrame) / 1_000,
+      framesDecoded,
+      framesPerSecond: fps,
+      timestamp: performance.timeOrigin + performance.now(),
+    };
+    sampleIndex++;
+    return Promise.resolve(new Map([['inbound', report]]));
+  });
 }
 
 function setupEmitResponses(responses: Record<string, unknown>) {
@@ -521,6 +550,7 @@ describe('VoiceService Extended', () => {
     mockCheckOne.mockResolvedValue('granted');
     mockGetCurrentKeyId.mockReturnValue(0);
     mockAddDecryptKeyAtEpoch.mockResolvedValue(undefined);
+    mockAddDecryptKeyAtVersion.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -535,6 +565,24 @@ describe('VoiceService Extended', () => {
       voiceService.emergencyCleanup();
     } catch {
       /* ok */
+    }
+  });
+
+  it('enables encodedInsertableStreams only for the legacy transform path', async () => {
+    await joinVoiceChannel();
+
+    expect(mockCreateSendTransport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        additionalSettings: { encodedInsertableStreams: true },
+      })
+    );
+    expect(mockCreateRecvTransport).toHaveBeenCalledTimes(2);
+    for (const [options] of mockCreateRecvTransport.mock.calls) {
+      expect(options).toEqual(
+        expect.objectContaining({
+          additionalSettings: { encodedInsertableStreams: true },
+        })
+      );
     }
   });
 
@@ -1698,7 +1746,7 @@ describe('VoiceService Extended', () => {
       triggerSocketEvent('epoch-sync', { epoch: 5 });
 
       await vi.advanceTimersByTimeAsync(100);
-      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'user-2', 5);
+      expect(mockAddDecryptKeyAtVersion).toHaveBeenCalledWith(expect.anything(), 'user-2', 0, 5);
       expect(mockCatchUpToEpoch).toHaveBeenCalledWith(5);
     });
 
@@ -2405,7 +2453,7 @@ describe('VoiceService Extended', () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
       svc.mediaEncryption = null;
-      const result = await svc.addDecryptKeyForUser('ch1', 'u1');
+      const result = await svc.addDecryptKeyForUser('channel-1', 'u1');
       expect(result).toBe(false);
     });
 
@@ -2415,9 +2463,9 @@ describe('VoiceService Extended', () => {
       const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
 
-      const result = await svc.addDecryptKeyForUser('ch1', 'u2');
+      const result = await svc.addDecryptKeyForUser('channel-1', 'u2');
       expect(result).toBe(true);
-      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'u2', 0);
+      expect(mockAddDecryptKeyAtVersion).toHaveBeenCalledWith(expect.anything(), 'u2', 0, 0);
     });
 
     it('returns false after all retries exhausted', async () => {
@@ -2427,7 +2475,7 @@ describe('VoiceService Extended', () => {
       svc.mediaEncryption = new MediaEncryption();
       mockGetChannelKey.mockRejectedValue(new Error('key unavailable'));
 
-      const resultPromise = svc.addDecryptKeyForUser('ch1', 'u2');
+      const resultPromise = svc.addDecryptKeyForUser('channel-1', 'u2');
       // Advance through retry delays
       await vi.advanceTimersByTimeAsync(500);
       await vi.advanceTimersByTimeAsync(1000);
@@ -2447,7 +2495,7 @@ describe('VoiceService Extended', () => {
       svc.mediaEncryption = new MediaEncryption();
       mockGetCurrentKeyId.mockReturnValue(101);
 
-      await expect(svc.deriveAndInstallDecryptKey('ch1', 'u2', 0)).rejects.toThrow(
+      await expect(svc.deriveAndInstallDecryptKey('channel-1', 'u2', 0)).rejects.toThrow(
         'epoch 101 exceeds ratchet limit'
       );
     });
@@ -2457,7 +2505,7 @@ describe('VoiceService Extended', () => {
       const svc = voiceService as any;
       svc.mediaEncryption = null;
 
-      await expect(svc.deriveAndInstallDecryptKey('ch1', 'u2', 0)).rejects.toThrow(
+      await expect(svc.deriveAndInstallDecryptKey('channel-1', 'u2', 0)).rejects.toThrow(
         'mediaEncryption destroyed'
       );
     });
@@ -2520,22 +2568,20 @@ describe('VoiceService Extended', () => {
   // ===== applyEncryptTransform =====
 
   describe('applyEncryptTransform', () => {
-    it('fails closed when an encrypted producer has no sender transform API', async () => {
+    it('fails closed and releases capture when a sender has no transform API', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
       const producer = createMockProducer('cam-no-transform', 'camera');
       delete (producer.rtpSender as Record<string, unknown>).createEncodedStreams;
-      svc.producers.set('camera', producer);
+      const stream = createMockMediaStream([{ kind: 'video' }]);
+      svc.localCameraStream = stream;
 
-      expect(() => svc.applyEncryptTransform(producer)).toThrow(
+      expect(() => svc.applyEncryptTransform(producer.rtpSender, 'vp8', 'camera')).toThrow(
         'E2EE: failed to attach encrypt transform'
       );
 
-      expect(producer.close).toHaveBeenCalled();
-      expect(svc.producers.has('camera')).toBe(false);
-      expect(mockSocket.emit).toHaveBeenCalledWith('close-producer', {
-        producerId: 'cam-no-transform',
-      });
+      expect(stream.getTracks()[0].stop).toHaveBeenCalledOnce();
+      expect(svc.localCameraStream).toBeNull();
     });
   });
 
@@ -2599,6 +2645,8 @@ describe('VoiceService Extended', () => {
   describe('initEncryption', () => {
     it('doubles delay for pending E2EE key errors', async () => {
       const svc = voiceService as any;
+      setupAuth();
+      useVoiceStore.setState({ activeChannelId: 'ch1' });
       // Fail first 4 calls (initial + 3 retries), succeed on none
       mockGetChannelKey.mockRejectedValue(new E2EEKeyUnavailableError('NO_KEY_YET', true));
 
@@ -2611,6 +2659,8 @@ describe('VoiceService Extended', () => {
 
     it('rethrows non-Error lastError', async () => {
       const svc = voiceService as any;
+      setupAuth();
+      useVoiceStore.setState({ activeChannelId: 'ch1' });
       mockGetChannelKey.mockRejectedValue('string error');
 
       vi.useRealTimers();
@@ -2628,26 +2678,7 @@ describe('VoiceService Extended', () => {
       const svc = voiceService as any;
 
       const consumer = createMockConsumer('cons-yellow', 'video', 'prod-yellow');
-      const statsMap = new Map();
-      // rho = (p95 * fps) / 1000 = (20 * 1.5 * 30) / 1000 = 0.9 > 0.8 (yellow) but < 0.925
-      // Actually need rho >= 0.8 and < 0.925
-      // Let's set: totalDecodeTime=0.02s for 100 frames => avg=0.2ms, p95=0.3ms
-      // rho = 0.3 * 30 / 1000 = 0.009 -- too low
-      // Need: rho = T_d_p95 * FPS / 1000 >= 0.8
-      // So T_d_p95 * 30 >= 800 => T_d_p95 >= 26.7ms
-      // avgDecodeMs = totalDecodeTime / framesDecoded * 1000
-      // p95 = avg * 1.5
-      // avg >= 26.7 / 1.5 = 17.8ms
-      // totalDecodeTime / framesDecoded >= 0.0178
-      // totalDecodeTime = 0.0178 * 100 = 1.78
-      statsMap.set('inbound', {
-        type: 'inbound-rtp',
-        kind: 'video',
-        totalDecodeTime: 1.78,
-        framesDecoded: 100,
-        framesPerSecond: 30,
-      });
-      consumer.getStats.mockResolvedValue(statsMap);
+      mockIntervalDecoderStats(consumer, 28); // rho = 28ms × 30fps / 1000 = 0.84
 
       // Add currentLayers and setPreferredLayers
       (consumer as any).currentLayers = { spatialLayer: 2, temporalLayer: 2 };
@@ -2655,7 +2686,7 @@ describe('VoiceService Extended', () => {
 
       svc.consumers.set('cons-yellow', consumer);
 
-      await vi.advanceTimersByTimeAsync(5500);
+      await vi.advanceTimersByTimeAsync(10_500);
 
       expect((consumer as any).setPreferredLayers).toHaveBeenCalledWith({
         spatialLayer: 2,
@@ -2672,23 +2703,12 @@ describe('VoiceService Extended', () => {
       const svc = voiceService as any;
 
       const consumer = createMockConsumer('cons-red2', 'video', 'prod-red2');
-      const statsMap = new Map();
-      // rho >= 0.925: T_d_p95 * 30 >= 925 => T_d_p95 >= 30.83ms
-      // avg >= 30.83 / 1.5 = 20.56ms
-      // totalDecodeTime = 20.56 * 100 / 1000 = 2.056
-      statsMap.set('inbound', {
-        type: 'inbound-rtp',
-        kind: 'video',
-        totalDecodeTime: 2.1,
-        framesDecoded: 100,
-        framesPerSecond: 30,
-      });
-      consumer.getStats.mockResolvedValue(statsMap);
+      mockIntervalDecoderStats(consumer, 40); // rho = 1.2
       (consumer as any).currentLayers = { spatialLayer: 2, temporalLayer: 2 };
       (consumer as any).setPreferredLayers = vi.fn();
       svc.consumers.set('cons-red2', consumer);
 
-      await vi.advanceTimersByTimeAsync(5500);
+      await vi.advanceTimersByTimeAsync(10_500);
 
       expect((consumer as any).setPreferredLayers).toHaveBeenCalledWith({
         spatialLayer: 1,
@@ -2701,20 +2721,12 @@ describe('VoiceService Extended', () => {
       const svc = voiceService as any;
 
       const consumer = createMockConsumer('cons-red3', 'video', 'prod-red3');
-      const statsMap = new Map();
-      statsMap.set('inbound', {
-        type: 'inbound-rtp',
-        kind: 'video',
-        totalDecodeTime: 2.1,
-        framesDecoded: 100,
-        framesPerSecond: 30,
-      });
-      consumer.getStats.mockResolvedValue(statsMap);
+      mockIntervalDecoderStats(consumer, 40);
       (consumer as any).currentLayers = { spatialLayer: 0, temporalLayer: 2 };
       (consumer as any).setPreferredLayers = vi.fn();
       svc.consumers.set('cons-red3', consumer);
 
-      await vi.advanceTimersByTimeAsync(5500);
+      await vi.advanceTimersByTimeAsync(10_500);
 
       expect((consumer as any).setPreferredLayers).toHaveBeenCalledWith({
         spatialLayer: 0,
@@ -2729,15 +2741,7 @@ describe('VoiceService Extended', () => {
       const screenConsumer = createMockConsumer('cons-screen', 'video', 'prod-screen');
       const cameraConsumer = createMockConsumer('cons-cam', 'video', 'prod-cam');
 
-      const statsMap = new Map();
-      statsMap.set('inbound', {
-        type: 'inbound-rtp',
-        kind: 'video',
-        totalDecodeTime: 2.1,
-        framesDecoded: 100,
-        framesPerSecond: 30,
-      });
-      screenConsumer.getStats.mockResolvedValue(statsMap);
+      mockIntervalDecoderStats(screenConsumer, 40);
       (screenConsumer as any).currentLayers = { spatialLayer: 0, temporalLayer: 0 };
       (screenConsumer as any).setPreferredLayers = vi.fn();
 
@@ -2747,7 +2751,7 @@ describe('VoiceService Extended', () => {
       // Mark screen consumer as tuned-in screen share
       useVoiceStore.getState().tuneIn('prod-screen', 'cons-screen');
 
-      await vi.advanceTimersByTimeAsync(5500);
+      await vi.advanceTimersByTimeAsync(10_500);
 
       // Camera should be paused (not the screen share)
       expect(cameraConsumer.pause).toHaveBeenCalled();
@@ -3159,7 +3163,7 @@ describe('VoiceService Extended', () => {
         ],
       });
 
-      await svc.setupE2EEForChannel('ch1', roomJoined);
+      await svc.setupE2EEForChannel('channel-1', roomJoined);
       // Should have called catchUpToEpoch
       expect(mockCatchUpToEpoch).toHaveBeenCalledWith(3);
     });
@@ -3302,7 +3306,7 @@ describe('VoiceService Extended', () => {
       });
 
       await vi.advanceTimersByTimeAsync(100);
-      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'user-3', 3);
+      expect(mockAddDecryptKeyAtVersion).toHaveBeenCalledWith(expect.anything(), 'user-3', 0, 3);
       expect(mockDebouncedRotateKeys).toHaveBeenCalled();
     });
 
@@ -3323,7 +3327,7 @@ describe('VoiceService Extended', () => {
       });
 
       await vi.advanceTimersByTimeAsync(100);
-      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'user-3', 4);
+      expect(mockAddDecryptKeyAtVersion).toHaveBeenCalledWith(expect.anything(), 'user-3', 0, 4);
       expect(mockDebouncedRotateKeys).toHaveBeenCalled();
     });
   });
@@ -3383,10 +3387,15 @@ describe('VoiceService Extended', () => {
       triggerSocketEvent('user-left', { userId: 'user-2', e2eeEpoch: 4 });
       await vi.advanceTimersByTimeAsync(100);
 
-      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'user-3', 4);
+      expect(mockAddDecryptKeyAtVersion).toHaveBeenCalledWith(expect.anything(), 'user-3', 0, 4);
       expect(workerPostMessage).toHaveBeenCalledWith({ type: 'catchUpToEpoch', targetEpoch: 4 });
       expect(mockCatchUpToEpoch).toHaveBeenCalledWith(4);
-      expect(mockAddDecryptKeyAtEpoch).not.toHaveBeenCalledWith(expect.anything(), 'user-2', 4);
+      expect(mockAddDecryptKeyAtVersion).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'user-2',
+        0,
+        4
+      );
     });
 
     it('does not catch up when authoritative leave epoch is not ahead locally', async () => {
@@ -3420,7 +3429,7 @@ describe('VoiceService Extended', () => {
       triggerSocketEvent('user-left', { userId: 'user-2', e2eeEpoch: 4 });
       await vi.advanceTimersByTimeAsync(100);
 
-      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'user-3', 4);
+      expect(mockAddDecryptKeyAtVersion).toHaveBeenCalledWith(expect.anything(), 'user-3', 0, 4);
       expect(workerPostMessage).not.toHaveBeenCalledWith({
         type: 'catchUpToEpoch',
         targetEpoch: 4,
@@ -3509,7 +3518,7 @@ describe('VoiceService Extended', () => {
       });
 
       await vi.advanceTimersByTimeAsync(100);
-      expect(mockAddDecryptKeyAtEpoch).toHaveBeenCalledWith(expect.anything(), 'user-2', 0);
+      expect(mockAddDecryptKeyAtVersion).toHaveBeenCalledWith(expect.anything(), 'user-2', 0, 0);
     });
   });
 
@@ -3605,6 +3614,41 @@ describe('VoiceService Extended', () => {
       const svc = voiceService as any;
       useVoiceStore.setState({ codecFloor: ['video/vp8'] });
       expect(svc.isInCodecFloor('video/VP9')).toBe(false);
+    });
+
+    it('maps AV1 application targets to the base RTP floor key', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useVoiceStore.setState({ codecFloor: ['video/av1'] });
+      expect(svc.isInCodecFloor('video/AV1:hdr')).toBe(true);
+      expect(svc.isInCodecFloor('video/AV1:sdr')).toBe(true);
+    });
+
+    it('compares VP9 profiles exactly while treating a bare candidate as Profile 0', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useVoiceStore.setState({ codecFloor: ['video/vp9:0'] });
+      expect(svc.isInCodecFloor('video/VP9')).toBe(true);
+      expect(svc.isInCodecFloor('video/VP9:0')).toBe(true);
+      expect(svc.isInCodecFloor('video/VP9:2')).toBe(false);
+    });
+
+    it('matches H264 levels within one class but rejects a different class', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useVoiceStore.setState({ codecFloor: ['video/h264:640034'] });
+      expect(svc.isInCodecFloor('video/H264:64001f')).toBe(true);
+      expect(svc.isInCodecFloor('video/H264:4d0032')).toBe(false);
+    });
+
+    it('handles old MIME-only floor entries conservatively', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      useVoiceStore.setState({ codecFloor: ['video/vp9', 'video/h264'] });
+      expect(svc.isInCodecFloor('video/VP9:0')).toBe(true);
+      expect(svc.isInCodecFloor('video/VP9:2')).toBe(false);
+      expect(svc.isInCodecFloor('video/H264')).toBe(true);
+      expect(svc.isInCodecFloor('video/H264:640034')).toBe(false);
     });
   });
 
@@ -3792,6 +3836,90 @@ describe('VoiceService Extended', () => {
       ({ ...useVideoSettingsStore.getState(), ...over }) as ReturnType<
         typeof useVideoSettingsStore.getState
       >;
+
+    it('preferred codec change reproduces an active screen without a camera', () => {
+      const svc = voiceService as any;
+      svc.producers.delete('camera');
+      svc.producers.set('screen', createMockProducer('scr-1', 'screen'));
+      const cameraSpy = vi.spyOn(svc, 'liveReproduceCamera').mockResolvedValue(undefined);
+      const screenSpy = vi.spyOn(svc, 'fastReproduceScreen').mockResolvedValue(undefined);
+
+      svc.handleVideoSettingsChange(
+        flip({ preferredVideoCodec: 'video/AV1:sdr' }),
+        flip({ preferredVideoCodec: 'video/VP8' })
+      );
+
+      expect(cameraSpy).not.toHaveBeenCalled();
+      expect(screenSpy).toHaveBeenCalledTimes(1);
+      cameraSpy.mockRestore();
+      screenSpy.mockRestore();
+    });
+
+    it('HDR change reproduces an active screen without a camera', () => {
+      const svc = voiceService as any;
+      svc.producers.delete('camera');
+      svc.producers.set('screen', createMockProducer('scr-1', 'screen'));
+      const cameraSpy = vi.spyOn(svc, 'liveReproduceCamera').mockResolvedValue(undefined);
+      const screenSpy = vi.spyOn(svc, 'fastReproduceScreen').mockResolvedValue(undefined);
+
+      svc.handleVideoSettingsChange(flip({ hdrEncoding: true }), flip({ hdrEncoding: false }));
+
+      expect(cameraSpy).not.toHaveBeenCalled();
+      expect(screenSpy).toHaveBeenCalledTimes(1);
+      cameraSpy.mockRestore();
+      screenSpy.mockRestore();
+    });
+
+    it('HDR change reproduces each active video source exactly once', () => {
+      const svc = voiceService as any;
+      svc.producers.set('camera', createMockProducer('cam-1', 'camera'));
+      svc.producers.set('screen', createMockProducer('scr-1', 'screen'));
+      const cameraSpy = vi.spyOn(svc, 'liveReproduceCamera').mockResolvedValue(undefined);
+      const screenSpy = vi.spyOn(svc, 'fastReproduceScreen').mockResolvedValue(undefined);
+
+      svc.handleVideoSettingsChange(flip({ hdrEncoding: true }), flip({ hdrEncoding: false }));
+
+      expect(cameraSpy).toHaveBeenCalledTimes(1);
+      expect(screenSpy).toHaveBeenCalledTimes(1);
+      cameraSpy.mockRestore();
+      screenSpy.mockRestore();
+    });
+
+    it('coalesces simultaneous codec and layering changes per active source', () => {
+      const svc = voiceService as any;
+      svc.producers.set('camera', createMockProducer('cam-1', 'camera'));
+      svc.producers.set('screen', createMockProducer('scr-1', 'screen'));
+      const cameraSpy = vi.spyOn(svc, 'liveReproduceCamera').mockResolvedValue(undefined);
+      const screenSpy = vi.spyOn(svc, 'fastReproduceScreen').mockResolvedValue(undefined);
+
+      svc.handleVideoSettingsChange(
+        flip({ preferredVideoCodec: 'video/AV1:sdr', supportSvc: false }),
+        flip({ preferredVideoCodec: 'video/VP8', supportSvc: true })
+      );
+
+      expect(cameraSpy).toHaveBeenCalledTimes(1);
+      expect(screenSpy).toHaveBeenCalledTimes(1);
+      cameraSpy.mockRestore();
+      screenSpy.mockRestore();
+    });
+
+    it('does not apply hardware acceleration changes live', () => {
+      const svc = voiceService as any;
+      svc.producers.set('camera', createMockProducer('cam-1', 'camera'));
+      svc.producers.set('screen', createMockProducer('scr-1', 'screen'));
+      const cameraSpy = vi.spyOn(svc, 'liveReproduceCamera').mockResolvedValue(undefined);
+      const screenSpy = vi.spyOn(svc, 'fastReproduceScreen').mockResolvedValue(undefined);
+
+      svc.handleVideoSettingsChange(
+        flip({ hardwareAcceleration: false }),
+        flip({ hardwareAcceleration: true })
+      );
+
+      expect(cameraSpy).not.toHaveBeenCalled();
+      expect(screenSpy).not.toHaveBeenCalled();
+      cameraSpy.mockRestore();
+      screenSpy.mockRestore();
+    });
 
     it('supportSvc change reproduces camera once', () => {
       const svc = voiceService as any;

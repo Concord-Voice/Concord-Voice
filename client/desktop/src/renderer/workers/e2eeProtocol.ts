@@ -7,11 +7,11 @@
 
 export type E2EEWorkerMessage =
   // #1878: init carries the authoritative CSK keyVersion so the worker stamps
-  // it into every outgoing v3 frame trailer (binds encrypt version at init /
+  // it into every outgoing versioned frame trailer (binds encrypt version at init /
   // reconnect / post-rotation — never a stale 0 when the channel is higher).
   | { type: 'init'; encryptKey: CryptoKey; currentKeyId: number; keyVersion: number }
   // #1878: addDecryptKey carries the CSK keyVersion so the worker keys its
-  // decrypt map by senderId:keyVersion:keyId (matches the v3 frame trailer).
+  // decrypt map by senderId:keyVersion:keyId (matches the versioned frame trailer).
   | {
       type: 'addDecryptKey';
       senderUserId: string;
@@ -78,7 +78,10 @@ export function codecFamilyFromMimeType(mimeType: string | undefined): CodecFami
 }
 
 /** The crypto scheme a codec family uses (single-sourced for both decrypt paths). */
-export function selectCryptoScheme(codec: CodecFamily | undefined): 'per-obu' | 'whole-frame' {
+export function selectCryptoScheme(
+  codec: CodecFamily | undefined
+): 'nal-aware' | 'per-obu' | 'whole-frame' {
+  if (codec === 'h264') return 'nal-aware';
   return codec === 'av1' ? 'per-obu' : 'whole-frame';
 }
 
@@ -127,6 +130,7 @@ export interface E2EETransformOptions {
   senderUserId?: string;
   // #1895: codec family of the stream this transform processes — encrypt uses
   // the LOCAL send codec, decrypt uses the SENDER's codec. Drives per-codec
-  // crypto dispatch (AV1 per-OBU vs whole-frame). Undefined → whole-frame.
+  // crypto dispatch (H.264 NAL-aware, AV1 per-OBU, otherwise whole-frame).
+  // Undefined → whole-frame.
   codecFamily?: CodecFamily;
 }

@@ -80,7 +80,7 @@ export interface VideoSettings {
   // Camera
   cameraPreset: string; // Key into VIDEO_QUALITY_PRESETS
   cameraBitrate: number; // bps, 0 = auto (codec/preset-dependent). Gated on the camera axis (#1602).
-  preferredVideoCodec: string | null; // canonical router key, e.g. "video/vp9:0" or "video/h264:640034"
+  preferredVideoCodec: string | null; // codec/app target, e.g. "video/av1:hdr" or "video/h264:640034"
   cameraPriority: VideoPriority; // DSCP priority for camera traffic
 
   // Screen share
@@ -105,7 +105,7 @@ export interface VideoSettings {
   hardwareAcceleration: boolean;
 
   // HDR
-  hdrEncoding: boolean; // Enable HDR encoding (VP9 P2). Auto-detected from display.
+  hdrEncoding: boolean; // Prefer AV1 HDR / VP9 P2 targets. Availability is display-gated.
   systemHdr: boolean; // Whether any connected display supports HDR (non-persisted, runtime)
 
   // Cached capabilities (non-persisted in practice, but ok to persist for fast initial render)

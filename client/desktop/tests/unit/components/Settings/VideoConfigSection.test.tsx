@@ -142,10 +142,12 @@ const makeCodec = (
     profileLabel?: string;
     isHdr?: boolean;
     hwAvailable?: boolean;
+    swAvailable?: boolean;
   } = {}
 ) => ({
   mimeType,
   hwAvailable: 'hwAvailable' in opts ? opts.hwAvailable : hwAvailable,
+  swAvailable: 'swAvailable' in opts ? opts.swAvailable : true,
   sdpFmtpLine: opts.sdpFmtpLine || 'default',
   supported: true,
   profileId: opts.profileId ?? null,
@@ -172,6 +174,18 @@ const sampleCodecsWithHdr = [
     profileLabel: 'Profile 2',
     isHdr: true,
     sdpFmtpLine: 'profile-id=2',
+  }),
+];
+
+const av1Targets = [
+  makeCodec('video/AV1', true, {
+    profileId: 'hdr',
+    profileLabel: '10-bit HDR target',
+    isHdr: true,
+  }),
+  makeCodec('video/AV1', true, {
+    profileId: 'sdr',
+    profileLabel: '8-bit SDR target',
   }),
 ];
 
@@ -475,8 +489,10 @@ describe('VideoConfigSection', () => {
       mockVideoSettingsStore({ videoAdvancedMode: true, systemHdr: true });
       mockDraftSettings({ hdrEncoding: true });
       renderComponent();
-      expect(screen.getByText(/prefers HDR-capable codec profiles/)).toBeInTheDocument();
-      expect(screen.getByText(/does not guarantee a 10-bit or HDR stream/)).toBeInTheDocument();
+      expect(screen.getByText(/AV1 HDR is a 10-bit target/)).toBeInTheDocument();
+      expect(
+        screen.getAllByText(/active outbound WebRTC stats are authoritative/)
+      ).not.toHaveLength(0);
     });
 
     it('shows disabled message when systemHdr=true and hdrEncoding=false', () => {
@@ -632,7 +648,7 @@ describe('VideoConfigSection', () => {
     });
 
     it('shows specific codec name when preferred codec set', () => {
-      mockDraftSettings({ preferredVideoCodec: 'video/VP8' });
+      mockDraftSettings({ preferredVideoCodec: 'video/VP8', hardwareAcceleration: false });
       (getCodecInfo as ReturnType<typeof vi.fn>).mockReturnValue({
         name: 'VP8',
         quality: 'Good',
@@ -673,6 +689,21 @@ describe('VideoConfigSection', () => {
       ).toBeInTheDocument();
       expect(document.querySelector('.settings-codec-item.preferred')).toHaveTextContent('VP8');
       expect(mockSetDraftVideoSetting).not.toHaveBeenCalledWith('preferredVideoCodec', null);
+    });
+
+    it('predicts a profile-qualified VP9 floor entry in Settings', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/VP9', false, { profileId: '2', profileLabel: 'HDR', isHdr: true }),
+        ],
+      });
+      mockVoiceStore({ codecFloor: ['video/vp9:2'] });
+      mockDraftSettings({ hdrEncoding: true, hardwareAcceleration: false });
+
+      renderComponent();
+
+      expect(document.querySelector('.settings-codec-item.preferred')).toHaveTextContent('VP9');
     });
 
     it('shows preference notice when preferred codec is set', () => {
@@ -806,13 +837,17 @@ describe('VideoConfigSection', () => {
     it('shows enabled hint', () => {
       mockDraftSettings({ hardwareAcceleration: true });
       renderComponent();
-      expect(screen.getByText(/Enabled\. Your GPU handles video encoding/)).toBeInTheDocument();
+      expect(
+        screen.getByText(/Enabled\. Concord prefers eligible hardware encoders/)
+      ).toBeInTheDocument();
     });
 
     it('shows disabled hint', () => {
       mockDraftSettings({ hardwareAcceleration: false });
       renderComponent();
-      expect(screen.getByText(/Disabled\. All video encoding/)).toBeInTheDocument();
+      expect(
+        screen.getByText(/Disabled target\. Concord prefers software encoding/)
+      ).toBeInTheDocument();
     });
   });
 
@@ -1021,6 +1056,7 @@ describe('VideoConfigSection', () => {
       mockDraftSettings({
         screenShareBitrate: 0,
         preferredVideoCodec: 'video/VP8',
+        hardwareAcceleration: false,
         screenResolution: '1080p',
         screenFrameRate: 30,
       });
@@ -1075,6 +1111,7 @@ describe('VideoConfigSection', () => {
       mockDraftSettings({
         screenShareBitrate: 0,
         preferredVideoCodec: 'video/VP8',
+        hardwareAcceleration: false,
         screenResolution: '1080p',
         screenFrameRate: 30,
       });
@@ -1183,7 +1220,7 @@ describe('VideoConfigSection', () => {
       // VP8 is not hardware-available in our sample data
       mockDraftSettings({
         preferredVideoCodec: 'video/VP8',
-        hardwareAcceleration: true,
+        hardwareAcceleration: false,
       });
       renderComponent();
       const swHeader = screen.getByText('Software');
@@ -1204,25 +1241,27 @@ describe('VideoConfigSection', () => {
       expect(swHeader.className).toContain('active');
     });
 
-    it('uses learned WebRTC hardware for Preferred without erasing GPU capabilities', () => {
+    it('demotes every qualified AV1 hardware target after a live software observation', () => {
       mockVideoSettingsStore({
         videoAdvancedMode: true,
-        codecCapabilities: [
-          makeCodec('video/AV1', true),
-          makeCodec('video/H264', false, { profileId: '640034', profileLabel: 'High' }),
-        ],
-        webrtcHwByMime: { 'video/av1': false, 'video/h264': true },
+        codecCapabilities: av1Targets,
+        webrtcHwByMime: { 'video/av1': false },
       });
-      mockDraftSettings({ hardwareAcceleration: true, preferredVideoCodec: '' });
+      mockDraftSettings({
+        hardwareAcceleration: true,
+        hdrEncoding: true,
+        preferredVideoCodec: '',
+      });
 
       renderComponent();
 
       const hardwareColumn = screen.getByText('Hardware').closest('.settings-codec-column');
-      expect(hardwareColumn).toHaveClass('active');
-      expect(hardwareColumn).toHaveTextContent('AV1');
-      expect(hardwareColumn).toHaveTextContent('AVC (H.264) (High 5.2)');
-      expect(hardwareColumn?.querySelector('.settings-codec-item.preferred')).toHaveTextContent(
-        'AVC (H.264) (High 5.2)'
+      const softwareColumn = screen.getByText('Software').closest('.settings-codec-column');
+      expect(hardwareColumn).not.toHaveClass('active');
+      expect(hardwareColumn?.querySelector('.settings-codec-item.preferred')).toBeNull();
+      expect(softwareColumn).toHaveClass('active');
+      expect(softwareColumn?.querySelector('.settings-codec-item.preferred')).toHaveTextContent(
+        '10-bit HDR target'
       );
     });
   });
@@ -1240,8 +1279,8 @@ describe('VideoConfigSection', () => {
     it('renders HDR codec options when hdrEncoding is true', () => {
       mockDraftSettings({ hdrEncoding: true });
       renderComponent();
-      const hdrOption = Array.from(getCodecSelect().options).find(
-        (option) => option.value === 'video/vp9:2'
+      const hdrOption = Array.from(getCodecSelect().options).find((option) =>
+        option.value.startsWith('video/vp9:2@@')
       );
       expect(hdrOption).toBeDefined();
       expect(hdrOption).not.toBeDisabled();
@@ -1251,11 +1290,144 @@ describe('VideoConfigSection', () => {
     it('keeps the real VP9 Profile 2 value disabled when hdrEncoding is false', () => {
       mockDraftSettings({ hdrEncoding: false });
       renderComponent();
-      const hdrOption = Array.from(getCodecSelect().options).find(
-        (option) => option.value === 'video/vp9:2'
+      const hdrOption = Array.from(getCodecSelect().options).find((option) =>
+        option.value.startsWith('video/vp9:2@@')
       );
       expect(hdrOption).toBeDisabled();
       expect(hdrOption).toHaveTextContent('Requires HDR setting');
+    });
+
+    it('shows distinct hardware and software entries for both AV1 color targets', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: av1Targets,
+        systemHdr: true,
+      });
+      mockDraftSettings({ hdrEncoding: true, hardwareAcceleration: true });
+
+      renderComponent();
+
+      const labels = Array.from(getCodecSelect().options).map((option) => option.textContent);
+      expect(labels).toContain('AV1 (10-bit HDR target) — Hardware');
+      expect(labels).toContain('AV1 (10-bit HDR target) — Software');
+      expect(labels).toContain('AV1 (8-bit SDR target) — Hardware');
+      expect(labels).toContain('AV1 (8-bit SDR target) — Software');
+    });
+
+    it('omits a software selector row for an exact hardware-only H264 profile', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/H264', true, {
+            profileId: '640034',
+            profileLabel: 'High',
+            swAvailable: false,
+          }),
+          makeCodec('video/H264', false, {
+            profileId: '4d0032',
+            profileLabel: 'Main',
+            swAvailable: true,
+          }),
+        ],
+      });
+
+      renderComponent();
+
+      const values = Array.from(getCodecSelect().options).map((option) => option.value);
+      expect(values).toContain('video/h264:640034@@hardware');
+      expect(values).not.toContain('video/h264:640034@@software');
+      expect(values).toContain('video/h264:4d0032@@software');
+
+      const softwareColumn = screen.getByText('Software').closest('.settings-codec-column');
+      expect(softwareColumn).not.toHaveTextContent('High 5.2');
+      expect(softwareColumn).toHaveTextContent('Main 5.0');
+    });
+
+    it('does not manufacture AV1 HDR hardware support from bare AV1 runtime evidence', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/AV1', false, {
+            profileId: 'hdr',
+            profileLabel: '10-bit HDR target',
+            isHdr: true,
+          }),
+          makeCodec('video/AV1', true, {
+            profileId: 'sdr',
+            profileLabel: '8-bit SDR target',
+          }),
+        ],
+        webrtcHwByMime: { 'video/av1': true },
+      });
+      mockDraftSettings({ hdrEncoding: true, hardwareAcceleration: true });
+
+      renderComponent();
+
+      const labels = Array.from(getCodecSelect().options).map((option) => option.textContent);
+      expect(labels).not.toContain('AV1 (10-bit HDR target) — Hardware');
+      expect(labels).toContain('AV1 (8-bit SDR target) — Hardware');
+    });
+
+    it('does not let bare AV1 software evidence suppress an affirmative HDR probe', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/AV1', true, {
+            profileId: 'hdr',
+            profileLabel: '10-bit HDR target',
+            isHdr: true,
+          }),
+          makeCodec('video/AV1', false, {
+            profileId: 'sdr',
+            profileLabel: '8-bit SDR target',
+          }),
+        ],
+        webrtcHwByMime: { 'video/av1': false },
+      });
+      mockDraftSettings({ hdrEncoding: true, hardwareAcceleration: true });
+
+      renderComponent();
+
+      const labels = Array.from(getCodecSelect().options).map((option) => option.textContent);
+      expect(labels).toContain('AV1 (10-bit HDR target) — Hardware');
+      expect(labels).not.toContain('AV1 (8-bit SDR target) — Hardware');
+    });
+
+    it('uses any affirmative H264 level probe within the canonical profile', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: [
+          makeCodec('video/H264', false, {
+            profileId: '64001f',
+            profileLabel: 'High 3.1',
+          }),
+          makeCodec('video/H264', true, {
+            profileId: '640034',
+            profileLabel: 'High 5.2',
+          }),
+        ],
+      });
+
+      renderComponent();
+
+      const labels = Array.from(getCodecSelect().options).map((option) => option.textContent);
+      expect(labels).toContain('H.264 (High 5.2 — Best H.264 quality) — Hardware');
+    });
+
+    it('describes AV1 HDR as a target and names outbound stats as authoritative', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: av1Targets,
+        systemHdr: true,
+      });
+      mockDraftSettings({ hdrEncoding: true, hardwareAcceleration: true });
+
+      renderComponent();
+
+      expect(screen.getByText(/AV1 HDR is a 10-bit target/)).toBeInTheDocument();
+      expect(
+        screen.getAllByText(/active outbound WebRTC stats are authoritative/)
+      ).not.toHaveLength(0);
     });
   });
 
@@ -1369,8 +1541,51 @@ describe('VideoConfigSection', () => {
         return Array.from(opts).some((o) => o.value === '' && o.textContent === 'Auto');
       });
       expect(codecSelect).toBeTruthy();
-      fireEvent.change(codecSelect!, { target: { value: 'video/vp8' } });
+      const vp8Software = Array.from((codecSelect as HTMLSelectElement).options).find(
+        (option) => option.textContent === 'VP8 — Software'
+      );
+      expect(vp8Software).toBeDefined();
+      fireEvent.change(codecSelect!, { target: { value: vp8Software!.value } });
       expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('preferredVideoCodec', 'video/vp8');
+      expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('hardwareAcceleration', false);
+    });
+
+    it('stages software and preserves the AV1 HDR target when its Software entry is chosen', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: av1Targets,
+      });
+      mockDraftSettings({ hdrEncoding: true, hardwareAcceleration: true });
+      renderComponent();
+      const codecSelect = getCodecSelect();
+      const software = Array.from(codecSelect.options).find(
+        (option) => option.textContent === 'AV1 (10-bit HDR target) — Software'
+      );
+      expect(software).toBeDefined();
+
+      fireEvent.change(codecSelect, { target: { value: software!.value } });
+
+      expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('preferredVideoCodec', 'video/av1:hdr');
+      expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('hardwareAcceleration', false);
+    });
+
+    it('stages hardware when a Hardware entry is chosen', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        codecCapabilities: av1Targets,
+      });
+      mockDraftSettings({ hdrEncoding: true, hardwareAcceleration: false });
+      renderComponent();
+      const codecSelect = getCodecSelect();
+      const hardware = Array.from(codecSelect.options).find(
+        (option) => option.textContent === 'AV1 (10-bit HDR target) — Hardware'
+      );
+      expect(hardware).toBeDefined();
+
+      fireEvent.change(codecSelect, { target: { value: hardware!.value } });
+
+      expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('preferredVideoCodec', 'video/av1:hdr');
+      expect(mockSetDraftVideoSetting).toHaveBeenCalledWith('hardwareAcceleration', true);
     });
 
     it('calls setDraftVideoSetting with null for preferredVideoCodec (Auto)', () => {
@@ -1439,10 +1654,11 @@ describe('VideoConfigSection', () => {
         videoAdvancedMode: true,
         codecCapabilities: sampleCodecs,
       });
-      // AV1 is first supported HW codec (highest priority), so it's preferred
-      // Make it also in-use
-      mockVoiceStore({ activeCameraCodec: 'video/av1' });
-      mockDraftSettings({ hardwareAcceleration: true });
+      mockVoiceStore({ activeCameraCodec: 'video/vp9:0' });
+      mockDraftSettings({
+        preferredVideoCodec: 'video/VP9:0',
+        hardwareAcceleration: true,
+      });
       renderComponent();
       const items = document.querySelectorAll('.settings-codec-item');
       const tooltips = Array.from(items).map((el) => el.getAttribute('data-tooltip'));
@@ -1463,7 +1679,38 @@ describe('VideoConfigSection', () => {
       expect(tooltips).toContain('Camera In Use');
     });
 
-    it('keeps In Use on the applied hardware path while the restart-only draft is off (#2242)', () => {
+    it('keeps a bare runtime AV1 target unknown when the draft selects HDR', () => {
+      mockVideoSettingsStore({
+        videoAdvancedMode: true,
+        hardwareAcceleration: false,
+        codecCapabilities: [
+          makeCodec('video/AV1', false, {
+            profileId: 'hdr',
+            profileLabel: '10-bit HDR target',
+          }),
+          makeCodec('video/AV1', false, {
+            profileId: 'sdr',
+            profileLabel: '8-bit SDR target',
+          }),
+        ],
+      });
+      mockDraftSettings({
+        preferredVideoCodec: 'video/AV1:hdr',
+        hardwareAcceleration: false,
+        hdrEncoding: true,
+      });
+      mockVoiceStore({ activeCameraCodec: 'video/av1' });
+
+      renderComponent();
+
+      const inUse = Array.from(document.querySelectorAll('.settings-codec-item.in-use'));
+      expect(inUse).toHaveLength(0);
+      expect(document.querySelector('.settings-codec-active-unknown')).toHaveTextContent(
+        'Camera in use: AV1 bit depth and HDR target unknown'
+      );
+    });
+
+    it('does not invent an AV1 target from a restart-only draft backend (#2242)', () => {
       mockVideoSettingsStore({
         videoAdvancedMode: true,
         hardwareAcceleration: true,
@@ -1475,9 +1722,9 @@ describe('VideoConfigSection', () => {
 
       renderComponent();
 
-      const hardwareColumn = screen.getByText('Hardware').closest('.settings-codec-column');
-      expect(hardwareColumn?.querySelector('.settings-codec-item.in-use')).toHaveTextContent(
-        'Camera In Use'
+      expect(document.querySelectorAll('.settings-codec-item.in-use')).toHaveLength(0);
+      expect(document.querySelector('.settings-codec-active-unknown')).toHaveTextContent(
+        'Camera in use: AV1 bit depth and HDR target unknown'
       );
     });
 
@@ -1609,7 +1856,7 @@ describe('VideoConfigSection', () => {
       renderComponent();
 
       const optionValues = Array.from(getCodecSelect().options).map((option) => option.value);
-      expect(optionValues).toContain('video/h264:640034');
+      expect(optionValues.some((value) => value.startsWith('video/h264:640034@@'))).toBe(true);
       expect(optionValues).not.toContain('video/H264:64001f');
       expect(document.querySelector('.settings-codec-item.preferred')).toHaveTextContent(
         'AVC (H.264) (High 3.1)'
@@ -1634,9 +1881,11 @@ describe('VideoConfigSection', () => {
           'video/h264:4d0032'
         );
       });
-      expect(Array.from(getCodecSelect().options).map((option) => option.value)).toContain(
-        'video/h264:4d0032'
-      );
+      expect(
+        Array.from(getCodecSelect().options).some((option) =>
+          option.value.startsWith('video/h264:4d0032@@')
+        )
+      ).toBe(true);
     });
 
     it('migrates a legacy family-only H264 preference to the best available profile', async () => {
@@ -1732,7 +1981,7 @@ describe('VideoConfigSection', () => {
       const optionValues = Array.from(codecSelect?.querySelectorAll('option') ?? []).map(
         (option) => option.value
       );
-      expect(optionValues).toContain('video/h264:640034');
+      expect(optionValues.some((value) => value.startsWith('video/h264:640034@@'))).toBe(true);
       expect(optionValues).not.toContain('video/h264:42001f');
       expect(optionValues).not.toContain('video/h264:f4000a');
     });

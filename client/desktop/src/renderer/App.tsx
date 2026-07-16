@@ -220,11 +220,6 @@ function AuthenticatedLayout() {
         systemHdr,
         ...(hwAccel == null ? {} : { hardwareAcceleration: hwAccel }),
       });
-
-      // Auto-enable HDR encoding on first detection if user hasn't explicitly toggled it
-      if (systemHdr && !current.hdrEncoding) {
-        useVideoSettingsStore.getState().setHdrEncoding(true);
-      }
     });
   }, []);
 

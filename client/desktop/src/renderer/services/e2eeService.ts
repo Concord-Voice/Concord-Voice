@@ -54,7 +54,7 @@ interface CachedWrappedKey {
   refetchAfterMalformed: number;
 }
 
-interface ChannelKeyMaterial {
+export interface ChannelKeyMaterial {
   channelKey: CryptoKey;
   keyVersion: number;
 }
@@ -472,7 +472,7 @@ class E2EEService {
    * The wrapped key and version are captured before any await so cache rotation
    * cannot pair key material from one epoch with metadata from another.
    */
-  private async getChannelKeyMaterial(channelId: string): Promise<ChannelKeyMaterial> {
+  async getChannelKeyMaterial(channelId: string): Promise<ChannelKeyMaterial> {
     if (!channelId) {
       throw new E2EEKeyUnavailableError('INVALID_REQUEST', false);
     }
@@ -824,13 +824,25 @@ class E2EEService {
   /**
    * #1878: the authoritative channel-key version currently cached for a channel,
    * or 0 when no key is cached yet. Used by voiceService to bind the media
-   * encrypt key's version at E2EE init (the value stamped into the v3 frame
+   * encrypt key's version at E2EE init (the value stamped into the versioned frame
    * trailer). Distinct from `getCurrentKeyVersion` (defaults to 1) — here the
    * floor is 0 so an unbound channel maps to the "no version known yet" value
    * rather than silently claiming v1.
    */
   getChannelKeyVersion(channelId: string): number {
     return this.channelKeyCache.get(channelId)?.keyVersion ?? 0;
+  }
+
+  /**
+   * Highest channel-key version observed through either the current-key or a
+   * by-version fetch. This intentionally differs from getChannelKeyVersion():
+   * the current-key cache can still hold vN after a decrypt-side history fetch
+   * has confirmed vN+1. Media initialization reads this after subscribing so it
+   * can reconcile an edge-triggered rotation that happened before its live
+   * sender subscription was committed.
+   */
+  getHighestSeenKeyVersion(channelId: string): number {
+    return this.highestSeenVersion.get(channelId) ?? 0;
   }
 
   /**

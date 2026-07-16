@@ -51,6 +51,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn().mockResolvedValue(null),
+    getChannelKeyMaterial: vi.fn().mockResolvedValue({ channelKey: null, keyVersion: 0 }),
     invalidateChannelKey: vi.fn(),
     // #1878: version binding + sender re-base surface.
     getChannelKeyVersion: vi.fn().mockReturnValue(0),
@@ -61,10 +62,10 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 
 // --- mediaEncryption ---
 vi.mock('@/renderer/services/mediaEncryption', () => ({
-  // #1878 Task 6: the client negotiates v3. Mirror the live constant so the mock
+  // Mirror the live media-frame crypto version so the mock
   // doesn't drift from production (these suites don't drive the join handshake,
   // but keeping the value accurate avoids a misleading pin).
-  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 3,
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
   MediaEncryption: class MockMediaEncryption {
     init = vi.fn().mockResolvedValue(undefined);
     initFromKey = vi.fn();
@@ -177,6 +178,7 @@ Object.defineProperty(globalThis, 'MediaStream', {
 });
 
 function MockRTCRtpSender() {}
+Object.defineProperty(MockRTCRtpSender.prototype, 'createEncodedStreams', { value: vi.fn() });
 Object.defineProperty(globalThis, 'RTCRtpSender', {
   value: MockRTCRtpSender,
   writable: true,

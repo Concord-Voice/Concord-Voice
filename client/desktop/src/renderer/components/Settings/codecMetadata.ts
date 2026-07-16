@@ -101,6 +101,21 @@ export interface CodecProfileGuideRow {
 /** Shared menu labels and guide copy for every selectable codec/profile. */
 export const CODEC_PROFILE_GUIDE: readonly CodecProfileGuideRow[] = [
   {
+    key: 'video/av1:hdr',
+    label: 'AV1 (10-bit HDR target)',
+    standard: 'AV1 Main profile (profile 0), 10-bit application target',
+    signal: 'WebCodecs probe av01.0.05M.10',
+    meaning:
+      'Targets 10-bit HDR-capable encoding. WebRTC does not expose definitive encoded AV1 bit depth.',
+  },
+  {
+    key: 'video/av1:sdr',
+    label: 'AV1 (8-bit SDR target)',
+    standard: 'AV1 Main profile (profile 0), 8-bit application target',
+    signal: 'WebCodecs probe av01.0.05M.08',
+    meaning: 'Targets 8-bit SDR encoding.',
+  },
+  {
     key: 'video/av1',
     label: 'AV1',
     standard: 'AV1 Main profile (profile 0)',
@@ -155,7 +170,12 @@ export const CODEC_PROFILE_GUIDE: readonly CodecProfileGuideRow[] = [
 export function codecProfileMenuLabel(mimeType: string, profileId: string | null): string {
   const mime = mimeType.toLowerCase();
   const normalizedProfile = profileId?.toLowerCase() ?? (mime === 'video/vp9' ? '0' : null);
+  const appTargetKey =
+    mime === 'video/av1' && (normalizedProfile === 'hdr' || normalizedProfile === 'sdr')
+      ? `${mime}:${normalizedProfile}`
+      : null;
   const key =
+    appTargetKey ??
     canonicalRouterCodecKey(mimeType, profileId) ??
     (normalizedProfile ? `${mime}:${normalizedProfile}` : mime);
   const row = CODEC_PROFILE_GUIDE.find((candidate) => candidate.key === key);

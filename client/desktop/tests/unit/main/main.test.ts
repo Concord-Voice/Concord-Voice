@@ -345,7 +345,7 @@ describe('main.ts', () => {
       const { app } = await import('electron');
       expect(app.commandLine.appendSwitch).toHaveBeenCalledWith(
         'enable-features',
-        'AcceleratedVideoEncoder,AcceleratedVideoDecodeLinuxGL'
+        'AcceleratedVideoEncoder,AcceleratedVideoDecodeLinuxGL,WebRtcAV1HWEncode'
       );
     });
 

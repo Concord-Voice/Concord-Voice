@@ -71,6 +71,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn().mockResolvedValue(null),
+    getChannelKeyMaterial: vi.fn().mockResolvedValue({ channelKey: null, keyVersion: 0 }),
     invalidateChannelKey: vi.fn(),
     getChannelKeyVersion: vi.fn().mockReturnValue(0),
     getChannelKeyByVersion: vi.fn().mockResolvedValue(null),
@@ -79,7 +80,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 }));
 
 vi.mock('@/renderer/services/mediaEncryption', () => ({
-  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 3,
+  MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
   MediaEncryption: class MockMediaEncryption {
     init = vi.fn().mockResolvedValue(undefined);
     destroy = vi.fn();
@@ -124,6 +125,7 @@ Object.defineProperty(globalThis, 'MediaStream', {
   configurable: true,
 });
 function MockRTCRtpSender() {}
+Object.defineProperty(MockRTCRtpSender.prototype, 'createEncodedStreams', { value: vi.fn() });
 Object.defineProperty(globalThis, 'RTCRtpSender', {
   value: MockRTCRtpSender,
   writable: true,
@@ -155,6 +157,10 @@ let nextProducerId = 0;
 // Toggled by the fail-closed test to make the NEXT produced producer lack rtpSender.
 let produceWithRtpSender = true;
 let produceWithRtpParameters = true;
+let requirePrePublishTransform = false;
+let pendingSenderSupportsTransform = true;
+let prePublishTransformSources: string[] = [];
+let publishedSources: string[] = [];
 let negotiatedVideoCodec: { mimeType: string; sdpFmtpLine?: string } = {
   mimeType: 'video/VP8',
 };
@@ -254,10 +260,33 @@ function makeSendTransport(): any {
       if (o?.track && o.track.readyState === 'ended') {
         throw new Error('track ended');
       }
+      const source = o?.appData?.source ?? 'unknown';
+      if (requirePrePublishTransform) {
+        if (typeof o?.onRtpSender !== 'function') {
+          throw new Error(`plaintext publication attempted for ${source}`);
+        }
+        const createEncodedStreams = pendingSenderSupportsTransform
+          ? vi.fn(() => ({
+              readable: new ReadableStream({
+                start(controller) {
+                  controller.close();
+                },
+              }),
+              writable: new WritableStream(),
+            }))
+          : undefined;
+        const sender = { createEncodedStreams, replaceTrack: vi.fn().mockResolvedValue(undefined) };
+        o.onRtpSender(sender);
+        if (!createEncodedStreams?.mock.calls.length) {
+          throw new Error(`sender transform missing before publication for ${source}`);
+        }
+        prePublishTransformSources.push(source);
+      }
+      publishedSources.push(source);
       return makeMockProducer({
         track: o?.track,
         stopTracks: o?.stopTracks,
-        source: o?.appData?.source ?? 'unknown',
+        source,
         withRtpSender: produceWithRtpSender,
       });
     }),
@@ -324,8 +353,73 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     nextProducerId = 0;
     produceWithRtpSender = true;
     produceWithRtpParameters = true;
+    requirePrePublishTransform = false;
+    pendingSenderSupportsTransform = true;
+    prePublishTransformSources = [];
+    publishedSources = [];
     negotiatedVideoCodec = { mimeType: 'video/VP8' };
     senderVideoCodec = null;
+  });
+
+  it('installs E2EE before all seven audio/video producer publication paths', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    requirePrePublishTransform = true;
+    svc.mediaEncryption = { encryptFrame: vi.fn().mockResolvedValue(undefined) };
+    svc.startPacketLossMonitor = vi.fn();
+    svc.startLocalVAD = vi.fn();
+    svc.applyNoiseGate = vi.fn((stream: MockMediaStream) => stream.getAudioTracks()[0]);
+    svc.applyInputVolume = vi.fn((track: unknown) => track);
+
+    const cameraTrack = makeVideoTrack('pre-publish-camera');
+    svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([cameraTrack]));
+    await svc.produceVideo();
+    await svc.fastReproduceCamera();
+
+    const screenTrack = makeVideoTrack('pre-publish-screen');
+    const screenAudioTrack = makeAudioTrack('pre-publish-screen-audio');
+    svc.captureScreen = vi
+      .fn()
+      .mockResolvedValue(new MockMediaStream([screenTrack, screenAudioTrack]));
+    await svc.produceScreen('window:pre-publish:0');
+    await svc.fastReproduceScreen();
+
+    const micTrack = makeAudioTrack('pre-publish-mic');
+    const micStream = new MockMediaStream([micTrack]);
+    svc.resolveAudioStream = vi.fn().mockResolvedValue(micStream);
+    await svc.produceAudio(undefined, micStream);
+
+    const expectedSources = [
+      'camera',
+      'camera',
+      'screen',
+      'screen-audio',
+      'screen',
+      'screen-audio',
+      'mic',
+    ];
+    expect(prePublishTransformSources).toEqual(expectedSources);
+    expect(publishedSources).toEqual(expectedSources);
+  });
+
+  it('fails closed before publication when the sender transform cannot attach', async () => {
+    const svc = voiceService as any;
+    resetService(svc);
+    requirePrePublishTransform = true;
+    pendingSenderSupportsTransform = false;
+    svc.mediaEncryption = { encryptFrame: vi.fn().mockResolvedValue(undefined) };
+    svc.applyInputVolume = vi.fn((track: unknown) => track);
+
+    const micTrack = makeAudioTrack('fail-closed-pre-publish-mic');
+    const micStream = new MockMediaStream([micTrack]);
+    svc.resolveAudioStream = vi.fn().mockResolvedValue(micStream);
+
+    await expect(svc.produceAudio(undefined, micStream)).rejects.toThrow(/encrypt transform/);
+    expect(publishedSources).toEqual([]);
+    expect(micTrack.readyState).toBe('ended');
+    expect(svc.localMicStream).toBeNull();
+    expect(svc.producers.has('mic')).toBe(false);
+    expect(svc.sendTransport.close).toHaveBeenCalledOnce();
   });
 
   it('records the exact negotiated H264 profile for camera produce and re-produce (#2242)', async () => {
@@ -753,14 +847,9 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     expect(after.dominantScreenShareId).toBe(reproduced.id);
   });
 
-  // failClosedEncryptTransform must stop the OWNING capture stream itself, since
-  // (with stopTracks:false) producer.close() no longer stops the track — otherwise
-  // an E2EE encrypt-transform failure leaks the camera/mic capture light (CWE-212).
-  // Parametrized over every source so each branch of the source→cleanup dispatch
-  // (camera/mic/screen/screen-audio) is exercised. A producer with no rtpSender
-  // deterministically forces failClosedEncryptTransform('no rtpSender'); close()
-  // here mirrors a stopTracks:false producer (does NOT stop the track), so only the
-  // companion fix can stop the capture stream.
+  // A pre-publication transform failure has no Producer to close. It must still
+  // stop the owning capture stream so camera/mic hardware is never left active.
+  // Parametrize every source through the source→cleanup dispatch.
   const failClosedCases = [
     { source: 'camera', kind: 'video', field: 'localCameraStream' },
     { source: 'mic', kind: 'audio', field: 'localMicStream' },
@@ -778,14 +867,7 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
         kind === 'video' ? makeVideoTrack(`${source}-track`) : makeAudioTrack(`${source}-track`);
       svc[field] = new MockMediaStream([track]);
 
-      const producer = makeMockProducer({
-        track,
-        stopTracks: false,
-        source,
-        withRtpSender: false,
-      });
-
-      expect(() => svc.applyEncryptTransform(producer)).toThrow(/encrypt transform/);
+      expect(() => svc.applyEncryptTransform({}, undefined, source)).toThrow(/encrypt transform/);
 
       expect(track.readyState, `${source} capture must be stopped on fail-closed`).toBe('ended');
       expect(svc[field], `${field} must be released on fail-closed`).toBeNull();
@@ -814,15 +896,8 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     // Force the awaited drain to reject so cleanupScreenState() rejects.
     svc.drainSendTransportQueue = vi.fn().mockRejectedValue(new Error('drain failed'));
 
-    const producer = makeMockProducer({
-      track: screenTrack,
-      stopTracks: false,
-      source: 'screen',
-      withRtpSender: false,
-    });
-
     // failClosed throws synchronously; the floated .catch() fires on a later microtask.
-    expect(() => svc.applyEncryptTransform(producer)).toThrow(/encrypt transform/);
+    expect(() => svc.applyEncryptTransform({}, undefined, 'screen')).toThrow(/encrypt transform/);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(errSpy).toHaveBeenCalledWith(
@@ -943,14 +1018,7 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     reproSpy.mockRestore();
     expect(svc.localScreenStream, 'capture stream survives the reproduce').not.toBeNull();
 
-    // A producer with no rtpSender forces failClosedEncryptTransform('no rtpSender').
-    const failing = makeMockProducer({
-      track: screenTrack,
-      stopTracks: false,
-      source: 'screen',
-      withRtpSender: false,
-    });
-    expect(() => svc.applyEncryptTransform(failing)).toThrow(/encrypt transform/);
+    expect(() => svc.applyEncryptTransform({}, undefined, 'screen')).toThrow(/encrypt transform/);
     expect(screenTrack.readyState, 'screen capture must be stopped on fail-closed').toBe('ended');
     expect(svc.localScreenStream, 'localScreenStream released on fail-closed').toBeNull();
   });

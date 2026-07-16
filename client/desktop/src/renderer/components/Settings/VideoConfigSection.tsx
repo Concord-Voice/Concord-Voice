@@ -7,13 +7,14 @@ import {
   type DegradationPreference,
   type VideoPriority,
 } from '../../stores/videoSettingsStore';
+import { codecKey, getCodecInfo, type CodecCapability } from '../../services/mediaCapabilities';
 import {
-  codecKey,
-  codecKeyMime,
-  getCodecInfo,
-  type CodecCapability,
-} from '../../services/mediaCapabilities';
-import { codecPriority, selectCodecFromCascade } from '../../services/voiceCodecSelection';
+  buildCodecCandidates,
+  codecPriority,
+  isCodecKeyInFloor,
+  selectCodecCandidate,
+  type SelectedCodecCandidate,
+} from '../../services/voiceCodecSelection';
 import {
   humanizeProfileLabel,
   getCodecMetadata,
@@ -233,6 +234,15 @@ function canonicalRequestedCodecKey(
   hdrEncoding = false
 ): string | null {
   const [mime, requestedProfile] = key.toLowerCase().split(':');
+  if (mime === 'video/av1') {
+    let target: 'hdr' | 'sdr';
+    if (requestedProfile === 'hdr' || requestedProfile === 'sdr') {
+      target = requestedProfile;
+    } else {
+      target = hdrEncoding ? 'hdr' : 'sdr';
+    }
+    return `${mime}:${target}`;
+  }
   // Migrate legacy family-only H.264 preferences to the best locally available
   // router-supported profile. Keep High as the pre-detection fallback.
   if (mime === 'video/h264' && requestedProfile === undefined) {
@@ -245,12 +255,26 @@ function canonicalRequestedCodecKey(
   return canonicalRouterCodecKey(mime, requestedProfile);
 }
 
+function capabilityTargetKey(capability: CodecCapability): string | null {
+  const mime = capability.mimeType.toLowerCase();
+  const profile = capability.profileId?.toLowerCase();
+  if (mime === 'video/av1' && (profile === 'hdr' || profile === 'sdr')) {
+    return `${mime}:${profile}`;
+  }
+  if (mime === 'video/av1' && profile == null) return 'video/av1:sdr';
+  return canonicalRouterCodecKey(capability.mimeType, capability.profileId);
+}
+
 function capabilityMatchesKey(capability: CodecCapability, key: string): boolean {
-  const requestedKey = canonicalRequestedCodecKey(key);
-  return (
-    requestedKey !== null &&
-    canonicalRouterCodecKey(capability.mimeType, capability.profileId) === requestedKey
-  );
+  const requestedKey = canonicalRequestedCodecKey(key, [], key.toLowerCase().endsWith(':hdr'));
+  if (
+    requestedKey === 'video/av1:sdr' &&
+    capability.mimeType.toLowerCase() === 'video/av1' &&
+    capability.profileId == null
+  ) {
+    return true;
+  }
+  return requestedKey !== null && capabilityTargetKey(capability) === requestedKey;
 }
 
 function isCapabilityHardware(
@@ -261,16 +285,15 @@ function isCapabilityHardware(
   return webrtcHwByMime[mime] ?? capability.hwAvailable === true;
 }
 
-/** Hardware-column membership answers whether the machine can hardware encode.
- * A learned positive WebRTC signal can add a missed capability, while a learned
- * software path must not erase a positive WebCodecs hardware capability. */
-function isHardwareEncodingAvailable(
-  capability: CodecCapability,
-  webrtcHwByMime: Record<string, boolean>
-): boolean {
-  return (
-    capability.hwAvailable === true || webrtcHwByMime[capability.mimeType.toLowerCase()] === true
-  );
+/** Target/profile eligibility requires an affirmative probe for that exact
+ * capability. MIME-wide live stats describe an active producer, not every
+ * profile or AV1 bit-depth target in the selector. */
+function hasAffirmativeHardwareProbe(capability: CodecCapability): boolean {
+  return capability.hwAvailable === true;
+}
+
+function hasAffirmativeSoftwareProbe(capability: CodecCapability): boolean {
+  return capability.swAvailable === true;
 }
 
 function resolveCodecTarget(args: {
@@ -280,35 +303,35 @@ function resolveCodecTarget(args: {
   hdrEncoding: boolean;
   codecFloor: string[] | null;
   webrtcHwByMime: Record<string, boolean>;
-}): CodecCapability | undefined {
+}): SelectedCodecCandidate<CodecCapability> | undefined {
   const supported = args.capabilities.filter((capability) =>
     isRouterSupportedCodecProfile(capability.mimeType, capability.profileId)
   );
   const matching = (key: string) =>
     supported.filter((capability) => capabilityMatchesKey(capability, key));
+  const hasUsableHardwareTarget = (capability: CodecCapability) =>
+    args.webrtcHwByMime[capability.mimeType.toLowerCase()] !== false &&
+    hasAffirmativeHardwareProbe(capability);
   const find = (key: string) => {
     const candidates = matching(key);
     if (args.hardwareAcceleration) {
       return (
-        candidates.find((capability) => isCapabilityHardware(capability, args.webrtcHwByMime)) ??
-        candidates[0]
+        candidates.find(hasUsableHardwareTarget) ?? candidates.find(hasAffirmativeSoftwareProbe)
       );
     }
-    return candidates[0];
+    return candidates.find(hasAffirmativeSoftwareProbe);
   };
   const canonicalPreferred = args.preferred
     ? canonicalRequestedCodecKey(args.preferred, args.capabilities, args.hdrEncoding)
     : null;
   const preferred = canonicalPreferred && find(canonicalPreferred) ? canonicalPreferred : null;
 
-  return selectCodecFromCascade<CodecCapability>({
+  return selectCodecCandidate<CodecCapability>({
     preferred,
     hwAccel: args.hardwareAcceleration,
     hdrEncoding: args.hdrEncoding,
-    isInCodecFloor: (key) =>
-      !args.codecFloor || args.codecFloor.includes(codecKeyMime(key).toLowerCase()),
-    isHwAccelerated: (key) =>
-      matching(key).some((capability) => isCapabilityHardware(capability, args.webrtcHwByMime)),
+    isInCodecFloor: (key) => isCodecKeyInFloor(key, args.codecFloor),
+    isHwAccelerated: (key) => matching(key).some(hasUsableHardwareTarget),
     findSendCodec: find,
   });
 }
@@ -316,6 +339,12 @@ function resolveCodecTarget(args: {
 function activeCodecMatches(capability: CodecCapability, activeKey: string | null): boolean {
   if (!activeKey) return false;
   const normalized = activeKey.toLowerCase();
+
+  // WebRTC reports AV1 as a base RTP codec and does not expose the negotiated
+  // bit depth. Keep the target unknown until producer-time target identity is
+  // tracked explicitly; drafts must never move an active marker between rows.
+  if (normalized === 'video/av1') return false;
+
   if (normalized === codecKey(capability).toLowerCase()) return true;
 
   // A family-only H.264 runtime key cannot truthfully identify a profile.
@@ -375,6 +404,13 @@ function unknownH264ProfileMessage(cameraUnknown: boolean, screenUnknown: boolea
   if (cameraUnknown && screenUnknown) return 'Camera and Screen in use: H.264 profile unknown.';
   if (cameraUnknown) return 'Camera in use: H.264 profile unknown.';
   return 'Screen in use: H.264 profile unknown.';
+}
+
+function unknownAv1TargetMessage(cameraUnknown: boolean, screenUnknown: boolean): string {
+  if (cameraUnknown && screenUnknown)
+    return 'Camera and Screen in use: AV1 bit depth and HDR target unknown.';
+  if (cameraUnknown) return 'Camera in use: AV1 bit depth and HDR target unknown.';
+  return 'Screen in use: AV1 bit depth and HDR target unknown.';
 }
 
 function codecStatuses(args: {
@@ -448,9 +484,7 @@ const CodecGridItem: React.FC<CodecGridItemProps> = ({
 }) => {
   const supported = isRouterSupportedCodecProfile(capability.mimeType, capability.profileId);
   const isPreferred =
-    isActiveColumn &&
-    supported &&
-    canonicalRouterCodecKey(capability.mimeType, capability.profileId) === preferredKey;
+    isActiveColumn && supported && capabilityTargetKey(capability) === preferredKey;
   const observedColumn: CodecColumnKey =
     appliedHardwareAcceleration && isCapabilityHardware(capability, webrtcHwByMime) ? 'hw' : 'sw';
   const cameraInUse = codecIsInUse({
@@ -516,6 +550,46 @@ interface SelectOption {
   label: string;
   group?: string;
   disabled?: boolean;
+}
+
+const CODEC_BACKEND_SEPARATOR = '@@';
+
+function codecSelectorValue(key: string, backend: 'hardware' | 'software'): string {
+  return `${key.toLowerCase()}${CODEC_BACKEND_SEPARATOR}${backend}`;
+}
+
+function buildCodecSelectorOptions(
+  capabilities: CodecCapability[],
+  hdrEncoding: boolean
+): SelectOption[] {
+  const supported = capabilities.filter((capability) =>
+    isRouterSupportedCodecProfile(capability.mimeType, capability.profileId)
+  );
+  const active = buildCodecCandidates(hdrEncoding, true);
+  const disabledHdr = hdrEncoding
+    ? []
+    : buildCodecCandidates(true, true).filter((candidate) => candidate.colorTarget === 'hdr');
+  const seen = new Set<string>();
+  const options: SelectOption[] = [];
+
+  for (const candidate of [...active, ...disabledHdr]) {
+    const matches = supported.filter((item) => capabilityMatchesKey(item, candidate.key));
+    const capability = matches.find(
+      candidate.backend === 'hardware' ? hasAffirmativeHardwareProbe : hasAffirmativeSoftwareProbe
+    );
+    if (!capability) continue;
+    const value = codecSelectorValue(candidate.key, candidate.backend);
+    if (seen.has(value)) continue;
+    seen.add(value);
+    const requiresHdr = candidate.colorTarget === 'hdr' && !hdrEncoding;
+    options.push({
+      value,
+      label: `${codecProfileMenuLabel(capability.mimeType, capability.profileId)} — ${candidate.backend === 'hardware' ? 'Hardware' : 'Software'}${requiresHdr ? ' — Requires HDR setting' : ''}`,
+      disabled: requiresHdr,
+    });
+  }
+
+  return options;
 }
 
 /** Build the camera-preset select options, marking premium presets (above the
@@ -712,7 +786,7 @@ const VideoConfigSection: React.FC = () => {
   const [codecProfilesOpen, setCodecProfilesOpen] = useState(false);
   const screenFpsGate = useGateActivation('video-quality');
 
-  const targetCodec = useMemo(
+  const targetSelection = useMemo(
     () =>
       resolveCodecTarget({
         capabilities: codecCapabilities,
@@ -731,13 +805,9 @@ const VideoConfigSection: React.FC = () => {
       webrtcHwByMime,
     ]
   );
-  const targetCodecKey = targetCodec
-    ? canonicalRouterCodecKey(targetCodec.mimeType, targetCodec.profileId)
-    : null;
-  const targetUsesHardware =
-    targetCodec !== undefined &&
-    hardwareAcceleration &&
-    isCapabilityHardware(targetCodec, webrtcHwByMime ?? {});
+  const targetCodec = targetSelection?.codec;
+  const targetCodecKey = targetSelection?.candidate.key.toLowerCase() ?? null;
+  const targetUsesHardware = targetSelection?.candidate.backend === 'hardware';
 
   useEffect(() => {
     if (!preferredVideoCodec || codecCapabilities.length === 0) return;
@@ -1262,7 +1332,7 @@ const VideoConfigSection: React.FC = () => {
                 const out: CodecCapability[] = [];
                 for (const c of list) {
                   const key =
-                    canonicalRouterCodecKey(c.mimeType, c.profileId) ??
+                    capabilityTargetKey(c) ??
                     `${c.mimeType.toLowerCase()}|${humanProfile(c) ?? ''}`;
                   if (seen.has(key)) continue;
                   seen.add(key);
@@ -1271,14 +1341,13 @@ const VideoConfigSection: React.FC = () => {
                 return out;
               };
 
-              // HW column: codecs with confirmed GPU acceleration
-              // SW column: ALL codecs (every codec has a software encoder fallback)
+              // Backend columns contain only exact affirmative WebCodecs probes.
               const hwCodecs = dedupe(
-                codecCapabilities
-                  .filter((c) => isHardwareEncodingAvailable(c, webrtcHwByMime ?? {}))
-                  .sort(sortByPriority)
+                codecCapabilities.filter(hasAffirmativeHardwareProbe).sort(sortByPriority)
               );
-              const swCodecs = dedupe([...codecCapabilities].sort(sortByPriority));
+              const swCodecs = dedupe(
+                codecCapabilities.filter(hasAffirmativeSoftwareProbe).sort(sortByPriority)
+              );
               // We have a definite HW verdict for at least one codec (WebCodecs probe
               // returned true/false rather than undefined). Drives the "no supported HW
               // codecs" fallback notice below.
@@ -1293,6 +1362,8 @@ const VideoConfigSection: React.FC = () => {
               const preferredKey = targetCodecKey?.toLowerCase() ?? null;
               const cameraProfileUnknown = activeCameraCodec?.toLowerCase() === 'video/h264';
               const screenProfileUnknown = activeScreenCodec?.toLowerCase() === 'video/h264';
+              const cameraAv1Unknown = activeCameraCodec?.toLowerCase() === 'video/av1';
+              const screenAv1Unknown = activeScreenCodec?.toLowerCase() === 'video/av1';
 
               return (
                 <>
@@ -1358,6 +1429,11 @@ const VideoConfigSection: React.FC = () => {
                       {unknownH264ProfileMessage(cameraProfileUnknown, screenProfileUnknown)}
                     </output>
                   )}
+                  {(cameraAv1Unknown || screenAv1Unknown) && (
+                    <output className="settings-codec-active-unknown">
+                      {unknownAv1TargetMessage(cameraAv1Unknown, screenAv1Unknown)}
+                    </output>
+                  )}
                   {hardwareAcceleration && systemProfilesPopulated && !hwHasSupported && (
                     <div className="settings-hw-fallback-notice">
                       Hardware acceleration is enabled, but none of your GPU&apos;s codecs are
@@ -1376,7 +1452,7 @@ const VideoConfigSection: React.FC = () => {
                   if (!systemHdr)
                     return 'No HDR display detected. Connect an HDR-capable display to enable.';
                   if (hdrEncoding)
-                    return 'Enabled. Concord prefers HDR-capable codec profiles when available. This does not guarantee a 10-bit or HDR stream.';
+                    return 'Enabled. AV1 HDR is a 10-bit target, not proof of encoded bit depth; active outbound WebRTC stats are authoritative for the negotiated codec and hardware path.';
                   return 'Disabled. Concord prefers SDR codec profiles and will not select VP9 Profile 2.';
                 })()}
               </span>
@@ -1389,18 +1465,6 @@ const VideoConfigSection: React.FC = () => {
           </div>
 
           {(() => {
-            const sortByPriority = (a: CodecCapability, b: CodecCapability) =>
-              codecPriority(codecKey(a), hdrEncoding) - codecPriority(codecKey(b), hdrEncoding);
-            const seenRouterKeys = new Set<string>();
-            const supported = codecCapabilities
-              .filter((c) => isRouterSupportedCodecProfile(c.mimeType, c.profileId))
-              .sort(sortByPriority)
-              .filter((capability) => {
-                const key = canonicalRouterCodecKey(capability.mimeType, capability.profileId);
-                if (!key || seenRouterKeys.has(key)) return false;
-                seenRouterKeys.add(key);
-                return true;
-              });
             const effectiveKey = targetCodecKey;
             const info = effectiveKey ? getCodecInfo(effectiveKey) : null;
             const selectedKey = preferredVideoCodec
@@ -1416,6 +1480,15 @@ const VideoConfigSection: React.FC = () => {
               targetName: info?.name ?? null,
               targetUsesHardware,
             });
+            const preferredBackend = hardwareAcceleration ? 'hardware' : 'software';
+            let preferredSelectorValue = '';
+            if (preferredVideoCodec) {
+              preferredSelectorValue = codecSelectorValue(
+                canonicalRequestedCodecKey(preferredVideoCodec, codecCapabilities, hdrEncoding) ??
+                  preferredVideoCodec,
+                preferredBackend
+              );
+            }
             return (
               <>
                 <div className="settings-row settings-codec-select-row">
@@ -1438,21 +1511,18 @@ const VideoConfigSection: React.FC = () => {
                     className="settings-select"
                     options={[
                       { value: '', label: 'Auto' },
-                      ...supported.flatMap((c) => {
-                        const key = canonicalRouterCodecKey(c.mimeType, c.profileId);
-                        if (!key) return [];
-                        const requiresHdr = key === 'video/vp9:2' && !hdrEncoding;
-                        return [
-                          {
-                            value: key,
-                            label: `${codecProfileMenuLabel(c.mimeType, c.profileId)}${requiresHdr ? ' — Requires HDR setting' : ''}`,
-                            disabled: requiresHdr,
-                          },
-                        ];
-                      }),
+                      ...buildCodecSelectorOptions(codecCapabilities, hdrEncoding),
                     ]}
-                    value={preferredVideoCodec ?? ''}
-                    onChange={(v) => setDraftVideoSetting('preferredVideoCodec', v || null)}
+                    value={preferredSelectorValue}
+                    onChange={(value) => {
+                      if (!value) {
+                        setDraftVideoSetting('preferredVideoCodec', null);
+                        return;
+                      }
+                      const [codec, backend] = value.split(CODEC_BACKEND_SEPARATOR);
+                      setDraftVideoSetting('preferredVideoCodec', codec);
+                      setDraftVideoSetting('hardwareAcceleration', backend === 'hardware');
+                    }}
                   />
                 </div>
 
@@ -1497,7 +1567,9 @@ const VideoConfigSection: React.FC = () => {
                 <div className="settings-codec-preference-notice">
                   <strong>Preferred</strong> is the target Concord will try first.{' '}
                   <strong>Camera In Use</strong> and <strong>Screen In Use</strong> report what each
-                  active producer actually uses after room compatibility checks.
+                  active producer actually uses after room compatibility checks. Hardware and
+                  Software entries are targets; active outbound WebRTC stats are authoritative for
+                  actual hardware use. WebRTC does not expose definitive AV1 encoded bit depth.
                 </div>
                 <CodecProfilesModal
                   isOpen={codecProfilesOpen}
@@ -1559,8 +1631,8 @@ const VideoConfigSection: React.FC = () => {
               <span className="settings-row-label">Hardware Acceleration</span>
               <span className="settings-row-hint">
                 {hardwareAcceleration
-                  ? 'Enabled. Your GPU handles video encoding and decoding. Concord Voice falls back to software encoding for unsupported codecs.'
-                  : 'Disabled. All video encoding and decoding runs on your CPU. Avoids GPU-specific limitations but increases CPU usage. Requires restart.'}
+                  ? 'Enabled. Concord prefers eligible hardware encoders and falls back when needed. Active outbound WebRTC stats report the actual path. Backend changes require restart.'
+                  : 'Disabled target. Concord prefers software encoding after restart; the browser and platform remain authoritative for the actual path. Requires restart.'}
               </span>
             </div>
             <ToggleSwitch

@@ -1,11 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import type { types as mediasoupTypes } from 'mediasoup-client';
+import * as codecSelection from '../../../src/renderer/services/voiceCodecSelection';
 import {
+  buildCodecCandidates,
   buildCodecCascade,
   codecPriority,
   findFirstFloorCompatibleCodec,
   h264ProfileClass,
   h264ProfilesCompatible,
+  isCodecKeyInFloor,
   selectCodecFromCascade,
   type CodecLookup,
 } from '../../../src/renderer/services/voiceCodecSelection';
@@ -49,6 +52,29 @@ function makeLookup(opts: {
 // ─── buildCodecCascade ───────────────────────────────────────────────
 
 describe('buildCodecCascade', () => {
+  it('enumerates the full HDR-first hardware/software Auto order', () => {
+    expect(buildCodecCandidates(true, true).map(({ key, backend }) => `${key}@${backend}`)).toEqual(
+      [
+        'video/AV1:hdr@hardware',
+        'video/VP9:2@hardware',
+        'video/AV1:hdr@software',
+        'video/VP9:2@software',
+        'video/AV1:sdr@hardware',
+        'video/VP9:0@hardware',
+        'video/H264:640034@hardware',
+        'video/H264:4d0032@hardware',
+        'video/H264:42e01f@hardware',
+        'video/VP8@hardware',
+        'video/AV1:sdr@software',
+        'video/VP9:0@software',
+        'video/H264:640034@software',
+        'video/H264:4d0032@software',
+        'video/H264:42e01f@software',
+        'video/VP8@software',
+      ]
+    );
+  });
+
   it('returns the canonical SDR order', () => {
     const cascade = buildCodecCascade(false);
     const allMimes = cascade.flatMap((e) => e.mimes);
@@ -119,6 +145,30 @@ describe('H264 profile identity', () => {
   });
 });
 
+describe('profile-aware codec floor', () => {
+  it('maps AV1 targets, compares VP9 exactly, and compares H264 by profile class', () => {
+    expect(isCodecKeyInFloor('video/AV1:hdr', ['video/av1'])).toBe(true);
+    expect(isCodecKeyInFloor('video/AV1:sdr', ['video/av1'])).toBe(true);
+    expect(isCodecKeyInFloor('video/VP8', ['video/vp8'])).toBe(true);
+
+    expect(isCodecKeyInFloor('video/VP9:0', ['video/vp9:0'])).toBe(true);
+    expect(isCodecKeyInFloor('video/VP9', ['video/vp9:0'])).toBe(true);
+    expect(isCodecKeyInFloor('video/VP9:2', ['video/vp9:0'])).toBe(false);
+    expect(isCodecKeyInFloor('video/VP9:0', ['video/vp9:2'])).toBe(false);
+
+    expect(isCodecKeyInFloor('video/H264:64001f', ['video/h264:640034'])).toBe(true);
+    expect(isCodecKeyInFloor('video/H264:640034', ['video/h264:4d0032'])).toBe(false);
+
+    // Conservative compatibility with codec floors emitted before profile-aware servers.
+    // A bare VP9 capability means the RFC default Profile 0; a bare H.264 capability
+    // cannot prove support for any particular profile-level-id.
+    expect(isCodecKeyInFloor('video/VP9:0', ['video/vp9'])).toBe(true);
+    expect(isCodecKeyInFloor('video/VP9:2', ['video/vp9'])).toBe(false);
+    expect(isCodecKeyInFloor('video/H264:640034', ['video/h264'])).toBe(false);
+    expect(isCodecKeyInFloor('video/H264', ['video/h264'])).toBe(true);
+  });
+});
+
 // ─── findFirstFloorCompatibleCodec ───────────────────────────────────
 
 describe('findFirstFloorCompatibleCodec', () => {
@@ -175,6 +225,143 @@ describe('findFirstFloorCompatibleCodec', () => {
 // ─── selectCodecFromCascade ──────────────────────────────────────────
 
 describe('selectCodecFromCascade', () => {
+  it('reports the selected backend and color target as policy metadata', () => {
+    const selectCandidate = (
+      codecSelection as typeof codecSelection & {
+        selectCodecCandidate?: (config: unknown) => {
+          codec: mediasoupTypes.RtpCodecCapability;
+          candidate: { backend: string; colorTarget: string; key: string };
+        };
+      }
+    ).selectCodecCandidate;
+    expect(selectCandidate).toBeTypeOf('function');
+    if (!selectCandidate) return;
+    const av1Hdr = fakeCodec('video/AV1');
+
+    const selected = selectCandidate({
+      preferred: null,
+      hwAccel: true,
+      hdrEncoding: true,
+      isInCodecFloor: () => true,
+      isHwAccelerated: () => true,
+      findSendCodec: (key: string) => (key.toLowerCase() === 'video/av1:hdr' ? av1Hdr : undefined),
+    });
+
+    expect(selected).toEqual({
+      codec: av1Hdr,
+      candidate: { key: 'video/AV1:hdr', backend: 'hardware', colorTarget: 'hdr' },
+    });
+  });
+
+  it('uses the exact HDR-first backend order before falling back to SDR', () => {
+    const av1Hdr = fakeCodec('video/AV1-hdr');
+    const vp9Hdr = fakeCodec('video/VP9-hdr');
+    const av1Sdr = fakeCodec('video/AV1-sdr');
+    const vp9Sdr = fakeCodec('video/VP9-sdr');
+    const available: Record<string, mediasoupTypes.RtpCodecCapability> = {
+      'video/av1:hdr': av1Hdr,
+      'video/vp9:2': vp9Hdr,
+      'video/av1:sdr': av1Sdr,
+      'video/vp9:0': vp9Sdr,
+    };
+    const select = (hardware: string[]) =>
+      selectCodecFromCascade({
+        preferred: null,
+        hwAccel: true,
+        hdrEncoding: true,
+        isInCodecFloor: () => true,
+        isHwAccelerated: (key) => hardware.includes(key.toLowerCase()),
+        findSendCodec: (key) => available[key.toLowerCase()],
+      });
+
+    expect(select(['video/av1:hdr', 'video/vp9:2', 'video/av1:sdr', 'video/vp9:0'])).toBe(av1Hdr);
+    expect(select(['video/vp9:2', 'video/av1:sdr', 'video/vp9:0'])).toBe(vp9Hdr);
+    expect(select(['video/av1:sdr', 'video/vp9:0'])).toBe(av1Hdr);
+    expect(select(['video/vp9:0'])).toBe(av1Hdr);
+  });
+
+  it('omits every hardware candidate when hardware acceleration is off', () => {
+    const av1Hdr = fakeCodec('video/AV1-hdr');
+    const available = { 'video/av1:hdr': av1Hdr };
+    const hardwareChecks: string[] = [];
+
+    const result = selectCodecFromCascade({
+      preferred: null,
+      hwAccel: false,
+      hdrEncoding: true,
+      isInCodecFloor: () => true,
+      isHwAccelerated: (key) => {
+        hardwareChecks.push(key);
+        return true;
+      },
+      findSendCodec: (key) => available[key.toLowerCase() as keyof typeof available],
+    });
+
+    expect(result).toBe(av1Hdr);
+    expect(hardwareChecks).toEqual([]);
+  });
+
+  it('discards a backend-incompatible manual preference and restarts Auto at candidate zero', () => {
+    const manualSdr = fakeCodec('video/AV1-sdr');
+    const autoHdr = fakeCodec('video/AV1-hdr');
+    const available: Record<string, mediasoupTypes.RtpCodecCapability> = {
+      'video/av1:sdr': manualSdr,
+      'video/av1:hdr': autoHdr,
+    };
+
+    const result = selectCodecFromCascade({
+      preferred: 'video/AV1:sdr',
+      hwAccel: true,
+      hdrEncoding: true,
+      isInCodecFloor: () => true,
+      isHwAccelerated: (key) => key.toLowerCase() === 'video/av1:hdr',
+      findSendCodec: (key) => available[key.toLowerCase()],
+    });
+
+    expect(result).toBe(autoHdr);
+  });
+
+  it('restarts Auto at candidate zero when a bottom-ranked manual codec misses the floor', () => {
+    const av1Hdr = fakeCodec('video/AV1-hdr');
+    const vp8 = fakeCodec('video/VP8');
+    const available: Record<string, mediasoupTypes.RtpCodecCapability> = {
+      'video/av1:hdr': av1Hdr,
+      'video/vp8': vp8,
+    };
+
+    const result = selectCodecFromCascade({
+      preferred: 'video/VP8',
+      hwAccel: false,
+      hdrEncoding: true,
+      isInCodecFloor: (key) => key.toLowerCase().startsWith('video/av1:'),
+      isHwAccelerated: () => false,
+      findSendCodec: (key) => available[key.toLowerCase()],
+    });
+
+    expect(result).toBe(av1Hdr);
+  });
+
+  it('honors a legacy bare H264 preference through its best eligible hardware profile', () => {
+    const av1 = fakeCodec('video/AV1');
+    const h264Main = fakeCodec('video/H264');
+    const available: Record<string, mediasoupTypes.RtpCodecCapability> = {
+      'video/av1:sdr': av1,
+      'video/h264:4d0032': h264Main,
+    };
+
+    const result = selectCodecFromCascade({
+      preferred: 'video/H264',
+      hwAccel: true,
+      hdrEncoding: false,
+      isInCodecFloor: () => true,
+      isHwAccelerated: (key) =>
+        key.toLowerCase() === 'video/av1:sdr' || key.toLowerCase() === 'video/h264:4d0032',
+      findSendCodec: (key) => available[key.toLowerCase()],
+    });
+
+    expect(result).toBe(h264Main);
+  });
+
   it('returns user-preferred codec when floor-compatible', () => {
     const vp9 = fakeCodec('video/VP9');
     const av1 = fakeCodec('video/AV1');
@@ -311,7 +498,7 @@ describe('selectCodecFromCascade', () => {
     expect(result).toBe(vp9_2);
   });
 
-  it('uses the exact profile hardware verdict before falling back to software', () => {
+  it('keeps an HDR software profile ahead of an SDR hardware profile', () => {
     const vp9Profile2 = fakeCodec('video/VP9');
     const vp9Profile0 = fakeCodec('video/VP9');
     const available: Record<string, mediasoupTypes.RtpCodecCapability> = {
@@ -327,7 +514,7 @@ describe('selectCodecFromCascade', () => {
       findSendCodec: (key) => available[key.toLowerCase()],
     });
 
-    expect(result).toBe(vp9Profile0);
+    expect(result).toBe(vp9Profile2);
   });
 
   it('never honors a manual HEVC preference while HEVC is disabled', () => {

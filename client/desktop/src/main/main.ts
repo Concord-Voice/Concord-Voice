@@ -152,7 +152,7 @@ if (readHwAccelPref()) {
   // Hardware acceleration flags for video encode/decode (IGNIS insight: fastest preset wins)
   app.commandLine.appendSwitch(
     'enable-features',
-    'AcceleratedVideoEncoder,AcceleratedVideoDecodeLinuxGL'
+    'AcceleratedVideoEncoder,AcceleratedVideoDecodeLinuxGL,WebRtcAV1HWEncode'
   );
 } else {
   app.disableHardwareAcceleration();

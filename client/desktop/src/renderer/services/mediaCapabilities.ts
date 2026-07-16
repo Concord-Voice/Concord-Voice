@@ -22,10 +22,11 @@ export interface CodecCapability {
   mimeType: string; // e.g. "video/VP9"
   sdpFmtpLine?: string;
   hwAvailable?: boolean; // true = GPU has a HW encoder, false = it does not, undefined = detection unavailable
+  swAvailable?: boolean; // true = exact SW encoder target exists, false = it does not, undefined = detection unavailable
   supported: boolean;
-  profileId: string | null; // "640034" for H264 High, "2" for VP9 P2, null for VP8/AV1
-  profileLabel: string | null; // "High", "Main", "Baseline", "HDR", null for no-profile codecs
-  isHdr: boolean; // true for HDR-only profiles (VP9 P2). AV1 is HDR-capable but works in SDR too.
+  profileId: string | null; // H264/VP9 profile, AV1 app target (hdr/sdr), or null for VP8
+  profileLabel: string | null;
+  isHdr: boolean; // true for VP9 P2 and the AV1 10-bit application target
 }
 
 export interface GpuInfo {
@@ -97,7 +98,7 @@ export function buildWebCodecsCodecString(
   const mime = mimeType.toLowerCase();
   if (mime === 'video/vp8') return 'vp8';
   if (mime === 'video/vp9') return isHdr ? 'vp09.02.31.10' : 'vp09.00.31.08';
-  if (mime === 'video/av1') return 'av01.0.05M.08';
+  if (mime === 'video/av1') return isHdr ? 'av01.0.05M.10' : 'av01.0.05M.08';
   if (mime === 'video/h264') {
     // Preserve the profile_idc + constraint-flags bytes from the SDP
     // profile-level-id, but PIN the level to 3.1 (0x1f). The SDP level_idc can be
@@ -122,14 +123,16 @@ const HW_PROBE_WIDTH = 1280;
 const HW_PROBE_HEIGHT = 720;
 
 /**
- * Probe whether the GPU exposes a genuine HARDWARE encoder for a codec string.
- * `hardwareAcceleration: 'prefer-hardware'` is the ONLY diagnostic variant —
- * Chromium's isConfigSupported filters out software codecs and forces a
- * hardware-only probe (verified in third_party/blink/.../webcodecs/video_encoder.cc).
+ * Probe whether Chromium exposes the requested encoder backend for a codec string.
+ * The pinned Chromium path treats `prefer-hardware` and `prefer-software` as
+ * backend-specific support queries rather than generic preferences.
  * Returns undefined when WebCodecs is unavailable or the probe throws — NEVER
- * coerce that to false, which would falsely claim "software".
+ * coerce that to false, which would invent a backend verdict.
  */
-async function probeHardwareEncode(codec: string): Promise<boolean | undefined> {
+async function probeEncodeBackend(
+  codec: string,
+  hardwareAcceleration: 'prefer-hardware' | 'prefer-software'
+): Promise<boolean | undefined> {
   if (typeof VideoEncoder === 'undefined' || typeof VideoEncoder.isConfigSupported !== 'function') {
     return undefined;
   }
@@ -138,7 +141,7 @@ async function probeHardwareEncode(codec: string): Promise<boolean | undefined> 
       codec,
       width: HW_PROBE_WIDTH,
       height: HW_PROBE_HEIGHT,
-      hardwareAcceleration: 'prefer-hardware',
+      hardwareAcceleration,
     });
     return result.supported === true;
   } catch {
@@ -352,18 +355,42 @@ export async function detectCodecCapabilities(): Promise<CodecCapability[]> {
   // isConfigSupported({hardwareAcceleration:'prefer-hardware'}) is true ONLY when
   // the GPU exposes a genuine hardware encoder for that codec — the reliable
   // signal the old getGPUInfo VEA list and WebRTC powerEfficient hint both lacked.
-  const parsed = uniqueCodecs.map((codec) => {
+  const parsed = uniqueCodecs.flatMap((codec) => {
+    if (codec.mimeType.toLowerCase() === 'video/av1') {
+      return [
+        {
+          codec,
+          id: 'hdr',
+          label: '10-bit HDR target',
+          isHdr: true,
+          codecString: buildWebCodecsCodecString(codec.mimeType, 'hdr', true),
+        },
+        {
+          codec,
+          id: 'sdr',
+          label: '8-bit SDR target',
+          isHdr: false,
+          codecString: buildWebCodecsCodecString(codec.mimeType, 'sdr', false),
+        },
+      ];
+    }
     const p = parseProfile(codec.mimeType, codec.sdpFmtpLine);
-    return { codec, ...p, codecString: buildWebCodecsCodecString(codec.mimeType, p.id, p.isHdr) };
+    return [{ codec, ...p, codecString: buildWebCodecsCodecString(codec.mimeType, p.id, p.isHdr) }];
   });
 
   const hwByCodecString = new Map<string, boolean | undefined>();
+  const swByCodecString = new Map<string, boolean | undefined>();
   const uniqueStrings = [
     ...new Set(parsed.map((x) => x.codecString).filter((s): s is string => s !== null)),
   ];
   await Promise.all(
     uniqueStrings.map(async (codecString) => {
-      hwByCodecString.set(codecString, await probeHardwareEncode(codecString));
+      const [hardware, software] = await Promise.all([
+        probeEncodeBackend(codecString, 'prefer-hardware'),
+        probeEncodeBackend(codecString, 'prefer-software'),
+      ]);
+      hwByCodecString.set(codecString, hardware);
+      swByCodecString.set(codecString, software);
     })
   );
 
@@ -371,6 +398,7 @@ export async function detectCodecCapabilities(): Promise<CodecCapability[]> {
     mimeType: codec.mimeType,
     sdpFmtpLine: codec.sdpFmtpLine,
     hwAvailable: codecString === null ? undefined : hwByCodecString.get(codecString),
+    swAvailable: codecString === null ? undefined : swByCodecString.get(codecString),
     supported: true,
     profileId: id,
     profileLabel: label,

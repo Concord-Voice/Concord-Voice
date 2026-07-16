@@ -73,6 +73,13 @@ describe('codec profile policy', () => {
     );
     expect(codecProfileMenuLabel('video/H264', '4d401f')).toBe('H.264 (Main 5.0 — Balanced)');
   });
+
+  it('keeps AV1 application targets distinct while mapping both to RTP AV1', () => {
+    expect(canonicalRouterCodecKey('video/AV1', 'hdr')).toBe('video/av1');
+    expect(canonicalRouterCodecKey('video/AV1', 'sdr')).toBe('video/av1');
+    expect(codecProfileMenuLabel('video/AV1', 'hdr')).toBe('AV1 (10-bit HDR target)');
+    expect(codecProfileMenuLabel('video/AV1', 'sdr')).toBe('AV1 (8-bit SDR target)');
+  });
 });
 
 describe('getCodecMetadata', () => {

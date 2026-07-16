@@ -398,27 +398,20 @@ const DM_CALL_ID_TOMBSTONE_MS = 60_000;
 /**
  * AES-256-GCM media-frame format advertised by clients at join time.
  * v1 legacy AES-128; v2 keyed by ratchet keyId; v3 (#1878) stamped the channel-key
- * version; v4 (#1895) is per-codec — AV1 per-OBU payload encryption, VP9/VP8/Opus
- * whole-frame. v4 is the current target; the room ratchets UP to the MAX advertised.
+ * version; v4 (#1895) added AV1 per-OBU encryption; v5 adds H.264 NAL-aware
+ * suffix encryption. Active rooms require an exact version match.
  */
-export const SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION = 4;
+export const SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION = 5;
 
 /**
- * Versions accepted at the admission gate during the v3→v4 rollout window
- * (#1895). v3 is tolerated so already-running v3 clients keep joining while the
- * fleet upgrades; DROP 3 post-rollout so the gate hard-requires v4. v1/v2 are
- * permanently rejected.
+ * Explicitly accepted rollout versions. Incompatible versions may each seed a
+ * room, but they never coexist in one active room.
  */
-const ACCEPTED_MEDIA_FRAME_CRYPTO_VERSIONS = new Set<number>([3, 4]);
+const ACCEPTED_MEDIA_FRAME_CRYPTO_VERSIONS = new Set<number>([3, 4, 5]);
 
 /**
- * Thrown when a participant advertises a media-frame crypto version strictly
- * LOWER than the room's already-negotiated version (#1878, OQ-1). The room
- * version is the MAX of advertised versions (higher-version-wins): a higher
- * joiner ratchets the room up; an equal joiner is allowed; a lower joiner is
- * rejected with this typed error so the Socket.IO handler can return an
- * actionable `crypto_version_mismatch` ack and the client can prompt "update
- * required" instead of surfacing a generic join failure.
+ * Thrown when a participant advertises a different version than an active
+ * room. Both mismatch directions use the same typed error.
  */
 export class CryptoVersionMismatchError extends Error {
   readonly code = 'crypto_version_mismatch' as const;
@@ -628,17 +621,92 @@ export interface AggregateRoomCounts {
 // Pure helpers (extracted to reduce cognitive complexity of computeCodecFloor)
 // ---------------------------------------------------------------------------
 
-/** Extract lowercase video mimeTypes from RTP capabilities. */
-function extractVideoMimeTypes(caps: RtpCapabilities): Set<string> {
-  const mimes = new Set<string>();
-  for (const c of caps.codecs ?? []) {
-    if (c.kind === 'video') mimes.add(c.mimeType.toLowerCase());
+type CodecFloorCapability = NonNullable<RtpCapabilities['codecs']>[number] & {
+  sdpFmtpLine?: string;
+};
+
+const H264_FLOOR_PROFILE_BY_CLASS = [
+  { profileIdc: 0x42, mask: 0x4f, value: 0x40, canonical: '42e01f' },
+  { profileIdc: 0x4d, mask: 0x8f, value: 0x80, canonical: '42e01f' },
+  { profileIdc: 0x58, mask: 0xcf, value: 0xc0, canonical: '42e01f' },
+  { profileIdc: 0x4d, mask: 0xaf, value: 0, canonical: '4d0032' },
+  { profileIdc: 0x64, mask: 0xff, value: 0, canonical: '640034' },
+] as const;
+
+function codecParameter(codec: CodecFloorCapability, name: string): string | undefined {
+  const value = codec.parameters?.[name];
+  if (typeof value === 'string' || typeof value === 'number') return String(value).toLowerCase();
+
+  const fmtp = typeof codec.sdpFmtpLine === 'string' ? codec.sdpFmtpLine : '';
+  for (const field of fmtp.split(';')) {
+    const separator = field.indexOf('=');
+    if (separator < 0 || field.slice(0, separator).trim().toLowerCase() !== name) continue;
+    const parsed = field
+      .slice(separator + 1)
+      .trim()
+      .toLowerCase();
+    return parsed || undefined;
   }
-  return mimes;
+  return undefined;
 }
 
-/** Compute the intersection of an array of string Sets. */
-function intersectMimeSets(sets: Set<string>[]): Set<string> {
+function canonicalH264FloorProfile(profileLevelId: string): string | null {
+  if (!/^[0-9a-f]{6}$/.test(profileLevelId)) return null;
+  const profileIdc = Number.parseInt(profileLevelId.slice(0, 2), 16);
+  const profileIop = Number.parseInt(profileLevelId.slice(2, 4), 16);
+  const match = H264_FLOOR_PROFILE_BY_CLASS.find(
+    (profile) => profile.profileIdc === profileIdc && (profileIop & profile.mask) === profile.value
+  );
+  return match?.canonical ?? null;
+}
+
+function canonicalH264VideoCodecKey(codec: CodecFloorCapability): string | null {
+  const mime = codec.mimeType.toLowerCase();
+  const profile = codecParameter(codec, 'profile-level-id');
+  if (!profile) {
+    const packetizationMode = codecParameter(codec, 'packetization-mode');
+    const levelAsymmetry = codecParameter(codec, 'level-asymmetry-allowed');
+    return packetizationMode === undefined && levelAsymmetry === undefined ? mime : null;
+  }
+  if (
+    codecParameter(codec, 'packetization-mode') !== '1' ||
+    codecParameter(codec, 'level-asymmetry-allowed') !== '1'
+  ) {
+    return null;
+  }
+  const canonicalProfile = canonicalH264FloorProfile(profile);
+  return canonicalProfile ? `${mime}:${canonicalProfile}` : null;
+}
+
+/** Canonical primary-video key admitted by Concord's router, or null when auxiliary/invalid. */
+function canonicalVideoCodecKey(codec: CodecFloorCapability): string | null {
+  if (codec?.kind !== 'video' || typeof codec.mimeType !== 'string') return null;
+  const mime = codec.mimeType.toLowerCase();
+  if (mime === 'video/av1' || mime === 'video/vp8') return mime;
+
+  if (mime === 'video/vp9') {
+    const profile = codecParameter(codec, 'profile-id') ?? '0';
+    return profile === '0' || profile === '2' ? `${mime}:${profile}` : null;
+  }
+
+  if (mime === 'video/h264') return canonicalH264VideoCodecKey(codec);
+
+  return null;
+}
+
+/** Extract canonical primary-video keys from RTP capabilities. */
+function extractVideoCodecKeys(caps: RtpCapabilities): Set<string> {
+  const keys = new Set<string>();
+  const codecs = Array.isArray(caps?.codecs) ? caps.codecs : [];
+  for (const codec of codecs) {
+    const key = canonicalVideoCodecKey(codec);
+    if (key) keys.add(key);
+  }
+  return keys;
+}
+
+/** Compute the intersection of canonical codec-key sets. */
+function intersectCodecKeySets(sets: Set<string>[]): Set<string> {
   if (sets.length === 0) return new Set();
   const result = new Set(sets[0]);
   for (let i = 1; i < sets.length; i++) {
@@ -649,13 +717,13 @@ function intersectMimeSets(sets: Set<string>[]): Set<string> {
   return result;
 }
 
-/** Apply the higher-version-wins media-frame admission rule before membership mutation. */
+/** Seed an empty room or require an exact active-room version before membership mutation. */
 function admitMediaFrameCryptoVersion(room: Room, joinerVersion: number): number {
-  if (room.mediaFrameCryptoVersion === null || joinerVersion > room.mediaFrameCryptoVersion) {
+  if (room.mediaFrameCryptoVersion === null) {
     room.mediaFrameCryptoVersion = joinerVersion;
     return joinerVersion;
   }
-  if (joinerVersion < room.mediaFrameCryptoVersion) {
+  if (joinerVersion !== room.mediaFrameCryptoVersion) {
     throw new CryptoVersionMismatchError(room.mediaFrameCryptoVersion, joinerVersion);
   }
   return room.mediaFrameCryptoVersion;
@@ -1007,13 +1075,9 @@ export class RoomManager {
       room.ownerTier = roomContext.ownerTier;
     }
 
-    // Media-frame crypto-version admission gate (#1878, OQ-1: higher-version-wins).
-    // The room version is the MAX of advertised versions:
+    // Media-frame crypto-version admission gate:
     //   - empty room  → seed with the joiner's version.
-    //   - joiner > room → ratchet the room UP to the joiner's version.
-    //   - joiner < room → reject with a typed CryptoVersionMismatchError so the
-    //     Socket.IO handler can return an actionable `crypto_version_mismatch`
-    //     ack (client → "update required") rather than a generic join failure.
+    //   - joiner != room → reject with a typed CryptoVersionMismatchError.
     //   - joiner == room → allow.
     // This runs BEFORE participant storage and the e2eeEpoch++ below — do NOT
     // move it past either (see [internal]rules/media-plane.md admission-gate rule).
@@ -2309,14 +2373,13 @@ export class RoomManager {
 
   /**
    * Compute the "codec floor" — the intersection of all participants' video
-   * decode capabilities. Returns lowercase mimeTypes that every participant
-   * with non-null rtpCapabilities can decode.
+   * decode capabilities. Returns canonical lowercase primary-video keys that
+   * every participant with non-null rtpCapabilities can decode.
    * Returns null if <2 participants have capabilities (no constraint needed).
    *
-   * Floor operates at mimeType level (e.g., "video/h264") — not profile level.
-   * This is intentional: canConsume() handles profile matching, and all modern
-   * browsers decode all profiles within a codec family. Profile-level floor
-   * can be added if a real-world decode failure is observed.
+   * VP9 profiles remain distinct. H.264 levels normalize to Concord's configured
+   * representative for their RFC 6184 profile class because level asymmetry is
+   * enabled on every admitted H.264 router codec.
    */
   computeCodecFloor(roomId: string): string[] | null {
     const room = this.rooms.get(roomId);
@@ -2329,8 +2392,8 @@ export class RoomManager {
 
     if (capableParts.length < 2) return null;
 
-    const mimeSets = capableParts.map(extractVideoMimeTypes);
-    const floor = intersectMimeSets(mimeSets);
+    const codecKeySets = capableParts.map(extractVideoCodecKeys);
+    const floor = intersectCodecKeySets(codecKeySets);
     return Array.from(floor);
   }
 
@@ -2931,7 +2994,12 @@ export class RoomManager {
   private cameraLayeringCodecKind(room: Room): LayeredCodecKind {
     const floor = this.computeCodecFloor(room.id);
     if (!floor) return 'svc';
-    if (floor.some((codec) => codec === 'video/av1' || codec === 'video/vp9')) return 'svc';
+    if (
+      floor.some(
+        (codec) => codec === 'video/av1' || codec === 'video/vp9' || codec.startsWith('video/vp9:')
+      )
+    )
+      return 'svc';
     return 'simulcast';
   }
 

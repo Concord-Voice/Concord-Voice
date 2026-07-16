@@ -98,6 +98,22 @@ function joinRoomWithSupportedCrypto(
   });
 }
 
+function createProfiledRtpCapabilities(
+  videoCodecs: Array<{
+    mimeType: string;
+    parameters?: Record<string, unknown>;
+    sdpFmtpLine?: string;
+  }>
+) {
+  return {
+    codecs: [
+      { kind: 'audio' as const, mimeType: 'audio/opus', clockRate: 48000, channels: 2 },
+      ...videoCodecs.map((codec) => ({ kind: 'video' as const, clockRate: 90000, ...codec })),
+    ],
+    headerExtensions: [],
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -448,6 +464,7 @@ describe('RoomManager', () => {
     });
 
     it('seeds the room media-frame crypto version from the first participant', async () => {
+      expect(SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION).toBe(5);
       const result = await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
         username: 'alice',
       });
@@ -556,44 +573,55 @@ describe('RoomManager', () => {
       );
     });
 
-    it('accepts v3 and v4 during the v3→v4 rollout window', () => {
+    it('accepts the explicit v3, v4, and v5 rollout set', () => {
       expect(parseMediaFrameCryptoVersion(3)).toBe(3);
       expect(parseMediaFrameCryptoVersion(4)).toBe(4);
+      expect(parseMediaFrameCryptoVersion(5)).toBe(5);
     });
 
-    it('rejects v2 now that the window has moved to v3→v4', () => {
+    it('rejects v2 outside the explicit rollout set', () => {
       expect(() => parseMediaFrameCryptoVersion(2)).toThrow(
         'Unsupported media frame crypto version 2'
       );
     });
 
-    it('raises the room from v3 to v4 when a v4 participant joins (higher-version-wins)', async () => {
+    it('rejects a higher-version joiner without mutating a v3 active room', async () => {
       await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, {
         mediaFrameCryptoVersion: 3,
       });
-      const res = await manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
-        mediaFrameCryptoVersion: 4,
-      });
+      const room = manager.getRoom('r')!;
+      const epochBefore = room.e2eeEpoch;
 
-      expect(res.mediaFrameCryptoVersion).toBe(4);
-      expect(manager.getRoom('r')?.mediaFrameCryptoVersion).toBe(4);
+      const promise = manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
+        mediaFrameCryptoVersion: 5,
+      });
+      await expect(promise).rejects.toMatchObject({
+        code: 'crypto_version_mismatch',
+        roomVersion: 3,
+        joinVersion: 5,
+      });
+      await expect(promise).rejects.toBeInstanceOf(CryptoVersionMismatchError);
+
+      expect(room.mediaFrameCryptoVersion).toBe(3);
+      expect(room.participants.has('u2')).toBe(false);
+      expect(room.e2eeEpoch).toBe(epochBefore);
     });
 
     it('keeps the room version when an equal-version participant joins', async () => {
       await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, {
-        mediaFrameCryptoVersion: 4,
+        mediaFrameCryptoVersion: 5,
       });
       const res = await manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
-        mediaFrameCryptoVersion: 4,
+        mediaFrameCryptoVersion: 5,
       });
 
-      expect(res.mediaFrameCryptoVersion).toBe(4);
-      expect(manager.getRoom('r')?.mediaFrameCryptoVersion).toBe(4);
+      expect(res.mediaFrameCryptoVersion).toBe(5);
+      expect(manager.getRoom('r')?.mediaFrameCryptoVersion).toBe(5);
     });
 
-    it('rejects a v3 joiner into a v4 room with a typed mismatch', async () => {
+    it('rejects a lower-version joiner without mutating a v5 active room', async () => {
       await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, {
-        mediaFrameCryptoVersion: 4,
+        mediaFrameCryptoVersion: 5,
       });
       const room = manager.getRoom('r')!;
       const epochBefore = room.e2eeEpoch;
@@ -603,12 +631,13 @@ describe('RoomManager', () => {
       });
       await expect(promise).rejects.toMatchObject({
         code: 'crypto_version_mismatch',
-        roomVersion: 4,
+        roomVersion: 5,
         joinVersion: 3,
       });
       await expect(promise).rejects.toBeInstanceOf(CryptoVersionMismatchError);
 
       // Gate must fire BEFORE participant storage / epoch mutation.
+      expect(room.mediaFrameCryptoVersion).toBe(5);
       expect(room.participants.has('u2')).toBe(false);
       expect(room.e2eeEpoch).toBe(epochBefore);
     });
@@ -3800,6 +3829,307 @@ describe('RoomManager', () => {
 
       const floor = manager.computeCodecFloor('room-1');
       expect(floor).toEqual(['video/vp8']);
+    });
+
+    it('does not treat VP9 Profile 0 and Profile 2 as interchangeable', async () => {
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        createProfiledRtpCapabilities([
+          { mimeType: 'video/VP9', parameters: { 'profile-id': 0 } },
+        ]) as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        createProfiledRtpCapabilities([
+          { mimeType: 'video/VP9', parameters: { 'profile-id': 2 } },
+        ]) as any
+      );
+
+      expect(manager.computeCodecFloor('room-1')).toEqual([]);
+    });
+
+    it('includes a common VP9 Profile 2 capability parsed from parameters or fmtp', async () => {
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        createProfiledRtpCapabilities([
+          { mimeType: 'video/VP9', parameters: { 'profile-id': 2 } },
+        ]) as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        createProfiledRtpCapabilities([
+          { mimeType: 'video/VP9', sdpFmtpLine: 'profile-id=2' },
+        ]) as any
+      );
+
+      expect(manager.computeCodecFloor('room-1')).toEqual(['video/vp9:2']);
+    });
+
+    it('intersects H264 by RFC 6184 profile class while ignoring asymmetric levels', async () => {
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        createProfiledRtpCapabilities([
+          {
+            mimeType: 'video/H264',
+            parameters: {
+              'packetization-mode': 1,
+              'level-asymmetry-allowed': 1,
+              'profile-level-id': '640034',
+            },
+          },
+        ]) as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        createProfiledRtpCapabilities([
+          {
+            mimeType: 'video/H264',
+            sdpFmtpLine: 'packetization-mode=1;level-asymmetry-allowed=1;profile-level-id=64001f',
+          },
+        ]) as any
+      );
+
+      expect(manager.computeCodecFloor('room-1')).toEqual(['video/h264:640034']);
+    });
+
+    it('does not treat H264 High and Main profile classes as interchangeable', async () => {
+      const h264 = (profile: string) => ({
+        mimeType: 'video/H264',
+        parameters: {
+          'packetization-mode': 1,
+          'level-asymmetry-allowed': 1,
+          'profile-level-id': profile,
+        },
+      });
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        createProfiledRtpCapabilities([h264('640034')]) as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        createProfiledRtpCapabilities([h264('4d0032')]) as any
+      );
+
+      expect(manager.computeCodecFloor('room-1')).toEqual([]);
+    });
+
+    it('excludes auxiliary RTP codecs from the primary-video floor', async () => {
+      const capabilities = createProfiledRtpCapabilities([
+        { mimeType: 'video/AV1' },
+        { mimeType: 'video/rtx', parameters: { apt: 96 } },
+        { mimeType: 'video/red' },
+        { mimeType: 'video/ulpfec' },
+      ]);
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        capabilities as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        capabilities as any
+      );
+
+      expect(manager.computeCodecFloor('room-1')).toEqual(['video/av1']);
+    });
+
+    it('preserves a base H264 floor for two legacy profileless capabilities', async () => {
+      const capabilities = createRtpCapabilities(['video/H264']);
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        capabilities as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        capabilities as any
+      );
+
+      expect(manager.computeCodecFloor('room-1')).toEqual(['video/h264']);
+    });
+
+    it('does not let a profileless H264 capability wildcard a specific profile', async () => {
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        createRtpCapabilities(['video/H264']) as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        createProfiledRtpCapabilities([
+          {
+            mimeType: 'video/H264',
+            parameters: {
+              'packetization-mode': 1,
+              'level-asymmetry-allowed': 1,
+              'profile-level-id': '640034',
+            },
+          },
+        ]) as any
+      );
+
+      expect(manager.computeCodecFloor('room-1')).toEqual([]);
+    });
+
+    it('rejects partially specified profileless H264 with router-incompatible flags', async () => {
+      const capabilities = createProfiledRtpCapabilities([
+        {
+          mimeType: 'video/H264',
+          parameters: { 'packetization-mode': 0, 'level-asymmetry-allowed': 0 },
+        },
+      ]);
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        capabilities as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        capabilities as any
+      );
+
+      expect(manager.computeCodecFloor('room-1')).toEqual([]);
+    });
+
+    it('ignores malformed codec records instead of poisoning floor computation', async () => {
+      const capabilities = createProfiledRtpCapabilities([{ mimeType: 'video/AV1' }]);
+      (capabilities.codecs as any[]).push({ kind: 'video', mimeType: null, sdpFmtpLine: 4 });
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        capabilities as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        createProfiledRtpCapabilities([{ mimeType: 'video/AV1' }]) as any
+      );
+
+      expect(manager.computeCodecFloor('room-1')).toEqual(['video/av1']);
+    });
+
+    it('fails closed when a capability update supplies a non-array codec collection', async () => {
+      const capabilities = createProfiledRtpCapabilities([{ mimeType: 'video/AV1' }]);
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        capabilities as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        capabilities as any
+      );
+      manager.updateRtpCapabilities('room-1', 'u-1', { codecs: {} } as any);
+
+      expect(manager.computeCodecFloor('room-1')).toEqual([]);
+    });
+
+    it('keeps profile-qualified VP9 on the SVC camera-layering path', async () => {
+      const capabilities = createProfiledRtpCapabilities([
+        { mimeType: 'video/VP9', parameters: { 'profile-id': 2 } },
+      ]);
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-1',
+        'sock-1',
+        { username: 'alice' },
+        capabilities as any
+      );
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-1',
+        'u-2',
+        'sock-2',
+        { username: 'bob' },
+        capabilities as any
+      );
+      const room = manager.getRoom('room-1');
+
+      expect((manager as any).cameraLayeringCodecKind(room)).toBe('svc');
+    });
+
+    it('keeps a legacy bare VP9 floor on the SVC camera-layering path', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+        username: 'alice',
+      });
+      const room = manager.getRoom('room-1');
+      vi.spyOn(manager, 'computeCodecFloor').mockReturnValue(['video/vp9']);
+
+      expect((manager as any).cameraLayeringCodecKind(room)).toBe('svc');
     });
   });
 

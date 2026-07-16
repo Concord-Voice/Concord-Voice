@@ -97,7 +97,7 @@ self.onmessage = (event: MessageEvent<E2EEWorkerMessage>) => {
       break;
 
     case 'addDecryptKey':
-      // #1878: keyed by (senderUserId, keyVersion, keyId) to match the v3 frame
+      // #1878: keyed by (senderUserId, keyVersion, keyId) to match the versioned frame
       // trailer. A successful add also clears any pending requestFrameKey backoff
       // so a later miss (e.g., a fresh keyVersion) re-requests promptly.
       encryption.addDecryptKeyDirectV3(msg.senderUserId, msg.keyVersion, msg.keyId, msg.key);

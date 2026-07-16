@@ -903,6 +903,24 @@ describe('e2eeService', () => {
       expect(events).toEqual([]);
     });
 
+    it('exposes the monotonic highest-seen version for late media subscribers', async () => {
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      mockApiFetch.mockImplementation((url: unknown) => {
+        const m = /version=(\d+)/.exec(String(url));
+        const ver = m ? Number(m[1]) : 1;
+        return Promise.resolve(okKeyResponse(wrappedForUser, ver));
+      });
+
+      expect(e2eeService.getHighestSeenKeyVersion('chan-late')).toBe(0);
+      await e2eeService.getChannelKeyByVersion('chan-late', 7);
+      await e2eeService.getChannelKeyByVersion('chan-late', 5);
+
+      expect(e2eeService.getHighestSeenKeyVersion('chan-late')).toBe(7);
+      e2eeService.clearKeys();
+      expect(e2eeService.getHighestSeenKeyVersion('chan-late')).toBe(0);
+    });
+
     it('unsubscribe stops further events', async () => {
       const channelKey = await generateChannelKey();
       const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
