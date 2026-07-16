@@ -93,7 +93,7 @@
     "globals": "^17.7.0",
     "ioredis": "^5.11.1",
     "jsdom": "^29.1.1",
-    "msw": "^2.14.6",
+    "msw": "^2.15.0",
     "prettier": "^3.9.4",
     "rehype-parse": "^9.0.1",
     "rehype-stringify": "^10.0.1",
