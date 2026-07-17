@@ -9853,11 +9853,17 @@ paths:
               $ref: '#/components/schemas/BanRequest'
       responses:
         '200':
-          description: Member banned
+          description: Member banned (with optional purge outcome)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessMessage'
+                type: object
+                required: [message]
+                properties:
+                  message:
+                    type: string
+                  purge:
+                    $ref: '#/components/schemas/PurgeOutcome'
         '400':
           description: Invalid server/user ID or attempt to ban yourself
           content:
@@ -10329,13 +10335,25 @@ paths:
         schema:
           type: string
           format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RemoveMemberRequest'
       responses:
         '200':
-          description: Member removed or left
+          description: Member removed or left (with optional purge outcome on moderator removal)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessMessage'
+                type: object
+                required: [message]
+                properties:
+                  message:
+                    type: string
+                  purge:
+                    $ref: '#/components/schemas/PurgeOutcome'
         '403':
           description: Insufficient permissions or owner cannot leave
           content:
@@ -16137,6 +16155,38 @@ components:
       properties:
         reason:
           type: string
+        purge_messages:
+          type: boolean
+          default: false
+          description: >-
+            When true and the actor holds Manage All Messages, additionally purge the banned
+            user's server-wide messages. Additive — the ban succeeds regardless of purge outcome.
+    RemoveMemberRequest:
+      type: object
+      description: Optional body for the kick (DELETE member) endpoint.
+      properties:
+        purge_messages:
+          type: boolean
+          default: false
+          description: >-
+            When true, the actor holds Manage All Messages, and this is a moderator removal
+            (not a self-leave), additionally purge the removed user's server-wide messages.
+            Additive — the removal succeeds regardless of purge outcome.
+    PurgeOutcome:
+      type: object
+      description: >-
+        Present in the response only when purge_messages was requested. Reports the additive
+        purge sub-action; the ban/kick itself always succeeds.
+      required: [requested, status, purged_count]
+      properties:
+        requested:
+          type: boolean
+        status:
+          type: string
+          enum: [completed, skipped_unauthorized, skipped_rate_limited, failed]
+        purged_count:
+          type: integer
+          minimum: 0
     BannedMember:
       type: object
       properties:

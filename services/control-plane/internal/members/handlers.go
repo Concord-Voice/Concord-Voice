@@ -4,7 +4,9 @@ package members
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -53,6 +55,15 @@ type Handler struct {
 	// snapshot, so it could keep publishing until it voluntarily left. Wired via
 	// SetVoiceEnforcer; nil means no push (the pre-push, join-snapshot behavior).
 	voiceEnforcer rbac.VoiceEnforcer
+	// purger backs the optional purge-on-ban/kick (#1353). Wired via
+	// SetServerMessagePurger; nil means the moderation purge fails closed (skipped).
+	purger serverMessagePurger
+	// purgeRateLimit / purgeRateWindow are the fail-closed per-actor budget for the
+	// moderation purge, wired from the same resolvePurgeRateLimit(cfg) values the standalone
+	// purge endpoint uses (#1353 review, Codex P2) so PURGE_RATE_LIMIT/WINDOW overrides apply
+	// consistently. Zero falls back to the package defaults.
+	purgeRateLimit  int
+	purgeRateWindow time.Duration
 }
 
 // SetVoiceEnforcer wires the mid-session voice permission push. Called once at
@@ -772,6 +783,25 @@ func (h *Handler) execRemovalTx(serverID, targetUserID string) error {
 	return tx.Commit()
 }
 
+// RemoveMemberRequest is the optional body for the kick (DELETE member) endpoint (#1353).
+// An empty body binds to the zero value, so existing bodyless callers are unaffected.
+type RemoveMemberRequest struct {
+	PurgeMessages bool `json:"purge_messages"`
+}
+
+// bindOptionalBody binds an OPTIONAL JSON request body. An empty body is fine (fields stay at
+// their zero value); a MALFORMED non-empty body is rejected with 400 (#1353 review, Codex P1).
+// Discarding the bind error would let a truncated body like `{"purge_messages":true,` set the
+// flag before ShouldBindJSON errors and trigger an irreversible purge from an invalid request.
+// Returns true to proceed; on false the caller must return (the 400 is already written).
+func bindOptionalBody(c *gin.Context, req any) bool {
+	if err := c.ShouldBindJSON(req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return false
+	}
+	return true
+}
+
 // RemoveMember removes a member from a server (kick or leave)
 func (h *Handler) RemoveMember(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -784,6 +814,11 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	}
 	if _, err := uuid.Parse(targetUserID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
+		return
+	}
+
+	var req RemoveMemberRequest
+	if !bindOptionalBody(c, &req) { // #1353 optional body; empty OK, malformed rejected
 		return
 	}
 
@@ -853,12 +888,19 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 
 	h.triggerKeyRevocationsForServer(serverID, targetUserID, userID)
 
-	c.JSON(http.StatusOK, gin.H{"message": "Member " + action + " successfully"})
+	resp := gin.H{"message": "Member " + action + " successfully"}
+	// #1353: additive purge applies ONLY to a moderator removal, never a self-leave
+	// (no moderation intent — a user leaving must not bulk-wipe their own history).
+	if req.PurgeMessages && !auth.isSelfRemoval {
+		resp["purge"] = h.applyPurgeOnModeration(c.Request.Context(), serverID, userID, targetUserID, "kick")
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // BanRequest represents a request to ban a member
 type BanRequest struct {
-	Reason string `json:"reason"`
+	Reason        string `json:"reason"`
+	PurgeMessages bool   `json:"purge_messages"` // #1353 additive purge-on-ban (optional; default false)
 }
 
 // BannedMember represents a banned user
@@ -952,7 +994,9 @@ func (h *Handler) BanMember(c *gin.Context) {
 	}
 
 	var req BanRequest
-	_ = c.ShouldBindJSON(&req)
+	if !bindOptionalBody(c, &req) { // #1353 optional body; empty OK, malformed rejected
+		return
+	}
 
 	var reason *string
 	if req.Reason != "" {
@@ -998,7 +1042,13 @@ func (h *Handler) BanMember(c *gin.Context) {
 
 	h.triggerKeyRevocationsForServer(serverID, targetUserID, userID)
 
-	c.JSON(http.StatusOK, gin.H{"message": "Member banned"})
+	resp := gin.H{"message": "Member banned"}
+	// #1353: additive purge — runs AFTER the ban has committed; a denied/failed purge
+	// never affects the ban (best-effort, surfaced via the purge object only).
+	if req.PurgeMessages {
+		resp["purge"] = h.applyPurgeOnModeration(c.Request.Context(), serverID, userID, targetUserID, "ban")
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // UnbanMember removes a ban from a server

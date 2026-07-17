@@ -127,6 +127,34 @@ func RateLimitByUserFailClosed(redis *redis.Client, requests int, window time.Du
 	return rateLimit(redis, config)
 }
 
+// AllowUserAction performs a fail-CLOSED per-key rate-limit check OUTSIDE the gin
+// middleware chain, for a privileged sub-action invoked programmatically rather than as a
+// route (e.g. the purge-on-ban/kick sub-action, #1353). It mirrors rateLimit's INCR +
+// first-hit Expire but returns (allowed, err) instead of touching gin: a Redis backend
+// error returns (false, err) so the caller treats an outage as DENY — the same fail-closed
+// posture as RateLimitByUserFailClosed. The caller owns key construction and the deny action.
+func AllowUserAction(ctx context.Context, rdb *redis.Client, key string, limit int, window time.Duration) (bool, error) {
+	count, err := rdb.Incr(ctx, key).Result()
+	if err != nil {
+		return false, err // fail-closed: a backend error denies
+	}
+	// Ensure the key carries a TTL. A fresh INCR creates the key with NO expiry, and if an
+	// earlier Expire failed after the INCR persisted, the key survives with no TTL (-1) — its
+	// counter would then never reset and, once over budget, lock the actor out forever. Re-apply
+	// the window whenever the key lacks an expiry (both the first hit and the repair case),
+	// mirroring resolveRateLimitTTL. Post-INCR the key exists, so TTL is -1 (no expiry) or >=0.
+	ttl, ttlErr := rdb.TTL(ctx, key).Result()
+	if ttlErr != nil {
+		return false, ttlErr // fail-closed: a TTL read failure denies
+	}
+	if ttl == -1 {
+		if err := rdb.Expire(ctx, key, window).Err(); err != nil {
+			return false, err // fail-closed: a TTL-set failure denies
+		}
+	}
+	return count <= int64(limit), nil
+}
+
 // rateLimit is the core rate limiting middleware
 func rateLimit(redis *redis.Client, config RateLimitConfig) gin.HandlerFunc {
 	return func(c *gin.Context) {

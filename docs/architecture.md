@@ -244,7 +244,7 @@ Packaged clients fetch binary update manifests + signed installers from the publ
 | `invites`       | Server invite code generation, listing, revoking, joining, preview                           |
 | `klipy`         | KLIPY GIF API + media proxy with SSRF egress guard                                           |
 | `media`         | Object-store handler: avatar, banner, server-icon, attachment up/download                    |
-| `members`       | Server membership: add, update role, remove, ban/unban                                       |
+| `members`       | Server membership: add, update role, remove, ban/unban (optional purge-on-ban/kick of the removed user's messages, #1353) |
 | `messages`      | Channel + DM message CRUD, reactions, pins, embed suppression                                |
 | `mfa`           | TOTP, WebAuthn, backup codes, recovery key, trusted devices, recovery circle                 |
 | `middleware`    | Auth, CORS, rate-limiting, security headers, attestation gate, request-ID                    |

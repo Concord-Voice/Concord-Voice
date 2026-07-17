@@ -315,6 +315,9 @@ func NewRouter(
 
 	purgeRateLimit, purgeRateWindow := resolvePurgeRateLimit(cfg)
 	messagesHandler := messages.NewHandler(db, log, hub, rbacResolver, entCache, purgeEngine, opsCounters)
+	// #1353: give the members handler the purge capability for optional purge-on-ban/kick,
+	// sharing the standalone purge endpoint's fail-closed rate-limit config (Codex P2 review).
+	membersHandler.SetServerMessagePurger(messagesHandler, purgeRateLimit, purgeRateWindow)
 	invitesHandler := invites.NewHandler(db, log, hub, rbacResolver)
 	voiceHandler := voice.NewHandler(voice.HandlerDeps{
 		DB:          db,

@@ -1,7 +1,9 @@
 package messages
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -11,10 +13,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 )
 
-const (
-	errMsgEnumerateChannels = "Failed to enumerate channels"
-	errMsgPurgeFailed       = "Purge failed"
-)
+const errMsgPurgeFailed = "Purge failed"
 
 // purgeRequest is the shared body for the channel and server purge endpoints (#1352).
 // Range is recent-ward ("1h".."90d") or "all"; TargetUserID narrows to one author
@@ -57,7 +56,7 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 		return
 	}
 
-	author, ok := h.resolvePurgeAuthor(c, serverID, userID, channelID, req.TargetUserID)
+	author, ok := h.resolvePurgeAuthor(c.Request.Context(), serverID, userID, channelID, req.TargetUserID)
 	if !ok {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions to purge this channel"})
 		return
@@ -93,16 +92,21 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"deleted_count": res.DeletedCount, "hidden_count": 0})
 }
 
+// PurgeStatus is the outcome of a server-scoped purge for one actor.
+type PurgeStatus string
+
+// Purge outcomes returned by purgeServerCore / PurgeUserServerMessages, plus the
+// moderation-path-only PurgeSkippedRateLimited (set by the members handler before the
+// engine runs, #1353).
+const (
+	PurgeCompleted           PurgeStatus = "completed"
+	PurgeSkippedUnauthorized PurgeStatus = "skipped_unauthorized"
+	PurgeSkippedRateLimited  PurgeStatus = "skipped_rate_limited"
+	PurgeFailed              PurgeStatus = "failed"
+)
+
 // PurgeServer handles DELETE /servers/:id/messages — bulk-delete across a server's
-// channels (#1352).
-//
-// SECURITY (review finding M1): authorization is re-resolved PER CHANNEL, never once
-// at server scope. computeEffectivePermissions skips applyChannelOverrides when
-// channelID is "", so a single server-scope check would bypass channel_permission_overrides
-// rows that DENY ManageAllMessages (or view) on specific channels — and irreversibly
-// delete messages the actor is explicitly denied access to. Channels where the actor
-// lacks permission are SKIPPED; if no channel is purgeable the request 403s with no
-// audit row (the guard runs before Engine.Run, which writes the audit).
+// channels (#1352). It parses the range/target request and delegates to purgeServerCore.
 func (h *Handler) PurgeServer(c *gin.Context) {
 	userID := c.GetString("user_id")
 	serverID := c.Param("id")
@@ -122,11 +126,42 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.QueryContext(c.Request.Context(),
-		`SELECT id FROM channels WHERE server_id = $1`, serverID)
+	deleted, status, err := h.purgeServerCore(
+		c.Request.Context(), serverID, userID, req.TargetUserID, "manual", rangeFrom, req.Range)
+	switch status {
+	case PurgeSkippedUnauthorized:
+		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions to purge this server"})
+	case PurgeFailed:
+		h.log.Error("Server purge failed", "error", err, "server_id", serverID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
+	default:
+		h.log.Info("Server purged", "server_id", serverID, "actor", userID, "deleted", deleted)
+		// hidden_count is structurally 0 for server contexts — returned so the response
+		// shape matches spec §4 { deleted_count, hidden_count } across ALL contexts.
+		c.JSON(http.StatusOK, gin.H{"deleted_count": deleted, "hidden_count": 0})
+	}
+}
+
+// purgeServerCore is the single authorization + purge path across a server's channels,
+// shared by the HTTP PurgeServer endpoint (range-aware, reason "manual") and the ban/kick
+// moderation path (All Time, reason "ban"/"kick").
+//
+// SECURITY (review finding M1, #1352): authorization is re-resolved PER CHANNEL, never once
+// at server scope. computeEffectivePermissions skips applyChannelOverrides when channelID is
+// "", so a single server-scope check would bypass channel_permission_overrides rows that DENY
+// ManageAllMessages (or view) on specific channels — and irreversibly delete messages the actor
+// is explicitly denied access to. Channels where the actor lacks permission are SKIPPED; if no
+// channel is purgeable the caller gets SkippedUnauthorized with no audit row (the guard runs
+// before Engine.Run, which writes the audit). A nil error accompanies Completed and
+// SkippedUnauthorized; a non-nil error accompanies Failed.
+func (h *Handler) purgeServerCore(
+	ctx context.Context, serverID, actorID string, target *string,
+	reason string, rangeFrom *time.Time, rangeLabel string,
+) (int, PurgeStatus, error) {
+	rows, err := h.db.QueryContext(ctx, `SELECT id FROM channels WHERE server_id = $1`, serverID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgEnumerateChannels})
-		return
+		h.log.Error("Server purge: enumerate channels failed", "error", err, "server_id", serverID)
+		return 0, PurgeFailed, err
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -134,19 +169,17 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgEnumerateChannels})
-			return
+			return 0, PurgeFailed, err
 		}
 		channelIDs = append(channelIDs, id)
 	}
 	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgEnumerateChannels})
-		return
+		return 0, PurgeFailed, err
 	}
 
 	var deletes []purge.DeleteSpec
 	for _, chID := range channelIDs {
-		author, ok := h.resolvePurgeAuthor(c, serverID, userID, chID, req.TargetUserID)
+		author, ok := h.resolvePurgeAuthor(ctx, serverID, actorID, chID, target)
 		if !ok {
 			continue // denied in this channel — skip it, never delete here
 		}
@@ -159,36 +192,39 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 		})
 	}
 	if len(deletes) == 0 {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions to purge this server"})
-		return
+		return 0, PurgeSkippedUnauthorized, nil
 	}
 
 	plan := purge.Plan{
 		ContextType: purge.ContextServer,
 		ContextID:   serverID,
 		ServerID:    &serverID,
-		ActorID:     userID,
-		Target:      req.TargetUserID,
-		Reason:      "manual",
+		ActorID:     actorID,
+		Target:      target,
+		Reason:      reason,
 		RangeFrom:   rangeFrom,
 		Deletes:     deletes,
 	}
-	res, err := h.purgeEngine.Run(c.Request.Context(), plan)
+	res, err := h.purgeEngine.Run(ctx, plan)
 	if err != nil {
 		h.log.Error("Server purge failed", "error", err, "server_id", serverID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
-		return
+		return 0, PurgeFailed, err
 	}
-
-	h.log.Info("Server purged", "server_id", serverID, "actor", userID,
-		"channels", len(deletes), "deleted", res.DeletedCount)
 	// One event per affected channel (spec §11). The engine returns only an aggregate
 	// count, so the per-channel event carries 0; clients treat the event as an
 	// invalidation signal and refetch (next-fetch is the correctness backstop).
 	for _, ds := range deletes {
-		h.emitChannelPurged(ds.ScopeID, userID, 0, req.Range)
+		h.emitChannelPurged(ds.ScopeID, actorID, 0, rangeLabel)
 	}
-	c.JSON(http.StatusOK, gin.H{"deleted_count": res.DeletedCount, "hidden_count": 0})
+	return res.DeletedCount, PurgeCompleted, nil
+}
+
+// PurgeUserServerMessages purges ALL of target's messages across serverID (All Time) for the
+// moderation (ban/kick) path; reason is "ban" or "kick". Thin wrapper over purgeServerCore so
+// the members package can consume it through a narrow interface without the range machinery.
+func (h *Handler) PurgeUserServerMessages(ctx context.Context, serverID, actorID, target, reason string) (int, PurgeStatus, error) {
+	t := target
+	return h.purgeServerCore(ctx, serverID, actorID, &t, reason, nil /* All Time */, "all")
 }
 
 // resolvePurgeAuthor resolves the author filter for one channel per the RBAC matrix:
@@ -196,13 +232,13 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 // ManageOwn only → self, and ONLY when no other author was requested; neither → not
 // authorized. Membership resolution is inside HasPermission (ErrNotMember → false).
 // Resolver errors fail CLOSED (denied).
-func (h *Handler) resolvePurgeAuthor(c *gin.Context, serverID, userID, channelID string, target *string) (*string, bool) {
+func (h *Handler) resolvePurgeAuthor(ctx context.Context, serverID, userID, channelID string, target *string) (*string, bool) {
 	// You cannot purge what you cannot see. Without this, a channel override that
 	// denies PermViewTextChannels but leaves ManageAllMessages intact would let an
 	// actor irreversibly wipe a private channel they cannot even open. Purge needs no
 	// message ID, so unlike DeleteMessage it reaches every message in the channel by
 	// scope alone — the view gate is what bounds that reach.
-	canView, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermViewTextChannels)
+	canView, err := h.resolver.HasPermission(ctx, serverID, userID, channelID, rbac.PermViewTextChannels)
 	if err != nil {
 		h.log.Error("Purge authz resolve failed", "error", err, "channel_id", channelID)
 		return nil, false
@@ -211,7 +247,7 @@ func (h *Handler) resolvePurgeAuthor(c *gin.Context, serverID, userID, channelID
 		return nil, false
 	}
 
-	canAll, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermManageAllMessages)
+	canAll, err := h.resolver.HasPermission(ctx, serverID, userID, channelID, rbac.PermManageAllMessages)
 	if err != nil {
 		h.log.Error("Purge authz resolve failed", "error", err, "channel_id", channelID)
 		return nil, false
@@ -219,7 +255,7 @@ func (h *Handler) resolvePurgeAuthor(c *gin.Context, serverID, userID, channelID
 	if canAll {
 		return target, true
 	}
-	canOwn, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermManageOwnMessages)
+	canOwn, err := h.resolver.HasPermission(ctx, serverID, userID, channelID, rbac.PermManageOwnMessages)
 	if err != nil || !canOwn {
 		return nil, false
 	}
