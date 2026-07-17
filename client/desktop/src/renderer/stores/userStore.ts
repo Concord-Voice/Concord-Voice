@@ -6,6 +6,7 @@ import { apiFetch } from '../services/apiClient';
 import { errorMessage } from '../utils/redactError';
 import { getWebSocketService } from '../services/websocketService';
 import { e2eeService } from '../services/e2eeService';
+import { E2EEInitTeardownError } from '../services/e2eeErrors';
 import { preferencesSyncService } from '../services/preferencesSync';
 import { savedGifsSyncService } from '../services/savedGifsSync';
 import { friendOrgSyncService } from '../services/friendOrgSync';
@@ -92,6 +93,13 @@ interface UserFetchLifecycle {
 }
 
 const PASSWORD_CHANGE_CANCELLED = 'Password change was cancelled'; // pragma: allowlist secret
+// Distinct from PASSWORD_CHANGE_CANCELLED: the server-side change ALREADY committed, so
+// the old credential is gone and the operation is NOT retryable — the user must
+// re-authenticate with the new password. Surfaced via the auth store's loginNotice
+// channel (which survives nuclearReset — clearAccessToken preserves it) so the login
+// screen can explain the sign-out (#2333 salvage).
+const REAUTH_REQUIRED_NOTICE =
+  'Your password was changed, but this session could not be re-secured. Please sign in again with your new password.';
 let activePasswordChange: PasswordChangeLifecycle | null = null;
 let activeUserFetch: UserFetchLifecycle | null = null;
 
@@ -194,6 +202,64 @@ function passwordChangeFailure(error: unknown, isCurrent: () => boolean): Passwo
     success: false,
     error: error instanceof Error ? error.message : 'Failed to change password',
   };
+}
+
+/**
+ * Re-init E2EE after a committed password change, failing closed if the new keyset was torn
+ * down mid-derivation. Returns `null` on success (the caller continues) or a
+ * `PasswordChangeResult` when it failed closed. Extracted (with its own `try/catch`) so
+ * `changePassword` stays under the S3776 cognitive-complexity ceiling.
+ *
+ * A teardown during the derivation surfaces as `E2EEInitTeardownError` (#2337). Because the
+ * password POST already committed (credential rotated, refresh tokens revoked), this is NOT
+ * a retryable cancellation — the old password is gone. The re-auth message goes in the auth
+ * store's `loginNotice` channel (which `clearAccessToken` — and therefore `nuclearReset` —
+ * preserves, and which the login screen renders once) so it survives the teardown that
+ * redirects the user to the login screen (the returned error can't render — the settings
+ * view unmounts on the auth transition).
+ *
+ * `nuclearReset` is passed in pre-resolved (loaded before the POST) so this path has NO
+ * await, letting the lifecycle be inspected synchronously and precisely (coderabbit):
+ * - still the current lifecycle → force the teardown (backstop for the rare non-token-
+ *   clearing throw) AND stage the notice;
+ * - superseded, but the session is already unauthenticated (a self-teardown already cleared
+ *   the token and is redirecting to login) → stage the notice only;
+ * - superseded by a DIFFERENT authenticated session (a newer login became current) →
+ *   neither: do not clobber the new session's state or notice.
+ * Any non-teardown error propagates unchanged.
+ */
+async function reinitE2EEOrFailClosed(
+  newPassword: string,
+  wrappedPrivateKeyBase64: string,
+  saltBase64: string,
+  lifecycleGuard: HydrationLifecycleGuard,
+  isCurrent: () => boolean,
+  nuclearReset: () => void
+): Promise<PasswordChangeResult | null> {
+  try {
+    await e2eeService.initialize(
+      newPassword,
+      wrappedPrivateKeyBase64,
+      saltBase64,
+      'argon2id',
+      lifecycleGuard
+    );
+    return null;
+  } catch (initError) {
+    if (!(initError instanceof E2EEInitTeardownError)) throw initError;
+    // No await below — nuclearReset is pre-resolved — so the lifecycle is inspected
+    // synchronously with no window for a newer login to slip in (coderabbit).
+    if (isCurrent()) {
+      nuclearReset();
+      useAuthStore.getState().setLoginNotice(REAUTH_REQUIRED_NOTICE);
+    } else if (useAuthStore.getState().accessToken === null) {
+      // Superseded, but already unauthenticated: a self-teardown cleared the token and is
+      // redirecting to login — stage the notice. NOT when a different authenticated session
+      // is current (that would clobber the new session's notice).
+      useAuthStore.getState().setLoginNotice(REAUTH_REQUIRED_NOTICE);
+    }
+    return { success: false, error: REAUTH_REQUIRED_NOTICE };
+  }
 }
 
 export const useUserStore = wrapStore(
@@ -428,6 +494,15 @@ export const useUserStore = wrapStore(
             );
             assertPasswordChangeCurrent(isCurrent);
 
+            // Pre-load the reset primitive BEFORE the irreversible password POST so the
+            // fail-closed path (reinitE2EEOrFailClosed) has NO await: a chunk-load failure
+            // surfaces here — before the change commits — instead of leaving a committed
+            // change unable to fail closed (CWE-693), and the teardown can check the
+            // lifecycle synchronously with no window for a newer login to slip in (which
+            // would otherwise get its notice clobbered). The dynamic import is required —
+            // resetService imports userStore, so a static import would cycle (coderabbit).
+            const { nuclearReset } = await import('../services/resetService');
+
             // Step 4: Send password change with re-wrapped keys
             const response = await apiFetch('/api/v1/users/me/password', {
               method: 'POST',
@@ -482,14 +557,20 @@ export const useUserStore = wrapStore(
               throw new Error('Server returned an invalid presence override version');
             }
 
-            // Re-initialize E2EE service with new password (always Argon2id after change)
-            await e2eeService.initialize(
+            // Re-initialize E2EE with the new password. The password POST above already
+            // committed, so a teardown during the derivation (E2EEInitTeardownError, #2337)
+            // is NOT retryable — reinitE2EEOrFailClosed fails closed with an honest re-auth
+            // notice rather than the misleading "Password change was cancelled" (#2333
+            // salvage). Returns non-null only on that fail-closed path.
+            const failClosed = await reinitE2EEOrFailClosed(
               newPassword,
               arrayBufferToBase64(newWrappedKey),
               arrayBufferToBase64(newSalt.buffer as ArrayBuffer),
-              'argon2id',
-              lifecycleGuard
+              lifecycleGuard,
+              isCurrent,
+              nuclearReset
             );
+            if (failClosed) return failClosed;
             assertPasswordChangeCurrent(isCurrent);
 
             usePresenceOverrideStore

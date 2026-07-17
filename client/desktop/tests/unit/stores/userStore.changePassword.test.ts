@@ -19,6 +19,16 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
+// changePassword fails closed via nuclearReset when the new keyset is torn down after the
+// server-side change already committed (#2333 salvage).
+const mockNuclearReset = vi.fn();
+vi.mock('@/renderer/services/resetService', () => ({
+  nuclearReset: (...args: unknown[]) => mockNuclearReset(...args),
+  gracefulReset: vi.fn(),
+  recoveryReset: vi.fn(),
+  softRestart: vi.fn(),
+}));
+
 vi.mock('@/renderer/services/preferencesSync', () => ({
   preferencesSyncService: {
     stopWatching: vi.fn(),
@@ -63,6 +73,7 @@ vi.mock('@/renderer/utils/crypto', () => ({
 
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
+import { E2EEInitTeardownError } from '@/renderer/services/e2eeErrors';
 import { apiFetch } from '@/renderer/services/apiClient';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { preferencesSyncService } from '@/renderer/services/preferencesSync';
@@ -100,6 +111,7 @@ describe('userStore - changePassword', () => {
     vi.clearAllMocks();
     useUserStore.setState({ user: mockUser as any, isLoading: false, error: null });
     useAuthStore.getState().setAccessToken('mock-access');
+    useAuthStore.getState().setLoginNotice(null);
     usePresenceOverrideStore.getState().reset();
     useSavedGifsStore.getState().reset();
     useFriendOrgStore.getState().reset();
@@ -403,6 +415,126 @@ describe('userStore - changePassword', () => {
     expect(preferencesSyncService.pushPreferences).not.toHaveBeenCalled();
     expect(usePresenceOverrideStore.getState().excludedUserIds).toEqual(excludedUserIds);
     expect(usePresenceOverrideStore.getState().appliedVersion).toBe(7);
+  });
+
+  it('fails closed (re-auth notice) when the keyset is torn down AFTER the password POST committed (#2333)', async () => {
+    // The POST has already rotated the password + revoked refresh tokens. A teardown
+    // during the new-key derivation surfaces as E2EEInitTeardownError (#2337). Reporting
+    // a retryable "Password change was cancelled" would be a lie (the old password is
+    // gone) and leave the session admitted-without-E2EE. It must fail closed with an
+    // honest re-auth message + a login-screen notice that survives nuclearReset.
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          e2ee_keys: { wrapped_private_key: 'old-wrapped-key', key_derivation_salt: 'old-salt' },
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ presence_override_version: 8 }),
+      } as Response);
+    vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new E2EEInitTeardownError());
+
+    const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
+
+    expect(result.success).toBe(false);
+    // NOT the retryable-cancellation lie:
+    expect(result.error).not.toBe('Password change was cancelled');
+    expect(result.error).toContain('sign in again with your new password');
+    // Reset-surviving login notice staged (auth store preserves it across nuclearReset):
+    expect(useAuthStore.getState().loginNotice).toContain('sign in again with your new password');
+    // Fail-closed teardown so the session cannot linger admitted-without-E2EE:
+    expect(mockNuclearReset).toHaveBeenCalledTimes(1);
+    // ...and no post-change work ran against the aborted keyset.
+    expect(preferencesSyncService.pushPreferences).not.toHaveBeenCalled();
+  });
+
+  it('stages the notice but skips a redundant nuclearReset when the teardown already superseded this change (#2333)', async () => {
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          e2ee_keys: { wrapped_private_key: 'old-wrapped-key', key_derivation_salt: 'old-salt' },
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ presence_override_version: 8 }),
+      } as Response);
+    // The teardown that throws E2EEInitTeardownError also cleared the token (as a real
+    // nuclearReset would), so the password-change lifecycle is already superseded when the
+    // fail-closed path runs: nuclearReset must NOT fire again (isCurrent() is false), but
+    // the loginNotice still stages (clearAccessToken preserves it).
+    vi.mocked(e2eeService.initialize).mockImplementationOnce(async () => {
+      useAuthStore.getState().clearAccessToken();
+      throw new E2EEInitTeardownError();
+    });
+
+    const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
+
+    expect(result.error).toContain('sign in again with your new password');
+    expect(useAuthStore.getState().loginNotice).toContain('sign in again with your new password');
+    expect(mockNuclearReset).not.toHaveBeenCalled();
+  });
+
+  it('does NOT stage the notice or reset when a DIFFERENT authenticated session became current (#2333)', async () => {
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          e2ee_keys: { wrapped_private_key: 'old-wrapped-key', key_derivation_salt: 'old-salt' },
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ presence_override_version: 8 }),
+      } as Response);
+    // A newer login became current mid-re-init (its token replaced ours). The stale
+    // password-change flow must NOT nuclearReset it and must NOT clobber its loginNotice.
+    vi.mocked(e2eeService.initialize).mockImplementationOnce(async () => {
+      useAuthStore.getState().setAccessToken('newer-session-token');
+      throw new E2EEInitTeardownError();
+    });
+
+    const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
+
+    expect(result.success).toBe(false);
+    // The newer session's notice channel is left untouched.
+    expect(useAuthStore.getState().loginNotice).toBeNull();
+    expect(mockNuclearReset).not.toHaveBeenCalled();
+  });
+
+  it('propagates a NON-teardown init error to the generic failure (no re-auth notice) (#2333)', async () => {
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          e2ee_keys: { wrapped_private_key: 'old-wrapped-key', key_derivation_salt: 'old-salt' },
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ presence_override_version: 8 }),
+      } as Response);
+    // A non-teardown error is a normal failure — it must propagate unchanged, NOT trigger
+    // the fail-closed re-auth path (no notice, no nuclearReset).
+    vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new Error('init boom'));
+
+    const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('init boom');
+    expect(useAuthStore.getState().loginNotice).toBeNull();
+    expect(mockNuclearReset).not.toHaveBeenCalled();
   });
 
   it('returns error when current password is incorrect (401)', async () => {
