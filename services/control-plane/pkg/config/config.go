@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -143,12 +144,16 @@ func (c CloudflareKVBridgeConfig) String() string {
 // Config holds all configuration for the application
 type Config struct {
 	Environment string
-	Port        string
-	DatabaseURL string
-	RedisURL    string
-	JWTSecret   string // #nosec G117 -- False positive: config field name, actual secret loaded from env
-	NATSUrl     string
-	OpsMetrics  OpsMetricsConfig
+	// HSTSHeaderValue is the Strict-Transport-Security policy the security
+	// middleware emits in production. Optional; empty falls back to
+	// middleware.DefaultHSTSHeaderValue (single source of truth).
+	HSTSHeaderValue string
+	Port            string
+	DatabaseURL     string
+	RedisURL        string
+	JWTSecret       string // #nosec G117 -- False positive: config field name, actual secret loaded from env
+	NATSUrl         string
+	OpsMetrics      OpsMetricsConfig
 
 	// CORS settings
 	AllowedOrigins []string
@@ -330,6 +335,7 @@ func Load() (*Config, error) {
 
 	cfg := &Config{
 		Environment:           getEnv("ENVIRONMENT", "development"),
+		HSTSHeaderValue:       getEnv("HSTS_HEADER_VALUE", ""),
 		Port:                  getEnv("PORT", "8080"),
 		DatabaseURL:           getEnv("DATABASE_URL", defaultDevDatabaseURL()),
 		RedisURL:              getEnv("REDIS_URL", defaultDevRedisURL()),
@@ -603,6 +609,81 @@ func (c *Config) validate() error {
 	return c.validateProduction()
 }
 
+// Structural RFC 6797 STS policy pieces: bare or token=token directives
+// (max-age, includeSubDomains, preload). Browsers silently IGNORE an invalid
+// STS policy — a "max-age=abc" typo, ANY duplicated directive (§6.1), or a
+// missing max-age — so each of those would disable HSTS despite the
+// fail-loud guard (#2318 review).
+// Directive values may be a bare token or an RFC 7230 quoted-string (Codex
+// review: `vendor-ext="foo bar"` is browser-valid). max-age is unbounded
+// decimal (RFC 6797 delta-seconds is 1*DIGIT; UAs clamp huge values).
+// Deliberate residual strictness: names are limited to [A-Za-z0-9-] (every
+// real STS directive fits), quoted values cannot contain ';' (the guard
+// splits on it) or '\' (quoted-pair escapes unsupported — a trailing
+// backslash would escape the apparent closing quote) — exotic-but-valid
+// policies beyond that fail loud at startup by design.
+var (
+	// Whole-value gate: printable ASCII plus TAB (legitimate RFC OWS).
+	// Categorically ends every invisible-byte class (controls, DEL, Unicode
+	// whitespace such as NBSP — which strings.TrimSpace would hide from
+	// validation while the emitter ships the original bytes) in one check
+	// (#2318 review).
+	hstsPrintableASCII     = regexp.MustCompile(`^[\x09\x20-\x7e]*$`)
+	hstsDirectivePattern   = regexp.MustCompile(`^[A-Za-z0-9-]+(?:=(?:[A-Za-z0-9._-]+|"[^"\\\x7f]*"))?$`)
+	hstsMaxAgeValuePattern = regexp.MustCompile(`^\d+$`)
+)
+
+// invalidHSTSHeaderValue reports whether an optional HSTS_HEADER_VALUE
+// override is set but not a structurally valid STS policy: exactly one
+// max-age=<decimal> in any position, plus optional non-duplicated directives
+// (names case-insensitive, order-free — RFC 6797 permits both). max-age=0
+// stays allowed: it is the legitimate policy-clear.
+func invalidHSTSHeaderValue(v string) bool {
+	if v == "" {
+		return false
+	}
+	if !hstsPrintableASCII.MatchString(v) {
+		return true
+	}
+	seen := map[string]bool{}
+	for _, p := range strings.Split(v, ";") {
+		// RFC OWS is SP/TAB only — TrimSpace would also strip Unicode
+		// whitespace and validate a fragment the emitter does not ship.
+		d := strings.Trim(p, " \t")
+		// RFC 6797's grammar allows empty directive slots (trailing or
+		// doubled semicolons) — browsers accept them, so the guard must too.
+		if d == "" {
+			continue
+		}
+		if invalidHSTSDirective(d, seen) {
+			return true
+		}
+	}
+	return !seen["max-age"]
+}
+
+// invalidHSTSDirective validates one trimmed, non-empty directive fragment,
+// recording its lowercased name in seen. Duplicates are invalid (RFC 6797
+// §6.1 has UAs ignore the whole field), max-age requires a decimal value, and
+// includeSubDomains/preload are valueless — a UA drops a malformed
+// "includeSubDomains=true" while keeping max-age, silently leaving subdomains
+// uncovered (#2318 review).
+func invalidHSTSDirective(d string, seen map[string]bool) bool {
+	if !hstsDirectivePattern.MatchString(d) {
+		return true
+	}
+	name, val, hasVal := strings.Cut(d, "=")
+	name = strings.ToLower(name)
+	if seen[name] {
+		return true
+	}
+	seen[name] = true
+	if name == "max-age" && !hstsMaxAgeValuePattern.MatchString(val) {
+		return true
+	}
+	return hasVal && (name == "includesubdomains" || name == "preload")
+}
+
 func (c *Config) validateProduction() error {
 	if c.Environment != "production" {
 		return nil
@@ -633,6 +714,8 @@ func (c *Config) validateProduction() error {
 			"STORAGE_ENDPOINT (or MINIO_ENDPOINT alias) must be set in production."},
 		{c.StorageBucket == "",
 			"STORAGE_BUCKET (or MINIO_BUCKET alias) must be set in production."},
+		{invalidHSTSHeaderValue(c.HSTSHeaderValue),
+			"HSTS_HEADER_VALUE must start with \"max-age=\" when set (RFC 6797 STS policy), or be empty to use the built-in default."},
 		{len(c.TrustedProxyCIDRs) == 0,
 			"TRUSTED_PROXY_CIDRS must be set in production. Without it, c.ClientIP() returns the reverse-proxy address instead of the real client IP, breaking rate limiting and session audit logs."},
 		// #725 review: MEDIA_PLANE_URL guard parity with other dev-default /

@@ -97,7 +97,8 @@ func TestLoad(t *testing.T) {
 	// Save and unset all env vars to test defaults
 	envVars := []string{
 		"ENVIRONMENT", "PORT", "DATABASE_URL", "REDIS_URL", "JWT_SECRET", "NATS_URL",
-		"ALLOWED_ORIGINS", "TRUSTED_PROXY_CIDRS", "ACTIVITY_HISTORY_CLUSTER_ENABLED",
+		"ALLOWED_ORIGINS", "TRUSTED_PROXY_CIDRS", "HSTS_HEADER_VALUE",
+		"ACTIVITY_HISTORY_CLUSTER_ENABLED",
 		"CONTROL_PLANE_REPLICA_COUNT", "ACTIVITY_HISTORY_OPERATOR_NAME",
 		"ACTIVITY_HISTORY_PRIVACY_POLICY_URL",
 	}
@@ -128,6 +129,9 @@ func TestLoad(t *testing.T) {
 		assert.Contains(t, cfg.NATSUrl, "nats://")
 		assert.NotEmpty(t, cfg.AllowedOrigins)
 		assert.Equal(t, []string{"172.16.0.0/12"}, cfg.TrustedProxyCIDRs)
+		// Empty default: the STS policy default lives ONLY in
+		// middleware.DefaultHSTSHeaderValue (single source of truth).
+		assert.Equal(t, "", cfg.HSTSHeaderValue)
 
 		// Message-purge tunables (#1352) default to the lightweight compose values.
 		assert.Equal(t, 5000, cfg.PurgeMaxBatch)

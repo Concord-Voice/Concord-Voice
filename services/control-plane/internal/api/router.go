@@ -228,7 +228,7 @@ func NewRouter(
 	opsCounters := configureOpsMetricsAndRecovery(router, cfg.OpsMetrics.Enabled)
 	router.Use(middleware.RequestID())
 	router.Use(middleware.Logger(log))
-	router.Use(middleware.SecurityHeaders(cfg.Environment))
+	router.Use(middleware.SecurityHeaders(cfg.Environment, cfg.HSTSHeaderValue))
 	router.Use(middleware.CORS(cfg.AllowedOrigins))
 	router.Use(middleware.ValidateCustomHeaders())
 
@@ -365,7 +365,8 @@ func NewRouter(
 		usersHandler.SetMediaStore(store)
 		serversHandler.SetMediaStore(store)
 	}
-	wsHandler := websocket.NewHandler(hub, db, redis, cfg.JWTSecret, cfg.AllowedOrigins)
+	wsHandler := websocket.NewHandler(hub, db, redis, cfg.JWTSecret, cfg.AllowedOrigins,
+		middleware.SecurityHeaderSet(cfg.Environment, cfg.HSTSHeaderValue))
 	wsTicketHandler := auth.NewWSTicketHandler(redis, cfg.JWTSecret)
 	clientConfigHandler := clientconfig.NewHandler(cfg, liveSpa, log)
 	serverCapabilitiesHandler := servercapabilities.NewHandler(cfg)

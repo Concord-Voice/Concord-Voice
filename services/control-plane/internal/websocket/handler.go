@@ -24,17 +24,23 @@ type Handler struct {
 	redis          *redis.Client
 	jwtSecret      string
 	allowedOrigins []string
-	upgrader       websocket.Upgrader
+	// securityHeaders is stamped onto the 101 handshake via Upgrade's
+	// responseHeader argument — gorilla hijacks the connection and does NOT
+	// serialize headers already set on the gin writer, so the security
+	// middleware alone never reaches successful upgrades (#2318 review).
+	securityHeaders http.Header
+	upgrader        websocket.Upgrader
 }
 
 // NewHandler creates a new WebSocket handler
-func NewHandler(hub *Hub, db *sql.DB, redisClient *redis.Client, jwtSecret string, allowedOrigins []string) *Handler {
+func NewHandler(hub *Hub, db *sql.DB, redisClient *redis.Client, jwtSecret string, allowedOrigins []string, securityHeaders http.Header) *Handler {
 	h := &Handler{
-		hub:            hub,
-		db:             db,
-		redis:          redisClient,
-		jwtSecret:      jwtSecret,
-		allowedOrigins: allowedOrigins,
+		hub:             hub,
+		db:              db,
+		redis:           redisClient,
+		jwtSecret:       jwtSecret,
+		allowedOrigins:  allowedOrigins,
+		securityHeaders: securityHeaders,
 	}
 	h.upgrader = websocket.Upgrader{
 		ReadBufferSize:  1024,
@@ -88,7 +94,7 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 
 	// Upgrade HTTP connection to WebSocket
 	// Origin is validated by h.upgrader.CheckOrigin (configured in NewHandler)
-	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil) // nosemgrep: go.gorilla.security.audit.websocket-missing-origin-check.websocket-missing-origin-check
+	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, h.securityHeaders) // nosemgrep: go.gorilla.security.audit.websocket-missing-origin-check.websocket-missing-origin-check
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to upgrade connection"})
 		return
