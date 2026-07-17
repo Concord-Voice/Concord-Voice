@@ -693,6 +693,8 @@ func TestDeleteMediaTier1Rejected(t *testing.T) {
 
 func TestUploadAvatarReuploadOverwrites(t *testing.T) {
 	ts := setupMediaTest(t)
+	counters := &mediaOpsCounterSpy{}
+	ts.handler.SetOpsCounter(counters)
 	userID := ts.createTestUser(t, "reupavatar")
 
 	// First upload
@@ -709,6 +711,7 @@ func TestUploadAvatarReuploadOverwrites(t *testing.T) {
 
 	// The storage key should still exist (overwritten, not duplicated)
 	assert.True(t, ts.store.hasObject(fmt.Sprintf(fmtAvatarsKey, userID)))
+	assert.Equal(t, 2, counters.uploads)
 }
 
 // =====================================================================
@@ -863,6 +866,8 @@ func TestDownloadAttachmentChannelSuccess(t *testing.T) {
 
 func TestUploadAttachmentStoreFailure(t *testing.T) {
 	ts := setupMediaTest(t)
+	counters := &mediaOpsCounterSpy{}
+	ts.handler.SetOpsCounter(counters)
 	owner := ts.createTestUser(t, "attachstorefail")
 	serverID := ts.createTestServer(t, owner, "StoreFail Server")
 	channelID := ts.createTestChannel(t, serverID, "storefail")
@@ -880,10 +885,13 @@ func TestUploadAttachmentStoreFailure(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 	resp := parseBody(t, w)
 	assert.Contains(t, resp["error"], "Failed to store file")
+	assert.Zero(t, counters.uploads)
 }
 
 func TestUploadAvatarStoreFailure(t *testing.T) {
 	ts := setupMediaTest(t)
+	counters := &mediaOpsCounterSpy{}
+	ts.handler.SetOpsCounter(counters)
 	userID := ts.createTestUser(t, "avatarstorefail")
 
 	ts.store.putErr = fmt.Errorf("storage unavailable")
@@ -897,6 +905,7 @@ func TestUploadAvatarStoreFailure(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 	resp := parseBody(t, w)
 	assert.Contains(t, resp["error"], "Failed to store image")
+	assert.Zero(t, counters.uploads)
 }
 
 // =====================================================================

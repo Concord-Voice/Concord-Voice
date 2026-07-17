@@ -5,6 +5,7 @@ import type {
   SeriesWindow,
 } from "./contracts";
 import { formatScalar } from "./formatMetric";
+import { formatTimestamp, type TimeMode } from "./time";
 
 const WIDTH = 800;
 const HEIGHT = 240;
@@ -50,6 +51,15 @@ const METRIC_LABELS: Record<MetricKey, string> = {
   channel_messages_total: "Channel messages",
   dm_messages_total: "Direct messages",
   ops_snapshot_rejections_total: "Operations snapshot rejections",
+  registered_users_current: "Registered users",
+  pending_registrations_current: "Pending registrations",
+  users_online_current: "Users online",
+  active_sessions_current: "Active sessions",
+  active_users_24h: "Active users over 24 hours",
+  active_users_7d: "Active users over 7 days",
+  active_users_15d: "Active users over 15 days",
+  active_users_30d: "Active users over 30 days",
+  media_uploads_total: "Media uploads",
   media_rooms_current: "Media rooms",
   media_participants_audio_current: "Audio participants",
   media_participants_webcam_current: "Webcam participants",
@@ -107,7 +117,8 @@ function polylinePoints(response: AdminSeriesResponse): string {
 
 export function SeriesChart({
   response,
-}: Readonly<{ response: AdminSeriesResponse }>) {
+  timeMode = "utc",
+}: Readonly<{ response: AdminSeriesResponse; timeMode?: TimeMode }>) {
   const label = METRIC_LABELS[response.metric.metric_key];
   const latestPoint = response.points.at(-1);
 
@@ -166,7 +177,7 @@ export function SeriesChart({
               <tr key={point.bucket_start}>
                 <td>
                   <time dateTime={point.bucket_start}>
-                    {point.bucket_start}
+                    {formatTimestamp(point.bucket_start, timeMode)}
                   </time>
                 </td>
                 <td>{formatScalar(point.value, response.metric.unit)}</td>

@@ -22,12 +22,14 @@ import { DEFAULT_THRESHOLDS } from "./preferences";
 import {
   ChangesWorkspace,
   CountersWorkspace,
+  deriveCounterRate,
   deriveCounterShare,
   HostWorkspace,
   ScalarValue,
   ServicesWorkspace,
   Status,
   TimeSeriesWorkspace,
+  UsersActivityWorkspace,
   type PollingResource,
 } from "./workspaces";
 import {
@@ -39,12 +41,16 @@ import {
 
 function counters(
   values: Partial<Record<CounterMetricKey, number>>,
+  sampledAt = SAMPLED_AT,
 ): AdminCountersResponse {
   return {
     node_id: NODE_ID,
     counters: Object.entries(values).map(([metricKey, value]) => ({
       metric_key: metricKey as CounterMetricKey,
-      source: metricKey.startsWith("media_") ? "media" : "control",
+      source:
+        metricKey.startsWith("media_") && metricKey !== "media_uploads_total"
+          ? "media"
+          : "control",
       unit: metricKey.startsWith("media_participant_hours_")
         ? "hours"
         : metricKey === "media_egress_cumulative_bytes"
@@ -52,7 +58,7 @@ function counters(
           : "count",
       kind: "counter",
       value: value ?? 0,
-      sampled_at: SAMPLED_AT,
+      sampled_at: sampledAt,
     })),
   };
 }
@@ -80,7 +86,12 @@ function definition(key: MetricKey): {
     key.startsWith("websocket_") ||
     key.startsWith("channel_") ||
     key.startsWith("dm_") ||
-    key.startsWith("ops_")
+    key.startsWith("ops_") ||
+    key.startsWith("registered_") ||
+    key.startsWith("pending_") ||
+    key.startsWith("users_") ||
+    key.startsWith("active_") ||
+    key === "media_uploads_total"
   ) {
     return {
       kind: COUNTER_METRIC_KEYS.includes(key as CounterMetricKey)
@@ -211,6 +222,7 @@ describe("Status", () => {
     ["degraded", "Degraded"],
     ["stopped", "Stopped"],
     ["unknown", "Unknown"],
+    ["available", "Available"],
     ["normal", "Normal"],
     ["warning", "Warning"],
     ["critical", "Critical"],
@@ -284,6 +296,230 @@ describe("deriveCounterShare", () => {
     });
 
     expect(deriveCounterShare(previous, current, errors)).toBeNull();
+  });
+});
+
+describe("deriveCounterRate", () => {
+  const messages = ["channel_messages_total", "dm_messages_total"] as const;
+
+  it("combines counters and scales by actual elapsed time", () => {
+    const previous = counters(
+      { channel_messages_total: 100, dm_messages_total: 50 },
+      "2026-07-14T12:00:00Z",
+    );
+    const current = counters(
+      { channel_messages_total: 120, dm_messages_total: 60 },
+      "2026-07-14T12:00:30Z",
+    );
+
+    expect(deriveCounterRate(previous, current, messages, 1)).toBe(1);
+    expect(deriveCounterRate(previous, current, messages, 60)).toBe(60);
+  });
+
+  it("rejects missing, reset, non-positive, and misaligned samples", () => {
+    const previous = counters(
+      { channel_messages_total: 100, dm_messages_total: 50 },
+      "2026-07-14T12:00:00Z",
+    );
+    const reset = counters(
+      { channel_messages_total: 90, dm_messages_total: 60 },
+      "2026-07-14T12:00:30Z",
+    );
+    const sameTime = counters(
+      { channel_messages_total: 120, dm_messages_total: 60 },
+      "2026-07-14T12:00:00Z",
+    );
+    const valid = counters(
+      { channel_messages_total: 120, dm_messages_total: 60 },
+      "2026-07-14T12:00:30Z",
+    );
+    const misaligned = counters(
+      { channel_messages_total: 120, dm_messages_total: 60 },
+      "2026-07-14T12:00:30Z",
+    );
+    misaligned.counters[1].sampled_at = "2026-07-14T12:00:31Z";
+    const differentNode = counters(
+      { channel_messages_total: 120, dm_messages_total: 60 },
+      "2026-07-14T12:00:30Z",
+    );
+    differentNode.node_id = "cvn_bbbbbbbbbbbbbbbb";
+
+    expect(deriveCounterRate(null, reset, messages, 1)).toBeNull();
+    expect(deriveCounterRate(previous, reset, messages, 1)).toBeNull();
+    expect(deriveCounterRate(previous, sameTime, messages, 1)).toBeNull();
+    expect(deriveCounterRate(previous, misaligned, messages, 1)).toBeNull();
+    expect(deriveCounterRate(previous, differentNode, messages, 1)).toBeNull();
+    expect(deriveCounterRate(previous, valid, messages, Number.NaN)).toBeNull();
+    expect(
+      deriveCounterRate(previous, valid, messages, Number.POSITIVE_INFINITY),
+    ).toBeNull();
+  });
+});
+
+describe("UsersActivityWorkspace", () => {
+  it("keeps people, sessions, clients, and throughput distinct", () => {
+    const current = fullCurrent();
+    const values: Partial<Record<MetricKey, number>> = {
+      registered_users_current: 100,
+      pending_registrations_current: 3,
+      active_users_24h: 7,
+      active_users_7d: 20,
+      active_users_15d: 30,
+      active_users_30d: 40,
+      users_online_current: 1,
+      active_sessions_current: 2,
+      websocket_connections_current: 2,
+    };
+    for (const metric of current.metrics) {
+      metric.value = values[metric.metric_key] ?? metric.value;
+    }
+    const previous = counters(
+      {
+        channel_messages_total: 100,
+        dm_messages_total: 50,
+        media_uploads_total: 10,
+      },
+      "2026-07-14T11:59:30Z",
+    );
+    const latest = counters({
+      channel_messages_total: 130,
+      dm_messages_total: 65,
+      media_uploads_total: 12,
+    });
+
+    render(
+      <UsersActivityWorkspace
+        counters={resource(latest)}
+        current={resource(current)}
+        previousCounters={previous}
+        timeMode="utc"
+      />,
+    );
+
+    expect(
+      screen.getByRole("article", { name: "Users online" }),
+    ).toHaveTextContent("1");
+    expect(
+      screen.getByRole("article", { name: "Active sessions" }),
+    ).toHaveTextContent("2");
+    expect(
+      screen.getByRole("article", { name: "WebSocket clients" }),
+    ).toHaveTextContent("2");
+    expect(
+      screen.getByRole("article", { name: "Message rate" }),
+    ).toHaveTextContent("90 / minute");
+    expect(
+      screen.getByRole("article", { name: "Upload rate" }),
+    ).toHaveTextContent("4 / minute");
+    expect(screen.getByRole("button", { name: "24 Hours" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(
+      screen.getByRole("article", { name: "Active users, 24 hours" }),
+    ).toHaveTextContent("7");
+    expect(
+      screen.getByRole("article", { name: "Registered users" }),
+    ).toHaveTextContent("Available");
+
+    fireEvent.click(screen.getByRole("button", { name: "7 Days" }));
+    expect(
+      screen.getByRole("article", { name: "Active users, 7 days" }),
+    ).toHaveTextContent("20");
+    fireEvent.click(
+      within(
+        screen.getByRole("group", { name: "Message rate period" }),
+      ).getByRole("button", { name: "Hour" }),
+    );
+    expect(
+      screen.getByRole("article", { name: "Message rate" }),
+    ).toHaveTextContent("5,400 / hour");
+    fireEvent.click(
+      within(
+        screen.getByRole("group", { name: "Upload rate period" }),
+      ).getByRole("button", { name: "Day" }),
+    );
+    expect(
+      screen.getByRole("article", { name: "Upload rate" }),
+    ).toHaveTextContent("5,760 / day");
+    expect(screen.getByText(/UTC/).closest("time")).toHaveAttribute(
+      "datetime",
+      SAMPLED_AT,
+    );
+  });
+
+  it("keeps cached rates visible while counters refresh", () => {
+    const previous = counters(
+      {
+        channel_messages_total: 100,
+        dm_messages_total: 50,
+        media_uploads_total: 10,
+      },
+      "2026-07-14T11:59:30Z",
+    );
+    const latest = counters({
+      channel_messages_total: 130,
+      dm_messages_total: 65,
+      media_uploads_total: 12,
+    });
+
+    render(
+      <UsersActivityWorkspace
+        counters={resource(latest, "loading")}
+        current={resource(fullCurrent())}
+        previousCounters={previous}
+        timeMode="utc"
+      />,
+    );
+
+    expect(
+      screen.getByRole("article", { name: "Message rate" }),
+    ).toHaveTextContent("90 / minute");
+    expect(
+      screen.getByRole("article", { name: "Upload rate" }),
+    ).toHaveTextContent("4 / minute");
+  });
+
+  it("does not derive rates from stale counters", () => {
+    render(
+      <UsersActivityWorkspace
+        counters={resource(fullCounters(), "stale")}
+        current={resource(fullCurrent())}
+        previousCounters={fullCounters(-10)}
+        timeMode="utc"
+      />,
+    );
+
+    expect(
+      screen.getByRole("article", { name: "Message rate" }),
+    ).toHaveTextContent("Unavailable");
+    expect(
+      screen.getByRole("article", { name: "Upload rate" }),
+    ).toHaveTextContent("Unavailable");
+  });
+
+  it("marks cached account and connection values stale", () => {
+    render(
+      <UsersActivityWorkspace
+        counters={resource(fullCounters())}
+        current={resource(fullCurrent(), "stale")}
+        previousCounters={fullCounters(-10)}
+        timeMode="utc"
+      />,
+    );
+
+    for (const label of [
+      "Registered users",
+      "Pending registrations",
+      "Active users, 24 hours",
+      "Users online",
+      "Active sessions",
+      "WebSocket clients",
+    ]) {
+      expect(screen.getByRole("article", { name: label })).toHaveTextContent(
+        "Stale",
+      );
+    }
   });
 });
 
@@ -509,7 +745,7 @@ describe("TimeSeriesWorkspace", () => {
       />,
     );
 
-    expect(screen.getAllByRole("option")).toHaveLength(52);
+    expect(screen.getAllByRole("option")).toHaveLength(61);
     for (const preset of [
       "Host pressure",
       "HTTP traffic",
@@ -640,7 +876,7 @@ describe("ChangesWorkspace", () => {
 });
 
 describe("primary workspace map", () => {
-  it("keeps the approved 4/28/20 split totaling 52 keys", () => {
+  it("keeps the approved 4/28/20/9 split totaling 61 keys", () => {
     expect(PRIMARY_METRIC_MAP.hostOverview).toHaveLength(4);
     expect(PRIMARY_METRIC_MAP.services).toHaveLength(28);
     expect([
@@ -649,6 +885,7 @@ describe("primary workspace map", () => {
       ...PRIMARY_METRIC_MAP.mediaEgress,
       ...PRIMARY_METRIC_MAP.participantHours,
     ]).toHaveLength(20);
-    expect(METRIC_KEYS).toHaveLength(52);
+    expect(PRIMARY_METRIC_MAP.usersActivity).toHaveLength(9);
+    expect(METRIC_KEYS).toHaveLength(61);
   });
 });

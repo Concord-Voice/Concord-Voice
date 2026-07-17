@@ -62,6 +62,9 @@ type Hub struct {
 
 	// Optional aggregate counter sink. Nil keeps metrics-disabled behavior inert.
 	opsCounter OpsCounter
+	// Optional trusted-side activity observer. It receives only first-client and
+	// last-client transitions for each user and must not perform blocking I/O.
+	activityObserver UserActivityObserver
 
 	// Mutex protecting maps accessed from outside the Run goroutine
 	mu sync.RWMutex
@@ -210,6 +213,12 @@ type OpsCounter interface {
 	Increment(opsmetrics.MetricKey)
 }
 
+// UserActivityObserver receives distinct-user connection boundary events.
+type UserActivityObserver interface {
+	UserConnected(uuid.UUID)
+	UserDisconnected(uuid.UUID)
+}
+
 // DMRingCanceller is the signature for the DM voice ring cleanup callback
 // invoked from handleUnregister when a user's last WS connection drops.
 // The dm.Handler.HandleUserDisconnect method satisfies this type.
@@ -314,6 +323,37 @@ func (h *Hub) ConnectionCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.clients)
+}
+
+// ConnectedUserCount returns the number of distinct users with a local client.
+func (h *Hub) ConnectedUserCount() int {
+	if h == nil {
+		return 0
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.userClients)
+}
+
+// SetActivityObserver installs the trusted-side distinct-user activity sink.
+// Existing connected users are seeded so startup races cannot lose an interval.
+func (h *Hub) SetActivityObserver(observer UserActivityObserver) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.activityObserver = observer
+	connectedUsers := make([]uuid.UUID, 0, len(h.userClients))
+	if observer != nil {
+		for userID := range h.userClients {
+			connectedUsers = append(connectedUsers, userID)
+		}
+	}
+	h.mu.Unlock()
+
+	for _, userID := range connectedUsers {
+		observer.UserConnected(userID)
+	}
 }
 
 // SetPresenceHistoryService binds the concrete service shared by Custom Status
@@ -441,30 +481,45 @@ func (h *Hub) Run() {
 			h.applyVoiceCountCatchup(c)
 
 		case <-h.done:
-			// Unpublish clients under the same lock held by typed delivery before
-			// closing their queues. A delivery already holding RLock completes
-			// first; a later delivery sees no connected target.
-			h.mu.Lock()
-			clients := make([]*Client, 0, len(h.clients))
-			for clientID, client := range h.clients {
-				clients = append(clients, client)
-				delete(h.clients, clientID)
-			}
-			clear(h.userClients)
-			h.mu.Unlock()
-
-			// Graceful shutdown: cancel async work, wait for completion, close connections.
-			for _, client := range clients {
-				if client.asyncCancel != nil {
-					client.asyncCancel()
-				}
-				client.asyncWg.Wait()
-				close(client.Send)
-			}
-			log.Printf("Hub shut down, closed %d client connections", len(clients))
+			h.shutdownClients()
 			return
 		}
 	}
+}
+
+func (h *Hub) shutdownClients() {
+	// Unpublish clients under the same lock held by typed delivery before
+	// closing their queues. A delivery already holding RLock completes first;
+	// a later delivery sees no connected target.
+	h.mu.Lock()
+	clients := make([]*Client, 0, len(h.clients))
+	connectedUsers := make([]uuid.UUID, 0, len(h.userClients))
+	for clientID, client := range h.clients {
+		clients = append(clients, client)
+		delete(h.clients, clientID)
+	}
+	for userID := range h.userClients {
+		connectedUsers = append(connectedUsers, userID)
+	}
+	observer := h.activityObserver
+	clear(h.userClients)
+	h.mu.Unlock()
+
+	if observer != nil {
+		for _, userID := range connectedUsers {
+			observer.UserDisconnected(userID)
+		}
+	}
+
+	// Cancel async work, wait for completion, then close connection queues.
+	for _, client := range clients {
+		if client.asyncCancel != nil {
+			client.asyncCancel()
+		}
+		client.asyncWg.Wait()
+		close(client.Send)
+	}
+	log.Printf("Hub shut down, closed %d client connections", len(clients))
 }
 
 // Shutdown gracefully stops the hub's Run loop, waits for it to exit, and
@@ -521,7 +576,6 @@ func (h *Hub) handleRegister(client *Client) {
 
 func (h *Hub) registerClient(client *Client) bool {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	h.clients[client.ID] = client
 
@@ -540,7 +594,14 @@ func (h *Hub) registerClient(client *Client) bool {
 		}
 	}
 
-	return len(h.userClients[client.UserID]) == 1
+	isFirstConnection := len(h.userClients[client.UserID]) == 1
+	observer := h.activityObserver
+	h.mu.Unlock()
+
+	if isFirstConnection && observer != nil {
+		observer.UserConnected(client.UserID)
+	}
+	return isFirstConnection
 }
 
 func (h *Hub) sendConnectedConfirmation(client *Client) {
@@ -769,18 +830,10 @@ func (h *Hub) sendVoiceCountsSnapshot(ctx context.Context, client *Client) {
 
 // handleUnregister unregisters a client
 func (h *Hub) handleUnregister(client *Client) {
-	h.mu.Lock()
-	_, exists := h.clients[client.ID]
+	exists, isLastConnection, remaining := h.unregisterClient(client)
 	if !exists {
-		h.mu.Unlock()
 		return
 	}
-
-	delete(h.clients, client.ID)
-	isLastConnection := h.removeUserClient(client)
-	h.removeClientSubscriptions(client)
-	remaining := len(h.clients)
-	h.mu.Unlock()
 
 	if client.asyncCancel != nil {
 		client.asyncCancel()
@@ -814,6 +867,28 @@ func (h *Hub) handleUnregister(client *Client) {
 
 	log.Printf("Client unregistered: user=%s client=%s remaining=%d",
 		sanitizeLogValue(client.UserID.String()), sanitizeLogValue(client.ID.String()), remaining)
+}
+
+func (h *Hub) unregisterClient(client *Client) (bool, bool, int) {
+	h.mu.Lock()
+	_, exists := h.clients[client.ID]
+	if !exists {
+		remaining := len(h.clients)
+		h.mu.Unlock()
+		return false, false, remaining
+	}
+
+	delete(h.clients, client.ID)
+	isLastConnection := h.removeUserClient(client)
+	h.removeClientSubscriptions(client)
+	remaining := len(h.clients)
+	observer := h.activityObserver
+	h.mu.Unlock()
+
+	if isLastConnection && observer != nil {
+		observer.UserDisconnected(client.UserID)
+	}
+	return true, isLastConnection, remaining
 }
 
 func (h *Hub) removeUserClient(client *Client) bool {

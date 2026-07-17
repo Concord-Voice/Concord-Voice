@@ -58,6 +58,18 @@ const CONTROL_METRIC_KEYS = [
   "ops_snapshot_rejections_total",
 ] as const;
 
+export const ACCOUNT_ACTIVITY_METRIC_KEYS = [
+  "registered_users_current",
+  "pending_registrations_current",
+  "users_online_current",
+  "active_sessions_current",
+  "active_users_24h",
+  "active_users_7d",
+  "active_users_15d",
+  "active_users_30d",
+  "media_uploads_total",
+] as const;
+
 const MEDIA_ACTIVITY_METRIC_KEYS = [
   "media_rooms_current",
   "media_participants_audio_current",
@@ -84,6 +96,7 @@ export const METRIC_KEYS = [
   ...HOST_METRIC_KEYS,
   ...SERVICE_METRIC_KEYS,
   ...CONTROL_METRIC_KEYS,
+  ...ACCOUNT_ACTIVITY_METRIC_KEYS,
   ...MEDIA_ACTIVITY_METRIC_KEYS,
   ...MEDIA_EGRESS_METRIC_KEYS,
   ...PARTICIPANT_HOUR_METRIC_KEYS,
@@ -95,6 +108,7 @@ export const PRIMARY_METRIC_MAP = {
   hostOverview: HOST_METRIC_KEYS,
   services: SERVICE_METRIC_KEYS,
   control: CONTROL_METRIC_KEYS,
+  usersActivity: ACCOUNT_ACTIVITY_METRIC_KEYS,
   mediaActivity: MEDIA_ACTIVITY_METRIC_KEYS,
   mediaEgress: MEDIA_EGRESS_METRIC_KEYS,
   participantHours: PARTICIPANT_HOUR_METRIC_KEYS,
@@ -106,6 +120,7 @@ export const COUNTER_METRIC_KEYS = [
   "http_server_errors_total",
   "channel_messages_total",
   "dm_messages_total",
+  "media_uploads_total",
   "ops_snapshot_rejections_total",
   "media_egress_cumulative_bytes",
   "media_participant_hours_audio",
@@ -196,7 +211,10 @@ export class ContractError extends Error {
 
 const metricKeySet = new Set<string>(METRIC_KEYS);
 const counterMetricKeySet = new Set<string>(COUNTER_METRIC_KEYS);
-const controlMetricKeySet = new Set<string>(CONTROL_METRIC_KEYS);
+const controlMetricKeySet = new Set<string>([
+  ...CONTROL_METRIC_KEYS,
+  ...ACCOUNT_ACTIVITY_METRIC_KEYS,
+]);
 const serviceNameSet = new Set<string>(SERVICE_NAMES);
 const sources = new Set<string>(["host", "control", "media"]);
 const units = new Set<string>([
@@ -439,7 +457,7 @@ export function parseCurrent(value: unknown): AdminCurrentResponse {
   const response = record(value);
   exactKeys(response, ["node_id", "metrics"]);
   const metrics = unique(
-    array(response.metrics, 52).map(parseMetricPoint),
+    array(response.metrics, 61).map(parseMetricPoint),
     (item) => item.metric_key,
   );
   return { node_id: nodeID(response.node_id), metrics };
@@ -449,7 +467,7 @@ export function parseCounters(value: unknown): AdminCountersResponse {
   const response = record(value);
   exactKeys(response, ["node_id", "counters"]);
   const counters = unique(
-    array(response.counters, 10).map((value): AdminCounterPoint => {
+    array(response.counters, 11).map((value): AdminCounterPoint => {
       const point = parseMetricPoint(value);
       if (
         !counterMetricKeySet.has(point.metric_key) ||

@@ -26,12 +26,22 @@ func TestCountersSnapshotIsClosedAndConcurrentSafe(t *testing.T) {
 	snapshot := counters.Snapshot()
 	require.Equal(t, float64(800), snapshot[opsmetrics.MetricChannelMessagesTotal])
 	require.Equal(t, float64(0), snapshot[opsmetrics.MetricDMMessagesTotal])
-	require.Len(t, snapshot, 6)
+	require.Equal(t, float64(0), snapshot[opsmetrics.MetricMediaUploadsTotal])
+	require.Len(t, snapshot, 7)
 	for key := range snapshot {
 		definition, ok := opsmetrics.Definition(key)
 		require.True(t, ok)
 		require.Equal(t, opsmetrics.SourceControl, definition.Source)
 	}
+}
+
+func TestCountersTrackSuccessfulMediaUploads(t *testing.T) {
+	counters := opsmetrics.NewCounters()
+
+	counters.Increment(opsmetrics.MetricMediaUploadsTotal)
+	counters.Increment(opsmetrics.MetricMediaUploadsTotal)
+
+	require.Equal(t, float64(2), counters.Snapshot()[opsmetrics.MetricMediaUploadsTotal])
 }
 
 func TestCountersIgnoreKeysNotOwnedByControlPlane(t *testing.T) {

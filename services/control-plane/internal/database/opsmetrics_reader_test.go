@@ -155,6 +155,8 @@ func TestOpsMetricsReaderConnectionIntegration(t *testing.T) {
 
 	for _, query := range []string{
 		`SELECT count(*) FROM users`,
+		`SELECT count(*) FROM pending_registrations`,
+		`SELECT count(*) FROM refresh_tokens`,
 		`SELECT count(*) FROM messages`,
 		`SELECT count(*) FROM user_keys`,
 		`SELECT count(*) FROM admin_users`,
@@ -539,6 +541,8 @@ func prepareOpsMetricsReaderIntegrationSchema(ctx context.Context, t *testing.T,
 
 	for _, query := range []string{
 		`CREATE TABLE IF NOT EXISTS users (test_id INTEGER)`,
+		`CREATE TABLE IF NOT EXISTS pending_registrations (test_id INTEGER)`,
+		`CREATE TABLE IF NOT EXISTS refresh_tokens (test_id INTEGER)`,
 		`CREATE TABLE IF NOT EXISTS messages (test_id INTEGER)`,
 		`CREATE TABLE IF NOT EXISTS user_keys (test_id INTEGER)`,
 		`CREATE TABLE IF NOT EXISTS admin_users (test_id INTEGER)`,

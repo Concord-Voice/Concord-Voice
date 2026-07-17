@@ -15,6 +15,7 @@ type Counters struct {
 	channelMessages    atomic.Uint64
 	dmMessages         atomic.Uint64
 	snapshotRejections atomic.Uint64
+	mediaUploads       atomic.Uint64
 
 	routesMu sync.RWMutex
 	routes   map[string]uint64
@@ -44,6 +45,8 @@ func (c *Counters) Increment(key MetricKey) {
 		c.dmMessages.Add(1)
 	case MetricSnapshotRejectionsTotal:
 		c.snapshotRejections.Add(1)
+	case MetricMediaUploadsTotal:
+		c.mediaUploads.Add(1)
 	}
 }
 
@@ -59,6 +62,7 @@ func (c *Counters) Snapshot() map[MetricKey]float64 {
 		MetricChannelMessagesTotal:    float64(c.channelMessages.Load()),
 		MetricDMMessagesTotal:         float64(c.dmMessages.Load()),
 		MetricSnapshotRejectionsTotal: float64(c.snapshotRejections.Load()),
+		MetricMediaUploadsTotal:       float64(c.mediaUploads.Load()),
 	}
 }
 

@@ -29,8 +29,11 @@ func TestAdminMetricsResponsesStayInsidePrivacyBoundary(t *testing.T) {
 		latest: []Point{
 			{NodeID: nodeID, Key: MetricServiceControlPlaneRunning, Value: 1, SampledAt: now},
 			{NodeID: nodeID, Key: MetricServiceControlPlaneHealthy, Value: 1, SampledAt: now},
+			{NodeID: nodeID, Key: MetricRegisteredUsersCurrent, Value: 12, SampledAt: now},
+			{NodeID: nodeID, Key: MetricActiveUsers24H, Value: 4, SampledAt: now},
 			{NodeID: nodeID, Key: MetricChannelMessagesTotal, Value: 20, SampledAt: now},
 			{NodeID: nodeID, Key: MetricDMMessagesTotal, Value: 10, SampledAt: now},
+			{NodeID: nodeID, Key: MetricMediaUploadsTotal, Value: 3, SampledAt: now},
 		},
 		series: []Bucket{
 			{

@@ -23,6 +23,61 @@ const opsMetricsTestDatabaseURL = "OPS_METRICS_TEST_DATABASE_URL"
 
 var migration000086MetricLiteral = regexp.MustCompile(`'(?:host|service|http|websocket|channel|dm|ops|media)_[a-z0-9_]+'`)
 
+var migration000086ExpectedMetricKeys = []string{
+	"channel_messages_total",
+	"dm_messages_total",
+	"host_cpu_percent",
+	"host_disk_percent",
+	"host_load_1m",
+	"host_memory_percent",
+	"http_client_errors_total",
+	"http_requests_total",
+	"http_server_errors_total",
+	"media_camera_publishers_current",
+	"media_egress_cumulative_bytes",
+	"media_egress_current_bps",
+	"media_egress_peak_bps",
+	"media_participant_hours_audio",
+	"media_participant_hours_screenshare",
+	"media_participant_hours_webcam",
+	"media_participants_audio_current",
+	"media_participants_screenshare_current",
+	"media_participants_webcam_current",
+	"media_peak_video_publishers_per_room",
+	"media_rooms_current",
+	"media_screen_publishers_current",
+	"ops_snapshot_rejections_total",
+	"service_control_plane_cpu_percent",
+	"service_control_plane_healthy",
+	"service_control_plane_memory_bytes",
+	"service_control_plane_running",
+	"service_coturn_cpu_percent",
+	"service_coturn_healthy",
+	"service_coturn_memory_bytes",
+	"service_coturn_running",
+	"service_media_plane_cpu_percent",
+	"service_media_plane_healthy",
+	"service_media_plane_memory_bytes",
+	"service_media_plane_running",
+	"service_minio_cpu_percent",
+	"service_minio_healthy",
+	"service_minio_memory_bytes",
+	"service_minio_running",
+	"service_nats_cpu_percent",
+	"service_nats_healthy",
+	"service_nats_memory_bytes",
+	"service_nats_running",
+	"service_postgres_cpu_percent",
+	"service_postgres_healthy",
+	"service_postgres_memory_bytes",
+	"service_postgres_running",
+	"service_redis_cpu_percent",
+	"service_redis_healthy",
+	"service_redis_memory_bytes",
+	"service_redis_running",
+	"websocket_connections_current",
+}
+
 func TestMigration000086_FilesAndSchemaLock(t *testing.T) {
 	up := migration000086SQL(t, "up")
 	down := migration000086SQL(t, "down")
@@ -38,7 +93,7 @@ func TestMigration000086_FilesAndSchemaLock(t *testing.T) {
 	assert.Contains(t, up, "ops_metric_samples_value_finite_check")
 	assert.Contains(t, up, "ops_metric_rollups_values_finite_check")
 	assert.Contains(t, up, "date_trunc('hour', bucket_start, 'UTC')")
-	assert.Equal(t, migration000086CatalogKeys(), migration000086MetricKeys(up))
+	assert.Equal(t, migration000086ExpectedMetricKeys, migration000086MetricKeys(up))
 
 	rollupsDrop := strings.Index(down, "DROP TABLE IF EXISTS ops_metric_rollups")
 	samplesDrop := strings.Index(down, "DROP TABLE IF EXISTS ops_metric_samples")
@@ -83,8 +138,8 @@ func TestMigration000086_IntegrationSchemaConstraintsAndSymmetry(t *testing.T) {
 	}, migration000086Columns(t, db, "ops_metric_rollups"))
 	assert.Equal(t, "node_id,metric_key,ts", migration000086PrimaryKey(t, db, "ops_metric_samples"))
 	assert.Equal(t, "node_id,metric_key,bucket_start", migration000086PrimaryKey(t, db, "ops_metric_rollups"))
-	assert.Equal(t, migration000086CatalogKeys(), migration000086ConstraintKeys(t, db, "ops_metric_samples_metric_key_check"))
-	assert.Equal(t, migration000086CatalogKeys(), migration000086ConstraintKeys(t, db, "ops_metric_rollups_metric_key_check"))
+	assert.Equal(t, migration000086ExpectedMetricKeys, migration000086ConstraintKeys(t, db, "ops_metric_samples_metric_key_check"))
+	assert.Equal(t, migration000086ExpectedMetricKeys, migration000086ConstraintKeys(t, db, "ops_metric_rollups_metric_key_check"))
 
 	var indexMethod string
 	require.NoError(t, db.QueryRowContext(ctx, `
@@ -247,16 +302,6 @@ func migration000086MetricKeys(contents string) []string {
 	}
 	sort.Strings(result)
 	return result
-}
-
-func migration000086CatalogKeys() []string {
-	definitions := opsmetrics.Catalog()
-	keys := make([]string, 0, len(definitions))
-	for _, definition := range definitions {
-		keys = append(keys, string(definition.Key))
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func migration000086RequireConstraint(t *testing.T, err error, name string) {

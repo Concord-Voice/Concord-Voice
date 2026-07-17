@@ -2151,6 +2151,65 @@ func TestHandleSetStatusMissingStatus(_ *testing.T) {
 
 // --- GetConnectedUsers / GetUserClientCount tests ---
 
+type recordingUserActivityObserver struct {
+	connected    []uuid.UUID
+	disconnected []uuid.UUID
+}
+
+func (observer *recordingUserActivityObserver) UserConnected(userID uuid.UUID) {
+	observer.connected = append(observer.connected, userID)
+}
+
+func (observer *recordingUserActivityObserver) UserDisconnected(userID uuid.UUID) {
+	observer.disconnected = append(observer.disconnected, userID)
+}
+
+func TestHubActivityObserverDeduplicatesMultipleClients(t *testing.T) {
+	hub := newMinimalHub()
+	observer := &recordingUserActivityObserver{}
+	hub.SetActivityObserver(observer)
+	userID := uuid.New()
+	hub.usernames[userID] = "activity-user"
+	first := newTestClient(hub, userID)
+	second := newTestClient(hub, userID)
+
+	require.True(t, hub.registerClient(first))
+	require.False(t, hub.registerClient(second))
+	require.Equal(t, []uuid.UUID{userID}, observer.connected)
+	require.Empty(t, observer.disconnected)
+	require.Equal(t, 1, hub.ConnectedUserCount())
+	require.Equal(t, 2, hub.ConnectionCount())
+
+	exists, last, remaining := hub.unregisterClient(first)
+	require.True(t, exists)
+	require.False(t, last)
+	require.Equal(t, 1, remaining)
+	require.Empty(t, observer.disconnected)
+
+	exists, last, remaining = hub.unregisterClient(second)
+	require.True(t, exists)
+	require.True(t, last)
+	require.Zero(t, remaining)
+	require.Equal(t, []uuid.UUID{userID}, observer.disconnected)
+
+	exists, _, _ = hub.unregisterClient(second)
+	require.False(t, exists)
+	require.Equal(t, []uuid.UUID{userID}, observer.disconnected)
+}
+
+func TestHubActivityObserverCountsPresenceHiddenUsers(t *testing.T) {
+	hub := newMinimalHub()
+	observer := &recordingUserActivityObserver{}
+	hub.SetActivityObserver(observer)
+	userID := uuid.New()
+	hub.usernames[userID] = "hidden-user"
+	hub.hiddenPresence = map[uuid.UUID]string{userID: statusInvisible}
+
+	require.True(t, hub.registerClient(newTestClient(hub, userID)))
+	require.Equal(t, []uuid.UUID{userID}, observer.connected)
+	require.Equal(t, 1, hub.ConnectedUserCount())
+}
+
 func TestGetConnectedUsers(t *testing.T) {
 	hub := newMinimalHub()
 	hub.mu.Lock()

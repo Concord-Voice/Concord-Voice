@@ -9,6 +9,14 @@ rollup failures do not take down normal API traffic. Host and Docker reads belon
 to the separate `cmd/ops-agent` binary; the control plane must never mount the
 Docker socket.
 
+The trusted collector also reduces account state to fixed counts for registered
+and pending users, active sessions, distinct connected users, and active-user
+windows. It retains only `users.ops_last_active_at` after a user has been
+connected for 60 cumulative seconds within a UTC day; user IDs and interval
+history never enter the metrics tables or Admin responses. Collection clears
+markers strictly older than the widest 30-day window. Successful uploads are
+counted by a process-lifetime counter.
+
 When the admin console and metrics collection are both enabled, four read-only
 admin GET routes expose health, current values, hourly series, and counters. They
 remain behind Cloudflare Access and the separate admin session, use a dedicated

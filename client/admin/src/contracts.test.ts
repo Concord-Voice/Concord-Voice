@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ACCOUNT_ACTIVITY_METRIC_KEYS,
+  COUNTER_METRIC_KEYS,
   METRIC_KEYS,
   PRIMARY_METRIC_MAP,
   ContractError,
@@ -28,10 +30,14 @@ describe("metric catalog", () => {
     expect(PRIMARY_METRIC_MAP.mediaActivity).toHaveLength(7);
     expect(PRIMARY_METRIC_MAP.mediaEgress).toHaveLength(3);
     expect(PRIMARY_METRIC_MAP.participantHours).toHaveLength(3);
+    expect(PRIMARY_METRIC_MAP.usersActivity).toEqual(
+      ACCOUNT_ACTIVITY_METRIC_KEYS,
+    );
 
     const assigned = Object.values(PRIMARY_METRIC_MAP).flat();
-    expect(assigned).toHaveLength(52);
+    expect(assigned).toHaveLength(61);
     expect(new Set(assigned)).toEqual(new Set(METRIC_KEYS));
+    expect(COUNTER_METRIC_KEYS).toHaveLength(11);
   });
 });
 
@@ -114,7 +120,7 @@ describe("parseCurrent", () => {
     expect(() => parseCurrent(duplicate)).toThrow(ContractError);
 
     const oversized = currentFixture();
-    oversized.metrics = Array.from({ length: 53 }, () =>
+    oversized.metrics = Array.from({ length: 62 }, () =>
       clone(oversized.metrics[0]),
     );
     expect(() => parseCurrent(oversized)).toThrow(ContractError);
@@ -122,7 +128,7 @@ describe("parseCurrent", () => {
 });
 
 describe("parseCounters", () => {
-  it("accepts only the ten fixed counter identifiers", () => {
+  it("accepts only the eleven fixed counter identifiers", () => {
     expect(parseCounters(countersFixture())).toEqual(countersFixture());
 
     const gauge = countersFixture() as unknown as {
@@ -138,10 +144,24 @@ describe("parseCounters", () => {
     expect(() => parseCounters(duplicate)).toThrow(ContractError);
 
     const oversized = countersFixture();
-    oversized.counters = Array.from({ length: 11 }, () =>
+    oversized.counters = Array.from({ length: 12 }, () =>
       clone(oversized.counters[0]),
     );
     expect(() => parseCounters(oversized)).toThrow(ContractError);
+  });
+
+  it("accepts the fixed upload counter metadata", () => {
+    const value = countersFixture();
+    value.counters[0] = {
+      metric_key: "media_uploads_total",
+      source: "control",
+      unit: "count",
+      kind: "counter",
+      value: 4,
+      sampled_at: "2026-07-14T12:00:00Z",
+    };
+
+    expect(parseCounters(value)).toEqual(value);
   });
 });
 

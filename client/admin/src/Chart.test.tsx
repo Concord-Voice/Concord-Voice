@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { SeriesChart } from "./Chart";
 import type { AdminSeriesPoint } from "./contracts";
@@ -79,17 +79,38 @@ describe("SeriesChart", () => {
       within(within(table).getAllByRole("row")[1])
         .getAllByRole("cell")
         .map((cell) => cell.textContent),
-    ).toEqual(["2026-07-14T10:00:00Z", "12.35%", "10.13%", "15.68%", "3"]);
+    ).toEqual([
+      "Jul 14, 2026, 10:00:00 AM UTC",
+      "12.35%",
+      "10.13%",
+      "15.68%",
+      "3",
+    ]);
     expect(
       within(within(table).getAllByRole("row")[2])
         .getAllByRole("cell")
         .map((cell) => cell.textContent),
-    ).toEqual(["2026-07-14T11:00:00Z", "18.23%", "11.11%", "21%", "4"]);
+    ).toEqual([
+      "Jul 14, 2026, 11:00:00 AM UTC",
+      "18.23%",
+      "11.11%",
+      "21%",
+      "4",
+    ]);
     expect(
       within(within(table).getAllByRole("row")[3])
         .getAllByRole("cell")
         .map((cell) => cell.textContent),
-    ).toEqual(["2026-07-14T12:00:00Z", "14.13%", "12.56%", "16.44%", "5"]);
+    ).toEqual([
+      "Jul 14, 2026, 12:00:00 PM UTC",
+      "14.13%",
+      "12.56%",
+      "16.44%",
+      "5",
+    ]);
+    expect(
+      within(table).getAllByText(/UTC/)[0].closest("time"),
+    ).toHaveAttribute("datetime", "2026-07-14T10:00:00Z");
   });
 
   it("labels and formats last-value rollups honestly", () => {
@@ -131,7 +152,34 @@ describe("SeriesChart", () => {
       within(within(table).getAllByRole("row")[1])
         .getAllByRole("cell")
         .map((cell) => cell.textContent),
-    ).toEqual(["2026-07-14T12:00:00Z", "1,234.57", "1,000", "1,250", "240"]);
+    ).toEqual([
+      "Jul 14, 2026, 12:00:00 PM UTC",
+      "1,234.57",
+      "1,000",
+      "1,250",
+      "240",
+    ]);
+  });
+
+  it("converts display text to local time without changing the timestamp", async () => {
+    vi.stubEnv("TZ", "America/New_York");
+    vi.resetModules();
+    try {
+      const { formatTimestamp } = await import("./time");
+
+      expect(formatTimestamp("2026-07-14T12:00:00Z", "local")).toBe(
+        "Jul 14, 2026, 08:00:00 AM EDT",
+      );
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  });
+
+  it("rejects invalid timestamps", async () => {
+    const { formatTimestamp } = await import("./time");
+
+    expect(() => formatTimestamp("not-a-timestamp", "utc")).toThrow(RangeError);
   });
 
   it.each([

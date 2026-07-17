@@ -90,6 +90,23 @@ type collectorTestProvider struct{ count int }
 
 func (p collectorTestProvider) ConnectionCount() int { return p.count }
 
+type collectorUserProvider struct {
+	clients int
+	users   int
+}
+
+func (provider collectorUserProvider) ConnectionCount() int    { return provider.clients }
+func (provider collectorUserProvider) ConnectedUserCount() int { return provider.users }
+
+type collectorAccountProvider struct {
+	metrics map[MetricKey]float64
+	err     error
+}
+
+func (provider collectorAccountProvider) AccountMetrics(context.Context, time.Time) (map[MetricKey]float64, error) {
+	return provider.metrics, provider.err
+}
+
 type collectorTestTicker struct {
 	c       chan time.Time
 	stop    chan struct{}
@@ -188,7 +205,8 @@ func TestCollectorWritesOneBatchAndRollsUpBeforePruning(t *testing.T) {
 	require.Equal(t, float64(7), values[MetricWebSocketConnections])
 	require.Equal(t, float64(1), values[MetricHTTPRequestsTotal])
 	require.Equal(t, float64(1), values[MetricChannelMessagesTotal])
-	require.Len(t, values, 9)
+	require.Zero(t, values[MetricMediaUploadsTotal])
+	require.Len(t, values, 10)
 
 	clock.set(now.Add(15 * time.Second))
 	ticker.tick(t, now.Add(15*time.Second))
@@ -203,7 +221,7 @@ func TestCollectorWritesOneBatchAndRollsUpBeforePruning(t *testing.T) {
 	secondValues := samplesByKey(batches[1])
 	require.NotContains(t, secondValues, MetricHostCPUPercent)
 	require.NotContains(t, secondValues, MetricMediaRoomsCurrent)
-	require.Len(t, secondValues, 7)
+	require.Len(t, secondValues, 8)
 
 	cancel()
 	require.Eventually(t, func() bool {
@@ -214,6 +232,58 @@ func TestCollectorWritesOneBatchAndRollsUpBeforePruning(t *testing.T) {
 			return false
 		}
 	}, time.Second, time.Millisecond)
+}
+
+func TestCollectorAddsDistinctUsersAndAccountMetrics(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	accountMetrics := map[MetricKey]float64{
+		MetricRegisteredUsersCurrent:      10,
+		MetricPendingRegistrationsCurrent: 2,
+		MetricActiveSessionsCurrent:       4,
+		MetricActiveUsers24H:              3,
+		MetricActiveUsers7D:               7,
+		MetricActiveUsers15D:              8,
+		MetricActiveUsers30D:              9,
+	}
+	collector := NewCollector(
+		newCollectorTestStore(),
+		nil,
+		NewCounters(),
+		collectorUserProvider{clients: 5, users: 3},
+		15*time.Second,
+		logger.NewWithWriter(&bytes.Buffer{}),
+		collectorAccountProvider{metrics: accountMetrics},
+	)
+
+	values := samplesByKey(collector.snapshot(now))
+	require.Equal(t, float64(5), values[MetricWebSocketConnections])
+	require.Equal(t, float64(3), values[MetricUsersOnlineCurrent])
+	for key, value := range accountMetrics {
+		require.Equal(t, value, values[key])
+	}
+	require.Len(t, values, 16)
+}
+
+func TestCollectorPreservesPartialAccountMetricsOnProviderFailure(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	output := &bytes.Buffer{}
+	providerErr := errors.New("account query unavailable")
+	collector := NewCollector(
+		newCollectorTestStore(),
+		nil,
+		NewCounters(),
+		nil,
+		15*time.Second,
+		logger.NewWithWriter(output),
+		collectorAccountProvider{
+			metrics: map[MetricKey]float64{MetricRegisteredUsersCurrent: 12},
+			err:     providerErr,
+		},
+	)
+
+	values := samplesByKey(collector.snapshot(now))
+	require.Equal(t, float64(12), values[MetricRegisteredUsersCurrent])
+	require.Contains(t, output.String(), "Failed to collect aggregate account metrics")
 }
 
 func TestCollectorAllowsOneMissedRemoteIntervalButRejectsOlderSnapshots(t *testing.T) {

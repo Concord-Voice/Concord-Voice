@@ -325,6 +325,15 @@ components:
         - channel_messages_total
         - dm_messages_total
         - ops_snapshot_rejections_total
+        - registered_users_current
+        - pending_registrations_current
+        - users_online_current
+        - active_sessions_current
+        - active_users_24h
+        - active_users_7d
+        - active_users_15d
+        - active_users_30d
+        - media_uploads_total
         - media_rooms_current
         - media_participants_audio_current
         - media_participants_webcam_current
@@ -347,6 +356,7 @@ components:
         - channel_messages_total
         - dm_messages_total
         - ops_snapshot_rejections_total
+        - media_uploads_total
         - media_egress_cumulative_bytes
         - media_participant_hours_audio
         - media_participant_hours_webcam
@@ -464,7 +474,7 @@ components:
           $ref: '#/components/schemas/NodeId'
         metrics:
           type: array
-          maxItems: 52
+          maxItems: 61
           items:
             $ref: '#/components/schemas/AdminMetricPoint'
     AdminCounterPoint:
@@ -505,7 +515,7 @@ components:
           $ref: '#/components/schemas/NodeId'
         counters:
           type: array
-          maxItems: 10
+          maxItems: 11
           items:
             $ref: '#/components/schemas/AdminCounterPoint'
     AdminSeriesMetric:

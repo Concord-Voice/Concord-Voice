@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import type {
   AdminCountersResponse,
   AdminCurrentResponse,
@@ -21,9 +23,10 @@ import { formatScalar } from "./formatMetric";
 import type { ThresholdStatus, Thresholds } from "./preferences";
 import { statusFor } from "./preferences";
 import type { PollingState } from "./usePolling";
+import { formatTimestamp, type TimeMode } from "./time";
 
 export type DisplayStatus =
-  HealthState | ThresholdStatus | "stale" | "unavailable";
+  HealthState | ThresholdStatus | "available" | "stale" | "unavailable";
 
 export interface PollingResource<T> {
   data: T | null;
@@ -44,6 +47,7 @@ const STATUS_COPY: Record<DisplayStatus, { glyph: string; label: string }> = {
   degraded: { glyph: "!", label: "Degraded" },
   stopped: { glyph: "×", label: "Stopped" },
   unknown: { glyph: "?", label: "Unknown" },
+  available: { glyph: "•", label: "Available" },
   normal: { glyph: "✓", label: "Normal" },
   warning: { glyph: "!", label: "Warning" },
   critical: { glyph: "×", label: "Critical" },
@@ -127,6 +131,15 @@ const METRIC_COPY: Partial<Record<MetricKey, string>> = {
   channel_messages_total: "Channel messages",
   dm_messages_total: "Direct messages",
   ops_snapshot_rejections_total: "Rejected operations snapshots",
+  registered_users_current: "Registered users",
+  pending_registrations_current: "Pending registrations",
+  users_online_current: "Users online",
+  active_sessions_current: "Active sessions",
+  active_users_24h: "Active users over 24 hours",
+  active_users_7d: "Active users over 7 days",
+  active_users_15d: "Active users over 15 days",
+  active_users_30d: "Active users over 30 days",
+  media_uploads_total: "Media uploads",
   media_rooms_current: "Media rooms",
   media_participants_audio_current: "Audio participants",
   media_participants_webcam_current: "Webcam participants",
@@ -151,6 +164,34 @@ const SERIES_PRESETS = [
   ["Video activity", "media_camera_publishers_current"],
   ["Media egress", "media_egress_current_bps"],
 ] as const satisfies readonly (readonly [string, MetricKey])[];
+
+const ACTIVE_USER_WINDOWS = [
+  { label: "24 Hours", value: "active_users_24h" },
+  { label: "7 Days", value: "active_users_7d" },
+  { label: "15 Days", value: "active_users_15d" },
+  { label: "30 Days", value: "active_users_30d" },
+] as const;
+
+const MESSAGE_COUNTER_KEYS = [
+  "channel_messages_total",
+  "dm_messages_total",
+] as const satisfies readonly CounterMetricKey[];
+
+const RATE_PERIODS = {
+  second: 1,
+  minute: 60,
+  hour: 60 * 60,
+  day: 24 * 60 * 60,
+} as const;
+
+type ActiveUserKey = (typeof ACTIVE_USER_WINDOWS)[number]["value"];
+type RatePeriod = keyof typeof RATE_PERIODS;
+
+function dataStatus(resource: PollingResource<unknown>): DisplayStatus {
+  return resource.state === "stale" || resource.state === "rate-limited"
+    ? "stale"
+    : "available";
+}
 
 function titleCase(value: string): string {
   return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
@@ -181,25 +222,22 @@ function metricMap(response: AdminCurrentResponse | null) {
   );
 }
 
-function retryTime(retryAt: number): string {
-  return new Intl.DateTimeFormat("en-US", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    timeZoneName: "short",
-  }).format(new Date(retryAt));
+function retryTime(retryAt: number, timeMode: TimeMode): string {
+  return formatTimestamp(retryAt, timeMode);
 }
 
 interface ResourceNoticeProps<T> {
   name: string;
   resource: PollingResource<T>;
   staleName?: string;
+  timeMode?: TimeMode;
 }
 
 function ResourceNotice<T>({
   name,
   resource,
   staleName = name,
+  timeMode = "utc",
 }: Readonly<ResourceNoticeProps<T>>) {
   if (resource.state === "loading" && resource.data === null) {
     return (
@@ -214,7 +252,7 @@ function ResourceNotice<T>({
         Requests paused until{" "}
         {resource.retryAt === null
           ? "the next scheduled refresh"
-          : retryTime(resource.retryAt)}
+          : retryTime(resource.retryAt, timeMode)}
       </output>
     );
   }
@@ -246,6 +284,7 @@ export function Status({ state }: Readonly<{ state: DisplayStatus }>) {
 }
 
 interface ScalarValueProps {
+  formattedValue?: string;
   label: string;
   status: DisplayStatus;
   unit: MetricUnit;
@@ -253,6 +292,7 @@ interface ScalarValueProps {
 }
 
 export function ScalarValue({
+  formattedValue,
   label,
   status,
   unit,
@@ -266,7 +306,9 @@ export function ScalarValue({
         <Status state={available ? status : "unavailable"} />
       </div>
       <strong className="metric-value">
-        {available ? formatScalar(value, unit) : "Unavailable"}
+        {available
+          ? (formattedValue ?? formatScalar(value, unit))
+          : "Unavailable"}
       </strong>
       {available && unit === "percent" ? (
         <meter aria-label={label} max={100} min={0} value={value} />
@@ -316,11 +358,60 @@ export function deriveCounterShare(
   return (100 * errorDelta) / totalDelta;
 }
 
+export function deriveCounterRate(
+  previous: AdminCountersResponse | null,
+  current: AdminCountersResponse | null,
+  keys: readonly CounterMetricKey[],
+  periodSeconds: number,
+): number | null {
+  if (
+    !previous ||
+    !current ||
+    keys.length === 0 ||
+    !Number.isFinite(periodSeconds) ||
+    periodSeconds <= 0
+  )
+    return null;
+  if (previous.node_id !== current.node_id) return null;
+
+  let beforeTime: string | undefined;
+  let afterTime: string | undefined;
+  let delta = 0;
+  for (const key of keys) {
+    const before = previous.counters.find(
+      (counter) => counter.metric_key === key,
+    );
+    const after = current.counters.find(
+      (counter) => counter.metric_key === key,
+    );
+    if (!before || !after) return null;
+    if (
+      (beforeTime !== undefined && before.sampled_at !== beforeTime) ||
+      (afterTime !== undefined && after.sampled_at !== afterTime)
+    ) {
+      return null;
+    }
+    beforeTime = before.sampled_at;
+    afterTime = after.sampled_at;
+
+    const change = after.value - before.value;
+    if (!Number.isFinite(change) || change < 0) return null;
+    delta += change;
+  }
+  if (beforeTime === undefined || afterTime === undefined) return null;
+
+  const elapsed = (Date.parse(afterTime) - Date.parse(beforeTime)) / 1000;
+  if (!Number.isFinite(elapsed) || elapsed <= 0) return null;
+
+  return (delta * periodSeconds) / elapsed;
+}
+
 interface HostWorkspaceProps {
   current: PollingResource<AdminCurrentResponse>;
   health: PollingResource<AdminHealthResponse>;
   series: PollingResource<AdminSeriesResponse>;
   thresholds: Thresholds;
+  timeMode?: TimeMode;
 }
 
 export function HostWorkspace({
@@ -328,6 +419,7 @@ export function HostWorkspace({
   health,
   series,
   thresholds,
+  timeMode = "utc",
 }: Readonly<HostWorkspaceProps>) {
   const metrics = metricMap(current.data);
   const hasHostSample = HOST_FIELDS.some(({ key }) => metrics.has(key));
@@ -338,6 +430,7 @@ export function HostWorkspace({
         name="current metrics"
         resource={current}
         staleName="current sample"
+        timeMode={timeMode}
       />
       {current.state === "ready" && !hasHostSample ? (
         <p className="empty-state">No recent host sample</p>
@@ -398,7 +491,11 @@ export function HostWorkspace({
             );
           })}
         </div>
-        <ResourceNotice name="service health" resource={health} />
+        <ResourceNotice
+          name="service health"
+          resource={health}
+          timeMode={timeMode}
+        />
       </section>
 
       <div className="workspace-split">
@@ -412,8 +509,14 @@ export function HostWorkspace({
               <p>Hourly aggregate rollup</p>
             </div>
           </div>
-          <ResourceNotice name="host series" resource={series} />
-          {series.data ? <SeriesChart response={series.data} /> : null}
+          <ResourceNotice
+            name="host series"
+            resource={series}
+            timeMode={timeMode}
+          />
+          {series.data ? (
+            <SeriesChart response={series.data} timeMode={timeMode} />
+          ) : null}
         </section>
 
         <section
@@ -452,6 +555,7 @@ interface ServicesWorkspaceProps {
   current: PollingResource<AdminCurrentResponse>;
   health: PollingResource<AdminHealthResponse>;
   thresholds: Thresholds;
+  timeMode?: TimeMode;
 }
 
 function serviceMetricKey(
@@ -470,6 +574,7 @@ export function ServicesWorkspace({
   current,
   health,
   thresholds,
+  timeMode = "utc",
 }: Readonly<ServicesWorkspaceProps>) {
   const metrics = metricMap(current.data);
 
@@ -479,8 +584,13 @@ export function ServicesWorkspace({
         name="current metrics"
         resource={current}
         staleName="current sample"
+        timeMode={timeMode}
       />
-      <ResourceNotice name="service health" resource={health} />
+      <ResourceNotice
+        name="service health"
+        resource={health}
+        timeMode={timeMode}
+      />
       <section
         aria-labelledby="services-table-title"
         className="workspace-section"
@@ -573,6 +683,7 @@ interface CountersWorkspaceProps {
   current: PollingResource<AdminCurrentResponse>;
   previousCounters: AdminCountersResponse | null;
   thresholds: Thresholds;
+  timeMode?: TimeMode;
 }
 
 export function CountersWorkspace({
@@ -580,6 +691,7 @@ export function CountersWorkspace({
   current,
   previousCounters,
   thresholds,
+  timeMode = "utc",
 }: Readonly<CountersWorkspaceProps>) {
   const metrics = metricMap(current.data);
   for (const counter of counters.data?.counters ?? []) {
@@ -598,11 +710,13 @@ export function CountersWorkspace({
         name="current metrics"
         resource={current}
         staleName="current sample"
+        timeMode={timeMode}
       />
       <ResourceNotice
         name="counters"
         resource={counters}
         staleName="counter sample"
+        timeMode={timeMode}
       />
       <section
         aria-labelledby="derived-shares-title"
@@ -683,12 +797,265 @@ export function CountersWorkspace({
   );
 }
 
+interface SegmentedOption<T extends string> {
+  label: string;
+  value: T;
+}
+
+function SegmentedControl<T extends string>({
+  label,
+  onChange,
+  options,
+  value,
+}: Readonly<{
+  label: string;
+  onChange: (value: T) => void;
+  options: readonly SegmentedOption<T>[];
+  value: T;
+}>) {
+  return (
+    <fieldset aria-label={label} className="segmented-control">
+      {options.map((option) => (
+        <button
+          key={option.value}
+          aria-pressed={value === option.value}
+          type="button"
+          onClick={() => onChange(option.value)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </fieldset>
+  );
+}
+
+const MESSAGE_RATE_PERIODS = [
+  { label: "Second", value: "second" },
+  { label: "Minute", value: "minute" },
+  { label: "Hour", value: "hour" },
+] as const satisfies readonly SegmentedOption<RatePeriod>[];
+
+const UPLOAD_RATE_PERIODS = [
+  ...MESSAGE_RATE_PERIODS,
+  { label: "Day", value: "day" },
+] as const satisfies readonly SegmentedOption<RatePeriod>[];
+
+interface UsersActivityWorkspaceProps {
+  counters: PollingResource<AdminCountersResponse>;
+  current: PollingResource<AdminCurrentResponse>;
+  previousCounters: AdminCountersResponse | null;
+  timeMode?: TimeMode;
+}
+
+export function UsersActivityWorkspace({
+  counters,
+  current,
+  previousCounters,
+  timeMode = "utc",
+}: Readonly<UsersActivityWorkspaceProps>) {
+  const [activeUserKey, setActiveUserKey] =
+    useState<ActiveUserKey>("active_users_24h");
+  const [messagePeriod, setMessagePeriod] = useState<RatePeriod>("minute");
+  const [uploadPeriod, setUploadPeriod] = useState<RatePeriod>("minute");
+  const currentStatus = dataStatus(current);
+  const counterStatus = dataStatus(counters);
+  const activeUserLabel = `Active users, ${(
+    ACTIVE_USER_WINDOWS.find((option) => option.value === activeUserKey)
+      ?.label ?? "24 Hours"
+  ).toLowerCase()}`;
+  const metrics = metricMap(current.data);
+  const sampledAt =
+    metrics.get("registered_users_current")?.sampled_at ??
+    current.data?.metrics[0]?.sampled_at;
+  const canDeriveRates =
+    counters.state === "ready" || counters.state === "loading";
+  const messageRate = canDeriveRates
+    ? deriveCounterRate(
+        previousCounters,
+        counters.data,
+        MESSAGE_COUNTER_KEYS,
+        RATE_PERIODS[messagePeriod],
+      )
+    : null;
+  const uploadRate = canDeriveRates
+    ? deriveCounterRate(
+        previousCounters,
+        counters.data,
+        ["media_uploads_total"],
+        RATE_PERIODS[uploadPeriod],
+      )
+    : null;
+
+  const value = (key: MetricKey) => metrics.get(key)?.value ?? null;
+
+  return (
+    <div className="workspace-content users-workspace">
+      <ResourceNotice
+        name="current metrics"
+        resource={current}
+        staleName="current sample"
+        timeMode={timeMode}
+      />
+      <ResourceNotice
+        name="counters"
+        resource={counters}
+        staleName="counter sample"
+        timeMode={timeMode}
+      />
+
+      <section aria-labelledby="accounts-title" className="workspace-section">
+        <div className="section-heading">
+          <div>
+            <h2 id="accounts-title">Accounts</h2>
+            <p>
+              Current aggregate account state
+              {sampledAt ? (
+                <>
+                  {" / "}
+                  <time dateTime={sampledAt}>
+                    {formatTimestamp(sampledAt, timeMode)}
+                  </time>
+                </>
+              ) : null}
+            </p>
+          </div>
+          <SegmentedControl
+            label="Active user window"
+            onChange={setActiveUserKey}
+            options={ACTIVE_USER_WINDOWS}
+            value={activeUserKey}
+          />
+        </div>
+        <div className="metric-grid users-metric-grid">
+          <div
+            data-metric-key="registered_users_current"
+            data-primary-home="users"
+          >
+            <ScalarValue
+              label="Registered users"
+              status={currentStatus}
+              unit="count"
+              value={value("registered_users_current")}
+            />
+          </div>
+          <div
+            data-metric-key="pending_registrations_current"
+            data-primary-home="users"
+          >
+            <ScalarValue
+              label="Pending registrations"
+              status={currentStatus}
+              unit="count"
+              value={value("pending_registrations_current")}
+            />
+          </div>
+          <div data-metric-key={activeUserKey} data-primary-home="users">
+            <ScalarValue
+              label={activeUserLabel}
+              status={currentStatus}
+              unit="count"
+              value={value(activeUserKey)}
+            />
+          </div>
+        </div>
+      </section>
+
+      <section aria-labelledby="connected-title" className="workspace-section">
+        <div className="section-heading">
+          <div>
+            <h2 id="connected-title">Connected now</h2>
+            <p>Distinct users, sessions, and physical clients</p>
+          </div>
+        </div>
+        <div className="metric-grid users-metric-grid">
+          {(
+            [
+              ["users_online_current", "Users online"],
+              ["active_sessions_current", "Active sessions"],
+              ["websocket_connections_current", "WebSocket clients"],
+            ] as const
+          ).map(([key, label]) => (
+            <div
+              key={key}
+              data-metric-key={key}
+              data-primary-home={
+                key === "websocket_connections_current" ? undefined : "users"
+              }
+            >
+              <ScalarValue
+                label={label}
+                status={currentStatus}
+                unit="count"
+                value={value(key)}
+              />
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section aria-labelledby="throughput-title" className="workspace-section">
+        <div className="section-heading">
+          <div>
+            <h2 id="throughput-title">Throughput</h2>
+            <p>Rates from consecutive process-lifetime counter samples</p>
+          </div>
+        </div>
+        <div className="throughput-grid">
+          <div className="throughput-metric">
+            <SegmentedControl
+              label="Message rate period"
+              onChange={setMessagePeriod}
+              options={MESSAGE_RATE_PERIODS}
+              value={messagePeriod}
+            />
+            <ScalarValue
+              formattedValue={
+                messageRate === null
+                  ? undefined
+                  : `${formatScalar(messageRate, "count")} / ${messagePeriod}`
+              }
+              label="Message rate"
+              status={counterStatus}
+              unit="count"
+              value={messageRate}
+            />
+          </div>
+          <div
+            className="throughput-metric"
+            data-metric-key="media_uploads_total"
+            data-primary-home="users"
+          >
+            <SegmentedControl
+              label="Upload rate period"
+              onChange={setUploadPeriod}
+              options={UPLOAD_RATE_PERIODS}
+              value={uploadPeriod}
+            />
+            <ScalarValue
+              formattedValue={
+                uploadRate === null
+                  ? undefined
+                  : `${formatScalar(uploadRate, "count")} / ${uploadPeriod}`
+              }
+              label="Upload rate"
+              status={counterStatus}
+              unit="count"
+              value={uploadRate}
+            />
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 interface TimeSeriesWorkspaceProps {
   metricKey: MetricKey;
   onMetricKeyChange: (metricKey: MetricKey) => void;
   onWindowChange: (window: SeriesWindow) => void;
   series: PollingResource<AdminSeriesResponse>;
   window: SeriesWindow;
+  timeMode?: TimeMode;
 }
 
 export function TimeSeriesWorkspace({
@@ -697,6 +1064,7 @@ export function TimeSeriesWorkspace({
   onWindowChange,
   series,
   window,
+  timeMode = "utc",
 }: Readonly<TimeSeriesWorkspaceProps>) {
   return (
     <div className="workspace-content">
@@ -768,8 +1136,14 @@ export function TimeSeriesWorkspace({
             </p>
           </div>
         </div>
-        <ResourceNotice name="selected series" resource={series} />
-        {series.data ? <SeriesChart response={series.data} /> : null}
+        <ResourceNotice
+          name="selected series"
+          resource={series}
+          timeMode={timeMode}
+        />
+        {series.data ? (
+          <SeriesChart response={series.data} timeMode={timeMode} />
+        ) : null}
       </section>
     </div>
   );
@@ -778,15 +1152,21 @@ export function TimeSeriesWorkspace({
 interface ChangesWorkspaceProps {
   events: readonly HealthChange[];
   health: PollingResource<AdminHealthResponse>;
+  timeMode?: TimeMode;
 }
 
 export function ChangesWorkspace({
   events,
   health,
+  timeMode = "utc",
 }: Readonly<ChangesWorkspaceProps>) {
   return (
     <div className="workspace-content">
-      <ResourceNotice name="service health" resource={health} />
+      <ResourceNotice
+        name="service health"
+        resource={health}
+        timeMode={timeMode}
+      />
       <section
         aria-labelledby="current-health-title"
         className="workspace-section"
@@ -835,12 +1215,7 @@ export function ChangesWorkspace({
             {events.map((event) => (
               <li className="event-row" key={event.id}>
                 <time dateTime={event.observedAt}>
-                  {new Intl.DateTimeFormat("en-US", {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                    second: "2-digit",
-                    timeZone: "UTC",
-                  }).format(new Date(event.observedAt))}
+                  {formatTimestamp(event.observedAt, timeMode)}
                 </time>
                 <strong>{SERVICE_LABELS[event.service]}</strong>
                 <span>

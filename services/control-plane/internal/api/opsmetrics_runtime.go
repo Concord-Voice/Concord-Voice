@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -13,11 +14,17 @@ import (
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 )
 
-// OpsMetricsRuntime owns the collector goroutine started by NewRouter.
+type accountActivityFlusher interface {
+	FlushQualifications(context.Context, time.Time) error
+}
+
+// OpsMetricsRuntime owns the collector goroutine and its account activity flush.
 type OpsMetricsRuntime struct {
 	cancel   context.CancelFunc
 	done     <-chan struct{}
 	receiver *opsmetrics.Receiver
+	accounts accountActivityFlusher
+	now      func() time.Time
 }
 
 func wireOpsMetricsRuntime(
@@ -71,17 +78,27 @@ func startOpsMetricsRuntime(
 		return nil, fmt.Errorf("activate operations metrics subscriptions: %w", err)
 	}
 
-	collector := opsmetrics.NewCollector(store, receiver, counters, hub, cfg.Interval, log)
+	tracker := opsmetrics.NewActivityTracker()
+	hub.SetActivityObserver(tracker)
+	accounts := opsmetrics.NewAccountProvider(db, tracker)
+	collector := opsmetrics.NewCollector(store, receiver, counters, hub, cfg.Interval, log, accounts)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		collector.Run(ctx)
 	}()
-	return &OpsMetricsRuntime{cancel: cancel, done: done, receiver: receiver}, nil
+	return &OpsMetricsRuntime{
+		cancel:   cancel,
+		done:     done,
+		receiver: receiver,
+		accounts: accounts,
+		now:      time.Now,
+	}, nil
 }
 
-// Stop cancels collection and waits for any in-flight collection to finish.
+// Stop cancels collection, waits for in-flight work, and flushes activity that
+// crossed the qualification threshold before graceful Hub shutdown completed.
 func (runtime *OpsMetricsRuntime) Stop(ctx context.Context) error {
 	if runtime == nil {
 		return nil
@@ -90,7 +107,15 @@ func (runtime *OpsMetricsRuntime) Stop(ctx context.Context) error {
 	unsubscribeErr := runtime.receiver.Unsubscribe()
 	select {
 	case <-runtime.done:
-		return unsubscribeErr
+		var flushErr error
+		if runtime.accounts != nil {
+			now := time.Now
+			if runtime.now != nil {
+				now = runtime.now
+			}
+			flushErr = runtime.accounts.FlushQualifications(ctx, now().UTC())
+		}
+		return errors.Join(unsubscribeErr, flushErr)
 	case <-ctx.Done():
 		return errors.Join(unsubscribeErr, fmt.Errorf("stop operations metrics collector: %w", ctx.Err()))
 	}

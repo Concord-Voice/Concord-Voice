@@ -31,6 +31,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -92,6 +93,32 @@ func mediaBrokenResolver(t *testing.T, rdb *redis.Client) *rbac.Resolver {
 type freeTierStub struct{}
 
 func (freeTierStub) GetTier(context.Context, string) string { return entitlements.TierFree }
+
+type mediaOpsCounterSpy struct{ uploads int }
+
+func (spy *mediaOpsCounterSpy) Increment(key opsmetrics.MetricKey) {
+	if key == opsmetrics.MetricMediaUploadsTotal {
+		spy.uploads++
+	}
+}
+
+func TestRecordSuccessfulUpload(t *testing.T) {
+	counters := &mediaOpsCounterSpy{}
+	handler := &Handler{}
+	handler.recordSuccessfulUpload()
+	handler.SetOpsCounter(counters)
+	handler.recordSuccessfulUpload()
+	require.Equal(t, 1, counters.uploads)
+}
+
+func TestRecordSuccessfulUploadAllowsDisabledOpsMetrics(t *testing.T) {
+	var counters *opsmetrics.Counters
+	handler := &Handler{}
+
+	handler.SetOpsCounter(counters)
+
+	require.NotPanics(t, handler.recordSuccessfulUpload)
+}
 
 const (
 	keyFileType           = "file_type"
@@ -384,6 +411,8 @@ func assertStorageDisabledResponse(t *testing.T, w *httptest.ResponseRecorder) {
 
 func TestUploadAvatarSuccess(t *testing.T) {
 	ts := setupMediaTest(t)
+	counters := &mediaOpsCounterSpy{}
+	ts.handler.SetOpsCounter(counters)
 	userID := ts.createTestUser(t, "avataruser")
 
 	imgData := makePNG(t, 200, 200)
@@ -395,10 +424,13 @@ func TestUploadAvatarSuccess(t *testing.T) {
 	resp := parseBody(t, w)
 	assert.Equal(t, fmt.Sprintf("/api/v1/media/avatars/%s", userID), resp["url"])
 	assert.True(t, ts.store.hasObject(fmt.Sprintf("avatars/%s", userID)))
+	assert.Equal(t, 1, counters.uploads)
 }
 
 func TestUploadAvatarInvalidType(t *testing.T) {
 	ts := setupMediaTest(t)
+	counters := &mediaOpsCounterSpy{}
+	ts.handler.SetOpsCounter(counters)
 	userID := ts.createTestUser(t, "badtype")
 
 	body, ct := multipartBody(t, "file", "document.pdf", []byte("%PDF-1.4 fake pdf content"), nil)
@@ -408,6 +440,7 @@ func TestUploadAvatarInvalidType(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	resp := parseBody(t, w)
 	assert.Contains(t, resp["error"], "Invalid image type")
+	assert.Zero(t, counters.uploads)
 }
 
 func TestUploadAvatarMissingFile(t *testing.T) {
@@ -558,6 +591,8 @@ func TestUploadAttachmentMembershipRequired(t *testing.T) {
 
 func TestUploadAttachmentSuccessChannel(t *testing.T) {
 	ts := setupMediaTest(t)
+	counters := &mediaOpsCounterSpy{}
+	ts.handler.SetOpsCounter(counters)
 	owner := ts.createTestUser(t, "attachsuccess")
 	serverID := ts.createTestServer(t, owner, "Attach Server 2")
 	channelID := ts.createTestChannel(t, serverID, "uploads")
@@ -574,6 +609,7 @@ func TestUploadAttachmentSuccessChannel(t *testing.T) {
 	resp := parseBody(t, w)
 	assert.NotEmpty(t, resp["file_id"])
 	assert.Equal(t, "photo", resp["file_type"])
+	assert.Equal(t, 1, counters.uploads)
 }
 
 // CV-CAN-004: with a real resolver, the server OWNER (owner-bypass grants all

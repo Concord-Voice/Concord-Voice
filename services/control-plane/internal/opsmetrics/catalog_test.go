@@ -71,6 +71,36 @@ func TestMediaEgressRatesUseBitsPerSecond(t *testing.T) {
 	}
 }
 
+func TestAccountActivityCatalogIsFixed(t *testing.T) {
+	expected := map[opsmetrics.MetricKey]opsmetrics.Kind{
+		opsmetrics.MetricRegisteredUsersCurrent:      opsmetrics.KindGauge,
+		opsmetrics.MetricPendingRegistrationsCurrent: opsmetrics.KindGauge,
+		opsmetrics.MetricUsersOnlineCurrent:          opsmetrics.KindGauge,
+		opsmetrics.MetricActiveSessionsCurrent:       opsmetrics.KindGauge,
+		opsmetrics.MetricActiveUsers24H:              opsmetrics.KindGauge,
+		opsmetrics.MetricActiveUsers7D:               opsmetrics.KindGauge,
+		opsmetrics.MetricActiveUsers15D:              opsmetrics.KindGauge,
+		opsmetrics.MetricActiveUsers30D:              opsmetrics.KindGauge,
+		opsmetrics.MetricMediaUploadsTotal:           opsmetrics.KindCounter,
+	}
+
+	require.Equal(t, 61, opsmetrics.CatalogSize())
+	for key, kind := range expected {
+		definition, ok := opsmetrics.Definition(key)
+		require.True(t, ok, "missing metric %q", key)
+		require.Equal(t, opsmetrics.SourceControl, definition.Source)
+		require.Equal(t, opsmetrics.Unit("count"), definition.Unit)
+		require.Equal(t, kind, definition.Kind)
+		if kind == opsmetrics.KindCounter {
+			require.Equal(t, opsmetrics.RollupLast, definition.Rollup)
+		} else {
+			require.Equal(t, opsmetrics.RollupAverage, definition.Rollup)
+		}
+		require.Zero(t, definition.Min)
+		require.Positive(t, definition.Max)
+	}
+}
+
 func TestCatalogReturnsAnIndependentCopy(t *testing.T) {
 	first := opsmetrics.Catalog()
 	require.NotEmpty(t, first)

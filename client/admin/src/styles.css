@@ -528,6 +528,22 @@ code,
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.users-metric-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.throughput-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.throughput-metric {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
 .metric-card,
 .service-summary,
 .counter-row,
@@ -625,6 +641,10 @@ meter::-moz-meter-bar {
 .status-healthy,
 .status-normal {
   color: var(--healthy);
+}
+
+.status-available {
+  color: var(--muted-strong);
 }
 
 .status-degraded,
@@ -824,6 +844,15 @@ td .status {
   border: 1px solid var(--border);
   border-radius: var(--radius-base);
   background: var(--night);
+}
+
+.time-mode-control {
+  flex: 0 0 auto;
+}
+
+.users-workspace .section-heading,
+.users-workspace .segmented-control {
+  flex-wrap: wrap;
 }
 
 .segmented-control button,
@@ -1091,6 +1120,11 @@ td .status {
     justify-content: start;
   }
 
+  .time-mode-control {
+    width: max-content;
+    grid-column: 1 / -1;
+  }
+
   .session-badge {
     min-width: 0;
   }
@@ -1101,7 +1135,8 @@ td .status {
 
   .metric-grid,
   .derived-grid,
-  .service-summary-grid {
+  .service-summary-grid,
+  .throughput-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1153,7 +1188,7 @@ td .status {
 
   .session-badge {
     grid-column: 1 / -1;
-    grid-row: 2;
+    grid-row: 3;
   }
 
   .threshold-settings fieldset {

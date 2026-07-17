@@ -65,8 +65,8 @@ func TestNewRouterActivityHistoryWiringOrderIsSingleAndFinal(t *testing.T) {
 		"usersHandler.SetPresenceHistory(presenceHistoryService)",
 		"presenceHistoryHandler := presencehistory.NewHandler(presenceHistoryService)",
 		"presenceHistoryHandler.RegisterRoutes(",
-		"go hub.Run()",
 		"opsRuntime := wireOpsMetricsRuntime(",
+		"go hub.Run()",
 		"return router, hub, natsClient, opsRuntime, nil",
 	}
 	prior := -1

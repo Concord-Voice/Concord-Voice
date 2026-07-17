@@ -7,6 +7,7 @@ import {
   RefreshCw,
   Server,
   Settings,
+  Users,
   type LucideIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -42,11 +43,14 @@ import {
   ServicesWorkspace,
   Status,
   TimeSeriesWorkspace,
+  UsersActivityWorkspace,
   type HealthChange,
   type PollingResource,
 } from "./workspaces";
+import type { TimeMode } from "./time";
 
-export type Workspace = "host" | "services" | "counters" | "series" | "changes";
+export type Workspace =
+  "host" | "services" | "users" | "counters" | "series" | "changes";
 
 interface WorkspaceDefinition {
   count: string;
@@ -58,6 +62,7 @@ interface WorkspaceDefinition {
 const WORKSPACES: readonly WorkspaceDefinition[] = [
   { count: "4", icon: Gauge, id: "host", label: "Host Overview" },
   { count: "7", icon: Server, id: "services", label: "Services" },
+  { count: "9", icon: Users, id: "users", label: "Users & Activity" },
   { count: "20", icon: ListChecks, id: "counters", label: "Counters" },
   { count: "1", icon: ChartLine, id: "series", label: "Time Series" },
   { count: "Live", icon: Activity, id: "changes", label: "Health & Changes" },
@@ -77,7 +82,12 @@ const THRESHOLD_FIELDS: readonly {
 
 const warningAfterMs = 25 * 60 * 1_000;
 const logoutAfterMs = 30 * 60 * 1_000;
-const CURRENT_WORKSPACES = new Set<Workspace>(["host", "services", "counters"]);
+const CURRENT_WORKSPACES = new Set<Workspace>([
+  "host",
+  "services",
+  "users",
+  "counters",
+]);
 const HEALTH_SEED_STATES = new Set<PollingState>([
   "idle",
   "loading",
@@ -190,6 +200,7 @@ interface WorkspaceContentProps {
   previousCounters: AdminCountersResponse | null;
   series: PollingResource<AdminSeriesResponse>;
   thresholds: Thresholds;
+  timeMode: TimeMode;
   window: SeriesWindow;
   workspace: Workspace;
 }
@@ -205,6 +216,7 @@ function WorkspaceContent({
   previousCounters,
   series,
   thresholds,
+  timeMode,
   window,
   workspace,
 }: Readonly<WorkspaceContentProps>) {
@@ -216,6 +228,7 @@ function WorkspaceContent({
           health={health}
           series={series}
           thresholds={thresholds}
+          timeMode={timeMode}
         />
       );
     case "services":
@@ -224,6 +237,16 @@ function WorkspaceContent({
           current={current}
           health={health}
           thresholds={thresholds}
+          timeMode={timeMode}
+        />
+      );
+    case "users":
+      return (
+        <UsersActivityWorkspace
+          counters={counters}
+          current={current}
+          previousCounters={previousCounters}
+          timeMode={timeMode}
         />
       );
     case "counters":
@@ -233,6 +256,7 @@ function WorkspaceContent({
           current={current}
           previousCounters={previousCounters}
           thresholds={thresholds}
+          timeMode={timeMode}
         />
       );
     case "series":
@@ -242,11 +266,14 @@ function WorkspaceContent({
           onMetricKeyChange={onMetricKeyChange}
           onWindowChange={onWindowChange}
           series={series}
+          timeMode={timeMode}
           window={window}
         />
       );
     case "changes":
-      return <ChangesWorkspace events={events} health={health} />;
+      return (
+        <ChangesWorkspace events={events} health={health} timeMode={timeMode} />
+      );
   }
 }
 
@@ -269,6 +296,7 @@ export function Portal({
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [seriesKey, setSeriesKey] = useState<MetricKey>("host_cpu_percent");
   const [seriesWindow, setSeriesWindow] = useState<SeriesWindow>("24h");
+  const [timeMode, setTimeMode] = useState<TimeMode>("utc");
   const [warning, setWarning] = useState(false);
   const [ending, setEnding] = useState(false);
   const [logoutError, setLogoutError] = useState(false);
@@ -380,7 +408,8 @@ export function Portal({
   );
 
   const currentEnabled = !ending && CURRENT_WORKSPACES.has(workspace);
-  const countersEnabled = !ending && workspace === "counters";
+  const countersEnabled =
+    !ending && (workspace === "counters" || workspace === "users");
   const seriesEnabled =
     !ending && (workspace === "host" || workspace === "series");
 
@@ -413,6 +442,34 @@ export function Portal({
     onUnauthorized: handleUnauthorized,
     sessionGeneration: sessionGenerationRef,
   });
+  useEffect(() => {
+    if (
+      countersEnabled &&
+      countersPoll.state !== "idle" &&
+      countersPoll.state !== "stale" &&
+      countersPoll.state !== "rate-limited" &&
+      countersPoll.state !== "error"
+    ) {
+      return;
+    }
+    previousCountersRef.current = null;
+    latestCountersRef.current = null;
+  }, [countersEnabled, countersPoll.state]);
+  useEffect(() => {
+    if (!countersEnabled) return;
+    const clearHiddenCounterBaseline = () => {
+      if (!document.hidden) return;
+      previousCountersRef.current = null;
+      latestCountersRef.current = null;
+    };
+    document.addEventListener("visibilitychange", clearHiddenCounterBaseline);
+    return () => {
+      document.removeEventListener(
+        "visibilitychange",
+        clearHiddenCounterBaseline,
+      );
+    };
+  }, [countersEnabled]);
   const seriesPoll = usePolling({
     enabled: seriesEnabled,
     intervalMs: 5 * 60_000,
@@ -639,6 +696,21 @@ export function Portal({
             </p>
           </div>
           <div className="workspace-actions">
+            <fieldset
+              aria-label="Timestamp display"
+              className="segmented-control time-mode-control"
+            >
+              {(["utc", "local"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  aria-pressed={timeMode === mode}
+                  type="button"
+                  onClick={() => setTimeMode(mode)}
+                >
+                  {mode === "utc" ? "UTC" : "Local"}
+                </button>
+              ))}
+            </fieldset>
             <span className="aggregate-status">
               <Status state={aggregate} />
               <span>{aggregateCopy(aggregate)}</span>
@@ -698,6 +770,7 @@ export function Portal({
             previousCounters={previousCountersRef.current}
             series={seriesResource}
             thresholds={thresholds}
+            timeMode={timeMode}
             window={seriesWindow}
             workspace={workspace}
           />

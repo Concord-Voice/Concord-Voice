@@ -27,6 +27,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	invitecodes "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
@@ -118,6 +119,18 @@ type Handler struct {
 	resolver    *rbac.Resolver
 	tiers       entitlements.TierResolver
 	serverTiers entitlements.ServerTierResolver
+	opsCounter  interface{ Increment(opsmetrics.MetricKey) }
+}
+
+// SetOpsCounter enables aggregate successful-upload counting.
+func (h *Handler) SetOpsCounter(counter interface{ Increment(opsmetrics.MetricKey) }) {
+	h.opsCounter = counter
+}
+
+func (h *Handler) recordSuccessfulUpload() {
+	if h.opsCounter != nil {
+		h.opsCounter.Increment(opsmetrics.MetricMediaUploadsTotal)
+	}
 }
 
 // NewHandler creates a new media handler.
@@ -251,6 +264,7 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 
 	h.log.Info("Attachment uploaded", "file_id", fileID, "user_id", userID, "size", header.Size, "type", fileType)
 
+	h.recordSuccessfulUpload()
 	c.JSON(http.StatusCreated, gin.H{
 		"file_id":     fileID,
 		"storage_key": storageKey,
@@ -581,6 +595,7 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 		"size_original", header.Size, "size_processed", len(processed.Data),
 		"dimensions", fmt.Sprintf("%dx%d", processed.Width, processed.Height))
 
+	h.recordSuccessfulUpload()
 	c.JSON(http.StatusCreated, gin.H{
 		"file_id":     fileID,
 		"storage_key": storageKey,

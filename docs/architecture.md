@@ -7,7 +7,10 @@ socket owner. The agent and media plane publish HMAC-signed, scalar-only v1
 snapshots over fixed NATS subjects. The control plane validates and stores raw
 samples for 24 hours plus hourly rollups for eight days. No user, room, server,
 address, hostname, or free-form Docker metadata is persisted. Collection failure
-degrades only this signal path. The admin portal reads these aggregates through
+degrades only this signal path. Account activity is reduced inside the trusted
+control plane to fixed counts; only a private latest-qualification timestamp is
+retained per user, and no identity enters the metrics store. The Admin Portal
+reads these aggregates through
 four Cloudflare- and admin-session-gated GET routes backed by a separate
 two-connection PostgreSQL role that can select only the metrics tables. See
 [ADR-0030](adr/0030-aggregate-operations-metrics-boundary.md).
@@ -477,7 +480,7 @@ erDiagram
 | Compliance           | `audit_log` (000035); `account_deletions` (000059)                                                                                                                                                                                                                                                            |
 | Attestation          | `release_binaries`, `release_spas` (000066)                                                                                                                                                                                                                                                                   |
 | Admin console        | `admin_users`, `admin_webauthn_credentials`, `admin_audit_log` (000077) — sessions are Redis-backed (opaque sids), not a table                                                                                                                                                                                |
-| Operations metrics   | `ops_metric_samples`, `ops_metric_rollups` (000086) — opaque node ID, fixed key, timestamp, and scalar values only; restricted reader role (000088)                                                                                                                                                        |
+| Operations metrics   | `ops_metric_samples`, `ops_metric_rollups` (000086) — opaque node ID, fixed key, timestamp, and scalar values only; `users.ops_last_active_at` private activity marker cleared beyond the 30-day window and catalog expansion (000091); restricted reader role (000088)                                                   |
 
 > Notable schema history: group-DM admin roles added `dm_participants.role` (`admin`/`member`) + `dm_conversations.icon_url` (000053); `dm_messages` gained a `call_event` type + `call_event_payload` JSONB (000064), and the transient `kind` column was dropped in favor of `type` (000065); `account_deletions.sentry_delete_attempted` was dropped (000060) when Sentry was removed; `key_revocations.revoked_by` was changed to `ON DELETE SET NULL` (000059) so account erasure isn't blocked.
 

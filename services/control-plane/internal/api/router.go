@@ -362,6 +362,7 @@ func NewRouter(
 	var mediaHandler *media.Handler
 	if store != nil {
 		mediaHandler = media.NewHandler(db, store, log, cfg, rbacResolver, entCache, serverEntCache)
+		mediaHandler.SetOpsCounter(opsCounters)
 		usersHandler.SetMediaStore(store)
 		serversHandler.SetMediaStore(store)
 	}
@@ -2053,9 +2054,9 @@ func NewRouter(
 	// Host/path gating of this surface is #1692/#1693.
 	wireAdminRoutes(router, db, redis, metricsReader, cfg, log)
 
-	// Start only after every dependency and route has been injected.
-	go hub.Run()
 	opsRuntime := wireOpsMetricsRuntime(db, natsClient, hub, opsCounters, cfg.OpsMetrics, log)
+	// Start only after every dependency, observer, and route has been injected.
+	go hub.Run()
 	return router, hub, natsClient, opsRuntime, nil
 }
 

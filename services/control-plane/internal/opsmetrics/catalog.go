@@ -80,13 +80,22 @@ const (
 	MetricServiceCoturnCPUPercent        MetricKey = "service_coturn_cpu_percent"
 	MetricServiceCoturnMemoryBytes       MetricKey = "service_coturn_memory_bytes"
 
-	MetricHTTPRequestsTotal       MetricKey = "http_requests_total"
-	MetricHTTPClientErrorsTotal   MetricKey = "http_client_errors_total"
-	MetricHTTPServerErrorsTotal   MetricKey = "http_server_errors_total"
-	MetricWebSocketConnections    MetricKey = "websocket_connections_current"
-	MetricChannelMessagesTotal    MetricKey = "channel_messages_total"
-	MetricDMMessagesTotal         MetricKey = "dm_messages_total"
-	MetricSnapshotRejectionsTotal MetricKey = "ops_snapshot_rejections_total"
+	MetricHTTPRequestsTotal           MetricKey = "http_requests_total"
+	MetricHTTPClientErrorsTotal       MetricKey = "http_client_errors_total"
+	MetricHTTPServerErrorsTotal       MetricKey = "http_server_errors_total"
+	MetricWebSocketConnections        MetricKey = "websocket_connections_current"
+	MetricChannelMessagesTotal        MetricKey = "channel_messages_total"
+	MetricDMMessagesTotal             MetricKey = "dm_messages_total"
+	MetricSnapshotRejectionsTotal     MetricKey = "ops_snapshot_rejections_total"
+	MetricRegisteredUsersCurrent      MetricKey = "registered_users_current"
+	MetricPendingRegistrationsCurrent MetricKey = "pending_registrations_current"
+	MetricUsersOnlineCurrent          MetricKey = "users_online_current"
+	MetricActiveSessionsCurrent       MetricKey = "active_sessions_current"
+	MetricActiveUsers24H              MetricKey = "active_users_24h"
+	MetricActiveUsers7D               MetricKey = "active_users_7d"
+	MetricActiveUsers15D              MetricKey = "active_users_15d"
+	MetricActiveUsers30D              MetricKey = "active_users_30d"
+	MetricMediaUploadsTotal           MetricKey = "media_uploads_total"
 
 	MetricMediaRoomsCurrent                   MetricKey = "media_rooms_current"
 	MetricMediaParticipantsAudioCurrent       MetricKey = "media_participants_audio_current"
@@ -143,7 +152,7 @@ func serviceMetrics(running, healthy, cpu, memory MetricKey) []MetricDefinition 
 }
 
 var catalog = func() map[MetricKey]MetricDefinition {
-	definitions := make([]MetricDefinition, 0, 52)
+	definitions := make([]MetricDefinition, 0, 61)
 	definitions = append(definitions,
 		metric(MetricHostCPUPercent, SourceHost, UnitPercent, KindGauge, RollupAverage, 0, 100),
 		metric(MetricHostMemoryPercent, SourceHost, UnitPercent, KindGauge, RollupAverage, 0, 100),
@@ -156,6 +165,15 @@ var catalog = func() map[MetricKey]MetricDefinition {
 		metric(MetricChannelMessagesTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
 		metric(MetricDMMessagesTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
 		metric(MetricSnapshotRejectionsTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
+		metric(MetricRegisteredUsersCurrent, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
+		metric(MetricPendingRegistrationsCurrent, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
+		metric(MetricUsersOnlineCurrent, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
+		metric(MetricActiveSessionsCurrent, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
+		metric(MetricActiveUsers24H, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
+		metric(MetricActiveUsers7D, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
+		metric(MetricActiveUsers15D, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
+		metric(MetricActiveUsers30D, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
+		metric(MetricMediaUploadsTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
 		metric(MetricMediaRoomsCurrent, SourceMedia, UnitCount, KindGauge, RollupAverage, 0, maxCount),
 		metric(MetricMediaParticipantsAudioCurrent, SourceMedia, UnitCount, KindGauge, RollupAverage, 0, maxCount),
 		metric(MetricMediaParticipantsWebcamCurrent, SourceMedia, UnitCount, KindGauge, RollupAverage, 0, maxCount),

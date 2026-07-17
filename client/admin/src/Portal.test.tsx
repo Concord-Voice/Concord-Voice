@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError, api } from "./api";
+import type { AdminCountersResponse } from "./contracts";
 import {
   DEFAULT_THRESHOLDS,
   FONT_STORAGE_KEY,
@@ -32,6 +33,46 @@ function setHidden(hidden: boolean): void {
   document.dispatchEvent(new Event("visibilitychange"));
 }
 
+function throughputCounters(
+  sampledAt: string,
+  messages: number,
+  uploads: number,
+): AdminCountersResponse {
+  return {
+    node_id: NODE_ID,
+    counters: [
+      {
+        metric_key: "channel_messages_total",
+        source: "control",
+        unit: "count",
+        kind: "counter",
+        value: messages,
+        sampled_at: sampledAt,
+      },
+      {
+        metric_key: "dm_messages_total",
+        source: "control",
+        unit: "count",
+        kind: "counter",
+        value: 0,
+        sampled_at: sampledAt,
+      },
+      {
+        metric_key: "media_uploads_total",
+        source: "control",
+        unit: "count",
+        kind: "counter",
+        value: uploads,
+        sampled_at: sampledAt,
+      },
+    ],
+  };
+}
+
+function messageRateCard(): HTMLElement {
+  return screen.getByRole("article", { name: "Message rate" });
+}
+
 describe("Portal", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -49,7 +90,7 @@ describe("Portal", () => {
     setHidden(false);
   });
 
-  it("starts with usable health and a fixed five-workspace command rail", () => {
+  it("starts with usable health and a fixed six-workspace command rail", () => {
     vi.spyOn(api, "logout").mockResolvedValue();
     render(<Portal initialHealth={healthFixture()} onSessionEnded={vi.fn()} />);
 
@@ -60,6 +101,7 @@ describe("Portal", () => {
     for (const workspace of [
       "Host Overview",
       "Services",
+      "Users & Activity",
       "Counters",
       "Time Series",
       "Health & Changes",
@@ -292,6 +334,202 @@ describe("Portal", () => {
     fireEvent.click(screen.getByRole("button", { name: "Time Series" }));
     await flush();
     expect(api.getSeries).toHaveBeenCalledTimes(2);
+  });
+
+  it("polls current metrics and counters only while Users & Activity is visible", async () => {
+    render(<Portal initialHealth={healthFixture()} onSessionEnded={vi.fn()} />);
+    await flush();
+    vi.mocked(api.getCurrent).mockClear();
+    vi.mocked(api.getCounters).mockClear();
+    vi.mocked(api.getSeries).mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "Users & Activity" }));
+    await flush();
+
+    expect(api.getCurrent).toHaveBeenCalledOnce();
+    expect(api.getCounters).toHaveBeenCalledOnce();
+    expect(api.getSeries).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["stale", new ApiError(503, null)],
+    ["rate-limited", new ApiError(429, 30)],
+    ["error", new ApiError(400, null)],
+  ])(
+    "requires a fresh counter baseline after polling enters %s state",
+    async (_state, cause) => {
+      vi.mocked(api.getCounters)
+        .mockResolvedValueOnce(
+          throughputCounters("2026-07-14T12:00:00Z", 100, 10),
+        )
+        .mockResolvedValueOnce(
+          throughputCounters("2026-07-14T12:00:30Z", 160, 40),
+        )
+        .mockRejectedValueOnce(cause)
+        .mockResolvedValueOnce(
+          throughputCounters("2026-07-14T12:01:30Z", 280, 100),
+        )
+        .mockResolvedValueOnce(
+          throughputCounters("2026-07-14T12:02:00Z", 340, 130),
+        );
+      render(
+        <Portal initialHealth={healthFixture()} onSessionEnded={vi.fn()} />,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Users & Activity" }));
+      await flush();
+      expect(
+        within(messageRateCard()).getByText("Unavailable", {
+          selector: "strong",
+        }),
+      ).toBeVisible();
+
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+        await Promise.resolve();
+      });
+      expect(within(messageRateCard()).getByText("120 / minute")).toBeVisible();
+
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+        await Promise.resolve();
+      });
+      expect(
+        within(messageRateCard()).getByText("Unavailable", {
+          selector: "strong",
+        }),
+      ).toBeVisible();
+
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+        await Promise.resolve();
+      });
+      expect(
+        within(messageRateCard()).getByText("Unavailable", {
+          selector: "strong",
+        }),
+      ).toBeVisible();
+
+      expect(api.getCounters).toHaveBeenCalledTimes(4);
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+        await Promise.resolve();
+      });
+      expect(api.getCounters).toHaveBeenCalledTimes(5);
+      expect(within(messageRateCard()).getByText("120 / minute")).toBeVisible();
+    },
+  );
+
+  it("requires a fresh counter baseline after reopening the workspace", async () => {
+    vi.mocked(api.getCounters)
+      .mockResolvedValueOnce(
+        throughputCounters("2026-07-14T12:00:00Z", 100, 10),
+      )
+      .mockResolvedValueOnce(
+        throughputCounters("2026-07-14T12:00:30Z", 160, 40),
+      )
+      .mockResolvedValueOnce(
+        throughputCounters("2026-07-14T12:01:00Z", 220, 70),
+      )
+      .mockResolvedValueOnce(
+        throughputCounters("2026-07-14T12:01:30Z", 280, 100),
+      );
+    render(<Portal initialHealth={healthFixture()} onSessionEnded={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Users & Activity" }));
+    await flush();
+    await act(async () => {
+      vi.advanceTimersByTime(30_000);
+      await Promise.resolve();
+    });
+    expect(within(messageRateCard()).getByText("120 / minute")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Host Overview" }));
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Users & Activity" }));
+    await flush();
+
+    expect(api.getCounters).toHaveBeenCalledTimes(3);
+    expect(
+      within(messageRateCard()).getByText("Unavailable", {
+        selector: "strong",
+      }),
+    ).toBeVisible();
+
+    await act(async () => {
+      vi.advanceTimersByTime(30_000);
+      await Promise.resolve();
+    });
+    expect(api.getCounters).toHaveBeenCalledTimes(4);
+    expect(within(messageRateCard()).getByText("120 / minute")).toBeVisible();
+  });
+
+  it("requires a fresh counter baseline after returning to a hidden tab", async () => {
+    vi.mocked(api.getCounters)
+      .mockResolvedValueOnce(
+        throughputCounters("2026-07-14T12:00:00Z", 100, 10),
+      )
+      .mockResolvedValueOnce(
+        throughputCounters("2026-07-14T12:00:30Z", 160, 40),
+      )
+      .mockResolvedValueOnce(
+        throughputCounters("2026-07-14T12:01:30Z", 280, 100),
+      )
+      .mockResolvedValueOnce(
+        throughputCounters("2026-07-14T12:02:00Z", 340, 130),
+      );
+    render(<Portal initialHealth={healthFixture()} onSessionEnded={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Users & Activity" }));
+    await flush();
+    await act(async () => {
+      vi.advanceTimersByTime(30_000);
+      await Promise.resolve();
+    });
+    expect(within(messageRateCard()).getByText("120 / minute")).toBeVisible();
+
+    setHidden(true);
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+      await Promise.resolve();
+    });
+    expect(api.getCounters).toHaveBeenCalledTimes(2);
+
+    setHidden(false);
+    await flush();
+    expect(api.getCounters).toHaveBeenCalledTimes(3);
+    expect(
+      within(messageRateCard()).getByText("Unavailable", {
+        selector: "strong",
+      }),
+    ).toBeVisible();
+
+    await act(async () => {
+      vi.advanceTimersByTime(30_000);
+      await Promise.resolve();
+    });
+    expect(api.getCounters).toHaveBeenCalledTimes(4);
+    expect(within(messageRateCard()).getByText("120 / minute")).toBeVisible();
+  });
+
+  it("keeps timestamp display in memory and resets to UTC on remount", () => {
+    const { unmount } = render(
+      <Portal initialHealth={healthFixture()} onSessionEnded={vi.fn()} />,
+    );
+    const utc = screen.getByRole("button", { name: "UTC" });
+    const local = screen.getByRole("button", { name: "Local" });
+    expect(utc).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(local);
+    expect(local).toHaveAttribute("aria-pressed", "true");
+    expect(localStorage).toHaveLength(0);
+    unmount();
+
+    render(<Portal initialHealth={healthFixture()} onSessionEnded={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "UTC" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
   });
 
   it("routes polling 401 to local login without an extra logout request", async () => {

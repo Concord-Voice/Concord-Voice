@@ -9,6 +9,7 @@ import {
 } from "@playwright/test";
 
 import {
+  ACCOUNT_ACTIVITY_METRIC_KEYS,
   COUNTER_METRIC_KEYS,
   METRIC_KEYS,
   type AdminCountersResponse,
@@ -71,6 +72,21 @@ function metricDefinition(metricKey: MetricKey): {
     };
   }
   if (
+    ACCOUNT_ACTIVITY_METRIC_KEYS.includes(
+      metricKey as (typeof ACCOUNT_ACTIVITY_METRIC_KEYS)[number],
+    )
+  ) {
+    const counter = COUNTER_METRIC_KEYS.includes(
+      metricKey as (typeof COUNTER_METRIC_KEYS)[number],
+    );
+    return {
+      kind: counter ? "counter" : "gauge",
+      rollup: counter ? "last" : "average",
+      source: "control",
+      unit: "count",
+    };
+  }
+  if (
     metricKey.startsWith("http_") ||
     metricKey.startsWith("websocket_") ||
     metricKey.startsWith("channel_") ||
@@ -128,7 +144,21 @@ function metricDefinition(metricKey: MetricKey): {
   };
 }
 
+const accountFixtureValues: Partial<Record<MetricKey, number>> = {
+  active_sessions_current: 52,
+  active_users_15d: 310,
+  active_users_24h: 95,
+  active_users_30d: 390,
+  active_users_7d: 220,
+  pending_registrations_current: 8,
+  registered_users_current: 420,
+  users_online_current: 37,
+  websocket_connections_current: 45,
+};
+
 function metricValue(metricKey: MetricKey, index: number): number {
+  const accountFixtureValue = accountFixtureValues[metricKey];
+  if (accountFixtureValue !== undefined) return accountFixtureValue;
   if (metricKey.endsWith("_running") || metricKey.endsWith("_healthy")) {
     return 1;
   }
@@ -156,6 +186,35 @@ function currentResponse(): AdminCurrentResponse {
     })).map(({ rollup: _rollup, ...metric }) => metric),
   };
 }
+
+test("telemetry fixture preserves account and client relationships", () => {
+  const values = new Map(
+    currentResponse().metrics.map((metric) => [
+      metric.metric_key,
+      metric.value,
+    ]),
+  );
+  const value = (key: MetricKey) => values.get(key) ?? Number.NaN;
+
+  expect(value("users_online_current")).toBeLessThanOrEqual(
+    value("registered_users_current"),
+  );
+  expect(value("users_online_current")).toBeLessThanOrEqual(
+    value("websocket_connections_current"),
+  );
+  expect(value("active_users_24h")).toBeLessThanOrEqual(
+    value("active_users_7d"),
+  );
+  expect(value("active_users_7d")).toBeLessThanOrEqual(
+    value("active_users_15d"),
+  );
+  expect(value("active_users_15d")).toBeLessThanOrEqual(
+    value("active_users_30d"),
+  );
+  expect(value("active_users_30d")).toBeLessThanOrEqual(
+    value("registered_users_current"),
+  );
+});
 
 function countersResponse(): AdminCountersResponse {
   return {
@@ -420,6 +479,7 @@ test("password plus WebAuthn signs in and explicit logout clears the session", a
     await expect(page.getByText("Admin Portal")).toBeVisible();
     for (const workspace of [
       "Host Overview",
+      "Users & Activity",
       "Services",
       "Counters",
       "Time Series",
@@ -776,6 +836,7 @@ test("Command Rail stays keyboard-operable, contained, and visibly rendered", as
   await disclosure.click();
   for (const workspace of [
     ["Host Overview", "host"],
+    ["Users & Activity", "users-activity"],
     ["Services", "services"],
     ["Counters", "counters"],
     ["Time Series", "time-series"],
