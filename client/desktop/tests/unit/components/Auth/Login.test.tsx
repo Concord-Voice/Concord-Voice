@@ -3,6 +3,7 @@ import Login from '@/renderer/components/Auth/Login';
 import { vi } from 'vitest';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
+import { e2eeService } from '@/renderer/services/e2eeService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock global fetch
@@ -28,6 +29,8 @@ vi.mock('@/renderer/utils/crypto', () => ({
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     initialize: vi.fn().mockResolvedValue(undefined),
+    captureTeardownEpoch: vi.fn().mockReturnValue(0),
+    wasTornDownSince: vi.fn().mockReturnValue(false),
     getSessionKeys: vi.fn().mockReturnValue({
       wrappingKeyBase64: 'mock-wrapping-key',
       preferencesKeyBase64: 'mock-preferences-key',
@@ -48,6 +51,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
   API_BASE: 'http://localhost:8080',
   apiFetch: vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }),
   ensureMachineId: vi.fn().mockResolvedValue('mock-machine-id'),
+  revokeAbortedSession: vi.fn().mockResolvedValue(undefined),
 }));
 
 /** Helper: standard login response payload */
@@ -94,8 +98,19 @@ describe('Login', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetAllStores();
+    vi.mocked(e2eeService.wasTornDownSince).mockReturnValue(false);
     useClientConfigStore.getState().setServerCapabilities({
       auth: { oauthProviders: ['google', 'apple'] },
+    });
+  });
+
+  // Tests that stub globalThis.electron (storeRefreshToken side effects) must
+  // not leak the stub into later tests — restore the pre-suite value.
+  const originalElectron = globalThis.electron;
+  afterEach(() => {
+    Object.defineProperty(globalThis, 'electron', {
+      value: originalElectron,
+      writable: true,
     });
   });
 
@@ -317,6 +332,315 @@ describe('Login', () => {
         })
       );
     });
+  });
+
+  it('aborts login on E2EEInitTeardownError — no onSuccess, no token store, no recovery prompt (PR #2337)', async () => {
+    // A mid-login teardown (401 -> nuclearReset) fences the key commit and
+    // initialize() rejects with the typed teardown error. Login must abort:
+    // never store the refresh token, never call onSuccess, and never route the
+    // teardown into the consented key-reset prompt.
+    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
+    vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new E2EEInitTeardownError());
+    const storeRefreshToken = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken },
+      writable: true,
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse(),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    // The typed error surfaces as a login error (outer catch), not the
+    // key-recovery consent modal.
+    await vi.waitFor(() => {
+      expect(e2eeService.initialize).toHaveBeenCalled();
+    });
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(storeRefreshToken).not.toHaveBeenCalled();
+    expect(screen.queryByText(/reset encryption keys/i)).not.toBeInTheDocument();
+    // The server session established by /auth/login (cookie already set) is
+    // revoked so the long-lived refresh credential can't outlive the abort.
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    expect(revokeAbortedSession).toHaveBeenCalled();
+  });
+
+  it('aborts login when a teardown lands AFTER initialize resolves (pre-admit epoch check, PR #2337)', async () => {
+    // The fence inside initialize() covers only the span up to the key commit.
+    // A teardown during the later token-store / persist / hydrate awaits must
+    // be caught by the pre-admit wasTornDownSince() checks — never onSuccess.
+    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    vi.mocked(e2eeService.wasTornDownSince).mockReturnValue(true);
+    const storeRefreshToken = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken },
+      writable: true,
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse(),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    await vi.waitFor(() => {
+      expect(e2eeService.wasTornDownSince).toHaveBeenCalled();
+    });
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(storeRefreshToken).not.toHaveBeenCalled();
+  });
+
+  it('clears a token resurrected by a teardown during storeRefreshToken (Gitar/Codex P1, PR #2337)', async () => {
+    // A teardown landing while storeRefreshToken is awaited clears the
+    // renderer token and bumps the epoch. Pre-fix, the flow then
+    // unconditionally re-published the torn-down token and the final abort
+    // check left it resident — routing treated the user as authenticated
+    // with E2EE cleared.
+    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const notice = 'Your session ended before sign-in could finish. Please sign in again.';
+    vi.mocked(e2eeService.wasTornDownSince)
+      .mockReturnValueOnce(false) // pre-admit check #1 passes
+      .mockReturnValue(true); // check #2 detects the mid-await teardown
+    const storeRefreshToken = vi.fn().mockImplementation(async () => {
+      useAuthStore.getState().clearAccessToken(); // the teardown's clear
+    });
+    const clearTokens = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken, clearTokens },
+      writable: true,
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse(),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    // The abort notice doubles as the flow-settled signal.
+    expect(await screen.findByText(notice)).toBeInTheDocument();
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    // The refresh token persisted mid-flight must not survive on disk — a
+    // failed best-effort revoke would otherwise let restoreSession()
+    // resurrect the torn-down session next launch (Codex P1, #2337).
+    expect(clearTokens).toHaveBeenCalled();
+  });
+
+  it('refuses admit when the token was cleared without an E2EE teardown (Codex P1, PR #2337)', async () => {
+    // handleRefreshFailure's `phase !== 'stable'` path clears the access
+    // token WITHOUT clearKeys(), so the teardown epoch never advances and
+    // every epoch check passes. The token-lifecycle admit gate must abort
+    // instead of completing login with credentials the auth layer already
+    // rejected.
+    const notice = 'Your session ended before sign-in could finish. Please sign in again.';
+    const storeRefreshToken = vi.fn().mockImplementation(async () => {
+      useAuthStore.getState().clearAccessToken(); // token-only clear, no epoch bump
+    });
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken },
+      writable: true,
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse(),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    expect(await screen.findByText(notice)).toBeInTheDocument();
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().accessToken).toBeNull();
+  });
+
+  it("never strips a successor login's token when a stale flow aborts (PR #2337)", async () => {
+    // If a rapid retry established a NEW session while this flow was
+    // unwinding, the stale abort must not clear the successor's token and
+    // must not stage a login notice for a user who is already in the app.
+    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const notice = 'Your session ended before sign-in could finish. Please sign in again.';
+    vi.mocked(e2eeService.wasTornDownSince).mockReturnValueOnce(false).mockReturnValue(true);
+    const storeRefreshToken = vi.fn().mockImplementation(async () => {
+      useAuthStore.getState().setAccessToken('successor-token'); // retry won the race
+    });
+    const clearTokens = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken, clearTokens },
+      writable: true,
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse(),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    expect(await screen.findByText(notice)).toBeInTheDocument();
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().accessToken).toBe('successor-token');
+    expect(useAuthStore.getState().loginNotice).toBeNull();
+    // The successor session's disk tokens (its own storeRefreshToken owns the
+    // disk copy now) must not be wiped by the stale abort (Codex P1, #2337).
+    expect(clearTokens).not.toHaveBeenCalled();
+  });
+
+  it('admits a login whose token was legitimately refreshed mid-flight — same session (Codex P1, PR #2337)', async () => {
+    // A proactive/reactive refresh rotates the access token for the SAME
+    // session_id while the login is still pending. The admit gate must key on
+    // session identity — pre-fix its raw token comparison treated the rotation
+    // as a foreign lifecycle and revoked the valid session.
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const storeRefreshToken = vi.fn().mockImplementation(async () => {
+      // Same session, newer token (what a refresh does).
+      useAuthStore.getState().setAccessToken('rotated-token');
+    });
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken },
+      writable: true,
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse(), // session_id: 'mock-session'
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    await vi.waitFor(() => {
+      expect(onSuccess).toHaveBeenCalled();
+    });
+    expect(revokeAbortedSession).not.toHaveBeenCalled();
+    // onSuccess must carry the LIVE (rotated) token — AuthFlow writes it back
+    // into authStore, and the original would clobber the refreshed credential
+    // (Codex P1, #2337).
+    expect(onSuccess).toHaveBeenCalledWith(
+      expect.objectContaining({ accessToken: 'rotated-token' })
+    );
+  });
+
+  it('revokes the server session when a teardown aborts the KEY-RECOVERY init (Codex P1, PR #2337)', async () => {
+    // handleKeyRecovery's initialize() can reject with the typed teardown
+    // error after the reset PUT succeeded. Pre-fix its catch only cleared the
+    // renderer token and rethrew — bypassing the revocation sites — so the
+    // login's refresh-token row + HttpOnly cookie outlived the teardown.
+    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('unwrap failed'));
+    vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new E2EEInitTeardownError());
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse(),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    // Consent to the key reset; the recovery init then hits the teardown.
+    await user.click(
+      await screen.findByLabelText(/encrypted message history will be permanently deleted/i)
+    );
+    await user.click(screen.getByRole('button', { name: /reset and continue/i }));
+
+    await vi.waitFor(() => {
+      expect(revokeAbortedSession).toHaveBeenCalled();
+    });
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+
+  it('a successful admit clears a stale abort notice staged mid-flight (Codex P1, PR #2337)', async () => {
+    // A torn-down EARLIER flow can stage the abort notice while THIS login is
+    // completing. A successful admit must clear it, or the notice survives and
+    // resurfaces on a much later Login mount as if that sign-in had failed.
+    const storeRefreshToken = vi.fn().mockImplementation(async () => {
+      useAuthStore.getState().setLoginNotice('stale abort notice from an earlier flow');
+    });
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken },
+      writable: true,
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse(),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    await vi.waitFor(() => {
+      expect(onSuccess).toHaveBeenCalled();
+    });
+    expect(useAuthStore.getState().loginNotice).toBeNull();
+  });
+
+  it('stages a one-shot notice that the NEXT Login mount renders after a teardown abort (PR #2337)', async () => {
+    // In the real app the early access-token set navigates "/" into the
+    // authenticated tree, so by the time the teardown abort reaches the login
+    // catch THIS Login instance is unmounted and setErrors is a no-op — while
+    // the teardown also cleared the token, bouncing the user to a FRESH Login.
+    // The abort therefore stages authStore.loginNotice, which the next mount
+    // seeds into its error banner and consumes (renders exactly once).
+    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
+    const notice = 'Your session ended before sign-in could finish. Please sign in again.';
+    vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new E2EEInitTeardownError());
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse(),
+    });
+
+    const user = userEvent.setup();
+    const first = render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    // Still-mounted instance (jsdom has no router): friendly copy, not the
+    // internal E2EEInitTeardownError message — and the notice is staged.
+    expect(await screen.findByText(notice)).toBeInTheDocument();
+    expect(useAuthStore.getState().loginNotice).toBe(notice);
+    first.unmount();
+
+    // The fresh Login seeds its banner from the staged notice and consumes it.
+    const second = render(<Login {...defaultProps} />);
+    expect(screen.getByText(notice)).toBeInTheDocument();
+    expect(useAuthStore.getState().loginNotice).toBeNull();
+    second.unmount();
+
+    // Exactly once: a later mount shows no stale notice.
+    render(<Login {...defaultProps} />);
+    expect(screen.queryByText(notice)).not.toBeInTheDocument();
   });
 
   it('sets access token in auth store on success', async () => {

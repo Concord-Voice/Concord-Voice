@@ -1,12 +1,13 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { unwrapLoginKeys, generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
 import { e2eeService } from '../../services/e2eeService';
+import { E2EEInitTeardownError } from '../../services/e2eeErrors';
 import { errorMessage } from '../../utils/redactError';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import { hydratePostLogin } from '../../services/postLoginHydration';
 import { useAuthStore } from '../../stores/authStore';
 import { useClientConfigStore } from '../../stores/clientConfigStore';
-import { apiFetch, ensureMachineId } from '../../services/apiClient';
+import { apiFetch, ensureMachineId, revokeAbortedSession } from '../../services/apiClient';
 import { apiUrl, getApiBase } from '../../services/runtimeServerBase';
 import { UserProfile } from '../../stores/userStore';
 import TOTPInput from './TOTPInput';
@@ -60,6 +61,37 @@ async function checkSafeStorage(): Promise<string | null> {
   } catch {
     return 'Secure storage could not be verified. Please try again, and if the problem persists, restart the app.';
   }
+}
+
+/**
+ * User-facing copy for a login aborted by a mid-login session teardown
+ * (E2EEInitTeardownError). Direction-neutral: the session died under the
+ * login (authoritative 401 → reset), not through anything the user did.
+ */
+const TEARDOWN_ABORT_NOTICE =
+  'Your session ended before sign-in could finish. Please sign in again.';
+
+/**
+ * Map a login-flow error to its user-facing message. A teardown abort
+ * additionally stages TEARDOWN_ABORT_NOTICE as a one-shot
+ * authStore.loginNotice: the early access-token set usually navigates "/"
+ * into the authenticated tree before the abort reaches a catch, so THIS
+ * Login instance is already unmounted and its setErrors/setMfaError are
+ * no-ops — while the teardown also cleared the token, bouncing the user to
+ * a FRESH Login, which seeds its error banner from the staged notice
+ * (PR #2337).
+ */
+function describeLoginError(error: unknown, fallback: string): string {
+  if (error instanceof E2EEInitTeardownError) {
+    // Stage the one-shot notice only when no live session took over: after a
+    // successful successor login the user is IN the app, and a staged notice
+    // would surface stale on a much-later Login mount.
+    if (useAuthStore.getState().accessToken === null) {
+      useAuthStore.getState().setLoginNotice(TEARDOWN_ABORT_NOTICE);
+    }
+    return TEARDOWN_ABORT_NOTICE;
+  }
+  return error instanceof Error ? error.message : fallback;
 }
 
 export interface LoginProps {
@@ -144,8 +176,22 @@ const Login: React.FC<LoginProps> = ({
     rememberMe: false,
   });
 
-  const [errors, setErrors] = useState<FormErrors>({});
+  // Seeded from any staged one-shot notice (a teardown-aborted prior login —
+  // see describeLoginError); the mount effect below consumes the store copy.
+  const [errors, setErrors] = useState<FormErrors>(() => {
+    const notice = useAuthStore.getState().loginNotice;
+    return notice ? { general: notice } : {};
+  });
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Consume the staged notice so it renders exactly once. StrictMode-safe:
+  // the seeded state survives the simulated remount, and the second effect
+  // pass is a no-op on the already-cleared store.
+  useEffect(() => {
+    if (useAuthStore.getState().loginNotice) {
+      useAuthStore.getState().setLoginNotice(null);
+    }
+  }, []);
 
   // SSO state — populated when the server returns 403 account_uses_sso. The
   // password form is replaced with a list of SSO-only buttons so the user is
@@ -286,7 +332,7 @@ const Login: React.FC<LoginProps> = ({
     } catch (error) {
       console.error('Login error:', errorMessage(error));
       setErrors({
-        general: error instanceof Error ? error.message : 'Login failed. Please try again.',
+        general: describeLoginError(error, 'Login failed. Please try again.'),
       });
     } finally {
       setIsSubmitting(false);
@@ -358,7 +404,10 @@ const Login: React.FC<LoginProps> = ({
   // error; the token is cleared here first). Extracted from
   // completeLoginFromResponse to keep that function under the cognitive-
   // complexity threshold (#1293).
-  const handleKeyRecovery = async (): Promise<boolean> => {
+  const handleKeyRecovery = async (
+    teardownEpoch?: number,
+    abortedSession?: { accessToken: string; sessionId: string | null; apiBase?: string }
+  ): Promise<boolean> => {
     const decision = await promptKeyRecovery();
     setKeyRecoveryResolver(null);
 
@@ -416,11 +465,23 @@ const Login: React.FC<LoginProps> = ({
         formData.password,
         newKeys.wrappedPrivateKey,
         newKeys.keyDerivationSalt,
-        newKeys.keyDerivationAlg
+        newKeys.keyDerivationAlg,
+        undefined,
+        teardownEpoch
       );
       console.debug('E2EE keys reset and service initialized!');
       return true;
     } catch (resetError) {
+      // A teardown during the recovery init follows the SAME abort contract as
+      // the primary init path (Codex P1, #2337): strip only this flow's own
+      // token and revoke the aborted server session — otherwise the login's
+      // refresh-token row + HttpOnly cookie outlive the logout-class teardown.
+      if (resetError instanceof E2EEInitTeardownError && abortedSession) {
+        const auth = useAuthStore.getState();
+        if (auth.accessToken === abortedSession.accessToken) auth.clearAccessToken();
+        await revokeAbortedSession(abortedSession);
+        throw resetError;
+      }
       useAuthStore.getState().clearAccessToken();
       throw resetError;
     }
@@ -430,6 +491,36 @@ const Login: React.FC<LoginProps> = ({
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- server login payload shape varies across direct-login and MFA-verify endpoints (different e2ee_keys wrapping, optional session_id); field-by-field narrowing inside the function is clearer than a 30-line union type
   const completeLoginFromResponse = async (data: any) => {
     console.debug('Login successful, unwrapping private key...');
+
+    // Capture the teardown epoch BEFORE publishing the access token: setting
+    // the token arms authenticated effects that can trigger an authoritative
+    // 401 -> nuclearReset() teardown while unwrap/Argon2id below is still in
+    // flight. Passing this epoch into initialize() makes a teardown anywhere
+    // in the login span abort the key commit (E2EEInitTeardownError) instead
+    // of letting the flow continue into a half-authenticated state
+    // (Codex P1-A/P1-B, PR #2337).
+    const teardownEpoch = e2eeService.captureTeardownEpoch();
+
+    // Abort-path token strip (Gitar/Codex P1, PR #2337): a teardown landing
+    // while an await below is in flight clears the access token, but this
+    // flow could leave it — or re-publish it — resident after the abort
+    // throw, and routing would then treat the user as authenticated with
+    // E2EE cleared. Identity-guarded so a rapid successor login's fresh
+    // token is never stripped by this stale continuation (same
+    // session-binding discipline as revokeAbortedSession).
+    const stripAbortedToken = () => {
+      const auth = useAuthStore.getState();
+      if (auth.accessToken === data.access_token) auth.clearAccessToken();
+    };
+
+    // One session reference for every abort site: this flow's own credentials
+    // plus the API origin they belong to (self-hosted switch hazard — see
+    // AbortedSessionRef in apiClient).
+    const abortedSession = {
+      accessToken: data.access_token as string,
+      sessionId: (data.session_id ?? null) as string | null,
+      apiBase: getApiBase(),
+    };
 
     // Set access token early so e2eeService can make authenticated API calls (e.g., key migration)
     useAuthStore.getState().setAccessToken(data.access_token);
@@ -448,16 +539,36 @@ const Login: React.FC<LoginProps> = ({
         formData.password,
         data.e2ee_keys.wrapped_private_key,
         data.e2ee_keys.key_derivation_salt,
-        kdAlg
+        kdAlg,
+        undefined,
+        teardownEpoch
       );
       console.debug('Private key unwrapped and E2EE service initialized!');
     } catch (unwrapError) {
+      // A teardown mid-login is NOT a corrupt-key condition — never route it
+      // into the consented key-reset prompt. Rethrow so the outer login catch
+      // surfaces an error WITHOUT storing tokens or calling onSuccess (the
+      // session this login belonged to is gone).
+      if (unwrapError instanceof E2EEInitTeardownError) {
+        stripAbortedToken();
+        await revokeAbortedSession(abortedSession);
+        throw unwrapError;
+      }
       console.warn(
         'Key unwrap failed; prompting for consented key reset',
         errorMessage(unwrapError)
       );
-      const recovered = await handleKeyRecovery();
+      const recovered = await handleKeyRecovery(teardownEpoch, abortedSession);
       if (!recovered) return;
+    }
+
+    // Pre-admit epoch check #1: initialize()'s fence covers only the span up
+    // to the key commit. A teardown landing after it resolved must not let us
+    // persist a refresh token for a dead session (Codex P1, PR #2337).
+    if (e2eeService.wasTornDownSince(teardownEpoch)) {
+      stripAbortedToken();
+      await revokeAbortedSession(abortedSession);
+      throw new E2EEInitTeardownError();
     }
 
     if (globalThis.electron?.storeRefreshToken) {
@@ -468,8 +579,11 @@ const Login: React.FC<LoginProps> = ({
         accessToken: data.access_token,
       });
     }
-    useAuthStore.getState().setAccessToken(data.access_token);
-    if (data.session_id) useAuthStore.getState().setSessionId(data.session_id);
+    // Deliberately NO token re-publish here: the early set above already
+    // installed it, and an unconditional re-set would resurrect a token that
+    // a mid-await teardown just cleared — past the final abort check below
+    // (Gitar/Codex P1, PR #2337). The admit gate before onSuccess verifies
+    // the early-published token is still the live one instead.
 
     // Persist E2EE keys for restart-survival; failure warns only and never
     // clears the valid in-session keys (#1278/#1288 — see persistE2EESessionKeys).
@@ -481,8 +595,64 @@ const Login: React.FC<LoginProps> = ({
     // of individual steps are non-fatal (each swallows its own network blips).
     await hydratePostLogin();
 
+    // The storeRefreshToken IPC above may have persisted this dead flow's
+    // refresh token + cached access token to DISK. The server revoke below is
+    // best-effort — if it fails (network), a later restoreSession() would
+    // resurrect the torn-down session from that disk copy (Codex P1, #2337).
+    // Identity-guarded: when a successor session owns the renderer, its own
+    // storeRefreshToken owns the disk copy too — never wipe it.
+    const clearAbortedDiskTokens = async () => {
+      const live = useAuthStore.getState().accessToken;
+      if (live === null || live === data.access_token) {
+        await globalThis.electron?.clearTokens?.();
+      }
+    };
+
+    // Pre-admit epoch check #2 — immediately before completing login: a
+    // teardown during the token-store / persist / hydrate awaits above must
+    // abort here, or AuthFlow would restore the rejected access token and
+    // navigate into the app with E2EE cleared (Codex P1, PR #2337).
+    if (e2eeService.wasTornDownSince(teardownEpoch)) {
+      stripAbortedToken();
+      await clearAbortedDiskTokens();
+      await revokeAbortedSession(abortedSession);
+      throw new E2EEInitTeardownError();
+    }
+
+    // Token-lifecycle admit gate (Codex P1, PR #2337): a token-ONLY clear —
+    // handleRefreshFailure's `phase !== 'stable'` path clears the access
+    // token WITHOUT clearKeys() — leaves the teardown epoch untouched, so
+    // every epoch check above passes. If this flow's session no longer owns
+    // the auth store (cleared, or replaced by a successor login), it must not
+    // be admitted: abort instead of completing with credentials the auth
+    // layer already rejected. Ownership is SESSION-identity first (a
+    // proactive/reactive refresh legitimately rotates the access token for
+    // the SAME session_id mid-flight — that must still admit, Codex P1);
+    // token equality is the fallback for responses without a session_id.
+    const liveAuth = useAuthStore.getState();
+    const stillOwnsStore = data.session_id
+      ? liveAuth.sessionId === data.session_id
+      : liveAuth.accessToken === data.access_token;
+    if (!stillOwnsStore) {
+      await clearAbortedDiskTokens();
+      await revokeAbortedSession(abortedSession);
+      throw new E2EEInitTeardownError();
+    }
+
+    // A successful admit clears any abort notice a torn-down EARLIER flow
+    // staged while this login was completing (Codex P1, PR #2337): the user
+    // is in the app now, and a surviving notice would resurface on a much
+    // later Login mount as if THAT sign-in had just failed.
+    useAuthStore.getState().setLoginNotice(null);
+
     onSuccess({
-      accessToken: data.access_token,
+      // The LIVE token, not data.access_token: when ownership was established
+      // via session_id, a mid-flight reactive refresh may have legitimately
+      // rotated the token. AuthFlow writes this value back into authStore, so
+      // passing the original would clobber the refreshed credential and leave
+      // the session holding an expired token inside the refresh cooldown
+      // (Codex P1, #2337).
+      accessToken: useAuthStore.getState().accessToken ?? data.access_token,
       user: data.user,
       rememberMe: data.remember_me ?? formData.rememberMe,
     });
@@ -513,7 +683,7 @@ const Login: React.FC<LoginProps> = ({
       // MFA verify returns full login response (tokens + user + keys)
       await completeLoginFromResponse(data);
     } catch (err) {
-      setMfaError(err instanceof Error ? err.message : 'Verification failed');
+      setMfaError(describeLoginError(err, 'Verification failed'));
     } finally {
       setIsSubmitting(false);
     }
@@ -583,7 +753,7 @@ const Login: React.FC<LoginProps> = ({
       if (!res.ok) throw new Error(data.error || 'Verification failed');
       await completeLoginFromResponse(data);
     } catch (err) {
-      setMfaError(err instanceof Error ? err.message : 'Verification failed');
+      setMfaError(describeLoginError(err, 'Verification failed'));
     } finally {
       setIsSubmitting(false);
     }

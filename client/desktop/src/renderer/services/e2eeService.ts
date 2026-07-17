@@ -31,7 +31,11 @@ import {
   base64ToArrayBuffer,
 } from '../utils/crypto';
 import { apiFetch, safeJson } from './apiClient';
-import { E2EEKeyUnavailableError, type E2EEKeyErrorCode } from './e2eeErrors';
+import {
+  E2EEInitTeardownError,
+  E2EEKeyUnavailableError,
+  type E2EEKeyErrorCode,
+} from './e2eeErrors';
 import { useE2EEStore } from '../stores/e2eeStore';
 
 // Session lifetime — keys cached until explicit invalidation (rotation) or logout/close.
@@ -114,6 +118,28 @@ class E2EEService {
   private readonly channelKeyGenerations: Map<string, number> = new Map();
   private readonly channelAccessRevocationGenerations: Map<string, number> = new Map();
   private keySessionGeneration: number = 0;
+  // Bumped ONLY by clearKeys() (actual key destruction: logout, nuclearReset/
+  // gracefulReset teardown, account switch). The init-commit fence keys on THIS
+  // counter, not keySessionGeneration: recoveryReset()/fencePendingOperations()
+  // bump keySessionGeneration to reject stale decrypt CONTINUATIONS while
+  // deliberately preserving key custody — a same-session Recovery-A landing
+  // mid-derivation must NOT abort a guarded re-init commit (the password-change
+  // flow would otherwise push preferences with the OLD keyset after the server
+  // committed the new password — undecryptable after relogin; Codex P1, PR #2337).
+  private keyClearGeneration: number = 0;
+  // Monotonic initialize()/initializeFromStoredKeys() attempt counter
+  // (Codex P1, PR #2337). A token-only session invalidation
+  // (handleRefreshFailure's `phase !== 'stable'` path) clears the access
+  // token WITHOUT bumping keyClearGeneration, so a rapid successor login can
+  // start a new initialization while a stale one's Argon2id is still
+  // pending — and last-writer-wins would let the STALE keyset overwrite the
+  // successor's committed keys (cross-session key confusion). The commit
+  // gate admits only the NEWEST attempt; a superseded attempt throws
+  // E2EEInitTeardownError (its session is gone from the flow's perspective —
+  // same abort contract as destruction). Token-lifecycle ownership itself
+  // stays at the auth surfaces (their pre-admit gates), keeping this service
+  // auth-store-agnostic.
+  private initAttemptSequence = 0;
   private rateLimitedUntil: number = 0; // timestamp when rate limit expires
 
   // #1878: authoritative CSK-rotation signal. Fires when a strictly-higher
@@ -143,13 +169,106 @@ class E2EEService {
     wrappedPrivateKeyBase64: string,
     saltBase64: string,
     _keyDerivationAlg: KeyDerivationAlgorithm = 'argon2id',
-    guard?: E2EEInitializationGuard
+    guard?: E2EEInitializationGuard,
+    sinceEpoch?: number
   ): Promise<void> {
     if (!initializationIsCurrent(guard)) return;
+    // Snapshot the key-CLEAR generation BEFORE the (slow) derivation begins —
+    // or adopt the caller-captured epoch (captureTeardownEpoch) when provided.
+    // The fresh-login callers (Login/Register/SSOEagerUnlock/SSOPassphraseSetup)
+    // pass no `guard`, so this internal fence is the ONLY thing that aborts the
+    // commit when a 401 -> nuclearReset() -> gracefulReset() -> clearKeys()
+    // (#2327) tears the session down mid-Argon2id: clearKeys() bumps
+    // keyClearGeneration, and the commit gate then throws E2EEInitTeardownError
+    // for a keyset derived under a stale generation (a silent void-success let
+    // Login continue past the teardown — Codex P1-A). The caller-captured
+    // epoch closes the sibling window where the teardown lands BEFORE
+    // initialize() is even called (Codex P1-B): an entry-time snapshot would
+    // postdate the clearKeys() bump and never trip. (CWE-212, #2199.)
+    // Deliberately NOT keySessionGeneration: recoveryReset() bumps that one
+    // while PRESERVING the session — see the keyClearGeneration field comment.
+    const startGeneration = sinceEpoch ?? this.keyClearGeneration;
+    // Pre-sequence staleness gate (Codex P1, PR #2337): a continuation whose
+    // caller epoch is ALREADY stale (a teardown fired before it resumed) must
+    // abort WITHOUT advancing initAttemptSequence. If it bumped the sequence
+    // first, it would invalidate a valid newer sign-in that started earlier and
+    // already captured a lower attempt number — cancelling a good login (whose
+    // abort path would then revoke its own freshly-issued session). Validate
+    // the epoch BEFORE claiming the newest-attempt slot.
+    if (this.keyClearGeneration !== startGeneration) throw new E2EEInitTeardownError();
+    // This call is now the newest initialization attempt — any still-pending
+    // earlier attempt is superseded and must not commit (see the
+    // initAttemptSequence field comment).
+    const attempt = ++this.initAttemptSequence;
+    // Entry gate: re-validate (guard + supersession) before any derivation work.
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
     const saltBytes = new Uint8Array(base64ToArrayBuffer(saltBase64));
-    await this.initializeWithArgon2id(password, wrappedPrivateKeyBase64, saltBytes, guard);
+    await this.initializeWithArgon2id(
+      password,
+      wrappedPrivateKeyBase64,
+      saltBytes,
+      startGeneration,
+      attempt,
+      guard
+    );
 
     // No periodic cleanup needed — session-scoped cache (keys stay until rotation or logout)
+  }
+
+  /**
+   * The current teardown epoch. Callers that begin auth-flow work BEFORE
+   * invoking initialize() (e.g. Login publishes the access token and unwraps
+   * keys first) capture this up front and pass it as initialize()'s
+   * `sinceEpoch`, so a teardown landing anywhere in the flow — not just during
+   * derivation — aborts the commit (Codex P1-B, PR #2337). Monotonic counter,
+   * bumped only by clearKeys(); carries no key material.
+   */
+  captureTeardownEpoch(): number {
+    return this.keyClearGeneration;
+  }
+
+  /**
+   * True if clearKeys() (logout / 401 teardown / account switch) ran since the
+   * captured epoch. Auth flows call this immediately before EVERY admit action
+   * (onSuccess / onUnlock / SSO phase-idle, and before persisting a refresh
+   * token) — initialize()'s own fence covers only the span up to the key
+   * commit, and a teardown landing during the later token-store / persist /
+   * hydrate awaits must not be steamrolled into an admit (Codex P1,
+   * PR #2337).
+   */
+  wasTornDownSince(epoch: number): boolean {
+    return this.keyClearGeneration !== epoch;
+  }
+
+  /**
+   * Commit gate for the async initialize() path, with two distinct outcomes:
+   * - Caller-owned guard abort (account switch / explicit cancel) → returns
+   *   false; callers bail SILENTLY (the guard's owner initiated it and handles
+   *   it via its own signal — existing contract, unchanged).
+   * - Key DESTRUCTION since the snapshot/epoch (clearKeys bumped
+   *   keyClearGeneration: logout, 401 teardown, account switch) → THROWS
+   *   E2EEInitTeardownError so `await initialize()` cannot resolve as success
+   *   and the login/restore flow cannot continue past the teardown
+   *   (Codex P1-A, PR #2337; CWE-212, #2199).
+   * - Supersession (a NEWER initialize()/initializeFromStoredKeys() attempt
+   *   started since this one) → ALSO THROWS E2EEInitTeardownError: a stale
+   *   pending attempt must never commit over — or after — the newest one
+   *   (last-writer-wins would let a token-only-invalidated login's keyset
+   *   overwrite a successor's; Codex P1, PR #2337).
+   * The fresh-login callers pass no guard, so the generation arm is what
+   * fences a 401 -> nuclearReset landing mid-Argon2id. A same-session
+   * recoveryReset() (continuation fence only, keys preserved) intentionally
+   * trips NEITHER arm (Codex P1, PR #2337).
+   */
+  private assertInitCommitCurrent(
+    startGeneration: number,
+    attempt: number,
+    guard?: E2EEInitializationGuard
+  ): boolean {
+    if (!initializationIsCurrent(guard)) return false;
+    if (this.keyClearGeneration !== startGeneration) throw new E2EEInitTeardownError();
+    if (this.initAttemptSequence !== attempt) throw new E2EEInitTeardownError();
+    return true;
   }
 
   /**
@@ -159,14 +278,23 @@ class E2EEService {
     password: string,
     wrappedPrivateKeyBase64: string,
     salt: Uint8Array,
+    startGeneration: number,
+    attempt: number,
     guard?: E2EEInitializationGuard
   ): Promise<void> {
     const exportableWrapping = await deriveKeyArgon2idExportable(password, salt);
-    if (!initializationIsCurrent(guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
     const exportablePrefs = await derivePreferencesKeyArgon2idExportable(password, salt);
-    if (!initializationIsCurrent(guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
 
-    await this.finalizeKeys(exportableWrapping, exportablePrefs, wrappedPrivateKeyBase64, guard);
+    await this.finalizeKeys(
+      exportableWrapping,
+      exportablePrefs,
+      wrappedPrivateKeyBase64,
+      startGeneration,
+      attempt,
+      guard
+    );
   }
 
   /**
@@ -176,12 +304,14 @@ class E2EEService {
     exportableWrapping: CryptoKey,
     exportablePrefs: CryptoKey,
     wrappedPrivateKeyBase64: string,
+    startGeneration: number,
+    attempt: number,
     guard?: E2EEInitializationGuard
   ): Promise<void> {
     const wrappingRaw = await crypto.subtle.exportKey('raw', exportableWrapping);
-    if (!initializationIsCurrent(guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
     const prefsRaw = await crypto.subtle.exportKey('raw', exportablePrefs);
-    if (!initializationIsCurrent(guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
 
     // Re-import into locals first. No singleton field changes until every
     // asynchronous step is complete and the initiating account is still current.
@@ -192,7 +322,7 @@ class E2EEService {
       false,
       ['wrapKey', 'unwrapKey']
     );
-    if (!initializationIsCurrent(guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
     const preferencesKey = await crypto.subtle.importKey(
       'raw',
       prefsRaw,
@@ -200,7 +330,7 @@ class E2EEService {
       false,
       ['encrypt', 'decrypt']
     );
-    if (!initializationIsCurrent(guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
 
     const sessionKeys: E2EESessionKeys = {
       wrappingKeyBase64: arrayBufferToBase64(wrappingRaw),
@@ -226,24 +356,44 @@ class E2EEService {
    * Imports raw key bytes as non-extractable CryptoKey objects.
    */
   async initializeFromStoredKeys(keys: E2EESessionKeys): Promise<void> {
+    // Same commit fence as initialize()/finalizeKeys(): snapshot the generation
+    // before the importKey awaits, re-import into LOCALS, and only publish the
+    // singleton fields once no teardown fired. Restore has no Argon2id window
+    // (only two fast importKey ops), but it is the same publish surface — a
+    // 401 -> nuclearReset landing between the two awaits would otherwise leave a
+    // ready=true / wrappingKey=null split-brain and resurrect sessionKeys for
+    // the torn-down account (CWE-212, #2199). This mirrors finalizeKeys' commit
+    // discipline; this path takes no guard, so the generation check is the fence.
+    // keyClearGeneration (destruction-only), NOT keySessionGeneration — see the
+    // field comment (same-session recoveryReset must not abort a commit).
+    const startGeneration = this.keyClearGeneration;
+    // This restore is now the newest initialization attempt — a still-pending
+    // earlier attempt (or one that starts later) supersedes/aborts per the
+    // initAttemptSequence contract (Codex P1, PR #2337).
+    const attempt = ++this.initAttemptSequence;
     const wrappingRaw = base64ToArrayBuffer(keys.wrappingKeyBase64);
     const prefsRaw = base64ToArrayBuffer(keys.preferencesKeyBase64);
 
-    this.wrappingKey = await crypto.subtle.importKey(
+    const wrappingKey = await crypto.subtle.importKey(
       'raw',
       wrappingRaw,
       { name: 'AES-GCM', length: 256 },
       false,
       ['wrapKey', 'unwrapKey']
     );
-    this.preferencesKey = await crypto.subtle.importKey(
+    if (!this.assertInitCommitCurrent(startGeneration, attempt)) return;
+    const preferencesKey = await crypto.subtle.importKey(
       'raw',
       prefsRaw,
       { name: 'AES-GCM', length: 256 },
       false,
       ['encrypt', 'decrypt']
     );
+    if (!this.assertInitCommitCurrent(startGeneration, attempt)) return;
 
+    // Synchronous commit — no await between the gate above and setReady().
+    this.wrappingKey = wrappingKey;
+    this.preferencesKey = preferencesKey;
     this.wrappedPrivateKey = keys.wrappedPrivateKeyBase64;
     this.sessionKeys = keys;
 
@@ -1104,6 +1254,9 @@ class E2EEService {
    */
   clearKeys(): void {
     this.fencePendingOperations();
+    // Destruction marker for the init-commit fence (assertInitCommitCurrent):
+    // bumped ONLY here, never in fencePendingOperations — see the field comment.
+    this.keyClearGeneration += 1;
     this.rateLimitedUntil = 0;
     this.wrappingKey = null;
     this.preferencesKey = null;

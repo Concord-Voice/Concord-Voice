@@ -29,9 +29,16 @@
  */
 
 import React, { useState } from 'react';
-import { apiFetch, safeJson } from '../../services/apiClient';
+import {
+  apiFetch,
+  safeJson,
+  revokeAbortedSession,
+  captureAuthSession,
+} from '../../services/apiClient';
 import { type KeyDerivationAlgorithm } from '../../utils/crypto';
 import { e2eeService } from '../../services/e2eeService';
+import { E2EEInitTeardownError } from '../../services/e2eeErrors';
+import { useAuthStore } from '../../stores/authStore';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import LoadingSpinner from './LoadingSpinner';
 import './SSOEagerUnlock.css';
@@ -51,6 +58,25 @@ interface KeysResponse {
 
 const MAX_ATTEMPTS = 3;
 
+/**
+ * Wipe main-process/disk credentials that a pending persist IPC re-wrote
+ * AFTER a teardown wiped them — but ONLY for a nuclear-class (!rememberMe)
+ * teardown and only when no successor session owns the store: a rememberMe
+ * (graceful) teardown deliberately PRESERVES disk credentials so the session
+ * can restore next launch (#1768), and this account's re-persisted keys are
+ * part of that restorable state — wiping would delete the preserved refresh
+ * token with them (Codex P1, PR #2337). File-private so handleSubmit stays
+ * under the S3776 cognitive-complexity ceiling.
+ */
+async function wipeRepersistedCredentialsForNuclearTeardown(aborted: {
+  accessToken: string | null;
+}): Promise<void> {
+  const live = useAuthStore.getState();
+  if (!live.rememberMe && (live.accessToken === null || live.accessToken === aborted.accessToken)) {
+    await globalThis.electron?.clearTokens?.();
+  }
+}
+
 const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
   const [passphrase, setPassphrase] = useState('');
   const [attemptCount, setAttemptCount] = useState(0);
@@ -64,6 +90,20 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
     }
     setSubmitting(true);
     setError(null);
+
+    // Teardown epoch for the whole unlock attempt (keys fetch + Argon2id):
+    // a 401 -> nuclearReset landing anywhere in this span makes initialize()
+    // reject with E2EEInitTeardownError instead of committing keys for a
+    // dead session (PR #2337 P1-B analogue for the SSO unlock surface).
+    const teardownEpoch = e2eeService.captureTeardownEpoch();
+    // Bind the abort-revoke to the session this unlock belongs to (set by the
+    // SSO callback before this gate mounted), so a concurrent newer login is
+    // not revoked by mistake (Codex P1, #2337). `let`, not `const`: the keys
+    // fetch below can transparently refresh a 401, rotating the token (and
+    // installing a session ID the SSO bootstrap never had) — the snapshot is
+    // re-captured after that refresh-capable call so the ownership gate and a
+    // later revoke track the CURRENT identity, not the stale bearer.
+    let abortedSession = captureAuthSession();
 
     // Step-isolated error handling so we can distinguish six failure sources
     // and only count true "incorrect passphrase" against the lockout counter.
@@ -110,10 +150,41 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
       key_derivation_alg: alg = 'argon2id',
     } = data.e2ee_keys;
 
+    // Re-capture after the refresh-capable keys fetch (Codex P1, #2337): a
+    // 401 that apiFetch recovered installed a rotated token + session ID for
+    // the SAME session. Without this, the ownership gate below would reject
+    // the valid refreshed session, and an abort would revoke the stale bearer.
+    // Adopt the post-fetch identity ONLY when it is live: a token-only
+    // teardown landing during the fetch/parse leaves an EMPTY store, and
+    // adopting {null, null} would make the ownership gate vacuously pass
+    // (null === null) and admit a dead session — keeping the pre-fetch owner
+    // makes the gate fail closed instead (Codex P1, #2337).
+    const postFetchSession = captureAuthSession();
+    if (postFetchSession.accessToken !== null) {
+      abortedSession = postFetchSession;
+    }
+
     // The ONLY step that counts toward the wrong-passphrase lockout.
     try {
-      await e2eeService.initialize(passphrase, wrappedPrivateKey, salt, alg);
-    } catch {
+      await e2eeService.initialize(
+        passphrase,
+        wrappedPrivateKey,
+        salt,
+        alg,
+        undefined,
+        teardownEpoch
+      );
+    } catch (err) {
+      // A teardown mid-unlock (401 -> nuclearReset) is a dead-session signal,
+      // NOT a wrong passphrase — never charge it against the lockout counter
+      // (contract on E2EEInitTeardownError; PR #2337). Mirrors the 401 branch
+      // of the keys fetch above.
+      if (err instanceof E2EEInitTeardownError) {
+        await revokeAbortedSession(abortedSession);
+        setError('Your session expired. Please sign in again.');
+        setSubmitting(false);
+        return;
+      }
       // Never log the underlying error — its `cause` chain can carry
       // ciphertext fragments. AES-GCM authentication failure is the
       // intended signal for "wrong passphrase".
@@ -128,6 +199,36 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
     // failure and never clears the valid in-session keys (#1278/#1288). This does
     // NOT count toward the lockout, and is a no-op if getSessionKeys() is null.
     await persistE2EESessionKeys(e2eeService.getSessionKeys());
+
+    // Pre-admit epoch check: a teardown landing after initialize() resolved
+    // (e.g. during the persist await) must not admit the user (PR #2337).
+    if (e2eeService.wasTornDownSince(teardownEpoch)) {
+      // The persist above may have re-written E2EE keys to the main process /
+      // safeStorage AFTER the teardown wiped them (Codex P1, #2337) — see the
+      // helper for the rememberMe (#1768) and successor-identity guards.
+      await wipeRepersistedCredentialsForNuclearTeardown(abortedSession);
+      await revokeAbortedSession(abortedSession);
+      setError('Your session expired. Please sign in again.');
+      setSubmitting(false);
+      return;
+    }
+
+    // Token-lifecycle admit gate (Codex P1, PR #2337): a token-ONLY clear —
+    // handleRefreshFailure's `phase !== 'stable'` path — invalidates the
+    // session WITHOUT advancing the E2EE epoch, so the check above passes.
+    // Verify the captured session still owns the auth store before admitting.
+    // Session-identity first (a same-session token refresh must still admit);
+    // token equality only when the SSO session carries no session ID.
+    const liveAuth = useAuthStore.getState();
+    const stillOwnsStore = abortedSession.sessionId
+      ? liveAuth.sessionId === abortedSession.sessionId
+      : liveAuth.accessToken === abortedSession.accessToken;
+    if (!stillOwnsStore) {
+      await revokeAbortedSession(abortedSession);
+      setError('Your session expired. Please sign in again.');
+      setSubmitting(false);
+      return;
+    }
 
     onUnlock();
   };

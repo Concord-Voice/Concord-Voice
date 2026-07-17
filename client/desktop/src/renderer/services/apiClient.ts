@@ -48,7 +48,7 @@ const MIN_REFRESH_INTERVAL_MS = 10_000; // Rate limit: max 1 refresh per 10s (#2
 
 let proactiveRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
-interface AuthLifecycleSnapshot {
+export interface AuthLifecycleSnapshot {
   accessToken: string | null;
   sessionId: string | null;
 }
@@ -821,4 +821,96 @@ export async function apiFetch(
   }
 
   return handle401Recovery(path, init, response, mid, opts?.authoritative ?? true, authLifecycle);
+}
+
+/**
+ * Best-effort revoke of a server session whose client-side login/SSO flow
+ * aborted on a logout-class teardown (E2EEInitTeardownError / wasTornDownSince).
+ *
+ * The teardown clears the RENDERER access token and the main-process/disk token
+ * halves, but a server response that resolved *after* the teardown (e.g. a late
+ * completeSSORegistration / login) has already minted a live refresh-token row
+ * and set the HttpOnly `refresh_token` cookie — clearing local state does not
+ * revoke that. This POSTs `/auth/logout` from the RENDERER as a DIRECT fetch
+ * with `credentials: 'include'` so the browser jar carries the HttpOnly cookie;
+ * the server revokes the row and clears the cookie via Set-Cookie
+ * (extractRefreshToken reads the cookie, so no client-held refresh token is
+ * needed — the main-process `electron.logout()` path can't help here because
+ * it uses `credentials:'omit'` + an `X-Refresh-Token` the renderer-jar SSO
+ * cookie never populates).
+ *
+ * Deliberately NOT apiFetch — see the inline comment at the fetch call for the
+ * TOCTOU + cross-origin + bearer rationale. A 401 here can never recurse into
+ * another teardown because the response never enters the auth-recovery path.
+ * Failure is swallowed — the row expires on its own if the network is down.
+ * See #2337 (Codex P1).
+ */
+/**
+ * An aborted flow's session reference: the auth lifecycle snapshot plus the
+ * runtime API base it authenticated against. The base matters on self-hosted
+ * switches (Codex P1, #2337): HttpOnly cookies are per-origin, so an abort
+ * continuation that runs after the user switched servers must revoke against
+ * the ABORTED origin — the current origin's jar never held that cookie.
+ */
+export interface AbortedSessionRef extends AuthLifecycleSnapshot {
+  apiBase?: string;
+}
+
+export async function revokeAbortedSession(aborted: AbortedSessionRef): Promise<void> {
+  const currentBase = getApiBase();
+  const abortedBase = aborted.apiBase ?? currentBase;
+  if (abortedBase === currentBase) {
+    // Bind the revoke to the aborted session (Codex P1, #2337). If a NEWER
+    // live session now owns the HttpOnly cookie — the user retried sign-in
+    // while this flow was unwinding and the second login succeeded — revoking
+    // would log the good session out, and the aborted cookie was already
+    // overwritten anyway. Decline. A torn-down/cleared store (the common
+    // abort case) is NOT "newer": the aborted cookie is still the only one in
+    // the jar, so proceed. The second clause deliberately does NOT require the
+    // aborted session ID to be null: a successor SSO login installs a token
+    // with NO session ID (useSSOFlow), so a mixed shape — aborted {A, S1},
+    // current {B, null} — must still decline (Codex P1, #2337).
+    //
+    // Cross-origin aborts (self-hosted switch) skip this check entirely:
+    // cookie jars are per-origin, so the current session cannot own the
+    // aborted origin's cookie.
+    const current = captureAuthLifecycle();
+    const newerSessionOwnsCookie =
+      (current.sessionId !== null && current.sessionId !== aborted.sessionId) ||
+      (current.sessionId === null &&
+        current.accessToken !== null &&
+        current.accessToken !== aborted.accessToken);
+    if (newerSessionOwnsCookie) return;
+  }
+  try {
+    // Direct fetch, deliberately NOT apiFetch (Codex P1 pair, #2337):
+    // (1) apiFetch awaits the attestation-token IPC before dispatch — a
+    //     successor login could install its cookie during that await, and the
+    //     logout would then revoke the successor's cookie (TOCTOU on the
+    //     ownership check above, which is now synchronous with dispatch);
+    // (2) apiFetch always targets the CURRENT runtime base, but a cross-origin
+    //     abort must revoke against the ABORTED origin;
+    // (3) the bearer must be the ABORTED session's own — the common abort case
+    //     runs after the teardown cleared authStore, and without it the
+    //     server's blacklistAccessToken no-ops, leaving the aborted 15-min
+    //     access JWT accepted until expiry.
+    // A 401 here can never recurse into teardown because nothing routes this
+    // response through the auth-recovery path.
+    await fetch(`${abortedBase}/api/v1/auth/logout`, {
+      method: 'POST',
+      credentials: 'include',
+      ...(aborted.accessToken
+        ? { headers: { Authorization: `Bearer ${aborted.accessToken}` } }
+        : {}),
+    });
+  } catch {
+    // best-effort — a failed revoke leaves the server row to expire naturally.
+  }
+}
+
+/** Snapshot the current auth session, for binding a later revokeAbortedSession. */
+export function captureAuthSession(): AbortedSessionRef {
+  // Carry the runtime API base so a later revoke targets the origin this
+  // session actually belongs to (self-hosted switch hazard — see AbortedSessionRef).
+  return { ...captureAuthLifecycle(), apiBase: getApiBase() };
 }

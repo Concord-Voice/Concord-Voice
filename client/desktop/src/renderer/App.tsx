@@ -33,6 +33,7 @@ import { useWebSocket } from './hooks/useWebSocket';
 import { useLaunchReset } from './hooks/useLaunchReset';
 import SubscriptionResetModal from './components/Settings/SubscriptionResetModal';
 import { e2eeService } from './services/e2eeService';
+import { E2EEInitTeardownError } from './services/e2eeErrors';
 import { hydratePostLogin } from './services/postLoginHydration';
 import { usePrivacyStore } from './stores/privacyStore';
 import { klipyClient } from './services/gifProvider/klipyClient';
@@ -110,6 +111,26 @@ export function handleAppRootError() {
       console.error('[App] Failed to soft-restart, forcing reload:', errorMessage(err));
       globalThis.location.reload();
     });
+}
+
+/**
+ * Log an E2EE session-restore failure, distinguishing a benign superseded/
+ * torn-down restore from a genuine key failure (Gitar quality note, PR #2337).
+ * Module-level (not inlined in the restore catch) so its branch does not add
+ * to App()'s cognitive complexity at the deep useEffect nesting depth (S3776).
+ */
+function logE2EERestoreError(err: unknown): void {
+  if (err instanceof E2EEInitTeardownError) {
+    // Superseded or torn-down restore — expected when a fresh login raced the
+    // restore (the newer attempt owns the E2EE singleton) or a teardown landed
+    // mid-restore. Benign; not a key failure.
+    console.debug('E2EE restore superseded/torn down (benign):', errorMessage(err));
+    return;
+  }
+  console.warn(
+    'Failed to restore E2EE keys — E2EE features will require re-login:',
+    errorMessage(err)
+  );
 }
 
 // ─── Launch-reset host (#1301) ─────────────────────────────────────────
@@ -387,10 +408,7 @@ function App() {
             await e2eeService.initializeFromStoredKeys(result.e2eeKeys);
             console.debug('E2EE service restored from stored session keys');
           } catch (err) {
-            console.warn(
-              'Failed to restore E2EE keys — E2EE features will require re-login:',
-              errorMessage(err)
-            );
+            logE2EERestoreError(err);
           }
         }
 

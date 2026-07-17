@@ -33,6 +33,7 @@ export function resetAllStores(): void {
   // Stores with explicit clear/reset methods
   useAuthStore.getState().clearAccessToken();
   useAuthStore.getState().setRememberMe(true); // Reset to default
+  useAuthStore.getState().setLoginNotice(null); // Not covered by clearAccessToken (by design)
   useUserStore.getState().clearUser();
   useServerStore.getState().clearServers();
   useChannelStore.getState().clearChannels();

@@ -10,6 +10,13 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
+// Partial-mock apiClient: keep real ssoService's apiFetch path, stub
+// revokeAbortedSession to assert it fires on a teardown-abort (PR #2337).
+vi.mock('@/renderer/services/apiClient', async (orig) => ({
+  ...(await orig<typeof import('@/renderer/services/apiClient')>()),
+  revokeAbortedSession: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Mock crypto utilities so the test does not actually run RSA-4096 keygen
 vi.mock('@/renderer/utils/crypto', () => ({
   generateRegistrationKeys: vi.fn().mockResolvedValue({
@@ -37,6 +44,8 @@ vi.mock('@/renderer/services/e2eeService', () => ({
     initialize: vi.fn(async () => {
       e2eeState.initialized = true;
     }),
+    captureTeardownEpoch: vi.fn().mockReturnValue(0),
+    wasTornDownSince: vi.fn().mockReturnValue(false),
     getSessionKeys: vi.fn(() =>
       e2eeState.initialized
         ? {
@@ -64,6 +73,7 @@ vi.mock('@/renderer/hooks/useSSOFlow', () => ({
 beforeEach(() => {
   vi.clearAllMocks();
   e2eeState.initialized = false;
+  vi.mocked(e2eeService.wasTornDownSince).mockReturnValue(false);
   resetAllStores();
   useSSOStore.getState().setState({
     phase: 'register_required',
@@ -237,7 +247,9 @@ describe('SSOPassphraseSetup', () => {
       'StrongPassphrase!12345',
       'bW9jay13cmFwcGVkLXByaXZhdGUta2V5', // pragma: allowlist secret
       'bW9jay1zYWx0', // pragma: allowlist secret
-      'argon2id'
+      'argon2id',
+      undefined, // no guard on this surface
+      0 // teardownEpoch captured at handleSubmit start (PR #2337)
     );
     // Session keys persisted to the OS keychain so E2EE survives an app restart.
     expect(storeE2EEKeysMock).toHaveBeenCalledWith({
@@ -267,6 +279,154 @@ describe('SSOPassphraseSetup', () => {
     });
     expect(useAuthStore.getState().accessToken).toBe('access-xyz');
     expect(e2eeService.clearKeys).toHaveBeenCalled();
+  });
+
+  it('aborts SSO setup on a mid-setup teardown — clears the fresh token, never admits (PR #2337)', async () => {
+    // A logout-class teardown landing after the teardown epoch is captured
+    // makes initialize() reject with the typed E2EEInitTeardownError. The
+    // registration succeeded server-side and published a FRESH access token —
+    // continuing to phase 'idle' would admit the user with E2EE cleared and
+    // resurrect the torn-down session. The catch must treat the teardown as
+    // fatal: clear the just-published token and abort the continuation.
+    const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
+    // Deferred initialize() so we can observe the token AFTER the registration
+    // response published it and BEFORE the teardown rejects — proving the clear
+    // is a cleanup of a published token, not a never-set no-op (CodeRabbit).
+    let rejectInit: (e: unknown) => void = () => {};
+    vi.mocked(e2eeService.initialize).mockReturnValueOnce(
+      new Promise<void>((_, reject) => {
+        rejectInit = reject;
+      })
+    );
+    const clearTokens = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, clearTokens },
+      writable: true,
+    });
+    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
+
+    render(<SSOPassphraseSetup />);
+    fillAndSubmit();
+
+    // The registration token IS published while initialize() is still pending.
+    await waitFor(() => {
+      expect(useAuthStore.getState().accessToken).toBe('access-xyz');
+    });
+
+    // Now the mid-setup teardown makes initialize() reject.
+    rejectInit(new E2EEInitTeardownError());
+
+    await waitFor(() => {
+      expect(screen.queryByText(/session ended during setup/i)).toBeInTheDocument();
+    });
+    // The just-published registration token must NOT survive the teardown.
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    // The admit path (phase 'idle') is never reached.
+    expect(useSSOStore.getState().state.phase).not.toBe('idle');
+    // The freshly-issued server session (HttpOnly refresh cookie + row) is revoked.
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    expect(revokeAbortedSession).toHaveBeenCalled();
+    // Main-process/disk artifacts a pending IPC may have re-written after the
+    // teardown are wiped too (Codex P1, #2337).
+    expect(clearTokens).toHaveBeenCalled();
+  });
+
+  it('does NOT complete setup when the token was invalidated WITHOUT an E2EE teardown (Codex P1, PR #2337)', async () => {
+    // A token-only invalidation (handleRefreshFailure's phase !== 'stable'
+    // path) clears the access token without advancing the teardown epoch, so
+    // the epoch check passes. The token-ownership admit gate must abort
+    // instead of setting phase 'idle' with rejected credentials.
+    const { useAuthStore } = await import('@/renderer/stores/authStore');
+    const { useSSOStore } = await import('@/renderer/stores/ssoStore');
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    // The token-only clear lands while init/persist is in flight.
+    vi.mocked(e2eeService.initialize).mockImplementationOnce(async () => {
+      useAuthStore.getState().clearAccessToken();
+    });
+    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
+
+    render(<SSOPassphraseSetup />);
+    fillAndSubmit();
+
+    await waitFor(() => {
+      expect(screen.queryByText(/session ended during setup/i)).toBeInTheDocument();
+    });
+    expect(useSSOStore.getState().state.phase).not.toBe('idle');
+    expect(revokeAbortedSession).toHaveBeenCalled();
+  });
+
+  it("preserves a successor session's token when the SSO abort fires (Codex P1, PR #2337)", async () => {
+    // A successor sign-in can complete while abortSetupForTeardown awaits
+    // revokeAbortedSession(). The local clear is identity-guarded: only the
+    // aborted flow's own token is stripped, never the successor's — pre-fix
+    // the unconditional clearAccessToken logged the NEW session out of the
+    // renderer even though the revoke helper correctly declined it.
+    const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    vi.mocked(revokeAbortedSession).mockImplementationOnce(async () => {
+      // The successor login lands while the revoke is in flight.
+      useAuthStore.getState().setAccessToken('successor-token');
+    });
+    let rejectInit: (e: unknown) => void = () => {};
+    vi.mocked(e2eeService.initialize).mockReturnValueOnce(
+      new Promise<void>((_, reject) => {
+        rejectInit = reject;
+      })
+    );
+    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
+
+    render(<SSOPassphraseSetup />);
+    fillAndSubmit();
+    await waitFor(() => {
+      expect(useAuthStore.getState().accessToken).toBe('access-xyz');
+    });
+    rejectInit(new E2EEInitTeardownError());
+
+    await waitFor(() => {
+      expect(screen.queryByText(/session ended during setup/i)).toBeInTheDocument();
+    });
+    expect(useAuthStore.getState().accessToken).toBe('successor-token');
+  });
+
+  it('ordinary init failure stays non-fatal — rollback clearKeys is NOT a teardown (Codex P2, PR #2337)', async () => {
+    // The catch's deliberate rollback clearKeys() bumps the real
+    // keyClearGeneration. With a FAITHFUL epoch mock (coupled to clearKeys,
+    // unlike the default), the pre-admit check must NOT misread that
+    // self-inflicted clear as an external teardown: setup completes
+    // non-fatally (phase idle, token kept) per the #1278 contract.
+    let clears = 0;
+    vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new Error('init boom'));
+    vi.mocked(e2eeService.clearKeys).mockImplementation(() => {
+      e2eeState.initialized = false;
+      clears += 1;
+    });
+    vi.mocked(e2eeService.captureTeardownEpoch).mockImplementation(() => clears);
+    vi.mocked(e2eeService.wasTornDownSince).mockImplementation((epoch: number) => clears !== epoch);
+    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
+
+    render(<SSOPassphraseSetup />);
+    fillAndSubmit();
+
+    await waitFor(() => {
+      expect(useSSOStore.getState().state.phase).toBe('idle');
+    });
+    expect(useAuthStore.getState().accessToken).toBe('access-xyz');
+    expect(screen.queryByText(/session ended during setup/i)).not.toBeInTheDocument();
+  });
+
+  it('does NOT admit when a teardown lands after initialize resolves (pre-admit check, PR #2337)', async () => {
+    vi.mocked(e2eeService.wasTornDownSince).mockReturnValue(true);
+    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
+
+    render(<SSOPassphraseSetup />);
+    fillAndSubmit();
+
+    await waitFor(() => {
+      expect(screen.queryByText(/session ended during setup/i)).toBeInTheDocument();
+    });
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(useSSOStore.getState().state.phase).not.toBe('idle');
   });
 
   it('keeps the in-memory E2EE session when only keychain persistence fails', async () => {

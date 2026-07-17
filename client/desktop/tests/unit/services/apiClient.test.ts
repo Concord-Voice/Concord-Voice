@@ -32,6 +32,7 @@ import {
   refreshAccessToken,
   safeJson,
   ensureMachineId,
+  revokeAbortedSession,
 } from '@/renderer/services/apiClient';
 
 describe('apiClient', () => {
@@ -960,6 +961,111 @@ describe('apiClient', () => {
       await expect(safeJson(res)).rejects.toThrow(
         'Invalid JSON in response (HTTP 200, Content-Type: application/json)'
       );
+    });
+  });
+
+  describe('revokeAbortedSession (#2337)', () => {
+    it('POSTs /auth/logout to revoke a session whose flow aborted on teardown', async () => {
+      useAuthStore.setState({ accessToken: null, sessionId: null });
+      mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
+      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(String(url)).toContain('/api/v1/auth/logout');
+      expect(init.method).toBe('POST');
+    });
+
+    it('does NOT tear down the session on a 401 (non-authoritative)', async () => {
+      // A 401 on the revoke call must not recursively trigger nuclearReset —
+      // the session is already being torn down. authoritative:false suppresses
+      // the teardown; the raw 401 is returned/swallowed.
+      useAuthStore.setState({ accessToken: null, sessionId: null });
+      mockFetch.mockResolvedValue(new Response('unauthorized', { status: 401 }));
+
+      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
+
+      expect(mockNuclearReset).not.toHaveBeenCalled();
+      expect(mockGracefulReset).not.toHaveBeenCalled();
+    });
+
+    it('swallows a network failure (best-effort)', async () => {
+      mockFetch.mockRejectedValueOnce(new Error('network down'));
+      await expect(
+        revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' })
+      ).resolves.toBeUndefined();
+    });
+
+    it('still revokes when the session was torn down (cleared, no re-login)', async () => {
+      // Common abort case: teardown cleared the store. The aborted cookie is the
+      // only one in the jar → revoke it.
+      useAuthStore.setState({ accessToken: null, sessionId: null });
+      mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
+      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(String(mockFetch.mock.calls[0][0])).toContain('/api/v1/auth/logout');
+    });
+
+    it('DECLINES to revoke when a newer live session now owns the cookie (#2337 wrong-session)', async () => {
+      // A second login succeeded while the aborted flow was unwinding; its cookie
+      // is current. Revoking would log the good session out — decline.
+      useAuthStore.setState({ accessToken: 'B', sessionId: 'S2' });
+
+      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
+
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('DECLINES for a token-only newer SSO session — mixed session-ID shape (Codex P1, #2337)', async () => {
+      // A successor SSO login installs a token with NO session ID (useSSOFlow),
+      // so the current lifecycle is {accessToken: B, sessionId: null}. Against
+      // an aborted {A, S1} this must still read as "a different live session
+      // owns the cookie" and decline — pre-fix, both ownership clauses missed
+      // this mixed shape and the successful SSO session was logged out.
+      useAuthStore.setState({ accessToken: 'B', sessionId: null });
+
+      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
+
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('revokes against the ABORTED origin when the runtime server switched (Codex P1, #2337)', async () => {
+      // Self-hosted switch: cookies are per-origin, so the current origin's
+      // session cannot own the aborted origin's cookie — the same-jar decline
+      // must not apply, and the POST must target the aborted origin with the
+      // aborted session's own bearer.
+      useAuthStore.setState({ accessToken: 'B', sessionId: 'S2' }); // live session on the NEW origin
+      mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
+      await revokeAbortedSession({
+        accessToken: 'A',
+        sessionId: 'S1',
+        apiBase: 'https://aborted.example',
+      });
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(String(url)).toBe('https://aborted.example/api/v1/auth/logout');
+      expect(init.credentials).toBe('include');
+      expect(new Headers(init.headers).get('Authorization')).toBe('Bearer A');
+    });
+
+    it("carries the aborted session's own bearer so the access JWT is blacklisted (Codex P1, #2337)", async () => {
+      // Common abort case: the teardown already cleared authStore, so apiFetch
+      // attaches no store token — without the explicit header the server's
+      // blacklistAccessToken no-ops and the aborted 15-min access JWT stays
+      // accepted until natural expiry.
+      useAuthStore.setState({ accessToken: null, sessionId: null });
+      mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
+      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const [, init] = mockFetch.mock.calls[0];
+      expect(new Headers(init.headers).get('Authorization')).toBe('Bearer A');
     });
   });
 });

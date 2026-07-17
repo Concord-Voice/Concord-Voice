@@ -28,6 +28,30 @@ export class E2EEKeyUnavailableError extends Error {
 }
 
 /**
+ * Typed error for an initialization commit aborted because the keyset was
+ * DESTROYED (clearKeys — logout / 401 teardown / account switch) after
+ * derivation began, or after the caller-captured teardown epoch
+ * (e2eeService.captureTeardownEpoch). A silent void-return here let Login
+ * continue past a mid-login teardown — storing the refresh token, restoring
+ * the access token, and calling onSuccess with E2EE dead (Codex P1 pair,
+ * PR #2337).
+ *
+ * Callers MUST treat this as "the session this login/restore belonged to is
+ * gone": abort the flow. NEVER route it into key-recovery / consented-reset
+ * prompts — the keys are not corrupt, the session is dead.
+ *
+ * Deliberately distinct from a caller-owned E2EEInitializationGuard abort,
+ * which stays a silent no-op (the guard's owner initiated that cancellation
+ * and handles it via its own signal).
+ */
+export class E2EEInitTeardownError extends Error {
+  constructor() {
+    super('E2EE initialization aborted: keys were cleared during initialization');
+    this.name = 'E2EEInitTeardownError';
+  }
+}
+
+/**
  * Type guard: returns true if the error is a typed E2EE key-unavailable error
  * with the retryable `NO_KEY_YET + pending: true` shape. This is the
  * replacement for the legacy `err.message === 'PENDING_KEY'` string match
