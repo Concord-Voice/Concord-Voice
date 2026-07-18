@@ -29,7 +29,9 @@ func setupEmailSmsSetupEndpoint(t *testing.T, emailSvc *email.Service) (*mfa.Han
 	user := ts.CreateTestUser(t, "emailsmsdelivery")
 	secret, _ := enrollTOTP(t, ts, user)
 
-	handler := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), make([]byte, 32), testhelpers.TestJWTSecret, nil, "test")
+	ring, err := mfa.ParseKeyring(strings.Repeat("00", 32), 1, "")
+	require.NoError(t, err)
+	handler := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), ring, testhelpers.TestJWTSecret, nil, "test")
 	if emailSvc != nil {
 		handler.SetEmailService(emailSvc)
 	}

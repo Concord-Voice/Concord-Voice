@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -457,11 +458,13 @@ func TestChangePasswordMFAReauthenticationUsesLockedTransactionConnection(t *tes
 	require.NoError(t, err)
 	var requestLogs bytes.Buffer
 	requestLogger := logger.NewWithWriter(&requestLogs)
+	mfaRing, err := mfa.ParseKeyring(strings.Repeat("00", 32), 1, "")
+	require.NoError(t, err)
 	mfaHandler := mfa.NewHandler(
 		db,
 		nil,
 		requestLogger,
-		encryptionKey,
+		mfaRing,
 		"test-secret",
 		nil,
 		"test",

@@ -203,9 +203,11 @@ type Config struct {
 	SMTPFrom     string // Sender address (e.g. "noreply@concordvoice.chat")
 
 	// MFA (TOTP + WebAuthn)
-	MFAEncryptionKey  string   // 32-byte hex-encoded AES key for TOTP secret encryption at rest
-	WebAuthnRPID      string   // Relying Party ID (domain, e.g. "concordvoice.chat")
-	WebAuthnRPOrigins []string // Allowed origins for WebAuthn (e.g. "https://concordvoice.chat")
+	MFAEncryptionKey         string   // 32-byte hex-encoded AES key for TOTP secret encryption at rest (the ACTIVE keyring version, #2307)
+	MFAEncryptionKeyVersion  int      // Version stamp of the active key; bump on rotation (default 1)
+	MFAEncryptionKeysRetired string   // Retired decrypt-only keys during a rotation window: "1:<hex64>,2:<hex64>" (normally empty)
+	WebAuthnRPID             string   // Relying Party ID (domain, e.g. "concordvoice.chat")
+	WebAuthnRPOrigins        []string // Allowed origins for WebAuthn (e.g. "https://concordvoice.chat")
 
 	// Admin console (#1688). AdminConsoleEnabled gates the entire platform-admin
 	// auth surface: when false (the default), the /admin routes are NOT mounted
@@ -334,35 +336,37 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Environment:           getEnv("ENVIRONMENT", "development"),
-		HSTSHeaderValue:       getEnv("HSTS_HEADER_VALUE", ""),
-		Port:                  getEnv("PORT", "8080"),
-		DatabaseURL:           getEnv("DATABASE_URL", defaultDevDatabaseURL()),
-		RedisURL:              getEnv("REDIS_URL", defaultDevRedisURL()),
-		JWTSecret:             getEnv("JWT_SECRET", devJWTSecret),
-		NATSUrl:               getEnv("NATS_URL", "nats://localhost:4222"),
-		OpsMetrics:            opsMetrics,
-		MediaPlaneURL:         getEnv("MEDIA_PLANE_URL", "http://localhost:3000"),
-		TURNServerHost:        getEnv("TURN_SERVER_HOST", ""),
-		TURNSecret:            getEnv("TURN_SECRET", ""),
-		TURNRealm:             getEnv("TURN_REALM", "localhost"),
-		LicensingAuthorityURL: getEnv("LICENSING_AUTHORITY_URL", "http://localhost:8082"),
-		AllowedOrigins:        parseOrigins(getEnv("ALLOWED_ORIGINS", "http://localhost:3001,http://localhost:3002,app://concord,spa-cache://concord")),
-		ClientMinVersion:      getEnv("CLIENT_MIN_VERSION", ""),
-		SpaURL:                getEnv("SPA_URL", ""),
-		SpaIpcContract:        getEnvInt("SPA_IPC_CONTRACT", 0),
-		SpaConfigFile:         getEnv("SPA_CONFIG_FILE", ""),
-		InstanceType:          getEnv("INSTANCE_TYPE", "saas"),
-		ServerVersion:         getEnv("SERVER_VERSION", "dev"),
-		ReleasesDir:           getEnv("RELEASES_DIR", ""),
-		SMTPHost:              getEnv("SMTP_HOST", ""),
-		SMTPPort:              getEnvInt("SMTP_PORT", 587),
-		SMTPUsername:          getEnv("SMTP_USERNAME", ""),
-		SMTPPassword:          getEnv("SMTP_PASSWORD", ""), // #nosec G101 -- env var name, not a secret
-		SMTPFrom:              getEnv("SMTP_FROM", "Concord Voice <noreply@example.com>"),
-		MFAEncryptionKey:      getEnv("MFA_ENCRYPTION_KEY", devMFAEncKey),
-		WebAuthnRPID:          getEnv("WEBAUTHN_RP_ID", "localhost"),
-		WebAuthnRPOrigins:     parseOrigins(getEnv("WEBAUTHN_RP_ORIGINS", "http://localhost:3001")),
+		Environment:              getEnv("ENVIRONMENT", "development"),
+		HSTSHeaderValue:          getEnv("HSTS_HEADER_VALUE", ""),
+		Port:                     getEnv("PORT", "8080"),
+		DatabaseURL:              getEnv("DATABASE_URL", defaultDevDatabaseURL()),
+		RedisURL:                 getEnv("REDIS_URL", defaultDevRedisURL()),
+		JWTSecret:                getEnv("JWT_SECRET", devJWTSecret),
+		NATSUrl:                  getEnv("NATS_URL", "nats://localhost:4222"),
+		OpsMetrics:               opsMetrics,
+		MediaPlaneURL:            getEnv("MEDIA_PLANE_URL", "http://localhost:3000"),
+		TURNServerHost:           getEnv("TURN_SERVER_HOST", ""),
+		TURNSecret:               getEnv("TURN_SECRET", ""),
+		TURNRealm:                getEnv("TURN_REALM", "localhost"),
+		LicensingAuthorityURL:    getEnv("LICENSING_AUTHORITY_URL", "http://localhost:8082"),
+		AllowedOrigins:           parseOrigins(getEnv("ALLOWED_ORIGINS", "http://localhost:3001,http://localhost:3002,app://concord,spa-cache://concord")),
+		ClientMinVersion:         getEnv("CLIENT_MIN_VERSION", ""),
+		SpaURL:                   getEnv("SPA_URL", ""),
+		SpaIpcContract:           getEnvInt("SPA_IPC_CONTRACT", 0),
+		SpaConfigFile:            getEnv("SPA_CONFIG_FILE", ""),
+		InstanceType:             getEnv("INSTANCE_TYPE", "saas"),
+		ServerVersion:            getEnv("SERVER_VERSION", "dev"),
+		ReleasesDir:              getEnv("RELEASES_DIR", ""),
+		SMTPHost:                 getEnv("SMTP_HOST", ""),
+		SMTPPort:                 getEnvInt("SMTP_PORT", 587),
+		SMTPUsername:             getEnv("SMTP_USERNAME", ""),
+		SMTPPassword:             getEnv("SMTP_PASSWORD", ""), // #nosec G101 -- env var name, not a secret
+		SMTPFrom:                 getEnv("SMTP_FROM", "Concord Voice <noreply@example.com>"),
+		MFAEncryptionKey:         getEnv("MFA_ENCRYPTION_KEY", devMFAEncKey),
+		MFAEncryptionKeyVersion:  getEnvInt("MFA_ENCRYPTION_KEY_VERSION", 1),
+		MFAEncryptionKeysRetired: getEnv("MFA_ENCRYPTION_KEYS_RETIRED", ""),
+		WebAuthnRPID:             getEnv("WEBAUTHN_RP_ID", "localhost"),
+		WebAuthnRPOrigins:        parseOrigins(getEnv("WEBAUTHN_RP_ORIGINS", "http://localhost:3001")),
 		// Admin console (#1688) — dormant by default; the dev RP defaults point at
 		// https-localhost (the console requires Secure for the __Host- session
 		// cookie); the allowed-AAGUIDs default is empty (operator opts in to the gate).

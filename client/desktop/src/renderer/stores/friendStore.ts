@@ -2,6 +2,10 @@ import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
 import { wrapStore } from '../utils/createStore';
 import { apiFetch, safeJson } from '../services/apiClient';
+import {
+  isHydrationLifecycleCurrent,
+  type HydrationLifecycleGuard,
+} from '../services/postLoginHydrationLifecycle';
 import { errorMessage } from '../utils/redactError';
 import type { PresenceStatus } from './memberStore';
 
@@ -155,7 +159,7 @@ interface FriendState {
   error: string | null;
 
   fetchFriends: () => Promise<void>;
-  fetchRequests: () => Promise<void>;
+  fetchRequests: (guard?: HydrationLifecycleGuard) => Promise<void>;
   sendRequest: (userIdOrUsername: string, byUsername?: boolean) => Promise<void>;
   acceptRequest: (requestId: string) => Promise<void>;
   declineRequest: (requestId: string) => Promise<void>;
@@ -240,7 +244,7 @@ export const useFriendStore = wrapStore(
           }
         },
 
-        fetchRequests: async () => {
+        fetchRequests: async (guard?: HydrationLifecycleGuard) => {
           try {
             const response = await apiFetch('/api/v1/friends/requests');
             if (!response.ok) {
@@ -262,6 +266,11 @@ export const useFriendStore = wrapStore(
               direction: r.direction,
               createdAt: r.created_at,
             }));
+
+            // #2329: under a Recovery-A refresh, skip the commit if the session
+            // was superseded mid-fetch (account switch) so stale requests cannot
+            // clobber a newer session.
+            if (!isHydrationLifecycleCurrent(guard)) return;
 
             set({ pendingRequests: requests });
           } catch (error) {

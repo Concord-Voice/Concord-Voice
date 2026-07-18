@@ -113,6 +113,51 @@ describe('serverStore', () => {
       expect(useUnreadStore.getState().serverUnreadSet.has('server-1')).toBe(false);
     });
 
+    it('does not let a stale concurrent fetch clobber a newer fetch (#2358 sequence guard)', async () => {
+      // The #2329 dedup-bypass lets a guarded Recovery-A fetch run concurrently
+      // with an in-flight unguarded fetch. The monotonic mySeq gate must let only
+      // the latest-started fetch commit, so a late stale response cannot overwrite
+      // the authoritative one (Gitar).
+      const releaseStale = deferred();
+      const firstEntered = deferred();
+      let call = 0;
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers`, async () => {
+          call += 1;
+          if (call === 1) {
+            // First (unguarded) fetch: STALE and resolves LAST.
+            firstEntered.resolve();
+            await releaseStale.promise;
+            return HttpResponse.json({ servers: [mockServer] });
+          }
+          // Second (guarded, latest) fetch: AUTHORITATIVE and resolves first.
+          return HttpResponse.json({ servers: [mockServer, mockServer2] });
+        })
+      );
+
+      const guard = { signal: new AbortController().signal, isCurrent: () => true };
+      const stalePromise = useServerStore.getState().fetchServers(); // seq 1, blocks
+      // Deterministic ordering: wait until the unguarded fetch is the one that
+      // reached the handler (call === 1) before starting the guarded fetch, so the
+      // guarded request can never be the one that blocks on releaseStale.
+      await firstEntered.promise;
+      const authoritativePromise = useServerStore.getState().fetchServers(guard); // seq 2, wins
+      await authoritativePromise;
+
+      expect(useServerStore.getState().servers.map((s) => s.id)).toEqual([
+        mockServer.id,
+        mockServer2.id,
+      ]);
+
+      // Releasing the older stale fetch must NOT clobber the authoritative result.
+      releaseStale.resolve();
+      await stalePromise;
+      expect(useServerStore.getState().servers.map((s) => s.id)).toEqual([
+        mockServer.id,
+        mockServer2.id,
+      ]);
+    });
+
     it.each([
       ['removeServer', () => useServerStore.getState().removeServer('server-1'), ['server-2']],
       ['clearServers', () => useServerStore.getState().clearServers(), []],

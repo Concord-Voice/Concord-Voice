@@ -4,7 +4,6 @@ package api // revive:disable-line:var-naming
 import (
 	"context"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
@@ -253,16 +252,17 @@ func NewRouter(
 		natsClient = nc
 	}
 
-	// Initialize MFA handler
-	mfaEncKey, err := hex.DecodeString(cfg.MFAEncryptionKey)
-	if err != nil || len(mfaEncKey) != 32 {
-		log.Fatal("Invalid MFA_ENCRYPTION_KEY: must be 64 hex chars (32 bytes)")
+	// Initialize MFA handler — versioned keyring (#2307). ParseKeyring errors
+	// never contain key material, only version numbers.
+	mfaKeyring, err := mfa.ParseKeyring(cfg.MFAEncryptionKey, cfg.MFAEncryptionKeyVersion, cfg.MFAEncryptionKeysRetired)
+	if err != nil {
+		log.Fatal("Invalid MFA encryption keyring", "error", err)
 	}
 	webauthnSvc, err := mfa.NewWebAuthnService(cfg.WebAuthnRPID, "ConcordVoice", cfg.WebAuthnRPOrigins)
 	if err != nil {
 		log.Fatal("Failed to create WebAuthn service", "error", err)
 	}
-	mfaHandler := mfa.NewHandler(db, redis, log, mfaEncKey, cfg.JWTSecret, webauthnSvc, cfg.Environment)
+	mfaHandler := mfa.NewHandler(db, redis, log, mfaKeyring, cfg.JWTSecret, webauthnSvc, cfg.Environment)
 
 	// Initialize RBAC components (before handlers that depend on resolver)
 	permCache := rbac.NewPermissionCache(redis)

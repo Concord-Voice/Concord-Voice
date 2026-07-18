@@ -1,17 +1,21 @@
 package mfa_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/pquerna/otp"
@@ -3781,4 +3785,151 @@ func TestWebAuthnRegisterFinishExpiredSession(t *testing.T) {
 	// Finish should fail
 	w = ts.DoRequest("POST", urlWebAuthnRegFinish, nil, auth)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// --- #2307: key rotation ---
+
+const (
+	rotationKeyV1 = "0101010101010101010101010101010101010101010101010101010101010101"
+	rotationKeyV2 = "0202020202020202020202020202020202020202020202020202020202020202"
+)
+
+// TestVerifyCode_SeedSealedV1_DecryptsAfterRotationToV2 is the #2307 headline
+// acceptance criterion: a seed sealed under key v1 still authenticates after
+// the active key advances to v2 with v1 retained in the ring.
+func TestVerifyCode_SeedSealedV1_DecryptsAfterRotationToV2(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "rotationuser")
+
+	// Seal a known TOTP secret under v1 and store it as an enabled+confirmed
+	// enrollment stamped key_version=1 (simulates a pre-rotation row).
+	v1Ring, err := mfa.ParseKeyring(rotationKeyV1, 1, "")
+	require.NoError(t, err)
+	totpSeed := "JBSWY3DPEHPK3PXP" // canonical example TOTP seed (base32 "Hello!"), test-only
+	ct, nonce, ver, err := v1Ring.Seal([]byte(totpSeed))
+	require.NoError(t, err)
+	require.Equal(t, 1, ver)
+	_, err = ts.DB.Exec(`
+		INSERT INTO user_mfa_totp (user_id, totp_secret_enc, totp_secret_nonce, key_version, enabled, confirmed)
+		VALUES ($1, $2, $3, $4, TRUE, TRUE)`,
+		user.ID, ct, nonce, ver)
+	require.NoError(t, err)
+
+	// Rotate: v2 active, v1 retained.
+	rotatedRing, err := mfa.ParseKeyring(rotationKeyV2, 2, "1:"+rotationKeyV1)
+	require.NoError(t, err)
+	handler := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), rotatedRing, testhelpers.TestJWTSecret, nil, "test")
+
+	code, err := totp.GenerateCodeCustom(totpSeed, time.Now(), totp.ValidateOpts{
+		Period: 30, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
+	})
+	require.NoError(t, err)
+
+	ok, err := handler.VerifyCode(context.Background(), user.ID, code)
+	require.NoError(t, err)
+	assert.True(t, ok, "v1-sealed seed must authenticate under a v2-active ring with v1 retained")
+}
+
+// TestRegenerateBackupCodes_KeyringDecryptFailureIsForbidden covers the #9 fix:
+// a TOTP row sealed under a version absent from the handler's ring (a retired
+// key removed too early) reaches the backup-code-regen decrypt path and is
+// reported as a plain 403 (no oracle), separately from a wrong code. The
+// operator-facing sealed/active_version log is the diagnostic side of this
+// branch; the test locks that the branch is reached and fails closed.
+func TestRegenerateBackupCodes_KeyringDecryptFailureIsForbidden(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "rotationregenmiss")
+
+	// Seal an enabled+confirmed row under version 3 — a key the handler's ring
+	// (v1 active + v2 retired) will NOT have.
+	orphanRing, err := mfa.ParseKeyring("0303030303030303030303030303030303030303030303030303030303030303", 3, "")
+	require.NoError(t, err)
+	ct, nonce, ver, err := orphanRing.Seal([]byte("JBSWY3DPEHPK3PXP"))
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		INSERT INTO user_mfa_totp (user_id, totp_secret_enc, totp_secret_nonce, key_version, enabled, confirmed)
+		VALUES ($1, $2, $3, $4, TRUE, TRUE)`, user.ID, ct, nonce, ver)
+	require.NoError(t, err)
+
+	ring, err := mfa.ParseKeyring(rotationKeyV1, 1, "2:"+rotationKeyV2)
+	require.NoError(t, err)
+	handler := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), ring, testhelpers.TestJWTSecret, nil, "test")
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body, _ := json.Marshal(map[string]string{"password": testPassword, "code": "000000"})
+	c.Request = httptest.NewRequest(http.MethodPost, urlBackupCodesRegen, bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user_id", user.ID)
+
+	handler.RegenerateBackupCodes(c)
+	assert.Equal(t, http.StatusForbidden, w.Code, "body: %s", w.Body.String())
+}
+
+// TestVerifyCode_SealingVersionAbsentFromRing_FailsClosed covers the failure
+// mode: the operator removed a retired key before backfilling.
+func TestVerifyCode_SealingVersionAbsentFromRing_FailsClosed(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "rotationorphan")
+
+	v1Ring, err := mfa.ParseKeyring(rotationKeyV1, 1, "")
+	require.NoError(t, err)
+	ct, nonce, _, err := v1Ring.Seal([]byte("JBSWY3DPEHPK3PXP"))
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		INSERT INTO user_mfa_totp (user_id, totp_secret_enc, totp_secret_nonce, key_version, enabled, confirmed)
+		VALUES ($1, $2, $3, 1, TRUE, TRUE)`,
+		user.ID, ct, nonce)
+	require.NoError(t, err)
+
+	// v2-only ring: v1 was (wrongly) dropped without a backfill.
+	v2OnlyRing, err := mfa.ParseKeyring(rotationKeyV2, 2, "")
+	require.NoError(t, err)
+	handler := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), v2OnlyRing, testhelpers.TestJWTSecret, nil, "test")
+
+	ok, err := handler.VerifyCode(context.Background(), user.ID, "000000")
+	assert.False(t, ok)
+	require.Error(t, err, "missing sealing key must surface as an error, not a silent auth failure")
+}
+
+// TestEnrollment_StampsActiveKeyVersion asserts new seals are stamped.
+func TestEnrollment_StampsActiveKeyVersion(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "rotationstamp")
+	enrollTOTP(t, ts, user)
+
+	var stamped int
+	err := ts.DB.QueryRow(`SELECT key_version FROM user_mfa_totp WHERE user_id = $1`, user.ID).Scan(&stamped)
+	require.NoError(t, err)
+	// The test server runs the default single-key config → active version 1.
+	assert.Equal(t, 1, stamped)
+}
+
+// TestTOTPSetup_StampsNonDefaultActiveVersion drives the real TOTPSetup handler
+// with an active ring version of 2 (NOT the database DEFAULT 1). A hardcoded or
+// omitted key_version in the INSERT would stamp 1 (the default) and be invisible
+// to the version-1 test above — this proves the stamp follows the ring.
+func TestTOTPSetup_StampsNonDefaultActiveVersion(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "rotationstampv2")
+
+	ring, err := mfa.ParseKeyring(rotationKeyV2, 2, "1:"+rotationKeyV1)
+	require.NoError(t, err)
+	handler := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), ring, testhelpers.TestJWTSecret, nil, "test")
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body, _ := json.Marshal(map[string]string{"password": testPassword})
+	c.Request = httptest.NewRequest(http.MethodPost, urlTOTPSetup, bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user_id", user.ID)
+
+	handler.TOTPSetup(c)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var stamped int
+	require.NoError(t, ts.DB.QueryRow(`SELECT key_version FROM user_mfa_totp WHERE user_id = $1`, user.ID).Scan(&stamped))
+	assert.Equal(t, 2, stamped, "stored key_version must equal the handler's active ring version, not the DB default")
 }

@@ -12,6 +12,8 @@ import { useConnectionStore } from '../stores/connectionStore';
 import { useUserStore } from '../stores/userStore';
 import { useVoiceStore } from '../stores/voiceStore';
 import { useMemberStore } from '../stores/memberStore';
+import { useServerStore } from '../stores/serverStore';
+import { useFriendStore } from '../stores/friendStore';
 import { runRecoveryModule } from '../utils/runRecoveryModule';
 import { hydratePostLogin } from '../services/postLoginHydration';
 import {
@@ -118,7 +120,11 @@ function handleConnectionLoss(wsService: ReturnType<typeof getWebSocketService>)
   }, 15_000);
 }
 
-/** Handle reconnection success (CONNECTED state). */
+/**
+ * Restores application state after the WebSocket reconnects.
+ *
+ * Performs recovery hydration for recovery phases, restores pending E2EE and voice state after a grace-period reconnect, and resets incomplete connection phases.
+ */
 function handleReconnected(
   wsService: ReturnType<typeof getWebSocketService>,
   validateEpochsOnReconnect: () => Promise<void>
@@ -143,15 +149,22 @@ function handleReconnected(
         await useUserStore.getState().fetchUser(guard);
         if (!isHydrationLifecycleCurrent(guard)) return;
         await hydratePostLogin(guard);
-        // NOTE: authoritative membership refresh + message backfill are NOT done
-        // here. A WS reconnect replays only subscriptions + a presence snapshot,
-        // so member_removed / channel_access_revoked and messages missed during
-        // the outage are not redelivered — a revoked server/channel stays visible
-        // until reload. Doing that refresh session-safely needs the hydration
-        // guard threaded through the store fetch actions themselves; it is tracked
-        // as #2329 (Recovery-A authoritative refresh). Do NOT bolt an unguarded
-        // refetch on here — an in-flight fetchRequests/fetchServers can clobber a
-        // newer session (see #2329).
+        if (!isHydrationLifecycleCurrent(guard)) return;
+        // #2329: a WS reconnect replays only subscriptions + a presence snapshot,
+        // so state that changed while offline is never redelivered — a server or
+        // channel the user was removed from stays visible, and messages sent
+        // during the outage are missing. Refresh both authoritatively, session-
+        // guarded so an in-flight fetch cannot clobber a newer session (account
+        // switch): fetchServers/fetchRequests re-check the guard before their
+        // committing set(), and useMessageFetch re-fetches the mounted channel on
+        // the `connection-recovered` event under its own aborted/channel/E2EE
+        // guards. Memberships first, so a revoked channel is dropped before we
+        // would re-fetch its messages.
+        await useServerStore.getState().fetchServers(guard);
+        if (!isHydrationLifecycleCurrent(guard)) return;
+        await useFriendStore.getState().fetchRequests(guard);
+        if (!isHydrationLifecycleCurrent(guard)) return;
+        globalThis.dispatchEvent(new CustomEvent('connection-recovered'));
       },
       'recoveryReset'
     );

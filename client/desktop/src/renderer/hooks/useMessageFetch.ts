@@ -340,6 +340,13 @@ async function loadOlderMessagesAttempt({
   }
 }
 
+/**
+ * Loads, decrypts, reconciles, and paginates messages for a channel.
+ *
+ * @param channelId - The channel to load, or `null` when no channel is active.
+ * @param options - Message type, page size, and optional completion callback.
+ * @returns The channel messages, loading and pagination state, error state, and older-message loader.
+ */
 export function useMessageFetch(channelId: string | null, options: UseMessageFetchOptions) {
   const { type, limit = DEFAULT_LIMIT, onFetchComplete } = options;
 
@@ -389,6 +396,19 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
     };
     globalThis.addEventListener('e2ee-key-delivered', handler);
     return () => globalThis.removeEventListener('e2ee-key-delivered', handler);
+  }, [channelId]);
+
+  // #2329: after a Recovery-A reconnect the WebSocket replays only subscriptions
+  // + a presence snapshot, so messages sent during the outage are never
+  // redelivered. useConnectionRecovery dispatches `connection-recovered` once the
+  // session-guarded hydration completes; re-fetch the mounted channel so the gap
+  // is backfilled. The fetch effect's own aborted/channel/E2EE-operation guards
+  // keep this session-safe.
+  useEffect(() => {
+    if (!channelId) return;
+    const handler = () => setFetchTrigger((prev) => prev + 1);
+    globalThis.addEventListener('connection-recovered', handler);
+    return () => globalThis.removeEventListener('connection-recovered', handler);
   }, [channelId]);
 
   // Retry key fetch when messages are stuck in pending state.

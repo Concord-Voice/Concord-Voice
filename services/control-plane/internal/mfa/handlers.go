@@ -60,7 +60,7 @@ type Handler struct {
 	db             *sql.DB
 	redis          *redis.Client
 	log            *logger.Logger
-	encKey         []byte // 32-byte AES key for TOTP secret encryption
+	keyring        *Keyring // versioned AES keys for TOTP secret encryption (#2307)
 	jwtSecret      string
 	webauthn       *WebAuthnService
 	loginCompleter LoginCompleter
@@ -72,12 +72,12 @@ type Handler struct {
 var _ Verifier = (*Handler)(nil)
 
 // NewHandler creates a new MFA handler.
-func NewHandler(db *sql.DB, redisClient *redis.Client, log *logger.Logger, encKey []byte, jwtSecret string, webauthnSvc *WebAuthnService, environment string) *Handler {
+func NewHandler(db *sql.DB, redisClient *redis.Client, log *logger.Logger, keyring *Keyring, jwtSecret string, webauthnSvc *WebAuthnService, environment string) *Handler {
 	return &Handler{
 		db:          db,
 		redis:       redisClient,
 		log:         log,
-		encKey:      encKey,
+		keyring:     keyring,
 		jwtSecret:   jwtSecret,
 		webauthn:    webauthnSvc,
 		environment: environment,
@@ -136,16 +136,18 @@ func (h *Handler) verifyCode(ctx context.Context, store codeVerificationStore, u
 
 	// Try TOTP
 	var secretEnc, secretNonce []byte
+	var keyVersion int
 	var totpEnabled, totpConfirmed bool
 	err := store.QueryRowContext(ctx,
-		`SELECT totp_secret_enc, totp_secret_nonce, enabled, confirmed FROM user_mfa_totp WHERE user_id = $1`,
+		`SELECT totp_secret_enc, totp_secret_nonce, key_version, enabled, confirmed FROM user_mfa_totp WHERE user_id = $1`,
 		userID,
-	).Scan(&secretEnc, &secretNonce, &totpEnabled, &totpConfirmed)
+	).Scan(&secretEnc, &secretNonce, &keyVersion, &totpEnabled, &totpConfirmed)
 
 	if err == nil && totpEnabled && totpConfirmed {
-		secret, decErr := DecryptSecret(secretEnc, secretNonce, h.encKey)
+		secret, decErr := h.keyring.Open(secretEnc, secretNonce, keyVersion)
 		if decErr != nil {
-			h.log.Error("TOTP secret decryption failed — likely encryption key mismatch", "user_id", userID, "error", decErr)
+			h.log.Error("TOTP secret decryption failed — likely encryption key mismatch",
+				"user_id", userID, "sealed_version", keyVersion, "active_version", h.keyring.ActiveVersion(), "error", decErr)
 			return false, fmt.Errorf("TOTP secret decryption failed: %w", decErr)
 		}
 		if ValidateCode(string(secret), code) {
@@ -506,7 +508,7 @@ func (h *Handler) TOTPSetup(c *gin.Context) {
 	}
 
 	// Encrypt the secret for storage
-	ciphertext, nonce, err := EncryptSecret([]byte(key.Secret()), h.encKey)
+	ciphertext, nonce, keyVer, err := h.keyring.Seal([]byte(key.Secret()))
 	if err != nil {
 		h.log.Error("Failed to encrypt TOTP secret", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to secure MFA secret"})
@@ -516,11 +518,12 @@ func (h *Handler) TOTPSetup(c *gin.Context) {
 	// Upsert (replace pending setup or insert new)
 
 	_, err = h.db.ExecContext(ctx, `
-		INSERT INTO user_mfa_totp (user_id, totp_secret_enc, totp_secret_nonce, enabled, confirmed)
-		VALUES ($1, $2, $3, FALSE, FALSE)
+		INSERT INTO user_mfa_totp (user_id, totp_secret_enc, totp_secret_nonce, key_version, enabled, confirmed)
+		VALUES ($1, $2, $3, $4, FALSE, FALSE)
 		ON CONFLICT (user_id) DO UPDATE SET
 			totp_secret_enc = EXCLUDED.totp_secret_enc,
 			totp_secret_nonce = EXCLUDED.totp_secret_nonce,
+			key_version = EXCLUDED.key_version,
 			enabled = FALSE,
 			confirmed = FALSE,
 			verified_at = NULL,
@@ -528,7 +531,7 @@ func (h *Handler) TOTPSetup(c *gin.Context) {
 			backup_codes_hash = '{}',
 			backup_codes_used = '{}',
 			updated_at = NOW()
-	`, userID, ciphertext, nonce)
+	`, userID, ciphertext, nonce, keyVer)
 	if err != nil {
 		h.log.Error("Failed to store TOTP secret", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store MFA secret"})
@@ -570,12 +573,13 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 
 	// Fetch the pending TOTP secret
 	var secretEnc, secretNonce []byte
+	var keyVersion int
 	var enabled bool
 
 	err := h.db.QueryRowContext(ctx,
-		`SELECT totp_secret_enc, totp_secret_nonce, enabled FROM user_mfa_totp WHERE user_id = $1`,
+		`SELECT totp_secret_enc, totp_secret_nonce, key_version, enabled FROM user_mfa_totp WHERE user_id = $1`,
 		userID,
-	).Scan(&secretEnc, &secretNonce, &enabled)
+	).Scan(&secretEnc, &secretNonce, &keyVersion, &enabled)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No TOTP setup in progress. Call /mfa/totp/setup first."})
 		return
@@ -586,9 +590,10 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 	}
 
 	// Decrypt and validate
-	secret, err := DecryptSecret(secretEnc, secretNonce, h.encKey)
+	secret, err := h.keyring.Open(secretEnc, secretNonce, keyVersion)
 	if err != nil {
-		h.log.Error("Failed to decrypt TOTP secret", "error", err)
+		h.log.Error("Failed to decrypt TOTP secret",
+			"sealed_version", keyVersion, "active_version", h.keyring.ActiveVersion(), "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify code"})
 		return
 	}
@@ -756,18 +761,29 @@ func (h *Handler) RegenerateBackupCodes(c *gin.Context) {
 
 	// Verify the TOTP code (not backup code — must prove they have the authenticator)
 	var secretEnc, secretNonce []byte
+	var keyVersion int
 	var totpEnabled, totpConfirmed bool
 	err = h.db.QueryRowContext(ctx,
-		`SELECT totp_secret_enc, totp_secret_nonce, enabled, confirmed FROM user_mfa_totp WHERE user_id = $1`,
+		`SELECT totp_secret_enc, totp_secret_nonce, key_version, enabled, confirmed FROM user_mfa_totp WHERE user_id = $1`,
 		userID,
-	).Scan(&secretEnc, &secretNonce, &totpEnabled, &totpConfirmed)
+	).Scan(&secretEnc, &secretNonce, &keyVersion, &totpEnabled, &totpConfirmed)
 	if err != nil || !totpEnabled || !totpConfirmed {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "TOTP is not enabled"})
 		return
 	}
 
-	secret, decErr := DecryptSecret(secretEnc, secretNonce, h.encKey)
-	if decErr != nil || !ValidateCode(string(secret), req.Code) {
+	secret, decErr := h.keyring.Open(secretEnc, secretNonce, keyVersion)
+	if decErr != nil {
+		// A keyring decrypt failure (e.g. a retired key missing from the ring
+		// during rotation) is an operator problem, not a wrong code — log it
+		// with the versions so it stays diagnosable, matching the other decrypt
+		// sites. The client still sees the same 403 (no oracle).
+		h.log.Error("Failed to decrypt TOTP secret",
+			"sealed_version", keyVersion, "active_version", h.keyring.ActiveVersion(), "error", decErr)
+		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid TOTP code"})
+		return
+	}
+	if !ValidateCode(string(secret), req.Code) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid TOTP code"})
 		return
 	}

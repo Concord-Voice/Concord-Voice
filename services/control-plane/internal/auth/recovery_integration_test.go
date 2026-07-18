@@ -72,16 +72,19 @@ func setupRecoverySMTPFailureTS(t *testing.T, closeDelay time.Duration) *testhel
 	require.NoError(t, err)
 
 	cfg := &config.Config{
-		Environment:       "test",
-		Port:              "0",
-		JWTSecret:         testhelpers.TestJWTSecret,
-		AllowedOrigins:    []string{"*"},
-		SMTPHost:          host,
-		SMTPPort:          port,
-		SMTPFrom:          "Concord Voice <noreply@test.concord.chat>",
-		MFAEncryptionKey:  "0000000000000000000000000000000000000000000000000000000000000000",
-		WebAuthnRPID:      "localhost",
-		WebAuthnRPOrigins: []string{"http://localhost:3001"},
+		Environment:      "test",
+		Port:             "0",
+		JWTSecret:        testhelpers.TestJWTSecret,
+		AllowedOrigins:   []string{"*"},
+		SMTPHost:         host,
+		SMTPPort:         port,
+		SMTPFrom:         "Concord Voice <noreply@test.concord.chat>",
+		MFAEncryptionKey: "0000000000000000000000000000000000000000000000000000000000000000",
+		// Directly-constructed Config: the keyring version gets no getEnv default
+		// here, and ParseKeyring fails closed on 0 (#2307).
+		MFAEncryptionKeyVersion: 1,
+		WebAuthnRPID:            "localhost",
+		WebAuthnRPOrigins:       []string{"http://localhost:3001"},
 	}
 
 	disclosure := presencehistory.BuildDisclosure(presencehistory.DisclosureOptions{InstanceType: "saas"})
