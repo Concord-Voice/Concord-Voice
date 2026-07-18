@@ -903,7 +903,7 @@ Concord/
 
 | Component      | Technology                              | Rationale                                                           |
 | -------------- | --------------------------------------- | ------------------------------------------------------------------- |
-| Desktop client | Electron 43 + React 19 + TS 6           | Mature WebRTC, fast iteration, OS keychain access                   |
+| Desktop client | Electron 43 + React 19 + TS native 7 / TS 6 API bridge (`tsc6` 6.0.3) | Mature WebRTC, fast iteration, OS keychain access                   |
 | Control plane  | Go 1.26 + Gin                           | Fast, concurrent, single-binary deploy                              |
 | Media plane    | Node.js 24 + mediasoup 3.21             | Best-in-class WebRTC SFU                                            |
 | Database       | PostgreSQL 16                           | Relational + JSONB, mature, declarative partitioning available      |

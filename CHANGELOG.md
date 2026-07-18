@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.30] — 2026-07-18
+
+### Changed
+
+- **Faster TypeScript builds** ([#2375](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2375)) — desktop, admin, and media-plane typechecks now use the native TypeScript 7 compiler while lint and editor tools temporarily retain the TypeScript 6 compiler API for compatibility.
+
 ## [0.2.29] — 2026-07-15
 
 ### Security
