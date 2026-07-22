@@ -14,7 +14,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 
 import { apiFetch } from '@/renderer/services/apiClient';
 import { e2eeService } from '@/renderer/services/e2eeService';
-import { fetchEncryptedBlob } from '@/renderer/services/e2eeBlobTransport';
+import { fetchBlobRowForRotation, fetchEncryptedBlob } from '@/renderer/services/e2eeBlobTransport';
 
 const mockApiFetch = vi.mocked(apiFetch);
 
@@ -59,5 +59,80 @@ describe('e2eeBlobTransport', () => {
       pushBootstrap: false,
     });
     expect(e2eeService.decryptPreferences).not.toHaveBeenCalled();
+  });
+});
+
+describe('fetchBlobRowForRotation (#2200)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (e2eeService as { isInitialized: boolean }).isInitialized = true;
+  });
+
+  it('returns absent on an explicit null row', async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ preferences: null }),
+    } as Response);
+
+    await expect(fetchBlobRowForRotation('/preferences', 'preferences')).resolves.toEqual({
+      kind: 'absent',
+    });
+    expect(e2eeService.decryptPreferences).not.toHaveBeenCalled();
+  });
+
+  it('returns present with version and plaintext on a decryptable row', async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ preferences: { encrypted_data: 'ciphertext', version: 4 } }),
+    } as Response);
+    vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({ v: 1, data: { theme: 'dark' } });
+
+    await expect(fetchBlobRowForRotation('/preferences', 'preferences')).resolves.toEqual({
+      kind: 'present',
+      version: 4,
+      plaintext: { v: 1, data: { theme: 'dark' } },
+    });
+  });
+
+  it('returns undecryptable with version when decryption throws', async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ preferences: { encrypted_data: 'old-key-ciphertext', version: 7 } }),
+    } as Response);
+    vi.mocked(e2eeService.decryptPreferences).mockRejectedValue(new Error('wrong key'));
+
+    await expect(fetchBlobRowForRotation('/preferences', 'preferences')).resolves.toEqual({
+      kind: 'undecryptable',
+      version: 7,
+    });
+  });
+
+  it('returns error on a non-ok response', async () => {
+    mockApiFetch.mockResolvedValue({ ok: false, status: 500 } as Response);
+
+    await expect(fetchBlobRowForRotation('/preferences', 'preferences')).resolves.toEqual({
+      kind: 'error',
+    });
+  });
+
+  it('returns error on a malformed wrapper missing a valid version', async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ preferences: { encrypted_data: 'ciphertext', version: 0 } }),
+    } as Response);
+
+    await expect(fetchBlobRowForRotation('/preferences', 'preferences')).resolves.toEqual({
+      kind: 'error',
+    });
+    expect(e2eeService.decryptPreferences).not.toHaveBeenCalled();
+  });
+
+  it('returns error when the E2EE service is not initialized', async () => {
+    (e2eeService as { isInitialized: boolean }).isInitialized = false;
+
+    await expect(fetchBlobRowForRotation('/preferences', 'preferences')).resolves.toEqual({
+      kind: 'error',
+    });
+    expect(mockApiFetch).not.toHaveBeenCalled();
   });
 });

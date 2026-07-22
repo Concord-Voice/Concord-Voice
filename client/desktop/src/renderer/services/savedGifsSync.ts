@@ -132,14 +132,6 @@ class SavedGifsSyncService {
     }
   }
 
-  /** Re-encrypt a pre-rotation snapshot after the preferences key changes. */
-  async pushSavedGifsSnapshot(
-    snapshot: readonly SavedGif[],
-    guard: HydrationLifecycleGuard
-  ): Promise<void> {
-    await this.pushSavedGifs(guard, this.generation, snapshot);
-  }
-
   private schedulePush(): void {
     if (this.isApplyingRemote) return;
 

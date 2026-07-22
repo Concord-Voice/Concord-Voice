@@ -881,6 +881,67 @@ type ChangePasswordRequest struct {
 	KeyDerivationAlg  string                          `json:"key_derivation_alg"` // "pbkdf2" or "argon2id"
 	MFACode           string                          `json:"mfa_code"`           // Required when MFA is enabled
 	PresenceOverride  *changePasswordPresenceOverride `json:"presence_override"`
+	SyncDomains       *changePasswordSyncDomains      `json:"sync_domains"`
+}
+
+// changePasswordDomainRotation is one password-derived sync domain's CAS
+// submission. Three states (spec #2200 §4.1):
+//
+//	{expected_version: 0}            — assert absent (no row may exist)
+//	{expected_version: N>0, data}    — rotate: CAS swap ciphertext at N
+//	{expected_version: N>0, no data} — verify + preserve (undecryptable row)
+type changePasswordDomainRotation struct {
+	EncryptedData   string `json:"encrypted_data"`
+	ExpectedVersion int    `json:"expected_version"`
+}
+
+// changePasswordSyncDomains carries the three non-presence password-derived
+// domains. When present, ALL sub-fields are required (all-or-nothing
+// accounting); nil as a whole is the legacy pre-#2200 client path.
+type changePasswordSyncDomains struct {
+	Preferences        *changePasswordDomainRotation `json:"preferences"`
+	SavedGifs          *changePasswordDomainRotation `json:"saved_gifs"`
+	FriendOrganization *changePasswordDomainRotation `json:"friend_organization"`
+}
+
+func validateChangePasswordDomainRotation(name string, rotation *changePasswordDomainRotation) error {
+	if rotation == nil {
+		return fmt.Errorf("sync_domains.%s is required when sync_domains is present", name)
+	}
+	if rotation.ExpectedVersion < 0 {
+		return fmt.Errorf("sync_domains.%s.expected_version must be nonnegative", name)
+	}
+	if rotation.ExpectedVersion == 0 && rotation.EncryptedData != "" {
+		return fmt.Errorf("sync_domains.%s cannot assert absence with encrypted_data", name)
+	}
+	if rotation.EncryptedData != "" {
+		if len(rotation.EncryptedData) > presenceOverrideMaxEncryptedDataBytes {
+			return fmt.Errorf("sync_domains.%s.encrypted_data exceeds size limit", name)
+		}
+		if _, err := base64.StdEncoding.DecodeString(rotation.EncryptedData); err != nil {
+			return fmt.Errorf("sync_domains.%s.encrypted_data must be valid base64", name)
+		}
+	}
+	return nil
+}
+
+func validateChangePasswordSyncDomains(domains *changePasswordSyncDomains) error {
+	if domains == nil {
+		return nil
+	}
+	for _, d := range []struct {
+		name     string
+		rotation *changePasswordDomainRotation
+	}{
+		{"preferences", domains.Preferences},
+		{"saved_gifs", domains.SavedGifs},
+		{"friend_organization", domains.FriendOrganization},
+	} {
+		if err := validateChangePasswordDomainRotation(d.name, d.rotation); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateChangePasswordPresenceOverride(rotation *changePasswordPresenceOverride) error {
@@ -1084,6 +1145,92 @@ func rotatePasswordPresenceOverride(
 	return newVersion, nil
 }
 
+// syncDomainVersionConflictError reports the first sync-domain CAS mismatch in
+// lock order. CurrentVersion 0 means the row is absent server-side.
+type syncDomainVersionConflictError struct {
+	Domain         string
+	CurrentVersion int
+}
+
+func (e *syncDomainVersionConflictError) Error() string {
+	return fmt.Sprintf("sync domain %s version conflict (current %d)", e.Domain, e.CurrentVersion)
+}
+
+// rotatePasswordSyncDomain generalizes rotatePasswordPresenceOverride to the
+// generic blob tables. Absence is version 0 (no row) and is never
+// materialized; a data-less rotation with matching version preserves the row
+// untouched (pre-existing old-key ciphertext the client cannot re-encrypt).
+func rotatePasswordSyncDomain(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID uuid.UUID,
+	cfg e2eeBlobConfig,
+	domain string,
+	rotation *changePasswordDomainRotation,
+) (int, error) {
+	var currentVersion int
+	err := tx.QueryRowContext(ctx, cfg.versionForUpdateSQL, userID).Scan(&currentVersion)
+	if errors.Is(err, sql.ErrNoRows) {
+		currentVersion = 0
+	} else if err != nil {
+		return 0, fmt.Errorf("read %s version: %w", cfg.logLabel, err)
+	}
+	if rotation.ExpectedVersion != currentVersion {
+		return 0, &syncDomainVersionConflictError{Domain: domain, CurrentVersion: currentVersion}
+	}
+	if currentVersion == 0 {
+		return 0, nil // verified absent; never create a row
+	}
+	if rotation.EncryptedData == "" {
+		return currentVersion, nil // verify + preserve
+	}
+	var newVersion int
+	if err := tx.QueryRowContext(ctx, cfg.rotateSQL,
+		rotation.EncryptedData, userID, rotation.ExpectedVersion,
+	).Scan(&newVersion); err != nil {
+		return 0, fmt.Errorf("rotate %s ciphertext: %w", cfg.logLabel, err)
+	}
+	return newVersion, nil
+}
+
+// rotateAllPasswordSyncDomains applies each submitted domain rotation in
+// migration-age lock order (spec #2200 §5), returning resulting versions.
+// A nil domains is the legacy client path.
+//
+// Deliberately NO *_updated broadcasts for these rotations (#2200 review,
+// Codex): a broadcast would reach sessions still holding the OLD preferences
+// key (including the initiating renderer mid-POST), whose fetch-and-apply
+// handlers could push old-key ciphertext back over the rotated rows. The
+// post-commit DisconnectUser + refresh-token revocation force every session
+// through re-login rehydration, which converges cross-device state safely.
+func rotateAllPasswordSyncDomains(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID uuid.UUID,
+	domains *changePasswordSyncDomains,
+) (map[string]int, error) {
+	if domains == nil {
+		return nil, nil
+	}
+	versions := make(map[string]int, 3)
+	for _, d := range []struct {
+		name     string
+		cfg      e2eeBlobConfig
+		rotation *changePasswordDomainRotation
+	}{
+		{"preferences", prefsBlobConfig, domains.Preferences},
+		{"saved_gifs", savedGifsBlobConfig, domains.SavedGifs},
+		{"friend_organization", friendOrgBlobConfig, domains.FriendOrganization},
+	} {
+		version, err := rotatePasswordSyncDomain(ctx, tx, userID, d.cfg, d.name, d.rotation)
+		if err != nil {
+			return nil, err
+		}
+		versions[d.name] = version
+	}
+	return versions, nil
+}
+
 type passwordChangeExecution struct {
 	userID          uuid.UUID
 	currentPassword string
@@ -1093,14 +1240,25 @@ type passwordChangeExecution struct {
 	salt            []byte
 	kdAlg           string
 	rotation        *changePasswordPresenceOverride
+	domains         *changePasswordSyncDomains
 }
 
-// executePasswordChange atomically rotates password/key material and any
-// existing presence-override ciphertext before revoking refresh tokens.
-func (h *Handler) executePasswordChange(ctx context.Context, change passwordChangeExecution) (int, error) {
+type passwordChangeOutcome struct {
+	presenceOverrideVersion int
+	domainVersions          map[string]int // nil when domains == nil (legacy request)
+}
+
+// executePasswordChange atomically rotates password/key material, every
+// submitted sync-domain ciphertext, and any existing presence-override
+// ciphertext before revoking refresh tokens. Lock order is users first, then
+// the domain tables by migration age (user_preferences 000016 → saved_gifs
+// 000055 → friend_organization 000075 → presence_override_preferences 000084);
+// any future multi-domain writer must follow the same order (spec #2200 §5).
+func (h *Handler) executePasswordChange(ctx context.Context, change passwordChangeExecution) (passwordChangeOutcome, error) {
+	var outcome passwordChangeOutcome
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("begin transaction: %w", err)
+		return outcome, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer func() {
 		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
@@ -1111,40 +1269,76 @@ func (h *Handler) executePasswordChange(ctx context.Context, change passwordChan
 	if err := h.verifyStepUpWithLockedUser(
 		ctx, tx, change.userID, change.currentPassword, change.mfaCode,
 	); err != nil {
-		return 0, err
+		return outcome, err
 	}
+
+	domainVersions, err := rotateAllPasswordSyncDomains(ctx, tx, change.userID, change.domains)
+	if err != nil {
+		return passwordChangeOutcome{}, err
+	}
+	outcome.domainVersions = domainVersions
 
 	presenceOverrideVersion, err := rotatePasswordPresenceOverride(
 		ctx, tx, change.userID, change.rotation,
 	)
 	if err != nil {
-		return 0, err
+		return passwordChangeOutcome{}, err
 	}
+	outcome.presenceOverrideVersion = presenceOverrideVersion
 	if _, err := tx.ExecContext(
 		ctx,
 		`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
 		change.newHash,
 		change.userID,
 	); err != nil {
-		return 0, fmt.Errorf("update password: %w", err)
+		return passwordChangeOutcome{}, fmt.Errorf("update password: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE user_keys SET wrapped_private_key = $1, key_derivation_salt = $2,
 		 key_derivation_alg = $3, updated_at = NOW() WHERE user_id = $4`,
 		change.wrappedKey, change.salt, change.kdAlg, change.userID,
 	); err != nil {
-		return 0, fmt.Errorf("update E2EE keys: %w", err)
+		return passwordChangeOutcome{}, fmt.Errorf("update E2EE keys: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`,
 		change.userID,
 	); err != nil {
-		return 0, fmt.Errorf("revoke refresh tokens: %w", err)
+		return passwordChangeOutcome{}, fmt.Errorf("revoke refresh tokens: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, err
+		return passwordChangeOutcome{}, err
 	}
-	return presenceOverrideVersion, nil
+	return outcome, nil
+}
+
+// respondChangePasswordError maps executePasswordChange failures onto their
+// stable HTTP shapes (step-up reauth, presence conflict, domain conflict, 500).
+func (h *Handler) respondChangePasswordError(c *gin.Context, err error) {
+	var reauthErr *stepUpReauthenticationError
+	if errors.As(err, &reauthErr) {
+		c.JSON(reauthErr.status, reauthErr.body)
+		return
+	}
+	var conflict *presenceOverrideVersionConflictError
+	if errors.As(err, &conflict) {
+		c.JSON(http.StatusConflict, gin.H{
+			"code":            "presence_override_version_conflict",
+			"current_version": conflict.CurrentVersion,
+		})
+		return
+	}
+	var domainConflict *syncDomainVersionConflictError
+	if errors.As(err, &domainConflict) {
+		c.JSON(http.StatusConflict, gin.H{
+			"code":            "sync_domain_version_conflict",
+			"domain":          domainConflict.Domain,
+			"current_version": domainConflict.CurrentVersion,
+		})
+		return
+	}
+	h.log.Error(errMsgFailedChangePassword, "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedChangePassword})
 }
 
 // ChangePassword changes the current user's password and re-wraps E2EE keys
@@ -1162,6 +1356,10 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 	}
 	if err := validateChangePasswordPresenceOverride(req.PresenceOverride); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid presence_override"})
+		return
+	}
+	if err := validateChangePasswordSyncDomains(req.SyncDomains); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid sync_domains"})
 		return
 	}
 
@@ -1199,7 +1397,7 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 		kdAlg = "argon2id"
 	}
 
-	presenceOverrideVersion, err := h.executePasswordChange(c.Request.Context(), passwordChangeExecution{
+	outcome, err := h.executePasswordChange(c.Request.Context(), passwordChangeExecution{
 		userID:          parsedUID,
 		currentPassword: req.CurrentPassword,
 		mfaCode:         req.MFACode,
@@ -1208,25 +1406,18 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 		salt:            saltBytes,
 		kdAlg:           kdAlg,
 		rotation:        req.PresenceOverride,
+		domains:         req.SyncDomains,
 	})
 	if err != nil {
-		var reauthErr *stepUpReauthenticationError
-		if errors.As(err, &reauthErr) {
-			c.JSON(reauthErr.status, reauthErr.body)
-			return
-		}
-		var conflict *presenceOverrideVersionConflictError
-		if errors.As(err, &conflict) {
-			c.JSON(http.StatusConflict, gin.H{
-				"code":            "presence_override_version_conflict",
-				"current_version": conflict.CurrentVersion,
-			})
-			return
-		}
-		h.log.Error(errMsgFailedChangePassword, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedChangePassword})
+		h.respondChangePasswordError(c, err)
 		return
 	}
+
+	// Deliberately NO *_updated broadcasts for rotated domains: sessions still
+	// holding the old preferences key (including the initiating renderer
+	// mid-POST) would fetch-and-apply and could push old-key ciphertext back
+	// over the rotated rows. DisconnectUser below forces every session through
+	// re-login rehydration instead (#2200 review, Codex).
 
 	// Force-close all WebSocket connections for this user.
 	if h.sessionDisconnector != nil {
@@ -1234,10 +1425,14 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 	}
 
 	h.log.Info("Password changed with key re-wrap", "user_id", userID)
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"message":                   "Password changed successfully",
-		"presence_override_version": presenceOverrideVersion,
-	})
+		"presence_override_version": outcome.presenceOverrideVersion,
+	}
+	if req.SyncDomains != nil {
+		resp["sync_domain_versions"] = outcome.domainVersions
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // SearchUsers searches for users by username or display_name.
@@ -1320,11 +1515,13 @@ func (h *Handler) GetPublicKey(c *gin.Context) {
 // blob type (no dynamic SQL) so getE2EEBlob/upsertE2EEBlob remain free of
 // string concatenation against table names.
 type e2eeBlobConfig struct {
-	selectSQL     string // SELECT encrypted_data, version, updated_at FROM <table> WHERE user_id = $1
-	upsertSQL     string // INSERT ... ON CONFLICT (user_id) DO UPDATE ... RETURNING version
-	jsonKey       string // e.g. "preferences", "saved_gifs"
-	logLabel      string // e.g. "preferences", "saved gifs"
-	broadcastType string // e.g. "preferences_updated", "saved_gifs_updated"
+	selectSQL           string // SELECT encrypted_data, version, updated_at FROM <table> WHERE user_id = $1
+	upsertSQL           string // INSERT ... ON CONFLICT (user_id) DO UPDATE ... RETURNING version
+	versionForUpdateSQL string // SELECT version FROM <table> WHERE user_id = $1 FOR UPDATE
+	rotateSQL           string // UPDATE <table> SET encrypted_data=$1, version=version+1 ... WHERE user_id=$2 AND version=$3 RETURNING version
+	jsonKey             string // e.g. "preferences", "saved_gifs"
+	logLabel            string // e.g. "preferences", "saved gifs"
+	broadcastType       string // e.g. "preferences_updated", "saved_gifs_updated"
 }
 
 // getE2EEBlob fetches an opaque encrypted blob for the authenticated user.
@@ -1365,6 +1562,47 @@ type EncryptedBlobRequest struct {
 	EncryptedData string `json:"encrypted_data" binding:"required"`
 }
 
+// upsertE2EEBlobTx performs the blob write serialized against the
+// password-change transaction via the users row (#2200 review): a bare INSERT
+// could otherwise land between the password transaction's assert-absent read
+// (which locks no row) and its commit, stranding old-key ciphertext past the
+// rotation. Locking users FOR NO KEY UPDATE — the same lock
+// executePasswordChange holds from step-up through commit — makes every blob
+// write wait out an in-flight rotation. Lock hierarchy stays users → domain
+// row on both paths, so no deadlock.
+func (h *Handler) upsertE2EEBlobTx(
+	ctx context.Context,
+	cfg e2eeBlobConfig,
+	userID interface{},
+	encryptedData string,
+) (int, error) {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin: %w", err)
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+			h.log.Error("Failed to rollback blob update", "error", rbErr)
+		}
+	}()
+
+	var one int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
+	).Scan(&one); err != nil {
+		return 0, fmt.Errorf("lock user: %w", err)
+	}
+
+	var version int
+	if err := tx.QueryRowContext(ctx, cfg.upsertSQL, userID, encryptedData).Scan(&version); err != nil {
+		return 0, fmt.Errorf("upsert: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
+	}
+	return version, nil
+}
+
 // upsertE2EEBlob validates an encrypted blob, upserts it for the authenticated user,
 // and broadcasts an update notification via WebSocket to the user's other clients.
 func (h *Handler) upsertE2EEBlob(c *gin.Context, cfg e2eeBlobConfig) {
@@ -1390,8 +1628,7 @@ func (h *Handler) upsertE2EEBlob(c *gin.Context, cfg e2eeBlobConfig) {
 		return
 	}
 
-	var version int
-	err := h.db.QueryRow(cfg.upsertSQL, userID, req.EncryptedData).Scan(&version)
+	version, err := h.upsertE2EEBlobTx(c.Request.Context(), cfg, userID, req.EncryptedData)
 	if err != nil {
 		h.log.Error("Failed to update "+cfg.logLabel, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update " + cfg.logLabel})
@@ -1419,25 +1656,31 @@ func (h *Handler) upsertE2EEBlob(c *gin.Context, cfg e2eeBlobConfig) {
 
 var (
 	prefsBlobConfig = e2eeBlobConfig{
-		selectSQL:     `SELECT encrypted_data, version, updated_at FROM user_preferences WHERE user_id = $1`,
-		upsertSQL:     `INSERT INTO user_preferences (user_id, encrypted_data, version, updated_at) VALUES ($1, $2, 1, NOW()) ON CONFLICT (user_id) DO UPDATE SET encrypted_data = $2, version = user_preferences.version + 1, updated_at = NOW() RETURNING version`,
-		jsonKey:       "preferences",
-		logLabel:      "preferences",
-		broadcastType: "preferences_updated",
+		selectSQL:           `SELECT encrypted_data, version, updated_at FROM user_preferences WHERE user_id = $1`,
+		upsertSQL:           `INSERT INTO user_preferences (user_id, encrypted_data, version, updated_at) VALUES ($1, $2, 1, NOW()) ON CONFLICT (user_id) DO UPDATE SET encrypted_data = $2, version = user_preferences.version + 1, updated_at = NOW() RETURNING version`,
+		versionForUpdateSQL: `SELECT version FROM user_preferences WHERE user_id = $1 FOR UPDATE`,
+		rotateSQL:           `UPDATE user_preferences SET encrypted_data = $1, version = version + 1, updated_at = NOW() WHERE user_id = $2 AND version = $3 RETURNING version`,
+		jsonKey:             "preferences",
+		logLabel:            "preferences",
+		broadcastType:       "preferences_updated",
 	}
 	savedGifsBlobConfig = e2eeBlobConfig{
-		selectSQL:     `SELECT encrypted_data, version, updated_at FROM saved_gifs WHERE user_id = $1`,
-		upsertSQL:     `INSERT INTO saved_gifs (user_id, encrypted_data, version, updated_at) VALUES ($1, $2, 1, NOW()) ON CONFLICT (user_id) DO UPDATE SET encrypted_data = $2, version = saved_gifs.version + 1, updated_at = NOW() RETURNING version`,
-		jsonKey:       "saved_gifs",
-		logLabel:      "saved gifs",
-		broadcastType: "saved_gifs_updated",
+		selectSQL:           `SELECT encrypted_data, version, updated_at FROM saved_gifs WHERE user_id = $1`,
+		upsertSQL:           `INSERT INTO saved_gifs (user_id, encrypted_data, version, updated_at) VALUES ($1, $2, 1, NOW()) ON CONFLICT (user_id) DO UPDATE SET encrypted_data = $2, version = saved_gifs.version + 1, updated_at = NOW() RETURNING version`,
+		versionForUpdateSQL: `SELECT version FROM saved_gifs WHERE user_id = $1 FOR UPDATE`,
+		rotateSQL:           `UPDATE saved_gifs SET encrypted_data = $1, version = version + 1, updated_at = NOW() WHERE user_id = $2 AND version = $3 RETURNING version`,
+		jsonKey:             "saved_gifs",
+		logLabel:            "saved gifs",
+		broadcastType:       "saved_gifs_updated",
 	}
 	friendOrgBlobConfig = e2eeBlobConfig{
-		selectSQL:     `SELECT encrypted_data, version, updated_at FROM friend_organization WHERE user_id = $1`,
-		upsertSQL:     `INSERT INTO friend_organization (user_id, encrypted_data, version, updated_at) VALUES ($1, $2, 1, NOW()) ON CONFLICT (user_id) DO UPDATE SET encrypted_data = $2, version = friend_organization.version + 1, updated_at = NOW() RETURNING version`,
-		jsonKey:       "friend_organization",
-		logLabel:      "friend organization",
-		broadcastType: "friend_organization_updated",
+		selectSQL:           `SELECT encrypted_data, version, updated_at FROM friend_organization WHERE user_id = $1`,
+		upsertSQL:           `INSERT INTO friend_organization (user_id, encrypted_data, version, updated_at) VALUES ($1, $2, 1, NOW()) ON CONFLICT (user_id) DO UPDATE SET encrypted_data = $2, version = friend_organization.version + 1, updated_at = NOW() RETURNING version`,
+		versionForUpdateSQL: `SELECT version FROM friend_organization WHERE user_id = $1 FOR UPDATE`,
+		rotateSQL:           `UPDATE friend_organization SET encrypted_data = $1, version = version + 1, updated_at = NOW() WHERE user_id = $2 AND version = $3 RETURNING version`,
+		jsonKey:             "friend_organization",
+		logLabel:            "friend organization",
+		broadcastType:       "friend_organization_updated",
 	}
 )
 

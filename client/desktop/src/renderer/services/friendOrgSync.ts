@@ -137,14 +137,6 @@ class FriendOrgSyncService {
     }
   }
 
-  /** Re-encrypt a pre-rotation snapshot after the preferences key changes. */
-  async pushFriendOrgSnapshot(
-    snapshot: FriendOrgBlob,
-    guard: HydrationLifecycleGuard
-  ): Promise<boolean> {
-    return this.pushFriendOrg(snapshot, guard);
-  }
-
   private schedulePush(): void {
     if (this.isApplyingRemote) return; // echo guard — suppresses the apply→push loop
 

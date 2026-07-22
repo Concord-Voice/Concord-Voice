@@ -68,6 +68,63 @@ export async function fetchEncryptedBlob<T>(
   }
 }
 
+/** Outcome of an authoritative row fetch for password-change rotation (#2200). */
+export type RotationFetchResult =
+  | { kind: 'absent' }
+  | { kind: 'present'; version: number; plaintext: unknown }
+  | { kind: 'undecryptable'; version: number }
+  | { kind: 'error' };
+
+/**
+ * Authoritative fetch of one password-derived domain row for atomic rotation.
+ * Unlike fetchEncryptedBlob this surfaces the row VERSION (the CAS
+ * precondition) and distinguishes undecryptable-present (preserve marker) from
+ * absence — the local store is never consulted (#2200 criterion 4). Decrypts
+ * with the HELD (old-password) preferences key, so it must run BEFORE the
+ * password POST re-initializes e2eeService. Uses the default authoritative
+ * apiFetch mode: this is a user-action fetch whose failure aborts the change,
+ * not a best-effort background sync.
+ */
+export async function fetchBlobRowForRotation(
+  endpoint: string,
+  responseKey: string,
+  signal?: AbortSignal
+): Promise<RotationFetchResult> {
+  if (!e2eeService.isInitialized || signal?.aborted === true) return { kind: 'error' };
+  try {
+    const res = await apiFetch(endpoint, signal ? { signal } : undefined);
+    if (!res.ok) return { kind: 'error' };
+    const data: unknown = await res.json();
+    if (typeof data !== 'object' || data === null || Array.isArray(data)) return { kind: 'error' };
+    const wrapper = (data as Record<string, unknown>)[responseKey];
+    if (wrapper === null) return { kind: 'absent' };
+    if (typeof wrapper !== 'object' || Array.isArray(wrapper)) return { kind: 'error' };
+    const { encrypted_data: encryptedData, version } = wrapper as {
+      encrypted_data?: unknown;
+      version?: unknown;
+    };
+    if (
+      typeof encryptedData !== 'string' ||
+      encryptedData.length === 0 ||
+      typeof version !== 'number' ||
+      !Number.isInteger(version) ||
+      version < 1
+    ) {
+      return { kind: 'error' };
+    }
+    try {
+      const plaintext = await e2eeService.decryptPreferences<unknown>(encryptedData);
+      return { kind: 'present', version, plaintext };
+    } catch {
+      // Present-but-undecryptable is NOT absence (#2191 posture): the caller
+      // submits a verify+preserve marker instead of new ciphertext.
+      return { kind: 'undecryptable', version };
+    }
+  } catch {
+    return { kind: 'error' };
+  }
+}
+
 /** Encrypt a blob and PUT it to the given endpoint. Errors are swallowed (logged). */
 export async function pushEncryptedBlob<T>(
   endpoint: string,

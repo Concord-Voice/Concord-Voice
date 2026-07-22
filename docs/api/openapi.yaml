@@ -12173,11 +12173,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: Presence-override version conflict; password and key material unchanged
+          description: Version conflict on a password-derived domain (presence
+            exception or a sync domain); the whole password/key transaction is
+            rolled back and nothing changed
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PresenceOverrideConflict'
+                oneOf:
+                - $ref: '#/components/schemas/PresenceOverrideConflict'
+                - $ref: '#/components/schemas/SyncDomainVersionConflict'
         '500':
           description: Password/key transaction failed or its commit result was ambiguous
           content:
@@ -14336,6 +14340,45 @@ components:
             or key material.'
           allOf:
           - $ref: '#/components/schemas/ChangePasswordPresenceOverride'
+        sync_domains:
+          description: 'Atomic compare-and-swap rotation of the three non-presence
+            password-derived sync domains (#2200). When present, all three
+            sub-fields are required (all-or-nothing accounting) and each domain''s
+            populated/absent state is verified and rotated in the same transaction
+            as the password, key material, presence-exception ciphertext, and
+            refresh-token revocation. Omitted entirely by pre-#2200 clients; the
+            legacy path leaves the three domains untouched.'
+          allOf:
+          - $ref: '#/components/schemas/ChangePasswordSyncDomains'
+    ChangePasswordSyncDomains:
+      type: object
+      required:
+      - preferences
+      - saved_gifs
+      - friend_organization
+      properties:
+        preferences:
+          $ref: '#/components/schemas/ChangePasswordDomainRotation'
+        saved_gifs:
+          $ref: '#/components/schemas/ChangePasswordDomainRotation'
+        friend_organization:
+          $ref: '#/components/schemas/ChangePasswordDomainRotation'
+    ChangePasswordDomainRotation:
+      type: object
+      required:
+      - expected_version
+      properties:
+        encrypted_data:
+          type: string
+          maxLength: 65536
+          description: 'Base64 domain document encrypted with the new preferences
+            key. Omit with expected_version 0 to assert absence, or with
+            expected_version > 0 to verify-and-preserve an existing row whose
+            ciphertext the client cannot re-encrypt (pre-existing old-key data).'
+        expected_version:
+          type: integer
+          minimum: 0
+          description: Authoritative server row version; zero requires that no row exists
     ChangePasswordPresenceOverride:
       type: object
       required:
@@ -14362,6 +14405,24 @@ components:
           type: integer
           minimum: 0
           description: Rotated exception version, or zero when no preference row exists
+        sync_domain_versions:
+          type: object
+          description: Present iff sync_domains was submitted. Each value is the
+            resulting domain version; zero means the domain is (still) absent.
+          required:
+          - preferences
+          - saved_gifs
+          - friend_organization
+          properties:
+            preferences:
+              type: integer
+              minimum: 0
+            saved_gifs:
+              type: integer
+              minimum: 0
+            friend_organization:
+              type: integer
+              minimum: 0
     PresenceOverrideConflict:
       type: object
       required:
@@ -14375,6 +14436,28 @@ components:
         current_version:
           type: integer
           minimum: 0
+    SyncDomainVersionConflict:
+      type: object
+      required:
+      - code
+      - domain
+      - current_version
+      properties:
+        code:
+          type: string
+          enum:
+          - sync_domain_version_conflict
+        domain:
+          type: string
+          enum:
+          - preferences
+          - saved_gifs
+          - friend_organization
+          description: First conflicting domain in server lock order
+        current_version:
+          type: integer
+          minimum: 0
+          description: Authoritative server version; zero means the row is absent
     ReplaceKeysRequest:
       type: object
       required:
