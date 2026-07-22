@@ -79,17 +79,18 @@ func TestIssueAccessAndRefresh_HappyPath(t *testing.T) {
 	rig := newAdapterRig(t)
 	userID := insertAdapterUser(t, rig, "issue@example.test", "issueuser", "Password!1234")
 
-	access, refresh, err := rig.Handler.IssueAccessAndRefresh(context.Background(), userID)
+	access, refresh, sessionID, err := rig.Handler.IssueAccessAndRefresh(context.Background(), userID)
 	require.NoError(t, err)
 	assert.NotEmpty(t, access, "access token must be issued")
 	assert.NotEmpty(t, refresh, "refresh token must be issued")
+	assert.NotEmpty(t, sessionID, "session ID must be issued")
 
-	// Verify the refresh-token row landed in the table.
-	var n int
+	// Verify the returned session ID is the refresh-token row that landed.
+	var storedSessionID string
 	require.NoError(t, rig.DB.QueryRow(
-		`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1`, userID,
-	).Scan(&n))
-	assert.Equal(t, 1, n, "exactly one refresh_tokens row expected")
+		`SELECT id FROM refresh_tokens WHERE user_id = $1`, userID,
+	).Scan(&storedSessionID))
+	assert.Equal(t, sessionID, storedSessionID)
 }
 
 // TestIssueAccessAndRefresh_UnknownUser_Errors verifies the wrapper surfaces
@@ -98,7 +99,7 @@ func TestIssueAccessAndRefresh_UnknownUser_Errors(t *testing.T) {
 	rig := newAdapterRig(t)
 	missing := uuid.New().String()
 
-	_, _, err := rig.Handler.IssueAccessAndRefresh(context.Background(), missing)
+	_, _, _, err := rig.Handler.IssueAccessAndRefresh(context.Background(), missing)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not found")
 }

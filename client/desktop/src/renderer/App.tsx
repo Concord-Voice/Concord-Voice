@@ -46,7 +46,8 @@ import { useDMStore } from './stores/dmStore';
 import { useVoiceStore } from './stores/voiceStore';
 import { desktopNotificationService } from './services/desktopNotificationService';
 import { usePendingRegistrationStore } from './stores/pendingRegistrationStore';
-// resetService is loaded on-demand via dynamic import() to allow code splitting
+// resetService is eagerly registered by main.tsx; local dynamic imports resolve
+// from that loaded module while avoiding direct feature-module cycles.
 
 // ─── Error Boundary Fallbacks ─────────────────────────────────────────
 // Static text only — no user data, no display names, no avatars.
@@ -133,6 +134,56 @@ function logE2EERestoreError(err: unknown): void {
   );
 }
 
+/**
+ * Clear a restored credential that arrived without a valid owner id, then reset
+ * to a clean logged-out state. Extracted verbatim from App()'s session-restore
+ * effect so the ownerless-credential rejection does not add to its cognitive
+ * complexity (S3776) at the deep useEffect nesting depth. `electron` is the
+ * caller's already-narrowed non-null handle, so the receiver is unchanged.
+ */
+async function clearOwnerlessRestoredCredential(
+  electron: NonNullable<typeof globalThis.electron>
+): Promise<void> {
+  console.warn('[App] Session restore rejected: missing credential owner');
+  await (electron.clearTokens?.() ?? Promise.resolve()).catch((err) => {
+    console.warn('Failed to clear ownerless restored credential:', errorMessage(err));
+  });
+  await runRecoveryModule(
+    () => import('./services/resetService'),
+    (m) => m.gracefulReset(),
+    'gracefulReset'
+  );
+}
+
+/**
+ * Restore the E2EE service from owner-bound stored session keys, returning
+ * whether the credential must still enter the eager-unlock gate
+ * (`pendingE2EEUnlock`). Extracted verbatim from App()'s session-restore effect
+ * to keep its cognitive complexity under the S3776 threshold. This does NOT
+ * touch beginAuthLifecycle / needsSSOUnlock ordering — the caller still
+ * sequences those after this resolves.
+ */
+async function restoreStoredE2EEKeys(result: {
+  pendingE2EEUnlock?: boolean;
+  e2eeKeys?: {
+    wrappingKeyBase64: string;
+    preferencesKeyBase64: string;
+    wrappedPrivateKeyBase64: string;
+  } | null;
+}): Promise<boolean> {
+  let pendingE2EEUnlock = result.pendingE2EEUnlock === true || !result.e2eeKeys;
+  if (!pendingE2EEUnlock && result.e2eeKeys) {
+    try {
+      await e2eeService.initializeFromStoredKeys(result.e2eeKeys);
+      console.debug('E2EE service restored from stored session keys');
+    } catch (err) {
+      logE2EERestoreError(err);
+      pendingE2EEUnlock = true;
+    }
+  }
+  return pendingE2EEUnlock;
+}
+
 // ─── Launch-reset host (#1301) ─────────────────────────────────────────
 // Runs the once-per-session free-tier settings clamp after entitlements are
 // known (hydrated by hydratePostLogin) and surfaces the one-time explainer.
@@ -152,7 +203,6 @@ function AuthenticatedLayout() {
   // SSO eager-unlock gate (#270 Task 21b). Selectively subscribed so the
   // layout re-renders the moment e2eeService.initialize flips `ready=true`,
   // letting us fall through to <Outlet /> on the next render.
-  const e2eeReady = useE2EEStore((s) => s.ready);
   const needsSSOUnlock = useE2EEStore((s) => s.needsSSOUnlock);
   const voiceActiveChannelId = useVoiceStore((s) => s.activeChannelId);
   const voiceConnectionState = useVoiceStore((s) => s.connectionState);
@@ -256,11 +306,11 @@ function AuthenticatedLayout() {
   // SSO eager-unlock gate (#270 Task 21b): when an SSO callback returned
   // `logged_in` but no E2EE keys have been initialized on this device yet,
   // SSOEagerUnlock prompts for the user's passphrase and calls
-  // e2eeService.initialize, which flips `ready=true` in useE2EEStore. Once
-  // ready, the gate falls through on the next render. Password-login users
-  // never set `needsSSOUnlock` (they initialize E2EE inline before
-  // navigating here), so they bypass this gate entirely.
-  if (needsSSOUnlock && !e2eeReady) {
+  // e2eeService.initialize. Gate on the one-shot SSO signal even if `ready`
+  // is already true: that flag may describe a superseded account's keyset,
+  // and must never let a fresh SSO lifecycle bypass its own unlock. Password-
+  // login users never set `needsSSOUnlock`, so they bypass this gate entirely.
+  if (needsSSOUnlock) {
     const handleUnlock = () => {
       // Clear the one-shot flag — `e2eeService.initialize` already flipped
       // `ready=true` via the store sync, so the next render falls through.
@@ -393,35 +443,41 @@ function App() {
 
       const result = await globalThis.electron.restoreSession();
       if (result.status === 'restored' && result.accessToken) {
-        useAuthStore.getState().setAccessToken(result.accessToken);
-        if (result.sessionId) useAuthStore.getState().setSessionId(result.sessionId);
+        const credentialOwner = result.credentialOwner;
+        if (
+          typeof credentialOwner !== 'number' ||
+          !Number.isSafeInteger(credentialOwner) ||
+          credentialOwner <= 0
+        ) {
+          await clearOwnerlessRestoredCredential(globalThis.electron);
+          setIsRestoring(false);
+          return;
+        }
+
         if (typeof result.rememberMe === 'boolean') {
           useAuthStore.getState().setRememberMe(result.rememberMe);
         }
 
-        // Restore E2EE service from the restored key material (disk for
-        // rememberMe sessions; main-process memory for session-only soft
-        // reloads — see tokenManager.restoreE2EEKeys). Skip only when there is
-        // genuinely no key material to initialize from.
-        if (result.e2eeKeys) {
-          try {
-            await e2eeService.initializeFromStoredKeys(result.e2eeKeys);
-            console.debug('E2EE service restored from stored session keys');
-          } catch (err) {
-            logE2EERestoreError(err);
-          }
-        }
+        // Restore keys before publishing auth. A credential whose owner-bound
+        // E2EE blob is pending, missing, malformed, or from a predecessor must
+        // enter the eager-unlock gate and must not hydrate encrypted content.
+        const pendingE2EEUnlock = await restoreStoredE2EEKeys(result);
 
-        // Hydrate post-login user state on EVERY successful restore (#1297, #1870)
-        // — not only when e2eeKeys are present — so a session-only (rememberMe=false)
-        // soft reload, which restores auth + E2EE from main-process memory, also
-        // reloads servers/profile/preferences instead of landing authenticated but
-        // empty. Runs after E2EE init so decrypted content has its keys. Wrapped so
-        // a hydration throw cannot strand the UI in the restoring state.
-        try {
-          await hydratePostLogin();
-        } catch (err) {
-          console.warn('Post-login hydration failed during session restore:', errorMessage(err));
+        useE2EEStore
+          .getState()
+          .setNeedsSSOUnlock(pendingE2EEUnlock, pendingE2EEUnlock ? credentialOwner : undefined);
+        useAuthStore.getState().beginAuthLifecycle(result.accessToken, result.sessionId ?? null);
+
+        // Hydrate only after this credential owner's E2EE keys are ready. A
+        // pending owner remains behind SSOEagerUnlock; that gate hydrates after
+        // passphrase unlock. Session-only soft reloads still hydrate here once
+        // their owner-matched in-memory keys are restored (#1297, #1870).
+        if (!pendingE2EEUnlock) {
+          try {
+            await hydratePostLogin();
+          } catch (err) {
+            console.warn('Post-login hydration failed during session restore:', errorMessage(err));
+          }
         }
       } else {
         // Session cannot be restored — clear content stores but keep disk tokens.

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -1094,6 +1095,39 @@ func TestLoginReturnsUserPublicData(t *testing.T) {
 	assert.Equal(t, user.Username, userData["username"])
 	assert.NotEmpty(t, body["session_id"])
 	assert.Equal(t, float64(900), body["expires_in"])
+	assert.Equal(t, "true", w.Header().Get(middleware.SessionIssuedHeader))
+	assert.Equal(t, body["session_id"], w.Header().Get(middleware.SessionIDHeader))
+}
+
+func TestLoginMissingE2EEKeysDoesNotCreateSession(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "loginkeyslookupfail")
+
+	_, err := ts.DB.Exec(`DELETE FROM user_keys WHERE user_id = $1`, user.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathAuthLogin, map[string]interface{}{
+		"email":    user.Email,
+		"password": testhelpers.TestAuthPlaintext,
+	}, nil)
+	require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+	assert.Empty(t, w.Header().Get(middleware.SessionIssuedHeader))
+	assert.Empty(t, w.Header().Get(middleware.SessionIDHeader))
+
+	var sessions int
+	err = ts.DB.QueryRow(`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1`, user.ID).Scan(&sessions)
+	require.NoError(t, err)
+	assert.Zero(t, sessions, "failed login completion must not create a refresh session")
+
+	for _, cookie := range w.Result().Cookies() {
+		assert.NotEqual(t, "refresh_token", cookie.Name, "failed login completion must not set a refresh cookie")
+	}
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Empty(t, body["access_token"])
+	assert.Empty(t, body["refresh_token"])
+	assert.Empty(t, body["session_id"])
 }
 
 func TestLoginWithMachineIDRevokesOldSession(t *testing.T) {
@@ -1377,6 +1411,8 @@ func TestLoginWithMFAReturnsChallenge(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	assert.Equal(t, true, body["mfa_required"])
 	assert.NotEmpty(t, body["mfa_challenge_token"])
+	assert.Empty(t, w.Header().Get(middleware.SessionIssuedHeader))
+	assert.Empty(t, w.Header().Get(middleware.SessionIDHeader))
 	methods := body["methods"].([]interface{})
 	assert.Contains(t, methods, "email")
 }

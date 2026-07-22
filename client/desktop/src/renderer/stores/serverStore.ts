@@ -89,7 +89,7 @@ const serverStore = create<ServerState>()(
         fetchServers: async (guard?: HydrationLifecycleGuard) => {
           const journal: ServerFetchJournal = { removedIds: new Set(), cleared: false };
           serverFetchJournals.add(journal);
-          const mySeq = ++serverFetchSequence;
+          let mySeq = serverFetchSequence;
 
           try {
             if (!serverStore.persist.hasHydrated()) {
@@ -106,6 +106,7 @@ const serverStore = create<ServerState>()(
             // (see the gate below, #2358); the isHydrationLifecycleCurrent guard
             // additionally fences an account switch.
             if (get().isLoading && guard === undefined) return;
+            mySeq = ++serverFetchSequence;
             set({ isLoading: true, error: null });
 
             const response = await apiFetch('/api/v1/servers');

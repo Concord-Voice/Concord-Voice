@@ -5,6 +5,11 @@ import { useSSOStore } from '@/renderer/stores/ssoStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useE2EEStore } from '@/renderer/stores/e2eeStore';
 import { useMFAChallengeStore } from '@/renderer/stores/mfaChallengeStore';
+import {
+  getApiBase,
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/runtimeServerBase';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock the service so we drive the hook through every SSOResult shape
@@ -17,34 +22,282 @@ vi.mock('@/renderer/services/ssoService', async (importOriginal) => {
   };
 });
 
+vi.mock('@/renderer/services/apiClient', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/services/apiClient')>();
+  return {
+    ...actual,
+    revokeAbortedSession: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 // SSO must defer the shared hydration helper until App's E2EE unlock boundary.
 vi.mock('@/renderer/services/postLoginHydration', () => ({
   hydratePostLogin: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { startSSOFlow } from '@/renderer/services/ssoService';
+import { startSSOFlow, type SSOResult } from '@/renderer/services/ssoService';
+import { revokeAbortedSession } from '@/renderer/services/apiClient';
 import { hydratePostLogin } from '@/renderer/services/postLoginHydration';
 const mockedStartSSOFlow = startSSOFlow as unknown as ReturnType<typeof vi.fn>;
+const mockedRevokeAbortedSession = vi.mocked(revokeAbortedSession);
 const mockedHydratePostLogin = vi.mocked(hydratePostLogin);
+
+let originalElectron: typeof globalThis.electron;
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let finish: ((value: T) => void) | null = null;
+  const promise = new Promise<T>((resolve) => {
+    finish = resolve;
+  });
+  return {
+    promise,
+    resolve: (value) => {
+      if (finish === null) throw new Error('deferred resolver was not initialized');
+      finish(value);
+    },
+  };
+}
 
 beforeEach(() => {
   // resetAllStores covers all known stores per the [internal]rules/tests.md
   // convention; we still call mockReset() for the spy on startSSOFlow.
   resetAllStores();
+  resetRuntimeServerBase();
+  originalElectron = globalThis.electron;
+  Object.defineProperty(globalThis, 'electron', {
+    value: {
+      ...originalElectron,
+      clearTokens: vi.fn().mockResolvedValue(undefined),
+      clearTokensIfOwner: vi.fn().mockResolvedValue(true),
+      storeRefreshToken: vi.fn().mockResolvedValue(71),
+    },
+    writable: true,
+  });
   mockedStartSSOFlow.mockReset();
+  mockedRevokeAbortedSession.mockClear();
+  mockedRevokeAbortedSession.mockResolvedValue(undefined);
   mockedHydratePostLogin.mockClear();
   mockedHydratePostLogin.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
+  resetRuntimeServerBase();
+  Object.defineProperty(globalThis, 'electron', {
+    value: originalElectron,
+    writable: true,
+  });
   vi.restoreAllMocks();
 });
 
 describe('useSSOFlow', () => {
+  it('reserves auth and clears password credentials before starting SSO', async () => {
+    useAuthStore.getState().beginAuthLifecycle('password-token', 'password-session');
+    const passwordGeneration = useAuthStore.getState().authGeneration;
+    let finishClear: () => void = () => {
+      throw new Error('clearTokens resolver was not initialized');
+    };
+    const clearTokens = vi.fn().mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishClear = resolve;
+      })
+    );
+    const originalElectron = globalThis.electron;
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...originalElectron, clearTokens },
+      writable: true,
+    });
+    mockedStartSSOFlow.mockResolvedValueOnce({
+      kind: 'logged_in',
+      accessToken: 'sso-token',
+      sessionId: 'sso-session',
+      credentialOwner: 11,
+    });
+
+    try {
+      const { result } = renderHook(() => useSSOFlow());
+      let pending: Promise<void> | undefined;
+      act(() => {
+        pending = result.current.begin('google');
+      });
+
+      expect(useAuthStore.getState()).toMatchObject({
+        accessToken: null,
+        sessionId: null,
+        authGeneration: passwordGeneration + 1,
+      });
+      expect(clearTokens).toHaveBeenCalledOnce();
+      expect(mockedStartSSOFlow).not.toHaveBeenCalled();
+
+      finishClear();
+      await act(async () => {
+        await pending;
+      });
+
+      expect(mockedStartSSOFlow).toHaveBeenCalledWith('google', getApiBase());
+      expect(useAuthStore.getState()).toMatchObject({
+        accessToken: 'sso-token',
+        sessionId: 'sso-session',
+      });
+    } finally {
+      Object.defineProperty(globalThis, 'electron', {
+        value: originalElectron,
+        writable: true,
+      });
+    }
+  });
+
+  it('admits only the newest of two out-of-order direct SSO completions', async () => {
+    const first = deferred<SSOResult>();
+    const second = deferred<SSOResult>();
+    mockedStartSSOFlow
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+    const clearTokensIfOwner = vi.mocked(globalThis.electron.clearTokensIfOwner);
+
+    const { result } = renderHook(() => useSSOFlow());
+    let firstPending = Promise.resolve();
+    act(() => {
+      firstPending = result.current.begin('google');
+    });
+    await vi.waitFor(() => expect(mockedStartSSOFlow).toHaveBeenCalledTimes(1));
+
+    let secondPending = Promise.resolve();
+    act(() => {
+      secondPending = result.current.begin('apple');
+    });
+    await vi.waitFor(() => expect(mockedStartSSOFlow).toHaveBeenCalledTimes(2));
+
+    second.resolve({
+      kind: 'logged_in',
+      accessToken: 'new-access-token',
+      sessionId: 'new-session',
+      credentialOwner: 22,
+    });
+    await act(async () => {
+      await secondPending;
+    });
+
+    first.resolve({
+      kind: 'logged_in',
+      accessToken: 'stale-access-token',
+      sessionId: 'stale-session',
+      credentialOwner: 21,
+    });
+    await act(async () => {
+      await firstPending;
+    });
+
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'new-access-token',
+      sessionId: 'new-session',
+    });
+    expect(useSSOStore.getState().state).toEqual({ phase: 'idle' });
+    expect(clearTokensIfOwner).toHaveBeenCalledOnce();
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(21);
+    expect(mockedRevokeAbortedSession).toHaveBeenCalledWith({
+      accessToken: 'stale-access-token',
+      sessionId: 'stale-session',
+      apiBase: getApiBase(),
+    });
+  });
+
+  it('does not let a stale register result replace the newer link phase', async () => {
+    const first = deferred<SSOResult>();
+    const second = deferred<SSOResult>();
+    mockedStartSSOFlow
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+
+    const { result } = renderHook(() => useSSOFlow());
+    let firstPending = Promise.resolve();
+    act(() => {
+      firstPending = result.current.begin('google');
+    });
+    await vi.waitFor(() => expect(mockedStartSSOFlow).toHaveBeenCalledTimes(1));
+
+    let secondPending = Promise.resolve();
+    act(() => {
+      secondPending = result.current.begin('apple');
+    });
+    await vi.waitFor(() => expect(mockedStartSSOFlow).toHaveBeenCalledTimes(2));
+
+    second.resolve({
+      kind: 'link_available',
+      ssoToken: 'new-link-token',
+      maskedEmail: 'n***@example.test',
+    });
+    await act(async () => {
+      await secondPending;
+    });
+
+    first.resolve({
+      kind: 'register_required',
+      ssoToken: 'stale-register-token',
+      email: 'stale@example.test',
+    });
+    await act(async () => {
+      await firstPending;
+    });
+
+    expect(useSSOStore.getState().state).toEqual({
+      phase: 'link_required',
+      provider: 'apple',
+      ssoToken: 'new-link-token',
+      maskedEmail: 'n***@example.test',
+    });
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(mockedRevokeAbortedSession).not.toHaveBeenCalled();
+  });
+
+  it('rejects a direct SSO result after an A-to-B-to-A server selection change', async () => {
+    const requestApiBase = 'https://origin-a.example';
+    setRuntimeServerBase(requestApiBase);
+    const pendingResult = deferred<SSOResult>();
+    mockedStartSSOFlow.mockImplementationOnce(() => pendingResult.promise);
+    const clearTokensIfOwner = vi.mocked(globalThis.electron.clearTokensIfOwner);
+
+    const { result } = renderHook(() => useSSOFlow());
+    let pending = Promise.resolve();
+    act(() => {
+      pending = result.current.begin('google');
+    });
+    await vi.waitFor(() =>
+      expect(mockedStartSSOFlow).toHaveBeenCalledWith('google', requestApiBase)
+    );
+
+    setRuntimeServerBase('https://origin-b.example');
+    setRuntimeServerBase(requestApiBase);
+    pendingResult.resolve({
+      kind: 'logged_in',
+      accessToken: 'origin-a-access',
+      sessionId: 'origin-a-session',
+      credentialOwner: 31,
+    });
+    await act(async () => {
+      await pending;
+    });
+
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(useE2EEStore.getState().needsSSOUnlock).toBe(false);
+    expect(globalThis.electron.storeRefreshToken).not.toHaveBeenCalled();
+    expect(useSSOStore.getState().state).toEqual({
+      phase: 'authenticating',
+      provider: 'google',
+    });
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(31);
+    expect(mockedRevokeAbortedSession).toHaveBeenCalledWith({
+      accessToken: 'origin-a-access',
+      sessionId: 'origin-a-session',
+      apiBase: requestApiBase,
+    });
+  });
+
   it('logged_in: sets access token and returns store to idle', async () => {
     mockedStartSSOFlow.mockResolvedValueOnce({
       kind: 'logged_in',
       accessToken: 'jwt-token-abc',
+      sessionId: 'session-abc',
+      credentialOwner: 12,
     });
 
     const { result } = renderHook(() => useSSOFlow());
@@ -53,14 +306,18 @@ describe('useSSOFlow', () => {
     });
 
     expect(useAuthStore.getState().accessToken).toBe('jwt-token-abc');
+    expect(useAuthStore.getState().sessionId).toBe('session-abc');
+    expect(useE2EEStore.getState().ssoCredentialOwner).toBe(12);
     expect(useSSOStore.getState().state).toEqual({ phase: 'idle' });
-    expect(mockedStartSSOFlow).toHaveBeenCalledWith('google');
+    expect(mockedStartSSOFlow).toHaveBeenCalledWith('google', getApiBase());
   });
 
   it('logged_in: defers encrypted post-login hydration until SSO unlock', async () => {
     mockedStartSSOFlow.mockResolvedValueOnce({
       kind: 'logged_in',
       accessToken: 'jwt-token-abc',
+      sessionId: 'session-abc',
+      credentialOwner: 13,
     });
 
     const { result } = renderHook(() => useSSOFlow());
@@ -75,6 +332,8 @@ describe('useSSOFlow', () => {
     mockedStartSSOFlow.mockResolvedValueOnce({
       kind: 'logged_in',
       accessToken: 'jwt-token-abc',
+      sessionId: 'session-abc',
+      credentialOwner: 14,
     });
     expect(useE2EEStore.getState().needsSSOUnlock).toBe(false);
 
@@ -177,7 +436,9 @@ describe('useSSOFlow', () => {
         verified: true,
         payload: {
           access_token: 'jwt-after-sso-mfa',
+          refresh_token: 'refresh-after-sso-mfa',
           session_id: 'sess-after-sso-mfa',
+          remember_me: false,
         },
       });
       // Allow the .then handler to fire
@@ -186,13 +447,132 @@ describe('useSSOFlow', () => {
 
     expect(useAuthStore.getState().accessToken).toBe('jwt-after-sso-mfa');
     expect(useAuthStore.getState().sessionId).toBe('sess-after-sso-mfa');
+    expect(globalThis.electron.storeRefreshToken).toHaveBeenCalledWith({
+      refreshToken: 'refresh-after-sso-mfa',
+      rememberMe: false,
+      apiBase: getApiBase(),
+      accessToken: 'jwt-after-sso-mfa',
+    });
     expect(useSSOStore.getState().state).toEqual({ phase: 'idle' });
     expect(useE2EEStore.getState().needsSSOUnlock).toBe(true);
+    expect(useE2EEStore.getState().ssoCredentialOwner).toBe(71);
     // E2EE is still locked; App's unlock boundary owns encrypted hydration.
     expect(mockedHydratePostLogin).not.toHaveBeenCalled();
   });
 
-  it('mfa_required: post-verify with payload missing session_id leaves sessionId unchanged', async () => {
+  it('mfa_required: ignores and revokes a successful completion superseded by a new flow', async () => {
+    mockedStartSSOFlow
+      .mockResolvedValueOnce({
+        kind: 'mfa_required',
+        mfaChallengeToken: 'stale-mfa-challenge',
+        methods: ['totp'],
+      })
+      .mockResolvedValueOnce({
+        kind: 'register_required',
+        ssoToken: 'new-registration-token',
+        email: 'new@example.test',
+      });
+
+    const { result } = renderHook(() => useSSOFlow());
+    await act(async () => {
+      await result.current.begin('google');
+    });
+
+    let newestPending = Promise.resolve();
+    act(() => {
+      useMFAChallengeStore.getState().completeChallenge({
+        verified: true,
+        payload: {
+          access_token: 'stale-mfa-access',
+          refresh_token: 'stale-mfa-refresh',
+          session_id: 'stale-mfa-session',
+        },
+      });
+      newestPending = result.current.begin('apple');
+    });
+    await act(async () => {
+      await newestPending;
+    });
+    await vi.waitFor(() => expect(mockedRevokeAbortedSession).toHaveBeenCalledOnce());
+
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(useE2EEStore.getState().needsSSOUnlock).toBe(false);
+    expect(globalThis.electron.storeRefreshToken).not.toHaveBeenCalled();
+    expect(useSSOStore.getState().state).toEqual({
+      phase: 'register_required',
+      provider: 'apple',
+      ssoToken: 'new-registration-token',
+      email: 'new@example.test',
+      name: undefined,
+    });
+    expect(mockedRevokeAbortedSession).toHaveBeenCalledWith({
+      accessToken: 'stale-mfa-access',
+      refreshToken: 'stale-mfa-refresh',
+      sessionId: 'stale-mfa-session',
+      apiBase: getApiBase(),
+    });
+  });
+
+  it('mfa_required: owner-cleans credentials when superseded during persistence', async () => {
+    mockedStartSSOFlow
+      .mockResolvedValueOnce({
+        kind: 'mfa_required',
+        mfaChallengeToken: 'persisting-mfa-challenge',
+        methods: ['totp'],
+      })
+      .mockResolvedValueOnce({
+        kind: 'register_required',
+        ssoToken: 'successor-registration-token',
+        email: 'successor@example.test',
+      });
+    const storedOwner = deferred<number>();
+    const storeRefreshToken = vi.fn().mockReturnValue(storedOwner.promise);
+    const clearTokensIfOwner = vi.mocked(globalThis.electron.clearTokensIfOwner);
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken },
+      writable: true,
+    });
+
+    const { result } = renderHook(() => useSSOFlow());
+    await act(async () => {
+      await result.current.begin('google');
+    });
+    act(() => {
+      useMFAChallengeStore.getState().completeChallenge({
+        verified: true,
+        payload: {
+          access_token: 'persisting-access',
+          refresh_token: 'persisting-refresh',
+          session_id: 'persisting-session',
+        },
+      });
+    });
+    await vi.waitFor(() => expect(storeRefreshToken).toHaveBeenCalledOnce());
+
+    await act(async () => {
+      await result.current.begin('apple');
+    });
+    storedOwner.resolve(81);
+    await vi.waitFor(() => expect(clearTokensIfOwner).toHaveBeenCalledWith(81));
+
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(useE2EEStore.getState().ssoCredentialOwner).toBeNull();
+    expect(useSSOStore.getState().state).toEqual({
+      phase: 'register_required',
+      provider: 'apple',
+      ssoToken: 'successor-registration-token',
+      email: 'successor@example.test',
+      name: undefined,
+    });
+    expect(mockedRevokeAbortedSession).toHaveBeenCalledWith({
+      accessToken: 'persisting-access',
+      refreshToken: 'persisting-refresh',
+      sessionId: 'persisting-session',
+      apiBase: getApiBase(),
+    });
+  });
+
+  it('mfa_required: rejects and revokes an incomplete credential tuple', async () => {
     mockedStartSSOFlow.mockResolvedValueOnce({
       kind: 'mfa_required',
       mfaChallengeToken: 'mfa-chal-no-session',
@@ -207,17 +587,28 @@ describe('useSSOFlow', () => {
     await act(async () => {
       useMFAChallengeStore.getState().completeChallenge({
         verified: true,
-        payload: { access_token: 'tok-no-sess' },
+        payload: {
+          access_token: 'tok-no-sess',
+          refresh_token: 'refresh-no-sess',
+        },
       });
       await Promise.resolve();
     });
 
-    // access_token hydrates as expected.
-    expect(useAuthStore.getState().accessToken).toBe('tok-no-sess');
-    // session_id was absent — sessionId in the auth store remains null.
+    expect(useAuthStore.getState().accessToken).toBeNull();
     expect(useAuthStore.getState().sessionId).toBeNull();
-    expect(useSSOStore.getState().state).toEqual({ phase: 'idle' });
-    expect(useE2EEStore.getState().needsSSOUnlock).toBe(true);
+    expect(useSSOStore.getState().state).toEqual({
+      phase: 'error',
+      message: 'mfa_verify_missing_token',
+    });
+    expect(useE2EEStore.getState().needsSSOUnlock).toBe(false);
+    expect(globalThis.electron.storeRefreshToken).not.toHaveBeenCalled();
+    expect(mockedRevokeAbortedSession).toHaveBeenCalledWith({
+      accessToken: 'tok-no-sess',
+      refreshToken: 'refresh-no-sess',
+      sessionId: null,
+      apiBase: getApiBase(),
+    });
   });
 
   it('mfa_required: post-verify with verified=true but missing access_token surfaces an error', async () => {

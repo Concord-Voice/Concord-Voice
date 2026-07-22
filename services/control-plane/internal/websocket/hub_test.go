@@ -75,14 +75,22 @@ func TestNewHubInitializesMaps(t *testing.T) {
 	assert.NotNil(t, hub.onlineCountPending)
 }
 
-func TestConnectionCountUsesReadLockedClientTotal(t *testing.T) {
+func TestConnectionCountsUseReadLockedTotals(t *testing.T) {
 	hub := NewHub(nil, nil)
+	firstClientID := uuid.New()
+	secondClientID := uuid.New()
 	hub.mu.Lock()
-	hub.clients[uuid.New()] = &Client{}
-	hub.clients[uuid.New()] = &Client{}
+	hub.clients[firstClientID] = &Client{}
+	hub.clients[secondClientID] = &Client{}
+	hub.userClients[uuid.New()] = map[uuid.UUID]bool{firstClientID: true}
+	hub.userClients[uuid.New()] = map[uuid.UUID]bool{secondClientID: true}
 	hub.mu.Unlock()
 
+	connections, users := hub.ConnectionCounts()
+	require.Equal(t, 2, connections)
+	require.Equal(t, 2, users)
 	require.Equal(t, 2, hub.ConnectionCount())
+	require.Equal(t, 2, hub.ConnectedUserCount())
 }
 
 func TestOpsMessageCounterWebSocketChannelCountsOnlySuccessfulInsert(t *testing.T) {

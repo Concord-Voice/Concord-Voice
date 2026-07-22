@@ -92,7 +92,7 @@ func TestIssueAccessAndRefresh_DisabledAccount_ReturnsSentinel(t *testing.T) {
 	require.NoError(t, err)
 
 	h := auth.NewHandler(ts.DB, ts.Redis, logger.New("test"), testhelpers.TestJWTSecret, noopDisconnector{})
-	_, _, err = h.IssueAccessAndRefresh(context.Background(), user.ID)
+	_, _, _, err = h.IssueAccessAndRefresh(context.Background(), user.ID)
 	require.ErrorIs(t, err, auth.ErrAccountDisabled)
 }
 
@@ -102,10 +102,11 @@ func TestIssueAccessAndRefresh_EnabledAccount_Mints(t *testing.T) {
 	user := ts.CreateTestUser(t, "ssoenableduser")
 
 	h := auth.NewHandler(ts.DB, ts.Redis, logger.New("test"), testhelpers.TestJWTSecret, noopDisconnector{})
-	access, refresh, err := h.IssueAccessAndRefresh(context.Background(), user.ID)
+	access, refresh, sessionID, err := h.IssueAccessAndRefresh(context.Background(), user.ID)
 	require.NoError(t, err)
 	assert.NotEmpty(t, access)
 	assert.NotEmpty(t, refresh)
+	assert.NotEmpty(t, sessionID)
 }
 
 // A userID with no users row hits the sql.ErrNoRows branch and returns a
@@ -115,10 +116,11 @@ func TestIssueAccessAndRefresh_UserNotFound(t *testing.T) {
 	ts := setupTS(t)
 	h := auth.NewHandler(ts.DB, ts.Redis, logger.New("test"), testhelpers.TestJWTSecret, noopDisconnector{})
 
-	access, refresh, err := h.IssueAccessAndRefresh(context.Background(), uuid.New().String())
+	access, refresh, sessionID, err := h.IssueAccessAndRefresh(context.Background(), uuid.New().String())
 	require.Error(t, err)
 	require.NotErrorIs(t, err, auth.ErrAccountDisabled)
 	assert.Contains(t, err.Error(), "not found")
 	assert.Empty(t, access)
 	assert.Empty(t, refresh)
+	assert.Empty(t, sessionID)
 }

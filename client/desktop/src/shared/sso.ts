@@ -6,6 +6,8 @@
 // Renamed from AppleSignInResult (#975 §Design): appleSso.ts re-exports these
 // under the legacy names during migration.
 
+import type { CredentialOwner } from '../main/ipcContract';
+
 export type SSOSignInErrorCode =
   | 'sso_initiate_failed'
   | 'sso_cancelled'
@@ -25,7 +27,12 @@ export type SSOSignInErrorCode =
   | 'google_id_token_invalid';
 
 export type SSOSignInResult =
-  | { kind: 'tokens'; accessToken: string }
+  | {
+      kind: 'tokens';
+      accessToken: string;
+      sessionId: string;
+      credentialOwner: CredentialOwner;
+    }
   | {
       kind: 'mfa_challenge';
       mfaChallengeToken: string;
@@ -36,3 +43,42 @@ export type SSOSignInResult =
   | { kind: 'sso_token'; branch: 'new_user'; ssoToken: string; email: string; name?: string }
   | { kind: 'sso_token'; branch: 'account_link'; ssoToken: string; maskedEmail: string }
   | { kind: 'error'; code: SSOSignInErrorCode };
+
+export interface SSOCompleteRegistrationPayload {
+  provider: 'google' | 'apple';
+  ssoToken: string;
+  username: string;
+  passphrase: string;
+  wrappedPrivateKey: string;
+  keyDerivationSalt: string;
+  publicKey: string;
+}
+
+export interface SSOCompleteLinkPayload {
+  provider: 'google' | 'apple';
+  ssoToken: string;
+  password: string;
+}
+
+export interface SSOCompletionErrorBody {
+  error_code?: string;
+  error?: string;
+  detail?: string;
+  attempts_remaining?: number;
+  retry_after_seconds?: number;
+}
+
+/** Renderer-safe result: refresh credentials remain exclusively in main. */
+export type SSOCompletionResult =
+  | {
+      kind: 'tokens';
+      accessToken: string;
+      sessionId: string;
+      credentialOwner: CredentialOwner;
+    }
+  | {
+      kind: 'error';
+      status: number;
+      code: string;
+      body?: SSOCompletionErrorBody;
+    };

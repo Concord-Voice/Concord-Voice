@@ -15,9 +15,9 @@ type ConnectionProvider interface {
 	ConnectionCount() int
 }
 
-// ConnectedUserProvider supplies the current distinct authenticated user count.
-type ConnectedUserProvider interface {
-	ConnectedUserCount() int
+// connectionSnapshotProvider supplies both local connection counts atomically.
+type connectionSnapshotProvider interface {
+	ConnectionCounts() (connections, users int)
 }
 
 // AccountMetricProvider reduces account state to the fixed account metric keys.
@@ -50,15 +50,15 @@ func (ticker systemCollectorTicker) Stop()               { ticker.ticker.Stop() 
 
 // Collector combines fresh remote snapshots and local aggregates into store batches.
 type Collector struct {
-	store       MetricStore
-	receiver    *Receiver
-	counters    *Counters
-	connections ConnectionProvider
-	users       ConnectedUserProvider
-	accounts    AccountMetricProvider
-	interval    time.Duration
-	log         *logger.Logger
-	clock       collectorClock
+	store              MetricStore
+	receiver           *Receiver
+	counters           *Counters
+	connections        ConnectionProvider
+	connectionSnapshot connectionSnapshotProvider
+	accounts           AccountMetricProvider
+	interval           time.Duration
+	log                *logger.Logger
+	clock              collectorClock
 
 	busy     atomic.Bool
 	active   sync.WaitGroup
@@ -78,8 +78,8 @@ func NewCollector(store MetricStore, receiver *Receiver, counters *Counters, con
 		clock:       systemCollectorClock{},
 		consumed:    make(map[Source]AcceptedPosition, 2),
 	}
-	if users, ok := connections.(ConnectedUserProvider); ok {
-		collector.users = users
+	if snapshot, ok := connections.(connectionSnapshotProvider); ok {
+		collector.connectionSnapshot = snapshot
 	}
 	if len(accounts) > 0 {
 		collector.accounts = accounts[0]
@@ -150,17 +150,16 @@ func (collector *Collector) snapshotContext(ctx context.Context, collectedAt tim
 	for key, value := range collector.counters.Snapshot() {
 		samples = append(samples, Sample{Key: key, Value: value, Source: SourceControl})
 	}
-	if collector.connections != nil {
+	if collector.connectionSnapshot != nil {
+		connections, users := collector.connectionSnapshot.ConnectionCounts()
+		samples = append(samples,
+			Sample{Key: MetricWebSocketConnections, Value: float64(connections), Source: SourceControl},
+			Sample{Key: MetricUsersOnlineCurrent, Value: float64(users), Source: SourceControl},
+		)
+	} else if collector.connections != nil {
 		samples = append(samples, Sample{
 			Key:    MetricWebSocketConnections,
 			Value:  float64(collector.connections.ConnectionCount()),
-			Source: SourceControl,
-		})
-	}
-	if collector.users != nil {
-		samples = append(samples, Sample{
-			Key:    MetricUsersOnlineCurrent,
-			Value:  float64(collector.users.ConnectedUserCount()),
 			Source: SourceControl,
 		})
 	}

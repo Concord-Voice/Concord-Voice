@@ -20,6 +20,8 @@
  * because session-restore on launch also produces `ready=false` while it
  * decrypts keys from safeStorage; we only want the eager-unlock prompt when
  * the user has just SSO'd from a fresh device, not on every cold start.
+ * `ssoCredentialOwner` carries the opaque main-process owner for that one-shot
+ * flow so key persistence and abort cleanup cannot touch a successor login.
  *
  * No `persist` middleware: both flags must reset on app restart. `ready` is
  * recomputed from the e2eeService restore path; `needsSSOUnlock` is a
@@ -27,6 +29,7 @@
  */
 
 import { createStore } from '../utils/createStore';
+import type { CredentialOwner } from '../../main/ipcContract';
 
 interface E2EEStore {
   /** True when user's private key is unwrapped and ready to decrypt. */
@@ -38,15 +41,22 @@ interface E2EEStore {
    * reach the post-auth gate (so they never need this flag set).
    */
   needsSSOUnlock: boolean;
+  /** Main-process credential owner for the pending SSO eager-unlock flow. */
+  ssoCredentialOwner: CredentialOwner | null;
   setReady: (ready: boolean) => void;
-  setNeedsSSOUnlock: (needs: boolean) => void;
+  setNeedsSSOUnlock: (needs: boolean, credentialOwner?: CredentialOwner) => void;
   reset: () => void;
 }
 
 export const useE2EEStore = createStore<E2EEStore>()((set) => ({
   ready: false,
   needsSSOUnlock: false,
+  ssoCredentialOwner: null,
   setReady: (ready) => set({ ready }),
-  setNeedsSSOUnlock: (needs) => set({ needsSSOUnlock: needs }),
-  reset: () => set({ ready: false, needsSSOUnlock: false }),
+  setNeedsSSOUnlock: (needs, credentialOwner) =>
+    set({
+      needsSSOUnlock: needs,
+      ssoCredentialOwner: needs ? (credentialOwner ?? null) : null,
+    }),
+  reset: () => set({ ready: false, needsSSOUnlock: false, ssoCredentialOwner: null }),
 }));

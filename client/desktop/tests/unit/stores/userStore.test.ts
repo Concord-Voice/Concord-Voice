@@ -73,6 +73,7 @@ import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';
 import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
 import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
 import { gracefulReset, nuclearReset } from '@/renderer/services/resetService';
+import { configureRefreshFailureReset } from '@/renderer/services/apiClient';
 import { hydratePostLogin } from '@/renderer/services/postLoginHydration';
 import { beginPostLoginHydrationGuard } from '@/renderer/services/postLoginHydrationLifecycle';
 import { resetAllStores } from '../../helpers/store-helpers';
@@ -97,6 +98,7 @@ describe('userStore', () => {
       useAuthStore.getState().clearAccessToken();
       globalThis.electron?.clearTokens?.();
     });
+    configureRefreshFailureReset({ gracefulReset, nuclearReset });
     window.electron.logout = vi.fn().mockResolvedValue(undefined);
     useAuthStore.getState().setAccessToken('mock-token');
   });

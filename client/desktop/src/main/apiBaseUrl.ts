@@ -13,8 +13,10 @@
  *   3. Dev (unpackaged): CONCORD_DEV_API_BASE env override, else the local
  *      control plane on :8080 (mirrors the renderer config.ts default).
  *
- * NEVER sourced from IPC input — the renderer cannot steer main-process
- * OAuth traffic to an attacker-controlled host (spec §Flow step 6).
+ * SSO may also supply an invocation-time API base over IPC, but the SSO
+ * handler accepts only this resolved base, the production SaaS origin, or a
+ * self-host origin already approved by the main-process probe registry. Raw
+ * renderer input never reaches OAuth network calls without that validation.
  */
 import { app } from 'electron';
 

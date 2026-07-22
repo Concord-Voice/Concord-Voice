@@ -19,15 +19,31 @@
  * `google_id_token_invalid`) so UI can localize without inspecting payload.
  */
 
-import { apiFetch, safeJson } from './apiClient';
-
+import type { CredentialOwner } from '../../main/ipcContract';
+import type { RuntimeServerSelection } from './runtimeServerBase';
 import type { AppleSignInResult } from '@/shared/appleSso';
-import type { SSOSignInResult } from '@/shared/sso';
+import type {
+  SSOCompleteLinkPayload,
+  SSOCompleteRegistrationPayload,
+  SSOCompletionResult as IPCSSOCompletionResult,
+  SSOSignInResult,
+} from '@/shared/sso';
 
 export type SSOProvider = 'google' | 'apple';
 
+export interface SSOCompletionResult {
+  accessToken: string;
+  sessionId: string;
+  credentialOwner: CredentialOwner;
+}
+
 export type SSOResult =
-  | { kind: 'logged_in'; accessToken: string }
+  | {
+      kind: 'logged_in';
+      accessToken: string;
+      sessionId: string;
+      credentialOwner: CredentialOwner;
+    }
   | {
       kind: 'mfa_required';
       mfaChallengeToken: string;
@@ -64,6 +80,24 @@ export class SSOServiceError extends Error {
   }
 }
 
+function unwrapCompletionResult(
+  result: IPCSSOCompletionResult,
+  failurePrefix: string
+): SSOCompletionResult {
+  if (result.kind === 'error') {
+    throw new SSOServiceError(
+      result.status,
+      `${failurePrefix}_${result.status}`,
+      result.body ? { ...result.body } : { error_code: result.code }
+    );
+  }
+  return {
+    accessToken: result.accessToken,
+    sessionId: result.sessionId,
+    credentialOwner: result.credentialOwner,
+  };
+}
+
 /**
  * Maps a discriminated SSOSignInResult / AppleSignInResult (both are the same
  * type after #975 made AppleSignInResult a re-export alias) onto the renderer's
@@ -73,7 +107,12 @@ export class SSOServiceError extends Error {
 function mapSSOResult(result: SSOSignInResult): SSOResult {
   switch (result.kind) {
     case 'tokens':
-      return { kind: 'logged_in', accessToken: result.accessToken };
+      return {
+        kind: 'logged_in',
+        accessToken: result.accessToken,
+        sessionId: result.sessionId,
+        credentialOwner: result.credentialOwner,
+      };
     case 'mfa_challenge':
       return {
         kind: 'mfa_required',
@@ -109,12 +148,12 @@ function mapSSOResult(result: SSOSignInResult): SSOResult {
  * verification, and the /session POST in the main process; the renderer
  * receives only the final discriminated result mapped onto SSOResult.
  */
-export async function startSSOFlow(provider: SSOProvider): Promise<SSOResult> {
+export async function startSSOFlow(provider: SSOProvider, apiBase: string): Promise<SSOResult> {
   if (provider === 'apple') {
-    const result: AppleSignInResult = await globalThis.electron.sso.appleSignIn();
+    const result: AppleSignInResult = await globalThis.electron.sso.appleSignIn(apiBase);
     return mapSSOResult(result);
   }
-  const result: SSOSignInResult = await globalThis.electron.sso.googleSignIn();
+  const result: SSOSignInResult = await globalThis.electron.sso.googleSignIn(apiBase);
   return mapSSOResult(result);
 }
 
@@ -123,73 +162,29 @@ export async function startSSOFlow(provider: SSOProvider): Promise<SSOResult> {
  * passphrase, and E2EE key material (wrapped private key + salt + public key)
  * along with the short-lived `sso_token` returned by the callback step.
  *
- * Returns a fresh access token on success.
+ * Returns a renderer-safe access/session reference plus the opaque main-process
+ * credential owner. The refresh token never crosses the IPC boundary.
  */
-export async function completeSSORegistration(params: {
-  provider: SSOProvider;
-  ssoToken: string;
-  username: string;
-  passphrase: string;
-  /** base64-encoded wrapped private key */
-  wrappedPrivateKey: string;
-  /** base64-encoded Argon2id salt used to derive the wrapping key */
-  keyDerivationSalt: string;
-  /** base64-encoded RSA public key */
-  publicKey: string;
-}): Promise<{ accessToken: string }> {
-  const res = await apiFetch(`/api/v1/auth/sso/${params.provider}/complete-registration`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sso_token: params.ssoToken,
-      username: params.username,
-      password: params.passphrase,
-      wrapped_private_key: params.wrappedPrivateKey,
-      key_derivation_salt: params.keyDerivationSalt,
-      public_key: params.publicKey,
-    }),
-  });
-  if (!res.ok) {
-    // Best-effort body parse so the caller can read error_code / detail.
-    // safeJson throws on parse failure → fall back to null body, not a fatal.
-    let body: Record<string, unknown> | null = null;
-    try {
-      body = await safeJson<Record<string, unknown>>(res);
-    } catch {
-      body = null;
-    }
-    throw new SSOServiceError(res.status, `sso_complete_registration_failed_${res.status}`, body);
-  }
-  const data = await safeJson<{ access_token: string }>(res);
-  return { accessToken: data.access_token };
+export async function completeSSORegistration(
+  params: SSOCompleteRegistrationPayload,
+  serverSelection: RuntimeServerSelection
+): Promise<SSOCompletionResult> {
+  return unwrapCompletionResult(
+    await globalThis.electron.sso.completeRegistration(serverSelection.apiBase, params),
+    'sso_complete_registration_failed'
+  );
 }
 
 /**
  * Link an SSO identity to an existing password-authenticated account.
  * The caller must provide the existing account password to authorize the link.
  */
-export async function completeSSOLink(params: {
-  provider: SSOProvider;
-  ssoToken: string;
-  password: string;
-}): Promise<{ accessToken: string }> {
-  const res = await apiFetch(`/api/v1/auth/sso/${params.provider}/complete-link`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sso_token: params.ssoToken,
-      password: params.password,
-    }),
-  });
-  if (!res.ok) {
-    let body: Record<string, unknown> | null = null;
-    try {
-      body = await safeJson<Record<string, unknown>>(res);
-    } catch {
-      body = null;
-    }
-    throw new SSOServiceError(res.status, `sso_complete_link_failed_${res.status}`, body);
-  }
-  const data = await safeJson<{ access_token: string }>(res);
-  return { accessToken: data.access_token };
+export async function completeSSOLink(
+  params: SSOCompleteLinkPayload,
+  serverSelection: RuntimeServerSelection
+): Promise<SSOCompletionResult> {
+  return unwrapCompletionResult(
+    await globalThis.electron.sso.completeLink(serverSelection.apiBase, params),
+    'sso_complete_link_failed'
+  );
 }

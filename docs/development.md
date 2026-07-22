@@ -417,6 +417,7 @@ lsof -ti:5432 | xargs kill -9
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ENVIRONMENT` | `development` | Environment mode |
+| `HSTS_HEADER_VALUE` | empty → `max-age=63072000; includeSubDomains; preload` | Optional production STS policy; nonempty values must pass the structural STS grammar |
 | `PORT` | `8080` | HTTP server port |
 | `DATABASE_URL` | (see above) | PostgreSQL connection |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection |
@@ -428,6 +429,8 @@ lsof -ti:5432 | xargs kill -9
 | `CONTROL_PLANE_REPLICA_COUNT` | unset (Compose: `1`) | Explicit control-plane replica contract; Activity History requires the environment value to be explicitly set to exactly one when the gate is enabled |
 | `ACTIVITY_HISTORY_OPERATOR_NAME` | empty | Self-host disclosure operator; required before new Activity History opt-in is available (`Concord Voice LLC` is reserved for SaaS) |
 | `ACTIVITY_HISTORY_PRIVACY_POLICY_URL` | empty | Self-host disclosure URL; absolute HTTPS is required outside loopback development/test |
+
+On managed hosts, `concord-ctl.sh nginx-reload` reads the canonical Compose-quoted value from `/opt/concord/.env`, validates it before sudo, and renders nginx as the public HSTS owner: nginx hides Go's upstream STS field, emits one server-level policy, and repeats it in the three locations whose own `add_header` directives suppress inheritance. Main/admin config activation is transactional; syntax, reload/start, and an exact one-field local HTTPS probe must pass or the prior files are restored. The direct self-host renderer keeps the committed default for scoped nginx responses while Go owns proxied responses.
 
 Activity History stays off by default. For SaaS, the operator and privacy URL are
 fixed by the binary. For self-hosted development, invalid or missing disclosure

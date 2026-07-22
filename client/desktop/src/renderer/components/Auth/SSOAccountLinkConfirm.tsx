@@ -30,13 +30,38 @@ import React, { useState } from 'react';
 import LoadingSpinner from './LoadingSpinner';
 import { useSSOStore } from '../../stores/ssoStore';
 import { useAuthStore } from '../../stores/authStore';
+import { useE2EEStore } from '../../stores/e2eeStore';
 import { completeSSOLink } from '../../services/ssoService';
+import { revokeAbortedSession, type AbortedSessionRef } from '../../services/apiClient';
+import {
+  captureRuntimeServerSelection,
+  runtimeServerSelectionIsCurrent,
+} from '../../services/runtimeServerBase';
+import type { CredentialOwner } from '../../../main/ipcContract';
 import './SSOAccountLinkConfirm.css';
+
+/**
+ * Map a completeSSOLink failure to the user-facing error copy. ssoService throws
+ * Error(`sso_complete_link_failed_${status}`). Pull the status off the error
+ * message — 423 means the server applied a brute-force lockout; any other status
+ * is treated as a generic mismatch (without leaking the status code). Extracted
+ * verbatim from handleSubmit's catch so the status decode does not add to its
+ * cognitive complexity (S3776).
+ */
+function mapCompleteLinkError(err: unknown): string {
+  const errMessage = err instanceof Error ? err.message : '';
+  const statusMatch = /sso_complete_link_failed_(\d+)/.exec(errMessage);
+  const status = statusMatch ? Number.parseInt(statusMatch[1], 10) : 0;
+
+  if (status === 423) {
+    return 'Too many failed attempts. Try again in 15 minutes.';
+  }
+  return 'Wrong password';
+}
 
 const SSOAccountLinkConfirm: React.FC = () => {
   const state = useSSOStore((s) => s.state);
   const setSSOState = useSSOStore((s) => s.setState);
-  const setAccessToken = useAuthStore((s) => s.setAccessToken);
 
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -53,33 +78,81 @@ const SSOAccountLinkConfirm: React.FC = () => {
     if (submitting || password.length === 0) {
       return;
     }
+    const requestSelection = captureRuntimeServerSelection();
+    const requestAuthGeneration = useAuthStore.getState().authGeneration;
+    const requestIsCurrent = () =>
+      runtimeServerSelectionIsCurrent(requestSelection) &&
+      useAuthStore.getState().authGeneration === requestAuthGeneration;
     setSubmitting(true);
     setError(null);
 
+    let issuedSession: AbortedSessionRef | null = null;
+    let credentialOwner: CredentialOwner | null = null;
+    let admittedGeneration: number | null = null;
+    const cleanupIssuedSession = async () => {
+      const auth = useAuthStore.getState();
+      if (admittedGeneration !== null && auth.authGeneration === admittedGeneration) {
+        auth.clearAccessToken();
+      }
+      if (credentialOwner !== null) {
+        const e2ee = useE2EEStore.getState();
+        if (e2ee.ssoCredentialOwner === credentialOwner) {
+          e2ee.setNeedsSSOUnlock(false);
+        }
+        try {
+          await globalThis.electron?.clearTokensIfOwner?.(credentialOwner);
+        } catch {
+          // Explicit server revocation below is the cleanup backstop.
+        }
+      }
+      if (issuedSession) await revokeAbortedSession(issuedSession);
+    };
+
     try {
-      const { accessToken } = await completeSSOLink({
-        provider: state.provider,
-        ssoToken: state.ssoToken,
-        password,
-      });
-      setAccessToken(accessToken);
+      const result = await completeSSOLink(
+        {
+          provider: state.provider,
+          ssoToken: state.ssoToken,
+          password,
+        },
+        requestSelection
+      );
+      issuedSession = {
+        accessToken: result.accessToken,
+        sessionId: result.sessionId,
+        apiBase: requestSelection.apiBase,
+      };
+      credentialOwner = result.credentialOwner;
+      if (!requestIsCurrent()) {
+        await cleanupIssuedSession();
+        return;
+      }
+
+      // Arm the post-auth gate before publishing the access token so React
+      // can never observe an admitted SSO session without its owner-bound
+      // unlock requirement.
+      useE2EEStore.getState().setNeedsSSOUnlock(true, credentialOwner);
+      admittedGeneration = useAuthStore
+        .getState()
+        .beginAuthLifecycleIfCurrent(requestAuthGeneration, result.accessToken, result.sessionId);
+      if (admittedGeneration === null) {
+        await cleanupIssuedSession();
+        return;
+      }
       // Returning to phase 'idle' lets AuthFlow re-evaluate based on the
       // new accessToken in authStore (the user is now logged in).
-      setSSOState({ phase: 'idle' });
-    } catch (err) {
-      // ssoService throws Error(`sso_complete_link_failed_${status}`).
-      // Pull the status off the error message — 423 means the server
-      // applied a brute-force lockout; any other status is treated as
-      // a generic mismatch (without leaking the status code).
-      const errMessage = err instanceof Error ? err.message : '';
-      const statusMatch = /sso_complete_link_failed_(\d+)/.exec(errMessage);
-      const status = statusMatch ? Number.parseInt(statusMatch[1], 10) : 0;
-
-      if (status === 423) {
-        setError('Too many failed attempts. Try again in 15 minutes.');
+      if (
+        runtimeServerSelectionIsCurrent(requestSelection) &&
+        useAuthStore.getState().authGeneration === admittedGeneration
+      ) {
+        setSSOState({ phase: 'idle' });
       } else {
-        setError('Wrong password');
+        await cleanupIssuedSession();
       }
+    } catch (err) {
+      await cleanupIssuedSession();
+      if (!requestIsCurrent()) return;
+      setError(mapCompleteLinkError(err));
       setSubmitting(false);
     }
   };

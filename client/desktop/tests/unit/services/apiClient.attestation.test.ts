@@ -14,19 +14,19 @@ import { resetAllStores } from '../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useAttestationFailureStore } from '@/renderer/stores/attestationFailureStore';
 
-// Mock resetService (dynamically imported by apiClient)
-vi.mock('@/renderer/services/resetService', () => ({
-  gracefulReset: vi.fn(),
-  nuclearReset: vi.fn(),
-  softRestart: vi.fn(),
-  stopProactiveRefresh: vi.fn(),
-}));
+const mockGracefulReset = vi.fn();
+const mockNuclearReset = vi.fn();
 
 // Mock fetch globally
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
-import { apiFetch, _resetRefreshState, ensureMachineId } from '@/renderer/services/apiClient';
+import {
+  apiFetch,
+  _resetRefreshState,
+  ensureMachineId,
+  configureRefreshFailureReset,
+} from '@/renderer/services/apiClient';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -69,6 +69,10 @@ describe('apiClient attestation — X-Attestation-Token injection', () => {
     resetAllStores();
     _resetRefreshState();
     vi.clearAllMocks();
+    configureRefreshFailureReset({
+      gracefulReset: mockGracefulReset,
+      nuclearReset: mockNuclearReset,
+    });
   });
 
   afterEach(() => {
@@ -192,6 +196,10 @@ describe('apiClient attestation — 403 interception', () => {
     resetAllStores();
     _resetRefreshState();
     vi.clearAllMocks();
+    configureRefreshFailureReset({
+      gracefulReset: mockGracefulReset,
+      nuclearReset: mockNuclearReset,
+    });
   });
 
   afterEach(() => {
@@ -634,6 +642,10 @@ describe('apiClient — 401 recovery header preservation (HIGH #14)', () => {
     resetAllStores();
     _resetRefreshState();
     vi.clearAllMocks();
+    configureRefreshFailureReset({
+      gracefulReset: mockGracefulReset,
+      nuclearReset: mockNuclearReset,
+    });
   });
 
   afterEach(() => {

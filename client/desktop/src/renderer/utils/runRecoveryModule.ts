@@ -5,15 +5,17 @@ import { triggerChunkSelfHeal } from '../spaSelfHealClient';
  * failure so it never surfaces as an `Uncaught (in promise)` and never strands
  * the connection-recovery state machine on a non-recovering screen.
  *
- * The dominant failure mode is a STALE SPA CHUNK: `recoveryService` /
- * `resetService` are lazy Vite chunks fetched on-demand DURING reconnect, so a
- * Cloudflare Pages redeploy that rotated their content hashes makes `import()`
+ * The dominant failure mode is a STALE SPA CHUNK: modules such as
+ * `recoveryService` are lazy Vite chunks fetched on-demand DURING reconnect, so
+ * a Cloudflare Pages redeploy that rotated their content hashes makes `import()`
  * reject (the missing `/assets/<hash>.js` 404s to the SPA `index.html`, served
- * as `text/html`). On failure we trigger SPA self-heal — a bounded,
- * main-process-driven reload that fetches fresh chunks — preserving the
- * recovery action a bare `import().then()` would have silently skipped. (Self-
- * heal is only effective once the host-shape patterns recognise the live SPA
- * origin; see the item-1/item-4 coupling and `[internal]rules/electron.md`.)
+ * as `text/html`). Logout-class reset primitives are deliberately registered in
+ * the eager renderer graph and do not depend on this recovery path. On a lazy
+ * module failure we trigger SPA self-heal — a bounded, main-process-driven reload
+ * that fetches fresh chunks — preserving the recovery action a bare
+ * `import().then()` would have silently skipped. (Self-heal is only effective
+ * once the host-shape patterns recognise the live SPA origin; see the
+ * item-1/item-4 coupling and `[internal]rules/electron.md`.)
  *
  * The returned promise NEVER rejects, so callers may float it without producing
  * an unhandled rejection.

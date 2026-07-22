@@ -40,9 +40,12 @@ import {
   performRefresh,
   performLogout,
   clearTokens,
+  clearTokensIfOwner,
   getCapabilities,
   storeE2EEKeys,
+  storeE2EEKeysIfOwner,
   restoreE2EEKeys,
+  getCredentialCustodyState,
   setProactiveRefreshCallback,
   onSystemResume,
   getCachedAccessToken,
@@ -100,7 +103,7 @@ import {
   setRemoteSpaState,
 } from './spaState';
 import { isPermittedFrameUrl } from './ipc/frameValidation';
-import { IPC_CONTRACT_VERSION } from './ipcContract';
+import { IPC_CONTRACT_VERSION, type CredentialOwner } from './ipcContract';
 import { registerIpcHandlers as registerPermissionHandlers } from './permissionManager';
 import { migrateUserData } from './userDataMigration';
 import { showSplash, closeSplash, updateSplashError } from './splashWindow';
@@ -854,8 +857,12 @@ app.whenReady().then(async () => {
 
   // Proactive token refresh (#254): notify renderer when main process
   // refreshes the token (timer or sleep/wake), so authStore stays current.
-  setProactiveRefreshCallback((accessToken, sessionId) => {
-    mainWindow?.webContents.send('auth:token-refreshed', { accessToken, sessionId });
+  setProactiveRefreshCallback((accessToken, sessionId, previousSessionId) => {
+    mainWindow?.webContents.send('auth:token-refreshed', {
+      accessToken,
+      sessionId,
+      previousSessionId,
+    });
   });
 
   // Refresh token immediately on system wake — main process timers may have
@@ -1221,7 +1228,7 @@ ipcMain.handle('auth:storeRefreshToken', (event, data: unknown) => {
     return rejectInvalidAuthPayload('auth:storeRefreshToken');
   }
 
-  storeRefreshToken(data);
+  const credentialOwner = storeRefreshToken(data);
   // Clear any cached restore result so subsequent restoreSession calls
   // (e.g. after HMR or renderer reload) use the fresh token, not a stale
   // 'refresh_failed' from a previous attempt.
@@ -1232,7 +1239,7 @@ ipcMain.handle('auth:storeRefreshToken', (event, data: unknown) => {
   if (data.apiBase) {
     setUpdateFeedUrl(data.apiBase);
   }
-  return undefined;
+  return credentialOwner;
 });
 
 // Deduplicate restoreSession: React Strict Mode can fire the renderer's
@@ -1245,6 +1252,8 @@ let restoreSessionPromise: Promise<{
   sessionId?: string;
   e2eeKeys?: unknown;
   rememberMe?: boolean;
+  credentialOwner?: CredentialOwner;
+  pendingE2EEUnlock?: boolean;
 }> | null = null;
 
 function isTrustedAuthSender(event: Electron.IpcMainInvokeEvent): boolean {
@@ -1332,6 +1341,10 @@ function isLogoutPayload(data: unknown): data is { accessToken?: string } | unde
   return data.accessToken === undefined || typeof data.accessToken === 'string';
 }
 
+function isCredentialOwner(value: unknown): value is CredentialOwner {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
 ipcMain.handle('auth:restoreSession', (event) => {
   if (!isTrustedAuthSender(event)) {
     return rejectUntrustedAuthSender('auth:restoreSession');
@@ -1344,18 +1357,37 @@ ipcMain.handle('auth:restoreSession', (event) => {
     if (restored.status !== 'ok') {
       return { status: restored.status };
     }
+    const restoreOwner = getCredentialCustodyState().credentialOwner;
+    if (restoreOwner === null) {
+      return { status: 'refresh_failed' };
+    }
     // Token restored from disk or main-process memory — refresh it to get a
     // fresh access token.
     const refreshResult = await performRefresh();
     if (refreshResult.status === 'ok' && refreshResult.accessToken) {
-      // Also restore E2EE keys if available
+      // A fresh login may have replaced the restored credential after refresh
+      // resolved but before this continuation resumed. Verify the owner before
+      // reading keys so an old access token can never be paired with a
+      // successor's E2EE custody.
+      const ownerCheck = getCredentialCustodyState();
+      if (ownerCheck.credentialOwner !== restoreOwner) {
+        return { status: 'refresh_failed' };
+      }
+      // Also restore E2EE keys if available. No await follows the owner check,
+      // so main-process state cannot interleave before this result is built.
       const e2eeKeys = restoreE2EEKeys();
+      const custody = getCredentialCustodyState();
+      if (custody.credentialOwner !== restoreOwner) {
+        return { status: 'refresh_failed' };
+      }
       return {
         status: 'restored',
         accessToken: refreshResult.accessToken,
         sessionId: refreshResult.sessionId,
         e2eeKeys,
         rememberMe: restored.rememberMe,
+        credentialOwner: custody.credentialOwner,
+        pendingE2EEUnlock: custody.pendingE2EEUnlock,
       };
     }
     return { status: 'refresh_failed' };
@@ -1377,6 +1409,17 @@ ipcMain.handle('auth:storeE2EEKeys', (event, data: unknown) => {
   // Surface persistence success/failure to the renderer (#1288) — a genuine
   // keychain/disk write failure returns false rather than being swallowed.
   return storeE2EEKeys(data);
+});
+
+ipcMain.handle('auth:storeE2EEKeysIfOwner', (event, data: unknown, owner: unknown) => {
+  if (!isTrustedAuthSender(event)) {
+    return rejectUntrustedAuthSender('auth:storeE2EEKeysIfOwner');
+  }
+  if (!isStoreE2EEKeysPayload(data) || !isCredentialOwner(owner)) {
+    return rejectInvalidAuthPayload('auth:storeE2EEKeysIfOwner');
+  }
+
+  return storeE2EEKeysIfOwner(data, owner);
 });
 
 ipcMain.handle('auth:refreshToken', async (event) => {
@@ -1406,6 +1449,17 @@ ipcMain.handle('auth:clearTokens', (event) => {
 
   clearTokens();
   return undefined;
+});
+
+ipcMain.handle('auth:clearTokensIfOwner', (event, owner: unknown) => {
+  if (!isTrustedAuthSender(event)) {
+    return rejectUntrustedAuthSender('auth:clearTokensIfOwner');
+  }
+  if (!isCredentialOwner(owner)) {
+    return rejectInvalidAuthPayload('auth:clearTokensIfOwner');
+  }
+
+  return clearTokensIfOwner(owner);
 });
 
 ipcMain.handle('auth:getCapabilities', (event) => {

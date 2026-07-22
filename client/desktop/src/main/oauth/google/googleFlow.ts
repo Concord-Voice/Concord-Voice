@@ -5,7 +5,7 @@
  *   out, {auth_url, state, nonce} back) → system browser → loopback callback →
  *   constant-time state check → POST Google /token (client-driven PKCE, embedded
  *   non-confidential client_secret) → local jose verification (nonce binding) →
- *   POST /session → discriminated SSOSignInResult.
+ *   POST /session → main-only discriminated sign-in result.
  *
  * Google is simpler than Apple: RFC 8252 loopback (no Worker bridge), plain-string
  * client_secret (no broker), no appleUserData, dual-issuer verification.
@@ -21,7 +21,7 @@
  *     { kind: 'error', code } so no raw Error (with a potential cause chain)
  *     crosses the IPC boundary ([internal]rules/observability.md).
  */
-import type { SSOSignInErrorCode, SSOSignInResult } from '../../../shared/sso';
+import type { SSOSignInErrorCode } from '../../../shared/sso';
 import type { startLoopback as startLoopbackFn, LoopbackHandle } from '../../ssoLoopback';
 
 import { GoogleFlowError } from './errors';
@@ -32,6 +32,7 @@ import {
   constantTimeEquals,
   mapSessionResponse as mapSessionResponseShared,
   toErrorCode as toErrorCodeShared,
+  type MainSSOSignInResult,
 } from '../ssoFlowShared';
 
 /** Overall flow deadline (spec R2). */
@@ -160,11 +161,11 @@ async function postSession(
 }
 
 /**
- * Maps the /session response into the IPC-safe discriminated union.
- * Exported for direct unit coverage. Delegates to the shared implementation
- * in ssoFlowShared.ts (response shapes are identical across providers).
+ * Maps the /session response into the main-only discriminated union.
+ * Exported for direct unit coverage. The IPC handler stores and removes the
+ * refresh credential before returning.
  */
-export function mapSessionResponse(body: Record<string, unknown>): SSOSignInResult {
+export function mapSessionResponse(body: Record<string, unknown>): MainSSOSignInResult {
   return mapSessionResponseShared(body);
 }
 
@@ -176,7 +177,7 @@ function toErrorCode(err: unknown): SSOSignInErrorCode {
   );
 }
 
-export async function runGoogleSignIn(deps: GoogleFlowDeps): Promise<SSOSignInResult> {
+export async function runGoogleSignIn(deps: GoogleFlowDeps): Promise<MainSSOSignInResult> {
   // Single-flight: a new invocation supersedes any in-flight flow.
   cancelActiveGoogleFlow();
 

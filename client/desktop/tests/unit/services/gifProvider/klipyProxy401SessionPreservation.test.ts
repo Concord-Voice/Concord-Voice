@@ -18,17 +18,10 @@ import { useAuthStore } from '@/renderer/stores/authStore';
 import { useConnectionStore } from '@/renderer/stores/connectionStore';
 import { resetRuntimeServerBase } from '@/renderer/services/runtimeServerBase';
 
-// Observe every session-teardown side effect. resetService is dynamically
-// imported by apiClient's 401 path; vi.mock intercepts that import (mirrors
-// apiClient.test.ts).
+// Observe every session-teardown side effect through apiClient's configured
+// composition-root reset callbacks.
 const mockGracefulReset = vi.fn();
 const mockNuclearReset = vi.fn();
-vi.mock('@/renderer/services/resetService', () => ({
-  gracefulReset: mockGracefulReset,
-  nuclearReset: mockNuclearReset,
-  softRestart: vi.fn(),
-  stopProactiveRefresh: vi.fn(),
-}));
 
 // Mock fetch globally — vi.stubGlobal is hoisted, so static import works.
 const mockFetch = vi.fn();
@@ -36,7 +29,7 @@ vi.stubGlobal('fetch', mockFetch);
 
 // REAL apiFetch (not mocked) — this is the surface the KLIPY proxy shares with
 // authoritative API calls, and where the teardown-on-401 lives.
-import { _resetRefreshState } from '@/renderer/services/apiClient';
+import { _resetRefreshState, configureRefreshFailureReset } from '@/renderer/services/apiClient';
 import { klipyClient } from '@/renderer/services/gifProvider/klipyClient';
 
 function jsonResponse(body: unknown, status: number): Response {
@@ -51,6 +44,10 @@ describe('#1957 — a KLIPY GIF proxy 401 must not tear down a valid session', (
     resetAllStores();
     _resetRefreshState();
     vi.clearAllMocks();
+    configureRefreshFailureReset({
+      gracefulReset: mockGracefulReset,
+      nuclearReset: mockNuclearReset,
+    });
     resetRuntimeServerBase();
     useConnectionStore.getState().reset(); // phase = 'stable' (matches the reported diagnostic)
     (klipyClient as unknown as { _resetForTesting: () => void })._resetForTesting();

@@ -27,39 +27,39 @@ import (
 // once the renderer connects WebSocket.
 
 // IssueAccessAndRefresh mints an access token and a refresh token for the
-// given userID, persisting the refresh-token hash in refresh_tokens. Used by
-// internal/oauth.Handler when an SSO sign-in succeeds.
+// given userID, persisting the refresh-token hash and returning its session ID.
+// Used by internal/oauth.Handler when an SSO sign-in succeeds.
 //
 // Reads users.email_verified so the access-token claim reflects current
 // state — SSO users are always email-verified at INSERT time (provider
 // asserts email_verified=true; the Callback handler refuses otherwise),
 // but we re-read in case the user later flips a flag via a recovery flow.
-func (h *Handler) IssueAccessAndRefresh(ctx context.Context, userID string) (accessToken, refreshToken string, err error) {
+func (h *Handler) IssueAccessAndRefresh(ctx context.Context, userID string) (accessToken, refreshToken, sessionID string, err error) {
 	var emailVerified, disabled bool
 	if err := h.db.QueryRowContext(ctx,
 		`SELECT email_verified, disabled FROM users WHERE id = $1`, userID,
 	).Scan(&emailVerified, &disabled); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", "", fmt.Errorf("user %s not found", userID)
+			return "", "", "", fmt.Errorf("user %s not found", userID)
 		}
-		return "", "", fmt.Errorf("lookup user state: %w", err)
+		return "", "", "", fmt.Errorf("lookup user state: %w", err)
 	}
 	// Gate the SSO mint path on the terminal disable (#1623), so a disabled user
 	// cannot establish a session via SSO — symmetric with the password Login /
 	// CompleteLogin gate and the refresh gate. (AuthRequired's denylist also
 	// backstops any access derived from a token, but we must not mint one.)
 	if disabled {
-		return "", "", ErrAccountDisabled
+		return "", "", "", ErrAccountDisabled
 	}
 
 	tier := h.entCache.GetTier(ctx, userID)
 	accessToken, err = GenerateAccessToken(userID, h.jwtSecret, emailVerified, tier)
 	if err != nil {
-		return "", "", fmt.Errorf("access: %w", err)
+		return "", "", "", fmt.Errorf("access: %w", err)
 	}
 	refreshToken, err = GenerateRefreshToken()
 	if err != nil {
-		return "", "", fmt.Errorf("refresh: %w", err)
+		return "", "", "", fmt.Errorf("refresh: %w", err)
 	}
 
 	tokenHash := HashRefreshToken(refreshToken)
@@ -74,10 +74,10 @@ func (h *Handler) IssueAccessAndRefresh(ctx context.Context, userID string) (acc
 		 VALUES ($1, $2, $3, $4, $5)`,
 		tokenID, userID, tokenHash, expiresAt, true,
 	); err != nil {
-		return "", "", fmt.Errorf("store refresh token: %w", err)
+		return "", "", "", fmt.Errorf("store refresh token: %w", err)
 	}
 
-	return accessToken, refreshToken, nil
+	return accessToken, refreshToken, tokenID, nil
 }
 
 // IssueMFAChallenge mints a short-lived MFA challenge token for users with

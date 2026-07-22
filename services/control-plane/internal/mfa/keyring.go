@@ -2,6 +2,7 @@ package mfa
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -20,8 +21,8 @@ type Keyring struct {
 // Fail-closed: any malformed input is an error (the caller fatal-exits), never
 // a partially-usable ring.
 func ParseKeyring(activeHex string, activeVersion int, retired string) (*Keyring, error) {
-	if activeVersion < 1 {
-		return nil, fmt.Errorf("MFA_ENCRYPTION_KEY_VERSION must be >= 1, got %d", activeVersion)
+	if !validKeyVersion(activeVersion) {
+		return nil, fmt.Errorf("MFA_ENCRYPTION_KEY_VERSION must be in PostgreSQL SMALLINT range 1..%d, got %d", math.MaxInt16, activeVersion)
 	}
 	active, err := ParseEncryptionKey(activeHex)
 	if err != nil {
@@ -41,8 +42,8 @@ func ParseKeyring(activeHex string, activeVersion int, retired string) (*Keyring
 
 // addRetiredKey parses one "<version>:<hex64>" retired-key entry and inserts it
 // into keys. n is the 1-based entry index (for error messages only). Fail-closed:
-// a malformed entry, a non-positive version, a version already in the ring, or a
-// bad key is an error. Never emits key material.
+// a malformed entry, a version outside PostgreSQL SMALLINT range 1..32767, a
+// version already in the ring, or a bad key is an error. Never emits key material.
 func addRetiredKey(keys map[int][]byte, n int, entry string) error {
 	entry = strings.TrimSpace(entry)
 	if entry == "" {
@@ -53,8 +54,8 @@ func addRetiredKey(keys map[int][]byte, n int, entry string) error {
 		return fmt.Errorf("MFA_ENCRYPTION_KEYS_RETIRED entry %d: want <version>:<hex64>", n)
 	}
 	ver, err := strconv.Atoi(verStr)
-	if err != nil || ver < 1 {
-		return fmt.Errorf("MFA_ENCRYPTION_KEYS_RETIRED entry %d: version must be a positive integer", n)
+	if err != nil || !validKeyVersion(ver) {
+		return fmt.Errorf("MFA_ENCRYPTION_KEYS_RETIRED entry %d: version must be an integer in PostgreSQL SMALLINT range 1..%d", n, math.MaxInt16)
 	}
 	if _, dup := keys[ver]; dup {
 		return fmt.Errorf("MFA_ENCRYPTION_KEYS_RETIRED entry %d: version %d already present in keyring", n, ver)
@@ -65,6 +66,10 @@ func addRetiredKey(keys map[int][]byte, n int, entry string) error {
 	}
 	keys[ver] = key
 	return nil
+}
+
+func validKeyVersion(version int) bool {
+	return version >= 1 && version <= math.MaxInt16
 }
 
 // ActiveVersion returns the version new seals are stamped with.

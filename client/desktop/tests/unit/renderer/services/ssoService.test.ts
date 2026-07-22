@@ -1,6 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
-import { http, HttpResponse } from 'msw';
-import { server } from '../../../mocks/server';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   startSSOFlow,
   completeSSORegistration,
@@ -18,6 +16,8 @@ interface ElectronSSO {
   appleCancel: ReturnType<typeof vi.fn>;
   googleSignIn: ReturnType<typeof vi.fn>;
   googleCancel: ReturnType<typeof vi.fn>;
+  completeRegistration: ReturnType<typeof vi.fn>;
+  completeLink: ReturnType<typeof vi.fn>;
 }
 
 interface ElectronTestSurface {
@@ -33,10 +33,32 @@ function installElectronMock(): ElectronTestSurface {
         .mockResolvedValue({ port: 65432, redirectURI: 'http://127.0.0.1:65432/oauth/callback' }),
       awaitCallback: vi.fn().mockResolvedValue({ code: 'fake-code', state: 'returned-state' }),
       cancelLoopback: vi.fn(),
-      appleSignIn: vi.fn().mockResolvedValue({ kind: 'tokens', accessToken: 'apple-at' }),
+      appleSignIn: vi.fn().mockResolvedValue({
+        kind: 'tokens',
+        accessToken: 'apple-at',
+        sessionId: 'apple-session',
+        credentialOwner: 41,
+      }),
       appleCancel: vi.fn(),
-      googleSignIn: vi.fn().mockResolvedValue({ kind: 'tokens', accessToken: 'google-at' }),
+      googleSignIn: vi.fn().mockResolvedValue({
+        kind: 'tokens',
+        accessToken: 'google-at',
+        sessionId: 'google-session',
+        credentialOwner: 42,
+      }),
       googleCancel: vi.fn(),
+      completeRegistration: vi.fn().mockResolvedValue({
+        kind: 'tokens',
+        accessToken: 'reg-token-1',
+        sessionId: 'reg-session-1',
+        credentialOwner: 43,
+      }),
+      completeLink: vi.fn().mockResolvedValue({
+        kind: 'tokens',
+        accessToken: 'link-token-1',
+        sessionId: 'link-session-1',
+        credentialOwner: 44,
+      }),
     },
     openExternal: vi.fn().mockResolvedValue({ ok: true }),
   };
@@ -47,15 +69,9 @@ function installElectronMock(): ElectronTestSurface {
   return surface;
 }
 
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
-afterAll(() => server.close());
-
 let electron: ElectronTestSurface;
 
 beforeEach(() => {
-  // The shared MSW server has handlers for /api/v1/auth/register etc. but no
-  // SSO routes — we register them per-test via server.use().
-  server.resetHandlers();
   // Auth token must be present for apiFetch to attach Authorization header.
   // The SSO start endpoint itself does not require auth, but apiFetch is shared.
   useAuthStore.getState().clearAccessToken();
@@ -74,9 +90,15 @@ describe('startSSOFlow', () => {
 
   describe('startSSOFlow — google (#975 main-driven)', () => {
     it('maps tokens → logged_in without touching the loopback IPC trio', async () => {
-      const result = await startSSOFlow('google');
-      expect(result).toEqual({ kind: 'logged_in', accessToken: 'google-at' });
+      const result = await startSSOFlow('google', API_BASE);
+      expect(result).toEqual({
+        kind: 'logged_in',
+        accessToken: 'google-at',
+        sessionId: 'google-session',
+        credentialOwner: 42,
+      });
       expect(electron.sso.googleSignIn).toHaveBeenCalledTimes(1);
+      expect(electron.sso.googleSignIn).toHaveBeenCalledWith(API_BASE);
       expect(electron.sso.startLoopback).not.toHaveBeenCalled();
       expect(electron.sso.awaitCallback).not.toHaveBeenCalled();
       expect(electron.openExternal).not.toHaveBeenCalled();
@@ -90,7 +112,7 @@ describe('startSSOFlow', () => {
         recoveryOnlyMethods: ['backup_code'],
         webauthnOptions: { rpId: 'y' },
       });
-      const result = await startSSOFlow('google');
+      const result = await startSSOFlow('google', API_BASE);
       expect(result).toEqual({
         kind: 'mfa_required',
         mfaChallengeToken: 'mfa-g-1',
@@ -108,7 +130,7 @@ describe('startSSOFlow', () => {
         email: 'new@example.test',
         name: 'Jane Doe',
       });
-      const result = await startSSOFlow('google');
+      const result = await startSSOFlow('google', API_BASE);
       expect(result).toEqual({
         kind: 'register_required',
         ssoToken: 'tok-g-n',
@@ -124,7 +146,7 @@ describe('startSSOFlow', () => {
         ssoToken: 'tok-g-l',
         maskedEmail: 'j***@example.test',
       });
-      const result = await startSSOFlow('google');
+      const result = await startSSOFlow('google', API_BASE);
       expect(result).toEqual({
         kind: 'link_available',
         ssoToken: 'tok-g-l',
@@ -137,7 +159,7 @@ describe('startSSOFlow', () => {
         kind: 'error',
         code: 'google_id_token_invalid',
       });
-      await expect(startSSOFlow('google')).rejects.toThrow('google_id_token_invalid');
+      await expect(startSSOFlow('google', API_BASE)).rejects.toThrow('google_id_token_invalid');
     });
   });
 
@@ -150,9 +172,15 @@ describe('startSSOFlow', () => {
 
   describe('startSSOFlow — apple (#974 main-driven)', () => {
     it('maps tokens → logged_in without touching the loopback IPC trio', async () => {
-      const result = await startSSOFlow('apple');
-      expect(result).toEqual({ kind: 'logged_in', accessToken: 'apple-at' });
+      const result = await startSSOFlow('apple', API_BASE);
+      expect(result).toEqual({
+        kind: 'logged_in',
+        accessToken: 'apple-at',
+        sessionId: 'apple-session',
+        credentialOwner: 41,
+      });
       expect(electron.sso.appleSignIn).toHaveBeenCalledTimes(1);
+      expect(electron.sso.appleSignIn).toHaveBeenCalledWith(API_BASE);
       expect(electron.sso.startLoopback).not.toHaveBeenCalled();
       expect(electron.sso.awaitCallback).not.toHaveBeenCalled();
       expect(electron.openExternal).not.toHaveBeenCalled();
@@ -166,7 +194,7 @@ describe('startSSOFlow', () => {
         recoveryOnlyMethods: ['backup_code'],
         webauthnOptions: { rpId: 'x' },
       });
-      const result = await startSSOFlow('apple');
+      const result = await startSSOFlow('apple', API_BASE);
       expect(result).toEqual({
         kind: 'mfa_required',
         mfaChallengeToken: 'mfa-1',
@@ -184,7 +212,7 @@ describe('startSSOFlow', () => {
         email: 'new@example.test',
         name: 'Jane Doe',
       });
-      const result = await startSSOFlow('apple');
+      const result = await startSSOFlow('apple', API_BASE);
       expect(result).toEqual({
         kind: 'register_required',
         ssoToken: 'tok-n',
@@ -200,7 +228,7 @@ describe('startSSOFlow', () => {
         ssoToken: 'tok-l',
         maskedEmail: 'j***@example.test',
       });
-      const result = await startSSOFlow('apple');
+      const result = await startSSOFlow('apple', API_BASE);
       expect(result).toEqual({
         kind: 'link_available',
         ssoToken: 'tok-l',
@@ -213,83 +241,93 @@ describe('startSSOFlow', () => {
         kind: 'error',
         code: 'apple_id_token_invalid',
       });
-      await expect(startSSOFlow('apple')).rejects.toThrow('apple_id_token_invalid');
+      await expect(startSSOFlow('apple', API_BASE)).rejects.toThrow('apple_id_token_invalid');
     });
   });
 });
 
 describe('completeSSORegistration', () => {
-  it('returns an access token on 2xx', async () => {
-    server.use(
-      http.post(`${API_BASE}/api/v1/auth/sso/google/complete-registration`, () =>
-        HttpResponse.json({ access_token: 'reg-token-1' }, { status: 201 })
-      )
-    );
-
-    const { accessToken } = await completeSSORegistration({
-      provider: 'google',
+  it('returns only the main-custodied credential reference', async () => {
+    const params = {
+      provider: 'google' as const,
       ssoToken: 'tok',
       username: 'newuser',
       passphrase: 'StrongPassphrase123!', // pragma: allowlist secret
       wrappedPrivateKey: 'd3JhcHBlZA==', // pragma: allowlist secret
       keyDerivationSalt: 'c2FsdA==',
       publicKey: 'cHViLWtleQ==',
-    });
+    };
+    const result = await completeSSORegistration(params, { apiBase: API_BASE, epoch: 0 });
 
-    expect(accessToken).toBe('reg-token-1');
+    expect(result).toEqual({
+      accessToken: 'reg-token-1',
+      sessionId: 'reg-session-1',
+      credentialOwner: 43,
+    });
+    expect(electron.sso.completeRegistration).toHaveBeenCalledWith(API_BASE, params);
+    expect(result).not.toHaveProperty('refreshToken');
   });
 
   it('throws sso_complete_registration_failed_<status> on non-2xx', async () => {
-    server.use(
-      http.post(`${API_BASE}/api/v1/auth/sso/google/complete-registration`, () =>
-        HttpResponse.json({ error_code: 'username_taken' }, { status: 409 })
-      )
-    );
+    electron.sso.completeRegistration.mockResolvedValueOnce({
+      kind: 'error',
+      status: 409,
+      code: 'username_taken',
+      body: { error_code: 'username_taken' },
+    });
 
     await expect(
-      completeSSORegistration({
-        provider: 'google',
-        ssoToken: 'tok',
-        username: 'taken',
-        passphrase: 'StrongPassphrase123!', // pragma: allowlist secret
-        wrappedPrivateKey: 'd3JhcHBlZA==', // pragma: allowlist secret
-        keyDerivationSalt: 'c2FsdA==',
-        publicKey: 'cHViLWtleQ==',
-      })
+      completeSSORegistration(
+        {
+          provider: 'google',
+          ssoToken: 'tok',
+          username: 'taken',
+          passphrase: 'StrongPassphrase123!', // pragma: allowlist secret
+          wrappedPrivateKey: 'd3JhcHBlZA==', // pragma: allowlist secret
+          keyDerivationSalt: 'c2FsdA==',
+          publicKey: 'cHViLWtleQ==',
+        },
+        { apiBase: API_BASE, epoch: 0 }
+      )
     ).rejects.toThrow(/sso_complete_registration_failed_409/);
   });
 });
 
 describe('completeSSOLink', () => {
-  it('returns an access token on 2xx', async () => {
-    server.use(
-      http.post(`${API_BASE}/api/v1/auth/sso/google/complete-link`, () =>
-        HttpResponse.json({ access_token: 'link-token-1' })
-      )
-    );
-
-    const { accessToken } = await completeSSOLink({
-      provider: 'google',
+  it('returns only the main-custodied credential reference', async () => {
+    const params = {
+      provider: 'google' as const,
       ssoToken: 'link-tok',
       password: 'CorrectPW!', // pragma: allowlist secret
-    });
+    };
+    const result = await completeSSOLink(params, { apiBase: API_BASE, epoch: 0 });
 
-    expect(accessToken).toBe('link-token-1');
+    expect(result).toEqual({
+      accessToken: 'link-token-1',
+      sessionId: 'link-session-1',
+      credentialOwner: 44,
+    });
+    expect(electron.sso.completeLink).toHaveBeenCalledWith(API_BASE, params);
+    expect(result).not.toHaveProperty('refreshToken');
   });
 
   it('throws sso_complete_link_failed_<status> on non-2xx', async () => {
-    server.use(
-      http.post(`${API_BASE}/api/v1/auth/sso/google/complete-link`, () =>
-        HttpResponse.json({ error_code: 'invalid_credentials' }, { status: 401 })
-      )
-    );
+    electron.sso.completeLink.mockResolvedValueOnce({
+      kind: 'error',
+      status: 401,
+      code: 'invalid_credentials',
+      body: { error_code: 'invalid_credentials' },
+    });
 
     await expect(
-      completeSSOLink({
-        provider: 'google',
-        ssoToken: 'link-tok',
-        password: 'wrong', // pragma: allowlist secret
-      })
+      completeSSOLink(
+        {
+          provider: 'google',
+          ssoToken: 'link-tok',
+          password: 'wrong', // pragma: allowlist secret
+        },
+        { apiBase: API_BASE, epoch: 0 }
+      )
     ).rejects.toThrow(/sso_complete_link_failed_401/);
   });
 });

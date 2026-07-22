@@ -3,7 +3,13 @@ import TOTPInput from './TOTPInput';
 import LoadingSpinner from './LoadingSpinner';
 import { useAuthStore } from '../../stores/authStore';
 import { usePendingRegistrationStore } from '../../stores/pendingRegistrationStore';
-import { apiUrl, getApiBase } from '../../services/runtimeServerBase';
+import { revokeAbortedSession } from '../../services/apiClient';
+import {
+  apiUrl,
+  captureRuntimeServerSelection,
+  runtimeServerSelectionIsCurrent,
+} from '../../services/runtimeServerBase';
+import type { CredentialOwner } from '../../../main/ipcContract';
 import './EmailVerification.css';
 import './TOTPInput.css';
 
@@ -72,6 +78,66 @@ interface ResendResponse {
   resends_remaining: number;
 }
 
+/**
+ * Persist the just-verified registration session and admit the user. Extracted
+ * verbatim from handleSubmitCode's `response.ok` branch so the persist-and-admit
+ * success path does not add to that callback's cognitive complexity (S3776).
+ * Every early return mirrors the original; the caller returns unconditionally
+ * once this resolves, exactly as the original `if (response.ok) { … return; }`.
+ */
+async function admitVerifiedSession(params: {
+  data: ConfirmResponse;
+  requestApiBase: string;
+  requestIsCurrent: () => boolean;
+  setError: (message: string) => void;
+  clearPending: () => void;
+  onSuccess: () => void;
+}): Promise<void> {
+  const { data, requestApiBase, requestIsCurrent, setError, clearPending, onSuccess } = params;
+  const issuedSession = {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+    sessionId: data.session_id ?? null,
+    apiBase: requestApiBase,
+  };
+  if (!requestIsCurrent()) {
+    setError('Verification interrupted because the server changed. Please try again.');
+    await revokeAbortedSession(issuedSession);
+    return;
+  }
+  let credentialOwner: CredentialOwner | null = null;
+  if (globalThis.electron?.storeRefreshToken) {
+    const storedOwner = await globalThis.electron.storeRefreshToken({
+      refreshToken: data.refresh_token,
+      rememberMe: true,
+      apiBase: requestApiBase,
+      accessToken: data.access_token,
+    });
+    if (typeof storedOwner !== 'number') {
+      setError('Verification failed. Please try again.');
+      await revokeAbortedSession(issuedSession);
+      return;
+    }
+    credentialOwner = storedOwner;
+  }
+  if (!requestIsCurrent()) {
+    setError('Verification interrupted because the server changed. Please try again.');
+    if (credentialOwner !== null) {
+      try {
+        await globalThis.electron?.clearTokensIfOwner?.(credentialOwner);
+      } catch {
+        // Server revocation below remains the cleanup backstop.
+      }
+    }
+    await revokeAbortedSession(issuedSession);
+    return;
+  }
+  useAuthStore.getState().beginAuthLifecycle(data.access_token, data.session_id ?? null);
+  useAuthStore.getState().setEmailVerified(true);
+  clearPending();
+  onSuccess();
+}
+
 const EmailVerification: React.FC<EmailVerificationProps> = ({
   maskEmail = true,
   onSuccess,
@@ -105,11 +171,17 @@ const EmailVerification: React.FC<EmailVerificationProps> = ({
   const handleSubmitCode = useCallback(
     async (code: string) => {
       if (isVerifying || !pendingId) return;
+      const requestSelection = captureRuntimeServerSelection();
+      const requestApiBase = requestSelection.apiBase;
+      const requestAuthGeneration = useAuthStore.getState().authGeneration;
+      const requestIsCurrent = () =>
+        runtimeServerSelectionIsCurrent(requestSelection) &&
+        useAuthStore.getState().authGeneration === requestAuthGeneration;
       setIsVerifying(true);
       setError('');
 
       try {
-        const response = await fetch(apiUrl('/api/v1/auth/register/confirm'), {
+        const response = await fetch(`${requestApiBase}/api/v1/auth/register/confirm`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           credentials: 'include',
@@ -123,19 +195,14 @@ const EmailVerification: React.FC<EmailVerificationProps> = ({
         };
 
         if (response.ok) {
-          if (globalThis.electron?.storeRefreshToken) {
-            await globalThis.electron.storeRefreshToken({
-              refreshToken: data.refresh_token,
-              rememberMe: true,
-              apiBase: getApiBase(),
-              accessToken: data.access_token,
-            });
-          }
-          useAuthStore.getState().setAccessToken(data.access_token);
-          if (data.session_id) useAuthStore.getState().setSessionId(data.session_id);
-          useAuthStore.getState().setEmailVerified(true);
-          clearPending();
-          onSuccess();
+          await admitVerifiedSession({
+            data,
+            requestApiBase,
+            requestIsCurrent,
+            setError,
+            clearPending,
+            onSuccess,
+          });
           return;
         }
 

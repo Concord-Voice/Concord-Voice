@@ -38,6 +38,16 @@ const (
 	pollSuffix              = "/some-id"
 )
 
+func secureRefreshCookie(value string) *http.Cookie {
+	return &http.Cookie{
+		Name:     "refresh_token",
+		Value:    value,
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	}
+}
+
 // ── Registration Edge Cases ─────────────────────────────────────────────────
 
 func TestRegisterInvalidJSON(t *testing.T) {
@@ -520,6 +530,142 @@ func TestLogoutWithXRefreshTokenHeader(t *testing.T) {
 	assert.Contains(t, body["message"], "Logged out successfully")
 }
 
+func TestLogout_ExplicitRefreshTokenPrecedesSessionIDAndAmbientCookie(t *testing.T) {
+	ts := setupTS(t)
+
+	abortedAccess, abortedRefresh, _ := registerAndConfirmTokens(t, ts, registerPayload())
+
+	otherPayload := registerPayload()
+	otherPayload["username"] = "otherlogout"
+	otherPayload["email"] = "otherlogout@test.concord.chat"
+	_, otherRefresh, _ := registerAndConfirmTokens(t, ts, otherPayload)
+	otherSessionID := sessionIDForRefreshToken(t, ts, otherRefresh)
+
+	successorPayload := registerPayload()
+	successorPayload["username"] = "successorlogout"
+	successorPayload["email"] = "successorlogout@test.concord.chat"
+	_, successorRefresh, _ := registerAndConfirmTokens(t, ts, successorPayload)
+
+	req := httptest.NewRequest("POST", pathLogout, nil)
+	req.Header.Set("Authorization", bearerPfx+abortedAccess)
+	req.Header.Set(headerXRefreshToken, abortedRefresh)
+	req.Header.Set("X-Session-ID", otherSessionID)
+	req.Header.Set(headerContentType, contentTypeJSON)
+	req.AddCookie(secureRefreshCookie(successorRefresh))
+	rw := httptest.NewRecorder()
+	ts.Router.ServeHTTP(rw, req)
+	require.Equal(t, http.StatusOK, rw.Code)
+
+	assertRefreshTokenRevoked(t, ts, abortedRefresh, true)
+	assertRefreshTokenRevoked(t, ts, otherRefresh, false)
+	assertRefreshTokenRevoked(t, ts, successorRefresh, false)
+	assert.Empty(t, rw.Header().Values("Set-Cookie"), "explicit cleanup must not erase the ambient successor cookie")
+}
+
+func TestLogout_SessionIDRequiresBearerOwnedRow(t *testing.T) {
+	ts := setupTS(t)
+
+	accessToken, refreshToken, _ := registerAndConfirmTokens(t, ts, registerPayload())
+	sessionID := sessionIDForRefreshToken(t, ts, refreshToken)
+	headers := http.Header{}
+	headers.Set("Authorization", bearerPfx+accessToken)
+	headers.Set("X-Session-ID", sessionID)
+	headers.Set(headerContentType, contentTypeJSON)
+
+	w := ts.DoRequest("POST", pathLogout, nil, headers)
+	require.Equal(t, http.StatusOK, w.Code)
+	assertRefreshTokenRevoked(t, ts, refreshToken, true)
+	assert.Empty(t, w.Header().Values("Set-Cookie"), "bearer-authorized cleanup must not erase an ambient cookie")
+}
+
+func TestLogout_SessionIDBindsToAmbientCookieWithoutBearer(t *testing.T) {
+	ts := setupTS(t)
+
+	_, refreshToken, _ := registerAndConfirmTokens(t, ts, registerPayload())
+	sessionID := sessionIDForRefreshToken(t, ts, refreshToken)
+
+	req := httptest.NewRequest("POST", pathLogout, nil)
+	req.Header.Set("X-Session-ID", sessionID)
+	req.Header.Set(headerContentType, contentTypeJSON)
+	req.AddCookie(secureRefreshCookie(refreshToken))
+	rw := httptest.NewRecorder()
+	ts.Router.ServeHTTP(rw, req)
+	require.Equal(t, http.StatusOK, rw.Code)
+
+	assertRefreshTokenRevoked(t, ts, refreshToken, true)
+	var cleared bool
+	for _, cookie := range rw.Result().Cookies() {
+		if cookie.Name == "refresh_token" && cookie.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	assert.True(t, cleared, "the matching cookie-authorized session must clear its cookie")
+}
+
+func TestLogout_OldSessionIDWithSuccessorCookieMatchesNothing(t *testing.T) {
+	ts := setupTS(t)
+
+	_, oldRefresh, _ := registerAndConfirmTokens(t, ts, registerPayload())
+	oldSessionID := sessionIDForRefreshToken(t, ts, oldRefresh)
+
+	successorPayload := registerPayload()
+	successorPayload["username"] = "cookiebindingsuccessor"
+	successorPayload["email"] = "cookiebindingsuccessor@test.concord.chat"
+	_, successorRefresh, _ := registerAndConfirmTokens(t, ts, successorPayload)
+
+	req := httptest.NewRequest("POST", pathLogout, nil)
+	req.Header.Set("X-Session-ID", oldSessionID)
+	req.Header.Set(headerContentType, contentTypeJSON)
+	req.AddCookie(secureRefreshCookie(successorRefresh))
+	rw := httptest.NewRecorder()
+	ts.Router.ServeHTTP(rw, req)
+	require.Equal(t, http.StatusOK, rw.Code)
+
+	assertRefreshTokenRevoked(t, ts, oldRefresh, false)
+	assertRefreshTokenRevoked(t, ts, successorRefresh, false)
+	assert.Empty(t, rw.Header().Values("Set-Cookie"), "a mismatched successor cookie must remain untouched")
+}
+
+func TestLogout_CrossUserSessionIDDoesNotFallBackToAmbientCookie(t *testing.T) {
+	ts := setupTS(t)
+
+	_, victimRefresh, _ := registerAndConfirmTokens(t, ts, registerPayload())
+	victimSessionID := sessionIDForRefreshToken(t, ts, victimRefresh)
+
+	attackerPayload := registerPayload()
+	attackerPayload["username"] = "sessionattacker"
+	attackerPayload["email"] = "sessionattacker@test.concord.chat"
+	attackerAccess, attackerRefresh, _ := registerAndConfirmTokens(t, ts, attackerPayload)
+
+	req := httptest.NewRequest("POST", pathLogout, nil)
+	req.Header.Set("Authorization", bearerPfx+attackerAccess)
+	req.Header.Set("X-Session-ID", victimSessionID)
+	req.Header.Set(headerContentType, contentTypeJSON)
+	req.AddCookie(secureRefreshCookie(attackerRefresh))
+	rw := httptest.NewRecorder()
+	ts.Router.ServeHTTP(rw, req)
+	require.Equal(t, http.StatusOK, rw.Code)
+
+	assertRefreshTokenRevoked(t, ts, victimRefresh, false)
+	assertRefreshTokenRevoked(t, ts, attackerRefresh, false)
+}
+
+func TestLogout_DatabaseFailureDoesNotReportSuccess(t *testing.T) {
+	ts := setupTS(t)
+	_, refreshToken, _ := registerAndConfirmTokens(t, ts, registerPayload())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest("POST", pathLogout, nil).WithContext(ctx)
+	req.Header.Set(headerXRefreshToken, refreshToken)
+	req.Header.Set(headerContentType, contentTypeJSON)
+	rw := httptest.NewRecorder()
+	ts.Router.ServeHTTP(rw, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rw.Code)
+	assertRefreshTokenRevoked(t, ts, refreshToken, false)
+}
+
 // TestLogout_AttackerCannotWipeArbitrarySessionAttestation is the security
 // regression test for finding #15 of the #1264 review.
 //
@@ -531,7 +677,8 @@ func TestLogoutWithXRefreshTokenHeader(t *testing.T) {
 // #1154 — client-supplied identity gating a privileged side-effect).
 //
 // Fixed posture: cleanup drives off `refresh_tokens.id` of the row we just
-// revoked, via UPDATE ... RETURNING user_id, id. The header is never read.
+// revoked, via UPDATE ... RETURNING user_id, id. The explicit refresh token
+// takes precedence, so the conflicting session header cannot select a row.
 //
 // This test:
 //  1. Registers a "victim" user; seeds an attestation token at
@@ -638,6 +785,7 @@ func TestRefreshReturnsNewRefreshTokenAndSessionID(t *testing.T) {
 	ts := setupTS(t)
 
 	_, refreshToken, _ := registerAndConfirmTokens(t, ts, registerPayload())
+	previousSessionID := sessionIDForRefreshToken(t, ts, refreshToken)
 
 	headers := http.Header{}
 	headers.Set(headerXRefreshToken, refreshToken)
@@ -650,7 +798,10 @@ func TestRefreshReturnsNewRefreshTokenAndSessionID(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	assert.NotEmpty(t, body["access_token"])
 	assert.NotEmpty(t, body["refresh_token"])
-	assert.NotEmpty(t, body["session_id"])
+	newSessionID, ok := body["session_id"].(string)
+	require.True(t, ok)
+	assert.NotEqual(t, previousSessionID, newSessionID)
+	assert.Equal(t, previousSessionID, body["previous_session_id"])
 	assert.Equal(t, float64(900), body["expires_in"])
 
 	// New refresh token should differ from the original
@@ -1599,6 +1750,22 @@ func registerAndConfirmTokens(t *testing.T, ts *testhelpers.TestServer, payload 
 func hashToken(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])
+}
+
+func assertRefreshTokenRevoked(
+	t *testing.T,
+	ts *testhelpers.TestServer,
+	refreshToken string,
+	wantRevoked bool,
+) {
+	t.Helper()
+	var revokedAt *time.Time
+	err := ts.DB.QueryRow(
+		`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`,
+		hashToken(refreshToken),
+	).Scan(&revokedAt)
+	require.NoError(t, err)
+	assert.Equal(t, wantRevoked, revokedAt != nil)
 }
 
 // seedRecoveryCodeLocal inserts a known recovery code into Redis (local helper to avoid

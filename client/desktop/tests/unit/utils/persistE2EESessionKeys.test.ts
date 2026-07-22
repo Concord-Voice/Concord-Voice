@@ -42,7 +42,7 @@ describe('persistE2EESessionKeys (#1288)', () => {
   it('no-ops (no warn) when the Electron bridge is unavailable', async () => {
     (globalThis as { electron?: unknown }).electron = undefined;
 
-    await expect(persistE2EESessionKeys(keys)).resolves.toBeUndefined();
+    await expect(persistE2EESessionKeys(keys)).resolves.toBe(true);
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
@@ -74,5 +74,29 @@ describe('persistE2EESessionKeys (#1288)', () => {
 
     expect(warnSpy).toHaveBeenCalledOnce();
     expect(String(warnSpy.mock.calls[0][0])).toContain('Failed to invoke');
+  });
+
+  it('uses only the owner-scoped writer when a credential owner is supplied', async () => {
+    const storeE2EEKeys = vi.fn().mockResolvedValue(true);
+    const storeE2EEKeysIfOwner = vi.fn().mockResolvedValue(true);
+    (globalThis as { electron?: unknown }).electron = {
+      storeE2EEKeys,
+      storeE2EEKeysIfOwner,
+    };
+
+    await expect(persistE2EESessionKeys(keys, 41)).resolves.toBe(true);
+
+    expect(storeE2EEKeysIfOwner).toHaveBeenCalledWith(keys, 41);
+    expect(storeE2EEKeys).not.toHaveBeenCalled();
+  });
+
+  it('never falls back to the generic writer when owner-scoped persistence is unavailable', async () => {
+    const storeE2EEKeys = vi.fn().mockResolvedValue(true);
+    (globalThis as { electron?: unknown }).electron = { storeE2EEKeys };
+
+    await expect(persistE2EESessionKeys(keys, 41)).resolves.toBe(false);
+
+    expect(storeE2EEKeys).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledOnce();
   });
 });

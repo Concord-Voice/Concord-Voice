@@ -372,9 +372,21 @@ paths:
             application/json:
               schema:
                 type: object
+                required:
+                - access_token
+                - refresh_token
+                - session_id
+                - remember_me
+                - user
+                - e2ee_keys
                 properties:
                   access_token:
                     type: string
+                  refresh_token:
+                    type: string
+                  session_id:
+                    type: string
+                    format: uuid
                   expires_in:
                     type: integer
                     example: 900
@@ -389,6 +401,17 @@ paths:
               description: HttpOnly refresh token cookie
               schema:
                 type: string
+            X-Concord-Session-Issued:
+              description: Present with value true when this response minted a login session
+              schema:
+                type: string
+                enum:
+                - 'true'
+            X-Concord-Session-ID:
+              description: Refresh-session UUID corresponding to the Set-Cookie value
+              schema:
+                type: string
+                format: uuid
         '401':
           description: Invalid credentials
           content:
@@ -410,11 +433,32 @@ paths:
       summary: Log out
       description: 'Invalidate the current session. Blacklists the access token in Redis.
 
+        Explicit X-Refresh-Token and X-Session-ID credentials take precedence over the
+        refresh-token cookie, in that order. X-Session-ID is authorized by either a valid
+        same-user bearer or an exact atomic match against the ambient refresh cookie hash.
+        Explicit refresh/bearer cleanup never expires an ambient cookie; cookie-authorized
+        cleanup expires it only when the database row matched.
+
         Rate limit: 10 requests per minute (IP-based).
 
         '
       security:
       - BearerAuth: []
+      - {}
+      parameters:
+      - name: X-Refresh-Token
+        in: header
+        required: false
+        description: Explicit refresh token to revoke. Takes precedence over X-Session-ID and the refresh-token cookie.
+        schema:
+          type: string
+      - name: X-Session-ID
+        in: header
+        required: false
+        description: Session to revoke when X-Refresh-Token is absent. Requires either a valid bearer whose user owns the session or an ambient refresh cookie whose hash belongs to this exact session.
+        schema:
+          type: string
+          format: uuid
       responses:
         '200':
           description: Logged out
@@ -515,6 +559,13 @@ paths:
                 oneOf:
                 - type: object
                   description: Login completion (purpose = login)
+                  required:
+                  - access_token
+                  - refresh_token
+                  - session_id
+                  - remember_me
+                  - user
+                  - e2ee_keys
                   properties:
                     access_token:
                       type: string
@@ -547,6 +598,17 @@ paths:
               description: HttpOnly refresh token cookie (login purpose only)
               schema:
                 type: string
+            X-Concord-Session-Issued:
+              description: Present with value true for login-purpose MFA completion only
+              schema:
+                type: string
+                enum:
+                - 'true'
+            X-Concord-Session-ID:
+              description: Refresh-session UUID for login-purpose MFA completion only
+              schema:
+                type: string
+                format: uuid
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -1012,7 +1074,8 @@ paths:
       tags:
       - Auth
       summary: Refresh access token
-      description: 'Exchange the HttpOnly refresh token cookie for a new access token.
+      description: 'Exchange a refresh token from the HttpOnly cookie or X-Refresh-Token header
+        for a rotated access-token and refresh-token pair.
 
         Implements single-use rotation with breach detection.
 
@@ -1021,6 +1084,7 @@ paths:
         '
       security:
       - CookieAuth: []
+      - RefreshTokenHeaderAuth: []
       responses:
         '200':
           description: New access token
@@ -1031,6 +1095,15 @@ paths:
                 properties:
                   access_token:
                     type: string
+                  refresh_token:
+                    type: string
+                  session_id:
+                    type: string
+                    format: uuid
+                  previous_session_id:
+                    type: string
+                    format: uuid
+                    description: Session ID presented by the client and replaced by this rotation
                   expires_in:
                     type: integer
                     example: 900
@@ -1435,14 +1508,33 @@ paths:
             application/json:
               schema:
                 type: object
+                required:
+                - access_token
+                - refresh_token
+                - session_id
+                - remember_me
                 properties:
                   access_token:
                     type: string
+                  refresh_token:
+                    type: string
+                  session_id:
+                    type: string
+                    format: uuid
+                  remember_me:
+                    type: boolean
+                    enum:
+                    - true
           headers:
             Set-Cookie:
               description: HttpOnly refresh token cookie
               schema:
                 type: string
+            X-Concord-Session-ID:
+              description: Refresh-session UUID corresponding to the Set-Cookie value
+              schema:
+                type: string
+                format: uuid
         '400':
           description: Invalid body (`invalid_request`)
           content:
@@ -1499,14 +1591,33 @@ paths:
             application/json:
               schema:
                 type: object
+                required:
+                - access_token
+                - refresh_token
+                - session_id
+                - remember_me
                 properties:
                   access_token:
                     type: string
+                  refresh_token:
+                    type: string
+                  session_id:
+                    type: string
+                    format: uuid
+                  remember_me:
+                    type: boolean
+                    enum:
+                    - true
           headers:
             Set-Cookie:
               description: HttpOnly refresh token cookie
               schema:
                 type: string
+            X-Concord-Session-ID:
+              description: Refresh-session UUID corresponding to the Set-Cookie value
+              schema:
+                type: string
+                format: uuid
         '400':
           description: Invalid body, username, password, or key material (`invalid_request` / `invalid_username`
             / `invalid_password` / `invalid_key_material`)
@@ -1576,7 +1687,7 @@ paths:
       responses:
         '200':
           description: 'Verification succeeded — one of four shapes (callback parity): existing-SSO
-            session (`access_token` + refresh cookie), existing-SSO MFA challenge, account-link offer,
+            session (`access_token`, `refresh_token`, `session_id` + refresh cookie), existing-SSO MFA challenge, account-link offer,
             or new-user registration handoff.
 
             '
@@ -1586,9 +1697,23 @@ paths:
                 oneOf:
                 - type: object
                   description: Existing SSO identity — session issued
+                  required:
+                  - access_token
+                  - refresh_token
+                  - session_id
+                  - remember_me
                   properties:
                     access_token:
                       type: string
+                    refresh_token:
+                      type: string
+                    session_id:
+                      type: string
+                      format: uuid
+                    remember_me:
+                      type: boolean
+                      enum:
+                      - true
                 - type: object
                   description: Existing SSO identity — MFA required
                   properties:
@@ -1629,6 +1754,11 @@ paths:
               description: HttpOnly refresh token cookie (session-issued branch only)
               schema:
                 type: string
+            X-Concord-Session-ID:
+              description: Refresh-session UUID for the session-issued branch only
+              schema:
+                type: string
+                format: uuid
         '400':
           description: Invalid body or oversized state (`invalid_request`)
           content:
@@ -13477,6 +13607,11 @@ components:
       in: cookie
       name: refresh_token
       description: HttpOnly refresh token cookie (30-day expiry)
+    RefreshTokenHeaderAuth:
+      type: apiKey
+      in: header
+      name: X-Refresh-Token
+      description: Explicit refresh token used by non-browser clients
     AdminTokenAuth:
       type: apiKey
       in: header

@@ -1,13 +1,13 @@
 # API Documentation
 
-OpenAPI 3.0 specifications for two supported Concord Voice control-plane
-surfaces. Coverage is precisely **260 public + 4 admin metrics** operations; it
-is not complete control-plane coverage.
+OpenAPI 3.0 specifications for the supported Concord Voice control-plane
+surfaces. The specs are mechanically checked against the router but do not
+cover every control-plane surface.
 
 ## Files
 
-- [openapi.yaml](./openapi.yaml) — 260 supported public `/api/v1` operations
-- [admin-metrics.openapi.yaml](./admin-metrics.openapi.yaml) — 4 supported admin metrics `/admin/api/v1` GET operations
+- [openapi.yaml](./openapi.yaml) — supported public `/api/v1` operations
+- [admin-metrics.openapi.yaml](./admin-metrics.openapi.yaml) — supported admin metrics `/admin/api/v1` GET operations
 
 The specs intentionally exclude other control-plane surfaces, including admin
 authentication and enrollment. Explicit method-denial registrations on the four
@@ -40,10 +40,14 @@ npx @redocly/cli lint docs/api/admin-metrics.openapi.yaml
 
 ## Public Authentication Flow
 
-1. **Register** or **Login** → receive JWT access token (15 min) + refresh token cookie (30 days)
-2. Pass `Authorization: Bearer <token>` on all protected endpoints
-3. When a 401 is returned, call `POST /auth/refresh` (sends cookie automatically) → new access token
-4. **Logout** → invalidates the refresh token server-side
+1. **Register** or **Login** creates a refresh session and returns `access_token` plus its `session_id`. Login responses that mint a session set `X-Concord-Session-Issued: true` and expose that exact row as `X-Concord-Session-ID`, allowing a client to clean up even when a successful response body is malformed.
+2. Pass `Authorization: Bearer <access_token>` on protected endpoints.
+3. **Refresh** with the HttpOnly `refresh_token` cookie, or `X-Refresh-Token` for non-browser clients. Rotation returns the successor `session_id` and the replaced `previous_session_id`; clients must accept the result only for that exact lineage.
+4. **Logout** revokes credentials in this precedence order: explicit `X-Refresh-Token`; bearer-owned `X-Session-ID`; `X-Session-ID` bound atomically to the presented refresh-token cookie; then the cookie alone. Explicit credentials never clear an ambient cookie, and a cookie is expired only when its database row matched, so stale cleanup cannot erase a successor session.
+
+The response bodies, security alternatives, header requirements, and error
+shapes are canonical in [openapi.yaml](./openapi.yaml); keep client integrations
+bound to those operation definitions rather than duplicating them here.
 
 ## Endpoint Groups
 

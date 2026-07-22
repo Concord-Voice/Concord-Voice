@@ -174,7 +174,7 @@ vi.mock('node:http', () => {
 vi.mock('electron-squirrel-startup', () => ({ default: false }));
 
 vi.mock('../../../src/main/tokenManager', () => ({
-  storeRefreshToken: vi.fn(),
+  storeRefreshToken: vi.fn(() => 41),
   restoreRefreshToken: vi.fn(() => ({
     status: 'ok',
     token: 'mock-token',
@@ -186,12 +186,18 @@ vi.mock('../../../src/main/tokenManager', () => ({
   ),
   performLogout: vi.fn(() => Promise.resolve()),
   clearTokens: vi.fn(),
+  clearTokensIfOwner: vi.fn((owner: number) => owner === 41),
   getCapabilities: vi.fn(() => ({ safeStorage: true, secureKeychain: true })),
   storeE2EEKeys: vi.fn(),
+  storeE2EEKeysIfOwner: vi.fn((_data: unknown, owner: number) => owner === 41),
   restoreE2EEKeys: vi.fn(() => ({
     wrappingKeyBase64: 'key',
     preferencesKeyBase64: 'pkey',
     wrappedPrivateKeyBase64: 'wpk',
+  })),
+  getCredentialCustodyState: vi.fn(() => ({
+    credentialOwner: 41,
+    pendingE2EEUnlock: false,
   })),
   setProactiveRefreshCallback: vi.fn(),
   onSystemResume: vi.fn(),
@@ -509,10 +515,11 @@ describe('main.ts', () => {
       const { storeRefreshToken } = await import('../../../src/main/tokenManager');
       const { setUpdateFeedUrl } = await import('../../../src/main/updater');
       const data = { refreshToken: 'tok', rememberMe: true, apiBase: 'http://localhost:8080' };
-      await handlers.get('auth:storeRefreshToken')!(
+      const result = await handlers.get('auth:storeRefreshToken')!(
         { senderFrame: { url: 'app://concord/index.html' } },
         data
       );
+      expect(result).toBe(41);
       expect(storeRefreshToken).toHaveBeenCalledWith(data);
       expect(setUpdateFeedUrl).toHaveBeenCalledWith('http://localhost:8080');
     });
@@ -624,6 +631,45 @@ describe('main.ts', () => {
       expect(result.status).toBe('restored');
       expect(result.accessToken).toBe('mock-access');
       expect(result.rememberMe).toBe(true);
+      expect(result).toMatchObject({ credentialOwner: 41, pendingE2EEUnlock: false });
+    });
+
+    it('auth:restoreSession reports owner-bound E2EE custody as pending', async () => {
+      const { getCredentialCustodyState, restoreE2EEKeys } =
+        await import('../../../src/main/tokenManager');
+      (restoreE2EEKeys as Mock).mockReturnValueOnce(null);
+      (getCredentialCustodyState as Mock)
+        .mockReturnValueOnce({ credentialOwner: 41, pendingE2EEUnlock: true })
+        .mockReturnValueOnce({ credentialOwner: 41, pendingE2EEUnlock: true })
+        .mockReturnValueOnce({ credentialOwner: 41, pendingE2EEUnlock: true });
+
+      const result = await handlers.get('auth:restoreSession')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      });
+
+      expect(result).toMatchObject({
+        status: 'restored',
+        accessToken: 'mock-access',
+        credentialOwner: 41,
+        pendingE2EEUnlock: true,
+        e2eeKeys: null,
+      });
+    });
+
+    it('auth:restoreSession never pairs an old refresh result with successor E2EE custody', async () => {
+      const { getCredentialCustodyState, restoreE2EEKeys } =
+        await import('../../../src/main/tokenManager');
+      (getCredentialCustodyState as Mock)
+        .mockReturnValueOnce({ credentialOwner: 41, pendingE2EEUnlock: true })
+        .mockReturnValueOnce({ credentialOwner: 42, pendingE2EEUnlock: false });
+      (restoreE2EEKeys as Mock).mockClear();
+
+      const result = await handlers.get('auth:restoreSession')!({
+        senderFrame: { url: 'app://concord/index.html' },
+      });
+
+      expect(result).toEqual({ status: 'refresh_failed' });
+      expect(restoreE2EEKeys).not.toHaveBeenCalled();
     });
 
     it('auth:restoreSession returns rememberMe=false for memory-only sessions', async () => {
@@ -705,6 +751,60 @@ describe('main.ts', () => {
       expect(storeE2EEKeys).not.toHaveBeenCalled();
     });
 
+    it('auth:storeE2EEKeysIfOwner delegates an owner-scoped key write', async () => {
+      const { storeE2EEKeysIfOwner } = await import('../../../src/main/tokenManager');
+      const data = {
+        wrappingKeyBase64: 'a',
+        preferencesKeyBase64: 'b',
+        wrappedPrivateKeyBase64: 'c',
+      };
+
+      const result = await handlers.get('auth:storeE2EEKeysIfOwner')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        data,
+        41
+      );
+
+      expect(result).toBe(true);
+      expect(storeE2EEKeysIfOwner).toHaveBeenCalledWith(data, 41);
+    });
+
+    it('auth:storeE2EEKeysIfOwner rejects invalid owners', async () => {
+      const { storeE2EEKeysIfOwner } = await import('../../../src/main/tokenManager');
+      (storeE2EEKeysIfOwner as Mock).mockClear();
+
+      const result = await handlers.get('auth:storeE2EEKeysIfOwner')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        {
+          wrappingKeyBase64: 'a',
+          preferencesKeyBase64: 'b',
+          wrappedPrivateKeyBase64: 'c',
+        },
+        0
+      );
+
+      expect(result).toEqual({ status: 'rejected' });
+      expect(storeE2EEKeysIfOwner).not.toHaveBeenCalled();
+    });
+
+    it('auth:storeE2EEKeysIfOwner rejects untrusted sender frames', async () => {
+      const { storeE2EEKeysIfOwner } = await import('../../../src/main/tokenManager');
+      (storeE2EEKeysIfOwner as Mock).mockClear();
+
+      const result = await handlers.get('auth:storeE2EEKeysIfOwner')!(
+        { senderFrame: { url: 'https://evil.example/' } },
+        {
+          wrappingKeyBase64: 'a',
+          preferencesKeyBase64: 'b',
+          wrappedPrivateKeyBase64: 'c',
+        },
+        41
+      );
+
+      expect(result).toEqual({ status: 'rejected' });
+      expect(storeE2EEKeysIfOwner).not.toHaveBeenCalled();
+    });
+
     it('auth:refreshToken delegates to performRefresh', async () => {
       const result = (await handlers.get('auth:refreshToken')!({
         senderFrame: { url: 'app://concord/index.html' },
@@ -769,6 +869,50 @@ describe('main.ts', () => {
       });
       expect(result).toEqual({ status: 'rejected' });
       expect(clearTokens).not.toHaveBeenCalled();
+    });
+
+    it('auth:clearTokensIfOwner delegates conditional credential clearing', async () => {
+      const { clearTokensIfOwner } = await import('../../../src/main/tokenManager');
+
+      const cleared = await handlers.get('auth:clearTokensIfOwner')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        41
+      );
+      const preserved = await handlers.get('auth:clearTokensIfOwner')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        40
+      );
+
+      expect(cleared).toBe(true);
+      expect(preserved).toBe(false);
+      expect(clearTokensIfOwner).toHaveBeenNthCalledWith(1, 41);
+      expect(clearTokensIfOwner).toHaveBeenNthCalledWith(2, 40);
+    });
+
+    it('auth:clearTokensIfOwner rejects invalid owners', async () => {
+      const { clearTokensIfOwner } = await import('../../../src/main/tokenManager');
+      (clearTokensIfOwner as Mock).mockClear();
+
+      const result = await handlers.get('auth:clearTokensIfOwner')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        Number.NaN
+      );
+
+      expect(result).toEqual({ status: 'rejected' });
+      expect(clearTokensIfOwner).not.toHaveBeenCalled();
+    });
+
+    it('auth:clearTokensIfOwner rejects untrusted sender frames', async () => {
+      const { clearTokensIfOwner } = await import('../../../src/main/tokenManager');
+      (clearTokensIfOwner as Mock).mockClear();
+
+      const result = await handlers.get('auth:clearTokensIfOwner')!(
+        { senderFrame: { url: 'https://evil.example/' } },
+        41
+      );
+
+      expect(result).toEqual({ status: 'rejected' });
+      expect(clearTokensIfOwner).not.toHaveBeenCalled();
     });
 
     it('auth:getCapabilities returns capabilities for a trusted sender', async () => {
@@ -1059,10 +1203,11 @@ describe('main.ts', () => {
       ) => void;
       expect(cb).toBeDefined();
       mockWebContents.send.mockClear();
-      cb('new-access-token', 'new-session-id');
+      cb('new-access-token', 'new-session-id', 'previous-session-id');
       expect(mockWebContents.send).toHaveBeenCalledWith('auth:token-refreshed', {
         accessToken: 'new-access-token',
         sessionId: 'new-session-id',
+        previousSessionId: 'previous-session-id',
       });
     });
 
@@ -1566,9 +1711,11 @@ describe('main.ts', () => {
         'auth:storeRefreshToken',
         'auth:restoreSession',
         'auth:storeE2EEKeys',
+        'auth:storeE2EEKeysIfOwner',
         'auth:refreshToken',
         'auth:logout',
         'auth:clearTokens',
+        'auth:clearTokensIfOwner',
         'auth:getCapabilities',
         'auth:getMachineId',
         'update:check',

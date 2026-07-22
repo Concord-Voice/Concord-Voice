@@ -1,8 +1,13 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
-import type { SelfHostedProbeResult } from '../main/ipcContract';
+import type { CredentialOwner, SelfHostedProbeResult } from '../main/ipcContract';
 import type { AppleSignInResult } from '../shared/appleSso';
-import type { SSOSignInResult } from '../shared/sso';
+import type {
+  SSOCompleteLinkPayload,
+  SSOCompleteRegistrationPayload,
+  SSOCompletionResult,
+  SSOSignInResult,
+} from '../shared/sso';
 
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
@@ -22,6 +27,12 @@ export type UpdateErrorSubtype = 'cert-pin-failure' | 'publisher-failure' | 'sig
 
 export type PermissionStatus =
   'granted' | 'denied' | 'not-determined' | 'restricted' | 'unavailable';
+
+export interface TokenRefreshedData {
+  accessToken: string;
+  sessionId?: string;
+  previousSessionId?: string;
+}
 
 contextBridge.exposeInMainWorld('electron', {
   // App info
@@ -111,7 +122,10 @@ contextBridge.exposeInMainWorld('electron', {
     rememberMe: boolean;
     apiBase: string;
     accessToken?: string;
-  }) => ipcRenderer.invoke('auth:storeRefreshToken', data),
+  }) =>
+    ipcRenderer.invoke('auth:storeRefreshToken', data) as Promise<
+      CredentialOwner | { status: 'rejected' }
+    >,
   restoreSession: () =>
     ipcRenderer.invoke('auth:restoreSession') as Promise<{
       status: string;
@@ -123,17 +137,24 @@ contextBridge.exposeInMainWorld('electron', {
         wrappedPrivateKeyBase64: string;
       } | null;
       rememberMe?: boolean;
+      credentialOwner?: CredentialOwner;
+      pendingE2EEUnlock?: boolean;
     }>,
   refreshToken: () =>
     ipcRenderer.invoke('auth:refreshToken') as Promise<{
       status: string;
       accessToken?: string;
       sessionId?: string;
+      previousSessionId?: string;
       mfaChallengeToken?: string;
       mfaMethods?: string[];
       mfaRecoveryOnlyMethods?: string[];
     }>,
   clearTokens: () => ipcRenderer.invoke('auth:clearTokens'),
+  clearTokensIfOwner: (owner: CredentialOwner) =>
+    ipcRenderer.invoke('auth:clearTokensIfOwner', owner) as Promise<
+      boolean | { status: 'rejected' }
+    >,
   logout: (data?: { accessToken?: string }) => ipcRenderer.invoke('auth:logout', data),
   getAuthCapabilities: () =>
     ipcRenderer.invoke('auth:getCapabilities') as Promise<{ persistAvailable: boolean }>,
@@ -151,14 +172,20 @@ contextBridge.exposeInMainWorld('electron', {
     preferencesKeyBase64: string;
     wrappedPrivateKeyBase64: string;
   }): Promise<boolean | { status: 'rejected' }> => ipcRenderer.invoke('auth:storeE2EEKeys', data),
+  storeE2EEKeysIfOwner: (
+    data: {
+      wrappingKeyBase64: string;
+      preferencesKeyBase64: string;
+      wrappedPrivateKeyBase64: string;
+    },
+    owner: CredentialOwner
+  ): Promise<boolean | { status: 'rejected' }> =>
+    ipcRenderer.invoke('auth:storeE2EEKeysIfOwner', data, owner),
 
   // Proactive token refresh event (#254): main process pushes new access token
   // when its timer or sleep/wake handler refreshes proactively.
-  onTokenRefreshed: (callback: (data: { accessToken: string; sessionId?: string }) => void) => {
-    const handler = (
-      _event: Electron.IpcRendererEvent,
-      data: { accessToken: string; sessionId?: string }
-    ) => callback(data);
+  onTokenRefreshed: (callback: (data: TokenRefreshedData) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: TokenRefreshedData) => callback(data);
     ipcRenderer.on('auth:token-refreshed', handler);
     return () => {
       ipcRenderer.removeListener('auth:token-refreshed', handler);
@@ -359,10 +386,21 @@ contextBridge.exposeInMainWorld('electron', {
     ): Promise<{ code: string; state: string; appleUserData?: string }> =>
       ipcRenderer.invoke('sso:awaitCallback', port),
     cancelLoopback: (port: number): void => ipcRenderer.send('sso:cancelLoopback', port),
-    appleSignIn: (): Promise<AppleSignInResult> => ipcRenderer.invoke('sso:appleSignIn'),
+    appleSignIn: (apiBase: string): Promise<AppleSignInResult> =>
+      ipcRenderer.invoke('sso:appleSignIn', apiBase),
     appleCancel: (): void => ipcRenderer.send('sso:appleCancel'),
-    googleSignIn: (): Promise<SSOSignInResult> => ipcRenderer.invoke('sso:googleSignIn'),
+    googleSignIn: (apiBase: string): Promise<SSOSignInResult> =>
+      ipcRenderer.invoke('sso:googleSignIn', apiBase),
     googleCancel: (): void => ipcRenderer.send('sso:googleCancel'),
+    completeRegistration: (
+      apiBase: string,
+      payload: SSOCompleteRegistrationPayload
+    ): Promise<SSOCompletionResult> =>
+      ipcRenderer.invoke('sso:completeRegistration', apiBase, payload),
+    completeLink: (
+      apiBase: string,
+      payload: SSOCompleteLinkPayload
+    ): Promise<SSOCompletionResult> => ipcRenderer.invoke('sso:completeLink', apiBase, payload),
   },
 
   // Window chrome control surface (#806): renderer pushes Client Behavior
@@ -488,7 +526,7 @@ export interface ElectronAPI {
     rememberMe: boolean;
     apiBase: string;
     accessToken?: string;
-  }) => Promise<void>;
+  }) => Promise<CredentialOwner | { status: 'rejected' }>;
   restoreSession: () => Promise<{
     status: string;
     accessToken?: string;
@@ -499,16 +537,20 @@ export interface ElectronAPI {
       wrappedPrivateKeyBase64: string;
     } | null;
     rememberMe?: boolean;
+    credentialOwner?: CredentialOwner;
+    pendingE2EEUnlock?: boolean;
   }>;
   refreshToken: () => Promise<{
     status: string;
     accessToken?: string;
     sessionId?: string;
+    previousSessionId?: string;
     mfaChallengeToken?: string;
     mfaMethods?: string[];
     mfaRecoveryOnlyMethods?: string[];
   }>;
   clearTokens: () => Promise<void>;
+  clearTokensIfOwner: (owner: CredentialOwner) => Promise<boolean | { status: 'rejected' }>;
   logout: (data?: { accessToken?: string }) => Promise<void>;
   getAuthCapabilities: () => Promise<{ persistAvailable: boolean }>;
 
@@ -524,11 +566,17 @@ export interface ElectronAPI {
     preferencesKeyBase64: string;
     wrappedPrivateKeyBase64: string;
   }) => Promise<boolean | { status: 'rejected' }>;
+  storeE2EEKeysIfOwner: (
+    data: {
+      wrappingKeyBase64: string;
+      preferencesKeyBase64: string;
+      wrappedPrivateKeyBase64: string;
+    },
+    owner: CredentialOwner
+  ) => Promise<boolean | { status: 'rejected' }>;
 
   // Proactive token refresh event (#254)
-  onTokenRefreshed: (
-    callback: (data: { accessToken: string; sessionId?: string }) => void
-  ) => () => void;
+  onTokenRefreshed: (callback: (data: TokenRefreshedData) => void) => () => void;
 
   // Bundled-SPA fallback diagnostic event (#830/#831)
   onConfigFetchFailed: (callback: (data: { reason: string }) => void) => () => void;
@@ -620,10 +668,18 @@ export interface ElectronAPI {
       port: number
     ) => Promise<{ code: string; state: string; appleUserData?: string }>;
     cancelLoopback: (port: number) => void;
-    appleSignIn: () => Promise<AppleSignInResult>;
+    appleSignIn: (apiBase: string) => Promise<AppleSignInResult>;
     appleCancel: () => void;
-    googleSignIn: () => Promise<SSOSignInResult>;
+    googleSignIn: (apiBase: string) => Promise<SSOSignInResult>;
     googleCancel: () => void;
+    completeRegistration: (
+      apiBase: string,
+      payload: SSOCompleteRegistrationPayload
+    ) => Promise<SSOCompletionResult>;
+    completeLink: (
+      apiBase: string,
+      payload: SSOCompleteLinkPayload
+    ) => Promise<SSOCompletionResult>;
   };
 
   // Window chrome control surface (#806)

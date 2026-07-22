@@ -19,6 +19,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -58,10 +59,9 @@ type HandlerDeps struct {
 // but a test-stubbing convenience; the concrete binding lives in
 // internal/auth/oauth_adapter.go.
 type AuthAdapter interface {
-	// IssueAccessAndRefresh mints an access token and a refresh-token cookie
-	// header value for the given userID. The cookie is returned as a Set-Cookie
-	// header value so the caller can attach it directly via c.Header.
-	IssueAccessAndRefresh(ctx context.Context, userID string) (accessToken string, refreshCookie string, err error)
+	// IssueAccessAndRefresh mints the access token, refresh token, and refresh-row
+	// session ID for the given userID. The caller owns the response cookie/body.
+	IssueAccessAndRefresh(ctx context.Context, userID string) (accessToken, refreshToken, sessionID string, err error)
 	// IssueMFAChallenge mints a short-lived MFA challenge token for users with
 	// MFA enabled. Returns:
 	//   - challengeToken: short-lived JWT the renderer presents to the modal
@@ -724,12 +724,18 @@ func (h *Handler) respondExistingSSO(c *gin.Context, info *UserInfo) {
 		}
 		if !mfaEnabled {
 			// Same trust posture as the trustSSO branch below — fall through.
-			access, refresh, err := h.deps.AuthHandler.IssueAccessAndRefresh(ctx, userID)
+			access, refresh, sessionID, err := h.deps.AuthHandler.IssueAccessAndRefresh(ctx, userID)
 			if handleSSOIssueError(c, err) {
 				return
 			}
 			auth.SetRefreshCookie(c, refresh, 60*60*24*30)
-			c.JSON(http.StatusOK, gin.H{"access_token": access})
+			c.Header(middleware.SessionIDHeader, sessionID)
+			c.JSON(http.StatusOK, gin.H{
+				"access_token":  access,
+				"refresh_token": refresh,
+				"session_id":    sessionID,
+				"remember_me":   true,
+			})
 			return
 		}
 		resp := gin.H{
@@ -746,7 +752,7 @@ func (h *Handler) respondExistingSSO(c *gin.Context, info *UserInfo) {
 		return
 	}
 
-	access, refresh, err := h.deps.AuthHandler.IssueAccessAndRefresh(ctx, userID)
+	access, refresh, sessionID, err := h.deps.AuthHandler.IssueAccessAndRefresh(ctx, userID)
 	if handleSSOIssueError(c, err) {
 		return
 	}
@@ -756,7 +762,13 @@ func (h *Handler) respondExistingSSO(c *gin.Context, info *UserInfo) {
 	// with /auth/login and /auth/refresh — the SSO sign-in path is just
 	// another way to mint a session and must not diverge.
 	auth.SetRefreshCookie(c, refresh, 60*60*24*30)
-	c.JSON(http.StatusOK, gin.H{"access_token": access})
+	c.Header(middleware.SessionIDHeader, sessionID)
+	c.JSON(http.StatusOK, gin.H{
+		"access_token":  access,
+		"refresh_token": refresh,
+		"session_id":    sessionID,
+		"remember_me":   true,
+	})
 }
 
 // respondAccountLink offers the user a chance to prove ownership of the
@@ -958,7 +970,7 @@ func (h *Handler) CompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	access, refresh, err := h.deps.AuthHandler.IssueAccessAndRefresh(ctx, userID)
+	access, refresh, sessionID, err := h.deps.AuthHandler.IssueAccessAndRefresh(ctx, userID)
 	if handleSSOIssueError(c, err) {
 		return
 	}
@@ -967,7 +979,13 @@ func (h *Handler) CompleteRegistration(c *gin.Context) {
 	// Routed through auth.SetRefreshCookie so cookie attributes stay aligned
 	// with /auth/login and /auth/refresh.
 	auth.SetRefreshCookie(c, refresh, 60*60*24*30)
-	c.JSON(http.StatusCreated, gin.H{"access_token": access})
+	c.Header(middleware.SessionIDHeader, sessionID)
+	c.JSON(http.StatusCreated, gin.H{
+		"access_token":  access,
+		"refresh_token": refresh,
+		"session_id":    sessionID,
+		"remember_me":   true,
+	})
 }
 
 // httpStatusForCreateUserError maps the stable errCode strings returned by
@@ -1072,7 +1090,7 @@ func (h *Handler) CompleteLink(c *gin.Context) {
 		return
 	}
 
-	access, refresh, err := h.deps.AuthHandler.IssueAccessAndRefresh(ctx, info.TargetUserID)
+	access, refresh, sessionID, err := h.deps.AuthHandler.IssueAccessAndRefresh(ctx, info.TargetUserID)
 	if handleSSOIssueError(c, err) {
 		return
 	}
@@ -1080,5 +1098,11 @@ func (h *Handler) CompleteLink(c *gin.Context) {
 	// CompleteRegistration. auth.SetRefreshCookie keeps cookie attributes
 	// aligned with /auth/login and /auth/refresh.
 	auth.SetRefreshCookie(c, refresh, 60*60*24*30)
-	c.JSON(http.StatusOK, gin.H{"access_token": access})
+	c.Header(middleware.SessionIDHeader, sessionID)
+	c.JSON(http.StatusOK, gin.H{
+		"access_token":  access,
+		"refresh_token": refresh,
+		"session_id":    sessionID,
+		"remember_me":   true,
+	})
 }

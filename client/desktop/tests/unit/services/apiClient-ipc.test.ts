@@ -5,7 +5,11 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 // We use vi.resetModules() + dynamic imports to get a fresh module graph
 // where apiClient sees our mock during its initialization.
 
-type TokenRefreshedCallback = (data: { accessToken: string; sessionId?: string }) => void;
+type TokenRefreshedCallback = (data: {
+  accessToken: string;
+  sessionId?: string;
+  previousSessionId?: string;
+}) => void;
 let capturedCallback: TokenRefreshedCallback | null = null;
 const mockUnsubscribe = vi.fn();
 
@@ -45,7 +49,7 @@ describe('apiClient — onTokenRefreshed IPC (#254)', () => {
   });
 
   it('updates authStore.accessToken when main process pushes a refreshed token', () => {
-    expect(useAuthStore.getState().accessToken).toBeNull();
+    useAuthStore.getState().beginAuthLifecycle('old-token', null);
 
     capturedCallback!({ accessToken: 'proactive-token-abc' });
 
@@ -53,20 +57,47 @@ describe('apiClient — onTokenRefreshed IPC (#254)', () => {
   });
 
   it('updates authStore.sessionId when provided', () => {
-    expect(useAuthStore.getState().sessionId).toBeNull();
+    const generation = useAuthStore.getState().beginAuthLifecycle('old-token', 'session-123');
 
-    capturedCallback!({ accessToken: 'token-xyz', sessionId: 'session-456' });
+    capturedCallback!({
+      accessToken: 'token-xyz',
+      sessionId: 'session-456',
+      previousSessionId: 'session-123',
+    });
 
     expect(useAuthStore.getState().accessToken).toBe('token-xyz');
     expect(useAuthStore.getState().sessionId).toBe('session-456');
+    expect(useAuthStore.getState().authGeneration).toBe(generation);
   });
 
   it('does not update sessionId when omitted', () => {
-    useAuthStore.getState().setSessionId('existing-session');
+    useAuthStore.getState().beginAuthLifecycle('old-token', 'existing-session');
 
     capturedCallback!({ accessToken: 'token-no-session' });
 
     expect(useAuthStore.getState().accessToken).toBe('token-no-session');
     expect(useAuthStore.getState().sessionId).toBe('existing-session');
+  });
+
+  it('rejects an arbitrary replacement session without matching lineage', () => {
+    const generation = useAuthStore.getState().beginAuthLifecycle('old-token', 'session-123');
+
+    capturedCallback!({
+      accessToken: 'attacker-token',
+      sessionId: 'unrelated-session',
+      previousSessionId: 'different-session',
+    });
+
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'old-token',
+      sessionId: 'session-123',
+      authGeneration: generation,
+    });
+  });
+
+  it('does not create auth from a proactive event after logout', () => {
+    capturedCallback!({ accessToken: 'late-token' });
+
+    expect(useAuthStore.getState().accessToken).toBeNull();
   });
 });

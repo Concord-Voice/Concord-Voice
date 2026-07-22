@@ -3,10 +3,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { API_BASE, WS_BASE } from '@/renderer/config';
 import {
   apiUrl,
+  captureRuntimeServerSelection,
   getApiBase,
   getWsBase,
   mediaUrl,
   resetRuntimeServerBase,
+  runtimeServerSelectionIsCurrent,
   setRuntimeServerBase,
 } from '@/renderer/services/runtimeServerBase';
 
@@ -57,5 +59,33 @@ describe('runtimeServerBase', () => {
 
     expect(getApiBase()).toBe(API_BASE);
     expect(getWsBase()).toBe(WS_BASE);
+  });
+
+  it('captures the current runtime server selection', () => {
+    setRuntimeServerBase('https://homelab.lan');
+
+    const selection = captureRuntimeServerSelection();
+
+    expect(selection.apiBase).toBe('https://homelab.lan');
+    expect(runtimeServerSelectionIsCurrent(selection)).toBe(true);
+  });
+
+  it('invalidates snapshots on same-base, ABA, and reset selections', () => {
+    setRuntimeServerBase('https://origin-a.example');
+    const original = captureRuntimeServerSelection();
+
+    setRuntimeServerBase('https://origin-a.example');
+    const repeated = captureRuntimeServerSelection();
+    expect(repeated.epoch).toBe(original.epoch + 1);
+    expect(runtimeServerSelectionIsCurrent(original)).toBe(false);
+
+    setRuntimeServerBase('https://origin-b.example');
+    setRuntimeServerBase('https://origin-a.example');
+    expect(runtimeServerSelectionIsCurrent(repeated)).toBe(false);
+
+    const beforeReset = captureRuntimeServerSelection();
+    resetRuntimeServerBase();
+    expect(captureRuntimeServerSelection().epoch).toBe(beforeReset.epoch + 1);
+    expect(runtimeServerSelectionIsCurrent(beforeReset)).toBe(false);
   });
 });

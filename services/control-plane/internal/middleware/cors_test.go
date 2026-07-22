@@ -45,6 +45,10 @@ func TestCORSAllowedOriginSetsHeaders(t *testing.T) {
 	assert.Equal(t, "true", w.Header().Get("Access-Control-Allow-Credentials"))
 	assert.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), "X-Machine-Id")
 	assert.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), "X-Attestation-Token")
+	assert.Equal(t,
+		middleware.SessionIssuedHeader+", "+middleware.SessionIDHeader,
+		w.Header().Get("Access-Control-Expose-Headers"),
+	)
 }
 
 func TestCORSEmptyOriginNoCORSHeaders(t *testing.T) {

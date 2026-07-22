@@ -343,24 +343,26 @@ func NewHub(db *sql.DB, redisClient *redis.Client, opsCounters ...OpsCounter) *H
 	return hub
 }
 
-// ConnectionCount returns the current number of registered WebSocket clients.
-func (h *Hub) ConnectionCount() int {
+// ConnectionCounts returns registered clients and distinct users from one snapshot.
+func (h *Hub) ConnectionCounts() (connections, users int) {
 	if h == nil {
-		return 0
+		return 0, 0
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return len(h.clients)
+	return len(h.clients), len(h.userClients)
+}
+
+// ConnectionCount returns the current number of registered WebSocket clients.
+func (h *Hub) ConnectionCount() int {
+	connections, _ := h.ConnectionCounts()
+	return connections
 }
 
 // ConnectedUserCount returns the number of distinct users with a local client.
 func (h *Hub) ConnectedUserCount() int {
-	if h == nil {
-		return 0
-	}
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return len(h.userClients)
+	_, users := h.ConnectionCounts()
+	return users
 }
 
 // SetActivityObserver installs the trusted-side distinct-user activity sink.

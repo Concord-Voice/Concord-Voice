@@ -76,7 +76,14 @@ function makeDeps(lo: FakeLoopback, o: RigOverrides = {}) {
       );
     }
     if (u.endsWith('/api/v1/auth/sso/apple/session')) {
-      return jsonResponse(o.sessionStatus ?? 200, o.sessionBody ?? { access_token: 'at-1' });
+      return jsonResponse(
+        o.sessionStatus ?? 200,
+        o.sessionBody ?? {
+          access_token: 'at-1',
+          refresh_token: 'rt-1',
+          session_id: 'session-1',
+        }
+      );
     }
     throw new Error(`unexpected control-plane url: ${u}`);
   });
@@ -116,7 +123,12 @@ describe('runAppleSignIn — happy path', () => {
     await vi.waitFor(() => expect(deps.openExternal).toHaveBeenCalledWith(AUTH_URL));
     deliverCallback(lo, { appleUserData: '{"name":{"firstName":"Jane"}}' });
 
-    await expect(p).resolves.toEqual({ kind: 'tokens', accessToken: 'at-1' });
+    await expect(p).resolves.toEqual({
+      kind: 'tokens',
+      accessToken: 'at-1',
+      refreshToken: 'rt-1',
+      sessionId: 'session-1',
+    });
 
     // initiate carried the loopback redirect AND a shaped S256 challenge
     const initiateUrl = String(controlPlaneFetch.mock.calls[0][0]);
@@ -264,7 +276,12 @@ describe('runAppleSignIn — failure taxonomy', () => {
     const p = runAppleSignIn(deps);
     await vi.waitFor(() => expect(deps.openExternal).toHaveBeenCalled());
     deliverCallback(lo);
-    await expect(p).resolves.toEqual({ kind: 'tokens', accessToken: 'at-1' });
+    await expect(p).resolves.toEqual({
+      kind: 'tokens',
+      accessToken: 'at-1',
+      refreshToken: 'rt-1',
+      sessionId: 'session-1',
+    });
     expect(deps.verifyIdToken).toHaveBeenCalledTimes(2);
   });
 
@@ -326,7 +343,12 @@ describe('runAppleSignIn — lifecycle', () => {
     await expect(p1).resolves.toEqual({ kind: 'error', code: 'sso_cancelled' });
     await vi.waitFor(() => expect(deps2.openExternal).toHaveBeenCalled());
     deliverCallback(lo2);
-    await expect(p2).resolves.toEqual({ kind: 'tokens', accessToken: 'at-1' });
+    await expect(p2).resolves.toEqual({
+      kind: 'tokens',
+      accessToken: 'at-1',
+      refreshToken: 'rt-1',
+      sessionId: 'session-1',
+    });
   });
 
   it('rejects a non-https auth_url without opening the browser', async () => {
@@ -347,8 +369,20 @@ describe('runAppleSignIn — lifecycle', () => {
 });
 
 describe('mapSessionResponse', () => {
-  it('maps access_token → tokens', () => {
-    expect(mapSessionResponse({ access_token: 'a' })).toEqual({ kind: 'tokens', accessToken: 'a' });
+  it('maps the complete session credential tuple → main-only tokens', () => {
+    expect(mapSessionResponse({ access_token: 'a', refresh_token: 'r', session_id: 's' })).toEqual({
+      kind: 'tokens',
+      accessToken: 'a',
+      refreshToken: 'r',
+      sessionId: 's',
+    });
+  });
+
+  it('rejects an incomplete credential tuple', () => {
+    expect(mapSessionResponse({ access_token: 'a' })).toEqual({
+      kind: 'error',
+      code: 'sso_session_rejected',
+    });
   });
 
   it('maps mfa_challenge_token → mfa_challenge with methods passthrough', () => {

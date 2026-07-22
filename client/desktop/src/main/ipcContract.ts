@@ -87,8 +87,29 @@
  *        validates a user-entered origin in the main process and probes
  *        /api/v1/client/config plus /api/v1/server/capabilities before the
  *        renderer may route auth storage to that origin.
+ * - v18: Refresh ownership + session lineage (#2374): auth:refreshToken results
+ *        and the auth:token-refreshed main-to-renderer event expose
+ *        previousSessionId. auth:storeRefreshToken returns an opaque
+ *        CredentialOwner; auth:clearTokensIfOwner and
+ *        auth:storeE2EEKeysIfOwner provide main-process CAS operations for
+ *        aborting stale login continuations without touching a successor.
+ *        sso:appleSignIn and sso:googleSignIn accept an approved API origin;
+ *        main stores the returned refresh credential and exposes only the
+ *        access token, session ID, and opaque CredentialOwner to renderer.
+ *        sso:completeRegistration and sso:completeLink keep the same custody
+ *        boundary for the final first-user/link exchanges. Session restore
+ *        exposes the owner-scoped pending-E2EE-unlock state so reload cannot
+ *        enter the authenticated app before matching keys are available.
  */
-export const IPC_CONTRACT_VERSION = 17;
+export const IPC_CONTRACT_VERSION = 18;
+
+/**
+ * Opaque main-process identity for one stored credential lifecycle.
+ *
+ * Renderers may retain and return this value for conditional operations, but
+ * must not derive ordering or user identity from it.
+ */
+export type CredentialOwner = number;
 
 /**
  * Result shape returned by performRefresh() in the main process and
@@ -99,6 +120,7 @@ export interface RefreshResult {
   status: string;
   accessToken?: string;
   sessionId?: string;
+  previousSessionId?: string;
   mfaChallengeToken?: string;
   mfaMethods?: string[];
   mfaRecoveryOnlyMethods?: string[];

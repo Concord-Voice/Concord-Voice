@@ -6,10 +6,11 @@ describe('e2eeStore', () => {
     resetAllStores();
   });
 
-  it('starts with both flags false', () => {
+  it('starts with both flags false and no SSO credential owner', () => {
     const state = useE2EEStore.getState();
     expect(state.ready).toBe(false);
     expect(state.needsSSOUnlock).toBe(false);
+    expect(state.ssoCredentialOwner).toBeNull();
   });
 
   it('setReady toggles the ready flag without affecting needsSSOUnlock', () => {
@@ -26,14 +27,27 @@ describe('e2eeStore', () => {
     expect(useE2EEStore.getState().needsSSOUnlock).toBe(true);
   });
 
-  it('reset clears both flags', () => {
+  it('carries the SSO credential owner only while eager unlock is pending', () => {
+    useE2EEStore.getState().setNeedsSSOUnlock(true, 41);
+
+    expect(useE2EEStore.getState().needsSSOUnlock).toBe(true);
+    expect(useE2EEStore.getState().ssoCredentialOwner).toBe(41);
+
+    useE2EEStore.getState().setNeedsSSOUnlock(false);
+
+    expect(useE2EEStore.getState().needsSSOUnlock).toBe(false);
+    expect(useE2EEStore.getState().ssoCredentialOwner).toBeNull();
+  });
+
+  it('reset clears both flags and the pending SSO credential owner', () => {
     useE2EEStore.getState().setReady(true);
-    useE2EEStore.getState().setNeedsSSOUnlock(true);
+    useE2EEStore.getState().setNeedsSSOUnlock(true, 73);
 
     useE2EEStore.getState().reset();
 
     const state = useE2EEStore.getState();
     expect(state.ready).toBe(false);
     expect(state.needsSSOUnlock).toBe(false);
+    expect(state.ssoCredentialOwner).toBeNull();
   });
 });

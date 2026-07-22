@@ -82,6 +82,16 @@ export interface E2EESessionKeys {
   wrappedPrivateKeyBase64: string;
 }
 
+/**
+ * Opaque proof of the exact initialize() commit currently held by the service.
+ * The attempt number distinguishes that commit from a newer initialization
+ * that has started but has not published its keys yet.
+ */
+export interface E2EEInitializationReceipt {
+  readonly sessionKeys: E2EESessionKeys;
+  readonly attempt: number;
+}
+
 /** Prevent an async key derivation owned by an old account from committing globally. */
 export interface E2EEInitializationGuard {
   signal: AbortSignal;
@@ -128,13 +138,11 @@ class E2EEService {
   // committed the new password — undecryptable after relogin; Codex P1, PR #2337).
   private keyClearGeneration: number = 0;
   // Monotonic initialize()/initializeFromStoredKeys() attempt counter
-  // (Codex P1, PR #2337). A token-only session invalidation
-  // (handleRefreshFailure's `phase !== 'stable'` path) clears the access
-  // token WITHOUT bumping keyClearGeneration, so a rapid successor login can
-  // start a new initialization while a stale one's Argon2id is still
-  // pending — and last-writer-wins would let the STALE keyset overwrite the
-  // successor's committed keys (cross-session key confusion). The commit
-  // gate admits only the NEWEST attempt; a superseded attempt throws
+  // (Codex P1, PR #2337). Concurrent auth flows can initialize under the same
+  // keyClearGeneration: a rapid successor may start while an earlier Argon2id
+  // derivation is still pending, and last-writer-wins would let the STALE
+  // keyset overwrite the successor's committed keys (cross-session key
+  // confusion). The commit gate admits only the NEWEST attempt; a superseded attempt throws
   // E2EEInitTeardownError (its session is gone from the flow's perspective —
   // same abort contract as destruction). Token-lifecycle ownership itself
   // stays at the auth surfaces (their pre-admit gates), keeping this service
@@ -153,6 +161,7 @@ class E2EEService {
 
   /** Cached exported keys for safeStorage persistence (set during initialize) */
   private sessionKeys: E2EESessionKeys | null = null;
+  private sessionKeysInitAttempt: number | null = null;
 
   /**
    * Initialize the E2EE service after login/registration.
@@ -253,8 +262,8 @@ class E2EEService {
    * - Supersession (a NEWER initialize()/initializeFromStoredKeys() attempt
    *   started since this one) → ALSO THROWS E2EEInitTeardownError: a stale
    *   pending attempt must never commit over — or after — the newest one
-   *   (last-writer-wins would let a token-only-invalidated login's keyset
-   *   overwrite a successor's; Codex P1, PR #2337).
+   *   (last-writer-wins would let a superseded auth flow's keyset overwrite
+   *   a successor's; Codex P1, PR #2337).
    * The fresh-login callers pass no guard, so the generation arm is what
    * fences a 401 -> nuclearReset landing mid-Argon2id. A same-session
    * recoveryReset() (continuation fence only, keys preserved) intentionally
@@ -344,6 +353,7 @@ class E2EEService {
     this.preferencesKey = preferencesKey;
     this.wrappedPrivateKey = wrappedPrivateKeyBase64;
     this.sessionKeys = sessionKeys;
+    this.sessionKeysInitAttempt = attempt;
 
     // Mark the renderer-side E2EE store ready so the post-auth gate
     // (#270 Task 21b) can transition past SSOEagerUnlock. Source of truth
@@ -396,6 +406,7 @@ class E2EEService {
     this.preferencesKey = preferencesKey;
     this.wrappedPrivateKey = keys.wrappedPrivateKeyBase64;
     this.sessionKeys = keys;
+    this.sessionKeysInitAttempt = attempt;
 
     // Mirror initialize(): mark the renderer-side E2EE store ready so the
     // post-auth gate (#270 Task 21b) can fall through to MainApp. Used on
@@ -411,6 +422,32 @@ class E2EEService {
    */
   getSessionKeys(): E2EESessionKeys | null {
     return this.sessionKeys;
+  }
+
+  /** Capture the exact committed initialization currently held by the singleton. */
+  captureInitializationReceipt(): E2EEInitializationReceipt | null {
+    if (this.sessionKeys === null || this.sessionKeysInitAttempt === null) return null;
+    return { sessionKeys: this.sessionKeys, attempt: this.sessionKeysInitAttempt };
+  }
+
+  /**
+   * Clear only the initialization represented by `receipt`.
+   *
+   * Both checks are required: session-key identity protects a newer committed
+   * account, while initAttemptSequence protects a newer initialization that is
+   * still deriving and would otherwise be aborted by clearKeys().
+   */
+  clearKeysIfInitializationCurrent(receipt: E2EEInitializationReceipt | null): boolean {
+    if (
+      receipt === null ||
+      this.sessionKeys !== receipt.sessionKeys ||
+      this.sessionKeysInitAttempt !== receipt.attempt ||
+      this.initAttemptSequence !== receipt.attempt
+    ) {
+      return false;
+    }
+    this.clearKeys();
+    return true;
   }
 
   /**
@@ -1262,6 +1299,7 @@ class E2EEService {
     this.preferencesKey = null;
     this.wrappedPrivateKey = '';
     this.sessionKeys = null;
+    this.sessionKeysInitAttempt = null;
     this.channelKeyCache.clear();
     this.versionedKeyCache.clear();
     this.channelKeyGenerations.clear();

@@ -31,6 +31,7 @@ COPY . .
 # Build the application and tools
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main ./cmd/server
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o migrate-media ./cmd/migrate-media
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mfa-rekey ./cmd/mfa-rekey
 
 # Final stage
 FROM alpine:3.21
@@ -48,6 +49,7 @@ WORKDIR /home/appuser
 # Copy binaries from builder
 COPY --from=builder /app/main .
 COPY --from=builder /app/migrate-media .
+COPY --from=builder /app/mfa-rekey .
 
 # Copy migrations
 COPY --from=builder /app/migrations ./migrations

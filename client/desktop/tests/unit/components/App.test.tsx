@@ -88,11 +88,13 @@ vi.mock('@/renderer/services/desktopNotificationService', () => ({
 
 const mockMarkRendererCrashed = vi.fn().mockResolvedValue(undefined);
 const mockSoftRestart = vi.fn().mockResolvedValue(undefined);
+const mockGracefulReset = vi.fn();
 vi.mock('@/renderer/services/recoveryService', () => ({
   markRendererCrashed: (...args: unknown[]) => mockMarkRendererCrashed(...args),
 }));
 vi.mock('@/renderer/services/resetService', () => ({
   softRestart: (...args: unknown[]) => mockSoftRestart(...args),
+  gracefulReset: (...args: unknown[]) => mockGracefulReset(...args),
 }));
 
 const mockInitializeFromStoredKeys = vi.fn().mockResolvedValue(undefined);
@@ -141,6 +143,7 @@ describe('App', () => {
     __resetRestoreSessionCalledForTesting();
     Object.assign(globalThis.electron ?? {}, {
       restoreSession: undefined,
+      clearTokens: undefined,
       onInviteReceived: undefined,
       inviteRendererReady: undefined,
       getDisplayInfo: undefined,
@@ -277,6 +280,8 @@ describe('App', () => {
       status: 'restored',
       accessToken: 'restored-token',
       rememberMe: false,
+      credentialOwner: 41,
+      pendingE2EEUnlock: true,
     });
     useAuthStore.getState().setRememberMe(true);
     Object.assign(globalThis.electron ?? {}, { restoreSession });
@@ -289,6 +294,24 @@ describe('App', () => {
     expect(useAuthStore.getState().rememberMe).toBe(false);
   });
 
+  it('fails closed and clears a restored credential that has no custody owner', async () => {
+    const restoreSession = vi.fn().mockResolvedValue({
+      status: 'restored',
+      accessToken: 'ownerless-token',
+      rememberMe: true,
+    });
+    const clearTokens = vi.fn().mockResolvedValue(undefined);
+    Object.assign(globalThis.electron ?? {}, { restoreSession, clearTokens });
+
+    render(<App />);
+
+    await waitFor(() => expect(clearTokens).toHaveBeenCalledTimes(1));
+    expect(mockGracefulReset).toHaveBeenCalledTimes(1);
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(mockInitializeFromStoredKeys).not.toHaveBeenCalled();
+    expect(mockHydratePostLogin).not.toHaveBeenCalled();
+  });
+
   it('inits E2EE and hydrates post-login state on a session-only soft reload (#1870)', async () => {
     const e2eeKeys = {
       wrappingKeyBase64: 'wk',
@@ -299,6 +322,8 @@ describe('App', () => {
       status: 'restored',
       accessToken: 'restored-token',
       rememberMe: false,
+      credentialOwner: 41,
+      pendingE2EEUnlock: false,
       e2eeKeys, // supplied from main-process memory for a session-only user
     });
     Object.assign(globalThis.electron ?? {}, { restoreSession });
@@ -314,12 +339,13 @@ describe('App', () => {
     await waitFor(() => expect(mockHydratePostLogin).toHaveBeenCalledTimes(1));
   });
 
-  it('runs post-login hydration on every successful restore, even without e2ee keys', async () => {
+  it('gates a restored credential with pending E2EE custody before hydration', async () => {
     const restoreSession = vi.fn().mockResolvedValue({
       status: 'restored',
       accessToken: 'restored-token',
       rememberMe: true,
-      // no e2eeKeys on this path
+      credentialOwner: 41,
+      pendingE2EEUnlock: true,
     });
     Object.assign(globalThis.electron ?? {}, { restoreSession });
 
@@ -329,7 +355,11 @@ describe('App', () => {
       expect(useAuthStore.getState().accessToken).toBe('restored-token');
     });
     expect(mockInitializeFromStoredKeys).not.toHaveBeenCalled();
-    await waitFor(() => expect(mockHydratePostLogin).toHaveBeenCalledTimes(1));
+    expect(mockHydratePostLogin).not.toHaveBeenCalled();
+    expect(useE2EEStore.getState()).toMatchObject({
+      needsSSOUnlock: true,
+      ssoCredentialOwner: 41,
+    });
   });
 
   // ── App structure ──
@@ -503,6 +533,17 @@ describe('App', () => {
 
     expect(screen.getByTestId('sso-eager-unlock')).toBeInTheDocument();
     // Main app routes must NOT render until the gate is cleared.
+    expect(screen.queryByTestId('dm-view')).not.toBeInTheDocument();
+  });
+
+  it('does not let a prior account ready flag bypass a fresh SSO unlock', () => {
+    authenticateUser();
+    useE2EEStore.getState().setReady(true);
+    useE2EEStore.getState().setNeedsSSOUnlock(true, 41);
+
+    render(<App />);
+
+    expect(screen.getByTestId('sso-eager-unlock')).toBeInTheDocument();
     expect(screen.queryByTestId('dm-view')).not.toBeInTheDocument();
   });
 

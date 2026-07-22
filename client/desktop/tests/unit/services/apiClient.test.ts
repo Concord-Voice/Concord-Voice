@@ -11,15 +11,8 @@ import {
   setRuntimeServerBase,
 } from '@/renderer/services/runtimeServerBase';
 
-// Mock resetService (dynamically imported by apiClient)
 const mockGracefulReset = vi.fn();
 const mockNuclearReset = vi.fn();
-vi.mock('@/renderer/services/resetService', () => ({
-  gracefulReset: mockGracefulReset,
-  nuclearReset: mockNuclearReset,
-  softRestart: vi.fn(),
-  stopProactiveRefresh: vi.fn(),
-}));
 
 // Mock fetch globally — vi.stubGlobal is hoisted by vitest, so static import works
 const mockFetch = vi.fn();
@@ -33,6 +26,7 @@ import {
   safeJson,
   ensureMachineId,
   revokeAbortedSession,
+  configureRefreshFailureReset,
 } from '@/renderer/services/apiClient';
 
 describe('apiClient', () => {
@@ -40,6 +34,10 @@ describe('apiClient', () => {
     resetAllStores();
     _resetRefreshState();
     vi.clearAllMocks();
+    configureRefreshFailureReset({
+      gracefulReset: mockGracefulReset,
+      nuclearReset: mockNuclearReset,
+    });
     mockFetch.mockReset();
     resetRuntimeServerBase();
     // Reset connection store to stable (default)
@@ -80,6 +78,39 @@ describe('apiClient', () => {
       'https://homelab.lan:8443/api/v1/test',
       expect.objectContaining({ credentials: 'include' })
     );
+  });
+
+  it('does not recover or tear down after an A -> B -> A switch during attestation', async () => {
+    const requestApiBase = 'https://old-origin.example';
+    setRuntimeServerBase(requestApiBase);
+    useAuthStore.getState().setAccessToken('old-token');
+    let resolveAttestation: (token: string | null) => void = () => {
+      throw new Error('Attestation resolver was not initialized.');
+    };
+    const refreshToken = vi.fn().mockResolvedValue({ status: 'error' });
+    globalThis.electron = {
+      refreshToken,
+      attestation: {
+        getToken: vi.fn().mockReturnValue(
+          new Promise<string | null>((resolve) => {
+            resolveAttestation = resolve;
+          })
+        ),
+      },
+    } as any;
+    mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+
+    const pending = apiFetch('/api/v1/users/me');
+    setRuntimeServerBase('https://successor-origin.example');
+    setRuntimeServerBase(requestApiBase);
+    resolveAttestation(null);
+    const response = await pending;
+
+    expect(response.status).toBe(401);
+    expect(mockFetch).toHaveBeenCalledWith(`${requestApiBase}/api/v1/users/me`, expect.any(Object));
+    expect(refreshToken).not.toHaveBeenCalled();
+    expect(mockGracefulReset).not.toHaveBeenCalled();
+    expect(mockNuclearReset).not.toHaveBeenCalled();
   });
 
   it('does not inject Authorization header when no token', async () => {
@@ -194,6 +225,9 @@ describe('apiClient', () => {
 
   describe('refreshAccessToken MFA challenge', () => {
     it('handles MFA challenge → showChallenge → retry refresh', async () => {
+      const generation = useAuthStore
+        .getState()
+        .beginAuthLifecycle('pre-mfa-token', 'sess-before-mfa');
       globalThis.electron = {
         refreshToken: vi
           .fn()
@@ -209,6 +243,7 @@ describe('apiClient', () => {
             status: 'ok',
             accessToken: 'mfa-refreshed-token',
             sessionId: 'sess-123',
+            previousSessionId: 'sess-before-mfa',
           }),
       } as any;
 
@@ -228,12 +263,14 @@ describe('apiClient', () => {
       );
       expect(useAuthStore.getState().accessToken).toBe('mfa-refreshed-token');
       expect(useAuthStore.getState().sessionId).toBe('sess-123');
+      expect(useAuthStore.getState().authGeneration).toBe(generation);
       expect(globalThis.electron!.refreshToken).toHaveBeenCalledTimes(2);
 
       showChallengeSpy.mockRestore();
     });
 
     it('returns null when MFA challenge is declined', async () => {
+      useAuthStore.getState().beginAuthLifecycle('pre-mfa-token', null);
       globalThis.electron = {
         refreshToken: vi.fn().mockResolvedValueOnce({
           status: 'mfa_required',
@@ -256,6 +293,7 @@ describe('apiClient', () => {
     });
 
     it('returns null when MFA retry refresh succeeds without sessionId', async () => {
+      useAuthStore.getState().beginAuthLifecycle('pre-mfa-token', null);
       globalThis.electron = {
         refreshToken: vi
           .fn()
@@ -284,6 +322,7 @@ describe('apiClient', () => {
     });
 
     it('returns null when MFA retry refresh fails', async () => {
+      useAuthStore.getState().beginAuthLifecycle('pre-mfa-token', null);
       globalThis.electron = {
         refreshToken: vi
           .fn()
@@ -308,6 +347,7 @@ describe('apiClient', () => {
     });
 
     it('uses the IPC retry access_token even when the verify body carries a different access_token', async () => {
+      useAuthStore.getState().beginAuthLifecycle('pre-mfa-token', 'sess-before-divergence');
       globalThis.electron = {
         refreshToken: vi
           .fn()
@@ -320,6 +360,7 @@ describe('apiClient', () => {
             status: 'ok',
             accessToken: 'ipc-token-authoritative',
             sessionId: 'sess-ipc',
+            previousSessionId: 'sess-before-divergence',
           }),
       } as any;
 
@@ -351,6 +392,7 @@ describe('apiClient', () => {
     });
 
     it('does NOT emit a divergence warn when the body has no access_token (suspicious_refresh shape)', async () => {
+      useAuthStore.getState().beginAuthLifecycle('pre-mfa-token', 'sess-before-ipc-only');
       globalThis.electron = {
         refreshToken: vi
           .fn()
@@ -363,6 +405,7 @@ describe('apiClient', () => {
             status: 'ok',
             accessToken: 'ipc-token-only',
             sessionId: 'sess-ipc-only',
+            previousSessionId: 'sess-before-ipc-only',
           }),
       } as any;
 
@@ -393,11 +436,13 @@ describe('apiClient', () => {
   });
 
   it('refreshAccessToken stores sessionId when refresh succeeds with one', async () => {
+    const generation = useAuthStore.getState().beginAuthLifecycle('old-token', 'session-111');
     globalThis.electron = {
       refreshToken: vi.fn().mockResolvedValue({
         status: 'ok',
         accessToken: 'token-with-session',
         sessionId: 'session-999',
+        previousSessionId: 'session-111',
       }),
     } as any;
 
@@ -405,9 +450,29 @@ describe('apiClient', () => {
 
     expect(token).toBe('token-with-session');
     expect(useAuthStore.getState().sessionId).toBe('session-999');
+    expect(useAuthStore.getState().authGeneration).toBe(generation);
+  });
+
+  it('rejects S1 -> S2 refresh rotation without matching previousSessionId', async () => {
+    const generation = useAuthStore.getState().beginAuthLifecycle('old-token', 'session-111');
+    globalThis.electron = {
+      refreshToken: vi.fn().mockResolvedValue({
+        status: 'ok',
+        accessToken: 'unproven-token',
+        sessionId: 'unproven-session',
+      }),
+    } as any;
+
+    await expect(refreshAccessToken()).resolves.toBeNull();
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'old-token',
+      sessionId: 'session-111',
+      authGeneration: generation,
+    });
   });
 
   it('refreshAccessToken succeeds without sessionId', async () => {
+    useAuthStore.getState().beginAuthLifecycle('old-token', null);
     globalThis.electron = {
       refreshToken: vi.fn().mockResolvedValue({
         status: 'ok',
@@ -454,7 +519,6 @@ describe('apiClient', () => {
       await apiFetch('/api/v1/test');
 
       // Second 401 immediately — should be rate-limited (within 10s window)
-      useAuthStore.getState().setAccessToken('old-token-2');
       mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
 
       const response = await apiFetch('/api/v1/test2');
@@ -787,6 +851,7 @@ describe('apiClient', () => {
     });
 
     it('deduplicates concurrent refreshAccessToken calls', async () => {
+      useAuthStore.getState().beginAuthLifecycle('old-token', null);
       let resolveRefresh!: (value: any) => void;
       globalThis.electron = {
         refreshToken: vi.fn().mockReturnValue(
@@ -841,6 +906,26 @@ describe('apiClient', () => {
       expect(getMachineId).toHaveBeenNthCalledWith(2, 'https://homelab.lan:8443');
     });
 
+    it('honors an explicit machine-ID base across a runtime server switch', async () => {
+      const requestApiBase = 'https://old-origin.example';
+      let resolveMachineId: (machineId: string) => void = () => {
+        throw new Error('Machine ID resolver was not initialized.');
+      };
+      const getMachineId = vi.fn().mockReturnValue(
+        new Promise<string>((resolve) => {
+          resolveMachineId = resolve;
+        })
+      );
+      globalThis.electron = { getMachineId } as any;
+
+      const pending = ensureMachineId(requestApiBase);
+      setRuntimeServerBase('https://successor-origin.example');
+      resolveMachineId('old-origin-machine');
+
+      await expect(pending).resolves.toBe('old-origin-machine');
+      expect(getMachineId).toHaveBeenCalledWith(requestApiBase);
+    });
+
     it('includes X-Machine-Id on retry after 401 refresh', async () => {
       // Ensure machine ID is cached for this test (self-contained)
       globalThis.electron = {
@@ -885,11 +970,11 @@ describe('apiClient', () => {
       expect(mockNuclearReset).not.toHaveBeenCalled();
     });
 
-    it('only clears accessToken when connection phase is not stable', async () => {
+    it('runs gracefulReset when authoritative refresh fails during recovery', async () => {
       useAuthStore.getState().setAccessToken('old-token');
+      useAuthStore.getState().setSessionId('session-a');
       useAuthStore.getState().setRememberMe(true);
-      // Simulate recovery in progress
-      useConnectionStore.setState({ phase: 'reconnecting' as any });
+      useConnectionStore.setState({ phase: 'recovery_a' });
 
       globalThis.electron = {
         refreshToken: vi.fn().mockResolvedValue({ status: 'error' }),
@@ -900,10 +985,12 @@ describe('apiClient', () => {
       const response = await apiFetch('/api/v1/test');
 
       expect(response.status).toBe(401);
-      expect(useAuthStore.getState().accessToken).toBeNull();
-      // Should NOT call gracefulReset or nuclearReset during recovery
-      expect(mockGracefulReset).not.toHaveBeenCalled();
+      // An authoritative failure ends this lifecycle even while transport
+      // recovery is active; gracefulReset clears renderer E2EE custody and
+      // decrypted account state before auth identity is discarded.
+      expect(mockGracefulReset).toHaveBeenCalledOnce();
       expect(mockNuclearReset).not.toHaveBeenCalled();
+      expect(useAuthStore.getState()).toMatchObject({ accessToken: null, sessionId: null });
     });
   });
 
@@ -965,79 +1052,56 @@ describe('apiClient', () => {
   });
 
   describe('revokeAbortedSession (#2337)', () => {
-    it('POSTs /auth/logout to revoke a session whose flow aborted on teardown', async () => {
-      useAuthStore.setState({ accessToken: null, sessionId: null });
+    it('revokes a password session with its explicit refresh token and no ambient credentials', async () => {
       mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
 
-      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
+      await revokeAbortedSession({
+        accessToken: 'aborted-access',
+        refreshToken: 'aborted-refresh',
+        sessionId: 'aborted-session',
+      });
 
       expect(mockFetch).toHaveBeenCalledTimes(1);
       const [url, init] = mockFetch.mock.calls[0];
       expect(String(url)).toContain('/api/v1/auth/logout');
       expect(init.method).toBe('POST');
+      expect(init.credentials).toBe('omit');
+      const headers = new Headers(init.headers);
+      expect(headers.get('Authorization')).toBe('Bearer aborted-access');
+      expect(headers.get('X-Refresh-Token')).toBe('aborted-refresh');
+      expect(headers.get('X-Session-ID')).toBeNull();
     });
 
-    it('does NOT tear down the session on a 401 (non-authoritative)', async () => {
-      // A 401 on the revoke call must not recursively trigger nuclearReset —
-      // the session is already being torn down. authoritative:false suppresses
-      // the teardown; the raw 401 is returned/swallowed.
-      useAuthStore.setState({ accessToken: null, sessionId: null });
-      mockFetch.mockResolvedValue(new Response('unauthorized', { status: 401 }));
-
-      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
-
-      expect(mockNuclearReset).not.toHaveBeenCalled();
-      expect(mockGracefulReset).not.toHaveBeenCalled();
-    });
-
-    it('swallows a network failure (best-effort)', async () => {
-      mockFetch.mockRejectedValueOnce(new Error('network down'));
-      await expect(
-        revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' })
-      ).resolves.toBeUndefined();
-    });
-
-    it('still revokes when the session was torn down (cleared, no re-login)', async () => {
-      // Common abort case: teardown cleared the store. The aborted cookie is the
-      // only one in the jar → revoke it.
-      useAuthStore.setState({ accessToken: null, sessionId: null });
+    it('revokes a cookie-only SSO session by bearer-owned session ID', async () => {
       mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
 
-      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
+      await revokeAbortedSession({ accessToken: 'sso-access', sessionId: 'sso-session' });
+
+      const [, init] = mockFetch.mock.calls[0];
+      expect(init.credentials).toBe('omit');
+      const headers = new Headers(init.headers);
+      expect(headers.get('Authorization')).toBe('Bearer sso-access');
+      expect(headers.get('X-Session-ID')).toBe('sso-session');
+      expect(headers.get('X-Refresh-Token')).toBeNull();
+    });
+
+    it('uses the aborted explicit credential even when a successor owns the auth store', async () => {
+      useAuthStore.getState().beginAuthLifecycle('successor-access', 'successor-session');
+      mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
+      await revokeAbortedSession({
+        accessToken: 'aborted-access',
+        refreshToken: 'aborted-refresh',
+        sessionId: 'aborted-session',
+      });
 
       expect(mockFetch).toHaveBeenCalledTimes(1);
-      expect(String(mockFetch.mock.calls[0][0])).toContain('/api/v1/auth/logout');
-    });
-
-    it('DECLINES to revoke when a newer live session now owns the cookie (#2337 wrong-session)', async () => {
-      // A second login succeeded while the aborted flow was unwinding; its cookie
-      // is current. Revoking would log the good session out — decline.
-      useAuthStore.setState({ accessToken: 'B', sessionId: 'S2' });
-
-      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
-
-      expect(mockFetch).not.toHaveBeenCalled();
-    });
-
-    it('DECLINES for a token-only newer SSO session — mixed session-ID shape (Codex P1, #2337)', async () => {
-      // A successor SSO login installs a token with NO session ID (useSSOFlow),
-      // so the current lifecycle is {accessToken: B, sessionId: null}. Against
-      // an aborted {A, S1} this must still read as "a different live session
-      // owns the cookie" and decline — pre-fix, both ownership clauses missed
-      // this mixed shape and the successful SSO session was logged out.
-      useAuthStore.setState({ accessToken: 'B', sessionId: null });
-
-      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
-
-      expect(mockFetch).not.toHaveBeenCalled();
+      const [, init] = mockFetch.mock.calls[0];
+      expect(init.credentials).toBe('omit');
+      expect(new Headers(init.headers).get('X-Refresh-Token')).toBe('aborted-refresh');
     });
 
     it('revokes against the ABORTED origin when the runtime server switched (Codex P1, #2337)', async () => {
-      // Self-hosted switch: cookies are per-origin, so the current origin's
-      // session cannot own the aborted origin's cookie — the same-jar decline
-      // must not apply, and the POST must target the aborted origin with the
-      // aborted session's own bearer.
-      useAuthStore.setState({ accessToken: 'B', sessionId: 'S2' }); // live session on the NEW origin
       mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
 
       await revokeAbortedSession({
@@ -1049,23 +1113,47 @@ describe('apiClient', () => {
       expect(mockFetch).toHaveBeenCalledTimes(1);
       const [url, init] = mockFetch.mock.calls[0];
       expect(String(url)).toBe('https://aborted.example/api/v1/auth/logout');
-      expect(init.credentials).toBe('include');
+      expect(init.credentials).toBe('omit');
       expect(new Headers(init.headers).get('Authorization')).toBe('Bearer A');
     });
 
-    it("carries the aborted session's own bearer so the access JWT is blacklisted (Codex P1, #2337)", async () => {
-      // Common abort case: the teardown already cleared authStore, so apiFetch
-      // attaches no store token — without the explicit header the server's
-      // blacklistAccessToken no-ops and the aborted 15-min access JWT stays
-      // accepted until natural expiry.
-      useAuthStore.setState({ accessToken: null, sessionId: null });
+    it('revokes a header-identified session through its matching ambient cookie', async () => {
       mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
 
-      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
+      await revokeAbortedSession({
+        accessToken: null,
+        sessionId: 'cookie-bound-session',
+        cookieBound: true,
+      });
 
       expect(mockFetch).toHaveBeenCalledTimes(1);
       const [, init] = mockFetch.mock.calls[0];
-      expect(new Headers(init.headers).get('Authorization')).toBe('Bearer A');
+      expect(init.credentials).toBe('include');
+      const headers = new Headers(init.headers);
+      expect(headers.get('X-Session-ID')).toBe('cookie-bound-session');
+      expect(headers.get('Authorization')).toBeNull();
+      expect(headers.get('X-Refresh-Token')).toBeNull();
+    });
+
+    it('does not dispatch when no explicit or cookie-bound credential is available', async () => {
+      await revokeAbortedSession({ accessToken: null, sessionId: 'cookie-only' });
+      await revokeAbortedSession({ accessToken: 'token-only', sessionId: null });
+      await revokeAbortedSession({ accessToken: null, sessionId: null, cookieBound: true });
+
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('does not route a 401 through authoritative recovery and swallows network failures', async () => {
+      mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+      await revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' });
+
+      mockFetch.mockRejectedValueOnce(new Error('network down'));
+      await expect(
+        revokeAbortedSession({ accessToken: 'A', sessionId: 'S1' })
+      ).resolves.toBeUndefined();
+
+      expect(mockNuclearReset).not.toHaveBeenCalled();
+      expect(mockGracefulReset).not.toHaveBeenCalled();
     });
   });
 });

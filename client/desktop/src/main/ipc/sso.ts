@@ -2,7 +2,7 @@
  * SSO IPC bridge — wires the loopback HTTP server in `ssoLoopback.ts` to the
  * renderer's OAuth flow.
  *
- * Channel surface (7):
+ * Channel surface (9):
  *   - `sso:startLoopback` (invoke)  — spin up a 127.0.0.1 ephemeral-port server
  *                                     and return `{port, redirectURI}` for the
  *                                     renderer to embed in the provider URL.
@@ -27,6 +27,10 @@
  *                                     SSOSignInResult; no OAuth material crosses
  *                                     IPC. Simpler than Apple — no broker.
  *   - `sso:googleCancel` (send)     — tear down the in-flight Google flow.
+ *   - `sso:completeRegistration` / `sso:completeLink` (invoke) — submit the
+ *                                     final server exchange in main, store the
+ *                                     refresh credential under the reserved
+ *                                     SSO owner, and return no refresh token.
  *
  * Sender-frame validation (the only layer the renderer cannot bypass) is
  * enforced via `isPermittedFrameUrl` — the same helper `openExternal.ts` uses,
@@ -41,7 +45,7 @@
  */
 import { ipcMain, net, shell, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 
-import { getApiBaseUrl } from '../apiBaseUrl';
+import { getApiBaseUrl, PRODUCTION_API_BASE } from '../apiBaseUrl';
 import { cancelActiveAppleFlow, runAppleSignIn } from '../oauth/apple/appleFlow';
 import { appleTokenCall } from '../oauth/apple/appleTokenCall';
 import { verifyAppleIDToken } from '../oauth/apple/idTokenVerifier';
@@ -50,7 +54,25 @@ import { loadGoogleClientSecret } from '../oauth/google/clientSecret';
 import { cancelActiveGoogleFlow, runGoogleSignIn } from '../oauth/google/googleFlow';
 import { googleTokenCall } from '../oauth/google/googleTokenCall';
 import { verifyGoogleIDToken } from '../oauth/google/idTokenVerifier';
+import { normalizeSelfHostedUrl } from '../selfHostedProbe';
+import { isValidatedSelfHostedApiBase } from '../selfHostedProfile';
 import { startLoopback, type LoopbackHandle } from '../ssoLoopback';
+import {
+  clearTokensIfOwner,
+  credentialOwnerIsCurrent,
+  reserveCredentialOwner,
+  storeRefreshTokenIfOwner,
+} from '../tokenManager';
+
+import type { MainSSOSignInResult } from '../oauth/ssoFlowShared';
+import type { CredentialOwner } from '../ipcContract';
+import type {
+  SSOCompleteLinkPayload,
+  SSOCompleteRegistrationPayload,
+  SSOCompletionErrorBody,
+  SSOCompletionResult,
+  SSOSignInResult,
+} from '../../shared/sso';
 
 import { isPermittedFrameUrl } from './frameValidation';
 
@@ -71,6 +93,23 @@ function resolveFetchUrl(input: Parameters<typeof fetch>[0]): string {
 }
 
 const active = new Map<number, LoopbackHandle>();
+const SESSION_ID_HEADER = 'X-Concord-Session-ID';
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+interface PendingSSOCompletion {
+  apiBase: string;
+  credentialOwner: CredentialOwner;
+  provider: 'google' | 'apple';
+  branch: 'new_user' | 'account_link';
+  ssoToken: string;
+}
+
+interface MainCompletionTokens {
+  accessToken: string;
+  refreshToken: string;
+  sessionId: string;
+  rememberMe: boolean;
+}
 
 // Google's client_secret is a non-confidential build constant (Google's
 // native-app guidance — PKCE is the control), read once from the
@@ -90,6 +129,132 @@ function checkFrame(
   return isPermittedFrameUrl(url, getSpaBaseUrl());
 }
 
+function approvedApiBase(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = normalizeSelfHostedUrl(value);
+  if (!normalized.ok || normalized.apiBase !== value) return null;
+  return value === PRODUCTION_API_BASE ||
+    value === getApiBaseUrl() ||
+    isValidatedSelfHostedApiBase(value)
+    ? value
+    : null;
+}
+
+function isBoundedString(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= maxLength;
+}
+
+function isProvider(value: unknown): value is 'google' | 'apple' {
+  return value === 'google' || value === 'apple';
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isCompleteRegistrationPayload(value: unknown): value is SSOCompleteRegistrationPayload {
+  return (
+    isRecord(value) &&
+    isProvider(value.provider) &&
+    isBoundedString(value.ssoToken, 8192) &&
+    isBoundedString(value.username, 128) &&
+    isBoundedString(value.passphrase, 1024) &&
+    isBoundedString(value.wrappedPrivateKey, 16_384) &&
+    isBoundedString(value.keyDerivationSalt, 1024) &&
+    isBoundedString(value.publicKey, 8192)
+  );
+}
+
+function isCompleteLinkPayload(value: unknown): value is SSOCompleteLinkPayload {
+  return (
+    isRecord(value) &&
+    isProvider(value.provider) &&
+    isBoundedString(value.ssoToken, 8192) &&
+    isBoundedString(value.password, 1024)
+  );
+}
+
+function parseCompletionTokens(value: unknown): MainCompletionTokens | null {
+  if (
+    !isRecord(value) ||
+    !isBoundedString(value.access_token, 32_768) ||
+    !isBoundedString(value.refresh_token, 32_768) ||
+    !isBoundedString(value.session_id, 256) ||
+    !UUID_PATTERN.test(value.session_id) ||
+    (value.remember_me !== undefined && typeof value.remember_me !== 'boolean')
+  ) {
+    return null;
+  }
+  return {
+    accessToken: value.access_token,
+    refreshToken: value.refresh_token,
+    sessionId: value.session_id,
+    rememberMe: value.remember_me ?? true,
+  };
+}
+
+function sanitizeCompletionErrorBody(value: unknown): SSOCompletionErrorBody | undefined {
+  if (!isRecord(value)) return undefined;
+  const body: SSOCompletionErrorBody = {};
+  if (isBoundedString(value.error_code, 256)) body.error_code = value.error_code;
+  if (isBoundedString(value.error, 2048)) body.error = value.error;
+  if (isBoundedString(value.detail, 4096)) body.detail = value.detail;
+  if (
+    typeof value.attempts_remaining === 'number' &&
+    Number.isSafeInteger(value.attempts_remaining)
+  ) {
+    body.attempts_remaining = value.attempts_remaining;
+  }
+  if (
+    typeof value.retry_after_seconds === 'number' &&
+    Number.isSafeInteger(value.retry_after_seconds)
+  ) {
+    body.retry_after_seconds = value.retry_after_seconds;
+  }
+  return Object.keys(body).length > 0 ? body : undefined;
+}
+
+async function responseJson(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+async function revokeExplicitSession(apiBase: string, tokens: MainCompletionTokens): Promise<void> {
+  try {
+    await net.fetch(`${apiBase}/api/v1/auth/logout`, {
+      method: 'POST',
+      credentials: 'omit',
+      headers: {
+        Authorization: `Bearer ${tokens.accessToken}`,
+        'X-Refresh-Token': tokens.refreshToken,
+      },
+    });
+  } catch {
+    // Best effort; the server-side expiry remains the cleanup backstop.
+  }
+}
+
+async function revokeCookieBoundSession(apiBase: string, sessionId: string | null): Promise<void> {
+  if (!sessionId || !UUID_PATTERN.test(sessionId)) return;
+  try {
+    await net.fetch(`${apiBase}/api/v1/auth/logout`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'X-Session-ID': sessionId },
+    });
+  } catch {
+    // Best effort; the session ID + cookie hash match prevents successor revoke.
+  }
+}
+
+function captureSessionId(response: Response): string | null {
+  const sessionId = response.headers.get(SESSION_ID_HEADER);
+  return sessionId && UUID_PATTERN.test(sessionId) ? sessionId : null;
+}
+
 /**
  * registerSSOIPC wires the three sso:* IPC channels used by the renderer's
  * SSO flow. The Electron main process owns the ephemeral loopback HTTP
@@ -102,6 +267,154 @@ function checkFrame(
  * build to serve.
  */
 export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
+  let pendingCompletion: PendingSSOCompletion | null = null;
+  const discardPendingCompletion = (completion: PendingSSOCompletion): void => {
+    if (pendingCompletion === completion) pendingCompletion = null;
+  };
+
+  const finishSignIn = async (
+    result: MainSSOSignInResult,
+    apiBase: string,
+    provider: 'google' | 'apple',
+    credentialOwner: CredentialOwner,
+    cookieBoundSessionId: string | null
+  ): Promise<SSOSignInResult> => {
+    if (!credentialOwnerIsCurrent(credentialOwner)) {
+      if (result.kind === 'tokens') {
+        await revokeCookieBoundSession(apiBase, cookieBoundSessionId);
+        await revokeExplicitSession(apiBase, { ...result, rememberMe: true });
+      } else {
+        await revokeCookieBoundSession(apiBase, cookieBoundSessionId);
+      }
+      return { kind: 'error', code: 'sso_cancelled' };
+    }
+
+    if (result.kind === 'tokens') {
+      const storedOwner = storeRefreshTokenIfOwner(
+        {
+          refreshToken: result.refreshToken,
+          rememberMe: true,
+          apiBase,
+          accessToken: result.accessToken,
+        },
+        credentialOwner
+      );
+      if (storedOwner === null) {
+        await revokeCookieBoundSession(apiBase, cookieBoundSessionId);
+        await revokeExplicitSession(apiBase, { ...result, rememberMe: true });
+        return { kind: 'error', code: 'sso_cancelled' };
+      }
+      pendingCompletion = null;
+      return {
+        kind: 'tokens',
+        accessToken: result.accessToken,
+        sessionId: result.sessionId,
+        credentialOwner: storedOwner,
+      };
+    }
+
+    if (result.kind === 'sso_token') {
+      pendingCompletion = {
+        apiBase,
+        credentialOwner,
+        provider,
+        branch: result.branch,
+        ssoToken: result.ssoToken,
+      };
+    } else if (result.kind === 'error') {
+      await revokeCookieBoundSession(apiBase, cookieBoundSessionId);
+    }
+    if (result.kind !== 'sso_token') {
+      // MFA continuations publish a fresh owner through auth:storeRefreshToken;
+      // terminal errors own nothing. Release this reservation so switching to
+      // registration can safely use the pre-credential key staging path.
+      clearTokensIfOwner(credentialOwner);
+    }
+    return result;
+  };
+
+  const controlPlaneFetch = (
+    sessionUrl: string,
+    onSession: (sessionId: string | null) => void
+  ): typeof fetch =>
+    (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = resolveFetchUrl(input);
+      const response = await net.fetch(url, { ...init, credentials: 'include' });
+      if (url === sessionUrl && response.ok) onSession(captureSessionId(response));
+      return response;
+    }) as typeof fetch;
+
+  const completeSSO = async (
+    completion: PendingSSOCompletion,
+    endpoint: 'complete-registration' | 'complete-link',
+    requestBody: Record<string, string>
+  ): Promise<SSOCompletionResult> => {
+    if (!credentialOwnerIsCurrent(completion.credentialOwner)) {
+      discardPendingCompletion(completion);
+      return { kind: 'error', status: 409, code: 'sso_cancelled' };
+    }
+
+    let response: Response;
+    try {
+      response = await net.fetch(
+        `${completion.apiBase}/api/v1/auth/sso/${completion.provider}/${endpoint}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify(requestBody),
+        }
+      );
+    } catch {
+      return { kind: 'error', status: 0, code: `sso_${endpoint}_failed` };
+    }
+
+    const cookieBoundSessionId = captureSessionId(response);
+    const body = await responseJson(response);
+    if (!response.ok) {
+      await revokeCookieBoundSession(completion.apiBase, cookieBoundSessionId);
+      const safeBody = sanitizeCompletionErrorBody(body);
+      return {
+        kind: 'error',
+        status: response.status,
+        code: safeBody?.error_code ?? `sso_${endpoint}_failed`,
+        ...(safeBody ? { body: safeBody } : {}),
+      };
+    }
+
+    const tokens = parseCompletionTokens(body);
+    if (!tokens) {
+      await revokeCookieBoundSession(completion.apiBase, cookieBoundSessionId);
+      discardPendingCompletion(completion);
+      clearTokensIfOwner(completion.credentialOwner);
+      return { kind: 'error', status: 502, code: 'sso_session_rejected' };
+    }
+
+    const storedOwner = storeRefreshTokenIfOwner(
+      {
+        refreshToken: tokens.refreshToken,
+        rememberMe: tokens.rememberMe,
+        apiBase: completion.apiBase,
+        accessToken: tokens.accessToken,
+      },
+      completion.credentialOwner
+    );
+    if (storedOwner === null) {
+      await revokeCookieBoundSession(completion.apiBase, cookieBoundSessionId);
+      await revokeExplicitSession(completion.apiBase, tokens);
+      discardPendingCompletion(completion);
+      return { kind: 'error', status: 409, code: 'sso_cancelled' };
+    }
+
+    pendingCompletion = null;
+    return {
+      kind: 'tokens',
+      accessToken: tokens.accessToken,
+      sessionId: tokens.sessionId,
+      credentialOwner: storedOwner,
+    };
+  };
+
   ipcMain.handle('sso:startLoopback', async (event) => {
     if (!checkFrame(event, getSpaBaseUrl)) {
       throw new Error('sso:startLoopback rejected: untrusted sender frame');
@@ -141,19 +454,88 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
     active.delete(port);
   });
 
-  ipcMain.handle('sso:appleSignIn', async (event) => {
+  ipcMain.handle(
+    'sso:completeRegistration',
+    async (event, requestedApiBase: unknown, payload: unknown): Promise<SSOCompletionResult> => {
+      if (!checkFrame(event, getSpaBaseUrl)) {
+        throw new Error('sso:completeRegistration rejected: untrusted sender frame');
+      }
+      const apiBase = approvedApiBase(requestedApiBase);
+      if (!apiBase || !isCompleteRegistrationPayload(payload)) {
+        return { kind: 'error', status: 400, code: 'sso_invalid_request' };
+      }
+      const completion = pendingCompletion;
+      if (
+        !completion ||
+        completion.apiBase !== apiBase ||
+        completion.provider !== payload.provider ||
+        completion.branch !== 'new_user' ||
+        completion.ssoToken !== payload.ssoToken
+      ) {
+        return { kind: 'error', status: 409, code: 'sso_cancelled' };
+      }
+      return completeSSO(completion, 'complete-registration', {
+        sso_token: payload.ssoToken,
+        username: payload.username,
+        password: payload.passphrase,
+        wrapped_private_key: payload.wrappedPrivateKey,
+        key_derivation_salt: payload.keyDerivationSalt,
+        public_key: payload.publicKey,
+      });
+    }
+  );
+
+  ipcMain.handle(
+    'sso:completeLink',
+    async (event, requestedApiBase: unknown, payload: unknown): Promise<SSOCompletionResult> => {
+      if (!checkFrame(event, getSpaBaseUrl)) {
+        throw new Error('sso:completeLink rejected: untrusted sender frame');
+      }
+      const apiBase = approvedApiBase(requestedApiBase);
+      if (!apiBase || !isCompleteLinkPayload(payload)) {
+        return { kind: 'error', status: 400, code: 'sso_invalid_request' };
+      }
+      const completion = pendingCompletion;
+      if (
+        !completion ||
+        completion.apiBase !== apiBase ||
+        completion.provider !== payload.provider ||
+        completion.branch !== 'account_link' ||
+        completion.ssoToken !== payload.ssoToken
+      ) {
+        return { kind: 'error', status: 409, code: 'sso_cancelled' };
+      }
+      return completeSSO(completion, 'complete-link', {
+        sso_token: payload.ssoToken,
+        password: payload.password,
+      });
+    }
+  );
+
+  ipcMain.handle('sso:appleSignIn', async (event, requestedApiBase: unknown) => {
     if (!checkFrame(event, getSpaBaseUrl)) {
       throw new Error('sso:appleSignIn rejected: untrusted sender frame');
     }
-    return runAppleSignIn({
-      apiBase: getApiBaseUrl(),
+    const apiBase = approvedApiBase(requestedApiBase);
+    if (!apiBase) {
+      throw new Error('sso:appleSignIn rejected: unapproved API origin');
+    }
+    const credentialOwner = reserveCredentialOwner(apiBase);
+    pendingCompletion = null;
+    let cookieBoundSessionId: string | null = null;
+    const result = await runAppleSignIn({
+      apiBase,
       // Electron net.fetch + credentials:'include' (NOT Node's fetch): the
       // /session response sets the refresh-token cookie, which must land in
       // the default-session jar — the SAME jar the renderer's /auth/refresh
       // reads. Node's fetch would silently drop it and strand the session at
       // access-token expiry (15 min). Plan deviation D2.
-      controlPlaneFetch: ((input: Parameters<typeof fetch>[0], init?: RequestInit) =>
-        net.fetch(resolveFetchUrl(input), { ...init, credentials: 'include' })) as typeof fetch,
+      controlPlaneFetch: controlPlaneFetch(
+        `${apiBase}/api/v1/auth/sso/apple/session`,
+        (sessionId) => {
+          cookieBoundSessionId = sessionId;
+        }
+      ),
       // Apple endpoints are cookie-less by design — plain global fetch.
       appleFetch: fetch,
       openExternal: async (url: string) => {
@@ -171,6 +553,7 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
       appleTokenCall,
       verifyIdToken: verifyAppleIDToken,
     });
+    return finishSignIn(result, apiBase, 'apple', credentialOwner, cookieBoundSessionId);
   });
 
   ipcMain.on('sso:appleCancel', (event) => {
@@ -178,12 +561,19 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
     cancelActiveAppleFlow();
   });
 
-  ipcMain.handle('sso:googleSignIn', async (event) => {
+  ipcMain.handle('sso:googleSignIn', async (event, requestedApiBase: unknown) => {
     if (!checkFrame(event, getSpaBaseUrl)) {
       throw new Error('sso:googleSignIn rejected: untrusted sender frame');
     }
-    return runGoogleSignIn({
-      apiBase: getApiBaseUrl(),
+    const apiBase = approvedApiBase(requestedApiBase);
+    if (!apiBase) {
+      throw new Error('sso:googleSignIn rejected: unapproved API origin');
+    }
+    const credentialOwner = reserveCredentialOwner(apiBase);
+    pendingCompletion = null;
+    let cookieBoundSessionId: string | null = null;
+    const result = await runGoogleSignIn({
+      apiBase,
       // Embedded non-confidential client_secret (Google native-app guidance);
       // client_id is NOT supplied here — googleFlow parses it from the
       // server-built authorize URL (sourced from the control-plane's
@@ -192,8 +582,12 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
       // Electron net.fetch + credentials:'include' so /session's refresh-token
       // cookie lands in the default-session jar the renderer reads (parity with
       // the Apple handler above).
-      controlPlaneFetch: ((input: Parameters<typeof fetch>[0], init?: RequestInit) =>
-        net.fetch(resolveFetchUrl(input), { ...init, credentials: 'include' })) as typeof fetch,
+      controlPlaneFetch: controlPlaneFetch(
+        `${apiBase}/api/v1/auth/sso/google/session`,
+        (sessionId) => {
+          cookieBoundSessionId = sessionId;
+        }
+      ),
       // Google endpoints are cookie-less by design — plain global fetch.
       googleFetch: fetch,
       openExternal: async (url: string) => {
@@ -206,6 +600,7 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
       googleTokenCall,
       verifyIdToken: verifyGoogleIDToken,
     });
+    return finishSignIn(result, apiBase, 'google', credentialOwner, cookieBoundSessionId);
   });
 
   ipcMain.on('sso:googleCancel', (event) => {

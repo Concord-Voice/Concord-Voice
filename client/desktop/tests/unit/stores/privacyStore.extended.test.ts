@@ -1,5 +1,6 @@
 import { usePrivacyStore } from '@/renderer/stores/privacyStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
+import { configureRefreshFailureReset } from '@/renderer/services/apiClient';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
@@ -12,6 +13,7 @@ afterEach(() => server.resetHandlers());
 
 beforeEach(() => {
   resetAllStores();
+  configureRefreshFailureReset({ gracefulReset: () => {}, nuclearReset: () => {} });
   useAuthStore.getState().setAccessToken('mock-token');
 });
 

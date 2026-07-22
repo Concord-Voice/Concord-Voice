@@ -26,15 +26,20 @@ import PasswordStrength from './PasswordStrength';
 import LoadingSpinner from './LoadingSpinner';
 import { useSSOStore } from '../../stores/ssoStore';
 import { useAuthStore } from '../../stores/authStore';
+import { useE2EEStore } from '../../stores/e2eeStore';
 import { completeSSORegistration, SSOServiceError } from '../../services/ssoService';
-import { revokeAbortedSession } from '../../services/apiClient';
-import { getApiBase } from '../../services/runtimeServerBase';
+import { revokeAbortedSession, type AbortedSessionRef } from '../../services/apiClient';
+import {
+  captureRuntimeServerSelection,
+  runtimeServerSelectionIsCurrent,
+} from '../../services/runtimeServerBase';
 import { useSSOFlow } from '../../hooks/useSSOFlow';
 import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
 import { e2eeService } from '../../services/e2eeService';
 import { E2EEInitTeardownError } from '../../services/e2eeErrors';
 import { errorMessage } from '../../utils/redactError';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
+import type { CredentialOwner } from '../../../main/ipcContract';
 import './SSOPassphraseSetup.css';
 
 interface CompleteRegistrationErrorBody {
@@ -81,7 +86,6 @@ function mapServerErrorToMessage(
 const SSOPassphraseSetup: React.FC = () => {
   const state = useSSOStore((s) => s.state);
   const setSSOState = useSSOStore((s) => s.setState);
-  const setAccessToken = useAuthStore((s) => s.setAccessToken);
   // begin(provider) re-mints a fresh sso_token via the full OAuth round-trip —
   // the recovery path when the current token has expired (#2045).
   const { begin } = useSSOFlow();
@@ -110,69 +114,83 @@ const SSOPassphraseSetup: React.FC = () => {
   const usernameValid = username.length >= 3;
   const valid = passphraseStrong && matches && usernameValid;
 
-  // Fatal-path for a logout-class teardown observed mid-setup: the
-  // registration succeeded server-side, but THIS renderer session is dead.
-  // Clear the just-published token (AuthFlow routes on the bare token) and
-  // surface the re-initiate affordance — the next SSO sign-in lands on
-  // eager-unlock against the server-held keys (Codex P1, PR #2337).
-  const abortSetupForTeardown = async (abortedSession: {
-    accessToken: string | null;
-    sessionId: string | null;
-  }) => {
-    // Revoke the freshly-issued server session (HttpOnly refresh cookie + row)
-    // BEFORE clearing the local token — the renderer apiFetch carries the
-    // cookie, so this must run while it is still in the jar (Codex P1, #2337).
-    await revokeAbortedSession(abortedSession);
-    // Identity-guarded local clear (Codex P1, PR #2337): if a successor
-    // sign-in completed while the revoke above was awaited, the store now
-    // holds the NEW session's token — clearing unconditionally would log that
-    // session out of the renderer even though the revoke helper correctly
-    // declined it. Strip only this aborted flow's own token (mirrors Login's
-    // stripAbortedToken discipline).
-    const auth = useAuthStore.getState();
-    if (auth.accessToken === abortedSession.accessToken) {
-      auth.clearAccessToken();
-    }
-    // Main-process/disk cleanup (Codex P1, PR #2337): a storeE2EEKeys /
-    // storeRefreshToken IPC pending when the teardown landed can repopulate
-    // the main-process memory + safeStorage files AFTER the teardown wiped
-    // them — leaving the dead registration session's key material resident.
-    // This registration session is BRAND NEW (its disk artifacts are its own,
-    // never a restorable prior session's), so the wipe mirrors Login's
-    // clearAbortedDiskTokens: identity-guarded against a successor only.
-    if (auth.accessToken === abortedSession.accessToken || auth.accessToken === null) {
-      await globalThis.electron?.clearTokens?.();
-    }
-    setError('Your session ended during setup. Please sign in again to continue.');
-    setTokenExpired(true);
-    setSubmitting(false);
-  };
-
   const handleSubmit = async (ev: React.FormEvent) => {
     ev.preventDefault();
     if (!valid || submitting) {
       return;
     }
+    const requestSelection = captureRuntimeServerSelection();
+    const requestAuthGeneration = useAuthStore.getState().authGeneration;
+    const requestIsCurrent = () =>
+      runtimeServerSelectionIsCurrent(requestSelection) &&
+      useAuthStore.getState().authGeneration === requestAuthGeneration;
     setSubmitting(true);
     setError(null);
     setTokenExpired(false);
 
-    // Teardown epoch for the whole setup attempt: a 401 -> nuclearReset
-    // landing anywhere in this span makes initialize() below reject with
-    // E2EEInitTeardownError instead of committing keys for a dead session
-    // (PR #2337 P1-B analogue for the SSO passphrase-setup surface).
-    // (let, not const: the non-fatal init-failure rollback below rebases it.)
     let teardownEpoch = e2eeService.captureTeardownEpoch();
+    let keyMaterialPrepared = false;
+    let issuedSession: AbortedSessionRef | null = null;
+    let credentialOwner: CredentialOwner | null = null;
+    let needsSSOUnlock = false;
+    let admittedGeneration: number | null = null;
+    let flowInitializationReceipt: ReturnType<typeof e2eeService.captureInitializationReceipt> =
+      null;
+
+    const clearFlowSessionKeys = () => {
+      e2eeService.clearKeysIfInitializationCurrent(flowInitializationReceipt);
+    };
+    const cleanupIssuedSession = async () => {
+      clearFlowSessionKeys();
+      const auth = useAuthStore.getState();
+      if (admittedGeneration !== null && auth.authGeneration === admittedGeneration) {
+        auth.clearAccessToken();
+      }
+      if (credentialOwner !== null) {
+        const e2ee = useE2EEStore.getState();
+        if (e2ee.ssoCredentialOwner === credentialOwner) {
+          e2ee.setNeedsSSOUnlock(false);
+        }
+        try {
+          await globalThis.electron?.clearTokensIfOwner?.(credentialOwner);
+        } catch {
+          // Explicit server revocation below is the cleanup backstop.
+        }
+      }
+      if (issuedSession) await revokeAbortedSession(issuedSession);
+    };
+    const staleAttemptCleanup = (): Promise<void> | null =>
+      requestIsCurrent() ? null : cleanupIssuedSession();
+    const showInterrupted = () => {
+      const auth = useAuthStore.getState();
+      if (
+        runtimeServerSelectionIsCurrent(requestSelection) &&
+        auth.authGeneration === requestAuthGeneration &&
+        auth.accessToken === null
+      ) {
+        setError('Your session ended during setup. Please sign in again to continue.');
+        setTokenExpired(true);
+        setSubmitting(false);
+      }
+    };
 
     try {
-      // Generate E2EE key material from the user's passphrase.
-      // Reuses the same primitives traditional Register.tsx uses — the SSO
-      // path produces identical key material; only the auth flow differs.
       const keys = await generateRegistrationKeys(passphrase);
+      let staleCleanup = staleAttemptCleanup();
+      if (staleCleanup) {
+        await staleCleanup;
+        return;
+      }
       const publicKeyBase64 = await exportPublicKey(keys.publicKey);
+      staleCleanup = staleAttemptCleanup();
+      if (staleCleanup) {
+        await staleCleanup;
+        return;
+      }
+      keyMaterialPrepared = true;
 
-      try {
-        const { accessToken } = await completeSSORegistration({
+      const result = await completeSSORegistration(
+        {
           provider: state.provider,
           ssoToken: state.ssoToken,
           username,
@@ -180,117 +198,104 @@ const SSOPassphraseSetup: React.FC = () => {
           wrappedPrivateKey: keys.wrappedPrivateKey,
           keyDerivationSalt: keys.keyDerivationSalt,
           publicKey: publicKeyBase64,
-        });
-        setAccessToken(accessToken);
-        // Bind a later teardown-abort revoke to THIS registration session, so a
-        // concurrent newer login isn't revoked by mistake — and to the API
-        // origin it was minted against (Codex P1, #2337).
-        const abortedSession = { accessToken, sessionId: null, apiBase: getApiBase() };
-
-        // Initialize e2eeService so E2EE is live for THIS session — mirrors the
-        // post-registration init added to Register.tsx in #1278. Without this, an
-        // SSO user who just set their passphrase has e2eeService.isInitialized ===
-        // false and is blocked from creating channels / sending messages ("Setting
-        // up secure messaging — try again in a moment.") until a logout→login. The
-        // keys were generated above and the server now holds the wrapped private
-        // key, so it is safe to establish the session here.
-        //
-        // The failure modes are handled SEPARATELY (per #1278 review + #2337):
-        //   1. Ordinary initialize() failure → clearKeys() + continue
-        //      NON-FATAL: SSO registration already succeeded server-side, so a
-        //      client-side hiccup must not fail the flow. Post-#2337 finalizeKeys
-        //      publishes the keyset in one synchronous block (no half-init state
-        //      is reachable), so the rollback is defense-in-depth; it also resets
-        //      the reactive ready flag.
-        //   2. A teardown mid-init (E2EEInitTeardownError) is FATAL — the session
-        //      is dead; continuing would admit the user on a resurrected token.
-        //      Handled by abortSetupForTeardown below (revoke + clear + abort).
-        try {
-          await e2eeService.initialize(
-            passphrase,
-            keys.wrappedPrivateKey,
-            keys.keyDerivationSalt,
-            keys.keyDerivationAlg,
-            undefined,
-            teardownEpoch
-          );
-        } catch (initError) {
-          // A logout-class teardown landed during setup: the registration DID
-          // succeed server-side, but THIS renderer session is dead —
-          // initialize() rejected on the stale teardown epoch. Continuing
-          // would resurrect the torn-down session with the token published
-          // above and admit the user with E2EE cleared (AuthFlow routes on
-          // the bare token). Treat as FATAL: clear the fresh token, surface
-          // the re-initiate affordance, abort. The next SSO sign-in lands on
-          // eager-unlock against the server-held keys (Codex P1, PR #2337).
-          if (initError instanceof E2EEInitTeardownError) {
-            await abortSetupForTeardown(abortedSession);
-            return;
-          }
-          e2eeService.clearKeys();
-          // The rollback clearKeys() above bumps the teardown epoch — rebase
-          // our baseline so this SELF-INFLICTED clear is not misread as an
-          // external teardown by the pre-admit check below, which would turn
-          // the deliberately non-fatal branch fatal (Codex P2, PR #2337). A
-          // real teardown after this still advances the epoch past the new
-          // baseline.
-          teardownEpoch = e2eeService.captureTeardownEpoch();
-          console.warn(
-            'E2EE init after SSO passphrase setup failed; secure messaging will require a manual re-login:',
-            errorMessage(initError)
-          );
-        }
-
-        //   2. Persist E2EE keys for restart-survival. Failure warns only and
-        //      NEVER clears the valid in-memory session from (1) (#1278/#1288 —
-        //      rationale lives in persistE2EESessionKeys). No-op if (1) failed
-        //      (getSessionKeys returns null after clearKeys).
-        await persistE2EESessionKeys(e2eeService.getSessionKeys());
-
-        // Pre-admit epoch check: a teardown landing after initialize()
-        // resolved (e.g. during the persist await) must not admit the user on
-        // the resurrected token (PR #2337).
-        if (e2eeService.wasTornDownSince(teardownEpoch)) {
-          await abortSetupForTeardown(abortedSession);
-          return;
-        }
-
-        // Token-lifecycle admit gate (Codex P1, PR #2337): a token-only
-        // invalidation — handleRefreshFailure's `phase !== 'stable'` path —
-        // clears the access token WITHOUT advancing the E2EE epoch, so the
-        // check above passes. Verify this registration's token still owns the
-        // auth store before completing (the fresh SSO registration session
-        // carries no session ID, so token equality is the identity).
-        if (useAuthStore.getState().accessToken !== abortedSession.accessToken) {
-          await abortSetupForTeardown(abortedSession);
-          return;
-        }
-
-        // Returning to phase 'idle' lets AuthFlow re-evaluate based on the
-        // new accessToken in authStore (the user is now logged in).
-        setSSOState({ phase: 'idle' });
-      } catch (err) {
-        // ssoService throws SSOServiceError carrying the parsed response body.
-        // Use it to map error_code → user-facing copy. Falling back to a
-        // synthetic body lets older paths (or unparseable responses) still
-        // surface a coherent message rather than going silent.
-        if (err instanceof SSOServiceError) {
-          const body = (err.body ?? {}) as CompleteRegistrationErrorBody;
-          setError(mapServerErrorToMessage(err.status, body, providerName));
-          // An expired/invalid sso_token cannot be retried — flip to the
-          // re-initiate affordance instead of leaving the user re-submitting a
-          // dead token against the same form (#2045).
-          if (err.status === 401 && body.error_code === 'sso_token_invalid') {
-            setTokenExpired(true);
-          }
-        } else {
-          setError('Registration failed. Please try again.');
-        }
-        setSubmitting(false);
+        },
+        requestSelection
+      );
+      issuedSession = {
+        accessToken: result.accessToken,
+        sessionId: result.sessionId,
+        apiBase: requestSelection.apiBase,
+      };
+      credentialOwner = result.credentialOwner;
+      staleCleanup = staleAttemptCleanup();
+      if (staleCleanup) {
+        await staleCleanup;
+        return;
       }
-    } catch {
-      // Crypto-error catch only — never log key material.
-      setError('Could not prepare encryption keys. Please try again.');
+
+      try {
+        await e2eeService.initialize(
+          passphrase,
+          keys.wrappedPrivateKey,
+          keys.keyDerivationSalt,
+          keys.keyDerivationAlg,
+          { signal: new AbortController().signal, isCurrent: requestIsCurrent },
+          teardownEpoch
+        );
+        // Capture the receipt the instant initialize() resolves — BEFORE the
+        // stale-attempt cleanup below. Otherwise a request that goes stale in the
+        // microtask window between initialize()'s synchronous key commit and this
+        // check runs cleanupIssuedSession() -> clearFlowSessionKeys() against a
+        // still-null receipt, leaving the just-committed keyset resident (CWE-212).
+        // captureInitializationReceipt() returns null when no keyset committed, and
+        // clearKeysIfInitializationCurrent is identity+attempt-guarded, so an early
+        // capture can never erase a successor's keys.
+        flowInitializationReceipt = e2eeService.captureInitializationReceipt();
+        staleCleanup = staleAttemptCleanup();
+        if (staleCleanup) {
+          await staleCleanup;
+          return;
+        }
+      } catch (initError) {
+        if (initError instanceof E2EEInitTeardownError || !requestIsCurrent()) {
+          await cleanupIssuedSession();
+          showInterrupted();
+          return;
+        }
+        e2eeService.clearKeys();
+        teardownEpoch = e2eeService.captureTeardownEpoch();
+        needsSSOUnlock = true;
+        console.warn(
+          'E2EE init after SSO passphrase setup failed; gating admission on SSO eager unlock:',
+          errorMessage(initError)
+        );
+      }
+
+      await persistE2EESessionKeys(flowInitializationReceipt?.sessionKeys ?? null, credentialOwner);
+      staleCleanup = staleAttemptCleanup();
+      if (staleCleanup) {
+        await staleCleanup;
+        return;
+      }
+      if (e2eeService.wasTornDownSince(teardownEpoch)) {
+        await cleanupIssuedSession();
+        showInterrupted();
+        return;
+      }
+
+      if (needsSSOUnlock) {
+        useE2EEStore.getState().setNeedsSSOUnlock(true, credentialOwner);
+      }
+      admittedGeneration = useAuthStore
+        .getState()
+        .beginAuthLifecycleIfCurrent(requestAuthGeneration, result.accessToken, result.sessionId);
+      if (admittedGeneration === null) {
+        await cleanupIssuedSession();
+        return;
+      }
+      if (
+        runtimeServerSelectionIsCurrent(requestSelection) &&
+        useAuthStore.getState().authGeneration === admittedGeneration
+      ) {
+        setSSOState({ phase: 'idle' });
+      } else {
+        await cleanupIssuedSession();
+      }
+    } catch (err) {
+      const mayReport = requestIsCurrent();
+      await cleanupIssuedSession();
+      if (!mayReport || !requestIsCurrent()) return;
+      if (err instanceof SSOServiceError) {
+        const body = (err.body ?? {}) as CompleteRegistrationErrorBody;
+        setError(mapServerErrorToMessage(err.status, body, providerName));
+        if (err.status === 401 && body.error_code === 'sso_token_invalid') {
+          setTokenExpired(true);
+        }
+      } else if (!keyMaterialPrepared) {
+        setError('Could not prepare encryption keys. Please try again.');
+      } else {
+        setError('Registration failed. Please try again.');
+      }
       setSubmitting(false);
     }
   };

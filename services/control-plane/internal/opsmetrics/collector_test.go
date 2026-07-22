@@ -97,6 +97,42 @@ type collectorUserProvider struct {
 
 func (provider collectorUserProvider) ConnectionCount() int    { return provider.clients }
 func (provider collectorUserProvider) ConnectedUserCount() int { return provider.users }
+func (provider collectorUserProvider) ConnectionCounts() (int, int) {
+	return provider.clients, provider.users
+}
+
+type collectorCountInterleavingProvider struct {
+	clients     int
+	delta       int
+	mutateAfter MetricKey
+	mutated     bool
+}
+
+func (provider *collectorCountInterleavingProvider) observe(key MetricKey) int {
+	count := provider.clients
+	if !provider.mutated && provider.mutateAfter == key {
+		provider.clients += provider.delta
+		provider.mutated = true
+	}
+	return count
+}
+
+func (provider *collectorCountInterleavingProvider) ConnectionCount() int {
+	return provider.observe(MetricWebSocketConnections)
+}
+
+func (provider *collectorCountInterleavingProvider) ConnectedUserCount() int {
+	return provider.observe(MetricUsersOnlineCurrent)
+}
+
+func (provider *collectorCountInterleavingProvider) ConnectionCounts() (int, int) {
+	count := provider.clients
+	if !provider.mutated {
+		provider.clients += provider.delta
+		provider.mutated = true
+	}
+	return count, count
+}
 
 type collectorAccountProvider struct {
 	metrics map[MetricKey]float64
@@ -265,6 +301,37 @@ func TestCollectorAddsDistinctUsersAndAccountMetrics(t *testing.T) {
 		require.Equal(t, value, values[key])
 	}
 	require.Len(t, values, 16)
+}
+
+func TestCollectorSnapshotDoesNotReportMoreOnlineUsersThanConnectionsDuringClientChange(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	for _, testCase := range []struct {
+		name        string
+		clients     int
+		delta       int
+		mutateAfter MetricKey
+	}{
+		{name: "join after connection count", clients: 1, delta: 1, mutateAfter: MetricWebSocketConnections},
+		{name: "disconnect after online user count", clients: 2, delta: -1, mutateAfter: MetricUsersOnlineCurrent},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			collector := NewCollector(
+				newCollectorTestStore(),
+				nil,
+				NewCounters(),
+				&collectorCountInterleavingProvider{
+					clients: testCase.clients, delta: testCase.delta, mutateAfter: testCase.mutateAfter,
+				},
+				15*time.Second,
+				logger.NewWithWriter(&bytes.Buffer{}),
+			)
+
+			values := samplesByKey(collector.snapshot(now))
+			require.Contains(t, values, MetricWebSocketConnections)
+			require.Contains(t, values, MetricUsersOnlineCurrent)
+			require.LessOrEqual(t, values[MetricUsersOnlineCurrent], values[MetricWebSocketConnections])
+		})
+	}
 }
 
 func TestCollectorPreservesPartialAccountMetricsOnProviderFailure(t *testing.T) {

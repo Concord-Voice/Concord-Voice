@@ -5,7 +5,7 @@
  *   {auth_url, state, nonce} back) → system browser → loopback callback →
  *   constant-time state check → POST /sign-client-secret → POST Apple
  *   /auth/token → local jose verification (nonce binding) → POST /session →
- *   discriminated AppleSignInResult.
+ *   main-only discriminated sign-in result.
  *
  * Lifecycle: ONE AbortController + the loopback handle per flow, torn down by
  * (a) sso:appleCancel, (b) main-window 'closed', (c) the 5-minute overall
@@ -24,7 +24,7 @@
  *     replays exactly what Apple saw at /authorize — RFC 6749 §4.1.3 —
  *     including whatever bridge redirect #973 lands.
  */
-import type { AppleSignInErrorCode, AppleSignInResult } from '../../../shared/appleSso';
+import type { AppleSignInErrorCode } from '../../../shared/appleSso';
 import type { startLoopback as startLoopbackFn, LoopbackHandle } from '../../ssoLoopback';
 
 import type { appleTokenCall as appleTokenCallFn } from './appleTokenCall';
@@ -36,6 +36,7 @@ import {
   constantTimeEquals,
   mapSessionResponse as mapSessionResponseShared,
   toErrorCode as toErrorCodeShared,
+  type MainSSOSignInResult,
 } from '../ssoFlowShared';
 
 /** Overall flow deadline (spec R2). */
@@ -157,11 +158,10 @@ async function postSession(
 }
 
 /**
- * Maps the /session response (Callback-shape parity) into the IPC-safe
- * discriminated union. Exported for direct unit coverage.
- * Delegates to the shared implementation in ssoFlowShared.ts.
+ * Maps the /session response into the main-only discriminated union. The IPC
+ * handler stores and removes the refresh credential before returning.
  */
-export function mapSessionResponse(body: Record<string, unknown>): AppleSignInResult {
+export function mapSessionResponse(body: Record<string, unknown>): MainSSOSignInResult {
   return mapSessionResponseShared(body);
 }
 
@@ -185,7 +185,7 @@ function toErrorCode(err: unknown): AppleSignInErrorCode {
   );
 }
 
-export async function runAppleSignIn(deps: AppleFlowDeps): Promise<AppleSignInResult> {
+export async function runAppleSignIn(deps: AppleFlowDeps): Promise<MainSSOSignInResult> {
   // Single-flight: a new invocation supersedes any in-flight flow — the
   // user double-clicked the Apple button after a stuck browser tab.
   cancelActiveAppleFlow();

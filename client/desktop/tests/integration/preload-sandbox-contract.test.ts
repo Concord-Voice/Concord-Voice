@@ -46,4 +46,17 @@ describe('preload sandbox contract (integration)', () => {
     const content = readFileSync(preloadPath, 'utf-8');
     expect(content).toContain('exposeInMainWorld');
   });
+
+  it('exposes credential-owner CAS channels in the sandbox bundle', () => {
+    const content = readFileSync(preloadPath, 'utf-8');
+    expect(content).toContain('auth:storeRefreshToken');
+    expect(content).toContain('auth:clearTokensIfOwner');
+    expect(content).toContain('auth:storeE2EEKeysIfOwner');
+  });
+
+  it('exposes main-owned SSO completion channels in the sandbox bundle', () => {
+    const content = readFileSync(preloadPath, 'utf-8');
+    expect(content).toContain('sso:completeRegistration');
+    expect(content).toContain('sso:completeLink');
+  });
 });

@@ -1,15 +1,27 @@
 import React, { useState, useMemo, useEffect } from 'react';
+import { z } from 'zod';
 import { unwrapLoginKeys, generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
-import { e2eeService } from '../../services/e2eeService';
+import { e2eeService, type E2EEInitializationGuard } from '../../services/e2eeService';
 import { E2EEInitTeardownError } from '../../services/e2eeErrors';
 import { errorMessage } from '../../utils/redactError';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import { hydratePostLogin } from '../../services/postLoginHydration';
+import { beginPostLoginHydrationGuard } from '../../services/postLoginHydrationLifecycle';
 import { useAuthStore } from '../../stores/authStore';
 import { useClientConfigStore } from '../../stores/clientConfigStore';
-import { apiFetch, ensureMachineId, revokeAbortedSession } from '../../services/apiClient';
-import { apiUrl, getApiBase } from '../../services/runtimeServerBase';
-import { UserProfile } from '../../stores/userStore';
+import {
+  apiFetch,
+  ensureMachineId,
+  revokeAbortedSession,
+  type AbortedSessionRef,
+} from '../../services/apiClient';
+import {
+  captureRuntimeServerSelection,
+  runtimeServerSelectionIsCurrent,
+  type RuntimeServerSelection,
+} from '../../services/runtimeServerBase';
+import type { CredentialOwner } from '../../../main/ipcContract';
+import type { UserProfile } from '../../stores/userStore';
 import TOTPInput from './TOTPInput';
 import BackupCodeInput from './BackupCodeInput';
 import WebAuthnPrompt from './WebAuthnPrompt';
@@ -21,26 +33,192 @@ import MFAMethodPicker, {
 import LoadingSpinner from './LoadingSpinner';
 import { SSOButton } from './SSOButton';
 import { useSSOFlow } from '../../hooks/useSSOFlow';
+import { useSSOStore } from '../../stores/ssoStore';
 import KeyRecoveryPrompt from './KeyRecoveryPrompt';
 import { Eye, EyeOff } from 'lucide-react';
 import { base64urlToBuffer } from '../../utils/base64url';
 import './Login.css';
 import './TOTPInput.css';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any -- server options arrive as JSON with base64url-encoded buffers; the whole purpose of this helper is to decode those into typed `PublicKeyCredentialRequestOptions` — accepting `any` at the boundary and narrowing field-by-field is the right discipline
-function parseWebAuthnOptions(serverOptions: any): PublicKeyCredentialRequestOptions {
-  const pk = serverOptions.publicKey || serverOptions;
+const AuthenticatorTransportSchema = z.enum([
+  'ble',
+  'hybrid',
+  'internal',
+  'nfc',
+  'smart-card',
+  'usb',
+]);
+const WebAuthnRequestSchema = z.object({
+  challenge: z.string().min(1),
+  timeout: z.number().nonnegative().optional(),
+  rpId: z.string().min(1).optional(),
+  allowCredentials: z
+    .array(
+      z.object({
+        type: z.literal('public-key'),
+        id: z.string().min(1),
+        transports: z.array(AuthenticatorTransportSchema).optional(),
+      })
+    )
+    .optional(),
+  userVerification: z.enum(['discouraged', 'preferred', 'required']).optional(),
+});
+const WebAuthnServerOptionsSchema = z.union([
+  WebAuthnRequestSchema,
+  z.object({ publicKey: WebAuthnRequestSchema }).transform(({ publicKey }) => publicKey),
+]);
+
+const UserProfileSchema = z
+  .object({
+    id: z.string().min(1),
+    username: z.string(),
+    email: z.string().optional(),
+    email_verified: z.boolean().optional(),
+    display_name: z.string().optional(),
+    bio: z.string().optional(),
+    avatar_url: z.string().optional(),
+    header_image_url: z.string().optional(),
+    links: z.array(z.string()).optional(),
+    created_at: z.string().optional(),
+    username_changed_at: z.string().optional(),
+    username_change_eligible_at: z.string().optional(),
+  })
+  .passthrough();
+const LoginSuccessResponseSchema = z.object({
+  access_token: z.string().min(1),
+  refresh_token: z.string().min(1),
+  session_id: z.string().min(1),
+  remember_me: z.boolean().optional(),
+  user: UserProfileSchema,
+  e2ee_keys: z.object({
+    wrapped_private_key: z.string().min(1),
+    key_derivation_salt: z.string().min(1),
+    key_derivation_alg: z.enum(['argon2id', 'pbkdf2']).optional(),
+    key_version: z.number().int().positive().optional(),
+  }),
+});
+const MFARequiredResponseSchema = z.object({
+  mfa_required: z.literal(true),
+  mfa_challenge_token: z.string().min(1),
+  methods: z.array(z.string()),
+  recovery_only_methods: z.array(z.string()).optional(),
+  webauthn_options: z.unknown().optional(),
+});
+const LoginErrorResponseSchema = z
+  .object({
+    error: z.string().optional(),
+    error_code: z.string().optional(),
+    providers: z.array(z.string()).optional(),
+  })
+  .passthrough();
+
+type LoginSuccessResponse = z.infer<typeof LoginSuccessResponseSchema>;
+type MFARequiredResponse = z.infer<typeof MFARequiredResponseSchema>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function responseError(data: unknown, fallback: string): string {
+  const parsed = LoginErrorResponseSchema.safeParse(data);
+  return parsed.success ? (parsed.data.error ?? fallback) : fallback;
+}
+
+function malformedLoginSession(data: unknown, apiBase: string) {
+  const record = isRecord(data) ? data : {};
+  return {
+    accessToken: typeof record.access_token === 'string' ? record.access_token : null,
+    refreshToken: typeof record.refresh_token === 'string' ? record.refresh_token : null,
+    sessionId: typeof record.session_id === 'string' ? record.session_id : null,
+    apiBase,
+  };
+}
+
+function responseIssuedSessionID(response: Response): string | null {
+  return response.headers?.get('X-Concord-Session-ID')?.trim() || null;
+}
+
+async function revokeMalformedLoginSession(
+  data: unknown,
+  apiBase: string,
+  issuedSessionID: string | null
+): Promise<void> {
+  const session = malformedLoginSession(data, apiBase);
+  // When present, the response header is the backend's authoritative refresh
+  // row ID. Prefer it to any partially decoded body value; this is precisely
+  // the malformed-success path the header exists to recover.
+  if (issuedSessionID !== null) session.sessionId = issuedSessionID;
+  if (
+    session.refreshToken !== null ||
+    (session.accessToken !== null && session.sessionId !== null)
+  ) {
+    await revokeAbortedSession(session);
+  } else if (issuedSessionID !== null) {
+    await revokeAbortedSession({
+      accessToken: null,
+      sessionId: issuedSessionID,
+      cookieBound: true,
+      apiBase,
+    });
+  }
+}
+
+async function parseLoginResponseJson(response: Response, apiBase: string): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch (error) {
+    if (!response.ok) throw error;
+
+    // Only CompleteLogin responses carry a server-issued session ID. An
+    // undecodable 2xx initial MFA challenge has no new session and must not log
+    // out an unrelated remembered cookie. The backend binds this ID to the
+    // ambient cookie hash atomically, so a successor cookie cannot be revoked.
+    const sessionID = responseIssuedSessionID(response);
+    if (sessionID !== null) {
+      await revokeAbortedSession({
+        accessToken: null,
+        sessionId: sessionID,
+        cookieBound: true,
+        apiBase,
+      });
+    }
+    throw new Error('Server returned an invalid login response.');
+  }
+}
+
+async function parseLoginSuccessResponse(
+  data: unknown,
+  apiBase: string,
+  issuedSessionID: string | null
+): Promise<LoginSuccessResponse> {
+  const parsed = LoginSuccessResponseSchema.safeParse(data);
+  if (!parsed.success) {
+    // The backend commits the refresh cookie before serializing the success
+    // body. Revoke when the issuance marker or safely extracted access/session
+    // evidence proves this is a completion — never for an unmarked malformed
+    // initial MFA challenge, which did not replace the remembered cookie.
+    await revokeMalformedLoginSession(data, apiBase, issuedSessionID);
+    throw new Error('Server returned an invalid login response.');
+  }
+  return parsed.data;
+}
+
+function parseWebAuthnOptions(serverOptions: unknown): PublicKeyCredentialRequestOptions {
+  const parsed = WebAuthnServerOptionsSchema.safeParse(serverOptions);
+  if (!parsed.success) throw new Error('Server returned invalid WebAuthn options.');
+  const pk = parsed.data;
   const opts: PublicKeyCredentialRequestOptions = {
     challenge: base64urlToBuffer(pk.challenge),
     timeout: pk.timeout,
     rpId: pk.rpId,
   };
   if (pk.allowCredentials) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- same rationale as the enclosing `parseWebAuthnOptions` — server-side JSON credentials are narrowed here into typed `PublicKeyCredentialDescriptor` entries
-    opts.allowCredentials = pk.allowCredentials.map((cred: any) => ({
+    opts.allowCredentials = pk.allowCredentials.map((cred) => ({
       type: cred.type,
       id: base64urlToBuffer(cred.id),
-      transports: cred.transports,
+      // TypeScript's lib.dom omits WebAuthn Level 3's smart-card value. The
+      // closed Zod enum above matches the backend's go-webauthn v0.17.4 contract.
+      transports: cred.transports?.map((transport) => transport as AuthenticatorTransport),
     }));
   }
   if (pk.userVerification) {
@@ -70,6 +248,15 @@ async function checkSafeStorage(): Promise<string | null> {
  */
 const TEARDOWN_ABORT_NOTICE =
   'Your session ended before sign-in could finish. Please sign in again.';
+
+class LoginOriginChangedError extends E2EEInitTeardownError {
+  constructor() {
+    super();
+    this.name = 'LoginOriginChangedError';
+  }
+}
+
+class LoginOwnershipChangedError extends E2EEInitTeardownError {}
 
 /**
  * Map a login-flow error to its user-facing message. A teardown abort
@@ -198,6 +385,8 @@ const Login: React.FC<LoginProps> = ({
   // never stranded with credentials they can't actually use.
   const [ssoOnlyProviders, setSsoOnlyProviders] = useState<string[] | null>(null);
   const { begin: beginSSO } = useSSOFlow();
+  const ssoAuthenticating = useSSOStore((state) => state.state.phase === 'authenticating');
+  const authBusy = isSubmitting || ssoAuthenticating;
   const oauthProviders = useClientConfigStore(
     (state) => state.serverCapabilities?.auth.oauthProviders ?? EMPTY_OAUTH_PROVIDERS
   );
@@ -212,6 +401,7 @@ const Login: React.FC<LoginProps> = ({
   const [mfaMode, setMfaMode] = useState<MFAMethodCategory | 'method-select'>('totp');
   const [mfaRecoveryOnly, setMfaRecoveryOnly] = useState<string[]>([]);
   const [mfaError, setMfaError] = useState('');
+  const [mfaServerSelection, setMfaServerSelection] = useState<RuntimeServerSelection | null>(null);
   const [webauthnOptions, setWebauthnOptions] = useState<PublicKeyCredentialRequestOptions | null>(
     null
   );
@@ -234,8 +424,12 @@ const Login: React.FC<LoginProps> = ({
 
   // Non-destructive abort: clear the early-set token so there is no
   // half-authenticated state, and surface guidance on the login screen (#1293).
-  const abortKeyRecovery = () => {
-    useAuthStore.getState().clearAccessToken();
+  const abortKeyRecovery = (expectedAuthGeneration?: number) => {
+    const auth = useAuthStore.getState();
+    if (expectedAuthGeneration !== undefined && auth.authGeneration !== expectedAuthGeneration) {
+      return;
+    }
+    auth.clearAccessToken();
     setErrors({
       general:
         'Your encryption keys couldn’t be recovered on this device. You can try again, or recover your account on a device that still has your keys.',
@@ -274,16 +468,27 @@ const Login: React.FC<LoginProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (ssoAuthenticating) return;
     setErrors({});
 
     if (!validateForm()) {
       return;
     }
 
+    // Bind the whole submission to its invocation-time origin before the first
+    // await. Safe-storage permission checking is an IPC boundary too; a server
+    // switch while it is pending must not retarget the credentials afterward.
+    const requestSelection = captureRuntimeServerSelection();
+    const requestApiBase = requestSelection.apiBase;
+
     // Fail-closed safeStorage enforcement (#197)
     const storageError = await checkSafeStorage();
     if (storageError) {
       setErrors({ general: storageError });
+      return;
+    }
+    if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+      setErrors({ general: 'Server selection changed. Please try again.' });
       return;
     }
 
@@ -292,10 +497,13 @@ const Login: React.FC<LoginProps> = ({
     try {
       console.debug('Logging in...');
 
-      const machineId = await ensureMachineId();
+      const machineId = await ensureMachineId(requestApiBase);
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+        throw new LoginOriginChangedError();
+      }
 
       // Login with backend
-      const response = await fetch(apiUrl('/api/v1/auth/login'), {
+      const response = await fetch(`${requestApiBase}/api/v1/auth/login`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -309,7 +517,11 @@ const Login: React.FC<LoginProps> = ({
         }),
       });
 
-      const data = await response.json();
+      const data = await parseLoginResponseJson(response, requestApiBase);
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+        await revokeMalformedLoginSession(data, requestApiBase, responseIssuedSessionID(response));
+        throw new LoginOriginChangedError();
+      }
 
       // SSO short-circuits — see helper closures below for the per-status
       // routing (403 account_uses_sso, 500 sso_provider_lookup_failed,
@@ -319,16 +531,28 @@ const Login: React.FC<LoginProps> = ({
       if (tryApplySSO500Error(response, data)) return;
 
       if (!response.ok) {
-        throw new Error(data.error || 'Login failed');
+        throw new Error(responseError(data, 'Login failed'));
       }
 
       // Check if MFA is required
-      if (data.mfa_required) {
-        applyMfaRequiredFromResponse(data);
+      if (isRecord(data) && data.mfa_required === true) {
+        const mfaResponse = MFARequiredResponseSchema.safeParse(data);
+        if (!mfaResponse.success) {
+          await revokeMalformedLoginSession(
+            data,
+            requestApiBase,
+            responseIssuedSessionID(response)
+          );
+          throw new Error('Server returned an invalid MFA challenge.');
+        }
+        applyMfaRequiredFromResponse(mfaResponse.data, requestSelection);
         return;
       }
 
-      await completeLoginFromResponse(data);
+      await completeLoginFromResponse(
+        await parseLoginSuccessResponse(data, requestApiBase, responseIssuedSessionID(response)),
+        requestSelection
+      );
     } catch (error) {
       console.error('Login error:', errorMessage(error));
       setErrors({
@@ -346,12 +570,11 @@ const Login: React.FC<LoginProps> = ({
   // handlers.go (PasswordLoginDisabled handling). Returns true if handled.
   // Extracted from handleSubmit to stay under S3776 (the inlined ternary on
   // data.providers contributed nesting penalty). Behavior unchanged.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- server payload is loose JSON; providers narrowed via Array.isArray below.
-  const tryApplyAccountUsesSSO = (response: Response, data: any): boolean => {
+  const tryApplyAccountUsesSSO = (response: Response, data: unknown): boolean => {
     if (response.status !== 403) return false;
-    if (data?.error_code !== 'account_uses_sso') return false;
-    const providers = Array.isArray(data.providers) ? (data.providers as string[]) : [];
-    setSsoOnlyProviders(providers);
+    const parsed = LoginErrorResponseSchema.safeParse(data);
+    if (!parsed.success || parsed.data.error_code !== 'account_uses_sso') return false;
+    setSsoOnlyProviders(parsed.data.providers ?? []);
     setIsSubmitting(false);
     return true;
   };
@@ -363,10 +586,11 @@ const Login: React.FC<LoginProps> = ({
   // under SonarQube's S3776 cognitive-complexity threshold; behavior is
   // unchanged. See the inline comment at the call site for the two error_codes
   // and their UX rationale.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- server error payload is loose JSON; we narrow on error_code field-by-field below.
-  const tryApplySSO500Error = (response: Response, data: any): boolean => {
+  const tryApplySSO500Error = (response: Response, data: unknown): boolean => {
     if (response.status !== 500) return false;
-    const code = data?.error_code as string | undefined;
+    const parsed = LoginErrorResponseSchema.safeParse(data);
+    if (!parsed.success) return false;
+    const code = parsed.data.error_code;
     let message: string | null = null;
     if (code === 'sso_provider_lookup_failed') {
       message =
@@ -384,15 +608,21 @@ const Login: React.FC<LoginProps> = ({
   // Surface MFA challenge to the user when the server returns mfa_required.
   // Extracted from handleSubmit so that handler stays under SonarQube's S3776
   // cognitive-complexity threshold; behavior is unchanged.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- server MFA payload shape (methods, recovery_only_methods, webauthn_options) is the same loose JSON the parent handler accepted; narrowing is done field-by-field inside.
-  const applyMfaRequiredFromResponse = (data: any) => {
-    const serverMethods = data.methods || [];
-    const recoveryOnly = data.recovery_only_methods || [];
+  const applyMfaRequiredFromResponse = (
+    data: MFARequiredResponse,
+    requestSelection: RuntimeServerSelection
+  ) => {
+    const serverMethods = data.methods;
+    const recoveryOnly = data.recovery_only_methods ?? [];
+    const parsedWebAuthnOptions = data.webauthn_options
+      ? parseWebAuthnOptions(data.webauthn_options)
+      : null;
     setMfaChallengeToken(data.mfa_challenge_token);
     setMfaMethods(serverMethods);
     setMfaRecoveryOnly(recoveryOnly);
+    setMfaServerSelection(requestSelection);
     setMfaMode(getDefaultMethod(serverMethods, recoveryOnly));
-    if (data.webauthn_options) setWebauthnOptions(parseWebAuthnOptions(data.webauthn_options));
+    setWebauthnOptions(parsedWebAuthnOptions);
     setMfaRequired(true);
     setIsSubmitting(false);
   };
@@ -405,14 +635,26 @@ const Login: React.FC<LoginProps> = ({
   // completeLoginFromResponse to keep that function under the cognitive-
   // complexity threshold (#1293).
   const handleKeyRecovery = async (
-    teardownEpoch?: number,
-    abortedSession?: { accessToken: string; sessionId: string | null; apiBase?: string }
+    teardownEpoch: number | undefined,
+    abortedSession: AbortedSessionRef,
+    requestSelection: RuntimeServerSelection,
+    abortForOriginChange: () => Promise<never>,
+    initializationGuard: E2EEInitializationGuard,
+    requireFlowOwnership: () => Promise<void>,
+    // Set the caller's flowInitializationReceipt the instant the recovery
+    // initialize() commits, so an ownership/origin abort inside this helper wipes
+    // the committed keyset instead of no-op'ing on a null receipt (CWE-212).
+    captureFlowReceipt: () => void
   ): Promise<boolean> => {
     const decision = await promptKeyRecovery();
     setKeyRecoveryResolver(null);
+    if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+      await abortForOriginChange();
+    }
+    await requireFlowOwnership();
 
     if (decision.action === 'cancel') {
-      abortKeyRecovery();
+      abortKeyRecovery(abortedSession.authGeneration);
       return false;
     }
 
@@ -425,8 +667,11 @@ const Login: React.FC<LoginProps> = ({
     try {
       const newKeys = await generateRegistrationKeys(formData.password);
       const publicKeyB64 = await exportPublicKey(newKeys.publicKey);
-      const sendReset = (mfaCode?: string) =>
-        apiFetch('/api/v1/users/me/keys', {
+      const sendReset = (mfaCode?: string) => {
+        if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+          return abortForOriginChange();
+        }
+        return apiFetch('/api/v1/users/me/keys', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -439,8 +684,14 @@ const Login: React.FC<LoginProps> = ({
             acknowledge_data_loss: true,
           }),
         });
+      };
 
+      await requireFlowOwnership();
       let replaceRes = await sendReset(decision.mfaCode);
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+        await abortForOriginChange();
+      }
+      await requireFlowOwnership();
 
       // Step-up MFA: if the server requires an MFA code, re-open the prompt in
       // MFA-entry mode and retry once with the supplied code.
@@ -451,24 +702,38 @@ const Login: React.FC<LoginProps> = ({
           const mfaDecision = await promptKeyRecovery();
           setKeyRecoveryResolver(null);
           setKeyRecoveryMfaRequired(false);
+          if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+            await abortForOriginChange();
+          }
+          await requireFlowOwnership();
           if (mfaDecision.action === 'cancel') {
-            abortKeyRecovery();
+            abortKeyRecovery(abortedSession.authGeneration);
             return false;
           }
+          await requireFlowOwnership();
           replaceRes = await sendReset(mfaDecision.mfaCode);
         }
       }
 
       if (!replaceRes.ok) throw new Error('Failed to reset encryption keys. Please try again.');
 
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+        await abortForOriginChange();
+      }
+      await requireFlowOwnership();
       await e2eeService.initialize(
         formData.password,
         newKeys.wrappedPrivateKey,
         newKeys.keyDerivationSalt,
         newKeys.keyDerivationAlg,
-        undefined,
+        initializationGuard,
         teardownEpoch
       );
+      captureFlowReceipt();
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+        await abortForOriginChange();
+      }
+      await requireFlowOwnership();
       console.debug('E2EE keys reset and service initialized!');
       return true;
     } catch (resetError) {
@@ -476,21 +741,40 @@ const Login: React.FC<LoginProps> = ({
       // the primary init path (Codex P1, #2337): strip only this flow's own
       // token and revoke the aborted server session — otherwise the login's
       // refresh-token row + HttpOnly cookie outlive the logout-class teardown.
-      if (resetError instanceof E2EEInitTeardownError && abortedSession) {
+      if (resetError instanceof E2EEInitTeardownError) {
         const auth = useAuthStore.getState();
-        if (auth.accessToken === abortedSession.accessToken) auth.clearAccessToken();
-        await revokeAbortedSession(abortedSession);
+        if (
+          abortedSession.authGeneration !== undefined &&
+          auth.authGeneration === abortedSession.authGeneration
+        ) {
+          auth.clearAccessToken();
+        }
+        if (
+          !(resetError instanceof LoginOriginChangedError) &&
+          !(resetError instanceof LoginOwnershipChangedError)
+        ) {
+          await revokeAbortedSession(abortedSession);
+        }
         throw resetError;
       }
-      useAuthStore.getState().clearAccessToken();
+      const auth = useAuthStore.getState();
+      if (
+        abortedSession.authGeneration !== undefined &&
+        auth.authGeneration === abortedSession.authGeneration
+      ) {
+        auth.clearAccessToken();
+      }
       throw resetError;
     }
   };
 
   // Complete login after receiving tokens (shared between direct login and MFA verify)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- server login payload shape varies across direct-login and MFA-verify endpoints (different e2ee_keys wrapping, optional session_id); field-by-field narrowing inside the function is clearer than a 30-line union type
-  const completeLoginFromResponse = async (data: any) => {
+  const completeLoginFromResponse = async (
+    data: LoginSuccessResponse,
+    requestSelection: RuntimeServerSelection
+  ) => {
     console.debug('Login successful, unwrapping private key...');
+    const requestApiBase = requestSelection.apiBase;
 
     // Capture the teardown epoch BEFORE publishing the access token: setting
     // the token arms authenticated effects that can trigger an authoritative
@@ -508,23 +792,85 @@ const Login: React.FC<LoginProps> = ({
     // E2EE cleared. Identity-guarded so a rapid successor login's fresh
     // token is never stripped by this stale continuation (same
     // session-binding discipline as revokeAbortedSession).
+    let flowAuthGeneration: number | null = null;
     const stripAbortedToken = () => {
       const auth = useAuthStore.getState();
-      if (auth.accessToken === data.access_token) auth.clearAccessToken();
+      if (flowAuthGeneration !== null && auth.authGeneration === flowAuthGeneration) {
+        auth.clearAccessToken();
+      }
     };
 
     // One session reference for every abort site: this flow's own credentials
     // plus the API origin they belong to (self-hosted switch hazard — see
     // AbortedSessionRef in apiClient).
-    const abortedSession = {
-      accessToken: data.access_token as string,
-      sessionId: (data.session_id ?? null) as string | null,
-      apiBase: getApiBase(),
+    const abortedSession: AbortedSessionRef = {
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token,
+      sessionId: data.session_id ?? null,
+      apiBase: requestApiBase,
     };
 
+    let credentialOwner: CredentialOwner | null = null;
+    const flowOwnsAuthStore = () => {
+      return (
+        flowAuthGeneration !== null && useAuthStore.getState().authGeneration === flowAuthGeneration
+      );
+    };
+    const clearAbortedDiskTokens = async () => {
+      if (credentialOwner !== null) {
+        await globalThis.electron?.clearTokensIfOwner?.(credentialOwner);
+      }
+    };
+    let flowInitializationReceipt: ReturnType<typeof e2eeService.captureInitializationReceipt> =
+      null;
+    const clearFlowSessionKeys = () => {
+      e2eeService.clearKeysIfInitializationCurrent(flowInitializationReceipt);
+    };
+    const abortForOriginChange = async (): Promise<never> => {
+      if (flowOwnsAuthStore()) {
+        // The key material and renderer token still belong to this old-origin
+        // flow. Clear them before the successor origin can observe either.
+        e2eeService.clearKeys();
+        useAuthStore.getState().clearAccessToken();
+        if (credentialOwner !== null) await clearAbortedDiskTokens();
+      } else {
+        // A successor may already own auth. Clear only if the singleton still
+        // holds this flow's exact keyset; never erase keys a successor committed.
+        clearFlowSessionKeys();
+      }
+      await revokeAbortedSession(abortedSession);
+      throw new LoginOriginChangedError();
+    };
+    const abortForLostOwnership = async (): Promise<never> => {
+      // The auth store belongs to a successor (or was cleared). Remove only
+      // this flow's exact in-memory keyset and only its disk copy; both helpers
+      // decline to touch successor-owned state.
+      clearFlowSessionKeys();
+      if (credentialOwner !== null) await clearAbortedDiskTokens();
+      await revokeAbortedSession(abortedSession);
+      throw new LoginOwnershipChangedError();
+    };
+    const requireFlowOwnership = async (): Promise<void> => {
+      if (!flowOwnsAuthStore()) await abortForLostOwnership();
+    };
+    const abortForCredentialPersistenceFailure = async (error: unknown): Promise<never> => {
+      clearFlowSessionKeys();
+      stripAbortedToken();
+      await revokeAbortedSession(abortedSession);
+      throw error;
+    };
+
+    if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
+
     // Set access token early so e2eeService can make authenticated API calls (e.g., key migration)
-    useAuthStore.getState().setAccessToken(data.access_token);
-    if (data.session_id) useAuthStore.getState().setSessionId(data.session_id);
+    flowAuthGeneration = useAuthStore
+      .getState()
+      .beginAuthLifecycle(data.access_token, data.session_id ?? null);
+    abortedSession.authGeneration = flowAuthGeneration;
+    const initializationGuard: E2EEInitializationGuard = {
+      signal: new AbortController().signal,
+      isCurrent: () => runtimeServerSelectionIsCurrent(requestSelection) && flowOwnsAuthStore(),
+    };
 
     const kdAlg = data.e2ee_keys.key_derivation_alg || 'pbkdf2';
     try {
@@ -534,15 +880,28 @@ const Login: React.FC<LoginProps> = ({
         data.e2ee_keys.key_derivation_salt,
         kdAlg
       );
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
+      await requireFlowOwnership();
       // e2eeService.initialize handles PBKDF2→Argon2id migration automatically
       await e2eeService.initialize(
         formData.password,
         data.e2ee_keys.wrapped_private_key,
         data.e2ee_keys.key_derivation_salt,
         kdAlg,
-        undefined,
+        initializationGuard,
         teardownEpoch
       );
+      // Capture the receipt the instant initialize() resolves — BEFORE the
+      // origin/ownership re-checks below. Otherwise, if ownership is lost in the
+      // microtask window between initialize()'s synchronous key commit and
+      // requireFlowOwnership(), the abort's clearFlowSessionKeys() runs against a
+      // still-null receipt and cannot wipe the committed keyset (CWE-212).
+      // captureInitializationReceipt() returns null when no keyset committed, and
+      // clearKeysIfInitializationCurrent is identity+attempt-guarded, so an early
+      // capture can never erase a successor's keys.
+      flowInitializationReceipt = e2eeService.captureInitializationReceipt();
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
+      await requireFlowOwnership();
       console.debug('Private key unwrapped and E2EE service initialized!');
     } catch (unwrapError) {
       // A teardown mid-login is NOT a corrupt-key condition — never route it
@@ -551,15 +910,33 @@ const Login: React.FC<LoginProps> = ({
       // session this login belonged to is gone).
       if (unwrapError instanceof E2EEInitTeardownError) {
         stripAbortedToken();
-        await revokeAbortedSession(abortedSession);
+        if (
+          !(unwrapError instanceof LoginOriginChangedError) &&
+          !(unwrapError instanceof LoginOwnershipChangedError)
+        ) {
+          await revokeAbortedSession(abortedSession);
+        }
         throw unwrapError;
       }
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
       console.warn(
         'Key unwrap failed; prompting for consented key reset',
         errorMessage(unwrapError)
       );
-      const recovered = await handleKeyRecovery(teardownEpoch, abortedSession);
+      const recovered = await handleKeyRecovery(
+        teardownEpoch,
+        abortedSession,
+        requestSelection,
+        abortForOriginChange,
+        initializationGuard,
+        requireFlowOwnership,
+        () => {
+          flowInitializationReceipt = e2eeService.captureInitializationReceipt();
+        }
+      );
       if (!recovered) return;
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
+      await requireFlowOwnership();
     }
 
     // Pre-admit epoch check #1: initialize()'s fence covers only the span up
@@ -570,15 +947,36 @@ const Login: React.FC<LoginProps> = ({
       await revokeAbortedSession(abortedSession);
       throw new E2EEInitTeardownError();
     }
+    if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
+    await requireFlowOwnership();
 
-    if (globalThis.electron?.storeRefreshToken) {
-      await globalThis.electron.storeRefreshToken({
-        refreshToken: data.refresh_token,
-        rememberMe: data.remember_me ?? formData.rememberMe,
-        apiBase: getApiBase(),
-        accessToken: data.access_token,
-      });
+    if (globalThis.electron) {
+      if (!globalThis.electron.storeRefreshToken) {
+        await abortForCredentialPersistenceFailure(
+          new Error('Desktop refresh-token persistence is unavailable.')
+        );
+      }
+      let storedOwner: CredentialOwner | { status: 'rejected' } | null = null;
+      try {
+        storedOwner = await globalThis.electron.storeRefreshToken({
+          refreshToken: data.refresh_token,
+          rememberMe: data.remember_me ?? formData.rememberMe,
+          apiBase: requestApiBase,
+          accessToken: data.access_token,
+        });
+      } catch (storeError) {
+        await abortForCredentialPersistenceFailure(storeError);
+      }
+      if (typeof storedOwner === 'number') {
+        credentialOwner = storedOwner;
+      } else {
+        await abortForCredentialPersistenceFailure(
+          new Error('Desktop rejected refresh-token persistence.')
+        );
+      }
     }
+    if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
+    await requireFlowOwnership();
     // Deliberately NO token re-publish here: the early set above already
     // installed it, and an unconditional re-set would resurrect a token that
     // a mid-await teardown just cleared — past the final abort check below
@@ -587,13 +985,29 @@ const Login: React.FC<LoginProps> = ({
 
     // Persist E2EE keys for restart-survival; failure warns only and never
     // clears the valid in-session keys (#1278/#1288 — see persistE2EESessionKeys).
-    await persistE2EESessionKeys(e2eeService.getSessionKeys());
+    await requireFlowOwnership();
+    await persistE2EESessionKeys(
+      flowInitializationReceipt?.sessionKeys ?? null,
+      credentialOwner ?? undefined
+    );
+    if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
+    await requireFlowOwnership();
 
     // Hydrate all post-login user state — preferences, saved GIFs, notification
     // mute prefs, and the entitlement capability set. Extracted to the shared
     // helper (#1297) so SSO and session-restore hydrate identically; failures
     // of individual steps are non-fatal (each swallows its own network blips).
-    await hydratePostLogin();
+    await requireFlowOwnership();
+    const hydrationGuard = beginPostLoginHydrationGuard();
+    await hydratePostLogin({
+      signal: hydrationGuard.signal,
+      isCurrent: () =>
+        hydrationGuard.isCurrent() &&
+        runtimeServerSelectionIsCurrent(requestSelection) &&
+        flowOwnsAuthStore(),
+    });
+    if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
+    await requireFlowOwnership();
 
     // The storeRefreshToken IPC above may have persisted this dead flow's
     // refresh token + cached access token to DISK. The server revoke below is
@@ -601,12 +1015,6 @@ const Login: React.FC<LoginProps> = ({
     // resurrect the torn-down session from that disk copy (Codex P1, #2337).
     // Identity-guarded: when a successor session owns the renderer, its own
     // storeRefreshToken owns the disk copy too — never wipe it.
-    const clearAbortedDiskTokens = async () => {
-      const live = useAuthStore.getState().accessToken;
-      if (live === null || live === data.access_token) {
-        await globalThis.electron?.clearTokens?.();
-      }
-    };
 
     // Pre-admit epoch check #2 — immediately before completing login: a
     // teardown during the token-store / persist / hydrate awaits above must
@@ -619,24 +1027,18 @@ const Login: React.FC<LoginProps> = ({
       throw new E2EEInitTeardownError();
     }
 
-    // Token-lifecycle admit gate (Codex P1, PR #2337): a token-ONLY clear —
-    // handleRefreshFailure's `phase !== 'stable'` path clears the access
-    // token WITHOUT clearKeys() — leaves the teardown epoch untouched, so
-    // every epoch check above passes. If this flow's session no longer owns
+    // Token-lifecycle admit gate (Codex P1, PR #2337): an epoch check proves
+    // key custody only at that instant; auth ownership can be cleared or
+    // replaced at a later await boundary. If this flow's session no longer owns
     // the auth store (cleared, or replaced by a successor login), it must not
     // be admitted: abort instead of completing with credentials the auth
-    // layer already rejected. Ownership is SESSION-identity first (a
-    // proactive/reactive refresh legitimately rotates the access token for
-    // the SAME session_id mid-flight — that must still admit, Codex P1);
-    // token equality is the fallback for responses without a session_id.
+    // layer already rejected. The client-owned generation remains stable while
+    // a refresh legitimately rotates both access token and session ID, unlike
+    // either server credential; a successor login always starts a new one.
     const liveAuth = useAuthStore.getState();
-    const stillOwnsStore = data.session_id
-      ? liveAuth.sessionId === data.session_id
-      : liveAuth.accessToken === data.access_token;
+    const stillOwnsStore = liveAuth.authGeneration === flowAuthGeneration;
     if (!stillOwnsStore) {
-      await clearAbortedDiskTokens();
-      await revokeAbortedSession(abortedSession);
-      throw new E2EEInitTeardownError();
+      await abortForLostOwnership();
     }
 
     // A successful admit clears any abort notice a torn-down EARLIER flow
@@ -662,8 +1064,17 @@ const Login: React.FC<LoginProps> = ({
     setIsSubmitting(true);
     setMfaError('');
     try {
-      const machineId = await ensureMachineId();
-      const res = await fetch(apiUrl('/api/v1/auth/mfa/verify'), {
+      if (mfaServerSelection === null) throw new Error('MFA challenge origin is unavailable.');
+      const requestSelection = mfaServerSelection;
+      const requestApiBase = requestSelection.apiBase;
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+        throw new LoginOriginChangedError();
+      }
+      const machineId = await ensureMachineId(requestApiBase);
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+        throw new LoginOriginChangedError();
+      }
+      const res = await fetch(`${requestApiBase}/api/v1/auth/mfa/verify`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -677,11 +1088,18 @@ const Login: React.FC<LoginProps> = ({
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Verification failed');
+      const data = await parseLoginResponseJson(res, requestApiBase);
+      if (!res.ok) throw new Error(responseError(data, 'Verification failed'));
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+        await revokeMalformedLoginSession(data, requestApiBase, responseIssuedSessionID(res));
+        throw new LoginOriginChangedError();
+      }
 
       // MFA verify returns full login response (tokens + user + keys)
-      await completeLoginFromResponse(data);
+      await completeLoginFromResponse(
+        await parseLoginSuccessResponse(data, requestApiBase, responseIssuedSessionID(res)),
+        requestSelection
+      );
     } catch (err) {
       setMfaError(describeLoginError(err, 'Verification failed'));
     } finally {
@@ -735,8 +1153,17 @@ const Login: React.FC<LoginProps> = ({
     setIsSubmitting(true);
     setMfaError('');
     try {
-      const machineId = await ensureMachineId();
-      const res = await fetch(apiUrl('/api/v1/auth/mfa/verify'), {
+      if (mfaServerSelection === null) throw new Error('MFA challenge origin is unavailable.');
+      const requestSelection = mfaServerSelection;
+      const requestApiBase = requestSelection.apiBase;
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+        throw new LoginOriginChangedError();
+      }
+      const machineId = await ensureMachineId(requestApiBase);
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+        throw new LoginOriginChangedError();
+      }
+      const res = await fetch(`${requestApiBase}/api/v1/auth/mfa/verify`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -749,9 +1176,16 @@ const Login: React.FC<LoginProps> = ({
           assertion,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Verification failed');
-      await completeLoginFromResponse(data);
+      const data = await parseLoginResponseJson(res, requestApiBase);
+      if (!res.ok) throw new Error(responseError(data, 'Verification failed'));
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+        await revokeMalformedLoginSession(data, requestApiBase, responseIssuedSessionID(res));
+        throw new LoginOriginChangedError();
+      }
+      await completeLoginFromResponse(
+        await parseLoginSuccessResponse(data, requestApiBase, responseIssuedSessionID(res)),
+        requestSelection
+      );
     } catch (err) {
       setMfaError(describeLoginError(err, 'Verification failed'));
     } finally {
@@ -874,6 +1308,7 @@ const Login: React.FC<LoginProps> = ({
               onClick={() => {
                 setMfaRequired(false);
                 setMfaError('');
+                setMfaServerSelection(null);
               }}
               disabled={isSubmitting}
             >
@@ -914,16 +1349,17 @@ const Login: React.FC<LoginProps> = ({
 
           <div className="login-form login-form--sso-only">
             {!isEmpty && ssoOnlyProviders.includes('google') && (
-              <SSOButton provider="google" onClick={() => beginSSO('google')} />
+              <SSOButton provider="google" onClick={() => beginSSO('google')} disabled={authBusy} />
             )}
             {!isEmpty && ssoOnlyProviders.includes('apple') && (
-              <SSOButton provider="apple" onClick={() => beginSSO('apple')} />
+              <SSOButton provider="apple" onClick={() => beginSSO('apple')} disabled={authBusy} />
             )}
 
             <button
               type="button"
               className="login-back-btn"
               onClick={() => setSsoOnlyProviders(null)}
+              disabled={authBusy}
             >
               ← Back to login
             </button>
@@ -961,18 +1397,10 @@ const Login: React.FC<LoginProps> = ({
         {hasDefaultSSO && (
           <div className="login-sso-row">
             {showGoogleSSO && (
-              <SSOButton
-                provider="google"
-                onClick={() => beginSSO('google')}
-                disabled={isSubmitting}
-              />
+              <SSOButton provider="google" onClick={() => beginSSO('google')} disabled={authBusy} />
             )}
             {showAppleSSO && (
-              <SSOButton
-                provider="apple"
-                onClick={() => beginSSO('apple')}
-                disabled={isSubmitting}
-              />
+              <SSOButton provider="apple" onClick={() => beginSSO('apple')} disabled={authBusy} />
             )}
           </div>
         )}
@@ -995,7 +1423,7 @@ const Login: React.FC<LoginProps> = ({
               placeholder="you@example.com"
               value={formData.email}
               onChange={handleChange('email')}
-              disabled={isSubmitting}
+              disabled={authBusy}
               autoFocus
             />
             {errors.email && <span className="form-error">{errors.email}</span>}
@@ -1005,7 +1433,7 @@ const Login: React.FC<LoginProps> = ({
           <PasswordField
             value={formData.password}
             onChange={handleChange('password')}
-            disabled={isSubmitting}
+            disabled={authBusy}
             error={errors.password}
           />
 
@@ -1016,7 +1444,7 @@ const Login: React.FC<LoginProps> = ({
                 type="checkbox"
                 checked={formData.rememberMe}
                 onChange={handleChange('rememberMe')}
-                disabled={isSubmitting}
+                disabled={authBusy}
               />
               <span>Remember me</span>
             </label>
@@ -1024,7 +1452,7 @@ const Login: React.FC<LoginProps> = ({
               type="button"
               className="forgot-password-link"
               onClick={onForgotPassword}
-              disabled={isSubmitting}
+              disabled={authBusy}
             >
               Forgot password?
             </button>
@@ -1038,7 +1466,7 @@ const Login: React.FC<LoginProps> = ({
           )}
 
           {/* Submit Button */}
-          <button type="submit" className="login-submit-btn" disabled={isSubmitting}>
+          <button type="submit" className="login-submit-btn" disabled={authBusy}>
             {isSubmitting ? (
               <>
                 Signing In...
@@ -1050,7 +1478,7 @@ const Login: React.FC<LoginProps> = ({
           </button>
 
           {/* Back Button */}
-          <button type="button" className="login-back-btn" onClick={onBack} disabled={isSubmitting}>
+          <button type="button" className="login-back-btn" onClick={onBack} disabled={authBusy}>
             ← Back to Connection Options
           </button>
         </form>
@@ -1061,7 +1489,7 @@ const Login: React.FC<LoginProps> = ({
             <button
               className="switch-to-register-btn"
               onClick={onSwitchToRegister}
-              disabled={isSubmitting}
+              disabled={authBusy}
             >
               Create one
             </button>

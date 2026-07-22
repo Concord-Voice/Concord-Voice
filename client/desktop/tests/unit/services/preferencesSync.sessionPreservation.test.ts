@@ -13,12 +13,6 @@ const API_BASE = 'http://localhost:8080';
 
 const mockGracefulReset = vi.fn();
 const mockNuclearReset = vi.fn();
-vi.mock('@/renderer/services/resetService', () => ({
-  gracefulReset: mockGracefulReset,
-  nuclearReset: mockNuclearReset,
-  softRestart: vi.fn(),
-  stopProactiveRefresh: vi.fn(),
-}));
 
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
@@ -28,7 +22,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { _resetRefreshState } from '@/renderer/services/apiClient';
+import { _resetRefreshState, configureRefreshFailureReset } from '@/renderer/services/apiClient';
 import { preferencesSyncService } from '@/renderer/services/preferencesSync';
 
 function initStubDeps(): void {
@@ -49,6 +43,10 @@ describe('#1956: preferences sync 401 must not force logout', () => {
     resetAllStores();
     _resetRefreshState();
     vi.clearAllMocks();
+    configureRefreshFailureReset({
+      gracefulReset: mockGracefulReset,
+      nuclearReset: mockNuclearReset,
+    });
     resetRuntimeServerBase();
     useConnectionStore.getState().reset();
     initStubDeps();

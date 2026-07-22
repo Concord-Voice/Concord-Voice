@@ -283,6 +283,10 @@ func TestAppleSession_ExistingSSO_IssuesTokens(t *testing.T) {
 	var resp map[string]any
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.NotEmpty(t, resp["access_token"], "trusted existing-SSO must mint tokens directly")
+	assert.NotEmpty(t, resp["refresh_token"], "main-process SSO must receive the refresh token")
+	assert.NotEmpty(t, resp["session_id"], "main-process SSO must receive the session ID")
+	assert.Equal(t, true, resp["remember_me"])
+	assert.Equal(t, resp["session_id"], w.Header().Get(middleware.SessionIDHeader))
 	assert.NotEmpty(t, w.Header().Get("Set-Cookie"), "refresh cookie must be set (respondExistingSSO reuse)")
 }
 

@@ -8,11 +8,10 @@
  * the passphrase by unwrapping the private key locally.
  *
  * On success: calls `e2eeService.initialize`, which derives the wrap-key,
- * unwraps the private key, and persists session keys in safeStorage via the
- * existing `electron.storeE2EEKeys` IPC bridge — the same path traditional
- * password-login uses (see `Login.tsx` `completeLoginFromResponse`). The
- * `onUnlock` callback signals the parent (Task 21 AuthFlow wiring) to
- * transition the user into the app.
+ * unwraps the private key, and persists session keys in safeStorage through
+ * the owner-scoped IPC bridge — the same credential-ownership boundary used
+ * by the SSO callback. The `onUnlock` callback signals the parent (Task 21
+ * AuthFlow wiring) to transition the user into the app.
  *
  * On 3 wrong attempts: surfaces a Social Recovery offer. Once the lock-out
  * branch renders, it stays rendered for this mount — the user can either
@@ -38,8 +37,14 @@ import {
 import { type KeyDerivationAlgorithm } from '../../utils/crypto';
 import { e2eeService } from '../../services/e2eeService';
 import { E2EEInitTeardownError } from '../../services/e2eeErrors';
+import {
+  captureRuntimeServerSelection,
+  runtimeServerSelectionIsCurrent,
+} from '../../services/runtimeServerBase';
 import { useAuthStore } from '../../stores/authStore';
+import { useE2EEStore } from '../../stores/e2eeStore';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
+import type { CredentialOwner } from '../../../main/ipcContract';
 import LoadingSpinner from './LoadingSpinner';
 import './SSOEagerUnlock.css';
 
@@ -68,13 +73,25 @@ const MAX_ATTEMPTS = 3;
  * token with them (Codex P1, PR #2337). File-private so handleSubmit stays
  * under the S3776 cognitive-complexity ceiling.
  */
-async function wipeRepersistedCredentialsForNuclearTeardown(aborted: {
-  accessToken: string | null;
-}): Promise<void> {
-  const live = useAuthStore.getState();
-  if (!live.rememberMe && (live.accessToken === null || live.accessToken === aborted.accessToken)) {
-    await globalThis.electron?.clearTokens?.();
+async function clearCredentialsIfOwner(credentialOwner: CredentialOwner | null): Promise<void> {
+  if (credentialOwner === null) return;
+  try {
+    await globalThis.electron?.clearTokensIfOwner?.(credentialOwner);
+  } catch {
+    // Explicit server revocation is the cleanup backstop.
   }
+}
+
+async function wipeRepersistedCredentialsForNuclearTeardown(
+  credentialOwner: CredentialOwner | null
+): Promise<void> {
+  const live = useAuthStore.getState();
+  if (live.rememberMe) return;
+
+  // SSO callbacks persist refresh credentials in the main process before this
+  // gate mounts. Keep cleanup in that same ownership domain so a stale unlock
+  // cannot erase a successor login that completed at an await boundary.
+  await clearCredentialsIfOwner(credentialOwner);
 }
 
 const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
@@ -82,6 +99,7 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
   const [attemptCount, setAttemptCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const ssoCredentialOwner = useE2EEStore((state) => state.ssoCredentialOwner);
 
   const handleSubmit = async (ev: React.FormEvent) => {
     ev.preventDefault();
@@ -90,6 +108,11 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
     }
     setSubmitting(true);
     setError(null);
+    // One-shot ownership token installed by useSSOFlow alongside the auth
+    // lifecycle. Capture it for this attempt so a later SSO flow cannot make
+    // this continuation persist or clear credentials under the new owner.
+    const credentialOwner = ssoCredentialOwner;
+    const requestSelection = captureRuntimeServerSelection();
 
     // Teardown epoch for the whole unlock attempt (keys fetch + Argon2id):
     // a 401 -> nuclearReset landing anywhere in this span makes initialize()
@@ -104,6 +127,13 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
     // re-captured after that refresh-capable call so the ownership gate and a
     // later revoke track the CURRENT identity, not the stale bearer.
     let abortedSession = captureAuthSession();
+    const requestAuthGeneration = abortedSession.authGeneration;
+    const requestIsCurrent = () =>
+      requestAuthGeneration !== undefined &&
+      useAuthStore.getState().authGeneration === requestAuthGeneration &&
+      runtimeServerSelectionIsCurrent(requestSelection);
+    let flowInitializationReceipt: ReturnType<typeof e2eeService.captureInitializationReceipt> =
+      null;
 
     // Step-isolated error handling so we can distinguish six failure sources
     // and only count true "incorrect passphrase" against the lockout counter.
@@ -160,7 +190,11 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
     // (null === null) and admit a dead session — keeping the pre-fetch owner
     // makes the gate fail closed instead (Codex P1, #2337).
     const postFetchSession = captureAuthSession();
-    if (postFetchSession.accessToken !== null) {
+    if (
+      postFetchSession.accessToken !== null &&
+      postFetchSession.authGeneration === requestAuthGeneration &&
+      runtimeServerSelectionIsCurrent(requestSelection)
+    ) {
       abortedSession = postFetchSession;
     }
 
@@ -171,9 +205,21 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
         wrappedPrivateKey,
         salt,
         alg,
-        undefined,
+        { signal: new AbortController().signal, isCurrent: requestIsCurrent },
         teardownEpoch
       );
+      if (!requestIsCurrent()) {
+        await clearCredentialsIfOwner(credentialOwner);
+        await revokeAbortedSession(abortedSession);
+        setError('Your session expired. Please sign in again.');
+        setSubmitting(false);
+        return;
+      }
+      // Capture only after proving this continuation still owns auth. The
+      // receipt also records the service attempt, so a later cleanup cannot
+      // clear a successor that has merely STARTED initialization but has not
+      // committed its keys yet.
+      flowInitializationReceipt = e2eeService.captureInitializationReceipt();
     } catch (err) {
       // A teardown mid-unlock (401 -> nuclearReset) is a dead-session signal,
       // NOT a wrong passphrase — never charge it against the lockout counter
@@ -198,7 +244,10 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
     // Best-effort persist for restart-survival; the shared helper warns only on
     // failure and never clears the valid in-session keys (#1278/#1288). This does
     // NOT count toward the lockout, and is a no-op if getSessionKeys() is null.
-    await persistE2EESessionKeys(e2eeService.getSessionKeys());
+    await persistE2EESessionKeys(
+      flowInitializationReceipt?.sessionKeys ?? null,
+      credentialOwner ?? undefined
+    );
 
     // Pre-admit epoch check: a teardown landing after initialize() resolved
     // (e.g. during the persist await) must not admit the user (PR #2337).
@@ -206,24 +255,26 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
       // The persist above may have re-written E2EE keys to the main process /
       // safeStorage AFTER the teardown wiped them (Codex P1, #2337) — see the
       // helper for the rememberMe (#1768) and successor-identity guards.
-      await wipeRepersistedCredentialsForNuclearTeardown(abortedSession);
+      e2eeService.clearKeysIfInitializationCurrent(flowInitializationReceipt);
+      await wipeRepersistedCredentialsForNuclearTeardown(credentialOwner);
       await revokeAbortedSession(abortedSession);
       setError('Your session expired. Please sign in again.');
       setSubmitting(false);
       return;
     }
 
-    // Token-lifecycle admit gate (Codex P1, PR #2337): a token-ONLY clear —
-    // handleRefreshFailure's `phase !== 'stable'` path — invalidates the
-    // session WITHOUT advancing the E2EE epoch, so the check above passes.
-    // Verify the captured session still owns the auth store before admitting.
-    // Session-identity first (a same-session token refresh must still admit);
-    // token equality only when the SSO session carries no session ID.
+    // Token-lifecycle admit gate (Codex P1, PR #2337): the epoch check proves
+    // key custody only at that instant, so separately verify that the captured
+    // session still owns the auth store before admitting.
+    // authGeneration is the renderer-owned lifecycle identity: access tokens
+    // and server session IDs can both rotate during a legitimate refresh, but
+    // the generation stays stable. The token/session fallback only supports
+    // legacy snapshots that predate generation tracking.
     const liveAuth = useAuthStore.getState();
-    const stillOwnsStore = abortedSession.sessionId
-      ? liveAuth.sessionId === abortedSession.sessionId
-      : liveAuth.accessToken === abortedSession.accessToken;
+    const stillOwnsStore = requestIsCurrent() && liveAuth.accessToken !== null;
     if (!stillOwnsStore) {
+      e2eeService.clearKeysIfInitializationCurrent(flowInitializationReceipt);
+      await clearCredentialsIfOwner(credentialOwner);
       await revokeAbortedSession(abortedSession);
       setError('Your session expired. Please sign in again.');
       setSubmitting(false);
@@ -231,6 +282,18 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
     }
 
     onUnlock();
+  };
+
+  const handleSocialRecovery = async () => {
+    if (submitting) return;
+    setSubmitting(true);
+    const abortedSession = captureAuthSession();
+    const credentialOwner = ssoCredentialOwner;
+    await Promise.allSettled([
+      clearCredentialsIfOwner(credentialOwner),
+      revokeAbortedSession(abortedSession),
+    ]);
+    onSocialRecovery();
   };
 
   if (attemptCount >= MAX_ATTEMPTS) {
@@ -241,7 +304,12 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
           If you&apos;ve forgotten your passphrase, you can recover access through your trustees.
         </p>
         <div className="sso-eager-unlock__actions">
-          <button type="button" className="sso-eager-unlock__submit" onClick={onSocialRecovery}>
+          <button
+            type="button"
+            className="sso-eager-unlock__submit"
+            onClick={() => void handleSocialRecovery()}
+            disabled={submitting}
+          >
             Use Social Recovery
           </button>
         </div>

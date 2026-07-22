@@ -4,6 +4,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	// SessionIssuedHeader marks responses that created a new refresh session.
+	SessionIssuedHeader = "X-Concord-Session-Issued"
+	// SessionIDHeader identifies that exact refresh session for safe cleanup.
+	SessionIDHeader = "X-Concord-Session-ID"
+)
+
 // CORS returns a middleware that handles CORS.
 // CORS headers are only set when the request includes a non-empty Origin
 // that matches the allowlist. Requests without an Origin header (native
@@ -40,6 +47,7 @@ func setCORSHeaders(c *gin.Context, origin string) {
 	c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
 	c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 	c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Refresh-Token, X-Session-ID, X-Machine-Id, X-Device-Name, X-Request-ID, X-Attestation-Token")
+	c.Writer.Header().Set("Access-Control-Expose-Headers", SessionIssuedHeader+", "+SessionIDHeader)
 	c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 	c.Writer.Header().Set("Access-Control-Max-Age", "86400")
 }

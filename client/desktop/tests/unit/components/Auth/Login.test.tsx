@@ -3,8 +3,14 @@ import Login from '@/renderer/components/Auth/Login';
 import { vi } from 'vitest';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
+import { useSSOStore } from '@/renderer/stores/ssoStore';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import {
+  getApiBase,
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/runtimeServerBase';
 
 // Mock global fetch
 const mockFetch = vi.fn();
@@ -18,6 +24,18 @@ const mockGenerateRegistrationKeys = vi.fn().mockResolvedValue({
   keyDerivationAlg: 'argon2id',
   publicKey: {},
 });
+const { mockE2EESessionKeys, mockE2EEInitializationReceipt, mockE2EEClearKeys } = vi.hoisted(() => {
+  const sessionKeys = {
+    wrappingKeyBase64: 'mock-wrapping-key',
+    preferencesKeyBase64: 'mock-preferences-key',
+    wrappedPrivateKeyBase64: 'mock-wrapped-private-key',
+  };
+  return {
+    mockE2EESessionKeys: sessionKeys,
+    mockE2EEInitializationReceipt: { sessionKeys, attempt: 1 },
+    mockE2EEClearKeys: vi.fn(),
+  };
+});
 
 // Mock crypto and services to avoid real key operations
 vi.mock('@/renderer/utils/crypto', () => ({
@@ -29,12 +47,15 @@ vi.mock('@/renderer/utils/crypto', () => ({
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     initialize: vi.fn().mockResolvedValue(undefined),
+    clearKeys: mockE2EEClearKeys,
     captureTeardownEpoch: vi.fn().mockReturnValue(0),
     wasTornDownSince: vi.fn().mockReturnValue(false),
-    getSessionKeys: vi.fn().mockReturnValue({
-      wrappingKeyBase64: 'mock-wrapping-key',
-      preferencesKeyBase64: 'mock-preferences-key',
-      wrappedPrivateKeyBase64: 'mock-wrapped-private-key',
+    getSessionKeys: vi.fn().mockReturnValue(mockE2EESessionKeys),
+    captureInitializationReceipt: vi.fn().mockReturnValue(mockE2EEInitializationReceipt),
+    clearKeysIfInitializationCurrent: vi.fn((receipt: unknown) => {
+      if (receipt !== mockE2EEInitializationReceipt) return false;
+      mockE2EEClearKeys();
+      return true;
     }),
   },
 }));
@@ -98,6 +119,16 @@ describe('Login', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetAllStores();
+    resetRuntimeServerBase();
+    Object.defineProperty(globalThis, 'electron', {
+      value: {
+        ...originalElectron,
+        storeRefreshToken: vi.fn().mockResolvedValue(41),
+        clearTokensIfOwner: vi.fn().mockResolvedValue(true),
+        storeE2EEKeysIfOwner: vi.fn().mockResolvedValue(true),
+      },
+      writable: true,
+    });
     vi.mocked(e2eeService.wasTornDownSince).mockReturnValue(false);
     useClientConfigStore.getState().setServerCapabilities({
       auth: { oauthProviders: ['google', 'apple'] },
@@ -107,10 +138,17 @@ describe('Login', () => {
   // Tests that stub globalThis.electron (storeRefreshToken side effects) must
   // not leak the stub into later tests — restore the pre-suite value.
   const originalElectron = globalThis.electron;
+  const originalCredentials = navigator.credentials;
   afterEach(() => {
+    resetRuntimeServerBase();
     Object.defineProperty(globalThis, 'electron', {
       value: originalElectron,
       writable: true,
+    });
+    Object.defineProperty(navigator, 'credentials', {
+      value: originalCredentials,
+      writable: true,
+      configurable: true,
     });
   });
 
@@ -342,7 +380,7 @@ describe('Login', () => {
     const { e2eeService } = await import('@/renderer/services/e2eeService');
     const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
     vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new E2EEInitTeardownError());
-    const storeRefreshToken = vi.fn().mockResolvedValue(undefined);
+    const storeRefreshToken = vi.fn().mockResolvedValue(41);
     Object.defineProperty(globalThis, 'electron', {
       value: { ...globalThis.electron, storeRefreshToken },
       writable: true,
@@ -372,13 +410,64 @@ describe('Login', () => {
     expect(revokeAbortedSession).toHaveBeenCalled();
   });
 
+  it('clears old-origin material and revokes when the server changes during login completion', async () => {
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { preferencesSyncService } = await import('@/renderer/services/preferencesSync');
+    const requestApiBase = 'https://login-origin.example';
+    setRuntimeServerBase(requestApiBase);
+    let finishUnwrap: () => void = () => {
+      throw new Error('Unwrap resolver was not initialized.');
+    };
+    mockUnwrapLoginKeys.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finishUnwrap = resolve;
+      })
+    );
+    const storeRefreshToken = vi.fn().mockResolvedValue(41);
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken },
+      writable: true,
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse(),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+    await vi.waitFor(() => expect(mockUnwrapLoginKeys).toHaveBeenCalled());
+
+    setRuntimeServerBase('https://successor-origin.example');
+    finishUnwrap();
+
+    await vi.waitFor(() => {
+      expect(revokeAbortedSession).toHaveBeenCalledWith(
+        expect.objectContaining({
+          accessToken: 'mock-access',
+          sessionId: 'mock-session',
+          apiBase: requestApiBase,
+          authGeneration: expect.any(Number),
+        })
+      );
+    });
+    expect(e2eeService.clearKeys).toHaveBeenCalledOnce();
+    expect(e2eeService.initialize).not.toHaveBeenCalled();
+    expect(preferencesSyncService.init).not.toHaveBeenCalled();
+    expect(storeRefreshToken).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(defaultProps.onSuccess).not.toHaveBeenCalled();
+  });
+
   it('aborts login when a teardown lands AFTER initialize resolves (pre-admit epoch check, PR #2337)', async () => {
     // The fence inside initialize() covers only the span up to the key commit.
     // A teardown during the later token-store / persist / hydrate awaits must
     // be caught by the pre-admit wasTornDownSince() checks — never onSuccess.
     const { e2eeService } = await import('@/renderer/services/e2eeService');
     vi.mocked(e2eeService.wasTornDownSince).mockReturnValue(true);
-    const storeRefreshToken = vi.fn().mockResolvedValue(undefined);
+    const storeRefreshToken = vi.fn().mockResolvedValue(41);
     Object.defineProperty(globalThis, 'electron', {
       value: { ...globalThis.electron, storeRefreshToken },
       writable: true,
@@ -414,10 +503,11 @@ describe('Login', () => {
       .mockReturnValue(true); // check #2 detects the mid-await teardown
     const storeRefreshToken = vi.fn().mockImplementation(async () => {
       useAuthStore.getState().clearAccessToken(); // the teardown's clear
+      return 41;
     });
-    const clearTokens = vi.fn().mockResolvedValue(undefined);
+    const clearTokensIfOwner = vi.fn().mockResolvedValue(true);
     Object.defineProperty(globalThis, 'electron', {
-      value: { ...globalThis.electron, storeRefreshToken, clearTokens },
+      value: { ...globalThis.electron, storeRefreshToken, clearTokensIfOwner },
       writable: true,
     });
     mockFetch.mockResolvedValueOnce({
@@ -438,18 +528,18 @@ describe('Login', () => {
     // The refresh token persisted mid-flight must not survive on disk — a
     // failed best-effort revoke would otherwise let restoreSession()
     // resurrect the torn-down session next launch (Codex P1, #2337).
-    expect(clearTokens).toHaveBeenCalled();
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(41);
   });
 
   it('refuses admit when the token was cleared without an E2EE teardown (Codex P1, PR #2337)', async () => {
-    // handleRefreshFailure's `phase !== 'stable'` path clears the access
-    // token WITHOUT clearKeys(), so the teardown epoch never advances and
-    // every epoch check passes. The token-lifecycle admit gate must abort
-    // instead of completing login with credentials the auth layer already
-    // rejected.
+    // Auth ownership can be lost at a different await boundary than key
+    // teardown. This synthetic token-only clear leaves the epoch unchanged,
+    // so the token-lifecycle admit gate must abort instead of completing login
+    // with credentials the auth layer already rejected.
     const notice = 'Your session ended before sign-in could finish. Please sign in again.';
     const storeRefreshToken = vi.fn().mockImplementation(async () => {
       useAuthStore.getState().clearAccessToken(); // token-only clear, no epoch bump
+      return 41;
     });
     Object.defineProperty(globalThis, 'electron', {
       value: { ...globalThis.electron, storeRefreshToken },
@@ -480,10 +570,11 @@ describe('Login', () => {
     vi.mocked(e2eeService.wasTornDownSince).mockReturnValueOnce(false).mockReturnValue(true);
     const storeRefreshToken = vi.fn().mockImplementation(async () => {
       useAuthStore.getState().setAccessToken('successor-token'); // retry won the race
+      return 40;
     });
-    const clearTokens = vi.fn().mockResolvedValue(undefined);
+    const clearTokensIfOwner = vi.fn().mockResolvedValue(false);
     Object.defineProperty(globalThis, 'electron', {
-      value: { ...globalThis.electron, storeRefreshToken, clearTokens },
+      value: { ...globalThis.electron, storeRefreshToken, clearTokensIfOwner },
       writable: true,
     });
     mockFetch.mockResolvedValueOnce({
@@ -503,18 +594,20 @@ describe('Login', () => {
     expect(useAuthStore.getState().loginNotice).toBeNull();
     // The successor session's disk tokens (its own storeRefreshToken owns the
     // disk copy now) must not be wiped by the stale abort (Codex P1, #2337).
-    expect(clearTokens).not.toHaveBeenCalled();
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(40);
   });
 
-  it('admits a login whose token was legitimately refreshed mid-flight — same session (Codex P1, PR #2337)', async () => {
-    // A proactive/reactive refresh rotates the access token for the SAME
-    // session_id while the login is still pending. The admit gate must key on
-    // session identity — pre-fix its raw token comparison treated the rotation
-    // as a foreign lifecycle and revoked the valid session.
+  it('admits a login whose token and session were legitimately refreshed mid-flight (Codex P1, PR #2337)', async () => {
+    // The backend rotates both A1 -> A2 and S1 -> S2. The client lifecycle
+    // generation remains stable across that validated refresh, so Login must
+    // admit without mistaking S2 for a successor account.
     const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
     const storeRefreshToken = vi.fn().mockImplementation(async () => {
-      // Same session, newer token (what a refresh does).
-      useAuthStore.getState().setAccessToken('rotated-token');
+      const auth = useAuthStore.getState();
+      expect(
+        auth.rotateAuthCredentials(auth.authGeneration, 'rotated-token', 'rotated-session')
+      ).toBe(true);
+      return 41;
     });
     Object.defineProperty(globalThis, 'electron', {
       value: { ...globalThis.electron, storeRefreshToken },
@@ -541,6 +634,104 @@ describe('Login', () => {
     expect(onSuccess).toHaveBeenCalledWith(
       expect.objectContaining({ accessToken: 'rotated-token' })
     );
+    expect(useAuthStore.getState().sessionId).toBe('rotated-session');
+  });
+
+  it('rejects a token-only SSO successor instead of false-admitting an A2/S1 mixed account', async () => {
+    // A password login owns {A1,S1}; a concurrent SSO completion has only A2.
+    // Atomic lifecycle replacement must clear S1 and the generation gate must
+    // stop the stale password/E2EE continuation from admitting as the SSO user.
+    let diskOwner = 'none';
+    const storeRefreshToken = vi.fn().mockImplementation(async () => {
+      diskOwner = 'stale-password-flow';
+      useAuthStore.getState().beginAuthLifecycle('sso-successor-token', null);
+      // Model the successor's later main-process write settling before the old
+      // IPC promise resolves. The stale continuation must not clear it.
+      diskOwner = 'sso-successor';
+      return 40;
+    });
+    const clearTokensIfOwner = vi.fn().mockResolvedValue(false);
+    const storeE2EEKeys = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(globalThis, 'electron', {
+      value: {
+        ...globalThis.electron,
+        storeRefreshToken,
+        clearTokensIfOwner,
+        storeE2EEKeys,
+      },
+      writable: true,
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse(),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    await vi.waitFor(() => expect(e2eeService.clearKeys).toHaveBeenCalled());
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'sso-successor-token',
+      sessionId: null,
+    });
+    expect(diskOwner).toBe('sso-successor');
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(40);
+    expect(storeE2EEKeys).not.toHaveBeenCalled();
+  });
+
+  it('stops old refresh/E2EE persistence when a same-origin successor wins before side effects', async () => {
+    const { preferencesSyncService } = await import('@/renderer/services/preferencesSync');
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    let finishUnwrap: () => void = () => {
+      throw new Error('Unwrap resolver was not initialized.');
+    };
+    mockUnwrapLoginKeys.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finishUnwrap = resolve;
+      })
+    );
+    const storeRefreshToken = vi.fn().mockResolvedValue(41);
+    const storeE2EEKeys = vi.fn().mockResolvedValue(undefined);
+    const clearTokensIfOwner = vi.fn().mockResolvedValue(true);
+    Object.defineProperty(globalThis, 'electron', {
+      value: {
+        ...globalThis.electron,
+        storeRefreshToken,
+        storeE2EEKeys,
+        clearTokensIfOwner,
+      },
+      writable: true,
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse(),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+    await vi.waitFor(() => expect(mockUnwrapLoginKeys).toHaveBeenCalled());
+
+    useAuthStore.getState().beginAuthLifecycle('sso-successor-token', null);
+    finishUnwrap();
+
+    await vi.waitFor(() => expect(revokeAbortedSession).toHaveBeenCalled());
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'sso-successor-token',
+      sessionId: null,
+    });
+    expect(storeRefreshToken).not.toHaveBeenCalled();
+    expect(storeE2EEKeys).not.toHaveBeenCalled();
+    expect(clearTokensIfOwner).not.toHaveBeenCalled();
+    expect(e2eeService.initialize).not.toHaveBeenCalled();
+    expect(preferencesSyncService.init).not.toHaveBeenCalled();
   });
 
   it('revokes the server session when a teardown aborts the KEY-RECOVERY init (Codex P1, PR #2337)', async () => {
@@ -582,6 +773,7 @@ describe('Login', () => {
     // resurfaces on a much later Login mount as if that sign-in had failed.
     const storeRefreshToken = vi.fn().mockImplementation(async () => {
       useAuthStore.getState().setLoginNotice('stale abort notice from an earlier flow');
+      return 41;
     });
     Object.defineProperty(globalThis, 'electron', {
       value: { ...globalThis.electron, storeRefreshToken },
@@ -735,13 +927,250 @@ describe('Login', () => {
     });
   });
 
+  it('fails closed before publishing auth when the login payload is malformed', async () => {
+    const { ensureMachineId, revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const requestApiBase = 'https://login-origin.example';
+    setRuntimeServerBase(requestApiBase);
+    const malformedPayload = makeLoginResponse({
+      e2ee_keys: {
+        wrapped_private_key: 'mock-wrapped',
+        // key_derivation_salt is required at this trust boundary
+      },
+    });
+    let resolveMachineId: (machineId: string) => void = () => {
+      throw new Error('Machine ID resolver was not initialized.');
+    };
+    vi.mocked(ensureMachineId).mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        resolveMachineId = resolve;
+      })
+    );
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify(malformedPayload), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+    await vi.waitFor(() => expect(ensureMachineId).toHaveBeenCalledWith(requestApiBase));
+
+    // Machine-ID lookup is async, but the malformed response remains bound to
+    // the invocation-time selection and is rejected before publishing auth.
+    resolveMachineId('origin-machine-id');
+
+    expect(
+      await screen.findByText('Server returned an invalid login response.')
+    ).toBeInTheDocument();
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(e2eeService.initialize).not.toHaveBeenCalled();
+    expect(defaultProps.onSuccess).not.toHaveBeenCalled();
+    expect(revokeAbortedSession).toHaveBeenCalledWith({
+      accessToken: 'mock-access',
+      refreshToken: 'mock-refresh',
+      sessionId: 'mock-session',
+      apiBase: requestApiBase,
+    });
+    expect(mockFetch).toHaveBeenCalledWith(
+      `${requestApiBase}/api/v1/auth/login`,
+      expect.objectContaining({
+        headers: expect.objectContaining({ 'X-Machine-Id': 'origin-machine-id' }),
+      })
+    );
+  });
+
+  it('revokes a successful login response missing required session lineage', async () => {
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { session_id: _sessionID, ...malformedPayload } = makeLoginResponse();
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify(malformedPayload), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    expect(
+      await screen.findByText('Server returned an invalid login response.')
+    ).toBeInTheDocument();
+    expect(revokeAbortedSession).toHaveBeenCalledWith({
+      accessToken: 'mock-access',
+      refreshToken: 'mock-refresh',
+      sessionId: null,
+      apiBase: getApiBase(),
+    });
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(defaultProps.onSuccess).not.toHaveBeenCalled();
+  });
+
+  it('prefers the authoritative session header when a malformed body disagrees', async () => {
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const malformedPayload = makeLoginResponse({ refresh_token: null });
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify(malformedPayload), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Concord-Session-ID': 'header-session',
+        },
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    expect(
+      await screen.findByText('Server returned an invalid login response.')
+    ).toBeInTheDocument();
+    expect(revokeAbortedSession).toHaveBeenCalledWith({
+      accessToken: 'mock-access',
+      refreshToken: null,
+      sessionId: 'header-session',
+      apiBase: getApiBase(),
+    });
+    expect(useAuthStore.getState().accessToken).toBeNull();
+  });
+
+  it('aborts before credential dispatch when the server changes during safe-storage permission', async () => {
+    const { ensureMachineId } = await import('@/renderer/services/apiClient');
+    const requestApiBase = 'https://login-origin.example';
+    setRuntimeServerBase(requestApiBase);
+    let resolvePermission: (status: 'granted') => void = () => {
+      throw new Error('Permission resolver was not initialized.');
+    };
+    const checkPermission = vi.fn().mockReturnValue(
+      new Promise<'granted'>((resolve) => {
+        resolvePermission = resolve;
+      })
+    );
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, checkPermission },
+      writable: true,
+    });
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+    await vi.waitFor(() => expect(checkPermission).toHaveBeenCalledWith('secureStorage'));
+
+    setRuntimeServerBase('https://successor-origin.example');
+    resolvePermission('granted');
+
+    expect(
+      await screen.findByText('Server selection changed. Please try again.')
+    ).toBeInTheDocument();
+    expect(ensureMachineId).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects an A-to-B-to-A server change while machine-ID lookup is pending', async () => {
+    const { ensureMachineId } = await import('@/renderer/services/apiClient');
+    const requestApiBase = 'https://login-origin.example';
+    setRuntimeServerBase(requestApiBase);
+    let resolveMachineId: (machineId: string) => void = () => {
+      throw new Error('Machine ID resolver was not initialized.');
+    };
+    vi.mocked(ensureMachineId).mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        resolveMachineId = resolve;
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+    await vi.waitFor(() => expect(ensureMachineId).toHaveBeenCalledWith(requestApiBase));
+
+    setRuntimeServerBase('https://successor-origin.example');
+    setRuntimeServerBase(requestApiBase);
+    resolveMachineId('origin-machine-id');
+
+    expect(
+      await screen.findByText(
+        'Your session ended before sign-in could finish. Please sign in again.'
+      )
+    ).toBeInTheDocument();
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(defaultProps.onSuccess).not.toHaveBeenCalled();
+  });
+
+  it('does not revoke an unmarked undecodable 2xx initial login response', async () => {
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: new Headers(),
+      json: async () => {
+        throw new SyntaxError('Unexpected end of JSON input');
+      },
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    expect(
+      await screen.findByText('Server returned an invalid login response.')
+    ).toBeInTheDocument();
+    expect(revokeAbortedSession).not.toHaveBeenCalled();
+    expect(defaultProps.onSuccess).not.toHaveBeenCalled();
+  });
+
+  it('revokes a header-identified cookie session when a direct login response is undecodable', async () => {
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: new Headers({
+        'X-Concord-Session-Issued': 'true',
+        'X-Concord-Session-ID': 'direct-login-session',
+      }),
+      json: async () => {
+        throw new SyntaxError('Unexpected end of JSON input');
+      },
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'MySecurePassword123!');
+    await user.click(screen.getByText('Sign In'));
+
+    expect(
+      await screen.findByText('Server returned an invalid login response.')
+    ).toBeInTheDocument();
+    expect(revokeAbortedSession).toHaveBeenCalledWith({
+      accessToken: null,
+      sessionId: 'direct-login-session',
+      cookieBound: true,
+      apiBase: getApiBase(),
+    });
+    expect(defaultProps.onSuccess).not.toHaveBeenCalled();
+  });
+
   it('stores E2EE session keys via electron bridge when available', async () => {
-    const mockStoreE2EEKeys = vi.fn().mockResolvedValue(undefined);
+    const mockStoreE2EEKeysIfOwner = vi.fn().mockResolvedValue(true);
     Object.defineProperty(globalThis, 'electron', {
       value: {
         ...globalThis.electron,
-        storeE2EEKeys: mockStoreE2EEKeys,
-        storeRefreshToken: vi.fn().mockResolvedValue(undefined),
+        storeE2EEKeysIfOwner: mockStoreE2EEKeysIfOwner,
+        storeRefreshToken: vi.fn().mockResolvedValue(41),
         checkPermission: vi.fn().mockResolvedValue('granted'),
       },
       writable: true,
@@ -759,10 +1188,11 @@ describe('Login', () => {
     await user.click(screen.getByText('Sign In'));
 
     await vi.waitFor(() => {
-      expect(mockStoreE2EEKeys).toHaveBeenCalledWith(
+      expect(mockStoreE2EEKeysIfOwner).toHaveBeenCalledWith(
         expect.objectContaining({
           wrappingKeyBase64: 'mock-wrapping-key',
-        })
+        }),
+        41
       );
     });
   });
@@ -872,7 +1302,7 @@ describe('Login', () => {
     Object.defineProperty(globalThis, 'electron', {
       value: {
         ...globalThis.electron,
-        storeRefreshToken: vi.fn().mockResolvedValue(undefined),
+        storeRefreshToken: vi.fn().mockResolvedValue(41),
         storeE2EEKeys: vi.fn().mockResolvedValue(undefined),
         checkPermission: vi.fn().mockResolvedValue('granted'),
       },
@@ -910,7 +1340,7 @@ describe('Login', () => {
     Object.defineProperty(globalThis, 'electron', {
       value: {
         ...globalThis.electron,
-        storeRefreshToken: vi.fn().mockResolvedValue(undefined),
+        storeRefreshToken: vi.fn().mockResolvedValue(41),
         storeE2EEKeys: vi.fn().mockResolvedValue(undefined),
         checkPermission: vi.fn().mockResolvedValue('granted'),
       },
@@ -964,7 +1394,7 @@ describe('Login', () => {
     Object.defineProperty(globalThis, 'electron', {
       value: {
         ...globalThis.electron,
-        storeRefreshToken: vi.fn().mockResolvedValue(undefined),
+        storeRefreshToken: vi.fn().mockResolvedValue(41),
         storeE2EEKeys: vi.fn().mockResolvedValue(undefined),
         checkPermission: vi.fn().mockResolvedValue('granted'),
       },
@@ -1094,6 +1524,133 @@ describe('Login', () => {
     });
   });
 
+  it('does not revoke a decoded unmarked malformed initial MFA challenge', async () => {
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: new Headers(),
+      json: async () => makeMFAResponse(['totp'], { methods: 'totp' }),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+    await user.click(screen.getByText('Sign In'));
+
+    expect(
+      await screen.findByText('Server returned an invalid MFA challenge.')
+    ).toBeInTheDocument();
+    expect(revokeAbortedSession).not.toHaveBeenCalled();
+    expect(screen.queryByText('Two-Factor Authentication')).not.toBeInTheDocument();
+  });
+
+  it('revokes an MFA session whose successful completion payload is malformed', async () => {
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const requestApiBase = 'https://mfa-origin.example';
+    setRuntimeServerBase(requestApiBase);
+    const malformedPayload = makeLoginResponse({
+      e2ee_keys: {
+        wrapped_private_key: 'mock-wrapped',
+        // key_derivation_salt is required at this trust boundary
+      },
+    });
+    let resolveMfaResponse: (response: Response) => void = () => {
+      throw new Error('MFA response resolver was not initialized.');
+    };
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => makeMFAResponse(['totp']),
+      })
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveMfaResponse = resolve;
+        })
+      );
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+    await user.click(screen.getByText('Sign In'));
+    await screen.findByText('Two-Factor Authentication');
+
+    for (let digit = 1; digit <= 6; digit += 1) {
+      await user.type(screen.getByLabelText(`Digit ${digit}`), String(digit));
+    }
+    await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
+
+    setRuntimeServerBase('https://successor-origin.example');
+    resolveMfaResponse(
+      new Response(JSON.stringify(malformedPayload), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+
+    expect(
+      await screen.findByText(
+        'Your session ended before sign-in could finish. Please sign in again.'
+      )
+    ).toBeInTheDocument();
+    expect(revokeAbortedSession).toHaveBeenCalledWith({
+      accessToken: 'mock-access',
+      refreshToken: 'mock-refresh',
+      sessionId: 'mock-session',
+      apiBase: requestApiBase,
+    });
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      2,
+      `${requestApiBase}/api/v1/auth/mfa/verify`,
+      expect.any(Object)
+    );
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(defaultProps.onSuccess).not.toHaveBeenCalled();
+  });
+
+  it('revokes the header-identified MFA session when a successful completion body is undecodable', async () => {
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => makeMFAResponse(['totp']),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        headers: new Headers({
+          'X-Concord-Session-Issued': 'true',
+          'X-Concord-Session-ID': 'mfa-login-session',
+        }),
+        json: async () => {
+          throw new SyntaxError('Unexpected end of JSON input');
+        },
+      });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+    await user.click(screen.getByText('Sign In'));
+    await screen.findByText('Two-Factor Authentication');
+
+    for (let digit = 1; digit <= 6; digit += 1) {
+      await user.type(screen.getByLabelText(`Digit ${digit}`), String(digit));
+    }
+
+    expect(
+      await screen.findByText('Server returned an invalid login response.')
+    ).toBeInTheDocument();
+    expect(revokeAbortedSession).toHaveBeenCalledWith({
+      accessToken: null,
+      sessionId: 'mfa-login-session',
+      cookieBound: true,
+      apiBase: getApiBase(),
+    });
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(defaultProps.onSuccess).not.toHaveBeenCalled();
+  });
+
   it('shows TOTP subtitle in MFA mode', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -1217,6 +1774,79 @@ describe('Login', () => {
     ).toBeInTheDocument();
   });
 
+  it('rejects malformed WebAuthn options before entering the MFA flow', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () =>
+        makeMFAResponse(['webauthn'], {
+          webauthn_options: {
+            publicKey: {
+              challenge: 'Y2hhbGxlbmdl',
+              allowCredentials: [{ type: 'public-key', id: 42 }],
+            },
+          },
+        }),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+    await user.click(screen.getByText('Sign In'));
+
+    expect(
+      await screen.findByText('Server returned invalid WebAuthn options.')
+    ).toBeInTheDocument();
+    expect(screen.queryByText('Two-Factor Authentication')).not.toBeInTheDocument();
+  });
+
+  it('accepts the backend-supported WebAuthn smart-card transport', async () => {
+    const getCredential = vi.fn().mockReturnValue(new Promise(() => {}));
+    Object.defineProperty(navigator, 'credentials', {
+      value: { get: getCredential },
+      writable: true,
+      configurable: true,
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () =>
+        makeMFAResponse(['webauthn'], {
+          webauthn_options: {
+            publicKey: {
+              challenge: 'Y2hhbGxlbmdl',
+              allowCredentials: [
+                {
+                  type: 'public-key',
+                  id: 'Y3JlZGVudGlhbA',
+                  transports: ['smart-card'],
+                },
+              ],
+            },
+          },
+        }),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+    await user.click(screen.getByText('Sign In'));
+
+    await vi.waitFor(() => {
+      expect(getCredential).toHaveBeenCalledWith(
+        expect.objectContaining({
+          publicKey: expect.objectContaining({
+            allowCredentials: [
+              expect.objectContaining({
+                transports: ['smart-card'],
+              }),
+            ],
+          }),
+        })
+      );
+    });
+  });
+
   it('shows email-sms subtitle when email-sms mode is active', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -1304,6 +1934,23 @@ describe('Login', () => {
       expect(screen.getByPlaceholderText('you@example.com')).toBeDisabled();
       expect(screen.getByPlaceholderText('Enter your password')).toBeDisabled();
     });
+  });
+
+  it('makes SSO authentication exclusive with the password form', async () => {
+    useSSOStore.getState().setState({ phase: 'authenticating', provider: 'google' });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+
+    expect(screen.getByPlaceholderText('you@example.com')).toBeDisabled();
+    expect(screen.getByPlaceholderText('Enter your password')).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Sign In' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Back to Connection Options/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Create one/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Sign in with Google/i })).toBeDisabled();
+
+    await user.click(screen.getByRole('button', { name: 'Sign In' }));
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   // ── account_uses_sso (#270) ────────────────────────────────────────────

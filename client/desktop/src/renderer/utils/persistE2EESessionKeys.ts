@@ -1,4 +1,5 @@
 import type { E2EESessionKeys } from '../services/e2eeService';
+import type { CredentialOwner } from '../../main/ipcContract';
 import { errorMessage } from './redactError';
 
 /**
@@ -23,20 +24,42 @@ import { errorMessage } from './redactError';
  * the warn-and-never-clear policy is defined once, not copy-pasted (which also
  * kept those handlers under the S3776 cognitive-complexity ceiling).
  */
-export async function persistE2EESessionKeys(sessionKeys: E2EESessionKeys | null): Promise<void> {
-  if (!sessionKeys || !globalThis.electron?.storeE2EEKeys) return;
+export async function persistE2EESessionKeys(
+  sessionKeys: E2EESessionKeys | null,
+  credentialOwner?: CredentialOwner
+): Promise<boolean> {
+  if (!sessionKeys) return true;
+
+  const electron = globalThis.electron;
+  if (!electron) return true;
+
+  // A login continuation that owns main-process credentials must keep key
+  // persistence in that same ownership domain. Never fall back to the generic
+  // writer: a stale continuation could otherwise overwrite a successor's
+  // keychain material after its renderer-side generation check.
+  if (credentialOwner !== undefined && !electron.storeE2EEKeysIfOwner) {
+    console.warn('Owner-scoped E2EE key persistence is unavailable in this desktop shell.');
+    return false;
+  }
+  if (credentialOwner === undefined && !electron.storeE2EEKeys) return true;
 
   try {
-    const persisted = await globalThis.electron.storeE2EEKeys(sessionKeys);
-    if (persisted === false) {
+    const persisted =
+      credentialOwner === undefined
+        ? await electron.storeE2EEKeys(sessionKeys)
+        : await electron.storeE2EEKeysIfOwner(sessionKeys, credentialOwner);
+    if (persisted === false || typeof persisted !== 'boolean') {
       console.warn(
         'E2EE session keys did not persist to the keychain (E2EE active for this session only; re-login on next launch to restore restart-survival).'
       );
+      return false;
     }
+    return true;
   } catch (storeError) {
     console.warn(
       'Failed to invoke E2EE key persistence (E2EE active for this session only):',
       errorMessage(storeError)
     );
+    return false;
   }
 }

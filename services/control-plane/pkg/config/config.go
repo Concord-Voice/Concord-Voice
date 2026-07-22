@@ -145,8 +145,9 @@ func (c CloudflareKVBridgeConfig) String() string {
 type Config struct {
 	Environment string
 	// HSTSHeaderValue is the Strict-Transport-Security policy the security
-	// middleware emits in production. Optional; empty falls back to
-	// middleware.DefaultHSTSHeaderValue (single source of truth).
+	// middleware emits in production. Optional; empty falls back to the
+	// middleware default. Managed nginx validates the same grammar/default and
+	// replaces this upstream field at the public edge.
 	HSTSHeaderValue string
 	Port            string
 	DatabaseURL     string
@@ -330,6 +331,14 @@ type Config struct {
 func Load() (*Config, error) {
 	// Load .env file if it exists (development)
 	_ = godotenv.Load()
+	mfaEncryptionKeyVersion := 1
+	if raw, explicit := os.LookupEnv("MFA_ENCRYPTION_KEY_VERSION"); explicit {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("MFA_ENCRYPTION_KEY_VERSION must be an integer: %w", err)
+		}
+		mfaEncryptionKeyVersion = parsed
+	}
 	opsMetrics, err := LoadOpsMetricsConfig()
 	if err != nil {
 		return nil, err
@@ -363,7 +372,7 @@ func Load() (*Config, error) {
 		SMTPPassword:             getEnv("SMTP_PASSWORD", ""), // #nosec G101 -- env var name, not a secret
 		SMTPFrom:                 getEnv("SMTP_FROM", "Concord Voice <noreply@example.com>"),
 		MFAEncryptionKey:         getEnv("MFA_ENCRYPTION_KEY", devMFAEncKey),
-		MFAEncryptionKeyVersion:  getEnvInt("MFA_ENCRYPTION_KEY_VERSION", 1),
+		MFAEncryptionKeyVersion:  mfaEncryptionKeyVersion,
 		MFAEncryptionKeysRetired: getEnv("MFA_ENCRYPTION_KEYS_RETIRED", ""),
 		WebAuthnRPID:             getEnv("WEBAUTHN_RP_ID", "localhost"),
 		WebAuthnRPOrigins:        parseOrigins(getEnv("WEBAUTHN_RP_ORIGINS", "http://localhost:3001")),
@@ -719,7 +728,7 @@ func (c *Config) validateProduction() error {
 		{c.StorageBucket == "",
 			"STORAGE_BUCKET (or MINIO_BUCKET alias) must be set in production."},
 		{invalidHSTSHeaderValue(c.HSTSHeaderValue),
-			"HSTS_HEADER_VALUE must start with \"max-age=\" when set (RFC 6797 STS policy), or be empty to use the built-in default."},
+			"HSTS_HEADER_VALUE must be a valid STS policy containing exactly one decimal max-age directive when set, or be empty to use the built-in default."},
 		{len(c.TrustedProxyCIDRs) == 0,
 			"TRUSTED_PROXY_CIDRS must be set in production. Without it, c.ClientIP() returns the reverse-proxy address instead of the real client IP, breaking rate limiting and session audit logs."},
 		// #725 review: MEDIA_PLANE_URL guard parity with other dev-default /

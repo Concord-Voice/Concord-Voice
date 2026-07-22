@@ -113,6 +113,30 @@ describe('serverStore', () => {
       expect(useUnreadStore.getState().serverUnreadSet.has('server-1')).toBe(false);
     });
 
+    it('deduplicates unguarded fetches without invalidating the in-flight response', async () => {
+      const started = deferred();
+      const release = deferred();
+      let requests = 0;
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers`, async () => {
+          requests += 1;
+          started.resolve();
+          await release.promise;
+          return HttpResponse.json({ servers: [mockServer] });
+        })
+      );
+
+      const firstFetch = useServerStore.getState().fetchServers();
+      await started.promise;
+      expect(useServerStore.getState().isLoading).toBe(true);
+      const secondFetch = useServerStore.getState().fetchServers();
+      release.resolve();
+      await Promise.all([firstFetch, secondFetch]);
+
+      expect(requests).toBe(1);
+      expect(useServerStore.getState().servers.map((server) => server.id)).toEqual([mockServer.id]);
+    });
+
     it('does not let a stale concurrent fetch clobber a newer fetch (#2358 sequence guard)', async () => {
       // The #2329 dedup-bypass lets a guarded Recovery-A fetch run concurrently
       // with an in-flight unguarded fetch. The monotonic mySeq gate must let only

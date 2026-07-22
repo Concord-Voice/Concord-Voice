@@ -143,7 +143,13 @@ const AuthFlow: React.FC = () => {
     rememberMe: boolean;
   }) => {
     console.debug('Login successful, access token received');
-    useAuthStore.getState().setAccessToken(data.accessToken);
+    const auth = useAuthStore.getState();
+    // Login already admitted this lifecycle before invoking onSuccess. Avoid
+    // starting it again (and dropping a refresh-rotated session ID); other
+    // callers that have not installed auth yet still begin an atomic pair.
+    if (auth.accessToken !== data.accessToken) {
+      auth.beginAuthLifecycle(data.accessToken, null);
+    }
     useAuthStore.getState().setRememberMe(data.rememberMe);
     if (data.user) {
       useUserStore.getState().setUser(data.user);

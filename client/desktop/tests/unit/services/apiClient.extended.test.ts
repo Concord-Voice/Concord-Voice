@@ -20,13 +20,21 @@ const {
   getMachineIdSync,
   stopProactiveRefresh,
   _resetRefreshState,
+  configureRefreshFailureReset,
 } = await import('@/renderer/services/apiClient');
+
+const mockGracefulReset = vi.fn();
+const mockNuclearReset = vi.fn();
 
 describe('apiClient — extended', () => {
   beforeEach(() => {
     resetAllStores();
     _resetRefreshState();
     vi.clearAllMocks();
+    configureRefreshFailureReset({
+      gracefulReset: mockGracefulReset,
+      nuclearReset: mockNuclearReset,
+    });
   });
 
   afterEach(() => {
@@ -180,11 +188,13 @@ describe('apiClient — extended', () => {
     });
 
     it('stores session ID when provided by refresh response', async () => {
+      useAuthStore.getState().beginAuthLifecycle('old-token', 'sess-old');
       (globalThis as any).electron = {
         refreshToken: vi.fn().mockResolvedValue({
           status: 'ok',
           accessToken: 'new-token',
           sessionId: 'sess-new',
+          previousSessionId: 'sess-old',
         }),
       };
 
@@ -225,7 +235,6 @@ describe('apiClient — extended', () => {
       expect(res1.status).toBe(200);
 
       // Second 401 immediately after — should be rate-limited (within 10s)
-      useAuthStore.getState().setAccessToken('new-token-1');
       mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
 
       const res2 = await apiFetch('/api/v1/test2');

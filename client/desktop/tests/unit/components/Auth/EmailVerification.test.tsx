@@ -1,21 +1,37 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import EmailVerification from '@/renderer/components/Auth/EmailVerification';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { usePendingRegistrationStore } from '@/renderer/stores/pendingRegistrationStore';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/runtimeServerBase';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock fetch
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
-// Mock API_BASE
+// Keep aborted-session cleanup observable without issuing a second network request.
 vi.mock('@/renderer/services/apiClient', () => ({
-  API_BASE: 'http://localhost:8080',
+  revokeAbortedSession: vi.fn().mockResolvedValue(undefined),
 }));
 
 const MOCK_PENDING_ID = 'test-pending-id';
 const MOCK_EMAIL = 'test@example.com';
+const MOCK_CONFIRM_SUCCESS = {
+  access_token: 'origin-a-access',
+  refresh_token: 'origin-a-refresh',
+  session_id: 'origin-a-session',
+};
+
+function mockSuccessfulConfirmation() {
+  mockFetch.mockResolvedValueOnce({
+    ok: true,
+    json: async () => MOCK_CONFIRM_SUCCESS,
+  });
+}
 
 function seedPendingStore() {
   usePendingRegistrationStore.getState().setPending({
@@ -30,12 +46,30 @@ describe('EmailVerification', () => {
   const mockOnSuccess = vi.fn();
   const mockOnChangeEmail = vi.fn();
   const mockOnCancel = vi.fn();
+  const originalElectron = globalThis.electron;
 
   beforeEach(() => {
     vi.clearAllMocks();
     resetAllStores();
+    resetRuntimeServerBase();
     seedPendingStore();
   });
+
+  afterEach(() => {
+    resetRuntimeServerBase();
+    Object.defineProperty(globalThis, 'electron', {
+      value: originalElectron,
+      writable: true,
+    });
+  });
+
+  function submitVerificationCode() {
+    render(<EmailVerification onSuccess={mockOnSuccess} />);
+    const inputs = screen.getAllByRole('textbox');
+    for (let i = 0; i < 6; i++) {
+      fireEvent.change(inputs[i], { target: { value: String(i + 1) } });
+    }
+  }
 
   // ── Rendering ──────────────────────────────────────────────────────────
 
@@ -127,6 +161,171 @@ describe('EmailVerification', () => {
       expect(useAuthStore.getState().accessToken).toBe('verified-token');
       expect(useAuthStore.getState().emailVerified).toBe(true);
     });
+  });
+
+  it('keeps origin B credentials when B persists before A token storage resolves', async () => {
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const requestApiBase = 'https://origin-a.example';
+    const originAOwner = 101;
+    const originBOwner = 202;
+    setRuntimeServerBase(requestApiBase);
+
+    let finishStore: (owner: number) => void = () => {
+      throw new Error('Token-store resolver was not initialized.');
+    };
+    const storeRefreshToken = vi.fn().mockReturnValue(
+      new Promise<number>((resolve) => {
+        finishStore = resolve;
+      })
+    );
+    let currentMainOwner = originAOwner;
+    const clearTokensIfOwner = vi.fn().mockImplementation(async (owner: number) => {
+      if (owner !== currentMainOwner) return false;
+      currentMainOwner = 0;
+      return true;
+    });
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken, clearTokensIfOwner },
+      writable: true,
+    });
+    mockSuccessfulConfirmation();
+
+    submitVerificationCode();
+
+    await waitFor(() => {
+      expect(storeRefreshToken).toHaveBeenCalledWith({
+        refreshToken: 'origin-a-refresh',
+        rememberMe: true,
+        apiBase: requestApiBase,
+        accessToken: 'origin-a-access',
+      });
+    });
+    expect(mockFetch).toHaveBeenCalledWith(
+      `${requestApiBase}/api/v1/auth/register/confirm`,
+      expect.any(Object)
+    );
+
+    // B wins main-process ownership but has not resumed from its IPC await to
+    // publish renderer auth yet. A may attempt only an owner-scoped clear.
+    setRuntimeServerBase('https://origin-b.example');
+    currentMainOwner = originBOwner;
+    finishStore(originAOwner);
+
+    await waitFor(() => {
+      expect(revokeAbortedSession).toHaveBeenCalledWith({
+        accessToken: 'origin-a-access',
+        refreshToken: 'origin-a-refresh',
+        sessionId: 'origin-a-session',
+        apiBase: requestApiBase,
+      });
+    });
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(originAOwner);
+    expect(currentMainOwner).toBe(originBOwner);
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(mockOnSuccess).not.toHaveBeenCalled();
+  });
+
+  it('clears persisted origin A tokens by owner when the server switches', async () => {
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const requestApiBase = 'https://origin-a.example';
+    const originAOwner = 101;
+    setRuntimeServerBase(requestApiBase);
+
+    const clearTokensIfOwner = vi.fn().mockResolvedValue(true);
+    const storeRefreshToken = vi.fn().mockImplementation(async () => {
+      setRuntimeServerBase('https://origin-b.example');
+      return originAOwner;
+    });
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken, clearTokensIfOwner },
+      writable: true,
+    });
+    mockSuccessfulConfirmation();
+
+    submitVerificationCode();
+
+    await waitFor(() => {
+      expect(revokeAbortedSession).toHaveBeenCalledWith({
+        accessToken: 'origin-a-access',
+        refreshToken: 'origin-a-refresh',
+        sessionId: 'origin-a-session',
+        apiBase: requestApiBase,
+      });
+    });
+    expect(storeRefreshToken).toHaveBeenCalledWith(
+      expect.objectContaining({ apiBase: requestApiBase })
+    );
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(originAOwner);
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(mockOnSuccess).not.toHaveBeenCalled();
+  });
+
+  it('does not persist A after switching to B while the confirmation response is pending', async () => {
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const requestApiBase = 'https://origin-a.example';
+    setRuntimeServerBase(requestApiBase);
+
+    let finishJson: (data: typeof MOCK_CONFIRM_SUCCESS) => void = () => {
+      throw new Error('Response resolver was not initialized.');
+    };
+    const responseJson = vi.fn().mockReturnValue(
+      new Promise<typeof MOCK_CONFIRM_SUCCESS>((resolve) => {
+        finishJson = resolve;
+      })
+    );
+    const storeRefreshToken = vi.fn().mockResolvedValue(101);
+    const clearTokensIfOwner = vi.fn().mockResolvedValue(true);
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken, clearTokensIfOwner },
+      writable: true,
+    });
+    mockFetch.mockResolvedValueOnce({ ok: true, json: responseJson });
+
+    submitVerificationCode();
+    await waitFor(() => expect(responseJson).toHaveBeenCalled());
+
+    setRuntimeServerBase('https://origin-b.example');
+    useAuthStore.getState().beginAuthLifecycle('origin-b-access', 'origin-b-session');
+    finishJson(MOCK_CONFIRM_SUCCESS);
+
+    await waitFor(() => expect(revokeAbortedSession).toHaveBeenCalled());
+    expect(mockFetch).toHaveBeenCalledWith(
+      `${requestApiBase}/api/v1/auth/register/confirm`,
+      expect.any(Object)
+    );
+    expect(storeRefreshToken).not.toHaveBeenCalled();
+    expect(clearTokensIfOwner).not.toHaveBeenCalled();
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'origin-b-access',
+      sessionId: 'origin-b-session',
+    });
+    expect(mockOnSuccess).not.toHaveBeenCalled();
+  });
+
+  it('rejects an A to B to A selection cycle while token persistence is pending', async () => {
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const requestApiBase = 'https://origin-a.example';
+    const originAOwner = 101;
+    setRuntimeServerBase(requestApiBase);
+
+    const clearTokensIfOwner = vi.fn().mockResolvedValue(true);
+    const storeRefreshToken = vi.fn().mockImplementation(async () => {
+      setRuntimeServerBase('https://origin-b.example');
+      setRuntimeServerBase(requestApiBase);
+      return originAOwner;
+    });
+    Object.defineProperty(globalThis, 'electron', {
+      value: { ...globalThis.electron, storeRefreshToken, clearTokensIfOwner },
+      writable: true,
+    });
+    mockSuccessfulConfirmation();
+
+    submitVerificationCode();
+
+    await waitFor(() => expect(revokeAbortedSession).toHaveBeenCalled());
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(originAOwner);
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(mockOnSuccess).not.toHaveBeenCalled();
   });
 
   it('clears pending store on success', async () => {

@@ -1,12 +1,10 @@
 /**
  * Regression (#2199 / CWE-212): fresh-login init vs. teardown race.
  *
- * The fresh-login e2eeService.initialize() callers (Login / Register /
- * SSOEagerUnlock / SSOPassphraseSetup) pass NO E2EEInitializationGuard, so the
- * only thing that can abort an in-flight commit is the internal
- * keyClearGeneration fence that clearKeys() raises (destruction-only —
- * keySessionGeneration deliberately does NOT abort commits: recoveryReset()
- * bumps it while preserving the session; see the third test case).
+ * The internal keyClearGeneration fence remains authoritative even when a
+ * caller also supplies an E2EEInitializationGuard: clearKeys() raises the
+ * destruction-only epoch, while keySessionGeneration deliberately does NOT
+ * abort commits (recoveryReset() bumps it while preserving the session).
  *
  * A 401 -> nuclearReset() landing in the ~hundreds-of-ms Argon2id derivation
  * window must NOT let finalizeKeys() commit the keyset + setReady(true) AFTER
@@ -149,14 +147,12 @@ describe('e2eeService fresh-login init/teardown race (#2199 / CWE-212)', () => {
   });
 
   it('a SUPERSEDED initialize() cannot commit over a newer attempt (Codex P1, PR #2337)', async () => {
-    // A token-only session invalidation (handleRefreshFailure's phase !==
-    // 'stable' path) clears the access token WITHOUT clearKeys(), so
-    // keyClearGeneration never advances. If the user rapidly signs in again,
-    // the stale first attempt's Argon2id can resolve AFTER the successor's
-    // commit — last-writer-wins would overwrite the successor's keyset with
-    // the stale one (cross-session key confusion). The attempt fence admits
-    // only the newest initializer; the superseded one aborts with the typed
-    // teardown error (same abort contract as destruction).
+    // Two overlapping initializers share keyClearGeneration because no key
+    // destruction occurs between them. If the stale first attempt's Argon2id
+    // resolves AFTER the successor's commit, last-writer-wins would overwrite
+    // the successor's keyset with the stale one (cross-session key confusion).
+    // The attempt fence admits only the newest initializer; the superseded one
+    // aborts with the typed teardown error (same abort contract as destruction).
     const stalePassword = 'StalePassword123!'; // pragma: allowlist secret
     const staleKeys = await generateRegistrationKeys(stalePassword);
     const successorKeys = await generateRegistrationKeys(password);
@@ -225,6 +221,58 @@ describe('e2eeService fresh-login init/teardown race (#2199 / CWE-212)', () => {
 
     // The valid successor must still complete — the stale continuation did not
     // cancel it.
+    await expect(successorPromise).resolves.toBeUndefined();
+    expect(e2eeService.isInitialized).toBe(true);
+    expect(useE2EEStore.getState().ready).toBe(true);
+  });
+
+  it('an old initialization receipt cannot clear a newer committed keyset', async () => {
+    const firstKeys = await generateRegistrationKeys(password);
+    await e2eeService.initialize(
+      password,
+      firstKeys.wrappedPrivateKey,
+      firstKeys.keyDerivationSalt
+    );
+    const firstReceipt = e2eeService.captureInitializationReceipt();
+    expect(firstReceipt).not.toBeNull();
+
+    const successorPassword = 'SuccessorPassword123!'; // pragma: allowlist secret
+    const successorKeys = await generateRegistrationKeys(successorPassword);
+    await e2eeService.initialize(
+      successorPassword,
+      successorKeys.wrappedPrivateKey,
+      successorKeys.keyDerivationSalt
+    );
+    const successorSession = e2eeService.getSessionKeys();
+
+    expect(e2eeService.clearKeysIfInitializationCurrent(firstReceipt)).toBe(false);
+    expect(e2eeService.getSessionKeys()).toBe(successorSession);
+    expect(e2eeService.isInitialized).toBe(true);
+    expect(useE2EEStore.getState().ready).toBe(true);
+  });
+
+  it('an old initialization receipt cannot abort a newer in-flight initializer', async () => {
+    const firstKeys = await generateRegistrationKeys(password);
+    await e2eeService.initialize(
+      password,
+      firstKeys.wrappedPrivateKey,
+      firstKeys.keyDerivationSalt
+    );
+    const firstReceipt = e2eeService.captureInitializationReceipt();
+    expect(firstReceipt).not.toBeNull();
+
+    const successorPassword = 'SuccessorPassword123!'; // pragma: allowlist secret
+    const successorKeys = await generateRegistrationKeys(successorPassword);
+    const successorPromise = e2eeService.initialize(
+      successorPassword,
+      successorKeys.wrappedPrivateKey,
+      successorKeys.keyDerivationSalt
+    );
+
+    // initialize() claims its monotonic attempt slot before its first await.
+    // The old keyset is still resident here, so key identity alone is
+    // insufficient; the attempt check must protect the in-flight successor.
+    expect(e2eeService.clearKeysIfInitializationCurrent(firstReceipt)).toBe(false);
     await expect(successorPromise).resolves.toBeUndefined();
     expect(e2eeService.isInitialized).toBe(true);
     expect(useE2EEStore.getState().ready).toBe(true);

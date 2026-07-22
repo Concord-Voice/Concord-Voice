@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.32] — 2026-07-22
+
+### Fixed
+
+- **Sign-in and refresh stay with the right account and server** ([#2374](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2374)) — session rotation, simultaneous sign-ins, and switching between hosted servers can no longer mix credentials or continue a stale sign-in against the newly selected server, and a superseded sign-in no longer leaves its encryption keys resident in memory.
+
 ## [0.2.31] — 2026-07-22
 
 ### Changed

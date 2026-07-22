@@ -3,15 +3,15 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import SSOPassphraseSetup from '@/renderer/components/Auth/SSOPassphraseSetup';
 import { useSSOStore } from '@/renderer/stores/ssoStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
+import { useE2EEStore } from '@/renderer/stores/e2eeStore';
 import { e2eeService } from '@/renderer/services/e2eeService';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/runtimeServerBase';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
-// Mock global fetch (matches Register.test.tsx pattern)
-const mockFetch = vi.fn();
-vi.stubGlobal('fetch', mockFetch);
-
-// Partial-mock apiClient: keep real ssoService's apiFetch path, stub
-// revokeAbortedSession to assert it fires on a teardown-abort (PR #2337).
+// Stub server-session cleanup so abort-path behavior is directly assertable.
 vi.mock('@/renderer/services/apiClient', async (orig) => ({
   ...(await orig<typeof import('@/renderer/services/apiClient')>()),
   revokeAbortedSession: vi.fn().mockResolvedValue(undefined),
@@ -38,22 +38,41 @@ vi.mock('@/renderer/utils/crypto', () => ({
 // getSessionKeys() returns keys ONLY while initialized — so the failure-path tests
 // can't false-pass on a post-clearKeys persist (getSessionKeys → null after
 // clearKeys, so the persist block no-ops). `e2eeState` is reset per test.
-const e2eeState = vi.hoisted(() => ({ initialized: false }));
+const e2eeState = vi.hoisted(() => ({
+  initialized: false,
+  attempt: 0,
+  sessionKeys: {
+    wrappingKeyBase64: 'wk',
+    preferencesKeyBase64: 'pk',
+    wrappedPrivateKeyBase64: 'wpk', // pragma: allowlist secret
+  },
+}));
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     initialize: vi.fn(async () => {
       e2eeState.initialized = true;
+      e2eeState.attempt += 1;
     }),
     captureTeardownEpoch: vi.fn().mockReturnValue(0),
     wasTornDownSince: vi.fn().mockReturnValue(false),
-    getSessionKeys: vi.fn(() =>
+    getSessionKeys: vi.fn(() => (e2eeState.initialized ? e2eeState.sessionKeys : null)),
+    captureInitializationReceipt: vi.fn(() =>
       e2eeState.initialized
-        ? {
-            wrappingKeyBase64: 'wk',
-            preferencesKeyBase64: 'pk',
-            wrappedPrivateKeyBase64: 'wpk', // pragma: allowlist secret
-          }
+        ? { sessionKeys: e2eeState.sessionKeys, attempt: e2eeState.attempt }
         : null
+    ),
+    clearKeysIfInitializationCurrent: vi.fn(
+      (receipt: { sessionKeys: typeof e2eeState.sessionKeys; attempt: number } | null) => {
+        if (
+          !e2eeState.initialized ||
+          receipt?.sessionKeys !== e2eeState.sessionKeys ||
+          receipt?.attempt !== e2eeState.attempt
+        ) {
+          return false;
+        }
+        e2eeState.initialized = false;
+        return true;
+      }
     ),
     clearKeys: vi.fn(() => {
       e2eeState.initialized = false;
@@ -70,11 +89,66 @@ vi.mock('@/renderer/hooks/useSSOFlow', () => ({
   useSSOFlow: () => ({ begin: mockBegin }),
 }));
 
+const storeRefreshToken = vi.fn().mockResolvedValue(71);
+const clearTokensIfOwner = vi.fn().mockResolvedValue(true);
+const storeE2EEKeysIfOwner = vi.fn().mockResolvedValue(true);
+const originalElectron = globalThis.electron;
+const registrationResult = {
+  kind: 'tokens' as const,
+  accessToken: 'access-xyz',
+  sessionId: 'session-xyz',
+  credentialOwner: 71,
+};
+const completeRegistration = vi.fn().mockResolvedValue(registrationResult);
+
 beforeEach(() => {
   vi.clearAllMocks();
   e2eeState.initialized = false;
+  e2eeState.attempt = 0;
+  vi.mocked(e2eeService.initialize).mockImplementation(async () => {
+    e2eeState.initialized = true;
+    e2eeState.attempt += 1;
+  });
+  vi.mocked(e2eeService.captureTeardownEpoch).mockReturnValue(0);
   vi.mocked(e2eeService.wasTornDownSince).mockReturnValue(false);
+  vi.mocked(e2eeService.getSessionKeys).mockImplementation(() =>
+    e2eeState.initialized ? e2eeState.sessionKeys : null
+  );
+  vi.mocked(e2eeService.captureInitializationReceipt).mockImplementation(() =>
+    e2eeState.initialized
+      ? { sessionKeys: e2eeState.sessionKeys, attempt: e2eeState.attempt }
+      : null
+  );
+  vi.mocked(e2eeService.clearKeysIfInitializationCurrent).mockImplementation((receipt) => {
+    if (
+      !e2eeState.initialized ||
+      receipt?.sessionKeys !== e2eeState.sessionKeys ||
+      receipt?.attempt !== e2eeState.attempt
+    ) {
+      return false;
+    }
+    e2eeState.initialized = false;
+    return true;
+  });
+  vi.mocked(e2eeService.clearKeys).mockImplementation(() => {
+    e2eeState.initialized = false;
+  });
+  storeRefreshToken.mockResolvedValue(71);
+  completeRegistration.mockResolvedValue(registrationResult);
+  clearTokensIfOwner.mockResolvedValue(true);
+  storeE2EEKeysIfOwner.mockResolvedValue(true);
   resetAllStores();
+  resetRuntimeServerBase();
+  Object.defineProperty(globalThis, 'electron', {
+    value: {
+      ...originalElectron,
+      storeRefreshToken,
+      clearTokensIfOwner,
+      storeE2EEKeysIfOwner,
+      sso: { ...originalElectron?.sso, completeRegistration },
+    },
+    writable: true,
+  });
   useSSOStore.getState().setState({
     phase: 'register_required',
     provider: 'google',
@@ -85,10 +159,11 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // E2EE-persistence tests override window.electron.storeE2EEKeys on the shared
-  // preload mock (tests/setup.ts). Remove it so it can't leak into later tests and
-  // make them order-dependent. (Mirrors Register.test.tsx, #1278 review.)
-  delete (window.electron as unknown as { storeE2EEKeys?: unknown }).storeE2EEKeys;
+  resetRuntimeServerBase();
+  Object.defineProperty(globalThis, 'electron', {
+    value: originalElectron,
+    writable: true,
+  });
 });
 
 describe('SSOPassphraseSetup', () => {
@@ -126,15 +201,7 @@ describe('SSOPassphraseSetup', () => {
     expect(screen.getByRole('button', { name: /create account/i })).toBeEnabled();
   });
 
-  it('posts complete-registration with wrapped key material on submit', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      headers: new Headers({ 'Content-Type': 'application/json' }),
-      json: async () => ({ access_token: 'access-xyz' }),
-      text: async () => JSON.stringify({ access_token: 'access-xyz' }),
-    });
-
+  it('delegates completion and key material to main without renderer refresh-token custody', async () => {
     render(<SSOPassphraseSetup />);
     fireEvent.change(screen.getByLabelText(/username/i), { target: { value: 'newcomer' } });
     fireEvent.change(screen.getByLabelText(/^passphrase$/i), {
@@ -145,24 +212,21 @@ describe('SSOPassphraseSetup', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: /create account/i }));
 
-    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
-
-    const [url, init] = mockFetch.mock.calls[0];
-    expect(String(url)).toContain('/api/v1/auth/sso/google/complete-registration');
-    expect(init?.method).toBe('POST');
-
-    const body = JSON.parse(init.body as string);
-    expect(body.sso_token).toBe('tok-fake');
-    expect(body.username).toBe('newcomer');
-    expect(body.password).toBe('StrongPassphrase!12345');
-    // Mocked base64 strings
-    expect(body.wrapped_private_key).toMatch(/^[A-Za-z0-9+/=]+$/);
-    expect(body.public_key).toMatch(/^[A-Za-z0-9+/=]+$/);
-    expect(body.key_derivation_salt).toMatch(/^[A-Za-z0-9+/=]+$/);
+    await waitFor(() => expect(completeRegistration).toHaveBeenCalledTimes(1));
+    expect(completeRegistration).toHaveBeenCalledWith('http://localhost:8080', {
+      provider: 'google',
+      ssoToken: 'tok-fake',
+      username: 'newcomer',
+      passphrase: 'StrongPassphrase!12345', // pragma: allowlist secret
+      wrappedPrivateKey: 'bW9jay13cmFwcGVkLXByaXZhdGUta2V5', // pragma: allowlist secret
+      keyDerivationSalt: 'bW9jay1zYWx0', // pragma: allowlist secret
+      publicKey: 'bW9jay1wdWJsaWMta2V5', // pragma: allowlist secret
+    });
 
     await waitFor(() => {
       expect(useAuthStore.getState().accessToken).toBe('access-xyz');
     });
+    expect(storeRefreshToken).not.toHaveBeenCalled();
     expect(useSSOStore.getState().state.phase).toBe('idle');
   });
 
@@ -173,15 +237,11 @@ describe('SSOPassphraseSetup', () => {
   });
 
   it('surfaces username_taken 409 with a friendly inline message', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: false,
+    completeRegistration.mockResolvedValueOnce({
+      kind: 'error',
       status: 409,
-      // ssoService now parses the body via safeJson, which requires a JSON
-      // content-type header to succeed. Include it so the error_code reaches
-      // the SSOPassphraseSetup mapper.
-      headers: new Headers({ 'Content-Type': 'application/json' }),
-      json: async () => ({ error_code: 'username_taken' }),
-      text: async () => JSON.stringify({ error_code: 'username_taken' }),
+      code: 'username_taken',
+      body: { error_code: 'username_taken' },
     });
 
     render(<SSOPassphraseSetup />);
@@ -212,22 +272,81 @@ describe('SSOPassphraseSetup', () => {
     fireEvent.click(screen.getByRole('button', { name: /create account/i }));
   };
 
-  const okRegistrationResponse = () => ({
-    ok: true,
-    status: 201,
-    headers: new Headers({ 'Content-Type': 'application/json' }),
-    json: async () => ({ access_token: 'access-xyz' }),
-    text: async () => JSON.stringify({ access_token: 'access-xyz' }),
+  const okRegistrationResult = () => ({ ...registrationResult });
+
+  it('revokes an old-origin response without auth, disk, or E2EE mutation after a server switch', async () => {
+    let resolveResponse: (response: ReturnType<typeof okRegistrationResult>) => void = () => {};
+    completeRegistration.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveResponse = resolve;
+      })
+    );
+
+    render(<SSOPassphraseSetup />);
+    fillAndSubmit();
+    await waitFor(() => expect(completeRegistration).toHaveBeenCalledTimes(1));
+
+    setRuntimeServerBase('https://server-b.example');
+    resolveResponse(okRegistrationResult());
+
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    await waitFor(() => expect(revokeAbortedSession).toHaveBeenCalledTimes(1));
+    expect(revokeAbortedSession).toHaveBeenCalledWith({
+      accessToken: 'access-xyz',
+      sessionId: 'session-xyz',
+      apiBase: 'http://localhost:8080',
+    });
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(71);
+    expect(storeRefreshToken).not.toHaveBeenCalled();
+    expect(e2eeService.initialize).not.toHaveBeenCalled();
+    expect(storeE2EEKeysIfOwner).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(useSSOStore.getState().state.phase).toBe('register_required');
+  });
+
+  it('preserves a successor generation and skips stale E2EE work after main completion', async () => {
+    completeRegistration.mockImplementationOnce(async () => {
+      useAuthStore.getState().beginAuthLifecycle('successor-token', 'successor-session');
+      return okRegistrationResult();
+    });
+
+    render(<SSOPassphraseSetup />);
+    fillAndSubmit();
+
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    await waitFor(() => expect(revokeAbortedSession).toHaveBeenCalledTimes(1));
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(71);
+    expect(e2eeService.initialize).not.toHaveBeenCalled();
+    expect(storeE2EEKeysIfOwner).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().accessToken).toBe('successor-token');
+    expect(useAuthStore.getState().sessionId).toBe('successor-session');
+    expect(useSSOStore.getState().state.phase).toBe('register_required');
+  });
+
+  it('does not clear E2EE keys committed by a successor while initialization resolves', async () => {
+    const successorKeys = {
+      wrappingKeyBase64: 'successor-wk',
+      preferencesKeyBase64: 'successor-pk',
+      wrappedPrivateKeyBase64: 'successor-wpk', // pragma: allowlist secret
+    };
+    vi.mocked(e2eeService.getSessionKeys).mockReturnValue(successorKeys);
+    vi.mocked(e2eeService.initialize).mockImplementationOnce(async () => {
+      useAuthStore.getState().beginAuthLifecycle('successor-token', 'successor-session');
+    });
+    completeRegistration.mockResolvedValueOnce(okRegistrationResult());
+
+    render(<SSOPassphraseSetup />);
+    fillAndSubmit();
+
+    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    await waitFor(() => expect(revokeAbortedSession).toHaveBeenCalledTimes(1));
+    expect(e2eeService.clearKeys).not.toHaveBeenCalled();
+    expect(storeE2EEKeysIfOwner).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().accessToken).toBe('successor-token');
   });
 
   it('initializes e2eeService with the generated keys and persists them on successful SSO setup', async () => {
-    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
-
-    // storeE2EEKeys is not in the default window.electron mock; add a spy so we can
-    // assert the session keys are persisted to the OS keychain.
-    const storeE2EEKeysMock = vi.fn().mockResolvedValue(undefined);
-    (window.electron as unknown as { storeE2EEKeys: typeof storeE2EEKeysMock }).storeE2EEKeys =
-      storeE2EEKeysMock;
+    completeRegistration.mockResolvedValueOnce(okRegistrationResult());
 
     render(<SSOPassphraseSetup />);
     fillAndSubmit();
@@ -248,32 +367,40 @@ describe('SSOPassphraseSetup', () => {
       'bW9jay13cmFwcGVkLXByaXZhdGUta2V5', // pragma: allowlist secret
       'bW9jay1zYWx0', // pragma: allowlist secret
       'argon2id',
-      undefined, // no guard on this surface
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        isCurrent: expect.any(Function),
+      }),
       0 // teardownEpoch captured at handleSubmit start (PR #2337)
     );
     // Session keys persisted to the OS keychain so E2EE survives an app restart.
-    expect(storeE2EEKeysMock).toHaveBeenCalledWith({
-      wrappingKeyBase64: 'wk',
-      preferencesKeyBase64: 'pk',
-      wrappedPrivateKeyBase64: 'wpk', // pragma: allowlist secret
-    });
+    expect(storeE2EEKeysIfOwner).toHaveBeenCalledWith(
+      {
+        wrappingKeyBase64: 'wk',
+        preferencesKeyBase64: 'pk',
+        wrappedPrivateKeyBase64: 'wpk', // pragma: allowlist secret
+      },
+      71
+    );
     expect(useAuthStore.getState().accessToken).toBe('access-xyz');
+    expect(useAuthStore.getState().sessionId).toBe('session-xyz');
+    expect(storeRefreshToken).not.toHaveBeenCalled();
     // ...and init precedes persistence.
     const initOrder = vi.mocked(e2eeService.initialize).mock.invocationCallOrder[0];
-    const persistOrder = storeE2EEKeysMock.mock.invocationCallOrder[0];
+    const persistOrder = storeE2EEKeysIfOwner.mock.invocationCallOrder[0];
     expect(initOrder).toBeLessThan(persistOrder);
   });
 
   it('completes SSO setup even if e2eeService init fails (non-fatal), rolling back via clearKeys', async () => {
     vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new Error('init boom'));
-    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
+    completeRegistration.mockResolvedValueOnce(okRegistrationResult());
 
     render(<SSOPassphraseSetup />);
     fillAndSubmit();
 
-    // A failed E2EE pre-init must NOT break an otherwise-successful SSO registration
-    // — the user falls back to secure-messaging-needs-a-logout→login. The catch must
-    // clearKeys() to roll back any partial init so isInitialized is honestly false.
+    // A failed E2EE pre-init must NOT discard an otherwise-successful SSO
+    // registration. The catch rolls back partial keys and the eager-unlock gate
+    // keeps the authenticated shell closed until the user unlocks them again.
     await waitFor(() => {
       expect(useSSOStore.getState().state.phase).toBe('idle');
     });
@@ -283,35 +410,22 @@ describe('SSOPassphraseSetup', () => {
 
   it('aborts SSO setup on a mid-setup teardown — clears the fresh token, never admits (PR #2337)', async () => {
     // A logout-class teardown landing after the teardown epoch is captured
-    // makes initialize() reject with the typed E2EEInitTeardownError. The
-    // registration succeeded server-side and published a FRESH access token —
-    // continuing to phase 'idle' would admit the user with E2EE cleared and
-    // resurrect the torn-down session. The catch must treat the teardown as
-    // fatal: clear the just-published token and abort the continuation.
+    // makes initialize() reject with the typed E2EEInitTeardownError. Admission
+    // is deliberately deferred until setup finishes, so no token is published.
     const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
-    // Deferred initialize() so we can observe the token AFTER the registration
-    // response published it and BEFORE the teardown rejects — proving the clear
-    // is a cleanup of a published token, not a never-set no-op (CodeRabbit).
     let rejectInit: (e: unknown) => void = () => {};
     vi.mocked(e2eeService.initialize).mockReturnValueOnce(
       new Promise<void>((_, reject) => {
         rejectInit = reject;
       })
     );
-    const clearTokens = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(globalThis, 'electron', {
-      value: { ...globalThis.electron, clearTokens },
-      writable: true,
-    });
-    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
+    completeRegistration.mockResolvedValueOnce(okRegistrationResult());
 
     render(<SSOPassphraseSetup />);
     fillAndSubmit();
 
-    // The registration token IS published while initialize() is still pending.
-    await waitFor(() => {
-      expect(useAuthStore.getState().accessToken).toBe('access-xyz');
-    });
+    await waitFor(() => expect(e2eeService.initialize).toHaveBeenCalled());
+    expect(useAuthStore.getState().accessToken).toBeNull();
 
     // Now the mid-setup teardown makes initialize() reject.
     rejectInit(new E2EEInitTeardownError());
@@ -319,23 +433,20 @@ describe('SSOPassphraseSetup', () => {
     await waitFor(() => {
       expect(screen.queryByText(/session ended during setup/i)).toBeInTheDocument();
     });
-    // The just-published registration token must NOT survive the teardown.
     expect(useAuthStore.getState().accessToken).toBeNull();
     // The admit path (phase 'idle') is never reached.
     expect(useSSOStore.getState().state.phase).not.toBe('idle');
     // The freshly-issued server session (HttpOnly refresh cookie + row) is revoked.
     const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
     expect(revokeAbortedSession).toHaveBeenCalled();
-    // Main-process/disk artifacts a pending IPC may have re-written after the
-    // teardown are wiped too (Codex P1, #2337).
-    expect(clearTokens).toHaveBeenCalled();
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(71);
   });
 
   it('does NOT complete setup when the token was invalidated WITHOUT an E2EE teardown (Codex P1, PR #2337)', async () => {
-    // A token-only invalidation (handleRefreshFailure's phase !== 'stable'
-    // path) clears the access token without advancing the teardown epoch, so
-    // the epoch check passes. The token-ownership admit gate must abort
-    // instead of setting phase 'idle' with rejected credentials.
+    // Auth ownership can be lost at a different await boundary than key
+    // teardown. This synthetic token-only clear leaves the epoch unchanged,
+    // so the token-ownership admit gate must abort instead of setting phase
+    // 'idle' with rejected credentials.
     const { useAuthStore } = await import('@/renderer/stores/authStore');
     const { useSSOStore } = await import('@/renderer/stores/ssoStore');
     const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
@@ -344,16 +455,14 @@ describe('SSOPassphraseSetup', () => {
     vi.mocked(e2eeService.initialize).mockImplementationOnce(async () => {
       useAuthStore.getState().clearAccessToken();
     });
-    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
+    completeRegistration.mockResolvedValueOnce(okRegistrationResult());
 
     render(<SSOPassphraseSetup />);
     fillAndSubmit();
 
-    await waitFor(() => {
-      expect(screen.queryByText(/session ended during setup/i)).toBeInTheDocument();
-    });
+    await waitFor(() => expect(revokeAbortedSession).toHaveBeenCalled());
     expect(useSSOStore.getState().state.phase).not.toBe('idle');
-    expect(revokeAbortedSession).toHaveBeenCalled();
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(71);
   });
 
   it("preserves a successor session's token when the SSO abort fires (Codex P1, PR #2337)", async () => {
@@ -374,27 +483,27 @@ describe('SSOPassphraseSetup', () => {
         rejectInit = reject;
       })
     );
-    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
+    completeRegistration.mockResolvedValueOnce(okRegistrationResult());
 
     render(<SSOPassphraseSetup />);
     fillAndSubmit();
-    await waitFor(() => {
-      expect(useAuthStore.getState().accessToken).toBe('access-xyz');
-    });
+    await waitFor(() => expect(e2eeService.initialize).toHaveBeenCalled());
+    expect(useAuthStore.getState().accessToken).toBeNull();
     rejectInit(new E2EEInitTeardownError());
 
-    await waitFor(() => {
-      expect(screen.queryByText(/session ended during setup/i)).toBeInTheDocument();
-    });
+    await waitFor(() => expect(revokeAbortedSession).toHaveBeenCalled());
     expect(useAuthStore.getState().accessToken).toBe('successor-token');
+    expect(screen.queryByText(/session ended during setup/i)).not.toBeInTheDocument();
   });
 
-  it('ordinary init failure stays non-fatal — rollback clearKeys is NOT a teardown (Codex P2, PR #2337)', async () => {
+  it('admits an ordinary init failure only behind owner-scoped SSO eager unlock', async () => {
     // The catch's deliberate rollback clearKeys() bumps the real
     // keyClearGeneration. With a FAITHFUL epoch mock (coupled to clearKeys,
     // unlike the default), the pre-admit check must NOT misread that
     // self-inflicted clear as an external teardown: setup completes
-    // non-fatally (phase idle, token kept) per the #1278 contract.
+    // non-fatally (phase idle, token kept) per the #1278 contract, but the
+    // authenticated shell must remain gated until this credential owner
+    // completes SSOEagerUnlock.
     let clears = 0;
     vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new Error('init boom'));
     vi.mocked(e2eeService.clearKeys).mockImplementation(() => {
@@ -403,7 +512,7 @@ describe('SSOPassphraseSetup', () => {
     });
     vi.mocked(e2eeService.captureTeardownEpoch).mockImplementation(() => clears);
     vi.mocked(e2eeService.wasTornDownSince).mockImplementation((epoch: number) => clears !== epoch);
-    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
+    completeRegistration.mockResolvedValueOnce(okRegistrationResult());
 
     render(<SSOPassphraseSetup />);
     fillAndSubmit();
@@ -412,12 +521,16 @@ describe('SSOPassphraseSetup', () => {
       expect(useSSOStore.getState().state.phase).toBe('idle');
     });
     expect(useAuthStore.getState().accessToken).toBe('access-xyz');
+    expect(useE2EEStore.getState()).toMatchObject({
+      needsSSOUnlock: true,
+      ssoCredentialOwner: 71,
+    });
     expect(screen.queryByText(/session ended during setup/i)).not.toBeInTheDocument();
   });
 
   it('does NOT admit when a teardown lands after initialize resolves (pre-admit check, PR #2337)', async () => {
     vi.mocked(e2eeService.wasTornDownSince).mockReturnValue(true);
-    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
+    completeRegistration.mockResolvedValueOnce(okRegistrationResult());
 
     render(<SSOPassphraseSetup />);
     fillAndSubmit();
@@ -430,28 +543,19 @@ describe('SSOPassphraseSetup', () => {
   });
 
   it('keeps the in-memory E2EE session when only keychain persistence fails', async () => {
-    // initialize() succeeds but the storeE2EEKeys IPC rejects. NOTE: the main-process
-    // handler currently swallows keychain-write errors internally and resolves void
-    // (tokenManager.ts) — see #1288 — so in production this renderer catch fires on an
-    // IPC-transport failure or a future re-throwing handler, NOT on a plain
-    // keychain-locked error. Either way clearKeys() must NOT be called: destroying the
-    // valid in-memory session over a persistence failure would lose E2EE for the
-    // current session, not just on restart (#1278 review, Gitar finding).
-    const storeE2EEKeysMock = vi.fn().mockRejectedValue(new Error('keychain locked'));
-    (window.electron as unknown as { storeE2EEKeys: typeof storeE2EEKeysMock }).storeE2EEKeys =
-      storeE2EEKeysMock;
-    mockFetch.mockResolvedValueOnce(okRegistrationResponse());
+    storeE2EEKeysIfOwner.mockRejectedValueOnce(new Error('keychain locked'));
+    completeRegistration.mockResolvedValueOnce(okRegistrationResult());
 
     render(<SSOPassphraseSetup />);
     fillAndSubmit();
 
     // Wait for the TERMINAL state: phase 'idle' is set after the persist catch runs,
-    // so by then storeE2EEKeys was called (and rejected, and caught). Asserting after
+    // so by then storeE2EEKeysIfOwner was called (and rejected, and caught). Asserting after
     // this wait avoids racing the still-pending catch (Copilot #1289 review).
     await waitFor(() => {
       expect(useSSOStore.getState().state.phase).toBe('idle');
     });
-    expect(storeE2EEKeysMock).toHaveBeenCalled();
+    expect(storeE2EEKeysIfOwner).toHaveBeenCalled();
     // The persistence failure must leave the in-memory session intact.
     expect(e2eeService.clearKeys).not.toHaveBeenCalled();
   });
@@ -464,12 +568,11 @@ describe('SSOPassphraseSetup', () => {
     // that to the generic "Registration failed. Please try again." and left the user
     // re-submitting the same dead token — a permanent dead-end. It must instead show
     // an actionable expiry message AND a one-click path to restart sign-in.
-    mockFetch.mockResolvedValueOnce({
-      ok: false,
+    completeRegistration.mockResolvedValueOnce({
+      kind: 'error',
       status: 401,
-      headers: new Headers({ 'Content-Type': 'application/json' }),
-      json: async () => ({ error_code: 'sso_token_invalid' }),
-      text: async () => JSON.stringify({ error_code: 'sso_token_invalid' }),
+      code: 'sso_token_invalid',
+      body: { error_code: 'sso_token_invalid' },
     });
 
     render(<SSOPassphraseSetup />);
@@ -499,12 +602,11 @@ describe('SSOPassphraseSetup', () => {
       email: 'new@example.test',
       name: 'New User',
     });
-    mockFetch.mockResolvedValueOnce({
-      ok: false,
+    completeRegistration.mockResolvedValueOnce({
+      kind: 'error',
       status: 401,
-      headers: new Headers({ 'Content-Type': 'application/json' }),
-      json: async () => ({ error_code: 'sso_token_invalid' }),
-      text: async () => JSON.stringify({ error_code: 'sso_token_invalid' }),
+      code: 'sso_token_invalid',
+      body: { error_code: 'sso_token_invalid' },
     });
 
     render(<SSOPassphraseSetup />);

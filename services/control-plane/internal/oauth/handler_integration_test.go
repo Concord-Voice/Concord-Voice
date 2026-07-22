@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/oauth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 )
@@ -257,11 +258,11 @@ type fakeAuthAdapter struct {
 	VerifyPasswordLocked bool
 }
 
-func (f *fakeAuthAdapter) IssueAccessAndRefresh(_ context.Context, userID string) (string, string, error) {
+func (f *fakeAuthAdapter) IssueAccessAndRefresh(_ context.Context, userID string) (string, string, string, error) {
 	if f.IssueAccessFail {
-		return "", "", fmt.Errorf("token issuance unavailable")
+		return "", "", "", fmt.Errorf("token issuance unavailable")
 	}
-	return "fake-access-" + userID, "fake-refresh-" + userID, nil
+	return "fake-access-" + userID, "fake-refresh-" + userID, "fake-session-" + userID, nil
 }
 func (f *fakeAuthAdapter) IssueMFAChallenge(_ context.Context, userID string) (string, []string, []string, interface{}, bool, error) {
 	if f.IssueMFAFail {
@@ -362,6 +363,10 @@ func TestCompleteRegistration_HappyPath(t *testing.T) {
 	var resp map[string]any
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.NotEmpty(t, resp["access_token"])
+	assert.NotEmpty(t, resp["refresh_token"])
+	assert.NotEmpty(t, resp["session_id"])
+	assert.Equal(t, true, resp["remember_me"])
+	assert.Equal(t, resp["session_id"], w.Header().Get(middleware.SessionIDHeader))
 
 	// Verify users row created with password_login_disabled=TRUE. // pragma: allowlist secret
 	var pld bool
@@ -1035,6 +1040,10 @@ func TestCompleteLink_HappyPath(t *testing.T) {
 	var resp map[string]any
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.NotEmpty(t, resp["access_token"])
+	assert.NotEmpty(t, resp["refresh_token"])
+	assert.NotEmpty(t, resp["session_id"])
+	assert.Equal(t, true, resp["remember_me"])
+	assert.Equal(t, resp["session_id"], w.Header().Get(middleware.SessionIDHeader))
 
 	// Verify identity row was created.
 	var providerName string

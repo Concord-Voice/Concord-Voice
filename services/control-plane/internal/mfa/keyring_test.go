@@ -69,6 +69,35 @@ func TestParseKeyring_FailClosedMatrix(t *testing.T) {
 	}
 }
 
+func TestParseKeyring_VersionsFitPostgreSQLSmallint(t *testing.T) {
+	tests := []struct {
+		name          string
+		activeVersion int
+		retired       string
+		wantErr       bool
+	}{
+		{name: "active minimum", activeVersion: 1},
+		{name: "active maximum", activeVersion: 32767},
+		{name: "active below minimum", activeVersion: 0, wantErr: true},
+		{name: "active above maximum", activeVersion: 32768, wantErr: true},
+		{name: "retired minimum", activeVersion: 2, retired: "1:" + testKeyV1},
+		{name: "retired maximum", activeVersion: 1, retired: "32767:" + testKeyV1},
+		{name: "retired below minimum", activeVersion: 2, retired: "0:" + testKeyV1, wantErr: true},
+		{name: "retired above maximum", activeVersion: 1, retired: "32768:" + testKeyV1, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseKeyring(testKeyV2, tt.activeVersion, tt.retired)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
 func TestKeyringSeal_UsesActiveVersionAndFreshNonce(t *testing.T) {
 	ring, err := ParseKeyring(testKeyV2, 2, "1:"+testKeyV1)
 	require.NoError(t, err)

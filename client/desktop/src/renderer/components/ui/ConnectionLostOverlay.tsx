@@ -6,7 +6,8 @@ import {
   type DiagnosticResults,
   type CheckResult,
 } from '../../stores/connectionStore';
-// recoveryService & resetService loaded on-demand via dynamic import() to allow code splitting
+// recoveryService remains lazy. resetService is eagerly registered by main.tsx;
+// local dynamic imports avoid a direct feature-module dependency.
 import { runRecoveryModule } from '../../utils/runRecoveryModule';
 import './ConnectionLostOverlay.css';
 

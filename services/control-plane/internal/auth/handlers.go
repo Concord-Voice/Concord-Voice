@@ -1061,26 +1061,42 @@ func (h *Handler) Login(c *gin.Context) {
 // CompleteLogin issues tokens and creates a session for the given user.
 // Called directly from Login (no MFA) or from the MFA verify handler after successful verification.
 func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool) {
-	// Look up email_verified + disabled. email_verified feeds the JWT claim;
-	// disabled gates token issuance here so a terminal age-disable (#1623) that
-	// landed DURING an MFA challenge blocks completion before any token is minted
-	// (the disable/MFA-window race). This runs on every CompleteLogin path (direct
-	// and post-MFA-verify), so it backs the Login-handler gate symmetrically.
-	var emailVerified bool
-	var disabled bool
-	if err := h.db.QueryRow(`SELECT email_verified, disabled FROM users WHERE id = $1`, userID).Scan(&emailVerified, &disabled); err != nil {
-		h.log.Error("Failed to look up email_verified for login", "error", err, "user_id", userID)
+	// Resolve every response prerequisite before minting tokens or creating a
+	// refresh session. Reading disabled and email_verified in this same snapshot
+	// keeps the terminal gate, JWT claim, and returned user mutually consistent.
+	var user models.User
+	if err := h.db.QueryRow(
+		`SELECT id, email, username, password_hash, display_name, bio, avatar_url, COALESCE(links, '[]'::jsonb),
+		        email_verified, age_verified, created_at, updated_at, password_login_disabled, disabled
+		 FROM users WHERE id = $1`, userID,
+	).Scan(
+		&user.ID, &user.Email, &user.Username, &user.PasswordHash,
+		&user.DisplayName, &user.Bio, &user.AvatarURL, &user.Links,
+		&user.EmailVerified, &user.AgeVerified,
+		&user.CreatedAt, &user.UpdatedAt, &user.PasswordLoginDisabled, &user.Disabled,
+	); err != nil {
+		h.log.Error("Failed to fetch user for login response", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
 		return
 	}
-	if disabled {
+	if user.Disabled {
 		c.JSON(http.StatusForbidden, gin.H{"error_code": "account_disabled"})
+		return
+	}
+
+	var keys models.UserKeys
+	if err := h.db.QueryRow(
+		`SELECT user_id, wrapped_private_key, key_derivation_salt, key_version, key_derivation_alg
+		 FROM user_keys WHERE user_id = $1`, userID,
+	).Scan(&keys.UserID, &keys.WrappedPrivateKey, &keys.KeyDerivationSalt, &keys.KeyVersion, &keys.KeyDerivationAlg); err != nil {
+		h.log.Error("Failed to fetch user keys", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
 		return
 	}
 
 	// Generate access token (JWT, 15 min)
 	tier := h.entCache.GetTier(c.Request.Context(), userID)
-	accessToken, err := GenerateAccessToken(userID, h.jwtSecret, emailVerified, tier)
+	accessToken, err := GenerateAccessToken(userID, h.jwtSecret, user.EmailVerified, tier)
 	if err != nil {
 		h.log.Error(errMsgFailedAccessToken, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
@@ -1143,36 +1159,8 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool) 
 		cookieMaxAge = 0
 	}
 	SetRefreshCookie(c, refreshToken, cookieMaxAge)
-
-	// Fetch user data
-	var user models.User
-	err = h.db.QueryRow(
-		`SELECT id, email, username, password_hash, display_name, bio, avatar_url, COALESCE(links, '[]'::jsonb),
-		        email_verified, age_verified, created_at, updated_at, password_login_disabled
-		 FROM users WHERE id = $1`, userID,
-	).Scan(
-		&user.ID, &user.Email, &user.Username, &user.PasswordHash,
-		&user.DisplayName, &user.Bio, &user.AvatarURL, &user.Links,
-		&user.EmailVerified, &user.AgeVerified,
-		&user.CreatedAt, &user.UpdatedAt, &user.PasswordLoginDisabled,
-	)
-	if err != nil {
-		h.log.Error("Failed to fetch user for login response", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return
-	}
-
-	// Fetch E2EE keys
-	var keys models.UserKeys
-	err = h.db.QueryRow(
-		`SELECT user_id, wrapped_private_key, key_derivation_salt, key_version, key_derivation_alg
-		 FROM user_keys WHERE user_id = $1`, userID,
-	).Scan(&keys.UserID, &keys.WrappedPrivateKey, &keys.KeyDerivationSalt, &keys.KeyVersion, &keys.KeyDerivationAlg)
-	if err != nil {
-		h.log.Error("Failed to fetch user keys", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return
-	}
+	c.Header(middleware.SessionIssuedHeader, "true")
+	c.Header(middleware.SessionIDHeader, tokenID)
 
 	// Clear cumulative IP auth failures only after full auth completion
 	// (credentials + MFA if enabled). This prevents resetting the counter
@@ -1605,10 +1593,11 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"access_token":  accessToken,
-		"refresh_token": newRefreshToken,
-		"session_id":    newTokenID,
-		"expires_in":    900,
+		"access_token":        accessToken,
+		"refresh_token":       newRefreshToken,
+		"session_id":          newTokenID,
+		"previous_session_id": token.ID,
+		"expires_in":          900,
 	})
 }
 
@@ -1745,10 +1734,11 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	)
 
 	c.JSON(http.StatusOK, gin.H{
-		"access_token":  accessToken,
-		"refresh_token": newRefreshToken,
-		"session_id":    newTokenID,
-		"expires_in":    900,
+		"access_token":        accessToken,
+		"refresh_token":       newRefreshToken,
+		"session_id":          newTokenID,
+		"previous_session_id": revokedTokenID,
+		"expires_in":          900,
 	})
 }
 
@@ -1795,21 +1785,31 @@ func (h *Handler) triggerTheftKeyRevocations(userID string) {
 	h.log.Info("Key revocations triggered for theft detection", "user_id", userID)
 }
 
-// Logout handles session termination
-func (h *Handler) blacklistAccessToken(c *gin.Context) {
+// Logout handles session termination. It returns claims only when the bearer
+// was valid before this request, so X-Session-ID can never authorize a
+// cross-user (or already logged-out) session revoke.
+func (h *Handler) blacklistAccessToken(c *gin.Context) *Claims {
 	authHeader := c.GetHeader("Authorization")
 	if !strings.HasPrefix(authHeader, bearerPrefix) {
-		return
+		return nil
 	}
 	token := strings.TrimPrefix(authHeader, bearerPrefix)
 	claims, err := ValidateAccessToken(token, h.jwtSecret)
 	if err != nil || claims.ID == "" {
-		return
+		return nil
 	}
+	wasBlacklisted, lookupErr := h.redis.Exists(
+		c.Request.Context(),
+		"blacklist:"+claims.ID,
+	).Result()
 	remaining := time.Until(claims.ExpiresAt.Time)
 	if blErr := middleware.BlacklistToken(context.Background(), h.redis, claims.ID, remaining); blErr != nil {
 		h.log.Error("Failed to blacklist access token", "error", blErr)
 	}
+	if lookupErr != nil || wasBlacklisted != 0 {
+		return nil
+	}
+	return claims
 }
 
 func (h *Handler) disconnectUserByID(userID string) {
@@ -1823,30 +1823,80 @@ func (h *Handler) disconnectUserByID(userID string) {
 
 // Logout revokes the current session's refresh token and blacklists the access token.
 //
-// Attestation cleanup is tied to the refresh-token revocation rather than the
-// client-supplied X-Session-ID header. The /auth/logout route is rate-limited
-// only (not behind AuthRequired) and X-Session-ID is not cross-checked against
-// the bearer's session — an attacker could otherwise POST with arbitrary
-// X-Session-ID and silently wipe another session's attestation tokens (sibling
-// of #1142/#1154; finding #15 of the #1264 review). Driving cleanup off the
-// `refresh_tokens.id` we just revoked closes the gap: only an attacker who
-// already possesses the victim's refresh token can trigger the wipe, and they
-// could already terminate the victim's session by other means at that point.
+// Explicit credentials take precedence over the cookie so best-effort cleanup
+// of an aborted flow can never revoke a successor session from the ambient
+// cookie jar. Without a valid bearer, X-Session-ID must atomically match the
+// ambient refresh cookie's token hash.
 func (h *Handler) Logout(c *gin.Context) {
-	h.blacklistAccessToken(c)
+	claims := h.blacklistAccessToken(c)
+	refreshToken := c.GetHeader("X-Refresh-Token")
+	sessionID := c.GetHeader("X-Session-ID")
+	credentialPresented := refreshToken != "" || sessionID != ""
 
-	refreshToken := h.extractRefreshToken(c)
-	if refreshToken == "" {
-		c.JSON(http.StatusOK, gin.H{"message": "Already logged out"})
+	var revokedUserID, revokedSessionID string
+	var cookieAuthorized bool
+	var revokeErr error
+	switch {
+	case refreshToken != "":
+		tokenHash := HashRefreshToken(refreshToken)
+		revokeErr = h.db.QueryRowContext(
+			c.Request.Context(),
+			`UPDATE refresh_tokens SET revoked_at = NOW()
+			 WHERE token_hash = $1 AND revoked_at IS NULL
+			 RETURNING user_id, id`,
+			tokenHash,
+		).Scan(&revokedUserID, &revokedSessionID)
+	case sessionID != "":
+		if _, parseErr := uuid.Parse(sessionID); parseErr != nil {
+			break
+		}
+		if claims != nil {
+			revokeErr = h.db.QueryRowContext(
+				c.Request.Context(),
+				`UPDATE refresh_tokens SET revoked_at = NOW()
+				 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+				 RETURNING user_id, id`,
+				sessionID, claims.UserID,
+			).Scan(&revokedUserID, &revokedSessionID)
+			break
+		}
+		cookieToken, err := c.Cookie("refresh_token")
+		if err == nil && cookieToken != "" {
+			cookieAuthorized = true
+			tokenHash := HashRefreshToken(cookieToken)
+			revokeErr = h.db.QueryRowContext(
+				c.Request.Context(),
+				`UPDATE refresh_tokens SET revoked_at = NOW()
+				 WHERE id = $1 AND token_hash = $2 AND revoked_at IS NULL
+				 RETURNING user_id, id`,
+				sessionID, tokenHash,
+			).Scan(&revokedUserID, &revokedSessionID)
+		}
+	default:
+		cookieToken, err := c.Cookie("refresh_token")
+		if err == nil && cookieToken != "" {
+			credentialPresented = true
+			cookieAuthorized = true
+			tokenHash := HashRefreshToken(cookieToken)
+			revokeErr = h.db.QueryRowContext(
+				c.Request.Context(),
+				`UPDATE refresh_tokens SET revoked_at = NOW()
+				 WHERE token_hash = $1 AND revoked_at IS NULL
+				 RETURNING user_id, id`,
+				tokenHash,
+			).Scan(&revokedUserID, &revokedSessionID)
+		}
+	}
+	if revokeErr != nil && !errors.Is(revokeErr, sql.ErrNoRows) {
+		h.log.Error("Failed to revoke refresh session during logout", "error", revokeErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalError})
 		return
 	}
 
-	tokenHash := HashRefreshToken(refreshToken)
-	var revokedUserID, revokedSessionID string
-	_ = h.db.QueryRow(
-		`UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1 RETURNING user_id, id`,
-		tokenHash,
-	).Scan(&revokedUserID, &revokedSessionID)
+	if !credentialPresented {
+		c.JSON(http.StatusOK, gin.H{"message": "Already logged out"})
+		return
+	}
 
 	// Free this session's attestation tokens proactively so they don't outlive
 	// the session in Redis. Orphan attestation keys are harmless (they bind a
@@ -1863,7 +1913,9 @@ func (h *Handler) Logout(c *gin.Context) {
 
 	h.disconnectUserByID(revokedUserID)
 
-	SetRefreshCookie(c, "", -1)
+	if cookieAuthorized && revokedSessionID != "" {
+		SetRefreshCookie(c, "", -1)
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
 }
 

@@ -1,7 +1,7 @@
 # State Management Architecture
 
 **Framework:** Zustand v5.0.12
-**Last Updated:** 2026-04-09
+**Last Updated:** 2026-07-18
 **Decision:** Zustand chosen over Redux after cost-benefit analysis (see below)
 
 ---
@@ -34,7 +34,7 @@ Full analysis was performed during Phase 1A architecture decisions (internal).
 
 | Store                           | Purpose                                                      | Persisted             | Phase |
 | ------------------------------- | ------------------------------------------------------------ | --------------------- | ----- |
-| **authStore**                   | JWT tokens, auth state                                       | ✅ refresh token only | 1A    |
+| **authStore**                   | Access/session lineage and auth lifecycle                    | ❌                    | 1A    |
 | **chatStore**                   | Messages, typing, connection                                 | ❌ (privacy)          | 1A    |
 | **serverStore**                 | Server list, active server                                   | ✅ active server ID   | 1A    |
 | **userStore**                   | User profile, preferences                                    | ❌                    | 1A    |
@@ -65,7 +65,9 @@ Full analysis was performed during Phase 1A architecture decisions (internal).
 | **savedGifsStore**              | User's saved/favourite GIFs (Klipy integration)              | ✅                    | 2B    |
 | **settingsOverlayStore**        | Settings panel open/close and active tab state               | ❌                    | 2B    |
 
-**Total:** The inventory above details 30 core stores; stores added in later work are not yet broken out individually here. The canonical set lives in `src/renderer/stores/`.
+> **Current metrics:** See [[internal] Key Counts](../../..[internal]#key-counts)
+
+The inventory above is an architectural overview; the canonical store set lives in `src/renderer/stores/`.
 
 ---
 
@@ -73,7 +75,7 @@ Full analysis was performed during Phase 1A architecture decisions (internal).
 
 ### 1. authStore
 
-**Purpose:** Authentication tokens and session management
+**Purpose:** Renderer-owned access credentials and authentication lifecycle fencing
 
 **Location:** `src/renderer/stores/authStore.ts`
 
@@ -82,20 +84,26 @@ Full analysis was performed during Phase 1A architecture decisions (internal).
 ```typescript
 interface AuthState {
   accessToken: string | null;
-  refreshToken: string | null;
-  setTokens: (access: string, refresh: string) => void;
-  clearTokens: () => void;
+  sessionId: string | null;
+  authGeneration: number;
+  beginAuthLifecycle: (accessToken: string, sessionId: string | null) => number;
+  rotateAuthCredentials: (
+    expectedGeneration: number,
+    accessToken: string,
+    sessionId: string | null
+  ) => boolean;
+  clearAccessToken: () => void;
 }
 ```
 
-**Persistence:**
+**Credential ownership:**
 
-- ✅ **Persists:** `refreshToken` only (30-day lifetime)
-- ❌ **Does NOT persist:** `accessToken` (15-minute lifetime, security best practice)
-- **Storage Key:** `concord-auth`
-- **Privacy Rationale:** Access tokens are short-lived and should not persist across app restarts
+- The renderer holds `accessToken`, `sessionId`, and the monotonic `authGeneration` in memory only.
+- Refresh credentials are main-process-owned. `tokenManager.ts` keeps session-only credentials in memory and uses Electron `safeStorage` only when Remember Me is enabled.
+- Login/restore starts a new auth generation; an accepted refresh rotates the access/session pair only when the captured generation still matches.
+- `clearAccessToken()` clears the renderer pair and advances the generation, fencing stale async continuations.
 
-**DevTools:** Enabled as "AuthStore"
+`authStore` uses the shared `createStore` wrapper and does not use Zustand persistence middleware.
 
 **Usage:**
 
@@ -104,10 +112,10 @@ import { useAuthStore } from '@/stores/authStore';
 
 // In component
 const accessToken = useAuthStore((state) => state.accessToken);
-const setTokens = useAuthStore((state) => state.setTokens);
+const sessionId = useAuthStore((state) => state.sessionId);
 
 // Direct access (non-reactive)
-const token = useAuthStore.getState().accessToken;
+const generation = useAuthStore.getState().authGeneration;
 ```
 
 ---
@@ -297,7 +305,7 @@ const result = await changePassword(accessToken, currentPwd, newPwd);
 
 ### DevTools Middleware
 
-**All stores** use Zustand's `devtools` middleware for debugging.
+Stores created with Zustand's `devtools` middleware appear in Redux DevTools. Lightweight stores such as `authStore` use the shared `createStore` wrapper without this middleware.
 
 **Setup:**
 
@@ -318,7 +326,7 @@ export const useChatStore = create<ChatState>()(
 
 1. Install [Redux DevTools Extension](https://github.com/reduxjs/redux-devtools)
 2. Open browser DevTools → Redux tab
-3. See all Zustand stores (AuthStore, ChatStore, ServerStore, UserStore)
+3. Select an instrumented store such as ChatStore, ServerStore, or UserStore
 
 **Features:**
 
@@ -338,27 +346,27 @@ export const useChatStore = create<ChatState>()(
 
 ### Persist Middleware
 
-**authStore** and **serverStore** use Zustand's `persist` middleware.
+Stores that retain device-local UI choices use Zustand's `persist` middleware. `authStore` deliberately does not; refresh credentials remain main-process-owned.
 
 **Setup:**
 
 ```typescript
 import { persist, devtools } from 'zustand/middleware';
 
-export const useAuthStore = create<AuthState>()(
+const serverStore = create<ServerState>()(
   devtools(
     persist(
       (set) => ({
         /* store logic */
       }),
       {
-        name: 'concord-auth', // localStorage key
+        name: 'concord-servers',
         partialize: (state) => ({
-          refreshToken: state.refreshToken, // Only persist refresh token
+          activeServerId: state.activeServerId,
         }),
       }
     ),
-    { name: 'AuthStore' }
+    { name: 'ServerStore' }
   )
 );
 ```
@@ -366,7 +374,7 @@ export const useAuthStore = create<AuthState>()(
 **Privacy Controls:**
 
 - Use `partialize` to control EXACTLY what persists
-- Example: authStore persists `refreshToken` but NOT `accessToken`
+- Keep credentials and user content out of renderer persistence
 - Default: Entire state persists (use partialize for fine-grained control)
 
 **Storage:**
@@ -440,27 +448,24 @@ export const useChatStore = create<ChatState>()(
 );
 ```
 
-**Auth tokens - partial persistence:**
+**Auth credentials - no renderer persistence:**
 
 ```typescript
-// authStore - ONLY persist refresh token
-partialize: (state) => ({
-  refreshToken: state.refreshToken, // ✅ Persist
-  // accessToken: NOT persisted ❌
-});
+// authStore uses createStore directly; tokenManager owns refresh credentials.
+export const useAuthStore = createStore<AuthState>()((set) => ({
+  accessToken: null,
+  sessionId: null,
+  authGeneration: 0,
+  // ...auth lifecycle actions
+}));
 ```
 
 **Logout - clear ALL stores:**
 
 ```typescript
-// userStore.logout()
-logout: async () => {
-  // Clear all stores
-  useUserStore.getState().clearUser();
-  useAuthStore.getState().clearTokens();
-  useServerStore.getState().clearServers();
-  useChatStore.getState().reset();
-};
+// userStore.logout() delegates the final cross-store wipe to resetService.
+const { nuclearReset } = await import('../services/resetService');
+nuclearReset();
 ```
 
 ---
@@ -492,11 +497,11 @@ export const useChatStore = create<ChatState>()(/* ... */);
 **Stores can call other stores:**
 
 ```typescript
-// userStore calls authStore and serverStore
+// userStore coordinates logout, then delegates the complete wipe.
 logout: async () => {
-  set({ user: null });
-  useAuthStore.getState().clearTokens(); // ✅ Cross-store access
-  useServerStore.getState().clearServers();
+  // ...stop sync and request main-process logout
+  const { nuclearReset } = await import('../services/resetService');
+  nuclearReset();
 };
 ```
 
@@ -517,18 +522,19 @@ import { useAuthStore } from '@/stores/authStore';
 describe('authStore', () => {
   beforeEach(() => {
     // Clear store before each test
-    useAuthStore.getState().clearTokens();
+    useAuthStore.getState().clearAccessToken();
   });
 
-  it('should set tokens', () => {
-    const { result } = renderHook(() => useAuthStore());
+  it('starts a new auth lifecycle', () => {
+    const { result } = renderHook(() => useAuthStore((state) => state));
 
     act(() => {
-      result.current.setTokens('access123', 'refresh456');
+      result.current.beginAuthLifecycle('access123', 'session-1');
     });
 
     expect(result.current.accessToken).toBe('access123');
-    expect(result.current.refreshToken).toBe('refresh456');
+    expect(result.current.sessionId).toBe('session-1');
+    expect(result.current.authGeneration).toBeGreaterThan(0);
   });
 });
 ```
@@ -587,16 +593,14 @@ const complexFeatureStore = configureStore({
 
 ### Q: How do I clear all data on logout?
 
-**A:** Call each store's clear method:
+**A:** Use the centralized reset path so renderer state and main-process credentials are cleared together:
 
 ```typescript
-useAuthStore.getState().clearTokens();
-useChatStore.getState().reset();
-useServerStore.getState().clearServers();
-useUserStore.getState().clearUser();
+const { nuclearReset } = await import('../services/resetService');
+nuclearReset();
 ```
 
-Or use the `userStore.logout()` action which does this automatically.
+Normal user-initiated logout should call `userStore.logout()`, which requests main-process logout before invoking that reset.
 
 ### Q: How do I debug WebSocket → Store flow?
 
@@ -634,18 +638,19 @@ Or use the `userStore.logout()` action which does this automatically.
 ## Related Documentation
 
 - [Zustand Official Docs](https://github.com/pmndrs/zustand)
-- [WebSocket Integration](../services/WEBSOCKET_README.md)
-- [Message Queue](../services/messageQueue.ts)
-- [E2EE Architecture](../utils/crypto.ts)
+- [WebSocket Integration](../src/renderer/hooks/useWebSocket.ts)
+- [Message Queue](../src/renderer/services/messageQueue.ts)
+- [E2EE Service](../src/renderer/services/e2eeService.ts)
 
 ---
 
 ## Changelog
 
-**2026-02-18:** Initial documentation, 4 core stores documented, DevTools + persist middleware enabled
-**2026-03-03:** Updated store inventory to 19 stores (Phase 1A–1C complete), removed dead reference to analysis doc
-**2026-03-27:** Updated to Zustand 5.0.12, added 5 Phase 2A stores (clientConfigStore, mfaChallengeStore, notificationStore, osPermissionStore, permissionStore), total now 24
-**2026-04-09:** Added 6 Phase 2B stores (channelScrollStore, draftMessageStore, keyboardShortcutStore, notificationNavigationStore, savedGifsStore, settingsOverlayStore), total now 30
+**2026-02-18:** Initial core-store documentation; DevTools and persistence middleware documented
+**2026-03-03:** Updated the Phase 1A–1C inventory; removed dead reference to analysis doc
+**2026-03-27:** Updated to Zustand 5.0.12; added the Phase 2A stores
+**2026-04-09:** Added the Phase 2B stores
+**2026-07-18:** Updated auth ownership and lifecycle semantics; replaced the point-in-time store total with the canonical Key Counts reference
 
 ---
 

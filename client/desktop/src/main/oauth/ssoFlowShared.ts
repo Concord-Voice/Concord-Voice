@@ -10,6 +10,16 @@ import { timingSafeEqual } from 'node:crypto';
 
 import type { SSOSignInErrorCode, SSOSignInResult } from '../../shared/sso';
 
+/** Main-only response shape. Refresh credentials are removed by the IPC handler. */
+export type MainSSOSignInResult =
+  | {
+      kind: 'tokens';
+      accessToken: string;
+      refreshToken: string;
+      sessionId: string;
+    }
+  | Exclude<SSOSignInResult, { kind: 'tokens' }>;
+
 /**
  * Constant-time string equality via Node crypto.timingSafeEqual.
  * Length is not secret (both values are CSPRNG-shaped); the over-equal-length
@@ -23,15 +33,24 @@ export function constantTimeEquals(a: string, b: string): boolean {
 }
 
 /**
- * Maps a raw /session response body (Callback-shape parity) into the
- * IPC-safe discriminated SSOSignInResult union.
- *
- * AppleSignInResult is a re-export alias of SSOSignInResult (./shared/appleSso),
- * so this function satisfies both flow return types.
+ * Maps a raw /session response body into a main-process-only result. The IPC
+ * handler stores refreshToken and returns the sanitized SSOSignInResult.
  */
-export function mapSessionResponse(body: Record<string, unknown>): SSOSignInResult {
-  if (typeof body.access_token === 'string' && body.access_token.length > 0) {
-    return { kind: 'tokens', accessToken: body.access_token };
+export function mapSessionResponse(body: Record<string, unknown>): MainSSOSignInResult {
+  if (
+    typeof body.access_token === 'string' &&
+    body.access_token.length > 0 &&
+    typeof body.refresh_token === 'string' &&
+    body.refresh_token.length > 0 &&
+    typeof body.session_id === 'string' &&
+    body.session_id.length > 0
+  ) {
+    return {
+      kind: 'tokens',
+      accessToken: body.access_token,
+      refreshToken: body.refresh_token,
+      sessionId: body.session_id,
+    };
   }
   if (typeof body.mfa_challenge_token === 'string' && body.mfa_challenge_token.length > 0) {
     return {

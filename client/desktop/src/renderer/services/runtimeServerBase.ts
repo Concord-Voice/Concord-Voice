@@ -2,6 +2,12 @@ import { API_BASE, WS_BASE } from '../config';
 
 let runtimeApiBase = API_BASE;
 let runtimeWsBase = WS_BASE;
+let runtimeServerSelectionEpoch = 0;
+
+export interface RuntimeServerSelection {
+  readonly apiBase: string;
+  readonly epoch: number;
+}
 
 function normalizeHttpBase(base: string): string {
   const parsed = new URL(base);
@@ -25,6 +31,14 @@ export function getWsBase(): string {
   return runtimeWsBase;
 }
 
+export function captureRuntimeServerSelection(): RuntimeServerSelection {
+  return { apiBase: runtimeApiBase, epoch: runtimeServerSelectionEpoch };
+}
+
+export function runtimeServerSelectionIsCurrent(selection: RuntimeServerSelection): boolean {
+  return selection.apiBase === runtimeApiBase && selection.epoch === runtimeServerSelectionEpoch;
+}
+
 export function apiUrl(path: string): string {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
   return `${runtimeApiBase}${normalizedPath}`;
@@ -40,11 +54,15 @@ export function mediaUrl(url?: string | null): string | undefined {
 }
 
 export function setRuntimeServerBase(base: string): void {
-  runtimeApiBase = normalizeHttpBase(base);
-  runtimeWsBase = deriveWsBase(runtimeApiBase);
+  const apiBase = normalizeHttpBase(base);
+  const wsBase = deriveWsBase(apiBase);
+  runtimeApiBase = apiBase;
+  runtimeWsBase = wsBase;
+  runtimeServerSelectionEpoch += 1;
 }
 
 export function resetRuntimeServerBase(): void {
   runtimeApiBase = API_BASE;
   runtimeWsBase = WS_BASE;
+  runtimeServerSelectionEpoch += 1;
 }

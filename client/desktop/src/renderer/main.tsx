@@ -4,11 +4,18 @@ import { HashRouter } from 'react-router-dom';
 import App from './App';
 import { installSelfHealHandlers } from './spaSelfHealClient';
 import { ModalProvider } from './components/ui/ModalContext';
+import { configureRefreshFailureReset } from './services/apiClient';
 import { install as installLogBuffer } from './services/logBufferService';
+import { gracefulReset, nuclearReset } from './services/resetService';
 import './styles/index.css';
 // Pride scheme rainbow flourishes — scoped to [data-scheme='pride'], imported
 // after index.css so its overrides win source-order ties (experiment/theme).
 import './styles/pride-flourishes.css';
+
+// Keep logout-class teardown in the initial renderer graph. An expired lazy
+// chunk must never be able to strand authenticated/E2EE state after a failed
+// token refresh.
+configureRefreshFailureReset({ gracefulReset, nuclearReset });
 
 // Install the ring-buffer log capture as early as possible so bug reports
 // (#158) include the maximal recent-log context. The buffer shadow-wraps
