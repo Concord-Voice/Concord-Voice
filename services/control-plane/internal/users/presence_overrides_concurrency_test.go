@@ -387,6 +387,7 @@ func newConcurrencyHandler(
 	require.NoError(t, service.BindDelivery(delivery))
 	handler := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
 	handler.SetPresenceHistory(service)
+	bindNoopActivitySettingsSuppressor(handler)
 	return handler, service
 }
 

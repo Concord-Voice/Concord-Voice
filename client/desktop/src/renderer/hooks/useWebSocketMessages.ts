@@ -2158,9 +2158,11 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // msg.data is already narrowed (no casts). The store keys other users'
     // custom text by user_id; the self slice is owned by the settings flow.
     const unsubRichPresenceUpdate = wsService.on('rich_presence_update', (msg) => {
+      if (msg.data.category !== 'custom_text') return;
       useRichPresenceStore.getState().setCustomText(msg.data.user_id, msg.data.payload);
     });
     const unsubRichPresenceClear = wsService.on('rich_presence_clear', (msg) => {
+      if (msg.data.category !== 'custom_text') return;
       useRichPresenceStore.getState().clearCustomText(msg.data.user_id);
     });
 

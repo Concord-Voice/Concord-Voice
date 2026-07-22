@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
 	"github.com/lib/pq"
@@ -55,6 +57,64 @@ const (
 func setupTS(t *testing.T) *testhelpers.TestServer {
 	t.Helper()
 	return testhelpers.SetupTestServer(t)
+}
+
+func seedDMVoiceParticipant(t *testing.T, ts *testhelpers.TestServer, convID, userID string) {
+	t.Helper()
+	_, err := ts.DB.Exec(`
+		INSERT INTO dm_voice_participants (conversation_id, user_id)
+		VALUES ($1, $2)
+	`, convID, userID)
+	require.NoError(t, err)
+}
+
+func subscribeDMVoiceDisconnect(t *testing.T) chan map[string]interface{} {
+	return subscribeDMVoiceEnforcement(t, "voice.enforce.disconnect")
+}
+
+func subscribeDMVoiceEnforcement(t *testing.T, subject string) chan map[string]interface{} {
+	t.Helper()
+	natsURL := os.Getenv("NATS_URL")
+	if natsURL == "" {
+		natsURL = "nats://localhost:4222"
+	}
+	observer, err := natsclient.Connect(natsURL)
+	if err != nil {
+		t.Skipf("NATS unavailable (%v); skipping live DM enforcement test", err)
+	}
+	t.Cleanup(observer.Close)
+	messages := make(chan map[string]interface{}, 8)
+	subscription, err := observer.Subscribe(subject, func(data []byte) {
+		var payload map[string]interface{}
+		if json.Unmarshal(data, &payload) == nil {
+			messages <- payload
+		}
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = subscription.Unsubscribe() })
+	require.NoError(t, observer.Flush())
+	return messages
+}
+
+func waitDMVoiceEnforcement(
+	t *testing.T,
+	messages <-chan map[string]interface{},
+	userID string,
+) map[string]interface{} {
+	t.Helper()
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case payload := <-messages:
+			if payload["userId"] == userID {
+				return payload
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for DM voice enforcement for user %s", userID)
+			return nil
+		}
+	}
 }
 
 // insertDMMessage inserts a DM message directly into the database and returns its ID.
@@ -3046,6 +3106,68 @@ func TestRemoveMemberSelfLeave(t *testing.T) {
 	assert.False(t, exists, "self-leave user should be removed")
 }
 
+func TestRemoveMemberAdminImmediatelyDisconnectsActiveDMVoiceTarget(t *testing.T) {
+	messages := subscribeDMVoiceDisconnect(t)
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "rmvoiceadmin")
+	member := ts.CreateTestUser(t, "rmvoicemember")
+	target := ts.CreateTestUser(t, "rmvoicetarget")
+	convID := createTestGroup(t, ts, admin, member, target)
+	seedDMVoiceParticipant(t, ts, convID, target.ID)
+
+	response := ts.DoRequest(
+		"DELETE",
+		pathDMConversationsPrefix+convID+pathMembersSlash+target.ID,
+		nil,
+		testhelpers.AuthHeaders(admin.AccessToken),
+	)
+	require.Equal(t, http.StatusOK, response.Code)
+	payload := waitDMVoiceEnforcement(t, messages, target.ID)
+	assert.Equal(t, convID, payload["channelId"])
+	assert.Equal(t, "disconnect", payload["action"])
+}
+
+func TestRemoveMemberAdminDisconnectsBeforeDMVoicePresenceRow(t *testing.T) {
+	messages := subscribeDMVoiceDisconnect(t)
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "rmvoiceraceadmin")
+	member := ts.CreateTestUser(t, "rmvoiceracemember")
+	target := ts.CreateTestUser(t, "rmvoiceracetarget")
+	convID := createTestGroup(t, ts, admin, member, target)
+
+	response := ts.DoRequest(
+		"DELETE",
+		pathDMConversationsPrefix+convID+pathMembersSlash+target.ID,
+		nil,
+		testhelpers.AuthHeaders(admin.AccessToken),
+	)
+	require.Equal(t, http.StatusOK, response.Code)
+	payload := waitDMVoiceEnforcement(t, messages, target.ID)
+	assert.Equal(t, convID, payload["channelId"])
+	assert.Equal(t, "disconnect", payload["action"])
+}
+
+func TestRemoveMemberSelfLeaveImmediatelyDisconnectsActiveDMVoiceTarget(t *testing.T) {
+	messages := subscribeDMVoiceDisconnect(t)
+	ts := setupTS(t)
+	admin := ts.CreateTestUser(t, "rmvoiceselfadmin")
+	member := ts.CreateTestUser(t, "rmvoiceselfmember")
+	leaver := ts.CreateTestUser(t, "rmvoiceselftarget")
+	convID := createTestGroup(t, ts, admin, member, leaver)
+	seedDMVoiceParticipant(t, ts, convID, leaver.ID)
+
+	response := ts.DoRequest(
+		"DELETE",
+		pathDMConversationsPrefix+convID+pathMembersSlash+leaver.ID,
+		nil,
+		testhelpers.AuthHeaders(leaver.AccessToken),
+	)
+	require.Equal(t, http.StatusOK, response.Code)
+	payload := waitDMVoiceEnforcement(t, messages, leaver.ID)
+	assert.Equal(t, convID, payload["channelId"])
+	assert.Equal(t, "disconnect", payload["action"])
+}
+
 func TestRemoveMemberCannotRemoveCreator(t *testing.T) {
 	ts := setupTS(t)
 	creator := ts.CreateTestUser(t, "rmcr1")
@@ -4309,6 +4431,34 @@ func TestRingDMCall_RejectsConversationWithLiveMediaRoom(t *testing.T) {
 	assert.False(t, dm.PendingDMCallExistsForTest(uuid.MustParse(convID)))
 }
 
+func TestRingDMCall_PreservesLongRunningMediaRoomWithRecentLifecycle(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	caller := ts.CreateTestUser(t, "ring_long_running_caller")
+	callee := ts.CreateTestUser(t, "ring_long_running_callee")
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+	_, err := ts.DB.Exec(`
+		INSERT INTO dm_voice_participants
+			(conversation_id, user_id, joined_at, lifecycle_event_at)
+		VALUES ($1, $2, NOW() - INTERVAL '10 minutes', NOW())
+	`, convID, caller.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceRing, nil,
+		testhelpers.AuthHeaders(caller.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code,
+		"a recent lifecycle watermark must keep a long-running call active: %s", w.Body.String())
+	assert.False(t, dm.PendingDMCallExistsForTest(uuid.MustParse(convID)))
+	var participantRows int
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT COUNT(*)
+		FROM dm_voice_participants
+		WHERE conversation_id = $1 AND user_id = $2
+	`, convID, caller.ID).Scan(&participantRows))
+	assert.Equal(t, 1, participantRows)
+}
+
 func TestRingDMCall_ExpiresStaleMediaPresenceBeforeRinging(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	t.Cleanup(dm.ResetPendingDMCallsForTest)
@@ -4317,8 +4467,13 @@ func TestRingDMCall_ExpiresStaleMediaPresenceBeforeRinging(t *testing.T) {
 	callee := ts.CreateTestUser(t, "ring_stale_room_callee")
 	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
 	_, err := ts.DB.Exec(`
-		INSERT INTO dm_voice_participants (conversation_id, user_id, joined_at)
-		VALUES ($1, $2, NOW() - INTERVAL '10 minutes')
+		INSERT INTO dm_voice_participants
+			(conversation_id, user_id, joined_at, lifecycle_event_at)
+		VALUES (
+			$1, $2,
+			NOW() - INTERVAL '10 minutes',
+			NOW() - INTERVAL '10 minutes'
+		)
 	`, convID, caller.ID)
 	require.NoError(t, err)
 
@@ -4790,6 +4945,12 @@ func TestAuthorizeDMVoiceForMediaPlane_Member_Returns200(t *testing.T) {
 	user := ts.CreateTestUser(t, "g7_member")
 	other := ts.CreateTestUser(t, "g7_other")
 	convID := ts.CreateDMConversation(t, user.ID, other.ID)
+	_, err := ts.DB.Exec(`
+		UPDATE dm_participants
+		SET server_muted = TRUE, server_deafened = TRUE
+		WHERE conversation_id = $1 AND user_id = $2
+	`, convID, user.ID)
+	require.NoError(t, err)
 
 	w, callID := authorizeDMVoiceForMediaPlaneAfterJoin(t, ts, convID, user)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
@@ -4798,6 +4959,8 @@ func TestAuthorizeDMVoiceForMediaPlane_Member_Returns200(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
 	assert.Equal(t, true, body["authorized"])
 	assert.Equal(t, false, body["is_group"], "DM 1:1 = not group")
+	assert.Equal(t, true, body["server_muted"])
+	assert.Equal(t, true, body["server_deafened"])
 	assert.Equal(t, callID, body["call_id"])
 	assert.Equal(t, user.ID, body["call_caller_user_id"])
 	lease, hasLease, err := dm.LookupDMVoiceCallLease(context.Background(), ts.Redis, uuid.MustParse(convID))

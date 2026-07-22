@@ -3425,8 +3425,10 @@ paths:
       - Direct Messages
       summary: Remove a member from a group DM (or leave when targeting yourself)
       description: 'Group conversations only. Admins may remove other members; any participant may remove
-        themselves (self-leave). The group creator can only be removed via self-leave. Rate limit: 10
-        requests/min per user.'
+        themselves (self-leave). The group creator can only be removed via self-leave. After the membership
+        commit, the control plane unconditionally publishes a target disconnect; successful DM heartbeats
+        retry disconnects for media-reported users who are no longer members. Rate limit: 10 requests/min
+        per user.'
       operationId: removeDMGroupMember
       security:
       - BearerAuth: []
@@ -3898,6 +3900,12 @@ paths:
 
         refresh a call lease.
 
+        The media plane calls this boundary once before provisional RoomManager registration and again
+
+        with the first response''s exact call ID before socket admission is acknowledged. A second-check
+
+        denial or lease rotation rolls the provisional participant back.
+
         Rate limit: 60 requests per minute (user-based).
 
         '
@@ -3949,6 +3957,16 @@ paths:
             application/json:
               schema:
                 type: object
+                required:
+                - authorized
+                - is_group
+                - call_id
+                - server_muted
+                - server_deafened
+                - media_entitlements
+                - username
+                - display_name
+                - avatar_url
                 properties:
                   authorized:
                     type: boolean
@@ -3967,6 +3985,23 @@ paths:
                     type: string
                     format: uuid
                     description: Server-derived original caller.
+                  server_muted:
+                    type: boolean
+                    description: Server-authoritative hard-mute state for this DM participant.
+                  server_deafened:
+                    type: boolean
+                    description: Server-authoritative hard-deafen state for this DM participant.
+                  media_entitlements:
+                    $ref: '#/components/schemas/MediaEntitlements'
+                  username:
+                    type: string
+                    description: Server-authoritative username for the admitted participant.
+                  display_name:
+                    type: string
+                    description: Server-authoritative display name; empty when unset.
+                  avatar_url:
+                    type: string
+                    description: Server-authoritative avatar URL; empty when unset.
         '400':
           description: Invalid conversation ID, request body, or call ID
           content:
@@ -9371,15 +9406,13 @@ paths:
       - Privacy
       summary: Erase account
       operationId: eraseAccount
-      description: 'Permanently erase the authenticated user''s account (GDPR Article 17).
-
-        Deletes atomically with cascade through all user-linked tables and
-
-        writes a privacy-safe audit row. Available before email verification.
-
-        Rate limit: 3 requests per 24 hours (user-based).
-
-        '
+      description: >-
+        Permanently erase the authenticated user's account (GDPR Article 17).
+        Any pending Rich Presence cleanup is resumed and active activity is
+        suppressed under the sender gate first. The subsequent user cascade and
+        privacy-safe audit insertion execute atomically in one database transaction.
+        Available before email verification. Rate limit: 3 requests per 24 hours
+        (user-based).
       security:
       - BearerAuth: []
       requestBody:
@@ -12244,32 +12277,31 @@ paths:
                     minimum: 0
                     maximum: 2
                     default: 1
-                    description: 'Persisted policy input for the later Server Voice
-                      runtime: 0=Off, 1=Friends (and opted-in friends-of-friends)
-                      in the active server, 2=all members of the active server. This
-                      change does not implement Server Voice fan-out.'
+                    description: 'Live Server Voice audience policy: 0=Off,
+                      1=Friends (and opted-in friends-of-friends) in the active
+                      server, 2=all members of the active server. Authoritative
+                      lifecycle events drive minimized delivery and every recipient
+                      is reauthorized before live or reconnect enqueue.'
                   server_voice_show_details:
                     type: boolean
                     default: true
-                    description: Persisted policy input controlling whether the later
-                      Server Voice runtime may expose detailed rather than coarse presence;
-                      this change does not implement that runtime.
+                    description: Whether authorized Server Voice viewers receive
+                      detailed rather than coarse minimized presence.
                   private_call_tier:
                     type: integer
                     minimum: 0
                     maximum: 2
                     default: 0
-                    description: 'Persisted policy input for the later Private Call
-                      runtime: 0=call participants only, 1=participants plus friends
-                      and opted-in friends-of-friends, 2=those viewers plus shared-server
-                      peers. master_enabled=false overrides every tier. This change
-                      does not implement Private Call fan-out.'
+                    description: 'Live Private Call audience policy: 0=call
+                      participants only, 1=participants plus friends and opted-in
+                      friends-of-friends, 2=those viewers plus shared-server peers.
+                      master_enabled=false overrides every tier. Authoritative call
+                      lifecycle events drive minimized, freshly authorized delivery.'
                   private_call_show_details:
                     type: boolean
                     default: false
-                    description: Persisted policy input controlling whether the later
-                      Private Call runtime may expose detailed rather than coarse presence;
-                      this change does not implement that runtime.
+                    description: Whether authorized Private Call viewers receive
+                      detailed rather than coarse minimized presence.
                   custom_text_tier:
                     type: integer
                     minimum: 0
@@ -12319,29 +12351,27 @@ paths:
                   type: integer
                   minimum: 0
                   maximum: 2
-                  description: 'Persisted policy input for the later Server Voice
-                    runtime: 0=Off, 1=Friends (and opted-in friends-of-friends)
-                    in the active server, 2=all members of the active server. This
-                    change does not implement Server Voice fan-out.'
+                  description: 'Live Server Voice audience policy: 0=Off,
+                    1=Friends (and opted-in friends-of-friends) in the active
+                    server, 2=all members of the active server. Updates immediately
+                    suppress or reproject current authoritative activity as needed.'
                 server_voice_show_details:
                   type: boolean
-                  description: Persisted policy input controlling whether the later
-                    Server Voice runtime may expose detailed rather than coarse presence;
-                    this change does not implement that runtime.
+                  description: Whether authorized Server Voice viewers receive
+                    detailed rather than coarse minimized presence.
                 private_call_tier:
                   type: integer
                   minimum: 0
                   maximum: 2
-                  description: 'Persisted policy input for the later Private Call
-                    runtime: 0=call participants only, 1=participants plus friends
-                    and opted-in friends-of-friends, 2=those viewers plus shared-server
-                    peers. master_enabled=false overrides every tier. This change
-                    does not implement Private Call fan-out.'
+                  description: 'Live Private Call audience policy: 0=call
+                    participants only, 1=participants plus friends and opted-in
+                    friends-of-friends, 2=those viewers plus shared-server peers.
+                    master_enabled=false overrides every tier. Updates immediately
+                    suppress or reproject current authoritative activity as needed.'
                 private_call_show_details:
                   type: boolean
-                  description: Persisted policy input controlling whether the later
-                    Private Call runtime may expose detailed rather than coarse presence;
-                    this change does not implement that runtime.
+                  description: Whether authorized Private Call viewers receive
+                    detailed rather than coarse minimized presence.
                 custom_text_tier:
                   type: integer
                   minimum: 0
@@ -12385,26 +12415,30 @@ paths:
                     minimum: 0
                     maximum: 2
                     default: 1
-                    description: 0=Off, 1=Friends (and opted-in friends-of-friends)
-                      in the active server, 2=all members of the active server.
+                    description: 'Live Server Voice audience policy: 0=Off,
+                      1=Friends (and opted-in friends-of-friends) in the active
+                      server, 2=all members of the active server. Updates immediately
+                      suppress or reproject current authoritative activity as needed.'
                   server_voice_show_details:
                     type: boolean
                     default: true
                     description: Whether authorized Server Voice viewers receive
-                      detailed rather than coarse presence.
+                      detailed rather than coarse minimized presence.
                   private_call_tier:
                     type: integer
                     minimum: 0
                     maximum: 2
                     default: 0
-                    description: 0=call participants only, 1=participants plus friends
-                      and opted-in friends-of-friends, 2=those viewers plus shared-server
-                      peers. master_enabled=false overrides every tier.
+                    description: 'Live Private Call audience policy: 0=call
+                      participants only, 1=participants plus friends and opted-in
+                      friends-of-friends, 2=those viewers plus shared-server peers.
+                      master_enabled=false overrides every tier. Updates immediately
+                      suppress or reproject current authoritative activity as needed.'
                   private_call_show_details:
                     type: boolean
                     default: false
                     description: Whether authorized Private Call viewers receive
-                      detailed rather than coarse presence.
+                      detailed rather than coarse minimized presence.
                   custom_text_tier:
                     type: integer
                     minimum: 0
@@ -12426,6 +12460,15 @@ paths:
           description: Empty or malformed JSON object; null, duplicate, or unknown
             fields; wrong field types; a tier outside 0..2; custom_text over 140
             Unicode code points; or custom_text_emoji over 32 Unicode code points
+        '503':
+          description: >-
+            Activity suppression is unavailable or durable cleanup could not be
+            resumed. The settings transaction may already be committed; retrying
+            the same request safely resumes cleanup and returns the current settings.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /users/me/presence-history:
     get:
       tags:
@@ -13278,7 +13321,8 @@ paths:
 
         - Server sends `connected` message with `client_id` and `user_id`
 
-        - Server sends `presence_snapshot` with all online users
+        - Server sends `presence_snapshot` with base presence and freshly authorized Server Voice/Private
+        Call activity
 
         - Client subscribes to channels/servers
 
@@ -13326,8 +13370,11 @@ paths:
 
         | `connected` | `client_id`, `user_id` | Connection established |
 
-        | `presence_snapshot` | `users[]` | All permitted online users with statuses. Audience-filtered
-        Custom Status snapshots follow as `rich_presence_update` frames. |
+        | `presence_snapshot` | `users[]` | Permitted base-presence users plus freshly authorized
+        activity-only users (which remain status `offline`). Each entry has `user_id`, `status`, and optional
+        `rich_presence`: a map keyed by `server_voice` or `private_call`, whose values are
+        `{minimized, payload, updated_at}`. Ordered Custom Status snapshots follow as
+        `rich_presence_update` frames. |
 
         | `subscribed` | `channel_id` | Channel subscription confirmed |
 
@@ -13357,11 +13404,16 @@ paths:
         to the sender''s connected clients after a successful exception write. Clients refetch and
         decrypt the preference; recipient IDs are never included. |
 
-        | `rich_presence_update` | `user_id`, `category`, `payload`, `updated_at` | Audience-filtered
-        Custom Status update, including reconnect snapshot delivery. |
+        | `rich_presence_update` | `user_id`, `category`, `payload`, `updated_at`, `minimized` (activity only)
+        | Audience-filtered Custom Status, Server Voice, or Private Call update. `category` is exactly
+        `custom_text`, `server_voice`, or `private_call`; `minimized` is a boolean present on the two activity
+        categories and absent from Custom Status frames. Activity categories are sent only to devices that opted
+        in with exactly one `activity_rich_presence=1` query value; Custom Status includes reconnect replay. |
 
-        | `rich_presence_clear` | `user_id`, `category` | Remove a Custom Status when the viewer
-        leaves the sender''s effective audience, including after an exception is added. |
+        | `rich_presence_clear` | `user_id`, `category` | Remove the exact `custom_text`, `server_voice`, or
+        `private_call` category when it ends or the viewer leaves the sender''s effective audience.
+        Activity-category clears are sent only to devices that opted in with exactly one
+        `activity_rich_presence=1` query value. |
 
         | `server_updated` | `server_id`, `name`, `icon_url` | Server modified |
 
@@ -13397,6 +13449,19 @@ paths:
         | `error` | `message` | Error |
 
         '
+      parameters:
+      - name: activity_rich_presence
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - '1'
+        description: >-
+          Enables live Server Voice and Private Call rich-presence update/clear frames for this device.
+          The parameter must occur exactly once with the exact value `1`; missing, malformed, or duplicate
+          values fail closed to legacy delivery. Custom Status delivery and safe enriched reconnect snapshot
+          fields do not require this capability.
       responses:
         '101':
           description: Switching Protocols (WebSocket upgrade)

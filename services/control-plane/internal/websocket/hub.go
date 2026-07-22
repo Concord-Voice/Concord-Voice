@@ -45,6 +45,9 @@ const (
 	statusInvisible   = "invisible"
 	statusDND         = "dnd"
 	sessionRevoked    = "session_revoked"
+
+	clientBootstrapConcurrency = 8
+	clientBootstrapTimeout     = 5 * time.Second
 )
 
 type presenceRecoveryState struct {
@@ -81,9 +84,32 @@ type Hub struct {
 	// The same concrete service instance is injected into writers and the Hub.
 	// Snapshots use its sender gate; typed delivery never reacquires that gate.
 	presenceHistoryService *presencehistory.Service
+	// Activity reconnect state is rebuilt outside Run with fresh policy checks.
+	activitySnapshotService *presence.ActivitySnapshotService
+	// Deterministic test seam; SetActivitySnapshotService installs the concrete
+	// service method in production before Run starts.
+	activitySnapshot func(context.Context, uuid.UUID) (presence.ActivitySnapshot, error)
+	// Finalization reloads exact Redis generations and reauthorizes while the
+	// client publication barrier is held.
+	activitySnapshotFinalize func(
+		context.Context,
+		uuid.UUID,
+		presence.ActivitySnapshot,
+		func(presence.ActivitySnapshot) error,
+	) error
+	// A Hub-wide semaphore and deadline bound reconnect amplification.
+	clientBootstrapSlots   chan struct{}
+	clientBootstrapTimeout time.Duration
+	// Deterministic test seam invoked after capacity preflight and before the
+	// first nonblocking completion write.
+	clientBootstrapBeforeFlush func()
+	// Deterministic test seam invoked after the snapshot write while sendMu is
+	// still held, proving generic writers cannot interleave with replay/live.
+	clientBootstrapAfterFirstFrame func()
 	// Per-Hub test seams for deterministic delivery failures and cancellation.
 	// Nil uses the production JSON marshaler, queue broadcaster, and socket close.
 	customTextFrameMarshaler        func(uuid.UUID, *CustomTextPayload) ([]byte, error)
+	richPresenceFrameMarshaler      richPresenceFrameMarshaler
 	customTextDeliveryBroadcaster   func(context.Context, *Client, []byte) error
 	customTextDeliveryBeforeEnqueue func()
 	customTextClientDisconnect      func(*Client) error
@@ -308,6 +334,8 @@ func NewHub(db *sql.DB, redisClient *redis.Client, opsCounters ...OpsCounter) *H
 		done:                     make(chan struct{}),
 		stopped:                  make(chan struct{}),
 		onlineCountPending:       make(map[uuid.UUID]bool),
+		clientBootstrapSlots:     make(chan struct{}, clientBootstrapConcurrency),
+		clientBootstrapTimeout:   clientBootstrapTimeout,
 	}
 	if len(opsCounters) > 0 {
 		hub.opsCounter = opsCounters[0]
@@ -360,6 +388,19 @@ func (h *Hub) SetActivityObserver(observer UserActivityObserver) {
 // writers and reconnect snapshots. Runtime wiring calls this before Run.
 func (h *Hub) SetPresenceHistoryService(service *presencehistory.Service) {
 	h.presenceHistoryService = service
+}
+
+// SetActivitySnapshotService binds the freshly authorizing reconnect reader.
+// Runtime wiring calls this before Run.
+func (h *Hub) SetActivitySnapshotService(service *presence.ActivitySnapshotService) {
+	h.activitySnapshotService = service
+	if service == nil {
+		h.activitySnapshot = nil
+		h.activitySnapshotFinalize = nil
+		return
+	}
+	h.activitySnapshot = service.Snapshot
+	h.activitySnapshotFinalize = service.FinalizeSnapshot
 }
 
 // SetMentionChecker injects the RBAC permission checker for mention enforcement.
@@ -513,11 +554,12 @@ func (h *Hub) shutdownClients() {
 
 	// Cancel async work, wait for completion, then close connection queues.
 	for _, client := range clients {
+		client.cancelBootstrap()
 		if client.asyncCancel != nil {
 			client.asyncCancel()
 		}
 		client.asyncWg.Wait()
-		close(client.Send)
+		client.closeOutbound()
 	}
 	log.Printf("Hub shut down, closed %d client connections", len(clients))
 }
@@ -538,6 +580,11 @@ func (h *Hub) Stopped() <-chan struct{} {
 
 // handleRegister registers a new client
 func (h *Hub) handleRegister(client *Client) {
+	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // cancel stored in client.asyncCancel, called by Run shutdown and handleUnregister
+	client.asyncCancel = cancel
+	// Start the replacement boundary before publishing the client in Hub maps so
+	// no privacy-critical or base-presence delta can overtake its snapshot.
+	client.beginBootstrap()
 	isFirstConnection := h.registerClient(client)
 
 	if isFirstConnection {
@@ -559,18 +606,12 @@ func (h *Hub) handleRegister(client *Client) {
 	log.Printf("Client registered: user=%s client=%s total_clients=%d",
 		sanitizeLogValue(client.UserID.String()), sanitizeLogValue(client.ID.String()), len(h.clients))
 
-	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // cancel stored in client.asyncCancel, called by Run shutdown and handleUnregister
-	client.asyncCancel = cancel
 	h.sendConnectedConfirmation(client)
-	h.sendPresenceSnapshot(client)
-	client.asyncWg.Add(2)
+	seed := h.capturePresenceSnapshotSeed(client.UserID)
+	client.asyncWg.Add(1)
 	go func() {
 		defer client.asyncWg.Done()
-		h.sendCustomTextSnapshot(ctx, client)
-	}()
-	go func() {
-		defer client.asyncWg.Done()
-		h.sendVoiceCountsSnapshot(ctx, client)
+		h.runClientBootstrap(ctx, client, seed)
 	}()
 }
 
@@ -617,7 +658,7 @@ func (h *Hub) sendConnectedConfirmation(client *Client) {
 		log.Printf("Failed to marshal connected confirmation: %v", err)
 		return
 	}
-	client.Send <- data
+	client.enqueueOutboundBlockingImmediate(data)
 }
 
 // handleConnectionReadyProbe acknowledges a client's subscribe barrier probe.
@@ -665,9 +706,7 @@ func (h *Hub) handleConnectionReadyProbe(msg IncomingMessage) {
 		log.Printf("Failed to marshal connection_ready message: %v", err)
 		return
 	}
-	select {
-	case client.Send <- data:
-	default:
+	if !client.enqueueOutbound(data) {
 		// Client send buffer full — log so operators can spot slow consumers.
 		// The client times out after 5s and proceeds best-effort, so this
 		// isn't fatal but is a monitoring signal worth surfacing.
@@ -676,8 +715,9 @@ func (h *Hub) handleConnectionReadyProbe(msg IncomingMessage) {
 }
 
 type userPresenceInfo struct {
-	UserID string `json:"user_id"`
-	Status string `json:"status"`
+	UserID       string                                          `json:"user_id"`
+	Status       string                                          `json:"status"`
+	RichPresence map[presence.Category]richPresenceSnapshotEntry `json:"rich_presence,omitempty"`
 }
 
 func (h *Hub) resolveVisibleStatus(ctx context.Context, uid, viewerID uuid.UUID) string {
@@ -720,53 +760,24 @@ func (h *Hub) resolveVisibleStatus(ctx context.Context, uid, viewerID uuid.UUID)
 
 func (h *Hub) sendPresenceSnapshot(client *Client) {
 	ctx := context.Background()
-	// #47: only include users the viewer is permitted to see. The viewer's own
-	// audience (friends + optional-FoF + shared-server peers) is the visibility
-	// set: friendship and server-membership are symmetric, so a user U is in the
-	// viewer's audience iff the viewer is in U's audience for those relations.
-	// (FoF is asymmetric; FoF-only contacts surface via the live broadcast rather
-	// than the on-connect snapshot — a deliberate, documented narrowing, not a
-	// leak.) One bounded query — no per-user N×M fan-out.
-	visible := map[uuid.UUID]bool{}
-	if h.db != nil { // production always has a DB; nil only in DB-free unit hubs
-		if aud, err := presence.ComputePresenceAudience(ctx, h.db, client.UserID); err != nil {
-			log.Printf("[hub] snapshot audience computation failed for %s; sending self-only snapshot: %v", sanitizeLogValue(client.UserID.String()), err)
-		} else {
-			visible = aud
-		}
+	base, err := h.loadBasePresenceSnapshot(ctx, h.capturePresenceSnapshotSeed(client.UserID))
+	if err != nil {
+		log.Printf("[hub] failed to build base presence snapshot: %T", err)
+		return
 	}
-	visible[client.UserID] = true // the viewer always sees their own presence
-
-	users := make([]userPresenceInfo, 0, len(visible))
-	onlineUserIDs := make([]string, 0, len(visible))
-	for uid := range h.userClients {
-		if !visible[uid] {
-			continue
-		}
-		uidStr := uid.String()
-		visibleStatus := h.resolveVisibleStatus(ctx, uid, client.UserID)
-		if visibleStatus != statusOffline {
-			onlineUserIDs = append(onlineUserIDs, uidStr)
-		}
-		users = append(users, userPresenceInfo{UserID: uidStr, Status: visibleStatus})
-	}
-	presenceSnapshot := OutgoingMessage{
-		Type: "presence_snapshot",
-		Data: map[string]interface{}{
-			"online_user_ids": onlineUserIDs,
-			"users":           users,
-		},
-	}
-	data, err := json.Marshal(presenceSnapshot)
+	data, err := marshalPresenceSnapshot(base, nil)
 	if err != nil {
 		log.Printf("Failed to marshal presence snapshot: %v", err)
 		return
 	}
-	client.Send <- data
+	client.enqueueOutboundBlocking(data)
 
 }
 
 func (h *Hub) sendVoiceCountsSnapshot(ctx context.Context, client *Client) {
+	if h.db == nil {
+		return
+	}
 	// CV-CAN-030: scope the initial voice-count snapshot to the servers this
 	// client's user is a member of — a client must not learn voice activity for
 	// servers it does not belong to. This runs off the Run goroutine (registration
@@ -822,10 +833,7 @@ func (h *Hub) sendVoiceCountsSnapshot(ctx context.Context, client *Client) {
 		log.Printf("Failed to marshal voice-count snapshot: %v", err)
 		return
 	}
-	select {
-	case client.Send <- data:
-	default:
-	}
+	client.enqueuePostBootstrap(ctx, data)
 }
 
 // handleUnregister unregisters a client
@@ -835,11 +843,12 @@ func (h *Hub) handleUnregister(client *Client) {
 		return
 	}
 
+	client.cancelBootstrap()
 	if client.asyncCancel != nil {
 		client.asyncCancel()
 	}
 	client.asyncWg.Wait()
-	close(client.Send)
+	client.closeOutbound()
 
 	if isLastConnection {
 		now := time.Now().Unix()
@@ -1220,9 +1229,7 @@ func (h *Hub) applyBroadcastDeliveryResult(result channelDeliveryResult) {
 			}
 			continue
 		}
-		select {
-		case client.Send <- result.data:
-		default:
+		if !client.enqueueOutbound(result.data) {
 			h.handleUnregister(client)
 		}
 	}
@@ -1242,10 +1249,7 @@ func (h *Hub) applyUnreadDeliveryResult(result channelDeliveryResult) {
 		if !decision.allowed {
 			continue
 		}
-		select {
-		case client.Send <- result.data:
-		default:
-		}
+		client.enqueueOutbound(result.data)
 	}
 }
 
@@ -1266,10 +1270,7 @@ func (h *Hub) applyMentionDeliveryResult(result channelDeliveryResult) {
 		if !decision.allowed {
 			continue
 		}
-		select {
-		case client.Send <- result.data:
-		default:
-		}
+		client.enqueueOutbound(result.data)
 	}
 }
 
@@ -1365,7 +1366,7 @@ func (h *Hub) handleSubscribe(msg IncomingMessage) {
 		log.Printf("Failed to marshal channel subscription confirmation: %v", err)
 		return
 	}
-	client.Send <- data
+	client.enqueueOutboundBlocking(data)
 }
 
 // handleUnsubscribe unsubscribes a client from a channel
@@ -1527,10 +1528,7 @@ func (h *Hub) applyVoiceCountCatchup(c voiceCountCatchup) {
 		log.Printf("Failed to marshal server voice-count catch-up: %v", err)
 		return
 	}
-	select {
-	case client.Send <- data:
-	default:
-	}
+	client.enqueueOutbound(data)
 }
 
 // handleUnsubscribeServer unsubscribes a client from server-level notifications
@@ -1577,10 +1575,7 @@ func (h *Hub) sendError(clientID uuid.UUID, message string) {
 		log.Printf("Failed to marshal WebSocket error message: %v", err)
 		return
 	}
-	select {
-	case client.Send <- data:
-	default:
-	}
+	client.enqueueOutbound(data)
 }
 
 // sendErrorWithData sends an error message with additional structured data to a specific client.
@@ -1606,10 +1601,7 @@ func (h *Hub) sendErrorWithData(clientID uuid.UUID, errorCode string, extra map[
 		log.Printf("Failed to marshal structured WebSocket error: %v", err)
 		return
 	}
-	select {
-	case client.Send <- raw:
-	default:
-	}
+	client.enqueueOutbound(raw)
 }
 
 // messageInput holds the parsed and validated fields from an incoming WebSocket message.
@@ -1955,10 +1947,7 @@ func (h *Hub) sendMessageAck(ack messageAck) {
 		log.Printf("Failed to marshal message acknowledgement: %v", err)
 		return
 	}
-	select {
-	case ack.Client.Send <- data:
-	default:
-	}
+	ack.Client.enqueueOutbound(data)
 }
 
 // linkChannelAttachments validates and links attachment file_ids to a channel message.
@@ -2764,10 +2753,7 @@ func (h *Hub) handleGlobalBroadcast(msg OutgoingMessage) {
 		return
 	}
 	for _, client := range h.clients {
-		select {
-		case client.Send <- data:
-		default:
-		}
+		client.enqueueOutbound(data)
 	}
 }
 
@@ -2802,18 +2788,47 @@ func (h *Hub) handleServerBroadcast(msg ServerBroadcastMessage) {
 		if !ok {
 			continue
 		}
-		select {
-		case client.Send <- data:
-		default:
-		}
+		client.enqueueOutbound(data)
 	}
 }
 
-// BroadcastToServer sends a message to all clients subscribed to a server (thread-safe).
+// BroadcastToServer sends a message to all clients subscribed to a server
+// (thread-safe). Once the Hub has stopped, a saturated queue must not strand a
+// caller forever.
 func (h *Hub) BroadcastToServer(serverID uuid.UUID, msg OutgoingMessage) {
-	h.serverBroadcast <- ServerBroadcastMessage{
+	h.BroadcastToServerContext(context.Background(), serverID, msg)
+}
+
+// BroadcastToServerContext is the deadline-aware form used by bounded lifecycle
+// callbacks. It returns false when the caller is canceled, the Hub is stopped,
+// or a full queue cannot be drained before either condition occurs.
+func (h *Hub) BroadcastToServerContext(
+	ctx context.Context,
+	serverID uuid.UUID,
+	msg OutgoingMessage,
+) bool {
+	if ctx == nil {
+		return false
+	}
+	select {
+	case <-h.done:
+		return false
+	default:
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	serverMessage := ServerBroadcastMessage{
 		ServerID: serverID,
 		Data:     msg,
+	}
+	select {
+	case h.serverBroadcast <- serverMessage:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-h.done:
+		return false
 	}
 }
 
@@ -2888,10 +2903,7 @@ func (h *Hub) handleUserBroadcast(msg UserBroadcastMessage) {
 		if !ok {
 			continue
 		}
-		select {
-		case client.Send <- data:
-		default:
-		}
+		client.enqueueOutbound(data)
 	}
 }
 
@@ -2960,7 +2972,7 @@ func (h *Hub) handleSubscribeDM(msg IncomingMessage) {
 		log.Printf("Failed to marshal DM subscription confirmation: %v", err)
 		return
 	}
-	client.Send <- data
+	client.enqueueOutboundBlocking(data)
 }
 
 // handleUnsubscribeDM unsubscribes a client from a DM conversation.
@@ -3202,10 +3214,7 @@ func (h *Hub) sendDMMessageAck(p dmMessageAckParams) {
 	}
 	ackMsg := OutgoingMessage{Type: "dm_message_ack", Data: dmAckData}
 	if ackData, ackErr := json.Marshal(ackMsg); ackErr == nil {
-		select {
-		case p.client.Send <- ackData:
-		default:
-		}
+		p.client.enqueueOutbound(ackData)
 	}
 }
 
@@ -3401,10 +3410,7 @@ func (h *Hub) notifyUnsubscribedUser(uid uuid.UUID, dmClients map[uuid.UUID]bool
 func (h *Hub) sendToUserClients(userClientIDs map[uuid.UUID]bool, data []byte) {
 	for clientID := range userClientIDs {
 		if c, ok := h.clients[clientID]; ok {
-			select {
-			case c.Send <- data:
-			default:
-			}
+			c.enqueueOutbound(data)
 		}
 	}
 }
@@ -3474,9 +3480,7 @@ func (h *Hub) handleDMBroadcast(msg DMBroadcastMessage) {
 			continue
 		}
 
-		select {
-		case client.Send <- messageData:
-		default:
+		if !client.enqueueOutbound(messageData) {
 			h.handleUnregister(client)
 		}
 	}
@@ -3559,10 +3563,7 @@ func (h *Hub) handleDisconnectUser(userID uuid.UUID) {
 	for _, client := range clients {
 		// Best-effort courtesy message (non-blocking)
 		if revokedMsg != nil {
-			select {
-			case client.Send <- revokedMsg:
-			default:
-			}
+			client.enqueueOutbound(revokedMsg)
 		}
 		// Real enforcement: sever TCP connection
 		h.handleUnregister(client)
@@ -3593,10 +3594,7 @@ func (h *Hub) handleDisconnectSession(sessionID string) {
 	for _, client := range h.clients {
 		if client.SessionID == sessionID {
 			if revokedMsg != nil {
-				select {
-				case client.Send <- revokedMsg:
-				default:
-				}
+				client.enqueueOutbound(revokedMsg)
 			}
 			h.handleUnregister(client)
 			count++
@@ -3725,10 +3723,7 @@ func (h *Hub) handleServerUpdate(msg IncomingMessage) {
 	}
 	for clientID := range subscribers {
 		if c, ok := h.clients[clientID]; ok {
-			select {
-			case c.Send <- data:
-			default:
-			}
+			c.enqueueOutbound(data)
 		}
 	}
 }
@@ -3778,11 +3773,17 @@ func (h *Hub) broadcastPresenceToAll(userID uuid.UUID, status string, timestamp 
 		log.Printf("Failed to marshal presence message: %v", err)
 		return
 	}
+	h.mu.RLock()
 	for viewerID := range audience {
 		if clientSet, ok := h.userClients[viewerID]; ok {
-			h.sendToUserClients(clientSet, data)
+			for clientID := range clientSet {
+				if client, connected := h.clients[clientID]; connected {
+					h.enqueueBasePresence(client, data)
+				}
+			}
 		}
 	}
+	h.mu.RUnlock()
 
 	// Schedule a debounced recomputation of online counts for all servers
 	// the affected user belongs to (batches rapid presence changes).
@@ -4053,10 +4054,7 @@ func (h *Hub) broadcastServerVoiceCounts() {
 			}
 			payloadCache[key] = data
 		}
-		select {
-		case client.Send <- data:
-		default:
-		}
+		client.enqueueOutbound(data)
 	}
 }
 

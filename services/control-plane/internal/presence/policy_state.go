@@ -51,6 +51,9 @@ func loadPrivateCallState(
 	senderID uuid.UUID,
 	input PrivateCallPolicyInput,
 ) (result privateCallState, returnErr error) {
+	if activityBuildCacheOwnsPrivateSnapshot(ctx, input.buildSnapshot) {
+		return privateCallStateFromBuildSnapshot(senderID, input)
+	}
 	var isGroup bool
 	if err := db.QueryRowContext(ctx,
 		`SELECT is_group FROM dm_conversations WHERE id = $1`,
@@ -59,41 +62,9 @@ func loadPrivateCallState(
 		return privateCallState{}, fmt.Errorf("read private call conversation: %w", err)
 	}
 
-	participants := make(map[uuid.UUID]bool)
-	rows, err := db.QueryContext(ctx, `
-		SELECT vp.user_id, dp.user_id IS NOT NULL
-		FROM dm_voice_participants vp
-		LEFT JOIN dm_participants dp
-		  ON dp.conversation_id = vp.conversation_id AND dp.user_id = vp.user_id
-		WHERE vp.conversation_id = $1
-	`, input.Context.ConversationID)
+	participants, err := loadPrivateCallParticipants(ctx, db, input.Context.ConversationID)
 	if err != nil {
-		return privateCallState{}, fmt.Errorf("query private call participants: %w", err)
-	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			result = privateCallState{}
-			returnErr = errors.Join(
-				returnErr,
-				fmt.Errorf("close private call participant rows: %w", closeErr),
-			)
-		}
-	}()
-	for rows.Next() {
-		var (
-			participantID uuid.UUID
-			isMember      bool
-		)
-		if err := rows.Scan(&participantID, &isMember); err != nil {
-			return privateCallState{}, fmt.Errorf("scan private call participant row: %w", err)
-		}
-		if !isMember {
-			return privateCallState{}, errors.New("private call participant is not a conversation member")
-		}
-		participants[participantID] = true
-	}
-	if err := rows.Err(); err != nil {
-		return privateCallState{}, fmt.Errorf("iterate private call participant rows: %w", err)
+		return privateCallState{}, err
 	}
 	if !participants[senderID] {
 		return privateCallState{}, errors.New("sender is not in current private call")
@@ -112,6 +83,74 @@ func loadPrivateCallState(
 	return privateCallState{
 		callType:     expectedCallType,
 		participants: participants,
+	}, nil
+}
+
+func loadPrivateCallParticipants(
+	ctx context.Context,
+	db DBTX,
+	conversationID uuid.UUID,
+) (result map[uuid.UUID]bool, returnErr error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT vp.user_id, dp.user_id IS NOT NULL
+		FROM dm_voice_participants vp
+		LEFT JOIN dm_participants dp
+		  ON dp.conversation_id = vp.conversation_id AND dp.user_id = vp.user_id
+		WHERE vp.conversation_id = $1
+		ORDER BY vp.user_id
+		LIMIT $2
+	`, conversationID, maxPrivateCallParticipants+1)
+	if err != nil {
+		return nil, fmt.Errorf("query private call participants: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			result = nil
+			returnErr = errors.Join(
+				returnErr,
+				fmt.Errorf("close private call participant rows: %w", closeErr),
+			)
+		}
+	}()
+	participants := make(map[uuid.UUID]bool)
+	rowCount := 0
+	for rows.Next() {
+		var (
+			participantID uuid.UUID
+			isMember      bool
+		)
+		if err := rows.Scan(&participantID, &isMember); err != nil {
+			return nil, fmt.Errorf("scan private call participant row: %w", err)
+		}
+		rowCount++
+		if !isMember || participantID == uuid.Nil || participants[participantID] {
+			return nil, errors.New("private call participant is not a conversation member")
+		}
+		participants[participantID] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate private call participant rows: %w", err)
+	}
+	if rowCount > maxPrivateCallParticipants {
+		return nil, errors.New("private call participant limit exceeded")
+	}
+	return participants, nil
+}
+
+func privateCallStateFromBuildSnapshot(
+	senderID uuid.UUID,
+	input PrivateCallPolicyInput,
+) (privateCallState, error) {
+	snapshot := input.buildSnapshot
+	if snapshot == nil || snapshot.key.conversationID != input.Context.ConversationID ||
+		!snapshot.participants[senderID] || input.Payload.CallType != snapshot.callType ||
+		input.Payload.ParticipantCount != len(snapshot.participantIDs) ||
+		!sameParticipantSet(snapshot.participants, input.Context.ParticipantIDs) {
+		return privateCallState{}, errors.New("stale private call context")
+	}
+	return privateCallState{
+		callType:     snapshot.callType,
+		participants: snapshot.participants,
 	}, nil
 }
 

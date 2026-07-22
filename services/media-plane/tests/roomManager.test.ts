@@ -153,6 +153,38 @@ describe('RoomManager', () => {
       expect(result.participants).toHaveLength(2);
     });
 
+    it('admits at most 1000 channel participants and still allows reconnect at capacity (#2231)', async () => {
+      const roomId = 'room-participant-cap';
+      for (let index = 0; index < 999; index++) {
+        await joinRoomWithSupportedCrypto(manager, roomId, `u-${index}`, `sock-${index}`, {
+          username: `user-${index}`,
+        });
+      }
+
+      const boundaryResults = await Promise.allSettled([
+        joinRoomWithSupportedCrypto(manager, roomId, 'u-boundary-a', 'sock-boundary-a', {
+          username: 'boundary-a',
+        }),
+        joinRoomWithSupportedCrypto(manager, roomId, 'u-boundary-b', 'sock-boundary-b', {
+          username: 'boundary-b',
+        }),
+      ]);
+      const fulfilled = boundaryResults.filter((result) => result.status === 'fulfilled');
+      const rejected = boundaryResults.filter(
+        (result): result is PromiseRejectedResult => result.status === 'rejected'
+      );
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0].reason.message).toContain('Voice participant limit reached (max 1000)');
+      expect(manager.getRoom(roomId)?.participants.size).toBe(1000);
+
+      await joinRoomWithSupportedCrypto(manager, roomId, 'u-0', 'sock-reconnected', {
+        username: 'user-0',
+      });
+      expect(manager.getRoom(roomId)?.participants.size).toBe(1000);
+      expect(manager.getParticipant(roomId, 'u-0')?.socketId).toBe('sock-reconnected');
+    }, 30_000);
+
     it('single-flights simultaneous first joins into one room', async () => {
       let resolveRouter!: (router: typeof mockRouter) => void;
       mockMediasoup.getOrCreateRouter.mockImplementationOnce(

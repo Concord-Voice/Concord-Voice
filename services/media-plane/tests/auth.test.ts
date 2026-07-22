@@ -370,6 +370,8 @@ describe('validateChannelAccess', () => {
         Promise.resolve({
           authorized: true,
           is_group: false,
+          server_muted: true,
+          server_deafened: false,
           call_id: callId,
           call_ring_id: ringId,
           call_caller_user_id: callerUserId,
@@ -383,6 +385,8 @@ describe('validateChannelAccess', () => {
     expect(result.callId).toBe(callId);
     expect(result.callRingId).toBe(ringId);
     expect(result.callCallerUserId).toBe(callerUserId);
+    expect(result.serverMuted).toBe(true);
+    expect(result.serverDeafened).toBe(false);
     // DM rooms don't carry server-channel metadata
     expect(result.serverId).toBe('');
     expect(result.channelName).toBe('');
@@ -537,6 +541,8 @@ describe('validateChannelAccess', () => {
         Promise.resolve({
           authorized: true,
           is_group: false,
+          server_muted: false,
+          server_deafened: false,
           username: 'dmuser',
           display_name: 'DM User',
           avatar_url: '/api/v1/media/avatars/dm.png',
@@ -549,6 +555,40 @@ describe('validateChannelAccess', () => {
     expect(result.authUsername).toBe('dmuser');
     expect(result.authDisplayName).toBe('DM User');
     expect(result.authAvatarUrl).toBe('/api/v1/media/avatars/dm.png');
+  });
+
+  it('fails closed when a DM response omits exact moderation booleans', async () => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ authorized: true, is_group: false }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'conv-1', 'token', 'dm');
+
+    expect(result.allowed).toBe(false);
+    expect(result.error).toBe('Invalid DM voice moderation state');
+  });
+
+  it.each([
+    { label: 'string mute', serverMuted: 'false', serverDeafened: false },
+    { label: 'numeric deafen', serverMuted: false, serverDeafened: 0 },
+    { label: 'null mute', serverMuted: null, serverDeafened: false },
+  ])('fails closed for non-boolean DM moderation values ($label)', async (moderation) => {
+    mockFetch().mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          authorized: true,
+          is_group: false,
+          server_muted: moderation.serverMuted,
+          server_deafened: moderation.serverDeafened,
+        }),
+    });
+
+    const result = await validateChannelAccess('u-1', 'conv-1', 'token', 'dm');
+
+    expect(result.allowed).toBe(false);
+    expect(result.error).toBe('Invalid DM voice moderation state');
   });
 
   it('ignores non-string identity fields (fails closed to undefined)', async () => {
@@ -685,6 +725,8 @@ describe('validateChannelAccess', () => {
         Promise.resolve({
           authorized: true,
           is_group: false,
+          server_muted: false,
+          server_deafened: false,
           media_entitlements: premiumEntitlements,
         }),
     });
@@ -915,7 +957,13 @@ describe('validateChannelAccess', () => {
   it('leaves roomOwnerTier undefined for DM rooms', async () => {
     mockFetch().mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve({ authorized: true, is_group: true }),
+      json: () =>
+        Promise.resolve({
+          authorized: true,
+          is_group: true,
+          server_muted: false,
+          server_deafened: false,
+        }),
     });
 
     const result = await validateChannelAccess('u-1', 'conv-1', 'token', 'dm');

@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000091)
+## Existing Migrations (000001–000098)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -201,6 +201,13 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000089 | add_presence_category_settings | Master, Server Voice, and Private Call persisted privacy controls (#2229) |
 | 000090 | message_purge | Privacy-safe purge audit, receiver-hide ranges, and confirmed attachment reap markers (#1352) |
 | 000091 | account_activity_metrics | Private latest-qualified activity marker plus aggregate account/upload metric keys (#2291) |
+| 000092 | mfa_totp_key_version | Stamp MFA TOTP seeds with the encryption-key version used for keyring rotation (#2307) |
+| 000093 | voice_lifecycle_watermarks | Add nullable lifecycle-event watermarks and defaults while preserving old-replica writes (#2231) |
+| 000094 | backfill_voice_lifecycle_watermarks | Backfill lifecycle watermarks from stable `joined_at` without taking `ACCESS EXCLUSIVE` (#2231) |
+| 000095 | guard_voice_lifecycle_watermarks_not_null | Add unvalidated non-null guards after the backfill (#2231) |
+| 000096 | validate_voice_lifecycle_watermarks_not_null | Validate lifecycle guards without blocking ordinary writes (#2231) |
+| 000097 | enforce_voice_lifecycle_watermarks_not_null | Revalidate rollback proofs, then convert lifecycle guards to metadata-native `NOT NULL` constraints (#2231) |
+| 000098 | add_activity_settings_cleanup_marker | Durable before/after policy evidence and completed-suppression receipts for retrying/finalizing Rich Presence settings cleanup (#2231) |
 
 ## Troubleshooting
 

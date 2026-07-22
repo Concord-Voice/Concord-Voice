@@ -429,6 +429,8 @@ export type RoomKind = 'channel' | 'dm';
 interface DmVoiceAuthorizationResponse {
   authorized: boolean;
   is_group: boolean;
+  server_muted?: unknown;
+  server_deafened?: unknown;
   media_entitlements?: unknown;
   username?: unknown;
   display_name?: unknown;
@@ -557,7 +559,9 @@ function dmChannelAccessResult(
   channelId: string,
   response: DmVoiceAuthorizationResponse
 ): ChannelAccessResult {
-  const allowed = response.authorized === true;
+  const moderationStateValid =
+    typeof response.server_muted === 'boolean' && typeof response.server_deafened === 'boolean';
+  const allowed = response.authorized === true && moderationStateValid;
   const ent = parseMediaEntitlements(response.media_entitlements);
   const identity = parseAuthoritativeIdentity(response);
   return {
@@ -565,8 +569,8 @@ function dmChannelAccessResult(
     channelId,
     serverId: '',
     channelName: '',
-    serverMuted: false,
-    serverDeafened: false,
+    serverMuted: response.server_muted === true,
+    serverDeafened: response.server_deafened === true,
     userTier: ent.userTier,
     allowedAudioTiers: ent.allowedAudioTiers,
     minPtimeMs: ent.minPtimeMs,
@@ -577,7 +581,13 @@ function dmChannelAccessResult(
     ...identity,
     // A 200 with authorized=false is rare; preserve a specific denial reason
     // instead of making the join handler fall back to generic "Access denied".
-    ...(allowed ? {} : { error: 'DM voice join not authorized' }),
+    ...(allowed
+      ? {}
+      : {
+          error: moderationStateValid
+            ? 'DM voice join not authorized'
+            : 'Invalid DM voice moderation state',
+        }),
   };
 }
 

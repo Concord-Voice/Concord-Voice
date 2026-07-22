@@ -943,14 +943,49 @@ export const CustomTextPresencePayloadSchema = z.object({
     .refine((value) => [...value].length <= 140),
 });
 
+const RichPresenceUpdateBaseSchema = z.object({
+  user_id: UUID,
+  updated_at: z.number().int().positive(),
+});
+
+const CustomTextRichPresenceUpdateDataSchema = RichPresenceUpdateBaseSchema.extend({
+  category: z.literal('custom_text'),
+  payload: CustomTextPresencePayloadSchema,
+});
+
+const ServerVoicePresencePayloadSchema = z.object({
+  channel_id: UUID,
+  server_id: UUID,
+  channel_name: z.string().min(1).max(100).optional(),
+  server_name: z.string().min(1).max(100).optional(),
+  started_at: z.number().int().positive().optional(),
+});
+
+const ServerVoiceRichPresenceUpdateDataSchema = RichPresenceUpdateBaseSchema.extend({
+  category: z.literal('server_voice'),
+  minimized: z.boolean(),
+  payload: ServerVoicePresencePayloadSchema,
+});
+
+const PrivateCallPresencePayloadSchema = z.object({
+  call_type: z.enum(['dm', 'group']),
+  participant_count: z.number().int().min(1).max(255).optional(),
+  started_at: z.number().int().positive().optional(),
+});
+
+const PrivateCallRichPresenceUpdateDataSchema = RichPresenceUpdateBaseSchema.extend({
+  category: z.literal('private_call'),
+  minimized: z.boolean(),
+  payload: PrivateCallPresencePayloadSchema,
+});
+
 export const RichPresenceUpdateSchema = z.object({
   type: z.literal('rich_presence_update'),
-  data: z.object({
-    user_id: UUID,
-    category: RichPresenceCategorySchema,
-    payload: CustomTextPresencePayloadSchema,
-    updated_at: z.number().int().positive(),
-  }),
+  data: z.discriminatedUnion('category', [
+    CustomTextRichPresenceUpdateDataSchema,
+    ServerVoiceRichPresenceUpdateDataSchema,
+    PrivateCallRichPresenceUpdateDataSchema,
+  ]),
 });
 
 export const RichPresenceClearSchema = z.object({

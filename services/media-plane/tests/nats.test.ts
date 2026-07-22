@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import './mocks/logger.js';
 
 // Mock config
@@ -39,6 +39,10 @@ describe('NatsService', () => {
 
   beforeEach(() => {
     service = new NatsService();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   describe('connect', () => {
@@ -194,6 +198,57 @@ describe('NatsService', () => {
         participantUserIds: ['u-1', 'u-2'],
         startedAt: '2026-07-14T12:00:00.000Z',
       });
+    });
+
+    it('orders a same-millisecond leave before the successor join', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-07-15T12:34:56.789Z'));
+      const handler = service.createRoomEventHandler();
+
+      handler({
+        type: 'user-left',
+        roomId: 'old-room',
+        userId: 'u-1',
+        socketId: 'sock-1',
+        e2eeEpoch: 3,
+      });
+      const leftTimestamp = mockEncode.mock.calls.at(-1)?.[0].timestamp as string;
+
+      handler({
+        type: 'user-joined',
+        roomId: 'new-room',
+        userId: 'u-1',
+        username: 'alice',
+        displayName: 'Alice',
+        e2eeEpoch: 4,
+      });
+      const joinedTimestamp = mockEncode.mock.calls.at(-1)?.[0].timestamp as string;
+
+      expect(leftTimestamp).toMatch(/\.\d{6}Z$/);
+      expect(joinedTimestamp).toMatch(/\.\d{6}Z$/);
+      expect(joinedTimestamp > leftTimestamp).toBe(true);
+      vi.useRealTimers();
+    });
+
+    it('shares lifecycle ordering with heartbeat publication', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-07-15T12:34:56.789Z'));
+      const handler = service.createRoomEventHandler();
+
+      handler({
+        type: 'user-joined',
+        roomId: 'room-1',
+        userId: 'u-1',
+        username: 'alice',
+        displayName: 'Alice',
+        e2eeEpoch: 1,
+      });
+      const joinedTimestamp = mockEncode.mock.calls.at(-1)?.[0].timestamp as string;
+      const heartbeatTimestamp = service.nextVoiceLifecycleTimestamp();
+
+      expect(heartbeatTimestamp).toMatch(/\.\d{6}Z$/);
+      expect(heartbeatTimestamp > joinedTimestamp).toBe(true);
+      vi.useRealTimers();
     });
 
     it('maps producer-added to voice.producer_added', () => {

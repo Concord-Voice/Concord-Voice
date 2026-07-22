@@ -734,6 +734,7 @@ export class WebSocketService {
       // the encode call.
       const finalUrl = new URL(wsBaseUrl.href);
       finalUrl.searchParams.set('ticket', ticket);
+      finalUrl.searchParams.set('activity_rich_presence', '1');
 
       this.ws = new WebSocket(finalUrl.href);
 

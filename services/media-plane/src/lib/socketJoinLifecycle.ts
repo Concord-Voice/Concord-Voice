@@ -1,5 +1,6 @@
 export type SocketBoundJoinOutcome<Access, Value> =
   | { access: Access; status: 'denied' }
+  | { access: Access; status: 'revoked' }
   | { access: Access; status: 'canceled' }
   | { access: Access; status: 'joined'; value: Value };
 
@@ -8,6 +9,8 @@ interface SocketBoundJoinOptions<Access, Value> {
   isAllowed: (access: Access) => boolean;
   isConnected: () => boolean;
   join: (access: Access) => Promise<Value>;
+  reauthorize?: (access: Access) => Promise<Access>;
+  finalize?: (access: Access, value: Value) => Promise<void>;
   rollback: (access: Access) => Promise<void>;
 }
 
@@ -32,6 +35,21 @@ interface RollbackSocketRoomJoinOptions {
 }
 
 export type EmptyDMJoinCleanupResult = 'active' | 'deferred' | 'noop' | 'released' | 'terminal';
+
+/** Keeps cleanup bound to the most recent server-issued call ID when available. */
+export class DMJoinCallIdTracker {
+  private authorizedCallId?: string;
+
+  constructor(private readonly requestedCallId?: string) {}
+
+  observe(callId?: string): void {
+    if (callId) this.authorizedCallId = callId;
+  }
+
+  current(): string | undefined {
+    return this.authorizedCallId ?? this.requestedCallId;
+  }
+}
 
 /**
  * Resolves one empty DM admission while its per-room fence is held. A queued
@@ -135,29 +153,48 @@ export async function withKeyedJoinFence<Value>(
   }
 }
 
+/** Re-check a provisional DM join against the exact call ID returned by A1. */
+export async function reauthorizeDMAdmission<Access extends { callId?: string }>(
+  roomKind: 'channel' | 'dm',
+  access: Access,
+  requestedCallId: string | undefined,
+  authorize: (exactCallId: string | undefined) => Promise<Access>
+): Promise<Access> {
+  if (roomKind !== 'dm') return access;
+  return authorize(access.callId ?? requestedCallId);
+}
+
 export async function runSocketBoundJoin<Access, Value>({
   authorize,
   isAllowed,
   isConnected,
   join,
+  reauthorize,
+  finalize,
   rollback,
 }: SocketBoundJoinOptions<Access, Value>): Promise<SocketBoundJoinOutcome<Access, Value>> {
-  const access = await authorize();
-  if (!isAllowed(access)) return { access, status: 'denied' };
+  const authorizedAccess = await authorize();
+  if (!isAllowed(authorizedAccess)) return { access: authorizedAccess, status: 'denied' };
 
   if (!isConnected()) {
-    await rollback(access);
-    return { access, status: 'canceled' };
+    await rollback(authorizedAccess);
+    return { access: authorizedAccess, status: 'canceled' };
   }
 
   try {
-    const value = await join(access);
+    const value = await join(authorizedAccess);
+    const access = reauthorize ? await reauthorize(authorizedAccess) : authorizedAccess;
+    if (!isAllowed(access)) {
+      await rollback(authorizedAccess);
+      return { access, status: 'revoked' };
+    }
+    await finalize?.(access, value);
     if (isConnected()) return { access, status: 'joined', value };
 
-    await rollback(access);
+    await rollback(authorizedAccess);
     return { access, status: 'canceled' };
   } catch (error) {
-    await rollback(access);
+    await rollback(authorizedAccess);
     throw error;
   }
 }

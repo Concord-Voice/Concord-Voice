@@ -160,12 +160,13 @@ func runControlPlane() (runErr error) {
 		adminMetricsRouterReader = deferredAdminMetricsReader
 	}
 	var opsMetricsRuntime *api.OpsMetricsRuntime
+	var voicePermissionEnforcer *voice.PermissionEnforcer
 	runtime, startupErr := startActivityHistoryRuntime(activityHistoryRuntimeDependencies{
 		startupContext:      context.Background(),
 		workerContext:       cleanupCtx,
 		reconcileDisclosure: presenceHistoryService.ReconcileStaleDisclosure,
 		bindRouter: func() (*gin.Engine, *websocket.Hub, *natsclient.Client, error) {
-			router, hub, natsClient, metricsRuntime, routerErr := api.NewRouter(
+			router, hub, natsClient, metricsRuntime, permissionEnforcer, routerErr := api.NewRouter(
 				db,
 				redisClient,
 				storageClient,
@@ -181,6 +182,7 @@ func runControlPlane() (runErr error) {
 				return nil, nil, nil, routerErr
 			}
 			opsMetricsRuntime = metricsRuntime
+			voicePermissionEnforcer = permissionEnforcer
 			return router, hub, natsClient, nil
 		},
 		reconcilePending: presenceHistoryService.ReconcilePending,
@@ -195,6 +197,12 @@ func runControlPlane() (runErr error) {
 	hub := runtime.hub
 	natsClient := runtime.natsClient
 	waitActivityHistoryWorkers := runtime.waitWorkers
+	waitBackgroundWorkers := func() {
+		waitActivityHistoryWorkers()
+		if voicePermissionEnforcer != nil {
+			voicePermissionEnforcer.Close()
+		}
+	}
 
 	go runCleanupJob(cleanupCtx, db, redisClient, hub, log)
 
@@ -259,7 +267,7 @@ func runControlPlane() (runErr error) {
 				liveSpa.Stop()
 			},
 			func() error { return srv.Shutdown(ctx) },
-			waitActivityHistoryWorkers,
+			waitBackgroundWorkers,
 			func() { hub.Shutdown() },
 			func() error { return opsMetricsRuntime.Stop(ctx) },
 			func() error {

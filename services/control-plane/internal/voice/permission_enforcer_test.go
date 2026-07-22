@@ -1,6 +1,7 @@
 package voice_test
 
 import (
+	"database/sql"
 	"encoding/json"
 	"strconv"
 	"testing"
@@ -8,9 +9,11 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,11 +22,12 @@ import (
 // live NATS pair (publisher + observer), mirroring nats_disconnect_test.go.
 // Skips the calling test when NATS is unreachable (runs in CI / dev env).
 type enforcerTestRig struct {
-	ts       *testhelpers.TestServer
-	enforcer *voice.PermissionEnforcer
-	resolver *rbac.Resolver
-	perms    chan map[string]interface{}
-	disc     chan map[string]interface{}
+	ts        *testhelpers.TestServer
+	enforcer  *voice.PermissionEnforcer
+	resolver  *rbac.Resolver
+	publisher *natsclient.Client
+	perms     chan map[string]interface{}
+	disc      chan map[string]interface{}
 }
 
 func setupEnforcerRig(t *testing.T) *enforcerTestRig {
@@ -66,7 +70,10 @@ func setupEnforcerRig(t *testing.T) *enforcerTestRig {
 	// (mirrors the race note in nats_disconnect_test.go).
 	require.NoError(t, obsClient.Flush())
 
-	return &enforcerTestRig{ts: ts, enforcer: enforcer, resolver: resolver, perms: perms, disc: disc}
+	return &enforcerTestRig{
+		ts: ts, enforcer: enforcer, resolver: resolver, publisher: pubClient,
+		perms: perms, disc: disc,
+	}
 }
 
 func (r *enforcerTestRig) addVoiceParticipant(t *testing.T, channelID, userID string) {
@@ -101,6 +108,105 @@ func assertNoPayload(t *testing.T, ch chan map[string]interface{}, what string) 
 	case p := <-ch:
 		t.Fatalf("expected no %s message, got %v", what, p)
 	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func assertNoEnforcementFor(
+	t *testing.T,
+	perms, disconnects <-chan map[string]interface{},
+	userID string,
+) {
+	t.Helper()
+	deadline := time.NewTimer(750 * time.Millisecond)
+	defer deadline.Stop()
+	for {
+		select {
+		case payload := <-perms:
+			if payload["userId"] == userID {
+				t.Fatalf("expected no permission push for %s, got %v", userID, payload)
+			}
+		case payload := <-disconnects:
+			if payload["userId"] == userID {
+				t.Fatalf("expected no disconnect for %s, got %v", userID, payload)
+			}
+		case <-deadline.C:
+			return
+		}
+	}
+}
+
+func openEnforcerMonitorDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("postgres", dbtest.DatabaseURL())
+	require.NoError(t, err)
+	require.NoError(t, db.PingContext(t.Context()))
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	return db
+}
+
+func lockEnforcerTable(t *testing.T, db *sql.DB, table string) *sql.Tx {
+	t.Helper()
+	tx, err := db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	switch table {
+	case "server_members":
+		_, err = tx.ExecContext(t.Context(), `LOCK TABLE server_members IN ACCESS EXCLUSIVE MODE`)
+	case "servers":
+		_, err = tx.ExecContext(t.Context(), `LOCK TABLE servers IN ACCESS EXCLUSIVE MODE`)
+	default:
+		t.Fatalf("unsupported enforcer test table %q", table)
+	}
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = tx.Rollback() })
+	return tx
+}
+
+func waitForEnforcerQuery(
+	t *testing.T,
+	db *sql.DB,
+	state, waitEventType, queryPattern string,
+) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		var found bool
+		err := db.QueryRowContext(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND pid <> pg_backend_pid()
+				  AND state = $1
+				  AND ($2 = '' OR COALESCE(wait_event_type, '') = $2)
+				  AND query LIKE $3
+			)
+		`, state, waitEventType, "%"+queryPattern+"%").Scan(&found)
+		return err == nil && found
+	}, 3*time.Second, 10*time.Millisecond)
+}
+
+func waitForPermissionWithoutDisconnect(
+	t *testing.T,
+	perms, disconnects <-chan map[string]interface{},
+	userID string,
+) map[string]interface{} {
+	t.Helper()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case payload := <-perms:
+			if payload["userId"] == userID {
+				return payload
+			}
+		case payload := <-disconnects:
+			if payload["userId"] == userID {
+				t.Fatalf("received stale disconnect for cleared timeout: %v", payload)
+			}
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for permission push for %s", userID)
+		}
 	}
 }
 
@@ -176,6 +282,146 @@ func TestPermissionEnforcer_RecheckChannel_PublishesForEachParticipant(t *testin
 	assert.True(t, got[m2.ID], "member 2 should receive a recheck")
 }
 
+func TestPermissionEnforcer_RecheckParticipants_BatchesAuthoritativeHeartbeatSet(t *testing.T) {
+	r := setupEnforcerRig(t)
+	owner := r.ts.CreateTestUser(t, "peheartbeatowner")
+	member := r.ts.CreateTestUser(t, "peheartbeatmember")
+	timedOut := r.ts.CreateTestUser(t, "peheartbeattimedout")
+	serverID := r.ts.CreateTestServer(t, owner.ID, "PermEnforce Heartbeat")
+	r.ts.AddMemberToServer(t, serverID, member.ID, "member")
+	r.ts.AddMemberToServer(t, serverID, timedOut.ID, "member")
+	channelID := r.ts.CreateVoiceChannel(t, serverID, "pe-voice-heartbeat")
+	_, err := r.ts.DB.Exec(`
+		UPDATE server_members
+		SET timed_out_until = NOW() + INTERVAL '1 hour'
+		WHERE server_id = $1 AND user_id = $2
+	`, serverID, timedOut.ID)
+	require.NoError(t, err)
+
+	r.enforcer.RecheckParticipants(serverID, channelID, []uuid.UUID{
+		uuid.MustParse(member.ID), uuid.MustParse(timedOut.ID),
+	})
+
+	permission := waitPayloadFor(
+		t, r.perms, "voice.enforce.permissions", map[string]bool{member.ID: true},
+	)
+	assert.Equal(t, channelID, permission["channelId"])
+	disconnect := waitPayloadFor(
+		t, r.disc, "voice.enforce.disconnect", map[string]bool{timedOut.ID: true},
+	)
+	assert.Equal(t, channelID, disconnect["channelId"])
+}
+
+func TestPermissionEnforcer_RecheckParticipants_TimeoutReadErrorPublishesNothing(t *testing.T) {
+	r := setupEnforcerRig(t)
+	owner := r.ts.CreateTestUser(t, "peheartbeaterrorowner")
+	member := r.ts.CreateTestUser(t, "peheartbeaterrormember")
+	serverID := r.ts.CreateTestServer(t, owner.ID, "PermEnforce Heartbeat Error")
+	r.ts.AddMemberToServer(t, serverID, member.ID, "member")
+	channelID := r.ts.CreateVoiceChannel(t, serverID, "pe-voice-heartbeat-error")
+
+	closedDB, err := sql.Open("postgres", dbtest.DatabaseURL())
+	require.NoError(t, err)
+	require.NoError(t, closedDB.Close())
+	brokenTimeoutReader := voice.NewPermissionEnforcer(
+		closedDB, logger.New("test"), r.resolver, r.publisher,
+	)
+	brokenTimeoutReader.RecheckParticipants(
+		serverID, channelID, []uuid.UUID{uuid.MustParse(member.ID)},
+	)
+
+	assertNoEnforcementFor(t, r.perms, r.disc, member.ID)
+}
+
+func TestPermissionEnforcer_RecheckParticipants_RequeuedChannelDoesNotStarvePendingChannel(
+	t *testing.T,
+) {
+	r := setupEnforcerRig(t)
+	monitor := openEnforcerMonitorDB(t)
+	owner := r.ts.CreateTestUser(t, "peheartbeatfifoowner")
+	first := r.ts.CreateTestUser(t, "peheartbeatfifofirst")
+	pending := r.ts.CreateTestUser(t, "peheartbeatfifopending")
+	replacement := r.ts.CreateTestUser(t, "peheartbeatfiforeplacement")
+	serverID := r.ts.CreateTestServer(t, owner.ID, "PermEnforce Heartbeat FIFO")
+	for _, member := range []string{first.ID, pending.ID, replacement.ID} {
+		r.ts.AddMemberToServer(t, serverID, member, "member")
+	}
+	channelA := r.ts.CreateVoiceChannel(t, serverID, "pe-voice-heartbeat-fifo-a")
+	channelB := r.ts.CreateVoiceChannel(t, serverID, "pe-voice-heartbeat-fifo-b")
+	lowChannel, highChannel := channelA, channelB
+	if highChannel < lowChannel {
+		lowChannel, highChannel = highChannel, lowChannel
+	}
+
+	lockTx := lockEnforcerTable(t, r.ts.DB, "server_members")
+	r.enforcer.RecheckParticipants(
+		serverID, lowChannel, []uuid.UUID{uuid.MustParse(first.ID)},
+	)
+	waitForEnforcerQuery(
+		t, monitor, "active", "Lock", "timed_out_until IS NOT NULL",
+	)
+	r.enforcer.RecheckParticipants(
+		serverID, highChannel, []uuid.UUID{uuid.MustParse(pending.ID)},
+	)
+	r.enforcer.RecheckParticipants(
+		serverID, lowChannel, []uuid.UUID{uuid.MustParse(replacement.ID)},
+	)
+	require.NoError(t, lockTx.Commit())
+
+	want := map[string]bool{first.ID: true, pending.ID: true, replacement.ID: true}
+	got := make([]string, 0, len(want))
+	for len(got) < 3 {
+		payload := waitPayloadFor(t, r.perms, "FIFO permission recheck", want)
+		userID, ok := payload["userId"].(string)
+		require.True(t, ok)
+		got = append(got, userID)
+		delete(want, userID)
+	}
+	require.Equal(t, []string{first.ID, pending.ID, replacement.ID}, got)
+}
+
+func TestPermissionEnforcer_RecheckParticipants_ClearedTimeoutPublishesFreshPermissions(
+	t *testing.T,
+) {
+	r := setupEnforcerRig(t)
+	monitor := openEnforcerMonitorDB(t)
+	owner := r.ts.CreateTestUser(t, "peheartbeatclearowner")
+	blocker := r.ts.CreateTestUser(t, "peheartbeatclearblocker")
+	target := r.ts.CreateTestUser(t, "peheartbeatcleartarget")
+	serverID := r.ts.CreateTestServer(t, owner.ID, "PermEnforce Heartbeat Clear")
+	r.ts.AddMemberToServer(t, serverID, blocker.ID, "member")
+	r.ts.AddMemberToServer(t, serverID, target.ID, "member")
+	blockerChannel := r.ts.CreateVoiceChannel(t, serverID, "pe-voice-heartbeat-clear-blocker")
+	targetChannel := r.ts.CreateVoiceChannel(t, serverID, "pe-voice-heartbeat-clear-target")
+	_, err := r.ts.DB.Exec(`
+		UPDATE server_members
+		SET timed_out_until = NOW() + INTERVAL '1 hour'
+		WHERE server_id = $1 AND user_id = $2
+	`, serverID, target.ID)
+	require.NoError(t, err)
+
+	lockTx := lockEnforcerTable(t, r.ts.DB, "servers")
+	r.enforcer.RecheckParticipant(blockerChannel, blocker.ID)
+	waitForEnforcerQuery(t, monitor, "active", "Lock", "SELECT owner_id FROM servers")
+
+	r.enforcer.RecheckParticipants(
+		serverID, targetChannel, []uuid.UUID{uuid.MustParse(target.ID)},
+	)
+	waitForEnforcerQuery(
+		t, monitor, "idle", "", "user_id = ANY($2::uuid[])",
+	)
+	_, err = r.ts.DB.Exec(`
+		UPDATE server_members
+		SET timed_out_until = NULL
+		WHERE server_id = $1 AND user_id = $2
+	`, serverID, target.ID)
+	require.NoError(t, err)
+	require.NoError(t, lockTx.Commit())
+
+	permission := waitForPermissionWithoutDisconnect(t, r.perms, r.disc, target.ID)
+	require.Equal(t, targetChannel, permission["channelId"])
+}
+
 // TestPermissionEnforcer_RecheckServer_CoversAllVoiceChannels verifies server
 // scope reaches participants across different voice channels of the server.
 func TestPermissionEnforcer_RecheckServer_CoversAllVoiceChannels(t *testing.T) {
@@ -205,11 +451,10 @@ func TestPermissionEnforcer_RecheckServer_CoversAllVoiceChannels(t *testing.T) {
 	assert.Equal(t, ch2, got[m2.ID], "member 2 rechecked in its own channel")
 }
 
-// TestPermissionEnforcer_ResolverErrorSkips locks the fail-safe direction: a
-// transient resolve failure must publish NOTHING — neither a permission strip
-// nor a disconnect. The member keeps the join-time snapshot (pre-push
-// behavior) rather than being kicked or muted by a DB blip.
-func TestPermissionEnforcer_ResolverErrorSkips(t *testing.T) {
+// TestPermissionEnforcer_ResolverErrorDisconnects locks the fail-closed
+// direction: after an authorization mutation, a fresh resolve failure must not
+// retain a potentially stale join-time permission snapshot.
+func TestPermissionEnforcer_ResolverErrorDisconnects(t *testing.T) {
 	r := setupEnforcerRig(t)
 	pubClient, err := natsclient.Connect(natsTestURL())
 	require.NoError(t, err)
@@ -239,9 +484,11 @@ func TestPermissionEnforcer_ResolverErrorSkips(t *testing.T) {
 	got := waitPayloadFor(t, r.perms, "voice.enforce.permissions",
 		map[string]bool{sentinel.ID: true, member.ID: true})
 	assert.Equal(t, sentinel.ID, got["userId"],
-		"only the healthy sentinel may publish; a broken resolve must stay silent")
+		"only the healthy sentinel may receive a permission snapshot")
+	disconnect := waitPayloadFor(t, r.disc, "voice.enforce.disconnect",
+		map[string]bool{member.ID: true})
+	assert.Equal(t, channelID, disconnect["channelId"])
 	assertNoPayload(t, r.perms, "voice.enforce.permissions")
-	assertNoPayload(t, r.disc, "voice.enforce.disconnect")
 }
 
 // TestPermissionEnforcer_RecheckParticipant_PushesOnJoin locks the join-race

@@ -14,7 +14,13 @@ import (
 // buildPrivacyHandler constructs the privacy handler wired to the
 // account-deletion service. Telemetry-related wiring was removed in #758 (sub-epic G);
 // the handler now exposes only POST /api/v1/privacy/erase-account.
-func buildPrivacyHandler(db *sql.DB, redisClient *redis.Client, log *logger.Logger) *privacy.Handler {
+func buildPrivacyHandler(
+	db *sql.DB,
+	redisClient *redis.Client,
+	log *logger.Logger,
+	activityCleanup *users.Handler,
+) *privacy.Handler {
 	account := users.NewAccountService(db, log)
+	account.SetActivitySettingsCleanupHandler(activityCleanup)
 	return privacy.NewHandler(account, redisClient, log)
 }

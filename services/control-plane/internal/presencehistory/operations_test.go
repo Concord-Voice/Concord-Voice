@@ -122,6 +122,97 @@ func TestAudienceOperationWithSenderGateSerializationCancellationAndBoundedStrip
 	require.NoError(t, operationReceiveError(t, holderDone, "held stripe did not finish"))
 }
 
+func TestWithSendersDeduplicatesStripeCollisionsAndOrdersGateAcquisition(t *testing.T) {
+	service := NewService(nil, DisclosureState{}, false)
+	senderA := uuid.MustParse("10000000-0000-4000-8000-000000000001")
+	senderACollision := operationSameStripeUUID(senderA)
+	senderB := operationDifferentStripeUUID(senderA)
+	require.NotEqual(t, senderA, senderACollision)
+	require.Equal(t, senderGateIndex(senderA), senderGateIndex(senderACollision))
+	require.NotEqual(t, senderGateIndex(senderA), senderGateIndex(senderB))
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- service.WithSenders(
+			context.Background(),
+			[]uuid.UUID{senderB, senderA, senderACollision, senderA},
+			func() error {
+				close(firstEntered)
+				<-releaseFirst
+				return nil
+			},
+		)
+	}()
+	operationReceiveSignal(t, firstEntered, "multi-sender operation deadlocked on duplicate stripes")
+
+	secondEntered := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- service.WithSenders(
+			context.Background(),
+			[]uuid.UUID{senderA, senderB},
+			func() error {
+				close(secondEntered)
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-secondEntered:
+		t.Fatal("overlapping multi-sender operation bypassed held gates")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	require.NoError(t, operationReceiveError(t, firstDone, "first multi-sender operation did not finish"))
+	operationReceiveSignal(t, secondEntered, "reverse-order multi-sender operation deadlocked")
+	require.NoError(t, operationReceiveError(t, secondDone, "second multi-sender operation did not finish"))
+}
+
+func TestWithSendersCancellationReleasesPartiallyAcquiredStripes(t *testing.T) {
+	service := NewService(nil, DisclosureState{}, false)
+	senderA := uuid.MustParse("10000000-0000-4000-8000-000000000001")
+	senderB := operationDifferentStripeUUID(senderA)
+	earlierSender, laterSender := senderA, senderB
+	if senderGateIndex(earlierSender) > senderGateIndex(laterSender) {
+		earlierSender, laterSender = laterSender, earlierSender
+	}
+	earlierIndex := senderGateIndex(earlierSender)
+	laterIndex := senderGateIndex(laterSender)
+	require.Less(t, earlierIndex, laterIndex)
+
+	// Hold the later sorted stripe so WithSenders can acquire the earlier one
+	// before it blocks. Cancellation must unwind that partial acquisition.
+	service.senderGates[laterIndex] <- struct{}{}
+	defer func() { <-service.senderGates[laterIndex] }()
+	ctx, cancel := context.WithCancel(context.Background())
+	workRan := atomic.Bool{}
+	done := make(chan error, 1)
+	go func() {
+		done <- service.WithSenders(
+			ctx,
+			[]uuid.UUID{laterSender, earlierSender},
+			func() error {
+				workRan.Store(true)
+				return nil
+			},
+		)
+	}()
+	require.Eventually(t, func() bool {
+		return len(service.senderGates[earlierIndex]) == 1
+	}, time.Second, time.Millisecond, "earlier stripe was not acquired before blocking")
+
+	cancel()
+	require.ErrorIs(t, operationReceiveError(t, done, "canceled multi-sender operation did not return"), context.Canceled)
+	assert.False(t, workRan.Load())
+
+	verificationCtx, verificationCancel := context.WithTimeout(context.Background(), time.Second)
+	defer verificationCancel()
+	require.NoError(t, service.WithSender(verificationCtx, earlierSender, func() error { return nil }))
+}
+
 func TestBeginAudienceOperationCapturesPriorStateAndCommitsMarker(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	defer cleanup()
@@ -683,6 +774,19 @@ func operationDifferentStripeUUID(senderID uuid.UUID) uuid.UUID {
 		}
 	}
 	panic("no distinct sender stripe")
+}
+
+func operationSameStripeUUID(senderID uuid.UUID) uuid.UUID {
+	for index := 0; index < len(senderID); index++ {
+		for candidate := byte(1); candidate != 0; candidate++ {
+			other := senderID
+			other[index] = candidate
+			if other != senderID && senderGateIndex(other) == senderGateIndex(senderID) {
+				return other
+			}
+		}
+	}
+	panic("no colliding sender stripe")
 }
 
 func operationReceiveSignal(t *testing.T, signal <-chan struct{}, message string) {

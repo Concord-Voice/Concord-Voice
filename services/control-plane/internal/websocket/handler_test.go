@@ -45,6 +45,28 @@ func TestNewHandlerNilDepsDoNotPanic(t *testing.T) {
 	require.NotNil(t, h)
 }
 
+func TestRequestSupportsActivityRichPresenceRequiresOneExactOptIn(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "absent", path: "/ws", want: false},
+		{name: "exact opt in", path: "/ws?activity_rich_presence=1", want: true},
+		{name: "boolean text is not accepted", path: "/ws?activity_rich_presence=true", want: false},
+		{name: "zero is not accepted", path: "/ws?activity_rich_presence=0", want: false},
+		{name: "duplicate values fail closed", path: "/ws?activity_rich_presence=1&activity_rich_presence=0", want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodGet, test.path, nil)
+			require.NoError(t, err)
+			assert.Equal(t, test.want, requestSupportsActivityRichPresence(request))
+		})
+	}
+}
+
 // --- CheckOrigin comprehensive tests ---
 
 func TestCheckOriginEmptyAllowList(t *testing.T) {
@@ -610,6 +632,44 @@ func TestHandleWebSocketDBLookupFallback(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
 	_ = conn.Close()
+}
+
+func TestHandleWebSocketCapturesActivityCapabilityBeforeRegistration(t *testing.T) {
+	db := setupHubTestDB(t)
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(db, redisClient)
+	go hub.Run()
+	handler := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil)
+
+	userID := uuid.New()
+	token := generateTestJWT(t, userID.String(), testJWTSecret)
+	server := setupWSTestServer(t, handler, hub)
+	baseURL := "ws" + server.URL[4:] + wsTokenPath + token
+	legacy, _, err := gorillaWS.DefaultDialer.Dial(baseURL, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = legacy.Close() })
+	capable, _, err := gorillaWS.DefaultDialer.Dial(baseURL+"&activity_rich_presence=1", nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = capable.Close() })
+
+	require.Eventually(t, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		legacyCount := 0
+		capableCount := 0
+		for clientID := range hub.userClients[userID] {
+			client := hub.clients[clientID]
+			if client == nil {
+				continue
+			}
+			if client.activityRichPresenceCapable {
+				capableCount++
+			} else {
+				legacyCount++
+			}
+		}
+		return legacyCount == 1 && capableCount == 1
+	}, time.Second, 10*time.Millisecond)
 }
 
 // TestHandleWebSocketSecurityHeadersOn101 locks the #2318 fix: gorilla builds

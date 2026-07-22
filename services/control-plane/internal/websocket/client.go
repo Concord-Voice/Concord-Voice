@@ -4,6 +4,7 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -31,6 +32,28 @@ const (
 	rateLimitBurst    = 10 // max burst
 	rateLimitPerSec   = 5  // sustained rate (tokens per second)
 	rateLimitInterval = time.Second / time.Duration(rateLimitPerSec)
+
+	// Reconnect replacement work is bounded independently of the socket queue.
+	// One slot is reserved for presence_snapshot; the rest cover Custom Status
+	// replay plus base/Rich Presence deltas that arrive while it is rebuilt.
+	clientBootstrapFrameLimit         = 256
+	clientBootstrapBufferedFrameLimit = clientBootstrapFrameLimit - 1
+)
+
+var (
+	errClientBootstrapInactive           = errors.New("client bootstrap is not active")
+	errClientBootstrapCanceled           = errors.New("client bootstrap is canceled")
+	errClientBootstrapOverflow           = errors.New("client bootstrap frame limit exceeded")
+	errClientBootstrapPublicationMissing = errors.New("client bootstrap snapshot was not published")
+)
+
+type bootstrapBufferOutcome uint8
+
+const (
+	bootstrapBufferInactive bootstrapBufferOutcome = iota
+	bootstrapBufferEnqueued
+	bootstrapBufferOverflow
+	bootstrapBufferCanceled
 )
 
 // Client represents a single WebSocket connection
@@ -62,6 +85,17 @@ type Client struct {
 
 	// Buffered channel of outbound messages
 	Send chan []byte
+	// activityRichPresenceCapable is declared explicitly on the authenticated
+	// WebSocket upgrade. Older desktop builds accept activity-category clear frames
+	// but misapply them to Custom Status, so live activity deltas remain disabled
+	// until a client opts into the corrected contract.
+	activityRichPresenceCapable bool
+	// sendMu serializes every production producer. Code that needs both client
+	// locks acquires sendMu before bootstrapMu. The reconnect replacement
+	// holds it across its full multi-frame flush so unrelated events cannot
+	// consume reserved capacity or interleave between snapshot/replay/live.
+	sendMu     sync.Mutex
+	sendClosed bool
 
 	// Channels the user is subscribed to
 	Channels map[uuid.UUID]bool
@@ -75,6 +109,152 @@ type Client struct {
 
 	// asyncCancel cancels the context passed to async registration goroutines
 	asyncCancel context.CancelFunc
+
+	// bootstrapMu orders replacement construction against privacy-critical and
+	// base-presence deltas. Delivery takes Hub.mu before this mutex; bootstrap
+	// completion/cancellation never takes Hub.mu while holding it.
+	bootstrapMu       sync.Mutex
+	bootstrapActive   bool
+	bootstrapCanceled bool
+	bootstrapFailed   bool
+	bootstrapReplay   [][]byte
+	bootstrapLive     [][]byte
+}
+
+func (c *Client) beginBootstrap() {
+	c.bootstrapMu.Lock()
+	defer c.bootstrapMu.Unlock()
+	c.bootstrapActive = true
+	c.bootstrapCanceled = false
+	c.bootstrapFailed = false
+	c.bootstrapReplay = nil
+	c.bootstrapLive = nil
+}
+
+func (c *Client) appendBootstrapReplay(data []byte) error {
+	c.bootstrapMu.Lock()
+	defer c.bootstrapMu.Unlock()
+	if c.bootstrapCanceled {
+		return errClientBootstrapCanceled
+	}
+	if !c.bootstrapActive {
+		return errClientBootstrapInactive
+	}
+	if c.bootstrapFailed || len(c.bootstrapReplay)+len(c.bootstrapLive) >= clientBootstrapBufferedFrameLimit {
+		c.bootstrapFailed = true
+		return errClientBootstrapOverflow
+	}
+	c.bootstrapReplay = append(c.bootstrapReplay, append([]byte(nil), data...))
+	return nil
+}
+
+func (c *Client) bufferBootstrapLive(data []byte) bootstrapBufferOutcome {
+	c.bootstrapMu.Lock()
+	defer c.bootstrapMu.Unlock()
+	if c.bootstrapCanceled {
+		return bootstrapBufferCanceled
+	}
+	if !c.bootstrapActive {
+		return bootstrapBufferInactive
+	}
+	if c.bootstrapFailed || len(c.bootstrapReplay)+len(c.bootstrapLive) >= clientBootstrapBufferedFrameLimit {
+		c.bootstrapFailed = true
+		return bootstrapBufferOverflow
+	}
+	c.bootstrapLive = append(c.bootstrapLive, append([]byte(nil), data...))
+	return bootstrapBufferEnqueued
+}
+
+func (c *Client) cancelBootstrap() {
+	c.bootstrapMu.Lock()
+	defer c.bootstrapMu.Unlock()
+	c.bootstrapActive = false
+	c.bootstrapCanceled = true
+	c.bootstrapReplay = nil
+	c.bootstrapLive = nil
+}
+
+func (c *Client) enqueueOutbound(data []byte) bool {
+	// While the reconnect replacement is active, ordinary producers append to
+	// its live tail instead of waiting on sendMu. This keeps Hub.Run responsive
+	// while the publication barrier waits on bounded DB/sender-gate work and
+	// guarantees the frame cannot overtake snapshot and replay.
+	switch c.bufferBootstrapLive(data) {
+	case bootstrapBufferEnqueued:
+		return true
+	case bootstrapBufferOverflow, bootstrapBufferCanceled:
+		return false
+	case bootstrapBufferInactive:
+	}
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if c.sendClosed || c.Send == nil {
+		return false
+	}
+	select {
+	case c.Send <- data:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) enqueueOutboundBlocking(data []byte) bool {
+	switch c.bufferBootstrapLive(data) {
+	case bootstrapBufferEnqueued:
+		return true
+	case bootstrapBufferOverflow, bootstrapBufferCanceled:
+		return false
+	case bootstrapBufferInactive:
+	}
+	return c.enqueueOutboundBlockingImmediate(data)
+}
+
+// enqueueOutboundBlockingImmediate bypasses bootstrap ordering only for the
+// initial connected acknowledgement, which is intentionally published before
+// the replacement. All other blocking producers use enqueueOutboundBlocking.
+func (c *Client) enqueueOutboundBlockingImmediate(data []byte) bool {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if c.sendClosed || c.Send == nil {
+		return false
+	}
+	c.Send <- data
+	return true
+}
+
+// enqueuePostBootstrap linearizes informational registration frames against
+// unregister cancellation. If cancellation wins bootstrapMu, no late frame is
+// allowed into the queue; if this send wins, unregister waits for it normally.
+func (c *Client) enqueuePostBootstrap(ctx context.Context, data []byte) bool {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	c.bootstrapMu.Lock()
+	defer c.bootstrapMu.Unlock()
+	if c.bootstrapCanceled || ctx.Err() != nil {
+		return false
+	}
+	if c.sendClosed || c.Send == nil {
+		return false
+	}
+	select {
+	case c.Send <- data:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) closeOutbound() {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if c.sendClosed {
+		return
+	}
+	c.sendClosed = true
+	if c.Send != nil {
+		close(c.Send)
+	}
 }
 
 // rateLimitAllow checks the token bucket and returns true if the message is allowed.

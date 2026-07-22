@@ -27,6 +27,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/notifications"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/ownership"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
@@ -42,6 +43,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -67,6 +69,21 @@ const (
 // without making the websocket package import rbac.
 type permissionCheckerAdapter struct {
 	resolver *rbac.Resolver
+}
+
+type dmVoiceCallLeaseVerifier struct {
+	redis *redis.Client
+}
+
+func (v dmVoiceCallLeaseVerifier) Matches(
+	ctx context.Context,
+	conversationID, callID uuid.UUID,
+) (bool, error) {
+	lease, found, err := dm.LookupDMVoiceCallLease(ctx, v.redis, conversationID)
+	if err != nil {
+		return false, err
+	}
+	return found && lease.CallID == callID, nil
 }
 
 func (a *permissionCheckerAdapter) HasMentionPermission(ctx context.Context, serverID, userID, channelID string, permBit int64) (bool, error) {
@@ -217,7 +234,7 @@ func NewRouter(
 	liveSpa *config.LiveSpaConfig,
 	log *logger.Logger,
 	dependencies RouterDependencies,
-) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, error) {
+) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, error) {
 	metricsReader := dependencies.OpsMetricsReader
 	presenceHistoryService := dependencies.PresenceHistory
 	router := gin.New()
@@ -240,7 +257,7 @@ func NewRouter(
 	// Initialize WebSocket hub
 	hub := websocket.NewHub(db, redis, opsCounters)
 	if err := bindPresenceHistoryRuntime(hub, presenceHistoryService); err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	// Initialize NATS (inter-service messaging with media plane)
@@ -270,6 +287,26 @@ func NewRouter(
 	permissionChecker := &permissionCheckerAdapter{resolver: rbacResolver}
 	hub.SetMentionChecker(permissionChecker)
 	hub.SetChannelPermissionChecker(permissionChecker)
+	activityStore := presence.NewActivityStore(redis)
+	activityBuilder := presence.NewActivityBuilder(
+		db, dmVoiceCallLeaseVerifier{redis: redis}, activityStore,
+	)
+	activityService := presence.NewActivityService(
+		presenceHistoryService,
+		activityBuilder,
+		activityStore,
+		db,
+		rbacResolver,
+		hub,
+	)
+	activitySnapshotService := presence.NewActivitySnapshotService(
+		db,
+		activityBuilder,
+		activityStore,
+		rbacResolver,
+		presenceHistoryService,
+	)
+	hub.SetActivitySnapshotService(activitySnapshotService)
 
 	auditWriter := rbac.NewAuditWriter(db, log)
 	rbacHandler := rbac.NewHandler(db, log, redis, hub, rbacResolver, permCache, auditWriter)
@@ -298,6 +335,7 @@ func NewRouter(
 	sessionsHandler := sessions.NewHandler(db, redis, log, hub, mfaHandler)
 	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache)
 	usersHandler.SetPresenceHistory(presenceHistoryService)
+	usersHandler.SetActivitySettingsSuppressor(activityService)
 	presenceHistoryHandler := presencehistory.NewHandler(presenceHistoryService)
 	serversHandler := servers.NewHandler(db, log, hub, rbacResolver, entCache, serverEntCache)
 	channelsHandler := channels.NewHandler(db, log, hub, rbacResolver, redis, serverEntCache)
@@ -375,7 +413,7 @@ func NewRouter(
 	clientConfigHandler := clientconfig.NewHandler(cfg, liveSpa, log)
 	serverCapabilitiesHandler := servercapabilities.NewHandler(cfg)
 	updatesHandler := updates.NewHandler(cfg, log)
-	privacyHandler := buildPrivacyHandler(db, redis, log)
+	privacyHandler := buildPrivacyHandler(db, redis, log, usersHandler)
 	oauthHandler := buildOAuthHandler(db, redis, cfg, authHandler, log)
 
 	// Client attestation (#677, ADR-0010). When REQUIRE_CLIENT_ATTESTATION=false
@@ -411,12 +449,14 @@ func NewRouter(
 
 	// Start NATS voice event subscriber
 	if natsClient != nil {
-		voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver)
+		voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver, activityService)
 		// Close the join-vs-mutation race: re-push fresh permissions when a
 		// voice.joined lands (CV-CAN-007 P1).
 		voiceSub.SetPermissionEnforcer(voicePermEnforcer)
 		if subErr := voiceSub.Subscribe(); subErr != nil {
 			log.Error("Failed to subscribe to voice NATS events", "error", subErr)
+		} else {
+			voicePermEnforcer.AddCloseHook(voiceSub.Close)
 		}
 	}
 	// API v1 routes
@@ -2060,7 +2100,7 @@ func NewRouter(
 	opsRuntime := wireOpsMetricsRuntime(db, natsClient, hub, opsCounters, cfg.OpsMetrics, log)
 	// Start only after every dependency, observer, and route has been injected.
 	go hub.Run()
-	return router, hub, natsClient, opsRuntime, nil
+	return router, hub, natsClient, opsRuntime, voicePermEnforcer, nil
 }
 
 // healthHandler responds with 200 + control-plane health JSON. Registered

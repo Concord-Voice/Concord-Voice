@@ -14,6 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const natsSubjectEnforceDisconnectForTest = "voice.enforce.disconnect"
+
 // natsTestURL returns the NATS URL for integration tests (dev default: no auth).
 func natsTestURL() string {
 	if u := os.Getenv("NATS_URL"); u != "" {
@@ -39,7 +41,7 @@ func TestPublishForceDisconnect_PublishesPayload(t *testing.T) {
 	t.Cleanup(obsClient.Close)
 
 	ts := testhelpers.SetupTestServer(t)
-	sub := voice.NewNATSSubscriber(ts.DB, logger.New("test"), ts.Hub, pubClient, ts.Redis, nil)
+	sub := voice.NewNATSSubscriber(ts.DB, logger.New("test"), ts.Hub, pubClient, ts.Redis, nil, nil)
 
 	received := make(chan []byte, 1)
 	natsSub, err := obsClient.Subscribe("voice.enforce.disconnect", func(data []byte) {
@@ -73,7 +75,7 @@ func TestPublishForceDisconnect_PublishesPayload(t *testing.T) {
 // publishEnforcementFlags nil guard.
 func TestPublishForceDisconnect_NilNATSNoop(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
-	sub := voice.NewNATSSubscriber(ts.DB, logger.New("test"), ts.Hub, nil, ts.Redis, nil)
+	sub := voice.NewNATSSubscriber(ts.DB, logger.New("test"), ts.Hub, nil, ts.Redis, nil, nil)
 	// Must not panic when nats is nil.
 	sub.PublishForceDisconnect("chan", "user")
 }

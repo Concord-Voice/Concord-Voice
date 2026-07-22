@@ -37,12 +37,12 @@ func TestNewRouterRequiresOneUnboundActivityHistoryService(t *testing.T) {
 	cfg := &config.Config{Environment: "test"}
 	log := logger.NewWithWriter(io.Discard)
 
-	_, _, _, _, err := api.NewRouter(nil, nil, nil, cfg, nil, log, api.RouterDependencies{})
+	_, _, _, _, _, err := api.NewRouter(nil, nil, nil, cfg, nil, log, api.RouterDependencies{})
 	require.Error(t, err)
 
 	service := presencehistory.NewService(nil, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(preboundActivityHistoryDelivery{}))
-	_, _, _, _, err = api.NewRouter(
+	_, _, _, _, _, err = api.NewRouter(
 		nil,
 		nil,
 		nil,
@@ -67,7 +67,7 @@ func TestNewRouterActivityHistoryWiringOrderIsSingleAndFinal(t *testing.T) {
 		"presenceHistoryHandler.RegisterRoutes(",
 		"opsRuntime := wireOpsMetricsRuntime(",
 		"go hub.Run()",
-		"return router, hub, natsClient, opsRuntime, nil",
+		"return router, hub, natsClient, opsRuntime, voicePermEnforcer, nil",
 	}
 	prior := -1
 	for _, needle := range needles {
@@ -214,8 +214,7 @@ func TestRouterUsesTestServerPresenceHistoryGateForWriterAndReconnectSnapshot(t 
 	require.NoError(t, err)
 	defer func() { _ = connection.Close() }()
 
-	presenceSnapshot := make(chan struct{}, 1)
-	customTextFrame := make(chan struct{}, 2)
+	replacementFrames := make(chan string, 3)
 	readError := make(chan error, 1)
 	go func() {
 		for {
@@ -236,31 +235,18 @@ func TestRouterUsesTestServerPresenceHistoryGateForWriterAndReconnectSnapshot(t 
 			}
 			switch envelope.Type {
 			case "presence_snapshot":
-				select {
-				case presenceSnapshot <- struct{}{}:
-				default:
-				}
+				replacementFrames <- envelope.Type
 			case "rich_presence_update":
 				if envelope.Data.Category != "custom_text" || envelope.Data.UserID != sender.ID {
 					continue
 				}
-				select {
-				case customTextFrame <- struct{}{}:
-				default:
-				}
+				replacementFrames <- "custom_text"
 			}
 		}
 	}()
 	select {
-	case <-presenceSnapshot:
-	case err := <-readError:
-		t.Fatalf("WebSocket read before snapshot: %v", err)
-	case <-time.After(3 * time.Second):
-		t.Fatal("reconnect did not reach presence snapshot")
-	}
-	select {
-	case <-customTextFrame:
-		t.Fatal("reconnect Custom Status snapshot escaped shared Service gate")
+	case frame := <-replacementFrames:
+		t.Fatalf("replacement frame %q escaped before all sender-gated Custom work completed", frame)
 	case err := <-readError:
 		t.Fatalf("WebSocket read while gate held: %v", err)
 	case <-time.After(100 * time.Millisecond):
@@ -279,13 +265,14 @@ func TestRouterUsesTestServerPresenceHistoryGateForWriterAndReconnectSnapshot(t 
 	case <-time.After(3 * time.Second):
 		t.Fatal("gate holder did not finish")
 	}
-	for frame := 1; frame <= 2; frame++ {
+	for index, expected := range []string{"presence_snapshot", "custom_text", "custom_text"} {
 		select {
-		case <-customTextFrame:
+		case actual := <-replacementFrames:
+			require.Equal(t, expected, actual, "replacement frame %d", index+1)
 		case err := <-readError:
 			t.Fatalf("WebSocket read after gate release: %v", err)
 		case <-time.After(5 * time.Second):
-			t.Fatalf("received %d/2 writer + reconnect Custom Status frames after gate release", frame-1)
+			t.Fatalf("received %d/3 ordered replacement frames after gate release", index)
 		}
 	}
 }

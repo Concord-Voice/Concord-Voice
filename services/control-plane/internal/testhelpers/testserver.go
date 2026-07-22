@@ -105,6 +105,7 @@ func SetupTestServer(t *testing.T) *TestServer {
 		ActivityHistoryClusterEnabled:    true,
 		ControlPlaneReplicaCount:         1,
 		ControlPlaneReplicaCountExplicit: true,
+		NATSUrl:                          os.Getenv("NATS_URL"),
 	}
 
 	// Route logs through a MultiWriter: humans running `go test -v` still see
@@ -116,13 +117,13 @@ func SetupTestServer(t *testing.T) *TestServer {
 	disclosure := presencehistory.BuildDisclosure(presencehistory.DisclosureOptions{InstanceType: "saas"})
 	presenceHistoryService := presencehistory.NewService(db, disclosure, true)
 
-	// Register dependency cleanup first so LIFO execution closes Hub, then
-	// operations metrics and NATS, before Redis/DB.
+	// Register dependency cleanup first so LIFO execution closes Hub, operations
+	// metrics, the permission enforcer, and NATS before Redis/DB.
 	t.Cleanup(func() {
 		redisCleanup()
 		dbCleanup()
 	})
-	router, hub, natsClient, opsRuntime, err := api.NewRouter(
+	router, hub, natsClient, opsRuntime, permissionEnforcer, err := api.NewRouter(
 		db,
 		redisClient,
 		nil,
@@ -137,6 +138,7 @@ func SetupTestServer(t *testing.T) *TestServer {
 	if natsClient != nil {
 		t.Cleanup(func() { natsClient.Close() })
 	}
+	t.Cleanup(permissionEnforcer.Close)
 	t.Cleanup(func() {
 		if err := opsRuntime.Stop(context.Background()); err != nil {
 			t.Errorf("stop operations metrics runtime: %v", err)

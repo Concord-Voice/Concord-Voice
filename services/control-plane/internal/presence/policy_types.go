@@ -64,6 +64,11 @@ type ServerVoicePolicyInput struct {
 type PrivateCallPolicyInput struct {
 	Context PrivateCallContext
 	Payload PrivateCallPayload
+
+	// buildSnapshot is an immutable request/event-local authoritative read
+	// produced only by ActivityBuilder. It lets the policy reuse the exact
+	// participant proof instead of re-querying the entire call per sender.
+	buildSnapshot *privateCallBuildSnapshot
 }
 
 // PolicyInput carries one category-specific rich-presence authorization input.
@@ -76,8 +81,9 @@ type PolicyInput struct {
 
 // Decision contains the authorized audience and serialized payload.
 type Decision struct {
-	Audience map[uuid.UUID]bool
-	Payload  json.RawMessage
+	Audience  map[uuid.UUID]bool
+	Payload   json.RawMessage
+	Minimized bool
 }
 
 // FailureClass is a stable, non-sensitive rich-presence policy error category.

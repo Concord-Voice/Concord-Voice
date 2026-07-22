@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/google/uuid"
 )
 
 // ErrUserNotFound is returned when DeleteAccount targets a user row that no
@@ -25,11 +26,12 @@ type AccountDeleter interface {
 }
 
 // AccountService is the concrete AccountDeleter backed by the primary
-// Postgres pool. It owns its own transaction boundary so the caller
-// never holds a connection across any slow or external operation.
+// Postgres pool. Its erasure transaction starts only after sender-gated
+// activity cleanup has completed.
 type AccountService struct {
-	db  *sql.DB
-	log *logger.Logger
+	db              *sql.DB
+	log             *logger.Logger
+	activityCleanup *Handler
 }
 
 // NewAccountService constructs an AccountService. The logger is optional;
@@ -40,7 +42,14 @@ func NewAccountService(db *sql.DB, log *logger.Logger) *AccountService {
 	return &AccountService{db: db, log: log}
 }
 
-// DeleteAccount performs the full erasure inside one transaction:
+// SetActivitySettingsCleanupHandler binds the same sender coordinator and
+// suppression service used by presence-settings writers.
+func (s *AccountService) SetActivitySettingsCleanupHandler(handler *Handler) {
+	s.activityCleanup = handler
+}
+
+// DeleteAccount first resumes any durable activity-policy cleanup while holding
+// the sender gate, then performs the database erasure inside one transaction:
 //  1. DELETE FROM users WHERE id = $1 — cascades through every user_id-FK
 //     table configured with ON DELETE CASCADE. If zero rows match, the user
 //     is already gone and we return ErrUserNotFound WITHOUT writing an audit
@@ -65,6 +74,35 @@ func (s *AccountService) DeleteAccount(
 	ctx context.Context,
 	userID string,
 ) error {
+	if s.activityCleanup == nil {
+		return s.deleteAccount(ctx, userID)
+	}
+	parsedUserID, err := uuid.Parse(userID)
+	if err != nil {
+		return fmt.Errorf("delete account: invalid user id: %w", err)
+	}
+	if s.activityCleanup.presenceHistory == nil {
+		return errors.New("delete account: activity cleanup coordinator unavailable")
+	}
+	if s.activityCleanup.activitySuppressor == nil {
+		return errors.New("delete account: full activity suppression unavailable")
+	}
+	return s.activityCleanup.presenceHistory.WithSender(ctx, parsedUserID, func() error {
+		if _, err := s.activityCleanup.resumePendingActivitySettingsCleanup(
+			ctx, parsedUserID,
+		); err != nil {
+			return fmt.Errorf("delete account: resume activity cleanup: %w", err)
+		}
+		if err := s.activityCleanup.activitySuppressor.SuppressAllActivityAlreadyGated(
+			ctx, parsedUserID,
+		); err != nil {
+			return fmt.Errorf("delete account: suppress active activity: %w", err)
+		}
+		return s.deleteAccount(ctx, userID)
+	})
+}
+
+func (s *AccountService) deleteAccount(ctx context.Context, userID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("delete account: begin tx: %w", err)

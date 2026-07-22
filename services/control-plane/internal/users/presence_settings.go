@@ -28,6 +28,7 @@ const (
 	presenceTierMin         = 0
 	presenceTierMax         = 2
 	maxPresenceSettingsBody = 16 * 1024
+	activityCleanupTimeout  = 5 * time.Second
 
 	errMsgFailedFetchPresence  = "Failed to fetch presence settings"
 	errMsgFailedUpdatePresence = "Failed to update presence settings"
@@ -182,8 +183,62 @@ type presenceUpdate struct {
 	fieldCount             int
 }
 
+func (u presenceUpdate) affectsActivityPolicy() bool {
+	return u.masterEnabled.Valid || u.serverVoiceTier.Valid ||
+		u.serverVoiceShowDetails.Valid || u.privateCallTier.Valid ||
+		u.privateCallShowDetails.Valid
+}
+
 func validPresenceTier(tier int) bool {
 	return tier >= presenceTierMin && tier <= presenceTierMax
+}
+
+func activityTierFromPersisted(value int) (presence.Tier, error) {
+	switch value {
+	case 0:
+		return presence.TierOff, nil
+	case 1:
+		return presence.TierFriends, nil
+	case 2:
+		return presence.TierServers, nil
+	default:
+		return presence.TierOff, errors.New("invalid persisted activity tier")
+	}
+}
+
+func activityPolicyFromWrite(
+	operation presencehistory.AudienceOperation,
+	after presenceSettingsResponse,
+) (presence.ActivityPolicySettings, presence.ActivityPolicySettings, error) {
+	beforeServerTier, err := activityTierFromPersisted(operation.BeforeServerVoiceTier)
+	if err != nil {
+		return presence.ActivityPolicySettings{}, presence.ActivityPolicySettings{}, err
+	}
+	beforePrivateTier, err := activityTierFromPersisted(operation.BeforePrivateCallTier)
+	if err != nil {
+		return presence.ActivityPolicySettings{}, presence.ActivityPolicySettings{}, err
+	}
+	afterServerTier, err := activityTierFromPersisted(after.ServerVoiceTier)
+	if err != nil {
+		return presence.ActivityPolicySettings{}, presence.ActivityPolicySettings{}, err
+	}
+	afterPrivateTier, err := activityTierFromPersisted(after.PrivateCallTier)
+	if err != nil {
+		return presence.ActivityPolicySettings{}, presence.ActivityPolicySettings{}, err
+	}
+	return presence.ActivityPolicySettings{
+			MasterEnabled:          operation.BeforeMasterEnabled,
+			ServerVoiceTier:        beforeServerTier,
+			ServerVoiceShowDetails: operation.BeforeServerVoiceShowDetails,
+			PrivateCallTier:        beforePrivateTier,
+			PrivateCallShowDetails: operation.BeforePrivateCallShowDetails,
+		}, presence.ActivityPolicySettings{
+			MasterEnabled:          after.MasterEnabled,
+			ServerVoiceTier:        afterServerTier,
+			ServerVoiceShowDetails: after.ServerVoiceShowDetails,
+			PrivateCallTier:        afterPrivateTier,
+			PrivateCallShowDetails: after.PrivateCallShowDetails,
+		}, nil
 }
 
 func presenceTierValue(tier *int, field string) (sql.NullInt64, int, string) {
@@ -288,9 +343,10 @@ func (e *presenceWriterFailure) Error() string { return "presence writer " + e.c
 func (e *presenceWriterFailure) Unwrap() error { return e.cause }
 
 type presenceSettingsWrite struct {
-	response  presenceSettingsResponse
-	operation presencehistory.AudienceOperation
-	plan      presencehistory.DeliveryPlan
+	response            presenceSettingsResponse
+	operation           presencehistory.AudienceOperation
+	plan                presencehistory.DeliveryPlan
+	mainCommitConfirmed bool
 }
 
 // UpdatePresenceSettings updates the caller's presence settings.
@@ -298,53 +354,111 @@ type presenceSettingsWrite struct {
 // row, application-sets updated_at (no DB trigger), and returns the resulting row.
 // PATCH /users/me/presence-settings
 func (h *Handler) UpdatePresenceSettings(c *gin.Context) {
-	userID := c.GetString("user_id")
-
-	raw, err := readExactPresenceSettingsBody(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+	update, ok := decodePresenceSettingsUpdate(c)
+	if !ok {
 		return
 	}
-	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
-	var req updatePresenceRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+	userUUID, ok := h.presenceSettingsSender(c, update)
+	if !ok {
 		return
 	}
-
-	update, status, msg := buildPresenceUpdate(&req)
-	if status != 0 {
-		c.JSON(status, gin.H{"error": msg})
-		return
-	}
-	if update.fieldCount == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "No fields to update"})
-		return
-	}
-	userUUID, err := uuid.Parse(userID)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgUnauthorized})
-		return
-	}
-	if h.presenceHistory == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedUpdatePresence})
-		return
-	}
-	mode := presencehistory.OrdinaryAudienceWrite
-	if update.masterEnabled.Valid && !update.masterEnabled.Bool {
-		mode = presencehistory.ForcedSecurityClear
-	}
+	mode := presenceSettingsOperationMode(update)
 	var write presenceSettingsWrite
-	err = h.presenceHistory.WithReadySenderMode(c.Request.Context(), userUUID, mode, func() error {
-		var writeErr error
-		write, writeErr = h.writePresenceSettings(c.Request.Context(), userUUID, update, mode)
-		return writeErr
-	})
+	err := h.presenceHistory.WithReadySenderMode(
+		c.Request.Context(), userUUID, mode, func() error {
+			var gatedErr error
+			write, gatedErr = h.updatePresenceSettingsAlreadyGated(
+				c.Request.Context(), userUUID, update, mode,
+			)
+			return gatedErr
+		},
+	)
 	if err != nil {
 		h.respondPresenceWriterFailure(c, errMsgFailedUpdatePresence, err)
 		return
 	}
 	c.JSON(http.StatusOK, write.response)
+}
+
+func decodePresenceSettingsUpdate(c *gin.Context) (presenceUpdate, bool) {
+	raw, err := readExactPresenceSettingsBody(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return presenceUpdate{}, false
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
+	var req updatePresenceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return presenceUpdate{}, false
+	}
+	update, status, msg := buildPresenceUpdate(&req)
+	if status != 0 {
+		c.JSON(status, gin.H{"error": msg})
+		return presenceUpdate{}, false
+	}
+	if update.fieldCount == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No fields to update"})
+		return presenceUpdate{}, false
+	}
+	return update, true
+}
+
+func (h *Handler) presenceSettingsSender(
+	c *gin.Context,
+	update presenceUpdate,
+) (uuid.UUID, bool) {
+	userUUID, err := uuid.Parse(c.GetString("user_id"))
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgUnauthorized})
+		return uuid.Nil, false
+	}
+	if h.presenceHistory == nil || (update.affectsActivityPolicy() && h.activitySuppressor == nil) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsgFailedUpdatePresence})
+		return uuid.Nil, false
+	}
+	return userUUID, true
+}
+
+func presenceSettingsOperationMode(update presenceUpdate) presencehistory.OperationMode {
+	mode := presencehistory.OrdinaryAudienceWrite
+	if update.masterEnabled.Valid && !update.masterEnabled.Bool {
+		mode = presencehistory.ForcedSecurityClear
+	}
+	return mode
+}
+
+func (h *Handler) updatePresenceSettingsAlreadyGated(
+	ctx context.Context,
+	userID uuid.UUID,
+	update presenceUpdate,
+	mode presencehistory.OperationMode,
+) (write presenceSettingsWrite, returnErr error) {
+	// Every later settings write first discharges older durable activity-policy
+	// cleanup, including Custom Status-only writes.
+	if _, err := h.resumePendingActivitySettingsCleanup(ctx, userID); err != nil {
+		return write, err
+	}
+	var writeErr error
+	for attempt := 0; attempt < activitySettingsCleanupResumeAttempts; attempt++ {
+		write, writeErr = h.writePresenceSettings(ctx, userID, update, mode)
+		if !errors.Is(writeErr, errActivitySettingsCleanupPending) {
+			break
+		}
+		if _, err := h.resumePendingActivitySettingsCleanup(ctx, userID); err != nil {
+			return write, err
+		}
+	}
+	if errors.Is(writeErr, errActivitySettingsCleanupPending) {
+		return write, &presenceWriterFailure{
+			status: 503, class: "activity_cleanup", cause: writeErr,
+		}
+	}
+	var cleanupErr error
+	if write.mainCommitConfirmed && update.affectsActivityPolicy() {
+		_, cleanupErr = h.resumePendingActivitySettingsCleanup(ctx, userID)
+	}
+	return write, errors.Join(writeErr, cleanupErr)
 }
 
 func (h *Handler) writePresenceSettings(
@@ -358,7 +472,10 @@ func (h *Handler) writePresenceSettings(
 		return result, &presenceWriterFailure{status: 500, class: "begin", cause: err}
 	}
 	if tx == nil {
-		return result, &presenceWriterFailure{status: 500, class: "begin", cause: errors.New("presence settings transaction missing")}
+		return result, &presenceWriterFailure{
+			status: 500, class: "begin",
+			cause: errors.New("presence settings transaction missing"),
+		}
 	}
 	defer tx.Rollback() //nolint:errcheck
 	defer h.joinPresenceWriterRollback(tx, &returnErr)
@@ -369,8 +486,66 @@ func (h *Handler) writePresenceSettings(
 	if err != nil {
 		return result, err
 	}
+	if err := ensureNoPendingActivitySettingsCleanup(ctx, tx, senderID); err != nil {
+		return result, err
+	}
+	response, err := updatePresenceSettingsRow(ctx, tx, senderID, update)
+	if err != nil {
+		return result, err
+	}
+	if err := recordActivitySettingsCleanup(
+		ctx, tx, senderID, update, operation, response,
+	); err != nil {
+		return result, err
+	}
+	after := presencehistory.CustomTextState{}
+	if response.CustomText != nil {
+		after.Text = *response.CustomText
+	}
+	if response.CustomTextEmoji != nil {
+		after.Emoji = *response.CustomTextEmoji
+	}
+	if err := h.presenceHistory.RecordCustomTextTransition(
+		ctx, tx, senderID, operation.Before, after,
+	); err != nil {
+		return result, &presenceWriterFailure{status: 500, class: "history", cause: err}
+	}
+	plan, err := preparePresenceSettingsPlan(ctx, tx, operation, response)
+	if err != nil {
+		return result, &presenceWriterFailure{status: 500, class: "prepare", cause: err}
+	}
+	result = presenceSettingsWrite{response: response, operation: operation, plan: plan}
+	result.mainCommitConfirmed, err = h.commitAndClaimPresenceWriterWithOutcome(ctx, tx, operation, plan)
+	if err != nil {
+		return result, err
+	}
+	return result, nil
+}
+func ensureNoPendingActivitySettingsCleanup(
+	ctx context.Context,
+	tx *sql.Tx,
+	senderID uuid.UUID,
+) error {
+	pending, err := activitySettingsCleanupPending(ctx, tx, senderID)
+	if err != nil {
+		return &presenceWriterFailure{
+			status: 503, class: "activity_cleanup", cause: err,
+		}
+	}
+	if pending {
+		return errActivitySettingsCleanupPending
+	}
+	return nil
+}
+
+func updatePresenceSettingsRow(
+	ctx context.Context,
+	tx *sql.Tx,
+	senderID uuid.UUID,
+	update presenceUpdate,
+) (presenceSettingsResponse, error) {
 	var response presenceSettingsResponse
-	err = tx.QueryRowContext(
+	err := tx.QueryRowContext(
 		ctx, updatePresenceSettingsQuery, senderID,
 		update.masterEnabled,
 		update.serverVoiceTier,
@@ -391,29 +566,41 @@ func (h *Handler) writePresenceSettings(
 		&response.CustomTextEmoji,
 	)
 	if err != nil {
-		return result, &presenceWriterFailure{status: 500, class: "update", cause: err}
+		return presenceSettingsResponse{}, &presenceWriterFailure{
+			status: 500, class: "update", cause: err,
+		}
 	}
-	after := presencehistory.CustomTextState{}
-	if response.CustomText != nil {
-		after.Text = *response.CustomText
+	return response, nil
+}
+
+func recordActivitySettingsCleanup(
+	ctx context.Context,
+	tx *sql.Tx,
+	senderID uuid.UUID,
+	update presenceUpdate,
+	operation presencehistory.AudienceOperation,
+	response presenceSettingsResponse,
+) error {
+	if !update.affectsActivityPolicy() {
+		return nil
 	}
-	if response.CustomTextEmoji != nil {
-		after.Emoji = *response.CustomTextEmoji
-	}
-	if err := h.presenceHistory.RecordCustomTextTransition(
-		ctx, tx, senderID, operation.Before, after,
-	); err != nil {
-		return result, &presenceWriterFailure{status: 500, class: "history", cause: err}
-	}
-	plan, err := preparePresenceSettingsPlan(ctx, tx, operation, response)
+	before, after, err := activityPolicyFromWrite(operation, response)
 	if err != nil {
-		return result, &presenceWriterFailure{status: 500, class: "prepare", cause: err}
+		return &presenceWriterFailure{
+			status: 500, class: "activity_cleanup", cause: err,
+		}
 	}
-	result = presenceSettingsWrite{response: response, operation: operation, plan: plan}
-	if err := h.commitAndClaimPresenceWriter(ctx, tx, operation, plan); err != nil {
-		return result, err
+	if before == after {
+		return nil
 	}
-	return result, nil
+	if err := insertActivitySettingsCleanup(
+		ctx, tx, senderID, operation.ID, before, after,
+	); err != nil {
+		return &presenceWriterFailure{
+			status: 503, class: "activity_cleanup", cause: err,
+		}
+	}
+	return nil
 }
 
 func preparePresenceSettingsPlan(
@@ -484,6 +671,16 @@ func (h *Handler) commitAndClaimPresenceWriter(
 	operation presencehistory.AudienceOperation,
 	plan presencehistory.DeliveryPlan,
 ) error {
+	_, err := h.commitAndClaimPresenceWriterWithOutcome(ctx, tx, operation, plan)
+	return err
+}
+
+func (h *Handler) commitAndClaimPresenceWriterWithOutcome(
+	ctx context.Context,
+	tx *sql.Tx,
+	operation presencehistory.AudienceOperation,
+	plan presencehistory.DeliveryPlan,
+) (bool, error) {
 	commitErr := h.presenceHistory.CommitTx(tx)
 	var confirmedCommitErr error
 	if commitErr != nil {
@@ -495,12 +692,12 @@ func (h *Handler) commitAndClaimPresenceWriter(
 		case presencehistory.CommitConfirmed:
 			confirmedCommitErr = commitErr
 		case presencehistory.RollbackConfirmed:
-			return &presenceWriterFailure{status: 500, class: "commit_rollback", cause: commitErr}
+			return false, &presenceWriterFailure{status: 500, class: "commit_rollback", cause: commitErr}
 		case presencehistory.WriteSuperseded:
-			return &presenceWriterFailure{status: 500, class: "commit_superseded", cause: commitErr}
+			return false, &presenceWriterFailure{status: 500, class: "commit_superseded", cause: commitErr}
 		default:
 			resetErr := h.presenceHistory.EmergencyReset(context.WithoutCancel(ctx), plan)
-			return &presenceWriterFailure{
+			return false, &presenceWriterFailure{
 				status: 500,
 				class:  "commit_unresolved",
 				cause:  errors.Join(commitErr, resetErr),
@@ -509,13 +706,13 @@ func (h *Handler) commitAndClaimPresenceWriter(
 	}
 	completion := h.presenceHistory.CompleteClaim(ctx, plan)
 	if completion.Err != nil {
-		return &presenceWriterFailure{
+		return true, &presenceWriterFailure{
 			status: 503,
 			class:  "delivery",
 			cause:  errors.Join(confirmedCommitErr, completion.Err),
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func (h *Handler) joinPresenceWriterRollback(tx *sql.Tx, returnErr *error) {

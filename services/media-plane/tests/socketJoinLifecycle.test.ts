@@ -1,12 +1,32 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   cleanupEmptyDMJoin,
+  DMJoinCallIdTracker,
   KeyedJoinFence,
+  reauthorizeDMAdmission,
   rollbackSocketRoomJoin,
   SocketRoomClaim,
   runSocketBoundJoin,
   withKeyedJoinFence,
 } from '../src/lib/socketJoinLifecycle.js';
+
+describe('DMJoinCallIdTracker', () => {
+  it('uses the requested call ID until authorization returns its canonical ID', () => {
+    const tracker = new DMJoinCallIdTracker('client-call');
+
+    expect(tracker.current()).toBe('client-call');
+    tracker.observe('server-call');
+    expect(tracker.current()).toBe('server-call');
+  });
+
+  it('retains the last server-authoritative ID when a later denial omits it', () => {
+    const tracker = new DMJoinCallIdTracker('client-call');
+
+    tracker.observe('server-call');
+    tracker.observe(undefined);
+    expect(tracker.current()).toBe('server-call');
+  });
+});
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -84,6 +104,72 @@ describe('runSocketBoundJoin', () => {
     expect(rollback).toHaveBeenCalledOnce();
   });
 
+  it('rolls back when DM access is revoked after room registration but before admission', async () => {
+    const initialAccess = { allowed: true, callId: 'call-a', serverMuted: false };
+    const revokedAccess = { allowed: false, callId: undefined, serverMuted: false };
+    const order: string[] = [];
+    const rollback = vi.fn(async (access: typeof initialAccess) => {
+      expect(access).toBe(initialAccess);
+      order.push('rollback');
+    });
+    const finalize = vi.fn(async () => {
+      order.push('finalize');
+    });
+
+    await expect(
+      runSocketBoundJoin({
+        authorize: async () => initialAccess,
+        isAllowed: (access) => access.allowed,
+        isConnected: () => true,
+        join: async () => {
+          order.push('join');
+          return { room: 'dm-1' };
+        },
+        reauthorize: async (access) => {
+          expect(access).toBe(initialAccess);
+          order.push('reauthorize');
+          return revokedAccess;
+        },
+        finalize,
+        rollback,
+      })
+    ).resolves.toEqual({ access: revokedAccess, status: 'revoked' });
+
+    expect(order).toEqual(['join', 'reauthorize', 'rollback']);
+    expect(finalize).not.toHaveBeenCalled();
+  });
+
+  it('finalizes admission from the revalidated moderation state', async () => {
+    const initialAccess = { allowed: true, serverMuted: false };
+    const refreshedAccess = { allowed: true, serverMuted: true };
+    const order: string[] = [];
+    const value = { room: 'dm-1' };
+
+    await expect(
+      runSocketBoundJoin({
+        authorize: async () => initialAccess,
+        isAllowed: (access) => access.allowed,
+        isConnected: () => true,
+        join: async () => {
+          order.push('join');
+          return value;
+        },
+        reauthorize: async () => {
+          order.push('reauthorize');
+          return refreshedAccess;
+        },
+        finalize: async (access, joined) => {
+          expect(access).toBe(refreshedAccess);
+          expect(joined).toBe(value);
+          order.push('finalize');
+        },
+        rollback: vi.fn(async () => undefined),
+      })
+    ).resolves.toEqual({ access: refreshedAccess, status: 'joined', value });
+
+    expect(order).toEqual(['join', 'reauthorize', 'finalize']);
+  });
+
   it('rejects when a canceled join cannot be rolled back', async () => {
     const failure = new Error('rollback failed');
     await expect(
@@ -97,6 +183,28 @@ describe('runSocketBoundJoin', () => {
         },
       })
     ).rejects.toBe(failure);
+  });
+});
+
+describe('reauthorizeDMAdmission', () => {
+  it('binds the second DM authorization to the exact call ID returned by the first', async () => {
+    const access = { allowed: true, callId: 'server-call' };
+    const authorize = vi.fn(async () => access);
+
+    await expect(reauthorizeDMAdmission('dm', access, 'client-call', authorize)).resolves.toBe(
+      access
+    );
+    expect(authorize).toHaveBeenCalledExactlyOnceWith('server-call');
+  });
+
+  it('does not duplicate channel authorization', async () => {
+    const access = { allowed: true, callId: 'channel-id' };
+    const authorize = vi.fn(async () => access);
+
+    await expect(reauthorizeDMAdmission('channel', access, undefined, authorize)).resolves.toBe(
+      access
+    );
+    expect(authorize).not.toHaveBeenCalled();
   });
 });
 

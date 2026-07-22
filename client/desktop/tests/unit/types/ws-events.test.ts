@@ -1322,6 +1322,46 @@ describe('EntitlementsChangedSchema', () => {
 // ────────────────────────────────────────────────────────────────────────
 
 describe('Rich Presence — custom_text', () => {
+  it.each([
+    {
+      category: 'server_voice',
+      payload: {
+        channel_id: UUID_A,
+        server_id: UUID_B,
+      },
+    },
+    {
+      category: 'private_call',
+      payload: { call_type: 'group' },
+    },
+  ])('accepts a minimized $category activity update', ({ category, payload }) => {
+    const result = WebSocketEventSchema.safeParse({
+      type: 'rich_presence_update',
+      data: {
+        user_id: UUID_A,
+        category,
+        minimized: true,
+        payload,
+        updated_at: 1,
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects a voice activity update with a Custom Status payload', () => {
+    const result = WebSocketEventSchema.safeParse({
+      type: 'rich_presence_update',
+      data: {
+        user_id: UUID_A,
+        category: 'server_voice',
+        minimized: true,
+        payload: { text: 'wrong category' },
+        updated_at: 1,
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
   it('accepts a valid rich_presence_update for custom_text', () => {
     const result = WebSocketEventSchema.safeParse({
       type: 'rich_presence_update',

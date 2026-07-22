@@ -472,9 +472,9 @@ erDiagram
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Auth / registration  | `pending_registrations` (000058)                                                                                                                                                                                                                                                                              |
 | MFA / recovery       | `user_mfa_totp`, `user_mfa_webauthn` (000029); `user_recovery_keys` (000043); `trusted_recovery_devices`, `recovery_requests` (000044); `recovery_circles`, `recovery_circle_shares`, `recovery_circle_requests`, `recovery_circle_responses` (000045)                                                        |
-| Profile / prefs      | `user_preferences` (000016); `privacy_settings` (000027); `username_history` (000046); `saved_gifs` (000055); `notification_preferences` (000063, polymorphic target); `user_presence_settings` (000074, eight Activity History fields added by 000087 and five category controls by 000089); `friend_organization` (000075); `presence_override_preferences`, `user_presence_overrides` (000084); `presence_settings_pending_operations` (000087) |
+| Profile / prefs      | `user_preferences` (000016); `privacy_settings` (000027); `username_history` (000046); `saved_gifs` (000055); `notification_preferences` (000063, polymorphic target); `user_presence_settings` (000074, eight Activity History fields added by 000087 and five category controls by 000089); `friend_organization` (000075); `presence_override_preferences`, `user_presence_overrides` (000084); `presence_settings_pending_operations` (000087); `activity_settings_pending_cleanups` (000098, durable Rich Presence policy-cleanup evidence) |
 | Activity history    | `presence_history` (000087, category-neutral self-owned interval ledger)                                                                                                                                                                                                                                     |
-| Voice                | `voice_participants` (000020); `dm_voice_participants` (000026)                                                                                                                                                                                                                                               |
+| Voice                | `voice_participants` (000020); `dm_voice_participants` (000026); both gain authoritative `lifecycle_event_at` watermarks in 000093                                                                                                                                                                              |
 | Media                | `media_files` (000042)                                                                                                                                                                                                                                                                                        |
 | Social / server-mgmt | `friend_codes` (000027); `server_invites` (000009); `ownership_transfers` (000047)                                                                                                                                                                                                                            |
 | Compliance           | `audit_log` (000035); `account_deletions` (000059)                                                                                                                                                                                                                                                            |
@@ -482,7 +482,7 @@ erDiagram
 | Admin console        | `admin_users`, `admin_webauthn_credentials`, `admin_audit_log` (000077) — sessions are Redis-backed (opaque sids), not a table                                                                                                                                                                                |
 | Operations metrics   | `ops_metric_samples`, `ops_metric_rollups` (000086) — opaque node ID, fixed key, timestamp, and scalar values only; `users.ops_last_active_at` private activity marker cleared beyond the 30-day window and catalog expansion (000091); restricted reader role (000088)                                                   |
 
-> Notable schema history: group-DM admin roles added `dm_participants.role` (`admin`/`member`) + `dm_conversations.icon_url` (000053); `dm_messages` gained a `call_event` type + `call_event_payload` JSONB (000064), and the transient `kind` column was dropped in favor of `type` (000065); `account_deletions.sentry_delete_attempted` was dropped (000060) when Sentry was removed; `key_revocations.revoked_by` was changed to `ON DELETE SET NULL` (000059) so account erasure isn't blocked.
+> Notable schema history: group-DM admin roles added `dm_participants.role` (`admin`/`member`) + `dm_conversations.icon_url` (000053); `dm_messages` gained a `call_event` type + `call_event_payload` JSONB (000064), and the transient `kind` column was dropped in favor of `type` (000065); `account_deletions.sentry_delete_attempted` was dropped (000060) when Sentry was removed; `key_revocations.revoked_by` was changed to `ON DELETE SET NULL` (000059) so account erasure isn't blocked; migrations 000093–000097 added, backfilled, validated, and enforced microsecond lifecycle watermarks on both active voice-participant tables; migration 000098 added one privacy-critical pending Rich Presence settings-cleanup marker per user.
 
 #### Admin auth surface (#1688)
 
@@ -644,11 +644,43 @@ erasing saved values. `server_voice_tier` defaults to 1 (Friends in the active
 server) and `server_voice_show_details` defaults to true. `private_call_tier`
 defaults to 0 (call participants only while the master gate is enabled) and
 `private_call_show_details` defaults to false. Both tiers accept 0..2. The four
-category-specific fields persist policy inputs for later Server Voice and
-Private Call runtime delivery; #2229 does not add category payload generation,
-fan-out, or detail minimization. The shipped Custom Status path immediately
-consumes `master_enabled` as its global gate. The migration adds no table,
+category-specific fields are policy inputs for #2231's authoritative Server
+Voice and Private Call production, minimized live delivery, and freshly
+authorized reconnect projection. The shipped Custom Status path also consumes
+`master_enabled` as its global gate. Migration 000089 itself adds no table,
 index, trigger, or speculative category columns.
+
+Server Voice and Private Call live WebSocket frames are enabled per device only
+when the authenticated `/api/v1/ws` upgrade has exactly one
+`activity_rich_presence=1` query value. The handler records the immutable flag
+before Hub registration and reconnect bootstrap; missing, malformed, or
+duplicate values fail closed. This preserves mixed-version sessions because
+released clients can accept an activity clear while misapplying it to Custom
+Status. The #2231 desktop advertises the value after adding category-specific
+live-update validation, but its handlers deliberately ignore Server Voice and
+Private Call updates/clears and its snapshot schema strips activity fields.
+Issue #2233 owns category state, snapshot replacement, resets, and rendering. Reconnect
+snapshot fields remain safe for legacy clients, whose schema strips them, and a capable client receives
+the snapshot before its buffered live tail because its capability is known
+before bootstrap starts.
+
+Migration 000098 adds `activity_settings_pending_cleanups`, one durable marker
+per user containing the exact versioned before/after policy bracket committed
+with a real activity-policy change. Successful suppression atomically replaces
+that bracket with a durable receipt; finalization deletes the receipt in a new
+transaction, so an ambiguous commit or retry cannot replay external suppression.
+Policy writers serialize on the canonical
+user/settings rows and recheck the marker in that transaction; cleanup
+resumptions hold a deterministic per-user advisory transaction lock around the
+marker row and suppression. A writer that waited behind a committed writer
+therefore sees its marker and routes through advisory-serialized resume. A
+confirmed commit whose exact suppression or affected-recipient disconnect fails
+returns 503 and keeps the marker; a same-value retry resumes that original
+obligation before applying another policy write. A retry that finds a suppression
+receipt skips suppression and only finalizes the exact operation; successor
+operation IDs fail closed. The destructive down migration takes an `ACCESS
+EXCLUSIVE` table lock before checking emptiness and refuses to drop pending
+privacy-repair evidence.
 
 ### Custom Status Recipient Exceptions
 
@@ -718,11 +750,45 @@ sequenceDiagram
 
 Audio is forwarded as-is (SFU, no transcoding) for low latency; frames are E2EE (see [Media E2EE](#media-e2ee-frame-encryption)). Redis holds crash-safe room membership (`voice:room:{channelId}` SET, `voice:user:{userId}` HASH, both 120s TTL).
 
+Voice join, leave, room-empty, and heartbeat publication uses
+`NatsService.nextVoiceLifecycleTimestamp()`: wall-clock microseconds when they
+advance, otherwise the previous published value plus one microsecond. The
+guarantee is strictly per media-plane process and prevents same-process events
+within one millisecond from collapsing to the same control-plane lifecycle
+version. It is not a distributed clock. The control plane qualifies competing
+replica/process events with exact 90-second sender/category lifecycle hashes,
+PostgreSQL advisory locks and persisted microsecond watermarks, bounded
+post-commit Server Voice result replay, and authoritative heartbeat repair.
+
+Channel Server Voice admission is hard-capped at 1,000 unique participants:
+the 1,000th is admitted, a new 1,001st is rejected, and an existing participant
+may reconnect at capacity. The control plane independently bounds both the
+media heartbeat set and each successfully read persisted participant set at
+1,000. For bounded inputs it clears stale rows before replacements and
+revalidates the post-clear union; its own work cannot create an over-cap state.
+Retries process missing rows first, then the oldest persisted lifecycle rows,
+using five context-aware workers over one contiguous priority queue above 255.
+Durable lifecycle work and deadline-aware WebSocket fanout precede the
+best-effort mute/deafen sweep; a dropped committed delta forces conservative
+Rich Presence reconnect. Permission batches coalesce by channel and drain in
+keyed-FIFO order so requeued work cannot starve another channel. Private Call's
+255-participant lifecycle bound and the 512-candidate Rich Presence reconnect
+snapshot bound remain independent.
+
 ### DM Voice Calls & Ringing
 
 DM 1:1 / group calls have a distinct **ring lifecycle** from server-channel voice. The control-plane `dm` package (`voicering.go`, `call_events.go`) drives ring → accept / decline / cancel / timeout over WebSocket + routes under `/api/v1/dm/conversations` (`…/voice/ring`, `…/voice/decline`, `…/voice/cancel`). Call outcomes are persisted as `dm_messages` rows with `type = 'call_event'` and a `call_event_payload` JSONB (migrations 000064–000065), so the call history renders inline in the DM timeline.
 
-For an accepted ring, the client supplies the current `ring_id` when it authorizes the DM voice join. The control-plane atomically promotes that ring into a shared Redis call lease and returns its authoritative `call_id`, which the client forwards to the media plane. A direct, non-ring `/voice/join` likewise reserves and returns a control-plane-generated call ID before room creation; until the media boundary authorizes or presence promotes it, an explicit ring may supersede and tombstone that short reservation so an abandoned join cannot block calls. The media-plane `/voice/authorize` boundary can only resolve a pre-existing lease and cannot create or refresh one. The media plane attaches a 30-second, domain-separated HMAC proof derived from the services' shared JWT key and bound to the HTTP method, conversation, call ID, and member token, so an ordinary member cannot mark or abort a phantom reservation by calling the route directly. Successful POST proof verification marks that exact handoff as admitted without extending its TTL, atomically preventing a competing ring during the authorize-to-`voice.joined` window. Authorization and admission remain socket-bound: one socket may own only one in-flight or admitted voice room, proof-bearing POST and DELETE hops are deadline-bounded, and a disconnect before/during admission rolls back only a participant still owned by that socket. If an unadmitted room is empty and no competing local admission remains, a DELETE-bound proof atomically tombstones only the exact short, ringless reservation, never an accepted ring, promoted call, or successor ID; after participant history is recorded, rollback follows the normal terminal lifecycle. Current media builds present the exact ID, while omission remains a verify-existing-only compatibility path for already released clients and must match that member's short-lived `/voice/join` admission. Media `voice.joined` and non-empty 30-second `voice.heartbeat` events renew the exact conversation/call lease for 90 seconds, so reconnect authorization remains correlated for long calls while dropped terminal events expire instead of blocking a conversation forever. The first admitted participant locks the room's call identity, ring, and caller metadata; the room retains participant history after individual leaves and briefly tombstones a terminal call ID so a delayed join cannot recreate it. When the final participant leaves, the media plane publishes a self-contained `voice.room_empty` terminal snapshot containing the call identity, participants, and timestamps. An exact empty heartbeat is treated as the same terminal reconciliation signal; it never renews the lease, and a missing or stale call ID fails closed without clearing replacement state. The control-plane atomically tombstones and clears only that exact lease, holds a short Redis cleanup guard across a deadline-bounded conversation-wide presence deletion so another replica cannot admit a replacement midway, and persists history idempotently under the call ID; a presence-derived heartbeat fallback uses `ON CONFLICT DO NOTHING`, while the later authoritative snapshot upgrades that row. A ring-backed room that never admitted a second participant is classified as `failed`; completed, missed, declined, and canceled calls retain their discrete outcomes. The media path itself reuses the same mediasoup SFU + bounded `dm_voice_participants` presence as channel voice.
+For an accepted ring, the client supplies the current `ring_id` when it authorizes the DM voice join. The control-plane atomically promotes that ring into a shared Redis call lease and returns its authoritative `call_id`, which the client forwards to the media plane. A direct, non-ring `/voice/join` likewise reserves and returns a control-plane-generated call ID before room creation; until the media boundary authorizes or presence promotes it, an explicit ring may supersede and tombstone that short reservation so an abandoned join cannot block calls. The media-plane `/voice/authorize` boundary can only resolve a pre-existing lease and cannot create or refresh one. DM admission provisionally registers the participant and repeats authorization with the first response's exact call ID before `socket.join` or acknowledgement, rolling back the exact provisional participant on membership denial or lease rotation. The media plane attaches a 30-second, domain-separated HMAC proof derived from the services' shared JWT key and bound to the HTTP method, conversation, call ID, and member token, so an ordinary member cannot mark or abort a phantom reservation by calling the route directly. Successful POST proof verification marks that exact handoff as admitted without extending its TTL, atomically preventing a competing ring during the authorize-to-`voice.joined` window. Authorization and admission remain socket-bound: one socket may own only one in-flight or admitted voice room, proof-bearing POST and DELETE hops are deadline-bounded, and a disconnect before/during admission rolls back only a participant still owned by that socket. If an unadmitted room is empty and no competing local admission remains, a DELETE-bound proof atomically tombstones only the exact short, ringless reservation, never an accepted ring, promoted call, or successor ID; after participant history is recorded, rollback follows the normal terminal lifecycle. Removing another group-DM member or self-leaving commits membership revocation first, then unconditionally publishes `voice.enforce.disconnect`; each successful DM heartbeat also retries disconnects for media-reported users who no longer remain members. Current media builds present the exact ID, while omission remains a verify-existing-only compatibility path for already released clients and must match that member's short-lived `/voice/join` admission. Media `voice.joined` and non-empty 30-second `voice.heartbeat` events renew the exact conversation/call lease for 90 seconds, so reconnect authorization remains correlated for long calls while dropped terminal events expire instead of blocking a conversation forever. The first admitted participant locks the room's call identity, ring, and caller metadata; the room retains participant history after individual leaves and briefly tombstones a terminal call ID so a delayed join cannot recreate it. When the final participant leaves, the media plane publishes a self-contained `voice.room_empty` terminal snapshot containing the call identity, participants, and timestamps. An exact empty heartbeat is treated as the same terminal reconciliation signal; it never renews the lease, and a missing or stale call ID fails closed without clearing replacement state. The control-plane atomically tombstones and clears only that exact lease, holds a short Redis cleanup guard across a deadline-bounded conversation-wide presence deletion so another replica cannot admit a replacement midway, and persists history idempotently under the call ID; a presence-derived heartbeat fallback uses `ON CONFLICT DO NOTHING`, while the later authoritative snapshot upgrades that row. A ring-backed room that never admitted a second participant is classified as `failed`; completed, missed, declined, and canceled calls retain their discrete outcomes. The media path itself reuses the same mediasoup SFU + bounded `dm_voice_participants` presence as channel voice.
+
+For Rich Presence production, the control plane narrows the lease-renewal rule:
+it first locks and verifies each proposed sender's current `dm_participants`
+membership, and only a non-empty accepted set may renew the exact lease. An
+all-nonmember heartbeat can verify an already-existing exact lease and remove
+watermark-qualified ghost rows, but cannot create or extend the lease. Every
+accepted Private Call participant-set mutation also advances one atomic exact
+lifecycle generation for all remaining affected senders, so a stale replica
+cannot publish a mixed pre/post roster.
 
 ### Server Mute / Deafen
 
@@ -761,7 +827,19 @@ Server channels (`channel_keys` / `key_revocations`) and DMs (`dm_channel_keys` 
 
 ### Account Erasure Cascade
 
-`POST /api/v1/privacy/erase-account` (the `privacy` package → `users.DeleteAccount`) runs a single transaction: `DELETE FROM users WHERE id = $1`. Every user-owned table FKs `users(id) ON DELETE CASCADE`, so refresh tokens, keys, memberships, messages, and DM data are removed atomically — strictly stronger than the soft-revoke in `ChangePassword` (no token residue). A NULL-`user_id` audit row is written to `account_deletions`.
+`POST /api/v1/privacy/erase-account` (the `privacy` package →
+`users.DeleteAccount`) first enters the shared sender gate and resumes any
+migration-000098 Rich Presence cleanup through suppression receipt and
+finalization. It then exact-deletes both supported activity keys and disconnects
+local Rich Presence clients so an already-delivered projection cannot survive
+the participant cascade. Only after all privacy cleanup succeeds does it start
+the account-erasure transaction and run `DELETE FROM users WHERE id = $1`. The
+cleanup-marker FK is `ON DELETE RESTRICT`, so a raced or failed obligation
+blocks deletion instead of being discarded.
+Other user-owned tables FK `users(id) ON DELETE CASCADE`, so refresh tokens,
+keys, memberships, messages, and DM data are removed atomically — strictly
+stronger than the soft-revoke in `ChangePassword` (no token residue). A
+NULL-`user_id` audit row is written to `account_deletions`.
 
 ### Runtime Client Configuration
 

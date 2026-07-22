@@ -101,6 +101,7 @@ func TestUpdatePresenceSettingsDBError(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.SetPresenceHistory(service)
+	bindNoopActivitySettingsSuppressor(h)
 
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()

@@ -58,6 +58,25 @@ describe('WebSocketService.handleMessage — dispatch validation', () => {
     expect(useConnectionStore.getState().wireViolationCount).toBe(0);
   });
 
+  it('voice rich-presence payload passes the dispatch schema boundary', () => {
+    const handler = vi.fn();
+    svc.on('rich_presence_update', handler);
+
+    fire({
+      type: 'rich_presence_update',
+      data: {
+        user_id: UUID_A,
+        category: 'server_voice',
+        minimized: true,
+        payload: { channel_id: UUID_A, server_id: UUID_B },
+        updated_at: 1,
+      },
+    });
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(useConnectionStore.getState().wireViolationCount).toBe(0);
+  });
+
   it('JSON.parse failure → log + drop, counter NOT incremented', () => {
     const handler = vi.fn();
     svc.on('message', handler);

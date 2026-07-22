@@ -109,7 +109,8 @@ func validServerVoiceInput(input ServerVoicePolicyInput) bool {
 	if !validPresenceName(input.Payload.ServerName) || !validPresenceName(input.Payload.ChannelName) {
 		return false
 	}
-	return input.Payload.StartedAt == nil || *input.Payload.StartedAt > 0
+	return input.Payload.StartedAt == nil ||
+		(*input.Payload.StartedAt > 0 && *input.Payload.StartedAt <= MaxActivityUnixSeconds)
 }
 
 func validPrivateCallInput(input PrivateCallPolicyInput) bool {
@@ -135,7 +136,8 @@ func validPrivateCallInput(input PrivateCallPolicyInput) bool {
 		}
 		seen[participantID] = struct{}{}
 	}
-	return input.Payload.StartedAt == nil || *input.Payload.StartedAt > 0
+	return input.Payload.StartedAt == nil ||
+		(*input.Payload.StartedAt > 0 && *input.Payload.StartedAt <= MaxActivityUnixSeconds)
 }
 
 func validPresenceName(name string) bool {
@@ -187,7 +189,7 @@ func AuthorizeAndMinimize(
 			return Decision{}, policyFailure(FailureMinimization, err)
 		}
 	}
-	return Decision{Audience: pending.audience, Payload: raw}, nil
+	return Decision{Audience: pending.audience, Payload: raw, Minimized: !pending.details}, nil
 }
 
 func preparePolicyDecision(

@@ -1,6 +1,7 @@
 package voice
 
 import (
+	"sort"
 	"testing"
 	"time"
 
@@ -22,12 +23,15 @@ func TestCompletedCallSummaryFromRoomEmpty(t *testing.T) {
 		ParticipantUserIDs: []string{callerID.String(), calleeID.String(), callerID.String()},
 		StartedAt:          startedAt,
 		Timestamp:          endedAt,
-	})
+	}, time.Date(2026, 7, 14, 12, 1, 30, 0, time.UTC))
 	require.NoError(t, err)
 	require.True(t, supplied)
 	assert.Equal(t, callID, summary.CallID)
 	assert.Equal(t, callerID, summary.CallerUserID)
-	assert.Equal(t, []uuid.UUID{callerID, calleeID}, summary.ParticipantUserIDs)
+	assert.ElementsMatch(t, []uuid.UUID{callerID, calleeID}, summary.ParticipantUserIDs)
+	assert.True(t, sort.SliceIsSorted(summary.ParticipantUserIDs, func(left, right int) bool {
+		return summary.ParticipantUserIDs[left].String() < summary.ParticipantUserIDs[right].String()
+	}))
 	assert.Equal(t, time.Minute+30*time.Second, summary.EndedAt.Sub(summary.StartedAt))
 }
 
@@ -35,7 +39,7 @@ func TestCompletedCallSummaryFromRoomEmpty_LegacyAndMalformed(t *testing.T) {
 	_, supplied, err := completedCallSummaryFromRoomEmpty(voiceRoomEmptyEvent{
 		ChannelID: "legacy-conversation",
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-	})
+	}, time.Now().UTC())
 	require.NoError(t, err)
 	assert.False(t, supplied)
 
@@ -44,7 +48,23 @@ func TestCompletedCallSummaryFromRoomEmpty_LegacyAndMalformed(t *testing.T) {
 		CallerUserID: uuid.New().String(),
 		StartedAt:    time.Now().UTC().Format(time.RFC3339),
 		Timestamp:    time.Now().UTC().Format(time.RFC3339),
-	})
+	}, time.Now().UTC())
 	require.Error(t, err)
 	assert.True(t, supplied)
+}
+
+func TestPrivateVoiceRejectedParticipantIDs(t *testing.T) {
+	accepted := uuid.New()
+	rejectedA := uuid.New()
+	rejectedB := uuid.New()
+
+	got := privateVoiceRejectedParticipantIDs(
+		[]uuid.UUID{rejectedB, accepted, rejectedA, rejectedB},
+		[]uuid.UUID{accepted},
+	)
+	require.Len(t, got, 2)
+	assert.ElementsMatch(t, []uuid.UUID{rejectedA, rejectedB}, got)
+	assert.True(t, sort.SliceIsSorted(got, func(left, right int) bool {
+		return got[left].String() < got[right].String()
+	}))
 }

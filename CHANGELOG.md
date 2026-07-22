@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.31] — 2026-07-22
+
+### Changed
+
+- **Privacy-safe voice activity groundwork** ([#2391](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2391)) — the server can now publish authorized Server Voice and Private Call activity, and the desktop safely validates the new wire format without displaying it yet. A later client update will add the visible experience.
+
 ## [0.2.30] — 2026-07-18
 
 ### Changed

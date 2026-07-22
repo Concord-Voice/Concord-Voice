@@ -28,8 +28,10 @@ var (
 	ErrCustomTextDeliveryPlan = errors.New("invalid custom status delivery plan")
 	// ErrCustomTextDeliveryMarshal identifies frame construction failures.
 	ErrCustomTextDeliveryMarshal = errors.New("custom status delivery marshal failed")
-	// ErrCustomTextDeliveryBroadcaster identifies queue or disconnect failures.
-	ErrCustomTextDeliveryBroadcaster = errors.New("custom status delivery broadcaster failed")
+	// ErrPrivacyCriticalDeliveryBroadcaster identifies queue or disconnect failures.
+	ErrPrivacyCriticalDeliveryBroadcaster = errors.New("privacy-critical delivery broadcaster failed")
+	// ErrCustomTextDeliveryBroadcaster preserves the original error identity for callers.
+	ErrCustomTextDeliveryBroadcaster = ErrPrivacyCriticalDeliveryBroadcaster
 )
 
 // CustomTextPayload is the wire payload for a custom-text rich-presence update.
@@ -97,12 +99,12 @@ func (h *Hub) deliverExactCustomText(
 	if plan.SenderID == uuid.Nil {
 		return fmt.Errorf("%w: exact delivery requires sender", ErrCustomTextDeliveryPlan)
 	}
-	if customTextRecipientCount(plan.UpdateRecipients) > 0 && plan.Payload == nil {
+	if privacyCriticalRecipientCount(plan.UpdateRecipients) > 0 && plan.Payload == nil {
 		return fmt.Errorf("%w: update recipients require payload", ErrCustomTextDeliveryPlan)
 	}
 
 	var clearData []byte
-	if customTextRecipientCount(plan.ClearRecipients) > 0 {
+	if privacyCriticalRecipientCount(plan.ClearRecipients) > 0 {
 		var err error
 		clearData, err = h.marshalCustomTextDeliveryFrame(plan.SenderID, nil)
 		if err != nil {
@@ -111,7 +113,7 @@ func (h *Hub) deliverExactCustomText(
 	}
 
 	var updateData []byte
-	if customTextRecipientCount(plan.UpdateRecipients) > 0 {
+	if privacyCriticalRecipientCount(plan.UpdateRecipients) > 0 {
 		payload := &CustomTextPayload{
 			Text:  plan.Payload.Text,
 			Emoji: plan.Payload.Emoji,
@@ -124,12 +126,12 @@ func (h *Hub) deliverExactCustomText(
 	}
 
 	if len(clearData) > 0 {
-		if err := h.deliverCustomTextToUsers(ctx, plan.ClearRecipients, clearData, disconnected); err != nil {
+		if err := h.deliverPrivacyCriticalToUsers(ctx, plan.ClearRecipients, clearData, disconnected); err != nil {
 			return err
 		}
 	}
 	if len(updateData) > 0 {
-		if err := h.deliverCustomTextToUsers(ctx, plan.UpdateRecipients, updateData, disconnected); err != nil {
+		if err := h.deliverPrivacyCriticalToUsers(ctx, plan.UpdateRecipients, updateData, disconnected); err != nil {
 			return err
 		}
 	}
@@ -142,9 +144,9 @@ func (h *Hub) deliverConservativeCustomText(
 	disconnected map[*Client]bool,
 ) error {
 	if plan.ClearRecipients == nil && plan.UpdateRecipients == nil {
-		return h.disconnectAllCustomTextClients(ctx)
+		return h.disconnectAllPrivacyCriticalClients(ctx)
 	}
-	recipients := customTextRecipientUnion(plan.ClearRecipients, plan.UpdateRecipients)
+	recipients := privacyCriticalRecipientUnion(plan.ClearRecipients, plan.UpdateRecipients)
 	if plan.SenderID == uuid.Nil && len(recipients) > 0 {
 		return fmt.Errorf("%w: prepared recipients require sender", ErrCustomTextDeliveryPlan)
 	}
@@ -155,7 +157,7 @@ func (h *Hub) deliverConservativeCustomText(
 	if err != nil {
 		return err
 	}
-	if err := h.deliverCustomTextToUsers(ctx, recipients, clearData, disconnected); err != nil {
+	if err := h.deliverPrivacyCriticalToUsers(ctx, recipients, clearData, disconnected); err != nil {
 		return err
 	}
 	return h.deliverCustomTextOverrideMetadata(ctx, plan, disconnected)
@@ -179,7 +181,7 @@ func (h *Hub) deliverCustomTextOverrideMetadata(
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrCustomTextDeliveryMarshal, err)
 	}
-	return h.deliverCustomTextToUsers(
+	return h.deliverPrivacyCriticalToUsers(
 		ctx,
 		map[uuid.UUID]bool{plan.SenderID: true},
 		data,
@@ -202,7 +204,7 @@ func (h *Hub) marshalCustomTextDeliveryFrame(
 	return data, nil
 }
 
-func customTextRecipientCount(recipients map[uuid.UUID]bool) int {
+func privacyCriticalRecipientCount(recipients map[uuid.UUID]bool) int {
 	count := 0
 	for _, included := range recipients {
 		if included {
@@ -212,7 +214,7 @@ func customTextRecipientCount(recipients map[uuid.UUID]bool) int {
 	return count
 }
 
-func customTextRecipientUnion(recipientSets ...map[uuid.UUID]bool) map[uuid.UUID]bool {
+func privacyCriticalRecipientUnion(recipientSets ...map[uuid.UUID]bool) map[uuid.UUID]bool {
 	union := make(map[uuid.UUID]bool)
 	for _, recipients := range recipientSets {
 		for userID, included := range recipients {
@@ -224,11 +226,21 @@ func customTextRecipientUnion(recipientSets ...map[uuid.UUID]bool) map[uuid.UUID
 	return union
 }
 
-func (h *Hub) deliverCustomTextToUsers(
+func (h *Hub) deliverPrivacyCriticalToUsers(
 	ctx context.Context,
 	recipients map[uuid.UUID]bool,
 	data []byte,
 	disconnected map[*Client]bool,
+) error {
+	return h.deliverPrivacyCriticalToUsersWhere(ctx, recipients, data, disconnected, nil)
+}
+
+func (h *Hub) deliverPrivacyCriticalToUsersWhere(
+	ctx context.Context,
+	recipients map[uuid.UUID]bool,
+	data []byte,
+	disconnected map[*Client]bool,
+	includeClient func(*Client) bool,
 ) error {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -236,25 +248,29 @@ func (h *Hub) deliverCustomTextToUsers(
 		if !included {
 			continue
 		}
-		if err := h.deliverCustomTextToUser(ctx, userID, data, disconnected); err != nil {
+		if err := h.deliverPrivacyCriticalToUser(
+			ctx, userID, data, disconnected, includeClient,
+		); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (h *Hub) deliverCustomTextToUser(
+func (h *Hub) deliverPrivacyCriticalToUser(
 	ctx context.Context,
 	userID uuid.UUID,
 	data []byte,
 	disconnected map[*Client]bool,
+	includeClient func(*Client) bool,
 ) error {
 	for clientID := range h.userClients[userID] {
 		client, connected := h.clients[clientID]
-		if !connected || disconnected[client] {
+		if !connected || disconnected[client] ||
+			(includeClient != nil && !includeClient(client)) {
 			continue
 		}
-		wasDisconnected, err := h.deliverCustomTextToClient(ctx, client, data)
+		wasDisconnected, err := h.deliverPrivacyCriticalToClient(ctx, client, data)
 		if err != nil {
 			return err
 		}
@@ -265,7 +281,7 @@ func (h *Hub) deliverCustomTextToUser(
 	return nil
 }
 
-func (h *Hub) deliverCustomTextToClient(
+func (h *Hub) deliverPrivacyCriticalToClient(
 	ctx context.Context,
 	client *Client,
 	data []byte,
@@ -276,28 +292,39 @@ func (h *Hub) deliverCustomTextToClient(
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	switch client.bufferBootstrapLive(data) {
+	case bootstrapBufferEnqueued:
+		return false, nil
+	case bootstrapBufferOverflow:
+		if err := h.disconnectPrivacyCriticalClient(client); err != nil {
+			return false, err
+		}
+		return true, nil
+	case bootstrapBufferCanceled:
+		return true, nil
+	case bootstrapBufferInactive:
+		// The replacement has completed; use normal immediate delivery.
+	}
 	if h.customTextDeliveryBroadcaster != nil {
 		if err := h.customTextDeliveryBroadcaster(ctx, client, data); err != nil {
-			return false, fmt.Errorf("%w: %w", ErrCustomTextDeliveryBroadcaster, err)
+			return false, fmt.Errorf("%w: %w", ErrPrivacyCriticalDeliveryBroadcaster, err)
 		}
 		return false, nil
 	}
-	select {
-	case client.Send <- data:
+	if client.enqueueOutbound(data) {
 		return false, nil
-	default:
 	}
-	if err := h.disconnectCustomTextClient(client); err != nil {
+	if err := h.disconnectPrivacyCriticalClient(client); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func (h *Hub) disconnectCustomTextClient(client *Client) error {
+func (h *Hub) disconnectPrivacyCriticalClient(client *Client) error {
 	disconnect := h.customTextClientDisconnect
 	if disconnect != nil {
 		if err := disconnect(client); err != nil {
-			return fmt.Errorf("%w: %w", ErrCustomTextDeliveryBroadcaster, err)
+			return fmt.Errorf("%w: %w", ErrPrivacyCriticalDeliveryBroadcaster, err)
 		}
 		return nil
 	}
@@ -305,23 +332,21 @@ func (h *Hub) disconnectCustomTextClient(client *Client) error {
 		return nil
 	}
 	if err := client.Conn.Close(); err != nil {
-		return fmt.Errorf("%w: %w", ErrCustomTextDeliveryBroadcaster, err)
+		return fmt.Errorf("%w: %w", ErrPrivacyCriticalDeliveryBroadcaster, err)
 	}
 	return nil
 }
 
-func (h *Hub) disconnectAllCustomTextClients(ctx context.Context) error {
+func (h *Hub) disconnectAllPrivacyCriticalClients(ctx context.Context) error {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	var disconnectErr error
 	for _, client := range h.clients {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := h.disconnectCustomTextClient(client); err != nil {
-			return err
+		if err := h.disconnectPrivacyCriticalClient(client); err != nil {
+			disconnectErr = errors.Join(disconnectErr, err)
 		}
 	}
-	return nil
+	return errors.Join(disconnectErr, ctx.Err())
 }
 
 // ClearCustomTextForPresenceAudience sends a privacy-critical clear only to the
@@ -382,10 +407,19 @@ const (
 )
 
 func enqueuePrivacyCritical(client *Client, data []byte) privacyCriticalEnqueueOutcome {
-	select {
-	case client.Send <- data:
+	switch client.bufferBootstrapLive(data) {
+	case bootstrapBufferEnqueued:
 		return privacyCriticalEnqueueSucceeded
-	default:
+	case bootstrapBufferOverflow:
+		closePrivacyCriticalClient(client)
+		return privacyCriticalEnqueueDisconnectRequired
+	case bootstrapBufferCanceled:
+		return privacyCriticalEnqueueDisconnectRequired
+	case bootstrapBufferInactive:
+		// The replacement has completed; use normal immediate delivery.
+	}
+	if client.enqueueOutbound(data) {
+		return privacyCriticalEnqueueSucceeded
 	}
 
 	// Never dequeue from the shared client queue. Other hub paths write to Send
@@ -443,57 +477,59 @@ func marshalCustomTextFrame(senderID uuid.UUID, payload *CustomTextPayload) ([]b
 //	  dm_friends_of_friends) U's friend-of-friend — NOT merely a shared-server peer.
 //	tier 2 (Servers): V also sees U as a shared-server peer.
 //
-// We resolve this by computing, for each candidate U, U's own custom-text
-// audience via presence.ComputeCustomTextAudience and including U only if V is in
-// it. The candidate set is bounded by a single query (users with custom text on),
-// so this is O(candidates) audience computations, not an N×M fan-out over all
-// users. Fail-closed per candidate: a candidate whose audience errors is skipped,
-// never optimistically included.
+// We resolve this with one viewer-correlated, bounded shortlist, then re-read
+// each candidate under its sender gate and run a single-viewer authorization
+// query. Final authorization returns one boolean rather than materializing U's
+// potentially unbounded audience. A candidate read/authorization failure aborts
+// the unpublished replacement so reconnect can retry; it is never optimistically
+// included.
 //
 // Called from the client's tracked async registration lifecycle, never the Hub
-// Run goroutine. Each candidate's final authorization read + enqueue holds the
-// local sender gate and a shared settings-row lock, so a stale snapshot update
-// cannot follow a newer committed delivery from this or another service.
-func (h *Hub) sendCustomTextSnapshot(ctx context.Context, client *Client) {
+// Run goroutine. The read-only transaction commits before its frame is appended
+// while the local sender gate remains held. A cross-process change that commits
+// after that read is delivered into the live buffer and therefore replays after
+// this committed snapshot frame.
+func (h *Hub) sendCustomTextSnapshot(ctx context.Context, client *Client) error {
 	if h.db == nil || h.presenceHistoryService == nil {
-		return // DB-free unit hub: nothing to snapshot, fail-safe
+		return nil // DB-free unit hub: nothing to snapshot, fail-safe
 	}
 
-	candidates, err := h.customTextCandidates(ctx)
+	candidates, err := h.customTextCandidates(ctx, client.UserID)
 	if err != nil {
 		h.logCustomTextSnapshotError(ctx, "candidate query", err)
-		return
+		return err
 	}
 	if h.customTextSnapshotAfterCandidates != nil {
 		h.customTextSnapshotAfterCandidates()
 	}
 
 	for _, senderID := range candidates {
-		if !h.sendCustomTextSnapshotForSender(ctx, client, senderID) {
-			return
+		if err := h.sendCustomTextSnapshotForSender(ctx, client, senderID); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
 func (h *Hub) sendCustomTextSnapshotForSender(
 	ctx context.Context,
 	client *Client,
 	senderID uuid.UUID,
-) bool {
+) error {
 	if ctx.Err() != nil {
-		return false
+		return ctx.Err()
 	}
 	if senderID == client.UserID {
-		return true // self is delivered via acknowledged writer self-sync, not the snapshot of others
+		return nil // self is delivered via acknowledged writer self-sync, not the snapshot of others
 	}
 	err := h.presenceHistoryService.WithSender(ctx, senderID, func() error {
 		return h.sendCustomTextSnapshotCandidate(ctx, client, senderID)
 	})
 	if err == nil {
-		return true
+		return nil
 	}
 	h.logCustomTextSnapshotError(ctx, "candidate", err)
-	return ctx.Err() == nil
+	return err
 }
 
 func (h *Hub) logCustomTextSnapshotError(ctx context.Context, operation string, err error) {
@@ -524,13 +560,10 @@ func (h *Hub) sendCustomTextSnapshotCandidate(
 	if !authorized {
 		return nil
 	}
-	if err := h.enqueueCustomTextSnapshot(ctx, client, senderID, payload); err != nil {
-		return err
-	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit Custom Status snapshot transaction: %w", err)
 	}
-	return nil
+	return h.enqueueCustomTextSnapshot(ctx, client, senderID, payload)
 }
 
 func mergeCustomTextSnapshotRollback(tx *sql.Tx, returnErr *error) {
@@ -578,15 +611,70 @@ func (h *Hub) readCustomTextSnapshotCandidate(
 	if h.customTextSnapshotAfterStateRead != nil {
 		h.customTextSnapshotAfterStateRead(senderID, viewerID)
 	}
-	if tier <= 0 || !text.Valid || text.String == "" {
+	if (tier != 1 && tier != 2) || !text.Valid || text.String == "" || senderID == viewerID {
 		return nil, false, nil
 	}
 
-	audience, audErr := presence.ComputeCustomTextAudience(ctx, tx, senderID)
+	var authorized bool
+	audErr := tx.QueryRowContext(ctx, `
+		SELECT NOT EXISTS (
+		         SELECT 1
+		         FROM user_presence_overrides excluded
+		         WHERE excluded.sender_id = $1
+		           AND excluded.category = 'custom_text'
+		           AND excluded.target_user_id = $2
+		       )
+		       AND (
+		         EXISTS (
+		           SELECT 1
+		           FROM friendships direct
+		           WHERE direct.status = 'accepted'
+		             AND (
+		               (direct.requester_id = $1 AND direct.addressee_id = $2)
+		               OR (direct.addressee_id = $1 AND direct.requester_id = $2)
+		             )
+		         )
+		         OR EXISTS (
+		           SELECT 1
+		           FROM privacy_settings sender_privacy
+		           JOIN friendships sender_friend
+		             ON sender_friend.status = 'accepted'
+		            AND (sender_friend.requester_id = $1 OR sender_friend.addressee_id = $1)
+		           WHERE sender_privacy.user_id = $1
+		             AND sender_privacy.dm_friends_of_friends
+		             AND EXISTS (
+		               SELECT 1
+		               FROM friendships friend_viewer
+		               WHERE friend_viewer.status = 'accepted'
+		                 AND (
+		                   (friend_viewer.requester_id = CASE
+		                      WHEN sender_friend.requester_id = $1
+		                      THEN sender_friend.addressee_id
+		                      ELSE sender_friend.requester_id END
+		                    AND friend_viewer.addressee_id = $2)
+		                   OR
+		                   (friend_viewer.addressee_id = CASE
+		                      WHEN sender_friend.requester_id = $1
+		                      THEN sender_friend.addressee_id
+		                      ELSE sender_friend.requester_id END
+		                    AND friend_viewer.requester_id = $2)
+		                 )
+		             )
+		         )
+		         OR ($3 = 2 AND EXISTS (
+		           SELECT 1
+		           FROM server_members sender_member
+		           JOIN server_members viewer_member
+		             ON viewer_member.server_id = sender_member.server_id
+		            AND viewer_member.user_id = $2
+		           WHERE sender_member.user_id = $1
+		         ))
+		       )
+	`, senderID, viewerID, tier).Scan(&authorized)
 	if audErr != nil {
 		return nil, false, fmt.Errorf("authorize Custom Status snapshot: %w", audErr)
 	}
-	if !audience[viewerID] {
+	if !authorized {
 		return nil, false, nil // viewer is NOT in this user's custom-text audience — exclude (privacy lock)
 	}
 
@@ -617,33 +705,112 @@ func (h *Hub) enqueueCustomTextSnapshot(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	select {
-	case client.Send <- data:
-	default:
+	if err := client.appendBootstrapReplay(data); err == nil {
+		return nil
+	} else if !errors.Is(err, errClientBootstrapInactive) {
+		if errors.Is(err, errClientBootstrapOverflow) {
+			if disconnectErr := h.disconnectPrivacyCriticalClient(client); disconnectErr != nil {
+				return errors.Join(err, disconnectErr)
+			}
+		}
+		return err
 	}
-	return nil
+	if client.enqueueOutbound(data) {
+		return nil
+	}
+	if err := h.disconnectPrivacyCriticalClient(client); err != nil {
+		return errors.Join(errClientBootstrapOverflow, err)
+	}
+	return errClientBootstrapOverflow
 }
 
-// customTextCandidates returns every user with custom text set AND tier > 0 —
-// the bounded sender-ID shortlist whose status MIGHT be visible to a connecting
-// viewer. The current tier, text, and emoji are deliberately re-read inside the
-// per-sender delivery coordinator before authorization and enqueue; the outer
-// query never captures a payload that could become stale while waiting.
+// customTextCandidates returns the bounded inverse-audience shortlist for one
+// connecting viewer. The current payload and authorization are deliberately
+// re-read inside the per-sender delivery coordinator before enqueue.
 func (h *Hub) customTextCandidates(
 	ctx context.Context,
+	viewerID uuid.UUID,
 ) (out []uuid.UUID, returnErr error) {
 	rows, err := h.db.QueryContext(ctx, `
 		SELECT settings.user_id
 		FROM user_presence_settings AS settings
-		WHERE settings.master_enabled
+		WHERE settings.user_id <> $1
+		  AND settings.master_enabled
 		  AND settings.custom_text_tier > 0
 		  AND settings.custom_text IS NOT NULL
+		  AND settings.custom_text <> ''
 		  AND NOT EXISTS (
 		      SELECT 1
 		      FROM presence_settings_pending_operations AS pending
 		      WHERE pending.user_id = settings.user_id
 		  )
-	`)
+		  AND NOT EXISTS (
+		      SELECT 1
+		      FROM user_presence_overrides AS excluded
+		      WHERE excluded.sender_id = settings.user_id
+		        AND excluded.category = 'custom_text'
+		        AND excluded.target_user_id = $1
+		  )
+		  AND (
+		      EXISTS (
+		          SELECT 1 FROM friendships direct
+		          WHERE direct.status = 'accepted'
+		            AND (
+		                (direct.requester_id = settings.user_id AND direct.addressee_id = $1)
+		                OR
+		                (direct.addressee_id = settings.user_id AND direct.requester_id = $1)
+		            )
+		      )
+		      OR EXISTS (
+		          SELECT 1
+		          FROM privacy_settings sender_privacy
+		          JOIN friendships sender_friend
+		            ON sender_friend.status = 'accepted'
+		           AND (
+		               sender_friend.requester_id = settings.user_id
+		               OR sender_friend.addressee_id = settings.user_id
+		           )
+		          WHERE sender_privacy.user_id = settings.user_id
+		            AND sender_privacy.dm_friends_of_friends
+		            AND EXISTS (
+		                SELECT 1
+		                FROM friendships friend_viewer
+		                WHERE friend_viewer.status = 'accepted'
+		                  AND (
+		                      (
+		                          friend_viewer.requester_id = CASE
+		                              WHEN sender_friend.requester_id = settings.user_id
+		                              THEN sender_friend.addressee_id
+		                              ELSE sender_friend.requester_id
+		                          END
+		                          AND friend_viewer.addressee_id = $1
+		                      )
+		                      OR (
+		                          friend_viewer.addressee_id = CASE
+		                              WHEN sender_friend.requester_id = settings.user_id
+		                              THEN sender_friend.addressee_id
+		                              ELSE sender_friend.requester_id
+		                          END
+		                          AND friend_viewer.requester_id = $1
+		                      )
+		                  )
+		            )
+		      )
+		      OR (
+		          settings.custom_text_tier = 2
+		          AND EXISTS (
+		              SELECT 1
+		              FROM server_members sender_member
+		              JOIN server_members viewer_member
+		                ON viewer_member.server_id = sender_member.server_id
+		               AND viewer_member.user_id = $1
+		              WHERE sender_member.user_id = settings.user_id
+		          )
+		      )
+		  )
+		ORDER BY settings.user_id
+		LIMIT $2
+	`, viewerID, clientBootstrapBufferedFrameLimit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -662,6 +829,9 @@ func (h *Hub) customTextCandidates(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if len(out) > clientBootstrapBufferedFrameLimit {
+		return nil, errClientBootstrapOverflow
 	}
 	return out, nil
 }

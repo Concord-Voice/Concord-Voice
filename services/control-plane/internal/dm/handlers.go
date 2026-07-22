@@ -1103,6 +1103,13 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		return
 	}
 
+	// Membership revocation is also an immediate media-plane revocation. Publish
+	// unconditionally after the transaction commits: the media plane may have
+	// provisionally registered the peer before its voice-presence row exists.
+	h.dmPublishEnforcementUnconditionally(
+		convID, targetUserID, "voice.enforce.disconnect", "disconnect",
+	)
+
 	// Broadcast events
 	h.broadcastMemberRemoved(convID, targetUserID, userID, isSelfLeave, newCreatorID, maxVersion)
 
@@ -2411,14 +2418,31 @@ func (h *Handler) dmIsTargetInVoice(convID, targetID string) bool {
 	return inVoice
 }
 
-// dmPublishEnforcement publishes a NATS enforcement message if the target is in DM voice.
+// dmPublishEnforcement publishes a NATS enforcement message if the target has
+// an active DM voice-presence row. Hard mute/deafen transitions use this guard;
+// membership removal uses the unconditional variant to close registration races.
 func (h *Handler) dmPublishEnforcement(convID, targetID, subject, action string) {
-	if h.dmIsTargetInVoice(convID, targetID) && h.nats != nil {
-		if err := h.nats.Publish(subject, map[string]interface{}{
-			"channelId": convID, "userId": targetID, "action": action,
-		}); err != nil {
-			h.log.Error("Failed to publish DM enforcement", "error", err, "subject", subject, "action", action, "conversation_id", convID, "target_id", targetID)
-		}
+	if !h.dmIsTargetInVoice(convID, targetID) {
+		return
+	}
+	h.dmPublishEnforcementUnconditionally(convID, targetID, subject, action)
+}
+
+func (h *Handler) dmPublishEnforcementUnconditionally(
+	convID, targetID, subject, action string,
+) {
+	if h.nats == nil {
+		return
+	}
+	if err := h.nats.Publish(subject, map[string]interface{}{
+		"channelId": convID, "userId": targetID, "action": action,
+	}); err != nil {
+		// Keep logs free of user-controlled conversation/member identifiers and
+		// broker error strings; the fixed subject/action classify the failed path.
+		h.log.Error("Failed to publish DM enforcement",
+			"failure_class", "delivery",
+			"subject", subject,
+			"action", action)
 	}
 }
 
@@ -2773,13 +2797,14 @@ func (h *Handler) ensureDMVoiceRingAvailable(c *gin.Context, convUUID uuid.UUID,
 		return false
 	}
 
-	// Presence is a bounded compatibility fence, not durable liveness. New
-	// heartbeats refresh joined_at; rows older than the lease window are stale
+	// Presence is a bounded compatibility fence, not durable liveness. Lifecycle
+	// events advance lifecycle_event_at while joined_at remains the stable call
+	// start; rows whose lifecycle watermark ages past the lease window are stale
 	// after a dropped terminal event and must not block future calls forever.
 	if _, err := h.db.Exec(`
 		DELETE FROM dm_voice_participants
 		WHERE conversation_id = $1
-		  AND joined_at < NOW() - ($2 * INTERVAL '1 second')
+		  AND lifecycle_event_at < NOW() - ($2 * INTERVAL '1 second')
 	`, convUUID, int(DMVoiceCallLeaseTTL.Seconds())); err != nil {
 		h.log.Error("Failed to expire stale DM voice presence", "error", err,
 			"conversation_id", sanitizeLogValue(convID))
@@ -3212,10 +3237,12 @@ func (h *Handler) CancelDMCall(c *gin.Context) {
 }
 
 type dmVoiceAuthorizeIdentity struct {
-	isGroup     bool
-	username    string
-	displayName sql.NullString
-	avatarURL   sql.NullString
+	isGroup        bool
+	serverMuted    bool
+	serverDeafened bool
+	username       string
+	displayName    sql.NullString
+	avatarURL      sql.NullString
 }
 
 func parseDMVoiceAuthorizeCallID(c *gin.Context) (uuid.UUID, bool) {
@@ -3246,13 +3273,16 @@ func (h *Handler) loadDMVoiceAuthorizeIdentity(
 ) (dmVoiceAuthorizeIdentity, bool) {
 	var identity dmVoiceAuthorizeIdentity
 	err := h.db.QueryRow(`
-		SELECT dc.is_group, u.username, u.display_name, u.avatar_url
+		SELECT dc.is_group, dp.server_muted, dp.server_deafened,
+		       u.username, u.display_name, u.avatar_url
 		FROM dm_conversations dc
 		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
 		JOIN users u ON u.id = dp.user_id
 		WHERE dc.id = $1
 	`, convID, userID).Scan(
 		&identity.isGroup,
+		&identity.serverMuted,
+		&identity.serverDeafened,
 		&identity.username,
 		&identity.displayName,
 		&identity.avatarURL,
@@ -3399,6 +3429,8 @@ func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 	response := gin.H{
 		"authorized":         true,
 		"is_group":           identity.isGroup,
+		"server_muted":       identity.serverMuted,
+		"server_deafened":    identity.serverDeafened,
 		"media_entitlements": mediaEnt,
 		// CV-CAN-017: server-authoritative display identity (see query above).
 		"username":     identity.username,

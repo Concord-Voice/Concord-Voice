@@ -22,7 +22,11 @@ func newCustomTextDeliveryHub() *Hub {
 }
 
 func customTextDeliveryClient(hub *Hub, userID uuid.UUID, capacity int) *Client {
+	existing := hub.userClients[userID]
 	client := connectClient(hub, userID)
+	for clientID := range existing {
+		hub.userClients[userID][clientID] = true
+	}
 	client.Send = make(chan []byte, capacity)
 	return client
 }

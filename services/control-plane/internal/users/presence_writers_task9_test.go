@@ -98,6 +98,7 @@ func TestUpdatePresenceSettingsCompletesPostCommitClaimAfterRequestCancellation(
 			require.NoError(t, service.BindDelivery(delivery))
 			h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
 			h.SetPresenceHistory(service)
+			bindNoopActivitySettingsSuppressor(h)
 
 			requestCtx, cancelRequest := context.WithCancel(context.Background())
 			restore := service.SetTransactionTestHooks(presencehistory.TransactionTestHooks{
@@ -141,6 +142,7 @@ func TestUpdatePresenceSettingsClaimBeginFailureRunsConservativeResetAndRetainsQ
 	require.NoError(t, service.BindDelivery(delivery))
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
 	h.SetPresenceHistory(service)
+	bindNoopActivitySettingsSuppressor(h)
 	claimBeginCause := errors.New("claim transaction unavailable")
 	beginCalls := 0
 	restore := service.SetTransactionTestHooks(presencehistory.TransactionTestHooks{
@@ -210,6 +212,7 @@ func newTask9Handler(
 	}, true)
 	require.NoError(t, service.BindDelivery(delivery))
 	h.SetPresenceHistory(service)
+	bindNoopActivitySettingsSuppressor(h)
 	return h
 }
 
@@ -234,6 +237,7 @@ func TestUpdatePresenceSettingsRequiresBoundPresenceHistory(t *testing.T) {
 			db, _ := testhelpers.SetupTestDB(t)
 			senderID := testhelpers.CreateUser(t, db)
 			h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+			bindNoopActivitySettingsSuppressor(h)
 			if test.bind != nil {
 				test.bind(h, db)
 			}
@@ -546,6 +550,7 @@ func TestUpdatePresenceSettings_MasterOffSupersedesUnexpiredOrdinaryPendingConse
 	require.NoError(t, service.CommitTx(ordinaryTx))
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
 	h.SetPresenceHistory(service)
+	bindNoopActivitySettingsSuppressor(h)
 
 	w := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{"master_enabled": false})
 
@@ -598,6 +603,7 @@ func TestUpdatePresenceSettings_MasterOffSupersedesEligiblePendingWhenDeliveryFa
 	require.NoError(t, service.BindDelivery(delivery))
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
 	h.SetPresenceHistory(service)
+	bindNoopActivitySettingsSuppressor(h)
 
 	w := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{"master_enabled": false})
 
@@ -655,6 +661,7 @@ func TestUpdatePresenceSettings_MasterOffDeliveryFailureReturns503AndRetainsQuar
 	require.NoError(t, service.BindDelivery(delivery))
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
 	h.SetPresenceHistory(service)
+	bindNoopActivitySettingsSuppressor(h)
 
 	w := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{"master_enabled": false})
 
@@ -745,6 +752,7 @@ func TestUpdatePresenceSettingsRecorderFailureRollsBackSettingsMarkerAndHistory(
 	t.Cleanup(restore)
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
 	h.SetPresenceHistory(service)
+	bindNoopActivitySettingsSuppressor(h)
 
 	response := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
 		"custom_text_tier": 1,
@@ -772,6 +780,7 @@ func TestUpdatePresenceSettingsMainCommitClassification(t *testing.T) {
 		db, _ := testhelpers.SetupTestDB(t)
 		senderID := testhelpers.CreateUser(t, db)
 		delivery := &task9Delivery{}
+		suppressor := &recordingActivitySettingsSuppressor{}
 		service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 		require.NoError(t, service.BindDelivery(delivery))
 		commitCalls := 0
@@ -788,18 +797,23 @@ func TestUpdatePresenceSettingsMainCommitClassification(t *testing.T) {
 		t.Cleanup(restore)
 		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
 		h.SetPresenceHistory(service)
+		h.SetActivitySettingsSuppressor(suppressor)
 		response := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
-			"custom_text_tier": 1,
-			"custom_text":      "committed",
+			"server_voice_show_details": false,
+			"custom_text_tier":          1,
+			"custom_text":               "committed",
 		})
 		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 		require.Len(t, delivery.snapshot(), 1)
+		require.Len(t, suppressor.snapshot(), 1,
+			"an ambiguously returned but durably confirmed commit must run cleanup")
 	})
 
 	t.Run("confirmed rollback sends no frame or success", func(t *testing.T) {
 		db, _ := testhelpers.SetupTestDB(t)
 		senderID := testhelpers.CreateUser(t, db)
 		delivery := &task9Delivery{}
+		suppressor := &recordingActivitySettingsSuppressor{}
 		service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 		require.NoError(t, service.BindDelivery(delivery))
 		restore := service.SetTransactionTestHooks(presencehistory.TransactionTestHooks{
@@ -808,18 +822,22 @@ func TestUpdatePresenceSettingsMainCommitClassification(t *testing.T) {
 		t.Cleanup(restore)
 		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
 		h.SetPresenceHistory(service)
+		h.SetActivitySettingsSuppressor(suppressor)
 		response := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
-			"custom_text_tier": 1,
-			"custom_text":      "rolled back",
+			"server_voice_show_details": false,
+			"custom_text_tier":          1,
+			"custom_text":               "rolled back",
 		})
 		assert.Equal(t, http.StatusInternalServerError, response.Code)
 		assert.Empty(t, delivery.snapshot())
+		assert.Empty(t, suppressor.snapshot())
 	})
 
 	t.Run("superseded write sends no frame or success", func(t *testing.T) {
 		db, _ := testhelpers.SetupTestDB(t)
 		senderID := testhelpers.CreateUser(t, db)
 		delivery := &task9Delivery{}
+		suppressor := &recordingActivitySettingsSuppressor{}
 		service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 		require.NoError(t, service.BindDelivery(delivery))
 		laterOperationID := uuid.New()
@@ -838,12 +856,15 @@ func TestUpdatePresenceSettingsMainCommitClassification(t *testing.T) {
 		t.Cleanup(restore)
 		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
 		h.SetPresenceHistory(service)
+		h.SetActivitySettingsSuppressor(suppressor)
 		response := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
-			"custom_text_tier": 1,
-			"custom_text":      "stale write",
+			"server_voice_show_details": false,
+			"custom_text_tier":          1,
+			"custom_text":               "stale write",
 		})
 		assert.Equal(t, http.StatusInternalServerError, response.Code)
 		assert.Empty(t, delivery.snapshot())
+		assert.Empty(t, suppressor.snapshot())
 		var durableOperationID uuid.UUID
 		require.NoError(t, db.QueryRow(
 			`SELECT presence_settings_operation_id FROM user_presence_settings WHERE user_id = $1`, senderID,
@@ -874,6 +895,7 @@ func TestUpdatePresenceSettingsUnexpiredPendingReturnsRetryAfterWithoutMutation(
 	require.NoError(t, service.BindDelivery(delivery))
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
 	h.SetPresenceHistory(service)
+	bindNoopActivitySettingsSuppressor(h)
 
 	response := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
 		"custom_text": "must wait",
@@ -917,6 +939,7 @@ func TestUpdatePresenceSettingsUnresolvedCommitRunsMarkerPreservingEmergencyRese
 	db, _ := testhelpers.SetupTestDB(t)
 	senderID := testhelpers.CreateUser(t, db)
 	delivery := &task9Delivery{}
+	suppressor := &recordingActivitySettingsSuppressor{}
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(delivery))
 	commitCalls := 0
@@ -937,15 +960,18 @@ func TestUpdatePresenceSettingsUnresolvedCommitRunsMarkerPreservingEmergencyRese
 	t.Cleanup(restore)
 	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
 	h.SetPresenceHistory(service)
+	h.SetActivitySettingsSuppressor(suppressor)
 
 	response := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
-		"custom_text_tier": 1,
-		"custom_text":      "uncertain",
+		"server_voice_show_details": false,
+		"custom_text_tier":          1,
+		"custom_text":               "uncertain",
 	})
 	assert.Equal(t, http.StatusInternalServerError, response.Code)
 	plans := delivery.snapshot()
 	require.Len(t, plans, 1)
 	assert.Equal(t, presencehistory.DeliveryConservativeReset, plans[0].Mode)
+	assert.Empty(t, suppressor.snapshot())
 }
 
 func TestPresenceSettingsDirectErrorBoundaries(t *testing.T) {

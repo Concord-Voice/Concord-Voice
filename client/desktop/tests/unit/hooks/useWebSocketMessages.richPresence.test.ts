@@ -137,6 +137,33 @@ describe('useWebSocketMessages — rich presence (#1233)', () => {
     }
   });
 
+  it('voice-category updates and clears never mutate Custom Status', () => {
+    const ws = createMockWsService();
+    renderHook(() => useWebSocketMessages(ws as never));
+    useRichPresenceStore.getState().setCustomText('user-2', { text: 'keep me' });
+
+    act(() => {
+      ws.handlers.get('rich_presence_update')?.({
+        type: 'rich_presence_update',
+        data: {
+          user_id: 'user-2',
+          category: 'server_voice',
+          payload: {
+            channel_id: '11111111-1111-4111-8111-111111111111',
+            server_id: '22222222-2222-4222-8222-222222222222',
+          },
+          updated_at: 1_700_000_000,
+        },
+      });
+      ws.handlers.get('rich_presence_clear')?.({
+        type: 'rich_presence_clear',
+        data: { user_id: 'user-2', category: 'private_call' },
+      });
+    });
+
+    expect(useRichPresenceStore.getState().getCustomText('user-2')).toEqual({ text: 'keep me' });
+  });
+
   it('treats a fresh presence snapshot as the boundary for other users custom text', () => {
     const ws = createMockWsService();
     renderHook(() => useWebSocketMessages(ws as never));

@@ -33,7 +33,9 @@ import {
 import { handleSetTestingStatus } from './lib/setTestingStatus.js';
 import {
   cleanupEmptyDMJoin,
+  DMJoinCallIdTracker,
   KeyedJoinFence,
+  reauthorizeDMAdmission,
   rollbackSocketRoomJoin,
   SocketRoomClaim,
   runSocketBoundJoin,
@@ -153,6 +155,7 @@ function registerJoinRoomHandler(
         socket.handshake.auth.room_kind === 'dm' ? 'dm' : 'channel';
       const token = socket.handshake.auth.token;
       const inputCallId = typeof callId === 'string' ? callId : undefined;
+      const dmCallId = new DMJoinCallIdTracker(inputCallId);
       const cleanupDMJoin = async (authorizedCallId?: string) => {
         if (roomKind !== 'dm') return;
         const room = roomManager.getRoom(roomId);
@@ -167,10 +170,28 @@ function registerJoinRoomHandler(
             : undefined,
         });
       };
+      const cleanupDMJoinSafely = async (message: string) => {
+        try {
+          await cleanupDMJoin(dmCallId.current());
+        } catch (error) {
+          logger.error(message, { error, roomId });
+        }
+      };
+      const authorizeRoom = async (requestedCallId?: string) => {
+        const access = await validateChannelAccess(
+          data.userId,
+          roomId,
+          token,
+          roomKind,
+          requestedCallId
+        );
+        if (roomKind === 'dm') dmCallId.observe(access.callId);
+        return access;
+      };
       const executeJoin = async () => {
         try {
           if (!socket.connected) {
-            await cleanupDMJoin(inputCallId);
+            await cleanupDMJoin(dmCallId.current());
             return;
           }
           const parsedMediaFrameCryptoVersion =
@@ -179,7 +200,7 @@ function registerJoinRoomHandler(
           // authorizes the JWT-derived user before any room mutation.
 
           const outcome = await runSocketBoundJoin({
-            authorize: () => validateChannelAccess(data.userId, roomId, token, roomKind, callId),
+            authorize: () => authorizeRoom(inputCallId),
             isAllowed: (access) => access.allowed,
             isConnected: () => socket.connected,
             join: async (access) => {
@@ -220,6 +241,16 @@ function registerJoinRoomHandler(
                 }
               );
 
+              return { identity, result };
+            },
+            // DM membership can change while the asynchronous RoomManager
+            // registration is in flight. Re-read the exact server-issued call
+            // ID after registration and before any socket.join/ack.
+            reauthorize: (access) =>
+              reauthorizeDMAdmission(roomKind, access, inputCallId, authorizeRoom),
+            finalize: async (access) => {
+              // The second authorization is authoritative for both channel and
+              // Private Call moderator state. Apply it before socket.join/ack.
               if (access.serverMuted) {
                 await roomManager.serverMuteUser(roomId, data.userId);
                 logger.info('Applied server-mute enforcement on join', {
@@ -234,7 +265,6 @@ function registerJoinRoomHandler(
                   userId: data.userId,
                 });
               }
-              return { identity, result };
             },
             rollback: (access) =>
               rollbackRegisteredRoomJoin({
@@ -248,11 +278,9 @@ function registerJoinRoomHandler(
               }),
           });
 
-          if (outcome.status === 'denied') {
-            try {
-              await cleanupDMJoin(inputCallId);
-            } catch (error) {
-              logger.error('Failed to clean up a queued DM room join', { error, roomId });
+          if (outcome.status === 'denied' || outcome.status === 'revoked') {
+            if (outcome.status === 'denied') {
+              await cleanupDMJoinSafely('Failed to clean up a queued DM room join');
             }
             logger.warn('Channel access denied', {
               userId: data.userId,
@@ -324,14 +352,7 @@ function registerJoinRoomHandler(
             socket.emit('room-joined', response);
           }
         } catch (error) {
-          try {
-            await cleanupDMJoin(inputCallId);
-          } catch (cleanupError) {
-            logger.error('Failed to clean up an errored DM room join', {
-              error: cleanupError,
-              roomId,
-            });
-          }
+          await cleanupDMJoinSafely('Failed to clean up an errored DM room join');
           emitJoinError(socket, roomId, data.userId, error, callback);
         }
       };
@@ -1153,7 +1174,7 @@ async function main() {
         callId: room.callId,
         ringId: room.callRingId,
         callerUserId: room.callCallerUserId,
-        timestamp: new Date().toISOString(),
+        timestamp: natsService.nextVoiceLifecycleTimestamp(),
       });
     }
     // #1553 measurement: sample here only when the ops publisher is disabled. When it is

@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/google/uuid"
 	gorillaws "github.com/gorilla/websocket"
@@ -295,6 +297,38 @@ func setupCustomTextHub(t *testing.T) (*Hub, *sql.DB) {
 	return hub, db
 }
 
+func TestSendCustomTextSnapshot_ReplayIsDeterministicBySenderID(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	viewer := insertCTUser(t, db, "ctsnapshotorderedviewer")
+	senders := []uuid.UUID{
+		insertCTUser(t, db, "ctsnapshotorderedsenderb"),
+		insertCTUser(t, db, "ctsnapshotorderedsendera"),
+	}
+	for index, senderID := range senders {
+		makeFriends(t, db, senderID, viewer)
+		setCustomText(t, db, senderID, 1, fmt.Sprintf("ordered-%d", index), "")
+	}
+	expected := append([]uuid.UUID(nil), senders...)
+	sort.Slice(expected, func(left, right int) bool {
+		return expected[left].String() < expected[right].String()
+	})
+	client := connectClient(hub, viewer)
+	client.beginBootstrap()
+	var replayOrder []uuid.UUID
+	hub.customTextSnapshotBeforeEnqueue = func(senderID, _ uuid.UUID) {
+		replayOrder = append(replayOrder, senderID)
+	}
+
+	require.NoError(t, hub.sendCustomTextSnapshot(context.Background(), client))
+	assert.Equal(t, expected, replayOrder)
+	require.True(t, hub.completeClientBootstrap(client, []byte(`{"type":"presence_snapshot"}`)))
+	require.Equal(t, "presence_snapshot", readClientMsg(t, client)["type"])
+	for _, senderID := range expected {
+		message := readClientMsg(t, client)
+		assert.Equal(t, senderID.String(), message["data"].(map[string]interface{})["user_id"])
+	}
+}
+
 // TestBroadcastCustomText_FriendsTier_AudienceVsNonAudience is the core B3
 // privacy lock. Sender at Friends tier (1): a friend RECEIVES the update; a
 // shared-server-only peer (NOT a friend) does NOT (Friends tier excludes
@@ -393,7 +427,7 @@ func TestSendCustomTextSnapshot_AudienceVsNonAudience(t *testing.T) {
 
 	viewerClient := connectClient(hub, viewer)
 
-	hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+	require.NoError(t, hub.sendCustomTextSnapshot(context.Background(), viewerClient))
 
 	// Drain all snapshot frames and collect which senders appear.
 	seen := map[string]map[string]interface{}{}
@@ -422,11 +456,13 @@ done:
 
 func TestCustomTextCandidates_PendingSenderIsAbsent(t *testing.T) {
 	hub, db := setupCustomTextHub(t)
+	viewer := insertCTUser(t, db, "ctpendingviewer")
 	sender := insertCTUser(t, db, "ctpendingcandidate")
+	makeFriends(t, db, sender, viewer)
 	setCustomText(t, db, sender, 1, "quarantined", "")
 	insertCustomTextPendingOperation(t, db, sender)
 
-	candidates, err := hub.customTextCandidates(context.Background())
+	candidates, err := hub.customTextCandidates(context.Background(), viewer)
 
 	require.NoError(t, err)
 	assert.NotContains(t, candidates, sender)
@@ -434,7 +470,9 @@ func TestCustomTextCandidates_PendingSenderIsAbsent(t *testing.T) {
 
 func TestCustomTextCandidates_MasterOffSenderIsAbsent(t *testing.T) {
 	hub, db := setupCustomTextHub(t)
+	viewer := insertCTUser(t, db, "ctmasteroffviewer")
 	sender := insertCTUser(t, db, "ctmasteroffcandidate")
+	makeFriends(t, db, sender, viewer)
 	setCustomText(t, db, sender, 2, "saved but disabled", "")
 	_, err := db.Exec(
 		`UPDATE user_presence_settings SET master_enabled = FALSE WHERE user_id = $1`,
@@ -442,10 +480,109 @@ func TestCustomTextCandidates_MasterOffSenderIsAbsent(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	candidates, err := hub.customTextCandidates(context.Background())
+	candidates, err := hub.customTextCandidates(context.Background(), viewer)
 
 	require.NoError(t, err)
 	assert.NotContains(t, candidates, sender)
+}
+
+func TestCustomTextCandidates_ViewerSpecificBound(t *testing.T) {
+	t.Run("unrelated rows do not consume the replay budget", func(t *testing.T) {
+		hub, db := setupCustomTextHub(t)
+		viewer := insertCTUser(t, db, "ctboundedunrelatedviewer")
+		for index := 0; index < clientBootstrapFrameLimit; index++ {
+			sender := insertCTUser(t, db, fmt.Sprintf("ctboundedunrelated%03d", index))
+			setCustomText(t, db, sender, 2, "not visible", "")
+		}
+
+		candidates, err := hub.customTextCandidates(context.Background(), viewer)
+
+		require.NoError(t, err)
+		assert.Empty(t, candidates)
+	})
+
+	t.Run("visible rows above the replay budget fail closed", func(t *testing.T) {
+		hub, db := setupCustomTextHub(t)
+		viewer := insertCTUser(t, db, "ctboundedvisibleviewer")
+		for index := 0; index < clientBootstrapFrameLimit; index++ {
+			sender := insertCTUser(t, db, fmt.Sprintf("ctboundedvisible%03d", index))
+			makeFriends(t, db, sender, viewer)
+			setCustomText(t, db, sender, 1, "visible", "")
+		}
+
+		candidates, err := hub.customTextCandidates(context.Background(), viewer)
+
+		assert.ErrorIs(t, err, errClientBootstrapOverflow)
+		assert.Nil(t, candidates)
+	})
+
+	t.Run("empty related rows do not consume the replay budget", func(t *testing.T) {
+		hub, db := setupCustomTextHub(t)
+		viewer := insertCTUser(t, db, "ctboundedemptyviewer")
+		for index := 0; index < clientBootstrapFrameLimit; index++ {
+			sender := insertCTUser(t, db, fmt.Sprintf("ctboundedempty%03d", index))
+			makeFriends(t, db, sender, viewer)
+			setCustomText(t, db, sender, 1, "", "")
+		}
+		visible := insertCTUser(t, db, "ctboundedemptyvisible")
+		makeFriends(t, db, visible, viewer)
+		setCustomText(t, db, visible, 1, "visible", "")
+
+		candidates, err := hub.customTextCandidates(context.Background(), viewer)
+
+		require.NoError(t, err)
+		assert.Equal(t, []uuid.UUID{visible}, candidates)
+	})
+}
+
+func TestCustomTextCandidateQueryStaysViewerCorrelated(t *testing.T) {
+	source, err := os.ReadFile("customtext.go")
+	require.NoError(t, err)
+	assert.NotContains(t, string(source), "WITH accepted_edges AS",
+		"bounded reconnect must not materialize the global friendship graph")
+	assert.NotContains(t, string(source), "ComputeCustomTextAudience(ctx, tx, senderID)",
+		"final authorization for one viewer must not materialize the sender's full audience")
+}
+
+func TestCustomTextCandidates_UsesSenderOwnedFoFAndFinalExclusions(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	viewer := insertCTUser(t, db, "ctinverseviewer")
+	mutual := insertCTUser(t, db, "ctinversemutual")
+	sender := insertCTUser(t, db, "ctinversesender")
+	makeFriends(t, db, sender, mutual)
+	makeFriends(t, db, mutual, viewer)
+	setCustomText(t, db, sender, 1, "sender owned", "")
+	_, err := db.Exec(`
+		INSERT INTO privacy_settings (user_id, dm_friends_of_friends)
+		VALUES ($1, TRUE), ($2, FALSE)
+	`, sender, viewer)
+	require.NoError(t, err)
+
+	candidates, err := hub.customTextCandidates(context.Background(), viewer)
+	require.NoError(t, err)
+	assert.Contains(t, candidates, sender)
+
+	_, err = db.Exec(`
+		UPDATE privacy_settings
+		SET dm_friends_of_friends = (user_id = $1)
+		WHERE user_id IN ($1, $2)
+	`, viewer, sender)
+	require.NoError(t, err)
+	candidates, err = hub.customTextCandidates(context.Background(), viewer)
+	require.NoError(t, err)
+	assert.NotContains(t, candidates, sender,
+		"the viewer's FoF preference must not authorize a sender")
+
+	makeFriends(t, db, sender, viewer)
+	excludeCustomTextViewer(t, db, sender, viewer)
+	candidates, err = hub.customTextCandidates(context.Background(), viewer)
+	require.NoError(t, err)
+	assert.NotContains(t, candidates, sender)
+
+	setCustomText(t, db, viewer, 2, "self", "")
+	candidates, err = hub.customTextCandidates(context.Background(), viewer)
+	require.NoError(t, err)
+	assert.NotContains(t, candidates, viewer)
 }
 
 func TestSendCustomTextSnapshot_FinalStateQuerySuppressesNewMasterOffSender(t *testing.T) {
@@ -465,10 +602,9 @@ func TestSendCustomTextSnapshot_FinalStateQuerySuppressesNewMasterOffSender(t *t
 	hub.customTextSnapshotAfterStateRead = func(_, _ uuid.UUID) {
 		audienceBoundaryReached <- struct{}{}
 	}
-	snapshotDone := make(chan struct{})
+	snapshotDone := make(chan error, 1)
 	go func() {
-		defer close(snapshotDone)
-		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+		snapshotDone <- hub.sendCustomTextSnapshot(context.Background(), viewerClient)
 	}()
 	awaitCustomTextSignal(t, candidatesRead)
 
@@ -478,7 +614,7 @@ func TestSendCustomTextSnapshot_FinalStateQuerySuppressesNewMasterOffSender(t *t
 	)
 	require.NoError(t, err)
 	close(releaseCandidates)
-	awaitCustomTextSignal(t, snapshotDone)
+	require.NoError(t, awaitCustomTextSignal(t, snapshotDone))
 
 	select {
 	case <-audienceBoundaryReached:
@@ -501,16 +637,15 @@ func TestSendCustomTextSnapshot_FinalStateQuerySuppressesNewPendingSender(t *tes
 		close(candidatesRead)
 		<-releaseCandidates
 	}
-	snapshotDone := make(chan struct{})
+	snapshotDone := make(chan error, 1)
 	go func() {
-		defer close(snapshotDone)
-		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+		snapshotDone <- hub.sendCustomTextSnapshot(context.Background(), viewerClient)
 	}()
 	awaitCustomTextSignal(t, candidatesRead)
 
 	insertCustomTextPendingOperation(t, db, sender)
 	close(releaseCandidates)
-	awaitCustomTextSignal(t, snapshotDone)
+	require.NoError(t, awaitCustomTextSignal(t, snapshotDone))
 
 	assertNoMessage(t, viewerClient)
 }
@@ -529,8 +664,9 @@ func TestSendCustomTextSnapshot_CancellationImmediatelyBeforeEnqueueSuppressesFr
 		}
 	}
 
-	hub.sendCustomTextSnapshot(ctx, viewerClient)
+	snapshotErr := hub.sendCustomTextSnapshot(ctx, viewerClient)
 
+	require.ErrorIs(t, snapshotErr, context.Canceled)
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 	assertNoMessage(t, viewerClient)
 }
@@ -561,13 +697,12 @@ func TestSendCustomTextSnapshot_TimeoutBeforeSharedGateCannotEnqueueLater(t *tes
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	snapshotDone := make(chan struct{})
+	snapshotDone := make(chan error, 1)
 	go func() {
-		defer close(snapshotDone)
-		hub.sendCustomTextSnapshot(ctx, viewerClient)
+		snapshotDone <- hub.sendCustomTextSnapshot(ctx, viewerClient)
 	}()
 	awaitCustomTextSignal(t, candidatesRead)
-	awaitCustomTextSignal(t, snapshotDone)
+	require.ErrorIs(t, awaitCustomTextSignal(t, snapshotDone), context.DeadlineExceeded)
 	require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
 
 	close(releaseGate)
@@ -637,7 +772,10 @@ func TestHubRun_BlockedCustomTextSnapshotGateDoesNotBlockOtherEvents(t *testing.
 		Type: "custom_text_hub_loop_probe",
 		Data: map[string]interface{}{"count": 1},
 	})
-	awaitClientMessageType(t, otherClient, "custom_text_hub_loop_probe")
+	// A newly registered client intentionally buffers ordinary live frames
+	// behind its replacement. Observe the broadcast on an already-ready client
+	// so this assertion measures Hub.Run responsiveness, not bootstrap ordering.
+	awaitClientMessageType(t, unregisterClient, "custom_text_hub_loop_probe")
 
 	hub.unregister <- unregisterClient
 	closeTimer := time.NewTimer(10 * time.Second)
@@ -663,9 +801,15 @@ func TestSendCustomTextSnapshot_StateAndAudienceUseOneDatabaseSnapshot(t *testin
 	viewer := insertCTUser(t, db, "ctsnapshotconsistentviewer")
 	sender := insertCTUser(t, db, "ctsnapshotconsistentsender")
 	shareServer(t, db, sender, sender, viewer)
-	setCustomText(t, db, sender, 1, "old private status", "")
+	setCustomText(t, db, sender, 2, "old private status", "")
 	viewerClient := connectClient(hub, viewer)
 
+	candidatesRead := make(chan struct{})
+	releaseCandidates := make(chan struct{})
+	hub.customTextSnapshotAfterCandidates = func() {
+		close(candidatesRead)
+		<-releaseCandidates
+	}
 	stateRead := make(chan struct{})
 	releaseSnapshot := make(chan struct{})
 	var releaseSnapshotOnce sync.Once
@@ -681,11 +825,18 @@ func TestSendCustomTextSnapshot_StateAndAudienceUseOneDatabaseSnapshot(t *testin
 		<-releaseSnapshot
 	}
 
-	snapshotDone := make(chan struct{})
+	snapshotDone := make(chan error, 1)
 	go func() {
-		defer close(snapshotDone)
-		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+		snapshotDone <- hub.sendCustomTextSnapshot(context.Background(), viewerClient)
 	}()
+	awaitCustomTextSignal(t, candidatesRead)
+	_, err := db.Exec(`
+		UPDATE user_presence_settings
+		SET custom_text_tier = 1
+		WHERE user_id = $1
+	`, sender)
+	require.NoError(t, err)
+	close(releaseCandidates)
 	awaitCustomTextSignal(t, stateRead)
 
 	// The viewer is not authorized for the old Friends-tier payload. A writer
@@ -708,7 +859,7 @@ func TestSendCustomTextSnapshot_StateAndAudienceUseOneDatabaseSnapshot(t *testin
 	}()
 	awaitCustomTextSignal(t, updateAttempted)
 	releaseSnapshotRead()
-	awaitCustomTextSignal(t, snapshotDone)
+	require.NoError(t, awaitCustomTextSignal(t, snapshotDone))
 	require.NoError(t, awaitCustomTextSignal(t, updateDone))
 
 	assertNoMessage(t, viewerClient)
@@ -731,10 +882,9 @@ func TestSendCustomTextSnapshot_SharedGateOrdersOldSnapshotBeforeNewerClearUpdat
 			<-releaseSnapshot
 		}
 	}
-	snapshotDone := make(chan struct{})
+	snapshotDone := make(chan error, 1)
 	go func() {
-		defer close(snapshotDone)
-		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+		snapshotDone <- hub.sendCustomTextSnapshot(context.Background(), viewerClient)
 	}()
 	awaitCustomTextSignal(t, stateRead)
 
@@ -799,7 +949,7 @@ func TestSendCustomTextSnapshot_SharedGateOrdersOldSnapshotBeforeNewerClearUpdat
 	}()
 	awaitCustomTextSignal(t, writerAttempted)
 	close(releaseSnapshot)
-	awaitCustomTextSignal(t, snapshotDone)
+	require.NoError(t, awaitCustomTextSignal(t, snapshotDone))
 	require.NoError(t, awaitCustomTextSignal(t, writerDone))
 
 	oldUpdate := readClientMsg(t, viewerClient)
@@ -814,7 +964,7 @@ func TestSendCustomTextSnapshot_SharedGateOrdersOldSnapshotBeforeNewerClearUpdat
 	assert.Equal(t, "new committed state", newPayload["text"])
 }
 
-func TestSendCustomTextSnapshot_CrossServiceMasterOffWaitsThroughSnapshotEnqueue(t *testing.T) {
+func TestSendCustomTextSnapshot_CommitsBeforeReplayAndOrdersCrossServiceClearAfterIt(t *testing.T) {
 	hub, db := setupCustomTextHub(t)
 	snapshotService := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	writerService := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
@@ -826,12 +976,13 @@ func TestSendCustomTextSnapshot_CrossServiceMasterOffWaitsThroughSnapshotEnqueue
 	makeFriends(t, db, sender, viewer)
 	setCustomText(t, db, sender, 1, "old cross-service snapshot", "")
 	viewerClient := connectClient(hub, viewer)
+	viewerClient.beginBootstrap()
 
 	stateRead := make(chan struct{})
 	releaseStateRead := make(chan struct{})
 	enqueueStarted := make(chan struct{})
 	releaseEnqueue := make(chan struct{})
-	snapshotDone := make(chan struct{})
+	snapshotDone := make(chan error, 1)
 	writerFinished := make(chan struct{})
 	writerResult := make(chan error, 1)
 	var releaseStateReadOnce sync.Once
@@ -879,8 +1030,7 @@ func TestSendCustomTextSnapshot_CrossServiceMasterOffWaitsThroughSnapshotEnqueue
 	}
 
 	go func() {
-		defer close(snapshotDone)
-		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+		snapshotDone <- hub.sendCustomTextSnapshot(context.Background(), viewerClient)
 	}()
 	awaitCustomTextSignal(t, stateRead)
 
@@ -924,19 +1074,17 @@ func TestSendCustomTextSnapshot_CrossServiceMasterOffWaitsThroughSnapshotEnqueue
 	)
 	releaseSnapshotState()
 	awaitCustomTextSignal(t, enqueueStarted)
-	requireCustomTextDatabaseWriterBlocked(
-		t,
-		db,
-		writerBackendPID,
-		writerFinished,
-		"snapshot enqueue",
-	)
-	releaseSnapshotEnqueue()
-
-	awaitCustomTextSignal(t, snapshotDone)
+	// The read-only authorization transaction must commit before collection.
+	// That releases the cross-service database writer, whose clear is buffered
+	// as live state while this committed snapshot replay is still paused.
 	awaitCustomTextSignal(t, writerFinished)
 	require.NoError(t, awaitCustomTextSignal(t, writerResult))
+	releaseSnapshotEnqueue()
 
+	require.NoError(t, awaitCustomTextSignal(t, snapshotDone))
+	require.True(t, hub.completeClientBootstrap(viewerClient, []byte(`{"type":"presence_snapshot"}`)))
+
+	require.Equal(t, "presence_snapshot", readClientMsg(t, viewerClient)["type"])
 	oldUpdate := readClientMsg(t, viewerClient)
 	newClear := readClientMsg(t, viewerClient)
 	require.Equal(t, "rich_presence_update", oldUpdate["type"])
@@ -1017,7 +1165,7 @@ func TestSendCustomTextSnapshot_RecipientOverrideExcludedThenRestored(t *testing
 	excludeCustomTextViewer(t, db, sender, viewer)
 
 	excludedClient := connectClient(hub, viewer)
-	hub.sendCustomTextSnapshot(context.Background(), excludedClient)
+	require.NoError(t, hub.sendCustomTextSnapshot(context.Background(), excludedClient))
 	assertNoMessage(t, excludedClient)
 
 	_, err := db.Exec(`
@@ -1025,9 +1173,26 @@ func TestSendCustomTextSnapshot_RecipientOverrideExcludedThenRestored(t *testing
 		WHERE sender_id = $1 AND category = 'custom_text' AND target_user_id = $2
 	`, sender.String(), viewer.String())
 	require.NoError(t, err)
+	var remainingOverrides int
+	require.NoError(t, db.QueryRow(`
+		SELECT COUNT(*) FROM user_presence_overrides
+		WHERE sender_id = $1 AND category = 'custom_text' AND target_user_id = $2
+	`, sender, viewer).Scan(&remainingOverrides))
+	require.Zero(t, remainingOverrides)
+	var friendshipCount int
+	require.NoError(t, db.QueryRow(`
+		SELECT COUNT(*) FROM friendships
+		WHERE status = 'accepted'
+		  AND ((requester_id = $1 AND addressee_id = $2)
+		    OR (requester_id = $2 AND addressee_id = $1))
+	`, sender, viewer).Scan(&friendshipCount))
+	require.Equal(t, 1, friendshipCount)
+	audience, err := presence.ComputeCustomTextAudience(context.Background(), db, sender)
+	require.NoError(t, err)
+	require.True(t, audience[viewer], "viewer must be restored before the replacement read")
 
 	restoredClient := connectClient(hub, viewer)
-	hub.sendCustomTextSnapshot(context.Background(), restoredClient)
+	require.NoError(t, hub.sendCustomTextSnapshot(context.Background(), restoredClient))
 	msg := readClientMsg(t, restoredClient)
 	require.Equal(t, "rich_presence_update", msg["type"])
 	data := msg["data"].(map[string]interface{})
@@ -1050,7 +1215,7 @@ func TestSendCustomTextSnapshot_ServerPeerExcludedAtFriendsTier(t *testing.T) {
 	setCustomText(t, db, sender, 1, "friends only status", "")
 
 	viewerClient := connectClient(hub, viewer)
-	hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+	require.NoError(t, hub.sendCustomTextSnapshot(context.Background(), viewerClient))
 
 	// PRIVACY LOCK: nothing delivered — a Friends-tier sender excludes a
 	// server-only peer from their custom-text audience.
@@ -1070,7 +1235,7 @@ func TestSendCustomTextSnapshot_ServerPeerIncludedAtServersTier(t *testing.T) {
 	setCustomText(t, db, sender, 2, "servers can see me", "")
 
 	viewerClient := connectClient(hub, viewer)
-	hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+	require.NoError(t, hub.sendCustomTextSnapshot(context.Background(), viewerClient))
 
 	msg := readClientMsg(t, viewerClient)
 	assert.Equal(t, "rich_presence_update", msg["type"])
@@ -1093,7 +1258,7 @@ func TestSendCustomTextSnapshot_TierOffExcluded(t *testing.T) {
 	setCustomText(t, db, sender, 0, "should be hidden", "")
 
 	viewerClient := connectClient(hub, viewer)
-	hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+	require.NoError(t, hub.sendCustomTextSnapshot(context.Background(), viewerClient))
 
 	// PRIVACY LOCK: tier Off ⇒ no audience ⇒ nothing delivered even to a friend.
 	assertNoMessage(t, viewerClient)
@@ -1154,9 +1319,11 @@ func TestSendCustomTextSnapshot_NilDB_NoPanicNoSend(t *testing.T) {
 	viewer := uuid.New()
 	viewerClient := connectClient(hub, viewer)
 
+	var snapshotErr error
 	assert.NotPanics(t, func() {
-		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+		snapshotErr = hub.sendCustomTextSnapshot(context.Background(), viewerClient)
 	})
+	require.NoError(t, snapshotErr)
 	assertNoMessage(t, viewerClient)
 }
 
@@ -1169,9 +1336,11 @@ func TestSendCustomTextSnapshot_ClosedDB_FailsClosed(t *testing.T) {
 
 	viewerClient := connectClient(hub, viewer)
 
+	var snapshotErr error
 	assert.NotPanics(t, func() {
-		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+		snapshotErr = hub.sendCustomTextSnapshot(context.Background(), viewerClient)
 	})
+	require.Error(t, snapshotErr)
 	assertNoMessage(t, viewerClient)
 }
 
@@ -1179,9 +1348,9 @@ func TestSendCustomTextSnapshot_ClosedDB_FailsClosed(t *testing.T) {
 // customTextCandidates query-error path (lines 198-200): a closed DB yields a
 // non-nil error and a nil slice (caller fails closed on it).
 func TestCustomTextCandidates_ClosedDB_ReturnsError(t *testing.T) {
-	hub, _, _ := closedDBHub(t)
+	hub, _, viewer := closedDBHub(t)
 
-	out, err := hub.customTextCandidates(context.Background())
+	out, err := hub.customTextCandidates(context.Background(), viewer)
 	require.Error(t, err)
 	assert.Nil(t, out)
 }
@@ -1199,16 +1368,16 @@ func TestSendCustomTextSnapshot_SelfCandidateSkipped(t *testing.T) {
 	setCustomText(t, db, viewer, 2, "my own status", "🙂")
 
 	viewerClient := connectClient(hub, viewer)
-	hub.sendCustomTextSnapshot(context.Background(), viewerClient)
+	require.NoError(t, hub.sendCustomTextSnapshot(context.Background(), viewerClient))
 
 	// Self row skipped ⇒ no frame delivered to the viewer about themselves.
 	assertNoMessage(t, viewerClient)
 }
 
-// TestSendCustomTextSnapshot_SendBufferFull covers the non-blocking-send
-// `default:` branch (line 172): when the viewer's Send channel is full, the
-// snapshot drops the frame rather than blocking the hub goroutine.
-func TestSendCustomTextSnapshot_SendBufferFull(t *testing.T) {
+// TestSendCustomTextSnapshot_SendBufferFull covers the privacy-critical
+// backpressure branch: the worker returns and disconnects instead of silently
+// dropping an authorized replacement frame.
+func TestSendCustomTextSnapshot_SendBufferFullDisconnects(t *testing.T) {
 	hub, db := setupCustomTextHub(t)
 
 	viewer := insertCTUser(t, db, "ctbufviewer")
@@ -1230,17 +1399,24 @@ func TestSendCustomTextSnapshot_SendBufferFull(t *testing.T) {
 	}
 	hub.clients[clientID] = viewerClient
 	hub.userClients[viewer] = map[uuid.UUID]bool{clientID: true}
+	disconnected := false
+	hub.customTextClientDisconnect = func(got *Client) error {
+		assert.Same(t, viewerClient, got)
+		disconnected = true
+		return nil
+	}
 
-	// Must not block / panic — the default branch drops the frame.
-	done := make(chan struct{})
+	// Must not block / panic — the default branch disconnects the stale client.
+	done := make(chan error, 1)
 	go func() {
-		hub.sendCustomTextSnapshot(context.Background(), viewerClient)
-		close(done)
+		done <- hub.sendCustomTextSnapshot(context.Background(), viewerClient)
 	}()
 	select {
-	case <-done:
+	case snapshotErr := <-done:
 		// good — returned without blocking on the unbuffered Send channel.
+		require.ErrorIs(t, snapshotErr, errClientBootstrapOverflow)
 	case <-time.After(2 * time.Second):
-		t.Fatal("sendCustomTextSnapshot blocked instead of taking the default drop branch")
+		t.Fatal("sendCustomTextSnapshot blocked instead of disconnecting the full queue")
 	}
+	assert.True(t, disconnected)
 }

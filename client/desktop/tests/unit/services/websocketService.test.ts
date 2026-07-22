@@ -170,7 +170,9 @@ describe('WebSocketService', () => {
       await vi.advanceTimersByTimeAsync(0);
 
       const ws = (runtimeService as any).ws as MockWebSocket;
-      expect(ws.url).toBe('wss://homelab.lan:8443/api/v1/ws?ticket=mock-ticket');
+      expect(ws.url).toBe(
+        'wss://homelab.lan:8443/api/v1/ws?ticket=mock-ticket&activity_rich_presence=1'
+      );
       runtimeService.disconnect();
     });
 
@@ -186,7 +188,9 @@ describe('WebSocketService', () => {
       await vi.advanceTimersByTimeAsync(0);
 
       const ws = (selfHostedService as any).ws as MockWebSocket;
-      expect(ws.url).toBe('wss://homelab.lan:8443/api/v1/ws?ticket=mock-ticket');
+      expect(ws.url).toBe(
+        'wss://homelab.lan:8443/api/v1/ws?ticket=mock-ticket&activity_rich_presence=1'
+      );
       saasService.disconnect();
       selfHostedService.disconnect();
     });

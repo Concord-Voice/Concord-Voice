@@ -345,6 +345,14 @@ export const ABSOLUTE_VIDEO_PUBLISHER_CEILING = 25;
 export const ABSOLUTE_SCREEN_PRODUCER_CEILING = 16;
 
 /**
+ * Hard Server Voice room-admission boundary shared with the control-plane's
+ * authoritative heartbeat reconciler (#2231). The reconciler independently
+ * caps the media and persisted participant sets at this value, permitting a
+ * bounded stale+replacement union of at most twice this size.
+ */
+export const MAX_SERVER_VOICE_PARTICIPANTS = 1000;
+
+/**
  * Premium per-room caps (#1542) — mirror the Go entitlements source of truth
  * (`entitlements.go` MaxWebcamPublishers 25 / MaxScreensharePublishers 16).
  * Free values come from config (`freeVideoPublisherCap` / `freeScreenProducerCap`).
@@ -1075,6 +1083,21 @@ export class RoomManager {
       room.ownerTier = roomContext.ownerTier;
     }
 
+    // Keep media admission exactly aligned with the authoritative control-plane
+    // heartbeat bound. This section is synchronous through participants.set, so
+    // simultaneous boundary joins cannot both reserve the final slot. Existing
+    // users may reconnect at capacity without evicting their valid old session.
+    const existing = room.participants.get(userId);
+    if (
+      room.roomKind === 'channel' &&
+      !existing &&
+      room.participants.size >= MAX_SERVER_VOICE_PARTICIPANTS
+    ) {
+      throw new Error(
+        `Voice participant limit reached (max ${MAX_SERVER_VOICE_PARTICIPANTS})`
+      );
+    }
+
     // Media-frame crypto-version admission gate:
     //   - empty room  → seed with the joiner's version.
     //   - joiner != room → reject with a typed CryptoVersionMismatchError.
@@ -1092,7 +1115,6 @@ export class RoomManager {
     // Keep the room/call instance alive while still performing the complete
     // per-participant cleanup and membership epoch transition. Admission runs
     // first so an incompatible reconnect cannot evict the valid old session.
-    const existing = room.participants.get(userId);
     if (existing) {
       logger.warn('User already in room, cleaning up old session', {
         roomId,

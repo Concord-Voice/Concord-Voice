@@ -16,6 +16,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -42,12 +43,25 @@ type sessionDisconnector interface {
 	DisconnectUser(uuid.UUID)
 }
 
+// ActivitySettingsSuppressor applies Rich Presence suppression after a
+// settings write while the caller still owns the sender gate.
+type ActivitySettingsSuppressor interface {
+	ApplySettingsSuppressionAlreadyGated(
+		context.Context,
+		uuid.UUID,
+		presence.ActivityPolicySettings,
+		presence.ActivityPolicySettings,
+	) error
+	SuppressAllActivityAlreadyGated(context.Context, uuid.UUID) error
+}
+
 // Handler handles user-related requests including profile management and settings.
 type Handler struct {
 	db                  *sql.DB
 	log                 *logger.Logger
 	hub                 *websocket.Hub
 	presenceHistory     *presencehistory.Service
+	activitySuppressor  ActivitySettingsSuppressor
 	sessionDisconnector sessionDisconnector
 	mfaVerifier         MFAVerifier
 	tiers               entitlements.TierResolver // resolves the acting user's subscription tier (#1298)
@@ -73,6 +87,11 @@ func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, mfaVerifier 
 // writers, acknowledged delivery, reconciliation, and reconnect snapshots.
 func (h *Handler) SetPresenceHistory(service *presencehistory.Service) {
 	h.presenceHistory = service
+}
+
+// SetActivitySettingsSuppressor injects the Rich Presence settings cleanup service.
+func (h *Handler) SetActivitySettingsSuppressor(suppressor ActivitySettingsSuppressor) {
+	h.activitySuppressor = suppressor
 }
 
 // SetMediaStore configures optional object storage for media cleanup on profile image removal.

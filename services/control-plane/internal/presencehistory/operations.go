@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -132,6 +133,50 @@ func (s *Service) WithSender(
 		return ctx.Err()
 	}
 	defer func() { <-gate }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return work()
+}
+
+// WithSenders holds every process-local sender stripe named by senderIDs for
+// one publication boundary. Stripe indexes, not UUIDs, are deduplicated and
+// acquired in sorted order so hash collisions and overlapping sender sets
+// cannot self-deadlock. Cross-process writers remain outside these local gates.
+func (s *Service) WithSenders(
+	ctx context.Context,
+	senderIDs []uuid.UUID,
+	work func() error,
+) error {
+	var selected [senderGateStripes]bool
+	indexes := make([]int, 0, min(len(senderIDs), senderGateStripes))
+	for _, senderID := range senderIDs {
+		index := senderGateIndex(senderID)
+		if !selected[index] {
+			selected[index] = true
+			indexes = append(indexes, index)
+		}
+	}
+	sort.Ints(indexes)
+
+	acquired := make([]chan struct{}, 0, len(indexes))
+	for _, index := range indexes {
+		gate := s.senderGates[index]
+		select {
+		case gate <- struct{}{}:
+			acquired = append(acquired, gate)
+		case <-ctx.Done():
+			for acquiredIndex := len(acquired) - 1; acquiredIndex >= 0; acquiredIndex-- {
+				<-acquired[acquiredIndex]
+			}
+			return ctx.Err()
+		}
+	}
+	defer func() {
+		for index := len(acquired) - 1; index >= 0; index-- {
+			<-acquired[index]
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}

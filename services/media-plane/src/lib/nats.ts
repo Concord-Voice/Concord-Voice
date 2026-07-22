@@ -21,6 +21,28 @@ export class NatsService {
   private nc: NatsConnection | null = null;
   private connected = false;
   private readonly subscriptions: Array<{ unsubscribe(): void }> = [];
+  private lastVoiceLifecycleMicroseconds = 0n;
+
+  /**
+   * Return a strictly increasing RFC3339 timestamp for lifecycle messages
+   * published by this media-plane process. The control plane compares these
+   * at microsecond precision, so advancing a logical microsecond avoids a
+   * same-millisecond leave/join collapsing to the same lifecycle version.
+   * Independent publisher processes remain unordered and are reconciled by
+   * the control plane's lifecycle fencing and authoritative heartbeats.
+   */
+  nextVoiceLifecycleTimestamp(): string {
+    const wallClockMicroseconds = BigInt(Date.now()) * 1000n;
+    const nextMicroseconds =
+      wallClockMicroseconds > this.lastVoiceLifecycleMicroseconds
+        ? wallClockMicroseconds
+        : this.lastVoiceLifecycleMicroseconds + 1n;
+    this.lastVoiceLifecycleMicroseconds = nextMicroseconds;
+
+    const milliseconds = nextMicroseconds / 1000n;
+    const fraction = (nextMicroseconds % 1_000_000n).toString().padStart(6, '0');
+    return new Date(Number(milliseconds)).toISOString().replace(/\.\d{3}Z$/, `.${fraction}Z`);
+  }
 
   async connect(): Promise<void> {
     try {
@@ -77,8 +99,6 @@ export class NatsService {
    */
   createRoomEventHandler(): RoomEventHandler {
     return (event: RoomEvent) => {
-      const timestamp = new Date().toISOString();
-
       switch (event.type) {
         case 'user-joined':
           this.publish('voice.joined', {
@@ -87,7 +107,7 @@ export class NatsService {
             username: event.username,
             displayName: event.displayName,
             callId: event.callId,
-            timestamp,
+            timestamp: this.nextVoiceLifecycleTimestamp(),
           });
           break;
 
@@ -96,7 +116,7 @@ export class NatsService {
             channelId: event.roomId,
             userId: event.userId,
             callId: event.callId,
-            timestamp,
+            timestamp: this.nextVoiceLifecycleTimestamp(),
           });
           break;
 
@@ -108,7 +128,7 @@ export class NatsService {
             callerUserId: event.callerUserId,
             participantUserIds: event.participantUserIds,
             startedAt: event.startedAt,
-            timestamp,
+            timestamp: this.nextVoiceLifecycleTimestamp(),
           });
           break;
 
@@ -119,7 +139,7 @@ export class NatsService {
             producerId: event.producerId,
             kind: event.kind,
             source: event.source,
-            timestamp,
+            timestamp: new Date().toISOString(),
           });
           break;
 
@@ -130,7 +150,7 @@ export class NatsService {
             producerId: event.producerId,
             kind: event.kind,
             source: event.source,
-            timestamp,
+            timestamp: new Date().toISOString(),
           });
           break;
 

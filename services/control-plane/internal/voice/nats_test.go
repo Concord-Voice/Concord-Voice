@@ -14,10 +14,13 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
+	concordws "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -29,9 +32,50 @@ import (
 // (backed by the test DB/Redis) is supplied so the #487 temp-SBAC cleanup path is
 // exercised end-to-end.
 func newTestSubscriber(ts *testhelpers.TestServer) *voice.NATSSubscriber {
+	return newTestSubscriberWithHub(ts, ts.Hub)
+}
+
+func newTestSubscriberWithHub(
+	ts *testhelpers.TestServer,
+	hub *concordws.Hub,
+) *voice.NATSSubscriber {
+	return newTestSubscriberWithHubAndNATS(ts, hub, nil)
+}
+
+func newTestSubscriberWithHubAndNATS(
+	ts *testhelpers.TestServer,
+	hub *concordws.Hub,
+	nats *natsclient.Client,
+) *voice.NATSSubscriber {
 	log := logger.New("test")
 	resolver := rbac.NewResolver(ts.DB, rbac.NewPermissionCache(ts.Redis), log)
-	return voice.NewNATSSubscriber(ts.DB, log, ts.Hub, nil, ts.Redis, resolver)
+	activityStore := presence.NewActivityStore(ts.Redis)
+	activity := presence.NewActivityService(
+		ts.PresenceHistory,
+		presence.NewActivityBuilder(
+			ts.DB, testCallLeaseVerifier{redis: ts.Redis}, activityStore,
+		),
+		activityStore,
+		ts.DB,
+		resolver,
+		hub,
+	)
+	return voice.NewNATSSubscriber(ts.DB, log, hub, nats, ts.Redis, resolver, activity)
+}
+
+type testCallLeaseVerifier struct {
+	redis *redis.Client
+}
+
+func (v testCallLeaseVerifier) Matches(
+	ctx context.Context,
+	conversationID, callID uuid.UUID,
+) (bool, error) {
+	lease, found, err := dm.LookupDMVoiceCallLease(ctx, v.redis, conversationID)
+	if err != nil {
+		return false, err
+	}
+	return found && lease.CallID == callID, nil
 }
 
 // countVoiceParticipants returns the number of rows in voice_participants for a channel.
@@ -88,8 +132,10 @@ func dmVoiceParticipantExists(t *testing.T, db *sql.DB, conversationID, userID s
 func insertVoiceParticipant(t *testing.T, db *sql.DB, channelID, userID string) {
 	t.Helper()
 	_, err := db.Exec(
-		"INSERT INTO voice_participants (channel_id, user_id, joined_at) VALUES ($1, $2, NOW())",
-		channelID, userID,
+		`INSERT INTO voice_participants
+			(channel_id, user_id, joined_at, lifecycle_event_at)
+		 VALUES ($1, $2, $3, $3)`,
+		channelID, userID, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 	)
 	if err != nil {
 		t.Fatalf("failed to insert voice_participant: %v", err)
@@ -100,8 +146,10 @@ func insertVoiceParticipant(t *testing.T, db *sql.DB, channelID, userID string) 
 func insertDMVoiceParticipant(t *testing.T, db *sql.DB, conversationID, userID string) {
 	t.Helper()
 	_, err := db.Exec(
-		"INSERT INTO dm_voice_participants (conversation_id, user_id, joined_at) VALUES ($1, $2, NOW())",
-		conversationID, userID,
+		`INSERT INTO dm_voice_participants
+			(conversation_id, user_id, joined_at, lifecycle_event_at)
+		 VALUES ($1, $2, $3, $3)`,
+		conversationID, userID, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 	)
 	if err != nil {
 		t.Fatalf("failed to insert dm_voice_participant: %v", err)
@@ -705,6 +753,75 @@ func TestHandleHeartbeat_RemovesStaleParticipant(t *testing.T) {
 	}
 }
 
+func TestHandleHeartbeat_PrivateCallRetriesDisconnectForReportedNonMember(t *testing.T) {
+	publisher, err := natsclient.Connect(natsTestURL())
+	if err != nil {
+		t.Skipf("NATS unavailable (%v); skipping heartbeat revocation retry test", err)
+	}
+	t.Cleanup(publisher.Close)
+	observer, err := natsclient.Connect(natsTestURL())
+	require.NoError(t, err)
+	t.Cleanup(observer.Close)
+	disconnects := make(chan map[string]interface{}, 4)
+	subscription, err := observer.Subscribe(natsSubjectEnforceDisconnectForTest, func(data []byte) {
+		var payload map[string]interface{}
+		if json.Unmarshal(data, &payload) == nil {
+			disconnects <- payload
+		}
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = subscription.Unsubscribe() })
+	require.NoError(t, observer.Flush())
+
+	ts := testhelpers.SetupTestServer(t)
+	sub := newTestSubscriberWithHubAndNATS(ts, ts.Hub, publisher)
+	caller := ts.CreateTestUser(t, "hb_dm_retry_caller")
+	member := ts.CreateTestUser(t, "hb_dm_retry_member")
+	removed := ts.CreateTestUser(t, "hb_dm_retry_removed")
+	conversationID := uuid.MustParse(ts.CreateGroupDMConversation(
+		t, caller.ID, member.ID, removed.ID,
+	))
+	callID := uuid.New()
+	joinedAt := time.Date(2026, 7, 22, 8, 0, 0, 0, time.UTC)
+	require.NoError(t, dm.RefreshDMVoiceCallLease(
+		context.Background(), ts.Redis, dm.VoiceCallLease{
+			ConversationID: conversationID,
+			CallID:         callID,
+			CallerUserID:   uuid.MustParse(caller.ID),
+		}, dm.DMVoiceCallLeaseTTL, true,
+	))
+	_, err = ts.DB.Exec(`
+		INSERT INTO dm_voice_participants
+			(conversation_id, user_id, joined_at, lifecycle_event_at)
+		VALUES ($1, $2, $3, $3)
+	`, conversationID, caller.ID, joinedAt)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		DELETE FROM dm_participants
+		WHERE conversation_id = $1 AND user_id = $2
+	`, conversationID, removed.ID)
+	require.NoError(t, err)
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		heartbeatAt := joinedAt.Add(time.Duration(attempt) * time.Second)
+		sub.HandleHeartbeat(mustJSON(t, map[string]interface{}{
+			"channelId":    conversationID.String(),
+			"callId":       callID.String(),
+			"callerUserId": caller.ID,
+			"userIds":      []string{caller.ID, removed.ID},
+			"timestamp":    heartbeatAt.Format(time.RFC3339Nano),
+		}))
+		select {
+		case payload := <-disconnects:
+			assert.Equal(t, conversationID.String(), payload["channelId"])
+			assert.Equal(t, removed.ID, payload["userId"])
+			assert.Equal(t, "disconnect", payload["action"])
+		case <-time.After(3 * time.Second):
+			t.Fatalf("heartbeat %d did not retry the removed participant disconnect", attempt)
+		}
+	}
+}
+
 func TestHandleHeartbeat_EmptyRoomClearsAll(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	sub := newTestSubscriber(ts)
@@ -1043,7 +1160,24 @@ func TestHandleVoiceLifecycle_DMRedisErrorFailsClosedBeforePresenceMutation(t *t
 		MaxRetries:   -1,
 	})
 	t.Cleanup(func() { _ = brokenRedis.Close() })
-	sub := voice.NewNATSSubscriber(ts.DB, logger.New("test"), ts.Hub, nil, brokenRedis, nil)
+	log := logger.New("test")
+	resolver := rbac.NewResolver(
+		ts.DB, rbac.NewPermissionCache(brokenRedis), log,
+	)
+	activityStore := presence.NewActivityStore(brokenRedis)
+	activity := presence.NewActivityService(
+		ts.PresenceHistory,
+		presence.NewActivityBuilder(
+			ts.DB, testCallLeaseVerifier{redis: brokenRedis}, activityStore,
+		),
+		activityStore,
+		ts.DB,
+		resolver,
+		ts.Hub,
+	)
+	sub := voice.NewNATSSubscriber(
+		ts.DB, log, ts.Hub, nil, brokenRedis, resolver, activity,
+	)
 	callID := uuid.New().String()
 
 	sub.HandleJoined(mustJSON(t, map[string]interface{}{
@@ -1311,7 +1445,7 @@ func TestNewNATSSubscriber(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	log := logger.New("test")
 
-	sub := voice.NewNATSSubscriber(ts.DB, log, ts.Hub, nil, ts.Redis, nil)
+	sub := voice.NewNATSSubscriber(ts.DB, log, ts.Hub, nil, ts.Redis, nil, nil)
 	if sub == nil {
 		t.Fatal("NewNATSSubscriber returned nil")
 	}

@@ -188,7 +188,7 @@ func waitCollectorEvents(t *testing.T, store *collectorTestStore, expected ...st
 func TestCollectorWritesOneBatchAndRollsUpBeforePruning(t *testing.T) {
 	now := time.Date(2026, 7, 12, 20, 0, 0, 0, time.UTC)
 	store := newCollectorTestStore()
-	_, clock, ticker, cancel, done := newCollectorUnderTest(now, store)
+	collector, clock, ticker, cancel, done := newCollectorUnderTest(now, store)
 	t.Cleanup(cancel)
 
 	ticker.tick(t, now)
@@ -207,6 +207,9 @@ func TestCollectorWritesOneBatchAndRollsUpBeforePruning(t *testing.T) {
 	require.Equal(t, float64(1), values[MetricChannelMessagesTotal])
 	require.Zero(t, values[MetricMediaUploadsTotal])
 	require.Len(t, values, 10)
+	require.Eventually(t, func() bool {
+		return !collector.busy.Load()
+	}, time.Second, time.Millisecond)
 
 	clock.set(now.Add(15 * time.Second))
 	ticker.tick(t, now.Add(15*time.Second))

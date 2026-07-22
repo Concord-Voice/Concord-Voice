@@ -272,6 +272,7 @@ func requireZeroPolicyError(t *testing.T, decision presence.Decision, err error,
 	t.Helper()
 	require.Error(t, err)
 	require.Equal(t, presence.Decision{}, decision)
+	require.False(t, decision.Minimized)
 	require.Equal(t, class, presence.PolicyErrorClass(err))
 	require.Equal(t, "rich-presence policy failed: "+string(class), err.Error())
 }
@@ -282,11 +283,13 @@ func requireEmptyDecision(t *testing.T, decision presence.Decision, err error) {
 	require.NotNil(t, decision.Audience)
 	require.Empty(t, decision.Audience)
 	require.Nil(t, decision.Payload)
+	require.False(t, decision.Minimized)
 }
 
 func TestAuthorizeAndMinimize_InvalidInputReturnsZeroDecision(t *testing.T) {
 	senderID := uuid.New()
 	zeroStartedAt := int64(0)
+	unsafeStartedAt := presence.MaxActivityUnixSeconds + 1
 
 	tests := []struct {
 		name  string
@@ -348,6 +351,11 @@ func TestAuthorizeAndMinimize_InvalidInputReturnsZeroDecision(t *testing.T) {
 			input.ServerVoice.Payload.StartedAt = &zeroStartedAt
 			return input
 		}()},
+		{name: "precision-unsafe server timestamp", input: func() presence.PolicyInput {
+			input := validServerVoicePolicyInput(senderID)
+			input.ServerVoice.Payload.StartedAt = &unsafeStartedAt
+			return input
+		}()},
 		{name: "zero conversation", input: func() presence.PolicyInput {
 			input := validPrivateCallPolicyInput(senderID)
 			input.PrivateCall.Context.ConversationID = uuid.Nil
@@ -394,6 +402,11 @@ func TestAuthorizeAndMinimize_InvalidInputReturnsZeroDecision(t *testing.T) {
 		{name: "nonpositive private timestamp", input: func() presence.PolicyInput {
 			input := validPrivateCallPolicyInput(senderID)
 			input.PrivateCall.Payload.StartedAt = &zeroStartedAt
+			return input
+		}()},
+		{name: "precision-unsafe private timestamp", input: func() presence.PolicyInput {
+			input := validPrivateCallPolicyInput(senderID)
+			input.PrivateCall.Payload.StartedAt = &unsafeStartedAt
 			return input
 		}()},
 	}
@@ -450,6 +463,7 @@ func TestAuthorizeAndMinimize_ServerVoiceFriendsIntersectsServerAndFoFOptIn(t *t
 
 	decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, input)
 	require.NoError(t, err)
+	require.False(t, decision.Minimized)
 	require.Equal(t, map[uuid.UUID]bool{
 		friendInServer:         true,
 		friendOfFriendInServer: true,
@@ -585,6 +599,7 @@ func TestAuthorizeAndMinimize_ServerVoiceDetailsOffOmitsGranularBytes(t *testing
 
 	decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, input)
 	require.NoError(t, err)
+	require.True(t, decision.Minimized)
 	var payload map[string]any
 	require.NoError(t, json.Unmarshal(decision.Payload, &payload))
 	require.Equal(t, map[string]any{

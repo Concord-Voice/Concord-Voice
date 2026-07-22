@@ -2301,7 +2301,7 @@ func TestBroadcastToAllQueuesMessage(t *testing.T) {
 }
 
 func TestBroadcastToServerQueuesMessage(t *testing.T) {
-	hub := newMinimalHub()
+	hub := NewHub(nil, nil)
 	serverID := uuid.New()
 	msg := OutgoingMessage{Type: "server_test", Data: map[string]interface{}{}}
 
@@ -2314,6 +2314,70 @@ func TestBroadcastToServerQueuesMessage(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("expected message on serverBroadcast channel")
 	}
+}
+
+func TestBroadcastToServerContextStopsAfterDeadlineWithSaturatedQueue(t *testing.T) {
+	hub := NewHub(nil, nil)
+	for index := 0; index < cap(hub.serverBroadcast); index++ {
+		require.True(t, hub.BroadcastToServerContext(
+			context.Background(), uuid.New(), OutgoingMessage{Type: "voice_state_update"},
+		))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan bool, 1)
+	go func() {
+		returned <- hub.BroadcastToServerContext(
+			ctx, uuid.New(), OutgoingMessage{Type: "voice_state_update"},
+		)
+	}()
+	select {
+	case <-returned:
+		t.Fatal("expected the 257th server broadcast to wait on a saturated queue")
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case queued := <-returned:
+		require.False(t, queued)
+	case <-time.After(2 * time.Second):
+		t.Fatal("server broadcast did not stop after its lifecycle deadline")
+	}
+}
+
+func TestBroadcastToServerStopsAfterHubShutdownWithSaturatedQueue(t *testing.T) {
+	hub := NewHub(nil, nil)
+	for index := 0; index < cap(hub.serverBroadcast); index++ {
+		hub.serverBroadcast <- ServerBroadcastMessage{ServerID: uuid.New()}
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		hub.BroadcastToServer(uuid.New(), OutgoingMessage{Type: "voice_state_update"})
+		close(returned)
+	}()
+	select {
+	case <-returned:
+		t.Fatal("expected the server broadcast to wait on a saturated queue")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(hub.done)
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server broadcast did not stop after Hub shutdown")
+	}
+}
+
+func TestBroadcastToServerContextDropsPostShutdownBulkFanout(t *testing.T) {
+	hub := NewHub(nil, nil)
+	close(hub.done)
+	for index := 0; index < 1000; index++ {
+		require.False(t, hub.BroadcastToServerContext(
+			context.Background(), uuid.New(), OutgoingMessage{Type: "voice_state_update"},
+		))
+	}
+	require.Empty(t, hub.serverBroadcast)
 }
 
 func TestBroadcastToUserQueuesMessage(t *testing.T) {

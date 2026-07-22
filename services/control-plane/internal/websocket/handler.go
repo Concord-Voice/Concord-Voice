@@ -82,6 +82,7 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
+	activityRichPresenceCapable := requestSupportsActivityRichPresence(c.Request)
 
 	// Look up username, display name, and avatar for this user
 	var username string
@@ -102,16 +103,17 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 
 	// Create new client
 	client := &Client{
-		ID:          uuid.New(),
-		UserID:      userID,
-		SessionID:   sessionID,
-		Username:    username,
-		DisplayName: displayName,
-		AvatarURL:   avatarURL,
-		Conn:        conn,
-		Hub:         h.hub,
-		Send:        make(chan []byte, 256),
-		Channels:    make(map[uuid.UUID]bool),
+		ID:                          uuid.New(),
+		UserID:                      userID,
+		SessionID:                   sessionID,
+		Username:                    username,
+		DisplayName:                 displayName,
+		AvatarURL:                   avatarURL,
+		Conn:                        conn,
+		Hub:                         h.hub,
+		Send:                        make(chan []byte, 256),
+		Channels:                    make(map[uuid.UUID]bool),
+		activityRichPresenceCapable: activityRichPresenceCapable,
 	}
 
 	// Register client with hub
@@ -120,6 +122,14 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 	// Start client's read and write pumps
 	go client.writePump()
 	go client.readPump()
+}
+
+func requestSupportsActivityRichPresence(request *http.Request) bool {
+	if request == nil || request.URL == nil {
+		return false
+	}
+	values := request.URL.Query()["activity_rich_presence"]
+	return len(values) == 1 && values[0] == "1"
 }
 
 // authenticateWebSocket validates the connection using ticket-based auth (preferred)

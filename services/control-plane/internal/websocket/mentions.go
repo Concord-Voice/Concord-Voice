@@ -572,10 +572,7 @@ func (h *Hub) sendToUnsubscribedClientsIf(
 		if allow != nil && !allow(client) {
 			continue
 		}
-		select {
-		case client.Send <- msg:
-		default:
-		}
+		client.enqueueOutbound(msg)
 	}
 }
 
