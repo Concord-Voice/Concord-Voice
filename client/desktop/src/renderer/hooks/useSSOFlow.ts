@@ -74,6 +74,64 @@ async function discardMFASession(
 }
 
 /**
+ * Persist the verified MFA session's refresh token and admit the auth lifecycle.
+ * Split out of `handleSSOMfaResult` so both stay under the S3776
+ * cognitive-complexity threshold; the persist/admit ordering and every
+ * `reservationIsCurrent` fence are preserved exactly. Reached only after the
+ * caller has validated the credential tuple and re-checked the reservation.
+ */
+async function admitVerifiedSSOMfaSession(
+  payload: MFAVerifyResponse,
+  accessToken: string,
+  refreshToken: string,
+  sessionId: string,
+  reservationGeneration: number,
+  serverSelection: RuntimeServerSelection,
+  setState: (state: SSOState) => void
+): Promise<void> {
+  let credentialOwner: CredentialOwner | undefined;
+  try {
+    const storedOwner = await globalThis.electron?.storeRefreshToken?.({
+      refreshToken,
+      rememberMe: payload.remember_me ?? true,
+      apiBase: serverSelection.apiBase,
+      accessToken,
+    });
+    if (typeof storedOwner !== 'number') {
+      throw new TypeError('SSO MFA refresh-token persistence was rejected');
+    }
+    credentialOwner = storedOwner;
+  } catch {
+    await discardMFASession(payload, serverSelection, credentialOwner);
+    if (!reservationIsCurrent(reservationGeneration, serverSelection)) return;
+    setState({ phase: 'error', message: 'sso_mfa_persistence_failed' });
+    return;
+  }
+  if (!reservationIsCurrent(reservationGeneration, serverSelection)) {
+    await discardMFASession(payload, serverSelection, credentialOwner);
+    return;
+  }
+
+  // E2EE unwrap is passphrase-based via SSOEagerUnlock — do
+  // not derive crypto material from the MFA verify payload.
+  const admittedGeneration = useAuthStore
+    .getState()
+    .beginAuthLifecycleIfCurrent(reservationGeneration, accessToken, sessionId);
+  if (admittedGeneration === null || !runtimeServerSelectionIsCurrent(serverSelection)) {
+    if (
+      admittedGeneration !== null &&
+      useAuthStore.getState().authGeneration === admittedGeneration
+    ) {
+      useAuthStore.getState().clearAccessToken();
+    }
+    await discardMFASession(payload, serverSelection, credentialOwner);
+    return;
+  }
+  useE2EEStore.getState().setNeedsSSOUnlock(true, credentialOwner);
+  setState({ phase: 'idle' });
+}
+
+/**
  * MFA-verify continuation for the SSO `mfa_required` branch. Promoted verbatim
  * out of `begin`'s `.then` callback so neither the begin flow nor this
  * continuation exceeds the S3776 cognitive-complexity threshold. All try/catch,
@@ -102,46 +160,15 @@ async function handleSSOMfaResult(
       return;
     }
 
-    let credentialOwner: CredentialOwner | undefined;
-    try {
-      const storedOwner = await globalThis.electron?.storeRefreshToken?.({
-        refreshToken,
-        rememberMe: payload.remember_me ?? true,
-        apiBase: serverSelection.apiBase,
-        accessToken,
-      });
-      if (typeof storedOwner !== 'number') {
-        throw new TypeError('SSO MFA refresh-token persistence was rejected');
-      }
-      credentialOwner = storedOwner;
-    } catch {
-      await discardMFASession(payload, serverSelection, credentialOwner);
-      if (!reservationIsCurrent(reservationGeneration, serverSelection)) return;
-      setState({ phase: 'error', message: 'sso_mfa_persistence_failed' });
-      return;
-    }
-    if (!reservationIsCurrent(reservationGeneration, serverSelection)) {
-      await discardMFASession(payload, serverSelection, credentialOwner);
-      return;
-    }
-
-    // E2EE unwrap is passphrase-based via SSOEagerUnlock — do
-    // not derive crypto material from the MFA verify payload.
-    const admittedGeneration = useAuthStore
-      .getState()
-      .beginAuthLifecycleIfCurrent(reservationGeneration, accessToken, sessionId);
-    if (admittedGeneration === null || !runtimeServerSelectionIsCurrent(serverSelection)) {
-      if (
-        admittedGeneration !== null &&
-        useAuthStore.getState().authGeneration === admittedGeneration
-      ) {
-        useAuthStore.getState().clearAccessToken();
-      }
-      await discardMFASession(payload, serverSelection, credentialOwner);
-      return;
-    }
-    useE2EEStore.getState().setNeedsSSOUnlock(true, credentialOwner);
-    setState({ phase: 'idle' });
+    await admitVerifiedSSOMfaSession(
+      payload,
+      accessToken,
+      refreshToken,
+      sessionId,
+      reservationGeneration,
+      serverSelection,
+      setState
+    );
   } else {
     if (!reservationIsCurrent(reservationGeneration, serverSelection)) return;
     // verified:false. The user cancelled (clearChallenge fires
@@ -152,6 +179,39 @@ async function handleSSOMfaResult(
     // explicitly to leave that state.
     setState({ phase: 'idle' });
   }
+}
+
+/**
+ * Admit a direct (non-MFA) SSO login: begin the auth lifecycle, arm the SSO
+ * eager-unlock gate, and settle the store — or discard the session if the
+ * reservation was superseded. Split out of `begin`'s switch so `begin` stays
+ * under the S3776 cognitive-complexity threshold; the fence ordering is
+ * preserved exactly.
+ */
+async function admitDirectSSOLogin(
+  result: Extract<SSOResult, { kind: 'logged_in' }>,
+  reservationGeneration: number,
+  serverSelection: RuntimeServerSelection,
+  setState: (state: SSOState) => void
+): Promise<void> {
+  const admittedGeneration = useAuthStore
+    .getState()
+    .beginAuthLifecycleIfCurrent(reservationGeneration, result.accessToken, result.sessionId);
+  if (admittedGeneration === null || !runtimeServerSelectionIsCurrent(serverSelection)) {
+    if (
+      admittedGeneration !== null &&
+      useAuthStore.getState().authGeneration === admittedGeneration
+    ) {
+      useAuthStore.getState().clearAccessToken();
+    }
+    await discardDirectSSOSession(result, serverSelection);
+    return;
+  }
+  // Arm the SSO eager-unlock gate (#270 Task 21b). See
+  // e2eeStore.ts file-level doc for the two-flag semantics
+  // that combine `needsSSOUnlock` and `ready` to gate MainApp.
+  useE2EEStore.getState().setNeedsSSOUnlock(true, result.credentialOwner);
+  setState({ phase: 'idle' });
 }
 
 export function useSSOFlow(): { begin: (provider: SSOProvider) => Promise<void> } {
@@ -186,31 +246,9 @@ export function useSSOFlow(): { begin: (provider: SSOProvider) => Promise<void> 
         }
 
         switch (result.kind) {
-          case 'logged_in': {
-            const admittedGeneration = useAuthStore
-              .getState()
-              .beginAuthLifecycleIfCurrent(
-                reservationGeneration,
-                result.accessToken,
-                result.sessionId
-              );
-            if (admittedGeneration === null || !runtimeServerSelectionIsCurrent(serverSelection)) {
-              if (
-                admittedGeneration !== null &&
-                useAuthStore.getState().authGeneration === admittedGeneration
-              ) {
-                useAuthStore.getState().clearAccessToken();
-              }
-              await discardDirectSSOSession(result, serverSelection);
-              return;
-            }
-            // Arm the SSO eager-unlock gate (#270 Task 21b). See
-            // e2eeStore.ts file-level doc for the two-flag semantics
-            // that combine `needsSSOUnlock` and `ready` to gate MainApp.
-            useE2EEStore.getState().setNeedsSSOUnlock(true, result.credentialOwner);
-            setState({ phase: 'idle' });
+          case 'logged_in':
+            await admitDirectSSOLogin(result, reservationGeneration, serverSelection, setState);
             break;
-          }
           case 'mfa_required':
             // Bridge to the canonical MFA modal. The store records the SSO-side
             // phase (so AuthFlow / Login can render fall-back UI if needed) AND

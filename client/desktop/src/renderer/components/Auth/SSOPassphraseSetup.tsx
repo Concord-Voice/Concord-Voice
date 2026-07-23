@@ -83,6 +83,52 @@ function mapServerErrorToMessage(
   return body.error ?? body.detail ?? 'Registration failed. Please try again.';
 }
 
+/**
+ * Apply the inline error state for a failed SSO registration submit and settle
+ * `submitting`. Split out of `handleSubmit` so it stays under the S3776
+ * cognitive-complexity threshold; the caller has already run its
+ * `requestIsCurrent()` guard, so this only maps the error to user-facing copy.
+ */
+function applySSORegistrationError(
+  err: unknown,
+  keyMaterialPrepared: boolean,
+  providerName: string,
+  setError: (message: string) => void,
+  setTokenExpired: (expired: boolean) => void,
+  setSubmitting: (submitting: boolean) => void
+): void {
+  if (err instanceof SSOServiceError) {
+    const body = (err.body ?? {}) as CompleteRegistrationErrorBody;
+    setError(mapServerErrorToMessage(err.status, body, providerName));
+    if (err.status === 401 && body.error_code === 'sso_token_invalid') {
+      setTokenExpired(true);
+    }
+  } else if (keyMaterialPrepared) {
+    // Registration failed after key material was successfully prepared.
+    setError('Registration failed. Please try again.');
+  } else {
+    // Key generation/export threw before any server call was made.
+    setError('Could not prepare encryption keys. Please try again.');
+  }
+  setSubmitting(false);
+}
+
+/**
+ * Generate the RSA-4096 keypair and export its public key for SSO registration.
+ * Both are pure, side-effect-free crypto operations, so they collapse behind a
+ * single stale-attempt checkpoint in `handleSubmit` (no server call happens
+ * between them); split out to keep `handleSubmit` under the S3776
+ * cognitive-complexity threshold.
+ */
+async function prepareSSOKeyMaterial(passphrase: string): Promise<{
+  keys: Awaited<ReturnType<typeof generateRegistrationKeys>>;
+  publicKeyBase64: string;
+}> {
+  const keys = await generateRegistrationKeys(passphrase);
+  const publicKeyBase64 = await exportPublicKey(keys.publicKey);
+  return { keys, publicKeyBase64 };
+}
+
 const SSOPassphraseSetup: React.FC = () => {
   const state = useSSOStore((s) => s.state);
   const setSSOState = useSSOStore((s) => s.setState);
@@ -173,46 +219,18 @@ const SSOPassphraseSetup: React.FC = () => {
         setSubmitting(false);
       }
     };
-
-    try {
-      const keys = await generateRegistrationKeys(passphrase);
-      let staleCleanup = staleAttemptCleanup();
-      if (staleCleanup) {
-        await staleCleanup;
-        return;
-      }
-      const publicKeyBase64 = await exportPublicKey(keys.publicKey);
-      staleCleanup = staleAttemptCleanup();
-      if (staleCleanup) {
-        await staleCleanup;
-        return;
-      }
-      keyMaterialPrepared = true;
-
-      const result = await completeSSORegistration(
-        {
-          provider: state.provider,
-          ssoToken: state.ssoToken,
-          username,
-          passphrase,
-          wrappedPrivateKey: keys.wrappedPrivateKey,
-          keyDerivationSalt: keys.keyDerivationSalt,
-          publicKey: publicKeyBase64,
-        },
-        requestSelection
-      );
-      issuedSession = {
-        accessToken: result.accessToken,
-        sessionId: result.sessionId,
-        apiBase: requestSelection.apiBase,
-      };
-      credentialOwner = result.credentialOwner;
-      staleCleanup = staleAttemptCleanup();
-      if (staleCleanup) {
-        await staleCleanup;
-        return;
-      }
-
+    // Init E2EE, persist keys, and admit the session — the tail of the happy
+    // path. Kept as its own closure (measured separately for cognitive
+    // complexity) so `handleSubmit` stays under the S3776 threshold. It closes
+    // over the same mutable flow state and cleanup helpers, so every
+    // stale-attempt / receipt-ordering (CWE-212) and admission fence is
+    // preserved exactly; an early `return` here simply ends the tail (nothing
+    // follows its call), matching the original inline control flow.
+    const finalizeAdmission = async (
+      keys: Awaited<ReturnType<typeof generateRegistrationKeys>>,
+      result: Awaited<ReturnType<typeof completeSSORegistration>>
+    ): Promise<void> => {
+      let staleCleanup: Promise<void> | null;
       try {
         await e2eeService.initialize(
           passphrase,
@@ -251,7 +269,10 @@ const SSOPassphraseSetup: React.FC = () => {
         );
       }
 
-      await persistE2EESessionKeys(flowInitializationReceipt?.sessionKeys ?? null, credentialOwner);
+      await persistE2EESessionKeys(
+        flowInitializationReceipt?.sessionKeys ?? null,
+        result.credentialOwner
+      );
       staleCleanup = staleAttemptCleanup();
       if (staleCleanup) {
         await staleCleanup;
@@ -264,7 +285,7 @@ const SSOPassphraseSetup: React.FC = () => {
       }
 
       if (needsSSOUnlock) {
-        useE2EEStore.getState().setNeedsSSOUnlock(true, credentialOwner);
+        useE2EEStore.getState().setNeedsSSOUnlock(true, result.credentialOwner);
       }
       admittedGeneration = useAuthStore
         .getState()
@@ -281,22 +302,54 @@ const SSOPassphraseSetup: React.FC = () => {
       } else {
         await cleanupIssuedSession();
       }
+    };
+
+    try {
+      const { keys, publicKeyBase64 } = await prepareSSOKeyMaterial(passphrase);
+      let staleCleanup = staleAttemptCleanup();
+      if (staleCleanup) {
+        await staleCleanup;
+        return;
+      }
+      keyMaterialPrepared = true;
+
+      const result = await completeSSORegistration(
+        {
+          provider: state.provider,
+          ssoToken: state.ssoToken,
+          username,
+          passphrase,
+          wrappedPrivateKey: keys.wrappedPrivateKey,
+          keyDerivationSalt: keys.keyDerivationSalt,
+          publicKey: publicKeyBase64,
+        },
+        requestSelection
+      );
+      issuedSession = {
+        accessToken: result.accessToken,
+        sessionId: result.sessionId,
+        apiBase: requestSelection.apiBase,
+      };
+      credentialOwner = result.credentialOwner;
+      staleCleanup = staleAttemptCleanup();
+      if (staleCleanup) {
+        await staleCleanup;
+        return;
+      }
+
+      await finalizeAdmission(keys, result);
     } catch (err) {
       const mayReport = requestIsCurrent();
       await cleanupIssuedSession();
       if (!mayReport || !requestIsCurrent()) return;
-      if (err instanceof SSOServiceError) {
-        const body = (err.body ?? {}) as CompleteRegistrationErrorBody;
-        setError(mapServerErrorToMessage(err.status, body, providerName));
-        if (err.status === 401 && body.error_code === 'sso_token_invalid') {
-          setTokenExpired(true);
-        }
-      } else if (!keyMaterialPrepared) {
-        setError('Could not prepare encryption keys. Please try again.');
-      } else {
-        setError('Registration failed. Please try again.');
-      }
-      setSubmitting(false);
+      applySSORegistrationError(
+        err,
+        keyMaterialPrepared,
+        providerName,
+        setError,
+        setTokenExpired,
+        setSubmitting
+      );
     }
   };
 

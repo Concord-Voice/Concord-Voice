@@ -646,25 +646,53 @@ const Login: React.FC<LoginProps> = ({
     // the committed keyset instead of no-op'ing on a null receipt (CWE-212).
     captureFlowReceipt: () => void
   ): Promise<boolean> => {
-    const decision = await promptKeyRecovery();
-    setKeyRecoveryResolver(null);
-    if (!runtimeServerSelectionIsCurrent(requestSelection)) {
-      await abortForOriginChange();
-    }
-    await requireFlowOwnership();
+    // Clear ONLY this flow's own early-set access token — never a successor's.
+    // Deduplicated from the two reset-error branches below and kept out of the
+    // reset flow so this handler stays under the S3776 cognitive-complexity
+    // threshold.
+    const clearAbortedFlowToken = () => {
+      const auth = useAuthStore.getState();
+      if (
+        abortedSession.authGeneration !== undefined &&
+        auth.authGeneration === abortedSession.authGeneration
+      ) {
+        auth.clearAccessToken();
+      }
+    };
 
-    if (decision.action === 'cancel') {
-      abortKeyRecovery(abortedSession.authGeneration);
-      return false;
-    }
+    // On ANY reset failure, clear the early-set token then rethrow so a failed
+    // reset cannot strand the user in a half-authenticated state (the cancel
+    // branch's invariant — spec §3.3.4). A teardown during the recovery init
+    // follows the SAME abort contract as the primary init path (Codex P1,
+    // #2337): strip only this flow's own token and revoke the aborted server
+    // session — otherwise the login's refresh-token row + HttpOnly cookie
+    // outlive the logout-class teardown. Always throws (never returns).
+    const handleResetError = async (resetError: unknown): Promise<never> => {
+      if (resetError instanceof E2EEInitTeardownError) {
+        clearAbortedFlowToken();
+        if (
+          !(resetError instanceof LoginOriginChangedError) &&
+          !(resetError instanceof LoginOwnershipChangedError)
+        ) {
+          await revokeAbortedSession(abortedSession);
+        }
+        throw resetError;
+      }
+      clearAbortedFlowToken();
+      throw resetError;
+    };
 
     // The access token set at login authenticates the reset PUT. The reset is a
     // destructive, step-up-authenticated operation, so it sends the current
     // password (already in hand from the login form) and, when the server
-    // demands it, an MFA code. On ANY failure, clear the early-set token then
-    // rethrow so a failed reset cannot strand the user in a half-authenticated
-    // state (the cancel branch's invariant — spec §3.3.4).
-    try {
+    // demands it, an MFA code; then re-inits E2EE with the new keys. Returns
+    // true on success, false if the user cancelled the MFA step-up. Kept as its
+    // own closure (measured separately for cognitive complexity) so this handler
+    // stays under the S3776 threshold; every origin/ownership fence is preserved
+    // exactly, and any failure propagates to handleResetError via the catch.
+    const performReset = async (
+      resetDecision: Awaited<ReturnType<typeof promptKeyRecovery>>
+    ): Promise<boolean> => {
       const newKeys = await generateRegistrationKeys(formData.password);
       const publicKeyB64 = await exportPublicKey(newKeys.publicKey);
       const sendReset = (mfaCode?: string) => {
@@ -687,7 +715,7 @@ const Login: React.FC<LoginProps> = ({
       };
 
       await requireFlowOwnership();
-      let replaceRes = await sendReset(decision.mfaCode);
+      let replaceRes = await sendReset(resetDecision.mfaCode);
       if (!runtimeServerSelectionIsCurrent(requestSelection)) {
         await abortForOriginChange();
       }
@@ -736,35 +764,24 @@ const Login: React.FC<LoginProps> = ({
       await requireFlowOwnership();
       console.debug('E2EE keys reset and service initialized!');
       return true;
+    };
+
+    const decision = await promptKeyRecovery();
+    setKeyRecoveryResolver(null);
+    if (!runtimeServerSelectionIsCurrent(requestSelection)) {
+      await abortForOriginChange();
+    }
+    await requireFlowOwnership();
+
+    if (decision.action === 'cancel') {
+      abortKeyRecovery(abortedSession.authGeneration);
+      return false;
+    }
+
+    try {
+      return await performReset(decision);
     } catch (resetError) {
-      // A teardown during the recovery init follows the SAME abort contract as
-      // the primary init path (Codex P1, #2337): strip only this flow's own
-      // token and revoke the aborted server session — otherwise the login's
-      // refresh-token row + HttpOnly cookie outlive the logout-class teardown.
-      if (resetError instanceof E2EEInitTeardownError) {
-        const auth = useAuthStore.getState();
-        if (
-          abortedSession.authGeneration !== undefined &&
-          auth.authGeneration === abortedSession.authGeneration
-        ) {
-          auth.clearAccessToken();
-        }
-        if (
-          !(resetError instanceof LoginOriginChangedError) &&
-          !(resetError instanceof LoginOwnershipChangedError)
-        ) {
-          await revokeAbortedSession(abortedSession);
-        }
-        throw resetError;
-      }
-      const auth = useAuthStore.getState();
-      if (
-        abortedSession.authGeneration !== undefined &&
-        auth.authGeneration === abortedSession.authGeneration
-      ) {
-        auth.clearAccessToken();
-      }
-      throw resetError;
+      return await handleResetError(resetError);
     }
   };
 
@@ -826,6 +843,12 @@ const Login: React.FC<LoginProps> = ({
     const clearFlowSessionKeys = () => {
       e2eeService.clearKeysIfInitializationCurrent(flowInitializationReceipt);
     };
+    // Read the captured receipt's session keys through a closure: the only
+    // writes to flowInitializationReceipt now happen inside unwrapOrRecoverKeys
+    // (a closure), which TypeScript's outer-scope control-flow analysis cannot
+    // observe — a direct outer read would narrow to null. The closure sees the
+    // declared receipt type and the live value.
+    const capturedSessionKeysForPersist = () => flowInitializationReceipt?.sessionKeys ?? null;
     const abortForOriginChange = async (): Promise<never> => {
       if (flowOwnsAuthStore()) {
         // The key material and renderer token still belong to this old-origin
@@ -853,6 +876,16 @@ const Login: React.FC<LoginProps> = ({
     const requireFlowOwnership = async (): Promise<void> => {
       if (!flowOwnsAuthStore()) await abortForLostOwnership();
     };
+    // Combined origin + ownership fence: the exact `if (!current)
+    // abortForOriginChange(); await requireFlowOwnership();` pair that guards
+    // every post-await boundary in this flow. Extracted so the pair is a single
+    // call (measured separately for cognitive complexity), keeping
+    // completeLoginFromResponse under the S3776 threshold — with the fence order
+    // (origin first, then ownership) preserved exactly.
+    const fenceOriginAndOwnership = async (): Promise<void> => {
+      if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
+      await requireFlowOwnership();
+    };
     const abortForCredentialPersistenceFailure = async (error: unknown): Promise<never> => {
       clearFlowSessionKeys();
       stripAbortedToken();
@@ -873,71 +906,80 @@ const Login: React.FC<LoginProps> = ({
     };
 
     const kdAlg = data.e2ee_keys.key_derivation_alg || 'pbkdf2';
-    try {
-      await unwrapLoginKeys(
-        formData.password,
-        data.e2ee_keys.wrapped_private_key,
-        data.e2ee_keys.key_derivation_salt,
-        kdAlg
-      );
-      if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
-      await requireFlowOwnership();
-      // e2eeService.initialize handles PBKDF2→Argon2id migration automatically
-      await e2eeService.initialize(
-        formData.password,
-        data.e2ee_keys.wrapped_private_key,
-        data.e2ee_keys.key_derivation_salt,
-        kdAlg,
-        initializationGuard,
-        teardownEpoch
-      );
-      // Capture the receipt the instant initialize() resolves — BEFORE the
-      // origin/ownership re-checks below. Otherwise, if ownership is lost in the
-      // microtask window between initialize()'s synchronous key commit and
-      // requireFlowOwnership(), the abort's clearFlowSessionKeys() runs against a
-      // still-null receipt and cannot wipe the committed keyset (CWE-212).
-      // captureInitializationReceipt() returns null when no keyset committed, and
-      // clearKeysIfInitializationCurrent is identity+attempt-guarded, so an early
-      // capture can never erase a successor's keys.
-      flowInitializationReceipt = e2eeService.captureInitializationReceipt();
-      if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
-      await requireFlowOwnership();
-      console.debug('Private key unwrapped and E2EE service initialized!');
-    } catch (unwrapError) {
-      // A teardown mid-login is NOT a corrupt-key condition — never route it
-      // into the consented key-reset prompt. Rethrow so the outer login catch
-      // surfaces an error WITHOUT storing tokens or calling onSuccess (the
-      // session this login belonged to is gone).
-      if (unwrapError instanceof E2EEInitTeardownError) {
-        stripAbortedToken();
-        if (
-          !(unwrapError instanceof LoginOriginChangedError) &&
-          !(unwrapError instanceof LoginOwnershipChangedError)
-        ) {
-          await revokeAbortedSession(abortedSession);
+    // Unwrap + initialize the private key, falling back to the consented
+    // key-reset prompt on a corrupt-key failure. Returns true to continue the
+    // login, false if the user cancelled recovery (caller returns). Kept as its
+    // own closure (measured separately for cognitive complexity) so
+    // completeLoginFromResponse stays under the S3776 threshold; every fence and
+    // the receipt-capture ordering (CWE-212) are preserved exactly, and a
+    // teardown/abort still rethrows to the outer login catch.
+    const unwrapOrRecoverKeys = async (): Promise<boolean> => {
+      try {
+        await unwrapLoginKeys(
+          formData.password,
+          data.e2ee_keys.wrapped_private_key,
+          data.e2ee_keys.key_derivation_salt,
+          kdAlg
+        );
+        await fenceOriginAndOwnership();
+        // e2eeService.initialize handles PBKDF2→Argon2id migration automatically
+        await e2eeService.initialize(
+          formData.password,
+          data.e2ee_keys.wrapped_private_key,
+          data.e2ee_keys.key_derivation_salt,
+          kdAlg,
+          initializationGuard,
+          teardownEpoch
+        );
+        // Capture the receipt the instant initialize() resolves — BEFORE the
+        // origin/ownership re-checks below. Otherwise, if ownership is lost in the
+        // microtask window between initialize()'s synchronous key commit and
+        // requireFlowOwnership(), the abort's clearFlowSessionKeys() runs against a
+        // still-null receipt and cannot wipe the committed keyset (CWE-212).
+        // captureInitializationReceipt() returns null when no keyset committed, and
+        // clearKeysIfInitializationCurrent is identity+attempt-guarded, so an early
+        // capture can never erase a successor's keys.
+        flowInitializationReceipt = e2eeService.captureInitializationReceipt();
+        await fenceOriginAndOwnership();
+        console.debug('Private key unwrapped and E2EE service initialized!');
+        return true;
+      } catch (unwrapError) {
+        // A teardown mid-login is NOT a corrupt-key condition — never route it
+        // into the consented key-reset prompt. Rethrow so the outer login catch
+        // surfaces an error WITHOUT storing tokens or calling onSuccess (the
+        // session this login belonged to is gone).
+        if (unwrapError instanceof E2EEInitTeardownError) {
+          stripAbortedToken();
+          if (
+            !(unwrapError instanceof LoginOriginChangedError) &&
+            !(unwrapError instanceof LoginOwnershipChangedError)
+          ) {
+            await revokeAbortedSession(abortedSession);
+          }
+          throw unwrapError;
         }
-        throw unwrapError;
+        if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
+        console.warn(
+          'Key unwrap failed; prompting for consented key reset',
+          errorMessage(unwrapError)
+        );
+        const recovered = await handleKeyRecovery(
+          teardownEpoch,
+          abortedSession,
+          requestSelection,
+          abortForOriginChange,
+          initializationGuard,
+          requireFlowOwnership,
+          () => {
+            flowInitializationReceipt = e2eeService.captureInitializationReceipt();
+          }
+        );
+        if (!recovered) return false;
+        await fenceOriginAndOwnership();
+        return true;
       }
-      if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
-      console.warn(
-        'Key unwrap failed; prompting for consented key reset',
-        errorMessage(unwrapError)
-      );
-      const recovered = await handleKeyRecovery(
-        teardownEpoch,
-        abortedSession,
-        requestSelection,
-        abortForOriginChange,
-        initializationGuard,
-        requireFlowOwnership,
-        () => {
-          flowInitializationReceipt = e2eeService.captureInitializationReceipt();
-        }
-      );
-      if (!recovered) return;
-      if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
-      await requireFlowOwnership();
-    }
+    };
+    if (!(await unwrapOrRecoverKeys())) return;
 
     // Pre-admit epoch check #1: initialize()'s fence covers only the span up
     // to the key commit. A teardown landing after it resolved must not let us
@@ -947,36 +989,41 @@ const Login: React.FC<LoginProps> = ({
       await revokeAbortedSession(abortedSession);
       throw new E2EEInitTeardownError();
     }
-    if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
-    await requireFlowOwnership();
+    await fenceOriginAndOwnership();
 
-    if (globalThis.electron) {
-      if (!globalThis.electron.storeRefreshToken) {
-        await abortForCredentialPersistenceFailure(
-          new Error('Desktop refresh-token persistence is unavailable.')
-        );
+    // Persist this flow's refresh token to the OS keychain (desktop only) and
+    // record its CredentialOwner. Kept as its own closure (measured separately
+    // for cognitive complexity) so completeLoginFromResponse stays under the
+    // S3776 threshold; every persistence-failure abort is preserved exactly.
+    const persistRefreshTokenForDesktop = async (): Promise<void> => {
+      if (globalThis.electron) {
+        if (!globalThis.electron.storeRefreshToken) {
+          await abortForCredentialPersistenceFailure(
+            new Error('Desktop refresh-token persistence is unavailable.')
+          );
+        }
+        let storedOwner: CredentialOwner | { status: 'rejected' } | null = null;
+        try {
+          storedOwner = await globalThis.electron.storeRefreshToken({
+            refreshToken: data.refresh_token,
+            rememberMe: data.remember_me ?? formData.rememberMe,
+            apiBase: requestApiBase,
+            accessToken: data.access_token,
+          });
+        } catch (storeError) {
+          await abortForCredentialPersistenceFailure(storeError);
+        }
+        if (typeof storedOwner === 'number') {
+          credentialOwner = storedOwner;
+        } else {
+          await abortForCredentialPersistenceFailure(
+            new Error('Desktop rejected refresh-token persistence.')
+          );
+        }
       }
-      let storedOwner: CredentialOwner | { status: 'rejected' } | null = null;
-      try {
-        storedOwner = await globalThis.electron.storeRefreshToken({
-          refreshToken: data.refresh_token,
-          rememberMe: data.remember_me ?? formData.rememberMe,
-          apiBase: requestApiBase,
-          accessToken: data.access_token,
-        });
-      } catch (storeError) {
-        await abortForCredentialPersistenceFailure(storeError);
-      }
-      if (typeof storedOwner === 'number') {
-        credentialOwner = storedOwner;
-      } else {
-        await abortForCredentialPersistenceFailure(
-          new Error('Desktop rejected refresh-token persistence.')
-        );
-      }
-    }
-    if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
-    await requireFlowOwnership();
+    };
+    await persistRefreshTokenForDesktop();
+    await fenceOriginAndOwnership();
     // Deliberately NO token re-publish here: the early set above already
     // installed it, and an unconditional re-set would resurrect a token that
     // a mid-await teardown just cleared — past the final abort check below
@@ -986,12 +1033,8 @@ const Login: React.FC<LoginProps> = ({
     // Persist E2EE keys for restart-survival; failure warns only and never
     // clears the valid in-session keys (#1278/#1288 — see persistE2EESessionKeys).
     await requireFlowOwnership();
-    await persistE2EESessionKeys(
-      flowInitializationReceipt?.sessionKeys ?? null,
-      credentialOwner ?? undefined
-    );
-    if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
-    await requireFlowOwnership();
+    await persistE2EESessionKeys(capturedSessionKeysForPersist(), credentialOwner ?? undefined);
+    await fenceOriginAndOwnership();
 
     // Hydrate all post-login user state — preferences, saved GIFs, notification
     // mute prefs, and the entitlement capability set. Extracted to the shared
@@ -1006,8 +1049,7 @@ const Login: React.FC<LoginProps> = ({
         runtimeServerSelectionIsCurrent(requestSelection) &&
         flowOwnsAuthStore(),
     });
-    if (!runtimeServerSelectionIsCurrent(requestSelection)) await abortForOriginChange();
-    await requireFlowOwnership();
+    await fenceOriginAndOwnership();
 
     // The storeRefreshToken IPC above may have persisted this dead flow's
     // refresh token + cached access token to DISK. The server revoke below is

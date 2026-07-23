@@ -801,6 +801,19 @@ func (s *NATSSubscriber) withVoiceLifecycleClaimStatusInParticipantSet(
 	return s.withServerVoiceLifecycleClaim(ctx, request, mutation)
 }
 
+// joinRollbackErr folds a non-benign rollback error into returnErr and returns
+// the result. A nil rollbackErr or a benign sql.ErrTxDone (the tx was already
+// committed or rolled back) is ignored. Shared by the transactional
+// voice-lifecycle mutators so they declare one rollback error-handling contract
+// in a single place. Each caller keeps the tx.Rollback() call itself inline in
+// its deferred closure so the rollback stays statically visible.
+func joinRollbackErr(returnErr, rollbackErr error, msg string) error {
+	if rollbackErr == nil || errors.Is(rollbackErr, sql.ErrTxDone) {
+		return returnErr
+	}
+	return errors.Join(returnErr, fmt.Errorf("%s: %w", msg, rollbackErr))
+}
+
 func (s *NATSSubscriber) withServerVoiceLifecycleClaim(
 	ctx context.Context,
 	request voiceLifecycleClaimRequest,
@@ -815,13 +828,8 @@ func (s *NATSSubscriber) withServerVoiceLifecycleClaim(
 		return false, voiceLifecycleRejected, fmt.Errorf("begin voice lifecycle mutation: %w", err)
 	}
 	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil &&
-			!errors.Is(rollbackErr, sql.ErrTxDone) {
-			returnErr = errors.Join(
-				returnErr,
-				fmt.Errorf("rollback voice lifecycle mutation: %w", rollbackErr),
-			)
-		}
+		rollbackErr := tx.Rollback()
+		returnErr = joinRollbackErr(returnErr, rollbackErr, "rollback voice lifecycle mutation")
 	}()
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
 		return false, voiceLifecycleRejected, fmt.Errorf("lock voice lifecycle mutation: %w", err)
@@ -1157,13 +1165,8 @@ func (s *NATSSubscriber) withPrivateVoiceParticipantSetClaim(
 		)
 	}
 	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil &&
-			!errors.Is(rollbackErr, sql.ErrTxDone) {
-			returnErr = errors.Join(
-				returnErr,
-				fmt.Errorf("rollback private voice participant-set mutation: %w", rollbackErr),
-			)
-		}
+		rollbackErr := tx.Rollback()
+		returnErr = joinRollbackErr(returnErr, rollbackErr, "rollback private voice participant-set mutation")
 	}()
 	state, rejected, err := s.preparePrivateVoiceParticipantSetClaim(ctx, tx, request)
 	if err != nil || rejected {
@@ -1464,13 +1467,8 @@ func (s *NATSSubscriber) withVoiceLifecycleLockInParticipantSet(
 		return false, fmt.Errorf("begin voice lifecycle lock mutation: %w", err)
 	}
 	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil &&
-			!errors.Is(rollbackErr, sql.ErrTxDone) {
-			returnErr = errors.Join(
-				returnErr,
-				fmt.Errorf("rollback voice lifecycle lock mutation: %w", rollbackErr),
-			)
-		}
+		rollbackErr := tx.Rollback()
+		returnErr = joinRollbackErr(returnErr, rollbackErr, "rollback voice lifecycle lock mutation")
 	}()
 	if err := lockVoiceLifecycleMutationScope(
 		ctx, tx, category, conversationID,
@@ -1544,13 +1542,8 @@ func (s *NATSSubscriber) withVoiceLifecycleClaims(
 		return nil, false, false, fmt.Errorf("begin grouped voice lifecycle mutation: %w", err)
 	}
 	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil &&
-			!errors.Is(rollbackErr, sql.ErrTxDone) {
-			returnErr = errors.Join(
-				returnErr,
-				fmt.Errorf("rollback grouped voice lifecycle mutation: %w", rollbackErr),
-			)
-		}
+		rollbackErr := tx.Rollback()
+		returnErr = joinRollbackErr(returnErr, rollbackErr, "rollback grouped voice lifecycle mutation")
 	}()
 	if err := s.lockGroupedPrivateVoiceScopes(ctx, tx, request, state); err != nil {
 		return nil, false, false, err
@@ -2285,13 +2278,8 @@ func (s *NATSSubscriber) upsertPrivateVoiceParticipant(
 		return false, nil, fmt.Errorf("begin private voice participant upsert: %w", err)
 	}
 	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil &&
-			!errors.Is(rollbackErr, sql.ErrTxDone) {
-			returnErr = errors.Join(
-				returnErr,
-				fmt.Errorf("rollback private voice participant upsert: %w", rollbackErr),
-			)
-		}
+		rollbackErr := tx.Rollback()
+		returnErr = joinRollbackErr(returnErr, rollbackErr, "rollback private voice participant upsert")
 	}()
 	rejected, err := s.lockPrivateVoiceParticipantUpsert(ctx, tx, state)
 	if err != nil || rejected {

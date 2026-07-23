@@ -1935,71 +1935,19 @@ func (h *Handler) disconnectUserByID(userID string) {
 // ambient refresh cookie's token hash.
 func (h *Handler) Logout(c *gin.Context) {
 	claims := h.blacklistAccessToken(c)
-	refreshToken := c.GetHeader("X-Refresh-Token")
-	sessionID := c.GetHeader("X-Session-ID")
-	credentialPresented := refreshToken != "" || sessionID != ""
-
-	var revokedUserID, revokedSessionID string
-	var cookieAuthorized bool
-	var revokeErr error
-	switch {
-	case refreshToken != "":
-		tokenHash := HashRefreshToken(refreshToken)
-		revokeErr = h.db.QueryRowContext(
-			c.Request.Context(),
-			`UPDATE refresh_tokens SET revoked_at = NOW()
-			 WHERE token_hash = $1 AND revoked_at IS NULL
-			 RETURNING user_id, id`,
-			tokenHash,
-		).Scan(&revokedUserID, &revokedSessionID)
-	case sessionID != "":
-		if _, parseErr := uuid.Parse(sessionID); parseErr != nil {
-			break
-		}
-		if claims != nil {
-			revokeErr = h.db.QueryRowContext(
-				c.Request.Context(),
-				`UPDATE refresh_tokens SET revoked_at = NOW()
-				 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
-				 RETURNING user_id, id`,
-				sessionID, claims.UserID,
-			).Scan(&revokedUserID, &revokedSessionID)
-			break
-		}
-		cookieToken, err := c.Cookie("refresh_token")
-		if err == nil && cookieToken != "" {
-			cookieAuthorized = true
-			tokenHash := HashRefreshToken(cookieToken)
-			revokeErr = h.db.QueryRowContext(
-				c.Request.Context(),
-				`UPDATE refresh_tokens SET revoked_at = NOW()
-				 WHERE id = $1 AND token_hash = $2 AND revoked_at IS NULL
-				 RETURNING user_id, id`,
-				sessionID, tokenHash,
-			).Scan(&revokedUserID, &revokedSessionID)
-		}
-	default:
-		cookieToken, err := c.Cookie("refresh_token")
-		if err == nil && cookieToken != "" {
-			credentialPresented = true
-			cookieAuthorized = true
-			tokenHash := HashRefreshToken(cookieToken)
-			revokeErr = h.db.QueryRowContext(
-				c.Request.Context(),
-				`UPDATE refresh_tokens SET revoked_at = NOW()
-				 WHERE token_hash = $1 AND revoked_at IS NULL
-				 RETURNING user_id, id`,
-				tokenHash,
-			).Scan(&revokedUserID, &revokedSessionID)
-		}
-	}
-	if revokeErr != nil && !errors.Is(revokeErr, sql.ErrNoRows) {
-		h.log.Error("Failed to revoke refresh session during logout", "error", revokeErr)
+	revoked := h.revokeLogoutSession(
+		c, claims,
+		c.GetHeader("X-Refresh-Token"),
+		c.GetHeader("X-Session-ID"),
+	)
+	revokedUserID, revokedSessionID := revoked.userID, revoked.sessionID
+	if revoked.err != nil && !errors.Is(revoked.err, sql.ErrNoRows) {
+		h.log.Error("Failed to revoke refresh session during logout", "error", revoked.err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalError})
 		return
 	}
 
-	if !credentialPresented {
+	if !revoked.credentialPresented {
 		c.JSON(http.StatusOK, gin.H{"message": "Already logged out"})
 		return
 	}
@@ -2019,10 +1967,106 @@ func (h *Handler) Logout(c *gin.Context) {
 
 	h.disconnectUserByID(revokedUserID)
 
-	if cookieAuthorized && revokedSessionID != "" {
+	if revoked.cookieAuthorized && revokedSessionID != "" {
 		SetRefreshCookie(c, "", -1)
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
+}
+
+// logoutRevocation is the outcome of revokeLogoutSession: which session (if any)
+// was revoked, whether the revocation was cookie-authorized (so the caller may
+// clear the cookie), whether any credential was presented at all, and the DB
+// error (sql.ErrNoRows is expected when no live row matched).
+type logoutRevocation struct {
+	userID              string
+	sessionID           string
+	cookieAuthorized    bool
+	credentialPresented bool
+	err                 error
+}
+
+// wrapRevokeErr adds operation context to a refresh-token revocation error.
+// A nil error is returned unchanged — wrapping nil would turn a successful
+// revoke into a failure — and the %w verb keeps the caller's
+// errors.Is(err, sql.ErrNoRows) check matching through the wrapper.
+func wrapRevokeErr(err error, op string) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", op, err)
+}
+
+// revokeByTokenHash revokes the live refresh-token row whose hash matches
+// tokenHash and returns the owning user and session IDs. Shared by the explicit
+// X-Refresh-Token path and the ambient-cookie path, which issue an identical
+// statement — one copy stops the two from drifting.
+func (h *Handler) revokeByTokenHash(
+	ctx context.Context,
+	tokenHash string,
+) (userID, sessionID string, err error) {
+	err = h.db.QueryRowContext(
+		ctx,
+		`UPDATE refresh_tokens SET revoked_at = NOW()
+		 WHERE token_hash = $1 AND revoked_at IS NULL
+		 RETURNING user_id, id`,
+		tokenHash,
+	).Scan(&userID, &sessionID)
+	return userID, sessionID, wrapRevokeErr(err, "revoke refresh token by token hash")
+}
+
+// revokeLogoutSession selects the refresh-token revocation strategy for a logout
+// and runs it: explicit X-Refresh-Token first, then X-Session-ID (bearer-scoped
+// to claims.UserID, else matched against the ambient cookie's token hash), then
+// the ambient refresh cookie alone. Explicit credentials take precedence over the
+// cookie so best-effort cleanup of an aborted flow can never revoke a successor
+// session from the ambient cookie jar (see Logout's doc comment).
+func (h *Handler) revokeLogoutSession(
+	c *gin.Context,
+	claims *Claims,
+	refreshToken, sessionID string,
+) logoutRevocation {
+	result := logoutRevocation{credentialPresented: refreshToken != "" || sessionID != ""}
+	switch {
+	case refreshToken != "":
+		result.userID, result.sessionID, result.err = h.revokeByTokenHash(
+			c.Request.Context(), HashRefreshToken(refreshToken),
+		)
+	case sessionID != "":
+		if _, parseErr := uuid.Parse(sessionID); parseErr != nil {
+			return result
+		}
+		if claims != nil {
+			result.err = wrapRevokeErr(h.db.QueryRowContext(
+				c.Request.Context(),
+				`UPDATE refresh_tokens SET revoked_at = NOW()
+				 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+				 RETURNING user_id, id`,
+				sessionID, claims.UserID,
+			).Scan(&result.userID, &result.sessionID), "revoke session for bearer user")
+			return result
+		}
+		cookieToken, err := c.Cookie("refresh_token")
+		if err == nil && cookieToken != "" {
+			result.cookieAuthorized = true
+			result.err = wrapRevokeErr(h.db.QueryRowContext(
+				c.Request.Context(),
+				`UPDATE refresh_tokens SET revoked_at = NOW()
+				 WHERE id = $1 AND token_hash = $2 AND revoked_at IS NULL
+				 RETURNING user_id, id`,
+				sessionID, HashRefreshToken(cookieToken),
+			).Scan(&result.userID, &result.sessionID), "revoke session by id and cookie hash")
+		}
+	default:
+		cookieToken, err := c.Cookie("refresh_token")
+		if err == nil && cookieToken != "" {
+			result.credentialPresented = true
+			result.cookieAuthorized = true
+			result.userID, result.sessionID, result.err = h.revokeByTokenHash(
+				c.Request.Context(), HashRefreshToken(cookieToken),
+			)
+		}
+	}
+	return result
 }
 
 // ── Account Recovery Endpoints ──────────────────────────────────────────────
