@@ -26,6 +26,15 @@ describe('DMJoinCallIdTracker', () => {
     tracker.observe(undefined);
     expect(tracker.current()).toBe('server-call');
   });
+
+  it('retains the A1 call ID when A2 reports a rotated generation (#2407)', () => {
+    const tracker = new DMJoinCallIdTracker('client-call');
+
+    tracker.observe('call-a1');
+    tracker.observe('call-a2-rotated');
+
+    expect(tracker.current()).toBe('call-a1');
+  });
 });
 
 function deferred<T>() {
@@ -170,6 +179,108 @@ describe('runSocketBoundJoin', () => {
     expect(order).toEqual(['join', 'reauthorize', 'finalize']);
   });
 
+  it('commits only after A2 refresh and the final connected check (#2407)', async () => {
+    const initialAccess = { allowed: true, callId: 'call-a1' };
+    const refreshedAccess = { allowed: true, callId: 'call-a1' };
+    const order: string[] = [];
+    let connectedChecks = 0;
+
+    await expect(
+      runSocketBoundJoin({
+        authorize: async () => initialAccess,
+        isAllowed: (access, authorizedAccess) => {
+          if (access === refreshedAccess) order.push('validate-a2');
+          return (
+            access.allowed &&
+            (authorizedAccess === undefined || access.callId === authorizedAccess.callId)
+          );
+        },
+        isConnected: () => {
+          connectedChecks++;
+          if (connectedChecks === 2) order.push('final-connected-check');
+          return true;
+        },
+        join: async () => {
+          order.push('register');
+          return { room: 'dm-1', committed: false };
+        },
+        reauthorize: async () => {
+          order.push('authorize-a2');
+          return refreshedAccess;
+        },
+        finalize: async () => {
+          order.push('apply-refreshed-state');
+        },
+        commit: (_access, value) => {
+          order.push('commit');
+          return { ...value, committed: true };
+        },
+        rollback: vi.fn(async () => undefined),
+      })
+    ).resolves.toEqual({
+      access: refreshedAccess,
+      status: 'joined',
+      value: { room: 'dm-1', committed: true },
+    });
+
+    expect(order).toEqual([
+      'register',
+      'authorize-a2',
+      'validate-a2',
+      'apply-refreshed-state',
+      'final-connected-check',
+      'commit',
+    ]);
+  });
+
+  it('rejects a rotated A2 generation before commit (#2407)', async () => {
+    const initialAccess = { allowed: true, callId: 'call-a1' };
+    const rotatedAccess = { allowed: true, callId: 'call-a2' };
+    const commit = vi.fn((_: typeof initialAccess, value: string) => value);
+    const rollback = vi.fn(async () => undefined);
+
+    await expect(
+      runSocketBoundJoin({
+        authorize: async () => initialAccess,
+        isAllowed: (access, authorizedAccess) =>
+          access.allowed &&
+          (authorizedAccess === undefined || access.callId === authorizedAccess.callId),
+        isConnected: () => true,
+        join: async () => 'registered',
+        reauthorize: async () => rotatedAccess,
+        commit,
+        rollback,
+      })
+    ).resolves.toEqual({ access: rotatedAccess, status: 'revoked' });
+
+    expect(commit).not.toHaveBeenCalled();
+    expect(rollback).toHaveBeenCalledExactlyOnceWith(initialAccess);
+  });
+
+  it('rolls back instead of committing when the socket disconnects after refresh (#2407)', async () => {
+    let connected = true;
+    const commit = vi.fn((_: { allowed: boolean }, value: string) => value);
+    const rollback = vi.fn(async () => undefined);
+
+    await expect(
+      runSocketBoundJoin({
+        authorize: async () => ({ allowed: true }),
+        isAllowed: (access) => access.allowed,
+        isConnected: () => connected,
+        join: async () => 'registered',
+        reauthorize: async () => ({ allowed: true }),
+        finalize: async () => {
+          connected = false;
+        },
+        commit,
+        rollback,
+      })
+    ).resolves.toEqual({ access: { allowed: true }, status: 'canceled' });
+
+    expect(commit).not.toHaveBeenCalled();
+    expect(rollback).toHaveBeenCalledOnce();
+  });
+
   it('rejects when a canceled join cannot be rolled back', async () => {
     const failure = new Error('rollback failed');
     await expect(
@@ -225,6 +336,38 @@ it('serializes admission and rollback for the same room', async () => {
   expect(fence.pending('dm-1')).toBe(1);
   releaseSecond();
   expect(fence.pending('dm-1')).toBe(0);
+});
+
+it('hands a deferred A1 call ID to the last queued cleanup (#2407)', async () => {
+  const fence = new KeyedJoinFence();
+  const releaseAuthorization = vi.fn(async () => undefined);
+  const firstStarted = deferred<void>();
+
+  const cleanup = async (callId?: string) => {
+    const cleanupCallId = fence.callIdForCleanup('dm-1', callId);
+    const result = await cleanupEmptyDMJoin({
+      authorizedCallId: cleanupCallId,
+      closeEmptyRoom: vi.fn(),
+      queuedJoinCount: fence.pending('dm-1'),
+      releaseAuthorization,
+    });
+    if (result === 'deferred') fence.deferCleanupCallId('dm-1', cleanupCallId);
+    return result;
+  };
+
+  const first = withKeyedJoinFence(fence, 'dm-1', async () => {
+    firstStarted.resolve();
+    await vi.waitFor(() => expect(fence.pending('dm-1')).toBe(2));
+    return cleanup('call-a1');
+  });
+  await firstStarted.promise;
+  const finalNoIdJoin = withKeyedJoinFence(fence, 'dm-1', () => cleanup());
+
+  await expect(first).resolves.toBe('deferred');
+  await expect(finalNoIdJoin).resolves.toBe('released');
+  expect(releaseAuthorization).toHaveBeenCalledExactlyOnceWith('call-a1');
+  expect(fence.pending('dm-1')).toBe(0);
+  expect(fence.callIdForCleanup('dm-1')).toBeUndefined();
 });
 
 it('releases the room fence when a stalled authorization aborts', async () => {

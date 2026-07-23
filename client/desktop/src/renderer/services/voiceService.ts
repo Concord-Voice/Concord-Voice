@@ -6003,23 +6003,26 @@ class VoiceService {
         displayName,
         avatarUrl,
         e2eeEpoch,
+        isDeafened,
+        isTesting,
       }: {
         userId: string;
         username: string;
         displayName?: string;
         avatarUrl?: string | null;
         e2eeEpoch?: number;
+        isDeafened?: boolean;
+        isTesting?: boolean;
       }) => {
-        // upsert (not addParticipant) with ROSTER fields only: if the consume
-        // path already created a record for this user (join-vs-consume race,
-        // #1873), a plain insert — or an upsert carrying isVideoOn/isMuted:false
-        // — would clobber the media/enforcement state the consume path set.
-        // upsertParticipant's create-branch supplies the false defaults for a
-        // genuinely-new participant; the merge-branch preserves existing media.
+        // Upsert roster fields plus the optional authoritative reconnect flags.
+        // Never default absent flags or media fields: the consume path may have
+        // already populated them in the join-vs-consume race (#1873).
         useVoiceStore.getState().upsertParticipant(userId, {
           username,
           displayName,
           avatarUrl: avatarUrl ?? undefined,
+          ...(typeof isDeafened === 'boolean' ? { isDeafened } : {}),
+          ...(typeof isTesting === 'boolean' ? { isTesting } : {}),
         });
 
         // Solo bandwidth saving: exit solo mode when someone joins

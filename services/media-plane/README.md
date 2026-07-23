@@ -185,10 +185,21 @@ socket.on('router-rtp-capabilities', ({ rtpCapabilities }) => {
 
 **user-joined**
 ```typescript
-socket.on('user-joined', ({ userId }) => {
-  // New user joined the room
+socket.on('user-joined', ({
+  userId,
+  username,
+  displayName,
+  avatarUrl,
+  e2eeEpoch,
+  isDeafened,
+  isTesting,
+}) => {
+  // New user joined the room; the two state flags are optional rollout fields.
 });
 ```
+
+When `isDeafened` or `isTesting` is absent, clients preserve existing state for
+backward compatibility and the join-vs-consume media race.
 
 **new-producer**
 ```typescript

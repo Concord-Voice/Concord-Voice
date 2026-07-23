@@ -30,12 +30,16 @@ function makeRoomManager(opts: {
   const updateParticipantPermissions = vi.fn().mockReturnValue(opts.updateResult ?? true);
   const closeForbiddenProducers = vi.fn().mockResolvedValue(opts.closedSources ?? []);
   const leaveRoom = vi.fn().mockResolvedValue(undefined);
+  const getProvisionalParticipantSocketId = vi.fn().mockReturnValue(undefined);
+  const removeProvisionalParticipantIfSocketOwned = vi.fn().mockResolvedValue(false);
   return {
     rm: {
       getParticipant,
+      getProvisionalParticipantSocketId,
       updateParticipantPermissions,
       closeForbiddenProducers,
       leaveRoom,
+      removeProvisionalParticipantIfSocketOwned,
     } as unknown as EnforcePermissionsRoomManager,
     getParticipant,
     updateParticipantPermissions,

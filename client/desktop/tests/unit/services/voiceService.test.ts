@@ -4424,6 +4424,55 @@ describe('VoiceService', () => {
       expect(useVoiceStore.getState().participants['user-2']?.username).toBe('other');
     });
 
+    it('refreshes reconnect flags without clobbering media or legacy state (#2407)', async () => {
+      await joinVoiceChannel();
+      const audioStream = createMockMediaStream([{ kind: 'audio', id: 'remote-audio' }]);
+      const videoStream = createMockMediaStream([{ kind: 'video', id: 'remote-video' }]);
+      useVoiceStore.getState().addParticipant({
+        userId: 'user-2',
+        username: 'old-name',
+        isMuted: true,
+        isDeafened: true,
+        isTesting: true,
+        isSpeaking: true,
+        isVideoOn: true,
+        isScreenSharing: false,
+        serverMuted: false,
+        serverDeafened: false,
+        audioStream: audioStream as MediaStream,
+        videoStream: videoStream as MediaStream,
+      });
+
+      const handler = socketListeners['user-joined']?.[0];
+      handler?.({
+        userId: 'user-2',
+        username: 'new-name',
+        isDeafened: false,
+        isTesting: false,
+      });
+
+      expect(useVoiceStore.getState().participants['user-2']).toMatchObject({
+        username: 'new-name',
+        isMuted: true,
+        isDeafened: false,
+        isTesting: false,
+        isSpeaking: true,
+        isVideoOn: true,
+        audioStream,
+        videoStream,
+      });
+
+      useVoiceStore.getState().updateParticipant('user-2', { isDeafened: true, isTesting: true });
+      handler?.({ userId: 'user-2', username: 'legacy-reconnect' });
+      expect(useVoiceStore.getState().participants['user-2']).toMatchObject({
+        username: 'legacy-reconnect',
+        isDeafened: true,
+        isTesting: true,
+        audioStream,
+        videoStream,
+      });
+    });
+
     it('handles user-left event', async () => {
       await joinVoiceChannel();
 

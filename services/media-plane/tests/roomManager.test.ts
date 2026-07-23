@@ -58,8 +58,14 @@ import {
   parseMediaFrameCryptoVersion,
   CryptoVersionMismatchError,
   SCREEN_GATE_OFF_DEBOUNCE_MS,
+  FREE_MEDIA_ENTITLEMENT,
 } from '../src/lib/roomManager.js';
 import type { Room, Participant, RoomEvent } from '../src/lib/roomManager.js';
+import {
+  handleForceDisconnect,
+  type ForceDisconnectIO,
+  type ForceDisconnectRoomManager,
+} from '../src/lib/forceDisconnect.js';
 // `./mocks/logger.js` (imported above) replaces @/lib/logger with vi.fn() spies;
 // importing it here gives us the SAME mocked object to assert on.
 import { logger } from '../src/lib/logger.js';
@@ -75,7 +81,75 @@ function createMockMediasoupService(router = createMockRouter()) {
   };
 }
 
-function joinRoomWithSupportedCrypto(
+type JoinRoomResult = Awaited<ReturnType<RoomManager['joinRoom']>>;
+
+type TestDMParticipantPromotion = {
+  callId?: string;
+  identity: { username: string; displayName?: string; avatarUrl?: string };
+  entitlement: {
+    tier: string;
+    allowedAudioTiers: string[];
+    minPtimeMs: number;
+    maxManualBitrateBps: number;
+  };
+  serverMuted: boolean;
+  serverDeafened: boolean;
+};
+
+type ProvisionalTestRoom = Room & {
+  pendingDMParticipants?: Map<
+    string,
+    { participant: Participant; callId: string; callRingId?: string; callCallerUserId?: string }
+  >;
+};
+
+function promoteDMParticipant(
+  manager: RoomManager,
+  roomId: string,
+  userId: string,
+  socketId: string,
+  expectedCallId: string,
+  promotion: TestDMParticipantPromotion
+): JoinRoomResult {
+  return (
+    manager as RoomManager & {
+      promoteDMParticipant(
+        roomId: string,
+        userId: string,
+        socketId: string,
+        expectedCallId: string,
+        promotion: TestDMParticipantPromotion,
+        commitSocketMembership: () => void
+      ): JoinRoomResult;
+    }
+  ).promoteDMParticipant(
+    roomId,
+    userId,
+    socketId,
+    expectedCallId,
+    promotion,
+    () => undefined
+  );
+}
+
+async function removeProvisionalParticipantIfSocketOwned(
+  manager: RoomManager,
+  roomId: string,
+  userId: string,
+  socketId: string
+): Promise<boolean> {
+  return (
+    manager as RoomManager & {
+      removeProvisionalParticipantIfSocketOwned(
+        roomId: string,
+        userId: string,
+        socketId: string
+      ): Promise<boolean>;
+    }
+  ).removeProvisionalParticipantIfSocketOwned(roomId, userId, socketId);
+}
+
+async function joinRoomWithSupportedCrypto(
   manager: RoomManager,
   roomId: string,
   userId: string,
@@ -91,10 +165,23 @@ function joinRoomWithSupportedCrypto(
     callCallerUserId?: string;
   }
 ) {
-  return manager.joinRoom(roomId, userId, socketId, identity, rtpCapabilities, {
+  const effectiveRoomContext =
+    roomContext?.roomKind === 'dm'
+      ? { ...roomContext, callId: roomContext.callId ?? `call-${roomId}` }
+      : roomContext;
+  const result = await manager.joinRoom(roomId, userId, socketId, identity, rtpCapabilities, {
     entitlement,
     mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
-    roomContext,
+    roomContext: effectiveRoomContext,
+  });
+  if (effectiveRoomContext?.roomKind !== 'dm') return result;
+
+  return promoteDMParticipant(manager, roomId, userId, socketId, effectiveRoomContext.callId, {
+    callId: effectiveRoomContext.callId,
+    identity,
+    entitlement: entitlement ?? { ...FREE_MEDIA_ENTITLEMENT },
+    serverMuted: false,
+    serverDeafened: false,
   });
 }
 
@@ -231,7 +318,8 @@ describe('RoomManager', () => {
       expect(mockMediasoup.getOrCreateRouter).toHaveBeenCalledTimes(2);
     });
 
-    it('keeps one generated call ID for a direct DM room', async () => {
+    it('keeps one authorized call ID for a direct DM room', async () => {
+      const authorizedCallId = '10101010-1010-4010-8010-101010101010';
       const events: RoomEvent[] = [];
       manager.onEvent((event) => events.push(event));
 
@@ -243,12 +331,10 @@ describe('RoomManager', () => {
         { username: 'alice' },
         undefined,
         undefined,
-        { roomKind: 'dm' }
+        { roomKind: 'dm', callId: authorizedCallId }
       );
       const callId = manager.getRoom('dm-1')?.callId;
-      expect(callId).toMatch(
-        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-      );
+      expect(callId).toBe(authorizedCallId);
 
       await joinRoomWithSupportedCrypto(
         manager,
@@ -258,7 +344,7 @@ describe('RoomManager', () => {
         { username: 'bob' },
         undefined,
         undefined,
-        { roomKind: 'dm' }
+        { roomKind: 'dm', callId: authorizedCallId }
       );
       expect(manager.getRoom('dm-1')?.callId).toBe(callId);
       expect(events.filter((event) => event.type === 'user-joined')).toEqual([
@@ -346,6 +432,509 @@ describe('RoomManager', () => {
           participantUserIds: ['u-1', 'u-2'],
         })
       );
+    });
+
+    describe('provisional DM admission (#2407)', () => {
+      const callId = '24070000-0000-4000-8000-000000000001';
+      const freeEntitlement = { ...FREE_MEDIA_ENTITLEMENT };
+      const premiumEntitlement = {
+        tier: 'premium',
+        allowedAudioTiers: [
+          'minimum',
+          'low',
+          'moderate',
+          'standard',
+          'high',
+          'hifi',
+          'studio',
+        ],
+        minPtimeMs: 10,
+        maxManualBitrateBps: 10_000_000,
+      };
+
+      it('keeps fresh A1 registration out of lifecycle, history, epoch, and heartbeat (#2407)', async () => {
+        const events: RoomEvent[] = [];
+        manager.onEvent((event) => events.push(event));
+
+        const result = await manager.joinRoom(
+          'dm-provisional',
+          'u-1',
+          'sock-1',
+          { username: 'a1-name' },
+          createProfiledRtpCapabilities([{ mimeType: 'video/VP8' }]),
+          {
+            entitlement: freeEntitlement,
+            mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+            roomContext: { roomKind: 'dm', callId, callCallerUserId: 'u-1' },
+          }
+        );
+        const room = manager.getRoom('dm-provisional') as ProvisionalTestRoom;
+
+        expect(manager.getProvisionalParticipantSocketId('dm-provisional', 'u-1')).toBe(
+          'sock-1'
+        );
+        expect(
+          manager.getProvisionalParticipantSocketId('dm-provisional', 'missing-user')
+        ).toBeUndefined();
+        expect(
+          manager.getProvisionalParticipantSocketId('missing-room', 'u-1')
+        ).toBeUndefined();
+
+        expect({
+          admittedUserIds: Array.from(room.participants.keys()),
+          pendingSocketId: room.pendingDMParticipants?.get('u-1')?.participant.socketId,
+          callId: room.callId,
+          callStartedAt: room.callStartedAt,
+          historySize: room.callParticipantHistory.size,
+          epoch: room.e2eeEpoch,
+          activeRoomIds: manager.getActiveRoomIds(),
+          returnedParticipants: result.participants.map((participant) => participant.userId),
+          lifecycleEvents: events.filter((event) =>
+            ['user-joined', 'user-left', 'room-empty'].includes(event.type)
+          ),
+        }).toEqual({
+          admittedUserIds: [],
+          pendingSocketId: 'sock-1',
+          callId: undefined,
+          callStartedAt: undefined,
+          historySize: 0,
+          epoch: 0,
+          activeRoomIds: [],
+          returnedParticipants: [],
+          lifecycleEvents: [],
+        });
+      });
+
+      it('excludes provisional entitlement and codecs from authoritative projections (#2407)', async () => {
+        await manager.joinRoom(
+          'dm-projections',
+          'u-free',
+          'sock-free',
+          { username: 'free' },
+          createProfiledRtpCapabilities([{ mimeType: 'video/VP8' }]),
+          {
+            entitlement: freeEntitlement,
+            mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+            roomContext: { roomKind: 'dm', callId },
+          }
+        );
+        await manager.joinRoom(
+          'dm-projections',
+          'u-premium',
+          'sock-premium',
+          { username: 'premium' },
+          createProfiledRtpCapabilities([
+            {
+              mimeType: 'video/H264',
+              parameters: {
+                'packetization-mode': 1,
+                'level-asymmetry-allowed': 1,
+                'profile-level-id': '42e01f',
+              },
+            },
+          ]),
+          {
+            entitlement: premiumEntitlement,
+            mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+            roomContext: { roomKind: 'dm', callId },
+          }
+        );
+        const room = manager.getRoom('dm-projections') as ProvisionalTestRoom;
+
+        expect({
+          capTier: resolveRoomCapTier(room),
+          codecFloor: manager.computeCodecFloor('dm-projections'),
+          heartbeatUserIds: Array.from(room.participants.keys()),
+          activeRoomIds: manager.getActiveRoomIds(),
+          pendingCount: room.pendingDMParticipants?.size,
+        }).toEqual({
+          capTier: 'free',
+          codecFloor: null,
+          heartbeatUserIds: [],
+          activeRoomIds: [],
+          pendingCount: 2,
+        });
+      });
+
+      it('promotes the exact socket once with refreshed A2 state (#2407)', async () => {
+        const events: RoomEvent[] = [];
+        manager.onEvent((event) => events.push(event));
+        await manager.joinRoom(
+          'dm-promote',
+          'u-1',
+          'sock-current',
+          { username: 'a1-name', displayName: 'A1' },
+          createProfiledRtpCapabilities([{ mimeType: 'video/VP8' }]),
+          {
+            entitlement: freeEntitlement,
+            mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+            roomContext: {
+              roomKind: 'dm',
+              callId,
+              callRingId: 'ring-1',
+              callCallerUserId: 'caller-1',
+            },
+          }
+        );
+        const provisionalRoom = manager.getRoom('dm-promote') as ProvisionalTestRoom;
+
+        expect({
+          admitted: provisionalRoom.participants.has('u-1'),
+          pendingSocketId:
+            provisionalRoom.pendingDMParticipants?.get('u-1')?.participant.socketId,
+          joinedEvents: events.filter((event) => event.type === 'user-joined').length,
+        }).toEqual({ admitted: false, pendingSocketId: 'sock-current', joinedEvents: 0 });
+
+        const promotion = {
+          callId,
+          identity: {
+            username: 'a2-name',
+            displayName: 'A2',
+            avatarUrl: 'https://cdn.example.test/a2.png',
+          },
+          entitlement: premiumEntitlement,
+          serverMuted: true,
+          serverDeafened: true,
+        };
+        const result = promoteDMParticipant(
+          manager,
+          'dm-promote',
+          'u-1',
+          'sock-current',
+          callId,
+          promotion
+        );
+        const room = manager.getRoom('dm-promote') as ProvisionalTestRoom;
+        const participant = manager.getParticipant('dm-promote', 'u-1');
+        const historyAt = room.callParticipantHistory.get('u-1');
+
+        expect(participant).toMatchObject({
+          socketId: 'sock-current',
+          username: 'a2-name',
+          displayName: 'A2',
+          avatarUrl: 'https://cdn.example.test/a2.png',
+          tier: 'premium',
+          serverMuted: true,
+          serverDeafened: true,
+        });
+        expect(room).toMatchObject({
+          callId,
+          callRingId: 'ring-1',
+          callCallerUserId: 'caller-1',
+          callStartedAt: expect.any(Date),
+          e2eeEpoch: 1,
+        });
+        expect(room.pendingDMParticipants?.has('u-1')).toBe(false);
+        expect(historyAt).toBeInstanceOf(Date);
+        expect(result.participants).toEqual([
+          expect.objectContaining({ userId: 'u-1', username: 'a2-name' }),
+        ]);
+        expect(events.filter((event) => event.type === 'user-joined')).toEqual([
+          expect.objectContaining({ roomId: 'dm-promote', userId: 'u-1', callId, e2eeEpoch: 1 }),
+        ]);
+
+        const repeat = promoteDMParticipant(
+          manager,
+          'dm-promote',
+          'u-1',
+          'sock-current',
+          callId,
+          promotion
+        );
+        expect(repeat.e2eeEpoch).toBe(1);
+        expect(room.callParticipantHistory.get('u-1')).toBe(historyAt);
+        expect(events.filter((event) => event.type === 'user-joined')).toHaveLength(1);
+
+        expect(() =>
+          promoteDMParticipant(manager, 'dm-promote', 'u-1', 'sock-stale', callId, promotion)
+        ).toThrow('DM provisional participant is not owned by this socket');
+        expect(() =>
+          promoteDMParticipant(manager, 'dm-promote', 'u-1', 'sock-current', 'call-stale', {
+            ...promotion,
+            callId: 'call-stale',
+          })
+        ).toThrow('DM call ID does not match the provisional admission');
+      });
+
+      it('rolls back a sole provisional socket without terminal lifecycle (#2407)', async () => {
+        const events: RoomEvent[] = [];
+        manager.onEvent((event) => events.push(event));
+        await manager.joinRoom(
+          'dm-rejected',
+          'u-1',
+          'sock-current',
+          { username: 'alice' },
+          undefined,
+          {
+            entitlement: freeEntitlement,
+            mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+            roomContext: { roomKind: 'dm', callId },
+          }
+        );
+        const room = manager.getRoom('dm-rejected') as ProvisionalTestRoom;
+
+        expect({
+          admitted: room.participants.size,
+          pendingSocketId: room.pendingDMParticipants?.get('u-1')?.participant.socketId,
+          history: room.callParticipantHistory.size,
+        }).toEqual({ admitted: 0, pendingSocketId: 'sock-current', history: 0 });
+
+        await expect(
+          removeProvisionalParticipantIfSocketOwned(
+            manager,
+            'dm-rejected',
+            'u-1',
+            'sock-stale'
+          )
+        ).resolves.toBe(false);
+        expect(manager.getRoom('dm-rejected')).toBe(room);
+        expect(manager.getProvisionalParticipantSocketId('dm-rejected', 'u-1')).toBe(
+          'sock-current'
+        );
+
+        await expect(
+          removeProvisionalParticipantIfSocketOwned(
+            manager,
+            'dm-rejected',
+            'u-1',
+            'sock-current'
+          )
+        ).resolves.toBe(true);
+        expect(manager.getRoom('dm-rejected')).toBeUndefined();
+        expect(
+          manager.getProvisionalParticipantSocketId('dm-rejected', 'u-1')
+        ).toBeUndefined();
+        expect(
+          events.filter((event) =>
+            ['user-joined', 'user-left', 'room-empty'].includes(event.type)
+          )
+        ).toHaveLength(0);
+      });
+
+      it('enforcement removes only the exact never-admitted candidate and closes silently (#2407)', async () => {
+        const roomId = 'dm-enforcement-fresh';
+        const events: RoomEvent[] = [];
+        manager.onEvent((event) => events.push(event));
+        await manager.joinRoom(roomId, 'u-1', 'sock-current', { username: 'alice' }, undefined, {
+          entitlement: freeEntitlement,
+          mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+          roomContext: { roomKind: 'dm', callId },
+        });
+
+        await expect(
+          manager.removeProvisionalParticipantForEnforcement(
+            roomId,
+            'u-1',
+            'sock-stale'
+          )
+        ).resolves.toBe(false);
+        expect(manager.getProvisionalParticipantSocketId(roomId, 'u-1')).toBe(
+          'sock-current'
+        );
+
+        await expect(
+          manager.removeProvisionalParticipantForEnforcement(
+            roomId,
+            'u-1',
+            'sock-current'
+          )
+        ).resolves.toBe(true);
+        expect(manager.getRoom(roomId)).toBeUndefined();
+        expect(
+          events.filter((event) =>
+            ['user-joined', 'user-left', 'room-empty'].includes(event.type)
+          )
+        ).toHaveLength(0);
+      });
+
+      it('keeps a candidate provisional when Socket.IO membership commit throws (#2407)', async () => {
+        const events: RoomEvent[] = [];
+        manager.onEvent((event) => events.push(event));
+        await manager.joinRoom(
+          'dm-adapter-failure',
+          'u-1',
+          'sock-current',
+          { username: 'a1-name' },
+          undefined,
+          {
+            entitlement: freeEntitlement,
+            mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+            roomContext: { roomKind: 'dm', callId },
+          }
+        );
+        const adapterFailure = new Error('socket adapter failed');
+
+        expect(() =>
+          manager.promoteDMParticipant(
+            'dm-adapter-failure',
+            'u-1',
+            'sock-current',
+            callId,
+            {
+              callId,
+              identity: { username: 'a2-name' },
+              entitlement: premiumEntitlement,
+              serverMuted: true,
+              serverDeafened: true,
+            },
+            () => {
+              throw adapterFailure;
+            }
+          )
+        ).toThrow(adapterFailure);
+
+        const room = manager.getRoom('dm-adapter-failure') as ProvisionalTestRoom;
+        expect({
+          admitted: room.participants.size,
+          pendingSocketId: room.pendingDMParticipants?.get('u-1')?.participant.socketId,
+          callId: room.callId,
+          history: room.callParticipantHistory.size,
+          epoch: room.e2eeEpoch,
+          lifecycleEvents: events.filter((event) =>
+            ['user-joined', 'user-left', 'room-empty'].includes(event.type)
+          ),
+        }).toEqual({
+          admitted: 0,
+          pendingSocketId: 'sock-current',
+          callId: undefined,
+          history: 0,
+          epoch: 0,
+          lifecycleEvents: [],
+        });
+      });
+
+      it('preserves an admitted same-user reconnect until exact promotion (#2407)', async () => {
+        const events: RoomEvent[] = [];
+        manager.onEvent((event) => events.push(event));
+        await joinRoomWithSupportedCrypto(
+          manager,
+          'dm-reconnect-provisional',
+          'u-1',
+          'sock-old',
+          { username: 'old-name' },
+          undefined,
+          freeEntitlement,
+          { roomKind: 'dm', callId }
+        );
+        const room = manager.getRoom('dm-reconnect-provisional') as ProvisionalTestRoom;
+        const startedAt = room.callStartedAt;
+        const historyAt = room.callParticipantHistory.get('u-1');
+        const epoch = room.e2eeEpoch;
+        manager.setParticipantDeafen('dm-reconnect-provisional', 'u-1', true);
+        manager.setParticipantTestingStatus('dm-reconnect-provisional', 'u-1', true);
+        events.length = 0;
+
+        await manager.joinRoom(
+          'dm-reconnect-provisional',
+          'u-1',
+          'sock-new',
+          { username: 'a1-new-name' },
+          undefined,
+          {
+            entitlement: premiumEntitlement,
+            mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+            roomContext: { roomKind: 'dm', callId },
+          }
+        );
+
+        expect({
+          admittedSocketId: manager.getParticipant('dm-reconnect-provisional', 'u-1')?.socketId,
+          pendingSocketId: room.pendingDMParticipants?.get('u-1')?.participant.socketId,
+          epoch: room.e2eeEpoch,
+          historyAt: room.callParticipantHistory.get('u-1'),
+          lifecycleEvents: events.filter((event) =>
+            ['user-joined', 'user-left', 'room-empty'].includes(event.type)
+          ),
+        }).toEqual({
+          admittedSocketId: 'sock-old',
+          pendingSocketId: 'sock-new',
+          epoch,
+          historyAt,
+          lifecycleEvents: [],
+        });
+
+        const result = promoteDMParticipant(
+          manager,
+          'dm-reconnect-provisional',
+          'u-1',
+          'sock-new',
+          callId,
+          {
+            callId,
+            identity: { username: 'a2-new-name' },
+            entitlement: premiumEntitlement,
+            serverMuted: false,
+            serverDeafened: false,
+          }
+        );
+
+        expect(manager.getParticipant('dm-reconnect-provisional', 'u-1')?.socketId).toBe(
+          'sock-new'
+        );
+        expect(result.participants).toEqual([
+          expect.objectContaining({ userId: 'u-1', isDeafened: false, isTesting: false }),
+        ]);
+        expect(room.callStartedAt).toBe(startedAt);
+        expect(room.callParticipantHistory.get('u-1')).toBe(historyAt);
+        expect(room.e2eeEpoch).toBe(epoch + 1);
+        expect(events.filter((event) => event.type === 'user-left')).toHaveLength(0);
+        expect(events.filter((event) => event.type === 'room-empty')).toHaveLength(0);
+        expect(events.filter((event) => event.type === 'user-joined')).toHaveLength(1);
+      });
+
+      it('terminalizes a history-bearing room when enforcement finds only the pending reconnect (#2407)', async () => {
+        const roomId = 'dm-enforce-pending-only';
+        const events: RoomEvent[] = [];
+        manager.onEvent((event) => events.push(event));
+        await joinRoomWithSupportedCrypto(
+          manager,
+          roomId,
+          'u-1',
+          'sock-old',
+          { username: 'old-name' },
+          undefined,
+          freeEntitlement,
+          { roomKind: 'dm', callId }
+        );
+        await manager.joinRoom(roomId, 'u-1', 'sock-new', { username: 'new-name' }, undefined, {
+          entitlement: freeEntitlement,
+          mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+          roomContext: { roomKind: 'dm', callId },
+        });
+
+        // The admitted socket can leave before the enforcement command arrives.
+        // Pending state keeps the history-bearing room open for its A2 outcome.
+        await manager.leaveRoom(roomId, 'u-1');
+        const pendingOnlyRoom = manager.getRoom(roomId) as ProvisionalTestRoom;
+        expect({
+          admitted: pendingOnlyRoom.participants.size,
+          pendingSocketId:
+            pendingOnlyRoom.pendingDMParticipants?.get('u-1')?.participant.socketId,
+          history: pendingOnlyRoom.callParticipantHistory.size,
+        }).toEqual({ admitted: 0, pendingSocketId: 'sock-new', history: 1 });
+        events.length = 0;
+
+        const emit = vi.fn();
+        const disconnect = vi.fn();
+        const io = {
+          sockets: {
+            sockets: new Map([['sock-new', { emit, disconnect }]]),
+          },
+        } as unknown as ForceDisconnectIO;
+
+        await handleForceDisconnect(
+          manager as unknown as ForceDisconnectRoomManager,
+          io,
+          roomId,
+          'u-1'
+        );
+
+        expect(disconnect).toHaveBeenCalledWith(true);
+        expect(manager.getRoom(roomId)).toBeUndefined();
+        expect(events.filter((event) => event.type === 'room-empty')).toEqual([
+          expect.objectContaining({ roomId, callId, participantUserIds: ['u-1'] }),
+        ]);
+      });
     });
 
     it('discards only the exact empty unadmitted DM room without a terminal event', async () => {
@@ -1921,10 +2510,16 @@ describe('RoomManager', () => {
     });
 
     it('does not enforce publish permissions for DM rooms (permissions undefined)', async () => {
-      await manager.joinRoom('room-dm', 'u-dm', 'sock-5', { username: 'dm' }, undefined, {
-        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
-        roomContext: { roomKind: 'dm' },
-      });
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-dm',
+        'u-dm',
+        'sock-5',
+        { username: 'dm' },
+        undefined,
+        undefined,
+        { roomKind: 'dm' }
+      );
       const transport = await transportFor('room-dm', 'u-dm');
       const producer = createMockProducer({ kind: 'audio' });
       transport.produce.mockResolvedValueOnce(producer);
@@ -2007,10 +2602,16 @@ describe('RoomManager', () => {
     });
 
     it('updateParticipantPermissions never bolts a permission model onto a DM room', async () => {
-      await manager.joinRoom('room-dm2', 'u-dm2', 'sock-dm2', { username: 'dm2' }, undefined, {
-        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
-        roomContext: { roomKind: 'dm' },
-      });
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-dm2',
+        'u-dm2',
+        'sock-dm2',
+        { username: 'dm2' },
+        undefined,
+        undefined,
+        { roomKind: 'dm' }
+      );
       expect(manager.updateParticipantPermissions('room-dm2', 'u-dm2', 0n)).toBe(false);
 
       // DM publish stays ungated after the attempted update.
@@ -2255,10 +2856,16 @@ describe('RoomManager', () => {
     });
 
     it('closeForbiddenProducers returns empty for DM rooms and absent participants', async () => {
-      await manager.joinRoom('room-dm3', 'u-dm3', 'sock-dm3', { username: 'dm3' }, undefined, {
-        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
-        roomContext: { roomKind: 'dm' },
-      });
+      await joinRoomWithSupportedCrypto(
+        manager,
+        'room-dm3',
+        'u-dm3',
+        'sock-dm3',
+        { username: 'dm3' },
+        undefined,
+        undefined,
+        { roomKind: 'dm' }
+      );
       await expect(manager.closeForbiddenProducers('room-dm3', 'u-dm3')).resolves.toEqual([]);
       await expect(manager.closeForbiddenProducers('room-1', 'u-nobody')).resolves.toEqual([]);
     });
@@ -5216,6 +5823,7 @@ const mkRoom = (over: Partial<Room>): Room => ({
   router: {} as any,
   audioLevelObserver: null,
   participants: new Map(),
+  pendingDMParticipants: new Map(),
   createdAt: new Date(),
   e2eeEpoch: 0,
   mediaFrameCryptoVersion: null,

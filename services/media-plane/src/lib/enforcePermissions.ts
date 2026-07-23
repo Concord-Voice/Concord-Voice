@@ -13,9 +13,11 @@ import { parsePermissionBitfield } from '../middleware/auth.js';
  */
 export interface EnforcePermissionsRoomManager {
   getParticipant: RoomManager['getParticipant'];
+  getProvisionalParticipantSocketId: RoomManager['getProvisionalParticipantSocketId'];
   updateParticipantPermissions: RoomManager['updateParticipantPermissions'];
   closeForbiddenProducers: RoomManager['closeForbiddenProducers'];
   leaveRoom: RoomManager['leaveRoom'];
+  removeProvisionalParticipantForEnforcement: RoomManager['removeProvisionalParticipantForEnforcement'];
 }
 
 /**

@@ -6,11 +6,12 @@ export type SocketBoundJoinOutcome<Access, Value> =
 
 interface SocketBoundJoinOptions<Access, Value> {
   authorize: () => Promise<Access>;
-  isAllowed: (access: Access) => boolean;
+  isAllowed: (access: Access, authorizedAccess?: Access) => boolean;
   isConnected: () => boolean;
   join: (access: Access) => Promise<Value>;
   reauthorize?: (access: Access) => Promise<Access>;
   finalize?: (access: Access, value: Value) => Promise<void>;
+  commit?: (access: Access, value: Value) => Value;
   rollback: (access: Access) => Promise<void>;
 }
 
@@ -30,20 +31,20 @@ interface EmptyDMJoinCleanupOptions {
 interface RollbackSocketRoomJoinOptions {
   cleanupDMJoin: () => Promise<void>;
   leaveChannelIfOwned: () => Promise<unknown>;
-  removeDMParticipant: () => unknown;
+  removeDMParticipant: () => void | Promise<unknown>;
   roomKind: 'channel' | 'dm';
 }
 
 export type EmptyDMJoinCleanupResult = 'active' | 'deferred' | 'noop' | 'released' | 'terminal';
 
-/** Keeps cleanup bound to the most recent server-issued call ID when available. */
+/** Keeps cleanup bound to the A1 call generation, even when A2 reports rotation. */
 export class DMJoinCallIdTracker {
   private authorizedCallId?: string;
 
   constructor(private readonly requestedCallId?: string) {}
 
   observe(callId?: string): void {
-    if (callId) this.authorizedCallId = callId;
+    if (callId && !this.authorizedCallId) this.authorizedCallId = callId;
   }
 
   current(): string | undefined {
@@ -87,7 +88,7 @@ export async function rollbackSocketRoomJoin({
     return;
   }
 
-  removeDMParticipant();
+  await removeDMParticipant();
   await cleanupDMJoin();
 }
 
@@ -109,6 +110,7 @@ export class SocketRoomClaim {
 }
 
 export class KeyedJoinFence {
+  private readonly deferredCleanupCallIds = new Map<string, string>();
   private readonly tails = new Map<string, Promise<void>>();
   private readonly pendingCounts = new Map<string, number>();
 
@@ -130,8 +132,21 @@ export class KeyedJoinFence {
       if (this.tails.get(roomId) === current) this.tails.delete(roomId);
       const remaining = this.pending(roomId) - 1;
       if (remaining > 0) this.pendingCounts.set(roomId, remaining);
-      else this.pendingCounts.delete(roomId);
+      else {
+        this.pendingCounts.delete(roomId);
+        this.deferredCleanupCallIds.delete(roomId);
+      }
     };
+  }
+
+  callIdForCleanup(roomId: string, callId?: string): string | undefined {
+    return callId ?? this.deferredCleanupCallIds.get(roomId);
+  }
+
+  deferCleanupCallId(roomId: string, callId?: string): void {
+    if (callId && !this.deferredCleanupCallIds.has(roomId)) {
+      this.deferredCleanupCallIds.set(roomId, callId);
+    }
   }
 
   pending(roomId: string): number {
@@ -171,10 +186,13 @@ export async function runSocketBoundJoin<Access, Value>({
   join,
   reauthorize,
   finalize,
+  commit,
   rollback,
 }: SocketBoundJoinOptions<Access, Value>): Promise<SocketBoundJoinOutcome<Access, Value>> {
   const authorizedAccess = await authorize();
-  if (!isAllowed(authorizedAccess)) return { access: authorizedAccess, status: 'denied' };
+  if (!isAllowed(authorizedAccess, authorizedAccess)) {
+    return { access: authorizedAccess, status: 'denied' };
+  }
 
   if (!isConnected()) {
     await rollback(authorizedAccess);
@@ -184,15 +202,17 @@ export async function runSocketBoundJoin<Access, Value>({
   try {
     const value = await join(authorizedAccess);
     const access = reauthorize ? await reauthorize(authorizedAccess) : authorizedAccess;
-    if (!isAllowed(access)) {
+    if (!isAllowed(access, authorizedAccess)) {
       await rollback(authorizedAccess);
       return { access, status: 'revoked' };
     }
     await finalize?.(access, value);
-    if (isConnected()) return { access, status: 'joined', value };
+    if (!isConnected()) {
+      await rollback(authorizedAccess);
+      return { access, status: 'canceled' };
+    }
 
-    await rollback(authorizedAccess);
-    return { access, status: 'canceled' };
+    return { access, status: 'joined', value: commit?.(access, value) ?? value };
   } catch (error) {
     await rollback(authorizedAccess);
     throw error;

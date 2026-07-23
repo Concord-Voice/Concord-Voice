@@ -9,7 +9,7 @@ import {
   parseMediaFrameCryptoVersion,
   RoomManager,
 } from './lib/roomManager.js';
-import type { MediaSource } from './lib/roomManager.js';
+import type { DMParticipantPromotion, MediaSource } from './lib/roomManager.js';
 import { MediaMetrics } from './lib/mediaMetrics.js';
 import {
   createAuthMiddleware,
@@ -123,7 +123,8 @@ async function rollbackRegisteredRoomJoin({
   await rollbackSocketRoomJoin({
     cleanupDMJoin: () => cleanupDMJoin(callId),
     leaveChannelIfOwned: () => roomManager.leaveRoomIfSocketOwned(roomId, userId, socketId),
-    removeDMParticipant: () => roomManager.removeParticipantIfSocketOwned(roomId, userId, socketId),
+    removeDMParticipant: () =>
+      roomManager.removeProvisionalParticipantIfSocketOwned(roomId, userId, socketId),
     roomKind,
   });
 }
@@ -150,6 +151,10 @@ function registerJoinRoomHandler(
         else socket.emit('error', error);
         return;
       }
+      const commitSocketMembership = () => {
+        socket.join(roomId);
+        data.roomId = roomId;
+      };
 
       const roomKind: 'channel' | 'dm' =
         socket.handshake.auth.room_kind === 'dm' ? 'dm' : 'channel';
@@ -159,8 +164,9 @@ function registerJoinRoomHandler(
       const cleanupDMJoin = async (authorizedCallId?: string) => {
         if (roomKind !== 'dm') return;
         const room = roomManager.getRoom(roomId);
-        await cleanupEmptyDMJoin({
-          authorizedCallId,
+        const cleanupCallId = dmJoinFence.callIdForCleanup(roomId, authorizedCallId);
+        const cleanupResult = await cleanupEmptyDMJoin({
+          authorizedCallId: cleanupCallId,
           closeEmptyRoom: (expectedCallId) => roomManager.closeEmptyDMRoom(roomId, expectedCallId),
           queuedJoinCount: dmJoinFence.pending(roomId),
           releaseAuthorization: (releaseCallId) =>
@@ -169,6 +175,9 @@ function registerJoinRoomHandler(
             ? { callId: room.callId, participantCount: room.participants.size }
             : undefined,
         });
+        if (cleanupResult === 'deferred') {
+          dmJoinFence.deferCleanupCallId(roomId, cleanupCallId);
+        }
       };
       const cleanupDMJoinSafely = async (message: string) => {
         try {
@@ -201,7 +210,12 @@ function registerJoinRoomHandler(
 
           const outcome = await runSocketBoundJoin({
             authorize: () => authorizeRoom(inputCallId),
-            isAllowed: (access) => access.allowed,
+            isAllowed: (access, authorizedAccess) =>
+              access.allowed &&
+              (roomKind === 'channel' ||
+                (typeof authorizedAccess?.callId === 'string' &&
+                  authorizedAccess.callId !== '' &&
+                  access.callId === authorizedAccess.callId)),
             isConnected: () => socket.connected,
             join: async (access) => {
               logger.debug('Channel access validated', { roomId, userId: data.userId });
@@ -241,16 +255,43 @@ function registerJoinRoomHandler(
                 }
               );
 
-              return { identity, result };
+              return {
+                authorizedCallId: access.callId,
+                identity,
+                promotion: undefined as DMParticipantPromotion | undefined,
+                result,
+              };
             },
             // DM membership can change while the asynchronous RoomManager
             // registration is in flight. Re-read the exact server-issued call
             // ID after registration and before any socket.join/ack.
             reauthorize: (access) =>
               reauthorizeDMAdmission(roomKind, access, inputCallId, authorizeRoom),
-            finalize: async (access) => {
+            finalize: async (access, value) => {
               // The second authorization is authoritative for both channel and
               // Private Call moderator state. Apply it before socket.join/ack.
+              if (roomKind === 'dm') {
+                const identity = resolveParticipantIdentity(access, {
+                  username: data.username,
+                  displayName: data.displayName,
+                  avatarUrl: data.avatarUrl,
+                });
+                value.identity = identity;
+                value.promotion = {
+                  callId: access.callId,
+                  identity,
+                  entitlement: {
+                    tier: access.userTier,
+                    allowedAudioTiers: access.allowedAudioTiers,
+                    minPtimeMs: access.minPtimeMs,
+                    maxManualBitrateBps: access.maxManualBitrateBps,
+                  },
+                  serverMuted: access.serverMuted,
+                  serverDeafened: access.serverDeafened,
+                };
+                return;
+              }
+
               if (access.serverMuted) {
                 await roomManager.serverMuteUser(roomId, data.userId);
                 logger.info('Applied server-mute enforcement on join', {
@@ -265,6 +306,37 @@ function registerJoinRoomHandler(
                   userId: data.userId,
                 });
               }
+            },
+            commit: (_access, value) => {
+              if (roomKind === 'channel') return value;
+              if (!value.authorizedCallId || !value.promotion) {
+                throw new Error('DM admission is missing its A2 promotion state');
+              }
+              try {
+                value.result = roomManager.promoteDMParticipant(
+                  roomId,
+                  data.userId,
+                  socket.id,
+                  value.authorizedCallId,
+                  value.promotion,
+                  commitSocketMembership
+                );
+              } catch (error) {
+                // A custom/failed adapter must not strand Socket.IO membership
+                // or socket.data when its synchronous join boundary throws.
+                data.roomId = undefined;
+                try {
+                  socket.leave(roomId);
+                } catch (leaveError) {
+                  logger.error('Failed to roll back Socket.IO room membership', {
+                    error: leaveError,
+                    roomId,
+                    userId: data.userId,
+                  });
+                }
+                throw error;
+              }
+              return value;
             },
             rollback: (access) =>
               rollbackRegisteredRoomJoin({
@@ -303,8 +375,12 @@ function registerJoinRoomHandler(
 
           const { access, value } = outcome;
           const { identity, result } = value;
-          socket.join(roomId);
-          data.roomId = roomId;
+          const joinedParticipant = result.participants.find(
+            (participant) => participant.userId === data.userId
+          );
+          if (roomKind === 'channel') {
+            commitSocketMembership();
+          }
 
           // The per-sharer screen-layering gate has no room-wide late-join state.
           // A join simply recomputes each share it consumes (#1924).
@@ -316,6 +392,12 @@ function registerJoinRoomHandler(
             displayName: identity.displayName,
             avatarUrl: identity.avatarUrl,
             e2eeEpoch: result.e2eeEpoch,
+            ...(joinedParticipant
+              ? {
+                  isDeafened: joinedParticipant.isDeafened,
+                  isTesting: joinedParticipant.isTesting,
+                }
+              : {}),
           });
 
           // Respond to the joining client.
