@@ -44,7 +44,8 @@ type sessionDisconnector interface {
 }
 
 // ActivitySettingsSuppressor applies Rich Presence suppression after a
-// settings write while the caller still owns the sender gate.
+// settings write while the caller still owns the sender gate and supplies the
+// detached, bounded suppression-phase context.
 type ActivitySettingsSuppressor interface {
 	ApplySettingsSuppressionAlreadyGated(
 		context.Context,
@@ -55,17 +56,22 @@ type ActivitySettingsSuppressor interface {
 	SuppressAllActivityAlreadyGated(context.Context, uuid.UUID) error
 }
 
+type activityCleanupPhaseContextFactory func(
+	context.Context,
+) (context.Context, context.CancelFunc)
+
 // Handler handles user-related requests including profile management and settings.
 type Handler struct {
-	db                  *sql.DB
-	log                 *logger.Logger
-	hub                 *websocket.Hub
-	presenceHistory     *presencehistory.Service
-	activitySuppressor  ActivitySettingsSuppressor
-	sessionDisconnector sessionDisconnector
-	mfaVerifier         MFAVerifier
-	tiers               entitlements.TierResolver // resolves the acting user's subscription tier (#1298)
-	store               media.ObjectDeleter       // nil when object storage is not configured
+	db                                 *sql.DB
+	log                                *logger.Logger
+	hub                                *websocket.Hub
+	presenceHistory                    *presencehistory.Service
+	activitySuppressor                 ActivitySettingsSuppressor
+	activityCleanupPhaseContextFactory activityCleanupPhaseContextFactory
+	sessionDisconnector                sessionDisconnector
+	mfaVerifier                        MFAVerifier
+	tiers                              entitlements.TierResolver // resolves the acting user's subscription tier (#1298)
+	store                              media.ObjectDeleter       // nil when object storage is not configured
 }
 
 // NewHandler creates a new user handler.

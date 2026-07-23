@@ -217,7 +217,7 @@ func TestActivitySettingsResolver_LifecycleFlipDuringAuthorizationFailsConservat
 	assert.Empty(t, delivery.targeted)
 }
 
-func TestActivitySettingsResolver_MissingEvidenceChecksAuthoritativeParticipants(t *testing.T) {
+func TestActivitySettingsResolver_MissingOrStaleEvidenceUsesPriorPolicy(t *testing.T) {
 	tests := []struct {
 		name           string
 		category       presence.Category
@@ -225,12 +225,12 @@ func TestActivitySettingsResolver_MissingEvidenceChecksAuthoritativeParticipants
 		authoritative  bool
 		wantDisconnect bool
 	}{
-		{name: "server state missing while active", category: presence.CategoryServerVoice, missingState: true, authoritative: true, wantDisconnect: true},
+		{name: "server state missing after prior suppression while active", category: presence.CategoryServerVoice, missingState: true, authoritative: true},
 		{name: "server lifecycle expired while active", category: presence.CategoryServerVoice, authoritative: true, wantDisconnect: true},
 		{name: "private state missing while active", category: presence.CategoryPrivateCall, missingState: true, authoritative: true, wantDisconnect: true},
 		{name: "private lifecycle expired while active", category: presence.CategoryPrivateCall, authoritative: true, wantDisconnect: true},
-		{name: "server state missing while inactive", category: presence.CategoryServerVoice, missingState: true},
-		{name: "private state missing while inactive", category: presence.CategoryPrivateCall, missingState: true},
+		{name: "server state missing after prior suppression while inactive", category: presence.CategoryServerVoice, missingState: true},
+		{name: "private prior eligible state missing while inactive", category: presence.CategoryPrivateCall, missingState: true, wantDisconnect: true},
 		{name: "server lifecycle expired after stored delivery", category: presence.CategoryServerVoice, wantDisconnect: true},
 		{name: "private lifecycle expired after stored delivery", category: presence.CategoryPrivateCall, wantDisconnect: true},
 	}

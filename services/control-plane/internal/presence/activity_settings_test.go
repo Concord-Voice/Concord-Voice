@@ -2,6 +2,7 @@ package presence
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"testing"
@@ -202,6 +203,72 @@ func TestActivityService_SettingsChangeSameValueOrInactiveDisconnectsNobody(t *t
 	})
 }
 
+func TestActivityService_SettingsCleanupMissingStateUsesPriorEligibility(t *testing.T) {
+	redisClient := setupActivityStoreRedis(t)
+	closedDB, err := sql.Open("postgres", testdb.DatabaseURL())
+	require.NoError(t, err)
+	require.NoError(t, closedDB.Close())
+	store := NewActivityStore(redisClient)
+
+	tests := []struct {
+		name          string
+		category      Category
+		masterEnabled bool
+		serverTier    Tier
+		privateTier   Tier
+		priorEligible bool
+	}{
+		{name: "server master off tier off", category: CategoryServerVoice, serverTier: TierOff},
+		{name: "server master off tier friends", category: CategoryServerVoice, serverTier: TierFriends},
+		{name: "server master off tier servers", category: CategoryServerVoice, serverTier: TierServers},
+		{name: "server master on tier off", category: CategoryServerVoice, masterEnabled: true, serverTier: TierOff},
+		{name: "server master on tier friends", category: CategoryServerVoice, masterEnabled: true, serverTier: TierFriends, priorEligible: true},
+		{name: "server master on tier servers", category: CategoryServerVoice, masterEnabled: true, serverTier: TierServers, priorEligible: true},
+		{name: "private master off tier off", category: CategoryPrivateCall, privateTier: TierOff},
+		{name: "private master off tier friends", category: CategoryPrivateCall, privateTier: TierFriends},
+		{name: "private master off tier servers", category: CategoryPrivateCall, privateTier: TierServers},
+		{name: "private master on tier off", category: CategoryPrivateCall, masterEnabled: true, privateTier: TierOff, priorEligible: true},
+		{name: "private master on tier friends", category: CategoryPrivateCall, masterEnabled: true, privateTier: TierFriends, priorEligible: true},
+		{name: "private master on tier servers", category: CategoryPrivateCall, masterEnabled: true, privateTier: TierServers, priorEligible: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			delivery := &activityServiceDeliveryStub{}
+			service := NewActivityService(
+				&activityServiceCoordinatorStub{},
+				NewActivityBuilder(closedDB, nil, store),
+				store,
+				closedDB,
+				nil,
+				delivery,
+			)
+			before := testActivityPolicySettings(
+				test.masterEnabled, test.serverTier, test.privateTier,
+			)
+			after := before
+			if test.category == CategoryServerVoice {
+				after.ServerVoiceShowDetails = false
+			} else {
+				after.PrivateCallShowDetails = false
+			}
+
+			err := service.ApplySettingsSuppressionAlreadyGated(
+				context.Background(), activityServiceSender, before, after,
+			)
+
+			if test.priorEligible {
+				assert.Error(t, err)
+				assert.Equal(t, 1, delivery.disconnectAllCalls)
+			} else {
+				assert.NoError(t, err)
+				assert.Zero(t, delivery.disconnectAllCalls)
+			}
+			assert.Empty(t, delivery.disconnects)
+		})
+	}
+}
+
 func TestActivityService_ApplySettingsSuppressionAlreadyGatedAttemptsAllCleanup(t *testing.T) {
 	deleteErr := errors.New("delete unavailable")
 	disconnectErr := errors.New("disconnect unavailable")
@@ -231,11 +298,14 @@ func TestActivityService_ApplySettingsSuppressionAlreadyGatedAttemptsAllCleanup(
 	assert.Zero(t, coordinator.calls)
 }
 
-func TestActivityService_ApplySettingsSuppressionAlreadyGatedSharesOneDeadlineBudget(t *testing.T) {
+func TestActivityService_ApplySettingsSuppressionAlreadyGatedSharesCallerDeadlineBudget(t *testing.T) {
 	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	callerDeadline := time.Now().Add(2*activityCleanupTimeout + time.Second)
+	callerCtx, cancelCaller := context.WithDeadline(context.Background(), callerDeadline)
+	defer cancelCaller()
 
 	err := service.ApplySettingsSuppressionAlreadyGated(
-		context.Background(), activityServiceSender,
+		callerCtx, activityServiceSender,
 		testActivityPolicySettings(true, TierFriends, TierFriends),
 		testActivityPolicySettings(false, TierServers, TierServers),
 	)
@@ -249,36 +319,124 @@ func TestActivityService_ApplySettingsSuppressionAlreadyGatedSharesOneDeadlineBu
 	disconnectDeadline, hasDisconnectDeadline := delivery.disconnectContexts[0].Deadline()
 	require.True(t, hasDeleteDeadline)
 	require.True(t, hasDisconnectDeadline)
+	assert.True(t, deleteDeadline.Before(callerDeadline),
+		"normal work must leave the outer fail-closed recovery budget")
 	assert.Equal(t, deleteDeadline, disconnectDeadline)
 }
 
-func TestActivityService_SettingsRecipientTimeoutUsesFreshFailClosedDisconnectBudget(t *testing.T) {
+func TestActivityService_SettingsRecipientFailureKeepsDisconnectWithinCallerBudget(t *testing.T) {
 	service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
 	before := testActivityPolicySettings(true, TierFriends, TierFriends)
 	after := before
 	after.ServerVoiceShowDetails = false
+	resolverErr := errors.New("settings recipient resolution failed")
+	var resolverCtx context.Context
 	service.settingsRecipients = func(
 		ctx context.Context,
 		_ uuid.UUID,
 		_ ActivityPolicySettings,
 		_ ActivityPolicySettings,
 	) (map[uuid.UUID]bool, error) {
-		<-ctx.Done()
-		return nil, ctx.Err()
+		resolverCtx = ctx
+		return nil, resolverErr
 	}
+	callerDeadline := time.Now().Add(2*activityCleanupTimeout + time.Second)
+	callerCtx, cancelCaller := context.WithDeadline(context.Background(), callerDeadline)
+	defer cancelCaller()
 
 	err := service.ApplySettingsSuppressionAlreadyGated(
-		context.Background(), activityServiceSender, before, after,
+		callerCtx, activityServiceSender, before, after,
+	)
+
+	assert.ErrorIs(t, err, resolverErr)
+	require.NotNil(t, resolverCtx)
+	resolverDeadline, resolverBounded := resolverCtx.Deadline()
+	require.True(t, resolverBounded)
+	assert.True(t, resolverDeadline.Before(callerDeadline),
+		"recipient resolution must leave the outer fail-closed recovery budget")
+	require.Len(t, delivery.disconnectAllContextErrors, 1)
+	assert.NoError(t, delivery.disconnectAllContextErrors[0])
+	require.Len(t, delivery.disconnectAllContexts, 1)
+	assert.True(t, delivery.disconnectAllContexts[0] == callerCtx,
+		"resolver-error disconnect must remain inside the transaction deadline")
+	deadline, bounded := delivery.disconnectAllContexts[0].Deadline()
+	require.True(t, bounded)
+	assert.Equal(t, callerDeadline, deadline)
+}
+
+func TestActivityService_SettingsRecipientDeadlineExceededUsesRemainingCallerBudgetForDisconnect(
+	t *testing.T,
+) {
+	service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	before := testActivityPolicySettings(true, TierFriends, TierFriends)
+	after := before
+	after.ServerVoiceShowDetails = false
+	var resolverDeadline time.Time
+	service.settingsRecipients = func(
+		ctx context.Context,
+		_ uuid.UUID,
+		_ ActivityPolicySettings,
+		_ ActivityPolicySettings,
+	) (map[uuid.UUID]bool, error) {
+		var bounded bool
+		resolverDeadline, bounded = ctx.Deadline()
+		require.True(t, bounded)
+		return nil, context.DeadlineExceeded
+	}
+	callerDeadline := time.Now().Add(2*activityCleanupTimeout + time.Second)
+	callerCtx, cancelCaller := context.WithDeadline(context.Background(), callerDeadline)
+	defer cancelCaller()
+
+	err := service.ApplySettingsSuppressionAlreadyGated(
+		callerCtx, activityServiceSender, before, after,
 	)
 
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.True(t, resolverDeadline.Before(callerDeadline),
+		"recipient work needs a child budget that leaves time for fail-closed disconnect")
 	require.Len(t, delivery.disconnectAllContextErrors, 1)
 	assert.NoError(t, delivery.disconnectAllContextErrors[0],
-		"the fail-closed disconnect needs a fresh emergency budget")
+		"fail-closed disconnect must use the remaining suppression-phase budget")
 	require.Len(t, delivery.disconnectAllContexts, 1)
-	deadline, bounded := delivery.disconnectAllContexts[0].Deadline()
+	assert.True(t, delivery.disconnectAllContexts[0] == callerCtx)
+	disconnectDeadline, bounded := delivery.disconnectAllContexts[0].Deadline()
 	require.True(t, bounded)
-	assert.Greater(t, time.Until(deadline), time.Duration(0))
+	assert.Equal(t, callerDeadline, disconnectDeadline)
+}
+
+func TestActivityService_SettingsSuppressionInsufficientBudgetDisconnectsWithoutResolution(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	before := testActivityPolicySettings(true, TierFriends, TierFriends)
+	after := before
+	after.ServerVoiceShowDetails = false
+	resolverCalls := 0
+	service.settingsRecipients = func(
+		context.Context,
+		uuid.UUID,
+		ActivityPolicySettings,
+		ActivityPolicySettings,
+	) (map[uuid.UUID]bool, error) {
+		resolverCalls++
+		return map[uuid.UUID]bool{}, nil
+	}
+	callerCtx, cancelCaller := context.WithTimeout(
+		context.Background(), activityCleanupTimeout,
+	)
+	defer cancelCaller()
+
+	err := service.ApplySettingsSuppressionAlreadyGated(
+		callerCtx, activityServiceSender, before, after,
+	)
+
+	assert.Error(t, err, "insufficient budget must retain the durable evidence")
+	assert.Zero(t, resolverCalls,
+		"do not start resolution that could consume the transaction deadline")
+	assert.Empty(t, delivery.disconnects)
+	assert.Equal(t, 1, delivery.disconnectAllCalls)
+	require.Len(t, delivery.disconnectAllContextErrors, 1)
+	assert.NoError(t, delivery.disconnectAllContextErrors[0])
+	assert.Empty(t, store.exactDeletes,
+		"no suppression receipt may follow an incomplete guarded attempt")
 }
 
 func TestActivityService_ApplySettingsSuppressionAlreadyGatedDisconnectsBeforeBlockingDeletes(t *testing.T) {

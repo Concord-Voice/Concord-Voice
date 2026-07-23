@@ -3,6 +3,7 @@ package users_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -409,6 +410,171 @@ func TestUpdatePresenceSettingsSuppressionReceiptSurvivesFinalizationRollback(t 
 func execActivityCleanupTestSQL(db *sql.DB, statement string) error {
 	_, err := db.Exec(statement)
 	return err
+}
+
+type settingsCleanupActivityDelivery struct {
+	disconnectAllCalls int
+}
+
+func (*settingsCleanupActivityDelivery) DeliverRichPresence(
+	context.Context,
+	presence.DeliveryPlan,
+) error {
+	return nil
+}
+
+func (*settingsCleanupActivityDelivery) DisconnectRichPresenceClients(
+	context.Context,
+	map[uuid.UUID]bool,
+) error {
+	return nil
+}
+
+func (d *settingsCleanupActivityDelivery) DisconnectAllRichPresenceClients(
+	context.Context,
+) error {
+	d.disconnectAllCalls++
+	return nil
+}
+
+func activityCleanupEvidenceJSON(
+	t *testing.T,
+	before, after presence.ActivityPolicySettings,
+) string {
+	t.Helper()
+	settings := func(value presence.ActivityPolicySettings) map[string]any {
+		return map[string]any{
+			"master_enabled":            value.MasterEnabled,
+			"server_voice_tier":         int(value.ServerVoiceTier),
+			"server_voice_show_details": value.ServerVoiceShowDetails,
+			"private_call_tier":         int(value.PrivateCallTier),
+			"private_call_show_details": value.PrivateCallShowDetails,
+		}
+	}
+	evidence, err := json.Marshal(map[string]any{
+		"version": 1,
+		"before":  settings(before),
+		"after":   settings(after),
+	})
+	require.NoError(t, err)
+	return string(evidence)
+}
+
+func TestUpdatePresenceSettingsPriorIneligibleMissingActivityStateClearsMarker(t *testing.T) {
+	for _, test := range []struct {
+		name                  string
+		beforeServerTier      presence.Tier
+		beforeDetails         bool
+		afterDetails          bool
+		request               map[string]interface{}
+		wantStatus            int
+		wantMarker            int
+		wantDisconnectAll     int
+		wantStoredShowDetails bool
+	}{
+		{
+			name:             "prior server voice off permits truly absent state",
+			beforeServerTier: presence.TierOff, beforeDetails: false,
+			afterDetails: true,
+			request: map[string]interface{}{
+				"server_voice_tier":         int(presence.TierFriends),
+				"server_voice_show_details": true,
+			},
+			wantStatus: http.StatusOK, wantStoredShowDetails: true,
+		},
+		{
+			name:             "prior server voice eligible remains fail closed",
+			beforeServerTier: presence.TierFriends, beforeDetails: true,
+			afterDetails: false,
+			request: map[string]interface{}{
+				"server_voice_show_details": true,
+			},
+			wantStatus: http.StatusServiceUnavailable, wantMarker: 1,
+			wantDisconnectAll: 1,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, dbCleanup := testhelpers.SetupTestDB(t)
+			t.Cleanup(dbCleanup)
+			redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+			t.Cleanup(redisCleanup)
+			userID := testhelpers.CreateUser(t, db)
+			serverID := testhelpers.CreateServer(t, db, userID)
+			testhelpers.AddServerMember(t, db, serverID, userID)
+			channelID := uuid.New()
+			_, err := db.Exec(`
+				INSERT INTO channels (id, server_id, name, type)
+				VALUES ($1, $2, 'settings-cleanup', 'voice')
+			`, channelID, serverID)
+			require.NoError(t, err)
+			lifecycleAt := time.Date(2026, 7, 22, 17, 0, 0, 0, time.UTC)
+			_, err = db.Exec(`
+				INSERT INTO voice_participants (
+					channel_id, user_id, joined_at, lifecycle_event_at
+				) VALUES ($1, $2, $3, $3)
+			`, channelID, userID, lifecycleAt)
+			require.NoError(t, err)
+			_, err = db.Exec(`
+				INSERT INTO user_presence_settings (
+					user_id, master_enabled, server_voice_tier,
+					server_voice_show_details
+				) VALUES ($1, TRUE, $2, $3)
+			`, userID, presence.TierFriends, test.afterDetails)
+			require.NoError(t, err)
+			before := presence.ActivityPolicySettings{
+				MasterEnabled: true, ServerVoiceTier: test.beforeServerTier,
+				ServerVoiceShowDetails: test.beforeDetails,
+				PrivateCallTier:        presence.TierOff,
+			}
+			after := before
+			after.ServerVoiceTier = presence.TierFriends
+			after.ServerVoiceShowDetails = test.afterDetails
+			operationID := uuid.New()
+			_, err = db.Exec(`
+				INSERT INTO activity_settings_pending_cleanups (
+					user_id, operation_id, evidence
+				) VALUES ($1, $2, $3)
+			`, userID, operationID, activityCleanupEvidenceJSON(t, before, after))
+			require.NoError(t, err)
+
+			coordinator := presencehistory.NewService(
+				db, presencehistory.DisclosureState{}, false,
+			)
+			require.NoError(t, coordinator.BindDelivery(&task9Delivery{}))
+			activityStore := presence.NewActivityStore(redisClient)
+			activityDelivery := &settingsCleanupActivityDelivery{}
+			activityService := presence.NewActivityService(
+				coordinator,
+				presence.NewActivityBuilder(db, nil, activityStore),
+				activityStore,
+				db,
+				nil,
+				activityDelivery,
+			)
+			handler := users.NewHandler(
+				db, logger.NewWithWriter(io.Discard), nil, nil, nil,
+			)
+			handler.SetPresenceHistory(coordinator)
+			handler.SetActivitySettingsSuppressor(activityService)
+
+			response := invokePresenceSettingsPATCH(handler, userID, test.request)
+
+			assert.Equal(t, test.wantStatus, response.Code, response.Body.String())
+			var markerCount int
+			require.NoError(t, db.QueryRow(`
+				SELECT COUNT(*) FROM activity_settings_pending_cleanups
+				WHERE user_id = $1 AND operation_id = $2
+			`, userID, operationID).Scan(&markerCount))
+			assert.Equal(t, test.wantMarker, markerCount)
+			assert.Equal(t, test.wantDisconnectAll, activityDelivery.disconnectAllCalls)
+			var storedShowDetails bool
+			require.NoError(t, db.QueryRow(`
+				SELECT server_voice_show_details
+				FROM user_presence_settings WHERE user_id = $1
+			`, userID).Scan(&storedShowDetails))
+			assert.Equal(t, test.wantStoredShowDetails, storedShowDetails)
+		})
+	}
 }
 
 func TestUpdatePresenceSettingsCustomTextOnlyResumesEarlierActivityCleanup(t *testing.T) {

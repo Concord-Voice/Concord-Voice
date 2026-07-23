@@ -364,8 +364,15 @@ func (h *Handler) UpdatePresenceSettings(c *gin.Context) {
 	}
 	mode := presenceSettingsOperationMode(update)
 	var write presenceSettingsWrite
-	err := h.presenceHistory.WithReadySenderMode(
-		c.Request.Context(), userUUID, mode, func() error {
+	err := h.presenceHistory.WithReadySenderModeBeforeReconcile(
+		c.Request.Context(), userUUID, mode,
+		func() error {
+			_, cleanupErr := h.resumePendingActivitySettingsCleanup(
+				c.Request.Context(), userUUID,
+			)
+			return cleanupErr
+		},
+		func() error {
 			var gatedErr error
 			write, gatedErr = h.updatePresenceSettingsAlreadyGated(
 				c.Request.Context(), userUUID, update, mode,
@@ -434,11 +441,6 @@ func (h *Handler) updatePresenceSettingsAlreadyGated(
 	update presenceUpdate,
 	mode presencehistory.OperationMode,
 ) (write presenceSettingsWrite, returnErr error) {
-	// Every later settings write first discharges older durable activity-policy
-	// cleanup, including Custom Status-only writes.
-	if _, err := h.resumePendingActivitySettingsCleanup(ctx, userID); err != nil {
-		return write, err
-	}
 	var writeErr error
 	for attempt := 0; attempt < activitySettingsCleanupResumeAttempts; attempt++ {
 		write, writeErr = h.writePresenceSettings(ctx, userID, update, mode)

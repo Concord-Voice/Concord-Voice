@@ -116,5 +116,7 @@ func TestUpdatePresenceSettingsDBError(t *testing.T) {
 
 	h.UpdatePresenceSettings(c)
 
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	// Activity cleanup now runs before Custom Status readiness, so its
+	// retryable database failure is the first authoritative error.
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 }

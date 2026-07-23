@@ -9,6 +9,12 @@ import (
 	"github.com/google/uuid"
 )
 
+const activitySettingsSuppressionMinimumBudget = 2 * activityCleanupTimeout
+
+var errActivitySettingsSuppressionBudget = errors.New(
+	"rich-presence settings cleanup budget cannot preserve fail-closed recovery",
+)
+
 // ActivityPolicySettings is the policy state bracketing one committed settings
 // write. It intentionally excludes Custom Status, which has its own delivery
 // plan and acknowledgement path.
@@ -55,7 +61,8 @@ func (s *ActivityService) SuppressAllActivityAlreadyGated(
 }
 
 // ApplySettingsSuppressionAlreadyGated removes activity made ineligible by a
-// confirmed committed settings write. The caller must already own the sender gate.
+// confirmed committed settings write. The caller must already own the sender
+// gate and supplies the context budget for the full suppression phase.
 func (s *ActivityService) ApplySettingsSuppressionAlreadyGated(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -68,13 +75,26 @@ func (s *ActivityService) ApplySettingsSuppressionAlreadyGated(
 	if before == after {
 		return nil
 	}
+	if !activitySettingsSuppressionHasRecoveryBudget(ctx) {
+		return errors.Join(
+			errActivitySettingsSuppressionBudget,
+			s.disconnectAllWithinBudget(ctx),
+		)
+	}
 
-	cleanupCtx, cancelCleanup := boundedActivityCleanupContext(ctx)
-	defer cancelCleanup()
+	workCtx, cancelWork := context.WithTimeout(ctx, activityCleanupTimeout)
+	defer cancelWork()
 
-	cleanupErrors := s.disconnectActivitySettingsRecipients(cleanupCtx, ctx, userID, before, after)
-	cleanupErrors = append(cleanupErrors, s.deleteSuppressedActivity(cleanupCtx, userID, after)...)
+	cleanupErrors := s.disconnectActivitySettingsRecipients(
+		workCtx, ctx, userID, before, after,
+	)
+	cleanupErrors = append(cleanupErrors, s.deleteSuppressedActivity(workCtx, userID, after)...)
 	return errors.Join(cleanupErrors...)
+}
+
+func activitySettingsSuppressionHasRecoveryBudget(ctx context.Context) bool {
+	deadline, bounded := ctx.Deadline()
+	return !bounded || time.Until(deadline) > activitySettingsSuppressionMinimumBudget
 }
 
 func validateActivitySettingsCleanup(
@@ -100,17 +120,17 @@ func validateActivitySettingsCleanup(
 }
 
 func (s *ActivityService) disconnectActivitySettingsRecipients(
-	cleanupCtx context.Context,
-	requestCtx context.Context,
+	workCtx context.Context,
+	suppressionCtx context.Context,
 	userID uuid.UUID,
 	before ActivityPolicySettings,
 	after ActivityPolicySettings,
 ) []error {
 	var cleanupErrors []error
-	recipients, err := s.settingsRecipients(cleanupCtx, userID, before, after)
+	recipients, err := s.settingsRecipients(workCtx, userID, before, after)
 	if err != nil {
 		cleanupErrors = append(cleanupErrors, fmt.Errorf("resolve affected rich-presence clients: %w", err))
-		if disconnectErr := s.disconnectAll(requestCtx); disconnectErr != nil {
+		if disconnectErr := s.disconnectAllWithinBudget(suppressionCtx); disconnectErr != nil {
 			cleanupErrors = append(cleanupErrors, disconnectErr)
 		}
 		return cleanupErrors
@@ -118,7 +138,7 @@ func (s *ActivityService) disconnectActivitySettingsRecipients(
 	if len(recipients) == 0 {
 		return cleanupErrors
 	}
-	if disconnectErr := s.delivery.DisconnectRichPresenceClients(cleanupCtx, recipients); disconnectErr != nil {
+	if disconnectErr := s.delivery.DisconnectRichPresenceClients(workCtx, recipients); disconnectErr != nil {
 		cleanupErrors = append(
 			cleanupErrors,
 			fmt.Errorf("disconnect affected rich-presence clients: %w", disconnectErr),
@@ -203,12 +223,10 @@ func changedServerSettingsRecipients(
 	}
 	return currentServerSettingsRecipients(
 		ctx,
-		dependencies.db,
-		dependencies.visibility,
-		dependencies.builder,
-		dependencies.store,
+		dependencies,
 		userID,
 		maxEnabledServerTier(before, after),
+		before.MasterEnabled && before.ServerVoiceTier != TierOff,
 	)
 }
 
@@ -229,6 +247,7 @@ func changedPrivateSettingsRecipients(
 		dependencies.store,
 		userID,
 		maxEnabledPrivateTier(before, after),
+		before.MasterEnabled,
 	)
 }
 
@@ -285,21 +304,21 @@ func maxEnabledPrivateTier(before, after ActivityPolicySettings) Tier {
 
 func currentServerSettingsRecipients(
 	ctx context.Context,
-	db DBTX,
-	visibility ChannelVisibilityResolver,
-	builder activityBuilder,
-	store *ActivityStore,
+	dependencies activitySettingsRecipientDependencies,
 	userID uuid.UUID,
 	tier Tier,
+	priorEligible bool,
 ) (map[uuid.UUID]bool, bool, error) {
-	state, found, err := store.Get(ctx, userID, CategoryServerVoice)
+	state, found, err := dependencies.store.Get(ctx, userID, CategoryServerVoice)
 	if err != nil {
 		return nil, false, err
 	}
 	if !found {
-		return settingsRecipientsWithoutState(ctx, db, userID, CategoryServerVoice)
+		return settingsRecipientsWithoutState(CategoryServerVoice, priorEligible)
 	}
-	built, err := loadCurrentServerSettingsActivity(ctx, builder, store, userID, state)
+	built, err := loadCurrentServerSettingsActivity(
+		ctx, dependencies.builder, dependencies.store, userID, state,
+	)
 	if err != nil {
 		return nil, false, err
 	}
@@ -307,7 +326,7 @@ func currentServerSettingsRecipients(
 	channelID := built.Input.ServerVoice.Context.ChannelID
 	if tier == TierOff {
 		if err := requireCurrentSettingsGeneration(
-			ctx, store, userID, CategoryServerVoice, state,
+			ctx, dependencies.store, userID, CategoryServerVoice, state,
 			"rich-presence server settings generation changed",
 		); err != nil {
 			return nil, false, err
@@ -315,13 +334,13 @@ func currentServerSettingsRecipients(
 		return map[uuid.UUID]bool{}, true, nil
 	}
 	out, err := visibleServerSettingsRecipients(
-		ctx, db, visibility, userID, serverID, channelID, tier,
+		ctx, dependencies.db, dependencies.visibility, userID, serverID, channelID, tier,
 	)
 	if err != nil {
 		return nil, false, err
 	}
 	if err := requireCurrentSettingsGeneration(
-		ctx, store, userID, CategoryServerVoice, state,
+		ctx, dependencies.store, userID, CategoryServerVoice, state,
 		"rich-presence server settings generation changed",
 	); err != nil {
 		return nil, false, err
@@ -474,13 +493,14 @@ func currentPrivateSettingsRecipients(
 	store *ActivityStore,
 	userID uuid.UUID,
 	tier Tier,
+	priorEligible bool,
 ) (map[uuid.UUID]bool, bool, error) {
 	state, found, err := store.Get(ctx, userID, CategoryPrivateCall)
 	if err != nil {
 		return nil, false, err
 	}
 	if !found {
-		return settingsRecipientsWithoutState(ctx, db, userID, CategoryPrivateCall)
+		return settingsRecipientsWithoutState(CategoryPrivateCall, priorEligible)
 	}
 	active, err := store.IsActiveGeneration(
 		ctx, userID, CategoryPrivateCall, state.SourceToken, state.SourceVersion,
@@ -573,30 +593,20 @@ func currentPrivateSettingsRecipients(
 }
 
 func settingsRecipientsWithoutState(
-	ctx context.Context,
-	db DBTX,
-	userID uuid.UUID,
 	category Category,
+	priorEligible bool,
 ) (map[uuid.UUID]bool, bool, error) {
-	var query string
 	switch category {
-	case CategoryServerVoice:
-		query = `SELECT EXISTS (SELECT 1 FROM voice_participants WHERE user_id = $1)`
-	case CategoryPrivateCall:
-		query = `SELECT EXISTS (SELECT 1 FROM dm_voice_participants WHERE user_id = $1)`
+	case CategoryServerVoice, CategoryPrivateCall:
 	default:
 		return nil, false, ErrInvalidActivityState
 	}
-	var authoritativeParticipant bool
-	if err := db.QueryRowContext(ctx, query, userID).Scan(&authoritativeParticipant); err != nil {
-		return nil, false, fmt.Errorf("verify authoritative %s participant: %w", category, err)
+	if !priorEligible {
+		return nil, false, nil
 	}
-	if authoritativeParticipant {
-		return nil, false, fmt.Errorf(
-			"rich-presence %s settings evidence unavailable for active participant", category,
-		)
-	}
-	return nil, false, nil
+	return nil, false, fmt.Errorf(
+		"rich-presence %s settings evidence unavailable for prior-eligible policy", category,
+	)
 }
 
 func exactCurrentPrivateCallScope(

@@ -669,10 +669,13 @@ before bootstrap starts.
 
 Migration 000098 adds `activity_settings_pending_cleanups`, one durable marker
 per user containing the exact versioned before/after policy bracket committed
-with a real activity-policy change. Successful suppression atomically replaces
-that bracket with a durable receipt; finalization deletes the receipt in a new
-transaction, so an ambiguous commit or retry cannot replay external suppression.
-Policy writers serialize on the canonical
+with a real activity-policy change. After successful suppression concludes its
+inspection transaction, at most two fresh transactions write or verify the
+exact durable receipt; finalization deletes that receipt in another fresh
+transaction. An ambiguous receipt commit is recovered without replay, but a
+process failure in the unavoidable interval between external suppression and
+receipt commit can leave evidence and cause replay. Suppression is replay-safe,
+not crash-proof exactly-once. Policy writers serialize on the canonical
 user/settings rows and recheck the marker in that transaction; cleanup
 resumptions hold a deterministic per-user advisory transaction lock around the
 marker row and suppression. A writer that waited behind a committed writer

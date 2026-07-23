@@ -156,11 +156,12 @@ func TestUpdatePresenceSettingsValidTierAndText(t *testing.T) {
 func TestUpdatePresenceSettingsPersistsExplicitFalseAndZero(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "presexplicit")
+	// Keep prior activity suppressed; this test covers explicit field binding.
 	_, err := ts.DB.Exec(`
 		INSERT INTO user_presence_settings (
 			user_id, master_enabled, server_voice_tier, server_voice_show_details,
 			private_call_tier, private_call_show_details, custom_text_tier, custom_text
-		) VALUES ($1, TRUE, 2, TRUE, 2, TRUE, 0, 'keep')
+		) VALUES ($1, FALSE, 2, TRUE, 2, TRUE, 0, 'keep')
 	`, user.ID)
 	require.NoError(t, err)
 
@@ -199,16 +200,17 @@ func TestUpdatePresenceSettingsPersistsExplicitFalseAndZero(t *testing.T) {
 func TestUpdatePresenceSettingsBindsCategoryFieldsIndependently(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "presbinds")
+	// Keep prior activity suppressed; this test covers independent field binding.
 	_, err := ts.DB.Exec(`
 		INSERT INTO user_presence_settings (
 			user_id, master_enabled, server_voice_tier, server_voice_show_details,
 			private_call_tier, private_call_show_details
-		) VALUES ($1, TRUE, 2, FALSE, 0, TRUE)
+		) VALUES ($1, FALSE, 2, FALSE, 0, TRUE)
 	`, user.ID)
 	require.NoError(t, err)
 
 	expected := map[string]interface{}{
-		"master_enabled":            true,
+		"master_enabled":            false,
 		"server_voice_tier":         float64(2),
 		"server_voice_show_details": false,
 		"private_call_tier":         float64(0),

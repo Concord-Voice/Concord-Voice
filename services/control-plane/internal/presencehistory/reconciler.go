@@ -130,7 +130,7 @@ func (s *Service) boundDelivery() (Delivery, error) {
 
 // WithReadySender retains one sender gate through reconciliation and work.
 func (s *Service) WithReadySender(ctx context.Context, senderID uuid.UUID, work func() error) error {
-	return s.WithReadySenderMode(ctx, senderID, OrdinaryAudienceWrite, work)
+	return s.withReadySenderMode(ctx, senderID, OrdinaryAudienceWrite, nil, work)
 }
 
 // WithReadySenderMode retains the same single sender gate while allowing a
@@ -141,25 +141,66 @@ func (s *Service) WithReadySenderMode(
 	mode OperationMode,
 	work func() error,
 ) error {
+	return s.withReadySenderMode(ctx, senderID, mode, nil, work)
+}
+
+// WithReadySenderModeBeforeReconcile retains one sender gate while running a
+// required pre-reconciliation step, Custom Status readiness, and the requested
+// work in that order.
+func (s *Service) WithReadySenderModeBeforeReconcile(
+	ctx context.Context,
+	senderID uuid.UUID,
+	mode OperationMode,
+	beforeReconcile func() error,
+	work func() error,
+) error {
+	if beforeReconcile == nil {
+		return errors.New("presence history pre-reconcile step unavailable")
+	}
+	return s.withReadySenderMode(ctx, senderID, mode, beforeReconcile, work)
+}
+
+func (s *Service) withReadySenderMode(
+	ctx context.Context,
+	senderID uuid.UUID,
+	mode OperationMode,
+	beforeReconcile func() error,
+	work func() error,
+) error {
 	if s == nil || s.db == nil || senderID == uuid.Nil || work == nil {
 		return errors.New("presence history ready sender unavailable")
 	}
 	if mode != OrdinaryAudienceWrite && mode != ForcedSecurityClear {
 		return errors.New("invalid presence history ready sender mode")
 	}
+	return s.WithSender(ctx, senderID, func() error {
+		return s.runReadySenderMode(ctx, senderID, mode, beforeReconcile, work)
+	})
+}
+
+func (s *Service) runReadySenderMode(
+	ctx context.Context,
+	senderID uuid.UUID,
+	mode OperationMode,
+	beforeReconcile func() error,
+	work func() error,
+) error {
+	if beforeReconcile != nil {
+		if err := beforeReconcile(); err != nil {
+			return err
+		}
+	}
 	if _, err := s.boundDelivery(); err != nil {
 		return err
 	}
-	return s.WithSender(ctx, senderID, func() error {
-		if _, err := s.reconcileSenderAlreadyGated(ctx, senderID, mode); err != nil {
-			var pending *ServiceError
-			if mode != ForcedSecurityClear || !errors.As(err, &pending) ||
-				err != pending || pending.Code != "presence_operation_pending" {
-				return err
-			}
+	if _, err := s.reconcileSenderAlreadyGated(ctx, senderID, mode); err != nil {
+		var pending *ServiceError
+		if mode != ForcedSecurityClear || !errors.As(err, &pending) ||
+			err != pending || pending.Code != "presence_operation_pending" {
+			return err
 		}
-		return work()
-	})
+	}
+	return work()
 }
 
 // ClaimAndDeliver holds canonical database locks until exact delivery is

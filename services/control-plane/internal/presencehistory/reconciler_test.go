@@ -1474,6 +1474,92 @@ func TestWithReadySenderRejectsUnexpiredAndKeepsOneContinuousGate(t *testing.T) 
 	require.NoError(t, task8ReceiveError(t, contenderDone, "contender did not finish"))
 }
 
+func TestWithReadySenderModeBeforeReconcile(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	senderID := testhelpers.CreateUser(t, db)
+	operationID := uuid.New()
+	seedTask8Pending(t, db, senderID, operationID, operationID, 0, true, CustomTextState{Text: "live"})
+
+	var orderMu sync.Mutex
+	var order []string
+	record := func(event string) {
+		orderMu.Lock()
+		defer orderMu.Unlock()
+		order = append(order, event)
+	}
+	delivery := &task8Delivery{deliver: func(context.Context, DeliveryPlan) error {
+		record("reconcile")
+		return nil
+	}}
+	service := NewService(db, DisclosureState{}, false)
+	require.NoError(t, service.BindDelivery(delivery))
+
+	beforeEntered := make(chan struct{})
+	releaseBefore := make(chan struct{})
+	workEntered := make(chan struct{})
+	releaseWork := make(chan struct{})
+	readyDone := make(chan error, 1)
+	go func() {
+		readyDone <- service.WithReadySenderModeBeforeReconcile(
+			context.Background(), senderID, OrdinaryAudienceWrite,
+			func() error {
+				record("beforeReconcile")
+				close(beforeEntered)
+				<-releaseBefore
+				return nil
+			},
+			func() error {
+				record("work")
+				close(workEntered)
+				<-releaseWork
+				return nil
+			},
+		)
+	}()
+	task8Receive(t, beforeEntered, "ready sender did not reach pre-reconcile work")
+
+	contenderCalling := make(chan struct{})
+	contenderEntered := make(chan struct{})
+	contenderDone := make(chan error, 1)
+	go func() {
+		close(contenderCalling)
+		contenderDone <- service.WithSender(context.Background(), senderID, func() error {
+			record("contender")
+			close(contenderEntered)
+			return nil
+		})
+	}()
+	task8Receive(t, contenderCalling, "same-sender contender did not start")
+	orderMu.Lock()
+	assert.Equal(t, []string{"beforeReconcile"}, append([]string(nil), order...))
+	orderMu.Unlock()
+	select {
+	case <-contenderEntered:
+		t.Fatal("same-sender callback bypassed pre-reconcile-held gate")
+	default:
+	}
+
+	close(releaseBefore)
+	task8Receive(t, workEntered, "ready sender did not reach work")
+	orderMu.Lock()
+	assert.Equal(t, []string{"beforeReconcile", "reconcile", "work"}, append([]string(nil), order...))
+	orderMu.Unlock()
+	select {
+	case <-contenderEntered:
+		t.Fatal("same-sender callback bypassed work-held gate")
+	default:
+	}
+
+	close(releaseWork)
+	require.NoError(t, task8ReceiveError(t, readyDone, "ready sender did not finish"))
+	task8Receive(t, contenderEntered, "same-sender callback did not enter after work released")
+	require.NoError(t, task8ReceiveError(t, contenderDone, "same-sender contender did not finish"))
+	orderMu.Lock()
+	assert.Equal(t, []string{"beforeReconcile", "reconcile", "work", "contender"}, order)
+	orderMu.Unlock()
+}
+
 func TestWithReadySenderDoesNotRunWorkWhenEligibleReconciliationFails(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	defer cleanup()

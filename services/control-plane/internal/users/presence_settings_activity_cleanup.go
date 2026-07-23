@@ -303,17 +303,12 @@ func (h *Handler) resumePendingActivitySettingsCleanup(
 	requestCtx context.Context,
 	userID uuid.UUID,
 ) (resumed bool, returnErr error) {
-	cleanupCtx, cancelCleanup := context.WithTimeout(
-		context.WithoutCancel(requestCtx),
-		activityCleanupTimeout,
-	)
-	defer cancelCleanup()
 	if h == nil || h.db == nil {
 		return false, activitySettingsCleanupFailure(
 			503, errors.New("activity settings cleanup database unavailable"),
 		)
 	}
-	marker, err := h.suppressPendingActivitySettingsCleanup(cleanupCtx, userID)
+	marker, err := h.suppressPendingActivitySettingsCleanup(requestCtx, userID)
 	if err != nil {
 		return marker != nil, err
 	}
@@ -321,24 +316,38 @@ func (h *Handler) resumePendingActivitySettingsCleanup(
 		return false, nil
 	}
 	return true, h.finalizeSuppressedActivitySettingsCleanup(
-		cleanupCtx, userID, marker.OperationID,
+		requestCtx, userID, marker.OperationID,
+	)
+}
+
+func (h *Handler) newActivityCleanupPhaseContext(
+	requestCtx context.Context,
+) (context.Context, context.CancelFunc) {
+	if h != nil && h.activityCleanupPhaseContextFactory != nil {
+		return h.activityCleanupPhaseContextFactory(requestCtx)
+	}
+	return context.WithTimeout(
+		context.WithoutCancel(requestCtx),
+		activityCleanupTimeout,
 	)
 }
 
 func (h *Handler) suppressPendingActivitySettingsCleanup(
-	cleanupCtx context.Context,
+	requestCtx context.Context,
 	userID uuid.UUID,
 ) (marker *activitySettingsCleanupMarker, returnErr error) {
-	tx, err := h.db.BeginTx(cleanupCtx, nil)
+	suppressionCtx, cancelSuppression := h.newActivityCleanupPhaseContext(requestCtx)
+	defer cancelSuppression()
+	tx, err := h.db.BeginTx(suppressionCtx, nil)
 	if err != nil {
 		return nil, activitySettingsCleanupFailure(503, err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 	defer joinActivitySettingsCleanupRollback(tx.Rollback, &returnErr)
-	if err := lockActivitySettingsCleanup(cleanupCtx, tx, userID); err != nil {
+	if err := lockActivitySettingsCleanup(suppressionCtx, tx, userID); err != nil {
 		return nil, activitySettingsCleanupFailure(503, err)
 	}
-	marker, err = loadActivitySettingsCleanup(cleanupCtx, tx, userID)
+	marker, err = loadActivitySettingsCleanup(suppressionCtx, tx, userID)
 	if err != nil {
 		return nil, classifyActivitySettingsCleanupFailure(err)
 	}
@@ -351,41 +360,57 @@ func (h *Handler) suppressPendingActivitySettingsCleanup(
 		)
 	}
 	if err := h.activitySuppressor.ApplySettingsSuppressionAlreadyGated(
-		cleanupCtx,
+		suppressionCtx,
 		userID,
 		marker.Before,
 		marker.After,
 	); err != nil {
 		return marker, activitySettingsCleanupFailure(503, err)
 	}
-	if err := markActivitySettingsCleanupSuppressed(
-		cleanupCtx, tx, userID, marker.OperationID,
-	); err != nil {
-		return marker, activitySettingsCleanupFailure(503, err)
+
+	// The external side effect has succeeded. Finish the transaction that held
+	// the inspection lock before using a fresh, detached budget to persist its
+	// exact receipt. Receipt recovery must not inherit an exhausted suppression
+	// context or an indeterminate transaction lifecycle.
+	rollbackErr := tx.Rollback()
+	if errors.Is(rollbackErr, sql.ErrTxDone) {
+		rollbackErr = nil
 	}
-	if err := h.commitSuppressedActivitySettingsCleanup(
-		cleanupCtx, tx, userID, marker.OperationID,
-	); err != nil {
-		return marker, err
+	persistErr := h.persistSuppressedActivitySettingsCleanup(
+		requestCtx, userID, marker.OperationID,
+	)
+	if rollbackErr != nil || persistErr != nil {
+		var cleanupErrors []error
+		if rollbackErr != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf(
+				"conclude activity settings suppression transaction: %w", rollbackErr,
+			))
+		}
+		if persistErr != nil {
+			cleanupErrors = append(cleanupErrors, persistErr)
+		}
+		return marker, activitySettingsCleanupFailure(503, errors.Join(cleanupErrors...))
 	}
 	marker.Suppressed = true
 	return marker, nil
 }
 
 func (h *Handler) finalizeSuppressedActivitySettingsCleanup(
-	cleanupCtx context.Context,
+	requestCtx context.Context,
 	userID, operationID uuid.UUID,
 ) (returnErr error) {
-	tx, err := h.db.BeginTx(cleanupCtx, nil)
+	finalizeCtx, cancelFinalize := h.newActivityCleanupPhaseContext(requestCtx)
+	defer cancelFinalize()
+	tx, err := h.db.BeginTx(finalizeCtx, nil)
 	if err != nil {
 		return activitySettingsCleanupFailure(503, err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 	defer joinActivitySettingsCleanupRollback(tx.Rollback, &returnErr)
-	if err := lockActivitySettingsCleanup(cleanupCtx, tx, userID); err != nil {
+	if err := lockActivitySettingsCleanup(finalizeCtx, tx, userID); err != nil {
 		return activitySettingsCleanupFailure(503, err)
 	}
-	marker, err := loadActivitySettingsCleanup(cleanupCtx, tx, userID)
+	marker, err := loadActivitySettingsCleanup(finalizeCtx, tx, userID)
 	if err != nil {
 		return classifyActivitySettingsCleanupFailure(err)
 	}
@@ -396,44 +421,46 @@ func (h *Handler) finalizeSuppressedActivitySettingsCleanup(
 		return activitySettingsCleanupFailure(503, errActivitySettingsCleanupPending)
 	}
 	if err := deleteActivitySettingsCleanup(
-		cleanupCtx, tx, userID, operationID,
+		finalizeCtx, tx, userID, operationID,
 	); err != nil {
 		return activitySettingsCleanupFailure(503, err)
 	}
 	return commitActivitySettingsCleanup(tx)
 }
 
-func (h *Handler) commitSuppressedActivitySettingsCleanup(
-	ctx context.Context,
-	tx *sql.Tx,
+func (h *Handler) persistSuppressedActivitySettingsCleanup(
+	requestCtx context.Context,
 	userID, operationID uuid.UUID,
 ) error {
-	commitErr := tx.Commit()
-	if commitErr == nil {
-		return nil
+	var attemptErrors []error
+	for attempt := 0; attempt < activitySettingsCleanupResumeAttempts; attempt++ {
+		receiptCtx, cancelReceipt := h.newActivityCleanupPhaseContext(requestCtx)
+		err := h.persistSuppressedActivitySettingsCleanupAttempt(
+			receiptCtx, userID, operationID,
+		)
+		cancelReceipt()
+		if err == nil {
+			return nil
+		}
+		attemptErrors = append(attemptErrors, err)
 	}
-	if err := h.persistSuppressedActivitySettingsCleanup(
-		ctx, userID, operationID,
-	); err != nil {
-		return activitySettingsCleanupFailure(503, errors.Join(commitErr, err))
-	}
-	return nil
+	return errors.Join(attemptErrors...)
 }
 
-func (h *Handler) persistSuppressedActivitySettingsCleanup(
-	ctx context.Context,
+func (h *Handler) persistSuppressedActivitySettingsCleanupAttempt(
+	receiptCtx context.Context,
 	userID, operationID uuid.UUID,
 ) (returnErr error) {
-	tx, err := h.db.BeginTx(ctx, nil)
+	tx, err := h.db.BeginTx(receiptCtx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
 	defer joinActivitySettingsCleanupRollback(tx.Rollback, &returnErr)
-	if err := lockActivitySettingsCleanup(ctx, tx, userID); err != nil {
+	if err := lockActivitySettingsCleanup(receiptCtx, tx, userID); err != nil {
 		return err
 	}
-	marker, err := loadActivitySettingsCleanup(ctx, tx, userID)
+	marker, err := loadActivitySettingsCleanup(receiptCtx, tx, userID)
 	if err != nil {
 		return err
 	}
@@ -445,7 +472,7 @@ func (h *Handler) persistSuppressedActivitySettingsCleanup(
 	}
 	if !marker.Suppressed {
 		if err := markActivitySettingsCleanupSuppressed(
-			ctx, tx, userID, operationID,
+			receiptCtx, tx, userID, operationID,
 		); err != nil {
 			return err
 		}
