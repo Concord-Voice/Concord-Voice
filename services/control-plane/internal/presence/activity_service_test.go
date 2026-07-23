@@ -286,6 +286,7 @@ func TestActivityService_MoveServerVoiceSuppressionCleansPriorGenerationAndAudie
 		wantDisconnectAll    bool
 		wantInspect          bool
 		successorFound       bool
+		successorActive      bool
 		inspectErr           error
 		wantNoSuccessorClear bool
 		wantErrors           []error
@@ -300,6 +301,7 @@ func TestActivityService_MoveServerVoiceSuppressionCleansPriorGenerationAndAudie
 			wantDisconnect:       true,
 			wantInspect:          true,
 			successorFound:       true,
+			successorActive:      true,
 			wantNoSuccessorClear: true,
 		},
 		{
@@ -375,6 +377,7 @@ func TestActivityService_MoveServerVoiceSuppressionCleansPriorGenerationAndAudie
 				Payload: json.RawMessage(`{"server_id":"successor"}`), UpdatedAt: time.Now().Unix(),
 			}
 			store.getErr = test.inspectErr
+			store.isActiveResult = test.successorActive
 
 			err := service.MoveServerVoice(
 				context.Background(), activityServiceSender, oldScope, newScope,
@@ -415,6 +418,13 @@ func TestActivityService_MoveServerVoiceSuppressionCleansPriorGenerationAndAudie
 				assert.Len(t, store.gets, 1)
 			} else {
 				assert.Empty(t, store.gets)
+			}
+			if test.successorActive {
+				require.Len(t, store.activeChecks, 1)
+				assert.Equal(t, store.getState.SourceToken, store.activeChecks[0].token)
+				assert.Equal(t, store.getState.SourceVersion, store.activeChecks[0].version)
+			} else {
+				assert.Empty(t, store.activeChecks)
 			}
 			if test.wantDisconnectAll {
 				assert.Equal(t, 1, delivery.disconnectAllCalls)
@@ -566,18 +576,73 @@ func TestActivityService_MoveOldStateFailureDeletesOnlyPriorGeneration(t *testin
 }
 
 func TestActivityService_GenerationMismatchNeverClearsSuccessor(t *testing.T) {
-	t.Run("refresh", func(t *testing.T) {
+	t.Run("refresh without a cached successor disconnects all", func(t *testing.T) {
 		service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
 		store.setResult = false
 
 		err := service.RefreshServerVoice(context.Background(), activityServiceSender, serverActivityScope(), nil)
+
 		require.NoError(t, err)
 		assert.Empty(t, delivery.plans)
 		assert.Empty(t, store.deletes, "stale writer must not delete a successor")
-		assert.Equal(t, []map[uuid.UUID]bool{{activityServiceViewer: true}}, delivery.disconnects)
+		assert.Empty(t, delivery.disconnects)
+		assert.Equal(t, 1, delivery.disconnectAllCalls)
 	})
 
-	t.Run("clear", func(t *testing.T) {
+	t.Run("refresh preserves an exact active higher successor", func(t *testing.T) {
+		service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+		ctx, cancel := context.WithCancel(context.Background())
+		store.setResult = false
+		store.getFound = true
+		store.getState = ActivityState{
+			SourceToken: uuid.New(), SourceVersion: serverActivityScope().EventAt.Add(time.Second).UnixMicro(),
+			Payload: json.RawMessage(`{"server_id":"successor"}`), UpdatedAt: time.Now().Unix(),
+		}
+		store.isActiveResult = true
+		store.onSet = cancel
+
+		err := service.RefreshServerVoice(ctx, activityServiceSender, serverActivityScope(), nil)
+
+		require.NoError(t, err)
+		assert.Empty(t, delivery.plans)
+		require.Len(t, store.activeChecks, 1)
+		assert.Equal(t, store.getState.SourceToken, store.activeChecks[0].token)
+		assert.Equal(t, store.getState.SourceVersion, store.activeChecks[0].version)
+		assert.Equal(t, []map[uuid.UUID]bool{{activityServiceViewer: true}}, delivery.disconnects)
+		assert.Zero(t, delivery.disconnectAllCalls)
+		require.Len(t, store.activeContextErrors, 1)
+		assert.NoError(t, store.activeContextErrors[0])
+		require.Len(t, store.activeContextHasDeadline, 1)
+		require.True(t, store.activeContextHasDeadline[0])
+		require.Len(t, store.activeContextDeadlines, 1)
+		remaining := time.Until(store.activeContextDeadlines[0])
+		assert.Positive(t, remaining)
+		assert.LessOrEqual(t, remaining, activityCleanupTimeout)
+	})
+
+	t.Run("clear preserves an exact active higher successor", func(t *testing.T) {
+		service, _, store, delivery, _ := newActivityServiceFixture(CategoryPrivateCall)
+		store.deleteResult = false
+		store.getFound = true
+		store.getState = ActivityState{
+			SourceToken: uuid.New(), SourceVersion: privateActivityScope().EventAt.Add(time.Second).UnixMicro(),
+			Payload: json.RawMessage(`{"call_type":"dm"}`), UpdatedAt: time.Now().Unix(),
+		}
+		store.isActiveResult = true
+
+		err := service.ClearPrivateCall(context.Background(), activityServiceSender, privateActivityScope(), nil, nil)
+
+		require.NoError(t, err)
+		assert.Empty(t, delivery.plans)
+		assert.Len(t, store.gets, 1)
+		require.Len(t, store.activeChecks, 1)
+		assert.Equal(t, store.getState.SourceToken, store.activeChecks[0].token)
+		assert.Equal(t, store.getState.SourceVersion, store.activeChecks[0].version)
+		assert.Equal(t, []map[uuid.UUID]bool{{activityServiceViewer: true}}, delivery.disconnects)
+		assert.Zero(t, delivery.disconnectAllCalls)
+	})
+
+	t.Run("higher inactive or mismatched successor disconnects all", func(t *testing.T) {
 		service, _, store, delivery, _ := newActivityServiceFixture(CategoryPrivateCall)
 		store.deleteResult = false
 		store.getFound = true
@@ -587,11 +652,12 @@ func TestActivityService_GenerationMismatchNeverClearsSuccessor(t *testing.T) {
 		}
 
 		err := service.ClearPrivateCall(context.Background(), activityServiceSender, privateActivityScope(), nil, nil)
+
 		require.NoError(t, err)
 		assert.Empty(t, delivery.plans)
-		assert.Len(t, store.gets, 1)
-		assert.Equal(t, []map[uuid.UUID]bool{{activityServiceViewer: true}}, delivery.disconnects)
-		assert.Zero(t, delivery.disconnectAllCalls)
+		assert.Len(t, store.activeChecks, 1)
+		assert.Empty(t, delivery.disconnects)
+		assert.Equal(t, 1, delivery.disconnectAllCalls)
 	})
 
 	t.Run("clear missing generation disconnects all", func(t *testing.T) {
@@ -599,23 +665,45 @@ func TestActivityService_GenerationMismatchNeverClearsSuccessor(t *testing.T) {
 		store.deleteResult = false
 
 		err := service.ClearPrivateCall(context.Background(), activityServiceSender, privateActivityScope(), nil, nil)
+
 		require.NoError(t, err)
 		assert.Empty(t, delivery.plans)
 		assert.Len(t, store.gets, 1)
+		assert.Empty(t, store.activeChecks)
 		assert.Empty(t, delivery.disconnects)
 		assert.Equal(t, 1, delivery.disconnectAllCalls)
 	})
 
-	t.Run("clear inspection failure disconnects all and returns error", func(t *testing.T) {
+	t.Run("clear malformed stored state disconnects all and returns error", func(t *testing.T) {
 		service, _, store, delivery, _ := newActivityServiceFixture(CategoryPrivateCall)
 		store.deleteResult = false
-		inspectErr := errors.New("forced clear generation inspection failure")
-		store.getErr = inspectErr
+		store.getErr = ErrMalformedActivityState
 
 		err := service.ClearPrivateCall(context.Background(), activityServiceSender, privateActivityScope(), nil, nil)
-		require.ErrorIs(t, err, inspectErr)
+
+		require.ErrorIs(t, err, ErrMalformedActivityState)
 		assert.Empty(t, delivery.plans)
 		assert.Len(t, store.gets, 1)
+		assert.Empty(t, store.activeChecks)
+		assert.Empty(t, delivery.disconnects)
+		assert.Equal(t, 1, delivery.disconnectAllCalls)
+	})
+
+	t.Run("successor verification failure disconnects all and returns error", func(t *testing.T) {
+		service, _, store, delivery, _ := newActivityServiceFixture(CategoryPrivateCall)
+		store.deleteResult = false
+		store.getFound = true
+		store.getState = ActivityState{
+			SourceToken: uuid.New(), SourceVersion: privateActivityScope().EventAt.Add(time.Second).UnixMicro(),
+			Payload: json.RawMessage(`{"call_type":"dm"}`), UpdatedAt: time.Now().Unix(),
+		}
+		store.isActiveErr = ErrMalformedActivityLifecycle
+
+		err := service.ClearPrivateCall(context.Background(), activityServiceSender, privateActivityScope(), nil, nil)
+
+		require.ErrorIs(t, err, ErrMalformedActivityLifecycle)
+		assert.Empty(t, delivery.plans)
+		assert.Len(t, store.activeChecks, 1)
 		assert.Empty(t, delivery.disconnects)
 		assert.Equal(t, 1, delivery.disconnectAllCalls)
 	})
@@ -638,12 +726,16 @@ func TestActivityService_SuppressionClassifiesMissingGeneration(t *testing.T) {
 			SourceToken: uuid.New(), SourceVersion: serverActivityScope().EventAt.Add(time.Second).UnixMicro(),
 			Payload: json.RawMessage(`{"server_id":"successor"}`), UpdatedAt: time.Now().Unix(),
 		}
+		store.isActiveResult = true
 
 		err := service.RefreshServerVoice(context.Background(), activityServiceSender, serverActivityScope(), nil)
 
 		require.NoError(t, err)
 		require.Len(t, store.deletes, 1)
 		assert.Len(t, store.gets, 1)
+		require.Len(t, store.activeChecks, 1)
+		assert.Equal(t, store.getState.SourceToken, store.activeChecks[0].token)
+		assert.Equal(t, store.getState.SourceVersion, store.activeChecks[0].version)
 		assert.Empty(t, store.exactDeletes, "lifecycle suppression must not erase a successor")
 		assert.Empty(t, store.sets)
 		assert.Empty(t, delivery.plans)
@@ -799,11 +891,15 @@ func TestActivityService_FailsClosedAtEveryErrorSeam(t *testing.T) {
 			SourceToken: uuid.New(), SourceVersion: privateActivityScope().EventAt.Add(time.Second).UnixMicro(),
 			Payload: json.RawMessage(`{"call_type":"dm"}`), UpdatedAt: time.Now().Unix(),
 		}
+		store.isActiveResult = true
 		err := service.RefreshPrivateCall(
 			context.Background(), activityServiceSender, privateActivityScope(), nil, nil,
 		)
 		assert.ErrorIs(t, err, errForced)
 		assert.Len(t, store.gets, 1)
+		require.Len(t, store.activeChecks, 1)
+		assert.Equal(t, store.getState.SourceToken, store.activeChecks[0].token)
+		assert.Equal(t, store.getState.SourceVersion, store.activeChecks[0].version)
 		assert.Len(t, delivery.disconnects, 1)
 		assert.Zero(t, delivery.disconnectAllCalls)
 	})
@@ -1105,6 +1201,13 @@ type activityServiceStoreStub struct {
 	getErr   error
 	gets     []activityStoreCall
 
+	isActiveResult           bool
+	isActiveErr              error
+	activeChecks             []activityStoreCall
+	activeContextErrors      []error
+	activeContextDeadlines   []time.Time
+	activeContextHasDeadline []bool
+
 	deleteContextErrors []error
 	exactDeleteContexts []context.Context
 }
@@ -1116,6 +1219,23 @@ func (s *activityServiceStoreStub) Get(
 ) (ActivityState, bool, error) {
 	s.gets = append(s.gets, activityStoreCall{userID: userID, category: category})
 	return s.getState, s.getFound, s.getErr
+}
+
+func (s *activityServiceStoreStub) IsActiveGeneration(
+	ctx context.Context,
+	userID uuid.UUID,
+	category Category,
+	token uuid.UUID,
+	version int64,
+) (bool, error) {
+	s.activeChecks = append(s.activeChecks, activityStoreCall{
+		userID: userID, category: category, token: token, version: version,
+	})
+	s.activeContextErrors = append(s.activeContextErrors, ctx.Err())
+	deadline, hasDeadline := ctx.Deadline()
+	s.activeContextDeadlines = append(s.activeContextDeadlines, deadline)
+	s.activeContextHasDeadline = append(s.activeContextHasDeadline, hasDeadline)
+	return s.isActiveResult, s.isActiveErr
 }
 
 func (s *activityServiceStoreStub) Delete(

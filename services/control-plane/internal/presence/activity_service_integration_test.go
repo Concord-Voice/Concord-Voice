@@ -84,6 +84,7 @@ func TestActivityService_RealRedisPersistsRefreshesAndDeletesExactState(t *testi
 	assert.False(t, found)
 }
 
+// regression for #2232
 func TestActivityService_ActivePublicationCannotRaceNewerTerminal(t *testing.T) {
 	rdb := setupActivityStoreRedis(t)
 	store := NewActivityStore(rdb)
@@ -171,6 +172,8 @@ func TestActivityService_ActivePublicationCannotRaceNewerTerminal(t *testing.T) 
 	require.NoError(t, err)
 	require.False(t, found)
 	require.Empty(t, activeDelivery.plans, "stale active generation must never be delivered")
-	require.Len(t, activeDelivery.disconnects, 1,
-		"prepared recipients are conservatively disconnected when publication loses the fence")
+	assert.Empty(t, activeDelivery.disconnects,
+		"an unverified generation miss must not trust the prepared recipient union")
+	require.Equal(t, 1, activeDelivery.disconnectAllCalls,
+		"a terminal winner leaves no verified successor, so every local rich-presence client must disconnect")
 }

@@ -33,6 +33,7 @@ type activityBuilder interface {
 
 type activityStateStore interface {
 	CompareAndSetActive(context.Context, uuid.UUID, Category, ActivityState) (bool, error)
+	IsActiveGeneration(context.Context, uuid.UUID, Category, uuid.UUID, int64) (bool, error)
 	CompareAndDelete(context.Context, uuid.UUID, Category, uuid.UUID, int64) (bool, error)
 	Get(context.Context, uuid.UUID, Category) (ActivityState, bool, error)
 	Delete(context.Context, uuid.UUID, Category) error
@@ -383,7 +384,9 @@ func (s *ActivityService) persistAndDeliverRefreshedActivity(
 	}
 	preparedRecipients := unionActivityRecipients(audience, clearRecipients)
 	if !stored {
-		return s.disconnectKnown(ctx, preparedRecipients)
+		return s.disconnectAfterGenerationMiss(
+			ctx, request.senderID, request.category, built.SourceVersion, preparedRecipients,
+		)
 	}
 	plan := DeliveryPlan{
 		SenderID: request.senderID, Category: request.category,
@@ -753,7 +756,13 @@ func (s *ActivityService) hasGenerationSuccessor(
 	if state.SourceVersion <= sourceVersion {
 		return false, errors.New("inspect current rich-presence activity: state is not a successor")
 	}
-	return true, nil
+	active, err := s.store.IsActiveGeneration(
+		inspectCtx, senderID, category, state.SourceToken, state.SourceVersion,
+	)
+	if err != nil {
+		return false, fmt.Errorf("verify current rich-presence activity successor: %w", err)
+	}
+	return active, nil
 }
 
 func (s *ActivityService) disconnectKnown(
