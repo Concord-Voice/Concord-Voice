@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -611,6 +612,87 @@ func TestRefreshBasePresenceForPublication_DropsDisconnectedCandidate(t *testing
 	)
 	require.NoError(t, err)
 	assert.Equal(t, map[uuid.UUID]string{viewerID: statusOnline}, refreshed)
+}
+
+// Regression for #2404.
+func TestHiddenPresenceWritesSynchronizeWithBootstrapPublication(t *testing.T) {
+	tests := []struct {
+		name    string
+		initial string
+		mutate  func(*Hub, uuid.UUID)
+		want    string
+	}{
+		{
+			name: "set invisible",
+			mutate: func(hub *Hub, userID uuid.UUID) {
+				hub.setHiddenPresence(userID, statusInvisible)
+			},
+			want: statusInvisible,
+		},
+		{
+			name:    "clear",
+			initial: statusInvisible,
+			mutate: func(hub *Hub, userID uuid.UUID) {
+				hub.clearHiddenPresence(userID)
+			},
+			want: statusOnline,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			hub := NewHub(nil, nil)
+			viewerID := uuid.New()
+			hub.userClients[viewerID] = map[uuid.UUID]bool{uuid.New(): true}
+			if test.initial != "" {
+				hub.hiddenPresence[viewerID] = test.initial
+			}
+			seed := presenceSnapshotSeed{
+				viewerID:     viewerID,
+				connectedIDs: []uuid.UUID{viewerID},
+				hidden:       map[uuid.UUID]string{},
+			}
+			base := map[uuid.UUID]string{viewerID: statusOnline}
+			visible := map[uuid.UUID]bool{viewerID: true}
+
+			hub.mu.RLock()
+			connected, _, _ := hub.currentBasePresenceCandidateLocked(
+				seed, visible, true, viewerID,
+			)
+			if !connected {
+				hub.mu.RUnlock()
+				t.Fatal("bootstrap publication fixture did not include the viewer")
+			}
+			mutationDone := make(chan struct{})
+			go func() {
+				test.mutate(hub, viewerID)
+				close(mutationDone)
+			}()
+
+			for {
+				hub.currentBasePresenceCandidateLocked(seed, visible, true, viewerID)
+				select {
+				case <-mutationDone:
+					hub.mu.RUnlock()
+					t.Fatalf("%s completed while bootstrap publication held h.mu.RLock", test.name)
+				default:
+				}
+				if !hub.mu.TryRLock() {
+					break
+				}
+				hub.mu.RUnlock()
+				runtime.Gosched()
+			}
+			hub.mu.RUnlock()
+			<-mutationDone
+
+			refreshed, err := hub.refreshBasePresenceForPublication(
+				context.Background(), seed, base, visible,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, test.want, refreshed[viewerID])
+		})
+	}
 }
 
 func TestRunClientBootstrap_GlobalPreparationFailureDisconnectsAfterOrdinaryOverflow(t *testing.T) {

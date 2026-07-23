@@ -122,7 +122,8 @@ type Hub struct {
 
 	// Hub-local fail-closed presence for connected users. Values are the status
 	// visible to the user themselves (invisible or offline); every other viewer
-	// sees offline. The Run goroutine owns this map alongside userClients.
+	// sees offline. Run owns direct reads and write decisions; writes use
+	// mutex-owning helpers so off-loop bootstrap readers can hold h.mu.RLock.
 	hiddenPresence map[uuid.UUID]string
 
 	// Trusted visible status for connected users and whether fail-closed
@@ -3945,6 +3946,8 @@ func isVisibleStatus(val interface{}) bool {
 }
 
 func (h *Hub) setHiddenPresence(userID uuid.UUID, selfStatus string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.hiddenPresence == nil {
 		h.hiddenPresence = make(map[uuid.UUID]string)
 	}
@@ -3952,6 +3955,8 @@ func (h *Hub) setHiddenPresence(userID uuid.UUID, selfStatus string) {
 }
 
 func (h *Hub) clearHiddenPresence(userID uuid.UUID) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	delete(h.hiddenPresence, userID)
 }
 
