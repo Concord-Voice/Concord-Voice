@@ -743,7 +743,7 @@ func loadActivitySnapshotStates(
 
 type activitySnapshotGet struct {
 	key     activitySnapshotKey
-	command *redis.StringCmd
+	command *redis.Cmd
 }
 
 func loadActivitySnapshotStateBatch(
@@ -756,7 +756,7 @@ func loadActivitySnapshotStateBatch(
 	if err != nil {
 		return nil, err
 	}
-	if _, err := pipeline.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+	if _, err := pipeline.Exec(ctx); err != nil {
 		return nil, fmt.Errorf("read rich-presence snapshot state batch: %w", err)
 	}
 	states := make(map[activitySnapshotKey]ActivityState, len(gets))
@@ -784,7 +784,7 @@ func queueActivitySnapshotGets(
 			return nil, err
 		}
 		gets = append(gets, activitySnapshotGet{
-			key: key, command: pipeline.Get(ctx, redisKey),
+			key: key, command: getActivityStateScript.Eval(ctx, pipeline, []string{redisKey}),
 		})
 	}
 	return gets, nil
@@ -795,12 +795,12 @@ func decodeActivitySnapshotGet(
 	store *ActivityStore,
 	get activitySnapshotGet,
 ) (ActivityState, bool, error) {
-	raw, err := get.command.Bytes()
-	if errors.Is(err, redis.Nil) {
-		return ActivityState{}, false, nil
-	}
+	status, raw, err := activityStateScriptResult(get.command)
 	if err != nil {
 		return ActivityState{}, false, fmt.Errorf("read rich-presence snapshot state: %w", err)
+	}
+	if status != "string" {
+		return ActivityState{}, false, nil
 	}
 	state, err := decodeActivityState(raw)
 	if err == nil {

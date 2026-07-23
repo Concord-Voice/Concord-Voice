@@ -77,9 +77,31 @@ local function decode_activity_state(raw)
 end
 `
 
-var compareAndSetActivityScript = redis.NewScript(decodeActivityStateLua + `
-local current = redis.call('GET', KEYS[1])
-if current then
+const readActivityStateLua = `
+local function read_activity_state(key)
+  local key_type = redis.call('TYPE', key).ok
+  if key_type == 'none' then
+    return 'none', nil
+  end
+  if key_type ~= 'string' then
+    redis.call('DEL', key)
+    return 'malformed', nil
+  end
+  return 'string', redis.call('GET', key)
+end
+`
+
+var getActivityStateScript = redis.NewScript(readActivityStateLua + `
+local status, raw = read_activity_state(KEYS[1])
+if status == 'string' then
+  return {status, raw}
+end
+return {status}
+`)
+
+var compareAndSetActivityScript = redis.NewScript(decodeActivityStateLua + readActivityStateLua + `
+local status, current = read_activity_state(KEYS[1])
+if status == 'string' then
   local state = decode_activity_state(current)
   if not state then
     redis.call('DEL', KEYS[1])
@@ -95,7 +117,7 @@ redis.call('SET', KEYS[1], ARGV[3], 'PX', ARGV[4])
 return 1
 `)
 
-var compareAndSetActiveActivityScript = redis.NewScript(decodeActivityStateLua + `
+var compareAndSetActiveActivityScript = redis.NewScript(decodeActivityStateLua + readActivityStateLua + `
 local lifecycle_type = redis.call('TYPE', KEYS[2]).ok
 if lifecycle_type == 'none' then
   return 0
@@ -129,8 +151,8 @@ if token ~= ARGV[1] or version ~= tonumber(ARGV[2]) or active ~= '1' then
   return 0
 end
 
-local current = redis.call('GET', KEYS[1])
-if current then
+local status, current = read_activity_state(KEYS[1])
+if status == 'string' then
   local state = decode_activity_state(current)
   if not state then
     redis.call('DEL', KEYS[1])
@@ -182,10 +204,13 @@ end
 return 0
 `)
 
-var refreshActivityScript = redis.NewScript(decodeActivityStateLua + `
-local current = redis.call('GET', KEYS[1])
-if not current then
+var refreshActivityScript = redis.NewScript(decodeActivityStateLua + readActivityStateLua + `
+local status, current = read_activity_state(KEYS[1])
+if status == 'none' then
   return 0
+end
+if status == 'malformed' then
+  return -1
 end
 local state = decode_activity_state(current)
 if not state then
@@ -199,10 +224,13 @@ redis.call('PEXPIRE', KEYS[1], ARGV[3])
 return 1
 `)
 
-var compareAndDeleteActivityScript = redis.NewScript(decodeActivityStateLua + `
-local current = redis.call('GET', KEYS[1])
-if not current then
+var compareAndDeleteActivityScript = redis.NewScript(decodeActivityStateLua + readActivityStateLua + `
+local status, current = read_activity_state(KEYS[1])
+if status == 'none' then
   return 0
+end
+if status == 'malformed' then
+  return -1
 end
 local state = decode_activity_state(current)
 if not state then
@@ -215,8 +243,9 @@ end
 return redis.call('DEL', KEYS[1])
 `)
 
-var compareAndDeleteRawActivityScript = redis.NewScript(`
-if redis.call('GET', KEYS[1]) == ARGV[1] then
+var compareAndDeleteRawActivityScript = redis.NewScript(readActivityStateLua + `
+local status, current = read_activity_state(KEYS[1])
+if status == 'string' and current == ARGV[1] then
   return redis.call('DEL', KEYS[1])
 end
 return 0
@@ -450,12 +479,17 @@ func (s *ActivityStore) Get(
 		return ActivityState{}, false, errors.New("rich-presence activity store unavailable")
 	}
 
-	raw, err := s.redis.Get(ctx, key).Bytes()
-	if errors.Is(err, redis.Nil) {
-		return ActivityState{}, false, nil
-	}
+	status, raw, err := activityStateScriptResult(
+		getActivityStateScript.Run(ctx, s.redis, []string{key}),
+	)
 	if err != nil {
 		return ActivityState{}, false, fmt.Errorf("read rich-presence activity state: %w", err)
+	}
+	switch status {
+	case "none":
+		return ActivityState{}, false, nil
+	case "malformed":
+		return ActivityState{}, false, ErrMalformedActivityState
 	}
 
 	state, err := decodeActivityState(raw)
@@ -469,6 +503,27 @@ func (s *ActivityStore) Get(
 		)
 	}
 	return ActivityState{}, false, err
+}
+
+func activityStateScriptResult(command *redis.Cmd) (string, []byte, error) {
+	values, err := command.Slice()
+	if err != nil {
+		return "", nil, err
+	}
+	switch len(values) {
+	case 1:
+		status, ok := values[0].(string)
+		if ok && (status == "none" || status == "malformed") {
+			return status, nil, nil
+		}
+	case 2:
+		status, statusOK := values[0].(string)
+		raw, rawOK := values[1].(string)
+		if statusOK && rawOK && status == "string" {
+			return status, []byte(raw), nil
+		}
+	}
+	return "", nil, errors.New("invalid rich-presence activity script reply")
 }
 
 // Refresh renews the TTL only for an exact lifecycle generation.

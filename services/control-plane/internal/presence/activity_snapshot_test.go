@@ -48,6 +48,8 @@ func (b *activitySnapshotBuilderStub) Build(
 type activitySnapshotPipelineHook struct {
 	mu      sync.Mutex
 	batches [][]string
+	failAt  int
+	err     error
 }
 
 type activitySnapshotCoordinatorStub struct {
@@ -106,7 +108,11 @@ func (h *activitySnapshotPipelineHook) ProcessPipelineHook(
 		}
 		h.mu.Lock()
 		h.batches = append(h.batches, names)
+		batchNumber := len(h.batches)
 		h.mu.Unlock()
+		if batchNumber == h.failAt {
+			return h.err
+		}
 		return next(ctx, commands)
 	}
 }
@@ -142,7 +148,9 @@ func TestLoadActivitySnapshotStatesUsesBoundedExactGetPipelines(t *testing.T) {
 	for _, batch := range batches {
 		assert.LessOrEqual(t, len(batch), activitySnapshotRedisBatchSize)
 		for _, command := range batch {
-			assert.Equal(t, "get", command)
+			if !assert.Equal(t, "eval", command) {
+				break
+			}
 		}
 	}
 }
@@ -159,6 +167,102 @@ func TestLoadActivitySnapshotStatesDeletesMalformedValues(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, states)
 	assert.Zero(t, rdb.Exists(context.Background(), redisKey).Val())
+}
+
+func TestLoadActivitySnapshotStatesWrongTypesHealWithoutAbortingPeers(t *testing.T) {
+	rdb := setupActivityStoreRedis(t)
+	store := NewActivityStore(rdb)
+	ctx := context.Background()
+	validKey := activitySnapshotKey{
+		SenderID: uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		Category: CategoryServerVoice,
+	}
+	missingKey := activitySnapshotKey{
+		SenderID: uuid.MustParse("22222222-2222-2222-2222-222222222222"),
+		Category: CategoryServerVoice,
+	}
+	malformedKey := activitySnapshotKey{
+		SenderID: uuid.MustParse("33333333-3333-3333-3333-333333333333"),
+		Category: CategoryServerVoice,
+	}
+	validState := wrongTypeActivityTestState()
+	stored, err := store.CompareAndSet(
+		ctx, validKey.SenderID, validKey.Category, validState,
+	)
+	require.NoError(t, err)
+	require.True(t, stored)
+
+	malformedRedisKey, err := activityKey(malformedKey.SenderID, malformedKey.Category)
+	require.NoError(t, err)
+	require.NoError(t, rdb.Set(
+		ctx, malformedRedisKey, `{"payload":"untrusted"}`, time.Minute,
+	).Err())
+
+	wrongTypeSeeds := wrongTypeActivitySeeds()
+	keys := make([]activitySnapshotKey, 0, 3+len(wrongTypeSeeds))
+	keys = append(keys, validKey, missingKey, malformedKey)
+	invalidRedisKeys := make([]string, 0, 1+len(wrongTypeSeeds))
+	invalidRedisKeys = append(invalidRedisKeys, malformedRedisKey)
+	wrongTypeSenderIDs := []uuid.UUID{
+		uuid.MustParse("44444444-4444-4444-4444-444444444444"),
+		uuid.MustParse("55555555-5555-5555-5555-555555555555"),
+		uuid.MustParse("66666666-6666-6666-6666-666666666666"),
+		uuid.MustParse("77777777-7777-7777-7777-777777777777"),
+		uuid.MustParse("88888888-8888-8888-8888-888888888888"),
+	}
+	for index, seed := range wrongTypeSeeds {
+		key := activitySnapshotKey{
+			SenderID: wrongTypeSenderIDs[index],
+			Category: CategoryServerVoice,
+		}
+		redisKey, keyErr := activityKey(key.SenderID, key.Category)
+		require.NoError(t, keyErr)
+		require.NoError(t, seed.seed(ctx, rdb, redisKey))
+		keys = append(keys, key)
+		invalidRedisKeys = append(invalidRedisKeys, redisKey)
+	}
+	require.NoError(t, rdb.Set(ctx, "sentinel:2405:snapshot", "untouched", time.Minute).Err())
+
+	states, err := loadActivitySnapshotStates(ctx, store, keys)
+	require.NoError(t, err)
+	assert.Equal(t, map[activitySnapshotKey]ActivityState{validKey: validState}, states)
+
+	validRedisKey, err := activityKey(validKey.SenderID, validKey.Category)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), rdb.Exists(ctx, validRedisKey).Val())
+	missingRedisKey, err := activityKey(missingKey.SenderID, missingKey.Category)
+	require.NoError(t, err)
+	assert.Zero(t, rdb.Exists(ctx, missingRedisKey).Val())
+	for _, redisKey := range invalidRedisKeys {
+		assert.Zero(t, rdb.Exists(ctx, redisKey).Val(), redisKey)
+	}
+	assert.Equal(t, "untouched", rdb.Get(ctx, "sentinel:2405:snapshot").Val())
+}
+
+func TestLoadActivitySnapshotStatesCommandErrorReturnsNoPartialState(t *testing.T) {
+	rdb := setupActivityStoreRedis(t)
+	ctx := context.Background()
+	store := NewActivityStore(rdb)
+	key := activitySnapshotKey{
+		SenderID: uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		Category: CategoryServerVoice,
+	}
+	stored, err := store.CompareAndSet(
+		ctx, key.SenderID, key.Category, wrongTypeActivityTestState(),
+	)
+	require.NoError(t, err)
+	require.True(t, stored)
+
+	forcedErr := errors.New("forced snapshot pipeline failure")
+	rdb.AddHook(&activitySnapshotPipelineHook{failAt: 2, err: forcedErr})
+	keys := make([]activitySnapshotKey, activitySnapshotRedisBatchSize+1)
+	for index := range keys {
+		keys[index] = key
+	}
+
+	states, err := loadActivitySnapshotStates(ctx, store, keys)
+	assert.Nil(t, states)
+	assert.ErrorIs(t, err, forcedErr)
 }
 
 func TestGroupActivitySnapshotCandidatesGuardsBeforeDedupAndMarksAmbiguity(t *testing.T) {

@@ -343,6 +343,319 @@ func TestActivityStoreCurrentState(t *testing.T) {
 	})
 }
 
+func TestActivityStoreWrongTypeCurrentStateSelfHeals(t *testing.T) {
+	rdb := setupActivityStoreRedis(t)
+	ctx := context.Background()
+	store := NewActivityStore(rdb)
+	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	key, err := activityKey(userID, CategoryServerVoice)
+	require.NoError(t, err)
+	state := wrongTypeActivityTestState()
+
+	operations := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{
+			name: "get",
+			run: func(t *testing.T) {
+				got, found, getErr := store.Get(ctx, userID, CategoryServerVoice)
+				assert.Equal(t, ActivityState{}, got)
+				assert.False(t, found)
+				assert.ErrorIs(t, getErr, ErrMalformedActivityState)
+				assert.Zero(t, rdb.Exists(ctx, key).Val())
+			},
+		},
+		{
+			name: "compare-set",
+			run: func(t *testing.T) {
+				stored, storeErr := store.CompareAndSet(ctx, userID, CategoryServerVoice, state)
+				require.NoError(t, storeErr)
+				assert.True(t, stored)
+				assertActivityStateStored(ctx, t, store, userID, CategoryServerVoice, state)
+			},
+		},
+		{
+			name: "compare-set-active",
+			run: func(t *testing.T) {
+				seedActivityLifecycle(
+					t, rdb, userID, CategoryServerVoice,
+					state.SourceToken, state.SourceVersion, true,
+				)
+				stored, storeErr := store.CompareAndSetActive(
+					ctx, userID, CategoryServerVoice, state,
+				)
+				require.NoError(t, storeErr)
+				assert.True(t, stored)
+				assertActivityStateStored(ctx, t, store, userID, CategoryServerVoice, state)
+			},
+		},
+		{
+			name: "refresh",
+			run: func(t *testing.T) {
+				refreshed, refreshErr := store.Refresh(
+					ctx, userID, CategoryServerVoice,
+					state.SourceToken, state.SourceVersion,
+				)
+				assert.False(t, refreshed)
+				assert.ErrorIs(t, refreshErr, ErrMalformedActivityState)
+				assert.Zero(t, rdb.Exists(ctx, key).Val())
+			},
+		},
+		{
+			name: "compare-delete",
+			run: func(t *testing.T) {
+				deleted, deleteErr := store.CompareAndDelete(
+					ctx, userID, CategoryServerVoice,
+					state.SourceToken, state.SourceVersion,
+				)
+				assert.False(t, deleted)
+				assert.ErrorIs(t, deleteErr, ErrMalformedActivityState)
+				assert.Zero(t, rdb.Exists(ctx, key).Val())
+			},
+		},
+	}
+
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			for _, seed := range wrongTypeActivitySeeds() {
+				t.Run(seed.name, func(t *testing.T) {
+					require.NoError(t, rdb.FlushDB(ctx).Err())
+					require.NoError(t, seed.seed(ctx, rdb, key))
+					operation.run(t)
+				})
+			}
+		})
+	}
+}
+
+func TestActivityStoreCompareAndSetActiveChecksLifecycleBeforeWrongTypeState(t *testing.T) {
+	rdb := setupActivityStoreRedis(t)
+	ctx := context.Background()
+	store := NewActivityStore(rdb)
+	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	key, err := activityKey(userID, CategoryServerVoice)
+	require.NoError(t, err)
+	state := wrongTypeActivityTestState()
+
+	for _, seed := range wrongTypeActivitySeeds() {
+		t.Run(seed.name, func(t *testing.T) {
+			require.NoError(t, rdb.FlushDB(ctx).Err())
+			seedActivityLifecycle(
+				t, rdb, userID, CategoryServerVoice,
+				state.SourceToken, state.SourceVersion+1, true,
+			)
+			require.NoError(t, seed.seed(ctx, rdb, key))
+
+			stored, storeErr := store.CompareAndSetActive(
+				ctx, userID, CategoryServerVoice, state,
+			)
+			require.NoError(t, storeErr)
+			assert.False(t, stored)
+			assert.Equal(t, seed.redisType, rdb.Type(ctx, key).Val())
+		})
+	}
+}
+
+func TestActivityStoreWrongTypeHealingIsExactKeyOnly(t *testing.T) {
+	rdb := setupActivityStoreRedis(t)
+	ctx := context.Background()
+	store := NewActivityStore(rdb)
+	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	otherUserID := uuid.MustParse("66666666-6666-6666-6666-666666666666")
+	targetKey, err := activityKey(userID, CategoryPrivateCall)
+	require.NoError(t, err)
+	otherCategoryKey, err := activityKey(userID, CategoryServerVoice)
+	require.NoError(t, err)
+	otherUserKey, err := activityKey(otherUserID, CategoryPrivateCall)
+	require.NoError(t, err)
+
+	require.NoError(t, rdb.HSet(ctx, targetKey, "poison", "value").Err())
+	wantValues := map[string]string{
+		otherCategoryKey: "neighbor-category",
+		otherUserKey:     "neighbor-user",
+		"sentinel:2405":  "unrelated",
+	}
+	for key, value := range wantValues {
+		require.NoError(t, rdb.Set(ctx, key, value, time.Minute).Err())
+	}
+
+	got, found, err := store.Get(ctx, userID, CategoryPrivateCall)
+	assert.Equal(t, ActivityState{}, got)
+	assert.False(t, found)
+	assert.ErrorIs(t, err, ErrMalformedActivityState)
+	assert.Zero(t, rdb.Exists(ctx, targetKey).Val())
+	for key, want := range wantValues {
+		assert.Equal(t, want, rdb.Get(ctx, key).Val())
+	}
+}
+
+func TestCompareAndDeleteRawActivityStateGuardsTypeAndPreservesStringSuccessor(t *testing.T) {
+	rdb := setupActivityStoreRedis(t)
+	ctx := context.Background()
+	key := "presence:rich:11111111-1111-1111-1111-111111111111:server_voice"
+
+	t.Run("string successor", func(t *testing.T) {
+		require.NoError(t, rdb.FlushDB(ctx).Err())
+		successor := `{"source_token":"22222222-2222-2222-2222-222222222222","source_version":1784088000000000,"minimized":false,"payload":{},"updated_at":1784088000}`
+		require.NoError(t, rdb.Set(ctx, key, successor, time.Minute).Err())
+
+		deleted, err := compareAndDeleteRawActivityScript.Run(
+			ctx, rdb, []string{key}, "stale-malformed-value",
+		).Int()
+		require.NoError(t, err)
+		assert.Zero(t, deleted)
+		assert.Equal(t, successor, rdb.Get(ctx, key).Val())
+	})
+
+	t.Run("wrong-type successor", func(t *testing.T) {
+		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, rdb.HSet(ctx, key, "poison", "value").Err())
+
+		_, err := compareAndDeleteRawActivityScript.Run(
+			ctx, rdb, []string{key}, "stale-malformed-value",
+		).Int()
+		require.NoError(t, err)
+		assert.Zero(t, rdb.Exists(ctx, key).Val())
+	})
+}
+
+type wrongTypeActivitySeed struct {
+	name      string
+	redisType string
+	seed      func(context.Context, *redis.Client, string) error
+}
+
+func wrongTypeActivitySeeds() []wrongTypeActivitySeed {
+	return []wrongTypeActivitySeed{
+		{
+			name: "hash", redisType: "hash",
+			seed: func(ctx context.Context, rdb *redis.Client, key string) error {
+				return rdb.HSet(ctx, key, "field", "value").Err()
+			},
+		},
+		{
+			name: "list", redisType: "list",
+			seed: func(ctx context.Context, rdb *redis.Client, key string) error {
+				return rdb.RPush(ctx, key, "value").Err()
+			},
+		},
+		{
+			name: "set", redisType: "set",
+			seed: func(ctx context.Context, rdb *redis.Client, key string) error {
+				return rdb.SAdd(ctx, key, "value").Err()
+			},
+		},
+		{
+			name: "zset", redisType: "zset",
+			seed: func(ctx context.Context, rdb *redis.Client, key string) error {
+				return rdb.ZAdd(ctx, key, redis.Z{Score: 1, Member: "value"}).Err()
+			},
+		},
+		{
+			name: "stream", redisType: "stream",
+			seed: func(ctx context.Context, rdb *redis.Client, key string) error {
+				return rdb.XAdd(ctx, &redis.XAddArgs{
+					Stream: key,
+					Values: map[string]interface{}{"field": "value"},
+				}).Err()
+			},
+		},
+	}
+}
+
+func wrongTypeActivityTestState() ActivityState {
+	return ActivityState{
+		SourceToken:   uuid.MustParse("22222222-2222-2222-2222-222222222222"),
+		SourceVersion: 1784088000000000,
+		Minimized:     true,
+		Payload:       json.RawMessage(`{"channel_id":"33333333-3333-3333-3333-333333333333","server_id":"44444444-4444-4444-4444-444444444444"}`),
+		UpdatedAt:     1784088000,
+	}
+}
+
+func assertActivityStateStored(
+	ctx context.Context,
+	t *testing.T,
+	store *ActivityStore,
+	userID uuid.UUID,
+	category Category,
+	want ActivityState,
+) {
+	t.Helper()
+	got, found, err := store.Get(ctx, userID, category)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, want, got)
+	key, err := activityKey(userID, category)
+	require.NoError(t, err)
+	ttl, err := store.redis.PTTL(ctx, key).Result()
+	require.NoError(t, err)
+	assert.Greater(t, ttl, 89*time.Second)
+	assert.LessOrEqual(t, ttl, ActivityStateTTL)
+}
+
+func TestActivityStateScriptResultValidatesTaggedReplies(t *testing.T) {
+	ctx := context.Background()
+
+	for _, test := range []struct {
+		name       string
+		value      []interface{}
+		wantStatus string
+		wantRaw    []byte
+	}{
+		{name: "missing", value: []interface{}{"none"}, wantStatus: "none"},
+		{name: "malformed", value: []interface{}{"malformed"}, wantStatus: "malformed"},
+		{
+			name: "string", value: []interface{}{"string", `{"payload":"value"}`},
+			wantStatus: "string", wantRaw: []byte(`{"payload":"value"}`),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := redis.NewCmd(ctx)
+			command.SetVal(test.value)
+
+			status, raw, err := activityStateScriptResult(command)
+			require.NoError(t, err)
+			assert.Equal(t, test.wantStatus, status)
+			assert.Equal(t, test.wantRaw, raw)
+		})
+	}
+
+	for _, test := range []struct {
+		name  string
+		value []interface{}
+	}{
+		{name: "empty", value: []interface{}{}},
+		{name: "unknown tag", value: []interface{}{"unknown"}},
+		{name: "non-string tag", value: []interface{}{int64(1)}},
+		{name: "missing string value", value: []interface{}{"string"}},
+		{name: "unexpected missing value", value: []interface{}{"none", "value"}},
+		{name: "non-string value", value: []interface{}{"string", int64(1)}},
+		{name: "too many values", value: []interface{}{"string", "value", "extra"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := redis.NewCmd(ctx)
+			command.SetVal(test.value)
+
+			status, raw, err := activityStateScriptResult(command)
+			assert.Empty(t, status)
+			assert.Nil(t, raw)
+			assert.Error(t, err)
+		})
+	}
+
+	t.Run("command error", func(t *testing.T) {
+		command := redis.NewCmd(ctx)
+		command.SetErr(context.Canceled)
+
+		status, raw, err := activityStateScriptResult(command)
+		assert.Empty(t, status)
+		assert.Nil(t, raw)
+		assert.ErrorIs(t, err, context.Canceled)
+	})
+}
+
 func TestActivityStoreIsActiveGenerationStrictlyVerifiesLifecycleEnvelope(t *testing.T) {
 	rdb := setupActivityStoreRedis(t)
 	ctx := context.Background()
