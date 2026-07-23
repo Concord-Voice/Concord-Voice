@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
@@ -1179,6 +1180,12 @@ func TestCreateGroup_TargetExistenceQueryError_FailsClosed(t *testing.T) {
 	ts := setupTS(t)
 	creator := ts.CreateTestUser(t, "grptargeterr1")
 	target := ts.CreateTestUser(t, "grptargeterr2")
+
+	// #2201: seed the creator's credential-epoch cache so AuthRequired's fence
+	// answers from Redis and does NOT read the (about to be renamed) users
+	// table — keeping this test pointed at the HANDLER's fail-closed path
+	// rather than the middleware's earlier store-unavailable 401.
+	require.NoError(t, ts.Redis.Set(context.Background(), credepoch.Key(creator.ID), "none", 5*time.Minute).Err())
 
 	_, err := ts.DB.Exec("ALTER TABLE users RENAME TO users_dberrtest")
 	require.NoError(t, err, "failed to rename users table for fault injection")

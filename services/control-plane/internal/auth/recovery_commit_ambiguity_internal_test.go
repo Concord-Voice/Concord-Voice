@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -165,6 +166,8 @@ func TestRecoveryCommitAmbiguityConsumesTokenAndAcknowledgesForcedClear(t *testi
 				hub:             observer,
 				mfaChecker:      &ambiguousRecoveryMFAChecker{claims: claims},
 				presenceHistory: service,
+				// #2201: recovery resets fail closed (503) without the fence.
+				credFence: credepoch.New(db, rdb, logger.NewWithWriter(io.Discard)),
 			}
 
 			response := httptest.NewRecorder()
@@ -188,6 +191,15 @@ func TestRecoveryCommitAmbiguityConsumesTokenAndAcknowledgesForcedClear(t *testi
 				`SELECT COUNT(*) FROM presence_settings_pending_operations WHERE user_id = $1`, senderID,
 			).Scan(&pending))
 			assert.Zero(t, pending, "read-back-confirmed acknowledgement must delete the marker")
+
+			// #2201 AC-5 (commit ambiguity): after an AMBIGUOUS commit, the
+			// credential-epoch blocked marker is RETAINED — neither Commit nor
+			// Rollback runs — so verification fails closed until the marker's
+			// TTL expires and DB read-through converges on the committed state.
+			epochVal, err := rdb.Get(context.Background(), credepoch.Key(senderID.String())).Result()
+			require.NoError(t, err, "blocked marker must survive an ambiguous commit")
+			assert.True(t, strings.HasPrefix(epochVal, "blocked:"),
+				"ambiguous commit must retain blocked state, got %q", epochVal)
 		})
 	}
 }
@@ -554,7 +566,7 @@ func TestRecoveryForcedClearTransactionInfrastructureFailures(t *testing.T) {
 		workCalled := false
 
 		_, err = handler.execRecoveryTx(
-			context.Background(), c, usedKey, errFailedResetPwd,
+			context.Background(), c, usedKey, errFailedResetPwd, nil,
 			func(context.Context, *sql.Tx) (recoveryPresenceResult, error) {
 				workCalled = true
 				return recoveryPresenceResult{}, nil
@@ -589,7 +601,7 @@ func TestRecoveryForcedClearTransactionInfrastructureFailures(t *testing.T) {
 		c, response := newContext()
 
 		_, err = handler.execRecoveryTx(
-			context.Background(), c, usedKey, errFailedResetPwd,
+			context.Background(), c, usedKey, errFailedResetPwd, nil,
 			func(context.Context, *sql.Tx) (recoveryPresenceResult, error) {
 				return recoveryPresenceResult{}, errors.New("work must not run")
 			},
@@ -625,7 +637,7 @@ func TestRecoveryForcedClearTransactionInfrastructureFailures(t *testing.T) {
 		c, response := newContext()
 
 		_, err = handler.execRecoveryTx(
-			context.Background(), c, usedKey, errFailedResetPwd,
+			context.Background(), c, usedKey, errFailedResetPwd, nil,
 			func(context.Context, *sql.Tx) (recoveryPresenceResult, error) {
 				return recoveryPresenceResult{}, workErr
 			},
@@ -677,7 +689,7 @@ func TestRecoveryForcedClearStatementFailureReleasesTokenAndRollsBack(t *testing
 	c, _ := gin.CreateTestContext(response)
 	c.Request = httptest.NewRequest(http.MethodPost, "/recovery", nil)
 
-	err := handler.executeRecoveryTransaction(c, senderID, usedKey, errFailedResetPwd, []recoveryTxOp{{
+	err := handler.executeRecoveryTransaction(c, senderID, usedKey, errFailedResetPwd, nil, []recoveryTxOp{{
 		query: `UPDATE recovery_table_that_does_not_exist SET value = $1`,
 		args:  []interface{}{1},
 		desc:  "forced statement failure",
@@ -724,6 +736,8 @@ func newRecoveryForcedHandler(
 	return &Handler{
 		db: db, redis: rdb, log: logger.NewWithWriter(io.Discard), hub: hub,
 		mfaChecker: &ambiguousRecoveryMFAChecker{claims: claims}, presenceHistory: service,
+		// #2201: recovery resets fail closed (503) without the fence.
+		credFence: credepoch.New(db, rdb, logger.NewWithWriter(io.Discard)),
 	}
 }
 

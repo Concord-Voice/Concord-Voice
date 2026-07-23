@@ -12,6 +12,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 )
 
 const (
@@ -27,7 +29,13 @@ const (
 // AuthRequired returns a middleware that validates JWT tokens and checks the
 // token blacklist in Redis. Tokens that have been revoked (e.g. on logout)
 // are rejected even if they are otherwise valid.
-func AuthRequired(jwtSecret string, redisClient *redis.Client) gin.HandlerFunc {
+//
+// fence enforces the per-user credential epoch (#2201): after a destructive
+// password/key recovery rotates users.credential_epoch, tokens minted under
+// the prior epoch (or lacking a cred_epoch claim post-rotation) are rejected.
+// A nil fence disables the check (tests that construct the middleware
+// directly); production always passes one.
+func AuthRequired(jwtSecret string, redisClient *redis.Client, fence *credepoch.Fence) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenString, ok := extractBearerToken(c.GetHeader("Authorization"))
 		if !ok {
@@ -62,11 +70,60 @@ func AuthRequired(jwtSecret string, redisClient *redis.Client) gin.HandlerFunc {
 			return
 		}
 
+		// Credential-epoch fence (#2201): fail closed while a destructive
+		// credential operation is blocked-in-flight, on a superseded epoch, or
+		// when neither Redis nor the DB can answer.
+		if credentialEpochRejected(c, fence, claims, userID) {
+			abortUnauthorized(c)
+			return
+		}
+
 		c.Set("user_id", userID)
 		c.Set(JWTClaimsContextKey, claims)
 		c.Set("email_verified", emailVerifiedFromClaims(claims))
 		c.Next()
 	}
+}
+
+// credentialEpochRejected runs the fence check for AuthRequired. A nil fence
+// disables the check (tests that construct the middleware directly).
+func credentialEpochRejected(c *gin.Context, fence *credepoch.Fence, claims jwt.MapClaims, userID string) bool {
+	if fence == nil {
+		return false
+	}
+	tokenEpoch, _ := claims["cred_epoch"].(string)
+	return fence.Check(c.Request.Context(), userID, tokenEpoch) != nil
+}
+
+// TokenCredentialEpoch returns the cred_epoch claim AuthRequired stored on the
+// context ("" when absent). Handlers pass it to credepoch.GuardTx so sensitive
+// encrypted-state transactions can recheck the epoch they were admitted under
+// (#2201).
+func TokenCredentialEpoch(c *gin.Context) string {
+	if claims, ok := c.Get(JWTClaimsContextKey); ok {
+		if m, ok := claims.(jwt.MapClaims); ok {
+			if e, ok := m["cred_epoch"].(string); ok {
+				return e
+			}
+		}
+	}
+	return ""
+}
+
+// TokenSessionID returns the authenticated access token's `sid` claim (the
+// refresh-session id, #2201), or "" for a legacy token minted without one. It
+// is the server-verified session identity — unlike a client-supplied
+// X-Session-ID header — so a socket registered under it can be evicted by
+// DisconnectSession on session revocation.
+func TokenSessionID(c *gin.Context) string {
+	if claims, ok := c.Get(JWTClaimsContextKey); ok {
+		if m, ok := claims.(jwt.MapClaims); ok {
+			if s, ok := m["sid"].(string); ok {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 func abortUnauthorized(c *gin.Context) {

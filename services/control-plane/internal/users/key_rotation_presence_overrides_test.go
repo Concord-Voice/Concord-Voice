@@ -469,7 +469,7 @@ func TestChangePasswordMFAReauthenticationUsesLockedTransactionConnection(t *tes
 		nil,
 		"test",
 	)
-	handler := users.NewHandler(db, requestLogger, nil, mfaHandler, nil)
+	handler := users.NewHandler(db, requestLogger, nil, mfaHandler, nil, testCredFence(t, db), nil)
 
 	// A password/key rotation already owns one transaction connection while it
 	// re-checks MFA under the locked users row. Constraining the pool to one
@@ -551,7 +551,7 @@ func TestReplaceMyKeysRequiresAcknowledgedForcedSecurityClear(t *testing.T) {
 		},
 	}, true)
 	require.NoError(t, service.BindDelivery(delivery))
-	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, testCredFence(t, ts.DB), nil)
 	handler.SetPresenceHistory(service)
 
 	publicKey, wrappedKey, salt := testhelpers.E2EETestKeys()
@@ -614,7 +614,7 @@ func TestReplaceMyKeysRecorderFailureRollsBackKeyStatusOverrideAndMarker(t *test
 		},
 	})
 	t.Cleanup(restore)
-	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, testCredFence(t, ts.DB), nil)
 	handler.SetPresenceHistory(service)
 
 	response := invokeReplaceMyKeysWithHandler(t, handler, user)
@@ -651,7 +651,7 @@ func TestReplaceMyKeysDeliveryFailureReturns503AndRetainsSecurityMarker(t *testi
 	delivery := &forcedClearRecordingDelivery{err: errors.New("forced delivery failure")}
 	service := presencehistory.NewService(ts.DB, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(delivery))
-	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, testCredFence(t, ts.DB), nil)
 	handler.SetPresenceHistory(service)
 
 	response := invokeReplaceMyKeysWithHandler(t, handler, user)
@@ -692,7 +692,7 @@ func invokeReplaceMyKeysWithHandler(
 func TestReplaceMyKeysPresenceGateFailureClassification(t *testing.T) {
 	t.Run("unbound delivery is retryable", func(t *testing.T) {
 		db, _ := testhelpers.SetupTestDB(t)
-		handler := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+		handler := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, testCredFence(t, db), nil)
 		handler.SetPresenceHistory(presencehistory.NewService(db, presencehistory.DisclosureState{}, false))
 
 		response := invokeReplaceMyKeysForPresenceGate(handler, uuid.New())
@@ -702,7 +702,7 @@ func TestReplaceMyKeysPresenceGateFailureClassification(t *testing.T) {
 	t.Run("database readiness failure is internal", func(t *testing.T) {
 		db, cleanup := testhelpers.SetupTestDB(t)
 		cleanup()
-		handler := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+		handler := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, testCredFence(t, db), nil)
 		service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 		require.NoError(t, service.BindDelivery(immediatePresenceDelivery{}))
 		handler.SetPresenceHistory(service)
@@ -725,7 +725,7 @@ func TestReplaceMyKeysPresenceGateFailureClassification(t *testing.T) {
 		)
 		require.NoError(t, err)
 		require.NoError(t, service.CommitTx(ordinaryTx))
-		handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil)
+		handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, testCredFence(t, ts.DB), nil)
 		handler.SetPresenceHistory(service)
 
 		response := invokeReplaceMyKeysWithHandler(t, handler, user)

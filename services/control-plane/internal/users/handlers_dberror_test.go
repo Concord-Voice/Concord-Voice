@@ -26,7 +26,7 @@ func TestUpdatePrivacySettingsDBError(t *testing.T) {
 	cleanup() // close the pool immediately so tx.Begin() fails
 
 	// nil tier resolver is safe: UpdatePrivacySettings never resolves entitlements (#1298).
-	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
@@ -46,7 +46,7 @@ func TestUpdatePrivacySettingsDBError(t *testing.T) {
 func TestGetPresenceOverridesDBError(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	cleanup()
-	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	if err := service.BindDelivery(immediatePresenceDelivery{}); err != nil {
 		t.Fatal(err)
@@ -68,7 +68,7 @@ func TestGetPresenceOverridesDBError(t *testing.T) {
 func TestReplacePresenceOverridesDBError(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	cleanup()
-	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	if err := service.BindDelivery(immediatePresenceDelivery{}); err != nil {
 		t.Fatal(err)
@@ -95,7 +95,7 @@ func TestReplacePresenceOverridesDBError(t *testing.T) {
 func TestUpdatePresenceSettingsDBError(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	cleanup()
-	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	if err := service.BindDelivery(immediatePresenceDelivery{}); err != nil {
 		t.Fatal(err)

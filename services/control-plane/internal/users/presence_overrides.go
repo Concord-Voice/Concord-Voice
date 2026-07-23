@@ -12,6 +12,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -209,7 +211,7 @@ func (h *Handler) ReplacePresenceOverrides(c *gin.Context) {
 	err = h.presenceHistory.WithReadySender(c.Request.Context(), senderID, func() error {
 		var writeErr error
 		result, writeErr = h.replacePresenceOverride(
-			c.Request.Context(), senderID, c.Param("category"), normalized,
+			c.Request.Context(), senderID, middleware.TokenCredentialEpoch(c), c.Param("category"), normalized,
 			presence.ComputeCustomTextAudience, prepareCurrentCustomTextPayload,
 		)
 		return writeErr
@@ -232,6 +234,7 @@ func (h *Handler) ReplacePresenceOverrides(c *gin.Context) {
 func (h *Handler) replacePresenceOverride(
 	ctx context.Context,
 	senderID uuid.UUID,
+	tokenEpoch string,
 	category string,
 	req normalizedPresenceOverrideRequest,
 	computeAudience presenceOverrideAudienceFunc,
@@ -247,11 +250,28 @@ func (h *Handler) replacePresenceOverride(
 	defer tx.Rollback() //nolint:errcheck
 	defer h.joinPresenceWriterRollback(tx, &err)
 
+	// #2201: override ciphertext is encrypted under the password-derived
+	// preferences key, so recheck the requester's credential epoch. Do it AFTER
+	// BeginAudienceOperation takes the users-row FOR NO KEY UPDATE lock (via
+	// lockUser): a plain read on that already-locked row, NOT a separate GuardTx
+	// FOR SHARE beforehand — two concurrent requests would each hold FOR SHARE
+	// and then deadlock (40P01) trying to upgrade to FOR NO KEY UPDATE
+	// (Codex #2397 re-review). Lock order is unchanged: BeginAudienceOperation
+	// locks the users row first (000087).
 	operation, err := h.presenceHistory.BeginAudienceOperation(
 		ctx, tx, senderID, presencehistory.OrdinaryAudienceWrite,
 	)
 	if err != nil {
 		return result, err
+	}
+	var epoch sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT credential_epoch FROM users WHERE id = $1`, senderID.String(),
+	).Scan(&epoch); err != nil {
+		return result, &presenceWriterFailure{status: 500, class: "credential_epoch_read", cause: err}
+	}
+	if credepoch.MatchEpoch(epoch, tokenEpoch) != nil {
+		return result, &presenceWriterFailure{status: 401, class: "credential_epoch", cause: credepoch.ErrEpochMismatch}
 	}
 	currentVersion, err := readPresenceOverrideVersion(ctx, tx, senderID, category, true)
 	if err != nil {

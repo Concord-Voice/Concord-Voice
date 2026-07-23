@@ -13,13 +13,13 @@ const testJWTSecret = "test_secret_key"
 
 func TestGenerateAccessToken(t *testing.T) {
 	t.Run("returns non-empty token", func(t *testing.T) {
-		token, err := GenerateAccessToken("user-123", testJWTSecret, true)
+		token, err := GenerateAccessToken("user-123", testJWTSecret, true, "", "")
 		require.NoError(t, err)
 		assert.NotEmpty(t, token)
 	})
 
 	t.Run("token contains correct user_id claim", func(t *testing.T) {
-		tokenStr, err := GenerateAccessToken("user-456", testJWTSecret, true)
+		tokenStr, err := GenerateAccessToken("user-456", testJWTSecret, true, "", "")
 		require.NoError(t, err)
 
 		claims, err := ValidateAccessToken(tokenStr, testJWTSecret)
@@ -28,8 +28,8 @@ func TestGenerateAccessToken(t *testing.T) {
 	})
 
 	t.Run("token has unique JTI", func(t *testing.T) {
-		token1, _ := GenerateAccessToken("user-1", testJWTSecret, true)
-		token2, _ := GenerateAccessToken("user-1", testJWTSecret, true)
+		token1, _ := GenerateAccessToken("user-1", testJWTSecret, true, "", "")
+		token2, _ := GenerateAccessToken("user-1", testJWTSecret, true, "", "")
 
 		claims1, _ := ValidateAccessToken(token1, testJWTSecret)
 		claims2, _ := ValidateAccessToken(token2, testJWTSecret)
@@ -38,7 +38,7 @@ func TestGenerateAccessToken(t *testing.T) {
 	})
 
 	t.Run("token expires in 15 minutes", func(t *testing.T) {
-		tokenStr, err := GenerateAccessToken("user-1", testJWTSecret, true)
+		tokenStr, err := GenerateAccessToken("user-1", testJWTSecret, true, "", "")
 		require.NoError(t, err)
 
 		claims, err := ValidateAccessToken(tokenStr, testJWTSecret)
@@ -49,7 +49,7 @@ func TestGenerateAccessToken(t *testing.T) {
 	})
 
 	t.Run("token has issuer set", func(t *testing.T) {
-		tokenStr, _ := GenerateAccessToken("user-1", testJWTSecret, true)
+		tokenStr, _ := GenerateAccessToken("user-1", testJWTSecret, true, "", "")
 		claims, _ := ValidateAccessToken(tokenStr, testJWTSecret)
 		assert.Equal(t, "concordvoice-control-plane", claims.Issuer)
 	})
@@ -57,14 +57,14 @@ func TestGenerateAccessToken(t *testing.T) {
 
 func TestValidateAccessToken(t *testing.T) {
 	t.Run("valid token returns claims", func(t *testing.T) {
-		tokenStr, _ := GenerateAccessToken("user-123", testJWTSecret, true)
+		tokenStr, _ := GenerateAccessToken("user-123", testJWTSecret, true, "", "")
 		claims, err := ValidateAccessToken(tokenStr, testJWTSecret)
 		require.NoError(t, err)
 		assert.Equal(t, "user-123", claims.UserID)
 	})
 
 	t.Run("wrong secret returns error", func(t *testing.T) {
-		tokenStr, _ := GenerateAccessToken("user-123", testJWTSecret, true)
+		tokenStr, _ := GenerateAccessToken("user-123", testJWTSecret, true, "", "")
 		_, err := ValidateAccessToken(tokenStr, "wrong_secret")
 		assert.ErrorIs(t, err, ErrInvalidToken)
 	})
@@ -98,7 +98,7 @@ func TestValidateAccessToken(t *testing.T) {
 }
 
 func TestGenerateAccessToken_EmbedsTierClaim(t *testing.T) {
-	tokenStr, err := GenerateAccessToken("user-1", testJWTSecret, true, "premium")
+	tokenStr, err := GenerateAccessToken("user-1", testJWTSecret, true, "", "", "premium")
 	require.NoError(t, err)
 
 	claims, err := ValidateAccessToken(tokenStr, testJWTSecret)
@@ -109,7 +109,7 @@ func TestGenerateAccessToken_EmbedsTierClaim(t *testing.T) {
 
 func TestGenerateAccessToken_OmittedTierIsEmpty(t *testing.T) {
 	// Variadic tier omitted → claim absent (omitempty) → parses back to "".
-	tokenStr, err := GenerateAccessToken("user-1", testJWTSecret, true)
+	tokenStr, err := GenerateAccessToken("user-1", testJWTSecret, true, "", "")
 	require.NoError(t, err)
 
 	claims, err := ValidateAccessToken(tokenStr, testJWTSecret)
@@ -119,7 +119,7 @@ func TestGenerateAccessToken_OmittedTierIsEmpty(t *testing.T) {
 
 func TestGenerateAccessToken_EmptyTierOmittedFromClaim(t *testing.T) {
 	// Explicit empty tier also yields an absent claim (omitempty), read as free.
-	tokenStr, err := GenerateAccessToken("user-1", testJWTSecret, true, "")
+	tokenStr, err := GenerateAccessToken("user-1", testJWTSecret, true, "", "", "")
 	require.NoError(t, err)
 
 	claims, err := ValidateAccessToken(tokenStr, testJWTSecret)
@@ -157,5 +157,33 @@ func TestHashRefreshToken(t *testing.T) {
 	t.Run("returns hex-encoded string", func(t *testing.T) {
 		hash := HashRefreshToken("test")
 		assert.Len(t, hash, 64, "SHA-256 hex digest should be 64 chars")
+	})
+}
+
+// #2201: access tokens carry the credential epoch + originating session id.
+func TestGenerateAccessToken_CredentialEpochAndSessionClaims(t *testing.T) {
+	t.Run("epoch and sid round-trip", func(t *testing.T) {
+		const testEpoch = "a1b2c3d4e5f60718a1b2c3d4e5f60718" // pragma: allowlist secret
+		tok, err := GenerateAccessToken("user-1", testJWTSecret, true, testEpoch, "sess-42", "premium")
+		require.NoError(t, err)
+		claims, err := ValidateAccessToken(tok, testJWTSecret)
+		require.NoError(t, err)
+		assert.Equal(t, testEpoch, claims.CredentialEpoch)
+		assert.Equal(t, "sess-42", claims.SessionID)
+	})
+
+	t.Run("empty epoch and sid are absent from the wire (legacy shape)", func(t *testing.T) {
+		tok, err := GenerateAccessToken("user-1", testJWTSecret, true, "", "")
+		require.NoError(t, err)
+		parsed, err := jwt.Parse(tok, func(_ *jwt.Token) (interface{}, error) {
+			return []byte(testJWTSecret), nil
+		})
+		require.NoError(t, err)
+		mc, ok := parsed.Claims.(jwt.MapClaims)
+		require.True(t, ok)
+		_, hasEpoch := mc["cred_epoch"]
+		_, hasSid := mc["sid"]
+		assert.False(t, hasEpoch, "omitempty must drop empty cred_epoch")
+		assert.False(t, hasSid, "omitempty must drop empty sid")
 	})
 }

@@ -73,7 +73,7 @@ func TestEraseAccount_Integration_DeniesOtherLiveAccessTokens(t *testing.T) {
 	// access token for the erased user, not only the token that called erasure.
 	ts := testhelpers.SetupTestServer(t)
 	user := ts.CreateTestUser(t, "eraseallsessions")
-	otherAccessToken, err := auth.GenerateAccessToken(user.ID, testhelpers.TestJWTSecret, true)
+	otherAccessToken, err := auth.GenerateAccessToken(user.ID, testhelpers.TestJWTSecret, true, "", "")
 	require.NoError(t, err)
 
 	w := ts.DoRequest(

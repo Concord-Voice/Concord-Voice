@@ -96,7 +96,7 @@ func TestUpdatePresenceSettingsCompletesPostCommitClaimAfterRequestCancellation(
 			delivery := &task9Delivery{}
 			service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 			require.NoError(t, service.BindDelivery(delivery))
-			h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+			h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 			h.SetPresenceHistory(service)
 			bindNoopActivitySettingsSuppressor(h)
 
@@ -140,7 +140,7 @@ func TestUpdatePresenceSettingsClaimBeginFailureRunsConservativeResetAndRetainsQ
 	delivery := &task9Delivery{}
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(delivery))
-	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 	h.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(h)
 	claimBeginCause := errors.New("claim transaction unavailable")
@@ -202,7 +202,7 @@ func newTask9Handler(
 	delivery *task9Delivery,
 ) *users.Handler {
 	t.Helper()
-	h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 	service := presencehistory.NewService(ts.DB, presencehistory.DisclosureState{
 		Available: true,
 		RequiredConsent: &presencehistory.RequiredConsent{
@@ -236,7 +236,7 @@ func TestUpdatePresenceSettingsRequiresBoundPresenceHistory(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			db, _ := testhelpers.SetupTestDB(t)
 			senderID := testhelpers.CreateUser(t, db)
-			h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+			h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 			bindNoopActivitySettingsSuppressor(h)
 			if test.bind != nil {
 				test.bind(h, db)
@@ -359,7 +359,7 @@ func TestReplacePresenceOverridesUsesExactDeltaAndOverrideMetadata(t *testing.T)
 func TestPresenceWriterValidationPrecedesPresenceService(t *testing.T) {
 	db, _ := testhelpers.SetupTestDB(t)
 	senderID := testhelpers.CreateUser(t, db)
-	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 
 	settings := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
 		"custom_text_tier": 9,
@@ -548,7 +548,7 @@ func TestUpdatePresenceSettings_MasterOffSupersedesUnexpiredOrdinaryPendingConse
 	)
 	require.NoError(t, err)
 	require.NoError(t, service.CommitTx(ordinaryTx))
-	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 	h.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(h)
 
@@ -601,7 +601,7 @@ func TestUpdatePresenceSettings_MasterOffSupersedesEligiblePendingWhenDeliveryFa
 	delivery := &task9Delivery{err: errors.New("delivery unavailable")}
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(delivery))
-	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 	h.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(h)
 
@@ -659,7 +659,7 @@ func TestUpdatePresenceSettings_MasterOffDeliveryFailureReturns503AndRetainsQuar
 	delivery := &task9Delivery{err: errors.New("master-off delivery failed")}
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(delivery))
-	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 	h.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(h)
 
@@ -750,7 +750,7 @@ func TestUpdatePresenceSettingsRecorderFailureRollsBackSettingsMarkerAndHistory(
 		},
 	})
 	t.Cleanup(restore)
-	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 	h.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(h)
 
@@ -795,7 +795,7 @@ func TestUpdatePresenceSettingsMainCommitClassification(t *testing.T) {
 			},
 		})
 		t.Cleanup(restore)
-		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 		h.SetPresenceHistory(service)
 		h.SetActivitySettingsSuppressor(suppressor)
 		response := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
@@ -820,7 +820,7 @@ func TestUpdatePresenceSettingsMainCommitClassification(t *testing.T) {
 			Commit: func(*sql.Tx) error { return errors.New("commit rejected") },
 		})
 		t.Cleanup(restore)
-		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 		h.SetPresenceHistory(service)
 		h.SetActivitySettingsSuppressor(suppressor)
 		response := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
@@ -854,7 +854,7 @@ func TestUpdatePresenceSettingsMainCommitClassification(t *testing.T) {
 			},
 		})
 		t.Cleanup(restore)
-		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 		h.SetPresenceHistory(service)
 		h.SetActivitySettingsSuppressor(suppressor)
 		response := invokePresenceSettingsPATCH(h, senderID, map[string]interface{}{
@@ -893,7 +893,7 @@ func TestUpdatePresenceSettingsUnexpiredPendingReturnsRetryAfterWithoutMutation(
 	delivery := &task9Delivery{}
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(delivery))
-	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 	h.SetPresenceHistory(service)
 	bindNoopActivitySettingsSuppressor(h)
 
@@ -958,7 +958,7 @@ func TestUpdatePresenceSettingsUnresolvedCommitRunsMarkerPreservingEmergencyRese
 		},
 	})
 	t.Cleanup(restore)
-	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 	h.SetPresenceHistory(service)
 	h.SetActivitySettingsSuppressor(suppressor)
 
@@ -978,7 +978,7 @@ func TestPresenceSettingsDirectErrorBoundaries(t *testing.T) {
 	t.Run("database failure", func(t *testing.T) {
 		db, cleanup := testhelpers.SetupTestDB(t)
 		cleanup()
-		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Set("user_id", uuid.NewString())
@@ -987,7 +987,7 @@ func TestPresenceSettingsDirectErrorBoundaries(t *testing.T) {
 	})
 	t.Run("malformed authenticated id", func(t *testing.T) {
 		db, _ := testhelpers.SetupTestDB(t)
-		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+		h := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Set("user_id", "not-a-uuid")

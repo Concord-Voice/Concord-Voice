@@ -36,9 +36,10 @@ import (
 // but we re-read in case the user later flips a flag via a recovery flow.
 func (h *Handler) IssueAccessAndRefresh(ctx context.Context, userID string) (accessToken, refreshToken, sessionID string, err error) {
 	var emailVerified, disabled bool
+	var credEpoch sql.NullString
 	if err := h.db.QueryRowContext(ctx,
-		`SELECT email_verified, disabled FROM users WHERE id = $1`, userID,
-	).Scan(&emailVerified, &disabled); err != nil {
+		`SELECT email_verified, disabled, credential_epoch FROM users WHERE id = $1`, userID,
+	).Scan(&emailVerified, &disabled, &credEpoch); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", "", "", fmt.Errorf("user %s not found", userID)
 		}
@@ -52,8 +53,10 @@ func (h *Handler) IssueAccessAndRefresh(ctx context.Context, userID string) (acc
 		return "", "", "", ErrAccountDisabled
 	}
 
+	// tokenID first so the access token carries it as the sid claim (#2201).
+	tokenID := uuid.New().String()
 	tier := h.entCache.GetTier(ctx, userID)
-	accessToken, err = GenerateAccessToken(userID, h.jwtSecret, emailVerified, tier)
+	accessToken, err = GenerateAccessToken(userID, h.jwtSecret, emailVerified, credEpoch.String, tokenID, tier)
 	if err != nil {
 		return "", "", "", fmt.Errorf("access: %w", err)
 	}
@@ -63,7 +66,6 @@ func (h *Handler) IssueAccessAndRefresh(ctx context.Context, userID string) (acc
 	}
 
 	tokenHash := HashRefreshToken(refreshToken)
-	tokenID := uuid.New().String()
 	expiresAt := time.Now().Add(30 * 24 * time.Hour)
 
 	// device_name / ip_address / user_agent / machine_id deliberately omitted —

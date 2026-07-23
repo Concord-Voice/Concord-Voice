@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
@@ -41,6 +43,13 @@ type MFAVerifier interface {
 
 type sessionDisconnector interface {
 	DisconnectUser(uuid.UUID)
+}
+
+// TokenPairIssuer mints the post-rotation continuation token pair (#2201).
+// Implemented by *auth.Handler.IssueTokenPair; called only AFTER the rotating
+// transaction commits so the pair carries the new credential epoch.
+type TokenPairIssuer interface {
+	IssueTokenPair(c *gin.Context, userID, expectedEpoch string) (accessToken, refreshToken, sessionID string, err error)
 }
 
 // ActivitySettingsSuppressor applies Rich Presence suppression after a
@@ -72,16 +81,20 @@ type Handler struct {
 	mfaVerifier                        MFAVerifier
 	tiers                              entitlements.TierResolver // resolves the acting user's subscription tier (#1298)
 	store                              media.ObjectDeleter       // nil when object storage is not configured
+	credFence                          *credepoch.Fence          // per-user credential-epoch fence (#2201)
+	tokenPairs                         TokenPairIssuer           // continuation pair for ChangePassword/ReplaceMyKeys (#2201)
 }
 
 // NewHandler creates a new user handler.
-func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, mfaVerifier MFAVerifier, tiers entitlements.TierResolver) *Handler {
+func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, mfaVerifier MFAVerifier, tiers entitlements.TierResolver, credFence *credepoch.Fence, tokenPairs TokenPairIssuer) *Handler {
 	h := &Handler{
 		db:          db,
 		log:         log,
 		hub:         hub,
 		mfaVerifier: mfaVerifier,
 		tiers:       tiers,
+		credFence:   credFence,
+		tokenPairs:  tokenPairs,
 	}
 	if hub != nil {
 		h.sessionDisconnector = hub
@@ -314,9 +327,18 @@ func (h *Handler) replaceMyKeysCoordinated(
 	req ReplaceKeysRequest,
 	wrappedKeyBytes, saltBytes, publicKeyBytes []byte,
 ) {
+	// Credential-epoch fence (#2201): publish the blocked marker before the
+	// rotating transaction. Fail closed if the fence is unwired — a destructive
+	// key replacement must never run without epoch rotation.
+	fenceOp, fenceOK := h.beginCredentialFence(c, senderID.String(), errMsgFailedReplaceKeys)
+	if !fenceOK {
+		return
+	}
+
 	tx, err := h.presenceHistory.BeginTx(c.Request.Context(), nil)
 	if err != nil || tx == nil {
 		h.log.Error("Failed to begin key replacement tx", "error_class", "begin")
+		fenceOp.Rollback(c.Request.Context())
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
 		return
 	}
@@ -326,30 +348,59 @@ func (h *Handler) replaceMyKeysCoordinated(
 	if err := h.verifyStepUpWithLockedUser(
 		c.Request.Context(), tx, senderID, req.CurrentPassword, req.MFACode,
 	); err != nil {
+		fenceOp.Rollback(c.Request.Context())
 		h.respondKeyReplacementReauthenticationFailure(c, err)
 		return
 	}
+
+	// Rotate the credential epoch under the user-row lock taken above (#2201).
+	if err := fenceOp.RotateTx(c.Request.Context(), tx); err != nil {
+		fenceOp.Rollback(c.Request.Context())
+		h.log.Error("Failed to rotate credential epoch", "error_class", "epoch_rotate")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
+		return
+	}
+
 	forcedClear, err := h.presenceHistory.BeginForcedSecurityClear(
 		c.Request.Context(), tx, senderID,
 	)
 	if err != nil {
+		fenceOp.Rollback(c.Request.Context())
 		h.log.Error("Failed to prepare forced Custom Status clear", "error_class", "prepare")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
 		return
 	}
 
 	if err := replaceKeyMaterialTx(tx, userID, wrappedKeyBytes, saltBytes, req.KeyDerivationAlg, publicKeyBytes); err != nil {
+		fenceOp.Rollback(c.Request.Context())
 		h.log.Error("Failed to replace E2EE key material", "error_class", "key_material")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
 		return
 	}
 
-	if !h.completeKeyReplacementClear(c, tx, forcedClear) {
+	// #2201: an E2EE identity reset revokes every refresh session. Pre-#2201
+	// this flow revoked nothing — existing sessions kept refreshing across a
+	// destructive key replacement. The caller's continuation is the fresh pair
+	// minted below after commit.
+	if _, err := tx.ExecContext(c.Request.Context(),
+		`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`,
+		senderID,
+	); err != nil {
+		fenceOp.Rollback(c.Request.Context())
+		h.log.Error("Failed to revoke refresh tokens on key replacement", "error_class", "revoke")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReplaceKeys})
 		return
 	}
 
+	if !h.completeKeyReplacementClear(c, tx, forcedClear, fenceOp) {
+		return
+	}
+
+	response := gin.H{"message": "Keys replaced successfully. Encrypted message history was reset."}
+	h.appendContinuationPair(c, response, senderID.String(), fenceOp.NewEpochValue())
+
 	h.log.Info("E2EE keys replaced (atomic reset)", "operation", "forced_security_clear")
-	c.JSON(http.StatusOK, gin.H{"message": "Keys replaced successfully. Encrypted message history was reset."})
+	c.JSON(http.StatusOK, response)
 }
 
 func (h *Handler) rollbackKeyReplacement(tx *sql.Tx) {
@@ -372,6 +423,7 @@ func (h *Handler) completeKeyReplacementClear(
 	c *gin.Context,
 	tx *sql.Tx,
 	forcedClear presencehistory.ForcedClearResult,
+	fenceOp *credepoch.Op,
 ) bool {
 	completion := h.presenceHistory.CompleteForcedSecurityClear(
 		c.Request.Context(), tx, forcedClear,
@@ -380,8 +432,16 @@ func (h *Handler) completeKeyReplacementClear(
 		h.sessionDisconnector.DisconnectUser(forcedClear.Operation.SenderID)
 	}
 	if completion.Err == nil {
+		if fenceOp != nil {
+			fenceOp.Commit(c.Request.Context()) // definite commit
+		}
 		return true
 	}
+	if fenceOp != nil && completion.Outcome == presencehistory.ForcedClearRolledBack {
+		fenceOp.Rollback(c.Request.Context()) // explicit rollback outcome — definite
+	}
+	// Any other completion error is an ambiguous commit: retain the blocked
+	// marker; its TTL plus DB read-through reconciles (#2201, spec §4.4 3c).
 	status := http.StatusInternalServerError
 	if completion.Outcome == presencehistory.ForcedClearQuarantined {
 		status = http.StatusServiceUnavailable
@@ -1249,18 +1309,25 @@ type passwordChangeExecution struct {
 	domains         *changePasswordSyncDomains
 }
 
+// errCommitAmbiguous marks a password-change failure where tx.Commit itself
+// errored: the transaction may or may not have committed. The fence op must
+// then call neither Commit nor Rollback — the blocked marker's TTL plus DB
+// read-through reconciles (#2201, spec §4.4 step 3c).
+var errCommitAmbiguous = errors.New("password change commit ambiguous")
+
 type passwordChangeOutcome struct {
 	presenceOverrideVersion int
 	domainVersions          map[string]int // nil when domains == nil (legacy request)
 }
 
-// executePasswordChange atomically rotates password/key material, every
-// submitted sync-domain ciphertext, and any existing presence-override
-// ciphertext before revoking refresh tokens. Lock order is users first, then
-// the domain tables by migration age (user_preferences 000016 → saved_gifs
-// 000055 → friend_organization 000075 → presence_override_preferences 000084);
-// any future multi-domain writer must follow the same order (spec #2200 §5).
-func (h *Handler) executePasswordChange(ctx context.Context, change passwordChangeExecution) (passwordChangeOutcome, error) {
+// executePasswordChange atomically rotates password/key material, the
+// credential epoch (#2201), every submitted sync-domain ciphertext (#2200), and
+// any existing presence-override ciphertext before revoking refresh tokens.
+// Lock order is users first (step-up lock + epoch rotation), then the domain
+// tables by migration age (user_preferences 000016 → saved_gifs 000055 →
+// friend_organization 000075 → presence_override_preferences 000084); any
+// future multi-domain writer must follow the same order (spec #2200 §5).
+func (h *Handler) executePasswordChange(ctx context.Context, change passwordChangeExecution, fenceOp *credepoch.Op) (passwordChangeOutcome, error) {
 	var outcome passwordChangeOutcome
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1276,6 +1343,13 @@ func (h *Handler) executePasswordChange(ctx context.Context, change passwordChan
 		ctx, tx, change.userID, change.currentPassword, change.mfaCode,
 	); err != nil {
 		return outcome, err
+	}
+
+	// Rotate the credential epoch under the user-row lock taken above (#2201) —
+	// a users-table write, so it stays in the users-first phase before the
+	// domain tables.
+	if err := fenceOp.RotateTx(ctx, tx); err != nil {
+		return passwordChangeOutcome{}, err
 	}
 
 	domainVersions, err := rotateAllPasswordSyncDomains(ctx, tx, change.userID, change.domains)
@@ -1313,7 +1387,7 @@ func (h *Handler) executePasswordChange(ctx context.Context, change passwordChan
 		return passwordChangeOutcome{}, fmt.Errorf("revoke refresh tokens: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return passwordChangeOutcome{}, err
+		return passwordChangeOutcome{}, errors.Join(errCommitAmbiguous, err)
 	}
 	return outcome, nil
 }
@@ -1403,6 +1477,13 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 		kdAlg = "argon2id"
 	}
 
+	// Credential-epoch fence (#2201): publish the blocked marker before the
+	// rotating transaction. Fail closed if the fence is unwired.
+	fenceOp, fenceOK := h.beginCredentialFence(c, uid, errMsgFailedChangePassword)
+	if !fenceOK {
+		return
+	}
+
 	outcome, err := h.executePasswordChange(c.Request.Context(), passwordChangeExecution{
 		userID:          parsedUID,
 		currentPassword: req.CurrentPassword,
@@ -1413,7 +1494,8 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 		kdAlg:           kdAlg,
 		rotation:        req.PresenceOverride,
 		domains:         req.SyncDomains,
-	})
+	}, fenceOp)
+	settleCredentialFence(c.Request.Context(), fenceOp, err)
 	if err != nil {
 		h.respondChangePasswordError(c, err)
 		return
@@ -1430,7 +1512,6 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 		h.sessionDisconnector.DisconnectUser(parsedUID)
 	}
 
-	h.log.Info("Password changed with key re-wrap", "user_id", userID)
 	resp := gin.H{
 		"message":                   "Password changed successfully",
 		"presence_override_version": outcome.presenceOverrideVersion,
@@ -1438,7 +1519,65 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 	if req.SyncDomains != nil {
 		resp["sync_domain_versions"] = outcome.domainVersions
 	}
+	h.appendContinuationPair(c, resp, uid, fenceOp.NewEpochValue())
+
+	h.log.Info("Password changed with key re-wrap", "user_id", userID)
 	c.JSON(http.StatusOK, resp)
+}
+
+// beginCredentialFence publishes the blocked marker before a destructive
+// credential transaction (#2201). Fails closed (503/500) when the fence is
+// unwired or entropy fails — a destructive flow must never run without epoch
+// rotation. On failure the HTTP response is written and ok=false is returned.
+func (h *Handler) beginCredentialFence(c *gin.Context, uid, errMsg string) (*credepoch.Op, bool) {
+	if h.credFence == nil {
+		h.log.Error("Destructive credential flow blocked: fence not wired", "error_class", "fence_missing")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsg})
+		return nil, false
+	}
+	fenceOp, fenceErr := h.credFence.Begin(c.Request.Context(), uid)
+	if fenceErr != nil {
+		h.log.Error("Destructive credential flow blocked: fence begin failed", "error_class", "fence_begin")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+		return nil, false
+	}
+	return fenceOp, true
+}
+
+// settleCredentialFence finalizes a destructive-flow fence op after its
+// transaction returns: Commit on success, Rollback on a DEFINITE pre-commit
+// failure, and neither on an AMBIGUOUS commit — the blocked marker's TTL plus
+// read-through reconcile that case (#2201 spec §4.4/§4.5).
+func settleCredentialFence(ctx context.Context, fenceOp *credepoch.Op, err error) {
+	switch {
+	case err == nil:
+		fenceOp.Commit(ctx)
+	case !errors.Is(err, errCommitAmbiguous):
+		fenceOp.Rollback(ctx)
+	}
+}
+
+// appendContinuationPair adds the post-rotation continuation token pair
+// (#2201): every prior session is revoked and the old access token dies on
+// its next request; the caller gets a fresh pair minted under the NEW epoch.
+// Best-effort — a mint failure degrades to the pre-#2201 re-login flow and
+// never fails the committed change.
+func (h *Handler) appendContinuationPair(c *gin.Context, response gin.H, uid, committedEpoch string) {
+	if h.tokenPairs == nil {
+		return
+	}
+	// Bind the mint to the epoch THIS flow committed (#2201): if a concurrent
+	// destructive flow advanced it in the post-commit window, IssueTokenPair
+	// returns an error and we skip the pair — the client re-authenticates rather
+	// than receive a session the later flow intended to terminate.
+	accessToken, refreshToken, sessionID, mintErr := h.tokenPairs.IssueTokenPair(c, uid, committedEpoch)
+	if mintErr != nil {
+		h.log.Error("Continuation pair skipped; client re-login required", "error_class", "continuation_mint")
+		return
+	}
+	response["access_token"] = accessToken
+	response["refresh_token"] = refreshToken
+	response["session_id"] = sessionID
 }
 
 // SearchUsers searches for users by username or display_name.
@@ -1568,49 +1707,60 @@ type EncryptedBlobRequest struct {
 	EncryptedData string `json:"encrypted_data" binding:"required"`
 }
 
-// upsertE2EEBlobTx performs the blob write serialized against the
-// password-change transaction via the users row (#2200 review): a bare INSERT
-// could otherwise land between the password transaction's assert-absent read
-// (which locks no row) and its commit, stranding old-key ciphertext past the
-// rotation. Locking users FOR NO KEY UPDATE — the same lock
-// executePasswordChange holds from step-up through commit — makes every blob
-// write wait out an in-flight rotation. Lock hierarchy stays users → domain
-// row on both paths, so no deadlock.
-func (h *Handler) upsertE2EEBlobTx(
-	ctx context.Context,
-	cfg e2eeBlobConfig,
-	userID interface{},
-	encryptedData string,
-) (int, error) {
+// upsertE2EEBlobGuarded runs the blob upsert inside ONE transaction whose single
+// users-row read serves both serialization invariants for this key-material-
+// coupled write:
+//   - #2200: FOR NO KEY UPDATE serializes the write against an in-flight password
+//     rotation (which holds the same lock from step-up through commit); a bare
+//     INSERT could otherwise land mid-rotation and strand old-key ciphertext.
+//     Lock hierarchy stays users → domain row.
+//   - #2201: the same read returns credential_epoch, and MatchEpoch rejects a
+//     request admitted before a destructive reset from recreating ciphertext
+//     after it. One read (not GuardTx's separate FOR SHARE) — the FOR NO KEY
+//     UPDATE lock already dominates, so a second read would be redundant.
+//
+// On failure the HTTP response is written and ok=false is returned.
+func (h *Handler) upsertE2EEBlobGuarded(c *gin.Context, cfg e2eeBlobConfig, uid, encryptedData string) (version int, ok bool) {
+	failMsg := "Failed to update " + cfg.logLabel
+	ctx := c.Request.Context()
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("begin: %w", err)
+		h.log.Error("Failed to begin "+cfg.logLabel+" tx", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failMsg})
+		return 0, false
 	}
 	defer func() {
 		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-			h.log.Error("Failed to rollback blob update", "error", rbErr)
+			h.log.Error("Failed to rollback "+cfg.logLabel+" tx", "error", rbErr)
 		}
 	}()
 
-	var one int
+	var epoch sql.NullString
 	if err := tx.QueryRowContext(ctx,
-		`SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
-	).Scan(&one); err != nil {
-		return 0, fmt.Errorf("lock user: %w", err)
+		`SELECT credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE`, uid,
+	).Scan(&epoch); err != nil {
+		h.log.Error("Failed to lock user for "+cfg.logLabel, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failMsg})
+		return 0, false
+	}
+	if credepoch.MatchEpoch(epoch, middleware.TokenCredentialEpoch(c)) != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+		return 0, false
 	}
 
-	var version int
-	if err := tx.QueryRowContext(ctx, cfg.upsertSQL, userID, encryptedData).Scan(&version); err != nil {
-		return 0, fmt.Errorf("upsert: %w", err)
+	if err := tx.QueryRowContext(ctx, cfg.upsertSQL, uid, encryptedData).Scan(&version); err != nil {
+		h.log.Error(failMsg, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failMsg})
+		return 0, false
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit: %w", err)
+		h.log.Error("Failed to commit "+cfg.logLabel+" tx", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failMsg})
+		return 0, false
 	}
-	return version, nil
+	return version, true
 }
 
-// upsertE2EEBlob validates an encrypted blob, upserts it for the authenticated user,
-// and broadcasts an update notification via WebSocket to the user's other clients.
 func (h *Handler) upsertE2EEBlob(c *gin.Context, cfg e2eeBlobConfig) {
 	userID, exists := c.Get("user_id")
 	if !exists {
@@ -1634,10 +1784,9 @@ func (h *Handler) upsertE2EEBlob(c *gin.Context, cfg e2eeBlobConfig) {
 		return
 	}
 
-	version, err := h.upsertE2EEBlobTx(c.Request.Context(), cfg, userID, req.EncryptedData)
-	if err != nil {
-		h.log.Error("Failed to update "+cfg.logLabel, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update " + cfg.logLabel})
+	uid, _ := userID.(string)
+	version, ok := h.upsertE2EEBlobGuarded(c, cfg, uid, req.EncryptedData)
+	if !ok {
 		return
 	}
 

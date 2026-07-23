@@ -10,7 +10,7 @@ import (
 func TestCheckOrigin(t *testing.T) {
 	// NewHandler with nil deps is safe — only the allowedOrigins and
 	// upgrader fields are used by CheckOrigin.
-	h := NewHandler(nil, nil, nil, "", []string{"https://concordvoice.chat"}, nil)
+	h := NewHandler(nil, nil, nil, "", []string{"https://concordvoice.chat"}, nil, nil)
 
 	tests := []struct {
 		name   string
@@ -39,7 +39,7 @@ func TestCheckOrigin(t *testing.T) {
 }
 
 func TestCheckOriginWildcard(t *testing.T) {
-	h := NewHandler(nil, nil, nil, "", []string{"*"}, nil)
+	h := NewHandler(nil, nil, nil, "", []string{"*"}, nil, nil)
 
 	tests := []struct {
 		name   string

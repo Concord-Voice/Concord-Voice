@@ -91,7 +91,7 @@ func newVoiceReplicaHub(
 	))
 	go hub.Run()
 	handler := concordws.NewHandler(
-		hub, ts.DB, ts.Redis, testhelpers.TestJWTSecret, []string{"*"}, nil,
+		hub, ts.DB, ts.Redis, testhelpers.TestJWTSecret, []string{"*"}, nil, nil,
 	)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()

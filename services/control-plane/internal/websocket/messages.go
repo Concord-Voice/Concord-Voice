@@ -13,6 +13,10 @@ type IncomingMessage struct {
 	// Sender info (set by server)
 	UserID   uuid.UUID `json:"-"`
 	ClientID uuid.UUID `json:"-"`
+	// CredEpoch is the sender's credential-epoch claim captured at WS auth time
+	// (#2201). Server-set; used to fence ciphertext writes against a destructive
+	// reset that advanced the epoch after this socket connected.
+	CredEpoch string `json:"-"`
 }
 
 // OutgoingMessage represents a message sent to a client

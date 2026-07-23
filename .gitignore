@@ -64,7 +64,9 @@ Thumbs.db
 scripts/rotate-secrets.sh
 
 # Node.js
-node_modules/
+# No trailing slash: also matches a node_modules SYMLINK (worktree setups link
+# it to the main checkout; the dir-only "node_modules/" let one get committed).
+node_modules
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

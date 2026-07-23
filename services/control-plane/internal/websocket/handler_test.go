@@ -30,7 +30,7 @@ func TestNewHandlerSetsFields(t *testing.T) {
 	hub := NewHub(nil, nil)
 	origins := []string{originMain, originApp}
 
-	h := NewHandler(hub, nil, nil, "test-secret", origins, nil)
+	h := NewHandler(hub, nil, nil, "test-secret", origins, nil, nil)
 
 	require.NotNil(t, h)
 	assert.Equal(t, hub, h.hub)
@@ -41,7 +41,7 @@ func TestNewHandlerSetsFields(t *testing.T) {
 
 func TestNewHandlerNilDepsDoNotPanic(t *testing.T) {
 	// NewHandler with nil deps is safe for CheckOrigin testing
-	h := NewHandler(nil, nil, nil, "", nil, nil)
+	h := NewHandler(nil, nil, nil, "", nil, nil, nil)
 	require.NotNil(t, h)
 }
 
@@ -70,7 +70,7 @@ func TestRequestSupportsActivityRichPresenceRequiresOneExactOptIn(t *testing.T) 
 // --- CheckOrigin comprehensive tests ---
 
 func TestCheckOriginEmptyAllowList(t *testing.T) {
-	h := NewHandler(nil, nil, nil, "", []string{}, nil)
+	h := NewHandler(nil, nil, nil, "", []string{}, nil, nil)
 
 	tests := []struct {
 		name   string
@@ -101,7 +101,7 @@ func TestCheckOriginMultipleAllowedOrigins(t *testing.T) {
 		originApp,
 		"http://localhost:3001",
 	}
-	h := NewHandler(nil, nil, nil, "", origins, nil)
+	h := NewHandler(nil, nil, nil, "", origins, nil, nil)
 
 	tests := []struct {
 		name   string
@@ -125,7 +125,7 @@ func TestCheckOriginMultipleAllowedOrigins(t *testing.T) {
 }
 
 func TestCheckOriginFileProtocolVariants(t *testing.T) {
-	h := NewHandler(nil, nil, nil, "", []string{originMain}, nil)
+	h := NewHandler(nil, nil, nil, "", []string{originMain}, nil, nil)
 
 	tests := []struct {
 		name   string
@@ -160,7 +160,7 @@ func TestCheckOriginNullOriginAlwaysRejected(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := NewHandler(nil, nil, nil, "", tt.origins, nil)
+			h := NewHandler(nil, nil, nil, "", tt.origins, nil, nil)
 			r, _ := http.NewRequest("GET", "/ws", nil)
 			r.Header.Set("Origin", "null")
 			assert.False(t, h.upgrader.CheckOrigin(r), "null origin should always be rejected")
@@ -242,6 +242,19 @@ func TestParseUserIDFromClaimsValidUUID(t *testing.T) {
 	assert.Equal(t, "", sessionID)
 }
 
+func TestParseUserIDFromClaimsPropagatesSessionID(t *testing.T) {
+	// #2201 review: the JWT fallback must carry the access token's sid so a
+	// socket it opens is evictable by DisconnectSession when that refresh
+	// lineage is revoked.
+	id := uuid.New()
+	claims := jwt.MapClaims{"user_id": id.String(), "sid": "sess-abc123"}
+
+	userID, sessionID, err := parseUserIDFromClaims(claims)
+	require.NoError(t, err)
+	assert.Equal(t, id, userID)
+	assert.Equal(t, "sess-abc123", sessionID)
+}
+
 func TestParseUserIDFromClaimsMissingUserID(t *testing.T) {
 	claims := jwt.MapClaims{"sub": "something"}
 
@@ -288,7 +301,7 @@ func generateTestJWT(t *testing.T, userID string, secret string) string {
 }
 
 func TestAuthenticateWebSocketNoAuth(t *testing.T) {
-	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 	r, _ := http.NewRequest("GET", "/ws", nil)
 	c := newGinContext(r)
 
@@ -299,7 +312,8 @@ func TestAuthenticateWebSocketNoAuth(t *testing.T) {
 
 func TestAuthenticateWebSocketJWTViaHeader(t *testing.T) {
 	userID := uuid.New()
-	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil)
+	// Success path reaches the #2201 user-disabled check, which needs Redis.
+	h := NewHandler(nil, nil, setupHubTestRedis(t), testJWTSecret, nil, nil, nil)
 	token := generateTestJWT(t, userID.String(), testJWTSecret)
 
 	r, _ := http.NewRequest("GET", "/ws", nil)
@@ -314,7 +328,8 @@ func TestAuthenticateWebSocketJWTViaHeader(t *testing.T) {
 
 func TestAuthenticateWebSocketJWTViaQueryParam(t *testing.T) {
 	userID := uuid.New()
-	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil)
+	// Success path reaches the #2201 user-disabled check, which needs Redis.
+	h := NewHandler(nil, nil, setupHubTestRedis(t), testJWTSecret, nil, nil, nil)
 	token := generateTestJWT(t, userID.String(), testJWTSecret)
 
 	r, _ := http.NewRequest("GET", wsTokenPath+token, nil)
@@ -326,7 +341,7 @@ func TestAuthenticateWebSocketJWTViaQueryParam(t *testing.T) {
 }
 
 func TestAuthenticateWebSocketInvalidJWT(t *testing.T) {
-	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 
 	r, _ := http.NewRequest("GET", wsTokenPath+"not-a-valid-jwt", nil)
 	c := newGinContext(r)
@@ -337,7 +352,7 @@ func TestAuthenticateWebSocketInvalidJWT(t *testing.T) {
 
 func TestAuthenticateWebSocketWrongSecret(t *testing.T) {
 	userID := uuid.New()
-	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 	token := generateTestJWT(t, userID.String(), "wrong-secret")
 
 	r, _ := http.NewRequest("GET", wsTokenPath+token, nil)
@@ -348,7 +363,7 @@ func TestAuthenticateWebSocketWrongSecret(t *testing.T) {
 }
 
 func TestAuthenticateWebSocketExpiredJWT(t *testing.T) {
-	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 	now := time.Now()
 	claims := jwt.MapClaims{
 		"user_id": uuid.New().String(),
@@ -368,7 +383,7 @@ func TestAuthenticateWebSocketExpiredJWT(t *testing.T) {
 }
 
 func TestAuthenticateWebSocketJWTMissingUserIDClaim(t *testing.T) {
-	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 	now := time.Now()
 	claims := jwt.MapClaims{
 		"sub": "something",
@@ -389,7 +404,7 @@ func TestAuthenticateWebSocketJWTMissingUserIDClaim(t *testing.T) {
 }
 
 func TestAuthenticateWebSocketJWTInvalidUserIDFormat(t *testing.T) {
-	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 	now := time.Now()
 	claims := jwt.MapClaims{
 		"user_id": notAValidUUID,
@@ -409,7 +424,7 @@ func TestAuthenticateWebSocketJWTInvalidUserIDFormat(t *testing.T) {
 }
 
 func TestAuthenticateWebSocketJWTNonHMACSigningMethod(t *testing.T) {
-	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 	now := time.Now()
 	claims := jwt.MapClaims{
 		"user_id": uuid.New().String(),
@@ -434,7 +449,7 @@ func TestAuthenticateWebSocketJWTNonHMACSigningMethod(t *testing.T) {
 // --- checkTokenBlacklist tests (require Redis) ---
 
 func TestCheckTokenBlacklistNoJTI(t *testing.T) {
-	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 	r, _ := http.NewRequest("GET", "/ws", nil)
 	c := newGinContext(r)
 
@@ -444,7 +459,7 @@ func TestCheckTokenBlacklistNoJTI(t *testing.T) {
 }
 
 func TestCheckTokenBlacklistEmptyJTI(t *testing.T) {
-	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 	r, _ := http.NewRequest("GET", "/ws", nil)
 	c := newGinContext(r)
 
@@ -455,7 +470,7 @@ func TestCheckTokenBlacklistEmptyJTI(t *testing.T) {
 
 func TestCheckTokenBlacklistBlacklistedToken(t *testing.T) {
 	redisClient := setupHubTestRedis(t)
-	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil, nil)
 
 	jti := uuid.New().String()
 	ctx := context.Background()
@@ -473,7 +488,7 @@ func TestCheckTokenBlacklistBlacklistedToken(t *testing.T) {
 
 func TestCheckTokenBlacklistNonBlacklistedToken(t *testing.T) {
 	redisClient := setupHubTestRedis(t)
-	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil, nil)
 
 	r, _ := http.NewRequest("GET", "/ws", nil)
 	c := newGinContext(r)
@@ -487,7 +502,7 @@ func TestCheckTokenBlacklistNonBlacklistedToken(t *testing.T) {
 
 func TestAuthenticateViaTicketValid(t *testing.T) {
 	redisClient := setupHubTestRedis(t)
-	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil, nil)
 
 	userID := uuid.New()
 	ticket := "test-ticket-valid"
@@ -506,7 +521,7 @@ func TestAuthenticateViaTicketValid(t *testing.T) {
 
 func TestAuthenticateViaTicketWithSessionID(t *testing.T) {
 	redisClient := setupHubTestRedis(t)
-	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil, nil)
 
 	userID := uuid.New()
 	ticket := "test-ticket-session"
@@ -525,7 +540,7 @@ func TestAuthenticateViaTicketWithSessionID(t *testing.T) {
 
 func TestAuthenticateViaTicketInvalidTicket(t *testing.T) {
 	redisClient := setupHubTestRedis(t)
-	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil, nil)
 
 	r, _ := http.NewRequest("GET", wsTicketPath+"nonexistent-ticket", nil)
 	c := newGinContext(r)
@@ -537,7 +552,7 @@ func TestAuthenticateViaTicketInvalidTicket(t *testing.T) {
 
 func TestAuthenticateViaTicketInvalidUserIDInTicket(t *testing.T) {
 	redisClient := setupHubTestRedis(t)
-	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil, nil)
 
 	ticket := "test-ticket-bad-uuid"
 	ctx := context.Background()
@@ -556,7 +571,7 @@ func TestAuthenticateViaTicketInvalidUserIDInTicket(t *testing.T) {
 
 func TestAuthenticateWebSocketBlacklistedJWT(t *testing.T) {
 	redisClient := setupHubTestRedis(t)
-	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil)
+	h := NewHandler(nil, nil, redisClient, testJWTSecret, nil, nil, nil)
 
 	userID := uuid.New()
 	jti := uuid.New().String()
@@ -588,7 +603,7 @@ func TestAuthenticateWebSocketBlacklistedJWT(t *testing.T) {
 
 func TestHandleWebSocketUnauthorized(t *testing.T) {
 	hub := NewHub(nil, nil)
-	h := NewHandler(hub, nil, nil, testJWTSecret, []string{"*"}, nil)
+	h := NewHandler(hub, nil, nil, testJWTSecret, []string{"*"}, nil, nil)
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -620,7 +635,7 @@ func TestHandleWebSocketDBLookupFallback(t *testing.T) {
 	hub := NewHub(db, redisClient)
 	go hub.Run()
 
-	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil)
+	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, nil)
 
 	userID := uuid.New()
 	token := generateTestJWT(t, userID.String(), testJWTSecret)
@@ -639,7 +654,7 @@ func TestHandleWebSocketCapturesActivityCapabilityBeforeRegistration(t *testing.
 	redisClient := setupHubTestRedis(t)
 	hub := NewHub(db, redisClient)
 	go hub.Run()
-	handler := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil)
+	handler := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, nil)
 
 	userID := uuid.New()
 	token := generateTestJWT(t, userID.String(), testJWTSecret)
@@ -686,7 +701,7 @@ func TestHandleWebSocketSecurityHeadersOn101(t *testing.T) {
 	secHeaders.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
 	secHeaders.Set("X-Content-Type-Options", "nosniff")
 
-	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, secHeaders)
+	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, secHeaders)
 
 	userID := uuid.New()
 	token := generateTestJWT(t, userID.String(), testJWTSecret)
@@ -717,7 +732,7 @@ func TestHandleWebSocketDBLookupSuccess(t *testing.T) {
 		db.Exec(`DELETE FROM users WHERE id = $1`, userID.String()) //nolint:errcheck,gosec
 	})
 
-	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil)
+	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, nil)
 	token := generateTestJWT(t, userID.String(), testJWTSecret)
 
 	srv := setupWSTestServer(t, h, hub)
@@ -749,7 +764,7 @@ func TestHandleWebSocketTicketAuth(t *testing.T) {
 	err = redisClient.Set(ctx, wsTicketKeyPfx+ticket, userID.String()+":test-session", 30*time.Second).Err()
 	require.NoError(t, err)
 
-	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil)
+	h := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, nil)
 
 	srv := setupWSTestServer(t, h, hub)
 

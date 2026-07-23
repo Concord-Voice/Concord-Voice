@@ -4,11 +4,13 @@ package channels
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
@@ -45,6 +47,10 @@ const (
 	errMsgFailedFetchServerUnread = "Failed to fetch server unread status"
 	errMsgNoEncryptionKey         = "No encryption key available yet"
 	errMsgFailedDistributeKeys    = "Failed to distribute keys"
+	// errMsgAuthRequired matches the middleware's generic auth-failure body so
+	// an epoch-fence rejection inside a handler is indistinguishable from the
+	// middleware's own rejection (#2201).
+	errMsgAuthRequired            = "Authentication required"
 	errMsgInvalidContextID        = "Invalid context ID"
 	errMsgFailedProcessRewrap     = "Failed to process rewrap request"
 	errMsgFailedEnrollRewrap      = "Failed to enroll rewrap request"
@@ -243,6 +249,44 @@ func (h *Handler) queryChannelGroups(serverID string) ([]models.ChannelGroup, er
 }
 
 // CreateChannel creates a new channel in a server
+// admitCreateChannelRequest runs CreateChannel's pre-transaction gates:
+// PermManageChannels, the CV-CAN-010 foreign-group rejection (binding a new
+// channel to another server's category would let the permission-sync cascade
+// copy that server's category overrides in by group_id), and the
+// E2EE-everywhere (#201) wrapped-keys requirement. On failure the HTTP
+// response is written and false is returned.
+func (h *Handler) admitCreateChannelRequest(c *gin.Context, req CreateChannelRequest, userID string) bool {
+	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), req.ServerID, userID, "", rbac.PermManageChannels)
+	if err != nil {
+		h.log.Error(logMsgFailedCheckPermissions, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		return false
+	}
+	if !hasPerm {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return false
+	}
+
+	groupOK, groupErr := h.groupBelongsToServer(c.Request.Context(), req.GroupID, req.ServerID)
+	if groupErr != nil {
+		h.log.Error("Failed to validate channel group ownership", "error", groupErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		return false
+	}
+	if !groupOK {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgForeignGroup})
+		return false
+	}
+
+	if len(req.WrappedKeys) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Encrypted channels require wrapped keys for all members"})
+		return false
+	}
+	return true
+}
+
+// CreateChannel creates a channel (plus a linked text channel for voice) and
+// stores the E2EE-everywhere wrapped keys inside one epoch-guarded transaction.
 func (h *Handler) CreateChannel(c *gin.Context) {
 	userID := c.GetString("user_id")
 
@@ -252,35 +296,7 @@ func (h *Handler) CreateChannel(c *gin.Context) {
 		return
 	}
 
-	// Check permission to manage channels
-	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), req.ServerID, userID, "", rbac.PermManageChannels)
-	if err != nil {
-		h.log.Error(logMsgFailedCheckPermissions, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
-		return
-	}
-	if !hasPerm {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
-		return
-	}
-
-	// CV-CAN-010: reject a group_id that belongs to another server. Binding a
-	// new channel to a foreign category lets the later permission-sync cascade
-	// copy that server's category overrides into this channel by group_id.
-	groupOK, groupErr := h.groupBelongsToServer(c.Request.Context(), req.GroupID, req.ServerID)
-	if groupErr != nil {
-		h.log.Error("Failed to validate channel group ownership", "error", groupErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
-		return
-	}
-	if !groupOK {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgForeignGroup})
-		return
-	}
-
-	// Under E2EE-everywhere (#201) wrapped keys are always required.
-	if len(req.WrappedKeys) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Encrypted channels require wrapped keys for all members"})
+	if !h.admitCreateChannelRequest(c, req, userID) {
 		return
 	}
 
@@ -296,6 +312,23 @@ func (h *Handler) CreateChannel(c *gin.Context) {
 			h.log.Error("Failed to rollback transaction", "error", rbErr)
 		}
 	}()
+
+	// #2201: the wrapped keys stored below are key-material-coupled state —
+	// recheck the creator's credential epoch inside the tx (covers both
+	// storeWrappedKeys and the linked-text-channel copy in this same tx).
+	if guardErr := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
+		// Discriminate an epoch-fence rejection (401) from a store/lock read
+		// error (logged 500): the request was already authenticated, so a
+		// transient DB failure is a server error, not "re-authenticate"
+		// (Codex #2397 review).
+		if errors.Is(guardErr, credepoch.ErrEpochMismatch) || errors.Is(guardErr, credepoch.ErrBlocked) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
+			return
+		}
+		h.log.Error("credential-epoch guard read failed", "error", guardErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		return
+	}
 
 	nextPos := h.computeNextPosition(tx, req.ServerID, req.GroupID)
 	channelID := uuid.New().String()
@@ -1274,7 +1307,11 @@ func (h *Handler) DistributeChannelKeys(c *gin.Context) {
 
 	targetKeyVersion := h.resolveTargetKeyVersion(channelID, req.KeyVersion)
 
-	distributed, duplicates, skippedErrors := h.distributeChannelKeysToMembers(channelID, req.WrappedKeys, targetKeyVersion)
+	distributed, duplicates, skippedErrors, distErr := h.distributeChannelKeysToMembers(c.Request.Context(), userID, middleware.TokenCredentialEpoch(c), channelID, req.WrappedKeys, targetKeyVersion)
+	if distErr != nil {
+		h.respondKeyDistributionError(c, distErr, channelID)
+		return
+	}
 
 	h.log.Info("Channel keys distributed",
 		"channel_id", channelID, "by_user", userID,
@@ -1363,67 +1400,157 @@ func (h *Handler) resolveTargetKeyVersion(channelID string, explicitVersion *int
 	return v
 }
 
-func (h *Handler) distributeChannelKeysToMembers(channelID string, wrappedKeys map[string]string, keyVersion int) (distributed, duplicates, skippedErrors int) {
-	ctx := context.Background()
+// distributionTargetAdmitted applies the CV-CAN-005 gate for one distribution
+// target: do not distribute a channel key to a target lacking channel VIEW (or
+// that is not a member). Fail CLOSED — skip on a definite deny AND on a
+// resolver error. A persistent resolver failure must not silently degrade this
+// security gate back to membership-only. Distribution is retryable and
+// eventually consistent: a target skipped on a transient error is enrolled
+// into the peer-fulfillment queue (idempotent) so a viewer re-delivers the key
+// once the resolver recovers; fulfillment re-checks VIEW, so this cannot
+// re-open CV-CAN-005 for a genuinely no-view user.
+func (h *Handler) distributionTargetAdmitted(ctx context.Context, channelID, memberUserID string) (admitted, skippedOnError bool) {
+	_, canView, vErr := h.channelKeyAccess(ctx, channelID, memberUserID)
+	if vErr != nil {
+		if _, enrollErr := h.enrollPending("channel", channelID, memberUserID); enrollErr != nil {
+			h.log.Error("key distribution: failed to enroll skipped target for retry",
+				"error", enrollErr, "channel_id", sanitizeID(channelID), "user_id", sanitizeID(memberUserID))
+		}
+		h.log.Error("key distribution: view check failed; skipping target (fail closed, enrolled for retry)", "error", vErr, "user_id", sanitizeID(memberUserID))
+		return false, true
+	}
+	return canView, false
+}
+
+// distributionOutcome classifies one target of a channel-key distribution.
+type distributionOutcome int
+
+const (
+	distributionSkipped distributionOutcome = iota
+	distributionSkippedOnError
+	distributionDuplicate
+	distributionDelivered
+)
+
+// distributeOneChannelKey processes one distribution target inside the
+// caller's epoch-guarded transaction: the CV-CAN-005 admission gate and the
+// idempotent insert (the caller validates the member UUID). A statement error
+// poisons the whole PG transaction (25P02), so the pre-#2201
+// skip-and-continue is no longer possible for insert failures — they fail
+// the batch via the error.
+func (h *Handler) distributeOneChannelKey(ctx context.Context, tx *sql.Tx, channelID, memberUserID, wrappedKey string, keyVersion int) (distributionOutcome, error) {
+	admitted, skippedOnError := h.distributionTargetAdmitted(ctx, channelID, memberUserID)
+	if skippedOnError {
+		return distributionSkippedOnError, nil
+	}
+	if !admitted {
+		return distributionSkipped, nil
+	}
+
+	inserted, insErr := insertWrappedChannelKeyTx(ctx, tx, channelID, memberUserID, wrappedKey, keyVersion)
+	if insErr != nil {
+		h.log.Error("Failed to store key for member", "error", insErr, "user_id", memberUserID)
+		return distributionSkipped, fmt.Errorf("store key: %w", insErr)
+	}
+	if !inserted {
+		return distributionDuplicate, nil
+	}
+	return distributionDelivered, nil
+}
+
+// insertWrappedChannelKeyTx inserts one wrapped key inside the caller's
+// epoch-guarded transaction. inserted=false with a nil error means the
+// (channel, user, version) row already existed.
+func insertWrappedChannelKeyTx(ctx context.Context, tx *sql.Tx, channelID, memberUserID, wrappedKey string, keyVersion int) (inserted bool, err error) {
+	result, err := tx.ExecContext(ctx,
+		`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (channel_id, user_id, key_version) DO NOTHING`,
+		channelID, memberUserID, wrappedKey, keyVersion,
+	)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, raErr := result.RowsAffected()
+	if raErr != nil {
+		// #2201 review: a RowsAffected error means we can't tell whether the
+		// wrapped-key row landed. Fail the batch (caller → 500) rather than
+		// silently classify it not-delivered and skip the delivered notification.
+		return false, fmt.Errorf("rows affected: %w", raErr)
+	}
+	return rowsAffected > 0, nil
+}
+
+// respondKeyDistributionError maps a distribution failure onto the wire (#2201):
+// epoch-fence rejections get the middleware-identical generic 401; anything
+// else (tx begin/commit, statement failures) is a 500.
+func (h *Handler) respondKeyDistributionError(c *gin.Context, distErr error, contextID string) {
+	if errors.Is(distErr, credepoch.ErrEpochMismatch) || errors.Is(distErr, credepoch.ErrBlocked) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
+		return
+	}
+	h.log.Error("Key distribution failed", "error", distErr, "context_id", sanitizeID(contextID))
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDistributeKeys})
+}
+
+// distributeChannelKeysToMembers writes wrapped keys inside ONE transaction
+// guarded by the distributing actor's credential epoch (#2201): a distributor
+// admitted before a destructive key reset cannot recreate wrapped-key rows
+// after it (GuardTx FOR SHARE serializes against the reset's user-row lock).
+// key_delivered notifications fire only after commit so a notified client
+// never fetches an uncommitted row. A guard/transaction failure returns an
+// error (the caller maps epoch errors to 401); per-member insert errors keep
+// their existing skip semantics.
+func (h *Handler) distributeChannelKeysToMembers(ctx context.Context, actorID, tokenEpoch, channelID string, wrappedKeys map[string]string, keyVersion int) (distributed, duplicates, skippedErrors int, err error) {
+	// #2201 review: run on the request context so a client disconnect cancels a
+	// GuardTx FOR SHARE lock-wait (which blocks against a destructive reset's
+	// FOR NO KEY UPDATE) instead of pinning a pooled connection with no deadline.
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("begin distribution tx: %w", err)
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+			h.log.Error("Failed to rollback distribution tx", "error", rbErr)
+		}
+	}()
+	if guardErr := credepoch.GuardTx(ctx, tx, actorID, tokenEpoch); guardErr != nil {
+		return 0, 0, 0, guardErr
+	}
+	var delivered []string
 	for memberUserID, wrappedKey := range wrappedKeys {
 		if _, parseErr := uuid.Parse(memberUserID); parseErr != nil {
 			continue
 		}
-
-		// CV-CAN-005: do not distribute a channel key to a target lacking channel
-		// VIEW (or that is not a member). Fail CLOSED — skip on a definite deny
-		// AND on a resolver error. A persistent resolver failure must not silently
-		// degrade this security gate back to membership-only and re-open the hole
-		// this change closes. Distribution is retryable and eventually consistent
-		// (the pending_key_requests row survives), so a skipped target is picked
-		// up on a later attempt once the resolver recovers, rather than being
-		// stranded.
-		_, canView, vErr := h.channelKeyAccess(ctx, channelID, memberUserID)
-		if vErr != nil {
-			// Fail CLOSED: skip rather than leak. A target skipped on a transient
-			// error during a rotation has no channel_keys row at the new epoch and
-			// (unlike a pending-fulfillment target) no pending_key_requests row, so
-			// nothing would ever retry it — leaving a legitimate member stranded.
-			// Enroll it into the peer-fulfillment queue (idempotent) so a viewer
-			// re-delivers the key once the resolver recovers. Fulfillment re-checks
-			// VIEW, so this cannot re-open CV-CAN-005 for a genuinely no-view user.
-			if _, enrollErr := h.enrollPending("channel", channelID, memberUserID); enrollErr != nil {
-				h.log.Error("key distribution: failed to enroll skipped target for retry",
-					"error", enrollErr, "channel_id", sanitizeID(channelID), "user_id", sanitizeID(memberUserID))
-			}
-			h.log.Error("key distribution: view check failed; skipping target (fail closed, enrolled for retry)", "error", vErr, "user_id", sanitizeID(memberUserID))
-			skippedErrors++
-			continue
+		outcome, distErr := h.distributeOneChannelKey(ctx, tx, channelID, memberUserID, wrappedKey, keyVersion)
+		if distErr != nil {
+			return 0, 0, 0, distErr
 		}
-		if !canView {
-			continue
-		}
-
-		result, err := h.db.Exec(
-			`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version)
-			 VALUES ($1, $2, $3, $4)
-			 ON CONFLICT (channel_id, user_id, key_version) DO NOTHING`,
-			channelID, memberUserID, wrappedKey, keyVersion,
-		)
-		if err != nil {
-			h.log.Error("Failed to store key for member", "error", err, "user_id", memberUserID)
-			continue
-		}
-		rowsAffected, _ := result.RowsAffected()
-		if rowsAffected == 0 {
+		switch outcome {
+		case distributionDelivered:
+			delivered = append(delivered, memberUserID)
+			distributed++
+		case distributionDuplicate:
 			duplicates++
-			continue
+		case distributionSkippedOnError:
+			skippedErrors++
+		case distributionSkipped:
 		}
-
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, 0, fmt.Errorf("commit distribution tx: %w", err)
+	}
+	for _, memberUserID := range delivered {
+		// Pending-request cleanup is best-effort POST-commit: the key row is
+		// already durable, and a failed DELETE inside the tx would poison the
+		// whole batch (25P02) for what is only retry-safe housekeeping.
 		_, _ = h.db.Exec(
 			`DELETE FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`,
 			channelID, memberUserID,
 		)
-
 		h.notifyKeyDelivered(channelID, memberUserID)
-		distributed++
 	}
-	return distributed, duplicates, skippedErrors
+	return distributed, duplicates, skippedErrors, nil
 }
 
 func (h *Handler) notifyKeyDelivered(contextID, memberUserID string) {
@@ -2128,7 +2255,11 @@ func (h *Handler) DistributeUnifiedKeys(c *gin.Context) {
 		return
 	}
 
-	distributed := h.distributeDMKeys(contextID, req.WrappedKeys, req.KeyVersion)
+	distributed, distErr := h.distributeDMKeys(c.Request.Context(), userID, middleware.TokenCredentialEpoch(c), contextID, req.WrappedKeys, req.KeyVersion)
+	if distErr != nil {
+		h.respondKeyDistributionError(c, distErr, contextID)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"distributed": distributed, "context_type": "dm"})
 }
 
@@ -2160,36 +2291,74 @@ func (h *Handler) resolveTargetKeyVersionDM(conversationID string, explicitVersi
 	return v
 }
 
-func (h *Handler) distributeDMKeys(conversationID string, wrappedKeys map[string]string, explicitVersion *int) int {
+// distributeDMKeys mirrors distributeChannelKeysToMembers' guarded-transaction
+// shape (#2201): one tx, actor-epoch GuardTx first, post-commit notifications.
+// insertWrappedDMKeyTx mirrors insertWrappedChannelKeyTx for the unified-DM
+// branch: inserted=false means an idempotent duplicate; any error (statement OR
+// RowsAffected — the latter leaves delivery unknowable, Codex #2397 review)
+// fails the batch.
+func insertWrappedDMKeyTx(ctx context.Context, tx *sql.Tx, conversationID, memberUserID, wrappedKey string, keyVersion int) (inserted bool, err error) {
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO dm_channel_keys (conversation_id, user_id, wrapped_key, key_version)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (conversation_id, user_id, key_version) DO NOTHING
+	`, conversationID, memberUserID, wrappedKey, keyVersion)
+	if err != nil {
+		return false, fmt.Errorf("store dm key: %w", err)
+	}
+	rowsAffected, raErr := result.RowsAffected()
+	if raErr != nil {
+		return false, fmt.Errorf("dm key rows affected: %w", raErr)
+	}
+	return rowsAffected > 0, nil
+}
+
+func (h *Handler) distributeDMKeys(ctx context.Context, actorID, tokenEpoch, conversationID string, wrappedKeys map[string]string, explicitVersion *int) (int, error) {
 	keyVersion := h.resolveTargetKeyVersionDM(conversationID, explicitVersion)
 
+	// #2201 review: request context, same rationale as distributeChannelKeysToMembers.
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin dm distribution tx: %w", err)
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+			h.log.Error("Failed to rollback dm distribution tx", "error", rbErr)
+		}
+	}()
+	if guardErr := credepoch.GuardTx(ctx, tx, actorID, tokenEpoch); guardErr != nil {
+		return 0, guardErr
+	}
+
 	distributed := 0
+	var delivered []string
 	for memberUserID, wrappedKey := range wrappedKeys {
 		if _, parseErr := uuid.Parse(memberUserID); parseErr != nil {
 			continue
 		}
-
-		result, err := h.db.Exec(`
-			INSERT INTO dm_channel_keys (conversation_id, user_id, wrapped_key, key_version)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (conversation_id, user_id, key_version) DO NOTHING
-		`, conversationID, memberUserID, wrappedKey, keyVersion)
-		if err != nil {
+		inserted, insErr := insertWrappedDMKeyTx(ctx, tx, conversationID, memberUserID, wrappedKey, keyVersion)
+		if insErr != nil {
+			// A statement error poisons the PG tx (25P02); fail the batch.
+			return 0, insErr
+		}
+		if !inserted {
 			continue
 		}
-		rowsAffected, _ := result.RowsAffected()
-		if rowsAffected == 0 {
-			continue
-		}
-
+		delivered = append(delivered, memberUserID)
+		distributed++
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit dm distribution tx: %w", err)
+	}
+	for _, memberUserID := range delivered {
+		// Best-effort POST-commit cleanup — see distributeChannelKeysToMembers.
 		_, _ = h.db.Exec(
 			`DELETE FROM dm_pending_key_requests WHERE conversation_id = $1 AND user_id = $2`,
 			conversationID, memberUserID,
 		)
 		h.notifyKeyDelivered(conversationID, memberUserID)
-		distributed++
 	}
-	return distributed
+	return distributed, nil
 }
 
 // RotateKey handles manual seal & rotate for server channel E2EE.

@@ -56,7 +56,7 @@ func TestReplaceMyKeysCommitAmbiguityAcknowledgesClearThenDisconnects(t *testing
 		},
 	})
 	t.Cleanup(restore)
-	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, testCredFence(t, ts.DB), nil)
 	handler.SetPresenceHistory(service)
 	users.SetKeyResetSessionDisconnectorForTest(handler, observer)
 
@@ -82,7 +82,7 @@ func TestReplaceMyKeysConfirmedRollbackSendsNothingAndKeepsSession(t *testing.T)
 		Commit: func(*sql.Tx) error { return errForcedAmbiguousKeyResetCommit },
 	})
 	t.Cleanup(restore)
-	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	handler := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil, testCredFence(t, ts.DB), nil)
 	handler.SetPresenceHistory(service)
 	users.SetKeyResetSessionDisconnectorForTest(handler, observer)
 

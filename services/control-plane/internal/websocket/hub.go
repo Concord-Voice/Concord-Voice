@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/klipy"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
@@ -45,6 +46,8 @@ const (
 	statusInvisible   = "invisible"
 	statusDND         = "dnd"
 	sessionRevoked    = "session_revoked"
+
+	errMsgFailedSaveMessage = "Failed to save message"
 
 	clientBootstrapConcurrency = 8
 	clientBootstrapTimeout     = 5 * time.Second
@@ -2047,6 +2050,7 @@ func (h *Hub) verifyAttachmentAccess(fileID, uploaderID string, ctx attachmentLi
 type persistMessageParams struct {
 	channelUUID      uuid.UUID
 	userID           uuid.UUID
+	credEpoch        string
 	content          string
 	keyVersion       int
 	embedsSuppressed bool
@@ -2057,7 +2061,29 @@ type persistMessageParams struct {
 func (h *Hub) persistMessage(p persistMessageParams) (uuid.UUID, time.Time, time.Time, string) {
 	messageID := uuid.New()
 	var createdAt, updatedAt time.Time
-	err := h.db.QueryRow(
+	ctx := context.Background()
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to begin message tx: %v", err)
+		return messageID, createdAt, updatedAt, errMsgFailedSaveMessage
+	}
+	defer func() { _ = tx.Rollback() }()
+	// #2201 (Codex #2397 review): a WS message frame read before a destructive
+	// reset's DisconnectUser lands must not commit ciphertext under the
+	// superseded epoch. GuardTx (users-row FOR SHARE) rechecks the sender's
+	// connect-time epoch against the current DB epoch inside the write tx.
+	if guardErr := credepoch.GuardTx(ctx, tx, p.userID.String(), p.credEpoch); guardErr != nil {
+		// A proven epoch mismatch/blocked rejects (client must re-auth); a
+		// transient users-row read/lock failure is not a proven mismatch — log it
+		// and return the retryable save error, not the auth-shaped one (#2201
+		// Codex review, mirroring respondGuardTxError on the HTTP paths).
+		if errors.Is(guardErr, credepoch.ErrEpochMismatch) || errors.Is(guardErr, credepoch.ErrBlocked) {
+			return messageID, createdAt, updatedAt, "Authentication required"
+		}
+		log.Printf("Message epoch guard read failed: %v", guardErr)
+		return messageID, createdAt, updatedAt, errMsgFailedSaveMessage
+	}
+	err = tx.QueryRowContext(ctx,
 		`INSERT INTO messages (id, channel_id, user_id, content, key_version, embeds_suppressed, reply_to_id, gif_slug, created_at, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
 		 RETURNING created_at, updated_at`,
@@ -2068,7 +2094,11 @@ func (h *Hub) persistMessage(p persistMessageParams) (uuid.UUID, time.Time, time
 	}
 	if err != nil {
 		log.Printf("Failed to persist message: %v", err)
-		return messageID, createdAt, updatedAt, "Failed to save message"
+		return messageID, createdAt, updatedAt, errMsgFailedSaveMessage
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit message: %v", err)
+		return messageID, createdAt, updatedAt, errMsgFailedSaveMessage
 	}
 	return messageID, createdAt, updatedAt, ""
 }
@@ -2243,7 +2273,7 @@ func (h *Hub) handleMessage(msg IncomingMessage) {
 
 	// Persist message
 	messageID, createdAt, updatedAt, persistErr := h.persistMessage(persistMessageParams{
-		channelUUID: channelUUID, userID: msg.UserID, content: input.content,
+		channelUUID: channelUUID, userID: msg.UserID, credEpoch: msg.CredEpoch, content: input.content,
 		keyVersion:       input.keyVersion,
 		embedsSuppressed: embedsSuppressed, replyToID: replyToID, gifSlug: input.gifSlug,
 	})
@@ -3177,16 +3207,29 @@ func (h *Hub) enforceDMEpoch(msg IncomingMessage, convUUID uuid.UUID, keyVersion
 	return false
 }
 
-func (h *Hub) persistDMMessage(convUUID uuid.UUID, userID uuid.UUID, input *dmMessageInput) (uuid.UUID, time.Time, time.Time, error) {
+func (h *Hub) persistDMMessage(convUUID uuid.UUID, userID uuid.UUID, credEpoch string, input *dmMessageInput) (uuid.UUID, time.Time, time.Time, error) {
 	messageID := uuid.New()
 	var createdAt, updatedAt time.Time
-	err := h.db.QueryRow(
+	ctx := context.Background()
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return messageID, createdAt, updatedAt, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// #2201 (Codex #2397 review): fence the WS DM ciphertext write against a
+	// destructive reset that advanced the sender's epoch after connect.
+	if guardErr := credepoch.GuardTx(ctx, tx, userID.String(), credEpoch); guardErr != nil {
+		return messageID, createdAt, updatedAt, guardErr
+	}
+	if err = tx.QueryRowContext(ctx,
 		`INSERT INTO dm_messages (id, conversation_id, user_id, content, key_version, type, gif_slug, created_at, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
 		 RETURNING created_at, updated_at`,
 		messageID, convUUID, userID, input.content, input.keyVersion, input.msgType, input.gifSlug,
-	).Scan(&createdAt, &updatedAt)
-	return messageID, createdAt, updatedAt, err
+	).Scan(&createdAt, &updatedAt); err != nil {
+		return messageID, createdAt, updatedAt, err
+	}
+	return messageID, createdAt, updatedAt, tx.Commit()
 }
 
 // dmMessageAckParams holds the fields for a dm_message_ack response.
@@ -3281,10 +3324,14 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 		return
 	}
 
-	messageID, createdAt, updatedAt, err := h.persistDMMessage(convUUID, msg.UserID, input)
+	messageID, createdAt, updatedAt, err := h.persistDMMessage(convUUID, msg.UserID, msg.CredEpoch, input)
 	if err != nil {
+		// Any guard/store failure logs and returns the retryable save error (a
+		// fenced epoch mismatch is caught by the client's next authoritative API
+		// call). The channel path additionally distinguishes an auth-shaped signal
+		// for a proven mismatch; the DM caller keeps the simpler safe default.
 		log.Printf("Failed to persist DM message: %v", err)
-		h.sendError(msg.ClientID, "Failed to save message")
+		h.sendError(msg.ClientID, errMsgFailedSaveMessage)
 		return
 	}
 	if input.msgType == "user" && h.opsCounter != nil {

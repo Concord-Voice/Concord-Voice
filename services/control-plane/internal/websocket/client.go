@@ -77,6 +77,11 @@ type Client struct {
 	// (for targeted session revocation). Empty if not provided.
 	SessionID string
 
+	// CredEpoch is the credential-epoch claim captured at WS auth time (#2201).
+	// Every message frame from this socket carries it so a ciphertext write can
+	// be fenced against a destructive reset that advanced the epoch after connect.
+	CredEpoch string
+
 	// The WebSocket connection
 	Conn *websocket.Conn
 
@@ -315,6 +320,7 @@ func (c *Client) readPump() {
 		// Set sender info
 		msg.UserID = c.UserID
 		msg.ClientID = c.ID
+		msg.CredEpoch = c.CredEpoch
 
 		// Route message to hub
 		c.Hub.incoming <- msg

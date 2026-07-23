@@ -497,6 +497,15 @@ func TestReplaceMyKeysKeepsPublicKeyConsistent(t *testing.T) {
 	w := ts.DoRequest("PUT", urlUsersMeKeys, payload, testhelpers.AuthHeaders(user.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
 
+	// #2201: the reset rotated the credential epoch, so the PRE-reset access
+	// token is now dead. Continue as the continuation contract intends: with
+	// the fresh pair the response carries.
+	var replaceBody map[string]interface{}
+	testhelpers.ParseJSON(t, w, &replaceBody)
+	continuationToken, ok := replaceBody["access_token"].(string)
+	require.True(t, ok, "ReplaceMyKeys response must carry a continuation access_token")
+	require.NotEmpty(t, replaceBody["refresh_token"], "continuation refresh_token expected")
+
 	// user_keys.key_version == public_keys.key_version
 	var ukVersion, pkVersion int
 	require.NoError(t, ts.DB.QueryRow(
@@ -506,7 +515,7 @@ func TestReplaceMyKeysKeepsPublicKeyConsistent(t *testing.T) {
 	assert.Equal(t, ukVersion, pkVersion, "user_keys and public_keys versions must match after reset")
 
 	// GetPublicKey returns the public key whose private counterpart the client holds.
-	gw := ts.DoRequest("GET", pathPublicKey(user.ID), nil, testhelpers.AuthHeaders(user.AccessToken))
+	gw := ts.DoRequest("GET", pathPublicKey(user.ID), nil, testhelpers.AuthHeaders(continuationToken))
 	require.Equal(t, http.StatusOK, gw.Code)
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, gw, &body)

@@ -10,8 +10,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/klipy"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
@@ -39,6 +41,21 @@ const (
 	errMsgFailedCheckMembership  = "Failed to check membership"
 	errMsgInvalidCiphertext      = "Invalid ciphertext format for E2EE channel"
 )
+
+// respondGuardTxError maps a credepoch.GuardTx failure onto the wire (#2201
+// review), mirroring channels.respondKeyDistributionError: an epoch-fence
+// rejection is the middleware-identical generic 401; any other failure (a
+// store/lock read error, e.g. "credepoch: guard read") is a logged 500 —
+// otherwise a transient DB error looks like "re-authenticate" to the client
+// and leaves no log trail.
+func (h *Handler) respondGuardTxError(c *gin.Context, err error, genericMsg string) {
+	if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+		return
+	}
+	h.log.Error("credential-epoch guard read failed", "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": genericMsg})
+}
 
 // minCiphertextSize is the minimum base64-decoded size for a valid AES-GCM ciphertext:
 // 12 bytes IV + 16 bytes auth tag = 28 bytes minimum (empty plaintext).
@@ -595,7 +612,27 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	message.ReplyToID = replyToID
 	message.GifSlug = gifSlug
 
-	err := h.db.QueryRow(insertQuery, messageID, req.ChannelID, userID, req.Content, keyVersion, embedsSuppressed, replyToID, gifSlug).Scan(
+	// #2201: an encrypted message write is key-material-coupled state — recheck
+	// the sender's credential epoch inside the write transaction so a request
+	// admitted before a destructive key reset cannot land ciphertext after it.
+	ctx := c.Request.Context()
+	tx, txErr := h.db.BeginTx(ctx, nil)
+	if txErr != nil {
+		h.log.Error("Failed to begin message tx", "error", txErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendMessage})
+		return
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+			h.log.Error("Failed to rollback message tx", "error", rbErr)
+		}
+	}()
+	if guardErr := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
+		h.respondGuardTxError(c, guardErr, errMsgFailedSendMessage)
+		return
+	}
+
+	err := tx.QueryRowContext(ctx, insertQuery, messageID, req.ChannelID, userID, req.Content, keyVersion, embedsSuppressed, replyToID, gifSlug).Scan(
 		&message.CreatedAt,
 		&message.UpdatedAt,
 	)
@@ -605,6 +642,11 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			return
 		}
 		h.log.Error("Failed to create message", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendMessage})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit message tx", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendMessage})
 		return
 	}
@@ -678,6 +720,15 @@ func (h *Handler) updateMessageCiphertext(
 			h.log.Error("Failed to rollback message update", "error", rbErr)
 		}
 	}()
+
+	// #2201: recheck the editor's credential epoch inside the edit transaction
+	// (users row FIRST, before the channel lock — the same users-first order
+	// every guarded write uses) so an edit admitted before a destructive key
+	// reset cannot commit ciphertext after it.
+	if guardErr := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
+		h.respondGuardTxError(c, guardErr, errMsgFailedUpdateMessage)
+		return models.Message{}, false
+	}
 
 	var lockedChannelID string
 	if err = tx.QueryRowContext(c.Request.Context(),

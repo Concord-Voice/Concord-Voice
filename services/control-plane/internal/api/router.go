@@ -12,6 +12,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/channels"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/clientconfig"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
@@ -322,10 +323,16 @@ func NewRouter(
 	// Initialize email service
 	emailSvc := email.NewService(cfg, log)
 
+	// Credential-epoch fence (#2201): the single process-wide verifier/mutator
+	// for users.credential_epoch. Injected into AuthRequired, the WS surfaces,
+	// and the destructive credential flows.
+	credFence := credepoch.New(db, redis, log)
+
 	// Initialize handlers
 	authHandler := auth.NewHandlerForInstance(db, redis, log, cfg.JWTSecret, hub, cfg.InstanceType)
 	authHandler.SetPresenceHistory(presenceHistoryService)
 	authHandler.SetEmailService(emailSvc)
+	authHandler.SetCredentialFence(credFence)
 	// Wire cross-references (breaks circular init dependency)
 	authHandler.SetMFAChecker(mfaHandler)
 	mfaHandler.SetLoginCompleter(authHandler)
@@ -333,7 +340,7 @@ func NewRouter(
 	entCache := entitlements.NewCacheForInstance(redis, db, cfg.InstanceType)
 	serverEntCache := entitlements.NewServerCacheForInstance(redis, db, cfg.InstanceType)
 	sessionsHandler := sessions.NewHandler(db, redis, log, hub, mfaHandler)
-	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache)
+	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache, credFence, authHandler)
 	usersHandler.SetPresenceHistory(presenceHistoryService)
 	usersHandler.SetActivitySettingsSuppressor(activityService)
 	presenceHistoryHandler := presencehistory.NewHandler(presenceHistoryService)
@@ -408,7 +415,7 @@ func NewRouter(
 		serversHandler.SetMediaStore(store)
 	}
 	wsHandler := websocket.NewHandler(hub, db, redis, cfg.JWTSecret, cfg.AllowedOrigins,
-		middleware.SecurityHeaderSet(cfg.Environment, cfg.HSTSHeaderValue))
+		credFence, middleware.SecurityHeaderSet(cfg.Environment, cfg.HSTSHeaderValue))
 	wsTicketHandler := auth.NewWSTicketHandler(redis, cfg.JWTSecret)
 	clientConfigHandler := clientconfig.NewHandler(cfg, liveSpa, log)
 	serverCapabilitiesHandler := servercapabilities.NewHandler(cfg)
@@ -708,7 +715,7 @@ func NewRouter(
 		// Client attestation routes (#677). Verify takes the configured TTL via
 		// closure since gin.HandlerFunc has a fixed signature.
 		v1.POST("/attestation/verify",
-			middleware.AuthRequired(cfg.JWTSecret, redis),
+			middleware.AuthRequired(cfg.JWTSecret, redis, credFence),
 			func(c *gin.Context) { attestationHandler.Verify(c, cfg.AttestationTokenTTL) },
 		)
 		// Internal CI publish endpoints (Y1 split — #677 R3 reconciliation).
@@ -740,7 +747,7 @@ func NewRouter(
 		// finding #BLOCK-1 of the #1264 review (the middleware was previously
 		// defined and unit-tested but never registered on any route).
 		authRequired := v1.Group("/")
-		authRequired.Use(middleware.AuthRequired(cfg.JWTSecret, redis))
+		authRequired.Use(middleware.AuthRequired(cfg.JWTSecret, redis, credFence))
 		authRequired.Use(middleware.RequireAttestation(cfg.RequireClientAttestation, redis, log))
 
 		// ── Pending-OK routes (unverified email allowed) ──────────────

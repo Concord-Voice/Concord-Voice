@@ -42,7 +42,7 @@ func (immediatePresenceDelivery) DeliverCustomText(
 }
 
 func directPresenceOverrideHandler(db *sql.DB) *users.Handler {
-	handler := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil)
+	handler := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil)
 	service := presencehistory.NewService(db, presencehistory.DisclosureState{}, false)
 	if err := service.BindDelivery(immediatePresenceDelivery{}); err != nil {
 		panic(err)

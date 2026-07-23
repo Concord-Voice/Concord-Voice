@@ -25,8 +25,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	invitecodes "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage"
@@ -254,8 +256,19 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 		storageKey: storageKey, fileSize: header.Size, keyVersion: keyVersion,
 		channelID: channelID, conversationID: conversationID,
 	}); err != nil {
-		if delErr := store.DeleteObject(c.Request.Context(), storageKey); delErr != nil {
+		// #2201 review: the metadata write can fail precisely BECAUSE the request
+		// context was canceled (client disconnect). Deleting the just-uploaded
+		// object with that same canceled context would also fail and strand an
+		// orphaned blob the reaper can't find (no media_files row). Detach the
+		// cleanup delete so it runs regardless.
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 10*time.Second)
+		if delErr := store.DeleteObject(cleanupCtx, storageKey); delErr != nil {
 			h.log.Error("Failed to delete orphaned attachment object", "error", delErr, "storage_key", storageKey)
+		}
+		cancelCleanup()
+		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+			return
 		}
 		h.log.Error("Failed to record attachment metadata", "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record file metadata"})
@@ -997,7 +1010,7 @@ type attachmentParams struct {
 	conversationID string
 }
 
-func createAttachmentRecord(h *Handler, _ *gin.Context, p attachmentParams) error {
+func createAttachmentRecord(h *Handler, c *gin.Context, p attachmentParams) error {
 	var chID, convID interface{}
 	if p.channelID != "" {
 		chID = p.channelID
@@ -1006,14 +1019,33 @@ func createAttachmentRecord(h *Handler, _ *gin.Context, p attachmentParams) erro
 		convID = p.conversationID
 	}
 
+	// #2201: a tier-2 attachment row is key-material-coupled (key_version +
+	// E2EE ciphertext object) — recheck the uploader's credential epoch inside
+	// the metadata-write transaction. The caller maps credepoch errors to 401.
+	ctx := c.Request.Context()
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin attachment tx: %w", err)
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+			h.log.Error("Failed to rollback attachment tx", "error", rbErr)
+		}
+	}()
+	if guardErr := credepoch.GuardTx(ctx, tx, p.userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
+		return guardErr
+	}
+
 	insertQuery := `
 		INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key,
 		                         key_version, channel_id, conversation_id, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
 	`
-	_, err := h.db.Exec(insertQuery, p.fileID, p.userID, string(p.fileType), MediaTierE2EE,
-		p.mimeType, p.fileSize, p.storageKey, p.keyVersion, chID, convID)
-	return err
+	if _, err := tx.ExecContext(ctx, insertQuery, p.fileID, p.userID, string(p.fileType), MediaTierE2EE,
+		p.mimeType, p.fileSize, p.storageKey, p.keyVersion, chID, convID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // proxyTier1Media fetches a Tier 1 media object from MinIO and streams it to

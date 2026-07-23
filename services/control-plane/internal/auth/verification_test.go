@@ -55,7 +55,7 @@ func TestRedisKey(t *testing.T) {
 
 func TestGenerateAccessTokenEmailVerifiedClaim(t *testing.T) {
 	t.Run("token with email_verified=true", func(t *testing.T) {
-		tokenStr, err := GenerateAccessToken("user-1", testJWTSecret, true)
+		tokenStr, err := GenerateAccessToken("user-1", testJWTSecret, true, "", "")
 		require.NoError(t, err)
 
 		claims, err := ValidateAccessToken(tokenStr, testJWTSecret)
@@ -65,7 +65,7 @@ func TestGenerateAccessTokenEmailVerifiedClaim(t *testing.T) {
 	})
 
 	t.Run("token with email_verified=false", func(t *testing.T) {
-		tokenStr, err := GenerateAccessToken("user-1", testJWTSecret, false)
+		tokenStr, err := GenerateAccessToken("user-1", testJWTSecret, false, "", "")
 		require.NoError(t, err)
 
 		claims, err := ValidateAccessToken(tokenStr, testJWTSecret)

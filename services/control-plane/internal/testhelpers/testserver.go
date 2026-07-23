@@ -12,6 +12,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/api"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
@@ -235,7 +236,7 @@ func (ts *TestServer) createTestUserWithVerification(t *testing.T, username stri
 
 	ts.insertE2EEKeys(t, userID)
 
-	accessToken, err := auth.GenerateAccessToken(userID, TestJWTSecret, emailVerified)
+	accessToken, err := auth.GenerateAccessToken(userID, TestJWTSecret, emailVerified, "", "")
 	if err != nil {
 		t.Fatalf("testhelpers: failed to generate access token: %v", err)
 	}
@@ -267,7 +268,7 @@ func (ts *TestServer) VerifyUserEmail(t *testing.T, userID string) string {
 		t.Fatalf("testhelpers: failed to verify user email: %v", err)
 	}
 
-	token, err := auth.GenerateAccessToken(userID, TestJWTSecret, true)
+	token, err := auth.GenerateAccessToken(userID, TestJWTSecret, true, "", "")
 	if err != nil {
 		t.Fatalf("testhelpers: failed to generate verified token: %v", err)
 	}
@@ -608,4 +609,30 @@ func (ts *TestServer) CreateVoiceChannel(t *testing.T, serverID, name string) st
 		t.Fatalf("testhelpers: failed to create voice channel: %v", err)
 	}
 	return channelID
+}
+
+// SimulateStaleEpochWindow materializes the #2201 "admitted before the reset,
+// commits after it" race deterministically: the DB holds the POST-reset epoch
+// while the fence's Redis cache still serves the PRE-reset one (the real
+// post-crash TTL window), and the returned bearer claims the stale epoch. The
+// HTTP middleware therefore ADMITS the request from cache; only a sensitive
+// write's in-transaction credepoch.GuardTx (which reads the DB) can stop it.
+func (ts *TestServer) SimulateStaleEpochWindow(t *testing.T, userID string) (staleToken string) {
+	t.Helper()
+
+	const oldEpoch = "staleepochaaaaaaaaaaaaaaaaaaaaaa" // pragma: allowlist secret
+	const newEpoch = "rotatedepochbbbbbbbbbbbbbbbbbbbb" // pragma: allowlist secret
+
+	if _, err := ts.DB.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, newEpoch, userID); err != nil {
+		t.Fatalf("testhelpers: failed to set rotated epoch: %v", err)
+	}
+	if err := ts.Redis.Set(context.Background(), "cred_epoch:"+userID, "active:"+oldEpoch, 5*time.Minute).Err(); err != nil {
+		t.Fatalf("testhelpers: failed to seed stale epoch cache: %v", err)
+	}
+
+	token, err := auth.GenerateAccessToken(userID, TestJWTSecret, true, oldEpoch, "")
+	if err != nil {
+		t.Fatalf("testhelpers: failed to mint stale-epoch token: %v", err)
+	}
+	return token
 }

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
@@ -89,8 +90,9 @@ const (
 	bearerPrefix                   = "Bearer "
 
 	// HTTP header names
-	headerMachineID = "X-Machine-Id"
-	headerUserAgent = "User-Agent"
+	headerMachineID  = "X-Machine-Id"
+	headerUserAgent  = "User-Agent"
+	headerDeviceName = "X-Device-Name"
 
 	// Additional error messages
 	errMsgRefreshFailed      = "Refresh failed"
@@ -140,6 +142,74 @@ type Handler struct {
 	emailSvc        *email.Service
 	pending         *PendingRepo
 	entCache        *entitlements.Cache
+	credFence       *credepoch.Fence
+}
+
+// SetCredentialFence injects the per-user credential-epoch fence (#2201).
+// The recovery reset flows FAIL CLOSED (503) when it is absent — a destructive
+// credential flow must never silently skip epoch rotation.
+func (h *Handler) SetCredentialFence(f *credepoch.Fence) {
+	h.credFence = f
+}
+
+// ErrContinuationEpochAdvanced signals that a concurrent destructive credential
+// flow advanced the user's epoch between the caller's committed rotation and
+// this best-effort continuation mint — so no pair is issued (#2201). The caller
+// drops the continuation pair and the client re-authenticates.
+var ErrContinuationEpochAdvanced = errors.New("continuation epoch advanced")
+
+// IssueTokenPair mints an access+refresh pair for the post-rotation continuation
+// contract (#2201), BOUND to expectedEpoch — the epoch the caller's destructive
+// flow just committed. Called AFTER that flow's transaction commits, it locks the
+// user row FOR NO KEY UPDATE and refuses to mint if a SECOND destructive flow
+// advanced the epoch in the window between the caller's commit and this mint
+// (else the earlier request would receive a live pair the later flow meant to
+// terminate — the same "mint reads the current epoch without a lock" gap the
+// refresh-rotation fix closes). On advance it returns
+// ErrContinuationEpochAdvanced; the access token and refresh row are minted under
+// the locked epoch so the pair cannot outlive the rotation it belongs to.
+func (h *Handler) IssueTokenPair(c *gin.Context, userID, expectedEpoch string) (accessToken, refreshToken, sessionID string, err error) {
+	ctx := c.Request.Context()
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", "", "", fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var emailVerified bool
+	var epoch sql.NullString
+	if err = tx.QueryRowContext(ctx,
+		`SELECT email_verified, credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
+	).Scan(&emailVerified, &epoch); err != nil {
+		return "", "", "", fmt.Errorf("lookup: %w", err)
+	}
+	if credepoch.MatchEpoch(epoch, expectedEpoch) != nil {
+		return "", "", "", ErrContinuationEpochAdvanced
+	}
+
+	sessionID = uuid.New().String()
+	tier := h.entCache.GetTier(ctx, userID)
+	accessToken, err = GenerateAccessToken(userID, h.jwtSecret, emailVerified, epoch.String, sessionID, tier)
+	if err != nil {
+		return "", "", "", fmt.Errorf("access: %w", err)
+	}
+	refreshToken, err = GenerateRefreshToken()
+	if err != nil {
+		return "", "", "", fmt.Errorf("refresh: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx,
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		sessionID, userID, HashRefreshToken(refreshToken), c.GetHeader(headerDeviceName),
+		c.ClientIP(), truncateUserAgent(c.GetHeader(headerUserAgent)),
+		time.Now().Add(30*24*time.Hour), true, nilIfEmpty(c.GetHeader(headerMachineID)),
+	); err != nil {
+		return "", "", "", fmt.Errorf("store: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return "", "", "", fmt.Errorf("commit: %w", err)
+	}
+	return accessToken, refreshToken, sessionID, nil
 }
 
 // NewHandler creates a new authentication handler.
@@ -228,8 +298,15 @@ func decodeE2EEKeys(publicKeyB64, wrappedKeyB64, saltB64 string) (publicKey, wra
 // generateTokenPair creates an access+refresh token pair and persists the
 // refresh token. Used by issueSessionTokens and other flows.
 func (h *Handler) generateTokenPair(c *gin.Context, userID string, emailVerified bool) (accessToken, refreshToken, tokenID string, err error) {
+	// #2201: embed the user's current credential epoch (fail closed — no mint
+	// without epoch knowledge) and the new refresh-session id in the access token.
+	var credEpoch sql.NullString
+	if err = h.db.QueryRow(`SELECT credential_epoch FROM users WHERE id = $1`, userID).Scan(&credEpoch); err != nil {
+		return "", "", "", fmt.Errorf("epoch lookup: %w", err)
+	}
+	tokenID = uuid.New().String()
 	tier := h.entCache.GetTier(c.Request.Context(), userID)
-	accessToken, err = GenerateAccessToken(userID, h.jwtSecret, emailVerified, tier)
+	accessToken, err = GenerateAccessToken(userID, h.jwtSecret, emailVerified, credEpoch.String, tokenID, tier)
 	if err != nil {
 		return "", "", "", fmt.Errorf("access: %w", err)
 	}
@@ -239,14 +316,13 @@ func (h *Handler) generateTokenPair(c *gin.Context, userID string, emailVerified
 	}
 
 	tokenHash := HashRefreshToken(refreshToken)
-	tokenID = uuid.New().String()
 	expiresAt := time.Now().Add(30 * 24 * time.Hour)
 	machineID := c.GetHeader(headerMachineID)
 
 	_, err = h.db.Exec(
 		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		tokenID, userID, tokenHash, c.GetHeader("X-Device-Name"),
+		tokenID, userID, tokenHash, c.GetHeader(headerDeviceName),
 		c.ClientIP(), truncateUserAgent(c.GetHeader(headerUserAgent)),
 		expiresAt, true, nilIfEmpty(machineID),
 	)
@@ -1064,16 +1140,19 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool) 
 	// Resolve every response prerequisite before minting tokens or creating a
 	// refresh session. Reading disabled and email_verified in this same snapshot
 	// keeps the terminal gate, JWT claim, and returned user mutually consistent.
+	// credential_epoch rides the same snapshot so the minted cred_epoch claim
+	// (#2201) is consistent with the gate decisions.
 	var user models.User
+	var credEpoch sql.NullString
 	if err := h.db.QueryRow(
 		`SELECT id, email, username, password_hash, display_name, bio, avatar_url, COALESCE(links, '[]'::jsonb),
-		        email_verified, age_verified, created_at, updated_at, password_login_disabled, disabled
+		        email_verified, age_verified, created_at, updated_at, password_login_disabled, disabled, credential_epoch
 		 FROM users WHERE id = $1`, userID,
 	).Scan(
 		&user.ID, &user.Email, &user.Username, &user.PasswordHash,
 		&user.DisplayName, &user.Bio, &user.AvatarURL, &user.Links,
 		&user.EmailVerified, &user.AgeVerified,
-		&user.CreatedAt, &user.UpdatedAt, &user.PasswordLoginDisabled, &user.Disabled,
+		&user.CreatedAt, &user.UpdatedAt, &user.PasswordLoginDisabled, &user.Disabled, &credEpoch,
 	); err != nil {
 		h.log.Error("Failed to fetch user for login response", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
@@ -1094,9 +1173,11 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool) 
 		return
 	}
 
-	// Generate access token (JWT, 15 min)
+	// Generate access token (JWT, 15 min). tokenID (the refresh-session id) is
+	// minted first so the access token can carry it as the sid claim (#2201).
+	tokenID := uuid.New().String()
 	tier := h.entCache.GetTier(c.Request.Context(), userID)
-	accessToken, err := GenerateAccessToken(userID, h.jwtSecret, user.EmailVerified, tier)
+	accessToken, err := GenerateAccessToken(userID, h.jwtSecret, user.EmailVerified, credEpoch.String, tokenID, tier)
 	if err != nil {
 		h.log.Error(errMsgFailedAccessToken, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
@@ -1113,9 +1194,8 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool) 
 
 	// Store refresh token in database
 	tokenHash := HashRefreshToken(refreshToken)
-	tokenID := uuid.New().String()
 	expiresAt := time.Now().Add(30 * 24 * time.Hour)
-	deviceName := c.GetHeader("X-Device-Name")
+	deviceName := c.GetHeader(headerDeviceName)
 	ipAddress := c.ClientIP()
 	userAgent := truncateUserAgent(c.GetHeader(headerUserAgent))
 	machineID := c.GetHeader(headerMachineID)
@@ -1512,15 +1592,6 @@ func computeRecoveryOnlyMethods(allMethods, loginMethods []string) []string {
 
 // rotateAndRespond completes the refresh: revokes the old token, issues a new one, and responds.
 func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, requestMachineID string) {
-	// Revoke the old refresh token (single-use rotation)
-	_, err := h.db.Exec(
-		`UPDATE refresh_tokens SET revoked_at = NOW(), last_used_at = NOW() WHERE id = $1`,
-		token.ID,
-	)
-	if err != nil {
-		h.log.Error("Failed to revoke old refresh token", "error", err)
-	}
-
 	newRefreshToken, err := GenerateRefreshToken()
 	if err != nil {
 		h.log.Error(errMsgFailedRefreshToken, "error", err)
@@ -1545,47 +1616,81 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 		"request_id", c.GetString(middleware.RequestIDContextKey),
 		"user_id", token.UserID, "remember_me", token.RememberMe)
 
-	// Conditional INSERT (#1623): mint the new token ONLY if the account is not
-	// disabled. This is the atomic close of the disable/refresh race — if the
-	// terminal-disable tx committed between fetchActiveRefreshToken and here, the
-	// EXISTS guard fails and no live token is minted (TOCTOU-free, unlike a
-	// SELECT-then-INSERT). The old token was already revoked above.
-	res, err := h.db.Exec(
-		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id)
-		 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
-		 WHERE EXISTS (SELECT 1 FROM users WHERE id = $2 AND disabled = FALSE)`,
-		newTokenID, token.UserID, newTokenHash, token.DeviceName,
-		c.ClientIP(), truncateUserAgent(c.GetHeader(headerUserAgent)),
-		newExpiry, token.RememberMe, nilIfEmpty(propagatedMachineID),
-	)
-
-	// Auto-purge old revoked sessions (> 90 days)
-	_, _ = h.db.Exec(
-		`DELETE FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NOT NULL AND revoked_at < NOW() - INTERVAL '90 days'`,
-		token.UserID)
+	// #2201 (Codex #2397 review): serialize this rotation against a concurrent
+	// destructive credential reset. One transaction: lock the user row
+	// FOR NO KEY UPDATE (the same lock the reset holds), read the epoch + disabled
+	// state under it, revoke the SOURCE token only if still active, and mint the
+	// successor. If a reset already revoked the source token (bulk revoke under
+	// its own hold of this lock), the conditional revoke returns no rows and we
+	// refuse — a pre-reset refresh token can no longer mint a fresh session under
+	// the new epoch.
+	ctx := c.Request.Context()
+	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
-		h.log.Error("Failed to store new refresh token", "error", err)
+		h.log.Error("Failed to begin refresh rotation tx", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
 		return
 	}
-	// 0 rows => the EXISTS guard failed => account disabled (or a RowsAffected
-	// failure => fail closed). Refuse; the old token is already revoked.
-	if affected, raErr := res.RowsAffected(); raErr != nil || affected == 0 {
+	defer func() { _ = tx.Rollback() }()
+
+	var refreshEmailVerified, disabled bool
+	var refreshCredEpoch sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT email_verified, credential_epoch, disabled FROM users WHERE id = $1 FOR NO KEY UPDATE`, token.UserID,
+	).Scan(&refreshEmailVerified, &refreshCredEpoch, &disabled); err != nil {
+		h.log.Error("Failed to lock user for refresh rotation", "error", err, "user_id", token.UserID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		return
+	}
+	// #1623 disable/refresh race — now closed by the FOR NO KEY UPDATE lock above
+	// (a concurrent disable serializes against it) rather than an EXISTS guard.
+	if disabled {
 		c.JSON(http.StatusForbidden, gin.H{"error_code": "account_disabled"})
 		return
 	}
 
-	SetRefreshCookie(c, newRefreshToken, cookieMaxAge)
-
-	var refreshEmailVerified bool
-	if err := h.db.QueryRow(`SELECT email_verified FROM users WHERE id = $1`, token.UserID).Scan(&refreshEmailVerified); err != nil {
-		h.log.Error("Failed to look up email_verified for refresh", "error", err, "user_id", token.UserID)
+	var revokedID string
+	if err := tx.QueryRowContext(ctx,
+		`UPDATE refresh_tokens SET revoked_at = NOW(), last_used_at = NOW() WHERE id = $1 AND revoked_at IS NULL RETURNING id`,
+		token.ID,
+	).Scan(&revokedID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// A concurrent destructive reset revoked the source token first.
+			c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgRefreshFailed})
+			return
+		}
+		h.log.Error("Failed to revoke old refresh token", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
 		return
 	}
 
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		newTokenID, token.UserID, newTokenHash, token.DeviceName,
+		c.ClientIP(), truncateUserAgent(c.GetHeader(headerUserAgent)),
+		newExpiry, token.RememberMe, nilIfEmpty(propagatedMachineID),
+	); err != nil {
+		h.log.Error("Failed to store new refresh token", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit refresh rotation", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		return
+	}
+
+	// Auto-purge old revoked sessions (> 90 days) — best-effort, post-commit.
+	_, _ = h.db.Exec(
+		`DELETE FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NOT NULL AND revoked_at < NOW() - INTERVAL '90 days'`,
+		token.UserID)
+
+	SetRefreshCookie(c, newRefreshToken, cookieMaxAge)
+
 	tier := h.entCache.GetTier(c.Request.Context(), token.UserID)
-	accessToken, err := GenerateAccessToken(token.UserID, h.jwtSecret, refreshEmailVerified, tier)
+	accessToken, err := GenerateAccessToken(token.UserID, h.jwtSecret, refreshEmailVerified, refreshCredEpoch.String, newTokenID, tier)
 	if err != nil {
 		h.log.Error(errMsgFailedAccessToken, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
@@ -1711,9 +1816,10 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	// Set cookie
 	SetRefreshCookie(c, newRefreshToken, cookieMaxAge)
 
-	// Look up current email_verified for grace recovery token
+	// Look up current email_verified + credential epoch for grace recovery token
 	var graceEmailVerified bool
-	if err := h.db.QueryRow(`SELECT email_verified FROM users WHERE id = $1`, userID).Scan(&graceEmailVerified); err != nil {
+	var graceCredEpoch sql.NullString
+	if err := h.db.QueryRow(`SELECT email_verified, credential_epoch FROM users WHERE id = $1`, userID).Scan(&graceEmailVerified, &graceCredEpoch); err != nil {
 		h.log.Error("Failed to look up email_verified for grace recovery", "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
 		return
@@ -1721,7 +1827,7 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 
 	// Generate access token
 	tier := h.entCache.GetTier(c.Request.Context(), userID)
-	accessToken, err := GenerateAccessToken(userID, h.jwtSecret, graceEmailVerified, tier)
+	accessToken, err := GenerateAccessToken(userID, h.jwtSecret, graceEmailVerified, graceCredEpoch.String, newTokenID, tier)
 	if err != nil {
 		h.log.Error("Failed to generate access token during grace recovery", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
@@ -2278,6 +2384,49 @@ type recoveryPresenceResult struct {
 
 type recoveryWork func(context.Context, *sql.Tx) (recoveryPresenceResult, error)
 
+// beginRecoveryFence publishes the credential-epoch blocked marker (#2201)
+// before a recovery reset transaction. Fails closed (503/500) when the fence
+// is unwired or entropy fails — a destructive credential flow must never run
+// without epoch rotation. On failure the recovery token's used-marker is
+// released so the caller may retry.
+func (h *Handler) beginRecoveryFence(c *gin.Context, userID, recoveryUsedKey, errMsg string) (*credepoch.Op, bool) {
+	ctx := c.Request.Context()
+	if h.credFence == nil {
+		h.log.Error("Recovery blocked: credential fence not wired", "error_class", "fence_missing")
+		h.redis.Del(ctx, recoveryUsedKey)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsg})
+		return nil, false
+	}
+	fenceOp, err := h.credFence.Begin(ctx, userID)
+	if err != nil {
+		h.log.Error("Recovery blocked: fence begin failed", "error_class", "fence_begin")
+		h.redis.Del(ctx, recoveryUsedKey)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+		return nil, false
+	}
+	return fenceOp, true
+}
+
+// recoveryEpochRotationOps locks the user row and rotates the credential
+// epoch (#2201). These MUST be the first ops in every recovery reset: the
+// recovery path takes no user-row lock of its own, and the lock is what
+// serializes the reset against concurrent sensitive-write GuardTx FOR SHARE
+// reads. The SELECT executes via Exec (rows discarded) — the lock is the point.
+func recoveryEpochRotationOps(userID string, fenceOp *credepoch.Op) []recoveryTxOp {
+	return []recoveryTxOp{
+		{
+			`SELECT credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE`,
+			[]interface{}{userID},
+			"Failed to lock user for epoch rotation",
+		},
+		{
+			`UPDATE users SET credential_epoch = $1, updated_at = NOW() WHERE id = $2`,
+			[]interface{}{fenceOp.NewEpochValue(), userID},
+			"Failed to rotate credential epoch",
+		},
+	}
+}
+
 // recoveryPresenceOverrideResetOps discards preference ciphertext encrypted
 // under the pre-recovery password-derived key. Deleting the preference
 // cascades to its materialized exception rows. The shared forced-clear helper
@@ -2312,21 +2461,23 @@ func (h *Handler) recoveryWork(senderID uuid.UUID, ops []recoveryTxOp) recoveryW
 
 // execRecoveryTx owns the typed recovery callback and preserves token
 // semantics across definite rollback versus ambiguous commit classification.
+//
+// fenceOp (#2201) rides the same classification: a pre-commit failure is a
+// DEFINITE rollback (fenceOp.Rollback — the deferred tx.Rollback ran before
+// any commit attempt); completion success is a DEFINITE commit
+// (fenceOp.Commit); a completion error that is not an explicit rollback is
+// AMBIGUOUS — neither is called, the blocked marker's TTL plus DB
+// read-through reconciles to whichever state actually committed.
 func (h *Handler) execRecoveryTx(
 	ctx context.Context,
 	c *gin.Context,
 	recoveryUsedKey string,
 	errMsg string,
+	fenceOp *credepoch.Op,
 	work recoveryWork,
 ) (result recoveryPresenceResult, returnErr error) {
-	tx, err := h.presenceHistory.BeginTx(ctx, nil)
-	if err != nil || tx == nil {
-		if err == nil {
-			err = errors.New("recovery transaction missing")
-		}
-		h.log.Error(errMsgFailedStartTransaction, "error_class", "begin")
-		h.redis.Del(ctx, recoveryUsedKey)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+	tx, err := h.beginRecoveryTx(ctx, c, recoveryUsedKey, errMsg, fenceOp)
+	if err != nil {
 		return result, err
 	}
 	defer tx.Rollback() //nolint:errcheck
@@ -2341,6 +2492,9 @@ func (h *Handler) execRecoveryTx(
 	if err != nil {
 		h.log.Error("Recovery transaction failed", "error_class", "statement")
 		h.redis.Del(ctx, recoveryUsedKey)
+		if fenceOp != nil {
+			fenceOp.Rollback(ctx) // definite: commit was never attempted
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
 		return result, err
 	}
@@ -2357,10 +2511,45 @@ func (h *Handler) execRecoveryTx(
 		h.hub.DisconnectUser(result.Operation.SenderID)
 	}
 	if completion.Err != nil {
+		classifyRecoveryFenceCompletion(ctx, fenceOp, completion.Outcome)
 		h.respondRecoveryPresenceFailure(c, errMsg, completion)
 		return result, completion.Err
 	}
+	if fenceOp != nil {
+		fenceOp.Commit(ctx)
+	}
 	return result, nil
+}
+
+// beginRecoveryTx opens the recovery transaction. A begin failure is a
+// DEFINITE pre-commit failure: it releases the recovery token's used-marker,
+// restores the fence (#2201), and writes the HTTP response.
+func (h *Handler) beginRecoveryTx(ctx context.Context, c *gin.Context, recoveryUsedKey, errMsg string, fenceOp *credepoch.Op) (*sql.Tx, error) {
+	tx, err := h.presenceHistory.BeginTx(ctx, nil)
+	if err == nil && tx != nil {
+		return tx, nil
+	}
+	if err == nil {
+		err = errors.New("recovery transaction missing")
+	}
+	h.log.Error(errMsgFailedStartTransaction, "error_class", "begin")
+	h.redis.Del(ctx, recoveryUsedKey)
+	if fenceOp != nil {
+		fenceOp.Rollback(ctx)
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+	return nil, err
+}
+
+// classifyRecoveryFenceCompletion maps a failed forced-clear completion onto
+// the fence op (#2201): an explicit rollback outcome is DEFINITE (restore the
+// fence); any other completion error is an AMBIGUOUS commit — call neither
+// Commit nor Rollback, so the blocked marker's TTL plus DB read-through
+// reconciles to whichever state actually committed (spec §4.4 step 3c).
+func classifyRecoveryFenceCompletion(ctx context.Context, fenceOp *credepoch.Op, outcome presencehistory.ForcedClearOutcome) {
+	if fenceOp != nil && outcome == presencehistory.ForcedClearRolledBack {
+		fenceOp.Rollback(ctx)
+	}
 }
 
 func (h *Handler) executeRecoveryTransaction(
@@ -2368,10 +2557,14 @@ func (h *Handler) executeRecoveryTransaction(
 	senderID uuid.UUID,
 	recoveryUsedKey string,
 	errMsg string,
+	fenceOp *credepoch.Op,
 	ops []recoveryTxOp,
 ) error {
 	if h.presenceHistory == nil {
 		h.redis.Del(c.Request.Context(), recoveryUsedKey)
+		if fenceOp != nil {
+			fenceOp.Rollback(c.Request.Context())
+		}
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsg})
 		return errors.New("recovery presence history unavailable")
 	}
@@ -2380,12 +2573,15 @@ func (h *Handler) executeRecoveryTransaction(
 		c.Request.Context(), senderID, presencehistory.ForcedSecurityClear, func() error {
 			workStarted = true
 			_, workErr := h.execRecoveryTx(
-				c.Request.Context(), c, recoveryUsedKey, errMsg, h.recoveryWork(senderID, ops),
+				c.Request.Context(), c, recoveryUsedKey, errMsg, fenceOp, h.recoveryWork(senderID, ops),
 			)
 			return workErr
 		})
 	if err != nil && !workStarted {
 		h.redis.Del(c.Request.Context(), recoveryUsedKey)
+		if fenceOp != nil {
+			fenceOp.Rollback(c.Request.Context()) // definite: work never started
+		}
 		h.respondRecoveryReadinessFailure(c, errMsg, err)
 	}
 	return err
@@ -2511,16 +2707,13 @@ func (h *Handler) RecoveryResetPassword(c *gin.Context) {
 		return
 	}
 
-	ops := make([]recoveryTxOp, 0, 5)
-	ops = append(ops,
-		recoveryTxOp{`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
-			[]interface{}{passwordHash, claims.UserID}, "Failed to update password"},
-		recoveryTxOp{`UPDATE user_keys SET wrapped_private_key = $1, key_derivation_salt = $2, key_derivation_alg = $3,
-		         key_version = key_version + 1, updated_at = NOW() WHERE user_id = $4`,
-			[]interface{}{wrappedKey, kdSalt, req.KeyDerivationAlg, claims.UserID}, "Failed to update user keys"},
-	)
-
-	// Optional recovery key upsert
+	// #2201 review: decode the OPTIONAL recovery-key fields BEFORE the fence
+	// side-effect. A bad-base64 field is client input; decoding it after
+	// beginRecoveryFence (as before) let the early return strand the published
+	// blocked: marker, fail-closing this user's HTTP/WS auth for the full 5m
+	// blockedTTL. No transaction has started here, so validating first leaves
+	// the fence untouched on bad input.
+	var recoveryKeyOp *recoveryTxOp
 	if req.RecoveryWrappedPrivateKey != "" && req.RecoveryKeySalt != "" {
 		recKey, recSalt, recPrefsKey, recPrefsSalt, decErr := decodeOptionalRecoveryKeys(
 			req.RecoveryWrappedPrivateKey, req.RecoveryKeySalt, req.RecoveryWrappedPrefsKey, req.RecoveryPrefsKeySalt)
@@ -2529,7 +2722,7 @@ func (h *Handler) RecoveryResetPassword(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": decErr})
 			return
 		}
-		ops = append(ops, recoveryTxOp{
+		recoveryKeyOp = &recoveryTxOp{
 			`INSERT INTO user_recovery_keys (user_id, recovery_wrapped_private_key, recovery_key_salt, recovery_wrapped_prefs_key, recovery_prefs_key_salt)
 			 VALUES ($1, $2, $3, $4, $5)
 			 ON CONFLICT (user_id) DO UPDATE SET
@@ -2538,7 +2731,25 @@ func (h *Handler) RecoveryResetPassword(c *gin.Context) {
 			     recovery_wrapped_prefs_key = EXCLUDED.recovery_wrapped_prefs_key,
 			     recovery_prefs_key_salt = EXCLUDED.recovery_prefs_key_salt,
 			     updated_at = NOW()`,
-			[]interface{}{claims.UserID, recKey, recSalt, recPrefsKey, recPrefsSalt}, "Failed to upsert recovery key"})
+			[]interface{}{claims.UserID, recKey, recSalt, recPrefsKey, recPrefsSalt}, "Failed to upsert recovery key"}
+	}
+
+	fenceOp, ok := h.beginRecoveryFence(c, claims.UserID, recoveryUsedKey, errFailedResetPwd)
+	if !ok {
+		return
+	}
+
+	ops := make([]recoveryTxOp, 0, 7)
+	ops = append(ops, recoveryEpochRotationOps(claims.UserID, fenceOp)...)
+	ops = append(ops,
+		recoveryTxOp{`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
+			[]interface{}{passwordHash, claims.UserID}, "Failed to update password"},
+		recoveryTxOp{`UPDATE user_keys SET wrapped_private_key = $1, key_derivation_salt = $2, key_derivation_alg = $3,
+		         key_version = key_version + 1, updated_at = NOW() WHERE user_id = $4`,
+			[]interface{}{wrappedKey, kdSalt, req.KeyDerivationAlg, claims.UserID}, "Failed to update user keys"},
+	)
+	if recoveryKeyOp != nil {
+		ops = append(ops, *recoveryKeyOp)
 	}
 
 	ops = append(ops, recoveryPresenceOverrideResetOps(claims.UserID)...)
@@ -2547,7 +2758,7 @@ func (h *Handler) RecoveryResetPassword(c *gin.Context) {
 		[]interface{}{claims.UserID}, "Failed to revoke refresh tokens"})
 
 	if err := h.executeRecoveryTransaction(
-		c, senderID, recoveryUsedKey, errFailedResetPwd, ops,
+		c, senderID, recoveryUsedKey, errFailedResetPwd, fenceOp, ops,
 	); err != nil {
 		return
 	}
@@ -2600,7 +2811,13 @@ func (h *Handler) RecoveryResetAccount(c *gin.Context) {
 		return
 	}
 
-	ops := make([]recoveryTxOp, 0, 9)
+	fenceOp, fok := h.beginRecoveryFence(c, claims.UserID, recoveryUsedKey, errFailedResetAccount)
+	if !fok {
+		return
+	}
+
+	ops := make([]recoveryTxOp, 0, 11)
+	ops = append(ops, recoveryEpochRotationOps(claims.UserID, fenceOp)...)
 	ops = append(ops,
 		recoveryTxOp{`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
 			[]interface{}{passwordHash, claims.UserID}, "Failed to update password"},
@@ -2623,7 +2840,7 @@ func (h *Handler) RecoveryResetAccount(c *gin.Context) {
 	})
 
 	if err := h.executeRecoveryTransaction(
-		c, senderID, recoveryUsedKey, errFailedResetAccount, ops,
+		c, senderID, recoveryUsedKey, errFailedResetAccount, fenceOp, ops,
 	); err != nil {
 		return
 	}

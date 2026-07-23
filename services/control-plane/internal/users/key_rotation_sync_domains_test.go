@@ -117,6 +117,7 @@ func TestChangePasswordSyncDomainsRotatesAllPopulatedDomains(t *testing.T) {
 
 	var body struct {
 		SyncDomainVersions map[string]int `json:"sync_domain_versions"`
+		SessionID          string         `json:"session_id"`
 	}
 	testhelpers.ParseJSON(t, w, &body)
 	assert.Equal(t, map[string]int{
@@ -145,11 +146,16 @@ func TestChangePasswordSyncDomainsRotatesAllPopulatedDomains(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, matchesNew)
 
+	// #2201 continuation contract: a successful password change now mints one
+	// fresh session for the acting client (session_id in the response); every
+	// OTHER refresh token must still be revoked atomically.
+	require.NotEmpty(t, body.SessionID, "continuation session_id must be present")
 	var unrevoked int
 	require.NoError(t, ts.DB.QueryRow(
-		`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, user.ID,
+		`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL AND id != $2`,
+		user.ID, body.SessionID,
 	).Scan(&unrevoked))
-	assert.Zero(t, unrevoked, "all refresh tokens must be revoked atomically")
+	assert.Zero(t, unrevoked, "all prior refresh tokens must be revoked atomically (continuation session excepted)")
 }
 
 func TestChangePasswordSyncDomainsAbsentAllVerifiesWithoutCreatingRows(t *testing.T) {
@@ -392,7 +398,7 @@ func TestUpsertE2EEBlobWaitsForPasswordTransaction(t *testing.T) {
 			  AND pid <> pg_backend_pid()
 			  AND state = 'active'
 			  AND wait_event_type = 'Lock'
-			  AND query LIKE '%SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE%'
+			  AND query LIKE '%SELECT credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE%'
 		`).Scan(&waiting)
 		return queryErr == nil && waiting > 0
 	}, 10*time.Second, 25*time.Millisecond,
