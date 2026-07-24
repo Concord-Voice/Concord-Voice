@@ -560,10 +560,10 @@ describe('e2eeService — extended', () => {
               pending_requests: [{ user_id: 'user-new', channel_id: 'ch-pending' }],
             }),
         } as Response)
-        // public key for the new member
+        // public key for the new member (carries the recipient's key_version)
         .mockResolvedValueOnce({
           ok: true,
-          json: () => Promise.resolve({ public_key: pubKeyBase64 }),
+          json: () => Promise.resolve({ public_key: pubKeyBase64, key_version: 7 }),
         } as Response)
         // getChannelKey (for wrapKeyForMember)
         .mockResolvedValueOnce({
@@ -580,6 +580,61 @@ describe('e2eeService — extended', () => {
 
       // Should have made 4 API calls
       expect(mockApiFetch.mock.calls.length).toBe(4);
+
+      // #2420: the distribution POST echoes the recipient's public-key version the
+      // CSK was wrapped against, activating the server-side recipient-freshness guard.
+      const uploadCall = mockApiFetch.mock.calls[3];
+      expect(uploadCall[0]).toBe('/api/v1/e2ee/keys/ch-pending');
+      const uploadBody = JSON.parse((uploadCall[1] as RequestInit).body as string);
+      expect(Object.keys(uploadBody.wrapped_keys)).toEqual(['user-new']);
+      expect(typeof uploadBody.wrapped_keys['user-new']).toBe('string');
+      expect(uploadBody.wrapped_key_versions).toEqual({ 'user-new': 7 });
+    });
+
+    it('omits wrapped_key_versions when the server returns no key_version (#2420 fail-open)', async () => {
+      // An old control-plane's GetPublicKey response has no `key_version`. The
+      // echo must degrade to the legacy insert: wrapped_keys is still sent, but
+      // wrapped_key_versions is omitted so the server does not activate the
+      // recipient-freshness guard against a version it never supplied.
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+
+      mockApiFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              pending_requests: [{ user_id: 'user-new', channel_id: 'ch-pending' }],
+            }),
+        } as Response)
+        // public key WITHOUT key_version (legacy server)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ public_key: pubKeyBase64 }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser } }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({}),
+        } as Response);
+
+      await e2eeService.processPendingKeyRequests();
+
+      const uploadCall = mockApiFetch.mock.calls[3];
+      expect(uploadCall[0]).toBe('/api/v1/e2ee/keys/ch-pending');
+      const uploadBody = JSON.parse((uploadCall[1] as RequestInit).body as string);
+      expect(Object.keys(uploadBody.wrapped_keys)).toEqual(['user-new']);
+      expect(uploadBody.wrapped_key_versions).toBeUndefined();
     });
 
     it('handles empty pending requests', async () => {

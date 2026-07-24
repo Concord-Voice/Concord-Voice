@@ -947,16 +947,24 @@ class E2EEService {
             continue;
           }
 
-          const pkData = await safeJson<{ public_key: string }>(pkRes);
+          const pkData = await safeJson<{ public_key: string; key_version?: number }>(pkRes);
           const wrappedKey = await this.wrapKeyForMember(req.channel_id, pkData.public_key);
 
-          // Upload the wrapped key
+          // Upload the wrapped key. Echo the recipient's public-key version the CSK
+          // was wrapped against (#2420) so the server's recipient-freshness guard
+          // can skip + self-heal-enqueue a wrap that raced a concurrent key reset.
+          // Omitted when the server didn't return a version (fail-open, old server).
+          const uploadBody: {
+            wrapped_keys: Record<string, string>;
+            wrapped_key_versions?: Record<string, number>;
+          } = { wrapped_keys: { [req.user_id]: wrappedKey } };
+          if (pkData.key_version !== undefined) {
+            uploadBody.wrapped_key_versions = { [req.user_id]: pkData.key_version };
+          }
           const uploadRes = await apiFetch(`/api/v1/e2ee/keys/${req.channel_id}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              wrapped_keys: { [req.user_id]: wrappedKey },
-            }),
+            body: JSON.stringify(uploadBody),
           });
           console.debug(
             '[E2EE] Key distributed for',
