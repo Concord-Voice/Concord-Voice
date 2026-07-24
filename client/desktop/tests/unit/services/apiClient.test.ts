@@ -201,6 +201,89 @@ describe('apiClient', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
+  // #2425: a delayed pre-rotation 401 must not tear down a session that was
+  // rotated (T1/S1/G -> T2/S1/G) after the request was issued. requestLifecycleIsCurrent
+  // now requires the exact captured token + session, not merely a live generation.
+  describe('#2425 stale pre-refresh 401 teardown guard', () => {
+    // Deferred fetch + a "fetch dispatched" barrier so the rotation deterministically
+    // lands while the original request is in-flight, then the 401 is delivered AFTER
+    // it — independent of apiFetch's internal await ordering (attestation lookup etc.).
+    function deferredFetch(): { started: Promise<void>; resolve: (r: Response) => void } {
+      let resolve!: (r: Response) => void;
+      let markStarted!: () => void;
+      const started = new Promise<void>((r) => {
+        markStarted = r;
+      });
+      mockFetch.mockImplementationOnce(() => {
+        markStarted();
+        return new Promise<Response>((r) => {
+          resolve = r;
+        });
+      });
+      // resolve is assigned when the mock is invoked (after `started`); wrap it so
+      // callers read the live closure binding rather than its undefined value here.
+      return { started, resolve: (r: Response) => resolve(r) };
+    }
+
+    it('does not refresh or tear down when the access token rotated after the request', async () => {
+      const g = useAuthStore.getState().beginAuthLifecycle('T1', 'S1');
+      const refreshToken = vi.fn();
+      globalThis.electron = { refreshToken } as any;
+      const fetchCtl = deferredFetch();
+
+      const pending = apiFetch('/api/v1/users/me');
+      await fetchCtl.started; // request dispatched with T1/S1/g
+      // A successful refresh on another path rotated T1 -> T2, preserving generation.
+      useAuthStore.getState().rotateAuthCredentials(g, 'T2', 'S1');
+      fetchCtl.resolve(new Response('unauthorized', { status: 401 }));
+      const response = await pending;
+
+      expect(response.status).toBe(401);
+      expect(refreshToken).not.toHaveBeenCalled();
+      expect(mockGracefulReset).not.toHaveBeenCalled();
+      expect(mockNuclearReset).not.toHaveBeenCalled();
+      // Rotated credentials + generation are intact.
+      expect(useAuthStore.getState().accessToken).toBe('T2');
+      expect(useAuthStore.getState().authGeneration).toBe(g);
+    });
+
+    it('does not tear down when the session ID changed within the generation', async () => {
+      const g = useAuthStore.getState().beginAuthLifecycle('T1', 'S1');
+      const refreshToken = vi.fn();
+      globalThis.electron = { refreshToken } as any;
+      const fetchCtl = deferredFetch();
+
+      const pending = apiFetch('/api/v1/users/me');
+      await fetchCtl.started; // request dispatched with T1/S1/g
+      // Same token, session S1 -> S2 within the same generation.
+      useAuthStore.getState().rotateAuthCredentials(g, 'T1', 'S2');
+      fetchCtl.resolve(new Response('unauthorized', { status: 401 }));
+      const response = await pending;
+
+      expect(response.status).toBe(401);
+      expect(refreshToken).not.toHaveBeenCalled();
+      expect(mockGracefulReset).not.toHaveBeenCalled();
+      expect(mockNuclearReset).not.toHaveBeenCalled();
+    });
+
+    it('still tears down when a request with the CURRENT rotated credentials 401s (revocation preserved)', async () => {
+      const g = useAuthStore.getState().beginAuthLifecycle('T1', 'S1');
+      useAuthStore.getState().rotateAuthCredentials(g, 'T2', 'S1'); // current is now T2/S1/g
+      useAuthStore.getState().setRememberMe(false);
+      globalThis.electron = {
+        refreshToken: vi.fn().mockResolvedValue({ status: 'error' }),
+      } as any;
+      mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+
+      // A NEW request captures the current T2/S1/g and is not rotated away from.
+      const response = await apiFetch('/api/v1/users/me');
+
+      expect(response.status).toBe(401);
+      // Current-credential authoritative 401 with a failed refresh still tears down.
+      expect(mockNuclearReset).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('passes through request init options', async () => {
     mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
 

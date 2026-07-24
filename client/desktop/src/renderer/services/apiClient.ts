@@ -286,11 +286,28 @@ function applyRefreshedCredentials(
     .rotateAuthCredentials(lifecycle.authGeneration, result.accessToken, nextSessionId);
 }
 
+/**
+ * Whether a request's response still belongs to the EXACT credentials that
+ * issued it — the gate for destructive recovery/teardown (#2425). Unlike
+ * authLifecyclesMatch (generation-only, correct for refresh single-flight and
+ * cooldown ownership), this requires the captured accessToken and sessionId to
+ * still be current, because a successful refresh intentionally PRESERVES
+ * authGeneration across a T1/S1/G -> T2/S1/G rotation. A generation-only check
+ * would let a delayed pre-rotation 401 (still passing "generation current")
+ * enter the cooldown and tear down the freshly rotated session. Generation is
+ * still required, to prevent credential ABA across separate login lifecycles.
+ */
 function requestLifecycleIsCurrent(
   snapshot: AuthLifecycleSnapshot,
   signal?: AbortSignal | null
 ): boolean {
-  return signal?.aborted !== true && authLifecycleIsCurrent(snapshot);
+  if (signal?.aborted === true) return false;
+  const current = useAuthStore.getState();
+  return (
+    current.authGeneration === snapshot.authGeneration &&
+    current.accessToken === snapshot.accessToken &&
+    current.sessionId === snapshot.sessionId
+  );
 }
 
 function refreshedRequestLifecycleIsCurrent(
