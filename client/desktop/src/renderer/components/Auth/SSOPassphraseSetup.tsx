@@ -35,7 +35,7 @@ import {
 } from '../../services/runtimeServerBase';
 import { useSSOFlow } from '../../hooks/useSSOFlow';
 import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
-import { e2eeService } from '../../services/e2eeService';
+import { e2eeService, type E2EEInitializationReceipt } from '../../services/e2eeService';
 import { E2EEInitTeardownError } from '../../services/e2eeErrors';
 import { errorMessage } from '../../utils/redactError';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
@@ -180,8 +180,7 @@ const SSOPassphraseSetup: React.FC = () => {
     let credentialOwner: CredentialOwner | null = null;
     let needsSSOUnlock = false;
     let admittedGeneration: number | null = null;
-    let flowInitializationReceipt: ReturnType<typeof e2eeService.captureInitializationReceipt> =
-      null;
+    let flowInitializationReceipt: E2EEInitializationReceipt | null = null;
 
     const clearFlowSessionKeys = () => {
       e2eeService.clearKeysIfInitializationCurrent(flowInitializationReceipt);
@@ -232,7 +231,16 @@ const SSOPassphraseSetup: React.FC = () => {
     ): Promise<void> => {
       let staleCleanup: Promise<void> | null;
       try {
-        await e2eeService.initialize(
+        // #2423: initialize() returns THIS invocation's commit receipt (null if
+        // its guard declined the commit), captured BEFORE the stale-attempt
+        // cleanup below. Otherwise a request that goes stale in the microtask
+        // window between the synchronous key commit and this check would run
+        // cleanupIssuedSession() -> clearFlowSessionKeys() against a still-null
+        // receipt, leaving the just-committed keyset resident (CWE-212). The
+        // returned receipt is null when no keyset committed, and
+        // clearKeysIfInitializationCurrent is identity+attempt-guarded, so it can
+        // never erase a successor's keys.
+        flowInitializationReceipt = await e2eeService.initialize(
           passphrase,
           keys.wrappedPrivateKey,
           keys.keyDerivationSalt,
@@ -240,15 +248,6 @@ const SSOPassphraseSetup: React.FC = () => {
           { signal: new AbortController().signal, isCurrent: requestIsCurrent },
           teardownEpoch
         );
-        // Capture the receipt the instant initialize() resolves — BEFORE the
-        // stale-attempt cleanup below. Otherwise a request that goes stale in the
-        // microtask window between initialize()'s synchronous key commit and this
-        // check runs cleanupIssuedSession() -> clearFlowSessionKeys() against a
-        // still-null receipt, leaving the just-committed keyset resident (CWE-212).
-        // captureInitializationReceipt() returns null when no keyset committed, and
-        // clearKeysIfInitializationCurrent is identity+attempt-guarded, so an early
-        // capture can never erase a successor's keys.
-        flowInitializationReceipt = e2eeService.captureInitializationReceipt();
         staleCleanup = staleAttemptCleanup();
         if (staleCleanup) {
           await staleCleanup;

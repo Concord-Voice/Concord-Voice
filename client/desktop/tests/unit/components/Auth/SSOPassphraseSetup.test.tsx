@@ -52,15 +52,12 @@ vi.mock('@/renderer/services/e2eeService', () => ({
     initialize: vi.fn(async () => {
       e2eeState.initialized = true;
       e2eeState.attempt += 1;
+      // #2423: initialize() returns THIS invocation's receipt.
+      return { sessionKeys: e2eeState.sessionKeys, attempt: e2eeState.attempt };
     }),
     captureTeardownEpoch: vi.fn().mockReturnValue(0),
     wasTornDownSince: vi.fn().mockReturnValue(false),
     getSessionKeys: vi.fn(() => (e2eeState.initialized ? e2eeState.sessionKeys : null)),
-    captureInitializationReceipt: vi.fn(() =>
-      e2eeState.initialized
-        ? { sessionKeys: e2eeState.sessionKeys, attempt: e2eeState.attempt }
-        : null
-    ),
     clearKeysIfInitializationCurrent: vi.fn(
       (receipt: { sessionKeys: typeof e2eeState.sessionKeys; attempt: number } | null) => {
         if (
@@ -108,16 +105,13 @@ beforeEach(() => {
   vi.mocked(e2eeService.initialize).mockImplementation(async () => {
     e2eeState.initialized = true;
     e2eeState.attempt += 1;
+    // #2423: initialize() returns THIS invocation's receipt.
+    return { sessionKeys: e2eeState.sessionKeys, attempt: e2eeState.attempt };
   });
   vi.mocked(e2eeService.captureTeardownEpoch).mockReturnValue(0);
   vi.mocked(e2eeService.wasTornDownSince).mockReturnValue(false);
   vi.mocked(e2eeService.getSessionKeys).mockImplementation(() =>
     e2eeState.initialized ? e2eeState.sessionKeys : null
-  );
-  vi.mocked(e2eeService.captureInitializationReceipt).mockImplementation(() =>
-    e2eeState.initialized
-      ? { sessionKeys: e2eeState.sessionKeys, attempt: e2eeState.attempt }
-      : null
   );
   vi.mocked(e2eeService.clearKeysIfInitializationCurrent).mockImplementation((receipt) => {
     if (

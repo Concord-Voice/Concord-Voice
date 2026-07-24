@@ -35,7 +35,7 @@ import {
   captureAuthSession,
 } from '../../services/apiClient';
 import { type KeyDerivationAlgorithm } from '../../utils/crypto';
-import { e2eeService } from '../../services/e2eeService';
+import { e2eeService, type E2EEInitializationReceipt } from '../../services/e2eeService';
 import { E2EEInitTeardownError } from '../../services/e2eeErrors';
 import {
   captureRuntimeServerSelection,
@@ -132,8 +132,7 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
       requestAuthGeneration !== undefined &&
       useAuthStore.getState().authGeneration === requestAuthGeneration &&
       runtimeServerSelectionIsCurrent(requestSelection);
-    let flowInitializationReceipt: ReturnType<typeof e2eeService.captureInitializationReceipt> =
-      null;
+    let flowInitializationReceipt: E2EEInitializationReceipt | null = null;
 
     // Step-isolated error handling so we can distinguish six failure sources
     // and only count true "incorrect passphrase" against the lockout counter.
@@ -200,7 +199,11 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
 
     // The ONLY step that counts toward the wrong-passphrase lockout.
     try {
-      await e2eeService.initialize(
+      // #2423: initialize() returns THIS invocation's commit receipt (or null if
+      // its guard declined the commit), so the receipt records exactly the keys
+      // this call committed — never a successor's ambient state. A later cleanup
+      // via clearKeysIfInitializationCurrent therefore cannot clear a successor.
+      flowInitializationReceipt = await e2eeService.initialize(
         passphrase,
         wrappedPrivateKey,
         salt,
@@ -215,11 +218,6 @@ const SSOEagerUnlock: React.FC<Props> = ({ onUnlock, onSocialRecovery }) => {
         setSubmitting(false);
         return;
       }
-      // Capture only after proving this continuation still owns auth. The
-      // receipt also records the service attempt, so a later cleanup cannot
-      // clear a successor that has merely STARTED initialization but has not
-      // committed its keys yet.
-      flowInitializationReceipt = e2eeService.captureInitializationReceipt();
     } catch (err) {
       // A teardown mid-unlock (401 -> nuclearReset) is a dead-session signal,
       // NOT a wrong passphrase — never charge it against the lockout counter

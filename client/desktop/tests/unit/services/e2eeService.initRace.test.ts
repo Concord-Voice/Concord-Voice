@@ -221,19 +221,20 @@ describe('e2eeService fresh-login init/teardown race (#2199 / CWE-212)', () => {
 
     // The valid successor must still complete — the stale continuation did not
     // cancel it.
-    await expect(successorPromise).resolves.toBeUndefined();
+    await expect(successorPromise).resolves.not.toBeNull();
     expect(e2eeService.isInitialized).toBe(true);
     expect(useE2EEStore.getState().ready).toBe(true);
   });
 
   it('an old initialization receipt cannot clear a newer committed keyset', async () => {
     const firstKeys = await generateRegistrationKeys(password);
-    await e2eeService.initialize(
+    // #2423: the receipt now comes from initialize()'s own return, not a post-hoc
+    // capture of ambient state.
+    const firstReceipt = await e2eeService.initialize(
       password,
       firstKeys.wrappedPrivateKey,
       firstKeys.keyDerivationSalt
     );
-    const firstReceipt = e2eeService.captureInitializationReceipt();
     expect(firstReceipt).not.toBeNull();
 
     const successorPassword = 'SuccessorPassword123!'; // pragma: allowlist secret
@@ -253,12 +254,13 @@ describe('e2eeService fresh-login init/teardown race (#2199 / CWE-212)', () => {
 
   it('an old initialization receipt cannot abort a newer in-flight initializer', async () => {
     const firstKeys = await generateRegistrationKeys(password);
-    await e2eeService.initialize(
+    // #2423: the receipt now comes from initialize()'s own return, not a post-hoc
+    // capture of ambient state.
+    const firstReceipt = await e2eeService.initialize(
       password,
       firstKeys.wrappedPrivateKey,
       firstKeys.keyDerivationSalt
     );
-    const firstReceipt = e2eeService.captureInitializationReceipt();
     expect(firstReceipt).not.toBeNull();
 
     const successorPassword = 'SuccessorPassword123!'; // pragma: allowlist secret
@@ -273,7 +275,37 @@ describe('e2eeService fresh-login init/teardown race (#2199 / CWE-212)', () => {
     // The old keyset is still resident here, so key identity alone is
     // insufficient; the attempt check must protect the in-flight successor.
     expect(e2eeService.clearKeysIfInitializationCurrent(firstReceipt)).toBe(false);
-    await expect(successorPromise).resolves.toBeUndefined();
+    await expect(successorPromise).resolves.not.toBeNull();
+    expect(e2eeService.isInitialized).toBe(true);
+    expect(useE2EEStore.getState().ready).toBe(true);
+  });
+
+  it('a guard-declined initialize() returns null, not a resident successor receipt (#2423)', async () => {
+    // A successor keyset is already committed and resident.
+    const residentKeys = await generateRegistrationKeys(password);
+    const residentReceipt = await e2eeService.initialize(
+      password,
+      residentKeys.wrappedPrivateKey,
+      residentKeys.keyDerivationSalt
+    );
+    expect(residentReceipt).not.toBeNull();
+    const residentSession = e2eeService.getSessionKeys();
+
+    // A stale flow runs with an already-false guard, so its commit is declined.
+    // A post-hoc ambient capture would have returned the resident receipt; the
+    // invocation-owned contract must return null instead.
+    const staleKeys = await generateRegistrationKeys('StaleFlowPassword123!'); // pragma: allowlist secret
+    const declinedReceipt = await e2eeService.initialize(
+      'StaleFlowPassword123!', // pragma: allowlist secret
+      staleKeys.wrappedPrivateKey,
+      staleKeys.keyDerivationSalt,
+      'argon2id',
+      { signal: new AbortController().signal, isCurrent: () => false }
+    );
+
+    expect(declinedReceipt).toBeNull();
+    // The resident keyset is untouched — the declined flow never superseded it.
+    expect(e2eeService.getSessionKeys()).toBe(residentSession);
     expect(e2eeService.isInitialized).toBe(true);
     expect(useE2EEStore.getState().ready).toBe(true);
   });

@@ -1,7 +1,11 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { z } from 'zod';
 import { unwrapLoginKeys, generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
-import { e2eeService, type E2EEInitializationGuard } from '../../services/e2eeService';
+import {
+  e2eeService,
+  type E2EEInitializationGuard,
+  type E2EEInitializationReceipt,
+} from '../../services/e2eeService';
 import { E2EEInitTeardownError } from '../../services/e2eeErrors';
 import { errorMessage } from '../../utils/redactError';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
@@ -641,10 +645,10 @@ const Login: React.FC<LoginProps> = ({
     abortForOriginChange: () => Promise<never>,
     initializationGuard: E2EEInitializationGuard,
     requireFlowOwnership: () => Promise<void>,
-    // Set the caller's flowInitializationReceipt the instant the recovery
-    // initialize() commits, so an ownership/origin abort inside this helper wipes
-    // the committed keyset instead of no-op'ing on a null receipt (CWE-212).
-    captureFlowReceipt: () => void
+    // Set the caller's flowInitializationReceipt from the recovery initialize()'s
+    // OWN returned receipt (#2423), so an ownership/origin abort inside this helper
+    // wipes the committed keyset instead of no-op'ing on a null receipt (CWE-212).
+    captureFlowReceipt: (receipt: E2EEInitializationReceipt | null) => void
   ): Promise<boolean> => {
     // Clear ONLY this flow's own early-set access token — never a successor's.
     // Deduplicated from the two reset-error branches below and kept out of the
@@ -749,7 +753,7 @@ const Login: React.FC<LoginProps> = ({
         await abortForOriginChange();
       }
       await requireFlowOwnership();
-      await e2eeService.initialize(
+      const recoveryReceipt = await e2eeService.initialize(
         formData.password,
         newKeys.wrappedPrivateKey,
         newKeys.keyDerivationSalt,
@@ -757,7 +761,7 @@ const Login: React.FC<LoginProps> = ({
         initializationGuard,
         teardownEpoch
       );
-      captureFlowReceipt();
+      captureFlowReceipt(recoveryReceipt);
       if (!runtimeServerSelectionIsCurrent(requestSelection)) {
         await abortForOriginChange();
       }
@@ -838,8 +842,7 @@ const Login: React.FC<LoginProps> = ({
         await globalThis.electron?.clearTokensIfOwner?.(credentialOwner);
       }
     };
-    let flowInitializationReceipt: ReturnType<typeof e2eeService.captureInitializationReceipt> =
-      null;
+    let flowInitializationReceipt: E2EEInitializationReceipt | null = null;
     const clearFlowSessionKeys = () => {
       e2eeService.clearKeysIfInitializationCurrent(flowInitializationReceipt);
     };
@@ -932,8 +935,16 @@ const Login: React.FC<LoginProps> = ({
           kdAlg
         );
         await fenceOriginAndOwnership();
-        // e2eeService.initialize handles PBKDF2→Argon2id migration automatically
-        await e2eeService.initialize(
+        // e2eeService.initialize handles PBKDF2→Argon2id migration automatically.
+        // #2423: initialize() returns THIS invocation's commit receipt (null if
+        // its guard declined the commit), captured BEFORE the origin/ownership
+        // re-checks below. Otherwise, if ownership is lost in the microtask window
+        // between the synchronous key commit and requireFlowOwnership(), the
+        // abort's clearFlowSessionKeys() would run against a still-null receipt
+        // and could not wipe the committed keyset (CWE-212). The returned receipt
+        // is null when no keyset committed, and clearKeysIfInitializationCurrent is
+        // identity+attempt-guarded, so it can never erase a successor's keys.
+        flowInitializationReceipt = await e2eeService.initialize(
           formData.password,
           data.e2ee_keys.wrapped_private_key,
           data.e2ee_keys.key_derivation_salt,
@@ -941,15 +952,6 @@ const Login: React.FC<LoginProps> = ({
           initializationGuard,
           teardownEpoch
         );
-        // Capture the receipt the instant initialize() resolves — BEFORE the
-        // origin/ownership re-checks below. Otherwise, if ownership is lost in the
-        // microtask window between initialize()'s synchronous key commit and
-        // requireFlowOwnership(), the abort's clearFlowSessionKeys() runs against a
-        // still-null receipt and cannot wipe the committed keyset (CWE-212).
-        // captureInitializationReceipt() returns null when no keyset committed, and
-        // clearKeysIfInitializationCurrent is identity+attempt-guarded, so an early
-        // capture can never erase a successor's keys.
-        flowInitializationReceipt = e2eeService.captureInitializationReceipt();
         await fenceOriginAndOwnership();
         console.debug('Private key unwrapped and E2EE service initialized!');
         return true;
@@ -980,8 +982,8 @@ const Login: React.FC<LoginProps> = ({
           abortForOriginChange,
           initializationGuard,
           requireFlowOwnership,
-          () => {
-            flowInitializationReceipt = e2eeService.captureInitializationReceipt();
+          (receipt) => {
+            flowInitializationReceipt = receipt;
           }
         );
         if (!recovered) return false;

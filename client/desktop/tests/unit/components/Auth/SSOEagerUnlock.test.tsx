@@ -31,7 +31,6 @@ vi.mock('@/renderer/services/e2eeService', () => ({
     captureTeardownEpoch: vi.fn().mockReturnValue(0),
     wasTornDownSince: vi.fn().mockReturnValue(false),
     getSessionKeys: vi.fn().mockReturnValue(mockSessionKeys),
-    captureInitializationReceipt: vi.fn().mockReturnValue(mockInitializationReceipt),
     clearKeysIfInitializationCurrent: (...args: unknown[]) => mockE2eeClearKeys(...args),
     clearKeys: (...args: unknown[]) => mockE2eeClearKeys(...args),
   },
@@ -94,7 +93,8 @@ describe('SSOEagerUnlock', () => {
       json: async () => makeKeysResponse(),
       text: async () => JSON.stringify(makeKeysResponse()),
     });
-    mockE2eeInitialize.mockResolvedValueOnce(undefined);
+    // #2423: initialize() resolves THIS invocation's receipt.
+    mockE2eeInitialize.mockResolvedValueOnce(mockInitializationReceipt);
 
     const onUnlock = vi.fn();
     render(<SSOEagerUnlock onUnlock={onUnlock} onSocialRecovery={vi.fn()} />);

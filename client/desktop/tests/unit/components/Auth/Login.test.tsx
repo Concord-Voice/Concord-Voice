@@ -46,12 +46,11 @@ vi.mock('@/renderer/utils/crypto', () => ({
 
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
-    initialize: vi.fn().mockResolvedValue(undefined),
+    initialize: vi.fn().mockResolvedValue(mockE2EEInitializationReceipt),
     clearKeys: mockE2EEClearKeys,
     captureTeardownEpoch: vi.fn().mockReturnValue(0),
     wasTornDownSince: vi.fn().mockReturnValue(false),
     getSessionKeys: vi.fn().mockReturnValue(mockE2EESessionKeys),
-    captureInitializationReceipt: vi.fn().mockReturnValue(mockE2EEInitializationReceipt),
     clearKeysIfInitializationCurrent: vi.fn((receipt: unknown) => {
       if (receipt !== mockE2EEInitializationReceipt) return false;
       mockE2EEClearKeys();

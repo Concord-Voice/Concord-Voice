@@ -180,8 +180,8 @@ class E2EEService {
     _keyDerivationAlg: KeyDerivationAlgorithm = 'argon2id',
     guard?: E2EEInitializationGuard,
     sinceEpoch?: number
-  ): Promise<void> {
-    if (!initializationIsCurrent(guard)) return;
+  ): Promise<E2EEInitializationReceipt | null> {
+    if (!initializationIsCurrent(guard)) return null;
     // Snapshot the key-CLEAR generation BEFORE the (slow) derivation begins —
     // or adopt the caller-captured epoch (captureTeardownEpoch) when provided.
     // The fresh-login callers (Login/Register/SSOEagerUnlock/SSOPassphraseSetup)
@@ -210,9 +210,11 @@ class E2EEService {
     // initAttemptSequence field comment).
     const attempt = ++this.initAttemptSequence;
     // Entry gate: re-validate (guard + supersession) before any derivation work.
-    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return null;
     const saltBytes = new Uint8Array(base64ToArrayBuffer(saltBase64));
-    await this.initializeWithArgon2id(
+    // Return the invocation-owned receipt (or null on a guard-declined commit) so
+    // auth flows use THIS call's committed keys, never ambient singleton state (#2423).
+    return this.initializeWithArgon2id(
       password,
       wrappedPrivateKeyBase64,
       saltBytes,
@@ -220,7 +222,6 @@ class E2EEService {
       attempt,
       guard
     );
-
     // No periodic cleanup needed — session-scoped cache (keys stay until rotation or logout)
   }
 
@@ -290,13 +291,13 @@ class E2EEService {
     startGeneration: number,
     attempt: number,
     guard?: E2EEInitializationGuard
-  ): Promise<void> {
+  ): Promise<E2EEInitializationReceipt | null> {
     const exportableWrapping = await deriveKeyArgon2idExportable(password, salt);
-    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return null;
     const exportablePrefs = await derivePreferencesKeyArgon2idExportable(password, salt);
-    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return null;
 
-    await this.finalizeKeys(
+    return this.finalizeKeys(
       exportableWrapping,
       exportablePrefs,
       wrappedPrivateKeyBase64,
@@ -316,11 +317,11 @@ class E2EEService {
     startGeneration: number,
     attempt: number,
     guard?: E2EEInitializationGuard
-  ): Promise<void> {
+  ): Promise<E2EEInitializationReceipt | null> {
     const wrappingRaw = await crypto.subtle.exportKey('raw', exportableWrapping);
-    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return null;
     const prefsRaw = await crypto.subtle.exportKey('raw', exportablePrefs);
-    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return null;
 
     // Re-import into locals first. No singleton field changes until every
     // asynchronous step is complete and the initiating account is still current.
@@ -331,7 +332,7 @@ class E2EEService {
       false,
       ['wrapKey', 'unwrapKey']
     );
-    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return null;
     const preferencesKey = await crypto.subtle.importKey(
       'raw',
       prefsRaw,
@@ -339,7 +340,7 @@ class E2EEService {
       false,
       ['encrypt', 'decrypt']
     );
-    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return;
+    if (!this.assertInitCommitCurrent(startGeneration, attempt, guard)) return null;
 
     const sessionKeys: E2EESessionKeys = {
       wrappingKeyBase64: arrayBufferToBase64(wrappingRaw),
@@ -359,6 +360,12 @@ class E2EEService {
     // (#270 Task 21b) can transition past SSOEagerUnlock. Source of truth
     // remains this service — the store is a downstream subscription point.
     useE2EEStore.getState().setReady(true);
+
+    // #2423: construct the receipt from THIS invocation's local sessionKeys +
+    // attempt at the synchronous commit point, so the caller receives provenance
+    // for exactly the keys it committed — never a successor's ambient state.
+    const receipt: E2EEInitializationReceipt = { sessionKeys, attempt };
+    return receipt;
   }
 
   /**
@@ -422,12 +429,6 @@ class E2EEService {
    */
   getSessionKeys(): E2EESessionKeys | null {
     return this.sessionKeys;
-  }
-
-  /** Capture the exact committed initialization currently held by the singleton. */
-  captureInitializationReceipt(): E2EEInitializationReceipt | null {
-    if (this.sessionKeys === null || this.sessionKeysInitAttempt === null) return null;
-    return { sessionKeys: this.sessionKeys, attempt: this.sessionKeysInitAttempt };
   }
 
   /**
