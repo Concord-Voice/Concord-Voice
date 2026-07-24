@@ -17,6 +17,11 @@ const (
 	pendingOperationGrace = 30 * time.Second
 	commitReadbackTimeout = 3 * time.Second
 	senderGateStripes     = 64
+
+	// Version 8 is the RFC 9562 application-defined UUID space. Topology
+	// operations use it as durable kind evidence when the settings marker is
+	// later repaired or corrupted and the same-version relation is ambiguous.
+	topologyOperationUUIDVersion uuid.Version = 8
 )
 
 // ErrPendingOperationEligible tells the caller to roll back and hand the
@@ -34,6 +39,13 @@ const (
 	ForcedSecurityClear
 )
 
+type audienceOperationKind uint8
+
+const (
+	audienceSettingsOperation audienceOperationKind = iota
+	audienceTopologyOperation
+)
+
 // DeliveryMode selects exact audience reconciliation or a conservative reset.
 type DeliveryMode uint8
 
@@ -47,6 +59,7 @@ const (
 // AudienceOperation is the complete durable evidence needed to classify the
 // main transaction and perform acknowledged delivery.
 type AudienceOperation struct {
+	kind                         audienceOperationKind
 	ID                           uuid.UUID
 	SenderID                     uuid.UUID
 	PriorVersion                 int64
@@ -72,6 +85,22 @@ type DeliveryPlan struct {
 	UpdateRecipients map[uuid.UUID]bool
 	Payload          *CustomTextState
 	OverrideVersion  *int
+}
+
+// TopologyAudience captures the authorized Custom Status audience on both
+// sides of one graph mutation for a sender already present in a topology batch.
+type TopologyAudience struct {
+	SenderID uuid.UUID
+	Before   map[uuid.UUID]bool
+	After    map[uuid.UUID]bool
+}
+
+// TopologyBatch is opaque transaction and delivery evidence. Callers prepare
+// it before topology locks, attach the in-transaction audiences, and pass the
+// resulting value to CompleteTopologyBatch.
+type TopologyBatch struct {
+	operations []AudienceOperation
+	plans      []DeliveryPlan
 }
 
 // DeliveryAck authorizes marker removal only for the matching operation.
@@ -206,7 +235,10 @@ func (s *Service) BeginAudienceOperation(
 	if err != nil {
 		return AudienceOperation{}, err
 	}
-	if err := validateAudienceOperationReadiness(mode, pending, now); err != nil {
+	pendingIsTopology := pending.exists && (isTopologyOperationID(pending.operationID) ||
+		prior.marker.Valid && prior.marker.UUID == pending.operationID &&
+			prior.version == pending.priorVersion)
+	if err := validateAudienceOperationReadiness(mode, pending, pendingIsTopology, now); err != nil {
 		return AudienceOperation{}, err
 	}
 	if prior.version == math.MaxInt64 {
@@ -248,6 +280,296 @@ func (s *Service) BeginAudienceOperation(
 		operation.PriorOperationID = &value
 	}
 	return operation, nil
+}
+
+// BeginTopologyBatch writes one same-version durable marker per distinct
+// sender in deterministic UUID order. The caller must hold the matching
+// process-local sender gates and must not acquire topology locks first.
+func (s *Service) BeginTopologyBatch(
+	ctx context.Context,
+	tx *sql.Tx,
+	senderIDs []uuid.UUID,
+) (TopologyBatch, error) {
+	if s == nil || tx == nil {
+		return TopologyBatch{}, errors.New("topology batch unavailable")
+	}
+	ordered, err := canonicalTopologySenders(senderIDs)
+	if err != nil {
+		return TopologyBatch{}, err
+	}
+	batch := TopologyBatch{operations: make([]AudienceOperation, 0, len(ordered))}
+	for _, senderID := range ordered {
+		operation, beginErr := s.beginTopologyOperation(ctx, tx, senderID)
+		if beginErr != nil {
+			return TopologyBatch{}, fmt.Errorf("begin topology audience operation: %w", beginErr)
+		}
+		batch.operations = append(batch.operations, operation)
+	}
+	return batch, nil
+}
+
+func canonicalTopologySenders(senderIDs []uuid.UUID) ([]uuid.UUID, error) {
+	if len(senderIDs) == 0 || len(senderIDs) > maxReconcileBatch {
+		return nil, errors.New("invalid topology sender batch")
+	}
+	seen := make(map[uuid.UUID]struct{}, len(senderIDs))
+	ordered := make([]uuid.UUID, 0, len(senderIDs))
+	for _, senderID := range senderIDs {
+		if senderID == uuid.Nil {
+			return nil, errors.New("invalid topology sender")
+		}
+		if _, exists := seen[senderID]; exists {
+			continue
+		}
+		seen[senderID] = struct{}{}
+		ordered = append(ordered, senderID)
+	}
+	sort.Slice(ordered, func(left, right int) bool {
+		return ordered[left].String() < ordered[right].String()
+	})
+	return ordered, nil
+}
+
+func (s *Service) beginTopologyOperation(
+	ctx context.Context,
+	tx *sql.Tx,
+	senderID uuid.UUID,
+) (AudienceOperation, error) {
+	prior, err := lockAudienceOperationPrior(ctx, tx, senderID)
+	if err != nil {
+		return AudienceOperation{}, err
+	}
+	pending, err := lockAudienceOperationPending(ctx, tx, senderID)
+	if err != nil {
+		return AudienceOperation{}, err
+	}
+	now, err := readAudienceOperationClock(ctx, tx)
+	if err != nil {
+		return AudienceOperation{}, err
+	}
+	if err := validateTopologyOperationReadiness(pending, now); err != nil {
+		return AudienceOperation{}, err
+	}
+
+	operationID := newTopologyOperationID()
+	if err := writeAudienceOperationPending(
+		ctx, tx, senderID, operationID, prior.version, now, pending.exists,
+	); err != nil {
+		return AudienceOperation{}, err
+	}
+	if err := writeTopologyOperationMarker(ctx, tx, senderID, operationID, now); err != nil {
+		return AudienceOperation{}, err
+	}
+
+	operation := AudienceOperation{
+		kind:           audienceTopologyOperation,
+		ID:             operationID,
+		SenderID:       senderID,
+		PriorVersion:   prior.version,
+		Version:        prior.version,
+		ReconcileAfter: now.Add(pendingOperationGrace),
+		Before: normalizeCustomTextState(CustomTextState{
+			Text:  nullableString(prior.text),
+			Emoji: nullableString(prior.emoji),
+		}),
+		BeforeTier:                   prior.tier,
+		BeforeMasterEnabled:          prior.masterEnabled,
+		BeforeServerVoiceTier:        prior.serverVoiceTier,
+		BeforeServerVoiceShowDetails: prior.serverVoiceShowDetails,
+		BeforePrivateCallTier:        prior.privateCallTier,
+		BeforePrivateCallShowDetails: prior.privateCallShowDetails,
+	}
+	if prior.marker.Valid {
+		value := prior.marker.UUID
+		operation.PriorOperationID = &value
+	}
+	return operation, nil
+}
+
+func validateTopologyOperationReadiness(
+	pending audienceOperationPending,
+	now time.Time,
+) error {
+	return validateAudienceOperationReadiness(OrdinaryAudienceWrite, pending, false, now)
+}
+
+func newTopologyOperationID() uuid.UUID {
+	operationID := uuid.New()
+	operationID[6] = operationID[6]&0x0f | byte(topologyOperationUUIDVersion)<<4
+	return operationID
+}
+
+func isTopologyOperationID(operationID uuid.UUID) bool {
+	return operationID != uuid.Nil && operationID.Version() == topologyOperationUUIDVersion
+}
+
+func writeTopologyOperationMarker(
+	ctx context.Context,
+	tx *sql.Tx,
+	senderID uuid.UUID,
+	operationID uuid.UUID,
+	now time.Time,
+) error {
+	result, err := tx.ExecContext(ctx, `
+		UPDATE user_presence_settings
+		SET presence_settings_operation_id = $2,
+		    updated_at = $3
+		WHERE user_id = $1
+	`, senderID, operationID, now)
+	if err != nil {
+		return fmt.Errorf("store topology audience operation marker: %w", err)
+	}
+	return requireOneAffected(result, "store topology audience operation marker")
+}
+
+// PrepareTopologyBatch validates and clones one old/new audience pair per
+// operation and computes only the exact recipients changed by the mutation.
+func PrepareTopologyBatch(
+	batch TopologyBatch,
+	audiences []TopologyAudience,
+) (TopologyBatch, error) {
+	if len(batch.operations) == 0 || len(batch.operations) > maxReconcileBatch ||
+		len(batch.plans) != 0 || len(audiences) != len(batch.operations) {
+		return TopologyBatch{}, errors.New("invalid topology audience coverage")
+	}
+	operations, err := indexTopologyOperations(batch.operations)
+	if err != nil {
+		return TopologyBatch{}, err
+	}
+	covered, err := indexTopologyAudiences(audiences, operations)
+	if err != nil {
+		return TopologyBatch{}, err
+	}
+
+	prepared := TopologyBatch{
+		operations: append([]AudienceOperation(nil), batch.operations...),
+		plans:      make([]DeliveryPlan, 0, len(batch.operations)),
+	}
+	for _, operation := range batch.operations {
+		audience, exists := covered[operation.SenderID]
+		if !exists {
+			return TopologyBatch{}, errors.New("missing topology audience")
+		}
+		plan, err := prepareTopologyPlan(operation, audience)
+		if err != nil {
+			return TopologyBatch{}, err
+		}
+		prepared.plans = append(prepared.plans, plan)
+	}
+	return prepared, nil
+}
+
+func indexTopologyOperations(
+	operations []AudienceOperation,
+) (map[uuid.UUID]AudienceOperation, error) {
+	indexed := make(map[uuid.UUID]AudienceOperation, len(operations))
+	var previous uuid.UUID
+	for index, operation := range operations {
+		if err := validateTopologyOperation(operation); err != nil {
+			return nil, err
+		}
+		if index > 0 && previous.String() >= operation.SenderID.String() {
+			return nil, errors.New("unordered topology operations")
+		}
+		if _, duplicate := indexed[operation.SenderID]; duplicate {
+			return nil, errors.New("duplicate topology operation")
+		}
+		indexed[operation.SenderID] = operation
+		previous = operation.SenderID
+	}
+	return indexed, nil
+}
+
+func validateTopologyOperation(operation AudienceOperation) error {
+	if operation.kind != audienceTopologyOperation || operation.ID == uuid.Nil ||
+		operation.SenderID == uuid.Nil || operation.PriorVersion < 0 ||
+		operation.Version != operation.PriorVersion {
+		return errors.New("invalid topology operation")
+	}
+	return nil
+}
+
+func indexTopologyAudiences(
+	audiences []TopologyAudience,
+	operations map[uuid.UUID]AudienceOperation,
+) (map[uuid.UUID]TopologyAudience, error) {
+	covered := make(map[uuid.UUID]TopologyAudience, len(audiences))
+	for _, audience := range audiences {
+		if audience.SenderID == uuid.Nil {
+			return nil, errors.New("invalid topology audience sender")
+		}
+		if _, exists := operations[audience.SenderID]; !exists {
+			return nil, errors.New("unknown topology audience sender")
+		}
+		if _, duplicate := covered[audience.SenderID]; duplicate {
+			return nil, errors.New("duplicate topology audience")
+		}
+		covered[audience.SenderID] = audience
+	}
+	return covered, nil
+}
+
+func prepareTopologyPlan(
+	operation AudienceOperation,
+	audience TopologyAudience,
+) (DeliveryPlan, error) {
+	before, err := cloneTopologyRecipients(operation.SenderID, audience.Before)
+	if err != nil {
+		return DeliveryPlan{}, err
+	}
+	after, err := cloneTopologyRecipients(operation.SenderID, audience.After)
+	if err != nil {
+		return DeliveryPlan{}, err
+	}
+	active := operation.BeforeMasterEnabled && operation.BeforeTier > 0 && operation.Before.Text != ""
+	if !active && (len(before) != 0 || len(after) != 0) {
+		return DeliveryPlan{}, errors.New("inactive topology operation has audience")
+	}
+	plan := DeliveryPlan{
+		Mode:             DeliveryExactDelta,
+		OperationID:      operation.ID,
+		SenderID:         operation.SenderID,
+		ClearRecipients:  make(map[uuid.UUID]bool),
+		UpdateRecipients: make(map[uuid.UUID]bool),
+	}
+	if active {
+		plan.ClearRecipients, plan.UpdateRecipients = topologyRecipientDelta(before, after)
+		payload := operation.Before
+		plan.Payload = &payload
+	}
+	return plan, nil
+}
+
+func topologyRecipientDelta(
+	before, after map[uuid.UUID]bool,
+) (map[uuid.UUID]bool, map[uuid.UUID]bool) {
+	clears := make(map[uuid.UUID]bool)
+	updates := make(map[uuid.UUID]bool)
+	for recipientID := range before {
+		if !after[recipientID] {
+			clears[recipientID] = true
+		}
+	}
+	for recipientID := range after {
+		if !before[recipientID] {
+			updates[recipientID] = true
+		}
+	}
+	return clears, updates
+}
+
+func cloneTopologyRecipients(
+	senderID uuid.UUID,
+	recipients map[uuid.UUID]bool,
+) (map[uuid.UUID]bool, error) {
+	cloned := make(map[uuid.UUID]bool, len(recipients))
+	for recipientID, included := range recipients {
+		if recipientID == uuid.Nil || recipientID == senderID || !included {
+			return nil, errors.New("invalid topology audience recipient")
+		}
+		cloned[recipientID] = true
+	}
+	return cloned, nil
 }
 
 type audienceOperationPrior struct {
@@ -312,6 +634,8 @@ func lockAudienceOperationPrior(
 }
 
 type audienceOperationPending struct {
+	operationID    uuid.UUID
+	priorVersion   int64
 	exists         bool
 	reconcileAfter time.Time
 }
@@ -321,14 +645,13 @@ func lockAudienceOperationPending(
 	tx *sql.Tx,
 	senderID uuid.UUID,
 ) (audienceOperationPending, error) {
-	var operationID uuid.UUID
 	var pending audienceOperationPending
 	err := tx.QueryRowContext(ctx, `
-		SELECT operation_id, reconcile_after
+		SELECT operation_id, prior_settings_version, reconcile_after
 		FROM presence_settings_pending_operations
 		WHERE user_id = $1
 		FOR UPDATE
-	`, senderID).Scan(&operationID, &pending.reconcileAfter)
+	`, senderID).Scan(&pending.operationID, &pending.priorVersion, &pending.reconcileAfter)
 	if errors.Is(err, sql.ErrNoRows) {
 		return pending, nil
 	}
@@ -350,12 +673,13 @@ func readAudienceOperationClock(ctx context.Context, tx *sql.Tx) (time.Time, err
 func validateAudienceOperationReadiness(
 	mode OperationMode,
 	pending audienceOperationPending,
+	pendingIsTopology bool,
 	now time.Time,
 ) error {
-	if !pending.exists || mode == ForcedSecurityClear {
+	if !pending.exists || mode == ForcedSecurityClear && !pendingIsTopology {
 		return nil
 	}
-	if pending.reconcileAfter.After(now) {
+	if pending.reconcileAfter.After(now) || mode == ForcedSecurityClear && pendingIsTopology {
 		return &ServiceError{
 			Status:     http.StatusServiceUnavailable,
 			Code:       "presence_operation_pending",
@@ -479,11 +803,18 @@ func (s *Service) ClassifyAudienceCommit(
 ) CommitOutcome {
 	readCtx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), commitReadbackTimeout)
 	defer cancel()
+	return s.classifyAudienceCommit(readCtx, operation)
+}
+
+func (s *Service) classifyAudienceCommit(
+	ctx context.Context,
+	operation AudienceOperation,
+) CommitOutcome {
 	readState := s.readCommitState
 	if readState == nil {
 		readState = s.readAudienceCommitState
 	}
-	state, err := readState(readCtx, operation.SenderID)
+	state, err := readState(ctx, operation.SenderID)
 	if err != nil {
 		return CommitUnresolved
 	}
@@ -582,9 +913,21 @@ func classifyAudienceCommitState(
 	operation AudienceOperation,
 	state audienceCommitState,
 ) CommitOutcome {
-	if operation.ID == uuid.Nil || operation.PriorVersion < 0 ||
-		operation.PriorVersion == math.MaxInt64 || operation.Version != operation.PriorVersion+1 ||
-		!state.UserExists {
+	if operation.ID == uuid.Nil || operation.PriorVersion < 0 || !state.UserExists {
+		return CommitUnresolved
+	}
+	expectedVersion := operation.PriorVersion + 1
+	switch operation.kind {
+	case audienceSettingsOperation:
+		if operation.PriorVersion == math.MaxInt64 {
+			return CommitUnresolved
+		}
+	case audienceTopologyOperation:
+		expectedVersion = operation.PriorVersion
+	default:
+		return CommitUnresolved
+	}
+	if operation.Version != expectedVersion {
 		return CommitUnresolved
 	}
 	if state.SettingsExists && state.Version == operation.Version &&
@@ -593,12 +936,12 @@ func classifyAudienceCommitState(
 		state.PendingPriorVersionSet && state.PendingPriorVersion == operation.PriorVersion {
 		return CommitConfirmed
 	}
+	if rollbackStateMatches(operation, state) {
+		return RollbackConfirmed
+	}
 	if state.SettingsExists && state.Version >= operation.Version &&
 		state.OperationID != nil && *state.OperationID != operation.ID {
 		return WriteSuperseded
-	}
-	if rollbackStateMatches(operation, state) {
-		return RollbackConfirmed
 	}
 	return CommitUnresolved
 }

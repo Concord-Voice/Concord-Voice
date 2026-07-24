@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/google/uuid"
 )
 
@@ -49,6 +50,18 @@ type reconcileResult struct {
 	proven      bool
 	compensated bool
 	retained    bool
+}
+
+type forcedSupersessionReadyError struct {
+	pending *ServiceError
+}
+
+func (e *forcedSupersessionReadyError) Error() string {
+	return e.pending.Error()
+}
+
+func (e *forcedSupersessionReadyError) Unwrap() error {
+	return e.pending
 }
 
 type claimCommitState uint8
@@ -194,9 +207,8 @@ func (s *Service) runReadySenderMode(
 		return err
 	}
 	if _, err := s.reconcileSenderAlreadyGated(ctx, senderID, mode); err != nil {
-		var pending *ServiceError
-		if mode != ForcedSecurityClear || !errors.As(err, &pending) ||
-			err != pending || pending.Code != "presence_operation_pending" {
+		var supersession *forcedSupersessionReadyError
+		if mode != ForcedSecurityClear || !errors.As(err, &supersession) || err != supersession {
 			return err
 		}
 	}
@@ -223,6 +235,401 @@ func (s *Service) CompleteClaim(requestCtx context.Context, plan DeliveryPlan) C
 		return s.recoverPreDeliveryClaim(claimCtx, plan, err)
 	}
 	return ClaimCompletion{Outcome: outcome, Err: err}
+}
+
+// CompleteTopologyBatch commits the caller's graph mutation before performing
+// deterministic, bounded delivery. Every delivery claim verifies and releases
+// its database locks before waiting on the WebSocket path.
+func (s *Service) CompleteTopologyBatch(
+	requestCtx context.Context,
+	tx *sql.Tx,
+	batch TopologyBatch,
+) error {
+	if err := validateTopologyBatchCompletion(requestCtx, s, tx, batch); err != nil {
+		return errors.Join(err, rollbackTopologyBatch(s, tx))
+	}
+	completionCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(requestCtx),
+		2*s.effectiveDeliveryTimeout()+2*commitReadbackTimeout,
+	)
+	defer cancel()
+	plans, completionErr := s.commitTopologyBatch(completionCtx, tx, batch)
+	return errors.Join(completionErr, s.completeTopologyPlans(completionCtx, plans))
+}
+
+func (s *Service) commitTopologyBatch(
+	requestCtx context.Context,
+	tx *sql.Tx,
+	batch TopologyBatch,
+) ([]DeliveryPlan, error) {
+	commitErr := s.CommitTx(tx)
+	if commitErr == nil {
+		return batch.plans, nil
+	}
+	completionErr := fmt.Errorf("commit topology audience batch: %w", commitErr)
+	if rollbackErr := s.RollbackTx(tx); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+		completionErr = errors.Join(
+			completionErr,
+			fmt.Errorf("rollback topology audience batch: %w", rollbackErr),
+		)
+	}
+	plans := make([]DeliveryPlan, 0, len(batch.plans))
+	for index, operation := range batch.operations {
+		if err := requestCtx.Err(); err != nil {
+			completionErr = errors.Join(
+				completionErr,
+				fmt.Errorf("classify topology audience batch: %w", err),
+			)
+			break
+		}
+		readCtx, cancel := boundedDetachedContext(requestCtx, commitReadbackTimeout)
+		outcome := s.classifyAudienceCommit(readCtx, operation)
+		cancel()
+		switch outcome {
+		case CommitConfirmed:
+			plans = append(plans, batch.plans[index])
+		case CommitUnresolved:
+			completionErr = errors.Join(
+				completionErr,
+				s.recoverUnresolvedTopologyCommit(requestCtx, operation, batch.plans[index]),
+			)
+		case RollbackConfirmed, WriteSuperseded:
+			// Atomic rollback needs no delivery; a newer marker owns recovery.
+		}
+	}
+	return plans, completionErr
+}
+
+func (s *Service) completeTopologyPlans(requestCtx context.Context, plans []DeliveryPlan) error {
+	var completionErr error
+	for _, plan := range plans {
+		if err := requestCtx.Err(); err != nil {
+			return errors.Join(
+				completionErr,
+				fmt.Errorf("complete topology audience batch: %w", err),
+			)
+		}
+		err := s.completeTopologyPlan(requestCtx, plan)
+		if err != nil {
+			completionErr = errors.Join(completionErr, err)
+		}
+	}
+	return completionErr
+}
+
+func validateTopologyBatchCompletion(
+	requestCtx context.Context,
+	s *Service,
+	tx *sql.Tx,
+	batch TopologyBatch,
+) error {
+	if s == nil || s.db == nil || s.repository == nil || requestCtx == nil || tx == nil ||
+		len(batch.operations) == 0 || len(batch.operations) > maxReconcileBatch ||
+		len(batch.operations) != len(batch.plans) {
+		return errors.New("invalid topology batch completion")
+	}
+	if _, err := s.boundDelivery(); err != nil {
+		return err
+	}
+	if _, err := indexTopologyOperations(batch.operations); err != nil {
+		return fmt.Errorf("invalid topology batch operation: %w", err)
+	}
+	seenOperations := make(map[uuid.UUID]struct{}, len(batch.operations))
+	for index, operation := range batch.operations {
+		plan := batch.plans[index]
+		if _, duplicate := seenOperations[operation.ID]; duplicate {
+			return errors.New("duplicate topology batch operation")
+		}
+		seenOperations[operation.ID] = struct{}{}
+		if err := validateTopologyBatchPlan(operation, plan); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateTopologyBatchPlan(operation AudienceOperation, plan DeliveryPlan) error {
+	if plan.Mode != DeliveryExactDelta || plan.OperationID != operation.ID ||
+		plan.SenderID != operation.SenderID {
+		return errors.New("invalid topology batch operation")
+	}
+	if _, err := cloneTopologyRecipients(plan.SenderID, plan.ClearRecipients); err != nil {
+		return err
+	}
+	if _, err := cloneTopologyRecipients(plan.SenderID, plan.UpdateRecipients); err != nil {
+		return err
+	}
+	return nil
+}
+
+func rollbackTopologyBatch(s *Service, tx *sql.Tx) error {
+	if s == nil || tx == nil {
+		return nil
+	}
+	err := s.RollbackTx(tx)
+	if err == nil || errors.Is(err, sql.ErrTxDone) {
+		return nil
+	}
+	return fmt.Errorf("rollback invalid topology audience batch: %w", err)
+}
+
+func (s *Service) recoverUnresolvedTopologyCommit(
+	ctx context.Context,
+	operation AudienceOperation,
+	plan DeliveryPlan,
+) error {
+	prior := pendingOperationRow{
+		ID:             operation.ID,
+		PriorVersion:   operation.PriorVersion,
+		ReconcileAfter: operation.ReconcileAfter,
+	}
+	_, quarantineErr := s.ensureClaimQuarantine(ctx, plan, prior)
+	plan.ClearRecipients = nil
+	plan.UpdateRecipients = nil
+	plan.Payload = nil
+	resetCtx, cancel := boundedDetachedContext(ctx, s.effectiveDeliveryTimeout())
+	defer cancel()
+	resetErr := s.EmergencyReset(resetCtx, plan)
+	if quarantineErr != nil {
+		quarantineErr = fmt.Errorf("retain unresolved topology quarantine: %w", quarantineErr)
+	}
+	if resetErr != nil {
+		resetErr = fmt.Errorf("reset unresolved topology audience: %w", resetErr)
+	}
+	return errors.Join(quarantineErr, resetErr)
+}
+
+func (s *Service) completeTopologyPlan(ctx context.Context, plan DeliveryPlan) error {
+	delivery, err := s.validateDeliveryPlan(plan)
+	if err != nil {
+		return err
+	}
+	prepared, current, err := s.prepareCurrentTopologyPlan(ctx, plan)
+	if err != nil || !current {
+		return err
+	}
+	if err := s.deliverTopologyPlan(ctx, delivery, prepared); err != nil {
+		return err
+	}
+	return s.acknowledgeTopologyPlan(ctx, prepared)
+}
+
+func (s *Service) prepareCurrentTopologyPlan(
+	ctx context.Context,
+	plan DeliveryPlan,
+) (DeliveryPlan, bool, error) {
+	current, err := s.verifyTopologyMarker(ctx, plan)
+	if err != nil {
+		return DeliveryPlan{}, false, s.recoverTopologyPlan(ctx, plan, err, true)
+	}
+	if !current {
+		return DeliveryPlan{}, false, nil
+	}
+	if plan.Mode == DeliveryExactDelta {
+		prepared, err := s.freshTopologyPlan(ctx, plan)
+		if err != nil {
+			return DeliveryPlan{}, false, s.recoverTopologyPlan(ctx, plan, err, true)
+		}
+		return prepared, true, nil
+	}
+	return plan, true, nil
+}
+
+func (s *Service) deliverTopologyPlan(
+	ctx context.Context,
+	delivery Delivery,
+	plan DeliveryPlan,
+) error {
+	deliveryCtx, cancel := context.WithTimeout(ctx, s.effectiveDeliveryTimeout())
+	ack, deliveryErr := delivery.DeliverCustomText(deliveryCtx, plan)
+	cancel()
+	if deliveryErr != nil {
+		return s.handleTopologyPlanFailure(ctx, plan, deliveryErr, false)
+	}
+	if ack.OperationID != plan.OperationID {
+		return s.handleTopologyPlanFailure(
+			ctx, plan, errors.New("topology delivery acknowledgement mismatch"), true,
+		)
+	}
+	return nil
+}
+
+func (s *Service) acknowledgeTopologyPlan(ctx context.Context, plan DeliveryPlan) error {
+	acknowledged, acknowledgeErr := s.acknowledgeTopologyMarker(ctx, plan)
+	if acknowledgeErr != nil {
+		if acknowledged {
+			return acknowledgeErr
+		}
+		return s.handleTopologyPlanFailure(ctx, plan, acknowledgeErr, true)
+	}
+	if !acknowledged {
+		return s.handleTopologyPlanFailure(
+			ctx, plan,
+			errors.New("topology delivery marker superseded before acknowledgement"), true,
+		)
+	}
+	return nil
+}
+
+func (s *Service) handleTopologyPlanFailure(
+	ctx context.Context,
+	plan DeliveryPlan,
+	cause error,
+	allLocal bool,
+) error {
+	if plan.Mode == DeliveryConservativeReset {
+		return cause
+	}
+	return s.recoverTopologyPlan(ctx, plan, cause, allLocal)
+}
+
+func (s *Service) verifyTopologyMarker(
+	ctx context.Context,
+	plan DeliveryPlan,
+) (current bool, returnErr error) {
+	tx, err := s.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin topology marker verification: %w", err)
+	}
+	if tx == nil {
+		return false, errors.New("begin topology marker verification: missing transaction")
+	}
+	defer tx.Rollback() //nolint:errcheck
+	defer s.joinTransactionRollback(tx, "topology_marker_verification", &returnErr)
+	_, current, err = lockTopologyMarkerState(ctx, tx, plan)
+	return current, err
+}
+
+func lockTopologyMarkerState(
+	ctx context.Context,
+	tx *sql.Tx,
+	plan DeliveryPlan,
+) (pendingOperationRow, bool, error) {
+	if err := lockUser(ctx, tx, plan.SenderID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return pendingOperationRow{}, false, nil
+		}
+		return pendingOperationRow{}, false, err
+	}
+	settings, err := lockPresenceSettings(ctx, tx, plan.SenderID)
+	if err != nil {
+		return pendingOperationRow{}, false, err
+	}
+	pending, err := lockPendingRow(ctx, tx, plan.SenderID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return pendingOperationRow{}, false, nil
+	}
+	if err != nil {
+		return pendingOperationRow{}, false, err
+	}
+	if !settings.OperationID.Valid || settings.OperationID.UUID != plan.OperationID ||
+		pending.ID != plan.OperationID {
+		return pendingOperationRow{}, false, nil
+	}
+	if settings.Version != pending.PriorVersion {
+		return pendingOperationRow{}, false, errors.New("topology marker version relation is uncertain")
+	}
+	return pending, true, nil
+}
+
+func (s *Service) freshTopologyPlan(
+	ctx context.Context,
+	plan DeliveryPlan,
+) (DeliveryPlan, error) {
+	fresh, err := presence.ComputeCustomTextAudience(ctx, s.db, plan.SenderID)
+	if err != nil {
+		return DeliveryPlan{}, fmt.Errorf("refresh topology audience authorization: %w", err)
+	}
+	updates := make(map[uuid.UUID]bool)
+	for recipientID := range plan.UpdateRecipients {
+		if fresh[recipientID] {
+			updates[recipientID] = true
+		}
+	}
+	clears := make(map[uuid.UUID]bool)
+	for recipientID := range plan.ClearRecipients {
+		if !fresh[recipientID] {
+			clears[recipientID] = true
+		}
+	}
+	plan.UpdateRecipients = updates
+	plan.ClearRecipients = clears
+	return plan, nil
+}
+
+func (s *Service) acknowledgeTopologyMarker(
+	ctx context.Context,
+	plan DeliveryPlan,
+) (acknowledged bool, returnErr error) {
+	tx, err := s.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin topology acknowledgement: %w", err)
+	}
+	if tx == nil {
+		return false, errors.New("begin topology acknowledgement: missing transaction")
+	}
+	defer tx.Rollback() //nolint:errcheck
+	defer s.joinTransactionRollback(tx, "topology_acknowledgement", &returnErr)
+	pending, current, err := lockTopologyMarkerState(ctx, tx, plan)
+	if err != nil {
+		return false, err
+	}
+	if !current {
+		return false, nil
+	}
+	result, err := s.deleteClaimedPending(ctx, tx, plan.SenderID, plan.OperationID)
+	if err != nil {
+		return false, fmt.Errorf("delete topology audience marker: %w", err)
+	}
+	if err := requireOneAffected(result, "delete topology audience marker"); err != nil {
+		return false, err
+	}
+	if err := s.CommitTx(tx); err != nil {
+		return s.resolveTopologyAcknowledgementCommit(ctx, tx, plan, pending, err)
+	}
+	return true, nil
+}
+
+func (s *Service) resolveTopologyAcknowledgementCommit(
+	ctx context.Context,
+	tx *sql.Tx,
+	plan DeliveryPlan,
+	pending pendingOperationRow,
+	commitErr error,
+) (bool, error) {
+	cause := fmt.Errorf("commit topology acknowledgement: %w", commitErr)
+	rollbackErr := s.RollbackTx(tx)
+	if rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+		cause = errors.Join(cause, fmt.Errorf("rollback topology acknowledgement: %w", rollbackErr))
+	}
+	switch s.classifyClaimCommit(ctx, plan, pending) {
+	case claimCommitConfirmed:
+		return true, cause
+	case claimCommitSuperseded, claimCommitQuarantined:
+		return false, cause
+	default:
+		_, repairErr := s.ensureClaimQuarantine(ctx, plan, pending)
+		return false, errors.Join(cause, repairErr)
+	}
+}
+
+func (s *Service) recoverTopologyPlan(
+	ctx context.Context,
+	plan DeliveryPlan,
+	cause error,
+	allLocal bool,
+) error {
+	if allLocal {
+		plan.ClearRecipients = nil
+	}
+	plan.UpdateRecipients = nil
+	plan.Payload = nil
+	resetCtx, cancel := boundedDetachedContext(ctx, s.effectiveDeliveryTimeout())
+	defer cancel()
+	if err := s.EmergencyReset(resetCtx, plan); err != nil {
+		return errors.Join(cause, fmt.Errorf("emergency topology reset: %w", err))
+	}
+	return cause
 }
 
 func boundedDetachedContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -769,7 +1176,14 @@ func (s *Service) reconcileSenderAlreadyGated(
 		return reconcileResult{retained: true}, fmt.Errorf("read presence reconciliation clock: %w", err)
 	}
 	if mode == ForcedSecurityClear {
-		return reconcileResult{retained: true}, pendingOperationError(pending, now)
+		pendingErr := pendingOperationError(pending, now)
+		pendingIsTopology := isTopologyOperationID(pending.ID) ||
+			settings.OperationID.Valid && settings.OperationID.UUID == pending.ID &&
+				settings.Version == pending.PriorVersion
+		if pendingIsTopology {
+			return reconcileResult{retained: true}, pendingErr
+		}
+		return reconcileResult{retained: true}, &forcedSupersessionReadyError{pending: pendingErr}
 	}
 	if pending.ReconcileAfter.After(now) {
 		return reconcileResult{retained: true}, pendingOperationError(pending, now)
@@ -821,27 +1235,82 @@ func (s *Service) reconcileLockedPending(
 	if !settings.OperationID.Valid || settings.OperationID.UUID != pending.ID {
 		return s.resolveProvenNonmatching(ctx, tx, senderID, settings, pending)
 	}
-	if pending.PriorVersion == math.MaxInt64 || settings.Version != pending.PriorVersion+1 {
-		return reconcileResult{retained: true}, errors.New("pending presence operation version is uncertain")
+	if settings.Version == pending.PriorVersion {
+		return s.reconcileTopologyMarker(ctx, tx, senderID, pending)
 	}
-	if settings.Version == math.MaxInt64 {
-		return reconcileResult{retained: true}, errors.New("presence settings version exhausted")
+	if err := validatePendingSettingsVersion(settings, pending); err != nil {
+		return reconcileResult{retained: true}, err
 	}
 	if !settings.MasterEnabled || settings.Tier == 0 {
-		if err := s.RollbackTx(tx); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			return reconcileResult{retained: true}, fmt.Errorf("release presence reconciliation locks: %w", err)
-		}
-		err := s.ClaimAndDeliver(ctx, DeliveryPlan{
-			Mode:        DeliveryConservativeReset,
-			OperationID: pending.ID,
-			SenderID:    senderID,
-		})
-		if err != nil {
-			return reconcileResult{retained: true}, err
-		}
-		return reconcileResult{resolved: true}, nil
+		return s.reconcileInactivePending(ctx, tx, senderID, pending)
 	}
 	return s.compensateAndClaim(ctx, tx, senderID, settings, pending, now)
+}
+
+func (s *Service) reconcileTopologyMarker(
+	ctx context.Context,
+	tx *sql.Tx,
+	senderID uuid.UUID,
+	pending pendingOperationRow,
+) (reconcileResult, error) {
+	if err := s.releaseReconcileLocks(tx, "topology"); err != nil {
+		return reconcileResult{retained: true}, err
+	}
+	claimCtx, cancel := context.WithTimeout(
+		ctx,
+		2*s.effectiveDeliveryTimeout()+2*commitReadbackTimeout,
+	)
+	defer cancel()
+	err := s.completeTopologyPlan(claimCtx, DeliveryPlan{
+		Mode:        DeliveryConservativeReset,
+		OperationID: pending.ID,
+		SenderID:    senderID,
+	})
+	if err != nil {
+		return reconcileResult{retained: true}, err
+	}
+	return reconcileResult{resolved: true}, nil
+}
+
+func validatePendingSettingsVersion(
+	settings lockedPresenceSettings,
+	pending pendingOperationRow,
+) error {
+	if pending.PriorVersion == math.MaxInt64 || settings.Version != pending.PriorVersion+1 {
+		return errors.New("pending presence operation version is uncertain")
+	}
+	if settings.Version == math.MaxInt64 {
+		return errors.New("presence settings version exhausted")
+	}
+	return nil
+}
+
+func (s *Service) reconcileInactivePending(
+	ctx context.Context,
+	tx *sql.Tx,
+	senderID uuid.UUID,
+	pending pendingOperationRow,
+) (reconcileResult, error) {
+	if err := s.releaseReconcileLocks(tx, "presence"); err != nil {
+		return reconcileResult{retained: true}, err
+	}
+	err := s.ClaimAndDeliver(ctx, DeliveryPlan{
+		Mode:        DeliveryConservativeReset,
+		OperationID: pending.ID,
+		SenderID:    senderID,
+	})
+	if err != nil {
+		return reconcileResult{retained: true}, err
+	}
+	return reconcileResult{resolved: true}, nil
+}
+
+func (s *Service) releaseReconcileLocks(tx *sql.Tx, operation string) error {
+	err := s.RollbackTx(tx)
+	if err == nil || errors.Is(err, sql.ErrTxDone) {
+		return nil
+	}
+	return fmt.Errorf("release %s reconciliation locks: %w", operation, err)
 }
 
 func lockPresenceSettings(
@@ -910,7 +1379,28 @@ func (s *Service) resolveProvenNonmatching(
 	settings lockedPresenceSettings,
 	pending pendingOperationRow,
 ) (reconcileResult, error) {
-	rollbackProven := settings.Version == pending.PriorVersion
+	sameVersion := settings.Version == pending.PriorVersion
+	if sameVersion && isTopologyOperationID(pending.ID) {
+		if err := s.releaseReconcileLocks(tx, "ambiguous topology"); err != nil {
+			return reconcileResult{retained: true}, err
+		}
+		resetCtx, cancel := boundedDetachedContext(ctx, s.effectiveDeliveryTimeout())
+		defer cancel()
+		if err := s.EmergencyReset(resetCtx, DeliveryPlan{
+			Mode:        DeliveryConservativeReset,
+			OperationID: pending.ID,
+			SenderID:    senderID,
+		}); err != nil {
+			return reconcileResult{retained: true}, fmt.Errorf(
+				"reset ambiguous pending presence topology operation: %w", err,
+			)
+		}
+		if err := s.deferAmbiguousTopologyRetry(ctx, senderID, pending.ID); err != nil {
+			return reconcileResult{retained: true}, err
+		}
+		return reconcileResult{retained: true}, errors.New("pending presence topology operation proof is uncertain")
+	}
+	rollbackProven := sameVersion
 	superseded := settings.Version > pending.PriorVersion &&
 		settings.OperationID.Valid && settings.OperationID.UUID != pending.ID
 	if !rollbackProven && !superseded {
@@ -930,6 +1420,35 @@ func (s *Service) resolveProvenNonmatching(
 		return reconcileResult{retained: true}, fmt.Errorf("commit proven presence reconciliation: %w", err)
 	}
 	return reconcileResult{resolved: true, proven: true}, nil
+}
+
+func (s *Service) deferAmbiguousTopologyRetry(
+	ctx context.Context,
+	senderID uuid.UUID,
+	operationID uuid.UUID,
+) error {
+	backoff := pendingOperationGrace
+	if configured := 2 * s.effectiveReconcileInterval(); configured > backoff {
+		backoff = configured
+	}
+	deferCtx, cancel := boundedDetachedContext(ctx, commitReadbackTimeout)
+	defer cancel()
+	result, err := s.db.ExecContext(deferCtx, `
+		UPDATE presence_settings_pending_operations
+		SET reconcile_after = clock_timestamp() + make_interval(secs => $3)
+		WHERE user_id = $1 AND operation_id = $2
+	`, senderID, operationID, backoff.Seconds())
+	if err != nil {
+		return fmt.Errorf("defer ambiguous pending presence topology retry: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read deferred ambiguous topology retry result: %w", err)
+	}
+	if affected > 1 {
+		return errors.New("defer ambiguous pending presence topology retry affected multiple rows")
+	}
+	return nil
 }
 
 func (s *Service) compensateAndClaim(
