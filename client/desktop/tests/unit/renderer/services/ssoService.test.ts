@@ -3,6 +3,7 @@ import {
   startSSOFlow,
   completeSSORegistration,
   completeSSOLink,
+  completeSSOMFA,
 } from '@/renderer/services/ssoService';
 import { useAuthStore } from '@/renderer/stores/authStore';
 
@@ -18,6 +19,7 @@ interface ElectronSSO {
   googleCancel: ReturnType<typeof vi.fn>;
   completeRegistration: ReturnType<typeof vi.fn>;
   completeLink: ReturnType<typeof vi.fn>;
+  completeMFA: ReturnType<typeof vi.fn>;
 }
 
 interface ElectronTestSurface {
@@ -58,6 +60,12 @@ function installElectronMock(): ElectronTestSurface {
         accessToken: 'link-token-1',
         sessionId: 'link-session-1',
         credentialOwner: 44,
+      }),
+      completeMFA: vi.fn().mockResolvedValue({
+        kind: 'tokens',
+        accessToken: 'mfa-token-1',
+        sessionId: 'mfa-session-1',
+        credentialOwner: 45,
       }),
     },
     openExternal: vi.fn().mockResolvedValue({ ok: true }),
@@ -329,5 +337,49 @@ describe('completeSSOLink', () => {
         { apiBase: API_BASE, epoch: 0 }
       )
     ).rejects.toThrow(/sso_complete_link_failed_401/);
+  });
+});
+
+describe('completeSSOMFA (#2424)', () => {
+  it('returns only the main-custodied credential reference', async () => {
+    const params = {
+      provider: 'google' as const,
+      mfaChallengeToken: 'mfa-chal',
+      credentialOwner: 45,
+      method: 'totp',
+      code: '123456',
+    };
+    const result = await completeSSOMFA(params, { apiBase: API_BASE, epoch: 0 });
+
+    expect(result).toEqual({
+      accessToken: 'mfa-token-1',
+      sessionId: 'mfa-session-1',
+      credentialOwner: 45,
+    });
+    expect(electron.sso.completeMFA).toHaveBeenCalledWith(API_BASE, params);
+    // The refresh token stays in main — never on the returned reference.
+    expect(result).not.toHaveProperty('refreshToken');
+  });
+
+  it('throws sso_complete_mfa_failed_<status> on non-2xx', async () => {
+    electron.sso.completeMFA.mockResolvedValueOnce({
+      kind: 'error',
+      status: 401,
+      code: 'mfa_code_invalid',
+      body: { error_code: 'mfa_code_invalid' },
+    });
+
+    await expect(
+      completeSSOMFA(
+        {
+          provider: 'google',
+          mfaChallengeToken: 'mfa-chal',
+          credentialOwner: 45,
+          method: 'totp',
+          code: '000000',
+        },
+        { apiBase: API_BASE, epoch: 0 }
+      )
+    ).rejects.toThrow(/sso_complete_mfa_failed_401/);
   });
 });

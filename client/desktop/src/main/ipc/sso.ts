@@ -2,7 +2,7 @@
  * SSO IPC bridge — wires the loopback HTTP server in `ssoLoopback.ts` to the
  * renderer's OAuth flow.
  *
- * Channel surface (9):
+ * Channel surface (10):
  *   - `sso:startLoopback` (invoke)  — spin up a 127.0.0.1 ephemeral-port server
  *                                     and return `{port, redirectURI}` for the
  *                                     renderer to embed in the provider URL.
@@ -31,6 +31,11 @@
  *                                     final server exchange in main, store the
  *                                     refresh credential under the reserved
  *                                     SSO owner, and return no refresh token.
+ *   - `sso:completeMFA` (invoke)    — submit the SSO MFA proof (#2424) in main,
+ *                                     store the refresh credential under the
+ *                                     owner reserved at sign-in, and return no
+ *                                     refresh token. Keeps the MFA path at parity
+ *                                     with the direct/registration custody model.
  *
  * Sender-frame validation (the only layer the renderer cannot bypass) is
  * enforced via `isPermittedFrameUrl` — the same helper `openExternal.ts` uses,
@@ -46,6 +51,7 @@
 import { ipcMain, net, shell, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 
 import { getApiBaseUrl, PRODUCTION_API_BASE } from '../apiBaseUrl';
+import { getMachineId } from '../machineId';
 import { cancelActiveAppleFlow, runAppleSignIn } from '../oauth/apple/appleFlow';
 import { appleTokenCall } from '../oauth/apple/appleTokenCall';
 import { verifyAppleIDToken } from '../oauth/apple/idTokenVerifier';
@@ -68,6 +74,7 @@ import type { MainSSOSignInResult } from '../oauth/ssoFlowShared';
 import type { CredentialOwner } from '../ipcContract';
 import type {
   SSOCompleteLinkPayload,
+  SSOCompleteMFAPayload,
   SSOCompleteRegistrationPayload,
   SSOCompletionErrorBody,
   SSOCompletionResult,
@@ -102,6 +109,18 @@ interface PendingSSOCompletion {
   provider: 'google' | 'apple';
   branch: 'new_user' | 'account_link';
   ssoToken: string;
+}
+
+// #2424: the reserved owner + challenge token held across an SSO MFA challenge.
+// The renderer collects the MFA proof (TOTP code or WebAuthn assertion) and calls
+// sso:completeMFA; main re-validates this state, submits the proof, and stores the
+// resulting refresh credential under `credentialOwner` — the raw refresh token
+// never crosses back to the renderer (parity with the direct SSO path).
+interface PendingSSOMFA {
+  apiBase: string;
+  credentialOwner: CredentialOwner;
+  provider: 'google' | 'apple';
+  mfaChallengeToken: string;
 }
 
 interface MainCompletionTokens {
@@ -171,6 +190,24 @@ function isCompleteLinkPayload(value: unknown): value is SSOCompleteLinkPayload 
     isProvider(value.provider) &&
     isBoundedString(value.ssoToken, 8192) &&
     isBoundedString(value.password, 1024)
+  );
+}
+
+// #2424: the SSO MFA proof the renderer routes to sso:completeMFA. `credentialOwner`
+// is the opaque number reserved at sign-in and echoed back through the mfa_challenge
+// result; `code` (TOTP/backup) and `assertion` (WebAuthn) are mutually exclusive by
+// method, but the control plane is the authority on which is required — this guard
+// only bounds shapes at the trust boundary.
+function isCompleteMFAPayload(value: unknown): value is SSOCompleteMFAPayload {
+  return (
+    isRecord(value) &&
+    isProvider(value.provider) &&
+    isBoundedString(value.mfaChallengeToken, 8192) &&
+    typeof value.credentialOwner === 'number' &&
+    Number.isSafeInteger(value.credentialOwner) &&
+    isBoundedString(value.method, 32) &&
+    (value.code === undefined || isBoundedString(value.code, 256)) &&
+    (value.assertion === undefined || isRecord(value.assertion))
   );
 }
 
@@ -271,6 +308,13 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
   const discardPendingCompletion = (completion: PendingSSOCompletion): void => {
     if (pendingCompletion === completion) pendingCompletion = null;
   };
+  // #2424: the reserved owner + challenge token held across an SSO MFA challenge,
+  // so sso:completeMFA can conditionally store the MFA credential under that exact
+  // owner. Cleared on a new sign-in, on completion, and on owner supersession.
+  let pendingMFA: PendingSSOMFA | null = null;
+  const discardPendingMFA = (mfa: PendingSSOMFA): void => {
+    if (pendingMFA === mfa) pendingMFA = null;
+  };
 
   const finishSignIn = async (
     result: MainSSOSignInResult,
@@ -321,15 +365,30 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
         branch: result.branch,
         ssoToken: result.ssoToken,
       };
-    } else if (result.kind === 'error') {
-      await revokeCookieBoundSession(apiBase, cookieBoundSessionId);
+      return result;
     }
-    if (result.kind !== 'sso_token') {
-      // MFA continuations publish a fresh owner through auth:storeRefreshToken;
-      // terminal errors own nothing. Release this reservation so switching to
-      // registration can safely use the pre-credential key staging path.
-      clearTokensIfOwner(credentialOwner);
+
+    if (result.kind === 'mfa_challenge') {
+      // #2424: preserve the reserved owner across the MFA challenge and return it
+      // to the renderer as opaque challenge context. sso:completeMFA re-validates
+      // it and stores the resulting credential owner-scoped, keeping the raw
+      // refresh token out of the renderer. Do NOT release the owner here — a
+      // released owner would force the renderer onto the unrestricted
+      // auth:storeRefreshToken path (the owner-CAS gap this change closes).
+      pendingMFA = {
+        apiBase,
+        credentialOwner,
+        provider,
+        mfaChallengeToken: result.mfaChallengeToken,
+      };
+      return { ...result, credentialOwner };
     }
+
+    // Terminal error (the only remaining kind): revoke the cookie-bound session
+    // and release this reservation so switching to registration can safely use
+    // the pre-credential key staging path.
+    await revokeCookieBoundSession(apiBase, cookieBoundSessionId);
+    clearTokensIfOwner(credentialOwner);
     return result;
   };
 
@@ -407,6 +466,82 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
     }
 
     pendingCompletion = null;
+    return {
+      kind: 'tokens',
+      accessToken: tokens.accessToken,
+      sessionId: tokens.sessionId,
+      credentialOwner: storedOwner,
+    };
+  };
+
+  // #2424: submit the SSO MFA proof to the control plane IN MAIN and store the
+  // resulting refresh credential under the reserved owner, so the raw refresh
+  // token never crosses into the renderer (parity with completeSSO / the direct
+  // SSO path). Mirrors completeSSO's owner-CAS + fail-closed shape.
+  const completeMFA = async (
+    mfa: PendingSSOMFA,
+    requestBody: Record<string, unknown>
+  ): Promise<SSOCompletionResult> => {
+    if (!credentialOwnerIsCurrent(mfa.credentialOwner)) {
+      discardPendingMFA(mfa);
+      return { kind: 'error', status: 409, code: 'sso_cancelled' };
+    }
+
+    let response: Response;
+    try {
+      response = await net.fetch(`${mfa.apiBase}/api/v1/auth/mfa/verify`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          // Same device-binding header the renderer sent pre-#2424; main now
+          // owns the POST, so it supplies the machine id for this apiBase.
+          'X-Machine-Id': getMachineId(mfa.apiBase),
+        },
+        credentials: 'include',
+        body: JSON.stringify(requestBody),
+      });
+    } catch {
+      return { kind: 'error', status: 0, code: 'sso_mfa_verify_failed' };
+    }
+
+    const cookieBoundSessionId = captureSessionId(response);
+    const body = await responseJson(response);
+    if (!response.ok) {
+      await revokeCookieBoundSession(mfa.apiBase, cookieBoundSessionId);
+      const safeBody = sanitizeCompletionErrorBody(body);
+      return {
+        kind: 'error',
+        status: response.status,
+        code: safeBody?.error_code ?? 'sso_mfa_verify_failed',
+        ...(safeBody ? { body: safeBody } : {}),
+      };
+    }
+
+    const tokens = parseCompletionTokens(body);
+    if (!tokens) {
+      await revokeCookieBoundSession(mfa.apiBase, cookieBoundSessionId);
+      discardPendingMFA(mfa);
+      clearTokensIfOwner(mfa.credentialOwner);
+      return { kind: 'error', status: 502, code: 'sso_session_rejected' };
+    }
+
+    const storedOwner = storeRefreshTokenIfOwner(
+      {
+        refreshToken: tokens.refreshToken,
+        rememberMe: tokens.rememberMe,
+        apiBase: mfa.apiBase,
+        accessToken: tokens.accessToken,
+      },
+      mfa.credentialOwner
+    );
+    if (storedOwner === null) {
+      await revokeCookieBoundSession(mfa.apiBase, cookieBoundSessionId);
+      await revokeExplicitSession(mfa.apiBase, tokens);
+      discardPendingMFA(mfa);
+      return { kind: 'error', status: 409, code: 'sso_cancelled' };
+    }
+
+    discardPendingMFA(mfa);
     return {
       kind: 'tokens',
       accessToken: tokens.accessToken,
@@ -512,6 +647,38 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
     }
   );
 
+  ipcMain.handle(
+    'sso:completeMFA',
+    async (event, requestedApiBase: unknown, payload: unknown): Promise<SSOCompletionResult> => {
+      if (!checkFrame(event, getSpaBaseUrl)) {
+        throw new Error('sso:completeMFA rejected: untrusted sender frame');
+      }
+      const apiBase = approvedApiBase(requestedApiBase);
+      if (!apiBase || !isCompleteMFAPayload(payload)) {
+        return { kind: 'error', status: 400, code: 'sso_invalid_request' };
+      }
+      const mfa = pendingMFA;
+      if (!mfa) {
+        return { kind: 'error', status: 409, code: 'sso_cancelled' };
+      }
+      if (
+        mfa.apiBase !== apiBase ||
+        mfa.provider !== payload.provider ||
+        mfa.credentialOwner !== payload.credentialOwner ||
+        mfa.mfaChallengeToken !== payload.mfaChallengeToken
+      ) {
+        return { kind: 'error', status: 409, code: 'sso_cancelled' };
+      }
+      const requestBody: Record<string, unknown> = {
+        mfa_challenge_token: payload.mfaChallengeToken,
+        method: payload.method,
+      };
+      if (payload.code !== undefined) requestBody.code = payload.code;
+      if (payload.assertion !== undefined) requestBody.assertion = payload.assertion;
+      return completeMFA(mfa, requestBody);
+    }
+  );
+
   ipcMain.handle('sso:appleSignIn', async (event, requestedApiBase: unknown) => {
     if (!checkFrame(event, getSpaBaseUrl)) {
       throw new Error('sso:appleSignIn rejected: untrusted sender frame');
@@ -522,6 +689,7 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
     }
     const credentialOwner = reserveCredentialOwner(apiBase);
     pendingCompletion = null;
+    pendingMFA = null;
     let cookieBoundSessionId: string | null = null;
     const result = await runAppleSignIn({
       apiBase,
@@ -571,6 +739,7 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
     }
     const credentialOwner = reserveCredentialOwner(apiBase);
     pendingCompletion = null;
+    pendingMFA = null;
     let cookieBoundSessionId: string | null = null;
     const result = await runGoogleSignIn({
       apiBase,

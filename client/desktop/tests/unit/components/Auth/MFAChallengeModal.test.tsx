@@ -1,11 +1,19 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
-import { useMFAChallengeStore } from '@/renderer/stores/mfaChallengeStore';
+import { useMFAChallengeStore, type MFAChallengeResult } from '@/renderer/stores/mfaChallengeStore';
+import { completeSSOMFA } from '@/renderer/services/ssoService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock global fetch
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
+
+// #2424: mock only completeSSOMFA (the sso_login verify path); keep the real
+// SSOServiceError class so the modal's error-branch instanceof check works.
+vi.mock('@/renderer/services/ssoService', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/services/ssoService')>();
+  return { ...actual, completeSSOMFA: vi.fn() };
+});
 
 // safeJson is mocked as a transparent passthrough so existing fetch mocks
 // (which only set ok / json / status) continue to work without supplying
@@ -168,6 +176,70 @@ describe('MFAChallengeModal', () => {
   it('renders nothing when no challenge token is present', () => {
     const { container } = render(<MFAChallengeModal />);
     expect(container.innerHTML).toBe('');
+  });
+
+  it('routes an SSO MFA proof through completeSSOMFA (main), not the renderer POST (#2424)', async () => {
+    const completion = { accessToken: 'sso-a', sessionId: 'sso-s', credentialOwner: 5 };
+    vi.mocked(completeSSOMFA).mockResolvedValueOnce(completion);
+    let resolved: MFAChallengeResult | undefined;
+    useMFAChallengeStore.setState({
+      challengeToken: 'sso-chal',
+      methods: ['totp'],
+      recoveryOnlyMethods: [],
+      purpose: 'sso_login',
+      ssoContext: { provider: 'google', credentialOwner: 5 },
+      resolve: (r) => {
+        resolved = r;
+      },
+    });
+
+    render(<MFAChallengeModal />);
+    fireEvent.click(screen.getByTestId('totp-submit'));
+
+    await waitFor(() => expect(completeSSOMFA).toHaveBeenCalledTimes(1));
+    expect(completeSSOMFA).toHaveBeenCalledWith(
+      {
+        provider: 'google',
+        mfaChallengeToken: 'sso-chal',
+        credentialOwner: 5,
+        method: 'totp',
+        code: '123456',
+      },
+      expect.anything()
+    );
+    // The SSO branch NEVER hits the renderer /auth/mfa/verify POST.
+    expect(mockFetch).not.toHaveBeenCalled();
+    await waitFor(() => expect(resolved).toEqual({ verified: true, ssoCompletion: completion }));
+  });
+
+  it('keeps the SSO modal open and shows the error_code when completeSSOMFA rejects (#2424)', async () => {
+    const { SSOServiceError } = await vi.importActual<
+      typeof import('@/renderer/services/ssoService')
+    >('@/renderer/services/ssoService');
+    vi.mocked(completeSSOMFA).mockRejectedValueOnce(
+      new SSOServiceError(401, 'sso_complete_mfa_failed_401', { error_code: 'mfa_code_invalid' })
+    );
+    let resolved: MFAChallengeResult | undefined;
+    useMFAChallengeStore.setState({
+      challengeToken: 'sso-chal',
+      methods: ['totp'],
+      recoveryOnlyMethods: [],
+      purpose: 'sso_login',
+      ssoContext: { provider: 'apple', credentialOwner: 8 },
+      resolve: (r) => {
+        resolved = r;
+      },
+    });
+
+    render(<MFAChallengeModal />);
+    fireEvent.click(screen.getByTestId('totp-submit'));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('totp-error')).toHaveTextContent('mfa_code_invalid')
+    );
+    // The challenge is NOT resolved on error — the modal stays open for retry.
+    expect(resolved).toBeUndefined();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('renders modal when challenge token is set', () => {

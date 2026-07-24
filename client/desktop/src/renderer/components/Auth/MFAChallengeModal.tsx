@@ -1,7 +1,8 @@
 import React, { useState, useCallback, useMemo } from 'react';
 import { useMFAChallengeStore, type MFAVerifyResponse } from '../../stores/mfaChallengeStore';
 import { ensureMachineId, safeJson } from '../../services/apiClient';
-import { apiUrl } from '../../services/runtimeServerBase';
+import { apiUrl, captureRuntimeServerSelection } from '../../services/runtimeServerBase';
+import { completeSSOMFA, SSOServiceError } from '../../services/ssoService';
 import TOTPInput from './TOTPInput';
 import BackupCodeInput from './BackupCodeInput';
 import WebAuthnPrompt from './WebAuthnPrompt';
@@ -12,10 +13,25 @@ import MFAMethodPicker, {
 } from './MFAMethodPicker';
 import './TOTPInput.css';
 
+// Maps a verify failure to a user-facing message (#2424). A non-2xx SSO verify
+// throws SSOServiceError carrying the server's error_code (wrong code / rate
+// limit); surface it and keep the modal open for retry. Never log token/proof
+// material — only the error `.message` per [internal]rules/observability.md.
+function resolveMfaProofError(err: unknown): string {
+  if (err instanceof SSOServiceError) {
+    const code = typeof err.body?.error_code === 'string' ? err.body.error_code : '';
+    return code || 'Verification failed. Please try again.';
+  }
+  console.error('MFA verify failed:', (err as Error).message);
+  return 'Verification failed. Please try again.';
+}
+
 const MFAChallengeModal: React.FC = () => {
   const challengeToken = useMFAChallengeStore((s) => s.challengeToken);
   const methods = useMFAChallengeStore((s) => s.methods);
   const recoveryOnlyMethods = useMFAChallengeStore((s) => s.recoveryOnlyMethods);
+  const purpose = useMFAChallengeStore((s) => s.purpose);
+  const ssoContext = useMFAChallengeStore((s) => s.ssoContext);
   const completeChallenge = useMFAChallengeStore((s) => s.completeChallenge);
   const clearChallenge = useMFAChallengeStore((s) => s.clearChallenge);
 
@@ -49,11 +65,34 @@ const MFAChallengeModal: React.FC = () => {
   );
   const hasMultipleMethods = available.length > 1;
 
-  const handleVerify = useCallback(
-    async (code: string, method: string) => {
+  // #2424: single verification path for both TOTP/backup and WebAuthn proofs.
+  // For the 'sso_login' purpose it routes the proof through the sso:completeMFA
+  // MAIN handler (refresh token never reaches the renderer); every other purpose
+  // keeps the existing renderer-side POST to /api/v1/auth/mfa/verify. The
+  // completeChallenge `forToken` argument binds the result to this challenge so a
+  // late proof cannot settle a superseding challenge (AC-11).
+  const submitMfaProof = useCallback(
+    async (proof: { method: string; code?: string; assertion?: unknown }): Promise<void> => {
+      if (!challengeToken) return;
       setLoading(true);
       setError('');
       try {
+        // `proof` already carries exactly the fields for its method ({method,code}
+        // or {method,assertion}), so it spreads directly into the payload/body.
+        if (purpose === 'sso_login' && ssoContext) {
+          const completion = await completeSSOMFA(
+            {
+              provider: ssoContext.provider,
+              mfaChallengeToken: challengeToken,
+              credentialOwner: ssoContext.credentialOwner,
+              ...proof,
+            },
+            captureRuntimeServerSelection()
+          );
+          completeChallenge({ verified: true, ssoCompletion: completion }, challengeToken);
+          return;
+        }
+
         const machineId = await ensureMachineId();
         const res = await fetch(apiUrl('/api/v1/auth/mfa/verify'), {
           method: 'POST',
@@ -62,27 +101,27 @@ const MFAChallengeModal: React.FC = () => {
             ...(machineId ? { 'X-Machine-Id': machineId } : {}),
           },
           credentials: 'include',
-          body: JSON.stringify({
-            mfa_challenge_token: challengeToken,
-            method,
-            code,
-          }),
+          body: JSON.stringify({ mfa_challenge_token: challengeToken, ...proof }),
         });
 
         const data = await safeJson<MFAVerifyResponse & { error?: string }>(res);
         if (res.ok) {
-          completeChallenge({ verified: true, payload: data });
+          completeChallenge({ verified: true, payload: data }, challengeToken);
         } else {
           setError(data.error || 'Verification failed');
         }
       } catch (err) {
-        console.error('MFA verify failed:', (err as Error).message);
-        setError('Verification failed. Please try again.');
+        setError(resolveMfaProofError(err));
       } finally {
         setLoading(false);
       }
     },
-    [challengeToken, completeChallenge]
+    [challengeToken, completeChallenge, purpose, ssoContext]
+  );
+
+  const handleVerify = useCallback(
+    (code: string, method: string) => submitMfaProof({ method, code }),
+    [submitMfaProof]
   );
 
   const handleWebAuthnSuccess = useCallback(
@@ -104,39 +143,9 @@ const MFAChallengeModal: React.FC = () => {
             : null,
         },
       };
-
-      setLoading(true);
-      setError('');
-      try {
-        const machineId = await ensureMachineId();
-        const res = await fetch(apiUrl('/api/v1/auth/mfa/verify'), {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(machineId ? { 'X-Machine-Id': machineId } : {}),
-          },
-          credentials: 'include',
-          body: JSON.stringify({
-            mfa_challenge_token: challengeToken,
-            method: 'webauthn',
-            assertion,
-          }),
-        });
-
-        const data = await safeJson<MFAVerifyResponse & { error?: string }>(res);
-        if (res.ok) {
-          completeChallenge({ verified: true, payload: data });
-        } else {
-          setError(data.error || 'Verification failed');
-        }
-      } catch (err) {
-        console.error('MFA WebAuthn verify failed:', (err as Error).message);
-        setError('Verification failed. Please try again.');
-      } finally {
-        setLoading(false);
-      }
+      await submitMfaProof({ method: 'webauthn', assertion });
     },
-    [challengeToken, completeChallenge]
+    [submitMfaProof]
   );
 
   const handleWebAuthnError = useCallback((errMsg: string) => {

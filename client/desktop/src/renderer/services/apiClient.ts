@@ -351,6 +351,9 @@ async function handleMfaChallengeIfNeeded(
   if (!authLifecycleIsCurrent(lifecycle)) return null;
   if (retryResult.status === 'ok' && retryResult.accessToken) {
     if (
+      // #2424: the union now also carries an SSO 'ssoCompletion' variant (never
+      // produced for the suspicious_refresh purpose); narrow to the payload one.
+      'payload' in mfaResult &&
       mfaResult.payload?.access_token &&
       mfaResult.payload.access_token !== retryResult.accessToken
     ) {

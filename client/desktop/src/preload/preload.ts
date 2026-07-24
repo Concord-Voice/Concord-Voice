@@ -4,6 +4,7 @@ import type { CredentialOwner, SelfHostedProbeResult } from '../main/ipcContract
 import type { AppleSignInResult } from '../shared/appleSso';
 import type {
   SSOCompleteLinkPayload,
+  SSOCompleteMFAPayload,
   SSOCompleteRegistrationPayload,
   SSOCompletionResult,
   SSOSignInResult,
@@ -401,6 +402,8 @@ contextBridge.exposeInMainWorld('electron', {
       apiBase: string,
       payload: SSOCompleteLinkPayload
     ): Promise<SSOCompletionResult> => ipcRenderer.invoke('sso:completeLink', apiBase, payload),
+    completeMFA: (apiBase: string, payload: SSOCompleteMFAPayload): Promise<SSOCompletionResult> =>
+      ipcRenderer.invoke('sso:completeMFA', apiBase, payload),
   },
 
   // Window chrome control surface (#806): renderer pushes Client Behavior
@@ -680,6 +683,7 @@ export interface ElectronAPI {
       apiBase: string,
       payload: SSOCompleteLinkPayload
     ) => Promise<SSOCompletionResult>;
+    completeMFA: (apiBase: string, payload: SSOCompleteMFAPayload) => Promise<SSOCompletionResult>;
   };
 
   // Window chrome control surface (#806)

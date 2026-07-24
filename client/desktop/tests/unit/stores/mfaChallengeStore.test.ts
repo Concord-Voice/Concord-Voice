@@ -94,4 +94,79 @@ describe('mfaChallengeStore', () => {
       .completeChallenge({ verified: true, payload: { access_token: 'tok' } });
     await promise;
   });
+
+  it('stores ssoContext and resolves the ssoCompletion variant for sso_login (#2424)', async () => {
+    const promise = useMFAChallengeStore
+      .getState()
+      .showChallenge('token-sso', ['totp'], 'sso_login', undefined, {
+        provider: 'apple',
+        credentialOwner: 12,
+      });
+    expect(useMFAChallengeStore.getState().ssoContext).toEqual({
+      provider: 'apple',
+      credentialOwner: 12,
+    });
+    expect(useMFAChallengeStore.getState().purpose).toBe('sso_login');
+
+    useMFAChallengeStore.getState().completeChallenge(
+      {
+        verified: true,
+        ssoCompletion: { accessToken: 'ax', sessionId: 'sx', credentialOwner: 12 },
+      },
+      'token-sso'
+    );
+    await expect(promise).resolves.toEqual({
+      verified: true,
+      ssoCompletion: { accessToken: 'ax', sessionId: 'sx', credentialOwner: 12 },
+    });
+    // State (including ssoContext) is cleared after completion.
+    expect(useMFAChallengeStore.getState().ssoContext).toBeNull();
+    expect(useMFAChallengeStore.getState().challengeToken).toBeNull();
+  });
+
+  it('a stale challenge-A completion does not settle a superseding challenge B (AC-11, #2424)', async () => {
+    // Challenge A
+    const promiseA = useMFAChallengeStore
+      .getState()
+      .showChallenge('token-A', ['totp'], 'sso_login', undefined, {
+        provider: 'google',
+        credentialOwner: 7,
+      });
+    let aSettled = false;
+    void promiseA.then(() => {
+      aSettled = true;
+    });
+    // Challenge B supersedes A (overwrites the active challenge + resolver).
+    const promiseB = useMFAChallengeStore
+      .getState()
+      .showChallenge('token-B', ['totp'], 'sso_login', undefined, {
+        provider: 'apple',
+        credentialOwner: 9,
+      });
+
+    // A late completion bound to challenge A must be IGNORED (token mismatch):
+    // it neither settles A nor clears the active challenge B.
+    useMFAChallengeStore
+      .getState()
+      .completeChallenge(
+        { verified: true, ssoCompletion: { accessToken: 'a', sessionId: 's', credentialOwner: 7 } },
+        'token-A'
+      );
+    await Promise.resolve();
+    expect(aSettled).toBe(false);
+    expect(useMFAChallengeStore.getState().challengeToken).toBe('token-B');
+
+    // A completion bound to challenge B settles B.
+    useMFAChallengeStore.getState().completeChallenge(
+      {
+        verified: true,
+        ssoCompletion: { accessToken: 'b', sessionId: 's2', credentialOwner: 9 },
+      },
+      'token-B'
+    );
+    await expect(promiseB).resolves.toEqual({
+      verified: true,
+      ssoCompletion: { accessToken: 'b', sessionId: 's2', credentialOwner: 9 },
+    });
+  });
 });

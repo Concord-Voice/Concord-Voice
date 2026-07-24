@@ -349,6 +349,33 @@ describe('useSSOFlow', () => {
     expect(useE2EEStore.getState().ready).toBe(false);
   });
 
+  it('logged_in: rolls back the owner-scoped gate when the auth publish fails (AC-8, #2424)', async () => {
+    mockedStartSSOFlow.mockResolvedValueOnce({
+      kind: 'logged_in',
+      accessToken: 'jwt-fail',
+      sessionId: 'session-fail',
+      credentialOwner: 77,
+    });
+    // Force the auth publish to fail AFTER the gate is armed (the reservation
+    // itself is still current), exercising the owner-scoped rollback path.
+    const spy = vi
+      .spyOn(useAuthStore.getState(), 'beginAuthLifecycleIfCurrent')
+      .mockReturnValueOnce(null);
+
+    const { result } = renderHook(() => useSSOFlow());
+    await act(async () => {
+      await result.current.begin('google');
+    });
+
+    expect(spy).toHaveBeenCalled();
+    // The gate was armed then rolled back (owner-scoped) — never left true
+    // against a session that was not published.
+    expect(useE2EEStore.getState().needsSSOUnlock).toBe(false);
+    expect(useE2EEStore.getState().ssoCredentialOwner).toBeNull();
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    spy.mockRestore();
+  });
+
   it('register_required: dispatches register_required phase with ssoToken and email', async () => {
     mockedStartSSOFlow.mockResolvedValueOnce({
       kind: 'register_required',
@@ -443,11 +470,12 @@ describe('useSSOFlow', () => {
     expect(useAuthStore.getState().accessToken).toBeNull();
   });
 
-  it('mfa_required: post-verify hydrates useAuthStore from payload and arms SSO unlock gate', async () => {
+  it('mfa_required: post-verify hydrates useAuthStore from the main-verified completion and arms SSO unlock gate', async () => {
     mockedStartSSOFlow.mockResolvedValueOnce({
       kind: 'mfa_required',
       mfaChallengeToken: 'mfa-chal-hydration',
       methods: ['totp'],
+      credentialOwner: 71,
     });
 
     const { result } = renderHook(() => useSSOFlow());
@@ -459,15 +487,15 @@ describe('useSSOFlow', () => {
     expect(useSSOStore.getState().state.phase).toBe('mfa_required');
     expect(useAuthStore.getState().accessToken).toBeNull();
 
-    // Simulate user completing MFA — modal calls completeChallenge with payload
+    // #2424: the SSO modal completes MFA in main (sso:completeMFA) and resolves
+    // the sanitized ssoCompletion tuple — no refresh token, no renderer store.
     await act(async () => {
       useMFAChallengeStore.getState().completeChallenge({
         verified: true,
-        payload: {
-          access_token: 'jwt-after-sso-mfa',
-          refresh_token: 'refresh-after-sso-mfa',
-          session_id: 'sess-after-sso-mfa',
-          remember_me: false,
+        ssoCompletion: {
+          accessToken: 'jwt-after-sso-mfa',
+          sessionId: 'sess-after-sso-mfa',
+          credentialOwner: 71,
         },
       });
       // Allow the .then handler to fire
@@ -476,12 +504,8 @@ describe('useSSOFlow', () => {
 
     expect(useAuthStore.getState().accessToken).toBe('jwt-after-sso-mfa');
     expect(useAuthStore.getState().sessionId).toBe('sess-after-sso-mfa');
-    expect(globalThis.electron.storeRefreshToken).toHaveBeenCalledWith({
-      refreshToken: 'refresh-after-sso-mfa',
-      rememberMe: false,
-      apiBase: getApiBase(),
-      accessToken: 'jwt-after-sso-mfa',
-    });
+    // The renderer NEVER stores the SSO MFA refresh token (main owns it).
+    expect(globalThis.electron.storeRefreshToken).not.toHaveBeenCalled();
     expect(useSSOStore.getState().state).toEqual({ phase: 'idle' });
     expect(useE2EEStore.getState().needsSSOUnlock).toBe(true);
     expect(useE2EEStore.getState().ssoCredentialOwner).toBe(71);
@@ -495,12 +519,14 @@ describe('useSSOFlow', () => {
         kind: 'mfa_required',
         mfaChallengeToken: 'stale-mfa-challenge',
         methods: ['totp'],
+        credentialOwner: 55,
       })
       .mockResolvedValueOnce({
         kind: 'register_required',
         ssoToken: 'new-registration-token',
         email: 'new@example.test',
       });
+    const clearTokensIfOwner = vi.mocked(globalThis.electron.clearTokensIfOwner);
 
     const { result } = renderHook(() => useSSOFlow());
     await act(async () => {
@@ -511,10 +537,10 @@ describe('useSSOFlow', () => {
     act(() => {
       useMFAChallengeStore.getState().completeChallenge({
         verified: true,
-        payload: {
-          access_token: 'stale-mfa-access',
-          refresh_token: 'stale-mfa-refresh',
-          session_id: 'stale-mfa-session',
+        ssoCompletion: {
+          accessToken: 'stale-mfa-access',
+          sessionId: 'stale-mfa-session',
+          credentialOwner: 55,
         },
       });
       newestPending = result.current.begin('apple');
@@ -527,6 +553,9 @@ describe('useSSOFlow', () => {
     expect(useAuthStore.getState().accessToken).toBeNull();
     expect(useE2EEStore.getState().needsSSOUnlock).toBe(false);
     expect(globalThis.electron.storeRefreshToken).not.toHaveBeenCalled();
+    // #2424: the stale completion's credential is cleaned OWNER-SCOPED in main;
+    // no refresh token exists in the renderer to revoke.
+    expect(clearTokensIfOwner).toHaveBeenCalledWith(55);
     expect(useSSOStore.getState().state).toEqual({
       phase: 'register_required',
       provider: 'apple',
@@ -536,143 +565,9 @@ describe('useSSOFlow', () => {
     });
     expect(mockedRevokeAbortedSession).toHaveBeenCalledWith({
       accessToken: 'stale-mfa-access',
-      refreshToken: 'stale-mfa-refresh',
       sessionId: 'stale-mfa-session',
       apiBase: getApiBase(),
     });
-  });
-
-  it('mfa_required: owner-cleans credentials when superseded during persistence', async () => {
-    mockedStartSSOFlow
-      .mockResolvedValueOnce({
-        kind: 'mfa_required',
-        mfaChallengeToken: 'persisting-mfa-challenge',
-        methods: ['totp'],
-      })
-      .mockResolvedValueOnce({
-        kind: 'register_required',
-        ssoToken: 'successor-registration-token',
-        email: 'successor@example.test',
-      });
-    const storedOwner = deferred<number>();
-    const storeRefreshToken = vi.fn().mockReturnValue(storedOwner.promise);
-    const clearTokensIfOwner = vi.mocked(globalThis.electron.clearTokensIfOwner);
-    Object.defineProperty(globalThis, 'electron', {
-      value: { ...globalThis.electron, storeRefreshToken },
-      writable: true,
-    });
-
-    const { result } = renderHook(() => useSSOFlow());
-    await act(async () => {
-      await result.current.begin('google');
-    });
-    act(() => {
-      useMFAChallengeStore.getState().completeChallenge({
-        verified: true,
-        payload: {
-          access_token: 'persisting-access',
-          refresh_token: 'persisting-refresh',
-          session_id: 'persisting-session',
-        },
-      });
-    });
-    await vi.waitFor(() => expect(storeRefreshToken).toHaveBeenCalledOnce());
-
-    await act(async () => {
-      await result.current.begin('apple');
-    });
-    storedOwner.resolve(81);
-    await vi.waitFor(() => expect(clearTokensIfOwner).toHaveBeenCalledWith(81));
-
-    expect(useAuthStore.getState().accessToken).toBeNull();
-    expect(useE2EEStore.getState().ssoCredentialOwner).toBeNull();
-    expect(useSSOStore.getState().state).toEqual({
-      phase: 'register_required',
-      provider: 'apple',
-      ssoToken: 'successor-registration-token',
-      email: 'successor@example.test',
-      name: undefined,
-    });
-    expect(mockedRevokeAbortedSession).toHaveBeenCalledWith({
-      accessToken: 'persisting-access',
-      refreshToken: 'persisting-refresh',
-      sessionId: 'persisting-session',
-      apiBase: getApiBase(),
-    });
-  });
-
-  it('mfa_required: rejects and revokes an incomplete credential tuple', async () => {
-    mockedStartSSOFlow.mockResolvedValueOnce({
-      kind: 'mfa_required',
-      mfaChallengeToken: 'mfa-chal-no-session',
-      methods: ['totp'],
-    });
-
-    const { result } = renderHook(() => useSSOFlow());
-    await act(async () => {
-      await result.current.begin('google');
-    });
-
-    await act(async () => {
-      useMFAChallengeStore.getState().completeChallenge({
-        verified: true,
-        payload: {
-          access_token: 'tok-no-sess',
-          refresh_token: 'refresh-no-sess',
-        },
-      });
-      await Promise.resolve();
-    });
-
-    expect(useAuthStore.getState().accessToken).toBeNull();
-    expect(useAuthStore.getState().sessionId).toBeNull();
-    expect(useSSOStore.getState().state).toEqual({
-      phase: 'error',
-      message: 'mfa_verify_missing_token',
-    });
-    expect(useE2EEStore.getState().needsSSOUnlock).toBe(false);
-    expect(globalThis.electron.storeRefreshToken).not.toHaveBeenCalled();
-    expect(mockedRevokeAbortedSession).toHaveBeenCalledWith({
-      accessToken: 'tok-no-sess',
-      refreshToken: 'refresh-no-sess',
-      sessionId: null,
-      apiBase: getApiBase(),
-    });
-  });
-
-  it('mfa_required: post-verify with verified=true but missing access_token surfaces an error', async () => {
-    mockedStartSSOFlow.mockResolvedValueOnce({
-      kind: 'mfa_required',
-      mfaChallengeToken: 'mfa-chal-no-token',
-      methods: ['totp'],
-    });
-
-    const { result } = renderHook(() => useSSOFlow());
-    await act(async () => {
-      await result.current.begin('google');
-    });
-
-    // Simulate the unexpected case: server returned verified=true but no
-    // access_token (e.g., the suspicious_refresh shape). The SSO path
-    // expects PurposeLogin to be encoded in the challenge token and a full
-    // payload to come back; if it doesn't, surface as an error rather than
-    // silently dropping the user at idle.
-    await act(async () => {
-      useMFAChallengeStore.getState().completeChallenge({
-        verified: true,
-        payload: {},
-      });
-      await Promise.resolve();
-    });
-
-    const state = useSSOStore.getState().state;
-    expect(state.phase).toBe('error');
-    if (state.phase === 'error') {
-      expect(state.message).toBe('mfa_verify_missing_token');
-    }
-    // Auth store remains uncorrupted.
-    expect(useAuthStore.getState().accessToken).toBeNull();
-    expect(useE2EEStore.getState().needsSSOUnlock).toBe(false);
   });
 
   it('mfa_required: cancellation resets SSO state without hydrating useAuthStore', async () => {

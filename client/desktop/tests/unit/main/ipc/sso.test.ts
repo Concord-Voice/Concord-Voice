@@ -189,6 +189,13 @@ vi.mock('../../../../src/main/tokenManager', () => ({
   clearTokensIfOwner: tokenMocks.clearTokensIfOwner,
 }));
 
+// #2424: sso:completeMFA supplies X-Machine-Id via getMachineId; mock it to a
+// fixed UUID so the MFA-verify POST is deterministic and touches no real file.
+const TEST_MACHINE_ID = '33333333-3333-4333-8333-333333333333';
+vi.mock('../../../../src/main/machineId', () => ({
+  getMachineId: vi.fn(() => TEST_MACHINE_ID),
+}));
+
 import { registerSSOIPC } from '@/main/ipc/sso';
 
 interface FakeInvokeEvent {
@@ -245,6 +252,11 @@ describe('sso IPC handlers', () => {
     apiBase: unknown,
     payload: unknown
   ) => Promise<unknown>;
+  let completeMFAHandler: (
+    event: FakeInvokeEvent,
+    apiBase: unknown,
+    payload: unknown
+  ) => Promise<unknown>;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -283,11 +295,13 @@ describe('sso IPC handlers', () => {
       (c) => c[0] === 'sso:completeRegistration'
     );
     const completeLinkCall = mocked.handleSpy.mock.calls.find((c) => c[0] === 'sso:completeLink');
-    if (!completeRegistrationCall || !completeLinkCall) {
+    const completeMFACall = mocked.handleSpy.mock.calls.find((c) => c[0] === 'sso:completeMFA');
+    if (!completeRegistrationCall || !completeLinkCall || !completeMFACall) {
       throw new Error('SSO completion IPC handlers not registered');
     }
     completeRegistrationHandler = completeRegistrationCall[1];
     completeLinkHandler = completeLinkCall[1];
+    completeMFAHandler = completeMFACall[1];
   });
 
   describe('sender-frame validation', () => {
@@ -763,6 +777,249 @@ describe('sso IPC handlers', () => {
       ).rejects.toThrow(/untrusted/i);
       expect(net.fetch).not.toHaveBeenCalled();
       expect(tokenMocks.storeRefreshTokenIfOwner).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('SSO MFA completion (#2424)', () => {
+    // Drive a google sign-in that returns mfa_challenge, establishing pendingMFA
+    // + the reserved owner (41). finishSignIn attaches the owner to the result.
+    async function beginGoogleMFA(token = 'mfa-tok-1') {
+      googleMocks.runGoogleSignIn.mockImplementationOnce(
+        async () =>
+          ({
+            kind: 'mfa_challenge',
+            mfaChallengeToken: token,
+            methods: ['totp'],
+          }) as never
+      );
+      return googleSignInHandler({ senderFrame: { url: TRUSTED } }, SAAS_API_BASE);
+    }
+
+    const totpPayload = {
+      provider: 'google' as const,
+      mfaChallengeToken: 'mfa-tok-1',
+      credentialOwner: 41,
+      method: 'totp',
+      code: '123456',
+    };
+
+    it('preserves the reserved owner across mfa_challenge and returns it as challenge context', async () => {
+      await expect(beginGoogleMFA()).resolves.toEqual({
+        kind: 'mfa_challenge',
+        mfaChallengeToken: 'mfa-tok-1',
+        methods: ['totp'],
+        credentialOwner: 41,
+      });
+      // The owner was NOT released (no clearTokensIfOwner on the MFA branch).
+      expect(tokenMocks.clearTokensIfOwner).not.toHaveBeenCalled();
+    });
+
+    it('verifies MFA in main, stores the owner-bound credential, and sanitizes IPC', async () => {
+      await beginGoogleMFA();
+      vi.mocked(net.fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: 'mfa-access',
+            refresh_token: 'mfa-refresh',
+            session_id: SUCCESS_SESSION_ID,
+            remember_me: true,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+
+      const result = await completeMFAHandler(
+        { senderFrame: { url: TRUSTED } },
+        SAAS_API_BASE,
+        totpPayload
+      );
+
+      expect(result).toEqual({
+        kind: 'tokens',
+        accessToken: 'mfa-access',
+        sessionId: SUCCESS_SESSION_ID,
+        credentialOwner: 41,
+      });
+      expect(result).not.toHaveProperty('refreshToken');
+      expect(JSON.stringify(result)).not.toContain('mfa-refresh');
+      // Refresh credential stored owner-scoped in main (never returned).
+      expect(tokenMocks.storeRefreshTokenIfOwner).toHaveBeenCalledWith(
+        {
+          accessToken: 'mfa-access',
+          refreshToken: 'mfa-refresh',
+          rememberMe: true,
+          apiBase: SAAS_API_BASE,
+        },
+        41
+      );
+      // Verify happened in main, with the machine-id header and the exact body.
+      expect(net.fetch).toHaveBeenCalledWith(`${SAAS_API_BASE}/api/v1/auth/mfa/verify`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Machine-Id': TEST_MACHINE_ID,
+        },
+        credentials: 'include',
+        body: JSON.stringify({
+          mfa_challenge_token: 'mfa-tok-1',
+          method: 'totp',
+          code: '123456',
+        }),
+      });
+    });
+
+    it('carries a WebAuthn assertion through to the verify body', async () => {
+      await beginGoogleMFA();
+      vi.mocked(net.fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: 'mfa-access-wa',
+            refresh_token: 'mfa-refresh-wa',
+            session_id: SUCCESS_SESSION_ID,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+
+      const result = await completeMFAHandler({ senderFrame: { url: TRUSTED } }, SAAS_API_BASE, {
+        provider: 'google',
+        mfaChallengeToken: 'mfa-tok-1',
+        credentialOwner: 41,
+        method: 'webauthn',
+        assertion: { id: 'cred-1', rawId: 'AAAA' },
+      });
+
+      expect(result).toMatchObject({ kind: 'tokens', credentialOwner: 41 });
+      expect(net.fetch).toHaveBeenCalledWith(`${SAAS_API_BASE}/api/v1/auth/mfa/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Machine-Id': TEST_MACHINE_ID },
+        credentials: 'include',
+        body: JSON.stringify({
+          mfa_challenge_token: 'mfa-tok-1',
+          method: 'webauthn',
+          assertion: { id: 'cred-1', rawId: 'AAAA' },
+        }),
+      });
+    });
+
+    it('rejects an untrusted sender frame before any network or credential access', async () => {
+      await beginGoogleMFA();
+      await expect(
+        completeMFAHandler({ senderFrame: { url: UNTRUSTED } }, SAAS_API_BASE, totpPayload)
+      ).rejects.toThrow(/untrusted/i);
+      expect(net.fetch).not.toHaveBeenCalled();
+      expect(tokenMocks.storeRefreshTokenIfOwner).not.toHaveBeenCalled();
+    });
+
+    it('rejects a malformed payload with 400 and no side effects', async () => {
+      await beginGoogleMFA();
+      const result = await completeMFAHandler({ senderFrame: { url: TRUSTED } }, SAAS_API_BASE, {
+        provider: 'google',
+        mfaChallengeToken: 'mfa-tok-1',
+        credentialOwner: 41,
+        // method missing → isCompleteMFAPayload fails
+      });
+      expect(result).toEqual({ kind: 'error', status: 400, code: 'sso_invalid_request' });
+      expect(net.fetch).not.toHaveBeenCalled();
+      expect(tokenMocks.storeRefreshTokenIfOwner).not.toHaveBeenCalled();
+    });
+
+    it('rejects a payload whose owner/token does not match pendingMFA (409, no fetch/store)', async () => {
+      await beginGoogleMFA();
+      const result = await completeMFAHandler({ senderFrame: { url: TRUSTED } }, SAAS_API_BASE, {
+        ...totpPayload,
+        credentialOwner: 999, // not the reserved owner
+      });
+      expect(result).toEqual({ kind: 'error', status: 409, code: 'sso_cancelled' });
+      expect(net.fetch).not.toHaveBeenCalled();
+      expect(tokenMocks.storeRefreshTokenIfOwner).not.toHaveBeenCalled();
+    });
+
+    it('surfaces only allowlisted verify-error fields, never leaks refresh material, and preserves the reservation', async () => {
+      await beginGoogleMFA();
+      vi.mocked(net.fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error_code: 'mfa_code_invalid',
+            detail: 'Try again',
+            attempts_remaining: 2,
+            refresh_token: 'must-not-cross-ipc',
+            access_token: 'must-not-cross-ipc',
+          }),
+          { status: 401, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+
+      const result = await completeMFAHandler(
+        { senderFrame: { url: TRUSTED } },
+        SAAS_API_BASE,
+        totpPayload
+      );
+      expect(result).toEqual({
+        kind: 'error',
+        status: 401,
+        code: 'mfa_code_invalid',
+        body: { error_code: 'mfa_code_invalid', detail: 'Try again', attempts_remaining: 2 },
+      });
+      expect(JSON.stringify(result)).not.toContain('must-not-cross-ipc');
+      expect(tokenMocks.storeRefreshTokenIfOwner).not.toHaveBeenCalled();
+      // Reservation preserved: a retry still reaches the network (pendingMFA intact).
+      vi.mocked(net.fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: 'mfa-access-retry',
+            refresh_token: 'mfa-refresh-retry',
+            session_id: SUCCESS_SESSION_ID,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+      const retry = await completeMFAHandler(
+        { senderFrame: { url: TRUSTED } },
+        SAAS_API_BASE,
+        totpPayload
+      );
+      expect(retry).toMatchObject({ kind: 'tokens', credentialOwner: 41 });
+    });
+
+    it('revokes a delayed completion that loses the credential-owner race (TOCTOU)', async () => {
+      await beginGoogleMFA();
+      let resolveVerify!: (response: Response) => void;
+      vi.mocked(net.fetch)
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              resolveVerify = resolve;
+            })
+        )
+        .mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+      const delayed = completeMFAHandler(
+        { senderFrame: { url: TRUSTED } },
+        SAAS_API_BASE,
+        totpPayload
+      );
+      await vi.waitFor(() => expect(net.fetch).toHaveBeenCalledTimes(1));
+      tokenMocks.supersedeCredential(); // a successor establishes credentials mid-verify
+      resolveVerify(
+        new Response(
+          JSON.stringify({
+            access_token: 'stale-access',
+            refresh_token: 'stale-refresh',
+            session_id: SUCCESS_SESSION_ID,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+
+      await expect(delayed).resolves.toEqual({ kind: 'error', status: 409, code: 'sso_cancelled' });
+      // The CAS store rejected (owner no longer current) — no successor overwrite.
+      expect(tokenMocks.storeRefreshTokenIfOwner).toHaveReturnedWith(null);
+      expect(net.fetch).toHaveBeenLastCalledWith(`${SAAS_API_BASE}/api/v1/auth/logout`, {
+        method: 'POST',
+        credentials: 'omit',
+        headers: { Authorization: 'Bearer stale-access', 'X-Refresh-Token': 'stale-refresh' },
+      });
     });
   });
 

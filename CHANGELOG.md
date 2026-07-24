@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.33] — 2026-07-24
+
+### Security
+
+- **Single sign-in with two-step verification stays bound to the right account** ([#2424](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2424)) — completing two-step verification during a social sign-in now finishes securely in the app's protected process and keeps your credentials tied to that exact sign-in, so a stale or superseded sign-in can no longer overwrite a newer session. The main window also never unlocks before your encryption is ready for the account that just signed in.
+
 ## [0.2.32] — 2026-07-22
 
 ### Fixed

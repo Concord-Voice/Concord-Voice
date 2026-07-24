@@ -1,5 +1,7 @@
 import { createStore } from '../utils/createStore';
 import type { UserProfile } from './userStore';
+import type { CredentialOwner } from '../../main/ipcContract';
+import type { SSOCompletionResult, SSOProvider } from '../services/ssoService';
 
 /**
  * Purpose discriminates which interceptor / flow is awaiting the MFA result.
@@ -16,12 +18,23 @@ import type { UserProfile } from './userStore';
  *   provider callback; useSSOFlow awaits the verified result before flipping
  *   the SSO store to idle and rehydrating E2EE.
  *
- * MFAChallengeModal does NOT branch on purpose — both paths render the same
- * UI and POST to /api/v1/auth/mfa/verify. The discriminator exists so future
- * cancel-flow analytics or per-flow logging can act on it (no telemetry
- * pipeline exists today; Sentry was removed per project memory).
+ * MFAChallengeModal renders the same UI for both purposes but branches on it at
+ * verification (#2424): 'suspicious_refresh' POSTs /api/v1/auth/mfa/verify from
+ * the renderer (unchanged), while 'sso_login' routes the proof through the
+ * `sso:completeMFA` main handler so the SSO refresh token never crosses IPC. The
+ * SSO branch requires `ssoContext` (provider + reserved owner) to be present.
  */
 type MFAChallengePurpose = 'suspicious_refresh' | 'sso_login';
+
+/**
+ * SSO-only routing context (#2424). Present on the store ONLY for the
+ * 'sso_login' purpose, so MFAChallengeModal can call `sso:completeMFA` with the
+ * owner reserved at sign-in. Absent (null) for 'suspicious_refresh'.
+ */
+export interface MFASSOContext {
+  provider: SSOProvider;
+  credentialOwner: CredentialOwner;
+}
 
 /**
  * Shape of the POST /api/v1/auth/mfa/verify response body.
@@ -66,6 +79,9 @@ export interface MFAVerifyResponse {
  */
 export type MFAChallengeResult =
   | { verified: true; payload: MFAVerifyResponse }
+  // #2424: SSO MFA completes in main (sso:completeMFA); the renderer receives
+  // only the sanitized access/session/owner tuple, never a refresh token.
+  | { verified: true; ssoCompletion: SSOCompletionResult }
   | { verified: false };
 
 interface MFAChallengeState {
@@ -87,6 +103,11 @@ interface MFAChallengeState {
    * unchanged for source compatibility.
    */
   webauthnOptions: PublicKeyCredentialRequestOptions | null;
+  /**
+   * SSO routing context (#2424). Non-null only for the 'sso_login' purpose;
+   * carries the provider + owner the modal needs to call `sso:completeMFA`.
+   */
+  ssoContext: MFASSOContext | null;
   /** Promise resolver — the interceptor awaits this */
   resolve: ((result: MFAChallengeResult) => void) | null;
 
@@ -95,10 +116,17 @@ interface MFAChallengeState {
     token: string,
     methods: string[],
     purpose: MFAChallengePurpose,
-    recoveryOnlyMethods?: string[]
+    recoveryOnlyMethods?: string[],
+    ssoContext?: MFASSOContext
   ) => Promise<MFAChallengeResult>;
-  /** Called by the modal after successful MFA verification */
-  completeChallenge: (result: MFAChallengeResult) => void;
+  /**
+   * Called by the modal after successful MFA verification. `forToken` (#2424)
+   * binds the completion to the challenge it was collected against: if it no
+   * longer matches the active `challengeToken`, the late result is ignored so a
+   * stale challenge-A completion cannot resolve or clear a superseding
+   * challenge B (AC-11). Omitted → unconditional (back-compat).
+   */
+  completeChallenge: (result: MFAChallengeResult, forToken?: string) => void;
   /** Clear the challenge state (cancel path) */
   clearChallenge: () => void;
 }
@@ -109,9 +137,10 @@ export const useMFAChallengeStore = createStore<MFAChallengeState>()((set, get) 
   recoveryOnlyMethods: [],
   purpose: null,
   webauthnOptions: null,
+  ssoContext: null,
   resolve: null,
 
-  showChallenge: (token, methods, purpose, recoveryOnlyMethods) => {
+  showChallenge: (token, methods, purpose, recoveryOnlyMethods, ssoContext) => {
     return new Promise<MFAChallengeResult>((resolve) => {
       set({
         challengeToken: token,
@@ -119,12 +148,16 @@ export const useMFAChallengeStore = createStore<MFAChallengeState>()((set, get) 
         recoveryOnlyMethods: recoveryOnlyMethods || [],
         purpose,
         webauthnOptions: null,
+        ssoContext: ssoContext ?? null,
         resolve,
       });
     });
   },
 
-  completeChallenge: (result) => {
+  completeChallenge: (result, forToken) => {
+    // AC-11: a completion collected against a superseded challenge must not
+    // settle or clear the current one. Ignore it if the token no longer matches.
+    if (forToken !== undefined && forToken !== get().challengeToken) return;
     const { resolve } = get();
     if (resolve) resolve(result);
     set({
@@ -133,6 +166,7 @@ export const useMFAChallengeStore = createStore<MFAChallengeState>()((set, get) 
       recoveryOnlyMethods: [],
       purpose: null,
       webauthnOptions: null,
+      ssoContext: null,
       resolve: null,
     });
   },
@@ -146,6 +180,7 @@ export const useMFAChallengeStore = createStore<MFAChallengeState>()((set, get) 
       recoveryOnlyMethods: [],
       purpose: null,
       webauthnOptions: null,
+      ssoContext: null,
       resolve: null,
     });
   },

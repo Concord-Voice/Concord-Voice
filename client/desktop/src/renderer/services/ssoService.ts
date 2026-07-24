@@ -24,8 +24,9 @@ import type { RuntimeServerSelection } from './runtimeServerBase';
 import type { AppleSignInResult } from '@/shared/appleSso';
 import type {
   SSOCompleteLinkPayload,
-  SSOCompleteRegistrationPayload,
+  SSOCompleteMFAPayload,
   SSOCompletionResult as IPCSSOCompletionResult,
+  SSOCompleteRegistrationPayload,
   SSOSignInResult,
 } from '@/shared/sso';
 
@@ -53,6 +54,13 @@ export type SSOResult =
       recoveryOnlyMethods?: string[];
       /** PublicKeyCredentialRequestOptions when "webauthn" is in methods */
       webauthnOptions?: unknown;
+      /**
+       * #2424: the opaque owner reserved at SSO sign-in, preserved across the MFA
+       * challenge. The renderer carries it to `sso:completeMFA` so main stores the
+       * resulting refresh credential under this exact owner — the refresh token
+       * never returns to the renderer.
+       */
+      credentialOwner: CredentialOwner;
     }
   | { kind: 'register_required'; ssoToken: string; email: string; name?: string }
   | { kind: 'link_available'; ssoToken: string; maskedEmail: string };
@@ -120,6 +128,7 @@ function mapSSOResult(result: SSOSignInResult): SSOResult {
         methods: result.methods,
         recoveryOnlyMethods: result.recoveryOnlyMethods,
         webauthnOptions: result.webauthnOptions,
+        credentialOwner: result.credentialOwner,
       };
     case 'sso_token':
       if (result.branch === 'new_user') {
@@ -186,5 +195,22 @@ export async function completeSSOLink(
   return unwrapCompletionResult(
     await globalThis.electron.sso.completeLink(serverSelection.apiBase, params),
     'sso_complete_link_failed'
+  );
+}
+
+/**
+ * Complete an SSO MFA challenge (#2424). Submits the MFA proof (TOTP/backup code
+ * or WebAuthn assertion) plus the owner reserved at sign-in to the `sso:completeMFA`
+ * main handler, which performs the /auth/mfa/verify exchange in main and stores
+ * the refresh credential under that owner. Returns only a renderer-safe
+ * access/session reference plus the owner — the refresh token never crosses IPC.
+ */
+export async function completeSSOMFA(
+  params: SSOCompleteMFAPayload,
+  serverSelection: RuntimeServerSelection
+): Promise<SSOCompletionResult> {
+  return unwrapCompletionResult(
+    await globalThis.electron.sso.completeMFA(serverSelection.apiBase, params),
+    'sso_complete_mfa_failed'
   );
 }

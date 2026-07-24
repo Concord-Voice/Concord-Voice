@@ -15,14 +15,15 @@
 
 import { useCallback } from 'react';
 import { useSSOStore, type SSOState } from '../stores/ssoStore';
-import { startSSOFlow, type SSOProvider, type SSOResult } from '../services/ssoService';
+import {
+  startSSOFlow,
+  type SSOProvider,
+  type SSOResult,
+  type SSOCompletionResult,
+} from '../services/ssoService';
 import { useAuthStore } from '../stores/authStore';
 import { useE2EEStore } from '../stores/e2eeStore';
-import {
-  useMFAChallengeStore,
-  type MFAVerifyResponse,
-  type MFAChallengeResult,
-} from '../stores/mfaChallengeStore';
+import { useMFAChallengeStore, type MFAChallengeResult } from '../stores/mfaChallengeStore';
 import { revokeAbortedSession } from '../services/apiClient';
 import {
   captureRuntimeServerSelection,
@@ -56,64 +57,64 @@ async function discardDirectSSOSession(
 }
 
 async function discardMFASession(
-  payload: MFAVerifyResponse,
-  serverSelection: RuntimeServerSelection,
-  credentialOwner?: CredentialOwner
+  completion: SSOCompletionResult,
+  serverSelection: RuntimeServerSelection
 ): Promise<void> {
+  // #2424: main stored the refresh credential under `credentialOwner`, so the
+  // renderer discards it owner-scoped (clearTokensIfOwner) and revokes the
+  // issued session by its access/session reference. No refresh token exists here.
   await Promise.allSettled([
-    credentialOwner === undefined
-      ? undefined
-      : globalThis.electron?.clearTokensIfOwner?.(credentialOwner),
+    globalThis.electron?.clearTokensIfOwner?.(completion.credentialOwner),
     revokeAbortedSession({
-      accessToken: payload.access_token ?? null,
-      refreshToken: payload.refresh_token ?? null,
-      sessionId: payload.session_id ?? null,
+      accessToken: completion.accessToken,
+      sessionId: completion.sessionId,
       apiBase: serverSelection.apiBase,
     }),
   ]);
 }
 
 /**
- * Persist the verified MFA session's refresh token and admit the auth lifecycle.
- * Split out of `handleSSOMfaResult` so both stay under the S3776
- * cognitive-complexity threshold; the persist/admit ordering and every
- * `reservationIsCurrent` fence are preserved exactly. Reached only after the
- * caller has validated the credential tuple and re-checked the reservation.
+ * AC-8: roll back the SSO eager-unlock gate ONLY while it still belongs to this
+ * flow's owner. A superseding flow may have re-armed the gate under its own
+ * owner between our arming and a failed auth publish; clearing it unconditionally
+ * would strip the successor's gate. Compares the live gate owner before clearing.
+ */
+function rollbackSSOUnlockGate(credentialOwner: CredentialOwner): void {
+  const e2ee = useE2EEStore.getState();
+  if (e2ee.needsSSOUnlock && e2ee.ssoCredentialOwner === credentialOwner) {
+    e2ee.setNeedsSSOUnlock(false);
+  }
+}
+
+/**
+ * Admit the SSO MFA session main already verified and stored (#2424).
+ *
+ * The refresh credential was persisted in main under `completion.credentialOwner`
+ * via `sso:completeMFA` (storeRefreshTokenIfOwner) — the renderer holds only the
+ * sanitized access/session/owner tuple and never a refresh token, so there is NO
+ * unrestricted `storeRefreshToken` call here. The E2EE unlock gate is armed with
+ * that owner BEFORE the auth lifecycle publishes (AC-7); a lost currentness check
+ * rolls the gate back only while it still belongs to this owner (AC-8). Split out
+ * of `handleSSOMfaResult` to stay under the S3776 cognitive-complexity threshold.
  */
 async function admitVerifiedSSOMfaSession(
-  payload: MFAVerifyResponse,
-  accessToken: string,
-  refreshToken: string,
-  sessionId: string,
+  completion: SSOCompletionResult,
   reservationGeneration: number,
   serverSelection: RuntimeServerSelection,
   setState: (state: SSOState) => void
 ): Promise<void> {
-  let credentialOwner: CredentialOwner | undefined;
-  try {
-    const storedOwner = await globalThis.electron?.storeRefreshToken?.({
-      refreshToken,
-      rememberMe: payload.remember_me ?? true,
-      apiBase: serverSelection.apiBase,
-      accessToken,
-    });
-    if (typeof storedOwner !== 'number') {
-      throw new TypeError('SSO MFA refresh-token persistence was rejected');
-    }
-    credentialOwner = storedOwner;
-  } catch {
-    await discardMFASession(payload, serverSelection, credentialOwner);
-    if (!reservationIsCurrent(reservationGeneration, serverSelection)) return;
-    setState({ phase: 'error', message: 'sso_mfa_persistence_failed' });
-    return;
-  }
+  const { accessToken, sessionId, credentialOwner } = completion;
   if (!reservationIsCurrent(reservationGeneration, serverSelection)) {
-    await discardMFASession(payload, serverSelection, credentialOwner);
+    await discardMFASession(completion, serverSelection);
     return;
   }
 
-  // E2EE unwrap is passphrase-based via SSOEagerUnlock — do
-  // not derive crypto material from the MFA verify payload.
+  // AC-7: arm the owner-bound gate before publishing auth, so any synchronous
+  // auth-store subscriber that sees a non-null access token also sees
+  // needsSSOUnlock=true with this owner (no transient E2EE-bypass window). E2EE
+  // unwrap stays passphrase-based via SSOEagerUnlock — never derived from MFA.
+  useE2EEStore.getState().setNeedsSSOUnlock(true, credentialOwner);
+
   const admittedGeneration = useAuthStore
     .getState()
     .beginAuthLifecycleIfCurrent(reservationGeneration, accessToken, sessionId);
@@ -124,10 +125,10 @@ async function admitVerifiedSSOMfaSession(
     ) {
       useAuthStore.getState().clearAccessToken();
     }
-    await discardMFASession(payload, serverSelection, credentialOwner);
+    rollbackSSOUnlockGate(credentialOwner);
+    await discardMFASession(completion, serverSelection);
     return;
   }
-  useE2EEStore.getState().setNeedsSSOUnlock(true, credentialOwner);
   setState({ phase: 'idle' });
 }
 
@@ -143,40 +144,24 @@ async function handleSSOMfaResult(
   serverSelection: RuntimeServerSelection,
   setState: (state: SSOState) => void
 ): Promise<void> {
-  if (mfaResult.verified) {
-    const payload = mfaResult.payload;
-    const accessToken = payload.access_token;
-    const refreshToken = payload.refresh_token;
-    const sessionId = payload.session_id;
-    if (!accessToken || !refreshToken || !sessionId) {
-      await discardMFASession(payload, serverSelection);
-      if (!reservationIsCurrent(reservationGeneration, serverSelection)) return;
-      console.error('SSO MFA verify returned an incomplete credential tuple');
-      setState({ phase: 'error', message: 'mfa_verify_missing_token' });
-      return;
-    }
-    if (!reservationIsCurrent(reservationGeneration, serverSelection)) {
-      await discardMFASession(payload, serverSelection);
-      return;
-    }
-
+  // The SSO modal branch resolves the main-verified `ssoCompletion` variant
+  // (#2424): main already ran /auth/mfa/verify and stored the refresh credential
+  // owner-scoped, so the renderer receives only access/session/owner. A
+  // verification failure keeps the modal open and does NOT resolve, so `verified`
+  // is only ever true-with-ssoCompletion (success) or false (explicit cancel).
+  if (mfaResult.verified && 'ssoCompletion' in mfaResult) {
     await admitVerifiedSSOMfaSession(
-      payload,
-      accessToken,
-      refreshToken,
-      sessionId,
+      mfaResult.ssoCompletion,
       reservationGeneration,
       serverSelection,
       setState
     );
   } else {
     if (!reservationIsCurrent(reservationGeneration, serverSelection)) return;
-    // verified:false. The user cancelled (clearChallenge fires
-    // resolve({ verified: false })) or the modal was cleared.
-    // The verification-failed case never reaches this branch:
-    // MFAChallengeModal stays open on a !res.ok response and
-    // does NOT resolve the promise; the user must cancel
-    // explicitly to leave that state.
+    // verified:false — the user cancelled (clearChallenge resolves
+    // { verified: false }). The verification-failed case never reaches here:
+    // MFAChallengeModal stays open on a failed proof and does NOT resolve; the
+    // user must cancel explicitly to leave that state.
     setState({ phase: 'idle' });
   }
 }
@@ -194,6 +179,22 @@ async function admitDirectSSOLogin(
   serverSelection: RuntimeServerSelection,
   setState: (state: SSOState) => void
 ): Promise<void> {
+  // Defense-in-depth: re-check the reservation before ARMING the gate, mirroring
+  // admitVerifiedSSOMfaSession. The caller already guards, and there is no await
+  // between here and the synchronous beginAuthLifecycleIfCurrent CAS, so this is
+  // currently redundant — but it keeps the two admit paths symmetric and robust
+  // if a future refactor inserts an await before the arm (#2424 security review).
+  if (!reservationIsCurrent(reservationGeneration, serverSelection)) {
+    await discardDirectSSOSession(result, serverSelection);
+    return;
+  }
+
+  // AC-7: arm the SSO eager-unlock gate (#270 Task 21b) BEFORE publishing auth,
+  // so a synchronous auth-store subscriber cannot observe a non-null access token
+  // with the gate still false and admit authenticated UI against a prior
+  // account's ambient `ready`. See e2eeStore.ts for the two-flag MainApp gate.
+  useE2EEStore.getState().setNeedsSSOUnlock(true, result.credentialOwner);
+
   const admittedGeneration = useAuthStore
     .getState()
     .beginAuthLifecycleIfCurrent(reservationGeneration, result.accessToken, result.sessionId);
@@ -204,13 +205,10 @@ async function admitDirectSSOLogin(
     ) {
       useAuthStore.getState().clearAccessToken();
     }
+    rollbackSSOUnlockGate(result.credentialOwner);
     await discardDirectSSOSession(result, serverSelection);
     return;
   }
-  // Arm the SSO eager-unlock gate (#270 Task 21b). See
-  // e2eeStore.ts file-level doc for the two-flag semantics
-  // that combine `needsSSOUnlock` and `ready` to gate MainApp.
-  useE2EEStore.getState().setNeedsSSOUnlock(true, result.credentialOwner);
   setState({ phase: 'idle' });
 }
 
@@ -264,7 +262,10 @@ export function useSSOFlow(): { begin: (provider: SSOProvider) => Promise<void> 
                 result.mfaChallengeToken,
                 result.methods ?? [],
                 'sso_login',
-                result.recoveryOnlyMethods
+                result.recoveryOnlyMethods,
+                // #2424: carry the reserved owner + provider so the modal can
+                // route the MFA proof through sso:completeMFA under this owner.
+                { provider, credentialOwner: result.credentialOwner }
               )
               .then((mfaResult) =>
                 handleSSOMfaResult(mfaResult, reservationGeneration, serverSelection, setState)

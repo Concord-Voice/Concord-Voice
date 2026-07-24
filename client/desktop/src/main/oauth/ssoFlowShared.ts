@@ -10,7 +10,14 @@ import { timingSafeEqual } from 'node:crypto';
 
 import type { SSOSignInErrorCode, SSOSignInResult } from '../../shared/sso';
 
-/** Main-only response shape. Refresh credentials are removed by the IPC handler. */
+/**
+ * Main-only response shape. Refresh credentials are removed by the IPC handler.
+ *
+ * The `mfa_challenge` variant OMITS `credentialOwner` here: the flow orchestrator
+ * (`mapSessionResponse`) parses the /session body before an owner exists — the SSO
+ * IPC handler reserves the owner and attaches it in `finishSignIn` when mapping to
+ * the renderer-facing `SSOSignInResult` (#2424).
+ */
 export type MainSSOSignInResult =
   | {
       kind: 'tokens';
@@ -18,7 +25,8 @@ export type MainSSOSignInResult =
       refreshToken: string;
       sessionId: string;
     }
-  | Exclude<SSOSignInResult, { kind: 'tokens' }>;
+  | Omit<Extract<SSOSignInResult, { kind: 'mfa_challenge' }>, 'credentialOwner'>
+  | Exclude<SSOSignInResult, { kind: 'tokens' | 'mfa_challenge' }>;
 
 /**
  * Constant-time string equality via Node crypto.timingSafeEqual.

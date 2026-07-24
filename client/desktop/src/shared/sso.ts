@@ -39,6 +39,12 @@ export type SSOSignInResult =
       methods: string[];
       recoveryOnlyMethods?: string[];
       webauthnOptions?: unknown;
+      // #2424: the SSO CredentialOwner reserved at sign-in is preserved across the
+      // MFA challenge and returned as opaque challenge context. The renderer must
+      // pass it back to sso:completeMFA so main can conditionally store the MFA
+      // credential under that exact owner — the raw refresh token never returns
+      // to the renderer.
+      credentialOwner: CredentialOwner;
     }
   | { kind: 'sso_token'; branch: 'new_user'; ssoToken: string; email: string; name?: string }
   | { kind: 'sso_token'; branch: 'account_link'; ssoToken: string; maskedEmail: string }
@@ -58,6 +64,23 @@ export interface SSOCompleteLinkPayload {
   provider: 'google' | 'apple';
   ssoToken: string;
   password: string;
+}
+
+/**
+ * #2424: the SSO MFA proof the renderer routes to the `sso:completeMFA` main
+ * handler. Main re-validates the reserved owner, submits the proof to
+ * `/api/v1/auth/mfa/verify`, and conditionally stores the resulting credential
+ * under that owner — no refresh token crosses back to the renderer. `code` is
+ * the TOTP/backup value; `assertion` is the WebAuthn assertion collected by the
+ * renderer's ceremony (main cannot perform `navigator.credentials.get`).
+ */
+export interface SSOCompleteMFAPayload {
+  provider: 'google' | 'apple';
+  mfaChallengeToken: string;
+  credentialOwner: CredentialOwner;
+  method: string;
+  code?: string;
+  assertion?: unknown;
 }
 
 export interface SSOCompletionErrorBody {

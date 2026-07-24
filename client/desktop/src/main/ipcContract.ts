@@ -100,8 +100,14 @@
  *        boundary for the final first-user/link exchanges. Session restore
  *        exposes the owner-scoped pending-E2EE-unlock state so reload cannot
  *        enter the authenticated app before matching keys are available.
+ * - v19: SSO MFA custody (#2424): the mfa_challenge sign-in result now carries
+ *        the reserved CredentialOwner, and sso:completeMFA submits the MFA proof
+ *        (TOTP code or WebAuthn assertion) in main, storing the resulting refresh
+ *        credential under that owner and returning only the access token, session
+ *        ID, and owner — extending the SSO refresh-token-never-in-renderer custody
+ *        boundary to the MFA path.
  */
-export const IPC_CONTRACT_VERSION = 18;
+export const IPC_CONTRACT_VERSION = 19;
 
 /**
  * Opaque main-process identity for one stored credential lifecycle.
