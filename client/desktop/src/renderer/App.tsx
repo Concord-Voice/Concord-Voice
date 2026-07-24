@@ -2,6 +2,7 @@ import { Suspense, lazy, useEffect, useState } from 'react';
 import { Routes, Route, Navigate, Outlet, useNavigate } from 'react-router-dom';
 import { Titlebar } from './components/Titlebar/Titlebar';
 import AuthFlow from './components/Auth/AuthFlow';
+import { isE2EEUnlockPending } from './utils/authAdmissionGate';
 import MainView from './components/MainView/MainView';
 import DirectMessagesView from './components/DirectMessages/DirectMessagesView';
 import ContextMenuProvider from './components/ui/ContextMenuProvider';
@@ -378,6 +379,17 @@ function App() {
   const [isDeepLinkInviteOpen, setIsDeepLinkInviteOpen] = useState(false);
   const accessToken = useAuthStore((state) => state.accessToken);
   const emailVerified = useAuthStore((state) => state.emailVerified);
+  const authGeneration = useAuthStore((state) => state.authGeneration);
+  const pendingE2EEUnlockGeneration = useAuthStore((state) => state.pendingE2EEUnlockGeneration);
+  // #2346: while a just-authenticated password login is still completing its
+  // inline E2EE unlock (or awaiting consented key recovery), hold "/" at
+  // AuthFlow rather than navigating into the app — otherwise Login unmounts
+  // before the key-recovery prompt (Login-local state) can render, stranding the
+  // user authenticated-but-undecryptable. Generation-bound (see authStore's
+  // pendingE2EEUnlockGeneration): a superseded/aborted flow's stale value never
+  // gates a successor, since a successor login or a clear advances authGeneration
+  // past it (a same-session refresh via rotateAuthCredentials preserves it).
+  const e2eeUnlockPending = isE2EEUnlockPending(pendingE2EEUnlockGeneration, authGeneration);
   const navigate = useNavigate();
 
   // Route cert-pin / publisher-signature failures into useUpdateStatusStore
@@ -565,7 +577,7 @@ function App() {
               <Route
                 path="/"
                 element={
-                  accessToken && emailVerified ? (
+                  accessToken && emailVerified && !e2eeUnlockPending ? (
                     <Navigate to="/app/dms" replace />
                   ) : (
                     <ErrorBoundary fallback={<AuthFallback />}>

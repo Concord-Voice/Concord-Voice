@@ -900,6 +900,16 @@ const Login: React.FC<LoginProps> = ({
       .getState()
       .beginAuthLifecycle(data.access_token, data.session_id ?? null);
     abortedSession.authGeneration = flowAuthGeneration;
+    // #2346: hold App's passive "/" route at AuthFlow until THIS login's E2EE is
+    // ready. Without it, the early token set above immediately re-renders "/"
+    // into <Navigate to="/app/dms"> and unmounts Login, so an inline unwrap
+    // failure can never surface the consented key-recovery prompt (Login-local
+    // state) and the user is stranded authenticated-but-undecryptable. Bound to
+    // flowAuthGeneration so a superseded/aborted flow's stale value can never
+    // gate a successor session (owner/generation-bound admission invariant,
+    // cf. #2424). Set with no intervening await after beginAuthLifecycle so React
+    // observes the token and the gate together on the next render.
+    useAuthStore.getState().setPendingE2EEUnlockGeneration(flowAuthGeneration);
     const initializationGuard: E2EEInitializationGuard = {
       signal: new AbortController().signal,
       isCurrent: () => runtimeServerSelectionIsCurrent(requestSelection) && flowOwnsAuthStore(),
@@ -980,6 +990,17 @@ const Login: React.FC<LoginProps> = ({
       }
     };
     if (!(await unwrapOrRecoverKeys())) return;
+
+    // #2346: E2EE is now ready (inline unwrap succeeded, or the user completed
+    // consented key recovery). Release the "/" route hold so post-login
+    // navigation proceeds normally. COMPARE-AND-CLEAR on flowAuthGeneration: if
+    // this flow lost ownership across the awaits above and a successor login
+    // armed its OWN hold, this is a no-op — a plain clear(null) would release the
+    // successor into the app before its E2EE is ready (successor-race strand;
+    // CodeRabbit review, PR #2435). The recovery-cancel path returned above
+    // (abortKeyRecovery already cleared the token, bumping the generation), so
+    // the stale gate value is inert there too.
+    useAuthStore.getState().clearPendingE2EEUnlockGenerationIfCurrent(flowAuthGeneration);
 
     // Pre-admit epoch check #1: initialize()'s fence covers only the span up
     // to the key commit. A teardown landing after it resolved must not let us

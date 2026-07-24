@@ -23,6 +23,29 @@ interface AuthState {
    * just-staged notice before the login screen renders it.
    */
   loginNotice: string | null;
+  /**
+   * The `authGeneration` of a just-authenticated session whose inline E2EE
+   * unlock is still pending, or null when none is. Password login publishes the
+   * access token BEFORE unwrapping keys (the PR #2337 ownership/abort machinery
+   * and the consented key-reset PUT both key on the early token), so App.tsx's
+   * passive "/" route must hold at AuthFlow while this equals the current
+   * `authGeneration` — otherwise the token set navigates "/" to /app/dms and
+   * unmounts Login before an inline unwrap failure can surface the consented
+   * key-recovery prompt, stranding the user authenticated-but-undecryptable
+   * (#2346). Generation-bound so a superseded or aborted flow's stale value can
+   * never gate a successor session (SSO / session-restore navigate via the same
+   * route): a successor login or a clear advances `authGeneration` past it
+   * (`beginAuthLifecycle` / `beginAuthLifecycleIfCurrent` / `setAccessToken` /
+   * `clearAccessToken`), while an ordinary same-session refresh
+   * (`rotateAuthCredentials`) intentionally preserves it — correctly keeping the
+   * hold for the still-pending session. Released via the
+   * compare-and-clear `clearPendingE2EEUnlockGenerationIfCurrent` once this login's
+   * E2EE is ready — a plain unconditional clear would let a stale predecessor
+   * clobber a successor login's hold (successor-race strand, CodeRabbit review on
+   * PR #2435). Aligns with the owner/generation-bound admission invariant tracked
+   * for the SSO paths in #2424.
+   */
+  pendingE2EEUnlockGeneration: number | null;
   beginAuthLifecycle: (accessToken: string, sessionId: string | null) => number;
   beginAuthLifecycleIfCurrent: (
     expectedGeneration: number,
@@ -39,6 +62,8 @@ interface AuthState {
   setRememberMe: (rememberMe: boolean) => void;
   setEmailVerified: (verified: boolean) => void;
   setLoginNotice: (notice: string | null) => void;
+  setPendingE2EEUnlockGeneration: (generation: number | null) => void;
+  clearPendingE2EEUnlockGenerationIfCurrent: (generation: number) => void;
   clearAccessToken: () => void;
 }
 
@@ -49,6 +74,7 @@ export const useAuthStore = createStore<AuthState>()((set) => ({
   rememberMe: true,
   emailVerified: true, // Default true for backward compat (existing sessions)
   loginNotice: null,
+  pendingE2EEUnlockGeneration: null,
   beginAuthLifecycle: (accessToken, sessionId) => {
     let generation = 0;
     set((state) => {
@@ -89,6 +115,20 @@ export const useAuthStore = createStore<AuthState>()((set) => ({
   setRememberMe: (rememberMe) => set({ rememberMe }),
   setEmailVerified: (emailVerified) => set({ emailVerified }),
   setLoginNotice: (loginNotice) => set({ loginNotice }),
+  setPendingE2EEUnlockGeneration: (pendingE2EEUnlockGeneration) =>
+    set({ pendingE2EEUnlockGeneration }),
+  // Compare-and-clear: release the E2EE-unlock hold ONLY if it still belongs to
+  // the calling flow's generation. An inline-login continuation clears its own
+  // hold after an await; without this guard a stale predecessor (whose flow lost
+  // ownership to a successor that armed its OWN hold) would unconditionally write
+  // null and release the SUCCESSOR into the app before its E2EE is ready — the
+  // successor-race form of the #2346 strand (CodeRabbit review, PR #2435).
+  clearPendingE2EEUnlockGenerationIfCurrent: (generation) =>
+    set((state) =>
+      state.authGeneration === generation && state.pendingE2EEUnlockGeneration === generation
+        ? { pendingE2EEUnlockGeneration: null }
+        : state
+    ),
   clearAccessToken: () =>
     set((state) => ({
       accessToken: null,

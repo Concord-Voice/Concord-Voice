@@ -104,4 +104,26 @@ describe('authStore', () => {
   it('starts with rememberMe as true', () => {
     expect(useAuthStore.getState().rememberMe).toBe(true);
   });
+
+  it('clearPendingE2EEUnlockGenerationIfCurrent releases only the current generation’s hold (#2346 successor-race)', () => {
+    // Flow A arms its E2EE-unlock hold under its own generation.
+    const genA = useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
+    useAuthStore.getState().setPendingE2EEUnlockGeneration(genA);
+    expect(useAuthStore.getState().pendingE2EEUnlockGeneration).toBe(genA);
+
+    // A successor login (Flow B) takes over and arms its OWN hold.
+    const genB = useAuthStore.getState().beginAuthLifecycle('token-b', 'session-b');
+    useAuthStore.getState().setPendingE2EEUnlockGeneration(genB);
+    expect(genB).not.toBe(genA);
+
+    // Flow A's stale continuation tries to release the hold. It MUST NOT clobber
+    // the successor's hold — otherwise Flow B is navigated into the app before
+    // its E2EE is ready (the successor-race form of the #2346 strand).
+    useAuthStore.getState().clearPendingE2EEUnlockGenerationIfCurrent(genA);
+    expect(useAuthStore.getState().pendingE2EEUnlockGeneration).toBe(genB);
+
+    // The current owner (Flow B) can still release its own hold.
+    useAuthStore.getState().clearPendingE2EEUnlockGenerationIfCurrent(genB);
+    expect(useAuthStore.getState().pendingE2EEUnlockGeneration).toBeNull();
+  });
 });

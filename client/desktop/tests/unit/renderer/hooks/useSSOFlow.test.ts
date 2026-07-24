@@ -374,6 +374,35 @@ describe('useSSOFlow', () => {
     expect(useAuthStore.getState().accessToken).toBeNull();
   });
 
+  // #2346 parallel — SSO ONBOARDING is structurally immune to the password-login
+  // strand. That bug needs an EARLY access token (published before E2EE is ready)
+  // to trip App's "/" route into /app/dms and unmount the auth UI; a brand-new
+  // SSO user in `register_required` never has one — the passphrase is set FIRST,
+  // then a token is issued. This guards that precondition: if a future change
+  // admits a token (or arms the inline-unlock gate) during register_required, it
+  // re-opens the same strand class and must fail here.
+  it('register_required: never admits a keyless new user into the app (#2346 parallel)', async () => {
+    mockedStartSSOFlow.mockResolvedValueOnce({
+      kind: 'register_required',
+      ssoToken: 'sso-tok-onboarding',
+      email: 'newuser@example.test',
+      name: 'New User',
+    });
+
+    const { result } = renderHook(() => useSSOFlow());
+    await act(async () => {
+      await result.current.begin('google');
+    });
+
+    const auth = useAuthStore.getState();
+    // No access token → App's `accessToken && emailVerified && !e2eeUnlockPending`
+    // gate stays false → the user stays on AuthFlow (SSOPassphraseSetup), never
+    // navigated to /app/dms with unready E2EE.
+    expect(auth.accessToken).toBeNull();
+    // …and no inline-E2EE-unlock hold is armed for a live session either.
+    expect(auth.pendingE2EEUnlockGeneration).toBeNull();
+  });
+
   it('link_available: dispatches link_required phase with maskedEmail', async () => {
     mockedStartSSOFlow.mockResolvedValueOnce({
       kind: 'link_available',
