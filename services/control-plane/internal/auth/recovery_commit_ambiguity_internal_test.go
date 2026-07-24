@@ -58,7 +58,7 @@ func (*ambiguousRecoveryMFAChecker) GetLoginMethods(context.Context, string) ([]
 	return nil, nil
 }
 
-func (*ambiguousRecoveryMFAChecker) GenerateLoginChallenge(context.Context, string, bool) (string, string, error) {
+func (*ambiguousRecoveryMFAChecker) GenerateLoginChallenge(context.Context, string, bool, string) (string, string, error) {
 	return "", "", nil
 }
 

@@ -30,20 +30,35 @@ type ChallengeClaims struct {
 	jwt.RegisteredClaims
 	UserID  string           `json:"user_id"`
 	Purpose ChallengePurpose `json:"purpose"`
+	// CredentialEpoch is the durable users.credential_epoch in effect when this
+	// challenge was issued (#2418). Redemption compares it against the epoch current
+	// at mint time, so a challenge issued before a destructive reset cannot complete
+	// into a post-reset session. Empty on challenges that never reach a mint
+	// (recovery, MFA upgrade) and on pre-#2418 tokens; auth.CompleteLogin rejects an
+	// empty claim for a user who has rotated.
+	//
+	// Deliberately NOT validated in a Claims.Validate() method: golang-jwt v5
+	// auto-invokes that during ParseWithClaims, where the current durable epoch is
+	// not available. Enforcement belongs at the redemption site.
+	CredentialEpoch string `json:"cred_epoch,omitempty"`
 }
 
 // GenerateChallengeToken creates a short-lived, purpose-bound JWT for MFA challenges.
-func GenerateChallengeToken(userID string, purpose ChallengePurpose, jwtSecret string) (string, string, error) {
-	return generateChallengeTokenWithTTL(userID, purpose, jwtSecret, challengeTTL)
+// credEpoch is the issuing user's durable credential epoch, or "" for purposes that
+// never mint a session.
+func GenerateChallengeToken(userID string, purpose ChallengePurpose, jwtSecret, credEpoch string) (string, string, error) {
+	return generateChallengeTokenWithTTL(userID, purpose, jwtSecret, credEpoch, challengeTTL)
 }
 
 // GenerateRecoveryToken creates a recovery-purpose JWT with a longer TTL (25 hours).
+// Recovery tokens authorize a destructive reset rather than a session mint, so they
+// carry no epoch — binding one to a pre-reset epoch would be incoherent.
 func GenerateRecoveryToken(userID, jwtSecret string) (string, string, error) {
-	return generateChallengeTokenWithTTL(userID, PurposeRecovery, jwtSecret, recoveryTTL)
+	return generateChallengeTokenWithTTL(userID, PurposeRecovery, jwtSecret, "", recoveryTTL)
 }
 
 // generateChallengeTokenWithTTL creates a purpose-bound JWT with a configurable TTL.
-func generateChallengeTokenWithTTL(userID string, purpose ChallengePurpose, jwtSecret string, ttl time.Duration) (string, string, error) {
+func generateChallengeTokenWithTTL(userID string, purpose ChallengePurpose, jwtSecret, credEpoch string, ttl time.Duration) (string, string, error) {
 	jti := uuid.New().String()
 	now := time.Now()
 
@@ -55,8 +70,9 @@ func generateChallengeTokenWithTTL(userID string, purpose ChallengePurpose, jwtS
 			NotBefore: jwt.NewNumericDate(now),
 			Issuer:    "concordvoice-mfa",
 		},
-		UserID:  userID,
-		Purpose: purpose,
+		UserID:          userID,
+		Purpose:         purpose,
+		CredentialEpoch: credEpoch,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

@@ -124,8 +124,34 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 		activityRichPresenceCapable: activityRichPresenceCapable,
 	}
 
-	// Register client with hub
+	// Register client with hub. This channel is UNBUFFERED (hub.go:322) and that is
+	// load-bearing for the re-check below — do not add a buffer.
 	h.hub.register <- client
+
+	// #2414 §C: close the register-vs-disconnect-sweep ordering race. registerClient
+	// and the DisconnectUser handler are both serviced by the Hub's single Run
+	// goroutine, so a socket whose register is delivered AFTER a reset's disconnectUser
+	// is never swept, and survives until its access token expires (~15m).
+	//
+	// The unbuffered register channel above blocks until Run receives it, so by here
+	// registration has happened. That gives a total order in both directions:
+	//   - the reset committed before this check  => we read the new epoch and close;
+	//   - the reset commits after this check     => its disconnectUser send follows our
+	//                                               already-consumed register, so the
+	//                                               sweep sees this client and closes it.
+	// This check MUST NOT move inside registerClient: that runs on the Run goroutine,
+	// where a Redis/DB round-trip would stall the entire hub.
+	//
+	// h.fence is nil only in tests that construct a Handler without one (#2201);
+	// skip the check rather than dereference a nil fence.
+	if h.fence != nil {
+		if err := h.fence.Check(c.Request.Context(), userID.String(), client.CredEpoch); err != nil {
+			log.Printf("Evicting WebSocket client for user %s: credential epoch superseded", sanitizeLogValue(userID.String()))
+			h.hub.unregister <- client
+			_ = conn.Close()
+			return
+		}
+	}
 
 	// Start client's read and write pumps
 	go client.writePump()

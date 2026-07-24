@@ -10,7 +10,7 @@ import (
 const testJWTSecret = "test-secret-for-mfa-challenges" // #nosec G101
 
 func TestGenerateChallengeToken(t *testing.T) {
-	token, jti, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret)
+	token, jti, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "")
 	if err != nil {
 		t.Fatalf("GenerateChallengeToken failed: %v", err)
 	}
@@ -24,7 +24,7 @@ func TestGenerateChallengeToken(t *testing.T) {
 }
 
 func TestValidateChallengeToken(t *testing.T) {
-	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret)
+	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "")
 	if err != nil {
 		t.Fatalf("GenerateChallengeToken failed: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestValidateChallengeToken(t *testing.T) {
 }
 
 func TestValidateChallengeTokenWrongPurpose(t *testing.T) {
-	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret)
+	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "")
 	if err != nil {
 		t.Fatalf("GenerateChallengeToken failed: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestValidateChallengeTokenWrongPurpose(t *testing.T) {
 }
 
 func TestValidateChallengeTokenWrongSecret(t *testing.T) {
-	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret)
+	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "")
 	if err != nil {
 		t.Fatalf("GenerateChallengeToken failed: %v", err)
 	}
@@ -143,5 +143,52 @@ func TestValidateChallengeTokenExpired(t *testing.T) {
 	_, err = ValidateChallengeToken(signed, testJWTSecret, PurposeLogin)
 	if err == nil {
 		t.Error("expected error for expired token")
+	}
+}
+
+func TestGenerateChallengeTokenStampsCredentialEpoch(t *testing.T) {
+	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "epoch-abc")
+	if err != nil {
+		t.Fatalf("GenerateChallengeToken failed: %v", err)
+	}
+
+	claims, err := ValidateChallengeToken(token, testJWTSecret, PurposeLogin)
+	if err != nil {
+		t.Fatalf("ValidateChallengeToken failed: %v", err)
+	}
+	if claims.CredentialEpoch != "epoch-abc" {
+		t.Errorf("CredentialEpoch = %q, want %q", claims.CredentialEpoch, "epoch-abc")
+	}
+}
+
+func TestGenerateChallengeTokenEmptyEpochOmitsClaim(t *testing.T) {
+	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "")
+	if err != nil {
+		t.Fatalf("GenerateChallengeToken failed: %v", err)
+	}
+
+	claims, err := ValidateChallengeToken(token, testJWTSecret, PurposeLogin)
+	if err != nil {
+		t.Fatalf("ValidateChallengeToken failed: %v", err)
+	}
+	if claims.CredentialEpoch != "" {
+		t.Errorf("CredentialEpoch = %q, want empty: an unstamped challenge must carry no epoch", claims.CredentialEpoch)
+	}
+}
+
+func TestGenerateRecoveryTokenCarriesNoEpoch(t *testing.T) {
+	// Recovery tokens never reach CompleteLogin — completeVerifyPurpose routes only
+	// PurposeLogin to a session mint — so they are deliberately unstamped (#2418).
+	token, _, err := GenerateRecoveryToken("user-456", testJWTSecret)
+	if err != nil {
+		t.Fatalf("GenerateRecoveryToken failed: %v", err)
+	}
+
+	claims, err := ValidateChallengeToken(token, testJWTSecret, PurposeRecovery)
+	if err != nil {
+		t.Fatalf("ValidateChallengeToken failed: %v", err)
+	}
+	if claims.CredentialEpoch != "" {
+		t.Errorf("CredentialEpoch = %q, want empty for a recovery token", claims.CredentialEpoch)
 	}
 }

@@ -226,7 +226,7 @@ func (s *stubMFAChecker) GetEnabledMethods(_ context.Context, _ string) ([]strin
 func (s *stubMFAChecker) GetLoginMethods(_ context.Context, _ string) ([]string, error) {
 	return s.LoginMethodsResult, s.LoginMethodsErr
 }
-func (s *stubMFAChecker) GenerateLoginChallenge(_ context.Context, _ string, _ bool) (string, string, error) {
+func (s *stubMFAChecker) GenerateLoginChallenge(_ context.Context, _ string, _ bool, _ string) (string, string, error) {
 	if s.GenerateChallengeErr != nil {
 		return "", "", s.GenerateChallengeErr
 	}
@@ -285,9 +285,12 @@ func TestIssueMFAChallenge_TOTPEnrolled_HydratesMethods(t *testing.T) {
 		LoginMethodsResult:   []string{"totp"},
 		GenerateChallengeTok: "ch-totp",
 	})
+	// A real users row is required since #2418: IssueMFAChallenge reads the
+	// credential epoch to stamp into the challenge, and fails closed if absent.
+	userID := insertAdapterUser(t, rig, "mfachallenge@test.concord.chat", "mfachallengeuser", "Test-Password-1!")
 
 	tok, methods, recoveryOnly, webauthn, mfaEnabled, err := rig.Handler.IssueMFAChallenge(
-		context.Background(), uuid.New().String(),
+		context.Background(), userID,
 	)
 	require.NoError(t, err)
 	assert.True(t, mfaEnabled)
@@ -309,12 +312,38 @@ func TestIssueMFAChallenge_GenerateError_PropagatesError(t *testing.T) {
 		EnabledMethodsResult: []string{"totp"},
 		GenerateChallengeErr: errors.New("redis unavailable"),
 	})
+	// Seeded so the #2418 epoch read succeeds and execution actually reaches
+	// GenerateLoginChallenge — otherwise the epoch read would fail first and this
+	// test would assert on the wrong error.
+	userID := insertAdapterUser(t, rig, "mfachallengeerr@test.concord.chat", "mfachallengeerruser", "Test-Password-1!")
 
 	_, _, _, _, _, err := rig.Handler.IssueMFAChallenge(
-		context.Background(), uuid.New().String(),
+		context.Background(), userID,
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "generate login challenge")
+}
+
+// TestIssueMFAChallenge_EpochReadFailure_PropagatesError covers the #2418
+// fail-closed branch: when the credential-epoch read fails (here, an authenticated
+// user id with no users row), IssueMFAChallenge surfaces a wrapped error rather than
+// stamping an empty epoch — which CompleteLogin would later reject as a 401 at the
+// end of the MFA flow instead of here.
+func TestIssueMFAChallenge_EpochReadFailure_PropagatesError(t *testing.T) {
+	rig := newAdapterRig(t)
+	rig.Handler.SetMFAChecker(&stubMFAChecker{
+		IsEnabledResult:      true,
+		LoginMethodsResult:   []string{"totp"},
+		EnabledMethodsResult: []string{"totp"},
+		GenerateChallengeTok: "should-not-be-reached",
+	})
+	// No users row seeded — readCredentialEpoch's SELECT returns no rows.
+	missing := uuid.New().String()
+
+	_, _, _, _, _, err := rig.Handler.IssueMFAChallenge(context.Background(), missing)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read credential epoch",
+		"an epoch-read failure must fail closed, never stamp an empty epoch")
 }
 
 // =============================================================================

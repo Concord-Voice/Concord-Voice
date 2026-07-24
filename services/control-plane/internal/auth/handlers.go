@@ -53,7 +53,10 @@ type MFAChecker interface {
 	GetLoginMethods(ctx context.Context, userID string) ([]string, error)
 	// GenerateLoginChallenge creates a challenge token for the two-step login flow.
 	// Returns the signed JWT and the JTI. Stores remember_me in Redis keyed by JTI.
-	GenerateLoginChallenge(ctx context.Context, userID string, rememberMe bool) (token string, jti string, err error)
+	// credEpoch is the user's durable credential epoch at authorization time (#2418);
+	// CompleteLogin re-checks it before minting, so an unstamped challenge is refused
+	// for any user who has rotated.
+	GenerateLoginChallenge(ctx context.Context, userID string, rememberMe bool, credEpoch string) (token string, jti string, err error)
 	// GenerateUpgradeChallenge creates a challenge token for pre-MFA sessions that
 	// need to verify MFA before continuing. Issues fresh tokens on success.
 	GenerateUpgradeChallenge(ctx context.Context, userID string, rememberMe bool) (token string, jti string, err error)
@@ -296,7 +299,17 @@ func decodeE2EEKeys(publicKeyB64, wrappedKeyB64, saltB64 string) (publicKey, wra
 }
 
 // generateTokenPair creates an access+refresh token pair and persists the
-// refresh token. Used by issueSessionTokens and other flows.
+// refresh token. Its ONLY caller is issueSessionTokens ← ConfirmRegistration,
+// which mints the FIRST session for a brand-new user (credential_epoch NULL).
+//
+// #2418 caution: this reads the epoch and INSERTs the refresh row in two
+// UNFENCED statements (no user-row lock, no transaction) — the same shape the
+// CompleteLogin fix replaced. That is safe HERE only because a user being
+// created for the first time has no pre-reset credential a destructive reset
+// could advance the epoch past. Do NOT reuse this for any flow that mints for an
+// EXISTING user (SSO, recovery, re-login) without first binding it to the
+// authorizing epoch under FOR NO KEY UPDATE, exactly as CompleteLogin and
+// IssueTokenPair do — otherwise the pre-reset-mint race this issue closes reopens.
 func (h *Handler) generateTokenPair(c *gin.Context, userID string, emailVerified bool) (accessToken, refreshToken, tokenID string, err error) {
 	// #2201: embed the user's current credential epoch (fail closed — no mint
 	// without epoch knowledge) and the new refresh-session id in the access token.
@@ -969,20 +982,42 @@ func (h *Handler) clearLoginAttempts(ctx context.Context, email string) {
 }
 
 // Login handles user authentication
-func (h *Handler) lookupUserForLogin(email string) (models.User, error) {
+// lookupUserForLogin reads the login candidate plus the credential epoch the
+// password is about to be verified under. The epoch is returned SEPARATELY rather
+// than on models.User: that struct has a PublicUser() client-facing serializer, and
+// a revocation tag must not sit one careless edit away from the wire (#2418).
+func (h *Handler) lookupUserForLogin(email string) (models.User, string, error) {
 	var user models.User
+	var credEpoch sql.NullString
 	err := h.db.QueryRow(
 		`SELECT id, email, username, password_hash, display_name, bio, avatar_url, COALESCE(links, '[]'::jsonb),
-		        email_verified, age_verified, created_at, updated_at, password_login_disabled, disabled
+		        email_verified, age_verified, created_at, updated_at, password_login_disabled, disabled, credential_epoch
 		 FROM users WHERE email = $1`,
 		email,
 	).Scan(
 		&user.ID, &user.Email, &user.Username, &user.PasswordHash,
 		&user.DisplayName, &user.Bio, &user.AvatarURL, &user.Links,
 		&user.EmailVerified, &user.AgeVerified,
-		&user.CreatedAt, &user.UpdatedAt, &user.PasswordLoginDisabled, &user.Disabled,
+		&user.CreatedAt, &user.UpdatedAt, &user.PasswordLoginDisabled, &user.Disabled, &credEpoch,
 	)
-	return user, err
+	return user, credEpoch.String, err
+}
+
+// readCredentialEpoch reads the user's durable credential epoch for stamping into an
+// MFA login challenge (#2418). Callers that already hold the epoch from an in-flight
+// user read must reuse that value instead of calling this.
+//
+// Fails closed: on error the caller MUST abort. Substituting "" would mint a claimless
+// challenge that CompleteLogin then rejects, turning a transient DB blip into a
+// confusing 401 at the end of the MFA flow.
+func (h *Handler) readCredentialEpoch(ctx context.Context, userID string) (string, error) {
+	var epoch sql.NullString
+	if err := h.db.QueryRowContext(ctx,
+		`SELECT credential_epoch FROM users WHERE id = $1`, userID,
+	).Scan(&epoch); err != nil {
+		return "", fmt.Errorf("read credential epoch: %w", err)
+	}
+	return epoch.String, nil
 }
 
 func (h *Handler) verifyCredentials(ctx context.Context, c *gin.Context, email, password, passwordHash string) bool {
@@ -1001,10 +1036,12 @@ func (h *Handler) verifyCredentials(ctx context.Context, c *gin.Context, email, 
 	return true
 }
 
-func (h *Handler) handleMFAChallenge(ctx context.Context, c *gin.Context, userID string, rememberMe bool) {
+// credEpoch is the epoch the password was verified under; it is stamped into the
+// challenge so CompleteLogin can refuse a completion that races a reset (#2418).
+func (h *Handler) handleMFAChallenge(ctx context.Context, c *gin.Context, userID string, rememberMe bool, credEpoch string) {
 	allMethods, _ := h.mfaChecker.GetEnabledMethods(ctx, userID)
 	loginMethods, _ := h.mfaChecker.GetLoginMethods(ctx, userID)
-	challengeToken, jti, mfaErr := h.mfaChecker.GenerateLoginChallenge(ctx, userID, rememberMe)
+	challengeToken, jti, mfaErr := h.mfaChecker.GenerateLoginChallenge(ctx, userID, rememberMe, credEpoch)
 	if mfaErr != nil {
 		h.log.Error("Failed to generate MFA challenge", "error", mfaErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
@@ -1061,7 +1098,7 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	user, err := h.lookupUserForLogin(req.Email)
+	user, loginEpoch, err := h.lookupUserForLogin(req.Email)
 	if err == sql.ErrNoRows {
 		h.recordFailedLogin(ctx, req.Email)
 		middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
@@ -1127,34 +1164,49 @@ func (h *Handler) Login(c *gin.Context) {
 	rememberMe := resolveRememberMe(&req)
 
 	if h.mfaChecker != nil && h.mfaChecker.IsEnabled(ctx, user.ID) {
-		h.handleMFAChallenge(ctx, c, user.ID, rememberMe)
+		h.handleMFAChallenge(ctx, c, user.ID, rememberMe, loginEpoch)
 		return
 	}
 
-	h.CompleteLogin(c, user.ID, rememberMe)
+	h.CompleteLogin(c, user.ID, rememberMe, loginEpoch)
 }
 
 // CompleteLogin issues tokens and creates a session for the given user.
 // Called directly from Login (no MFA) or from the MFA verify handler after successful verification.
-func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool) {
-	// Resolve every response prerequisite before minting tokens or creating a
-	// refresh session. Reading disabled and email_verified in this same snapshot
-	// keeps the terminal gate, JWT claim, and returned user mutually consistent.
-	// credential_epoch rides the same snapshot so the minted cred_epoch claim
-	// (#2201) is consistent with the gate decisions.
+func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, expectedEpoch string) {
+	// #2418: bind this mint to the epoch the login was AUTHORIZED under — the epoch
+	// read alongside the password verification (direct path) or stamped into the MFA
+	// challenge at issuance (MFA path). The whole mint runs in ONE transaction holding
+	// the users row FOR NO KEY UPDATE, the same lock every destructive reset holds, so
+	// a reset racing this login either commits first (we observe the advanced epoch
+	// and refuse) or waits for us (and then revokes what we minted). Before this, five
+	// unserialized pool statements let a reset committing mid-flight leave a live
+	// post-reset session minted from pre-reset authorization.
+	ctx := c.Request.Context()
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		h.log.Error("Failed to begin login mint tx", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Reading disabled, email_verified and credential_epoch in this same locked
+	// snapshot keeps the terminal gate, the JWT claim, and the returned user
+	// mutually consistent.
 	var user models.User
 	var credEpoch sql.NullString
-	if err := h.db.QueryRow(
+	if err := tx.QueryRowContext(ctx,
 		`SELECT id, email, username, password_hash, display_name, bio, avatar_url, COALESCE(links, '[]'::jsonb),
 		        email_verified, age_verified, created_at, updated_at, password_login_disabled, disabled, credential_epoch
-		 FROM users WHERE id = $1`, userID,
+		 FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
 	).Scan(
 		&user.ID, &user.Email, &user.Username, &user.PasswordHash,
 		&user.DisplayName, &user.Bio, &user.AvatarURL, &user.Links,
 		&user.EmailVerified, &user.AgeVerified,
 		&user.CreatedAt, &user.UpdatedAt, &user.PasswordLoginDisabled, &user.Disabled, &credEpoch,
 	); err != nil {
-		h.log.Error("Failed to fetch user for login response", "error", err)
+		h.log.Error("Failed to lock user for login mint", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
 		return
 	}
@@ -1163,8 +1215,22 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool) 
 		return
 	}
 
+	// Refuse if the durable epoch advanced past the one this login was authorized
+	// under. A claimless (pre-#2418) challenge presents "" and is refused for any
+	// user who has rotated — fail closed. Log the outcome only, never epoch values.
+	if err := credepoch.MatchEpoch(credEpoch, expectedEpoch); err != nil {
+		h.log.Warn("Login mint refused: credential epoch superseded", "user_id", userID)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidCredentials})
+		return
+	}
+
+	// Read the E2EE keys BEFORE minting anything. This ordering is load-bearing:
+	// a user with no user_keys row must fail the login WITHOUT a refresh session
+	// having been created (regression-locked by
+	// TestLoginMissingE2EEKeysDoesNotCreateSession). Doing it after the commit
+	// would leave a live session behind a 500.
 	var keys models.UserKeys
-	if err := h.db.QueryRow(
+	if err := tx.QueryRowContext(ctx,
 		`SELECT user_id, wrapped_private_key, key_derivation_salt, key_version, key_derivation_alg
 		 FROM user_keys WHERE user_id = $1`, userID,
 	).Scan(&keys.UserID, &keys.WrappedPrivateKey, &keys.KeyDerivationSalt, &keys.KeyVersion, &keys.KeyDerivationAlg); err != nil {
@@ -1176,7 +1242,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool) 
 	// Generate access token (JWT, 15 min). tokenID (the refresh-session id) is
 	// minted first so the access token can carry it as the sid claim (#2201).
 	tokenID := uuid.New().String()
-	tier := h.entCache.GetTier(c.Request.Context(), userID)
+	tier := h.entCache.GetTier(ctx, userID)
 	accessToken, err := GenerateAccessToken(userID, h.jwtSecret, user.EmailVerified, credEpoch.String, tokenID, tier)
 	if err != nil {
 		h.log.Error(errMsgFailedAccessToken, "error", err)
@@ -1207,28 +1273,42 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool) 
 		"user_id", userID,
 	)
 
-	// Revoke old sessions from the same device
+	// Revoke old sessions from the same device. This moves INSIDE the transaction:
+	// it mutates refresh_tokens for this user and must be atomic with the mint, or a
+	// reset interleaving between the revoke and the INSERT could leave the old
+	// session dead and the new one live under a superseded epoch.
 	if machineID != "" {
-		_, _ = h.db.Exec(
+		if _, err := tx.ExecContext(ctx,
 			`UPDATE refresh_tokens SET revoked_at = NOW()
 			 WHERE user_id = $1 AND machine_id = $2 AND revoked_at IS NULL`,
 			userID, machineID,
-		)
-	} else {
-		_, _ = h.db.Exec(
-			`UPDATE refresh_tokens SET revoked_at = NOW()
-			 WHERE user_id = $1 AND ip_address = $2 AND user_agent = $3 AND revoked_at IS NULL`,
-			userID, ipAddress, userAgent,
-		)
+		); err != nil {
+			h.log.Error("Failed to revoke same-device sessions", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
+			return
+		}
+	} else if _, err := tx.ExecContext(ctx,
+		`UPDATE refresh_tokens SET revoked_at = NOW()
+		 WHERE user_id = $1 AND ip_address = $2 AND user_agent = $3 AND revoked_at IS NULL`,
+		userID, ipAddress, userAgent,
+	); err != nil {
+		h.log.Error("Failed to revoke same-origin sessions", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
+		return
 	}
 
-	_, err = h.db.Exec(
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		tokenID, userID, tokenHash, deviceName, ipAddress, userAgent, expiresAt, rememberMe, nilIfEmpty(machineID),
-	)
-	if err != nil {
+	); err != nil {
 		h.log.Error("Failed to store refresh token", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit login mint", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
 		return
 	}
@@ -1489,7 +1569,19 @@ func (h *Handler) handleSuspiciousMachineID(c *gin.Context, token models.Refresh
 	}
 
 	ctx := c.Request.Context()
-	challengeToken, jti, mfaErr := h.mfaChecker.GenerateLoginChallenge(ctx, token.UserID, token.RememberMe)
+	// #2418: stamp the epoch into the challenge. Unlike the GenerateLoginChallenge
+	// failure below, this one does NOT degrade-to-allow: passing "" would mint a
+	// claimless challenge that CompleteLogin rejects for a rotated user, turning a
+	// transient DB blip into a confusing 401 at the END of the MFA flow. Surfacing
+	// the read failure here is the honest, debuggable outcome.
+	suspiciousEpoch, epochErr := h.readCredentialEpoch(ctx, token.UserID)
+	if epochErr != nil {
+		h.log.Error("Failed to read credential epoch for suspicious-refresh challenge",
+			"error", epochErr, "user_id", token.UserID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		return true
+	}
+	challengeToken, jti, mfaErr := h.mfaChecker.GenerateLoginChallenge(ctx, token.UserID, token.RememberMe, suspiciousEpoch)
 	if mfaErr != nil {
 		h.log.Error("Failed to generate suspicious refresh MFA challenge", "error", mfaErr)
 		return false // Graceful degradation — allow

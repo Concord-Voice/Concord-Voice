@@ -126,7 +126,16 @@ func (h *Handler) IssueMFAChallenge(ctx context.Context, userID string) (
 	}
 	recoveryOnlyMethods = computeRecoveryOnlyMethods(allMethods, loginMethods)
 
-	token, jti, err := h.mfaChecker.GenerateLoginChallenge(ctx, userID, true)
+	// #2418: stamp the epoch the SSO sign-in was authorized under, so CompleteLogin
+	// can refuse a completion that races a destructive reset. Fails closed — never
+	// substitute "" here; CompleteLogin rejects a claimless challenge for a rotated
+	// user, which would surface as a 401 at the end of the MFA flow instead of here.
+	ssoEpoch, epochErr := h.readCredentialEpoch(ctx, userID)
+	if epochErr != nil {
+		return "", nil, nil, nil, false, fmt.Errorf("read credential epoch for SSO MFA challenge: %w", epochErr)
+	}
+
+	token, jti, err := h.mfaChecker.GenerateLoginChallenge(ctx, userID, true, ssoEpoch)
 	if err != nil {
 		return "", nil, nil, nil, false, fmt.Errorf("generate login challenge: %w", err)
 	}

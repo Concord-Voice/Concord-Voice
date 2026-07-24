@@ -51,8 +51,10 @@ const (
 
 // LoginCompleter completes the login flow after MFA verification.
 // Implemented by the auth handler to issue tokens and create sessions.
+// expectedEpoch is the credential epoch stamped into the challenge at issuance
+// (#2418); the implementation refuses to mint if the durable epoch advanced past it.
 type LoginCompleter interface {
-	CompleteLogin(c *gin.Context, userID string, rememberMe bool)
+	CompleteLogin(c *gin.Context, userID string, rememberMe bool, expectedEpoch string)
 }
 
 // Handler implements MFA API endpoints and the Verifier interface.
@@ -217,8 +219,10 @@ func (h *Handler) GetLoginMethods(ctx context.Context, userID string) ([]string,
 
 // GenerateLoginChallenge creates a challenge token for two-step login and stores
 // the remember_me preference in Redis keyed by JTI for retrieval after MFA verify.
-func (h *Handler) GenerateLoginChallenge(ctx context.Context, userID string, rememberMe bool) (string, string, error) {
-	token, jti, err := GenerateChallengeToken(userID, PurposeLogin, h.jwtSecret)
+// credEpoch is stamped into the challenge and re-checked at CompleteLogin (#2418),
+// so a challenge issued before a destructive reset cannot complete after it.
+func (h *Handler) GenerateLoginChallenge(ctx context.Context, userID string, rememberMe bool, credEpoch string) (string, string, error) {
+	token, jti, err := GenerateChallengeToken(userID, PurposeLogin, h.jwtSecret, credEpoch)
 	if err != nil {
 		return "", "", err
 	}
@@ -237,7 +241,10 @@ func (h *Handler) GenerateLoginChallenge(ctx context.Context, userID string, rem
 // GenerateUpgradeChallenge creates a challenge token for pre-MFA session upgrades.
 // On successful MFA verification, fresh tokens are issued (same as login).
 func (h *Handler) GenerateUpgradeChallenge(ctx context.Context, userID string, rememberMe bool) (string, string, error) {
-	token, jti, err := GenerateChallengeToken(userID, PurposeMFAUpgrade, h.jwtSecret)
+	// PurposeMFAUpgrade completes into a 30s Redis bypass key (completeVerifyPurpose),
+	// never a session mint — the subsequent refresh mints via rotateAndRespond, which
+	// is already epoch-fenced. So this challenge carries no epoch (#2418).
+	token, jti, err := GenerateChallengeToken(userID, PurposeMFAUpgrade, h.jwtSecret, "")
 	if err != nil {
 		return "", "", err
 	}
@@ -1278,7 +1285,7 @@ func (h *Handler) completeVerifyPurpose(ctx context.Context, c *gin.Context, cla
 		rememberKey := fmt.Sprintf(redisKeyMFAChallengeRememberMe, claims.ID)
 		rememberMe := h.redis.Get(ctx, rememberKey).Val() == "1"
 		h.redis.Del(ctx, rememberKey)
-		h.loginCompleter.CompleteLogin(c, claims.UserID, rememberMe)
+		h.loginCompleter.CompleteLogin(c, claims.UserID, rememberMe, claims.CredentialEpoch)
 
 	case PurposeMFAUpgrade:
 		bypassKey := fmt.Sprintf("mfa_upgrade_bypass:%s", claims.UserID)
