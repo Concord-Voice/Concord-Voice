@@ -1459,18 +1459,10 @@ func (h *Handler) attemptGracePeriodRecovery(c *gin.Context, tokenHash string) b
 	machineIDOk := revokedMachineID == "" || graceRequestMachineID == "" || revokedMachineID == graceRequestMachineID
 
 	if time.Since(revokedAt) < 30*time.Second && storedIP == requestIP && revokedUA == requestUA && machineIDOk {
-		// #1623: never grace-recover a disabled account. The terminal-disable tx
-		// revokes the token, which routes here within the 30s grace window;
-		// recovering would re-mint tokens for a disabled user, bypassing the gate
-		// (this path is not covered by the rotateAndRespond conditional INSERT).
-		// Fail closed on a lookup error — deny rather than recover.
-		var graceDisabled bool
-		if derr := h.db.QueryRow(`SELECT disabled FROM users WHERE id = $1`, revokedUserID).Scan(&graceDisabled); derr != nil || graceDisabled {
-			h.log.Warn("Grace recovery denied: account disabled or lookup failed",
-				"user_id", revokedUserID, "lookup_failed", derr != nil)
-			c.JSON(http.StatusForbidden, gin.H{"error_code": "account_disabled"})
-			return true
-		}
+		// #2428: the disabled check now happens under the users-row lock inside
+		// handleGracePeriodRefresh's transaction. No separate SELECT-then-act
+		// pre-check here — that was the exact non-atomic pattern this work closes,
+		// and a disable committing before the tx's locked read yields a 403 there.
 		h.log.Info("Refresh token replay within grace period, recovering session",
 			"user_id", revokedUserID, "revoked_ago_ms", time.Since(revokedAt).Milliseconds(), "ip", requestIP)
 		h.handleGracePeriodRefresh(c, revokedUserID, revokedTokenID, revokedAt)
@@ -1757,11 +1749,11 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 	}
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id, predecessor_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		newTokenID, token.UserID, newTokenHash, token.DeviceName,
 		c.ClientIP(), truncateUserAgent(c.GetHeader(headerUserAgent)),
-		newExpiry, token.RememberMe, nilIfEmpty(propagatedMachineID),
+		newExpiry, token.RememberMe, nilIfEmpty(propagatedMachineID), token.ID,
 	); err != nil {
 		h.log.Error("Failed to store new refresh token", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
@@ -1799,126 +1791,131 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 }
 
 // handleGracePeriodRefresh recovers a session when a recently-revoked refresh token
-// is replayed within the grace period. This happens when the client process was killed
-// between the server revoking the old token and the client persisting the new one.
-// We find the successor token (issued during the rotation that revoked the replayed
-// token), revoke it, and issue a fresh token pair — effectively re-rotating.
-func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revokedTokenID string, revokedAt time.Time) {
-	// Find the successor token: same user, created around the time the replayed token
-	// was revoked (within a small window), and not yet revoked itself.
-	var successor models.RefreshToken
-	var successorMachineID sql.NullString
-	err := h.db.QueryRow(
-		`SELECT id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, created_at, last_used_at, remember_me, COALESCE(machine_id, '')
-		 FROM refresh_tokens
-		 WHERE user_id = $1
-		   AND revoked_at IS NULL
-		   AND created_at >= $2 - INTERVAL '2 seconds'
-		   AND created_at <= $2 + INTERVAL '2 seconds'
-		 ORDER BY created_at DESC
-		 LIMIT 1`,
-		userID, revokedAt,
-	).Scan(
-		&successor.ID,
-		&successor.UserID,
-		&successor.TokenHash,
-		&successor.DeviceName,
-		&successor.IPAddress,
-		&successor.UserAgent,
-		&successor.ExpiresAt,
-		&successor.CreatedAt,
-		&successor.LastUsedAt,
-		&successor.RememberMe,
-		&successorMachineID,
-	)
-	if successorMachineID.Valid {
-		successor.MachineID = successorMachineID.String
-	}
+// is replayed within the grace period — the client process was killed between the
+// server revoking the old token and the client persisting the rotated one. It selects
+// the exact successor by predecessor_id lineage (#2428), revokes it, and mints a fresh
+// pair, all inside one users FOR NO KEY UPDATE transaction so it composes with the
+// #2201 credential-epoch fence. The 30s window check already happened in the caller
+// (attemptGracePeriodRecovery); recovery keys on revokedTokenID, not the timestamp.
+func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revokedTokenID string, _ time.Time) {
+	ctx := c.Request.Context()
+	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
-		// No successor found — can't recover; treat as stale replay
-		h.log.Warn("Grace period replay but no successor token found",
-			"user_id", userID,
-			"revoked_token_id", revokedTokenID,
-		)
-		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidRefreshToken})
+		h.log.Error("Failed to begin grace recovery tx", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Lock the user row (the same lock a destructive reset holds) and read epoch +
+	// disabled under it, so grace recovery composes with the #2201 epoch fence.
+	var graceEmailVerified, disabled bool
+	var graceCredEpoch sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT email_verified, credential_epoch, disabled FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
+	).Scan(&graceEmailVerified, &graceCredEpoch, &disabled); err != nil {
+		h.log.Error("Failed to lock user for grace recovery", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		return
+	}
+	if disabled {
+		c.JSON(http.StatusForbidden, gin.H{"error_code": "account_disabled"})
 		return
 	}
 
-	// Revoke the successor (it was never delivered to the client)
-	_, err = h.db.Exec(
-		`UPDATE refresh_tokens SET revoked_at = NOW(), last_used_at = NOW() WHERE id = $1`,
-		successor.ID,
+	// Exact lineage lookup: the still-live token whose predecessor is the replayed
+	// token. A foreign concurrent/post-reset token has no edge to revokedTokenID and
+	// can never be selected. LIMIT 1 is defensive — the chain is strictly linear.
+	// `expires_at > NOW()` mirrors the normal Refresh path's expiry gate (#2428
+	// CWE-613): an already-expired successor must not re-mint a fresh access token;
+	// it fails closed to the sql.ErrNoRows -> 401 branch below.
+	var successor models.RefreshToken
+	var successorMachineID sql.NullString
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, user_id, device_name, expires_at, remember_me, COALESCE(machine_id, '')
+		 FROM refresh_tokens
+		 WHERE predecessor_id = $1 AND revoked_at IS NULL AND expires_at > NOW()
+		 ORDER BY created_at DESC LIMIT 1`,
+		revokedTokenID,
+	).Scan(
+		&successor.ID, &successor.UserID, &successor.DeviceName,
+		&successor.ExpiresAt, &successor.RememberMe, &successorMachineID,
 	)
+	if errors.Is(err, sql.ErrNoRows) {
+		// No live successor in this lineage — nothing to recover; stale replay.
+		h.log.Warn("Grace period replay but no live successor in lineage",
+			"user_id", userID, "revoked_token_id", revokedTokenID)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidRefreshToken})
+		return
+	}
 	if err != nil {
-		h.log.Error("Failed to revoke successor token during grace recovery", "error", err)
+		// A real query/DB error must be observable, not collapsed into a 401.
+		h.log.Error("Grace recovery successor lookup failed", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		return
+	}
+	if successorMachineID.Valid {
+		successor.MachineID = successorMachineID.String
 	}
 
-	// Generate a fresh refresh token
+	// Revoke the successor (never delivered to the client) — checked, inside the tx.
+	var revokedSuccessorID string
+	revokeErr := tx.QueryRowContext(ctx,
+		`UPDATE refresh_tokens SET revoked_at = NOW(), last_used_at = NOW()
+		 WHERE id = $1 AND revoked_at IS NULL RETURNING id`,
+		successor.ID,
+	).Scan(&revokedSuccessorID)
+	if errors.Is(revokeErr, sql.ErrNoRows) {
+		// Revoked out from under us mid-tx (e.g. concurrent reset). Fail closed.
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidRefreshToken})
+		return
+	}
+	if revokeErr != nil {
+		h.log.Error("Failed to revoke successor during grace recovery", "error", revokeErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		return
+	}
+
+	// Mint the fresh successor', chaining lineage to the token it replaces (D1).
 	newRefreshToken, err := GenerateRefreshToken()
 	if err != nil {
 		h.log.Error("Failed to generate refresh token during grace recovery", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
 		return
 	}
-
-	// Determine expiry
 	newExpiry := successor.ExpiresAt
 	cookieMaxAge := 0
 	if successor.RememberMe {
 		newExpiry = time.Now().Add(30 * 24 * time.Hour)
 		cookieMaxAge = 30 * 24 * 60 * 60
 	}
-
-	// Store the new token (propagate machine_id)
 	newTokenHash := HashRefreshToken(newRefreshToken)
 	newTokenID := uuid.New().String()
 	graceMachineID := c.GetHeader(headerMachineID)
 	if graceMachineID == "" {
 		graceMachineID = successor.MachineID
 	}
-	// Conditional INSERT mirroring rotateAndRespond (#1623): the caller
-	// attemptGracePeriodRecovery already gates on users.disabled, but that is a
-	// SELECT-then-act; the EXISTS guard makes the grace mint atomically race-safe so
-	// a disable committing between that check and this INSERT cannot mint a live token.
-	res, err := h.db.Exec(
-		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id)
-		 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
-		 WHERE EXISTS (SELECT 1 FROM users WHERE id = $2 AND disabled = FALSE)`,
-		newTokenID,
-		userID,
-		newTokenHash,
-		successor.DeviceName,
-		c.ClientIP(),
-		truncateUserAgent(c.GetHeader(headerUserAgent)),
-		newExpiry,
-		successor.RememberMe,
-		nilIfEmpty(graceMachineID),
-	)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, device_name, ip_address, user_agent, expires_at, remember_me, machine_id, predecessor_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		newTokenID, userID, newTokenHash, successor.DeviceName,
+		c.ClientIP(), truncateUserAgent(c.GetHeader(headerUserAgent)),
+		newExpiry, successor.RememberMe, nilIfEmpty(graceMachineID), successor.ID,
+	); err != nil {
 		h.log.Error("Failed to store new refresh token during grace recovery", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
 		return
 	}
-	if affected, raErr := res.RowsAffected(); raErr != nil || affected == 0 {
-		// 0 rows => account disabled (or RowsAffected failed => fail closed).
-		c.JSON(http.StatusForbidden, gin.H{"error_code": "account_disabled"})
-		return
-	}
 
-	// Set cookie
-	SetRefreshCookie(c, newRefreshToken, cookieMaxAge)
-
-	// Look up current email_verified + credential epoch for grace recovery token
-	var graceEmailVerified bool
-	var graceCredEpoch sql.NullString
-	if err := h.db.QueryRow(`SELECT email_verified, credential_epoch FROM users WHERE id = $1`, userID).Scan(&graceEmailVerified, &graceCredEpoch); err != nil {
-		h.log.Error("Failed to look up email_verified for grace recovery", "error", err, "user_id", userID)
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit grace recovery", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
 		return
 	}
 
-	// Generate access token
-	tier := h.entCache.GetTier(c.Request.Context(), userID)
+	SetRefreshCookie(c, newRefreshToken, cookieMaxAge)
+
+	tier := h.entCache.GetTier(ctx, userID)
 	accessToken, err := GenerateAccessToken(userID, h.jwtSecret, graceEmailVerified, graceCredEpoch.String, newTokenID, tier)
 	if err != nil {
 		h.log.Error("Failed to generate access token during grace recovery", "error", err)
@@ -1927,9 +1924,7 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	}
 
 	h.log.Info("Session recovered via grace period refresh",
-		"user_id", userID,
-		"new_session_id", newTokenID,
-	)
+		"user_id", userID, "new_session_id", newTokenID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"access_token":        accessToken,

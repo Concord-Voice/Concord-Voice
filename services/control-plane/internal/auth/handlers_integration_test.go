@@ -565,13 +565,14 @@ func TestRefreshRotatesToken(t *testing.T) {
 	ts.Router.ServeHTTP(rw, req)
 	require.Equal(t, http.StatusOK, rw.Code)
 
-	// Replay old token — should fail (breach detection)
+	// Replay old token within the grace window, same client → grace recovery (#2428):
+	// the client was killed before persisting the rotated token, so re-rotate.
 	req2 := httptest.NewRequest("POST", pathRefresh, nil)
 	req2.AddCookie(firstCookie)
 	req2.Header.Set(headerContentType, contentTypeJSON)
 	rw2 := httptest.NewRecorder()
 	ts.Router.ServeHTTP(rw2, req2)
-	assert.Equal(t, http.StatusUnauthorized, rw2.Code)
+	assert.Equal(t, http.StatusOK, rw2.Code)
 }
 
 // --- WS Ticket Tests ---

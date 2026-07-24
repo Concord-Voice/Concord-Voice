@@ -1328,11 +1328,12 @@ func TestRefreshWithCompromisedTokenDetectsReplay(t *testing.T) {
 	w := doRefreshWithMachineID(ts, refreshToken, "", "")
 	require.Equal(t, http.StatusOK, w.Code)
 
-	// Second refresh with same old token — replay detected (outside grace period UA/IP)
-	// The token was just revoked, so we're within the 30s window. But the grace period
-	// recovery fails (known bug), so it falls back to rejection.
+	// Second refresh with the same old token, same client, within the 30s grace
+	// window: this is the benign rotation-race (client killed before persisting the
+	// rotated token) — grace recovery re-rotates by lineage and returns a fresh
+	// session (#2428). Stale-replay rejection is covered in grace_recovery_test.go.
 	w = doRefreshWithMachineID(ts, refreshToken, "", "")
-	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Equal(t, http.StatusOK, w.Code)
 }
 
 // ── Poll Device Recovery: Approved Status ──────────────────────────────────
