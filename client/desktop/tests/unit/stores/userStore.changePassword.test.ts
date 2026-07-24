@@ -462,6 +462,112 @@ describe('userStore - changePassword', () => {
     expect(preferencesSyncService.pushPreferences).not.toHaveBeenCalled();
   });
 
+  // #2422: a fulfilled 2xx whose body is unreadable/malformed is commit evidence,
+  // so it must fail closed to re-auth (clear old-key custody, keep watchers
+  // stopped) rather than throw → be reported as ordinary failure → restart the
+  // old-key sync watchers over an already-rotated server.
+  const keysOk = {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      e2ee_keys: { wrapped_private_key: 'old-wrapped-key', key_derivation_salt: 'old-salt' },
+    }),
+  } as Response;
+
+  it('#2422: 200 whose JSON is unreadable fails closed to re-auth and leaves watchers stopped', async () => {
+    // A real nuclearReset clears the token; model that (Once, so it does not leak
+    // into later tests) so the finally sees the superseded lifecycle and does NOT
+    // restart the quiesced watchers.
+    mockNuclearReset.mockImplementationOnce(() => {
+      useAuthStore.getState().clearAccessToken();
+    });
+    mockApiFetch.mockResolvedValueOnce(keysOk).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => {
+        throw new SyntaxError('Unexpected end of JSON input');
+      },
+    } as Response);
+
+    const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('sign in again with your new password');
+    expect(useAuthStore.getState().loginNotice).toContain('sign in again with your new password');
+    expect(mockNuclearReset).toHaveBeenCalledTimes(1);
+    // Never proceeded to reinit or re-pushed domains against an already-committed change.
+    expect(e2eeService.initialize).not.toHaveBeenCalled();
+    expect(preferencesSyncService.pushPreferences).not.toHaveBeenCalled();
+    // The data-loss crux: watchers were stopped for the rotation and NOT restarted.
+    expect(preferencesSyncService.stopWatching).toHaveBeenCalled();
+    expect(preferencesSyncService.startWatching).not.toHaveBeenCalled();
+    expect(savedGifsSyncService.startWatching).not.toHaveBeenCalled();
+    expect(friendOrgSyncService.startWatching).not.toHaveBeenCalled();
+  });
+
+  it('#2422: 200 with an invalid presence_override_version fails closed to re-auth', async () => {
+    mockApiFetch.mockResolvedValueOnce(keysOk).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ presence_override_version: 'not-a-number' }),
+    } as Response);
+
+    const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
+
+    expect(result.error).toContain('sign in again with your new password');
+    expect(mockNuclearReset).toHaveBeenCalledTimes(1);
+    expect(e2eeService.initialize).not.toHaveBeenCalled();
+  });
+
+  it('#2422: 200 with malformed sync_domain_versions fails closed to re-auth', async () => {
+    mockApiFetch.mockResolvedValueOnce(keysOk).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ presence_override_version: 8, sync_domain_versions: 'garbage' }),
+    } as Response);
+
+    const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
+
+    expect(result.error).toContain('sign in again with your new password');
+    expect(mockNuclearReset).toHaveBeenCalledTimes(1);
+  });
+
+  it('#2422: a lifecycle superseded during the unreadable-2xx parse does not reset the successor', async () => {
+    mockApiFetch.mockResolvedValueOnce(keysOk).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => {
+        // A newer session became current (token cleared) before we read the body.
+        useAuthStore.getState().clearAccessToken();
+        throw new SyntaxError('Unexpected end of JSON input');
+      },
+    } as Response);
+
+    const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
+
+    expect(result.success).toBe(false);
+    // Cancellation stays a cancellation; the stale flow must NOT nuclearReset the successor.
+    expect(result.error).not.toContain('sign in again with your new password');
+    expect(mockNuclearReset).not.toHaveBeenCalled();
+  });
+
+  it('#2422: a malformed non-2xx (500) is NOT promoted to a committed outcome', async () => {
+    mockApiFetch.mockResolvedValueOnce(keysOk).mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: async () => {
+        throw new SyntaxError('Unexpected end of JSON input');
+      },
+    } as Response);
+
+    const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
+
+    expect(result.success).toBe(false);
+    // Not a committed outcome: no re-auth notice, no custody teardown.
+    expect(result.error).not.toContain('sign in again with your new password');
+    expect(mockNuclearReset).not.toHaveBeenCalled();
+  });
+
   it('stages the notice but skips a redundant nuclearReset when the teardown already superseded this change (#2333)', async () => {
     mockApiFetch
       .mockResolvedValueOnce({

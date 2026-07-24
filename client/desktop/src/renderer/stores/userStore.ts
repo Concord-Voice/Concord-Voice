@@ -204,6 +204,31 @@ function passwordChangeFailure(error: unknown, isCurrent: () => boolean): Passwo
 }
 
 /**
+ * Fail a committed-but-unrecoverable password change closed to re-authentication
+ * (#2337 E2EE-reinit teardown; #2422 unreadable-2xx). The password POST already
+ * committed (credential rotated, old refresh token revoked), so this is NOT a
+ * retryable cancellation. Inspected synchronously (no await): still the current
+ * lifecycle → force the teardown (clears old-key custody) AND stage the notice;
+ * superseded but already unauthenticated (a self-teardown cleared the token and
+ * is redirecting to login) → stage the notice only; superseded by a DIFFERENT
+ * authenticated session → neither (do not clobber the new session's state).
+ * `nuclearReset` clears the access token, which flips `isCurrent()` false so the
+ * `changePassword` `finally` skips restarting the old-key sync watchers.
+ */
+function failClosedToReauth(
+  isCurrent: () => boolean,
+  nuclearReset: () => void
+): PasswordChangeResult {
+  if (isCurrent()) {
+    nuclearReset();
+    useAuthStore.getState().setLoginNotice(REAUTH_REQUIRED_NOTICE);
+  } else if (useAuthStore.getState().accessToken === null) {
+    useAuthStore.getState().setLoginNotice(REAUTH_REQUIRED_NOTICE);
+  }
+  return { success: false, error: REAUTH_REQUIRED_NOTICE };
+}
+
+/**
  * Re-init E2EE after a committed password change, failing closed if the new keyset was torn
  * down mid-derivation. Returns `null` on success (the caller continues) or a
  * `PasswordChangeResult` when it failed closed. Extracted (with its own `try/catch`) so
@@ -248,16 +273,7 @@ async function reinitE2EEOrFailClosed(
     if (!(initError instanceof E2EEInitTeardownError)) throw initError;
     // No await below — nuclearReset is pre-resolved — so the lifecycle is inspected
     // synchronously with no window for a newer login to slip in (coderabbit).
-    if (isCurrent()) {
-      nuclearReset();
-      useAuthStore.getState().setLoginNotice(REAUTH_REQUIRED_NOTICE);
-    } else if (useAuthStore.getState().accessToken === null) {
-      // Superseded, but already unauthenticated: a self-teardown cleared the token and is
-      // redirecting to login — stage the notice. NOT when a different authenticated session
-      // is current (that would clobber the new session's notice).
-      useAuthStore.getState().setLoginNotice(REAUTH_REQUIRED_NOTICE);
-    }
-    return { success: false, error: REAUTH_REQUIRED_NOTICE };
+    return failClosedToReauth(isCurrent, nuclearReset);
   }
 }
 
@@ -351,11 +367,16 @@ type PasswordSubmitOutcome =
   // — a skewed server may have ignored sync_domains entirely. The caller runs
   // the same new-key repair (harmless double-write against a current server).
   | { kind: 'committed-ambiguous'; plaintexts: SyncDomainPlaintexts }
+  // #2422: a fulfilled 2xx (commit evidence) whose body could not be read/validated.
+  // The #2397 continuation pair lives only in that unreadable body, so the session
+  // cannot self-repair — the caller fails closed to re-auth.
+  | { kind: 'committed-unreadable' }
   | { kind: 'terminal'; result: PasswordChangeResult };
 
 type PasswordResponseClassification =
   | { kind: 'retry' }
   | { kind: 'committed'; presenceOverrideVersion: number; skew: boolean }
+  | { kind: 'committed-unreadable' }
   | { kind: 'terminal'; result: PasswordChangeResult };
 
 interface PasswordSubmitContext {
@@ -418,6 +439,36 @@ async function classifyPasswordChangeResponse(
     return { kind: 'terminal', result: { success: false, error: 'Session expired' } };
   }
 
+  // #2422: a fulfilled 2xx IS commit evidence. Read + validate its body inside a
+  // guard BEFORE any non-2xx handling. Any failure to read a committed body fails
+  // closed to committed-unreadable — never throw here, because a throw is reported
+  // as ordinary failure and the changePassword `finally` would restart the old-key
+  // sync watchers over an already-rotated server (CWE-212 / data-loss). A lifecycle
+  // cancellation (isCurrent flipped) must stay a cancellation, so re-assert in the
+  // catch (it rethrows PASSWORD_CHANGE_CANCELLED when no longer current).
+  if (response.ok) {
+    try {
+      const raw: unknown = await response.json();
+      assertPasswordChangeCurrent(isCurrent);
+      const data = asRecord(raw);
+      const version = data.presence_override_version;
+      if (!Number.isInteger(version) || (version as number) < 0) {
+        throw new Error('Server returned an invalid presence override version');
+      }
+      // This client ALWAYS submits sync_domains, so a success response missing
+      // sync_domain_versions means a version-skewed server ignored the field and
+      // committed the password change without rotating the domains (#2200 review).
+      // A present-but-malformed value fails closed here (was a throw pre-#2422).
+      const skew = !validateSyncDomainVersions(data.sync_domain_versions);
+      return { kind: 'committed', presenceOverrideVersion: version as number, skew };
+    } catch {
+      assertPasswordChangeCurrent(isCurrent);
+      return { kind: 'committed-unreadable' };
+    }
+  }
+
+  // Non-2xx (non-401): parse for the 409 conflict codes / error message. A parse
+  // failure here is a non-commit error, NOT promoted to a committed outcome (#2422).
   const raw: unknown = await response.json();
   assertPasswordChangeCurrent(isCurrent);
   const data = asRecord(raw);
@@ -447,24 +498,11 @@ async function classifyPasswordChangeResponse(
     return { kind: 'retry' };
   }
 
-  if (!response.ok) {
-    const message = typeof data.error === 'string' ? data.error : 'Failed to change password';
-    return {
-      kind: 'terminal',
-      result: { success: false, error: message },
-    };
-  }
-
-  const version = data.presence_override_version;
-  if (!Number.isInteger(version) || (version as number) < 0) {
-    throw new Error('Server returned an invalid presence override version');
-  }
-  // This client ALWAYS submits sync_domains, so a success response missing
-  // sync_domain_versions means a version-skewed server ignored the field and
-  // committed the password change without rotating the domains (#2200 review).
-  // A present-but-malformed value is a server contract violation and throws.
-  const skew = !validateSyncDomainVersions(data.sync_domain_versions);
-  return { kind: 'committed', presenceOverrideVersion: version as number, skew };
+  const message = typeof data.error === 'string' ? data.error : 'Failed to change password';
+  return {
+    kind: 'terminal',
+    result: { success: false, error: message },
+  };
 }
 
 /**
@@ -858,6 +896,15 @@ export const useUserStore = wrapStore(
               },
             });
             if (submit.kind === 'terminal') return submit.result;
+
+            // #2422: a committed-but-unreadable 2xx. The change is committed but its
+            // body (the #2397 continuation pair, sync versions) could not be read, so
+            // the session cannot self-repair — fail closed to re-auth BEFORE reinit.
+            // failClosedToReauth's nuclearReset clears old-key custody and flips
+            // isCurrent() false, so the finally leaves the sync watchers stopped.
+            if (submit.kind === 'committed-unreadable') {
+              return failClosedToReauth(isCurrent, nuclearReset);
+            }
 
             // Re-initialize E2EE with the new password. The password POST above already
             // committed, so a teardown during the derivation (E2EEInitTeardownError, #2337)
