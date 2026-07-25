@@ -42,6 +42,11 @@
  *        Server's spaIpcContract is NOT bumped to 9 — older v8 shells
  *        continue to work without the overlay, since webContents.send
  *        to a non-listening renderer is a harmless no-op.
+ *        AMENDED by #2401 — see v20 below for the `kind` classification the
+ *        payload gained. The "spaIpcContract is NOT bumped" note above is
+ *        about the SERVER's required minimum and still holds; it is NOT a
+ *        precedent against bumping this shell's own IPC_CONTRACT_VERSION,
+ *        which #2401 does bump because the payload signature changed.
  * - v10: Forensic build-tag observability (#920 §5.13, #939):
  *        app:getBuildTag handler, returns the CI build tag baked into
  *        the packaged app at build time (via forge extraResource
@@ -106,8 +111,25 @@
  *        credential under that owner and returning only the access token, session
  *        ID, and owner — extending the SSO refresh-token-never-in-renderer custody
  *        boundary to the MFA path.
+ * - v20: SPA fallback diagnostic classification (#2401): the app:configFetchFailed
+ *        payload gains an OPTIONAL `kind` ('unreachable' | 'rejected' | 'contract',
+ *        SpaFallbackDiagnostic in shared/spaIpcTypes.ts) so the renderer can tell
+ *        which of the six isUnexpectedBundled conditions fired. Only 'unreachable'
+ *        is falsified by proof of reachability; 'rejected' (a refused spaUrl, incl.
+ *        the #750 poisoned sentinel) and 'contract' (shell older than the deployed
+ *        SPA) fire against a REACHABLE server, so retracting them on connectivity
+ *        would silence a fail-loud sentinel.
+ *
+ *        The SERVER's spaIpcContract stays 19 — the field is additive and a
+ *        renderer that receives no `kind` fails closed to non-retractable, i.e.
+ *        degrades exactly to v19 behavior. Bumping the SHELL version is still
+ *        correct per [internal]rules/electron.md ("bump when channels are added,
+ *        removed, or change signature"): the payload signature changed. The two
+ *        numbers are independent — IPC_CONTRACT_VERSION is what this shell
+ *        implements, SPA_IPC_CONTRACT (spa.env) is the minimum the deployed SPA
+ *        demands, and a 20-shell still satisfies a 19-minimum.
  */
-export const IPC_CONTRACT_VERSION = 19;
+export const IPC_CONTRACT_VERSION = 20;
 
 /**
  * Opaque main-process identity for one stored credential lifecycle.

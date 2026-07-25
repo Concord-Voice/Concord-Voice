@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.34] — 2026-07-25
+
+### Fixed
+
+- **The "can't reach Concord servers" warning at startup now clears itself** ([#2401](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2401)) — this warning could appear when the app opened and then stay on screen even though you were connected and your messages were loading, only going away if you manually refreshed the window. It now disappears on its own the moment the app reaches the servers, and it no longer appears at all when the connection was already up. Startup warnings that are not about reachability — a configuration the app declined to use, or an app version too old for the current interface — still appear as before, and now say which of those actually happened instead of blaming the connection.
+
 ## [0.2.33] — 2026-07-24
 
 ### Security

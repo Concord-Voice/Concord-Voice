@@ -1,12 +1,18 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, act } from '@testing-library/react';
 import { SpaFallbackOverlay } from '../../../src/renderer/components/SpaFallbackOverlay/SpaFallbackOverlay';
+import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('SpaFallbackOverlay', () => {
   const originalElectron = (globalThis as unknown as { electron?: unknown }).electron;
   let configFetchFailedHandler: ((data: { reason: string }) => void) | null = null;
 
   beforeEach(() => {
+    // Required since #2401: the component reads chatStore, so a leaked
+    // `isConnected: true` would seed its latch and suppress the banner these
+    // cases assert on — failing with a cause that points at the component
+    // rather than at leaked store state ([internal]rules/tests.md).
+    resetAllStores();
     configFetchFailedHandler = null;
     (globalThis as unknown as { electron: unknown }).electron = {
       onConfigFetchFailed: (handler: (data: { reason: string }) => void) => {

@@ -16,6 +16,7 @@ import { revealLoadFailure } from './loadFailureVisibility';
 import { loadWindowState, attachWindowState } from './windowState';
 import { isWayland } from './waylandDetect';
 import { deriveCloseAction, deriveMinimizeAction } from '../shared/clientBehavior';
+import { SPA_FALLBACK_MESSAGE } from '../shared/spaIpcTypes';
 import {
   app,
   autoUpdater as electronAutoUpdater,
@@ -81,6 +82,7 @@ import { resolveAppProtocolPath } from './appProtocol';
 import {
   resolveSpaSource,
   isUnexpectedBundled,
+  classifyFallbackReason,
   isTransientRemoteFailure,
   captureSpaHash,
   hashEntryHtml,
@@ -461,15 +463,26 @@ async function loadPackagedRenderer(window: BrowserWindow, _bundledPath: string)
   // #830 Option C: surface a non-blocking diagnostic event if the bundled
   // fallback fired for an unexpected reason (config fetch failed, network
   // issue, spaUrl rejected, etc.). Expected fallbacks (first launch, no
-  // spaUrl, contract zero) do NOT trigger it. The renderer shows the
-  // "Could not reach Concord servers" banner on app:configFetchFailed.
+  // spaUrl, contract zero) do NOT trigger it.
   // Delay 2000ms to ensure renderer listeners are registered.
+  //
+  // The payload carries a CLASS, not just prose (#2401). Six distinct reasons
+  // reach this branch and only one of them ("config fetch failed" / 5xx) means
+  // the servers were unreachable — the rest fire against a perfectly reachable
+  // server that sent something this client refused, or that this shell is too
+  // old for. Sending one hardcoded "Could not reach Concord servers" for all
+  // six was wrong on five of them, and left the renderer unable to tell which
+  // it had received — so it could not know whether proof of reachability
+  // falsified the claim. The class decides both the copy and whether the
+  // banner may be retracted; see SpaFallbackKind in shared/spaIpcTypes.ts.
   if (decision.mode === 'bundled' && isUnexpectedBundled(decision.reason)) {
+    const kind = classifyFallbackReason(decision.reason);
     setTimeout(() => {
       // Guard against window destroyed during the 2s delay (rapid quit, crash).
       if (window.isDestroyed()) return;
       window.webContents.send('app:configFetchFailed', {
-        reason: 'Could not reach Concord servers',
+        reason: SPA_FALLBACK_MESSAGE[kind],
+        kind,
       });
     }, 2000);
     // Self-heal the cold-start race: retry on a warm network and switch to

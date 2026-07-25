@@ -9,6 +9,7 @@ import type {
   SSOCompletionResult,
   SSOSignInResult,
 } from '../shared/sso';
+import type { SpaFallbackDiagnostic } from '../shared/spaIpcTypes';
 
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
@@ -196,8 +197,13 @@ contextBridge.exposeInMainWorld('electron', {
   // Bundled-SPA fallback diagnostic event (#830/#831): main process emits
   // when spaLoader falls back to bundled for an unexpected reason.
   // Renderer subscribes via SpaFallbackOverlay component.
-  onConfigFetchFailed: (callback: (data: { reason: string }) => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, data: { reason: string }) => callback(data);
+  // Carries a `kind` classifying the reason since #2401 — the renderer needs it
+  // to decide whether proof of reachability falsifies the diagnostic. Pure
+  // pass-through; no validation here, and `kind` is optional so a payload from
+  // a pre-#2401 shell still satisfies the type.
+  onConfigFetchFailed: (callback: (data: SpaFallbackDiagnostic) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: SpaFallbackDiagnostic) =>
+      callback(data);
     ipcRenderer.on('app:configFetchFailed', handler);
     return () => {
       ipcRenderer.removeListener('app:configFetchFailed', handler);
@@ -582,7 +588,7 @@ export interface ElectronAPI {
   onTokenRefreshed: (callback: (data: TokenRefreshedData) => void) => () => void;
 
   // Bundled-SPA fallback diagnostic event (#830/#831)
-  onConfigFetchFailed: (callback: (data: { reason: string }) => void) => () => void;
+  onConfigFetchFailed: (callback: (data: SpaFallbackDiagnostic) => void) => () => void;
   onInviteReceived: (callback: (data: { code: string }) => void) => () => void;
   inviteRendererReady: () => void;
 

@@ -33,6 +33,7 @@ import {
   resolveSpaSource,
   isUnexpectedBundled,
   isTransientRemoteFailure,
+  classifyFallbackReason,
   captureSpaHash,
   hashEntryHtml,
   SPA_NO_CACHE_LOAD_OPTIONS,
@@ -360,5 +361,68 @@ describe('hashEntryHtml', () => {
 
     await expect(hashEntryHtml('https://spa.concordvoice.chat/index.html')).resolves.toBeNull();
     expect(arrayBuffer).not.toHaveBeenCalled();
+  });
+});
+
+describe('classifyFallbackReason (#2401)', () => {
+  // The load-bearing property: exactly ONE class is retractable by proof of
+  // reachability. Every reason string resolveSpaSource can emit for an
+  // UNEXPECTED bundled fallback is enumerated here, so a new reason added
+  // without a classification decision shows up as a failing case rather than
+  // silently defaulting into the retractable arm.
+
+  it('classifies a failed config fetch as unreachable', () => {
+    expect(classifyFallbackReason('config fetch failed: timeout after 5000ms')).toBe('unreachable');
+    expect(classifyFallbackReason('config fetch failed: getaddrinfo ENOTFOUND')).toBe(
+      'unreachable'
+    );
+  });
+
+  it('classifies a 5xx config response as unreachable', () => {
+    expect(classifyFallbackReason('config fetch returned 500')).toBe('unreachable');
+    expect(classifyFallbackReason('config fetch returned 503')).toBe('unreachable');
+  });
+
+  it('classifies a 4xx config response as rejected, not unreachable', () => {
+    // The server answered — it is reachable. A 4xx is a client/auth problem,
+    // which reaching the server does not disprove.
+    expect(classifyFallbackReason('config fetch returned 404')).toBe('rejected');
+    expect(classifyFallbackReason('config fetch returned 403')).toBe('rejected');
+  });
+
+  it('classifies every spaUrl refusal as rejected', () => {
+    expect(classifyFallbackReason('spaUrl rejected: non-HTTPS protocol http:')).toBe('rejected');
+    expect(classifyFallbackReason('spaUrl rejected: invalid URL')).toBe('rejected');
+    // #750 poisoned sentinel — the case where reaching the server is the point.
+    expect(
+      classifyFallbackReason('spaUrl rejected: legacy /api/v1/spa/ path (poisoned sentinel)')
+    ).toBe('rejected');
+  });
+
+  it('classifies an IPC contract mismatch as contract', () => {
+    expect(classifyFallbackReason('IPC contract 18 < required 19 — shell update needed')).toBe(
+      'contract'
+    );
+  });
+
+  it('classifies an unrecognized future reason as rejected (fail loud)', () => {
+    // Mirrors isUnexpectedBundled's posture: an unknown reason must not land in
+    // the one arm that can be silently retracted.
+    expect(classifyFallbackReason('some reason nobody has written yet')).toBe('rejected');
+    expect(classifyFallbackReason('')).toBe('rejected');
+  });
+
+  it('never returns unreachable for a reason isTransientRemoteFailure rejects', () => {
+    // Locks the two classifiers together: unreachable is defined AS the
+    // transient-remote-failure set, so they cannot drift apart.
+    for (const reason of [
+      'config fetch returned 404',
+      'spaUrl rejected: invalid URL',
+      'IPC contract 18 < required 19 — shell update needed',
+      'unknown',
+    ]) {
+      expect(isTransientRemoteFailure(reason)).toBe(false);
+      expect(classifyFallbackReason(reason)).not.toBe('unreachable');
+    }
   });
 });

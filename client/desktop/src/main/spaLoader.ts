@@ -24,6 +24,7 @@ import { IPC_CONTRACT_VERSION } from './ipcContract';
 import { getPersistedApiBase } from './tokenManager';
 import { setSpaHash, setSpaVersion } from './spaState';
 import { getBuildSha7 } from './buildInfo';
+import type { SpaFallbackKind } from '../shared/spaIpcTypes';
 
 const CONFIG_TIMEOUT_MS = 5_000;
 const SPA_NO_CACHE_HEADERS = {
@@ -190,6 +191,29 @@ export function isUnexpectedBundled(reason: string): boolean {
  */
 export function isTransientRemoteFailure(reason: string): boolean {
   return reason.startsWith('config fetch failed') || /^config fetch returned 5\d\d/.test(reason);
+}
+
+/**
+ * Classify an UNEXPECTED bundled-fallback reason for the renderer's diagnostic
+ * banner (#2401). See `SpaFallbackKind` in shared/spaIpcTypes.ts for what each
+ * class means and why only `unreachable` may be retracted.
+ *
+ * Call only for reasons `isUnexpectedBundled()` accepts — an expected reason
+ * emits no diagnostic at all, so it has no class.
+ *
+ * `unreachable` deliberately reuses `isTransientRemoteFailure` rather than
+ * re-deriving the predicate: "the config fetch got no answer or a 5xx" is
+ * exactly the same question the LKG cache already asks, and one classifier
+ * cannot drift from the other.
+ */
+export function classifyFallbackReason(reason: string): SpaFallbackKind {
+  if (isTransientRemoteFailure(reason)) return 'unreachable';
+  if (reason.startsWith('IPC contract ')) return 'contract';
+  // Everything else — spaUrl rejected (non-HTTPS / invalid / #750 poisoned
+  // sentinel), a 4xx, and any future reason string we have not anticipated.
+  // Conservative by construction: `rejected` is never retracted, so an
+  // unclassified new reason stays fail-loud.
+  return 'rejected';
 }
 
 /**
