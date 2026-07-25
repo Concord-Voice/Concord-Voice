@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Clock, TimerOff } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { ServerMember, useMemberStore } from '../../stores/memberStore';
 import { usePermissionStore } from '../../stores/permissionStore';
 import { useDMStore } from '../../stores/dmStore';

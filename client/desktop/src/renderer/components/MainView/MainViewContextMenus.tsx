@@ -1,4 +1,4 @@
-import { useLocation } from 'react-router-dom';
+import { useLocation } from 'react-router';
 import ServerContextMenu from '../Servers/ServerContextMenu';
 import ChannelContextMenu from '../Channels/ChannelContextMenu';
 import ChannelListContextMenu from '../Channels/ChannelListContextMenu';

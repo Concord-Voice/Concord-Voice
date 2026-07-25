@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { PhoneOff, MoveRight } from 'lucide-react';
 import ContextMenu from '../ui/ContextMenu';
 import { EnforcementMenuItems } from '../ui/EnforcementMenuItems';
@@ -11,7 +11,10 @@ import { useDMStore } from '../../stores/dmStore';
 import { useFriendRequestState } from '../../hooks/useFriendRequestState';
 import { Permissions, MUTE_MEMBERS, DEAFEN_MEMBERS, MOVE_MEMBERS } from '../../utils/permissions';
 import { errorMessage } from '../../utils/redactError';
-import { moveVoiceParticipant, disconnectVoiceParticipant } from '../../services/voiceParticipantApi';
+import {
+  moveVoiceParticipant,
+  disconnectVoiceParticipant,
+} from '../../services/voiceParticipantApi';
 import './VoiceParticipantContextMenu.css';
 
 /**
@@ -82,7 +85,12 @@ const dmIcon = (
 const friendIcon = (
   <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
     <circle cx="7" cy="5" r="3" stroke="currentColor" strokeWidth="1.5" />
-    <path d="M1 14c0-2.76 2.24-5 6-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    <path
+      d="M1 14c0-2.76 2.24-5 6-5"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+    />
     <path d="M12 10v4M10 12h4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
   </svg>
 );

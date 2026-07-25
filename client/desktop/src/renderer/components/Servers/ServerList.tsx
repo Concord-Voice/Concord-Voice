@@ -1,6 +1,6 @@
 import React, { useEffect } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router';
 import { useAuthStore } from '../../stores/authStore';
 import { useServerStore } from '../../stores/serverStore';
 import { useUnreadStore } from '../../stores/unreadStore';
@@ -95,7 +95,11 @@ const ServerList: React.FC<ServerListProps> = ({ onOpenActionModal, onContextMen
               aria-label={`${server.name} server`}
             >
               {resolveMediaUrl(server.icon_url) ? (
-                <img src={resolveMediaUrl(server.icon_url)} alt={server.name} className="server-icon-img" />
+                <img
+                  src={resolveMediaUrl(server.icon_url)}
+                  alt={server.name}
+                  className="server-icon-img"
+                />
               ) : (
                 <span className="server-icon-initial">{server.name.charAt(0).toUpperCase()}</span>
               )}

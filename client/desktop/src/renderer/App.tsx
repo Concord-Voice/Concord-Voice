@@ -1,5 +1,5 @@
 import { Suspense, lazy, useEffect, useState } from 'react';
-import { Routes, Route, Navigate, Outlet, useNavigate } from 'react-router-dom';
+import { Routes, Route, Navigate, Outlet, useNavigate } from 'react-router';
 import { Titlebar } from './components/Titlebar/Titlebar';
 import AuthFlow from './components/Auth/AuthFlow';
 import { isE2EEUnlockPending } from './utils/authAdmissionGate';

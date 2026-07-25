@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { ConnectionMode } from '../../types/auth';
 import { useAuthStore } from '../../stores/authStore';
 import { useUserStore, UserProfile } from '../../stores/userStore';

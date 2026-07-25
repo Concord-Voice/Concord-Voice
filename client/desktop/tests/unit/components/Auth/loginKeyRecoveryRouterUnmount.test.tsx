@@ -20,7 +20,7 @@
 
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { MemoryRouter, Routes, Route, Navigate } from 'react-router';
 import { vi } from 'vitest';
 
 import Login from '@/renderer/components/Auth/Login';

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import Modal from '../ui/Modal';
 import { useFriendStore, type Friend } from '../../stores/friendStore';
 import { useSendInviteToFriend, type SendInviteResult } from '../../hooks/useSendInviteToFriend';

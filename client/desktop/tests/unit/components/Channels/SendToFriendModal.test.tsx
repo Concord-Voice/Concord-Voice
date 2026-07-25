@@ -4,8 +4,8 @@ import { useFriendStore, type Friend } from '@/renderer/stores/friendStore';
 import { SendToFriendModal } from '@/renderer/components/Channels/SendToFriendModal';
 
 const mockNavigate = vi.fn();
-vi.mock('react-router-dom', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('react-router-dom')>()),
+vi.mock('react-router', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('react-router')>()),
   useNavigate: () => mockNavigate,
 }));
 

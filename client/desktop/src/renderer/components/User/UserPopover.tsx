@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useMemo } from 'react';
 import { SmilePlus } from 'lucide-react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { openProfilePage } from '../../utils/openProfilePage';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
 import { UserProfile, useUserStore } from '../../stores/userStore';
 import { useMemberStore, PresenceStatus } from '../../stores/memberStore';

@@ -5,7 +5,7 @@ import { useChannelStore } from '../../stores/channelStore';
 import { useDMStore } from '../../stores/dmStore';
 import { useServerStore } from '../../stores/serverStore';
 import { useUserStore } from '../../stores/userStore';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import './ChannelSwitcher.css';
 
 interface SwitcherItem {

@@ -11,7 +11,7 @@ import {
 } from '../../stores/notificationPrefsStore';
 import { useVoiceStore } from '../../stores/voiceStore';
 import { useLayoutStore, ServerFolder } from '../../stores/layoutStore';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router';
 import { ServerWithRole } from '../../types/server';
 import ContextMenu from '../ui/ContextMenu';
 import Modal from '../ui/Modal';

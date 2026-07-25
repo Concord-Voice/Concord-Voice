@@ -1,6 +1,6 @@
 import React from 'react';
 import { render, RenderOptions } from '@testing-library/react';
-import { BrowserRouter } from 'react-router-dom';
+import { BrowserRouter } from 'react-router';
 import userEventLib from '@testing-library/user-event';
 import { ModalProvider } from '@/renderer/components/ui/ModalContext';
 
