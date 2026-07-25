@@ -1039,8 +1039,26 @@ func (h *Handler) verifyCredentials(ctx context.Context, c *gin.Context, email, 
 // credEpoch is the epoch the password was verified under; it is stamped into the
 // challenge so CompleteLogin can refuse a completion that races a reset (#2418).
 func (h *Handler) handleMFAChallenge(ctx context.Context, c *gin.Context, userID string, rememberMe bool, credEpoch string) {
-	allMethods, _ := h.mfaChecker.GetEnabledMethods(ctx, userID)
-	loginMethods, _ := h.mfaChecker.GetLoginMethods(ctx, userID)
+	// #2450: these were blank-discarded. errcheck honors an explicit `_`, so the
+	// linter never flagged them (the review-only class in [internal]rules/backend.md,
+	// founding incidents #1142/#1154). On error the response shipped
+	// `"methods": []` alongside a VALID mfa_challenge_token, so the client rendered
+	// an MFA prompt with no selectable method and nothing was logged — the user is
+	// hard-stuck mid-login with zero server-side signal.
+	//
+	// loginMethods is load-bearing for the response, so its failure is fatal.
+	// allMethods only feeds the recovery-only hint, so a failure there degrades
+	// to an empty hint rather than blocking a login that can still proceed.
+	allMethods, err := h.mfaChecker.GetEnabledMethods(ctx, userID)
+	if err != nil {
+		h.log.Error("Failed to read enabled MFA methods", "error", err, "user_id", userID)
+	}
+	loginMethods, err := h.mfaChecker.GetLoginMethods(ctx, userID)
+	if err != nil {
+		h.log.Error("Failed to read MFA login methods", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
+		return
+	}
 	challengeToken, jti, mfaErr := h.mfaChecker.GenerateLoginChallenge(ctx, userID, rememberMe, credEpoch)
 	if mfaErr != nil {
 		h.log.Error("Failed to generate MFA challenge", "error", mfaErr)
@@ -1183,6 +1201,14 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	// unserialized pool statements let a reset committing mid-flight leave a live
 	// post-reset session minted from pre-reset authorization.
 	ctx := c.Request.Context()
+	// #2450: resolve the tier BEFORE opening the transaction. GetTier is a Redis
+	// GET that reads through to the subscriptions table on a miss, so calling it
+	// under the row lock would acquire a SECOND pool connection while this handler
+	// already holds one for the tx — under a login burst approaching MaxOpenConns
+	// that deadlocks until statement timeout. It also extended the hold on the
+	// same users-row lock every destructive reset needs. The tier is only a JWT
+	// claim and needs no consistent snapshot with the locked read.
+	tier := h.entCache.GetTier(ctx, userID)
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		h.log.Error("Failed to begin login mint tx", "error", err)
@@ -1242,7 +1268,6 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	// Generate access token (JWT, 15 min). tokenID (the refresh-session id) is
 	// minted first so the access token can carry it as the sid claim (#2201).
 	tokenID := uuid.New().String()
-	tier := h.entCache.GetTier(ctx, userID)
 	accessToken, err := GenerateAccessToken(userID, h.jwtSecret, user.EmailVerified, credEpoch.String, tokenID, tier)
 	if err != nil {
 		h.log.Error(errMsgFailedAccessToken, "error", err)
@@ -1583,7 +1608,13 @@ func (h *Handler) handleSuspiciousMachineID(c *gin.Context, token models.Refresh
 		"user_id", token.UserID, "stored_machine_id", token.MachineID,
 		"request_machine_id", requestMachineID, "ip", requestIP)
 
-	resp := h.buildMFAChallengeResponse("suspicious_session_mfa", "Session verification required", challengeToken, token.UserID, jti)
+	resp, respErr := h.buildMFAChallengeResponse(ctx, "suspicious_session_mfa", "Session verification required", challengeToken, token.UserID, jti)
+	if respErr != nil {
+		// Same graceful degradation as the GenerateLoginChallenge failure above — better to
+		// allow the refresh than to hand back a challenge with no selectable method (#2450).
+		h.log.Error("Failed to build suspicious refresh MFA challenge", "error", respErr)
+		return false
+	}
 	c.JSON(http.StatusForbidden, resp)
 	return true
 }
@@ -1618,19 +1649,47 @@ func (h *Handler) checkPreMFASessionLock(c *gin.Context, token models.RefreshTok
 	h.log.Info("Pre-MFA session requires MFA verification",
 		"user_id", token.UserID, "session_created", token.CreatedAt, "mfa_enabled_at", mfaEnabledAt.Time)
 
-	resp := h.buildMFAChallengeResponse("mfa_upgrade_required",
+	resp, respErr := h.buildMFAChallengeResponse(ctx, "mfa_upgrade_required",
 		"This session was created before MFA was enabled. Please verify your identity.",
 		challengeToken, token.UserID, jti)
+	if respErr != nil {
+		// Matches the GenerateUpgradeChallenge failure above — don't block, and don't ship
+		// a challenge the user cannot answer (#2450).
+		h.log.Error("Failed to build pre-MFA session challenge", "error", respErr)
+		return false
+	}
 	c.JSON(http.StatusForbidden, resp)
 	return true
 }
 
 // buildMFAChallengeResponse constructs the common MFA challenge JSON response with
 // methods, recovery-only methods, and optional WebAuthn options.
-func (h *Handler) buildMFAChallengeResponse(errorCode, message, challengeToken, userID, jti string) gin.H {
-	ctx := context.Background()
-	allMethods, _ := h.mfaChecker.GetEnabledMethods(ctx, userID)
-	loginMethods, _ := h.mfaChecker.GetLoginMethods(ctx, userID)
+//
+// #2450: both method reads were blank-discarded, and this is the SHARED builder for the
+// suspicious-refresh and MFA-upgrade challenges — so the defect handleMFAChallenge fixed
+// on the login path was still live on two others. errcheck honors an explicit `_`, so the
+// linter never flagged it (the review-only class in [internal]rules/backend.md, founding
+// incidents #1142/#1154). On error the response shipped `"methods": []` beside a VALID
+// challenge token: the client renders an MFA prompt with nothing selectable, the challenge
+// JTI is burned, and nothing is logged.
+//
+// It now returns an error rather than a half-built response. Callers already degrade to
+// `return false` on their sibling GenerateChallenge error, so they keep that exact posture
+// — the point is to never ship an unusable challenge, not to add a new failure mode.
+// ctx is the request context (was context.Background(), which discarded cancellation and
+// deadline across three backing calls).
+func (h *Handler) buildMFAChallengeResponse(ctx context.Context, errorCode, message, challengeToken, userID, jti string) (gin.H, error) {
+	// allMethods only feeds the recovery-only hint, so it degrades to an empty hint.
+	allMethods, err := h.mfaChecker.GetEnabledMethods(ctx, userID)
+	if err != nil {
+		h.log.Error("Failed to read enabled MFA methods", "error", err, "user_id", userID)
+	}
+	// loginMethods is load-bearing for the response — an empty list is the hard-stuck bug.
+	loginMethods, err := h.mfaChecker.GetLoginMethods(ctx, userID)
+	if err != nil {
+		h.log.Error("Failed to read MFA login methods", "error", err, "user_id", userID)
+		return nil, fmt.Errorf("read MFA login methods: %w", err)
+	}
 
 	resp := gin.H{
 		"error":               errorCode,
@@ -1656,7 +1715,7 @@ func (h *Handler) buildMFAChallengeResponse(errorCode, message, challengeToken, 
 		}
 	}
 
-	return resp
+	return resp, nil
 }
 
 // computeRecoveryOnlyMethods returns methods in allMethods but not in loginMethods.

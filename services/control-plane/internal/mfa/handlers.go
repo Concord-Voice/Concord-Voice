@@ -222,7 +222,7 @@ func (h *Handler) GetLoginMethods(ctx context.Context, userID string) ([]string,
 // credEpoch is stamped into the challenge and re-checked at CompleteLogin (#2418),
 // so a challenge issued before a destructive reset cannot complete after it.
 func (h *Handler) GenerateLoginChallenge(ctx context.Context, userID string, rememberMe bool, credEpoch string) (string, string, error) {
-	token, jti, err := GenerateChallengeToken(userID, PurposeLogin, h.jwtSecret, credEpoch)
+	token, jti, err := GenerateChallengeToken(userID, PurposeLogin, JWTSecret(h.jwtSecret), CredEpoch(credEpoch))
 	if err != nil {
 		return "", "", err
 	}
@@ -244,7 +244,7 @@ func (h *Handler) GenerateUpgradeChallenge(ctx context.Context, userID string, r
 	// PurposeMFAUpgrade completes into a 30s Redis bypass key (completeVerifyPurpose),
 	// never a session mint — the subsequent refresh mints via rotateAndRespond, which
 	// is already epoch-fenced. So this challenge carries no epoch (#2418).
-	token, jti, err := GenerateChallengeToken(userID, PurposeMFAUpgrade, h.jwtSecret, "")
+	token, jti, err := GenerateChallengeToken(userID, PurposeMFAUpgrade, JWTSecret(h.jwtSecret), "")
 	if err != nil {
 		return "", "", err
 	}
@@ -2002,7 +2002,7 @@ func isValidEmail(email string) bool {
 // GenerateRecoveryToken creates a recovery-purpose JWT with a 25-hour TTL.
 // Implements auth.MFAChecker interface.
 func (h *Handler) GenerateRecoveryToken(userID string) (string, string, error) {
-	return GenerateRecoveryToken(userID, h.jwtSecret)
+	return GenerateRecoveryToken(userID, JWTSecret(h.jwtSecret))
 }
 
 // ValidateRecoveryToken validates a recovery-purpose JWT and returns the claims.

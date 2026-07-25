@@ -43,22 +43,44 @@ type ChallengeClaims struct {
 	CredentialEpoch string `json:"cred_epoch,omitempty"`
 }
 
+// CredEpoch is a user's durable credential epoch as carried into a challenge token.
+//
+// #2450: this is a distinct type purely to make a parameter transposition a
+// COMPILE error. jwtSecret and credEpoch were adjacent plain strings, so swapping
+// them compiled cleanly — and would have written the HMAC signing secret into the
+// client-visible `cred_epoch` claim while signing with an epoch string. Blast
+// radius is total signing-key disclosure, and no test would obviously fail. Do not
+// collapse this back to a bare string.
+type CredEpoch string
+
+// JWTSecret is the HMAC signing key for challenge tokens.
+//
+// #2450 follow-up: `CredEpoch` alone left the hazard half-closed. `GenerateRecoveryToken`
+// took `(userID, jwtSecret string)` — two adjacent plain strings, two lines below the type
+// added to prevent exactly that. Transposing them compiled cleanly and would sign the
+// RECOVERY token with the user's UUID as the HMAC key — a value the attacker already knows,
+// yielding forgeable recovery tokens and full account takeover via RecoveryResetAccount —
+// while writing the real signing secret into the client-visible `sub` claim. Typing the
+// secret closes the whole class rather than one instance. Do not collapse either type back
+// to a bare string.
+type JWTSecret string
+
 // GenerateChallengeToken creates a short-lived, purpose-bound JWT for MFA challenges.
 // credEpoch is the issuing user's durable credential epoch, or "" for purposes that
 // never mint a session.
-func GenerateChallengeToken(userID string, purpose ChallengePurpose, jwtSecret, credEpoch string) (string, string, error) {
+func GenerateChallengeToken(userID string, purpose ChallengePurpose, jwtSecret JWTSecret, credEpoch CredEpoch) (string, string, error) {
 	return generateChallengeTokenWithTTL(userID, purpose, jwtSecret, credEpoch, challengeTTL)
 }
 
 // GenerateRecoveryToken creates a recovery-purpose JWT with a longer TTL (25 hours).
 // Recovery tokens authorize a destructive reset rather than a session mint, so they
 // carry no epoch — binding one to a pre-reset epoch would be incoherent.
-func GenerateRecoveryToken(userID, jwtSecret string) (string, string, error) {
+func GenerateRecoveryToken(userID string, jwtSecret JWTSecret) (string, string, error) {
 	return generateChallengeTokenWithTTL(userID, PurposeRecovery, jwtSecret, "", recoveryTTL)
 }
 
 // generateChallengeTokenWithTTL creates a purpose-bound JWT with a configurable TTL.
-func generateChallengeTokenWithTTL(userID string, purpose ChallengePurpose, jwtSecret, credEpoch string, ttl time.Duration) (string, string, error) {
+func generateChallengeTokenWithTTL(userID string, purpose ChallengePurpose, jwtSecret JWTSecret, credEpoch CredEpoch, ttl time.Duration) (string, string, error) {
 	jti := uuid.New().String()
 	now := time.Now()
 
@@ -72,7 +94,7 @@ func generateChallengeTokenWithTTL(userID string, purpose ChallengePurpose, jwtS
 		},
 		UserID:          userID,
 		Purpose:         purpose,
-		CredentialEpoch: credEpoch,
+		CredentialEpoch: string(credEpoch),
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

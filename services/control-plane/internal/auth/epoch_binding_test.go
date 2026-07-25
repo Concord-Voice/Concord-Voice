@@ -24,14 +24,29 @@ import (
 // MFA challenge issued pre-reset.
 
 // newRejectPathHandler builds the minimal handler for tests that assert a REFUSAL.
-// The epoch check runs before any token minting, so a DB-only handler exercises the
-// guard in isolation — the same shape continuation_epoch_test.go uses.
+// The epoch check still runs before any token MINTING, so this exercises the guard
+// in isolation from token generation.
+//
+// #2450: it is no longer DB-only. entCache.GetTier moved ABOVE BeginTx because
+// calling it under the users-row lock acquired a second pool connection while the
+// handler already held one for the tx — a pool-exhaustion deadlock near
+// MaxOpenConns, on a lock every destructive reset needs. The deliberate trade is
+// that a login destined for refusal now pays one tier lookup: the refusal path is
+// rare (it fires only during an epoch race) and the lookup is a Redis GET that
+// reads through to the DB only on a miss, so the wasted work is negligible next to
+// the availability risk it removes. Production always wires this cache
+// (internal/api/router.go), so the nil cache here was a test-only shape.
 func newRejectPathHandler(t *testing.T) (*Handler, *sql.DB, uuid.UUID) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	db, _ := dbtest.SetupTestDB(t)
+	rdb := setupAuthAttemptRedis(t)
 	userID := dbtest.CreateUser(t, db)
-	return &Handler{db: db, log: logger.NewWithWriter(io.Discard)}, db, userID
+	return &Handler{
+		db:       db,
+		log:      logger.NewWithWriter(io.Discard),
+		entCache: entitlements.NewCache(rdb, db),
+	}, db, userID
 }
 
 // newAdmitPathHandler builds a handler that can mint: Redis for the auth-failure

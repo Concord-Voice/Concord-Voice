@@ -34,11 +34,54 @@ import (
 // state — SSO users are always email-verified at INSERT time (provider
 // asserts email_verified=true; the Callback handler refuses otherwise),
 // but we re-read in case the user later flips a flag via a recovery flow.
+// #2450: the locked read and the refresh INSERT run in ONE transaction holding
+// the users row FOR NO KEY UPDATE — the same lock the four destructive resets
+// take (ChangePassword / ReplaceMyKeys / RecoveryResetPassword /
+// RecoveryResetAccount). No expectedEpoch is compared here, so the value is the
+// LOCK, not a comparison: it forces a total order with those resets — either the
+// reset commits first (and this sign-in is genuinely post-reset, acceptable and
+// matching CompleteLogin semantics), or this mint holds the lock and the reset,
+// which must wait for it, sweeps the freshly-inserted row.
+//
+// TWO SCOPE LIMITS, both proven by PoC during the #2453 review — do not restate
+// this as a general "the lock alone is sufficient" claim:
+//
+//  1. A lock only orders actors that TAKE it. Two bulk revokers of
+//     refresh_tokens hold no users-row lock and are therefore NOT serialized by
+//     this: sessions.revokeAllSessionsDB (#2457) and auth.handleTokenTheft
+//     (#2460). Those are revoker-side defects, fixed there, not here.
+//  2. "SSO carries no separately-authorized epoch" is true of the provider-
+//     assertion Callback path and FALSE of CompleteLink, whose authorization is
+//     a password verified at an earlier instant — i.e. exactly a separately-
+//     authorized epoch. Binding that path needs a MatchEpoch comparison, not
+//     just this lock; tracked in #2458.
+//
+// Before this the epoch SELECT and the INSERT were two unfenced statements with
+// a Redis round trip between them, so a reset could bulk-revoke, commit, and
+// still leave this row un-swept and live — rotateAndRespond would then rotate it
+// into a fully valid post-reset session derived from pre-reset authorization
+// (CWE-367 -> CWE-613). handlers.go's generateTokenPair comment already named
+// SSO as a flow that must not mint unfenced; this is that fix. The unlocked
+// `disabled` read had the identical shape and is closed by the same change.
 func (h *Handler) IssueAccessAndRefresh(ctx context.Context, userID string) (accessToken, refreshToken, sessionID string, err error) {
+	// Resolve the tier BEFORE opening the transaction. GetTier is a Redis GET
+	// that reads through to the subscriptions table on a miss, so calling it
+	// under the row lock would acquire a second pool connection while this
+	// handler already holds one — a pool-exhaustion hazard under load, and it
+	// would extend the hold on a lock destructive resets need. The tier is only
+	// a JWT claim; it needs no consistent snapshot with the locked read.
+	tier := h.entCache.GetTier(ctx, userID)
+
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", "", "", fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	var emailVerified, disabled bool
 	var credEpoch sql.NullString
-	if err := h.db.QueryRowContext(ctx,
-		`SELECT email_verified, disabled, credential_epoch FROM users WHERE id = $1`, userID,
+	if err := tx.QueryRowContext(ctx,
+		`SELECT email_verified, disabled, credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
 	).Scan(&emailVerified, &disabled, &credEpoch); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", "", "", fmt.Errorf("user %s not found", userID)
@@ -55,7 +98,6 @@ func (h *Handler) IssueAccessAndRefresh(ctx context.Context, userID string) (acc
 
 	// tokenID first so the access token carries it as the sid claim (#2201).
 	tokenID := uuid.New().String()
-	tier := h.entCache.GetTier(ctx, userID)
 	accessToken, err = GenerateAccessToken(userID, h.jwtSecret, emailVerified, credEpoch.String, tokenID, tier)
 	if err != nil {
 		return "", "", "", fmt.Errorf("access: %w", err)
@@ -71,12 +113,16 @@ func (h *Handler) IssueAccessAndRefresh(ctx context.Context, userID string) (acc
 	// device_name / ip_address / user_agent / machine_id deliberately omitted —
 	// the adapter signature is ctx-only. SSO-issued sessions accept the missing
 	// metadata; subsequent /auth/refresh + WS ticket flows will stamp it.
-	if _, err := h.db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, remember_me)
 		 VALUES ($1, $2, $3, $4, $5)`,
 		tokenID, userID, tokenHash, expiresAt, true,
 	); err != nil {
 		return "", "", "", fmt.Errorf("store refresh token: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", "", "", fmt.Errorf("commit: %w", err)
 	}
 
 	return accessToken, refreshToken, tokenID, nil
