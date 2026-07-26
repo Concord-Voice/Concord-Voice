@@ -323,7 +323,7 @@ func (h *Hub) resolveSnapshotVisibleStatus(
 		return snapshotStatusForViewer(userID == seed.viewerID, statusOnline), nil
 	}
 
-	status, err := h.redis.Get(ctx, fmt.Sprintf(presenceKeyFmt, userID)).Result()
+	status, err := h.redis.Get(ctx, presence.StatusRedisKey(userID)).Result()
 	if errors.Is(err, redis.Nil) {
 		return snapshotStatusForViewer(userID == seed.viewerID, statusOnline), nil
 	}

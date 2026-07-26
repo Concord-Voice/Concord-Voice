@@ -115,7 +115,9 @@ func TestDeleteAccountDeletesActiveActivityStateWithoutPendingMarker(t *testing.
 		require.True(t, stored)
 	}
 	delivery := &accountActivityDelivery{}
-	activityService := presence.NewActivityService(nil, nil, store, nil, nil, delivery)
+	activityService := presence.NewActivityService(
+		nil, nil, store, nil, nil, delivery, permitAllPresence{},
+	)
 	service := configuredAccountServiceForCleanup(t, db, activityService)
 
 	require.NoError(t, service.DeleteAccount(ctx, userID.String()))

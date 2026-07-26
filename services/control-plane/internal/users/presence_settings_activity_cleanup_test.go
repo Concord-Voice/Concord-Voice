@@ -550,6 +550,7 @@ func TestUpdatePresenceSettingsPriorIneligibleMissingActivityStateClearsMarker(t
 				db,
 				nil,
 				activityDelivery,
+				permitAllPresence{},
 			)
 			handler := users.NewHandler(
 				db, logger.NewWithWriter(io.Discard), nil, nil, nil, nil, nil,

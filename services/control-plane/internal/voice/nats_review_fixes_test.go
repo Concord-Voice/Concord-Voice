@@ -320,6 +320,7 @@ func TestPrivateJoinedPostCommitActivityFailureStillBroadcasts(t *testing.T) {
 		ts.DB,
 		resolver,
 		ts.Hub,
+		permitAllPresence{},
 	)
 	sub := voice.NewNATSSubscriber(
 		ts.DB, log, ts.Hub, nil, ts.Redis, resolver, activity,

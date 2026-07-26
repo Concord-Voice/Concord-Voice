@@ -63,7 +63,7 @@ func TestAuthorizeAndMinimize_RealResolverEnforcesFreshVoiceVisibility(t *testin
 	}
 	resolver := rbac.NewResolver(ts.DB, nil, nil)
 
-	decision, err := presence.AuthorizeAndMinimize(ctx, ts.DB, resolver, input)
+	decision, err := presence.AuthorizeAndMinimize(ctx, ts.DB, resolver, permitAllPresence{}, input)
 	require.NoError(t, err)
 	require.Equal(t, map[uuid.UUID]bool{
 		uuid.MustParse(owner.ID):         true,
@@ -74,7 +74,7 @@ func TestAuthorizeAndMinimize_RealResolverEnforcesFreshVoiceVisibility(t *testin
 
 	viewVoice := int64(rbac.PermViewVoiceChannels)
 	ts.CreateChannelOverride(t, channelID, "user", deniedMember.ID, viewVoice, viewVoice)
-	decision, err = presence.AuthorizeAndMinimize(ctx, ts.DB, resolver, input)
+	decision, err = presence.AuthorizeAndMinimize(ctx, ts.DB, resolver, permitAllPresence{}, input)
 	require.NoError(t, err)
 	require.True(t, decision.Audience[uuid.MustParse(owner.ID)])
 	require.True(t, decision.Audience[uuid.MustParse(baseMember.ID)])
@@ -86,7 +86,7 @@ func TestAuthorizeAndMinimize_RealResolverEnforcesFreshVoiceVisibility(t *testin
 		`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID,
 	).Scan(&allRoleID))
 	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, viewVoice)
-	decision, err = presence.AuthorizeAndMinimize(ctx, ts.DB, resolver, input)
+	decision, err = presence.AuthorizeAndMinimize(ctx, ts.DB, resolver, permitAllPresence{}, input)
 	require.NoError(t, err)
 	require.True(t, decision.Audience[uuid.MustParse(owner.ID)], "owner bypasses SBAC")
 	require.True(t, decision.Audience[uuid.MustParse(administrator.ID)], "administrator bypasses SBAC")
@@ -103,7 +103,7 @@ func TestAuthorizeAndMinimize_RealResolverEnforcesFreshVoiceVisibility(t *testin
 	rowsAffected, err := result.RowsAffected()
 	require.NoError(t, err)
 	require.EqualValues(t, 1, rowsAffected)
-	decision, err = presence.AuthorizeAndMinimize(ctx, ts.DB, resolver, input)
+	decision, err = presence.AuthorizeAndMinimize(ctx, ts.DB, resolver, permitAllPresence{}, input)
 	require.NoError(t, err)
 	require.True(t, decision.Audience[uuid.MustParse(owner.ID)])
 	require.True(t, decision.Audience[uuid.MustParse(administrator.ID)])

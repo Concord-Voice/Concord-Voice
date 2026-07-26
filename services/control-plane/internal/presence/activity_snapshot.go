@@ -93,13 +93,18 @@ func NewActivitySnapshotService(
 	store *ActivityStore,
 	visibility ChannelVisibilityResolver,
 	coordinator SenderPublicationCoordinator,
+	senderPresence SenderPresenceResolver,
 ) *ActivitySnapshotService {
+	// Required, not optional -- see NewActivityService. A nil resolver fails
+	// closed, so a viewer bootstrapping here cannot be shown a suppressed
+	// sender's stored row (#2444).
+	presenceGate := senderPresence
 	return newActivitySnapshotService(
 		db,
 		builder,
 		store,
 		func(ctx context.Context, input PolicyInput) (Decision, error) {
-			return AuthorizeAndMinimize(ctx, db, visibility, input)
+			return AuthorizeAndMinimize(ctx, db, visibility, presenceGate, input)
 		},
 		coordinator,
 	)
@@ -147,7 +152,6 @@ func (s *ActivitySnapshotService) Snapshot(
 	if err := s.removeInactiveSnapshotStates(ctx, keys, states); err != nil {
 		return nil, err
 	}
-
 	out := make(ActivitySnapshot)
 	for _, key := range keys {
 		state, found := states[key]

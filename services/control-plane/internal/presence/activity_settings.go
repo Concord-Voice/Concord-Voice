@@ -681,3 +681,122 @@ func mergeAudience(into, from map[uuid.UUID]bool) {
 		}
 	}
 }
+
+// hiddenSenderSuppressedSettings is the policy state an invisible or offline
+// sender is treated as having: master off, both categories off. Invisible is
+// modelled as master-off for these two categories, which is what lets the
+// existing settings-suppression machinery apply verbatim.
+var hiddenSenderSuppressedSettings = ActivityPolicySettings{
+	MasterEnabled:   false,
+	ServerVoiceTier: TierOff,
+	PrivateCallTier: TierOff,
+}
+
+// hiddenSenderWidestPriorSettings is a deliberately SYNTHETIC "before" state.
+//
+// The recipient resolver derives the affected audience from the max of before
+// and after, so passing the widest possible prior policy yields a SUPERSET of
+// whoever could actually be holding a badge. That is the correct direction to
+// err: a clear frame for a recipient who never received the activity is a
+// client-side no-op, whereas a too-narrow audience leaves a live badge on a user
+// who just went invisible -- the exact leak #2444 closes.
+//
+// The alternative -- reading the sender's real settings here -- would add a
+// database query to a path that runs on a presence transition, for no privacy
+// gain.
+var hiddenSenderWidestPriorSettings = ActivityPolicySettings{
+	MasterEnabled:          true,
+	ServerVoiceTier:        TierServers,
+	ServerVoiceShowDetails: true,
+	PrivateCallTier:        TierServers,
+	PrivateCallShowDetails: true,
+}
+
+// SuppressHiddenSenderActivityAlreadyGated removes every supported current
+// activity for a sender whose base presence now forbids emission, then delivers
+// targeted clears to the exact prior audience.
+//
+// The caller MUST already own the sender gate (presencehistory WithSender) --
+// this mirrors SuppressAllActivityAlreadyGated, whose caller holds the gate for
+// its own transaction.
+//
+// It delivers clears rather than disconnecting, which is a DELIBERATE divergence
+// from the #2408 settings-suppression precedent above (spec 3.2.1): total
+// suppression is fully expressible as a clear frame, and disconnecting the
+// sender's audience emits a correlated timing signal on precisely the action the
+// user took in order not to be observed. Disconnect is retained only for the
+// fail-closed paths, where the audience cannot be resolved and a clear therefore
+// cannot be aimed.
+func (s *ActivityService) SuppressHiddenSenderActivityAlreadyGated(
+	ctx context.Context,
+	userID uuid.UUID,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if userID == uuid.Nil {
+		return errors.New("hidden-sender activity suppression requires a user")
+	}
+	if s == nil || s.store == nil || s.delivery == nil || s.settingsRecipients == nil {
+		return errors.New("hidden-sender activity suppression unavailable")
+	}
+
+	// Resolve the audience BEFORE deleting: the resolver reconstructs each
+	// category's scope from the stored generation, so deleting first would erase
+	// the evidence it needs.
+	recipients, err := s.settingsRecipients(
+		ctx, userID, hiddenSenderWidestPriorSettings, hiddenSenderSuppressedSettings,
+	)
+	if err != nil {
+		return errors.Join(
+			wrapActivityError("resolve hidden-sender activity recipients", err),
+			s.disconnectAllWithinBudget(ctx),
+		)
+	}
+
+	if deleteErrs := s.deleteSuppressedActivity(
+		ctx, userID, hiddenSenderSuppressedSettings,
+	); len(deleteErrs) > 0 {
+		return errors.Join(
+			errors.Join(deleteErrs...),
+			s.disconnectAllWithinBudget(ctx),
+		)
+	}
+
+	return s.deliverHiddenSenderClears(ctx, userID, recipients)
+}
+
+// deliverHiddenSenderClears aims one clear frame per category at the resolved
+// prior audience. A delivery failure falls back to disconnecting exactly those
+// recipients -- never the whole replica.
+func (s *ActivityService) deliverHiddenSenderClears(
+	ctx context.Context,
+	userID uuid.UUID,
+	recipients map[uuid.UUID]bool,
+) error {
+	if len(recipients) == 0 {
+		return nil
+	}
+	// The sender is never its own recipient for this purpose; self-view is a
+	// separate product decision (spec 7.1).
+	delete(recipients, userID)
+	if len(recipients) == 0 {
+		return nil
+	}
+
+	var errs []error
+	for _, category := range []Category{CategoryServerVoice, CategoryPrivateCall} {
+		plan := DeliveryPlan{
+			SenderID:        userID,
+			Category:        category,
+			ClearRecipients: recipients,
+		}
+		if err := s.delivery.DeliverRichPresence(ctx, plan); err != nil {
+			errs = append(errs,
+				wrapActivityError("deliver hidden-sender activity clear", err),
+				s.disconnectKnown(ctx, recipients),
+			)
+		}
+	}
+	return errors.Join(errs...)
+}

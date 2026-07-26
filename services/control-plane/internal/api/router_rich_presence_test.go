@@ -63,9 +63,13 @@ func TestNewRouterWiresOneAuthoritativeRichPresenceBridgeIntoVoiceNATS(t *testin
 	needles := []string{
 		"activityStore := presence.NewActivityStore(redis)",
 		"activityBuilder := presence.NewActivityBuilder(",
+		// One shared base-presence gate, constructed before both consumers so
+		// they cannot disagree about whether a sender may publish (#2444).
+		"senderPresence := websocket.NewSenderPresenceResolver(redis, db)",
 		"activityService := presence.NewActivityService(",
 		"activitySnapshotService := presence.NewActivitySnapshotService(",
 		"hub.SetActivitySnapshotService(activitySnapshotService)",
+		"hub.SetRichPresenceHiddenSuppressor(",
 		"usersHandler.SetActivitySettingsSuppressor(activityService)",
 		"voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver, activityService)",
 	}
@@ -85,5 +89,6 @@ func TestNewRouterWiresOneAuthoritativeRichPresenceBridgeIntoVoiceNATS(t *testin
 		activityStore,
 		rbacResolver,
 		presenceHistoryService,
+		senderPresence,
 	)`)
 }

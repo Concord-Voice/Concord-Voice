@@ -88,6 +88,7 @@ func newVoiceReplicaHub(
 		activityStore,
 		resolver,
 		ts.PresenceHistory,
+		permitAllPresence{},
 	))
 	go hub.Run()
 	handler := concordws.NewHandler(

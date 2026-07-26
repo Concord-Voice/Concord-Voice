@@ -23,6 +23,15 @@ type ChannelVisibilityResolver interface {
 	) ([]string, error)
 }
 
+// SenderPresenceResolver reports whether one sender's base presence currently
+// permits rich-presence emission. Implementations absorb their own transport
+// errors into a fail-closed false and own their logging — returning an error
+// here would route through failClosedGeneration to a global disconnect, so a
+// Redis blip must never surface as one.
+type SenderPresenceResolver interface {
+	RichPresenceEmissionPermitted(ctx context.Context, senderID uuid.UUID) bool
+}
+
 type policySettings struct {
 	master         bool
 	serverTier     Tier
@@ -154,10 +163,20 @@ func AuthorizeAndMinimize(
 	ctx context.Context,
 	db DBTX,
 	visibility ChannelVisibilityResolver,
+	senderPresence SenderPresenceResolver,
 	input PolicyInput,
 ) (Decision, error) {
 	if err := validatePolicyInput(input); err != nil {
 		return Decision{}, err
+	}
+	// Base-presence gate first: it is the cheapest check, and suppressing here
+	// makes the settings read unnecessary on the suppressed path. A nil resolver
+	// fails closed rather than defaulting to emission.
+	if senderPresence == nil ||
+		!senderPresence.RichPresenceEmissionPermitted(ctx, input.SenderID) {
+		suppressed := emptyDecision()
+		suppressed.SuppressedBySenderPresence = true
+		return suppressed, nil
 	}
 	if db == nil {
 		return Decision{}, policyFailure(FailureSettingsRead, errors.New("missing policy database"))

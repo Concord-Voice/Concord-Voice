@@ -72,6 +72,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 			store,
 			activitySnapshotVisibility{allow: true},
 			nil,
+			permitAllPresence{},
 		)
 
 		snapshot, err := service.Snapshot(ctx, viewerID)
@@ -118,6 +119,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 		service := presence.NewActivitySnapshotService(
 			db, presence.NewActivityBuilder(db, nil, store), store,
 			activitySnapshotVisibility{allow: false}, nil,
+			permitAllPresence{},
 		)
 
 		snapshot, err := service.Snapshot(ctx, viewerID)
@@ -155,6 +157,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 		service := presence.NewActivitySnapshotService(
 			db, presence.NewActivityBuilder(db, nil, store), store,
 			activitySnapshotVisibility{allow: true}, nil,
+			permitAllPresence{},
 		)
 
 		snapshot, err := service.Snapshot(ctx, viewerID)
@@ -192,6 +195,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 		service := presence.NewActivitySnapshotService(
 			db, presence.NewActivityBuilder(db, nil, store), store,
 			activitySnapshotVisibility{allow: true}, nil,
+			permitAllPresence{},
 		)
 
 		snapshot, err := service.Snapshot(ctx, viewerID)
@@ -243,6 +247,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 			store,
 			activitySnapshotVisibility{allow: true},
 			nil,
+			permitAllPresence{},
 		)
 
 		snapshot, err := service.Snapshot(ctx, viewerID)
@@ -281,6 +286,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 			store,
 			activitySnapshotVisibility{allow: true},
 			nil,
+			permitAllPresence{},
 		)
 
 		snapshot, err := service.Snapshot(ctx, viewerID)
@@ -316,6 +322,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 			store,
 			activitySnapshotVisibility{allow: true},
 			nil,
+			permitAllPresence{},
 		)
 
 		snapshot, err := service.Snapshot(ctx, viewerID)
@@ -357,6 +364,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 			store,
 			activitySnapshotVisibility{allow: true},
 			nil,
+			permitAllPresence{},
 		)
 
 		snapshot, err := service.Snapshot(ctx, formerParticipantID)

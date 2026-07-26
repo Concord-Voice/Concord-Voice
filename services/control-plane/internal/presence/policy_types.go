@@ -84,6 +84,12 @@ type Decision struct {
 	Audience  map[uuid.UUID]bool
 	Payload   json.RawMessage
 	Minimized bool
+	// SuppressedBySenderPresence marks a decision emptied solely because the
+	// sender's base presence forbids emission (invisible, offline, or an
+	// unreadable status). It is NOT set for ordinary settings-driven empties,
+	// which keeps the existing conservative-disconnect classification in
+	// suppressGeneration unchanged for every other suppression cause.
+	SuppressedBySenderPresence bool
 }
 
 // FailureClass is a stable, non-sensitive rich-presence policy error category.

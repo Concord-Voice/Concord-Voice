@@ -1525,11 +1525,16 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     const unsubPresence = wsService.on('presence', (msg) => {
       const { user_id: userId, status, timestamp } = msg.data;
 
-      // Skip overriding self user's status from broadcast — selfStatus is the local source of truth.
-      // The server broadcasts "offline" for invisible users, so trusting the broadcast
-      // would incorrectly show the self user as offline when they chose invisible.
+      // The server sends the real status to a user's own devices as the
+      // acknowledgement of a successful status change. Other viewers receive
+      // offline for Invisible, so never adopt an offline self broadcast.
       const selfId = useUserStore.getState().user?.id;
-      if (userId === selfId) return;
+      if (userId === selfId) {
+        if (status !== 'offline') {
+          useMemberStore.getState().setSelfStatus(status);
+        }
+        return;
+      }
 
       useMemberStore.getState().setUserStatus(userId, status);
 

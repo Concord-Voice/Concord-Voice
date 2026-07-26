@@ -48,6 +48,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// richPresenceSuppressTimeout bounds one hidden-sender suppression: acquiring the
+// sender gate, a bounded recipient resolve, the deletes, and the clear fan-out.
+// It runs off the hub Run goroutine, so this bounds the worker, not the loop.
+const richPresenceSuppressTimeout = 5 * time.Second
+
 // Route path constants — extracted to satisfy go:S1192 (no duplicate string literals).
 const (
 	routeTransferOwnership = "/:id/transfer-ownership"
@@ -292,6 +297,10 @@ func NewRouter(
 	activityBuilder := presence.NewActivityBuilder(
 		db, dmVoiceCallLeaseVerifier{redis: redis}, activityStore,
 	)
+	// The base-presence gate for Rich Presence emission (#2444). Both the
+	// lifecycle service and the bootstrap snapshot reader share one resolver so
+	// they cannot disagree about whether a sender may publish.
+	senderPresence := websocket.NewSenderPresenceResolver(redis, db)
 	activityService := presence.NewActivityService(
 		presenceHistoryService,
 		activityBuilder,
@@ -299,6 +308,7 @@ func NewRouter(
 		db,
 		rbacResolver,
 		hub,
+		senderPresence,
 	)
 	activitySnapshotService := presence.NewActivitySnapshotService(
 		db,
@@ -306,8 +316,16 @@ func NewRouter(
 		activityStore,
 		rbacResolver,
 		presenceHistoryService,
+		senderPresence,
 	)
 	hub.SetActivitySnapshotService(activitySnapshotService)
+	// The edge arm. The sender gate is acquired HERE, at the injection site,
+	// because SuppressHiddenSenderActivityAlreadyGated is an AlreadyGated method
+	// by contract -- matching how account erasure calls its sibling. The hub
+	// dispatches this off its Run goroutine, so blocking on the gate is safe.
+	hub.SetRichPresenceHiddenSuppressor(
+		newRichPresenceHiddenSuppressor(activityService, presenceHistoryService, log),
+	)
 
 	auditWriter := rbac.NewAuditWriter(db, log)
 	rbacHandler := rbac.NewHandler(db, log, redis, hub, rbacResolver, permCache, auditWriter)
@@ -2133,4 +2151,35 @@ func healthHandler(c *gin.Context) {
 		"status":  "healthy",
 		"service": "control-plane",
 	})
+}
+
+// newRichPresenceHiddenSuppressor builds the hub callback that clears a sender's
+// active Rich Presence when their base presence transitions to invisible or
+// offline (#2444).
+//
+// Extracted from NewRouter rather than inlined: the nested closure plus its error
+// branch pushed NewRouter's cognitive complexity past the SonarQube threshold, and
+// the rule is not tunable on AI-authored code.
+//
+// The sender gate is acquired HERE, at the injection site, because
+// SuppressHiddenSenderActivityAlreadyGated is an AlreadyGated method by contract --
+// matching how account erasure calls its sibling. The hub dispatches this off its
+// Run goroutine, so blocking on the gate is safe.
+func newRichPresenceHiddenSuppressor(
+	activityService *presence.ActivityService,
+	presenceHistoryService *presencehistory.Service,
+	log *logger.Logger,
+) func(uuid.UUID) {
+	return func(userID uuid.UUID) {
+		ctx, cancel := context.WithTimeout(
+			context.Background(), richPresenceSuppressTimeout,
+		)
+		defer cancel()
+		if err := presenceHistoryService.WithSender(ctx, userID, func() error {
+			return activityService.SuppressHiddenSenderActivityAlreadyGated(ctx, userID)
+		}); err != nil {
+			// PII-safe: operation class only, never recipients or channel identity.
+			log.Warn("rich-presence hidden-sender suppression failed", "error", err)
+		}
+	}
 }

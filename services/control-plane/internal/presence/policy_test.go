@@ -65,6 +65,37 @@ func containsVisibilityID(ids []string, target string) bool {
 	return false
 }
 
+// permitAllPresence permits every sender, matching the pre-#2444 behavior the
+// existing cases in this file assert: base presence was not a policy input.
+type permitAllPresence struct{}
+
+func (permitAllPresence) RichPresenceEmissionPermitted(context.Context, uuid.UUID) bool {
+	return true
+}
+
+// stubSenderPresence counts calls so a case can prove the gate ran exactly once.
+type stubSenderPresence struct {
+	permitted bool
+	calls     int
+}
+
+func (s *stubSenderPresence) RichPresenceEmissionPermitted(context.Context, uuid.UUID) bool {
+	s.calls++
+	return s.permitted
+}
+
+// failDB fails every read, proving the presence gate short-circuits before any
+// settings read.
+type failDB struct{}
+
+func (failDB) QueryContext(context.Context, string, ...any) (*sql.Rows, error) {
+	return nil, errors.New("db must not be queried on the suppressed path")
+}
+
+func (failDB) QueryRowContext(context.Context, string, ...any) *sql.Row {
+	panic("db must not be queried on the suppressed path")
+}
+
 type failingQueryDB struct {
 	presence.DBTX
 	contains string
@@ -286,6 +317,62 @@ func requireEmptyDecision(t *testing.T, decision presence.Decision, err error) {
 	require.False(t, decision.Minimized)
 }
 
+func TestAuthorizeAndMinimize_SuppressedSenderSkipsSettingsRead(t *testing.T) {
+	resolver := &stubSenderPresence{permitted: false}
+
+	decision, err := presence.AuthorizeAndMinimize(
+		context.Background(), failDB{}, nil, resolver, validServerVoicePolicyInput(uuid.New()),
+	)
+
+	require.NoError(t, err)
+	require.True(t, decision.SuppressedBySenderPresence)
+	require.NotNil(t, decision.Audience)
+	require.Empty(t, decision.Audience)
+	require.Nil(t, decision.Payload)
+	require.False(t, decision.Minimized)
+	require.Equal(t, 1, resolver.calls)
+}
+
+func TestAuthorizeAndMinimize_MissingSenderPresenceResolverFailsClosed(t *testing.T) {
+	decision, err := presence.AuthorizeAndMinimize(
+		context.Background(), failDB{}, nil, nil, validPrivateCallPolicyInput(uuid.New()),
+	)
+
+	require.NoError(t, err)
+	require.True(t, decision.SuppressedBySenderPresence)
+	require.Empty(t, decision.Audience)
+	require.Nil(t, decision.Payload)
+}
+
+func TestAuthorizeAndMinimize_PermittedSenderPresenceLeavesDecisionUnmarked(t *testing.T) {
+	db, ctx := setupPolicyDB(t)
+	senderID := testhelpers.CreateUser(t, db)
+	viewerID := testhelpers.CreateUser(t, db)
+	input := createServerVoicePolicyFixture(t, db, senderID, viewerID)
+	testhelpers.AddFriendship(t, db, senderID, viewerID)
+	setPolicySettings(t, db, senderID, true, presence.TierFriends, true, presence.TierOff, false)
+	visibility := &visibilityStub{defaultIDs: []string{input.ServerVoice.Context.ChannelID.String()}}
+	resolver := &stubSenderPresence{permitted: true}
+
+	decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, resolver, input)
+
+	require.NoError(t, err)
+	require.False(t, decision.SuppressedBySenderPresence)
+	require.Equal(t, map[uuid.UUID]bool{viewerID: true}, decision.Audience)
+	require.Equal(t, 1, resolver.calls)
+}
+
+func TestAuthorizeAndMinimize_InvalidInputPrecedesSenderPresenceGate(t *testing.T) {
+	resolver := &stubSenderPresence{permitted: true}
+
+	decision, err := presence.AuthorizeAndMinimize(
+		context.Background(), failDB{}, nil, resolver, presence.PolicyInput{},
+	)
+
+	requireZeroPolicyError(t, decision, err, presence.FailureInvalidInput)
+	require.Zero(t, resolver.calls, "invalid input must be rejected before the presence gate")
+}
+
 func TestAuthorizeAndMinimize_InvalidInputReturnsZeroDecision(t *testing.T) {
 	senderID := uuid.New()
 	zeroStartedAt := int64(0)
@@ -413,7 +500,7 @@ func TestAuthorizeAndMinimize_InvalidInputReturnsZeroDecision(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			decision, err := presence.AuthorizeAndMinimize(context.Background(), nil, nil, test.input)
+			decision, err := presence.AuthorizeAndMinimize(context.Background(), nil, nil, permitAllPresence{}, test.input)
 			requireZeroPolicyError(t, decision, err, presence.FailureInvalidInput)
 		})
 	}
@@ -428,7 +515,7 @@ func TestAuthorizeAndMinimize_MasterOffSuppressesBothCategories(t *testing.T) {
 		validServerVoicePolicyInput(senderID),
 		validPrivateCallPolicyInput(senderID),
 	} {
-		decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, permitAllPresence{}, input)
 		requireEmptyDecision(t, decision, err)
 	}
 }
@@ -438,7 +525,7 @@ func TestAuthorizeAndMinimize_ServerVoiceTierOffReturnsNoPayload(t *testing.T) {
 	senderID := testhelpers.CreateUser(t, db)
 	setPolicySettings(t, db, senderID, true, presence.TierOff, true, presence.TierServers, true)
 
-	decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, validServerVoicePolicyInput(senderID))
+	decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, permitAllPresence{}, validServerVoicePolicyInput(senderID))
 	requireEmptyDecision(t, decision, err)
 }
 
@@ -461,7 +548,7 @@ func TestAuthorizeAndMinimize_ServerVoiceFriendsIntersectsServerAndFoFOptIn(t *t
 	setPolicySettings(t, db, senderID, true, presence.TierFriends, true, presence.TierOff, false)
 	visibility := &visibilityStub{defaultIDs: []string{input.ServerVoice.Context.ChannelID.String()}}
 
-	decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, input)
+	decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, permitAllPresence{}, input)
 	require.NoError(t, err)
 	require.False(t, decision.Minimized)
 	require.Equal(t, map[uuid.UUID]bool{
@@ -473,7 +560,7 @@ func TestAuthorizeAndMinimize_ServerVoiceFriendsIntersectsServerAndFoFOptIn(t *t
 	require.NotContains(t, decision.Audience, unrelatedMember)
 
 	testhelpers.SetFriendsOfFriends(t, db, senderID, false)
-	decision, err = presence.AuthorizeAndMinimize(ctx, db, visibility, input)
+	decision, err = presence.AuthorizeAndMinimize(ctx, db, visibility, permitAllPresence{}, input)
 	require.NoError(t, err)
 	require.Equal(t, map[uuid.UUID]bool{friendInServer: true}, decision.Audience)
 }
@@ -495,7 +582,7 @@ func TestAuthorizeAndMinimize_ServerVoiceServersUsesExactMembersAndVisibility(t 
 		visibleMember.String(): {input.ServerVoice.Context.ChannelID.String()},
 	}, extraIDs: []string{senderID.String(), outsideFriend.String(), uuid.NewString(), visibleMember.String()}}
 
-	decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, input)
+	decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, permitAllPresence{}, input)
 	require.NoError(t, err)
 	require.Equal(t, map[uuid.UUID]bool{visibleMember: true}, decision.Audience)
 	require.NotContains(t, decision.Audience, senderID)
@@ -515,12 +602,12 @@ func TestAuthorizeAndMinimize_ServerVoiceServersUsesExactMembersAndVisibility(t 
 	require.False(t, calledUsers[outsideFriend.String()])
 
 	t.Run("all hidden returns no payload", func(t *testing.T) {
-		decision, err := presence.AuthorizeAndMinimize(ctx, db, &visibilityStub{}, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, db, &visibilityStub{}, permitAllPresence{}, input)
 		requireEmptyDecision(t, decision, err)
 	})
 
 	t.Run("nil resolver fails closed", func(t *testing.T) {
-		decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureAuthorizationRead)
 	})
 }
@@ -565,7 +652,7 @@ func TestAuthorizeAndMinimize_ServerVoiceRejectsChannelServerTypeAndJoinMismatch
 			input := createServerVoicePolicyFixture(t, db, senderID)
 			test.mutate(t, db, &input)
 
-			decision, err := presence.AuthorizeAndMinimize(ctx, db, &visibilityStub{}, input)
+			decision, err := presence.AuthorizeAndMinimize(ctx, db, &visibilityStub{}, permitAllPresence{}, input)
 			requireZeroPolicyError(t, decision, err, presence.FailureStateRead)
 		})
 	}
@@ -583,7 +670,7 @@ func TestAuthorizeAndMinimize_ServerVoiceVisibilityErrorDiscardsWholeDecision(t 
 		failAfter:  1,
 	}
 
-	decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, input)
+	decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, permitAllPresence{}, input)
 	requireZeroPolicyError(t, decision, err, presence.FailureAuthorizationRead)
 	require.Len(t, visibility.calls, 1)
 }
@@ -597,7 +684,7 @@ func TestAuthorizeAndMinimize_ServerVoiceDetailsOffOmitsGranularBytes(t *testing
 	setPolicySettings(t, db, senderID, true, presence.TierFriends, false, presence.TierOff, false)
 	visibility := &visibilityStub{defaultIDs: []string{input.ServerVoice.Context.ChannelID.String()}}
 
-	decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, input)
+	decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, permitAllPresence{}, input)
 	require.NoError(t, err)
 	require.True(t, decision.Minimized)
 	var payload map[string]any
@@ -624,7 +711,7 @@ func TestAuthorizeAndMinimize_PrivateCallTierOffReturnsCurrentParticipantsOnly(t
 	require.NoError(t, err)
 	input.PrivateCall.Context.ParticipantIDs = []uuid.UUID{currentParticipant, senderID}
 
-	decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, input)
+	decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, permitAllPresence{}, input)
 	require.NoError(t, err)
 	require.Equal(t, map[uuid.UUID]bool{currentParticipant: true}, decision.Audience)
 	require.NotContains(t, decision.Audience, nonVoiceParticipant)
@@ -638,7 +725,7 @@ func TestAuthorizeAndMinimize_PrivateCallTierOffReturnsCurrentParticipantsOnly(t
 		require.NoError(t, testhelpers.TruncateAllTables(db))
 		onlySender := testhelpers.CreateUser(t, db)
 		onlySenderInput := createPrivateCallPolicyFixture(t, db, false, onlySender)
-		decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, onlySenderInput)
+		decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, permitAllPresence{}, onlySenderInput)
 		requireEmptyDecision(t, decision, err)
 	})
 }
@@ -659,7 +746,7 @@ func TestAuthorizeAndMinimize_PrivateCallFriendsAndServersComposeExistingPredica
 	testhelpers.AddServerMember(t, db, serverID, serverPeerID)
 	setPolicySettings(t, db, senderID, true, presence.TierOff, false, presence.TierFriends, true)
 
-	decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, input)
+	decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, permitAllPresence{}, input)
 	require.NoError(t, err)
 	require.Equal(t, map[uuid.UUID]bool{
 		currentParticipant: true,
@@ -679,7 +766,7 @@ func TestAuthorizeAndMinimize_PrivateCallFriendsAndServersComposeExistingPredica
 	}
 
 	setPolicySettings(t, db, senderID, true, presence.TierOff, false, presence.TierServers, true)
-	decision, err = presence.AuthorizeAndMinimize(ctx, db, nil, input)
+	decision, err = presence.AuthorizeAndMinimize(ctx, db, nil, permitAllPresence{}, input)
 	require.NoError(t, err)
 	require.Equal(t, map[uuid.UUID]bool{
 		currentParticipant: true,
@@ -748,7 +835,7 @@ func TestAuthorizeAndMinimize_PrivateCallRejectsStaleParticipantSetTypeAndCount(
 			input := createPrivateCallPolicyFixture(t, db, false, senderID, participantID)
 			test.mutate(t, db, &input, extraID)
 
-			decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, input)
+			decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, permitAllPresence{}, input)
 			requireZeroPolicyError(t, decision, err, presence.FailureStateRead)
 		})
 	}
@@ -763,7 +850,7 @@ func TestAuthorizeAndMinimize_MissingSettingsUsesCategoryDefaults(t *testing.T) 
 		testhelpers.AddFriendship(t, db, senderID, friendID)
 		visibility := &visibilityStub{defaultIDs: []string{input.ServerVoice.Context.ChannelID.String()}}
 
-		decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, db, visibility, permitAllPresence{}, input)
 		require.NoError(t, err)
 		require.Equal(t, map[uuid.UUID]bool{friendID: true}, decision.Audience)
 		require.Contains(t, string(decision.Payload), `"channel_name":"General"`)
@@ -776,7 +863,7 @@ func TestAuthorizeAndMinimize_MissingSettingsUsesCategoryDefaults(t *testing.T) 
 		participantID := testhelpers.CreateUser(t, db)
 		input := createPrivateCallPolicyFixture(t, db, false, senderID, participantID)
 
-		decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, db, nil, permitAllPresence{}, input)
 		require.NoError(t, err)
 		require.Equal(t, map[uuid.UUID]bool{participantID: true}, decision.Audience)
 		require.NotContains(t, string(decision.Payload), "participant_count")
@@ -805,7 +892,7 @@ func TestAuthorizeAndMinimize_InvalidStoredTierFailsClosed(t *testing.T) {
 				DBTX: db, contains: "FROM user_presence_settings", query: test.query,
 			}
 			decision, err := presence.AuthorizeAndMinimize(
-				ctx, wrapped, nil, validServerVoicePolicyInput(senderID),
+				ctx, wrapped, nil, permitAllPresence{}, validServerVoicePolicyInput(senderID),
 			)
 			requireZeroPolicyError(t, decision, err, presence.FailureSettingsRead)
 		})
@@ -816,7 +903,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 	t.Run("missing database", func(t *testing.T) {
 		senderID := uuid.New()
 		decision, err := presence.AuthorizeAndMinimize(
-			context.Background(), nil, nil, validServerVoicePolicyInput(senderID),
+			context.Background(), nil, nil, permitAllPresence{}, validServerVoicePolicyInput(senderID),
 		)
 		requireZeroPolicyError(t, decision, err, presence.FailureSettingsRead)
 	})
@@ -828,7 +915,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 			DBTX: db, contains: "FROM user_presence_settings", query: `SELECT 1 / 0`,
 		}
 		decision, err := presence.AuthorizeAndMinimize(
-			ctx, wrapped, nil, validServerVoicePolicyInput(senderID),
+			ctx, wrapped, nil, permitAllPresence{}, validServerVoicePolicyInput(senderID),
 		)
 		requireZeroPolicyError(t, decision, err, presence.FailureSettingsRead)
 	})
@@ -838,7 +925,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 		senderID := testhelpers.CreateUser(t, db)
 		input := createServerVoicePolicyFixture(t, db, senderID)
 		wrapped := substituteRowDB{DBTX: db, contains: "FROM channels c", query: `SELECT 1 / 0`}
-		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, &visibilityStub{}, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, &visibilityStub{}, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureStateRead)
 	})
 
@@ -848,7 +935,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 		participantID := testhelpers.CreateUser(t, db)
 		input := createPrivateCallPolicyFixture(t, db, false, senderID, participantID)
 		wrapped := substituteRowDB{DBTX: db, contains: "FROM dm_conversations", query: `SELECT 1 / 0`}
-		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, nil, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, nil, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureStateRead)
 	})
 
@@ -858,7 +945,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 		participantID := testhelpers.CreateUser(t, db)
 		input := createPrivateCallPolicyFixture(t, db, false, senderID, participantID)
 		wrapped := failingQueryDB{DBTX: db, contains: "FROM dm_voice_participants"}
-		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, nil, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, nil, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureStateRead)
 	})
 
@@ -870,7 +957,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 		wrapped := substituteQueryDB{
 			DBTX: db, contains: "FROM dm_voice_participants", query: `SELECT 'not-a-uuid'`,
 		}
-		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, nil, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, nil, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureStateRead)
 		require.ErrorContains(t, errors.Unwrap(err), "scan private call participant row")
 	})
@@ -881,7 +968,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 		memberID := testhelpers.CreateUser(t, db)
 		input := createServerVoicePolicyFixture(t, db, senderID, memberID)
 		wrapped := failingQueryDB{DBTX: db, contains: "FROM server_members WHERE server_id"}
-		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, &visibilityStub{}, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, &visibilityStub{}, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureAudienceRead)
 	})
 
@@ -891,7 +978,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 		memberID := testhelpers.CreateUser(t, db)
 		input := createServerVoicePolicyFixture(t, db, senderID, memberID)
 		wrapped := failingQueryDB{DBTX: db, contains: "FROM friendships"}
-		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, &visibilityStub{}, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, &visibilityStub{}, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureAudienceRead)
 	})
 
@@ -901,7 +988,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 		memberID := testhelpers.CreateUser(t, db)
 		input := createServerVoicePolicyFixture(t, db, senderID, memberID)
 		wrapped := substituteRowDB{DBTX: db, contains: "FROM privacy_settings", query: `SELECT 1 / 0`}
-		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, &visibilityStub{}, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, &visibilityStub{}, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureAudienceRead)
 	})
 
@@ -914,7 +1001,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 		testhelpers.AddFriendship(t, db, senderID, friendID)
 		testhelpers.SetFriendsOfFriends(t, db, senderID, true)
 		wrapped := failingQueryDB{DBTX: db, contains: "WITH sender_friends"}
-		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, &visibilityStub{}, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, &visibilityStub{}, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureAudienceRead)
 	})
 
@@ -925,7 +1012,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 		input := createPrivateCallPolicyFixture(t, db, false, senderID, participantID)
 		setPolicySettings(t, db, senderID, true, presence.TierOff, false, presence.TierFriends, true)
 		wrapped := failingQueryDB{DBTX: db, contains: "FROM friendships"}
-		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, nil, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, nil, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureAudienceRead)
 	})
 
@@ -936,7 +1023,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 		input := createPrivateCallPolicyFixture(t, db, false, senderID, participantID)
 		setPolicySettings(t, db, senderID, true, presence.TierOff, false, presence.TierFriends, true)
 		wrapped := substituteRowDB{DBTX: db, contains: "FROM privacy_settings", query: `SELECT 1 / 0`}
-		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, nil, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, nil, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureAudienceRead)
 	})
 
@@ -947,7 +1034,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 		input := createPrivateCallPolicyFixture(t, db, false, senderID, participantID)
 		setPolicySettings(t, db, senderID, true, presence.TierOff, false, presence.TierServers, true)
 		wrapped := failingQueryDB{DBTX: db, contains: "JOIN server_members sm2"}
-		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, nil, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, nil, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureAudienceRead)
 	})
 
@@ -959,7 +1046,7 @@ func TestAuthorizeAndMinimize_ReadErrorsReturnZeroDecisionAndFixedClass(t *testi
 		wrapped := substituteQueryDB{
 			DBTX: db, contains: "FROM server_members WHERE server_id", query: `SELECT 'not-a-uuid'`,
 		}
-		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, &visibilityStub{}, input)
+		decision, err := presence.AuthorizeAndMinimize(ctx, wrapped, &visibilityStub{}, permitAllPresence{}, input)
 		requireZeroPolicyError(t, decision, err, presence.FailureAudienceRead)
 	})
 }

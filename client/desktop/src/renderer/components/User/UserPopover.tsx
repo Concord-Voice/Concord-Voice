@@ -54,7 +54,6 @@ const UserPopover: React.FC<UserPopoverProps> = ({
   const navigate = useNavigate();
   const logout = useUserStore((state) => state.logout);
   const selfStatus = useMemberStore((state) => state.selfStatus);
-  const setSelfStatus = useMemberStore((state) => state.setSelfStatus);
 
   // Build color_scheme JSON from the current user's settings for identity scoping
   const colorScheme = useSettingsStore((s) => s.appearance.colorScheme);
@@ -119,7 +118,6 @@ const UserPopover: React.FC<UserPopoverProps> = ({
   };
 
   const handleStatusChange = (status: PresenceStatus) => {
-    setSelfStatus(status);
     if (status !== 'offline') {
       const ws = getWebSocketService();
       ws.sendSetStatus(status);

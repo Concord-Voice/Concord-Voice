@@ -114,10 +114,10 @@ describe('UserPopover', () => {
     expect(screen.getByText('Log Out')).toBeInTheDocument();
   });
 
-  it('changes status on click and sends to WebSocket', () => {
+  it('waits for server acknowledgement before changing status', () => {
     render(<UserPopover {...defaultProps} />);
     fireEvent.click(screen.getByText('Do Not Disturb'));
-    expect(useMemberStore.getState().selfStatus).toBe('dnd');
+    expect(useMemberStore.getState().selfStatus).toBe('online');
     expect(mockSendSetStatus).toHaveBeenCalledWith('dnd');
   });
 

@@ -189,6 +189,23 @@ describe('Presence fan-out (integration)', () => {
     expect(useMemberStore.getState().userStatuses.get('user-1')).toBeUndefined();
   });
 
+  it('adopts an acknowledged visible-or-invisible self presence event', () => {
+    useUserStore.setState({ user: mockUser as never });
+    useMemberStore.getState().setSelfStatus('online');
+
+    const wsService = createMockWsService();
+    renderHook(() => useWebSocketMessages(wsService as never));
+
+    act(() => {
+      wsService.handlers.get('presence')!({
+        type: 'presence',
+        data: { user_id: 'user-1', status: 'invisible' },
+      });
+    });
+
+    expect(useMemberStore.getState().selfStatus).toBe('invisible');
+  });
+
   // regression for #803 — Member List + UserPopover show the connected
   // self-user as Offline. The server's connect-time presence_snapshot INCLUDES
   // self (hub.go sendPresenceSnapshot), but the renderer never reconciles the

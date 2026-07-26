@@ -3,12 +3,15 @@ package websocket
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -192,4 +195,75 @@ func marshalRichPresenceFrame(
 			keyUpdatedAt: updatedAt,
 		},
 	})
+}
+
+// senderPresenceResolver answers the rich-presence policy's base-presence gate
+// from the same Redis key the hub writes.
+//
+// It lives in this package rather than internal/presence for two reasons: the
+// hub owns that key's lifecycle, and its failure logging must stay outside the
+// activity core's AST log guards (internal/presence/activity_log_emissions_test.go).
+type senderPresenceResolver struct {
+	redis *redis.Client
+	db    *sql.DB
+}
+
+// NewSenderPresenceResolver builds the presence.SenderPresenceResolver consumed
+// by both the activity service and the bootstrap snapshot service.
+func NewSenderPresenceResolver(rdb *redis.Client, db *sql.DB) presence.SenderPresenceResolver {
+	return &senderPresenceResolver{redis: rdb, db: db}
+}
+
+// RichPresenceEmissionPermitted fails CLOSED on every uncertainty.
+//
+// It returns no error by contract: an error would reach failClosedGeneration and
+// turn a transient Redis blip into a global Rich Presence disconnect (#2444).
+//
+// Note the deliberate asymmetry with resolveSnapshotVisibleStatus, which treats
+// a missing key as online. That path answers "what status do I display"; this
+// one answers "may this user broadcast their location", so a missing key is
+// offline and MUST suppress.
+func (r *senderPresenceResolver) RichPresenceEmissionPermitted(
+	ctx context.Context, senderID uuid.UUID,
+) bool {
+	if r == nil || r.redis == nil {
+		return false
+	}
+
+	status, err := r.redis.Get(ctx, presence.StatusRedisKey(senderID)).Result()
+	if errors.Is(err, redis.Nil) {
+		return false // no persisted visible status is never allowed to emit
+	}
+	if err != nil {
+		log.Printf(
+			"[richpresence] presence lookup failed for user %s; suppressing activity: %v",
+			sanitizeLogValue(senderID.String()), err,
+		)
+		return false
+	}
+
+	permitted := presence.EmissionPermittedForStatus(status)
+	if !permitted && status != presence.StatusInvisible && status != presence.StatusOffline {
+		// Invisible is the expected suppression; anything else reaching here is
+		// a corrupt or unrecognised persisted value worth surfacing.
+		log.Printf(
+			"[richpresence] invalid persisted presence status for user %s: %q; suppressing activity",
+			sanitizeLogValue(senderID.String()), sanitizeLogValue(status),
+		)
+	}
+	if !permitted || r.db == nil {
+		return false
+	}
+
+	var fenced bool
+	if err := r.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM presence_offline_fences WHERE user_id = $1)`, senderID,
+	).Scan(&fenced); err != nil {
+		log.Printf(
+			"[richpresence] offline fence lookup failed for user %s; suppressing activity: %v",
+			sanitizeLogValue(senderID.String()), err,
+		)
+		return false
+	}
+	return !fenced
 }

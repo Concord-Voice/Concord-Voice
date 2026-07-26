@@ -242,6 +242,7 @@ func TestActivityService_SettingsCleanupMissingStateUsesPriorEligibility(t *test
 				closedDB,
 				nil,
 				delivery,
+				alwaysPermitPresence{},
 			)
 			before := testActivityPolicySettings(
 				test.masterEnabled, test.serverTier, test.privateTier,
@@ -572,4 +573,109 @@ func testActivityPolicySettings(
 		PrivateCallTier:        privateTier,
 		PrivateCallShowDetails: true,
 	}
+}
+
+// The edge arm's entry point (#2444). It diverges from the #2408 settings
+// precedent on purpose: total suppression is expressible as a clear, and
+// disconnecting the audience would emit a correlated timing signal on exactly
+// the action the user took in order not to be observed.
+func TestSuppressHiddenSenderActivity_ClearsWithoutDisconnecting(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	var gotBefore, gotAfter ActivityPolicySettings
+	service.settingsRecipients = func(
+		_ context.Context, _ uuid.UUID, before ActivityPolicySettings, after ActivityPolicySettings,
+	) (map[uuid.UUID]bool, error) {
+		gotBefore, gotAfter = before, after
+		return map[uuid.UUID]bool{activityServiceViewer: true}, nil
+	}
+
+	err := service.SuppressHiddenSenderActivityAlreadyGated(
+		context.Background(), activityServiceSender,
+	)
+
+	require.NoError(t, err)
+	assert.Zero(t, delivery.disconnectAllCalls,
+		"total suppression is expressible as a clear; do not disconnect the audience")
+	assert.Empty(t, delivery.disconnects)
+	require.Len(t, delivery.plans, 2, "one clear per supported category")
+	for _, plan := range delivery.plans {
+		assert.Contains(t, plan.ClearRecipients, activityServiceViewer)
+		assert.Empty(t, plan.UpdateRecipients)
+	}
+	assert.NotEmpty(t, store.exactDeletes, "the stored generation must be removed")
+
+	// The synthetic prior policy must be the WIDEST one, so the resolved audience
+	// is a superset of whoever could hold a badge.
+	assert.True(t, gotBefore.MasterEnabled)
+	assert.Equal(t, TierServers, gotBefore.ServerVoiceTier)
+	assert.Equal(t, TierServers, gotBefore.PrivateCallTier)
+	assert.False(t, gotAfter.MasterEnabled)
+	assert.Equal(t, TierOff, gotAfter.ServerVoiceTier)
+	assert.Equal(t, TierOff, gotAfter.PrivateCallTier)
+}
+
+func TestSuppressHiddenSenderActivity_ResolutionErrorDisconnects(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	resolverErr := errors.New("hidden-sender recipient resolution failed")
+	service.settingsRecipients = func(
+		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
+	) (map[uuid.UUID]bool, error) {
+		return nil, resolverErr
+	}
+
+	err := service.SuppressHiddenSenderActivityAlreadyGated(
+		context.Background(), activityServiceSender,
+	)
+
+	require.ErrorIs(t, err, resolverErr)
+	assert.Equal(t, 1, delivery.disconnectAllCalls,
+		"an unresolvable audience must fail closed to a disconnect")
+	assert.Empty(t, delivery.plans, "no partial clear may be delivered")
+	assert.Empty(t, store.exactDeletes,
+		"the audience is resolved before deletion, so a resolver failure deletes nothing")
+}
+
+func TestSuppressHiddenSenderActivity_EmptyAudienceIsQuiet(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	service.settingsRecipients = func(
+		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
+	) (map[uuid.UUID]bool, error) {
+		return map[uuid.UUID]bool{}, nil
+	}
+
+	err := service.SuppressHiddenSenderActivityAlreadyGated(
+		context.Background(), activityServiceSender,
+	)
+
+	require.NoError(t, err)
+	assert.Empty(t, delivery.plans)
+	assert.Zero(t, delivery.disconnectAllCalls)
+	assert.NotEmpty(t, store.exactDeletes, "state is still removed even with no audience to clear")
+}
+
+func TestSuppressHiddenSenderActivity_SenderIsNeverItsOwnRecipient(t *testing.T) {
+	service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	service.settingsRecipients = func(
+		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
+	) (map[uuid.UUID]bool, error) {
+		return map[uuid.UUID]bool{activityServiceSender: true}, nil
+	}
+
+	err := service.SuppressHiddenSenderActivityAlreadyGated(
+		context.Background(), activityServiceSender,
+	)
+
+	require.NoError(t, err)
+	assert.Empty(t, delivery.plans,
+		"an audience consisting only of the sender leaves nothing to clear")
+}
+
+func TestSuppressHiddenSenderActivity_RejectsNilUser(t *testing.T) {
+	service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+
+	err := service.SuppressHiddenSenderActivityAlreadyGated(context.Background(), uuid.Nil)
+
+	require.Error(t, err)
+	assert.Zero(t, delivery.disconnectAllCalls)
+	assert.Empty(t, delivery.plans)
 }

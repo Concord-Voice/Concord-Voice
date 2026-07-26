@@ -90,6 +90,7 @@ func TestActivitySettingsResolver_MismatchedPrivateLeaseFailsConservatively(t *t
 		db,
 		activitySnapshotVisibility{allow: true},
 		delivery,
+		permitAllPresence{},
 	)
 	before := presence.ActivityPolicySettings{
 		MasterEnabled: true, ServerVoiceTier: presence.TierFriends,
@@ -141,6 +142,7 @@ func TestActivitySettingsResolver_PrivateOffTargetsOnlyCurrentParticipantsAndSen
 		db,
 		activitySnapshotVisibility{allow: true},
 		delivery,
+		permitAllPresence{},
 	)
 	before := presence.ActivityPolicySettings{
 		MasterEnabled: true, ServerVoiceTier: presence.TierOff,
@@ -201,6 +203,7 @@ func TestActivitySettingsResolver_LifecycleFlipDuringAuthorizationFailsConservat
 		db,
 		visibility,
 		delivery,
+		permitAllPresence{},
 	)
 	before := presence.ActivityPolicySettings{
 		MasterEnabled: true, ServerVoiceTier: presence.TierServers,
@@ -286,6 +289,7 @@ func TestActivitySettingsResolver_MissingOrStaleEvidenceUsesPriorPolicy(t *testi
 				db,
 				activitySnapshotVisibility{allow: true},
 				delivery,
+				permitAllPresence{},
 			)
 			before := presence.ActivityPolicySettings{
 				MasterEnabled: true, ServerVoiceTier: presence.TierOff,

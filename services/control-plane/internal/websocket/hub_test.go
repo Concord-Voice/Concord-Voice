@@ -463,6 +463,7 @@ func newMinimalHub() *Hub {
 		clients:                make(map[uuid.UUID]*Client),
 		userClients:            make(map[uuid.UUID]map[uuid.UUID]bool),
 		presenceRecovery:       make(map[uuid.UUID]presenceRecoveryState),
+		suppressorPending:      make(map[uuid.UUID]struct{}),
 		channelSubscriptions:   make(map[uuid.UUID]map[uuid.UUID]bool),
 		usernames:              make(map[uuid.UUID]string),
 		serverSubscriptions:    make(map[uuid.UUID]map[uuid.UUID]bool),

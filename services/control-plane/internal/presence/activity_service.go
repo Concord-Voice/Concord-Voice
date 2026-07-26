@@ -67,13 +67,19 @@ func NewActivityService(
 	db DBTX,
 	visibility ChannelVisibilityResolver,
 	delivery Delivery,
+	senderPresence SenderPresenceResolver,
 ) *ActivityService {
+	// Required, not optional: a nil resolver fails closed in
+	// AuthorizeAndMinimize, so forgetting to wire it would silently suppress ALL
+	// Rich Presence rather than erroring. Making the parameter positional turns
+	// that omission into a compile error (#2444).
+	presenceGate := senderPresence
 	service := newActivityService(
 		coordinator,
 		builder,
 		store,
 		func(ctx context.Context, input PolicyInput) (Decision, error) {
-			return AuthorizeAndMinimize(ctx, db, visibility, input)
+			return AuthorizeAndMinimize(ctx, db, visibility, presenceGate, input)
 		},
 		delivery,
 	)
@@ -252,7 +258,7 @@ func (s *ActivityService) refreshAlreadyGated(
 		return err
 	}
 	if len(decision.Payload) == 0 {
-		return s.suppressRefreshedActivity(ctx, request, previous, built)
+		return s.suppressRefreshedActivity(ctx, request, previous, built, decision)
 	}
 	return s.persistAndDeliverRefreshedActivity(ctx, request, previous, built, decision)
 }
@@ -346,11 +352,26 @@ func (s *ActivityService) suppressRefreshedActivity(
 	request refreshActivityRequest,
 	previous previousActivity,
 	built BuiltActivity,
+	decision Decision,
 ) error {
 	if previous.built != nil {
+		// The move branch stays FIRST because only it holds the prior
+		// generation's exact token/version, which is what must be deleted. The
+		// suppression reason is threaded in rather than reordered: without it a
+		// suppressed move takes the reason-blind global-disconnect terminal, and
+		// the heartbeat bridge calls MoveServerVoice on every channel change, so
+		// an invisible user hopping channels could disconnect the replica at will
+		// (#2444).
 		return s.suppressMovedGeneration(
 			ctx, request.senderID, request.category,
 			previous.built.SourceToken, previous.built.SourceVersion, previous.audience,
+			decision.SuppressedBySenderPresence,
+		)
+	}
+	if decision.SuppressedBySenderPresence {
+		return s.suppressHiddenSenderGeneration(
+			ctx, request.senderID, request.category,
+			built.SourceToken, built.SourceVersion,
 		)
 	}
 	return s.suppressGeneration(
@@ -458,6 +479,19 @@ func (s *ActivityService) clearAlreadyGated(
 		return err
 	}
 	if len(prepared.decision.Payload) == 0 {
+		// Mirror suppressRefreshedActivity: the clear path must key on the
+		// suppression REASON, not just an empty payload. By the time an
+		// invisible sender leaves voice, the level arm has already removed the
+		// stored generation, so the reason-blind path below would find nothing
+		// to delete, find no successor, and force-disconnect every
+		// Rich-Presence client on the replica -- on an ordinary user action
+		// (#2444).
+		if prepared.decision.SuppressedBySenderPresence {
+			return s.suppressHiddenSenderGeneration(
+				ctx, request.senderID, request.category,
+				prepared.built.SourceToken, prepared.built.SourceVersion,
+			)
+		}
 		return s.suppressGeneration(
 			ctx, request.senderID, request.category,
 			prepared.built.SourceToken, prepared.built.SourceVersion,
@@ -620,6 +654,89 @@ func (s *ActivityService) suppressGeneration(
 	)
 }
 
+// suppressHiddenSenderGeneration removes an active generation for a sender whose
+// base presence forbids emission. It differs from suppressGeneration in exactly
+// one classification: a delete that finds nothing stored is a BENIGN terminal
+// here, not a conservative global disconnect.
+//
+// Why that is safe: this path runs on every heartbeat for as long as the sender
+// stays invisible, so treating "nothing to delete" as an anomaly would force a
+// full-replica disconnect every heartbeat, indefinitely (#2444). And it cannot
+// leave a stale badge, because the edge arm already cleared any audience that
+// existed at the transition, or failed loudly and disconnected. This function's
+// job is preventing RE-publication, not cleanup.
+//
+// Every other outcome keeps the conservative posture unchanged.
+func (s *ActivityService) suppressHiddenSenderGeneration(
+	ctx context.Context,
+	senderID uuid.UUID,
+	category Category,
+	sourceToken uuid.UUID,
+	sourceVersion int64,
+) error {
+	// Resolve the audience BEFORE deleting, mirroring the edge arm's ordering.
+	//
+	// The resolver reconstructs each category's scope from the STORED generation
+	// (currentServerSettingsRecipients -> store.Get), and a widest-prior policy
+	// makes priorEligible true -- so resolving after a successful delete finds no
+	// row, returns "settings evidence unavailable for prior-eligible policy", and
+	// escalates to a full-replica disconnect on the FIRST suppressed heartbeat of
+	// every sender who goes invisible while in voice. That is precisely the storm
+	// this function exists to prevent (#2444).
+	//
+	// Resolving unconditionally costs one wasted resolver call per heartbeat in the
+	// steady state (nothing stored), where its error is discarded and the benign
+	// terminal below is taken. That is the cheaper mistake: the alternative is an
+	// extra existence read for the same information.
+	var recipients map[uuid.UUID]bool
+	var resolveErr error
+	if s.settingsRecipients != nil {
+		recipients, resolveErr = s.settingsRecipients(
+			ctx, senderID, hiddenSenderWidestPriorSettings, hiddenSenderSuppressedSettings,
+		)
+	}
+
+	deleteCtx, cancelDelete := boundedActivityCleanupContext(ctx)
+	deleted, deleteErr := s.store.CompareAndDelete(
+		deleteCtx, senderID, category, sourceToken, sourceVersion,
+	)
+	cancelDelete()
+
+	if deleteErr != nil {
+		return errors.Join(
+			wrapActivityError("delete hidden-sender rich-presence activity", deleteErr),
+			s.disconnectAll(ctx),
+		)
+	}
+
+	if deleted {
+		// We removed a live generation, so a prior audience may hold a badge.
+		// Clear it precisely rather than disconnecting (#2444 spec 3.2.1). An
+		// unusable audience is the one case that must still fail closed.
+		if s.settingsRecipients == nil {
+			return s.disconnectAll(ctx)
+		}
+		if resolveErr != nil {
+			return errors.Join(
+				wrapActivityError("resolve hidden-sender activity recipients", resolveErr),
+				s.disconnectAllWithinBudget(ctx),
+			)
+		}
+		return s.deliverHiddenSenderClears(ctx, senderID, recipients)
+	}
+
+	// Nothing stored. Distinguish "already gone" (benign) from "a newer
+	// generation exists that we must not silently ignore".
+	successor, inspectErr := s.hasGenerationSuccessor(ctx, senderID, category, sourceVersion)
+	if inspectErr != nil {
+		return errors.Join(inspectErr, s.disconnectAll(ctx))
+	}
+	if successor {
+		return s.disconnectAll(ctx)
+	}
+	return nil // benign terminal — the steady state for an invisible sender
+}
+
 func (s *ActivityService) suppressMovedGeneration(
 	ctx context.Context,
 	senderID uuid.UUID,
@@ -627,6 +744,7 @@ func (s *ActivityService) suppressMovedGeneration(
 	priorSourceToken uuid.UUID,
 	priorSourceVersion int64,
 	priorAudience map[uuid.UUID]bool,
+	hiddenSender bool,
 ) error {
 	deleteCtx, cancelDelete := boundedActivityCleanupContext(ctx)
 	deleted, deleteErr := s.store.CompareAndDelete(
@@ -644,6 +762,15 @@ func (s *ActivityService) suppressMovedGeneration(
 		)
 	}
 	if !deleted {
+		if hiddenSender {
+			// Same benign terminal as suppressHiddenSenderGeneration, and for the
+			// same reason: for a hidden sender "nothing stored" is the STEADY
+			// STATE, because the edge arm already removed the row. Treating it as
+			// an anomaly here would force a full-replica disconnect on every
+			// channel hop, indefinitely. Every other outcome keeps the
+			// conservative posture unchanged.
+			return nil
+		}
 		return s.disconnectAfterGenerationMiss(
 			ctx, senderID, category, priorSourceVersion, priorAudience,
 		)

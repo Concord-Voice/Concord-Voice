@@ -59,6 +59,7 @@ func newTestSubscriberWithHubAndNATS(
 		ts.DB,
 		resolver,
 		hub,
+		permitAllPresence{},
 	)
 	return voice.NewNATSSubscriber(ts.DB, log, hub, nats, ts.Redis, resolver, activity)
 }
@@ -1174,6 +1175,7 @@ func TestHandleVoiceLifecycle_DMRedisErrorFailsClosedBeforePresenceMutation(t *t
 		ts.DB,
 		resolver,
 		ts.Hub,
+		permitAllPresence{},
 	)
 	sub := voice.NewNATSSubscriber(
 		ts.DB, log, ts.Hub, nil, brokenRedis, resolver, activity,

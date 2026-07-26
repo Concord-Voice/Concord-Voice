@@ -709,6 +709,143 @@ func TestActivityService_GenerationMismatchNeverClearsSuccessor(t *testing.T) {
 	})
 }
 
+// The storm regression (#2444). Ten consecutive suppressed refreshes with an
+// empty store must produce zero disconnects.
+func TestActivityService_SuppressedSenderDoesNotStormDisconnects(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	service.authorize = func(context.Context, PolicyInput) (Decision, error) {
+		return Decision{
+			Audience:                   map[uuid.UUID]bool{},
+			SuppressedBySenderPresence: true,
+		}, nil
+	}
+	store.deleteResult = false // nothing stored: the steady state
+
+	for i := 0; i < 10; i++ {
+		require.NoError(t, service.RefreshServerVoice(
+			context.Background(), activityServiceSender, serverActivityScope(), nil,
+		))
+	}
+
+	require.Zero(t, delivery.disconnectAllCalls,
+		"a suppressed sender must never trigger a global disconnect")
+	require.Empty(t, delivery.plans)
+	require.Len(t, store.deletes, 10)
+	require.Empty(t, store.sets)
+}
+
+// Sibling of TestActivityService_SuppressionClassifiesMissingGeneration for the
+// hidden-sender reason (#2444). Only the absent-state row is reclassified.
+func TestActivityService_SuppressionClassifiesHiddenSender(t *testing.T) {
+	newHiddenFixture := func() (*ActivityService, *activityServiceStoreStub, *activityServiceDeliveryStub) {
+		service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+		service.authorize = func(context.Context, PolicyInput) (Decision, error) {
+			return Decision{
+				Audience:                   map[uuid.UUID]bool{},
+				SuppressedBySenderPresence: true,
+			}, nil
+		}
+		store.deleteResult = false
+		return service, store, delivery
+	}
+
+	t.Run("absent state is a benign terminal", func(t *testing.T) {
+		service, store, delivery := newHiddenFixture()
+
+		err := service.RefreshServerVoice(context.Background(), activityServiceSender, serverActivityScope(), nil)
+
+		require.NoError(t, err)
+		assert.Len(t, store.deletes, 1)
+		assert.Len(t, store.gets, 1)
+		assert.Zero(t, delivery.disconnectAllCalls)
+		assert.Empty(t, delivery.plans)
+	})
+
+	t.Run("delete failure disconnects and is returned", func(t *testing.T) {
+		service, store, delivery := newHiddenFixture()
+		deleteErr := errors.New("forced hidden-sender delete failure")
+		store.deleteErr = deleteErr
+
+		err := service.RefreshServerVoice(context.Background(), activityServiceSender, serverActivityScope(), nil)
+
+		require.ErrorIs(t, err, deleteErr)
+		assert.Empty(t, store.gets)
+		assert.Equal(t, 1, delivery.disconnectAllCalls)
+	})
+
+	t.Run("inspection failure disconnects and is returned", func(t *testing.T) {
+		service, store, delivery := newHiddenFixture()
+		inspectErr := errors.New("forced hidden-sender inspection failure")
+		store.getErr = inspectErr
+
+		err := service.RefreshServerVoice(context.Background(), activityServiceSender, serverActivityScope(), nil)
+
+		require.ErrorIs(t, err, inspectErr)
+		assert.Equal(t, 1, delivery.disconnectAllCalls)
+	})
+
+	t.Run("live successor disconnects", func(t *testing.T) {
+		service, store, delivery := newHiddenFixture()
+		store.getFound = true
+		store.getState = ActivityState{
+			SourceToken:   uuid.New(),
+			SourceVersion: serverActivityScope().EventAt.Add(time.Second).UnixMicro(),
+			Payload:       json.RawMessage(`{"server_id":"successor"}`),
+			UpdatedAt:     time.Now().Unix(),
+		}
+		store.isActiveResult = true
+
+		err := service.RefreshServerVoice(context.Background(), activityServiceSender, serverActivityScope(), nil)
+
+		require.NoError(t, err)
+		assert.Equal(t, 1, delivery.disconnectAllCalls,
+			"a live generation must not stay published while the sender is hidden")
+		assert.Empty(t, delivery.plans)
+	})
+
+	t.Run("removed generation is not a silent no-op", func(t *testing.T) {
+		service, store, delivery := newHiddenFixture()
+		store.deleteResult = true
+
+		err := service.RefreshServerVoice(context.Background(), activityServiceSender, serverActivityScope(), nil)
+
+		require.NoError(t, err)
+		assert.Len(t, store.deletes, 1)
+		assert.Empty(t, store.gets, "a removed generation needs no successor inspection")
+		assert.Positive(t, delivery.disconnectAllCalls+len(delivery.plans)+len(delivery.disconnects),
+			"a removed generation must clear or disconnect its prior audience")
+	})
+}
+
+// The clear path must honour the hidden-sender reason too (#2444).
+//
+// Leaving voice while invisible is an ordinary user action, and the level arm
+// has already deleted the stored generation by then. Routing that clear through
+// the reason-blind suppressGeneration made CompareAndDelete miss, find no
+// successor, and force-disconnect every Rich-Presence client on the replica --
+// the same class of user-triggerable global disconnect the storm guard exists to
+// prevent, reached through the clear path instead of the refresh path.
+func TestActivityService_HiddenSenderClearDoesNotDisconnectAll(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	service.authorize = func(context.Context, PolicyInput) (Decision, error) {
+		return Decision{
+			Audience:                   map[uuid.UUID]bool{},
+			SuppressedBySenderPresence: true,
+		}, nil
+	}
+	// The level arm already removed the row on an earlier suppressed heartbeat.
+	store.deleteResult = false
+
+	err := service.ClearServerVoice(
+		context.Background(), activityServiceSender, serverActivityScope(), nil,
+	)
+
+	require.NoError(t, err)
+	assert.Zero(t, delivery.disconnectAllCalls,
+		"leaving voice while invisible must not disconnect the whole replica")
+	assert.Empty(t, delivery.plans)
+}
+
 func TestActivityService_SuppressionClassifiesMissingGeneration(t *testing.T) {
 	newSuppressedFixture := func() (*ActivityService, *activityServiceStoreStub, *activityServiceDeliveryStub) {
 		service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
@@ -1058,6 +1195,7 @@ func TestNewActivityService_WiresProductionPolicyAndRejectsInvalidCalls(t *testi
 		nil,
 		nil,
 		delivery,
+		alwaysPermitPresence{},
 	)
 	require.NotNil(t, service)
 	_, err := service.authorize(context.Background(), PolicyInput{})
