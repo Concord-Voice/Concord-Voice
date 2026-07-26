@@ -11,6 +11,8 @@ const { mockMainWindow, mockWebContents, MockBrowserWindow } = vi.hoisted(() => 
     setWindowOpenHandler: vi.fn(),
     send: vi.fn(),
     on: vi.fn(),
+    getURL: vi.fn(() => ''),
+    mainFrame: { url: 'http://localhost:3001/', frameTreeNodeId: 77 },
   };
   const mockMainWindow = {
     loadURL: vi.fn().mockResolvedValue(undefined),
@@ -222,6 +224,7 @@ vi.mock('../../../src/main/updater', () => ({
   safeQuitAndInstall: vi.fn(() => Promise.resolve()),
   getAllowPrerelease: vi.fn(() => false),
   setAllowPrerelease: vi.fn(),
+  forceCheckForUpdates: vi.fn(() => Promise.resolve()),
   getUpdateLogger: vi.fn(() => null),
   getUpdateLogPath: vi.fn(() => '/tmp/test-logs/update-2026-03-25.log'),
 }));
@@ -275,6 +278,12 @@ vi.mock('../../../src/main/permissionManager', () => ({
 type HandlerFn = (...args: unknown[]) => unknown;
 type CallbackFn = (...args: unknown[]) => void;
 let handlers: Map<string, HandlerFn>;
+const trustedIpcEvent = {
+  senderFrame: { url: 'http://localhost:3001/', frameTreeNodeId: 41 },
+};
+const foreignIpcEvent = {
+  senderFrame: { url: 'https://evil.example/', frameTreeNodeId: 99 },
+};
 let appOnCallbacks: Map<string, CallbackFn>;
 let sessionHandlers: {
   permissionRequest?: CallbackFn;
@@ -428,7 +437,7 @@ describe('main.ts', () => {
 
     it('app:setHardwareAcceleration writes pref file', async () => {
       const fs = (await import('node:fs')).default;
-      await handlers.get('app:setHardwareAcceleration')!({}, false);
+      await handlers.get('app:setHardwareAcceleration')!(trustedIpcEvent, false);
       expect(fs.writeFileSync).toHaveBeenCalledWith(
         expect.stringContaining('hw-accel.json'),
         JSON.stringify({ enabled: false }),
@@ -438,7 +447,7 @@ describe('main.ts', () => {
 
     it('app:relaunch restarts the app', async () => {
       const { app } = await import('electron');
-      await handlers.get('app:relaunch')!();
+      await handlers.get('app:relaunch')!(trustedIpcEvent);
       expect(app.relaunch).toHaveBeenCalled();
       expect(app.quit).toHaveBeenCalled();
     });
@@ -492,7 +501,7 @@ describe('main.ts', () => {
 
   describe('IPC: media & clipboard', () => {
     it('media:getDesktopSources returns source list', async () => {
-      const result = (await handlers.get('media:getDesktopSources')!()) as Array<{
+      const result = (await handlers.get('media:getDesktopSources')!(trustedIpcEvent)) as Array<{
         id: string;
         name: string;
         thumbnail: string;
@@ -505,7 +514,7 @@ describe('main.ts', () => {
 
     it('clipboard:writeText writes to clipboard', async () => {
       const { clipboard } = await import('electron');
-      await handlers.get('clipboard:writeText')!({}, 'hello');
+      await handlers.get('clipboard:writeText')!(trustedIpcEvent, 'hello');
       expect(clipboard.writeText).toHaveBeenCalledWith('hello');
     });
   });
@@ -1006,18 +1015,20 @@ describe('main.ts', () => {
 
   describe('IPC: auto-update', () => {
     it('update:check delegates to checkForUpdates', async () => {
-      const result = (await handlers.get('update:check')!()) as { updateAvailable: boolean };
+      const result = (await handlers.get('update:check')!(trustedIpcEvent)) as {
+        updateAvailable: boolean;
+      };
       expect(result.updateAvailable).toBe(false);
     });
 
     it('update:download delegates to downloadUpdate', async () => {
-      await handlers.get('update:download')!();
+      await handlers.get('update:download')!(trustedIpcEvent);
       const { downloadUpdate } = await import('../../../src/main/updater');
       expect(downloadUpdate).toHaveBeenCalled();
     });
 
     it('update:install delegates to safeQuitAndInstall', async () => {
-      await handlers.get('update:install')!();
+      await handlers.get('update:install')!(trustedIpcEvent);
       const { safeQuitAndInstall } = await import('../../../src/main/updater');
       expect(safeQuitAndInstall).toHaveBeenCalled();
     });
@@ -1028,54 +1039,228 @@ describe('main.ts', () => {
     });
 
     it('update:setAllowPrerelease updates setting', async () => {
-      await handlers.get('update:setAllowPrerelease')!({}, true);
+      await handlers.get('update:setAllowPrerelease')!(trustedIpcEvent, true);
       const { setAllowPrerelease } = await import('../../../src/main/updater');
       expect(setAllowPrerelease).toHaveBeenCalledWith(true);
     });
+
+    it.each([foreignIpcEvent, { senderFrame: null }])(
+      'rejects an untrusted or missing sender before privileged work',
+      async (event) => {
+        const electron = await import('electron');
+        const fs = (await import('node:fs')).default;
+        const updater = await import('../../../src/main/updater');
+        const sideEffects = [
+          electron.desktopCapturer.getSources,
+          electron.clipboard.writeText,
+          fs.writeFileSync,
+          electron.app.relaunch,
+          electron.app.quit,
+          updater.checkForUpdates,
+          updater.downloadUpdate,
+          updater.safeQuitAndInstall,
+          updater.setAllowPrerelease,
+          updater.forceCheckForUpdates,
+          mockWebContents.openDevTools,
+          mockWebContents.closeDevTools,
+        ] as Mock[];
+        sideEffects.forEach((effect) => effect.mockClear());
+
+        await handlers.get('media:getDesktopSources')!(event);
+        await handlers.get('clipboard:writeText')!(event, 'secret');
+        await handlers.get('app:setHardwareAcceleration')!(event, false);
+        await handlers.get('app:relaunch')!(event);
+        await handlers.get('update:check')!(event);
+        await handlers.get('update:download')!(event);
+        await handlers.get('update:install')!(event);
+        await handlers.get('update:setAllowPrerelease')!(event, true);
+        await handlers.get('updater:force-check')!(event, 'user_triggered');
+        await handlers.get('app:setDeveloperMode')!(event, true);
+
+        sideEffects.forEach((effect) => expect(effect).not.toHaveBeenCalled());
+      }
+    );
   });
 
   describe('IPC: PiP window management', () => {
     // pip:open requires a valid senderFrame URL post-#815 (isValidPipOpenSender
     // defense-in-depth). In this test environment isPackaged=false, so a
     // localhost URL satisfies the validator.
-    const pipOpenEvent = { senderFrame: { url: 'http://localhost:3001/' } };
+    const pipOwnerEvent = {
+      senderFrame: { url: 'http://localhost:3001/', frameTreeNodeId: 41 },
+    };
+    const otherPermittedPipEvent = {
+      senderFrame: { url: 'http://localhost:3001/', frameTreeNodeId: 99 },
+    };
 
-    it('pip:open creates a new PiP window', async () => {
-      const { BrowserWindow } = await import('electron');
-      (BrowserWindow as unknown as Mock).mockClear();
-      await handlers.get('pip:open')!(pipOpenEvent, {
-        id: 'test-pip',
-        width: 400,
-        height: 300,
-      });
-      expect(BrowserWindow).toHaveBeenCalled();
-    });
+    async function openPip(id: string, event = pipOwnerEvent): Promise<() => void> {
+      const firstNewCall = mockMainWindow.on.mock.calls.length;
+      await handlers.get('pip:open')!(event, { id });
+      const closed = mockMainWindow.on.mock.calls
+        .slice(firstNewCall)
+        .find((call) => call[0] === 'closed')?.[1] as (() => void) | undefined;
+      expect(closed).toBeDefined();
+      return closed!;
+    }
 
-    it('pip:open rejects unauthorized sender frames (defense-in-depth)', async () => {
-      // Use call-count delta (not mockClear) so the BrowserWindow mock's
-      // history remains intact for downstream tests (e.g. createWindow's
-      // "called during module init" assertion).
+    it('lets the opener focus, update, and close its PiP window', async () => {
       const { BrowserWindow } = await import('electron');
       const before = (BrowserWindow as unknown as Mock).mock.calls.length;
-      await handlers.get('pip:open')!(
-        { senderFrame: { url: 'https://evil.example.com/' } },
-        { id: 'test-pip-evil' }
-      );
-      const after = (BrowserWindow as unknown as Mock).mock.calls.length;
-      expect(after).toBe(before);
-    });
+      const closed = await openPip('owner-controls-pip');
+      expect((BrowserWindow as unknown as Mock).mock.calls.length).toBe(before + 1);
 
-    it('pip:close closes a PiP window', async () => {
-      mockMainWindow.close.mockClear();
-      await handlers.get('pip:close')!({}, { id: 'test-pip' });
-      // Window was stored in pipWindows map by the pip:open test above.
-      expect(mockMainWindow.close).toHaveBeenCalled();
-    });
-
-    it('pip:setAlwaysOnTop sets the flag', async () => {
+      mockMainWindow.focus.mockClear();
       mockMainWindow.setAlwaysOnTop.mockClear();
-      await handlers.get('pip:setAlwaysOnTop')!({}, { id: 'test-pip', flag: false });
+      mockMainWindow.close.mockClear();
+      await handlers.get('pip:open')!(pipOwnerEvent, { id: 'owner-controls-pip' });
+      expect((BrowserWindow as unknown as Mock).mock.calls.length).toBe(before + 1);
+      await handlers.get('pip:setAlwaysOnTop')!(pipOwnerEvent, {
+        id: 'owner-controls-pip',
+        flag: false,
+      });
+      await handlers.get('pip:close')!(pipOwnerEvent, { id: 'owner-controls-pip' });
+      expect(mockMainWindow.focus).toHaveBeenCalled();
       expect(mockMainWindow.setAlwaysOnTop).toHaveBeenCalledWith(false);
+      expect(mockMainWindow.close).toHaveBeenCalled();
+      closed();
+    });
+
+    it('lets the PiP window main frame update and close itself', async () => {
+      const closed = await openPip('child-controls-pip');
+      const pipMainFrameEvent = {
+        sender: mockWebContents,
+        senderFrame: mockWebContents.mainFrame,
+      };
+      mockMainWindow.setAlwaysOnTop.mockClear();
+      mockMainWindow.close.mockClear();
+
+      await handlers.get('pip:setAlwaysOnTop')!(pipMainFrameEvent, {
+        id: 'child-controls-pip',
+        flag: false,
+      });
+      await handlers.get('pip:close')!(pipMainFrameEvent, { id: 'child-controls-pip' });
+
+      expect(mockMainWindow.setAlwaysOnTop).toHaveBeenCalledWith(false);
+      expect(mockMainWindow.close).toHaveBeenCalled();
+      closed();
+    });
+
+    it.each([foreignIpcEvent, { senderFrame: null }])(
+      'rejects an untrusted or missing sender for every PiP mutation',
+      async (event) => {
+        // Use call-count delta (not mockClear) so the BrowserWindow mock's
+        // history remains intact for downstream tests (e.g. createWindow's
+        // "called during module init" assertion).
+        const { BrowserWindow } = await import('electron');
+        const before = (BrowserWindow as unknown as Mock).mock.calls.length;
+        mockMainWindow.close.mockClear();
+        mockMainWindow.setAlwaysOnTop.mockClear();
+        await handlers.get('pip:open')!(event, { id: 'rejected-pip' });
+        await handlers.get('pip:close')!(event, { id: 'rejected-pip' });
+        await handlers.get('pip:setAlwaysOnTop')!(event, { id: 'rejected-pip', flag: false });
+        const after = (BrowserWindow as unknown as Mock).mock.calls.length;
+        expect(after).toBe(before);
+        expect(mockMainWindow.close).not.toHaveBeenCalled();
+        expect(mockMainWindow.setAlwaysOnTop).not.toHaveBeenCalled();
+      }
+    );
+
+    it('rejects another permitted frame with a different frameTreeNodeId', async () => {
+      const { BrowserWindow } = await import('electron');
+      const before = (BrowserWindow as unknown as Mock).mock.calls.length;
+      const closed = await openPip('frame-owned-pip');
+      expect((BrowserWindow as unknown as Mock).mock.calls.length).toBe(before + 1);
+      mockMainWindow.focus.mockClear();
+      mockMainWindow.close.mockClear();
+      mockMainWindow.setAlwaysOnTop.mockClear();
+
+      await handlers.get('pip:open')!(otherPermittedPipEvent, { id: 'frame-owned-pip' });
+      expect((BrowserWindow as unknown as Mock).mock.calls.length).toBe(before + 1);
+      await handlers.get('pip:close')!(otherPermittedPipEvent, { id: 'frame-owned-pip' });
+      await handlers.get('pip:setAlwaysOnTop')!(otherPermittedPipEvent, {
+        id: 'frame-owned-pip',
+        flag: false,
+      });
+
+      expect(mockMainWindow.focus).not.toHaveBeenCalled();
+      expect(mockMainWindow.close).not.toHaveBeenCalled();
+      expect(mockMainWindow.setAlwaysOnTop).not.toHaveBeenCalled();
+      closed();
+    });
+
+    it.each([
+      {
+        name: 'remote to bundled',
+        initialRemoteSpaUrl: 'https://spa.example.test/spa/a/index.html',
+        nextRemoteSpaUrl: null,
+        senderFrameUrl: 'https://spa.example.test/spa/a/index.html#/pip/transition-pip',
+      },
+      {
+        name: 'bundled to remote',
+        initialRemoteSpaUrl: null,
+        nextRemoteSpaUrl: 'https://spa.example.test/spa/b/index.html',
+        senderFrameUrl: 'app://concord/index.html#/pip/transition-pip',
+      },
+    ])('keeps PiP self controls working across a $name SPA transition', async (transition) => {
+      const { app } = await import('electron');
+      const { setRemoteSpaState } = await import('../../../src/main/spaState');
+      const originalMainFrame = mockWebContents.mainFrame;
+      const testApp = app as unknown as { isPackaged: boolean };
+      testApp.isPackaged = true;
+      setRemoteSpaState(transition.initialRemoteSpaUrl);
+      mockWebContents.mainFrame = {
+        url: transition.senderFrameUrl,
+        frameTreeNodeId: 77,
+      };
+
+      try {
+        const closed = await openPip('transition-pip', {
+          senderFrame: {
+            url: transition.senderFrameUrl,
+            frameTreeNodeId: 41,
+          },
+        });
+        const pipMainFrameEvent = {
+          sender: mockWebContents,
+          senderFrame: mockWebContents.mainFrame,
+        };
+        setRemoteSpaState(transition.nextRemoteSpaUrl);
+        mockMainWindow.setAlwaysOnTop.mockClear();
+        mockMainWindow.close.mockClear();
+
+        await handlers.get('pip:setAlwaysOnTop')!(pipMainFrameEvent, {
+          id: 'transition-pip',
+          flag: false,
+        });
+        await handlers.get('pip:close')!(pipMainFrameEvent, { id: 'transition-pip' });
+
+        expect(mockMainWindow.setAlwaysOnTop).toHaveBeenCalledWith(false);
+        expect(mockMainWindow.close).toHaveBeenCalled();
+        closed();
+      } finally {
+        setRemoteSpaState(null);
+        testApp.isPackaged = false;
+        mockWebContents.mainFrame = originalMainFrame;
+      }
+    });
+
+    it('assigns a fresh owner when a closed PiP ID is reused', async () => {
+      const closeFirst = await openPip('reused-pip');
+      closeFirst();
+      const closeSecond = await openPip('reused-pip', otherPermittedPipEvent);
+      mockMainWindow.setAlwaysOnTop.mockClear();
+
+      await handlers.get('pip:setAlwaysOnTop')!(pipOwnerEvent, {
+        id: 'reused-pip',
+        flag: false,
+      });
+      expect(mockMainWindow.setAlwaysOnTop).not.toHaveBeenCalled();
+      await handlers.get('pip:setAlwaysOnTop')!(otherPermittedPipEvent, {
+        id: 'reused-pip',
+        flag: false,
+      });
+      expect(mockMainWindow.setAlwaysOnTop).toHaveBeenCalledWith(false);
+      closeSecond();
     });
   });
 

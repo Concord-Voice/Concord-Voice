@@ -28,6 +28,7 @@
  * or http://localhost:3000.evil.com/.
  */
 
+import type { IpcMainInvokeEvent, WebFrameMain } from 'electron';
 import { SPA_CACHE_HOST, SPA_CACHE_SCHEME } from '../spaCache/manifestSchema';
 
 const LOCAL_DEV_PATTERN = /^http:\/\/localhost:\d+(\/|$)/;
@@ -77,4 +78,14 @@ export function isPermittedFrameUrl(url: string, remoteSpaOrigin: string | null)
   if (LOCAL_DEV_PATTERN.test(url)) return true;
   if (remoteSpaOrigin && url.startsWith(remoteSpaOrigin + '/')) return true;
   return false;
+}
+
+/** Return the sender frame only when it belongs to a permitted renderer origin. */
+export function requireTrustedSender(
+  event: IpcMainInvokeEvent,
+  remoteSpaOrigin: string | null
+): WebFrameMain | null {
+  const senderFrame = event.senderFrame;
+  if (!senderFrame || !isPermittedFrameUrl(senderFrame.url, remoteSpaOrigin)) return null;
+  return senderFrame;
 }

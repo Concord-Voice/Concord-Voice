@@ -31,6 +31,7 @@ import {
   screen,
   session,
   shell,
+  type IpcMainInvokeEvent,
 } from 'electron';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -104,7 +105,7 @@ import {
   getSpaHash,
   setRemoteSpaState,
 } from './spaState';
-import { isPermittedFrameUrl } from './ipc/frameValidation';
+import { isPermittedFrameUrl, requireTrustedSender } from './ipc/frameValidation';
 import { IPC_CONTRACT_VERSION, type CredentialOwner } from './ipcContract';
 import { registerIpcHandlers as registerPermissionHandlers } from './permissionManager';
 import { migrateUserData } from './userDataMigration';
@@ -772,7 +773,7 @@ app.whenReady().then(async () => {
 
   // OS permission management (#197) — JIT prompting replaces proactive startup requests.
   // Camera/mic/screen/notifications are requested when the feature is first used.
-  registerPermissionHandlers(() => mainWindow);
+  registerPermissionHandlers(() => mainWindow, getRemoteSpaBaseUrl);
 
   // KLIPY media proxy auth injection (#626): <img>/<video> src attributes
   // send plain GETs without Authorization headers. This interceptor injects
@@ -988,7 +989,8 @@ ipcMain.handle('app:getBuildTag', () => {
 });
 
 // Screen capture sources for voice/video screen share picker (#44)
-ipcMain.handle('media:getDesktopSources', async () => {
+ipcMain.handle('media:getDesktopSources', async (event) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
   const sources = await desktopCapturer.getSources({
     types: ['window', 'screen'],
     thumbnailSize: { width: 320, height: 180 },
@@ -1002,7 +1004,8 @@ ipcMain.handle('media:getDesktopSources', async () => {
 });
 
 // Clipboard write (navigator.clipboard.writeText is blocked in Electron)
-ipcMain.handle('clipboard:writeText', (_event, text: string) => {
+ipcMain.handle('clipboard:writeText', (event, text: string) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
   clipboard.writeText(text);
 });
 
@@ -1096,12 +1099,14 @@ ipcMain.handle('screen:getDisplayInfo', () => {
 // Hardware acceleration preference
 ipcMain.handle('app:getHardwareAcceleration', () => readHwAccelPref());
 
-ipcMain.handle('app:setHardwareAcceleration', (_event, enabled: boolean) => {
+ipcMain.handle('app:setHardwareAcceleration', (event, enabled: boolean) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
   fs.writeFileSync(hwAccelPrefPath, JSON.stringify({ enabled }), 'utf-8');
 });
 
 // Relaunch (for hardware acceleration toggle)
-ipcMain.handle('app:relaunch', () => {
+ipcMain.handle('app:relaunch', (event) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
   app.relaunch();
   app.quit();
 });
@@ -1203,27 +1208,36 @@ ipcMain.handle('app:focusWindow', () => {
 
 // ─── Auto-Update IPC ──────────────────────────────────────────────────
 
-ipcMain.handle('update:check', () => checkForUpdates());
-ipcMain.handle('update:download', () => downloadUpdate());
-ipcMain.handle('update:install', () => safeQuitAndInstall());
+ipcMain.handle('update:check', (event) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
+  return checkForUpdates();
+});
+ipcMain.handle('update:download', (event) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
+  return downloadUpdate();
+});
+ipcMain.handle('update:install', (event) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
+  return safeQuitAndInstall();
+});
 ipcMain.handle('update:getAllowPrerelease', () => getAllowPrerelease());
-ipcMain.handle('update:setAllowPrerelease', (_event, enabled: boolean) =>
-  setAllowPrerelease(enabled)
-);
+ipcMain.handle('update:setAllowPrerelease', (event, enabled: boolean) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
+  return setAllowPrerelease(enabled);
+});
 ipcMain.handle('update:getLogPath', () => getUpdateLogPath());
-// No sender-frame validation, by parity with the sibling `update:*` handlers
-// above. `forceCheckForUpdates` only triggers a check against the pinned
-// electron-updater feed (#719); `reason` flows solely to a log line and cannot
-// influence the network target. Worst case from a compromised renderer is a
-// redundant check against our own server (DoS-equivalent) — strictly less
-// powerful than the adjacent unvalidated update:download / update:install.
-ipcMain.handle('updater:force-check', (_event, reason: 'attestation_required' | 'user_triggered') =>
-  forceCheckForUpdates(reason)
+ipcMain.handle(
+  'updater:force-check',
+  (event, reason: 'attestation_required' | 'user_triggered') => {
+    if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
+    return forceCheckForUpdates(reason);
+  }
 );
 
 // Developer Mode (gates DevTools in packaged builds — REMOVE BEFORE BETA)
 ipcMain.handle('app:getDeveloperMode', () => readDeveloperModePref());
-ipcMain.handle('app:setDeveloperMode', (_event, enabled: boolean) => {
+ipcMain.handle('app:setDeveloperMode', (event, enabled: boolean) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
   writeDeveloperModePref(enabled);
   if (!mainWindow) return;
   if (enabled) {
@@ -1530,13 +1544,40 @@ ipcMain.handle('auth:getMachineId', (event, apiBase?: unknown) => {
 });
 
 // ─── PiP (Picture-in-Picture) Window Management ──────────────────────
-const pipWindows = new Map<string, BrowserWindow>();
+type PipWindowEntry = {
+  window: BrowserWindow;
+  ownerFrameTreeNodeId: number;
+  remoteSpaUrl: string | null;
+};
+const pipWindows = new Map<string, PipWindowEntry>();
 
 /** Force-close PiP children during full-app shutdown so renderer unload guards cannot veto quit. */
 function destroyPipWindowsForQuit(): void {
-  for (const pip of pipWindows.values()) {
+  for (const { window: pip } of pipWindows.values()) {
     if (!pip.isDestroyed()) pip.destroy();
   }
+}
+
+function getOwnedPipWindow(event: IpcMainInvokeEvent, id: string): BrowserWindow | null {
+  const senderFrame = event.senderFrame;
+  if (!senderFrame) return null;
+  const entry = pipWindows.get(id);
+  if (!entry || entry.window.isDestroyed()) return null;
+  const isPipMainFrame =
+    event.sender === entry.window.webContents &&
+    senderFrame.frameTreeNodeId === entry.window.webContents.mainFrame.frameTreeNodeId;
+  if (
+    !isValidPipOpenSender(
+      senderFrame.url,
+      app.isPackaged,
+      isPipMainFrame ? entry.remoteSpaUrl : getRemoteSpaUrl()
+    )
+  ) {
+    return null;
+  }
+  const isOwnerFrame = entry.ownerFrameTreeNodeId === senderFrame.frameTreeNodeId;
+  if (!isOwnerFrame && !isPipMainFrame) return null;
+  return entry.window;
 }
 
 ipcMain.handle(
@@ -1545,15 +1586,18 @@ ipcMain.handle(
     // Defense-in-depth: only accept pip:open from the active SPA, the dev
     // server, or the bundled renderer. Without validation any frame loaded
     // in any window could spawn PiP windows.
+    const senderFrame = event.senderFrame;
     const remoteUrl = getRemoteSpaUrl();
-    if (!isValidPipOpenSender(event.senderFrame?.url ?? '', app.isPackaged, remoteUrl)) {
+    if (!senderFrame || !isValidPipOpenSender(senderFrame.url, app.isPackaged, remoteUrl)) {
       console.warn('[pip:open] rejected — sender frame validation failed');
       return;
     }
 
     const existing = pipWindows.get(opts.id);
     if (existing) {
-      existing.focus();
+      if (existing.ownerFrameTreeNodeId === senderFrame.frameTreeNodeId) {
+        existing.window.focus();
+      }
       return;
     }
 
@@ -1607,7 +1651,11 @@ ipcMain.handle(
       pip.loadURL(`app://concord/index.html#/pip/${opts.id}`);
     }
 
-    pipWindows.set(opts.id, pip);
+    pipWindows.set(opts.id, {
+      window: pip,
+      ownerFrameTreeNodeId: senderFrame.frameTreeNodeId,
+      remoteSpaUrl: remoteUrl,
+    });
 
     pip.on('closed', () => {
       pipWindows.delete(opts.id);
@@ -1616,12 +1664,12 @@ ipcMain.handle(
   }
 );
 
-ipcMain.handle('pip:close', (_event, opts: { id: string }) => {
-  pipWindows.get(opts.id)?.close();
+ipcMain.handle('pip:close', (event, opts: { id: string }) => {
+  getOwnedPipWindow(event, opts.id)?.close();
 });
 
-ipcMain.handle('pip:setAlwaysOnTop', (_event, opts: { id: string; flag: boolean }) => {
-  pipWindows.get(opts.id)?.setAlwaysOnTop(opts.flag);
+ipcMain.handle('pip:setAlwaysOnTop', (event, opts: { id: string; flag: boolean }) => {
+  getOwnedPipWindow(event, opts.id)?.setAlwaysOnTop(opts.flag);
 });
 
 ipcMain.handle('spa:requestSelfHeal', async (event, payload: unknown) => {

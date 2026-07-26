@@ -1,6 +1,24 @@
 import { describe, it, expect } from 'vitest';
+import type { IpcMainInvokeEvent } from 'electron';
 
-import { isPermittedFrameUrl } from '@/main/ipc/frameValidation';
+import { isPermittedFrameUrl, requireTrustedSender } from '@/main/ipc/frameValidation';
+
+describe('requireTrustedSender', () => {
+  it('returns the captured sender frame for a permitted origin', () => {
+    const event = {
+      senderFrame: { url: 'app://concord/index.html', frameTreeNodeId: 41 },
+    } as IpcMainInvokeEvent;
+
+    expect(requireTrustedSender(event, null)).toBe(event.senderFrame);
+  });
+
+  it.each([
+    { senderFrame: { url: 'https://evil.example/', frameTreeNodeId: 99 } },
+    { senderFrame: null },
+  ])('rejects an untrusted or missing sender frame', (event) => {
+    expect(requireTrustedSender(event as IpcMainInvokeEvent, null)).toBeNull();
+  });
+});
 
 /**
  * Frame-origin allowlist used by the privileged IPC handlers (attestation,

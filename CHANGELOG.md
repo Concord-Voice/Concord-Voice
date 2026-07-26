@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.36] — 2026-07-26
+
+### Security
+
+- **Desktop actions now reject untrusted web content** ([#2351](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2351)) — screen capture, clipboard, update, permission, lifecycle, and developer controls now act only on calls from a permitted Concord Voice frame. Floating call windows remain usable while the app switches between remote and bundled interface sources.
+
 ## [0.2.35] — 2026-07-25
 
 ### Fixed

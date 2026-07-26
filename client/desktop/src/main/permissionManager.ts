@@ -20,22 +20,15 @@ import {
   shell,
   systemPreferences,
 } from 'electron';
+import { requireTrustedSender } from './ipc/frameValidation';
 
 // ─── Types ────────────────────────────────────────────────────────────
 
 export type OsPermissionType =
-  | 'microphone'
-  | 'camera'
-  | 'screen'
-  | 'secureStorage'
-  | 'notifications';
+  'microphone' | 'camera' | 'screen' | 'secureStorage' | 'notifications';
 
 export type OsPermissionStatus =
-  | 'granted'
-  | 'denied'
-  | 'not-determined'
-  | 'restricted'
-  | 'unavailable';
+  'granted' | 'denied' | 'not-determined' | 'restricted' | 'unavailable';
 
 export type OsPermissionState = Record<OsPermissionType, OsPermissionStatus>;
 
@@ -235,19 +228,25 @@ export function openSystemSettings(type: OsPermissionType): void {
 
 // ─── IPC Registration ─────────────────────────────────────────────────
 
-export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): void {
-  ipcMain.handle('permission:checkAll', () => {
+export function registerIpcHandlers(
+  getMainWindow: () => BrowserWindow | null,
+  getRemoteSpaBaseUrl: () => string | null
+): void {
+  ipcMain.handle('permission:checkAll', (event) => {
+    if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
     return checkAllPermissions();
   });
 
-  ipcMain.handle('permission:check', (_event, type: string) => {
+  ipcMain.handle('permission:check', (event, type: string) => {
+    if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
     if (!PERMISSION_TYPES.has(type as OsPermissionType)) {
       throw new Error(`Unknown permission type: ${type}`);
     }
     return checkPermission(type as OsPermissionType);
   });
 
-  ipcMain.handle('permission:request', async (_event, type: string) => {
+  ipcMain.handle('permission:request', async (event, type: string) => {
+    if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
     if (!PERMISSION_TYPES.has(type as OsPermissionType)) {
       throw new Error(`Unknown permission type: ${type}`);
     }
@@ -262,7 +261,8 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
     return status;
   });
 
-  ipcMain.handle('permission:openSettings', (_event, type: string) => {
+  ipcMain.handle('permission:openSettings', (event, type: string) => {
+    if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
     if (!PERMISSION_TYPES.has(type as OsPermissionType)) {
       throw new Error(`Unknown permission type: ${type}`);
     }

@@ -3,6 +3,7 @@
 // permissionManager — OS permission check, request, settings, and IPC tests.
 
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import type { IpcMainInvokeEvent } from 'electron';
 
 // ── Hoisted mocks ──────────────────────────────────────────────────────
 
@@ -63,6 +64,9 @@ import {
 // ── Helpers ────────────────────────────────────────────────────────────
 
 const originalPlatform = process.platform;
+const trustedIpcEvent = {
+  senderFrame: { url: 'app://concord/index.html', frameTreeNodeId: 41 },
+} as IpcMainInvokeEvent;
 
 function setPlatform(platform: string) {
   Object.defineProperty(process, 'platform', {
@@ -526,7 +530,7 @@ describe('permissionManager', () => {
   describe('registerIpcHandlers', () => {
     it('registers 4 IPC handlers', () => {
       const getMainWindow = vi.fn(() => null);
-      registerIpcHandlers(getMainWindow);
+      registerIpcHandlers(getMainWindow, () => null);
       expect(mockIpcMainHandle).toHaveBeenCalledTimes(4);
       const channels = mockIpcMainHandle.mock.calls.map((c: unknown[]) => c[0]);
       expect(channels).toContain('permission:checkAll');
@@ -537,6 +541,10 @@ describe('permissionManager', () => {
 
     describe('IPC handler behavior', () => {
       let handlers: Record<string, (...args: unknown[]) => unknown>;
+      let mockWindow: {
+        isDestroyed: ReturnType<typeof vi.fn>;
+        webContents: { send: ReturnType<typeof vi.fn> };
+      };
 
       beforeEach(() => {
         mockIpcMainHandle.mockReset();
@@ -547,16 +555,41 @@ describe('permissionManager', () => {
           }
         );
 
-        const mockWindow = {
+        mockWindow = {
           isDestroyed: vi.fn(() => false),
           webContents: { send: vi.fn() },
         };
-        registerIpcHandlers(() => mockWindow as never);
+        registerIpcHandlers(
+          () => mockWindow as never,
+          () => null
+        );
+      });
+
+      it.each([
+        { senderFrame: { url: 'https://evil.example/', frameTreeNodeId: 99 } },
+        { senderFrame: null },
+      ])('rejects an untrusted or missing sender before validation or OS work', async (event) => {
+        setPlatform('darwin');
+
+        expect(handlers['permission:checkAll'](event)).toBeUndefined();
+        expect(handlers['permission:check'](event, 'badtype')).toBeUndefined();
+        await expect(handlers['permission:request'](event, 'microphone')).resolves.toBeUndefined();
+        await expect(
+          handlers['permission:request'](event, 'notifications')
+        ).resolves.toBeUndefined();
+        expect(handlers['permission:openSettings'](event, 'badtype')).toBeUndefined();
+
+        expect(mockGetMediaAccessStatus).not.toHaveBeenCalled();
+        expect(mockGetNotificationSettings).not.toHaveBeenCalled();
+        expect(mockAskForMediaAccess).not.toHaveBeenCalled();
+        expect(mockNotificationShow).not.toHaveBeenCalled();
+        expect(mockOpenExternal).not.toHaveBeenCalled();
+        expect(mockWindow.webContents.send).not.toHaveBeenCalled();
       });
 
       it('permission:checkAll returns all permissions', () => {
         setPlatform('win32');
-        const result = handlers['permission:checkAll']({});
+        const result = handlers['permission:checkAll'](trustedIpcEvent);
         expect(result).toHaveProperty('microphone');
         expect(result).toHaveProperty('camera');
         expect(result).toHaveProperty('screen');
@@ -566,37 +599,37 @@ describe('permissionManager', () => {
 
       it('permission:check returns status for valid type', () => {
         setPlatform('win32');
-        const result = handlers['permission:check']({}, 'microphone');
+        const result = handlers['permission:check'](trustedIpcEvent, 'microphone');
         expect(result).toBe('granted');
       });
 
       it('permission:check throws for unknown type', () => {
-        expect(() => handlers['permission:check']({}, 'badtype')).toThrow(
+        expect(() => handlers['permission:check'](trustedIpcEvent, 'badtype')).toThrow(
           'Unknown permission type: badtype'
         );
       });
 
       it('permission:request returns status and sends changed event', async () => {
         setPlatform('win32');
-        const result = await handlers['permission:request']({}, 'microphone');
+        const result = await handlers['permission:request'](trustedIpcEvent, 'microphone');
         expect(result).toBe('granted');
       });
 
       it('permission:request throws for unknown type', async () => {
-        await expect(handlers['permission:request']({}, 'badtype')).rejects.toThrow(
+        await expect(handlers['permission:request'](trustedIpcEvent, 'badtype')).rejects.toThrow(
           'Unknown permission type: badtype'
         );
       });
 
       it('permission:openSettings throws for unknown type', () => {
-        expect(() => handlers['permission:openSettings']({}, 'badtype')).toThrow(
+        expect(() => handlers['permission:openSettings'](trustedIpcEvent, 'badtype')).toThrow(
           'Unknown permission type: badtype'
         );
       });
 
       it('permission:openSettings calls openSystemSettings for valid type', () => {
         setPlatform('darwin');
-        handlers['permission:openSettings']({}, 'microphone');
+        handlers['permission:openSettings'](trustedIpcEvent, 'microphone');
         expect(mockOpenExternal).toHaveBeenCalled();
       });
 
@@ -608,10 +641,13 @@ describe('permissionManager', () => {
             handlers[channel] = handler;
           }
         );
-        registerIpcHandlers(() => null);
+        registerIpcHandlers(
+          () => null,
+          () => null
+        );
         setPlatform('win32');
         // Should not throw
-        const result = await handlers['permission:request']({}, 'microphone');
+        const result = await handlers['permission:request'](trustedIpcEvent, 'microphone');
         expect(result).toBe('granted');
       });
 
@@ -627,9 +663,12 @@ describe('permissionManager', () => {
           isDestroyed: vi.fn(() => true),
           webContents: { send: vi.fn() },
         };
-        registerIpcHandlers(() => destroyedWindow as never);
+        registerIpcHandlers(
+          () => destroyedWindow as never,
+          () => null
+        );
         setPlatform('win32');
-        await handlers['permission:request']({}, 'microphone');
+        await handlers['permission:request'](trustedIpcEvent, 'microphone');
         expect(destroyedWindow.webContents.send).not.toHaveBeenCalled();
       });
     });

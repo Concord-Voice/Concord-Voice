@@ -52,6 +52,11 @@ import {
   type OsPermissionType,
 } from '@/main/permissionManager';
 
+const trustedIpcEvent = {
+  senderFrame: { url: 'app://concord/index.html', frameTreeNodeId: 41 },
+};
+const getRemoteSpaBaseUrl = () => null;
+
 describe('permissionManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -353,7 +358,7 @@ describe('permissionManager', () => {
 
   describe('registerIpcHandlers', () => {
     it('registers all handlers', () => {
-      registerIpcHandlers(vi.fn().mockReturnValue(null));
+      registerIpcHandlers(vi.fn().mockReturnValue(null), getRemoteSpaBaseUrl);
       const channels = mockHandle.mock.calls.map((c: unknown[]) => c[0]);
       expect(channels).toContain('permission:checkAll');
       expect(channels).toContain('permission:check');
@@ -362,33 +367,33 @@ describe('permissionManager', () => {
     });
 
     it('check handler validates type', () => {
-      registerIpcHandlers(vi.fn().mockReturnValue(null));
+      registerIpcHandlers(vi.fn().mockReturnValue(null), getRemoteSpaBaseUrl);
       const call = mockHandle.mock.calls.find(
         (c: unknown[]) => (c as string[])[0] === 'permission:check'
       );
       const handler = (call as [string, (...args: unknown[]) => unknown])[1];
-      expect(() => handler({}, 'invalid')).toThrow('Unknown permission type');
+      expect(() => handler(trustedIpcEvent, 'invalid')).toThrow('Unknown permission type');
     });
 
     it('check handler returns status', () => {
-      registerIpcHandlers(vi.fn().mockReturnValue(null));
+      registerIpcHandlers(vi.fn().mockReturnValue(null), getRemoteSpaBaseUrl);
       const call = mockHandle.mock.calls.find(
         (c: unknown[]) => (c as string[])[0] === 'permission:check'
       );
       const handler = (call as [string, (...args: unknown[]) => unknown])[1];
       mockIsEncryptionAvailable.mockReturnValue(true);
-      expect(handler({}, 'secureStorage')).toBe('granted');
+      expect(handler(trustedIpcEvent, 'secureStorage')).toBe('granted');
     });
 
     it('request handler notifies renderer', async () => {
       const win = { isDestroyed: vi.fn().mockReturnValue(false), webContents: { send: mockSend } };
-      registerIpcHandlers(vi.fn().mockReturnValue(win));
+      registerIpcHandlers(vi.fn().mockReturnValue(win), getRemoteSpaBaseUrl);
       const call = mockHandle.mock.calls.find(
         (c: unknown[]) => (c as string[])[0] === 'permission:request'
       );
       const handler = (call as [string, (...args: unknown[]) => unknown])[1];
       mockIsEncryptionAvailable.mockReturnValue(true);
-      await handler({}, 'secureStorage');
+      await handler(trustedIpcEvent, 'secureStorage');
       expect(mockSend).toHaveBeenCalledWith('permission:changed', {
         type: 'secureStorage',
         status: 'granted',
@@ -397,43 +402,43 @@ describe('permissionManager', () => {
 
     it('request handler skips destroyed window', async () => {
       const win = { isDestroyed: vi.fn().mockReturnValue(true), webContents: { send: mockSend } };
-      registerIpcHandlers(vi.fn().mockReturnValue(win));
+      registerIpcHandlers(vi.fn().mockReturnValue(win), getRemoteSpaBaseUrl);
       const call = mockHandle.mock.calls.find(
         (c: unknown[]) => (c as string[])[0] === 'permission:request'
       );
       const handler = (call as [string, (...args: unknown[]) => unknown])[1];
       mockIsEncryptionAvailable.mockReturnValue(true);
-      await handler({}, 'secureStorage');
+      await handler(trustedIpcEvent, 'secureStorage');
       expect(mockSend).not.toHaveBeenCalled();
     });
 
     it('request handler skips null window', async () => {
-      registerIpcHandlers(vi.fn().mockReturnValue(null));
+      registerIpcHandlers(vi.fn().mockReturnValue(null), getRemoteSpaBaseUrl);
       const call = mockHandle.mock.calls.find(
         (c: unknown[]) => (c as string[])[0] === 'permission:request'
       );
       const handler = (call as [string, (...args: unknown[]) => unknown])[1];
       mockIsEncryptionAvailable.mockReturnValue(true);
-      await handler({}, 'secureStorage');
+      await handler(trustedIpcEvent, 'secureStorage');
       expect(mockSend).not.toHaveBeenCalled();
     });
 
     it('request handler throws for invalid type', async () => {
-      registerIpcHandlers(vi.fn().mockReturnValue(null));
+      registerIpcHandlers(vi.fn().mockReturnValue(null), getRemoteSpaBaseUrl);
       const call = mockHandle.mock.calls.find(
         (c: unknown[]) => (c as string[])[0] === 'permission:request'
       );
       const handler = (call as [string, (...args: unknown[]) => unknown])[1];
-      await expect(handler({}, 'bogus')).rejects.toThrow('Unknown permission type');
+      await expect(handler(trustedIpcEvent, 'bogus')).rejects.toThrow('Unknown permission type');
     });
 
     it('openSettings handler throws for invalid type', () => {
-      registerIpcHandlers(vi.fn().mockReturnValue(null));
+      registerIpcHandlers(vi.fn().mockReturnValue(null), getRemoteSpaBaseUrl);
       const call = mockHandle.mock.calls.find(
         (c: unknown[]) => (c as string[])[0] === 'permission:openSettings'
       );
       const handler = (call as [string, (...args: unknown[]) => unknown])[1];
-      expect(() => handler({}, 'bogus')).toThrow('Unknown permission type');
+      expect(() => handler(trustedIpcEvent, 'bogus')).toThrow('Unknown permission type');
     });
   });
 });
