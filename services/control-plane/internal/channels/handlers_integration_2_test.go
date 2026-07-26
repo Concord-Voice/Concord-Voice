@@ -1,14 +1,18 @@
 package channels_test
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/e2eekeys"
 	"github.com/google/uuid"
@@ -26,6 +30,24 @@ const (
 	pathE2EEKeys         = "/api/v1/e2ee/keys/"
 	pathE2EEKeysZero     = pathE2EEKeys + zeroUUID
 )
+
+func doRawChunkedJSONRequest(
+	ts *testhelpers.TestServer,
+	method string,
+	path string,
+	body string,
+	headers http.Header,
+) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	req.Header = headers.Clone()
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	ts.Router.ServeHTTP(w, req)
+	return w
+}
 
 // ===========================================================================
 // List Channels — edge cases
@@ -78,6 +100,99 @@ func TestCreateChannelEdgeCases(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "ccedge")
 	serverID := ts.CreateTestServer(t, user.ID, "CC Edge Server")
+	admin := ts.CreateTestUser(t, "ccedgeadmin")
+	ts.AddMemberToServer(t, serverID, admin.ID, "admin")
+
+	t.Run("RejectsBodyOver512KiB", func(t *testing.T) {
+		w := ts.DoRequest("POST", pathChannels, map[string]interface{}{
+			keyServerID: serverID,
+			"name":      "oversized-channel",
+			"type":      "text",
+			keyWrappedKeys: map[string]string{
+				user.ID: strings.Repeat("x", 512*1024),
+			},
+		}, testhelpers.AuthHeaders(user.AccessToken))
+		assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+		assert.Contains(t, w.Body.String(), "Request body too large")
+	})
+
+	t.Run("RejectsOversizedChunkedTrailingBodyBeforeDatabaseFanout", func(t *testing.T) {
+		body := fmt.Sprintf(
+			`{"server_id":%q,"name":"oversized-trailing-channel","type":"text","wrapped_keys":{%q:%q}}{}`,
+			serverID,
+			user.ID,
+			testhelpers.ValidCiphertext(),
+		) + strings.Repeat(" ", 512*1024)
+
+		withRenamedTable(t, ts, "server_members", func() {
+			w := doRawChunkedJSONRequest(
+				ts,
+				http.MethodPost,
+				pathChannels,
+				body,
+				testhelpers.AuthHeaders(user.AccessToken),
+			)
+			assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+			assert.JSONEq(t, `{"error":"Request body too large"}`, w.Body.String())
+		})
+	})
+
+	t.Run("RejectsSecondJSONDocumentBeforeDatabaseFanout", func(t *testing.T) {
+		body := fmt.Sprintf(
+			`{"server_id":%q,"name":"second-document-channel","type":"text","wrapped_keys":{%q:%q}}{}`,
+			serverID,
+			user.ID,
+			testhelpers.ValidCiphertext(),
+		)
+
+		withRenamedTable(t, ts, "server_members", func() {
+			w := doRawChunkedJSONRequest(ts, http.MethodPost, pathChannels, body, testhelpers.AuthHeaders(user.AccessToken))
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.JSONEq(t, `{"error":"Invalid request body"}`, w.Body.String())
+		})
+	})
+
+	t.Run("RejectsMoreThan500WrappedKeysBeforeDatabaseFanout", func(t *testing.T) {
+		wrappedKeys := make(map[string]string, 501)
+		for i := range 501 {
+			wrappedKeys[fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)] = "k"
+		}
+		const channelName = "too-many-key-wraps"
+
+		withRenamedTable(t, ts, "server_members", func() {
+			w := ts.DoRequest("POST", pathChannels, map[string]interface{}{
+				keyServerID:    serverID,
+				"name":         channelName,
+				"type":         "text",
+				keyWrappedKeys: wrappedKeys,
+			}, testhelpers.AuthHeaders(admin.AccessToken))
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Contains(t, w.Body.String(), "Too many wrapped keys")
+		})
+
+		var channelCount int
+		require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM channels WHERE name = $1`, channelName).Scan(&channelCount))
+		assert.Zero(t, channelCount)
+	})
+
+	t.Run("RejectsMoreThan500WrappedKeyVersions", func(t *testing.T) {
+		wrappedKeyVersions := make(map[string]int, 501)
+		for i := range 501 {
+			wrappedKeyVersions[fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)] = 1
+		}
+
+		w := ts.DoRequest("POST", pathChannels, map[string]interface{}{
+			keyServerID: serverID,
+			"name":      "too-many-key-versions",
+			"type":      "text",
+			keyWrappedKeys: map[string]string{
+				user.ID: "k",
+			},
+			"wrapped_key_versions": wrappedKeyVersions,
+		}, testhelpers.AuthHeaders(user.AccessToken))
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "Too many wrapped keys")
+	})
 
 	t.Run("BadRequestBody", func(t *testing.T) {
 		w := ts.DoRequest("POST", pathChannels, map[string]interface{}{}, testhelpers.AuthHeaders(user.AccessToken))
@@ -119,6 +234,16 @@ func TestCreateChannelEdgeCases(t *testing.T) {
 		}, nil)
 		assert.Equal(t, http.StatusUnauthorized, w.Code)
 	})
+
+	// The invalid authenticated requests above intentionally exercise the route's
+	// body validation, but also consume its per-user request budget. This test
+	// is not a rate-limit test, so isolate the remaining success cases.
+	deleted, err := ts.Redis.Del(
+		context.Background(),
+		fmt.Sprintf("ratelimit:user:%s:POST:/api/v1/channels", user.ID),
+	).Result()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, deleted, "rate-limit key format drifted; update this test's key")
 
 	t.Run("VoiceCreatesLinkedText", func(t *testing.T) {
 		w := ts.DoRequest("POST", pathChannels, map[string]interface{}{
@@ -581,6 +706,83 @@ func TestGetServerUnreadStatusEdgeCases(t *testing.T) {
 func TestDistributeChannelKeysEdgeCases(t *testing.T) {
 	ts, owner, serverID, channelID := setupEncryptedChannel(t)
 
+	t.Run("RejectsBodyOver512KiB", func(t *testing.T) {
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+			keyWrappedKeys: map[string]string{
+				owner.ID: strings.Repeat("x", 512*1024),
+			},
+		}, testhelpers.AuthHeaders(owner.AccessToken))
+		assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+		assert.Contains(t, w.Body.String(), "Request body too large")
+	})
+
+	t.Run("RejectsOversizedChunkedTrailingBodyBeforeChannelLookup", func(t *testing.T) {
+		body := fmt.Sprintf(
+			`{"wrapped_keys":{%q:%q}}{}`,
+			owner.ID,
+			testhelpers.ValidCiphertext(),
+		) + strings.Repeat(" ", 512*1024)
+
+		withRenamedTable(t, ts, "channels", func() {
+			w := doRawChunkedJSONRequest(
+				ts,
+				http.MethodPost,
+				pathChannelsPrefix+channelID+pathKeys,
+				body,
+				testhelpers.AuthHeaders(owner.AccessToken),
+			)
+			assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+			assert.JSONEq(t, `{"error":"Request body too large"}`, w.Body.String())
+		})
+	})
+
+	t.Run("RejectsSecondJSONDocumentBeforeChannelLookup", func(t *testing.T) {
+		body := fmt.Sprintf(`{"wrapped_keys":{%q:%q}}{}`, owner.ID, testhelpers.ValidCiphertext())
+
+		withRenamedTable(t, ts, "channels", func() {
+			w := doRawChunkedJSONRequest(
+				ts,
+				http.MethodPost,
+				pathChannelsPrefix+channelID+pathKeys,
+				body,
+				testhelpers.AuthHeaders(owner.AccessToken),
+			)
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.JSONEq(t, `{"error":"Invalid request body"}`, w.Body.String())
+		})
+	})
+
+	t.Run("RejectsMoreThan500WrappedKeyVersions", func(t *testing.T) {
+		wrappedKeyVersions := make(map[string]int, 501)
+		for i := range 501 {
+			wrappedKeyVersions[fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)] = 1
+		}
+
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+			keyWrappedKeys: map[string]string{
+				owner.ID: "k",
+			},
+			"wrapped_key_versions": wrappedKeyVersions,
+		}, testhelpers.AuthHeaders(owner.AccessToken))
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "Too many wrapped keys")
+	})
+
+	t.Run("RejectsMoreThan500WrappedKeysBeforeChannelLookup", func(t *testing.T) {
+		wrappedKeys := make(map[string]string, 501)
+		for i := range 501 {
+			wrappedKeys[fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)] = "k"
+		}
+
+		withRenamedTable(t, ts, "channels", func() {
+			w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+				keyWrappedKeys: wrappedKeys,
+			}, testhelpers.AuthHeaders(owner.AccessToken))
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Contains(t, w.Body.String(), "Too many wrapped keys")
+		})
+	})
+
 	t.Run("InvalidChannelID", func(t *testing.T) {
 		w := ts.DoRequest("POST", "/api/v1/channels/not-a-uuid/keys", map[string]interface{}{
 			keyWrappedKeys: map[string]string{
@@ -699,8 +901,64 @@ func TestRotateKeyAllPaths(t *testing.T) {
 // ===========================================================================
 
 func TestValidateEpochsAllPaths(t *testing.T) {
-	ts, user, _, channelID := setupEncryptedChannel(t)
+	ts, user, serverID, channelID := setupEncryptedChannel(t)
 	outsider := ts.CreateTestUser(t, "epochsouter")
+
+	t.Run("RejectsBodyOver32KiB", func(t *testing.T) {
+		w := ts.DoRequest("POST", pathValidateEpochs, map[string]interface{}{
+			"epochs":  map[string]int{channelID: 1},
+			"padding": strings.Repeat("x", 32*1024),
+		}, testhelpers.AuthHeaders(user.AccessToken))
+		assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+		assert.Contains(t, w.Body.String(), "Request body too large")
+	})
+
+	t.Run("RejectsOversizedChunkedTrailingBodyBeforeAccessLookup", func(t *testing.T) {
+		body := fmt.Sprintf(`{"epochs":{%q:1}}{}`, channelID) + strings.Repeat(" ", 32*1024)
+
+		withRenamedTable(t, ts, "channels", func() {
+			w := doRawChunkedJSONRequest(
+				ts,
+				http.MethodPost,
+				pathValidateEpochs,
+				body,
+				testhelpers.AuthHeaders(user.AccessToken),
+			)
+			assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+			assert.JSONEq(t, `{"error":"Request body too large"}`, w.Body.String())
+		})
+	})
+
+	t.Run("RejectsSecondJSONDocumentBeforeAccessLookup", func(t *testing.T) {
+		body := fmt.Sprintf(`{"epochs":{%q:1}}{}`, channelID)
+
+		withRenamedTable(t, ts, "channels", func() {
+			w := doRawChunkedJSONRequest(
+				ts,
+				http.MethodPost,
+				pathValidateEpochs,
+				body,
+				testhelpers.AuthHeaders(user.AccessToken),
+			)
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.JSONEq(t, `{"error":"Invalid request body"}`, w.Body.String())
+		})
+	})
+
+	t.Run("RejectsMoreThan500EpochsBeforeAccessLookup", func(t *testing.T) {
+		epochs := make(map[string]int, 501)
+		for i := range 501 {
+			epochs[fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)] = 1
+		}
+
+		withRenamedTable(t, ts, "channels", func() {
+			w := ts.DoRequest("POST", pathValidateEpochs, map[string]interface{}{
+				"epochs": epochs,
+			}, testhelpers.AuthHeaders(user.AccessToken))
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Contains(t, w.Body.String(), "Too many epochs")
+		})
+	})
 
 	t.Run("Success", func(t *testing.T) {
 		w := ts.DoRequest("POST", pathValidateEpochs, map[string]interface{}{
@@ -754,6 +1012,86 @@ func TestValidateEpochsAllPaths(t *testing.T) {
 		testhelpers.ParseJSON(t, w, &body)
 		revocations := body["revocations"].([]interface{})
 		assert.Empty(t, revocations)
+		assert.Equal(t, []interface{}{channelID}, body["access_lost"])
+	})
+
+	t.Run("UnknownChannelUsesTheSameAccessLostShape", func(t *testing.T) {
+		unknownChannelID := "00000000-0000-0000-0000-000000000099"
+		w := ts.DoRequest("POST", pathValidateEpochs, map[string]interface{}{
+			"epochs": map[string]int{unknownChannelID: 1},
+		}, testhelpers.AuthHeaders(user.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Empty(t, body["revocations"])
+		assert.Equal(t, []interface{}{unknownChannelID}, body["access_lost"])
+	})
+
+	t.Run("AllowsSixtyBatchedReconnectRequests", func(t *testing.T) {
+		rateLimitedUser := ts.CreateTestUser(t, "epochsratelimit")
+		for i := 0; i < 60; i++ {
+			w := ts.DoRequest("POST", pathValidateEpochs, map[string]interface{}{
+				"epochs": map[string]int{},
+			}, testhelpers.AuthHeaders(rateLimitedUser.AccessToken))
+			require.Equal(t, http.StatusOK, w.Code, "request %d", i+1)
+		}
+
+		w := ts.DoRequest("POST", pathValidateEpochs, map[string]interface{}{
+			"epochs": map[string]int{},
+		}, testhelpers.AuthHeaders(rateLimitedUser.AccessToken))
+		assert.Equal(t, http.StatusTooManyRequests, w.Code)
+	})
+
+	t.Run("RevocationLookupFailureFailsClosed", func(t *testing.T) {
+		withRenamedTable(t, ts, "key_revocations", func() {
+			w := ts.DoRequest("POST", pathValidateEpochs, map[string]interface{}{
+				"epochs": map[string]int{channelID: 1},
+			}, testhelpers.AuthHeaders(user.AccessToken))
+			assert.Equal(t, http.StatusInternalServerError, w.Code)
+		})
+	})
+
+	t.Run("HiddenChannelSkipped", func(t *testing.T) {
+		member := ts.CreateTestUser(t, "epochshidden")
+		ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+		_, err := ts.DB.Exec(
+			`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by)
+			 VALUES ($1, 1, 2, 'permission_revocation', $2)`,
+			channelID, user.ID,
+		)
+		require.NoError(t, err)
+
+		var allRoleID string
+		require.NoError(t, ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID))
+		ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+		require.NoError(t, rbac.NewPermissionCache(ts.Redis).InvalidateServer(context.Background(), serverID))
+		t.Cleanup(func() {
+			_, cleanupErr := ts.DB.Exec(`DELETE FROM key_revocations WHERE channel_id = $1`, channelID)
+			require.NoError(t, cleanupErr)
+			_, cleanupErr = ts.DB.Exec(`DELETE FROM channel_permission_overrides WHERE channel_id = $1`, channelID)
+			require.NoError(t, cleanupErr)
+			require.NoError(t, rbac.NewPermissionCache(ts.Redis).InvalidateServer(context.Background(), serverID))
+		})
+
+		w := ts.DoRequest("POST", pathValidateEpochs, map[string]interface{}{
+			"epochs": map[string]int{channelID: 1},
+		}, testhelpers.AuthHeaders(member.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Empty(t, body["revocations"], "view-denied member must not receive hidden-channel revocations")
+		assert.Equal(t, []interface{}{channelID}, body["access_lost"])
+	})
+
+	t.Run("AccessLookupFailureFailsClosed", func(t *testing.T) {
+		withRenamedTable(t, ts, "channels", func() {
+			w := ts.DoRequest("POST", pathValidateEpochs, map[string]interface{}{
+				"epochs": map[string]int{channelID: 1},
+			}, testhelpers.AuthHeaders(user.AccessToken))
+			assert.Equal(t, http.StatusInternalServerError, w.Code)
+		})
 	})
 }
 
@@ -1014,9 +1352,17 @@ var renameTableStmts = map[string]struct {
 		rename: `ALTER TABLE dm_key_revocations RENAME TO dm_key_revocations_hidden_for_test`,
 		revert: `ALTER TABLE dm_key_revocations_hidden_for_test RENAME TO dm_key_revocations`,
 	},
+	"key_revocations": {
+		rename: `ALTER TABLE key_revocations RENAME TO key_revocations_hidden_for_test`,
+		revert: `ALTER TABLE key_revocations_hidden_for_test RENAME TO key_revocations`,
+	},
 	"roles": {
 		rename: `ALTER TABLE roles RENAME TO roles_hidden_for_test`,
 		revert: `ALTER TABLE roles_hidden_for_test RENAME TO roles`,
+	},
+	"server_members": {
+		rename: `ALTER TABLE server_members RENAME TO server_members_hidden_for_test`,
+		revert: `ALTER TABLE server_members_hidden_for_test RENAME TO server_members`,
 	},
 }
 
@@ -1415,17 +1761,96 @@ func TestDistributeUnifiedKeysDM(t *testing.T) {
 	ts.CreateFriendship(t, user1.ID, user2.ID, "accepted")
 	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
 
-	w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
-		keyWrappedKeys: map[string]string{
-			user2.ID: testhelpers.ValidCiphertext(),
-		},
-	}, testhelpers.AuthHeaders(user1.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
+	t.Run("Success", func(t *testing.T) {
+		w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
+			keyWrappedKeys: map[string]string{
+				user2.ID: testhelpers.ValidCiphertext(),
+			},
+		}, testhelpers.AuthHeaders(user1.AccessToken))
+		assert.Equal(t, http.StatusOK, w.Code)
 
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, "dm", body["context_type"])
-	assert.Equal(t, float64(1), body["distributed"])
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, "dm", body["context_type"])
+		assert.Equal(t, float64(1), body["distributed"])
+	})
+
+	t.Run("RejectsBodyOver16KiB", func(t *testing.T) {
+		w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
+			keyWrappedKeys: map[string]string{
+				user2.ID: strings.Repeat("x", 16*1024),
+			},
+		}, testhelpers.AuthHeaders(user1.AccessToken))
+		assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+		assert.Contains(t, w.Body.String(), "Request body too large")
+	})
+
+	t.Run("RejectsOversizedChunkedTrailingBodyBeforeDatabaseFanout", func(t *testing.T) {
+		body := fmt.Sprintf(
+			`{"wrapped_keys":{%q:%q}}{}`,
+			user2.ID,
+			testhelpers.ValidCiphertext(),
+		) + strings.Repeat(" ", 16*1024)
+
+		withRenamedTable(t, ts, "dm_channel_keys", func() {
+			w := doRawChunkedJSONRequest(
+				ts,
+				http.MethodPost,
+				pathE2EEKeys+convID,
+				body,
+				testhelpers.AuthHeaders(user1.AccessToken),
+			)
+			assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+			assert.JSONEq(t, `{"error":"Request body too large"}`, w.Body.String())
+		})
+	})
+
+	t.Run("RejectsSecondJSONDocumentBeforeDatabaseFanout", func(t *testing.T) {
+		body := fmt.Sprintf(`{"wrapped_keys":{%q:%q}}{}`, user2.ID, testhelpers.ValidCiphertext())
+
+		withRenamedTable(t, ts, "dm_channel_keys", func() {
+			w := doRawChunkedJSONRequest(
+				ts,
+				http.MethodPost,
+				pathE2EEKeys+convID,
+				body,
+				testhelpers.AuthHeaders(user1.AccessToken),
+			)
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.JSONEq(t, `{"error":"Invalid request body"}`, w.Body.String())
+		})
+	})
+
+	t.Run("RejectsMoreThan10WrappedKeyVersions", func(t *testing.T) {
+		wrappedKeyVersions := make(map[string]int, 11)
+		for i := range 11 {
+			wrappedKeyVersions[fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)] = 1
+		}
+
+		w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
+			keyWrappedKeys: map[string]string{
+				user2.ID: "k",
+			},
+			"wrapped_key_versions": wrappedKeyVersions,
+		}, testhelpers.AuthHeaders(user1.AccessToken))
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "Too many wrapped keys")
+	})
+
+	t.Run("RejectsMoreThan10WrappedKeysBeforeDatabaseFanout", func(t *testing.T) {
+		wrappedKeys := make(map[string]string, 11)
+		for i := range 11 {
+			wrappedKeys[fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)] = "k"
+		}
+
+		withRenamedTable(t, ts, "dm_channel_keys", func() {
+			w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
+				keyWrappedKeys: wrappedKeys,
+			}, testhelpers.AuthHeaders(user1.AccessToken))
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Contains(t, w.Body.String(), "Too many wrapped keys")
+		})
+	})
 }
 
 // queryDMKeyVersion returns the key_version of the row in dm_channel_keys for

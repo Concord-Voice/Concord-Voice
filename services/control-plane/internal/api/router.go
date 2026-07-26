@@ -1672,9 +1672,12 @@ func NewRouter(
 					channelsHandler.RequestRewrap,
 				)
 
-				// Validate cached key epochs on reconnect (pull-based catch-up for missed revocations)
+				// Validate cached key epochs on reconnect (pull-based catch-up for missed revocations).
+				// Desktop sends sequential 500-entry batches, so permit up to 30,000
+				// bounded entries per user per minute rather than stopping a large
+				// reconnect reconciliation after its first ten requests.
 				e2eeRoutes.POST("/validate-epochs",
-					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
+					middleware.RateLimitByUser(redis, 60, 1*time.Minute),
 					channelsHandler.ValidateEpochs,
 				)
 			}

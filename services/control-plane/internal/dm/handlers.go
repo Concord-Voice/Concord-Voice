@@ -68,6 +68,10 @@ const (
 	errMsgTargetNotParticipant       = "Target is not a participant"
 	errMsgCannotUnmuteWhileDeafened  = "Cannot unmute while server-deafened — remove deafen first"
 	errMsgFailedDistributeKeys       = "Failed to distribute keys"
+	maxDMWrappedKeys                 = 10
+	maxDMWrappedKeysRequestBytes     = 16 * 1_024
+	errMsgRequestBodyTooLarge        = "Request body too large"
+	errMsgTooManyWrappedKeys         = "Too many wrapped keys"
 )
 
 // dm_privacy_level enum values (matches migration 000032_dm_privacy_level.up.sql).
@@ -1472,8 +1476,24 @@ func (h *Handler) DistributeKeys(c *gin.Context) {
 	}
 
 	var req DistributeKeysRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxDMWrappedKeysRequestBytes)
+	if err := c.ShouldBindBodyWithJSON(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": errMsgRequestBodyTooLarge})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return
+	}
+	body, ok := c.Get(gin.BodyBytesKey)
+	bodyBytes, bodyIsBytes := body.([]byte)
+	if !ok || !bodyIsBytes || !json.Valid(bodyBytes) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return
+	}
+	if len(req.WrappedKeys) > maxDMWrappedKeys {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTooManyWrappedKeys})
 		return
 	}
 

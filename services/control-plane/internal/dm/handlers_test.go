@@ -1720,6 +1720,113 @@ func TestDistributeKeys_Success(t *testing.T) {
 	assert.Equal(t, float64(2), body["distributed"])
 }
 
+func TestDistributeKeys_AcceptsTrailingJSONWhitespace(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "distkeyspace1")
+	user2 := ts.CreateTestUser(t, "distkeyspace2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	document := fmt.Sprintf(`{"wrapped_keys":{%q:%q}}`, user2.ID, testhelpers.ValidCiphertext())
+	req := httptest.NewRequest(
+		http.MethodPost,
+		pathDMConversationsPrefix+convID+"/keys",
+		strings.NewReader(document+" \n\t"),
+	)
+	req.Header = testhelpers.AuthHeaders(user1.AccessToken)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	ts.Router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, float64(1), body["distributed"])
+}
+
+func TestDistributeKeys_RejectsBodyOver16KiB(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "distkeysize1")
+	user2 := ts.CreateTestUser(t, "distkeysize2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
+		"wrapped_keys": map[string]string{
+			user2.ID: strings.Repeat("x", 16*1024),
+		},
+	}, testhelpers.AuthHeaders(user1.AccessToken))
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+	assert.Contains(t, w.Body.String(), "Request body too large")
+}
+
+func TestDistributeKeys_RejectsTrailingJSONBeforeDatabaseFanout(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "distkeytrail1")
+	user2 := ts.CreateTestUser(t, "distkeytrail2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	_, err := ts.DB.Exec("ALTER TABLE dm_participants RENAME TO dm_participants_trailing_body_test")
+	require.NoError(t, err)
+	defer func() {
+		if _, revertErr := ts.DB.Exec("ALTER TABLE dm_participants_trailing_body_test RENAME TO dm_participants"); revertErr != nil {
+			t.Errorf("testhelpers: failed to revert dm_participants rename: %v", revertErr)
+		}
+	}()
+
+	document := fmt.Sprintf(`{"wrapped_keys":{%q:%q}}`, user2.ID, testhelpers.ValidCiphertext())
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantError  string
+	}{
+		{"OversizedChunkedBody", document + `{}` + strings.Repeat(" ", 16*1024), http.StatusRequestEntityTooLarge, "Request body too large"},
+		{"SecondDocument", document + `{}`, http.StatusBadRequest, "Invalid request body"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, pathDMConversationsPrefix+convID+"/keys", strings.NewReader(test.body))
+			req.ContentLength = -1
+			req.TransferEncoding = []string{"chunked"}
+			req.Header = testhelpers.AuthHeaders(user1.AccessToken)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			ts.Router.ServeHTTP(w, req)
+
+			assert.Equal(t, test.wantStatus, w.Code)
+			assert.JSONEq(t, fmt.Sprintf(`{"error":%q}`, test.wantError), w.Body.String())
+		})
+	}
+}
+
+func TestDistributeKeys_RejectsMoreThan10WrappedKeysBeforeDatabaseFanout(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "distkeycap1")
+	user2 := ts.CreateTestUser(t, "distkeycap2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+	wrappedKeys := make(map[string]string, 11)
+	for i := range 11 {
+		wrappedKeys[fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)] = "k"
+	}
+
+	_, err := ts.DB.Exec("ALTER TABLE dm_participants RENAME TO dm_participants_limit_test")
+	require.NoError(t, err)
+	defer func() {
+		if _, revertErr := ts.DB.Exec("ALTER TABLE dm_participants_limit_test RENAME TO dm_participants"); revertErr != nil {
+			t.Errorf("testhelpers: failed to revert dm_participants rename: %v", revertErr)
+		}
+	}()
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
+		"wrapped_keys": wrappedKeys,
+	}, testhelpers.AuthHeaders(user1.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "Too many wrapped keys")
+}
+
 func TestDistributeKeys_WithExplicitVersion(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "distkeyver1")

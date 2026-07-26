@@ -19,12 +19,19 @@ import { useChannelStore } from '../stores/channelStore';
 import { getWebSocketService, ConnectionState } from '../services/websocketService';
 import { e2eeService } from '../services/e2eeService';
 import { apiFetch, safeJson } from '../services/apiClient';
+import {
+  captureRuntimeServerSelection,
+  runtimeServerSelectionIsCurrent,
+} from '../services/runtimeServerBase';
 import { useConnectionRecovery } from './useConnectionRecovery';
 import { useWebSocketMessages } from './useWebSocketMessages';
+
+const maxEpochsPerValidationRequest = 500;
 
 export function useWebSocket() {
   const accessToken = useAuthStore((state) => state.accessToken);
   const wsService = useRef(getWebSocketService()).current;
+  const epochValidationGenerationRef = useRef(0);
 
   const setConnectionStatus = useChatStore((s) => s.setConnectionStatus);
 
@@ -33,56 +40,84 @@ export function useWebSocket() {
    * Sends current cached epochs to the server and processes any revocations.
    */
   const validateEpochsOnReconnect = useCallback(async () => {
+    const validationGeneration = ++epochValidationGenerationRef.current;
     // Build epochs map from cached channel keys
     const epochs: Record<string, number> = {};
-    // Only validate channels we're subscribed to (active channels)
-    const channels = useChannelStore.getState().channels;
-    for (const ch of channels) {
-      const version = e2eeService.getCurrentKeyVersion(ch.id);
+    // Validate all known channel IDs, including cached channels from servers
+    // that are not currently rendered after a server switch.
+    const channelIds = new Set(Object.values(useChannelStore.getState().channelIdsByServer).flat());
+    for (const channelId of channelIds) {
+      const version = e2eeService.getCurrentKeyVersion(channelId);
       if (version > 0) {
-        epochs[ch.id] = version;
+        epochs[channelId] = version;
       }
     }
 
     if (Object.keys(epochs).length === 0) return;
 
-    const res = await apiFetch('/api/v1/e2ee/validate-epochs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ epochs }),
-    });
-
-    if (!res.ok) return;
-    const data = await safeJson<{
-      revocations?: Array<{
-        channel_id: string;
-        revoked_epoch: number;
-        successor_epoch: number;
-        reason?: string;
-      }>;
-    }>(res);
-    const revocations = data.revocations || [];
-
-    for (const rev of revocations) {
-      console.debug(
-        '[WebSocket] Stale epoch detected:',
-        rev.channel_id,
-        'revoked:',
-        rev.revoked_epoch,
-        '→',
-        rev.successor_epoch
+    const serverSelection = captureRuntimeServerSelection();
+    const authGeneration = useAuthStore.getState().authGeneration;
+    const validationIsCurrent = () =>
+      e2eeService.isInitialized &&
+      epochValidationGenerationRef.current === validationGeneration &&
+      useAuthStore.getState().authGeneration === authGeneration &&
+      runtimeServerSelectionIsCurrent(serverSelection);
+    const epochEntries = Object.entries(epochs);
+    for (let start = 0; start < epochEntries.length; start += maxEpochsPerValidationRequest) {
+      if (!validationIsCurrent()) return;
+      const epochsBatch = Object.fromEntries(
+        epochEntries.slice(start, start + maxEpochsPerValidationRequest)
       );
-      e2eeService.invalidateChannelKey(rev.channel_id);
+      const res = await apiFetch('/api/v1/e2ee/validate-epochs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ epochs: epochsBatch }),
+      });
 
-      // Trigger rotation coordinator
-      globalThis.dispatchEvent(
-        new CustomEvent('e2ee-key-rotation', {
-          detail: {
-            channelId: rev.channel_id,
-            newEpoch: rev.successor_epoch,
-            reason: rev.reason,
-          },
-        })
+      if (!validationIsCurrent()) return;
+      if (!res.ok) {
+        console.debug('[WebSocket] Epoch validation batch failed:', res.status);
+        return;
+      }
+      const data = await safeJson<{
+        revocations?: Array<{
+          channel_id: string;
+          revoked_epoch: number;
+          successor_epoch: number;
+          reason?: string;
+        }>;
+        access_lost?: string[];
+      }>(res);
+      if (!validationIsCurrent()) return;
+      const revocations = data.revocations || [];
+
+      for (const rev of revocations) {
+        console.debug(
+          '[WebSocket] Stale epoch detected:',
+          rev.channel_id,
+          'revoked:',
+          rev.revoked_epoch,
+          '→',
+          rev.successor_epoch
+        );
+        e2eeService.invalidateChannelKey(rev.channel_id);
+
+        // Trigger rotation coordinator
+        globalThis.dispatchEvent(
+          new CustomEvent('e2ee-key-rotation', {
+            detail: {
+              channelId: rev.channel_id,
+              newEpoch: rev.successor_epoch,
+              reason: rev.reason,
+            },
+          })
+        );
+      }
+
+      // The server returns inaccessible and unknown submitted UUIDs alike,
+      // allowing this client-side purge without creating a channel oracle.
+      (data.access_lost || []).forEach((channelId) =>
+        useChannelStore.getState().removeChannel(channelId)
       );
     }
   }, []);
@@ -104,10 +139,15 @@ export function useWebSocket() {
       }
     }
 
-    const channel = useChannelStore.getState().channels.find((c) => c.id === channelId);
-    if (!channel) return;
+    const channelState = useChannelStore.getState();
+    const serverId =
+      channelState.channels.find((channel) => channel.id === channelId)?.server_id ??
+      Object.entries(channelState.channelIdsByServer).find(([, channelIds]) =>
+        channelIds.includes(channelId)
+      )?.[0];
+    if (!serverId) return;
 
-    const membersRes = await apiFetch(`/api/v1/servers/${channel.server_id}/members`);
+    const membersRes = await apiFetch(`/api/v1/servers/${serverId}/members`);
     if (!membersRes.ok) return;
     const membersData = await safeJson<{ members?: Array<{ user_id: string }> }>(membersRes);
     const members = membersData.members || [];

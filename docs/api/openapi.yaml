@@ -2068,7 +2068,10 @@ paths:
       summary: Create a channel
       description: 'Create a channel in a server. Requires owner or admin role.
 
-        For encrypted channels, provide wrapped_keys mapping user IDs to wrapped CSKs.
+        All channels are E2EE and require a non-empty `wrapped_keys` map from user IDs
+        to wrapped CSKs.
+        `wrapped_keys` and `wrapped_key_versions` each accept at most 500 entries.
+        The request body must not exceed 512 KiB.
 
         Rate limit: 10 requests per minute.
 
@@ -2092,13 +2095,28 @@ paths:
                   channel:
                     $ref: '#/components/schemas/Channel'
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: Invalid request body, including a missing or empty `wrapped_keys` map. If either
+            wrapped-key map exceeds 500 entries, the error is `Too many wrapped keys`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Too many wrapped keys
         '403':
           description: Insufficient permissions
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '413':
+          description: Request body exceeds 512 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Request body too large
   /channels/{id}:
     get:
       tags:
@@ -2228,7 +2246,8 @@ paths:
       description: 'Distribute wrapped CSKs to new members. The caller must already have a key for this
         channel.
 
-        First-response-wins on duplicates.
+        First-response-wins on duplicates. `wrapped_keys` and `wrapped_key_versions`
+        each accept at most 500 entries. The request body must not exceed 512 KiB.
 
         Rate limit: 10 requests per minute.
 
@@ -2255,6 +2274,24 @@ paths:
                     type: integer
                   duplicates:
                     type: integer
+        '400':
+          description: Invalid channel UUID or request body. An invalid path identifier returns `Invalid
+            channel ID`; if either wrapped-key map exceeds 500 entries, the error is `Too many wrapped
+            keys`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Too many wrapped keys
+        '413':
+          description: Request body exceeds 512 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Request body too large
   /channels/{id}/messages:
     delete:
       tags:
@@ -3407,7 +3444,8 @@ paths:
       tags:
       - DM
       summary: Distribute DM encryption keys
-      description: 'Distribute wrapped E2EE keys to DM conversation participants.
+      description: 'Distribute wrapped E2EE keys to DM conversation participants. `wrapped_keys`
+        accepts at most 10 entries. The request body must not exceed 16 KiB.
 
         Rate limit: 10 requests per minute (user-based).
 
@@ -3433,6 +3471,7 @@ paths:
               properties:
                 wrapped_keys:
                   type: object
+                  maxProperties: 10
                   additionalProperties:
                     type: string
                   description: Map of user_id → base64-encoded wrapped key
@@ -3449,17 +3488,28 @@ paths:
                   distributed:
                     type: integer
         '400':
-          description: Invalid conversation ID or request body
+          description: Invalid conversation ID or request body. If `wrapped_keys` exceeds 10 entries,
+            the error is `Too many wrapped keys`.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+              example:
+                error: Too many wrapped keys
         '403':
           description: Not a participant
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '413':
+          description: Request body exceeds 16 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Request body too large
   /dm/conversations/{id}/members:
     post:
       tags:
@@ -4919,6 +4969,9 @@ paths:
       - E2EE
       summary: Distribute keys for a context
       description: 'Distribute wrapped E2EE keys to members of a channel or DM conversation.
+        Channel contexts accept at most 500 entries in each wrapped-key map and a
+        512 KiB request body. DM contexts accept at most 10 entries in each map and
+        a 16 KiB request body.
 
         Rate limit: 10 requests per minute (user-based).
 
@@ -4943,9 +4996,18 @@ paths:
               properties:
                 wrapped_keys:
                   type: object
+                  maxProperties: 500
                   additionalProperties:
                     type: string
-                  description: Map of user_id → base64-encoded wrapped key
+                  description: Map of user_id → base64-encoded wrapped key; limited to 500 entries
+                    for channels and 10 for DMs
+                wrapped_key_versions:
+                  type: object
+                  maxProperties: 500
+                  additionalProperties:
+                    type: integer
+                  description: Map of user_id → recipient public-key version; limited to 500 entries
+                    for channels and 10 for DMs
                 key_version:
                   type: integer
                   nullable: true
@@ -4959,6 +5021,24 @@ paths:
                 properties:
                   distributed:
                     type: integer
+        '400':
+          description: Invalid context UUID or request body. An invalid path identifier returns `Invalid
+            context ID`; if either wrapped-key map exceeds the context limit, the error is `Too many
+            wrapped keys`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Too many wrapped keys
+        '413':
+          description: Request body exceeds 512 KiB for a channel context or 16 KiB for a DM context
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Request body too large
   /e2ee/keys/{context_id}/rewrap:
     post:
       tags:
@@ -5048,11 +5128,12 @@ paths:
       tags:
       - E2EE
       summary: Validate key epochs
-      description: 'Validate that the client''s key versions (epochs) for channels and DMs
+      description: 'Validate the client''s cached channel key versions (epochs). Returns
+        matching channel revocations and submitted IDs whose local access should be purged.
+        `epochs` accepts at most 500 entries, and the
+        request body must not exceed 32 KiB.
 
-        are current. Returns validity status and any revocations.
-
-        Rate limit: 10 requests per minute (user-based).
+        Rate limit: 60 requests per minute (user-based).
 
         '
       security:
@@ -5068,9 +5149,10 @@ paths:
               properties:
                 epochs:
                   type: object
+                  maxProperties: 500
                   additionalProperties:
                     type: integer
-                  description: Map of context_id → key_version
+                  description: Map of channel_id → key_version
       responses:
         '200':
           description: Epoch validation results
@@ -5079,23 +5161,43 @@ paths:
               schema:
                 type: object
                 properties:
-                  valid:
-                    type: object
-                    additionalProperties:
-                      type: boolean
-                    description: Map of context_id → is_valid
                   revocations:
                     type: array
                     items:
                       type: object
                       properties:
-                        context_id:
+                        channel_id:
                           type: string
                           format: uuid
                         revoked_epoch:
                           type: integer
                         successor_epoch:
                           type: integer
+                        reason:
+                          type: string
+                  access_lost:
+                    type: array
+                    description: Submitted channel IDs that are no longer accessible. Unknown and inaccessible IDs are returned identically to avoid an existence oracle.
+                    items:
+                      type: string
+                      format: uuid
+        '400':
+          description: Invalid request body. If `epochs` exceeds 500 entries, the error is `Too many
+            epochs`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Too many epochs
+        '413':
+          description: Request body exceeds 32 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Request body too large
   /entitlements:
     get:
       tags:
@@ -14537,6 +14639,7 @@ components:
       - server_id
       - name
       - type
+      - wrapped_keys
       properties:
         server_id:
           type: string
@@ -14556,10 +14659,18 @@ components:
           nullable: true
         wrapped_keys:
           type: object
+          minProperties: 1
+          maxProperties: 500
           additionalProperties:
             type: string
           description: 'Map of user_id → base64 wrapped CSK (required for all channels — every channel
             is E2EE under the E2EE-everywhere posture, #201)'
+        wrapped_key_versions:
+          type: object
+          maxProperties: 500
+          additionalProperties:
+            type: integer
+          description: Map of user_id → recipient public-key version used to wrap the CSK
     PurgeMessagesRequest:
       type: object
       description: Bulk message-purge parameters for server-channel contexts (#1352).
@@ -14668,9 +14779,21 @@ components:
       properties:
         wrapped_keys:
           type: object
+          maxProperties: 500
           additionalProperties:
             type: string
           description: Map of user_id → base64 wrapped CSK
+        wrapped_key_versions:
+          type: object
+          maxProperties: 500
+          additionalProperties:
+            type: integer
+          description: Map of user_id → recipient public-key version used to wrap the CSK
+        key_version:
+          type: integer
+          nullable: true
+          description: Optional explicit key epoch. Positive values are used directly; omitted, null,
+            zero, or negative values use the channel's current maximum epoch.
     SendMessageRequest:
       type: object
       required:

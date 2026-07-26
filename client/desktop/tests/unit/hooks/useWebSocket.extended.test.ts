@@ -5,10 +5,15 @@
  * this focuses on the E2EE reconnect logic and rotation coordinator.
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { renderHook, act } from '@testing-library/react';
+import { renderHook, act, waitFor } from '@testing-library/react';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useChannelStore } from '@/renderer/stores/channelStore';
 import { useChatStore } from '@/renderer/stores/chatStore';
+import { useConnectionStore } from '@/renderer/stores/connectionStore';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/runtimeServerBase';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // Capture registered handlers so we can invoke them in tests
@@ -99,7 +104,67 @@ vi.mock('@/renderer/services/apiClient', () => ({
 
 import { useWebSocket } from '@/renderer/hooks/useWebSocket';
 
-beforeEach(() => {
+interface EpochRevocation {
+  channel_id: string;
+  revoked_epoch: number;
+  successor_epoch: number;
+  reason?: string;
+}
+
+function seedEpochChannels(count: number) {
+  const channels = Array.from({ length: count }, (_, index) => ({
+    id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    server_id: 'server-1',
+    name: `channel-${index}`,
+    type: 'text' as const,
+    position: index,
+    created_at: '',
+    updated_at: '',
+  }));
+  const epochs = new Map(channels.map((channel, index) => [channel.id, index + 1]));
+
+  useChannelStore.setState({
+    channels,
+    channelIdsByServer: { 'server-1': channels.map((channel) => channel.id) },
+  });
+  mockGetCurrentKeyVersion.mockImplementation((channelId: string) => epochs.get(channelId) ?? 0);
+
+  return channels;
+}
+
+function successfulEpochResponse(revocations: EpochRevocation[] = [], accessLost: string[] = []) {
+  return {
+    ok: true,
+    json: () => Promise.resolve({ revocations, access_lost: accessLost }),
+  };
+}
+
+function defaultApiResponse() {
+  return {
+    ok: true,
+    json: () => Promise.resolve({ participants: [] }),
+  };
+}
+
+function epochValidationCalls() {
+  return mockApiFetch.mock.calls.filter(([path]) => path === '/api/v1/e2ee/validate-epochs');
+}
+
+function epochsFromRequest(index: number): Record<string, number> {
+  const options = epochValidationCalls()[index]?.[1] as RequestInit | undefined;
+  if (!options) throw new Error(`Missing validate-epochs request ${index}`);
+  return (JSON.parse(String(options.body)) as { epochs: Record<string, number> }).epochs;
+}
+
+function triggerEpochValidation() {
+  useConnectionStore.getState().startGracePeriod();
+  act(() => {
+    fireConnectionChange('connected');
+  });
+}
+
+beforeEach(async () => {
+  resetRuntimeServerBase();
   resetAllStores();
   registeredHandlers.clear();
   connectionChangeHandlers = [];
@@ -108,13 +173,16 @@ beforeEach(() => {
   // overrides — tests that mutate getState.mockReturnValue would leak that
   // value into subsequent tests. Reset to the documented default here.
   mockWsService.getState.mockReturnValue('disconnected');
-  mockApiFetch.mockResolvedValue({
-    ok: true,
-    json: () => Promise.resolve({ participants: [] }),
-  });
+  mockGetCurrentKeyVersion.mockReset();
+  mockGetCurrentKeyVersion.mockReturnValue(0);
+  mockApiFetch.mockReset();
+  mockApiFetch.mockResolvedValue(defaultApiResponse());
+  const { e2eeService } = await import('@/renderer/services/e2eeService');
+  (e2eeService as unknown as { isInitialized: boolean }).isInitialized = false;
 });
 
 afterEach(() => {
+  resetRuntimeServerBase();
   vi.restoreAllMocks();
 });
 
@@ -217,6 +285,358 @@ describe('useWebSocket — extended', () => {
       expect(mockWsService.updateToken).toHaveBeenCalledWith('token-2');
       expect(mockWsService.connect).not.toHaveBeenCalled();
       expect(mockWsService.disconnect).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('epoch validation batching', () => {
+    async function renderInitializedHook() {
+      useAuthStore.getState().setAccessToken('test-token');
+      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
+      return renderHook(() => useWebSocket());
+    }
+
+    it('skips validation when no cached channel has an epoch', async () => {
+      seedEpochChannels(0);
+      const hook = await renderInitializedHook();
+
+      triggerEpochValidation();
+
+      await Promise.resolve();
+      expect(epochValidationCalls()).toHaveLength(0);
+      hook.unmount();
+    });
+
+    it('sends 500 cached epochs in one request', async () => {
+      const channels = seedEpochChannels(500);
+      mockApiFetch.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === '/api/v1/e2ee/validate-epochs' ? successfulEpochResponse() : defaultApiResponse()
+        )
+      );
+      const hook = await renderInitializedHook();
+
+      triggerEpochValidation();
+
+      await waitFor(() => expect(epochValidationCalls()).toHaveLength(1));
+      const epochs = epochsFromRequest(0);
+      expect(Object.keys(epochs)).toHaveLength(500);
+      expect(epochs[channels[0].id]).toBe(1);
+      expect(epochs[channels[499].id]).toBe(500);
+      hook.unmount();
+    });
+
+    it('purges a cached key after missed channel-access revocation', async () => {
+      const [channel] = seedEpochChannels(1);
+      mockApiFetch.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === '/api/v1/e2ee/validate-epochs'
+            ? successfulEpochResponse([], [channel.id])
+            : defaultApiResponse()
+        )
+      );
+      const hook = await renderInitializedHook();
+
+      triggerEpochValidation();
+
+      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      await waitFor(() => {
+        expect(useChannelStore.getState().channels).toEqual([]);
+        expect(e2eeService.revokeChannelAccess).toHaveBeenCalledWith(channel.id);
+      });
+      hook.unmount();
+    });
+
+    it('validates and purges a cached channel outside the active server', async () => {
+      const [activeChannel] = seedEpochChannels(1);
+      const cachedChannelId = '00000000-0000-4000-8000-000000000001';
+      useChannelStore.setState({
+        channelIdsByServer: {
+          'server-1': [activeChannel.id],
+          'server-2': [cachedChannelId],
+        },
+      });
+      mockGetCurrentKeyVersion.mockReturnValue(1);
+      mockApiFetch.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === '/api/v1/e2ee/validate-epochs'
+            ? successfulEpochResponse([], [cachedChannelId])
+            : defaultApiResponse()
+        )
+      );
+      const hook = await renderInitializedHook();
+      const { e2eeService } = await import('@/renderer/services/e2eeService');
+
+      triggerEpochValidation();
+
+      await waitFor(() => {
+        expect(epochsFromRequest(0)).toEqual({ [activeChannel.id]: 1, [cachedChannelId]: 1 });
+        expect(useChannelStore.getState().channelIdsByServer['server-2']).toEqual([]);
+        expect(e2eeService.revokeChannelAccess).toHaveBeenCalledWith(cachedChannelId);
+      });
+      hook.unmount();
+    });
+
+    it('rotates a cached channel outside the active server after a missed revocation', async () => {
+      const [activeChannel] = seedEpochChannels(1);
+      const cachedChannelId = '00000000-0000-4000-8000-000000000001';
+      useChannelStore.setState({
+        channelIdsByServer: {
+          'server-1': [activeChannel.id],
+          'server-2': [cachedChannelId],
+        },
+      });
+      mockGetCurrentKeyVersion.mockReturnValue(1);
+      mockApiFetch.mockImplementation((path: string) => {
+        if (path === '/api/v1/e2ee/validate-epochs') {
+          return Promise.resolve(
+            successfulEpochResponse([
+              { channel_id: cachedChannelId, revoked_epoch: 1, successor_epoch: 2 },
+            ])
+          );
+        }
+        if (path === `/api/v1/e2ee/keys/${cachedChannelId}`) {
+          return Promise.resolve({ ok: false, json: () => Promise.resolve({}) });
+        }
+        if (path === '/api/v1/servers/server-2/members') {
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ members: [{ user_id: 'user-1' }] }),
+          });
+        }
+        if (path === '/api/v1/users/user-1/public-key') {
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ public_key: 'mock-pk-1' }),
+          });
+        }
+        return Promise.resolve(defaultApiResponse());
+      });
+      const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+      const hook = await renderInitializedHook();
+
+      try {
+        triggerEpochValidation();
+
+        await waitFor(() => {
+          expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/servers/server-2/members');
+          expect(mockRotateChannelKey).toHaveBeenCalledWith(
+            cachedChannelId,
+            2,
+            new Map([['user-1', 'mock-pk-1']])
+          );
+        });
+      } finally {
+        random.mockRestore();
+        hook.unmount();
+      }
+    });
+
+    it('waits for each response and processes revocations from both batches', async () => {
+      const channels = seedEpochChannels(501);
+      let resolveFirst:
+        ((response: ReturnType<typeof successfulEpochResponse>) => void) | undefined;
+      const firstResponse = new Promise<ReturnType<typeof successfulEpochResponse>>((resolve) => {
+        resolveFirst = resolve;
+      });
+      let epochRequest = 0;
+      mockApiFetch.mockImplementation((path: string) => {
+        if (path !== '/api/v1/e2ee/validate-epochs') {
+          return Promise.resolve(defaultApiResponse());
+        }
+        epochRequest += 1;
+        if (epochRequest === 1) return firstResponse;
+        return Promise.resolve(
+          successfulEpochResponse([
+            { channel_id: 'revoked-b', revoked_epoch: 2, successor_epoch: 3 },
+          ])
+        );
+      });
+      const hook = await renderInitializedHook();
+      const rotations: Array<{ channelId: string; newEpoch: number }> = [];
+      const captureRotation = (event: Event) => {
+        const detail = (event as CustomEvent<{ channelId: string; newEpoch: number }>).detail;
+        rotations.push({ channelId: detail.channelId, newEpoch: detail.newEpoch });
+      };
+      globalThis.addEventListener('e2ee-key-rotation', captureRotation);
+
+      try {
+        triggerEpochValidation();
+        expect(epochValidationCalls()).toHaveLength(1);
+        const firstEpochs = epochsFromRequest(0);
+        const expectedFirstEpochs = Object.fromEntries(
+          channels.slice(0, 500).map((channel, index) => [channel.id, index + 1])
+        );
+        expect(firstEpochs).toEqual(expectedFirstEpochs);
+
+        resolveFirst?.(
+          successfulEpochResponse([
+            { channel_id: 'revoked-a', revoked_epoch: 1, successor_epoch: 2 },
+          ])
+        );
+
+        await waitFor(() => expect(epochValidationCalls()).toHaveLength(2));
+        expect(epochsFromRequest(1)).toEqual({ [channels[500].id]: 501 });
+        await waitFor(() => {
+          expect(mockInvalidateChannelKey).toHaveBeenCalledTimes(2);
+          expect(mockInvalidateChannelKey).toHaveBeenNthCalledWith(1, 'revoked-a');
+          expect(mockInvalidateChannelKey).toHaveBeenNthCalledWith(2, 'revoked-b');
+          expect(rotations).toEqual([
+            { channelId: 'revoked-a', newEpoch: 2 },
+            { channelId: 'revoked-b', newEpoch: 3 },
+          ]);
+        });
+      } finally {
+        globalThis.removeEventListener('e2ee-key-rotation', captureRotation);
+        hook.unmount();
+      }
+    });
+
+    it('supersedes an in-flight validation after a newer reconnect', async () => {
+      seedEpochChannels(501);
+      let resolveFirst:
+        ((response: ReturnType<typeof successfulEpochResponse>) => void) | undefined;
+      let resolveSecond:
+        ((response: ReturnType<typeof successfulEpochResponse>) => void) | undefined;
+      const firstResponse = new Promise<ReturnType<typeof successfulEpochResponse>>((resolve) => {
+        resolveFirst = resolve;
+      });
+      const secondResponse = new Promise<ReturnType<typeof successfulEpochResponse>>((resolve) => {
+        resolveSecond = resolve;
+      });
+      let requestCount = 0;
+      mockApiFetch.mockImplementation((path: string) => {
+        if (path !== '/api/v1/e2ee/validate-epochs') {
+          return Promise.resolve(defaultApiResponse());
+        }
+        requestCount += 1;
+        return requestCount === 1 ? firstResponse : secondResponse;
+      });
+      const hook = await renderInitializedHook();
+
+      triggerEpochValidation();
+      await waitFor(() => expect(epochValidationCalls()).toHaveLength(1));
+      triggerEpochValidation();
+      await waitFor(() => expect(epochValidationCalls()).toHaveLength(2));
+
+      await act(async () => {
+        resolveFirst?.(
+          successfulEpochResponse([
+            { channel_id: 'stale-revocation', revoked_epoch: 1, successor_epoch: 2 },
+          ])
+        );
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(mockInvalidateChannelKey).not.toHaveBeenCalled();
+      expect(epochValidationCalls()).toHaveLength(2);
+      resolveSecond?.(successfulEpochResponse());
+      hook.unmount();
+    });
+
+    it('drops a pending batch when the runtime server selection changes', async () => {
+      seedEpochChannels(501);
+      let resolveFirst:
+        ((response: ReturnType<typeof successfulEpochResponse>) => void) | undefined;
+      const firstResponse = new Promise<ReturnType<typeof successfulEpochResponse>>((resolve) => {
+        resolveFirst = resolve;
+      });
+      let epochRequest = 0;
+      mockApiFetch.mockImplementation((path: string) => {
+        if (path !== '/api/v1/e2ee/validate-epochs') {
+          return Promise.resolve(defaultApiResponse());
+        }
+        epochRequest += 1;
+        return epochRequest === 1 ? firstResponse : Promise.resolve(successfulEpochResponse());
+      });
+      const hook = await renderInitializedHook();
+      const rotations: Array<{ channelId: string; newEpoch: number }> = [];
+      const captureRotation = (event: Event) => {
+        const detail = (event as CustomEvent<{ channelId: string; newEpoch: number }>).detail;
+        rotations.push({ channelId: detail.channelId, newEpoch: detail.newEpoch });
+      };
+      globalThis.addEventListener('e2ee-key-rotation', captureRotation);
+
+      try {
+        triggerEpochValidation();
+        expect(epochValidationCalls()).toHaveLength(1);
+        setRuntimeServerBase('https://successor-session.example');
+
+        await act(async () => {
+          resolveFirst?.(
+            successfulEpochResponse([
+              { channel_id: 'stale-revocation', revoked_epoch: 1, successor_epoch: 2 },
+            ])
+          );
+          await Promise.resolve();
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+
+        expect.soft(mockInvalidateChannelKey).not.toHaveBeenCalled();
+        expect.soft(rotations).toEqual([]);
+        expect.soft(epochValidationCalls()).toHaveLength(1);
+      } finally {
+        globalThis.removeEventListener('e2ee-key-rotation', captureRotation);
+        hook.unmount();
+      }
+    });
+
+    it('drops a pending batch when the auth generation changes', async () => {
+      seedEpochChannels(501);
+      let resolveFirst:
+        ((response: ReturnType<typeof successfulEpochResponse>) => void) | undefined;
+      const firstResponse = new Promise<ReturnType<typeof successfulEpochResponse>>((resolve) => {
+        resolveFirst = resolve;
+      });
+      mockApiFetch.mockImplementation((path: string) =>
+        path === '/api/v1/e2ee/validate-epochs'
+          ? firstResponse
+          : Promise.resolve(defaultApiResponse())
+      );
+      const hook = await renderInitializedHook();
+
+      triggerEpochValidation();
+      expect(epochValidationCalls()).toHaveLength(1);
+      useAuthStore.getState().setAccessToken('successor-token');
+
+      await act(async () => {
+        resolveFirst?.(
+          successfulEpochResponse([
+            { channel_id: 'stale-revocation', revoked_epoch: 1, successor_epoch: 2 },
+          ])
+        );
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(mockInvalidateChannelKey).not.toHaveBeenCalled();
+      expect(epochValidationCalls()).toHaveLength(1);
+      hook.unmount();
+    });
+
+    it('stops after a non-OK first batch response', async () => {
+      seedEpochChannels(501);
+      mockApiFetch.mockImplementation((path: string) => {
+        if (path !== '/api/v1/e2ee/validate-epochs') {
+          return Promise.resolve(defaultApiResponse());
+        }
+        return Promise.resolve({
+          ok: false,
+          json: () => Promise.resolve({ error: 'validation failed' }),
+        });
+      });
+      const hook = await renderInitializedHook();
+
+      triggerEpochValidation();
+
+      await waitFor(() => expect(epochValidationCalls()).toHaveLength(1));
+      expect(Object.keys(epochsFromRequest(0))).toHaveLength(500);
+      await Promise.resolve();
+      expect(epochValidationCalls()).toHaveLength(1);
+      expect(mockInvalidateChannelKey).not.toHaveBeenCalled();
+      hook.unmount();
     });
   });
 

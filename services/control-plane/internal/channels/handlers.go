@@ -4,6 +4,7 @@ package channels
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -25,28 +26,37 @@ import (
 )
 
 const (
-	errMsgInvalidServerID         = "Invalid server ID"
-	errMsgInvalidChannelID        = "Invalid channel ID"
-	errMsgInvalidRequestBody      = "Invalid request body"
-	errMsgInsufficientPerms       = "insufficient permissions"
-	errMsgForeignGroup            = "group_id does not belong to this server"
-	errMsgNotMemberOfServer       = "Not a member of this server"
-	errMsgChannelNotFound         = "Channel not found"
-	errMsgChannelNotFoundOrDenied = "Channel not found or access denied"
-	errMsgFailedFetchChannel      = "Failed to fetch channel"
-	errMsgFailedFetchChannels     = "Failed to fetch channels"
-	errMsgFailedCreateChannel     = "Failed to create channel"
-	errMsgFailedUpdateChannel     = "Failed to update channel"
-	errMsgFailedDeleteChannel     = "Failed to delete channel"
-	errMsgFailedCheckMembership   = "Failed to check membership"
-	errMsgFailedFetchKeys         = "Failed to fetch keys"
-	errMsgFailedFetchUnreadCounts = "Failed to fetch unread counts"
-	errMsgFailedMarkServerRead    = "Failed to mark server read"
-	errMsgFailedMarkChannelRead   = "Failed to mark channel read"
-	errMsgFailedResolveVisible    = "Failed to resolve visible channels"
-	errMsgFailedFetchServerUnread = "Failed to fetch server unread status"
-	errMsgNoEncryptionKey         = "No encryption key available yet"
-	errMsgFailedDistributeKeys    = "Failed to distribute keys"
+	maxChannelWrappedKeys             = 500
+	maxChannelWrappedKeysRequestBytes = 512 * 1_024
+	maxDMWrappedKeys                  = 10
+	maxDMWrappedKeysRequestBytes      = 16 * 1_024
+	maxEpochValidationEntries         = 500
+	maxEpochValidationRequestBytes    = 32 * 1_024
+	errMsgRequestBodyTooLarge         = "Request body too large"
+	errMsgTooManyWrappedKeys          = "Too many wrapped keys"
+	errMsgTooManyEpochs               = "Too many epochs"
+	errMsgInvalidServerID             = "Invalid server ID"
+	errMsgInvalidChannelID            = "Invalid channel ID"
+	errMsgInvalidRequestBody          = "Invalid request body"
+	errMsgInsufficientPerms           = "insufficient permissions"
+	errMsgForeignGroup                = "group_id does not belong to this server"
+	errMsgNotMemberOfServer           = "Not a member of this server"
+	errMsgChannelNotFound             = "Channel not found"
+	errMsgChannelNotFoundOrDenied     = "Channel not found or access denied"
+	errMsgFailedFetchChannel          = "Failed to fetch channel"
+	errMsgFailedFetchChannels         = "Failed to fetch channels"
+	errMsgFailedCreateChannel         = "Failed to create channel"
+	errMsgFailedUpdateChannel         = "Failed to update channel"
+	errMsgFailedDeleteChannel         = "Failed to delete channel"
+	errMsgFailedCheckMembership       = "Failed to check membership"
+	errMsgFailedFetchKeys             = "Failed to fetch keys"
+	errMsgFailedFetchUnreadCounts     = "Failed to fetch unread counts"
+	errMsgFailedMarkServerRead        = "Failed to mark server read"
+	errMsgFailedMarkChannelRead       = "Failed to mark channel read"
+	errMsgFailedResolveVisible        = "Failed to resolve visible channels"
+	errMsgFailedFetchServerUnread     = "Failed to fetch server unread status"
+	errMsgNoEncryptionKey             = "No encryption key available yet"
+	errMsgFailedDistributeKeys        = "Failed to distribute keys"
 	// errMsgAuthRequired matches the middleware's generic auth-failure body so
 	// an epoch-fence rejection inside a handler is indistinguishable from the
 	// middleware's own rejection (#2201).
@@ -290,14 +300,47 @@ func (h *Handler) admitCreateChannelRequest(c *gin.Context, req CreateChannelReq
 	return true
 }
 
+// bindStrictJSONBody consumes and validates one complete, bounded JSON document.
+func bindStrictJSONBody(c *gin.Context, target any, maxBytes int64) bool {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+	if err := c.ShouldBindBodyWithJSON(target); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": errMsgRequestBodyTooLarge})
+			return false
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return false
+	}
+	body, ok := c.Get(gin.BodyBytesKey)
+	bodyBytes, bodyIsBytes := body.([]byte)
+	if !ok || !bodyIsBytes || !json.Valid(bodyBytes) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return false
+	}
+	return true
+}
+
+func (h *Handler) respondCreateChannelGuardError(c *gin.Context, guardErr error) {
+	if errors.Is(guardErr, credepoch.ErrEpochMismatch) || errors.Is(guardErr, credepoch.ErrBlocked) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
+		return
+	}
+	h.log.Error("credential-epoch guard read failed", "error", guardErr)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+}
+
 // CreateChannel creates a channel (plus a linked text channel for voice) and
 // stores the E2EE-everywhere wrapped keys inside one epoch-guarded transaction.
 func (h *Handler) CreateChannel(c *gin.Context) {
 	userID := c.GetString("user_id")
 
 	var req CreateChannelRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+	if !bindStrictJSONBody(c, &req, maxChannelWrappedKeysRequestBytes) {
+		return
+	}
+	if len(req.WrappedKeys) > maxChannelWrappedKeys || len(req.WrappedKeyVersions) > maxChannelWrappedKeys {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTooManyWrappedKeys})
 		return
 	}
 
@@ -322,16 +365,7 @@ func (h *Handler) CreateChannel(c *gin.Context) {
 	// recheck the creator's credential epoch inside the tx (covers both
 	// storeWrappedKeys and the linked-text-channel copy in this same tx).
 	if guardErr := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
-		// Discriminate an epoch-fence rejection (401) from a store/lock read
-		// error (logged 500): the request was already authenticated, so a
-		// transient DB failure is a server error, not "re-authenticate"
-		// (Codex #2397 review).
-		if errors.Is(guardErr, credepoch.ErrEpochMismatch) || errors.Is(guardErr, credepoch.ErrBlocked) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
-			return
-		}
-		h.log.Error("credential-epoch guard read failed", "error", guardErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		h.respondCreateChannelGuardError(c, guardErr)
 		return
 	}
 
@@ -1344,8 +1378,11 @@ func (h *Handler) DistributeChannelKeys(c *gin.Context) {
 	}
 
 	var req DistributeChannelKeysRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+	if !bindStrictJSONBody(c, &req, maxChannelWrappedKeysRequestBytes) {
+		return
+	}
+	if len(req.WrappedKeys) > maxChannelWrappedKeys || len(req.WrappedKeyVersions) > maxChannelWrappedKeys {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTooManyWrappedKeys})
 		return
 	}
 
@@ -2380,8 +2417,11 @@ func (h *Handler) DistributeUnifiedKeys(c *gin.Context) {
 	}
 
 	var req DistributeChannelKeysRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+	if !bindStrictJSONBody(c, &req, maxDMWrappedKeysRequestBytes) {
+		return
+	}
+	if len(req.WrappedKeys) > maxDMWrappedKeys || len(req.WrappedKeyVersions) > maxDMWrappedKeys {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTooManyWrappedKeys})
 		return
 	}
 
@@ -2601,61 +2641,74 @@ func (h *Handler) ValidateEpochs(c *gin.Context) {
 	var req struct {
 		Epochs map[string]int `json:"epochs" binding:"required"` // channel_id → current cached epoch
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+	if !bindStrictJSONBody(c, &req, maxEpochValidationRequestBytes) {
+		return
+	}
+	if len(req.Epochs) > maxEpochValidationEntries {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTooManyEpochs})
 		return
 	}
 
-	type revocationInfo struct {
-		ChannelID      string `json:"channel_id"`
-		RevokedEpoch   int    `json:"revoked_epoch"`
-		SuccessorEpoch int    `json:"successor_epoch"`
-		Reason         string `json:"reason"`
-	}
-
-	var revocations []revocationInfo
+	var revocations []epochRevocationInfo
+	accessLost := []string{}
 
 	for channelID, clientEpoch := range req.Epochs {
 		if _, parseErr := uuid.Parse(channelID); parseErr != nil {
 			continue
 		}
 
-		// Verify the user has access to this channel (member of server or DM participant)
-		var hasAccess bool
-		_ = h.db.QueryRow(
-			`SELECT EXISTS(
-				SELECT 1 FROM channels c
-				INNER JOIN server_members sm ON c.server_id = sm.server_id
-				WHERE c.id = $1 AND sm.user_id = $2
-			)`,
-			channelID, userID,
-		).Scan(&hasAccess)
-		if !hasAccess {
+		// CV-CAN-005: revocation metadata, like wrapped keys, must not reveal
+		// a hidden channel to a server member who lacks channel VIEW.
+		isMember, canView, accessErr := h.channelKeyAccess(c.Request.Context(), channelID, userID)
+		if accessErr != nil {
+			h.log.Error("Failed to check channel access for epoch validation", "error", accessErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate epochs"})
+			return
+		}
+		if !isMember || !canView {
+			// Return every inaccessible submitted UUID, including unknown IDs, so
+			// a missed channel_access_revoked event can purge the local key without
+			// revealing whether the channel exists or why access was denied.
+			accessLost = append(accessLost, channelID)
 			continue
 		}
 
-		// Check if the client's epoch has been revoked
-		var revokedEpoch, successorEpoch int
-		var reason string
-		err := h.db.QueryRow(
-			`SELECT revoked_epoch, successor_epoch, reason
-			 FROM key_revocations
-			 WHERE channel_id = $1 AND revoked_epoch = $2`,
-			channelID, clientEpoch,
-		).Scan(&revokedEpoch, &successorEpoch, &reason)
-		if err == nil {
-			revocations = append(revocations, revocationInfo{
-				ChannelID:      channelID,
-				RevokedEpoch:   revokedEpoch,
-				SuccessorEpoch: successorEpoch,
-				Reason:         reason,
-			})
+		if err := h.appendEpochRevocation(&revocations, channelID, clientEpoch); err != nil {
+			h.log.Error("Failed to check epoch revocation", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate epochs"})
+			return
 		}
 	}
 
 	if revocations == nil {
-		revocations = []revocationInfo{}
+		revocations = []epochRevocationInfo{}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"revocations": revocations})
+	c.JSON(http.StatusOK, gin.H{"revocations": revocations, "access_lost": accessLost})
+}
+
+type epochRevocationInfo struct {
+	ChannelID      string `json:"channel_id"`
+	RevokedEpoch   int    `json:"revoked_epoch"`
+	SuccessorEpoch int    `json:"successor_epoch"`
+	Reason         string `json:"reason"`
+}
+
+func (h *Handler) appendEpochRevocation(revocations *[]epochRevocationInfo, channelID string, clientEpoch int) error {
+	var revocation epochRevocationInfo
+	err := h.db.QueryRow(
+		`SELECT revoked_epoch, successor_epoch, reason
+		 FROM key_revocations
+		 WHERE channel_id = $1 AND revoked_epoch = $2`,
+		channelID, clientEpoch,
+	).Scan(&revocation.RevokedEpoch, &revocation.SuccessorEpoch, &revocation.Reason)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	revocation.ChannelID = channelID
+	*revocations = append(*revocations, revocation)
+	return nil
 }
