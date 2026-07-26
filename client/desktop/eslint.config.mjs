@@ -94,9 +94,14 @@ export default [
             'scripts/classify-playwright-results.test.ts',
             'scripts/generate-tray-icons.test.ts',
             'scripts/csp-prod-strip.ts',
+            // #2402: the Forge 7 NSIS maker. Lives in build/ (excluded from
+            // tsconfig.json's include, like forge.config.ts above) because it is
+            // build tooling, not app source — so it belongs to no TS project and
+            // projectService cannot parse it without this entry.
+            'build/makerNsis.ts',
           ],
-          // The 12 on-disk allowDefaultProject files (3 root configs + 8
-          // scripts/*.test.ts + csp-prod-strip.ts) exceed typescript-eslint's
+          // The 13 on-disk allowDefaultProject files (3 root configs + 8
+          // scripts/*.test.ts + csp-prod-strip.ts + build/makerNsis.ts) exceed typescript-eslint's
           // default cap of 8 default-project files, so a full-tree `npm run lint`
           // (`eslint .`) fails with "Too many files (>8) have matched the default
           // project". The per-file pre-commit eslint hook never trips this (it
@@ -106,7 +111,7 @@ export default [
           // bounded cap is the right-sized fix; the perf caveat in the option's
           // name is immaterial for ~9 tiny tooling files. If this set grows much
           // larger, prefer moving scripts/ into a dedicated scripts/tsconfig.json.
-          maximumDefaultProjectFileMatchCount_THIS_WILL_SLOW_DOWN_LINTING: 12,
+          maximumDefaultProjectFileMatchCount_THIS_WILL_SLOW_DOWN_LINTING: 13,
         },
         tsconfigRootDir: import.meta.dirname,
       },

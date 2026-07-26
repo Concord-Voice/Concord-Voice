@@ -1,5 +1,6 @@
 import type { ForgeConfig } from '@electron-forge/shared-types';
-import { MakerSquirrel } from '@electron-forge/maker-squirrel';
+import { MakerNsis } from './build/makerNsis';
+import { ALLOWED_WINDOWS_PUBLISHERS } from './src/shared/allowedWindowsPublishers';
 import { MakerZIP } from '@electron-forge/maker-zip';
 import { MakerDMG } from '@electron-forge/maker-dmg';
 import { MakerDeb } from '@electron-forge/maker-deb';
@@ -179,15 +180,54 @@ const config: ForgeConfig = {
     },
   },
   makers: [
-    new MakerSquirrel({
-      name: 'ConcordVoice',
-      setupExe: 'ConcordVoiceSetup.exe',
-      setupIcon: './build/icon.ico',
-      loadingGif: './build/splash.gif',
-      iconUrl: 'https://concordvoice.com/icon.ico',
-      description: 'Concord Voice Desktop Client - Privacy-first voice communication',
-      copyright: 'Copyright © 2026 Concord Voice LLC. All rights reserved.',
-      owners: 'Concord Voice LLC',
+    // Windows: NSIS, not Squirrel.Windows (#2402). Squirrel's Setup.exe
+    // recursive-deletes its own install root before writing, which meant deleting
+    // the very installer executing from %LOCALAPPDATA%\ConcordVoice\pending\ —
+    // Windows locks a running image, so the delete threw UnauthorizedAccessException
+    // and the installer died. Confirmed across three trials on a live Windows box.
+    // electron-builder also documents Squirrel.Windows as unsupported by
+    // electron-updater, which is what we use to deliver updates.
+    //
+    // MakerNsis is local (build/makerNsis.ts) because the published
+    // electron-forge-maker-nsis is Forge-5-era and throws under Forge 7.
+    new MakerNsis({
+      appId: 'com.concordvoice.desktop',
+      productName: 'Concord Voice',
+      // IMPORTED, not duplicated. scripts/generate-app-update.mts spreads this same
+      // constant into app-update.yml's publisherName, and electron-updater reads the
+      // Windows allowlist ONLY from that on-disk file — so if the installer were
+      // stamped with a different name than the file, install-time Authenticode
+      // verification would silently stop matching (#2020).
+      //
+      // A hardcoded literal here would make that divergence possible AND invisible:
+      // a cert-rotation LLC rename (the case allowedWindowsPublishers.ts exists to
+      // handle) would update the constant and app-update.yml while this file kept
+      // stamping the old name, with every test still green.
+      publisherName: [...ALLOWED_WINDOWS_PUBLISHERS],
+      nsis: {
+        oneClick: true,
+        perMachine: false,
+        // Pins $INSTDIR to $LOCALAPPDATA\ConcordVoice\app so the install root and
+        // the updater cache (…\ConcordVoice\pending) are SIBLINGS that cannot
+        // destroy each other. Without it, app-builder-lib takes the sanitizedName
+        // branch (targetUtil.js:40) and installs to a directory derived from
+        // @concordvoice/desktop.
+        include: './build/installer.nsh',
+        // build-desktop.yml:1163 globs *Setup.exe; electron-builder's default
+        // artifactName does not end in Setup.exe and would fail the release
+        // signature-verification step.
+        artifactName: 'ConcordVoiceSetup.exe',
+        // NSIS is differential-aware by default and would emit
+        // ConcordVoiceSetup.exe.blockmap into out/make. That name matches no branch in
+        // build-desktop.yml's artifact-normalization case, so it would fall to the
+        // catch-all un-renamed — and then be picked up by the `-name "*.blockmap"`
+        // release attach glob with the SAME basename from both the x64 and arm64 legs,
+        // colliding on upload. Windows has no differential-download path today anyway
+        // (latest.yml carries no blockMapSize for win32), so this costs nothing.
+        differentialPackage: false,
+        installerIcon: './build/icon.ico',
+        uninstallerIcon: './build/icon.ico',
+      },
     }),
     new MakerZIP({}, ['darwin']),
     // DMG installer (#1159 Phase 1) — branded drag-to-Applications experience.

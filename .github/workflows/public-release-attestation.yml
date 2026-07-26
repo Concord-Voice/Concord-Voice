@@ -68,7 +68,6 @@ jobs:
               printf 'ConcordVoice-%s-macos-%s.zip\n' "$version" "$arch"
               printf 'ConcordVoice-%s-macos-%s.zip.blockmap\n' "$version" "$arch"
               printf 'ConcordVoice-%s-windows-%s-Setup.exe\n' "$version" "$arch"
-              printf 'ConcordVoice-%s-windows-%s-full.nupkg\n' "$version" "$arch"
               printf 'ConcordVoice-%s-linux-%s.AppImage\n' "$version" "$arch"
               printf 'concord-voice_%s_linux-%s.deb\n' "$version" "$arch"
               printf 'concord-voice-%s-linux-%s.rpm\n' "$version" "$arch"

@@ -11,6 +11,7 @@ import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import type { ForgeConfig } from '@electron-forge/shared-types';
 import fs from 'node:fs';
 import path from 'node:path';
+import { ALLOWED_WINDOWS_PUBLISHERS } from '../../../src/shared/allowedWindowsPublishers';
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -230,67 +231,102 @@ describe('Packaging Identity (#382)', () => {
     });
   });
 
-  describe('forge.config.ts — MakerSquirrel (Windows)', () => {
-    it('has name set to "ConcordVoice" (no spaces — registry safe)', async () => {
+  // Windows packaging migrated from Squirrel.Windows to NSIS in #2402. Squirrel's
+  // Setup.exe recursive-deleted its own install root before writing, which meant
+  // deleting the very installer executing from %LOCALAPPDATA%\ConcordVoice\pending\
+  // — Windows locks a running image, so the delete threw UnauthorizedAccessException
+  // and the installer died.
+  //
+  // Assertions that survived the migration are the IDENTITY ones this file exists to
+  // guard (#382): a branded, spaceless, non-generic installer name. Dropped with the
+  // Squirrel maker are `description`, `copyright`, `owners`, `loadingGif`, and
+  // `iconUrl` — those were Squirrel maker OPTIONS with no NSIS equivalent in our
+  // config; electron-builder derives the equivalent metadata from package.json.
+  // Their loss is intentional, not an oversight.
+  describe('forge.config.ts — MakerNsis (Windows)', () => {
+    it('registers an NSIS maker (and no Squirrel maker)', async () => {
       const config = await loadForgeConfig();
-      const squirrel = getMakerOptions(config, 'Squirrel');
-      expect(squirrel).not.toBeNull();
-      expect(squirrel.name).toBe('ConcordVoice');
+      expect(getMakerOptions(config, 'Nsis')).not.toBeNull();
+      expect(getMakerOptions(config, 'Squirrel')).toBeNull();
     });
 
-    it('has setupExe set and containing "ConcordVoice"', async () => {
+    it('has artifactName containing "ConcordVoice"', async () => {
       const config = await loadForgeConfig();
-      const squirrel = getMakerOptions(config, 'Squirrel');
-      expect(squirrel.setupExe).toBeTruthy();
-      expect(squirrel.setupExe).toContain('ConcordVoice');
+      const nsis = getMakerOptions(config, 'Nsis');
+      expect(nsis.nsis.artifactName).toBeTruthy();
+      expect(nsis.nsis.artifactName).toContain('ConcordVoice');
     });
 
-    it('setupExe does not use generic names', async () => {
+    it('artifactName does not use generic names', async () => {
       const config = await loadForgeConfig();
-      const squirrel = getMakerOptions(config, 'Squirrel');
-      const exe = squirrel.setupExe?.toLowerCase() ?? '';
+      const nsis = getMakerOptions(config, 'Nsis');
+      const exe = nsis.nsis.artifactName?.toLowerCase() ?? '';
       expect(exe).not.toBe('setup.exe');
       expect(exe).not.toContain('electron');
     });
 
-    it('has description set', async () => {
+    it('artifactName is spaceless (registry- and shell-safe)', async () => {
       const config = await loadForgeConfig();
-      const squirrel = getMakerOptions(config, 'Squirrel');
-      expect(squirrel.description).toBeTruthy();
-      expect(squirrel.description.length).toBeGreaterThan(10);
+      const nsis = getMakerOptions(config, 'Nsis');
+      expect(nsis.nsis.artifactName).not.toMatch(/\s/);
     });
 
-    it('has copyright set', async () => {
+    it('artifactName ends in Setup.exe (release verification glob)', async () => {
+      // build-desktop.yml:1163 globs *Setup.exe and fails the release when nothing
+      // matches. electron-builder's default artifactName does NOT end in Setup.exe.
       const config = await loadForgeConfig();
-      const squirrel = getMakerOptions(config, 'Squirrel');
-      expect(squirrel.copyright).toBeTruthy();
-      expect(squirrel.copyright).toContain('Concord');
+      const nsis = getMakerOptions(config, 'Nsis');
+      expect(nsis.nsis.artifactName).toMatch(/Setup\.exe$/);
     });
 
-    it('has owners set', async () => {
+    it('pins the install directory via the customInit include', async () => {
+      // build/installer.nsh sets $INSTDIR to $LOCALAPPDATA\ConcordVoice\app so the
+      // install root and the updater cache (…\ConcordVoice\pending) are SIBLINGS.
       const config = await loadForgeConfig();
-      const squirrel = getMakerOptions(config, 'Squirrel');
-      expect(squirrel.owners).toBeTruthy();
+      const nsis = getMakerOptions(config, 'Nsis');
+      expect(nsis.nsis.include).toBe('./build/installer.nsh');
     });
 
-    it('has loadingGif set for branded installer splash', async () => {
+    it('the referenced NSIS include and icons actually exist on disk', async () => {
+      // Asserting the STRING alone passes whether or not the file is there. If
+      // installer.nsh is renamed, moved, or excluded from packaging, app-builder-lib
+      // falls back to the sanitizedName branch, $INSTDIR reverts to a directory
+      // derived from @concordvoice/desktop, and the updater cache nests back INSIDE
+      // the install root — silently reinstating the exact failure this PR fixes, on
+      // users' machines, with no CI signal (there is no Windows CI).
       const config = await loadForgeConfig();
-      const squirrel = getMakerOptions(config, 'Squirrel');
-      expect(squirrel.loadingGif).toBeTruthy();
+      const nsis = getMakerOptions(config, 'Nsis');
+      for (const rel of [nsis.nsis.include, nsis.nsis.installerIcon, nsis.nsis.uninstallerIcon]) {
+        expect(rel).toBeTruthy();
+        expect(fs.existsSync(path.resolve(desktopRoot, rel as string))).toBe(true);
+      }
     });
 
-    it('has iconUrl set to HTTPS URL', async () => {
+    it('has publisherName matching the Authenticode allowlist', async () => {
+      // Asserted against the CONSTANT, not a re-hardcoded literal. generate-app-update.mts
+      // spreads the same constant into app-update.yml, and electron-updater reads the
+      // Windows allowlist ONLY from that file — so a literal here would let a
+      // cert-rotation LLC rename update the constant and app-update.yml while
+      // forge.config.ts kept stamping the old name, with this test still green (#2020).
       const config = await loadForgeConfig();
-      const squirrel = getMakerOptions(config, 'Squirrel');
-      expect(squirrel.iconUrl).toBeTruthy();
-      expect(squirrel.iconUrl).toMatch(/^https:\/\//);
+      const nsis = getMakerOptions(config, 'Nsis');
+      expect(nsis.publisherName).toEqual([...ALLOWED_WINDOWS_PUBLISHERS]);
     });
 
-    it('name is the spaceless form of packagerConfig.name', async () => {
+    it('uses a one-click per-user install', async () => {
+      // oneClick drives app-builder-lib's install-dir naming branch
+      // (targetUtil.js:40) and perMachine keeps the install per-user under
+      // $LOCALAPPDATA — both load-bearing for the ConcordVoice\app pin.
       const config = await loadForgeConfig();
-      const squirrel = getMakerOptions(config, 'Squirrel');
-      const expected = config.packagerConfig?.name?.replaceAll(/\s+/g, '');
-      expect(squirrel.name).toBe(expected);
+      const nsis = getMakerOptions(config, 'Nsis');
+      expect(nsis.nsis.oneClick).toBe(true);
+      expect(nsis.nsis.perMachine).toBe(false);
+    });
+
+    it('productName is the display form of packagerConfig.name', async () => {
+      const config = await loadForgeConfig();
+      const nsis = getMakerOptions(config, 'Nsis');
+      expect(nsis.productName).toBe(config.packagerConfig?.name);
     });
   });
 

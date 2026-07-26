@@ -110,6 +110,7 @@ import { registerIpcHandlers as registerPermissionHandlers } from './permissionM
 import { migrateUserData } from './userDataMigration';
 import { showSplash, closeSplash, updateSplashError } from './splashWindow';
 import { maybePromptMove } from './applicationsFolderGate';
+import { cleanupSquirrelResidue } from './squirrelCleanup';
 
 // One-time migration: consolidate any legacy userData tree into the pinned
 // "ConcordVoice" dir (#1291). Runs after pinUserDataPath.ts has set the path,
@@ -847,6 +848,38 @@ app.whenReady().then(async () => {
   void createWindow().then(() => {
     drainPendingInviteCodes();
     setTimeout(drainPendingInviteCodes, 1000);
+
+    // Remove orphaned Squirrel.Windows residue left by the NSIS migration (#2402).
+    //
+    // Runs from the INSTALLED APP on a later launch, never from the installer. An
+    // installer executing from %LOCALAPPDATA%\ConcordVoice\pending\ cannot delete
+    // %LOCALAPPDATA%\ConcordVoice\ — it would be deleting its own locked image,
+    // which IS the bug this migration fixes (Squirrel died exactly that way with
+    // UnauthorizedAccessException).
+    //
+    // Deliberately AFTER the window exists and deferred a further tick: the sweep is
+    // SYNCHRONOUS recursive rmSync over app-* directories that can total hundreds of
+    // MB, so running it during whenReady would block the main-process event loop
+    // before first paint. It is allowlist-scoped, never throws, and never touches
+    // ConcordVoice\app (the running install) or ConcordVoice\pending (the updater
+    // cache). No-op on non-win32.
+    //
+    // app.isPackaged-gated: without it, a developer running `npm start` on a real
+    // Windows machine would have their genuine %LOCALAPPDATA%\ConcordVoice profile
+    // swept — Update.exe, packages\, SquirrelTemp\, the Start Menu folder and the
+    // uninstall registry key deleted as a side effect of local development. Matches
+    // the packaged-gating of the other startup side effects in this file.
+    //
+    // Reuses the logger initAutoUpdater() already created rather than calling
+    // createUpdateLogger() again: each construction re-runs mkdirSync plus a full
+    // readdirSync + pruneOldLogs sweep of the log directory (updateLogger.ts), so a
+    // second one doubles that filesystem work on every launch.
+    if (app.isPackaged) {
+      const squirrelLogger = getUpdateLogger();
+      if (squirrelLogger) {
+        setTimeout(() => cleanupSquirrelResidue(squirrelLogger), 0);
+      }
+    }
   });
 
   // System tray (#1099): init after the first window exists so the activate

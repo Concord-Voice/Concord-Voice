@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.35] — 2026-07-25
+
+### Fixed
+
+- **Windows updates now install when you click Restart** ([#2402](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2402)) — after downloading an update, clicking Restart closed Concord Voice and then nothing happened; a window flashed briefly and disappeared. Running the downloaded installer by hand did the same thing, and the only way through was to move that file somewhere else, like your Downloads folder, and run it from there. Updates now install normally from the Restart button, with no manual step. Leftover files from the old installer are tidied up on a later launch, and your downloaded updates and your installed app are never touched by that cleanup.
+
 ## [0.2.34] — 2026-07-25
 
 ### Fixed
