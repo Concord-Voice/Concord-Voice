@@ -60,12 +60,8 @@ func AuthRequired(jwtSecret string, redisClient *redis.Client, fence *credepoch.
 			return
 		}
 
-		// Immediate-effect user-disabled denylist (#1623): a per-user key set
-		// synchronously by the age-verification terminal-disable path. SAME
-		// fail-closed posture as the token blacklist above — reject on a present
-		// key OR on a Redis error. Source of truth is users.disabled; the key is
-		// persistent (no TTL) and rebuilt at startup (RebuildDisabledDenylist).
-		if isUserDisabled(c, redisClient, userID) {
+		emailVerified, err := VerifyLiveTokenState(c.Request.Context(), redisClient, userID, claims)
+		if err != nil {
 			abortAccountDisabled(c)
 			return
 		}
@@ -80,7 +76,7 @@ func AuthRequired(jwtSecret string, redisClient *redis.Client, fence *credepoch.
 
 		c.Set("user_id", userID)
 		c.Set(JWTClaimsContextKey, claims)
-		c.Set("email_verified", emailVerifiedFromClaims(claims))
+		c.Set("email_verified", emailVerified)
 		c.Next()
 	}
 }
@@ -142,17 +138,21 @@ func abortAccountDisabled(c *gin.Context) {
 // silently break the denylist.
 func UserDisabledKey(userID string) string { return "user_disabled:" + userID }
 
-// isUserDisabled mirrors isTokenBlacklisted's fail-closed posture: a present key OR a
-// Redis error rejects the request (#1623). A disabled user keeps no usable access
-// token past the next request even though the JWT itself is still cryptographically valid.
-func isUserDisabled(c *gin.Context, redisClient *redis.Client, userID string) bool {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+// VerifyLiveTokenState evaluates shared post-parse bearer-token state. A present
+// disabled-user key or a Redis error rejects fail closed; otherwise it returns
+// the token's backward-compatible email-verification value.
+func VerifyLiveTokenState(ctx context.Context, redisClient *redis.Client, userID string, claims jwt.MapClaims) (bool, error) {
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	exists, err := redisClient.Exists(ctx, UserDisabledKey(userID)).Result()
+
+	exists, err := redisClient.Exists(checkCtx, UserDisabledKey(userID)).Result()
 	if err != nil {
-		return true // fail closed
+		return false, fmt.Errorf("check disabled user: %w", err)
 	}
-	return exists > 0
+	if exists > 0 {
+		return false, fmt.Errorf("account disabled")
+	}
+	return emailVerifiedFromClaims(claims), nil
 }
 
 // RebuildDisabledDenylist repopulates the user_disabled:<id> keys from the source of

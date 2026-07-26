@@ -269,12 +269,14 @@ func (h *Handler) authenticateViaJWT(c *gin.Context, tokenString string) (uuid.U
 	if err != nil {
 		return uuid.Nil, "", err
 	}
-	// Parity with HTTP bearer auth (#2201): the JWT fallback previously checked
-	// only the JTI blacklist — add the user-disabled denylist and the
-	// credential-epoch fence so a revoked or superseded token cannot open a
-	// socket that AuthRequired would reject.
-	if derr := h.checkUserDisabled(c, userID.String()); derr != nil {
-		return uuid.Nil, "", derr
+	// Share HTTP bearer auth's live disabled/email state while retaining the
+	// WebSocket policy that an explicitly unverified token is rejected here.
+	emailVerified, err := middleware.VerifyLiveTokenState(c.Request.Context(), h.redis, userID.String(), claims)
+	if err != nil {
+		return uuid.Nil, "", err
+	}
+	if !emailVerified {
+		return uuid.Nil, "", fmt.Errorf("email verification required")
 	}
 	tokenEpoch, _ := claims["cred_epoch"].(string)
 	if h.fence != nil {

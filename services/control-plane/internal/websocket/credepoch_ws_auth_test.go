@@ -56,7 +56,7 @@ func TestAuthenticateWS_JWTStaleEpochRejected(t *testing.T) {
 	assert.Contains(t, err.Error(), "credential epoch")
 }
 
-func TestAuthenticateWS_JWTMatchingEpochAdmitsWithSession(t *testing.T) {
+func TestAuthenticateWS_JWTMatchingEpochWithoutEmailClaimAdmitsWithSession(t *testing.T) {
 	userID := uuid.New()
 	h, rc := fenceWiredWSHandler(t)
 	require.NoError(t, rc.Set(context.Background(), credepoch.Key(userID.String()), "active:goodEpoch", time.Minute).Err())
@@ -74,6 +74,49 @@ func TestAuthenticateWS_JWTMatchingEpochAdmitsWithSession(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, userID, gotID)
 	assert.Equal(t, "sess-xyz", sessionID)
+}
+
+// regression for #2352: the JWT fallback must not admit an unverified account.
+func TestAuthenticateWS_JWTUnverifiedEmailRejected(t *testing.T) {
+	userID := uuid.New()
+	h, rc := fenceWiredWSHandler(t)
+	require.NoError(t, rc.Set(context.Background(), credepoch.Key(userID.String()), "active:goodEpoch", time.Minute).Err())
+	token := signedJWTWithClaims(t, jwt.MapClaims{
+		"user_id":        userID.String(),
+		"email_verified": false,
+		"cred_epoch":     "goodEpoch",
+		"exp":            jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	})
+	r, err := http.NewRequest(http.MethodGet, "/ws", nil)
+	require.NoError(t, err)
+	r.Header.Set("Authorization", "Bearer "+token)
+
+	_, _, err = h.authenticateWebSocket(newGinContext(r))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "email verification required")
+}
+
+func TestAuthenticateWS_JWTRedisOutageRejected(t *testing.T) {
+	userID := uuid.New()
+	rc := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: 100 * time.Millisecond,
+		MaxRetries:  -1,
+	})
+	t.Cleanup(func() { assert.NoError(t, rc.Close()) })
+	h := NewHandler(nil, nil, rc, testJWTSecret, nil, nil, nil)
+	token := signedJWTWithClaims(t, jwt.MapClaims{
+		"user_id":        userID.String(),
+		"email_verified": true,
+		"exp":            jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	})
+	r, err := http.NewRequest(http.MethodGet, "/ws", nil)
+	require.NoError(t, err)
+	r.Header.Set("Authorization", "Bearer "+token)
+
+	_, _, err = h.authenticateWebSocket(newGinContext(r))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "check disabled user")
 }
 
 func TestAuthenticateWS_JWTDisabledUserRejected(t *testing.T) {
