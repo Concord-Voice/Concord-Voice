@@ -952,8 +952,8 @@ export async function unwrapPrefsKeyWithRecoveryKey(
 
 export async function generateECDHKeyPair(): Promise<CryptoKeyPair> {
   return crypto.subtle.generateKey(
-    { name: 'ECDH', namedCurve: 'P-256' },
-    true, // extractable for transport
+    { name: 'ECDH', namedCurve: 'P-384' },
+    false, // keep the ephemeral private key non-exportable
     ['deriveKey']
   );
 }
@@ -965,7 +965,7 @@ export async function exportECDHPublicKey(key: CryptoKey): Promise<string> {
 
 export async function importECDHPublicKey(base64: string): Promise<CryptoKey> {
   const raw = base64ToArrayBuffer(base64);
-  return crypto.subtle.importKey('raw', raw, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  return crypto.subtle.importKey('raw', raw, { name: 'ECDH', namedCurve: 'P-384' }, false, []);
 }
 
 export async function deriveSharedSecret(

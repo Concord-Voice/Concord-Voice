@@ -389,27 +389,44 @@ describe('crypto utilities', () => {
   // ── ECDH shared secret ──
 
   describe('ECDH operations', () => {
+    // Regression for #2355: recovery ECDH must meet the P-384 policy floor and retain a non-exportable private key.
     it('generates ECDH key pair', async () => {
       const { generateECDHKeyPair } = await import('@/renderer/utils/crypto');
       const kp = await generateECDHKeyPair();
-      expect(kp.publicKey.algorithm.name).toBe('ECDH');
-      expect(kp.privateKey.algorithm.name).toBe('ECDH');
+      expect.soft(kp.publicKey.algorithm).toMatchObject({ name: 'ECDH', namedCurve: 'P-384' });
+      expect.soft(kp.privateKey.algorithm).toMatchObject({ name: 'ECDH', namedCurve: 'P-384' });
+      expect.soft(kp.privateKey.extractable).toBe(false);
+      await expect(crypto.subtle.exportKey('pkcs8', kp.privateKey)).rejects.toThrow();
     });
 
     it('exports and imports ECDH public key', async () => {
       const { generateECDHKeyPair, exportECDHPublicKey, importECDHPublicKey } =
         await import('@/renderer/utils/crypto');
       const kp = await generateECDHKeyPair();
+      expect(kp.publicKey.algorithm).toMatchObject({ name: 'ECDH', namedCurve: 'P-384' });
       const exported = await exportECDHPublicKey(kp.publicKey);
       expect(typeof exported).toBe('string');
 
       const imported = await importECDHPublicKey(exported);
-      expect(imported.algorithm.name).toBe('ECDH');
+      expect(imported.algorithm).toMatchObject({ name: 'ECDH', namedCurve: 'P-384' });
+    });
+
+    it('rejects a P-256 recovery public key', async () => {
+      const { exportECDHPublicKey, importECDHPublicKey } = await import('@/renderer/utils/crypto');
+      const legacy = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, [
+        'deriveKey',
+      ]);
+
+      await expect(
+        importECDHPublicKey(await exportECDHPublicKey(legacy.publicKey))
+      ).rejects.toThrow();
     });
 
     it('derives shared secret and encrypts/decrypts', async () => {
       const {
         generateECDHKeyPair,
+        exportECDHPublicKey,
+        importECDHPublicKey,
         deriveSharedSecret,
         encryptWithSharedSecret,
         decryptWithSharedSecret,
@@ -417,9 +434,13 @@ describe('crypto utilities', () => {
 
       const alice = await generateECDHKeyPair();
       const bob = await generateECDHKeyPair();
+      const alicePublicKey = await importECDHPublicKey(await exportECDHPublicKey(alice.publicKey));
+      const bobPublicKey = await importECDHPublicKey(await exportECDHPublicKey(bob.publicKey));
 
-      const aliceSecret = await deriveSharedSecret(alice.privateKey, bob.publicKey);
-      const bobSecret = await deriveSharedSecret(bob.privateKey, alice.publicKey);
+      const aliceSecret = await deriveSharedSecret(alice.privateKey, bobPublicKey);
+      const bobSecret = await deriveSharedSecret(bob.privateKey, alicePublicKey);
+      expect(aliceSecret.algorithm).toMatchObject({ name: 'AES-GCM', length: 256 });
+      expect(bobSecret.algorithm).toMatchObject({ name: 'AES-GCM', length: 256 });
 
       // Both should be able to encrypt/decrypt the same data
       const data = new TextEncoder().encode('hello ECDH');

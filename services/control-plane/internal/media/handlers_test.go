@@ -14,15 +14,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-migrate/migrate/v4"
-	"github.com/golang-migrate/migrate/v4/database/postgres"
-	_ "github.com/golang-migrate/migrate/v4/source/file" // register file source driver for side effects
 	"github.com/google/uuid"
 	_ "github.com/lib/pq" // register PostgreSQL driver for side effects
 	"github.com/stretchr/testify/assert"
@@ -33,6 +28,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -159,52 +155,10 @@ type testSetup struct {
 	db      *sql.DB
 }
 
-// setupTestDB opens a DB connection, runs migrations, and returns a cleanup function.
-// Inlined here to avoid import cycle with testhelpers → api → media.
+// setupTestDB shares the cycle-free test fixture's cross-process lock.
 func setupTestDB(t *testing.T) (*sql.DB, func()) {
 	t.Helper()
-
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = defaultTestDatabaseURL
-	}
-
-	db, err := sql.Open("postgres", dbURL)
-	if err != nil {
-		t.Fatalf("media_test: failed to open database: %v", err)
-	}
-	if err := db.Ping(); err != nil {
-		t.Skipf("media_test: database unavailable (skipping integration tests): %v", err)
-	}
-	db.SetMaxOpenConns(5)
-	db.SetMaxIdleConns(2)
-
-	// Run migrations
-	_, thisFile, _, _ := runtime.Caller(0)
-	migrationsDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "migrations")
-	absDir, _ := filepath.Abs(migrationsDir)
-
-	driver, err := postgres.WithInstance(db, &postgres.Config{})
-	if err != nil {
-		t.Fatalf("media_test: failed to create migration driver: %v", err)
-	}
-	m, err := migrate.NewWithDatabaseInstance("file://"+absDir, "postgres", driver)
-	if err != nil {
-		t.Fatalf("media_test: failed to create migrator: %v", err)
-	}
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		t.Fatalf("media_test: failed to run migrations: %v", err)
-	}
-
-	cleanup := func() {
-		tables := []string{"dm_message_attachments", "message_attachments", "media_files", "dm_participants", "dm_conversations", "channel_keys", "channels", "member_roles", "roles", "server_invites", "server_members", "servers", "public_keys", "user_keys", "users"}
-		for _, table := range tables {
-			// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,go.lang.security.audit.sqli.gosql-sqli.gosql-sqli — test cleanup; table names from hardcoded slice above
-			_, _ = db.Exec(fmt.Sprintf("DELETE FROM %s", table)) //nolint:gosec
-		}
-		_ = db.Close()
-	}
-	return db, cleanup
+	return testdb.SetupTestDB(t)
 }
 
 func setupMediaTest(t *testing.T) *testSetup {
