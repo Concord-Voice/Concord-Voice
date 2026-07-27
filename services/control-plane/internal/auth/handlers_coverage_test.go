@@ -17,29 +17,39 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const (
-	ctJSON              = "application/json"
-	ctHeader            = "Content-Type"
-	bearerPrefix        = "Bearer "
-	pathDeviceReqCreate = "/api/v1/auth/recovery/device-request"
-	pathDeviceReqPoll   = "/api/v1/auth/recovery/device-request/"
-	pathSocialReqCreate = "/api/v1/auth/recovery/social-request"
-	pathSocialReqPoll   = "/api/v1/auth/recovery/social-request/"
-	pathVerifyCode      = "/api/v1/auth/recovery/verify-code"
-	pathResetPwd        = "/api/v1/auth/recovery/reset-password" //nolint:gosec // G101 false positive: URL path
-	pathResetAcct       = "/api/v1/auth/recovery/reset-account"
-	fakeEphemeralKey    = "fake-ephemeral-key"
-	recoveryCodeKeyPfx  = "recovery_code:"
-	testNewPassword2    = "NewSecurePassword123!" //nolint:gosec // G101 false positive: test credential
-	headerXMachineID    = "X-Machine-Id"
-	pathAuthRegister    = "/api/v1/auth/register"
-	pathAuthLogin       = "/api/v1/auth/login"
-	pathAuthLogout      = "/api/v1/auth/logout"
+	ctJSON                        = "application/json"
+	ctHeader                      = "Content-Type"
+	bearerPrefix                  = "Bearer "
+	pathDeviceReqCreate           = "/api/v1/auth/recovery/device-request"
+	pathDeviceReqPoll             = "/api/v1/auth/recovery/device-request/"
+	pathSocialReqCreate           = "/api/v1/auth/recovery/social-request"
+	pathSocialReqPoll             = "/api/v1/auth/recovery/social-request/"
+	pathVerifyCode                = "/api/v1/auth/recovery/verify-code"
+	pathResetPwd                  = "/api/v1/auth/recovery/reset-password" //nolint:gosec // G101 false positive: URL path
+	pathResetAcct                 = "/api/v1/auth/recovery/reset-account"
+	fakeEphemeralKey              = "fake-ephemeral-key"
+	recoveryCodeKeyPfx            = "recovery_code:"
+	testNewPassword2              = "NewSecurePassword123!" //nolint:gosec // G101 false positive: test credential
+	headerXMachineID              = "X-Machine-Id"
+	pathAuthRegister              = "/api/v1/auth/register"
+	pathAuthLogin                 = "/api/v1/auth/login"
+	pathAuthLogout                = "/api/v1/auth/logout"
+	tokenTheftMintBarrierLockID   = "2460001"
+	tokenTheftMintBarrierFunction = `
+		CREATE OR REPLACE FUNCTION token_theft_mint_barrier() RETURNS trigger AS $$
+		BEGIN
+			PERFORM pg_advisory_xact_lock(` + tokenTheftMintBarrierLockID + `);
+			RETURN NULL;
+		END;
+		$$ LANGUAGE plpgsql`
 )
 
 // ── Machine-ID Theft Detection ─────────────────────────────────────────────
@@ -191,6 +201,201 @@ func TestRefreshMachineIDTheftDifferentIPAndMachineID(t *testing.T) {
 	).Scan(&activeCount)
 	require.NoError(t, err)
 	assert.Equal(t, 0, activeCount)
+}
+
+// TestRefreshMachineIDTheft_ConcurrentMintDoesNotSurvive is a regression for #2460.
+// It holds a real SSO mint after its refresh row is inserted but before commit,
+// then proves the theft sweep waits and revokes that newly minted session.
+func TestRefreshMachineIDTheft_ConcurrentMintDoesNotSurvive(t *testing.T) {
+	ts := setupTS(t)
+	ctx := context.Background()
+	originalMachineID := uuid.New().String()
+	refreshToken, userID := registerAndGetRefreshToken(t, ts, "theftmint", originalMachineID)
+
+	_, err := ts.DB.Exec(
+		`UPDATE refresh_tokens SET ip_address = '10.0.0.1', machine_id = $1 WHERE token_hash = $2`,
+		originalMachineID, auth.HashRefreshToken(refreshToken),
+	)
+	require.NoError(t, err)
+
+	installTokenTheftMintBarrier(t, ts.DB)
+	releaseMint := holdTokenTheftMintBarrier(t)
+	mintHandler := auth.NewHandler(ts.DB, ts.Redis, logger.New("test"), testhelpers.TestJWTSecret, noopDisconnector{})
+	mintDone := make(chan tokenTheftMintResult, 1)
+	go func() {
+		_, refresh, _, mintErr := mintHandler.IssueAccessAndRefresh(ctx, userID)
+		mintDone <- tokenTheftMintResult{refresh: refresh, err: mintErr}
+	}()
+	assertTokenTheftMintIsBlocked(t, ts.DB)
+
+	theftDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		theftDone <- doRefreshWithMachineID(ts, refreshToken, uuid.New().String(), "10.0.0.99:5678")
+	}()
+
+	require.Eventually(t, func() bool {
+		var waiting bool
+		err := ts.DB.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE '%SELECT credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE%'
+		)`).Scan(&waiting)
+		return err == nil && waiting
+	}, time.Second, 10*time.Millisecond,
+		"token-theft sweep must wait on the users-row lock held by the concurrent mint")
+
+	releaseMint()
+
+	var mint tokenTheftMintResult
+	select {
+	case mint = <-mintDone:
+		require.NoError(t, mint.err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("mint did not finish after releasing its insert barrier")
+	}
+
+	select {
+	case w := <-theftDone:
+		require.Equal(t, http.StatusUnauthorized, w.Code)
+	case <-time.After(10 * time.Second):
+		t.Fatal("token-theft response did not finish after the mint committed")
+	}
+
+	var revokedAt sql.NullTime
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, auth.HashRefreshToken(mint.refresh),
+	).Scan(&revokedAt))
+	require.True(t, revokedAt.Valid, "the refresh session minted during the theft sweep must be revoked")
+}
+
+// TestRefreshMachineIDTheft_RevokeFailureLogsAndRejects is a regression for #2460.
+// A failed best-effort revocation must still reject the theft request and leave an
+// auditable, non-sensitive failure log.
+func TestRefreshMachineIDTheft_RevokeFailureLogsAndRejects(t *testing.T) {
+	ts := setupTS(t)
+	originalMachineID := uuid.New().String()
+	refreshToken, _ := registerAndGetRefreshToken(t, ts, "theftrevokeerror", originalMachineID)
+
+	_, err := ts.DB.Exec(
+		`UPDATE refresh_tokens SET ip_address = '10.0.0.1', machine_id = $1 WHERE token_hash = $2`,
+		originalMachineID, auth.HashRefreshToken(refreshToken),
+	)
+	require.NoError(t, err)
+	installTokenTheftRevokeFailure(t, ts.DB)
+
+	differentMachineID := uuid.New().String()
+	logs := ts.CaptureLogs(t)
+	w := doRefreshWithMachineID(ts, refreshToken, differentMachineID, "10.0.0.99:5678")
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	logOutput := logs.String()
+	assert.Contains(t, logOutput, "Failed to revoke refresh tokens after token theft")
+	assert.NotContains(t, logOutput, originalMachineID)
+	assert.NotContains(t, logOutput, differentMachineID)
+	theftLog := findLogLine(logOutput, "TOKEN THEFT DETECTED")
+	require.NotEmpty(t, theftLog)
+	assert.NotContains(t, theftLog, "10.0.0.1")
+	assert.NotContains(t, theftLog, "10.0.0.99")
+}
+
+func findLogLine(logOutput, marker string) string {
+	for _, line := range strings.Split(logOutput, "\n") {
+		if strings.Contains(line, marker) {
+			return line
+		}
+	}
+	return ""
+}
+
+type tokenTheftMintResult struct {
+	refresh string
+	err     error
+}
+
+func installTokenTheftMintBarrier(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.Exec(tokenTheftMintBarrierFunction)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		CREATE TRIGGER token_theft_mint_barrier AFTER INSERT ON refresh_tokens
+		FOR EACH ROW EXECUTE FUNCTION token_theft_mint_barrier()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if _, dropErr := db.Exec(`DROP TRIGGER IF EXISTS token_theft_mint_barrier ON refresh_tokens`); dropErr != nil {
+			t.Errorf("drop token-theft mint barrier trigger: %v", dropErr)
+		}
+		if _, dropErr := db.Exec(`DROP FUNCTION IF EXISTS token_theft_mint_barrier()`); dropErr != nil {
+			t.Errorf("drop token-theft mint barrier function: %v", dropErr)
+		}
+	})
+}
+
+func installTokenTheftRevokeFailure(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.Exec(`
+		CREATE OR REPLACE FUNCTION token_theft_revoke_failure() RETURNS trigger AS $$
+		BEGIN
+			RAISE EXCEPTION 'token theft revoke failure';
+		END;
+		$$ LANGUAGE plpgsql`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		CREATE TRIGGER token_theft_revoke_failure BEFORE UPDATE ON refresh_tokens
+		FOR EACH ROW EXECUTE FUNCTION token_theft_revoke_failure()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if _, dropErr := db.Exec(`DROP TRIGGER IF EXISTS token_theft_revoke_failure ON refresh_tokens`); dropErr != nil {
+			t.Errorf("drop token-theft revoke failure trigger: %v", dropErr)
+		}
+		if _, dropErr := db.Exec(`DROP FUNCTION IF EXISTS token_theft_revoke_failure()`); dropErr != nil {
+			t.Errorf("drop token-theft revoke failure function: %v", dropErr)
+		}
+	})
+}
+
+func holdTokenTheftMintBarrier(t *testing.T) func() {
+	t.Helper()
+	lockDB, err := sql.Open("postgres", dbtest.DatabaseURL())
+	require.NoError(t, err)
+	lockDB.SetMaxOpenConns(1)
+	conn, err := lockDB.Conn(context.Background())
+	require.NoError(t, err)
+	_, err = conn.ExecContext(context.Background(), `SELECT pg_advisory_lock($1::bigint)`, tokenTheftMintBarrierLockID)
+	require.NoError(t, err)
+
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		if _, unlockErr := conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1::bigint)`, tokenTheftMintBarrierLockID); unlockErr != nil {
+			t.Errorf("release token-theft mint barrier: %v", unlockErr)
+		}
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("close token-theft barrier connection: %v", closeErr)
+		}
+		if closeErr := lockDB.Close(); closeErr != nil {
+			t.Errorf("close token-theft barrier database: %v", closeErr)
+		}
+	}
+	t.Cleanup(release)
+	return release
+}
+
+func assertTokenTheftMintIsBlocked(t *testing.T, db *sql.DB) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		err := db.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND wait_event_type = 'Lock'
+			  AND wait_event = 'advisory'
+			  AND query LIKE 'INSERT INTO refresh_tokens%'
+		)`).Scan(&waiting)
+		return err == nil && waiting
+	}, time.Second, 10*time.Millisecond, "mint did not reach the refresh-token insert barrier")
 }
 
 func TestRefreshSameMachineIDSucceeds(t *testing.T) {

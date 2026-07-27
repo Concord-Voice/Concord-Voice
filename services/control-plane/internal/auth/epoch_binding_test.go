@@ -7,13 +7,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -84,6 +87,164 @@ func newLoginContext() (*gin.Context, *httptest.ResponseRecorder) {
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
 	return c, rec
+}
+
+type tokenTheftTestDisconnector struct{}
+
+func (tokenTheftTestDisconnector) DisconnectUser(uuid.UUID) {}
+
+// TestHandleTokenTheftRevokesAfterRequestCancellation ensures a hostile client
+// cannot abort the theft sweep by cancelling the request after authentication.
+func TestHandleTokenTheftRevokesAfterRequestCancellation(t *testing.T) {
+	h, db, userID := newAdmitPathHandler(t)
+	h.hub = tokenTheftTestDisconnector{}
+	_, err := db.Exec(
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
+		uuid.New(), userID, HashRefreshToken("cancelled-token"), time.Now().Add(time.Hour),
+	)
+	require.NoError(t, err)
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c, rec := newLoginContext()
+	c.Request = c.Request.WithContext(requestCtx)
+
+	require.True(t, h.handleTokenTheft(c, models.RefreshToken{UserID: userID.String()}))
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
+
+	var activeCount int
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, userID,
+	).Scan(&activeCount))
+	assert.Zero(t, activeCount, "theft sweep must not inherit attacker request cancellation")
+}
+
+func TestRevokeAllRefreshTokens_ExcludesCurrentToken(t *testing.T) {
+	_, db, userID := newAdmitPathHandler(t)
+	excludedHash := HashRefreshToken("current-token")
+	revokedHash := HashRefreshToken("other-token")
+	for _, tokenHash := range []string{excludedHash, revokedHash} {
+		_, err := db.Exec(
+			`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
+			uuid.New(), userID, tokenHash, time.Now().Add(time.Hour),
+		)
+		require.NoError(t, err)
+	}
+	_, err := db.Exec(
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, revoked_at) VALUES ($1, $2, $3, $4, $5)`,
+		uuid.New(), userID, HashRefreshToken("already-revoked-token"), time.Now().Add(time.Hour), time.Now().Add(-time.Hour),
+	)
+	require.NoError(t, err)
+	otherUserID := dbtest.CreateUser(t, db)
+	otherHash := HashRefreshToken("other-user-token")
+	_, err = db.Exec(
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
+		uuid.New(), otherUserID, otherHash, time.Now().Add(time.Hour),
+	)
+	require.NoError(t, err)
+
+	var revokedBefore time.Time
+	require.NoError(t, db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, HashRefreshToken("already-revoked-token")).Scan(&revokedBefore))
+
+	result, err := RevokeAllRefreshTokens(context.Background(), db, userID.String(), RevokeAllRefreshTokensOptions{ExcludeTokenHash: excludedHash})
+	require.NoError(t, err)
+	rowsAffected, err := result.RowsAffected()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, rowsAffected)
+
+	var excludedRevokedAt, otherRevokedAt sql.NullTime
+	require.NoError(t, db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, excludedHash).Scan(&excludedRevokedAt))
+	require.NoError(t, db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, revokedHash).Scan(&otherRevokedAt))
+	assert.False(t, excludedRevokedAt.Valid, "the current refresh token must remain active")
+	assert.True(t, otherRevokedAt.Valid, "all non-current refresh tokens must be revoked")
+
+	var revokedAfter time.Time
+	require.NoError(t, db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, HashRefreshToken("already-revoked-token")).Scan(&revokedAfter))
+	assert.Equal(t, revokedBefore, revokedAfter, "an already-revoked token must not be rewritten")
+	var otherUserRevokedAt sql.NullTime
+	require.NoError(t, db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, otherHash).Scan(&otherUserRevokedAt))
+	assert.False(t, otherUserRevokedAt.Valid, "a different user's active token must remain active")
+}
+
+func TestRevokeAllRefreshTokens_WithoutExclusionPreservesOtherUsersAndRevokedRows(t *testing.T) {
+	_, db, userID := newAdmitPathHandler(t)
+	activeHash := HashRefreshToken("active-token")
+	revokedHash := HashRefreshToken("already-revoked-token")
+	for _, tokenHash := range []string{activeHash, revokedHash} {
+		_, err := db.Exec(
+			`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
+			uuid.New(), userID, tokenHash, time.Now().Add(time.Hour),
+		)
+		require.NoError(t, err)
+	}
+	_, err := db.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1`, revokedHash)
+	require.NoError(t, err)
+	otherUserID := dbtest.CreateUser(t, db)
+	otherHash := HashRefreshToken("other-user-active-token")
+	_, err = db.Exec(
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
+		uuid.New(), otherUserID, otherHash, time.Now().Add(time.Hour),
+	)
+	require.NoError(t, err)
+
+	var revokedBefore time.Time
+	require.NoError(t, db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, revokedHash).Scan(&revokedBefore))
+
+	result, err := RevokeAllRefreshTokens(context.Background(), db, userID.String(), RevokeAllRefreshTokensOptions{})
+	require.NoError(t, err)
+	rowsAffected, err := result.RowsAffected()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, rowsAffected)
+
+	var activeRevokedAt, otherUserRevokedAt sql.NullTime
+	require.NoError(t, db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, activeHash).Scan(&activeRevokedAt))
+	require.NoError(t, db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, otherHash).Scan(&otherUserRevokedAt))
+	assert.True(t, activeRevokedAt.Valid, "the user's active token must be revoked")
+	assert.False(t, otherUserRevokedAt.Valid, "a different user's active token must remain active")
+	var revokedAfter time.Time
+	require.NoError(t, db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, revokedHash).Scan(&revokedAfter))
+	assert.Equal(t, revokedBefore, revokedAfter, "an already-revoked token must not be rewritten")
+}
+
+func TestRevokeAllRefreshTokens_RejectsSupersededCredentialEpoch(t *testing.T) {
+	_, db, userID := newAdmitPathHandler(t)
+	_, err := db.Exec(`UPDATE users SET credential_epoch = 'epoch-current' WHERE id = $1`, userID)
+	require.NoError(t, err)
+	activeHash := HashRefreshToken("epoch-guarded-token")
+	_, err = db.Exec(
+		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
+		uuid.New(), userID, activeHash, time.Now().Add(time.Hour),
+	)
+	require.NoError(t, err)
+
+	expectedEpoch := "epoch-before-step-up"
+	_, err = RevokeAllRefreshTokens(context.Background(), db, userID.String(), RevokeAllRefreshTokensOptions{
+		ExpectedCredentialEpoch: expectedEpoch,
+		EnforceCredentialEpoch:  true,
+	})
+	require.ErrorIs(t, err, credepoch.ErrEpochMismatch)
+
+	var revokedAt sql.NullTime
+	require.NoError(t, db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, activeHash).Scan(&revokedAt))
+	assert.False(t, revokedAt.Valid, "a stale step-up authorization must not revoke a newer session")
+}
+
+func TestRevokeAllRefreshTokens_UnknownUser_ReturnsError(t *testing.T) {
+	_, db, _ := newAdmitPathHandler(t)
+
+	_, err := RevokeAllRefreshTokens(context.Background(), db, uuid.New().String(), RevokeAllRefreshTokensOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "lock refresh-token revocation user")
+}
+
+func TestRevokeAllRefreshTokens_CanceledContext_ReturnsError(t *testing.T) {
+	_, db, userID := newAdmitPathHandler(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := RevokeAllRefreshTokens(ctx, db, userID.String(), RevokeAllRefreshTokensOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "begin refresh-token revocation transaction")
 }
 
 func TestCompleteLoginRejectsSupersededEpoch(t *testing.T) {

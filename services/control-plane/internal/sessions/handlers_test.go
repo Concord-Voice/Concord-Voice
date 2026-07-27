@@ -7,7 +7,12 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/sessions"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -173,4 +178,80 @@ func TestRevokeAllSessionsExceptCurrent(t *testing.T) {
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, rw, &body)
 	assert.Equal(t, "All other sessions revoked successfully", body["message"])
+}
+
+func TestRevokeAllSessionsExceptCurrent_UsesBearerSessionWithoutCookie(t *testing.T) {
+	ts := setupTS(t)
+	accessToken, _ := registerAndGetTokens(t, ts, "revokeotherbearer@test.concord.chat", "revokeotherbearer")
+	claims, err := auth.ValidateAccessToken(accessToken, testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	userID, currentSessionID := claims.UserID, claims.SessionID
+	require.NotEmpty(t, currentSessionID)
+	var otherSessionID string
+	require.NoError(t, ts.DB.QueryRow(
+		`INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
+		 VALUES ($1, $2, NOW() + INTERVAL '30 days') RETURNING id`,
+		userID, auth.HashRefreshToken("other-session-token"),
+	).Scan(&otherSessionID))
+
+	w := ts.DoRequest("POST", "/api/v1/sessions/revoke-all", map[string]interface{}{
+		"password": "TestPassword123!",
+	}, testhelpers.AuthHeaders(accessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var currentActive, otherActive int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL`, currentSessionID).Scan(&currentActive))
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL`, otherSessionID).Scan(&otherActive))
+	assert.Equal(t, 1, currentActive, "the bearer-authenticated session must be preserved without a refresh cookie")
+	assert.Zero(t, otherActive, "all non-current sessions must be revoked")
+}
+
+func TestRevokeAllSessionsExceptCurrent_WithoutSessionIdentityFailsSafely(t *testing.T) {
+	ts := setupTS(t)
+	accessToken, _ := registerAndGetTokens(t, ts, "revokeotherlegacy@test.concord.chat", "revokeotherlegacy")
+	claims, err := auth.ValidateAccessToken(accessToken, testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	legacyAccessToken, err := auth.GenerateAccessToken(claims.UserID, testhelpers.TestJWTSecret, true, "", "")
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", revokeAllPath, map[string]interface{}{
+		"password": "TestPassword123!",
+	}, testhelpers.AuthHeaders(legacyAccessToken))
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Current session cannot be identified", body["error"])
+
+	var active int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, claims.UserID,
+	).Scan(&active))
+	assert.Equal(t, 1, active, "a request without a current-session identity must not revoke any session")
+}
+
+func TestRevokeAllSessions_EpochAdvanceAfterAuthenticationReturnsUnauthorized(t *testing.T) {
+	ts := setupTS(t)
+	accessToken, _ := registerAndGetTokens(t, ts, "revokeepoch@test.concord.chat", "revokeepoch")
+	claims, err := auth.ValidateAccessToken(accessToken, testhelpers.TestJWTSecret)
+	require.NoError(t, err)
+	staleToken, err := auth.GenerateAccessToken(claims.UserID, testhelpers.TestJWTSecret, true, "stale-epoch", "")
+	require.NoError(t, err)
+
+	router := gin.New()
+	router.Use(middleware.AuthRequired(testhelpers.TestJWTSecret, ts.Redis, nil))
+	router.Use(func(c *gin.Context) {
+		if _, updateErr := ts.DB.Exec(`UPDATE users SET credential_epoch = 'new-epoch' WHERE id = $1`, claims.UserID); updateErr != nil {
+			c.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+	})
+	router.POST(revokeAllPath, sessions.NewHandler(ts.DB, ts.Redis, logger.New("test"), nil, nil).RevokeAllSessions)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, revokeAllPath, bytes.NewBufferString(`{"password":"TestPassword123!","include_current":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+staleToken)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }

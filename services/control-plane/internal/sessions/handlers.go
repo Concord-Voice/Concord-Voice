@@ -4,6 +4,7 @@ package sessions
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
@@ -26,7 +29,10 @@ const (
 	errMsgFailedVerifyPassword  = "Failed to verify password"
 	errMsgIncorrectPassword     = "Incorrect password"
 	errMsgFailedFetchSessions   = "Failed to fetch sessions"
+	errMsgCurrentSessionUnknown = "Current session cannot be identified"
 )
+
+var errCurrentSessionUnknown = errors.New("current session cannot be identified")
 
 // SessionDisconnector allows forcefully disconnecting WebSocket connections.
 // Defined as an interface to avoid coupling to the websocket package.
@@ -488,6 +494,14 @@ func (h *Handler) RevokeAllSessions(c *gin.Context) {
 
 	result, err := h.revokeAllSessionsDB(uid, req.IncludeCurrent, c)
 	if err != nil {
+		if errors.Is(err, errCurrentSessionUnknown) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsgCurrentSessionUnknown})
+			return
+		}
+		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgUnauthorized})
+			return
+		}
 		h.log.Error("Failed to revoke sessions", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to revoke sessions"})
 		return
@@ -517,21 +531,21 @@ func (h *Handler) RevokeAllSessions(c *gin.Context) {
 
 // revokeAllSessionsDB revokes all sessions, optionally excluding the current one.
 func (h *Handler) revokeAllSessionsDB(uid string, includeCurrent bool, c *gin.Context) (sql.Result, error) {
-	currentToken, cookieErr := c.Cookie("refresh_token")
-	if cookieErr != nil {
-		currentToken = ""
+	options := auth.RevokeAllRefreshTokensOptions{
+		ExpectedCredentialEpoch: middleware.TokenCredentialEpoch(c),
+		EnforceCredentialEpoch:  true,
 	}
-
-	if currentToken != "" && !includeCurrent {
-		currentTokenHash := auth.HashRefreshToken(currentToken)
-		return h.db.Exec(
-			`UPDATE refresh_tokens SET revoked_at = NOW()
-			 WHERE user_id = $1 AND token_hash != $2 AND revoked_at IS NULL`,
-			uid, currentTokenHash)
+	if !includeCurrent {
+		options.ExcludeSessionID = middleware.TokenSessionID(c)
+		if options.ExcludeSessionID == "" {
+			if currentToken, cookieErr := c.Cookie("refresh_token"); cookieErr == nil && currentToken != "" {
+				options.ExcludeTokenHash = auth.HashRefreshToken(currentToken)
+			} else {
+				return nil, errCurrentSessionUnknown
+			}
+		}
 	}
-	return h.db.Exec(
-		`UPDATE refresh_tokens SET revoked_at = NOW()
-		 WHERE user_id = $1 AND revoked_at IS NULL`, uid)
+	return auth.RevokeAllRefreshTokens(c.Request.Context(), h.db, uid, options)
 }
 
 // UpdateRevocationMode allows users to toggle between "simple" and "secure"

@@ -898,6 +898,7 @@ Dev/test services (`pgadmin`, `redis-commander`) are gated behind the `tools` co
 
 - Email + password with **Argon2id** hashing (t=3, m=64MB, p=4); username validation with profanity/leetspeak filtering. Login authenticates by **email**.
 - **JWT access tokens** (15-minute TTL) + **refresh tokens** (30-day rolling) in HttpOnly cookies (`internal/auth/`).
+- **Refresh-token revocation ordering:** standalone bulk sweeps call `auth.RevokeAllRefreshTokens`, which locks the user row `FOR NO KEY UPDATE` in the revocation transaction. Destructive flows that already hold that lock retain their own atomic sweeps. Session mints take the same lock, so a sweep and mint have a total order. The helper can exclude the authenticated refresh session for “revoke all other sessions”; that exclusion changes only the sweep predicate, not the users-row lock.
 - **WebSocket auth:** single-use ticket (30s TTL, consumed on first use).
 - **MFA (implemented):** TOTP, WebAuthn, backup codes, recovery key, trusted devices, and social recovery circles (`internal/mfa/`).
 - **SSO (implemented):** OAuth 2.0 / OIDC for Google and Apple (`internal/oauth/`; auth-side integration in `internal/auth/oauth_adapter.go`).

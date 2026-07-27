@@ -12017,20 +12017,103 @@ paths:
       tags:
       - Sessions
       summary: Revoke all sessions
-      description: 'Revoke all active sessions for the authenticated user, including the current one.
+      description: 'Revoke the authenticated user''s active sessions after password
+
+        or MFA re-verification. A request with neither step-up credential returns a
+
+        403 discovery response describing the required method. By default, the authenticated
+
+        bearer session is preserved; legacy bearer tokens without a session ID preserve
+
+        the supplied refresh token. Set `include_current` to `true` to revoke that
+
+        session too.
 
         Rate limit: 5 requests per minute (user-based).
 
         '
       security:
       - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password:
+                  type: string
+                  format: password
+                  description: Current account password for step-up authentication
+                mfa_code:
+                  type: string
+                  description: MFA verification code; may be used instead of the password
+                include_current:
+                  type: boolean
+                  default: false
+                  description: Revoke the current refresh token as well as all other sessions
       responses:
         '200':
-          description: All sessions revoked
+          description: Sessions revoked
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessMessage'
+                type: object
+                required:
+                - message
+                - count
+                - include_current
+                properties:
+                  message:
+                    type: string
+                  count:
+                    type: integer
+                    minimum: 0
+                    description: Number of refresh-token sessions revoked
+                  include_current:
+                    type: boolean
+        '400':
+          description: Invalid JSON request body or an unidentifiable current session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid access token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Account access is denied, or password or MFA verification is required or failed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/AccountDisabledError'
+                - type: object
+                  required:
+                  - error
+                  properties:
+                    error:
+                      type: string
+                    message:
+                      type: string
+                      description: Present when step-up authentication is required
+                    methods:
+                      type: array
+                      nullable: true
+                      items:
+                        type: string
+                      description: Enabled MFA methods when MFA authentication is required
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Password/MFA verification or session revocation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /sessions/{id}:
     delete:
       tags:

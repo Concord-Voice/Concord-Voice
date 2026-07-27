@@ -43,18 +43,10 @@ import (
 // matching CompleteLogin semantics), or this mint holds the lock and the reset,
 // which must wait for it, sweeps the freshly-inserted row.
 //
-// TWO SCOPE LIMITS, both proven by PoC during the #2453 review — do not restate
-// this as a general "the lock alone is sufficient" claim:
-//
-//  1. A lock only orders actors that TAKE it. Two bulk revokers of
-//     refresh_tokens hold no users-row lock and are therefore NOT serialized by
-//     this: sessions.revokeAllSessionsDB (#2457) and auth.handleTokenTheft
-//     (#2460). Those are revoker-side defects, fixed there, not here.
-//  2. "SSO carries no separately-authorized epoch" is true of the provider-
-//     assertion Callback path and FALSE of CompleteLink, whose authorization is
-//     a password verified at an earlier instant — i.e. exactly a separately-
-//     authorized epoch. Binding that path needs a MatchEpoch comparison, not
-//     just this lock; tracked in #2458.
+// Standalone bulk refresh-token revocations use RevokeAllRefreshTokens, while
+// destructive flows already holding this row lock retain atomic sweeps. SSO's scope limit remains:
+// CompleteLink is authorized by an earlier password verification and needs a
+// MatchEpoch comparison, not just this lock (#2458).
 //
 // Before this the epoch SELECT and the INSERT were two unfenced statements with
 // a Redis round trip between them, so a reset could bulk-revoke, commit, and
