@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.37] — 2026-07-27
+
+### Fixed
+
+- **Desktop updates no longer risk a crash or missing preload files** ([#2492](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2492)) — updated Electron to 43.1.1, which fixes failures when an installed app archive is replaced while Concord Voice is still running and includes Chromium 150.0.7871.114.
+
 ## [0.2.36] — 2026-07-26
 
 ### Security
