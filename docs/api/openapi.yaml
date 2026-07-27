@@ -12031,9 +12031,13 @@ paths:
 
         403 discovery response describing the required method. By default, the authenticated
 
-        bearer session is preserved; legacy bearer tokens without a session ID preserve
+        active bearer session is preserved; if it is no longer active, the supplied
 
-        the supplied refresh token. Set `include_current` to `true` to revoke that
+        refresh token session is preserved instead. A request that identifies no active
+
+        current session fails without revoking any sessions. When a bearer session is preserved, a different
+
+        refresh-token cookie session is revoked and can no longer be used. Set `include_current` to `true` to revoke that
 
         session too.
 

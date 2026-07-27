@@ -206,6 +206,94 @@ func TestRevokeAllSessionsExceptCurrent_UsesBearerSessionWithoutCookie(t *testin
 	assert.Zero(t, otherActive, "all non-current sessions must be revoked")
 }
 
+func TestRevokeAllSessionsExceptCurrent_StaleBearerPreservesCurrentCookieSession(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "revokeallstalebearer")
+
+	loginW := ts.DoRequest(http.MethodPost, "/api/v1/auth/login", map[string]interface{}{
+		"email":    user.Email,
+		"password": testhelpers.TestAuthPlaintext,
+	}, nil)
+	require.Equal(t, http.StatusOK, loginW.Code)
+	var loginBody struct {
+		AccessToken string `json:"access_token"` //nolint:gosec // G117: response-binding field
+		SessionID   string `json:"session_id"`
+	}
+	testhelpers.ParseJSON(t, loginW, &loginBody)
+	require.NotEmpty(t, loginBody.AccessToken)
+	require.NotEmpty(t, loginBody.SessionID)
+	var refreshCookieA *http.Cookie
+	for _, cookie := range loginW.Result().Cookies() {
+		if cookie.Name == "refresh_token" {
+			refreshCookieA = cookie
+			break
+		}
+	}
+	require.NotNil(t, refreshCookieA)
+
+	refreshReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", nil)
+	refreshReq.AddCookie(refreshCookieA)
+	refreshW := httptest.NewRecorder()
+	ts.Router.ServeHTTP(refreshW, refreshReq)
+	require.Equal(t, http.StatusOK, refreshW.Code)
+	var refreshBody struct {
+		SessionID string `json:"session_id"`
+	}
+	testhelpers.ParseJSON(t, refreshW, &refreshBody)
+	require.NotEmpty(t, refreshBody.SessionID)
+	require.NotEqual(t, loginBody.SessionID, refreshBody.SessionID)
+	var refreshCookieB *http.Cookie
+	for _, cookie := range refreshW.Result().Cookies() {
+		if cookie.Name == "refresh_token" {
+			refreshCookieB = cookie
+			break
+		}
+	}
+	require.NotNil(t, refreshCookieB)
+
+	otherSessionID := createSession(t, ts, user.ID, "OtherDevice", testIP2)
+	body, err := json.Marshal(map[string]interface{}{"password": testhelpers.TestAuthPlaintext})
+	require.NoError(t, err)
+	staleReq := httptest.NewRequest(http.MethodPost, revokeAllPath, bytes.NewReader(body))
+	staleReq.Header.Set("Authorization", "Bearer "+loginBody.AccessToken)
+	staleReq.Header.Set("Content-Type", "application/json")
+	staleReq.AddCookie(refreshCookieA)
+	staleW := httptest.NewRecorder()
+	ts.Router.ServeHTTP(staleW, staleReq)
+	require.Equal(t, http.StatusBadRequest, staleW.Code)
+	var staleBody map[string]interface{}
+	testhelpers.ParseJSON(t, staleW, &staleBody)
+	assert.Equal(t, "Current session cannot be identified", staleBody["error"])
+
+	var activeBeforeCurrent, activeBeforeOther int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL`, refreshBody.SessionID,
+	).Scan(&activeBeforeCurrent))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL`, otherSessionID,
+	).Scan(&activeBeforeOther))
+	assert.Equal(t, 1, activeBeforeCurrent, "unknown current session must not revoke the active cookie session")
+	assert.Equal(t, 1, activeBeforeOther, "unknown current session must not revoke unrelated sessions")
+
+	revokeReq := httptest.NewRequest(http.MethodPost, revokeAllPath, bytes.NewReader(body))
+	revokeReq.Header.Set("Authorization", "Bearer "+loginBody.AccessToken)
+	revokeReq.Header.Set("Content-Type", "application/json")
+	revokeReq.AddCookie(refreshCookieB)
+	revokeW := httptest.NewRecorder()
+	ts.Router.ServeHTTP(revokeW, revokeReq)
+	require.Equal(t, http.StatusOK, revokeW.Code)
+
+	var currentActive, otherActive int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL`, refreshBody.SessionID,
+	).Scan(&currentActive))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM refresh_tokens WHERE id = $1 AND revoked_at IS NULL`, otherSessionID,
+	).Scan(&otherActive))
+	assert.Equal(t, 1, currentActive, "the current refresh-cookie session must be preserved when the bearer sid is stale")
+	assert.Zero(t, otherActive, "all unrelated active sessions must be revoked")
+}
+
 func TestRevokeAllSessionsExceptCurrent_WithoutSessionIdentityFailsSafely(t *testing.T) {
 	ts := setupTS(t)
 	accessToken, _ := registerAndGetTokens(t, ts, "revokeotherlegacy@test.concord.chat", "revokeotherlegacy")

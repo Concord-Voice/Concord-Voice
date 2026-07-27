@@ -9,6 +9,9 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 )
 
+// ErrNoActiveRefreshSession reports that no requested preserved session remains active.
+var ErrNoActiveRefreshSession = errors.New("no active refresh session")
+
 // RevokeAllRefreshTokensOptions controls a serialized bulk revocation.
 type RevokeAllRefreshTokensOptions struct {
 	ExcludeTokenHash        string
@@ -55,18 +58,16 @@ func revokeAllRefreshTokensTx(ctx context.Context, tx *sql.Tx, userID string, op
 		}
 	}
 
-	switch {
-	case options.ExcludeSessionID != "":
+	if options.ExcludeSessionID != "" || options.ExcludeTokenHash != "" {
+		excludeSessionID, resolveErr := activeRefreshSessionID(ctx, tx, userID, options)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
 		result, err = tx.ExecContext(ctx,
 			`UPDATE refresh_tokens SET revoked_at = NOW()
 			 WHERE user_id = $1 AND id != $2 AND revoked_at IS NULL`,
-			userID, options.ExcludeSessionID)
-	case options.ExcludeTokenHash != "":
-		result, err = tx.ExecContext(ctx,
-			`UPDATE refresh_tokens SET revoked_at = NOW()
-			 WHERE user_id = $1 AND token_hash != $2 AND revoked_at IS NULL`,
-			userID, options.ExcludeTokenHash)
-	default:
+			userID, excludeSessionID)
+	} else {
 		result, err = tx.ExecContext(ctx,
 			`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, userID)
 	}
@@ -74,4 +75,46 @@ func revokeAllRefreshTokensTx(ctx context.Context, tx *sql.Tx, userID string, op
 		return nil, fmt.Errorf("revoke refresh tokens: %w", err)
 	}
 	return result, nil
+}
+
+// activeRefreshSessionID resolves the active session that bulk revocation must preserve.
+// The caller already holds the user lock; this row lock also serializes individual
+// session revocation with the following bulk update.
+func activeRefreshSessionID(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+	options RevokeAllRefreshTokensOptions,
+) (string, error) {
+	if options.ExcludeSessionID != "" {
+		var sessionID string
+		err := tx.QueryRowContext(ctx,
+			`SELECT id FROM refresh_tokens
+			 WHERE user_id = $1 AND id = $2 AND revoked_at IS NULL AND expires_at > NOW()
+			 FOR UPDATE`, userID, options.ExcludeSessionID,
+		).Scan(&sessionID)
+		if err == nil {
+			return sessionID, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("resolve active bearer refresh session: %w", err)
+		}
+	}
+
+	if options.ExcludeTokenHash != "" {
+		var sessionID string
+		err := tx.QueryRowContext(ctx,
+			`SELECT id FROM refresh_tokens
+			 WHERE user_id = $1 AND token_hash = $2 AND revoked_at IS NULL AND expires_at > NOW()
+			 FOR UPDATE`, userID, options.ExcludeTokenHash,
+		).Scan(&sessionID)
+		if err == nil {
+			return sessionID, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("resolve active cookie refresh session: %w", err)
+		}
+	}
+
+	return "", ErrNoActiveRefreshSession
 }

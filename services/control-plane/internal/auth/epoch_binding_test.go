@@ -166,6 +166,76 @@ func TestRevokeAllRefreshTokens_ExcludesCurrentToken(t *testing.T) {
 	assert.False(t, otherUserRevokedAt.Valid, "a different user's active token must remain active")
 }
 
+func TestRevokeAllRefreshTokens_ResolvesActiveExcludedSession(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		bearerRevoked    bool
+		cookieRevoked    bool
+		bearerExpired    bool
+		cookieExpired    bool
+		preservedSession string
+	}{
+		{name: "prefers active bearer", preservedSession: "bearer"},
+		{name: "falls back to active cookie", bearerRevoked: true, preservedSession: "cookie"},
+		{name: "falls back from expired bearer", bearerExpired: true, preservedSession: "cookie"},
+		{name: "rejects stale bearer and cookie", bearerRevoked: true, cookieRevoked: true},
+		{name: "rejects expired bearer and cookie", bearerExpired: true, cookieExpired: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, db, userID := newAdmitPathHandler(t)
+			bearerID, cookieID, otherID := uuid.New(), uuid.New(), uuid.New()
+			cookieHash := HashRefreshToken("current-cookie")
+			for id, tokenHash := range map[uuid.UUID]string{
+				bearerID: HashRefreshToken("stale-bearer"),
+				cookieID: cookieHash,
+				otherID:  HashRefreshToken("other-token"),
+			} {
+				_, err := db.Exec(
+					`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
+					id, userID, tokenHash, time.Now().Add(time.Hour),
+				)
+				require.NoError(t, err)
+			}
+			if tc.bearerRevoked {
+				_, err := db.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`, bearerID)
+				require.NoError(t, err)
+			}
+			if tc.cookieRevoked {
+				_, err := db.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`, cookieID)
+				require.NoError(t, err)
+			}
+			if tc.bearerExpired {
+				_, err := db.Exec(`UPDATE refresh_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1`, bearerID)
+				require.NoError(t, err)
+			}
+			if tc.cookieExpired {
+				_, err := db.Exec(`UPDATE refresh_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1`, cookieID)
+				require.NoError(t, err)
+			}
+
+			_, err := RevokeAllRefreshTokens(context.Background(), db, userID.String(), RevokeAllRefreshTokensOptions{
+				ExcludeSessionID: bearerID.String(),
+				ExcludeTokenHash: cookieHash,
+			})
+			if tc.preservedSession == "" {
+				require.ErrorIs(t, err, ErrNoActiveRefreshSession)
+			} else {
+				require.NoError(t, err)
+			}
+
+			for id, name := range map[uuid.UUID]string{bearerID: "bearer", cookieID: "cookie", otherID: "other"} {
+				var revokedAt sql.NullTime
+				require.NoError(t, db.QueryRow(`SELECT revoked_at FROM refresh_tokens WHERE id = $1`, id).Scan(&revokedAt))
+				expectedRevoked := name != tc.preservedSession
+				if tc.preservedSession == "" {
+					expectedRevoked = (name == "bearer" && tc.bearerRevoked) || (name == "cookie" && tc.cookieRevoked)
+				}
+				assert.Equal(t, expectedRevoked, revokedAt.Valid, "%s token revocation", name)
+			}
+		})
+	}
+}
+
 func TestRevokeAllRefreshTokens_WithoutExclusionPreservesOtherUsersAndRevokedRows(t *testing.T) {
 	_, db, userID := newAdmitPathHandler(t)
 	activeHash := HashRefreshToken("active-token")

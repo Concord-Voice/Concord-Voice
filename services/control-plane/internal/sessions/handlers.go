@@ -537,15 +537,18 @@ func (h *Handler) revokeAllSessionsDB(uid string, includeCurrent bool, c *gin.Co
 	}
 	if !includeCurrent {
 		options.ExcludeSessionID = middleware.TokenSessionID(c)
-		if options.ExcludeSessionID == "" {
-			if currentToken, cookieErr := c.Cookie("refresh_token"); cookieErr == nil && currentToken != "" {
-				options.ExcludeTokenHash = auth.HashRefreshToken(currentToken)
-			} else {
-				return nil, errCurrentSessionUnknown
-			}
+		if currentToken, cookieErr := c.Cookie("refresh_token"); cookieErr == nil && currentToken != "" {
+			options.ExcludeTokenHash = auth.HashRefreshToken(currentToken)
+		}
+		if options.ExcludeSessionID == "" && options.ExcludeTokenHash == "" {
+			return nil, errCurrentSessionUnknown
 		}
 	}
-	return auth.RevokeAllRefreshTokens(c.Request.Context(), h.db, uid, options)
+	result, err := auth.RevokeAllRefreshTokens(c.Request.Context(), h.db, uid, options)
+	if errors.Is(err, auth.ErrNoActiveRefreshSession) {
+		return nil, errCurrentSessionUnknown
+	}
+	return result, err
 }
 
 // UpdateRevocationMode allows users to toggle between "simple" and "secure"
