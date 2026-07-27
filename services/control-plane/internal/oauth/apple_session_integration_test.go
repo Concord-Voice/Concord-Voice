@@ -288,6 +288,8 @@ func TestAppleSession_ExistingSSO_IssuesTokens(t *testing.T) {
 	assert.Equal(t, true, resp["remember_me"])
 	assert.Equal(t, resp["session_id"], w.Header().Get(middleware.SessionIDHeader))
 	assert.NotEmpty(t, w.Header().Get("Set-Cookie"), "refresh cookie must be set (respondExistingSSO reuse)")
+	assert.Equal(t, 1, rig.Adapter.IssueAccessAndRefreshCalls)
+	assert.Zero(t, rig.Adapter.IssueAccessAndRefreshBoundCalls)
 }
 
 func TestAppleSession_ExistingSSO_RequiresMFA(t *testing.T) {

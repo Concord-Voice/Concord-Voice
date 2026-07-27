@@ -1480,7 +1480,9 @@ paths:
       description: 'Prove ownership of the email-matched account with its password (shares the /auth/login
         lockout counter),
 
-        then attach the SSO identity and issue a session. Rate limit: 5 requests per 15 minutes (IP-based).
+        then atomically attach the SSO identity and issue a session. The password proof is bound to the
+        credential epoch it verified; an intervening credential reset refuses both the identity link and session.
+        Rate limit: 5 requests per 15 minutes (IP-based).
 
         '
       operationId: ssoCompleteLink
@@ -1549,6 +1551,12 @@ paths:
                 $ref: '#/components/schemas/SSOError'
         '423':
           description: Account locked after repeated failed password attempts (`account_locked`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SSOError'
+        '500':
+          description: Session issuance or SSO identity persistence failed (`token_issuance_failed` / `sso_identity_insert_failed`)
           content:
             application/json:
               schema:

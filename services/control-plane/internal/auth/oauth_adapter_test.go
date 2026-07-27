@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -104,12 +105,114 @@ func TestIssueAccessAndRefresh_UnknownUser_Errors(t *testing.T) {
 	assert.Contains(t, err.Error(), "not found")
 }
 
+func TestIssueAccessAndRefreshBound_MatchingCredentialEpoch_Succeeds(t *testing.T) {
+	rig := newAdapterRig(t)
+	const password = "CorrectHorseBatteryStaple1!" // pragma: allowlist secret
+	userID := insertAdapterUser(t, rig, "bound-match@example.test", "boundmatch", password)
+
+	_, err := rig.DB.ExecContext(context.Background(),
+		`UPDATE users SET credential_epoch = $2 WHERE id = $1`, userID, "epoch-current")
+	require.NoError(t, err)
+
+	verifiedEpoch, err := rig.Handler.VerifyPassword(context.Background(), userID, password)
+	require.NoError(t, err)
+	require.Equal(t, "epoch-current", verifiedEpoch)
+
+	access, refresh, sessionID, err := rig.Handler.IssueAccessAndRefreshBound(context.Background(), userID, verifiedEpoch, auth.SSOIdentityLink{
+		Provider:       "google",
+		ProviderUserID: "bound-subject",
+		ProviderEmail:  "bound@example.test",
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, access)
+	assert.NotEmpty(t, refresh)
+	assert.NotEmpty(t, sessionID)
+
+	var storedSessionID string
+	require.NoError(t, rig.DB.QueryRow(
+		`SELECT id FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, userID,
+	).Scan(&storedSessionID))
+	assert.Equal(t, sessionID, storedSessionID)
+
+	var identityProvider string
+	require.NoError(t, rig.DB.QueryRow(
+		`SELECT provider FROM user_sso_identities WHERE user_id = $1`, userID,
+	).Scan(&identityProvider))
+	assert.Equal(t, "google", identityProvider)
+}
+
+func TestIssueAccessAndRefreshBound_RejectsAdvancedCredentialEpoch(t *testing.T) {
+	rig := newAdapterRig(t)
+	const password = "CorrectHorseBatteryStaple1!" // pragma: allowlist secret
+	userID := insertAdapterUser(t, rig, "bound@example.test", "bounduser", password)
+
+	_, err := rig.DB.ExecContext(context.Background(),
+		`UPDATE users SET credential_epoch = $2 WHERE id = $1`, userID, "epoch-before-reset")
+	require.NoError(t, err)
+
+	verifiedEpoch, err := rig.Handler.VerifyPassword(context.Background(), userID, password)
+	require.NoError(t, err)
+	require.Equal(t, "epoch-before-reset", verifiedEpoch)
+
+	// A committed destructive reset advances the durable epoch before the mint.
+	_, err = rig.DB.ExecContext(context.Background(),
+		`UPDATE users SET credential_epoch = $2 WHERE id = $1`, userID, "epoch-after-reset")
+	require.NoError(t, err)
+
+	access, refresh, sessionID, err := rig.Handler.IssueAccessAndRefreshBound(context.Background(), userID, verifiedEpoch, auth.SSOIdentityLink{
+		Provider:       "google",
+		ProviderUserID: "stale-bound-subject",
+		ProviderEmail:  "bound@example.test",
+	})
+	require.ErrorIs(t, err, credepoch.ErrEpochMismatch)
+	assert.Empty(t, access)
+	assert.Empty(t, refresh)
+	assert.Empty(t, sessionID)
+
+	var live int
+	require.NoError(t, rig.DB.QueryRow(
+		`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, userID,
+	).Scan(&live))
+	assert.Zero(t, live, "an epoch-mismatched mint must not create a live refresh row")
+
+	var identities int
+	require.NoError(t, rig.DB.QueryRow(
+		`SELECT COUNT(*) FROM user_sso_identities WHERE user_id = $1`, userID,
+	).Scan(&identities))
+	assert.Zero(t, identities, "an epoch-mismatched mint must not link an SSO identity")
+}
+
+func TestIssueAccessAndRefreshBound_RollsBackIdentityWhenRefreshInsertFails(t *testing.T) {
+	rig := newAdapterRig(t)
+	userID := insertAdapterUser(t, rig, "bound-rollback@example.test", "boundrollback", "Password!1234") // pragma: allowlist secret
+
+	_, err := rig.DB.Exec(`ALTER TABLE refresh_tokens ADD CONSTRAINT oauth_adapter_reject_refresh CHECK (false) NOT VALID`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := rig.DB.Exec(`ALTER TABLE refresh_tokens DROP CONSTRAINT oauth_adapter_reject_refresh`)
+		require.NoError(t, cleanupErr)
+	})
+
+	_, _, _, err = rig.Handler.IssueAccessAndRefreshBound(context.Background(), userID, "", auth.SSOIdentityLink{
+		Provider:       "google",
+		ProviderUserID: "rollback-subject",
+		ProviderEmail:  "bound-rollback@example.test",
+	})
+	require.Error(t, err)
+
+	var identities, refreshes int
+	require.NoError(t, rig.DB.QueryRow(`SELECT COUNT(*) FROM user_sso_identities WHERE user_id = $1`, userID).Scan(&identities))
+	require.NoError(t, rig.DB.QueryRow(`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1`, userID).Scan(&refreshes))
+	assert.Zero(t, identities, "a failed refresh insert must roll back the linked identity")
+	assert.Zero(t, refreshes, "a failed bound mint must not persist a refresh row")
+}
+
 // =============================================================================
 // VerifyPassword (4 paths: lookup miss, lockout, bad password, good password)
 // =============================================================================
 
 // TestVerifyPassword_GoodPassword_Succeeds verifies the happy path: a correct
-// password returns nil and clears the failure counter.
+// password returns its credential epoch and clears the failure counter.
 func TestVerifyPassword_GoodPassword_Succeeds(t *testing.T) {
 	rig := newAdapterRig(t)
 	const password = "CorrectHorseBatteryStaple1!" // pragma: allowlist secret
@@ -120,7 +223,7 @@ func TestVerifyPassword_GoodPassword_Succeeds(t *testing.T) {
 		context.Background(), "login_attempts:verify@example.test", "3", 0,
 	).Err())
 
-	err := rig.Handler.VerifyPassword(context.Background(), userID, password)
+	_, err := rig.Handler.VerifyPassword(context.Background(), userID, password)
 	require.NoError(t, err)
 
 	// Counter should be cleared (Get returns redis.Nil when key is absent).
@@ -140,7 +243,7 @@ func TestVerifyPassword_WrongPassword_IncrementsCounter(t *testing.T) {
 	const wrongPassword = "WrongHorseBatteryStaple1!"  // pragma: allowlist secret
 	userID := insertAdapterUser(t, rig, "wrong@example.test", "wronguser", goodPassword)
 
-	err := rig.Handler.VerifyPassword(context.Background(), userID, wrongPassword)
+	_, err := rig.Handler.VerifyPassword(context.Background(), userID, wrongPassword)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid_credentials")
 	// Sentinel must NOT match here — only threshold-trip returns ErrAccountLocked.
@@ -171,7 +274,7 @@ func TestVerifyPassword_PreflightLockout_ReturnsSentinel(t *testing.T) {
 	).Err())
 
 	// Even with the CORRECT password, lockout pre-flight wins.
-	err := rig.Handler.VerifyPassword(context.Background(), userID, password)
+	_, err := rig.Handler.VerifyPassword(context.Background(), userID, password)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, auth.ErrAccountLocked),
 		"locked account must return auth.ErrAccountLocked sentinel")
@@ -184,7 +287,7 @@ func TestVerifyPassword_UnknownUser_ReturnsInvalidCredentials(t *testing.T) {
 	rig := newAdapterRig(t)
 	missing := uuid.New().String()
 
-	err := rig.Handler.VerifyPassword(context.Background(), missing, "anything")
+	_, err := rig.Handler.VerifyPassword(context.Background(), missing, "anything")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid_credentials")
 	assert.False(t, errors.Is(err, auth.ErrAccountLocked))

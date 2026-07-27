@@ -62,6 +62,9 @@ type AuthAdapter interface {
 	// IssueAccessAndRefresh mints the access token, refresh token, and refresh-row
 	// session ID for the given userID. The caller owns the response cookie/body.
 	IssueAccessAndRefresh(ctx context.Context, userID string) (accessToken, refreshToken, sessionID string, err error)
+	// IssueAccessAndRefreshBound additionally refuses when the credential epoch
+	// has advanced since authorization.
+	IssueAccessAndRefreshBound(ctx context.Context, userID, expectedEpoch string, identity auth.SSOIdentityLink) (accessToken, refreshToken, sessionID string, err error)
 	// IssueMFAChallenge mints a short-lived MFA challenge token for users with
 	// MFA enabled. Returns:
 	//   - challengeToken: short-lived JWT the renderer presents to the modal
@@ -74,8 +77,9 @@ type AuthAdapter interface {
 	//     surfacing it on this method keeps behavior parallel.
 	IssueMFAChallenge(ctx context.Context, userID string) (challengeToken string, methods []string, recoveryOnlyMethods []string, webauthnOptions interface{}, mfaEnabled bool, err error)
 	// VerifyPassword performs a constant-time password check against the user's
-	// stored Argon2id hash, used by the link-existing-account flow.
-	VerifyPassword(ctx context.Context, userID, password string) error
+	// stored Argon2id hash and returns the epoch it verified, used by the
+	// link-existing-account flow.
+	VerifyPassword(ctx context.Context, userID, password string) (credentialEpoch string, err error)
 	// HashPassword computes an Argon2id hash of the supplied passphrase, used
 	// by the new-user SSO registration path to populate users.password_hash.
 	// Even when password login is disabled, the column is NOT NULL — the hash
@@ -676,6 +680,10 @@ func handleSSOIssueError(c *gin.Context, err error) bool {
 		c.JSON(http.StatusForbidden, gin.H{"error_code": "account_disabled"})
 		return true
 	}
+	if errors.Is(err, auth.ErrSSOIdentityInsert) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "sso_identity_insert_failed"})
+		return true
+	}
 	c.JSON(http.StatusInternalServerError, gin.H{"error_code": "token_issuance_failed"})
 	return true
 }
@@ -1030,19 +1038,12 @@ type completeLinkRequest struct {
 //     the SAME counter that gates /login. The adapter returns the
 //     auth.ErrAccountLocked sentinel when the threshold is reached
 //     (matched via errors.Is); the handler translates that to 423 Locked.
-//  5. INSERT user_sso_identities. password_login_disabled is NOT modified
-//     — the user already has a password posture; linking does not change
-//     it. The user retains password login + gains SSO login as a parallel
-//     option, until they explicitly opt out via Settings (Task 12).
-//  6. Issue access + refresh tokens via AuthAdapter and return 200.
+//  5. Atomically insert user_sso_identities and issue a bound access + refresh
+//     pair under the users row lock. password_login_disabled is NOT modified.
 //
-// No DB transaction is needed — only one INSERT happens. The verify+insert+
-// token sequence is not atomic, but the worst-case race (same user invoked
-// twice concurrently) is bounded by the user_sso_identities UNIQUE
-// (provider, provider_user_id) constraint: a second insert fails with
-// sso_identity_insert_failed; harmless beyond a duplicate 500 response on
-// the loser. Token-issuance duplication is also harmless — refresh cookies
-// are valid as a set, not a singleton.
+// The password proof is authorized under the epoch returned by VerifyPassword.
+// The bound mint compares it and persists both the identity and refresh row in
+// one transaction, so a reset that advances the epoch leaves neither behind.
 func (h *Handler) CompleteLink(c *gin.Context) {
 	var req completeLinkRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1068,7 +1069,8 @@ func (h *Handler) CompleteLink(c *gin.Context) {
 	// invalid_credentials and returns auth.ErrAccountLocked once threshold is
 	// reached. We translate to 423 Locked for the locked path; everything
 	// else is opaque 401 invalid_credentials.
-	if err := h.deps.AuthHandler.VerifyPassword(ctx, info.TargetUserID, req.Password); err != nil {
+	expectedEpoch, err := h.deps.AuthHandler.VerifyPassword(ctx, info.TargetUserID, req.Password)
+	if err != nil {
 		if errors.Is(err, auth.ErrAccountLocked) {
 			c.JSON(http.StatusLocked, gin.H{"error_code": "account_locked"})
 			return
@@ -1077,20 +1079,15 @@ func (h *Handler) CompleteLink(c *gin.Context) {
 		return
 	}
 
-	// Create the SSO identity row. Do NOT modify password_login_disabled —
-	// the user is opting INTO an additional sign-in option, not opting OUT
-	// of password login. Only the explicit Settings toggle (Task 12) flips
-	// that posture.
-	if _, err := h.deps.DB.ExecContext(ctx,
-		`INSERT INTO user_sso_identities (user_id, provider, provider_user_id, provider_email, is_relay_email)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		info.TargetUserID, info.Provider, info.ProviderUserID, info.ProviderEmail, info.IsRelayEmail,
-	); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error_code": "sso_identity_insert_failed"})
-		return
-	}
-
-	access, refresh, sessionID, err := h.deps.AuthHandler.IssueAccessAndRefresh(ctx, info.TargetUserID)
+	// Do NOT modify password_login_disabled — the user is opting INTO an
+	// additional sign-in option, not opting OUT. Persist the identity in the
+	// same transaction as the bound mint so a reset-race rolls back both.
+	access, refresh, sessionID, err := h.deps.AuthHandler.IssueAccessAndRefreshBound(ctx, info.TargetUserID, expectedEpoch, auth.SSOIdentityLink{
+		Provider:       info.Provider,
+		ProviderUserID: info.ProviderUserID,
+		ProviderEmail:  info.ProviderEmail,
+		IsRelayEmail:   info.IsRelayEmail,
+	})
 	if handleSSOIssueError(c, err) {
 		return
 	}

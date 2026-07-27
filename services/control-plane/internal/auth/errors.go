@@ -26,3 +26,8 @@ var ErrAccountLocked = errors.New("account_locked: too many failed attempts")
 // Used by:
 //   - internal/oauth.Handler — translates to HTTP 403 + error_code "account_disabled".
 var ErrAccountDisabled = errors.New("account_disabled: account is terminally disabled")
+
+// ErrSSOIdentityInsert is returned when a CompleteLink transaction cannot add
+// the requested SSO identity. The OAuth handler preserves its established
+// sso_identity_insert_failed response without exposing the database error.
+var ErrSSOIdentityInsert = errors.New("sso identity insert failed")
