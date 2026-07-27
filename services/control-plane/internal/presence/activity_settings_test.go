@@ -614,6 +614,34 @@ func TestSuppressHiddenSenderActivity_ClearsWithoutDisconnecting(t *testing.T) {
 	assert.Equal(t, TierOff, gotAfter.PrivateCallTier)
 }
 
+func TestSuppressHiddenSenderActivity_VisibleSenderDoesNothing(t *testing.T) {
+	delivery := &activityServiceDeliveryStub{}
+	service := NewActivityService(
+		&activityServiceCoordinatorStub{},
+		NewActivityBuilder(nil, nil),
+		NewActivityStore(nil),
+		nil,
+		nil,
+		delivery,
+		alwaysPermitPresence{},
+	)
+	service.settingsRecipients = func(
+		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
+	) (map[uuid.UUID]bool, error) {
+		t.Fatal("a visible sender must not resolve recipients for stale suppression work")
+		return nil, nil
+	}
+
+	err := service.SuppressHiddenSenderActivityAlreadyGated(
+		context.Background(), activityServiceSender,
+	)
+
+	require.NoError(t, err)
+	assert.Empty(t, delivery.plans)
+	assert.Empty(t, delivery.disconnects)
+	assert.Zero(t, delivery.disconnectAllCalls)
+}
+
 func TestSuppressHiddenSenderActivity_ResolutionErrorDisconnects(t *testing.T) {
 	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
 	resolverErr := errors.New("hidden-sender recipient resolution failed")

@@ -56,6 +56,7 @@ type ActivityService struct {
 	store              activityStateStore
 	authorize          activityAuthorizer
 	delivery           Delivery
+	senderPresence     SenderPresenceResolver
 	settingsRecipients activitySettingsRecipientResolver
 }
 
@@ -83,6 +84,7 @@ func NewActivityService(
 		},
 		delivery,
 	)
+	service.senderPresence = senderPresence
 	service.settingsRecipients = func(
 		ctx context.Context,
 		userID uuid.UUID,

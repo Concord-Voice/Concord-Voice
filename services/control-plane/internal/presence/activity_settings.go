@@ -740,6 +740,12 @@ func (s *ActivityService) SuppressHiddenSenderActivityAlreadyGated(
 	if s == nil || s.store == nil || s.delivery == nil || s.settingsRecipients == nil {
 		return errors.New("hidden-sender activity suppression unavailable")
 	}
+	// The hub queues edge work. A visible return completed before this re-read
+	// makes the edge a no-op; a later return deliberately errs toward clearing
+	// until the normal lifecycle rebuild republishes current state.
+	if s.senderPresence != nil && s.senderPresence.RichPresenceEmissionPermitted(ctx, userID) {
+		return nil
+	}
 
 	// Resolve the audience BEFORE deleting: the resolver reconstructs each
 	// category's scope from the stored generation, so deleting first would erase
