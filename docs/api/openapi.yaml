@@ -9764,8 +9764,10 @@ paths:
         Authorization is re-resolved PER CHANNEL: channels where the actor lacks
         `Manage All Messages` (or is denied it by a channel permission override) are
         skipped rather than purged, and an actor holding only `Manage Own Messages` in
-        a channel purges only their own messages there. If no channel is purgeable the
-        request returns 403 with nothing deleted and no audit row.
+	        a channel purges only their own messages there. If the server has no channels,
+	        an actor authorized at server scope receives 200 with a zero-count audit row;
+	        otherwise, if no channel is purgeable the request returns 403 with nothing
+	        deleted and no audit row.
 
 
         Emits one `channel_purged` event per affected channel.
@@ -9795,6 +9797,12 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '403':
           description: Insufficient permissions to purge this server
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Purge failed or timed out
           content:
             application/json:
               schema:

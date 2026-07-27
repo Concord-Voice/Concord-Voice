@@ -236,6 +236,102 @@ func TestHasPermissionChannelDenyOverride(t *testing.T) {
 	assert.True(t, hasPerm, "PermViewTextChannels should still work (not denied)")
 }
 
+func TestResolveEffectivePermissionsForChannelsFreshMatchesSingleChannelResolution(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "batchpermsowner")
+	member := ts.CreateTestUser(t, "batchpermsmember")
+	serverID := ts.CreateTestServer(t, owner.ID, "Batch Permissions Server")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	textChannelID := ts.CreateTestChannel(t, serverID, "text")
+	voiceChannelID := ts.CreateVoiceChannel(t, serverID, "voice")
+
+	var defaultRoleID string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&defaultRoleID))
+	ts.CreateChannelOverride(t, textChannelID, "role", defaultRoleID, 0, int64(rbac.PermViewTextChannels))
+	ts.CreateChannelOverride(t, voiceChannelID, "user", member.ID, int64(rbac.PermManageAllMessages), int64(rbac.PermManageOwnMessages))
+
+	channelIDs := []string{textChannelID, voiceChannelID}
+	batched, err := resolver.ResolveEffectivePermissionsForChannelsFresh(ctx, serverID, member.ID, channelIDs)
+	require.NoError(t, err)
+	for _, channelID := range channelIDs {
+		single, err := resolver.ResolveEffectivePermissionsFresh(ctx, serverID, member.ID, channelID)
+		require.NoError(t, err)
+		assert.Equal(t, single, batched[channelID], "batched channel permissions must preserve SBAC semantics")
+	}
+
+	ts.CreateChannelOverride(t, textChannelID, "user", owner.ID, 0, int64(rbac.PermManageAllMessages))
+	ownerBatched, err := resolver.ResolveEffectivePermissionsForChannelsFresh(ctx, serverID, owner.ID, channelIDs)
+	require.NoError(t, err)
+	for _, channelID := range channelIDs {
+		assert.Equal(t, rbac.OwnerPermissions, ownerBatched[channelID], "owner must bypass channel overrides in batch resolution")
+	}
+}
+
+func TestResolveEffectivePermissionsForChannelsFreshDoesNotRefillCache(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	cache := rbac.NewPermissionCache(ts.Redis)
+	resolver := rbac.NewResolver(ts.DB, cache, logger.New("test"))
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "batchfreshowner")
+	member := ts.CreateTestUser(t, "batchfreshmember")
+	serverID := ts.CreateTestServer(t, owner.ID, "Batch Fresh Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+	_, err := resolver.ResolveEffectivePermissionsForChannelsFresh(ctx, serverID, member.ID, []string{channelID})
+	require.NoError(t, err)
+	_, cached := cache.Get(ctx, serverID, member.ID, channelID)
+	assert.False(t, cached, "fresh batch resolution must not restore a permission invalidation")
+}
+
+func TestResolveEffectivePermissionsUncachedDoesNotRefillCache(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	cache := rbac.NewPermissionCache(ts.Redis)
+	resolver := rbac.NewResolver(ts.DB, cache, logger.New("test"))
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "uncachedpermsowner")
+	member := ts.CreateTestUser(t, "uncachedpermsmember")
+	serverID := ts.CreateTestServer(t, owner.ID, "Uncached Permissions Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+	_, err := resolver.ResolveEffectivePermissionsUncached(ctx, serverID, member.ID, channelID)
+	require.NoError(t, err)
+	_, cached := cache.Get(ctx, serverID, member.ID, channelID)
+	assert.False(t, cached, "uncached resolution must not restore a permission invalidation")
+}
+
+func TestCacheFreeResolversRejectNonMembersWithoutCacheWrite(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	cache := rbac.NewPermissionCache(ts.Redis)
+	resolver := rbac.NewResolver(ts.DB, cache, logger.New("test"))
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "cachefreeowner")
+	outsider := ts.CreateTestUser(t, "cachefreeoutsider")
+	serverID := ts.CreateTestServer(t, owner.ID, "Cache-Free Non-Member Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+
+	t.Run("batched", func(t *testing.T) {
+		_, err := resolver.ResolveEffectivePermissionsForChannelsFresh(ctx, serverID, outsider.ID, []string{channelID})
+		require.ErrorIs(t, err, rbac.ErrNotMember)
+		_, cached := cache.Get(ctx, serverID, outsider.ID, channelID)
+		assert.False(t, cached, "batched resolution must not cache a non-member result")
+	})
+
+	t.Run("single channel", func(t *testing.T) {
+		_, err := resolver.ResolveEffectivePermissionsUncached(ctx, serverID, outsider.ID, channelID)
+		require.ErrorIs(t, err, rbac.ErrNotMember)
+		_, cached := cache.Get(ctx, serverID, outsider.ID, channelID)
+		assert.False(t, cached, "uncached resolution must not cache a non-member result")
+	})
+}
+
 func TestOwnerImmuneToChannelDenyOverrides(t *testing.T) {
 	resolver, ts := setupResolver(t)
 	ctx := context.Background()

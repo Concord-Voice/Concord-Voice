@@ -40,6 +40,7 @@ const (
 	errMsgNotMember              = "Not a member of this channel's server"
 	errMsgFailedCheckMembership  = "Failed to check membership"
 	errMsgInvalidCiphertext      = "Invalid ciphertext format for E2EE channel"
+	messageWriteTimeout          = 3 * time.Second
 )
 
 // respondGuardTxError maps a credepoch.GuardTx failure onto the wire (#2201
@@ -554,6 +555,25 @@ func (h *Handler) enforceE2EE(c *gin.Context, channelID string, content string, 
 	return keyVersion, true
 }
 
+// lockMessageMembership serializes a message write with member removal and
+// writes the matching HTTP failure response when the lock cannot be acquired.
+func (h *Handler) lockMessageMembership(ctx context.Context, c *gin.Context, tx *sql.Tx, serverID, userID string) bool {
+	var membership int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`,
+		serverID, userID,
+	).Scan(&membership); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
+			return false
+		}
+		h.log.Error("Failed to lock message membership", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendMessage})
+		return false
+	}
+	return true
+}
+
 // SendMessage sends a new message to a channel
 func (h *Handler) SendMessage(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -564,7 +584,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		return
 	}
 
-	_, serverAllowEmbeds, accessOK := h.checkSendAccess(c, req.ChannelID, userID)
+	serverID, serverAllowEmbeds, accessOK := h.checkSendAccess(c, req.ChannelID, userID)
 	if !accessOK {
 		return
 	}
@@ -595,27 +615,31 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// If server policy is OFF (default), embeds_suppressed = true.
 	embedsSuppressed := !serverAllowEmbeds
 
-	messageID := uuid.New().String()
+	h.persistMessage(c, serverID, models.Message{
+		ID:               uuid.New().String(),
+		ChannelID:        req.ChannelID,
+		UserID:           userID,
+		Content:          req.Content,
+		KeyVersion:       keyVersion,
+		EmbedsSuppressed: embedsSuppressed,
+		ReplyToID:        replyToID,
+		GifSlug:          gifSlug,
+	})
+}
+
+// persistMessage inserts a validated message and writes the matching HTTP response.
+func (h *Handler) persistMessage(c *gin.Context, serverID string, message models.Message) {
 	insertQuery := `
 		INSERT INTO messages (id, channel_id, user_id, content, key_version, embeds_suppressed, reply_to_id, gif_slug, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
 		RETURNING created_at, updated_at
 	`
 
-	var message models.Message
-	message.ID = messageID
-	message.ChannelID = req.ChannelID
-	message.UserID = userID
-	message.Content = req.Content
-	message.KeyVersion = keyVersion
-	message.EmbedsSuppressed = embedsSuppressed
-	message.ReplyToID = replyToID
-	message.GifSlug = gifSlug
-
 	// #2201: an encrypted message write is key-material-coupled state — recheck
 	// the sender's credential epoch inside the write transaction so a request
 	// admitted before a destructive key reset cannot land ciphertext after it.
-	ctx := c.Request.Context()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), messageWriteTimeout)
+	defer cancel()
 	tx, txErr := h.db.BeginTx(ctx, nil)
 	if txErr != nil {
 		h.log.Error("Failed to begin message tx", "error", txErr)
@@ -627,15 +651,22 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			h.log.Error("Failed to rollback message tx", "error", rbErr)
 		}
 	}()
-	if guardErr := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
+	if guardErr := credepoch.GuardTx(ctx, tx, message.UserID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
 		h.respondGuardTxError(c, guardErr, errMsgFailedSendMessage)
 		return
 	}
+	// Serialize the message write with member removal. A bare preflight membership
+	// check is a TOCTOU: a kick/ban can delete this row and finish its purge before
+	// an already-admitted send inserts. DELETE conflicts with this shared lock; after
+	// a wait, READ COMMITTED rechecks the row and a completed removal yields no row.
+	if !h.lockMessageMembership(ctx, c, tx, serverID, message.UserID) {
+		return
+	}
 
-	err := tx.QueryRowContext(ctx, insertQuery, messageID, req.ChannelID, userID, req.Content, keyVersion, embedsSuppressed, replyToID, gifSlug).Scan(
-		&message.CreatedAt,
-		&message.UpdatedAt,
-	)
+	err := tx.QueryRowContext(ctx, insertQuery,
+		message.ID, message.ChannelID, message.UserID, message.Content, message.KeyVersion,
+		message.EmbedsSuppressed, message.ReplyToID, message.GifSlug,
+	).Scan(&message.CreatedAt, &message.UpdatedAt)
 	if err != nil {
 		if isFKViolation(err) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Reply target message not found"})
@@ -654,8 +685,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		h.ops.Increment(opsmetrics.MetricChannelMessagesTotal)
 	}
 
-	h.log.Info("Message sent", "message_id", messageID, "channel_id", req.ChannelID, "user_id", userID)
-
+	h.log.Info("Message sent", "message_id", message.ID, "channel_id", message.ChannelID, "user_id", message.UserID)
 	c.JSON(http.StatusCreated, gin.H{"message": message})
 }
 

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -333,6 +334,39 @@ func TestUpdateMemberUnauthorized(t *testing.T) {
 }
 
 // ── RemoveMember (extended) ──────────────────────────────────────────────────
+
+func TestMemberRemovalInvalidatesPermissionCache(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		method string
+		path   func(string, string) string
+	}{
+		{name: "kick", method: http.MethodDelete, path: memberPath},
+		{name: "ban", method: http.MethodPost, path: banPath},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := setupTS(t)
+			owner := ts.CreateTestUser(t, "cache_"+tt.name+"_owner")
+			member := ts.CreateTestUser(t, "cache_"+tt.name+"_member")
+			serverID := ts.CreateTestServer(t, owner.ID, "Cache "+tt.name+" Server")
+			channelID := ts.CreateTestChannel(t, serverID, "general")
+			ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+			cache := rbac.NewPermissionCache(ts.Redis)
+			ctx := context.Background()
+			require.NoError(t, cache.Set(ctx, serverID, member.ID, "", rbac.PermManageAllMessages))
+			require.NoError(t, cache.Set(ctx, serverID, member.ID, channelID, rbac.PermManageAllMessages))
+
+			w := ts.DoRequest(tt.method, tt.path(serverID, member.ID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			_, serverCached := cache.Get(ctx, serverID, member.ID, "")
+			_, channelCached := cache.Get(ctx, serverID, member.ID, channelID)
+			assert.False(t, serverCached, "member removal must evict the server permission cache entry")
+			assert.False(t, channelCached, "member removal must evict the channel permission cache entry")
+		})
+	}
+}
 
 func TestRemoveMemberCannotKickOwner(t *testing.T) {
 	ts := setupTS(t)

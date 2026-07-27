@@ -574,6 +574,176 @@ func TestUpdateMessage_SerializesWithConcurrentRevocation(t *testing.T) {
 	assert.Equal(t, 1, storedKeyVersion)
 }
 
+// regression for #2344: a send admitted before a moderation removal must lock the
+// membership row before it writes. The removal then either waits and purges the
+// committed send, or commits first and makes the send fail without inserting.
+func TestSendMessage_RacingMembershipRemovalCannotOutrunPurge(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "sendrace_owner")
+	victim := ts.CreateTestUser(t, "sendrace_victim")
+	serverID := ts.CreateTestServer(t, owner.ID, "Send Race Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	ts.AddMemberToServer(t, serverID, victim.ID, "member")
+
+	moderationTx, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = moderationTx.Rollback() }()
+	var locked int
+	require.NoError(t, moderationTx.QueryRow(
+		`SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2 FOR UPDATE`,
+		serverID, victim.ID,
+	).Scan(&locked))
+
+	sendResult := make(chan int, 1)
+	go func() {
+		w := ts.DoRequest(http.MethodPost, pathAPIMessages, map[string]any{
+			"channel_id": channelID,
+			"content":    testhelpers.ValidCiphertext(),
+		}, testhelpers.AuthHeaders(victim.AccessToken))
+		sendResult <- w.Code
+	}()
+
+	require.Eventually(t, func() bool {
+		var waiting bool
+		queryErr := ts.DB.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE '%SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE%'
+		)`).Scan(&waiting)
+		return queryErr == nil && waiting
+	}, time.Second, 10*time.Millisecond, "send should wait on the membership lock")
+
+	_, err = moderationTx.Exec(
+		`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, victim.ID,
+	)
+	require.NoError(t, err)
+	require.NoError(t, moderationTx.Commit())
+
+	w := ts.DoRequest(http.MethodDelete, purgeServerPath(serverID), map[string]any{
+		"range":          "all",
+		"target_user_id": victim.ID,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	select {
+	case status := <-sendResult:
+		assert.Equal(t, http.StatusForbidden, status)
+	case <-time.After(time.Second):
+		t.Fatal("send did not resume after membership removal")
+	}
+	assert.Zero(t, countChannelMessages(t, ts, channelID))
+	assert.Equal(t, 1, countPurgeAudits(t, ts, serverID))
+}
+
+func TestSendMessage_MembershipLockHonorsTimeout(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "sendtimeout_owner")
+	member := ts.CreateTestUser(t, "sendtimeout_member")
+	serverID := ts.CreateTestServer(t, owner.ID, "Send Timeout Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+	lockTx, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = lockTx.Rollback() }()
+	var locked int
+	require.NoError(t, lockTx.QueryRow(
+		`SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2 FOR UPDATE`,
+		serverID, member.ID,
+	).Scan(&locked))
+
+	result := make(chan int, 1)
+	started := time.Now()
+	go func() {
+		w := ts.DoRequest(http.MethodPost, pathAPIMessages, map[string]any{
+			"channel_id": channelID,
+			"content":    testhelpers.ValidCiphertext(),
+		}, testhelpers.AuthHeaders(member.AccessToken))
+		result <- w.Code
+	}()
+
+	select {
+	case status := <-result:
+		assert.Equal(t, http.StatusInternalServerError, status)
+		assert.GreaterOrEqual(t, time.Since(started), 2*time.Second,
+			"membership lock should hold the message write until its context deadline")
+	case <-time.After(4 * time.Second):
+		t.Fatal("membership lock did not honor the message write timeout")
+	}
+}
+
+// regression for #2344: once the writer has acquired the membership share lock,
+// removal waits for the write to commit and then its purge deletes that message.
+func TestSendMessage_MembershipLockWriterFirstIsPurgedAfterRemoval(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "sendfirst_owner")
+	victim := ts.CreateTestUser(t, "sendfirst_victim")
+	serverID := ts.CreateTestServer(t, owner.ID, "Send First Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	ts.AddMemberToServer(t, serverID, victim.ID, "member")
+
+	messageLockTx, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = messageLockTx.Rollback() }()
+	_, err = messageLockTx.Exec(`LOCK TABLE messages IN ACCESS EXCLUSIVE MODE`)
+	require.NoError(t, err)
+
+	sendResult := make(chan int, 1)
+	go func() {
+		w := ts.DoRequest(http.MethodPost, pathAPIMessages, map[string]any{
+			"channel_id": channelID,
+			"content":    testhelpers.ValidCiphertext(),
+		}, testhelpers.AuthHeaders(victim.AccessToken))
+		sendResult <- w.Code
+	}()
+
+	require.Eventually(t, func() bool {
+		var waiting bool
+		queryErr := ts.DB.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE '%INSERT INTO messages%'
+		)`).Scan(&waiting)
+		return queryErr == nil && waiting
+	}, time.Second, 10*time.Millisecond, "send should hold membership while waiting to insert")
+
+	removalResult := make(chan int, 1)
+	go func() {
+		w := ts.DoRequest(http.MethodDelete, "/api/v1/servers/"+serverID+"/members/"+victim.ID,
+			map[string]any{"purge_messages": true}, testhelpers.AuthHeaders(owner.AccessToken))
+		removalResult <- w.Code
+	}()
+
+	require.Eventually(t, func() bool {
+		var waiting bool
+		queryErr := ts.DB.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE '%DELETE FROM server_members%'
+		)`).Scan(&waiting)
+		return queryErr == nil && waiting
+	}, time.Second, 10*time.Millisecond, "removal should wait on the writer's membership lock")
+
+	require.NoError(t, messageLockTx.Commit())
+	select {
+	case status := <-sendResult:
+		assert.Equal(t, http.StatusCreated, status)
+	case <-time.After(time.Second):
+		t.Fatal("send did not commit after releasing the message lock")
+	}
+	select {
+	case status := <-removalResult:
+		assert.Equal(t, http.StatusOK, status)
+	case <-time.After(time.Second):
+		t.Fatal("removal did not finish after the writer committed")
+	}
+	assert.Zero(t, countChannelMessages(t, ts, channelID))
+	assert.Equal(t, 1, countPurgeAudits(t, ts, serverID))
+}
+
 // =====================================================================
 // DeleteMessage: Edge Cases
 // =====================================================================

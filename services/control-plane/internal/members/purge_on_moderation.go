@@ -20,9 +20,9 @@ const (
 	purgeModerationRateLimit  = 5
 	purgeModerationRateWindow = time.Hour
 	// purgeOnModerationTimeout bounds the cancellation-detached best-effort purge so a
-	// pathological hang cannot hold the response open forever; normal batched purges finish
-	// well under it, and a genuinely huge over-timeout purge fails cleanly + retryably.
-	purgeOnModerationTimeout = 2 * time.Minute
+	// pathological hang cannot outlive the control plane's 15s HTTP write deadline;
+	// a genuinely large purge fails cleanly instead of completing without a response.
+	purgeOnModerationTimeout = 10 * time.Second
 )
 
 // serverMessagePurger is the narrow capability the moderation handlers need from the
@@ -75,16 +75,25 @@ func (h *Handler) applyPurgeOnModeration(ctx context.Context, serverID, actorID,
 		return purgeOutcome{Requested: true, Status: messages.PurgeFailed}
 	}
 
-	// Detach from the request context FIRST so BOTH the fail-closed rate-limit check and the
+	// Detach from request cancellation FIRST so BOTH the fail-closed rate-limit check and the
 	// purge complete server-side even if the client disconnects after the ban/kick committed
 	// (the purge engine's own audit-count salvage uses the same WithoutCancel pattern). Running
 	// the rate check on the raw request ctx would let a post-commit disconnect fail the INCR,
 	// trip the fail-closed branch, and skip the purge as skipped_rate_limited — the exact
-	// mid-flight abort this detachment exists to prevent (#1353 review, Gitar). A bounded
-	// timeout caps a pathological hang without truncating normal batched purges.
+	// mid-flight abort this detachment exists to prevent (#1353 review, Gitar).
+	// Preserve any caller deadline, which begins before the ban/kick's synchronous
+	// prework, so the detached cleanup cannot overrun the HTTP write deadline.
 	pctx := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		var deadlineCancel context.CancelFunc
+		pctx, deadlineCancel = context.WithDeadline(pctx, deadline)
+		defer deadlineCancel()
+	}
 	pctx, cancel := context.WithTimeout(pctx, purgeOnModerationTimeout)
 	defer cancel()
+	if pctx.Err() != nil {
+		return purgeOutcome{Requested: true, Status: messages.PurgeFailed}
+	}
 
 	// Fail-CLOSED per-actor rate limit: the moderation purge is destructive and must not
 	// escape the velocity control the standalone purge endpoint enforces. An exhausted budget
@@ -95,6 +104,9 @@ func (h *Handler) applyPurgeOnModeration(ctx context.Context, serverID, actorID,
 		key := fmt.Sprintf("ratelimit:user:%s:purge-on-moderation", actorID)
 		allowed, rlErr := middleware.AllowUserAction(pctx, h.redis, key, limit, window)
 		if rlErr != nil || !allowed {
+			if pctx.Err() != nil {
+				return purgeOutcome{Requested: true, Status: messages.PurgeFailed}
+			}
 			h.log.Warn("purge-on-moderation rate-limited",
 				"server_id", serverID, "reason", reason, "exhausted", !allowed, "backend_error", rlErr != nil)
 			return purgeOutcome{Requested: true, Status: messages.PurgeSkippedRateLimited}
@@ -106,7 +118,7 @@ func (h *Handler) applyPurgeOnModeration(ctx context.Context, serverID, actorID,
 	// a PurgeFailed status must resolve to failed even on a nil error, never logged as completed.
 	if err != nil || status == messages.PurgeFailed {
 		h.log.Error("purge-on-moderation failed", "server_id", serverID, "reason", reason, "error", err)
-		return purgeOutcome{Requested: true, Status: messages.PurgeFailed}
+		return purgeOutcome{Requested: true, Status: messages.PurgeFailed, PurgedCount: count}
 	}
 	if status == messages.PurgeSkippedUnauthorized {
 		h.log.Info("purge-on-moderation skipped (unauthorized)", "server_id", serverID, "reason", reason)

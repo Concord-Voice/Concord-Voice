@@ -38,6 +38,9 @@ const (
 
 	minTimeoutDuration = time.Minute
 	maxTimeoutDuration = 7 * 24 * time.Hour
+	// permissionCacheInvalidationTimeout bounds post-commit Redis cleanup without
+	// tying it to a client connection that may have already been cancelled.
+	permissionCacheInvalidationTimeout = 3 * time.Second
 )
 
 // Handler handles member-related requests
@@ -783,6 +786,14 @@ func (h *Handler) execRemovalTx(serverID, targetUserID string) error {
 	return tx.Commit()
 }
 
+func (h *Handler) invalidateMemberPermissions(serverID, userID, action string) {
+	ctx, cancel := context.WithTimeout(context.Background(), permissionCacheInvalidationTimeout)
+	defer cancel()
+	if err := h.resolver.InvalidateUser(ctx, serverID, userID); err != nil {
+		h.log.Error("Failed to invalidate member permissions", "error", err, "server_id", serverID, "user_id", userID, "action", action)
+	}
+}
+
 // RemoveMemberRequest is the optional body for the kick (DELETE member) endpoint (#1353).
 // An empty body binds to the zero value, so existing bodyless callers are unaffected.
 type RemoveMemberRequest struct {
@@ -807,6 +818,8 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	userID := c.GetString("user_id")
 	serverID := c.Param("id")
 	targetUserID := c.Param("user_id")
+	purgeCtx, purgeCancel := context.WithTimeout(c.Request.Context(), purgeOnModerationTimeout)
+	defer purgeCancel()
 
 	if _, err := uuid.Parse(serverID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
@@ -852,18 +865,10 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		return
 	}
 
-	// CV-CAN-007 (review P1): membership is now deleted — recheck the removed
-	// member's voice presence so the media plane evicts them (the fresh resolve
-	// returns ErrNotMember -> voice.enforce.disconnect) instead of letting them
-	// publish on the stale join-time snapshot until they voluntarily leave.
-	h.recheckVoiceUser(serverID, targetUserID)
-
 	action := "removed"
 	if auth.isSelfRemoval {
 		action = "left"
 	}
-
-	h.log.Info("Member "+action, "server_id", serverID, "target_user", targetUserID, "by_user", userID)
 
 	serverUUID, _ := uuid.Parse(serverID)
 	memberRemoved := websocket.OutgoingMessage{
@@ -886,13 +891,22 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		h.hub.BroadcastToServer(serverUUID, memberRemoved)
 	}
 
+	// Rotate before the cache scan so a slow invalidation cannot extend the old-key window.
 	h.triggerKeyRevocationsForServer(serverID, targetUserID, userID)
+
+	// CV-CAN-007 (review P1): membership is now deleted — recheck the removed
+	// member's voice presence so the media plane evicts them (the fresh resolve
+	// returns ErrNotMember -> voice.enforce.disconnect) instead of letting them
+	// publish on the stale join-time snapshot until they voluntarily leave.
+	h.recheckVoiceUser(serverID, targetUserID)
+	h.invalidateMemberPermissions(serverID, targetUserID, "removed")
+	h.log.Info("Member "+action, "server_id", serverID, "target_user", targetUserID, "by_user", userID)
 
 	resp := gin.H{"message": "Member " + action + " successfully"}
 	// #1353: additive purge applies ONLY to a moderator removal, never a self-leave
 	// (no moderation intent — a user leaving must not bulk-wipe their own history).
 	if req.PurgeMessages && !auth.isSelfRemoval {
-		resp["purge"] = h.applyPurgeOnModeration(c.Request.Context(), serverID, userID, targetUserID, "kick")
+		resp["purge"] = h.applyPurgeOnModeration(purgeCtx, serverID, userID, targetUserID, "kick")
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -939,11 +953,21 @@ func (h *Handler) execBanTx(serverID, targetUserID, actorID string, reason *stri
 		return err
 	}
 
-	_, _ = tx.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, targetUserID)
-	_, _ = tx.Exec(`DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2`, serverID, targetUserID)
-	_, _ = tx.Exec(`DELETE FROM channel_keys WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID)
-	_, _ = tx.Exec(`DELETE FROM pending_key_requests WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID)
-	_, _ = tx.Exec(`DELETE FROM channel_read_states WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID)
+	if _, err := tx.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, targetUserID); err != nil {
+		return fmt.Errorf("delete server member: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2`, serverID, targetUserID); err != nil {
+		return fmt.Errorf("delete member roles: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM channel_keys WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID); err != nil {
+		return fmt.Errorf("delete channel keys: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM pending_key_requests WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID); err != nil {
+		return fmt.Errorf("delete pending key requests: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM channel_read_states WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID); err != nil {
+		return fmt.Errorf("delete channel read states: %w", err)
+	}
 
 	return tx.Commit()
 }
@@ -953,6 +977,8 @@ func (h *Handler) BanMember(c *gin.Context) {
 	userID := c.GetString("user_id")
 	serverID := c.Param("id")
 	targetUserID := c.Param("user_id")
+	purgeCtx, purgeCancel := context.WithTimeout(c.Request.Context(), purgeOnModerationTimeout)
+	defer purgeCancel()
 
 	if _, err := uuid.Parse(serverID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
@@ -1004,16 +1030,10 @@ func (h *Handler) BanMember(c *gin.Context) {
 	}
 
 	if err := h.execBanTx(serverID, targetUserID, userID, reason); err != nil {
+		h.log.Error("Failed to ban member", "error", err, "server_id", serverID, "user_id", targetUserID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedBanMember})
 		return
 	}
-
-	// CV-CAN-007 (review P1): membership is now deleted — recheck the banned
-	// member's voice presence so the media plane evicts them (the fresh resolve
-	// returns ErrNotMember -> voice.enforce.disconnect) instead of letting them
-	// publish on the stale join-time snapshot until they voluntarily leave.
-	h.recheckVoiceUser(serverID, targetUserID)
-
 	if h.audit != nil {
 		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "member_banned", "member", &targetUserID, //nolint:errcheck
 			map[string]interface{}{"reason": req.Reason})
@@ -1040,13 +1060,21 @@ func (h *Handler) BanMember(c *gin.Context) {
 		h.hub.BroadcastToServer(serverUUID, memberRemoved)
 	}
 
+	// Rotate before the cache scan so a slow invalidation cannot extend the old-key window.
 	h.triggerKeyRevocationsForServer(serverID, targetUserID, userID)
+
+	// CV-CAN-007 (review P1): membership is now deleted — recheck the banned
+	// member's voice presence so the media plane evicts them (the fresh resolve
+	// returns ErrNotMember -> voice.enforce.disconnect) instead of letting them
+	// publish on the stale join-time snapshot until they voluntarily leave.
+	h.recheckVoiceUser(serverID, targetUserID)
+	h.invalidateMemberPermissions(serverID, targetUserID, "banned")
 
 	resp := gin.H{"message": "Member banned"}
 	// #1353: additive purge — runs AFTER the ban has committed; a denied/failed purge
 	// never affects the ban (best-effort, surfaced via the purge object only).
 	if req.PurgeMessages {
-		resp["purge"] = h.applyPurgeOnModeration(c.Request.Context(), serverID, userID, targetUserID, "ban")
+		resp["purge"] = h.applyPurgeOnModeration(purgeCtx, serverID, userID, targetUserID, "ban")
 	}
 	c.JSON(http.StatusOK, resp)
 }

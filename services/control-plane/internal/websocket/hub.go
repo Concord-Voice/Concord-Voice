@@ -2208,13 +2208,18 @@ type persistMessageParams struct {
 func (h *Hub) persistMessage(p persistMessageParams) (uuid.UUID, time.Time, time.Time, string) {
 	messageID := uuid.New()
 	var createdAt, updatedAt time.Time
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), channelAuthCtxTimeout)
+	defer cancel()
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		log.Printf("Failed to begin message tx: %v", err)
 		return messageID, createdAt, updatedAt, errMsgFailedSaveMessage
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			log.Printf("Failed to rollback message transaction: %v", rbErr)
+		}
+	}()
 	// #2201 (Codex #2397 review): a WS message frame read before a destructive
 	// reset's DisconnectUser lands must not commit ciphertext under the
 	// superseded epoch. GuardTx (users-row FOR SHARE) rechecks the sender's
@@ -2228,6 +2233,25 @@ func (h *Hub) persistMessage(p persistMessageParams) (uuid.UUID, time.Time, time
 			return messageID, createdAt, updatedAt, "Authentication required"
 		}
 		log.Printf("Message epoch guard read failed: %v", guardErr)
+		return messageID, createdAt, updatedAt, errMsgFailedSaveMessage
+	}
+	// Lock the stable membership row inside the write transaction. A ban/kick's
+	// conflicting DELETE either waits for this insert and then purges it, or commits
+	// first so this locked read sees no row and the stale socket cannot insert.
+	var membership int
+	err = tx.QueryRowContext(ctx,
+		`SELECT 1
+		 FROM channels ch
+		 INNER JOIN server_members sm ON sm.server_id = ch.server_id
+		 WHERE ch.id = $1 AND sm.user_id = $2
+		 FOR SHARE OF sm`,
+		p.channelUUID, p.userID,
+	).Scan(&membership)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return messageID, createdAt, updatedAt, "Not a member of this server"
+		}
+		log.Printf("Failed to lock message membership: %v", err)
 		return messageID, createdAt, updatedAt, errMsgFailedSaveMessage
 	}
 	err = tx.QueryRowContext(ctx,

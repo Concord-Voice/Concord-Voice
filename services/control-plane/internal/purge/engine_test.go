@@ -6,8 +6,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The identifier allow-list is the ONLY thing standing between fmt.Sprintf-built SQL
-// and an injected table/column name, so its accept/reject behavior is locked here.
+// The identifier allow-list keeps each DeleteSpec aligned with its fixed query template.
 
 func TestValidateIdentifiers_RejectsUnknownTable(t *testing.T) {
 	err := validateIdentifiers(DeleteSpec{
@@ -51,8 +50,7 @@ func TestValidateIdentifiers_RejectsMismatchedAttachmentsTable(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestTimeCastFor_MatchesColumnTypes(t *testing.T) {
-	// The per-table cast must track each table's created_at column type (M2).
-	require.Equal(t, "timestamp", timeCastFor("messages"))
-	require.Equal(t, "timestamptz", timeCastFor("dm_messages"))
+func TestDeleteQueriesUseColumnTypes(t *testing.T) {
+	require.Contains(t, deleteQueries["messages"], "$2::timestamp")
+	require.Contains(t, deleteQueries["dm_messages"], "$2::timestamptz")
 }

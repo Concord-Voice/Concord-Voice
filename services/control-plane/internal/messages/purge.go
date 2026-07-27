@@ -2,6 +2,8 @@ package messages
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"time"
 
@@ -13,7 +15,15 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 )
 
-const errMsgPurgeFailed = "Purge failed"
+const (
+	errMsgPurgeFailed       = "Purge failed"
+	synchronousPurgeTimeout = 10 * time.Second
+)
+
+type channelScope struct {
+	id          string
+	channelType string
+}
 
 // purgeRequest is the shared body for the channel and server purge endpoints (#1352).
 // Range is recent-ward ("1h".."90d") or "all"; TargetUserID narrows to one author
@@ -37,6 +47,8 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid channel ID"})
 		return
 	}
+	purgeCtx, cancel := context.WithTimeout(c.Request.Context(), synchronousPurgeTimeout)
+	defer cancel()
 
 	var req purgeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -49,14 +61,24 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 		return
 	}
 
-	var serverID string
-	if err := h.db.QueryRowContext(c.Request.Context(),
-		`SELECT server_id FROM channels WHERE id = $1`, channelID).Scan(&serverID); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Channel not found"})
+	var serverID, channelType string
+	if err := h.db.QueryRowContext(purgeCtx,
+		`SELECT server_id, type FROM channels WHERE id = $1`, channelID).Scan(&serverID, &channelType); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Channel not found"})
+			return
+		}
+		h.log.Error("Channel purge lookup failed", "error", err, "channel_id", channelID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
 		return
 	}
 
-	author, ok := h.resolvePurgeAuthor(c.Request.Context(), serverID, userID, channelID, req.TargetUserID)
+	author, ok, authErr := h.resolvePurgeAuthor(purgeCtx, serverID, userID, channelID, channelType, req.TargetUserID)
+	if authErr != nil {
+		h.log.Error("Channel purge authorization failed", "error", authErr, "channel_id", channelID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
+		return
+	}
 	if !ok {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions to purge this channel"})
 		return
@@ -78,9 +100,12 @@ func (h *Handler) PurgeChannel(c *gin.Context) {
 			Author:           author,
 		}},
 	}
-	res, err := h.purgeEngine.Run(c.Request.Context(), plan)
+	res, err := h.purgeEngine.Run(purgeCtx, plan)
 	if err != nil {
 		h.log.Error("Channel purge failed", "error", err, "channel_id", channelID)
+		if res.DeletedCount > 0 {
+			h.emitChannelPurged(channelID, userID, res.DeletedCount, req.Range)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
 		return
 	}
@@ -114,6 +139,8 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid server ID"})
 		return
 	}
+	purgeCtx, cancel := context.WithTimeout(c.Request.Context(), synchronousPurgeTimeout)
+	defer cancel()
 
 	var req purgeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -127,7 +154,7 @@ func (h *Handler) PurgeServer(c *gin.Context) {
 	}
 
 	deleted, status, err := h.purgeServerCore(
-		c.Request.Context(), serverID, userID, req.TargetUserID, "manual", rangeFrom, req.Range)
+		purgeCtx, serverID, userID, req.TargetUserID, "manual", rangeFrom, req.Range)
 	switch status {
 	case PurgeSkippedUnauthorized:
 		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions to purge this server"})
@@ -158,41 +185,28 @@ func (h *Handler) purgeServerCore(
 	ctx context.Context, serverID, actorID string, target *string,
 	reason string, rangeFrom *time.Time, rangeLabel string,
 ) (int, PurgeStatus, error) {
-	rows, err := h.db.QueryContext(ctx, `SELECT id FROM channels WHERE server_id = $1`, serverID)
+	rows, err := h.db.QueryContext(ctx, `SELECT id, type FROM channels WHERE server_id = $1`, serverID)
 	if err != nil {
 		h.log.Error("Server purge: enumerate channels failed", "error", err, "server_id", serverID)
 		return 0, PurgeFailed, err
 	}
 	defer func() { _ = rows.Close() }()
 
-	var channelIDs []string
+	var channels []channelScope
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var channel channelScope
+		if err := rows.Scan(&channel.id, &channel.channelType); err != nil {
 			return 0, PurgeFailed, err
 		}
-		channelIDs = append(channelIDs, id)
+		channels = append(channels, channel)
 	}
 	if err := rows.Err(); err != nil {
 		return 0, PurgeFailed, err
 	}
 
-	var deletes []purge.DeleteSpec
-	for _, chID := range channelIDs {
-		author, ok := h.resolvePurgeAuthor(ctx, serverID, actorID, chID, target)
-		if !ok {
-			continue // denied in this channel — skip it, never delete here
-		}
-		deletes = append(deletes, purge.DeleteSpec{
-			MessagesTable:    "messages",
-			ScopeColumn:      "channel_id",
-			ScopeID:          chID,
-			AttachmentsTable: "message_attachments",
-			Author:           author,
-		})
-	}
-	if len(deletes) == 0 {
-		return 0, PurgeSkippedUnauthorized, nil
+	deletes, status, err := h.serverPurgeDeletes(ctx, serverID, actorID, target, channels)
+	if status != PurgeCompleted {
+		return 0, status, err
 	}
 
 	plan := purge.Plan{
@@ -208,7 +222,12 @@ func (h *Handler) purgeServerCore(
 	res, err := h.purgeEngine.Run(ctx, plan)
 	if err != nil {
 		h.log.Error("Server purge failed", "error", err, "server_id", serverID)
-		return 0, PurgeFailed, err
+		if res.DeletedCount > 0 {
+			for _, ds := range deletes {
+				h.emitChannelPurged(ds.ScopeID, actorID, 0, rangeLabel)
+			}
+		}
+		return res.DeletedCount, PurgeFailed, err
 	}
 	// One event per affected channel (spec §11). The engine returns only an aggregate
 	// count, so the per-channel event carries 0; clients treat the event as an
@@ -217,6 +236,53 @@ func (h *Handler) purgeServerCore(
 		h.emitChannelPurged(ds.ScopeID, actorID, 0, rangeLabel)
 	}
 	return res.DeletedCount, PurgeCompleted, nil
+}
+
+// serverPurgeDeletes authorizes every channel before constructing the purge plan.
+func (h *Handler) serverPurgeDeletes(ctx context.Context, serverID, actorID string, target *string, channels []channelScope) ([]purge.DeleteSpec, PurgeStatus, error) {
+	if len(channels) == 0 {
+		// With no channel overrides to bypass, a server-scope authorization check
+		// distinguishes a legitimate empty purge from an existence oracle.
+		_, ok, err := h.resolvePurgeAuthor(ctx, serverID, actorID, "", "", target)
+		if err != nil {
+			return nil, PurgeFailed, err
+		}
+		if !ok {
+			return nil, PurgeSkippedUnauthorized, nil
+		}
+	}
+
+	channelIDs := make([]string, len(channels))
+	for i, channel := range channels {
+		channelIDs[i] = channel.id
+	}
+	permsByChannel, err := h.resolver.ResolveEffectivePermissionsForChannelsFresh(ctx, serverID, actorID, channelIDs)
+	if err != nil {
+		if errors.Is(err, rbac.ErrNotMember) {
+			return nil, PurgeSkippedUnauthorized, nil
+		}
+		h.log.Error("Server purge authorization failed", "error", err, "server_id", serverID)
+		return nil, PurgeFailed, err
+	}
+
+	var deletes []purge.DeleteSpec
+	for _, channel := range channels {
+		author, ok := purgeAuthorForPermissions(permsByChannel[channel.id], actorID, channel.channelType, target)
+		if !ok {
+			continue // denied in this channel — skip it, never delete here
+		}
+		deletes = append(deletes, purge.DeleteSpec{
+			MessagesTable:    "messages",
+			ScopeColumn:      "channel_id",
+			ScopeID:          channel.id,
+			AttachmentsTable: "message_attachments",
+			Author:           author,
+		})
+	}
+	if len(channels) > 0 && len(deletes) == 0 {
+		return nil, PurgeSkippedUnauthorized, nil
+	}
+	return deletes, PurgeCompleted, nil
 }
 
 // PurgeUserServerMessages purges ALL of target's messages across serverID (All Time) for the
@@ -230,33 +296,49 @@ func (h *Handler) PurgeUserServerMessages(ctx context.Context, serverID, actorID
 // resolvePurgeAuthor resolves the author filter for one channel per the RBAC matrix:
 // View → required first; ManageAll → requested target (or nil = all authors);
 // ManageOwn only → self, and ONLY when no other author was requested; neither → not
-// authorized. Membership resolution is inside HasPermission (ErrNotMember → false).
-// Resolver errors fail CLOSED (denied).
-func (h *Handler) resolvePurgeAuthor(ctx context.Context, serverID, userID, channelID string, target *string) (*string, bool) {
+// authorized. Permissions are resolved from committed state to avoid using a stale
+// cache entry after a membership or role change. Resolver errors fail closed and
+// are reported separately from permission denials.
+func (h *Handler) resolvePurgeAuthor(ctx context.Context, serverID, userID, channelID, channelType string, target *string) (*string, bool, error) {
 	// You cannot purge what you cannot see. Without this, a channel override that
 	// denies PermViewTextChannels but leaves ManageAllMessages intact would let an
 	// actor irreversibly wipe a private channel they cannot even open. Purge needs no
 	// message ID, so unlike DeleteMessage it reaches every message in the channel by
 	// scope alone — the view gate is what bounds that reach.
-	canView, err := h.resolver.HasPermission(ctx, serverID, userID, channelID, rbac.PermViewTextChannels)
+	perms, err := h.resolver.ResolveEffectivePermissionsUncached(ctx, serverID, userID, channelID)
 	if err != nil {
+		if errors.Is(err, rbac.ErrNotMember) {
+			return nil, false, nil
+		}
 		h.log.Error("Purge authz resolve failed", "error", err, "channel_id", channelID)
-		return nil, false
+		return nil, false, err
 	}
-	if !canView {
-		return nil, false
+	author, ok := purgeAuthorForPermissions(perms, userID, channelType, target)
+	return author, ok, nil
+}
+
+func purgeAuthorForPermissions(perms rbac.Permission, userID, channelType string, target *string) (*string, bool) {
+	if channelType == "" {
+		// A channel-less server has no text/voice scope to privilege. Requiring
+		// either view bit keeps the same visibility boundary without inventing a
+		// text-only scope that rejects a voice-only moderator.
+		if !perms.Has(rbac.PermViewTextChannels) && !perms.Has(rbac.PermViewVoiceChannels) {
+			return nil, false
+		}
+	} else {
+		viewPerm := rbac.PermViewTextChannels
+		if channelType == "voice" {
+			viewPerm = rbac.PermViewVoiceChannels
+		}
+		if !perms.Has(viewPerm) {
+			return nil, false
+		}
 	}
 
-	canAll, err := h.resolver.HasPermission(ctx, serverID, userID, channelID, rbac.PermManageAllMessages)
-	if err != nil {
-		h.log.Error("Purge authz resolve failed", "error", err, "channel_id", channelID)
-		return nil, false
-	}
-	if canAll {
+	if perms.Has(rbac.PermManageAllMessages) {
 		return target, true
 	}
-	canOwn, err := h.resolver.HasPermission(ctx, serverID, userID, channelID, rbac.PermManageOwnMessages)
-	if err != nil || !canOwn {
+	if !perms.Has(rbac.PermManageOwnMessages) {
 		return nil, false
 	}
 	// ManageOwn only: may purge their own messages, and ONLY their own.

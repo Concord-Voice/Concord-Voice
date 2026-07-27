@@ -251,6 +251,51 @@ func TestEngineRun_PartialDeleteIsAudited(t *testing.T) {
 	assert.Equal(t, 3, deleted, "the audit must record the rows actually deleted, not 0")
 }
 
+func TestEngineDurableDeletedCount_ReadsAuditOrFallsBack(t *testing.T) {
+	f := seedEngineFixture(t)
+	e := f.newEngine(5000)
+	purgeID, err := e.writeAuditInProgress(context.Background(), f.channelPlan())
+	require.NoError(t, err)
+	_, err = f.db.Exec(`UPDATE message_purges SET deleted_count = 4 WHERE id = $1`, purgeID)
+	require.NoError(t, err)
+
+	assert.Equal(t, 4, e.durableDeletedCount(context.Background(), purgeID, 3))
+	assert.Equal(t, 3, e.durableDeletedCount(context.Background(), f.serverID, 3))
+}
+
+// A batch's audit increment must commit with its delete. Otherwise an audit-update
+// failure could leave irreversible deletion with an understated audit row.
+func TestEngineRun_RollsBackDeleteWhenBatchAuditUpdateFails(t *testing.T) {
+	f := seedEngineFixture(t)
+	f.seedMessages(t, f.authorID, 3, 0)
+
+	_, err := f.db.Exec(`
+		CREATE FUNCTION test_reject_purge_batch_audit_update() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'forced purge audit update failure'; END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER test_reject_purge_batch_audit_update
+		BEFORE UPDATE OF deleted_count ON message_purges
+		FOR EACH ROW EXECUTE FUNCTION test_reject_purge_batch_audit_update()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := f.db.Exec(`
+			DROP TRIGGER IF EXISTS test_reject_purge_batch_audit_update ON message_purges;
+			DROP FUNCTION IF EXISTS test_reject_purge_batch_audit_update()`)
+		if cleanupErr != nil {
+			t.Errorf("cleanup batch audit failure trigger: %v", cleanupErr)
+		}
+	})
+
+	res, err := f.newEngine(5000).Run(context.Background(), f.channelPlan())
+	require.Error(t, err)
+	assert.Zero(t, res.DeletedCount)
+	assert.Equal(t, 3, f.countMessages(t), "a failed audit increment must roll back the matching delete")
+
+	status, deleted, _ := f.auditRow(t)
+	assert.Equal(t, "in_progress", status)
+	assert.Zero(t, deleted)
+}
+
 // TestEngineFinalizeHidden covers the DM receiver-hide audit enrichment.
 func TestEngineFinalizeHidden(t *testing.T) {
 	f := seedEngineFixture(t)

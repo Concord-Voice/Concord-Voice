@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/lib/pq"
+
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -27,6 +29,10 @@ type Resolver struct {
 	db    *sql.DB
 	cache *PermissionCache
 	log   *logger.Logger
+}
+
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 // NewResolver creates a new RBAC resolver
@@ -103,44 +109,103 @@ func (r *Resolver) ResolveEffectivePermissionsFresh(ctx context.Context, serverI
 	return perms, nil
 }
 
+// ResolveEffectivePermissionsUncached recomputes permissions from the database
+// without reading or publishing a cache entry. Destructive preflight paths use
+// it so an in-flight result cannot restore permissions after invalidation.
+func (r *Resolver) ResolveEffectivePermissionsUncached(ctx context.Context, serverID, userID, channelID string) (Permission, error) {
+	return r.computeEffectivePermissions(ctx, serverID, userID, channelID)
+}
+
+// ResolveEffectivePermissionsForChannelsFresh resolves a member's effective
+// permissions for channels from one server in one fresh database pass. It keeps
+// per-channel SBAC allow/deny semantics while avoiding an N+1 preflight loop.
+func (r *Resolver) ResolveEffectivePermissionsForChannelsFresh(ctx context.Context, serverID, userID string, channelIDs []string) (map[string]Permission, error) {
+	permsByChannel := make(map[string]Permission, len(channelIDs))
+	if len(channelIDs) == 0 {
+		return permsByChannel, nil
+	}
+
+	// One repeatable-read transaction prevents a concurrent membership or role
+	// mutation from mixing base RBAC with a later SBAC override snapshot.
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin permission snapshot: %w", err)
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+			r.log.Warn("failed to rollback permission snapshot", "error", rollbackErr)
+		}
+	}()
+
+	basePerms, isOwner, err := r.resolveServerPermissions(ctx, tx, serverID, userID)
+	if err != nil {
+		return nil, err
+	}
+	for _, channelID := range channelIDs {
+		permsByChannel[channelID] = basePerms
+	}
+	if !isOwner && !basePerms.Has(PermAdministrator) {
+		if err := r.applyBatchedChannelOverrides(ctx, tx, channelIDs, serverID, userID, basePerms, permsByChannel); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit permission snapshot: %w", err)
+	}
+	return permsByChannel, nil
+}
+
+func (r *Resolver) applyBatchedChannelOverrides(
+	ctx context.Context, tx *sql.Tx, channelIDs []string, serverID, userID string,
+	basePerms Permission, permsByChannel map[string]Permission,
+) error {
+	rows, err := tx.QueryContext(ctx, batchChannelOverrideQuery, pq.Array(channelIDs), serverID, userID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve channel overrides: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			r.log.Warn("failed to close permission override rows", "error", closeErr)
+		}
+	}()
+
+	for rows.Next() {
+		var channelID string
+		var roleAllow, roleDeny, userAllow, userDeny int64
+		if err := rows.Scan(&channelID, &roleAllow, &roleDeny, &userAllow, &userDeny); err != nil {
+			return err
+		}
+		perms := basePerms
+		perms |= Permission(roleAllow)
+		perms &^= Permission(roleDeny)
+		perms |= Permission(userAllow)
+		perms &^= Permission(userDeny)
+		permsByChannel[channelID] = perms
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
 // computeEffectivePermissions implements the two-layer permission resolution model:
 // 1. RBAC: OR together permissions from all user's roles
 // 2. SBAC: Apply channel-specific overrides (deny > allow)
 func (r *Resolver) computeEffectivePermissions(ctx context.Context, serverID, userID, channelID string) (Permission, error) {
-	// Step 1: Verify server membership
-	var isMember bool
-	memberQuery := `SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`
-	if err := r.db.QueryRowContext(ctx, memberQuery, serverID, userID).Scan(&isMember); err != nil {
-		return 0, fmt.Errorf("failed to check membership: %w", err)
-	}
-	if !isMember {
-		return 0, ErrNotMember
-	}
-
-	// Step 2: Check if user is server owner (owner bypasses RBAC, gets OwnerPermissions)
-	var ownerID string
-	ownerQuery := `SELECT owner_id FROM servers WHERE id = $1`
-	if err := r.db.QueryRowContext(ctx, ownerQuery, serverID).Scan(&ownerID); err != nil {
-		return 0, fmt.Errorf("failed to fetch server owner: %w", err)
-	}
-	if ownerID == userID {
-		// Owner gets all permissions — immune to channel overrides
-		// Owner bypasses SBAC layer entirely (cannot be restricted per-channel)
-		return OwnerPermissions, nil
-	}
-
-	// Step 3: Compute base permissions from roles (OR all role permissions together)
-	basePerms, err := r.computeRolePermissions(ctx, serverID, userID)
+	basePerms, isOwner, err := r.resolveServerPermissionsFresh(ctx, serverID, userID)
 	if err != nil {
-		return 0, fmt.Errorf("failed to compute role permissions: %w", err)
+		return 0, err
+	}
+	if isOwner {
+		return basePerms, nil
 	}
 
-	// Step 4: If no channel specified, return base permissions
+	// If no channel specified, return base permissions.
 	if channelID == "" {
 		return basePerms, nil
 	}
 
-	// Step 5: Apply channel-specific overrides (SBAC layer)
+	// Apply channel-specific overrides (SBAC layer).
 	finalPerms, err := r.applyChannelOverrides(ctx, channelID, userID, basePerms)
 	if err != nil {
 		return 0, fmt.Errorf("failed to apply channel overrides: %w", err)
@@ -149,8 +214,45 @@ func (r *Resolver) computeEffectivePermissions(ctx context.Context, serverID, us
 	return finalPerms, nil
 }
 
+// resolveServerPermissionsFresh checks current membership and resolves the
+// server-level RBAC bitfield without consulting the cache.
+func (r *Resolver) resolveServerPermissionsFresh(ctx context.Context, serverID, userID string) (Permission, bool, error) {
+	return r.resolveServerPermissions(ctx, r.db, serverID, userID)
+}
+
+func (r *Resolver) resolveServerPermissions(ctx context.Context, db rowQuerier, serverID, userID string) (Permission, bool, error) {
+	// Verify server membership.
+	var isMember bool
+	memberQuery := `SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`
+	if err := db.QueryRowContext(ctx, memberQuery, serverID, userID).Scan(&isMember); err != nil {
+		return 0, false, fmt.Errorf("failed to check membership: %w", err)
+	}
+	if !isMember {
+		return 0, false, ErrNotMember
+	}
+
+	// Server owner bypasses RBAC and SBAC.
+	var ownerID string
+	ownerQuery := `SELECT owner_id FROM servers WHERE id = $1`
+	if err := db.QueryRowContext(ctx, ownerQuery, serverID).Scan(&ownerID); err != nil {
+		return 0, false, fmt.Errorf("failed to fetch server owner: %w", err)
+	}
+	if ownerID == userID {
+		// Owner gets all permissions — immune to channel overrides
+		// Owner bypasses SBAC layer entirely (cannot be restricted per-channel)
+		return OwnerPermissions, true, nil
+	}
+
+	// Compute base permissions from roles (OR all role permissions together).
+	basePerms, err := r.computeRolePermissions(ctx, db, serverID, userID)
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to compute role permissions: %w", err)
+	}
+	return basePerms, false, nil
+}
+
 // computeRolePermissions computes base permissions by OR'ing all user's role permissions
-func (r *Resolver) computeRolePermissions(ctx context.Context, serverID, userID string) (Permission, error) {
+func (r *Resolver) computeRolePermissions(ctx context.Context, db rowQuerier, serverID, userID string) (Permission, error) {
 	query := `
 		SELECT COALESCE(BIT_OR(r.permissions), 0) AS total_permissions
 		FROM member_roles mr
@@ -159,7 +261,7 @@ func (r *Resolver) computeRolePermissions(ctx context.Context, serverID, userID 
 	`
 
 	var totalPerms int64
-	if err := r.db.QueryRowContext(ctx, query, serverID, userID).Scan(&totalPerms); err != nil {
+	if err := db.QueryRowContext(ctx, query, serverID, userID).Scan(&totalPerms); err != nil {
 		// COALESCE(BIT_OR(...), 0) always returns a row, so ErrNoRows is unreachable.
 		// Any error here is a genuine database failure.
 		return 0, err
@@ -243,10 +345,15 @@ func (r *Resolver) InvalidateChannel(ctx context.Context, serverID, channelID st
 	return r.cache.InvalidateChannel(ctx, serverID, channelID)
 }
 
+// InvalidateUser clears cached server and channel permissions for one user.
+func (r *Resolver) InvalidateUser(ctx context.Context, serverID, userID string) error {
+	return r.cache.Invalidate(ctx, serverID, userID)
+}
+
 // sbacChannelOverrideColumns is the SELECT column list, shared verbatim by the
-// channel_overrides CTE in GetVisibleChannelIDs and GetAllVisibleChannelIDs, that
-// aggregates the SBAC role/user allow/deny bitfields for a channel. Both callers
-// then derive effective visibility from these four columns using the identical
+// batched resolver and visibility queries, that aggregates the SBAC role/user
+// allow/deny bitfields for a channel. Callers derive effective permissions from
+// these four columns using the identical
 // formula ((base | role_allow) & ~role_deny | user_allow) & ~user_deny, so the
 // aggregation must stay byte-for-byte identical between them; keeping it in one
 // constant guarantees the two queries can never silently drift apart.
@@ -259,6 +366,21 @@ const sbacChannelOverrideColumns = `
 				COALESCE(BIT_OR(cpo.deny)  FILTER (WHERE cpo.target_type = 'role'), 0) AS role_deny,
 				COALESCE(BIT_OR(cpo.allow) FILTER (WHERE cpo.target_type = 'user'), 0) AS user_allow,
 				COALESCE(BIT_OR(cpo.deny)  FILTER (WHERE cpo.target_type = 'user'), 0) AS user_deny`
+
+const batchChannelOverrideQuery = `
+	WITH user_roles AS (
+		SELECT role_id
+		FROM member_roles
+		WHERE server_id = $2 AND user_id = $3
+	)
+	SELECT cpo.channel_id,` + sbacChannelOverrideColumns + `
+	FROM channel_permission_overrides cpo
+	WHERE cpo.channel_id = ANY($1::uuid[])
+	  AND (
+	      (cpo.target_type = 'role' AND cpo.target_id IN (SELECT role_id FROM user_roles))
+	      OR (cpo.target_type = 'user' AND cpo.target_id = $3)
+	  )
+	GROUP BY cpo.channel_id`
 
 // GetVisibleChannelIDs returns a list of channel IDs that the user can view.
 // Visibility is type-aware: text/bulletin channels require PermViewTextChannels,
@@ -503,7 +625,7 @@ func (r *Resolver) CheckHierarchy(ctx context.Context, serverID, actorID, target
 	}
 
 	// Check if actor has PermAdministrator (bypasses position-based hierarchy)
-	actorPerms, err := r.computeRolePermissions(ctx, serverID, actorID)
+	actorPerms, err := r.computeRolePermissions(ctx, r.db, serverID, actorID)
 	if err != nil {
 		return fmt.Errorf(errMsgHierarchyCheckFailed, err)
 	}

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
@@ -25,6 +26,7 @@ type fakePurger struct {
 	called                                      bool
 	gotServerID, gotActor, gotTarget, gotReason string
 	gotCtxErr                                   error // ctx.Err() observed at call time
+	gotDeadline                                 time.Time
 	retCount                                    int
 	retStatus                                   messages.PurgeStatus
 	retErr                                      error
@@ -34,6 +36,7 @@ func (f *fakePurger) PurgeUserServerMessages(ctx context.Context, serverID, acto
 	f.called = true
 	f.gotServerID, f.gotActor, f.gotTarget, f.gotReason = serverID, actorID, target, reason
 	f.gotCtxErr = ctx.Err()
+	f.gotDeadline, _ = ctx.Deadline()
 	return f.retCount, f.retStatus, f.retErr
 }
 
@@ -69,9 +72,9 @@ func TestApplyPurgeOnModeration_SkippedUnauthorized(t *testing.T) {
 }
 
 func TestApplyPurgeOnModeration_Failed(t *testing.T) {
-	fp := &fakePurger{retStatus: messages.PurgeFailed, retErr: errors.New("boom")}
+	fp := &fakePurger{retCount: 3, retStatus: messages.PurgeFailed, retErr: errors.New("boom")}
 	out := testHandlerWithPurger(fp).applyPurgeOnModeration(context.Background(), "srv", "mod", "victim", "ban")
-	assert.Equal(t, purgeOutcome{Requested: true, Status: messages.PurgeFailed}, out)
+	assert.Equal(t, purgeOutcome{Requested: true, Status: messages.PurgeFailed, PurgedCount: 3}, out)
 }
 
 func TestApplyPurgeOnModeration_NilPurger(t *testing.T) {
@@ -122,6 +125,17 @@ func TestApplyPurgeOnModeration_DetachesFromRequestContext(t *testing.T) {
 	assert.True(t, fp.called, "purge still runs despite a cancelled request context")
 	assert.NoError(t, fp.gotCtxErr, "purger receives a cancellation-detached context")
 	assert.Equal(t, messages.PurgeCompleted, out.Status)
+}
+
+func TestApplyPurgeOnModeration_PreservesCallerDeadline(t *testing.T) {
+	fp := &fakePurger{retStatus: messages.PurgeCompleted}
+	deadline := time.Now().Add(time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	testHandlerWithPurger(fp).applyPurgeOnModeration(ctx, "srv", "mod", "victim", "ban")
+	require.True(t, fp.called)
+	require.WithinDuration(t, deadline, fp.gotDeadline, 20*time.Millisecond)
 }
 
 // Fail-CLOSED rate limit: an exhausted per-actor budget skips the purge (ban/kick already

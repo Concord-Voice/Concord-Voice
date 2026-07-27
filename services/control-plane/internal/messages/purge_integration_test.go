@@ -5,10 +5,14 @@ package messages_test
 // SetupTestServer fatals locally without a reachable test database).
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -78,6 +82,60 @@ func TestPurgeChannel_ManageAllDeletesAllAndAudits(t *testing.T) {
 	assert.Equal(t, "channel", ctxType)
 	assert.Equal(t, "completed", status)
 	assert.Equal(t, 6, deleted)
+}
+
+// TestPurgeChannel_ChannelLookupHonorsSynchronousTimeout proves the preflight
+// query shares the bounded context used by the purge engine. Without it, a
+// locked channels table can hold this HTTP request past the write deadline.
+func TestPurgeChannel_ChannelLookupHonorsSynchronousTimeout(t *testing.T) {
+	assertPurgeChannelPreflightTimeout(t, "channel lookup",
+		`LOCK TABLE channels IN ACCESS EXCLUSIVE MODE`, http.StatusInternalServerError)
+}
+
+// TestPurgeChannel_PermissionResolutionHonorsSynchronousTimeout proves RBAC
+// resolution shares the bounded context used by the purge engine.
+func TestPurgeChannel_PermissionResolutionHonorsSynchronousTimeout(t *testing.T) {
+	assertPurgeChannelPreflightTimeout(t, "permission resolution",
+		`LOCK TABLE server_members IN ACCESS EXCLUSIVE MODE`, http.StatusInternalServerError)
+}
+
+func assertPurgeChannelPreflightTimeout(t *testing.T, preflight, lockQuery string, wantStatus int) {
+	t.Helper()
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "purge_timeout_owner")
+	serverID := ts.CreateTestServer(t, owner.ID, "purge-timeout-server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+
+	lockTx, err := ts.DB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	defer func() { _ = lockTx.Rollback() }()
+	_, err = lockTx.Exec(lockQuery)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodDelete, purgeChannelPath(channelID),
+		strings.NewReader(`{"range":"all"}`))
+	req.Header = testhelpers.AuthHeaders(owner.AccessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	responses := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		ts.Router.ServeHTTP(w, req)
+		responses <- w
+	}()
+
+	select {
+	case w := <-responses:
+		assert.Equal(t, wantStatus, w.Code, w.Body.String())
+	case <-time.After(11 * time.Second):
+		require.NoError(t, lockTx.Rollback())
+		select {
+		case <-responses:
+		case <-time.After(time.Second):
+			t.Fatal("purge request did not complete after releasing channel lock")
+		}
+		t.Fatalf("%s did not honor the synchronous purge timeout", preflight)
+	}
 }
 
 func TestPurgeChannel_ManageOwnOnlyForcedToSelf(t *testing.T) {
@@ -164,6 +222,31 @@ func TestPurgeChannel_ViewDenyBlocksPurge(t *testing.T) {
 
 	assert.Equal(t, 1, countChannelMessages(t, ts, channelID),
 		"a channel the actor cannot view must not be purgeable")
+	assert.Equal(t, 0, countPurgeAudits(t, ts, channelID), "denied purge must write no audit row")
+}
+
+// regression for #2344: the view gate must match the channel type. Granting text
+// visibility must not authorize a destructive purge of a voice channel.
+func TestPurgeChannel_VoiceViewDenyBlocksPurge(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "vvd_owner")
+	mod := ts.CreateTestUser(t, "vvd_mod")
+	serverID := ts.CreateTestServer(t, owner.ID, "vvd-server")
+	ts.AddMemberToServer(t, serverID, mod.ID, "member")
+	modRole := ts.CreateTestRole(t, serverID, "Mods", 5, int64(rbac.ModeratorPermissions))
+	ts.AssignRoleToUser(t, serverID, mod.ID, modRole)
+
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice")
+	ts.CreateTestMessage(t, channelID, owner, "voice-history")
+	// A text-view grant must not defeat a voice-view deny on a voice channel.
+	ts.CreateChannelOverride(t, channelID, "role", modRole,
+		int64(rbac.PermViewTextChannels), int64(rbac.PermViewVoiceChannels))
+
+	w := ts.DoRequest(http.MethodDelete, purgeChannelPath(channelID),
+		map[string]any{"range": "all"}, testhelpers.AuthHeaders(mod.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	assert.Equal(t, 1, countChannelMessages(t, ts, channelID),
+		"a voice-view denial must leave the voice-channel history intact")
 	assert.Equal(t, 0, countPurgeAudits(t, ts, channelID), "denied purge must write no audit row")
 }
 
@@ -278,6 +361,87 @@ func TestPurgeServer_NonMemberDeniedNoAudit(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, w.Code)
 	assert.Equal(t, 1, countChannelMessages(t, ts, chID))
 	assert.Equal(t, 0, countPurgeAudits(t, ts, serverID))
+}
+
+// regression for #2344: a channel-less server is a valid empty scope. Its owner
+// receives a completed zero-count purge with an audit row; an outsider cannot use
+// that result to learn whether the server exists or has channels.
+func TestPurgeServer_EmptyScopeAuthorizesBeforeCompletingAndAudits(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "empty_owner")
+	outsider := ts.CreateTestUser(t, "empty_outsider")
+	serverID := ts.CreateTestServer(t, owner.ID, "empty-server") // deliberately no channels
+
+	t.Run("owner receives completed zero-count audit", func(t *testing.T) {
+		w := ts.DoRequest(http.MethodDelete, purgeServerPath(serverID),
+			map[string]any{"range": "all"}, testhelpers.AuthHeaders(owner.AccessToken))
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		var resp struct {
+			DeletedCount int `json:"deleted_count"`
+			HiddenCount  int `json:"hidden_count"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Zero(t, resp.DeletedCount)
+		assert.Zero(t, resp.HiddenCount)
+
+		var status string
+		var deleted int
+		require.NoError(t, ts.DB.QueryRow(
+			`SELECT status, deleted_count FROM message_purges WHERE context_id = $1`, serverID,
+		).Scan(&status, &deleted))
+		assert.Equal(t, "completed", status)
+		assert.Zero(t, deleted)
+	})
+
+	t.Run("outsider receives no completion signal or audit", func(t *testing.T) {
+		w := ts.DoRequest(http.MethodDelete, purgeServerPath(serverID),
+			map[string]any{"range": "all"}, testhelpers.AuthHeaders(outsider.AccessToken))
+		assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+		assert.Equal(t, 1, countPurgeAudits(t, ts, serverID),
+			"the owner's audit is the only audit row")
+	})
+}
+
+func TestPurgeServer_EmptyScopeAllowsVoiceOnlyModerator(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "empty_voice_owner")
+	member := ts.CreateTestUser(t, "empty_voice_member")
+	serverID := ts.CreateTestServer(t, owner.ID, "empty-voice-server") // deliberately no channels
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+	var allRoleID string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID,
+	).Scan(&allRoleID))
+	_, err := ts.DB.Exec(`UPDATE roles SET permissions = 0 WHERE id = $1`, allRoleID)
+	require.NoError(t, err)
+	voiceModerator := ts.CreateTestRole(t, serverID, "Voice moderator", 5,
+		int64(rbac.PermViewVoiceChannels|rbac.PermManageAllMessages))
+	ts.AssignRoleToUser(t, serverID, member.ID, voiceModerator)
+
+	w := ts.DoRequest(http.MethodDelete, purgeServerPath(serverID),
+		map[string]any{"range": "all"}, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, 1, countPurgeAudits(t, ts, serverID))
+}
+
+// regression for #2344: empty scopes must resolve authorization from committed
+// state, not a permission bitfield cached before the actor was removed.
+func TestPurgeServer_EmptyScopeRejectsRemovedMemberWithWarmCache(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "empty_cached_owner")
+	serverID := ts.CreateTestServer(t, owner.ID, "empty-cached-server") // deliberately no channels
+
+	cache := rbac.NewPermissionCache(ts.Redis)
+	require.NoError(t, cache.Set(context.Background(), serverID, owner.ID, "", rbac.OwnerPermissions))
+	_, err := ts.DB.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, owner.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest(http.MethodDelete, purgeServerPath(serverID),
+		map[string]any{"range": "all"}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	assert.Zero(t, countPurgeAudits(t, ts, serverID), "a removed member must not create a zero-count audit")
 }
 
 // --- Request-validation paths (400/404) ---
