@@ -65,7 +65,7 @@ func TestNewRouterWiresOneAuthoritativeRichPresenceBridgeIntoVoiceNATS(t *testin
 		"activityBuilder := presence.NewActivityBuilder(",
 		// One shared base-presence gate, constructed before both consumers so
 		// they cannot disagree about whether a sender may publish (#2444).
-		"senderPresence := websocket.NewSenderPresenceResolver(redis, db)",
+		"senderPresence := websocket.NewSenderPresenceResolver(redis, db, hub)",
 		"activityService := presence.NewActivityService(",
 		"activitySnapshotService := presence.NewActivitySnapshotService(",
 		"hub.SetActivitySnapshotService(activitySnapshotService)",

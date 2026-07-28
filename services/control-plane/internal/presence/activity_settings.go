@@ -731,6 +731,23 @@ func (s *ActivityService) SuppressHiddenSenderActivityAlreadyGated(
 	ctx context.Context,
 	userID uuid.UUID,
 ) error {
+	return s.suppressHiddenSenderActivityAlreadyGated(ctx, userID, false)
+}
+
+// ForceSuppressHiddenSenderActivityAlreadyGated preserves a hidden transition
+// when neither shared hidden marker could be written before work was queued.
+func (s *ActivityService) ForceSuppressHiddenSenderActivityAlreadyGated(
+	ctx context.Context,
+	userID uuid.UUID,
+) error {
+	return s.suppressHiddenSenderActivityAlreadyGated(ctx, userID, true)
+}
+
+func (s *ActivityService) suppressHiddenSenderActivityAlreadyGated(
+	ctx context.Context,
+	userID uuid.UUID,
+	forced bool,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -741,9 +758,9 @@ func (s *ActivityService) SuppressHiddenSenderActivityAlreadyGated(
 		return errors.New("hidden-sender activity suppression unavailable")
 	}
 	// The hub queues edge work. A visible return completed before this re-read
-	// makes the edge a no-op; a later return deliberately errs toward clearing
-	// until the normal lifecycle rebuild republishes current state.
-	if s.senderPresence != nil && s.senderPresence.RichPresenceEmissionPermitted(ctx, userID) {
+	// makes a normal edge a no-op. A forced edge bypasses the check because no
+	// shared hidden marker survived the transition.
+	if !forced && s.senderPresence != nil && s.senderPresence.RichPresenceEmissionPermitted(ctx, userID) {
 		return nil
 	}
 

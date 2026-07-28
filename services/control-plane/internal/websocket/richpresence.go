@@ -206,12 +206,17 @@ func marshalRichPresenceFrame(
 type senderPresenceResolver struct {
 	redis *redis.Client
 	db    *sql.DB
+	hub   *Hub
 }
 
 // NewSenderPresenceResolver builds the presence.SenderPresenceResolver consumed
 // by both the activity service and the bootstrap snapshot service.
-func NewSenderPresenceResolver(rdb *redis.Client, db *sql.DB) presence.SenderPresenceResolver {
-	return &senderPresenceResolver{redis: rdb, db: db}
+func NewSenderPresenceResolver(
+	rdb *redis.Client,
+	db *sql.DB,
+	hub *Hub,
+) presence.SenderPresenceResolver {
+	return &senderPresenceResolver{redis: rdb, db: db, hub: hub}
 }
 
 // RichPresenceEmissionPermitted fails CLOSED on every uncertainty.
@@ -226,7 +231,7 @@ func NewSenderPresenceResolver(rdb *redis.Client, db *sql.DB) presence.SenderPre
 func (r *senderPresenceResolver) RichPresenceEmissionPermitted(
 	ctx context.Context, senderID uuid.UUID,
 ) bool {
-	if r == nil || r.redis == nil {
+	if r == nil || r.redis == nil || !r.hub.richPresenceEmissionPermitted(senderID) {
 		return false
 	}
 

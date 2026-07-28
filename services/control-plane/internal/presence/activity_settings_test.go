@@ -614,6 +614,26 @@ func TestSuppressHiddenSenderActivity_ClearsWithoutDisconnecting(t *testing.T) {
 	assert.Equal(t, TierOff, gotAfter.PrivateCallTier)
 }
 
+func TestForceSuppressHiddenSenderActivity_BypassesVisibleRecheckAndClearsBothCategories(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	service.senderPresence = alwaysPermitPresence{}
+
+	err := service.ForceSuppressHiddenSenderActivityAlreadyGated(
+		context.Background(), activityServiceSender,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, map[Category]int{
+		CategoryServerVoice: 1,
+		CategoryPrivateCall: 1,
+	}, storeCallCategories(store.exactDeletes))
+	assert.Equal(t, map[Category]int{
+		CategoryServerVoice: 1,
+		CategoryPrivateCall: 1,
+	}, planCategories(delivery.plans))
+	assert.Zero(t, delivery.disconnectAllCalls)
+}
+
 func TestSuppressHiddenSenderActivity_VisibleSenderDoesNothing(t *testing.T) {
 	delivery := &activityServiceDeliveryStub{}
 	service := NewActivityService(

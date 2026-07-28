@@ -2,15 +2,105 @@ package websocket
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 )
+
+type forcedHiddenSuppressorSetter interface {
+	SetRichPresenceHiddenSuppressor(func(uuid.UUID), ...func(uuid.UUID))
+}
+
+type localRichPresenceGate interface {
+	richPresenceEmissionPermitted(uuid.UUID) bool
+}
+
+func hubPermitsRichPresence(hub *Hub, userID uuid.UUID) bool {
+	gate, ok := any(hub).(localRichPresenceGate)
+	if !ok {
+		return true // pre-fix behavior: no Hub-local suppression gate
+	}
+	return gate.richPresenceEmissionPermitted(userID)
+}
+
+type blockingExecDriver struct {
+	entered     chan struct{}
+	release     chan struct{}
+	resultErr   error
+	enterOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func (d *blockingExecDriver) Open(string) (driver.Conn, error) {
+	return &blockingExecConn{driver: d}, nil
+}
+
+func (d *blockingExecDriver) unblock() {
+	d.releaseOnce.Do(func() { close(d.release) })
+}
+
+type blockingExecConn struct {
+	driver *blockingExecDriver
+}
+
+func (c *blockingExecConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepare not supported")
+}
+
+func (c *blockingExecConn) Close() error {
+	return nil
+}
+
+func (c *blockingExecConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions not supported")
+}
+
+func (c *blockingExecConn) ExecContext(ctx context.Context, _ string, _ []driver.NamedValue) (driver.Result, error) {
+	c.driver.enterOnce.Do(func() { close(c.driver.entered) })
+	select {
+	case <-c.driver.release:
+		if c.driver.resultErr != nil {
+			return nil, c.driver.resultErr
+		}
+		return driver.RowsAffected(1), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+var _ driver.ExecerContext = (*blockingExecConn)(nil)
+
+func openBlockingExecDB(t *testing.T, resultErr ...error) (*sql.DB, *blockingExecDriver) {
+	t.Helper()
+	script := &blockingExecDriver{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	if len(resultErr) > 0 {
+		script.resultErr = resultErr[0]
+	}
+	driverName := "websocket-blocking-exec-" + uuid.NewString()
+	sql.Register(driverName, script)
+	db, err := sql.Open(driverName, "")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		script.unblock()
+		require.NoError(t, db.Close())
+	})
+	return db, script
+}
 
 // drainSuppressors waits for every dispatched hidden-sender suppression. The
 // dispatch is deliberately off the Run goroutine, so tests must join it.
@@ -193,6 +283,167 @@ func TestHub_SaturatedSuppressorQueuesEdgesWithoutBlocking(t *testing.T) {
 		"the queued sender runs once after capacity returns")
 }
 
+// Regression #2444: a failed offline transition must upgrade an already-queued
+// normal suppression so stale recovered Redis cannot make the clear fail open.
+func TestHub_OfflineTransitionForcesAlreadyQueuedSuppression(t *testing.T) {
+	ctx := context.Background()
+	userID := uuid.New()
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: -1})
+	t.Cleanup(func() { require.NoError(t, rdb.Close()) })
+	require.NoError(t, rdb.Set(ctx, presence.StatusRedisKey(userID), statusOnline, 0).Err())
+
+	db, err := sql.Open("postgres", "")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	hub := NewHub(db, rdb)
+	clientID := uuid.New()
+	hub.userClients[userID] = map[uuid.UUID]bool{clientID: true}
+	hub.presenceRecovery[userID] = presenceRecoveryState{status: statusOnline}
+
+	var cleared []presence.Category
+	recordClear := func(id uuid.UUID) {
+		if id == userID {
+			cleared = append(cleared, presence.CategoryServerVoice, presence.CategoryPrivateCall)
+		}
+	}
+	normal := func(id uuid.UUID) {
+		status, readErr := rdb.Get(ctx, presence.StatusRedisKey(id)).Result()
+		if readErr != nil || presence.EmissionPermittedForStatus(status) {
+			return
+		}
+		recordClear(id)
+	}
+	if setter, ok := any(hub).(forcedHiddenSuppressorSetter); ok {
+		setter.SetRichPresenceHiddenSuppressor(normal, recordClear)
+	} else {
+		hub.SetRichPresenceHiddenSuppressor(normal)
+	}
+
+	hub.suppressorMu.Lock()
+	hub.suppressorRunning = richPresenceSuppressorSlots
+	hub.suppressorMu.Unlock()
+	hub.spawnRichPresenceSuppression(userID)
+
+	mr.Close()
+	require.Error(t, db.PingContext(ctx))
+	require.Error(t, rdb.Ping(ctx).Err())
+	hub.transitionUserOffline(ctx, userID, false)
+
+	require.NoError(t, mr.Restart())
+	status, err := rdb.Get(ctx, presence.StatusRedisKey(userID)).Result()
+	require.NoError(t, err)
+	require.Equal(t, statusOnline, status, "failed offline write must leave the stale visible value")
+	assert.False(t, hubPermitsRichPresence(hub, userID),
+		"a connected sender without a confirmed visible state must stay suppressed after both offline writes fail")
+	hub.presenceRecovery[userID] = presenceRecoveryState{status: statusOnline}
+	assert.True(t, hubPermitsRichPresence(hub, userID),
+		"a confirmed visible state for the connected sender may emit again")
+
+	hub.suppressorMu.Lock()
+	hub.suppressorRunning = 0
+	hub.startPendingRichPresenceSuppressions()
+	hub.suppressorMu.Unlock()
+	hub.drainSuppressors()
+
+	assert.Equal(t, []presence.Category{
+		presence.CategoryServerVoice,
+		presence.CategoryPrivateCall,
+	}, cleared, "expected both categories, got %v", cleared)
+}
+
+func TestHub_QueuedForcedSuppressionCannotBeDowngraded(t *testing.T) {
+	hub := newMinimalHub()
+	userID := uuid.New()
+	called := make(chan string, 1)
+	hub.SetRichPresenceHiddenSuppressor(
+		func(uuid.UUID) { called <- "normal" },
+		func(uuid.UUID) { called <- "forced" },
+	)
+	hub.suppressorRunning = richPresenceSuppressorSlots
+
+	hub.spawnRichPresenceSuppression(userID, true)
+	hub.spawnRichPresenceSuppression(userID)
+	hub.suppressorMu.Lock()
+	hub.suppressorRunning = 0
+	hub.startPendingRichPresenceSuppressions()
+	hub.suppressorMu.Unlock()
+	hub.drainSuppressors()
+
+	assert.Equal(t, "forced", <-called)
+}
+
+// Regression #2444 / CWE-367: process-local authorization must close before
+// either durable offline write can block or fail. Otherwise a concurrent
+// refresh/bootstrap can publish from stale visible Redis during the I/O window.
+func TestHub_HiddenTransitionRevokesLocalAuthorizationBeforeOfflineFenceIO(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		transition   func(*Hub, uuid.UUID)
+		wantRecovery bool
+	}{
+		{
+			name: "offline transition",
+			transition: func(hub *Hub, userID uuid.UUID) {
+				hub.transitionUserOffline(context.Background(), userID, false)
+			},
+		},
+		{
+			name:         "fail-closed heartbeat",
+			transition:   func(hub *Hub, userID uuid.UUID) { hub.failClosedPresenceHeartbeat(userID) },
+			wantRecovery: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, script := openBlockingExecDB(t)
+			hub := NewHub(db, nil)
+			userID := uuid.New()
+			hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+			hub.presenceRecovery[userID] = presenceRecoveryState{status: statusOnline}
+			require.True(t, hub.richPresenceEmissionPermitted(userID))
+
+			transitionDone := make(chan struct{})
+			go func() {
+				test.transition(hub, userID)
+				close(transitionDone)
+			}()
+			select {
+			case <-script.entered:
+			case <-time.After(time.Second):
+				t.Fatal("offline fence writer did not reach the DB boundary")
+			}
+
+			readerDone := make(chan struct{})
+			go func() {
+				_ = hub.richPresenceEmissionPermitted(userID)
+				close(readerDone)
+			}()
+			select {
+			case <-readerDone:
+			case <-time.After(time.Second):
+				t.Fatal("offline fence I/O held the Hub mutex")
+			}
+			assert.False(t, hub.richPresenceEmissionPermitted(userID),
+				"local authorization must be revoked before the fallible offline fence write")
+			script.unblock()
+			select {
+			case <-transitionDone:
+			case <-time.After(time.Second):
+				t.Fatal("offline transition remained blocked after releasing the fence")
+			}
+			assert.False(t, hub.richPresenceEmissionPermitted(userID))
+
+			if test.wantRecovery {
+				hub.mu.RLock()
+				recovery := hub.presenceRecovery[userID]
+				hub.mu.RUnlock()
+				assert.Equal(t, presenceRecoveryState{status: statusOnline}, recovery,
+					"fail-closed heartbeat must retain the visible recovery candidate")
+			}
+		})
+	}
+}
+
 // E3: the offline edge. The last connection going away writes a durable offline
 // state before the suppressor runs.
 // This one hook also covers handleDisconnectUser and handleDisconnectSession,
@@ -254,6 +505,29 @@ func TestHub_FailClosedRegisterSpawnsSuppressor(t *testing.T) {
 		`SELECT EXISTS (SELECT 1 FROM presence_offline_fences WHERE user_id = $1)`, userID,
 	).Scan(&fenced))
 	assert.True(t, fenced)
+}
+
+func TestHub_FirstRegisterFenceClearFailureKeepsRecoveryPending(t *testing.T) {
+	db, script := openBlockingExecDB(t, errors.New("fence clear failed"))
+	script.unblock()
+	hub := NewHub(db, setupHubTestRedis(t))
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.SetRichPresenceHiddenSuppressor(func(uuid.UUID) {})
+
+	hub.handleRegister(client)
+	hub.drainSuppressors()
+	client.cancelBootstrap()
+	client.asyncWg.Wait()
+
+	hub.mu.RLock()
+	recovery, known := hub.presenceRecovery[userID]
+	hiddenStatus := hub.hiddenPresence[userID]
+	hub.mu.RUnlock()
+	require.True(t, known)
+	assert.True(t, recovery.pending,
+		"a failed fence clear must not expose a confirmed visible recovery candidate")
+	assert.Equal(t, statusOffline, hiddenStatus)
 }
 
 func TestHub_VisibleStatusClearsOfflineFence(t *testing.T) {

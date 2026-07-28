@@ -300,7 +300,7 @@ func NewRouter(
 	// The base-presence gate for Rich Presence emission (#2444). Both the
 	// lifecycle service and the bootstrap snapshot reader share one resolver so
 	// they cannot disagree about whether a sender may publish.
-	senderPresence := websocket.NewSenderPresenceResolver(redis, db)
+	senderPresence := websocket.NewSenderPresenceResolver(redis, db, hub)
 	activityService := presence.NewActivityService(
 		presenceHistoryService,
 		activityBuilder,
@@ -324,7 +324,8 @@ func NewRouter(
 	// by contract -- matching how account erasure calls its sibling. The hub
 	// dispatches this off its Run goroutine, so blocking on the gate is safe.
 	hub.SetRichPresenceHiddenSuppressor(
-		newRichPresenceHiddenSuppressor(activityService, presenceHistoryService, log),
+		newRichPresenceHiddenSuppressor(activityService, presenceHistoryService, log, false),
+		newRichPresenceHiddenSuppressor(activityService, presenceHistoryService, log, true),
 	)
 
 	auditWriter := rbac.NewAuditWriter(db, log)
@@ -2172,6 +2173,7 @@ func newRichPresenceHiddenSuppressor(
 	activityService *presence.ActivityService,
 	presenceHistoryService *presencehistory.Service,
 	log *logger.Logger,
+	forced bool,
 ) func(uuid.UUID) {
 	return func(userID uuid.UUID) {
 		ctx, cancel := context.WithTimeout(
@@ -2179,6 +2181,9 @@ func newRichPresenceHiddenSuppressor(
 		)
 		defer cancel()
 		if err := presenceHistoryService.WithSender(ctx, userID, func() error {
+			if forced {
+				return activityService.ForceSuppressHiddenSenderActivityAlreadyGated(ctx, userID)
+			}
 			return activityService.SuppressHiddenSenderActivityAlreadyGated(ctx, userID)
 		}); err != nil {
 			// PII-safe: operation class only, never recipients or channel identity.

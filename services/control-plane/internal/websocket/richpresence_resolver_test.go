@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"context"
+	"database/sql/driver"
 	"testing"
 
 	"github.com/google/uuid"
@@ -27,6 +28,51 @@ func newUnreachableRedisClient(t *testing.T) *redis.Client {
 	return client
 }
 
+func locallyVisibleHub(senderID uuid.UUID) *Hub {
+	hub := newMinimalHub()
+	hub.userClients[senderID] = map[uuid.UUID]bool{uuid.New(): true}
+	hub.presenceRecovery[senderID] = presenceRecoveryState{status: statusOnline}
+	return hub
+}
+
+func TestSenderPresenceResolver_LocalGateOverridesStaleVisibleStatus(t *testing.T) {
+	senderID := uuid.New()
+	rdb := setupHubTestRedis(t)
+	require.NoError(t, rdb.Set(
+		context.Background(), presence.StatusRedisKey(senderID), statusOnline, 0,
+	).Err())
+	db := openScriptedRowsDB(t, []string{"exists"}, [][]driver.Value{{false}}, nil)
+
+	connected := func() *Hub {
+		hub := newMinimalHub()
+		hub.userClients[senderID] = map[uuid.UUID]bool{uuid.New(): true}
+		return hub
+	}
+	hidden := connected()
+	hidden.presenceRecovery[senderID] = presenceRecoveryState{status: statusOnline}
+	hidden.setHiddenPresence(senderID, statusOffline)
+	pending := connected()
+	pending.presenceRecovery[senderID] = presenceRecoveryState{status: statusOnline, pending: true}
+
+	for _, test := range []struct {
+		name      string
+		hub       *Hub
+		permitted bool
+	}{
+		{name: "disconnected", hub: newMinimalHub()},
+		{name: "unknown local recovery", hub: connected()},
+		{name: "hidden", hub: hidden},
+		{name: "pending recovery", hub: pending},
+		{name: "confirmed visible", hub: locallyVisibleHub(senderID), permitted: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resolver := NewSenderPresenceResolver(rdb, db, test.hub)
+			require.Equal(t, test.permitted,
+				resolver.RichPresenceEmissionPermitted(context.Background(), senderID))
+		})
+	}
+}
+
 func TestSenderPresenceResolver_Mapping(t *testing.T) {
 	db := setupHubTestDB(t)
 	rdb := setupHubTestRedis(t)
@@ -50,7 +96,7 @@ func TestSenderPresenceResolver_Mapping(t *testing.T) {
 				).Err())
 			}
 
-			resolver := NewSenderPresenceResolver(rdb, db)
+			resolver := NewSenderPresenceResolver(rdb, db, locallyVisibleHub(senderID))
 			require.Equal(t, tc.permitted,
 				resolver.RichPresenceEmissionPermitted(context.Background(), senderID))
 		})
@@ -58,18 +104,22 @@ func TestSenderPresenceResolver_Mapping(t *testing.T) {
 }
 
 func TestSenderPresenceResolver_TransportErrorSuppresses(t *testing.T) {
-	resolver := NewSenderPresenceResolver(newUnreachableRedisClient(t), nil)
+	senderID := uuid.New()
+	resolver := NewSenderPresenceResolver(
+		newUnreachableRedisClient(t), nil, locallyVisibleHub(senderID),
+	)
 
 	require.False(t,
-		resolver.RichPresenceEmissionPermitted(context.Background(), uuid.New()),
+		resolver.RichPresenceEmissionPermitted(context.Background(), senderID),
 		"a transport error must fail closed, never emit")
 }
 
 func TestSenderPresenceResolver_NilClientSuppresses(t *testing.T) {
-	resolver := NewSenderPresenceResolver(nil, nil)
+	senderID := uuid.New()
+	resolver := NewSenderPresenceResolver(nil, nil, locallyVisibleHub(senderID))
 
 	require.False(t,
-		resolver.RichPresenceEmissionPermitted(context.Background(), uuid.New()),
+		resolver.RichPresenceEmissionPermitted(context.Background(), senderID),
 		"an unwired resolver must fail closed")
 }
 
@@ -86,7 +136,7 @@ func TestSenderPresenceResolver_ReadsLiveOnEveryCall(t *testing.T) {
 	db := setupHubTestDB(t)
 	rdb := setupHubTestRedis(t)
 	senderID := uuid.New()
-	resolver := NewSenderPresenceResolver(rdb, db)
+	resolver := NewSenderPresenceResolver(rdb, db, locallyVisibleHub(senderID))
 	ctx := context.Background()
 
 	require.NoError(t, rdb.Set(ctx, presence.StatusRedisKey(senderID), statusOnline, 0).Err())
@@ -110,7 +160,7 @@ func TestSenderPresenceResolver_OfflineFenceSuppressesStaleVisibleStatus(t *test
 	)
 	require.NoError(t, err)
 
-	resolver := NewSenderPresenceResolver(rdb, db)
+	resolver := NewSenderPresenceResolver(rdb, db, locallyVisibleHub(senderID))
 	require.False(t, resolver.RichPresenceEmissionPermitted(ctx, senderID),
 		"a durable offline fence must override a stale visible Redis status")
 }

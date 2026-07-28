@@ -112,11 +112,13 @@ type Hub struct {
 	// their base presence transitions to invisible or offline (#2444). Injected
 	// so the hub does not depend on internal/presence's service construction,
 	// mirroring dmRingCanceller.
-	richPresenceHiddenSuppressor func(uuid.UUID)
-	suppressorMu                 sync.Mutex
-	suppressorPending            map[uuid.UUID]struct{}
-	suppressorRunning            int
-	suppressorWg                 sync.WaitGroup
+	richPresenceHiddenSuppressor      func(uuid.UUID)
+	richPresenceHiddenForceSuppressor func(uuid.UUID)
+	suppressorMu                      sync.Mutex
+	suppressorPending                 map[uuid.UUID]struct{}
+	suppressorForced                  map[uuid.UUID]bool
+	suppressorRunning                 int
+	suppressorWg                      sync.WaitGroup
 	// Deterministic test seam invoked after capacity preflight and before the
 	// first nonblocking completion write.
 	clientBootstrapBeforeFlush func()
@@ -471,8 +473,12 @@ func (h *Hub) SetDMRingCanceller(c DMRingCanceller) {
 // SetRichPresenceHiddenSuppressor injects the hidden-sender suppression callback
 // invoked when a base-presence transition forbids Rich Presence emission (#2444).
 // Mirrors SetDMRingCanceller: installed before Run starts.
-func (h *Hub) SetRichPresenceHiddenSuppressor(fn func(uuid.UUID)) {
+func (h *Hub) SetRichPresenceHiddenSuppressor(fn func(uuid.UUID), forced ...func(uuid.UUID)) {
 	h.richPresenceHiddenSuppressor = fn
+	h.richPresenceHiddenForceSuppressor = fn
+	if len(forced) > 0 {
+		h.richPresenceHiddenForceSuppressor = forced[0]
+	}
 }
 
 // spawnRichPresenceSuppression runs the suppressor OFF the Run goroutine.
@@ -489,13 +495,18 @@ func (h *Hub) SetRichPresenceHiddenSuppressor(fn func(uuid.UUID)) {
 // an edge from a level, and the invisible heartbeat re-asserts the level on every
 // beat. Distinct edges are coalesced per sender and drained at fixed concurrency,
 // so saturation never drops a privacy clear or blocks the Run goroutine.
-func (h *Hub) spawnRichPresenceSuppression(userID uuid.UUID) {
-	h.spawnRichPresenceSuppressionDuringShutdown(userID, false)
+func (h *Hub) spawnRichPresenceSuppression(userID uuid.UUID, forced ...bool) {
+	force := len(forced) > 0 && forced[0]
+	h.spawnRichPresenceSuppressionDuringShutdown(userID, false, force)
 }
 
 // spawnRichPresenceSuppressionDuringShutdown preserves offline edges that
 // Shutdown established after stopping the Run loop from accepting new work.
-func (h *Hub) spawnRichPresenceSuppressionDuringShutdown(userID uuid.UUID, allowStopping bool) {
+func (h *Hub) spawnRichPresenceSuppressionDuringShutdown(
+	userID uuid.UUID,
+	allowStopping bool,
+	forced bool,
+) {
 	if h == nil || h.richPresenceHiddenSuppressor == nil {
 		return
 	}
@@ -511,10 +522,15 @@ func (h *Hub) spawnRichPresenceSuppressionDuringShutdown(userID uuid.UUID, allow
 	if h.suppressorPending == nil {
 		h.suppressorPending = make(map[uuid.UUID]struct{})
 	}
+	if h.suppressorForced == nil {
+		h.suppressorForced = make(map[uuid.UUID]bool)
+	}
 	if _, queued := h.suppressorPending[userID]; queued {
+		h.suppressorForced[userID] = h.suppressorForced[userID] || forced
 		return
 	}
 	h.suppressorPending[userID] = struct{}{}
+	h.suppressorForced[userID] = forced
 	h.startPendingRichPresenceSuppressions()
 }
 
@@ -525,8 +541,13 @@ func (h *Hub) startPendingRichPresenceSuppressions() {
 		for userID = range h.suppressorPending {
 			break
 		}
+		forced := h.suppressorForced[userID]
 		delete(h.suppressorPending, userID)
+		delete(h.suppressorForced, userID)
 		fn := h.richPresenceHiddenSuppressor
+		if forced {
+			fn = h.richPresenceHiddenForceSuppressor
+		}
 		if fn == nil {
 			return
 		}
@@ -708,7 +729,7 @@ func (h *Hub) handleRegister(client *Client) {
 		if err := h.redis.Set(ctx, presence.StatusRedisKey(client.UserID), statusOnline, 120*time.Second).Err(); err != nil {
 			log.Printf("[hub] failed to persist initial presence for user %s: %v", sanitizeLogValue(client.UserID.String()), err)
 			recovery.pending = true
-			h.presenceRecovery[client.UserID] = recovery
+			h.setPresenceRecovery(client.UserID, recovery)
 			// E5 (#2444): a first registration that cannot persist presence
 			// fails closed to offline, so any activity from a prior session
 			// must not keep publishing.
@@ -716,10 +737,11 @@ func (h *Hub) handleRegister(client *Client) {
 		} else {
 			if err := h.clearOfflinePresenceFence(ctx, client.UserID); err != nil {
 				log.Printf("[hub] failed to clear offline presence fence for user %s: %v", sanitizeLogValue(client.UserID.String()), err)
-				h.presenceRecovery[client.UserID] = recovery
+				recovery.pending = true
+				h.setPresenceRecovery(client.UserID, recovery)
 				h.failClosedPresenceHeartbeat(client.UserID)
 			} else {
-				h.presenceRecovery[client.UserID] = recovery
+				h.setPresenceRecovery(client.UserID, recovery)
 				h.clearHiddenPresence(client.UserID)
 				h.broadcastPresenceToAll(client.UserID, statusOnline, time.Now().Unix())
 			}
@@ -995,18 +1017,26 @@ func (h *Hub) handleUnregister(client *Client) {
 }
 
 func (h *Hub) transitionUserOffline(ctx context.Context, userID uuid.UUID, allowStopping bool) {
+	h.clearPresenceRecovery(userID)
+	fencePersisted := false
 	if err := h.persistOfflinePresenceFence(ctx, userID); err != nil {
 		log.Printf("[hub] failed to persist offline presence fence for user %s: %v", sanitizeLogValue(userID.String()), err)
+	} else if h.db != nil {
+		fencePersisted = true
 	}
+	offlinePersisted := false
 	if h.redis == nil {
 		log.Printf("[hub] presence Redis client unavailable while taking user %s offline", sanitizeLogValue(userID.String()))
 	} else if err := h.redis.Set(ctx, presence.StatusRedisKey(userID), statusOffline, 120*time.Second).Err(); err != nil {
 		log.Printf("[hub] failed to persist offline presence for user %s: %v", sanitizeLogValue(userID.String()), err)
+	} else {
+		offlinePersisted = true
 	}
 
-	delete(h.presenceRecovery, userID)
 	h.clearHiddenPresence(userID)
-	h.spawnRichPresenceSuppressionDuringShutdown(userID, allowStopping)
+	h.spawnRichPresenceSuppressionDuringShutdown(
+		userID, allowStopping, !fencePersisted && !offlinePersisted,
+	)
 	h.broadcastPresenceToAll(userID, statusOffline, time.Now().Unix())
 }
 
@@ -2683,7 +2713,7 @@ func (h *Hub) handleHeartbeat(msg IncomingMessage) {
 	if _, hidden := h.hiddenPresence[msg.UserID]; !hidden {
 		if recovery, known := h.presenceRecovery[msg.UserID]; known && isVisibleStatus(recovery.status) {
 			recovery.pending = true
-			h.presenceRecovery[msg.UserID] = recovery
+			h.setPresenceRecovery(msg.UserID, recovery)
 		}
 	}
 	h.failClosedPresenceHeartbeat(msg.UserID)
@@ -2692,13 +2722,13 @@ func (h *Hub) handleHeartbeat(msg IncomingMessage) {
 func (h *Hub) handlePersistedPresenceHeartbeat(ctx context.Context, key string, userID uuid.UUID, status string) {
 	switch status {
 	case statusInvisible:
-		delete(h.presenceRecovery, userID)
+		h.clearPresenceRecovery(userID)
 		h.setHiddenPresence(userID, statusInvisible)
 		h.refreshPresenceTTL(ctx, key, userID)
 	case statusOnline, statusDND:
 		h.handleVisiblePresenceHeartbeat(ctx, key, userID, status)
 	default:
-		delete(h.presenceRecovery, userID)
+		h.clearPresenceRecovery(userID)
 		h.failClosedPresenceHeartbeat(userID)
 	}
 }
@@ -2708,11 +2738,11 @@ func (h *Hub) handleVisiblePresenceHeartbeat(ctx context.Context, key string, us
 	if !hidden {
 		recovery := presenceRecoveryState{status: status}
 		recovery.pending = !h.refreshPresenceTTL(ctx, key, userID)
-		h.presenceRecovery[userID] = recovery
+		h.setPresenceRecovery(userID, recovery)
 		return
 	}
 	if selfStatus == statusInvisible {
-		delete(h.presenceRecovery, userID)
+		h.clearPresenceRecovery(userID)
 		if err := h.redis.Set(ctx, key, statusInvisible, 120*time.Second).Err(); err != nil {
 			log.Printf("[hub] failed to repair invisible presence for user %s: %v", sanitizeLogValue(userID.String()), err)
 		}
@@ -2723,7 +2753,7 @@ func (h *Hub) handleVisiblePresenceHeartbeat(ctx context.Context, key string, us
 	// A valid persisted value proves Redis recovered, so make the user visible again.
 	recovery := presenceRecoveryState{status: status}
 	recovery.pending = !h.refreshPresenceTTL(ctx, key, userID)
-	h.presenceRecovery[userID] = recovery
+	h.setPresenceRecovery(userID, recovery)
 	if recovery.pending {
 		return
 	}
@@ -2747,7 +2777,7 @@ func (h *Hub) handleMissingPresenceHeartbeat(ctx context.Context, key string, us
 		return
 	}
 	if hidden && selfStatus == statusInvisible {
-		delete(h.presenceRecovery, userID)
+		h.clearPresenceRecovery(userID)
 		if err := h.redis.Set(ctx, key, statusInvisible, 120*time.Second).Err(); err != nil {
 			log.Printf("[hub] failed to restore invisible presence for user %s: %v", sanitizeLogValue(userID.String()), err)
 		}
@@ -2764,7 +2794,7 @@ func (h *Hub) handleMissingPresenceHeartbeat(ctx context.Context, key string, us
 		return
 	}
 	recovery.pending = false
-	h.presenceRecovery[userID] = recovery
+	h.setPresenceRecovery(userID, recovery)
 	if err := h.clearOfflinePresenceFence(ctx, userID); err != nil {
 		log.Printf("[hub] failed to clear offline presence fence for user %s: %v", sanitizeLogValue(userID.String()), err)
 		return
@@ -2787,16 +2817,29 @@ func (h *Hub) refreshPresenceTTL(ctx context.Context, key string, userID uuid.UU
 }
 
 func (h *Hub) failClosedPresenceHeartbeat(userID uuid.UUID) {
+	h.mu.Lock()
+	_, hidden := h.hiddenPresence[userID]
+	newEdge := !hidden
+	if newEdge {
+		if h.hiddenPresence == nil {
+			h.hiddenPresence = make(map[uuid.UUID]string)
+		}
+		h.hiddenPresence[userID] = statusOffline
+	}
+	h.mu.Unlock()
+
+	fencePersisted := false
 	if err := h.persistOfflinePresenceFence(context.Background(), userID); err != nil {
 		log.Printf("[hub] failed to persist offline presence fence for user %s: %v", sanitizeLogValue(userID.String()), err)
+	} else if h.db != nil {
+		fencePersisted = true
 	}
-	if _, hidden := h.hiddenPresence[userID]; hidden {
+	if !newEdge {
 		return
 	}
-	h.setHiddenPresence(userID, statusOffline)
 	h.broadcastPresenceToAll(userID, statusOffline, time.Now().Unix())
 	// E4 (#2444): the early return above already makes this an edge.
-	h.spawnRichPresenceSuppression(userID)
+	h.spawnRichPresenceSuppression(userID, !fencePersisted)
 }
 
 // handleSetStatus allows users to manually set their status (online/dnd/invisible)
@@ -2830,7 +2873,7 @@ func (h *Hub) handleSetStatus(msg IncomingMessage) {
 	// For invisible, broadcast as offline to other users (but store real status in Redis)
 	broadcastStatus := status
 	if status == statusInvisible {
-		delete(h.presenceRecovery, msg.UserID)
+		h.clearPresenceRecovery(msg.UserID)
 		h.setHiddenPresence(msg.UserID, statusInvisible)
 		broadcastStatus = statusOffline
 		if !wasHidden {
@@ -2848,7 +2891,7 @@ func (h *Hub) handleSetStatus(msg IncomingMessage) {
 			h.sendErrorWithData(msg.ClientID, "presence_status_unavailable", nil)
 			return
 		}
-		h.presenceRecovery[msg.UserID] = presenceRecoveryState{status: status}
+		h.setPresenceRecovery(msg.UserID, presenceRecoveryState{status: status})
 		h.clearHiddenPresence(msg.UserID)
 	}
 	h.broadcastPresenceToAll(msg.UserID, broadcastStatus, time.Now().Unix())
@@ -2862,7 +2905,7 @@ func (h *Hub) handleSetStatusWriteFailure(msg IncomingMessage, status string, er
 	}
 	if recovery, known := h.presenceRecovery[msg.UserID]; known && isVisibleStatus(recovery.status) {
 		recovery.pending = true
-		h.presenceRecovery[msg.UserID] = recovery
+		h.setPresenceRecovery(msg.UserID, recovery)
 	}
 }
 
@@ -4234,6 +4277,40 @@ func (h *Hub) clearHiddenPresence(userID uuid.UUID) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.hiddenPresence, userID)
+}
+
+func (h *Hub) setPresenceRecovery(userID uuid.UUID, recovery presenceRecoveryState) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.presenceRecovery == nil {
+		h.presenceRecovery = make(map[uuid.UUID]presenceRecoveryState)
+	}
+	h.presenceRecovery[userID] = recovery
+}
+
+func (h *Hub) clearPresenceRecovery(userID uuid.UUID) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.presenceRecovery, userID)
+}
+
+// richPresenceEmissionPermitted is the process-local half of the sender gate.
+// A shared visible value is not authoritative unless this replica also has a
+// connected sender whose visible transition completed without pending recovery.
+func (h *Hub) richPresenceEmissionPermitted(userID uuid.UUID) bool {
+	if h == nil {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if len(h.userClients[userID]) == 0 {
+		return false
+	}
+	if _, hidden := h.hiddenPresence[userID]; hidden {
+		return false
+	}
+	recovery, known := h.presenceRecovery[userID]
+	return known && !recovery.pending && isVisibleStatus(recovery.status)
 }
 
 // computeServerCounts tallies the number of visibly-online members per server.
