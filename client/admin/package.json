@@ -16,8 +16,8 @@
   },
   "dependencies": {
     "lucide-react": "^1.25.0",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@eslint-react/eslint-plugin": "^5.17.3",
