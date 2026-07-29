@@ -460,37 +460,42 @@ func (h *Handler) validateReplyToID(c *gin.Context, replyToID *string, channelID
 }
 
 // checkSendAccess validates membership, PermSendMessages, and fetches the embed policy.
-// Returns (serverID, allowEmbeds, ok). On failure, writes the JSON error to c.
-func (h *Handler) checkSendAccess(c *gin.Context, channelID, userID string) (string, bool, bool) {
+// Returns (serverID, membershipIncarnation, allowEmbeds, ok). On failure, writes the JSON error to c.
+func (h *Handler) checkSendAccess(c *gin.Context, channelID, userID string) (string, time.Time, bool, bool) {
 	var serverID string
+	var membershipIncarnation time.Time
 	var serverAllowEmbeds bool
 	var timedOutUntil sql.NullTime
 	err := h.db.QueryRow(`
-		SELECT c.server_id, s.allow_embedded_content, sm.timed_out_until
+		SELECT c.server_id, sm.joined_at, s.allow_embedded_content, sm.timed_out_until
 		FROM channels c
 		INNER JOIN server_members sm ON c.server_id = sm.server_id
 		INNER JOIN servers s ON c.server_id = s.id
 		WHERE c.id = $1 AND sm.user_id = $2
-	`, channelID, userID).Scan(&serverID, &serverAllowEmbeds, &timedOutUntil)
+	`, channelID, userID).Scan(&serverID, &membershipIncarnation, &serverAllowEmbeds, &timedOutUntil)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
-		return "", false, false
+		return "", time.Time{}, false, false
 	}
 	if err != nil {
 		h.log.Error(errMsgFailedCheckMembership, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendMessage})
-		return "", false, false
+		return "", time.Time{}, false, false
 	}
 
-	hasPerm, permErr := h.resolver.HasPermission(c.Request.Context(), serverID, userID, channelID, rbac.PermSendMessages)
+	effectivePerms, permErr := h.resolver.ResolveEffectivePermissionsUncached(c.Request.Context(), serverID, userID, channelID)
+	if errors.Is(permErr, rbac.ErrNotMember) {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
+		return "", time.Time{}, false, false
+	}
 	if permErr != nil {
 		h.log.Error(errMsgFailedCheckPerms, "error", permErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendMessage})
-		return "", false, false
+		return "", time.Time{}, false, false
 	}
-	if !hasPerm {
+	if !effectivePerms.Has(rbac.PermSendMessages) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
-		return "", false, false
+		return "", time.Time{}, false, false
 	}
 	if timedOutUntil.Valid && timedOutUntil.Time.After(time.Now().UTC()) {
 		c.JSON(http.StatusForbidden, gin.H{
@@ -498,10 +503,10 @@ func (h *Handler) checkSendAccess(c *gin.Context, channelID, userID string) (str
 			"code":            "member_timed_out",
 			"timed_out_until": timedOutUntil.Time,
 		})
-		return "", false, false
+		return "", time.Time{}, false, false
 	}
 
-	return serverID, serverAllowEmbeds, true
+	return serverID, membershipIncarnation, serverAllowEmbeds, true
 }
 
 // enforceChannelEpoch rejects revoked key versions and reports the latest
@@ -557,18 +562,28 @@ func (h *Handler) enforceE2EE(c *gin.Context, channelID string, content string, 
 
 // lockMessageMembership serializes a message write with member removal and
 // writes the matching HTTP failure response when the lock cannot be acquired.
-func (h *Handler) lockMessageMembership(ctx context.Context, c *gin.Context, tx *sql.Tx, serverID, userID string) bool {
-	var membership int
+func (h *Handler) lockMessageMembership(ctx context.Context, c *gin.Context, tx *sql.Tx, serverID, userID string, membershipIncarnation time.Time) bool {
+	var timedOutUntil sql.NullTime
+	var timedOut bool
 	if err := tx.QueryRowContext(ctx,
-		`SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE`,
-		serverID, userID,
-	).Scan(&membership); err != nil {
+		`SELECT timed_out_until, timed_out_until IS NOT NULL AND timed_out_until > clock_timestamp()
+		 FROM server_members WHERE server_id = $1 AND user_id = $2 AND joined_at = $3 FOR SHARE`,
+		serverID, userID, membershipIncarnation,
+	).Scan(&timedOutUntil, &timedOut); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
 			return false
 		}
 		h.log.Error("Failed to lock message membership", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendMessage})
+		return false
+	}
+	if timedOut {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":           "Member is timed out",
+			"code":            "member_timed_out",
+			"timed_out_until": timedOutUntil.Time,
+		})
 		return false
 	}
 	return true
@@ -584,7 +599,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		return
 	}
 
-	serverID, serverAllowEmbeds, accessOK := h.checkSendAccess(c, req.ChannelID, userID)
+	serverID, membershipIncarnation, serverAllowEmbeds, accessOK := h.checkSendAccess(c, req.ChannelID, userID)
 	if !accessOK {
 		return
 	}
@@ -615,7 +630,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// If server policy is OFF (default), embeds_suppressed = true.
 	embedsSuppressed := !serverAllowEmbeds
 
-	h.persistMessage(c, serverID, models.Message{
+	h.persistMessage(c, serverID, membershipIncarnation, models.Message{
 		ID:               uuid.New().String(),
 		ChannelID:        req.ChannelID,
 		UserID:           userID,
@@ -628,7 +643,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 }
 
 // persistMessage inserts a validated message and writes the matching HTTP response.
-func (h *Handler) persistMessage(c *gin.Context, serverID string, message models.Message) {
+func (h *Handler) persistMessage(c *gin.Context, serverID string, membershipIncarnation time.Time, message models.Message) {
 	insertQuery := `
 		INSERT INTO messages (id, channel_id, user_id, content, key_version, embeds_suppressed, reply_to_id, gif_slug, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
@@ -655,11 +670,9 @@ func (h *Handler) persistMessage(c *gin.Context, serverID string, message models
 		h.respondGuardTxError(c, guardErr, errMsgFailedSendMessage)
 		return
 	}
-	// Serialize the message write with member removal. A bare preflight membership
-	// check is a TOCTOU: a kick/ban can delete this row and finish its purge before
-	// an already-admitted send inserts. DELETE conflicts with this shared lock; after
-	// a wait, READ COMMITTED rechecks the row and a completed removal yields no row.
-	if !h.lockMessageMembership(ctx, c, tx, serverID, message.UserID) {
+	// Serialize the message write with member removal. The preflight's immutable
+	// joined_at value prevents a kicked sender from writing through a same-key rejoin.
+	if !h.lockMessageMembership(ctx, c, tx, serverID, message.UserID, membershipIncarnation) {
 		return
 	}
 

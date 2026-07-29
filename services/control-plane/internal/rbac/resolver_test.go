@@ -2,7 +2,10 @@ package rbac_test
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
@@ -304,6 +307,90 @@ func TestResolveEffectivePermissionsUncachedDoesNotRefillCache(t *testing.T) {
 	require.NoError(t, err)
 	_, cached := cache.Get(ctx, serverID, member.ID, channelID)
 	assert.False(t, cached, "uncached resolution must not restore a permission invalidation")
+}
+
+func TestResolveEffectivePermissionsUncachedServerScopeDoesNotRefillCache(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "uncachedserverowner")
+	member := ts.CreateTestUser(t, "uncachedservermember")
+	serverID := ts.CreateTestServer(t, owner.ID, "Uncached Server Permissions")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+	cache := rbac.NewPermissionCache(ts.Redis)
+	require.NoError(t, cache.Set(ctx, serverID, member.ID, "", rbac.PermBan))
+
+	perms, err := resolver.ResolveEffectivePermissionsUncached(ctx, serverID, member.ID, "")
+	require.NoError(t, err)
+	assert.True(t, perms.Has(rbac.PermViewTextChannels))
+
+	cachedPerms, cached := cache.Get(ctx, serverID, member.ID, "")
+	assert.True(t, cached)
+	assert.Equal(t, rbac.PermBan, cachedPerms, "uncached server resolution must not read or overwrite the cache")
+}
+
+func TestResolveEffectivePermissionsUncachedUsesSingleSnapshot(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "snapshotpermsowner")
+	member := ts.CreateTestUser(t, "snapshotpermsmember")
+	serverID := ts.CreateTestServer(t, owner.ID, "Permission Snapshot Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+	var defaultRoleID string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID,
+	).Scan(&defaultRoleID))
+	ts.CreateChannelOverride(t, channelID, "role", defaultRoleID, 0, int64(rbac.PermSendMessages))
+
+	lockTx, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() {
+		if rollbackErr := lockTx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("rollback override lock transaction: %v", rollbackErr)
+		}
+	}()
+	_, err = lockTx.Exec(`LOCK TABLE channel_permission_overrides IN ACCESS EXCLUSIVE MODE`)
+	require.NoError(t, err)
+
+	type result struct {
+		perms rbac.Permission
+		err   error
+	}
+	resolved := make(chan result, 1)
+	go func() {
+		perms, err := resolver.ResolveEffectivePermissionsUncached(ctx, serverID, member.ID, channelID)
+		resolved <- result{perms: perms, err: err}
+	}()
+
+	require.Eventually(t, func() bool {
+		var waiting bool
+		err := ts.DB.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE '%channel_permission_overrides%'
+		)`).Scan(&waiting)
+		return err == nil && waiting
+	}, time.Second, 10*time.Millisecond, "permission snapshot should wait for channel overrides")
+
+	_, err = ts.DB.Exec(
+		`DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3`,
+		serverID, member.ID, defaultRoleID,
+	)
+	require.NoError(t, err)
+	require.NoError(t, lockTx.Commit())
+
+	select {
+	case got := <-resolved:
+		require.NoError(t, got.err)
+		assert.False(t, got.perms.Has(rbac.PermSendMessages), "role deny must come from the same snapshot as base permissions")
+	case <-time.After(time.Second):
+		t.Fatal("permission snapshot did not resume after override lock release")
+	}
 }
 
 func TestCacheFreeResolversRejectNonMembersWithoutCacheWrite(t *testing.T) {

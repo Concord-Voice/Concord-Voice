@@ -113,7 +113,32 @@ func (r *Resolver) ResolveEffectivePermissionsFresh(ctx context.Context, serverI
 // without reading or publishing a cache entry. Destructive preflight paths use
 // it so an in-flight result cannot restore permissions after invalidation.
 func (r *Resolver) ResolveEffectivePermissionsUncached(ctx context.Context, serverID, userID, channelID string) (Permission, error) {
-	return r.computeEffectivePermissions(ctx, serverID, userID, channelID)
+	if channelID != "" {
+		permsByChannel, err := r.ResolveEffectivePermissionsForChannelsFresh(ctx, serverID, userID, []string{channelID})
+		if err != nil {
+			return 0, err
+		}
+		return permsByChannel[channelID], nil
+	}
+
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin permission snapshot: %w", err)
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+			r.log.Warn("failed to rollback permission snapshot", "error", rollbackErr)
+		}
+	}()
+
+	perms, _, err := r.resolveServerPermissions(ctx, tx, serverID, userID)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit permission snapshot: %w", err)
+	}
+	return perms, nil
 }
 
 // ResolveEffectivePermissionsForChannelsFresh resolves a member's effective

@@ -495,7 +495,21 @@ type staticChannelPermissionChecker struct {
 	err     error
 }
 
+type staleChannelPermissionChecker struct{}
+
+func (staleChannelPermissionChecker) HasChannelPermission(context.Context, string, string, string, int64) (bool, error) {
+	return true, nil
+}
+
+func (staleChannelPermissionChecker) HasChannelPermissionsUncached(context.Context, string, string, string, ...int64) (bool, error) {
+	return false, nil
+}
+
 func (c staticChannelPermissionChecker) HasChannelPermission(context.Context, string, string, string, int64) (bool, error) {
+	return c.allowed, c.err
+}
+
+func (c staticChannelPermissionChecker) HasChannelPermissionsUncached(context.Context, string, string, string, ...int64) (bool, error) {
 	return c.allowed, c.err
 }
 
@@ -515,6 +529,14 @@ func newBlockingChannelPermissionChecker(allowed bool) *blockingChannelPermissio
 }
 
 func (c *blockingChannelPermissionChecker) HasChannelPermission(context.Context, string, string, string, int64) (bool, error) {
+	c.once.Do(func() {
+		close(c.entered)
+	})
+	<-c.release
+	return c.allowed, nil
+}
+
+func (c *blockingChannelPermissionChecker) HasChannelPermissionsUncached(context.Context, string, string, string, ...int64) (bool, error) {
 	c.once.Do(func() {
 		close(c.entered)
 	})
@@ -569,19 +591,30 @@ func (c keyedChannelPermissionChecker) HasChannelPermission(
 	}], nil
 }
 
+func (c keyedChannelPermissionChecker) HasChannelPermissionsUncached(ctx context.Context, serverID, userID, channelID string, permBits ...int64) (bool, error) {
+	for _, permBit := range permBits {
+		allowed, err := c.HasChannelPermission(ctx, serverID, userID, channelID, permBit)
+		if err != nil || !allowed {
+			return allowed, err
+		}
+	}
+	return true, nil
+}
+
 func TestAuthorizeChannelPermissionMissingCheckerFailsClosed(t *testing.T) {
 	hub := newMinimalHub()
 	userID := uuid.New()
 	client := newTestClient(hub, userID)
 	hub.clients[client.ID] = client
 
-	ok := hub.authorizeChannelPermission(
+	ok := hub.authorizeChannelPermissions(
 		IncomingMessage{ClientID: client.ID},
 		userID,
 		&channelContext{serverUUID: uuid.New()},
 		uuid.New(),
-		permSendMessages,
+		[]int64{permSendMessages},
 		"denied",
+		false,
 	)
 
 	assert.False(t, ok)
@@ -596,13 +629,36 @@ func TestAuthorizeChannelPermissionCheckerErrorFailsClosed(t *testing.T) {
 	client := newTestClient(hub, userID)
 	hub.clients[client.ID] = client
 
-	ok := hub.authorizeChannelPermission(
+	ok := hub.authorizeChannelPermissions(
 		IncomingMessage{ClientID: client.ID},
 		userID,
 		&channelContext{serverUUID: uuid.New()},
 		uuid.New(),
-		permSendMessages,
+		[]int64{permSendMessages},
 		"denied",
+		false,
+	)
+
+	assert.False(t, ok)
+	resp := readClientMsg(t, client)
+	assert.Equal(t, "error", resp["type"])
+}
+
+func TestAuthorizeChannelPermissionsUsesUncachedChecker(t *testing.T) {
+	hub := newMinimalHub()
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.clients[client.ID] = client
+	hub.SetChannelPermissionChecker(staleChannelPermissionChecker{})
+
+	ok := hub.authorizeChannelPermissions(
+		IncomingMessage{ClientID: client.ID},
+		userID,
+		&channelContext{serverUUID: uuid.New()},
+		uuid.New(),
+		[]int64{permSendMessages},
+		"denied",
+		true,
 	)
 
 	assert.False(t, ok)
@@ -1440,6 +1496,37 @@ func TestSendErrorClientNotFound(_ *testing.T) {
 	hub := newMinimalHub()
 	// Should not panic
 	hub.sendError(uuid.New(), "test error")
+}
+
+func TestRespondPersistMessageError(t *testing.T) {
+	t.Run("timeout keeps structured response", func(t *testing.T) {
+		hub := newMinimalHub()
+		client := newTestClient(hub, uuid.New())
+		hub.clients[client.ID] = client
+		deadline := time.Now().UTC().Add(time.Hour)
+
+		assert.True(t, hub.respondPersistMessageError(IncomingMessage{ClientID: client.ID}, "", &deadline))
+		response := readClientMsg(t, client)
+		data := response["data"].(map[string]interface{})
+		assert.Equal(t, "member_timed_out", data["code"])
+		assert.Equal(t, errMsgMemberTimedOut, data[keyMessage])
+		assert.NotEmpty(t, data["timed_out_until"])
+	})
+
+	t.Run("generic error remains generic", func(t *testing.T) {
+		hub := newMinimalHub()
+		client := newTestClient(hub, uuid.New())
+		hub.clients[client.ID] = client
+
+		assert.True(t, hub.respondPersistMessageError(IncomingMessage{ClientID: client.ID}, errMsgFailedSaveMessage, nil))
+		response := readClientMsg(t, client)
+		data := response["data"].(map[string]interface{})
+		assert.Equal(t, errMsgFailedSaveMessage, data[keyMessage])
+	})
+
+	t.Run("empty result continues", func(t *testing.T) {
+		assert.False(t, newMinimalHub().respondPersistMessageError(IncomingMessage{}, "", nil))
+	})
 }
 
 // --- sendErrorWithData tests ---

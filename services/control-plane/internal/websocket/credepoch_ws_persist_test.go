@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -18,6 +19,15 @@ import (
 
 const wsPersistArgonHash = "$argon2id$v=19$m=65536,t=3,p=4$3pE9STD1TqLPoZQ2/BTLCg$8SKTCjsZh8Q7pAulEqAIEzJQK9eeOb5ipWhPz4REdCY" //nolint:gosec // dev-only test hash // pragma: allowlist secret
 
+func membershipIncarnation(t *testing.T, db *sql.DB, serverID, userID uuid.UUID) time.Time {
+	t.Helper()
+	var incarnation time.Time
+	require.NoError(t, db.QueryRow(
+		`SELECT joined_at FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, userID,
+	).Scan(&incarnation))
+	return incarnation
+}
+
 func TestPersistMessage_StaleEpochRejected(t *testing.T) {
 	db := setupHubTestDB(t)
 	hub := NewHub(db, nil)
@@ -27,7 +37,7 @@ func TestPersistMessage_StaleEpochRejected(t *testing.T) {
 		userID.String(), "wsstalechan@test.concord.chat", "wsstalechan", wsPersistArgonHash)
 	require.NoError(t, err)
 
-	_, _, _, errMsg := hub.persistMessage(persistMessageParams{
+	_, _, _, errMsg, _ := hub.persistMessage(persistMessageParams{
 		channelUUID: uuid.New(), userID: userID, credEpoch: "staleEpoch",
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 	})
@@ -46,7 +56,7 @@ func TestPersistMessage_GuardReadFailureIsSaveError(t *testing.T) {
 	db := setupHubTestDB(t)
 	hub := NewHub(db, nil)
 
-	_, _, _, errMsg := hub.persistMessage(persistMessageParams{
+	_, _, _, errMsg, _ := hub.persistMessage(persistMessageParams{
 		channelUUID: uuid.New(), userID: uuid.New(), credEpoch: "whatever",
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 	})
@@ -57,12 +67,13 @@ func TestPersistMessage_GuardReadFailureIsSaveError(t *testing.T) {
 func TestPersistMessage_RemovedMemberRejected(t *testing.T) {
 	setup := setupMessageTest(t)
 	channelID := uuid.MustParse(setup.convID)
+	incarnation := membershipIncarnation(t, setup.db, setup.user2, setup.user1)
 
 	_, err := setup.db.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, setup.user2, setup.user1)
 	require.NoError(t, err)
 
-	_, _, _, errMsg := setup.hub.persistMessage(persistMessageParams{
-		channelUUID: channelID, userID: setup.user1,
+	_, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
+		channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 	})
 	assert.Equal(t, "Not a member of this server", errMsg)
@@ -72,9 +83,148 @@ func TestPersistMessage_RemovedMemberRejected(t *testing.T) {
 	assert.Zero(t, count, "a removed member's socket must not persist a channel message")
 }
 
+func TestPersistMessage_RejoinedMemberRejected(t *testing.T) {
+	setup := setupMessageTest(t)
+	channelID := uuid.MustParse(setup.convID)
+	incarnation := membershipIncarnation(t, setup.db, setup.user2, setup.user1)
+
+	_, err := setup.db.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, setup.user2, setup.user1)
+	require.NoError(t, err)
+	_, err = setup.db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner')`, setup.user2, setup.user1)
+	require.NoError(t, err)
+
+	_, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
+		channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
+		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
+	})
+	assert.Equal(t, "Not a member of this server", errMsg)
+
+	var count int
+	require.NoError(t, setup.db.QueryRow(`SELECT count(*) FROM messages WHERE channel_id = $1`, channelID).Scan(&count))
+	assert.Zero(t, count, "a rejoined member must not admit a stale socket message")
+}
+
+func TestPersistMessage_MemberUpdateKeepsIncarnation(t *testing.T) {
+	setup := setupMessageTest(t)
+	channelID := uuid.MustParse(setup.convID)
+	incarnation := membershipIncarnation(t, setup.db, setup.user2, setup.user1)
+
+	_, err := setup.db.Exec(
+		`UPDATE server_members SET server_muted = true WHERE server_id = $1 AND user_id = $2`,
+		setup.user2, setup.user1,
+	)
+	require.NoError(t, err)
+
+	_, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
+		channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
+		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
+	})
+	assert.Empty(t, errMsg)
+
+	var count int
+	require.NoError(t, setup.db.QueryRow(`SELECT count(*) FROM messages WHERE channel_id = $1`, channelID).Scan(&count))
+	assert.Equal(t, 1, count, "an in-place membership update must not reject the message")
+}
+
+func TestHandleMessage_RejoinedMemberDuringPermissionCheckRejected(t *testing.T) {
+	setup := setupMessageTest(t)
+	checker := newBlockingChannelPermissionChecker(true)
+	setup.hub.SetChannelPermissionChecker(checker)
+
+	done := make(chan struct{})
+	go func() {
+		setup.hub.handleMessage(IncomingMessage{
+			Type:     "message",
+			UserID:   setup.user1,
+			ClientID: setup.client.ID,
+			Data: map[string]interface{}{
+				keyChannelID:  setup.convID,
+				keyContent:    "stale member frame",
+				keyKeyVersion: float64(1),
+			},
+		})
+		close(done)
+	}()
+
+	select {
+	case <-checker.entered:
+	case <-time.After(time.Second):
+		t.Fatal("message send did not reach the permission check")
+	}
+
+	_, err := setup.db.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, setup.user2, setup.user1)
+	require.NoError(t, err)
+	_, err = setup.db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner')`, setup.user2, setup.user1)
+	require.NoError(t, err)
+	close(checker.release)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("message send did not complete after permission check")
+	}
+
+	response := readClientMsg(t, setup.client)
+	assert.Equal(t, "error", response["type"])
+	var count int
+	require.NoError(t, setup.db.QueryRow(`SELECT count(*) FROM messages WHERE channel_id = $1`, setup.convID).Scan(&count))
+	assert.Zero(t, count, "a frame authorized before removal must not persist after rejoin")
+}
+
+func TestHandleMessage_TimedOutDuringPermissionCheckRejected(t *testing.T) {
+	setup := setupMessageTest(t)
+	checker := newBlockingChannelPermissionChecker(true)
+	setup.hub.SetChannelPermissionChecker(checker)
+
+	done := make(chan struct{})
+	go func() {
+		setup.hub.handleMessage(IncomingMessage{
+			Type:     "message",
+			UserID:   setup.user1,
+			ClientID: setup.client.ID,
+			Data: map[string]interface{}{
+				keyChannelID:  setup.convID,
+				keyContent:    "timed out member frame",
+				keyKeyVersion: float64(1),
+			},
+		})
+		close(done)
+	}()
+
+	select {
+	case <-checker.entered:
+	case <-time.After(time.Second):
+		t.Fatal("message send did not reach the permission check")
+	}
+
+	_, err := setup.db.Exec(
+		`UPDATE server_members SET timed_out_until = NOW() + INTERVAL '1 hour' WHERE server_id = $1 AND user_id = $2`,
+		setup.user2, setup.user1,
+	)
+	require.NoError(t, err)
+	close(checker.release)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("message send did not complete after permission check")
+	}
+
+	response := readClientMsg(t, setup.client)
+	assert.Equal(t, "error", response["type"])
+	data := response["data"].(map[string]interface{})
+	assert.Equal(t, "member_timed_out", data["code"])
+	assert.Equal(t, errMsgMemberTimedOut, data[keyMessage])
+	assert.NotEmpty(t, data["timed_out_until"])
+	var count int
+	require.NoError(t, setup.db.QueryRow(`SELECT count(*) FROM messages WHERE channel_id = $1`, setup.convID).Scan(&count))
+	assert.Zero(t, count, "a member timed out during authorization must not persist a message")
+}
+
 func TestPersistMessage_MembershipLockHonorsTimeout(t *testing.T) {
 	setup := setupMessageTest(t)
 	channelID := uuid.MustParse(setup.convID)
+	incarnation := membershipIncarnation(t, setup.db, setup.user2, setup.user1)
 
 	lockTx, err := setup.db.BeginTx(context.Background(), nil)
 	require.NoError(t, err)
@@ -88,8 +238,8 @@ func TestPersistMessage_MembershipLockHonorsTimeout(t *testing.T) {
 
 	result := make(chan string, 1)
 	go func() {
-		_, _, _, errMsg := setup.hub.persistMessage(persistMessageParams{
-			channelUUID: channelID, userID: setup.user1,
+		_, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
+			channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
 			content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 		})
 		result <- errMsg
@@ -106,6 +256,7 @@ func TestPersistMessage_MembershipLockHonorsTimeout(t *testing.T) {
 func TestPersistMessage_MembershipLockWriterFirstDefersRemoval(t *testing.T) {
 	setup := setupMessageTest(t)
 	channelID := uuid.MustParse(setup.convID)
+	incarnation := membershipIncarnation(t, setup.db, setup.user2, setup.user1)
 
 	messageLockTx, err := setup.db.Begin()
 	require.NoError(t, err)
@@ -115,8 +266,8 @@ func TestPersistMessage_MembershipLockWriterFirstDefersRemoval(t *testing.T) {
 
 	sendResult := make(chan string, 1)
 	go func() {
-		_, _, _, errMsg := setup.hub.persistMessage(persistMessageParams{
-			channelUUID: channelID, userID: setup.user1,
+		_, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
+			channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
 			content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 		})
 		sendResult <- errMsg
