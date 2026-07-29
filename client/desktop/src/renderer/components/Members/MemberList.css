@@ -29,6 +29,81 @@
   background: var(--text-muted);
 }
 
+/* ─── Compact Role Rail ─────────────────────────────────────────────── */
+
+.member-list--compact {
+  align-items: center;
+  overflow-x: hidden;
+  padding: 8px 6px;
+}
+
+.member-compact-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  gap: 4px;
+}
+
+.member-compact-trigger {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  padding: 4px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.member-compact-trigger:hover,
+.member-compact-trigger[aria-expanded='true'] {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.member-compact-trigger:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.member-search-trigger {
+  flex-shrink: 0;
+  margin-bottom: 4px;
+}
+
+.member-compact-emoji {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.member-compact-trigger-count {
+  position: absolute;
+  right: 1px;
+  bottom: 1px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 3px;
+  border-radius: 8px;
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+}
+
+.member-compact-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 44px);
+  gap: 4px;
+}
+
 /* ─── Header ────────────────────────────────────────────────────────────── */
 
 .member-list-header {
@@ -71,6 +146,12 @@
 
 .member-list-search-input:focus {
   border-color: var(--accent-primary);
+}
+
+.member-list-search--popover {
+  width: 100%;
+  margin: 0;
+  padding: 0;
 }
 
 /* ─── Role Group Headers ────────────────────────────────────────────────── */
@@ -160,11 +241,26 @@
   background-color: var(--bg-tertiary);
 }
 
-.member-item.offline {
+.member-item--compact {
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 8px;
+  margin: 0;
+  border-radius: 8px;
+}
+
+.member-item--compact .member-avatar {
+  margin-right: 0;
+}
+
+.member-item.offline,
+.member-item--compact.invisible {
   opacity: 0.45;
 }
 
-.member-item.offline:hover {
+.member-item.offline:hover,
+.member-item--compact.invisible:hover {
   opacity: 0.75;
 }
 

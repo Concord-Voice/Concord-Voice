@@ -56,6 +56,9 @@ const Modal: React.FC<ModalProps> = ({
     // capture half of focus return; the restore half is the next effect's
     // cleanup. WCAG 2.1 SC 2.4.3 (#2087).
     previousFocusRef.current = document.activeElement as HTMLElement | null;
+    if (previousFocusRef.current?.id) {
+      overlayRef.current?.setAttribute('data-dock-focus-owner', previousFocusRef.current.id);
+    }
     // Pass the overlay element so ModalContext can make it inert when this modal
     // is not the topmost of a nested stack (#2087). overlayRef is set by the time
     // this post-commit effect runs (the portal content is already mounted).

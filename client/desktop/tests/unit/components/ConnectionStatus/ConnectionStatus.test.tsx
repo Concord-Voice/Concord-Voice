@@ -38,4 +38,13 @@ describe('ConnectionStatus', () => {
     const el = document.querySelector('.connection-status');
     expect(el?.getAttribute('title')).toContain('abc-123');
   });
+
+  it('renders compact state as a status dot without text', () => {
+    useChatStore.setState({ connectionState: 'connected', connectionClientId: 'client-123' });
+
+    const { container } = render(<ConnectionStatus compact />);
+
+    expect(container.querySelector('.connection-status--compact .status-dot')).toBeInTheDocument();
+    expect(screen.queryByText('Connected')).not.toBeInTheDocument();
+  });
 });

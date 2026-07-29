@@ -1,78 +1,347 @@
-import { useLayoutStore } from '@/renderer/stores/layoutStore';
+import {
+  migrateLegacySidebarState,
+  normalizeSidebarProfiles,
+  selectSidebarDock,
+  type SidebarProfile,
+  type SidebarProfiles,
+  useLayoutStore,
+} from '@/renderer/stores/layoutStore';
 import { resetAllStores } from '../../helpers/store-helpers';
+
+const dm: SidebarProfile = {
+  left: { width: 240, pinned: true },
+  right: { width: 260, pinned: true },
+};
+
+const server: SidebarProfile = {
+  left: { width: 180, pinned: false },
+  right: { width: 120, pinned: false },
+};
+
+const defaultProfiles = (): SidebarProfiles => ({
+  dm: {
+    left: { width: 240, pinned: true },
+    right: { width: 260, pinned: true },
+  },
+  server: {
+    left: { width: 240, pinned: true },
+    right: { width: 260, pinned: true },
+  },
+});
 
 describe('layoutStore', () => {
   beforeEach(() => {
     resetAllStores();
     // Reset layout store to defaults
     useLayoutStore.setState({
-      channelPanelPinned: true,
-      channelPanelWidth: 240,
-      memberPanelMode: 'expanded',
-      memberPanelWidth: 240,
+      sidebarProfiles: defaultProfiles(),
+      sidebarLayoutsDecoupled: false,
       serverBarHeight: 48,
       folderBarHeight: 32,
       serverFolders: [],
       serverOrder: [],
       interfaceLocked: false,
-      channelPanelHoverVisible: false,
     });
   });
 
-  describe('channel panel', () => {
-    it('toggles channel pin', () => {
-      const initial = useLayoutStore.getState().channelPanelPinned;
-      useLayoutStore.getState().toggleChannelPin();
-      expect(useLayoutStore.getState().channelPanelPinned).toBe(!initial);
+  describe('sidebar profiles', () => {
+    it('routes coupled Server writes and reads through the DM profile', () => {
+      useLayoutStore.setState({
+        sidebarProfiles: { dm, server },
+        sidebarLayoutsDecoupled: false,
+        interfaceLocked: false,
+      });
+
+      useLayoutStore.getState().setSidebarWidth('server', 'right', 300);
+      useLayoutStore.getState().setSidebarPinned('server', 'left', false);
+
+      expect(useLayoutStore.getState().sidebarProfiles.dm.right.width).toBe(300);
+      expect(useLayoutStore.getState().sidebarProfiles.dm.left.pinned).toBe(false);
+      expect(useLayoutStore.getState().sidebarProfiles.server.right.width).toBe(120);
+      expect(useLayoutStore.getState().sidebarProfiles.server.left.pinned).toBe(false);
+      expect(selectSidebarDock(useLayoutStore.getState(), 'server', 'right').width).toBe(300);
     });
 
-    it('toggleChannelPin also clears hover visible', () => {
-      useLayoutStore.setState({ channelPanelHoverVisible: true });
-      useLayoutStore.getState().toggleChannelPin();
-      expect(useLayoutStore.getState().channelPanelHoverVisible).toBe(false);
+    it('routes decoupled Server width and pin writes to the Server profile', () => {
+      useLayoutStore.setState({
+        sidebarProfiles: { dm, server },
+        sidebarLayoutsDecoupled: true,
+      });
+
+      useLayoutStore.getState().setSidebarWidth('server', 'right', 300);
+      useLayoutStore.getState().setSidebarPinned('server', 'left', true);
+
+      expect(useLayoutStore.getState().sidebarProfiles.dm).toEqual(dm);
+      expect(useLayoutStore.getState().sidebarProfiles.server).toEqual({
+        left: { width: 180, pinned: true },
+        right: { width: 300, pinned: false },
+      });
     });
 
-    it('clamps channel panel width to valid range', () => {
-      useLayoutStore.getState().setChannelPanelWidth(100);
-      expect(useLayoutStore.getState().channelPanelWidth).toBe(180);
-      useLayoutStore.getState().setChannelPanelWidth(500);
-      expect(useLayoutStore.getState().channelPanelWidth).toBe(400);
+    it('returns retained dock references for valid normalized profiles', () => {
+      useLayoutStore.setState({
+        sidebarProfiles: { dm, server },
+        sidebarLayoutsDecoupled: true,
+      });
+
+      expect(selectSidebarDock(useLayoutStore.getState(), 'dm', 'right')).toBe(dm.right);
+      expect(selectSidebarDock(useLayoutStore.getState(), 'server', 'right')).toBe(server.right);
     });
 
-    it('accepts valid width', () => {
-      useLayoutStore.getState().setChannelPanelWidth(300);
-      expect(useLayoutStore.getState().channelPanelWidth).toBe(300);
+    it('preserves dormant Server values across coupling and restores them on re-decoupling', () => {
+      useLayoutStore.setState({
+        sidebarProfiles: { dm, server },
+        sidebarLayoutsDecoupled: true,
+      });
+
+      useLayoutStore.getState().setSidebarLayoutsDecoupled(false);
+      expect(useLayoutStore.getState().sidebarProfiles.server).toEqual(server);
+      expect(selectSidebarDock(useLayoutStore.getState(), 'server', 'left')).toEqual(dm.left);
+
+      useLayoutStore.getState().setSidebarLayoutsDecoupled(true);
+      expect(useLayoutStore.getState().sidebarProfiles.server).toEqual(server);
+      expect(selectSidebarDock(useLayoutStore.getState(), 'server', 'left')).toEqual(server.left);
     });
 
-    it('shows and hides channel panel hover', () => {
-      useLayoutStore.getState().showChannelPanelHover();
-      expect(useLayoutStore.getState().channelPanelHoverVisible).toBe(true);
-      useLayoutStore.getState().hideChannelPanelHover();
-      expect(useLayoutStore.getState().channelPanelHoverVisible).toBe(false);
+    it('provisions only missing or invalid Server fields from normalized DM fields', () => {
+      const normalized = normalizeSidebarProfiles({
+        dm,
+        server: {
+          left: { width: 320, pinned: false },
+          right: { width: Number.NaN, pinned: false },
+        },
+      });
+
+      expect(normalized.server).toEqual({
+        left: { width: 320, pinned: false },
+        right: { width: 260, pinned: false },
+      });
+      expect(normalizeSidebarProfiles(normalized)).toEqual(normalized);
+    });
+
+    it('clones DM into a missing Server profile before enabling decoupling', () => {
+      useLayoutStore.setState({
+        sidebarProfiles: { dm, server: undefined } as unknown as SidebarProfiles,
+        sidebarLayoutsDecoupled: false,
+      });
+
+      useLayoutStore.getState().setSidebarLayoutsDecoupled(true);
+
+      expect(useLayoutStore.getState().sidebarProfiles.server).toEqual(dm);
+      expect(useLayoutStore.getState().sidebarLayoutsDecoupled).toBe(true);
+    });
+
+    it('falls back field-by-field when a malformed Server dock reaches the selector', () => {
+      const profiles = {
+        dm,
+        server: {
+          left: server.left,
+          right: { width: 300 },
+        },
+      } as unknown as SidebarProfiles;
+
+      expect(
+        selectSidebarDock(
+          { sidebarProfiles: profiles, sidebarLayoutsDecoupled: true },
+          'server',
+          'right'
+        )
+      ).toEqual({ width: 300, pinned: true });
+    });
+
+    it('clamps left and right widths to their side-specific bounds', () => {
+      useLayoutStore.getState().setSidebarWidth('dm', 'left', 0);
+      expect(useLayoutStore.getState().sidebarProfiles.dm.left.width).toBe(56);
+      useLayoutStore.getState().setSidebarWidth('dm', 'left', 500);
+      expect(useLayoutStore.getState().sidebarProfiles.dm.left.width).toBe(400);
+
+      useLayoutStore.getState().setSidebarWidth('dm', 'right', 0);
+      expect(useLayoutStore.getState().sidebarProfiles.dm.right.width).toBe(56);
+      useLayoutStore.getState().setSidebarWidth('dm', 'right', 500);
+      expect(useLayoutStore.getState().sidebarProfiles.dm.right.width).toBe(340);
+    });
+
+    it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+      'rejects non-finite sidebar width %s without changing retained state',
+      (width) => {
+        const profiles = useLayoutStore.getState().sidebarProfiles;
+
+        useLayoutStore.getState().setSidebarWidth('dm', 'left', width);
+
+        expect(useLayoutStore.getState().sidebarProfiles).toBe(profiles);
+        expect(useLayoutStore.getState().sidebarProfiles.dm.left.width).toBe(240);
+      }
+    );
+
+    it('normalizes and applies unlocked sidebar preferences with the decoupling flag', () => {
+      const profiles = {
+        dm: {
+          left: { width: 500, pinned: false },
+          right: { width: 280, pinned: false },
+        },
+        server: {
+          left: { width: 320, pinned: false },
+        },
+      } as unknown as SidebarProfiles;
+
+      useLayoutStore.getState().applySidebarPreferences(profiles, true);
+
+      expect(useLayoutStore.getState().sidebarProfiles).toEqual({
+        dm: {
+          left: { width: 400, pinned: false },
+          right: { width: 280, pinned: false },
+        },
+        server: {
+          left: { width: 320, pinned: false },
+          right: { width: 280, pinned: false },
+        },
+      });
+      expect(useLayoutStore.getState().sidebarLayoutsDecoupled).toBe(true);
+    });
+
+    it('rejects profile and decoupling mutations while Interface Lock is enabled', () => {
+      useLayoutStore.setState({
+        sidebarProfiles: { dm, server },
+        sidebarLayoutsDecoupled: false,
+        interfaceLocked: true,
+      });
+
+      useLayoutStore.getState().setSidebarWidth('dm', 'left', 300);
+      useLayoutStore.getState().setSidebarPinned('dm', 'right', false);
+      useLayoutStore.getState().setSidebarLayoutsDecoupled(true);
+      useLayoutStore.getState().applySidebarPreferences(defaultProfiles(), true);
+
+      expect(useLayoutStore.getState().sidebarProfiles).toEqual({ dm, server });
+      expect(useLayoutStore.getState().sidebarLayoutsDecoupled).toBe(false);
     });
   });
 
-  describe('member panel', () => {
-    it('sets member panel mode', () => {
-      useLayoutStore.getState().setMemberPanelMode('collapsed');
-      expect(useLayoutStore.getState().memberPanelMode).toBe('collapsed');
+  describe('sidebar profile migration', () => {
+    it('imports all three rendered legacy widths and maps expanded state', () => {
+      localStorage.setItem('concord:channelPanelWidth', '310');
+      localStorage.setItem('concord:memberPanelWidth', '330');
+      localStorage.setItem('concord:friendsPanelWidth', '300');
+
+      expect(
+        migrateLegacySidebarState({
+          channelPanelPinned: false,
+          channelPanelWidth: 240,
+          memberPanelMode: 'expanded',
+          memberPanelWidth: 260,
+          friendsPanelMode: 'expanded',
+        })
+      ).toEqual({
+        dm: {
+          left: { width: 310, pinned: false },
+          right: { width: 300, pinned: true },
+        },
+        server: {
+          left: { width: 310, pinned: false },
+          right: { width: 330, pinned: true },
+        },
+      });
     });
 
-    it('cycles member panel mode', () => {
-      useLayoutStore.getState().setMemberPanelMode('expanded');
-      useLayoutStore.getState().cycleMemberPanelMode();
-      expect(useLayoutStore.getState().memberPanelMode).toBe('collapsed');
-      useLayoutStore.getState().cycleMemberPanelMode();
-      expect(useLayoutStore.getState().memberPanelMode).toBe('hidden');
-      useLayoutStore.getState().cycleMemberPanelMode();
-      expect(useLayoutStore.getState().memberPanelMode).toBe('expanded');
+    it.each([
+      ['expanded', 290, true],
+      ['collapsed', 56, true],
+      ['hidden', 290, false],
+    ] as const)('maps %s legacy right panels to width %i and pinned %s', (mode, width, pinned) => {
+      localStorage.setItem('concord:memberPanelWidth', '290');
+      localStorage.setItem('concord:friendsPanelWidth', '290');
+
+      const profiles = migrateLegacySidebarState({
+        memberPanelMode: mode,
+        friendsPanelMode: mode,
+      });
+
+      expect(profiles.server.right).toEqual({ width, pinned });
+      expect(profiles.dm.right).toEqual({ width, pinned });
     });
 
-    it('clamps member panel width', () => {
-      useLayoutStore.getState().setMemberPanelWidth(100);
-      expect(useLayoutStore.getState().memberPanelWidth).toBe(160);
-      useLayoutStore.getState().setMemberPanelWidth(500);
-      expect(useLayoutStore.getState().memberPanelWidth).toBe(340);
+    it('ignores invalid local width strings and uses valid persisted/default widths', () => {
+      localStorage.setItem('concord:channelPanelWidth', 'not-a-number');
+      localStorage.setItem('concord:memberPanelWidth', 'Infinity');
+      localStorage.setItem('concord:friendsPanelWidth', '');
+
+      const profiles = migrateLegacySidebarState({
+        channelPanelWidth: 250,
+        memberPanelWidth: 275,
+        memberPanelMode: 'expanded',
+        friendsPanelMode: 'expanded',
+      });
+
+      expect(profiles.dm.left.width).toBe(250);
+      expect(profiles.server.right.width).toBe(275);
+      expect(profiles.dm.right.width).toBe(260);
+    });
+
+    it.each([
+      ['below', 179, 159],
+      ['above', 401, 341],
+    ] as const)(
+      'rejects %s-range legacy widths before applying the new sidebar bounds',
+      (_range, channelWidth, rightWidth) => {
+        localStorage.setItem('concord:channelPanelWidth', String(channelWidth));
+        localStorage.setItem('concord:memberPanelWidth', String(rightWidth));
+        localStorage.setItem('concord:friendsPanelWidth', String(rightWidth));
+
+        const profiles = migrateLegacySidebarState({
+          channelPanelWidth: channelWidth,
+          memberPanelWidth: rightWidth,
+          memberPanelMode: 'expanded',
+          friendsPanelMode: 'expanded',
+        });
+
+        expect(profiles.dm.left.width).toBe(240);
+        expect(profiles.server.right.width).toBe(260);
+        expect(profiles.dm.right.width).toBe(260);
+      }
+    );
+
+    it('keeps retained profiles stable on repeated migration', () => {
+      const first = migrateLegacySidebarState({ sidebarProfiles: { dm, server } });
+      localStorage.setItem('concord:channelPanelWidth', '399');
+
+      expect(migrateLegacySidebarState(first)).toEqual(first);
+    });
+
+    it('migrates persisted state to version 2 without losing unrelated preferences', async () => {
+      localStorage.setItem('concord:channelPanelWidth', '300');
+      localStorage.setItem(
+        'concord-layout',
+        JSON.stringify({
+          version: 1,
+          state: {
+            channelPanelPinned: false,
+            channelPanelWidth: 240,
+            memberPanelMode: 'collapsed',
+            memberPanelWidth: 280,
+            friendsPanelMode: 'hidden',
+            serverBarHeight: 60,
+            folderBarHeight: 40,
+            serverFolders: [{ id: 'folder-1', name: 'Work', serverIds: ['server-1'] }],
+            serverOrder: ['server-2'],
+            interfaceLocked: true,
+          },
+        })
+      );
+
+      await useLayoutStore.persist.rehydrate();
+
+      const state = useLayoutStore.getState();
+      expect(state.sidebarProfiles.dm.left).toEqual({ width: 300, pinned: false });
+      expect(state.sidebarProfiles.dm.right).toEqual({ width: 260, pinned: false });
+      expect(state.sidebarProfiles.server.right).toEqual({ width: 56, pinned: true });
+      expect(state.sidebarLayoutsDecoupled).toBe(false);
+      expect(state.serverBarHeight).toBe(60);
+      expect(state.folderBarHeight).toBe(40);
+      expect(state.serverFolders).toEqual([
+        { id: 'folder-1', name: 'Work', serverIds: ['server-1'] },
+      ]);
+      expect(state.serverOrder).toEqual(['server-2']);
+      expect(state.interfaceLocked).toBe(true);
+      expect(JSON.parse(localStorage.getItem('concord-layout') || '{}').version).toBe(2);
     });
   });
 
@@ -199,16 +468,31 @@ describe('layoutStore', () => {
   });
 
   describe('persistence', () => {
-    it('persists layout settings to localStorage', () => {
-      useLayoutStore.getState().setChannelPanelWidth(350);
+    it('persists retained profiles and the decoupling preference', () => {
+      useLayoutStore.getState().setSidebarWidth('dm', 'right', 320);
+      useLayoutStore.getState().setSidebarLayoutsDecoupled(true);
+
       const stored = JSON.parse(localStorage.getItem('concord-layout') || '{}');
-      expect(stored.state?.channelPanelWidth).toBe(350);
+      expect(stored.state?.sidebarProfiles.dm.right.width).toBe(320);
+      expect(stored.state?.sidebarLayoutsDecoupled).toBe(true);
     });
 
-    it('does not persist channelPanelHoverVisible', () => {
-      useLayoutStore.getState().showChannelPanelHover();
+    it('does not retain obsolete panel modes, widths, pins, or transient hover state', () => {
+      useLayoutStore.getState().setSidebarWidth('dm', 'left', 350);
       const stored = JSON.parse(localStorage.getItem('concord-layout') || '{}');
-      expect(stored.state?.channelPanelHoverVisible).toBeUndefined();
+      const runtime = useLayoutStore.getState();
+
+      for (const key of [
+        'channelPanelPinned',
+        'channelPanelWidth',
+        'memberPanelMode',
+        'memberPanelWidth',
+        'friendsPanelMode',
+        'channelPanelHoverVisible',
+      ]) {
+        expect(runtime).not.toHaveProperty(key);
+        expect(stored.state).not.toHaveProperty(key);
+      }
     });
 
     it('persists interfaceLocked to localStorage (#188)', () => {

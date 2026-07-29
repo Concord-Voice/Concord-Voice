@@ -256,7 +256,7 @@
 }
 
 /* Column headers */
-.member-list-header {
+.settings-member-list-header {
   display: grid;
   grid-template-columns: 1fr 300px;
   gap: 16px;
@@ -265,7 +265,7 @@
   margin-bottom: 8px;
 }
 
-.member-list-header span {
+.settings-member-list-header span {
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 600;
   color: var(--text-muted);

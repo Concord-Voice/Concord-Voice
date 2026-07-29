@@ -7,23 +7,27 @@ import { ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
 import { mockServer, mockChannel } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
+const channelPanelPresentation = vi.hoisted(() => ({ compact: false }));
+
 // ── Layout mocks ───────────────────────────────────────────────────────────────
 
 vi.mock('@/renderer/components/Layout/AppLayout', () => ({
   default: ({
+    context,
     serverBar,
     folderBar,
     channelPanel,
     chatArea,
     memberSpace,
   }: {
+    context: 'dm' | 'server';
     serverBar: React.ReactNode;
     folderBar: React.ReactNode;
     channelPanel: React.ReactNode;
     chatArea: React.ReactNode;
     memberSpace: React.ReactNode;
   }) => (
-    <div data-testid="app-layout">
+    <div data-testid="app-layout" data-context={context}>
       <div data-testid="server-bar">{serverBar}</div>
       <div data-testid="folder-bar">{folderBar}</div>
       <div data-testid="channel-panel">{channelPanel}</div>
@@ -64,10 +68,16 @@ vi.mock('@/renderer/components/Layout/FolderBar', () => ({
   default: () => <div>FolderBar</div>,
 }));
 vi.mock('@/renderer/components/Layout/ChannelPanel', () => ({
-  default: ({ header, children }: { header: React.ReactNode; children: React.ReactNode }) => (
+  default: ({
+    header,
+    renderContent,
+  }: {
+    header: React.ReactNode | ((compact: boolean) => React.ReactNode);
+    renderContent: (compact: boolean) => React.ReactNode;
+  }) => (
     <div>
-      {header}
-      {children}
+      {typeof header === 'function' ? header(channelPanelPresentation.compact) : header}
+      {renderContent(channelPanelPresentation.compact)}
     </div>
   ),
 }));
@@ -103,8 +113,8 @@ vi.mock('@/renderer/services/voiceService', () => ({
 // ── Channel list / action bar ──────────────────────────────────────────────────
 
 vi.mock('@/renderer/components/Channels/ChannelList', () => ({
-  default: ({ onContextMenu, onCategoryContextMenu, onEmptyContextMenu }: any) => (
-    <>
+  default: ({ compact, onContextMenu, onCategoryContextMenu, onEmptyContextMenu }: any) => (
+    <div data-testid="channel-list" data-compact={String(Boolean(compact))}>
       <div>ChannelList</div>
       <button
         data-testid="cl-ch-ctx"
@@ -133,20 +143,24 @@ vi.mock('@/renderer/components/Channels/ChannelList', () => ({
         }
       />
       <button data-testid="cl-empty-ctx" onClick={() => onEmptyContextMenu?.({ x: 0, y: 0 })} />
-    </>
+    </div>
   ),
 }));
 vi.mock('@/renderer/components/Channels/ServerActionBar', () => ({
-  default: ({ onOpenCreateModal, onOpenCreateCategoryModal }: any) => (
-    <>
+  default: ({ compact, onOpenCreateModal, onOpenCreateCategoryModal }: any) => (
+    <div data-testid="server-action-bar" data-compact={String(Boolean(compact))}>
       <div>ServerActionBar</div>
       <button data-testid="sab-create-channel" onClick={onOpenCreateModal} />
       <button data-testid="sab-create-category" onClick={onOpenCreateCategoryModal} />
-    </>
+    </div>
   ),
 }));
 vi.mock('@/renderer/components/ConnectionStatus/ConnectionStatus', () => ({
-  default: () => <div>ConnectionStatus</div>,
+  default: ({ compact }: { compact?: boolean }) => (
+    <div data-testid="connection-status" data-compact={String(Boolean(compact))}>
+      ConnectionStatus
+    </div>
+  ),
 }));
 vi.mock('@/renderer/hooks/useServerChannelSubscriptions', () => ({
   useServerChannelSubscriptions: vi.fn(),
@@ -303,6 +317,7 @@ describe('MainView', () => {
   beforeEach(() => {
     resetAllStores();
     vi.clearAllMocks();
+    channelPanelPresentation.compact = false;
     useServerStore.setState({
       servers: [mockServer],
       activeServerId: 'server-1',
@@ -321,6 +336,7 @@ describe('MainView', () => {
   it('renders the app layout', () => {
     render(<MainView />);
     expect(screen.getByTestId('app-layout')).toBeInTheDocument();
+    expect(screen.getByTestId('app-layout')).toHaveAttribute('data-context', 'server');
   });
 
   it('renders server bar section', () => {
@@ -340,6 +356,30 @@ describe('MainView', () => {
     // Server name should appear in the channel header
     expect(screen.getByText(mockServer.name)).toBeInTheDocument();
     expect(screen.getByText('ConnectionStatus')).toBeInTheDocument();
+  });
+
+  it('passes the compact dock presentation to ChannelList', () => {
+    channelPanelPresentation.compact = true;
+    render(<MainView />);
+    expect(screen.getByTestId('channel-list')).toHaveAttribute('data-compact', 'true');
+  });
+
+  it('uses compact server chrome without the server name', () => {
+    channelPanelPresentation.compact = true;
+
+    render(<MainView />);
+
+    expect(screen.queryByText(mockServer.name)).not.toBeInTheDocument();
+    expect(screen.getByTestId('connection-status')).toHaveAttribute('data-compact', 'true');
+    expect(screen.getByTestId('server-action-bar')).toHaveAttribute('data-compact', 'true');
+  });
+
+  it('stacks server actions above the channel list', () => {
+    render(<MainView />);
+
+    const channelList = screen.getByTestId('channel-list');
+    expect(channelList.parentElement).toHaveClass('channel-panel-content');
+    expect(channelList.parentElement).toContainElement(screen.getByTestId('server-action-bar'));
   });
 
   it('renders chat view when active channel exists', () => {

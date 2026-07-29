@@ -5,22 +5,26 @@ import { useLayoutStore } from '@/renderer/stores/layoutStore';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { vi } from 'vitest';
 
+const channelPanelState = vi.hoisted(() => ({ compact: false }));
+
 // Mock all heavy child components
 vi.mock('@/renderer/components/Layout/AppLayout', () => ({
   default: ({
+    context,
     serverBar,
     folderBar,
     channelPanel,
     chatArea,
     memberSpace,
   }: {
+    context: 'dm' | 'server';
     serverBar: React.ReactNode;
     folderBar: React.ReactNode;
     channelPanel: React.ReactNode;
     chatArea: React.ReactNode;
     memberSpace: React.ReactNode;
   }) => (
-    <div data-testid="app-layout">
+    <div data-testid="app-layout" data-context={context}>
       <div data-testid="server-bar-slot">{serverBar}</div>
       <div data-testid="folder-bar-slot">{folderBar}</div>
       <div data-testid="channel-panel-slot">{channelPanel}</div>
@@ -43,23 +47,39 @@ vi.mock('@/renderer/components/Layout/FolderBar', () => ({
 }));
 
 vi.mock('@/renderer/components/Layout/ChannelPanel', () => ({
-  default: ({ header, children }: { header: React.ReactNode; children: React.ReactNode }) => (
+  default: ({
+    context,
+    header,
+    renderContent,
+  }: {
+    context: 'dm' | 'server';
+    header: React.ReactNode | ((compact: boolean) => React.ReactNode);
+    renderContent: (compact: boolean) => React.ReactNode;
+  }) => (
     <div data-testid="channel-panel">
-      <div data-testid="channel-panel-header">{header}</div>
-      {children}
+      <div data-testid="channel-panel-header">
+        {typeof header === 'function' ? header(channelPanelState.compact) : header}
+      </div>
+      <div data-context={context}>{renderContent(channelPanelState.compact)}</div>
     </div>
   ),
 }));
 
 vi.mock('@/renderer/components/DirectMessages/ConversationList', () => ({
   default: ({
+    compact,
     selectedThreadId,
     onSelectThread,
   }: {
+    compact?: boolean;
     selectedThreadId: string | null;
     onSelectThread: (id: string) => void;
   }) => (
-    <div data-testid="conversation-list" data-selected={selectedThreadId}>
+    <div
+      data-testid="conversation-list"
+      data-compact={compact || undefined}
+      data-selected={selectedThreadId}
+    >
       <button onClick={() => onSelectThread('conv-1')}>Select Thread</button>
     </div>
   ),
@@ -156,13 +176,26 @@ describe('DirectMessagesView', () => {
   beforeEach(() => {
     resetAllStores();
     vi.clearAllMocks();
+    channelPanelState.compact = false;
     useDMStore.setState({
       activeConversationId: null,
       setActiveConversation: vi.fn(),
       conversations: [],
       openDM: vi.fn().mockResolvedValue({ id: 'dm-conv-1' }),
     });
-    useLayoutStore.setState({ channelPanelPinned: true });
+    useLayoutStore.setState({
+      sidebarProfiles: {
+        dm: {
+          left: { width: 240, pinned: true },
+          right: { width: 260, pinned: true },
+        },
+        server: {
+          left: { width: 240, pinned: true },
+          right: { width: 260, pinned: true },
+        },
+      },
+      sidebarLayoutsDecoupled: true,
+    });
     useVoiceStore.setState({
       activeChannelId: null,
       connectionState: 'disconnected',
@@ -174,6 +207,7 @@ describe('DirectMessagesView', () => {
   it('renders the AppLayout with all slots', () => {
     render(<DirectMessagesView />);
     expect(screen.getByTestId('app-layout')).toBeInTheDocument();
+    expect(screen.getByTestId('app-layout')).toHaveAttribute('data-context', 'dm');
     expect(screen.getByTestId('server-bar-slot')).toBeInTheDocument();
     expect(screen.getByTestId('folder-bar-slot')).toBeInTheDocument();
     expect(screen.getByTestId('channel-panel-slot')).toBeInTheDocument();
@@ -181,9 +215,19 @@ describe('DirectMessagesView', () => {
     expect(screen.getByTestId('member-space-slot')).toBeInTheDocument();
   });
 
-  it('renders "Direct Messages" in channel panel header', () => {
+  it('uses the full Direct Messages title in the standard sidebar', () => {
     render(<DirectMessagesView />);
     expect(screen.getByText('Direct Messages')).toBeInTheDocument();
+    expect(screen.queryByText('DMs')).not.toBeInTheDocument();
+  });
+
+  it('uses the compact DMs title in the collapsed sidebar', () => {
+    channelPanelState.compact = true;
+
+    render(<DirectMessagesView />);
+
+    expect(screen.getByText('DMs')).toBeInTheDocument();
+    expect(screen.queryByText('Direct Messages')).not.toBeInTheDocument();
   });
 
   it('renders ConversationList in channel panel', () => {
@@ -213,6 +257,14 @@ describe('DirectMessagesView', () => {
     useDMStore.setState({ activeConversationId: 'conv-42' });
     render(<DirectMessagesView />);
     expect(screen.getByTestId('conversation-list')).toHaveAttribute('data-selected', 'conv-42');
+  });
+
+  it('passes the ChannelPanel compact state to ConversationList', () => {
+    channelPanelState.compact = true;
+
+    render(<DirectMessagesView />);
+
+    expect(screen.getByTestId('conversation-list')).toHaveAttribute('data-compact', 'true');
   });
 
   // --- Voice Bar ---
@@ -246,21 +298,21 @@ describe('DirectMessagesView', () => {
   // --- Floating Avatar ---
 
   it('shows floating UserPanel when channel panel is unpinned and no active conversation', () => {
-    useLayoutStore.setState({ channelPanelPinned: false });
+    useLayoutStore.getState().setSidebarPinned('dm', 'left', false);
     useDMStore.setState({ activeConversationId: null });
     render(<DirectMessagesView />);
     expect(screen.getByTestId('user-panel')).toBeInTheDocument();
   });
 
   it('does not show floating UserPanel when channel panel is pinned', () => {
-    useLayoutStore.setState({ channelPanelPinned: true });
+    useLayoutStore.getState().setSidebarPinned('dm', 'left', true);
     useDMStore.setState({ activeConversationId: null });
     render(<DirectMessagesView />);
     expect(screen.queryByTestId('user-panel')).not.toBeInTheDocument();
   });
 
   it('does not show floating UserPanel when a conversation is active', () => {
-    useLayoutStore.setState({ channelPanelPinned: false });
+    useLayoutStore.getState().setSidebarPinned('dm', 'left', false);
     useDMStore.setState({ activeConversationId: 'conv-1' });
     render(<DirectMessagesView />);
     expect(screen.queryByTestId('user-panel')).not.toBeInTheDocument();

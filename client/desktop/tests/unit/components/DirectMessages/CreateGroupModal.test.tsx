@@ -52,6 +52,15 @@ describe('CreateGroupModal', () => {
     expect(screen.getByText('Create Group DM')).toBeInTheDocument();
   });
 
+  it('uses the shared centered modal shell (#1750)', () => {
+    render(<CreateGroupModal isOpen={true} onClose={mockOnClose} />);
+
+    const dialog = screen.getByRole('dialog', { name: 'Create Group DM' });
+    expect(dialog).toHaveClass('modal-container');
+    expect(dialog.parentElement).toHaveClass('modal-overlay');
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+  });
+
   it('does not render when isOpen is false', () => {
     const { container } = render(<CreateGroupModal isOpen={false} onClose={mockOnClose} />);
     expect(container.innerHTML).toBe('');
@@ -69,9 +78,7 @@ describe('CreateGroupModal', () => {
 
   it('calls onClose when close button clicked', () => {
     render(<CreateGroupModal isOpen={true} onClose={mockOnClose} />);
-    const closeBtn = document.querySelector('.create-group-close-btn');
-    expect(closeBtn).toBeInTheDocument();
-    fireEvent.click(closeBtn!);
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     expect(mockOnClose).toHaveBeenCalled();
   });
 

@@ -84,11 +84,14 @@ describe('nuclearReset preserves device-local settings (#1603)', () => {
     // Seed a non-default value so the assertion locks preserve-not-recreate
     // (a bare key-exists check would also pass if the reset recreated the
     // key with defaults).
-    useLayoutStore.getState().setChannelPanelWidth(320);
+    useLayoutStore.getState().setSidebarWidth('dm', 'left', 320);
 
     nuclearReset();
 
     const layout = persistedState('concord-layout');
-    expect(layout?.channelPanelWidth).toBe(320);
+    expect(
+      (layout?.sidebarProfiles as { dm?: { left?: { width?: number } } } | undefined)?.dm?.left
+        ?.width
+    ).toBe(320);
   });
 });

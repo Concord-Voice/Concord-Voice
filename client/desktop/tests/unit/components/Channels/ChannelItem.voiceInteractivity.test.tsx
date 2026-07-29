@@ -1,6 +1,7 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, userEvent } from '../../../test-utils';
 import ChannelItem, { type VoiceMemberInfo } from '@/renderer/components/Channels/ChannelItem';
 import type { Channel } from '@/renderer/types/chat';
+import { resetAllStores } from '../../../helpers/store-helpers';
 import { vi } from 'vitest';
 
 const mockVoiceChannel: Channel = {
@@ -44,6 +45,7 @@ const baseProps = {
 
 describe('ChannelItem — voice participant interactivity (#487)', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
   });
 
@@ -115,5 +117,88 @@ describe('ChannelItem — voice participant interactivity (#487)', () => {
   it('applies the participant drop-target highlight class to the channel row', () => {
     const { container } = render(<ChannelItem {...baseProps} isParticipantDropTarget />);
     expect(container.querySelector('.channel-item--participant-drop-target')).toBeInTheDocument();
+  });
+
+  it('preserves participant profile actions inside compact voice detail', () => {
+    const onParticipantClick = vi.fn();
+    render(<ChannelItem {...baseProps} compact onParticipantClick={onParticipantClick} />);
+
+    fireEvent.focus(screen.getByRole('button', { name: /General Voice.*participant/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Alice' }));
+    expect(onParticipantClick).toHaveBeenCalledWith(
+      expect.anything(),
+      'voice-1',
+      expect.objectContaining({ userId: 'u1' })
+    );
+  });
+
+  it('preserves participant context actions inside compact voice detail', () => {
+    const onParticipantContextMenu = vi.fn();
+    render(
+      <ChannelItem {...baseProps} compact onParticipantContextMenu={onParticipantContextMenu} />
+    );
+
+    fireEvent.focus(screen.getByRole('button', { name: /General Voice.*participant/i }));
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Alice' }));
+    expect(onParticipantContextMenu).toHaveBeenCalledWith(
+      expect.anything(),
+      'voice-1',
+      expect.objectContaining({ userId: 'u1' })
+    );
+  });
+
+  it('preserves participant drag actions inside compact voice detail', () => {
+    const onParticipantDragStart = vi.fn();
+    render(<ChannelItem {...baseProps} compact onParticipantDragStart={onParticipantDragStart} />);
+
+    fireEvent.focus(screen.getByRole('button', { name: /General Voice.*participant/i }));
+    const participant = screen.getByRole('button', { name: 'Alice' });
+    expect(participant).toHaveAttribute('draggable', 'true');
+    fireEvent.dragStart(participant);
+    expect(onParticipantDragStart).toHaveBeenCalledWith(
+      expect.anything(),
+      'voice-1',
+      expect.objectContaining({ userId: 'u1' })
+    );
+  });
+
+  it('hands keyboard focus into compact detail, traverses actions, and restores the trigger', async () => {
+    const user = userEvent.setup();
+    const onChannelClick = vi.fn();
+    render(
+      <ChannelItem
+        {...baseProps}
+        compact
+        voiceMembers={[
+          ...voiceMembers,
+          {
+            userId: 'u2',
+            username: 'bob',
+            displayName: 'Bob',
+            isMuted: false,
+            isSpeaking: false,
+          },
+        ]}
+        onChannelClick={onChannelClick}
+        onParticipantClick={vi.fn()}
+      />
+    );
+
+    await user.tab();
+    const trigger = screen.getByRole('button', { name: /General Voice.*2 participants/i });
+    expect(trigger).toHaveFocus();
+
+    await user.keyboard('{Enter}');
+    expect(onChannelClick).toHaveBeenCalledWith(mockVoiceChannel);
+    expect(screen.getByRole('button', { name: 'Alice' })).toHaveFocus();
+
+    await user.tab();
+    expect(screen.getByRole('button', { name: 'Bob' })).toHaveFocus();
+
+    await user.keyboard('{Escape}');
+    expect(trigger).toHaveFocus();
+    expect(
+      screen.queryByRole('dialog', { name: 'General Voice channel details' })
+    ).not.toBeInTheDocument();
   });
 });

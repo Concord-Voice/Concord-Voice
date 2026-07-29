@@ -1,6 +1,7 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { act, render, screen, fireEvent } from '../../../test-utils';
 import { LayoutSection } from '@/renderer/components/Settings/AppearanceSection';
 import { useLayoutStore } from '@/renderer/stores/layoutStore';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 // LayoutSection is the "Lock Interface" row that lives in Appearance settings
 // (#188, per markdrogersjr's spec comment). It is wired directly to the real
@@ -10,7 +11,8 @@ import { useLayoutStore } from '@/renderer/stores/layoutStore';
 // mirroring the ClientBehaviorSection pattern.
 describe('AppearanceSection — Lock Interface (#188)', () => {
   beforeEach(() => {
-    useLayoutStore.setState({ interfaceLocked: false });
+    resetAllStores();
+    useLayoutStore.setState({ interfaceLocked: false, sidebarLayoutsDecoupled: false });
   });
 
   const getCheckbox = () =>
@@ -40,7 +42,7 @@ describe('AppearanceSection — Lock Interface (#188)', () => {
   });
 
   it('reflects the locked state on the toggle', () => {
-    useLayoutStore.setState({ interfaceLocked: true });
+    act(() => useLayoutStore.setState({ interfaceLocked: true }));
     render(<LayoutSection />);
     expect(getCheckbox().checked).toBe(true);
   });
@@ -54,5 +56,29 @@ describe('AppearanceSection — Lock Interface (#188)', () => {
 
     fireEvent.click(checkbox);
     expect(useLayoutStore.getState().interfaceLocked).toBe(false);
+  });
+
+  it('immediately toggles separate DM and server sidebar layouts', () => {
+    render(<LayoutSection />);
+    const toggle = screen.getByRole('checkbox', {
+      name: 'Use separate DM and server sidebar layouts',
+    });
+
+    fireEvent.click(toggle);
+
+    expect(useLayoutStore.getState().sidebarLayoutsDecoupled).toBe(true);
+  });
+
+  it('disables the sidebar layout toggle and shows the approved helper while locked', () => {
+    render(<LayoutSection />);
+    fireEvent.click(screen.getByText('Layout'));
+    const toggle = screen.getByRole('checkbox', {
+      name: 'Use separate DM and server sidebar layouts',
+    });
+
+    act(() => useLayoutStore.setState({ interfaceLocked: true }));
+
+    expect(toggle).toBeDisabled();
+    expect(screen.getByText('Unlock Interface to change sidebar layout settings.')).toBeVisible();
   });
 });

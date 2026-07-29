@@ -59,9 +59,12 @@ import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
 import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
 import { tryHydrateNotificationPrefs } from '@/renderer/services/notificationPrefsService';
 import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
+import { useLayoutStore, type SidebarProfiles } from '@/renderer/stores/layoutStore';
+import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('hydratePostLogin', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
     vi.mocked(preferencesSyncService.fetchAndApply).mockResolvedValue(undefined);
     vi.mocked(savedGifsSyncService.fetchAndApply).mockResolvedValue(undefined);
@@ -203,25 +206,79 @@ describe('hydratePostLogin', () => {
   it('initializes preferencesSync with a dependency bag', async () => {
     await hydratePostLogin();
     // init() is called with the deps built by buildPreferencesSyncDeps — a
-    // bag exposing the four injection points.
+    // bag exposing the five injection points.
     const deps = vi.mocked(preferencesSyncService.init).mock.calls[0]?.[0];
     expect(deps).toMatchObject({
       getAppearance: expect.any(Function),
       setAppearance: expect.any(Function),
       getLayout: expect.any(Function),
       setLayout: expect.any(Function),
+      applySidebarPreferences: expect.any(Function),
     });
   });
 });
 
 describe('buildPreferencesSyncDeps', () => {
-  it('returns the four-function dependency bag', () => {
+  beforeEach(() => {
+    resetAllStores();
+    useLayoutStore.setState({ interfaceLocked: false, sidebarLayoutsDecoupled: false });
+  });
+
+  it('returns the five-function dependency bag', () => {
     const deps = buildPreferencesSyncDeps();
     expect(deps).toMatchObject({
       getAppearance: expect.any(Function),
       setAppearance: expect.any(Function),
       getLayout: expect.any(Function),
       setLayout: expect.any(Function),
+      applySidebarPreferences: expect.any(Function),
     });
+  });
+
+  it('returns both retained profiles and the decouple flag from getLayout', () => {
+    const profiles: SidebarProfiles = {
+      dm: {
+        left: { width: 280, pinned: true },
+        right: { width: 175, pinned: false },
+      },
+      server: {
+        left: { width: 320, pinned: false },
+        right: { width: 300, pinned: true },
+      },
+    };
+    useLayoutStore.setState({
+      sidebarProfiles: profiles,
+      sidebarLayoutsDecoupled: true,
+    });
+
+    const layout = buildPreferencesSyncDeps().getLayout();
+
+    expect(layout.sidebarProfiles).toEqual(profiles);
+    expect(layout.sidebarLayoutsDecoupled).toBe(true);
+    expect(layout).not.toHaveProperty('channelPanelPinned');
+    expect(layout).not.toHaveProperty('channelPanelWidth');
+    expect(layout).not.toHaveProperty('memberPanelMode');
+    expect(layout).not.toHaveProperty('memberPanelWidth');
+    expect(layout).not.toHaveProperty('friendsPanelMode');
+  });
+
+  it('applies remote sidebar state through the Interface Lock guarded action', () => {
+    const retained = useLayoutStore.getState().sidebarProfiles;
+    const remote: SidebarProfiles = {
+      dm: {
+        left: { width: 300, pinned: false },
+        right: { width: 280, pinned: false },
+      },
+      server: {
+        left: { width: 310, pinned: false },
+        right: { width: 290, pinned: false },
+      },
+    };
+    useLayoutStore.setState({ interfaceLocked: true });
+
+    buildPreferencesSyncDeps().applySidebarPreferences(remote, true);
+
+    expect(useLayoutStore.getState().sidebarProfiles).toEqual(retained);
+    expect(useLayoutStore.getState().sidebarLayoutsDecoupled).toBe(false);
   });
 });

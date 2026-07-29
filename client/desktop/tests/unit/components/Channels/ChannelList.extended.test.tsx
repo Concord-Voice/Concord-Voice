@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, within } from '../../../test-utils';
 import ChannelList, {
   parseGapSlot,
   buildGapDropUpdates,
@@ -53,9 +53,10 @@ describe('ChannelList — extended coverage', () => {
   const onEmptyContextMenu = vi.fn();
   const onCategoryContextMenu = vi.fn();
 
-  const renderChannelList = () =>
+  const renderChannelList = (compact = false) =>
     render(
       <ChannelList
+        compact={compact}
         onContextMenu={onContextMenu}
         onEmptyContextMenu={onEmptyContextMenu}
         onCategoryContextMenu={onCategoryContextMenu}
@@ -145,6 +146,45 @@ describe('ChannelList — extended coverage', () => {
       });
       renderChannelList();
       expect(screen.getByText('legacy')).toBeInTheDocument();
+    });
+  });
+
+  describe('compact ordering', () => {
+    it('preserves category/channel order without truncating the rail', () => {
+      const firstGroupChannels = Array.from({ length: 60 }, (_, index) => ({
+        ...mockChannel,
+        id: `text-${index}`,
+        name: `text-${index}`,
+        group_id: 'group-1',
+        position: index,
+      }));
+      const secondGroupChannels = Array.from({ length: 45 }, (_, index) => ({
+        ...mockVoiceChannel,
+        id: `voice-${index}`,
+        name: `voice-${index}`,
+        group_id: 'group-2',
+        position: index,
+      }));
+      useServerStore.setState({ activeServerId: 'server-1' });
+      useChannelStore.setState({
+        channels: [...secondGroupChannels, ...firstGroupChannels],
+        channelGroups: [mockGroup2, mockGroup1],
+        collapsedGroups: [],
+        isLoading: false,
+        error: null,
+      });
+
+      renderChannelList(true);
+
+      const navigation = screen.getByRole('navigation', { name: 'Server channels' });
+      expect(navigation).toBeInTheDocument();
+      expect(screen.queryByRole('tree', { name: 'Server channels' })).not.toBeInTheDocument();
+      const items = navigation.querySelectorAll('.channel-item-wrapper');
+      expect(items).toHaveLength(105);
+      expect(within(items[0]).getByRole('button')).toHaveAccessibleName(/^text-0,/i);
+      expect(within(items[59]).getByRole('button')).toHaveAccessibleName(/^text-59,/i);
+      expect(within(items[60]).getByRole('button')).toHaveAccessibleName(/^voice-0,/i);
+      expect(within(items[104]).getByRole('button')).toHaveAccessibleName(/^voice-44,/i);
     });
   });
 

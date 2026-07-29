@@ -13,7 +13,7 @@ import ServerActionModal from '../Servers/ServerActionModal';
 import CreateServerModal from '../Servers/CreateServerModal';
 import JoinServerModal from '../Servers/JoinServerModal';
 import ServerContextMenu from '../Servers/ServerContextMenu';
-import { useLayoutStore } from '../../stores/layoutStore';
+import { selectSidebarDock, useLayoutStore } from '../../stores/layoutStore';
 import { useVoiceStore } from '../../stores/voiceStore';
 import { useDMStore } from '../../stores/dmStore';
 import { ServerWithRole } from '../../types/server';
@@ -22,7 +22,7 @@ const DirectMessagesView: React.FC = () => {
   const activeConversationId = useDMStore((s) => s.activeConversationId);
   const setActiveConversation = useDMStore((s) => s.setActiveConversation);
 
-  const channelPanelPinned = useLayoutStore((s) => s.channelPanelPinned);
+  const leftPinned = useLayoutStore((state) => selectSidebarDock(state, 'dm', 'left').pinned);
   const voiceActiveChannelId = useVoiceStore((s) => s.activeChannelId);
   const voiceConnectionState = useVoiceStore((s) => s.connectionState);
   const voiceIsDMCall = useVoiceStore((s) => s.isDMCall);
@@ -34,7 +34,7 @@ const DirectMessagesView: React.FC = () => {
 
   // Show floating avatar when channel panel is unpinned and no conversation is active
   // (when a conversation IS active, MessageInput provides the UserPanel)
-  const showFloatingAvatar = !channelPanelPinned && !activeConversationId;
+  const showFloatingAvatar = !leftPinned && !activeConversationId;
 
   // Server modals (triggered by ServerBar add button or stale server placeholder)
   const [isServerActionModalOpen, setIsServerActionModalOpen] = useState(false);
@@ -68,15 +68,16 @@ const DirectMessagesView: React.FC = () => {
     [setActiveConversation]
   );
 
-  const channelHeader = (
+  const channelHeader = (compact: boolean) => (
     <span style={{ fontWeight: 600, fontSize: 'calc(14px * var(--font-scale, 1))' }}>
-      Direct Messages
+      {compact ? 'DMs' : 'Direct Messages'}
     </span>
   );
 
   return (
     <div className="view-container main-view">
       <AppLayout
+        context="dm"
         serverBar={
           <ServerBar
             onOpenActionModal={() => setIsServerActionModalOpen(true)}
@@ -85,12 +86,17 @@ const DirectMessagesView: React.FC = () => {
         }
         folderBar={<FolderBar />}
         channelPanel={
-          <ChannelPanel header={channelHeader}>
-            <ConversationList
-              selectedThreadId={activeConversationId}
-              onSelectThread={setActiveConversation}
-            />
-          </ChannelPanel>
+          <ChannelPanel
+            context="dm"
+            header={channelHeader}
+            renderContent={(compact) => (
+              <ConversationList
+                compact={compact}
+                selectedThreadId={activeConversationId}
+                onSelectThread={setActiveConversation}
+              />
+            )}
+          />
         }
         chatArea={
           <div
@@ -107,7 +113,6 @@ const DirectMessagesView: React.FC = () => {
           </div>
         }
         memberSpace={<FriendsFlexSpace onFriendClick={handleFriendClick} />}
-        forceMemberExpanded
       />
 
       {/* Server management modals */}

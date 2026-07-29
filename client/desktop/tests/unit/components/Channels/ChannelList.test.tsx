@@ -67,9 +67,10 @@ describe('ChannelList', () => {
   const onEmptyContextMenu = vi.fn();
   const onCategoryContextMenu = vi.fn();
 
-  const renderChannelList = () =>
+  const renderChannelList = (compact = false) =>
     render(
       <ChannelList
+        compact={compact}
         onContextMenu={onContextMenu}
         onEmptyContextMenu={onEmptyContextMenu}
         onCategoryContextMenu={onCategoryContextMenu}
@@ -147,6 +148,24 @@ describe('ChannelList', () => {
     renderChannelList();
     expect(screen.getByText('general')).toBeInTheDocument();
     expect(screen.getByText('TEXT CHANNELS')).toBeInTheDocument();
+  });
+
+  it('labels every compact channel control with its full-size name (#1750)', () => {
+    useServerStore.setState({ activeServerId: 'server-1' });
+    useChannelStore.setState({
+      channels: [{ ...mockChannel, group_id: 'group-1' }],
+      channelGroups: [mockChannelGroup],
+      isLoading: false,
+      error: null,
+    });
+
+    const { container } = renderChannelList(true);
+
+    expect(
+      Array.from(container.querySelectorAll('.channel-list--compact button')).map((button) =>
+        button.getAttribute('title')
+      )
+    ).toEqual(['Text Channels', 'general']);
   });
 
   it('renders voice channels', () => {
@@ -302,6 +321,23 @@ describe('ChannelList', () => {
       useUnreadStore.getState().setInitialUnreads(new Map([['channel-1', 5]]));
       useNotificationPrefsStore.getState().setMute('channel', 'channel-1', true, null);
       renderChannelList();
+      expect(screen.queryByText('5')).not.toBeInTheDocument();
+    });
+
+    it('announces a muted compact channel while suppressing its unread badge', () => {
+      useServerStore.setState({ activeServerId: 'server-1' });
+      useChannelStore.setState({
+        channels: [mockChannel],
+        activeChannelId: null,
+        isLoading: false,
+        error: null,
+      });
+      useUnreadStore.getState().setInitialUnreads(new Map([['channel-1', 5]]));
+      useNotificationPrefsStore.getState().setMute('channel', 'channel-1', true, null);
+
+      renderChannelList(true);
+
+      expect(screen.getByRole('button', { name: /general.*muted/i })).toBeInTheDocument();
       expect(screen.queryByText('5')).not.toBeInTheDocument();
     });
 
@@ -533,6 +569,62 @@ describe('ChannelList', () => {
     });
     renderChannelList();
     expect(screen.getByText('Other User')).toBeInTheDocument();
+  });
+
+  it('uses the existing cached roster for compact voice count and detail', () => {
+    useServerStore.setState({ activeServerId: 'server-1' });
+    useChannelStore.setState({
+      channels: [mockVoiceChannel],
+      isLoading: false,
+      error: null,
+    });
+    useVoiceStore.setState({
+      activeChannelId: null,
+      connectionState: 'idle',
+      channelVoiceMembers: {
+        'voice-1': [
+          { userId: 'user-2', username: 'alice', displayName: 'Alice', isMuted: false },
+          { userId: 'user-3', username: 'bob', displayName: 'Bob', isMuted: false },
+        ],
+      },
+    });
+
+    renderChannelList(true);
+
+    expect(screen.getByLabelText('2 participants')).toBeInTheDocument();
+    expect(screen.queryByText('Alice')).not.toBeInTheDocument();
+    expect(screen.queryByText('Bob')).not.toBeInTheDocument();
+    fireEvent.focus(screen.getByRole('button', { name: /general voice.*2 participants/i }));
+    expect(screen.getByText('Alice')).toBeInTheDocument();
+    expect(screen.getByText('Bob')).toBeInTheDocument();
+  });
+
+  it('includes the connected self roster entry in the compact voice count', () => {
+    useServerStore.setState({ activeServerId: 'server-1' });
+    useChannelStore.setState({
+      channels: [mockVoiceChannel],
+      isLoading: false,
+      error: null,
+    });
+    useVoiceStore.setState({
+      activeChannelId: 'voice-1',
+      connectionState: 'connected',
+      participants: {
+        self: {
+          peerId: 'peer-self',
+          userId: 'self',
+          username: 'selfuser',
+          displayName: 'Self User',
+          isMuted: false,
+          isDeafened: false,
+          isSpeaking: false,
+        },
+      },
+    });
+
+    renderChannelList(true);
+
+    expect(screen.getByLabelText('1 participant')).toBeInTheDocument();
   });
 
   it('maps enforcement flags from real-time participants to voice members', () => {

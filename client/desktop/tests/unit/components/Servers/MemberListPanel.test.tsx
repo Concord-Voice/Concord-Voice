@@ -133,9 +133,9 @@ describe('MemberListPanel', () => {
 
   it('renders column headers', () => {
     render(<MemberListPanel {...defaultProps} />);
-    const header = document.querySelector('.member-list-header');
+    const header = document.querySelector('.settings-member-list-header');
     expect(header).toBeInTheDocument();
-    const spans = document.querySelectorAll('.member-list-header span');
+    const spans = document.querySelectorAll('.settings-member-list-header span');
     expect(spans[0]).toHaveTextContent('User');
     expect(spans[1]).toHaveTextContent('Roles');
   });

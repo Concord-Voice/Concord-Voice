@@ -491,6 +491,92 @@
   gap: calc(4px * var(--sp, 1));
 }
 
+/* Compact Friends category rail */
+.friends-list--compact {
+  align-items: center;
+  overflow-x: hidden;
+  padding: 8px 6px;
+}
+
+.friends-list--compact .friends-list-header {
+  justify-content: center;
+  padding: 0;
+  margin-bottom: 8px;
+}
+
+.friends-list--compact .friends-list-header-actions,
+.friends-compact-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.friends-list--compact .friends-add-btn,
+.friends-compact-trigger {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  padding: 4px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.friends-list--compact .friends-add-btn:hover,
+.friends-compact-trigger:hover,
+.friends-compact-trigger[aria-expanded='true'] {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.friends-list--compact .friends-add-btn:focus-visible,
+.friends-compact-trigger:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.friends-compact-rail {
+  width: 100%;
+}
+
+.friends-compact-category {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+}
+
+.friends-compact-emoji {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.friends-compact-trigger-count {
+  position: absolute;
+  right: 1px;
+  bottom: 1px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 3px;
+  border-radius: 8px;
+  background: var(--accent-fill);
+  color: var(--bg-primary);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+}
+
+.attributed-popover .friend-item {
+  min-height: 40px;
+}
+
 /* Category emoji shown in the section header (#324) */
 .friend-category-header .category-item-emoji {
   font-size: calc(13px * var(--font-scale, 1));
@@ -591,6 +677,57 @@
   height: 1px;
   background: var(--border-color);
   margin: calc(4px * var(--sp, 1)) calc(8px * var(--sp, 1));
+}
+
+/* Compact Threads rail */
+.conversation-list--compact {
+  align-items: center;
+  overflow-x: hidden;
+}
+
+.conversation-list--compact .conversation-item--compact {
+  position: relative;
+  justify-content: center;
+  flex: 0 0 44px;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  margin: 2px 6px;
+  padding: 4px;
+  gap: 0;
+  border-radius: 8px;
+}
+
+.conversation-list--compact .conversation-item--compact.active {
+  padding: 4px;
+}
+
+.conversation-list--compact .conversation-item--compact:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.conversation-list--compact .personal-thread-divider {
+  width: 36px;
+  flex-shrink: 0;
+  margin: 4px 10px;
+}
+
+.conversation-item--compact .conversation-unread-badge {
+  position: absolute;
+  top: 0;
+  right: 0;
+}
+
+.conversation-compact-draft {
+  position: absolute;
+  left: 2px;
+  bottom: 2px;
+  padding: 2px;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  color: var(--text-muted);
 }
 
 /* ─── Add Friend Modal ──────────────────────────────────────────────── */
@@ -905,6 +1042,22 @@
   text-align: center;
 }
 
+.friends-list-empty-icon {
+  margin-bottom: 8px;
+  opacity: 0.4;
+}
+
+.friends-list-empty--compact {
+  flex: 0 0 44px;
+  width: 44px;
+  min-height: 44px;
+  padding: 0;
+}
+
+.friends-list-empty--compact .friends-list-empty-icon {
+  margin-bottom: 0;
+}
+
 .friends-list-empty p {
   font-size: calc(12px * var(--font-scale, 1));
   color: var(--text-muted);
@@ -1049,7 +1202,6 @@
 
 /* ─── Create Group Modal ──────────────────────────────────────────────── */
 
-.create-group-modal-overlay,
 .edit-group-modal-overlay {
   position: fixed;
   top: 0;
@@ -1063,7 +1215,6 @@
   z-index: 1000;
 }
 
-.create-group-modal,
 .edit-group-modal {
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
@@ -1076,7 +1227,6 @@
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
 }
 
-.create-group-modal-header,
 .edit-group-modal-header {
   display: flex;
   align-items: center;
@@ -1085,7 +1235,6 @@
   border-bottom: 1px solid var(--border-color);
 }
 
-.create-group-modal-header h3,
 .edit-group-modal-header h3 {
   font-size: calc(16px * var(--font-scale, 1));
   font-weight: 600;
@@ -1115,10 +1264,13 @@
 
 .create-group-modal-body,
 .edit-group-modal-body {
-  padding: calc(14px * var(--sp, 1)) calc(16px * var(--sp, 1));
   display: flex;
   flex-direction: column;
   gap: calc(10px * var(--sp, 1));
+}
+
+.edit-group-modal-body {
+  padding: calc(14px * var(--sp, 1)) calc(16px * var(--sp, 1));
   overflow-y: auto;
   flex: 1;
   min-height: 0;

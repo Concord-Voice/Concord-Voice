@@ -9,9 +9,22 @@ interface MemberItemProps {
   status: PresenceStatus;
   onClick: (e: React.MouseEvent, member: ServerMember) => void;
   onContextMenu: (e: React.MouseEvent, member: ServerMember) => void;
+  compact?: boolean;
 }
 
-const MemberItem: React.FC<MemberItemProps> = ({ member, status, onClick, onContextMenu }) => {
+function getStatusLabel(status: PresenceStatus): string {
+  if (status === 'dnd') return 'Do Not Disturb';
+  if (status === 'offline' || status === 'invisible') return 'Offline';
+  return 'Online';
+}
+
+const MemberItem: React.FC<MemberItemProps> = ({
+  member,
+  status,
+  onClick,
+  onContextMenu,
+  compact = false,
+}) => {
   const memberColors = resolveUserAccentColors(member.color_scheme);
   // Selective subscription: only this member's custom-text status (undefined if none).
   const customText = useRichPresenceStore((s) => s.customTextByUser[member.user_id]);
@@ -21,14 +34,17 @@ const MemberItem: React.FC<MemberItemProps> = ({ member, status, onClick, onCont
         .sort((a, b) => b.position - a.position)[0] ?? null)
     : null;
   const roleColor = topDisplayRole?.role_color ?? null;
+  const displayName = member.display_name || member.username;
+  const statusLabel = getStatusLabel(status);
   return (
     <button
       type="button"
-      className={`member-item ${status}`}
+      className={`member-item ${status}${compact ? ' member-item--compact' : ''}`}
+      aria-label={compact ? `${displayName} — ${statusLabel}` : undefined}
       onClick={(e) => onClick(e, member)}
       onMouseDown={(e) => e.stopPropagation()}
       onContextMenu={(e) => onContextMenu(e, member)}
-      title={member.display_name || member.username}
+      title={displayName}
     >
       <div className="member-avatar">
         {resolveMediaUrl(member.avatar_url) ? (
@@ -47,19 +63,21 @@ const MemberItem: React.FC<MemberItemProps> = ({ member, status, onClick, onCont
         )}
         <span className={`member-status-dot ${status}`} />
       </div>
-      <div className="member-item-text">
-        <span className="member-username" style={roleColor ? { color: roleColor } : undefined}>
-          {member.display_name || member.username}
-        </span>
-        {customText && (
-          <span className="member-custom-status">
-            {customText.emoji && (
-              <span className="member-custom-status-emoji">{customText.emoji}</span>
-            )}
-            <span className="member-custom-status-text">{customText.text}</span>
+      {!compact && (
+        <div className="member-item-text">
+          <span className="member-username" style={roleColor ? { color: roleColor } : undefined}>
+            {displayName}
           </span>
-        )}
-      </div>
+          {customText && (
+            <span className="member-custom-status">
+              {customText.emoji && (
+                <span className="member-custom-status-emoji">{customText.emoji}</span>
+              )}
+              <span className="member-custom-status-text">{customText.text}</span>
+            </span>
+          )}
+        </div>
+      )}
     </button>
   );
 };

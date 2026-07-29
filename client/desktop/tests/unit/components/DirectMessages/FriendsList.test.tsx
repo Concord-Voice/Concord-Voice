@@ -1,18 +1,24 @@
-import { render, screen, fireEvent, waitFor, within } from '../../../test-utils';
+import { act, render, screen, fireEvent, waitFor, within, userEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useFriendStore, type Friend, type FriendRequest } from '@/renderer/stores/friendStore';
 import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
+import { useLayoutStore } from '@/renderer/stores/layoutStore';
+import { DockOverlayProvider, DockShell } from '@/renderer/components/Layout/DockShell';
 import { vi } from 'vitest';
 
 // Mock child components that are heavy or have their own dependencies
-vi.mock('@/renderer/components/DirectMessages/AddFriendModal', () => ({
-  default: ({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) =>
-    isOpen ? (
-      <div data-testid="add-friend-modal">
-        <button onClick={onClose}>Close Modal</button>
-      </div>
-    ) : null,
-}));
+vi.mock('@/renderer/components/DirectMessages/AddFriendModal', async () => {
+  const { default: Modal } = await import('@/renderer/components/ui/Modal');
+  return {
+    default: ({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) => (
+      <Modal isOpen={isOpen} onClose={onClose} title="Add Friend">
+        <div data-testid="add-friend-modal">
+          <button onClick={onClose}>Close Modal</button>
+        </div>
+      </Modal>
+    ),
+  };
+});
 
 vi.mock('@/renderer/components/Members/MemberProfileCard', () => ({
   default: ({
@@ -141,6 +147,16 @@ describe('FriendsList', () => {
   it('shows empty state when no friends', () => {
     render(<FriendsList onFriendClick={mockOnFriendClick} />);
     expect(screen.getByText('Add friends to see them here')).toBeInTheDocument();
+  });
+
+  it('centers and scales the empty-state icon for the compact rail', () => {
+    const { container } = render(<FriendsList compact onFriendClick={mockOnFriendClick} />);
+    const emptyState = container.querySelector('.friends-list-empty');
+    const icon = emptyState?.querySelector('svg');
+
+    expect(emptyState).toHaveClass('friends-list-empty--compact');
+    expect(icon).toHaveAttribute('width', '20');
+    expect(icon).toHaveAttribute('height', '20');
   });
 
   // --- Online/Offline Categories ---
@@ -424,6 +440,8 @@ describe('FriendsList', () => {
     await waitFor(() => {
       expect(acceptBtn).toBeDisabled();
       expect(declineBtn).toBeDisabled();
+      expect(acceptBtn).toHaveAccessibleName('Accepting friend request from Bob');
+      expect(declineBtn).toHaveAccessibleName('Decline friend request from Bob');
     });
   });
 
@@ -517,6 +535,41 @@ describe('FriendsList', () => {
 
     fireEvent.click(screen.getByText('Close Modal'));
     expect(screen.queryByTestId('add-friend-modal')).not.toBeInTheDocument();
+  });
+
+  it('keeps an Add Friend modal owned by its trigger while a transient dock is open', () => {
+    vi.useFakeTimers();
+    useLayoutStore.getState().setSidebarPinned('dm', 'right', false);
+
+    const { container } = render(
+      <DockOverlayProvider>
+        <DockShell
+          context="dm"
+          side="right"
+          label="Friends"
+          header={null}
+          renderBody={(compact) => (
+            <FriendsList compact={compact} onFriendClick={mockOnFriendClick} />
+          )}
+        />
+      </DockOverlayProvider>
+    );
+    const lip = screen.getByRole('button', { name: 'Open Friends sidebar' });
+    fireEvent.focus(lip);
+    const trigger = screen.getByRole('button', { name: 'Add Friend' });
+    const surface = container.querySelector('.dock-shell__surface') as HTMLElement;
+
+    expect(trigger.id).not.toBe('');
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    const dialog = screen.getByRole('dialog', { name: 'Add Friend' });
+    expect(dialog.closest('.modal-overlay')).toHaveAttribute('data-dock-focus-owner', trigger.id);
+
+    fireEvent.mouseLeave(surface);
+    act(() => vi.runAllTimers());
+    expect(surface).toHaveAttribute('data-state', 'open');
+    vi.useRealTimers();
   });
 
   // --- Context Menu ---
@@ -1044,5 +1097,240 @@ describe('FriendsList', () => {
     fireEvent.click(within(menu).getByText('New category…'));
 
     expect(screen.getByTestId('category-manager-panel')).toBeInTheDocument();
+  });
+
+  // --- Compact category rail ---
+
+  it('preserves standard invisible friends in Online without offline dimming', () => {
+    useFriendStore.setState({
+      friends: [
+        makeFriend({
+          id: 'f-invisible',
+          userId: 'u-invisible',
+          displayName: 'Invisible',
+          status: 'invisible',
+        }),
+      ],
+    });
+
+    render(<FriendsList onFriendClick={mockOnFriendClick} />);
+
+    expect(
+      screen.getByText('Online').closest('button')?.querySelector('.friend-category-count')
+        ?.textContent
+    ).toBe('1');
+    expect(
+      screen.getByText('Offline').closest('button')?.querySelector('.friend-category-count')
+        ?.textContent
+    ).toBe('0');
+    expect(screen.getByRole('button', { name: 'Invisible' })).not.toHaveClass('offline');
+  });
+
+  it('renders compact category triggers in the persisted section order', () => {
+    useFriendStore.setState({
+      friends: [
+        makeFriend({ id: 'f-online', userId: 'u-online', displayName: 'Alice', status: 'online' }),
+        makeFriend({ id: 'f-offline', userId: 'u-offline', displayName: 'Bob', status: 'offline' }),
+        makeFriend({ id: 'f-work', userId: 'u-work', displayName: 'Cara', status: 'dnd' }),
+      ],
+      pendingRequests: [makeRequest()],
+    });
+    useFriendOrgStore.getState()._hydrate({
+      v: 1,
+      categories: [
+        { id: 'cat-work', name: 'Work', emoji: '🛠️', color: null, memberIds: ['u-work'] },
+      ],
+      sectionOrder: ['offline', 'cat-work', 'pending', 'online'],
+    });
+
+    const { container } = render(<FriendsList compact onFriendClick={mockOnFriendClick} />);
+
+    const rail = screen.getByRole('navigation', { name: 'Friends categories' });
+    expect(
+      within(rail)
+        .getAllByRole('button')
+        .map((button) => button.getAttribute('aria-label'))
+    ).toEqual(['Offline — 1', 'Work — 1', 'Pending Requests — 1', 'Online — 1']);
+    expect(
+      Array.from(container.querySelectorAll('.friends-list--compact button')).map((button) =>
+        button.getAttribute('title')
+      )
+    ).toEqual(['Manage categories', 'Add Friend', 'Offline', 'Work', 'Pending Requests', 'Online']);
+  });
+
+  it('switches compact bubbles with a real pointer sequence and restores the active trigger', async () => {
+    const user = userEvent.setup();
+    useFriendStore.setState({
+      friends: [
+        makeFriend({ id: 'f-online', userId: 'u-online', displayName: 'Alice', status: 'online' }),
+        makeFriend({ id: 'f-offline', userId: 'u-offline', displayName: 'Bob', status: 'offline' }),
+      ],
+    });
+    render(<FriendsList compact onFriendClick={mockOnFriendClick} />);
+
+    const onlineTrigger = screen.getByRole('button', { name: 'Online — 1' });
+    expect(onlineTrigger.id).not.toBe('');
+    await user.click(onlineTrigger);
+    expect(screen.getByRole('region', { name: 'Online — 1' })).toHaveAttribute(
+      'data-dock-focus-owner',
+      onlineTrigger.id
+    );
+    const onlineFocus = vi.spyOn(onlineTrigger, 'focus');
+
+    const offlineTrigger = screen.getByRole('button', { name: 'Offline — 1' });
+    await user.click(offlineTrigger);
+    expect(onlineFocus).not.toHaveBeenCalled();
+    expect(offlineTrigger).toHaveFocus();
+    expect(screen.queryByRole('region', { name: 'Online — 1' })).not.toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Offline — 1' })).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('region', { name: 'Offline — 1' })).not.toBeInTheDocument();
+    expect(offlineTrigger).toHaveFocus();
+  });
+
+  it('clears the open compact bubble when switching through standard mode', () => {
+    useFriendStore.setState({
+      friends: [
+        makeFriend({ id: 'f-online', userId: 'u-online', displayName: 'Alice', status: 'online' }),
+      ],
+    });
+    const { rerender } = render(<FriendsList compact onFriendClick={mockOnFriendClick} />);
+
+    const originalTrigger = screen.getByRole('button', { name: 'Online — 1' });
+    fireEvent.click(originalTrigger);
+    expect(screen.getByRole('region', { name: 'Online — 1' })).toBeInTheDocument();
+
+    rerender(<FriendsList onFriendClick={mockOnFriendClick} />);
+    expect(
+      screen.queryByRole('navigation', { name: 'Friends categories' })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Online — 1' })).not.toBeInTheDocument();
+
+    rerender(<FriendsList compact onFriendClick={mockOnFriendClick} />);
+    const replacementTrigger = screen.getByRole('button', { name: 'Online — 1' });
+    expect(replacementTrigger).not.toBe(originalTrigger);
+    expect(replacementTrigger).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('region', { name: 'Online — 1' })).not.toBeInTheDocument();
+
+    fireEvent.click(replacementTrigger);
+    expect(screen.getByRole('region', { name: 'Online — 1' })).toBeInTheDocument();
+  });
+
+  it('requires a fresh click after an open pending section is removed and re-added', async () => {
+    useFriendStore.setState({ pendingRequests: [makeRequest()] });
+    render(<FriendsList compact onFriendClick={mockOnFriendClick} />);
+
+    const originalTrigger = screen.getByRole('button', { name: 'Pending Requests — 1' });
+    fireEvent.click(originalTrigger);
+    expect(screen.getByRole('region', { name: 'Pending Requests — 1' })).toBeInTheDocument();
+
+    act(() => useFriendStore.setState({ pendingRequests: [] }));
+    await waitFor(() => {
+      expect(screen.queryByRole('region', { name: /^Pending Requests/ })).not.toBeInTheDocument();
+    });
+
+    act(() => useFriendStore.setState({ pendingRequests: [makeRequest({ id: 'req-2' })] }));
+    const replacementTrigger = screen.getByRole('button', { name: 'Pending Requests — 1' });
+    expect(replacementTrigger).not.toBe(originalTrigger);
+    expect(replacementTrigger).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('region', { name: 'Pending Requests — 1' })).not.toBeInTheDocument();
+
+    fireEvent.click(replacementTrigger);
+    expect(screen.getByRole('region', { name: 'Pending Requests — 1' })).toBeInTheDocument();
+  });
+
+  it('reuses pending request actions inside the compact bubble', async () => {
+    const acceptRequest = vi.fn().mockResolvedValue(undefined);
+    const declineRequest = vi.fn().mockResolvedValue(undefined);
+    useFriendStore.setState({
+      pendingRequests: [makeRequest()],
+      acceptRequest,
+      declineRequest,
+    });
+    render(<FriendsList compact onFriendClick={mockOnFriendClick} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Pending Requests — 1' }));
+
+    fireEvent.click(screen.getByTitle('Accept'));
+    await waitFor(() => expect(acceptRequest).toHaveBeenCalledWith('req-1'));
+
+    fireEvent.click(screen.getByTitle('Decline'));
+    await waitFor(() => expect(declineRequest).toHaveBeenCalledWith('req-1'));
+  });
+
+  it('reuses friend profile, context, messaging, and category actions in compact mode', () => {
+    useFriendStore.setState({
+      friends: [makeFriend({ id: 'f-1', userId: 'u-1', displayName: 'Alice', status: 'online' })],
+    });
+    const work = useFriendOrgStore.getState().createCategory('Work', '', null);
+    const { container } = render(<FriendsList compact onFriendClick={mockOnFriendClick} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Online — 1' }));
+
+    const friendRow = screen.getByRole('button', { name: 'Alice' });
+    fireEvent.click(friendRow, { clientX: 150, clientY: 250 });
+    expect(screen.getByTestId('profile-card')).toHaveAttribute('data-user-id', 'u-1');
+
+    fireEvent.contextMenu(friendRow, { clientX: 100, clientY: 200 });
+    fireEvent.click(screen.getByText('Message'));
+    expect(mockOnFriendClick).toHaveBeenCalledWith('u-1');
+
+    fireEvent.contextMenu(friendRow, { clientX: 100, clientY: 200 });
+    const menu = document.querySelector('.ctx-menu') as HTMLElement;
+    fireEvent.click(within(menu).getByText('Move to category'));
+    fireEvent.click(within(menu).getByText('Work'));
+    expect(categoryOf('u-1')?.id).toBe(work);
+
+    fireEvent.click(screen.getByRole('button', { name: /manage categories/i }));
+    expect(screen.getByTestId('category-manager-panel')).toBeInTheDocument();
+    expect(container.querySelector('.friends-list--compact')).toBeInTheDocument();
+  });
+
+  it('treats offline and invisible compact friends as dimmed but keyboard reachable', () => {
+    useFriendStore.setState({
+      friends: [
+        makeFriend({
+          id: 'f-offline',
+          userId: 'u-offline',
+          displayName: 'Offline',
+          status: 'offline',
+        }),
+        makeFriend({
+          id: 'f-invisible',
+          userId: 'u-invisible',
+          displayName: 'Invisible',
+          status: 'invisible',
+        }),
+      ],
+    });
+    render(<FriendsList compact onFriendClick={mockOnFriendClick} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Offline — 2' }));
+
+    for (const name of ['Offline', 'Invisible']) {
+      const row = screen.getByRole('button', { name });
+      expect(row).toHaveClass('offline');
+      expect(row).toHaveAccessibleDescription('Offline');
+      expect(row).not.toHaveAttribute('tabindex', '-1');
+    }
+  });
+
+  it('keeps existing empty-section rules and does not cap long compact sections', () => {
+    const friends = Array.from({ length: 24 }, (_, index) =>
+      makeFriend({
+        id: `f-${index}`,
+        userId: `u-${index}`,
+        displayName: `Friend ${index + 1}`,
+        status: 'online',
+      })
+    );
+    useFriendStore.setState({ friends });
+    useFriendOrgStore.getState().createCategory('Gaming', '', null);
+    render(<FriendsList compact onFriendClick={mockOnFriendClick} />);
+
+    expect(screen.queryByRole('button', { name: /^Pending Requests/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Offline — 0' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Gaming — 0' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Online — 24' }));
+    expect(screen.getAllByRole('button', { name: /^Friend \d+$/ })).toHaveLength(24);
   });
 });

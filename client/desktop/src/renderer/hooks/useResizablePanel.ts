@@ -1,100 +1,116 @@
-import { useState, useCallback, useRef, useEffect, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 
 interface UseResizablePanelOptions {
-  defaultWidth: number;
+  width: number;
   minWidth: number;
   maxWidth: number;
   /** 'left' = drag handle is on the right edge, 'right' = drag handle is on the left edge */
   side: 'left' | 'right';
-  storageKey?: string;
+  disabled?: boolean;
+  onWidthCommit: (width: number) => void;
 }
 
 export function useResizablePanel({
-  defaultWidth,
+  width,
   minWidth,
   maxWidth,
   side,
-  storageKey,
+  disabled = false,
+  onWidthCommit,
 }: UseResizablePanelOptions) {
-  const [width, setWidth] = useState(() => {
-    if (storageKey) {
-      const saved = localStorage.getItem(storageKey);
-      if (saved) {
-        const parsed = Number.parseInt(saved, 10);
-        if (!Number.isNaN(parsed) && parsed >= minWidth && parsed <= maxWidth) return parsed;
-      }
-    }
-    return defaultWidth;
-  });
-
+  const [draftWidth, setDraftWidth] = useState<number | null>(null);
   const isDraggingRef = useRef(false);
   const startXRef = useRef(0);
   const startWidthRef = useRef(0);
+  const draftWidthRef = useRef(width);
+  const minWidthRef = useRef(minWidth);
+  const maxWidthRef = useRef(maxWidth);
+  const sideRef = useRef(side);
+  const onWidthCommitRef = useRef(onWidthCommit);
+  const previousCursorRef = useRef('');
+  const previousUserSelectRef = useRef('');
+  const isResizing = draftWidth !== null;
+
+  useEffect(() => {
+    onWidthCommitRef.current = onWidthCommit;
+  }, [onWidthCommit]);
 
   const onMouseDown = useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault();
+    (event: React.MouseEvent) => {
+      if (disabled || isDraggingRef.current) return;
+
+      event.preventDefault();
       isDraggingRef.current = true;
-      startXRef.current = e.clientX;
+      startXRef.current = event.clientX;
       startWidthRef.current = width;
+      draftWidthRef.current = width;
+      minWidthRef.current = minWidth;
+      maxWidthRef.current = maxWidth;
+      sideRef.current = side;
+      previousCursorRef.current = document.body.style.cursor;
+      previousUserSelectRef.current = document.body.style.userSelect;
       document.body.style.cursor = 'col-resize';
       document.body.style.userSelect = 'none';
+      setDraftWidth(width);
     },
-    [width]
+    [disabled, maxWidth, minWidth, side, width]
   );
 
   useEffect(() => {
-    const onMouseMove = (e: MouseEvent) => {
-      if (!isDraggingRef.current) return;
-      const delta = e.clientX - startXRef.current;
-      const newWidth =
-        side === 'left' ? startWidthRef.current + delta : startWidthRef.current - delta;
-      const clamped = Math.max(minWidth, Math.min(maxWidth, newWidth));
-      setWidth(clamped);
+    if (!isResizing) return;
+
+    const onMouseMove = (event: MouseEvent) => {
+      const delta = event.clientX - startXRef.current;
+      const nextWidth =
+        sideRef.current === 'left' ? startWidthRef.current + delta : startWidthRef.current - delta;
+      const clamped = Math.max(minWidthRef.current, Math.min(maxWidthRef.current, nextWidth));
+      draftWidthRef.current = clamped;
+      setDraftWidth(clamped);
     };
 
     const onMouseUp = () => {
       if (!isDraggingRef.current) return;
+      const committedWidth = draftWidthRef.current;
       isDraggingRef.current = false;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      if (storageKey) {
-        // Persist after drag ends — read latest width from DOM to avoid stale closure
-        setWidth((current) => {
-          localStorage.setItem(storageKey, String(current));
-          return current;
-        });
-      }
+      setDraftWidth(null);
+      onWidthCommitRef.current(committedWidth);
     };
 
     globalThis.addEventListener('mousemove', onMouseMove);
     globalThis.addEventListener('mouseup', onMouseUp);
     return () => {
+      isDraggingRef.current = false;
       globalThis.removeEventListener('mousemove', onMouseMove);
       globalThis.removeEventListener('mouseup', onMouseUp);
+      document.body.style.cursor = previousCursorRef.current;
+      document.body.style.userSelect = previousUserSelectRef.current;
     };
-  }, [minWidth, maxWidth, side, storageKey]);
+  }, [isResizing]);
 
   const onKeyDown = useCallback(
-    (e: KeyboardEvent) => {
-      let step = 0;
-      const large = e.shiftKey ? 5 : 1;
-      if (e.key === 'ArrowRight') {
-        step = (side === 'left' ? 10 : -10) * large;
-      } else if (e.key === 'ArrowLeft') {
-        step = (side === 'left' ? -10 : 10) * large;
+    (event: KeyboardEvent) => {
+      if (disabled) return;
+
+      const multiplier = event.shiftKey ? 5 : 1;
+      let step: number;
+      if (event.key === 'ArrowRight') {
+        step = (side === 'left' ? 10 : -10) * multiplier;
+      } else if (event.key === 'ArrowLeft') {
+        step = (side === 'left' ? -10 : 10) * multiplier;
       } else {
         return;
       }
-      e.preventDefault();
-      setWidth((prev) => {
-        const next = Math.max(minWidth, Math.min(maxWidth, prev + step));
-        if (storageKey) localStorage.setItem(storageKey, String(next));
-        return next;
-      });
+
+      event.preventDefault();
+      onWidthCommit(Math.max(minWidth, Math.min(maxWidth, width + step)));
     },
-    [side, minWidth, maxWidth, storageKey]
+    [disabled, maxWidth, minWidth, onWidthCommit, side, width]
   );
 
-  return { width, onMouseDown, onKeyDown };
+  return {
+    width: draftWidth ?? width,
+    isResizing,
+    onMouseDown,
+    onKeyDown,
+  };
 }

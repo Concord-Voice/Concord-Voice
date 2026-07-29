@@ -80,7 +80,7 @@ describe('ServerBar', () => {
       isLoading: false,
     });
     render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
-    expect(screen.getByLabelText('Toggle channel panel')).toBeInTheDocument();
+    expect(screen.getByLabelText('Test Server server')).toBeInTheDocument();
   });
 
   it('shows placeholder when no active server', () => {
@@ -285,56 +285,6 @@ describe('ServerBar', () => {
 
       const pmButton = screen.getByLabelText('Direct Messages');
       expect(pmButton.querySelector('.server-bar-badge')).toBeInTheDocument();
-    });
-  });
-
-  // ── Pin state is NOT toggled by icon clicks (#188) ──────────────────────
-  // Regression guard: clicking the active-server icon (or PM icon) while the
-  // channel panel is pinned used to call toggleChannelPin() → surprising
-  // unpin, and it bypassed the interface lock. Now those clicks never change
-  // the pin state; when unpinned they only peek (show the hover overlay).
-  describe('channel-panel pin is not toggled by sticky-icon clicks (#188)', () => {
-    beforeEach(() => {
-      useServerStore.setState({
-        servers: [mockServer],
-        activeServerId: mockServer.id,
-        isLoading: false,
-        fetchServers: vi.fn() as unknown as () => Promise<void>,
-      });
-    });
-
-    it('does not unpin when the pinned active-server icon is clicked (on /app)', () => {
-      window.history.pushState({}, '', '/app');
-      useLayoutStore.setState({ channelPanelPinned: true, channelPanelHoverVisible: false });
-      render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
-      fireEvent.click(screen.getByLabelText('Toggle channel panel'));
-      expect(useLayoutStore.getState().channelPanelPinned).toBe(true);
-    });
-
-    it('peeks without pinning when the unpinned active-server icon is clicked (on /app)', () => {
-      window.history.pushState({}, '', '/app');
-      useLayoutStore.setState({ channelPanelPinned: false, channelPanelHoverVisible: false });
-      render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
-      fireEvent.click(screen.getByLabelText('Toggle channel panel'));
-      expect(useLayoutStore.getState().channelPanelHoverVisible).toBe(true);
-      expect(useLayoutStore.getState().channelPanelPinned).toBe(false);
-    });
-
-    it('does not unpin when the pinned PM icon is clicked (on /app/dms)', () => {
-      window.history.pushState({}, '', '/app/dms');
-      useLayoutStore.setState({ channelPanelPinned: true, channelPanelHoverVisible: false });
-      render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
-      fireEvent.click(screen.getByLabelText('Direct Messages'));
-      expect(useLayoutStore.getState().channelPanelPinned).toBe(true);
-    });
-
-    it('peeks without pinning when the unpinned PM icon is clicked (on /app/dms)', () => {
-      window.history.pushState({}, '', '/app/dms');
-      useLayoutStore.setState({ channelPanelPinned: false, channelPanelHoverVisible: false });
-      render(<ServerBar onOpenActionModal={onOpenActionModal} onContextMenu={onContextMenu} />);
-      fireEvent.click(screen.getByLabelText('Direct Messages'));
-      expect(useLayoutStore.getState().channelPanelHoverVisible).toBe(true);
-      expect(useLayoutStore.getState().channelPanelPinned).toBe(false);
     });
   });
 });

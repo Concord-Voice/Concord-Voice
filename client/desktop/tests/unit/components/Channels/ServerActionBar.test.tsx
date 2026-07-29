@@ -1,4 +1,5 @@
 import { render, screen, fireEvent } from '../../../test-utils';
+import { resetAllStores } from '../../../helpers/store-helpers';
 import { useInviteStore } from '@/renderer/stores/inviteStore';
 import { usePermissionStore } from '@/renderer/stores/permissionStore';
 import ServerActionBar from '@/renderer/components/Channels/ServerActionBar';
@@ -24,6 +25,7 @@ describe('ServerActionBar', () => {
   const memberServer: ServerWithRole = { ...mockServer, role: 'member' };
 
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
     useInviteStore.setState({ invites: {}, isLoading: false, error: null });
     // Default to owner permissions; individual tests override as needed
@@ -42,6 +44,53 @@ describe('ServerActionBar', () => {
     );
     expect(screen.getByText('Add')).toBeInTheDocument();
     expect(screen.getByText('Invite')).toBeInTheDocument();
+  });
+
+  it('renders compact actions as icon-only controls', () => {
+    render(
+      <ServerActionBar
+        compact
+        server={ownerServer}
+        onOpenCreateModal={mockOnOpenCreateModal}
+        onOpenCreateCategoryModal={mockOnOpenCreateCategoryModal}
+      />
+    );
+
+    expect(screen.getByRole('button', { name: 'Add' })).toHaveAttribute('title', 'Add');
+    expect(screen.getByRole('button', { name: 'Invite' })).toHaveAttribute('title', 'Invite');
+    expect(screen.getByRole('button', { name: 'Settings' })).toHaveAttribute('title', 'Settings');
+    expect(screen.queryByText('Add')).not.toBeInTheDocument();
+    expect(screen.queryByText('Invite')).not.toBeInTheDocument();
+    expect(screen.queryByText('Settings')).not.toBeInTheDocument();
+  });
+
+  it('opens compact Add and Invite surfaces outward from their icons', () => {
+    render(
+      <ServerActionBar
+        compact
+        server={ownerServer}
+        onOpenCreateModal={mockOnOpenCreateModal}
+        onOpenCreateCategoryModal={mockOnOpenCreateCategoryModal}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+    expect(screen.getByRole('region', { name: 'Add channel or category' })).toHaveAttribute(
+      'data-placement',
+      'right'
+    );
+    expect(screen.getByRole('button', { name: 'Channel' })).toHaveFocus();
+    fireEvent.click(screen.getByRole('button', { name: 'Channel' }));
+    expect(mockOnOpenCreateModal).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Invite' }));
+    expect(screen.getByRole('region', { name: 'Invite people to this server' })).toHaveAttribute(
+      'data-placement',
+      'right'
+    );
+    expect(screen.getByRole('button', { name: 'Generate Code' })).toHaveFocus();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.getByRole('button', { name: 'Invite' })).toHaveFocus();
   });
 
   it('renders Add and Invite buttons for admin', () => {

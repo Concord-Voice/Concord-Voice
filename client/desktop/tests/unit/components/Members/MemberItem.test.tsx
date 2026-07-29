@@ -3,6 +3,7 @@ import MemberItem from '@/renderer/components/Members/MemberItem';
 import { vi } from 'vitest';
 import type { ServerMember, PresenceStatus } from '@/renderer/stores/memberStore';
 import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 vi.mock('@/renderer/utils/schemeColors', () => ({
   resolveUserAccentColors: vi.fn(() => null),
@@ -28,8 +29,8 @@ const defaultProps = {
 
 describe('MemberItem', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
-    useRichPresenceStore.getState().reset();
   });
 
   it('renders as a button element', () => {
@@ -151,5 +152,27 @@ describe('MemberItem', () => {
       <MemberItem {...defaultProps} member={makeMember({ user_id: 'u1' })} />
     );
     expect(container.querySelector('.member-custom-status')).not.toBeInTheDocument();
+  });
+
+  it('renders a compact avatar button with the member name and presence in its accessible name', () => {
+    const member = makeMember({ username: 'alice', display_name: 'Alice' });
+    render(<MemberItem {...defaultProps} member={member} compact />);
+
+    const button = screen.getByRole('button', { name: 'Alice — Online' });
+    expect(button).toHaveClass('member-item--compact', 'online');
+    expect(screen.getByText('A')).toBeInTheDocument();
+    expect(screen.queryByText('Alice')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['offline', 'Offline'],
+    ['invisible', 'Offline'],
+  ] as const)('keeps compact %s members focusable and announces them as %s', (status, label) => {
+    const member = makeMember({ username: 'alice', display_name: 'Alice' });
+    render(<MemberItem {...defaultProps} member={member} status={status} compact />);
+
+    const button = screen.getByRole('button', { name: `Alice — ${label}` });
+    expect(button).toHaveClass(status);
+    expect(button).not.toHaveAttribute('tabindex', '-1');
   });
 });

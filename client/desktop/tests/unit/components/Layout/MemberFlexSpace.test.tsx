@@ -1,93 +1,90 @@
-import { render, screen } from '../../../test-utils';
+import { fireEvent, render, screen } from '../../../test-utils';
+import { resetAllStores } from '../../../helpers/store-helpers';
+import { useAuthStore } from '@/renderer/stores/authStore';
 import { useLayoutStore } from '@/renderer/stores/layoutStore';
 import { useServerStore } from '@/renderer/stores/serverStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { mockUser, mockServer, mockMember } from '../../../mocks/fixtures';
-
-// Mock MemberList to prevent complex rendering
-vi.mock('@/renderer/components/Members/MemberList', () => ({
-  default: () => <div data-testid="member-list">Member List</div>,
-}));
-
-// Mock useResizablePanel
-vi.mock('@/renderer/hooks/useResizablePanel', () => ({
-  useResizablePanel: () => ({
-    width: 260,
-    onMouseDown: vi.fn(),
-    onKeyDown: vi.fn(),
-  }),
-}));
-
-// Mock apiFetch
-vi.mock('@/renderer/services/apiClient', () => ({
-  apiFetch: vi.fn().mockResolvedValue({
-    ok: true,
-    json: async () => ({ members: [] }),
-  }),
-  API_BASE: 'http://localhost:8080',
-}));
-
+import { mockServer } from '../../../mocks/fixtures';
 import MemberFlexSpace from '@/renderer/components/Layout/MemberFlexSpace';
+import { DockOverlayProvider } from '@/renderer/components/Layout/DockShell';
+
+vi.mock('@/renderer/components/Members/MemberList', () => ({
+  default: ({ compact }: { compact?: boolean }) => (
+    <div data-testid="member-list" data-compact={String(compact)}>
+      Member List
+    </div>
+  ),
+}));
+
+const renderMembers = () =>
+  render(
+    <DockOverlayProvider>
+      <MemberFlexSpace />
+    </DockOverlayProvider>
+  );
 
 describe('MemberFlexSpace', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    resetAllStores();
+    useAuthStore.getState().setAccessToken('mock-token');
     useServerStore.setState({ servers: [mockServer], activeServerId: 'server-1' });
-    useUserStore.setState({ user: mockUser });
-    useMemberStore.setState({
-      members: [mockMember],
-      onlineUserIds: new Set(['user-1']),
-      userStatuses: new Map([['user-1', 'online']]),
-      selfStatus: 'online',
+    useLayoutStore.setState({
+      sidebarLayoutsDecoupled: true,
+      sidebarProfiles: {
+        dm: {
+          left: { width: 212, pinned: true },
+          right: { width: 294, pinned: true },
+        },
+        server: {
+          left: { width: 318, pinned: true },
+          right: { width: 306, pinned: true },
+        },
+      },
+      interfaceLocked: false,
     });
-    useLayoutStore.setState({ memberPanelMode: 'expanded', interfaceLocked: false });
   });
 
-  it('renders nothing when no active server', () => {
+  it('renders nothing without an active server', () => {
     useServerStore.setState({ activeServerId: null });
-    const { container } = render(<MemberFlexSpace />);
-    expect(container.innerHTML).toBe('');
+    const { container } = renderMembers();
+    expect(container).toBeEmptyDOMElement();
   });
 
-  it('renders member list when expanded', () => {
-    render(<MemberFlexSpace />);
+  it('adapts the existing member list into the Server right dock', () => {
+    const { container } = renderMembers();
+
     expect(screen.getByTestId('member-list')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Unpin Members sidebar' })).toBeInTheDocument();
+    expect(container.querySelector('.dock-shell__surface')).toHaveStyle({ width: '306px' });
   });
 
-  it('renders toggle button when hidden', () => {
-    useLayoutStore.setState({ memberPanelMode: 'hidden' });
-    render(<MemberFlexSpace />);
-    expect(screen.getByLabelText('Toggle member panel')).toBeInTheDocument();
+  it('commits right-side keyboard resizing to the Server profile', () => {
+    renderMembers();
+    fireEvent.keyDown(screen.getByRole('separator', { name: 'Resize Members sidebar' }), {
+      key: 'ArrowLeft',
+    });
+
+    expect(useLayoutStore.getState().sidebarProfiles.server.right.width).toBe(316);
+    expect(useLayoutStore.getState().sidebarProfiles.dm.right.width).toBe(294);
   });
 
-  it('renders collapsed avatar strip', () => {
-    useLayoutStore.setState({ memberPanelMode: 'collapsed' });
-    const { container } = render(<MemberFlexSpace />);
-    expect(container.querySelector('.member-panel-collapsed')).toBeInTheDocument();
-    expect(screen.getByLabelText('Expand member list')).toBeInTheDocument();
+  it('passes the dock compact presentation to the existing member list', () => {
+    useLayoutStore.setState((state) => ({
+      sidebarProfiles: {
+        ...state.sidebarProfiles,
+        server: {
+          ...state.sidebarProfiles.server,
+          right: { ...state.sidebarProfiles.server.right, width: 120 },
+        },
+      },
+    }));
+
+    renderMembers();
+    expect(screen.getByTestId('member-list')).toHaveAttribute('data-compact', 'true');
   });
 
-  it('shows member avatar initial in collapsed mode', () => {
-    useLayoutStore.setState({ memberPanelMode: 'collapsed' });
-    render(<MemberFlexSpace />);
-    // mockMember.username starts with 't'
-    expect(screen.getByText('T')).toBeInTheDocument();
-  });
-
-  it('resize handle is keyboard-accessible with aria-label', () => {
-    useLayoutStore.setState({ memberPanelMode: 'expanded' });
-    render(<MemberFlexSpace />);
-    const handle = screen.getByLabelText('Resize member panel');
-    expect(handle).toBeInTheDocument();
-    expect(handle).toHaveAttribute('tabindex', '0');
-  });
-
-  // Interface lock (#188) — the member-panel resize handle is removed when
-  // locked, freezing the current width.
-  it('removes the resize handle when the interface is locked', () => {
-    useLayoutStore.setState({ memberPanelMode: 'expanded', interfaceLocked: true });
-    render(<MemberFlexSpace />);
-    expect(screen.queryByLabelText('Resize member panel')).not.toBeInTheDocument();
+  it('uses the shared right-edge lip when unpinned', () => {
+    useLayoutStore.getState().setSidebarPinned('server', 'right', false);
+    renderMembers();
+    expect(screen.getByRole('button', { name: 'Open Members sidebar' })).toBeInTheDocument();
   });
 });

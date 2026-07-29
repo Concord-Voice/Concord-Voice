@@ -101,7 +101,9 @@ const themes: { value: AppearanceSettings['theme']; label: string; icon: React.R
 // can be unit-tested in isolation against the real layoutStore.
 export const LayoutSection: React.FC = () => {
   const interfaceLocked = useLayoutStore((s) => s.interfaceLocked);
+  const sidebarLayoutsDecoupled = useLayoutStore((s) => s.sidebarLayoutsDecoupled);
   const setInterfaceLocked = useLayoutStore((s) => s.setInterfaceLocked);
+  const setSidebarLayoutsDecoupled = useLayoutStore((s) => s.setSidebarLayoutsDecoupled);
 
   return (
     <CollapsibleSection id="section-layout" title="Layout">
@@ -114,6 +116,22 @@ export const LayoutSection: React.FC = () => {
           </span>
         </div>
         <ToggleSwitch checked={interfaceLocked} onChange={setInterfaceLocked} />
+      </div>
+      <div className="settings-row">
+        <div className="settings-row-info">
+          <span className="settings-row-label">Use separate DM and server sidebar layouts</span>
+          <span className="settings-row-hint">
+            {interfaceLocked
+              ? 'Unlock Interface to change sidebar layout settings.'
+              : 'Save different sidebar widths and pin states for direct messages and servers. When disabled, changes made in either view use the DM layout everywhere.'}
+          </span>
+        </div>
+        <ToggleSwitch
+          checked={sidebarLayoutsDecoupled}
+          onChange={setSidebarLayoutsDecoupled}
+          disabled={interfaceLocked}
+          label="Use separate DM and server sidebar layouts"
+        />
       </div>
     </CollapsibleSection>
   );

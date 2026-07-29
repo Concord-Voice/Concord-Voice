@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, useId, useRef, useMemo } from 'react';
 import { useServerStore } from '../../stores/serverStore';
 import { useUserStore } from '../../stores/userStore';
 import { useMemberStore, ServerMember, PresenceStatus } from '../../stores/memberStore';
@@ -9,9 +9,109 @@ import MemberContextMenu from './MemberContextMenu';
 import UserProfileModal from './UserProfileModal';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
 import { apiFetch, safeJson } from '../../services/apiClient';
+import { Search, Users } from 'lucide-react';
+import { AttributedPopover } from '../Layout/AttributedPopover';
 import './MemberList.css';
 
-const MemberList: React.FC = () => {
+interface MemberListProps {
+  compact?: boolean;
+}
+
+interface MemberGroup {
+  key: string;
+  label: string;
+  emoji?: string;
+  color?: string;
+  members: ServerMember[];
+}
+
+interface OpenMemberGroup {
+  key: string;
+  anchor: HTMLElement;
+}
+
+interface CompactMemberGroupsProps {
+  groups: MemberGroup[];
+  openGroup: OpenMemberGroup | null;
+  selectedGroup?: MemberGroup;
+  triggerId: string;
+  getMemberStatus: (userId: string) => PresenceStatus;
+  onMemberClick: (event: React.MouseEvent, member: ServerMember) => void;
+  onMemberContextMenu: (event: React.MouseEvent, member: ServerMember) => void;
+  setOpenGroup: React.Dispatch<React.SetStateAction<OpenMemberGroup | null>>;
+}
+
+const CompactMemberGroups: React.FC<CompactMemberGroupsProps> = ({
+  groups,
+  openGroup,
+  selectedGroup,
+  triggerId,
+  getMemberStatus,
+  onMemberClick,
+  onMemberContextMenu,
+  setOpenGroup,
+}) => (
+  <>
+    <nav className="member-compact-rail" aria-label="Member groups">
+      {groups.map((group) => {
+        const isOpen = openGroup?.key === group.key;
+        return (
+          <button
+            key={group.key}
+            id={`${triggerId}-members-${group.key}`}
+            type="button"
+            className="member-compact-trigger"
+            aria-expanded={isOpen}
+            aria-controls={`member-group-${group.key}`}
+            aria-label={`${group.label} — ${group.members.length}`}
+            title={group.label}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              const anchor = event.currentTarget;
+              setOpenGroup((current) =>
+                current?.key === group.key ? null : { key: group.key, anchor }
+              );
+            }}
+            style={group.color ? { color: group.color } : undefined}
+          >
+            {group.emoji ? (
+              <span className="member-compact-emoji">{group.emoji}</span>
+            ) : (
+              <Users size={20} aria-hidden="true" />
+            )}
+            <span className="member-compact-trigger-count" aria-hidden="true">
+              {group.members.length}
+            </span>
+          </button>
+        );
+      })}
+    </nav>
+    {selectedGroup && openGroup && (
+      <AttributedPopover
+        id={`member-group-${selectedGroup.key}`}
+        anchor={openGroup.anchor}
+        label={`${selectedGroup.label} — ${selectedGroup.members.length}`}
+        open
+        onClose={() => setOpenGroup(null)}
+      >
+        <div className="member-compact-grid">
+          {selectedGroup.members.map((member) => (
+            <MemberItem
+              key={member.user_id}
+              member={member}
+              status={getMemberStatus(member.user_id)}
+              onClick={onMemberClick}
+              onContextMenu={onMemberContextMenu}
+              compact
+            />
+          ))}
+        </div>
+      </AttributedPopover>
+    )}
+  </>
+);
+
+const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
   const activeServerId = useServerStore((state) => state.activeServerId);
   const servers = useServerStore((state) => state.servers);
   const activeServer = servers.find((s) => s.id === activeServerId) || null;
@@ -41,6 +141,9 @@ const MemberList: React.FC = () => {
   const [fullProfileUserId, setFullProfileUserId] = useState<string | null>(null);
   const [banTarget, setBanTarget] = useState<ServerMember | null>(null);
   const [kickTarget, setKickTarget] = useState<ServerMember | null>(null);
+  const [openGroup, setOpenGroup] = useState<OpenMemberGroup | null>(null);
+  const [searchAnchor, setSearchAnchor] = useState<HTMLElement | null>(null);
+  const compactTriggerId = useId();
 
   // Derive live member data from store (not stale snapshots)
   const selectedMemberData = selectedMember
@@ -74,6 +177,15 @@ const MemberList: React.FC = () => {
       clearMembers();
     }
   }, [activeServerId, fetchMembers, fetchRoles, clearMembers]);
+
+  useEffect(() => {
+    if (!compact) {
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- compact triggers unmount in standard mode, so its detached popover state must be discarded
+      setOpenGroup(null);
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- compact search uses a detached trigger that must not survive standard mode
+      setSearchAnchor(null);
+    }
+  }, [compact]);
 
   // Presence is handled globally in useWebSocket (presence_snapshot + presence events)
 
@@ -161,13 +273,7 @@ const MemberList: React.FC = () => {
 
     // Build groups: each member appears in their highest-position display_separately role
     const assignedUserIds = new Set<string>();
-    const groups: Array<{
-      key: string;
-      label: string;
-      emoji?: string;
-      color?: string;
-      members: ServerMember[];
-    }> = [];
+    const groups: MemberGroup[] = [];
 
     for (const role of displayRoles) {
       const roleMembers = filteredMembers.filter((m) => {
@@ -216,13 +322,7 @@ const MemberList: React.FC = () => {
     // eslint-disable-next-line @eslint-react/exhaustive-deps -- voice state (useVoiceStore) is read synchronously inside the computation but intentionally omitted from deps: member grouping recomputes on roster/role/server changes, and voice-presence badging is separately reactive through the store subscription on the rendered rows — including voice state here would re-run the entire grouping on every mic-unmute event
   }, [filteredMembers, serverRoles, activeServerId, sortMembers]);
 
-  const renderGroup = (group: {
-    key: string;
-    label: string;
-    emoji?: string;
-    color?: string;
-    members: ServerMember[];
-  }) => {
+  const renderGroup = (group: MemberGroup) => {
     if (group.members.length === 0) return null;
     const isCollapsed = collapsedGroups.has(group.key);
     return (
@@ -266,14 +366,66 @@ const MemberList: React.FC = () => {
     );
   };
 
+  const selectedGroup = openGroup
+    ? roleGroups.find((group) => group.key === openGroup.key)
+    : undefined;
+  const activeSearchAnchor = compact && searchAnchor?.isConnected ? searchAnchor : null;
+
+  useEffect(() => {
+    if (openGroup && (!selectedGroup || !openGroup.anchor.isConnected)) {
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- live grouping can remove a compact trigger while retaining this component; discard its detached anchor before the key can reappear
+      setOpenGroup(null);
+    }
+  }, [openGroup, selectedGroup]);
+
   return (
-    <div className="member-list">
-      <div className="member-list-header">
-        <h3>Members</h3>
-      </div>
+    <div className={`member-list${compact ? ' member-list--compact' : ''}`}>
+      {!compact && (
+        <div className="member-list-header">
+          <h3>Members</h3>
+        </div>
+      )}
 
       {/* Search */}
-      {members.length > 0 && (
+      {compact && members.length > 0 && (
+        <>
+          <button
+            id={`${compactTriggerId}-member-search`}
+            type="button"
+            className="member-compact-trigger member-search-trigger"
+            aria-label="Search members"
+            title="Search members"
+            aria-expanded={activeSearchAnchor !== null}
+            aria-controls={`${compactTriggerId}-member-search-popover`}
+            onClick={(event) => {
+              const anchor = event.currentTarget;
+              setSearchAnchor((current) => (current === anchor ? null : anchor));
+            }}
+          >
+            <Search size={20} aria-hidden="true" />
+          </button>
+          <AttributedPopover
+            id={`${compactTriggerId}-member-search-popover`}
+            anchor={activeSearchAnchor}
+            label="Search members"
+            open={activeSearchAnchor !== null}
+            placement="left"
+            onClose={() => setSearchAnchor(null)}
+          >
+            <div className="member-list-search member-list-search--popover">
+              <input
+                type="text"
+                className="member-list-search-input"
+                placeholder="Search members..."
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                autoFocus
+              />
+            </div>
+          </AttributedPopover>
+        </>
+      )}
+      {!compact && members.length > 0 && (
         <div className="member-list-search">
           <input
             type="text"
@@ -324,7 +476,21 @@ const MemberList: React.FC = () => {
       )}
 
       {/* Member Groups */}
-      {filteredMembers.length > 0 && <>{roleGroups.map((group) => renderGroup(group))}</>}
+      {filteredMembers.length > 0 &&
+        (compact ? (
+          <CompactMemberGroups
+            groups={roleGroups}
+            openGroup={openGroup}
+            selectedGroup={selectedGroup}
+            triggerId={compactTriggerId}
+            getMemberStatus={getMemberStatus}
+            onMemberClick={handleMemberClick}
+            onMemberContextMenu={handleMemberContextMenu}
+            setOpenGroup={setOpenGroup}
+          />
+        ) : (
+          <>{roleGroups.map((group) => renderGroup(group))}</>
+        ))}
 
       {/* Profile Card */}
       {selectedMember && selectedMemberData && (

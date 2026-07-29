@@ -245,12 +245,13 @@ const CategoryGroupHeader: React.FC<CategoryGroupHeaderProps> = React.memo(
         className="channel-group-header__toggle"
         onClick={() => onToggleCollapsed(group.id)}
         aria-expanded={!isCollapsed}
+        title={group.name}
         {...(group.name ? { 'aria-label': group.name } : {})}
       >
         <span className="channel-group-header__chevron">
           {isCollapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
         </span>
-        <span>{(group.name ?? '').toUpperCase()}</span>
+        <span className="channel-group-header__name">{(group.name ?? '').toUpperCase()}</span>
         {isCollapsed && groupVoiceUsers.length > 0 && (
           <CollapsedVoiceAvatars voiceUsers={groupVoiceUsers} />
         )}
@@ -293,12 +294,14 @@ const CollapsedVoiceAvatars: React.FC<{ voiceUsers: ChannelVoiceMember[] }> = Re
 CollapsedVoiceAvatars.displayName = 'CollapsedVoiceAvatars';
 
 interface ChannelListProps {
+  compact?: boolean;
   onContextMenu: (channel: Channel, position: { x: number; y: number }) => void;
   onEmptyContextMenu: (position: { x: number; y: number }) => void;
   onCategoryContextMenu: (group: ChannelGroup, position: { x: number; y: number }) => void;
 }
 
 const ChannelList: React.FC<ChannelListProps> = ({
+  compact = false,
   onContextMenu,
   onEmptyContextMenu,
   onCategoryContextMenu,
@@ -956,6 +959,8 @@ const ChannelList: React.FC<ChannelListProps> = ({
           channel={channel}
           isActive={isActive}
           unread={unread}
+          compact={compact}
+          isMuted={channelMuted}
           isGrouped={isGrouped}
           isLastInGroup={isLastInGroup}
           voiceMembers={voiceMembers}
@@ -991,6 +996,7 @@ const ChannelList: React.FC<ChannelListProps> = ({
     },
     [
       activeChannelId,
+      compact,
       unreadCounts,
       mutedChannels,
       mutedServers,
@@ -1024,7 +1030,7 @@ const ChannelList: React.FC<ChannelListProps> = ({
   // No server selected
   if (!activeServerId) {
     return (
-      <div className="channel-list">
+      <div className={`channel-list${compact ? ' channel-list--compact' : ''}`}>
         <div className="channel-list-empty">
           <p>Select a server to view channels</p>
         </div>
@@ -1032,12 +1038,14 @@ const ChannelList: React.FC<ChannelListProps> = ({
     );
   }
 
+  const ChannelListContainer: 'nav' | 'div' = compact ? 'nav' : 'div';
+
   return (
-    <div
-      className="channel-list"
-      role="tree"
+    <ChannelListContainer
+      className={`channel-list${compact ? ' channel-list--compact' : ''}`}
+      role={compact ? undefined : 'tree'}
       aria-label="Server channels"
-      tabIndex={0}
+      tabIndex={compact ? undefined : 0}
       onContextMenu={handleEmptyContextMenu}
       onDragOver={canReorder ? (e) => e.preventDefault() : undefined}
       onDrop={canReorder ? handleDrop : undefined}
@@ -1207,7 +1215,7 @@ const ChannelList: React.FC<ChannelListProps> = ({
           }}
         />
       )}
-    </div>
+    </ChannelListContainer>
   );
 };
 

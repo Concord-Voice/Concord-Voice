@@ -40,6 +40,8 @@ function initSyncServiceDeps() {
     getLayout: () => {
       const s = useLayoutStore.getState();
       return {
+        sidebarProfiles: s.sidebarProfiles,
+        sidebarLayoutsDecoupled: s.sidebarLayoutsDecoupled,
         channelPanelPinned: s.channelPanelPinned,
         channelPanelWidth: s.channelPanelWidth,
         memberPanelMode: s.memberPanelMode,
@@ -51,6 +53,8 @@ function initSyncServiceDeps() {
       };
     },
     setLayout: (patch) => useLayoutStore.setState(patch),
+    applySidebarPreferences: (profiles, decoupled) =>
+      useLayoutStore.getState().applySidebarPreferences(profiles, decoupled),
   });
 }
 
@@ -74,6 +78,17 @@ describe('preferencesSyncService — extended', () => {
       },
     });
     useLayoutStore.setState({
+      sidebarProfiles: {
+        dm: {
+          left: { width: 240, pinned: true },
+          right: { width: 260, pinned: true },
+        },
+        server: {
+          left: { width: 240, pinned: true },
+          right: { width: 260, pinned: true },
+        },
+      },
+      sidebarLayoutsDecoupled: false,
       channelPanelPinned: true,
       channelPanelWidth: 240,
       memberPanelMode: 'expanded',
@@ -82,6 +97,7 @@ describe('preferencesSyncService — extended', () => {
       folderBarHeight: 32,
       serverFolders: [],
       serverOrder: [],
+      interfaceLocked: false,
     });
     useAuthStore.getState().setAccessToken('mock-token');
     vi.mocked(e2eeService.encryptPreferences).mockResolvedValue('encrypted-blob');
@@ -91,7 +107,7 @@ describe('preferencesSyncService — extended', () => {
   });
 
   describe('fetchAndApply — layout clamping', () => {
-    it('clamps layout values to valid ranges', async () => {
+    it('rejects invalid legacy widths and clamps current scalar fields', async () => {
       vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({
         v: 1,
         settings: {
@@ -102,9 +118,9 @@ describe('preferencesSyncService — extended', () => {
         },
         layout: {
           channelPanelPinned: true,
-          channelPanelWidth: 9999, // Should be clamped to 400
+          channelPanelWidth: 9999,
           memberPanelMode: 'expanded',
-          memberPanelWidth: 10, // Should be clamped to 160
+          memberPanelWidth: 10,
           serverBarHeight: 0, // Should be clamped to 36
           folderBarHeight: 100, // Should be clamped to 48
           serverFolders: [],
@@ -122,8 +138,8 @@ describe('preferencesSyncService — extended', () => {
 
       await preferencesSyncService.fetchAndApply();
 
-      expect(useLayoutStore.getState().channelPanelWidth).toBe(400);
-      expect(useLayoutStore.getState().memberPanelWidth).toBe(160);
+      expect(useLayoutStore.getState().sidebarProfiles.dm.left.width).toBe(240);
+      expect(useLayoutStore.getState().sidebarProfiles.server.right.width).toBe(260);
       expect(useLayoutStore.getState().serverBarHeight).toBe(36);
       expect(useLayoutStore.getState().folderBarHeight).toBe(48);
     });
@@ -169,28 +185,30 @@ describe('preferencesSyncService — extended', () => {
   });
 
   describe('fetchAndApply — decryption failure', () => {
-    it('re-encrypts and pushes when decryption fails', async () => {
-      vi.mocked(e2eeService.decryptPreferences).mockRejectedValue(new Error('Decryption failed'));
+    it.each(['authenticated decryption failed', 'malformed preferences JSON'])(
+      'preserves authoritative ciphertext when %s',
+      async (failure) => {
+        vi.mocked(e2eeService.decryptPreferences).mockRejectedValue(new Error(failure));
 
-      let pushCalled = false;
-      server.use(
-        http.get(`${API_BASE}/api/v1/users/me/preferences`, () =>
-          HttpResponse.json({
-            preferences: { encrypted_data: 'old-encrypted', version: 1 },
+        let putCount = 0;
+        server.use(
+          http.get(`${API_BASE}/api/v1/users/me/preferences`, () =>
+            HttpResponse.json({
+              preferences: { encrypted_data: 'authoritative-ciphertext', version: 1 },
+            })
+          ),
+          http.put(`${API_BASE}/api/v1/users/me/preferences`, () => {
+            putCount++;
+            return HttpResponse.json({ version: 2 });
           })
-        ),
-        http.put(`${API_BASE}/api/v1/users/me/preferences`, () => {
-          pushCalled = true;
-          return HttpResponse.json({ version: 2 });
-        })
-      );
+        );
 
-      await preferencesSyncService.fetchAndApply();
+        await preferencesSyncService.fetchAndApply();
 
-      // Should have pushed local state as recovery
-      expect(e2eeService.encryptPreferences).toHaveBeenCalled();
-      expect(pushCalled).toBe(true);
-    });
+        expect(e2eeService.encryptPreferences).not.toHaveBeenCalled();
+        expect(putCount).toBe(0);
+      }
+    );
   });
 
   describe('fetchAndApply — no changes needed', () => {
@@ -243,6 +261,17 @@ describe('preferencesSyncService — extended', () => {
         },
       });
       useLayoutStore.setState({
+        sidebarProfiles: {
+          dm: {
+            left: { width: 310, pinned: false },
+            right: { width: 120, pinned: true },
+          },
+          server: {
+            left: { width: 225, pinned: true },
+            right: { width: 285, pinned: false },
+          },
+        },
+        sidebarLayoutsDecoupled: true,
         channelPanelPinned: false,
         channelPanelWidth: 300,
         memberPanelMode: 'collapsed',
@@ -270,10 +299,22 @@ describe('preferencesSyncService — extended', () => {
             reduceAnimations: true,
           }),
           layout: expect.objectContaining({
+            sidebarProfiles: {
+              dm: {
+                left: { width: 310, pinned: false },
+                right: { width: 120, pinned: true },
+              },
+              server: {
+                left: { width: 225, pinned: true },
+                right: { width: 285, pinned: false },
+              },
+            },
+            sidebarLayoutsDecoupled: true,
             channelPanelPinned: false,
-            channelPanelWidth: 300,
+            channelPanelWidth: 310,
             memberPanelMode: 'collapsed',
-            memberPanelWidth: 200,
+            memberPanelWidth: 120,
+            friendsPanelMode: 'collapsed',
             serverBarHeight: 50,
             folderBarHeight: 40,
             serverFolders: expect.any(Array),
@@ -281,6 +322,8 @@ describe('preferencesSyncService — extended', () => {
           }),
         })
       );
+      const encryptedBlob = vi.mocked(e2eeService.encryptPreferences).mock.calls[0]?.[0];
+      expect(encryptedBlob?.layout).not.toHaveProperty('interfaceLocked');
     });
   });
 
@@ -348,6 +391,27 @@ describe('preferencesSyncService — extended', () => {
       expect(e2eeService.encryptPreferences).not.toHaveBeenCalled();
 
       vi.useRealTimers();
+    });
+
+    it('watches retained profiles and decouple state but ignores legacy mode-only changes', async () => {
+      vi.useFakeTimers();
+      try {
+        preferencesSyncService.startWatching();
+        await vi.advanceTimersByTimeAsync(0);
+        vi.mocked(e2eeService.encryptPreferences).mockClear();
+
+        useLayoutStore.setState({ memberPanelMode: 'collapsed', friendsPanelMode: 'hidden' });
+        await vi.advanceTimersByTimeAsync(3500);
+        expect(e2eeService.encryptPreferences).not.toHaveBeenCalled();
+
+        useLayoutStore.getState().setSidebarWidth('dm', 'left', 280);
+        useLayoutStore.getState().setSidebarLayoutsDecoupled(true);
+        await vi.advanceTimersByTimeAsync(3500);
+        expect(e2eeService.encryptPreferences).toHaveBeenCalledTimes(1);
+      } finally {
+        preferencesSyncService.stopWatching();
+        vi.useRealTimers();
+      }
     });
   });
 

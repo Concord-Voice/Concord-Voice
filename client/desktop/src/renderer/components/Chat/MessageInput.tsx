@@ -10,7 +10,7 @@ import UserPanel from '../User/UserPanel';
 import SyntaxHelpModal from '../Markdown/SyntaxHelpModal';
 import { InviteServerPicker } from './InviteServerPicker';
 import { useClientConfigStore } from '../../stores/clientConfigStore';
-import { useLayoutStore } from '../../stores/layoutStore';
+import { selectSidebarDock, type SidebarContext, useLayoutStore } from '../../stores/layoutStore';
 import { buildAddendum, encodeMentionMeta, type ParsedMention } from '../../utils/mentions';
 import type { AttachmentSummary, MessageWithStatus } from '../../types/chat';
 import { useFileUpload } from '../../hooks/useFileUpload';
@@ -157,7 +157,10 @@ const MessageInput: React.FC<MessageInputProps> = ({
   onCancelReply,
   canAttachFiles = true,
 }) => {
-  const channelPanelPinned = useLayoutStore((s) => s.channelPanelPinned);
+  const sidebarContext: SidebarContext = conversationId ? 'dm' : 'server';
+  const leftPinned = useLayoutStore(
+    (state) => selectSidebarDock(state, sidebarContext, 'left').pinned
+  );
   // L7/L9 (#1301): informational-only premium caps. The message char-limit and
   // attachment-size limit are server-authoritative; these only drive UX hints —
   // NEVER a hard client block (the server re-checks every send/upload).
@@ -921,7 +924,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
           <label className="message-input-box-hit-target" htmlFor={textareaId}>
             <span className="sr-only">Message input</span>
           </label>
-          {!channelPanelPinned && (
+          {!leftPinned && (
             <div className="message-input-user-panel">
               <UserPanel compact />
             </div>

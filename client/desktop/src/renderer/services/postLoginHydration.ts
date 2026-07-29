@@ -31,10 +31,8 @@ export function buildPreferencesSyncDeps(): PreferencesSyncDeps {
     getLayout: () => {
       const s = useLayoutStore.getState();
       return {
-        channelPanelPinned: s.channelPanelPinned,
-        channelPanelWidth: s.channelPanelWidth,
-        memberPanelMode: s.memberPanelMode,
-        memberPanelWidth: s.memberPanelWidth,
+        sidebarProfiles: s.sidebarProfiles,
+        sidebarLayoutsDecoupled: s.sidebarLayoutsDecoupled,
         serverBarHeight: s.serverBarHeight,
         folderBarHeight: s.folderBarHeight,
         serverFolders: s.serverFolders,
@@ -42,6 +40,8 @@ export function buildPreferencesSyncDeps(): PreferencesSyncDeps {
       };
     },
     setLayout: (patch) => useLayoutStore.setState(patch),
+    applySidebarPreferences: (profiles, decoupled) =>
+      useLayoutStore.getState().applySidebarPreferences(profiles, decoupled),
   };
 }
 

@@ -14,7 +14,7 @@ import PersistentVoiceBar from '../Voice/PersistentVoiceBar';
 import VoiceTextChat from '../Voice/VoiceTextChat';
 import UserPanel from '../User/UserPanel';
 import { useVoiceStore } from '../../stores/voiceStore';
-import { useLayoutStore } from '../../stores/layoutStore';
+import { selectSidebarDock, useLayoutStore } from '../../stores/layoutStore';
 
 // New layout components
 import AppLayout from '../Layout/AppLayout';
@@ -114,8 +114,7 @@ const usePipSignalingProxy = (isInVoice: boolean): void => {
     let proxy: PipSignalingProxy | null = null;
     // Capture voiceService ref synchronously for cleanup (avoids async race)
     let capturedVoiceService:
-      | (typeof import('../../services/voiceService'))['voiceService']
-      | null = null;
+      (typeof import('../../services/voiceService'))['voiceService'] | null = null;
 
     import('../../services/voiceService')
       .then(({ voiceService }) => {
@@ -211,7 +210,7 @@ const MainView: React.FC = () => {
   const voiceTextChatWidth = useVoiceStore((s) => s.voiceTextChatWidth);
   const setVoiceTextChatWidth = useVoiceStore((s) => s.setVoiceTextChatWidth);
   const voiceControlsPinned = useVoiceStore((s) => s.voiceControlsPinned);
-  const channelPanelPinned = useLayoutStore((s) => s.channelPanelPinned);
+  const leftPinned = useLayoutStore((state) => selectSidebarDock(state, 'server', 'left').pinned);
   const getLinkedTextChannel = useChannelStore((s) => s.getLinkedTextChannel);
   const fetchServerPermissions = usePermissionStore((s) => s.fetchServerPermissions);
   const activeServerPerms = usePermissionStore(
@@ -272,13 +271,13 @@ const MainView: React.FC = () => {
   };
 
   // ─── Channel panel header content ───
-  const channelHeader = (
+  const channelHeader = (compact: boolean) => (
     <div className="channel-header-info">
       <div className="channel-header-name-row">
-        <h3>{activeServer ? activeServer.name : 'Channels'}</h3>
+        {!compact && <h3>{activeServer ? activeServer.name : 'Channels'}</h3>}
         {activeServer && <ServerE2eeIndicator />}
       </div>
-      <ConnectionStatus />
+      <ConnectionStatus compact={compact} />
     </div>
   );
 
@@ -366,13 +365,14 @@ const MainView: React.FC = () => {
     (isViewingOwnVoiceChannel || (showPersistentBar && voiceControlsPinned));
   const hasVisibleMessageInput =
     (activeChannel?.type === 'text' && !!activeChannelId) || voiceTextChatVisible;
-  const showFloatingAvatar = !channelPanelPinned && !hasVisibleMessageInput;
+  const showFloatingAvatar = !leftPinned && !hasVisibleMessageInput;
 
   // ─── Channel panel body content ───
-  const channelBody = (
-    <>
+  const renderChannelBody = (compact: boolean) => (
+    <div className="channel-panel-content">
       {activeServer && (
         <ServerActionBar
+          compact={compact}
           server={activeServer}
           onOpenCreateModal={() => setIsCreateChannelModalOpen(true)}
           onOpenCreateCategoryModal={() => setIsCreateCategoryModalOpen(true)}
@@ -383,11 +383,12 @@ const MainView: React.FC = () => {
         />
       )}
       <ChannelList
+        compact={compact}
         onContextMenu={handleChannelContextMenu}
         onEmptyContextMenu={(pos) => setEmptyContextMenu({ position: pos })}
         onCategoryContextMenu={handleCategoryContextMenu}
       />
-    </>
+    </div>
   );
 
   // ─── Chat area content ───
@@ -444,6 +445,7 @@ const MainView: React.FC = () => {
   return (
     <div className="view-container main-view">
       <AppLayout
+        context="server"
         forceChannelPin={!!activeServer && channels.length === 0}
         serverBar={
           <ServerBar
@@ -453,9 +455,12 @@ const MainView: React.FC = () => {
         }
         folderBar={<FolderBar />}
         channelPanel={
-          <ChannelPanel header={channelHeader} forcePin={!!activeServer && channels.length === 0}>
-            {channelBody}
-          </ChannelPanel>
+          <ChannelPanel
+            context="server"
+            header={channelHeader}
+            forcePin={!!activeServer && channels.length === 0}
+            renderContent={renderChannelBody}
+          />
         }
         chatArea={chatContent}
         memberSpace={<MemberFlexSpace />}

@@ -1,27 +1,234 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useId } from 'react';
 import { Plus, UserPlus, Settings } from 'lucide-react';
 import { useInviteStore } from '../../stores/inviteStore';
 import { usePermissionStore } from '../../stores/permissionStore';
 import { Permissions, hasPermission } from '../../utils/permissions';
 import type { ServerWithRole, ServerInviteWithCreator } from '../../types/server';
 import { SendToFriendModal } from './SendToFriendModal';
+import { AttributedPopover } from '../Layout/AttributedPopover';
 import './ServerActionBar.css';
 
 const EMPTY_INVITES: ServerInviteWithCreator[] = [];
 
 interface ServerActionBarProps {
+  compact?: boolean;
   server: ServerWithRole;
   onOpenCreateModal: () => void;
   onOpenCreateCategoryModal: () => void;
   onOpenSettings?: () => void;
 }
 
+interface AddActionProps {
+  compact: boolean;
+  popoverId: string;
+  open: boolean;
+  buttonRef: React.RefObject<HTMLButtonElement | null>;
+  menuRef: React.RefObject<HTMLDivElement | null>;
+  content: React.ReactNode;
+  onToggle: () => void;
+  onClose: () => void;
+}
+
+interface InviteActionProps {
+  compact: boolean;
+  popoverId: string;
+  open: boolean;
+  buttonRef: React.RefObject<HTMLButtonElement | null>;
+  popupRef: React.RefObject<HTMLDivElement | null>;
+  content: React.ReactNode;
+  onToggle: () => void;
+  onClose: () => void;
+}
+
+interface AddMenuContentProps {
+  compact: boolean;
+  onOpenChannel: () => void;
+  onOpenCategory: () => void;
+}
+
+interface InvitePopupContentProps {
+  compact: boolean;
+  activeInvite?: ServerInviteWithCreator;
+  copied: boolean;
+  isGenerating: boolean;
+  onCopyCode: () => void;
+  onGenerate: () => void;
+  onSendToFriend: () => void;
+}
+
+interface SettingsActionProps {
+  compact: boolean;
+  onOpenSettings?: () => void;
+}
+
+const AddMenuContent: React.FC<AddMenuContentProps> = ({
+  compact,
+  onOpenChannel,
+  onOpenCategory,
+}) => (
+  <div className="add-menu-content">
+    <button className="add-menu-item" autoFocus={compact} onClick={onOpenChannel}>
+      <Plus size={14} />
+      <span>Channel</span>
+    </button>
+    <button className="add-menu-item" onClick={onOpenCategory}>
+      <Plus size={14} />
+      <span>Category</span>
+    </button>
+  </div>
+);
+
+const InvitePopupContent: React.FC<InvitePopupContentProps> = ({
+  compact,
+  activeInvite,
+  copied,
+  isGenerating,
+  onCopyCode,
+  onGenerate,
+  onSendToFriend,
+}) => (
+  <>
+    <div className="invite-popup-section">
+      <div className="invite-popup-header">Invite Code</div>
+      {activeInvite ? (
+        <>
+          <code className="invite-popup-code">{activeInvite.code}</code>
+          <button className="invite-popup-action-btn" autoFocus={compact} onClick={onCopyCode}>
+            {copied ? 'Copied!' : 'Copy Code'}
+          </button>
+        </>
+      ) : (
+        <button
+          className="invite-popup-action-btn"
+          autoFocus={compact}
+          onClick={onGenerate}
+          disabled={isGenerating}
+        >
+          {isGenerating ? 'Generating...' : 'Generate Code'}
+        </button>
+      )}
+    </div>
+
+    <div className="invite-popup-divider" />
+
+    <div className="invite-popup-section">
+      <div className="invite-popup-header">Direct Invite</div>
+      <button className="invite-popup-action-btn secondary" onClick={onSendToFriend}>
+        <UserPlus size={14} />
+        Send to a Friend
+      </button>
+    </div>
+  </>
+);
+
+const AddAction: React.FC<AddActionProps> = ({
+  compact,
+  popoverId,
+  open,
+  buttonRef,
+  menuRef,
+  content,
+  onToggle,
+  onClose,
+}) => (
+  <>
+    <button
+      id={`${popoverId}-server-add`}
+      ref={buttonRef}
+      className={`channel-action-item ${open ? 'active' : ''}`}
+      onClick={onToggle}
+      title={compact ? 'Add' : 'Create a channel or category'}
+      aria-label={compact ? 'Add' : undefined}
+      aria-expanded={compact ? open : undefined}
+      aria-controls={compact ? `${popoverId}-server-add-popover` : undefined}
+    >
+      <Plus size={16} />
+      {!compact && <span>Add</span>}
+    </button>
+    {open &&
+      (compact ? (
+        <AttributedPopover
+          id={`${popoverId}-server-add-popover`}
+          anchor={buttonRef.current}
+          label="Add channel or category"
+          open
+          placement="right"
+          onClose={onClose}
+        >
+          {content}
+        </AttributedPopover>
+      ) : (
+        <div className="add-menu-popup" ref={menuRef}>
+          {content}
+        </div>
+      ))}
+  </>
+);
+
+const InviteAction: React.FC<InviteActionProps> = ({
+  compact,
+  popoverId,
+  open,
+  buttonRef,
+  popupRef,
+  content,
+  onToggle,
+  onClose,
+}) => (
+  <>
+    <button
+      id={`${popoverId}-server-invite`}
+      ref={buttonRef}
+      className={`channel-action-item ${open ? 'active' : ''}`}
+      onClick={onToggle}
+      title={compact ? 'Invite' : 'Invite people to this server'}
+      aria-label={compact ? 'Invite' : undefined}
+      aria-expanded={compact ? open : undefined}
+      aria-controls={compact ? `${popoverId}-server-invite-popover` : undefined}
+    >
+      <UserPlus size={16} />
+      {!compact && <span>Invite</span>}
+    </button>
+    {open &&
+      (compact ? (
+        <AttributedPopover
+          id={`${popoverId}-server-invite-popover`}
+          anchor={buttonRef.current}
+          label="Invite people to this server"
+          open
+          placement="right"
+          onClose={onClose}
+        >
+          {content}
+        </AttributedPopover>
+      ) : (
+        <div className="invite-popup" ref={popupRef}>
+          {content}
+        </div>
+      ))}
+  </>
+);
+
+const SettingsAction: React.FC<SettingsActionProps> = ({ compact, onOpenSettings }) => (
+  <button
+    className="channel-action-item"
+    onClick={onOpenSettings}
+    title={compact ? 'Settings' : 'Server settings'}
+    aria-label={compact ? 'Settings' : undefined}
+  >
+    <Settings size={16} />
+    {!compact && <span>Settings</span>}
+  </button>
+);
+
 const ServerActionBar: React.FC<ServerActionBarProps> = ({
+  compact = false,
   server,
   onOpenCreateModal,
   onOpenCreateCategoryModal,
   onOpenSettings,
 }) => {
+  const popoverId = useId();
   const [showPopup, setShowPopup] = useState(false);
   const [showAddMenu, setShowAddMenu] = useState(false);
   const [showSendToFriend, setShowSendToFriend] = useState(false);
@@ -51,7 +258,7 @@ const ServerActionBar: React.FC<ServerActionBarProps> = ({
 
   // Close popup on click outside
   useEffect(() => {
-    if (!showPopup) return;
+    if (!showPopup || compact) return;
     const handleClickOutside = (e: MouseEvent) => {
       const target = e.target as Node;
       if (
@@ -66,11 +273,11 @@ const ServerActionBar: React.FC<ServerActionBarProps> = ({
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [showPopup]);
+  }, [compact, showPopup]);
 
   // Close add menu on click outside
   useEffect(() => {
-    if (!showAddMenu) return;
+    if (!showAddMenu || compact) return;
     const handleClickOutside = (e: MouseEvent) => {
       const target = e.target as Node;
       if (
@@ -84,7 +291,7 @@ const ServerActionBar: React.FC<ServerActionBarProps> = ({
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [showAddMenu]);
+  }, [compact, showAddMenu]);
 
   const handleTogglePopup = async () => {
     if (showPopup) {
@@ -126,114 +333,77 @@ const ServerActionBar: React.FC<ServerActionBarProps> = ({
     }
   };
 
+  const addMenuContent = (
+    <AddMenuContent
+      compact={compact}
+      onOpenChannel={() => {
+        setShowAddMenu(false);
+        onOpenCreateModal();
+      }}
+      onOpenCategory={() => {
+        setShowAddMenu(false);
+        onOpenCreateCategoryModal();
+      }}
+    />
+  );
+
+  const invitePopupContent = (
+    <InvitePopupContent
+      compact={compact}
+      activeInvite={activeInvite}
+      copied={copied}
+      isGenerating={isGenerating}
+      onCopyCode={handleCopyCode}
+      onGenerate={handleGenerate}
+      onSendToFriend={() => {
+        setShowPopup(false);
+        setShowSendToFriend(true);
+      }}
+    />
+  );
+
   // No actions available — just a thin spacer
   if (buttonCount === 0) {
     return <div className="channel-actions-spacer" />;
   }
 
   return (
-    <div className={`channel-actions-strip ${buttonCount === 1 ? 'single' : ''}`}>
+    <div
+      className={`channel-actions-strip${compact ? ' channel-actions-strip--compact' : ''}${buttonCount === 1 ? ' single' : ''}`}
+    >
       {canCreateChannel && (
-        <button
-          ref={addBtnRef}
-          className={`channel-action-item ${showAddMenu ? 'active' : ''}`}
-          onClick={() => setShowAddMenu(!showAddMenu)}
-          title="Create a channel or category"
-        >
-          <Plus size={16} />
-          <span>Add</span>
-        </button>
-      )}
-
-      {showAddMenu && (
-        <div className="add-menu-popup" ref={addMenuRef}>
-          <button
-            className="add-menu-item"
-            onClick={() => {
-              setShowAddMenu(false);
-              onOpenCreateModal();
-            }}
-          >
-            <Plus size={14} />
-            <span>Channel</span>
-          </button>
-          <button
-            className="add-menu-item"
-            onClick={() => {
-              setShowAddMenu(false);
-              onOpenCreateCategoryModal();
-            }}
-          >
-            <Plus size={14} />
-            <span>Category</span>
-          </button>
-        </div>
+        <AddAction
+          compact={compact}
+          popoverId={popoverId}
+          open={showAddMenu}
+          buttonRef={addBtnRef}
+          menuRef={addMenuRef}
+          content={addMenuContent}
+          onToggle={() => setShowAddMenu(!showAddMenu)}
+          onClose={() => setShowAddMenu(false)}
+        />
       )}
 
       {canCreateChannel && canInvite && <div className="channel-action-divider" />}
 
       {canInvite && (
-        <button
-          ref={btnRef}
-          className={`channel-action-item ${showPopup ? 'active' : ''}`}
-          onClick={handleTogglePopup}
-          title="Invite people to this server"
-        >
-          <UserPlus size={16} />
-          <span>Invite</span>
-        </button>
-      )}
-
-      {showPopup && (
-        <div className="invite-popup" ref={popupRef}>
-          <div className="invite-popup-section">
-            <div className="invite-popup-header">Invite Code</div>
-            {activeInvite ? (
-              <>
-                <code className="invite-popup-code">{activeInvite.code}</code>
-                <button className="invite-popup-action-btn" onClick={handleCopyCode}>
-                  {copied ? 'Copied!' : 'Copy Code'}
-                </button>
-              </>
-            ) : (
-              <button
-                className="invite-popup-action-btn"
-                onClick={handleGenerate}
-                disabled={isGenerating}
-              >
-                {isGenerating ? 'Generating...' : 'Generate Code'}
-              </button>
-            )}
-          </div>
-
-          <div className="invite-popup-divider" />
-
-          <div className="invite-popup-section">
-            <div className="invite-popup-header">Direct Invite</div>
-            <button
-              className="invite-popup-action-btn secondary"
-              onClick={() => {
-                setShowPopup(false);
-                setShowSendToFriend(true);
-              }}
-            >
-              <UserPlus size={14} />
-              Send to a Friend
-            </button>
-          </div>
-        </div>
+        <InviteAction
+          compact={compact}
+          popoverId={popoverId}
+          open={showPopup}
+          buttonRef={btnRef}
+          popupRef={popupRef}
+          content={invitePopupContent}
+          onToggle={handleTogglePopup}
+          onClose={() => setShowPopup(false)}
+        />
       )}
 
       {(canCreateChannel || canInvite) && canManageServer && (
         <div className="channel-action-divider" />
       )}
 
-      {canManageServer && (
-        <button className="channel-action-item" onClick={onOpenSettings} title="Server settings">
-          <Settings size={16} />
-          <span>Settings</span>
-        </button>
-      )}
+      {canManageServer && <SettingsAction compact={compact} onOpenSettings={onOpenSettings} />}
 
       <SendToFriendModal
         serverId={server.id}

@@ -1,6 +1,7 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import ChannelItem, { type VoiceMemberInfo } from '@/renderer/components/Channels/ChannelItem';
 import type { Channel } from '@/renderer/types/chat';
+import { resetAllStores } from '../../../helpers/store-helpers';
 import { vi } from 'vitest';
 
 const mockTextChannel: Channel = {
@@ -71,6 +72,7 @@ const defaultProps = {
 
 describe('ChannelItem', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
   });
 
@@ -95,6 +97,106 @@ describe('ChannelItem', () => {
     render(<ChannelItem {...defaultProps} />);
     const item = document.querySelector('.channel-item');
     expect(item?.getAttribute('title')).toBe('general');
+  });
+
+  describe('compact presentation', () => {
+    it('exposes unread and draft state and opens the detail on focus or hover', () => {
+      render(<ChannelItem {...defaultProps} compact unread={3} hasDraft isMuted={false} />);
+
+      const channel = screen.getByRole('button', {
+        name: /general.*text channel.*3 unread.*draft/i,
+      });
+      expect(
+        screen.queryByRole('dialog', { name: 'general channel details' })
+      ).not.toBeInTheDocument();
+
+      fireEvent.focus(channel);
+      expect(screen.getByRole('dialog', { name: 'general channel details' })).toBeInTheDocument();
+      fireEvent.blur(channel);
+      expect(
+        screen.queryByRole('dialog', { name: 'general channel details' })
+      ).not.toBeInTheDocument();
+
+      fireEvent.mouseEnter(channel);
+      expect(screen.getByRole('dialog', { name: 'general channel details' })).toBeInTheDocument();
+      fireEvent.mouseLeave(channel);
+      expect(
+        screen.queryByRole('dialog', { name: 'general channel details' })
+      ).not.toBeInTheDocument();
+    });
+
+    it('retains channel-type icons and selected state', () => {
+      const { container, rerender } = render(
+        <ChannelItem {...defaultProps} compact isActive channel={mockTextChannel} />
+      );
+      expect(container.querySelector('.lucide-hash')).toHaveAttribute('width', '14');
+      expect(container.querySelector('.lucide-hash')).toHaveAttribute('height', '14');
+      expect(screen.getByRole('button')).toHaveAttribute('aria-current', 'page');
+
+      rerender(<ChannelItem {...defaultProps} compact channel={mockVoiceChannel} />);
+      expect(container.querySelector('.lucide-volume-2')).toBeInTheDocument();
+
+      rerender(<ChannelItem {...defaultProps} compact channel={mockBulletinChannel} />);
+      expect(container.querySelector('.lucide-pin')).toBeInTheDocument();
+    });
+
+    it('announces mute independently from an unread count', () => {
+      render(<ChannelItem {...defaultProps} compact unread={0} isMuted />);
+      expect(screen.getByRole('button', { name: /general.*muted/i })).toBeInTheDocument();
+      expect(document.querySelector('.channel-unread-badge')).not.toBeInTheDocument();
+    });
+
+    it('bounds large unread badges at 99+', () => {
+      render(<ChannelItem {...defaultProps} compact unread={150} />);
+      expect(screen.getByText('99+')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /99\+ unread/i })).toBeInTheDocument();
+    });
+
+    it('shows a positive voice count and the existing participant detail', () => {
+      const voiceMembers: VoiceMemberInfo[] = [
+        {
+          userId: 'u1',
+          username: 'alice',
+          displayName: 'Alice',
+          isMuted: false,
+          isSpeaking: false,
+          serverMuted: false,
+          serverDeafened: false,
+          isDeafened: false,
+        },
+        {
+          userId: 'u2',
+          username: 'bob',
+          displayName: 'Bob',
+          isMuted: false,
+          isSpeaking: false,
+          serverMuted: false,
+          serverDeafened: false,
+          isDeafened: false,
+        },
+      ];
+      render(
+        <ChannelItem
+          {...defaultProps}
+          channel={mockVoiceChannel}
+          compact
+          voiceMembers={voiceMembers}
+        />
+      );
+
+      expect(screen.getByLabelText('2 participants')).toBeInTheDocument();
+      expect(screen.queryByText('Alice')).not.toBeInTheDocument();
+      expect(screen.queryByText('Bob')).not.toBeInTheDocument();
+      const channel = screen.getByRole('button', { name: /general voice.*2 participants/i });
+      fireEvent.focus(channel);
+      expect(screen.getByText('Alice')).toBeInTheDocument();
+      expect(screen.getByText('Bob')).toBeInTheDocument();
+    });
+
+    it('does not render a zero participant badge', () => {
+      render(<ChannelItem {...defaultProps} channel={mockVoiceChannel} compact />);
+      expect(screen.queryByLabelText('0 participants')).not.toBeInTheDocument();
+    });
   });
 
   // -- Channel Type Icons --

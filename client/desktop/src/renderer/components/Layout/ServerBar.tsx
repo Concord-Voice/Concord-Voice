@@ -74,15 +74,8 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
   const serverOrder = useLayoutStore((s) => s.serverOrder);
   const reorderServers = useLayoutStore((s) => s.reorderServers);
   const removeServerFromFolder = useLayoutStore((s) => s.removeServerFromFolder);
-  const channelPanelPinned = useLayoutStore((s) => s.channelPanelPinned);
-  const showChannelPanelHover = useLayoutStore((s) => s.showChannelPanelHover);
-  const hideChannelPanelHover = useLayoutStore((s) => s.hideChannelPanelHover);
   const serverBarHeight = useLayoutStore((s) => s.serverBarHeight);
   const reduceAnimations = useSettingsStore((s) => s.appearance.reduceAnimations);
-
-  // Hover-to-open timers for unpinned channel panel
-  const hoverShowRef = useRef<NodeJS.Timeout | null>(null);
-  const hoverHideRef = useRef<NodeJS.Timeout | null>(null);
 
   const [showLeftArrow, setShowLeftArrow] = useState(false);
   const [showRightArrow, setShowRightArrow] = useState(false);
@@ -179,90 +172,18 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
     scrollRef.current?.scrollBy({ left: delta, behavior: 'smooth' });
   };
 
-  // Click active server icon → navigate to server view (from DM), toggle pin, or instant-show unpinned panel
+  // Sticky icons only navigate. Sidebar peeking is owned by the adjacent DockShell lip.
   const handleActiveServerClick = () => {
     if (location.pathname !== '/app') {
       navigate('/app');
-      return;
-    }
-    // Already on the server view. When pinned, do nothing — clicking the active
-    // server must NOT unpin the panel (#188 feedback: surprising re-collapse,
-    // and it would also bypass the interface lock). When unpinned, instant-show
-    // the peek overlay (cancel any pending hover timers).
-    if (!channelPanelPinned) {
-      if (hoverShowRef.current) {
-        clearTimeout(hoverShowRef.current);
-        hoverShowRef.current = null;
-      }
-      if (hoverHideRef.current) {
-        clearTimeout(hoverHideRef.current);
-        hoverHideRef.current = null;
-      }
-      showChannelPanelHover();
     }
   };
 
-  // Click PM icon — navigate to DMs, or instant-show unpinned panel if already there
   const handlePMClick = () => {
     if (location.pathname !== '/app/dms') {
       navigate('/app/dms');
-      return;
-    }
-    // Same rule as the active-server icon (#188): when pinned, do NOT unpin on
-    // click. When unpinned, instant-show the peek overlay.
-    if (!channelPanelPinned) {
-      if (hoverShowRef.current) {
-        clearTimeout(hoverShowRef.current);
-        hoverShowRef.current = null;
-      }
-      if (hoverHideRef.current) {
-        clearTimeout(hoverHideRef.current);
-        hoverHideRef.current = null;
-      }
-      showChannelPanelHover();
     }
   };
-
-  // Hover-to-open for unpinned channel panel with intentful delay
-  const hoverShowDelay = reduceAnimations ? 0 : 300;
-  // Keep a grace period on hide so the user can travel from the icon to the panel
-  const hoverHideDelay = reduceAnimations ? 200 : 300;
-
-  const handleActiveServerEnter = useCallback(() => {
-    if (channelPanelPinned) return;
-    // Clear any pending hide so re-hovering keeps the panel alive
-    if (hoverHideRef.current) {
-      clearTimeout(hoverHideRef.current);
-      hoverHideRef.current = null;
-    }
-    // Intentful delay — only open if the cursor lingers (instant when reduced)
-    hoverShowRef.current = setTimeout(() => {
-      showChannelPanelHover();
-      hoverShowRef.current = null;
-    }, hoverShowDelay);
-  }, [channelPanelPinned, showChannelPanelHover, hoverShowDelay]);
-
-  const handleActiveServerLeave = useCallback(() => {
-    // Cancel any pending show
-    if (hoverShowRef.current) {
-      clearTimeout(hoverShowRef.current);
-      hoverShowRef.current = null;
-    }
-    if (channelPanelPinned) return;
-    // Give the user time to reach the channel panel before hiding
-    hoverHideRef.current = setTimeout(() => {
-      hideChannelPanelHover();
-      hoverHideRef.current = null;
-    }, hoverHideDelay);
-  }, [channelPanelPinned, hideChannelPanelHover, hoverHideDelay]);
-
-  // Cleanup hover timers on unmount
-  useEffect(() => {
-    return () => {
-      if (hoverShowRef.current) clearTimeout(hoverShowRef.current);
-      if (hoverHideRef.current) clearTimeout(hoverHideRef.current);
-    };
-  }, []);
 
   // Click server in bar
   const handleServerClick = (server: ServerWithRole) => {
@@ -492,11 +413,9 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
           onClick={handlePMClick}
           onMouseEnter={() => {
             showStickyTooltip('Direct Messages', pmBtnRef);
-            if (location.pathname === '/app/dms') handleActiveServerEnter();
           }}
           onMouseLeave={() => {
             hideStickyTooltip();
-            if (location.pathname === '/app/dms') handleActiveServerLeave();
           }}
           style={{ width: stickyIconSize, height: stickyIconSize }}
         >
@@ -511,14 +430,12 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
             onClick={handleActiveServerClick}
             onMouseEnter={() => {
               showStickyTooltip(activeServer.name, activeServerBtnRef);
-              if (location.pathname !== '/app/dms') handleActiveServerEnter();
             }}
             onMouseLeave={() => {
               hideStickyTooltip();
-              if (location.pathname !== '/app/dms') handleActiveServerLeave();
             }}
             onContextMenu={(e) => handleContextMenu(e, activeServer)}
-            aria-label="Toggle channel panel"
+            aria-label={`${activeServer.name} server`}
             style={{ width: stickyIconSize, height: stickyIconSize }}
           >
             {resolveMediaUrl(activeServer.icon_url) ? (

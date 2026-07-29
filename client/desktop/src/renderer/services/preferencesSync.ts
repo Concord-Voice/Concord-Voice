@@ -13,7 +13,15 @@ import { e2eeService } from './e2eeService';
 import { apiFetch } from './apiClient';
 import { errorMessage } from '../utils/redactError';
 import type { AppearanceSettings } from '../stores/settingsStore';
-import type { MemberPanelMode, ServerFolder } from '../stores/layoutStore';
+import {
+  deriveLegacySidebarProfiles,
+  migrateLegacySidebarState,
+  normalizeSidebarProfiles,
+  SIDEBAR_COMPACT_BREAKPOINT,
+  type ServerFolder,
+  type SidebarDockPreference,
+  type SidebarProfiles,
+} from '../stores/layoutStore';
 import {
   isHydrationLifecycleCurrent,
   type HydrationLifecycleGuard,
@@ -21,11 +29,17 @@ import {
 
 const DEBOUNCE_MS = 3000;
 
+type LegacyPanelMode = 'expanded' | 'collapsed' | 'hidden';
+
 export interface LayoutPersistedState {
-  channelPanelPinned: boolean;
-  channelPanelWidth: number;
-  memberPanelMode: MemberPanelMode;
-  memberPanelWidth: number;
+  sidebarProfiles?: SidebarProfiles;
+  sidebarLayoutsDecoupled?: boolean;
+  // Compatibility projection retained during the beta window.
+  channelPanelPinned?: boolean;
+  channelPanelWidth?: number;
+  memberPanelMode?: LegacyPanelMode;
+  memberPanelWidth?: number;
+  friendsPanelMode?: LegacyPanelMode;
   serverBarHeight: number;
   folderBarHeight: number;
   serverFolders: ServerFolder[];
@@ -37,6 +51,7 @@ export interface PreferencesSyncDeps {
   setAppearance: (patch: AppearanceSettings) => void;
   getLayout: () => LayoutPersistedState;
   setLayout: (patch: Partial<LayoutPersistedState>) => void;
+  applySidebarPreferences: (profiles: SidebarProfiles, decoupled: boolean) => void;
 }
 
 interface PreferencesBlob {
@@ -47,6 +62,26 @@ interface PreferencesBlob {
 
 interface PreferencesResponse {
   preferences: { encrypted_data: string; version: number } | null;
+}
+
+function projectLegacyMode(dock: SidebarDockPreference): LegacyPanelMode {
+  if (!dock.pinned) return 'hidden';
+  return dock.width < SIDEBAR_COMPACT_BREAKPOINT ? 'collapsed' : 'expanded';
+}
+
+function normalizeRemoteSidebarLayout(remote: LayoutPersistedState): {
+  profiles: SidebarProfiles;
+  decoupled: boolean;
+} {
+  const profiles =
+    remote.sidebarProfiles === undefined
+      ? deriveLegacySidebarProfiles(remote)
+      : normalizeSidebarProfiles(remote.sidebarProfiles);
+  return {
+    profiles,
+    decoupled:
+      typeof remote.sidebarLayoutsDecoupled === 'boolean' ? remote.sidebarLayoutsDecoupled : false,
+  };
 }
 
 /** Diff and apply remote appearance settings to the local settings store. */
@@ -92,11 +127,12 @@ function applyRemoteAppearance(remote: AppearanceSettings, deps: PreferencesSync
 function applyRemoteLayout(remote: PreferencesBlob['layout'], deps: PreferencesSyncDeps): void {
   const current = deps.getLayout();
   const patch: Record<string, unknown> = {};
+  const sidebar = normalizeRemoteSidebarLayout(remote);
+
+  deps.applySidebarPreferences(sidebar.profiles, sidebar.decoupled);
 
   // Scalar fields with min/max clamping
   const clampedFields: { key: keyof typeof remote; min: number; max: number }[] = [
-    { key: 'channelPanelWidth', min: 180, max: 400 },
-    { key: 'memberPanelWidth', min: 160, max: 340 },
     { key: 'serverBarHeight', min: 36, max: 64 },
     { key: 'folderBarHeight', min: 24, max: 48 },
   ];
@@ -104,14 +140,6 @@ function applyRemoteLayout(remote: PreferencesBlob['layout'], deps: PreferencesS
     if (remote[key] !== current[key]) {
       patch[key] = Math.max(min, Math.min(max, remote[key] as number));
     }
-  }
-
-  // Boolean / enum fields
-  if (remote.channelPanelPinned !== current.channelPanelPinned) {
-    patch.channelPanelPinned = remote.channelPanelPinned;
-  }
-  if (remote.memberPanelMode !== current.memberPanelMode) {
-    patch.memberPanelMode = remote.memberPanelMode;
   }
 
   // Deep-compared fields
@@ -258,17 +286,8 @@ class PreferencesSyncService {
     guard: HydrationLifecycleGuard | undefined,
     generation: number
   ): Promise<PreferencesBlob | null> {
-    try {
-      const blob = await e2eeService.decryptPreferences<PreferencesBlob>(encryptedData);
-      return this.isOperationCurrent(generation, guard) ? blob : null;
-    } catch {
-      if (!this.isOperationCurrent(generation, guard)) return null;
-      // Preferences encrypted with a different key (e.g., after a KDF migration).
-      // Push current local state to overwrite stale server data.
-      console.warn('[PrefsSync] Cannot decrypt server preferences, re-encrypting with current key');
-      await this.pushPreferences(guard, generation);
-      return null;
-    }
+    const blob = await e2eeService.decryptPreferences<PreferencesBlob>(encryptedData);
+    return this.isOperationCurrent(generation, guard) ? blob : null;
   }
 
   /**
@@ -329,10 +348,9 @@ class PreferencesSyncService {
         if (gen !== this.watchGeneration) return; // stale — service was stopped/restarted
         const unsubLayout = useLayoutStore.subscribe(
           (state) => ({
-            channelPanelPinned: state.channelPanelPinned,
-            channelPanelWidth: state.channelPanelWidth,
-            memberPanelMode: state.memberPanelMode,
-            memberPanelWidth: state.memberPanelWidth,
+            dmSidebarProfile: state.sidebarProfiles.dm,
+            serverSidebarProfile: state.sidebarProfiles.server,
+            sidebarLayoutsDecoupled: state.sidebarLayoutsDecoupled,
             serverBarHeight: state.serverBarHeight,
             folderBarHeight: state.folderBarHeight,
             serverFolders: state.serverFolders,
@@ -393,6 +411,10 @@ class PreferencesSyncService {
     try {
       const settings = deps.getAppearance();
       const layout = deps.getLayout();
+      const sidebarProfiles = normalizeSidebarProfiles(
+        layout.sidebarProfiles ?? migrateLegacySidebarState(layout)
+      );
+      const liveDm = sidebarProfiles.dm;
 
       const blob: PreferencesBlob = {
         v: 1,
@@ -413,10 +435,13 @@ class PreferencesSyncService {
           dyslexicSupport: settings.dyslexicSupport,
         },
         layout: {
-          channelPanelPinned: layout.channelPanelPinned,
-          channelPanelWidth: layout.channelPanelWidth,
-          memberPanelMode: layout.memberPanelMode,
-          memberPanelWidth: layout.memberPanelWidth,
+          sidebarProfiles,
+          sidebarLayoutsDecoupled: layout.sidebarLayoutsDecoupled === true,
+          channelPanelPinned: liveDm.left.pinned,
+          channelPanelWidth: liveDm.left.width,
+          memberPanelMode: projectLegacyMode(liveDm.right),
+          memberPanelWidth: liveDm.right.width,
+          friendsPanelMode: projectLegacyMode(liveDm.right),
           serverBarHeight: layout.serverBarHeight,
           folderBarHeight: layout.folderBarHeight,
           serverFolders: layout.serverFolders,

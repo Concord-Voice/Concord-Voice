@@ -3,7 +3,11 @@ import {
   type PreferencesSyncDeps,
 } from '@/renderer/services/preferencesSync';
 import { useSettingsStore } from '@/renderer/stores/settingsStore';
-import { useLayoutStore } from '@/renderer/stores/layoutStore';
+import {
+  useLayoutStore,
+  type SidebarProfile,
+  type SidebarProfiles,
+} from '@/renderer/stores/layoutStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
@@ -37,10 +41,13 @@ function initSyncServiceDeps() {
     getLayout: () => {
       const s = useLayoutStore.getState();
       return {
+        sidebarProfiles: s.sidebarProfiles,
+        sidebarLayoutsDecoupled: s.sidebarLayoutsDecoupled,
         channelPanelPinned: s.channelPanelPinned,
         channelPanelWidth: s.channelPanelWidth,
         memberPanelMode: s.memberPanelMode,
         memberPanelWidth: s.memberPanelWidth,
+        friendsPanelMode: s.friendsPanelMode,
         serverBarHeight: s.serverBarHeight,
         folderBarHeight: s.folderBarHeight,
         serverFolders: s.serverFolders,
@@ -48,6 +55,8 @@ function initSyncServiceDeps() {
       };
     },
     setLayout: (patch) => useLayoutStore.setState(patch),
+    applySidebarPreferences: (profiles, decoupled) =>
+      useLayoutStore.getState().applySidebarPreferences(profiles, decoupled),
   });
 }
 
@@ -66,12 +75,14 @@ describe('preferencesSyncService — DI lifecycle', () => {
       setAppearance: vi.fn(),
       getLayout: () => useLayoutStore.getState() as any,
       setLayout: vi.fn(),
+      applySidebarPreferences: vi.fn(),
     };
     const deps2: PreferencesSyncDeps = {
       getAppearance: vi.fn().mockReturnValue({}),
       setAppearance: vi.fn(),
       getLayout: vi.fn().mockReturnValue({}),
       setLayout: vi.fn(),
+      applySidebarPreferences: vi.fn(),
     };
 
     preferencesSyncService.init(deps1);
@@ -128,6 +139,17 @@ describe('preferencesSyncService', () => {
       },
     });
     useLayoutStore.setState({
+      sidebarProfiles: {
+        dm: {
+          left: { width: 240, pinned: true },
+          right: { width: 260, pinned: true },
+        },
+        server: {
+          left: { width: 240, pinned: true },
+          right: { width: 260, pinned: true },
+        },
+      },
+      sidebarLayoutsDecoupled: false,
       channelPanelPinned: true,
       channelPanelWidth: 240,
       memberPanelMode: 'expanded',
@@ -136,6 +158,7 @@ describe('preferencesSyncService', () => {
       folderBarHeight: 32,
       serverFolders: [],
       serverOrder: [],
+      interfaceLocked: false,
     });
     useAuthStore.getState().setAccessToken('mock-token');
     vi.mocked(e2eeService.encryptPreferences).mockClear().mockResolvedValue('encrypted-blob');
@@ -158,6 +181,70 @@ describe('preferencesSyncService', () => {
 
       expect(e2eeService.encryptPreferences).toHaveBeenCalled();
       expect(pushedBody).toEqual({ encrypted_data: 'encrypted-blob' });
+    });
+
+    it('round-trips all four retained docks and the decoupling preference', async () => {
+      const profiles: SidebarProfiles = {
+        dm: {
+          left: { width: 56, pinned: true },
+          right: { width: 179, pinned: false },
+        },
+        server: {
+          left: { width: 180, pinned: false },
+          right: { width: 340, pinned: true },
+        },
+      };
+      let encryptedBlob: unknown;
+      let pushedBody: unknown;
+      vi.mocked(e2eeService.encryptPreferences).mockImplementationOnce(async (blob) => {
+        encryptedBlob = blob;
+        return 'round-trip-blob';
+      });
+      server.use(
+        http.put(`${API_BASE}/api/v1/users/me/preferences`, async ({ request }) => {
+          pushedBody = await request.json();
+          return HttpResponse.json({ version: 1 });
+        }),
+        http.get(`${API_BASE}/api/v1/users/me/preferences`, () =>
+          HttpResponse.json({
+            preferences: { encrypted_data: 'round-trip-blob', version: 1 },
+          })
+        )
+      );
+      useLayoutStore.setState({
+        sidebarProfiles: profiles,
+        sidebarLayoutsDecoupled: true,
+      });
+
+      await preferencesSyncService.pushPreferences();
+
+      expect(encryptedBlob).toMatchObject({
+        layout: {
+          sidebarProfiles: profiles,
+          sidebarLayoutsDecoupled: true,
+        },
+      });
+      expect(pushedBody).toEqual({ encrypted_data: 'round-trip-blob' });
+      vi.mocked(e2eeService.decryptPreferences).mockResolvedValueOnce(encryptedBlob);
+      useLayoutStore.setState({
+        sidebarProfiles: {
+          dm: {
+            left: { width: 240, pinned: true },
+            right: { width: 260, pinned: true },
+          },
+          server: {
+            left: { width: 240, pinned: true },
+            right: { width: 260, pinned: true },
+          },
+        },
+        sidebarLayoutsDecoupled: false,
+      });
+
+      await preferencesSyncService.fetchAndApply();
+
+      expect(e2eeService.decryptPreferences).toHaveBeenCalledExactlyOnceWith('round-trip-blob');
+      expect(useLayoutStore.getState().sidebarProfiles).toEqual(profiles);
+      expect(useLayoutStore.getState().sidebarLayoutsDecoupled).toBe(true);
     });
 
     it('does nothing when e2ee is not initialized', async () => {
@@ -302,12 +389,13 @@ describe('preferencesSyncService', () => {
           compactMode: true,
         },
         layout: {
-          channelPanelPinned: false,
-          channelPanelWidth: 300,
+          channelPanelPinned: true,
+          channelPanelWidth: 220,
           memberPanelMode: 'collapsed',
-          memberPanelWidth: 200,
-          serverBarHeight: 50,
-          folderBarHeight: 40,
+          memberPanelWidth: 260,
+          friendsPanelMode: 'hidden',
+          serverBarHeight: 48,
+          folderBarHeight: 32,
           serverFolders: [],
           serverOrder: ['server-1'],
         },
@@ -327,10 +415,268 @@ describe('preferencesSyncService', () => {
       expect(useSettingsStore.getState().appearance.colorScheme).toBe('hacker');
       expect(useSettingsStore.getState().appearance.fontSize).toBe('large');
       expect(useSettingsStore.getState().appearance.compactMode).toBe(true);
-      expect(useLayoutStore.getState().channelPanelPinned).toBe(false);
-      expect(useLayoutStore.getState().channelPanelWidth).toBe(300);
-      expect(useLayoutStore.getState().memberPanelMode).toBe('collapsed');
+      expect(useLayoutStore.getState().sidebarProfiles).toEqual({
+        dm: {
+          left: { width: 220, pinned: true },
+          right: { width: 260, pinned: false },
+        },
+        server: {
+          left: { width: 220, pinned: true },
+          right: { width: 56, pinned: true },
+        },
+      });
       expect(useLayoutStore.getState().serverOrder).toEqual(['server-1']);
+    });
+
+    it('provisions a missing Server profile from the normalized DM profile', async () => {
+      const dm: SidebarProfile = {
+        left: { width: 240, pinned: true },
+        right: { width: 260, pinned: true },
+      };
+      vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({
+        v: 1,
+        settings: useSettingsStore.getState().appearance,
+        layout: {
+          channelPanelPinned: true,
+          channelPanelWidth: 240,
+          memberPanelMode: 'expanded',
+          memberPanelWidth: 260,
+          friendsPanelMode: 'expanded',
+          serverBarHeight: 48,
+          folderBarHeight: 32,
+          serverFolders: [],
+          serverOrder: [],
+          sidebarProfiles: { dm, server: undefined as unknown as SidebarProfile },
+          sidebarLayoutsDecoupled: true,
+        },
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/preferences`, () =>
+          HttpResponse.json({
+            preferences: { encrypted_data: 'encrypted', version: 1 },
+          })
+        )
+      );
+
+      await preferencesSyncService.fetchAndApply();
+
+      expect(useLayoutStore.getState().sidebarProfiles.server).toEqual(dm);
+      expect(useLayoutStore.getState().sidebarLayoutsDecoupled).toBe(true);
+    });
+
+    it('derives retained profiles from an older version-1 legacy layout', async () => {
+      vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({
+        v: 1,
+        settings: useSettingsStore.getState().appearance,
+        layout: {
+          channelPanelPinned: false,
+          channelPanelWidth: 300,
+          memberPanelMode: 'collapsed',
+          memberPanelWidth: 210,
+          friendsPanelMode: 'hidden',
+          serverBarHeight: 48,
+          folderBarHeight: 32,
+          serverFolders: [],
+          serverOrder: [],
+        },
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/preferences`, () =>
+          HttpResponse.json({
+            preferences: { encrypted_data: 'encrypted', version: 1 },
+          })
+        )
+      );
+
+      await preferencesSyncService.fetchAndApply();
+
+      expect(useLayoutStore.getState().sidebarProfiles).toEqual({
+        dm: {
+          left: { width: 300, pinned: false },
+          right: { width: 260, pinned: false },
+        },
+        server: {
+          left: { width: 300, pinned: false },
+          right: { width: 56, pinned: true },
+        },
+      });
+      expect(useLayoutStore.getState().sidebarLayoutsDecoupled).toBe(false);
+    });
+
+    it('uses encrypted legacy widths instead of conflicting device-local migration keys', async () => {
+      localStorage.setItem('concord:channelPanelWidth', '350');
+      localStorage.setItem('concord:memberPanelWidth', '330');
+      localStorage.setItem('concord:friendsPanelWidth', '320');
+      vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({
+        v: 1,
+        settings: useSettingsStore.getState().appearance,
+        layout: {
+          channelPanelPinned: false,
+          channelPanelWidth: 300,
+          memberPanelMode: 'expanded',
+          memberPanelWidth: 210,
+          friendsPanelMode: 'hidden',
+          serverBarHeight: 48,
+          folderBarHeight: 32,
+          serverFolders: [],
+          serverOrder: [],
+        },
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/preferences`, () =>
+          HttpResponse.json({
+            preferences: { encrypted_data: 'encrypted', version: 1 },
+          })
+        )
+      );
+
+      await preferencesSyncService.fetchAndApply();
+
+      expect(useLayoutStore.getState().sidebarProfiles).toEqual({
+        dm: {
+          left: { width: 300, pinned: false },
+          right: { width: 260, pinned: false },
+        },
+        server: {
+          left: { width: 300, pinned: false },
+          right: { width: 210, pinned: true },
+        },
+      });
+    });
+
+    it('fills only missing Server fields from DM before remote application', async () => {
+      const dm: SidebarProfile = {
+        left: { width: 275, pinned: true },
+        right: { width: 205, pinned: false },
+      };
+      const partialServer = {
+        left: { width: 320, pinned: false },
+        right: { width: 310 },
+      };
+      vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({
+        v: 1,
+        settings: useSettingsStore.getState().appearance,
+        layout: {
+          channelPanelPinned: true,
+          channelPanelWidth: 240,
+          memberPanelMode: 'expanded',
+          memberPanelWidth: 260,
+          friendsPanelMode: 'expanded',
+          serverBarHeight: 48,
+          folderBarHeight: 32,
+          serverFolders: [],
+          serverOrder: [],
+          sidebarProfiles: { dm, server: partialServer } as unknown as SidebarProfiles,
+          sidebarLayoutsDecoupled: true,
+        },
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/preferences`, () =>
+          HttpResponse.json({
+            preferences: { encrypted_data: 'encrypted', version: 1 },
+          })
+        )
+      );
+
+      await preferencesSyncService.fetchAndApply();
+
+      expect(useLayoutStore.getState().sidebarProfiles.server).toEqual({
+        left: { width: 320, pinned: false },
+        right: { width: 310, pinned: false },
+      });
+    });
+
+    it('normalizes malformed nested profile values instead of installing them', async () => {
+      const malformedProfiles = {
+        dm: {
+          left: { width: 'wide', pinned: 'yes' },
+          right: { width: 205, pinned: false },
+        },
+        server: {
+          left: null,
+          right: { width: 'invalid', pinned: true },
+        },
+      };
+      vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({
+        v: 1,
+        settings: useSettingsStore.getState().appearance,
+        layout: {
+          channelPanelPinned: true,
+          channelPanelWidth: 240,
+          memberPanelMode: 'expanded',
+          memberPanelWidth: 260,
+          friendsPanelMode: 'expanded',
+          serverBarHeight: 48,
+          folderBarHeight: 32,
+          serverFolders: [],
+          serverOrder: [],
+          sidebarProfiles: malformedProfiles as unknown as SidebarProfiles,
+          sidebarLayoutsDecoupled: true,
+        },
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/preferences`, () =>
+          HttpResponse.json({
+            preferences: { encrypted_data: 'encrypted', version: 1 },
+          })
+        )
+      );
+
+      await preferencesSyncService.fetchAndApply();
+
+      expect(useLayoutStore.getState().sidebarProfiles).toEqual({
+        dm: {
+          left: { width: 240, pinned: true },
+          right: { width: 205, pinned: false },
+        },
+        server: {
+          left: { width: 240, pinned: true },
+          right: { width: 205, pinned: true },
+        },
+      });
+    });
+
+    it('routes remote profiles through the Interface Lock guarded store action', async () => {
+      const retained = useLayoutStore.getState().sidebarProfiles;
+      useLayoutStore.setState({ interfaceLocked: true });
+      vi.mocked(e2eeService.decryptPreferences).mockResolvedValue({
+        v: 1,
+        settings: useSettingsStore.getState().appearance,
+        layout: {
+          channelPanelPinned: false,
+          channelPanelWidth: 300,
+          memberPanelMode: 'hidden',
+          memberPanelWidth: 300,
+          friendsPanelMode: 'hidden',
+          serverBarHeight: 48,
+          folderBarHeight: 32,
+          serverFolders: [],
+          serverOrder: [],
+          sidebarProfiles: {
+            dm: {
+              left: { width: 300, pinned: false },
+              right: { width: 300, pinned: false },
+            },
+            server: {
+              left: { width: 320, pinned: false },
+              right: { width: 310, pinned: false },
+            },
+          },
+          sidebarLayoutsDecoupled: true,
+        },
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/users/me/preferences`, () =>
+          HttpResponse.json({
+            preferences: { encrypted_data: 'encrypted', version: 1 },
+          })
+        )
+      );
+
+      await preferencesSyncService.fetchAndApply();
+
+      expect(useLayoutStore.getState().sidebarProfiles).toEqual(retained);
+      expect(useLayoutStore.getState().sidebarLayoutsDecoupled).toBe(false);
     });
 
     it('does not apply a response invalidated by stopWatching during decryption', async () => {

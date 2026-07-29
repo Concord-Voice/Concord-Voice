@@ -129,12 +129,14 @@
 [data-scheme='pride'] .channel-unread-badge,
 [data-scheme='pride'] .conversation-unread-badge,
 [data-scheme='pride'] .friends-add-btn:hover,
+[data-scheme='pride'] .friends-compact-trigger-count,
 [data-scheme='pride'] .personal-thread-avatar,
 [data-scheme='pride'] .add-friend-action-btn,
 [data-scheme='pride'] .create-group-btn:hover,
 [data-scheme='pride'] .create-group-add-btn:hover:not(:disabled),
 [data-scheme='pride'] .create-group-create-btn,
 [data-scheme='pride'] .group-member-role-badge,
+[data-scheme='pride'] .member-compact-trigger-count,
 [data-scheme='pride'] .session-card-badge,
 [data-scheme='pride'] .settings-rotate-id-btn:hover:not(:disabled) {
   text-shadow:

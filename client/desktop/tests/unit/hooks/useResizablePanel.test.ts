@@ -1,314 +1,163 @@
 import React from 'react';
-import { renderHook, act } from '@testing-library/react';
+import { act, renderHook } from '@testing-library/react';
 import { useResizablePanel } from '@/renderer/hooks/useResizablePanel';
+import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('useResizablePanel', () => {
   beforeEach(() => {
+    resetAllStores();
     localStorage.clear();
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
   });
 
-  it('returns default width when no stored value', () => {
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-      })
-    );
-    expect(result.current.width).toBe(250);
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
-  it('returns stored width from localStorage', () => {
-    localStorage.setItem('panel-width', '300');
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-        storageKey: 'panel-width',
-      })
+  it('keeps drag width transient, commits once, and follows controlled width while idle', () => {
+    const onWidthCommit = vi.fn();
+    const storageSpy = vi.spyOn(Storage.prototype, 'setItem');
+    const { result, rerender } = renderHook(
+      ({ width }) =>
+        useResizablePanel({
+          width,
+          minWidth: 56,
+          maxWidth: 400,
+          side: 'left',
+          onWidthCommit,
+        }),
+      { initialProps: { width: 240 } }
     );
+
+    act(() => {
+      result.current.onMouseDown({
+        clientX: 240,
+        preventDefault: vi.fn(),
+      } as unknown as React.MouseEvent);
+    });
+    expect(result.current.isResizing).toBe(true);
+
+    act(() => window.dispatchEvent(new MouseEvent('mousemove', { clientX: 300 })));
     expect(result.current.width).toBe(300);
+    expect(onWidthCommit).not.toHaveBeenCalled();
+
+    act(() => window.dispatchEvent(new MouseEvent('mouseup')));
+    expect(onWidthCommit).toHaveBeenCalledTimes(1);
+    expect(onWidthCommit).toHaveBeenCalledWith(300);
+    expect(result.current.isResizing).toBe(false);
+
+    act(() => window.dispatchEvent(new MouseEvent('mouseup')));
+    expect(onWidthCommit).toHaveBeenCalledTimes(1);
+
+    rerender({ width: 180 });
+    expect(result.current.width).toBe(180);
+    expect(storageSpy).not.toHaveBeenCalled();
   });
 
-  it('ignores stored value outside min/max range', () => {
-    localStorage.setItem('panel-width', '100');
+  it('inverts horizontal drag direction for a right-side panel', () => {
+    const onWidthCommit = vi.fn();
     const { result } = renderHook(() =>
       useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-        storageKey: 'panel-width',
-      })
-    );
-    expect(result.current.width).toBe(250);
-  });
-
-  it('ignores invalid stored value', () => {
-    localStorage.setItem('panel-width', 'not-a-number');
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-        storageKey: 'panel-width',
-      })
-    );
-    expect(result.current.width).toBe(250);
-  });
-
-  it('provides onMouseDown handler', () => {
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-      })
-    );
-    expect(result.current.onMouseDown).toBeInstanceOf(Function);
-  });
-
-  it('resizes on drag for left side panel', () => {
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-      })
-    );
-
-    // Simulate mouse down
-    act(() => {
-      result.current.onMouseDown({
-        preventDefault: vi.fn(),
-        clientX: 250,
-      } as unknown as React.MouseEvent);
-    });
-
-    // Simulate mouse move
-    act(() => {
-      window.dispatchEvent(new MouseEvent('mousemove', { clientX: 300 }));
-    });
-
-    expect(result.current.width).toBe(300); // 250 + (300 - 250) = 300
-
-    // Simulate mouse up
-    act(() => {
-      window.dispatchEvent(new MouseEvent('mouseup'));
-    });
-  });
-
-  it('resizes on drag for right side panel (delta is inverted)', () => {
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
+        width: 240,
+        minWidth: 56,
+        maxWidth: 340,
         side: 'right',
+        onWidthCommit,
       })
     );
 
     act(() => {
       result.current.onMouseDown({
+        clientX: 240,
         preventDefault: vi.fn(),
-        clientX: 250,
       } as unknown as React.MouseEvent);
     });
-
-    // Moving mouse left for right-side panel = increase width
-    act(() => {
-      window.dispatchEvent(new MouseEvent('mousemove', { clientX: 200 }));
-    });
-
-    expect(result.current.width).toBe(300); // 250 - (200 - 250) = 300
-
-    act(() => {
-      window.dispatchEvent(new MouseEvent('mouseup'));
-    });
-  });
-
-  it('clamps width to min/max bounds', () => {
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-      })
-    );
-
-    act(() => {
-      result.current.onMouseDown({
-        preventDefault: vi.fn(),
-        clientX: 250,
-      } as unknown as React.MouseEvent);
-    });
-
-    // Try to exceed max
-    act(() => {
-      window.dispatchEvent(new MouseEvent('mousemove', { clientX: 700 }));
-    });
-
-    expect(result.current.width).toBe(400); // clamped to max
-
-    act(() => {
-      window.dispatchEvent(new MouseEvent('mouseup'));
-    });
-  });
-
-  it('provides onKeyDown handler', () => {
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-      })
-    );
-    expect(result.current.onKeyDown).toBeInstanceOf(Function);
-  });
-
-  it('ArrowRight increases width for left side panel', () => {
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-      })
-    );
-
-    act(() => {
-      result.current.onKeyDown({
-        key: 'ArrowRight',
-        shiftKey: false,
-        preventDefault: vi.fn(),
-      } as unknown as React.KeyboardEvent);
-    });
-
-    expect(result.current.width).toBe(260);
-  });
-
-  it('ArrowLeft decreases width for left side panel', () => {
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-      })
-    );
-
-    act(() => {
-      result.current.onKeyDown({
-        key: 'ArrowLeft',
-        shiftKey: false,
-        preventDefault: vi.fn(),
-      } as unknown as React.KeyboardEvent);
-    });
-
-    expect(result.current.width).toBe(240);
-  });
-
-  it('ArrowRight decreases width for right side panel', () => {
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'right',
-      })
-    );
-
-    act(() => {
-      result.current.onKeyDown({
-        key: 'ArrowRight',
-        shiftKey: false,
-        preventDefault: vi.fn(),
-      } as unknown as React.KeyboardEvent);
-    });
-
-    expect(result.current.width).toBe(240);
-  });
-
-  it('Shift+ArrowRight increases width by 50px for left side panel', () => {
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-      })
-    );
-
-    act(() => {
-      result.current.onKeyDown({
-        key: 'ArrowRight',
-        shiftKey: true,
-        preventDefault: vi.fn(),
-      } as unknown as React.KeyboardEvent);
-    });
+    act(() => window.dispatchEvent(new MouseEvent('mousemove', { clientX: 180 })));
 
     expect(result.current.width).toBe(300);
+
+    act(() => window.dispatchEvent(new MouseEvent('mouseup')));
+    expect(onWidthCommit).toHaveBeenCalledWith(300);
   });
 
-  it('clamps keyboard resize to min/max', () => {
+  it('clamps transient drag width to both bounds', () => {
+    const onWidthCommit = vi.fn();
     const { result } = renderHook(() =>
       useResizablePanel({
-        defaultWidth: 395,
-        minWidth: 200,
+        width: 240,
+        minWidth: 56,
         maxWidth: 400,
         side: 'left',
+        onWidthCommit,
       })
     );
 
-    // Try to go past max
     act(() => {
-      result.current.onKeyDown({
-        key: 'ArrowRight',
-        shiftKey: true,
+      result.current.onMouseDown({
+        clientX: 240,
         preventDefault: vi.fn(),
-      } as unknown as React.KeyboardEvent);
+      } as unknown as React.MouseEvent);
     });
-
+    act(() => window.dispatchEvent(new MouseEvent('mousemove', { clientX: 800 })));
     expect(result.current.width).toBe(400);
 
-    // Now test min clamping with a fresh hook
-    const { result: result2 } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 205,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-      })
+    act(() => window.dispatchEvent(new MouseEvent('mousemove', { clientX: -100 })));
+    expect(result.current.width).toBe(56);
+
+    act(() => window.dispatchEvent(new MouseEvent('mouseup')));
+    expect(onWidthCommit).toHaveBeenCalledWith(56);
+  });
+
+  it('commits normal and Shift+Arrow keyboard steps immediately', () => {
+    const onWidthCommit = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ width }) =>
+        useResizablePanel({
+          width,
+          minWidth: 56,
+          maxWidth: 400,
+          side: 'left',
+          onWidthCommit,
+        }),
+      { initialProps: { width: 240 } }
     );
+    const normalPreventDefault = vi.fn();
 
     act(() => {
-      result2.current.onKeyDown({
+      result.current.onKeyDown({
+        key: 'ArrowRight',
+        shiftKey: false,
+        preventDefault: normalPreventDefault,
+      } as unknown as React.KeyboardEvent);
+    });
+    expect(normalPreventDefault).toHaveBeenCalledTimes(1);
+    expect(onWidthCommit).toHaveBeenLastCalledWith(250);
+
+    rerender({ width: 250 });
+    act(() => {
+      result.current.onKeyDown({
         key: 'ArrowLeft',
         shiftKey: true,
         preventDefault: vi.fn(),
       } as unknown as React.KeyboardEvent);
     });
-
-    expect(result2.current.width).toBe(200);
+    expect(onWidthCommit).toHaveBeenLastCalledWith(200);
+    expect(onWidthCommit).toHaveBeenCalledTimes(2);
   });
 
-  it('persists width to localStorage on keyboard resize', () => {
-    const { result } = renderHook(() =>
-      useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
-        maxWidth: 400,
-        side: 'left',
-        storageKey: 'panel-width',
-      })
+  it('inverts keyboard direction on the right and clamps commits', () => {
+    const onWidthCommit = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ width }) =>
+        useResizablePanel({
+          width,
+          minWidth: 56,
+          maxWidth: 340,
+          side: 'right',
+          onWidthCommit,
+        }),
+      { initialProps: { width: 60 } }
     );
 
     act(() => {
@@ -318,36 +167,173 @@ describe('useResizablePanel', () => {
         preventDefault: vi.fn(),
       } as unknown as React.KeyboardEvent);
     });
+    expect(onWidthCommit).toHaveBeenLastCalledWith(56);
 
-    expect(localStorage.getItem('panel-width')).toBe('260');
+    rerender({ width: 330 });
+    act(() => {
+      result.current.onKeyDown({
+        key: 'ArrowLeft',
+        shiftKey: true,
+        preventDefault: vi.fn(),
+      } as unknown as React.KeyboardEvent);
+    });
+    expect(onWidthCommit).toHaveBeenLastCalledWith(340);
   });
 
-  it('persists width to localStorage on mouse up', () => {
+  it('ignores drag and keyboard input while disabled', () => {
+    const onWidthCommit = vi.fn();
+    const mousePreventDefault = vi.fn();
+    const keyPreventDefault = vi.fn();
     const { result } = renderHook(() =>
       useResizablePanel({
-        defaultWidth: 250,
-        minWidth: 200,
+        width: 240,
+        minWidth: 56,
         maxWidth: 400,
         side: 'left',
-        storageKey: 'panel-width',
+        disabled: true,
+        onWidthCommit,
       })
     );
 
     act(() => {
       result.current.onMouseDown({
-        preventDefault: vi.fn(),
-        clientX: 250,
+        clientX: 240,
+        preventDefault: mousePreventDefault,
       } as unknown as React.MouseEvent);
-    });
-
-    act(() => {
-      window.dispatchEvent(new MouseEvent('mousemove', { clientX: 280 }));
-    });
-
-    act(() => {
+      result.current.onKeyDown({
+        key: 'ArrowRight',
+        shiftKey: false,
+        preventDefault: keyPreventDefault,
+      } as unknown as React.KeyboardEvent);
+      window.dispatchEvent(new MouseEvent('mousemove', { clientX: 300 }));
       window.dispatchEvent(new MouseEvent('mouseup'));
     });
 
-    expect(localStorage.getItem('panel-width')).toBe('280');
+    expect(mousePreventDefault).not.toHaveBeenCalled();
+    expect(keyPreventDefault).not.toHaveBeenCalled();
+    expect(result.current.width).toBe(240);
+    expect(result.current.isResizing).toBe(false);
+    expect(onWidthCommit).not.toHaveBeenCalled();
+  });
+
+  it('keeps the active draft when the controlled width changes during a drag', () => {
+    const onWidthCommit = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ width }) =>
+        useResizablePanel({
+          width,
+          minWidth: 56,
+          maxWidth: 400,
+          side: 'left',
+          onWidthCommit,
+        }),
+      { initialProps: { width: 240 } }
+    );
+
+    act(() => {
+      result.current.onMouseDown({
+        clientX: 240,
+        preventDefault: vi.fn(),
+      } as unknown as React.MouseEvent);
+    });
+    act(() => window.dispatchEvent(new MouseEvent('mousemove', { clientX: 300 })));
+
+    rerender({ width: 180 });
+    expect(result.current.width).toBe(300);
+
+    act(() => window.dispatchEvent(new MouseEvent('mouseup')));
+    expect(onWidthCommit).toHaveBeenCalledWith(300);
+    expect(result.current.width).toBe(180);
+
+    rerender({ width: 210 });
+    expect(result.current.width).toBe(210);
+  });
+
+  it('uses the latest commit callback when it changes during a drag', () => {
+    const firstCommit = vi.fn();
+    const latestCommit = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ onWidthCommit }) =>
+        useResizablePanel({
+          width: 240,
+          minWidth: 56,
+          maxWidth: 400,
+          side: 'left',
+          onWidthCommit,
+        }),
+      { initialProps: { onWidthCommit: firstCommit } }
+    );
+
+    act(() => {
+      result.current.onMouseDown({
+        clientX: 240,
+        preventDefault: vi.fn(),
+      } as unknown as React.MouseEvent);
+    });
+    act(() => window.dispatchEvent(new MouseEvent('mousemove', { clientX: 300 })));
+    rerender({ onWidthCommit: latestCommit });
+    act(() => window.dispatchEvent(new MouseEvent('mouseup')));
+
+    expect(firstCommit).not.toHaveBeenCalled();
+    expect(latestCommit).toHaveBeenCalledWith(300);
+  });
+
+  it('restores body styles and removes active listeners on unmount', () => {
+    const onWidthCommit = vi.fn();
+    document.body.style.cursor = 'wait';
+    document.body.style.userSelect = 'text';
+    const { result, unmount } = renderHook(() =>
+      useResizablePanel({
+        width: 240,
+        minWidth: 56,
+        maxWidth: 400,
+        side: 'left',
+        onWidthCommit,
+      })
+    );
+
+    act(() => {
+      result.current.onMouseDown({
+        clientX: 240,
+        preventDefault: vi.fn(),
+      } as unknown as React.MouseEvent);
+    });
+    expect(document.body.style.cursor).toBe('col-resize');
+    expect(document.body.style.userSelect).toBe('none');
+
+    unmount();
+    expect(document.body.style.cursor).toBe('wait');
+    expect(document.body.style.userSelect).toBe('text');
+
+    act(() => {
+      window.dispatchEvent(new MouseEvent('mousemove', { clientX: 300 }));
+      window.dispatchEvent(new MouseEvent('mouseup'));
+    });
+    expect(onWidthCommit).not.toHaveBeenCalled();
+  });
+
+  it('ignores non-arrow keyboard input', () => {
+    const onWidthCommit = vi.fn();
+    const preventDefault = vi.fn();
+    const { result } = renderHook(() =>
+      useResizablePanel({
+        width: 240,
+        minWidth: 56,
+        maxWidth: 400,
+        side: 'left',
+        onWidthCommit,
+      })
+    );
+
+    act(() => {
+      result.current.onKeyDown({
+        key: 'Enter',
+        shiftKey: false,
+        preventDefault,
+      } as unknown as React.KeyboardEvent);
+    });
+
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(onWidthCommit).not.toHaveBeenCalled();
   });
 });

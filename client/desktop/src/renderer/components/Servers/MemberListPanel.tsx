@@ -188,7 +188,7 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
 
   return (
     <div className="members-list">
-      <div className="member-list-header">
+      <div className="settings-member-list-header">
         <span>User</span>
         <span>Roles</span>
       </div>

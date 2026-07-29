@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { MessageSquare, Users, BookOpen, UserPlus, PenLine } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback, useId } from 'react';
+import { MessageSquare, Users, BookOpen, MessagesSquare, PenLine, Search } from 'lucide-react';
 import { useDMStore, type DMConversation, type DMParticipant } from '../../stores/dmStore';
 import {
   useNotificationPrefsStore,
@@ -7,7 +7,7 @@ import {
 } from '../../stores/notificationPrefsStore';
 import { useUserStore } from '../../stores/userStore';
 import { useVoiceStore } from '../../stores/voiceStore';
-import { useFriendStore } from '../../stores/friendStore';
+import { useFriendStore, type Friend } from '../../stores/friendStore';
 import { e2eeService } from '../../services/e2eeService';
 import { subscribeSearchScopeInvalidations } from '../../services/searchService';
 import { useDraftMessageStore } from '../../stores/draftMessageStore';
@@ -20,9 +20,11 @@ import ConfirmActionModal from '../ui/ConfirmActionModal';
 import { DIRECT_MESSAGES_CONTEXT_AREA } from '../ui/ContextMenuProvider';
 import DMConversationContextMenu from './DMConversationContextMenu';
 import DMProfileModal from './DMProfileModal';
+import { AttributedPopover } from '../Layout/AttributedPopover';
 import './DirectMessages.css';
 
 interface ConversationListProps {
+  compact?: boolean;
   selectedThreadId: string | null;
   onSelectThread: (id: string) => void;
 }
@@ -109,11 +111,268 @@ const ConversationAvatar: React.FC<ConversationAvatarProps> = ({
   );
 };
 
+interface ConversationItemProps {
+  conv: DMConversation;
+  compact: boolean;
+  currentUserId: string;
+  friends: Friend[];
+  muted: boolean;
+  hasDraft: boolean;
+  activeCallParticipantIds?: string[];
+  isInOwnCall: boolean;
+  decryptedPreview?: string;
+  selected: boolean;
+  onSelectThread: (id: string) => void;
+  onOpenContextMenu: (value: {
+    conversation: DMConversation;
+    position: { x: number; y: number };
+  }) => void;
+}
+
+interface ConversationItemViewProps {
+  conv: DMConversation;
+  currentUserId: string;
+  other?: DMParticipant;
+  status: string;
+  name: string;
+  showUnread: boolean;
+  hasDraft: boolean;
+  boundedUnread: string | number;
+  callLabel: string | null;
+  activeCallParticipantIds?: string[];
+  selected: boolean;
+  onSelect: () => void;
+  onContextMenu: (event: React.MouseEvent) => void;
+}
+
+function getConversationCallLabel(
+  conv: DMConversation,
+  activeCallParticipantIds: string[] | undefined,
+  isInOwnCall: boolean
+): string | null {
+  if (conv.isGroup && activeCallParticipantIds) {
+    return `${activeCallParticipantIds.length} of ${conv.participants.length} in call`;
+  }
+  if (isInOwnCall) return 'In voice call';
+  return null;
+}
+
+function getConversationPreview(
+  conv: DMConversation,
+  currentUserId: string,
+  decryptedPreview: string | undefined
+): string {
+  if (!conv.lastMessage) return '';
+  const hasPlaintextPreview = conv.lastMessage.plaintextPreview !== undefined;
+  const previewContent = hasPlaintextPreview
+    ? conv.lastMessage.plaintextPreview
+    : (decryptedPreview ?? '');
+  return formatMessagePreview({
+    content: previewContent,
+    gifSlug: hasPlaintextPreview ? conv.lastMessage.gifSlug : undefined,
+    attachmentType: conv.lastMessage.attachmentType,
+    callEventPayload: conv.lastMessage.callEventPayload,
+    currentUserId,
+    fallback: 'Encrypted message',
+  });
+}
+
+const CompactConversationItem: React.FC<ConversationItemViewProps> = ({
+  conv,
+  currentUserId,
+  other,
+  status,
+  name,
+  showUnread,
+  hasDraft,
+  boundedUnread,
+  callLabel,
+  selected,
+  onSelect,
+  onContextMenu,
+}) => {
+  const ariaLabel = [
+    name,
+    showUnread ? `${boundedUnread} unread` : null,
+    hasDraft ? 'Draft' : null,
+    callLabel,
+  ]
+    .filter(Boolean)
+    .join(', ');
+
+  return (
+    <button
+      type="button"
+      className={`conversation-item conversation-item--compact${selected ? ' active' : ''}${showUnread ? ' unread' : ''}`}
+      aria-label={ariaLabel}
+      title={name}
+      onClick={onSelect}
+      onContextMenu={onContextMenu}
+    >
+      <ConversationAvatar conv={conv} currentUserId={currentUserId} other={other} status={status} />
+      {hasDraft && <PenLine className="conversation-compact-draft" size={12} aria-hidden="true" />}
+      {showUnread && (
+        <span className="conversation-unread-badge" aria-hidden="true">
+          {boundedUnread}
+        </span>
+      )}
+    </button>
+  );
+};
+
+const ConversationCallBadge: React.FC<
+  Pick<ConversationItemViewProps, 'conv' | 'activeCallParticipantIds' | 'callLabel'>
+> = ({ conv, activeCallParticipantIds, callLabel }) => {
+  if (conv.isGroup && activeCallParticipantIds) {
+    return (
+      <span
+        className="conversation-in-call-badge group"
+        title={callLabel ?? undefined}
+        aria-label={callLabel ?? undefined}
+      >
+        {activeCallParticipantIds.length} of {conv.participants.length} in call
+      </span>
+    );
+  }
+  if (!callLabel) return null;
+  return (
+    <span className="conversation-in-call-badge" title={callLabel} aria-label={callLabel}>
+      🔊
+    </span>
+  );
+};
+
+interface StandardConversationItemProps extends ConversationItemViewProps {
+  preview: string;
+  lastTime: string;
+}
+
+const StandardConversationItem: React.FC<StandardConversationItemProps> = ({
+  conv,
+  currentUserId,
+  other,
+  status,
+  name,
+  showUnread,
+  hasDraft,
+  boundedUnread,
+  callLabel,
+  activeCallParticipantIds,
+  selected,
+  preview,
+  lastTime,
+  onSelect,
+  onContextMenu,
+}) => (
+  <button
+    type="button"
+    className={`conversation-item${selected ? ' active' : ''}${showUnread ? ' unread' : ''}`}
+    onClick={onSelect}
+    onContextMenu={onContextMenu}
+    onKeyDown={(event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        onSelect();
+      }
+    }}
+    aria-label={name}
+  >
+    <ConversationAvatar conv={conv} currentUserId={currentUserId} other={other} status={status} />
+
+    <div className="conversation-content">
+      <div className="conversation-top-row">
+        <span className="conversation-name">{name}</span>
+        <span className="conversation-time">{getRelativeTime(lastTime)}</span>
+      </div>
+      <div className="conversation-bottom-row">
+        <span className="conversation-preview">{preview}</span>
+        <div className="conversation-badges">
+          {/* Group conversations surface joinable calls even when the local user has not joined;
+              1:1 conversations keep the local in-call indicator. */}
+          <ConversationCallBadge
+            conv={conv}
+            activeCallParticipantIds={activeCallParticipantIds}
+            callLabel={callLabel}
+          />
+          {hasDraft && (
+            <span className="conversation-draft-indicator" title="Draft message">
+              <PenLine size={12} />
+            </span>
+          )}
+          {showUnread && <span className="conversation-unread-badge">{boundedUnread}</span>}
+        </div>
+      </div>
+    </div>
+  </button>
+);
+
+const ConversationItem: React.FC<ConversationItemProps> = ({
+  conv,
+  compact,
+  currentUserId,
+  friends,
+  muted,
+  hasDraft,
+  activeCallParticipantIds,
+  isInOwnCall,
+  decryptedPreview,
+  selected,
+  onSelectThread,
+  onOpenContextMenu,
+}) => {
+  const name = getConversationName(conv, currentUserId);
+  const other = conv.isGroup
+    ? undefined
+    : conv.participants.find((participant) => participant.userId !== currentUserId);
+  const friendStatus = other
+    ? friends.find((friend) => friend.userId === other.userId)?.status
+    : undefined;
+  const status = friendStatus ?? other?.status ?? 'offline';
+  const showUnread = conv.unreadCount > 0 && !muted;
+  const boundedUnread = conv.unreadCount > 99 ? '99+' : conv.unreadCount;
+  const callLabel = getConversationCallLabel(conv, activeCallParticipantIds, isInOwnCall);
+  const onSelect = () => onSelectThread(conv.id);
+  const onContextMenu = (event: React.MouseEvent) => {
+    event.preventDefault();
+    onOpenContextMenu({
+      conversation: conv,
+      position: { x: event.clientX, y: event.clientY },
+    });
+  };
+  const sharedProps: ConversationItemViewProps = {
+    conv,
+    currentUserId,
+    other,
+    status,
+    name,
+    showUnread,
+    hasDraft,
+    boundedUnread,
+    callLabel,
+    activeCallParticipantIds,
+    selected,
+    onSelect,
+    onContextMenu,
+  };
+
+  if (compact) return <CompactConversationItem {...sharedProps} />;
+  return (
+    <StandardConversationItem
+      {...sharedProps}
+      preview={getConversationPreview(conv, currentUserId, decryptedPreview)}
+      lastTime={conv.lastMessage?.createdAt || conv.createdAt}
+    />
+  );
+};
+
 const ConversationList: React.FC<ConversationListProps> = ({
+  compact = false,
   selectedThreadId,
   onSelectThread,
 }) => {
   const [search, setSearch] = useState('');
+  const [searchAnchor, setSearchAnchor] = useState<HTMLElement | null>(null);
+  const searchTriggerId = useId();
   const [isCreateGroupOpen, setIsCreateGroupOpen] = useState(false);
   const [contextMenu, setContextMenu] = useState<{
     conversation: DMConversation;
@@ -228,10 +487,10 @@ const ConversationList: React.FC<ConversationListProps> = ({
 
   const filtered = conversations
     .filter((c) => !c.isPersonal)
-    .filter((c) => {
-      const name = getConversationName(c, currentUserId);
-      return name.toLowerCase().includes(search.toLowerCase());
-    });
+    .filter((c) =>
+      getConversationName(c, currentUserId).toLowerCase().includes(search.toLowerCase())
+    );
+  const activeSearchAnchor = compact && searchAnchor?.isConnected ? searchAnchor : null;
 
   const handleOpenPersonalThread = async () => {
     try {
@@ -242,30 +501,96 @@ const ConversationList: React.FC<ConversationListProps> = ({
     }
   };
 
+  const contextMenuElement = contextMenu ? (
+    <DMConversationContextMenu
+      conversation={contextMenu.conversation}
+      currentUserId={currentUserId}
+      position={contextMenu.position}
+      onClose={() => setContextMenu(null)}
+      onBlockUser={(conv) => setBlockTarget(conv)}
+      onUnfriend={(conv) => setUnfriendTarget(conv)}
+      onViewProfile={(conv) => setProfileTarget(conv)}
+    />
+  ) : null;
+
   return (
-    <div className="conversation-list" data-context-area={DIRECT_MESSAGES_CONTEXT_AREA}>
-      <div className="conversation-search">
-        <input
-          type="text"
-          placeholder="Search conversations..."
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
-        <button
-          type="button"
-          className="create-group-btn"
-          onClick={() => setIsCreateGroupOpen(true)}
-          aria-label="Create Group DM"
-          title="Create Group DM"
-        >
-          <UserPlus size={16} />
-        </button>
-      </div>
+    <div
+      className={`conversation-list${compact ? ' conversation-list--compact' : ''}`}
+      data-context-area={DIRECT_MESSAGES_CONTEXT_AREA}
+    >
+      {compact && (
+        <>
+          <button
+            id={`${searchTriggerId}-thread-search`}
+            type="button"
+            className="conversation-item conversation-item--compact conversation-search-trigger"
+            aria-label="Search conversations"
+            title="Search conversations"
+            aria-expanded={activeSearchAnchor !== null}
+            aria-controls={`${searchTriggerId}-thread-search-popover`}
+            onClick={(event) =>
+              setSearchAnchor((current) =>
+                current === event.currentTarget ? null : event.currentTarget
+              )
+            }
+          >
+            <Search size={20} />
+          </button>
+          <AttributedPopover
+            id={`${searchTriggerId}-thread-search-popover`}
+            anchor={activeSearchAnchor}
+            label="Search conversations"
+            open={activeSearchAnchor !== null}
+            placement="right"
+            onClose={() => setSearchAnchor(null)}
+          >
+            <div className="conversation-search conversation-search--popover">
+              <input
+                type="text"
+                placeholder="Search conversations..."
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                autoFocus
+              />
+            </div>
+          </AttributedPopover>
+          <button
+            id={`${searchTriggerId}-create-group`}
+            type="button"
+            className="conversation-item conversation-item--compact"
+            onClick={() => setIsCreateGroupOpen(true)}
+            aria-label="Create Group DM"
+            title="Create Group DM"
+          >
+            <MessagesSquare size={20} aria-hidden="true" />
+          </button>
+        </>
+      )}
+      {!compact && (
+        <div className="conversation-search">
+          <input
+            type="text"
+            placeholder="Search conversations..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <button
+            id={`${searchTriggerId}-create-group`}
+            type="button"
+            className="create-group-btn"
+            onClick={() => setIsCreateGroupOpen(true)}
+            aria-label="Create Group DM"
+            title="Create Group DM"
+          >
+            <MessagesSquare size={16} />
+          </button>
+        </div>
+      )}
 
       {/* Pinned Personal Thread */}
       <button
         type="button"
-        className={`conversation-item personal-thread${
+        className={`conversation-item personal-thread${compact ? ' conversation-item--compact' : ''}${
           personalThread && selectedThreadId === personalThread.id ? ' active' : ''
         }`}
         onClick={handleOpenPersonalThread}
@@ -276,146 +601,43 @@ const ConversationList: React.FC<ConversationListProps> = ({
           }
         }}
         aria-label="Personal Thread"
+        title={compact ? 'Personal Thread' : undefined}
       >
         <div className="conversation-avatar personal-thread-avatar">
           <BookOpen size={14} />
         </div>
-        <span className="conversation-name personal-thread-name">Personal Thread</span>
+        {!compact && (
+          <span className="conversation-name personal-thread-name">Personal Thread</span>
+        )}
       </button>
       <div className="personal-thread-divider" />
 
-      {filtered.length === 0 ? (
-        <div className="conversation-list-empty">
-          <MessageSquare size={32} />
-          <p>No conversations yet</p>
-        </div>
-      ) : (
-        filtered.map((conv) => {
-          const name = getConversationName(conv, currentUserId);
-          const other = conv.isGroup
-            ? null
-            : conv.participants.find((p) => p.userId !== currentUserId);
-          const friendStatus = other
-            ? friends.find((f) => f.userId === other.userId)?.status
-            : undefined;
-          const participantStatus = other?.status;
-          const status = friendStatus ?? participantStatus ?? 'offline';
-          const lastTime = conv.lastMessage?.createdAt || conv.createdAt;
-          // A muted conversation shows no unread affordance (badge or row
-          // highlight); the count itself is preserved in the store.
-          const showUnread = conv.unreadCount > 0 && !isEntryCurrentlyMuted(mutedDMs.get(conv.id));
-          let preview = '';
-          if (conv.lastMessage) {
-            const hasPlaintextPreview = conv.lastMessage.plaintextPreview !== undefined;
-            const previewContent = hasPlaintextPreview
-              ? conv.lastMessage.plaintextPreview
-              : (decryptedPreviews[conv.id]?.text ?? '');
-            preview = formatMessagePreview({
-              content: previewContent,
-              gifSlug: hasPlaintextPreview ? conv.lastMessage.gifSlug : undefined,
-              attachmentType: conv.lastMessage.attachmentType,
-              callEventPayload: conv.lastMessage.callEventPayload,
-              currentUserId,
-              fallback: 'Encrypted message',
-            });
-          }
-
-          return (
-            <button
-              type="button"
+      {filtered.length === 0
+        ? !compact && (
+            <div className="conversation-list-empty">
+              <MessageSquare size={32} />
+              <p>No conversations yet</p>
+            </div>
+          )
+        : filtered.map((conv) => (
+            <ConversationItem
               key={conv.id}
-              className={`conversation-item${selectedThreadId === conv.id ? ' active' : ''}${showUnread ? ' unread' : ''}`}
-              onClick={() => onSelectThread(conv.id)}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                setContextMenu({
-                  conversation: conv,
-                  position: { x: e.clientX, y: e.clientY },
-                });
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  onSelectThread(conv.id);
-                }
-              }}
-              aria-label={name}
-            >
-              <ConversationAvatar
-                conv={conv}
-                currentUserId={currentUserId}
-                other={other ?? undefined}
-                status={status}
-              />
-
-              <div className="conversation-content">
-                <div className="conversation-top-row">
-                  <span className="conversation-name">{name}</span>
-                  <span className="conversation-time">{getRelativeTime(lastTime)}</span>
-                </div>
-                <div className="conversation-bottom-row">
-                  <span className="conversation-preview">{preview}</span>
-                  <div className="conversation-badges">
-                    {/* In-call indicator. Group conversations with an active
-                        voice call show a multi-participant "N of M in call"
-                        tally (#1219 R6) — surfaced even for calls the local
-                        user has NOT joined, so the list advertises joinable
-                        calls. 1:1 conversations keep the 🔊 badge (#1209 F5),
-                        shown only when the local user IS in the call.
-                        M = the live `conv.participants.length` (this conv is
-                        loaded — we're rendering it), NOT the stored roster
-                        `total`, which can be 0 if the dm_voice_state_update
-                        delta arrived before the conversation was in dmStore
-                        (#1568 Gitar "N of 0 in call" edge-case fix). */}
-                    {conv.isGroup && activeDMCalls[conv.id] ? (
-                      <span
-                        className="conversation-in-call-badge group"
-                        title={`${activeDMCalls[conv.id].participantIds.length} of ${conv.participants.length} in call`}
-                        aria-label={`${activeDMCalls[conv.id].participantIds.length} of ${conv.participants.length} in call`}
-                      >
-                        {activeDMCalls[conv.id].participantIds.length} of {conv.participants.length}{' '}
-                        in call
-                      </span>
-                    ) : (
-                      inCallForThisConv === conv.id && (
-                        <span
-                          className="conversation-in-call-badge"
-                          title="In voice call"
-                          aria-label="In voice call"
-                        >
-                          🔊
-                        </span>
-                      )
-                    )}
-                    {drafts[conv.id] && (
-                      <span className="conversation-draft-indicator" title="Draft message">
-                        <PenLine size={12} />
-                      </span>
-                    )}
-                    {showUnread && (
-                      <span className="conversation-unread-badge">
-                        {conv.unreadCount > 99 ? '99+' : conv.unreadCount}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </button>
-          );
-        })
-      )}
+              conv={conv}
+              compact={compact}
+              currentUserId={currentUserId}
+              friends={friends}
+              muted={isEntryCurrentlyMuted(mutedDMs.get(conv.id))}
+              hasDraft={Boolean(drafts[conv.id])}
+              activeCallParticipantIds={activeDMCalls[conv.id]?.participantIds}
+              isInOwnCall={inCallForThisConv === conv.id}
+              decryptedPreview={decryptedPreviews[conv.id]?.text}
+              selected={selectedThreadId === conv.id}
+              onSelectThread={onSelectThread}
+              onOpenContextMenu={setContextMenu}
+            />
+          ))}
       <CreateGroupModal isOpen={isCreateGroupOpen} onClose={() => setIsCreateGroupOpen(false)} />
-      {contextMenu && (
-        <DMConversationContextMenu
-          conversation={contextMenu.conversation}
-          currentUserId={currentUserId}
-          position={contextMenu.position}
-          onClose={() => setContextMenu(null)}
-          onBlockUser={(conv) => setBlockTarget(conv)}
-          onUnfriend={(conv) => setUnfriendTarget(conv)}
-          onViewProfile={(conv) => setProfileTarget(conv)}
-        />
-      )}
+      {contextMenuElement}
 
       {/* Block-user confirmation (#984). The peer is computed from the
           conversation's participants by filtering out the current user. The

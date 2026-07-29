@@ -4,8 +4,11 @@ import { useFriendStore } from '@/renderer/stores/friendStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
+import { useDraftMessageStore } from '@/renderer/stores/draftMessageStore';
+import { useLayoutStore } from '@/renderer/stores/layoutStore';
 import { API_BASE } from '@/renderer/config';
 import { vi } from 'vitest';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock e2eeService
 vi.mock('@/renderer/services/e2eeService', () => ({
@@ -19,6 +22,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 }));
 
 import ConversationList from '@/renderer/components/DirectMessages/ConversationList';
+import { DockOverlayProvider, DockShell } from '@/renderer/components/Layout/DockShell';
 import ContextMenuProvider from '@/renderer/components/ui/ContextMenuProvider';
 import { e2eeService } from '@/renderer/services/e2eeService';
 
@@ -52,6 +56,7 @@ describe('ConversationList', () => {
   const mockOnSelectThread = vi.fn();
 
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
     (e2eeService as any).isInitialized = false;
     (e2eeService.createChannelOperationGuard as ReturnType<typeof vi.fn>).mockImplementation(
@@ -82,6 +87,7 @@ describe('ConversationList', () => {
       openPersonalThread: vi.fn().mockResolvedValue(personalThread),
     });
     useFriendStore.setState({ friends: [] });
+    useDraftMessageStore.getState().clearAllDrafts();
   });
 
   it('renders conversation list container', () => {
@@ -1290,6 +1296,268 @@ describe('ConversationList', () => {
       expect(container.querySelector('.conversation-unread-badge')).toBeInTheDocument();
       expect(screen.getByText('5')).toBeInTheDocument();
       expect(container.querySelector('.conversation-item.unread')).toBeInTheDocument();
+    });
+  });
+
+  describe('thread sidebar presentations', () => {
+    it('renders personal, one-to-one, fallback group, and search controls', () => {
+      const group = makeConversation({
+        id: 'group-1',
+        isGroup: true,
+        name: null,
+        participants: [
+          { userId: 'user-1', username: 'me', displayName: 'Me' },
+          { userId: 'user-2', username: 'alice', displayName: 'Alice' },
+          { userId: 'user-3', username: 'bob', displayName: 'Bob' },
+        ],
+      });
+      useDMStore.setState({
+        conversations: [personalThread, makeConversation({ unreadCount: 2 }), group],
+      });
+      useDraftMessageStore.getState().setDraft('conv-1', {
+        text: 'unfinished',
+        updatedAt: 1,
+      });
+
+      const { container } = render(
+        <ConversationList compact selectedThreadId="group-1" onSelectThread={mockOnSelectThread} />
+      );
+
+      expect(screen.getByRole('button', { name: /Personal Thread/i })).toBeVisible();
+      expect(screen.getByRole('button', { name: /Alice.*2 unread.*draft/i })).toBeVisible();
+      expect(screen.getByRole('button', { name: 'Me, Alice, Bob' })).toBeVisible();
+      expect(screen.queryByPlaceholderText('Search conversations...')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Search conversations' })).toBeVisible();
+      expect(screen.getByRole('button', { name: 'Me, Alice, Bob' })).toHaveClass('active');
+      expect(container.querySelector('.conversation-list--compact')).toBeInTheDocument();
+
+      fireEvent.contextMenu(screen.getByRole('button', { name: /Alice, 2 unread, draft/i }));
+      const viewProfileAction = screen.getByRole('button', { name: 'View Profile' });
+      expect(viewProfileAction).toBeVisible();
+      fireEvent.click(viewProfileAction);
+      expect(screen.getByRole('dialog')).toBeVisible();
+      expect(screen.getByText('@alice')).toBeVisible();
+    });
+
+    it('preserves an active search when the standard list rerenders compact', () => {
+      useDMStore.setState({
+        conversations: [
+          makeConversation(),
+          makeConversation({
+            id: 'conv-2',
+            participants: [
+              { userId: 'user-1', username: 'me', displayName: 'Me' },
+              { userId: 'user-3', username: 'bob', displayName: 'Bob' },
+            ],
+          }),
+        ],
+      });
+      const { rerender } = render(
+        <ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+      );
+      fireEvent.change(screen.getByPlaceholderText('Search conversations...'), {
+        target: { value: 'Alice' },
+      });
+      expect(screen.getByRole('button', { name: 'Alice' })).toBeVisible();
+      expect(screen.queryByRole('button', { name: 'Bob' })).not.toBeInTheDocument();
+
+      rerender(
+        <ConversationList compact selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+      );
+
+      expect(screen.queryByPlaceholderText('Search conversations...')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Alice' })).toBeVisible();
+      expect(screen.queryByRole('button', { name: 'Bob' })).not.toBeInTheDocument();
+    });
+
+    it('opens search outward from the compact icon and filters conversations', () => {
+      useDMStore.setState({
+        conversations: [
+          makeConversation(),
+          makeConversation({
+            id: 'conv-2',
+            participants: [
+              { userId: 'user-1', username: 'me', displayName: 'Me' },
+              { userId: 'user-3', username: 'bob', displayName: 'Bob' },
+            ],
+          }),
+        ],
+      });
+      render(
+        <ConversationList compact selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+      );
+
+      const trigger = screen.getByRole('button', { name: 'Search conversations' });
+      fireEvent.click(trigger);
+
+      const popover = screen.getByRole('region', { name: 'Search conversations' });
+      const input = screen.getByPlaceholderText('Search conversations...');
+      expect(popover).toHaveAttribute('data-placement', 'right');
+      expect(input).toHaveFocus();
+
+      fireEvent.change(input, { target: { value: 'Bob' } });
+      expect(screen.queryByRole('button', { name: 'Alice' })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Bob' })).toBeVisible();
+
+      fireEvent.keyDown(document, { key: 'Escape' });
+      expect(screen.queryByPlaceholderText('Search conversations...')).not.toBeInTheDocument();
+      expect(trigger).toHaveFocus();
+    });
+
+    it('opens Create Group DM from the compact rail (#1750)', () => {
+      useDMStore.setState({ conversations: [makeConversation()] });
+      const { container } = render(
+        <ConversationList compact selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+      );
+
+      const createGroup = screen.getByRole('button', { name: 'Create Group DM' });
+      expect(createGroup.querySelector('.lucide-messages-square')).toBeInTheDocument();
+      expect(
+        Array.from(container.querySelectorAll('.conversation-list--compact > button')).map(
+          (button) => button.getAttribute('title')
+        )
+      ).toEqual(['Search conversations', 'Create Group DM', 'Personal Thread', 'Alice']);
+
+      fireEvent.click(createGroup);
+      expect(screen.getByRole('dialog', { name: 'Create Group DM' })).toBeVisible();
+    });
+
+    it.each([
+      ['compact', 56],
+      ['standard', 240],
+    ] as const)(
+      'keeps an unpinned %s rail open while Create Group DM owns focus (#1750)',
+      (_presentation, width) => {
+        const sidebarProfiles = useLayoutStore.getState().sidebarProfiles;
+        useLayoutStore.setState({
+          sidebarLayoutsDecoupled: true,
+          sidebarProfiles: {
+            ...sidebarProfiles,
+            dm: { ...sidebarProfiles.dm, left: { width, pinned: false } },
+          },
+        });
+
+        const { container } = render(
+          <DockOverlayProvider>
+            <DockShell
+              context="dm"
+              side="left"
+              label="Threads"
+              header={<span>DMs</span>}
+              renderBody={(compact) => (
+                <ConversationList
+                  compact={compact}
+                  selectedThreadId={null}
+                  onSelectThread={mockOnSelectThread}
+                />
+              )}
+            />
+          </DockOverlayProvider>
+        );
+        const surface = container.querySelector('.dock-shell__surface') as HTMLElement;
+        const lip = screen.getByRole('button', { name: 'Open Threads sidebar' });
+        act(() => lip.focus());
+        const trigger = screen.getByRole('button', { name: 'Create Group DM' });
+        act(() => trigger.focus());
+
+        fireEvent.click(trigger);
+
+        expect(screen.getByRole('dialog', { name: 'Create Group DM' })).toBeVisible();
+        expect(screen.getByPlaceholderText('Search friends...')).toHaveFocus();
+        expect(surface).toHaveAttribute('data-state', 'open');
+
+        fireEvent.keyDown(document, { key: 'Escape' });
+
+        expect(screen.queryByRole('dialog', { name: 'Create Group DM' })).not.toBeInTheDocument();
+        expect(trigger).toHaveFocus();
+        expect(surface).toHaveAttribute('data-state', 'open');
+      }
+    );
+
+    it('opens the personal thread from its compact button', async () => {
+      const openPersonalThread = vi.fn().mockResolvedValue(personalThread);
+      useDMStore.setState({
+        conversations: [personalThread],
+        openPersonalThread,
+      });
+
+      render(
+        <ConversationList compact selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Personal Thread' }));
+
+      await waitFor(() => {
+        expect(openPersonalThread).toHaveBeenCalledTimes(1);
+        expect(mockOnSelectThread).toHaveBeenCalledWith('personal-1');
+      });
+    });
+
+    it('keeps one-to-one presence and omits muted unread state', () => {
+      useFriendStore.getState().addFriend({
+        id: 'friendship-1',
+        userId: 'user-2',
+        username: 'alice',
+        displayName: 'Alice',
+        status: 'online',
+      });
+      useDMStore.setState({ conversations: [makeConversation({ unreadCount: 7 })] });
+      useNotificationPrefsStore.getState().setMute('dm', 'conv-1', true, null);
+
+      const { container } = render(
+        <ConversationList compact selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+      );
+
+      expect(screen.getByRole('button', { name: 'Alice' })).not.toHaveClass('unread');
+      expect(screen.getByRole('button', { name: 'Alice' })).not.toHaveAccessibleName(/unread/i);
+      expect(container.querySelector('.conversation-unread-badge')).not.toBeInTheDocument();
+      expect(container.querySelector('.member-status-dot.online')).toBeInTheDocument();
+    });
+
+    it('bounds unread counts and includes active call state in accessible names', () => {
+      const group = makeConversation({
+        id: 'group-1',
+        isGroup: true,
+        name: 'Study Group',
+        participants: [
+          { userId: 'user-1', username: 'me', displayName: 'Me' },
+          { userId: 'user-2', username: 'alice', displayName: 'Alice' },
+          { userId: 'user-3', username: 'bob', displayName: 'Bob' },
+        ],
+      });
+      useDMStore.setState({
+        conversations: [makeConversation({ unreadCount: 200 }), group],
+      });
+      useVoiceStore.getState().seedActiveDMCall('group-1', ['user-2', 'user-3'], 3);
+
+      render(
+        <ConversationList compact selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+      );
+
+      expect(screen.getByRole('button', { name: /Alice, 99\+ unread/i })).toBeVisible();
+      expect(screen.getByRole('button', { name: /Study Group, 2 of 3 in call/i })).toBeVisible();
+    });
+
+    it('renders every conversation without an arbitrary compact-mode cap', () => {
+      const conversations = Array.from({ length: 18 }, (_, index) =>
+        makeConversation({
+          id: `conv-${index}`,
+          participants: [
+            { userId: 'user-1', username: 'me', displayName: 'Me' },
+            {
+              userId: `user-${index + 2}`,
+              username: `friend-${index + 1}`,
+              displayName: `Friend ${index + 1}`,
+            },
+          ],
+        })
+      );
+      useDMStore.setState({ conversations });
+
+      render(
+        <ConversationList compact selectedThreadId={null} onSelectThread={mockOnSelectThread} />
+      );
+
+      expect(screen.getByRole('button', { name: 'Friend 18' })).toBeVisible();
     });
   });
 });

@@ -1,10 +1,12 @@
-import { render, screen, fireEvent, act } from '../../../test-utils';
+import { render, screen, fireEvent, act, userEvent, within } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useServerStore } from '@/renderer/stores/serverStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useMemberStore, ServerMember } from '@/renderer/stores/memberStore';
 import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import type { Role } from '@/renderer/types/server';
+import { ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
 import { mockUser, mockServer, mockMember, mockMember2 } from '../../../mocks/fixtures';
 
 import MemberList from '@/renderer/components/Members/MemberList';
@@ -20,12 +22,26 @@ vi.mock('@/renderer/services/apiClient', () => ({
 
 // Mock MemberProfileCard to avoid complex rendering
 vi.mock('@/renderer/components/Members/MemberProfileCard', () => ({
-  default: ({ member, onClose }: { member: { username: string }; onClose: () => void }) => (
+  default: ({
+    member,
+    onClose,
+    onViewFullProfile,
+  }: {
+    member: { username: string };
+    onClose: () => void;
+    onViewFullProfile?: () => void;
+  }) => (
     <div data-testid="profile-card">
       {member.username}
       <button onClick={onClose}>Close</button>
+      {onViewFullProfile && <button onClick={onViewFullProfile}>View Full Profile</button>}
     </div>
   ),
+}));
+
+vi.mock('@/renderer/components/Members/UserProfileModal', () => ({
+  default: ({ isOpen, member }: { isOpen: boolean; member: ServerMember }) =>
+    isOpen ? <div data-testid="full-profile">{member.username}</div> : null,
 }));
 
 // Mock MemberContextMenu — expose onBan/onKick so we can trigger the modals
@@ -53,6 +69,52 @@ vi.mock('@/renderer/components/Members/MemberContextMenu', () => ({
     </div>
   ),
 }));
+
+const makeMember = (overrides: Partial<ServerMember> = {}): ServerMember => ({
+  user_id: 'member-1',
+  username: 'alice',
+  display_name: 'Alice',
+  role: 'member',
+  joined_at: '2025-01-01T00:00:00Z',
+  roles: [],
+  ...overrides,
+});
+
+const makeRole = (overrides: Partial<Role> = {}): Role => ({
+  id: 'role-1',
+  server_id: mockServer.id,
+  name: 'Moderators',
+  position: 10,
+  permissions: '0',
+  is_default: false,
+  display_separately: true,
+  mentionable: false,
+  require_mfa: false,
+  created_at: '2025-01-01T00:00:00Z',
+  updated_at: '2025-01-01T00:00:00Z',
+  ...overrides,
+});
+
+const seedCompactMembers = (
+  members: ServerMember[],
+  statuses: Array<[string, 'online' | 'offline' | 'dnd' | 'invisible']>,
+  roles: Role[] = []
+) => {
+  mockApiFetch.mockReturnValue(new Promise(() => {}));
+  useMemberStore.setState({
+    members,
+    onlineUserIds: new Set(
+      statuses.filter(([, status]) => status === 'online' || status === 'dnd').map(([id]) => id)
+    ),
+    userStatuses: new Map(statuses),
+    isLoading: false,
+    error: null,
+  });
+  usePermissionStore.setState({
+    serverPermissions: { [mockServer.id]: ADMIN_PERMISSIONS },
+    serverRoles: { [mockServer.id]: roles },
+  });
+};
 
 describe('MemberList', () => {
   beforeEach(() => {
@@ -297,6 +359,275 @@ describe('MemberList', () => {
 
       fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
       expect(screen.queryByText(/can rejoin with a new invite/)).not.toBeInTheDocument();
+    });
+  });
+
+  describe('compact role bubbles', () => {
+    it('opens member search to the left and filters the compact groups', async () => {
+      const user = userEvent.setup();
+      const alice = makeMember();
+      const bob = makeMember({
+        user_id: 'bob',
+        username: 'bob',
+        display_name: 'Bob',
+      });
+      seedCompactMembers(
+        [alice, bob],
+        [
+          [alice.user_id, 'online'],
+          [bob.user_id, 'online'],
+        ]
+      );
+      render(<MemberList compact />);
+
+      const trigger = screen.getByRole('button', { name: 'Search members' });
+      expect(trigger).toHaveAttribute('title', 'Search members');
+      expect(screen.getByRole('button', { name: 'Online — 2' })).toHaveAttribute('title', 'Online');
+      await user.click(trigger);
+      const search = screen.getByRole('region', { name: 'Search members' });
+      expect(search).toHaveAttribute('data-placement', 'left');
+      const input = screen.getByPlaceholderText('Search members...');
+      expect(input).toHaveFocus();
+
+      await user.type(input, 'Bob');
+      await user.click(screen.getByRole('button', { name: 'Online — 1' }));
+      expect(screen.getByRole('button', { name: 'Bob — Online' })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Alice — Online' })).not.toBeInTheDocument();
+    });
+
+    it('uses highest-role assignment, role emoji/fallback, and presence fallback groups', () => {
+      const moderators = makeRole({ id: 'moderators', emoji: '🛡️', position: 20 });
+      const helpers = makeRole({ id: 'helpers', name: 'Helpers', position: 10 });
+      const alice = makeMember({
+        user_id: 'alice',
+        roles: [
+          {
+            role_id: helpers.id,
+            role_name: helpers.name,
+            position: helpers.position,
+            display_separately: true,
+          },
+          {
+            role_id: moderators.id,
+            role_name: moderators.name,
+            position: moderators.position,
+            display_separately: true,
+          },
+        ],
+      });
+      const eve = makeMember({
+        user_id: 'eve',
+        username: 'eve',
+        display_name: 'Eve',
+        roles: [
+          {
+            role_id: moderators.id,
+            role_name: moderators.name,
+            position: moderators.position,
+            display_separately: true,
+          },
+        ],
+      });
+      const bob = makeMember({
+        user_id: 'bob',
+        username: 'bob',
+        display_name: 'Bob',
+        roles: [
+          {
+            role_id: helpers.id,
+            role_name: helpers.name,
+            position: helpers.position,
+            display_separately: true,
+          },
+        ],
+      });
+      const online = makeMember({
+        user_id: 'online',
+        username: 'online',
+        display_name: 'Online Member',
+      });
+      const offline = makeMember({
+        user_id: 'offline',
+        username: 'offline',
+        display_name: 'Offline Member',
+      });
+      const invisible = makeMember({
+        user_id: 'invisible',
+        username: 'invisible',
+        display_name: 'Invisible Member',
+      });
+      seedCompactMembers(
+        [alice, eve, bob, online, offline, invisible],
+        [
+          ['alice', 'online'],
+          ['eve', 'dnd'],
+          ['bob', 'online'],
+          ['online', 'online'],
+          ['offline', 'offline'],
+          ['invisible', 'invisible'],
+        ],
+        [helpers, moderators]
+      );
+
+      render(<MemberList compact />);
+
+      const rail = screen.getByRole('navigation', { name: 'Member groups' });
+      expect(
+        within(rail)
+          .getAllByRole('button')
+          .map((button) => button.getAttribute('aria-label'))
+      ).toEqual(['Moderators — 2', 'Helpers — 1', 'Online — 1', 'Offline — 2']);
+      expect(
+        within(screen.getByRole('button', { name: 'Moderators — 2' })).getByText('🛡️')
+      ).toBeVisible();
+      expect(
+        screen.getByRole('button', { name: 'Helpers — 1' }).querySelector('.lucide-users')
+      ).toBeInTheDocument();
+
+      const moderatorsTrigger = screen.getByRole('button', { name: 'Moderators — 2' });
+      expect(moderatorsTrigger.id).not.toBe('');
+      fireEvent.click(moderatorsTrigger);
+      expect(screen.getByRole('region', { name: 'Moderators — 2' })).toHaveAttribute(
+        'data-dock-focus-owner',
+        moderatorsTrigger.id
+      );
+      expect(screen.getByRole('button', { name: 'Alice — Online' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Eve — Do Not Disturb' })).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: 'Helpers — 1' }));
+      expect(screen.getByRole('button', { name: 'Bob — Online' })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Alice — Online' })).not.toBeInTheDocument();
+    });
+
+    it('reuses profile and full-profile handlers from compact member avatars', () => {
+      const alice = makeMember();
+      seedCompactMembers([alice], [[alice.user_id, 'online']]);
+      render(<MemberList compact />);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Online — 1' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Alice — Online' }));
+      expect(screen.getByTestId('profile-card')).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'View Full Profile' }));
+      expect(screen.getByTestId('full-profile')).toHaveTextContent('alice');
+    });
+
+    it('reuses right-click context and permitted moderation actions', () => {
+      const alice = makeMember();
+      seedCompactMembers([alice], [[alice.user_id, 'online']]);
+      render(<MemberList compact />);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Online — 1' }));
+      fireEvent.contextMenu(screen.getByRole('button', { name: 'Alice — Online' }));
+      expect(screen.getByTestId('context-menu')).toBeInTheDocument();
+      expect(screen.getByTestId('ctx-ban')).toBeInTheDocument();
+      expect(screen.getByTestId('ctx-kick')).toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId('ctx-ban'));
+      expect(screen.getByText(/permanently remove them/)).toBeInTheDocument();
+    });
+
+    it('switches one bubble at a time and restores focus after outside or Escape dismissal', async () => {
+      const user = userEvent.setup();
+      const alice = makeMember();
+      const bob = makeMember({
+        user_id: 'bob',
+        username: 'bob',
+        display_name: 'Bob',
+      });
+      seedCompactMembers(
+        [alice, bob],
+        [
+          [alice.user_id, 'online'],
+          [bob.user_id, 'offline'],
+        ]
+      );
+      render(<MemberList compact />);
+
+      const onlineTrigger = screen.getByRole('button', { name: 'Online — 1' });
+      await user.click(onlineTrigger);
+      expect(screen.getByRole('region', { name: 'Online — 1' })).toBeVisible();
+      const onlineFocus = vi.spyOn(onlineTrigger, 'focus');
+
+      const offlineTrigger = screen.getByRole('button', { name: 'Offline — 1' });
+      await user.click(offlineTrigger);
+      expect(onlineFocus).not.toHaveBeenCalled();
+      expect(offlineTrigger).toHaveFocus();
+      expect(screen.queryByRole('region', { name: 'Online — 1' })).not.toBeInTheDocument();
+      expect(screen.getByRole('region', { name: 'Offline — 1' })).toBeVisible();
+
+      fireEvent.pointerDown(document.body);
+      expect(screen.queryByRole('region', { name: 'Offline — 1' })).not.toBeInTheDocument();
+      expect(offlineTrigger).toHaveFocus();
+
+      await user.click(onlineTrigger);
+      fireEvent.keyDown(document, { key: 'Escape' });
+      expect(screen.queryByRole('region', { name: 'Online — 1' })).not.toBeInTheDocument();
+      expect(onlineTrigger).toHaveFocus();
+    });
+
+    it('discards a detached compact anchor when switching through standard mode', () => {
+      const alice = makeMember();
+      seedCompactMembers([alice], [[alice.user_id, 'online']]);
+      const { rerender } = render(<MemberList compact />);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Online — 1' }));
+      expect(screen.getByRole('region', { name: 'Online — 1' })).toBeInTheDocument();
+
+      rerender(<MemberList />);
+      expect(screen.queryByRole('region', { name: 'Online — 1' })).not.toBeInTheDocument();
+
+      rerender(<MemberList compact />);
+      expect(screen.getByRole('button', { name: 'Online — 1' })).toHaveAttribute(
+        'aria-expanded',
+        'false'
+      );
+      expect(screen.queryByRole('region', { name: 'Online — 1' })).not.toBeInTheDocument();
+    });
+
+    it('clears a detached group anchor when live presence removes and later restores its key', () => {
+      const alice = makeMember();
+      seedCompactMembers([alice], [[alice.user_id, 'online']]);
+      render(<MemberList compact />);
+
+      const originalTrigger = screen.getByRole('button', { name: 'Online — 1' });
+      fireEvent.click(originalTrigger);
+      expect(screen.getByRole('region', { name: 'Online — 1' })).toBeInTheDocument();
+
+      act(() => useMemberStore.getState().setUserOffline(alice.user_id));
+      expect(originalTrigger).not.toBeInTheDocument();
+      expect(screen.queryByRole('region', { name: 'Online — 1' })).not.toBeInTheDocument();
+
+      act(() => useMemberStore.getState().setUserOnline(alice.user_id));
+      const replacementTrigger = screen.getByRole('button', { name: 'Online — 1' });
+      expect(replacementTrigger).not.toBe(originalTrigger);
+      expect(replacementTrigger).toHaveAttribute('aria-expanded', 'false');
+      expect(screen.queryByRole('region', { name: 'Online — 1' })).not.toBeInTheDocument();
+
+      fireEvent.click(replacementTrigger);
+      expect(screen.getByRole('region', { name: 'Online — 1' })).toBeVisible();
+    });
+
+    it('keeps every member in a long internally scrollable bubble', () => {
+      const members = Array.from({ length: 24 }, (_, index) =>
+        makeMember({
+          user_id: `member-${index}`,
+          username: `member-${index + 1}`,
+          display_name: `Member ${index + 1}`,
+        })
+      );
+      seedCompactMembers(
+        members,
+        members.map((member) => [member.user_id, 'online'] as const)
+      );
+      render(<MemberList compact />);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Online — 24' }));
+      const region = screen.getByRole('region', { name: 'Online — 24' });
+      expect(screen.getAllByRole('button', { name: /^Member \d+ — Online$/ })).toHaveLength(24);
+      expect(region).toHaveStyle({ maxHeight: 'calc(100vh - 16px)' });
+      expect(region.querySelector('.attributed-popover__body')).toContainElement(
+        screen.getByRole('button', { name: 'Member 24 — Online' })
+      );
     });
   });
 });

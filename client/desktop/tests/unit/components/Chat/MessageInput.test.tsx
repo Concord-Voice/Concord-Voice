@@ -7,6 +7,12 @@ import { vi } from 'vitest';
 import userEvent from '@testing-library/user-event';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { resetAllStores } from '../../../helpers/store-helpers';
+
+const mockSidebarProfiles = vi.hoisted(() => ({
+  dm: { left: { width: 240, pinned: false }, right: { width: 260, pinned: true } },
+  server: { left: { width: 240, pinned: true }, right: { width: 260, pinned: true } },
+}));
 
 // Mock child components and stores that MessageInput depends on
 vi.mock('@/renderer/components/Chat/MessageInputContextMenu', () => ({
@@ -16,7 +22,13 @@ vi.mock('@/renderer/components/User/UserPanel', () => ({
   default: () => <div data-testid="user-panel" />,
 }));
 vi.mock('@/renderer/stores/layoutStore', () => ({
-  useLayoutStore: () => false,
+  selectSidebarDock: (
+    state: { sidebarProfiles: typeof mockSidebarProfiles },
+    context: 'dm' | 'server',
+    side: 'left' | 'right'
+  ) => state.sidebarProfiles[context][side],
+  useLayoutStore: (selector: (state: { sidebarProfiles: typeof mockSidebarProfiles }) => unknown) =>
+    selector({ sidebarProfiles: mockSidebarProfiles }),
 }));
 
 // Mock useFileUpload with controllable state via mutable overrides
@@ -76,6 +88,7 @@ describe('MessageInput', () => {
   const onTyping = vi.fn();
 
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
     uploadMockOverrides.hasFiles = false;
     uploadMockOverrides.isUploading = false;
@@ -86,6 +99,8 @@ describe('MessageInput', () => {
       channelOverrides: {},
     });
     useSubscriptionStore.getState().reset(); // back to FREE_ENTITLEMENT (5120)
+    mockSidebarProfiles.dm.left.pinned = false;
+    mockSidebarProfiles.server.left.pinned = true;
   });
 
   it('warm-fetches effective channel permissions on server channel mount', () => {
@@ -165,7 +180,9 @@ describe('MessageInput', () => {
   });
 
   it('keeps the compact user popover above the textarea layer when unpinned', () => {
-    render(<MessageInput onSendMessage={onSendMessage} channelName="general" />);
+    render(
+      <MessageInput onSendMessage={onSendMessage} channelName="general" conversationId="dm-1" />
+    );
 
     const userPanel = screen.getByTestId('user-panel').closest('.message-input-user-panel');
     const userPanelLayerDeclarations = getCssDeclarations(
@@ -179,6 +196,11 @@ describe('MessageInput', () => {
     expect(Number(userPanelLayerDeclarations['z-index'])).toBeGreaterThan(
       Number(childLayerDeclarations['z-index'])
     );
+  });
+
+  it('resolves the Server left dock when no DM conversation is present', () => {
+    render(<MessageInput onSendMessage={onSendMessage} channelId="channel-1" />);
+    expect(screen.queryByTestId('user-panel')).not.toBeInTheDocument();
   });
 
   it('links the visible input box hit target to the textarea', () => {
@@ -679,7 +701,9 @@ describe('MessageInput cap reduction + overflow', () => {
   const onSendMessage = vi.fn();
 
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
+    useSubscriptionStore.getState().reset();
     uploadMockOverrides.hasFiles = false;
     uploadMockOverrides.isUploading = false;
     uploadMockOverrides.files = [];
@@ -919,10 +943,6 @@ describe('MessageInput cap reduction + overflow', () => {
         .getState()
         .setEntitlement({ ...useSubscriptionStore.getState().entitlement, tier, maxMessageChars });
     }
-
-    // beforeEach in a sibling describe does NOT run here — reset locally so a
-    // premium tier set by one test cannot leak into the next (free-assuming) one.
-    beforeEach(() => useSubscriptionStore.getState().reset());
 
     it('counter denominator reflects the premium entitlement (10240)', () => {
       setTier(10240);

@@ -3,6 +3,7 @@ import { X, Search, UserPlus } from 'lucide-react';
 import { useDMStore } from '../../stores/dmStore';
 import { useFriendStore, type Friend } from '../../stores/friendStore';
 import { useUserStore } from '../../stores/userStore';
+import Modal from '../ui/Modal';
 import './DirectMessages.css';
 
 interface CreateGroupModalProps {
@@ -28,13 +29,6 @@ const CreateGroupModal: React.FC<CreateGroupModalProps> = ({ isOpen, onClose }) 
 
   const friends = useFriendStore((s) => s.friends);
   const currentUserId = useUserStore((s) => s.user?.id) || '';
-
-  // Focus search input when modal opens
-  useEffect(() => {
-    if (!isOpen) return;
-    const focusTimer = setTimeout(() => searchInputRef.current?.focus(), 100);
-    return () => clearTimeout(focusTimer);
-  }, [isOpen]);
 
   // Reset state when modal closes
   useEffect(() => {
@@ -99,111 +93,104 @@ const CreateGroupModal: React.FC<CreateGroupModalProps> = ({ isOpen, onClose }) 
     }
   }, [selectedUsers, groupName, isCreating, onClose]);
 
-  if (!isOpen) return null;
-
   return (
-    <dialog className="create-group-modal-overlay" open aria-label="Create Group DM">
-      <div className="create-group-modal">
-        <div className="create-group-modal-header">
-          <h3>Create Group DM</h3>
-          <button type="button" className="create-group-close-btn" onClick={onClose}>
-            <X size={18} />
-          </button>
-        </div>
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title="Create Group DM"
+      width="medium"
+      initialFocusRef={searchInputRef}
+    >
+      <div className="create-group-modal-body">
+        <input
+          type="text"
+          className="create-group-name-input"
+          placeholder="Group Name (optional)"
+          value={groupName}
+          onChange={(e) => setGroupName(e.target.value)}
+          maxLength={100}
+        />
 
-        <div className="create-group-modal-body">
+        {selectedUsers.length > 0 && (
+          <div className="create-group-chips">
+            {selectedUsers.map((u) => (
+              <span key={u.userId} className="create-group-chip">
+                {u.displayName || u.username}
+                <button
+                  type="button"
+                  onClick={() => handleRemoveUser(u.userId)}
+                  aria-label={`Remove ${u.username}`}
+                >
+                  <X size={12} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+
+        <div className="create-group-search">
+          <Search size={14} className="create-group-search-icon" />
           <input
+            ref={searchInputRef}
             type="text"
-            className="create-group-name-input"
-            placeholder="Group Name (optional)"
-            value={groupName}
-            onChange={(e) => setGroupName(e.target.value)}
-            maxLength={100}
+            placeholder="Search friends..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
           />
+        </div>
 
-          {selectedUsers.length > 0 && (
-            <div className="create-group-chips">
-              {selectedUsers.map((u) => (
-                <span key={u.userId} className="create-group-chip">
-                  {u.displayName || u.username}
-                  <button
-                    type="button"
-                    onClick={() => handleRemoveUser(u.userId)}
-                    aria-label={`Remove ${u.username}`}
-                  >
-                    <X size={12} />
-                  </button>
-                </span>
-              ))}
+        {selectedUsers.length >= MAX_GROUP_MEMBERS && (
+          <div className="create-group-limit">Maximum {MAX_GROUP_MEMBERS + 1} members reached</div>
+        )}
+
+        <div className="create-group-results">
+          {filteredFriends.length === 0 ? (
+            <div className="create-group-no-results">
+              {searchQuery ? 'No friends match your search' : 'No friends available to add'}
             </div>
-          )}
-
-          <div className="create-group-search">
-            <Search size={14} className="create-group-search-icon" />
-            <input
-              ref={searchInputRef}
-              type="text"
-              placeholder="Search friends..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-            />
-          </div>
-
-          {selectedUsers.length >= MAX_GROUP_MEMBERS && (
-            <div className="create-group-limit">
-              Maximum {MAX_GROUP_MEMBERS + 1} members reached
-            </div>
-          )}
-
-          <div className="create-group-results">
-            {filteredFriends.length === 0 ? (
-              <div className="create-group-no-results">
-                {searchQuery ? 'No friends match your search' : 'No friends available to add'}
-              </div>
-            ) : (
-              filteredFriends.map((friend) => (
-                <div key={friend.userId} className="create-group-user-row">
-                  <div className="conversation-avatar" style={{ width: 32, height: 32 }}>
-                    <span className="conversation-avatar-initial" style={{ fontSize: 12 }}>
-                      {(friend.displayName || friend.username).charAt(0).toUpperCase()}
-                    </span>
-                  </div>
-                  <div className="create-group-user-info">
-                    <span className="create-group-user-display">
-                      {friend.displayName || friend.username}
-                    </span>
-                    {friend.displayName && (
-                      <span className="create-group-user-username">@{friend.username}</span>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    className="create-group-add-btn"
-                    onClick={() => handleAddUser(friend)}
-                    disabled={selectedUsers.length >= MAX_GROUP_MEMBERS}
-                  >
-                    <UserPlus size={14} />
-                  </button>
+          ) : (
+            filteredFriends.map((friend) => (
+              <div key={friend.userId} className="create-group-user-row">
+                <div className="conversation-avatar" style={{ width: 32, height: 32 }}>
+                  <span className="conversation-avatar-initial" style={{ fontSize: 12 }}>
+                    {(friend.displayName || friend.username).charAt(0).toUpperCase()}
+                  </span>
                 </div>
-              ))
-            )}
-          </div>
-
-          {error && <div className="create-group-error">{error}</div>}
+                <div className="create-group-user-info">
+                  <span className="create-group-user-display">
+                    {friend.displayName || friend.username}
+                  </span>
+                  {friend.displayName && (
+                    <span className="create-group-user-username">@{friend.username}</span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  className="create-group-add-btn"
+                  onClick={() => handleAddUser(friend)}
+                  disabled={selectedUsers.length >= MAX_GROUP_MEMBERS}
+                >
+                  <UserPlus size={14} />
+                </button>
+              </div>
+            ))
+          )}
         </div>
 
-        <div className="create-group-modal-footer">
-          <button
-            type="button"
-            className="create-group-create-btn"
-            onClick={handleCreate}
-            disabled={selectedUsers.length === 0 || isCreating}
-          >
-            {isCreating ? 'Creating...' : `Create Group (${selectedUsers.length} selected)`}
-          </button>
-        </div>
+        {error && <div className="create-group-error">{error}</div>}
       </div>
-    </dialog>
+
+      <div className="create-group-modal-footer">
+        <button
+          type="button"
+          className="create-group-create-btn"
+          onClick={handleCreate}
+          disabled={selectedUsers.length === 0 || isCreating}
+        >
+          {isCreating ? 'Creating...' : `Create Group (${selectedUsers.length} selected)`}
+        </button>
+      </div>
+    </Modal>
   );
 };
 

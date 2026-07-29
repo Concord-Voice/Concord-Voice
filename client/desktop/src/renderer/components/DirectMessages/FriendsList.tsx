@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useId, useMemo } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import {
   ChevronDown,
@@ -12,6 +12,9 @@ import {
   UserMinus,
   FolderPlus,
   GripVertical,
+  Users,
+  WifiOff,
+  Folder,
 } from 'lucide-react';
 import { useFriendStore, type Friend } from '../../stores/friendStore';
 import { useFriendOrgStore, type FriendCategory } from '../../stores/friendOrgStore';
@@ -21,17 +24,159 @@ import { resolveUserAccentColors } from '../../utils/schemeColors';
 import AddFriendModal from './AddFriendModal';
 import CategoryManagerPanel from './CategoryManagerPanel';
 import { errorMessage } from '../../utils/redactError';
+import { AttributedPopover } from '../Layout/AttributedPopover';
 import './DirectMessages.css';
 
 interface FriendsListProps {
   onFriendClick?: (userId: string) => void;
+  compact?: boolean;
 }
+
+type RenderSection =
+  | { kind: 'pending'; key: string }
+  | { kind: 'builtin'; key: string; label: string; friends: Friend[] }
+  | { kind: 'category'; key: string; cat: FriendCategory; friends: Friend[] };
+
+interface OpenFriendSection {
+  key: string;
+  anchor: HTMLElement;
+}
+
+interface CompactSectionTriggerProps {
+  section: RenderSection;
+  pendingCount: number;
+  openSection: OpenFriendSection | null;
+  triggerId: string;
+  setOpenSection: React.Dispatch<React.SetStateAction<OpenFriendSection | null>>;
+}
+
+interface CompactFriendsSectionsProps {
+  sections: RenderSection[];
+  pendingCount: number;
+  openSection: OpenFriendSection | null;
+  selectedSection?: RenderSection;
+  triggerId: string;
+  renderPendingRows: () => React.ReactNode;
+  renderFriendRow: (friend: Friend, tintColor: string | null) => React.ReactNode;
+  setOpenSection: React.Dispatch<React.SetStateAction<OpenFriendSection | null>>;
+}
+
+function getSectionLabel(section: RenderSection): string {
+  if (section.kind === 'pending') return 'Pending Requests';
+  if (section.kind === 'category') return section.cat.name;
+  return section.label;
+}
+
+function getSectionCount(section: RenderSection, pendingCount: number): number {
+  return section.kind === 'pending' ? pendingCount : section.friends.length;
+}
+
+function getFriendStatusLabel(status: Friend['status'], appearsOffline: boolean): string {
+  if (appearsOffline) return 'Offline';
+  if (status === 'dnd') return 'Do Not Disturb';
+  return 'Online';
+}
+
+const CompactSectionIcon: React.FC<{ section: RenderSection }> = ({ section }) => {
+  if (section.kind === 'pending') return <Clock size={20} />;
+  if (section.kind === 'builtin') {
+    return section.key === 'online' ? <Users size={20} /> : <WifiOff size={20} />;
+  }
+  if (section.cat.emoji) {
+    return <span className="friends-compact-emoji">{section.cat.emoji}</span>;
+  }
+  return <Folder size={20} />;
+};
+
+const CompactSectionTrigger: React.FC<CompactSectionTriggerProps> = ({
+  section,
+  pendingCount,
+  openSection,
+  triggerId,
+  setOpenSection,
+}) => {
+  const label = getSectionLabel(section);
+  const count = getSectionCount(section, pendingCount);
+  const isOpen = openSection?.key === section.key;
+
+  return (
+    <div className="friends-compact-category">
+      <button
+        id={`${triggerId}-friends-${section.key}`}
+        type="button"
+        className="friends-compact-trigger"
+        aria-expanded={isOpen}
+        aria-controls={`friends-section-${section.key}`}
+        aria-label={`${label} — ${count}`}
+        title={label}
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={(event) => {
+          const anchor = event.currentTarget;
+          setOpenSection((current) =>
+            current?.key === section.key ? null : { key: section.key, anchor }
+          );
+        }}
+      >
+        <CompactSectionIcon section={section} />
+        <span className="friends-compact-trigger-count" aria-hidden="true">
+          {count}
+        </span>
+      </button>
+    </div>
+  );
+};
+
+const CompactFriendsSections: React.FC<CompactFriendsSectionsProps> = ({
+  sections,
+  pendingCount,
+  openSection,
+  selectedSection,
+  triggerId,
+  renderPendingRows,
+  renderFriendRow,
+  setOpenSection,
+}) => {
+  return (
+    <>
+      <nav className="friends-compact-rail" aria-label="Friends categories">
+        {sections.map((section) => (
+          <CompactSectionTrigger
+            key={section.key}
+            section={section}
+            pendingCount={pendingCount}
+            openSection={openSection}
+            triggerId={triggerId}
+            setOpenSection={setOpenSection}
+          />
+        ))}
+      </nav>
+      {selectedSection && openSection && (
+        <AttributedPopover
+          id={`friends-section-${selectedSection.key}`}
+          anchor={openSection.anchor}
+          label={`${getSectionLabel(selectedSection)} — ${getSectionCount(selectedSection, pendingCount)}`}
+          open
+          onClose={() => setOpenSection(null)}
+        >
+          {selectedSection.kind === 'pending'
+            ? renderPendingRows()
+            : selectedSection.friends.map((friend) =>
+                renderFriendRow(
+                  friend,
+                  selectedSection.kind === 'category' ? selectedSection.cat.color : null
+                )
+              )}
+        </AttributedPopover>
+      )}
+    </>
+  );
+};
 
 // §5.1 DnD contract: two typed sources on one surface, disambiguated by dataTransfer type.
 const DT_SECTION = 'application/concord-section'; // section-header handle → reorder sectionOrder
 const DT_FRIEND = 'application/concord-friend'; // friend row → assign friend to a category
 
-const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick }) => {
+const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick, compact = false }) => {
   // eslint-disable-next-line @eslint-react/use-state -- Set() is cheap to construct; lazy initializer would add noise without benefit
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
   const [showAddFriendModal, setShowAddFriendModal] = useState(false);
@@ -67,11 +212,21 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick }) => {
     userId: string;
     position: { x: number; y: number };
   } | null>(null);
+  const [openSection, setOpenSection] = useState<OpenFriendSection | null>(null);
+  const compactTriggerId = useId();
+  const addFriendTriggerId = useId();
 
   useEffect(() => {
     fetchFriends();
     fetchRequests();
   }, [fetchFriends, fetchRequests]);
+
+  useEffect(() => {
+    if (!compact) {
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: compact triggers unmount in standard mode, so their detached popover state must be discarded
+      setOpenSection(null);
+    }
+  }, [compact]);
 
   const toggleCategory = (category: string) => {
     setCollapsedCategories((prev) => {
@@ -165,8 +320,12 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick }) => {
   }, [categoryList]);
 
   const uncategorized = friends.filter((f) => !catByMember.has(f.userId));
-  const onlineUncat = uncategorized.filter((f) => f.status !== 'offline');
-  const offlineUncat = uncategorized.filter((f) => f.status === 'offline');
+  const onlineUncat = uncategorized.filter(
+    (f) => f.status !== 'offline' && (!compact || f.status !== 'invisible')
+  );
+  const offlineUncat = uncategorized.filter(
+    (f) => f.status === 'offline' || (compact && f.status === 'invisible')
+  );
 
   // Build the ordered render list: persisted sectionOrder, then any category present in
   // the blob but missing from sectionOrder, then any missing built-ins — both appended in
@@ -180,11 +339,6 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick }) => {
     const tail = (['pending', 'online', 'offline'] as const).filter((k) => !present.has(k));
     return [...sectionOrder, ...missingCats, ...tail];
   }, [sectionOrder, categoryList]);
-
-  type RenderSection =
-    | { kind: 'pending'; key: string }
-    | { kind: 'builtin'; key: string; label: string; friends: Friend[] }
-    | { kind: 'category'; key: string; cat: FriendCategory; friends: Friend[] };
 
   const sections = order
     .map((key): RenderSection | null => {
@@ -209,6 +363,16 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick }) => {
         : null;
     })
     .filter((s): s is RenderSection => s !== null);
+  const selectedSection = openSection
+    ? sections.find((section) => section.key === openSection.key)
+    : undefined;
+
+  useEffect(() => {
+    if (openSection && (!selectedSection || !openSection.anchor.isConnected)) {
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- live friend/category updates can remove a compact trigger while retaining this component; discard its detached anchor before the key can reappear
+      setOpenSection(null);
+    }
+  }, [openSection, selectedSection]);
 
   // The current render order of section keys (what reorderSections operates on).
   const currentOrderKeys = sections.map((s) => s.key);
@@ -326,11 +490,17 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick }) => {
   // A single friend row. `tintColor` (category color) tints the username when set.
   const renderFriendRow = (friend: Friend, tintColor: string | null) => {
     const friendColors = resolveUserAccentColors(friend.colorScheme);
+    const displayName = friend.displayName || friend.username;
+    const appearsOffline =
+      friend.status === 'offline' || (compact && friend.status === 'invisible');
+    const statusLabel = getFriendStatusLabel(friend.status, appearsOffline);
     return (
       <button
         type="button"
         key={friend.id}
-        className={`friend-item ${friend.status === 'offline' ? 'offline' : ''}`}
+        className={`friend-item ${appearsOffline ? 'offline' : ''}`}
+        aria-label={displayName}
+        title={statusLabel}
         // Friend-assign drag source (§5.1). `draggable` does NOT block the click/keyboard
         // handlers, and the onMouseDown stopPropagation below does NOT suppress dragstart.
         draggable
@@ -367,27 +537,110 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick }) => {
                 friendColors ? { background: friendColors.gradient, color: '#fff' } : undefined
               }
             >
-              {(friend.displayName || friend.username).charAt(0).toUpperCase()}
+              {displayName.charAt(0).toUpperCase()}
             </span>
           )}
           <span className={`member-status-dot ${friend.status}`} />
         </div>
         <span className="member-username" style={tintColor ? { color: tintColor } : undefined}>
-          {friend.displayName || friend.username}
+          {displayName}
         </span>
       </button>
     );
   };
 
+  const renderPendingRows = () => (
+    <>
+      {incomingRequests.map((req) => {
+        const displayName = req.fromDisplayName || req.fromUsername;
+        const initial = displayName.charAt(0).toUpperCase();
+        const isLoading = actionLoading[req.id];
+        return (
+          <div key={req.id} className="friend-item friend-request-item">
+            <div className="member-avatar">
+              <span className="member-avatar-initial">{initial}</span>
+            </div>
+            <div className="friend-request-info">
+              <span className="member-username">{displayName}</span>
+              <span className="friend-request-meta">Incoming request</span>
+            </div>
+            <div className="friend-request-actions">
+              <button
+                type="button"
+                className="friend-request-btn friend-request-accept"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleAccept(req.id);
+                }}
+                disabled={!!isLoading}
+                aria-label={`${isLoading === 'accept' ? 'Accepting' : 'Accept'} friend request from ${displayName}`}
+                title="Accept"
+              >
+                {isLoading === 'accept' ? (
+                  <span className="friend-request-spinner" />
+                ) : (
+                  <Check size={14} />
+                )}
+              </button>
+              <button
+                type="button"
+                className="friend-request-btn friend-request-decline"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleDecline(req.id);
+                }}
+                disabled={!!isLoading}
+                aria-label={`${isLoading === 'decline' ? 'Declining' : 'Decline'} friend request from ${displayName}`}
+                title="Decline"
+              >
+                {isLoading === 'decline' ? (
+                  <span className="friend-request-spinner" />
+                ) : (
+                  <X size={14} />
+                )}
+              </button>
+            </div>
+          </div>
+        );
+      })}
+
+      {outgoingRequests.map((req) => {
+        const displayName = req.toDisplayName || req.toUsername;
+        const initial = displayName.charAt(0).toUpperCase();
+        return (
+          <div key={req.id} className="friend-item friend-request-item friend-request-outgoing">
+            <div className="member-avatar">
+              <span className="member-avatar-initial">{initial}</span>
+            </div>
+            <div className="friend-request-info">
+              <span className="member-username">{displayName}</span>
+              <span className="friend-request-meta">Outgoing request</span>
+            </div>
+            <div className="friend-request-actions">
+              <span className="friend-request-pending-label">
+                <Clock size={12} />
+                Pending
+              </span>
+            </div>
+          </div>
+        );
+      })}
+    </>
+  );
+
   return (
-    <div className="friends-list">
+    <div className={`friends-list${compact ? ' friends-list--compact' : ''}`}>
       <div className="friends-list-header">
-        <h3>
-          Friends
-          {incomingCount > 0 && (
-            <span className="conversation-unread-badge friends-header-badge">{incomingCount}</span>
-          )}
-        </h3>
+        {!compact && (
+          <h3>
+            Friends
+            {incomingCount > 0 && (
+              <span className="conversation-unread-badge friends-header-badge">
+                {incomingCount}
+              </span>
+            )}
+          </h3>
+        )}
         <div className="friends-list-header-actions">
           <button
             type="button"
@@ -399,8 +652,11 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick }) => {
             <FolderPlus size={16} />
           </button>
           <button
+            id={`${addFriendTriggerId}-add-friend`}
+            type="button"
             className="friends-add-btn"
             onClick={() => setShowAddFriendModal(true)}
+            aria-label="Add Friend"
             title="Add Friend"
           >
             <Plus size={16} />
@@ -413,12 +669,26 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick }) => {
         {reorderAnnouncement}
       </div>
 
-      {friends.length === 0 && categoryList.length === 0 && pendingRequests.length === 0 ? (
-        <div className="friends-list-empty">
-          <UserPlus size={28} style={{ marginBottom: 8, opacity: 0.4 }} />
-          <p>Add friends to see them here</p>
+      {compact && (friends.length > 0 || categoryList.length > 0 || pendingRequests.length > 0) && (
+        <CompactFriendsSections
+          sections={sections}
+          pendingCount={pendingRequests.length}
+          openSection={openSection}
+          selectedSection={selectedSection}
+          triggerId={compactTriggerId}
+          renderPendingRows={renderPendingRows}
+          renderFriendRow={renderFriendRow}
+          setOpenSection={setOpenSection}
+        />
+      )}
+      {friends.length === 0 && categoryList.length === 0 && pendingRequests.length === 0 && (
+        <div className={`friends-list-empty${compact ? ' friends-list-empty--compact' : ''}`}>
+          <UserPlus className="friends-list-empty-icon" size={compact ? 20 : 28} />
+          {!compact && <p>Add friends to see them here</p>}
         </div>
-      ) : (
+      )}
+      {!compact &&
+        (friends.length > 0 || categoryList.length > 0 || pendingRequests.length > 0) &&
         sections.map((section) => {
           if (section.kind === 'pending') {
             const isCollapsed = collapsedCategories.has('pending');
@@ -441,85 +711,7 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick }) => {
                   <span className="friend-category-count">{pendingRequests.length}</span>
                 </button>
 
-                {!isCollapsed && (
-                  <>
-                    {/* Incoming requests */}
-                    {incomingRequests.map((req) => {
-                      const displayName = req.fromDisplayName || req.fromUsername;
-                      const initial = displayName.charAt(0).toUpperCase();
-                      const isLoading = actionLoading[req.id];
-                      return (
-                        <div key={req.id} className="friend-item friend-request-item">
-                          <div className="member-avatar">
-                            <span className="member-avatar-initial">{initial}</span>
-                          </div>
-                          <div className="friend-request-info">
-                            <span className="member-username">{displayName}</span>
-                            <span className="friend-request-meta">Incoming request</span>
-                          </div>
-                          <div className="friend-request-actions">
-                            <button
-                              className="friend-request-btn friend-request-accept"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleAccept(req.id);
-                              }}
-                              disabled={!!isLoading}
-                              title="Accept"
-                            >
-                              {isLoading === 'accept' ? (
-                                <span className="friend-request-spinner" />
-                              ) : (
-                                <Check size={14} />
-                              )}
-                            </button>
-                            <button
-                              className="friend-request-btn friend-request-decline"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleDecline(req.id);
-                              }}
-                              disabled={!!isLoading}
-                              title="Decline"
-                            >
-                              {isLoading === 'decline' ? (
-                                <span className="friend-request-spinner" />
-                              ) : (
-                                <X size={14} />
-                              )}
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-
-                    {/* Outgoing requests */}
-                    {outgoingRequests.map((req) => {
-                      const displayName = req.toDisplayName || req.toUsername;
-                      const initial = displayName.charAt(0).toUpperCase();
-                      return (
-                        <div
-                          key={req.id}
-                          className="friend-item friend-request-item friend-request-outgoing"
-                        >
-                          <div className="member-avatar">
-                            <span className="member-avatar-initial">{initial}</span>
-                          </div>
-                          <div className="friend-request-info">
-                            <span className="member-username">{displayName}</span>
-                            <span className="friend-request-meta">Outgoing request</span>
-                          </div>
-                          <div className="friend-request-actions">
-                            <span className="friend-request-pending-label">
-                              <Clock size={12} />
-                              Pending
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </>
-                )}
+                {!isCollapsed && renderPendingRows()}
               </div>
             );
           }
@@ -577,8 +769,7 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick }) => {
               {!isCollapsed && section.friends.map((friend) => renderFriendRow(friend, tintColor))}
             </section>
           );
-        })
-      )}
+        })}
 
       {contextMenu && (
         <ContextMenu position={contextMenu.position} onClose={() => setContextMenu(null)}>

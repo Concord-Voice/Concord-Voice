@@ -38,6 +38,26 @@
   padding: calc(8px * var(--sp, 1)) calc(32px * var(--sp, 1)) calc(6px * var(--sp, 1));
 }
 
+.channel-actions-strip--compact {
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.channel-actions-strip--compact .channel-action-item,
+.channel-actions-strip--compact.single .channel-action-item {
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border-radius: 8px;
+}
+
+.channel-actions-strip--compact .channel-action-divider {
+  display: none;
+}
+
 .channel-action-item:hover {
   color: var(--text-primary);
   background-color: var(--bg-tertiary);
@@ -68,6 +88,16 @@
   display: flex;
   flex-direction: column;
   min-width: 140px;
+}
+
+.add-menu-content {
+  display: flex;
+  flex-direction: column;
+  min-width: 140px;
+}
+
+.add-menu-popup .add-menu-content {
+  min-width: 0;
 }
 
 .add-menu-item {
