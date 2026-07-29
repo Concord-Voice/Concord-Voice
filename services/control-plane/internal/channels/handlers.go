@@ -74,6 +74,7 @@ const (
 	errMsgContextNotFoundOrDenied = "Context not found or access denied"
 	errMsgNotMemberOrParticipant  = "Not a member or participant"
 	logMsgFailedCheckPermissions  = "Failed to check permissions"
+	pgRevokedChannelKeyEpoch      = "CV001"
 )
 
 var (
@@ -1983,8 +1984,8 @@ func insertWrappedChannelKeyTx(ctx context.Context, tx *sql.Tx, channelID, membe
 }
 
 // respondKeyDistributionError maps a distribution failure onto the wire (#2201):
-// epoch-fence rejections get the middleware-identical generic 401; anything
-// else (tx begin/commit, statement failures) is a 500.
+// revoked epochs get a typed 409, credential-epoch rejections get the generic
+// 401, and unexpected transaction or statement failures get a 500.
 func (h *Handler) respondKeyDistributionError(c *gin.Context, distErr error, contextID string) {
 	if errors.Is(distErr, errChannelKeyDistributorAccess) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "You must have the channel key to distribute keys"})
@@ -2008,6 +2009,15 @@ func (h *Handler) respondKeyDistributionError(c *gin.Context, distErr error, con
 	}
 	if errors.Is(distErr, errRotationDistributor) {
 		c.JSON(http.StatusConflict, gin.H{"error": "Key rotation requires its established key fingerprint"})
+		return
+	}
+	var pqErr *pq.Error
+	if errors.As(distErr, &pqErr) && pqErr.Code == pgRevokedChannelKeyEpoch {
+		c.JSON(http.StatusConflict, e2eekeys.ErrorResponse{
+			Error: "Key epoch has been revoked; rekey required",
+			Code:  e2eekeys.CodeRevokedEpoch,
+			Kind:  e2eekeys.KindChannel,
+		})
 		return
 	}
 	if errors.Is(distErr, credepoch.ErrEpochMismatch) || errors.Is(distErr, credepoch.ErrBlocked) {

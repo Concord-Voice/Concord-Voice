@@ -3,12 +3,14 @@ package channels
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -44,9 +46,16 @@ func TestRespondKeyDistributionError_Mapping(t *testing.T) {
 		assert.Equal(t, http.StatusUnauthorized, w.Code)
 	})
 
+	t.Run("revoked epoch is a non-retryable conflict", func(t *testing.T) {
+		c, w := newInternalTestContext()
+		h.respondKeyDistributionError(c, fmt.Errorf("store key: %w", &pq.Error{Code: "CV001"}), "ctx-3")
+		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.Contains(t, w.Body.String(), `"code":"REVOKED_EPOCH"`)
+	})
+
 	t.Run("any other failure is a 500", func(t *testing.T) {
 		c, w := newInternalTestContext()
-		h.respondKeyDistributionError(c, errors.New("tx begin failed"), "ctx-3")
+		h.respondKeyDistributionError(c, errors.New("tx begin failed"), "ctx-4")
 		assert.Equal(t, http.StatusInternalServerError, w.Code)
 		assert.Contains(t, w.Body.String(), errMsgFailedDistributeKeys)
 	})

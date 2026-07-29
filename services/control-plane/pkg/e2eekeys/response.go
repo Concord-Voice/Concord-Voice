@@ -29,12 +29,11 @@ const (
 type Code string
 
 // Code values returned in ErrorResponse.Code. Each represents a distinct
-// failure mode of the key-fetch endpoint:
+// failure mode of the E2EE key endpoints:
 //   - CodeNotMember: caller is not a member of the context
 //   - CodeNoKeyYet: caller is a member but no key row exists
-//   - CodeRevokedEpoch: caller's epoch appears in dm_key_revocations (DM path
-//     only — server-channel revocation uses a separate ledger and does not
-//     currently emit this code)
+//   - CodeRevokedEpoch: caller's DM epoch or a distributed channel epoch appears
+//     in its context's revocation ledger
 //   - CodeInvalidRequest: malformed UUID or version parameter
 //   - CodeInternalError: server-side 500 (e.g., DB error); client may retry
 const (
@@ -45,7 +44,8 @@ const (
 	CodeInternalError  Code = "INTERNAL_ERROR"
 )
 
-// ErrorResponse is emitted on every 4xx from GET /api/v1/e2ee/keys/:context_id.
+// ErrorResponse is emitted on key-fetch 4xx responses and typed channel-key
+// distribution conflicts.
 type ErrorResponse struct {
 	Error   string `json:"error"`
 	Code    Code   `json:"code"`

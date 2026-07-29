@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000108)
+## Existing Migrations (000001–000109)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -218,6 +218,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000106 | bind_rotation_key_fingerprint | Pin the client-asserted CSK fingerprint across rotation batches, fence old-replica initial writers, and default future omitted claims to recoverable unclaimed state (#2503) |
 | 000107 | recover_unwritten_rotation_claims | Backfill the recovery default for databases that applied 000106 before that default moved there (#2503) |
 | 000108 | reject_unissued_rotation_epochs | Reject old-replica wrapped-key writes for successor epochs without a recorded revocation (#2503) |
+| 000109 | reject_revoked_distribution_epochs | Reject new wrapped-key writes for channel epochs that have already been revoked (#2534) |
 
 ## Troubleshooting
 
