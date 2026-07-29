@@ -17,7 +17,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useChatStore } from '../stores/chatStore';
 import { useChannelStore } from '../stores/channelStore';
 import { getWebSocketService, ConnectionState } from '../services/websocketService';
-import { e2eeService } from '../services/e2eeService';
+import { e2eeService, type E2EEChannelOperationGuard } from '../services/e2eeService';
 import { apiFetch, safeJson } from '../services/apiClient';
 import {
   captureRuntimeServerSelection,
@@ -27,6 +27,30 @@ import { useConnectionRecovery } from './useConnectionRecovery';
 import { useWebSocketMessages } from './useWebSocketMessages';
 
 const maxEpochsPerValidationRequest = 500;
+const memberPublicKeyCacheTTLms = 5_000;
+
+interface MemberPublicKey {
+  publicKey: string;
+  keyVersion: number;
+}
+
+function createRotationOperationGuard(
+  authGeneration: number,
+  serverSelection: ReturnType<typeof captureRuntimeServerSelection>,
+  e2eeGuard: E2EEChannelOperationGuard
+): E2EEChannelOperationGuard {
+  return {
+    assertCurrent() {
+      if (
+        useAuthStore.getState().authGeneration !== authGeneration ||
+        !runtimeServerSelectionIsCurrent(serverSelection)
+      ) {
+        throw new Error('E2EE rotation context changed');
+      }
+      e2eeGuard.assertCurrent();
+    },
+  };
+}
 
 export function useWebSocket() {
   const accessToken = useAuthStore((state) => state.accessToken);
@@ -125,53 +149,105 @@ export function useWebSocket() {
   // Track rotation timeouts so they can be cleared on unmount
   // eslint-disable-next-line @eslint-react/naming-convention-ref-name -- stable ref; rename to the *Ref-suffix convention deferred to avoid churning untested handler lines in this low-coverage component (new-code coverage gate). Cosmetic rule suppressed per [internal]rules conventions.
   const rotationTimers = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  const memberPublicKeyCacheRef = useRef(
+    new Map<string, { expiresAt: number; keys: Map<string, MemberPublicKey> }>()
+  );
+  const memberPublicKeyFetchesRef = useRef(
+    new Map<string, Promise<Map<string, MemberPublicKey> | null>>()
+  );
+
+  const getMemberPublicKeys = useCallback(async (serverId: string) => {
+    const authGeneration = useAuthStore.getState().authGeneration;
+    const serverSelection = captureRuntimeServerSelection();
+    const requestIsCurrent = () =>
+      useAuthStore.getState().authGeneration === authGeneration &&
+      runtimeServerSelectionIsCurrent(serverSelection);
+    const cacheKey = `${authGeneration}:${serverSelection.epoch}:${serverId}`;
+    const now = Date.now();
+    for (const [key, entry] of memberPublicKeyCacheRef.current) {
+      if (entry.expiresAt <= now) memberPublicKeyCacheRef.current.delete(key);
+    }
+    const cached = memberPublicKeyCacheRef.current.get(cacheKey);
+    if (cached) return cached.keys;
+
+    const inFlight = memberPublicKeyFetchesRef.current.get(cacheKey);
+    if (inFlight) return inFlight;
+
+    const promise = (async () => {
+      const memberKeysRes = await apiFetch(`/api/v1/servers/${serverId}/member-public-keys`);
+      if (!memberKeysRes.ok || !requestIsCurrent()) return null;
+      const memberKeysData = await safeJson<{
+        members?: Array<{ user_id: string; public_key: string; key_version: number }>;
+      }>(memberKeysRes);
+      if (!requestIsCurrent()) return null;
+      const keys = new Map(
+        (memberKeysData.members || []).map(({ user_id, public_key, key_version }) => [
+          user_id,
+          { publicKey: public_key, keyVersion: key_version },
+        ])
+      );
+      memberPublicKeyCacheRef.current.set(cacheKey, {
+        expiresAt: Date.now() + memberPublicKeyCacheTTLms,
+        keys,
+      });
+      return keys;
+    })();
+    memberPublicKeyFetchesRef.current.set(cacheKey, promise);
+    try {
+      return await promise;
+    } finally {
+      if (memberPublicKeyFetchesRef.current.get(cacheKey) === promise) {
+        memberPublicKeyFetchesRef.current.delete(cacheKey);
+      }
+    }
+  }, []);
 
   // Perform key rotation for a single channel — extracted to reduce nesting depth
-  const performKeyRotation = useCallback(async (channelId: string, newEpoch: number) => {
-    // Check if another client already rotated to this epoch
-    const checkRes = await apiFetch(`/api/v1/e2ee/keys/${channelId}`);
-    if (checkRes.ok) {
-      const checkData = await safeJson<{ key?: { key_version: number } }>(checkRes);
-      if (checkData.key && checkData.key.key_version >= newEpoch) {
-        console.debug('[E2EE] Key rotation already done for', channelId, 'epoch', newEpoch);
-        e2eeService.invalidateChannelKey(channelId);
-        return;
-      }
-    }
-
-    const channelState = useChannelStore.getState();
-    const serverId =
-      channelState.channels.find((channel) => channel.id === channelId)?.server_id ??
-      Object.entries(channelState.channelIdsByServer).find(([, channelIds]) =>
-        channelIds.includes(channelId)
-      )?.[0];
-    if (!serverId) return;
-
-    const membersRes = await apiFetch(`/api/v1/servers/${serverId}/members`);
-    if (!membersRes.ok) return;
-    const membersData = await safeJson<{ members?: Array<{ user_id: string }> }>(membersRes);
-    const members = membersData.members || [];
-
-    const memberPublicKeys = new Map<string, string>();
-    for (const member of members) {
-      try {
-        const pkRes = await apiFetch(`/api/v1/users/${member.user_id}/public-key`);
-        if (pkRes.ok) {
-          const pkData = await safeJson<{ public_key?: string }>(pkRes);
-          if (pkData.public_key) {
-            memberPublicKeys.set(member.user_id, pkData.public_key);
-          }
+  const performKeyRotation = useCallback(
+    async (channelId: string, newEpoch: number, operationGuard: E2EEChannelOperationGuard) => {
+      operationGuard.assertCurrent();
+      // Check if another client already rotated to this epoch
+      const checkRes = await apiFetch(`/api/v1/e2ee/keys/${channelId}`);
+      operationGuard.assertCurrent();
+      if (checkRes.ok) {
+        const checkData = await safeJson<{ key?: { key_version: number } }>(checkRes);
+        operationGuard.assertCurrent();
+        if (checkData.key && checkData.key.key_version >= newEpoch) {
+          console.debug('[E2EE] Key rotation already done for', channelId, 'epoch', newEpoch);
+          e2eeService.invalidateChannelKey(channelId);
+          return;
         }
-      } catch {
-        // Skip members whose keys we can't fetch
       }
-    }
 
-    if (memberPublicKeys.size === 0) return;
+      const channelState = useChannelStore.getState();
+      const serverId =
+        channelState.channels.find((channel) => channel.id === channelId)?.server_id ??
+        Object.entries(channelState.channelIdsByServer).find(([, channelIds]) =>
+          channelIds.includes(channelId)
+        )?.[0];
+      if (!serverId) return;
 
-    await e2eeService.rotateChannelKey(channelId, newEpoch, memberPublicKeys);
-    console.debug('[E2EE] Key rotation completed for', channelId, 'epoch', newEpoch);
-  }, []);
+      const memberPublicKeys = await getMemberPublicKeys(serverId);
+      operationGuard.assertCurrent();
+      if (!memberPublicKeys || memberPublicKeys.size === 0) return;
+
+      const publicKeys = new Map(
+        [...memberPublicKeys].map(([userId, key]) => [userId, key.publicKey])
+      );
+      const wrappedKeyVersions = Object.fromEntries(
+        [...memberPublicKeys].map(([userId, key]) => [userId, key.keyVersion])
+      );
+      await e2eeService.rotateChannelKey(
+        channelId,
+        newEpoch,
+        publicKeys,
+        wrappedKeyVersions,
+        operationGuard
+      );
+      console.debug('[E2EE] Key rotation completed for', channelId, 'epoch', newEpoch);
+    },
+    [getMemberPublicKeys]
+  );
 
   // Rotation coordinator — listens for key rotation events and distributes new keys
   useEffect(() => {
@@ -179,6 +255,14 @@ export function useWebSocket() {
     const handleKeyRotation = (event: Event) => {
       const { channelId, newEpoch } = (event as CustomEvent).detail;
       if (!channelId || !newEpoch || !e2eeService.isInitialized) return;
+      const authGeneration = useAuthStore.getState().authGeneration;
+      const serverSelection = captureRuntimeServerSelection();
+      const e2eeGuard = e2eeService.createChannelRotationGuard(channelId);
+      const operationGuard = createRotationOperationGuard(
+        authGeneration,
+        serverSelection,
+        e2eeGuard
+      );
 
       // Non-fatal: another client may handle the rotation (first-response-wins)
       const onRotationError = (error: unknown) =>
@@ -189,7 +273,12 @@ export function useWebSocket() {
       // eslint-disable-next-line @eslint-react/web-api-no-leaked-timeout -- Timer is tracked in the effect-local `timers` Set; cleanup at line 159-160 iterates the Set and clearTimeout()s each pending rotation on unmount. The rule doesn't recognize Set.add() as a cleanup mechanism.
       const timerId = setTimeout(() => {
         timers.delete(timerId);
-        performKeyRotation(channelId, newEpoch).catch(onRotationError);
+        if (
+          useAuthStore.getState().authGeneration !== authGeneration ||
+          !runtimeServerSelectionIsCurrent(serverSelection)
+        )
+          return;
+        performKeyRotation(channelId, newEpoch, operationGuard).catch(onRotationError);
       }, jitterMs);
       timers.add(timerId);
     };

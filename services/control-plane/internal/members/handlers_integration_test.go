@@ -41,6 +41,10 @@ func bansPath(serverID string) string {
 	return fmt.Sprintf("/api/v1/servers/%s/bans", serverID)
 }
 
+func memberPublicKeysPath(serverID string) string {
+	return fmt.Sprintf("/api/v1/servers/%s/member-public-keys", serverID)
+}
+
 // ── ListMembers (extended) ───────────────────────────────────────────────────
 
 func TestListMembersReturnsUserDetails(t *testing.T) {
@@ -63,6 +67,51 @@ func TestListMembersReturnsUserDetails(t *testing.T) {
 	assert.NotEmpty(t, m["role"])
 	assert.NotEmpty(t, m["joined_at"])
 	assert.NotNil(t, m["roles"])
+}
+
+func TestListMemberPublicKeysReturnsCurrentKeys(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "keylistowner")
+	member := ts.CreateTestUser(t, "keylistmember")
+	serverID := ts.CreateTestServer(t, owner.ID, "KeyListServer")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+
+	w := ts.DoRequest("GET", memberPublicKeysPath(serverID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	keys := body["members"].([]interface{})
+	require.Len(t, keys, 2)
+	for _, rawKey := range keys {
+		key := rawKey.(map[string]interface{})
+		assert.NotEmpty(t, key["user_id"])
+		assert.NotEmpty(t, key["public_key"])
+		assert.Greater(t, key["key_version"].(float64), float64(0))
+	}
+}
+
+func TestListMemberPublicKeysRejectsMissingMemberKey(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "keylistmissing")
+	member := ts.CreateTestUser(t, "keylistnokey")
+	serverID := ts.CreateTestServer(t, owner.ID, "MissingKeyServer")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	_, err := ts.DB.Exec(`DELETE FROM public_keys WHERE user_id = $1`, member.ID)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("GET", memberPublicKeysPath(serverID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusConflict, w.Code)
+}
+
+func TestListMemberPublicKeysRejectsNonMember(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "keylistown")
+	outsider := ts.CreateTestUser(t, "keylistout")
+	serverID := ts.CreateTestServer(t, owner.ID, "PrivateKeyListServer")
+
+	w := ts.DoRequest("GET", memberPublicKeysPath(serverID), nil, testhelpers.AuthHeaders(outsider.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
 func TestListMembersInvalidServerID(t *testing.T) {
@@ -985,6 +1034,35 @@ func TestRemoveMemberTriggersKeyRevocation(t *testing.T) {
 	).Scan(&revCount)
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, revCount, 1)
+}
+
+func TestRemoveMemberRotatesKeyDuringInitialDistribution(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "kickdeferown")
+	member := ts.CreateTestUser(t, "kickdefermem")
+	serverID := ts.CreateTestServer(t, owner.ID, "Kick Deferred Server")
+	channelID := ts.CreateTestChannel(t, serverID, "e2ee-ch")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	_, err := ts.DB.Exec(
+		`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, $3, 1)`,
+		channelID, member.ID, []byte("test-key-2"),
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id) VALUES ($1, $2)`, channelID, owner.ID,
+	)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("DELETE", memberPath(serverID, member.ID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+	var markerEpoch int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT key_version FROM channel_initial_key_distributions WHERE channel_id = $1`, channelID,
+	).Scan(&markerEpoch))
+	assert.Equal(t, 2, markerEpoch)
+	var count int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM key_revocations WHERE channel_id = $1`, channelID).Scan(&count))
+	assert.Equal(t, 1, count)
 }
 
 // ── AddMember missing body ───────────────────────────────────────────────────

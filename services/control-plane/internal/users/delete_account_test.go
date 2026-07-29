@@ -93,6 +93,63 @@ func TestDeleteAccount_AuditRowInsertWithoutSentryColumn(t *testing.T) {
 	require.NoError(t, err, "INSERT must succeed without sentry_delete_attempted column")
 }
 
+func TestDeleteAccount_BroadcastsIncompleteChannelDeletion(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "erasechannelowner")
+	creator := ts.CreateTestUser(t, "erasechannelcreator")
+	serverID := ts.CreateTestServer(t, owner.ID, "Erase Channel Server")
+	channelID := ts.CreateTestChannel(t, serverID, "incomplete-channel")
+	ts.AddMemberToServer(t, serverID, creator.ID, "member")
+	_, err := ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id) VALUES ($1, $2)`, channelID, creator.ID,
+	)
+	require.NoError(t, err)
+
+	var broadcasts [][2]string
+	svc := users.NewAccountService(ts.DB, logger.New("test"))
+	svc.SetChannelDeletedBroadcaster(func(serverID, channelID string) {
+		broadcasts = append(broadcasts, [2]string{serverID, channelID})
+	})
+	require.NoError(t, svc.DeleteAccount(context.Background(), creator.ID))
+
+	assert.Equal(t, [][2]string{{serverID, channelID}}, broadcasts)
+	var channelRows int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM channels WHERE id = $1`, channelID).Scan(&channelRows))
+	assert.Zero(t, channelRows)
+}
+
+func TestDeleteAccount_BroadcastsCascadedIncompleteLinkedChannelDeletion(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "erasevoiceowner")
+	creator := ts.CreateTestUser(t, "erasevoicecreator")
+	serverID := ts.CreateTestServer(t, owner.ID, "Erase Voice Channel Server")
+	voiceID := ts.CreateTestChannel(t, serverID, "incomplete-voice")
+	linkedTextID := ts.CreateTestChannel(t, serverID, "completed-linked-text")
+	ts.AddMemberToServer(t, serverID, creator.ID, "member")
+	_, err := ts.DB.Exec(
+		`UPDATE channels SET linked_voice_channel_id = $2 WHERE id = $1`, linkedTextID, voiceID,
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id) VALUES ($1, $2)`, voiceID, creator.ID,
+	)
+	require.NoError(t, err)
+
+	var broadcasts [][2]string
+	svc := users.NewAccountService(ts.DB, logger.New("test"))
+	svc.SetChannelDeletedBroadcaster(func(serverID, channelID string) {
+		broadcasts = append(broadcasts, [2]string{serverID, channelID})
+	})
+	require.NoError(t, svc.DeleteAccount(context.Background(), creator.ID))
+
+	assert.ElementsMatch(t, [][2]string{{serverID, voiceID}, {serverID, linkedTextID}}, broadcasts)
+	var channelRows int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM channels WHERE id IN ($1, $2)`, voiceID, linkedTextID,
+	).Scan(&channelRows))
+	assert.Zero(t, channelRows)
+}
+
 // TestDeleteAccount_CascadeDeletesUserRelatedData verifies that the
 // ON DELETE CASCADE behavior correctly cleans up all user-associated
 // data (servers, channels, messages, roles, etc.) when the user row

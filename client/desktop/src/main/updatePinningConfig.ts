@@ -27,19 +27,6 @@ export const PIN_CONFIG: PinConfig = {
     // same-day production pin below is rollback-only.
     'adc59f988ed774248efa8e2a5cf3a5114ddf05252abc72ae93ee445ba5d8ce75', // pragma: allowlist secret
     '6f7894c8ade945ca564b5c26cd0bae8f2994bd417da5d25e4c29e9b4564a5ac2', // pragma: allowlist secret
-    // Previous production leaf SPKI SHA-256 (Let's Encrypt E7, via CloudFlare edge).
-    // Measured 2026-05-08 — replaces pre-cutover pin (53257bb4...) after the
-    // cert was renewed during the #885 webroot-certbot switch. The renewal
-    // generated a new keypair instead of following the rotation runbook's
-    // backup-keypair swap procedure (#899); a future PR (V1.7) will regenerate
-    // the backup keypair and engage the proper rotation invariant. This is a
-    // public-key fingerprint, not a secret — reproducible by anyone connecting
-    // to the host:
-    //   echo | openssl s_client -connect api.concordvoice.chat:443 \
-    //     -servername api.concordvoice.chat 2>/dev/null \
-    //     | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \
-    //     | openssl dgst -sha256 -binary | xxd -p | tr -d '\n'
-    '0a4ccc0dfc2c60c67e4b814292467bbf7e525d6b75d38e32ea646153fc7c49f2', // pragma: allowlist secret
   ] as const,
   fallbackPins: [
     // Pre-staged backup keypair SPKI SHA-256. The corresponding RSA-4096

@@ -15,10 +15,13 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -353,6 +356,29 @@ func installTokenTheftRevokeFailure(t *testing.T, db *sql.DB) {
 	})
 }
 
+func installTokenTheftKeyRevocationFailure(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.Exec(`
+		CREATE OR REPLACE FUNCTION token_theft_key_revocation_failure() RETURNS trigger AS $$
+		BEGIN
+			RAISE EXCEPTION 'token theft key revocation failure';
+		END;
+		$$ LANGUAGE plpgsql`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		CREATE TRIGGER token_theft_key_revocation_failure BEFORE INSERT ON key_revocations
+		FOR EACH ROW EXECUTE FUNCTION token_theft_key_revocation_failure()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if _, dropErr := db.Exec(`DROP TRIGGER IF EXISTS token_theft_key_revocation_failure ON key_revocations`); dropErr != nil {
+			t.Errorf("drop token-theft key-revocation failure trigger: %v", dropErr)
+		}
+		if _, dropErr := db.Exec(`DROP FUNCTION IF EXISTS token_theft_key_revocation_failure()`); dropErr != nil {
+			t.Errorf("drop token-theft key-revocation failure function: %v", dropErr)
+		}
+	})
+}
+
 func holdTokenTheftMintBarrier(t *testing.T) func() {
 	t.Helper()
 	lockDB, err := sql.Open("postgres", dbtest.DatabaseURL())
@@ -526,6 +552,114 @@ func TestTheftTriggersKeyRevocations(t *testing.T) {
 	).Scan(&revocationCount)
 	require.NoError(t, err)
 	assert.Greater(t, revocationCount, 0)
+}
+
+func TestTheftKeyRevocationFailureStillRejectsRefresh(t *testing.T) {
+	ts := setupTS(t)
+	originalMachineID := uuid.New().String()
+	refreshToken, userID := registerAndGetRefreshToken(t, ts, "theftkeyerror", originalMachineID)
+	serverID := ts.CreateTestServer(t, userID, "Theft Key Error Server")
+	channelID := ts.CreateTestChannel(t, serverID, "encrypted-channel")
+	_, err := ts.DB.Exec(
+		`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, $3, 1)`,
+		channelID, userID, []byte("fake-wrapped-key"),
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`UPDATE refresh_tokens SET ip_address = '10.0.0.1', machine_id = $1 WHERE token_hash = $2`,
+		originalMachineID, auth.HashRefreshToken(refreshToken),
+	)
+	require.NoError(t, err)
+	installTokenTheftKeyRevocationFailure(t, ts.DB)
+
+	logs := ts.CaptureLogs(t)
+	w := doRefreshWithMachineID(ts, refreshToken, uuid.New().String(), "10.0.0.99:5678")
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Contains(t, logs.String(), "Failed to record key revocation for theft")
+	var revocations int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM key_revocations WHERE channel_id = $1`, channelID,
+	).Scan(&revocations))
+	assert.Zero(t, revocations)
+}
+
+func TestTheftDeletesIncompleteChannelWhenCreatorCompromised(t *testing.T) {
+	ts := setupTS(t)
+	originalMachineID := uuid.New().String()
+	refreshToken, userID := registerAndGetRefreshToken(t, ts, "theftdeferred", originalMachineID)
+	tokenHash := auth.HashRefreshToken(refreshToken)
+	serverID := ts.CreateTestServer(t, userID, "Theft Deferred Server")
+	channelID := ts.CreateTestChannel(t, serverID, "encrypted-channel")
+	_, err := ts.DB.Exec(
+		`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, $3, 1)`,
+		channelID, userID, []byte("fake-wrapped-key"),
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id) VALUES ($1, $2)`, channelID, userID,
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`UPDATE refresh_tokens SET ip_address = '10.0.0.1', machine_id = $1 WHERE token_hash = $2`, originalMachineID, tokenHash,
+	)
+	require.NoError(t, err)
+
+	w := doRefreshWithMachineID(ts, refreshToken, uuid.New().String(), "10.0.0.99:5678")
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	var count int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM channels WHERE id = $1`, channelID).Scan(&count))
+	assert.Zero(t, count)
+}
+
+func TestTheftBroadcastsInitialDistributionRotation(t *testing.T) {
+	ts := setupTS(t)
+	originalMachineID := uuid.New().String()
+	refreshToken, userID := registerAndGetRefreshToken(t, ts, "theftbroadcast", originalMachineID)
+	tokenHash := auth.HashRefreshToken(refreshToken)
+	serverID := ts.CreateTestServer(t, userID, "Theft Broadcast Server")
+	creator := ts.CreateTestUser(t, "theftrotationcreator")
+	ts.AddMemberToServer(t, serverID, creator.ID, "member")
+	channelID := ts.CreateTestChannel(t, serverID, "encrypted-channel")
+	_, err := ts.DB.Exec(
+		`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, $3, 1)`,
+		channelID, userID, []byte("fake-wrapped-key"),
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id) VALUES ($1, $2)`, channelID, creator.ID,
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`UPDATE refresh_tokens SET ip_address = '10.0.0.1', machine_id = $1 WHERE token_hash = $2`, originalMachineID, tokenHash,
+	)
+	require.NoError(t, err)
+
+	h := auth.NewHandler(ts.DB, ts.Redis, logger.New("test"), testhelpers.TestJWTSecret, noopDisconnector{})
+	h.SetInitialDistributorChecker(rbac.NewResolver(ts.DB, nil, logger.New("test")).CanDistributeChannelKeyTx)
+	var rotations []keyrotation.Rotation
+	h.SetKeyRevocationBroadcaster(func(rotation keyrotation.Rotation) {
+		rotations = append(rotations, rotation)
+	})
+	router := gin.New()
+	router.POST("/api/v1/auth/refresh", h.Refresh)
+	req := httptest.NewRequest("POST", "/api/v1/auth/refresh", nil)
+	req.Header.Set(ctHeader, ctJSON)
+	req.Header.Set("X-Refresh-Token", refreshToken)
+	req.Header.Set(headerXMachineID, uuid.New().String())
+	req.RemoteAddr = "10.0.0.99:5678"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	require.Len(t, rotations, 1)
+	assert.Equal(t, channelID, rotations[0].ChannelID)
+	assert.Equal(t, 1, rotations[0].RevokedEpoch)
+	assert.Equal(t, 2, rotations[0].SuccessorEpoch)
+	var markerEpoch int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT key_version FROM channel_initial_key_distributions WHERE channel_id = $1`, channelID,
+	).Scan(&markerEpoch))
+	assert.Equal(t, 2, markerEpoch)
 }
 
 // ── Poll Device Recovery Request ───────────────────────────────────────────

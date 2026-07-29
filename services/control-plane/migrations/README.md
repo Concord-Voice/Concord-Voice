@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000101)
+## Existing Migrations (000001–000108)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -211,6 +211,13 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000099 | user_credential_epoch | Durable per-user credential-epoch fence for destructive access-token revocation (#2201) |
 | 000100 | add_refresh_token_predecessor | Exact predecessor-to-successor lineage for grace-period refresh recovery (#2428) |
 | 000101 | add_presence_offline_fences | Durable Rich Presence emission-denial fences after disconnects |
+| 000102 | add_channel_initial_key_distributions | Creator-only fence for incomplete channel-key distributions (#2503) |
+| 000103 | bind_rotation_distributor | Durable first-distributor claim for every batched successor-epoch key distribution (#2503) |
+| 000104 | validate_rotation_distributor_fk | Validate the distributor foreign key after the schema-change transaction (#2503) |
+| 000105 | enforce_rotation_distributor_writer | Block old handlers from bypassing a successor epoch's distributor claim (#2503) |
+| 000106 | bind_rotation_key_fingerprint | Pin the client-asserted CSK fingerprint across rotation batches, fence old-replica initial writers, and default future omitted claims to recoverable unclaimed state (#2503) |
+| 000107 | recover_unwritten_rotation_claims | Backfill the recovery default for databases that applied 000106 before that default moved there (#2503) |
+| 000108 | reject_unissued_rotation_epochs | Reject old-replica wrapped-key writes for successor epochs without a recorded revocation (#2503) |
 
 ## Troubleshooting
 

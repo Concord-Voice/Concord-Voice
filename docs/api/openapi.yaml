@@ -2078,7 +2078,13 @@ paths:
 
         All channels are E2EE and require a non-empty `wrapped_keys` map from user IDs
         to wrapped CSKs.
-        `wrapped_keys` and `wrapped_key_versions` each accept at most 500 entries.
+        `wrapped_keys` and `wrapped_key_versions` each accept at most 500 entries. Clients
+        creating a larger channel must include the caller in this initial batch, then distribute
+        subsequent batches of at most 500 eligible viewers through `POST /channels/{id}/keys` at
+        `key_version: 1`. For a voice channel, distribute each subsequent batch to both the
+        returned `channel.id` and `linked_text_channel.id`. Until every current eligible viewer
+        has an epoch-1 key, only the channel creator may distribute those initial overflow batches
+        and key rotation is blocked.
         The request body must not exceed 512 KiB.
 
         Rate limit: 10 requests per minute.
@@ -2102,6 +2108,10 @@ paths:
                 properties:
                   channel:
                     $ref: '#/components/schemas/Channel'
+                  linked_text_channel:
+                    description: Present when the created channel is a voice channel.
+                    allOf:
+                    - $ref: '#/components/schemas/Channel'
         '400':
           description: Invalid request body, including a missing or empty `wrapped_keys` map. If either
             wrapped-key map exceeds 500 entries, the error is `Too many wrapped keys`.
@@ -2113,6 +2123,12 @@ paths:
                 error: Too many wrapped keys
         '403':
           description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The creator did not provide a current epoch-1 key
           content:
             application/json:
               schema:
@@ -2252,7 +2268,11 @@ paths:
       - E2EE
       summary: Distribute channel keys
       description: 'Distribute wrapped CSKs to new members. The caller must already have a key for this
-        channel.
+        channel. During an incomplete epoch-1 overflow from channel creation, only the channel
+        creator may distribute the marker''s current `key_version`; for a later epoch issued by
+        the rotation endpoint, the first batch records a `key_fingerprint` (base64 SHA-256 of the
+        CSK), and every batch or later rewrap for that epoch must present the same fingerprint.
+        `Manage Crypto Rotation` is required only to initiate the rotation.
 
         First-response-wins on duplicates. `wrapped_keys` and `wrapped_key_versions`
         each accept at most 500 entries. The request body must not exceed 512 KiB.
@@ -2282,10 +2302,15 @@ paths:
                     type: integer
                   duplicates:
                     type: integer
+                  skipped:
+                    type: integer
+                  skipped_stale:
+                    type: integer
         '400':
           description: Invalid channel UUID or request body. An invalid path identifier returns `Invalid
             channel ID`; if either wrapped-key map exceeds 500 entries, the error is `Too many wrapped
-            keys`.
+            keys`; a rotation batch with no eligible recipient returns `No eligible recipients supplied
+            for channel-key distribution`.
           content:
             application/json:
               schema:
@@ -2300,6 +2325,35 @@ paths:
                 $ref: '#/components/schemas/Error'
               example:
                 error: Request body too large
+        '403':
+          description: Caller lacks a channel key or channel access, or an active initial distribution is restricted to its creator and marker epoch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The active initial-distribution marker has no eligible creator, a requested successor epoch has not been issued, or a rotation batch omitted or mismatched the established key fingerprint.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: One or more target access checks failed. No key was distributed to those targets; retry the batch.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  distributed:
+                    type: integer
+                  duplicates:
+                    type: integer
+                  skipped:
+                    type: integer
+                  skipped_stale:
+                    type: integer
   /channels/{id}/messages:
     delete:
       tags:
@@ -2783,7 +2837,8 @@ paths:
       summary: Rotate channel encryption key
       description: 'Initiate a key rotation for an encrypted channel. Increments the
 
-        key version; members must re-distribute wrapped keys.
+        key version; members must re-distribute wrapped keys. Rotation is unavailable
+        while the creator is completing the initial epoch-1 distribution.
 
         Rate limit: 10 requests per 24 hours (per channel, Redis INCR+EXPIRE).
 
@@ -2807,6 +2862,12 @@ paths:
                     type: integer
         '403':
           description: Not authorized (must be server owner or admin)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Initial epoch-1 distribution is incomplete
           content:
             application/json:
               schema:
@@ -4979,7 +5040,9 @@ paths:
       description: 'Distribute wrapped E2EE keys to members of a channel or DM conversation.
         Channel contexts accept at most 500 entries in each wrapped-key map and a
         512 KiB request body. DM contexts accept at most 10 entries in each map and
-        a 16 KiB request body.
+        a 16 KiB request body. For an issued channel rotation, the client must provide
+        the same `key_fingerprint` (base64 SHA-256 of its CSK) on every batch or later
+        rewrap; DM contexts ignore this field.
 
         Rate limit: 10 requests per minute (user-based).
 
@@ -5004,6 +5067,7 @@ paths:
               properties:
                 wrapped_keys:
                   type: object
+                  minProperties: 1
                   maxProperties: 500
                   additionalProperties:
                     type: string
@@ -5019,6 +5083,11 @@ paths:
                 key_version:
                   type: integer
                   nullable: true
+                  description: Optional key epoch. For an issued channel rotation, the first CSK fingerprint is pinned for every batch at this epoch.
+                key_fingerprint:
+                  type: string
+                  pattern: '^[A-Za-z0-9+/]{43}=$'
+                  description: Client assertion of SHA-256(CSK). Required to claim or rewrap an issued channel rotation epoch; ignored for DMs.
       responses:
         '200':
           description: Keys distributed
@@ -5032,7 +5101,8 @@ paths:
         '400':
           description: Invalid context UUID or request body. An invalid path identifier returns `Invalid
             context ID`; if either wrapped-key map exceeds the context limit, the error is `Too many
-            wrapped keys`.
+            wrapped keys`; a channel rotation batch with no eligible recipient returns `No eligible
+            recipients supplied for channel-key distribution`.
           content:
             application/json:
               schema:
@@ -5047,6 +5117,12 @@ paths:
                 $ref: '#/components/schemas/Error'
               example:
                 error: Request body too large
+        '409':
+          description: A channel rotation batch omitted or mismatched the established key fingerprint
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /e2ee/keys/{context_id}/rewrap:
     post:
       tags:
@@ -10551,6 +10627,47 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /servers/{id}/member-public-keys:
+    get:
+      tags:
+      - Members
+      summary: List current public keys for server members
+      description: 'Returns public keys and versions for E2EE channel wrapping. Caller must belong to the server.
+
+        Every server member must have a public key; otherwise this endpoint returns 409 and the
+        client must not create a channel.
+
+        Rate limit: 30 requests per minute.
+
+        '
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ServerId'
+      responses:
+        '200':
+          description: Member public key list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  members:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MemberPublicKey'
+        '403':
+          description: Not a member of this server
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: A server member has no public key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /servers/{id}/members/{user_id}:
     patch:
       tags:
@@ -14882,6 +14999,7 @@ components:
       properties:
         wrapped_keys:
           type: object
+          minProperties: 1
           maxProperties: 500
           additionalProperties:
             type: string
@@ -14895,8 +15013,14 @@ components:
         key_version:
           type: integer
           nullable: true
-          description: Optional explicit key epoch. Positive values are used directly; omitted, null,
-            zero, or negative values use the channel's current maximum epoch.
+          description: Optional explicit key epoch. A positive value must be epoch 1 while the
+            channel's current epoch is 1, the current marker epoch, or an issued successor; an
+            issued rotation epoch is bound to its first CSK fingerprint for every batch. Omitted,
+            null, zero, or negative values use the channel's current maximum epoch.
+        key_fingerprint:
+          type: string
+          pattern: '^[A-Za-z0-9+/]{43}=$'
+          description: Client assertion of SHA-256(CSK). Required to claim or rewrap an issued rotation epoch; the server pins this value without receiving or inspecting the CSK or its encrypted wraps.
     SendMessageRequest:
       type: object
       required:
@@ -15241,6 +15365,19 @@ components:
           format: date-time
           nullable: true
           description: UTC timestamp until this member may send messages, react, or join voice channels
+    MemberPublicKey:
+      type: object
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        public_key:
+          type: string
+          format: byte
+          description: Base64-encoded current RSA-OAEP public key
+        key_version:
+          type: integer
+          minimum: 1
     ServerInvite:
       type: object
       properties:

@@ -26,6 +26,11 @@ import (
 
 var errForcedAmbiguousRecoveryCommit = errors.New("forced ambiguous recovery commit")
 
+// This test is in package auth, which cannot import testhelpers because that
+// package constructs an auth.Handler. Keep the recovery payload valid under the
+// public-key ingress contract while exercising its later commit paths.
+const recoveryTestPublicKeyBase64 = "MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA2qM/seYPo49k6tRZvNCVl0A7jKbVTGWwsPYSfX6MWd7/VU4ocUh6v/au02rvDIXoCyHHHAP/YCN+SLgZBJnSd77KqzWBoXczEd3uZhr/rHIfPAewHKYICj2tKXKAr6KduK42I0guEODiHXwWT4vHfzUEk7dJRALhNnKc6utjBjD9fyeasC/m12hw9b007NoyA9xUIeVT0/n+Yy+BmJSmhlgEXywQ0NCXQtJnW3Vj6iZiDhORt7udauPYlzdf1N7YCM0rMs/BtdgNE8m+/mj4OazKasRn8hOCPDOuHfprbDhW6yaACugsjtX3chE7TeXzg+q41+zARuC/YgkPZy7FgNuUsOONSvkHefi0b646+CzUcXE8I4oJQ7MIpjGb7n+h52TH4VO9GWdLwHAOd1A19XyniI7+NeH/D5pJNW6HJqbq5CTAhYAWXvEymnow2nX4MBNtin5fNovmIsh3Z9mGhvl2e3D3kBfgtMO+n6PW4c0k1g6qBhGwMwrx+f0nLKDii/tXN2GBLM3URPxjob55O4YJk+6FyGUNekfw1IFcf4mp0klytHaIEHQFBxpnYf+/0rTO1a59m98nVxY8LBjBFuzFAhFNB1nCSL0P1T5G1AkLbIE2myKOIsksDVo7WNyqvbwaqk4B7zKXkOUUXIhJLgX8oLduD74OgMqGXhZDTXUCAwEAAQ==" // pragma: allowlist secret -- public RSA-4096 SPKI test fixture
+
 type recoveryForcedEventRecorder struct {
 	events []string
 	plans  []presencehistory.DeliveryPlan
@@ -119,16 +124,16 @@ func recoveryForcedFlows() []recoveryForcedFlow {
 		{
 			name: "account recovery",
 			path: "/api/v1/auth/recovery/reset-account",
-			body: `{
+			body: strings.Replace(`{
 				"recovery_token":"token",
 				"new_password":"NewSecurePassword123!",
 				"wrapped_private_key":"a2V5",
 				"key_derivation_salt":"c2FsdA==",
 				"key_derivation_alg":"argon2id",
-				"public_key":"cHVibGlj",
+				"public_key":"PUBLIC_KEY",
 				"acknowledge_data_loss":true,
 				"user_id":"00000000-0000-0000-0000-000000000001"
-			}`,
+			}`, "PUBLIC_KEY", recoveryTestPublicKeyBase64, 1),
 			handler: func(h *Handler, c *gin.Context) { h.RecoveryResetAccount(c) },
 		},
 	}

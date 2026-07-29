@@ -352,6 +352,8 @@ func NewRouter(
 	authHandler.SetPresenceHistory(presenceHistoryService)
 	authHandler.SetEmailService(emailSvc)
 	authHandler.SetCredentialFence(credFence)
+	authHandler.SetKeyRevocationBroadcaster(websocket.KeyRevocationBroadcaster(hub))
+	authHandler.SetInitialDistributorChecker(rbacResolver.CanDistributeChannelKeyTx)
 	// Wire cross-references (breaks circular init dependency)
 	authHandler.SetMFAChecker(mfaHandler)
 	mfaHandler.SetLoginCompleter(authHandler)
@@ -439,7 +441,7 @@ func NewRouter(
 	clientConfigHandler := clientconfig.NewHandler(cfg, liveSpa, log)
 	serverCapabilitiesHandler := servercapabilities.NewHandler(cfg)
 	updatesHandler := updates.NewHandler(cfg, log)
-	privacyHandler := buildPrivacyHandler(db, redis, log, usersHandler)
+	privacyHandler := buildPrivacyHandler(db, redis, log, usersHandler, hub)
 	oauthHandler := buildOAuthHandler(db, redis, cfg, authHandler, log)
 
 	// Client attestation (#677, ADR-0010). When REQUIRE_CLIENT_ATTESTATION=false
@@ -1282,6 +1284,12 @@ func NewRouter(
 				serverRoutes.GET(pathIDMembers,
 					middleware.RateLimitByUser(redis, 30, 1*time.Minute),
 					membersHandler.ListMembers,
+				)
+
+				// List member public keys for E2EE channel wrapping (30 requests per minute)
+				serverRoutes.GET("/:id/member-public-keys",
+					middleware.RateLimitByUser(redis, 30, 1*time.Minute),
+					membersHandler.ListMemberPublicKeys,
 				)
 
 				// Add member to server (10 requests per minute)

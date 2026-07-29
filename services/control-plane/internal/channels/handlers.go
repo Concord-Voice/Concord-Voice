@@ -4,6 +4,7 @@ package channels
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
@@ -57,6 +59,10 @@ const (
 	errMsgFailedFetchServerUnread     = "Failed to fetch server unread status"
 	errMsgNoEncryptionKey             = "No encryption key available yet"
 	errMsgFailedDistributeKeys        = "Failed to distribute keys"
+	errMsgFailedStoreEncryptionKeys   = "Failed to store encryption keys"
+	errMsgFailedRotateKey             = "Failed to rotate key"
+	errMsgInitialKeyDistributionOnly  = "Initial channel key distribution is restricted to the channel creator"
+	errMsgInitialKeyDistributionBusy  = "Initial channel key distribution is incomplete"
 	// errMsgAuthRequired matches the middleware's generic auth-failure body so
 	// an epoch-fence rejection inside a handler is indistinguishable from the
 	// middleware's own rejection (#2201).
@@ -68,6 +74,16 @@ const (
 	errMsgContextNotFoundOrDenied = "Context not found or access denied"
 	errMsgNotMemberOrParticipant  = "Not a member or participant"
 	logMsgFailedCheckPermissions  = "Failed to check permissions"
+)
+
+var (
+	errInitialKeyDistributionCreator = errors.New("initial channel key distribution requires creator")
+	errInitialKeyDistributionBusy    = errors.New("initial channel key distribution is incomplete")
+	errInitialCreatorKeyMissing      = errors.New("creator initial key missing")
+	errUnissuedChannelKeyVersion     = errors.New("channel key version was not issued for rotation")
+	errRotationDistributor           = errors.New("channel key rotation already has a distributor")
+	errChannelKeyDistributorAccess   = errors.New("channel key distributor no longer has access")
+	errNoChannelKeyRecipients        = errors.New("channel key distribution has no eligible recipients")
 )
 
 // Handler handles channel-related requests
@@ -281,6 +297,22 @@ func (h *Handler) admitCreateChannelRequest(c *gin.Context, req CreateChannelReq
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
 		return false
 	}
+	viewPerms := []rbac.Permission{viewPermForType(req.Type)}
+	if req.Type == "voice" {
+		viewPerms = append(viewPerms, rbac.PermViewTextChannels)
+	}
+	for _, viewPerm := range viewPerms {
+		canView, err := h.resolver.HasPermission(c.Request.Context(), req.ServerID, userID, "", viewPerm)
+		if err != nil {
+			h.log.Error(logMsgFailedCheckPermissions, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+			return false
+		}
+		if !canView {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+			return false
+		}
+	}
 
 	groupOK, groupErr := h.groupBelongsToServer(c.Request.Context(), req.GroupID, req.ServerID)
 	if groupErr != nil {
@@ -330,6 +362,113 @@ func (h *Handler) respondCreateChannelGuardError(c *gin.Context, guardErr error)
 	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
 }
 
+type createChannelResult struct {
+	channel                    models.Channel
+	linkedTextChannel          *models.Channel
+	initialDistributionPending bool
+	linkedDistributionPending  bool
+}
+
+func (h *Handler) storeInitialChannelKeys(c *gin.Context, tx *sql.Tx, req CreateChannelRequest, channelID, userID string, linked bool) bool {
+	recipients, err := h.initialKeyRecipients(c.Request.Context(), tx, req.ServerID, channelID)
+	if err != nil {
+		logMessage := "Failed to resolve initial key recipients"
+		if linked {
+			logMessage = "Failed to resolve linked-text initial key recipients"
+		}
+		h.log.Error(logMessage, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resolve encryption key recipients"})
+		return false
+	}
+	recipients[userID] = struct{}{}
+	if err := h.storeWrappedKeys(c.Request.Context(), tx, channelID, req.WrappedKeys, req.WrappedKeyVersions, recipients); err != nil {
+		if linked {
+			h.log.Error("Failed to store linked text channel encryption keys", "error", err)
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreEncryptionKeys})
+		return false
+	}
+	if err := ensureInitialCreatorKey(c.Request.Context(), tx, channelID, userID); err != nil {
+		h.respondInitialCreatorKeyError(c, err)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) startCreatedChannelKeyDistributions(c *gin.Context, tx *sql.Tx, req CreateChannelRequest, channelID, userID string, linkedTextChannel *models.Channel) (initialPending, linkedPending, ok bool) {
+	initialPending, err := h.startInitialKeyDistribution(c.Request.Context(), tx, req.ServerID, channelID, userID)
+	if err != nil {
+		h.log.Error("Failed to start initial channel key distribution", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		return false, false, false
+	}
+	if linkedTextChannel == nil {
+		return initialPending, false, true
+	}
+	linkedPending, err = h.startInitialKeyDistribution(c.Request.Context(), tx, req.ServerID, linkedTextChannel.ID, userID)
+	if err != nil {
+		h.log.Error("Failed to start linked-text initial channel key distribution", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		return false, false, false
+	}
+	return initialPending, linkedPending, true
+}
+
+func (h *Handler) createChannelTx(c *gin.Context, tx *sql.Tx, req CreateChannelRequest, userID string) (createChannelResult, bool) {
+	var result createChannelResult
+	if guardErr := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
+		h.respondCreateChannelGuardError(c, guardErr)
+		return result, false
+	}
+
+	nextPos := h.computeNextPosition(tx, req.ServerID, req.GroupID)
+	channelID := uuid.New().String()
+	channel, err := h.insertChannel(tx, channelID, req, nextPos)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
+		return result, false
+	}
+	if !h.storeInitialChannelKeys(c, tx, req, channelID, userID, false) {
+		return result, false
+	}
+
+	linkedTextChannel, err := h.maybeCreateLinkedTextChannel(c.Request.Context(), tx, req, channelID, nextPos)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create linked text channel"})
+		return result, false
+	}
+	if linkedTextChannel != nil && !h.storeInitialChannelKeys(c, tx, req, linkedTextChannel.ID, userID, true) {
+		return result, false
+	}
+
+	initialPending, linkedPending, ok := h.startCreatedChannelKeyDistributions(c, tx, req, channelID, userID, linkedTextChannel)
+	if !ok {
+		return result, false
+	}
+	result.channel = channel
+	result.linkedTextChannel = linkedTextChannel
+	result.initialDistributionPending = initialPending
+	result.linkedDistributionPending = linkedPending
+	return result, true
+}
+
+func (h *Handler) finishCreateChannel(c *gin.Context, serverID, userID string, result createChannelResult) {
+	h.log.Info("Channel created", "channel_id", result.channel.ID, "server_id", serverID, "user_id", userID)
+	h.broadcastChannelCreated(serverID, result.channel, result.linkedTextChannel)
+	if result.initialDistributionPending {
+		h.notifyInitialKeyDistribution(userID, serverID, result.channel.ID)
+	}
+	if result.linkedDistributionPending {
+		h.notifyInitialKeyDistribution(userID, serverID, result.linkedTextChannel.ID)
+	}
+
+	response := gin.H{"channel": result.channel}
+	if result.linkedTextChannel != nil {
+		response["linked_text_channel"] = result.linkedTextChannel
+	}
+	c.JSON(http.StatusCreated, response)
+}
+
 // CreateChannel creates a channel (plus a linked text channel for voice) and
 // stores the E2EE-everywhere wrapped keys inside one epoch-guarded transaction.
 func (h *Handler) CreateChannel(c *gin.Context) {
@@ -361,33 +500,10 @@ func (h *Handler) CreateChannel(c *gin.Context) {
 		}
 	}()
 
-	// #2201: the wrapped keys stored below are key-material-coupled state —
-	// recheck the creator's credential epoch inside the tx (covers both
-	// storeWrappedKeys and the linked-text-channel copy in this same tx).
-	if guardErr := credepoch.GuardTx(c.Request.Context(), tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
-		h.respondCreateChannelGuardError(c, guardErr)
-		return
-	}
-
-	nextPos := h.computeNextPosition(tx, req.ServerID, req.GroupID)
-	channelID := uuid.New().String()
-
-	channel, err := h.insertChannel(tx, channelID, req, nextPos)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateChannel})
-		return
-	}
-
-	// Store wrapped channel keys (always required under E2EE-everywhere)
-	if h.storeWrappedKeys(c.Request.Context(), tx, channelID, req.WrappedKeys, req.WrappedKeyVersions) != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store encryption keys"})
-		return
-	}
-
-	// Auto-create linked text channel for voice channels
-	linkedTextChannel, ltcErr := h.maybeCreateLinkedTextChannel(c.Request.Context(), tx, req, channelID, nextPos)
-	if ltcErr != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create linked text channel"})
+	// #2201: every key-material-coupled write stays inside this transaction,
+	// behind the creator's credential-epoch guard.
+	result, ok := h.createChannelTx(c, tx, req, userID)
+	if !ok {
 		return
 	}
 
@@ -397,16 +513,7 @@ func (h *Handler) CreateChannel(c *gin.Context) {
 		return
 	}
 
-	h.log.Info("Channel created", "channel_id", channelID, "server_id", req.ServerID, "user_id", userID)
-
-	h.broadcastChannelCreated(req.ServerID, channel, linkedTextChannel)
-
-	// Return response: voice channels include the linked text channel
-	response := gin.H{"channel": channel}
-	if linkedTextChannel != nil {
-		response["linked_text_channel"] = linkedTextChannel
-	}
-	c.JSON(http.StatusCreated, response)
+	h.finishCreateChannel(c, req.ServerID, userID, result)
 }
 
 // computeNextPosition returns the next position for a channel within a group (or uncategorized).
@@ -480,14 +587,14 @@ func wrappedKeyRecipientStale(ctx context.Context, tx *sql.Tx, channelID, member
 	return true, nil
 }
 
-func (h *Handler) storeWrappedKeys(ctx context.Context, tx *sql.Tx, channelID string, wrappedKeys map[string]string, wrappedKeyVersions map[string]int) error {
+func (h *Handler) storeWrappedKeys(ctx context.Context, tx *sql.Tx, channelID string, wrappedKeys map[string]string, wrappedKeyVersions map[string]int, recipients map[string]struct{}) error {
 	keyInsert := `
 		INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version)
 		VALUES ($1, $2, $3, 1)
 	`
 	for memberUserID, wrappedKey := range wrappedKeys {
-		if _, parseErr := uuid.Parse(memberUserID); parseErr != nil {
-			continue // skip invalid UUIDs
+		if _, eligible := recipients[memberUserID]; !eligible {
+			continue
 		}
 		stale, sErr := wrappedKeyRecipientStale(ctx, tx, channelID, memberUserID, wrappedKeyVersions)
 		if sErr != nil {
@@ -504,6 +611,142 @@ func (h *Handler) storeWrappedKeys(ctx context.Context, tx *sql.Tx, channelID st
 	return nil
 }
 
+// initialKeyRecipients returns the transaction's current channel viewers. It
+// uses the same fresh permission query at creation and completion so hidden
+// members neither receive nor block initial key distribution.
+func (h *Handler) initialKeyRecipients(ctx context.Context, tx *sql.Tx, serverID, channelID string) (map[string]struct{}, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT user_id FROM server_members WHERE server_id = $1`, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("list initial key candidates: %w", err)
+	}
+	defer h.closeRows(rows, "initial key candidates")
+	candidates := make([]string, 0)
+	for rows.Next() {
+		var userID string
+		if err := rows.Scan(&userID); err != nil {
+			return nil, fmt.Errorf("scan initial key candidate: %w", err)
+		}
+		candidates = append(candidates, userID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate initial key candidates: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close initial key candidates: %w", err)
+	}
+	if h.resolver != nil {
+		viewers, err := h.resolver.FilterVisibleUserIDsForChannelTx(ctx, tx, serverID, channelID, candidates)
+		if err != nil {
+			return nil, fmt.Errorf("filter initial key recipients: %w", err)
+		}
+		candidates = viewers
+	}
+	recipients := make(map[string]struct{}, len(candidates))
+	for _, userID := range candidates {
+		recipients[userID] = struct{}{}
+	}
+	return recipients, nil
+}
+
+func ensureInitialCreatorKey(ctx context.Context, tx *sql.Tx, channelID, creatorID string) error {
+	var hasKey bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM channel_keys
+			WHERE channel_id = $1 AND user_id = $2 AND key_version = 1
+		)`, channelID, creatorID).Scan(&hasKey); err != nil {
+		return fmt.Errorf("check creator initial key: %w", err)
+	}
+	if !hasKey {
+		return errInitialCreatorKeyMissing
+	}
+	return nil
+}
+
+func (h *Handler) respondInitialCreatorKeyError(c *gin.Context, err error) {
+	if errors.Is(err, errInitialCreatorKeyMissing) {
+		c.JSON(http.StatusConflict, gin.H{"error": "Creator must provide a current encryption key"})
+		return
+	}
+	h.log.Error("Failed to verify creator initial encryption key", "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreEncryptionKeys})
+}
+
+// startInitialKeyDistribution records the creator as the only writer while an
+// initial epoch-1 distribution is incomplete. It counts durable key rows, not
+// caller-supplied wraps, because stale recipient wraps are intentionally skipped.
+func (h *Handler) startInitialKeyDistribution(ctx context.Context, tx *sql.Tx, serverID, channelID, creatorID string) (bool, error) {
+	recipients, err := h.initialKeyRecipients(ctx, tx, serverID, channelID)
+	if err != nil {
+		return false, err
+	}
+	recipientIDs := make([]string, 0, len(recipients))
+	for userID := range recipients {
+		recipientIDs = append(recipientIDs, userID)
+	}
+	var incomplete bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM unnest($2::uuid[]) AS recipient(user_id)
+			WHERE NOT EXISTS (
+				SELECT 1 FROM channel_keys key
+				WHERE key.channel_id = $1
+				  AND key.user_id = recipient.user_id
+				  AND key.key_version = 1
+			)
+		)`, channelID, pq.Array(recipientIDs)).Scan(&incomplete); err != nil {
+		return false, fmt.Errorf("check initial key recipients: %w", err)
+	}
+	if !incomplete {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO pending_key_requests (channel_id, user_id)
+		SELECT $1, recipient.user_id
+		FROM unnest($2::uuid[]) AS recipient(user_id)
+		WHERE NOT EXISTS (
+			SELECT 1 FROM channel_keys key
+			WHERE key.channel_id = $1
+			  AND key.user_id = recipient.user_id
+			  AND key.key_version = 1
+		)
+		ON CONFLICT (channel_id, user_id) DO NOTHING
+	`, channelID, pq.Array(recipientIDs)); err != nil {
+		return false, fmt.Errorf("enqueue initial key recipients: %w", err)
+	}
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id)
+		 VALUES ($1, $2)`,
+		channelID, creatorID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("record initial key distribution: %w", err)
+	}
+	return true, nil
+}
+
+func (h *Handler) notifyInitialKeyDistribution(creatorID, serverID, channelID string) {
+	h.notifyKeyNeeded(creatorID, serverID, channelID)
+}
+
+func (h *Handler) notifyKeyNeeded(userID, serverID, channelID string) {
+	if h.hub == nil {
+		return
+	}
+	userUUID, err := uuid.Parse(userID)
+	if err != nil {
+		return
+	}
+	h.hub.BroadcastToUser(userUUID, websocket.OutgoingMessage{
+		Type: "key_needed",
+		Data: map[string]interface{}{
+			"server_id":   serverID,
+			"user_id":     userID,
+			"channel_ids": []string{channelID},
+		},
+	})
+}
+
 // maybeCreateLinkedTextChannel creates a linked text channel for voice channels, or returns nil for other types.
 func (h *Handler) maybeCreateLinkedTextChannel(ctx context.Context, tx *sql.Tx, req CreateChannelRequest, voiceChannelID string, nextPos int) (*models.Channel, error) {
 	if req.Type != "voice" {
@@ -513,7 +756,7 @@ func (h *Handler) maybeCreateLinkedTextChannel(ctx context.Context, tx *sql.Tx, 
 }
 
 // createLinkedTextChannel creates a linked text channel for a voice channel.
-func (h *Handler) createLinkedTextChannel(ctx context.Context, tx *sql.Tx, req CreateChannelRequest, voiceChannelID string, position int) (*models.Channel, error) {
+func (h *Handler) createLinkedTextChannel(_ context.Context, tx *sql.Tx, req CreateChannelRequest, voiceChannelID string, position int) (*models.Channel, error) {
 	linkedTextID := uuid.New().String()
 	linkedInsert := `
 		INSERT INTO channels (id, server_id, name, type, group_id, linked_voice_channel_id, position, created_at, updated_at)
@@ -538,38 +781,7 @@ func (h *Handler) createLinkedTextChannel(ctx context.Context, tx *sql.Tx, req C
 		return nil, err
 	}
 
-	// Copy wrapped keys for the linked text channel too (non-fatal)
-	h.storeWrappedKeysNonFatal(ctx, tx, linkedTextID, req.WrappedKeys, req.WrappedKeyVersions)
-
 	return &ltc, nil
-}
-
-// storeWrappedKeysNonFatal stores wrapped keys but does not fail on error (keys can be distributed later).
-func (h *Handler) storeWrappedKeysNonFatal(ctx context.Context, tx *sql.Tx, channelID string, wrappedKeys map[string]string, wrappedKeyVersions map[string]int) {
-	keyInsert := `
-		INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version)
-		VALUES ($1, $2, $3, 1)
-	`
-	for memberUserID, wrappedKey := range wrappedKeys {
-		if _, parseErr := uuid.Parse(memberUserID); parseErr != nil {
-			continue
-		}
-		// #2420: apply the same recipient-freshness guard to the linked-text copy
-		// so a stale member is skipped consistently across both channels. A
-		// freshness-read error is non-fatal here (like an insert error) — skip and
-		// log; the key can be distributed later.
-		stale, sErr := wrappedKeyRecipientStale(ctx, tx, channelID, memberUserID, wrappedKeyVersions)
-		if sErr != nil {
-			h.log.Error("Failed recipient-freshness check for linked text channel key", "error", sErr, "user_id", memberUserID)
-			continue
-		}
-		if stale {
-			continue
-		}
-		if _, err := tx.ExecContext(ctx, keyInsert, channelID, memberUserID, wrappedKey); err != nil {
-			h.log.Error("Failed to store linked text channel key", "error", err, "user_id", memberUserID)
-		}
-	}
 }
 
 // broadcastChannelCreated sends channel_created events to server subscribers.
@@ -1357,8 +1569,9 @@ func (h *Handler) GetChannelKeys(c *gin.Context) {
 
 // DistributeChannelKeysRequest represents wrapped keys for new members
 type DistributeChannelKeysRequest struct {
-	WrappedKeys map[string]string `json:"wrapped_keys" binding:"required"` // user_id → wrapped CSK
-	KeyVersion  *int              `json:"key_version,omitempty"`           // Explicit epoch for rotation (must be > current max)
+	WrappedKeys    map[string]string `json:"wrapped_keys" binding:"required"` // user_id → wrapped CSK
+	KeyVersion     *int              `json:"key_version,omitempty"`           // Explicit epoch for rotation (must be > current max)
+	KeyFingerprint string            `json:"key_fingerprint,omitempty"`       // SHA-256(CSK), required when claiming a rotation epoch
 	// WrappedKeyVersions carries the public_keys.key_version each CSK was wrapped
 	// against (#2420). Optional and fail-open: a recipient with no entry keeps the
 	// legacy bare insert. Shared by the channel and DM distribution paths (the DM
@@ -1381,11 +1594,14 @@ func (h *Handler) DistributeChannelKeys(c *gin.Context) {
 	if !bindStrictJSONBody(c, &req, maxChannelWrappedKeysRequestBytes) {
 		return
 	}
+	if len(req.WrappedKeys) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return
+	}
 	if len(req.WrappedKeys) > maxChannelWrappedKeys || len(req.WrappedKeyVersions) > maxChannelWrappedKeys {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTooManyWrappedKeys})
 		return
 	}
-
 	if err := h.verifyChannelEncrypted(c.Request.Context(), channelID, userID); err != nil {
 		h.respondKeyDistError(c, err)
 		return
@@ -1396,9 +1612,20 @@ func (h *Handler) DistributeChannelKeys(c *gin.Context) {
 		return
 	}
 
-	targetKeyVersion := h.resolveTargetKeyVersion(channelID, req.KeyVersion)
-
-	distributed, duplicates, skippedErrors, skippedStale, distErr := h.distributeChannelKeysToMembers(c.Request.Context(), userID, middleware.TokenCredentialEpoch(c), channelID, req.WrappedKeys, req.WrappedKeyVersions, targetKeyVersion)
+	rotationKeyFingerprint, err := normalizeChannelKeyFingerprint(req.KeyFingerprint)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return
+	}
+	distribution, distErr := h.distributeChannelKeysToMembers(c.Request.Context(), channelKeyDistributionRequest{
+		actorID:                userID,
+		tokenEpoch:             middleware.TokenCredentialEpoch(c),
+		channelID:              channelID,
+		wrappedKeys:            req.WrappedKeys,
+		wrappedKeyVersions:     req.WrappedKeyVersions,
+		requestedKeyVersion:    req.KeyVersion,
+		rotationKeyFingerprint: rotationKeyFingerprint,
+	})
 	if distErr != nil {
 		h.respondKeyDistributionError(c, distErr, channelID)
 		return
@@ -1406,8 +1633,8 @@ func (h *Handler) DistributeChannelKeys(c *gin.Context) {
 
 	h.log.Info("Channel keys distributed",
 		"channel_id", channelID, "by_user", userID,
-		"distributed", distributed, "duplicates", duplicates, "skipped", skippedErrors,
-		"skipped_stale", skippedStale)
+		"distributed", distribution.distributed, "duplicates", distribution.duplicates, "skipped", distribution.skippedErrors,
+		"skipped_stale", distribution.skippedStale)
 
 	// CV-CAN-005: distribution fails CLOSED — a channelKeyAccess resolver error
 	// skips the target rather than leaking a key. Skipped targets are enrolled
@@ -1417,25 +1644,25 @@ func (h *Handler) DistributeChannelKeys(c *gin.Context) {
 	// leave skipped members on a stale epoch with no synchronous signal. Return
 	// 503 so res.ok is false and the caller can retry the rotation; the counts
 	// stay in the body for observability.
-	if skippedErrors > 0 {
+	if distribution.skippedErrors > 0 {
 		h.log.Warn("key distribution: targets skipped due to view-check errors (degraded rotation)",
 			"channel_id", sanitizeID(channelID), "by_user", sanitizeID(userID),
-			"skipped_errors", skippedErrors, "distributed", distributed)
+			"skipped_errors", distribution.skippedErrors, "distributed", distribution.distributed)
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"error":         "Some targets could not be verified and were skipped; retry",
-			"distributed":   distributed,
-			"duplicates":    duplicates,
-			"skipped":       skippedErrors,
-			"skipped_stale": skippedStale,
+			"distributed":   distribution.distributed,
+			"duplicates":    distribution.duplicates,
+			"skipped":       distribution.skippedErrors,
+			"skipped_stale": distribution.skippedStale,
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"distributed":   distributed,
-		"duplicates":    duplicates,
-		"skipped":       skippedErrors,
-		"skipped_stale": skippedStale,
+		"distributed":   distribution.distributed,
+		"duplicates":    distribution.duplicates,
+		"skipped":       distribution.skippedErrors,
+		"skipped_stale": distribution.skippedStale,
 	})
 }
 
@@ -1482,16 +1709,142 @@ func (h *Handler) callerHasChannelKey(channelID, userID string) bool {
 	return hasKey
 }
 
-func (h *Handler) resolveTargetKeyVersion(channelID string, explicitVersion *int) int {
-	if explicitVersion != nil && *explicitVersion > 0 {
-		return *explicitVersion
+// verifyChannelKeyDistributorTx repeats the distributor checks after the
+// channel lock. A removal can otherwise commit while this request waits for
+// that lock, leaving a stale actor able to claim the successor epoch.
+func (h *Handler) verifyChannelKeyDistributorTx(ctx context.Context, tx *sql.Tx, serverID, channelID, actorID string) error {
+	var memberID string
+	err := tx.QueryRowContext(ctx,
+		`SELECT user_id FROM server_members
+		 WHERE server_id = $1 AND user_id = $2
+		 FOR KEY SHARE`,
+		serverID, actorID,
+	).Scan(&memberID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errChannelKeyDistributorAccess
 	}
-	var v int
-	_ = h.db.QueryRow(
+	if err != nil {
+		return fmt.Errorf("lock channel distributor membership: %w", err)
+	}
+
+	if h.resolver != nil {
+		canDistribute, err := h.resolver.CanDistributeChannelKeyTx(ctx, tx, serverID, channelID, actorID)
+		if err != nil {
+			return fmt.Errorf("recheck channel distributor access: %w", err)
+		}
+		if !canDistribute {
+			return errChannelKeyDistributorAccess
+		}
+	}
+
+	var keyHolderID string
+	err = tx.QueryRowContext(ctx,
+		`SELECT user_id FROM channel_keys
+		 WHERE channel_id = $1 AND user_id = $2
+		 ORDER BY key_version DESC
+		 LIMIT 1
+		 FOR KEY SHARE`,
+		channelID, actorID,
+	).Scan(&keyHolderID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errChannelKeyDistributorAccess
+	}
+	if err != nil {
+		return fmt.Errorf("lock channel distributor key: %w", err)
+	}
+	return nil
+}
+
+func (h *Handler) initialKeyDistributionActive(ctx context.Context, channelID string) (bool, error) {
+	var active bool
+	if err := h.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM channel_initial_key_distributions WHERE channel_id = $1)`, channelID,
+	).Scan(&active); err != nil {
+		return false, fmt.Errorf("check initial key distribution: %w", err)
+	}
+	return active, nil
+}
+
+func normalizeChannelKeyFingerprint(fingerprint string) (string, error) {
+	if fingerprint == "" {
+		return "", nil
+	}
+	digest, err := base64.StdEncoding.DecodeString(fingerprint)
+	if err != nil || len(digest) != 32 || base64.StdEncoding.EncodeToString(digest) != fingerprint {
+		return "", errors.New("invalid channel key fingerprint")
+	}
+	return fingerprint, nil
+}
+
+func resolveChannelKeyVersionTx(ctx context.Context, tx *sql.Tx, channelID, actorID, keyFingerprint string, explicitVersion *int) (int, error) {
+	var currentVersion int
+	if err := tx.QueryRowContext(ctx,
 		`SELECT COALESCE(MAX(key_version), 1) FROM channel_keys WHERE channel_id = $1`,
 		channelID,
-	).Scan(&v)
-	return v
+	).Scan(&currentVersion); err != nil {
+		return 0, fmt.Errorf("read current channel key version: %w", err)
+	}
+	keyVersion := currentVersion
+	if explicitVersion != nil && *explicitVersion > 0 {
+		if *explicitVersion == 1 && currentVersion == 1 {
+			return 1, nil
+		}
+		if *explicitVersion != currentVersion && *explicitVersion != currentVersion+1 {
+			return 0, errUnissuedChannelKeyVersion
+		}
+		keyVersion = *explicitVersion
+	}
+	if err := claimChannelKeyRotationTx(ctx, tx, channelID, actorID, keyFingerprint, keyVersion, explicitVersion != nil && *explicitVersion > 0); err != nil {
+		return 0, err
+	}
+	return keyVersion, nil
+}
+
+// claimChannelKeyRotationTx binds or verifies the CSK assertion for a recorded
+// successor epoch. A marker has already authorized its explicit version, even
+// when no intermediary channel_keys rows have been distributed yet.
+func claimChannelKeyRotationTx(ctx context.Context, tx *sql.Tx, channelID, actorID, keyFingerprint string, keyVersion int, requireIssued bool) error {
+	var distributorClaimed sql.NullBool
+	var distributorKeyFingerprint sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT rotation_distributor_claimed, rotation_key_fingerprint
+		 FROM key_revocations
+		 WHERE channel_id = $1
+		   AND revoked_epoch = $2 - 1
+		   AND successor_epoch = $2
+		 FOR UPDATE`, channelID, keyVersion,
+	).Scan(&distributorClaimed, &distributorKeyFingerprint); errors.Is(err, sql.ErrNoRows) {
+		if requireIssued {
+			return errUnissuedChannelKeyVersion
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("read issued channel key version: %w", err)
+	}
+	// A NULL claim denotes a legacy successor epoch whose CSK is unknown. Do
+	// not let a current client attach a different CSK to it. Once an epoch is
+	// claimed, any member holding that same CSK may service later rewraps.
+	if !distributorClaimed.Valid {
+		return errRotationDistributor
+	}
+	if distributorClaimed.Bool {
+		if !distributorKeyFingerprint.Valid || distributorKeyFingerprint.String != keyFingerprint {
+			return errRotationDistributor
+		}
+		return nil
+	}
+	if keyFingerprint == "" {
+		return errRotationDistributor
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE key_revocations
+		 SET rotation_distributor_id = $3, rotation_distributor_claimed = TRUE,
+		     rotation_key_fingerprint = $4
+		 WHERE channel_id = $1 AND revoked_epoch = $2 - 1 AND successor_epoch = $2`, channelID, keyVersion, actorID, keyFingerprint,
+	); err != nil {
+		return fmt.Errorf("claim rotation key distribution: %w", err)
+	}
+	return nil
 }
 
 // distributionTargetAdmitted applies the CV-CAN-005 gate for one distribution
@@ -1503,10 +1856,10 @@ func (h *Handler) resolveTargetKeyVersion(channelID string, explicitVersion *int
 // into the peer-fulfillment queue (idempotent) so a viewer re-delivers the key
 // once the resolver recovers; fulfillment re-checks VIEW, so this cannot
 // re-open CV-CAN-005 for a genuinely no-view user.
-func (h *Handler) distributionTargetAdmitted(ctx context.Context, channelID, memberUserID string) (admitted, skippedOnError bool) {
+func (h *Handler) distributionTargetAdmitted(ctx context.Context, tx *sql.Tx, channelID, memberUserID string) (admitted, skippedOnError bool) {
 	_, canView, vErr := h.channelKeyAccess(ctx, channelID, memberUserID)
 	if vErr != nil {
-		if _, enrollErr := h.enrollPending("channel", channelID, memberUserID); enrollErr != nil {
+		if enrollErr := enqueueChannelKeyRequest(ctx, tx, channelID, memberUserID); enrollErr != nil {
 			h.log.Error("key distribution: failed to enroll skipped target for retry",
 				"error", enrollErr, "channel_id", sanitizeID(channelID), "user_id", sanitizeID(memberUserID))
 		}
@@ -1574,7 +1927,7 @@ func enqueueChannelKeyRequest(ctx context.Context, tx *sql.Tx, channelID, userID
 // cannot re-create a row the reset just purged. A statement error poisons the
 // whole PG transaction (25P02), so insert failures fail the batch via the error.
 func (h *Handler) distributeOneChannelKey(ctx context.Context, tx *sql.Tx, channelID, memberUserID, wrappedKey string, wrappedKeyVersions map[string]int, keyVersion int) (distributionOutcome, error) {
-	admitted, skippedOnError := h.distributionTargetAdmitted(ctx, channelID, memberUserID)
+	admitted, skippedOnError := h.distributionTargetAdmitted(ctx, tx, channelID, memberUserID)
 	if skippedOnError {
 		return distributionSkippedOnError, nil
 	}
@@ -1633,12 +1986,158 @@ func insertWrappedChannelKeyTx(ctx context.Context, tx *sql.Tx, channelID, membe
 // epoch-fence rejections get the middleware-identical generic 401; anything
 // else (tx begin/commit, statement failures) is a 500.
 func (h *Handler) respondKeyDistributionError(c *gin.Context, distErr error, contextID string) {
+	if errors.Is(distErr, errChannelKeyDistributorAccess) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You must have the channel key to distribute keys"})
+		return
+	}
+	if errors.Is(distErr, errNoChannelKeyRecipients) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No eligible recipients supplied for channel-key distribution"})
+		return
+	}
+	if errors.Is(distErr, errInitialKeyDistributionCreator) {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInitialKeyDistributionOnly})
+		return
+	}
+	if errors.Is(distErr, errInitialKeyDistributionBusy) {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgInitialKeyDistributionBusy})
+		return
+	}
+	if errors.Is(distErr, errUnissuedChannelKeyVersion) {
+		c.JSON(http.StatusConflict, gin.H{"error": "Key rotation has not been initiated"})
+		return
+	}
+	if errors.Is(distErr, errRotationDistributor) {
+		c.JSON(http.StatusConflict, gin.H{"error": "Key rotation requires its established key fingerprint"})
+		return
+	}
 	if errors.Is(distErr, credepoch.ErrEpochMismatch) || errors.Is(distErr, credepoch.ErrBlocked) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
 		return
 	}
 	h.log.Error("Key distribution failed", "error", distErr, "context_id", sanitizeID(contextID))
 	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDistributeKeys})
+}
+
+type channelKeyDistributionRequest struct {
+	actorID                string
+	tokenEpoch             string
+	channelID              string
+	wrappedKeys            map[string]string
+	wrappedKeyVersions     map[string]int
+	requestedKeyVersion    *int
+	rotationKeyFingerprint string
+}
+
+type channelKeyDistributionState struct {
+	serverID                      string
+	keyVersion                    int
+	initialKeyVersion             int
+	queuedRecipients              int64
+	initialDistributionIncomplete bool
+}
+
+func (h *Handler) prepareChannelKeyDistribution(ctx context.Context, tx *sql.Tx, req channelKeyDistributionRequest) (channelKeyDistributionState, error) {
+	var state channelKeyDistributionState
+	if guardErr := credepoch.GuardTx(ctx, tx, req.actorID, req.tokenEpoch); guardErr != nil {
+		return state, guardErr
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT server_id FROM channels WHERE id = $1 FOR UPDATE`, req.channelID).Scan(&state.serverID); err != nil {
+		return state, fmt.Errorf("lock channel for key distribution: %w", err)
+	}
+	if err := h.verifyChannelKeyDistributorTx(ctx, tx, state.serverID, req.channelID, req.actorID); err != nil {
+		return state, err
+	}
+	if _, err := tx.ExecContext(ctx, `SELECT set_config('concord.rotation_distributor_id', $1, TRUE)`, req.actorID); err != nil {
+		return state, fmt.Errorf("set rotation distributor: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `SELECT set_config('concord.rotation_key_fingerprint', $1, TRUE)`, req.rotationKeyFingerprint); err != nil {
+		return state, fmt.Errorf("set rotation key fingerprint: %w", err)
+	}
+	initialKeyVersion, err := h.authorizeInitialKeyDistribution(ctx, tx, req.channelID, req.actorID, req.requestedKeyVersion)
+	if err != nil {
+		return state, err
+	}
+	state.initialKeyVersion = initialKeyVersion
+	state.initialDistributionIncomplete = initialKeyVersion > 0
+	return h.resolveChannelKeyDistributionVersion(ctx, tx, req, state)
+}
+
+func (h *Handler) resolveChannelKeyDistributionVersion(ctx context.Context, tx *sql.Tx, req channelKeyDistributionRequest, state channelKeyDistributionState) (channelKeyDistributionState, error) {
+	state.keyVersion = state.initialKeyVersion
+	if state.keyVersion == 0 {
+		keyVersion, err := resolveChannelKeyVersionTx(ctx, tx, req.channelID, req.actorID, req.rotationKeyFingerprint, req.requestedKeyVersion)
+		if err != nil {
+			return state, err
+		}
+		state.keyVersion = keyVersion
+	} else if state.keyVersion > 1 {
+		if err := claimChannelKeyRotationTx(ctx, tx, req.channelID, req.actorID, req.rotationKeyFingerprint, state.keyVersion, true); err != nil {
+			return state, err
+		}
+	}
+	if state.keyVersion <= 1 {
+		return state, nil
+	}
+	queuedRecipients, err := h.enqueueRotationKeyRecipients(ctx, tx, state.serverID, req.channelID, state.keyVersion)
+	if err != nil {
+		return state, err
+	}
+	state.queuedRecipients = queuedRecipients
+	return state, nil
+}
+
+func (h *Handler) distributeChannelKeyBatch(ctx context.Context, tx *sql.Tx, req channelKeyDistributionRequest, keyVersion int) (channelDistributionTally, error) {
+	var tally channelDistributionTally
+	for memberUserID, wrappedKey := range req.wrappedKeys {
+		if _, parseErr := uuid.Parse(memberUserID); parseErr != nil {
+			continue
+		}
+		outcome, err := h.distributeOneChannelKey(ctx, tx, req.channelID, memberUserID, wrappedKey, req.wrappedKeyVersions, keyVersion)
+		if err != nil {
+			return tally, err
+		}
+		tally.record(outcome, memberUserID)
+	}
+	return tally, nil
+}
+
+func (h *Handler) completeChannelKeyDistribution(ctx context.Context, tx *sql.Tx, req channelKeyDistributionRequest, state channelKeyDistributionState, tally channelDistributionTally) (channelKeyDistributionState, error) {
+	if state.keyVersion > 1 && tally.distributed == 0 && tally.duplicates == 0 {
+		return state, errNoChannelKeyRecipients
+	}
+	if state.initialKeyVersion > 0 && tally.skippedErrors == 0 {
+		incomplete, err := h.finishInitialKeyDistribution(ctx, tx, req.channelID, state.keyVersion)
+		if err != nil {
+			return state, err
+		}
+		state.initialDistributionIncomplete = incomplete
+	}
+	if err := tx.Commit(); err != nil {
+		return state, fmt.Errorf("commit distribution tx: %w", err)
+	}
+	return state, nil
+}
+
+func (h *Handler) notifyChannelKeyDistribution(req channelKeyDistributionRequest, state channelKeyDistributionState, tally channelDistributionTally) {
+	for _, memberUserID := range tally.delivered {
+		// Pending-request cleanup is best-effort POST-commit: the key row is
+		// already durable, and a failed DELETE inside the tx would poison the
+		// whole batch (25P02) for what is only retry-safe housekeeping.
+		_, _ = h.db.Exec(
+			`DELETE FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`,
+			req.channelID, memberUserID,
+		)
+		h.notifyKeyDelivered(req.channelID, memberUserID)
+	}
+	if state.initialDistributionIncomplete {
+		// A marker remains creator-only even after it advances. Wake that
+		// creator, not a recipient that happens to hold its successor key.
+		h.notifyKeyNeeded(req.actorID, state.serverID, req.channelID)
+	} else if state.keyVersion > 1 && state.queuedRecipients > 0 && len(tally.holders) > 0 {
+		// The holder received or already had the successor key, so it can drain
+		// the durable queue if the original batching renderer has gone away.
+		h.notifyKeyNeeded(tally.holders[0], state.serverID, req.channelID)
+	}
 }
 
 // distributeChannelKeysToMembers writes wrapped keys inside ONE transaction
@@ -1649,47 +2148,128 @@ func (h *Handler) respondKeyDistributionError(c *gin.Context, distErr error, con
 // never fetches an uncommitted row. A guard/transaction failure returns an
 // error (the caller maps epoch errors to 401); per-member insert errors keep
 // their existing skip semantics.
-func (h *Handler) distributeChannelKeysToMembers(ctx context.Context, actorID, tokenEpoch, channelID string, wrappedKeys map[string]string, wrappedKeyVersions map[string]int, keyVersion int) (distributed, duplicates, skippedErrors, skippedStale int, err error) {
+func (h *Handler) distributeChannelKeysToMembers(ctx context.Context, req channelKeyDistributionRequest) (channelDistributionTally, error) {
+	var tally channelDistributionTally
 	// #2201 review: run on the request context so a client disconnect cancels a
 	// GuardTx FOR SHARE lock-wait (which blocks against a destructive reset's
 	// FOR NO KEY UPDATE) instead of pinning a pooled connection with no deadline.
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("begin distribution tx: %w", err)
+		return tally, fmt.Errorf("begin distribution tx: %w", err)
 	}
 	defer func() {
 		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
 			h.log.Error("Failed to rollback distribution tx", "error", rbErr)
 		}
 	}()
-	if guardErr := credepoch.GuardTx(ctx, tx, actorID, tokenEpoch); guardErr != nil {
-		return 0, 0, 0, 0, guardErr
+	state, err := h.prepareChannelKeyDistribution(ctx, tx, req)
+	if err != nil {
+		return tally, err
 	}
-	var tally channelDistributionTally
-	for memberUserID, wrappedKey := range wrappedKeys {
-		if _, parseErr := uuid.Parse(memberUserID); parseErr != nil {
-			continue
-		}
-		outcome, distErr := h.distributeOneChannelKey(ctx, tx, channelID, memberUserID, wrappedKey, wrappedKeyVersions, keyVersion)
-		if distErr != nil {
-			return 0, 0, 0, 0, distErr
-		}
-		tally.record(outcome, memberUserID)
+	tally, err = h.distributeChannelKeyBatch(ctx, tx, req, state.keyVersion)
+	if err != nil {
+		return tally, err
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("commit distribution tx: %w", err)
+	state, err = h.completeChannelKeyDistribution(ctx, tx, req, state, tally)
+	if err != nil {
+		return tally, err
 	}
-	for _, memberUserID := range tally.delivered {
-		// Pending-request cleanup is best-effort POST-commit: the key row is
-		// already durable, and a failed DELETE inside the tx would poison the
-		// whole batch (25P02) for what is only retry-safe housekeeping.
-		_, _ = h.db.Exec(
-			`DELETE FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`,
-			channelID, memberUserID,
+	h.notifyChannelKeyDistribution(req, state, tally)
+	return tally, nil
+}
+
+// enqueueRotationKeyRecipients makes an established successor CSK recoverable
+// if a later client batch fails or its renderer reloads. Successful batches
+// remove their rows after commit.
+func (h *Handler) enqueueRotationKeyRecipients(ctx context.Context, tx *sql.Tx, serverID, channelID string, keyVersion int) (int64, error) {
+	recipients, err := h.initialKeyRecipients(ctx, tx, serverID, channelID)
+	if err != nil {
+		return 0, fmt.Errorf("list rotation key recipients: %w", err)
+	}
+	recipientIDs := make([]string, 0, len(recipients))
+	for userID := range recipients {
+		recipientIDs = append(recipientIDs, userID)
+	}
+	if len(recipientIDs) == 0 {
+		return 0, nil
+	}
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO pending_key_requests (channel_id, user_id)
+		SELECT $1, recipient.user_id
+		FROM unnest($2::uuid[]) AS recipient(user_id)
+		WHERE NOT EXISTS (
+			SELECT 1 FROM channel_keys key
+			WHERE key.channel_id = $1
+			  AND key.user_id = recipient.user_id
+			  AND key.key_version = $3
 		)
-		h.notifyKeyDelivered(channelID, memberUserID)
+		ON CONFLICT (channel_id, user_id) DO NOTHING
+	`, channelID, pq.Array(recipientIDs), keyVersion)
+	if err != nil {
+		return 0, fmt.Errorf("enqueue rotation key recipients: %w", err)
 	}
-	return tally.distributed, tally.duplicates, tally.skippedErrors, tally.skippedStale, nil
+	queuedRecipients, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count queued rotation key recipients: %w", err)
+	}
+	return queuedRecipients, nil
+}
+
+func (h *Handler) authorizeInitialKeyDistribution(ctx context.Context, tx *sql.Tx, channelID, actorID string, requestedKeyVersion *int) (int, error) {
+	var creatorID sql.NullString
+	var markerKeyVersion int
+	err := tx.QueryRowContext(ctx,
+		`SELECT creator_id, key_version FROM channel_initial_key_distributions
+		 WHERE channel_id = $1 FOR UPDATE`, channelID,
+	).Scan(&creatorID, &markerKeyVersion)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read initial key distribution: %w", err)
+	}
+	if !creatorID.Valid {
+		return 0, errInitialKeyDistributionBusy
+	}
+	if creatorID.String != actorID || (requestedKeyVersion != nil && *requestedKeyVersion > 0 && *requestedKeyVersion != markerKeyVersion) {
+		return 0, errInitialKeyDistributionCreator
+	}
+	if markerKeyVersion > 1 && (requestedKeyVersion == nil || *requestedKeyVersion != markerKeyVersion) {
+		return 0, errInitialKeyDistributionCreator
+	}
+	return markerKeyVersion, nil
+}
+
+func (h *Handler) finishInitialKeyDistribution(ctx context.Context, tx *sql.Tx, channelID string, keyVersion int) (bool, error) {
+	var serverID string
+	if err := tx.QueryRowContext(ctx, `SELECT server_id FROM channels WHERE id = $1`, channelID).Scan(&serverID); err != nil {
+		return false, fmt.Errorf("read initial key distribution server: %w", err)
+	}
+	recipients, err := h.initialKeyRecipients(ctx, tx, serverID, channelID)
+	if err != nil {
+		return false, err
+	}
+	recipientIDs := make([]string, 0, len(recipients))
+	for userID := range recipients {
+		recipientIDs = append(recipientIDs, userID)
+	}
+	var incomplete bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM unnest($2::uuid[]) AS recipient(user_id)
+			WHERE NOT EXISTS (
+				SELECT 1 FROM channel_keys key
+				WHERE key.channel_id = $1
+				  AND key.user_id = recipient.user_id
+				  AND key.key_version = $3
+			)
+		)`, channelID, pq.Array(recipientIDs), keyVersion).Scan(&incomplete); err != nil {
+		return false, fmt.Errorf("check initial key completion: %w", err)
+	}
+	if incomplete {
+		return true, nil
+	}
+	return false, keyrotation.CompleteInitialKeyDistributionTx(ctx, tx, channelID)
 }
 
 // channelDistributionTally accumulates per-target outcomes for a channel-key
@@ -1697,15 +2277,17 @@ func (h *Handler) distributeChannelKeysToMembers(ctx context.Context, actorID, t
 // under the cognitive-complexity ceiling.
 type channelDistributionTally struct {
 	distributed, duplicates, skippedErrors, skippedStale int
-	delivered                                            []string
+	delivered, holders                                   []string
 }
 
 func (t *channelDistributionTally) record(outcome distributionOutcome, memberUserID string) {
 	switch outcome {
 	case distributionDelivered:
 		t.delivered = append(t.delivered, memberUserID)
+		t.holders = append(t.holders, memberUserID)
 		t.distributed++
 	case distributionDuplicate:
+		t.holders = append(t.holders, memberUserID)
 		t.duplicates++
 	case distributionSkippedOnError:
 		t.skippedErrors++
@@ -1741,10 +2323,11 @@ func (h *Handler) notifyKeyDelivered(contextID, memberUserID string) {
 // pendingKeyRequest is a single pending E2EE key request row (channel or DM)
 // returned by GetPendingKeyRequests.
 type pendingKeyRequest struct {
-	ID        string `json:"id"`
-	ChannelID string `json:"channel_id"`
-	UserID    string `json:"user_id"`
-	CreatedAt string `json:"created_at"`
+	ID         string `json:"id"`
+	ChannelID  string `json:"channel_id"`
+	UserID     string `json:"user_id"`
+	KeyVersion int    `json:"key_version,omitempty"`
+	CreatedAt  string `json:"created_at"`
 }
 
 // GetPendingKeyRequests lists pending channel-key requests the caller may
@@ -1754,11 +2337,18 @@ type pendingKeyRequest struct {
 func (h *Handler) GetPendingKeyRequests(c *gin.Context) {
 	userID := c.GetString("user_id")
 
-	// Return pending requests for channels where the caller already has a key
+	// Return pending requests for channels where the caller already has a key.
+	// An active initial-distribution marker pins a successor epoch, so only a
+	// holder of that exact epoch can recover its queued recipients. Markers
+	// remain creator-only, so exposing their queue to another holder would
+	// guarantee a 403 when it tries to submit the wrap.
 	query := `
-		SELECT pkr.id, pkr.channel_id, pkr.user_id, pkr.created_at
+		SELECT DISTINCT pkr.id, pkr.channel_id, pkr.user_id, COALESCE(cid.key_version, 0), pkr.created_at
 		FROM pending_key_requests pkr
-		INNER JOIN channel_keys ck ON pkr.channel_id = ck.channel_id AND ck.user_id = $1
+		LEFT JOIN channel_initial_key_distributions cid ON cid.channel_id = pkr.channel_id
+		INNER JOIN channel_keys ck ON pkr.channel_id = ck.channel_id
+			AND ck.user_id = $1
+			AND (cid.key_version IS NULL OR (cid.creator_id = $1 AND ck.key_version = cid.key_version))
 		ORDER BY pkr.created_at ASC
 	`
 
@@ -1776,7 +2366,7 @@ func (h *Handler) GetPendingKeyRequests(c *gin.Context) {
 	candidates := make([]pendingKeyRequest, 0)
 	for rows.Next() {
 		var req pendingKeyRequest
-		if err := rows.Scan(&req.ID, &req.ChannelID, &req.UserID, &req.CreatedAt); err != nil {
+		if err := rows.Scan(&req.ID, &req.ChannelID, &req.UserID, &req.KeyVersion, &req.CreatedAt); err != nil {
 			h.log.Error("Failed to scan pending request", "error", err)
 			continue
 		}
@@ -2420,6 +3010,10 @@ func (h *Handler) DistributeUnifiedKeys(c *gin.Context) {
 	if !bindStrictJSONBody(c, &req, maxDMWrappedKeysRequestBytes) {
 		return
 	}
+	if len(req.WrappedKeys) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return
+	}
 	if len(req.WrappedKeys) > maxDMWrappedKeys || len(req.WrappedKeyVersions) > maxDMWrappedKeys {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTooManyWrappedKeys})
 		return
@@ -2582,7 +3176,7 @@ func (h *Handler) RotateKey(c *gin.Context) {
 		return
 	} else if err != nil {
 		h.log.Error("Failed to look up channel for rotation", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to rotate key"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRotateKey})
 		return
 	}
 
@@ -2590,11 +3184,21 @@ func (h *Handler) RotateKey(c *gin.Context) {
 	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, "", rbac.PermManageCryptoRotation)
 	if err != nil {
 		h.log.Error("Failed to check permissions for rotation", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to rotate key"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRotateKey})
 		return
 	}
 	if !hasPerm {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+		return
+	}
+	active, activeErr := h.initialKeyDistributionActive(c.Request.Context(), channelID)
+	if activeErr != nil {
+		h.log.Error("Failed to check initial key distribution", "error", activeErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRotateKey})
+		return
+	}
+	if active {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgInitialKeyDistributionBusy})
 		return
 	}
 
@@ -2606,29 +3210,22 @@ func (h *Handler) RotateKey(c *gin.Context) {
 		return
 	}
 
-	var maxVersion int
-	_ = h.db.QueryRow(`SELECT COALESCE(MAX(key_version), 0) FROM channel_keys WHERE channel_id = $1`, channelID).Scan(&maxVersion)
-
-	h.log.Info("Channel key rotation requested", "channel_id", channelID, "user_id", userID, "current_version", maxVersion)
-
-	// Broadcast key_rotation to all server subscribers
-	if h.hub != nil {
-		if serverUUID, parseErr := uuid.Parse(serverID); parseErr == nil {
-			h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
-				Type: "key_rotation",
-				Data: map[string]interface{}{
-					"channel_id":      channelID,
-					"server_id":       serverID,
-					"triggered_by":    userID,
-					"new_key_version": maxVersion + 1,
-				},
-			})
-		}
+	rotation, err := keyrotation.NewRotator(h.db, h.log, h.resolver.CanDistributeChannelKeyTx, websocket.KeyRevocationBroadcaster(h.hub)).StartManualRotation(c.Request.Context(), channelID, userID)
+	if err != nil {
+		h.log.Error("Failed to record channel key rotation", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRotateKey})
+		return
 	}
+	if rotation == nil {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgInitialKeyDistributionBusy})
+		return
+	}
+
+	h.log.Info("Channel key rotation requested", "channel_id", sanitizeID(channelID), "user_id", sanitizeID(userID), "current_version", rotation.RevokedEpoch)
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":         "Key rotation initiated",
-		"new_key_version": maxVersion + 1,
+		"new_key_version": rotation.SuccessorEpoch,
 	})
 }
 

@@ -50,6 +50,11 @@ func replaceKeyMaterialTx(tx *sql.Tx, userID any, wrappedPriv, salt []byte, alg 
 		return fmt.Errorf("expected exactly 1 public_keys row for user, got %d", n)
 	}
 
+	// An identity reset removes the creator's only CSK. Release any incomplete
+	// distribution fence so a remaining holder can drain its durable queue.
+	if _, err := tx.Exec(`DELETE FROM channel_initial_key_distributions WHERE creator_id = $1`, userID); err != nil {
+		return fmt.Errorf("clear initial key distributions: %w", err)
+	}
 	if _, err := tx.Exec(`DELETE FROM channel_keys WHERE user_id = $1`, userID); err != nil {
 		return fmt.Errorf("clear channel_keys: %w", err)
 	}

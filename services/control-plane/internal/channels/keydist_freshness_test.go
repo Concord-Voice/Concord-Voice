@@ -201,6 +201,7 @@ func TestCreateChannel_StaleInitialMember_SkippedAndEnqueued(t *testing.T) {
 	owner := ts.CreateTestUser(t, "createchanowner2")
 	serverID := ts.CreateTestServer(t, owner.ID, "Create Chan Guard Server")
 	member := ts.CreateTestUser(t, "createchanstale")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
 	setRecipientPublicKeyVersion(t, ts, member.ID, 6) // member rotated to v6
 
 	w := ts.DoRequest("POST", "/api/v1/channels", map[string]interface{}{
@@ -228,4 +229,7 @@ func TestCreateChannel_StaleInitialMember_SkippedAndEnqueued(t *testing.T) {
 	assert.Equal(t, 1, rowCount(t, ts,
 		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, owner.ID),
 		"creator (no version supplied) falls open to the legacy insert")
+	assert.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_initial_key_distributions WHERE channel_id = $1`, channelID),
+		"a stale persisted wrap must retain the creator fence")
 }

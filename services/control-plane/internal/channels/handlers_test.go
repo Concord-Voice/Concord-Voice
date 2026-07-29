@@ -2,15 +2,22 @@ package channels_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/google/uuid"
+	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -22,9 +29,12 @@ const (
 	pathKeys               = "/keys"
 	keyServerID            = "server_id"
 	keyWrappedKeys         = "wrapped_keys"
+	keyFingerprint         = "key_fingerprint"
 	keyChannel             = "channel"
 	roleMember             = "member"
 	fmtRateLimitChannelKey = "ratelimit:channel_rotate:%s"
+	rotationFingerprint    = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	otherFingerprint       = "//////////////////////////////////////////8="
 )
 
 func setupTS(t *testing.T) *testhelpers.TestServer {
@@ -84,6 +94,59 @@ func TestCreateChannelSuccess(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	channel := body[keyChannel].(map[string]interface{})
 	assert.Equal(t, "new-channel", channel["name"])
+}
+
+func TestCreateChannel_OverflowBindsInitialDistributionToCreator(t *testing.T) {
+	ts := setupTS(t)
+	creator := ts.CreateTestUser(t, "overflowcreator")
+	serverID := ts.CreateTestServer(t, creator.ID, "Overflow Channel Server")
+	member := ts.CreateTestUser(t, "overflowmember")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+
+	w := ts.DoRequest("POST", pathChannels, map[string]interface{}{
+		keyServerID: serverID,
+		"name":      "overflow-channel",
+		"type":      "text",
+		keyWrappedKeys: map[string]string{
+			creator.ID: testhelpers.ValidCiphertext(),
+		},
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	channelID := body[keyChannel].(map[string]interface{})["id"].(string)
+	var recordedCreator string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT creator_id FROM channel_initial_key_distributions WHERE channel_id = $1`, channelID,
+	).Scan(&recordedCreator))
+	assert.Equal(t, creator.ID, recordedCreator)
+	assert.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID),
+		"an omitted initial recipient must be enqueued for creator re-wrap")
+}
+
+func TestCreateChannel_RequiresCreatorWrappedKey(t *testing.T) {
+	ts := setupTS(t)
+	creator := ts.CreateTestUser(t, "missingcreatorkey")
+	serverID := ts.CreateTestServer(t, creator.ID, "Creator Key Server")
+	member := ts.CreateTestUser(t, "creator-key-member")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+
+	w := ts.DoRequest("POST", pathChannels, map[string]interface{}{
+		keyServerID: serverID,
+		"name":      "missing-creator-key",
+		"type":      "text",
+		keyWrappedKeys: map[string]string{
+			member.ID: testhelpers.ValidCiphertext(),
+		},
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+	assert.JSONEq(t, `{"error":"Creator must provide a current encryption key"}`, w.Body.String())
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channels WHERE server_id = $1 AND name = $2`, serverID, "missing-creator-key"),
+		"failed creation must roll back its channel row")
 }
 
 // TestCreateChannel_ForeignGroupRejected covers CV-CAN-010: a new channel must
@@ -146,6 +209,27 @@ func TestCreateChannelNotAdmin(t *testing.T) {
 		"type":      "text",
 	}, testhelpers.AuthHeaders(member.AccessToken))
 
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestCreateChannelRequiresCreatorView(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "chanviewowner")
+	creator := ts.CreateTestUser(t, "chanviewcreator")
+	serverID := ts.CreateTestServer(t, owner.ID, "Channel View Server")
+	ts.AddMemberToServer(t, serverID, creator.ID, roleMember)
+	_, err := ts.DB.Exec(`UPDATE roles SET permissions = $2 WHERE server_id = $1 AND is_default = TRUE`, serverID, int64(rbac.PermManageChannels))
+	require.NoError(t, err)
+	require.NoError(t, rbac.NewPermissionCache(ts.Redis).InvalidateServer(context.Background(), serverID))
+
+	w := ts.DoRequest("POST", pathChannels, map[string]interface{}{
+		keyServerID: serverID,
+		"name":      "unviewable-channel",
+		"type":      "text",
+		keyWrappedKeys: map[string]string{
+			creator.ID: testhelpers.ValidCiphertext(),
+		},
+	}, testhelpers.AuthHeaders(creator.AccessToken))
 	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
@@ -457,6 +541,10 @@ func TestDistributeChannelKeys_SkipsNoViewTarget(t *testing.T) {
 	var allRoleID string
 	require.NoError(t, ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID))
 	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+	_, err := ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id) VALUES ($1, $2)`, channelID, owner.ID,
+	)
+	require.NoError(t, err)
 
 	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
 		keyWrappedKeys: map[string]string{member.ID: testhelpers.ValidCiphertext()},
@@ -465,6 +553,9 @@ func TestDistributeChannelKeys_SkipsNoViewTarget(t *testing.T) {
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
 	assert.Equal(t, float64(0), body["distributed"], "no-view target must be skipped by distribution")
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_initial_key_distributions WHERE channel_id = $1`, channelID),
+		"a no-view member must not keep the creator fence active")
 }
 
 // TestDistributeChannelKeys_CallerDeniedViewForbidden covers CV-CAN-005: the
@@ -650,22 +741,14 @@ func TestDistributeChannelKeys_VerifyDBError(t *testing.T) {
 	})
 }
 
-// TestDistributeChannelKeys_SkippedOnResolverError surfaces the CV-CAN-005
-// fail-closed observability contract: when a target's VIEW check ERRORS (not a
-// definite deny), the target is skipped, counted in the response `skipped`
-// field, enrolled into pending_key_requests for peer retry, and the endpoint
-// returns 503 (not a silent 200/distributed:0) so a rotation caller can retry
-// instead of treating the degraded rotation as success. The owner-caller still
-// passes because server owners short-circuit RBAC before the roles lookup;
-// renaming roles makes only the non-owner target's resolver lookup error,
-// isolating the skipped-on-error branch.
-func TestDistributeChannelKeys_SkippedOnResolverError(t *testing.T) {
+// TestDistributeChannelKeys_TransactionRecheckFailsClosedOnViewCheckError
+// verifies that a fresh post-lock VIEW check cannot fail open. Renaming roles
+// makes the recheck fail before any target can receive a wrapped key.
+func TestDistributeChannelKeys_TransactionRecheckFailsClosedOnViewCheckError(t *testing.T) {
 	ts, owner, serverID, channelID := setupEncryptedChannel(t)
 	target := ts.CreateTestUser(t, "distskiperr")
 	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
 
-	// Force a fresh compute path for the target (owner bypasses roles via
-	// ownership, so its check is unaffected by the rename below).
 	require.NoError(t, rbac.NewPermissionCache(ts.Redis).InvalidateServer(context.Background(), serverID))
 
 	withRenamedTable(t, ts, "roles", func() {
@@ -673,22 +756,10 @@ func TestDistributeChannelKeys_SkippedOnResolverError(t *testing.T) {
 			keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
 		}, testhelpers.AuthHeaders(owner.AccessToken))
 
-		require.Equal(t, http.StatusServiceUnavailable, w.Code, "degraded rotation must not report success; body: %s", w.Body.String())
-		var body map[string]interface{}
-		testhelpers.ParseJSON(t, w, &body)
-		assert.Equal(t, float64(0), body["distributed"], "resolver-errored target must not receive a key (fail closed)")
-		assert.Equal(t, float64(1), body["skipped"], "resolver-errored target must be counted in skipped")
+		require.Equal(t, http.StatusInternalServerError, w.Code, "the post-lock recheck must fail closed; body: %s", w.Body.String())
 	})
-
-	// Self-heal: the skipped target is enrolled into the peer-fulfillment queue
-	// so it recovers once the resolver is healthy, instead of being stranded with
-	// no pending request to retry.
-	var count int
-	require.NoError(t, ts.DB.QueryRow(
-		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`,
-		channelID, target.ID,
-	).Scan(&count))
-	assert.Equal(t, 1, count, "skipped-on-error target must be enrolled for retry")
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, target.ID))
 }
 
 // TestGetPendingKeyRequests_CallerViewDBErrorFailsClosed covers CV-CAN-005: when
@@ -793,6 +864,540 @@ func TestDistributeChannelKeysNotMember(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
+func TestDistributeChannelKeys_InitialOverflowAllowsOnlyCreator(t *testing.T) {
+	ts, creator, serverID, channelID := setupEncryptedChannel(t)
+	attacker := ts.CreateTestUser(t, "initialkeyattacker")
+	target := ts.CreateTestUser(t, "initialkeytarget")
+	ts.AddMemberToServer(t, serverID, attacker.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+
+	// Give the attacker a valid existing channel key so the test isolates the
+	// initial-distribution creator fence from the normal caller-has-key gate.
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{attacker.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	_, err := ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id) VALUES ($1, $2)`,
+		channelID, creator.ID,
+	)
+	require.NoError(t, err)
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(attacker.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, target.ID))
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+	}, testhelpers.AuthHeaders(attacker.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 2`, channelID, target.ID))
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 2`, channelID, target.ID))
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_initial_key_distributions WHERE channel_id = $1`, channelID))
+}
+
+func TestDistributeChannelKeys_RequiresIssuedRotationEpoch(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	member := ts.CreateTestUser(t, "rotationresponder")
+	target := ts.CreateTestUser(t, "rotationtarget")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{member.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2147483647,
+	}, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusConflict, w.Code)
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND key_version = 2147483647`, channelID))
+
+	_, err := ts.DB.Exec(
+		`INSERT INTO key_revocations (
+			channel_id, revoked_epoch, successor_epoch, reason, revoked_by, rotation_distributor_claimed
+		 ) VALUES ($1, 1, 2, 'member_removal', $2, FALSE)`, channelID, owner.ID,
+	)
+	require.NoError(t, err)
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code, "an ordinary member may answer an issued rotation")
+}
+
+func TestDistributeChannelKeys_BindsIssuedRotationToFirstDistributor(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	distributor := ts.CreateTestUser(t, "rotationdistributor")
+	target := ts.CreateTestUser(t, "rotationbatchtarget")
+	ts.AddMemberToServer(t, serverID, distributor.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{distributor.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	_, err := ts.DB.Exec(
+		`INSERT INTO key_revocations (
+			channel_id, revoked_epoch, successor_epoch, reason, revoked_by, rotation_distributor_claimed
+		 ) VALUES ($1, 1, 2, 'member_removal', $2, FALSE)`, channelID, owner.ID,
+	)
+	require.NoError(t, err)
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{},
+		"key_version":  2,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code, "an empty batch must not claim a rotation")
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+	}, testhelpers.AuthHeaders(distributor.AccessToken))
+	assert.Equal(t, http.StatusConflict, w.Code, "an issued rotation requires a CSK fingerprint")
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(distributor.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// Two clients on one account can generate different CSKs. The second must
+	// fail just like a different account, rather than interleave later batches.
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{owner.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+		keyFingerprint: otherFingerprint,
+	}, testhelpers.AuthHeaders(distributor.AccessToken))
+	assert.Equal(t, http.StatusConflict, w.Code)
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{owner.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+		keyFingerprint: otherFingerprint,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusConflict, w.Code)
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{owner.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code, "a later holder of the established CSK may rewrap it")
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(distributor.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	_, err = ts.DB.Exec(`DELETE FROM users WHERE id = $1`, distributor.ID)
+	require.NoError(t, err)
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code, "erasing the first distributor must not block a holder of the established CSK")
+}
+
+func TestDistributeChannelKeys_RechecksDistributorAfterChannelLock(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	distributor := ts.CreateTestUser(t, "staledistributor")
+	target := ts.CreateTestUser(t, "staledistributiontarget")
+	ts.AddMemberToServer(t, serverID, distributor.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{distributor.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	_, err := ts.DB.Exec(
+		`INSERT INTO key_revocations (
+			channel_id, revoked_epoch, successor_epoch, reason, revoked_by, rotation_distributor_claimed
+		 ) VALUES ($1, 1, 2, 'member_removal', $2, FALSE)`, channelID, owner.ID,
+	)
+	require.NoError(t, err)
+
+	lockTx, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = lockTx.Rollback() }()
+	_, err = lockTx.Exec(`SELECT 1 FROM channels WHERE id = $1 FOR UPDATE`, channelID)
+	require.NoError(t, err)
+
+	response := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response <- ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+			keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+			"key_version":  2,
+			keyFingerprint: rotationFingerprint,
+		}, testhelpers.AuthHeaders(distributor.AccessToken))
+	}()
+
+	require.Eventually(t, func() bool {
+		var waiting int
+		err := ts.DB.QueryRow(`SELECT COUNT(*) FROM pg_locks WHERE NOT granted`).Scan(&waiting)
+		return err == nil && waiting > 0
+	}, time.Second, 10*time.Millisecond, "distribution must wait on the channel lock after its preflight")
+	_, err = ts.DB.Exec(`DELETE FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, distributor.ID)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, distributor.ID)
+	require.NoError(t, err)
+	require.NoError(t, lockTx.Commit())
+
+	w = <-response
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 2`, channelID, target.ID))
+	var claimed bool
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT rotation_distributor_claimed FROM key_revocations WHERE channel_id = $1 AND revoked_epoch = 1`, channelID,
+	).Scan(&claimed))
+	assert.False(t, claimed)
+}
+
+func TestDistributeChannelKeys_QueuesRemainingRotationRecipients(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	distributor := ts.CreateTestUser(t, "partialrotationdistributor")
+	remaining := ts.CreateTestUser(t, "partialrotationremaining")
+	ts.AddMemberToServer(t, serverID, distributor.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, remaining.ID, roleMember)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{distributor.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	_, err := ts.DB.Exec(
+		`INSERT INTO key_revocations (
+			channel_id, revoked_epoch, successor_epoch, reason, revoked_by, rotation_distributor_claimed
+		 ) VALUES ($1, 1, 2, 'member_removal', $2, FALSE)`, channelID, owner.ID,
+	)
+	require.NoError(t, err)
+	wsServer := httptest.NewServer(ts.Router)
+	t.Cleanup(wsServer.Close)
+	conn, _, err := gorillaWS.DefaultDialer.Dial(
+		"ws"+strings.TrimPrefix(wsServer.URL, "http")+"/api/v1/ws?token="+url.QueryEscape(distributor.AccessToken), nil,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	require.Eventually(t, func() bool {
+		return ts.Hub.GetUserClientCount(uuid.MustParse(distributor.ID)) > 0
+	}, time.Second, 10*time.Millisecond)
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, _, err = conn.ReadMessage() // connection bootstrap
+	require.NoError(t, err)
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{distributor.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(distributor.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 2`, channelID, distributor.ID))
+	assert.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, remaining.ID),
+		"an unsubmitted later batch must stay recoverable after the first batch claims the CSK")
+	messageTypes := make([]string, 0, 2)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(messageTypes) < 2 && time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(deadline)
+		_, frame, err := conn.ReadMessage()
+		require.NoError(t, err)
+		var message struct {
+			Type string `json:"type"`
+		}
+		require.NoError(t, json.Unmarshal(frame, &message))
+		if message.Type == "key_delivered" || message.Type == "key_needed" {
+			messageTypes = append(messageTypes, message.Type)
+		}
+	}
+	assert.Equal(t, []string{"key_delivered", "key_needed"}, messageTypes)
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{remaining.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(distributor.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, remaining.ID))
+
+	_ = conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+	for {
+		_, frame, readErr := conn.ReadMessage()
+		if readErr != nil {
+			if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+				break
+			}
+			require.NoError(t, readErr)
+		}
+		var message struct {
+			Type string `json:"type"`
+		}
+		require.NoError(t, json.Unmarshal(frame, &message))
+		assert.NotEqual(t, "key_needed", message.Type, "fulfilling an existing queue row must not start another queue drain")
+	}
+}
+
+func TestDistributeChannelKeys_DoesNotClaimRotationWithoutRecipient(t *testing.T) {
+	ts, owner, _, channelID := setupEncryptedChannel(t)
+	_, err := ts.DB.Exec(
+		`INSERT INTO key_revocations (
+			channel_id, revoked_epoch, successor_epoch, reason, revoked_by, rotation_distributor_claimed
+		 ) VALUES ($1, 1, 2, 'member_removal', $2, FALSE)`, channelID, owner.ID,
+	)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{"not-a-uuid": testhelpers.ValidCiphertext()},
+		"key_version":  2,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var claimed bool
+	var fingerprint sql.NullString
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT rotation_distributor_claimed, rotation_key_fingerprint
+		 FROM key_revocations WHERE channel_id = $1 AND revoked_epoch = 1`, channelID,
+	).Scan(&claimed, &fingerprint))
+	assert.False(t, claimed)
+	assert.False(t, fingerprint.Valid)
+}
+
+func TestDistributeChannelKeys_WakesCreatorForIncompleteMarker(t *testing.T) {
+	ts, creator, serverID, channelID := setupEncryptedChannel(t)
+	delivered := ts.CreateTestUser(t, "markerbatchdelivered")
+	remaining := ts.CreateTestUser(t, "markerbatchremaining")
+	ts.AddMemberToServer(t, serverID, delivered.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, remaining.ID, roleMember)
+
+	tx, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.Exec(
+		`INSERT INTO key_revocations (
+			channel_id, revoked_epoch, successor_epoch, reason, revoked_by,
+			rotation_distributor_id, rotation_distributor_claimed, rotation_key_fingerprint
+		 ) VALUES ($1, 1, 2, 'member_removal', $2, $2, TRUE, $3)`,
+		channelID, creator.ID, rotationFingerprint,
+	)
+	require.NoError(t, err)
+	_, err = tx.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id, key_version)
+		 VALUES ($1, $2, 2)`,
+		channelID, creator.ID,
+	)
+	require.NoError(t, err)
+	_, err = tx.Exec(`SELECT set_config('concord.rotation_distributor_id', $1, TRUE)`, creator.ID)
+	require.NoError(t, err)
+	_, err = tx.Exec(`SELECT set_config('concord.rotation_key_fingerprint', $1, TRUE)`, rotationFingerprint)
+	require.NoError(t, err)
+	_, err = tx.Exec(
+		`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version)
+		 VALUES ($1, $2, 'creator-epoch-two', 2)`,
+		channelID, creator.ID,
+	)
+	require.NoError(t, err)
+	_, err = tx.Exec(
+		`INSERT INTO pending_key_requests (channel_id, user_id) VALUES ($1, $2)`,
+		channelID, remaining.ID,
+	)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	wsServer := httptest.NewServer(ts.Router)
+	t.Cleanup(wsServer.Close)
+	conn, _, err := gorillaWS.DefaultDialer.Dial(
+		"ws"+strings.TrimPrefix(wsServer.URL, "http")+"/api/v1/ws?token="+url.QueryEscape(creator.AccessToken), nil,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	require.Eventually(t, func() bool {
+		return ts.Hub.GetUserClientCount(uuid.MustParse(creator.ID)) > 0
+	}, time.Second, 10*time.Millisecond)
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, _, err = conn.ReadMessage() // connection bootstrap
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{delivered.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, remaining.ID))
+
+	foundKeyNeeded := false
+	deadline := time.Now().Add(2 * time.Second)
+	for !foundKeyNeeded && time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(deadline)
+		_, frame, readErr := conn.ReadMessage()
+		if readErr != nil {
+			if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+				break
+			}
+			require.NoError(t, readErr)
+		}
+		var message struct {
+			Type string `json:"type"`
+		}
+		require.NoError(t, json.Unmarshal(frame, &message))
+		foundKeyNeeded = message.Type == "key_needed"
+	}
+	assert.True(t, foundKeyNeeded)
+}
+
+func TestDistributeChannelKeys_RejectsLegacyIssuedRotation(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	member := ts.CreateTestUser(t, "legacyrotationmember")
+	target := ts.CreateTestUser(t, "legacyrotationtarget")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{member.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	_, err := ts.DB.Exec(
+		`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by)
+		 VALUES ($1, 1, 2, 'member_removal', $2)`, channelID, owner.ID,
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`UPDATE key_revocations
+		 SET rotation_distributor_claimed = NULL
+		 WHERE channel_id = $1 AND revoked_epoch = 1`, channelID,
+	)
+	require.NoError(t, err)
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+	}, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusConflict, w.Code, "legacy rotations must remain sealed")
+}
+
+func TestDistributeChannelKeys_ExplicitVersionDoesNotRevealHiddenChannel(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	member := ts.CreateTestUser(t, "hiddenrotationmember")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{member.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	var allRoleID string
+	require.NoError(t, ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID))
+	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermViewTextChannels))
+	require.NoError(t, rbac.NewPermissionCache(ts.Redis).InvalidateServer(context.Background(), serverID))
+
+	body := map[string]interface{}{
+		keyWrappedKeys: map[string]string{owner.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+	}
+	hidden := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, body, testhelpers.AuthHeaders(member.AccessToken))
+	unknown := ts.DoRequest("POST", pathChannelsPrefix+uuid.New().String()+pathKeys, body, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusForbidden, hidden.Code)
+	assert.Equal(t, hidden.Code, unknown.Code)
+}
+
+func TestDistributeChannelKeys_DeletedInitialCreatorDeletesIncompleteChannel(t *testing.T) {
+	ts, _, serverID, channelID := setupEncryptedChannel(t)
+	creator := ts.CreateTestUser(t, "deletedinitialcreator")
+	ts.AddMemberToServer(t, serverID, creator.ID, roleMember)
+
+	_, err := ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id) VALUES ($1, $2)`,
+		channelID, creator.ID,
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`DELETE FROM users WHERE id = $1`, creator.ID)
+	require.NoError(t, err)
+
+	assert.Zero(t, rowCount(t, ts, `SELECT COUNT(*) FROM channels WHERE id = $1`, channelID))
+}
+
+func TestDistributeChannelKeys_CompletesAdvancedInitialDistribution(t *testing.T) {
+	ts, creator, serverID, channelID := setupEncryptedChannel(t)
+	target := ts.CreateTestUser(t, "deferredrotationtarget")
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+	_, err := ts.DB.Exec(
+		`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by, rotation_distributor_claimed)
+		 VALUES ($1, 1, 2, 'member_removal', $2, FALSE)`, channelID, creator.ID,
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by, rotation_distributor_claimed)
+		 VALUES ($1, 2, 3, 'member_removal', $2, FALSE)`, channelID, creator.ID,
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id, key_version)
+		 VALUES ($1, $2, 3)`, channelID, creator.ID,
+	)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code, "an advanced marker cannot accept an unversioned stale wrap")
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		"key_version":  3,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, "a twice-advanced marker uses its recorded successor epoch")
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{creator.ID: testhelpers.ValidCiphertext()},
+		"key_version":  3,
+		keyFingerprint: otherFingerprint,
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	assert.Equal(t, http.StatusConflict, w.Code, "the creator cannot interleave a different CSK at an advanced marker")
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{
+			creator.ID: testhelpers.ValidCiphertext(),
+		},
+		"key_version":  3,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(creator.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_initial_key_distributions WHERE channel_id = $1`, channelID))
+	assert.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM key_revocations WHERE channel_id = $1 AND revoked_epoch = 2 AND successor_epoch = 3`, channelID))
+	assert.Equal(t, 2, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND key_version = 3`, channelID))
+}
+
 // --- Pending Key Requests ---
 
 func TestGetPendingKeyRequestsEmpty(t *testing.T) {
@@ -807,7 +1412,75 @@ func TestGetPendingKeyRequestsEmpty(t *testing.T) {
 	assert.Equal(t, 0, len(requests))
 }
 
+func TestGetPendingKeyRequests_UsesActiveMarkerEpoch(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	requester := ts.CreateTestUser(t, "pendingmarkerepoch")
+	nonCreator := ts.CreateTestUser(t, "pendingmarkernoncreator")
+	ts.AddMemberToServer(t, serverID, requester.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, nonCreator.ID, roleMember)
+
+	tx, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.Exec(
+		`INSERT INTO key_revocations (
+			channel_id, revoked_epoch, successor_epoch, reason, revoked_by,
+			rotation_distributor_id, rotation_distributor_claimed, rotation_key_fingerprint
+		 ) VALUES ($1, 1, 2, 'member_removal', $2, $2, TRUE, $3)`,
+		channelID, owner.ID, rotationFingerprint,
+	)
+	require.NoError(t, err)
+	_, err = tx.Exec(`INSERT INTO channel_initial_key_distributions (channel_id, creator_id, key_version) VALUES ($1, $2, 2)`, channelID, owner.ID)
+	require.NoError(t, err)
+	_, err = tx.Exec(`SELECT set_config('concord.rotation_distributor_id', $1, TRUE)`, owner.ID)
+	require.NoError(t, err)
+	_, err = tx.Exec(`SELECT set_config('concord.rotation_key_fingerprint', $1, TRUE)`, rotationFingerprint)
+	require.NoError(t, err)
+	_, err = tx.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'epoch-two', 2)`, channelID, owner.ID)
+	require.NoError(t, err)
+	_, err = tx.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'epoch-two-other', 2)`, channelID, nonCreator.ID)
+	require.NoError(t, err)
+	_, err = tx.Exec(`INSERT INTO pending_key_requests (channel_id, user_id) VALUES ($1, $2)`, channelID, requester.ID)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	w := ts.DoRequest("GET", "/api/v1/e2ee/pending-keys", nil, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	requests := body["pending_requests"].([]interface{})
+	require.Len(t, requests, 1)
+	assert.Equal(t, float64(2), requests[0].(map[string]interface{})["key_version"])
+
+	// A recipient that holds v2 cannot complete the creator-only marker, so it
+	// must not be prompted with recovery work it would receive a 403 submitting.
+	w = ts.DoRequest("GET", "/api/v1/e2ee/pending-keys", nil, testhelpers.AuthHeaders(nonCreator.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Empty(t, body["pending_requests"].([]interface{}))
+
+	// Conversely, the creator must hold the active marker epoch; an older key
+	// cannot be used to recover a successor CSK.
+	_, err = ts.DB.Exec(`DELETE FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 2`, channelID, owner.ID)
+	require.NoError(t, err)
+	w = ts.DoRequest("GET", "/api/v1/e2ee/pending-keys", nil, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Empty(t, body["pending_requests"].([]interface{}))
+}
+
 // --- Rate Limiting: RotateKey ---
+
+func TestRotateKey_InitialDistributionBlocked(t *testing.T) {
+	ts, user, _, channelID := setupEncryptedChannel(t)
+	_, err := ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id) VALUES ($1, $2)`, channelID, user.ID,
+	)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathRotateKey, nil, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusConflict, w.Code)
+}
 
 func TestRotateKeyRateLimitBlocks11th(t *testing.T) {
 	ts, user, _, channelID := setupEncryptedChannel(t)

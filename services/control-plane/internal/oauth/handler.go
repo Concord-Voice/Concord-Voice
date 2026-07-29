@@ -260,6 +260,9 @@ func decodeSSOKeyMaterial(req *completeRegistrationRequest) (wrapped, salt, pubK
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	if err := auth.ValidateE2EEPublicKey(pubKey); err != nil {
+		return nil, nil, nil, err
+	}
 	return wrapped, salt, pubKey, nil
 }
 

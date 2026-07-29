@@ -49,7 +49,7 @@ func newTempGrantManager(db *sql.DB, log *logger.Logger, hub *websocket.Hub, res
 		log:      log,
 		hub:      hub,
 		resolver: resolver,
-		rotator:  keyrotation.NewRotator(db, log, hub),
+		rotator:  keyrotation.NewRotator(db, log, resolver.CanDistributeChannelKeyTx, websocket.KeyRevocationBroadcaster(hub)),
 		nats:     nats,
 	}
 }
@@ -154,7 +154,7 @@ func (m *tempGrantManager) revokeTemporaryChannelAccess(ctx context.Context, ser
 	}
 
 	// P2: rotate the channel CSK so the departed user cannot decrypt post-visit traffic.
-	m.rotator.TriggerForChannel(channelID, revokeReason, actorID)
+	m.rotator.RevokeChannelKeyEpoch(channelID, revokeReason, actorID, userID)
 
 	// P3: force-disconnect the live peer (revoking VIEW/CONNECT does not eject a
 	// connected peer).

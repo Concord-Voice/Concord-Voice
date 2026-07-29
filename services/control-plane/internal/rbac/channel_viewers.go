@@ -2,6 +2,7 @@ package rbac
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 
@@ -14,6 +15,39 @@ import (
 // role/user SBAC overrides in one fresh database query.
 func (r *Resolver) FilterVisibleUserIDsForChannelFresh(
 	ctx context.Context,
+	serverID string,
+	channelID string,
+	candidateUserIDs []string,
+) (viewerIDs []string, returnErr error) {
+	return filterVisibleUserIDsForChannel(ctx, r.db, serverID, channelID, candidateUserIDs)
+}
+
+// FilterVisibleUserIDsForChannelTx is the transaction-bound variant for a
+// channel being created or updated in the caller's transaction.
+func (r *Resolver) FilterVisibleUserIDsForChannelTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	serverID string,
+	channelID string,
+	candidateUserIDs []string,
+) (viewerIDs []string, returnErr error) {
+	return filterVisibleUserIDsForChannel(ctx, tx, serverID, channelID, candidateUserIDs)
+}
+
+// CanDistributeChannelKeyTx reports whether one current channel viewer can
+// serve as the sole writer for an incomplete initial key distribution.
+func (r *Resolver) CanDistributeChannelKeyTx(ctx context.Context, tx *sql.Tx, serverID, channelID, userID string) (bool, error) {
+	viewers, err := r.FilterVisibleUserIDsForChannelTx(ctx, tx, serverID, channelID, []string{userID})
+	return len(viewers) == 1, err
+}
+
+type channelViewerQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func filterVisibleUserIDsForChannel(
+	ctx context.Context,
+	queryer channelViewerQueryer,
 	serverID string,
 	channelID string,
 	candidateUserIDs []string,
@@ -92,7 +126,7 @@ func (r *Resolver) FilterVisibleUserIDsForChannelFresh(
 		ORDER BY members.user_id
 	`
 
-	rows, err := r.db.QueryContext(
+	rows, err := queryer.QueryContext(
 		ctx,
 		query,
 		serverID,

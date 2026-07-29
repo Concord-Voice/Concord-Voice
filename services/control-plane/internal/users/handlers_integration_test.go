@@ -608,6 +608,11 @@ func TestReplaceMyKeysClearsChannelKeys(t *testing.T) {
 		channelID, user.ID, []byte("test-wrapped-channel-key"),
 	)
 	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id) VALUES ($1, $2)`,
+		channelID, user.ID,
+	)
+	require.NoError(t, err)
 
 	// Seed a dm_channel_keys row via the DM conversation + key helpers.
 	convID := ts.CreateDMConversation(t, user.ID, other.ID)
@@ -640,6 +645,10 @@ func TestReplaceMyKeysClearsChannelKeys(t *testing.T) {
 		`SELECT count(*) FROM channel_keys WHERE user_id = $1`, user.ID).Scan(&postChannel))
 	require.NoError(t, ts.DB.QueryRow(
 		`SELECT count(*) FROM dm_channel_keys WHERE user_id = $1`, user.ID).Scan(&postDM))
+	var postMarker int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM channel_initial_key_distributions WHERE channel_id = $1`, channelID).Scan(&postMarker))
+	assert.Zero(t, postMarker)
 	assert.Equal(t, 0, postChannel, "channel_keys must be cleared after reset")
 	assert.Equal(t, 0, postDM, "dm_channel_keys must be cleared after reset")
 }

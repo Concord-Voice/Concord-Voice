@@ -2450,13 +2450,28 @@ func TestHandleMessageEpochRevoked(t *testing.T) {
 		channelUUID.String(), setup.user1.String(), []byte("test-key"))
 	require.NoError(t, err)
 
-	_, err = setup.db.Exec(`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by) VALUES ($1, 1, 2, 'test', $2)`,
-		channelUUID.String(), setup.user1.String())
+	_, err = setup.db.Exec(`INSERT INTO key_revocations (
+		channel_id, revoked_epoch, successor_epoch, reason, revoked_by,
+		rotation_distributor_id, rotation_distributor_claimed, rotation_key_fingerprint
+	) VALUES ($1, 1, 2, 'test', $2, $2, TRUE, $3)`,
+		channelUUID.String(), setup.user1.String(), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	require.NoError(t, err)
 
-	_, err = setup.db.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, $3, 2)`,
+	tx, err := setup.db.Begin()
+	require.NoError(t, err)
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			t.Errorf("rollback epoch-revoked test transaction: %v", rbErr)
+		}
+	}()
+	_, err = tx.Exec(`SELECT set_config('concord.rotation_distributor_id', $1, TRUE)`, setup.user1.String())
+	require.NoError(t, err)
+	_, err = tx.Exec(`SELECT set_config('concord.rotation_key_fingerprint', $1, TRUE)`, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	require.NoError(t, err)
+	_, err = tx.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, $3, 2)`,
 		channelUUID.String(), setup.user1.String(), []byte("test-key-v2"))
 	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
 
 	msg := IncomingMessage{
 		Type:     "message",

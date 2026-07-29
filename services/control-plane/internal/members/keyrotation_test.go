@@ -129,6 +129,7 @@ func newKeyRotationHandler(t *testing.T) (*Handler, *sql.DB) {
 }
 
 const krTestPasswordHash = "$argon2id$v=19$m=65536,t=3,p=4$3pE9STD1TqLPoZQ2/BTLCg$8SKTCjsZh8Q7pAulEqAIEzJQK9eeOb5ipWhPz4REdCY" //nolint:gosec // dummy hash, not a credential // pragma: allowlist secret
+const krRotationFingerprint = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 // krSeedServerChannel inserts a user (owner), server, and channel, returning their IDs.
 // The DB is truncated between tests (see krSetupDB cleanup), so fixed literal
@@ -156,12 +157,34 @@ func krSeedServerChannel(t *testing.T, db *sql.DB) (ownerID, serverID, channelID
 
 func krSeedEpoch(t *testing.T, db *sql.DB, channelID, userID string, version int) {
 	t.Helper()
-	_, err := db.Exec(
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.Exec(
 		`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version)
-		 VALUES ($1, $2, $3, $4)`,
-		channelID, userID, "test-wrapped-key", version,
+		 VALUES ($1, $2, 'initial-wrapped-key', 1)`,
+		channelID, userID,
 	)
 	require.NoError(t, err)
+	for epoch := 2; epoch <= version; epoch++ {
+		_, err = tx.Exec(
+			`INSERT INTO key_revocations (
+				channel_id, revoked_epoch, successor_epoch, reason, revoked_by,
+				rotation_distributor_id, rotation_distributor_claimed, rotation_key_fingerprint
+			 ) VALUES ($1, $2, $3, 'test_rotation', $4, $4, TRUE, $5)`,
+			channelID, epoch-1, epoch, userID, krRotationFingerprint,
+		)
+		require.NoError(t, err)
+		_, err = tx.Exec(`SELECT set_config('concord.rotation_key_fingerprint', $1, TRUE)`, krRotationFingerprint)
+		require.NoError(t, err)
+		_, err = tx.Exec(
+			`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version)
+			 VALUES ($1, $2, 'test-wrapped-key', $3)`,
+			channelID, userID, epoch,
+		)
+		require.NoError(t, err)
+	}
+	require.NoError(t, tx.Commit())
 }
 
 // TestTriggerKeyRevocationForChannel_InsertsRevocation verifies the extracted
@@ -177,7 +200,8 @@ func TestTriggerKeyRevocationForChannel_InsertsRevocation(t *testing.T) {
 	var revokedEpoch, successorEpoch int
 	var reason string
 	err := db.QueryRow(
-		`SELECT revoked_epoch, successor_epoch, reason FROM key_revocations WHERE channel_id = $1`, channelID,
+		`SELECT revoked_epoch, successor_epoch, reason
+		 FROM key_revocations WHERE channel_id = $1 AND revoked_epoch = 3`, channelID,
 	).Scan(&revokedEpoch, &successorEpoch, &reason)
 	require.NoError(t, err, "a key_revocations row should be inserted for the channel")
 	assert.Equal(t, 3, revokedEpoch, "revoked_epoch should equal the current max key_version")

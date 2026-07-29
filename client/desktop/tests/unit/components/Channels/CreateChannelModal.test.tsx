@@ -2,8 +2,9 @@ import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useServerStore } from '@/renderer/stores/serverStore';
 import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { mockServer, mockChannel, mockMember } from '../../../mocks/fixtures';
+import { useUserStore } from '@/renderer/stores/userStore';
+import { useAuthStore } from '@/renderer/stores/authStore';
+import { mockServer, mockChannel, mockUser } from '../../../mocks/fixtures';
 
 // Mock apiFetch to avoid timing issues in jsdom
 vi.mock('@/renderer/services/apiClient', () => ({
@@ -30,6 +31,35 @@ import CreateChannelModal from '@/renderer/components/Channels/CreateChannelModa
 
 const mockedApiFetch = vi.mocked(apiFetch);
 
+function setOverflowMembersAndKeys(count = 501): {
+  members: Array<{ user_id: string; public_key: string; key_version: number }>;
+  wrappedKeys: Map<string, string>;
+} {
+  const overflowCount = count - 1;
+  const overflowMembers = Array.from({ length: overflowCount }, (_, index) => ({
+    user_id: `user-${index + 2}`,
+    public_key: `mock-public-key-${index + 2}`,
+    key_version: index + 2,
+  }));
+
+  const wrappedKeys = new Map<string, string>();
+  for (const member of overflowMembers) {
+    wrappedKeys.set(member.user_id, `wrapped-${member.user_id}`);
+  }
+  wrappedKeys.set(mockUser.id, 'wrapped-user-1');
+  return {
+    members: [
+      ...overflowMembers,
+      { user_id: mockUser.id, public_key: 'mock-public-key-1', key_version: 1 },
+    ],
+    wrappedKeys,
+  };
+}
+
+const currentMemberPublicKeys = [
+  { user_id: mockUser.id, public_key: 'mock-public-key-1', key_version: 1 },
+];
+
 describe('CreateChannelModal', () => {
   const mockOnClose = vi.fn();
   const mockOnSuccess = vi.fn();
@@ -39,6 +69,7 @@ describe('CreateChannelModal', () => {
     vi.clearAllMocks();
     useServerStore.getState().addServer(mockServer);
     useServerStore.getState().setActiveServer(mockServer.id);
+    useUserStore.getState().setUser(mockUser);
   });
 
   it('renders nothing when closed', () => {
@@ -75,14 +106,13 @@ describe('CreateChannelModal', () => {
     vi.useFakeTimers();
 
     // All channels are always E2EE — set up member + public key + createChannelKeys mocks
-    useMemberStore.setState({ members: [mockMember] });
     vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(
       new Map([['user-1', 'wrapped-key']])
     );
     mockedApiFetch
       .mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ public_key: 'mock-pub-key' }),
+        json: async () => ({ members: currentMemberPublicKeys }),
       } as Response)
       .mockResolvedValueOnce({
         ok: true,
@@ -109,16 +139,298 @@ describe('CreateChannelModal', () => {
     vi.useRealTimers();
   });
 
+  it('batches overflow keys to both voice channel IDs while retaining the creator', async () => {
+    const { members, wrappedKeys } = setOverflowMembersAndKeys();
+    vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(wrappedKeys);
+
+    const voiceChannel = { ...mockChannel, id: 'voice-channel', type: 'voice' as const };
+    const linkedTextChannel = { ...mockChannel, id: 'linked-text-channel', type: 'text' as const };
+    mockedApiFetch.mockImplementation(async (url) => {
+      if (url === `/api/v1/servers/${mockServer.id}/member-public-keys`) {
+        return { ok: true, json: async () => ({ members }) } as Response;
+      }
+      if (url === '/api/v1/channels') {
+        return {
+          ok: true,
+          json: async () => ({ channel: voiceChannel, linked_text_channel: linkedTextChannel }),
+        } as Response;
+      }
+      return { ok: true, json: async () => ({}) } as Response;
+    });
+
+    render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
+    fireEvent.change(screen.getByPlaceholderText('general-chat'), {
+      target: { value: 'voice-overflow' },
+    });
+    fireEvent.click(screen.getByText('Voice').closest('button')!);
+    fireEvent.click(screen.getByText('Create Channel', { selector: 'button[type="submit"]' }));
+
+    await waitFor(() => {
+      expect(mockedApiFetch).toHaveBeenCalledWith(
+        '/api/v1/channels/voice-channel/keys',
+        expect.anything()
+      );
+    });
+
+    const createCall = mockedApiFetch.mock.calls.find(([url]) => url === '/api/v1/channels');
+    const createBody = JSON.parse((createCall?.[1]?.body as string) ?? '{}');
+    expect(Object.keys(createBody.wrapped_keys)).toHaveLength(500);
+    expect(createBody.wrapped_keys).toHaveProperty(mockUser.id, 'wrapped-user-1');
+    expect(createBody.wrapped_key_versions).toHaveProperty(mockUser.id, 1);
+    expect(e2eeService.createChannelKeys).toHaveBeenCalledTimes(1);
+
+    const distributionCalls = mockedApiFetch.mock.calls.filter(
+      ([url]) => typeof url === 'string' && url.endsWith('/keys')
+    );
+    expect(distributionCalls).toHaveLength(2);
+    expect(distributionCalls.map(([url]) => url)).toEqual([
+      '/api/v1/channels/voice-channel/keys',
+      '/api/v1/channels/linked-text-channel/keys',
+    ]);
+    for (const [, request] of distributionCalls) {
+      expect(JSON.parse((request?.body as string) ?? '{}')).toEqual({
+        wrapped_keys: { 'user-501': 'wrapped-user-501' },
+        wrapped_key_versions: { 'user-501': 501 },
+        key_version: 1,
+      });
+    }
+  });
+
+  it('reports a failed overflow distribution as a partial channel creation', async () => {
+    const { members, wrappedKeys } = setOverflowMembersAndKeys();
+    vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(wrappedKeys);
+    mockedApiFetch.mockImplementation(async (url) => {
+      if (url === `/api/v1/servers/${mockServer.id}/member-public-keys`) {
+        return { ok: true, json: async () => ({ members }) } as Response;
+      }
+      if (url === '/api/v1/channels') {
+        return { ok: true, json: async () => ({ channel: mockChannel }) } as Response;
+      }
+      return {
+        ok: false,
+        json: async () => ({ error: 'Key distribution unavailable' }),
+      } as Response;
+    });
+
+    render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
+    fireEvent.change(screen.getByPlaceholderText('general-chat'), {
+      target: { value: 'text-overflow' },
+    });
+    fireEvent.click(screen.getByText('Create Channel', { selector: 'button[type="submit"]' }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByText('Channel created, but Key distribution unavailable')
+      ).toBeInTheDocument();
+    });
+    expect(screen.queryByText('Channel created successfully!')).not.toBeInTheDocument();
+    expect(useChannelStore.getState().channels).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Create Channel' })).toBeDisabled();
+  });
+
+  it('retries the 11th overflow batch after rate limiting', async () => {
+    vi.useFakeTimers();
+    try {
+      const { members, wrappedKeys } = setOverflowMembersAndKeys(5501);
+      vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(wrappedKeys);
+      let distributionAttempts = 0;
+      mockedApiFetch.mockImplementation(async (url) => {
+        if (url === `/api/v1/servers/${mockServer.id}/member-public-keys`) {
+          return { ok: true, json: async () => ({ members }) } as Response;
+        }
+        if (url === '/api/v1/channels') {
+          return { ok: true, json: async () => ({ channel: mockChannel }) } as Response;
+        }
+        distributionAttempts++;
+        if (distributionAttempts === 11) {
+          return {
+            ok: false,
+            status: 429,
+            headers: new Headers({
+              'Retry-After': '1',
+            }),
+            json: async () => ({}),
+          } as Response;
+        }
+        return { ok: true, json: async () => ({}) } as Response;
+      });
+
+      render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
+      fireEvent.change(screen.getByPlaceholderText('general-chat'), {
+        target: { value: 'rate-limited-overflow' },
+      });
+      fireEvent.click(screen.getByText('Create Channel', { selector: 'button[type="submit"]' }));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(distributionAttempts).toBe(11);
+
+      await act(async () => {
+        await vi.runAllTimersAsync();
+      });
+      expect(distributionAttempts).toBe(12);
+      expect(useChannelStore.getState().channels).toHaveLength(1);
+      expect(screen.queryByText(/Channel created, but/)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('caps an overflow Retry-After delay at one minute', async () => {
+    vi.useFakeTimers();
+    try {
+      const { members, wrappedKeys } = setOverflowMembersAndKeys();
+      vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(wrappedKeys);
+      let distributionAttempts = 0;
+      mockedApiFetch.mockImplementation(async (url) => {
+        if (url === `/api/v1/servers/${mockServer.id}/member-public-keys`) {
+          return { ok: true, json: async () => ({ members }) } as Response;
+        }
+        if (url === '/api/v1/channels') {
+          return { ok: true, json: async () => ({ channel: mockChannel }) } as Response;
+        }
+        distributionAttempts++;
+        if (distributionAttempts === 1) {
+          return {
+            ok: false,
+            status: 429,
+            headers: new Headers({ 'Retry-After': '3600' }),
+            json: async () => ({}),
+          } as Response;
+        }
+        return { ok: true, json: async () => ({}) } as Response;
+      });
+
+      render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
+      fireEvent.change(screen.getByPlaceholderText('general-chat'), {
+        target: { value: 'capped-rate-limit-overflow' },
+      });
+      fireEvent.click(screen.getByText('Create Channel', { selector: 'button[type="submit"]' }));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(distributionAttempts).toBe(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(59_999);
+      });
+      expect(distributionAttempts).toBe(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(distributionAttempts).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops after bounded retries when overflow key distribution remains rate limited', async () => {
+    vi.useFakeTimers();
+    try {
+      const { members, wrappedKeys } = setOverflowMembersAndKeys();
+      vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(wrappedKeys);
+      let distributionAttempts = 0;
+      mockedApiFetch.mockImplementation(async (url) => {
+        if (url === `/api/v1/servers/${mockServer.id}/member-public-keys`) {
+          return { ok: true, json: async () => ({ members }) } as Response;
+        }
+        if (url === '/api/v1/channels') {
+          return { ok: true, json: async () => ({ channel: mockChannel }) } as Response;
+        }
+        distributionAttempts++;
+        return {
+          ok: false,
+          status: 429,
+          headers: new Headers(),
+          json: async () => ({}),
+        } as Response;
+      });
+
+      render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
+      fireEvent.change(screen.getByPlaceholderText('general-chat'), {
+        target: { value: 'persistently-rate-limited-overflow' },
+      });
+      fireEvent.click(screen.getByText('Create Channel', { selector: 'button[type="submit"]' }));
+
+      await act(async () => {
+        await vi.runAllTimersAsync();
+      });
+
+      expect(distributionAttempts).toBe(4);
+      expect(
+        screen.getByText(
+          'Channel created, but Channel key distribution is rate limited; try again later'
+        )
+      ).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not retry an overflow key distribution after auth supersession', async () => {
+    vi.useFakeTimers();
+    try {
+      const { members, wrappedKeys } = setOverflowMembersAndKeys();
+      vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(wrappedKeys);
+      let distributionAttempts = 0;
+      mockedApiFetch.mockImplementation(async (url) => {
+        if (url === `/api/v1/servers/${mockServer.id}/member-public-keys`) {
+          return { ok: true, json: async () => ({ members }) } as Response;
+        }
+        if (url === '/api/v1/channels') {
+          return { ok: true, json: async () => ({ channel: mockChannel }) } as Response;
+        }
+        distributionAttempts++;
+        return {
+          ok: false,
+          status: 429,
+          headers: new Headers({
+            'X-RateLimit-Reset': String(Math.ceil((Date.now() + 1000) / 1000)),
+          }),
+          json: async () => ({}),
+        } as Response;
+      });
+
+      render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
+      fireEvent.change(screen.getByPlaceholderText('general-chat'), {
+        target: { value: 'superseded-overflow' },
+      });
+      fireEvent.click(screen.getByText('Create Channel', { selector: 'button[type="submit"]' }));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(distributionAttempts).toBe(1);
+
+      act(() => {
+        useAuthStore.getState().setAccessToken('successor-token');
+      });
+      await act(async () => {
+        await vi.runAllTimersAsync();
+      });
+
+      expect(distributionAttempts).toBe(1);
+      expect(screen.queryByText('Channel created successfully!')).not.toBeInTheDocument();
+      expect(
+        screen.getByText('Create Channel', { selector: 'button[type="submit"]' })
+      ).toBeDisabled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('shows error on API failure', async () => {
     // Public key fetch succeeds; channel creation fails
-    useMemberStore.setState({ members: [mockMember] });
     vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(
       new Map([['user-1', 'wrapped-key']])
     );
     mockedApiFetch
       .mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ public_key: 'mock-pub-key' }),
+        json: async () => ({ members: currentMemberPublicKeys }),
       } as Response)
       .mockResolvedValueOnce({
         ok: false,
@@ -137,6 +449,33 @@ describe('CreateChannelModal', () => {
 
     await waitFor(() => {
       expect(screen.getByText('Duplicate name')).toBeInTheDocument();
+    });
+  });
+
+  it('shows the generic error when channel creation returns non-JSON', async () => {
+    vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(
+      new Map([['user-1', 'wrapped-key']])
+    );
+    mockedApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ members: currentMemberPublicKeys }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: false,
+        json: async () => {
+          throw new SyntaxError('Unexpected token');
+        },
+      } as Response);
+
+    render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
+    fireEvent.change(screen.getByPlaceholderText('general-chat'), {
+      target: { value: 'non-json-error' },
+    });
+    fireEvent.click(screen.getByText('Create Channel', { selector: 'button[type="submit"]' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Failed to create channel')).toBeInTheDocument();
     });
   });
 
@@ -173,7 +512,6 @@ describe('CreateChannelModal', () => {
     vi.useFakeTimers();
 
     // All channels are E2EE — set up member + public key + key gen mocks
-    useMemberStore.setState({ members: [mockMember] });
 
     const wrappedKeyMap = new Map([['user-1', 'wrapped-key-data']]);
     vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(wrappedKeyMap);
@@ -182,7 +520,7 @@ describe('CreateChannelModal', () => {
     mockedApiFetch
       .mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ public_key: 'mock-public-key' }),
+        json: async () => ({ members: currentMemberPublicKeys }),
       } as Response)
       .mockResolvedValueOnce({
         ok: true,
@@ -217,8 +555,6 @@ describe('CreateChannelModal', () => {
     const original = e2eeService.isInitialized;
     Object.defineProperty(e2eeService, 'isInitialized', { value: false, writable: true });
 
-    useMemberStore.setState({ members: [mockMember] });
-
     render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
 
     fireEvent.change(screen.getByPlaceholderText('general-chat'), {
@@ -240,12 +576,10 @@ describe('CreateChannelModal', () => {
   });
 
   it('shows error when no member public keys are available', async () => {
-    useMemberStore.setState({ members: [mockMember] });
-
-    // Public key fetch fails — no wrapped keys can be generated
+    // No current member has a public key.
     mockedApiFetch.mockResolvedValueOnce({
-      ok: false,
-      json: async () => ({}),
+      ok: true,
+      json: async () => ({ members: [] }),
     } as Response);
 
     render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
@@ -278,7 +612,6 @@ describe('CreateChannelModal', () => {
     vi.useFakeTimers();
 
     // All channels are E2EE — need member + public key + key gen mocks
-    useMemberStore.setState({ members: [mockMember] });
     vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(
       new Map([['user-1', 'wrapped-key']])
     );
@@ -286,7 +619,7 @@ describe('CreateChannelModal', () => {
     mockedApiFetch
       .mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ public_key: 'mock-pub-key' }),
+        json: async () => ({ members: currentMemberPublicKeys }),
       } as Response)
       .mockResolvedValueOnce({
         ok: true,
@@ -313,12 +646,10 @@ describe('CreateChannelModal', () => {
   });
 
   it('handles non-Error thrown exceptions', async () => {
-    // All channels are E2EE — public key fetch rejects with a string (non-Error)
     // Public key fetch succeeds; createChannelKeys throws a non-Error (string)
-    useMemberStore.setState({ members: [mockMember] });
     mockedApiFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ public_key: 'mock-pub-key' }),
+      json: async () => ({ members: currentMemberPublicKeys }),
     } as Response);
     vi.mocked(e2eeService.createChannelKeys).mockRejectedValue('string-error');
 
@@ -350,8 +681,6 @@ describe('CreateChannelModal', () => {
       // property, so override via Object.defineProperty matching the existing pattern.
       const original = e2eeService.isInitialized;
       Object.defineProperty(e2eeService, 'isInitialized', { value: false, writable: true });
-
-      useMemberStore.setState({ members: [mockMember] });
 
       render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
 

@@ -41,6 +41,7 @@ import { useE2EEStore } from '../stores/e2eeStore';
 // Session lifetime — keys cached until explicit invalidation (rotation) or logout/close.
 // Lazy fetch + hold: each channel's key is fetched on first visit and held for the session.
 const CHANNEL_KEY_CACHE_TTL = Number.MAX_SAFE_INTEGER;
+const PENDING_KEY_RETRY_DELAY_MS = 60_000;
 
 interface CachedWrappedKey {
   wrappedKey: string;
@@ -73,6 +74,28 @@ interface ErrorResponseShape {
 interface KeyResponseShape {
   key: { wrapped_key: string; key_version?: number };
   kind?: 'channel' | 'dm' | 'unknown';
+}
+
+interface PendingKeyRequest {
+  user_id: string;
+  channel_id: string;
+  key_version?: number;
+}
+
+interface PendingRecipientPublicKey {
+  public_key: string;
+  key_version?: number;
+}
+
+interface WrappedPendingKey {
+  wrappedKey: string;
+  keyFingerprint: string;
+}
+
+type PendingKeyStepResult<T> = { action: 'process'; data: T } | { action: 'continue' | 'stop' };
+
+function pendingKeyResponseIsRetryable(res: Response): boolean {
+  return res.status === 429 || res.status >= 500;
 }
 
 /** Exported key material for safeStorage persistence */
@@ -127,6 +150,10 @@ class E2EEService {
   private readonly pendingVersionedKeyFetches: Map<string, Promise<CryptoKey>> = new Map();
   private readonly channelKeyGenerations: Map<string, number> = new Map();
   private readonly channelAccessRevocationGenerations: Map<string, number> = new Map();
+  private pendingKeyRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingKeyRequestProcessor: Promise<void> | null = null;
+  private pendingKeyRequestProcessorGeneration: number | null = null;
+  private pendingKeyRequestRerun = false;
   private keySessionGeneration: number = 0;
   // Bumped ONLY by clearKeys() (actual key destruction: logout, nuclearReset/
   // gracefulReset teardown, account switch). The init-commit fence keys on THIS
@@ -646,6 +673,27 @@ class E2EEService {
   }
 
   /**
+   * Rotation sends `key_delivered` to its own holder before the upload response.
+   * That expected cache invalidation must not abort later rotation batches, but
+   * session changes and terminal access revocation still fence the operation.
+   */
+  createChannelRotationGuard(channelId: string): E2EEChannelOperationGuard {
+    const sessionGeneration = this.keySessionGeneration;
+    const accessRevocationGeneration = this.channelAccessRevocationGenerations.get(channelId) ?? -1;
+    return {
+      assertCurrent: () => {
+        this.assertCurrentKeySession(sessionGeneration);
+        if (
+          (this.channelAccessRevocationGenerations.get(channelId) ?? -1) !==
+          accessRevocationGeneration
+        ) {
+          throw new E2EEKeyUnavailableError('NOT_MEMBER', false);
+        }
+      },
+    };
+  }
+
+  /**
    * Get the unwrapped channel key for a channel (JIT).
    * Fetches the wrapped key from cache or server, unwraps with private key.
    * Uses pendingKeyFetches to prevent cache stampeding (concurrent fetches for the same channel).
@@ -900,8 +948,20 @@ class E2EEService {
    * Used when an existing member distributes keys to a joining member.
    */
   async wrapKeyForMember(channelId: string, memberPublicKeyBase64: string): Promise<string> {
+    return (await this.wrapKeyForMemberWithFingerprint(channelId, memberPublicKeyBase64))
+      .wrappedKey;
+  }
+
+  private async wrapKeyForMemberWithFingerprint(
+    channelId: string,
+    memberPublicKeyBase64: string,
+    keyVersion?: number
+  ): Promise<{ wrappedKey: string; keyFingerprint: string }> {
     // Get the unwrapped channel key
-    const channelKey = await this.getChannelKey(channelId);
+    const channelKey =
+      keyVersion !== undefined && keyVersion > 0
+        ? await this.getChannelKeyByVersion(channelId, keyVersion)
+        : await this.getChannelKey(channelId);
     const memberPublicKey = await importPublicKey(memberPublicKeyBase64);
 
     // Export and re-wrap for the new member
@@ -913,79 +973,262 @@ class E2EEService {
       true,
       ['encrypt', 'decrypt']
     );
-    return wrapChannelKey(tempKey, memberPublicKey);
+    return {
+      wrappedKey: await wrapChannelKey(tempKey, memberPublicKey),
+      keyFingerprint: arrayBufferToBase64(await crypto.subtle.digest('SHA-256', rawKey)),
+    };
   }
 
   /**
    * Process pending key requests — auto-wrap keys for new members.
    */
-  async processPendingKeyRequests(): Promise<void> {
-    if (!this.isInitialized) return;
+  processPendingKeyRequests(): Promise<void> {
+    if (!this.isInitialized) return Promise.resolve();
+    const sessionGeneration = this.keySessionGeneration;
+
+    if (
+      this.pendingKeyRequestProcessor !== null &&
+      this.pendingKeyRequestProcessorGeneration === sessionGeneration
+    ) {
+      this.pendingKeyRequestRerun = true;
+      return this.pendingKeyRequestProcessor;
+    }
+    this.pendingKeyRequestProcessor = null;
+    this.pendingKeyRequestProcessorGeneration = null;
+    this.pendingKeyRequestRerun = false;
+
+    const processor = (async () => {
+      do {
+        this.pendingKeyRequestRerun = false;
+        await this.processPendingKeyRequestsOnce(sessionGeneration);
+      } while (
+        this.pendingKeyRequestRerun &&
+        this.isPendingKeyRequestSessionCurrent(sessionGeneration)
+      );
+    })();
+    this.pendingKeyRequestProcessor = processor;
+    this.pendingKeyRequestProcessorGeneration = sessionGeneration;
+    return processor.finally(() => {
+      if (
+        this.pendingKeyRequestProcessor === processor &&
+        this.pendingKeyRequestProcessorGeneration === sessionGeneration
+      ) {
+        this.pendingKeyRequestProcessor = null;
+        this.pendingKeyRequestProcessorGeneration = null;
+      }
+    });
+  }
+
+  private isPendingKeyRequestSessionCurrent(sessionGeneration: number): boolean {
+    return this.isInitialized && this.keySessionGeneration === sessionGeneration;
+  }
+
+  private async processPendingKeyRequestsOnce(sessionGeneration: number): Promise<void> {
+    if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return;
 
     try {
-      const res = await apiFetch('/api/v1/e2ee/pending-keys');
-      if (!res.ok) {
-        console.debug('[E2EE] pending-keys request failed:', res.status, res.statusText);
-        return;
-      }
-
-      const data = await safeJson<{
-        pending_requests?: Array<{ user_id: string; channel_id: string }>;
-      }>(res);
-      const requests = data.pending_requests || [];
+      const requests = await this.fetchPendingKeyRequests(sessionGeneration);
+      if (requests === null) return;
       console.debug('[E2EE] Pending key requests:', requests.length);
 
-      for (const req of requests) {
-        try {
-          // Fetch new member's public key
-          const pkRes = await apiFetch(`/api/v1/users/${req.user_id}/public-key`);
-          if (!pkRes.ok) {
-            console.warn('[E2EE] Failed to fetch public key for pending key distribution', {
-              userId: req.user_id,
-              status: pkRes.status,
-            });
-            continue;
-          }
-
-          const pkData = await safeJson<{ public_key: string; key_version?: number }>(pkRes);
-          const wrappedKey = await this.wrapKeyForMember(req.channel_id, pkData.public_key);
-
-          // Upload the wrapped key. Echo the recipient's public-key version the CSK
-          // was wrapped against (#2420) so the server's recipient-freshness guard
-          // can skip + self-heal-enqueue a wrap that raced a concurrent key reset.
-          // Omitted when the server didn't return a version (fail-open, old server).
-          const uploadBody: {
-            wrapped_keys: Record<string, string>;
-            wrapped_key_versions?: Record<string, number>;
-          } = { wrapped_keys: { [req.user_id]: wrappedKey } };
-          if (pkData.key_version !== undefined) {
-            uploadBody.wrapped_key_versions = { [req.user_id]: pkData.key_version };
-          }
-          const uploadRes = await apiFetch(`/api/v1/e2ee/keys/${req.channel_id}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(uploadBody),
-          });
-          console.debug(
-            '[E2EE] Key distributed for',
-            req.user_id,
-            'channel',
-            req.channel_id,
-            uploadRes.status
-          );
-        } catch (err) {
-          console.warn('[E2EE] Failed to process pending key request', {
-            channelId: req.channel_id,
-            userId: req.user_id,
-            error: (err as Error).message,
-          });
-        }
+      for (const request of requests) {
+        const action = await this.processPendingKeyRequest(request, sessionGeneration);
+        if (action === 'stop') break;
       }
     } catch (err) {
+      if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return;
       console.warn('[E2EE] processPendingKeyRequests fatal', {
         error: (err as Error).message,
       });
+      this.schedulePendingKeyRetry(sessionGeneration);
     }
+  }
+
+  private async fetchPendingKeyRequests(
+    sessionGeneration: number
+  ): Promise<PendingKeyRequest[] | null> {
+    let res: Response;
+    try {
+      res = await apiFetch('/api/v1/e2ee/pending-keys');
+    } catch (err) {
+      if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return null;
+      console.warn('[E2EE] pending-keys request failed', { error: (err as Error).message });
+      this.schedulePendingKeyRetry(sessionGeneration);
+      return null;
+    }
+    if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return null;
+    if (!res.ok) {
+      console.debug('[E2EE] pending-keys request failed:', res.status, res.statusText);
+      if (pendingKeyResponseIsRetryable(res)) this.schedulePendingKeyRetry(sessionGeneration);
+      return null;
+    }
+
+    let data: { pending_requests?: PendingKeyRequest[] };
+    try {
+      data = await safeJson(res);
+    } catch (err) {
+      if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return null;
+      console.warn('[E2EE] pending-keys response was invalid', { error: (err as Error).message });
+      this.schedulePendingKeyRetry(sessionGeneration);
+      return null;
+    }
+    if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return null;
+    return data.pending_requests || [];
+  }
+
+  private async processPendingKeyRequest(
+    request: PendingKeyRequest,
+    sessionGeneration: number
+  ): Promise<'continue' | 'stop'> {
+    const recipientKey = await this.fetchPendingRecipientPublicKey(request, sessionGeneration);
+    if (recipientKey.action !== 'process') return recipientKey.action;
+
+    const wrappedKey = await this.wrapPendingKey(request, recipientKey.data, sessionGeneration);
+    if (wrappedKey.action !== 'process') return wrappedKey.action;
+
+    return this.uploadPendingKey(request, recipientKey.data, wrappedKey.data, sessionGeneration);
+  }
+
+  private async fetchPendingRecipientPublicKey(
+    request: PendingKeyRequest,
+    sessionGeneration: number
+  ): Promise<PendingKeyStepResult<PendingRecipientPublicKey>> {
+    let res: Response;
+    try {
+      res = await apiFetch(`/api/v1/users/${request.user_id}/public-key`);
+    } catch (err) {
+      if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return { action: 'stop' };
+      console.warn('[E2EE] Failed to fetch public key for pending key distribution', {
+        userId: request.user_id,
+        error: (err as Error).message,
+      });
+      this.schedulePendingKeyRetry(sessionGeneration);
+      return { action: 'stop' };
+    }
+    if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return { action: 'stop' };
+    if (!res.ok) {
+      console.warn('[E2EE] Failed to fetch public key for pending key distribution', {
+        userId: request.user_id,
+        status: res.status,
+      });
+      if (pendingKeyResponseIsRetryable(res)) {
+        this.schedulePendingKeyRetry(sessionGeneration);
+        return { action: 'stop' };
+      }
+      return { action: 'continue' };
+    }
+
+    try {
+      const data = await safeJson<PendingRecipientPublicKey>(res);
+      if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return { action: 'stop' };
+      return { action: 'process', data };
+    } catch (err) {
+      if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return { action: 'stop' };
+      console.warn('[E2EE] pending public key response was invalid', {
+        userId: request.user_id,
+        error: (err as Error).message,
+      });
+      this.schedulePendingKeyRetry(sessionGeneration);
+      return { action: 'stop' };
+    }
+  }
+
+  private async wrapPendingKey(
+    request: PendingKeyRequest,
+    recipientKey: PendingRecipientPublicKey,
+    sessionGeneration: number
+  ): Promise<PendingKeyStepResult<WrappedPendingKey>> {
+    try {
+      const data = await this.wrapKeyForMemberWithFingerprint(
+        request.channel_id,
+        recipientKey.public_key,
+        request.key_version
+      );
+      if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return { action: 'stop' };
+      return { action: 'process', data };
+    } catch (err) {
+      if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return { action: 'stop' };
+      console.warn('[E2EE] Failed to process pending key request', {
+        channelId: request.channel_id,
+        userId: request.user_id,
+        error: (err as Error).message,
+      });
+      if (
+        err instanceof TypeError ||
+        (err instanceof E2EEKeyUnavailableError &&
+          (err.code === 'INTERNAL_ERROR' || err.code === 'NO_KEY_YET'))
+      ) {
+        this.schedulePendingKeyRetry(sessionGeneration);
+        return { action: 'stop' };
+      }
+      return { action: 'continue' };
+    }
+  }
+
+  private async uploadPendingKey(
+    request: PendingKeyRequest,
+    recipientKey: PendingRecipientPublicKey,
+    wrappedKey: WrappedPendingKey,
+    sessionGeneration: number
+  ): Promise<'continue' | 'stop'> {
+    // Echo the recipient's public-key version the CSK was wrapped against (#2420)
+    // so the server can skip + self-heal a wrap that raced a concurrent key reset.
+    const uploadBody: {
+      wrapped_keys: Record<string, string>;
+      key_fingerprint: string;
+      key_version?: number;
+      wrapped_key_versions?: Record<string, number>;
+    } = {
+      wrapped_keys: { [request.user_id]: wrappedKey.wrappedKey },
+      key_fingerprint: wrappedKey.keyFingerprint,
+    };
+    if (recipientKey.key_version !== undefined) {
+      uploadBody.wrapped_key_versions = { [request.user_id]: recipientKey.key_version };
+    }
+    if (request.key_version !== undefined && request.key_version > 0) {
+      uploadBody.key_version = request.key_version;
+    }
+
+    let res: Response;
+    try {
+      res = await apiFetch(`/api/v1/e2ee/keys/${request.channel_id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(uploadBody),
+      });
+    } catch (err) {
+      if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return 'stop';
+      console.warn('[E2EE] Failed to upload pending key distribution', {
+        channelId: request.channel_id,
+        userId: request.user_id,
+        error: (err as Error).message,
+      });
+      this.schedulePendingKeyRetry(sessionGeneration);
+      return 'stop';
+    }
+    if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return 'stop';
+    console.debug(
+      '[E2EE] Key distributed for',
+      request.user_id,
+      'channel',
+      request.channel_id,
+      res.status
+    );
+    if (!res.ok && pendingKeyResponseIsRetryable(res)) {
+      this.schedulePendingKeyRetry(sessionGeneration);
+      return 'stop';
+    }
+    return 'continue';
+  }
+
+  private schedulePendingKeyRetry(sessionGeneration: number): void {
+    if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return;
+    if (this.pendingKeyRetryTimer !== null) return;
+    this.pendingKeyRetryTimer = setTimeout(() => {
+      this.pendingKeyRetryTimer = null;
+      if (!this.isPendingKeyRequestSessionCurrent(sessionGeneration)) return;
+      void this.processPendingKeyRequests();
+    }, PENDING_KEY_RETRY_DELAY_MS);
   }
 
   /**
@@ -1225,37 +1468,82 @@ class E2EEService {
    * @param channelId - The channel to rotate keys for
    * @param newKeyVersion - The new epoch/version number
    * @param memberPublicKeys - Map of user_id → base64 public key for remaining members
+   * @param wrappedKeyVersions - Public-key versions for recipient freshness checks
+   * @param operationGuard - Lifecycle guard captured by the rotation caller
    */
   async rotateChannelKey(
     channelId: string,
     newKeyVersion: number,
-    memberPublicKeys: Map<string, string>
+    memberPublicKeys: Map<string, string>,
+    wrappedKeyVersions?: Record<string, number>,
+    operationGuard: E2EEChannelOperationGuard = this.createChannelOperationGuard(channelId)
   ): Promise<void> {
+    operationGuard.assertCurrent();
     const channelKey = await generateChannelKey();
-    const wrappedKeys: Record<string, string> = {};
-
+    operationGuard.assertCurrent();
+    const exportedChannelKey = await exportChannelKey(channelKey);
+    operationGuard.assertCurrent();
+    const keyFingerprint = arrayBufferToBase64(
+      await crypto.subtle.digest('SHA-256', exportedChannelKey)
+    );
+    operationGuard.assertCurrent();
+    const wrappedMembers: Array<[string, string]> = [];
     for (const [userId, publicKeyBase64] of memberPublicKeys) {
-      const publicKey = await importPublicKey(publicKeyBase64);
-      const wrapped = await wrapChannelKey(channelKey, publicKey);
-      wrappedKeys[userId] = wrapped;
+      operationGuard.assertCurrent();
+      try {
+        const publicKey = await importPublicKey(publicKeyBase64);
+        operationGuard.assertCurrent();
+        wrappedMembers.push([userId, await wrapChannelKey(channelKey, publicKey)]);
+      } catch (err) {
+        console.warn('[E2EE] Skipping member with invalid public key during rotation', {
+          userId,
+          error: (err as Error).message,
+        });
+      }
+      operationGuard.assertCurrent();
+    }
+    if (wrappedMembers.length === 0) {
+      throw new Error('channel key rotation has no valid recipients');
+    }
+    const wrappedBatches: Array<Record<string, string>> = [];
+    for (let start = 0; start < wrappedMembers.length; start += 500) {
+      wrappedBatches.push(Object.fromEntries(wrappedMembers.slice(start, start + 500)));
     }
 
-    const res = await apiFetch(`/api/v1/e2ee/keys/${channelId}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    for (const wrappedKeys of wrappedBatches) {
+      const batchKeyVersions: Record<string, number> = {};
+      for (const userId of Object.keys(wrappedKeys)) {
+        const keyVersion = wrappedKeyVersions?.[userId];
+        if (keyVersion !== undefined) batchKeyVersions[userId] = keyVersion;
+      }
+      const body: {
+        wrapped_keys: Record<string, string>;
+        key_version: number;
+        key_fingerprint: string;
+        wrapped_key_versions?: Record<string, number>;
+      } = {
         wrapped_keys: wrappedKeys,
         key_version: newKeyVersion,
-      }),
-    });
-
-    if (!res.ok) {
-      const data = await safeJson(res).catch(() => ({}));
-      console.debug('[E2EE] Key rotation distribution failed:', res.status, data);
-      // Non-fatal: another client may have already distributed (first-response-wins)
+        key_fingerprint: keyFingerprint,
+      };
+      if (Object.keys(batchKeyVersions).length > 0) body.wrapped_key_versions = batchKeyVersions;
+      operationGuard.assertCurrent();
+      const res = await apiFetch(`/api/v1/e2ee/keys/${channelId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      operationGuard.assertCurrent();
+      if (!res.ok) {
+        const data = await safeJson(res).catch(() => ({}));
+        operationGuard.assertCurrent();
+        console.debug('[E2EE] Key rotation distribution failed:', res.status, data);
+        throw new Error('channel key rotation distribution failed');
+      }
     }
 
     // Invalidate current cache so next encrypt/decrypt fetches the new key
+    operationGuard.assertCurrent();
     this.invalidateChannelKey(channelId);
   }
 
@@ -1290,6 +1578,10 @@ class E2EEService {
    * Same-session resets use this fence so late decrypts cannot outlive content cleanup.
    */
   fencePendingOperations(): void {
+    if (this.pendingKeyRetryTimer !== null) {
+      clearTimeout(this.pendingKeyRetryTimer);
+      this.pendingKeyRetryTimer = null;
+    }
     this.keySessionGeneration += 1;
     this.pendingKeyFetches.clear();
     this.pendingVersionedKeyFetches.clear();
@@ -1299,6 +1591,9 @@ class E2EEService {
    * Clear all keys on logout.
    */
   clearKeys(): void {
+    this.pendingKeyRequestProcessor = null;
+    this.pendingKeyRequestProcessorGeneration = null;
+    this.pendingKeyRequestRerun = false;
     this.fencePendingOperations();
     // Destruction marker for the init-commit fence (assertInitCommitCurrent):
     // bumped ONLY here, never in fencePendingOperations — see the field comment.

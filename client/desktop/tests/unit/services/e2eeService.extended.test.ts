@@ -11,7 +11,9 @@ import {
   generateChannelKey,
   wrapChannelKey,
   encryptMessage,
+  exportChannelKey,
   exportPublicKey,
+  arrayBufferToBase64,
 } from '@/renderer/utils/crypto';
 
 import { e2eeService } from '@/renderer/services/e2eeService';
@@ -540,6 +542,67 @@ describe('e2eeService — extended', () => {
       expect(mockApiFetch).not.toHaveBeenCalled();
     });
 
+    it('coalesces concurrent pending-key signals into one rerun', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+      const firstPending = deferred<Response>();
+      mockApiFetch
+        .mockImplementationOnce(() => firstPending.promise)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ pending_requests: [] }),
+        } as Response);
+
+      const first = e2eeService.processPendingKeyRequests();
+      const second = e2eeService.processPendingKeyRequests();
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+
+      firstPending.resolve({
+        ok: true,
+        json: () => Promise.resolve({ pending_requests: [] }),
+      } as Response);
+      await Promise.all([first, second]);
+
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not join a pending-key drain from a cleared session', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+      const stalePending = deferred<Response>();
+      mockApiFetch
+        .mockImplementationOnce(() => stalePending.promise)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ pending_requests: [] }),
+        } as Response);
+
+      const staleDrain = e2eeService.processPendingKeyRequests();
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+
+      e2eeService.clearKeys();
+      const nextAccountKeys = await generateRegistrationKeys('NextAccountPassword!');
+      await e2eeService.initialize(
+        'NextAccountPassword!',
+        nextAccountKeys.wrappedPrivateKey,
+        nextAccountKeys.keyDerivationSalt
+      );
+      await e2eeService.processPendingKeyRequests();
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+
+      stalePending.resolve({
+        ok: true,
+        json: () => Promise.resolve({ pending_requests: [] }),
+      } as Response);
+      await staleDrain;
+    });
+
     it('fetches and processes pending requests', async () => {
       await e2eeService.initialize(
         testPassword,
@@ -547,17 +610,25 @@ describe('e2eeService — extended', () => {
         regKeys.keyDerivationSalt
       );
 
-      const channelKey = await generateChannelKey();
-      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      const channelKeyV1 = await generateChannelKey();
+      const channelKeyV2 = await generateChannelKey();
+      const wrappedForV1 = await wrapChannelKey(channelKeyV1, regKeys.publicKey);
+      const wrappedForV2 = await wrapChannelKey(channelKeyV2, regKeys.publicKey);
       const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
 
       mockApiFetch
+        // Prime the stale current-key cache. The pending request below must not
+        // reuse this v1 key when its durable marker requests v2.
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ key: { wrapped_key: wrappedForV1, key_version: 1 } }),
+        } as Response)
         // pending-keys endpoint
         .mockResolvedValueOnce({
           ok: true,
           json: () =>
             Promise.resolve({
-              pending_requests: [{ user_id: 'user-new', channel_id: 'ch-pending' }],
+              pending_requests: [{ user_id: 'user-new', channel_id: 'ch-pending', key_version: 2 }],
             }),
         } as Response)
         // public key for the new member (carries the recipient's key_version)
@@ -565,10 +636,10 @@ describe('e2eeService — extended', () => {
           ok: true,
           json: () => Promise.resolve({ public_key: pubKeyBase64, key_version: 7 }),
         } as Response)
-        // getChannelKey (for wrapKeyForMember)
+        // exact v2 key for the pending-marker recovery
         .mockResolvedValueOnce({
           ok: true,
-          json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser } }),
+          json: () => Promise.resolve({ key: { wrapped_key: wrappedForV2, key_version: 2 } }),
         } as Response)
         // upload wrapped key
         .mockResolvedValueOnce({
@@ -576,19 +647,27 @@ describe('e2eeService — extended', () => {
           json: () => Promise.resolve({}),
         } as Response);
 
+      await e2eeService.getChannelKey('ch-pending');
       await e2eeService.processPendingKeyRequests();
 
-      // Should have made 4 API calls
-      expect(mockApiFetch.mock.calls.length).toBe(4);
+      // The v1 cache priming plus pending/public-key/v2/upload calls.
+      expect(mockApiFetch.mock.calls.length).toBe(5);
+      expect(mockApiFetch.mock.calls[3][0]).toBe('/api/v1/e2ee/keys/ch-pending?version=2');
 
       // #2420: the distribution POST echoes the recipient's public-key version the
       // CSK was wrapped against, activating the server-side recipient-freshness guard.
-      const uploadCall = mockApiFetch.mock.calls[3];
+      const uploadCall = mockApiFetch.mock.calls[4];
       expect(uploadCall[0]).toBe('/api/v1/e2ee/keys/ch-pending');
       const uploadBody = JSON.parse((uploadCall[1] as RequestInit).body as string);
       expect(Object.keys(uploadBody.wrapped_keys)).toEqual(['user-new']);
       expect(typeof uploadBody.wrapped_keys['user-new']).toBe('string');
+      expect(uploadBody.key_fingerprint).toBe(
+        arrayBufferToBase64(
+          await crypto.subtle.digest('SHA-256', await exportChannelKey(channelKeyV2))
+        )
+      );
       expect(uploadBody.wrapped_key_versions).toEqual({ 'user-new': 7 });
+      expect(uploadBody.key_version).toBe(2);
     });
 
     it('omits wrapped_key_versions when the server returns no key_version (#2420 fail-open)', async () => {
@@ -634,6 +713,7 @@ describe('e2eeService — extended', () => {
       expect(uploadCall[0]).toBe('/api/v1/e2ee/keys/ch-pending');
       const uploadBody = JSON.parse((uploadCall[1] as RequestInit).body as string);
       expect(Object.keys(uploadBody.wrapped_keys)).toEqual(['user-new']);
+      expect(uploadBody.key_fingerprint).toMatch(/^[A-Za-z0-9+/]{43}=$/);
       expect(uploadBody.wrapped_key_versions).toBeUndefined();
     });
 
@@ -654,24 +734,569 @@ describe('e2eeService — extended', () => {
       expect(mockApiFetch).toHaveBeenCalledTimes(1);
     });
 
-    it('handles pending-keys fetch failure', async () => {
+    it('retries a transient pending-keys fetch failure', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+
+        mockApiFetch.mockResolvedValueOnce({
+          ok: false,
+          status: 500,
+          statusText: 'Internal Server Error',
+          json: () => Promise.resolve({}),
+        } as Response);
+
+        // Should not throw
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch).toHaveBeenCalledTimes(2);
+        expect(mockApiFetch.mock.calls[1][0]).toBe('/api/v1/e2ee/pending-keys');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('retries a malformed pending-keys response', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: true,
+            headers: new Headers({ 'Content-Type': 'application/json' }),
+            json: () => Promise.reject(new Error('invalid JSON')),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: [] }),
+          } as Response);
+
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch.mock.calls[1][0]).toBe('/api/v1/e2ee/pending-keys');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('retries a rejected pending-keys fetch', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        mockApiFetch
+          .mockRejectedValueOnce(new TypeError('network unavailable'))
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: [] }),
+          } as Response);
+
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch.mock.calls[1][0]).toBe('/api/v1/e2ee/pending-keys');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('schedules a fresh retry after a same-session fence', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: false,
+            status: 500,
+            statusText: 'Internal Server Error',
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: false,
+            status: 500,
+            statusText: 'Internal Server Error',
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: [] }),
+          } as Response);
+
+        await e2eeService.processPendingKeyRequests();
+        e2eeService.fencePendingOperations();
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch).toHaveBeenCalledTimes(3);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('continues after a non-retryable pending recipient failure', async () => {
       await e2eeService.initialize(
         testPassword,
         regKeys.wrappedPrivateKey,
         regKeys.keyDerivationSalt
       );
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+      mockApiFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              pending_requests: [
+                { user_id: 'user-invalid', channel_id: 'ch-pending' },
+                { user_id: 'user-valid', channel_id: 'ch-pending' },
+              ],
+            }),
+        } as Response)
+        .mockResolvedValueOnce({ ok: false, status: 404 } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ public_key: pubKeyBase64, key_version: 1 }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser, key_version: 1 } }),
+        } as Response)
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({}) } as Response);
 
-      mockApiFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 500,
-        statusText: 'Internal Server Error',
-        json: () => Promise.resolve({}),
-      } as Response);
-
-      // Should not throw
       await e2eeService.processPendingKeyRequests();
 
-      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+      expect(mockApiFetch.mock.calls[4][0]).toBe('/api/v1/e2ee/keys/ch-pending');
+    });
+
+    it('retries after a pending recipient public-key network failure', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                pending_requests: [{ user_id: 'user-new', channel_id: 'ch-pending' }],
+              }),
+          } as Response)
+          .mockRejectedValueOnce(new Error('network unavailable'))
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: [] }),
+          } as Response);
+
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch.mock.calls[2][0]).toBe('/api/v1/e2ee/pending-keys');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('retries after a retryable pending recipient public-key response', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                pending_requests: [{ user_id: 'user-new', channel_id: 'ch-pending' }],
+              }),
+          } as Response)
+          .mockResolvedValueOnce({ ok: false, status: 500 } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: [] }),
+          } as Response);
+
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch.mock.calls[2][0]).toBe('/api/v1/e2ee/pending-keys');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('retries after a malformed pending recipient public-key response', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                pending_requests: [{ user_id: 'user-new', channel_id: 'ch-pending' }],
+              }),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.reject(new Error('invalid JSON')),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: [] }),
+          } as Response);
+
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch.mock.calls[2][0]).toBe('/api/v1/e2ee/pending-keys');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('continues after a recipient public key cannot be imported', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+      mockApiFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              pending_requests: [
+                { user_id: 'user-invalid', channel_id: 'ch-pending' },
+                { user_id: 'user-valid', channel_id: 'ch-pending' },
+              ],
+            }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ public_key: 'not-an-rsa-spki' }),
+        } as Response)
+        .mockResolvedValueOnce(keyResponse(wrappedForUser, 1))
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ public_key: pubKeyBase64, key_version: 1 }),
+        } as Response)
+        .mockResolvedValueOnce({ ok: true } as Response);
+
+      await e2eeService.processPendingKeyRequests();
+
+      expect(mockApiFetch.mock.calls[4][0]).toBe('/api/v1/e2ee/keys/ch-pending');
+    });
+
+    it('retries when the requested pending-key epoch is temporarily unavailable', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                pending_requests: [
+                  { user_id: 'user-new', channel_id: 'ch-pending', key_version: 2 },
+                ],
+              }),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ public_key: pubKeyBase64 }),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: false,
+            status: 500,
+            headers: new Headers(),
+            json: () => Promise.resolve({ code: 'INTERNAL_ERROR' }),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: [] }),
+          } as Response);
+
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch.mock.calls[3][0]).toBe('/api/v1/e2ee/pending-keys');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('retries after an exact pending-key fetch network failure', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                pending_requests: [
+                  { user_id: 'user-new', channel_id: 'ch-pending', key_version: 2 },
+                ],
+              }),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ public_key: pubKeyBase64 }),
+          } as Response)
+          .mockRejectedValueOnce(new TypeError('network unavailable'))
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: [] }),
+          } as Response);
+
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch.mock.calls[3][0]).toBe('/api/v1/e2ee/pending-keys');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('retries after a rate-limited exact pending-key fetch', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                pending_requests: [
+                  { user_id: 'user-new', channel_id: 'ch-pending', key_version: 2 },
+                ],
+              }),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ public_key: pubKeyBase64 }),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: false,
+            status: 429,
+            headers: new Headers(),
+            json: () => Promise.resolve({}),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: [] }),
+          } as Response);
+
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch.mock.calls[3][0]).toBe('/api/v1/e2ee/pending-keys');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('retries pending distribution after a retryable upload failure', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        const channelKey = await generateChannelKey();
+        const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+        const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                pending_requests: [{ user_id: 'user-new', channel_id: 'ch-pending' }],
+              }),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ public_key: pubKeyBase64, key_version: 1 }),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ key: { wrapped_key: wrappedForUser, key_version: 1 } }),
+          } as Response)
+          .mockResolvedValueOnce({ ok: false, status: 429 } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: [] }),
+          } as Response);
+
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch.mock.calls[4][0]).toBe('/api/v1/e2ee/pending-keys');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('retries pending distribution after an upload network failure', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        const channelKey = await generateChannelKey();
+        const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+        const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                pending_requests: [{ user_id: 'user-new', channel_id: 'ch-pending' }],
+              }),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ public_key: pubKeyBase64 }),
+          } as Response)
+          .mockResolvedValueOnce(keyResponse(wrappedForUser, 1))
+          .mockRejectedValueOnce(new Error('network unavailable'))
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: [] }),
+          } as Response);
+
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch.mock.calls[4][0]).toBe('/api/v1/e2ee/pending-keys');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('retries after an unexpected pending-requests payload shape', async () => {
+      vi.useFakeTimers();
+      try {
+        await e2eeService.initialize(
+          testPassword,
+          regKeys.wrappedPrivateKey,
+          regKeys.keyDerivationSalt
+        );
+        mockApiFetch
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: {} }),
+          } as Response)
+          .mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ pending_requests: [] }),
+          } as Response);
+
+        await e2eeService.processPendingKeyRequests();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(mockApiFetch.mock.calls[1][0]).toBe('/api/v1/e2ee/pending-keys');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not upload a wrapped key after a session fence', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+      const channelKey = await generateChannelKey();
+      const wrappedForUser = await wrapChannelKey(channelKey, regKeys.publicKey);
+      const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+      mockApiFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              pending_requests: [{ user_id: 'user-new', channel_id: 'ch-pending' }],
+            }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ public_key: pubKeyBase64 }),
+        } as Response)
+        .mockResolvedValueOnce(keyResponse(wrappedForUser, 1));
+
+      const originalEncrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+      const wrapStarted = deferred<void>();
+      const blockedWrap = deferred<ArrayBuffer>();
+      let blockWrap = true;
+      const encryptSpy = vi
+        .spyOn(crypto.subtle, 'encrypt')
+        .mockImplementation(async (algorithm, key, data) => {
+          if (algorithm.name === 'RSA-OAEP' && blockWrap) {
+            blockWrap = false;
+            wrapStarted.resolve(undefined);
+            return blockedWrap.promise;
+          }
+          return originalEncrypt(algorithm, key, data);
+        });
+
+      try {
+        const processing = e2eeService.processPendingKeyRequests();
+        await wrapStarted.promise;
+        e2eeService.fencePendingOperations();
+        blockedWrap.resolve(new Uint8Array(512).buffer);
+        await processing;
+      } finally {
+        encryptSpy.mockRestore();
+      }
+
+      expect(mockApiFetch).toHaveBeenCalledTimes(3);
     });
   });
 
@@ -699,7 +1324,7 @@ describe('e2eeService — extended', () => {
       );
     });
 
-    it('handles upload failure gracefully', async () => {
+    it('fails rotation when distribution upload fails', async () => {
       await e2eeService.initialize(
         testPassword,
         regKeys.wrappedPrivateKey,
@@ -715,10 +1340,153 @@ describe('e2eeService — extended', () => {
         json: () => Promise.resolve({ error: 'conflict' }),
       } as Response);
 
-      // Should not throw
-      await e2eeService.rotateChannelKey('ch-fail', 3, memberKeys);
+      await expect(e2eeService.rotateChannelKey('ch-fail', 3, memberKeys)).rejects.toThrow(
+        'channel key rotation distribution failed'
+      );
 
       expect(mockApiFetch).toHaveBeenCalled();
+    });
+
+    it('sends recipient key versions with a rotation batch', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+      mockApiFetch.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({}) } as Response);
+
+      await e2eeService.rotateChannelKey(
+        'ch-versioned-rotate',
+        3,
+        new Map([['user-1', pubKeyBase64]]),
+        { 'user-1': 7 }
+      );
+
+      const body = JSON.parse((mockApiFetch.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.wrapped_key_versions).toEqual({ 'user-1': 7 });
+    });
+
+    it('does not complete a rotation after its operation guard is fenced', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const uploadStarted = deferred<void>();
+      const upload = deferred<Response>();
+      mockApiFetch.mockImplementationOnce(() => {
+        uploadStarted.resolve(undefined);
+        return upload.promise;
+      });
+      const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+      const guard = e2eeService.createChannelRotationGuard('ch-fenced-rotate');
+      const rotation = e2eeService.rotateChannelKey(
+        'ch-fenced-rotate',
+        3,
+        new Map([['user-1', pubKeyBase64]]),
+        undefined,
+        guard
+      );
+
+      await uploadStarted.promise;
+      e2eeService.fencePendingOperations();
+      upload.resolve({ ok: true, json: () => Promise.resolve({}) } as Response);
+
+      await expect(rotation).rejects.toThrow('E2EE key session changed');
+    });
+
+    it('fences a rotation after channel access is revoked', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const guard = e2eeService.createChannelRotationGuard('ch-revoked-rotate');
+      e2eeService.revokeChannelAccess('ch-revoked-rotate');
+
+      expect(() => guard.assertCurrent()).toThrow('E2EE key unavailable: NOT_MEMBER');
+    });
+
+    it('splits rotation uploads at the server batch limit', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+      const memberKeys = new Map<string, string>(
+        Array.from({ length: 501 }, (_, index): [string, string] => [`user-${index}`, pubKeyBase64])
+      );
+      let uploadCount = 0;
+      mockApiFetch.mockImplementation(() => {
+        uploadCount += 1;
+        if (uploadCount === 1) e2eeService.invalidateChannelKey('ch-batched');
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({}) } as Response);
+      });
+
+      await e2eeService.rotateChannelKey(
+        'ch-batched',
+        3,
+        memberKeys,
+        undefined,
+        e2eeService.createChannelRotationGuard('ch-batched')
+      );
+
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+      const first = JSON.parse((mockApiFetch.mock.calls[0][1] as RequestInit).body as string);
+      const second = JSON.parse((mockApiFetch.mock.calls[1][1] as RequestInit).body as string);
+      expect(Object.keys(first.wrapped_keys)).toHaveLength(500);
+      expect(Object.keys(second.wrapped_keys)).toHaveLength(1);
+      expect(first.key_fingerprint).toMatch(/^[A-Za-z0-9+/]{43}=$/);
+      expect(second.key_fingerprint).toBe(first.key_fingerprint);
+    });
+
+    it('skips malformed member keys before uploading any batch', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      const pubKeyBase64 = await exportPublicKey(regKeys.publicKey);
+      const memberKeys = new Map<string, string>(
+        Array.from({ length: 501 }, (_, index): [string, string] => [
+          `user-${index}`,
+          index === 0 ? 'not-an-rsa-spki' : pubKeyBase64,
+        ])
+      );
+      mockApiFetch.mockResolvedValue({ ok: true, json: () => Promise.resolve({}) } as Response);
+
+      await e2eeService.rotateChannelKey('ch-batch-fail', 3, memberKeys);
+
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+      const wrappedKeys = JSON.parse(
+        (mockApiFetch.mock.calls[0][1] as RequestInit).body as string
+      ).wrapped_keys;
+      expect(Object.keys(wrappedKeys)).toHaveLength(500);
+      expect(wrappedKeys['user-0']).toBeUndefined();
+    });
+
+    it('rejects rotation when every member public key is malformed', async () => {
+      await e2eeService.initialize(
+        testPassword,
+        regKeys.wrappedPrivateKey,
+        regKeys.keyDerivationSalt
+      );
+
+      await expect(
+        e2eeService.rotateChannelKey(
+          'ch-no-valid-recipients',
+          3,
+          new Map([['user-invalid', 'not-an-rsa-spki']])
+        )
+      ).rejects.toThrow('channel key rotation has no valid recipients');
+      expect(mockApiFetch).not.toHaveBeenCalled();
     });
 
     it('invalidates channel cache after rotation', async () => {

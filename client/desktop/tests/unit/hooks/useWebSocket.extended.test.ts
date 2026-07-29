@@ -66,16 +66,52 @@ vi.mock('@/renderer/services/websocketService', () => ({
 }));
 
 const mockGetCurrentKeyVersion = vi.fn().mockReturnValue(0);
-const mockInvalidateChannelKey = vi.fn();
+let mockChannelGuardGeneration = 0;
+let mockRotationSessionGeneration = 0;
+let mockRotationAccessGeneration = 0;
+const mockInvalidateChannelKey = vi.fn(() => {
+  mockChannelGuardGeneration += 1;
+});
+const mockRevokeChannelAccess = vi.fn(() => {
+  mockRotationAccessGeneration += 1;
+});
+const mockFencePendingOperations = vi.fn(() => {
+  mockRotationSessionGeneration += 1;
+});
 const mockRotateChannelKey = vi.fn().mockResolvedValue(undefined);
+const mockCreateChannelOperationGuard = vi.fn(() => {
+  const generation = mockChannelGuardGeneration;
+  return {
+    assertCurrent: () => {
+      if (mockChannelGuardGeneration !== generation) throw new Error('stale channel operation');
+    },
+  };
+});
+const mockCreateChannelRotationGuard = vi.fn(() => {
+  const sessionGeneration = mockRotationSessionGeneration;
+  const accessGeneration = mockRotationAccessGeneration;
+  return {
+    assertCurrent: () => {
+      if (
+        mockRotationSessionGeneration !== sessionGeneration ||
+        mockRotationAccessGeneration !== accessGeneration
+      ) {
+        throw new Error('stale rotation operation');
+      }
+    },
+  };
+});
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
     processPendingKeyRequests: vi.fn().mockResolvedValue(undefined),
     decryptForChannel: vi.fn(),
     invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
-    revokeChannelAccess: vi.fn(),
+    revokeChannelAccess: vi.fn((...args: unknown[]) => mockRevokeChannelAccess(...args)),
+    fencePendingOperations: vi.fn((...args: unknown[]) => mockFencePendingOperations(...args)),
     getCurrentKeyVersion: (...args: unknown[]) => mockGetCurrentKeyVersion(...args),
+    createChannelOperationGuard: () => mockCreateChannelOperationGuard(),
+    createChannelRotationGuard: () => mockCreateChannelRotationGuard(),
     rotateChannelKey: (...args: unknown[]) => mockRotateChannelKey(...args),
   },
 }));
@@ -166,6 +202,9 @@ function triggerEpochValidation() {
 beforeEach(async () => {
   resetRuntimeServerBase();
   resetAllStores();
+  mockChannelGuardGeneration = 0;
+  mockRotationSessionGeneration = 0;
+  mockRotationAccessGeneration = 0;
   registeredHandlers.clear();
   connectionChangeHandlers = [];
   vi.clearAllMocks();
@@ -398,16 +437,13 @@ describe('useWebSocket — extended', () => {
         if (path === `/api/v1/e2ee/keys/${cachedChannelId}`) {
           return Promise.resolve({ ok: false, json: () => Promise.resolve({}) });
         }
-        if (path === '/api/v1/servers/server-2/members') {
+        if (path === '/api/v1/servers/server-2/member-public-keys') {
           return Promise.resolve({
             ok: true,
-            json: () => Promise.resolve({ members: [{ user_id: 'user-1' }] }),
-          });
-        }
-        if (path === '/api/v1/users/user-1/public-key') {
-          return Promise.resolve({
-            ok: true,
-            json: () => Promise.resolve({ public_key: 'mock-pk-1' }),
+            json: () =>
+              Promise.resolve({
+                members: [{ user_id: 'user-1', public_key: 'mock-pk-1', key_version: 7 }],
+              }),
           });
         }
         return Promise.resolve(defaultApiResponse());
@@ -419,11 +455,13 @@ describe('useWebSocket — extended', () => {
         triggerEpochValidation();
 
         await waitFor(() => {
-          expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/servers/server-2/members');
+          expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/servers/server-2/member-public-keys');
           expect(mockRotateChannelKey).toHaveBeenCalledWith(
             cachedChannelId,
             2,
-            new Map([['user-1', 'mock-pk-1']])
+            new Map([['user-1', 'mock-pk-1']]),
+            { 'user-1': 7 },
+            expect.any(Object)
           );
         });
       } finally {
@@ -674,15 +712,14 @@ describe('useWebSocket — extended', () => {
             Promise.resolve({
               members: [{ user_id: 'user-1' }, { user_id: 'user-2' }],
             }),
-        }) // fetch members
-        .mockResolvedValueOnce({
-          ok: true,
-          json: () => Promise.resolve({ public_key: 'mock-pk-1' }),
-        }) // user-1 public key
-        .mockResolvedValueOnce({
-          ok: true,
-          json: () => Promise.resolve({ public_key: 'mock-pk-2' }),
-        }); // user-2 public key
+          json: () =>
+            Promise.resolve({
+              members: [
+                { user_id: 'user-1', public_key: 'mock-pk-1' },
+                { user_id: 'user-2', public_key: 'mock-pk-2' },
+              ],
+            }),
+        }); // fetch member public keys
 
       // Dispatch the event
       globalThis.dispatchEvent(
@@ -698,6 +735,315 @@ describe('useWebSocket — extended', () => {
       expect(mockApiFetch).toHaveBeenCalled();
 
       vi.useRealTimers();
+    });
+
+    it('coalesces member public key lookups during a server rotation burst', async () => {
+      useAuthStore.getState().setAccessToken('test-token');
+      vi.useFakeTimers();
+      const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
+      useChannelStore.getState().addChannel({
+        id: 'ch-rotate-a',
+        server_id: 'server-1',
+        name: 'first',
+        type: 'text',
+        position: 0,
+        created_at: '',
+        updated_at: '',
+      });
+      useChannelStore.getState().addChannel({
+        id: 'ch-rotate-b',
+        server_id: 'server-1',
+        name: 'second',
+        type: 'text',
+        position: 1,
+        created_at: '',
+        updated_at: '',
+      });
+      mockApiFetch.mockImplementation((path: string) => {
+        if (path.startsWith('/api/v1/e2ee/keys/')) {
+          return Promise.resolve({ ok: false, json: () => Promise.resolve({}) });
+        }
+        if (path === '/api/v1/servers/server-1/member-public-keys') {
+          return Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                members: [{ user_id: 'user-1', public_key: 'mock-pk-1', key_version: 1 }],
+              }),
+          });
+        }
+        return Promise.resolve(defaultApiResponse());
+      });
+      const hook = renderHook(() => useWebSocket());
+
+      try {
+        globalThis.dispatchEvent(
+          new CustomEvent('e2ee-key-rotation', {
+            detail: { channelId: 'ch-rotate-a', newEpoch: 2 },
+          })
+        );
+        globalThis.dispatchEvent(
+          new CustomEvent('e2ee-key-rotation', {
+            detail: { channelId: 'ch-rotate-b', newEpoch: 2 },
+          })
+        );
+
+        await vi.advanceTimersByTimeAsync(1);
+
+        expect(
+          mockApiFetch.mock.calls.filter(
+            ([path]) => path === '/api/v1/servers/server-1/member-public-keys'
+          )
+        ).toHaveLength(1);
+        expect(mockRotateChannelKey).toHaveBeenCalledTimes(2);
+      } finally {
+        random.mockRestore();
+        hook.unmount();
+        vi.useRealTimers();
+      }
+    });
+
+    it('starts a queued rotation after an unrelated cache invalidation', async () => {
+      useAuthStore.getState().setAccessToken('test-token');
+      vi.useFakeTimers();
+      const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
+      useChannelStore.getState().addChannel({
+        id: 'ch-invalidate-before-rotation',
+        server_id: 'server-1',
+        name: 'queued rotation',
+        type: 'text',
+        position: 0,
+        created_at: '',
+        updated_at: '',
+      });
+      mockApiFetch.mockImplementation((path: string) =>
+        path.startsWith('/api/v1/e2ee/keys/')
+          ? Promise.resolve({ ok: false, json: () => Promise.resolve({}) })
+          : Promise.resolve({
+              ok: true,
+              json: () =>
+                Promise.resolve({
+                  members: [{ user_id: 'user-1', public_key: 'mock-pk-1', key_version: 1 }],
+                }),
+            })
+      );
+      const hook = renderHook(() => useWebSocket());
+
+      try {
+        globalThis.dispatchEvent(
+          new CustomEvent('e2ee-key-rotation', {
+            detail: { channelId: 'ch-invalidate-before-rotation', newEpoch: 2 },
+          })
+        );
+        mockInvalidateChannelKey('ch-invalidate-before-rotation');
+
+        await vi.advanceTimersByTimeAsync(1);
+
+        expect(mockRotateChannelKey).toHaveBeenCalledWith(
+          'ch-invalidate-before-rotation',
+          2,
+          expect.any(Map),
+          { 'user-1': 1 },
+          expect.any(Object)
+        );
+      } finally {
+        random.mockRestore();
+        hook.unmount();
+        vi.useRealTimers();
+      }
+    });
+
+    it.each(['a pending E2EE session fence', 'channel access revocation'])(
+      'drops a rotation queued before %s',
+      async (cause) => {
+        useAuthStore.getState().setAccessToken('test-token');
+        vi.useFakeTimers();
+        const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+        const { e2eeService } = await import('@/renderer/services/e2eeService');
+        (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
+        useChannelStore.getState().addChannel({
+          id: 'ch-stale-e2ee',
+          server_id: 'server-1',
+          name: 'stale E2EE',
+          type: 'text',
+          position: 0,
+          created_at: '',
+          updated_at: '',
+        });
+        const hook = renderHook(() => useWebSocket());
+
+        try {
+          globalThis.dispatchEvent(
+            new CustomEvent('e2ee-key-rotation', {
+              detail: { channelId: 'ch-stale-e2ee', newEpoch: 2 },
+            })
+          );
+          if (cause === 'a pending E2EE session fence') {
+            (
+              e2eeService as unknown as { fencePendingOperations: () => void }
+            ).fencePendingOperations();
+          } else {
+            (
+              e2eeService as unknown as { revokeChannelAccess: (channelId: string) => void }
+            ).revokeChannelAccess('ch-stale-e2ee');
+          }
+
+          await vi.advanceTimersByTimeAsync(1);
+
+          expect(mockApiFetch).not.toHaveBeenCalled();
+          expect(mockRotateChannelKey).not.toHaveBeenCalled();
+        } finally {
+          random.mockRestore();
+          hook.unmount();
+          vi.useRealTimers();
+        }
+      }
+    );
+
+    it('reports completion when rotation invalidates its operation guard', async () => {
+      useAuthStore.getState().setAccessToken('test-token');
+      vi.useFakeTimers();
+      const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+      const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
+      useChannelStore.getState().addChannel({
+        id: 'ch-complete-rotation',
+        server_id: 'server-1',
+        name: 'complete rotation',
+        type: 'text',
+        position: 0,
+        created_at: '',
+        updated_at: '',
+      });
+      mockRotateChannelKey.mockImplementationOnce(async () => {
+        mockChannelGuardGeneration += 1;
+      });
+      mockApiFetch.mockImplementation((path: string) =>
+        path.startsWith('/api/v1/e2ee/keys/')
+          ? Promise.resolve({ ok: false, json: () => Promise.resolve({}) })
+          : Promise.resolve({
+              ok: true,
+              json: () =>
+                Promise.resolve({
+                  members: [{ user_id: 'user-1', public_key: 'mock-pk-1', key_version: 1 }],
+                }),
+            })
+      );
+      const hook = renderHook(() => useWebSocket());
+
+      try {
+        globalThis.dispatchEvent(
+          new CustomEvent('e2ee-key-rotation', {
+            detail: { channelId: 'ch-complete-rotation', newEpoch: 2 },
+          })
+        );
+
+        await vi.advanceTimersByTimeAsync(1);
+
+        expect(debug).toHaveBeenCalledWith(
+          '[E2EE] Key rotation completed for',
+          'ch-complete-rotation',
+          'epoch',
+          2
+        );
+        expect(debug).not.toHaveBeenCalledWith('[E2EE] Key rotation failed', expect.any(Object));
+      } finally {
+        random.mockRestore();
+        hook.unmount();
+        vi.useRealTimers();
+      }
+    });
+
+    it('drops a rotation queued before an auth-generation change', async () => {
+      useAuthStore.getState().setAccessToken('test-token');
+      vi.useFakeTimers();
+      const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
+      useChannelStore.getState().addChannel({
+        id: 'ch-stale-auth',
+        server_id: 'server-1',
+        name: 'stale auth',
+        type: 'text',
+        position: 0,
+        created_at: '',
+        updated_at: '',
+      });
+      const hook = renderHook(() => useWebSocket());
+
+      try {
+        globalThis.dispatchEvent(
+          new CustomEvent('e2ee-key-rotation', {
+            detail: { channelId: 'ch-stale-auth', newEpoch: 2 },
+          })
+        );
+        useAuthStore.getState().setAccessToken('successor-token');
+
+        await vi.advanceTimersByTimeAsync(1);
+
+        expect(mockApiFetch).not.toHaveBeenCalled();
+        expect(mockRotateChannelKey).not.toHaveBeenCalled();
+      } finally {
+        random.mockRestore();
+        hook.unmount();
+        vi.useRealTimers();
+      }
+    });
+
+    it('stops an in-flight rotation when the runtime server changes', async () => {
+      useAuthStore.getState().setAccessToken('test-token');
+      vi.useFakeTimers();
+      const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
+      useChannelStore.getState().addChannel({
+        id: 'ch-stale-server',
+        server_id: 'server-1',
+        name: 'stale server',
+        type: 'text',
+        position: 0,
+        created_at: '',
+        updated_at: '',
+      });
+      let resolveKeyCheck: ((response: ReturnType<typeof defaultApiResponse>) => void) | undefined;
+      const keyCheck = new Promise<ReturnType<typeof defaultApiResponse>>((resolve) => {
+        resolveKeyCheck = resolve;
+      });
+      mockApiFetch.mockImplementation((path: string) =>
+        path === '/api/v1/e2ee/keys/ch-stale-server'
+          ? keyCheck
+          : Promise.resolve(defaultApiResponse())
+      );
+      const hook = renderHook(() => useWebSocket());
+
+      try {
+        globalThis.dispatchEvent(
+          new CustomEvent('e2ee-key-rotation', {
+            detail: { channelId: 'ch-stale-server', newEpoch: 2 },
+          })
+        );
+        await vi.advanceTimersByTimeAsync(1);
+        setRuntimeServerBase('https://successor-session.example');
+        resolveKeyCheck?.(defaultApiResponse());
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(
+          mockApiFetch.mock.calls.filter(
+            ([path]) => path === '/api/v1/servers/server-1/member-public-keys'
+          )
+        ).toHaveLength(0);
+        expect(mockRotateChannelKey).not.toHaveBeenCalled();
+      } finally {
+        random.mockRestore();
+        hook.unmount();
+        vi.useRealTimers();
+      }
     });
 
     it('cleans up rotation event listener on unmount', () => {

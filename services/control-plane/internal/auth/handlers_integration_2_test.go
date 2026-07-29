@@ -148,6 +148,27 @@ func TestRegisterInvalidBase64PublicKey(t *testing.T) {
 	assert.Contains(t, body["error"], "public key")
 }
 
+func TestRegisterRejectsNonSPKIPublicKey(t *testing.T) {
+	ts := setupTS(t)
+
+	_, priv, salt := testhelpers.E2EETestKeys()
+	payload := map[string]interface{}{
+		"email":               "nonspki@test.concord.chat",
+		"username":            "nonspki",
+		"password":            testPassword,
+		"age_confirmation":    true,
+		"public_key":          base64.StdEncoding.EncodeToString([]byte("not-an-rsa-spki")),
+		"wrapped_private_key": priv,
+		"key_derivation_salt": salt,
+	}
+	w := ts.DoRequest("POST", pathRegister, payload, nil)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Contains(t, body["error"], "public key")
+}
+
 func TestRegisterInvalidBase64WrappedPrivateKey(t *testing.T) {
 	ts := setupTS(t)
 
@@ -1244,6 +1265,11 @@ func TestRecoveryResetAccountDeletesChannelKeys(t *testing.T) {
 		channelID, user.ID, []byte("test-wrapped-key"),
 	)
 	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id) VALUES ($1, $2)`,
+		channelID, user.ID,
+	)
+	require.NoError(t, err)
 
 	// Verify key exists
 	var keyCount int
@@ -1274,6 +1300,10 @@ func TestRecoveryResetAccountDeletesChannelKeys(t *testing.T) {
 	).Scan(&keyCount)
 	require.NoError(t, err)
 	assert.Equal(t, 0, keyCount, "Channel keys should be deleted after account reset")
+	var markerCount int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM channel_initial_key_distributions WHERE channel_id = $1`, channelID).Scan(&markerCount))
+	assert.Zero(t, markerCount)
 }
 
 func TestRecoveryResetAccountRevokesAllSessions(t *testing.T) {

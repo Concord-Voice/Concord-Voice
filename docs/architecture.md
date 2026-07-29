@@ -438,6 +438,8 @@ erDiagram
     channels ||--o{ channel_keys : "wrapped per-member"
     channels ||--o{ pending_key_requests : "awaiting distribution"
     channels ||--o{ key_revocations : "epoch ledger"
+	channels ||--o| channel_initial_key_distributions : "incomplete epoch 1"
+	users o|--o{ channel_initial_key_distributions : "creator (nullable)"
     dm_conversations ||--o{ dm_channel_keys : "wrapped per-member"
     dm_conversations ||--o{ dm_pending_key_requests : "awaiting distribution"
     dm_conversations ||--o{ dm_key_revocations : "epoch ledger"
@@ -454,7 +456,15 @@ erDiagram
         UUID channel_id FK
         INTEGER revoked_epoch
         INTEGER successor_epoch
+        UUID rotation_distributor_id FK "nullable"
+        BOOLEAN rotation_distributor_claimed "nullable"
+        TEXT rotation_key_fingerprint "nullable; client assertion"
     }
+	channel_initial_key_distributions {
+		UUID channel_id PK, FK
+		UUID creator_id FK "nullable; ON DELETE SET NULL"
+		INTEGER key_version
+	}
     dm_channel_keys {
         UUID id PK
         UUID conversation_id FK
@@ -815,26 +825,44 @@ sequenceDiagram
 
     Note over A,B: Channel creation
     A->>A: Generate AES-256-GCM channel key (CSK)
-    A->>A: RSA-OAEP wrap CSK with each member's public key
-    A->>S: POST /api/v1/channels {wrapped_keys: {user_id: wrapped_CSK}}
-    Note over S: epoch fixed at 1 on creation (key_version)
+    A->>S: GET /api/v1/servers/{id}/member-public-keys
+    A->>A: RSA-OAEP wrap CSK for self + at most 499 other members (≤500 submitted)
+    A->>S: POST /api/v1/channels {wrapped_keys: initial batch, wrapped_key_versions}
+    Note over S: Persist only currently eligible viewers
+    S-->>A: channel ID (+ linked text channel ID for voice)
+    loop Remaining ≤500-viewer batches
+        A->>S: POST /api/v1/channels/{id}/keys {key_version: 1, wrapped_keys, wrapped_key_versions}
+        opt Voice channel
+            A->>S: POST /api/v1/channels/{linkedTextId}/keys {key_version: 1, wrapped_keys, wrapped_key_versions}
+        end
+    end
+    Note over A,S: Creator alone completes epoch 1; rotation waits for every eligible viewer
 
     Note over A,B: New member joins
     B->>S: Join (via invite)
     S->>S: Create pending_key_requests rows
     S-->>A: WS key_needed {server_id, user_id, channel_ids}
     A->>S: GET B's public key → re-wrap CSK with B's key
-    A->>S: POST /api/v1/channels/{id}/keys {user_id: B, wrapped_key}
+    A->>S: POST /api/v1/channels/{id}/keys {user_id: B, wrapped_key, wrapped_key_versions}
     S-->>B: WS key_delivered {channel_id}
 
-    Note over A,B: Revocation / rotation (e.g. member removed)
+    Note over A,B: Revocation / rotation
+    alt Manual rotation
+        A->>S: POST /api/v1/channels/{id}/rotate-key
+        S->>S: Record key_revocations {revoked_epoch: N, successor_epoch: N+1}
+    else Member removal or access revocation
+        S->>S: Record mandatory key_revocations {revoked_epoch: N, successor_epoch: N+1}
+    end
+    S-->>A: WS key_revocation {new_epoch: N+1}
     A->>A: Generate CSK' at epoch N+1
-    A->>S: Distribute wrapped CSK' to remaining members
-    A->>S: Record key_revocations {revoked_epoch: N, successor_epoch: N+1}
+    loop Remaining ≤500-member batches
+        A->>S: Distribute wrapped CSK' {key_version: N+1, key_fingerprint, wrapped_key_versions}
+        Note over S: First batch pins a client-asserted CSK fingerprint<br/>and queues eligible viewers missing N+1 for recovery;<br/>later batches/rewraps must assert the same fingerprint
+    end
     Note over S: New messages use epoch N+1<br/>removed member cannot derive CSK'
 ```
 
-Server channels (`channel_keys` / `key_revocations`) and DMs (`dm_channel_keys` / `dm_key_revocations`) use parallel epoch ledgers. Media E2EE mirrors the same epoch discipline: the media plane includes the authoritative `e2eeEpoch` in `join-room` responses and `user-joined` broadcasts, and the desktop client installs target-epoch decrypt keys on join/leave/epoch-sync before worker catch-up to reduce dropped encrypted video frames. Epoch gaps above the local ratchet limit fail closed and require rejoin instead of installing an epoch-0 fallback key. The `CHECK(successor_epoch > revoked_epoch)` constraint is present on `dm_key_revocations` (migration 000041); on `key_revocations` the constraint was added only in a re-declaration (000035) that is a no-op once the table exists from 000028, so it may be absent on already-migrated databases.
+Server channels (`channel_keys` / `key_revocations`) and DMs (`dm_channel_keys` / `dm_key_revocations`) use parallel epoch ledgers. `channel_initial_key_distributions` holds the creator-only distribution fence until all current eligible viewers have a durable key at its tracked epoch. A key reset deletes its creator-owned marker so another eligible holder can drain the resulting pending-key queue. Mandatory rotations advance that epoch and broadcast the successor immediately; if the sole creator was removed, compromised, or erased, the incomplete channel is deleted fail-closed rather than leaving the revoked epoch usable. Every desktop pending-key and rotation batch includes the recipient public-key versions used for its wraps, so the server can reject stale wraps after a reset. Media E2EE mirrors the same epoch discipline: the media plane includes the authoritative `e2eeEpoch` in `join-room` responses and `user-joined` broadcasts, and the desktop client installs target-epoch decrypt keys on join/leave/epoch-sync before worker catch-up to reduce dropped encrypted video frames. Epoch gaps above the local ratchet limit fail closed and require rejoin instead of installing an epoch-0 fallback key. The `CHECK(successor_epoch > revoked_epoch)` constraint is present on `dm_key_revocations` (migration 000041); on `key_revocations` the constraint was added only in a re-declaration (000035) that is a no-op once the table exists from 000028, so it may be absent on already-migrated databases.
 
 ### Account Erasure Cascade
 

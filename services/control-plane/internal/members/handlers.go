@@ -4,6 +4,7 @@ package members
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -22,19 +23,21 @@ import (
 )
 
 const (
-	errMsgInvalidServerID      = "Invalid server ID"
-	errMsgInvalidUserID        = "Invalid user ID"
-	errMsgInvalidRequestBody   = "Invalid request body"
-	errMsgInsufficientPerms    = "insufficient permissions"
-	errMsgFailedFetchMembers   = "Failed to fetch members"
-	errMsgFailedAddMember      = "Failed to add member"
-	errMsgFailedUpdateMember   = "Failed to update member"
-	errMsgFailedRemoveMember   = "Failed to remove member"
-	errMsgFailedBanMember      = "Failed to ban member"
-	errMsgFailedTimeoutMember  = "Failed to timeout member"
-	errMsgFailedGetServerOwner = "Failed to get server owner"
-	errMsgFailedCheckPerms     = "Failed to check permissions"
-	errMsgUserNotMember        = "User is not a member of this server"
+	errMsgInvalidServerID        = "Invalid server ID"
+	errMsgInvalidUserID          = "Invalid user ID"
+	errMsgInvalidRequestBody     = "Invalid request body"
+	errMsgInsufficientPerms      = "insufficient permissions"
+	errMsgFailedFetchMembers     = "Failed to fetch members"
+	errMsgMissingMemberPublicKey = "Every server member needs a public key for secure channel creation"
+	errMsgFailedAddMember        = "Failed to add member"
+	errMsgFailedUpdateMember     = "Failed to update member"
+	errMsgFailedRemoveMember     = "Failed to remove member"
+	errMsgFailedBanMember        = "Failed to ban member"
+	errMsgFailedTimeoutMember    = "Failed to timeout member"
+	errMsgFailedGetServerOwner   = "Failed to get server owner"
+	errMsgFailedCheckPerms       = "Failed to check permissions"
+	errMsgUserNotMember          = "User is not a member of this server"
+	errMsgNotMember              = "Not a member of this server"
 
 	minTimeoutDuration = time.Minute
 	maxTimeoutDuration = 7 * 24 * time.Hour
@@ -107,7 +110,7 @@ func NewHandler(db *sql.DB, log *logger.Logger, redisClient *redis.Client, hub *
 		hub:      hub,
 		resolver: resolver,
 		audit:    audit,
-		rotator:  keyrotation.NewRotator(db, log, hub),
+		rotator:  keyrotation.NewRotator(db, log, resolver.CanDistributeChannelKeyTx, websocket.KeyRevocationBroadcaster(hub)),
 	}
 }
 
@@ -155,6 +158,13 @@ type MemberWithUser struct {
 	TimedOutUntil  *time.Time       `json:"timed_out_until,omitempty"`
 }
 
+// MemberPublicKey is a server member's current public key for E2EE wrapping.
+type MemberPublicKey struct {
+	UserID     string `json:"user_id"`
+	PublicKey  string `json:"public_key"`
+	KeyVersion int    `json:"key_version"`
+}
+
 // ListMembers returns all members of a server
 func (h *Handler) ListMembers(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -183,7 +193,7 @@ func (h *Handler) ListMembers(c *gin.Context) {
 	}
 
 	if !isMember {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Not a member of this server"})
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
 		return
 	}
 
@@ -200,6 +210,83 @@ func (h *Handler) ListMembers(c *gin.Context) {
 	h.maskOwnerRole(c, serverID, userID, members)
 
 	c.JSON(http.StatusOK, gin.H{"members": members})
+}
+
+// ListMemberPublicKeys returns current E2EE public keys for the server's members.
+func (h *Handler) ListMemberPublicKeys(c *gin.Context) {
+	userID := c.GetString("user_id")
+	serverID := c.Param("id")
+
+	if _, err := uuid.Parse(serverID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
+		return
+	}
+
+	var isMember bool
+	err := h.db.QueryRow(
+		`SELECT EXISTS(
+			SELECT 1 FROM server_members
+			WHERE server_id = $1 AND user_id = $2
+		)`,
+		serverID, userID,
+	).Scan(&isMember)
+	if err != nil {
+		h.log.Error("Failed to check membership", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchMembers})
+		return
+	}
+	if !isMember {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
+		return
+	}
+
+	rows, err := h.db.Query(
+		`SELECT sm.user_id, pk.public_key, pk.key_version
+		 FROM server_members sm
+		 LEFT JOIN LATERAL (
+			SELECT public_key, key_version FROM public_keys
+			WHERE user_id = sm.user_id ORDER BY key_version DESC LIMIT 1
+		 ) pk ON TRUE
+		 WHERE sm.server_id = $1
+		 ORDER BY sm.joined_at ASC`,
+		serverID,
+	)
+	if err != nil {
+		h.log.Error("Failed to query member public keys", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchMembers})
+		return
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			h.log.Error("Failed to close member public key rows", "error", closeErr)
+		}
+	}()
+
+	keys := []MemberPublicKey{}
+	for rows.Next() {
+		var key MemberPublicKey
+		var publicKey []byte
+		var keyVersion sql.NullInt64
+		if err := rows.Scan(&key.UserID, &publicKey, &keyVersion); err != nil {
+			h.log.Error("Failed to scan member public key", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchMembers})
+			return
+		}
+		if !keyVersion.Valid {
+			c.JSON(http.StatusConflict, gin.H{"error": errMsgMissingMemberPublicKey})
+			return
+		}
+		key.PublicKey = base64.StdEncoding.EncodeToString(publicKey)
+		key.KeyVersion = int(keyVersion.Int64)
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		h.log.Error("Error iterating member public keys", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchMembers})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"members": keys})
 }
 
 // queryServerMembers fetches all members of a server with user details.
@@ -837,7 +924,7 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 
 	requesterExists, err := h.checkMembership(serverID, userID)
 	if err != nil || !requesterExists {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Not a member of this server"})
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
 		return
 	}
 	targetExists, err := h.checkMembership(serverID, targetUserID)
@@ -1169,11 +1256,9 @@ func (h *Handler) ListBans(c *gin.Context) {
 // #487 P2) — the rotation SQL + broadcast lives in ONE place (internal/keyrotation).
 func (h *Handler) triggerKeyRevocationsForServer(serverID, removedUserID, actorID string) {
 	rows, err := h.db.Query(
-		`SELECT c.id, COALESCE(MAX(ck.key_version), 1)
+		`SELECT c.id
 		 FROM channels c
-		 LEFT JOIN channel_keys ck ON ck.channel_id = c.id
-		 WHERE c.server_id = $1
-		 GROUP BY c.id`,
+		 WHERE c.server_id = $1`,
 		serverID,
 	)
 	if err != nil {
@@ -1182,18 +1267,15 @@ func (h *Handler) triggerKeyRevocationsForServer(serverID, removedUserID, actorI
 	}
 	defer func() { _ = rows.Close() }()
 
-	serverUUID, _ := uuid.Parse(serverID)
-
 	for rows.Next() {
 		var channelID string
-		var maxEpoch int
-		if err := rows.Scan(&channelID, &maxEpoch); err != nil {
+		if err := rows.Scan(&channelID); err != nil {
 			h.log.Error("Failed to scan channel for key revocation", "error", err)
 			continue
 		}
 
 		// Per-channel rotation with the member-removal payload shape.
-		h.rotator.RevokeChannelKeyEpoch(serverID, serverUUID, channelID, maxEpoch, "member_removal", actorID, removedUserID)
+		h.rotator.RevokeChannelKeyEpoch(channelID, "member_removal", actorID, removedUserID)
 	}
 
 	h.log.Info("Key revocations triggered for member removal",

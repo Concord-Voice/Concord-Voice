@@ -498,6 +498,10 @@ func parseReplaceKeysRequest(c *gin.Context) (req ReplaceKeysRequest, wrapped, s
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid public_key format"})
 		return req, nil, nil, nil, false
 	}
+	if err := auth.ValidateE2EEPublicKey(publicKey); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return req, nil, nil, nil, false
+	}
 
 	if req.KeyDerivationAlg == "" {
 		req.KeyDerivationAlg = "argon2id"

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/lib/pq"
+
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
 )
@@ -25,6 +27,10 @@ type AccountDeleter interface {
 	DeleteAccount(ctx context.Context, userID string) error
 }
 
+// ChannelDeletedBroadcaster notifies connected server members after account
+// erasure removes an incomplete channel.
+type ChannelDeletedBroadcaster func(serverID, channelID string)
+
 // AccountService is the concrete AccountDeleter backed by the primary
 // Postgres pool. Its erasure transaction starts only after sender-gated
 // activity cleanup has completed.
@@ -32,6 +38,7 @@ type AccountService struct {
 	db              *sql.DB
 	log             *logger.Logger
 	activityCleanup *Handler
+	channelDeleted  ChannelDeletedBroadcaster
 }
 
 // NewAccountService constructs an AccountService. The logger is optional;
@@ -48,19 +55,24 @@ func (s *AccountService) SetActivitySettingsCleanupHandler(handler *Handler) {
 	s.activityCleanup = handler
 }
 
+// SetChannelDeletedBroadcaster binds the post-commit incomplete-channel event.
+func (s *AccountService) SetChannelDeletedBroadcaster(broadcaster ChannelDeletedBroadcaster) {
+	s.channelDeleted = broadcaster
+}
+
 // DeleteAccount first resumes any durable activity-policy cleanup while holding
 // the sender gate, then performs the database erasure inside one transaction:
-//  1. DELETE FROM users WHERE id = $1 — cascades through every user_id-FK
-//     table configured with ON DELETE CASCADE. If zero rows match, the user
-//     is already gone and we return ErrUserNotFound WITHOUT writing an audit
-//     row (nothing happened to audit).
-//  2. INSERT an audit row into account_deletions with user_id = NULL. We
+//  1. Lock the user and delete any incomplete E2EE channels they created, so
+//     the post-commit caller can notify their server members.
+//  2. DELETE FROM users WHERE id = $1 — cascades through every remaining
+//     user_id-FK table configured with ON DELETE CASCADE.
+//  3. INSERT an audit row into account_deletions with user_id = NULL. We
 //     cannot reference the just-deleted user_id at this point — the FK
 //     check would fire on insert and fail — but a NULL is the intended
 //     post-commit state anyway (the schema's ON DELETE SET NULL would have
 //     nulled it automatically had we ordered INSERT before DELETE). The
 //     audit row captures the deletion event and timestamp.
-//  3. COMMIT.
+//  4. COMMIT.
 //
 // The DELETE-then-INSERT ordering makes the retry-after-success path behave
 // correctly: a second call gets RowsAffected = 0, returns ErrUserNotFound,
@@ -114,30 +126,74 @@ func (s *AccountService) deleteAccount(ctx context.Context, userID string) error
 			}
 		}
 	}()
+	channelIDs, serverIDs, err := s.deleteAccountTx(ctx, tx, userID)
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("delete account: commit: %w", err)
+	}
+	if s.channelDeleted != nil {
+		for index, channelID := range channelIDs {
+			s.channelDeleted(serverIDs[index], channelID)
+		}
+	}
+	return nil
+}
+
+func (s *AccountService) deleteAccountTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+) (pq.StringArray, pq.StringArray, error) {
+	var lockedUserID string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&lockedUserID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, ErrUserNotFound
+		}
+		return nil, nil, fmt.Errorf("delete account: lock user: %w", err)
+	}
+
+	var channelIDs, serverIDs pq.StringArray
+	if err := tx.QueryRowContext(ctx, `
+		WITH incomplete AS (
+			SELECT channel_id
+			FROM channel_initial_key_distributions
+			WHERE creator_id = $1
+		)
+		SELECT COALESCE(array_agg(c.id::text ORDER BY c.id), ARRAY[]::text[]),
+		       COALESCE(array_agg(c.server_id::text ORDER BY c.id), ARRAY[]::text[])
+		FROM channels c
+		WHERE c.id IN (SELECT channel_id FROM incomplete)
+		   OR c.linked_voice_channel_id IN (SELECT channel_id FROM incomplete)`, lockedUserID,
+	).Scan(&channelIDs, &serverIDs); err != nil {
+		return nil, nil, fmt.Errorf("delete account: list incomplete channels: %w", err)
+	}
+	if len(channelIDs) > 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE id = ANY($1::uuid[])`, pq.Array(channelIDs)); err != nil {
+			return nil, nil, fmt.Errorf("delete account: delete incomplete channels: %w", err)
+		}
+	}
 
 	result, err := tx.ExecContext(ctx,
 		`DELETE FROM users WHERE id = $1`,
-		userID,
+		lockedUserID,
 	)
 	if err != nil {
-		return fmt.Errorf("delete account: delete user: %w", err)
+		return nil, nil, fmt.Errorf("delete account: delete user: %w", err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("delete account: rows affected: %w", err)
+		return nil, nil, fmt.Errorf("delete account: rows affected: %w", err)
 	}
 	if rows == 0 {
-		return ErrUserNotFound
+		return nil, nil, ErrUserNotFound
 	}
 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO account_deletions (user_id) VALUES (NULL)`,
 	); err != nil {
-		return fmt.Errorf("delete account: insert audit: %w", err)
+		return nil, nil, fmt.Errorf("delete account: insert audit: %w", err)
 	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("delete account: commit: %w", err)
-	}
-	return nil
+	return channelIDs, serverIDs, nil
 }

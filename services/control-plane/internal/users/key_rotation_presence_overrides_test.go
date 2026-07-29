@@ -695,7 +695,7 @@ func TestReplaceMyKeysPresenceGateFailureClassification(t *testing.T) {
 		handler := users.NewHandler(db, logger.NewWithWriter(io.Discard), nil, nil, nil, testCredFence(t, db), nil)
 		handler.SetPresenceHistory(presencehistory.NewService(db, presencehistory.DisclosureState{}, false))
 
-		response := invokeReplaceMyKeysForPresenceGate(handler, uuid.New())
+		response := invokeReplaceMyKeysForPresenceGate(t, handler, uuid.New())
 		assert.Equal(t, http.StatusServiceUnavailable, response.Code)
 	})
 
@@ -707,7 +707,7 @@ func TestReplaceMyKeysPresenceGateFailureClassification(t *testing.T) {
 		require.NoError(t, service.BindDelivery(immediatePresenceDelivery{}))
 		handler.SetPresenceHistory(service)
 
-		response := invokeReplaceMyKeysForPresenceGate(handler, uuid.New())
+		response := invokeReplaceMyKeysForPresenceGate(t, handler, uuid.New())
 		assert.Equal(t, http.StatusInternalServerError, response.Code)
 	})
 
@@ -736,18 +736,21 @@ func TestReplaceMyKeysPresenceGateFailureClassification(t *testing.T) {
 	})
 }
 
-func invokeReplaceMyKeysForPresenceGate(handler *users.Handler, senderID uuid.UUID) *httptest.ResponseRecorder {
-	body := bytes.NewBufferString(`{
-		"wrapped_private_key":"a2V5",
-		"key_derivation_salt":"c2FsdA==",
-		"public_key":"cHVibGlj",
-		"current_password":"CurrentPassword123!",
-		"acknowledge_data_loss":true
-	}`)
+func invokeReplaceMyKeysForPresenceGate(t *testing.T, handler *users.Handler, senderID uuid.UUID) *httptest.ResponseRecorder {
+	t.Helper()
+	publicKey, wrappedKey, salt := testhelpers.E2EETestKeys()
+	body, err := json.Marshal(map[string]interface{}{
+		keyWrappedPrivateKey:    wrappedKey,
+		keyKeyDerivationSalt:    salt,
+		"public_key":            publicKey,
+		keyCurrentPassword:      "CurrentPassword123!", // pragma: allowlist secret
+		"acknowledge_data_loss": true,
+	})
+	require.NoError(t, err)
 	response := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(response)
 	c.Set("user_id", senderID.String())
-	c.Request = httptest.NewRequest(http.MethodPut, urlUsersMeKeys, body)
+	c.Request = httptest.NewRequest(http.MethodPut, urlUsersMeKeys, bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	handler.ReplaceMyKeys(c)
 	return response

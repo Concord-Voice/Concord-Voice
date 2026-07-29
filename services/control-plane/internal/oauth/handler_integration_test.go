@@ -374,7 +374,7 @@ func TestCompleteRegistration_HappyPath(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("wrapped-priv-key-bytes")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("salt-bytes-xxxxxxx")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("public-key-bytes")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -442,7 +442,7 @@ func TestCompleteRegistration_ConsumedTokenNotReusable(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("wrapped-priv-key-bytes")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("salt-bytes-xxxxxxx")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("public-key-bytes")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -491,7 +491,7 @@ func TestCompleteRegistration_NormalizesUsername(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("wrapped-priv-key-bytes")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("salt-bytes-xxxxxxx")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("public-key-bytes")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -529,7 +529,7 @@ func TestCompleteRegistration_ReplayedSSOToken_Rejected(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("k")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("s")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("p")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -588,7 +588,7 @@ func TestCompleteRegistration_BranchMismatch_Rejected(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("k")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("s")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("p")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -636,7 +636,7 @@ func TestCompleteRegistration_InvalidKeyMaterial(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": "!!!not-base64!!!",
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("s")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("p")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -679,7 +679,7 @@ func TestCompleteRegistration_EmailTaken_409(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("k")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("s")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("p")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -720,7 +720,7 @@ func TestCompleteRegistration_UsernameTaken_409(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("k")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("s")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("p")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -765,7 +765,7 @@ func TestCompleteRegistration_UsernameTaken_CaseVariant_409(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("k")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("s")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("p")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -805,7 +805,7 @@ func TestCompleteRegistration_TokenIssuanceFails(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("k")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("s")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("p")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -856,7 +856,7 @@ func TestCompleteRegistration_HashFails(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("k")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("s")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("p")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -897,7 +897,7 @@ func TestCompleteRegistration_MalformedRedisJSON(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("k")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("s")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("p")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -939,7 +939,7 @@ func TestCompleteRegistration_InvalidUsername(t *testing.T) {
 		"password":            "TestPassphrase!12345", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("k")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("s")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("p")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -995,7 +995,7 @@ func TestCompleteRegistration_InvalidPassword(t *testing.T) {
 		"password":            "passwordpassword123", // pragma: allowlist secret
 		"wrapped_private_key": base64.StdEncoding.EncodeToString([]byte("k")),
 		"key_derivation_salt": base64.StdEncoding.EncodeToString([]byte("s")),
-		"public_key":          base64.StdEncoding.EncodeToString([]byte("p")),
+		"public_key":          testhelpers.E2EETestPublicKey,
 	}
 	bodyJSON, err := json.Marshal(body)
 	require.NoError(t, err)

@@ -43,6 +43,34 @@ func TestRevokeTempAccess_RevokesGrant(t *testing.T) {
 	assert.Equal(t, 1, keyRevocationCount(t, ts.DB, channelID), "CSK rotated on revoke")
 }
 
+func TestRevokeTempAccess_RotatesDuringInitialDistribution(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "tar_defer_owner")
+	mover := ts.CreateTestUser(t, "tar_defer_mover")
+	target := ts.CreateTestUser(t, "tar_defer_target")
+	serverID := ts.CreateTestServer(t, owner.ID, "RevokeTemp Deferred")
+	ts.AddMemberToServer(t, serverID, mover.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+	moverRole := ts.CreateTestRole(t, serverID, "Organizer", 5, int64(rbac.PermMoveMembers))
+	ts.AssignRoleToUser(t, serverID, mover.ID, moverRole)
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-tar-defer")
+	seedTempGrant(t, ts, serverID, channelID, target.ID)
+	_, err := ts.DB.Exec(
+		`INSERT INTO channel_initial_key_distributions (channel_id, creator_id) VALUES ($1, $2)`, channelID, owner.ID,
+	)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("DELETE", voiceEnforcePath(serverID, target.ID, pathTempAccess),
+		map[string]interface{}{"channel_id": channelID}, testhelpers.AuthHeaders(mover.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+	var markerEpoch int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT key_version FROM channel_initial_key_distributions WHERE channel_id = $1`, channelID,
+	).Scan(&markerEpoch))
+	assert.Equal(t, 2, markerEpoch)
+	assert.Equal(t, 1, keyRevocationCount(t, ts.DB, channelID))
+}
+
 // TestRevokeTempAccess_PermanentGrantNoOp: when only a PERMANENT override exists
 // for (user, channel), the revoke is a no-op → 200 {revoked:false}, the permanent
 // override survives, and no CSK rotation happens.
