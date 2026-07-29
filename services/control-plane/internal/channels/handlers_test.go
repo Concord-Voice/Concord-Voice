@@ -1164,6 +1164,90 @@ func TestDistributeChannelKeys_QueuesRemainingRotationRecipients(t *testing.T) {
 	}
 }
 
+// regression for #2533: duplicate rotation batches must reconcile recovery state.
+func TestDistributeChannelKeys_DuplicateRotationWakesHolderForExistingPendingRecipient(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	holder := ts.CreateTestUser(t, "duplicate-rotation-holder")
+	missing := ts.CreateTestUser(t, "duplicate-rotation-missing")
+	ts.AddMemberToServer(t, serverID, holder.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, missing.ID, roleMember)
+
+	tx, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.Exec(
+		`INSERT INTO key_revocations (
+			channel_id, revoked_epoch, successor_epoch, reason, revoked_by,
+			rotation_distributor_id, rotation_distributor_claimed, rotation_key_fingerprint
+		 ) VALUES ($1, 1, 2, 'member_removal', $2, $3, TRUE, $4)`,
+		channelID, owner.ID, holder.ID, rotationFingerprint,
+	)
+	require.NoError(t, err)
+	_, err = tx.Exec(`SELECT set_config('concord.rotation_distributor_id', $1, TRUE)`, holder.ID)
+	require.NoError(t, err)
+	_, err = tx.Exec(`SELECT set_config('concord.rotation_key_fingerprint', $1, TRUE)`, rotationFingerprint)
+	require.NoError(t, err)
+	_, err = tx.Exec(
+		`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version)
+		 VALUES ($1, $2, 'owner-epoch-two', 2), ($1, $3, 'holder-epoch-two', 2)`,
+		channelID, owner.ID, holder.ID,
+	)
+	require.NoError(t, err)
+	_, err = tx.Exec(
+		`INSERT INTO pending_key_requests (channel_id, user_id)
+		 VALUES ($1, $2), ($1, $3)`,
+		channelID, holder.ID, missing.ID,
+	)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	wsServer := httptest.NewServer(ts.Router)
+	t.Cleanup(wsServer.Close)
+	conn, _, err := gorillaWS.DefaultDialer.Dial(
+		"ws"+strings.TrimPrefix(wsServer.URL, "http")+"/api/v1/ws?token="+url.QueryEscape(holder.AccessToken), nil,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	require.Eventually(t, func() bool {
+		return ts.Hub.GetUserClientCount(uuid.MustParse(holder.ID)) > 0
+	}, time.Second, 10*time.Millisecond)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Second)))
+	_, _, err = conn.ReadMessage() // connection bootstrap
+	require.NoError(t, err)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{holder.ID: testhelpers.ValidCiphertext()},
+		"key_version":  2,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(holder.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, holder.ID),
+		"a current-epoch duplicate holder must not retain a stale pending row")
+	assert.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, missing.ID),
+		"an eligible recipient missing the epoch must remain pending")
+
+	foundKeyNeeded := false
+	deadline := time.Now().Add(2 * time.Second)
+	for !foundKeyNeeded && time.Now().Before(deadline) {
+		require.NoError(t, conn.SetReadDeadline(deadline))
+		_, frame, readErr := conn.ReadMessage()
+		if readErr != nil {
+			if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+				break
+			}
+			require.NoError(t, readErr)
+		}
+		var message struct {
+			Type string `json:"type"`
+		}
+		require.NoError(t, json.Unmarshal(frame, &message))
+		foundKeyNeeded = message.Type == "key_needed"
+	}
+	assert.True(t, foundKeyNeeded, "a duplicate holder must be woken for an existing missing recipient")
+}
+
 func TestDistributeChannelKeys_DoesNotClaimRotationWithoutRecipient(t *testing.T) {
 	ts, owner, _, channelID := setupEncryptedChannel(t)
 	_, err := ts.DB.Exec(

@@ -2042,7 +2042,7 @@ type channelKeyDistributionState struct {
 	serverID                      string
 	keyVersion                    int
 	initialKeyVersion             int
-	queuedRecipients              int64
+	rotationRecipientsPending     bool
 	initialDistributionIncomplete bool
 }
 
@@ -2088,11 +2088,9 @@ func (h *Handler) resolveChannelKeyDistributionVersion(ctx context.Context, tx *
 	if state.keyVersion <= 1 {
 		return state, nil
 	}
-	queuedRecipients, err := h.enqueueRotationKeyRecipients(ctx, tx, state.serverID, req.channelID, state.keyVersion)
-	if err != nil {
+	if err := h.enqueueRotationKeyRecipients(ctx, tx, state.serverID, req.channelID, state.keyVersion); err != nil {
 		return state, err
 	}
-	state.queuedRecipients = queuedRecipients
 	return state, nil
 }
 
@@ -2122,6 +2120,13 @@ func (h *Handler) completeChannelKeyDistribution(ctx context.Context, tx *sql.Tx
 		}
 		state.initialDistributionIncomplete = incomplete
 	}
+	if state.keyVersion > 1 && state.initialKeyVersion == 0 {
+		pending, err := h.rotationKeyRecipientsPending(ctx, tx, state.serverID, req.channelID, state.keyVersion)
+		if err != nil {
+			return state, err
+		}
+		state.rotationRecipientsPending = pending
+	}
 	if err := tx.Commit(); err != nil {
 		return state, fmt.Errorf("commit distribution tx: %w", err)
 	}
@@ -2130,20 +2135,23 @@ func (h *Handler) completeChannelKeyDistribution(ctx context.Context, tx *sql.Tx
 
 func (h *Handler) notifyChannelKeyDistribution(req channelKeyDistributionRequest, state channelKeyDistributionState, tally channelDistributionTally) {
 	for _, memberUserID := range tally.delivered {
-		// Pending-request cleanup is best-effort POST-commit: the key row is
-		// already durable, and a failed DELETE inside the tx would poison the
-		// whole batch (25P02) for what is only retry-safe housekeeping.
-		_, _ = h.db.Exec(
+		// Newly delivered rows are best-effort POST-commit: the key row is already
+		// durable, and a failed DELETE inside the tx would poison the whole batch
+		// (25P02) for what is only retry-safe housekeeping.
+		if _, err := h.db.Exec(
 			`DELETE FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`,
 			req.channelID, memberUserID,
-		)
+		); err != nil {
+			h.log.Warn("key distribution: delivered pending cleanup failed",
+				"channel_id", sanitizeID(req.channelID), "user_id", sanitizeID(memberUserID), "error", err)
+		}
 		h.notifyKeyDelivered(req.channelID, memberUserID)
 	}
 	if state.initialDistributionIncomplete {
 		// A marker remains creator-only even after it advances. Wake that
 		// creator, not a recipient that happens to hold its successor key.
 		h.notifyKeyNeeded(req.actorID, state.serverID, req.channelID)
-	} else if state.keyVersion > 1 && state.queuedRecipients > 0 && len(tally.holders) > 0 {
+	} else if state.keyVersion > 1 && state.rotationRecipientsPending && len(tally.holders) > 0 {
 		// The holder received or already had the successor key, so it can drain
 		// the durable queue if the original batching renderer has gone away.
 		h.notifyKeyNeeded(tally.holders[0], state.serverID, req.channelID)
@@ -2189,21 +2197,32 @@ func (h *Handler) distributeChannelKeysToMembers(ctx context.Context, req channe
 }
 
 // enqueueRotationKeyRecipients makes an established successor CSK recoverable
-// if a later client batch fails or its renderer reloads. Successful batches
-// remove their rows after commit.
-func (h *Handler) enqueueRotationKeyRecipients(ctx context.Context, tx *sql.Tx, serverID, channelID string, keyVersion int) (int64, error) {
+// if a later client batch fails or its renderer reloads. Current holders first
+// clear stale requests in this transaction; successful new deliveries remove
+// their rows after commit.
+func (h *Handler) enqueueRotationKeyRecipients(ctx context.Context, tx *sql.Tx, serverID, channelID string, keyVersion int) error {
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM pending_key_requests pending
+		USING channel_keys key
+		WHERE pending.channel_id = $1
+		  AND key.channel_id = pending.channel_id
+		  AND key.user_id = pending.user_id
+		  AND key.key_version = $2
+	`, channelID, keyVersion); err != nil {
+		return fmt.Errorf("clear delivered rotation key requests: %w", err)
+	}
 	recipients, err := h.initialKeyRecipients(ctx, tx, serverID, channelID)
 	if err != nil {
-		return 0, fmt.Errorf("list rotation key recipients: %w", err)
+		return fmt.Errorf("list rotation key recipients: %w", err)
 	}
 	recipientIDs := make([]string, 0, len(recipients))
 	for userID := range recipients {
 		recipientIDs = append(recipientIDs, userID)
 	}
 	if len(recipientIDs) == 0 {
-		return 0, nil
+		return nil
 	}
-	result, err := tx.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO pending_key_requests (channel_id, user_id)
 		SELECT $1, recipient.user_id
 		FROM unnest($2::uuid[]) AS recipient(user_id)
@@ -2214,15 +2233,35 @@ func (h *Handler) enqueueRotationKeyRecipients(ctx context.Context, tx *sql.Tx, 
 			  AND key.key_version = $3
 		)
 		ON CONFLICT (channel_id, user_id) DO NOTHING
-	`, channelID, pq.Array(recipientIDs), keyVersion)
-	if err != nil {
-		return 0, fmt.Errorf("enqueue rotation key recipients: %w", err)
+	`, channelID, pq.Array(recipientIDs), keyVersion); err != nil {
+		return fmt.Errorf("enqueue rotation key recipients: %w", err)
 	}
-	queuedRecipients, err := result.RowsAffected()
+	return nil
+}
+
+func (h *Handler) rotationKeyRecipientsPending(ctx context.Context, tx *sql.Tx, serverID, channelID string, keyVersion int) (bool, error) {
+	recipients, err := h.initialKeyRecipients(ctx, tx, serverID, channelID)
 	if err != nil {
-		return 0, fmt.Errorf("count queued rotation key recipients: %w", err)
+		return false, fmt.Errorf("list rotation key recipients: %w", err)
 	}
-	return queuedRecipients, nil
+	recipientIDs := make([]string, 0, len(recipients))
+	for userID := range recipients {
+		recipientIDs = append(recipientIDs, userID)
+	}
+	var pending bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM unnest($2::uuid[]) AS recipient(user_id)
+			WHERE NOT EXISTS (
+				SELECT 1 FROM channel_keys key
+				WHERE key.channel_id = $1
+				  AND key.user_id = recipient.user_id
+				  AND key.key_version = $3
+			)
+		)`, channelID, pq.Array(recipientIDs), keyVersion).Scan(&pending); err != nil {
+		return false, fmt.Errorf("check pending rotation key recipients: %w", err)
+	}
+	return pending, nil
 }
 
 func (h *Handler) authorizeInitialKeyDistribution(ctx context.Context, tx *sql.Tx, channelID, actorID string, requestedKeyVersion *int) (int, error) {
