@@ -1518,7 +1518,7 @@ func (h *Handler) attemptGracePeriodRecovery(c *gin.Context, tokenHash string) b
 		// pre-check here — that was the exact non-atomic pattern this work closes,
 		// and a disable committing before the tx's locked read yields a 403 there.
 		h.log.Info("Refresh token replay within grace period, recovering session",
-			"user_id", revokedUserID, "revoked_ago_ms", time.Since(revokedAt).Milliseconds(), "ip", requestIP)
+			"user_id", revokedUserID, "revoked_ago_ms", time.Since(revokedAt).Milliseconds())
 		h.handleGracePeriodRefresh(c, revokedUserID, revokedTokenID, revokedAt)
 		return true
 	}
@@ -1580,7 +1580,7 @@ func (h *Handler) checkMachineIDTheft(c *gin.Context, token models.RefreshToken,
 	if storedIP != requestIP {
 		return h.handleTokenTheft(c, token)
 	}
-	return h.handleSuspiciousMachineID(c, token, requestMachineID, requestIP)
+	return h.handleSuspiciousMachineID(c, token, requestMachineID)
 }
 
 // handleTokenTheft handles the case where both machine ID and IP differ — high risk token theft.
@@ -1606,11 +1606,11 @@ func (h *Handler) handleTokenTheft(c *gin.Context, token models.RefreshToken) bo
 
 // handleSuspiciousMachineID handles same-IP but different machine ID — suspicious but not theft.
 // Returns true if the response was written (MFA challenge sent), false to allow.
-func (h *Handler) handleSuspiciousMachineID(c *gin.Context, token models.RefreshToken, requestMachineID, requestIP string) bool {
+func (h *Handler) handleSuspiciousMachineID(c *gin.Context, token models.RefreshToken, requestMachineID string) bool {
 	if h.mfaChecker == nil || !h.mfaChecker.IsEnabled(c.Request.Context(), token.UserID) {
 		h.log.Warn("Refresh from different machine_id but same IP (no MFA: allowing)",
 			"user_id", token.UserID, "stored_machine_id", token.MachineID,
-			"request_machine_id", requestMachineID, "ip", requestIP)
+			"request_machine_id", requestMachineID)
 		return false
 	}
 
@@ -1635,7 +1635,7 @@ func (h *Handler) handleSuspiciousMachineID(c *gin.Context, token models.Refresh
 
 	h.log.Warn("Suspicious refresh: different machine_id, same IP — MFA required",
 		"user_id", token.UserID, "stored_machine_id", token.MachineID,
-		"request_machine_id", requestMachineID, "ip", requestIP)
+		"request_machine_id", requestMachineID)
 
 	resp, respErr := h.buildMFAChallengeResponse(ctx, "suspicious_session_mfa", "Session verification required", challengeToken, token.UserID, jti)
 	if respErr != nil {

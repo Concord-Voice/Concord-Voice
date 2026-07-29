@@ -18,6 +18,7 @@ import (
 func TestGraceRecovery_BenignRotationRaceRecovers(t *testing.T) {
 	ts := setupTS(t)
 	refreshToken, userID := registerAndGetRefreshToken(t, ts, "gracebenign", "")
+	logs := ts.CaptureLogs(t)
 
 	// First refresh rotates: source revoked, successor minted (predecessor_id = source).
 	w := doRefreshWithMachineID(ts, refreshToken, "", "")
@@ -26,6 +27,9 @@ func TestGraceRecovery_BenignRotationRaceRecovers(t *testing.T) {
 	// Replay the source within the 30s grace window, same client → recovers.
 	w = doRefreshWithMachineID(ts, refreshToken, "", "")
 	require.Equal(t, http.StatusOK, w.Code, "in-grace replay should recover the session")
+	graceLog := findLogLine(logs.String(), "Refresh token replay within grace period, recovering session")
+	require.NotEmpty(t, graceLog)
+	assert.NotContains(t, graceLog, "192.0.2.1")
 
 	// Exactly one live token remains (the fresh re-mint).
 	var live int

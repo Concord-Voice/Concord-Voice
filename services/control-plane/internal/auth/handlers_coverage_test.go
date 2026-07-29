@@ -455,9 +455,13 @@ func TestRefreshDifferentMachineIDSameIP(t *testing.T) {
 
 	// Same IP but different machine ID: suspicious but not theft (no MFA = allow)
 	differentMachineID := uuid.New().String()
+	logs := ts.CaptureLogs(t)
 	w := doRefreshWithMachineID(ts, refreshToken, differentMachineID, "")
 	// Without MFA enabled, this should succeed (graceful degradation)
 	assert.Equal(t, http.StatusOK, w.Code)
+	suspiciousLog := findLogLine(logs.String(), "Refresh from different machine_id but same IP")
+	require.NotEmpty(t, suspiciousLog)
+	assert.NotContains(t, suspiciousLog, "192.0.2.1")
 }
 
 // ── Grace Period Refresh ───────────────────────────────────────────────────
@@ -1842,6 +1846,7 @@ func TestRefreshSuspiciousMachineIDWithMFA(t *testing.T) {
 
 	// Refresh with different machine ID but same IP should trigger suspicious MFA challenge
 	differentMachineID := uuid.New().String()
+	logs := ts.CaptureLogs(t)
 	w = doRefreshWithMachineID(ts, refreshToken, differentMachineID, "")
 	assert.Equal(t, http.StatusForbidden, w.Code)
 
@@ -1850,6 +1855,9 @@ func TestRefreshSuspiciousMachineIDWithMFA(t *testing.T) {
 	assert.Equal(t, "suspicious_session_mfa", body["error"])
 	assert.NotEmpty(t, body["mfa_challenge_token"])
 	assert.NotEmpty(t, body["methods"])
+	suspiciousLog := findLogLine(logs.String(), "Suspicious refresh: different machine_id, same IP")
+	require.NotEmpty(t, suspiciousLog)
+	assert.NotContains(t, suspiciousLog, "192.0.2.1")
 }
 
 // ── CompleteLogin via MFA Verify ────────────────────────────────────────────
