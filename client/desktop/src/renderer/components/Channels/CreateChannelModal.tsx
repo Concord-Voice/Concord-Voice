@@ -316,10 +316,15 @@ const CreateChannelModal: React.FC<CreateChannelModalProps> = ({ isOpen, onClose
   };
 
   const handleClose = () => {
-    if (!isSubmitting) {
-      resetForm();
-      onClose();
+    if (isSubmitting && !hasPartialChannel) return;
+
+    submissionControllerRef.current?.abort();
+    if (closeTimerRef.current !== null) {
+      clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
     }
+    resetForm();
+    onClose();
   };
 
   const validateForm = (): boolean => {
@@ -524,7 +529,7 @@ const CreateChannelModal: React.FC<CreateChannelModalProps> = ({ isOpen, onClose
             type="button"
             className="btn btn-secondary"
             onClick={handleClose}
-            disabled={isSubmitting}
+            disabled={isSubmitting && !hasPartialChannel}
           >
             Cancel
           </button>

@@ -139,6 +139,44 @@ describe('CreateChannelModal', () => {
     vi.useRealTimers();
   });
 
+  it('keeps the initial channel creation open until it is recorded locally', async () => {
+    vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(
+      new Map([['user-1', 'wrapped-key']])
+    );
+    let resolveCreate!: (response: Response) => void;
+    let createSignal: AbortSignal | null = null;
+    const createResponse = new Promise<Response>((resolve) => {
+      resolveCreate = resolve;
+    });
+    mockedApiFetch.mockImplementation(async (url, init) => {
+      if (url === `/api/v1/servers/${mockServer.id}/member-public-keys`) {
+        return { ok: true, json: async () => ({ members: currentMemberPublicKeys }) } as Response;
+      }
+      if (url === '/api/v1/channels') {
+        createSignal = init?.signal ?? null;
+        return createResponse;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+
+    render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
+    fireEvent.change(screen.getByPlaceholderText('general-chat'), {
+      target: { value: 'pending-channel' },
+    });
+    fireEvent.click(screen.getByText('Create Channel', { selector: 'button[type="submit"]' }));
+
+    await waitFor(() => expect(createSignal).toBeInstanceOf(AbortSignal));
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    expect(cancel).toBeDisabled();
+    fireEvent.click(cancel);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(createSignal?.aborted).toBe(false);
+    expect(mockOnClose).not.toHaveBeenCalled();
+
+    resolveCreate({ ok: true, json: async () => ({ channel: mockChannel }) } as Response);
+    await waitFor(() => expect(useChannelStore.getState().channels).toHaveLength(1));
+  });
+
   it('batches overflow keys to both voice channel IDs while retaining the creator', async () => {
     const { members, wrappedKeys } = setOverflowMembersAndKeys();
     vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(wrappedKeys);
@@ -365,6 +403,96 @@ describe('CreateChannelModal', () => {
           'Channel created, but Channel key distribution is rate limited; try again later'
         )
       ).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Regression for #2532: users must be able to leave a rate-limited overflow retry.
+  it('cancels a rate-limited overflow distribution during its backoff', async () => {
+    vi.useFakeTimers();
+    try {
+      const { members, wrappedKeys } = setOverflowMembersAndKeys();
+      vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(wrappedKeys);
+      let distributionAttempts = 0;
+      let distributionSignal: AbortSignal | null | undefined;
+      mockedApiFetch.mockImplementation(async (url, init) => {
+        if (url === `/api/v1/servers/${mockServer.id}/member-public-keys`) {
+          return { ok: true, json: async () => ({ members }) } as Response;
+        }
+        if (url === '/api/v1/channels') {
+          return { ok: true, json: async () => ({ channel: mockChannel }) } as Response;
+        }
+        distributionAttempts++;
+        distributionSignal = init?.signal;
+        return {
+          ok: false,
+          status: 429,
+          headers: new Headers({ 'Retry-After': '60' }),
+          json: async () => ({}),
+        } as Response;
+      });
+
+      render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
+      fireEvent.change(screen.getByPlaceholderText('general-chat'), {
+        target: { value: 'cancel-rate-limited-overflow' },
+      });
+      fireEvent.click(screen.getByText('Create Channel', { selector: 'button[type="submit"]' }));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(distributionAttempts).toBe(1);
+
+      const cancel = screen.getByRole('button', { name: 'Cancel' });
+      expect(cancel).toBeEnabled();
+      fireEvent.click(cancel);
+
+      expect(distributionSignal?.aborted).toBe(true);
+      expect(mockOnClose).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        await vi.runAllTimersAsync();
+      });
+      expect(distributionAttempts).toBe(1);
+      expect(useChannelStore.getState().channels).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels a scheduled success close without closing twice', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(e2eeService.createChannelKeys).mockResolvedValue(
+        new Map([['user-1', 'wrapped-key']])
+      );
+      mockedApiFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ members: currentMemberPublicKeys }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ channel: mockChannel }),
+        } as Response);
+
+      render(<CreateChannelModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
+      fireEvent.change(screen.getByPlaceholderText('general-chat'), {
+        target: { value: 'cancel-scheduled-close' },
+      });
+      fireEvent.click(screen.getByText('Create Channel', { selector: 'button[type="submit"]' }));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+      expect(mockOnClose).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.runAllTimersAsync();
+      });
+      expect(mockOnClose).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
