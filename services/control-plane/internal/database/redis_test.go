@@ -45,3 +45,15 @@ func TestNewRedisClientSuccess(t *testing.T) {
 	}()
 	require.NotNil(t, client)
 }
+
+func TestNewRedisClientEnablesContextTimeouts(t *testing.T) {
+	client, err := NewRedisClient(testRedisURL())
+	if err != nil {
+		t.Skipf("Redis not available in this environment: %v", err)
+	}
+	t.Cleanup(func() {
+		require.NoError(t, client.Close())
+	})
+
+	assert.True(t, client.Options().ContextTimeoutEnabled)
+}

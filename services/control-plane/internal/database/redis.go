@@ -13,6 +13,7 @@ func NewRedisClient(redisURL string) (*redis.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid redis URL: %w", err)
 	}
+	opt.ContextTimeoutEnabled = true
 
 	client := redis.NewClient(opt)
 

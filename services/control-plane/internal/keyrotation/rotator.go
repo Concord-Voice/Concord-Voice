@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -251,13 +252,40 @@ func (r *Rotator) RevokeChannelKeyEpoch(channelID, reason, actorID, removedUserI
 	r.revokeChannelKey(context.Background(), channelID, reason, actorID, removedUserID)
 }
 
-// StartManualRotation records and broadcasts a manual rotation.
-func (r *Rotator) StartManualRotation(ctx context.Context, channelID, actorID string) (*Rotation, error) {
-	rotation, err := r.recordRotation(ctx, channelID, "manual_rotation", actorID, "")
-	if err != nil || rotation == nil {
-		return rotation, err
+// StartManualRotation records and broadcasts a manual rotation after fencing
+// the actor's credential epoch within the revocation transaction.
+func (r *Rotator) StartManualRotation(
+	ctx context.Context,
+	channelID, actorID, tokenEpoch string,
+	admit func(context.Context) error,
+) (*Rotation, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin key revocation: %w", err)
 	}
-	r.broadcast(*rotation)
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			r.log.Error("Failed to rollback key revocation", "error", rbErr)
+		}
+	}()
+	if err := credepoch.GuardTx(ctx, tx, actorID, tokenEpoch); err != nil {
+		return nil, fmt.Errorf("guard manual key rotation credential epoch: %w", err)
+	}
+	if admit != nil {
+		if err := admit(ctx); err != nil {
+			return nil, fmt.Errorf("admit manual key rotation: %w", err)
+		}
+	}
+	rotation, err := RecordKeyRevocationTx(ctx, tx, r.canDistribute, channelID, "manual_rotation", actorID, "")
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit key revocation: %w", err)
+	}
+	if rotation != nil {
+		r.broadcast(*rotation)
+	}
 	return rotation, nil
 }
 

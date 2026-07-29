@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -256,7 +257,7 @@ func TestStartManualRotation_RecordsAndBroadcasts(t *testing.T) {
 	owner, serverID, channelID := krSeedServerChannel(t, db)
 	krSeedEpoch(t, db, channelID, owner, 2)
 
-	rotation, err := r.StartManualRotation(context.Background(), channelID, owner)
+	rotation, err := r.StartManualRotation(context.Background(), channelID, owner, "", nil)
 
 	require.NoError(t, err)
 	require.NotNil(t, rotation)
@@ -268,6 +269,72 @@ func TestStartManualRotation_RecordsAndBroadcasts(t *testing.T) {
 		Reason:         "manual_rotation",
 	}, *rotation)
 	assert.Equal(t, []keyrotation.Rotation{*rotation}, broadcasts)
+}
+
+func TestStartManualRotation_RejectsStaleCredentialEpoch(t *testing.T) {
+	db := krSetupDB(t)
+	var broadcasts []keyrotation.Rotation
+	log := logger.New("test")
+	r := keyrotation.NewRotator(db, log, rbac.NewResolver(db, nil, log).CanDistributeChannelKeyTx, func(rotation keyrotation.Rotation) {
+		broadcasts = append(broadcasts, rotation)
+	})
+	owner, _, channelID := krSeedServerChannel(t, db)
+	krSeedEpoch(t, db, channelID, owner, 2)
+	_, err := db.Exec(`UPDATE users SET credential_epoch = 'E2' WHERE id = $1`, owner)
+	require.NoError(t, err)
+
+	admitCalls := 0
+	rotation, err := r.StartManualRotation(context.Background(), channelID, owner, "E1", func(context.Context) error {
+		admitCalls++
+		return nil
+	})
+
+	require.ErrorIs(t, err, credepoch.ErrEpochMismatch)
+	assert.Zero(t, admitCalls, "admission must not run after a stale credential-epoch rejection")
+	assert.Nil(t, rotation)
+	assert.Empty(t, broadcasts)
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM key_revocations WHERE channel_id = $1`, channelID).Scan(&count))
+	assert.Equal(t, 1, count, "the existing seeded revocation must be the only row")
+}
+
+func TestStartManualRotation_DoesNotPersistOrBroadcastOnAdmissionError(t *testing.T) {
+	db := krSetupDB(t)
+	var broadcasts []keyrotation.Rotation
+	log := logger.New("test")
+	r := keyrotation.NewRotator(db, log, rbac.NewResolver(db, nil, log).CanDistributeChannelKeyTx, func(rotation keyrotation.Rotation) {
+		broadcasts = append(broadcasts, rotation)
+	})
+	owner, _, channelID := krSeedServerChannel(t, db)
+	krSeedEpoch(t, db, channelID, owner, 2)
+	admissionErr := errors.New("quota exhausted")
+
+	rotation, err := r.StartManualRotation(context.Background(), channelID, owner, "", func(context.Context) error {
+		return admissionErr
+	})
+
+	require.ErrorIs(t, err, admissionErr)
+	assert.Nil(t, rotation)
+	assert.Empty(t, broadcasts)
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM key_revocations WHERE channel_id = $1`, channelID).Scan(&count))
+	assert.Equal(t, 1, count, "admission failure must not write a successor revocation")
+}
+
+func TestStartManualRotation_DoesNotBroadcastOnRecordError(t *testing.T) {
+	db := krSetupDB(t)
+	var broadcasts []keyrotation.Rotation
+	log := logger.New("test")
+	r := keyrotation.NewRotator(db, log, rbac.NewResolver(db, nil, log).CanDistributeChannelKeyTx, func(rotation keyrotation.Rotation) {
+		broadcasts = append(broadcasts, rotation)
+	})
+	owner, _, _ := krSeedServerChannel(t, db)
+
+	rotation, err := r.StartManualRotation(context.Background(), uuid.NewString(), owner, "", nil)
+
+	require.ErrorContains(t, err, "lock channel for key revocation")
+	assert.Nil(t, rotation)
+	assert.Empty(t, broadcasts)
 }
 
 func TestCompleteInitialKeyDistributionTx(t *testing.T) {

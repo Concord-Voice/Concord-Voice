@@ -86,6 +86,7 @@ var (
 	errRotationDistributor           = errors.New("channel key rotation already has a distributor")
 	errChannelKeyDistributorAccess   = errors.New("channel key distributor no longer has access")
 	errNoChannelKeyRecipients        = errors.New("channel key distribution has no eligible recipients")
+	errManualRotationRateLimited     = errors.New("manual channel rotation rate limited")
 )
 
 // Handler handles channel-related requests
@@ -3281,15 +3282,29 @@ func (h *Handler) RotateKey(c *gin.Context) {
 	// Per-resource rate limit: 10 rotations per 24h per channel.
 	// Subscription-tiered limits deferred to issue #603.
 	rateLimitKey := fmt.Sprintf("ratelimit:channel_rotate:%s", channelID)
-	if blocked, retryAfter := middleware.IsRateLimited(c.Request.Context(), h.redis, rateLimitKey, 10, 24*time.Hour); blocked {
-		middleware.RespondRateLimited(c, retryAfter, 10)
-		return
+	var retryAfter time.Duration
+	admit := func(ctx context.Context) error {
+		admissionCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+		defer cancel()
+		blocked, retry := middleware.IsRateLimited(admissionCtx, h.redis, rateLimitKey, 10, 24*time.Hour)
+		if !blocked {
+			return nil
+		}
+		retryAfter = retry
+		return errManualRotationRateLimited
 	}
 
-	rotation, err := keyrotation.NewRotator(h.db, h.log, h.resolver.CanDistributeChannelKeyTx, websocket.KeyRevocationBroadcaster(h.hub)).StartManualRotation(c.Request.Context(), channelID, userID)
+	rotation, err := keyrotation.NewRotator(h.db, h.log, h.resolver.CanDistributeChannelKeyTx, websocket.KeyRevocationBroadcaster(h.hub)).StartManualRotation(c.Request.Context(), channelID, userID, middleware.TokenCredentialEpoch(c), admit)
 	if err != nil {
-		h.log.Error("Failed to record channel key rotation", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRotateKey})
+		switch {
+		case errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked):
+			c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
+		case errors.Is(err, errManualRotationRateLimited):
+			middleware.RespondRateLimited(c, retryAfter, 10)
+		default:
+			h.log.Error("Failed to record channel key rotation", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRotateKey})
+		}
 		return
 	}
 	if rotation == nil {
