@@ -21,6 +21,7 @@ See [SETUP_GITHUB.md](./SETUP_GITHUB.md) for full GitHub collaboration workflow.
 - **Docker** and **Docker Compose**
 - **Git**
 - **Python 3** (for `pre-commit` hooks framework and mediasoup build)
+- **lsof** (preinstalled on macOS; `sudo apt-get install lsof` on Debian/Ubuntu)
 
 ### Optional
 
@@ -402,13 +403,16 @@ If ports are in use:
 - `.env` files for services
 - `vite.config.ts` for client dev server
 
-**Or kill processes**:
+**Or stop verified Concord processes**:
 ```bash
-# macOS/Linux
-lsof -ti:8080 | xargs kill -9
-lsof -ti:3000 | xargs kill -9
-lsof -ti:5432 | xargs kill -9
+./scripts/concord-dev.sh down --force
+
+# If a port remains, inspect its owner before taking manual action
+lsof -nP -iTCP:8080 -sTCP:LISTEN
 ```
+
+Only signal a remaining PID manually after verifying its command and working
+directory belong to the intended service.
 
 ## Environment Variables Reference
 
@@ -504,12 +508,15 @@ docker-compose restart postgres
 ### "Port already in use"
 
 ```bash
-# Find process using port
-lsof -i :8080
+# Stop identity-verified Concord processes first
+./scripts/concord-dev.sh down --force
 
-# Kill it
-kill -9 <PID>
+# Inspect any remaining listener without signaling it
+lsof -nP -iTCP:8080 -sTCP:LISTEN
 ```
+
+If cleanup still fails, verify the listener's command and working directory
+before sending it `SIGTERM`; do not blindly signal a PID returned by `lsof`.
 
 ### "Module not found" (Node.js)
 

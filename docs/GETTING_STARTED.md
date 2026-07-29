@@ -52,13 +52,15 @@ Install these first:
 - **Docker Desktop** - [Download](https://www.docker.com/products/docker-desktop/)
 - **Git** - [Download](https://git-scm.com/)
 - **Python 3** - [Download](https://www.python.org/downloads/) (for `pre-commit` hooks framework and mediasoup build)
+- **lsof** - Preinstalled on macOS; install with `sudo apt-get install lsof` on Debian/Ubuntu
 
 ### Verify Installation
 
 ```bash
-node --version    # Should be v20.x or higher
+node --version    # Should be v24.x or higher
 go version        # Should be go1.26.1 or higher
 docker --version  # Should be 20.x or higher
+lsof -v           # Used for safe local-process cleanup
 ```
 
 ## Setup (15 minutes)
@@ -360,11 +362,16 @@ Check [GitHub Issues](https://github.com/Concord-Voice/Concord-Voice-Alpha/issue
 ### Port already in use
 
 ```bash
-# Kill process on port
-lsof -ti:8080 | xargs kill -9
+# Stop verified Concord services and listeners
+./scripts/concord-dev.sh down --force
 
-# Or change ports in .env files
+# If a port remains, inspect its owner before taking any manual action
+lsof -nP -iTCP:8080 -sTCP:LISTEN
 ```
+
+Only signal the reported PID manually after verifying its command and working
+directory belong to the intended service. Otherwise, change the port in the
+relevant `.env` file.
 
 ### Docker not starting
 
