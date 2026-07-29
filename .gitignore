@@ -280,3 +280,6 @@ graphify-out/transcripts/
 graphify-out/.graphify_*
 !graphify-out/.graphify_labels.json
 graphify-out/cost.json
+graphify-out/.vocab.txt
+graphify-out/memory/
+graphify-out/reflections/
