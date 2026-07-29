@@ -946,6 +946,72 @@ func TestDistributeChannelKeys_RequiresIssuedRotationEpoch(t *testing.T) {
 		keyFingerprint: rotationFingerprint,
 	}, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code, "an ordinary member may answer an issued rotation")
+
+	_, err = ts.DB.Exec(
+		`DELETE FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 2`, channelID, target.ID,
+	)
+	require.NoError(t, err)
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 2`, channelID, target.ID))
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 1`, channelID, target.ID))
+
+	_, err = ts.DB.Exec(
+		`DELETE FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 2`, channelID, target.ID,
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO key_revocations (
+			channel_id, revoked_epoch, successor_epoch, reason, revoked_by, rotation_distributor_claimed
+		 ) VALUES ($1, 2, 3, 'member_removal', $2, FALSE)`, channelID, owner.ID,
+	)
+	require.NoError(t, err)
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		"key_version":  3,
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, "a ledger-issued successor must distribute after its sole prior holder is removed")
+	assert.Equal(t, 1, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 3`, channelID, target.ID))
+}
+
+func TestDistributeChannelKeys_RejectsUnversionedLedgerOnlySuccessor(t *testing.T) {
+	ts, owner, serverID, channelID := setupEncryptedChannel(t)
+	member := ts.CreateTestUser(t, "ledgeronlymember")
+	target := ts.CreateTestUser(t, "ledgeronlytarget")
+	ts.AddMemberToServer(t, serverID, member.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, target.ID, roleMember)
+
+	w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{member.ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	_, err := ts.DB.Exec(
+		`INSERT INTO key_revocations (
+			channel_id, revoked_epoch, successor_epoch, reason, revoked_by, rotation_distributor_claimed
+		 ) VALUES ($1, 1, 2, 'member_removal', $2, FALSE)`, channelID, owner.ID,
+	)
+	require.NoError(t, err)
+
+	w = ts.DoRequest("POST", pathChannelsPrefix+channelID+pathKeys, map[string]interface{}{
+		keyWrappedKeys: map[string]string{target.ID: testhelpers.ValidCiphertext()},
+		keyFingerprint: rotationFingerprint,
+	}, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusConflict, w.Code, "a ledger-only successor requires its explicit epoch")
+	assert.Equal(t, 0, rowCount(t, ts,
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 2`, channelID, target.ID))
+	var claimed bool
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT rotation_distributor_claimed FROM key_revocations WHERE channel_id = $1 AND revoked_epoch = 1`, channelID,
+	).Scan(&claimed))
+	assert.False(t, claimed)
 }
 
 func TestDistributeChannelKeys_BindsIssuedRotationToFirstDistributor(t *testing.T) {
@@ -1551,6 +1617,64 @@ func TestGetPendingKeyRequests_UsesActiveMarkerEpoch(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	testhelpers.ParseJSON(t, w, &body)
 	assert.Empty(t, body["pending_requests"].([]interface{}))
+}
+
+func TestGetPendingKeyRequests_RequiresActiveLedgerEpoch(t *testing.T) {
+	ts, staleHolder, serverID, channelID := setupEncryptedChannel(t)
+	activeHolder := ts.CreateTestUser(t, "pendingledgeractive")
+	requester := ts.CreateTestUser(t, "pendingledgerrequester")
+	ts.AddMemberToServer(t, serverID, activeHolder.ID, roleMember)
+	ts.AddMemberToServer(t, serverID, requester.ID, roleMember)
+
+	tx, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.Exec(
+		`INSERT INTO key_revocations (
+			channel_id, revoked_epoch, successor_epoch, reason, revoked_by,
+			rotation_distributor_id
+		 ) VALUES ($1, 1, 2, 'member_removal', $2, $2)`,
+		channelID, activeHolder.ID,
+	)
+	require.NoError(t, err)
+	_, err = tx.Exec(`INSERT INTO pending_key_requests (channel_id, user_id) VALUES ($1, $2)`, channelID, requester.ID)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	// After deletion of the sole v2 row, the original v1 holder must not receive
+	// an unversioned recovery request that could relabel its old CSK as the
+	// ledger-issued v2 successor.
+	w := ts.DoRequest("GET", "/api/v1/e2ee/pending-keys", nil, testhelpers.AuthHeaders(staleHolder.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Empty(t, body["pending_requests"].([]interface{}))
+
+	tx, err = ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.Exec(
+		`UPDATE key_revocations
+		 SET rotation_distributor_claimed = TRUE, rotation_key_fingerprint = $2
+		 WHERE channel_id = $1 AND revoked_epoch = 1`,
+		channelID, rotationFingerprint,
+	)
+	require.NoError(t, err)
+	_, err = tx.Exec(`SELECT set_config('concord.rotation_distributor_id', $1, TRUE)`, activeHolder.ID)
+	require.NoError(t, err)
+	_, err = tx.Exec(`SELECT set_config('concord.rotation_key_fingerprint', $1, TRUE)`, rotationFingerprint)
+	require.NoError(t, err)
+	_, err = tx.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'epoch-two', 2)`, channelID, activeHolder.ID)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	// A holder of the active epoch receives that version explicitly.
+	w = ts.DoRequest("GET", "/api/v1/e2ee/pending-keys", nil, testhelpers.AuthHeaders(activeHolder.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	testhelpers.ParseJSON(t, w, &body)
+	requests := body["pending_requests"].([]interface{})
+	require.Len(t, requests, 1)
+	assert.Equal(t, float64(2), requests[0].(map[string]interface{})["key_version"])
 }
 
 // --- Rate Limiting: RotateKey ---

@@ -259,6 +259,28 @@ func TestHandleDMMessageRevokedEpochRejected(t *testing.T) {
 	assert.Equal(t, float64(2), data["current_epoch"])
 }
 
+func TestEnforceDMEpoch_CurrentEpochLookupFailureFailsClosed(t *testing.T) {
+	setup := setupEpochTest(t, true, true)
+	convUUID, err := uuid.Parse(setup.convID)
+	require.NoError(t, err)
+
+	_, err = setup.db.Exec(`ALTER TABLE dm_channel_keys RENAME TO dm_channel_keys_epoch_lookup_test`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, revertErr := setup.db.Exec(`ALTER TABLE dm_channel_keys_epoch_lookup_test RENAME TO dm_channel_keys`)
+		require.NoError(t, revertErr)
+	})
+
+	msg := IncomingMessage{ClientID: setup.client.ID}
+	assert.False(t, setup.hub.enforceDMEpoch(msg, convUUID, 1))
+
+	resp := readClientMsg(t, setup.client)
+	assert.Equal(t, "error", resp["type"])
+	data := resp["data"].(map[string]interface{})
+	assert.Equal(t, errMsgFailedVerifyKeyEpoch, data["message"])
+	assert.NotContains(t, data, "current_epoch")
+}
+
 func TestHandleDMMessageNotSubscribed(t *testing.T) {
 	setup := setupEpochTest(t, false, false)
 

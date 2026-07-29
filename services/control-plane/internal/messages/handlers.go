@@ -509,34 +509,45 @@ func (h *Handler) checkSendAccess(c *gin.Context, channelID, userID string) (str
 	return serverID, membershipIncarnation, serverAllowEmbeds, true
 }
 
-// enforceChannelEpoch rejects revoked key versions and reports the latest
-// successor recorded by the authoritative revocation ledger.
+// enforceChannelEpoch rejects revoked key versions and reports the latest epoch
+// from surviving keys or the authoritative revocation ledger.
 func (h *Handler) enforceChannelEpoch(c *gin.Context, q epochQueryRower, channelID string, keyVersion int) bool {
 	var epochRevoked bool
-	var currentEpoch int
 	if err := q.QueryRowContext(c.Request.Context(),
 		`SELECT EXISTS(
 			SELECT 1 FROM key_revocations WHERE channel_id = $1 AND revoked_epoch = $2
-		), COALESCE(MAX(successor_epoch), 1)
-		FROM key_revocations
-		WHERE channel_id = $1`,
+		)`,
 		channelID, keyVersion,
-	).Scan(&epochRevoked, &currentEpoch); err != nil {
+	).Scan(&epochRevoked); err != nil {
 		h.log.Error("Failed to check epoch revocation", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify key epoch"})
 		return false
 	}
-	if epochRevoked {
-		c.JSON(http.StatusConflict, gin.H{
-			"error":         "Key epoch has been revoked — re-encrypt with current epoch",
-			"code":          "epoch_revoked",
-			"current_epoch": currentEpoch,
-			"channel_id":    channelID,
-		})
-		return false
+	if !epochRevoked {
+		return true
 	}
 
-	return true
+	var currentEpoch int
+	if err := q.QueryRowContext(c.Request.Context(),
+		`SELECT GREATEST(
+			COALESCE(MAX(successor_epoch), 1),
+			COALESCE((SELECT MAX(key_version) FROM channel_keys WHERE channel_id = $1), 1)
+		)
+		FROM key_revocations
+		WHERE channel_id = $1`,
+		channelID,
+	).Scan(&currentEpoch); err != nil {
+		h.log.Error("Failed to resolve current key epoch", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify key epoch"})
+		return false
+	}
+	c.JSON(http.StatusConflict, gin.H{
+		"error":         "Key epoch has been revoked — re-encrypt with current epoch",
+		"code":          "epoch_revoked",
+		"current_epoch": currentEpoch,
+		"channel_id":    channelID,
+	})
+	return false
 }
 
 // enforceE2EE validates ciphertext shape and epoch revocation for the channel.

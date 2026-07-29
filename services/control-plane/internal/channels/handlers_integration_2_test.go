@@ -974,6 +974,33 @@ func TestValidateEpochsAllPaths(t *testing.T) {
 		assert.Empty(t, revocations, "no revocations should exist for a fresh channel")
 	})
 
+	t.Run("ReturnsTerminalLedgerEpoch", func(t *testing.T) {
+		_, err := ts.DB.Exec(
+			`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by)
+			 VALUES ($1, 1, 2, 'member_removal', $2),
+			        ($1, 2, 3, 'member_removal', $2)`,
+			channelID, user.ID,
+		)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_, cleanupErr := ts.DB.Exec(`DELETE FROM key_revocations WHERE channel_id = $1`, channelID)
+			require.NoError(t, cleanupErr)
+		})
+
+		w := ts.DoRequest("POST", pathValidateEpochs, map[string]interface{}{
+			"epochs": map[string]int{channelID: 1},
+		}, testhelpers.AuthHeaders(user.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		revocations := body["revocations"].([]interface{})
+		require.Len(t, revocations, 1)
+		revocation := revocations[0].(map[string]interface{})
+		assert.Equal(t, float64(1), revocation["revoked_epoch"])
+		assert.Equal(t, float64(3), revocation["successor_epoch"])
+	})
+
 	t.Run("BadBody", func(t *testing.T) {
 		w := ts.DoRequest("POST", pathValidateEpochs, map[string]interface{}{}, testhelpers.AuthHeaders(user.AccessToken))
 		assert.Equal(t, http.StatusBadRequest, w.Code)

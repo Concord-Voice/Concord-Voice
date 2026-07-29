@@ -87,7 +87,10 @@ func RecordKeyRevocationTx(ctx context.Context, tx *sql.Tx, canDistribute Initia
 
 	var maxEpoch int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(key_version), 1) FROM channel_keys WHERE channel_id = $1`, channelID,
+		`SELECT GREATEST(
+			COALESCE(MAX(key_version), 1),
+			COALESCE((SELECT MAX(successor_epoch) FROM key_revocations WHERE channel_id = $1), 1)
+		) FROM channel_keys WHERE channel_id = $1`, channelID,
 	).Scan(&maxEpoch); err != nil {
 		return nil, fmt.Errorf("read current key epoch: %w", err)
 	}

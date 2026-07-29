@@ -205,6 +205,29 @@ func TestTriggerForChannel_InsertsRevocation(t *testing.T) {
 	assert.False(t, distributorClaimed, "current writers must explicitly leave a new rotation unclaimed")
 }
 
+// regression for #2527: a deleted final holder must not make rotation reuse 1 -> 2.
+func TestTriggerForChannel_UsesLedgerEpochAfterDeletingSoleHolder(t *testing.T) {
+	r, db := newRotator(t)
+	owner, _, channelID := krSeedServerChannel(t, db)
+	krSeedEpoch(t, db, channelID, owner, 2)
+
+	_, err := db.Exec(
+		`DELETE FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 2`,
+		channelID, owner,
+	)
+	require.NoError(t, err)
+
+	r.TriggerForChannel(channelID, "member_removal", owner)
+
+	var transitions int
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM key_revocations
+		 WHERE channel_id = $1 AND revoked_epoch = 2 AND successor_epoch = 3`,
+		channelID,
+	).Scan(&transitions))
+	assert.Equal(t, 1, transitions, "rotation must advance the ledger from 2 to 3")
+}
+
 // TestTriggerForChannel_DefaultsEpochWhenNoKeys verifies the
 // COALESCE(MAX(key_version),1) default fires when a channel has no channel_keys
 // rows yet (rotates 1 -> 2).

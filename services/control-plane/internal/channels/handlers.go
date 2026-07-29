@@ -52,6 +52,7 @@ const (
 	errMsgFailedDeleteChannel         = "Failed to delete channel"
 	errMsgFailedCheckMembership       = "Failed to check membership"
 	errMsgFailedFetchKeys             = "Failed to fetch keys"
+	errMsgFailedFetchPendingKeys      = "Failed to fetch pending key requests"
 	errMsgFailedFetchUnreadCounts     = "Failed to fetch unread counts"
 	errMsgFailedMarkServerRead        = "Failed to mark server read"
 	errMsgFailedMarkChannelRead       = "Failed to mark channel read"
@@ -1780,7 +1781,10 @@ func normalizeChannelKeyFingerprint(fingerprint string) (string, error) {
 func resolveChannelKeyVersionTx(ctx context.Context, tx *sql.Tx, channelID, actorID, keyFingerprint string, explicitVersion *int) (int, error) {
 	var currentVersion int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(key_version), 1) FROM channel_keys WHERE channel_id = $1`,
+		`SELECT GREATEST(
+			COALESCE(MAX(key_version), 1),
+			COALESCE((SELECT MAX(successor_epoch) FROM key_revocations WHERE channel_id = $1), 1)
+		) FROM channel_keys WHERE channel_id = $1`,
 		channelID,
 	).Scan(&currentVersion); err != nil {
 		return 0, fmt.Errorf("read current channel key version: %w", err)
@@ -1833,6 +1837,9 @@ func claimChannelKeyRotationTx(ctx context.Context, tx *sql.Tx, channelID, actor
 			return errRotationDistributor
 		}
 		return nil
+	}
+	if !requireIssued {
+		return errUnissuedChannelKeyVersion
 	}
 	if keyFingerprint == "" {
 		return errRotationDistributor
@@ -2386,27 +2393,42 @@ type pendingKeyRequest struct {
 func (h *Handler) GetPendingKeyRequests(c *gin.Context) {
 	userID := c.GetString("user_id")
 
-	// Return pending requests for channels where the caller already has a key.
-	// An active initial-distribution marker pins a successor epoch, so only a
-	// holder of that exact epoch can recover its queued recipients. Markers
-	// remain creator-only, so exposing their queue to another holder would
-	// guarantee a 403 when it tries to submit the wrap.
+	// Return pending requests only to a holder of the active epoch. An active
+	// initial-distribution marker pins its successor epoch and remains
+	// creator-only; otherwise the active epoch comes from the newer of the
+	// surviving wrapped-key rows and the revocation ledger.
 	query := `
-		SELECT DISTINCT pkr.id, pkr.channel_id, pkr.user_id, COALESCE(cid.key_version, 0), pkr.created_at
+		SELECT DISTINCT pkr.id, pkr.channel_id, pkr.user_id, COALESCE(cid.key_version, active_epoch.key_version), pkr.created_at
 		FROM pending_key_requests pkr
 		LEFT JOIN channel_initial_key_distributions cid ON cid.channel_id = pkr.channel_id
+		CROSS JOIN LATERAL (
+			SELECT GREATEST(
+				COALESCE(MAX(key_version), 1),
+				COALESCE((SELECT MAX(successor_epoch) FROM key_revocations WHERE channel_id = pkr.channel_id), 1)
+			) AS key_version
+			FROM channel_keys
+			WHERE channel_id = pkr.channel_id
+		) active_epoch
 		INNER JOIN channel_keys ck ON pkr.channel_id = ck.channel_id
 			AND ck.user_id = $1
-			AND (cid.key_version IS NULL OR (cid.creator_id = $1 AND ck.key_version = cid.key_version))
+			AND (
+				(cid.key_version IS NULL AND ck.key_version = active_epoch.key_version)
+				OR (cid.creator_id = $1 AND ck.key_version = cid.key_version)
+			)
 		ORDER BY pkr.created_at ASC
 	`
 
 	rows, err := h.db.Query(query, userID)
 	if err != nil {
 		h.log.Error("Failed to query pending key requests", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch pending key requests"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchPendingKeys})
 		return
 	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			h.log.Error("Failed to close pending key request rows", "error", closeErr)
+		}
+	}()
 	// Drain the cursor fully before running the per-request VIEW filter below.
 	// The filter calls channelKeyAccess (a DB query + RBAC resolver lookup) per
 	// row, so filtering inline would hold this cursor's pooled connection open
@@ -2422,10 +2444,15 @@ func (h *Handler) GetPendingKeyRequests(c *gin.Context) {
 		candidates = append(candidates, req)
 	}
 	rowsErr := rows.Err()
-	_ = rows.Close()
+	closeErr := rows.Close()
 	if rowsErr != nil {
 		h.log.Error("Error iterating pending requests", "error", rowsErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch pending key requests"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchPendingKeys})
+		return
+	}
+	if closeErr != nil {
+		h.log.Error("Failed to close pending key request rows", "error", closeErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchPendingKeys})
 		return
 	}
 
@@ -3343,7 +3370,13 @@ type epochRevocationInfo struct {
 func (h *Handler) appendEpochRevocation(revocations *[]epochRevocationInfo, channelID string, clientEpoch int) error {
 	var revocation epochRevocationInfo
 	err := h.db.QueryRow(
-		`SELECT revoked_epoch, successor_epoch, reason
+		`SELECT revoked_epoch,
+			 GREATEST(
+				successor_epoch,
+				COALESCE((SELECT MAX(key_version) FROM channel_keys WHERE channel_id = $1), 1),
+				COALESCE((SELECT MAX(successor_epoch) FROM key_revocations WHERE channel_id = $1), 1)
+			 ),
+			 reason
 		 FROM key_revocations
 		 WHERE channel_id = $1 AND revoked_epoch = $2`,
 		channelID, clientEpoch,

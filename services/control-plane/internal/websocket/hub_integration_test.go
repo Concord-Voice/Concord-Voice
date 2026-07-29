@@ -2508,6 +2508,9 @@ func TestHandleMessageEpochRevoked(t *testing.T) {
 		channelUUID.String(), setup.user1.String(), []byte("test-key-v2"))
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
+	_, err = setup.db.Exec(`DELETE FROM channel_keys WHERE channel_id = $1 AND user_id = $2 AND key_version = 2`,
+		channelUUID.String(), setup.user1.String())
+	require.NoError(t, err)
 
 	msg := IncomingMessage{
 		Type:     "message",
@@ -2527,6 +2530,29 @@ func TestHandleMessageEpochRevoked(t *testing.T) {
 	data := resp["data"].(map[string]interface{})
 	assert.Equal(t, "epoch_revoked", data["code"])
 	assert.Equal(t, float64(2), data["current_epoch"])
+}
+
+func TestEnforceWSEpoch_CurrentEpochLookupFailureFailsClosed(t *testing.T) {
+	setup := setupMessageTest(t)
+	channelUUID, _ := uuid.Parse(setup.convID)
+
+	_, err := setup.db.Exec(`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by) VALUES ($1, 1, 2, 'test', $2)`, channelUUID.String(), setup.user1.String())
+	require.NoError(t, err)
+	_, err = setup.db.Exec(`ALTER TABLE channel_keys RENAME TO channel_keys_epoch_lookup_test`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, revertErr := setup.db.Exec(`ALTER TABLE channel_keys_epoch_lookup_test RENAME TO channel_keys`)
+		require.NoError(t, revertErr)
+	})
+
+	msg := IncomingMessage{ClientID: setup.client.ID}
+	assert.False(t, setup.hub.enforceWSEpoch(msg, channelUUID, setup.convID, 1))
+
+	resp := readClientMsg(t, setup.client)
+	assert.Equal(t, "error", resp["type"])
+	data := resp["data"].(map[string]interface{})
+	assert.Equal(t, "Failed to verify key epoch", data["message"])
+	assert.NotContains(t, data, "current_epoch")
 }
 
 // --- validateReplyToID integration tests ---

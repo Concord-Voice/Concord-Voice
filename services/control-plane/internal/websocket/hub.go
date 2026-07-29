@@ -48,7 +48,8 @@ const (
 	statusDND       = presence.StatusDND
 	sessionRevoked  = "session_revoked"
 
-	errMsgFailedSaveMessage = "Failed to save message"
+	errMsgFailedSaveMessage    = "Failed to save message"
+	errMsgFailedVerifyKeyEpoch = "Failed to verify key epoch"
 
 	clientBootstrapConcurrency = 8
 	// Bounds concurrent hidden-sender suppressions so a deploy-time mass
@@ -2105,16 +2106,21 @@ func (h *Hub) enforceWSEpoch(msg IncomingMessage, channelUUID uuid.UUID, channel
 		channelUUID, keyVersion,
 	).Scan(&epochRevoked); err != nil {
 		log.Printf("Failed to check epoch revocation: %v", err)
-		h.sendError(msg.ClientID, "Failed to verify key epoch")
+		h.sendError(msg.ClientID, errMsgFailedVerifyKeyEpoch)
 		return false
 	}
 	if epochRevoked {
 		currentEpoch := 1
 		if err := h.db.QueryRow(
-			`SELECT COALESCE(MAX(key_version), 1) FROM channel_keys WHERE channel_id = $1`,
+			`SELECT GREATEST(
+				COALESCE(MAX(key_version), 1),
+				COALESCE((SELECT MAX(successor_epoch) FROM key_revocations WHERE channel_id = $1), 1)
+			) FROM channel_keys WHERE channel_id = $1`,
 			channelUUID,
 		).Scan(&currentEpoch); err != nil {
 			log.Printf("Failed to fetch current epoch for channel %s: %v", sanitizeLogValue(channelID), err)
+			h.sendError(msg.ClientID, errMsgFailedVerifyKeyEpoch)
+			return false
 		}
 		h.sendErrorWithData(msg.ClientID, "epoch_revoked", map[string]interface{}{
 			"current_epoch": currentEpoch,
@@ -3489,7 +3495,7 @@ func (h *Hub) enforceDMEpoch(msg IncomingMessage, convUUID uuid.UUID, keyVersion
 		convUUID, keyVersion,
 	).Scan(&epochRevoked); err != nil {
 		log.Printf("Failed to check DM epoch revocation: %v", err)
-		h.sendError(msg.ClientID, "Failed to verify key epoch")
+		h.sendError(msg.ClientID, errMsgFailedVerifyKeyEpoch)
 		return false
 	}
 	if !epochRevoked {
@@ -3501,6 +3507,8 @@ func (h *Hub) enforceDMEpoch(msg IncomingMessage, convUUID uuid.UUID, keyVersion
 		convUUID,
 	).Scan(&currentEpoch); err != nil {
 		log.Printf("Failed to fetch current epoch for DM %s: %v", sanitizeLogValue(convUUID.String()), err)
+		h.sendError(msg.ClientID, errMsgFailedVerifyKeyEpoch)
+		return false
 	}
 	convID := convUUID.String()
 	h.sendErrorWithData(msg.ClientID, "epoch_revoked", map[string]interface{}{

@@ -1078,7 +1078,7 @@ func TestSendMessageRevokedEpochRejected(t *testing.T) {
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
 	assert.Equal(t, "epoch_revoked", body["code"])
-	assert.NotNil(t, body["current_epoch"])
+	assert.Equal(t, float64(2), body["current_epoch"], "the ledger remains authoritative without an epoch-2 key row")
 }
 
 // =====================================================================
