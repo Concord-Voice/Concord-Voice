@@ -283,3 +283,6 @@ graphify-out/cost.json
 graphify-out/.vocab.txt
 graphify-out/memory/
 graphify-out/reflections/
+# Every `graphify update .` snapshots the previous bundle into a dated dir
+# (~44 MB each). Local rollback only — never committed.
+graphify-out/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
