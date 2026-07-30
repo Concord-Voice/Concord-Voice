@@ -565,6 +565,19 @@ build-time-only attributions:
   by a dev tool; not linked into any shipped binary (confirmed via
   `go mod why github.com/avast/apkparser` returning "main module does
   not need package").
+- **"cure for AI slop" kit** (MIT, Copyright (c) 2026 Ege Çelebi) —
+  **vendored source, not a managed package.** The ASD-STE100 writing skill
+  and its `ste-lint.py` heuristic linter, copied into
+  `[internal]skills/ste-writing/` and its generated mirrors under
+  `.github/skills/`, `.gemini/skills/`, and `.codex/skills/`. Repo tooling
+  only; not linked into or bundled with any shipped artifact. Modified by
+  Concord Voice — local changes are listed in the linter's file header. The
+  full MIT copyright and permission notice is preserved at
+  `[internal]skills/ste-writing/LICENSE.upstream`. Upstream:
+  <https://github.com/woosal1337/blog/tree/b912d5fa59f368253683af2ebfac64ad6d08312d/videos/ep01-the-cure-for-ai-slop>.
+  Because it is vendored rather than resolved by a package manager, it will
+  **not** appear in regenerated dependency listings — update this entry by
+  hand if the vendored copy changes.
 
 ## Regenerating This File
 
