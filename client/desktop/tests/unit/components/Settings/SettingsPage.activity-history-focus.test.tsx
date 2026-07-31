@@ -3,17 +3,43 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
 import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
 
-vi.mock('@/renderer/components/Settings/AccountSection', () => ({
+vi.mock('@/renderer/components/Settings/PrivacySecuritySection', () => ({
   default: () => (
-    <details>
-      <summary>My Profile</summary>
-      <section id="section-profile" />
-      <section id="section-presence-history" aria-labelledby="presence-history-heading">
+    <>
+      <details id="section-privacy-settings">
+        <summary>Privacy</summary>
+      </details>
+      <details id="section-mfa">
+        <summary>Multi-Factor Authentication</summary>
+      </details>
+      <details id="section-presence-history">
+        <summary>Activity History</summary>
         <h3 id="presence-history-heading" tabIndex={-1}>
           Activity History
         </h3>
-      </section>
+      </details>
+      <details id="section-active-sessions">
+        <summary>Active Sessions</summary>
+      </details>
+    </>
+  ),
+}));
+
+vi.mock('@/renderer/components/Settings/subscription/SubscriptionSection', () => ({
+  default: () => (
+    <details id="section-current-plan">
+      <summary>Current Plan</summary>
     </details>
+  ),
+}));
+
+vi.mock('@/renderer/components/Settings/AccountSection', () => ({
+  default: () => (
+    <>
+      <section id="section-profile" />
+      <section id="section-password" />
+      <section id="section-nsfw-content" />
+    </>
   ),
 }));
 
@@ -35,7 +61,7 @@ afterEach(() => {
 });
 
 describe('SettingsPage Activity History focus integration', () => {
-  it('routes the Account sidebar item through the persistent history heading focus target', () => {
+  it('routes the Privacy sidebar item through the persistent history heading focus target', () => {
     useClientConfigStore.getState().setActivityHistoryCapability({ status: 'supported' });
     render(<SettingsPage />);
 
@@ -64,22 +90,22 @@ describe('SettingsPage Activity History focus integration', () => {
     expect(screen.getByRole('button', { name: 'Activity History' })).toBeInTheDocument();
   });
 
-  it('hides only unsupported Activity History navigation and preserves ordinary Account subsections', () => {
+  it('hides only unsupported Activity History navigation and preserves ordinary Privacy subsections', () => {
     useClientConfigStore
       .getState()
       .setActivityHistoryCapability({ status: 'confirmed-unsupported' });
     render(<SettingsPage />);
 
     expect(screen.queryByRole('button', { name: 'Activity History' })).not.toBeInTheDocument();
-    const profileButton = screen.getByRole('button', { name: 'My Profile' });
-    expect(screen.getByRole('button', { name: 'NSFW Content Access' })).toBeInTheDocument();
+    const privacyButton = screen.getByRole('button', { name: 'Privacy' });
+    expect(screen.getByRole('button', { name: 'Active Sessions' })).toBeInTheDocument();
 
-    fireEvent.click(profileButton);
+    fireEvent.click(privacyButton);
     act(() => {
       vi.advanceTimersByTime(60);
     });
 
-    expect(document.getElementById('section-profile')).not.toBeNull();
+    expect(document.getElementById('section-privacy-settings')).not.toBeNull();
     expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({
       behavior: 'smooth',
       block: 'start',
@@ -90,7 +116,7 @@ describe('SettingsPage Activity History focus integration', () => {
     render(<SettingsPage />);
 
     act(() => {
-      useSettingsNavStore.getState().requestFocus('account', 'presence-history-heading');
+      useSettingsNavStore.getState().requestFocus('privacy', 'presence-history-heading');
     });
     act(() => {
       vi.advanceTimersByTime(60);
@@ -99,6 +125,25 @@ describe('SettingsPage Activity History focus integration', () => {
     const heading = document.getElementById('presence-history-heading');
     expect(document.activeElement).toBe(heading);
     expect(heading?.closest('details')).toHaveAttribute('open');
+    expect(useSettingsNavStore.getState().focusRequest).toBeNull();
+  });
+  it('focuses the summary when a deep-link targets a <details> (subscriptions deep-link)', () => {
+    render(<SettingsPage />);
+
+    act(() => {
+      useSettingsNavStore.getState().requestFocus('subscriptions', 'section-current-plan');
+    });
+    act(() => {
+      vi.advanceTimersByTime(60);
+    });
+
+    const details = document.getElementById('section-current-plan');
+    expect(details).not.toBeNull();
+    // focus() on a <details> is a no-op, so the effect must redirect to its <summary>.
+    // Without that redirect this silently lands nowhere and clearFocusRequest() still
+    // runs, so the failure mode is invisible — which is why it needs an explicit test.
+    expect(document.activeElement).toBe(details?.querySelector(':scope > summary'));
+    expect(details).toHaveAttribute('open');
     expect(useSettingsNavStore.getState().focusRequest).toBeNull();
   });
 });

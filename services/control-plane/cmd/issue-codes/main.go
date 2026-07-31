@@ -9,7 +9,7 @@
 // DBAuditSink the HTTP path uses (issuer_context='cli').
 //
 // Codes are printed to stdout ONCE — only their SHA-256 hash is persisted. Pipe
-// to a file or --csv for the Kickstarter backer survey; they are unrecoverable
+// to a file or --csv for secure distribution; they are unrecoverable
 // afterward. See [internal]redemption-code-issuance.md.
 package main
 
@@ -80,14 +80,14 @@ func main() {
 // directly unit-testable with synthetic args.
 func parseFlags(fs *flag.FlagSet, args []string) issueOptions {
 	var (
-		grantKind  = fs.String("grant-kind", "", "Grant catalog key (e.g. premium:subscription, feature:custom_themes, cosmetic:founder_badge)")
+		grantKind  = fs.String("grant-kind", "", "Grant catalog key (e.g. premium:subscription, feature:custom_themes, cosmetic:profile_badge)")
 		months     = fs.Int("months", 0, "Months for premium:subscription grants (sets grant_params {\"months\":N}); ignored for other kinds")
 		count      = fs.Int("count", 1, "Number of codes to mint")
-		prefix     = fs.String("prefix", "", "Non-secret support prefix (e.g. KS, PROMO); ≤16 chars")
+		prefix     = fs.String("prefix", "", "Non-secret support prefix (e.g. CV, PROMO); ≤16 chars")
 		singleUse  = fs.Bool("single-use", true, "Mark codes single-use (one-off). Set --single-use=false for promo codes")
 		maxRedeems = fs.String("max-redeems", "1", "Max redemptions per code: a positive integer, or 'unlimited' (promo). Unlimited requires --expires")
 		expires    = fs.String("expires", "", "Hard expiry as RFC3339 (e.g. 2026-12-31T23:59:59Z). Required for unlimited promo codes")
-		batchID    = fs.String("batch-id", "", "Shared campaign label across the batch (e.g. ks-2026-founder); ≤64 chars")
+		batchID    = fs.String("batch-id", "", "Shared campaign label across the batch (e.g. promo-2026-q3); ≤64 chars")
 		csvPath    = fs.String("csv", "", "Write codes to this CSV path (columns: code,batch_id,grant_kind) instead of plain stdout")
 	)
 	// args come from a caller-built slice (os.Args[1:] in main); parse errors use

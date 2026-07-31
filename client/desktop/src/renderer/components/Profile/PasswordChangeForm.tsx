@@ -56,8 +56,6 @@ const PasswordChangeForm: React.FC = () => {
 
   return (
     <form className="profile-section" onSubmit={handlePasswordSubmit}>
-      <h2 className="profile-section-title">Change Password</h2>
-
       {/* Current Password */}
       <div className="form-group">
         <label htmlFor="current-password" className="form-label">

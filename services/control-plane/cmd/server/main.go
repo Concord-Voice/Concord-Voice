@@ -227,8 +227,8 @@ func runControlPlane() (runErr error) {
 	voice.StartTempGrantSweepWorker(cleanupCtx, db, log, hub, sweepResolver, natsClient, voice.DefaultTempGrantSweepInterval)
 
 	// Start the subscription-expiry sweeper (#2158). Fixed-duration code grants
-	// (Kickstarter, Beta) lapse purely by the clock; without this the passive
-	// expiry never fires OnTierChange, so a client keeps premium UI affordances
+	// lapse purely by the clock; without this the passive expiry never fires
+	// OnTierChange, so a client keeps premium UI affordances
 	// until it reconnects while the server already rejects them. The sweep flips
 	// each lapsed subscription to 'expired' and runs the SAME OnTierChange
 	// convergence point (cache invalidate + entitlements_changed push + downgrade

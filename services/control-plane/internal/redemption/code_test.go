@@ -48,7 +48,7 @@ func TestNormalizeAndValidate_RoundTrip(t *testing.T) {
 
 	cases := []string{
 		formatCode(raw, ""),               // grouped, no prefix
-		formatCode(raw, "KS"),             // grouped, with prefix
+		formatCode(raw, "CV"),             // grouped, with prefix
 		formatCode(raw, "promo"),          // lowercase prefix
 		strings.ToLower(raw),              // ungrouped lowercase, no hyphens
 		"  " + formatCode(raw, "") + "  ", // surrounding whitespace
@@ -131,6 +131,6 @@ func TestHashCode_Deterministic(t *testing.T) {
 func TestFormatCode_Grouping(t *testing.T) {
 	raw := "ABCDEFGHIJ" // 10 symbols → two groups of 5
 	assert.Equal(t, "ABCDE-FGHIJ", formatCode(raw, ""))
-	assert.Equal(t, "KS-ABCDE-FGHIJ", formatCode(raw, "KS"))
+	assert.Equal(t, "CV-ABCDE-FGHIJ", formatCode(raw, "CV"))
 	assert.Equal(t, "PROMO-ABCDE-FGHIJ", formatCode(raw, "promo"))
 }

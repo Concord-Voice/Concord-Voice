@@ -29,15 +29,18 @@
 
 /* display:block because the status states render as <output> (inline by default). */
 .nsfw-gate__status,
-.nsfw-gate__error,
-.nsfw-gate__satisfied {
+.nsfw-gate__error {
   display: block;
-  margin: 8px 0;
   color: var(--text-secondary);
 }
 
-.nsfw-gate__status--ok {
-  color: var(--success-color, var(--accent-color));
+.nsfw-gate__status {
+  margin: 0;
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+.nsfw-gate__error {
+  margin: 8px 0;
 }
 
 .nsfw-gate__error,

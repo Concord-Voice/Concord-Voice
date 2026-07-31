@@ -1,17 +1,22 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { openSubscriptionPage } from '@/renderer/utils/openSubscriptionPage';
 import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 beforeEach(() => {
+  resetAllStores();
   useSettingsNavStore.getState().clearFocusRequest();
+  useSettingsOverlayStore.setState({ open: null, payload: null });
 });
 
 describe('openSubscriptionPage', () => {
-  it('navigates to Account ▸ section-subscription', () => {
+  it('opens app settings and navigates to Subscriptions ▸ Current Plan', () => {
     openSubscriptionPage();
+    expect(useSettingsOverlayStore.getState().open).toBe('app');
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'account',
-      controlId: 'section-subscription',
+      section: 'subscriptions',
+      controlId: 'section-current-plan',
     });
   });
 
@@ -19,7 +24,7 @@ describe('openSubscriptionPage', () => {
     const spy = vi.spyOn(useSettingsNavStore.getState(), 'requestFocus');
     openSubscriptionPage('audio-tier');
     expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy).toHaveBeenCalledWith('account', 'section-subscription');
+    expect(spy).toHaveBeenCalledWith('subscriptions', 'section-current-plan');
     spy.mockRestore();
   });
 
@@ -32,9 +37,7 @@ describe('openSubscriptionPage', () => {
     expect(first).toEqual(second);
   });
 
-  it('only navigates — it does not render a Subscription page (page is #1304)', () => {
-    // Boundary test (spec §8): the function has no return value / no DOM side
-    // effect beyond the focus request.
+  it('does not render a Subscription page itself', () => {
     const result = openSubscriptionPage('video-quality');
     expect(result).toBeUndefined();
   });

@@ -26,7 +26,7 @@ export interface SubscriptionResetModalProps {
  *
  * Native `<dialog>` `.showModal()` provides the focus trap (a11y O2) AND returns
  * focus to the element that was focused before opening, on close. Both actions
- * dismiss; "See what Premium includes" also routes to the Subscription page.
+ * dismiss; the secondary action also routes to the Subscription page.
  */
 const SubscriptionResetModal: React.FC<SubscriptionResetModalProps> = ({ open, onAcknowledge }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -49,9 +49,9 @@ const SubscriptionResetModal: React.FC<SubscriptionResetModalProps> = ({ open, o
 
   if (!open) return null;
 
-  const handleSeePremium = (): void => {
-    openSubscriptionPage();
+  const handleViewSubscriptions = (): void => {
     onAcknowledge();
+    openSubscriptionPage();
   };
 
   return (
@@ -64,18 +64,17 @@ const SubscriptionResetModal: React.FC<SubscriptionResetModalProps> = ({ open, o
       onClose={onAcknowledge}
     >
       <div className="subscription-reset-modal">
-        <h2 id="subscription-reset-modal-title">Some features are now part of Premium</h2>
+        <h2 id="subscription-reset-modal-title">Some settings were reset</h2>
         <p id="subscription-reset-modal-body">
-          Your audio/video quality was reset to free defaults. You can unlock it again any time with
-          Premium.
+          Your audio/video quality was reset to free defaults.
         </p>
         <div className="subscription-reset-modal__actions">
           <button
             type="button"
             className="subscription-reset-modal__secondary"
-            onClick={handleSeePremium}
+            onClick={handleViewSubscriptions}
           >
-            See what Premium includes
+            View planned subscriptions
           </button>
           <button
             type="button"

@@ -23,8 +23,11 @@ const { mockSetDraftVideoSetting } = vi.hoisted(() => ({
 // ─── Mocks (before component imports) ───────────────────────────────────────
 
 vi.mock('@/renderer/stores/voiceStore', () => ({
-  useVoiceStore: vi.fn((s: (state: Record<string, unknown>) => unknown) =>
-    s({ activeCameraCodec: null, activeScreenCodec: null })
+  useVoiceStore: Object.assign(
+    vi.fn((s: (state: Record<string, unknown>) => unknown) =>
+      s({ activeCameraCodec: null, activeScreenCodec: null })
+    ),
+    { getState: () => ({ reset: vi.fn() }), setState: vi.fn() }
   ),
 }));
 
@@ -102,6 +105,7 @@ vi.mock('@/renderer/hooks/useEntitlement', () => ({
 
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { resetAllStores } from '../../../helpers/store-helpers';
 import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
 import VideoConfigSection from '@/renderer/components/Settings/VideoConfigSection';
 
@@ -120,6 +124,7 @@ function openDetails() {
 }
 
 beforeEach(() => {
+  resetAllStores();
   vi.clearAllMocks();
   videoAdvancedMode = false;
   setEntitlement({});
@@ -542,8 +547,8 @@ describe('VideoConfigSection — L5 manual STREAM bitrate clamp', () => {
     openDetails();
     fireEvent.click(document.querySelector('.settings-bitrate-ghost-zone') as HTMLElement);
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'account',
-      controlId: 'section-subscription',
+      section: 'subscriptions',
+      controlId: 'section-current-plan',
     });
   });
 

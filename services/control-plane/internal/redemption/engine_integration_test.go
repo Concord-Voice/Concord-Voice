@@ -107,6 +107,40 @@ func TestRedeem_PremiumHappyPath(t *testing.T) {
 	assert.Equal(t, [3]string{user.String(), "free", "premium"}, notifier.calls[0])
 }
 
+func TestRedeem_PremiumPreservesStripeSource(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	user := insertUser(t, db)
+	originalEnd := time.Now().UTC().AddDate(0, 1, 0).Truncate(time.Second)
+	_, err := db.Exec(
+		`INSERT INTO subscriptions (user_id, tier, status, source, current_period_end)
+		 VALUES ($1, 'premium', 'active', 'stripe', $2)`,
+		user, originalEnd,
+	)
+	require.NoError(t, err)
+
+	code := issueOne(t, db, redemption.IssueSpec{
+		GrantKind:   redemption.GrantPremiumSubscription,
+		GrantParams: map[string]any{"months": 1},
+		Count:       1,
+		SingleUse:   true,
+		MaxRedeems:  intPtr(1),
+		BatchID:     "stripe-preservation",
+	})
+	_, err = newEngine(db, &recordingNotifier{}).Redeem(ctx, user, code)
+	require.NoError(t, err)
+
+	var source string
+	var extendedEnd time.Time
+	require.NoError(t, db.QueryRow(
+		`SELECT source, current_period_end FROM subscriptions WHERE user_id=$1`, user,
+	).Scan(&source, &extendedEnd))
+	assert.Equal(t, "stripe", source)
+	assert.Greater(t, extendedEnd.Unix(), originalEnd.Unix())
+	assert.WithinDuration(t, originalEnd.AddDate(0, 1, 0), extendedEnd, time.Second)
+}
+
 // TestRedeem_FeatureAndCosmetic: non-premium kinds redeem (ledger-of-record),
 // no subscription, no tier change.
 func TestRedeem_FeatureAndCosmetic(t *testing.T) {
@@ -114,7 +148,7 @@ func TestRedeem_FeatureAndCosmetic(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	for _, kind := range []string{"feature:custom_themes", "cosmetic:founder_badge"} {
+	for _, kind := range []string{"feature:custom_themes", "cosmetic:profile_badge"} {
 		user := insertUser(t, db)
 		code := issueOne(t, db, redemption.IssueSpec{
 			GrantKind: kind, Count: 1, SingleUse: true, MaxRedeems: intPtr(1),

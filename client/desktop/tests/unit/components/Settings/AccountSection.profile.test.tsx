@@ -1,6 +1,7 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { mockUser } from '../../../mocks/fixtures';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock PasswordStrength
 vi.mock('@/renderer/components/Auth/PasswordStrength', () => ({
@@ -16,23 +17,22 @@ vi.mock('@/renderer/components/Auth/LoadingSpinner', () => ({
 
 // NsfwContentGate (the sibling section in AccountSection) reads age status.
 vi.mock('@/renderer/hooks/useAgeStatus', () => ({
-  useAgeStatus: () => ({ nsfwAuth: 'unknown' }),
+  useAgeStatus: () => ({ state: 'unverified' }),
 }));
 
 vi.mock('@/renderer/components/Profile/PresenceHistorySection', () => ({
-  default: ({ userId }: { userId: string | null }) => (
-    <section aria-label="Self Activity History" data-user-id={userId ?? ''} />
-  ),
+  default: () => null,
 }));
 
 import AccountSection from '@/renderer/components/Settings/AccountSection';
 
-// Profile/password form behavior, exercised through their new host AccountSection ▸
-// My Profile (#1773). Was tests/unit/components/Profile/ProfilePage.test.tsx before the
+// Profile/password form behavior, exercised through their host AccountSection (#1773).
+// Was tests/unit/components/Profile/ProfilePage.test.tsx before the
 // standalone page was removed; retained here so ProfileInfoForm + PasswordChangeForm
 // (an OWASP A07 surface) coverage does not regress during the move.
-describe('AccountSection ▸ My Profile', () => {
+describe('AccountSection profile and password forms', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
     useUserStore.setState({
       user: {
@@ -45,18 +45,11 @@ describe('AccountSection ▸ My Profile', () => {
     });
   });
 
-  it('renders the My Profile section title', () => {
+  it('renders Profile Information as the profile section title', () => {
     render(<AccountSection />);
-    expect(screen.getByText('My Profile')).toBeInTheDocument();
-  });
-
-  it('keeps the self-history feed in My Profile and scopes it to the profile owner', () => {
-    render(<AccountSection />);
-
-    const history = screen.getByLabelText('Self Activity History');
-    const profileDetails = screen.getByText('My Profile').closest('details');
-    expect(history).toHaveAttribute('data-user-id', mockUser.id);
-    expect(profileDetails).toContainElement(history);
+    expect(document.getElementById('section-profile')?.querySelector('summary')).toHaveTextContent(
+      'Profile Information'
+    );
   });
 
   it('renders profile information section', () => {
@@ -107,9 +100,9 @@ describe('AccountSection ▸ My Profile', () => {
 
   it('renders password change section', () => {
     render(<AccountSection />);
-    // "Change Password" appears as h2 title AND as submit button text
-    const elements = screen.getAllByText('Change Password');
-    expect(elements.length).toBeGreaterThanOrEqual(2);
+    const passwordSection = document.getElementById('section-password');
+    expect(passwordSection).not.toBeNull();
+    expect(passwordSection?.querySelector('summary')).toHaveTextContent('Change Password');
   });
 
   it('renders current password field', () => {

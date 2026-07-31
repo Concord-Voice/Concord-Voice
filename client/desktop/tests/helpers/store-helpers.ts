@@ -10,6 +10,7 @@ import { useDMStore } from '../../src/renderer/stores/dmStore';
 import { useFriendStore } from '../../src/renderer/stores/friendStore';
 import { useConnectionStore } from '../../src/renderer/stores/connectionStore';
 import { usePrivacyStore } from '../../src/renderer/stores/privacyStore';
+import { useSubscriptionStore } from '../../src/renderer/stores/subscriptionStore';
 import { useMFAChallengeStore } from '../../src/renderer/stores/mfaChallengeStore';
 import { useSavedGifsStore } from '../../src/renderer/stores/savedGifsStore';
 import { useChannelScrollStore } from '../../src/renderer/stores/channelScrollStore';
@@ -24,6 +25,7 @@ import { useRichPresenceStore } from '../../src/renderer/stores/richPresenceStor
 import { useChangelogStore } from '../../src/renderer/stores/changelogStore';
 import { useFriendOrgStore } from '../../src/renderer/stores/friendOrgStore';
 import { usePresenceOverrideStore } from '../../src/renderer/stores/presenceOverrideStore';
+import { useSettingsStore } from '../../src/renderer/stores/settingsStore';
 
 /**
  * Resets all Zustand stores to their initial state.
@@ -45,6 +47,8 @@ export function resetAllStores(): void {
   useFriendStore.getState().clearFriends();
   useConnectionStore.getState().reset();
   usePrivacyStore.getState().clearPrivacy();
+  useSubscriptionStore.getState().reset();
+  useSettingsStore.getState().setAllowNsfwContent(false);
   useMFAChallengeStore.getState().clearChallenge();
   useSavedGifsStore.setState({ gifs: [] });
   useChannelScrollStore.setState({ positions: {}, latestMessageIds: {} });

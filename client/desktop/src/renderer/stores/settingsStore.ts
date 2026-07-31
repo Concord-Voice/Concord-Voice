@@ -96,6 +96,21 @@ interface SettingsState {
    * persist `merge` below, which must carry it through rehydration.
    */
   subscriptionResetAcknowledged: boolean;
+  /**
+   * The user's stored *intent* to see NSFW content — NOT permission to show it.
+   *
+   * `setAllowNsfwContent` is unconditional and this value is persisted, so a stored
+   * `true` can outlive the age eligibility that permitted it (a `nsfwAuth` revocation,
+   * a downgrading re-verification, or the transient loading window on launch).
+   *
+   * **Never render NSFW content on this field alone.** Any consumer must conjoin it with
+   * live age eligibility — `useAgeStatus()`'s `validAge && nsfwAuth`, the same test
+   * `NsfwContentGate` applies before it renders `checked`. Reading the raw boolean is
+   * fail-OPEN, which is the wrong direction for an adult-content gate. Writes are guarded
+   * at the gate component; reads are the caller's responsibility until a derived selector
+   * exists (worth adding when NSFW-marked channels land and the second consumer appears).
+   */
+  allowNsfwContent: boolean;
   setTheme: (theme: AppearanceSettings['theme']) => void;
   setColorScheme: (scheme: AppearanceSettings['colorScheme']) => void;
   setFontSize: (size: AppearanceSettings['fontSize']) => void;
@@ -108,6 +123,7 @@ interface SettingsState {
   setDyslexicSupport: (on: boolean) => void;
   setClientBehavior: (value: ClientBehavior) => void;
   setSubscriptionResetAcknowledged: (acknowledged: boolean) => void;
+  setAllowNsfwContent: (allowed: boolean) => void;
 }
 
 const defaultAppearance: AppearanceSettings = {
@@ -202,6 +218,7 @@ export const useSettingsStore = wrapStore(
         appearance: defaultAppearance,
         clientBehavior: DEFAULT_CLIENT_BEHAVIOR,
         subscriptionResetAcknowledged: false,
+        allowNsfwContent: false,
 
         setTheme: (theme) =>
           set((state) => ({
@@ -255,6 +272,8 @@ export const useSettingsStore = wrapStore(
         setSubscriptionResetAcknowledged: (subscriptionResetAcknowledged) =>
           set({ subscriptionResetAcknowledged }),
 
+        setAllowNsfwContent: (allowNsfwContent) => set({ allowNsfwContent }),
+
         setClientBehavior: (value: ClientBehavior) => {
           set({ clientBehavior: value });
           // Push to main so the close/minimize intercepts see the new value.
@@ -284,6 +303,7 @@ export const useSettingsStore = wrapStore(
             // Default false when a pre-#1301 snapshot has no ack flag (the
             // `...p` spread already carries it forward when present).
             subscriptionResetAcknowledged: p?.subscriptionResetAcknowledged ?? false,
+            allowNsfwContent: p?.allowNsfwContent ?? false,
           };
         },
       }

@@ -19,6 +19,7 @@ import './PresenceHistorySection.css';
 
 export interface PresenceHistorySectionProps {
   readonly userId: string | null;
+  readonly onVisibilityChange?: (visible: boolean) => void;
 }
 
 type LoadMoreState = 'idle' | 'loading' | 'error';
@@ -366,7 +367,10 @@ function ReadyHistoryFeed({ state, onLoadMore }: ReadyHistoryFeedProps) {
   );
 }
 
-export default function PresenceHistorySection({ userId }: PresenceHistorySectionProps) {
+export default function PresenceHistorySection({
+  userId,
+  onVisibilityChange,
+}: PresenceHistorySectionProps) {
   const capability = useClientConfigStore((state) => state.activityHistoryCapability);
   const staleSupported = capability.status === 'error' && capability.lastConfirmedSupported;
   const historyCapabilityUsable =
@@ -576,14 +580,21 @@ export default function PresenceHistorySection({ userId }: PresenceHistorySectio
   }, [feedState, userId]);
 
   const currentState = feedState.ownerId === userId ? feedState : emptyFeedState(userId);
-  if (
+  const visible = !(
     capability.status === 'confirmed-unsupported' &&
     (currentState.status === 'idle' ||
       currentState.status === 'loading' ||
       (currentState.status === 'error' &&
         currentState.confirmed === null &&
         currentState.routeMissing))
-  ) {
+  );
+  useEffect(() => {
+    onVisibilityChange?.(visible);
+    // Un-latch on unmount: the parent lifts this into a `hidden` wrapper, and without
+    // the cleanup a section that unmounts while visible leaves an empty collapsible.
+    return () => onVisibilityChange?.(false);
+  }, [onVisibilityChange, visible]);
+  if (!visible) {
     return null;
   }
   const currentAnnouncement = announcement.ownerId === userId ? announcement.message : '';
@@ -620,11 +631,7 @@ export default function PresenceHistorySection({ userId }: PresenceHistorySectio
   }
 
   return (
-    <section
-      id="section-presence-history"
-      className="presence-history"
-      aria-labelledby="presence-history-heading"
-    >
+    <section className="presence-history" aria-labelledby="presence-history-heading">
       <h3
         id="presence-history-heading"
         className="settings-section-title presence-history__heading"

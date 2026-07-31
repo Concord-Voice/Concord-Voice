@@ -43,7 +43,17 @@ describe('NsfwContentGate — verified state persists across mounts (regression 
     render(<NsfwContentGate />);
 
     // The gate must reflect the authoritative verified record — never re-prompt for DOB.
-    expect(await screen.findByText(/already verified/i)).toBeInTheDocument();
+    expect(await screen.findByText('Age verified · Eligible for NSFW content')).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).toHaveAttribute(
+      'aria-disabled',
+      'false'
+    );
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).not.toBeChecked();
+    expect(
+      screen.getByText(
+        'This saves your preference for future NSFW-marked channels. NSFW-marked channels are not available yet.'
+      )
+    ).toBeInTheDocument();
     expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
   });
 });

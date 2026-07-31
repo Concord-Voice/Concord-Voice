@@ -1,7 +1,8 @@
-import { render, screen, fireEvent, waitFor } from '../../../test-utils';
+import { render, screen, fireEvent, waitFor, userEvent } from '../../../test-utils';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import type { AgeStatus } from '@/renderer/hooks/useAgeStatus';
+import { useSettingsStore } from '@/renderer/stores/settingsStore';
 
 const { mockSubmit, ageStatusRef } = vi.hoisted(() => ({
   mockSubmit: vi.fn(),
@@ -23,6 +24,9 @@ vi.mock('@/renderer/hooks/useAgeStatus', () => ({
 }));
 
 import NsfwContentGate from '@/renderer/components/Settings/NsfwContentGate';
+
+const FUTURE_COPY =
+  'This saves your preference for future NSFW-marked channels. NSFW-marked channels are not available yet.';
 
 function enterDob(year: string, month: string, day: string) {
   fireEvent.change(screen.getByRole('spinbutton', { name: /year/i }), { target: { value: year } });
@@ -46,26 +50,112 @@ describe('NsfwContentGate', () => {
     vi.useRealTimers();
   });
 
-  it('skips the gate when a verified status is already known (nsfw enabled)', () => {
-    ageStatusRef.current = { state: 'verified', validAge: true, nsfwAuth: true };
+  it.each([
+    [{ state: 'loading' }, 'Checking your verification status…'],
+    [{ state: 'unverified' }, 'Verify your age before you can change this preference.'],
+    [
+      { state: 'verified', validAge: false, nsfwAuth: false },
+      "Age verification did not meet Concord's minimum age requirement.",
+    ],
+    [
+      { state: 'verified', validAge: true, nsfwAuth: false },
+      'Age verified · Not eligible for NSFW content',
+    ],
+  ] as const)('keeps the preference disabled for %o', (ageStatus, copy) => {
+    ageStatusRef.current = ageStatus;
     render(<NsfwContentGate />);
-    expect(screen.getByText(/already verified/i)).toBeInTheDocument();
-    expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
+
+    expect(screen.getByText(copy)).toBeInTheDocument();
+    expect(screen.getByText(FUTURE_COPY)).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).not.toBeChecked();
+
+    if (ageStatus.state === 'unverified') {
+      expect(screen.getByRole('spinbutton', { name: /year/i })).toBeInTheDocument();
+    } else {
+      expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
+    }
   });
 
-  it('shows the verified-but-locked state on mount for a known 16–17 verification', () => {
+  // The switch is aria-disabled (focusable, so AT can reach the explanation) rather than
+  // HTML-disabled, so the browser no longer blocks the click. Enforcement moved to the
+  // component's handler guard — this proves the guard, not the attribute, is what holds.
+  it('refuses to store the preference when the user is not age-eligible', async () => {
     ageStatusRef.current = { state: 'verified', validAge: true, nsfwAuth: false };
     render(<NsfwContentGate />);
-    expect(screen.getByText(/remains\s+locked/i)).toBeInTheDocument();
-    expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
+
+    const toggle = screen.getByRole('switch', { name: 'Allow NSFW content' });
+    expect(toggle).toHaveAttribute('aria-disabled', 'true');
+    // Reachable by keyboard/AT — the whole point of not using HTML `disabled`.
+    expect(toggle).toBeEnabled();
+
+    await userEvent.click(toggle);
+
+    expect(useSettingsStore.getState().allowNsfwContent).toBe(false);
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).not.toBeChecked();
   });
 
-  it('shows a neutral checking state while the status is loading (no DOB flash)', () => {
-    ageStatusRef.current = { state: 'loading' };
+  it('explains why a verified under-18 user cannot opt in', () => {
+    ageStatusRef.current = { state: 'verified', validAge: true, nsfwAuth: false };
     render(<NsfwContentGate />);
-    expect(screen.getByText(/checking your verification status/i)).toBeInTheDocument();
-    // The DOB form must NOT flash while we are still resolving the durable outcome.
+
+    expect(screen.getByText('Age verified · Not eligible for NSFW content')).toBeInTheDocument();
+    expect(
+      screen.getByText('You must be 18 or older to enable this preference.')
+    ).toBeInTheDocument();
+  });
+
+  it('keeps every switch description target mounted', () => {
+    render(<NsfwContentGate />);
+
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).toHaveAttribute(
+      'aria-describedby',
+      'allow-nsfw-content-status allow-nsfw-content-reason allow-nsfw-content-future'
+    );
+    expect(document.getElementById('allow-nsfw-content-status')).toBeInTheDocument();
+    expect(document.getElementById('allow-nsfw-content-reason')).toBeInTheDocument();
+    expect(document.getElementById('allow-nsfw-content-future')).toBeInTheDocument();
+  });
+
+  it('stores a verified adult explicit opt-in', async () => {
+    const user = userEvent.setup();
+    ageStatusRef.current = { state: 'verified', validAge: true, nsfwAuth: true };
+    render(<NsfwContentGate />);
+
+    expect(screen.getByText('Age verified · Eligible for NSFW content')).toBeInTheDocument();
+    expect(screen.getByText(FUTURE_COPY)).toBeInTheDocument();
+    const preference = screen.getByRole('switch', { name: 'Allow NSFW content' });
+    expect(preference).toBeEnabled();
+    expect(preference).not.toBeChecked();
     expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
+
+    await user.click(preference);
+
+    expect(preference).toBeChecked();
+    expect(useSettingsStore.getState().allowNsfwContent).toBe(true);
+  });
+
+  it('masks stored intent while ineligible and restores it when eligibility returns', () => {
+    useSettingsStore.getState().setAllowNsfwContent(true);
+    ageStatusRef.current = { state: 'verified', validAge: true, nsfwAuth: true };
+    const { rerender } = render(<NsfwContentGate />);
+
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).toBeChecked();
+
+    ageStatusRef.current = { state: 'unverified' };
+    rerender(<NsfwContentGate />);
+
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).not.toBeChecked();
+    expect(useSettingsStore.getState().allowNsfwContent).toBe(true);
+
+    ageStatusRef.current = { state: 'verified', validAge: true, nsfwAuth: true };
+    rerender(<NsfwContentGate />);
+
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).toBeChecked();
+    expect(useSettingsStore.getState().allowNsfwContent).toBe(true);
   });
 
   it('disables submit until a valid, non-future, real date is entered', () => {
@@ -91,12 +181,18 @@ describe('NsfwContentGate', () => {
     enterDob('2000', '3', '5');
     fireEvent.click(screen.getByRole('button', { name: /verify age/i }));
     expect(screen.getByText('2000-03-05')).toBeInTheDocument();
+    expect(screen.getByText(FUTURE_COPY)).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+    expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
     expect(mockSubmit).not.toHaveBeenCalled();
     expect(screen.getByRole('spinbutton', { name: /year/i })).toHaveValue(2000); // retained
   });
 
-  it('unlocks NSFW for an adult (>=18) and submits the exact birthdate signal', async () => {
+  it('enables the preference after adult verification without automatically opting in', async () => {
     mockSubmit.mockResolvedValue({ ok: true, validAge: true, nsfwAuth: true });
     render(<NsfwContentGate />);
     enterDob('2000', '1', '1');
@@ -107,7 +203,46 @@ describe('NsfwContentGate', () => {
         signal: { kind: 'birthdate', year: 2000, month: 1, day: 1 },
       })
     );
-    expect(await screen.findByText(/now enabled/i)).toBeInTheDocument();
+    expect(await screen.findByText('Age verified · Eligible for NSFW content')).toBeInTheDocument();
+    expect(screen.getByText(FUTURE_COPY)).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).toHaveAttribute(
+      'aria-disabled',
+      'false'
+    );
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).not.toBeChecked();
+    expect(useSettingsStore.getState().allowNsfwContent).toBe(false);
+    expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
+  });
+
+  it('moves focus to the persistent status output through the signed terminal outcome', async () => {
+    const user = userEvent.setup();
+    type AdultVerdict = { ok: true; validAge: true; nsfwAuth: true };
+    let resolveSubmit!: (verdict: AdultVerdict) => void;
+    mockSubmit.mockReturnValue(
+      new Promise<AdultVerdict>((resolve) => {
+        resolveSubmit = resolve;
+      })
+    );
+    render(<NsfwContentGate />);
+
+    await user.type(screen.getByRole('spinbutton', { name: /year/i }), '2000');
+    await user.type(screen.getByRole('spinbutton', { name: /month/i }), '1');
+    await user.type(screen.getByRole('spinbutton', { name: /day/i }), '1');
+    await user.click(screen.getByRole('button', { name: /verify age/i }));
+    await user.click(screen.getByRole('button', { name: /submit/i }));
+
+    const statusOutput = screen.getByRole('status');
+    expect(statusOutput).toHaveTextContent('Submitting age verification…');
+    expect.soft(statusOutput).toHaveAttribute('tabindex', '-1');
+    expect.soft(statusOutput).toHaveFocus();
+
+    resolveSubmit({ ok: true, validAge: true, nsfwAuth: true });
+
+    await waitFor(() =>
+      expect(statusOutput).toHaveTextContent('Age verified · Eligible for NSFW content')
+    );
+    expect(screen.getByRole('status')).toBe(statusOutput);
+    expect(statusOutput).toHaveFocus();
   });
 
   it('shows verified-but-locked for a 16–17 year old', async () => {
@@ -116,7 +251,19 @@ describe('NsfwContentGate', () => {
     enterDob('2009', '1', '1'); // age 17 at 2026-06-20
     fireEvent.click(screen.getByRole('button', { name: /verify age/i }));
     fireEvent.click(screen.getByRole('button', { name: /submit/i }));
-    expect(await screen.findByText(/remains locked/i)).toBeInTheDocument();
+    expect(
+      await screen.findByText('Age verified · Not eligible for NSFW content')
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('You must be 18 or older to enable this preference.')
+    ).toBeInTheDocument();
+    expect(screen.getByText(FUTURE_COPY)).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).not.toBeChecked();
+    expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
   });
 
   it('shows the disabled terminal screen for a sub-16 user (service returns validAge=false)', async () => {
@@ -128,6 +275,13 @@ describe('NsfwContentGate', () => {
     fireEvent.click(screen.getByRole('button', { name: /verify age/i }));
     fireEvent.click(screen.getByRole('button', { name: /submit/i }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/disabled/i);
+    expect(screen.getByText(FUTURE_COPY)).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).not.toBeChecked();
+    expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
   });
 
   it('shows the disabled screen on the account_disabled re-submit edge case', async () => {
@@ -137,6 +291,13 @@ describe('NsfwContentGate', () => {
     fireEvent.click(screen.getByRole('button', { name: /verify age/i }));
     fireEvent.click(screen.getByRole('button', { name: /submit/i }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/disabled/i);
+    expect(screen.getByText(FUTURE_COPY)).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).not.toBeChecked();
+    expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
   });
 
   it('surfaces a retryable error and re-renders the form on a non-disable failure', async () => {
@@ -149,6 +310,12 @@ describe('NsfwContentGate', () => {
     const year = screen.getByRole('spinbutton', { name: /year/i });
     expect(year).toBeInTheDocument();
     expect(year).toHaveValue(null); // DOB cleared after submit, even on error (privacy)
+    expect(screen.getByText(FUTURE_COPY)).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).not.toBeChecked();
   });
 
   it('never writes the raw DOB to web storage (submit path actually exercised)', async () => {
@@ -158,7 +325,7 @@ describe('NsfwContentGate', () => {
     enterDob('2000', '7', '4');
     fireEvent.click(screen.getByRole('button', { name: /verify age/i }));
     fireEvent.click(screen.getByRole('button', { name: /submit/i }));
-    await screen.findByText(/now enabled/i);
+    await screen.findByText('Age verified · Eligible for NSFW content');
     // Positive precondition so the no-write assertion is not vacuous: the submit ran.
     expect(mockSubmit).toHaveBeenCalledTimes(1);
     const wrote = setItem.mock.calls.flat().join('|');

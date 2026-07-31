@@ -9,6 +9,7 @@ import PrivacySecuritySection from './PrivacySecuritySection';
 import VoiceAudioSection from './VoiceAudioSection';
 import AccessibilitySection from './AccessibilitySection';
 import AccountSection from './AccountSection';
+import SubscriptionSection from './subscription/SubscriptionSection';
 import NotificationSection from './NotificationSection';
 import AboutUpdateSection from './AboutUpdateSection';
 import ExpandCollapseAllButton from './ExpandCollapseAllButton';
@@ -75,6 +76,17 @@ const navItems: NavItem[] = [
           strokeWidth="1.5"
           strokeLinecap="round"
         />
+      </svg>
+    ),
+  },
+  {
+    id: 'subscriptions',
+    label: 'Subscriptions',
+    enabled: true,
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+        <rect x="2" y="4" width="14" height="10" rx="2" stroke="currentColor" strokeWidth="1.5" />
+        <path d="M2 7h14" stroke="currentColor" strokeWidth="1.5" />
       </svg>
     ),
   },
@@ -162,17 +174,25 @@ const NAV_SUBSECTIONS: Record<string, NavSubsection[]> = {
     { id: 'presence-settings', label: 'Custom Status' },
     { id: 'system-permissions', label: 'System Permissions' },
     { id: 'mfa', label: 'Multi-Factor Auth' },
-    { id: 'active-sessions', label: 'Active Sessions' },
-    { id: 'past-sessions', label: 'Past Sessions' },
-  ],
-  account: [
-    { id: 'profile', label: 'My Profile' },
     {
       id: 'presence-history',
       label: 'Activity History',
       focusControlId: 'presence-history-heading',
     },
+    { id: 'active-sessions', label: 'Active Sessions' },
+    { id: 'past-sessions', label: 'Past Sessions' },
+  ],
+  account: [
+    { id: 'profile', label: 'Profile Information' },
+    { id: 'password', label: 'Change Password' },
     { id: 'nsfw-content', label: 'NSFW Content Access' },
+  ],
+  subscriptions: [
+    { id: 'current-plan', label: 'Current Plan' },
+    { id: 'personal-plans', label: 'Personal Plans' },
+    { id: 'group-plans', label: 'Group Plans' },
+    { id: 'server-plans', label: 'Server Plans' },
+    { id: 'redeem-code', label: 'Redeem a Code' },
   ],
   notifications: [
     { id: 'desktop-notifications', label: 'Desktop Notifications' },
@@ -276,10 +296,14 @@ const SettingsPage: React.FC = () => {
     const timer = setTimeout(() => {
       const el = document.getElementById(focusRequest.controlId);
       if (el) {
-        const details = el.closest('details');
+        const focusTarget =
+          el instanceof HTMLDetailsElement
+            ? (el.querySelector<HTMLElement>(':scope > summary') ?? el)
+            : el;
+        const details = focusTarget.closest('details');
         if (details instanceof HTMLDetailsElement && !details.open) details.open = true;
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        el.focus();
+        focusTarget.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        focusTarget.focus();
       }
       clearFocusRequest();
     }, 50);
@@ -305,6 +329,8 @@ const SettingsPage: React.FC = () => {
         return <PrivacySecuritySection />;
       case 'account':
         return <AccountSection />;
+      case 'subscriptions':
+        return <SubscriptionSection />;
       case 'notifications':
         return <NotificationSection />;
       case 'voice':

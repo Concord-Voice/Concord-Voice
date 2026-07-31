@@ -54,8 +54,8 @@ func insertSubscription(t *testing.T, db *sql.DB, userID uuid.UUID, tier, status
 	require.NoError(t, err)
 }
 
-// TestGetMe_ActivePremiumFromCode: a live premium row created by a Kickstarter
-// code redemption renders its tier/status/source/expiry.
+// TestGetMe_ActivePremiumFromCode: a live premium row created by a code
+// redemption renders its tier/status/source/expiry.
 func TestGetMe_ActivePremiumFromCode(t *testing.T) {
 	h, r, db := newTestHandler(t)
 	user := testhelpers.CreateUser(t, db)
@@ -128,12 +128,11 @@ func TestGetMe_CanceledRowFreeDefault(t *testing.T) {
 	assert.Equal(t, "none", resp.Status)
 }
 
-// TestGetMe_NullPeriodEndActive: a live premium row with a NULL expiry (the
-// kickstarter/code Beta shape) renders active with no expiry field.
-func TestGetMe_NullPeriodEndActive(t *testing.T) {
+func TestGetMe_ActivePremiumFromStripe(t *testing.T) {
 	h, r, db := newTestHandler(t)
 	user := testhelpers.CreateUser(t, db)
-	insertSubscription(t, db, user, "premium", "active", "kickstarter", nil)
+	periodEnd := time.Now().UTC().Add(30 * 24 * time.Hour).Truncate(time.Second)
+	insertSubscription(t, db, user, "premium", "active", "stripe", &periodEnd)
 
 	r.GET("/subscriptions/me", authAs(user), h.GetMe)
 	w := doGet(r, "/subscriptions/me")
@@ -143,8 +142,9 @@ func TestGetMe_NullPeriodEndActive(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, "premium", resp.Tier)
 	assert.Equal(t, "active", resp.Status)
-	assert.Equal(t, "kickstarter", resp.Source)
-	assert.Nil(t, resp.CurrentPeriodEnd)
+	assert.Equal(t, "stripe", resp.Source)
+	require.NotNil(t, resp.CurrentPeriodEnd)
+	assert.Equal(t, periodEnd.Format("2006-01-02T15:04:05Z07:00"), *resp.CurrentPeriodEnd)
 }
 
 // TestGetMe_DBErrorDegradesToFree: a closed DB handle forces a query error; the

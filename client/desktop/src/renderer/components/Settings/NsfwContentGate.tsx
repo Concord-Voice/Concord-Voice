@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from 'react';
 import { submitSignedAgeClaim } from '../../services/ageClaim/ageClaimService';
 import { type AgeSignal } from '../../services/ageClaim/evaluateAge';
 import { useAgeStatus } from '../../hooks/useAgeStatus';
+import { useSettingsStore } from '../../stores/settingsStore';
+import ToggleSwitch from './ToggleSwitch';
 import './NsfwContentGate.css';
 
 // parseDob only ever produces the birthdate variant; narrow so the confirm screen can
@@ -55,8 +57,30 @@ export function parseDob(
   return { kind: 'birthdate', year, month, day };
 }
 
+/**
+ * The gate's copy is driven by two independent inputs — the local `phase` and the
+ * server-backed `status` — which can each resolve to the same user-facing outcome.
+ * Resolving an outcome token first and mapping it to copy once keeps every string
+ * defined in exactly one place (SonarQube S1871).
+ */
+type GateOutcome = 'underage' | 'eligible' | 'ineligible' | 'submitting' | 'loading' | 'unverified';
+
+const GATE_COPY: Record<GateOutcome, { status: string; reason?: string }> = {
+  underage: { status: "Age verification did not meet Concord's minimum age requirement." },
+  eligible: { status: 'Age verified · Eligible for NSFW content' },
+  ineligible: {
+    status: 'Age verified · Not eligible for NSFW content',
+    reason: 'You must be 18 or older to enable this preference.',
+  },
+  submitting: { status: 'Submitting age verification…' },
+  loading: { status: 'Checking your verification status…' },
+  unverified: { status: 'Verify your age before you can change this preference.' },
+};
+
 const NsfwContentGate = () => {
   const status = useAgeStatus();
+  const allowNsfwContent = useSettingsStore((state) => state.allowNsfwContent);
+  const setAllowNsfwContent = useSettingsStore((state) => state.setAllowNsfwContent);
   const [year, setYear] = useState('');
   const [month, setMonth] = useState('');
   const [day, setDay] = useState('');
@@ -66,6 +90,7 @@ const NsfwContentGate = () => {
   // mount-time "now" is fine.
   const [now] = useState(() => new Date());
   const confirmRef = useRef<HTMLFieldSetElement>(null);
+  const statusRef = useRef<HTMLOutputElement>(null);
 
   // Move focus to the confirm group EXACTLY ONCE when entering the confirm phase —
   // announces the step to screen readers and keeps keyboard focus off document body when
@@ -77,28 +102,9 @@ const NsfwContentGate = () => {
     if (phase.kind === 'confirm') confirmRef.current?.focus();
   }, [phase.kind]);
 
-  // Mount-time rehydration of the durable verified outcome (#1763). Only short-circuits
-  // the first-run form: once the user has entered the local submit flow (confirm /
-  // submitting / a terminal result), those phases own the render below. A fail-closed
-  // 'unverified' status falls through to the DOB form, so a degraded read re-prompts
-  // rather than under-gates.
-  if (phase.kind === 'form') {
-    if (status.state === 'loading') {
-      return <output className="nsfw-gate__status">Checking your verification status…</output>;
-    }
-    if (status.state === 'verified') {
-      return status.nsfwAuth ? (
-        <p className="nsfw-gate__satisfied">
-          Your age is already verified — NSFW content access is enabled.
-        </p>
-      ) : (
-        <output className="nsfw-gate__status">
-          Your age is verified. NSFW content access requires you to be 18 or older, so it remains
-          locked.
-        </output>
-      );
-    }
-  }
+  useEffect(() => {
+    if (phase.kind === 'submitting') statusRef.current?.focus();
+  }, [phase.kind]);
 
   const clearDob = () => {
     setYear('');
@@ -135,140 +141,214 @@ const NsfwContentGate = () => {
     setPhase({ kind: 'error', message: errorCopyFor(result.code) });
   };
 
-  // <output> is the native status live-region (implicit role=status) — preferred over
-  // role="status" on a <p> per Sonar S6819, and semantically apt: each is the RESULT of
-  // the user's verification action.
-  if (phase.kind === 'submitting') {
-    return <output className="nsfw-gate__status">Submitting age verification…</output>;
-  }
+  const locallyAdult = phase.kind === 'unlocked';
+  const durablyAdult =
+    phase.kind === 'form' &&
+    status.state === 'verified' &&
+    status.validAge === true &&
+    status.nsfwAuth === true;
+  const nsfwEligible = locallyAdult || durablyAdult;
+  const checked = nsfwEligible && allowNsfwContent;
 
-  if (phase.kind === 'unlocked') {
-    return (
-      <output className="nsfw-gate__status nsfw-gate__status--ok">
-        Age verified. NSFW content access is now enabled.
-      </output>
-    );
-  }
+  // The store setter is unconditional and its value is persisted to disk, so the
+  // eligibility conjunction must be enforced somewhere that actually writes. Guarding
+  // the handler (rather than relying on the removed `disabled` attribute) keeps an
+  // ineligible user from ever setting it.
+  const handleToggle = (next: boolean) => {
+    if (!nsfwEligible) return;
+    setAllowNsfwContent(next);
+  };
 
-  if (phase.kind === 'verifiedLocked') {
-    return (
-      <output className="nsfw-gate__status">
-        Age verified. NSFW content access requires you to be 18 or older, so it remains locked.
-      </output>
-    );
-  }
+  // NOTE: deliberately NOT clearing a stored `true` when eligibility is lost. Ineligible
+  // includes the transient `status.state === 'loading'` window on every launch, so
+  // clearing would silently destroy the user's opt-in each start; and the stored value is
+  // intent, which `masks stored intent while ineligible and restores it when eligibility
+  // returns` locks as a behaviour. The fail-open risk the reviewers raised is closed at
+  // the two write paths instead (the guard above) plus the store-field contract comment.
 
+  // Precedence is unchanged from the original chain: every `phase` kind is resolved
+  // before any `status` state is consulted.
+  let outcome: GateOutcome;
   if (phase.kind === 'disabled') {
-    // The actionable appeal link wires up when #1646 (re-enablement/appeal) lands; until
-    // then this is text guidance (no invented route).
-    return (
-      <div className="nsfw-gate__disabled" role="alert">
-        <p>
-          Your account has been disabled because the date of birth you provided is below our minimum
-          age requirement.
-        </p>
-        <p>If you believe this is a mistake, please contact support to request a review.</p>
-      </div>
-    );
+    outcome = 'underage';
+  } else if (phase.kind === 'unlocked') {
+    outcome = 'eligible';
+  } else if (phase.kind === 'verifiedLocked') {
+    outcome = 'ineligible';
+  } else if (phase.kind === 'submitting') {
+    outcome = 'submitting';
+  } else if (status.state === 'loading') {
+    outcome = 'loading';
+  } else if (status.state === 'verified' && status.validAge && status.nsfwAuth) {
+    outcome = 'eligible';
+  } else if (status.state === 'verified' && status.validAge) {
+    outcome = 'ineligible';
+  } else if (status.state === 'verified') {
+    outcome = 'underage';
+  } else {
+    outcome = 'unverified';
   }
 
-  if (phase.kind === 'confirm') {
-    const { year: cy, month: cm, day: cd } = phase.signal;
-    const pretty = `${cy}-${String(cm).padStart(2, '0')}-${String(cd).padStart(2, '0')}`;
-    return (
-      // Native <fieldset> groups the confirm step (preferred over role="group" per Sonar
-      // S6819). Focus is moved here once on entering the confirm phase by the effect above.
-      <fieldset
-        className="nsfw-gate__confirm"
-        aria-label="Confirm your date of birth"
-        tabIndex={-1}
-        ref={confirmRef}
-      >
-        <p>
-          You entered <strong>{pretty}</strong>. Submit this date of birth for age verification?
-        </p>
-        <div className="nsfw-gate__actions">
-          <button type="button" className="btn-primary" onClick={() => handleConfirm(phase.signal)}>
-            Submit
-          </button>
-          <button
-            type="button"
-            className="settings-btn-secondary"
-            onClick={() => setPhase({ kind: 'form' })}
-          >
-            Cancel
-          </button>
-        </div>
-      </fieldset>
-    );
-  }
+  const statusCopy = GATE_COPY[outcome].status;
+  const reasonCopy = GATE_COPY[outcome].reason ?? '';
 
-  // phase.kind === 'form' | 'error'
+  const showDobForm =
+    status.state === 'unverified' && (phase.kind === 'form' || phase.kind === 'error');
+
   return (
     <div className="nsfw-gate">
-      <p className="settings-section-description">
-        To access NSFW content, verify your age by entering your date of birth. Your date of birth
-        is used only to compute your age on this device — it is never saved or sent anywhere. Only
-        the verified result is submitted.
+      <div className="settings-row">
+        <div className="settings-row-info">
+          <span id="allow-nsfw-content-label" className="settings-row-label">
+            Allow NSFW content
+          </span>
+          <output
+            id="allow-nsfw-content-status"
+            className="nsfw-gate__status"
+            tabIndex={-1}
+            ref={statusRef}
+          >
+            {statusCopy}
+          </output>
+          <span id="allow-nsfw-content-reason" className="settings-row-hint">
+            {reasonCopy}
+          </span>
+        </div>
+        <ToggleSwitch
+          id="allow-nsfw-content"
+          ariaLabelledBy="allow-nsfw-content-label"
+          aria-describedby="allow-nsfw-content-status allow-nsfw-content-reason allow-nsfw-content-future"
+          inputRole="switch"
+          checked={checked}
+          // `aria-disabled`, never the HTML `disabled` attribute — see ToggleSwitch's
+          // own contract. `disabled` removes the control from the tab order, so a
+          // keyboard/AT user could never reach it to hear the `aria-describedby`
+          // explanation of WHY it is unavailable. Enforcement moves to the handler
+          // guard below, which is stronger than a DOM attribute anyway.
+          aria-disabled={!nsfwEligible}
+          onChange={handleToggle}
+        />
+      </div>
+      <p id="allow-nsfw-content-future" className="settings-section-description">
+        This saves your preference for future NSFW-marked channels. NSFW-marked channels are not
+        available yet.
       </p>
 
-      {phase.kind === 'error' && (
-        <p className="nsfw-gate__error" role="alert">
-          {phase.message}
-        </p>
+      {showDobForm && (
+        <>
+          <p className="settings-section-description">
+            To access NSFW content, verify your age by entering your date of birth. Your date of
+            birth is used only to compute your age on this device — it is never saved or sent
+            anywhere. Only the verified result is submitted.
+          </p>
+
+          {phase.kind === 'error' && (
+            <p className="nsfw-gate__error" role="alert">
+              {phase.message}
+            </p>
+          )}
+
+          <div className="nsfw-gate__fields">
+            <div className="form-group">
+              <label className="form-label" htmlFor="nsfw-dob-year">
+                Year
+              </label>
+              <input
+                id="nsfw-dob-year"
+                type="number"
+                inputMode="numeric"
+                className="nsfw-gate__input"
+                value={year}
+                min={1900}
+                max={now.getUTCFullYear()}
+                onChange={(e) => setYear(e.target.value)}
+              />
+            </div>
+            <div className="form-group">
+              <label className="form-label" htmlFor="nsfw-dob-month">
+                Month
+              </label>
+              <input
+                id="nsfw-dob-month"
+                type="number"
+                inputMode="numeric"
+                className="nsfw-gate__input"
+                value={month}
+                min={1}
+                max={12}
+                onChange={(e) => setMonth(e.target.value)}
+              />
+            </div>
+            <div className="form-group">
+              <label className="form-label" htmlFor="nsfw-dob-day">
+                Day
+              </label>
+              <input
+                id="nsfw-dob-day"
+                type="number"
+                inputMode="numeric"
+                className="nsfw-gate__input"
+                value={day}
+                min={1}
+                max={31}
+                onChange={(e) => setDay(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <button type="button" className="btn-primary" onClick={handleReview} disabled={!signal}>
+            Verify age
+          </button>
+        </>
       )}
 
-      <div className="nsfw-gate__fields">
-        <div className="form-group">
-          <label className="form-label" htmlFor="nsfw-dob-year">
-            Year
-          </label>
-          <input
-            id="nsfw-dob-year"
-            type="number"
-            inputMode="numeric"
-            className="nsfw-gate__input"
-            value={year}
-            min={1900}
-            max={now.getUTCFullYear()}
-            onChange={(e) => setYear(e.target.value)}
-          />
-        </div>
-        <div className="form-group">
-          <label className="form-label" htmlFor="nsfw-dob-month">
-            Month
-          </label>
-          <input
-            id="nsfw-dob-month"
-            type="number"
-            inputMode="numeric"
-            className="nsfw-gate__input"
-            value={month}
-            min={1}
-            max={12}
-            onChange={(e) => setMonth(e.target.value)}
-          />
-        </div>
-        <div className="form-group">
-          <label className="form-label" htmlFor="nsfw-dob-day">
-            Day
-          </label>
-          <input
-            id="nsfw-dob-day"
-            type="number"
-            inputMode="numeric"
-            className="nsfw-gate__input"
-            value={day}
-            min={1}
-            max={31}
-            onChange={(e) => setDay(e.target.value)}
-          />
-        </div>
-      </div>
+      {phase.kind === 'confirm' && (
+        // Native <fieldset> groups the confirm step (preferred over role="group" per Sonar
+        // S6819). Focus is moved here once on entering the confirm phase by the effect above.
+        <fieldset
+          className="nsfw-gate__confirm"
+          aria-label="Confirm your date of birth"
+          tabIndex={-1}
+          ref={confirmRef}
+        >
+          <p>
+            You entered{' '}
+            <strong>
+              {phase.signal.year}-{String(phase.signal.month).padStart(2, '0')}-
+              {String(phase.signal.day).padStart(2, '0')}
+            </strong>
+            {'. Submit this date of birth for age verification?'}
+          </p>
+          <div className="nsfw-gate__actions">
+            <button
+              type="button"
+              className="btn-primary"
+              onClick={() => handleConfirm(phase.signal)}
+            >
+              Submit
+            </button>
+            <button
+              type="button"
+              className="settings-btn-secondary"
+              onClick={() => setPhase({ kind: 'form' })}
+            >
+              Cancel
+            </button>
+          </div>
+        </fieldset>
+      )}
 
-      <button type="button" className="btn-primary" onClick={handleReview} disabled={!signal}>
-        Verify age
-      </button>
+      {phase.kind === 'disabled' && (
+        // The actionable appeal link wires up when #1646 (re-enablement/appeal) lands; until
+        // then this is text guidance (no invented route).
+        <div className="nsfw-gate__disabled" role="alert">
+          <p>
+            Your account has been disabled because the date of birth you provided is below our
+            minimum age requirement.
+          </p>
+          <p>If you believe this is a mistake, please contact support to request a review.</p>
+        </div>
+      )}
     </div>
   );
 };

@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router';
 import { useAuthStore } from '../../stores/authStore';
 import { useUserStore } from '../../stores/userStore';
 import { usePrivacyStore, DMPrivacyLevel } from '../../stores/privacyStore';
+import { useClientConfigStore } from '../../stores/clientConfigStore';
 import { apiFetch, API_BASE } from '../../services/apiClient';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import Modal from '../ui/Modal';
@@ -22,6 +23,8 @@ import ContentSafetyControls from './ContentSafetyControls';
 import SearchVisibilityControls from './SearchVisibilityControls';
 import LinkedAccountsList from './LinkedAccountsList';
 import PresenceSettingsSection from './PresenceSettingsSection';
+import ActivityHistoryCard from './ActivityHistoryCard';
+import PresenceHistorySection from '../Profile/PresenceHistorySection';
 import ToggleSwitch from './ToggleSwitch';
 import './MFA.css';
 
@@ -646,12 +649,18 @@ const SessionCard: React.FC<SessionCardProps> = ({
 const PrivacySecuritySection: React.FC = () => {
   const accessToken = useAuthStore((s) => s.accessToken);
   const logout = useUserStore((s) => s.logout);
+  const userId = useUserStore((s) => s.user?.id ?? null);
+  const activityHistoryCapability = useClientConfigStore(
+    (state) => state.activityHistoryCapability
+  );
   const navigate = useNavigate();
   const privacySettings = usePrivacyStore((s) => s.settings);
   const fetchPrivacy = usePrivacyStore((s) => s.fetchPrivacy);
   const updatePrivacy = usePrivacyStore((s) => s.updatePrivacy);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [pastSessions, setPastSessions] = useState<PastSession[]>([]);
+  const [activityHistoryControlsVisible, setActivityHistoryControlsVisible] = useState(false);
+  const [presenceHistoryVisible, setPresenceHistoryVisible] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [revokingId, setRevokingId] = useState<string | null>(null);
@@ -1434,6 +1443,19 @@ const PrivacySecuritySection: React.FC = () => {
           onCancel={cancelSSOToggle}
         />
       </CollapsibleSection>
+
+      <div
+        hidden={
+          activityHistoryCapability.status === 'confirmed-unsupported' &&
+          !activityHistoryControlsVisible &&
+          !presenceHistoryVisible
+        }
+      >
+        <CollapsibleSection id="section-presence-history" title="Activity History">
+          <ActivityHistoryCard onVisibilityChange={setActivityHistoryControlsVisible} />
+          <PresenceHistorySection userId={userId} onVisibilityChange={setPresenceHistoryVisible} />
+        </CollapsibleSection>
+      </div>
 
       <CollapsibleSection id="section-active-sessions" title="Active Sessions">
         <p className="settings-section-description">

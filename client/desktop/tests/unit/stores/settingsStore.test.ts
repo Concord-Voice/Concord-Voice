@@ -24,6 +24,16 @@ describe('settingsStore', () => {
     expect(appearance.highContrast).toBe(false);
   });
 
+  it('defaults NSFW content intent to false', () => {
+    expect(useSettingsStore.getState().allowNsfwContent).toBe(false);
+  });
+
+  it('sets and persists NSFW content intent', () => {
+    useSettingsStore.getState().setAllowNsfwContent(true);
+    expect(useSettingsStore.getState().allowNsfwContent).toBe(true);
+    expect(localStorage.getItem('concord-settings')).toContain('"allowNsfwContent":true');
+  });
+
   it('setTheme updates theme', () => {
     useSettingsStore.getState().setTheme('light');
     expect(useSettingsStore.getState().appearance.theme).toBe('light');
@@ -144,6 +154,13 @@ describe('settingsStore', () => {
       const stored = JSON.parse(localStorage.getItem('concord-settings') || '{}');
       expect(stored.state?.appearance?.theme).toBe('light');
       expect(stored.state?.appearance?.colorScheme).toBe('morky');
+    });
+
+    it('defaults a version-1 snapshot missing NSFW intent to false', async () => {
+      useSettingsStore.getState().setAllowNsfwContent(true);
+      localStorage.setItem('concord-settings', JSON.stringify({ state: {}, version: 1 }));
+      await useSettingsStore.persist.rehydrate();
+      expect(useSettingsStore.getState().allowNsfwContent).toBe(false);
     });
   });
 });

@@ -4,6 +4,7 @@ import { useAuthStore } from '@/renderer/stores/authStore';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
 import { mockUser } from '../../../mocks/fixtures';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock apiFetch for session fetching
 vi.mock('@/renderer/services/apiClient', () => ({
@@ -27,6 +28,7 @@ import SettingsPage from '@/renderer/components/Settings/SettingsPage';
 
 describe('SettingsPage', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
     useAuthStore.getState().setAccessToken('mock-token');
     useUserStore.setState({ user: mockUser });
@@ -57,6 +59,7 @@ describe('SettingsPage', () => {
     expect(screen.getByText('Appearance')).toBeInTheDocument();
     expect(screen.getByText('Privacy & Security')).toBeInTheDocument();
     expect(screen.getByText('Account')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Subscriptions' })).toBeInTheDocument();
     expect(screen.getByText('Notifications')).toBeInTheDocument();
     expect(screen.getByText('Audio & Video')).toBeInTheDocument();
     expect(screen.getByText('Accessibility')).toBeInTheDocument();

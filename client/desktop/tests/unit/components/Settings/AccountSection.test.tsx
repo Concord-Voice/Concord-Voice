@@ -1,18 +1,15 @@
-import { render, screen, within } from '../../../test-utils';
+import { render, screen } from '../../../test-utils';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/authStore';
-import { useUserStore } from '@/renderer/stores/userStore';
 
 vi.mock('@/renderer/hooks/useAgeStatus', () => ({
-  useAgeStatus: () => ({ nsfwAuth: 'unknown' }),
+  useAgeStatus: () => ({ state: 'unverified' }),
 }));
 
 vi.mock('@/renderer/components/Profile/PresenceHistorySection', () => ({
   default: ({ userId }: { userId: string | null }) => (
-    <section data-testid="presence-history-section" data-user-id={userId ?? ''}>
-      <h3>Activity History</h3>
-    </section>
+    <section aria-label="Self Activity History" data-user-id={userId ?? ''} />
   ),
 }));
 
@@ -30,29 +27,19 @@ describe('AccountSection', () => {
     expect(screen.getByRole('button', { name: /verify age/i })).toBeInTheDocument();
   });
 
-  it('renders the My Profile subsection with both forms (#1773)', () => {
+  it('renders profile, password, and NSFW content as distinct ordered sections', () => {
     render(<AccountSection />);
-    expect(screen.getByText('My Profile')).toBeInTheDocument();
-    expect(screen.getByText('Profile Information')).toBeInTheDocument();
-    // "Change Password" appears as the section h2 title AND the submit button.
-    expect(screen.getAllByText('Change Password').length).toBeGreaterThanOrEqual(2);
-  });
-
-  it('mounts self-only Activity History below the profile forms with the current user ID', () => {
-    useUserStore.setState({
-      user: { id: 'user-self', username: 'self' },
-      isLoading: false,
-    });
-
-    render(<AccountSection />);
-
-    const profileDetails = screen.getByText('My Profile').closest('details');
-    expect(profileDetails).not.toBeNull();
-    const history = within(profileDetails as HTMLElement).getByTestId('presence-history-section');
-    expect(history).toHaveAttribute('data-user-id', 'user-self');
-    expect(profileDetails).toContainElement(history);
+    const account = document.getElementById('section-profile')!;
+    const password = document.getElementById('section-password')!;
+    const nsfw = document.getElementById('section-nsfw-content')!;
+    expect(account).not.toBeNull();
+    expect(password).not.toBeNull();
+    expect(nsfw).not.toBeNull();
     expect(
-      within(profileDetails as HTMLElement).getByRole('heading', { name: 'Activity History' })
-    ).toBeInTheDocument();
+      account.compareDocumentPosition(password) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+    expect(password.compareDocumentPosition(nsfw) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(document.getElementById('section-subscription')).toBeNull();
+    expect(screen.queryByLabelText('Self Activity History')).not.toBeInTheDocument();
   });
 });

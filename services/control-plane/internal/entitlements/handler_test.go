@@ -14,14 +14,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// insertActiveSubscription INSERTs one active, never-expiring subscription row
-// for the user at the given tier (Kickstarter-sourced, matching the Beta entry
-// path). current_period_end is NULL so ResolveTier treats it as live.
+// insertActiveSubscription INSERTs one active, never-expiring code subscription
+// row for the user at the given tier. current_period_end is NULL so ResolveTier
+// treats it as live.
 func insertActiveSubscription(t *testing.T, ts *testhelpers.TestServer, userID, tier string) {
 	t.Helper()
 	_, err := ts.DB.Exec(
 		`INSERT INTO subscriptions (user_id, tier, status, source, current_period_end)
-		 VALUES ($1, $2, 'active', 'kickstarter', NULL)`,
+		 VALUES ($1, $2, 'active', 'code', NULL)`,
 		userID, tier,
 	)
 	require.NoError(t, err)

@@ -1,6 +1,8 @@
 import { render, act } from '../../../test-utils';
 import { vi } from 'vitest';
+import { resetAllStores } from '../../../helpers/store-helpers';
 import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { openSubscriptionPage } from '@/renderer/utils/openSubscriptionPage';
 import SettingsPage from '@/renderer/components/Settings/SettingsPage';
 
 // jsdom lacks scrollIntoView
@@ -10,12 +12,26 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  resetAllStores();
   useSettingsNavStore.getState().clearFocusRequest();
   vi.useFakeTimers();
 });
 afterEach(() => vi.useRealTimers());
 
 describe('SettingsPage cross-section focus (#1644)', () => {
+  it('focuses the Current Plan summary when a subscription gate opens Settings', () => {
+    render(<SettingsPage />);
+
+    act(() => openSubscriptionPage());
+    act(() => {
+      vi.advanceTimersByTime(60);
+    });
+
+    const summary = document.querySelector('#section-current-plan > summary');
+    expect(summary).toHaveTextContent('Current Plan');
+    expect(summary).toHaveFocus();
+  });
+
   it('a focus request switches to the accessibility pane and focuses the toggle', () => {
     render(<SettingsPage />);
     // default pane is appearance; the dyslexic toggle is not mounted yet

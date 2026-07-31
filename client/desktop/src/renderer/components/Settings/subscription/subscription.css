@@ -1,10 +1,20 @@
-/* Subscription page (#1304) — Settings ▸ Account ▸ Subscription.
-   Uses the shared theme tokens so it inherits every scheme/dark-light variant. */
-
 .subscription-section {
   display: flex;
   flex-direction: column;
   gap: 20px;
+}
+
+/* Subscription page (#1304) — Settings ▸ Subscriptions.
+   Uses the shared theme tokens so it inherits every scheme/dark-light variant. */
+
+.subscription-disclaimer {
+  margin: 0 0 24px;
+  padding: 12px 14px;
+  border-left: 3px solid var(--accent-primary);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  line-height: 1.5;
 }
 
 /* ── Plan card ─────────────────────────────────────────────────────────── */
@@ -60,33 +70,6 @@
 .subscription-plan-source {
   color: var(--text-primary);
   font-weight: 600;
-}
-
-/* Locked purchase placeholder — native <button aria-disabled>, never a live CTA. */
-.subscription-purchase-locked {
-  align-self: flex-start;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 4px;
-  padding: 9px 14px;
-  border: 1px dashed var(--border-color);
-  border-radius: 8px;
-  background: var(--bg-tertiary);
-  color: var(--text-tertiary);
-  font-weight: 600;
-  cursor: not-allowed;
-}
-
-.subscription-purchase-badge {
-  font-size: 0.72rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 2px 6px;
-  border-radius: 999px;
-  background: var(--bg-primary);
-  color: var(--text-muted);
 }
 
 /* ── Redeem form ───────────────────────────────────────────────────────── */
@@ -221,52 +204,41 @@
   color: var(--accent-primary);
 }
 
-/* ── Kickstarter promo card ────────────────────────────────────────────── */
-.subscription-kickstarter-card {
-  display: flex;
-  gap: 14px;
-  padding: 16px 18px;
-  border: 1px solid var(--border-color);
-  border-radius: 10px;
-  background: var(--bg-tertiary);
-}
-
-.subscription-kickstarter-logo {
-  flex: 0 0 auto;
-  width: 48px;
-  height: 48px;
+/* ── Planned catalog ───────────────────────────────────────────────────── */
+.subscription-catalog-table-wrap {
   max-width: 100%;
+  margin-bottom: 16px;
+  overflow-x: auto;
 }
 
-.subscription-kickstarter-body {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.subscription-kickstarter-title {
-  margin: 0;
-  font-family: var(--font-display-stack);
-  font-size: 1.05rem;
-  font-weight: 700;
+.subscription-catalog-table {
+  width: 100%;
+  min-width: 440px;
+  border-collapse: collapse;
   color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
 }
 
-.subscription-kickstarter-text {
-  margin: 0;
+.subscription-catalog-table caption {
+  margin-bottom: 8px;
   color: var(--text-secondary);
-  font-size: 0.9rem;
-  line-height: 1.45;
-}
-
-.subscription-kickstarter-link {
-  align-self: flex-start;
-  color: var(--accent-primary);
   font-weight: 600;
-  font-size: 0.9rem;
-  text-decoration: none;
+  text-align: left;
 }
 
-.subscription-kickstarter-link:hover {
-  text-decoration: underline;
+.subscription-catalog-table th,
+.subscription-catalog-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border-color);
+  text-align: right;
+  vertical-align: top;
+}
+
+.subscription-catalog-table th:first-child {
+  text-align: left;
+}
+
+.subscription-catalog-table thead th {
+  color: var(--text-secondary);
+  font-weight: 600;
 }

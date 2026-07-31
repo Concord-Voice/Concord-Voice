@@ -12,6 +12,7 @@ import { clientConfigService } from '@/renderer/services/clientConfigService';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
 import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { resetAllStores } from '../../../helpers/store-helpers';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { vi } from 'vitest';
 
@@ -116,6 +117,7 @@ function setCapability(
 
 describe('ActivityHistoryCard', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
     setOwner();
     setCapability({ status: 'supported' });
@@ -194,7 +196,7 @@ describe('ActivityHistoryCard', () => {
 
     await user.click(screen.getByRole('button', { name: 'View history' }));
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'account',
+      section: 'privacy',
       controlId: 'presence-history-heading',
     });
   });
@@ -314,7 +316,7 @@ describe('ActivityHistoryCard', () => {
 
     await user.click(screen.getByRole('button', { name: 'View history' }));
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'account',
+      section: 'privacy',
       controlId: 'presence-history-heading',
     });
   });

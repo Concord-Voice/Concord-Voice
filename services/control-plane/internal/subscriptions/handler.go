@@ -2,7 +2,7 @@
 // Settings ▸ Account subscription page (#1304) consumes. The entitlement store
 // (#1297) carries only the resolved tier; the status view additionally needs
 // the grant's status/source/expiry to render "Supersonic — active · Redeemed
-// via Kickstarter code · expires …". This package owns that one read-only
+// via code · expires …". This package owns that one read-only
 // GET /api/v1/subscriptions/me handler.
 //
 // It does NOT own the subscriptions source of truth (that is the redemption
@@ -26,8 +26,8 @@ const statusNone = "none"
 
 // StatusDTO is the wire shape of GET /api/v1/subscriptions/me. Snake-case JSON
 // matches the sibling redemption/subscription contracts (#1303). The expiry is
-// omitempty: kickstarter/code-sourced Beta grants and the free-default shape
-// have no period end, so the field is simply absent rather than null.
+// omitempty: code-sourced grants and the free-default shape may have no period
+// end, so the field is simply absent rather than null.
 type StatusDTO struct {
 	Tier             string  `json:"tier"`
 	Status           string  `json:"status"`

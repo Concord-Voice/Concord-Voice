@@ -306,8 +306,6 @@ const ProfileInfoForm: React.FC = () => {
 
   return (
     <form className="profile-section" onSubmit={handleProfileSubmit}>
-      <h2 className="profile-section-title">Profile Information</h2>
-
       {/* Avatar */}
       <div className="profile-avatar-section">
         <button

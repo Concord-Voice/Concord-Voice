@@ -10,8 +10,9 @@ const mockStashAndSwap = vi.fn();
 let currentTier = 'standard';
 
 vi.mock('@/renderer/stores/voiceStore', () => ({
-  useVoiceStore: vi.fn((selector) =>
-    selector({ qualityTier: currentTier, setQualityTier: mockSetQualityTier })
+  useVoiceStore: Object.assign(
+    vi.fn((selector) => selector({ qualityTier: currentTier, setQualityTier: mockSetQualityTier })),
+    { getState: () => ({ reset: vi.fn() }), setState: vi.fn() }
   ),
   AUDIO_QUALITY_TIERS: {
     minimum: { label: 'Minimum', maxBitrate: 16000, opusDtx: true, opusFec: true, premium: false },
@@ -72,6 +73,7 @@ vi.mock('@/renderer/hooks/useEntitlement', () => ({
 
 import { render, screen, fireEvent } from '../../../test-utils';
 import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { resetAllStores } from '../../../helpers/store-helpers';
 import AudioConfigSection from '@/renderer/components/Settings/AudioConfigSection';
 
 function setEntitlement(overrides: Record<string, unknown>) {
@@ -88,6 +90,7 @@ function tierSlider(): HTMLInputElement {
 }
 
 beforeEach(() => {
+  resetAllStores();
   vi.clearAllMocks();
   currentTier = 'standard';
   setEntitlement({});
@@ -149,8 +152,8 @@ describe('AudioConfigSection — L1 audio tier clamp', () => {
     fireEvent.click(tierLabel('Studio'));
     fireEvent.click(screen.getByRole('button', { name: /Premium/ }));
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'account',
-      controlId: 'section-subscription',
+      section: 'subscriptions',
+      controlId: 'section-current-plan',
     });
   });
 });

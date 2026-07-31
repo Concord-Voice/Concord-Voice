@@ -136,7 +136,7 @@ func TestHandler_GenerateHappyPath(t *testing.T) {
 		"grant_kind":      redemption.GrantPremiumSubscription,
 		"grant_params":    map[string]any{"months": 6},
 		"count":           3,
-		"prefix":          "KS",
+		"prefix":          "CV",
 		"single_use":      true,
 		"max_redemptions": 1,
 		"batch_id":        "http-batch",
@@ -156,7 +156,7 @@ func TestHandler_GenerateHappyPath(t *testing.T) {
 	assert.Equal(t, 3, resp.Count)
 	require.Len(t, resp.Codes, 3)
 	for _, c := range resp.Codes {
-		assert.Contains(t, c, "KS-")
+		assert.Contains(t, c, "CV-")
 	}
 }
 

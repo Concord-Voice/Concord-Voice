@@ -81,7 +81,7 @@ var migration000086ExpectedMetricKeys = []string{
 func TestMigration000086_FilesAndSchemaLock(t *testing.T) {
 	up := migration000086SQL(t, "up")
 	down := migration000086SQL(t, "down")
-	readme := migration000086ReadFile(t, filepath.Join("..", "..", "migrations", "README.md"))
+	readme := migrationReadFile(t, filepath.Join("..", "..", "migrations", "README.md"))
 
 	assert.Contains(t, up, "CREATE TABLE ops_metric_samples")
 	assert.Contains(t, up, "CREATE TABLE ops_metric_rollups")
@@ -323,10 +323,10 @@ func migration000086TableExists(t *testing.T, db *sql.DB, table string) bool {
 
 func migration000086SQL(t *testing.T, direction string) string {
 	t.Helper()
-	return migration000086ReadFile(t, filepath.Join("..", "..", "migrations", "000086_ops_metrics."+direction+".sql"))
+	return migrationReadFile(t, filepath.Join("..", "..", "migrations", "000086_ops_metrics."+direction+".sql"))
 }
 
-func migration000086ReadFile(t *testing.T, relativePath string) string {
+func migrationReadFile(t *testing.T, relativePath string) string {
 	t.Helper()
 
 	_, filename, _, ok := runtime.Caller(0)

@@ -120,9 +120,9 @@ func (s *ExpirySweeper) SweepExpired(ctx context.Context) (int, error) {
 // grant UPSERT) so an already-'expired'/'canceled' row is never re-selected —
 // this is what makes the sweep idempotent across restarts.
 //
-// The source predicate scopes the sweep to code-owned grants ('code',
-// 'kickstarter') and deliberately excludes 'stripe'. A Stripe subscription's
-// lifecycle (renewal, past_due grace, terminal cancel) is owned by the Stripe
+// The source predicate scopes the sweep to code-owned grants ('code') and
+// deliberately excludes 'stripe'. A Stripe subscription's lifecycle (renewal,
+// past_due grace, terminal cancel) is owned by the Stripe
 // webhook path (#1306); its local current_period_end can lag a delayed renewal
 // webhook, so expiring a stripe row here would fire a premium->free
 // downgrade/disconnect before Stripe has declared the subscription terminal.
@@ -134,7 +134,7 @@ func (s *ExpirySweeper) selectExpiredSubscriptions(ctx context.Context) ([]expir
 		SELECT id, user_id, tier
 		  FROM subscriptions
 		 WHERE status IN ('active', 'trialing', 'past_due')
-		   AND source IN ('code', 'kickstarter')
+		   AND source = 'code'
 		   AND current_period_end IS NOT NULL
 		   AND current_period_end <= NOW()`)
 	if err != nil {
@@ -188,7 +188,7 @@ func (s *ExpirySweeper) expireOne(ctx context.Context, e expiredSubscription) er
 		   SET status = 'expired', updated_at = NOW()
 		 WHERE id = $1
 		   AND status IN ('active', 'trialing', 'past_due')
-		   AND source IN ('code', 'kickstarter')
+		   AND source = 'code'
 		   AND current_period_end IS NOT NULL
 		   AND current_period_end <= NOW()`, e.id)
 	if err != nil {

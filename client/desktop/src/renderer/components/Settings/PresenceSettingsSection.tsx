@@ -4,7 +4,6 @@ import { useAuthStore } from '../../stores/authStore';
 import { useRichPresenceStore } from '../../stores/richPresenceStore';
 import CategoryManagerPanel from '../DirectMessages/CategoryManagerPanel';
 import CollapsibleSection from './CollapsibleSection';
-import ActivityHistoryCard from './ActivityHistoryCard';
 import PresenceExceptions from './PresenceExceptions';
 import './PresenceSettingsSection.css';
 
@@ -131,8 +130,6 @@ const PresenceSettingsSection: React.FC = () => {
         categoryManagerOpen={categoryManagerOpen}
         onOpenCategoryManager={() => setCategoryManagerOpen(true)}
       />
-
-      <ActivityHistoryCard />
 
       {categoryManagerOpen && (
         <CategoryManagerPanel onClose={() => setCategoryManagerOpen(false)} />

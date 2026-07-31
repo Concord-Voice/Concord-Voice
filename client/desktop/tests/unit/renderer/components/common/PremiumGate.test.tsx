@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen } from '../../../../test-utils';
 import userEvent from '@testing-library/user-event';
 import PremiumGate from '@/renderer/components/common/PremiumGate';
 import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { resetAllStores } from '../../../../helpers/store-helpers';
 
 beforeEach(() => {
+  resetAllStores();
   useSettingsNavStore.getState().clearFocusRequest();
 });
 
@@ -99,8 +101,8 @@ describe('PremiumGate — locked state (a11y O1)', () => {
     expect(controlClick).not.toHaveBeenCalled();
     // …and the Subscription navigation DID.
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'account',
-      controlId: 'section-subscription',
+      section: 'subscriptions',
+      controlId: 'section-current-plan',
     });
   });
 
@@ -120,8 +122,8 @@ describe('PremiumGate — locked state (a11y O1)', () => {
     await userEvent.keyboard('{Enter}');
     expect(controlClick).not.toHaveBeenCalled();
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'account',
-      controlId: 'section-subscription',
+      section: 'subscriptions',
+      controlId: 'section-current-plan',
     });
   });
 
@@ -131,8 +133,8 @@ describe('PremiumGate — locked state (a11y O1)', () => {
     const chip = screen.getByRole('button', { name: /Premium/ });
     await userEvent.click(chip);
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'account',
-      controlId: 'section-subscription',
+      section: 'subscriptions',
+      controlId: 'section-current-plan',
     });
   });
 

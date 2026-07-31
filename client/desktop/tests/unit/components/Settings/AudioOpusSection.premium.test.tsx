@@ -17,6 +17,10 @@ const defaultSettings: Record<string, unknown> = {
 const mockSetDraftAudioSetting = vi.fn();
 
 vi.mock('@/renderer/stores/voiceStore', () => ({
+  useVoiceStore: Object.assign(vi.fn(), {
+    getState: () => ({ reset: vi.fn() }),
+    setState: vi.fn(),
+  }),
   AUDIO_QUALITY_TIERS: {
     standard: {
       preferredFrameSize: 20,
@@ -56,6 +60,7 @@ vi.mock('@/renderer/hooks/useEntitlement', () => ({
 
 import { render, screen, fireEvent } from '../../../test-utils';
 import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { resetAllStores } from '../../../helpers/store-helpers';
 import AudioOpusSection from '@/renderer/components/Settings/AudioOpusSection';
 
 function setEntitlement(overrides: Record<string, unknown>) {
@@ -69,6 +74,7 @@ function frameSizeSelect(): HTMLSelectElement {
 }
 
 beforeEach(() => {
+  resetAllStores();
   vi.clearAllMocks();
   setEntitlement({});
   useSettingsNavStore.getState().clearFocusRequest();
@@ -109,8 +115,8 @@ describe('AudioOpusSection — L3 Music Mode lock', () => {
     fireEvent.click(checkbox);
     expect(mockSetDraftAudioSetting).not.toHaveBeenCalledWith('musicMode', expect.anything());
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'account',
-      controlId: 'section-subscription',
+      section: 'subscriptions',
+      controlId: 'section-current-plan',
     });
   });
 

@@ -1,10 +1,20 @@
-import { describe, it, expect, beforeEach, beforeAll, afterAll, afterEach } from 'vitest';
-import { renderHook, waitFor, act } from '@testing-library/react';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  expectTypeOf,
+  it,
+} from 'vitest';
+import { act, renderHook, waitFor } from '../../test-utils';
 import { http, HttpResponse } from 'msw';
 import { server } from '../../mocks/server';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useSubscription } from '@/renderer/hooks/useSubscription';
+import type { SubscriptionSource } from '@/renderer/hooks/useSubscription';
 
 const API_BASE = 'http://localhost:8080';
 const STATUS_PATH = `${API_BASE}/api/v1/subscriptions/me`;
@@ -17,6 +27,10 @@ describe('useSubscription (#1304)', () => {
   beforeEach(() => {
     resetAllStores();
     useAuthStore.getState().setAccessToken('mock-token');
+  });
+
+  it('publishes only code and Stripe subscription sources', () => {
+    expectTypeOf<SubscriptionSource>().toEqualTypeOf<'code' | 'stripe'>();
   });
 
   it('starts in the loading state before the status resolves', () => {
@@ -56,10 +70,21 @@ describe('useSubscription (#1304)', () => {
     expect(result.current.expiry).toBe('2027-01-01T00:00:00Z');
   });
 
+  it('reports Stripe as the other supported subscription source', async () => {
+    server.use(
+      http.get(STATUS_PATH, () =>
+        HttpResponse.json({ tier: 'premium', status: 'active', source: 'stripe' })
+      )
+    );
+    const { result } = renderHook(() => useSubscription());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.source).toBe('stripe');
+  });
+
   it('drops an unknown source value rather than surfacing it', async () => {
     server.use(
       http.get(STATUS_PATH, () =>
-        HttpResponse.json({ tier: 'premium', status: 'active', source: 'mystery' })
+        HttpResponse.json({ tier: 'premium', status: 'active', source: 'legacy' })
       )
     );
     const { result } = renderHook(() => useSubscription());

@@ -1,10 +1,8 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/authStore';
-import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
 import { useFriendStore, type Friend } from '@/renderer/stores/friendStore';
 import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
 import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
 import { server as mswServer } from '../../../mocks/server';
 import { http, HttpResponse } from 'msw';
@@ -20,7 +18,6 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 
 const API_BASE = 'http://localhost:8080';
 const PRESENCE_PATH = `${API_BASE}/api/v1/users/me/presence-settings`;
-const HISTORY_SETTINGS_PATH = `${API_BASE}/api/v1/users/me/presence-history/settings`;
 const OVERRIDE_PATH = `${API_BASE}/api/v1/users/me/presence-overrides/custom_text`;
 const UUID_A = '11111111-1111-4111-8111-111111111111';
 
@@ -94,47 +91,9 @@ describe('PresenceSettingsSection', () => {
     expect(tierRow?.compareDocumentPosition(exceptions!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   });
 
-  it('mounts Activity History after presence exceptions', async () => {
-    useAuthStore.getState().setSessionId('session-a');
-    useUserStore.setState({
-      user: { id: 'user-a', username: 'user-a' },
-      isLoading: false,
-      error: null,
-    });
-    useClientConfigStore.setState({
-      activityHistoryCapability: { status: 'supported' },
-    });
-    mswServer.use(
-      http.get(HISTORY_SETTINGS_PATH, () =>
-        HttpResponse.json({
-          available: true,
-          enabled: false,
-          reconsent_required: false,
-          retention_days: 30,
-          consent_version: null,
-          consent_copy_hash: null,
-          consented_at: null,
-          required_consent: {
-            version: 4,
-            copy_hash: 'a'.repeat(64),
-            operator_name: 'Concord Voice, Inc.',
-            required_text: 'Activity History stores future Custom Status changes.',
-            details: ['No backfill occurs.'],
-            privacy_policy_url: 'https://concordvoice.com/privacy#activity-history',
-            acknowledgement_label: 'I consent to Activity History.',
-          },
-        })
-      )
-    );
-
+  it('does not mount Activity History in Custom Status', () => {
     render(<PresenceSettingsSection />);
-
-    const exceptions = screen.getByText('Exceptions - 0 people').closest('details');
-    const historyHeading = await screen.findByRole('heading', { name: 'Activity History' });
-    expect(exceptions).toBeInTheDocument();
-    expect(
-      exceptions?.compareDocumentPosition(historyHeading.closest('.activity-history-card')!)
-    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(screen.queryByRole('heading', { name: 'Activity History' })).not.toBeInTheDocument();
   });
 
   it('PUTs only the override endpoint when exceptions are saved', async () => {

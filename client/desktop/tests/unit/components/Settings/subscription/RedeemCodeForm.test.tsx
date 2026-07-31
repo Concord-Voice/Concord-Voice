@@ -1,6 +1,5 @@
-import { describe, it, expect, beforeEach, beforeAll, afterAll, afterEach, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { render, screen, userEvent, waitFor } from '../../../../test-utils';
 import { http, HttpResponse } from 'msw';
 import { server } from '../../../../mocks/server';
 import { resetAllStores } from '../../../../helpers/store-helpers';
@@ -19,19 +18,24 @@ describe('RedeemCodeForm (#1304)', () => {
   beforeEach(() => {
     resetAllStores();
     useAuthStore.getState().setAccessToken('mock-token');
-    // The store's post-redeem hydrate hits /entitlements — stub a benign 200.
     server.use(
       http.get(ENTITLEMENTS_PATH, () => HttpResponse.json({ tier: 'free' }, { status: 200 }))
     );
   });
 
-  it('renders a labelled input and a submit control', () => {
+  it('renders neutral code input copy and a submit control', () => {
     render(<RedeemCodeForm onRedeemed={() => {}} />);
-    expect(screen.getByLabelText(/Redeem a code/i)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Redeem/i })).toBeInTheDocument();
+
+    expect(screen.getByRole('textbox', { name: 'Code' })).toHaveAttribute(
+      'placeholder',
+      'Enter a code'
+    );
+    expect(screen.getByText('Enter a code you received from Concord Voice.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Redeem' })).toBeInTheDocument();
   });
 
-  it('on 200 shows the granted description in a role=status and calls onRedeemed', async () => {
+  it('on 200 accepts arbitrary non-empty text, reports the grant, and calls onRedeemed', async () => {
+    const user = userEvent.setup();
     const onRedeemed = vi.fn();
     server.use(
       http.post(REDEEM_PATH, () =>
@@ -40,59 +44,65 @@ describe('RedeemCodeForm (#1304)', () => {
     );
     render(<RedeemCodeForm onRedeemed={onRedeemed} />);
 
-    await userEvent.type(screen.getByLabelText(/Redeem a code/i), 'KS-AAAA-BBBB-CCCC');
-    await userEvent.click(screen.getByRole('button', { name: /Redeem/i }));
+    await user.type(screen.getByRole('textbox', { name: 'Code' }), 'PROMO thank-you code');
+    await user.click(screen.getByRole('button', { name: 'Redeem' }));
 
-    const status = await screen.findByRole('status');
-    expect(status).toHaveTextContent('Premium subscription for 12 months');
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Premium subscription for 12 months'
+    );
     await waitFor(() => expect(onRedeemed).toHaveBeenCalledTimes(1));
   });
 
-  it('on 400 shows a generic (no-oracle) alert', async () => {
+  it('on 400 shows a generic no-oracle alert', async () => {
+    const user = userEvent.setup();
     server.use(
       http.post(REDEEM_PATH, () =>
         HttpResponse.json({ error: 'That code is not valid.' }, { status: 400 })
       )
     );
     render(<RedeemCodeForm onRedeemed={() => {}} />);
-    await userEvent.type(screen.getByLabelText(/Redeem a code/i), 'BAD-CODE');
-    await userEvent.click(screen.getByRole('button', { name: /Redeem/i }));
 
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent(/not valid/i);
+    await user.type(screen.getByRole('textbox', { name: 'Code' }), 'BAD-CODE');
+    await user.click(screen.getByRole('button', { name: 'Redeem' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/not valid/i);
   });
 
   it('on 409 shows the already-redeemed alert', async () => {
+    const user = userEvent.setup();
     server.use(http.post(REDEEM_PATH, () => HttpResponse.json({ error: 'x' }, { status: 409 })));
     render(<RedeemCodeForm onRedeemed={() => {}} />);
-    await userEvent.type(screen.getByLabelText(/Redeem a code/i), 'KS-DUP');
-    await userEvent.click(screen.getByRole('button', { name: /Redeem/i }));
 
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent(/already redeemed/i);
+    await user.type(screen.getByRole('textbox', { name: 'Code' }), 'PROMO-DUP');
+    await user.click(screen.getByRole('button', { name: 'Redeem' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/already redeemed/i);
   });
 
   it('on 429 shows the rate-limited alert', async () => {
+    const user = userEvent.setup();
     server.use(http.post(REDEEM_PATH, () => HttpResponse.json({ error: 'x' }, { status: 429 })));
     render(<RedeemCodeForm onRedeemed={() => {}} />);
-    await userEvent.type(screen.getByLabelText(/Redeem a code/i), 'KS-RATE');
-    await userEvent.click(screen.getByRole('button', { name: /Redeem/i }));
 
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent(/Too many attempts/i);
+    await user.type(screen.getByRole('textbox', { name: 'Code' }), 'PROMO-RATE');
+    await user.click(screen.getByRole('button', { name: 'Redeem' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/Too many attempts/i);
   });
 
   it('on 500 shows the generic try-again alert', async () => {
+    const user = userEvent.setup();
     server.use(http.post(REDEEM_PATH, () => HttpResponse.json({ error: 'x' }, { status: 500 })));
     render(<RedeemCodeForm onRedeemed={() => {}} />);
-    await userEvent.type(screen.getByLabelText(/Redeem a code/i), 'KS-BOOM');
-    await userEvent.click(screen.getByRole('button', { name: /Redeem/i }));
 
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent(/Please try again/i);
+    await user.type(screen.getByRole('textbox', { name: 'Code' }), 'PROMO-BOOM');
+    await user.click(screen.getByRole('button', { name: 'Redeem' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/Please try again/i);
   });
 
-  it('does not submit an empty/whitespace code (client-side non-empty guard)', async () => {
+  it('does not submit an empty or whitespace-only code', async () => {
+    const user = userEvent.setup();
     let called = false;
     server.use(
       http.post(REDEEM_PATH, () => {
@@ -101,9 +111,10 @@ describe('RedeemCodeForm (#1304)', () => {
       })
     );
     render(<RedeemCodeForm onRedeemed={() => {}} />);
-    // Submit is disabled while empty; type whitespace only → still disabled.
-    await userEvent.type(screen.getByLabelText(/Redeem a code/i), '   ');
-    expect(screen.getByRole('button', { name: /Redeem/i })).toBeDisabled();
+
+    await user.type(screen.getByRole('textbox', { name: 'Code' }), '   ');
+
+    expect(screen.getByRole('button', { name: 'Redeem' })).toBeDisabled();
     expect(called).toBe(false);
   });
 });

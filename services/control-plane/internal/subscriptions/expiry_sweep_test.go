@@ -101,8 +101,8 @@ func TestSweep_LeavesValidPremium(t *testing.T) {
 // is NOT swept. Stripe subscription lifecycle is owned by the Stripe webhook
 // path (#1306), whose renewal can lag the locally-stored current_period_end;
 // expiring it here would fire a premium->free downgrade/disconnect before Stripe
-// declared the subscription terminal. Only code-owned grants ('code',
-// 'kickstarter') are the sweeper's responsibility.
+// declared the subscription terminal. Only code-owned grants are the sweeper's
+// responsibility.
 func TestSweep_LeavesStripeSourced(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	defer cleanup()

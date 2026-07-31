@@ -2,8 +2,10 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useGateActivation } from '@/renderer/hooks/useGateActivation';
 import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 beforeEach(() => {
+  resetAllStores();
   useSettingsNavStore.getState().clearFocusRequest();
 });
 
@@ -20,8 +22,8 @@ describe('useGateActivation', () => {
     const { result } = renderHook(() => useGateActivation('audio-tier'));
     act(() => result.current.onActivate());
     expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'account',
-      controlId: 'section-subscription',
+      section: 'subscriptions',
+      controlId: 'section-current-plan',
     });
   });
 

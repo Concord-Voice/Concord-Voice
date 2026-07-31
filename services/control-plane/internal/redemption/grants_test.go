@@ -30,9 +30,9 @@ func TestCatalog_LookupAndSupports(t *testing.T) {
 	})
 
 	t.Run("cosmetic prefix with id", func(t *testing.T) {
-		_, err := c.lookup("cosmetic:founder_badge")
+		_, err := c.lookup("cosmetic:profile_badge")
 		require.NoError(t, err)
-		assert.True(t, c.Supports("cosmetic:founder_badge"))
+		assert.True(t, c.Supports("cosmetic:profile_badge"))
 	})
 
 	t.Run("bare prefix (no capability) is NOT supported", func(t *testing.T) {
@@ -59,9 +59,9 @@ func TestGrantFeatureFlag_And_Cosmetic(t *testing.T) {
 	assert.Contains(t, res.Description, "custom_themes")
 	assert.False(t, res.TierChanged)
 
-	res, err = grantCosmetic(ctx, nil, uid, "cosmetic:founder_badge", nil)
+	res, err = grantCosmetic(ctx, nil, uid, "cosmetic:profile_badge", nil)
 	require.NoError(t, err)
-	assert.Contains(t, res.Description, "founder_badge")
+	assert.Contains(t, res.Description, "profile_badge")
 
 	// Empty capability/id → unknown (defends a malformed issued code).
 	_, err = grantFeatureFlag(ctx, nil, uid, "feature:", nil)
@@ -107,20 +107,20 @@ func TestParseMaxRedeems(t *testing.T) {
 // TestWriteCSV checks header + rows + flush.
 func TestWriteCSV(t *testing.T) {
 	codes := []IssuedCode{
-		{ID: uuid.New(), Plaintext: "KS-ABCDE-FGHIJ"},
-		{ID: uuid.New(), Plaintext: "KS-KLMNP-QRSTV"},
+		{ID: uuid.New(), Plaintext: "CV-ABCDE-FGHIJ"},
+		{ID: uuid.New(), Plaintext: "CV-KLMNP-QRSTV"},
 	}
 	var buf bytes.Buffer
-	require.NoError(t, WriteCSV(&buf, codes, "ks-2026-founder", GrantPremiumSubscription))
+	require.NoError(t, WriteCSV(&buf, codes, "promo-2026-q3", GrantPremiumSubscription))
 
 	out := buf.String()
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	require.Len(t, lines, 3, "header + 2 rows")
 	assert.Equal(t, "code,batch_id,grant_kind", lines[0])
-	assert.Contains(t, lines[1], "KS-ABCDE-FGHIJ")
-	assert.Contains(t, lines[1], "ks-2026-founder")
+	assert.Contains(t, lines[1], "CV-ABCDE-FGHIJ")
+	assert.Contains(t, lines[1], "promo-2026-q3")
 	assert.Contains(t, lines[1], GrantPremiumSubscription)
-	assert.Contains(t, lines[2], "KS-KLMNP-QRSTV")
+	assert.Contains(t, lines[2], "CV-KLMNP-QRSTV")
 }
 
 // silence unused sql import if future test seams drop the tx-typed effects.

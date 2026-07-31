@@ -42,6 +42,7 @@ import { useSSOStore } from '../stores/ssoStore';
 import { useE2EEStore } from '../stores/e2eeStore';
 import { useRichPresenceStore } from '../stores/richPresenceStore';
 import { useSubscriptionStore } from '../stores/subscriptionStore';
+import { useSettingsStore } from '../stores/settingsStore';
 import { useAudioSettingsStore } from '../stores/audioSettingsStore';
 import { preferencesSyncService } from './preferencesSync';
 import { savedGifsSyncService } from './savedGifsSync';
@@ -213,6 +214,15 @@ export function nuclearReset(): void {
   // disk halves. Together: a login-screen transition leaves NO renderer, main, or
   // disk key material for the prior account (CWE-212).
   gracefulReset();
+
+  // Account-scoped, NOT device-local — so it is cleared here rather than in
+  // gracefulReset(). softRestart() calls gracefulReset() on a same-account
+  // Recovery-B reload (valid session, unchanged token), and clearing there would
+  // silently revoke the user's NSFW opt-in and persist it to disk on any
+  // transport blip — the exact shape #2199 exists to prevent. Every
+  // login-screen transition routes through nuclearReset(), so cross-account
+  // hygiene is unchanged.
+  useSettingsStore.getState().setAllowNsfwContent(false);
 
   // Additionally clear auth store
   useAuthStore.getState().clearAccessToken();

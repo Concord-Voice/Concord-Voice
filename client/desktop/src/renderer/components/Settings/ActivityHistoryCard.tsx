@@ -97,6 +97,10 @@ interface ActivityHistoryCardController {
   retryAvailability: () => void;
 }
 
+interface ActivityHistoryCardProps {
+  onVisibilityChange?: (visible: boolean) => void;
+}
+
 const STALE_CAPABILITY_ANNOUNCEMENT = 'Availability not refreshed.';
 const CAPABILITY_WIDENING_PAUSED_MESSAGE =
   'Activity History availability changed. Enabling and retention increases are paused until support is confirmed.';
@@ -951,7 +955,7 @@ const ActivityHistoryActions: React.FC<SettingsControlProps> = ({
         type="button"
         className="secondary-button"
         onClick={() =>
-          useSettingsNavStore.getState().requestFocus('account', 'presence-history-heading')
+          useSettingsNavStore.getState().requestFocus('privacy', 'presence-history-heading')
         }
       >
         View history
@@ -1092,17 +1096,23 @@ const ActivityHistoryCardView: React.FC<ControllerProps> = ({ controller }) => {
   );
 };
 
-const ActivityHistoryCard: React.FC = () => {
+const ActivityHistoryCard: React.FC<ActivityHistoryCardProps> = ({ onVisibilityChange }) => {
   const controller = useActivityHistoryCardController();
-  if (controller.capability.status === 'confirmed-unsupported') {
-    if (controller.requestState.status === 'loading') return null;
-    if (
-      controller.requestState.status === 'error' &&
-      controller.requestState.confirmed === null &&
-      controller.requestState.routeMissing
-    ) {
-      return null;
-    }
+  const visible = !(
+    controller.capability.status === 'confirmed-unsupported' &&
+    (controller.requestState.status === 'loading' ||
+      (controller.requestState.status === 'error' &&
+        controller.requestState.confirmed === null &&
+        controller.requestState.routeMissing))
+  );
+  useEffect(() => {
+    onVisibilityChange?.(visible);
+    // Un-latch on unmount: the parent lifts this into a `hidden` wrapper, and without
+    // the cleanup a section that unmounts while visible leaves an empty collapsible.
+    return () => onVisibilityChange?.(false);
+  }, [onVisibilityChange, visible]);
+  if (!visible) {
+    return null;
   }
   return <ActivityHistoryCardView controller={controller} />;
 };

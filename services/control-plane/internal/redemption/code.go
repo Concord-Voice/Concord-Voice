@@ -84,9 +84,9 @@ func crockfordValue(c byte) int {
 }
 
 // formatCode groups the raw code into hyphenated runs and prepends an optional
-// non-secret prefix (e.g. "KS-"). The grouped form is what the issuer hands to
+// non-secret prefix (e.g. "CV-"). The grouped form is what the issuer hands to
 // the user; NormalizeAndValidate inverts it. Prefix is upper-cased and its own
-// hyphen joined: "KS" + "ABCDE-FGHIJ-..." → "KS-ABCDE-FGHIJ-...".
+// hyphen joined: "CV" + "ABCDE-FGHIJ-..." → "CV-ABCDE-FGHIJ-...".
 func formatCode(raw, prefix string) string {
 	var b strings.Builder
 	for i := 0; i < len(raw); i += groupSize {
@@ -138,7 +138,7 @@ func NormalizeAndValidate(input string) (string, error) {
 
 // normalizeSymbols canonicalizes user input for hashing: trim + upper-case, drop
 // separators (hyphen, space, underscore), fold Crockford aliases (I/L→1, O→0),
-// then — because the optional non-secret prefix (KS-, PROMO-) has no fixed length
+// then — because the optional non-secret prefix (CV-, PROMO-) has no fixed length
 // — keep only the TRAILING payloadSymbols+1 symbols when the cleaned string is
 // longer than canonical. The code itself is always exactly that trailing run, so
 // any prefix is discarded uniformly. NormalizeAndValidate then checksum-validates

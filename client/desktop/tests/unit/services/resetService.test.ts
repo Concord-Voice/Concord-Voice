@@ -73,6 +73,7 @@ import { e2eeService } from '@/renderer/services/e2eeService';
 import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/searchService';
 import { useDraftMessageStore } from '@/renderer/stores/draftMessageStore';
 import { useE2EEStore } from '@/renderer/stores/e2eeStore';
+import { useSettingsStore } from '@/renderer/stores/settingsStore';
 import { mockServer } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 
@@ -103,6 +104,19 @@ beforeEach(() => {
 });
 
 describe('resetService', () => {
+  // Only nuclearReset() clears NSFW intent. gracefulReset() must NOT: softRestart()
+  // calls it on a same-account Recovery-B reload, and clearing there would revoke the
+  // user's opt-in and persist it to disk on any transport blip (#2199).
+  it('only nuclear reset clears NSFW intent; recovery and graceful preserve it', () => {
+    useSettingsStore.getState().setAllowNsfwContent(true);
+    recoveryReset();
+    expect(useSettingsStore.getState().allowNsfwContent).toBe(true);
+    gracefulReset();
+    expect(useSettingsStore.getState().allowNsfwContent).toBe(true);
+    nuclearReset();
+    expect(useSettingsStore.getState().allowNsfwContent).toBe(false);
+  });
+
   describe('gracefulReset', () => {
     it('cancels encrypted-social sync before clearing either decrypted store', () => {
       useFriendOrgStore.getState()._hydrate({
@@ -252,6 +266,14 @@ describe('resetService', () => {
   });
 
   describe('nuclearReset', () => {
+    it('clears freshly reseeded NSFW content intent', () => {
+      useSettingsStore.getState().setAllowNsfwContent(true);
+
+      nuclearReset();
+
+      expect(useSettingsStore.getState().allowNsfwContent).toBe(false);
+    });
+
     it('inherits encrypted-social cancellation before clearing auth and tokens', () => {
       useFriendOrgStore.getState()._hydrate({
         v: 1,
@@ -298,9 +320,9 @@ describe('resetService', () => {
 
       nuclearReset();
 
-      // The audio key is re-serialized by clearAllParticipantVolumes()'s
-      // persist write-back, so assert presence, not raw-string equality.
-      expect(localStorage.getItem('concord-settings')).toBe('device-pref');
+      // The settings and audio keys are re-serialized by their reset write-backs,
+      // so assert presence, not raw-string equality.
+      expect(localStorage.getItem('concord-settings')).not.toBeNull();
       expect(localStorage.getItem('concord:audio-advanced')).not.toBeNull();
       expect(localStorage.getItem('concord:video-settings')).toBe('device-pref');
       expect(localStorage.getItem('concord:tts-settings')).toBe('device-pref');

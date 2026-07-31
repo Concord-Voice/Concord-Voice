@@ -3,8 +3,6 @@
 // the marketing names Sonic / Supersonic. This map is the single translation
 // point — never render the raw wire tier in the UI.
 
-export const KICKSTARTER_URL = 'https://www.kickstarter.com/projects/concord-mark/concord-voice';
-
 // Wire tier → marketing display name. Unknown tiers fall back to the free name
 // (least surprise; a drifted tier never shows a scary blank).
 const TIER_DISPLAY_NAME: Record<string, string> = {
@@ -18,7 +16,6 @@ export function tierDisplayName(tier: string): string {
 
 // Wire subscription source → human sentence for the PlanCard "how you got this".
 const SOURCE_DISPLAY: Record<string, string> = {
-  kickstarter: 'Redeemed via Kickstarter',
   code: 'Redeemed via code',
   stripe: 'Active subscription',
 };

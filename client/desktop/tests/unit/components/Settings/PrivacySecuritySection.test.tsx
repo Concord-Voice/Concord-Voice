@@ -198,6 +198,12 @@ vi.mock('@/renderer/components/Auth/LoadingSpinner', () => ({
     </div>
   ),
 }));
+vi.mock('@/renderer/components/Settings/ActivityHistoryCard', () => ({
+  default: () => <div aria-label="Activity History controls" />,
+}));
+vi.mock('@/renderer/components/Profile/PresenceHistorySection', () => ({
+  default: () => <section aria-label="Activity History feed" />,
+}));
 vi.mock('@/renderer/components/ui/Modal', () => ({
   default: ({
     isOpen,
@@ -270,6 +276,20 @@ describe('PrivacySecuritySection', () => {
   it('renders privacy section heading', async () => {
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByText('Privacy')).toBeInTheDocument());
+  });
+  it('places Activity History immediately before Active Sessions', async () => {
+    render(<PrivacySecuritySection />);
+
+    await vi.waitFor(() =>
+      expect(document.getElementById('section-presence-history')).not.toBeNull()
+    );
+    const history = document.getElementById('section-presence-history')!;
+    const sessions = document.getElementById('section-active-sessions')!;
+    expect(screen.getByLabelText('Activity History controls')).toBeInTheDocument();
+    expect(screen.getByLabelText('Activity History feed')).toBeInTheDocument();
+    expect(
+      history.compareDocumentPosition(sessions) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
   });
   it('renders privacy description', async () => {
     render(<PrivacySecuritySection />);

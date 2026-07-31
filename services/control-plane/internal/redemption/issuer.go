@@ -21,7 +21,7 @@ type IssueSpec struct {
 	GrantKind   string         // catalog key; MUST be Supports()-ed (validated)
 	GrantParams map[string]any // e.g. {"months": 12}; nil → {}
 	Count       int            // number of codes to mint (≥1)
-	Prefix      string         // non-secret support handle ('KS','PROMO'); ≤16 chars
+	Prefix      string         // non-secret support handle ('CV','PROMO'); ≤16 chars
 	SingleUse   bool           // true for one-off
 	MaxRedeems  *int           // nil = unlimited (promo); pointer distinguishes nil from 0
 	ExpiresAt   *time.Time     // hard expiry; required for unlimited promo (validated)
@@ -59,8 +59,8 @@ var (
 // attacker-influenced Count must be bounded BEFORE any allocation to prevent a
 // memory-exhaustion DoS (CWE-789, CodeQL go/uncontrolled-allocation-size).
 //
-// 10,000 is comfortably above the largest realistic issuance — the Kickstarter
-// CSV use case in [internal]redemption-code-issuance.md mints hundreds per
+// 10,000 is comfortably above the largest realistic issuance — the operator CSV
+// use case in [internal]redemption-code-issuance.md mints hundreds per
 // batch — while keeping the worst-case single-call allocation small (~10k
 // IssuedCode structs). Larger campaigns issue multiple batches.
 const MaxBatchSize = 10_000
@@ -218,8 +218,8 @@ func csvSafe(v string) string {
 	return v
 }
 
-// WriteCSV exports a batch's plaintext codes as CSV for the Kickstarter backer
-// survey (spec §7). Columns: code, batch_id, grant_kind. The plaintext appears
+// WriteCSV exports a batch's plaintext codes as CSV for operator distribution
+// (spec §7). Columns: code, batch_id, grant_kind. The plaintext appears
 // ONLY in this issuer-side export (it is never persisted server-side). Callers
 // are responsible for the export's confidentiality. Cells are formula-injection
 // neutralised (CWE-1236) via csvSafe.

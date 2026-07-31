@@ -37,7 +37,7 @@ func (f *fakeIssuer) Issue(_ context.Context, spec redemption.IssueSpec) ([]rede
 func sampleCodes(n int) []redemption.IssuedCode {
 	codes := make([]redemption.IssuedCode, n)
 	for i := range codes {
-		codes[i] = redemption.IssuedCode{ID: uuid.New(), Plaintext: "KS-AAAA-BBBB-CCCC"}
+		codes[i] = redemption.IssuedCode{ID: uuid.New(), Plaintext: "CV-AAAA-BBBB-CCCC"}
 	}
 	return codes
 }
@@ -52,10 +52,10 @@ func TestRunIssue_HappyPathStdout(t *testing.T) {
 		GrantKind:  redemption.GrantPremiumSubscription,
 		Months:     12,
 		Count:      3,
-		Prefix:     "KS",
+		Prefix:     "CV",
 		SingleUse:  true,
 		MaxRedeems: "1",
-		BatchID:    "ks-2026",
+		BatchID:    "promo-2026-q3",
 	}
 	err := runIssue(context.Background(), opts, fi, &out, &errOut)
 	require.NoError(t, err)
@@ -64,7 +64,7 @@ func TestRunIssue_HappyPathStdout(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
 	assert.Len(t, lines, 3)
 	for _, l := range lines {
-		assert.Equal(t, "KS-AAAA-BBBB-CCCC", l)
+		assert.Equal(t, "CV-AAAA-BBBB-CCCC", l)
 	}
 
 	// Banner on stderr, never on stdout.
@@ -75,8 +75,8 @@ func TestRunIssue_HappyPathStdout(t *testing.T) {
 	// and the CLI context).
 	assert.Equal(t, redemption.GrantPremiumSubscription, fi.gotSpec.GrantKind)
 	assert.Equal(t, 3, fi.gotSpec.Count)
-	assert.Equal(t, "KS", fi.gotSpec.Prefix)
-	assert.Equal(t, "ks-2026", fi.gotSpec.BatchID)
+	assert.Equal(t, "CV", fi.gotSpec.Prefix)
+	assert.Equal(t, "promo-2026-q3", fi.gotSpec.BatchID)
 	assert.Equal(t, redemption.IssuerContextCLI, fi.gotSpec.Context)
 	require.NotNil(t, fi.gotSpec.GrantParams)
 	assert.Equal(t, 12, fi.gotSpec.GrantParams["months"])
@@ -112,7 +112,7 @@ func TestRunIssue_HappyPathCSV(t *testing.T) {
 	require.NoError(t, readErr)
 	csv := string(contents)
 	assert.Contains(t, csv, "code,batch_id,grant_kind") // header
-	assert.Contains(t, csv, "KS-AAAA-BBBB-CCCC,csv-batch,feature:custom_themes")
+	assert.Contains(t, csv, "CV-AAAA-BBBB-CCCC,csv-batch,feature:custom_themes")
 	// Header + 2 rows = 3 non-empty lines.
 	rows := strings.Split(strings.TrimSpace(csv), "\n")
 	assert.Len(t, rows, 3)
@@ -262,7 +262,7 @@ func TestParseFlags(t *testing.T) {
 		"--grant-kind=premium:subscription",
 		"--months=3",
 		"--count=7",
-		"--prefix=KS",
+		"--prefix=CV",
 		"--single-use=false",
 		"--max-redeems=unlimited",
 		"--expires=2026-01-01T00:00:00Z",
@@ -272,7 +272,7 @@ func TestParseFlags(t *testing.T) {
 	assert.Equal(t, "premium:subscription", opts.GrantKind)
 	assert.Equal(t, 3, opts.Months)
 	assert.Equal(t, 7, opts.Count)
-	assert.Equal(t, "KS", opts.Prefix)
+	assert.Equal(t, "CV", opts.Prefix)
 	assert.False(t, opts.SingleUse)
 	assert.Equal(t, "unlimited", opts.MaxRedeems)
 	assert.Equal(t, "2026-01-01T00:00:00Z", opts.Expires)

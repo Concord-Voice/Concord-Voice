@@ -29,26 +29,26 @@ func TestIssue_AuditRecordedNoSecret(t *testing.T) {
 		GrantKind:   redemption.GrantPremiumSubscription,
 		GrantParams: map[string]any{"months": 12},
 		Count:       5,
-		Prefix:      "KS",
+		Prefix:      "CV",
 		SingleUse:   true,
 		MaxRedeems:  intPtr(1),
-		BatchID:     "ks-2026-founder",
+		BatchID:     "promo-2026-q3",
 		CreatedBy:   issuer,
 		Context:     redemption.IssuerContextAdminHTTP,
 	})
 	require.NoError(t, err)
 	require.Len(t, codes, 5)
 	for _, c := range codes {
-		assert.Contains(t, c.Plaintext, "KS-", "formatted with prefix")
+		assert.Contains(t, c.Plaintext, "CV-", "formatted with prefix")
 	}
 
 	// 5 code rows, all with the shared batch_id and a non-empty hash.
 	var codeRows int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM redemption_codes WHERE batch_id='ks-2026-founder'`).Scan(&codeRows))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM redemption_codes WHERE batch_id='promo-2026-q3'`).Scan(&codeRows))
 	assert.Equal(t, 5, codeRows)
 
 	// Hashes are 64-hex and distinct (no plaintext stored anywhere).
-	rows, err := db.Query(`SELECT code_hash FROM redemption_codes WHERE batch_id='ks-2026-founder'`)
+	rows, err := db.Query(`SELECT code_hash FROM redemption_codes WHERE batch_id='promo-2026-q3'`)
 	require.NoError(t, err)
 	defer rows.Close() //nolint:errcheck // test cleanup
 	seen := map[string]struct{}{}
@@ -72,13 +72,13 @@ func TestIssue_AuditRecordedNoSecret(t *testing.T) {
 	)
 	require.NoError(t, db.QueryRow(`
 		SELECT issuer_id, issuer_context, grant_kind, code_count, batch_id, created_at
-		  FROM redemption_code_issuance WHERE batch_id='ks-2026-founder'`,
+		  FROM redemption_code_issuance WHERE batch_id='promo-2026-q3'`,
 	).Scan(&auditIssuer, &auditCtx, &auditKind, &auditCount, &auditBatch, &auditCreated))
 	assert.Equal(t, issuer.UUID, auditIssuer.UUID)
 	assert.Equal(t, redemption.IssuerContextAdminHTTP, auditCtx)
 	assert.Equal(t, redemption.GrantPremiumSubscription, auditKind)
 	assert.Equal(t, 5, auditCount)
-	assert.Equal(t, "ks-2026-founder", auditBatch)
+	assert.Equal(t, "promo-2026-q3", auditBatch)
 	assert.WithinDuration(t, time.Now(), auditCreated, time.Minute)
 }
 

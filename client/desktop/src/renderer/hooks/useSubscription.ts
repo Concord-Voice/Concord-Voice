@@ -5,7 +5,7 @@ import { useSubscriptionStore } from '../stores/subscriptionStore';
 // Subscription status for the Settings subscription page (#1304). Reads
 // GET /api/v1/subscriptions/me (the read-only status companion to the
 // entitlement set) on mount and exposes tier/status/source/expiry so the
-// PlanCard can render "Supersonic — active · Redeemed via Kickstarter code".
+// PlanCard can render the active plan's neutral source and optional expiry.
 //
 // The entitlementStore (#1297) carries only the resolved `tier`; this hook adds
 // the grant's status/source/expiry which the store does not hold. `refetch` is
@@ -17,7 +17,7 @@ import { useSubscriptionStore } from '../stores/subscriptionStore';
 // subscriptionStore's tier (itself fail-closed to free) with status 'unknown'
 // and surfaces `error`, so the page still renders a valid plan state.
 
-export type SubscriptionSource = 'kickstarter' | 'stripe' | 'code';
+export type SubscriptionSource = 'code' | 'stripe';
 
 // Wire shape of GET /api/v1/subscriptions/me (snake_case; mirrors the Go
 // StatusDTO). All fields optional to stay resilient to a partial/drifted 200.
@@ -38,10 +38,8 @@ export interface SubscriptionInfo {
   refetch: () => void;
 }
 
-const KNOWN_SOURCES: ReadonlySet<string> = new Set(['kickstarter', 'stripe', 'code']);
-
 function normalizeSource(source: string | undefined): SubscriptionSource | undefined {
-  return source && KNOWN_SOURCES.has(source) ? (source as SubscriptionSource) : undefined;
+  return source === 'code' || source === 'stripe' ? source : undefined;
 }
 
 export function useSubscription(): SubscriptionInfo {

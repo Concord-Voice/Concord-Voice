@@ -19,7 +19,7 @@ var migration000091MetricLiteral = regexp.MustCompile(`'(?:host|service|http|web
 func TestMigration000091_FilesAndSchemaLock(t *testing.T) {
 	up := migration000091SQL(t, "up")
 	down := migration000091SQL(t, "down")
-	readme := migration000086ReadFile(t, filepath.Join("..", "..", "migrations", "README.md"))
+	readme := migrationReadFile(t, filepath.Join("..", "..", "migrations", "README.md"))
 
 	assert.Contains(t, up, "ADD COLUMN ops_last_active_at TIMESTAMPTZ")
 	assert.Contains(t, up, "CREATE INDEX idx_users_ops_last_active_at")
@@ -129,7 +129,7 @@ func migration000091ColumnExists(t *testing.T, ts *testhelpers.TestServer, colum
 
 func migration000091SQL(t *testing.T, direction string) string {
 	t.Helper()
-	return migration000086ReadFile(t, filepath.Join("..", "..", "migrations", "000091_account_activity_metrics."+direction+".sql"))
+	return migrationReadFile(t, filepath.Join("..", "..", "migrations", "000091_account_activity_metrics."+direction+".sql"))
 }
 
 func migration000091MetricKeys(contents string) []string {

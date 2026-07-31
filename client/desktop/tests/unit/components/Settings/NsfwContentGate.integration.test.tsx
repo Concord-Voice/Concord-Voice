@@ -15,6 +15,10 @@ vi.mock('@/renderer/services/e2eeService', () => ({ e2eeService: mockE2EE }));
 import NsfwContentGate from '@/renderer/components/Settings/NsfwContentGate';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
+import { useSettingsStore } from '@/renderer/stores/settingsStore';
+
+const FUTURE_COPY =
+  'This saves your preference for future NSFW-marked channels. NSFW-marked channels are not available yet.';
 
 // 'error' (stricter than 'bypass') fails the test on any request the handlers don't cover —
 // correct for this single-flow integration test (only GET public-key + PUT claim expected).
@@ -62,7 +66,15 @@ describe('NsfwContentGate (integration via MSW)', () => {
     fireEvent.click(screen.getByRole('button', { name: /verify age/i }));
     fireEvent.click(screen.getByRole('button', { name: /submit/i }));
 
-    expect(await screen.findByText(/now enabled/i)).toBeInTheDocument();
+    expect(await screen.findByText('Age verified · Eligible for NSFW content')).toBeInTheDocument();
+    expect(screen.getByText(FUTURE_COPY)).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).toHaveAttribute(
+      'aria-disabled',
+      'false'
+    );
+    expect(screen.getByRole('switch', { name: 'Allow NSFW content' })).not.toBeChecked();
+    expect(useSettingsStore.getState().allowNsfwContent).toBe(false);
+    expect(screen.queryByRole('spinbutton', { name: /year/i })).not.toBeInTheDocument();
     // The wire body carries the derived booleans + signed metadata — NO date-of-birth
     // field. Asserting field-shape (not a substring over the random hex nonce) keeps this
     // privacy assertion deterministic / non-flaky.

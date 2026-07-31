@@ -90,14 +90,18 @@ const RedeemCodeForm: React.FC<RedeemCodeFormProps> = ({ onRedeemed }) => {
   return (
     <form className="subscription-redeem-form" onSubmit={handleSubmit}>
       <label htmlFor="redeem-code" className="subscription-redeem-label">
-        Redeem a code
+        Code
       </label>
+      <p id="redeem-code-help" className="settings-section-description">
+        Enter a code you received from Concord Voice.
+      </p>
       <div className="subscription-redeem-row">
         <input
           id="redeem-code"
           type="text"
           className="subscription-redeem-input"
-          placeholder="e.g. KS-XXXX-XXXX-XXXX"
+          placeholder="Enter a code"
+          aria-describedby="redeem-code-help"
           autoComplete="off"
           spellCheck={false}
           value={code}

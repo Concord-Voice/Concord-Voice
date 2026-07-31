@@ -1,76 +1,96 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { render, screen, userEvent } from '../../../../test-utils';
 import SubscriptionResetModal from '@/renderer/components/Settings/SubscriptionResetModal';
 import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
+import { resetAllStores } from '../../../../helpers/store-helpers';
 
 beforeEach(() => {
+  resetAllStores();
   useSettingsNavStore.getState().clearFocusRequest();
+  useSettingsOverlayStore.setState({ open: null, payload: null });
+  vi.restoreAllMocks();
 });
 
 describe('SubscriptionResetModal', () => {
   it('does not render when open=false', () => {
     render(<SubscriptionResetModal open={false} onAcknowledge={vi.fn()} />);
-    expect(screen.queryByText(/Some features are now part of Premium/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
-  it('renders the dossier copy when open', () => {
+  it('renders neutral reset copy when open', () => {
     render(<SubscriptionResetModal open onAcknowledge={vi.fn()} />);
-    expect(screen.getByText(/Some features are now part of Premium/i)).toBeInTheDocument();
-    expect(screen.getByText(/reset to free defaults/i)).toBeInTheDocument();
+
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent(/reset to free defaults/i);
+    expect(dialog).not.toHaveTextContent(/premium/i);
   });
 
-  it('is an aria-modal dialog (focus trap via native showModal)', () => {
+  it('is an aria-modal dialog with the native showModal focus trap', () => {
     const showModalSpy = vi
       .spyOn(HTMLDialogElement.prototype, 'showModal')
       .mockImplementation(function (this: HTMLDialogElement) {
         this.setAttribute('open', '');
       });
     render(<SubscriptionResetModal open onAcknowledge={vi.fn()} />);
-    const dialog = document.querySelector('dialog');
-    expect(dialog).toHaveAttribute('aria-modal', 'true');
-    // .showModal() is the native focus trap (a11y O2).
+
+    expect(screen.getByRole('dialog')).toHaveAttribute('aria-modal', 'true');
     expect(showModalSpy).toHaveBeenCalled();
-    showModalSpy.mockRestore();
   });
 
-  it('unmounts the dialog when closed (focus returns via native showModal trap)', () => {
+  it('unmounts the dialog when closed so the native trap can restore focus', () => {
     vi.spyOn(HTMLDialogElement.prototype, 'showModal').mockImplementation(function (
       this: HTMLDialogElement
     ) {
       this.setAttribute('open', '');
     });
     const { rerender } = render(<SubscriptionResetModal open onAcknowledge={vi.fn()} />);
-    expect(document.querySelector('dialog')).toBeInTheDocument();
-    // Closing removes the dialog entirely. In production .showModal() trapped
-    // focus on open and returns it to the prior element when the dialog leaves
-    // the tree; jsdom can't simulate the return, so we assert the teardown.
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+
     rerender(<SubscriptionResetModal open={false} onAcknowledge={vi.fn()} />);
-    expect(document.querySelector('dialog')).not.toBeInTheDocument();
-    vi.restoreAllMocks();
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
-  it('"Got it" acknowledges (dismiss + persist)', () => {
+  it('acknowledges from the primary action', async () => {
+    const user = userEvent.setup();
     const onAcknowledge = vi.fn();
     render(<SubscriptionResetModal open onAcknowledge={onAcknowledge} />);
-    fireEvent.click(screen.getByRole('button', { name: /Got it/i }));
+
+    await user.click(screen.getByRole('button', { name: 'Got it' }));
+
     expect(onAcknowledge).toHaveBeenCalledTimes(1);
   });
 
-  it('"See what Premium includes" navigates AND acknowledges', () => {
-    const onAcknowledge = vi.fn();
-    render(<SubscriptionResetModal open onAcknowledge={onAcknowledge} />);
-    fireEvent.click(screen.getByRole('button', { name: /See what Premium includes/i }));
-    expect(useSettingsNavStore.getState().focusRequest).toEqual({
-      section: 'account',
-      controlId: 'section-subscription',
+  it('acknowledges before opening planned subscriptions at the stable target', async () => {
+    const user = userEvent.setup();
+    let overlayDuringAcknowledge: string | null = 'unobserved';
+    let focusDuringAcknowledge = useSettingsNavStore.getState().focusRequest;
+    const onAcknowledge = vi.fn(() => {
+      overlayDuringAcknowledge = useSettingsOverlayStore.getState().open;
+      focusDuringAcknowledge = useSettingsNavStore.getState().focusRequest;
     });
+    render(<SubscriptionResetModal open onAcknowledge={onAcknowledge} />);
+
+    await user.click(screen.getByRole('button', { name: 'View planned subscriptions' }));
+
     expect(onAcknowledge).toHaveBeenCalledTimes(1);
+    expect(overlayDuringAcknowledge).toBeNull();
+    expect(focusDuringAcknowledge).toBeNull();
+    expect(useSettingsOverlayStore.getState().open).toBe('app');
+    expect(useSettingsNavStore.getState().focusRequest).toEqual({
+      section: 'subscriptions',
+      controlId: 'section-current-plan',
+    });
   });
 
-  it('acknowledges on Escape (jsdom fallback path)', () => {
+  it('acknowledges on Escape in the jsdom fallback path', async () => {
+    const user = userEvent.setup();
     const onAcknowledge = vi.fn();
     render(<SubscriptionResetModal open onAcknowledge={onAcknowledge} />);
-    fireEvent.keyDown(window, { key: 'Escape' });
-    expect(onAcknowledge).toHaveBeenCalled();
+
+    await user.keyboard('{Escape}');
+
+    expect(onAcknowledge).toHaveBeenCalledTimes(1);
   });
 });

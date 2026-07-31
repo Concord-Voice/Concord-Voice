@@ -5483,7 +5483,7 @@ paths:
                 code:
                   type: string
                   description: The redemption code as shown to the user (prefix + grouped
-                    plaintext, e.g. `KS-XXXX-XXXX-XXXX`). Normalized and checksum-validated
+                    plaintext, e.g. `CV-XXXX-XXXX-XXXX`). Normalized and checksum-validated
                     server-side.
       responses:
         '200':
@@ -5573,7 +5573,7 @@ paths:
                 grant_kind:
                   type: string
                   description: 'Catalog key for the grant effect (e.g. `premium:subscription`,
-                    `feature:custom_themes`, `cosmetic:founder_badge`). Rejected with
+                    `feature:custom_themes`, `cosmetic:profile_badge`). Rejected with
                     400 if not supported by this binary.'
                 grant_params:
                   type: object
@@ -5590,7 +5590,7 @@ paths:
                   type: string
                   maxLength: 16
                   description: Non-secret support handle prepended to each code (e.g.
-                    `KS`, `PROMO`).
+                    `CV`, `PROMO`).
                 single_use:
                   type: boolean
                   default: true
@@ -10066,8 +10066,8 @@ paths:
       description: 'Returns the authenticated user''s live subscription status
         (tier / status / source / expiry) for the Settings subscription page (#1304).
         The entitlement set (`GET /entitlements`) carries only the resolved tier;
-        this read adds the grant''s status, source (`kickstarter` | `stripe` |
-        `code`), and optional period end. Server-authoritative from the JWT user_id
+        this read adds the grant''s status, source (`code` | `stripe`), and optional
+        period end. Server-authoritative from the JWT user_id
         — never client-supplied.
 
 
@@ -14566,16 +14566,14 @@ components:
           type: string
           description: Where the grant came from. Absent in the free-default shape.
           enum:
-          - kickstarter
-          - stripe
           - code
+          - stripe
           example: code
         current_period_end:
           type: string
           format: date-time
           description: When the current subscription period ends (RFC 3339, UTC).
-            Absent for kickstarter/code-sourced Beta grants (no fixed period) and
-            for the free-default shape.
+            Absent when the grant has no fixed period and for the free-default shape.
     RegisterRequest:
       type: object
       required:
