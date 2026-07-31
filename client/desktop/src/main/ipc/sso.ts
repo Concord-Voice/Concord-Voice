@@ -2,7 +2,7 @@
  * SSO IPC bridge — wires the loopback HTTP server in `ssoLoopback.ts` to the
  * renderer's OAuth flow.
  *
- * Channel surface (10):
+ * Channel surface (11):
  *   - `sso:startLoopback` (invoke)  — spin up a 127.0.0.1 ephemeral-port server
  *                                     and return `{port, redirectURI}` for the
  *                                     renderer to embed in the provider URL.
@@ -36,6 +36,12 @@
  *                                     owner reserved at sign-in, and return no
  *                                     refresh token. Keeps the MFA path at parity
  *                                     with the direct/registration custody model.
+ *   - `sso:abandonReservation` (invoke) — release an ORPHANED credential
+ *                                     reservation (#2394) so the pre-credential
+ *                                     E2EE staging lane reopens for password
+ *                                     registration. Zero-argument: main resolves
+ *                                     the target from its own state, so the
+ *                                     renderer carries no authority.
  *
  * Sender-frame validation (the only layer the renderer cannot bypass) is
  * enforced via `isPermittedFrameUrl` — the same helper `openExternal.ts` uses,
@@ -66,6 +72,7 @@ import { startLoopback, type LoopbackHandle } from '../ssoLoopback';
 import {
   clearTokensIfOwner,
   credentialOwnerIsCurrent,
+  releaseCredentialReservation,
   reserveCredentialOwner,
   storeRefreshTokenIfOwner,
 } from '../tokenManager';
@@ -678,6 +685,47 @@ export function registerSSOIPC(getSpaBaseUrl: RemoteSpaOriginProvider): void {
       return completeMFA(mfa, requestBody);
     }
   );
+
+  // #2394: release an ORPHANED SSO reservation so a later password registration
+  // can stage its E2EE keys. Zero-argument by design — main resolves the target
+  // entirely from its own state, so the renderer carries no authority here.
+  ipcMain.handle('sso:abandonReservation', (event): boolean => {
+    // The frame check is the FIRST statement and this handler has no `await`,
+    // so event.senderFrame is read immediately (Electron: late access after a
+    // cross-origin navigation returns null). This channel fires while the
+    // renderer is transitioning between auth screens — the riskiest window.
+    // It must also stay AHEAD of the pending discard: an untrusted call
+    // mutates nothing at all.
+    if (!checkFrame(event, getSpaBaseUrl)) {
+      console.warn('[sso:abandonReservation] rejected — sender frame validation failed');
+      return false;
+    }
+    // Deliberate deviation: sibling sso:* handlers THROW on an untrusted frame.
+    // This one returns false because it is invoked from Register.handleSubmit,
+    // where a throw would turn a fail-closed *release* into a fail-closed
+    // *registration*. Precedent: the auth:getCapabilities handler in main.ts.
+    // Do NOT copy this shape into a channel where a throw is required.
+    const released = releaseCredentialReservation();
+    // Discard the pendings ONLY when the release actually happened. A
+    // successful release bumps the credential generation, which already
+    // terminally fails every continuation bound to it, so clearing the
+    // pendings is correct cleanup of state that is provably dead.
+    //
+    // A `false` release changed nothing, and must therefore destroy nothing.
+    // This handler is invoked from stale UI (a Register submit, an MFA-modal
+    // cancel, a link-confirm cancel) that can sit in the IPC queue, so an
+    // unconditional discard could wipe a NEWER sign-in's live pendingMFA /
+    // pendingCompletion while doing no useful work — e.g. once
+    // restoreRefreshToken has nulled the reservation but a challenge is still
+    // in flight. Every other pending-clearing site in this file is likewise
+    // identity-checked (discardPendingCompletion / discardPendingMFA) or fires
+    // from a supersede-everything context. (#2655 review.)
+    if (released) {
+      pendingCompletion = null;
+      pendingMFA = null;
+    }
+    return released;
+  });
 
   ipcMain.handle('sso:appleSignIn', async (event, requestedApiBase: unknown) => {
     if (!checkFrame(event, getSpaBaseUrl)) {

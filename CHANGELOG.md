@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.38] — 2026-07-30
+
+### Fixed
+
+- **Signing up with a password after backing out of a social sign-in no longer costs you your encryption keys** ([#2655](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2655)) — if you started signing in with Google or Apple and then changed your mind, the abandoned attempt kept a hold on the app's secure-key slot. A password registration that followed silently failed to save its encryption keys to your keychain, so those keys did not survive a restart until you logged in again. The abandoned attempt is now released before registration begins.
+
 ## [0.2.37] — 2026-07-27
 
 ### Fixed

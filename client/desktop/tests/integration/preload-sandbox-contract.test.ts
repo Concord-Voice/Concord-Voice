@@ -58,5 +58,11 @@ describe('preload sandbox contract (integration)', () => {
     const content = readFileSync(preloadPath, 'utf-8');
     expect(content).toContain('sso:completeRegistration');
     expect(content).toContain('sso:completeLink');
+    // #2424 added this channel to the bridge but never to this lock — added
+    // while touching the file, since this is exactly the test that exists to
+    // catch a bridge channel going missing from the built preload.
+    expect(content).toContain('sso:completeMFA');
+    // #2394
+    expect(content).toContain('sso:abandonReservation');
   });
 });

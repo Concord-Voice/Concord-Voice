@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import SSOAccountLinkConfirm from '@/renderer/components/Auth/SSOAccountLinkConfirm';
+import { abandonSSOReservation } from '@/renderer/services/ssoService';
 import { useSSOStore } from '@/renderer/stores/ssoStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useE2EEStore } from '@/renderer/stores/e2eeStore';
@@ -13,6 +14,13 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 vi.mock('@/renderer/services/apiClient', async (orig) => ({
   ...(await orig<typeof import('@/renderer/services/apiClient')>()),
   revokeAbortedSession: vi.fn().mockResolvedValue(undefined),
+}));
+
+// #2394: replace only abandonSSOReservation. completeSSOLink stays real so the
+// existing tests keep asserting against the electron sso.completeLink bridge.
+vi.mock('@/renderer/services/ssoService', async (orig) => ({
+  ...(await orig<typeof import('@/renderer/services/ssoService')>()),
+  abandonSSOReservation: vi.fn().mockResolvedValue(true),
 }));
 
 const storeRefreshToken = vi.fn().mockResolvedValue(41);
@@ -186,6 +194,20 @@ describe('SSOAccountLinkConfirm', () => {
     expect(lockoutMessage).toBeInTheDocument();
     // Lockout must NOT mint an access token — verifies the 423 path
     // does not accidentally fall through to the success-token handler.
+    expect(useAuthStore.getState().accessToken).toBeNull();
+  });
+
+  it('Cancel abandons the SSO reservation and returns the store to idle (#2394)', async () => {
+    // Backing out of account linking abandons the SSO flow, so the orphaned
+    // main-process reservation is retired eagerly rather than left to block a
+    // later password registration's E2EE key staging.
+    render(<SSOAccountLinkConfirm />);
+    fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+
+    await waitFor(() => expect(useSSOStore.getState().state.phase).toBe('idle'));
+    expect(abandonSSOReservation).toHaveBeenCalledTimes(1);
+    // Cancelling never touches credentials — it only releases the reservation.
+    expect(clearTokensIfOwner).not.toHaveBeenCalled();
     expect(useAuthStore.getState().accessToken).toBeNull();
   });
 });

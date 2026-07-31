@@ -128,8 +128,29 @@
  *        numbers are independent — IPC_CONTRACT_VERSION is what this shell
  *        implements, SPA_IPC_CONTRACT (spa.env) is the minimum the deployed SPA
  *        demands, and a 20-shell still satisfies a 19-minimum.
+ * - v21: Orphaned SSO reservation release (#2394): the zero-argument
+ *        sso:abandonReservation channel releases a credential reservation that
+ *        has no live main-process continuation, reopening the pre-credential
+ *        auth:storeE2EEKeys staging lane for password registration. Before it,
+ *        an abandoned SSO attempt left the reservation resident forever and a
+ *        later password registration silently lost restart-survival of its
+ *        E2EE keys.
+ *
+ *        It takes NO renderer-supplied authority — main resolves the target
+ *        from reservedCredentialOwner / pendingCompletion / pendingMFA, the
+ *        same zero-arg posture as spa:reloadLatest. It requires the slot to be
+ *        RESERVED and UNFILLED, so it is a structural no-op once a credential
+ *        is published and cannot be used as a logout. Deliberately NOT routed
+ *        through clearTokensIfOwner, which CAS-checks the generation only while
+ *        publishRefreshToken preserves the generation across a rotation — that
+ *        path could pass the CAS and wipe a live credential.
+ *
+ *        The SERVER's spaIpcContract stays 19, for the same reason as v20: the
+ *        channel is additive, and a shell without it degrades to the pre-#2394
+ *        bug (E2EE keys session-only, recoverable by unlock or re-login) —
+ *        never to a weaker or unowned credential writer.
  */
-export const IPC_CONTRACT_VERSION = 20;
+export const IPC_CONTRACT_VERSION = 21;
 
 /**
  * Opaque main-process identity for one stored credential lifecycle.

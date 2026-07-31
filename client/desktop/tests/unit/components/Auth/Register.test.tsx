@@ -1,10 +1,12 @@
-import { render, screen, userEvent } from '../../../test-utils';
+import { render, screen, userEvent, waitFor } from '../../../test-utils';
 import Register from '@/renderer/components/Auth/Register';
 import { vi } from 'vitest';
 import { usePendingRegistrationStore } from '@/renderer/stores/pendingRegistrationStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
 import { e2eeService } from '@/renderer/services/e2eeService';
+import { generateRegistrationKeys } from '@/renderer/utils/crypto';
+import { abandonSSOReservation } from '@/renderer/services/ssoService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock global fetch
@@ -52,6 +54,14 @@ vi.mock('@/renderer/services/e2eeService', () => ({
     }),
   },
 }));
+
+// #2394: partial-mock ssoService so the pre-submit reservation release can be
+// observed. Only abandonSSOReservation is replaced — the rest of the module is
+// real, so nothing else in this suite changes behavior.
+vi.mock('@/renderer/services/ssoService', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/services/ssoService')>();
+  return { ...actual, abandonSSOReservation: vi.fn().mockResolvedValue(true) };
+});
 
 // Mock useSSOFlow so we can assert the SSOButton wiring without exercising
 // the full loopback flow. The actual flow is covered in ssoService.test.ts.
@@ -460,5 +470,161 @@ describe('Register', () => {
 
     await user.click(screen.getByRole('button', { name: /sign in with apple/i }));
     expect(beginSSOMock).toHaveBeenCalledWith('apple');
+  });
+
+  // ── Orphaned SSO reservation release (#2394) ──────────────────────────
+  // An SSO attempt the user abandoned leaves a credential reservation resident
+  // in the main process, and the generic E2EE staging writer refuses while any
+  // reservation exists. Register.handleSubmit therefore awaits
+  // abandonSSOReservation() as the FIRST statement inside its try — before the
+  // key generation and, transitively, before the persist call at the bottom of
+  // the same function.
+
+  describe('SSO reservation release (#2394)', () => {
+    const REGISTRATION_KEYS = {
+      wrappedPrivateKey: 'mock',
+      keyDerivationSalt: 'mock',
+      keyDerivationAlg: 'argon2id',
+      publicKey: {},
+    };
+
+    /** Resolve the register POST as a 201 with a well-formed pending body. */
+    function mockRegistrationSuccess() {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({
+          pending_id: 'mock-pending-id',
+          email: 'test@example.com',
+          expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+          code_expires_at: new Date(Date.now() + 2 * 60_000).toISOString(),
+        }),
+      });
+    }
+
+    /** Fill every field the validator requires so handleSubmit reaches its try. */
+    async function fillValidForm(user: ReturnType<typeof userEvent.setup>) {
+      await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+      await user.type(screen.getByPlaceholderText('your_username'), 'testuser');
+      await user.type(
+        screen.getByPlaceholderText('Create a strong password'),
+        'MySecurePassword123!'
+      );
+      await user.type(screen.getByPlaceholderText('Confirm your password'), 'MySecurePassword123!');
+      await user.click(screen.getByText(/at least 16 years old/));
+    }
+
+    const submitButton = () => screen.getByRole('button', { name: 'Create Account' });
+
+    it('abandons an orphaned SSO reservation BEFORE generating registration keys', async () => {
+      // The load-bearing assertion of #2394 is ORDER, not merely that the call
+      // happened: a release that lands after key generation still races the
+      // staging write it exists to unblock. Both mocks append to one shared
+      // array so the sequence itself is asserted.
+      // The push happens AFTER a microtask turn, deliberately. If it pushed
+      // synchronously at call time the order would hold even without the
+      // `await` in Register.handleSubmit — both calls are made in sequence
+      // either way. Yielding first means only a genuinely awaited release
+      // records before key generation, so dropping the `await` fails this.
+      const order: string[] = [];
+      vi.mocked(abandonSSOReservation).mockImplementationOnce(async () => {
+        await Promise.resolve();
+        order.push('abandon');
+        return true;
+      });
+      vi.mocked(generateRegistrationKeys).mockImplementationOnce(async () => {
+        order.push('generate');
+        return REGISTRATION_KEYS;
+      });
+      mockRegistrationSuccess();
+
+      const user = userEvent.setup();
+      render(<Register onBack={onBack} onSuccess={onSuccess} onSwitchToLogin={onSwitchToLogin} />);
+      await fillValidForm(user);
+      await user.click(submitButton());
+
+      await waitFor(() => expect(order).toEqual(['abandon', 'generate']));
+    });
+
+    it('does not abandon when form validation fails', async () => {
+      // The release sits after validateForm()'s early return, so a submit that
+      // was never going to register must not retire a reservation the user may
+      // still want.
+      const user = userEvent.setup();
+      render(<Register onBack={onBack} onSuccess={onSuccess} onSwitchToLogin={onSwitchToLogin} />);
+      await user.click(submitButton());
+
+      expect(await screen.findByText('Email is required')).toBeInTheDocument();
+      expect(abandonSSOReservation).not.toHaveBeenCalled();
+    });
+
+    it('does not abandon when the secureStorage gate denies', async () => {
+      // Same reasoning as validation: the fail-closed #197 gate returns before
+      // the try block, so no reservation is released.
+      vi.mocked(window.electron.checkPermission).mockResolvedValueOnce('denied');
+
+      const user = userEvent.setup();
+      render(<Register onBack={onBack} onSuccess={onSuccess} onSwitchToLogin={onSwitchToLogin} />);
+      await fillValidForm(user);
+      await user.click(submitButton());
+
+      expect(await screen.findByText(/secure storage is unavailable/i)).toBeInTheDocument();
+      expect(abandonSSOReservation).not.toHaveBeenCalled();
+    });
+
+    it('registers normally when the abandon bridge is absent (older shell)', async () => {
+      // A shell below IPC contract v21 has no sso:abandonReservation channel,
+      // so the helper resolves false. That degrades to the pre-#2394 behavior
+      // (keys session-only) and must never block registration.
+      vi.mocked(abandonSSOReservation).mockResolvedValueOnce(false);
+      mockRegistrationSuccess();
+
+      const user = userEvent.setup();
+      render(<Register onBack={onBack} onSuccess={onSuccess} onSwitchToLogin={onSwitchToLogin} />);
+      await fillValidForm(user);
+      await user.click(submitButton());
+
+      await waitFor(() =>
+        expect(onSuccess).toHaveBeenCalledWith({
+          pendingId: 'mock-pending-id',
+          email: 'test@example.com',
+        })
+      );
+      expect(abandonSSOReservation).toHaveBeenCalledTimes(1);
+    });
+
+    it('warns but does not block registration when key persistence returns false', async () => {
+      // #1278/#1288: registration already succeeded server-side, so a
+      // recoverable persistence miss warns and nothing more. Turning it into a
+      // general form error would be the regression.
+      const storeE2EEKeysMock = vi.fn().mockResolvedValue(false);
+      (window.electron as unknown as { storeE2EEKeys: typeof storeE2EEKeysMock }).storeE2EEKeys =
+        storeE2EEKeysMock;
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      mockRegistrationSuccess();
+
+      const user = userEvent.setup();
+      const { container } = render(
+        <Register onBack={onBack} onSuccess={onSuccess} onSwitchToLogin={onSwitchToLogin} />
+      );
+      await fillValidForm(user);
+      await user.click(submitButton());
+
+      await waitFor(() =>
+        expect(onSuccess).toHaveBeenCalledWith({
+          pendingId: 'mock-pending-id',
+          email: 'test@example.com',
+        })
+      );
+      expect(storeE2EEKeysMock).toHaveBeenCalled();
+      // The warn comes from persistE2EESessionKeys, not from Register — the
+      // helper owns the warn policy (electron.md), and duplicating it at the
+      // call site logged the same failure twice with different wording.
+      const emitted = warn.mock.calls.flat().join(' ');
+      expect(emitted).toContain('this session only');
+      // No general error banner is rendered for a persistence miss.
+      expect(container.querySelector('.form-error-banner')).toBeNull();
+      warn.mockRestore();
+    });
   });
 });

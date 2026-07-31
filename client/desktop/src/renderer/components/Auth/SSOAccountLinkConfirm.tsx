@@ -31,7 +31,7 @@ import LoadingSpinner from './LoadingSpinner';
 import { useSSOStore } from '../../stores/ssoStore';
 import { useAuthStore } from '../../stores/authStore';
 import { useE2EEStore } from '../../stores/e2eeStore';
-import { completeSSOLink } from '../../services/ssoService';
+import { completeSSOLink, abandonSSOReservation } from '../../services/ssoService';
 import { revokeAbortedSession, type AbortedSessionRef } from '../../services/apiClient';
 import {
   captureRuntimeServerSelection,
@@ -158,6 +158,11 @@ const SSOAccountLinkConfirm: React.FC = () => {
   };
 
   const handleCancel = () => {
+    // #2394: backing out here abandons the SSO flow, so retire the orphaned
+    // main-process reservation eagerly rather than leaving it to block a later
+    // password registration's E2EE key staging. Fire-and-forget: the helper
+    // never throws, and nothing below depends on its result.
+    void abandonSSOReservation();
     setSSOState({ phase: 'idle' });
   };
 

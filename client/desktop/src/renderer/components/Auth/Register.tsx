@@ -10,6 +10,7 @@ import { apiUrl } from '../../services/runtimeServerBase';
 import { e2eeService } from '../../services/e2eeService';
 import { errorMessage } from '../../utils/redactError';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
+import { abandonSSOReservation } from '../../services/ssoService';
 import { useClientConfigStore } from '../../stores/clientConfigStore';
 import {
   usePendingRegistrationStore,
@@ -143,6 +144,23 @@ const Register: React.FC<RegisterProps> = ({ onBack, onSuccess, onSwitchToLogin 
     setIsSubmitting(true);
 
     try {
+      // #2394: claim the pre-credential E2EE staging lane before we generate
+      // anything. An SSO attempt the user abandoned leaves a reservation
+      // resident in the main process, and the generic staging writer refuses
+      // while any reservation exists — which would make the persistE2EESessionKeys
+      // call at the bottom of this function a silent no-op and cost this
+      // account restart-survival of its keys.
+      //
+      // AWAITED, and deliberately in the SAME function as that staging call, so
+      // the ordering is a language guarantee rather than a scheduling
+      // assumption. Do not move this to a mount effect or a route guard: both
+      // are unordered against the staging call, and both fire on paths that
+      // never reach a submit, which would widen the window in which an SSO
+      // flow the user still wants gets released. It sits after validateForm()
+      // and after the fail-closed secureStorage gate, so a submit that will
+      // abort anyway never releases a reservation. Idempotent on retry.
+      await abandonSSOReservation();
+
       // Generate E2EE keys
       console.debug('Generating E2EE keys...');
       const keys = await generateRegistrationKeys(formData.password);
@@ -215,6 +233,15 @@ const Register: React.FC<RegisterProps> = ({ onBack, onSuccess, onSwitchToLogin 
       //      NEVER clears the valid in-memory session from (1) (#1278/#1288 —
       //      the warn/never-clear rationale lives in persistE2EESessionKeys).
       //      No-op if (1) failed (getSessionKeys returns null after clearKeys).
+      //      #2394: the result was discarded before, which is why the
+      //      staging-lane bug was invisible in practice — the #1288 "surface,
+      //      don't swallow" contract was honored by the helper and then dropped
+      //      here. It is consumed now, but NOT re-warned: the helper already
+      //      logs on `false` (persistE2EESessionKeys), and electron.md puts the
+      //      warn policy there rather than at each call site. Warn-only is also
+      //      the whole policy — registration already succeeded server-side, so
+      //      failing it over a recoverable persistence miss would contradict
+      //      #1278.
       await persistE2EESessionKeys(e2eeService.getSessionKeys());
 
       usePendingRegistrationStore.getState().setPending(data);

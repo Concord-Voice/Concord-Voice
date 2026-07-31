@@ -4,6 +4,7 @@ import {
   completeSSORegistration,
   completeSSOLink,
   completeSSOMFA,
+  abandonSSOReservation,
 } from '@/renderer/services/ssoService';
 import { useAuthStore } from '@/renderer/stores/authStore';
 
@@ -20,6 +21,7 @@ interface ElectronSSO {
   completeRegistration: ReturnType<typeof vi.fn>;
   completeLink: ReturnType<typeof vi.fn>;
   completeMFA: ReturnType<typeof vi.fn>;
+  abandonReservation?: ReturnType<typeof vi.fn>;
 }
 
 interface ElectronTestSurface {
@@ -381,5 +383,49 @@ describe('completeSSOMFA (#2424)', () => {
         { apiBase: API_BASE, epoch: 0 }
       )
     ).rejects.toThrow(/sso_complete_mfa_failed_401/);
+  });
+});
+
+describe('abandonSSOReservation (#2394)', () => {
+  // The helper must NEVER throw: it is called from the registration submit
+  // path and from modal cancels, where a rejection would abort user-visible
+  // work. Absence degrades to the pre-#2394 bug, never to a weaker writer.
+
+  it('returns false when the bridge is entirely absent (older shell)', async () => {
+    (window as unknown as { electron?: unknown }).electron = undefined;
+    await expect(abandonSSOReservation()).resolves.toBe(false);
+  });
+
+  it('returns false when the sso namespace lacks the method', async () => {
+    delete electron.sso.abandonReservation;
+    await expect(abandonSSOReservation()).resolves.toBe(false);
+  });
+
+  it('swallows an IPC rejection and returns false', async () => {
+    electron.sso.abandonReservation = vi.fn().mockRejectedValue(new Error('ipc down'));
+    await expect(abandonSSOReservation()).resolves.toBe(false);
+  });
+
+  // Register.handleSubmit AWAITS this before doing anything else, so an
+  // ipcRenderer.invoke that never settles (wedged main process) would hang the
+  // submit with isSubmitting stuck true and no error surfaced.
+  it('resolves false instead of hanging when the bridge never settles', async () => {
+    vi.useFakeTimers();
+    try {
+      electron.sso.abandonReservation = vi.fn(() => new Promise<boolean>(() => {}));
+      const pending = abandonSSOReservation();
+      await vi.advanceTimersByTimeAsync(3000);
+      await expect(pending).resolves.toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('passes the main-process boolean through', async () => {
+    electron.sso.abandonReservation = vi.fn().mockResolvedValue(true);
+    await expect(abandonSSOReservation()).resolves.toBe(true);
+
+    electron.sso.abandonReservation = vi.fn().mockResolvedValue(false);
+    await expect(abandonSSOReservation()).resolves.toBe(false);
   });
 });

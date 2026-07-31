@@ -834,6 +834,49 @@ export function clearTokensIfOwner(owner: CredentialOwner): boolean {
   return true;
 }
 
+/**
+ * Release an ORPHANED SSO credential reservation so the pre-credential staging
+ * lane (`storeE2EEKeys`, below) reopens for password registration (#2394).
+ *
+ * A reservation exists to say "an SSO flow with a live continuation in main
+ * holds the exclusive right to mint the next credential." When the user
+ * abandons that flow, nothing retired the reservation, so a later password
+ * registration silently lost restart-survival of its E2EE keys.
+ *
+ * Deliberately NOT `clearTokensIfOwner`: that primitive CAS-checks the
+ * generation ONLY, and `publishRefreshToken` preserves the generation across a
+ * rotation, so a renderer-timed release routed through it could pass the CAS
+ * and wipe a just-published live credential. This guard additionally requires
+ * the slot to be RESERVED and UNFILLED — the same triple
+ * `storeRefreshTokenIfOwner` checks — which makes that case structurally
+ * unreachable.
+ *
+ * Which clause actually closes it, precisely: `publishRefreshToken` nulls
+ * `reservedCredentialOwner` in the same synchronous block that sets the token,
+ * so after a publish the FIRST clause already short-circuits. The
+ * `inMemoryRefreshToken` clause is therefore defense-in-depth against a future
+ * writer that sets a token without clearing the reservation — a state no
+ * current code path can reach, and consequently one no test can construct
+ * through the public API. Do not read the published-credential test as a lock
+ * on that clause; it exercises clause one. Do not "simplify" this back to
+ * `clearTokensIfOwner` — the reasoning above, not a test, is what stops you.
+ *
+ * Delegates the wipe to `clearTokens()`: one wipe implementation, and the
+ * generation bump is DESIRED — every in-flight SSO continuation then fails its
+ * next `credentialOwnerIsCurrent` check and revokes its own server session.
+ */
+export function releaseCredentialReservation(): boolean {
+  if (
+    reservedCredentialOwner === null ||
+    reservedCredentialOwner !== credentialGeneration ||
+    inMemoryRefreshToken !== null
+  ) {
+    return false;
+  }
+  clearTokens();
+  return true;
+}
+
 // ─── E2EE Key Persistence (safeStorage) ──────────────────────────────
 
 /**
@@ -852,7 +895,17 @@ export function storeE2EEKeys(data: E2EEKeyMaterial): boolean {
   // The generic writer exists only for pre-credential registration staging.
   // Once a credential or SSO reservation exists, accepting an unowned write
   // could let a stale renderer continuation overwrite its successor's keys.
-  if (inMemoryRefreshToken !== null || reservedCredentialOwner !== null) return false;
+  if (inMemoryRefreshToken !== null || reservedCredentialOwner !== null) {
+    // #2394: make "the staging lane is held" distinguishable from a keychain
+    // failure in the main-process log. The renderer sees only `false` and
+    // cannot tell these apart, and before #2394 the surviving cause of a held
+    // lane was an orphaned SSO reservation — a bug, not an expected state.
+    // Never log the owner value or any key material (observability.md #1).
+    console.warn(
+      '[TokenManager] storeE2EEKeys refused — a credential or SSO reservation already holds the staging lane'
+    );
+    return false;
+  }
   stagedE2EEKeys = { generation: credentialGeneration, keys: data };
   return true;
 }

@@ -410,6 +410,9 @@ contextBridge.exposeInMainWorld('electron', {
     ): Promise<SSOCompletionResult> => ipcRenderer.invoke('sso:completeLink', apiBase, payload),
     completeMFA: (apiBase: string, payload: SSOCompleteMFAPayload): Promise<SSOCompletionResult> =>
       ipcRenderer.invoke('sso:completeMFA', apiBase, payload),
+    // #2394: zero-argument by design — main resolves the target reservation
+    // from its own state, so the renderer supplies no authority here.
+    abandonReservation: (): Promise<boolean> => ipcRenderer.invoke('sso:abandonReservation'),
   },
 
   // Window chrome control surface (#806): renderer pushes Client Behavior
@@ -690,6 +693,12 @@ export interface ElectronAPI {
       payload: SSOCompleteLinkPayload
     ) => Promise<SSOCompletionResult>;
     completeMFA: (apiBase: string, payload: SSOCompleteMFAPayload) => Promise<SSOCompletionResult>;
+    // Optional by design: a shell older than IPC contract v21 does not expose
+    // this channel, and the renderer's optional-chain guard degrades to the
+    // pre-#2394 behaviour. Declaring it non-optional would make that documented
+    // path type-invisible, so a refactor could drop the guard without a
+    // compile error.
+    abandonReservation?: () => Promise<boolean>;
   };
 
   // Window chrome control surface (#806)

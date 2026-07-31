@@ -162,12 +162,23 @@ const tokenMocks = vi.hoisted(() => {
     hasToken = false;
     return true;
   });
+  // #2394: mirrors the real primitive's triple guard — reserved, current
+  // generation, and NO published credential. The published-credential clause is
+  // what stops a stale abandon from wiping a live session (the D2 footgun).
+  const releaseCredentialReservation = vi.fn(() => {
+    if (reservedOwner === null || reservedOwner !== currentOwner || hasToken) return false;
+    currentOwner += 1;
+    reservedOwner = null;
+    hasToken = false;
+    return true;
+  });
 
   return {
     reserveCredentialOwner,
     credentialOwnerIsCurrent,
     storeRefreshTokenIfOwner,
     clearTokensIfOwner,
+    releaseCredentialReservation,
     reset: () => {
       currentOwner = 40;
       reservedOwner = null;
@@ -187,6 +198,7 @@ vi.mock('../../../../src/main/tokenManager', () => ({
   credentialOwnerIsCurrent: tokenMocks.credentialOwnerIsCurrent,
   storeRefreshTokenIfOwner: tokenMocks.storeRefreshTokenIfOwner,
   clearTokensIfOwner: tokenMocks.clearTokensIfOwner,
+  releaseCredentialReservation: tokenMocks.releaseCredentialReservation,
 }));
 
 // #2424: sso:completeMFA supplies X-Machine-Id via getMachineId; mock it to a
@@ -257,6 +269,7 @@ describe('sso IPC handlers', () => {
     apiBase: unknown,
     payload: unknown
   ) => Promise<unknown>;
+  let abandonReservationHandler: (event: FakeInvokeEvent) => boolean;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -302,6 +315,10 @@ describe('sso IPC handlers', () => {
     completeRegistrationHandler = completeRegistrationCall[1];
     completeLinkHandler = completeLinkCall[1];
     completeMFAHandler = completeMFACall[1];
+
+    const abandonCall = mocked.handleSpy.mock.calls.find((c) => c[0] === 'sso:abandonReservation');
+    if (!abandonCall) throw new Error('sso:abandonReservation handler not registered');
+    abandonReservationHandler = abandonCall[1];
   });
 
   describe('sender-frame validation', () => {
@@ -1019,6 +1036,198 @@ describe('sso IPC handlers', () => {
         method: 'POST',
         credentials: 'omit',
         headers: { Authorization: 'Bearer stale-access', 'X-Refresh-Token': 'stale-refresh' },
+      });
+    });
+  });
+
+  describe('sso:abandonReservation (#2394)', () => {
+    // Drive a google sign-in that parks an sso_token completion, establishing
+    // pendingCompletion + the reserved owner (41).
+    async function beginGoogleRegistration(ssoToken = 'st-1') {
+      googleMocks.runGoogleSignIn.mockImplementationOnce(
+        async () =>
+          ({
+            kind: 'sso_token',
+            branch: 'new_user',
+            ssoToken,
+            email: 'alice@example.com',
+            name: 'Alice',
+          }) as never
+      );
+      return googleSignInHandler({ senderFrame: { url: TRUSTED } }, SAAS_API_BASE);
+    }
+
+    // Drive a google sign-in that parks an MFA challenge, establishing
+    // pendingMFA + the reserved owner (41).
+    async function beginGoogleMFAChallenge(token = 'mfa-tok-1') {
+      googleMocks.runGoogleSignIn.mockImplementationOnce(
+        async () =>
+          ({
+            kind: 'mfa_challenge',
+            mfaChallengeToken: token,
+            methods: ['totp'],
+          }) as never
+      );
+      return googleSignInHandler({ senderFrame: { url: TRUSTED } }, SAAS_API_BASE);
+    }
+
+    const googleRegistrationPayload = {
+      ...registrationPayload,
+      provider: 'google' as const,
+      ssoToken: 'st-1',
+    };
+
+    const googleTotpPayload = {
+      provider: 'google' as const,
+      mfaChallengeToken: 'mfa-tok-1',
+      credentialOwner: 41,
+      method: 'totp',
+      code: '123456',
+    };
+
+    it('releases the reservation and discards pendingCompletion', async () => {
+      await expect(beginGoogleRegistration()).resolves.toMatchObject({ kind: 'sso_token' });
+
+      expect(abandonReservationHandler({ senderFrame: { url: TRUSTED } })).toBe(true);
+      expect(tokenMocks.releaseCredentialReservation).toHaveBeenCalledTimes(1);
+
+      vi.mocked(net.fetch).mockClear();
+      tokenMocks.credentialOwnerIsCurrent.mockClear();
+
+      await expect(
+        completeRegistrationHandler(
+          { senderFrame: { url: TRUSTED } },
+          SAAS_API_BASE,
+          googleRegistrationPayload
+        )
+      ).resolves.toEqual({ kind: 'error', status: 409, code: 'sso_cancelled' });
+      expect(net.fetch).not.toHaveBeenCalled();
+      // The 409 came from the DISCARDED pending, not from completeSSO's owner
+      // CAS — that path would have called credentialOwnerIsCurrent. Without
+      // this assertion the generation bump alone would satisfy the 409.
+      expect(tokenMocks.credentialOwnerIsCurrent).not.toHaveBeenCalled();
+    });
+
+    it('releases the reservation and discards pendingMFA', async () => {
+      await expect(beginGoogleMFAChallenge()).resolves.toMatchObject({ kind: 'mfa_challenge' });
+
+      expect(abandonReservationHandler({ senderFrame: { url: TRUSTED } })).toBe(true);
+      expect(tokenMocks.releaseCredentialReservation).toHaveBeenCalledTimes(1);
+
+      vi.mocked(net.fetch).mockClear();
+      tokenMocks.credentialOwnerIsCurrent.mockClear();
+
+      await expect(
+        completeMFAHandler({ senderFrame: { url: TRUSTED } }, SAAS_API_BASE, googleTotpPayload)
+      ).resolves.toEqual({ kind: 'error', status: 409, code: 'sso_cancelled' });
+      expect(net.fetch).not.toHaveBeenCalled();
+      expect(tokenMocks.credentialOwnerIsCurrent).not.toHaveBeenCalled();
+    });
+
+    it('rejects an untrusted sender frame without mutating any state', async () => {
+      await beginGoogleMFAChallenge();
+
+      expect(abandonReservationHandler({ senderFrame: { url: UNTRUSTED } })).toBe(false);
+      expect(tokenMocks.releaseCredentialReservation).not.toHaveBeenCalled();
+
+      // The pendings survive an untrusted call — the frame check runs AHEAD of
+      // the discard, so a completion still reaches the network and succeeds.
+      vi.mocked(net.fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: 'mfa-access',
+            refresh_token: 'mfa-refresh',
+            session_id: SUCCESS_SESSION_ID,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+      await expect(
+        completeMFAHandler({ senderFrame: { url: TRUSTED } }, SAAS_API_BASE, googleTotpPayload)
+      ).resolves.toMatchObject({ kind: 'tokens', credentialOwner: 41 });
+    });
+
+    it('rejects a null sender frame', () => {
+      expect(abandonReservationHandler({ senderFrame: null } as never)).toBe(false);
+      expect(tokenMocks.releaseCredentialReservation).not.toHaveBeenCalled();
+    });
+
+    // Gitar (PR #2655): a release that returned false changed NOTHING, so it
+    // must destroy nothing. This handler is invoked from stale UI that can sit
+    // in the IPC queue, and an unconditional discard could wipe a NEWER
+    // sign-in's live pendingMFA while doing no useful work.
+    it('returns false when there is no reservation, and PRESERVES the pendings', async () => {
+      await beginGoogleMFAChallenge();
+      // A successor credential took the slot, so the release is a structural
+      // no-op. The pending must survive it untouched.
+      tokenMocks.supersedeCredential();
+
+      expect(abandonReservationHandler({ senderFrame: { url: TRUSTED } })).toBe(false);
+      expect(tokenMocks.releaseCredentialReservation).toHaveReturnedWith(false);
+
+      vi.mocked(net.fetch).mockClear();
+      tokenMocks.credentialOwnerIsCurrent.mockClear();
+
+      // Still 409s — but via the stale owner CAS, not via a missing pending.
+      await expect(
+        completeMFAHandler({ senderFrame: { url: TRUSTED } }, SAAS_API_BASE, googleTotpPayload)
+      ).resolves.toEqual({ kind: 'error', status: 409, code: 'sso_cancelled' });
+      expect(net.fetch).not.toHaveBeenCalled();
+      // Load-bearing: a DISCARDED pendingMFA would bail before the owner check
+      // and 409 with the CAS never called. The CAS having been called is what
+      // proves the pending survived and was evaluated on its merits.
+      expect(tokenMocks.credentialOwnerIsCurrent).toHaveBeenCalled();
+    });
+
+    // AC5 — a completion already past its pre-fetch owner check, racing the
+    // abandon, must not leave an orphaned server session behind.
+    it('revokes the issued server session when a completion races the abandon', async () => {
+      await beginGoogleMFAChallenge();
+
+      // The verify POST resolves 200 with a well-formed body, but the abandon
+      // lands while it is in flight, so storeRefreshTokenIfOwner refuses the
+      // now-stale owner and BOTH issued sessions must be revoked.
+      vi.mocked(net.fetch)
+        .mockImplementationOnce(async () => {
+          abandonReservationHandler({ senderFrame: { url: TRUSTED } });
+          return new Response(
+            JSON.stringify({
+              access_token: 'raced-access',
+              refresh_token: 'raced-refresh',
+              session_id: SUCCESS_SESSION_ID,
+            }),
+            {
+              status: 200,
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Concord-Session-ID': SESSION_ID,
+              },
+            }
+          );
+        })
+        .mockResolvedValueOnce(new Response(null, { status: 204 }))
+        .mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+      await expect(
+        completeMFAHandler({ senderFrame: { url: TRUSTED } }, SAAS_API_BASE, googleTotpPayload)
+      ).resolves.toEqual({ kind: 'error', status: 409, code: 'sso_cancelled' });
+
+      // The CAS store rejected — the raced credential was never adopted.
+      expect(tokenMocks.storeRefreshTokenIfOwner).toHaveReturnedWith(null);
+      // revokeCookieBoundSession then revokeExplicitSession, both against
+      // /api/v1/auth/logout (the real endpoints in ipc/sso.ts).
+      expect(net.fetch).toHaveBeenNthCalledWith(2, `${SAAS_API_BASE}/api/v1/auth/logout`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'X-Session-ID': SESSION_ID },
+      });
+      expect(net.fetch).toHaveBeenNthCalledWith(3, `${SAAS_API_BASE}/api/v1/auth/logout`, {
+        method: 'POST',
+        credentials: 'omit',
+        headers: {
+          Authorization: 'Bearer raced-access',
+          'X-Refresh-Token': 'raced-refresh',
+        },
       });
     });
   });

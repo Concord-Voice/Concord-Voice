@@ -49,8 +49,12 @@ export async function persistE2EESessionKeys(
         ? await electron.storeE2EEKeys(sessionKeys)
         : await electron.storeE2EEKeysIfOwner(sessionKeys, credentialOwner);
     if (persisted === false || typeof persisted !== 'boolean') {
+      // #2394: deliberately NOT attributed to the keychain. A `false` can also
+      // mean the main-process staging lane was held by a credential or an SSO
+      // reservation, which the renderer cannot distinguish. The main process
+      // logs which cause fired; here we state only the consequence.
       console.warn(
-        'E2EE session keys did not persist to the keychain (E2EE active for this session only; re-login on next launch to restore restart-survival).'
+        'E2EE session keys did not persist (E2EE active for this session only; re-login on next launch to restore restart-survival).'
       );
       return false;
     }

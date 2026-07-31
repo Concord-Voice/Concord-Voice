@@ -30,6 +30,9 @@ import type {
   SSOSignInResult,
 } from '@/shared/sso';
 
+/** Upper bound on the #2394 abandon IPC, so a wedged main process cannot hang a registration submit. */
+const ABANDON_RESERVATION_TIMEOUT_MS = 3000;
+
 export type SSOProvider = 'google' | 'apple';
 
 export interface SSOCompletionResult {
@@ -213,4 +216,43 @@ export async function completeSSOMFA(
     await globalThis.electron.sso.completeMFA(serverSelection.apiBase, params),
     'sso_complete_mfa_failed'
   );
+}
+
+/**
+ * Release an orphaned main-process SSO credential reservation (#2394).
+ *
+ * NEVER throws. Callers invoke it on paths where a rejection would abort
+ * user-visible work — the password-registration submit, a modal cancel — so a
+ * failure here must degrade, not propagate.
+ *
+ * An absent bridge (a shell older than IPC contract v21) resolves `false`,
+ * degrading to the pre-#2394 behaviour: E2EE keys stay session-only and are
+ * recovered by unlock or re-login. This deliberately does NOT follow the
+ * fail-closed shape in `persistE2EESessionKeys` — there, an unavailable
+ * owner-scoped method must never fall through to the generic writer, because
+ * that would be a custody downgrade. Here, absence costs restart-survival
+ * only, so degrading is correct.
+ */
+export async function abandonSSOReservation(): Promise<boolean> {
+  const invoke = globalThis.electron?.sso?.abandonReservation;
+  if (!invoke) return false;
+  // The helper cannot reject, but `ipcRenderer.invoke` can fail to SETTLE if the
+  // main process is wedged — and Register.handleSubmit awaits this before doing
+  // anything else, so an unsettled promise would hang the submit with
+  // isSubmitting stuck true and no error surfaced. Bound it: on timeout we
+  // report `false`, which is the same "could not release" answer an older shell
+  // gives, and registration proceeds.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      invoke(),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), ABANDON_RESERVATION_TIMEOUT_MS);
+      }),
+    ]);
+  } catch {
+    return false;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }

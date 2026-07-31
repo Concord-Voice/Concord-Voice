@@ -2,7 +2,7 @@ import React, { useState, useCallback, useMemo } from 'react';
 import { useMFAChallengeStore, type MFAVerifyResponse } from '../../stores/mfaChallengeStore';
 import { ensureMachineId, safeJson } from '../../services/apiClient';
 import { apiUrl, captureRuntimeServerSelection } from '../../services/runtimeServerBase';
-import { completeSSOMFA, SSOServiceError } from '../../services/ssoService';
+import { completeSSOMFA, SSOServiceError, abandonSSOReservation } from '../../services/ssoService';
 import TOTPInput from './TOTPInput';
 import BackupCodeInput from './BackupCodeInput';
 import WebAuthnPrompt from './WebAuthnPrompt';
@@ -250,7 +250,16 @@ const MFAChallengeModal: React.FC = () => {
         <button
           type="button"
           className="btn btn-secondary mfa-modal-cancel"
-          onClick={clearChallenge}
+          onClick={() => {
+            // #2394: only the 'sso_login' purpose holds an SSO reservation.
+            // The other purpose, 'suspicious_refresh', runs mid-session where a
+            // published credential already makes the release a structural
+            // no-op — the gate states that rather than relying on it.
+            // Fire-and-forget: clearChallenge must not wait on an IPC round
+            // trip, and the helper never throws.
+            if (purpose === 'sso_login') void abandonSSOReservation();
+            clearChallenge();
+          }}
           disabled={loading}
         >
           Cancel

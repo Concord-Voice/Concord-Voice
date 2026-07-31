@@ -60,7 +60,9 @@ import {
   restoreRefreshToken,
   clearTokens,
   clearTokensIfOwner,
+  releaseCredentialReservation,
   reserveCredentialOwner,
+  credentialOwnerIsCurrent,
   storeRefreshTokenIfOwner,
   storeE2EEKeys,
   storeE2EEKeysIfOwner,
@@ -808,6 +810,90 @@ describe('tokenManager', () => {
       // Session-only skip is not a failure — the renderer must not warn.
       expect(storeE2EEKeysIfOwner(keys, owner)).toBe(true);
       expect(fsWriteCalls.length).toBe(0);
+    });
+  });
+
+  describe('releaseCredentialReservation (#2394)', () => {
+    const API = 'http://localhost:8080';
+    const keys = {
+      wrappingKeyBase64: 'wk',
+      preferencesKeyBase64: 'pk',
+      wrappedPrivateKeyBase64: 'wpk', // pragma: allowlist secret
+    };
+
+    it('reopens the generic staging lane after an orphaned SSO reservation', () => {
+      reserveCredentialOwner(API);
+      expect(storeE2EEKeys(keys)).toBe(false);
+
+      expect(releaseCredentialReservation()).toBe(true);
+      expect(storeE2EEKeys(keys)).toBe(true);
+    });
+
+    it('lets the staged keys survive to storeRefreshToken adoption', () => {
+      reserveCredentialOwner(API);
+      releaseCredentialReservation();
+      expect(storeE2EEKeys(keys)).toBe(true);
+
+      storeRefreshToken({ refreshToken: 'rt-new', rememberMe: true, apiBase: API });
+
+      expect(restoreE2EEKeys()).toEqual(keys);
+    });
+
+    // Asserts the outcome that matters — a published credential survives an
+    // abandon — but be precise about WHY it passes: publishRefreshToken nulls
+    // reservedCredentialOwner, so the release short-circuits on the FIRST
+    // guard clause. This is NOT a lock on the inMemoryRefreshToken clause, and
+    // it would NOT catch a rewrite to `if (reserved === null) return false;
+    // return clearTokensIfOwner(reserved)`. That rewrite is ruled out by the
+    // reasoning in the primitive's docstring, not by this test — the state it
+    // would need (reserved set AND a token published) is unreachable through
+    // the public API, so no test can construct it.
+    it('is a no-op after a credential is published (cannot wipe a live session)', () => {
+      const owner = reserveCredentialOwner(API);
+      expect(
+        storeRefreshTokenIfOwner({ refreshToken: 'rt-live', rememberMe: true, apiBase: API }, owner)
+      ).not.toBeNull();
+
+      expect(releaseCredentialReservation()).toBe(false);
+      expect(restoreRefreshToken()).toMatchObject({ status: 'ok', token: 'rt-live' });
+    });
+
+    it('is a no-op when no reservation exists', () => {
+      expect(releaseCredentialReservation()).toBe(false);
+    });
+
+    it('bumps the credential generation so straggler continuations fail their CAS', () => {
+      const owner = reserveCredentialOwner(API);
+      expect(credentialOwnerIsCurrent(owner)).toBe(true);
+
+      expect(releaseCredentialReservation()).toBe(true);
+
+      expect(credentialOwnerIsCurrent(owner)).toBe(false);
+    });
+
+    it('is idempotent — a second release is a no-op', () => {
+      reserveCredentialOwner(API);
+      expect(releaseCredentialReservation()).toBe(true);
+      expect(releaseCredentialReservation()).toBe(false);
+      expect(storeE2EEKeys(keys)).toBe(true);
+    });
+
+    it('warns without leaking key material or the owner value when the lane is held', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const owner = reserveCredentialOwner(API);
+
+      expect(storeE2EEKeys(keys)).toBe(false);
+
+      const emitted = warn.mock.calls.flat().join(' ');
+      expect(emitted).toContain('storeE2EEKeys');
+      expect(emitted).not.toContain(String(owner));
+      // Iterate every component rather than spot-checking one: a future log
+      // leak of ANY key field must fail this test, not just the wrapped
+      // private key. (CodeRabbit, PR #2655 — CWE-532.)
+      for (const value of Object.values(keys)) {
+        expect(emitted).not.toContain(value);
+      }
+      warn.mockRestore();
     });
   });
 

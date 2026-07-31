@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
 import { useMFAChallengeStore, type MFAChallengeResult } from '@/renderer/stores/mfaChallengeStore';
-import { completeSSOMFA } from '@/renderer/services/ssoService';
+import { completeSSOMFA, abandonSSOReservation } from '@/renderer/services/ssoService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock global fetch
@@ -10,9 +10,11 @@ vi.stubGlobal('fetch', mockFetch);
 
 // #2424: mock only completeSSOMFA (the sso_login verify path); keep the real
 // SSOServiceError class so the modal's error-branch instanceof check works.
+// #2394 adds abandonSSOReservation to the same partial mock so the Cancel
+// purpose-gate can be observed without an Electron bridge.
 vi.mock('@/renderer/services/ssoService', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/renderer/services/ssoService')>();
-  return { ...actual, completeSSOMFA: vi.fn() };
+  return { ...actual, completeSSOMFA: vi.fn(), abandonSSOReservation: vi.fn() };
 });
 
 // safeJson is mocked as a transparent passthrough so existing fetch mocks
@@ -682,6 +684,51 @@ describe('MFAChallengeModal', () => {
     // prompt's internal cancel which triggers onCancel for the prompt.
     fireEvent.click(screen.getByText('Cancel'));
 
+    expect(mockResolve).toHaveBeenCalledWith({ verified: false });
+    expect(useMFAChallengeStore.getState().challengeToken).toBeNull();
+  });
+
+  // ── Cancel purpose gate (#2394) ──────────────────────────────────────────
+  // Only the 'sso_login' purpose holds a main-process SSO credential
+  // reservation. The mid-session purposes run behind a published credential,
+  // where the release is already a structural no-op; the gate makes that
+  // explicit instead of relying on it. Both paths must still clear the
+  // challenge — the release is hygiene, never a precondition.
+
+  it('Cancel on an sso_login challenge abandons the SSO reservation (#2394)', () => {
+    const mockResolve = vi.fn();
+    useMFAChallengeStore.setState({
+      challengeToken: 'sso-chal',
+      methods: ['totp'],
+      recoveryOnlyMethods: [],
+      purpose: 'sso_login',
+      ssoContext: { provider: 'google', credentialOwner: 5 },
+      resolve: mockResolve,
+    });
+
+    render(<MFAChallengeModal />);
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(abandonSSOReservation).toHaveBeenCalledTimes(1);
+    expect(mockResolve).toHaveBeenCalledWith({ verified: false });
+    expect(useMFAChallengeStore.getState().challengeToken).toBeNull();
+  });
+
+  it('Cancel on a suspicious_refresh challenge does NOT abandon (#2394)', () => {
+    const mockResolve = vi.fn();
+    useMFAChallengeStore.setState({
+      challengeToken: 'refresh-chal',
+      methods: ['totp'],
+      recoveryOnlyMethods: [],
+      purpose: 'suspicious_refresh',
+      ssoContext: null,
+      resolve: mockResolve,
+    });
+
+    render(<MFAChallengeModal />);
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(abandonSSOReservation).not.toHaveBeenCalled();
     expect(mockResolve).toHaveBeenCalledWith({ verified: false });
     expect(useMFAChallengeStore.getState().challengeToken).toBeNull();
   });
