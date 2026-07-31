@@ -3,23 +3,28 @@ package mfa_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -3932,4 +3937,329 @@ func TestTOTPSetup_StampsNonDefaultActiveVersion(t *testing.T) {
 	var stamped int
 	require.NoError(t, ts.DB.QueryRow(`SELECT key_version FROM user_mfa_totp WHERE user_id = $1`, user.ID).Scan(&stamped))
 	assert.Equal(t, 2, stamped, "stored key_version must equal the handler's active ring version, not the DB default")
+}
+
+// --- #2356: constant-time MFA setup-code comparison ---
+
+// readFuncBody returns the source text of the named top-level function in
+// handlers.go, from its `func` declaration to its own closing brace. Scoping the
+// assertion to one function is what stops a positive assertion from
+// false-passing off an unrelated constant-time call elsewhere in the file, and
+// stops a negative assertion from false-firing on unrelated code.
+//
+// The terminator is `"\n}\n"` — a closing brace in column 0 — NOT the next
+// `"\nfunc "`. gofmt indents every nested closing brace, so the first column-0
+// brace is this function's own end. Terminating at the next declaration instead
+// over-reads past that brace and swallows the FOLLOWING function's doc comment,
+// which makes the positive assertion satisfiable by a mere comment mentioning
+// subtle.ConstantTimeCompare. Combined with an operand swap (`stored != code`,
+// which the literal negative assertion does not match) that is a complete
+// bypass: the CWE-208 defect returns and this test stays green. Found by an
+// adversarial pass with an executable proof-of-concept; do not relax it back.
+//
+// A source-anchored assertion is the right shape here because the property under
+// test is *how* a comparison executes, not *what* it returns: a plain `!=` and
+// subtle.ConstantTimeCompare produce an identical 403 for an identical input, and
+// wall-clock timing is not assertable in CI. Same rationale as the AST-walking
+// log_emissions_test.go in internal/auth.
+func readFuncBody(t *testing.T, decl string) string {
+	t.Helper()
+	// Constant relative path: `go test` runs with CWD set to the package dir and
+	// handlers.go is a sibling of this file. No user input, so no gosec G304.
+	src, err := os.ReadFile("handlers.go")
+	require.NoError(t, err, "cannot read handlers.go to anchor the #2356 regression test")
+
+	s := string(src)
+	start := strings.Index(s, decl)
+	require.NotEqual(t, -1, start,
+		"declaration %q not found in handlers.go — the function was moved or renamed; re-anchor this test, see #2356", decl)
+
+	rest := s[start+len(decl):]
+	end := strings.Index(rest, "\n}\n")
+	require.NotEqual(t, -1, end,
+		"could not find the closing brace of %q in handlers.go — re-anchor this test, see #2356", decl)
+
+	return rest[:end]
+}
+
+func TestVerifyEmailSmsCodesUsesConstantTimeCompare(t *testing.T) {
+	body := readFuncBody(t, "func (h *Handler) verifyEmailSmsCodes(")
+
+	// Anchor on the `if` so the call must be the branch CONDITION, not merely
+	// present in the body. Codex demonstrated the bypass a bare
+	// `subtle.ConstantTimeCompare(` anchor allows: discard the result
+	// (`_ = subtle.ConstantTimeCompare(...)`) and branch on `if stored != code`
+	// instead — timing-variable again, both original assertions still green.
+	assert.Contains(t, body, "if subtle.ConstantTimeCompare(",
+		"verifyEmailSmsCodes must compare the client code against the Redis-stored code in constant time, "+
+			"with the constant-time call as the `if` CONDITION rather than a discarded call beside a "+
+			"short-circuiting comparison (#2356, CWE-208)")
+	assert.NotContains(t, body, "code != stored",
+		"the short-circuiting string comparison must be gone from verifyEmailSmsCodes (#2356, CWE-208)")
+}
+
+// TestEmailSmsVerifyWrongCodeDoesNotConsumePendingCode locks the half of the
+// contract the existing suite does not cover. TestEmailSmsVerifySuccess and
+// TestEmailSmsVerifyWrongCode already pin the 200 and the 403; what is not
+// pinned anywhere is that a failed attempt leaves the pending code intact, so a
+// later correct attempt still succeeds. Locking it makes any future
+// "consume on failure" change a deliberate, reviewed decision (#2356).
+func TestEmailSmsVerifyWrongCodeDoesNotConsumePendingCode(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "emsmsnoconsume")
+	enrollTOTP(t, ts, user)
+
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	require.NoError(t, ts.Redis.Set(ctx, fmt.Sprintf(redisEmailSmsSetup, user.ID), "654321", 10*time.Minute).Err())
+
+	// Wrong code: 403 with the exact message (pins both halves of the contract).
+	wrong := ts.DoRequest("POST", urlEmailSmsVerify, map[string]interface{}{
+		"codes": map[string]string{"email": "111111"},
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusForbidden, wrong.Code, "Response body: %s", wrong.Body.String())
+	var wrongBody map[string]interface{}
+	testhelpers.ParseJSON(t, wrong, &wrongBody)
+	assert.Equal(t, "Invalid email code", wrongBody["error"])
+
+	// The failed attempt must NOT have consumed the pending code.
+	right := ts.DoRequest("POST", urlEmailSmsVerify, map[string]interface{}{
+		"codes": map[string]string{"email": "654321"},
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, right.Code, "Response body: %s", right.Body.String())
+	var rightBody map[string]interface{}
+	testhelpers.ParseJSON(t, right, &rightBody)
+	verified, ok := rightBody["verified"].([]interface{})
+	require.True(t, ok, "expected verified array, got: %v", rightBody)
+	assert.Contains(t, verified, "email")
+}
+
+// TestEmailSmsVerifyFailsClosedOnHardenedLookupError drives EmailSmsVerify
+// directly in order to inject a database fault deterministically — not because
+// the guard is otherwise unreachable. It IS reachable through the real router:
+// AuthRequired's live check (middleware.VerifyLiveTokenState) is Redis-only, a
+// user_disabled:<id> lookup, so a deleted users row with a still-valid JWT
+// reaches this handler. That deleted-row case is sql.ErrNoRows and is refused as
+// a 401; this test covers the other arm — a genuine infrastructure fault, which
+// is refused as a 500. Both arms fail closed.
+//
+// Discarding the recovery_hardened Scan error would leave recoveryHardened at
+// its false zero value and silently skip the hardened-mode dual-code
+// requirement — so on a hardened account a SINGLE correct code would activate
+// MFA. A security control defeated by an infrastructure fault (#2356).
+func TestEmailSmsVerifyFailsClosedOnHardenedLookupError(t *testing.T) {
+	ts := setupTS(t)
+
+	// sql.Open is lazy, so this succeeds; the first query fails at connect.
+	// Port 1 is not listenable; connect_timeout keeps the failure fast. Keyword
+	// DSN form (not a URL) so there is no user:pass@ construct for the
+	// detect-secrets pre-commit hook to flag as Basic Auth Credentials.
+	brokenDB, err := sql.Open("postgres",
+		"host=127.0.0.1 port=1 dbname=nonexistent sslmode=disable connect_timeout=1")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, brokenDB.Close()) })
+
+	// Real Redis, broken DB: the handler must refuse before it ever reaches the
+	// code lookup, so a passing test proves the guard fired rather than that
+	// Redis happened to be unavailable too.
+	h := mfa.NewHandler(brokenDB, ts.Redis, logger.New("test"), nil, testhelpers.TestJWTSecret, nil, "test")
+	w := invokeEmailSmsVerify(t, h, uuid.NewString(), `{"codes":{"email":"123456"}}`)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code, "Response body: %s", w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Failed to verify MFA settings", body["error"])
+}
+
+// invokeEmailSmsVerify drives EmailSmsVerify directly rather than through
+// ts.DoRequest, which is what lets these tests inject an infrastructure fault:
+// the router would hand the handler the test server's own healthy DB and Redis
+// handles, so the error arms below would be unreachable.
+func invokeEmailSmsVerify(t *testing.T, h *mfa.Handler, userID, jsonBody string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, urlEmailSmsVerify, bytes.NewBufferString(jsonBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user_id", userID)
+
+	h.EmailSmsVerify(c)
+	return w
+}
+
+// TestEmailSmsVerifyRejectsDeletedAccount covers the sql.ErrNoRows arm of the
+// same recovery_hardened read: a users row that is simply gone. AuthRequired's
+// live check (middleware.VerifyLiveTokenState) is Redis-only, so a deleted
+// account holding a still-valid JWT reaches this handler through the real
+// router. That is a client-side condition, not an infrastructure fault, so it
+// is a 401 — the request is still refused, so it fails closed either way (#2356).
+func TestEmailSmsVerifyRejectsDeletedAccount(t *testing.T) {
+	ts := setupTS(t)
+
+	// Healthy DB and Redis: the 401 can only come from the missing users row.
+	h := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), nil, testhelpers.TestJWTSecret, nil, "test")
+	w := invokeEmailSmsVerify(t, h, uuid.NewString(), `{"codes":{"email":"123456"}}`)
+
+	require.Equal(t, http.StatusUnauthorized, w.Code, "Response body: %s", w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Session no longer valid", body["error"])
+}
+
+// TestEmailSmsVerifyFailsClosedOnPendingCodeLookupError covers the non-redis.Nil
+// arm of the pending-code Get. A transport fault must NOT be mistaken for
+// "no pending code": that would answer 400 and invite the caller to request a
+// fresh code that Redis equally cannot store. TestEmailSmsVerifyNoPendingCode
+// already pins the redis.Nil 400, so this test pins the other half (#2356).
+func TestEmailSmsVerifyFailsClosedOnPendingCodeLookupError(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "emsmsredisdown")
+
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+
+	// Redis client pointed at an unreachable port, DB healthy — mirrors the
+	// down-Redis pattern in internal/entitlements/cache_test.go. Because the
+	// recovery_hardened read still succeeds, a passing test proves the Get error
+	// arm fired rather than some earlier guard.
+	downRedis := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { require.NoError(t, downRedis.Close()) })
+
+	h := mfa.NewHandler(ts.DB, downRedis, logger.New("test"), nil, testhelpers.TestJWTSecret, nil, "test")
+	w := invokeEmailSmsVerify(t, h, user.ID, `{"codes":{"email":"123456"}}`)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code, "Response body: %s", w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Failed to verify MFA settings", body["error"])
+}
+
+// failNthSetHook fails the Nth Redis SET command it observes and passes every
+// other command through to the real server. redis.Hook is go-redis' first-class
+// instrumentation seam, so this injects the fault without a fake client — the
+// handler's pending-code Get still reads real data from real Redis, which is
+// what makes the activation arm (and only the activation arm) reachable.
+type failNthSetHook struct {
+	n    int
+	seen int
+}
+
+func (*failNthSetHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *failNthSetHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() != "set" {
+			return next(ctx, cmd)
+		}
+		h.seen++
+		if h.seen != h.n {
+			return next(ctx, cmd)
+		}
+		err := errors.New("simulated redis SET failure")
+		cmd.SetErr(err) // preserve the error on the Cmder, as go-redis hooks require
+		return err
+	}
+}
+
+func (*failNthSetHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// TestEmailSmsVerifyKeepsPendingCodesWhenActivationWriteFails covers the failed
+// activation Set, and is the regression lock for the two-phase ordering
+// (CodeRabbit + Codex, PR #2654). The pre-fix loop did Set-then-Del per method,
+// so on a hardened account a failure on the second method left the first one
+// activated AND its pending code deleted: the caller's retry with the same still
+// valid payload would then be answered "No pending <method> code" — permanently
+// unretryable. Deleting only after every durable write has committed fixes it.
+func TestEmailSmsVerifyKeepsPendingCodesWhenActivationWriteFails(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "emsmssetfail")
+
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = TRUE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	emailKey := fmt.Sprintf(redisEmailSmsSetup, user.ID)
+	smsKey := fmt.Sprintf("mfa_emailsms_setup:%s:sms", user.ID)
+	require.NoError(t, ts.Redis.Set(ctx, emailKey, "123456", 10*time.Minute).Err())
+	require.NoError(t, ts.Redis.Set(ctx, smsKey, "654321", 10*time.Minute).Err())
+
+	// Copy the options so redis.NewClient's init cannot mutate the live client's.
+	opts := *ts.Redis.Options()
+	failing := redis.NewClient(&opts)
+	t.Cleanup(func() { require.NoError(t, failing.Close()) })
+	// Fail the SECOND activation write. Ordinal rather than method name is what
+	// makes this deterministic: Go randomizes map iteration over req.Codes, so
+	// which of email/sms goes first is not fixed — but exactly one is fully
+	// activated before the other fails, either way.
+	failing.AddHook(&failNthSetHook{n: 2})
+
+	h := mfa.NewHandler(ts.DB, failing, logger.New("test"), nil, testhelpers.TestJWTSecret, nil, "test")
+	w := invokeEmailSmsVerify(t, h, user.ID, `{"codes":{"email":"123456","sms":"654321"}}`)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code, "Response body: %s", w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Failed to activate MFA methods", body["error"])
+
+	// Both pending codes must survive, so the caller can simply retry.
+	assert.NoError(t, ts.Redis.Get(ctx, emailKey).Err(),
+		"the pending email code must survive a failed activation so the caller can retry (#2654)")
+	assert.NoError(t, ts.Redis.Get(ctx, smsKey).Err(),
+		"the pending sms code must survive a failed activation so the caller can retry (#2654)")
+}
+
+// TestEmailSmsVerifyKeepsPendingCodesWhenFlagUpdateFails covers the
+// updateUserMFAFlags error arm, and locks the same two-phase ordering from the
+// other side: the durable flag write is the LAST thing that can fail, and when
+// it does the pending code must still be there.
+func TestEmailSmsVerifyKeepsPendingCodesWhenFlagUpdateFails(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "emsmsflagfail")
+
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	emailKey := fmt.Sprintf(redisEmailSmsSetup, user.ID)
+	require.NoError(t, ts.Redis.Set(ctx, emailKey, "123456", 10*time.Minute).Err())
+
+	// A second pool against the same test database, pinned to a single
+	// connection and switched into a read-only session. Every SELECT the handler
+	// makes still succeeds (recovery_hardened, and updateUserMFAFlags' own
+	// reads); only its UPDATE fails. default_transaction_read_only is
+	// session-scoped on a connection this test owns, so unlike a role or a
+	// trigger it mutates no shared state in the test database.
+	roDB, err := sql.Open("postgres", dbtest.DatabaseURL())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, roDB.Close()) })
+	roDB.SetMaxOpenConns(1)
+	roDB.SetMaxIdleConns(1)
+	_, err = roDB.ExecContext(ctx, `SET default_transaction_read_only = on`)
+	require.NoError(t, err)
+
+	// Prove the session pin actually took, so a future pooling change cannot
+	// make this test pass for the wrong reason (e.g. by failing earlier).
+	var probe bool
+	require.NoError(t, roDB.QueryRowContext(ctx,
+		`SELECT recovery_hardened FROM users WHERE id = $1`, user.ID).Scan(&probe),
+		"reads must still work on the read-only session")
+	_, err = roDB.ExecContext(ctx, `UPDATE users SET mfa_enabled = TRUE WHERE id = $1`, user.ID)
+	require.Error(t, err, "the read-only session pin did not take effect")
+
+	h := mfa.NewHandler(roDB, ts.Redis, logger.New("test"), nil, testhelpers.TestJWTSecret, nil, "test")
+	w := invokeEmailSmsVerify(t, h, user.ID, `{"codes":{"email":"123456"}}`)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code, "Response body: %s", w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Failed to activate MFA methods", body["error"])
+
+	assert.NoError(t, ts.Redis.Get(ctx, emailKey).Err(),
+		"the pending email code must survive a failed flag update so the caller can retry (#2654)")
 }

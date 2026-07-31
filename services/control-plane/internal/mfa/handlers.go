@@ -1828,11 +1828,15 @@ func (h *Handler) verifyEmailSmsCodes(ctx context.Context, userID string, codes 
 
 		key := fmt.Sprintf(redisKeyEmailSmsSetup, userID, method)
 		stored, err := h.redis.Get(ctx, key).Result()
-		if err != nil {
+		if errors.Is(err, redis.Nil) {
 			return nil, fmt.Sprintf("No pending %s code. Request a new one.", method), http.StatusBadRequest
 		}
+		if err != nil {
+			h.log.Error("Failed to read pending MFA setup code", "method", method, "error", err)
+			return nil, "Failed to verify MFA settings", http.StatusInternalServerError
+		}
 
-		if code != stored {
+		if subtle.ConstantTimeCompare([]byte(code), []byte(stored)) != 1 {
 			return nil, fmt.Sprintf("Invalid %s code", method), http.StatusForbidden
 		}
 
@@ -1860,10 +1864,26 @@ func (h *Handler) EmailSmsVerify(c *gin.Context) {
 		return
 	}
 
+	// Fail closed: a discarded error here would leave recoveryHardened at its
+	// false zero value and silently skip the hardened-mode dual-code
+	// requirement below, defeating a security control on an infrastructure
+	// fault. Refusing the request is the correct posture — assuming hardened
+	// instead would reject legitimate non-hardened users with a confusing 400.
 	var recoveryHardened bool
-	_ = h.db.QueryRowContext(ctx,
+	if err := h.db.QueryRowContext(ctx,
 		`SELECT recovery_hardened FROM users WHERE id = $1`, userID,
-	).Scan(&recoveryHardened)
+	).Scan(&recoveryHardened); err != nil {
+		// A missing users row is routine and client-side (a deleted account
+		// holding a still-valid JWT — AuthRequired's live check is Redis-only),
+		// so it is a 401, not a 5xx. Still fail closed: the request is refused.
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Session no longer valid"})
+			return
+		}
+		h.log.Error("Failed to read recovery_hardened for MFA verify", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify MFA settings"})
+		return
+	}
 
 	if recoveryHardened {
 		if errMsg := ValidateHardenedModeCodes(req.Codes); errMsg != "" {
@@ -1878,19 +1898,64 @@ func (h *Handler) EmailSmsVerify(c *gin.Context) {
 		return
 	}
 
-	for _, method := range verified {
-		h.redis.Set(ctx, fmt.Sprintf(redisKeyEmailSmsEnabled, userID, method), "1", 0)
-		h.redis.Del(ctx, fmt.Sprintf(redisKeyEmailSmsSetup, userID, method))
-	}
-
-	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
-		h.log.Error("Failed to update MFA flags after email/sms enable", "error", err)
+	// Extracted to keep EmailSmsVerify under the cognitive-complexity budget
+	// (go:S3776). The sequencing rationale lives on the helper.
+	if err := h.activateEmailSmsMethods(ctx, userID, verified); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to activate MFA methods"})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":  "MFA methods activated",
 		"verified": verified,
 	})
+}
+
+// activateEmailSmsMethods commits the verified email/SMS methods and then clears
+// their pending setup codes.
+//
+// go-redis returns *StatusCmd/*IntCmd rather than an error, so errcheck is
+// structurally blind here: a dropped Set would leave the method inactive while
+// the handler still answered 200, and updateUserMFAFlags — which reads this
+// exact key back to derive mfa_methods — could then write mfa_enabled = FALSE.
+//
+// Two-phase: activate every method and commit the durable flags BEFORE deleting
+// any pending setup code. A Del is irreversible, so deleting mid-loop makes a
+// later failure unretryable — with a hardened account's email+sms pair, a failed
+// sms Set after a successful email Set+Del would fail the request while the
+// caller's resubmitted (still valid) email code now hits a key we already
+// removed, answering "No pending email code". Found by CodeRabbit + Codex on
+// PR #2654.
+//
+// The flag write is fatal on this ENABLE path only: mfa_enabled_at is
+// load-bearing (pre-existing sessions are challenged based on it), so a failed
+// write would leave those sessions silently never challenged while the user is
+// told MFA is on. EmailSmsDisable deliberately keeps log-and-continue — a failed
+// write there leaves MFA ON, which is already fail-closed.
+func (h *Handler) activateEmailSmsMethods(ctx context.Context, userID string, verified []string) error {
+	for _, method := range verified {
+		if err := h.redis.Set(ctx, fmt.Sprintf(redisKeyEmailSmsEnabled, userID, method), "1", 0).Err(); err != nil {
+			h.log.Error("Failed to persist MFA method activation", "method", method, "error", err)
+			return err
+		}
+	}
+
+	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
+		h.log.Error("Failed to update MFA flags after email/sms enable", "error", err)
+		return err
+	}
+
+	// Best-effort cleanup, and only now that the activation is durable. The
+	// asymmetry with the Set above is deliberate: a failed Set must fail the
+	// request (the method is NOT active), but a failed Del may log-and-continue —
+	// the method genuinely IS active and the stale code expires by its own TTL.
+	for _, method := range verified {
+		if err := h.redis.Del(ctx, fmt.Sprintf(redisKeyEmailSmsSetup, userID, method)).Err(); err != nil {
+			h.log.Error("Failed to clear pending MFA setup code", "method", method, "error", err)
+		}
+	}
+
+	return nil
 }
 
 // EmailSmsDisable removes email and/or SMS MFA methods.
