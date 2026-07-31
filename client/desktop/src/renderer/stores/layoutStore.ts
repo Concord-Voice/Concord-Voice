@@ -26,8 +26,14 @@ export interface SidebarProfiles {
   server: SidebarProfile;
 }
 
-export const SIDEBAR_MIN_WIDTH = 56;
-export const SIDEBAR_COMPACT_BREAKPOINT = 180;
+export const SIDEBAR_MIN_WIDTH = 44;
+/**
+ * The pre-#2653 rail width. A legacy `'collapsed'` panel migrates to this, not
+ * to SIDEBAR_MIN_WIDTH — the user's stored intent was "the old rail", not the
+ * new floor. Deliberately distinct from SIDEBAR_MIN_WIDTH; do not merge them.
+ */
+export const LEGACY_COLLAPSED_WIDTH = 56;
+export const SIDEBAR_COMPACT_BREAKPOINT = 135;
 export const LEFT_SIDEBAR_MAX_WIDTH = 400;
 export const RIGHT_SIDEBAR_MAX_WIDTH = 340;
 
@@ -141,7 +147,7 @@ function legacyNumber(
 }
 
 function legacyRightDock(mode: unknown, width: number): SidebarDockPreference {
-  if (mode === 'collapsed') return { width: SIDEBAR_MIN_WIDTH, pinned: true };
+  if (mode === 'collapsed') return { width: LEGACY_COLLAPSED_WIDTH, pinned: true };
   if (mode === 'hidden') return { width, pinned: false };
   return { width, pinned: true };
 }

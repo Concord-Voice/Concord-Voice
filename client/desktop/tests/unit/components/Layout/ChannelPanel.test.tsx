@@ -18,7 +18,7 @@ const renderPanel = (props: Partial<React.ComponentProps<typeof ChannelPanel>> =
     <DockOverlayProvider>
       <ChannelPanel
         context="dm"
-        header={<div>Test Header</div>}
+        renderHeader={() => <div>Test Header</div>}
         renderContent={(compact) => <div>{compact ? 'compact content' : 'standard content'}</div>}
         {...props}
       />

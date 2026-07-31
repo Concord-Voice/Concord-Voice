@@ -630,4 +630,100 @@ describe('MemberList', () => {
       );
     });
   });
+
+  // --- #2653 item 3: the offline group reads as inactive, not as an alert ---
+
+  describe('offline group presentation (#2653 item 3)', () => {
+    const seedOnlineAndOffline = (roles: Role[] = []) => {
+      const alice = makeMember({ user_id: 'alice', username: 'alice', display_name: 'Alice' });
+      const bob = makeMember({ user_id: 'bob', username: 'bob', display_name: 'Bob' });
+      seedCompactMembers(
+        [alice, bob],
+        [
+          ['alice', 'online'],
+          ['bob', 'offline'],
+        ],
+        roles
+      );
+    };
+
+    it('renders the offline group with a moon and leaves Online on the Users glyph', () => {
+      seedOnlineAndOffline();
+      render(<MemberList compact />);
+
+      const offline = screen.getByRole('button', { name: 'Offline — 1' });
+      expect(offline.querySelector('.lucide-moon')).not.toBeNull();
+      expect(
+        screen.getByRole('button', { name: 'Online — 1' }).querySelector('.lucide-users')
+      ).not.toBeNull();
+    });
+
+    it('keeps the Users fallback on an emoji-less ROLE group, which is not offline', () => {
+      // The `Users` glyph is the no-emoji fallback for EVERY group. Swapping it wholesale
+      // would put a moon on every role group; only key === 'offline' may take the Moon.
+      const helpers = makeRole({ id: 'helpers', name: 'Helpers', position: 10 });
+      const alice = makeMember({
+        user_id: 'alice',
+        username: 'alice',
+        display_name: 'Alice',
+        roles: [
+          {
+            role_id: helpers.id,
+            role_name: helpers.name,
+            position: helpers.position,
+            display_separately: true,
+          },
+        ],
+      });
+      seedCompactMembers([alice], [['alice', 'offline']], [helpers]);
+      render(<MemberList compact />);
+
+      const helpersTrigger = screen.getByRole('button', { name: 'Helpers — 1' });
+      expect(helpersTrigger.querySelector('.lucide-users')).not.toBeNull();
+      expect(helpersTrigger.querySelector('.lucide-moon')).toBeNull();
+      expect(helpersTrigger.querySelector('.member-compact-trigger-count')).not.toHaveClass(
+        'member-compact-trigger-count--offline'
+      );
+    });
+
+    it('mutes only the offline count badge', () => {
+      seedOnlineAndOffline();
+      render(<MemberList compact />);
+
+      expect(
+        screen
+          .getByRole('button', { name: 'Offline — 1' })
+          .querySelector('.member-compact-trigger-count')
+      ).toHaveClass('member-compact-trigger-count--offline');
+      expect(
+        screen
+          .getByRole('button', { name: 'Online — 1' })
+          .querySelector('.member-compact-trigger-count')
+      ).not.toHaveClass('member-compact-trigger-count--offline');
+    });
+
+    it('still prefers a role emoji over the group glyph in the compact rail (#2653 regression lock)', () => {
+      const guards = makeRole({ id: 'guards', name: 'Guards', emoji: '⚔️', position: 20 });
+      const alice = makeMember({
+        user_id: 'alice',
+        username: 'alice',
+        display_name: 'Alice',
+        roles: [
+          {
+            role_id: guards.id,
+            role_name: guards.name,
+            position: guards.position,
+            display_separately: true,
+          },
+        ],
+      });
+      seedCompactMembers([alice], [['alice', 'online']], [guards]);
+      const { container } = render(<MemberList compact />);
+
+      expect(container.querySelector('.member-compact-emoji')?.textContent).toBe('⚔️');
+      expect(
+        screen.getByRole('button', { name: 'Guards — 1' }).querySelector('.lucide')
+      ).toBeNull();
+    });
+  });
 });

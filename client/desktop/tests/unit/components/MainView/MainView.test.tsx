@@ -69,14 +69,14 @@ vi.mock('@/renderer/components/Layout/FolderBar', () => ({
 }));
 vi.mock('@/renderer/components/Layout/ChannelPanel', () => ({
   default: ({
-    header,
+    renderHeader,
     renderContent,
   }: {
-    header: React.ReactNode | ((compact: boolean) => React.ReactNode);
+    renderHeader: (compact: boolean) => React.ReactNode;
     renderContent: (compact: boolean) => React.ReactNode;
   }) => (
     <div>
-      {typeof header === 'function' ? header(channelPanelPresentation.compact) : header}
+      {renderHeader(channelPanelPresentation.compact)}
       {renderContent(channelPanelPresentation.compact)}
     </div>
   ),

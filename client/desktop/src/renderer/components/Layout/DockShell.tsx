@@ -54,7 +54,20 @@ export interface DockShellProps {
   context: SidebarContext;
   side: SidebarSide;
   label: string;
-  header: React.ReactNode | ((compact: boolean) => React.ReactNode);
+  /**
+   * Static header content. `null` selects the floating actions-only overlay; a node is
+   * rendered in the in-flow header row. For content that depends on the presentation,
+   * use `renderHeader` — the two are mutually exclusive and `renderHeader` wins.
+   */
+  header?: React.ReactNode;
+  /**
+   * Presentation-dependent header content, named to match `renderBody`. The `render`
+   * prefix is load-bearing, not cosmetic: a function-valued prop returning JSX under any
+   * other name reads to `typescript:S6478` as a component declared inside a component.
+   * It is not one — the returned element is embedded, never used as a component type —
+   * but the convention is what tells both the rule and a reader which it is.
+   */
+  renderHeader?: (compact: boolean) => React.ReactNode;
   renderBody: (compact: boolean) => React.ReactNode;
   footer?: React.ReactNode | ((compact: boolean) => React.ReactNode);
   forcePinned?: boolean;
@@ -89,6 +102,20 @@ interface DockResizeHandleProps {
   onMouseDown: (event: React.MouseEvent) => void;
   onKeyDown: (event: React.KeyboardEvent) => void;
 }
+
+/**
+ * Compact-rail density band boundary — the INCLUSIVE minimum for the `compact`
+ * band, compared with `<`. A shell at exactly this width is `compact`; the widest
+ * `dense` shell is one pixel below it. Named for the band it opens rather than the
+ * one it closes, because the earlier `RAIL_DENSE_MAX_WIDTH` asserted an inclusive
+ * ceiling the comparison does not implement.
+ *
+ * Below it the count badges step down to the channel rail's proven 14px/9px
+ * geometry and lucide strokes thicken (see AppLayout.css `[data-rail-density='dense']`).
+ * It coincides with LEGACY_COLLAPSED_WIDTH numerically but is a distinct concept —
+ * do not merge.
+ */
+const RAIL_COMPACT_MIN_WIDTH = 56;
 
 interface DockSurfaceProps {
   side: SidebarSide;
@@ -222,15 +249,20 @@ const DockSurface: React.FC<DockSurfaceProps> = ({
   onMouseLeave,
 }) => {
   const open = effectivePinned || showOverlay;
+  // Density band is compact-only: the attribute is absent in the standard
+  // presentation so `[data-rail-density]` cannot match outside the rail.
+  let railDensity: 'dense' | 'compact' | undefined;
+  if (compact) railDensity = width < RAIL_COMPACT_MIN_WIDTH ? 'dense' : 'compact';
   return (
     <div
       className={`dock-shell__surface dock-shell__surface--${effectivePinned ? 'pinned' : 'overlay'}`}
       data-mode={effectivePinned ? 'pinned' : 'overlay'}
       data-state={open ? 'open' : 'closed'}
       data-presentation={compact ? 'compact' : 'standard'}
+      data-rail-density={railDensity}
       data-resizing={String(isResizing)}
       ref={surfaceRef}
-      style={{ width }}
+      style={{ width, ['--dock-width' as string]: `${width}px` } as React.CSSProperties}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
       aria-hidden={!open}
@@ -269,6 +301,7 @@ export const DockShell: React.FC<DockShellProps> = ({
   side,
   label,
   header,
+  renderHeader,
   renderBody,
   footer,
   forcePinned = false,
@@ -304,7 +337,7 @@ export const DockShell: React.FC<DockShellProps> = ({
   const showOverlay = !effectivePinned && overlay.activeOverlayId === overlayId;
   const lipCovered = showOverlay && !lipFocused;
   const compact = panel.width < SIDEBAR_COMPACT_BREAKPOINT;
-  const headerContent = typeof header === 'function' ? header(compact) : header;
+  const headerContent = renderHeader ? renderHeader(compact) : header;
   const footerContent = typeof footer === 'function' ? footer(compact) : footer;
 
   const clearHideTimer = useCallback(() => {

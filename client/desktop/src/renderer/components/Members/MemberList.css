@@ -50,10 +50,10 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 44px;
-  min-width: 44px;
-  height: 44px;
-  min-height: 44px;
+  width: var(--rail-cell);
+  min-width: var(--rail-cell);
+  height: var(--rail-cell);
+  min-height: var(--rail-cell);
   padding: 4px;
   border: 0;
   border-radius: 8px;
@@ -79,7 +79,7 @@
 }
 
 .member-compact-emoji {
-  font-size: 20px;
+  font-size: var(--rail-icon);
   line-height: 1;
 }
 
@@ -87,15 +87,30 @@
   position: absolute;
   right: 1px;
   bottom: 1px;
-  min-width: 16px;
-  height: 16px;
+  min-width: var(--rail-badge);
+  height: var(--rail-badge);
   padding: 0 3px;
   border-radius: 8px;
   background: var(--accent-fill);
   color: var(--bg-primary);
-  font-size: 10px;
+  font-size: calc(var(--rail-badge-font) * var(--font-scale, 1));
   font-weight: 700;
-  line-height: 16px;
+  line-height: var(--rail-badge);
+}
+
+/* #2653 item 3: mirrors .friends-compact-trigger-count--offline exactly — DM↔Server rail
+   parity is the invariant. --text-primary on --bg-tertiary clears WCAG 2.1 SC 1.4.3
+   (4.5:1 — the badge renders a numeral) in all 34 theme blocks; table in the spec §5. */
+.member-compact-trigger-count--offline {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* Load-bearing: the trigger's own hover/expanded fill is ALSO --bg-tertiary, so without
+   this the muted badge dissolves into the button exactly when the pointer is on it. */
+.member-compact-trigger:hover .member-compact-trigger-count--offline,
+.member-compact-trigger[aria-expanded='true'] .member-compact-trigger-count--offline {
+  background: var(--bg-secondary);
 }
 
 .member-compact-grid {
@@ -128,6 +143,11 @@
 
 .member-list-search-input {
   width: 100%;
+  /* #2653: at the 135px breakpoint the placeholder no longer fits, so it must
+     ellipsize rather than clip mid-glyph. min-width:0 stops the flex/grid
+     min-content floor from re-widening the input past its container. */
+  min-width: 0;
+  text-overflow: ellipsis;
   padding: calc(5px * var(--sp, 1)) calc(8px * var(--sp, 1));
   font-size: calc(12px * var(--font-scale, 1));
   font-family: inherit;

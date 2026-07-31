@@ -48,6 +48,7 @@ vi.mock('@/renderer/components/DirectMessages/CategoryManagerPanel', () => ({
 }));
 
 import FriendsList from '@/renderer/components/DirectMessages/FriendsList';
+import FriendsFlexSpace from '@/renderer/components/DirectMessages/FriendsFlexSpace';
 
 // --- Test fixtures ---
 
@@ -1155,7 +1156,17 @@ describe('FriendsList', () => {
       Array.from(container.querySelectorAll('.friends-list--compact button')).map((button) =>
         button.getAttribute('title')
       )
-    ).toEqual(['Manage categories', 'Add Friend', 'Offline', 'Work', 'Pending Requests', 'Online']);
+      // #2653 item 2b: the search trigger sits between the header actions and the rail,
+      // matching where MemberList puts its own compact search button.
+    ).toEqual([
+      'Manage categories',
+      'Add Friend',
+      'Search friends',
+      'Offline',
+      'Work',
+      'Pending Requests',
+      'Online',
+    ]);
   });
 
   it('switches compact bubbles with a real pointer sequence and restores the active trigger', async () => {
@@ -1332,5 +1343,467 @@ describe('FriendsList', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Online — 24' }));
     expect(screen.getAllByRole('button', { name: /^Friend \d+$/ })).toHaveLength(24);
+  });
+});
+
+// --- #2653 item 2a: the Friends header stops colliding with the dock pin ---
+
+describe('FriendsList header (#2653 item 2a)', () => {
+  const seedFriends = () => {
+    resetAllStores();
+    useFriendOrgStore.getState()._hydrate({ v: 1, categories: [], sectionOrder: [] });
+    vi.clearAllMocks();
+    useFriendStore.setState({
+      friends: [makeFriend()],
+      pendingRequests: [],
+      fetchFriends: vi.fn().mockResolvedValue(undefined),
+      fetchRequests: vi.fn().mockResolvedValue(undefined),
+    });
+  };
+
+  const renderDockedFriends = () =>
+    render(
+      <DockOverlayProvider>
+        <FriendsFlexSpace />
+      </DockOverlayProvider>
+    );
+
+  beforeEach(() => {
+    seedFriends();
+    useLayoutStore.setState({
+      interfaceLocked: false,
+      sidebarProfiles: {
+        dm: {
+          left: { width: 212, pinned: true },
+          right: { width: 294, pinned: true },
+        },
+        server: {
+          left: { width: 318, pinned: true },
+          right: { width: 306, pinned: true },
+        },
+      },
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('gives the truncatable title a title attribute so a clipped label is recoverable', () => {
+    render(<FriendsList />);
+
+    expect(screen.getByRole('heading', { name: /Friends/ })).toHaveAttribute('title', 'Friends');
+  });
+
+  it('puts the title, the actions and the pin in the dock header — one row, not two', () => {
+    const { container } = renderDockedFriends();
+
+    const dockHeader = container.querySelector('.dock-shell__header');
+    const headers = container.querySelectorAll('.friends-list-header');
+
+    expect(headers).toHaveLength(1);
+    expect(dockHeader?.contains(headers[0])).toBe(true);
+    expect(dockHeader?.contains(screen.getByRole('heading', { name: /Friends/ }))).toBe(true);
+    expect(dockHeader?.contains(screen.getByRole('button', { name: 'Add Friend' }))).toBe(true);
+    expect(dockHeader?.contains(screen.getByRole('button', { name: 'Manage categories' }))).toBe(
+      true
+    );
+    expect(
+      dockHeader?.contains(screen.getByRole('button', { name: 'Unpin Friends sidebar' }))
+    ).toBe(true);
+    // The body must not draw a second header strip below the dock's.
+    expect(container.querySelector('.friends-list .friends-list-header')).toBeNull();
+  });
+
+  it('keeps the dock header in flow rather than floating it over the list header', () => {
+    const { container } = renderDockedFriends();
+
+    const dockHeader = container.querySelector('.dock-shell__header');
+
+    expect(dockHeader).not.toBeNull();
+    expect(dockHeader).not.toHaveClass('dock-shell__header--actions-only');
+    expect(
+      dockHeader?.contains(screen.getByRole('button', { name: 'Unpin Friends sidebar' }))
+    ).toBe(true);
+  });
+
+  it('still carries the title and actions when the pin is hidden by the interface lock', () => {
+    useLayoutStore.setState({ interfaceLocked: true });
+
+    const { container } = renderDockedFriends();
+
+    const dockHeader = container.querySelector('.dock-shell__header');
+    expect(dockHeader?.contains(screen.getByRole('heading', { name: /Friends/ }))).toBe(true);
+    expect(screen.queryByRole('button', { name: /Friends sidebar$/ })).toBeNull();
+  });
+
+  it('omits the compact dock header entirely when the pin is hidden, leaving no empty strip', () => {
+    useLayoutStore.setState({ interfaceLocked: true });
+    useLayoutStore.setState((state) => ({
+      sidebarProfiles: {
+        ...state.sidebarProfiles,
+        dm: { ...state.sidebarProfiles.dm, right: { width: 120, pinned: true } },
+      },
+    }));
+
+    const { container } = renderDockedFriends();
+
+    // Compact keeps its own action row in the rail, so the dock header would be an empty
+    // padded, bordered strip — the reason the compact header resolver returns null.
+    expect(container.querySelector('.dock-shell__header')).toBeNull();
+    expect(container.querySelector('.friends-list--compact .friends-list-header')).not.toBeNull();
+  });
+});
+
+// --- #2653 item 2b: friend search in both presentations, mirroring MemberList ---
+
+describe('FriendsList search (#2653 item 2b)', () => {
+  const alice = makeFriend({ id: 'f-1', userId: 'u-1', username: 'alice', displayName: 'Alice' });
+  const bob = makeFriend({ id: 'f-2', userId: 'u-2', username: 'bob', displayName: 'Bob' });
+
+  const seed = (friends: Friend[], pendingRequests: FriendRequest[] = []) => {
+    useFriendStore.setState({ friends, pendingRequests });
+  };
+
+  beforeEach(() => {
+    resetAllStores();
+    useFriendOrgStore.getState()._hydrate({ v: 1, categories: [], sectionOrder: [] });
+    vi.clearAllMocks();
+    useFriendStore.setState({
+      friends: [alice, bob],
+      pendingRequests: [],
+      fetchFriends: vi.fn().mockResolvedValue(undefined),
+      fetchRequests: vi.fn().mockResolvedValue(undefined),
+      acceptRequest: vi.fn().mockResolvedValue(undefined),
+      declineRequest: vi.fn().mockResolvedValue(undefined),
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('exposes a named search control in the standard presentation', () => {
+    render(<FriendsList />);
+
+    expect(screen.getByRole('textbox', { name: 'Search friends' })).toBeVisible();
+  });
+
+  it('filters the rendered friends by the term', async () => {
+    const user = userEvent.setup();
+    render(<FriendsList />);
+
+    await user.type(screen.getByRole('textbox', { name: 'Search friends' }), 'ali');
+
+    expect(screen.getByText('Alice')).toBeVisible();
+    expect(screen.queryByText('Bob')).toBeNull();
+  });
+
+  it('matches on username as well as display name', async () => {
+    const user = userEvent.setup();
+    seed([alice, makeFriend({ id: 'f-3', userId: 'u-3', username: 'zephyr', displayName: 'Zed' })]);
+    render(<FriendsList />);
+
+    await user.type(screen.getByRole('textbox', { name: 'Search friends' }), 'zephyr');
+
+    expect(screen.getByText('Zed')).toBeVisible();
+    expect(screen.queryByText('Alice')).toBeNull();
+  });
+
+  it('restores the full list when the term is cleared', async () => {
+    const user = userEvent.setup();
+    render(<FriendsList />);
+    const input = screen.getByRole('textbox', { name: 'Search friends' });
+
+    await user.type(input, 'ali');
+    await user.clear(input);
+
+    expect(screen.getByText('Alice')).toBeVisible();
+    expect(screen.getByText('Bob')).toBeVisible();
+  });
+
+  it('reports no matches rather than leaving the list silently empty', async () => {
+    const user = userEvent.setup();
+    render(<FriendsList />);
+
+    await user.type(screen.getByRole('textbox', { name: 'Search friends' }), 'zzz');
+
+    expect(screen.getByText('No friends match "zzz"')).toBeVisible();
+  });
+
+  it('does not render the search control when there are no friends at all', () => {
+    seed([]);
+    render(<FriendsList />);
+
+    expect(screen.queryByRole('textbox', { name: 'Search friends' })).toBeNull();
+  });
+
+  // The sections the search filters are gated on friends OR categories OR pending requests.
+  // Gating the CONTROL on friends alone left a user with only pending requests a filterable
+  // panel and nothing to filter it with.
+  it('offers search in both presentations when only pending requests exist', () => {
+    seed([], [makeRequest({ id: 'req-1', fromUsername: 'bob', fromDisplayName: 'Bob' })]);
+    const { rerender } = render(<FriendsList />);
+
+    expect(screen.getByRole('textbox', { name: 'Search friends' })).toBeVisible();
+
+    rerender(<FriendsList compact />);
+    expect(screen.getByRole('button', { name: 'Search friends' })).toBeVisible();
+  });
+
+  it('filters pending requests for a user with no friends at all', async () => {
+    const user = userEvent.setup();
+    seed(
+      [],
+      [
+        makeRequest({ id: 'req-1', fromUsername: 'bob', fromDisplayName: 'Bob' }),
+        makeRequest({ id: 'req-2', fromUsername: 'cara', fromDisplayName: 'Cara' }),
+      ]
+    );
+    render(<FriendsList />);
+
+    await user.type(screen.getByRole('textbox', { name: 'Search friends' }), 'bob');
+
+    expect(screen.getByText('Bob')).toBeVisible();
+    expect(screen.queryByText('Cara')).toBeNull();
+  });
+
+  it('explains a zero-match term for a user with no friends at all', async () => {
+    const user = userEvent.setup();
+    seed([], [makeRequest({ id: 'req-1', fromUsername: 'bob', fromDisplayName: 'Bob' })]);
+    render(<FriendsList />);
+
+    await user.type(screen.getByRole('textbox', { name: 'Search friends' }), 'zzz');
+
+    expect(screen.getByText('No friends match "zzz"')).toBeVisible();
+  });
+
+  it('offers search when only a category exists', () => {
+    seed([]);
+    useFriendOrgStore.getState()._hydrate({
+      v: 1,
+      categories: [{ id: 'cat-work', name: 'Work', emoji: '', color: null, memberIds: [] }],
+      sectionOrder: ['cat-work'],
+    });
+    render(<FriendsList />);
+
+    expect(screen.getByRole('textbox', { name: 'Search friends' })).toBeVisible();
+  });
+
+  it('reports a zero-match term in the compact popover and on its trigger', async () => {
+    const user = userEvent.setup();
+    render(<FriendsList compact />);
+
+    await user.click(screen.getByRole('button', { name: 'Search friends' }));
+    await user.type(screen.getByRole('textbox', { name: 'Search friends' }), 'zzz');
+
+    const popover = screen.getByRole('region', { name: 'Search friends' });
+    expect(within(popover).getByText('No friends match "zzz"')).toBeVisible();
+    // The popover is dismissable, so the trigger has to carry the state once it closes.
+    expect(screen.getByRole('button', { name: 'Search friends' })).toHaveAttribute(
+      'title',
+      'No friends match "zzz"'
+    );
+  });
+
+  it('opens at most one compact popover at a time', async () => {
+    const user = userEvent.setup();
+    render(<FriendsList compact />);
+
+    await user.click(screen.getByRole('button', { name: 'Online — 2' }));
+    expect(screen.getByRole('region', { name: /^Online/ })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Search friends' }));
+    expect(screen.queryByRole('region', { name: /^Online/ })).toBeNull();
+    expect(screen.getByRole('region', { name: 'Search friends' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Online — 2' }));
+    expect(screen.queryByRole('region', { name: 'Search friends' })).toBeNull();
+    expect(screen.getByRole('region', { name: /^Online/ })).toBeInTheDocument();
+  });
+
+  it('filters the category sections as well as the built-in ones', async () => {
+    const user = userEvent.setup();
+    useFriendOrgStore.getState()._hydrate({
+      v: 1,
+      categories: [{ id: 'cat-work', name: 'Work', emoji: '', color: null, memberIds: ['u-1'] }],
+      sectionOrder: ['cat-work', 'online', 'offline'],
+    });
+    render(<FriendsList />);
+
+    const countFor = (label: string) =>
+      screen.getByText(label).closest('button')?.querySelector('.friend-category-count')
+        ?.textContent;
+
+    expect(countFor('Work')).toBe('1');
+    expect(countFor('Online')).toBe('1');
+
+    await user.type(screen.getByRole('textbox', { name: 'Search friends' }), 'bob');
+
+    expect(countFor('Work')).toBe('0');
+    expect(countFor('Online')).toBe('1');
+    expect(screen.getByText('Bob')).toBeVisible();
+    expect(screen.queryByText('Alice')).toBeNull();
+  });
+
+  it('filters pending requests but keeps the header badge term-independent (C9)', async () => {
+    const user = userEvent.setup();
+    seed(
+      [alice],
+      [
+        makeRequest({ id: 'req-1', fromUsername: 'bob', fromDisplayName: 'Bob' }),
+        makeRequest({ id: 'req-2', fromUsername: 'cara', fromDisplayName: 'Cara' }),
+      ]
+    );
+    const { container } = render(<FriendsList />);
+
+    const badge = () => container.querySelector('.friends-header-badge');
+    expect(badge()?.textContent).toBe('2');
+    expect(badge()).not.toHaveAttribute('title');
+
+    await user.type(screen.getByRole('textbox', { name: 'Search friends' }), 'bob');
+
+    // The badge still counts every incoming request — it is not a search result count.
+    expect(badge()?.textContent).toBe('2');
+    expect(badge()).toHaveAttribute('title', '2 pending — hidden by search');
+    // ...but the rows and the section count follow the term.
+    expect(screen.getByText('Bob')).toBeVisible();
+    expect(screen.queryByText('Cara')).toBeNull();
+    expect(
+      screen
+        .getByText('Pending Requests')
+        .closest('button')
+        ?.querySelector('.friend-category-count')?.textContent
+    ).toBe('1');
+  });
+
+  it('drops the pending section entirely when no request matches', async () => {
+    const user = userEvent.setup();
+    seed([alice], [makeRequest({ id: 'req-1', fromUsername: 'bob', fromDisplayName: 'Bob' })]);
+    render(<FriendsList />);
+
+    expect(screen.getByText('Pending Requests')).toBeVisible();
+
+    await user.type(screen.getByRole('textbox', { name: 'Search friends' }), 'ali');
+
+    expect(screen.queryByText('Pending Requests')).toBeNull();
+    expect(screen.getByText('Alice')).toBeVisible();
+  });
+
+  it('opens friend search to the left and filters the compact rail', async () => {
+    const user = userEvent.setup();
+    render(<FriendsList compact />);
+
+    const trigger = screen.getByRole('button', { name: 'Search friends' });
+    expect(trigger).toHaveAttribute('title', 'Search friends');
+    expect(screen.getByRole('button', { name: 'Online — 2' })).toBeInTheDocument();
+
+    await user.click(trigger);
+
+    const popover = screen.getByRole('region', { name: 'Search friends' });
+    expect(popover).toHaveAttribute('data-placement', 'left');
+    const input = screen.getByRole('textbox', { name: 'Search friends' });
+    expect(input).toHaveFocus();
+
+    await user.type(input, 'ali');
+
+    await user.click(screen.getByRole('button', { name: 'Online — 1' }));
+    expect(screen.getByRole('button', { name: 'Alice' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Bob' })).toBeNull();
+  });
+
+  it('does not render the compact search trigger when there are no friends at all', () => {
+    seed([]);
+    render(<FriendsList compact />);
+
+    expect(screen.queryByRole('button', { name: 'Search friends' })).toBeNull();
+  });
+
+  it('discards the compact search anchor when switching through standard mode', () => {
+    const { rerender } = render(<FriendsList compact />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Search friends' }));
+    expect(screen.getByRole('region', { name: 'Search friends' })).toBeInTheDocument();
+
+    rerender(<FriendsList />);
+    expect(screen.queryByRole('region', { name: 'Search friends' })).toBeNull();
+
+    rerender(<FriendsList compact />);
+    const replacement = screen.getByRole('button', { name: 'Search friends' });
+    expect(replacement).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('region', { name: 'Search friends' })).toBeNull();
+  });
+});
+
+// --- #2653 item 3: the offline group reads as inactive, not as an alert ---
+
+describe('FriendsList offline group (#2653 item 3)', () => {
+  beforeEach(() => {
+    resetAllStores();
+    useFriendOrgStore.getState()._hydrate({ v: 1, categories: [], sectionOrder: [] });
+    vi.clearAllMocks();
+    useFriendStore.setState({
+      friends: [
+        makeFriend({ id: 'f-1', userId: 'u-1', username: 'alice', displayName: 'Alice' }),
+        makeFriend({
+          id: 'f-2',
+          userId: 'u-2',
+          username: 'bob',
+          displayName: 'Bob',
+          status: 'offline',
+        }),
+      ],
+      pendingRequests: [],
+      fetchFriends: vi.fn().mockResolvedValue(undefined),
+      fetchRequests: vi.fn().mockResolvedValue(undefined),
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const trigger = (name: string) => screen.getByRole('button', { name });
+
+  it('renders the offline rail trigger with a moon, not a network-fault glyph', () => {
+    render(<FriendsList compact />);
+
+    const offline = trigger('Offline — 1');
+    expect(offline.querySelector('.lucide-moon')).not.toBeNull();
+    expect(offline.querySelector('.lucide-wifi-off')).toBeNull();
+  });
+
+  it('leaves the online group on the Users glyph', () => {
+    render(<FriendsList compact />);
+
+    expect(trigger('Online — 1').querySelector('.lucide-users')).not.toBeNull();
+  });
+
+  it('mutes only the offline count badge', () => {
+    render(<FriendsList compact />);
+
+    expect(trigger('Offline — 1').querySelector('.friends-compact-trigger-count')).toHaveClass(
+      'friends-compact-trigger-count--offline'
+    );
+    expect(trigger('Online — 1').querySelector('.friends-compact-trigger-count')).not.toHaveClass(
+      'friends-compact-trigger-count--offline'
+    );
+  });
+
+  it('still prefers a category emoji over any glyph (regression lock)', () => {
+    useFriendOrgStore.getState()._hydrate({
+      v: 1,
+      categories: [{ id: 'cat-work', name: 'Work', emoji: '🛠️', color: null, memberIds: ['u-1'] }],
+      sectionOrder: ['cat-work', 'online', 'offline'],
+    });
+    render(<FriendsList compact />);
+
+    const work = trigger('Work — 1');
+    expect(work.querySelector('.friends-compact-emoji')?.textContent).toBe('🛠️');
+    expect(work.querySelector('.lucide')).toBeNull();
+    // A category is never the offline builtin, so its badge keeps the accent fill.
+    expect(work.querySelector('.friends-compact-trigger-count')).not.toHaveClass(
+      'friends-compact-trigger-count--offline'
+    );
   });
 });

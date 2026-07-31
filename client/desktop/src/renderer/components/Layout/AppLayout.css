@@ -117,6 +117,12 @@
   flex-shrink: 0;
   overflow: hidden;
   background-color: var(--bg-secondary);
+
+  /* #2653: static fallback for the width DockShell publishes inline. If that
+     inline style ever fails to apply, the rail cell resolves to its 44px upper
+     clamp rather than zero. The rail geometry that consumes it is declared
+     further down under "Compact Rail Geometry". */
+  --dock-width: 240px;
 }
 
 .dock-shell[data-side='left'] .dock-shell__surface {
@@ -185,11 +191,18 @@
   background: transparent;
 }
 
+/* #2653: no SIDE padding on the compact row. The pin's focus ring is drawn OUTSIDE its box
+   (`outline: 2px` at `outline-offset: 2px`, below), so it needs 4px clear on each side — but
+   at SIDEBAR_MIN_WIDTH the row's content box is 43px against a 31px `--rail-cell`, and a 6px
+   side gutter leaves exactly 0. `overflow: hidden` on the surface then clips the ring. The
+   `--actions-only` variant that used to carry the Friends pin had `padding: 0` and so never
+   hit this; the gutter is handed to the non-pin children below, which are the only things
+   that wanted it. */
 .dock-shell__surface[data-presentation='compact'] .dock-shell__header {
   flex-direction: column;
   justify-content: center;
   gap: 4px;
-  padding: 6px;
+  padding: 6px 0;
 }
 
 .dock-shell__surface[data-presentation='compact'] .dock-shell__header--actions-only {
@@ -203,12 +216,17 @@
   min-width: 0;
   overflow: hidden;
   text-align: center;
+  /* The row's own side gutter, re-homed here so removing it above cannot flush a compact
+     header's CONTENT to the surface edge. Global `box-sizing: border-box` keeps this inside
+     the 100% width. */
+  padding-left: 6px;
+  padding-right: 6px;
 }
 
 .dock-shell__surface[data-presentation='compact'] .dock-shell__pin {
-  flex: 0 0 44px;
-  width: 44px;
-  height: 44px;
+  flex: 0 0 var(--rail-cell);
+  width: var(--rail-cell);
+  height: var(--rail-cell);
 }
 
 .dock-shell__body {
@@ -259,6 +277,70 @@
 
 .dock-shell[data-reduce-motion='true'] .dock-shell__surface--overlay {
   transition: none;
+}
+
+/* ─── Compact Rail Geometry (#2653) ─────────────────────────────────────────
+   Every compact-rail size is a continuous function of the panel width that
+   DockShell publishes as --dock-width, clamped at today's 44px cell on top and
+   a 31px cell at SIDEBAR_MIN_WIDTH. Declared once here; the component
+   stylesheets only consume. Never multiply these by --sp: a multiplied cell
+   overflows the physical panel. --font-scale composes on badge text only,
+   outside the geometry. */
+
+.dock-shell__surface[data-presentation='compact'] {
+  --rail-gutter: 6px;
+  --rail-cell: clamp(31px, calc(var(--dock-width) - 2 * var(--rail-gutter) - 1px), 44px);
+  /* Each derived size is `cell x numerator / 44` — length x number / number, which is
+     valid everywhere. Do NOT reintroduce a unitless `--rail-scale` intermediate via
+     `calc(var(--rail-cell) / 44)`: dividing a length by a NUMBER yields a LENGTH, so
+     every consumer became `20px * 1px`, i.e. length squared, which is invalid at
+     computed-value time. Custom properties are unvalidated at declaration, so that
+     failed silently at use — icons, emoji and avatars simply stopped being sized, and
+     the `, 36px` fallback did not fire because the property was declared, just invalid. */
+  --rail-icon: clamp(12px, calc(var(--rail-cell) * 20 / 44), 20px);
+  --rail-icon-sm: clamp(11px, calc(var(--rail-cell) * 14 / 44), 14px);
+  --rail-avatar: clamp(26px, calc(var(--rail-cell) * 36 / 44), 36px);
+  --rail-divider: calc(var(--rail-cell) - 8px);
+  --rail-badge: 16px;
+  --rail-badge-font: 10px;
+}
+
+.dock-shell__surface[data-rail-density='dense'] {
+  --rail-badge: 14px;
+  --rail-badge-font: 9px;
+}
+
+/* Scoped to the rail containers, NOT to the whole surface. A surface-wide selector also
+   caught the overlays FriendsList renders INLINE rather than through a portal —
+   ContextMenu, MemberProfileCard, AddFriendModal and CategoryManagerPanel — thickening
+   their icons below shell 56. `AttributedPopover` is body-portalled and so was never the
+   only thing keeping this scoped; do not restore the surface-wide form on that reasoning. */
+/* The pin is rail chrome, not an overlay: it sits in the dock header INSIDE the surface at the
+   same 14px the dense band targets, so it needs the bump too. The lip does not appear here —
+   DockLip renders as a SIBLING of DockSurface, so a `[data-rail-density]` descendant selector
+   never matched it, before this rule was re-scoped or after. */
+[data-rail-density='dense'] .dock-shell__pin .lucide,
+[data-rail-density='dense'] .friends-compact-rail .lucide,
+[data-rail-density='dense'] .friends-list--compact .friends-add-btn .lucide,
+[data-rail-density='dense'] .friends-list--compact .friends-search-trigger .lucide,
+[data-rail-density='dense'] .member-compact-rail .lucide,
+[data-rail-density='dense'] .member-list--compact .member-search-trigger .lucide,
+[data-rail-density='dense'] .conversation-list--compact .lucide,
+[data-rail-density='dense'] .channel-list--compact .lucide {
+  stroke-width: 2.25;
+}
+
+/* CSS width/height beat the SVG size attribute by specificity, so the TSX
+   `size` props remain the fallback and these follow the cell. */
+.dock-shell__surface[data-presentation='compact'] .friends-compact-trigger .lucide,
+.dock-shell__surface[data-presentation='compact'] .member-compact-trigger .lucide {
+  width: var(--rail-icon);
+  height: var(--rail-icon);
+}
+
+.dock-shell__surface[data-presentation='compact'] .channel-item--compact .lucide {
+  width: var(--rail-icon-sm);
+  height: var(--rail-icon-sm);
 }
 
 .dock-shell__pin {

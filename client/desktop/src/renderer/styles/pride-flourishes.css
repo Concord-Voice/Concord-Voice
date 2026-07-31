@@ -54,13 +54,17 @@
 }
 [data-scheme='pride'] .titlebar-title {
   background: var(--gradient-brand);
+  /* impeccable-disable-next-line gradient-text -- rainbow titlebar IS the Pride scheme */
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
   color: transparent;
 }
 
-/* Rainbow left stripe on the active channel (alongside the existing arrow) */
+/* Rainbow left stripe on the active channel (alongside the existing arrow).
+   Deliberate decorative flourish, scoped to [data-scheme='pride'] and layered over
+   the symmetric accent frame in ChannelList.css — it does not replace it. */
+/* impeccable-disable-next-line side-tab -- scheme-scoped Pride flourish, not chrome */
 [data-scheme='pride'] .channel-item.active::before {
   content: '';
   position: absolute;
@@ -124,7 +128,7 @@
     0 0 4px rgba(0, 0, 0, 0.5);
 }
 
-/* Dark text (color: var(--bg-primary)) → light halo */
+/* Dark text (color: var(--bg-primary)) → light halo. */
 [data-scheme='pride'] .channel-group-header__count,
 [data-scheme='pride'] .channel-unread-badge,
 [data-scheme='pride'] .conversation-unread-badge,
@@ -142,4 +146,16 @@
   text-shadow:
     0 0 2px rgba(255, 255, 255, 0.9),
     0 0 4px rgba(255, 255, 255, 0.55);
+}
+
+/* #2653 item 3: the offline count badges swap the dark-on-accent fill above for
+   --text-primary on --bg-tertiary, so the light halo would smear an already-light
+   numeral. They opt OUT here rather than being excluded from the group above —
+   tests/unit/styles/accent-fill.test.ts pairs each --accent-fill text surface with a
+   halo by canonicalized selector, and a :not() on the group entry stops the base
+   selector matching, which reads as a missing halo. The base badge still carries the
+   accent fill and still needs its halo; only the modifier does not. */
+[data-scheme='pride'] .friends-compact-trigger-count--offline,
+[data-scheme='pride'] .member-compact-trigger-count--offline {
+  text-shadow: none;
 }

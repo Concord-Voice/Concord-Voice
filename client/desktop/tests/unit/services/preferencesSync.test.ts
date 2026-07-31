@@ -4,6 +4,9 @@ import {
 } from '@/renderer/services/preferencesSync';
 import { useSettingsStore } from '@/renderer/stores/settingsStore';
 import {
+  LEGACY_COLLAPSED_WIDTH,
+  SIDEBAR_COMPACT_BREAKPOINT,
+  SIDEBAR_MIN_WIDTH,
   useLayoutStore,
   type SidebarProfile,
   type SidebarProfiles,
@@ -186,11 +189,11 @@ describe('preferencesSyncService', () => {
     it('round-trips all four retained docks and the decoupling preference', async () => {
       const profiles: SidebarProfiles = {
         dm: {
-          left: { width: 56, pinned: true },
-          right: { width: 179, pinned: false },
+          left: { width: SIDEBAR_MIN_WIDTH, pinned: true },
+          right: { width: SIDEBAR_COMPACT_BREAKPOINT - 1, pinned: false },
         },
         server: {
-          left: { width: 180, pinned: false },
+          left: { width: SIDEBAR_COMPACT_BREAKPOINT, pinned: false },
           right: { width: 340, pinned: true },
         },
       };
@@ -422,7 +425,7 @@ describe('preferencesSyncService', () => {
         },
         server: {
           left: { width: 220, pinned: true },
-          right: { width: 56, pinned: true },
+          right: { width: LEGACY_COLLAPSED_WIDTH, pinned: true },
         },
       });
       expect(useLayoutStore.getState().serverOrder).toEqual(['server-1']);
@@ -497,7 +500,7 @@ describe('preferencesSyncService', () => {
         },
         server: {
           left: { width: 300, pinned: false },
-          right: { width: 56, pinned: true },
+          right: { width: LEGACY_COLLAPSED_WIDTH, pinned: true },
         },
       });
       expect(useLayoutStore.getState().sidebarLayoutsDecoupled).toBe(false);

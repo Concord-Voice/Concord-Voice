@@ -199,6 +199,43 @@ describe('ChannelItem', () => {
     });
   });
 
+  // -- Compact emoji (#2653 item 4) --
+  //
+  // The rail's emoji-wins behavior is implemented in ChannelList.css
+  // (`.channel-item--compact:has(.channel-custom-emoji) .channel-type-icon`), NOT in
+  // this component: `ChannelButtonContent` renders both nodes unconditionally. Vitest
+  // runs with the default `css: false`, so jsdom never applies that stylesheet and no
+  // assertion here can observe which node is hidden — the Playwright visual baseline
+  // is the authoritative check for the rendered result. What these lock is the DOM
+  // contract the CSS rule selects against, plus the accessible name.
+  describe('compact emoji (#2653 item 4)', () => {
+    it('renders a configured emoji alongside the type glyph for the CSS rule to pick between', () => {
+      const { container } = render(
+        <ChannelItem {...defaultProps} compact channel={{ ...mockTextChannel, emoji: '🎲' }} />
+      );
+
+      expect(container.querySelector('.channel-custom-emoji')?.textContent).toBe('🎲');
+      expect(container.querySelector('.channel-type-icon')).toBeInTheDocument();
+    });
+
+    it('renders no emoji node at all when the channel has none, leaving the glyph alone', () => {
+      const { container } = render(<ChannelItem {...defaultProps} compact />);
+
+      expect(container.querySelector('.channel-custom-emoji')).not.toBeInTheDocument();
+      expect(container.querySelector('.channel-type-icon')).toBeInTheDocument();
+    });
+
+    it('names the channel and its type in the accessible label either way', () => {
+      const { rerender } = render(
+        <ChannelItem {...defaultProps} compact channel={{ ...mockTextChannel, emoji: '🎲' }} />
+      );
+      expect(screen.getByRole('button', { name: 'general, text channel' })).toBeInTheDocument();
+
+      rerender(<ChannelItem {...defaultProps} compact />);
+      expect(screen.getByRole('button', { name: 'general, text channel' })).toBeInTheDocument();
+    });
+  });
+
   // -- Channel Type Icons --
 
   it('renders hash icon for text channels', () => {

@@ -167,11 +167,16 @@
   background-color: var(--bg-tertiary);
 }
 
+/* The two accent borders are a SYMMETRIC frame, not a side tab: the padding below drops
+   3px on each side to compensate, so the row keeps its width when selected. Matches
+   .conversation-item.active in the DM sidebar — the DM/Server parity #2510 established. */
 .channel-item.active {
   background-color: var(--bg-tertiary);
   color: var(--text-primary);
   font-weight: 600;
+  /* impeccable-disable-next-line side-tab -- symmetric with the right border below */
   border-left: 3px solid var(--accent-primary);
+  /* impeccable-disable-next-line side-tab -- symmetric with the left border above */
   border-right: 3px solid var(--accent-primary);
   padding-left: calc(9px * var(--sp, 1));
   padding-right: calc(9px * var(--sp, 1));
@@ -188,6 +193,10 @@
   height: 0;
   border-top: 6px solid transparent;
   border-bottom: 6px solid transparent;
+  /* CSS triangle idiom: width/height are 0 and the transparent top/bottom borders meet this
+     one at a point, so these borders ARE the arrow. No card, no border — a glyph built out
+     of border geometry. */
+  /* impeccable-disable-next-line side-tab -- CSS triangle, not a card border */
   border-left: 6px solid var(--accent-primary);
 }
 
@@ -413,9 +422,12 @@
   z-index: 1;
 }
 
-/* Active grouped channel — accent border, keep consistent padding */
+/* Active grouped channel — symmetric accent frame, keep consistent padding.
+   Same house pattern as .channel-item.active above; not a side tab. */
 .channel-item--grouped.active {
+  /* impeccable-disable-next-line side-tab -- symmetric with the right border below */
   border-left: 3px solid var(--accent-primary);
+  /* impeccable-disable-next-line side-tab -- symmetric with the left border above */
   border-right: 3px solid var(--accent-primary);
   padding-left: calc(8px * var(--sp, 1));
   padding-right: calc(9px * var(--sp, 1));
@@ -726,8 +738,8 @@
   position: relative;
   flex: none;
   justify-content: center;
-  width: 44px;
-  height: 44px;
+  width: var(--rail-cell);
+  height: var(--rail-cell);
   border-radius: 8px;
 }
 
@@ -764,10 +776,10 @@
 
 .channel-list--compact .channel-item--compact {
   justify-content: center;
-  width: 44px;
-  min-width: 44px;
-  height: 44px;
-  min-height: 44px;
+  width: var(--rail-cell);
+  min-width: var(--rail-cell);
+  height: var(--rail-cell);
+  min-height: var(--rail-cell);
   padding: 0;
   margin: 2px auto;
   border: 0;
@@ -790,7 +802,7 @@
 }
 
 .channel-list--compact .channel-item--grouped {
-  width: 44px;
+  width: var(--rail-cell);
   margin-left: auto;
   padding: 0;
 }
@@ -815,12 +827,26 @@
   white-space: nowrap;
 }
 
-.channel-list--compact .channel-item--compact .channel-custom-emoji,
 .channel-list--compact .channel-item--compact .channel-encrypted-icon {
   display: none;
 }
 
-.channel-list--compact .channel-item--muted .channel-type-icon {
+/* A configured emoji replaces the generic type glyph in the rail; with no emoji the
+   glyph stands. ChannelItem.tsx renders both nodes unconditionally, so the choice is
+   made here rather than in the TSX. :has() is supported in Electron 43's Chromium.
+   margin: 0 mirrors the .channel-type-icon rule above — the base .channel-custom-emoji
+   carries a margin-right that would push the glyph off-centre in a centred cell. */
+.channel-list--compact .channel-item--compact:has(.channel-custom-emoji) .channel-type-icon {
+  display: none;
+}
+
+.channel-list--compact .channel-item--compact .channel-custom-emoji {
+  margin: 0;
+  font-size: var(--rail-icon-sm);
+}
+
+.channel-list--compact .channel-item--muted .channel-type-icon,
+.channel-list--compact .channel-item--muted .channel-custom-emoji {
   opacity: 0.5;
 }
 

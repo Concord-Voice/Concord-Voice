@@ -1,7 +1,12 @@
 import { useState, type ComponentProps, type ReactNode } from 'react';
 import { act, fireEvent, render, screen, userEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useLayoutStore, type SidebarProfiles } from '@/renderer/stores/layoutStore';
+import {
+  SIDEBAR_COMPACT_BREAKPOINT,
+  SIDEBAR_MIN_WIDTH,
+  useLayoutStore,
+  type SidebarProfiles,
+} from '@/renderer/stores/layoutStore';
 import { useSettingsStore } from '@/renderer/stores/settingsStore';
 import { DockOverlayProvider, DockShell } from '@/renderer/components/Layout/DockShell';
 import { AttributedPopover } from '@/renderer/components/Layout/AttributedPopover';
@@ -48,9 +53,9 @@ describe('DockShell', () => {
   });
 
   it.each([
-    [56, 'compact'],
-    [179, 'compact'],
-    [180, 'standard'],
+    [SIDEBAR_MIN_WIDTH, 'compact'],
+    [SIDEBAR_COMPACT_BREAKPOINT - 1, 'compact'],
+    [SIDEBAR_COMPACT_BREAKPOINT, 'standard'],
   ] as const)('renders %ipx as the %s presentation', (width, presentation) => {
     useLayoutStore.setState({ sidebarProfiles: profiles(width) });
 
@@ -118,26 +123,30 @@ describe('DockShell', () => {
   });
 
   it('exposes a focusable adjustable separator and commits keyboard resize steps', () => {
-    useLayoutStore.setState({ sidebarProfiles: profiles(179) });
+    useLayoutStore.setState({ sidebarProfiles: profiles(SIDEBAR_COMPACT_BREAKPOINT - 1) });
     renderDock({ side: 'left', label: 'Threads' });
 
     const separator = screen.getByRole('separator', { name: 'Resize Threads sidebar' });
     expect(separator).toHaveAttribute('tabindex', '0');
     expect(separator).toHaveAttribute('aria-orientation', 'vertical');
-    expect(separator).toHaveAttribute('aria-valuemin', '56');
+    expect(separator).toHaveAttribute('aria-valuemin', String(SIDEBAR_MIN_WIDTH));
     expect(separator).toHaveAttribute('aria-valuemax', '400');
-    expect(separator).toHaveAttribute('aria-valuenow', '179');
+    expect(separator).toHaveAttribute('aria-valuenow', String(SIDEBAR_COMPACT_BREAKPOINT - 1));
 
     separator.focus();
     expect(separator).toHaveFocus();
 
     fireEvent.keyDown(separator, { key: 'ArrowRight' });
-    expect(useLayoutStore.getState().sidebarProfiles.dm.left.width).toBe(189);
-    expect(separator).toHaveAttribute('aria-valuenow', '189');
+    expect(useLayoutStore.getState().sidebarProfiles.dm.left.width).toBe(
+      SIDEBAR_COMPACT_BREAKPOINT + 9
+    );
+    expect(separator).toHaveAttribute('aria-valuenow', String(SIDEBAR_COMPACT_BREAKPOINT + 9));
 
     fireEvent.keyDown(separator, { key: 'ArrowRight', shiftKey: true });
-    expect(useLayoutStore.getState().sidebarProfiles.dm.left.width).toBe(239);
-    expect(separator).toHaveAttribute('aria-valuenow', '239');
+    expect(useLayoutStore.getState().sidebarProfiles.dm.left.width).toBe(
+      SIDEBAR_COMPACT_BREAKPOINT + 59
+    );
+    expect(separator).toHaveAttribute('aria-valuenow', String(SIDEBAR_COMPACT_BREAKPOINT + 59));
   });
 
   it('opens on hover and closes after pointer leave', () => {
@@ -401,5 +410,29 @@ describe('DockShell', () => {
     const { container } = renderDock();
 
     expect(container.querySelector('.dock-shell')).toHaveAttribute('data-reduce-motion', 'true');
+  });
+
+  it.each([
+    [44, 'dense'],
+    [55, 'dense'],
+    [56, 'compact'],
+    [SIDEBAR_COMPACT_BREAKPOINT - 1, 'compact'],
+  ] as const)('publishes --dock-width and density %i → %s', (width, density) => {
+    useLayoutStore.setState({ sidebarProfiles: profiles(width) });
+
+    const { container } = renderDock();
+    const surface = container.querySelector('.dock-shell__surface') as HTMLElement;
+
+    expect(surface.style.getPropertyValue('--dock-width')).toBe(`${width}px`);
+    expect(surface).toHaveAttribute('data-rail-density', density);
+  });
+
+  it('omits data-rail-density in the standard presentation', () => {
+    useLayoutStore.setState({ sidebarProfiles: profiles(SIDEBAR_COMPACT_BREAKPOINT) });
+
+    const { container } = renderDock();
+    const surface = container.querySelector('.dock-shell__surface') as HTMLElement;
+
+    expect(surface).not.toHaveAttribute('data-rail-density');
   });
 });

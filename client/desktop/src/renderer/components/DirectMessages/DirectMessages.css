@@ -76,9 +76,14 @@
   background-color: var(--bg-tertiary);
 }
 
+/* The two accent borders are a SYMMETRIC frame, not a side tab: the padding below drops
+   3px on each side to compensate, so the row keeps its width when selected. The detector
+   evaluates each declaration alone and reports the pair as two single-side tabs. */
 .conversation-item.active {
   background-color: var(--bg-tertiary);
+  /* impeccable-disable-next-line side-tab -- symmetric with the right border below */
   border-left: 3px solid var(--accent-primary);
+  /* impeccable-disable-next-line side-tab -- symmetric with the left border above */
   border-right: 3px solid var(--accent-primary);
   padding-left: calc(9px * var(--sp, 1));
   padding-right: calc(9px * var(--sp, 1));
@@ -87,8 +92,10 @@
 /* Avatar */
 .conversation-avatar {
   position: relative;
-  width: 36px;
-  height: 36px;
+  /* The fallback is required: this rule also applies outside the compact rail,
+     where --rail-avatar is not declared. */
+  width: var(--rail-avatar, 36px);
+  height: var(--rail-avatar, 36px);
   border-radius: 50%;
   background: var(--bg-tertiary);
   display: flex;
@@ -377,13 +384,20 @@
   background: var(--text-muted);
 }
 
-/* Header */
+/* Header. #2653 item 2a: the title yields space first; the action buttons never do. Only the
+   standard presentation renders an h3, so this needs no presentation qualifier — and it must
+   not have one, because the docked instance of this header lives in DockShell's header row,
+   outside `.friends-list`. */
 .friends-list-header h3 {
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Friend category */
@@ -489,6 +503,72 @@
   display: flex;
   align-items: center;
   gap: calc(4px * var(--sp, 1));
+  flex-shrink: 0;
+}
+
+/* #2653 item 2a: the docked instance IS DockShell's header row, sharing it with the pin.
+   The dock supplies that row's padding, border and background, so this contributes only the
+   flex geometry that keeps the title truncating before the actions do. */
+.friends-list-header--dock {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  gap: calc(8px * var(--sp, 1));
+}
+
+/* #2653 item 2b: friend search. Values mirror .member-list-search* so the two rails
+   present the same control — see components/Members/MemberList.css. */
+.friends-list-search {
+  padding: 0 calc(8px * var(--sp, 1));
+  margin-bottom: calc(8px * var(--sp, 1));
+}
+
+.friends-list-search-input {
+  width: 100%;
+  /* Same reason as .member-list-search-input: at the 135px breakpoint the placeholder no
+     longer fits, so it must ellipsize rather than clip mid-glyph. min-width:0 stops the
+     flex min-content floor from re-widening the input past its container. */
+  min-width: 0;
+  text-overflow: ellipsis;
+  padding: calc(5px * var(--sp, 1)) calc(8px * var(--sp, 1));
+  font-size: calc(12px * var(--font-scale, 1));
+  font-family: inherit;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  outline: none;
+  transition: border-color 0.15s ease;
+  box-sizing: border-box;
+}
+
+.friends-list-search-input::placeholder {
+  color: var(--text-muted);
+}
+
+.friends-list-search-input:focus {
+  border-color: var(--accent-primary);
+}
+
+/* The popover supplies its own padding; drop the in-panel gutter and gap. */
+.friends-list-search--popover {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+/* The compact rail cannot hold a sentence, so the no-match message rides the search popover
+   the user is already typing into — the compact half of the standard `.friends-list-empty`. */
+.friends-list-search-empty {
+  margin: calc(6px * var(--sp, 1)) 0 0;
+  font-size: calc(12px * var(--font-scale, 1));
+  color: var(--text-muted);
+}
+
+.friends-search-trigger {
+  flex-shrink: 0;
+  margin-bottom: 4px;
 }
 
 /* Compact Friends category rail */
@@ -518,10 +598,10 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 44px;
-  min-width: 44px;
-  height: 44px;
-  min-height: 44px;
+  width: var(--rail-cell);
+  min-width: var(--rail-cell);
+  height: var(--rail-cell);
+  min-height: var(--rail-cell);
   padding: 4px;
   border: 0;
   border-radius: 8px;
@@ -554,7 +634,7 @@
 }
 
 .friends-compact-emoji {
-  font-size: 20px;
+  font-size: var(--rail-icon);
   line-height: 1;
 }
 
@@ -562,15 +642,31 @@
   position: absolute;
   right: 1px;
   bottom: 1px;
-  min-width: 16px;
-  height: 16px;
+  min-width: var(--rail-badge);
+  height: var(--rail-badge);
   padding: 0 3px;
   border-radius: 8px;
   background: var(--accent-fill);
   color: var(--bg-primary);
-  font-size: 10px;
+  font-size: calc(var(--rail-badge-font) * var(--font-scale, 1));
   font-weight: 700;
-  line-height: 16px;
+  line-height: var(--rail-badge);
+}
+
+/* #2653 item 3: the Offline group is inactive, so its count reads as chrome rather than
+   as an accent-coloured alert. --text-primary on --bg-tertiary clears WCAG 2.1 SC 1.4.3
+   (4.5:1 — the badge renders a numeral, so it is text) in all 34 theme blocks; the
+   computed table is recorded in the #2653 design spec §5. */
+.friends-compact-trigger-count--offline {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* Load-bearing: the trigger's own hover/expanded fill is ALSO --bg-tertiary, so without
+   this the muted badge dissolves into the button exactly when the pointer is on it. */
+.friends-compact-trigger:hover .friends-compact-trigger-count--offline,
+.friends-compact-trigger[aria-expanded='true'] .friends-compact-trigger-count--offline {
+  background: var(--bg-secondary);
 }
 
 .attributed-popover .friend-item {
@@ -688,11 +784,11 @@
 .conversation-list--compact .conversation-item--compact {
   position: relative;
   justify-content: center;
-  flex: 0 0 44px;
-  width: 44px;
-  min-width: 44px;
-  height: 44px;
-  min-height: 44px;
+  flex: 0 0 var(--rail-cell);
+  width: var(--rail-cell);
+  min-width: var(--rail-cell);
+  height: var(--rail-cell);
+  min-height: var(--rail-cell);
   margin: 2px 6px;
   padding: 4px;
   gap: 0;
@@ -709,7 +805,7 @@
 }
 
 .conversation-list--compact .personal-thread-divider {
-  width: 36px;
+  width: var(--rail-divider);
   flex-shrink: 0;
   margin: 4px 10px;
 }

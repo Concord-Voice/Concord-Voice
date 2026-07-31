@@ -88,7 +88,7 @@ const DirectMessagesView: React.FC = () => {
         channelPanel={
           <ChannelPanel
             context="dm"
-            header={channelHeader}
+            renderHeader={channelHeader}
             renderContent={(compact) => (
               <ConversationList
                 compact={compact}

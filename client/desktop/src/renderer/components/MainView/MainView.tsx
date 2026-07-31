@@ -457,7 +457,7 @@ const MainView: React.FC = () => {
         channelPanel={
           <ChannelPanel
             context="server"
-            header={channelHeader}
+            renderHeader={channelHeader}
             forcePin={!!activeServer && channels.length === 0}
             renderContent={renderChannelBody}
           />

@@ -288,3 +288,10 @@ client/desktop/src/renderer/styles/.ds-index.css
 # evaluated and README.md would be ignored too.
 graphify-out/*
 !graphify-out/README.md
+
+# impeccable design-detector runtime state. The shared `.impeccable/config.json` IS
+# tracked (it is the reviewable home for any detector ignore); the dedup cache and the
+# per-developer override are machine-local. `**/` because the hook writes a cache
+# beside whichever package it scanned, not only at the repo root.
+**/.impeccable/hook.cache.json
+**/.impeccable/config.local.json

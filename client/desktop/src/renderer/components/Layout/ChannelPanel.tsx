@@ -5,7 +5,9 @@ import { DockShell } from './DockShell';
 
 interface ChannelPanelProps {
   context: SidebarContext;
-  header: React.ReactNode | ((compact: boolean) => React.ReactNode);
+  /** Presentation-dependent header, forwarded to DockShell's `renderHeader`. The
+   *  `render` prefix is load-bearing — see the note on that prop. */
+  renderHeader: (compact: boolean) => React.ReactNode;
   renderContent: (compact: boolean) => React.ReactNode;
   forcePin?: boolean;
 }
@@ -14,7 +16,7 @@ const renderUserPanelFooter = (compact: boolean) => <UserPanel compact={compact}
 
 const ChannelPanel: React.FC<ChannelPanelProps> = ({
   context,
-  header,
+  renderHeader,
   renderContent,
   forcePin = false,
 }) => (
@@ -22,7 +24,7 @@ const ChannelPanel: React.FC<ChannelPanelProps> = ({
     context={context}
     side="left"
     label={context === 'dm' ? 'Threads' : 'Channels'}
-    header={header}
+    renderHeader={renderHeader}
     forcePinned={forcePin}
     footer={renderUserPanelFooter}
     renderBody={renderContent}

@@ -1,6 +1,11 @@
 import { fireEvent, render, screen } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { selectSidebarDock, useLayoutStore } from '@/renderer/stores/layoutStore';
+import {
+  SIDEBAR_COMPACT_BREAKPOINT,
+  SIDEBAR_MIN_WIDTH,
+  selectSidebarDock,
+  useLayoutStore,
+} from '@/renderer/stores/layoutStore';
 import AppLayout from '@/renderer/components/Layout/AppLayout';
 import { DockOverlayProvider, DockShell } from '@/renderer/components/Layout/DockShell';
 
@@ -57,9 +62,9 @@ describe('AppLayout', () => {
   });
 
   it.each([
-    ['dm', 'left', 56, true, 'compact'],
-    ['dm', 'right', 179, false, 'compact'],
-    ['server', 'left', 180, true, 'standard'],
+    ['dm', 'left', SIDEBAR_MIN_WIDTH, true, 'compact'],
+    ['dm', 'right', SIDEBAR_COMPACT_BREAKPOINT - 1, false, 'compact'],
+    ['server', 'left', SIDEBAR_COMPACT_BREAKPOINT, true, 'standard'],
     ['server', 'right', 340, true, 'standard'],
   ] as const)(
     '%s %s resolves %ipx pinned=%s as %s',

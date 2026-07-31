@@ -9,7 +9,7 @@ import MemberContextMenu from './MemberContextMenu';
 import UserProfileModal from './UserProfileModal';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
 import { apiFetch, safeJson } from '../../services/apiClient';
-import { Search, Users } from 'lucide-react';
+import { Moon, Search, Users } from 'lucide-react';
 import { AttributedPopover } from '../Layout/AttributedPopover';
 import './MemberList.css';
 
@@ -40,6 +40,15 @@ interface CompactMemberGroupsProps {
   onMemberContextMenu: (event: React.MouseEvent, member: ServerMember) => void;
   setOpenGroup: React.Dispatch<React.SetStateAction<OpenMemberGroup | null>>;
 }
+
+// A role emoji always wins. Otherwise the PRESENCE-fallback offline group takes the Moon
+// (#2653 item 3, DM/Server parity) and every other group — role groups included — keeps
+// the `Users` fallback. Role keys are `role-<id>`, so they can never match 'offline'.
+const CompactGroupIcon: React.FC<{ group: MemberGroup }> = ({ group }) => {
+  if (group.emoji) return <span className="member-compact-emoji">{group.emoji}</span>;
+  if (group.key === 'offline') return <Moon size={20} aria-hidden="true" />;
+  return <Users size={20} aria-hidden="true" />;
+};
 
 const CompactMemberGroups: React.FC<CompactMemberGroupsProps> = ({
   groups,
@@ -74,12 +83,13 @@ const CompactMemberGroups: React.FC<CompactMemberGroupsProps> = ({
             }}
             style={group.color ? { color: group.color } : undefined}
           >
-            {group.emoji ? (
-              <span className="member-compact-emoji">{group.emoji}</span>
-            ) : (
-              <Users size={20} aria-hidden="true" />
-            )}
-            <span className="member-compact-trigger-count" aria-hidden="true">
+            <CompactGroupIcon group={group} />
+            <span
+              className={`member-compact-trigger-count${
+                group.key === 'offline' ? ' member-compact-trigger-count--offline' : ''
+              }`}
+              aria-hidden="true"
+            >
               {group.members.length}
             </span>
           </button>

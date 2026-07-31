@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useId, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import {
   ChevronDown,
@@ -13,8 +14,9 @@ import {
   FolderPlus,
   GripVertical,
   Users,
-  WifiOff,
+  Moon,
   Folder,
+  Search,
 } from 'lucide-react';
 import { useFriendStore, type Friend } from '../../stores/friendStore';
 import { useFriendOrgStore, type FriendCategory } from '../../stores/friendOrgStore';
@@ -30,6 +32,21 @@ import './DirectMessages.css';
 interface FriendsListProps {
   onFriendClick?: (userId: string) => void;
   compact?: boolean;
+  /**
+   * #2653 item 2a: the standard-presentation `[title | actions]` row belongs in DockShell's
+   * own header so the dock renders ONE row, `[title | actions | pin]` (spec §4 item 2a).
+   * The markup stays here because every piece of state behind it lives here — the pending
+   * badge, the search term that mutes it, and both modals — so the row is delivered by
+   * portalling into a host the dock supplies rather than by lifting that state out.
+   *
+   * Three states, deliberately distinct:
+   *   `undefined` — not docked (standalone/tests): render the row in flow, as before.
+   *   `null`      — docked, host not attached yet: render nothing for this commit.
+   *   element     — portal the row into the dock header.
+   * Compact ignores it: the spec keeps compact behaviour exactly, so the rail actions stay
+   * in the body and the dock header carries only the pin.
+   */
+  headerHost?: HTMLElement | null;
 }
 
 type RenderSection =
@@ -47,7 +64,7 @@ interface CompactSectionTriggerProps {
   pendingCount: number;
   openSection: OpenFriendSection | null;
   triggerId: string;
-  setOpenSection: React.Dispatch<React.SetStateAction<OpenFriendSection | null>>;
+  onToggleSection: (key: string, anchor: HTMLElement) => void;
 }
 
 interface CompactFriendsSectionsProps {
@@ -58,7 +75,8 @@ interface CompactFriendsSectionsProps {
   triggerId: string;
   renderPendingRows: () => React.ReactNode;
   renderFriendRow: (friend: Friend, tintColor: string | null) => React.ReactNode;
-  setOpenSection: React.Dispatch<React.SetStateAction<OpenFriendSection | null>>;
+  onToggleSection: (key: string, anchor: HTMLElement) => void;
+  onCloseSection: () => void;
 }
 
 function getSectionLabel(section: RenderSection): string {
@@ -80,7 +98,10 @@ function getFriendStatusLabel(status: Friend['status'], appearsOffline: boolean)
 const CompactSectionIcon: React.FC<{ section: RenderSection }> = ({ section }) => {
   if (section.kind === 'pending') return <Clock size={20} />;
   if (section.kind === 'builtin') {
-    return section.key === 'online' ? <Users size={20} /> : <WifiOff size={20} />;
+    // #2653 item 3: Moon, not WifiOff — offline is "not here", not a network fault. It is
+    // also the only candidate that is a single continuous path, so it survives the dense
+    // rail intact and stays distinguishable from the Online `Users` silhouette (spec C7).
+    return section.key === 'online' ? <Users size={20} /> : <Moon size={20} />;
   }
   if (section.cat.emoji) {
     return <span className="friends-compact-emoji">{section.cat.emoji}</span>;
@@ -93,11 +114,13 @@ const CompactSectionTrigger: React.FC<CompactSectionTriggerProps> = ({
   pendingCount,
   openSection,
   triggerId,
-  setOpenSection,
+  onToggleSection,
 }) => {
   const label = getSectionLabel(section);
   const count = getSectionCount(section, pendingCount);
   const isOpen = openSection?.key === section.key;
+  // Only the Offline BUILT-IN mutes its badge — a category is never this key.
+  const isOffline = section.kind === 'builtin' && section.key === 'offline';
 
   return (
     <div className="friends-compact-category">
@@ -110,15 +133,15 @@ const CompactSectionTrigger: React.FC<CompactSectionTriggerProps> = ({
         aria-label={`${label} — ${count}`}
         title={label}
         onPointerDown={(event) => event.stopPropagation()}
-        onClick={(event) => {
-          const anchor = event.currentTarget;
-          setOpenSection((current) =>
-            current?.key === section.key ? null : { key: section.key, anchor }
-          );
-        }}
+        onClick={(event) => onToggleSection(section.key, event.currentTarget)}
       >
         <CompactSectionIcon section={section} />
-        <span className="friends-compact-trigger-count" aria-hidden="true">
+        <span
+          className={`friends-compact-trigger-count${
+            isOffline ? ' friends-compact-trigger-count--offline' : ''
+          }`}
+          aria-hidden="true"
+        >
           {count}
         </span>
       </button>
@@ -134,7 +157,8 @@ const CompactFriendsSections: React.FC<CompactFriendsSectionsProps> = ({
   triggerId,
   renderPendingRows,
   renderFriendRow,
-  setOpenSection,
+  onToggleSection,
+  onCloseSection,
 }) => {
   return (
     <>
@@ -146,7 +170,7 @@ const CompactFriendsSections: React.FC<CompactFriendsSectionsProps> = ({
             pendingCount={pendingCount}
             openSection={openSection}
             triggerId={triggerId}
-            setOpenSection={setOpenSection}
+            onToggleSection={onToggleSection}
           />
         ))}
       </nav>
@@ -156,7 +180,7 @@ const CompactFriendsSections: React.FC<CompactFriendsSectionsProps> = ({
           anchor={openSection.anchor}
           label={`${getSectionLabel(selectedSection)} — ${getSectionCount(selectedSection, pendingCount)}`}
           open
-          onClose={() => setOpenSection(null)}
+          onClose={onCloseSection}
         >
           {selectedSection.kind === 'pending'
             ? renderPendingRows()
@@ -176,7 +200,11 @@ const CompactFriendsSections: React.FC<CompactFriendsSectionsProps> = ({
 const DT_SECTION = 'application/concord-section'; // section-header handle → reorder sectionOrder
 const DT_FRIEND = 'application/concord-friend'; // friend row → assign friend to a category
 
-const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick, compact = false }) => {
+const FriendsList: React.FC<FriendsListProps> = ({
+  onFriendClick,
+  compact = false,
+  headerHost,
+}) => {
   // eslint-disable-next-line @eslint-react/use-state -- Set() is cheap to construct; lazy initializer would add noise without benefit
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
   const [showAddFriendModal, setShowAddFriendModal] = useState(false);
@@ -213,6 +241,8 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick, compact = fals
     position: { x: number; y: number };
   } | null>(null);
   const [openSection, setOpenSection] = useState<OpenFriendSection | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchAnchor, setSearchAnchor] = useState<HTMLElement | null>(null);
   const compactTriggerId = useId();
   const addFriendTriggerId = useId();
 
@@ -225,8 +255,24 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick, compact = fals
     if (!compact) {
       // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: compact triggers unmount in standard mode, so their detached popover state must be discarded
       setOpenSection(null);
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- compact search uses a detached trigger that must not survive standard mode
+      setSearchAnchor(null);
     }
   }, [compact]);
+
+  // Exactly one compact popover may be open: the search bubble and a section bubble are
+  // anchored to neighbouring rail cells, so leaving both open overlaps them.
+  const toggleSection = useCallback((key: string, anchor: HTMLElement) => {
+    setSearchAnchor(null);
+    setOpenSection((current) => (current?.key === key ? null : { key, anchor }));
+  }, []);
+
+  const closeSection = useCallback(() => setOpenSection(null), []);
+
+  const toggleSearch = useCallback((anchor: HTMLElement) => {
+    setOpenSection(null);
+    setSearchAnchor((current) => (current === anchor ? null : anchor));
+  }, []);
 
   const toggleCategory = (category: string) => {
     setCollapsedCategories((prev) => {
@@ -308,9 +354,55 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick, compact = fals
     ? friends.find((f) => f.userId === selectedFriend.userId)
     : null;
 
-  const incomingRequests = pendingRequests.filter((r) => r.direction === 'received');
-  const outgoingRequests = pendingRequests.filter((r) => r.direction === 'sent');
-  const incomingCount = incomingRequests.length;
+  // The header badge counts every incoming request, not the search results — it is the
+  // "you have mail" signal, so a term must not make it appear to drop (#2653 item 2b, C9).
+  const incomingCount = pendingRequests.filter((r) => r.direction === 'received').length;
+
+  // #2653 item 2b: filter BEFORE the section build so categories, the Online/Offline
+  // built-ins, pending, and the compact rail all inherit the term. Filtering after the
+  // build (or only at the rendered rows) leaves sections whose counts disagree with their
+  // contents. Mirrors MemberList's `filteredMembers` seam.
+  const trimmedQuery = searchQuery.trim();
+  const searchTerm = trimmedQuery.toLowerCase();
+
+  const filteredFriends = useMemo(() => {
+    if (!searchTerm) return friends;
+    return friends.filter(
+      (f) =>
+        f.username.toLowerCase().includes(searchTerm) ||
+        f.displayName?.toLowerCase().includes(searchTerm)
+    );
+  }, [friends, searchTerm]);
+
+  const filteredPending = useMemo(() => {
+    if (!searchTerm) return pendingRequests;
+    return pendingRequests.filter((r) => {
+      // Match the counterparty — the name the row actually renders — not the local user.
+      const username = r.direction === 'received' ? r.fromUsername : r.toUsername;
+      const displayName = r.direction === 'received' ? r.fromDisplayName : r.toDisplayName;
+      return (
+        username.toLowerCase().includes(searchTerm) ||
+        displayName?.toLowerCase().includes(searchTerm)
+      );
+    });
+  }, [pendingRequests, searchTerm]);
+
+  const incomingRequests = filteredPending.filter((r) => r.direction === 'received');
+  const outgoingRequests = filteredPending.filter((r) => r.direction === 'sent');
+
+  // One gate for "this panel has something a term could filter". The search controls used to
+  // key on `friends.length` alone while the sections they filter keyed on this triple, so a
+  // user with no friends but a pending request (or a category) got a filterable panel and no
+  // control to filter it. The no-match message below shares the gate for the same reason:
+  // widening the controls without widening it leaves that user staring at a blank panel.
+  const hasFilterableContent =
+    friends.length > 0 || categoryList.length > 0 || pendingRequests.length > 0;
+  const noMatches =
+    searchTerm !== '' &&
+    hasFilterableContent &&
+    filteredFriends.length === 0 &&
+    filteredPending.length === 0;
+  const noMatchMessage = `No friends match "${trimmedQuery}"`;
 
   // userId -> category (one-per-friend); categorized friends never fall to Online/Offline.
   const catByMember = useMemo(() => {
@@ -319,7 +411,7 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick, compact = fals
     return m;
   }, [categoryList]);
 
-  const uncategorized = friends.filter((f) => !catByMember.has(f.userId));
+  const uncategorized = filteredFriends.filter((f) => !catByMember.has(f.userId));
   const onlineUncat = uncategorized.filter(
     (f) => f.status !== 'offline' && (!compact || f.status !== 'invisible')
   );
@@ -343,7 +435,7 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick, compact = fals
   const sections = order
     .map((key): RenderSection | null => {
       if (key === 'pending') {
-        return pendingRequests.length ? { kind: 'pending', key } : null;
+        return filteredPending.length ? { kind: 'pending', key } : null;
       }
       if (key === 'online') {
         return { kind: 'builtin', key, label: 'Online', friends: onlineUncat };
@@ -358,7 +450,7 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick, compact = fals
             kind: 'category',
             key,
             cat,
-            friends: friends.filter((f) => cat.memberIds.includes(f.userId)),
+            friends: filteredFriends.filter((f) => cat.memberIds.includes(f.userId)),
           }
         : null;
     })
@@ -366,6 +458,7 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick, compact = fals
   const selectedSection = openSection
     ? sections.find((section) => section.key === openSection.key)
     : undefined;
+  const activeSearchAnchor = compact && searchAnchor?.isConnected ? searchAnchor : null;
 
   useEffect(() => {
     if (openSection && (!selectedSection || !openSection.anchor.isConnected)) {
@@ -628,67 +721,139 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick, compact = fals
     </>
   );
 
+  const headerRow = (
+    <>
+      {!compact && (
+        <h3 title="Friends">
+          Friends
+          {incomingCount > 0 && (
+            <span
+              className="conversation-unread-badge friends-header-badge"
+              // While a term is active the badge can outnumber the visible rows; say why.
+              title={searchTerm ? `${incomingCount} pending — hidden by search` : undefined}
+            >
+              {incomingCount}
+            </span>
+          )}
+        </h3>
+      )}
+      <div className="friends-list-header-actions">
+        <button
+          type="button"
+          className="friends-add-btn"
+          aria-label="Manage categories"
+          title="Manage categories"
+          onClick={openCategoryManager}
+        >
+          <FolderPlus size={16} />
+        </button>
+        <button
+          id={`${addFriendTriggerId}-add-friend`}
+          type="button"
+          className="friends-add-btn"
+          onClick={() => setShowAddFriendModal(true)}
+          aria-label="Add Friend"
+          title="Add Friend"
+        >
+          <Plus size={16} />
+        </button>
+      </div>
+    </>
+  );
+
+  // Docked + standard: the dock owns the row (see `headerHost`). `null` means the host has
+  // not attached yet — ref callbacks flush before paint, so nothing is visibly missing.
+  const headerBelongsToDock = !compact && headerHost !== undefined;
+
   return (
     <div className={`friends-list${compact ? ' friends-list--compact' : ''}`}>
-      <div className="friends-list-header">
-        {!compact && (
-          <h3>
-            Friends
-            {incomingCount > 0 && (
-              <span className="conversation-unread-badge friends-header-badge">
-                {incomingCount}
-              </span>
-            )}
-          </h3>
-        )}
-        <div className="friends-list-header-actions">
-          <button
-            type="button"
-            className="friends-add-btn"
-            aria-label="Manage categories"
-            title="Manage categories"
-            onClick={openCategoryManager}
-          >
-            <FolderPlus size={16} />
-          </button>
-          <button
-            id={`${addFriendTriggerId}-add-friend`}
-            type="button"
-            className="friends-add-btn"
-            onClick={() => setShowAddFriendModal(true)}
-            aria-label="Add Friend"
-            title="Add Friend"
-          >
-            <Plus size={16} />
-          </button>
+      {headerBelongsToDock ? (
+        headerHost && createPortal(headerRow, headerHost)
+      ) : (
+        <div className="friends-list-header">{headerRow}</div>
+      )}
+
+      {!compact && hasFilterableContent && (
+        <div className="friends-list-search">
+          <input
+            type="text"
+            className="friends-list-search-input"
+            aria-label="Search friends"
+            placeholder="Search friends..."
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+          />
         </div>
-      </div>
+      )}
 
       {/* Keyboard-reorder announcements (WCAG 4.1.3 status messages) */}
       <div className="sr-only" aria-live="polite" role="status">
         {reorderAnnouncement}
       </div>
 
-      {compact && (friends.length > 0 || categoryList.length > 0 || pendingRequests.length > 0) && (
+      {compact && hasFilterableContent && (
+        <>
+          <button
+            id={`${compactTriggerId}-friends-search`}
+            type="button"
+            className="friends-compact-trigger friends-search-trigger"
+            aria-label="Search friends"
+            // The rail has no room for a sentence, so the trigger carries the no-match state
+            // once the popover is dismissed — the popover body says it while it is open.
+            title={noMatches ? noMatchMessage : 'Search friends'}
+            aria-expanded={activeSearchAnchor !== null}
+            aria-controls={`${compactTriggerId}-friends-search-popover`}
+            onClick={(event) => toggleSearch(event.currentTarget)}
+          >
+            <Search size={20} aria-hidden="true" />
+          </button>
+          <AttributedPopover
+            id={`${compactTriggerId}-friends-search-popover`}
+            anchor={activeSearchAnchor}
+            label="Search friends"
+            open={activeSearchAnchor !== null}
+            placement="left"
+            onClose={() => setSearchAnchor(null)}
+          >
+            <div className="friends-list-search friends-list-search--popover">
+              <input
+                type="text"
+                className="friends-list-search-input"
+                aria-label="Search friends"
+                placeholder="Search friends..."
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                autoFocus
+              />
+              {/* Parity with MemberList's ungated `No members found`: a compact user whose
+                  term matches nothing must get the same signal a standard user does. */}
+              {noMatches && <p className="friends-list-search-empty">{noMatchMessage}</p>}
+            </div>
+          </AttributedPopover>
+        </>
+      )}
+
+      {compact && hasFilterableContent && (
         <CompactFriendsSections
           sections={sections}
-          pendingCount={pendingRequests.length}
+          pendingCount={filteredPending.length}
           openSection={openSection}
           selectedSection={selectedSection}
           triggerId={compactTriggerId}
           renderPendingRows={renderPendingRows}
           renderFriendRow={renderFriendRow}
-          setOpenSection={setOpenSection}
+          onToggleSection={toggleSection}
+          onCloseSection={closeSection}
         />
       )}
-      {friends.length === 0 && categoryList.length === 0 && pendingRequests.length === 0 && (
+      {!hasFilterableContent && (
         <div className={`friends-list-empty${compact ? ' friends-list-empty--compact' : ''}`}>
           <UserPlus className="friends-list-empty-icon" size={compact ? 20 : 28} />
           {!compact && <p>Add friends to see them here</p>}
         </div>
       )}
       {!compact &&
-        (friends.length > 0 || categoryList.length > 0 || pendingRequests.length > 0) &&
+        hasFilterableContent &&
         sections.map((section) => {
           if (section.kind === 'pending') {
             const isCollapsed = collapsedCategories.has('pending');
@@ -708,7 +873,7 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick, compact = fals
                 >
                   {isCollapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
                   <span>Pending Requests</span>
-                  <span className="friend-category-count">{pendingRequests.length}</span>
+                  <span className="friend-category-count">{filteredPending.length}</span>
                 </button>
 
                 {!isCollapsed && renderPendingRows()}
@@ -770,6 +935,14 @@ const FriendsList: React.FC<FriendsListProps> = ({ onFriendClick, compact = fals
             </section>
           );
         })}
+
+      {/* The built-in Online/Offline sections always render (they are drop targets), so an
+          unmatched term shows a row of zero counts rather than an empty panel. Say so. */}
+      {!compact && noMatches && (
+        <div className="friends-list-empty">
+          <p>{noMatchMessage}</p>
+        </div>
+      )}
 
       {contextMenu && (
         <ContextMenu position={contextMenu.position} onClose={() => setContextMenu(null)}>

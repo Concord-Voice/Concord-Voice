@@ -1,4 +1,7 @@
 import {
+  LEGACY_COLLAPSED_WIDTH,
+  SIDEBAR_COMPACT_BREAKPOINT,
+  SIDEBAR_MIN_WIDTH,
   migrateLegacySidebarState,
   normalizeSidebarProfiles,
   selectSidebarDock,
@@ -151,12 +154,12 @@ describe('layoutStore', () => {
 
     it('clamps left and right widths to their side-specific bounds', () => {
       useLayoutStore.getState().setSidebarWidth('dm', 'left', 0);
-      expect(useLayoutStore.getState().sidebarProfiles.dm.left.width).toBe(56);
+      expect(useLayoutStore.getState().sidebarProfiles.dm.left.width).toBe(SIDEBAR_MIN_WIDTH);
       useLayoutStore.getState().setSidebarWidth('dm', 'left', 500);
       expect(useLayoutStore.getState().sidebarProfiles.dm.left.width).toBe(400);
 
       useLayoutStore.getState().setSidebarWidth('dm', 'right', 0);
-      expect(useLayoutStore.getState().sidebarProfiles.dm.right.width).toBe(56);
+      expect(useLayoutStore.getState().sidebarProfiles.dm.right.width).toBe(SIDEBAR_MIN_WIDTH);
       useLayoutStore.getState().setSidebarWidth('dm', 'right', 500);
       expect(useLayoutStore.getState().sidebarProfiles.dm.right.width).toBe(340);
     });
@@ -214,6 +217,33 @@ describe('layoutStore', () => {
       expect(useLayoutStore.getState().sidebarProfiles).toEqual({ dm, server });
       expect(useLayoutStore.getState().sidebarLayoutsDecoupled).toBe(false);
     });
+
+    it('clamps a drag below the floor to SIDEBAR_MIN_WIDTH', () => {
+      useLayoutStore.getState().setSidebarWidth('dm', 'left', 10);
+      expect(useLayoutStore.getState().sidebarProfiles.dm.left.width).toBe(SIDEBAR_MIN_WIDTH);
+    });
+
+    // Value pins for the three exported width constants, kept together as one set.
+    //
+    // Every other suite reads them symbolically (`SIDEBAR_COMPACT_BREAKPOINT - 1`,
+    // `.toBe(SIDEBAR_MIN_WIDTH)`, the migration `it.each`), which locks each
+    // boundary's DIRECTION but not its number — without these assertions a
+    // find-replace of any of the three literals passes the entire suite.
+    //
+    // The numbers are not arbitrary. SIDEBAR_COMPACT_BREAKPOINT (135) is derived
+    // from the measured text floors (112px at `--sp 1`, 122px at 1.25) against a
+    // 93/104px header-chrome floor, and it has a cross-version consequence: widths
+    // between the old and new breakpoints now project `expanded` rather than
+    // `collapsed` into the synced encrypted-preferences blob. LEGACY_COLLAPSED_WIDTH
+    // (56) is the pre-migration rail width, deliberately ABOVE the new resize floor
+    // SIDEBAR_MIN_WIDTH (44) so a legacy collapsed panel migrates to the old rail
+    // rather than to the floor. Changing any of these is a deliberate act; update
+    // this pin in the same commit.
+    it('pins the sidebar width constants: floor 44 < legacy rail 56 < compact breakpoint 135', () => {
+      expect(SIDEBAR_MIN_WIDTH).toBe(44);
+      expect(LEGACY_COLLAPSED_WIDTH).toBe(56);
+      expect(SIDEBAR_COMPACT_BREAKPOINT).toBe(135);
+    });
   });
 
   describe('sidebar profile migration', () => {
@@ -244,7 +274,7 @@ describe('layoutStore', () => {
 
     it.each([
       ['expanded', 290, true],
-      ['collapsed', 56, true],
+      ['collapsed', LEGACY_COLLAPSED_WIDTH, true],
       ['hidden', 290, false],
     ] as const)('maps %s legacy right panels to width %i and pinned %s', (mode, width, pinned) => {
       localStorage.setItem('concord:memberPanelWidth', '290');
@@ -332,7 +362,10 @@ describe('layoutStore', () => {
       const state = useLayoutStore.getState();
       expect(state.sidebarProfiles.dm.left).toEqual({ width: 300, pinned: false });
       expect(state.sidebarProfiles.dm.right).toEqual({ width: 260, pinned: false });
-      expect(state.sidebarProfiles.server.right).toEqual({ width: 56, pinned: true });
+      expect(state.sidebarProfiles.server.right).toEqual({
+        width: LEGACY_COLLAPSED_WIDTH,
+        pinned: true,
+      });
       expect(state.sidebarLayoutsDecoupled).toBe(false);
       expect(state.serverBarHeight).toBe(60);
       expect(state.folderBarHeight).toBe(40);
