@@ -33,12 +33,19 @@ const revokeReason = "temp_access_revoked"
 // triggers) so the security-critical cleanup runs through ONE code path
 // (revokeTemporaryChannelAccess), regardless of which trigger fires.
 type tempGrantManager struct {
-	db       *sql.DB
-	log      *logger.Logger
-	hub      *websocket.Hub
-	resolver *rbac.Resolver
-	rotator  *keyrotation.Rotator
-	nats     *natsclient.Client
+	db              *sql.DB
+	log             *logger.Logger
+	hub             *websocket.Hub
+	resolver        *rbac.Resolver
+	rotator         *keyrotation.Rotator
+	nats            *natsclient.Client
+	presenceRecheck rbac.PresenceRecheck
+}
+
+// SetPresenceRecheck wires the #2445 Rich Presence capture. Nil leaves the
+// revoke path at its pre-#2445 behavior.
+func (m *tempGrantManager) SetPresenceRecheck(p rbac.PresenceRecheck) {
+	m.presenceRecheck = p
 }
 
 // newTempGrantManager constructs the manager. The rotator is built from the same
@@ -119,17 +126,16 @@ func (m *tempGrantManager) grantTemporaryChannelAccess(ctx context.Context, serv
 // actorID is the actor attributed to the key_revocations row ("system" for
 // presence/sweep triggers, the moderator's user_id for an explicit revoke).
 func (m *tempGrantManager) revokeTemporaryChannelAccess(ctx context.Context, serverID, channelID, userID, actorID string) error {
-	res, err := m.db.ExecContext(ctx,
-		`DELETE FROM channel_permission_overrides
-		 WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2 AND is_temporary = true`,
-		channelID, userID)
+	plan, removed, err := m.deleteTemporaryGrantWithCapture(ctx, serverID, channelID, userID)
 	if err != nil {
-		return fmt.Errorf("temp revoke delete: %w", err)
+		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	if !removed {
 		// No temporary grant → permanent grant or none at all; do nothing.
+		// Total no-op: no capture is dispatched, no viewer is disconnected.
 		return nil
 	}
+	m.presenceExecute(plan)
 
 	// Purge the departed user's wrapped channel key + any pending key request so they
 	// cannot decrypt traffic after access is revoked.
@@ -176,6 +182,75 @@ func (m *tempGrantManager) revokeTemporaryChannelAccess(ctx context.Context, ser
 	}
 
 	return nil
+}
+
+// deleteTemporaryGrantWithCapture runs the is_temporary DELETE atomically with
+// the pre-mutation Server Voice visibility capture, under the per-server
+// advisory lock, so the captured set is the exact pre-write authorized audience
+// (#2445). Phase 1 runs before BeginTx; phase 2 runs under the lock.
+func (m *tempGrantManager) deleteTemporaryGrantWithCapture(
+	ctx context.Context,
+	serverID, channelID, userID string,
+) (rbac.PresenceRecheckPlan, bool, error) {
+	// PHASE 1 — pre-transaction, outside the advisory lock. The phase-2
+	// visibility-filter input is bounded to the revoked user: only that user's
+	// permission inputs change.
+	var plan rbac.PresenceRecheckPlan
+	if m.presenceRecheck != nil {
+		prepared, prepareErr := m.presenceRecheck.PrepareCapture(
+			ctx, serverID, []string{channelID}, &userID,
+		)
+		if prepareErr != nil {
+			return nil, false, fmt.Errorf("temp revoke prepare capture: %w", prepareErr)
+		}
+		plan = prepared
+	}
+
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("temp revoke begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+		return nil, false, fmt.Errorf("temp revoke lock: %w", err)
+	}
+	// PHASE 2 — under the lock, before the write.
+	if m.presenceRecheck != nil && plan != nil {
+		if visibilityErr := m.presenceRecheck.CaptureVisibility(ctx, tx, plan); visibilityErr != nil {
+			return nil, false, fmt.Errorf("temp revoke capture: %w", visibilityErr)
+		}
+	}
+	res, err := tx.ExecContext(ctx,
+		`DELETE FROM channel_permission_overrides
+		 WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2 AND is_temporary = true`,
+		channelID, userID)
+	if err != nil {
+		return nil, false, fmt.Errorf("temp revoke delete: %w", err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, fmt.Errorf("temp revoke rows affected: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		m.presenceAbandon(plan, "ambiguous_commit")
+		return nil, false, fmt.Errorf("temp revoke commit: %w", err)
+	}
+	return plan, rowsAffected > 0, nil
+}
+
+func (m *tempGrantManager) presenceExecute(plan rbac.PresenceRecheckPlan) {
+	if m.presenceRecheck == nil || plan == nil || !plan.HasWork() {
+		return
+	}
+	m.presenceRecheck.Execute(plan)
+}
+
+func (m *tempGrantManager) presenceAbandon(plan rbac.PresenceRecheckPlan, cause string) {
+	if m.presenceRecheck == nil || plan == nil || !plan.HasWork() {
+		return
+	}
+	m.presenceRecheck.Abandon(plan, cause)
 }
 
 // publishForceDisconnect publishes a voice.enforce.disconnect command so the media

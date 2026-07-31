@@ -40,6 +40,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/updates"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voicepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -248,6 +249,36 @@ type RouterDependencies struct {
 	PresenceHistory  *presencehistory.Service
 }
 
+// requirePresenceRecheckWired fails startup when the #2445 Rich Presence capture
+// executor is missing while the activity service is present.
+//
+// A missing wiring line is the one fail-OPEN path in that design: RBAC mutations
+// would commit with no capture and no clear, silently restoring the disclosure
+// the issue closed. Converting it into a boot failure matches the fail-closed
+// posture, and it cannot misfire where the activity service itself is absent.
+//
+// It interrogates the HANDLER, not the executor value the caller happens to
+// hold. Taking `presenceRecheck rbac.PresenceRecheck` made the guard a
+// tautology: voicepresence.NewExecutor always returns a non-nil *Executor, and
+// boxing a non-nil pointer into an interface always yields a non-nil interface,
+// so the condition was unreachable. Worse, it inspected a local variable rather
+// than handler state — deleting the SetPresenceRecheck call, the exact
+// fail-OPEN path named above, still booted cleanly. Asking the handler whether
+// it was wired is the only formulation that catches that (#2445 review).
+//
+// Extracted from NewRouter rather than inlined: the guard's two-condition check
+// is two points of cognitive complexity in a function already at the go:S3776
+// limit.
+func requirePresenceRecheckWired(
+	log *logger.Logger,
+	activityService *presence.ActivityService,
+	rbacHandler *rbac.Handler,
+) {
+	if activityService != nil && !rbacHandler.HasPresenceRecheck() {
+		log.Fatal("Rich Presence recheck executor is required when the activity service is wired")
+	}
+}
+
 // NewRouter creates a new API router and returns its background runtime dependencies.
 func NewRouter(
 	db *sql.DB,
@@ -257,7 +288,7 @@ func NewRouter(
 	liveSpa *config.LiveSpaConfig,
 	log *logger.Logger,
 	dependencies RouterDependencies,
-) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, error) {
+) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, rbac.PresenceRecheck, error) {
 	metricsReader := dependencies.OpsMetricsReader
 	presenceHistoryService := dependencies.PresenceHistory
 	router := gin.New()
@@ -280,7 +311,7 @@ func NewRouter(
 	// Initialize WebSocket hub
 	hub := websocket.NewHub(db, redis, opsCounters)
 	if err := bindPresenceHistoryRuntime(hub, presenceHistoryService); err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Initialize NATS (inter-service messaging with media plane)
@@ -356,6 +387,16 @@ func NewRouter(
 	voicePermEnforcer := voice.NewPermissionEnforcer(db, log, rbacResolver, natsClient)
 	rbacHandler.SetVoiceEnforcer(voicePermEnforcer)
 
+	// Post-mutation Rich Presence reconciliation (#2445). One shared executor
+	// backs the RBAC handler and the temporary-SBAC revoke path; it owns both
+	// halves — the in-transaction pre-mutation capture and the post-commit
+	// dispatch. It imports rbac and presence; rbac imports neither.
+	presenceRecheckExecutor := voicepresence.NewExecutor(
+		db, activityService, rbacResolver, senderPresence, hub, log,
+	)
+	rbacHandler.SetPresenceRecheck(presenceRecheckExecutor)
+	requirePresenceRecheckWired(log, activityService, rbacHandler)
+
 	// Initialize email service
 	emailSvc := email.NewService(cfg, log)
 
@@ -413,6 +454,12 @@ func NewRouter(
 		EntCache:    entCache,
 		ServerTiers: serverEntCache,
 	})
+	// #2445: the REST RevokeTempAccess path owns its own tempGrantManager, so it
+	// needs the shared executor forwarded explicitly. revokeTemporaryChannelAccess
+	// is one function but three manager instances reach it (this handler, the NATS
+	// subscriber, and the nightly sweep); an unwired owner revokes with no capture
+	// and no clear, which is the disclosure this issue closes.
+	voiceHandler.SetPresenceRecheck(presenceRecheckExecutor)
 	// mfaHandler implements mfa.Verifier — the DM purge step-up gate (#1352).
 	dmHandler := dm.NewHandler(dm.HandlerDeps{
 		DB:          db,
@@ -498,6 +545,10 @@ func NewRouter(
 		// Close the join-vs-mutation race: re-push fresh permissions when a
 		// voice.joined lands (CV-CAN-007 P1).
 		voiceSub.SetPermissionEnforcer(voicePermEnforcer)
+		// Temporary-SBAC revoke shares the one #2445 executor with the RBAC
+		// handler, so a presence-triggered revoke captures the same way an
+		// authority write does.
+		voiceSub.SetPresenceRecheck(presenceRecheckExecutor)
 		if subErr := voiceSub.Subscribe(); subErr != nil {
 			log.Error("Failed to subscribe to voice NATS events", "error", subErr)
 		} else {
@@ -2154,7 +2205,7 @@ func NewRouter(
 	opsRuntime := wireOpsMetricsRuntime(db, natsClient, hub, opsCounters, cfg.OpsMetrics, log)
 	// Start only after every dependency, observer, and route has been injected.
 	go hub.Run()
-	return router, hub, natsClient, opsRuntime, voicePermEnforcer, nil
+	return router, hub, natsClient, opsRuntime, voicePermEnforcer, presenceRecheckExecutor, nil
 }
 
 // healthHandler responds with 200 + control-plane health JSON. Registered

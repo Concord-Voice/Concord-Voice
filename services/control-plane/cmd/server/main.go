@@ -161,12 +161,17 @@ func runControlPlane() (runErr error) {
 	}
 	var opsMetricsRuntime *api.OpsMetricsRuntime
 	var voicePermissionEnforcer *voice.PermissionEnforcer
+	// #2445: the shared Rich Presence capture executor is built inside NewRouter
+	// (it needs the activity service and sender-presence resolver, which live
+	// there). The nightly temp-grant sweep constructs its own tempGrantManager
+	// out here, so the executor is carried out to wire it.
+	var voicePresenceRecheck rbac.PresenceRecheck
 	runtime, startupErr := startActivityHistoryRuntime(activityHistoryRuntimeDependencies{
 		startupContext:      context.Background(),
 		workerContext:       cleanupCtx,
 		reconcileDisclosure: presenceHistoryService.ReconcileStaleDisclosure,
 		bindRouter: func() (*gin.Engine, *websocket.Hub, *natsclient.Client, error) {
-			router, hub, natsClient, metricsRuntime, permissionEnforcer, routerErr := api.NewRouter(
+			router, hub, natsClient, metricsRuntime, permissionEnforcer, presenceRecheck, routerErr := api.NewRouter(
 				db,
 				redisClient,
 				storageClient,
@@ -183,6 +188,7 @@ func runControlPlane() (runErr error) {
 			}
 			opsMetricsRuntime = metricsRuntime
 			voicePermissionEnforcer = permissionEnforcer
+			voicePresenceRecheck = presenceRecheck
 			return router, hub, natsClient, nil
 		},
 		reconcilePending: presenceHistoryService.ReconcilePending,
@@ -224,7 +230,14 @@ func runControlPlane() (runErr error) {
 	// channel but whose override survived a missed trigger (e.g., a restart between
 	// leave and revoke). Its resolver shares the same Redis-backed permission cache.
 	sweepResolver := rbac.NewResolver(db, rbac.NewPermissionCache(redisClient), log)
-	voice.StartTempGrantSweepWorker(cleanupCtx, db, log, hub, sweepResolver, natsClient, voice.DefaultTempGrantSweepInterval)
+	voice.StartTempGrantSweepWorker(cleanupCtx, voice.TempGrantSweepDeps{
+		DB:              db,
+		Log:             log,
+		Hub:             hub,
+		Resolver:        sweepResolver,
+		NATS:            natsClient,
+		PresenceRecheck: voicePresenceRecheck,
+	}, voice.DefaultTempGrantSweepInterval)
 
 	// Start the subscription-expiry sweeper (#2158). Fixed-duration code grants
 	// lapse purely by the clock; without this the passive expiry never fires

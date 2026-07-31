@@ -46,6 +46,17 @@ func NewTempGrantSweeper(db *sql.DB, log *logger.Logger, hub *websocket.Hub, res
 	}
 }
 
+// SetPresenceRecheck forwards the #2445 Rich Presence capture to the sweeper's
+// tempGrantManager. Without it the nightly orphan sweep — a temporary-SBAC
+// revocation path like any other — would revoke with no capture and no clear.
+// Nil leaves the sweep at its pre-#2445 behavior.
+func (s *TempGrantSweeper) SetPresenceRecheck(p rbac.PresenceRecheck) {
+	if s.mgr == nil {
+		return
+	}
+	s.mgr.SetPresenceRecheck(p)
+}
+
 // sweepOrphanedTempGrants finds every is_temporary='user' override whose target has
 // no live voice_participants row in that channel and revokes each through the single
 // cleanup convergence point. Returns the count of orphans revoked. actorID is ""
@@ -107,20 +118,37 @@ func (s *TempGrantSweeper) selectOrphanedTempGrants(ctx context.Context) ([]orph
 	return orphans, nil
 }
 
+// TempGrantSweepDeps carries the sweep worker's collaborators.
+//
+// PresenceRecheck is the shared #2445 executor built in api.NewRouter. It is
+// passed rather than reconstructed because the executor needs the activity
+// service and sender-presence resolver, neither of which exists at the worker's
+// call site. A nil value leaves the sweep at its pre-#2445 no-capture behavior.
+type TempGrantSweepDeps struct {
+	DB              *sql.DB
+	Log             *logger.Logger
+	Hub             *websocket.Hub
+	Resolver        *rbac.Resolver
+	NATS            *natsclient.Client
+	PresenceRecheck rbac.PresenceRecheck
+}
+
 // StartTempGrantSweepWorker launches a goroutine that runs the orphan sweep on a
 // fixed interval (default 24h), plus once at startup. It stops cleanly when ctx is
 // cancelled. Mirrors auth.StartPendingCleanupWorker (the established background-job
 // pattern). Safe no-op constructed at call sites; failures are logged, never fatal.
+//
+// deps bundles the sweeper's collaborators; they are exactly the arguments
+// NewTempGrantSweeper takes plus the recheck, so the worker entry point stays a
+// thin lifecycle wrapper rather than a widening parameter list.
 func StartTempGrantSweepWorker(
 	ctx context.Context,
-	db *sql.DB,
-	log *logger.Logger,
-	hub *websocket.Hub,
-	resolver *rbac.Resolver,
-	nats *natsclient.Client,
+	deps TempGrantSweepDeps,
 	interval time.Duration,
 ) {
-	sweeper := NewTempGrantSweeper(db, log, hub, resolver, nats)
+	sweeper := NewTempGrantSweeper(deps.DB, deps.Log, deps.Hub, deps.Resolver, deps.NATS)
+	sweeper.SetPresenceRecheck(deps.PresenceRecheck)
+	log := deps.Log
 	ticker := time.NewTicker(interval)
 	go func() {
 		defer ticker.Stop()

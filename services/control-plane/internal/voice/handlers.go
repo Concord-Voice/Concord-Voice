@@ -70,6 +70,19 @@ func NewHandler(deps HandlerDeps) *Handler {
 	}
 }
 
+// SetPresenceRecheck forwards the #2445 Rich Presence capture to this handler's
+// tempGrantManager, so a REST-triggered temporary-SBAC revoke captures its
+// pre-mutation Server Voice audience under the same per-server advisory lock the
+// RBAC authority writes use. newTempGrantManager is called at three sites and
+// each owns an independent manager, so every owner must forward the executor or
+// its revoke path silently keeps the pre-#2445 no-capture behavior.
+func (h *Handler) SetPresenceRecheck(p rbac.PresenceRecheck) {
+	if h.tempGrant == nil {
+		return
+	}
+	h.tempGrant.SetPresenceRecheck(p)
+}
+
 func (h *Handler) serverTier(ctx context.Context, serverID string) string {
 	if h.serverTiers != nil {
 		return h.serverTiers.GetServerTier(ctx, serverID)

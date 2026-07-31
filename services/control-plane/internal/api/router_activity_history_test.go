@@ -37,12 +37,12 @@ func TestNewRouterRequiresOneUnboundActivityHistoryService(t *testing.T) {
 	cfg := &config.Config{Environment: "test"}
 	log := logger.NewWithWriter(io.Discard)
 
-	_, _, _, _, _, err := api.NewRouter(nil, nil, nil, cfg, nil, log, api.RouterDependencies{})
+	_, _, _, _, _, _, err := api.NewRouter(nil, nil, nil, cfg, nil, log, api.RouterDependencies{})
 	require.Error(t, err)
 
 	service := presencehistory.NewService(nil, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(preboundActivityHistoryDelivery{}))
-	_, _, _, _, _, err = api.NewRouter(
+	_, _, _, _, _, _, err = api.NewRouter(
 		nil,
 		nil,
 		nil,
@@ -67,7 +67,8 @@ func TestNewRouterActivityHistoryWiringOrderIsSingleAndFinal(t *testing.T) {
 		"presenceHistoryHandler.RegisterRoutes(",
 		"opsRuntime := wireOpsMetricsRuntime(",
 		"go hub.Run()",
-		"return router, hub, natsClient, opsRuntime, voicePermEnforcer, nil",
+		// #2445 added a 7th return value (the shared presence-recheck executor).
+		"return router, hub, natsClient, opsRuntime, voicePermEnforcer, presenceRecheckExecutor, nil",
 	}
 	prior := -1
 	for _, needle := range needles {

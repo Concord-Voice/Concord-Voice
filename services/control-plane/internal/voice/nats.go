@@ -3230,6 +3230,17 @@ func (s *NATSSubscriber) SetPermissionEnforcer(e *PermissionEnforcer) {
 	s.permEnforcer = e
 }
 
+// SetPresenceRecheck forwards the #2445 Rich Presence capture to the shared
+// tempGrantManager, so a voice.left / heartbeat-triggered temporary-SBAC revoke
+// captures its pre-mutation Server Voice audience under the same per-server
+// advisory lock the RBAC authority writes use.
+func (s *NATSSubscriber) SetPresenceRecheck(p rbac.PresenceRecheck) {
+	if s.tempGrant == nil {
+		return
+	}
+	s.tempGrant.SetPresenceRecheck(p)
+}
+
 // NewNATSSubscriber creates a new NATS subscriber for voice events. The resolver is
 // required so the subscriber can drive temporary-SBAC cleanup (#487 P1) on
 // voice.left / heartbeat stale-removal through the shared tempGrantManager.

@@ -184,7 +184,9 @@ func TestStartTempGrantSweepWorker_StartupAndTick(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	// Short interval so the periodic tick fires quickly in-test (nil NATS is fine —
 	// publishForceDisconnect is a no-op without it).
-	voice.StartTempGrantSweepWorker(ctx, ts.DB, log, ts.Hub, resolver, nil, 50*time.Millisecond)
+	voice.StartTempGrantSweepWorker(ctx, voice.TempGrantSweepDeps{
+		DB: ts.DB, Log: log, Hub: ts.Hub, Resolver: resolver,
+	}, 50*time.Millisecond)
 
 	// (1) Startup sweep revokes orphan A.
 	require.Eventually(t, func() bool {

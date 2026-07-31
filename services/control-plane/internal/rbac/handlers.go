@@ -3,6 +3,7 @@ package rbac
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -60,6 +61,11 @@ type Handler struct {
 	// after a mutation (CV-CAN-007 review P1). Wired via SetVoiceEnforcer;
 	// nil (dev/test default) means no push — join-snapshot behavior.
 	voiceEnforcer VoiceEnforcer
+	// presenceRecheck reconciles active Server Voice Rich Presence with the
+	// pre-mutation authorized audience captured inside the authority
+	// transaction (#2445). Wired via SetPresenceRecheck; nil (dev/test default)
+	// means no capture and no clear.
+	presenceRecheck PresenceRecheck
 }
 
 // NewHandler creates a new RBAC handler
@@ -318,12 +324,19 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 		", updated_at = NOW() WHERE id = $1 AND server_id = $2 RETURNING id, server_id, name, color, emoji, position, permissions, is_default, is_managed, mentionable, display_separately, created_at, updated_at"
 
 	var role Role
-	err = h.db.QueryRow(query, args...).Scan(
-		&role.ID, &role.ServerID, &role.Name, &role.Color, &role.Emoji,
-		&role.Position, &role.Permissions, &role.IsDefault, &role.IsManaged,
-		&role.Mentionable, &role.DisplaySeparately, &role.CreatedAt, &role.UpdatedAt,
+	// nil channelIDs = server scope: every voice channel with active senders.
+	// nil onlyUserID = the full candidate set (a role edit can change any
+	// member's visibility).
+	plan, err := h.withAuthorityCapture(c.Request.Context(), serverID, nil, nil,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return tx.QueryRowContext(ctx, query, args...).Scan(
+				&role.ID, &role.ServerID, &role.Name, &role.Color, &role.Emoji,
+				&role.Position, &role.Permissions, &role.IsDefault, &role.IsManaged,
+				&role.Mentionable, &role.DisplaySeparately, &role.CreatedAt, &role.UpdatedAt,
+			)
+		},
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
 		return
 	}
@@ -335,6 +348,7 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 
 	_ = h.cache.InvalidateServer(c.Request.Context(), serverID)
 	h.recheckVoiceServer(serverID)
+	h.presenceExecute(plan)
 	h.revalidateServerSubscribers(serverID)
 	h.auditRoleUpdate(c, serverID, userID, roleID, req)
 	h.broadcastRoleUpdated(serverID, roleID, role)
@@ -492,6 +506,86 @@ func (h *Handler) broadcastRoleUpdated(serverID, roleID string, role Role) {
 	})
 }
 
+// execRequiringRow runs an authority write and reports sql.ErrNoRows when the
+// statement matched no rows, so the caller can tell "not found" apart from a
+// transaction failure.
+func execRequiringRow(ctx context.Context, tx *sql.Tx, query string, args ...interface{}) error {
+	result, execErr := tx.ExecContext(ctx, query, args...)
+	if execErr != nil {
+		return execErr
+	}
+	rowsAffected, affectedErr := result.RowsAffected()
+	if affectedErr != nil {
+		return affectedErr
+	}
+	if rowsAffected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// authorizeRoleHierarchy enforces the actor's role-hierarchy bound: the actor may
+// only act on roles below their own highest role position. Server owners bypass
+// it. forbiddenMsg is the 403 body and failureMsg the 500 body for the calling
+// handler. Returns false once a response has been written.
+func (h *Handler) authorizeRoleHierarchy(
+	c *gin.Context, serverID, actorID string, rolePosition int, forbiddenMsg, failureMsg string,
+) bool {
+	var actorMaxPosition int
+	if err := h.db.QueryRow(
+		`SELECT COALESCE(MAX(r.position), 0) FROM member_roles mr INNER JOIN roles r ON mr.role_id = r.id WHERE mr.server_id = $1 AND mr.user_id = $2`,
+		serverID, actorID,
+	).Scan(&actorMaxPosition); err != nil {
+		h.log.Error(errMsgFailedGetActorPosition, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failureMsg})
+		return false
+	}
+
+	var ownerID string
+	if err := h.db.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
+		h.log.Error(errMsgFailedGetServerOwner, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failureMsg})
+		return false
+	}
+
+	if ownerID != actorID && rolePosition >= actorMaxPosition {
+		c.JSON(http.StatusForbidden, gin.H{"error": forbiddenMsg})
+		return false
+	}
+	return true
+}
+
+// loadDeletableRole loads the role's hierarchy position after rejecting managed
+// and default roles, which cannot be deleted. Returns false once a response has
+// been written.
+func (h *Handler) loadDeletableRole(c *gin.Context, roleID, serverID string) (int, bool) {
+	var isManaged, isDefault bool
+	var rolePosition int
+	err := h.db.QueryRow(
+		`SELECT is_managed, is_default, position FROM roles WHERE id = $1 AND server_id = $2`,
+		roleID, serverID,
+	).Scan(&isManaged, &isDefault, &rolePosition)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
+		return 0, false
+	}
+	if err != nil {
+		h.log.Error(errMsgFailedQueryRole, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteRole})
+		return 0, false
+	}
+
+	if isManaged {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot delete managed roles"})
+		return 0, false
+	}
+	if isDefault {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot delete default roles"})
+		return 0, false
+	}
+	return rolePosition, true
+}
+
 // DeleteRole deletes a role from a server
 func (h *Handler) DeleteRole(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -508,69 +602,39 @@ func (h *Handler) DeleteRole(c *gin.Context) {
 	}
 
 	// Check if role is managed or default (cannot be deleted) and get position for hierarchy check
-	var isManaged, isDefault bool
-	var rolePosition int
-	err := h.db.QueryRow(
-		`SELECT is_managed, is_default, position FROM roles WHERE id = $1 AND server_id = $2`,
-		roleID, serverID,
-	).Scan(&isManaged, &isDefault, &rolePosition)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
-		return
-	}
-	if err != nil {
-		h.log.Error(errMsgFailedQueryRole, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteRole})
-		return
-	}
-
-	if isManaged {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot delete managed roles"})
-		return
-	}
-	if isDefault {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot delete default roles"})
+	rolePosition, ok := h.loadDeletableRole(c, roleID, serverID)
+	if !ok {
 		return
 	}
 
 	// Hierarchy check: actor can only delete roles below their highest role position
-	var actorMaxPosition int
-	if err := h.db.QueryRow(
-		`SELECT COALESCE(MAX(r.position), 0) FROM member_roles mr INNER JOIN roles r ON mr.role_id = r.id WHERE mr.server_id = $1 AND mr.user_id = $2`,
-		serverID, userID,
-	).Scan(&actorMaxPosition); err != nil {
-		h.log.Error(errMsgFailedGetActorPosition, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteRole})
-		return
-	}
-	var ownerID string
-	if err := h.db.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
-		h.log.Error(errMsgFailedGetServerOwner, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteRole})
-		return
-	}
-	if ownerID != userID && rolePosition >= actorMaxPosition {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot delete a role at or above your own position"})
+	if !h.authorizeRoleHierarchy(c, serverID, userID, rolePosition,
+		"Cannot delete a role at or above your own position", errMsgFailedDeleteRole) {
 		return
 	}
 
 	// Delete role (CASCADE will remove member_roles entries)
-	result, err := h.db.Exec(`DELETE FROM roles WHERE id = $1 AND server_id = $2`, roleID, serverID)
+	// nil channelIDs = server scope; nil onlyUserID = the full candidate set.
+	plan, err := h.withAuthorityCapture(c.Request.Context(), serverID, nil, nil,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return execRequiringRow(ctx, tx,
+				`DELETE FROM roles WHERE id = $1 AND server_id = $2`, roleID, serverID)
+		},
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
+		return
+	}
 	if err != nil {
 		h.log.Error("Failed to delete role", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteRole})
 		return
 	}
 
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
-		return
-	}
-
 	// Invalidate cache
 	_ = h.cache.InvalidateServer(c.Request.Context(), serverID)
 	h.recheckVoiceServer(serverID)
+	h.presenceExecute(plan)
 	h.revalidateServerSubscribers(serverID)
 
 	// Audit log
@@ -799,11 +863,19 @@ func (h *Handler) AssignRole(c *gin.Context) {
 	}
 
 	// Assign role
-	_, err = h.db.Exec(
-		`INSERT INTO member_roles (server_id, user_id, role_id, assigned_by)
-		 VALUES ($1, $2, $3, $4)
-		 ON CONFLICT (server_id, user_id, role_id) DO NOTHING`,
-		serverID, targetUserID, req.RoleID, actorID,
+	// nil channelIDs = server scope; the phase-2 visibility-filter input is
+	// bounded to the one affected user, because only that user's permission
+	// inputs changed. Candidate SETS are never pruned by mutation shape.
+	plan, err := h.withAuthorityCapture(c.Request.Context(), serverID, nil, &targetUserID,
+		func(ctx context.Context, tx *sql.Tx) error {
+			_, execErr := tx.ExecContext(ctx,
+				`INSERT INTO member_roles (server_id, user_id, role_id, assigned_by)
+				 VALUES ($1, $2, $3, $4)
+				 ON CONFLICT (server_id, user_id, role_id) DO NOTHING`,
+				serverID, targetUserID, req.RoleID, actorID,
+			)
+			return execErr
+		},
 	)
 	if err != nil {
 		h.log.Error("Failed to assign role", "error", err)
@@ -814,6 +886,7 @@ func (h *Handler) AssignRole(c *gin.Context) {
 	// Invalidate cache
 	_ = h.cache.Invalidate(c.Request.Context(), serverID, targetUserID)
 	h.recheckVoiceUser(serverID, targetUserID)
+	h.presenceExecute(plan)
 	h.revalidateServerSubscribers(serverID)
 
 	// Audit log
@@ -834,6 +907,29 @@ func (h *Handler) AssignRole(c *gin.Context) {
 	})
 
 	c.JSON(http.StatusOK, gin.H{"message": "Role assigned"})
+}
+
+// loadUnassignableRole loads the role's hierarchy position after rejecting
+// default roles, which cannot be unassigned. Returns false once a response has
+// been written.
+func (h *Handler) loadUnassignableRole(c *gin.Context, roleID, serverID string) (int, bool) {
+	var isDefault bool
+	var rolePosition int
+	err := h.db.QueryRow(`SELECT is_default, position FROM roles WHERE id = $1 AND server_id = $2`, roleID, serverID).Scan(&isDefault, &rolePosition)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
+		return 0, false
+	}
+	if err != nil {
+		h.log.Error(errMsgFailedQueryRole, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnassignRole})
+		return 0, false
+	}
+	if isDefault {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot unassign default roles"})
+		return 0, false
+	}
+	return rolePosition, true
 }
 
 // UnassignRole removes a role from a member
@@ -857,66 +953,42 @@ func (h *Handler) UnassignRole(c *gin.Context) {
 	}
 
 	// Cannot unassign default roles
-	var isDefault bool
-	var rolePosition int
-	err := h.db.QueryRow(`SELECT is_default, position FROM roles WHERE id = $1 AND server_id = $2`, roleID, serverID).Scan(&isDefault, &rolePosition)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
-		return
-	}
-	if err != nil {
-		h.log.Error(errMsgFailedQueryRole, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnassignRole})
-		return
-	}
-	if isDefault {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot unassign default roles"})
+	rolePosition, ok := h.loadUnassignableRole(c, roleID, serverID)
+	if !ok {
 		return
 	}
 
 	// Hierarchy check: actor can only unassign roles with lower position than their highest role
-	var actorMaxPosition int
-	if err := h.db.QueryRow(
-		`SELECT COALESCE(MAX(r.position), 0) FROM member_roles mr INNER JOIN roles r ON mr.role_id = r.id WHERE mr.server_id = $1 AND mr.user_id = $2`,
-		serverID, actorID,
-	).Scan(&actorMaxPosition); err != nil {
-		h.log.Error(errMsgFailedGetActorPosition, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnassignRole})
-		return
-	}
-
-	var ownerID string
-	if err := h.db.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
-		h.log.Error(errMsgFailedGetServerOwner, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnassignRole})
-		return
-	}
-
-	if ownerID != actorID && rolePosition >= actorMaxPosition {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot unassign a role with equal or higher position than your own"})
+	if !h.authorizeRoleHierarchy(c, serverID, actorID, rolePosition,
+		"Cannot unassign a role with equal or higher position than your own", errMsgFailedUnassignRole) {
 		return
 	}
 
 	// Remove role assignment
-	result, err := h.db.Exec(
-		`DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3`,
-		serverID, targetUserID, roleID,
+	// nil channelIDs = server scope; the phase-2 visibility-filter input is
+	// bounded to the one affected user.
+	plan, err := h.withAuthorityCapture(c.Request.Context(), serverID, nil, &targetUserID,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return execRequiringRow(ctx, tx,
+				`DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3`,
+				serverID, targetUserID, roleID,
+			)
+		},
 	)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Role assignment not found"})
+		return
+	}
 	if err != nil {
 		h.log.Error("Failed to unassign role", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnassignRole})
 		return
 	}
 
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Role assignment not found"})
-		return
-	}
-
 	// Invalidate cache
 	_ = h.cache.Invalidate(c.Request.Context(), serverID, targetUserID)
 	h.recheckVoiceUser(serverID, targetUserID)
+	h.presenceExecute(plan)
 	h.revalidateServerSubscribers(serverID)
 
 	// Audit log
@@ -1161,8 +1233,15 @@ func (h *Handler) UpsertChannelOverride(c *gin.Context) {
 	override.Deny = req.Deny
 
 	var isInsert bool
-	err = h.db.QueryRow(query, overrideID, channelID, req.TargetType, req.TargetID, req.Allow, req.Deny).
-		Scan(&override.ID, &override.CreatedAt, &override.UpdatedAt, &isInsert)
+	// Channel scope: only this channel's overrides changed. nil onlyUserID =
+	// the full candidate set (an override can change any member's visibility).
+	plan, err := h.withAuthorityCapture(c.Request.Context(), serverID, []string{channelID}, nil,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return tx.QueryRowContext(ctx, query,
+				overrideID, channelID, req.TargetType, req.TargetID, req.Allow, req.Deny,
+			).Scan(&override.ID, &override.CreatedAt, &override.UpdatedAt, &isInsert)
+		},
+	)
 	if err != nil {
 		h.log.Error("Failed to upsert override", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSaveOverride})
@@ -1172,6 +1251,7 @@ func (h *Handler) UpsertChannelOverride(c *gin.Context) {
 	// Invalidate cache for affected channel
 	_ = h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID)
 	h.recheckVoiceChannel(serverID, channelID)
+	h.presenceExecute(plan)
 	h.revalidateChannelSubscribers(serverID, channelID)
 
 	// Audit log — xmax=0 means INSERT (new row), otherwise UPDATE (conflict)
@@ -1233,25 +1313,40 @@ func (h *Handler) DeleteChannelOverride(c *gin.Context) {
 	}
 
 	// Delete override
-	result, err := h.db.Exec(
-		`DELETE FROM channel_permission_overrides WHERE id = $1 AND channel_id = $2`,
-		overrideID, channelID,
+	// Channel scope; nil onlyUserID = the full candidate set.
+	plan, err := h.withAuthorityCapture(c.Request.Context(), serverID, []string{channelID}, nil,
+		func(ctx context.Context, tx *sql.Tx) error {
+			result, execErr := tx.ExecContext(ctx,
+				`DELETE FROM channel_permission_overrides WHERE id = $1 AND channel_id = $2`,
+				overrideID, channelID,
+			)
+			if execErr != nil {
+				return execErr
+			}
+			rowsAffected, affectedErr := result.RowsAffected()
+			if affectedErr != nil {
+				return affectedErr
+			}
+			if rowsAffected == 0 {
+				return sql.ErrNoRows
+			}
+			return nil
+		},
 	)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Override not found"})
+		return
+	}
 	if err != nil {
 		h.log.Error("Failed to delete override", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteOverride})
 		return
 	}
 
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Override not found"})
-		return
-	}
-
 	// Invalidate cache
 	_ = h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID)
 	h.recheckVoiceChannel(serverID, channelID)
+	h.presenceExecute(plan)
 	h.revalidateChannelSubscribers(serverID, channelID)
 
 	// Audit log
@@ -1560,24 +1655,16 @@ func (h *Handler) DeleteCategoryOverride(c *gin.Context) {
 		return
 	}
 
-	// Delete the category override
-	_, err = h.db.Exec(
-		`DELETE FROM category_permission_overrides WHERE id = $1 AND category_id = $2`,
-		overrideID, categoryID,
-	)
-	if err != nil {
+	// Delete the override and its mirrored child rows under one capture.
+	// The error body is byte-identical to the query path above — a #1794
+	// disclosure invariant, not a style choice.
+	if err := h.deleteCategoryOverrideWithCapture(
+		c.Request.Context(), serverID, categoryID, overrideID, targetType, targetID,
+	); err != nil {
 		h.log.Error("Failed to delete category override", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteOverride})
 		return
 	}
-
-	// Cascade delete from synced child channels
-	_, _ = h.db.Exec(
-		`DELETE FROM channel_permission_overrides
-		 WHERE channel_id IN (SELECT id FROM channels WHERE group_id = $1 AND sync_permissions = TRUE)
-		   AND target_type = $2 AND target_id = $3`,
-		categoryID, targetType, targetID,
-	)
 
 	// Invalidate cache
 	h.invalidateSyncedChannelCaches(c.Request.Context(), serverID, categoryID)
@@ -1643,6 +1730,11 @@ func (h *Handler) SetChannelPermissionSync(c *gin.Context) {
 		return
 	}
 
+	// NOT hooked for #2445 presence capture: this write is visibility-INERT.
+	// filterVisibleUserIDsForChannel reads neither sync_permissions nor
+	// category_permission_overrides, so flipping the flag alone changes no
+	// viewer set. The visibility-changing work is copyCategoryOverridesToChannel
+	// below, which carries its own lock + capture.
 	if _, err = h.db.Exec(`UPDATE channels SET sync_permissions = $1 WHERE id = $2`, req.SyncPermissions, channelID); err != nil {
 		h.log.Error("Failed to update sync flag", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateSync})
@@ -1650,7 +1742,7 @@ func (h *Handler) SetChannelPermissionSync(c *gin.Context) {
 	}
 
 	if req.SyncPermissions && groupID != nil {
-		if err := h.copyCategoryOverridesToChannel(c.Request.Context(), channelID, *groupID); err != nil {
+		if err := h.copyCategoryOverridesToChannel(c.Request.Context(), serverID, channelID, *groupID); err != nil {
 			h.log.Error("Failed to sync category overrides to channel", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateSync})
 			return
@@ -1676,12 +1768,108 @@ func (h *Handler) getChannelSyncInfo(channelID string) (string, *string, error) 
 	return serverID, groupID, err
 }
 
-func (h *Handler) copyCategoryOverridesToChannel(ctx context.Context, channelID, categoryID string) error {
+// copyCategoryOverridesToChannel replaces one channel's overrides with its
+// category's. It is reached from SetChannelPermissionSync, NOT from the
+// category-override cascade. Phase 1 runs before BeginTx; the advisory lock and
+// phase 2 are the transaction's first statements (#2445).
+// deleteCategoryOverrideWithCapture removes a category override and the rows it
+// mirrored onto every synced child channel, binding a pre-mutation Server Voice
+// Rich Presence capture to the write (#2445).
+//
+// The cascade DELETE is a visibility-changing write:
+// filterVisibleUserIDsForChannel reads channel_permission_overrides for both
+// role and user targets, so removing an allow-override strictly narrows the
+// viewer set on every synced child. It was unhooked and its error discarded
+// (`_, _ = h.db.Exec`), so a viewer whose only sight of an occupied voice
+// channel came from the category-synced allow kept the sender's live "in Server
+// Voice" state until the ≤90 s ActivityStateTTL expired. The #2445 review's
+// adversarial pass proved that with a proof-of-concept whose control arm — the
+// identical narrowing routed through the already-hooked DeleteChannelOverride —
+// did capture the victim, so the silence was a real gap and not a dead fixture.
+//
+// Both deletes now share one transaction, so the parent row and its mirrored
+// children can no longer diverge: previously a failed cascade left the parent
+// deleted, the children stale, and the API answering 200.
+//
+// Unlike syncCategoryOverridesToChannels, nothing has committed when phase 1
+// runs here, so a capture failure legitimately blocks the write per design §8
+// row 1 — rollback, nothing changed, nothing disclosed, retryable.
+func (h *Handler) deleteCategoryOverrideWithCapture(
+	ctx context.Context,
+	serverID, categoryID, overrideID, targetType, targetID string,
+) error {
+	// Capture scope is the voice subset; the cascade DELETE still targets every
+	// synced child via its own subquery.
+	_, voiceChannelIDs, err := h.syncedChannelsForCategory(ctx, categoryID)
+	if err != nil {
+		return fmt.Errorf("enumerate synced channels: %w", err)
+	}
+
+	// PHASE 1 — pre-transaction, outside the advisory lock.
+	plan, err := h.preparePresenceCapture(ctx, serverID, voiceChannelIDs, nil)
+	if err != nil {
+		return fmt.Errorf("prepare category override presence capture: %w", err)
+	}
+
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback() //nolint:errcheck
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+		return err
+	}
+	// PHASE 2 — under the lock, before the writes.
+	if err := h.capturePresenceVisibility(ctx, tx, plan); err != nil {
+		return fmt.Errorf("capture category override presence audience: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM category_permission_overrides WHERE id = $1 AND category_id = $2`,
+		overrideID, categoryID,
+	); err != nil {
+		return fmt.Errorf("delete category override: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM channel_permission_overrides
+		WHERE channel_id IN (SELECT id FROM channels WHERE group_id = $1 AND sync_permissions = TRUE)
+		  AND target_type = $2 AND target_id = $3
+	`, categoryID, targetType, targetID); err != nil {
+		return fmt.Errorf("cascade delete synced channel overrides: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.presenceAbandon(plan, "ambiguous_commit")
+		return err
+	}
+	h.presenceExecute(plan)
+	return nil
+}
+
+func (h *Handler) copyCategoryOverridesToChannel(
+	ctx context.Context,
+	serverID, channelID, categoryID string,
+) error {
+	// PHASE 1 — pre-transaction, outside the advisory lock.
+	plan, err := h.preparePresenceCapture(ctx, serverID, []string{channelID}, nil)
+	if err != nil {
+		return fmt.Errorf("prepare channel presence capture: %w", err)
+	}
+
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+		return err
+	}
+	// PHASE 2 — under the lock, before the write.
+	if err := h.capturePresenceVisibility(ctx, tx, plan); err != nil {
+		return fmt.Errorf("capture channel presence audience: %w", err)
+	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM channel_permission_overrides WHERE channel_id = $1`, channelID); err != nil {
 		return fmt.Errorf("delete existing overrides: %w", err)
@@ -1696,31 +1884,100 @@ func (h *Handler) copyCategoryOverridesToChannel(ctx context.Context, channelID,
 		return fmt.Errorf("copy category overrides: %w", err)
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		h.presenceAbandon(plan, "ambiguous_commit")
+		return err
+	}
+	h.presenceExecute(plan)
+	return nil
 }
 
-// syncCategoryOverridesToChannels copies all category overrides to synced child channels
-func (h *Handler) syncCategoryOverridesToChannels(ctx context.Context, _, categoryID string) {
-	// Get all synced channels in this category
-	rows, err := h.db.QueryContext(ctx, `SELECT id FROM channels WHERE group_id = $1 AND sync_permissions = TRUE`, categoryID)
+// syncedChannelsForCategory returns every sync_permissions child of a category
+// and, separately, the voice subset. Callers rewrite overrides on all of them
+// but capture Rich Presence on only the voice ones.
+//
+// Errors propagate. The previous inline loop dropped per-row Scan errors and
+// never checked rows.Err(), so a mid-iteration failure yielded a silently
+// truncated list — the dropped channels kept their stale, more-permissive
+// overrides while the caller reported success, defeating the "all channels
+// update or none do" property the transaction below exists to provide.
+func (h *Handler) syncedChannelsForCategory(
+	ctx context.Context,
+	categoryID string,
+) (all []string, voice []string, err error) {
+	rows, err := h.db.QueryContext(ctx, `
+		SELECT id, type = 'voice' FROM channels
+		WHERE group_id = $1 AND sync_permissions = TRUE
+	`, categoryID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("query synced channels: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // read-only scan; Err() is checked below
+
+	for rows.Next() {
+		var (
+			chID    string
+			isVoice bool
+		)
+		if scanErr := rows.Scan(&chID, &isVoice); scanErr != nil {
+			return nil, nil, fmt.Errorf("scan synced channel: %w", scanErr)
+		}
+		all = append(all, chID)
+		if isVoice {
+			voice = append(voice, chID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate synced channels: %w", err)
+	}
+	return all, voice, nil
+}
+
+// syncCategoryOverridesToChannels copies all category overrides to synced child
+// channels. The hook captures exactly the synced-channel list it rewrites, so
+// all N channel deltas are atomic with all N writes under one commit (#2445).
+// Phase 1 runs before BeginTx so the cascade's O(#senders) candidate resolution
+// never holds the advisory lock.
+func (h *Handler) syncCategoryOverridesToChannels(ctx context.Context, serverID, categoryID string) {
+	// Two lists, deliberately. The WRITE loop below must touch every synced
+	// child channel; the presence capture only has work on voice channels
+	// (Executor.activeSenders filters c.type = 'voice'). Feeding the unfiltered
+	// list to the capture made text channels consume presenceCaptureMaxChannels,
+	// so a category of 65 synced text channels — zero presence work — tripped
+	// the voice fan-out bound (#2445 review).
+	channelIDs, voiceChannelIDs, err := h.syncedChannelsForCategory(ctx, categoryID)
 	if err != nil {
 		h.log.Error("Failed to query synced channels", "error", err)
 		return
 	}
-	defer rows.Close() //nolint:errcheck
-
-	var channelIDs []string
-	for rows.Next() {
-		var chID string
-		if err := rows.Scan(&chID); err == nil {
-			channelIDs = append(channelIDs, chID)
-		}
-	}
-	// Explicitly close rows before starting a new transaction to avoid holding the connection
-	_ = rows.Close() //nolint:errcheck
 
 	if len(channelIDs) == 0 {
 		return
+	}
+
+	// PHASE 1 — pre-transaction, outside the advisory lock.
+	//
+	// A capture failure must NEVER veto the permission write. This function is
+	// called after UpsertCategoryOverride/DeleteCategoryOverride already
+	// committed the parent category_permission_overrides row, and the child
+	// channel_permission_overrides rows ARE the enforcement — the visibility
+	// resolver never reads the category table. Returning here left the parent
+	// persisted and every child stale while the API answered 200, so tightening
+	// a category override silently no-opped while loosening one still worked:
+	// the wrong direction to fail, and a regression this PR introduced (the
+	// pre-#2445 function had no capture-shaped abort).
+	//
+	// So degrade instead: drop the plan, keep the writes. Presence then falls
+	// back to the ≤90 s ActivityStateTTL, which is exactly the pre-#2445
+	// baseline for this path — never worse than before — while access control
+	// stays correct. Diverges from design §8 row 1 ("pre-tx resolution errors
+	// block the write") deliberately: row 1 governs the six authority handlers,
+	// whose write has not happened yet. Here it has.
+	plan, err := h.preparePresenceCapture(ctx, serverID, voiceChannelIDs, nil)
+	if err != nil {
+		h.log.Error("Cascade presence capture unavailable; applying overrides without it",
+			"failure_class", "cascade_capture_unavailable", "error", err)
+		plan = nil
 	}
 
 	// Wrap in transaction for atomicity — all channels update or none do
@@ -1729,7 +1986,23 @@ func (h *Handler) syncCategoryOverridesToChannels(ctx context.Context, _, catego
 		h.log.Error("Failed to begin sync transaction", "error", err)
 		return
 	}
-	defer tx.Rollback() //nolint:errcheck
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+		h.log.Error("Failed to lock sync transaction", "error", err)
+		return
+	}
+	// PHASE 2 — under the lock, before the writes. One query per channel.
+	// Same rule as phase 1: the capture does not get to block the write. A
+	// partially-populated plan is fail-closed via Abandon (disconnect what was
+	// captured — a disconnect discloses nothing) rather than executed, since a
+	// partial plan would otherwise produce a partial clear.
+	if err := h.capturePresenceVisibility(ctx, tx, plan); err != nil {
+		h.log.Error("Cascade presence capture failed; applying overrides without it",
+			"failure_class", "cascade_capture_failed", "error", err)
+		h.presenceAbandon(plan, "cascade_capture_failed")
+		plan = nil
+	}
 
 	for _, chID := range channelIDs {
 		// Replace channel overrides with category overrides
@@ -1750,10 +2023,17 @@ func (h *Handler) syncCategoryOverridesToChannels(ctx context.Context, _, catego
 
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit sync transaction", "error", err)
+		h.presenceAbandon(plan, "ambiguous_commit")
+		return
 	}
+	h.presenceExecute(plan)
 }
 
-// invalidateSyncedChannelCaches invalidates caches for all channels in a category
+// invalidateSyncedChannelCaches invalidates caches for all channels in a category.
+//
+// NOT hooked for #2445 presence capture: it performs NO write, and it iterates
+// ALL channels in the category including unsynced ones. Capturing here would be
+// over-broad AND pointless. It keeps its existing recheckVoiceChannel loop.
 func (h *Handler) invalidateSyncedChannelCaches(ctx context.Context, serverID, categoryID string) {
 	rows, err := h.db.Query(`SELECT id FROM channels WHERE group_id = $1`, categoryID)
 	if err != nil {

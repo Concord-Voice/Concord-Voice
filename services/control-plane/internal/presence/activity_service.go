@@ -229,6 +229,13 @@ type refreshActivityRequest struct {
 	recheckViewers map[uuid.UUID]bool
 	mutation       ActivityMutation
 	category       Category
+	// recheckBenignNotCurrent is set ONLY by RefreshServerVoiceRecheck (#2445).
+	// Under it, an ErrActivityNotCurrent fresh build is a benign per-sender
+	// terminal instead of the replica-wide failClosedGeneration/disconnectAll
+	// path: an RBAC sweep racing one ordinary voice leave must not disconnect
+	// every Rich Presence client on the replica (#2444 class). Precedent: the
+	// reason-specific suppressHiddenSenderGeneration carve-out.
+	recheckBenignNotCurrent bool
 }
 
 type previousActivity struct {
@@ -332,6 +339,15 @@ func (s *ActivityService) buildFreshActivity(
 ) (BuiltActivity, Decision, error) {
 	built, err := s.builder.Build(ctx, request.senderID, request.scope)
 	if err != nil {
+		if request.recheckBenignNotCurrent && errors.Is(err, ErrActivityNotCurrent) {
+			// Benign per-sender terminal: the caller disconnects only THAT
+			// sender's captured viewers. Deliberately not a silent skip — the
+			// sender's own leave path computes the post-mutation audience and
+			// would never clear the revoked viewer.
+			return BuiltActivity{}, Decision{}, fmt.Errorf(
+				"%w: %w", ErrRecheckSenderNotCurrent, err,
+			)
+		}
 		failure := fmt.Errorf("build fresh %s rich-presence activity: %w", request.category, err)
 		return BuiltActivity{}, Decision{}, s.failClosedGeneration(
 			ctx, request.senderID, request.category,
