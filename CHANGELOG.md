@@ -4,19 +4,62 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [0.2.38] — 2026-07-30
+## [0.2.39] — 2026-07-31
+
+Pointing Concord Voice at a self-hosted server is now checked at the moment it connects, not only when you type the address. A server on your own network or machine is reachable only after you approve it in a confirmation the web layer cannot draw or click.
 
 ### Fixed
 
+- **A compromised web layer can no longer make the app read your private network** ([#2668](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2668)) — when you pointed Concord Voice at a self-hosted server, the app checked that the address looked well-formed but never checked where it actually led. That let a hostile page inside the app reach devices on your own network, or your machine itself, and read what came back. Addresses are now checked at the moment the connection is made, addresses that could never host a server are refused outright, and a server on your own network or machine is reachable only after you have approved that server in a confirmation the web layer cannot draw or click. Approving a server is also now a separate, deliberate step rather than something a successful connection did on its own.
+
+## [0.2.38] — 2026-07-30
+
+Encrypted channel keys now reach every member of a busy server without stalling, retrying forever, or handing out a key that was already revoked. The DM and server sidebars share one adaptive layout, so both behave the same way when you narrow the window. Several sign-in paths were tightened so an abandoned or superseded attempt cannot disturb the session that replaced it.
+
+### Changed
+
+- **The DM and server sidebars now share one adaptive layout** ([#2510](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2510)) — both sidebars resize by the same rules, so a narrow window behaves the same whether you are in a server or in direct messages.
+- **Updated the voice server and interface libraries** ([#2513](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2513), [#2515](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2515), [#2517](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2517)) — the media server moves to mediasoup 3.22.0 and the interface moves to the current React release.
+
+### Fixed
+
+- **Encrypted channel keys are delivered in batches** ([#2503](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2503)) — a channel with many members no longer sends one key request per member at once. Distribution is grouped, so a large server finishes key delivery instead of overwhelming the server and stalling.
+- **Key distribution can be cancelled while it waits to retry** ([#2541](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2541)) — when the server asks the app to slow down, the app waits before trying again. Leaving the channel during that wait now cancels the work instead of letting it resume against a channel you left.
+- **Key recovery resumes after a repeated rotation** ([#2539](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2539)) — two rotation batches arriving for the same channel could leave a member waiting for a key that was never re-requested. Recovery now wakes on the second batch.
+
+### Security
+
 - **Signing up with a password after backing out of a social sign-in no longer costs you your encryption keys** ([#2655](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2655)) — if you started signing in with Google or Apple and then changed your mind, the abandoned attempt kept a hold on the app's secure-key slot. A password registration that followed silently failed to save its encryption keys to your keychain, so those keys did not survive a restart until you logged in again. The abandoned attempt is now released before registration begins.
+- **Two-step verification codes are compared in constant time** ([#2654](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2654)) — the comparison no longer stops early on the first wrong character, so the time it takes to reject a code reveals nothing about how much of it was correct.
+- **A key from a revoked epoch is refused** ([#2534](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2534)) — the server rejects distribution into a channel epoch that has already been revoked, so a removed member cannot be handed a key that a rotation was meant to take away.
+- **Manual channel rotation is fenced to the current credentials** ([#2540](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2540)) — a rotation started before a password change or key reset can no longer commit afterward.
+- **A channel's active key epoch survives concurrent writes** ([#2542](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2542)) — the recorded epoch is read from the durable ledger, so two overlapping rotations cannot leave the channel pointing at the wrong one.
+- **Signing out other sessions no longer signs out the one you are using** ([#2501](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2501)) — revoking all sessions preserves the session that issued the request.
+- **Rich Presence suppression fails closed** ([#2522](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2522)) — if the server cannot confirm that your activity should be hidden, it hides it rather than publishing it.
+- **Returning from invisible does not replay a stale suppression** ([#2502](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2502)) — a suppression queued while you were hidden is discarded when you come back online, so your activity is not blanked immediately after you choose to show it.
+- **Resolved static-analysis findings in authentication handling** ([#2525](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2525)) — no user-visible behavior changed.
 
 ## [0.2.37] — 2026-07-27
+
+Sign-in and session handling were hardened across the board: a stolen or superseded token can no longer outlive the reset that was meant to end it, and an account that is disabled while connected is disconnected instead of lingering. Recovery keys now use the stronger elliptic curve the rest of Concord Voice already required.
 
 ### Fixed
 
 - **Desktop updates no longer risk a crash or missing preload files** ([#2492](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2492)) — updated Electron to 43.1.1, which fixes failures when an installed app archive is replaced while Concord Voice is still running and includes Chromium 150.0.7871.114.
+- **Encrypted key requests no longer flood the server** ([#2482](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2482)) — the number of key requests the app sends at once is bounded, so rejoining a large server does not produce a burst the server must shed.
+- **Bulk message removal is more reliable** ([#2483](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2483)) — purging a member's messages records its progress, so an interrupted purge can be identified and completed instead of stopping silently partway.
+
+### Security
+
+- **Linking a social account is bound to the password you just verified** ([#2458](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2458)) — if your credentials change between entering your password and completing the link, the link is refused instead of completing against the old proof.
+- **Token-theft revocation and session creation cannot interleave** ([#2460](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2460), [#2457](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2457)) — when a reused refresh token triggers a revocation, a sign-in running at the same moment can no longer slip a new session past the sweep.
+- **A disabled account is disconnected from an open connection** ([#2480](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2480)) — the live connection checks account state rather than trusting the token it was opened with, so disabling an account takes effect immediately instead of at the next reconnect.
+- **Recovery keys use P-384** ([#2355](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2355)) — account-recovery key agreement now enforces the same curve Concord Voice requires everywhere else. Weaker curves are rejected.
+- **Going invisible or offline clears activity that was already published** ([#2461](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2461)) — voice and call activity is suppressed on the transition itself, so nothing you were doing stays visible after you hide.
 
 ## [0.2.36] — 2026-07-26
+
+Desktop actions that touch your camera, clipboard, updates, or permissions now verify the request came from Concord Voice itself before acting.
 
 ### Security
 
@@ -24,29 +67,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.2.35] — 2026-07-25
 
+Windows updates install when you click Restart. The previous installer deleted its own files partway through and stopped, which is why updates appeared to do nothing.
+
 ### Fixed
 
 - **Windows updates now install when you click Restart** ([#2402](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2402)) — after downloading an update, clicking Restart closed Concord Voice and then nothing happened; a window flashed briefly and disappeared. Running the downloaded installer by hand did the same thing, and the only way through was to move that file somewhere else, like your Downloads folder, and run it from there. Updates now install normally from the Restart button, with no manual step. Leftover files from the old installer are tidied up on a later launch, and your downloaded updates and your installed app are never touched by that cleanup.
 
 ## [0.2.34] — 2026-07-25
 
+Version 0.2.33 never reached you — it was bumped but never released, so everything it carried ships here. On top of that: signing in with Google or Apple is bound to the account state at the moment it completes, and the "can't reach Concord servers" warning clears itself once the connection is up.
+
 ### Fixed
 
 - **The "can't reach Concord servers" warning at startup now clears itself** ([#2401](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2401)) — this warning could appear when the app opened and then stay on screen even though you were connected and your messages were loading, only going away if you manually refreshed the window. It now disappears on its own the moment the app reaches the servers, and it no longer appears at all when the connection was already up. Startup warnings that are not about reachability — a configuration the app declined to use, or an app version too old for the current interface — still appear as before, and now say which of those actually happened instead of blaming the connection.
 
+### Security
+
+- **Social sign-in is bound to your current account state** ([#2453](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2453)) — the session is created while the account record is held, so a password reset or key recovery running at the same moment cannot leave a sign-in behind that the reset was meant to cancel.
+- **Updated the desktop router to close a published advisory** ([#2442](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2442)) — resolves GHSA-QWWW-VCR4-C8H2.
+- **Encryption key self-healing checks the recipient's current key** ([#2440](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2440)) — when the app re-sends a channel key to someone who missed it, it names the key version it wrapped for. The server refuses the delivery if that person has since reset their keys, so a key is never wrapped to an identity that no longer exists.
+
 ## [0.2.33] — 2026-07-24
+
+This release was bumped but never published; its contents reached you in 0.2.34. It is the largest security pass of the beta so far. Sessions, encryption keys, and password changes are now tied to the exact credentials that authorized them, so a stale sign-in, a slow reply, or an interrupted password change can no longer disturb the session that replaced it.
+
+### Fixed
+
+- **Key recovery stays reachable after a password sign-in** ([#2435](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2435)) — the app holds the main route until encryption is ready, so you are not dropped into the app in a state where recovery cannot be started.
+- **Custom Status visibility settles consistently** ([#2419](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2419)) — the record of who may see your status is reconciled durably, so a failed update is repaired rather than left half-applied.
+- **Rich Presence cleanup resumes after an interruption** ([#2408](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2408)) — if hiding your activity fails partway, the evidence of what still needs hiding is kept and retried instead of being derived from state that has already moved on.
+- **Private calls appear only once both sides are admitted** ([#2407](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2407)) — a call that is still being authorized no longer shows up as a live call or leaves a phantom entry behind if it is abandoned.
+- **Hidden presence stays hidden across servers** ([#2404](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2404), [#2405](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2405), [#2232](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2232)) — presence state is synchronized rather than recomputed per connection, malformed stored activity is repaired instead of trusted, and a superseded presence generation is verified before it is allowed to write.
+- **Reduced complexity in sign-in and voice lifecycle code** ([#2421](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2421)) — no behavior change; the paths involved in the fixes above were made easier to reason about.
 
 ### Security
 
-- **Single sign-in with two-step verification stays bound to the right account** ([#2424](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2424)) — completing two-step verification during a social sign-in now finishes securely in the app's protected process and keeps your credentials tied to that exact sign-in, so a stale or superseded sign-in can no longer overwrite a newer session. The main window also never unlocks before your encryption is ready for the account that just signed in.
+- **Two-step verification during a social sign-in completes inside the app's protected process** ([#2436](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2436)) — your credentials stay tied to that exact sign-in, so a stale or superseded attempt cannot overwrite a newer session. The main window also never unlocks before encryption is ready for the account that just signed in.
+- **Encryption keys are committed by the sign-in that created them** ([#2434](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2434)) — a sign-in that has been replaced can no longer clear or overwrite the keys belonging to the one that replaced it.
+- **A password change that succeeded is never reported as a failure** ([#2431](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2431)) — if the server confirms the change but the reply cannot be read, the app signs you out and asks you to sign in again rather than continuing with keys that no longer match your password.
+- **Key delivery checks the recipient against a concurrent key reset** ([#2430](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2430)) — a channel key is not wrapped to someone whose keys were reset while the delivery was in flight; the delivery is skipped and re-queued against their new key.
+- **A slow rejected request cannot end a rotated session** ([#2432](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2432)) — a rejection that arrives after your session has already been refreshed is ignored instead of signing you out.
+- **Grace-period session refresh follows an exact lineage** ([#2428](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2428)) — when two devices refresh at nearly the same moment, the replacement session is matched to the exact token it replaced rather than guessed from timing.
+- **Every session is bound to the credentials that authorized it** ([#2427](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2427), [#2397](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2397)) — a password change or key recovery advances a per-account marker, and any sign-in still holding the previous marker is refused. This closes the window where a session authorized just before a reset could be created just after it.
+- **Password changes rotate every encrypted setting together** ([#2395](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2395)) — saved GIFs, interface preferences, friend organization, and Custom Status visibility are re-encrypted in one transaction. Previously a failure partway could leave some of them locked to your old password.
 
 ## [0.2.32] — 2026-07-22
+
+Sign-in and session refresh stay with the account and server you chose, even when two sign-ins overlap or you switch between hosted servers.
 
 ### Fixed
 
 - **Sign-in and refresh stay with the right account and server** ([#2374](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2374)) — session rotation, simultaneous sign-ins, and switching between hosted servers can no longer mix credentials or continue a stale sign-in against the newly selected server, and a superseded sign-in no longer leaves its encryption keys resident in memory.
 
+### Changed
+
+- **Updated the voice server and build libraries** ([#2379](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2379), [#2384](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2384), [#2380](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2380), [#2389](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2389)) — mediasoup, Vite, the icon set, and the media server's request parser move to their current releases.
+
 ## [0.2.31] — 2026-07-22
+
+Groundwork for showing what your friends are doing. The server can now publish voice and call activity, and the desktop app validates it without displaying it yet.
 
 ### Changed
 
@@ -54,17 +133,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.2.30] — 2026-07-18
 
-### Changed
+Reconnecting after a network drop now restores what changed while you were away, instead of leaving stale servers and missing messages on screen. Moderators can remove a member's messages when kicking or banning them, and Apple sign-in works again on desktop.
 
-- **Faster TypeScript builds** ([#2375](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2375)) — desktop, admin, and media-plane typechecks now use the native TypeScript 7 compiler while lint and editor tools temporarily retain the TypeScript 6 compiler API for compatibility.
+### Added
+
+- **Removing a member can remove their messages** ([#2342](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2342)) — kicking or banning a member can also purge the messages they posted in that server.
+- **Account activity metrics and an Admin workspace** ([#2338](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2338)) — operators can see aggregate account activity. The figures are counts only; they carry no user, server, or channel identity.
+- **Safe rotation of the two-step verification encryption key** ([#2345](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2345)) — operators can rotate the key that protects stored two-step secrets. Each stored secret records the key version that sealed it, so old and new keys coexist during a rotation.
+
+### Fixed
+
+- **Reconnecting restores what changed while you were disconnected** ([#2327](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2327), [#2358](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2358)) — a brief network drop used to leave the app showing servers you had been removed from and missing messages sent during the outage, until you reloaded. Reconnecting now refreshes your memberships and back-fills the open conversation. Your unsent drafts and queued messages are kept, which the previous behavior discarded.
+- **Apple sign-in completes on desktop** ([#2323](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2323)) — the sign-in returns through the hosted bridge rather than a local address, which the previous flow could not reach.
+
+### Security
+
+- **A password change that loses your encryption keys fails closed** ([#2357](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2357)) — the app signs you out and asks you to sign in again rather than continuing in a state where your keys no longer match your password.
+- **Encryption keys are not cleared by a sign-in that has ended** ([#2337](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2337)) — a sign-in torn down mid-setup can no longer clear the keys belonging to the sign-in that replaced it.
+- **Security headers are sent once, from one place** ([#2328](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2328)) — duplicate and conflicting headers are removed, and the transport-security policy is stated once.
 
 ## [0.2.29] — 2026-07-15
+
+Moderators can now remove a member's messages in bulk, across a channel, a server, or a conversation. Voice gets more honest about video: the codec shown in Settings is the one actually in use, and H.264 calls are encrypted per access unit rather than whole-frame. Operators get an Admin console with aggregate figures that carry no user identity.
+
+### Added
+
+- **Bulk message removal** ([#2290](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2290)) — a moderator can delete a member's messages across a channel, a whole server, or a conversation in one action. The removal is recorded as counts and context only; message text is never written to the audit record.
+- **The Admin Portal console** ([#2268](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2268)) — operators get a web console for instance health and aggregate metrics, behind its own sign-in.
+- **Rich Presence category settings persist** ([#2275](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2275)) — your per-category choices for what activity is shared are stored, so they survive a restart.
+
+### Fixed
+
+- **The codec shown in Settings is the one in use** ([#2242](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2242)) — the video settings screen previously showed the codec the app intended to use. It now separates what will be tried from what is actually running, read from the live connection, so hardware encoding is never claimed when software encoding is doing the work.
+- **H.264 video is encrypted per access unit** ([#2298](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2298)) — H.264 calls use a format-aware encryption boundary instead of whole-frame encryption, which lets the video server route frames without ever seeing their contents. HDR target selection was corrected at the same time.
+- **Admin metrics read correctly** ([#2286](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2286), [#2287](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2287), [#2281](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2281)) — hourly averages stay inside their bounds, chart values are formatted and labelled, and host telemetry is restored in production.
 
 ### Security
 
 - **Desktop release signing is isolated from pull requests** ([#2296](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2296)) — pull-request packages now run unsigned without signing secrets or OIDC, while signed releases rebuild protected `main` with environment-scoped credentials and same-run artifacts.
+- **Voice activity is authorized before it is published** ([#2282](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2282)) — the server checks that a viewer is allowed to see your Server Voice or Private Call activity, and publishes the minimum needed to render it.
 
 ## [0.2.28] — 2026-07-14
+
+Direct-message call previews now say what actually happened, and Custom Status counts characters the way you would.
+
+### Fixed
+
+- **DM call previews describe the call** ([#2245](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2245)) — a call entry in your conversation list now reflects its outcome instead of showing one generic line for every case.
+- **Custom Status counts characters, not bytes** ([#2250](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2250)) — the length limit counts Unicode code points, so accented letters, non-Latin scripts, and emoji no longer consume several characters each.
 
 ### Changed
 
@@ -72,29 +188,113 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.2.27] — 2026-07-14
 
+Activity History arrives: an opt-in, self-only record of your own voice and call intervals, off until you turn it on and deleted on your schedule. Video codec selection was also reworked so a call that drops to software encoding re-selects instead of staying there.
+
+### Added
+
+- **Activity History — opt-in and self-only** ([#1235](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/1235)) — you can record your own voice and call intervals and review them in Settings. It is off until you consent, the record is visible only to you, and it is pruned on the retention window you choose. Consent is versioned: if the terms change, you are asked again rather than opted in silently. Nothing is recorded while it is off.
+- **A read-only admin metrics API** ([#2228](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2228), [#2218](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2218)) — operators can read aggregate instance metrics through a restricted role. The figures are fixed numeric counts with no user, server, or channel dimension.
+
+### Fixed
+
+- **Video re-selects its codec mid-call** ([#2187](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2187)) — when a call falls back to software encoding, the app now re-selects toward a hardware-capable codec instead of staying on the slower path for the rest of the call. Re-selection is serialized so two triggers cannot fight, and cannot oscillate between two software codecs.
+- **Chat stays where you left it** ([#2227](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2227)) — a late layout change no longer scrolls you away from the newest message.
+- **Edited encrypted messages display correctly** ([#2217](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2217)) — an edit is decrypted before it is stored, so an edited message no longer shows as unreadable.
+- **Dialog placement corrected** ([#2225](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2225)) — the outgoing-call and What's-new dialogs no longer appear behind other windows.
+
 ### Security
 
 - **Safer desktop update checks** ([#2247](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2247)) — updated the parser used by Concord Voice's desktop updater to prevent specially crafted recovery-feed YAML from consuming excessive CPU during update checks. Routine security maintenance; no action needed.
 
 ## [0.2.26] — 2026-07-12
 
-### Fixed
+Screen sharing was rebuilt around what viewers can actually see. Every participant can share at once, each stream carries its own volume and mute, and the server sends each viewer only the resolution their window needs. Video codec selection now learns from the live call whether hardware encoding is really being used.
 
+### Added
+- **Everyone can share their screen at once** ([#2160](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2160), [#2185](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2185)) — concurrent screenshare limits were raised substantially, and a shared screen is sent at several qualities so each viewer receives the one that fits their window instead of everyone paying for the largest.
+- **Per-stream screenshare audio** ([#2169](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2169)) — each shared screen has its own volume slider and mute. Muting one stops the server sending you that audio at all, rather than silencing it locally.
+- **A voice tile view** ([#2177](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2177)) — participants fill the available space, and the view switch moved somewhere you can find it.
+- **Custom Status recipient exceptions** ([#2191](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2191)) — you can hide your Custom Status from specific people. The exception list is encrypted with your password-derived key, so the server enforces it without being able to read it.
+
+### Changed
+- **Subscriptions expire on schedule** ([#2168](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2168)) — when a plan reaches the end of its period, entitlements return to the free tier automatically instead of waiting for the next sign-in.
+
+### Fixed
+- **Hardware video encoding is detected from the live call** ([#2184](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2184), [#2189](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2189)) — the app probes what your machine can encode and then confirms it against the running call, so a codec that claims hardware support but silently falls back is demoted for the session.
+- **Voice survives a brief server blip on join** ([#2181](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2181)) — joining a call during a short interruption now retries instead of failing outright.
 - **Picture-in-picture windows close promptly when a call ends** ([#2215](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2215)) — leaving voice now releases each floating window's media immediately instead of leaving an always-on-top window visible while cleanup requests time out.
+- **System audio is captured only for whole-screen shares** ([#2165](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2165)) — sharing a single window no longer captures audio from everything else.
+- **The focused screen stays focused** ([#2156](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2156)) — tuning into a second screen no longer displaces the one you were already watching.
+- **Update settings are quiet at rest** ([#2183](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2183)) — interface and app update state are reported separately instead of one status standing in for both.
+- **Renamed Settings ▸ Sounds and Notifications to Notifications** ([#2188](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2188)).
+- **Screen quality demand no longer flaps for AV1 and VP9 shares** ([#2212](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2212)) — layer preferences for those codecs apply directly instead of feeding the decision about whether to publish several qualities.
+- **Follow-up fixes from the desktop notification work** ([#2167](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2167)) — remaining issues found while auditing the notification changes.
+
+### Security
+- **Voice publishing is checked by the media server** ([#2140](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2140)) — permission to speak or share is enforced where the media is actually accepted, not only in the interface.
+- **An empty server-supplied voice identity fails closed** ([#2152](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2152)) — following the change in 0.2.25, a blank authoritative name is used as-is rather than falling back to the name the client supplied.
+- **Channel video limits follow the server's plan, not the owner's** ([#2175](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2175)) — per-room camera and screenshare limits are resolved from the server's own subscription, so a premium member or owner on a free server cannot raise the limits for that room.
+- **Screenshare resolution and frame rate follow your plan** ([#2172](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2172)) — the limit is a combined pixel-rate, so 1080p30 and 720p60 both work on the free tier while 1080p60 does not.
+- **Shutdown no longer strands connections** ([#2203](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2203), [#2149](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2149), [#2214](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2214)) — the server drains in-flight requests before closing live connections, and voice transports are released by their owner.
 
 ## [0.2.25] — 2026-07-09
 
+A full security audit of channel and message permissions landed: what you can see is now checked on every path that can reveal it, not only on the one that lists it. The message composer also grew up — emoji autocomplete, keyboard shortcuts for the pickers, and no more layout jump on first open.
+
+### Added
+
+- **Emoji autocomplete in the composer** ([#2081](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2081)) — type a `:shortcode:` and pick from suggestions inline.
+- **Keyboard shortcuts for the pickers** ([#2079](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2079)) — Ctrl+E opens emoji, Ctrl+G opens GIFs, from the composer.
+- **Tune in and out of individual screens** ([#2126](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2126)) — you choose which shared screens to watch, globally or one at a time.
+- **See exactly what a bug report sends** ([#2086](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2086), [#2082](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2082)) — a preview shows the diagnostic log attached to a report before you send it. Identifiers are replaced with per-report placeholders, and tokens, addresses, and file paths are removed.
+
+### Fixed
+
+- **The composer no longer jumps when a picker first opens** ([#2075](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2075), [#2085](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2085)) — picker code is loaded ahead of the first open, so the composer stops expanding and snapping back.
+- **Emoji-only messages render large again** ([#2073](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2073)) — a message that is only `:shortcode:` emoji scales up, matching the behavior for literal emoji.
+- **Privacy and Security settings no longer sign you out** ([#2067](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2067)) — a background settings sync that failed used to be treated as an expired session.
+- **Dialogs trap focus correctly** ([#2089](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2089)) — modals announce themselves to screen readers, keep keyboard focus inside while open, and return focus where it came from.
+
 ### Security
 
+- **Channel visibility is enforced everywhere it can leak** ([#2134](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2134), [#2136](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2136), [#2138](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2138), [#2132](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2132), [#2130](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2130)) — channel metadata, unread counts, attachments, encryption keys, live update broadcasts, and voice participant lists are all gated on permission to view the channel, rather than on server membership alone. Previously a member of the server could learn about channels they could not open.
+- **Removed members are evicted from live connections** ([#2133](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2133), [#2135](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2135)) — kicking or banning a member closes their live subscription immediately, and voice counts are scoped to servers the recipient is actually in.
+- **Group conversation creation respects your privacy settings** ([#2127](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2127)) — you cannot be added to a group conversation by someone your settings do not permit to message you.
+- **Channels cannot be bound across servers** ([#2131](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2131)) — a channel category must belong to the same server as its channel, enforced by the database rather than by the caller.
+- **Sign-in state is consumed atomically** ([#2129](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2129), [#2139](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2139)) — single sign-on state and one-time tokens are read and deleted in one step so they cannot be replayed, and device attestation tokens are bound to the account that minted them.
+- **Voice display identity comes from the server** ([#2143](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2143)) — the name and avatar other participants see are resolved from your authenticated account rather than sent by your app, so a modified client cannot present itself as someone else in a call.
+- **Admin enrollment links no longer carry their token in the address** ([#2137](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2137)) — the enrollment token is kept out of the URL, where it would be recorded in history and server logs.
+- **A wildcard origin is refused in production** ([#2128](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2128)) — the server refuses to start with a permissive cross-origin setting, which would have allowed a hostile page to make credentialed requests.
 - **Archive handling hardened against malicious files** ([#2142](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2142)) — updated the tar library used by our desktop build tooling and the voice server's installer so maliciously crafted archives (compression bombs and malformed headers) can no longer hang or crash those steps. Routine hygiene — no user action needed.
+- **Verification failures respond consistently** ([#2083](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2083)) — running out of verification attempts returns the same shape as any other failure, so the response reveals nothing extra.
 
 ## [0.2.24] — 2026-07-05
+
+A batch of things that were quietly broken: username search, the friend-request sound, password-reset email, and the verification-code window that was too short to type in. Voice also picked up a visual layer that shows who is speaking and that the call is encrypted.
+
+### Added
+
+- **A voice stage that shows who is talking** ([#2059](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2059), [#2062](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2062)) — the active speaker takes the foreground, an encryption ring marks the call as end-to-end encrypted, and a backdrop appears before you join. Messages that fail to decrypt are now visibly distinct rather than blank.
+- **Show your password while typing it** ([#2061](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2061)) — the sign-in screen has a reveal toggle.
 
 ### Fixed
 
 - **A clearer signal when your encryption keys can't be saved** ([#2068](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2068)) — if your device keychain is locked or full when Concord saves your encryption keys for next launch, the app now notices instead of failing silently. Your current session keeps working either way; if saving didn't succeed, signing in again on the next launch restores it.
+- **Searching for a user by name works again** ([#2057](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2057)).
+- **Friend requests make a sound again** ([#2054](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2054)).
+- **Password-reset email is delivered** ([#2058](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2058)) — the reset message failed to send; it now arrives.
+- **There is time to enter the email verification code** ([#2055](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2055)) — the window was short enough that the code often expired while you were reading it.
+- **One-to-one calls show a single bottom bar** ([#2056](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2056)) — the duplicate bar is gone.
+- **Settings and help overlays close** ([#2064](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2064)) — both can be dismissed without reaching for the keyboard.
+- **A GIF that fails to load no longer signs you out** ([#2051](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2051)) — a rejection from the third-party GIF service is no longer read as your session expiring.
+
+### Security
+
+- **The test environment setting is refused in production** ([#2060](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2060)) — the server will not start in production with test-mode configuration, which relaxes several checks.
 
 ## [0.2.23] — 2026-07-04
+
+Your subscription is visible and manageable in the app, and call quality, upload limits, and server capabilities follow the plan you are on. When bandwidth gets tight, Concord Voice sheds webcam before screenshare before audio, so voice stays clear.
 
 ### Added
 
@@ -113,12 +313,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.2.22] — 2026-07-02
 
+Update Concord Voice and the next launch tells you what changed. This file became the canonical public record at the same time, and the release pipeline now refuses to cut a version without an entry for it.
+
 ### Added
 
 - **See what changed, right after you update** ([#2034](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2034)) — update Concord Voice, and the next launch shows a "What's new" dialog covering every version since the one you had. It shows once, works offline, and never slows startup. Read it or dismiss it — your call.
 - **A changelog you can hold us to** ([#2034](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2034)) — this file is now the canonical public record of every change we ship. Every release since Beta is documented below, and CI refuses to cut a new version without its entry. No entry, no release.
 
 ## [0.2.21] — 2026-07-02
+
+Windows verifies an update's signature before installing it, and public releases carry build provenance you can check yourself. A batch of chat fixes came with it: pinning works again, scroll stays where you left it, and previews say what they mean.
 
 ### Added
 
@@ -146,12 +350,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.2.20] — 2026-06-30
 
+Self-hosted instances get the full feature set with no artificial limits. The licence, privacy policy, and terms are one click away in About.
+
 ### Added
 
 - **Self-host it, get everything** ([#1985](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1985)) — run Concord Voice on your own hardware and every premium entitlement is unlocked out of the box. No subscription required. That is the self-hosting deal: your server, your rules, all of it.
 - **Legal documents, one click away** ([#1987](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1987)) — the license, terms, and other notices are readable directly from Settings ▸ About.
 
 ## [0.2.19] — 2026-06-30
+
+You can sign in to a Concord Voice server you run yourself. Clients that lost track of the hosted interface can now find their way back without reinstalling.
 
 ### Added
 
@@ -167,11 +375,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.2.18] — 2026-06-29
 
+Certificate pinning is back on for connections to Concord Voice servers.
+
 ### Security
 
 - **Certificate pinning restored** ([#1983](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1983)) — our certificate pinning for Cloudflare-fronted connections had lapsed. This release brings it back: connections to Concord Voice services are once again verified against the exact certificates we expect. We are telling you it lapsed because you deserve to know — that is the point of this file.
 
 ## [0.2.17] — 2026-06-29
+
+React to direct messages with emoji. Connecting at launch is more reliable, and rotating a certificate no longer locks you out of your own server.
 
 ### Added
 
@@ -187,6 +399,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Certificate rotation no longer locks you out** ([#1980](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1980)) — clients enforcing the old production API certificate pin failed to connect after we rotated the certificate. The client now trusts the rotated pin.
 
 ## [0.2.16] — 2026-06-29
+
+Choose how much a notification reveals on screen. Every colour scheme is now free for everyone, and opening direct messages no longer interrupts your call.
 
 ### Added
 
@@ -204,6 +418,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.2.15] — 2026-06-29
 
+Moderators can time a member out instead of removing them. Passkey registration is stricter, and erasing your account now revokes the session that asked for it.
+
 ### Added
 
 - **Member timeout moderation** ([#1967](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1967)) — moderators can put a member in timeout for a set duration. Participation is restricted until the clock runs out — no permanent ban required for a temporary problem.
@@ -219,6 +435,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Access token revoked on account erasure** ([#1965](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1965)) — erase your account and your current access token dies with it. No authenticated session outlives the deletion.
 
 ## [0.2.14] — 2026-06-28
+
+A channel can set one audio standard for everyone in it, so voice quality no longer depends on each person's plan. Usernames became case-insensitive everywhere, and self-hosted certificate failures are reported instead of swallowed.
 
 ### Added
 
@@ -244,6 +462,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.2.13] — 2026-06-28
 
+Invite bubbles name the person who actually invited you. Linux updates are signature-verified before they install, and the signed offline interface cache went live.
+
 ### Fixed
 
 - **Invite bubbles now name the person who actually invited you** ([#1909](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1909)) — Send-to-a-Friend invite messages in chat were attributed to the wrong user. Now the sender shown is the sender who sent it.
@@ -260,6 +480,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.2.12] — 2026-06-27
 
+Your camera and screen share stay live when the call switches video quality layers, instead of dropping for a moment each time.
+
 ### Fixed
 
 - **Your camera and screen share stay live when video quality layers switch** ([#1903](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1903)) — re-negotiating video layers mid-call could stop the underlying capture track and take down every camera in the room. Producers now keep the track alive across the switch.
@@ -271,11 +493,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.2.11] — 2026-06-26
 
+Hardware video encoding is offered only when your graphics hardware actually supports it.
+
 ### Fixed
 
 - **Hardware video encoding now matches what your GPU can actually do** ([#1879](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1879)) — Concord Voice now queries your system's supported hardware encode profiles instead of assuming a fixed codec set, so camera and screen-share encoding picks codecs your GPU genuinely accelerates.
 
 ## [0.2.10] — 2026-06-26
+
+You can run your own Concord Voice instance. AV1 video no longer black-screens in end-to-end encrypted calls.
 
 ### Added
 
@@ -290,6 +516,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Behind-the-scenes tooling, CI, and dependency upkeep** ([#1877](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1877), [#1894](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1894)) — refreshed our supply-chain threat indicators and taught macOS release builds to retry a transient DMG packaging flake.
 
 ## [0.2.9] — 2026-06-24
+
+Video no longer black-screens after an encryption key rotates mid-call, and the offline interface cache is signed so a tampered copy cannot load.
 
 ### Added
 
@@ -311,6 +539,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.2.8] — 2026-06-24
 
+Voice and video got steadier: audio devices switch mid-call, direct-message calls open the call view with sound, and encrypted video keeps up with layered streams. Older direct-message attachments decrypt correctly again.
+
 ### Changed
 
 - **A cleaner invite landing page** ([#1869](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1869)) — open a server invite link and you land on a restyled page that gets you into the server without ceremony.
@@ -329,6 +559,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [0.2.7] — 2026-06-23
 
 > Versions 0.2.4–0.2.6 never reached you — they were release-pipeline iterations that produced no public release. Everything they carried ships here.
+
+Images open in a proper lightbox, and invite links can be public. Camera quality adapts in group calls, and video recovers on its own once an encryption key catches up.
 
 ### Added
 
@@ -354,6 +586,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.2.3] — 2026-06-22
 
+The message composer shows how many characters you have left, and handles going over the limit without losing what you typed.
+
 ### Added
 
 - **Live message character-limit counter with overflow handling** ([#1709](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1709)) — see exactly how much room you have left as you type. The composer counts characters against your account's message limit and flags over-limit text before you send — no more surprise rejections.
@@ -363,6 +597,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Behind-the-scenes tooling, CI, and documentation upkeep** ([#1780](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1780), [#1781](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1781), [#1764](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1764), [#1783](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1783)) — build-pipeline and security-scanning maintenance, documentation cleanups, and a routine supply-chain threat-list refresh. Nothing changes in how Concord Voice behaves for you.
 
 ## [0.2.2] — 2026-06-22
+
+Premium features show what they unlock and can be redeemed with a code. Voice audio crackle is fixed, and reconnecting after a server deploy no longer needs a restart.
 
 ### Added
 
@@ -390,13 +626,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > drag-to-Applications `.dmg` ships alongside the `.zip` (which remains the
 > electron-updater auto-update artifact — the `.dmg` is install-only).
 
+Friend categories also arrive: organize your direct messages into groups with your own emoji and colours. The grouping is encrypted with your key, so the server stores it without being able to read it.
+
 ### Fixed
 
+- **Friend categories in direct messages** ([#1704](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1704)) — group your direct messages into categories with your own emoji and colours. The grouping is stored encrypted with your key, so the server keeps it without being able to read it.
 - **macOS `.dmg` installer now attached to releases** ([#1722](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/1722)) — the release-asset `find` glob in `build-desktop.yml` (feeding `gh release create`) omitted `*.dmg`, so the notarized installer was missing from the v0.2.0 GitHub Release and the public mirror. The DMG is now attached and normalized to `ConcordVoice-<version>-macos-<arch>.dmg`, consistent with the `.zip`. The `latest-mac.yml` auto-updater manifest deliberately remains `.zip`-only (Squirrel.Mac cannot auto-update from a DMG).
 
 ## [0.2.0-Beta] — 2026-06-20 (Phase 2 — Beta release)
 
 > Release-level rollup of Phase 2A + Phase 2B work. Per-revision detail lives in the `[0.1.12]`–`[0.1.18]` entries below; this entry surfaces the user-visible themes that close the v0.2.0-Beta milestone.
+
+The Beta release. Sign in with Google or Apple, add two-step verification or a passkey, and recover an account you have locked yourself out of. Roles and permissions arrive alongside GIFs, server moderation, and end-to-end encrypted attachments.
 
 ### Added
 

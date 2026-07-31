@@ -1,6 +1,16 @@
+/* The DIALOG is the scroll container, not the inner notes region — deliberate,
+   and load-bearing for keyboard access (WCAG 2.1.1). Arrow keys scroll the
+   nearest scrollable ancestor of the focused element, and the close button that
+   receives initial focus lives inside this box. Scoping the overflow to
+   `__notes` instead would put the scroll container outside the focus path: the
+   region carries no links now that it renders a preamble, so it would be
+   unreachable without a mouse, and making it focusable means a `tabIndex` on a
+   non-interactive element. Keep the overflow here and the actions sticky. */
 .changelog-modal {
   max-width: 640px;
   width: calc(100vw - 48px);
+  max-height: 85vh;
+  overflow-y: auto;
   margin: auto;
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -18,10 +28,7 @@
 }
 
 .changelog-modal__notes {
-  max-height: 50vh;
-  overflow-y: auto;
   margin: 12px 0;
-  padding-right: 8px;
 }
 
 .changelog-modal__section h3 {
@@ -49,9 +56,16 @@
   font-style: italic;
 }
 
+/* Sticky so "Got it" stays reachable while the dialog scrolls. The negative
+   bottom margin and matching padding cancel the dialog's own 24px pad, so the
+   bar sits flush against the bottom edge rather than floating above a gap. */
 .changelog-modal__actions {
+  position: sticky;
+  bottom: -24px;
   display: flex;
   justify-content: space-between;
   align-items: center;
   margin-top: 16px;
+  padding: 12px 0;
+  background: var(--bg-primary);
 }

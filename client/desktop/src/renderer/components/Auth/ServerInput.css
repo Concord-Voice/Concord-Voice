@@ -74,7 +74,7 @@
   border-radius: 8px;
   color: var(--text-primary);
   font-size: calc(15px * var(--font-scale, 1));
-  font-family: 'SourceSans', monospace;
+  font-family: var(--font-mono, monospace);
   transition: all 0.2s ease;
 }
 
@@ -82,6 +82,14 @@
   outline: none;
   border-color: var(--accent-primary);
   background: var(--bg-tertiary);
+}
+
+/* `:focus` above suppresses the UA outline and signals focus with border COLOUR alone.
+   This component now programmatically focuses this input on two outcomes, so restore a
+   non-colour indicator for keyboard users (matches the button rule below). */
+.server-url-input:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
 }
 
 .server-url-input.error {
@@ -92,43 +100,40 @@
   color: var(--text-muted);
 }
 
+/* Reserve one line so the region does not grow from zero when the first message
+   appears, pushing the Connect button down as the user reaches for it. */
+.input-status-region {
+  min-height: calc(20px * var(--font-scale, 1));
+}
+
+.input-status,
+.input-note {
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+/* Both terminal glyphs share --danger deliberately: the distinction between "retry"
+   and "never" is carried by the glyph and the word "never", never by hue. */
 .input-error {
   font-size: calc(13px * var(--font-scale, 1));
   color: var(--danger);
   margin-top: 4px;
 }
 
-/* Security Info */
-.security-info {
-  display: flex;
-  gap: 12px;
-  padding: 16px;
-  background: rgba(67, 181, 129, 0.1);
-  border: 1px solid rgba(67, 181, 129, 0.2);
-  border-radius: 8px;
+.input-message-text {
+  overflow-wrap: anywhere;
 }
 
-.info-icon {
-  font-size: calc(20px * var(--font-scale, 1));
-  flex-shrink: 0;
-}
-
-.info-text {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.info-title {
-  font-size: calc(13px * var(--font-scale, 1));
-  font-weight: 600;
-  color: var(--success);
-}
-
-.info-description {
-  font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-secondary);
-  line-height: 1.4;
+/* CSS-drawn, never an emoji: an emoji cannot be paused for reduced motion, renders
+   through each OS's emoji font, and cannot take theme tokens. */
+.server-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border-color);
+  border-top-color: var(--accent-primary);
+  border-radius: 50%;
 }
 
 /* Buttons */
@@ -147,16 +152,22 @@
   transition: all 0.2s ease;
 }
 
-.server-connect-btn:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(250, 112, 154, 0.3);
-}
-
-.server-connect-btn:active:not(:disabled) {
+.server-connect-btn:active:not(:disabled):not([aria-disabled='true']) {
   transform: translateY(0);
 }
 
-.server-connect-btn:disabled {
+/* Hover feedback is box-shadow, which is not motion — it belongs on the unconditional
+   rule. Only the transform is motion, and it stays in the media query below. Moving the
+   whole rule in there left a reduced-motion user with NO hover feedback on the primary
+   button. */
+.server-connect-btn:hover:not(:disabled):not([aria-disabled='true']) {
+  box-shadow: 0 4px 12px rgba(250, 112, 154, 0.3);
+}
+
+/* The in-flight state is aria-disabled, not `disabled` (see the JSX note — disabling the
+   focused button drops focus to <body>), so the inert affordance must key on both. */
+.server-connect-btn:disabled,
+.server-connect-btn[aria-disabled='true'] {
   opacity: 0.5;
   cursor: not-allowed;
 }
@@ -174,13 +185,45 @@
   transition: all 0.2s ease;
 }
 
-.server-back-btn:hover {
+.server-back-btn:hover:not(:disabled):not([aria-disabled='true']) {
   border-color: var(--accent-primary);
   color: var(--text-primary);
   background: var(--bg-secondary);
 }
 
-/* Footer */
+.server-connect-btn:focus-visible,
+.server-back-btn:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+.server-back-btn:disabled,
+.server-back-btn[aria-disabled='true'] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .server-connect-btn:hover:not(:disabled):not([aria-disabled='true']) {
+    transform: translateY(-1px);
+  }
+
+  .server-spinner {
+    animation: server-spin 0.8s linear infinite;
+  }
+}
+
+@keyframes server-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/*
+ * Footer — retained deliberately. Design spec (#2354 §8.5) scopes this out of the
+ * boy-scout set: the `.help-link` span is inert, but that is a separate defect and
+ * fixing it means deciding where it should point. See the matching note in the JSX.
+ */
 .server-footer {
   display: flex;
   justify-content: center;
@@ -196,7 +239,12 @@
   color: var(--accent-primary);
   text-decoration: none;
   font-weight: 600;
-  transition: color 0.2s ease;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .help-link {
+    transition: color 0.2s ease;
+  }
 }
 
 .help-link:hover {

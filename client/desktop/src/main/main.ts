@@ -23,6 +23,7 @@ import {
   BrowserWindow,
   clipboard,
   desktopCapturer,
+  dialog,
   ipcMain,
   nativeImage,
   net,
@@ -54,8 +55,18 @@ import {
   getApiBaseOrigin,
 } from './tokenManager';
 import { getMachineId } from './machineId';
-import { probeSelfHostedServer } from './selfHostedProbe';
-import { isValidatedSelfHostedApiBase } from './selfHostedProfile';
+import { normalizeSelfHostedUrl, probeSelfHostedServer } from './selfHostedProbe';
+import { consumeCeremonyToken } from './selfHostedCeremonyBudget';
+import {
+  approvalTierForApiBase,
+  beginPendingApproval,
+  clearPendingApproval,
+  commitSelfHostedApproval,
+  isValidatedSelfHostedApiBase,
+  loadApprovedSelfHostedOrigins,
+} from './selfHostedProfile';
+import { resolveForDisplay, type ResolveForDisplayResult } from './guardedRequest';
+import type { EgressDecision } from './egressPolicy';
 import {
   initAutoUpdater,
   stopAutoUpdater,
@@ -106,7 +117,11 @@ import {
   setRemoteSpaState,
 } from './spaState';
 import { isPermittedFrameUrl, requireTrustedSender } from './ipc/frameValidation';
-import { IPC_CONTRACT_VERSION, type CredentialOwner } from './ipcContract';
+import {
+  IPC_CONTRACT_VERSION,
+  type CredentialOwner,
+  type SelfHostedProbeResult,
+} from './ipcContract';
 import { registerIpcHandlers as registerPermissionHandlers } from './permissionManager';
 import { migrateUserData } from './userDataMigration';
 import { showSplash, closeSplash, updateSplashError } from './splashWindow';
@@ -124,6 +139,10 @@ import { cleanupSquirrelResidue } from './squirrelCleanup';
 // never data loss (#1314 review, Gitar). Acquiring the lock this early would
 // reorder unrelated startup and isn't worth the risk.
 migrateUserData();
+
+// Hydrate the in-memory validated-origin set from the durable approval store (#2354).
+// Trust is minted only by the native ceremony below; this replays prior decisions.
+loadApprovedSelfHostedOrigins();
 
 // Hardware acceleration preference — must be checked before app.whenReady()
 const hwAccelPrefPath = path.join(app.getPath('userData'), 'hw-accel.json');
@@ -1260,6 +1279,79 @@ ipcMain.handle('app:getSystemInfo', () => ({
 
 // ─── Secure Auth Token Management (safeStorage) ──────────────────────
 
+export interface ApprovalDialogParams {
+  host: string;
+  address: string;
+  decision: EgressDecision;
+}
+
+function addressClassSuffix(decision: EgressDecision): string {
+  if (decision.tier === 'tier2') {
+    if (decision.reason === 'loopback') return 'on this device';
+    if (decision.reason === 'cgnat') return "on your provider's network";
+    return 'on your network'; // private / ula
+  }
+  return 'on the internet'; // public (tier1 never reaches the ceremony)
+}
+
+/** Exported for unit test. Copy is verbatim per spec §7.2; punycode is never decoded. */
+export function buildApprovalDialogCopy(p: ApprovalDialogParams): {
+  message: string;
+  detail: string;
+} {
+  const suffix = addressClassSuffix(p.decision);
+  const message = `Trust ${p.host}?`;
+  const detail =
+    `Host:         ${p.host}\n` +
+    `Resolves to:  ${p.address}, ${suffix}\n\n` +
+    `If you trust it, Concord Voice will store your sign-in on this device and ` +
+    `use ${p.host} to sign you in from now on.\n\n` +
+    `Concord Voice will remember this choice on this device.`;
+  return { message, detail };
+}
+
+/** Exported for unit test. showMessageBox is injected (the applicationsFolderGate pattern). */
+export async function requestSelfHostedApproval(
+  win: unknown,
+  p: ApprovalDialogParams,
+  deps: { showMessageBox: (w: unknown, o: unknown) => Promise<{ response: number }> } = {
+    showMessageBox: (w, o) =>
+      w
+        ? dialog.showMessageBox(w as BrowserWindow, o as Electron.MessageBoxOptions)
+        : dialog.showMessageBox(o as Electron.MessageBoxOptions),
+  }
+): Promise<boolean> {
+  const { message, detail } = buildApprovalDialogCopy(p);
+  const { response } = await deps.showMessageBox(win, {
+    type: 'warning',
+    title: 'Concord Voice',
+    message,
+    detail,
+    buttons: ['Cancel', 'Trust This Server'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+  return response === 1;
+}
+
+// One probe at a time per webContents (the set is keyed on event.sender.id, so the
+// bound is PER-FRAME, not process-global). This is a REJECTING single-flight, not the
+// promise-sharing kind used by restoreSessionPromise / spaSelfHeal: two concurrent
+// probes of DIFFERENT urls must never share one result.
+//
+// It gates the whole handler because resolveForDisplay's dns.lookup is a
+// libuv-threadpool job that cannot be cancelled. The default pool is 4, so N
+// concurrent probes of unresolvable names queue N getaddrinfo jobs against those
+// slots and head-of-line-block every async fs operation in the main process —
+// credential IO and the approvals-file read included — with zero dialogs shown.
+// The threadpool is process-global while this bound is not, so the protection rests
+// on there being one auth window and the renderer having no way to mint another.
+// A per-request timeout (resolveForDisplay's race) does not free the slot; only
+// not starting the lookup does. ServerInput already disables Connect while busy,
+// so the refused concurrency has no legitimate caller.
+const probesInFlight = new Set<number>();
+
 ipcMain.handle('selfHosted:probeServer', async (event, url: unknown) => {
   if (!isTrustedAuthSender(event)) {
     console.warn('[selfHosted:probeServer] rejected — sender frame validation failed');
@@ -1269,6 +1361,35 @@ ipcMain.handle('selfHosted:probeServer', async (event, url: unknown) => {
       message: 'Self-hosted server probing is not available from this frame.',
     };
   }
+  // Set synchronously, before the handler's first await, so a burst dispatched in
+  // one tick cannot all observe an empty set.
+  // Fail closed rather than collapsing an unidentifiable sender into a shared bucket.
+  // `?? -1` would put every such caller on one key, so unrelated frames would refuse
+  // each other's probes as 'busy'. Electron populates `sender` for every ipcMain.handle
+  // today; this guards the refactor or harness where it does not. `rejected`, not
+  // `busy` — 'busy' is a transient retryable state and this is not transient.
+  const senderId = event.sender?.id;
+  if (senderId === undefined) {
+    console.warn('[selfHosted:probeServer] rejected — the invoke event carried no sender id');
+    return {
+      status: 'error',
+      code: 'rejected',
+      message: 'Self-hosted server probing is not available from this frame.',
+    };
+  }
+  if (probesInFlight.has(senderId)) {
+    console.warn('[selfHosted:probeServer] refused — a probe is already in flight');
+    return { status: 'error', code: 'busy', message: '' };
+  }
+  probesInFlight.add(senderId);
+  try {
+    return await handleProbeSelfHostedServer(url);
+  } finally {
+    probesInFlight.delete(senderId);
+  }
+});
+
+async function handleProbeSelfHostedServer(url: unknown): Promise<SelfHostedProbeResult> {
   if (typeof url !== 'string') {
     return {
       status: 'error',
@@ -1277,8 +1398,76 @@ ipcMain.handle('selfHosted:probeServer', async (event, url: unknown) => {
     };
   }
 
-  return probeSelfHostedServer(url);
-});
+  const normalized = normalizeSelfHostedUrl(url);
+  if (!normalized.ok) {
+    return { status: 'error', code: normalized.code, message: normalized.message };
+  }
+
+  const parsed = new URL(normalized.apiBase);
+  const resolved: ResolveForDisplayResult = await resolveForDisplay(parsed.hostname);
+  if (!resolved.ok && resolved.kind === 'tier1') {
+    // Reason token only; the renderer owns the user-facing copy.
+    return { status: 'error', code: 'address_not_allowed', message: resolved.reason };
+  }
+  if (!resolved.ok) {
+    return { status: 'error', code: 'unreachable', message: 'Could not reach the server.' };
+  }
+
+  // Consent is scoped to the address class the ceremony displayed. An origin approved
+  // against a public address has NOT authorized a tier-2 dial under that name, so a
+  // server that has genuinely moved onto a LAN re-runs the ceremony once — showing the
+  // private address this time — instead of stranding. An origin already approved at
+  // tier 2, or one still resolving public, never re-prompts.
+  const approvalTier = approvalTierForApiBase(normalized.apiBase);
+  const needsApproval =
+    approvalTier === null || (resolved.decision.tier === 'tier2' && approvalTier !== 'tier2');
+
+  if (needsApproval) {
+    // Rations the DIALOG, not the probe: an approved origin never reaches this
+    // branch, so re-probing it stays unthrottled. The token is taken before the
+    // modal opens because a declined ceremony cost the user the same interruption
+    // an approved one did.
+    if (!consumeCeremonyToken()) {
+      console.warn('[selfHosted:probeServer] refused — approval prompt budget exhausted');
+      return { status: 'error', code: 'too_many_prompts', message: '' };
+    }
+    // `mainWindow` is read HERE, at ceremony time — not at handler registration,
+    // when the auth window does not yet exist.
+    const approved = await requestSelfHostedApproval(mainWindow, {
+      host: parsed.hostname,
+      // Every resolved address, not just the representative: the user consents to the
+      // whole set the name answers with, so the whole set is what the dialog states.
+      address: resolved.addresses.join(', '),
+      decision: resolved.decision,
+    });
+    if (!approved) {
+      return { status: 'error', code: 'approval_declined', message: 'Connection cancelled.' };
+    }
+    // Consent is not proof. The grant is PROVISIONAL until the probe shows this origin
+    // answers like a Concord server: beginPendingApproval authorizes only the dial the
+    // probe itself needs, and the durable record is written after. Committing first meant
+    // any post-consent failure — non-Concord server, TLS, ECONNREFUSED, HTTP 500 — still
+    // left a permanent grant gating auth:storeRefreshToken and the SSO exchange.
+    beginPendingApproval(normalized.apiBase, resolved.address);
+    let result: SelfHostedProbeResult;
+    try {
+      result = await probeSelfHostedServer(normalized.apiBase);
+    } finally {
+      clearPendingApproval();
+    }
+    if (result?.status !== 'ok') return result;
+    if (!commitSelfHostedApproval(normalized.apiBase, resolved.address)) {
+      return {
+        status: 'error',
+        code: 'approval_not_saved',
+        message: "Concord couldn't save your choice.",
+      };
+    }
+    return result;
+  }
+
+  return probeSelfHostedServer(normalized.apiBase);
+}
 
 ipcMain.handle('auth:storeRefreshToken', (event, data: unknown) => {
   if (!isTrustedAuthSender(event)) {

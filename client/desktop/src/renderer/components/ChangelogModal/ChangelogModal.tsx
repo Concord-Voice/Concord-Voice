@@ -21,8 +21,20 @@ import './ChangelogModal.css';
 /** Public releases page (same public-repo target as UpdateSecurityBanner). */
 const FULL_NOTES_URL = 'https://github.com/Concord-Voice/Concord-Voice/releases';
 
-/** Newest sections rendered in full; the rest collapse to an "earlier versions" line. */
-const MAX_RENDERED_SECTIONS = 3;
+/**
+ * Newest sections rendered in full; the rest collapse to an "earlier versions" line.
+ *
+ * Raising this costs no layout: `.changelog-modal__notes` is a fixed `50vh`
+ * `overflow-y: auto` region and the actions row sits OUTSIDE it, so extra
+ * sections lengthen the scroll and can never push "Got it" off-screen.
+ *
+ * 12 is the two-week number. The 0.2.x line shipped 35 releases in 40 days
+ * (~6.1/week), so a user away one week skips ~6 and a user away two weeks skips
+ * ~12 — this shows an ordinary vacation's worth in full and collapses only the
+ * genuinely long absences, where the count plus "View full release notes" beats
+ * an endless scroll. Re-derive it if the release cadence changes materially.
+ */
+export const MAX_RENDERED_SECTIONS = 12;
 
 // Module-scope anchor override (same shape as MarkdownContent's MarkdownA —
 // defined at module scope so it isn't redeclared every render).
@@ -111,10 +123,13 @@ export function ChangelogModal({
         <h2 id="changelog-modal-title">What&apos;s new in v{currentVersion}</h2>
         <p id="changelog-modal-summary">{summary}</p>
         {visible.length > 0 && (
-          // Long release notes scroll. Native <section aria-label> carries the
-          // implicit region role (Sonar S6819/S6845 — no role/tabIndex props);
-          // keyboard scrolling rides the focusable PR links every section body
-          // carries, so focus moves the scroll position through the overflow.
+          // Native <section aria-label> carries the implicit region role, so no
+          // role prop is needed (Sonar S6819/S6845) — and deliberately no
+          // tabIndex either. Overflow lives on the DIALOG, not here, so the
+          // scroll container already contains the focused close button and arrow
+          // keys scroll it (WCAG 2.1.1). See ChangelogModal.css: moving the
+          // overflow back onto this region would leave it outside the focus path,
+          // because a preamble carries no links to tab to.
           <section className="changelog-modal__notes" aria-label="Release notes">
             {visible.map((s) => (
               <section key={s.version} className="changelog-modal__section">
@@ -123,7 +138,17 @@ export function ChangelogModal({
                   {s.date && <span className="changelog-modal__date"> — {s.date}</span>}
                 </h3>
                 <div className="changelog-modal__section-body">
-                  <ChangelogMarkdown content={s.body} />
+                  {/*
+                    Preamble-first: the modal is a notification, not the record.
+                    `preamble` is the short brand-voice summary above the first
+                    `### ` category; `body` is the full STE-flavored detail that
+                    CHANGELOG.md keeps for the public archive. Falling back to
+                    `body` keeps every entry predating the convention rendering
+                    exactly as it did before — and matters most here, because
+                    sectionsBetween() concatenates EVERY version the user
+                    skipped, so full bodies stack into an unreadable wall.
+                  */}
+                  <ChangelogMarkdown content={s.preamble || s.body} />
                 </div>
               </section>
             ))}

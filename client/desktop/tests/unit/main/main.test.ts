@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect, vi, beforeAll, type Mock } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, type Mock } from 'vitest';
 
 // ── Hoisted mocks (available during vi.mock factory execution) ─────────
 
@@ -48,6 +48,19 @@ const { mockRevealLoadFailure } = vi.hoisted(() => ({
 }));
 const { mockProbeSelfHostedServer } = vi.hoisted(() => ({
   mockProbeSelfHostedServer: vi.fn(),
+}));
+// #2354: the native approval ceremony + its pre-resolution seam.
+const { mockShowMessageBox, mockResolveForDisplay, approvalStore } = vi.hoisted(() => ({
+  mockShowMessageBox: vi.fn(async () => ({ response: 1 })),
+  mockResolveForDisplay: vi.fn(async () => ({
+    ok: true,
+    address: '10.0.0.5',
+    addresses: ['10.0.0.5'],
+    decision: { tier: 'tier2', reason: 'private' },
+  })),
+  // `failAppend` simulates a durable-write failure (safeStorage/fs), so the
+  // approval_not_saved path stays reachable after the commit moved behind the probe.
+  approvalStore: { records: [] as { origin: string }[], failAppend: false },
 }));
 const { mockMaybePromptMove } = vi.hoisted(() => ({
   mockMaybePromptMove: vi.fn(() => false),
@@ -139,6 +152,7 @@ vi.mock('electron', () => ({
   },
   shell: { openExternal: vi.fn(() => Promise.resolve()) },
   powerMonitor: { on: vi.fn() },
+  dialog: { showMessageBox: mockShowMessageBox },
 }));
 
 // ── Node / internal module mocks ───────────────────────────────────────
@@ -211,8 +225,31 @@ vi.mock('../../../src/main/machineId', () => ({
   getMachineId: vi.fn(() => 'mock-machine-id'),
 }));
 
-vi.mock('../../../src/main/selfHostedProbe', () => ({
+vi.mock('../../../src/main/selfHostedProbe', async (importActual) => ({
+  // normalizeSelfHostedUrl stays REAL — the ceremony keys its approval on the same
+  // normalized origin the probe will dial.
+  ...(await importActual<typeof import('../../../src/main/selfHostedProbe')>()),
   probeSelfHostedServer: mockProbeSelfHostedServer,
+}));
+
+// In-memory approval store so the ceremony's durable writer stays hermetic here.
+vi.mock('../../../src/main/selfHostedApprovals', () => ({
+  readApprovalsFile: () => approvalStore.records,
+  appendApprovalRecord: (r: { origin: string }) => {
+    if (approvalStore.failAppend) return false;
+    approvalStore.records.push(r);
+    return true;
+  },
+  // Most-recent-wins, matching the real append-only reader.
+  findApprovalRecord: (origin: string) =>
+    [...approvalStore.records].reverse().find((r) => r.origin === origin),
+  _resetApprovalsCacheForTesting: () => {
+    approvalStore.records.length = 0;
+  },
+}));
+
+vi.mock('../../../src/main/guardedRequest', () => ({
+  resolveForDisplay: mockResolveForDisplay,
 }));
 
 vi.mock('../../../src/main/updater', () => ({
@@ -279,9 +316,11 @@ type HandlerFn = (...args: unknown[]) => unknown;
 type CallbackFn = (...args: unknown[]) => void;
 let handlers: Map<string, HandlerFn>;
 const trustedIpcEvent = {
+  sender: { id: 41 },
   senderFrame: { url: 'http://localhost:3001/', frameTreeNodeId: 41 },
 };
 const foreignIpcEvent = {
+  sender: { id: 99 },
   senderFrame: { url: 'https://evil.example/', frameTreeNodeId: 99 },
 };
 let appOnCallbacks: Map<string, CallbackFn>;
@@ -299,9 +338,23 @@ let klipyInterceptor: {
   ) => void;
 } | null = null;
 
+// #2354: dialog calls attributable to main.ts's module load + init, captured before
+// any test can add its own. Order-independent, unlike reading the mock later.
+let dialogCallsAfterImport = -1;
+
+// #2354: the approval-prompt bucket is module-level state in the real (unmocked)
+// selfHostedCeremonyBudget, so without this every ceremony in this file spends from
+// one shared 10-minute window and later tests would throttle on earlier ones.
+beforeEach(async () => {
+  const { _resetCeremonyBudgetForTesting } =
+    await import('../../../src/main/selfHostedCeremonyBudget');
+  _resetCeremonyBudgetForTesting();
+});
+
 beforeAll(async () => {
   // Import triggers all module-scope side effects + whenReady resolves
   await import('../../../src/main/main');
+  dialogCallsAfterImport = mockShowMessageBox.mock.calls.length;
 
   // Allow async operations to settle (createWindow, whenReady callback)
   await new Promise((resolve) => setTimeout(resolve, 100));
@@ -525,7 +578,7 @@ describe('main.ts', () => {
       const { setUpdateFeedUrl } = await import('../../../src/main/updater');
       const data = { refreshToken: 'tok', rememberMe: true, apiBase: 'http://localhost:8080' };
       const result = await handlers.get('auth:storeRefreshToken')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         data
       );
       expect(result).toBe(41);
@@ -551,7 +604,7 @@ describe('main.ts', () => {
       (setUpdateFeedUrl as Mock).mockClear();
 
       const result = await handlers.get('auth:storeRefreshToken')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         { refreshToken: 'tok', rememberMe: true, apiBase: 'javascript:alert(1)' }
       );
 
@@ -574,7 +627,7 @@ describe('main.ts', () => {
       try {
         // Attacker host rejected even with a trusted frame + well-formed https URL.
         const evil = await handlers.get('auth:storeRefreshToken')!(
-          { senderFrame: { url: 'app://concord/index.html' } },
+          { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
           { refreshToken: 'tok', rememberMe: true, apiBase: 'https://evil.example' }
         );
         expect(evil).toEqual({ status: 'rejected' });
@@ -588,7 +641,7 @@ describe('main.ts', () => {
           apiBase: 'https://api.concordvoice.chat/',
         };
         await handlers.get('auth:storeRefreshToken')!(
-          { senderFrame: { url: 'app://concord/index.html' } },
+          { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
           data
         );
         expect(storeRefreshToken).toHaveBeenCalledWith(data);
@@ -601,14 +654,14 @@ describe('main.ts', () => {
     it('auth:storeRefreshToken accepts a validated self-hosted apiBase in packaged builds', async () => {
       const { storeRefreshToken } = await import('../../../src/main/tokenManager');
       const { setUpdateFeedUrl } = await import('../../../src/main/updater');
-      const { _resetSelfHostedProfileForTesting, rememberValidatedSelfHostedApiBase } =
+      const { _resetSelfHostedProfileForTesting, commitSelfHostedApproval } =
         await import('../../../src/main/selfHostedProfile');
       const electron = await import('electron');
       const app = electron.app as unknown as { isPackaged: boolean };
       (storeRefreshToken as Mock).mockClear();
       (setUpdateFeedUrl as Mock).mockClear();
       _resetSelfHostedProfileForTesting();
-      rememberValidatedSelfHostedApiBase('https://homelab.lan/setup');
+      commitSelfHostedApproval('https://homelab.lan/setup', '10.0.0.5');
 
       app.isPackaged = true;
       try {
@@ -618,7 +671,7 @@ describe('main.ts', () => {
           apiBase: 'https://homelab.lan',
         };
         await handlers.get('auth:storeRefreshToken')!(
-          { senderFrame: { url: 'app://concord/index.html' } },
+          { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
           data
         );
         expect(storeRefreshToken).toHaveBeenCalledWith(data);
@@ -704,7 +757,7 @@ describe('main.ts', () => {
       (restoreRefreshToken as Mock).mockClear();
       (performRefresh as Mock).mockClear();
 
-      const event = { senderFrame: { url: 'app://concord/index.html' } };
+      const event = { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } };
       await handlers.get('auth:restoreSession')!(event);
       await handlers.get('auth:restoreSession')!(event);
 
@@ -730,7 +783,7 @@ describe('main.ts', () => {
         wrappedPrivateKeyBase64: 'c',
       };
       await handlers.get('auth:storeE2EEKeys')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         data
       );
       expect(storeE2EEKeys).toHaveBeenCalledWith(data);
@@ -752,7 +805,7 @@ describe('main.ts', () => {
       (storeE2EEKeys as Mock).mockClear();
 
       const result = await handlers.get('auth:storeE2EEKeys')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         { wrappingKeyBase64: 'a', preferencesKeyBase64: 42, wrappedPrivateKeyBase64: 'c' }
       );
 
@@ -769,7 +822,7 @@ describe('main.ts', () => {
       };
 
       const result = await handlers.get('auth:storeE2EEKeysIfOwner')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         data,
         41
       );
@@ -783,7 +836,7 @@ describe('main.ts', () => {
       (storeE2EEKeysIfOwner as Mock).mockClear();
 
       const result = await handlers.get('auth:storeE2EEKeysIfOwner')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         {
           wrappingKeyBase64: 'a',
           preferencesKeyBase64: 'b',
@@ -834,7 +887,7 @@ describe('main.ts', () => {
     it('auth:logout delegates to performLogout', async () => {
       const { performLogout } = await import('../../../src/main/tokenManager');
       await handlers.get('auth:logout')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         { accessToken: 'tok' }
       );
       expect(performLogout).toHaveBeenCalledWith('tok');
@@ -855,7 +908,7 @@ describe('main.ts', () => {
       const { performLogout } = await import('../../../src/main/tokenManager');
       (performLogout as Mock).mockClear();
       const result = await handlers.get('auth:logout')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         { accessToken: 42 }
       );
       expect(result).toEqual({ status: 'rejected' });
@@ -884,11 +937,11 @@ describe('main.ts', () => {
       const { clearTokensIfOwner } = await import('../../../src/main/tokenManager');
 
       const cleared = await handlers.get('auth:clearTokensIfOwner')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         41
       );
       const preserved = await handlers.get('auth:clearTokensIfOwner')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         40
       );
 
@@ -903,7 +956,7 @@ describe('main.ts', () => {
       (clearTokensIfOwner as Mock).mockClear();
 
       const result = await handlers.get('auth:clearTokensIfOwner')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         Number.NaN
       );
 
@@ -951,13 +1004,12 @@ describe('main.ts', () => {
 
     it('auth:getMachineId returns the machine id for a validated self-hosted apiBase', async () => {
       const { getMachineId } = await import('../../../src/main/machineId');
-      const { rememberValidatedSelfHostedApiBase } =
-        await import('../../../src/main/selfHostedProfile');
+      const { commitSelfHostedApproval } = await import('../../../src/main/selfHostedProfile');
       (getMachineId as Mock).mockClear();
-      rememberValidatedSelfHostedApiBase('https://homelab.lan');
+      commitSelfHostedApproval('https://homelab.lan', '10.0.0.5');
 
       const result = await handlers.get('auth:getMachineId')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         'https://homelab.lan'
       );
 
@@ -982,7 +1034,7 @@ describe('main.ts', () => {
       });
 
       const result = await handlers.get('selfHosted:probeServer')!(
-        { senderFrame: { url: 'app://concord/index.html' } },
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
         'https://homelab.lan'
       );
 
@@ -993,6 +1045,28 @@ describe('main.ts', () => {
         capabilities: {},
       });
       expect(probeSelfHostedServer).toHaveBeenCalledWith('https://homelab.lan');
+    });
+
+    it('selfHosted:probeServer rejects an event carrying no sender id (Gitar, #2668)', async () => {
+      // The single-flight key was `event.sender?.id ?? -1`, which collapsed every
+      // sender-less event onto ONE bucket — unrelated frames would then refuse each
+      // other's probes as 'busy'. Fail closed instead, and with 'rejected' rather than
+      // 'busy': 'busy' advertises a transient state the caller should retry, and this
+      // is not transient. Electron always populates `sender` for ipcMain.handle today;
+      // this guards the refactor or harness where it does not.
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      (probeSelfHostedServer as Mock).mockClear();
+      const result = await handlers.get('selfHosted:probeServer')!(
+        { senderFrame: { url: 'app://concord/index.html' } },
+        'https://real.lan'
+      );
+      expect(result).toEqual({
+        status: 'error',
+        code: 'rejected',
+        message: 'Self-hosted server probing is not available from this frame.',
+      });
+      // Refused before any side effect: no probe, no ceremony.
+      expect(probeSelfHostedServer).not.toHaveBeenCalled();
     });
 
     it('selfHosted:probeServer rejects untrusted sender frames', async () => {
@@ -1010,6 +1084,485 @@ describe('main.ts', () => {
         message: 'Self-hosted server probing is not available from this frame.',
       });
       expect(probeSelfHostedServer).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('approval dialog copy (#2354)', () => {
+    // The §8.4 forbidden-vocabulary list is scoped to RENDERER-visible strings. The
+    // `resolve` stem is deliberately NOT asserted here: §7.2 mandates this native
+    // dialog's copy verbatim, and that copy carries the `Resolves to:` label.
+    const FORBIDDEN = [
+      'DNS',
+      'lookup',
+      'denylist',
+      'blocklist',
+      'tier',
+      'CIDR',
+      'RFC1918',
+      'private network',
+      'loopback',
+      'origin',
+      'IPC',
+      'SSRF',
+      'socket',
+      'agent',
+      'redirect hop',
+    ];
+
+    it('renders the loopback variant with identical weight and no softening', async () => {
+      const { buildApprovalDialogCopy } = await import('../../../src/main/main');
+      const { classifyAddress } = await import('../../../src/main/egressPolicy');
+      const { message, detail } = buildApprovalDialogCopy({
+        host: 'concord.lan',
+        address: '127.0.0.1',
+        decision: classifyAddress('127.0.0.1'),
+      });
+      expect(message).toContain('Trust concord.lan?');
+      expect(detail).toContain('Host:         concord.lan');
+      expect(detail).toContain('127.0.0.1, on this device');
+      expect(detail).toContain('store your sign-in on this device');
+      expect(detail).toContain('Concord Voice will remember this choice on this device.');
+      expect(detail).not.toContain('You will not be asked again');
+    });
+
+    it('renders the LAN / CGNAT / public suffixes', async () => {
+      const { buildApprovalDialogCopy } = await import('../../../src/main/main');
+      const { classifyAddress } = await import('../../../src/main/egressPolicy');
+      expect(
+        buildApprovalDialogCopy({
+          host: 'a',
+          address: '10.0.0.5',
+          decision: classifyAddress('10.0.0.5'),
+        }).detail
+      ).toContain('10.0.0.5, on your network');
+      expect(
+        buildApprovalDialogCopy({
+          host: 'a',
+          address: '100.64.0.1',
+          decision: classifyAddress('100.64.0.1'),
+        }).detail
+      ).toContain("100.64.0.1, on your provider's network");
+      expect(
+        buildApprovalDialogCopy({
+          host: 'a',
+          address: '93.184.216.34',
+          decision: classifyAddress('93.184.216.34'),
+        }).detail
+      ).toContain('93.184.216.34, on the internet');
+    });
+
+    it('uses no forbidden mechanism vocabulary and never decodes punycode', async () => {
+      const { buildApprovalDialogCopy } = await import('../../../src/main/main');
+      const { classifyAddress } = await import('../../../src/main/egressPolicy');
+      const { message, detail } = buildApprovalDialogCopy({
+        host: 'xn--bcher-kva.example',
+        address: '203.0.113.4',
+        decision: classifyAddress('203.0.113.4'),
+      });
+      const text = `${message}\n${detail}`.toLowerCase();
+      for (const word of FORBIDDEN) expect(text).not.toContain(word.toLowerCase());
+      expect(detail).toContain('xn--bcher-kva.example'); // punycode preserved verbatim
+    });
+  });
+
+  // Every assertion here locks #14a — "main introduces no trigger of its own" — and only
+  // that. None of them measures renderer-side anchoring, which ADR-0035 § "Non-property
+  // #14b" records as a property this design does not have.
+  describe('#14a — main introduces no ceremony trigger of its own (#2354)', () => {
+    it('shows no dialog at module import or main init (no startup/revalidation trigger)', () => {
+      // Captured immediately after the import in beforeAll, so this cannot be
+      // satisfied or broken by test-execution order.
+      expect(dialogCallsAfterImport).toBe(0);
+    });
+
+    it('refuses a tier-1 address with no dialog and no probe', async () => {
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      const { _resetSelfHostedProfileForTesting } =
+        await import('../../../src/main/selfHostedProfile');
+      _resetSelfHostedProfileForTesting();
+      approvalStore.records.length = 0;
+      (probeSelfHostedServer as Mock).mockClear();
+      mockShowMessageBox.mockClear();
+      mockResolveForDisplay.mockResolvedValueOnce({
+        ok: false,
+        kind: 'tier1',
+        reason: 'metadata_link_local',
+      } as never);
+
+      const result = await handlers.get('selfHosted:probeServer')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        'https://metadata.invalid'
+      );
+
+      expect(result).toEqual({
+        status: 'error',
+        code: 'address_not_allowed',
+        message: 'metadata_link_local',
+      });
+      expect(mockShowMessageBox).not.toHaveBeenCalled();
+      expect(probeSelfHostedServer).not.toHaveBeenCalled();
+    });
+
+    it('declining the ceremony mints nothing and never probes', async () => {
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      const { _resetSelfHostedProfileForTesting, isValidatedSelfHostedApiBase } =
+        await import('../../../src/main/selfHostedProfile');
+      _resetSelfHostedProfileForTesting();
+      approvalStore.records.length = 0;
+      (probeSelfHostedServer as Mock).mockClear();
+      mockShowMessageBox.mockClear();
+      mockShowMessageBox.mockResolvedValueOnce({ response: 0 });
+
+      const result = await handlers.get('selfHosted:probeServer')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        'https://declined.lan'
+      );
+
+      expect(result).toEqual({
+        status: 'error',
+        code: 'approval_declined',
+        message: 'Connection cancelled.',
+      });
+      expect(mockShowMessageBox).toHaveBeenCalledTimes(1);
+      expect(probeSelfHostedServer).not.toHaveBeenCalled();
+      expect(isValidatedSelfHostedApiBase('https://declined.lan')).toBe(false);
+      expect(approvalStore.records).toHaveLength(0);
+    });
+
+    // Consent alone used to mint the durable grant, so EVERY post-consent failure — a
+    // non-Concord server, TLS, ECONNREFUSED, HTTP 500, an oversized body — left the origin
+    // permanently in the approved set and the approvals file, gating auth:storeRefreshToken
+    // and the SSO exchange with no in-app revocation. A compromised renderer only needed the
+    // user to approve some origin once; it never had to make that origin behave like Concord.
+    it('a probe that fails after consent mints nothing durable (#2354 review item 3)', async () => {
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      const { _resetSelfHostedProfileForTesting, isValidatedSelfHostedApiBase } =
+        await import('../../../src/main/selfHostedProfile');
+      _resetSelfHostedProfileForTesting();
+      approvalStore.records.length = 0;
+      mockShowMessageBox.mockClear();
+      (probeSelfHostedServer as Mock).mockClear();
+      const failure = {
+        status: 'error',
+        code: 'client_config_failed',
+        message: 'The server did not respond like a Concord server.',
+      };
+      (probeSelfHostedServer as Mock).mockResolvedValueOnce(failure);
+
+      const result = await handlers.get('selfHosted:probeServer')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        'https://not-concord.lan'
+      );
+
+      // The user consented and the probe ran on the provisional grant …
+      expect(mockShowMessageBox).toHaveBeenCalledTimes(1);
+      expect(probeSelfHostedServer).toHaveBeenCalledTimes(1);
+      expect(result).toEqual(failure);
+      // … but nothing durable was minted, so the origin holds no credential or SSO trust.
+      expect(isValidatedSelfHostedApiBase('https://not-concord.lan')).toBe(false);
+      expect(approvalStore.records).toHaveLength(0);
+    });
+
+    it('a successful probe still mints, and still reports a failed durable write', async () => {
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      const { _resetSelfHostedProfileForTesting, isValidatedSelfHostedApiBase } =
+        await import('../../../src/main/selfHostedProfile');
+      _resetSelfHostedProfileForTesting();
+      approvalStore.records.length = 0;
+      mockShowMessageBox.mockClear();
+      (probeSelfHostedServer as Mock).mockClear();
+      const ok = { status: 'ok', apiBase: 'https://real.lan' };
+      (probeSelfHostedServer as Mock).mockResolvedValue(ok);
+
+      expect(
+        await handlers.get('selfHosted:probeServer')!(
+          { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+          'https://real.lan'
+        )
+      ).toEqual(ok);
+      expect(isValidatedSelfHostedApiBase('https://real.lan')).toBe(true);
+      expect(approvalStore.records).toHaveLength(1);
+
+      // approval_not_saved must survive the reorder: a durable-write failure on an
+      // otherwise-successful probe is still surfaced, not silently swallowed.
+      _resetSelfHostedProfileForTesting();
+      approvalStore.records.length = 0;
+      approvalStore.failAppend = true;
+      try {
+        expect(
+          await handlers.get('selfHosted:probeServer')!(
+            { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+            'https://unwritable.lan'
+          )
+        ).toEqual({
+          status: 'error',
+          code: 'approval_not_saved',
+          message: "Concord couldn't save your choice.",
+        });
+      } finally {
+        approvalStore.failAppend = false;
+      }
+      expect(isValidatedSelfHostedApiBase('https://unwritable.lan')).toBe(false);
+    });
+
+    it('approving mints once, then a second probe of the same origin does not re-prompt', async () => {
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      const { _resetSelfHostedProfileForTesting, isValidatedSelfHostedApiBase } =
+        await import('../../../src/main/selfHostedProfile');
+      _resetSelfHostedProfileForTesting();
+      approvalStore.records.length = 0;
+      mockShowMessageBox.mockClear();
+      (probeSelfHostedServer as Mock).mockClear();
+      (probeSelfHostedServer as Mock).mockResolvedValue({ status: 'ok' });
+
+      await handlers.get('selfHosted:probeServer')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        'https://approved.lan'
+      );
+      await handlers.get('selfHosted:probeServer')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        'https://approved.lan'
+      );
+
+      expect(mockShowMessageBox).toHaveBeenCalledTimes(1); // rarity: once per origin
+      expect(isValidatedSelfHostedApiBase('https://approved.lan')).toBe(true);
+      expect(approvalStore.records).toHaveLength(1);
+      expect(probeSelfHostedServer).toHaveBeenCalledTimes(2);
+    });
+
+    it('re-runs the ceremony when a public-approved origin now resolves into tier 2', async () => {
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      const { _resetSelfHostedProfileForTesting } =
+        await import('../../../src/main/selfHostedProfile');
+      _resetSelfHostedProfileForTesting();
+      approvalStore.records.length = 0;
+      mockShowMessageBox.mockClear();
+      (probeSelfHostedServer as Mock).mockClear();
+      (probeSelfHostedServer as Mock).mockResolvedValue({ status: 'ok' });
+
+      // First connect: the ceremony displays a public address; consent is 'public'.
+      mockResolveForDisplay.mockResolvedValueOnce({
+        ok: true,
+        address: '203.0.113.10',
+        addresses: ['203.0.113.10'],
+        decision: { tier: 'public' },
+      } as never);
+      await handlers.get('selfHosted:probeServer')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        'https://moved.lan'
+      );
+      expect(approvalStore.records).toEqual([
+        expect.objectContaining({ tierAtApproval: 'public' }),
+      ]);
+
+      // Second connect: the same name now resolves onto the LAN. Consent taken against
+      // a public address never authorized that, so the user is asked again — showing
+      // the private address this time — rather than the dial being silently permitted.
+      mockResolveForDisplay.mockResolvedValueOnce({
+        ok: true,
+        address: '10.0.0.5',
+        addresses: ['10.0.0.5'],
+        decision: { tier: 'tier2', reason: 'private' },
+      } as never);
+      await handlers.get('selfHosted:probeServer')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        'https://moved.lan'
+      );
+
+      expect(mockShowMessageBox).toHaveBeenCalledTimes(2);
+      expect(approvalStore.records).toHaveLength(2);
+      expect(approvalStore.records[1]).toEqual(
+        expect.objectContaining({ tierAtApproval: 'tier2' })
+      );
+    });
+
+    it('does not re-prompt a public-approved origin that still resolves public', async () => {
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      const { _resetSelfHostedProfileForTesting } =
+        await import('../../../src/main/selfHostedProfile');
+      _resetSelfHostedProfileForTesting();
+      approvalStore.records.length = 0;
+      mockShowMessageBox.mockClear();
+      (probeSelfHostedServer as Mock).mockClear();
+      (probeSelfHostedServer as Mock).mockResolvedValue({ status: 'ok' });
+
+      const publicResolution = {
+        ok: true,
+        address: '203.0.113.10',
+        addresses: ['203.0.113.10'],
+        decision: { tier: 'public' },
+      } as never;
+      mockResolveForDisplay.mockResolvedValueOnce(publicResolution);
+      await handlers.get('selfHosted:probeServer')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        'https://steady.lan'
+      );
+      mockResolveForDisplay.mockResolvedValueOnce(publicResolution);
+      await handlers.get('selfHosted:probeServer')!(
+        { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+        'https://steady.lan'
+      );
+
+      // Rarity invariant: an approved origin produces no prompt on repeat connect.
+      expect(mockShowMessageBox).toHaveBeenCalledTimes(1);
+      expect(approvalStore.records).toHaveLength(1);
+      expect(probeSelfHostedServer).toHaveBeenCalledTimes(2);
+    });
+
+    // Assertion 4 of #14a. This locks that the dialog answers THIS SPECIFIC INVOCATION —
+    // an invocation, not a user action. It does not, and cannot, show a human initiated
+    // it: see ADR-0035 § "Non-property #14b".
+    it('resolves an approval from the dialog that same invocation asked to show', async () => {
+      const { requestSelfHostedApproval } = await import('../../../src/main/main');
+      const showMessageBox = vi.fn().mockResolvedValue({ response: 1 });
+      const approved = await requestSelfHostedApproval(
+        {},
+        {
+          host: 'concord.lan',
+          address: '10.0.0.5',
+          decision: { tier: 'tier2', reason: 'private' },
+        },
+        { showMessageBox }
+      );
+      expect(showMessageBox).toHaveBeenCalledTimes(1);
+      expect(approved).toBe(true);
+    });
+
+    it('treats Cancel (response 0) and dismiss as decline', async () => {
+      const { requestSelfHostedApproval } = await import('../../../src/main/main');
+      const showMessageBox = vi.fn().mockResolvedValue({ response: 0 });
+      const approved = await requestSelfHostedApproval(
+        {},
+        {
+          host: 'concord.lan',
+          address: '127.0.0.1',
+          decision: { tier: 'tier2', reason: 'loopback' },
+        },
+        { showMessageBox }
+      );
+      expect(approved).toBe(false);
+    });
+
+    it('passes a destructive-safe button configuration', async () => {
+      const { requestSelfHostedApproval } = await import('../../../src/main/main');
+      const showMessageBox = vi.fn().mockResolvedValue({ response: 0 });
+      await requestSelfHostedApproval(
+        {},
+        {
+          host: 'concord.lan',
+          address: '10.0.0.5',
+          decision: { tier: 'tier2', reason: 'private' },
+        },
+        { showMessageBox }
+      );
+      const options = showMessageBox.mock.calls[0][1] as Record<string, unknown>;
+      expect(options.type).toBe('warning');
+      expect(options.buttons).toEqual(['Cancel', 'Trust This Server']);
+      expect(options.defaultId).toBe(0);
+      expect(options.cancelId).toBe(0);
+      expect(options.noLink).toBe(true);
+      expect(options.icon).toBeUndefined();
+      // A decision, not an omission — ADR-0035 § "Non-property #14b". MessageBoxOptions
+      // cannot gate the affirmative on checkbox state, so an unchecked accept becomes a
+      // silent no-op that a native dialog cannot explain or validate inline.
+      expect(options.checkboxLabel).toBeUndefined();
+    });
+  });
+
+  describe('ceremony budget (#2354)', () => {
+    // The bucket rations DIALOGS, not probes: an approved origin re-probes freely.
+    it('refuses a ceremony past the budget while an approved origin still probes', async () => {
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      const { _resetSelfHostedProfileForTesting } =
+        await import('../../../src/main/selfHostedProfile');
+      const { CEREMONY_BUDGET } = await import('../../../src/main/selfHostedCeremonyBudget');
+      _resetSelfHostedProfileForTesting();
+      approvalStore.records.length = 0;
+      mockShowMessageBox.mockClear();
+      (probeSelfHostedServer as Mock).mockReset();
+      (probeSelfHostedServer as Mock).mockResolvedValue({ status: 'ok' });
+
+      // Each distinct origin is a fresh ceremony.
+      for (let i = 0; i < CEREMONY_BUDGET; i++) {
+        await handlers.get('selfHosted:probeServer')!(trustedIpcEvent, `https://burst${i}.lan`);
+      }
+      expect(mockShowMessageBox).toHaveBeenCalledTimes(CEREMONY_BUDGET);
+
+      const refused = await handlers.get('selfHosted:probeServer')!(
+        trustedIpcEvent,
+        'https://burst-over.lan'
+      );
+      expect(refused).toEqual({ status: 'error', code: 'too_many_prompts', message: '' });
+      expect(mockShowMessageBox).toHaveBeenCalledTimes(CEREMONY_BUDGET);
+
+      // An origin approved before the bucket drained is unaffected — no dialog, so
+      // no token, so the throttle must not touch it.
+      const approved = await handlers.get('selfHosted:probeServer')!(
+        trustedIpcEvent,
+        'https://burst0.lan'
+      );
+      expect(approved).toEqual({ status: 'ok' });
+      expect(mockShowMessageBox).toHaveBeenCalledTimes(CEREMONY_BUDGET);
+    });
+  });
+
+  describe('probe single-flight (#2354)', () => {
+    // resolveForDisplay's dns.lookup is a libuv-threadpool job that cannot be
+    // cancelled, so concurrency here is a resource-exhaustion lever, not a
+    // convenience issue. The gate must therefore cover the WHOLE handler.
+    it('refuses a concurrent probe from the same sender while letting another sender through', async () => {
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      const { _resetSelfHostedProfileForTesting } =
+        await import('../../../src/main/selfHostedProfile');
+      _resetSelfHostedProfileForTesting();
+      approvalStore.records.length = 0;
+      mockShowMessageBox.mockClear();
+      (probeSelfHostedServer as Mock).mockReset();
+
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      (probeSelfHostedServer as Mock).mockImplementation(async () => {
+        await gate;
+        return { status: 'ok' };
+      });
+
+      const senderA = { senderFrame: { url: 'app://concord/index.html' }, sender: { id: 7 } };
+      const senderB = { senderFrame: { url: 'app://concord/index.html' }, sender: { id: 8 } };
+
+      const first = handlers.get('selfHosted:probeServer')!(senderA, 'https://inflight.lan');
+      const refused = await handlers.get('selfHosted:probeServer')!(senderA, 'https://other.lan');
+      const third = handlers.get('selfHosted:probeServer')!(senderB, 'https://third.lan');
+
+      expect(refused).toEqual({ status: 'error', code: 'busy', message: '' });
+
+      release();
+      await expect(first).resolves.toEqual({ status: 'ok' });
+      await expect(third).resolves.toEqual({ status: 'ok' });
+      // The refused call must not have dialled or prompted for its own origin.
+      expect(probeSelfHostedServer).toHaveBeenCalledTimes(2);
+    });
+
+    it('releases the slot after a probe settles, including on rejection', async () => {
+      const { probeSelfHostedServer } = await import('../../../src/main/selfHostedProbe');
+      const { _resetSelfHostedProfileForTesting } =
+        await import('../../../src/main/selfHostedProfile');
+      _resetSelfHostedProfileForTesting();
+      approvalStore.records.length = 0;
+      mockShowMessageBox.mockClear();
+      (probeSelfHostedServer as Mock).mockReset();
+      (probeSelfHostedServer as Mock).mockRejectedValueOnce(new Error('boom'));
+
+      const sender = { senderFrame: { url: 'app://concord/index.html' }, sender: { id: 9 } };
+      await expect(
+        handlers.get('selfHosted:probeServer')!(sender, 'https://flaky.lan')
+      ).rejects.toThrow('boom');
+
+      (probeSelfHostedServer as Mock).mockResolvedValueOnce({ status: 'ok' });
+      await expect(
+        handlers.get('selfHosted:probeServer')!(sender, 'https://flaky.lan')
+      ).resolves.toEqual({ status: 'ok' });
     });
   });
 
@@ -1865,7 +2418,7 @@ describe('main.ts', () => {
       // The restoreSession handler caches its promise — calling it twice
       // should return the same result without re-invoking performRefresh.
       const handler = handlers.get('auth:restoreSession')!;
-      const event = { senderFrame: { url: 'app://concord/index.html' } };
+      const event = { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } };
       const result1 = await handler(event);
       const result2 = await handler(event);
       expect(result1).toEqual(result2);
@@ -1873,7 +2426,10 @@ describe('main.ts', () => {
 
     it('restoreSession handler exists and returns an object', async () => {
       const handler = handlers.get('auth:restoreSession')!;
-      const result = await handler({ senderFrame: { url: 'app://concord/index.html' } });
+      const result = await handler({
+        sender: { id: 1 },
+        senderFrame: { url: 'app://concord/index.html' },
+      });
       expect(result).toHaveProperty('status');
     });
   });

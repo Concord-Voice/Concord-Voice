@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import ChangelogModalHost, {
   ChangelogModal,
+  MAX_RENDERED_SECTIONS,
 } from '../../../src/renderer/components/ChangelogModal/ChangelogModal';
 import { useChangelogStore } from '../../../src/renderer/stores/changelogStore';
 import { useAuthStore } from '../../../src/renderer/stores/authStore';
@@ -21,11 +22,12 @@ beforeEach(() => {
   });
 });
 
-const section = (version: string, body: string): ChangelogSection => ({
+const section = (version: string, body: string, preamble = ''): ChangelogSection => ({
   version,
   label: version,
   date: '2026-07-01',
   body,
+  preamble,
 });
 
 describe('ChangelogModal (presentational)', () => {
@@ -45,15 +47,31 @@ describe('ChangelogModal (presentational)', () => {
     expect(document.activeElement).toBe(screen.getByRole('button', { name: /got it/i }));
   });
 
-  it('renders newest 3 sections plus an "earlier versions" line', () => {
-    const sections = ['0.2.21', '0.2.20', '0.2.19', '0.2.18', '0.2.17'].map((v) =>
-      section(v, `notes for ${v}`)
+  it('renders the newest MAX_RENDERED_SECTIONS plus an "earlier versions" line', () => {
+    // Derived from the constant, not a literal, so a cadence-driven cap change
+    // does not need a matching edit here (the cap moved 3 → 12 for exactly that).
+    const overflow = 2;
+    const sections = Array.from({ length: MAX_RENDERED_SECTIONS + overflow }, (_, i) =>
+      section(`0.2.${100 - i}`, `notes for index ${i}`)
     );
-    render(<ChangelogModal currentVersion="0.2.21" sections={sections} onDismiss={() => {}} />);
-    expect(screen.getByText('notes for 0.2.21')).toBeInTheDocument();
-    expect(screen.getByText('notes for 0.2.19')).toBeInTheDocument();
-    expect(screen.queryByText('notes for 0.2.18')).not.toBeInTheDocument();
-    expect(screen.getByText(/and 2 earlier versions/)).toBeInTheDocument();
+    render(<ChangelogModal currentVersion="0.2.100" sections={sections} onDismiss={() => {}} />);
+
+    expect(screen.getByText('notes for index 0')).toBeInTheDocument();
+    expect(screen.getByText(`notes for index ${MAX_RENDERED_SECTIONS - 1}`)).toBeInTheDocument();
+    expect(screen.queryByText(`notes for index ${MAX_RENDERED_SECTIONS}`)).not.toBeInTheDocument();
+    expect(screen.getByText(new RegExp(`and ${overflow} earlier versions`))).toBeInTheDocument();
+  });
+
+  it('renders every section with no overflow line when the range fits the cap', () => {
+    // The point of raising the cap: an ordinary two-week absence (~12 releases
+    // at the measured 6.1/week) is shown in full rather than collapsed.
+    const sections = Array.from({ length: MAX_RENDERED_SECTIONS }, (_, i) =>
+      section(`0.2.${100 - i}`, `notes for index ${i}`)
+    );
+    render(<ChangelogModal currentVersion="0.2.100" sections={sections} onDismiss={() => {}} />);
+
+    expect(screen.getByText(`notes for index ${MAX_RENDERED_SECTIONS - 1}`)).toBeInTheDocument();
+    expect(screen.queryByText(/earlier version/)).not.toBeInTheDocument();
   });
 
   it('exposes the notes as a named region with keyboard-focusable link content', () => {
@@ -105,6 +123,72 @@ describe('ChangelogModal (presentational)', () => {
     render(<ChangelogModal currentVersion="0.2.21" sections={[]} onDismiss={onDismiss} />);
     fireEvent(screen.getByRole('dialog'), new Event('close'));
     expect(onDismiss).toHaveBeenCalled();
+  });
+
+  it('keeps scrollable content reachable by keyboard (WCAG 2.1.1)', () => {
+    // Overflow lives on the DIALOG, so the scroll container contains the focused
+    // close button and arrow keys scroll it. A preamble carries no links, so
+    // moving overflow onto the notes region would put the scroll container
+    // outside the focus path — and making that region focusable would mean a
+    // tabIndex on a non-interactive element. Vitest runs with css:false, so the
+    // overflow itself is asserted by the stylesheet; this locks the DOM half.
+    render(
+      <ChangelogModal
+        currentVersion="0.2.40"
+        sections={[section('0.2.40', 'Detail.', 'Summary with no links at all.')]}
+        onDismiss={() => {}}
+      />
+    );
+    const notes = screen.getByRole('region', { name: /release notes/i });
+    expect(notes).not.toHaveAttribute('tabindex');
+    // The scroll container (the dialog) must own a focusable descendant.
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toContainElement(screen.getByRole('button', { name: /got it/i }));
+  });
+
+  it('renders the preamble and NOT the full detail body when a preamble exists', () => {
+    render(
+      <ChangelogModal
+        currentVersion="0.2.40"
+        sections={[section('0.2.40', 'Full STE detail bullet text.', 'Short brand summary.')]}
+        onDismiss={() => {}}
+      />
+    );
+    expect(screen.getByText('Short brand summary.')).toBeInTheDocument();
+    expect(screen.queryByText('Full STE detail bullet text.')).not.toBeInTheDocument();
+  });
+
+  it('falls back to the body for entries predating the preamble convention', () => {
+    render(
+      <ChangelogModal
+        currentVersion="0.2.21"
+        sections={[section('0.2.21', 'Legacy body text.')]}
+        onDismiss={() => {}}
+      />
+    );
+    expect(screen.getByText('Legacy body text.')).toBeInTheDocument();
+  });
+
+  it('keeps a mixed range readable — preamble sections stay summarized alongside legacy ones', () => {
+    // sectionsBetween() concatenates EVERY skipped version, so a user upgrading
+    // across the convention boundary sees both shapes at once. The new sections
+    // must not regress to full bodies just because an older one has none.
+    render(
+      <ChangelogModal
+        currentVersion="0.2.41"
+        sections={[
+          section('0.2.41', 'Detail for 41.', 'Summary for 41.'),
+          section('0.2.40', 'Detail for 40.', 'Summary for 40.'),
+          section('0.2.39', 'Legacy detail for 39.'),
+        ]}
+        onDismiss={() => {}}
+      />
+    );
+    expect(screen.getByText('Summary for 41.')).toBeInTheDocument();
+    expect(screen.getByText('Summary for 40.')).toBeInTheDocument();
+    expect(screen.getByText('Legacy detail for 39.')).toBeInTheDocument();
+    expect(screen.queryByText('Detail for 41.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Detail for 40.')).not.toBeInTheDocument();
   });
 });
 

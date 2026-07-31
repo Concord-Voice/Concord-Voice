@@ -54,9 +54,15 @@
  * promise settles — if the renderer never calls awaitCallback the active map
  * does not leak forever.
  */
+// `isIP` is imported as a NAMED binding, not a default `net` namespace: `net` is
+// already bound to Electron's `net` above/below, and a default import would shadow it.
+import { isIP } from 'node:net';
+
 import { ipcMain, net, shell, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 
 import { getApiBaseUrl, PRODUCTION_API_BASE } from '../apiBaseUrl';
+import { classifyAddress } from '../egressPolicy';
+import { guardedRequest } from '../guardedRequest';
 import { getMachineId } from '../machineId';
 import { cancelActiveAppleFlow, runAppleSignIn } from '../oauth/apple/appleFlow';
 import { appleTokenCall } from '../oauth/apple/appleTokenCall';
@@ -67,7 +73,7 @@ import { cancelActiveGoogleFlow, runGoogleSignIn } from '../oauth/google/googleF
 import { googleTokenCall } from '../oauth/google/googleTokenCall';
 import { verifyGoogleIDToken } from '../oauth/google/idTokenVerifier';
 import { normalizeSelfHostedUrl } from '../selfHostedProbe';
-import { isValidatedSelfHostedApiBase } from '../selfHostedProfile';
+import { isTier2DialApproved, isValidatedSelfHostedApiBase } from '../selfHostedProfile';
 import { startLoopback, type LoopbackHandle } from '../ssoLoopback';
 import {
   clearTokensIfOwner,
@@ -155,10 +161,27 @@ function checkFrame(
   return isPermittedFrameUrl(url, getSpaBaseUrl());
 }
 
-function approvedApiBase(value: unknown): string | null {
+export function approvedApiBase(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const normalized = normalizeSelfHostedUrl(value);
   if (!normalized.ok || normalized.apiBase !== value) return null;
+
+  // Tier-1 pre-flight (#2354 §6.5). DEFENSE IN DEPTH ONLY — this does NOT close the
+  // TOCTOU window, and it does NOT protect the four un-movable credentials:'include'
+  // sites below against DNS rebinding: it inspects the URL's own text, not the address
+  // the socket ultimately dials. Its threat model is narrower — a hand-edited or
+  // tampered self-hosted-approvals.json, or a future code path that adds to the
+  // validated set outside the approval ceremony. It is deliberately SYNCHRONOUS and
+  // IP-LITERAL-ONLY (no name lookup) so approvedApiBase stays synchronous for its
+  // callers; making it async would ripple through every sso: handler. It is also
+  // TIER-1-ONLY: a tier-2 literal (loopback / RFC1918 / ULA / CGNAT) in a tampered
+  // approvals file passes this check, and the four credentials:'include' sites below
+  // carry no egress guard of their own, so they would dial it. The real
+  // connection-time guarantee lives in guardedRequest. Reuses classifyAddress so there
+  // is never a second, drifting address predicate.
+  const host = new URL(value).hostname.replace(/^\[|\]$/g, '');
+  if (isIP(host) !== 0 && classifyAddress(host).tier === 'tier1') return null;
+
   return value === PRODUCTION_API_BASE ||
     value === getApiBaseUrl() ||
     isValidatedSelfHostedApiBase(value)
@@ -268,18 +291,28 @@ async function responseJson(response: Response): Promise<unknown> {
 
 async function revokeExplicitSession(apiBase: string, tokens: MainCompletionTokens): Promise<void> {
   try {
-    await net.fetch(`${apiBase}/api/v1/auth/logout`, {
+    // #2354 §6.4: this is the ONLY sso.ts egress that may move to the guarded Node
+    // transport, because it is credentials:'omit' and writes its own headers — it needs
+    // no cookie jar. The public SaaS origin is permitted by policy; a self-hosted origin
+    // has already been approved through the native ceremony. The four credentials:'include'
+    // sites CANNOT follow it (Node's fetch has no cookie jar — see the notes below).
+    await guardedRequest(`${apiBase}/api/v1/auth/logout`, {
       method: 'POST',
-      credentials: 'omit',
       headers: {
         Authorization: `Bearer ${tokens.accessToken}`,
         'X-Refresh-Token': tokens.refreshToken,
       },
+      // Same split as the probe: origin trust admitted this apiBase for credential
+      // custody, but dialling a tier-2 address needs consent taken AT tier 2.
+      isOriginApproved: (origin) => isTier2DialApproved(origin),
     });
   } catch {
     // Best effort; the server-side expiry remains the cleanup backstop.
   }
 }
+
+/** Test seam for the #2354 guarded-egress contract. Not part of the IPC surface. */
+export const __revokeExplicitSessionForTest = revokeExplicitSession;
 
 async function revokeCookieBoundSession(apiBase: string, sessionId: string | null): Promise<void> {
   if (!sessionId || !UUID_PATTERN.test(sessionId)) return;

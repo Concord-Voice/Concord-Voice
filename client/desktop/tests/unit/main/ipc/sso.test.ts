@@ -13,7 +13,7 @@
  * us verify the cleanup contract deterministically without binding real ports.
  */
 import { net } from 'electron';
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest';
 
 // vi.mock is hoisted above ALL `const` declarations, so any references to
 // outer-scope state from inside a vi.mock factory must come from vi.hoisted —
@@ -130,11 +130,33 @@ vi.mock('../../../../src/main/apiBaseUrl', () => ({
 
 const profileMocks = vi.hoisted(() => ({
   isValidatedSelfHostedApiBase: vi.fn((apiBase: string) => apiBase === 'https://voice.example'),
+  // sso.ts imports this too. Omitting it left the export `undefined`, so the
+  // `isOriginApproved` callback would have thrown a TypeError the instant it ran —
+  // which nothing noticed, because guardedRequest is mocked and never runs it. The
+  // predicate is only testable once its own dependency exists here.
+  isTier2DialApproved: vi.fn((apiBase: string) => apiBase === 'https://voice.example'),
 }));
 
 vi.mock('../../../../src/main/selfHostedProfile', () => ({
   isValidatedSelfHostedApiBase: profileMocks.isValidatedSelfHostedApiBase,
-  rememberValidatedSelfHostedApiBase: vi.fn(),
+  isTier2DialApproved: profileMocks.isTier2DialApproved,
+}));
+
+// #2354 §6.4: revokeExplicitSession (credentials:'omit') moves onto the guarded Node
+// transport. The four credentials:'include' sites cannot follow it — Node has no cookie
+// jar — so they stay on Electron net.fetch and are gated by the approval ceremony.
+const guardedMocks = vi.hoisted(() => ({
+  guardedRequest: vi.fn(async () => ({
+    ok: true,
+    status: 200,
+    url: '',
+    json: () => Promise.resolve({}),
+  })),
+}));
+
+vi.mock('../../../../src/main/guardedRequest', () => ({
+  guardedRequest: guardedMocks.guardedRequest,
+  EgressDeniedError: class EgressDeniedError extends Error {},
 }));
 
 const tokenMocks = vi.hoisted(() => {
@@ -208,7 +230,7 @@ vi.mock('../../../../src/main/machineId', () => ({
   getMachineId: vi.fn(() => TEST_MACHINE_ID),
 }));
 
-import { registerSSOIPC } from '@/main/ipc/sso';
+import { __revokeExplicitSessionForTest, approvedApiBase, registerSSOIPC } from '@/main/ipc/sso';
 
 interface FakeInvokeEvent {
   senderFrame: { url: string };
@@ -550,14 +572,19 @@ describe('sso IPC handlers', () => {
 
       await expect(delayedSSO).resolves.toEqual({ kind: 'error', code: 'sso_cancelled' });
       expect(tokenMocks.storeRefreshTokenIfOwner).not.toHaveBeenCalled();
-      expect(net.fetch).toHaveBeenCalledWith(`${SAAS_API_BASE}/api/v1/auth/logout`, {
-        method: 'POST',
-        credentials: 'omit',
-        headers: {
-          Authorization: 'Bearer stale-access',
-          'X-Refresh-Token': 'stale-refresh',
-        },
-      });
+      // #2354 §6.4: the explicit-session revoke is credentials:'omit', so it moved onto
+      // the guarded Node transport. It is the ONLY sso.ts egress that may.
+      expect(guardedMocks.guardedRequest).toHaveBeenCalledWith(
+        `${SAAS_API_BASE}/api/v1/auth/logout`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer stale-access',
+            'X-Refresh-Token': 'stale-refresh',
+          },
+          isOriginApproved: expect.any(Function),
+        }
+      );
     });
 
     it('sso:appleCancel tears down the active flow for trusted frames', () => {
@@ -741,14 +768,15 @@ describe('sso IPC handlers', () => {
     it('revokes a delayed completion that loses the credential-owner race', async () => {
       await beginAppleCompletion();
       let resolveCompletion!: (response: Response) => void;
-      vi.mocked(net.fetch)
-        .mockImplementationOnce(
-          () =>
-            new Promise((resolve) => {
-              resolveCompletion = resolve;
-            })
-        )
-        .mockResolvedValueOnce(new Response(null, { status: 204 }));
+      // Only ONE queued net.fetch response now: the completion POST. The revoke that
+      // follows it goes through guardedRequest (#2354 §6.4), so a second queued `Once`
+      // would go unconsumed and leak into the next test's net.fetch queue.
+      vi.mocked(net.fetch).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveCompletion = resolve;
+          })
+      );
 
       const delayedCompletion = completeRegistrationHandler(
         { senderFrame: { url: TRUSTED } },
@@ -774,14 +802,17 @@ describe('sso IPC handlers', () => {
         code: 'sso_cancelled',
       });
       expect(tokenMocks.storeRefreshTokenIfOwner).toHaveReturnedWith(null);
-      expect(net.fetch).toHaveBeenLastCalledWith(`${SAAS_API_BASE}/api/v1/auth/logout`, {
-        method: 'POST',
-        credentials: 'omit',
-        headers: {
-          Authorization: 'Bearer stale-access',
-          'X-Refresh-Token': 'stale-refresh',
-        },
-      });
+      expect(guardedMocks.guardedRequest).toHaveBeenCalledWith(
+        `${SAAS_API_BASE}/api/v1/auth/logout`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer stale-access',
+            'X-Refresh-Token': 'stale-refresh',
+          },
+          isOriginApproved: expect.any(Function),
+        }
+      );
     });
 
     it('rejects untrusted completion senders before network or credential access', async () => {
@@ -1002,14 +1033,15 @@ describe('sso IPC handlers', () => {
     it('revokes a delayed completion that loses the credential-owner race (TOCTOU)', async () => {
       await beginGoogleMFA();
       let resolveVerify!: (response: Response) => void;
-      vi.mocked(net.fetch)
-        .mockImplementationOnce(
-          () =>
-            new Promise((resolve) => {
-              resolveVerify = resolve;
-            })
-        )
-        .mockResolvedValueOnce(new Response(null, { status: 204 }));
+      // Only ONE queued net.fetch response: the MFA verify POST. The revoke that follows
+      // goes through guardedRequest (#2354 §6.4), so a second queued `Once` would go
+      // unconsumed and leak into the next test's net.fetch queue.
+      vi.mocked(net.fetch).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveVerify = resolve;
+          })
+      );
 
       const delayed = completeMFAHandler(
         { senderFrame: { url: TRUSTED } },
@@ -1032,11 +1064,14 @@ describe('sso IPC handlers', () => {
       await expect(delayed).resolves.toEqual({ kind: 'error', status: 409, code: 'sso_cancelled' });
       // The CAS store rejected (owner no longer current) — no successor overwrite.
       expect(tokenMocks.storeRefreshTokenIfOwner).toHaveReturnedWith(null);
-      expect(net.fetch).toHaveBeenLastCalledWith(`${SAAS_API_BASE}/api/v1/auth/logout`, {
-        method: 'POST',
-        credentials: 'omit',
-        headers: { Authorization: 'Bearer stale-access', 'X-Refresh-Token': 'stale-refresh' },
-      });
+      expect(guardedMocks.guardedRequest).toHaveBeenCalledWith(
+        `${SAAS_API_BASE}/api/v1/auth/logout`,
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer stale-access', 'X-Refresh-Token': 'stale-refresh' },
+          isOriginApproved: expect.any(Function),
+        }
+      );
     });
   });
 
@@ -1205,7 +1240,10 @@ describe('sso IPC handlers', () => {
             }
           );
         })
-        .mockResolvedValueOnce(new Response(null, { status: 204 }))
+        // Exactly ONE more net.fetch follows: revokeCookieBoundSession. The explicit-session
+        // revoke moved onto guardedRequest (#2354 §6.4), so a second queued `Once` here goes
+        // unconsumed — and vi.clearAllMocks() does NOT drain the once-queue, so it would leak
+        // into whichever later test consumes net.fetch next.
         .mockResolvedValueOnce(new Response(null, { status: 204 }));
 
       await expect(
@@ -1215,20 +1253,26 @@ describe('sso IPC handlers', () => {
       // The CAS store rejected — the raced credential was never adopted.
       expect(tokenMocks.storeRefreshTokenIfOwner).toHaveReturnedWith(null);
       // revokeCookieBoundSession then revokeExplicitSession, both against
-      // /api/v1/auth/logout (the real endpoints in ipc/sso.ts).
+      // /api/v1/auth/logout (the real endpoints in ipc/sso.ts). They now travel on
+      // DIFFERENT transports: #2354 §6.4 moved revokeExplicitSession onto the guarded
+      // Node transport because it is the one credentials:'omit' egress here, while
+      // revokeCookieBoundSession must stay on Electron net.fetch — Node has no cookie
+      // jar, and dropping that cookie would strand the session at access-token expiry.
       expect(net.fetch).toHaveBeenNthCalledWith(2, `${SAAS_API_BASE}/api/v1/auth/logout`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'X-Session-ID': SESSION_ID },
       });
-      expect(net.fetch).toHaveBeenNthCalledWith(3, `${SAAS_API_BASE}/api/v1/auth/logout`, {
-        method: 'POST',
-        credentials: 'omit',
-        headers: {
-          Authorization: 'Bearer raced-access',
-          'X-Refresh-Token': 'raced-refresh',
-        },
-      });
+      expect(guardedMocks.guardedRequest).toHaveBeenCalledWith(
+        `${SAAS_API_BASE}/api/v1/auth/logout`,
+        expect.objectContaining({
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer raced-access',
+            'X-Refresh-Token': 'raced-refresh',
+          },
+        })
+      );
     });
   });
 
@@ -1288,14 +1332,17 @@ describe('sso IPC handlers', () => {
         expect.objectContaining({ refreshToken: 'g-rt-1' }),
         42
       );
-      expect(net.fetch).toHaveBeenCalledWith(`${SAAS_API_BASE}/api/v1/auth/logout`, {
-        method: 'POST',
-        credentials: 'omit',
-        headers: {
-          Authorization: 'Bearer old-at',
-          'X-Refresh-Token': 'old-rt',
-        },
-      });
+      expect(guardedMocks.guardedRequest).toHaveBeenCalledWith(
+        `${SAAS_API_BASE}/api/v1/auth/logout`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer old-at',
+            'X-Refresh-Token': 'old-rt',
+          },
+          isOriginApproved: expect.any(Function),
+        }
+      );
     });
 
     it('sso:googleCancel tears down the active flow for trusted frames', () => {
@@ -1306,6 +1353,154 @@ describe('sso IPC handlers', () => {
     it('sso:googleCancel silently no-ops for untrusted frames', () => {
       googleCancelHandler({ senderFrame: { url: UNTRUSTED } });
       expect(googleMocks.cancelActiveGoogleFlow).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('approvedApiBase tier-1 pre-flight (#2354 §6.5)', () => {
+  const defaultApproval = (apiBase: string) => apiBase === SELF_HOSTED_API_BASE;
+
+  afterEach(() => {
+    profileMocks.isValidatedSelfHostedApiBase.mockImplementation(defaultApproval);
+  });
+
+  it('refuses a tier-1 IP-literal apiBase even when the approvals store claims it', () => {
+    // A tier-1 literal can never enter the set through the ceremony; this defends a
+    // hand-edited/tampered self-hosted-approvals.json, or a future path that adds to
+    // the set outside the ceremony. It is synchronous and IP-literal-only, so it does
+    // NOT close a TOCTOU window.
+    profileMocks.isValidatedSelfHostedApiBase.mockReturnValue(true);
+    expect(approvedApiBase('https://169.254.169.254')).toBeNull();
+  });
+
+  it('refuses a bracketed tier-1 IPv6 literal', () => {
+    profileMocks.isValidatedSelfHostedApiBase.mockReturnValue(true);
+    expect(approvedApiBase('https://[fe80::1]')).toBeNull();
+  });
+
+  it('passes the production SaaS origin through unchanged', () => {
+    expect(approvedApiBase(SAAS_API_BASE)).toBe(SAAS_API_BASE);
+  });
+
+  it('passes an approved self-hosted hostname through (pre-flight is IP-literal-only)', () => {
+    expect(approvedApiBase(SELF_HOSTED_API_BASE)).toBe(SELF_HOSTED_API_BASE);
+  });
+
+  // The pre-flight is TIER-1-ONLY by design. Every other case here is a hostname or a
+  // tier-1 literal, so all of them stay green if the condition is tightened from
+  // `.tier === 'tier1'` to `.tier !== 'public'` — and that tightening silently strips
+  // credential custody from every localhost/LAN self-hoster, the most common deployment
+  // this feature exists to serve. These two are the only tests that can catch it.
+  it.each([
+    ['an approved IPv4 loopback literal', 'https://127.0.0.1:8443'],
+    ['an approved RFC1918 literal', 'https://192.168.1.20:8443'],
+  ])('passes %s through (tier 2 is approvable, only tier 1 is refused)', (_label, apiBase) => {
+    profileMocks.isValidatedSelfHostedApiBase.mockImplementation((v: string) => v === apiBase);
+    expect(approvedApiBase(apiBase)).toBe(apiBase);
+  });
+
+  it('still refuses an origin that is not approved', () => {
+    expect(approvedApiBase('https://not-approved.example')).toBeNull();
+  });
+
+  it('refuses a non-string value', () => {
+    expect(approvedApiBase(42)).toBeNull();
+  });
+});
+
+describe('revokeExplicitSession egress (#2354 §6.4)', () => {
+  const tokens = {
+    accessToken: 'at-1',
+    refreshToken: 'rt-1',
+    sessionId: SESSION_ID,
+    rememberMe: true,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('routes the explicit-session revoke through the guarded transport, not net.fetch', async () => {
+    await __revokeExplicitSessionForTest(SAAS_API_BASE, tokens);
+
+    expect(guardedMocks.guardedRequest).toHaveBeenCalledWith(
+      `${SAAS_API_BASE}/api/v1/auth/logout`,
+      expect.objectContaining({ method: 'POST' })
+    );
+    expect(net.fetch).not.toHaveBeenCalled();
+  });
+
+  it('swallows a guarded-transport failure — server-side expiry is the backstop', async () => {
+    guardedMocks.guardedRequest.mockRejectedValueOnce(new Error('egress denied'));
+
+    await expect(__revokeExplicitSessionForTest(SAAS_API_BASE, tokens)).resolves.toBeUndefined();
+    expect(net.fetch).not.toHaveBeenCalled();
+  });
+
+  // The whole point of routing this egress through guardedRequest is the TIER bound on
+  // the dial. `expect.any(Function)` proves a callback was passed and nothing about what
+  // it decides — a regression to `() => true`, or back to the ORIGIN-trust predicate
+  // `isValidatedSelfHostedApiBase` (which re-opens public-consent → loopback dial, the
+  // exact hole #2354 closes), satisfies it identically. So capture the callback and run
+  // it. Mirrors selfHostedDialConsent.test.ts, which does the same for the probe egress.
+  describe('the isOriginApproved callback is the tier-2 dial predicate, not a constant', () => {
+    const LOOPBACK_ORIGIN = 'http://127.0.0.1:8443';
+
+    // vi.clearAllMocks() clears CALLS, not implementations, so a mockReturnValue set here
+    // would otherwise outlive the test that set it.
+    afterEach(() => {
+      profileMocks.isTier2DialApproved.mockImplementation(
+        (apiBase: string) => apiBase === SELF_HOSTED_API_BASE
+      );
+      profileMocks.isValidatedSelfHostedApiBase.mockImplementation(
+        (apiBase: string) => apiBase === SELF_HOSTED_API_BASE
+      );
+    });
+
+    async function captureIsOriginApproved(): Promise<(origin: string) => boolean> {
+      await __revokeExplicitSessionForTest(SELF_HOSTED_API_BASE, tokens);
+      expect(guardedMocks.guardedRequest).toHaveBeenCalledTimes(1);
+      const opts = guardedMocks.guardedRequest.mock.calls[0][1] as {
+        isOriginApproved: (origin: string) => boolean;
+      };
+      expect(typeof opts.isOriginApproved).toBe('function');
+      return opts.isOriginApproved;
+    }
+
+    it('delegates to isTier2DialApproved and returns its verdict verbatim', async () => {
+      const isOriginApproved = await captureIsOriginApproved();
+
+      profileMocks.isTier2DialApproved.mockReturnValue(false);
+      expect(isOriginApproved(LOOPBACK_ORIGIN)).toBe(false);
+
+      profileMocks.isTier2DialApproved.mockReturnValue(true);
+      expect(isOriginApproved(LOOPBACK_ORIGIN)).toBe(true);
+
+      // Both directions came from the tier predicate, so a constant cannot pass.
+      expect(profileMocks.isTier2DialApproved).toHaveBeenCalledWith(LOOPBACK_ORIGIN);
+    });
+
+    it('consults the DIAL predicate, never the origin-trust one', async () => {
+      const isOriginApproved = await captureIsOriginApproved();
+      profileMocks.isTier2DialApproved.mockClear();
+      profileMocks.isValidatedSelfHostedApiBase.mockClear();
+
+      isOriginApproved(LOOPBACK_ORIGIN);
+
+      expect(profileMocks.isTier2DialApproved).toHaveBeenCalledTimes(1);
+      // Origin trust admits credential custody; it must NOT admit a tier-2 dial. If this
+      // fires, the predicate was swapped back to the pre-#2354 one.
+      expect(profileMocks.isValidatedSelfHostedApiBase).not.toHaveBeenCalled();
+    });
+
+    it('an origin trusted for custody is still refused the dial without tier-2 consent', async () => {
+      const isOriginApproved = await captureIsOriginApproved();
+      // The realistic post-#2354 split: the ceremony displayed a PUBLIC address, so the
+      // origin holds credentials but has no tier-2 consent behind it.
+      profileMocks.isValidatedSelfHostedApiBase.mockReturnValue(true);
+      profileMocks.isTier2DialApproved.mockReturnValue(false);
+
+      expect(isOriginApproved(LOOPBACK_ORIGIN)).toBe(false);
     });
   });
 });
