@@ -5,6 +5,7 @@ package testdb
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,6 +36,13 @@ var (
 )
 
 const testDBAdvisoryLockID int64 = 0x434f4e434f5244 // "CONCORD"
+
+// testDBLockTimeout bounds the wait for the shared advisory lock. pg_advisory_lock
+// blocks forever by default, so a stuck holder used to surface as Go's opaque
+// "panic: test timed out after 10m0s" with no indication that a lock was involved.
+// 120s leaves ample room for a legitimately slow sibling package while still
+// failing well inside the default timeout, with a message naming the cause.
+const testDBLockTimeout = 120 * time.Second
 
 // defaultTestDatabaseURL is used when DATABASE_URL is not set.
 // Assembled from parts to satisfy static credential analysis (S6698/S2068).
@@ -139,9 +147,17 @@ func openTestDatabaseLockConn(t *testing.T, dbURL string) (*sql.DB, *sql.Conn) {
 		_ = db.Close()
 		t.Fatalf("testhelpers: failed to reserve database lock connection: %v", err)
 	}
-	if _, err := conn.ExecContext(context.Background(), `SELECT pg_advisory_lock($1)`, testDBAdvisoryLockID); err != nil {
+	lockCtx, cancel := context.WithTimeout(context.Background(), testDBLockTimeout)
+	defer cancel()
+	if _, err := conn.ExecContext(lockCtx, `SELECT pg_advisory_lock($1)`, testDBAdvisoryLockID); err != nil {
 		_ = conn.Close()
 		_ = db.Close()
+		if errors.Is(lockCtx.Err(), context.DeadlineExceeded) {
+			// Never interpolate dbURL here — it carries the password (observability.md #1).
+			t.Fatalf("testhelpers: timed out after %s waiting for the shared test-database "+
+				"advisory lock (%#x). Another `go test` process is holding it; stop it, or "+
+				"point DATABASE_URL at a scratch database.", testDBLockTimeout, testDBAdvisoryLockID)
+		}
 		t.Fatalf("testhelpers: failed to acquire database lock: %v", err)
 	}
 	return db, conn
