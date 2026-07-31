@@ -113,7 +113,7 @@ Concord Voice is a distributed real-time communications platform with three serv
 - **Cache:** Redis 7 for sessions, presence, RBAC cache, rate limiting (both planes connect to the same server)
 - **Messaging:** NATS 2.x for inter-service events
 - **CI/CD:** GitHub Actions → SonarQube Quality Gate (≥ 80% coverage)
-- **Security:** 41 pre-commit hooks (across 22 repos), SAST (Semgrep), secret detection (gitleaks, TruffleHog)
+- **Security:** pre-commit hooks, SAST (Semgrep), secret detection (gitleaks, TruffleHog)
 - **Deployment:** Docker Compose (base + production overlay); SPA on Cloudflare Pages
 
 ### Key Design Decisions

@@ -262,8 +262,8 @@ snapshots/
 
 # ZAP API DAST local-run scan output (#1465) — CI consumes it in-job only
 /reports/
-# Python bytecode from the .zap/ DAST helpers (#1465)
-.zap/__pycache__/
+# Python bytecode, anywhere (widened from the .zap/-only scope, #1465).
+__pycache__/
 .ds-sync/
 ds-bundle/
 .design-sync/.cache/
