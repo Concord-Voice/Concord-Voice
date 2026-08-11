@@ -306,7 +306,7 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 		return // Response already written
 	}
 
-	if h.checkPermissionEscalation(c, serverID, userID, isOwner, req.Permissions) {
+	if h.checkPermissionEscalation(c, serverID, userID, isOwner, req.Permissions, errMsgFailedUpdateRole) {
 		return
 	}
 
@@ -409,15 +409,37 @@ func (h *Handler) checkRoleOwnerAndHierarchy(c *gin.Context, serverID, userID st
 }
 
 // checkPermissionEscalation verifies the actor cannot grant permissions they don't have.
+// failureMsg is the caller-specific 500 error body used when the actor's own
+// permissions cannot be resolved; the 403 body is always errMsgCannotGrantPerms.
 // Returns true if the request was blocked (response written).
-func (h *Handler) checkPermissionEscalation(c *gin.Context, serverID, userID string, isOwner bool, permissions *int64) bool {
+//
+// The actor's permissions are resolved CACHE-BYPASSING. Both callers of this
+// guard (UpdateRole, AssignRole) write DURABLE authority — a role bitfield or a
+// member_roles row — that outlives the 5-minute cache entry which authorized it.
+// A concurrently in-flight pre-mutation compute can repopulate that entry after
+// a demotion invalidated it, so a cached read would let a just-demoted actor
+// mint a permanent grant. That is the exact race
+// ResolveEffectivePermissionsFresh exists for; the cost is one DB round-trip on
+// endpoints already rate-limited to 5/min. Do NOT switch this back to
+// GetEffectivePermissions for symmetry with the ephemeral HasPermission checks —
+// their staleness expires with the cache entry, this one does not.
+//
+// PermAdministrator is deliberately NOT exempted here. UpsertChannelOverride and
+// UpsertCategoryOverride do exempt it, so a holder of that bit alone is refused a
+// role carrying bits they do not literally hold while being allowed the
+// equivalent channel override. That asymmetry is accepted: it fails CLOSED (it
+// over-blocks, never over-grants), and adding a bypass to an escalation guard to
+// buy symmetry would weaken the control. The containment that actually keeps bit
+// 62 out of a server is CreateRole having no owner bypass — an owner's effective
+// set is OwnerPermissions, which excludes it — not this omission.
+func (h *Handler) checkPermissionEscalation(c *gin.Context, serverID, userID string, isOwner bool, permissions *int64, failureMsg string) bool {
 	if isOwner || permissions == nil {
 		return false
 	}
-	actorPerms, permErr := h.resolver.GetEffectivePermissions(c.Request.Context(), serverID, userID, "")
+	actorPerms, permErr := h.resolver.ResolveEffectivePermissionsFresh(c.Request.Context(), serverID, userID, "")
 	if permErr != nil {
 		h.log.Error(errMsgFailedGetActorPerms, "error", permErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateRole})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failureMsg})
 		return true
 	}
 	if Permission(*permissions)&^actorPerms != 0 {
@@ -822,13 +844,15 @@ func (h *Handler) AssignRole(c *gin.Context) {
 		return
 	}
 
-	// Verify role exists and get its position for hierarchy check
+	// Verify role exists; read its position for the hierarchy check and its
+	// permission bitfield for the escalation guard below.
 	var rolePosition int
+	var rolePermissions int64
 	err := h.db.QueryRow(
-		`SELECT position FROM roles WHERE id = $1 AND server_id = $2`,
+		`SELECT position, permissions FROM roles WHERE id = $1 AND server_id = $2`,
 		req.RoleID, serverID,
-	).Scan(&rolePosition)
-	if err == sql.ErrNoRows {
+	).Scan(&rolePosition, &rolePermissions)
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
 		return
 	}
@@ -849,16 +873,25 @@ func (h *Handler) AssignRole(c *gin.Context) {
 		return
 	}
 
-	// Check if actor is server owner (owners bypass hierarchy)
+	// Check if actor is server owner (owners bypass hierarchy and the escalation guard)
 	var ownerID string
 	if err := h.db.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
 		h.log.Error(errMsgFailedGetServerOwner, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAssignRole})
 		return
 	}
+	isOwner := ownerID == actorID
 
-	if ownerID != actorID && rolePosition >= actorMaxPosition {
+	if !isOwner && rolePosition >= actorMaxPosition {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot assign a role with equal or higher position than your own"})
+		return
+	}
+
+	// Privilege escalation check: the assigned role's permissions must be a subset
+	// of the actor's own effective permissions (CWE-269). Position bounds WHICH
+	// roles the actor may assign; this bounds WHICH BITS they may confer. Both are
+	// required — a lower-positioned role can carry a bit the actor does not hold.
+	if h.checkPermissionEscalation(c, serverID, actorID, isOwner, &rolePermissions, errMsgFailedAssignRole) {
 		return
 	}
 

@@ -10769,7 +10769,9 @@ paths:
       summary: Assign a role to a member
       description: 'Assign a role to a server member. Requires the Manage Role Assignments permission;
 
-        non-owners can only assign roles below their own highest position.
+        hierarchy and permission-escalation checks apply — non-owners can only assign roles below
+
+        their own highest position, and only roles whose permissions are a subset of their own.
 
         Rate limit: 5 requests per minute.
 
@@ -10805,7 +10807,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Insufficient permissions or role position at/above the actor's own
+          description: Insufficient permissions, role position at/above the actor's own, or permission
+            escalation
           content:
             application/json:
               schema:

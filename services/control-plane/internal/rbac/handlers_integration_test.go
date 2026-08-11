@@ -1,13 +1,17 @@
 package rbac_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -744,6 +748,177 @@ func TestAssignRole_Idempotent(t *testing.T) {
 	// Assign again — ON CONFLICT DO NOTHING, should still return 200
 	w = ts.DoRequest("POST", assignRolePath(serverID, member.ID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// TestAssignRole_PrivilegeEscalation locks the permission-subset guard (#2350).
+//
+// Only the "escalation_blocked" case is failing-first: against the pre-fix
+// position-only handler it returns 200 and writes a member_roles row. The other
+// two cases pass both before and after the fix — they are anti-over-block
+// regression locks, one pinning the actor-vs-target orientation of the guard and
+// one proving the owner bypass survives.
+func TestAssignRole_PrivilegeEscalation(t *testing.T) {
+	testCases := []struct {
+		name            string
+		actorIsOwner    bool
+		actorPerms      int64
+		actorPosition   int
+		rolePerms       int64
+		rolePosition    int
+		selfAssign      bool
+		wantStatus      int
+		wantErrContains string
+		wantRow         bool
+	}{
+		{
+			// Actor holds the capability to assign roles but NOT PermBan, and
+			// PermBan is not in BasePermissions, so the target role genuinely
+			// confers a bit the actor lacks. Its position (2) is BELOW the
+			// actor's (5), so the hierarchy check passes and only the subset
+			// guard can stop it.
+			name:            "escalation_blocked",
+			actorPerms:      int64(rbac.PermManageRolesAssign),
+			actorPosition:   5,
+			rolePerms:       int64(rbac.PermBan),
+			rolePosition:    2,
+			selfAssign:      true,
+			wantStatus:      http.StatusForbidden,
+			wantErrContains: "Cannot grant permissions you do not have",
+			wantRow:         false,
+		},
+		{
+			// Same shape, except the actor already holds PermBan. Targets a
+			// THIRD member, not the actor: if the guard is wired to
+			// targetUserID instead of actorID it checks a base member who
+			// lacks PermBan, and this case flips to 403.
+			name:          "subset_allowed",
+			actorPerms:    int64(rbac.PermManageRolesAssign | rbac.PermBan),
+			actorPosition: 5,
+			rolePerms:     int64(rbac.PermBan),
+			rolePosition:  2,
+			selfAssign:    false,
+			wantStatus:    http.StatusOK,
+			wantRow:       true,
+		},
+		{
+			// OwnerPermissions deliberately excludes PermAdministrator
+			// (types.go:85), so without the owner bypass the subset check
+			// would reject this and the case would 403.
+			name:         "owner_bypass",
+			actorIsOwner: true,
+			rolePerms:    int64(rbac.AdminPermissions | rbac.PermAdministrator),
+			rolePosition: 50,
+			selfAssign:   false,
+			wantStatus:   http.StatusOK,
+			wantRow:      true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, owner, member, serverID := setupOwnerAndMember(t)
+
+			actorToken := owner.AccessToken
+			actorID := owner.ID
+			if !tc.actorIsOwner {
+				actorToken = member.AccessToken
+				actorID = member.ID
+				grantPermToUser(t, ts, serverID, member.ID, tc.actorPosition, tc.actorPerms)
+			}
+
+			targetID := actorID
+			if !tc.selfAssign {
+				target := ts.CreateTestUser(t, "esctgt"+uuid.New().String()[:6])
+				ts.AddMemberToServer(t, serverID, target.ID, "member")
+				targetID = target.ID
+			}
+
+			roleID := ts.CreateTestRole(t, serverID, "esc_"+uuid.New().String()[:8], tc.rolePosition, tc.rolePerms)
+
+			body := map[string]interface{}{"role_id": roleID}
+			w := ts.DoRequest("POST", assignRolePath(serverID, targetID), body, testhelpers.AuthHeaders(actorToken))
+
+			require.Equal(t, tc.wantStatus, w.Code, "unexpected status; body: %s", w.Body.String())
+
+			if tc.wantErrContains != "" {
+				// Asserting the STRING matters: the RequirePermission middleware
+				// also returns 403, so a bare status assertion would pass against
+				// the vulnerable handler for the wrong reason.
+				var resp map[string]interface{}
+				testhelpers.ParseJSON(t, w, &resp)
+				assert.Contains(t, resp["error"], tc.wantErrContains)
+			}
+
+			var exists bool
+			require.NoError(t, ts.DB.QueryRow(
+				`SELECT EXISTS(SELECT 1 FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3)`,
+				serverID, targetID, roleID,
+			).Scan(&exists))
+			assert.Equal(t, tc.wantRow, exists, "member_roles row presence")
+		})
+	}
+}
+
+// TestAssignRole_ResolverError_FailsClosed covers the guard's 500 branch (#2350).
+//
+// Two things are asserted that nothing else in the suite reaches:
+//
+//  1. The 500 body is errMsgFailedAssignRole ("Failed to assign role"), not
+//     errMsgFailedUpdateRole. That string IS the entire reason the failureMsg
+//     parameter was added to checkPermissionEscalation — without this case the
+//     argument could be wired to the wrong constant and every other test passes.
+//  2. No member_roles row is written. The guard must fail CLOSED: a permission
+//     resolution failure denies the assignment rather than falling through.
+//
+// Reaching the branch needs error injection, because a healthy resolver never
+// errors on a valid request. testhelpers.BrokenResolver is the sanctioned seam:
+// a resolver over a closed DB, paired with the handler's own working DB so the
+// membership and role lookups still succeed and control reaches the guard.
+func TestAssignRole_ResolverError_FailsClosed(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+
+	// A role the actor could legitimately assign if the resolver worked:
+	// permissions 0 is a subset of anything, and position 2 is below the actor's 5.
+	roleID := ts.CreateTestRole(t, serverID, "failclosed_"+uuid.New().String()[:8], 2, 0)
+	grantPermToUser(t, ts, serverID, member.ID, 5, int64(rbac.PermManageRolesAssign))
+
+	handler := rbac.NewHandler(
+		ts.DB,                                   // working DB: membership + role lookups succeed
+		logger.New("test"),                      //
+		ts.Redis,                                //
+		nil,                                     // hub: unreached, the 500 returns before any broadcast
+		testhelpers.BrokenResolver(t, ts.Redis), // closed DB => every permission resolve errors
+		rbac.NewPermissionCache(ts.Redis),       //
+		nil,                                     // audit: unreached, and nil-checked regardless
+	)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "id", Value: serverID},
+		{Key: "user_id", Value: owner.ID},
+	}
+	c.Set("user_id", member.ID) // non-owner actor, so the guard is not bypassed
+	body := `{"role_id":"` + roleID + `"}`
+	c.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.AssignRole(c)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
+
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "Failed to assign role", resp["error"],
+		"500 body must name the assign operation, not update — this is what failureMsg exists for")
+
+	var exists bool
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3)`,
+		serverID, owner.ID, roleID,
+	).Scan(&exists))
+	assert.False(t, exists, "a resolver error must not write a member_roles row (fail closed)")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
