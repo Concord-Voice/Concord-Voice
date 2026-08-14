@@ -6,30 +6,31 @@ When `OPS_METRICS_ENABLED=true`, the control plane verifies signed host/media
 snapshots from fixed NATS subjects and stores only closed-catalog numeric values.
 Raw samples retain 24 hours and hourly rollups retain eight days. Collection and
 rollup failures do not take down normal API traffic. Host and Docker reads belong
-to the separate `cmd/ops-agent` binary; the control plane must never mount the
+to the separate `cmd/ops-agent` binary. The control plane must never mount the
 Docker socket.
 
 The trusted collector also reduces account state to fixed counts for registered
 and pending users, active sessions, distinct connected users, and active-user
-windows. It retains only `users.ops_last_active_at` after a user has been
-connected for 60 cumulative seconds within a UTC day; user IDs and interval
-history never enter the metrics tables or Admin responses. Collection clears
-markers strictly older than the widest 30-day window. Successful uploads are
-counted by a process-lifetime counter.
+windows. It retains only `users.ops_last_active_at`, and only after a user reaches 60
+cumulative connected seconds within a UTC day. User IDs and interval history
+never enter the metrics tables or Admin responses. Collection clears
+markers strictly older than the widest 30-day window. A process-lifetime counter
+counts successful uploads.
 
 When the admin console and metrics collection are both enabled, four read-only
 admin GET routes expose health, current values, hourly series, and counters. They
-remain behind Cloudflare Access and the separate admin session, use a dedicated
-two-connection, database-scoped PostgreSQL login with `SELECT` only on the
-metrics tables, and never fall back to the normal application pool. The
-temporary credential is generated and rotated in memory only after router setup;
-startup and shutdown commit `NOLOGIN PASSWORD NULL` before draining every
-cluster-wide reader session. Unowned role collisions, memberships, and effective
-privilege drift fail closed. If collection is disabled, startup accepts an absent
-or already-`NOLOGIN` reader role without privileged role SQL; a login-enabled role
-must be revoked successfully. The mounted metrics routes return a fixed 503 while
-collection is disabled or Redis cannot evaluate their route-local rate limit,
-and all admin responses are `private, no-store`. See ADR-0030.
+remain behind Cloudflare Access and the separate admin session. They use a
+dedicated two-connection, database-scoped PostgreSQL login with `SELECT` only on
+the metrics tables. They never fall back to the normal application pool.
+
+The control plane generates and rotates the temporary credential in memory, and
+only after router setup. Startup and shutdown commit `NOLOGIN PASSWORD NULL`
+before draining every cluster-wide reader session. Unowned role collisions, memberships, and effective
+privilege drift fail closed. With collection disabled, startup accepts an absent
+or already-`NOLOGIN` reader role without privileged role SQL. A login-enabled
+role must revoke successfully. The mounted metrics routes return a fixed 503
+while collection is off, or while Redis cannot evaluate their route-local rate
+limit. All admin responses carry `private, no-store`. See ADR-0030.
 
 The control plane handles authentication, authorization, server/channel management, billing, and user presence for Concord Voice.
 
@@ -307,8 +308,8 @@ make migrate-create NAME=add_user_status
 
 - Migrations run automatically when the server starts
 - Each migration has an UP (apply) and DOWN (rollback) SQL file
-- Migrations are versioned sequentially (000001, 000002, etc.)
-- Migration state is tracked in the `schema_migrations` table
+- Migrations use sequential version numbers (000001, 000002, etc.)
+- The `schema_migrations` table holds migration state
 
 ### Creating New Migrations
 
@@ -329,7 +330,7 @@ make migrate-create NAME=add_user_status
 ### Migration Best Practices
 
 - Always create both UP and DOWN migrations
-- Test rollbacks to ensure they properly reverse changes
+- Test rollbacks to confirm they properly reverse changes
 - One logical change per migration
 - Never modify committed migrations (create new ones instead)
 - Migrations run in transactions automatically
@@ -386,7 +387,7 @@ For detailed migration documentation, see [migrations/README.md](migrations/READ
 ### Additional Tables ✅
 - user_keys, server_invites, channel_keys, channel_key_recipients, channel_read_states, voice_participants, user_preferences, friend_codes, privacy_settings
 
-See `migrations/` for the full schema; use `make migrate-version` to inspect the current local schema version.
+See `migrations/` for the full schema. Use `make migrate-version` to inspect the current local schema version.
 
 ## Current Status
 

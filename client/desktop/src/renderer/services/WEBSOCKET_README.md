@@ -1,8 +1,8 @@
 # WebSocket Client Implementation
 
-**Status:** ✅ Complete
-**Issue:** #20 - Build WebSocket Client Connection Manager (Phase 1B)
-**Related Backend:** Issue #10 - Implement WebSocket Server Infrastructure (Phase 1B)
+**Status:** ✅ Complete.
+**Issue:** #20 - Build WebSocket Client Connection Manager (Phase 1B).
+**Related Backend:** Issue #10 - Implement WebSocket Server Infrastructure (Phase 1B).
 
 ---
 
@@ -123,7 +123,7 @@ wsService.disconnect();
 
 **Connection Flow:**
 1. User logs in → JWT access token stored in `authStore`
-2. `useWebSocket` hook detects token → calls `POST /auth/ws-ticket` to obtain a 30-second single-use ticket
+2. `useWebSocket` hook detects token → calls `POST /auth/ws-ticket` to get a 30-second single-use ticket
 3. WebSocket connects to `ws://localhost:8080/api/v1/ws?ticket=<ticket>`
 4. Backend validates ticket (single-use, expires in 30s) → sends `connected` message with `client_id` and `user_id`
 5. Client stores connection info → notifies UI via `chatStore.setConnectionStatus(true, clientId)`
@@ -554,15 +554,15 @@ console.log('Connected:', useChatStore.getState().isConnected);
 ## Security Considerations
 
 ### Ticket-Based Authentication
-- ✅ Client obtains 30-second single-use ticket via `POST /auth/ws-ticket`
+- ✅ Client gets a 30-second single-use ticket via `POST /auth/ws-ticket`
 - ✅ Ticket sent via query parameter (WebSocket upgrade handshake) — NOT the raw JWT
 - ✅ Ticket validated and consumed on backend before upgrade (single-use, prevents replay)
-- ✅ JWT blacklist check performed during ticket creation
+- ✅ JWT blacklist check runs during ticket creation
 - ⚠️  Use HTTPS/WSS in production to protect ticket in transit
 
 ### Connection Security
 - ✅ Ticket-based authentication required for all connections
-- ✅ User ID extracted from validated session (cannot be spoofed)
+- ✅ User ID extracted from validated session (no client can spoof it)
 - ⚠️  Currently uses `ws://` (unencrypted), must use `wss://` in production
 - ✅ CORS properly configured in backend
 

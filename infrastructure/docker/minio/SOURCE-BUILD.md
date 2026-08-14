@@ -52,7 +52,7 @@ docker buildx build \
 For a registry manifest, use `--platform linux/amd64,linux/arm64`,
 `--build-arg SOURCE_DATE_EPOCH=1760549395`, and an image exporter with
 `push=true,rewrite-timestamp=true`. The rewrite option normalizes file and
-directory timestamps inside generated layers; `SOURCE_DATE_EPOCH` alone only
+directory timestamps inside generated layers. `SOURCE_DATE_EPOCH` alone only
 normalizes image metadata. The repository publisher uses the pinned Buildx and
 BuildKit versions above, writes run-scoped staging artifacts, tests both native
 architectures by digest, and only then promotes the stable runtime/source tag
@@ -60,7 +60,7 @@ pair. Recovery accepts a matching pair or a matching source-only partial. A
 runtime-only stable tag stops publication even when its digest matches. GHCR
 does not document registry-enforced immutable tags, so the captured digests—not
 the discovery tags—are
-authoritative; package write access is restricted to the controlled publisher
+authoritative. Package write access is restricted to the controlled publisher
 repository, and corresponding source is promoted and verified before the
 runtime tag.
 
@@ -100,11 +100,11 @@ included.
 The companion OCI artifact contains:
 
 - `minio-source.tar.gz`, produced from the exact commit with `git archive` and
-  normalized `gzip -n` output;
-- `minio-source.tar.gz.sha256`;
-- `runtime-manifest-digest.txt`, binding the source artifact to its runtime;
-- this Dockerfile; and
-- this `SOURCE-BUILD.md` recipe.
+  normalized `gzip -n` output
+- `minio-source.tar.gz.sha256`
+- `runtime-manifest-digest.txt`, binding the source artifact to its runtime
+- this Dockerfile
+- this `SOURCE-BUILD.md` recipe
 
 The source archive plus these build files are the inputs used to produce the
 runtime binary. MinIO's upstream license materials are also copied unchanged

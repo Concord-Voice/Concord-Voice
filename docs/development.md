@@ -1,6 +1,6 @@
 # Development Guide
 
-This guide will help you get Concord Voice running locally for development.
+This guide helps you run Concord Voice locally for development.
 
 **IMPORTANT:** Before you start developing, install git hooks to prevent committing secrets:
 
@@ -15,13 +15,13 @@ See [SETUP_GITHUB.md](./SETUP_GITHUB.md) for full GitHub collaboration workflow.
 
 ### Required
 
-- **Node.js** 24+ and npm 10+ for the desktop and media-plane workspaces;
-  **Node.js 24.x** for `client/admin` (Go-only work does not require Node.js)
+- **Node.js** 24+ and npm 10+ for the desktop and media-plane workspaces.
+  `client/admin` needs **Node.js 24.x**. Go-only work does not require Node.js
 - **Go** 1.26.1+
 - **Docker** and **Docker Compose**
 - **Git**
 - **Python 3** (for `pre-commit` hooks framework and mediasoup build)
-- **lsof** (preinstalled on macOS; `sudo apt-get install lsof` on Debian/Ubuntu)
+- **lsof** (preinstalled on macOS, or `sudo apt-get install lsof` on Debian/Ubuntu)
 
 ### Optional
 
@@ -45,7 +45,7 @@ Start PostgreSQL and Redis using Docker Compose:
 docker-compose up -d postgres redis nats
 ```
 
-Verify they're running:
+Check their status:
 
 ```bash
 docker-compose ps
@@ -73,7 +73,7 @@ EOF
 go run cmd/server/main.go
 ```
 
-The control plane will start on `http://localhost:8080`.
+The control plane starts on `http://localhost:8080`.
 
 Test it:
 ```bash
@@ -103,7 +103,7 @@ EOF
 npm run dev
 ```
 
-The media plane will start on `http://localhost:3000`.
+The media plane starts on `http://localhost:3000`.
 
 Test it:
 ```bash
@@ -141,10 +141,10 @@ npx vite preview --host 127.0.0.1 --port 4181 --strictPort
 
 Open `http://127.0.0.1:4181/admin/`. Vite has no API proxy: development and
 preview builds send `/admin/api/v1/*` requests to their own origin. Unit and
-browser tests intercept those requests; production serves the built assets and
+browser tests intercept those requests. Production serves the built assets and
 API from the control plane at the same origin. See
 [`client/admin/README.md`](../client/admin/README.md) for the full command set
-and named `admin_ui` Docker build context.
+and the named `admin_ui` Docker build context.
 
 ## Development Workflow
 
@@ -157,19 +157,19 @@ and named `admin_ui` Docker build context.
 
 **Media Plane (Node.js)**:
 - Edit files in `services/media-plane/src/`
-- Hot reload is enabled via `tsx watch`
+- Hot reload runs through `tsx watch`
 - Changes apply automatically
 
 **Desktop Client**:
 - Edit files in `client/desktop/src/`
-- Hot reload is enabled via Vite
+- Hot reload runs through Vite
 - Changes apply automatically to renderer process
 - Main process changes require restart
 
 **Admin Portal**:
 - Edit files in `client/admin/src/`
 - `npm run dev` starts the frontend at `/admin/` with hot reload
-- There is no development API proxy; use tests for mocked API flows or the
+- There is no development API proxy. Use tests for mocked API flows, or the
   control-plane production image for same-origin integration
 
 ### Database Migrations
@@ -248,7 +248,7 @@ go test ./internal/auth/ -run "Integration"
 go test ./internal/servers/... ./internal/channels/... ./internal/messages/...
 ```
 
-Integration tests use the `testhelpers` package which auto-connects to PostgreSQL/Redis, runs migrations, and provides user/server/channel creation helpers. See `services/control-plane/tests/README.md` for details.
+Integration tests use the `testhelpers` package. It auto-connects to PostgreSQL and Redis, runs migrations, and creates user, server, and channel helpers. See `services/control-plane/tests/README.md` for details.
 
 ### Media Plane
 
@@ -411,7 +411,7 @@ If ports are in use:
 lsof -nP -iTCP:8080 -sTCP:LISTEN
 ```
 
-Only signal a remaining PID manually after verifying its command and working
+Signal a remaining PID manually only after you verify its command and working
 directory belong to the intended service.
 
 ## Environment Variables Reference
@@ -421,7 +421,7 @@ directory belong to the intended service.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ENVIRONMENT` | `development` | Environment mode |
-| `HSTS_HEADER_VALUE` | empty → `max-age=63072000; includeSubDomains; preload` | Optional production STS policy; nonempty values must pass the structural STS grammar |
+| `HSTS_HEADER_VALUE` | empty → `max-age=63072000; includeSubDomains; preload` | Optional production STS policy. Nonempty values must pass the structural STS grammar |
 | `PORT` | `8080` | HTTP server port |
 | `DATABASE_URL` | (see above) | PostgreSQL connection |
 | `REDIS_URL` | `redis://:concord_dev_redis@localhost:6379` | Redis connection. Compose starts Redis with `--requirepass "$REDIS_PASSWORD"`, so the URL must carry that password (repo-root `.env`); an uncredentialed URL fails every Redis call with `NOAUTH` |
@@ -429,26 +429,28 @@ directory belong to the intended service.
 | `INSTANCE_TYPE` | `saas` | Deployment/entitlement mode (`saas` or `self-hosted`) |
 | `SERVER_VERSION` | `dev` | Advertised server version for capability discovery |
 | `NATS_URL` | `nats://localhost:4222` | NATS connection |
-| `ACTIVITY_HISTORY_CLUSTER_ENABLED` | `false` | Global Activity History rollout gate; keep false for ordinary development unless testing the guarded single-replica path |
-| `CONTROL_PLANE_REPLICA_COUNT` | unset (Compose: `1`) | Explicit control-plane replica contract; Activity History requires the environment value to be explicitly set to exactly one when the gate is enabled |
-| `ACTIVITY_HISTORY_OPERATOR_NAME` | empty | Self-host disclosure operator; required before new Activity History opt-in is available (`Concord Voice LLC` is reserved for SaaS) |
-| `ACTIVITY_HISTORY_PRIVACY_POLICY_URL` | empty | Self-host disclosure URL; absolute HTTPS is required outside loopback development/test |
+| `ACTIVITY_HISTORY_CLUSTER_ENABLED` | `false` | Global Activity History rollout gate. Keep false for ordinary development unless you test the guarded single-replica path |
+| `CONTROL_PLANE_REPLICA_COUNT` | unset (Compose: `1`) | Explicit control-plane replica contract. Activity History requires this value set to exactly one when the gate is on |
+| `ACTIVITY_HISTORY_OPERATOR_NAME` | empty | Self-host disclosure operator. Required before new Activity History opt-in becomes available (SaaS uses `Concord Voice LLC`) |
+| `ACTIVITY_HISTORY_PRIVACY_POLICY_URL` | empty | Self-host disclosure URL. Absolute HTTPS applies outside loopback development and test |
 
-On managed hosts, `concord-ctl.sh nginx-reload` reads the canonical Compose-quoted value from `/opt/concord/.env`, validates it before sudo, and renders nginx as the public HSTS owner: nginx hides Go's upstream STS field, emits one server-level policy, and repeats it in the three locations whose own `add_header` directives suppress inheritance. Main/admin config activation is transactional; syntax, reload/start, and an exact one-field local HTTPS probe must pass or the prior files are restored. The direct self-host renderer keeps the committed default for scoped nginx responses while Go owns proxied responses.
+On managed hosts, `concord-ctl.sh nginx-reload` reads the canonical Compose-quoted value from `/opt/concord/.env`. It validates that value before sudo. It then renders nginx as the public HSTS owner. The nginx config hides Go's upstream STS field and emits one server-level policy. It repeats that policy in the three locations whose own `add_header` directives suppress inheritance.
 
-Activity History stays off by default. For SaaS, the operator and privacy URL are
-fixed by the binary. For self-hosted development, invalid or missing disclosure
-keeps new opt-in unavailable without preventing existing history reads or deletion.
+Main and admin config activation is transactional. Syntax, reload or start, and an exact one-field local HTTPS probe must all pass, or the controller restores the prior files. The direct self-host renderer keeps the committed default for scoped nginx responses, while Go owns proxied responses.
+
+Activity History stays off by default. For SaaS, the binary fixes the operator and
+privacy URL. For self-hosted development, invalid or missing disclosure keeps new
+opt-in unavailable. It does not prevent existing history reads or deletion.
 
 ### Operations Metrics (Control Plane, Media Plane, and Ops Agent)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPS_METRICS_ENABLED` | `false` | Enables the aggregate-only metrics pipeline |
-| `OPS_METRICS_NODE_ID` | (empty) | Opaque assigned `cvn_` node token; required when enabled |
-| `OPS_METRICS_SHARED_SECRET` | (empty) | Snapshot-signing secret of at least 32 bytes; required when enabled |
+| `OPS_METRICS_NODE_ID` | (empty) | Opaque assigned `cvn_` node token. Required when enabled |
+| `OPS_METRICS_SHARED_SECRET` | (empty) | Snapshot-signing secret of at least 32 bytes. Required when enabled |
 | `OPS_METRICS_INTERVAL` | `15s` | Sampling interval from 5 seconds through 5 minutes |
-| `OPS_METRICS_ROLE` | `local` | Local storage role; `aggregator` is reserved for #1504 |
+| `OPS_METRICS_ROLE` | `local` | Local storage role. Reserve `aggregator` for #1504 |
 
 ### Media Plane
 
@@ -478,7 +480,7 @@ No environment variables needed for development.
 
 ### Failover/Production Ports
 
-These ports are used in staging/production deployments with nginx reverse proxy and database replication:
+Staging and production deployments use these ports, with an nginx reverse proxy and database replication:
 
 | Port | Service | Notes |
 |------|---------|-------|
@@ -516,7 +518,7 @@ lsof -nP -iTCP:8080 -sTCP:LISTEN
 ```
 
 If cleanup still fails, verify the listener's command and working directory
-before sending it `SIGTERM`; do not blindly signal a PID returned by `lsof`.
+before you send it `SIGTERM`. Do not blindly signal a PID that `lsof` returned.
 
 ### "Module not found" (Node.js)
 
@@ -601,8 +603,8 @@ Recommended:
 
 ### Node.js
 
-- Use the Node.js version declared by each workspace's `package.json`; the Admin
-  Portal requires Node.js 24.x
+- Use the Node.js version that each workspace's `package.json` declares. The
+  Admin Portal requires Node.js 24.x
 - Enable V8 flags: `--max-old-space-size=4096`
 - Profile with Chrome DevTools
 
@@ -614,7 +616,7 @@ Recommended:
 
 ## Next Steps
 
-- Read [API Documentation](./api/) — OpenAPI 3.0 specification with full live-route coverage enforced by `scripts/api/check-openapi-coverage.sh`
-- Review [Architecture](./architecture.md) — System diagrams, database ERD, message flows
+- Read [API Documentation](./api/): the OpenAPI 3.0 specification. `scripts/api/check-openapi-coverage.sh` enforces full live-route coverage
+- Review [Architecture](./architecture.md): system diagrams, database ERD, message flows
 - Check [Contributing Guidelines](../.github/CONTRIBUTING.md)
 - Join the Discord for discussions

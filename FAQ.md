@@ -108,7 +108,7 @@ On the applicable Change Date, each version of Concord Voice becomes additionall
 - Modifications must be shared (AGPL network-copyleft)
 - This ensures long-term sustainability and community ownership
 
-**Per-version timing.** Each version has its own Change Date, calculated as the earlier of (a) February 15, 2030 or (b) the fourth anniversary of that version's first public release under the License. Versions released before February 2026 reach AGPL on their fourth anniversary; versions released after February 2026 all converge on 2030-02-15.
+**Per-version timing.** Each version has its own Change Date, calculated as the earlier of (a) February 15, 2030 or (b) the fourth anniversary of that version's first public release under the License. Versions released before February 2026 reach AGPL on their fourth anniversary. Versions released after February 2026 all converge on 2030-02-15.
 
 ---
 
@@ -491,7 +491,7 @@ cd client/desktop
 npm test
 ```
 
-> SonarQube enforces ≥ 80% coverage on new code as a mandatory Quality Gate; current coverage and test status are reported by CI.
+> SonarQube enforces ≥ 80% coverage on new code as a mandatory Quality Gate. Current coverage and test status are reported by CI.
 
 ---
 
@@ -562,7 +562,7 @@ npm test
 
 ### How do I self-host Concord Voice?
 
-**Status:** Self-hosting installer is planned for Phase 3 (issue #210); narrative deployment guide tracked at #819.
+**Status:** Self-hosting installer is planned for Phase 3 (issue #210). Narrative deployment guide tracked at #819.
 
 **Current workaround** (for developers):
 
@@ -687,7 +687,7 @@ Supported uploads:
 
 ### Is there a file size limit?
 
-Yes — configurable per-deployment via the `UPLOAD_MAX_SIZE` env var on the control-plane (defaults to 25 MB for general attachments). Profile and server image uploads use entitlement-tiered caps: free users and Groundspeed servers can upload avatars, profile banners, server icons, and server banners up to 5 MiB; Supersonic users and Mach servers can upload those image assets up to 8 MiB. The authoritative values live in `services/control-plane/internal/entitlements/entitlements.go` and `services/control-plane/internal/entitlements/server_entitlements.go`, with enforcement in `services/control-plane/internal/media/handlers.go`.
+Yes — configurable per-deployment via the `UPLOAD_MAX_SIZE` env var on the control-plane (defaults to 25 MB for general attachments). Profile and server image uploads use entitlement-tiered caps: free users and Groundspeed servers can upload avatars, profile banners, server icons, and server banners up to 5 MiB. Supersonic users and Mach servers can upload those image assets up to 8 MiB. The authoritative values live in `services/control-plane/internal/entitlements/entitlements.go` and `services/control-plane/internal/entitlements/server_entitlements.go`, with enforcement in `services/control-plane/internal/media/handlers.go`.
 
 ---
 

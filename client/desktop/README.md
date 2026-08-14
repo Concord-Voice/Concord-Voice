@@ -77,7 +77,7 @@ The main process (`src/main/main.ts`) handles:
 
 ### Preload Script
 
-The preload script (`src/preload/preload.ts`) provides a secure bridge between main and renderer processes using `contextBridge`.
+The preload script (`src/preload/preload.ts`) is a secure bridge between main and renderer processes, built with `contextBridge`.
 
 ### Renderer Process
 
@@ -127,16 +127,17 @@ chmod +x ConcordVoice-<version>-linux-x64.AppImage
 ./ConcordVoice-<version>-linux-x64.AppImage
 ```
 
-Do not launch packaged Linux builds with `--no-sandbox`. Electron's `chrome-sandbox` helper is expected to ship with SUID mode `4755`; the CI package verifier checks this for DEB and RPM artifacts.
+Do not launch packaged Linux builds with `--no-sandbox`. Electron's `chrome-sandbox` helper must ship with SUID mode `4755`. The CI package verifier checks this for DEB and RPM artifacts.
 
 ### Google SSO build constant (`GOOGLE_OAUTH_CLIENT_SECRET_DESKTOP`)
 
-Google Sign-In uses a client-driven PKCE exchange (#975): the desktop main
-process performs Google's `/token` exchange itself, so it embeds Google's
+Google Sign-In uses a client-driven PKCE exchange (#975). The desktop main
+process runs Google's `/token` exchange itself, so it embeds Google's
 OAuth `client_secret`. Per Google's [OAuth 2.0 for Native Apps guidance](https://developers.google.com/identity/protocols/oauth2/native-app),
-a "Desktop application" client's `client_secret` is **not confidential** — PKCE
-(`code_challenge_method=S256`) is the actual security control. The value is
-injected at package time by `npm run build:gclientsecret` (from the
+a "Desktop application" client's `client_secret` is **not confidential**. PKCE
+(`code_challenge_method=S256`) is the actual security control.
+
+`npm run build:gclientsecret` injects the value at package time (from the
 `GOOGLE_OAUTH_CLIENT_SECRET_DESKTOP` env var / CI repo secret) into a
 main-process-only `googleClientSecret.json` resource, read by
 `src/main/oauth/google/clientSecret.ts`. It is deliberately **not** a
@@ -178,7 +179,7 @@ without the value produces an inert Google SSO (empty secret), not a failure.
 - Channel groups with drag-and-drop ordering
 - Custom context menus
 - Profile popovers
-- **Zustand stores** (Zustand 5.0.12) for state management — see [STATE_MANAGEMENT.md](docs/STATE_MANAGEMENT.md) and `src/renderer/stores/` for the current set
+- **Zustand stores** (Zustand 5.0.12) for state management. See [STATE_MANAGEMENT.md](docs/STATE_MANAGEMENT.md) and `src/renderer/stores/` for the current set
 
 ### Security ✅
 

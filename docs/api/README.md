@@ -1,7 +1,7 @@
 # API Documentation
 
 OpenAPI 3.0 specifications for the supported Concord Voice control-plane
-surfaces. The specs are mechanically checked against the router but do not
+surfaces. A drift gate mechanically checks the specs against the router, but they do not
 cover every control-plane surface.
 
 ## Files
@@ -13,7 +13,7 @@ The specs intentionally exclude other control-plane surfaces, including admin
 authentication and enrollment. Explicit method-denial registrations on the four
 admin metrics paths are enforcement behavior, not supported operations.
 
-> **Drift gate (#822):** `scripts/api/check-openapi-coverage.sh` (pr-ci `verify-openapi-coverage` job) independently checks the public router against `openapi.yaml` and the supported admin metrics GET routes against `admin-metrics.openapi.yaml`, in both drift directions. Unlisted public delegated registrars fail extraction rather than silently dropping routes. Inventory tooling: `scripts/api/extract-routes.py` (`--list` / `--missing` / `--stale` / `--check`); `--list` prints the union of supported operations from both surfaces.
+> **Drift gate (#822):** `scripts/api/check-openapi-coverage.sh` runs in the pr-ci `verify-openapi-coverage` job. It independently checks the public router against `openapi.yaml`, and the supported admin metrics GET routes against `admin-metrics.openapi.yaml`, in both drift directions. Unlisted public delegated registrars fail extraction rather than silently dropping routes. Inventory tooling is `scripts/api/extract-routes.py` (`--list` / `--missing` / `--stale` / `--check`). The `--list` flag prints the union of supported operations from both surfaces.
 
 ## Viewing the Spec
 
@@ -40,13 +40,13 @@ npx @redocly/cli lint docs/api/admin-metrics.openapi.yaml
 
 ## Public Authentication Flow
 
-1. **Register** or **Login** creates a refresh session and returns `access_token` plus its `session_id`. Login responses that mint a session set `X-Concord-Session-Issued: true` and expose that exact row as `X-Concord-Session-ID`, allowing a client to clean up even when a successful response body is malformed.
+1. **Register** or **Login** creates a refresh session and returns `access_token` plus its `session_id`. A login response that mints a session sets `X-Concord-Session-Issued: true`. It exposes that exact row as `X-Concord-Session-ID`, so a client can clean up even when a successful response body is malformed.
 2. Pass `Authorization: Bearer <access_token>` on protected endpoints.
-3. **Refresh** with the HttpOnly `refresh_token` cookie, or `X-Refresh-Token` for non-browser clients. Rotation returns the successor `session_id` and the replaced `previous_session_id`; clients must accept the result only for that exact lineage.
-4. **Logout** revokes credentials in this precedence order: explicit `X-Refresh-Token`; bearer-owned `X-Session-ID`; `X-Session-ID` bound atomically to the presented refresh-token cookie; then the cookie alone. Explicit credentials never clear an ambient cookie, and a cookie is expired only when its database row matched, so stale cleanup cannot erase a successor session.
+3. **Refresh** with the HttpOnly `refresh_token` cookie, or `X-Refresh-Token` for non-browser clients. Rotation returns the successor `session_id` and the replaced `previous_session_id`. Clients must accept the result only for that exact lineage.
+4. **Logout** revokes credentials in this precedence order: explicit `X-Refresh-Token`, then bearer-owned `X-Session-ID`. After those come `X-Session-ID` bound atomically to the presented refresh-token cookie, then the cookie alone. Explicit credentials never clear an ambient cookie. A cookie expires only when its database row matched, so stale cleanup cannot erase a successor session.
 
 The response bodies, security alternatives, header requirements, and error
-shapes are canonical in [openapi.yaml](./openapi.yaml); keep client integrations
+shapes are canonical in [openapi.yaml](./openapi.yaml). Keep client integrations
 bound to those operation definitions rather than duplicating them here.
 
 ## Endpoint Groups
@@ -104,7 +104,7 @@ DELETE /api/v1/sessions/:id
 
 ### WebSocket
 
-Obtain a 30-second single-use ticket via `POST /auth/ws-ticket`, then connect:
+Get a 30-second single-use ticket via `POST /auth/ws-ticket`, then connect:
 
 ```text
 ws://localhost:8080/api/v1/ws?ticket=<ticket>
@@ -139,7 +139,7 @@ Activity History handler errors instead use a stable code and may include the cu
 }
 ```
 
-Its bearer-token and rate-limit failures still use the existing `error` envelope. Global header validation, account state, email verification, and client-attestation gates retain their own documented shapes. See each OpenAPI operation for its exact response schema; the Activity History routes do not expose Custom Status delivery/quarantine error codes.
+Its bearer-token and rate-limit failures still use the existing `error` envelope. Global header validation, account state, email verification, and client-attestation gates retain their own documented shapes. See each OpenAPI operation for its exact response schema. The Activity History routes do not expose Custom Status delivery or quarantine error codes.
 
 Common status codes: `200 OK`, `201 Created`, `400 Bad Request`, `401 Unauthorized`, `403 Forbidden`, `404 Not Found`, `429 Too Many Requests`, `500 Internal Server Error`.
 

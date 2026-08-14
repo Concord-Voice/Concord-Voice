@@ -2,7 +2,7 @@
 
 <a href="https://sonarcloud.io/summary/new_code?id=Concord-Voice-Alpha"><img align="right" src="https://sonarcloud.io/api/project_badges/quality_gate?project=Concord-Voice-Alpha&token=170bdb3864bdffb9834f9341a37e3a708e9d7287" alt="Quality gate" /></a>
 
-<!-- SonarCloud badges use a read-only image-rendering token (renders for anyone; grants no API/data access). CI badges point at this repo's curated public CI. -->
+<!-- SonarCloud badges use a read-only image-rendering token. It renders for anyone and grants no API/data access. CI badges point at this repo's curated public CI. -->
 [![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=Concord-Voice-Alpha&metric=ncloc&token=170bdb3864bdffb9834f9341a37e3a708e9d7287)](https://sonarcloud.io/summary/new_code?id=Concord-Voice-Alpha)
 [![Coverage](https://sonarcloud.io/api/project_badges/measure?project=Concord-Voice-Alpha&metric=coverage&token=170bdb3864bdffb9834f9341a37e3a708e9d7287)](https://sonarcloud.io/summary/new_code?id=Concord-Voice-Alpha)
 [![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=Concord-Voice-Alpha&metric=security_rating&token=170bdb3864bdffb9834f9341a37e3a708e9d7287)](https://sonarcloud.io/summary/new_code?id=Concord-Voice-Alpha)
@@ -18,9 +18,9 @@
 
 A privacy-first, hybrid SaaS + self-hosted real-time communications platform — voice, video, and chat with end-to-end encryption, deployable to the cloud or to your own hardware.
 
-> **This is the public, source-available mirror of Concord Voice.** It is a read-only
-> snapshot published from our canonical repository — issues and pull requests are not
-> tracked here. Please use the channels under [Contact](#contact) to reach us.
+> **This is the public, source-available mirror of Concord Voice**. It is a read-only
+> snapshot from our canonical repository. We do not track issues or pull requests
+> here. Please use the channels under [Contact](#contact) to reach us.
 
 **Website:** [www.concordvoice.com](https://www.concordvoice.com) | **Security:** security@concordvoice.com
 
@@ -28,7 +28,7 @@ A privacy-first, hybrid SaaS + self-hosted real-time communications platform —
 
 ## Overview
 
-Concord Voice combines a Go control plane, a mediasoup WebRTC SFU, and an Electron desktop client. Messages are end-to-end encrypted client-side (AES-256-GCM with RSA-OAEP 4096-bit key wrapping). Identity is hosted, but accounts can connect to self-hosted servers. The roadmap targets v0.2.0-Beta (Phase 2 in flight) with v1.0.0 to follow.
+Concord Voice combines a Go control plane, a mediasoup WebRTC SFU, and an Electron desktop client. Messages are end-to-end encrypted client-side (AES-256-GCM with RSA-OAEP 4096-bit key wrapping). Concord hosts identity, but accounts can connect to self-hosted servers. The roadmap targets v0.2.0-Beta (Phase 2 in flight) with v1.0.0 to follow.
 
 For the high-level system design, see **[docs/architecture.md](./docs/architecture.md)**.
 
@@ -110,7 +110,7 @@ We welcome contributions. Start with:
 
 ## License
 
-Concord Voice Source License 1.0 (CVSL 1.0) — source-available, free for personal and non-profit use; commercial self-hosted use by for-profit or governmental entities requires a [commercial license](./docs/legal/commercial-license.md); converts to AGPL-3.0-or-later on 2030-02-15.
+Concord Voice Source License 1.0 (CVSL 1.0): source-available, and free for personal and non-profit use. Commercial self-hosted use by a for-profit or governmental entity requires a [commercial license](./docs/legal/commercial-license.md). The license converts to AGPL-3.0-or-later on 2030-02-15.
 
 See [LICENSE](./LICENSE) and [FAQ.md](./FAQ.md) for details.
 

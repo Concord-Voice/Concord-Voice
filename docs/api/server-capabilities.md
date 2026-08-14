@@ -7,11 +7,11 @@ desktop client connects to an older self-hosted server).
 
 - **Auth:** none required. The response is identical with or without an
   `Authorization` header — it carries no user-specific data.
-- **Caching:** `Cache-Control: public, max-age=300` (5-minute TTL; a rollout
+- **Caching:** `Cache-Control: public, max-age=300` (5-minute TTL, a rollout
   configuration change propagates within the TTL).
 - **Rate limit:** 30 requests/minute/IP (matches the sibling `/client/config`).
   The descriptor is constant and auth-state-independent, so there is nothing to
-  enumerate; the limit is abuse/DoS throttling. It is deliberately not tighter
+  enumerate. The limit is abuse/DoS throttling. It is deliberately not tighter
   than `/client/config` because this is the first pre-auth request and
   self-hosted deployments commonly egress many clients through one NAT IP.
 - **Introduced:** #662 (child of epic #1615, self-hosted deployment).
@@ -48,8 +48,8 @@ operator/disclosure-unavailable state.
 
 ## Additive-evolution contract
 
-The schema is **versioned by addition**: new fields are optional; **old clients
-ignore unknown fields, new clients tolerate missing fields**. Clients MUST validate
+The schema is **versioned by addition**: new fields are optional. **Old clients
+ignore unknown fields, and new clients tolerate missing fields**. Clients MUST validate
 at the boundary (zod per `[internal]rules/frontend.md`) and degrade gracefully rather
 than erroring on an unexpected shape. This is the single handshake that the
 self-hosted epic's SSO-suppression (#1619) and entitlement-unlock (#1620) children

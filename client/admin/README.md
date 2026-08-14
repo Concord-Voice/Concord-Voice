@@ -16,8 +16,8 @@ npm ci
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173/admin/`. Vite does not proxy API requests;
-`/admin/api/v1/*` targets the Vite origin and is expected to fail unless a test
+Open `http://127.0.0.1:5173/admin/`. Vite does not proxy API requests.
+`/admin/api/v1/*` targets the Vite origin, and it fails unless a test
 intercepts it. Use the production control-plane image for live same-origin API
 integration.
 
@@ -52,7 +52,7 @@ build context. Build through Compose from the repository root:
 docker compose build control-plane
 ```
 
-For direct Buildx use, pass both contexts explicitly; a bare `docker build` is
+For direct Buildx use, pass both contexts explicitly. A bare `docker build` is
 not sufficient:
 
 ```bash
@@ -68,5 +68,5 @@ npm are not present at runtime.
 ## Current scope
 
 The portal supports enrollment, password-plus-WebAuthn login, logout, and the
-read-only health and metrics workspaces. It does not yet provide UI for creating
-subsequent admins or adding backup credentials.
+read-only health and metrics workspaces. It has no UI yet for creating later admins or
+adding backup credentials.

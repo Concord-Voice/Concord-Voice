@@ -43,17 +43,17 @@ GET wss://host/api/v1/ws?ticket=<SINGLE_USE_TICKET>
 
 WebSocket connections use **ticket-based authentication**:
 
-1. Client calls `POST /api/v1/auth/ws-ticket` with a valid access token to obtain a single-use ticket (30s TTL)
+1. Client calls `POST /api/v1/auth/ws-ticket` with a valid access token to get a single-use ticket (30s TTL)
 2. Client connects to `wss://host/api/v1/ws?ticket=<ticket>`
 3. Server validates and consumes the ticket (single-use, prevents replay attacks)
 
-> **Security note:** Raw JWT tokens should NOT be passed in the WebSocket URL. Tickets are single-use and expire in 30 seconds, minimizing the window for interception.
+> **Security note:** never pass a raw JWT token in the WebSocket URL. Tickets are single-use and expire in 30 seconds, which minimizes the window for interception.
 
 ### Connection Lifecycle
 
 1. **Connect** - Client opens WebSocket with single-use ticket
 2. **Upgrade** - Server validates ticket and upgrades connection
-3. **Register** - Client is registered with Hub
+3. **Register** - The Hub registers the client
 4. **Confirmation** - Server sends `connected` message with client/user IDs
 5. **Subscribe** - Client subscribes to channels
 6. **Messaging** - Bidirectional message exchange
@@ -160,8 +160,8 @@ WebSocket connections use **ticket-based authentication**:
 
 **Shipped:** 2026-04-24 (issue #752)
 
-Version 2 adds a subscribe-barrier handshake to eliminate a race where a
-client's message queue could begin processing before the hub had committed
+Version 2 adds a subscribe-barrier handshake. It eliminates a race where a
+client's message queue could start processing before the hub had committed
 its resubscribe frames.
 
 ### Client-emitted frame
@@ -190,9 +190,9 @@ Sent by v2 clients after the last `subscribe` / `subscribe_server` /
 
 Emitted in response to `connection_ready_probe`. Because the hub's
 `Run()` goroutine processes all incoming frames serially, every
-resubscribe queued before the probe is guaranteed to be committed before
-this response fires — no explicit lock or barrier is needed beyond the
-natural ordering of a single-goroutine consumer.
+resubscribe queued before the probe commits before this response fires. No
+explicit lock or barrier is necessary beyond the natural ordering of a
+single-goroutine consumer.
 
 ### Backwards compatibility
 
@@ -209,7 +209,7 @@ No server-side version negotiation required.
 - **Read Timeout**: Updated on each pong received
 - **Write Timeout**: 10 seconds per message
 
-If a client fails to respond to a ping within 60 seconds, the connection is closed.
+If a client fails to respond to a ping within 60 seconds, the hub closes the connection.
 
 ## Configuration
 

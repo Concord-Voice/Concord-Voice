@@ -8,7 +8,7 @@
 
 <!-- audit-exempt: historical reference (v0.1.0-Alpha is a shipped versioned identifier) -->
 
-**Note:** Concord Voice is currently in active development. Phase 1 is live (v0.1.0-Alpha); Phase 2A is near-complete and Phase 2B is in flight, with active development toward v0.2.0-Beta. Security updates are provided for the latest development version.
+**Note:** Concord Voice is currently in active development. Phase 1 is live (v0.1.0-Alpha). Phase 2A is near-complete and Phase 2B is in flight, with active development toward v0.2.0-Beta. Security updates are provided for the latest development version.
 
 ## Reporting a Vulnerability
 
@@ -172,7 +172,7 @@ Subscribe to security announcements:
 
 ## Bug Bounty Program
 
-**Status:** Targeted for v1.0.0 (formal program not yet launched). In the interim, vulnerability reports are welcomed via the channels in "Reporting a Vulnerability" above; researchers will be acknowledged in the section below.
+**Status:** Targeted for v1.0.0 (formal program not yet launched). In the interim, vulnerability reports are welcomed via the channels in "Reporting a Vulnerability" above. Researchers will be acknowledged in the section below.
 
 Scope will include:
 
@@ -220,7 +220,7 @@ Assess whether the vulnerability is an isolated incident or a systematic model b
 1. **Fix** the vulnerability following standard severity timelines (see above)
 2. **Pattern search** — check if the same flaw exists elsewhere in AI-generated code
 3. **Instruction update** — add the vulnerability pattern as a negative example in AI instruction files (`[internal]`, `.github/copilot-instructions.md`)
-4. **Rule creation** — add a custom Semgrep rule to catch the pattern automatically in future code (Semgrep integration planned in Phase 3, #457; until then, document the pattern in AI instruction files)
+4. **Rule creation** — add a custom Semgrep rule to catch the pattern automatically in future code (Semgrep integration planned in Phase 3, #457. Until then, document the pattern in AI instruction files)
 5. **Template update** — if a prompt template exists for the affected code area, update it to prevent recurrence
 
 ### Reporting

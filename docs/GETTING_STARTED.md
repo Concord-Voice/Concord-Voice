@@ -9,9 +9,9 @@ Concord Voice is a privacy-first, real-time voice communication platform with tw
 - **Self-Hosted** - Licensed deployment for organizations
 
 > **Self-hosting?** Run `[internal]install-selfhost.sh` and pick a TLS mode
-> when prompted (`letsencrypt` recommended; `local` self-signed for a trusted LAN; `import`
-> for a BYO cert). The desktop client can connect to CA-trusted self-hosted servers;
-> in-app self-signed certificate consent is tracked separately, so local/self-signed mode
+> when prompted (`letsencrypt` recommended, `local` self-signed for a trusted LAN, `import`
+> for a BYO cert). The desktop client can connect to CA-trusted self-hosted servers.
+> In-app self-signed certificate consent is tracked separately, so local/self-signed mode
 > must be trusted by the OS for now. Full guides: [[internal]self-hosted-tls.md](runbooks/self-hosted-tls.md)
 > and [docs/self-hosted-client.md](self-hosted-client.md).
 
@@ -52,7 +52,7 @@ Install these first:
 - **Docker Desktop** - [Download](https://www.docker.com/products/docker-desktop/)
 - **Git** - [Download](https://git-scm.com/)
 - **Python 3** - [Download](https://www.python.org/downloads/) (for `pre-commit` hooks framework and mediasoup build)
-- **lsof** - Preinstalled on macOS; install with `sudo apt-get install lsof` on Debian/Ubuntu
+- **lsof** - Preinstalled on macOS. Install with `sudo apt-get install lsof` on Debian/Ubuntu
 
 ### Verify Installation
 

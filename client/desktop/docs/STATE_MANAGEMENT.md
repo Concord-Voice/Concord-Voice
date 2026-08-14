@@ -67,7 +67,7 @@ Full analysis was performed during Phase 1A architecture decisions (internal).
 
 > **Current metrics:** See [[internal] Key Counts](../../..[internal]#key-counts)
 
-The inventory above is an architectural overview; the canonical store set lives in `src/renderer/stores/`.
+The inventory above is an architectural overview. The canonical store set lives in `src/renderer/stores/`.
 
 ---
 
@@ -100,7 +100,7 @@ interface AuthState {
 
 - The renderer holds `accessToken`, `sessionId`, and the monotonic `authGeneration` in memory only.
 - Refresh credentials are main-process-owned. `tokenManager.ts` keeps session-only credentials in memory and uses Electron `safeStorage` only when Remember Me is enabled.
-- Login/restore starts a new auth generation; an accepted refresh rotates the access/session pair only when the captured generation still matches.
+- Login/restore starts a new auth generation. An accepted refresh rotates the access/session pair only when the captured generation still matches.
 - `clearAccessToken()` clears the renderer pair and advances the generation, fencing stale async continuations.
 
 `authStore` uses the shared `createStore` wrapper and does not use Zustand persistence middleware.
@@ -346,7 +346,7 @@ export const useChatStore = create<ChatState>()(
 
 ### Persist Middleware
 
-Stores that retain device-local UI choices use Zustand's `persist` middleware. `authStore` deliberately does not; refresh credentials remain main-process-owned.
+Stores that retain device-local UI choices use Zustand's `persist` middleware. `authStore` deliberately does not. Refresh credentials remain main-process-owned.
 
 **Setup:**
 
@@ -646,11 +646,11 @@ Normal user-initiated logout should call `userStore.logout()`, which requests ma
 
 ## Changelog
 
-**2026-02-18:** Initial core-store documentation; DevTools and persistence middleware documented
-**2026-03-03:** Updated the Phase 1A–1C inventory; removed dead reference to analysis doc
-**2026-03-27:** Updated to Zustand 5.0.12; added the Phase 2A stores
+**2026-02-18:** Initial core-store documentation, DevTools and persistence middleware documented
+**2026-03-03:** Updated the Phase 1A–1C inventory, removed dead reference to analysis doc
+**2026-03-27:** Updated to Zustand 5.0.12, added the Phase 2A stores
 **2026-04-09:** Added the Phase 2B stores
-**2026-07-18:** Updated auth ownership and lifecycle semantics; replaced the point-in-time store total with the canonical Key Counts reference
+**2026-07-18:** Updated auth ownership and lifecycle semantics, replaced the point-in-time store total with the canonical Key Counts reference
 
 ---
 

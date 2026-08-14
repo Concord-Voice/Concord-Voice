@@ -4,7 +4,7 @@ This directory contains versioned database migrations for the Concord Control Pl
 
 ## Migration File Naming
 
-Migrations are named with the following pattern:
+Name migrations with the following pattern:
 ```
 {version}_{description}.{direction}.sql
 ```
@@ -57,8 +57,8 @@ make migrate-version
 ## Migration Best Practices
 
 1. **Always create both UP and DOWN migrations** - Every migration must be reversible
-2. **Test rollbacks** - Ensure your down migration properly reverses the up migration
-3. **One logical change per migration** - Don't mix unrelated schema changes
+2. **Test rollbacks** - Make sure your down migration properly reverses the up migration
+3. **One logical change per migration** - Do not mix unrelated schema changes
 4. **Use transactions implicitly** - Each migration file runs in its own transaction
 5. **Avoid data migrations in schema migrations** - Consider separate data migration scripts
 6. **Never modify committed migrations** - Create new migrations to fix issues
@@ -184,7 +184,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000072 | code_redemptions | `code_redemptions` ledger (UNIQUE(code_id,user_id)) #1295 |
 | 000073 | drop_users_e2ee_preference | Drop per-user `e2ee_preference` from users + pending_registrations (E2EE-everywhere residual, #1648) |
 | 000074 | user_presence_settings | `user_presence_settings` — per-user presence + custom-text-status preferences (#1233) |
-| 000075 | create_friend_organization | `friend_organization` — per-user zero-knowledge AES-256-GCM friend-category blob; server stores ciphertext + version only (#324) |
+| 000075 | create_friend_organization | `friend_organization` — per-user zero-knowledge AES-256-GCM friend-category blob. The server stores ciphertext and version only (#324) |
 | 000076 | redemption_code_issuance | `redemption_code_issuance` — platform audit trail for redemption-code generation (CLI + admin HTTP), one row per issue/batch in-txn with minted codes (#1303) |
 | 000077 | admin_auth | `admin_users` / `admin_webauthn_credentials` / `admin_audit_log` (append-only via `concord_admin_rt` role) — platform-admin auth for the Admin/Ops console #1688 |
 | 000078 | default_load_gifs_automatically_true | Default GIF autoload preference to true for new users (#1766) |
@@ -218,7 +218,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000106 | bind_rotation_key_fingerprint | Pin the client-asserted CSK fingerprint across rotation batches, fence old-replica initial writers, and default future omitted claims to recoverable unclaimed state (#2503) |
 | 000107 | recover_unwritten_rotation_claims | Backfill the recovery default for databases that applied 000106 before that default moved there (#2503) |
 | 000108 | reject_unissued_rotation_epochs | Reject old-replica wrapped-key writes for successor epochs without a recorded revocation (#2503) |
-| 000109 | reject_revoked_distribution_epochs | Reject new wrapped-key writes for channel epochs that have already been revoked (#2534) |
+| 000109 | reject_revoked_distribution_epochs | Reject new wrapped-key writes into already-revoked channel epochs (#2534) |
 | 000110 | tighten_subscription_source | Restrict subscriptions.source to code and stripe after the Kickstarter campaign closed unfunded (PR #2660) |
 
 ## Troubleshooting

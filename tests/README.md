@@ -1,6 +1,6 @@
 # Concord Voice — Testing Overview
 
-This is the project-wide entry point for Concord Voice's test strategy. It explains the testing philosophy, the per-service tooling split, the coverage policy, and how to run tests locally. **Detailed, per-service documentation is linked in [Per-service test docs](#per-service-test-docs)** — this file is the index, not a replacement for those.
+This is the project-wide entry point for Concord Voice's test strategy. It explains the testing philosophy, the per-service tooling split, the coverage policy, and how to run tests locally. **[Per-service test docs](#per-service-test-docs) links the detailed documentation.** This file is the index, not a replacement for those.
 
 > Single source of truth for test conventions: [`[internal]rules/tests.md`](../[internal]rules/tests.md).
 > Canonical run commands also live in [`[internal]` → "Test & Lint Commands"](..[internal]).
@@ -8,7 +8,7 @@ This is the project-wide entry point for Concord Voice's test strategy. It expla
 ## Philosophy
 
 - **Test behavior, not implementation details.**
-- **Both positive and negative cases** are required — new functions need at least one happy-path and one error-path test.
+- **Both positive and negative cases.** A new function needs at least one happy-path and one error-path test.
 - **Deterministic** — no reliance on timing, random data, or live external services.
 - **No real credentials** in test data — use `test-token-123`-style placeholders.
 - **Descriptive names** — e.g. `TestHashCode_SameInput_ReturnsSameHash`.
@@ -34,9 +34,9 @@ Shell/operational scripts have their own lightweight test convention (no framewo
 
 ## Coverage policy
 
-- **Provider: Istanbul**, not v8 — the v8 provider has caused OOM in this suite; Istanbul is the project standard (`@vitest/coverage-istanbul`).
+- **Provider: Istanbul**, not v8. The v8 provider has caused OOM in this suite. Istanbul is the project standard (`@vitest/coverage-istanbul`).
 - **SonarQube Quality Gate enforces ≥ 80% coverage on new code** (mandatory — see [`[internal]quality-gate-definition.md`](../[internal]quality-gate-definition.md)).
-- Every new source file needs a corresponding test file; every new function needs at least a happy-path and an error-path test.
+- Every new source file needs a corresponding test file. Every new function needs at least a happy-path and an error-path test.
 
 ## Running tests locally
 
@@ -54,15 +54,15 @@ cd client/desktop && npm run lint
 
 Per service, the most common invocations:
 
-- **Desktop** — `npm test` (full Vitest suite — unit + integration), `npm run test:watch`, `npm run test:coverage`, `npm run test:unit` (unit only), `npm run test:integration` (integration only), `npm run test:e2e` (Playwright; renderer-only specs need only the Vite dev server, full-stack specs need the backend running). Full command set: [`client/desktop/tests/README.md`](../client/desktop/tests/README.md).
-- **Control-plane** — `go test ./...`, `go test -race ./...`; integration tests require PostgreSQL + Redis (`docker-compose up -d postgres redis`). Full command set + `testhelpers` reference: [`services/control-plane/tests/README.md`](../services/control-plane/tests/README.md).
+- **Desktop** — `npm test` (full Vitest suite — unit + integration), `npm run test:watch`, `npm run test:coverage`, `npm run test:unit` (unit only), `npm run test:integration` (integration only), `npm run test:e2e` (Playwright: renderer-only specs need only the Vite dev server, and full-stack specs need the backend running). Full command set: [`client/desktop/tests/README.md`](../client/desktop/tests/README.md).
+- **Control-plane** — `go test ./...` and `go test -race ./...`. Integration tests require PostgreSQL and Redis (`docker-compose up -d postgres redis`). Full command set plus `testhelpers` reference: [`services/control-plane/tests/README.md`](../services/control-plane/tests/README.md).
 - **Media-plane** — `cd services/media-plane && npm test`.
 - **Whole stack for E2E** — `./scripts/concord-dev.sh up` then run Playwright from `client/desktop`.
 
 ## CI/CD
 
-- [`.github/workflows/build.yml`](../.github/workflows/build.yml) runs on every PR, invoked via `workflow_call` from `pr-ci.yml`: desktop, control-plane, and media-plane test suites run in parallel with coverage, then results upload to SonarQube for Quality Gate enforcement.
-- The Playwright E2E specs run **manually** via `npm run test:e2e` in `client/desktop` — the CI workflow was removed in #1435 (deferred-to-manual posture; visual-regression diffs were non-blocking advisory noise).
+- [`.github/workflows/build.yml`](../.github/workflows/build.yml) runs on every PR, invoked via `workflow_call` from `pr-ci.yml`. The desktop, control-plane, and media-plane test suites run in parallel with coverage. Results then upload to SonarQube for Quality Gate enforcement.
+- The Playwright E2E specs run **manually** via `npm run test:e2e` in `client/desktop`. #1435 removed the CI workflow, moving to a deferred-to-manual posture. Visual-regression diffs were non-blocking advisory noise.
 
 See the desktop README's [CI/CD section](../client/desktop/tests/README.md#cicd) for the full E2E job semantics.
 
@@ -72,4 +72,4 @@ See the desktop README's [CI/CD section](../client/desktop/tests/README.md#cicd)
 - [`services/control-plane/tests/README.md`](../services/control-plane/tests/README.md) — Go test layout across packages, `internal/testhelpers`, integration prerequisites and env vars.
 - [`scripts/tests/README.md`](../scripts/tests/README.md) — bash assertion convention for `scripts/concord-dev.sh` and deploy scripts.
 
-> **Gap:** `services/media-plane/` has tests (`services/media-plane/tests/`) but no per-service `README.md` yet. Authoring it is tracked separately (out of scope for this overview).
+> **Gap:** `services/media-plane/` has tests (`services/media-plane/tests/`) but no per-service `README.md` yet. A separate issue tracks authoring it (out of scope for this overview).

@@ -41,7 +41,7 @@ If revoked → Instance enters restricted mode
 ## Security Model
 
 **Important Design Decision:**
-Based on the architectural review, the "break glass" remote kill switch has been **softened** to address trust concerns:
+The architectural review **softened** the "break glass" remote kill switch, to address trust concerns:
 
 ### Recommended Approach: Offline-Capable Validation
 
@@ -141,7 +141,7 @@ Response: { "success": true }
 
 ## Key Management
 
-**Critical:** Private keys must be secured!
+**Critical:** Secure the private keys!
 
 - Use HSM (Hardware Security Module) in production
 - Or AWS KMS / Google Cloud KMS

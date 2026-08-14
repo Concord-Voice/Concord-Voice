@@ -5,8 +5,8 @@
 When enabled, the media plane publishes a fixed scalar snapshot of aggregate
 room, participant, publisher, egress, and participant-hour counters. It sends no
 room/user/server IDs or arbitrary labels. Snapshots use the signed v1 envelope
-and fixed `ops.metrics.media.v1` NATS subject; failed publication drops one
-interval without buffering or blocking media traffic. See ADR-0030.
+and fixed `ops.metrics.media.v1` NATS subject. A failed publication drops one
+interval, without buffering or blocking media traffic. See ADR-0030.
 
 **Status:** ✅ IMPLEMENTED (Phase 1C - Complete)
 
@@ -110,7 +110,7 @@ MEDIASOUP_LOG_LEVEL=warn
 
 **Important for Docker/Cloud:**
 - Set `ANNOUNCED_IP` to your server's public IP
-- Ensure UDP ports `40000-49999` are open in your firewall
+- Open UDP ports `40000-49999` in your firewall
 
 ## Socket.IO Events
 
@@ -127,8 +127,8 @@ socket.emit('join-room', {
 ```
 
 `mediaFrameCryptoVersion: 2` is the AES-256-GCM media-frame format. The media
-plane rejects missing or legacy frame-format declarations and keeps one
-room-wide value so mixed AES-128/AES-256 clients cannot enter the same call.
+plane rejects missing or legacy frame-format declarations. It keeps one
+room-wide value, so mixed AES-128/AES-256 clients cannot enter the same call.
 
 **create-transport**
 ```typescript
@@ -249,7 +249,7 @@ Client 3 (Producer) → WebRTC Transport ↗         ↘ WebRTC Transport → Cl
 
 **Consumer** - Media stream sink
 - Created when user wants to receive audio
-- One per Producer being consumed
+- One per consumed Producer
 
 ## Port Requirements
 
@@ -259,7 +259,7 @@ Client 3 (Producer) → WebRTC Transport ↗         ↘ WebRTC Transport → Cl
 ### UDP
 - **40000-49999** - RTC media ports (configurable)
 
-**Note:** In production, you may want to limit the port range to reduce firewall rules, e.g., 40000-40099 for a small deployment.
+**Note:** in production, consider a smaller port range to reduce firewall rules. A small deployment might use 40000-40099.
 
 ## Scaling
 
@@ -306,7 +306,7 @@ Key metrics to monitor:
 - Check firewall allows UDP ports
 - Verify `ANNOUNCED_IP` is correct
 - Check ICE candidates in logs
-- Ensure client has microphone permissions
+- Confirm the client has microphone permissions
 
 ### High latency
 - Check geographic distance to media plane
@@ -343,7 +343,7 @@ Key metrics to monitor:
 
 Two Docker build verification tiers run on every PR touching `services/media-plane/**`:
 
-- **Tier-1 `Media Plane / Docker build (cache-warm)`** — fast feedback (~4 min on cache hit). Uses Blacksmith's persistent Docker builder, which is intentionally excluded from Tier 2. Defends application logic correctness; cache miss on `package-lock.json` or `Dockerfile` change is expected. See [ADR-0006 §"Tier 1"](../../[internal]0006-cache-tier-split.md).
+- **Tier-1 `Media Plane / Docker build (cache-warm)`** — fast feedback (~4 min on cache hit). Uses Blacksmith's persistent Docker builder, which is intentionally excluded from Tier 2. Defends application logic correctness. A cache miss on a `package-lock.json` or `Dockerfile` change is normal. See [ADR-0006 §"Tier 1"](../../[internal]0006-cache-tier-split.md).
 - **Tier-2 `Production-compose / Docker build (cache-cold)`** — defense-in-depth for the full four-image production-active stack (PostgreSQL, control plane, media plane, and `concord-ops-agent`). The no-cache build catches file-`COPY`-order regressions, postinstall failures, and cross-image Compose drift invisible to cache-warm CI. See [ADR-0006 §"Tier 2"](../../[internal]0006-cache-tier-split.md) and [`[internal]rules/media-plane.md`](../../[internal]rules/media-plane.md) §"Docker Build Context Invariant".
 
-Tier 1 runs a direct media-plane build plus the toolchain-absent, mediasoup worker-spawn, and image-size checks. Tier 2 runs the production Compose build, asserts all four images exist, then repeats the media-plane toolchain and worker smokes. The cache-warm job's success metric (≥85% cache hit rate on lockfile-unchanged PRs over a 2-week window) is measured per spec [`[internal]specs/2026-05-28-1167-cache-warm-mediaplane-design.md`](../../[internal]specs/2026-05-28-1167-cache-warm-mediaplane-design.md) §6.5 by the script at `[internal]artifacts/1167-measurements/measure-hit-rate.sh`.
+Tier 1 runs a direct media-plane build plus the toolchain-absent, mediasoup worker-spawn, and image-size checks. Tier 2 runs the production Compose build, asserts all four images exist, then repeats the media-plane toolchain and worker smokes. The cache-warm job has a success metric: a ≥85% cache hit rate on lockfile-unchanged PRs over a 2-week window. The script at `[internal]artifacts/1167-measurements/measure-hit-rate.sh` measures it, per spec [`[internal]specs/2026-05-28-1167-cache-warm-mediaplane-design.md`](../../[internal]specs/2026-05-28-1167-cache-warm-mediaplane-design.md) §6.5.

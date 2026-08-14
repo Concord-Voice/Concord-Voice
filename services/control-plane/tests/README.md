@@ -108,7 +108,7 @@ pkg/
     └── logger_test.go              # Logger tests
 ```
 
-**Backend test status:** current results are reported by CI.
+**Backend test status:** CI reports current results.
 
 ## Running Tests
 
@@ -147,11 +147,11 @@ go tool cover -html=coverage.out  # Open in browser
 
 ### Test Helpers (`internal/testhelpers/`)
 
-**SetupTestDB(t)** — Connects to PostgreSQL via `DATABASE_URL` env var (default: localhost), runs all migrations, returns DB handle + cleanup function that truncates all tables.
+**SetupTestDB(t)** — Connects to PostgreSQL via the `DATABASE_URL` env var (default: localhost). Runs all migrations. Returns a DB handle plus a cleanup function that truncates all tables.
 
 **SetupTestRedis(t)** — Connects to Redis via `REDIS_URL` env var, uses DB index 1 for isolation, cleanup calls FLUSHDB.
 
-**SetupTestServer(t)** — Creates a full test server with Gin router, Hub, DB, Redis, and JWT secret. Provides convenience methods:
+**SetupTestServer(t)** — Creates a full test server with Gin router, Hub, DB, Redis, and JWT secret. It offers these convenience methods:
 - `CreateTestUser(t, username)` — Inserts user with pre-computed Argon2id hash (avoids ~100ms per user), generates JWT
 - `CreateTestServer(t, ownerID, name)` — Inserts server + owner membership
 - `CreateTestChannel(t, serverID, name, isEncrypted)` — Inserts channel
@@ -175,15 +175,15 @@ docker-compose up -d postgres redis
 | `DATABASE_URL` | `postgres://concord:concord_dev_password@localhost:5432/concord?sslmode=disable` | Test database |
 | `REDIS_URL` | `redis://:concord_dev_redis@localhost:6379/1` | Test Redis. Must carry the compose `REDIS_PASSWORD`, or every Redis-backed test fails with `NOAUTH`/`WRONGPASS`. **Keep the `/1`** — see below |
 
-> **The `/1` is load-bearing.** `SetupTestRedis` forces DB 1 only when `REDIS_URL` is *unset*; when it is set, the
+> **The `/1` is load-bearing.** `SetupTestRedis` forces DB 1 only when `REDIS_URL` is *unset*. When it is set, the
 > DB comes from the URL, and a URL with no path selects DB **0**. The helper then runs `FLUSHDB`, so a
 > `REDIS_URL` without `/1` wipes your development keyspace. This bites hardest if you export `REDIS_URL` for the
 > control-plane service (where DB 0 is correct) and then run the tests in the same shell.
 
 ## CI/CD
 
-Tests run in GitHub Actions via `.github/workflows/build.yml` on every push to `main` and all PRs. The workflow spins up PostgreSQL and Redis service containers, runs `go test` with coverage, and uploads results to SonarQube for Quality Gate enforcement.
+Tests run in GitHub Actions via `.github/workflows/build.yml` on every push to `main` and all PRs. The workflow starts PostgreSQL and Redis service containers. It runs `go test` with coverage. It uploads results to SonarQube for Quality Gate enforcement.
 
-Pre-commit hooks (`./scripts/install-git-hooks.sh`) provide local Go linting (golangci-lint, go vet, gofmt) before push.
+Pre-commit hooks (`./scripts/install-git-hooks.sh`) run local Go linting (golangci-lint, go vet, gofmt) before push.
 
-Coverage target: **80%+** on new code (enforced by SonarQube Quality Gate).
+Coverage target: **80%+** on new code, which the SonarQube Quality Gate enforces.

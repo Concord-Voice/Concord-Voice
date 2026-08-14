@@ -2,7 +2,7 @@
 
 Test suite for the Concord Voice Desktop Client (Electron/React/TypeScript).
 
-Test files span unit, component, hook, service, shared, and E2E categories. Current test status and coverage are reported by CI.
+Test files span unit, component, hook, service, shared, and E2E categories. CI reports current test status and coverage.
 
 ## Structure
 
@@ -111,11 +111,11 @@ npx playwright test
 
 ### Component Tests
 
-Components are tested with the custom `render()` from `test-utils.tsx` which wraps with `BrowserRouter`. Zustand stores are set directly via `setState()` for setup and read via `getState()` for assertions.
+Component tests use the custom `render()` from `test-utils.tsx`, which wraps with `BrowserRouter`. Tests set Zustand stores directly via `setState()` for setup, and read them via `getState()` for assertions.
 
 ### Store Tests
 
-Zustand stores are tested directly — call actions, assert state changes. MSW intercepts API calls made by async actions. Stores are reset between tests.
+Store tests call actions directly and assert state changes. MSW intercepts API calls from async actions. Each test resets the stores.
 
 ### Mocking
 
@@ -126,26 +126,26 @@ Zustand stores are tested directly — call actions, assert state changes. MSW i
 
 ### Known Limitations
 
-- `window.matchMedia` is unavailable in jsdom — system theme tests must be skipped
-- `InviteToServerModal` causes OOM in jsdom — excluded from test suite
-- Components that fetch in `useEffect` on mount will override manually-set store state — mock the fetch function or API client
+- `window.matchMedia` is unavailable in jsdom, so system theme tests must be skipped
+- `InviteToServerModal` causes OOM in jsdom, so the suite excludes it
+- Components that fetch in `useEffect` on mount will override manually-set store state. Mock the fetch function or the API client
 
 ## CI/CD
 
-Tests run in GitHub Actions via `.github/workflows/build.yml`, invoked via `workflow_call` from `pr-ci.yml` on every PR. The workflow runs desktop tests in parallel with control-plane and media-plane checks, then uploads coverage to SonarQube for Quality Gate enforcement.
+Tests run in GitHub Actions via `.github/workflows/build.yml`, invoked via `workflow_call` from `pr-ci.yml` on every PR. The workflow runs desktop tests in parallel with control-plane and media-plane checks. It then uploads coverage to SonarQube for Quality Gate enforcement.
 
 ### E2E (Playwright)
 
-The 8 e2e specs in `tests/e2e/` run **manually** via `npm run test:e2e` — CI enforcement was removed in #1435 (advisory-only signal, macOS visual-baseline flakiness; see the historical playwright ADR-0011).
+The 8 e2e specs in `tests/e2e/` run **manually** via `npm run test:e2e`. #1435 removed CI enforcement, because the signal was advisory-only and macOS visual baselines were flaky. See the historical playwright ADR-0011.
 
 - **Renderer-only specs** (`visual-regression`, `design-tokens`, `bundled-fallback-login`) — tagged with `{ tag: '@renderer-only' }`. Run on every PR. Need only the Vite dev server.
 - **Full-stack specs** (`auth`, `channels`, `invites`, `messaging`, `servers`) — untagged (default). Run ONLY when the PR also touches `services/control-plane/**` or migrations. Need a running backend (Postgres + Redis + control-plane).
 
-The workflow uses `services:` blocks for Postgres + Redis; the control-plane Go binary starts via `go run ./cmd/server &` conditionally based on `dorny/paths-filter` output.
+The workflow uses `services:` blocks for Postgres and Redis. The control-plane Go binary starts via `go run ./cmd/server &`, conditionally on `dorny/paths-filter` output.
 
-**Visual-regression failure semantics:** non-blocking. A snapshot diff against the committed baseline posts a sticky PR comment with the diff artifact link, but the workflow exits 0 (green CI). Real test failures (assertion, timeout, navigation) exit 1 (red CI).
+**Visual-regression failure semantics:** non-blocking. A snapshot diff against the committed baseline posts a sticky PR comment with the diff artifact link. The workflow still exits 0 (green CI). Real test failures (assertion, timeout, navigation) exit 1 (red CI).
 
-**Re-baselining:** the canonical Linux baselines are captured + committed by a one-shot bot-authored follow-up PR after #1074 merges. The original Mac-captured `*-chromium-darwin.png` baselines remain in the tree until that PR merges; PRs in the meantime will see non-blocking drift comments from Mac→Linux subpixel rendering differences.
+**Re-baselining:** a one-shot bot-authored follow-up PR captures and commits the canonical Linux baselines after #1074 merges. The original Mac-captured `*-chromium-darwin.png` baselines remain in the tree until that PR merges. Until then, PRs see non-blocking drift comments from Mac→Linux subpixel rendering differences.
 
 To run e2e locally (renderer-only specs, no backend needed):
 
@@ -165,6 +165,6 @@ cd client/desktop
 npx playwright test
 ```
 
-Pre-commit hooks (`./scripts/install-git-hooks.sh`) provide local linting and type-checking before push.
+Pre-commit hooks (`./scripts/install-git-hooks.sh`) run local linting and type-checking before push.
 
-Coverage target: **80%+** on new code (enforced by SonarQube Quality Gate).
+Coverage target: **80%+** on new code, which the SonarQube Quality Gate enforces.
