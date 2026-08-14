@@ -1,4 +1,4 @@
 {
-  "//": "Tracked HIGH/CRITICAL npm-audit advisory exceptions for client/admin. Consumed by scripts/security/npm-audit-gate.{sh,mjs}. Prefer updating dependencies over accepting. Each entry requires id, reason with tracking link, and review_by date.",
+  "//": "Tracked HIGH/CRITICAL npm-audit advisory exceptions for client/admin. Consumed by scripts/security/npm-audit-gate.{sh,mjs}. Prefer updating dependencies over accepting. Each entry requires id, package (the npm package npm reported the advisory for), reason with tracking link, and review_by date; scope: \"dev\" is optional. `package` is REQUIRED and matched against npm's report — an entry without it, or scoped to a different package, does NOT suppress and blocks instead. `scope: dev` is verified against a production-only `npm audit --omit=dev` report and fails closed when unavailable.",
   "accepted": []
 }

@@ -111,6 +111,7 @@
     "node": ">=24.0.0",
     "npm": ">=10.0.0"
   },
+  "//overrides_security": "js-yaml@^4.3.1 closes GHSA-5p4m-2wfm-xmqj (quadratic CPU consumption in !!omap resolution; 4.x first-patched 4.3.1, 3.x 3.15.1) and is one of exactly THREE runtime-reachable overrides in this block — the others are ws and socket.io-parser; every other entry resolves dev-only, verified via the `dev` flag in package-lock.json rather than assumed from the package's reputation. js-yaml matters because electron-updater parses update manifests with it inside the main process, i.e. against remote-fetched content, so it is fixed rather than accepted. ip-address@^10.3.1 closes GHSA-mwp4-54f8-5fhr (leading-zero octets decoded as decimal while resolvers decode octal -> SSRF/trust-boundary bypass; vulnerable <= 10.3.0). undici@^7.29.0 closes GHSA-4cwx-7wf7-3272 (cross-user disclosure + parse-time crash via degenerate private cache directives; 7.x first-patched 7.29.0). fast-uri@^3.1.5 closes GHSA-7p8r-x3mc-p8w7 (host confusion via backslash authority introducer; 3.x first-patched 3.1.5). nanoid@^3.3.17 closes GHSA-2v37-7h3g-55p8 (custom generators loop indefinitely at size zero; transitive via vite->postcss). socket.io-parser@~4.2.7 closes GHSA-2m8v-j782-fhvr (zero-attachment memory exhaustion; transitive via socket.io-client). TILDE, not caret, and deliberately so: socket.io-client declares ~4.2.4, so a caret here would force a future 4.3.x under a client that never declared compatibility with it. This is the wire-format decoder — a silent minor drift is a protocol-compatibility risk, not merely a behavioral one. brace-expansion@^2.1.4 stays on the 2.x line DELIBERATELY: the minimatch@^9.0.7 cap above needs the 2.x default export that 5.x dropped (overriding to 5.x breaks eslint — 'brace_expansion_1.default is not a function'). 2.x carries backports for ALL THREE advisories that reach this line — GHSA-3jxr-9vmj-r5cp at 2.1.2 (which is where the former ^2.1.2 pin came from), GHSA-mh99-v99m-4gvg at 2.1.3, and GHSA-rgw5-rvv9-x895 at 2.1.4 — so none of them needs an allowlist entry. Note there is ZERO headroom: 2.1.4 sits exactly on the GHSA-rgw5 boundary, and the minimatch cap pins this workspace to the 2.x line, so a future advisory patched only on 5.x puts desktop straight back into allowlist territory. When you read or write a first-patched claim here, state the LINE it applies to and check the others — issue #2441 is the founding incident for that rule.",
   "overrides": {
     "tar": "^7.5.16",
     "@tootallnate/once": "^3.0.1",
@@ -118,13 +119,17 @@
     "serialize-javascript": "^7.0.3",
     "minimatch": "^9.0.7",
     "rollup": "^4.59.0",
-    "brace-expansion": "^2.1.2",
-    "fast-uri": "^3.1.4",
+    "brace-expansion": "^2.1.4",
+    "fast-uri": "^3.1.5",
     "shell-quote": "^1.10.0",
     "ws": "^8.21.0",
-    "undici": "^7.28.0",
+    "undici": "^7.29.0",
     "@babel/core": "^7.29.6",
-    "postcss": "^8.5.18"
+    "postcss": "^8.5.18",
+    "ip-address": "^10.3.1",
+    "js-yaml": "^4.3.1",
+    "nanoid": "^3.3.17",
+    "socket.io-parser": "~4.2.7"
   },
   "optionalDependencies": {
     "@noble/hashes": "^2.2.0"

@@ -46,7 +46,7 @@
     "node": "24.x",
     "npm": ">=10.0.0"
   },
-  "//overrides_security": "brace-expansion@^5.0.8 closes GHSA-mh99-v99m-4gvg (unbounded expansion -> OOM crash, first patched in 5.0.8; transitive via eslint->minimatch). minimatch@^10.2.5 REPLACES a former ^9.0.7 pin, which was a downgrade CAP (<10.0.0): eslint@10's chain requests minimatch ^10.2.x (^10.2.2 from @typescript-eslint/typescript-estree, ^10.2.4 from eslint and @eslint/config-array), and minimatch@9 is the version that calls brace-expansion's 2.x default export, dropped in 5.x — so the ^9 cap is what made brace-expansion@5 unreachable here. ^10.2.5 keeps an EXPLICIT floor above every 10.x minimatch advisory boundary (GHSA-7r86-cg39-jmmj and GHSA-23c5-xmqv-rm74 patch at 10.2.3, GHSA-3ppc-4f35-3m26 at 10.2.1) rather than relying on the consumer union floor, whose weakest member (^10.2.2) sits below two of those boundaries. minimatch@10.2.5 declares brace-expansion ^5.0.5, satisfied by the ^5.0.8 above. Do not re-add a minimatch pin below 10.",
+  "//overrides_security": "brace-expansion@^5.0.9 closes GHSA-mh99-v99m-4gvg (unbounded expansion -> OOM crash, first patched in 5.0.8 on the 5.x line; 2.x at 2.1.3) and GHSA-rgw5-rvv9-x895 (DoS via unbounded intermediate arrays, bypassing the CVE-2026-14257 mitigation; first patched in 5.0.9 on the 5.x line; 2.x at 2.1.4); both transitive via eslint->minimatch. nanoid@^3.3.17 closes GHSA-2v37-7h3g-55p8 (custom generators loop indefinitely when size is zero; transitive via vite->postcss). undici@^7.29.0 closes GHSA-4cwx-7wf7-3272 (cross-user information disclosure and parse-time crash via degenerate private cache directives). minimatch@^10.2.5 REPLACES a former ^9.0.7 pin, which was a downgrade CAP (<10.0.0): eslint@10's chain requests minimatch ^10.2.x (^10.2.2 from @typescript-eslint/typescript-estree, ^10.2.4 from eslint and @eslint/config-array), and minimatch@9 is the version that calls brace-expansion's 2.x default export, dropped in 5.x — so the ^9 cap is what made brace-expansion@5 unreachable here. ^10.2.5 keeps an EXPLICIT floor above every 10.x minimatch advisory boundary (GHSA-7r86-cg39-jmmj and GHSA-23c5-xmqv-rm74 patch at 10.2.3, GHSA-3ppc-4f35-3m26 at 10.2.1) rather than relying on the consumer union floor, whose weakest member (^10.2.2) sits below two of those boundaries. minimatch@10.2.5 declares brace-expansion ^5.0.5, satisfied by the ^5.0.9 above. Do not re-add a minimatch pin below 10. A former fast-uri override was removed here: this lockfile does not resolve fast-uri, so it bound nothing, and the npm-audit gate — which resolves live against this lockfile on every CI run — is the control that would catch a reintroduction. That was decided for fast-uri specifically, because its motivating advisory is closed AND it bound nothing. It is NOT a general instruction to prune: tar, @tootallnate/once, tmp, serialize-javascript, rollup and ws are dormant in this workspace too, predate this change, and were deliberately left alone rather than swept.",
   "overrides": {
     "tar": "^7.5.16",
     "@tootallnate/once": "^1.0.3",
@@ -54,10 +54,10 @@
     "serialize-javascript": "^7.0.3",
     "minimatch": "^10.2.5",
     "rollup": "^4.59.0",
-    "fast-uri": "^3.1.2",
     "ws": "^8.21.0",
-    "undici": "^7.28.0",
+    "undici": "^7.29.0",
     "@babel/core": "^7.29.6",
-    "brace-expansion": "^5.0.8"
+    "brace-expansion": "^5.0.9",
+    "nanoid": "^3.3.17"
   }
 }

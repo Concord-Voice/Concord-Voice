@@ -9,12 +9,14 @@ COPY --from=admin_ui . .
 RUN npm run build && test -f dist/index.html
 
 # Go build stage
-# Patch-pinned to 1.26.5 (not the floating 1.26-alpine tag) so the SHIPPED
+# Patch-pinned to 1.26.6 (not the floating 1.26-alpine tag) so the SHIPPED
 # binary is compiled with the Go stdlib CVE fixes (GO-2026-5037/5038/5039
-# plus GO-2026-5856/GO-2026-4970), deterministically, not reliant on Docker
-# Hub tag-float + a GOTOOLCHAIN build-time download. Keep in lockstep with
+# plus GO-2026-5856/GO-2026-4970, and the 1.26.6 set: GO-2026-5026/5972/6088/
+# 6089/6090/6091/6218 across net/http, crypto/tls, html/template, encoding/xml,
+# encoding/asn1 and net/url), deterministically, not reliant on Docker Hub
+# tag-float + a GOTOOLCHAIN build-time download. Keep in lockstep with
 # services/control-plane/go.mod's `go` directive.
-FROM golang:1.26.5-alpine AS builder
+FROM golang:1.26.6-alpine AS builder
 
 WORKDIR /app
 
