@@ -173,7 +173,12 @@ docker-compose up -d postgres redis
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | `postgres://concord:concord_dev_password@localhost:5432/concord?sslmode=disable` | Test database |
-| `REDIS_URL` | `redis://localhost:6379` | Test Redis (uses DB 1) |
+| `REDIS_URL` | `redis://:concord_dev_redis@localhost:6379/1` | Test Redis. Must carry the compose `REDIS_PASSWORD`, or every Redis-backed test fails with `NOAUTH`/`WRONGPASS`. **Keep the `/1`** — see below |
+
+> **The `/1` is load-bearing.** `SetupTestRedis` forces DB 1 only when `REDIS_URL` is *unset*; when it is set, the
+> DB comes from the URL, and a URL with no path selects DB **0**. The helper then runs `FLUSHDB`, so a
+> `REDIS_URL` without `/1` wipes your development keyspace. This bites hardest if you export `REDIS_URL` for the
+> control-plane service (where DB 0 is correct) and then run the tests in the same shell.
 
 ## CI/CD
 

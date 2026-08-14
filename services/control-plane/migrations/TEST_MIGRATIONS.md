@@ -33,7 +33,7 @@ cd services/control-plane
 # Create .env file if it doesn't exist
 cat > .env << 'EOF'
 DATABASE_URL=postgres://concord:concord_dev_password@localhost:5432/concord?sslmode=disable
-REDIS_URL=redis://localhost:6379
+REDIS_URL=redis://:concord_dev_redis@localhost:6379
 JWT_SECRET=dev_jwt_secret_change_in_production
 PORT=8080
 ENVIRONMENT=development

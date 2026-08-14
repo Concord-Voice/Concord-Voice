@@ -95,7 +95,7 @@ The service will start on port 3000 by default.
 ```bash
 ENVIRONMENT=development
 PORT=3000
-REDIS_URL=redis://localhost:6379
+REDIS_URL=redis://:concord_dev_redis@localhost:6379
 CONTROL_PLANE_URL=http://localhost:8080
 
 # WebRTC settings

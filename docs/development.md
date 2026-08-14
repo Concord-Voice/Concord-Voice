@@ -64,7 +64,7 @@ go mod download
 # Create .env file (optional, has defaults)
 cat > .env << EOF
 DATABASE_URL=postgres://concord:concord_dev_password@localhost:5432/concord?sslmode=disable
-REDIS_URL=redis://localhost:6379
+REDIS_URL=redis://:concord_dev_redis@localhost:6379
 JWT_SECRET=dev_jwt_secret_change_in_production
 PORT=8080
 EOF
@@ -424,7 +424,7 @@ directory belong to the intended service.
 | `HSTS_HEADER_VALUE` | empty → `max-age=63072000; includeSubDomains; preload` | Optional production STS policy; nonempty values must pass the structural STS grammar |
 | `PORT` | `8080` | HTTP server port |
 | `DATABASE_URL` | (see above) | PostgreSQL connection |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection |
+| `REDIS_URL` | `redis://:concord_dev_redis@localhost:6379` | Redis connection. Compose starts Redis with `--requirepass "$REDIS_PASSWORD"`, so the URL must carry that password (repo-root `.env`); an uncredentialed URL fails every Redis call with `NOAUTH` |
 | `JWT_SECRET` | (dev secret) | JWT signing key |
 | `INSTANCE_TYPE` | `saas` | Deployment/entitlement mode (`saas` or `self-hosted`) |
 | `SERVER_VERSION` | `dev` | Advertised server version for capability discovery |

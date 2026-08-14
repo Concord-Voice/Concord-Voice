@@ -140,8 +140,8 @@ The service will start on port 8080 by default.
 ```bash
 ENVIRONMENT=development
 PORT=8080
-DATABASE_URL=postgres://concord:password@localhost:5432/concord?sslmode=disable
-REDIS_URL=redis://localhost:6379
+DATABASE_URL=postgres://concord:concord_dev_password@localhost:5432/concord?sslmode=disable
+REDIS_URL=redis://:concord_dev_redis@localhost:6379
 JWT_SECRET=your-secret-key
 NATS_URL=nats://localhost:4222
 MEDIA_PLANE_URL=http://localhost:3000
