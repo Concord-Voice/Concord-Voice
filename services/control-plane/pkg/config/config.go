@@ -418,17 +418,18 @@ func Load() (*Config, error) {
 		OIDCSubjectPrefix:        getEnv("ATTESTATION_OIDC_SUBJECT_PREFIX", "repo:Concord-Voice/Concord-Voice-Alpha:"),
 		OIDCSPAWorkflow:          getEnv("ATTESTATION_OIDC_SPA_WORKFLOW", "main-cd.yml"),
 		OIDCSPARef:               getEnv("ATTESTATION_OIDC_SPA_REF", "refs/heads/main"),
-		// CAUTION (#2021 B3 deferral): this default predates the #1492
-		// main-ci.yml workflow_call orchestration. Under workflow_call the
-		// OIDC workflow_ref claim names the TOP-LEVEL CALLER (main-ci.yml),
-		// so matchWorkflow(workflow_ref, "build-desktop.yml") will NOT match
-		// tokens minted by the orchestrated push:main build. The candidate
-		// fix is matching the binary axis on job_workflow_ref (which carries
-		// the called reusable workflow per GitHub OIDC docs) — but per the
-		// #654 closure caveat it MUST be verified against a REAL token's
-		// claims before the binary axis is wired. The axis is dormant today
-		// (no binary publisher); validateAttestation() WARNs when attestation
-		// is enabled while this unverified default is still in place.
+		// CAUTION (#2021 B3): the binary axis is dormant — nothing POSTs
+		// /publish/binary — and this default has never been checked against
+		// a REAL minted token. Untested, not known-bad: the original #1492
+		// hazard is GONE. That hazard was build-desktop.yml running under
+		// workflow_call from main-ci.yml, where the OIDC workflow_ref claim
+		// names the top-level CALLER. #2274 replaced that topology — every
+		// release run is now a standalone workflow_dispatch of
+		// build-desktop.yml, so workflow_ref names this workflow again and
+		// the default is expected to match. Verify against a real token's
+		// claims before the axis is wired (#654 closure caveat). If a
+		// workflow_call hop ever returns, the fix is matching the binary
+		// axis on job_workflow_ref, which carries the CALLED workflow.
 		OIDCBinaryWorkflow: getEnv("ATTESTATION_OIDC_BINARY_WORKFLOW", "build-desktop.yml"),
 		OIDCBinaryRef:      getEnv("ATTESTATION_OIDC_BINARY_REF", "refs/heads/main"),
 	}
@@ -848,6 +849,17 @@ func (c *Config) validateProduction() error {
 // configured when attestation is required — operator may have overridden the
 // non-empty defaults with empty env values, which would silently disable the
 // axis-binding check at the OIDC layer.
+// oidcSubjectPrefixShape requires a FULLY-QUALIFIED "repo:<owner>/<repo>:"
+// prefix. A bare shape check (HasPrefix "repo:") is not enough: the subject
+// prefix is the ONLY thing binding an attestation token to a repository —
+// matchWorkflow() anchors on the "/.github/workflows/<name>" suffix and places
+// no constraint on the owner/repo segment, the ref check is equality, and the
+// issuer is shared by every repo on GitHub. So "repo:" alone, "repo:Owner"
+// (an org anyone can register a lookalike of), or an unterminated
+// "repo:Owner/Repo" (which HasPrefix-matches "repo:Owner/Repo-Evil:") each
+// collapse that binding. The trailing colon is load-bearing (#2021).
+var oidcSubjectPrefixShape = regexp.MustCompile(`^repo:[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*:`)
+
 func (c *Config) validateAttestation() error {
 	if !c.RequireClientAttestation {
 		return nil
@@ -858,8 +870,8 @@ func (c *Config) validateAttestation() error {
 	if c.OIDCSubjectPrefix == "" {
 		return fmt.Errorf("ATTESTATION_OIDC_SUBJECT_PREFIX must be set when REQUIRE_CLIENT_ATTESTATION=true")
 	}
-	if !strings.HasPrefix(c.OIDCSubjectPrefix, "repo:") {
-		return fmt.Errorf("ATTESTATION_OIDC_SUBJECT_PREFIX must start with %q (GitHub OIDC sub claim shape), got %q", "repo:", c.OIDCSubjectPrefix)
+	if !oidcSubjectPrefixShape.MatchString(c.OIDCSubjectPrefix) {
+		return fmt.Errorf("ATTESTATION_OIDC_SUBJECT_PREFIX must start with %q — a fully-qualified %q prefix (GitHub OIDC sub claim shape), got %q", "repo:", "repo:<owner>/<repo>:", c.OIDCSubjectPrefix)
 	}
 	if c.Environment == "production" && c.OIDCIssuer != "https://token.actions.githubusercontent.com" {
 		return fmt.Errorf("ATTESTATION_OIDC_ISSUER must be the canonical GitHub issuer in production")
@@ -876,12 +888,15 @@ func (c *Config) validateAttestation() error {
 	if c.OIDCBinaryRef == "" {
 		return fmt.Errorf("ATTESTATION_OIDC_BINARY_REF must be set when REQUIRE_CLIENT_ATTESTATION=true")
 	}
-	if c.OIDCBinaryWorkflow == "build-desktop.yml" {
-		// Advisory only — the binary axis is dormant (no binary publisher is
-		// wired). See the OIDCBinaryWorkflow default in Load() for the #1492
-		// workflow_call identity mismatch this warns about (#2021 B3).
-		log.Printf("WARN: ATTESTATION_OIDC_BINARY_WORKFLOW=build-desktop.yml predates the #1492 main-ci.yml workflow_call orchestration; the binary-axis OIDC workflow_ref claim will NOT match until the axis binding is re-verified against a real token (see #2021)")
-	}
+	// Advisory only, and deliberately UNCONDITIONAL within this function.
+	// An earlier form fired on OIDCBinaryWorkflow == "build-desktop.yml",
+	// which post-#2274 is the value expected to MATCH — so it warned when the
+	// configuration was right and stayed silent when it was wrong. The fact
+	// worth surfacing does not depend on the configured value at all: the
+	// binary axis is dormant (nothing POSTs /publish/binary) and its binding
+	// has never been checked against a real minted token (#654 closure
+	// caveat, #2021 B3). See the OIDCBinaryWorkflow default in Load().
+	log.Printf("WARN: client attestation is enabled, but the binary axis is dormant (nothing publishes to /publish/binary) and its OIDC binding has never been verified against a real minted token; verify before wiring a binary publisher (see #2021)")
 	return nil
 }
 

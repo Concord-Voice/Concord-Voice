@@ -1161,6 +1161,49 @@ func TestValidateAttestation_MalformedSubjectPrefix(t *testing.T) {
 	require.ErrorContains(t, err, `must start with "repo:"`)
 }
 
+// TestValidateAttestation_OverbroadSubjectPrefix covers the fully-qualified
+// shape guard (#2021). The prefix is the ONLY thing binding an attestation
+// token to a repository — matchWorkflow ignores the owner/repo segment, the
+// ref check is equality, and the issuer is shared platform-wide. Each input
+// below passed the old bare HasPrefix("repo:") check while widening trust to
+// other repositories; a proof-of-concept drove a foreign-repo token all the
+// way through VerifySPA under the first one.
+func TestValidateAttestation_OverbroadSubjectPrefix(t *testing.T) {
+	cases := []struct {
+		name   string
+		prefix string
+		why    string
+	}{
+		{"bare scheme", "repo:", "matches every repository on GitHub"},
+		{"owner only", "repo:Concord-Voice", "matches a lookalike org anyone can register"},
+		{"owner with slash", "repo:Concord-Voice/", "matches any repo under the org"},
+		{"missing trailing colon", "repo:Concord-Voice/Concord-Voice-Alpha", "also matches ...-Alpha-Evil:"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validAttestationConfig()
+			cfg.OIDCSubjectPrefix = tc.prefix
+			err := cfg.validateAttestation()
+			require.Error(t, err, "prefix %q must be rejected — %s", tc.prefix, tc.why)
+			require.ErrorContains(t, err, "ATTESTATION_OIDC_SUBJECT_PREFIX")
+		})
+	}
+}
+
+// TestValidateAttestation_AcceptsFullyQualifiedSubjectPrefix is the positive
+// control for the guard above: the shipped default and a self-hosted fork's
+// own slug must both still pass.
+func TestValidateAttestation_AcceptsFullyQualifiedSubjectPrefix(t *testing.T) {
+	for _, prefix := range []string{
+		"repo:Concord-Voice/Concord-Voice-Alpha:",
+		"repo:some-operator/their.fork_name:",
+	} {
+		cfg := validAttestationConfig()
+		cfg.OIDCSubjectPrefix = prefix
+		require.NoError(t, cfg.validateAttestation(), "prefix %q must be accepted", prefix)
+	}
+}
+
 // TestValidate_WarnsOnBroadRFC1918Fallback verifies that production with
 // the broad RFC1918 fallback for TRUSTED_PROXY_CIDRS does NOT fail
 // startup but emits a warning log line. The test captures the standard
