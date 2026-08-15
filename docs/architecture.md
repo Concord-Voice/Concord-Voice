@@ -976,7 +976,7 @@ sequenceDiagram
             A->>S: POST /api/v1/channels/{linkedTextId}/keys {key_version: 1, wrapped_keys, wrapped_key_versions}
         end
     end
-    Note over A,S: Creator alone completes epoch 1; rotation waits for every eligible viewer
+    Note over A,S: Creator alone completes epoch 1. Rotation waits for every eligible viewer
 
     Note over A,B: New member joins
     B->>S: Join (via invite)
@@ -997,7 +997,7 @@ sequenceDiagram
     A->>A: Generate CSK' at epoch N+1
     loop Remaining ≤500-member batches
         A->>S: Distribute wrapped CSK' {key_version: N+1, key_fingerprint, wrapped_key_versions}
-        Note over S: First batch pins a client-asserted CSK fingerprint<br/>and queues eligible viewers missing N+1 for recovery;<br/>later batches/rewraps must assert the same fingerprint
+        Note over S: First batch pins a client-asserted CSK fingerprint<br/>and queues eligible viewers missing N+1 for recovery.<br/>Later batches and rewraps must assert the same fingerprint
     end
     Note over S: New messages use epoch N+1<br/>removed member cannot derive CSK'
 ```

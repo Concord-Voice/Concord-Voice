@@ -49,7 +49,11 @@ operator/disclosure-unavailable state.
 ## Additive-evolution contract
 
 The schema is **versioned by addition**: new fields are optional. **Old clients
-ignore unknown fields, and new clients tolerate missing fields**. Clients MUST validate
+ignore unknown fields, and new clients tolerate missing *optional* fields**. The
+rule covers additive fields only — the table above marks exactly one field optional,
+and the rest are always emitted. A client MUST NOT treat a missing
+`auth.mfaEnabled` or `features.e2eeEnforcedEverywhere` as a tolerable absence and
+degrade its posture; an absent non-optional field is a malformed response. Clients MUST validate
 at the boundary (zod per `[internal]rules/frontend.md`) and degrade gracefully rather
 than erroring on an unexpected shape. This is the single handshake that the
 self-hosted epic's SSO-suppression (#1619) and entitlement-unlock (#1620) children

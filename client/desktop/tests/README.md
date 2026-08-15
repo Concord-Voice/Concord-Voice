@@ -60,11 +60,16 @@ tests/
 │       └── crypto.test.ts          # Key derivation, key pair generation, wrap/unwrap, encrypt/decrypt (uses real Node webcrypto)
 └── e2e/                            # Playwright E2E tests
     ├── helpers.ts                  # registerUser, loginUser, createServer, createChannel helpers
+    ├── activity-history.spec.ts
     ├── auth.spec.ts
-    ├── servers.spec.ts
+    ├── bundled-fallback-login.spec.ts
     ├── channels.spec.ts
+    ├── design-tokens.spec.ts
+    ├── invites.spec.ts
     ├── messaging.spec.ts
-    └── invites.spec.ts
+    ├── rich-presence-overrides.spec.ts
+    ├── servers.spec.ts
+    └── visual-regression.spec.ts
 ```
 
 ## Running Tests
@@ -136,7 +141,7 @@ Tests run in GitHub Actions via `.github/workflows/build.yml`, invoked via `work
 
 ### E2E (Playwright)
 
-The 8 e2e specs in `tests/e2e/` run **manually** via `npm run test:e2e`. #1435 removed CI enforcement, because the signal was advisory-only and macOS visual baselines were flaky. See the historical playwright ADR-0011.
+The 10 e2e specs in `tests/e2e/` run **manually** via `npm run test:e2e`. #1435 removed CI enforcement, because the signal was advisory-only and macOS visual baselines were flaky. See the historical playwright ADR-0011.
 
 - **Renderer-only specs** (`visual-regression`, `design-tokens`, `bundled-fallback-login`) — tagged with `{ tag: '@renderer-only' }`. Run on every PR. Need only the Vite dev server.
 - **Full-stack specs** (`auth`, `channels`, `invites`, `messaging`, `servers`) — untagged (default). Run ONLY when the PR also touches `services/control-plane/**` or migrations. Need a running backend (Postgres + Redis + control-plane).
