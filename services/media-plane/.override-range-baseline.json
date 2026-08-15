@@ -1,0 +1,17 @@
+{
+  "//": "Accepted override-range skews — see scripts/security/override-range-lint.mjs. Each row is a consumer that resolves OUTSIDE the range it declares, because an `overrides` entry forces it there. Rows are matched on the full tuple, so a new consumer or a changed range/resolution is reported even for a package already listed here. Prune a row when the lint reports it as no longer occurring. Regenerate: node scripts/security/override-range-lint.mjs --dir <pkg> --update-baseline",
+  "accepted": [
+    {
+      "consumer": "node_modules/engine.io",
+      "dep": "ws",
+      "range": "~8.20.1",
+      "resolved": "8.21.0"
+    },
+    {
+      "consumer": "node_modules/socket.io-adapter",
+      "dep": "ws",
+      "range": "~8.20.1",
+      "resolved": "8.21.0"
+    }
+  ]
+}
