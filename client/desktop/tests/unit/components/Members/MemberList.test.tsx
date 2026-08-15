@@ -624,7 +624,11 @@ describe('MemberList', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Online — 24' }));
       const region = screen.getByRole('region', { name: 'Online — 24' });
       expect(screen.getAllByRole('button', { name: /^Member \d+ — Online$/ })).toHaveLength(24);
-      expect(region).toHaveStyle({ maxHeight: 'calc(100vh - 16px)' });
+      // Inline value, not computed — jsdom 30 resolves calc() against the
+      // viewport, so toHaveStyle would see "752px" rather than the declaration
+      // AttributedPopover actually sets. See the matching note in
+      // AttributedPopover.test.tsx.
+      expect(region.style.maxHeight).toBe('calc(100vh - 16px)');
       expect(region.querySelector('.attributed-popover__body')).toContainElement(
         screen.getByRole('button', { name: 'Member 24 — Online' })
       );

@@ -1,3 +1,16 @@
+// @vitest-environment node
+// This suite reads a file off disk and imports playwright.config — both pure
+// Node concerns with no DOM in sight. It inherited the global jsdom
+// environment (vite.config.ts) only by default.
+//
+// Not load-bearing for correctness any more, but kept deliberately. It was
+// added when `import('@playwright/test')` deadlocked here: jsdom 30 declares
+// undici ^8.9.0 and a stale global override was forcing the whole tree onto
+// undici 7, so jsdom ran a major below its own dependency. Removing that
+// override is the actual fix and this import works under jsdom again. Running
+// in node keeps a Node-only concern from being coupled to the DOM environment
+// at all, which is what made that dependency skew surface here as an
+// unexplained 10s timeout rather than anywhere informative.
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 

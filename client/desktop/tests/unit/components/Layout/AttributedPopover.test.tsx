@@ -216,7 +216,12 @@ describe('AttributedPopover', () => {
       expect(surface).toHaveStyle({ left: '8px', top: '52px' });
     });
     expect(Number.parseFloat(surface.style.left)).toBeLessThan(anchorRect.left);
-    expect(surface).toHaveStyle({ maxHeight: 'calc(100vh - 16px)' });
+    // Assert the INLINE value, not the computed one. jsdom 30 resolves calc()
+    // against the viewport, so getComputedStyle (which is what toHaveStyle
+    // reads) returns "752px" here — 768px default viewport height minus 16.
+    // The component's contract is the declaration it writes, not the pixel
+    // value a particular jsdom viewport happens to resolve it to.
+    expect(surface.style.maxHeight).toBe('calc(100vh - 16px)');
     expect(surface.querySelector('.attributed-popover__arrow')).toHaveStyle({ top: '100px' });
   });
 
