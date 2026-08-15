@@ -303,6 +303,67 @@ describe('config', () => {
     });
   });
 
+  // ── mediasoup worker count (#2178) ──────────────────────────────────
+
+  describe('mediasoup worker count (#2178)', () => {
+    it('defaults to 4 workers when NUM_WORKERS is unset', async () => {
+      const { config } = await loadConfig();
+      expect(config.mediasoup.numWorkers).toBe(4);
+      expect(process.exit).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { raw: '1', expected: 1 },
+      { raw: '3', expected: 3 },
+      // The ceiling itself must be accepted — an off-by-one here would reject a
+      // legitimate boundary value.
+      { raw: '32', expected: 32 },
+      // Pins .trim(): without it this parses as NaN and fatal-exits.
+      { raw: '  3  ', expected: 3 },
+    ])('accepts NUM_WORKERS=$raw as $expected worker(s)', async ({ raw, expected }) => {
+      const { config } = await loadConfig({ NUM_WORKERS: raw });
+      expect(config.mediasoup.numWorkers).toBe(expected);
+      expect(process.exit).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['0'],
+      ['-1'],
+      ['abc'],
+      [''],
+      ['3.5'],
+      // The exact example named in the parser's own comment.
+      ['4abc'],
+      // Whitespace-only must reject, not trim-to-empty-then-default.
+      ['   '],
+      // Above the sanity ceiling (#2178 review). '64' is the archetypal typo —
+      // it forks more subprocesses than the container cgroup can hold, which
+      // OOM-loops with no startup signal, unlike the zero case.
+      ['33'],
+      ['64'],
+      ['999999999'],
+      // Beyond Number.MAX_SAFE_INTEGER. NOTE: while the ceiling stands, no test
+      // can distinguish Number.isSafeInteger from Number.isInteger here — this
+      // value is rejected by the ceiling either way. The predicate matters only
+      // if the ceiling is ever removed.
+      ['9007199254740993'],
+    ])('fails closed for invalid NUM_WORKERS %j', async (raw) => {
+      await loadConfig({ NUM_WORKERS: raw });
+      expect(process.exit).toHaveBeenCalledWith(1);
+    });
+
+    it('names the variable and the observed value in the FATAL log', async () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await loadConfig({ NUM_WORKERS: '0' });
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('FATAL: NUM_WORKERS="0"'));
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('integer between 1 and 32'));
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+  });
+
   // ── Production Guard ────────────────────────────────────────────────
 
   describe('production guard', () => {

@@ -504,6 +504,12 @@ func loadActivityHistoryConfig(cfg *Config) error {
 		}
 		cfg.ControlPlaneReplicaCount = count
 	}
+	// Unconditional single-replica guard FIRST (#2178): validateActivityHistory
+	// below would otherwise shadow it whenever both constraints fail, sending the
+	// operator to disable Activity History instead of to the actual root cause.
+	if err := cfg.validateControlPlaneReplicaCount(); err != nil {
+		return err
+	}
 	return cfg.validateActivityHistory()
 }
 
@@ -511,6 +517,41 @@ func (c *Config) validateActivityHistory() error {
 	if c.ActivityHistoryClusterEnabled &&
 		(!c.ControlPlaneReplicaCountExplicit || c.ControlPlaneReplicaCount != 1) {
 		return fmt.Errorf("activity history requires CONTROL_PLANE_REPLICA_COUNT=1 to be explicitly configured")
+	}
+	return nil
+}
+
+// validateControlPlaneReplicaCount rejects any explicitly configured replica
+// count other than exactly 1 (#2178). This is a structural, unconditional
+// constraint — it deliberately COEXISTS WITH validateActivityHistory rather
+// than folding into it, because the two express different invariants (this one
+// holds regardless of the Activity History gate) and merging them would make
+// the Activity History error responsible for a constraint unrelated to it.
+//
+// Values below 1 are rejected alongside values above 1:
+// .github/workflows/provision-secrets.yml already refuses a non-positive count
+// ("CONTROL_PLANE_REPLICA_COUNT must be a positive integer"), so no
+// provisioning path emits 0 and rejecting it here costs nothing.
+//
+// Called from BOTH loadActivityHistoryConfig and validate(), and BOTH fire on
+// every real startup: Load() calls loadActivityHistoryConfig and then
+// cfg.validate(). The distinction between the two call sites is ORDERING, not
+// liveness — the load-time call runs first, so it is the site whose error an
+// operator actually sees; the validate() call is a second, later evaluation
+// reached only once the first has already passed. It is a pure predicate over
+// *Config, so calling it twice is idempotent. Do not delete either call as
+// "the redundant one": at both sites the guard is deliberately ordered ahead of
+// validateActivityHistory for the shadowing reason above.
+func (c *Config) validateControlPlaneReplicaCount() error {
+	if c.ControlPlaneReplicaCountExplicit && c.ControlPlaneReplicaCount != 1 {
+		return fmt.Errorf(
+			"CONTROL_PLANE_REPLICA_COUNT=%d is not supported: the control-plane WebSocket hub "+
+				"holds per-connection session state and channel interest maps in process memory, "+
+				"so a second replica silently drops cross-replica event fanout — members would "+
+				"see partial presence, typing, and message events with no error. Horizontal "+
+				"scaling requires externalized WebSocket session state (Redis interest maps + "+
+				"NATS broadcast) — tracked in #2757. Set CONTROL_PLANE_REPLICA_COUNT=1",
+			c.ControlPlaneReplicaCount)
 	}
 	return nil
 }
@@ -617,6 +658,12 @@ func loadCloudflareKVBridgeConfig(cfg *Config) error {
 // validate checks for dangerous configuration in production environments.
 // Returns an error if required secrets are missing or still set to dev defaults.
 func (c *Config) validate() error {
+	// Ordered before validateActivityHistory for the same reason as in
+	// loadActivityHistoryConfig (#2178): the unconditional constraint is the
+	// root cause, and fixing it also satisfies the Activity History one.
+	if err := c.validateControlPlaneReplicaCount(); err != nil {
+		return err
+	}
 	if err := c.validateActivityHistory(); err != nil {
 		return err
 	}

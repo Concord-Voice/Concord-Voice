@@ -271,6 +271,60 @@ function parsePositiveIntEnv(raw: string | undefined, fallback: number): number 
   return Number.isFinite(n) && n >= 1 ? n : fallback;
 }
 
+/**
+ * Sanity ceiling for the mediasoup worker pool (#2178 review). A worker is a
+ * single-threaded C++ subprocess; no host this deploys to has anywhere near this
+ * many cores, so a value above it is a typo, not a configuration.
+ */
+const MAX_MEDIASOUP_WORKERS = 32;
+
+/**
+ * Parse the mediasoup worker count fail-closed (#2178). Deliberately NOT
+ * `parsePositiveIntEnv` above: a silent fallback is right for an operational
+ * limit, but a bad worker count is unrecoverable.
+ *
+ * Clamped at BOTH ends, matching the discipline `[internal]rules/media-plane.md`
+ * states for every other capacity value ("Both resolvers clamp both ends: the
+ * upper bound stops a tier value raising the global ceiling; the lower bound
+ * stops a 0/negative value from disabling the cap").
+ *
+ * Below the floor — `NUM_WORKERS=0` builds an empty worker pool, `init()` still
+ * resolves, Express still listens and `/health` still answers 200. Then every
+ * voice join reaches `MediasoupService.getWorker()` (lib/mediasoup.ts), whose
+ * `workers[0]` is undefined, and the resulting TypeError is caught by the join
+ * handler and returned as an ordinary join-error ack. The process does NOT
+ * crash: it survives indefinitely, answering /health 200 while failing every
+ * join, so nothing restarts it. That silent-black-hole shape is exactly why the
+ * guard belongs at config load.
+ *
+ * Above the ceiling — `NUM_WORKERS=64` (a fat-fingered 6+4, or a value copied
+ * from a bare-metal sizing note) forks 64 subprocesses inside a 4 GB / 3-CPU
+ * cgroup, producing an OOM-kill → `restart: unless-stopped` → respawn loop with
+ * no startup signal at all. That is the more likely typo of the two.
+ *
+ * Both compose files now set this explicitly, so an operator typo is caught at
+ * startup by the same `FATAL:` + `process.exit(1)` mechanism as the JWT_SECRET
+ * and ALLOWED_ORIGINS guards below.
+ */
+function parseWorkerCountEnv(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  // Strict: bare Number.parseInt would accept '3.5' (-> 3) and '4abc' (-> 4).
+  const trimmed = raw.trim();
+  const workers = /^\d+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
+  if (!Number.isSafeInteger(workers) || workers < 1 || workers > MAX_MEDIASOUP_WORKERS) {
+    console.error(
+      `FATAL: NUM_WORKERS=${JSON.stringify(raw)} is not a valid worker count. ` +
+        `It must be an integer between 1 and ${MAX_MEDIASOUP_WORKERS} ` +
+        `(leave it unset for the default of ${fallback}). ` +
+        'A zero or unparseable count builds an empty mediasoup worker pool that ' +
+        'starts and answers /health, then fails every voice join without crashing; ' +
+        'an oversized count forks more subprocesses than the container cgroup can hold.'
+    );
+    process.exit(1);
+  }
+  return workers;
+}
+
 function parseOpsMetricsIntervalMs(raw: string | undefined): number {
   const match = /^(\d+)(ms|s|m)$/.exec((raw || '15s').trim());
   if (!match) return Number.NaN;
@@ -354,7 +408,10 @@ export const config = {
 
   // mediasoup settings
   mediasoup: {
-    numWorkers: Number.parseInt(process.env.NUM_WORKERS || '4', 10),
+    // Worker count (#2178). Fail-closed at load — see parseWorkerCountEnv. The
+    // default describes an unconstrained host; each compose file sets its own
+    // value (base "4", production "3" = its cpus limit).
+    numWorkers: parseWorkerCountEnv(process.env.NUM_WORKERS, 4),
 
     worker: {
       logLevel: (process.env.MEDIASOUP_LOG_LEVEL || 'warn') as mediasoup.types.WorkerLogLevel,

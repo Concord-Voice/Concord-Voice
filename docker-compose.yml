@@ -298,6 +298,12 @@ services:
       OPS_METRICS_INTERVAL: ${OPS_METRICS_INTERVAL:-15s}
       OPS_METRICS_ROLE: ${OPS_METRICS_ROLE:-local}
       PORT: 3000
+      # Explicit worker count (#2178). This file declares no `cpus` limit for any
+      # service, so "size to the CPU allocation" is undefined here and the value
+      # matches the code default in src/config/index.ts instead. Production sizes
+      # its own copy to its cpus allocation — see docker-compose.production.yml.
+      # A literal, not an interpolation: see the production file for why.
+      NUM_WORKERS: "4"
     ports:
       - "3000:3000"
       - "40000-40099:40000-40099/udp"  # RTC ports (limited range for dev)
@@ -308,6 +314,18 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
+    # BusyBox wget ships in node:24-alpine (same basis as the nats healthcheck
+    # above); --spider writes nothing, so this also satisfies the production
+    # overlay's read_only + cap_drop: ALL + tmpfs-only hardening. Paired with
+    # `docker compose up --wait` in concord-ctl.sh rebuild — without a
+    # healthcheck, --wait falls back to "container is running" and gates
+    # nothing. #2178.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks:
       - concordvoice-services
       - concordvoice-data

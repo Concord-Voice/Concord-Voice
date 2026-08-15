@@ -26,6 +26,7 @@ WebRTC Selective Forwarding Unit (SFU) for routing voice and video media in Conc
 ## Architecture
 
 The media plane is responsible for:
+
 - WebRTC media routing using SFU architecture
 - Handling ICE/STUN/TURN for NAT traversal
 - Managing mediasoup workers, routers, and transports
@@ -35,6 +36,7 @@ The media plane is responsible for:
 ### Why SFU?
 
 An SFU (Selective Forwarding Unit) forwards media streams without decoding/encoding:
+
 - **Low latency** - No transcoding overhead
 - **Scalable** - Each client receives optimized streams
 - **Quality** - Preserves original audio quality
@@ -73,11 +75,13 @@ media-plane/
 ### Setup
 
 1. **Install dependencies**
+
    ```bash
    npm install
    ```
 
 2. **Set up environment variables**
+
    ```bash
    cp .env.example .env
    # Edit .env with your configuration
@@ -109,14 +113,36 @@ MEDIASOUP_LOG_LEVEL=warn
 ```
 
 **Important for Docker/Cloud:**
+
 - Set `ANNOUNCED_IP` to your server's public IP
 - Open UDP ports `40000-49999` in your firewall
+- `NUM_WORKERS=4` is the code default and the value `docker-compose.yml` sets.
+  **Production uses `3`**, matching the media-plane's `cpus: '3'` limit in
+  `docker-compose.production.yml`. A mediasoup worker is a single-threaded C++
+  subprocess pinned to one core, so a count above the CPU allocation
+  oversubscribes the CFS quota and shows up as RTP jitter rather than a crash.
+  Nothing enforces agreement between the two values — change them together.
+- The worker count is validated fail-closed at startup (#2178): a value that is
+  not an integer in `[1, 32]` logs `FATAL:` and exits 1 instead of falling back
+  to the default. Both bounds matter. `NUM_WORKERS=0` would otherwise build an
+  empty worker pool, let `init()` resolve and `/health` answer 200, and then
+  fail every voice join **without crashing** — `getNextWorker()` returns
+  `undefined`, `worker.createRouter()` throws a TypeError, and that rejected
+  promise is caught by the join handler and converted into an ordinary
+  join-error ack. The process survives indefinitely: every join fails, `/health`
+  keeps answering 200, and nothing restarts the container. An oversized count is
+  the likelier typo and would fail differently — absent the ceiling it would fork
+  more subprocesses than the container cgroup can hold, `init()` would never
+  resolve, `/health` would never answer, and a scoped deploy's `--wait` would
+  time out with the old container already gone. Both are descriptions of what
+  the guard prevents; neither value reaches the worker loop today.
 
 ## Socket.IO Events
 
 ### Client → Server
 
 **join-room**
+
 ```typescript
 socket.emit('join-room', {
   roomId: string,
@@ -131,6 +157,7 @@ plane rejects missing or legacy frame-format declarations. It keeps one
 room-wide value, so mixed AES-128/AES-256 clients cannot enter the same call.
 
 **create-transport**
+
 ```typescript
 socket.emit('create-transport', { roomId: string, direction: 'send' | 'recv' }, (data) => {
   // data: { id, iceParameters, iceCandidates, dtlsParameters }
@@ -138,6 +165,7 @@ socket.emit('create-transport', { roomId: string, direction: 'send' | 'recv' }, 
 ```
 
 **connect-transport**
+
 ```typescript
 socket.emit('connect-transport', { transportId: string, dtlsParameters }, (data) => {
   // data: { success: boolean }
@@ -145,6 +173,7 @@ socket.emit('connect-transport', { transportId: string, dtlsParameters }, (data)
 ```
 
 **produce**
+
 ```typescript
 socket.emit('produce', { transportId, kind: 'audio', rtpParameters }, (data) => {
   // data: { id: producerId }
@@ -152,6 +181,7 @@ socket.emit('produce', { transportId, kind: 'audio', rtpParameters }, (data) => 
 ```
 
 **consume**
+
 ```typescript
 socket.emit('consume', { producerId, rtpCapabilities }, (data) => {
   // data: { id, producerId, kind, rtpParameters }
@@ -159,6 +189,7 @@ socket.emit('consume', { producerId, rtpCapabilities }, (data) => {
 ```
 
 **request-keyframe**
+
 ```typescript
 socket.emit('request-keyframe', { senderUserId }, (data) => {
   // data: { success: true, requested: number } | { error: string }
@@ -168,6 +199,7 @@ socket.emit('request-keyframe', { senderUserId }, (data) => {
 Requests a fresh video keyframe for the caller's consumer of `senderUserId` after E2EE epoch recovery. The media plane validates room membership and applies a 5s per-sender cooldown before calling mediasoup `consumer.requestKeyFrame()`.
 
 **update-test-status**
+
 ```typescript
 socket.emit('update-test-status', { isTesting: boolean }, (data) => {
   // data: { success: true } | { error: string }
@@ -177,6 +209,7 @@ socket.emit('update-test-status', { isTesting: boolean }, (data) => {
 ### Server → Client
 
 **router-rtp-capabilities**
+
 ```typescript
 socket.on('router-rtp-capabilities', ({ rtpCapabilities }) => {
   // Use to create send/recv transports
@@ -184,24 +217,21 @@ socket.on('router-rtp-capabilities', ({ rtpCapabilities }) => {
 ```
 
 **user-joined**
+
 ```typescript
-socket.on('user-joined', ({
-  userId,
-  username,
-  displayName,
-  avatarUrl,
-  e2eeEpoch,
-  isDeafened,
-  isTesting,
-}) => {
-  // New user joined the room; the two state flags are optional rollout fields.
-});
+socket.on(
+  'user-joined',
+  ({ userId, username, displayName, avatarUrl, e2eeEpoch, isDeafened, isTesting }) => {
+    // New user joined the room; the two state flags are optional rollout fields.
+  }
+);
 ```
 
 When `isDeafened` or `isTesting` is absent, clients preserve existing state for
 backward compatibility and the join-vs-consume media race.
 
 **new-producer**
+
 ```typescript
 socket.on('new-producer', ({ producerId, userId }) => {
   // Another user started producing media
@@ -209,6 +239,7 @@ socket.on('new-producer', ({ producerId, userId }) => {
 ```
 
 **user-left**
+
 ```typescript
 socket.on('user-left', ({ userId }) => {
   // User left the room
@@ -216,6 +247,7 @@ socket.on('user-left', ({ userId }) => {
 ```
 
 **participant-testing-changed**
+
 ```typescript
 socket.on('participant-testing-changed', ({ userId, isTesting }) => {
   // A participant started or stopped an audio device test
@@ -232,31 +264,38 @@ Client 3 (Producer) → WebRTC Transport ↗         ↘ WebRTC Transport → Cl
 ### Components
 
 **Worker** - CPU-bound process that handles media
+
 - One per CPU core recommended
 - Isolated failure domains
 
 **Router** - Routes media within a room
+
 - One per voice channel/room
 - Handles codec negotiation
 
 **Transport** - WebRTC connection endpoint
+
 - Two per client (send + receive)
 - Handles ICE, DTLS, SRTP
 
 **Producer** - Media stream source
+
 - Created when user starts sending audio
 - One per media track
 
 **Consumer** - Media stream sink
+
 - Created when user wants to receive audio
 - One per consumed Producer
 
 ## Port Requirements
 
 ### TCP
+
 - **3000** - HTTP/WebSocket server
 
 ### UDP
+
 - **40000-49999** - RTC media ports (configurable)
 
 **Note:** in production, consider a smaller port range to reduce firewall rules. A small deployment might use 40000-40099.
@@ -303,17 +342,20 @@ Key metrics to monitor:
 ## Troubleshooting
 
 ### No audio
+
 - Check firewall allows UDP ports
 - Verify `ANNOUNCED_IP` is correct
 - Check ICE candidates in logs
 - Confirm the client has microphone permissions
 
 ### High latency
+
 - Check geographic distance to media plane
 - Monitor CPU usage
 - Verify network bandwidth
 
 ### Connection failures
+
 - Check TURN server configuration
 - Verify firewall rules
 - Test with different network types

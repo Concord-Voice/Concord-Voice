@@ -117,7 +117,7 @@ GET /api/v1/server/capabilities
 | `INSTANCE_TYPE` | `saas` | `saas` or `self-hosted`. The self-hosted deploy sets `self-hosted`; unknown values normalize to `saas` before capabilities and entitlement resolution. |
 | `SERVER_VERSION` | `dev` | Advertised server version. The SaaS deploy pipeline sets the release tag. |
 | `ACTIVITY_HISTORY_CLUSTER_ENABLED` | `false` | Activity History rollout gate. Support is advertised only when this is `true`. |
-| `CONTROL_PLANE_REPLICA_COUNT` | unset | Must be explicitly set to `1`, together with the enabled cluster gate, before Activity History support is advertised. |
+| `CONTROL_PLANE_REPLICA_COUNT` | unset | Must be explicitly set to `1`, together with the enabled cluster gate, before Activity History support is advertised. Independently of that gate (#2178), any explicitly set value other than `1` now fails control-plane startup unconditionally — `validateControlPlaneReplicaCount()` rejects it regardless of environment or feature flags, because the WebSocket hub holds per-connection session state in process memory. Horizontal scaling is tracked in [#2757](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2757). |
 
 These values are non-secret and flow through the deployment configuration.
 Other fields derive from existing server config (SMTP, SSO, WebAuthn presence).

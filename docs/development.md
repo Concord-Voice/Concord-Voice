@@ -430,7 +430,7 @@ directory belong to the intended service.
 | `SERVER_VERSION` | `dev` | Advertised server version for capability discovery |
 | `NATS_URL` | `nats://localhost:4222` | NATS connection |
 | `ACTIVITY_HISTORY_CLUSTER_ENABLED` | `false` | Global Activity History rollout gate. Keep false for ordinary development unless you test the guarded single-replica path |
-| `CONTROL_PLANE_REPLICA_COUNT` | unset (Compose: `1`) | Explicit control-plane replica contract. Activity History requires this value set to exactly one when the gate is on |
+| `CONTROL_PLANE_REPLICA_COUNT` | unset (Compose: `1`) | Explicit control-plane replica contract. Since #2178 it is enforced **unconditionally at startup**, not only under the Activity History gate: any explicitly set value other than `1` fails `Load()` with a fatal error, on every environment. The WebSocket hub holds per-connection session state and channel interest maps in process memory, so a second replica silently drops cross-replica fanout. Horizontal scaling is tracked in #2757. Leaving it unset is fine — the guard only fires on an explicit value |
 | `ACTIVITY_HISTORY_OPERATOR_NAME` | empty | Self-host disclosure operator. Required before new Activity History opt-in becomes available (SaaS uses `Concord Voice LLC`) |
 | `ACTIVITY_HISTORY_PRIVACY_POLICY_URL` | empty | Self-host disclosure URL. Absolute HTTPS applies outside loopback development and test |
 
@@ -461,7 +461,7 @@ opt-in unavailable. It does not prevent existing history reads or deletion.
 | `ANNOUNCED_IP` | `127.0.0.1` | Public IP for WebRTC |
 | `RTC_MIN_PORT` | `40000` | Min RTC port |
 | `RTC_MAX_PORT` | `49999` | Max RTC port |
-| `NUM_WORKERS` | `4` | Mediasoup workers |
+| `NUM_WORKERS` | `4` (code); Compose sets its own literal per file — `4` in `docker-compose.yml`, `3` in `docker-compose.production.yml` | Mediasoup workers. The production value matches that file's `cpus: '3'` limit — a mediasoup worker is a single-threaded subprocess pinned to one core, and nothing enforces agreement between the two values, so change them together. Validated fail-closed at startup (#2178): anything that is not an integer `>= 1` logs `FATAL:` and exits 1 rather than falling back to the default. `0` would otherwise build an empty worker pool that starts and answers `/health`, then crashes on the first voice join |
 
 ### STUN/TURN (coturn)
 
