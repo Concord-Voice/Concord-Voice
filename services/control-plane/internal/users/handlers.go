@@ -19,7 +19,9 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
@@ -83,6 +85,11 @@ type Handler struct {
 	store                              media.ObjectDeleter       // nil when object storage is not configured
 	credFence                          *credepoch.Fence          // per-user credential-epoch fence (#2201)
 	tokenPairs                         TokenPairIssuer           // continuation pair for ChangePassword/ReplaceMyKeys (#2201)
+
+	// graphPresence reconciles already-delivered Rich Presence with the
+	// audience a settings write destroys (#2446). Nil leaves every handler at
+	// its pre-#2446 behaviour.
+	graphPresence presencecapture.GraphPresenceCapture
 }
 
 // NewHandler creates a new user handler.
@@ -101,6 +108,19 @@ func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, mfaVerifier 
 	}
 	return h
 }
+
+// SetGraphPresenceCapture wires the #2446 pre-mutation presence capture. A nil
+// capture leaves every handler behaving exactly as it did before the hook.
+func (h *Handler) SetGraphPresenceCapture(c presencecapture.GraphPresenceCapture) {
+	h.graphPresence = c
+}
+
+// HasGraphPresenceCapture reports whether the capture was wired. The router's
+// boot guard interrogates the HANDLER through this, never the constructed
+// reconciler value: graphpresence.New always returns a non-nil pointer, so a
+// check on that value is a tautology that still boots with the wiring line
+// deleted — the exact fail-open the guard exists to catch.
+func (h *Handler) HasGraphPresenceCapture() bool { return h.graphPresence != nil }
 
 // SetPresenceHistory injects the one concrete service shared by Custom Status
 // writers, acknowledged delivery, reconciliation, and reconnect snapshots.
@@ -2023,6 +2043,27 @@ func dmPrivacyLegacySync(level int) []string {
 	}
 }
 
+// readPriorFoF returns the user's dm_friends_of_friends flag as it stands
+// inside tx, before the settings UPDATE overwrites it.
+//
+// privacy_settings.dm_friends_of_friends is BOOLEAN NOT NULL DEFAULT FALSE
+// (migration 000032), so there is no NULL case. A missing row is the only
+// absent case and its effective value is that column default.
+func readPriorFoF(ctx context.Context, tx *sql.Tx, userID string) (bool, error) {
+	var fof bool
+	err := tx.QueryRowContext(ctx,
+		`SELECT dm_friends_of_friends FROM privacy_settings WHERE user_id = $1`,
+		userID,
+	).Scan(&fof)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read prior friends-of-friends flag: %w", err)
+	}
+	return fof, nil
+}
+
 // UpdatePrivacySettings updates the current user's privacy settings.
 // Accepts a partial JSON body — only provided fields are updated.
 // PATCH /users/me/privacy
@@ -2057,15 +2098,44 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 	// from dmPrivacyLegacySync — verbatim. The DB work runs in a closure so the
 	// failure response (and its message) is written in exactly one place.
 	var ps privacySettingsResponse
+	ctx := c.Request.Context()
 	txErr := func() error {
-		tx, err := h.db.Begin()
+		tx, err := h.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
-		defer func() { _ = tx.Rollback() }() // no-op once Commit succeeds
+		defer presencehook.RollbackUnlessDone(tx, h.log) // no-op once the terminal committed
 
-		if _, err := tx.Exec(`INSERT INTO privacy_settings (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
+		// The OLD flag value dies with the UPDATE below, so read it first and
+		// inside this transaction. Reading it afterwards computes the BEFORE
+		// audience against the NEW value and the delta comes out silently
+		// empty. This read precedes the row-ensuring INSERT so sql.ErrNoRows
+		// still distinguishes a first-ever write.
+		oldFoF, err := readPriorFoF(ctx, tx, userID)
+		if err != nil {
 			return err
+		}
+
+		if _, err := tx.ExecContext(ctx, `INSERT INTO privacy_settings (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
+			return err
+		}
+
+		// Capture strictly precedes the write, with nothing between them. Only
+		// an actual transition is captured: a PATCH that resends the current
+		// value changes no audience, and capturing anyway would take users-row
+		// locks for no reconciliation. No direction branch — widening and
+		// narrowing both capture, and the clear set is always captured minus
+		// fresh.
+		var plan presencecapture.Plan
+		if req.DMFriendsOfFriends != nil && *req.DMFriendsOfFriends != oldFoF {
+			plan, err = presencehook.Capture(ctx, h.graphPresence, tx, presencehook.Spec{
+				Family:      presencecapture.FamilyFriendsOfFriendsToggle,
+				Posture:     presencecapture.FailClosedBlockWrite,
+				PrincipalID: userID,
+			})
+			if err != nil {
+				return fmt.Errorf("presence capture: %w", err)
+			}
 		}
 
 		// #nosec G201 -- Safe: setClauses contains only parameterized ($N) assignments and fixed legacy literal clauses; no user value is interpolated
@@ -2077,16 +2147,19 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 			          share_personalization_with_gif_provider, require_auth_before_purge, updated_at
 		`, strings.Join(setClauses, ", "))
 
-		if err := tx.QueryRow(query, args...).Scan(
+		if err := tx.QueryRowContext(ctx, query, args...).Scan(
 			&ps.MessagesFriendsOnly, &ps.MessagesServerMembers, &ps.DMPrivacyLevel, &ps.DMFriendsOfFriends,
 			&ps.AutoAcceptFriendCodes, &ps.SearchableByUsername, &ps.SearchableByEmail, &ps.SearchableByPhone,
 			&ps.AllowEmbeddedContent, &ps.LoadGifsAutomatically, &ps.EnableKlipyProxy,
 			&ps.SharePersonalizationWithGifProvider, &ps.RequireAuthBeforePurge, &ps.UpdatedAt,
 		); err != nil {
+			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
 			return err
 		}
 
-		return tx.Commit()
+		// presencehook.Complete owns the commit on BOTH paths, so this handler never
+		// calls tx.Commit() itself. A nil plan is the benign terminal.
+		return presencehook.Complete(ctx, h.graphPresence, tx, plan)
 	}()
 	if txErr != nil {
 		h.log.Error("Failed to update privacy settings", "error", txErr)

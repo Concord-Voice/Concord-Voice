@@ -124,7 +124,7 @@ func SetupTestServer(t *testing.T) *TestServer {
 		redisCleanup()
 		dbCleanup()
 	})
-	router, hub, natsClient, opsRuntime, permissionEnforcer, _, err := api.NewRouter(
+	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, err := api.NewRouter(
 		db,
 		redisClient,
 		nil,
@@ -149,6 +149,11 @@ func SetupTestServer(t *testing.T) *TestServer {
 	// Shut down the hub goroutine before operations metrics, NATS, Redis, and DB.
 	// t.Cleanup runs in LIFO order, so registered-last runs first.
 	t.Cleanup(func() { hub.Shutdown() })
+	// Registered after the hub so it runs BEFORE it: both presence workers
+	// disconnect through the hub during their fail-closed drain. Nothing closed
+	// them at all before #2738, so every test server leaked two dispatch
+	// goroutines for the life of the run.
+	t.Cleanup(closePresence)
 
 	return &TestServer{
 		Router:          router,

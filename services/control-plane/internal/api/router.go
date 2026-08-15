@@ -19,6 +19,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedback"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/friends"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/graphpresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/klipy"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
@@ -279,6 +280,33 @@ func requirePresenceRecheckWired(
 	}
 }
 
+// graphPresenceWiringComplete reports whether every #2446 consumer handler was
+// wired. It asks the HANDLERS, never the constructed reconciler:
+// graphpresence.New always returns a non-nil pointer, so a check on that value
+// is a tautology that still boots with a SetGraphPresenceCapture line deleted —
+// the one fail-OPEN path this guard exists to catch.
+func graphPresenceWiringComplete(f *friends.Handler, u *users.Handler) bool {
+	return f.HasGraphPresenceCapture() && u.HasGraphPresenceCapture()
+}
+
+// requireGraphPresenceCaptureWired fatal-exits when the activity service exists
+// and any #2446 consumer is unwired. Its scope stops at the handlers it names:
+// adding a third consumer without adding it here is a silent hazard, exactly as
+// the three temp-grant owners remain one for #2445.
+func requireGraphPresenceCaptureWired(
+	log *logger.Logger,
+	activityService *presence.ActivityService,
+	f *friends.Handler,
+	u *users.Handler,
+) {
+	if activityService == nil {
+		return
+	}
+	if !graphPresenceWiringComplete(f, u) {
+		log.Fatal("graph presence capture is not wired on every consumer handler")
+	}
+}
+
 // NewRouter creates a new API router and returns its background runtime dependencies.
 func NewRouter(
 	db *sql.DB,
@@ -288,7 +316,7 @@ func NewRouter(
 	liveSpa *config.LiveSpaConfig,
 	log *logger.Logger,
 	dependencies RouterDependencies,
-) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, rbac.PresenceRecheck, error) {
+) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, rbac.PresenceRecheck, func(), error) {
 	metricsReader := dependencies.OpsMetricsReader
 	presenceHistoryService := dependencies.PresenceHistory
 	router := gin.New()
@@ -311,7 +339,7 @@ func NewRouter(
 	// Initialize WebSocket hub
 	hub := websocket.NewHub(db, redis, opsCounters)
 	if err := bindPresenceHistoryRuntime(hub, presenceHistoryService); err != nil {
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Initialize NATS (inter-service messaging with media plane)
@@ -477,6 +505,30 @@ func NewRouter(
 	// HandleUserDisconnect to cancel any rings they initiated.
 	hub.SetDMRingCanceller(dmHandler.HandleUserDisconnect)
 	friendsHandler := friends.NewHandler(db, log, hub)
+
+	// Pre-mutation Rich Presence capture for graph-destroying writes (#2446). It
+	// imports presence; friends and users import neither, via the presencecapture
+	// leaf. Separate from the #2445 executor by design: that family's durability
+	// belongs to #2635 and must not be conflated with this one.
+	graphPresenceCapture := graphpresence.New(db, activityService, hub, senderPresence, log)
+	friendsHandler.SetGraphPresenceCapture(graphPresenceCapture)
+	usersHandler.SetGraphPresenceCapture(graphPresenceCapture)
+	requireGraphPresenceCaptureWired(log, activityService, friendsHandler, usersHandler)
+
+	// Both presence workers own a goroutine and a queue, and NOTHING called
+	// either Close: a graceful shutdown left queued plans undrained, so the
+	// fail-closed abandons that exist to clear revoked state never ran. The
+	// #2445 executor had the identical gap, so one closer covers both (PR
+	// #2738 review, CodeRabbit).
+	//
+	// The caller must run this BEFORE hub.Shutdown and after the HTTP drain:
+	// the drain's abandons disconnect through the hub, so closing the hub
+	// first would silently discard exactly the work the drain exists to do.
+	closePresenceWorkers := func() {
+		graphPresenceCapture.Close()
+		presenceRecheckExecutor.Close()
+	}
+
 	feedbackHandler := buildFeedbackHandler(cfg, log)
 	notificationsHandler := notifications.NewHandler(db, log)
 	ownershipHandler := ownership.NewHandler(ownership.HandlerDeps{
@@ -2205,7 +2257,7 @@ func NewRouter(
 	opsRuntime := wireOpsMetricsRuntime(db, natsClient, hub, opsCounters, cfg.OpsMetrics, log)
 	// Start only after every dependency, observer, and route has been injected.
 	go hub.Run()
-	return router, hub, natsClient, opsRuntime, voicePermEnforcer, presenceRecheckExecutor, nil
+	return router, hub, natsClient, opsRuntime, voicePermEnforcer, presenceRecheckExecutor, closePresenceWorkers, nil
 }
 
 // healthHandler responds with 200 + control-plane health JSON. Registered

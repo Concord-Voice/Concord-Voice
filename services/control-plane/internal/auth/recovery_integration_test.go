@@ -99,7 +99,7 @@ func setupRecoverySMTPFailureTS(t *testing.T, closeDelay time.Duration) *testhel
 		redisCleanup()
 		dbCleanup()
 	})
-	router, hub, natsClient, opsRuntime, permissionEnforcer, _, err := api.NewRouter(
+	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, err := api.NewRouter(
 		db,
 		redisClient,
 		nil,
@@ -115,6 +115,9 @@ func setupRecoverySMTPFailureTS(t *testing.T, closeDelay time.Duration) *testhel
 	t.Cleanup(permissionEnforcer.Close)
 	t.Cleanup(func() { require.NoError(t, opsRuntime.Stop(context.Background())) })
 	t.Cleanup(func() { hub.Shutdown() })
+	// Registered after the hub so it runs BEFORE it: the presence drains
+	// disconnect through the hub (#2738).
+	t.Cleanup(closePresence)
 
 	return &testhelpers.TestServer{
 		Router:          router,

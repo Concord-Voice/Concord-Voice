@@ -166,12 +166,16 @@ func runControlPlane() (runErr error) {
 	// there). The nightly temp-grant sweep constructs its own tempGrantManager
 	// out here, so the executor is carried out to wire it.
 	var voicePresenceRecheck rbac.PresenceRecheck
+	// Closes both presence dispatch workers; ordered before hub.Shutdown so
+	// their fail-closed drains can still reach live sockets (#2738).
+	closePresenceWorkers := func() {}
 	runtime, startupErr := startActivityHistoryRuntime(activityHistoryRuntimeDependencies{
 		startupContext:      context.Background(),
 		workerContext:       cleanupCtx,
 		reconcileDisclosure: presenceHistoryService.ReconcileStaleDisclosure,
 		bindRouter: func() (*gin.Engine, *websocket.Hub, *natsclient.Client, error) {
-			router, hub, natsClient, metricsRuntime, permissionEnforcer, presenceRecheck, routerErr := api.NewRouter(
+			router, hub, natsClient, metricsRuntime, permissionEnforcer, presenceRecheck,
+				closePresence, routerErr := api.NewRouter(
 				db,
 				redisClient,
 				storageClient,
@@ -189,6 +193,7 @@ func runControlPlane() (runErr error) {
 			opsMetricsRuntime = metricsRuntime
 			voicePermissionEnforcer = permissionEnforcer
 			voicePresenceRecheck = presenceRecheck
+			closePresenceWorkers = closePresence
 			return router, hub, natsClient, nil
 		},
 		reconcilePending: presenceHistoryService.ReconcilePending,
@@ -281,6 +286,7 @@ func runControlPlane() (runErr error) {
 			},
 			func() error { return srv.Shutdown(ctx) },
 			waitBackgroundWorkers,
+			func() { closePresenceWorkers() },
 			func() { hub.Shutdown() },
 			func() error { return opsMetricsRuntime.Stop(ctx) },
 			func() error {
@@ -371,7 +377,13 @@ func runControlPlaneServer(
 func shutdownControlPlane(
 	stopBackground func(),
 	shutdownHTTP func() error,
-	waitActivityWorkers, shutdownHub func(),
+	waitActivityWorkers func(),
+	// closePresenceWorkers drains the #2445 and #2446 presence dispatch queues.
+	// It sits BEFORE shutdownHub on purpose: their fail-closed abandons
+	// disconnect through the hub, so closing the hub first would discard
+	// exactly the work the drain exists to perform (#2738 review).
+	closePresenceWorkers func(),
+	shutdownHub func(),
 	shutdownMetrics func() error,
 	shutdownAdminMetricsReader func() error,
 	closeNATS func(),
@@ -379,6 +391,7 @@ func shutdownControlPlane(
 	stopBackground()
 	shutdownErr := shutdownHTTP()
 	waitActivityWorkers()
+	closePresenceWorkers()
 	shutdownHub()
 	shutdownErr = errors.Join(shutdownErr, shutdownMetrics())
 	shutdownErr = errors.Join(shutdownErr, shutdownAdminMetricsReader())

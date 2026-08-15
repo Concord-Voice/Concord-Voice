@@ -2,12 +2,16 @@
 package friends
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
@@ -18,13 +22,24 @@ const (
 	errMsgFailedClaimFriendCode   = "Failed to claim friend code"
 	errMsgFailedSendFriendRequest = "Failed to send friend request"
 	errMsgFailedBlockUser         = "Failed to block user"
+	errMsgFailedAcceptRequest     = "Failed to accept friend request"
+	errMsgFailedRemoveFriend      = "Failed to remove friend"
 )
+
+// logMsgStartTransactionFailed is a LOG message, never a response body. It
+// sat inside the errMsg block above, one careless c.JSON away from returning
+// internal transaction detail to a client (PR #2738 review, @code-reviewer).
+const logMsgStartTransactionFailed = "Failed to start transaction"
 
 // Handler handles friend-related requests.
 type Handler struct {
 	db  *sql.DB
 	log *logger.Logger
 	hub *websocket.Hub
+	// graphPresence reconciles already-delivered Rich Presence with the friend
+	// graph these handlers mutate (#2446). Nil until the router wires it, and a
+	// nil capture leaves every handler behaving exactly as it did before.
+	graphPresence presencecapture.GraphPresenceCapture
 }
 
 // NewHandler creates a new friends handler.
@@ -33,6 +48,32 @@ func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub) *Handler {
 		db:  db,
 		log: log,
 		hub: hub,
+	}
+}
+
+// SetGraphPresenceCapture wires the #2446 pre-mutation presence capture. A nil
+// capture leaves every handler behaving exactly as it did before the hook.
+func (h *Handler) SetGraphPresenceCapture(c presencecapture.GraphPresenceCapture) {
+	h.graphPresence = c
+}
+
+// HasGraphPresenceCapture reports whether the capture was wired. The router's
+// boot guard interrogates the HANDLER through this, never the constructed
+// reconciler value: graphpresence.New always returns a non-nil pointer, so a
+// check on that value is a tautology that still boots with the wiring line
+// deleted — the exact fail-open the guard exists to catch.
+func (h *Handler) HasGraphPresenceCapture() bool { return h.graphPresence != nil }
+
+// blockCaptureSpec declares the block site's capture. Block is the ONLY #2446
+// site using FailConservativeDegrade: refusing a block because the capture read
+// failed would let a large friend graph deny a safety affordance, which is a
+// worse outcome than a conservative disconnect.
+func blockCaptureSpec(blockerID, blockedID string) presencehook.Spec {
+	return presencehook.Spec{
+		Family:        presencecapture.FamilyBlock,
+		Posture:       presencecapture.FailConservativeDegrade,
+		PrincipalID:   blockerID,
+		CounterpartID: blockedID,
 	}
 }
 
@@ -320,13 +361,71 @@ type RespondRequestBody struct {
 }
 
 func (h *Handler) acceptFriendRequest(c *gin.Context, requestID, userID, requesterID string) {
-	_, err := h.db.Exec(`
+	ctx := c.Request.Context()
+
+	// The write widens the friend graph the capture reads, so the two must share
+	// a transaction: an autocommit write leaves no window in which the
+	// pre-mutation audience is still readable.
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		h.log.Error(logMsgStartTransactionFailed, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAcceptRequest})
+		return
+	}
+	defer presencehook.RollbackUnlessDone(tx, h.log)
+
+	// Capture strictly precedes the write, with nothing between them. No
+	// direction branch — accepting widens, but the capture and refresh are
+	// unconditional and the clear set is always captured minus fresh.
+	plan, err := presencehook.Capture(ctx, h.graphPresence, tx, presencehook.Spec{
+		Family:        presencecapture.FamilyFriendshipAccept,
+		Posture:       presencecapture.FailClosedBlockWrite,
+		PrincipalID:   userID,
+		CounterpartID: requesterID,
+	})
+	if err != nil {
+		h.log.Error("Presence capture failed", "failure_class", "capture", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAcceptRequest})
+		return
+	}
+
+	// The predicate is repeated here on purpose, inside the transaction.
+	// RespondRequest's eligibility read runs on h.db OUTSIDE this tx, so
+	// matching on id alone left a TOCTOU window: if the counterpart called
+	// BlockUser in between, executeBlockTx set the row to 'blocked' and this
+	// UPDATE silently flipped it back to 'accepted' — an authorization
+	// regression that undoes a block (PR #2738 review, @code-reviewer).
+	// Re-asserting addressee_id and status='pending' makes the write refuse
+	// any row the caller is no longer entitled to accept.
+	res, err := tx.ExecContext(ctx, `
 		UPDATE friendships SET status = 'accepted', updated_at = NOW()
-		WHERE id = $1
-	`, requestID)
+		WHERE id = $1 AND addressee_id = $2 AND status = 'pending'
+	`, requestID, userID)
 	if err != nil {
 		h.log.Error("Failed to accept friend request", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to accept friend request"})
+		presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAcceptRequest})
+		return
+	}
+	accepted, err := res.RowsAffected()
+	if err != nil {
+		h.log.Error("Failed to read accept rows affected", "error", err)
+		presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseRowsAffected)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAcceptRequest})
+		return
+	}
+	if accepted == 0 {
+		// The request stopped being acceptable between the eligibility read and
+		// this write — blocked, withdrawn, or already answered. Nothing was
+		// written, so per the same rule the rowsAffected == 0 branch of
+		// RemoveFriend follows, drop the plan without disconnecting anyone.
+		c.JSON(http.StatusNotFound, gin.H{"error": "Friend request not found"})
+		return
+	}
+
+	if err = presencehook.Complete(ctx, h.graphPresence, tx, plan); err != nil {
+		h.log.Error("Failed to commit friend request acceptance", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAcceptRequest})
 		return
 	}
 
@@ -427,24 +526,82 @@ func (h *Handler) RemoveFriend(c *gin.Context) {
 		return
 	}
 
-	result, err := h.db.Exec(`
+	ctx := c.Request.Context()
+
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		h.log.Error(logMsgStartTransactionFailed, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveFriend})
+		return
+	}
+	defer presencehook.RollbackUnlessDone(tx, h.log)
+
+	// Capture strictly precedes the write, with nothing between them: the DELETE
+	// destroys the friend graph the capture reads.
+	plan, err := presencehook.Capture(ctx, h.graphPresence, tx, presencehook.Spec{
+		Family:        presencecapture.FamilyFriendshipRemove,
+		Posture:       presencecapture.FailClosedBlockWrite,
+		PrincipalID:   userID,
+		CounterpartID: targetUserID,
+	})
+	if err != nil {
+		h.log.Error("Presence capture failed", "failure_class", "capture", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveFriend})
+		return
+	}
+
+	result, err := tx.ExecContext(ctx, `
 		DELETE FROM friendships
 		WHERE ((requester_id = $1 AND addressee_id = $2) OR (requester_id = $2 AND addressee_id = $1))
 		  AND status = 'accepted'
 	`, userID, targetUserID)
 	if err != nil {
 		h.log.Error("Failed to remove friend", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove friend"})
+		presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveFriend})
 		return
 	}
 
-	rowsAffected, _ := result.RowsAffected()
+	// The previous `rowsAffected, _ :=` discarded a driver error and reported
+	// "Friendship not found" for a genuine failure ([internal]rules/backend.md).
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		h.log.Error("Failed to read rows affected", "error", err)
+		presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseRowsAffected)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveFriend})
+		return
+	}
 	if rowsAffected == 0 {
+		// Deliberately NO Abandon here. `rowsAffected == 0` is positive PROOF
+		// that no accepted friendship existed and nothing was written, so there
+		// is no stale audience to reconcile and nobody to disconnect. The
+		// deferred RollbackUnlessDone discards the transaction and the
+		// in-memory plan is simply dropped.
+		//
+		// Abandoning here was a security defect (#2738 review): the captured
+		// plan's viewer set always contains BOTH principals, and Abandon calls
+		// DisconnectRichPresenceClients, which closes every local device for
+		// those users. Any authenticated caller could therefore invoke
+		// RemoveFriend against a stranger and force a full websocket disconnect
+		// of that stranger, repeatably, having mutated nothing — a cheap DoS
+		// amplification vector.
+		//
+		// Contrast the `rows_affected` branch above, which DOES abandon: a
+		// driver error there leaves the write's outcome genuinely unknown, and
+		// unknown state must fail closed. Proven no-change must not.
 		c.JSON(http.StatusNotFound, gin.H{"error": "Friendship not found"})
 		return
 	}
 
-	h.log.Info("Friend removed", "user_id", userID, "target", targetUserID)
+	if err = presencehook.Complete(ctx, h.graphPresence, tx, plan); err != nil {
+		h.log.Error("Failed to commit friend removal", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveFriend})
+		return
+	}
+
+	// Counterpart omitted: this handler DELETES the row, so keeping the edge in
+	// logs would outlive the record the user just removed.
+	h.log.Info("Friend removed", "user_id", userID)
 
 	// Notify the other user
 	if h.hub != nil {
@@ -461,25 +618,42 @@ func (h *Handler) RemoveFriend(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Friend removed"})
 }
 
-func executeBlockTx(tx *sql.Tx, userID, targetUserID string) error {
-	res, err := tx.Exec(`
+// executeBlockTx captures the pre-mutation audience and applies the block, both
+// inside tx. It deliberately does NOT commit: presencehook.Complete owns the commit
+// so the durable rail can replace the terminal without touching this site.
+//
+// The capture is unconditional. The site sees all three prior friendship states
+// (accepted, pending, absent) and must not branch on them: the delta is simply
+// empty where nothing changed.
+func (h *Handler) executeBlockTx(
+	ctx context.Context, tx *sql.Tx, userID, targetUserID string,
+) (presencecapture.Plan, error) {
+	plan, err := presencehook.Capture(ctx, h.graphPresence, tx, blockCaptureSpec(userID, targetUserID))
+	if err != nil {
+		return nil, fmt.Errorf("capture block presence: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx, `
 		UPDATE friendships SET status = 'blocked', updated_at = NOW()
 		WHERE (requester_id = $1 AND addressee_id = $2) OR (requester_id = $2 AND addressee_id = $1)
 	`, userID, targetUserID)
 	if err != nil {
-		return err
+		return plan, fmt.Errorf("update friendship to blocked: %w", err)
 	}
-	rowsAffected, _ := res.RowsAffected()
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return plan, fmt.Errorf("read block rows affected: %w", err)
+	}
 	if rowsAffected == 0 {
-		_, err = tx.Exec(`
+		_, err = tx.ExecContext(ctx, `
 			INSERT INTO friendships (requester_id, addressee_id, status)
 			VALUES ($1, $2, 'blocked')
 		`, userID, targetUserID)
 		if err != nil {
-			return err
+			return plan, fmt.Errorf("insert block row: %w", err)
 		}
 	}
-	return nil
+	return plan, nil
 }
 
 type convEpoch struct {
@@ -487,8 +661,21 @@ type convEpoch struct {
 	maxEpoch int
 }
 
-func (h *Handler) findDMRevocations(tx *sql.Tx, userID, targetUserID string) []convEpoch {
-	revokeRows, revokeErr := tx.Query(`
+// findDMRevocations discovers the shared DM conversations whose key material a
+// block must revoke. It returns an error so a failed DISCOVERY fails the block.
+//
+// Every failure here was previously reported as "no revocations": a query error
+// logged and returned nil, a scan error was `continue`d — conflated with the
+// benign maxEpoch == 0 case — and rows.Err() only logged. The caller then wrote
+// no `dm_key_revocations` row, deleted the keys, and COMMITTED, so the DM key
+// endpoint kept accepting stale key material because its revocation check reads
+// exactly that row. A scan error is client-side and does not poison the
+// transaction, so nothing downstream failed either — the block looked healthy
+// (PR #2738 review, CodeRabbit; CWE-703).
+func (h *Handler) findDMRevocations(
+	ctx context.Context, tx *sql.Tx, userID, targetUserID string,
+) ([]convEpoch, error) {
+	revokeRows, revokeErr := tx.QueryContext(ctx, `
 		SELECT dp1.conversation_id, COALESCE(MAX(dck.key_version), 0)
 		FROM dm_participants dp1
 		INNER JOIN dm_participants dp2 ON dp1.conversation_id = dp2.conversation_id
@@ -497,38 +684,58 @@ func (h *Handler) findDMRevocations(tx *sql.Tx, userID, targetUserID string) []c
 		GROUP BY dp1.conversation_id
 	`, userID, targetUserID)
 	if revokeErr != nil {
-		h.log.Error("Failed to query shared DM conversations for revocation", "error", revokeErr)
-		return nil
+		return nil, fmt.Errorf("query shared dm conversations for revocation: %w", revokeErr)
 	}
 	defer func() { _ = revokeRows.Close() }()
 
 	var revocations []convEpoch
 	for revokeRows.Next() {
 		var ce convEpoch
-		if err := revokeRows.Scan(&ce.convID, &ce.maxEpoch); err != nil || ce.maxEpoch == 0 {
+		if err := revokeRows.Scan(&ce.convID, &ce.maxEpoch); err != nil {
+			return nil, fmt.Errorf("scan dm revocation row: %w", err)
+		}
+		if ce.maxEpoch == 0 {
+			// Genuinely nothing to revoke for this conversation — no key has
+			// ever been distributed. Distinct from a scan failure, which the
+			// old code conflated with this.
 			continue
 		}
 		revocations = append(revocations, ce)
 	}
 	if err := revokeRows.Err(); err != nil {
-		h.log.Error("Error iterating DM revocation rows", "error", err)
+		return nil, fmt.Errorf("iterate dm revocation rows: %w", err)
 	}
-	return revocations
+	return revocations, nil
 }
 
-func (h *Handler) revokeBlockedDMKeys(tx *sql.Tx, userID, targetUserID string) {
-	revocations := h.findDMRevocations(tx, userID, targetUserID)
+// revokeBlockedDMKeys revokes the blocked user's DM key material inside the
+// block transaction. It returns an error so a failed revocation FAILS THE BLOCK
+// rather than committing one.
+//
+// Every write here was previously discarded (`_, _ = tx.Exec`, and a
+// log-and-continue on the revocation insert), so a failed revocation of KEY
+// MATERIAL still committed the block and returned 200 — the caller believed the
+// blocked user had lost their keys when they had not. That is the incident class
+// `[internal]rules/backend.md` cites for #1154, in the same subsystem. Surfaced by
+// `@code-reviewer` and `@e2ee-reviewer` on PR #2738.
+func (h *Handler) revokeBlockedDMKeys(
+	ctx context.Context, tx *sql.Tx, userID, targetUserID string,
+) error {
+	revocations, err := h.findDMRevocations(ctx, tx, userID, targetUserID)
+	if err != nil {
+		return fmt.Errorf("find dm revocations: %w", err)
+	}
 	for _, ce := range revocations {
-		if _, err := tx.Exec(`
+		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO dm_key_revocations (conversation_id, revoked_epoch, successor_epoch, reason, revoked_by)
 			VALUES ($1, $2, $3, 'user_blocked', $4)
 			ON CONFLICT (conversation_id, revoked_epoch) DO NOTHING
 		`, ce.convID, ce.maxEpoch, ce.maxEpoch+1, userID); err != nil {
-			h.log.Error("Failed to record DM key revocation on block", "error", err, "conversation_id", ce.convID)
+			return fmt.Errorf("record dm key revocation: %w", err)
 		}
 	}
 
-	_, _ = tx.Exec(`
+	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM dm_channel_keys
 		WHERE user_id = $2
 		  AND conversation_id IN (
@@ -540,7 +747,10 @@ func (h *Handler) revokeBlockedDMKeys(tx *sql.Tx, userID, targetUserID string) {
 			SELECT MAX(key_version) FROM dm_channel_keys dck2
 			WHERE dck2.conversation_id = dm_channel_keys.conversation_id
 		  )
-	`, userID, targetUserID)
+	`, userID, targetUserID); err != nil {
+		return fmt.Errorf("delete blocked dm keys: %w", err)
+	}
+	return nil
 }
 
 func (h *Handler) notifyBlock(userID, targetUserID string) {
@@ -582,27 +792,36 @@ func (h *Handler) BlockUser(c *gin.Context) {
 		return
 	}
 
-	tx, err := h.db.Begin()
+	ctx := c.Request.Context()
+
+	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
-		h.log.Error("Failed to start transaction", "error", err)
+		h.log.Error(logMsgStartTransactionFailed, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedBlockUser})
 		return
 	}
-	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-			h.log.Error("Failed to rollback transaction", "error", rbErr)
-		}
-	}()
+	defer presencehook.RollbackUnlessDone(tx, h.log)
 
-	if err := executeBlockTx(tx, userID, targetUserID); err != nil {
+	plan, err := h.executeBlockTx(ctx, tx, userID, targetUserID)
+	if err != nil {
 		h.log.Error(errMsgFailedBlockUser, "error", err)
+		presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedBlockUser})
 		return
 	}
 
-	h.revokeBlockedDMKeys(tx, userID, targetUserID)
+	if err = h.revokeBlockedDMKeys(ctx, tx, userID, targetUserID); err != nil {
+		// A failed key revocation must not commit a block that claims to have
+		// revoked. The deferred rollback discards the friendship write too, so
+		// nothing landed — hence CauseWriteFailed, which proves no commit and
+		// therefore disconnects nobody.
+		h.log.Error("Failed to revoke blocked DM keys", "error", err)
+		presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedBlockUser})
+		return
+	}
 
-	if err := tx.Commit(); err != nil {
+	if err = presencehook.Complete(ctx, h.graphPresence, tx, plan); err != nil {
 		h.log.Error("Failed to commit block", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedBlockUser})
 		return
@@ -700,7 +919,10 @@ func (h *Handler) CreateFriendCode(c *gin.Context) {
 			continue
 		}
 
-		h.log.Info("Friend code created", "user_id", userID, "code", code)
+		// The code value is omitted deliberately: anyone holding it can claim a
+		// friendship with the owner, so it is bearer material, and logs are a
+		// weaker trust boundary than the table it lives in (#2738 review).
+		h.log.Info("Friend code created", "user_id", userID)
 		c.JSON(http.StatusCreated, gin.H{"friend_code": fc})
 		return
 	}
@@ -884,28 +1106,63 @@ func claimFriendshipConflictResponse(status string) (int, string) {
 	}
 }
 
-func executeFriendCodeClaim(tx *sql.Tx, userID, ownerID, codeID string, autoAccept bool) (string, string, string, error) {
+// claimResult carries the claim's outcome plus the presence plan its caller
+// must carry to the terminal. The plan is a return value rather than handler
+// state because ClaimFriendCode owns the transaction and therefore the commit.
+type claimResult struct {
+	friendshipID string
+	createdAt    string
+	status       string
+	plan         presencecapture.Plan
+}
+
+// executeFriendCodeClaim inserts the friendship and consumes one use of the
+// code inside the caller's transaction. It deliberately does NOT commit:
+// presencehook.Complete owns the commit on both the wired and unwired paths.
+func (h *Handler) executeFriendCodeClaim(
+	ctx context.Context, tx *sql.Tx, userID, ownerID, codeID string, autoAccept bool,
+) (claimResult, error) {
 	status := "pending"
 	if autoAccept {
 		status = "accepted"
 	}
 
+	// Only an auto-accepting claim widens the friend graph. A 'pending' row
+	// confers no friend-of-friends visibility, which is why SendRequest — the
+	// other pending-friendship writer — carries no capture either. Capturing
+	// here would block a plain friend request on a capture failure for no
+	// reconciliation.
+	var plan presencecapture.Plan
+	if status == "accepted" {
+		var err error
+		plan, err = presencehook.Capture(ctx, h.graphPresence, tx, presencehook.Spec{
+			Family:        presencecapture.FamilyFriendshipAccept,
+			Posture:       presencecapture.FailClosedBlockWrite,
+			PrincipalID:   userID,
+			CounterpartID: ownerID,
+		})
+		if err != nil {
+			return claimResult{}, fmt.Errorf("presence capture: %w", err)
+		}
+	}
+
 	var friendshipID, createdAt string
-	err := tx.QueryRow(`
+	err := tx.QueryRowContext(ctx, `
 		INSERT INTO friendships (requester_id, addressee_id, status)
 		VALUES ($1, $2, $3)
 		RETURNING id, created_at
 	`, userID, ownerID, status).Scan(&friendshipID, &createdAt)
 	if err != nil {
-		return "", "", "", err
+		presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+		return claimResult{}, fmt.Errorf("insert friendship from friend code: %w", err)
 	}
 
-	_, err = tx.Exec(`UPDATE friend_codes SET use_count = use_count + 1 WHERE id = $1`, codeID)
-	if err != nil {
-		return "", "", "", err
+	if _, err = tx.ExecContext(ctx, `UPDATE friend_codes SET use_count = use_count + 1 WHERE id = $1`, codeID); err != nil {
+		presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+		return claimResult{}, fmt.Errorf("increment friend code use count: %w", err)
 	}
 
-	return friendshipID, createdAt, status, nil
+	return claimResult{friendshipID: friendshipID, createdAt: createdAt, status: status, plan: plan}, nil
 }
 
 type userProfile struct {
@@ -1024,17 +1281,15 @@ func (h *Handler) ClaimFriendCode(c *gin.Context) {
 		return
 	}
 
-	tx, err := h.db.Begin()
+	ctx := c.Request.Context()
+
+	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		h.log.Error("Failed to begin transaction", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedClaimFriendCode})
 		return
 	}
-	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-			h.log.Error("Failed to rollback", "error", rbErr)
-		}
-	}()
+	defer presencehook.RollbackUnlessDone(tx, h.log)
 
 	fc, err := lookupFriendCode(tx, code)
 	if err == sql.ErrNoRows {
@@ -1064,20 +1319,24 @@ func (h *Handler) ClaimFriendCode(c *gin.Context) {
 		return
 	}
 
-	friendshipID, createdAt, status, err := executeFriendCodeClaim(tx, userID, fc.ownerID, fc.codeID, fc.autoAccept)
+	claim, err := h.executeFriendCodeClaim(ctx, tx, userID, fc.ownerID, fc.codeID, fc.autoAccept)
 	if err != nil {
 		h.log.Error("Failed to create friendship", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedClaimFriendCode})
 		return
 	}
+	friendshipID, createdAt, status := claim.friendshipID, claim.createdAt, claim.status
 
-	if err := tx.Commit(); err != nil {
+	// presencehook.Complete owns the commit on both the wired and unwired paths, so
+	// this handler never calls tx.Commit() itself.
+	if err := presencehook.Complete(ctx, h.graphPresence, tx, claim.plan); err != nil {
 		h.log.Error("Failed to commit", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedClaimFriendCode})
 		return
 	}
 
-	h.log.Info("Friend code claimed", "code", code, "claimer", userID, "owner", fc.ownerID, "status", status)
+	// Code value omitted — bearer material, see the note in CreateFriendCode.
+	h.log.Info("Friend code claimed", "claimer", userID, "owner", fc.ownerID, "status", status)
 
 	claimer := h.fetchUserProfile(userID)
 	owner := h.fetchUserProfile(fc.ownerID)
