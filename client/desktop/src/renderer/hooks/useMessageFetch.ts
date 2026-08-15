@@ -10,6 +10,29 @@ import { unwrapGifEnvelope } from '../utils/gifEnvelope';
 const DEFAULT_LIMIT = 50;
 const MAX_PAGINATION_RECONCILIATION_ATTEMPTS = 2;
 
+/**
+ * Purge generations, keyed by scope (channel id or DM conversation id).
+ *
+ * A purge is irreversible deletion, so a request that was already in flight
+ * when it landed must never publish. The effect-local `aborted` flag cannot
+ * cover that window on its own: it only flips in the fetch effect's cleanup,
+ * which runs after React commits the `setFetchTrigger` bump the purge listener
+ * queues. A response resolving in between passes every `if (aborted) return`
+ * and repopulates both the store and the search index with purged plaintext.
+ * The generation is bumped synchronously with the purge event, snapshotted at
+ * request start, and re-asserted at publication — the same shape as the
+ * existing E2EE `operationGuard` fence it sits beside (#1741).
+ */
+const purgeGenerationByScope = new Map<string, number>();
+
+function currentPurgeGeneration(scopeId: string): number {
+  return purgeGenerationByScope.get(scopeId) ?? 0;
+}
+
+function recordScopePurge(scopeId: string): void {
+  purgeGenerationByScope.set(scopeId, currentPurgeGeneration(scopeId) + 1);
+}
+
 /** Index decrypted messages for search (passive, skips failed/pending). */
 function indexDecryptedMessages(channelId: string, msgs: MessageWithStatus[]) {
   const indexable = msgs
@@ -411,6 +434,26 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
     return () => globalThis.removeEventListener('connection-recovered', handler);
   }, [channelId]);
 
+  // A purge clears the scope wholesale; the server is the only source of truth for
+  // what survived. One seam covers channels and DMs alike — useMessageFetch already
+  // builds the DM URL from `type` (see buildEndpoint).
+  useEffect(() => {
+    if (!channelId) return;
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { scopeId?: string | null } | undefined;
+      const scopeId = detail?.scopeId;
+      // A server-wide purge has no channel scope to name — a server id can
+      // never equal a channel/conversation id — so it dispatches a null scope
+      // meaning "refetch whatever is mounted". A real scope id still has to
+      // match this hook's channel exactly.
+      if (scopeId != null && scopeId !== channelId) return;
+      recordScopePurge(channelId);
+      setFetchTrigger((prev) => prev + 1);
+    };
+    globalThis.addEventListener('messages-purged', handler);
+    return () => globalThis.removeEventListener('messages-purged', handler);
+  }, [channelId]);
+
   // Retry key fetch when messages are stuck in pending state.
   // Only retry when E2EE is initialized — fail-closed also sets pendingKeys
   // but retrying without E2EE just wastes cycles.
@@ -446,6 +489,7 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
         )
       );
       const invalidatedDuringRequest = new Set<string>();
+      const purgeGenerationAtRequestStart = currentPurgeGeneration(channelId);
       const unsubscribeInvalidations = subscribeSearchResultInvalidations((messageId) => {
         invalidatedDuringRequest.add(messageId);
       });
@@ -475,6 +519,9 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
         reconciled.fetched.reverse();
         const merged = [...reconciled.fetched, ...reconciled.preserved];
         operationGuard.assertCurrent();
+        // A purge landed after this request started: everything below it is
+        // deleted plaintext. The refetch the purge queued establishes truth.
+        if (currentPurgeGeneration(channelId) !== purgeGenerationAtRequestStart) return;
         unsubscribeInvalidations();
         indexDecryptedMessages(channelId, merged);
         setMessages(channelId, merged);
@@ -517,6 +564,7 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
     if (!channelMessages || channelMessages.length === 0) return;
 
     const oldestMessage = channelMessages[0];
+    const purgeGenerationAtRequestStart = currentPurgeGeneration(requestChannelId);
 
     setIsLoading(true);
     try {
@@ -527,7 +575,12 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
           limit,
           before: oldestMessage.id,
           attempt,
-          isCurrent: () => channelIdRef.current === requestChannelId,
+          // A page in flight when a purge lands carries deleted plaintext, so
+          // the purge generation fences pagination exactly as it fences the
+          // initial fetch above.
+          isCurrent: () =>
+            channelIdRef.current === requestChannelId &&
+            currentPurgeGeneration(requestChannelId) === purgeGenerationAtRequestStart,
           prependMessages,
           setHasMore,
         });

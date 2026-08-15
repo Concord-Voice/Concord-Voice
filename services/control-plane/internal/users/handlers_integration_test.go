@@ -1079,6 +1079,96 @@ func TestUpdatePrivacySettingsKlipyPartialUpdate(t *testing.T) {
 	assert.Equal(t, false, priv["share_personalization_with_gif_provider"], "unchanged field should keep its value")
 }
 
+// ── require_auth_before_purge (#1354) ────────────────────────────────────────
+
+// privacyRequireAuthBeforePurge reads require_auth_before_purge out of a
+// GET/PATCH /users/me/privacy response body.
+func privacyRequireAuthBeforePurge(t *testing.T, respBody []byte) bool {
+	t.Helper()
+	var body struct {
+		Privacy struct {
+			RequireAuthBeforePurge bool `json:"require_auth_before_purge"`
+		} `json:"privacy"`
+	}
+	require.NoError(t, json.Unmarshal(respBody, &body))
+	return body.Privacy.RequireAuthBeforePurge
+}
+
+func TestGetPrivacySettingsRequireAuthBeforePurgeDefaultsTrueWithNoRow(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "purgedefault")
+	// Deliberately do NOT create a privacy_settings row — rows are created lazily
+	// on the first PATCH, so "no row" is the majority state.
+
+	w := ts.DoRequest("GET", urlUsersMePrivacy, nil, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	require.True(t, privacyRequireAuthBeforePurge(t, w.Body.Bytes()),
+		"a user with no privacy_settings row must default to TRUE — the DM purge handler "+
+			"fail-closes to true, so a false default renders the toggle OFF while purges 403")
+}
+
+func TestPatchPrivacySettingsRequireAuthBeforePurgeRoundTrips(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "purgepatch")
+
+	patch := ts.DoRequest(methodPatch, urlUsersMePrivacy,
+		map[string]interface{}{"require_auth_before_purge": false},
+		testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, patch.Code, patch.Body.String())
+	assert.False(t, privacyRequireAuthBeforePurge(t, patch.Body.Bytes()),
+		"the PATCH response must echo the value it just wrote")
+
+	get := ts.DoRequest("GET", urlUsersMePrivacy, nil, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, get.Code, get.Body.String())
+	assert.False(t, privacyRequireAuthBeforePurge(t, get.Body.Bytes()))
+}
+
+func TestPatchUnrelatedFieldDoesNotClobberRequireAuthBeforePurge(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "purgeclobber")
+
+	require.Equal(t, http.StatusOK, ts.DoRequest(methodPatch, urlUsersMePrivacy,
+		map[string]interface{}{"require_auth_before_purge": false},
+		testhelpers.AuthHeaders(user.AccessToken)).Code)
+	// A PATCH that does not mention the field must leave it alone.
+	require.Equal(t, http.StatusOK, ts.DoRequest(methodPatch, urlUsersMePrivacy,
+		map[string]interface{}{"load_gifs_automatically": true},
+		testhelpers.AuthHeaders(user.AccessToken)).Code)
+
+	get := ts.DoRequest("GET", urlUsersMePrivacy, nil, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, get.Code, get.Body.String())
+	assert.False(t, privacyRequireAuthBeforePurge(t, get.Body.Bytes()),
+		"an unrelated PATCH must not reset the field")
+}
+
+// TestPrivacyToggleGovernsDMPurgeStepUp is the only test proving the
+// users-package WRITE is the dm-package READ: the toggle this endpoint exposes
+// is the same row internal/dm/purge.go consults before a DM purge.
+func TestPrivacyToggleGovernsDMPurgeStepUp(t *testing.T) {
+	ts := setupTS(t)
+	actor := ts.CreateTestUser(t, "purgee2eactor")
+	peer := ts.CreateTestUser(t, "purgee2epeer")
+	convID := ts.CreateDMConversation(t, actor.ID, peer.ID)
+	purgePath := "/api/v1/dm/conversations/" + convID + "/messages"
+
+	// Toggle ON (the row-less default): a credential-less purge must be refused.
+	w := ts.DoRequest(http.MethodDelete, purgePath, map[string]interface{}{"range": "1h"},
+		testhelpers.AuthHeaders(actor.AccessToken))
+	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "password_required")
+
+	// Toggle OFF through the privacy endpoint...
+	require.Equal(t, http.StatusOK, ts.DoRequest(methodPatch, urlUsersMePrivacy,
+		map[string]interface{}{"require_auth_before_purge": false},
+		testhelpers.AuthHeaders(actor.AccessToken)).Code)
+
+	// ...and the same request now passes step-up.
+	w2 := ts.DoRequest(http.MethodDelete, purgePath, map[string]interface{}{"range": "1h"},
+		testhelpers.AuthHeaders(actor.AccessToken))
+	require.Equal(t, http.StatusOK, w2.Code, w2.Body.String())
+}
+
 func TestUpdatePrivacySettingsDMLevel0LegacySync(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "privdm0")

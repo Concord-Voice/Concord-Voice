@@ -2,13 +2,13 @@ import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { createPortal } from 'react-dom';
 import { MicOff, HeadphoneOff, Lock, Clock } from 'lucide-react';
-import { useMemberStore, type ServerMember } from '../../stores/memberStore';
+import type { ServerMember } from '../../stores/memberStore';
 import type { Role } from '../../types/server';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 import MemberContextMenu from '../Members/MemberContextMenu';
 import UserProfileModal from '../Members/UserProfileModal';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
-import { apiFetch, safeJson } from '../../services/apiClient';
+import { PurgeMessagesOptIn, moderateMember } from '../Members/purgeOnModeration';
 
 interface MemberListPanelProps {
   members: ServerMember[];
@@ -163,6 +163,11 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
   const [fullProfileUserId, setFullProfileUserId] = useState<string | null>(null);
   const [banTarget, setBanTarget] = useState<ServerMember | null>(null);
   const [kickTarget, setKickTarget] = useState<ServerMember | null>(null);
+  const [purgeOnBan, setPurgeOnBan] = useState(false);
+  const [purgeOnKick, setPurgeOnKick] = useState(false);
+  // ConfirmActionModal closes itself on success, so the purge outcome is
+  // announced by this panel instead of inside the modal.
+  const [moderationNotice, setModerationNotice] = useState('');
   const [renderedAtMs] = useState(() => Date.now());
 
   const fullProfileMemberData = fullProfileUserId
@@ -174,6 +179,22 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
     e.stopPropagation();
     setContextMenu({ member, position: { x: e.clientX, y: e.clientY } });
   }, []);
+
+  // Symmetric with `Members/MemberList`: this panel is scoped by a `serverId`
+  // prop and normally remounts per server, but nothing structurally guarantees
+  // that, and a stale notice would name a member of the previous server.
+  useEffect(() => {
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- a server change invalidates the moderation notice, which describes a member of the previous server
+    setModerationNotice('');
+  }, [serverId]);
+
+  const runModeration = useCallback(
+    async (target: ServerMember, action: 'ban' | 'kick', alsoPurge: boolean) => {
+      const { notice } = await moderateMember(serverId, target, action, alsoPurge);
+      setModerationNotice(notice);
+    },
+    [serverId]
+  );
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLButtonElement>, member: ServerMember) => {
@@ -192,6 +213,27 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
         <span>User</span>
         <span>Roles</span>
       </div>
+      {/* Always mounted so the live region announces the outcome when it
+          arrives; the moderation action's own success is never demoted or
+          restyled by the purge sub-outcome, so this is a notice, not an error. */}
+      {/* <output> carries an implicit role="status", so the live region is native
+          rather than ARIA-annotated. display:block keeps the pre-existing layout —
+          <output> is inline by default. */}
+      <output
+        className="member-moderation-notice"
+        style={
+          moderationNotice
+            ? {
+                display: 'block',
+                padding: '8px 12px',
+                color: 'var(--text-secondary)',
+                fontSize: 'calc(13px * var(--font-scale, 1))',
+              }
+            : undefined
+        }
+      >
+        {moderationNotice}
+      </output>
       <ul className="member-list">
         {members.map((member) => {
           const assignedRoles = assignableRoles.filter((role) =>
@@ -321,10 +363,12 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
           }}
           onBan={(m) => {
             setContextMenu(null);
+            setModerationNotice('');
             setBanTarget(m);
           }}
           onKick={(m) => {
             setContextMenu(null);
+            setModerationNotice('');
             setKickTarget(m);
           }}
         />
@@ -341,41 +385,36 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
 
       <ConfirmActionModal
         isOpen={!!banTarget}
-        onClose={() => setBanTarget(null)}
+        onClose={() => {
+          setBanTarget(null);
+          setPurgeOnBan(false);
+        }}
         title={`Ban ${banTarget?.display_name || banTarget?.username || 'User'}`}
         message="This will permanently remove them from the server and prevent them from rejoining."
-        confirmLabel="Ban"
+        extraContent={<PurgeMessagesOptIn checked={purgeOnBan} onChange={setPurgeOnBan} />}
+        // Degrades gracefully: an unchecked box never blocks the ban.
+        confirmLabel={purgeOnBan ? 'Ban and purge' : 'Ban'}
         loadingLabel="Banning..."
         onConfirm={async () => {
           if (!banTarget) return;
-          const res = await apiFetch(`/api/v1/servers/${serverId}/bans/${banTarget.user_id}`, {
-            method: 'POST',
-          });
-          if (!res.ok) {
-            const data = await safeJson<{ error?: string }>(res);
-            throw new Error(data?.error || 'Ban failed');
-          }
-          useMemberStore.getState().removeMember(banTarget.user_id);
+          await runModeration(banTarget, 'ban', purgeOnBan);
         }}
       />
 
       <ConfirmActionModal
         isOpen={!!kickTarget}
-        onClose={() => setKickTarget(null)}
+        onClose={() => {
+          setKickTarget(null);
+          setPurgeOnKick(false);
+        }}
         title={`Kick ${kickTarget?.display_name || kickTarget?.username || 'User'}`}
         message="This will remove them from the server. They can rejoin with a new invite."
-        confirmLabel="Kick"
+        extraContent={<PurgeMessagesOptIn checked={purgeOnKick} onChange={setPurgeOnKick} />}
+        confirmLabel={purgeOnKick ? 'Kick and purge' : 'Kick'}
         loadingLabel="Kicking..."
         onConfirm={async () => {
           if (!kickTarget) return;
-          const res = await apiFetch(`/api/v1/servers/${serverId}/members/${kickTarget.user_id}`, {
-            method: 'DELETE',
-          });
-          if (!res.ok) {
-            const data = await safeJson<{ error?: string }>(res);
-            throw new Error(data?.error || 'Kick failed');
-          }
-          useMemberStore.getState().removeMember(kickTarget.user_id);
+          await runModeration(kickTarget, 'kick', purgeOnKick);
         }}
       />
     </div>

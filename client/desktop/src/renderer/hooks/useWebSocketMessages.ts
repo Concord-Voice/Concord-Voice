@@ -58,7 +58,7 @@ import {
 function isDoNotDisturb(): boolean {
   return useMemberStore.getState().selfStatus === 'dnd';
 }
-import { indexMessage, removeMessage } from '../services/searchService';
+import { indexMessage, removeMessage, removeScope } from '../services/searchService';
 import { unwrapGifEnvelope } from '../utils/gifEnvelope';
 import { formatMessagePreview } from '../utils/messagePreview';
 import { summarizeWsServerError } from '../utils/wsDiagnostics';
@@ -582,6 +582,29 @@ function invalidateMessageContentOperation(
   }
 }
 
+/**
+ * Invalidate every in-flight message-content operation for a whole scope.
+ *
+ * A purge deletes an unbounded set of messages and the event carries no IDs, so
+ * the per-message invalidator cannot be used. Keys are
+ * `${channelId}\u0000${messageId}\u0000${kind}`, and the NUL separator cannot
+ * appear in a UUID, so a prefix match is exact.
+ *
+ * This is the #1741 content-invariant lane: a live deletion must never be
+ * restorable by a decrypt continuation that started before the purge landed.
+ */
+function invalidateMessageContentOperationsForScope(
+  owner: MessageContentOperationOwner,
+  scopeId: string
+): void {
+  const prefix = `${scopeId}\u0000`;
+  for (const key of owner.latestOperations.keys()) {
+    if (key.startsWith(prefix)) {
+      owner.latestOperations.delete(key);
+    }
+  }
+}
+
 function deactivateMessageContentOperationOwner(owner: MessageContentOperationOwner): void {
   owner.active = false;
   owner.latestOperations.clear();
@@ -832,6 +855,24 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     const pendingMessagePlaceholders = new Map<string, { channelId: string; messageId: string }>();
     const settleMessagePlaceholder = (channelId: string, messageId: string) =>
       pendingMessagePlaceholders.delete(messageContentPlaceholderKey(channelId, messageId));
+    /**
+     * Settle every placeholder for a whole scope.
+     *
+     * A purge carries no message IDs, so the per-message settler cannot be
+     * used. Placeholder keys are `${channelId}\u0000${messageId}` — the same
+     * NUL shape as the operation keys — so a prefix match is exact. Without
+     * this the scope invalidator makes the decrypt continuation return before
+     * `onSettled`, orphaning the row until unmount (#1741 names placeholders
+     * explicitly).
+     */
+    const settleMessagePlaceholdersForScope = (scopeId: string) => {
+      const prefix = `${scopeId}\u0000`;
+      for (const key of pendingMessagePlaceholders.keys()) {
+        if (key.startsWith(prefix)) {
+          pendingMessagePlaceholders.delete(key);
+        }
+      }
+    };
     const storeMessageContent = (
       channelId: string,
       messageId: string,
@@ -1011,6 +1052,108 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       settleMessagePlaceholder(data.channel_id, data.id);
       removeMessage(data.id);
       deleteMessage(data.channel_id, data.id);
+    });
+
+    // Bulk purge — an invalidation signal, never a diff. A whole-server purge emits
+    // one channel_purged PER CHANNEL with deleted_count: 0, so the count is not
+    // usable here; clear the scope and let the refetch establish truth.
+    //
+    // Ordering mirrors the canonical scope-loss pairing in channelStore /
+    // dmStore: fence in-flight decrypts first, then drop searchable plaintext,
+    // then clear the store. `removeScope` is load-bearing — it discards the
+    // decrypted rows the local index holds, fences running backfills so one
+    // cannot RE-index purged plaintext after the purge lands, and dismisses
+    // copies already emitted into an open search pane.
+    const clearScopeState = (scopeId: string) => {
+      invalidateMessageContentOperationsForScope(messageContentOperationOwner, scopeId);
+      settleMessagePlaceholdersForScope(scopeId);
+      removeScope(scopeId);
+      useChatStore.getState().clearMessages(scopeId);
+    };
+
+    // Every channel of one server the client knows about. `channels` holds the
+    // current server's fetched list; `channelIdsByServer` retains ids seen for
+    // other servers. Unioning both mirrors `removeServerChannels`, and the bound
+    // is the correct one: the deletion is already authoritative server-side, and
+    // a channel the client has never loaded holds no local plaintext to clear.
+    const clearServerScopes = (serverId: string) => {
+      const channelState = useChannelStore.getState();
+      const scopeIds = new Set(channelState.channelIdsByServer[serverId] ?? []);
+      for (const channel of channelState.channels) {
+        if (channel.server_id === serverId) scopeIds.add(channel.id);
+      }
+      for (const scopeId of scopeIds) clearScopeState(scopeId);
+    };
+
+    // ONE clearing lane, two producers. The WebSocket echo is not sufficient on
+    // its own: `channel_purged` reaches only subscribers of the purged channel —
+    // in practice the one the client has mounted — so an actor who purges a
+    // channel they are not currently viewing never receives their own purge, and
+    // that channel's decrypted plaintext would stay searchable (#1741 forbids a
+    // live deletion remaining reachable via the search path). `PurgeMessagesModal`
+    // dispatches this same event locally on every terminal outcome, so the clear
+    // belongs on the EVENT rather than inside each handler — that is what makes
+    // the actor's own purge converge whether or not the echo reaches them.
+    //
+    // `bumpConversation` drops the conversation-list preview, a second copy of
+    // decrypted plaintext held outside chatStore. It no-ops on an id it does not
+    // know, so a channel scope passes through it harmlessly.
+    //
+    // Every listener here is synchronous, so the clear completes before any
+    // refetch a sibling listener queues can observe the store.
+    //
+    // The detail's two fields carry DIFFERENT instructions and are not
+    // alternatives: `scopeId` names the scope to REFETCH (null meaning "whatever
+    // is mounted", which is how a server purge addresses a channel it cannot
+    // name), while `serverId` names a server whose known channels must be
+    // CLEARED. A server purge sets both.
+    const handleMessagesPurged = (e: Event) => {
+      const detail = (e as CustomEvent).detail as
+        { scopeId?: string | null; serverId?: string } | undefined;
+      if (detail?.serverId) clearServerScopes(detail.serverId);
+      const scopeId = detail?.scopeId;
+      if (typeof scopeId !== 'string') return;
+      clearScopeState(scopeId);
+      useDMStore.getState().bumpConversation(scopeId, null);
+    };
+    globalThis.addEventListener('messages-purged', handleMessagesPurged);
+
+    const purgeScope = (scopeId: string) => {
+      globalThis.dispatchEvent(new CustomEvent('messages-purged', { detail: { scopeId } }));
+    };
+
+    const unsubChannelPurged = wsService.on('channel_purged', (msg) => {
+      purgeScope(msg.data.channel_id);
+    });
+
+    // dmStore already routes conversation clears through chatStore.clearMessages,
+    // so the DM scope uses the same primitive keyed by conversation_id.
+    const unsubDmPurged = wsService.on('dm_purged', (msg) => {
+      purgeScope(msg.data.conversation_id);
+    });
+
+    // Server-wide purge. `channel_purged` only reaches clients subscribed to that
+    // one channel — i.e. the channel they have mounted — so on its own it would
+    // leave every OTHER purged channel's decrypted plaintext in the local search
+    // index, still reachable via multi-scope search.
+    //
+    // The echo dispatches rather than clearing directly, so the WS lane and the
+    // actor's local lane run the SAME enumeration. That symmetry is load-bearing:
+    // a server purge whose HTTP call fails is exactly the case where the echo is
+    // least likely to arrive (a transport rejection means the WebSocket is
+    // plausibly down too), so the actor's own dispatch must be able to clear the
+    // server's scopes on its own.
+    //
+    // The scope stays null — `useMessageFetch` reads that as "refetch whatever is
+    // mounted", which covers the mounted scope even when it was not enumerable,
+    // instead of relying on the channel list being complete. A server id can
+    // never equal a channel id, so a scoped dispatch could not address it anyway.
+    const unsubServerPurged = wsService.on('server_purged', (msg) => {
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', {
+          detail: { scopeId: null, serverId: msg.data.server_id },
+        })
+      );
     });
 
     // Reaction event handler (shared logic for added/removed)
@@ -2207,6 +2350,10 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       unsubMessage();
       unsubUpdate();
       unsubDelete();
+      unsubChannelPurged();
+      unsubDmPurged();
+      unsubServerPurged();
+      globalThis.removeEventListener('messages-purged', handleMessagesPurged);
       unsubReactionAdded();
       unsubReactionRemoved();
       unsubMessagePinned();

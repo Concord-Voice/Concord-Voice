@@ -1,6 +1,7 @@
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useChatStore } from '@/renderer/stores/chatStore';
 import { mockMessage, mockMessage2, mockPendingMessage } from '../../mocks/fixtures';
+import { resetAllStores } from '../../helpers/store-helpers';
 import type { MessageWithStatus } from '@/renderer/types/chat';
 
 // Mock apiFetch and safeJson
@@ -47,6 +48,21 @@ function mockFetchResponse(messages: MessageWithStatus[], ok = true) {
   } else {
     mockSafeJson.mockResolvedValueOnce({ error: 'Server error' });
   }
+}
+
+/** A promise whose resolution the test controls, for in-flight-window cases. */
+function deferred<T>() {
+  let resolvePromise: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    resolve(value: T) {
+      if (!resolvePromise) throw new Error('deferred promise was not initialized');
+      resolvePromise(value);
+    },
+  };
 }
 
 describe('useMessageFetch', () => {
@@ -439,5 +455,152 @@ describe('useMessageFetch', () => {
     // channel-1 should NOT have messages from the aborted fetch
     const ch1 = useChatStore.getState().messagesByChannel.get('channel-1');
     expect(ch1).toBeUndefined();
+  });
+
+  // --- Purge refetch seam (#1354) ---
+
+  // A purge clears the scope wholesale, so the server is the only source of
+  // truth for what survived. One seam covers channels and DMs alike.
+  describe('messages-purged', () => {
+    beforeEach(() => {
+      resetAllStores();
+    });
+
+    it('refetches the mounted scope on messages-purged', async () => {
+      mockFetchResponse([mockMessage]);
+      renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+      await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(1));
+
+      mockFetchResponse([mockMessage2]);
+      act(() => {
+        globalThis.dispatchEvent(
+          new CustomEvent('messages-purged', { detail: { scopeId: 'channel-1' } })
+        );
+      });
+
+      await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+    });
+
+    it('ignores messages-purged for a scope that is not mounted', async () => {
+      mockFetchResponse([mockMessage]);
+      renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+      await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(1));
+
+      await act(async () => {
+        globalThis.dispatchEvent(
+          new CustomEvent('messages-purged', { detail: { scopeId: 'some-other-scope' } })
+        );
+      });
+
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    });
+
+    // A server-wide purge names a server id, which can never equal a channel
+    // id, so the modal dispatches a null scope meaning "refetch what is
+    // mounted". Before this, server purges left every mounted view stale.
+    it('treats a null scopeId as a match for the mounted scope', async () => {
+      mockFetchResponse([mockMessage]);
+      renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+      await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(1));
+
+      mockFetchResponse([mockMessage2]);
+      act(() => {
+        globalThis.dispatchEvent(new CustomEvent('messages-purged', { detail: { scopeId: null } }));
+      });
+
+      await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+    });
+
+    // #1741 content invariant: `aborted` alone cannot close this window. It
+    // flips in the effect cleanup, which runs only after React commits the
+    // setFetchTrigger bump the purge queues — a response resolving in between
+    // reaches indexDecryptedMessages + setMessages with purged plaintext.
+    it('does not publish a response that resolves inside the purge window', async () => {
+      // vi.clearAllMocks() keeps queued once-implementations, so drain them:
+      // this case depends on THIS test's request being the deferred one.
+      mockApiFetch.mockReset();
+      mockSafeJson.mockReset();
+
+      const response = { ok: true, status: 200 };
+      const purgedPage = deferred<{ messages: MessageWithStatus[] }>();
+      mockApiFetch.mockResolvedValueOnce(response);
+      mockSafeJson.mockReturnValueOnce(purgedPage.promise);
+
+      renderHook(() => useMessageFetch('channel-purge-window', { type: 'channel' }));
+      await waitFor(() => expect(mockSafeJson).toHaveBeenCalledTimes(1));
+
+      // The refetch the purge queues never resolves, so the store's final
+      // state reflects only whether the in-flight request published.
+      mockApiFetch.mockResolvedValueOnce(response);
+      mockSafeJson.mockReturnValueOnce(new Promise<never>(() => {}));
+
+      await act(async () => {
+        globalThis.dispatchEvent(
+          new CustomEvent('messages-purged', { detail: { scopeId: 'channel-purge-window' } })
+        );
+        // Still inside act(): the listener has run synchronously (bumping the
+        // purge generation) but React has not committed, so `aborted` is false
+        // — exactly the window this fence exists for.
+        purgedPage.resolve({
+          messages: [
+            { ...mockMessage, channel_id: 'channel-purge-window', content: 'purged plaintext' },
+          ],
+        });
+        // Drain the request's remaining microtasks WITHOUT returning from
+        // act(), which is what defers React's commit. The fetch therefore
+        // reaches its publication point with `aborted` still false: only the
+        // purge generation can stop it here.
+        for (let tick = 0; tick < 50; tick += 1) {
+          // eslint-disable-next-line no-await-in-loop -- sequential microtask drain is the point
+          await Promise.resolve();
+        }
+      });
+
+      // Zero rows, not an empty string in a row: the fence stops publication
+      // outright. Contrast with the positive control below, which publishes one
+      // row from the same mechanics minus the purge.
+      const stored = useChatStore.getState().messagesByChannel.get('channel-purge-window') ?? [];
+      expect(stored).toEqual([]);
+    });
+
+    // Positive control for the fence above. An empty store is also what you get
+    // when the response never reached publication for some unrelated reason —
+    // a mock that resolved wrongly, a hook that bailed early — so the empty
+    // assertion alone cannot distinguish "the fence stopped it" from "nothing
+    // ever arrived". This runs the SAME mechanics with the purge dispatch
+    // removed and asserts the content DOES land, which is what makes the
+    // difference attributable to the fence.
+    it('publishes that same response when no purge intervenes', async () => {
+      mockApiFetch.mockReset();
+      mockSafeJson.mockReset();
+
+      const response = { ok: true, status: 200 };
+      const page = deferred<{ messages: MessageWithStatus[] }>();
+      mockApiFetch.mockResolvedValueOnce(response);
+      mockSafeJson.mockReturnValueOnce(page.promise);
+
+      renderHook(() => useMessageFetch('channel-purge-control', { type: 'channel' }));
+      await waitFor(() => expect(mockSafeJson).toHaveBeenCalledTimes(1));
+
+      await act(async () => {
+        page.resolve({
+          messages: [
+            { ...mockMessage, channel_id: 'channel-purge-control', content: 'published plaintext' },
+          ],
+        });
+        for (let tick = 0; tick < 50; tick += 1) {
+          // eslint-disable-next-line no-await-in-loop -- sequential microtask drain is the point
+          await Promise.resolve();
+        }
+      });
+
+      // The ROW is the signal, not its text: this suite stubs the decrypt seam,
+      // so the published row carries the fail-closed empty placeholder rather
+      // than the plaintext. That is precisely the contrast the control needs —
+      // one row published here, zero rows above, from identical mechanics.
+      const stored = useChatStore.getState().messagesByChannel.get('channel-purge-control') ?? [];
+      expect(stored).toHaveLength(1);
+      expect(stored[0].id).toBe(mockMessage.id);
+    });
   });
 });

@@ -8,7 +8,7 @@ import MemberProfileCard from './MemberProfileCard';
 import MemberContextMenu from './MemberContextMenu';
 import UserProfileModal from './UserProfileModal';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
-import { apiFetch, safeJson } from '../../services/apiClient';
+import { PurgeMessagesOptIn, moderateMember } from './purgeOnModeration';
 import { Moon, Search, Users } from 'lucide-react';
 import { AttributedPopover } from '../Layout/AttributedPopover';
 import './MemberList.css';
@@ -151,6 +151,11 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
   const [fullProfileUserId, setFullProfileUserId] = useState<string | null>(null);
   const [banTarget, setBanTarget] = useState<ServerMember | null>(null);
   const [kickTarget, setKickTarget] = useState<ServerMember | null>(null);
+  const [purgeOnBan, setPurgeOnBan] = useState(false);
+  const [purgeOnKick, setPurgeOnKick] = useState(false);
+  // ConfirmActionModal closes itself on success, so the purge outcome (#1354) is
+  // announced by this sidebar instead of inside the modal.
+  const [moderationNotice, setModerationNotice] = useState('');
   const [openGroup, setOpenGroup] = useState<OpenMemberGroup | null>(null);
   const [searchAnchor, setSearchAnchor] = useState<HTMLElement | null>(null);
   const compactTriggerId = useId();
@@ -176,6 +181,13 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
   const memberFetchRef = useRef<string | null>(null);
 
   useEffect(() => {
+    // The notice names a member of whichever server was active when the
+    // moderation ran. This component derives `activeServer` from the store
+    // rather than being keyed on it, so a server switch re-renders it in place
+    // — without this the notice would sit above a different server's roster.
+    // No timed auto-clear: the notice must live long enough to be announced.
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- a server switch invalidates the moderation notice exactly as it invalidates the roster this effect refetches
+    setModerationNotice('');
     if (activeServerId) {
       if (memberFetchRef.current !== activeServerId) {
         memberFetchRef.current = activeServerId;
@@ -396,6 +408,28 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
         </div>
       )}
 
+      {/* Always mounted so the live region announces the purge outcome when it
+          arrives; the ban or kick's own success is never demoted or restyled by
+          the purge sub-outcome, so this is a notice, not an error. */}
+      {/* <output> carries an implicit role="status", so the live region is native
+          rather than ARIA-annotated. display:block keeps the pre-existing layout —
+          <output> is inline by default. */}
+      <output
+        className="member-moderation-notice"
+        style={
+          moderationNotice
+            ? {
+                display: 'block',
+                padding: '8px 12px',
+                color: 'var(--text-secondary)',
+                fontSize: 'calc(13px * var(--font-scale, 1))',
+              }
+            : undefined
+        }
+      >
+        {moderationNotice}
+      </output>
+
       {/* Search */}
       {compact && members.length > 0 && (
         <>
@@ -530,10 +564,12 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
           }}
           onBan={(m) => {
             setContextMenu(null);
+            setModerationNotice('');
             setBanTarget(m);
           }}
           onKick={(m) => {
             setContextMenu(null);
+            setModerationNotice('');
             setKickTarget(m);
           }}
         />
@@ -554,22 +590,20 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
       {activeServer && (
         <ConfirmActionModal
           isOpen={!!banTarget}
-          onClose={() => setBanTarget(null)}
+          onClose={() => {
+            setBanTarget(null);
+            setPurgeOnBan(false);
+          }}
           title={`Ban ${banTarget?.display_name || banTarget?.username || 'User'}`}
           message="This will permanently remove them from the server and prevent them from rejoining."
-          confirmLabel="Ban"
+          extraContent={<PurgeMessagesOptIn checked={purgeOnBan} onChange={setPurgeOnBan} />}
+          // Degrades gracefully: an unchecked box never blocks the ban.
+          confirmLabel={purgeOnBan ? 'Ban and purge' : 'Ban'}
           loadingLabel="Banning..."
           onConfirm={async () => {
             if (!banTarget) return;
-            const res = await apiFetch(
-              `/api/v1/servers/${activeServer.id}/bans/${banTarget.user_id}`,
-              { method: 'POST' }
-            );
-            if (!res.ok) {
-              const data = await safeJson<{ error?: string }>(res);
-              throw new Error(data?.error || 'Ban failed');
-            }
-            useMemberStore.getState().removeMember(banTarget.user_id);
+            const { notice } = await moderateMember(activeServer.id, banTarget, 'ban', purgeOnBan);
+            setModerationNotice(notice);
           }}
         />
       )}
@@ -578,22 +612,24 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
       {activeServer && (
         <ConfirmActionModal
           isOpen={!!kickTarget}
-          onClose={() => setKickTarget(null)}
+          onClose={() => {
+            setKickTarget(null);
+            setPurgeOnKick(false);
+          }}
           title={`Kick ${kickTarget?.display_name || kickTarget?.username || 'User'}`}
           message="This will remove them from the server. They can rejoin with a new invite."
-          confirmLabel="Kick"
+          extraContent={<PurgeMessagesOptIn checked={purgeOnKick} onChange={setPurgeOnKick} />}
+          confirmLabel={purgeOnKick ? 'Kick and purge' : 'Kick'}
           loadingLabel="Kicking..."
           onConfirm={async () => {
             if (!kickTarget) return;
-            const res = await apiFetch(
-              `/api/v1/servers/${activeServer.id}/members/${kickTarget.user_id}`,
-              { method: 'DELETE' }
+            const { notice } = await moderateMember(
+              activeServer.id,
+              kickTarget,
+              'kick',
+              purgeOnKick
             );
-            if (!res.ok) {
-              const data = await safeJson<{ error?: string }>(res);
-              throw new Error(data?.error || 'Kick failed');
-            }
-            useMemberStore.getState().removeMember(kickTarget.user_id);
+            setModerationNotice(notice);
           }}
         />
       )}

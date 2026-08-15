@@ -83,6 +83,7 @@ import {
   // Message purge (#1352) (2)
   ChannelPurgedSchema,
   DmPurgedSchema,
+  ServerPurgedSchema,
   // Union + scrubber
   WebSocketEventSchema,
   EntitlementsChangedSchema,
@@ -855,7 +856,7 @@ describe('ws-events schemas — happy path (one per event)', () => {
     expect(result.success).toBe(true);
   });
 
-  // ──────────── Message purge (#1352) (2) ──────────────────────────────
+  // ──────────── Message purge (#1352) (3) ──────────────────────────────
 
   it('ChannelPurgedSchema accepts a canonical channel_purged envelope', () => {
     const result = WebSocketEventSchema.safeParse({
@@ -877,6 +878,18 @@ describe('ws-events schemas — happy path (one per event)', () => {
         conversation_id: UUID_A,
         purged_by: UUID_B,
         deleted_count: 0,
+        range: 'all',
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('ServerPurgedSchema accepts a canonical server_purged envelope', () => {
+    const result = WebSocketEventSchema.safeParse({
+      type: 'server_purged',
+      data: {
+        server_id: UUID_A,
+        purged_by: UUID_B,
         range: 'all',
       },
     });
@@ -1124,6 +1137,45 @@ describe('ws-events schemas — rejection cases', () => {
     });
     expect(result.success).toBe(false);
   });
+
+  it('ServerPurgedSchema rejects a non-UUID server_id', () => {
+    const result = ServerPurgedSchema.safeParse({
+      type: 'server_purged',
+      data: {
+        server_id: 'not-a-uuid',
+        purged_by: UUID_B,
+        range: 'all',
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('ServerPurgedSchema rejects a missing range', () => {
+    const result = ServerPurgedSchema.safeParse({
+      type: 'server_purged',
+      data: {
+        server_id: UUID_A,
+        purged_by: UUID_B,
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // The wire contract deliberately omits a count — a server purge's per-channel
+  // deleted_count is 0 by design, so the union must not admit a channel_purged
+  // shape under the server_purged discriminator.
+  it('WebSocketEventSchema rejects server_purged carrying a channel_id instead of a server_id', () => {
+    const result = WebSocketEventSchema.safeParse({
+      type: 'server_purged',
+      data: {
+        channel_id: UUID_A,
+        purged_by: UUID_B,
+        deleted_count: 0,
+        range: 'all',
+      },
+    });
+    expect(result.success).toBe(false);
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1150,6 +1202,29 @@ describe('WebSocketEventSchema — discriminated union behavior', () => {
       // zod 4.x emits 'invalid_union' for discriminator-mismatch (renamed from
       // 4.0-pre's 'invalid_union_discriminator'); structurally equivalent.
       expect(codes).toContain('invalid_union');
+    }
+  });
+
+  // A near-miss on the server_purged discriminator must fail as a discriminator
+  // miss, not as a field error — zod 4 marks that with `note`, so this asserts
+  // the zod-4 shape rather than zod 3's `invalid_union_discriminator`.
+  it('rejects a near-miss server purge type as a discriminator miss', () => {
+    const result = WebSocketEventSchema.safeParse({
+      type: 'server_purge',
+      data: { server_id: UUID_A, purged_by: UUID_B, range: 'all' },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      // Assert `code` and `path`, never the human-readable `note`: that string
+      // is not part of zod's documented issue contract and can be reworded in a
+      // patch release, which would red this suite for a wording change rather
+      // than a behavioural one. `path: ['type']` is the property that actually
+      // matters — it attributes the failure to the DISCRIMINATOR rather than to
+      // some field inside a member the parser had already matched.
+      const issues: Array<{ code: string; path: PropertyKey[] }> = result.error.issues;
+      const discriminatorIssue = issues.find((issue) => issue.code === 'invalid_union');
+      expect(discriminatorIssue).toBeDefined();
+      expect(discriminatorIssue?.path).toEqual(['type']);
     }
   });
 

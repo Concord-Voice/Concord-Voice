@@ -1,8 +1,11 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { Eraser } from 'lucide-react';
 import Modal from '../ui/Modal';
 import OverridePanel from '../Permissions/OverridePanel';
+import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
 import { usePermissionStore, ChannelOverride } from '../../stores/permissionStore';
 import { useMemberStore } from '../../stores/memberStore';
+import { MANAGE_ALL_MESSAGES, MANAGE_OWN_MESSAGES, hasPermission } from '../../utils/permissions';
 import { Channel } from '../../types/chat';
 import './ChannelSettingsModal.css';
 
@@ -29,6 +32,18 @@ const ChannelSettingsModal: React.FC<ChannelSettingsModalProps> = ({
   const members = useMemberStore((s) => s.members);
 
   const [synced, setSynced] = useState(channel.sync_permissions ?? false);
+  const [isPurgeModalOpen, setIsPurgeModalOpen] = useState(false);
+
+  // Either manage-messages bit authorizes a purge; a ManageOwn-only actor gets
+  // a self-scoped one rather than no entry point at all (spec §4.2). Per-channel
+  // effective permissions when known, server-level grant otherwise.
+  const channelPerms = usePermissionStore((s) => s.channelPermissions[channel.id]);
+  const serverPerms = usePermissionStore((s) => s.serverPermissions[serverId]);
+  const purgePerms = channelPerms ?? serverPerms ?? 0n;
+  const canPurge =
+    hasPermission(purgePerms, MANAGE_OWN_MESSAGES) ||
+    hasPermission(purgePerms, MANAGE_ALL_MESSAGES);
+  const purgeSelfScopeOnly = canPurge && !hasPermission(purgePerms, MANAGE_ALL_MESSAGES);
 
   const overrides: ChannelOverride[] = channelOverrides[channel.id] ?? [];
   const roles = serverRoles[serverId] ?? [];
@@ -122,6 +137,31 @@ const ChannelSettingsModal: React.FC<ChannelSettingsModalProps> = ({
         onDelete={handleDelete}
         disabled={synced}
         emptyMessage="No permission overrides configured for this channel."
+      />
+
+      {/* Destructive cluster. The purge dialog nests inside this one — ui/Modal
+          maintains a depth stack, so the child owns focus and Escape while it
+          is topmost (#2087). */}
+      {canPurge && (
+        <div className="sync-section">
+          <button
+            type="button"
+            className="channel-settings-purge-btn"
+            onClick={() => setIsPurgeModalOpen(true)}
+          >
+            <Eraser size={16} />
+            Purge Messages
+          </button>
+        </div>
+      )}
+
+      <PurgeMessagesModal
+        context="channel"
+        isOpen={isPurgeModalOpen}
+        onClose={() => setIsPurgeModalOpen(false)}
+        scopeId={channel.id}
+        scopeName={channel.name}
+        selfScopeOnly={purgeSelfScopeOnly}
       />
     </Modal>
   );

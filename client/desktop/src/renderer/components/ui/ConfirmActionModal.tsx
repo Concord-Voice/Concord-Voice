@@ -11,6 +11,13 @@ interface ConfirmActionModalProps {
   confirmLabel: string;
   loadingLabel: string;
   onConfirm: () => Promise<void>;
+  /**
+   * Optional caller-owned content rendered between the message and the
+   * confirmation input — e.g. the kick/ban purge opt-in (#1354). Rendered bare
+   * so an undefined value leaves the markup byte-identical for the consumers
+   * that don't pass it.
+   */
+  extraContent?: React.ReactNode;
   /** When provided, user must type expectedValue to enable the confirm button */
   confirmationInput?: {
     label: React.ReactNode;
@@ -57,6 +64,7 @@ const ConfirmActionModal: React.FC<ConfirmActionModalProps> = ({
   confirmLabel,
   loadingLabel,
   onConfirm,
+  extraContent,
   confirmationInput,
 }) => {
   const inputId = useId();
@@ -100,6 +108,8 @@ const ConfirmActionModal: React.FC<ConfirmActionModalProps> = ({
           <WarningIcon />
           <div className="confirm-action-message">{message}</div>
         </div>
+
+        {extraContent}
 
         {confirmationInput && (
           <div className="delete-server-confirm">

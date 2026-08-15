@@ -20,6 +20,7 @@ import ConfirmActionModal from '../ui/ConfirmActionModal';
 import { DIRECT_MESSAGES_CONTEXT_AREA } from '../ui/ContextMenuProvider';
 import DMConversationContextMenu from './DMConversationContextMenu';
 import DMProfileModal from './DMProfileModal';
+import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
 import { AttributedPopover } from '../Layout/AttributedPopover';
 import './DirectMessages.css';
 
@@ -383,6 +384,9 @@ const ConversationList: React.FC<ConversationListProps> = ({
   // after the menu's onClose() unmounts the menu — mirrors MemberListPanel's
   // Ban / Kick lifted-state pattern.
   const [blockTarget, setBlockTarget] = useState<DMConversation | null>(null);
+  // Purge target — same lifted-state pattern; the purge dialog outlives the
+  // context menu that opened it (#1354).
+  const [purgeTarget, setPurgeTarget] = useState<DMConversation | null>(null);
   const [unfriendTarget, setUnfriendTarget] = useState<DMConversation | null>(null);
   // DM Profile modal target (#1208). Same lifted-state pattern as block/unfriend
   // so the modal continues rendering after the context menu unmounts.
@@ -423,6 +427,16 @@ const ConversationList: React.FC<ConversationListProps> = ({
     fetchConversations();
   }, [fetchConversations]);
 
+  const forgetPreview = useCallback((scope: string) => {
+    decryptingRef.current.delete(scope);
+    setDecryptedPreviews((current) => {
+      if (!(scope in current)) return current;
+      const next = { ...current };
+      delete next[scope];
+      return next;
+    });
+  }, []);
+
   useEffect(
     () =>
       subscribeSearchScopeInvalidations((scope) => {
@@ -431,16 +445,36 @@ const ConversationList: React.FC<ConversationListProps> = ({
           setDecryptedPreviews({});
           return;
         }
-        decryptingRef.current.delete(scope);
-        setDecryptedPreviews((current) => {
-          if (!(scope in current)) return current;
-          const next = { ...current };
-          delete next[scope];
-          return next;
-        });
+        forgetPreview(scope);
       }),
-    []
+    [forgetPreview]
   );
+
+  // A purge deletes the conversation's last message, but dropping the decrypted
+  // cache alone does not close it: `lastMessage` still holds the purged
+  // ciphertext, so the decrypt effect below re-decrypts on the very next pass
+  // (its `conversationStillOwnsCiphertext` guard passes — nothing removed the
+  // ciphertext) and the purged text renders again. Clearing that stored
+  // `lastMessage` is what closes the loop, and it belongs to the shared
+  // `messages-purged` lane in `useWebSocketMessages` — that lane runs whether or
+  // not this list is mounted, so an unmounted list cannot leave a purged preview
+  // to reappear. What stays here is the view-local decrypted cache plus the
+  // refetch that re-establishes the authoritative post-purge preview, which
+  // every DM read already filters through the server's purge.HiddenRangeFilter.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { scopeId?: string | null } | undefined;
+      const scopeId = detail?.scopeId;
+      // A null scope is the server-wide purge signal — it can never name a DM.
+      if (typeof scopeId !== 'string') return;
+      const known = useDMStore.getState().conversations;
+      if (!known.some((conversation) => conversation.id === scopeId)) return;
+      forgetPreview(scopeId);
+      void fetchConversations();
+    };
+    globalThis.addEventListener('messages-purged', handler);
+    return () => globalThis.removeEventListener('messages-purged', handler);
+  }, [fetchConversations, forgetPreview]);
 
   // Decrypt last message previews for encrypted conversations
   const decryptPreview = useCallback(async (convId: string, ciphertext: string) => {
@@ -510,6 +544,7 @@ const ConversationList: React.FC<ConversationListProps> = ({
       onBlockUser={(conv) => setBlockTarget(conv)}
       onUnfriend={(conv) => setUnfriendTarget(conv)}
       onViewProfile={(conv) => setProfileTarget(conv)}
+      onPurgeMessages={(conv) => setPurgeTarget(conv)}
     />
   ) : null;
 
@@ -643,6 +678,26 @@ const ConversationList: React.FC<ConversationListProps> = ({
           conversation's participants by filtering out the current user. The
           confirmation copy uses the peer's display name (or username
           fallback) to make the destructive action unambiguous. */}
+      {/* Purge Messages — the modal's consequence copy depends on the group
+          role because the backend behaviour does: an admin's purge removes
+          messages for everyone, a member's removes only their own and
+          receiver-hides the rest. Unknown role falls back to 'member', the
+          shape that promises less. */}
+      {purgeTarget && (
+        <PurgeMessagesModal
+          context={purgeTarget.isGroup ? 'group' : 'dm'}
+          isOpen={purgeTarget !== null}
+          scopeId={purgeTarget.id}
+          scopeName={getConversationName(purgeTarget, currentUserId)}
+          role={
+            purgeTarget.participants.find((p) => p.userId === currentUserId)?.role === 'admin'
+              ? 'admin'
+              : 'member'
+          }
+          onClose={() => setPurgeTarget(null)}
+        />
+      )}
+
       <ConfirmActionModal
         isOpen={blockTarget !== null}
         onClose={() => setBlockTarget(null)}

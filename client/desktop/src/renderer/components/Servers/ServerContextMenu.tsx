@@ -1,9 +1,10 @@
 import React from 'react';
+import { Eraser } from 'lucide-react';
 import { ServerWithRole } from '../../types/server';
 import { useUnreadStore } from '../../stores/unreadStore';
 import { usePermissionStore } from '../../stores/permissionStore';
 import { useUserStore } from '../../stores/userStore';
-import { Permissions } from '../../utils/permissions';
+import { MANAGE_ALL_MESSAGES, MANAGE_OWN_MESSAGES, Permissions } from '../../utils/permissions';
 import { apiFetch } from '../../services/apiClient';
 import ContextMenu from '../ui/ContextMenu';
 import MuteContextMenuItem from '../Notifications/MuteContextMenuItem';
@@ -17,6 +18,12 @@ interface ServerContextMenuProps {
   onDeleteServer: (server: ServerWithRole) => void;
   onLeaveServer: (server: ServerWithRole) => void;
   onInvite: (server: ServerWithRole) => void;
+  /**
+   * Parent-owned purge modal host — the exact Delete Server wiring: item here,
+   * handler in MainView, modal mounted in MainViewModals. Optional so a host
+   * without that state (DirectMessagesView) simply omits the item.
+   */
+  onPurgeMessages?: (server: ServerWithRole) => void;
 }
 
 const ServerContextMenu: React.FC<ServerContextMenuProps> = ({
@@ -27,11 +34,18 @@ const ServerContextMenu: React.FC<ServerContextMenuProps> = ({
   onDeleteServer,
   onLeaveServer,
   onInvite,
+  onPurgeMessages,
 }) => {
   const hasServerPerm = usePermissionStore((s) => s.hasServerPermission);
   const currentUserId = useUserStore((s) => s.user?.id);
   const canEdit = hasServerPerm(server.id, Permissions.MANAGE_SERVER);
   const isOwner = currentUserId === server.owner_id;
+  // EITHER manage-messages bit authorizes a purge. A ManageOwn-only actor is
+  // genuinely permitted — the server self-scopes their purge to their own
+  // messages in the channels they moderate — so hiding the item would deny a
+  // permitted action (spec §4.2).
+  const canPurge =
+    hasServerPerm(server.id, MANAGE_OWN_MESSAGES) || hasServerPerm(server.id, MANAGE_ALL_MESSAGES);
 
   return (
     <ContextMenu position={position} onClose={onClose}>
@@ -121,6 +135,20 @@ const ServerContextMenu: React.FC<ServerContextMenuProps> = ({
       />
 
       <ContextMenu.Separator />
+
+      {/* Purge Messages — opens the destructive cluster, above Leave and
+          Delete Server so the cluster reads in ascending severity. */}
+      {canPurge && onPurgeMessages && (
+        <ContextMenu.Item
+          icon={<Eraser size={16} />}
+          label="Purge Messages"
+          danger
+          onClick={() => {
+            onPurgeMessages(server);
+            onClose();
+          }}
+        />
+      )}
 
       {/* Leave Server — everyone except owner */}
       {!isOwner && (

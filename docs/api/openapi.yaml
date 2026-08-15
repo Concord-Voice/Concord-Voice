@@ -15942,6 +15942,17 @@ components:
         messages_server_members:
           type: boolean
           description: Server members can send DMs (default true)
+        dm_privacy_level:
+          type: integer
+          minimum: 0
+          maximum: 3
+          description: >-
+            Who may open a DM: 0=nobody, 1=friends, 2=friends and server members,
+            3=anyone (default 2). Supersedes the two legacy booleans above, which
+            the server keeps in sync with this value.
+        dm_friends_of_friends:
+          type: boolean
+          description: Friends of friends can send DMs (default false)
         auto_accept_friend_codes:
           type: boolean
           description: Auto-accept friend codes (default false)
@@ -15954,6 +15965,24 @@ components:
         searchable_by_phone:
           type: boolean
           description: Searchable by phone (default false)
+        allow_embedded_content:
+          type: boolean
+          description: Render link previews and embedded media (default false)
+        load_gifs_automatically:
+          type: boolean
+          description: Auto-load GIFs in the message list (default true)
+        enable_klipy_proxy:
+          type: boolean
+          description: Proxy GIF provider requests through the control-plane (default false)
+        share_personalization_with_gif_provider:
+          type: boolean
+          description: Share personalization signals with the GIF provider (default true)
+        require_auth_before_purge:
+          type: boolean
+          description: >-
+            Require password (and MFA when enabled) before purging DM messages
+            (default true). A user with no saved privacy settings reads as true —
+            the DM purge endpoint fail-closes to the same value.
         updated_at:
           type: string
           format: date-time

@@ -1,10 +1,15 @@
 import React, { useState } from 'react';
-import { Hash, Volume2, Pin } from 'lucide-react';
+import { Hash, Volume2, Pin, Eraser } from 'lucide-react';
 import { useUnreadStore } from '../../stores/unreadStore';
 import { useServerStore } from '../../stores/serverStore';
 import { hasUnmutedChannel } from '../../stores/notificationPrefsStore';
 import { usePermissionStore } from '../../stores/permissionStore';
-import { Permissions } from '../../utils/permissions';
+import {
+  MANAGE_ALL_MESSAGES,
+  MANAGE_OWN_MESSAGES,
+  Permissions,
+  hasPermission,
+} from '../../utils/permissions';
 import { apiFetch } from '../../services/apiClient';
 import { useRotateKey } from '../../hooks/useRotateKey';
 import { Channel } from '../../types/chat';
@@ -20,6 +25,11 @@ interface ChannelContextMenuProps {
   onEditChannel: (channel: Channel) => void;
   onDeleteChannel: (channel: Channel) => void;
   onChannelPermissions?: (channel: Channel) => void;
+  /**
+   * Parent-owned purge modal host. The menu unmounts on close, so the modal
+   * lives in MainViewModals — the same lifted-state shape as Delete Channel.
+   */
+  onPurgeMessages?: (channel: Channel) => void;
 }
 
 const ChannelContextMenu: React.FC<ChannelContextMenuProps> = ({
@@ -30,12 +40,25 @@ const ChannelContextMenu: React.FC<ChannelContextMenuProps> = ({
   onEditChannel,
   onDeleteChannel,
   onChannelPermissions,
+  onPurgeMessages,
 }) => {
   const [copiedLink, setCopiedLink] = useState(false);
   const hasServerPerm = usePermissionStore((s) => s.hasServerPermission);
   const canEdit = hasServerPerm(serverId, Permissions.MANAGE_CHANNELS);
   const canDelete = hasServerPerm(serverId, Permissions.MANAGE_CHANNELS);
   const canRotateKey = hasServerPerm(serverId, Permissions.MANAGE_CRYPTO_ROTATION);
+  // Per-channel effective permissions when they have already been fetched for
+  // this channel (MessageInput fetches them for the open channel), server-level
+  // grant otherwise. EITHER manage bit authorizes a purge: a ManageOwn-only
+  // actor is genuinely permitted and the server self-scopes their purge, so
+  // hiding the item would deny a permitted action (spec §4.2). The client gate
+  // is UX-only — every purge is re-authorized server-side.
+  const channelPerms = usePermissionStore((s) => s.channelPermissions[channel.id]);
+  const serverPerms = usePermissionStore((s) => s.serverPermissions[serverId]);
+  const purgePerms = channelPerms ?? serverPerms ?? 0n;
+  const canPurge =
+    hasPermission(purgePerms, MANAGE_OWN_MESSAGES) ||
+    hasPermission(purgePerms, MANAGE_ALL_MESSAGES);
 
   const { rotateStatus, rotateMessage, handleRotate } = useRotateKey(
     `/api/v1/channels/${channel.id}/rotate-key`,
@@ -204,6 +227,24 @@ const ChannelContextMenu: React.FC<ChannelContextMenuProps> = ({
             />
           );
         })()}
+
+      {/* Purge Messages — above Delete Channel so the destructive cluster
+          reads in ascending severity. The separator is only needed when the
+          Edit Channel block above did not already open the cluster. */}
+      {canPurge && onPurgeMessages && (
+        <>
+          {!canEdit && <ContextMenu.Separator />}
+          <ContextMenu.Item
+            icon={<Eraser size={16} />}
+            label="Purge Messages"
+            danger
+            onClick={() => {
+              onPurgeMessages(channel);
+              onClose();
+            }}
+          />
+        </>
+      )}
 
       {/* Delete Channel — admin/owner only */}
       {canDelete && (

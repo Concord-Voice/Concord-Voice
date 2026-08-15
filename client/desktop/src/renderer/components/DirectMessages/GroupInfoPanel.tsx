@@ -1,9 +1,10 @@
 import { useState, useCallback } from 'react';
-import { LogOut, Trash2, Edit3, X } from 'lucide-react';
+import { LogOut, Trash2, Edit3, Eraser, X } from 'lucide-react';
 import { useDMStore, type DMConversation } from '../../stores/dmStore';
 import { useUserStore } from '../../stores/userStore';
 import GroupMemberItem from './GroupMemberItem';
 import EditGroupModal from './EditGroupModal';
+import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
 import './DirectMessages.css';
 
 interface GroupInfoPanelProps {
@@ -13,6 +14,7 @@ interface GroupInfoPanelProps {
 
 const GroupInfoPanel: React.FC<GroupInfoPanelProps> = ({ conversation, onClose }) => {
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [isPurgeModalOpen, setIsPurgeModalOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const currentUserId = useUserStore((s) => s.user?.id) || '';
 
@@ -133,6 +135,18 @@ const GroupInfoPanel: React.FC<GroupInfoPanelProps> = ({ conversation, onClose }
             Leave Group
           </button>
 
+          {/* Purge Messages — always available: authorization is
+              participant-based, not RBAC. Only the copy differs by role, and
+              the modal derives that from `role` below. */}
+          <button
+            type="button"
+            className="group-info-action-btn group-info-delete-btn"
+            onClick={() => setIsPurgeModalOpen(true)}
+          >
+            <Eraser size={14} />
+            Purge Messages
+          </button>
+
           {(isCreator || isCurrentUserAdmin) && (
             <button
               type="button"
@@ -151,6 +165,19 @@ const GroupInfoPanel: React.FC<GroupInfoPanelProps> = ({ conversation, onClose }
         onClose={() => setIsEditModalOpen(false)}
         conversationId={conversation.id}
         currentName={conversation.name}
+      />
+
+      {/* A group admin's purge removes messages for everyone; a member's only
+          removes their own and receiver-hides the rest. The copy promises
+          exactly what the backend does, so the role is passed explicitly and
+          defaults to the safer 'member' shape when it is unknown. */}
+      <PurgeMessagesModal
+        context="group"
+        isOpen={isPurgeModalOpen}
+        onClose={() => setIsPurgeModalOpen(false)}
+        scopeId={conversation.id}
+        scopeName={groupName}
+        role={currentUserParticipant?.role === 'admin' ? 'admin' : 'member'}
       />
     </div>
   );

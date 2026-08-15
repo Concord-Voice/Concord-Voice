@@ -192,6 +192,11 @@ const MainView: React.FC = () => {
   const [editingCategory, setEditingCategory] = useState<ChannelGroup | null>(null);
   const [deletingCategory, setDeletingCategory] = useState<ChannelGroup | null>(null);
   const [invitingServer, setInvitingServer] = useState<ServerWithRole | null>(null);
+  // Purge targets follow the Delete Server / Delete Channel precedent: the
+  // context menu unmounts on close, so the modal state is lifted here and the
+  // modal is mounted in MainViewModals (#1354).
+  const [purgingServer, setPurgingServer] = useState<ServerWithRole | null>(null);
+  const [purgingChannel, setPurgingChannel] = useState<Channel | null>(null);
   const [channelPermissions, setChannelPermissions] = useState<Channel | null>(null);
   const [categoryPermissions, setCategoryPermissions] = useState<ChannelGroup | null>(null);
 
@@ -255,6 +260,11 @@ const MainView: React.FC = () => {
   const handleLeaveServer = (server: ServerWithRole) => {
     setServerContextMenu(null);
     setLeavingServer(server);
+  };
+
+  const handlePurgeServerMessages = (server: ServerWithRole) => {
+    setServerContextMenu(null);
+    setPurgingServer(server);
   };
 
   const handleChannelContextMenu = (channel: Channel, position: { x: number; y: number }) => {
@@ -497,6 +507,10 @@ const MainView: React.FC = () => {
         setChannelPermissions={setChannelPermissions}
         categoryPermissions={categoryPermissions}
         setCategoryPermissions={setCategoryPermissions}
+        purgingServer={purgingServer}
+        setPurgingServer={setPurgingServer}
+        purgingChannel={purgingChannel}
+        setPurgingChannel={setPurgingChannel}
         activeServer={activeServer}
         onCreateServerSuccess={handleCreateServerSuccess}
         onCreateChannelSuccess={handleCreateChannelSuccess}
@@ -517,6 +531,11 @@ const MainView: React.FC = () => {
         onDeleteServer={handleDeleteServer}
         onLeaveServer={handleLeaveServer}
         onInviteServer={handleInviteServer}
+        onPurgeServerMessages={handlePurgeServerMessages}
+        onPurgeChannelMessages={(channel) => {
+          setChannelContextMenu(null);
+          setPurgingChannel(channel);
+        }}
         onEditChannel={handleEditChannel}
         onDeleteChannel={(channel) => {
           setChannelContextMenu(null);

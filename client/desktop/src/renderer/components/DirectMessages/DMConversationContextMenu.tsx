@@ -1,4 +1,5 @@
 import React from 'react';
+import { Eraser } from 'lucide-react';
 import ContextMenu from '../ui/ContextMenu';
 import MuteContextMenuItem from '../Notifications/MuteContextMenuItem';
 import { useRotateKey } from '../../hooks/useRotateKey';
@@ -21,6 +22,7 @@ interface DMConversationContextMenuProps {
   onBlockUser?: (conversation: DMConversation) => void;
   onUnfriend?: (conversation: DMConversation) => void;
   onViewProfile?: (conversation: DMConversation) => void;
+  onPurgeMessages?: (conversation: DMConversation) => void;
 }
 
 const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
@@ -31,6 +33,7 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
   onBlockUser,
   onUnfriend,
   onViewProfile,
+  onPurgeMessages,
 }) => {
   const canRotateKey = !conversation.isGroup || conversation.createdBy === currentUserId;
 
@@ -289,6 +292,24 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
           disabled={rotateStatus === 'success'}
           onClick={handleRotate}
         />
+      )}
+
+      {/* Purge Messages — always available in a DM: authorization is
+          participant-based, not RBAC. Divider-separated from Block / Close
+          Conversation so the destructive act stands on its own (spec §4.2). */}
+      {onPurgeMessages && (
+        <>
+          <ContextMenu.Separator />
+          <ContextMenu.Item
+            icon={<Eraser size={16} />}
+            label="Purge Messages"
+            danger
+            onClick={() => {
+              onPurgeMessages(conversation);
+              onClose();
+            }}
+          />
+        </>
       )}
     </ContextMenu>
   );

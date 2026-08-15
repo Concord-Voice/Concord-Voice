@@ -28,6 +28,11 @@ import PresenceHistorySection from '../Profile/PresenceHistorySection';
 import ToggleSwitch from './ToggleSwitch';
 import './MFA.css';
 
+// #1354: the purge dead-end card navigates here by control id
+// (`settingsNavStore.requestFocus('privacy', 'requireAuthBeforePurge')`),
+// so the switch id and the label it points at are a cross-component contract.
+const PURGE_AUTH_LABEL_ID = 'requireAuthBeforePurge-label';
+
 interface Session {
   id: string;
   device_name: string;
@@ -752,6 +757,23 @@ const PrivacySecuritySection: React.FC = () => {
     };
   }, []);
 
+  // #1354: a toggle-only PATCH against a control-plane that predates the field
+  // comes back 400. The store maps that one shape to the skew copy; surfacing it
+  // here is what stops the flip from failing silently.
+  const [purgeAuthError, setPurgeAuthError] = useState<string | null>(null);
+
+  const setRequireAuthBeforePurge = useCallback(
+    async (next: boolean) => {
+      setPurgeAuthError(null);
+      try {
+        await updatePrivacy({ requireAuthBeforePurge: next });
+      } catch (err) {
+        setPurgeAuthError(err instanceof Error ? err.message : 'Failed to update privacy settings');
+      }
+    },
+    [updatePrivacy]
+  );
+
   const fetchSessions = useCallback(async () => {
     if (!accessToken) return;
     setIsLoading(true);
@@ -1324,6 +1346,40 @@ const PrivacySecuritySection: React.FC = () => {
         </p>
 
         <DMPrivacyControls localDmLevel={localDmLevel} setDmPrivacyLevel={setDmPrivacyLevel} />
+
+        <div className="settings-row">
+          <div className="settings-row-info">
+            <label
+              className="settings-row-label"
+              id={PURGE_AUTH_LABEL_ID}
+              htmlFor="requireAuthBeforePurge"
+            >
+              Require authentication before purging
+            </label>
+            <span className="settings-row-hint">
+              Ask for your password before purging messages in a direct message or group chat.
+            </span>
+            {!privacySettings.requireAuthBeforePurge && (
+              <span className="settings-row-hint" role="alert">
+                Without this, anyone with access to your unlocked account can permanently purge your
+                message history.
+              </span>
+            )}
+            {purgeAuthError && (
+              <span className="settings-row-hint" role="alert">
+                {purgeAuthError}
+              </span>
+            )}
+          </div>
+          <ToggleSwitch
+            id="requireAuthBeforePurge"
+            checked={privacySettings.requireAuthBeforePurge}
+            onChange={(v) => void setRequireAuthBeforePurge(v)}
+            ariaLabelledBy={PURGE_AUTH_LABEL_ID}
+            inputRole="switch"
+          />
+        </div>
+
         <ContentSafetyControls />
         <SearchVisibilityControls />
       </CollapsibleSection>

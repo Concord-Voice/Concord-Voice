@@ -1889,6 +1889,7 @@ type privacySettingsResponse struct {
 	LoadGifsAutomatically               bool   `json:"load_gifs_automatically"`
 	EnableKlipyProxy                    bool   `json:"enable_klipy_proxy"`
 	SharePersonalizationWithGifProvider bool   `json:"share_personalization_with_gif_provider"`
+	RequireAuthBeforePurge              bool   `json:"require_auth_before_purge"`
 	UpdatedAt                           string `json:"updated_at,omitempty"`
 }
 
@@ -1903,14 +1904,14 @@ func (h *Handler) GetPrivacySettings(c *gin.Context) {
 		SELECT messages_friends_only, messages_server_members, dm_privacy_level, dm_friends_of_friends,
 		       auto_accept_friend_codes, searchable_by_username, searchable_by_email, searchable_by_phone,
 		       allow_embedded_content, load_gifs_automatically, enable_klipy_proxy,
-		       share_personalization_with_gif_provider, updated_at
+		       share_personalization_with_gif_provider, require_auth_before_purge, updated_at
 		FROM privacy_settings
 		WHERE user_id = $1
 	`, userID).Scan(
 		&ps.MessagesFriendsOnly, &ps.MessagesServerMembers, &ps.DMPrivacyLevel, &ps.DMFriendsOfFriends,
 		&ps.AutoAcceptFriendCodes, &ps.SearchableByUsername, &ps.SearchableByEmail, &ps.SearchableByPhone,
 		&ps.AllowEmbeddedContent, &ps.LoadGifsAutomatically, &ps.EnableKlipyProxy,
-		&ps.SharePersonalizationWithGifProvider, &ps.UpdatedAt,
+		&ps.SharePersonalizationWithGifProvider, &ps.RequireAuthBeforePurge, &ps.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
 		// Return full defaults matching the schema defaults (all fields explicit)
@@ -1928,6 +1929,12 @@ func (h *Handler) GetPrivacySettings(c *gin.Context) {
 				LoadGifsAutomatically:               true, // #1766: default ON for new users (matches schema default after migration 000078)
 				EnableKlipyProxy:                    false,
 				SharePersonalizationWithGifProvider: true,
+				// #1354: MUST be true. The column is NOT NULL DEFAULT TRUE (migration
+				// 000090) and internal/dm/purge.go fail-closes to true on a missing row —
+				// privacy_settings rows are created lazily, so a false here would render
+				// the toggle OFF for every user who has never PATCHed their settings while
+				// their purges kept 403-ing.
+				RequireAuthBeforePurge: true,
 			},
 		})
 		return
@@ -1955,6 +1962,7 @@ type updatePrivacyRequest struct {
 	LoadGifsAutomatically               *bool `json:"load_gifs_automatically"`
 	EnableKlipyProxy                    *bool `json:"enable_klipy_proxy"`
 	SharePersonalizationWithGifProvider *bool `json:"share_personalization_with_gif_provider"`
+	RequireAuthBeforePurge              *bool `json:"require_auth_before_purge"`
 }
 
 // buildPrivacyClauses constructs the SET clauses for a partial privacy settings update.
@@ -1996,6 +2004,7 @@ func buildPrivacyClauses(req *updatePrivacyRequest) ([]string, []interface{}, in
 	addBoolClause("load_gifs_automatically", req.LoadGifsAutomatically)
 	addBoolClause("enable_klipy_proxy", req.EnableKlipyProxy)
 	addBoolClause("share_personalization_with_gif_provider", req.SharePersonalizationWithGifProvider)
+	addBoolClause("require_auth_before_purge", req.RequireAuthBeforePurge)
 
 	return setClauses, args, 0, ""
 }
@@ -2065,14 +2074,14 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 			RETURNING messages_friends_only, messages_server_members, dm_privacy_level, dm_friends_of_friends,
 			          auto_accept_friend_codes, searchable_by_username, searchable_by_email, searchable_by_phone,
 			          allow_embedded_content, load_gifs_automatically, enable_klipy_proxy,
-			          share_personalization_with_gif_provider, updated_at
+			          share_personalization_with_gif_provider, require_auth_before_purge, updated_at
 		`, strings.Join(setClauses, ", "))
 
 		if err := tx.QueryRow(query, args...).Scan(
 			&ps.MessagesFriendsOnly, &ps.MessagesServerMembers, &ps.DMPrivacyLevel, &ps.DMFriendsOfFriends,
 			&ps.AutoAcceptFriendCodes, &ps.SearchableByUsername, &ps.SearchableByEmail, &ps.SearchableByPhone,
 			&ps.AllowEmbeddedContent, &ps.LoadGifsAutomatically, &ps.EnableKlipyProxy,
-			&ps.SharePersonalizationWithGifProvider, &ps.UpdatedAt,
+			&ps.SharePersonalizationWithGifProvider, &ps.RequireAuthBeforePurge, &ps.UpdatedAt,
 		); err != nil {
 			return err
 		}

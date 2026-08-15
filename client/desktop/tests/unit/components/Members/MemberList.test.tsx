@@ -245,10 +245,15 @@ describe('MemberList', () => {
         fireEvent.click(confirmBtn);
       });
 
-      // Verify ban API was called
+      // Verify ban API was called. The body carries the #1354 purge opt-in,
+      // which defaults to false when the checkbox is left alone.
       expect(mockApiFetch).toHaveBeenCalledWith(
         `/api/v1/servers/${mockServer.id}/bans/${mockMember.user_id}`,
-        { method: 'POST' }
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ purge_messages: false }),
+        }
       );
       // Member should be removed from store
       const members = useMemberStore.getState().members;
@@ -320,7 +325,11 @@ describe('MemberList', () => {
 
       expect(mockApiFetch).toHaveBeenCalledWith(
         `/api/v1/servers/${mockServer.id}/members/${mockMember.user_id}`,
-        { method: 'DELETE' }
+        {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ purge_messages: false }),
+        }
       );
       const members = useMemberStore.getState().members;
       expect(members.find((m) => m.user_id === mockMember.user_id)).toBeUndefined();

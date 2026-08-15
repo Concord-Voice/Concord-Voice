@@ -23,7 +23,39 @@ export interface PrivacySettings {
   // KLIPY GIF integration settings (decoupled from allowEmbeddedContent in v2)
   loadGifsAutomatically: boolean;
   sharePersonalizationWithGifProvider: boolean;
+  // #1354: step-up authentication before a DM/group purge.
+  requireAuthBeforePurge: boolean;
 }
+
+/**
+ * Client field → wire field, for the PATCH body.
+ *
+ * Typed `Record<keyof PrivacySettings, string>` so the mapping is exhaustive: a
+ * new PrivacySettings key that is not listed here is a compile error, where the
+ * previous per-field `if` chain would simply have dropped it from every update.
+ */
+const PRIVACY_WIRE_FIELDS: Record<keyof PrivacySettings, string> = {
+  messagesFriendsOnly: 'messages_friends_only',
+  messagesServerMembers: 'messages_server_members',
+  dmPrivacyLevel: 'dm_privacy_level',
+  dmFriendsOfFriends: 'dm_friends_of_friends',
+  autoAcceptFriendCodes: 'auto_accept_friend_codes',
+  searchableByUsername: 'searchable_by_username',
+  searchableByEmail: 'searchable_by_email',
+  searchableByPhone: 'searchable_by_phone',
+  allowEmbeddedContent: 'allow_embedded_content',
+  loadGifsAutomatically: 'load_gifs_automatically',
+  sharePersonalizationWithGifProvider: 'share_personalization_with_gif_provider',
+  requireAuthBeforePurge: 'require_auth_before_purge',
+};
+
+/**
+ * #1354: a PATCH that carries only `require_auth_before_purge` is rejected with
+ * this exact 400 by a control-plane that predates the field. Surfaced verbatim
+ * from the copy deck — the user flipped a switch and must learn it did not take.
+ */
+export const PURGE_AUTH_SKEW_MESSAGE =
+  "This version of the server doesn't support this setting yet.";
 
 const defaultSettings: PrivacySettings = {
   messagesFriendsOnly: true,
@@ -43,6 +75,11 @@ const defaultSettings: PrivacySettings = {
   // personalization-on degrades nothing when KLIPY traffic is always proxied).
   // Overwritten by fetchPrivacy() with the server value.
   sharePersonalizationWithGifProvider: true,
+  // #1354: fail-closed. Mirrors the column default (migration 000090), the
+  // backend's no-row fallback, and internal/dm/purge.go's own read — an OFF
+  // placeholder would show the toggle disabled while DM purges kept demanding
+  // credentials.
+  requireAuthBeforePurge: true,
 };
 
 interface PrivacyState {
@@ -87,6 +124,9 @@ export const usePrivacyStore = wrapStore(
                 loadGifsAutomatically: p.load_gifs_automatically ?? false,
                 sharePersonalizationWithGifProvider:
                   p.share_personalization_with_gif_provider ?? true,
+                // #1354: a missing key means an old control-plane. Fail closed —
+                // the server still requires step-up for DM purges.
+                requireAuthBeforePurge: p.require_auth_before_purge ?? true,
               },
               isLoading: false,
             });
@@ -100,28 +140,10 @@ export const usePrivacyStore = wrapStore(
 
         updatePrivacy: async (updates: Partial<PrivacySettings>) => {
           const body: Record<string, boolean | number> = {};
-          if (updates.messagesFriendsOnly !== undefined)
-            body.messages_friends_only = updates.messagesFriendsOnly;
-          if (updates.messagesServerMembers !== undefined)
-            body.messages_server_members = updates.messagesServerMembers;
-          if (updates.dmPrivacyLevel !== undefined) body.dm_privacy_level = updates.dmPrivacyLevel;
-          if (updates.dmFriendsOfFriends !== undefined)
-            body.dm_friends_of_friends = updates.dmFriendsOfFriends;
-          if (updates.autoAcceptFriendCodes !== undefined)
-            body.auto_accept_friend_codes = updates.autoAcceptFriendCodes;
-          if (updates.searchableByUsername !== undefined)
-            body.searchable_by_username = updates.searchableByUsername;
-          if (updates.searchableByEmail !== undefined)
-            body.searchable_by_email = updates.searchableByEmail;
-          if (updates.searchableByPhone !== undefined)
-            body.searchable_by_phone = updates.searchableByPhone;
-          if (updates.allowEmbeddedContent !== undefined)
-            body.allow_embedded_content = updates.allowEmbeddedContent;
-          if (updates.loadGifsAutomatically !== undefined)
-            body.load_gifs_automatically = updates.loadGifsAutomatically;
-          if (updates.sharePersonalizationWithGifProvider !== undefined)
-            body.share_personalization_with_gif_provider =
-              updates.sharePersonalizationWithGifProvider;
+          for (const [field, wireField] of Object.entries(PRIVACY_WIRE_FIELDS)) {
+            const value = updates[field as keyof PrivacySettings];
+            if (value !== undefined) body[wireField] = value;
+          }
 
           const response = await apiFetch('/api/v1/users/me/privacy', {
             method: 'PATCH',
@@ -130,8 +152,26 @@ export const usePrivacyStore = wrapStore(
           });
 
           if (!response.ok) {
-            const data = await response.json();
-            throw new Error(data.error || 'Failed to update privacy settings');
+            // A non-JSON failure (proxy HTML 502, empty 400) must not reject
+            // with a SyntaxError — the caller renders this message verbatim.
+            //
+            // Annotate the variable rather than asserting the fallback: `json()`
+            // resolves to `any`, so an `as` on the catch value asserts into a
+            // position that already accepts it (SonarQube S4325) while leaving
+            // `data` untyped either way. The annotation types BOTH branches.
+            const data: { error?: string } = await response.json().catch(() => ({}));
+            // #1354: an old control-plane rejects a toggle-only body as empty.
+            // Translate that one shape so the failure is legible, and record it
+            // on the store so the caller cannot swallow it silently.
+            const isPurgeAuthSkew =
+              response.status === 400 &&
+              data.error === 'No fields to update' &&
+              updates.requireAuthBeforePurge !== undefined;
+            const message = isPurgeAuthSkew
+              ? PURGE_AUTH_SKEW_MESSAGE
+              : data.error || 'Failed to update privacy settings';
+            set({ error: message });
+            throw new Error(message);
           }
 
           const data = await response.json();
@@ -150,7 +190,11 @@ export const usePrivacyStore = wrapStore(
               loadGifsAutomatically: p.load_gifs_automatically ?? false,
               sharePersonalizationWithGifProvider:
                 p.share_personalization_with_gif_provider ?? true,
+              // #1354: same fail-closed read as fetchPrivacy — an echo without
+              // the key is an old server, not an OFF setting.
+              requireAuthBeforePurge: p.require_auth_before_purge ?? true,
             },
+            error: null,
           });
         },
 

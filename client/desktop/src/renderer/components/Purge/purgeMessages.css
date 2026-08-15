@@ -1,0 +1,358 @@
+/* Message purge modal (#1354).
+ *
+ * A NEW stylesheet, deliberately not an addition to components/ui/
+ * ConfirmActionModal.css — that file is a one-line @import of
+ * DeleteServerModal.css whose classes are still named delete-server-* for
+ * backward compatibility, and whose rgba(240, 71, 71, …) literals are pinned to
+ * one palette. Every colour here comes from a token so it tracks all 32 theme
+ * blocks. No new design tokens are introduced.
+ */
+
+.purge-modal__body {
+  /* Stage transitions without a height jump. Electron ships a single known
+     Chromium well past 129, where interpolate-size landed — so this needs no
+     fallback branch. If unsupported the declaration is inert and the modal
+     jumps, which is the pre-existing behaviour.
+
+     The height animation below is deliberate, approved as an exception on
+     PR #2743 rather than silenced — the rule's own suggested remedy
+     (grid-template-rows) animates layout identically, and no compositor-only
+     property can express a container resizing to fit new content. The
+     suppression entry and its full rationale live in .impeccable/config.json,
+     keyed to this file's repo-root-relative path.
+
+     Deliberately worded WITHOUT the literal property:value token the detector
+     scans for. Its matcher does not skip comments, so naming the pattern in
+     prose reports a second finding against a line that declares nothing —
+     verified by pointing the suppression at a bogus path and re-running
+     scripts/detect.mjs. Describe the rule here; never quote it. */
+  interpolate-size: allow-keywords;
+  height: auto;
+  transition: height 180ms ease;
+  /* Load-bearing during the transition: a scrollbar appearing mid-animation
+     reflows and fights the height interpolation. Must not become auto. */
+  overflow: hidden;
+}
+
+.purge-modal__form,
+.purge-modal__result {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  border: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+  /* No translate — a slide would imply reversible navigation, and the stage
+     machine has no back edge. */
+  animation: purge-stage-in 120ms ease;
+}
+
+@keyframes purge-stage-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+/* Range picker ------------------------------------------------------------ */
+
+.purge-modal__ranges {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.purge-modal__ranges legend {
+  padding: 0 0 8px;
+  color: var(--text-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.purge-modal__range {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  cursor: pointer;
+}
+
+.purge-modal__range:hover {
+  background: var(--bg-tertiary);
+}
+
+.purge-modal__range:has(input:checked) {
+  border-color: var(--accent-primary);
+  background: var(--bg-tertiary);
+}
+
+/* The widest option is set apart structurally, so an accidental click on it is
+   a deliberate reach. Its accessible name carries the same weight (deck §3). */
+.purge-modal__range--all {
+  margin-top: 12px;
+  border-top: 1px solid var(--border-color);
+  border-radius: 0 0 6px 6px;
+  padding-top: 16px;
+}
+
+.purge-modal__ranges-helper {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.5;
+}
+
+/* Scope echo -------------------------------------------------------------- */
+
+/* The single tinted element: the sentence naming what will be destroyed. The
+   12% / 30% pair mirrors DeleteServerModal.css's 0.08 / 0.3 ratio but sources
+   the hue from the token, matching the established prior art in
+   Settings/subscription/subscription.css and the three SSO stylesheets. */
+.purge-modal__scope {
+  display: flex;
+  gap: 12px;
+  margin: 0;
+  padding: 16px;
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--text-secondary);
+  font-size: calc(14px * var(--font-scale, 1));
+  line-height: 1.5;
+  /* The sentence rewrites when the range changes; the tint settles without
+     moving anything. */
+  transition: background-color 200ms ease;
+}
+
+/* Paired with the tint so the signal is never colour-only (WCAG 1.4.1). */
+.purge-modal__scope-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--danger);
+}
+
+.purge-modal__scope strong {
+  color: var(--text-primary);
+}
+
+/* Typed confirmation ------------------------------------------------------ */
+
+.purge-modal__typed {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+}
+
+.purge-modal__typed input {
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 400;
+}
+
+.purge-modal__typed input:focus-visible {
+  border-color: var(--accent-primary);
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+
+/* Step-up ----------------------------------------------------------------- */
+
+.purge-modal__stepup {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+/* The stage heading, not the dialog title: ui/Modal owns the title and it must
+   stay constant, so this is what names the stage and takes focus. */
+.purge-modal__stage-heading {
+  margin: 0;
+  color: var(--text-primary);
+  font-family: var(--font-display-stack);
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 700;
+}
+
+.purge-modal__stage-heading:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 4px;
+}
+
+.purge-modal__stepup-body,
+.purge-modal__deadend {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: calc(14px * var(--font-scale, 1));
+  line-height: 1.5;
+}
+
+.purge-modal__deadend strong {
+  color: var(--text-primary);
+}
+
+.purge-modal__fields {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.purge-modal__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.purge-modal__field label {
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+}
+
+.purge-modal__field input {
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  transition: border-color 0.2s ease;
+}
+
+.purge-modal__field input:focus-visible {
+  border-color: var(--accent-primary);
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+
+/* Paired with aria-invalid and the message below, so the rejection is never
+   signalled by colour alone (WCAG 1.4.1). */
+.purge-modal__field input[aria-invalid='true'] {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, var(--bg-tertiary));
+}
+
+.purge-modal__field-helper,
+.purge-modal__field-error {
+  margin: 0;
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.4;
+}
+
+.purge-modal__field-helper {
+  color: var(--text-secondary);
+}
+
+.purge-modal__field-error {
+  color: var(--danger);
+}
+
+/* Result ------------------------------------------------------------------ */
+
+.purge-modal__result p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: calc(14px * var(--font-scale, 1));
+  line-height: 1.5;
+}
+
+.purge-modal__result strong {
+  color: var(--text-primary);
+}
+
+/* Actions ----------------------------------------------------------------- */
+
+.purge-modal__actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.purge-modal__cancel,
+.purge-modal__done {
+  padding: 12px 24px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.purge-modal__cancel:hover:not(:disabled),
+.purge-modal__done:hover:not(:disabled) {
+  border-color: var(--accent-primary);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* Saturation is the right tool in exactly one place. */
+.purge-modal__confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 24px;
+  border: none;
+  border-radius: 8px;
+  background: var(--danger);
+  color: var(--on-accent);
+  font-family: var(--font-display-stack);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+
+.purge-modal__confirm:hover:not(:disabled) {
+  background: var(--danger-hover);
+}
+
+.purge-modal__confirm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.purge-modal__confirm:focus-visible {
+  outline: 2px solid var(--danger);
+  outline-offset: 2px;
+}
+
+/* Reduced animation ------------------------------------------------------- */
+
+[data-reduce-animations='true'] .purge-modal__body,
+[data-reduce-animations='true'] .purge-modal__scope,
+[data-reduce-animations='true'] .purge-modal__cancel,
+[data-reduce-animations='true'] .purge-modal__done,
+[data-reduce-animations='true'] .purge-modal__confirm,
+[data-reduce-animations='true'] .purge-modal__field input {
+  transition: none;
+}
+
+[data-reduce-animations='true'] .purge-modal__form,
+[data-reduce-animations='true'] .purge-modal__result {
+  animation: none;
+}

@@ -68,3 +68,35 @@
   font-size: calc(12px * var(--font-scale, 1));
   font-style: italic;
 }
+
+/* Purge entry point (#1354). Its own class rather than the purge modal's
+   `purge-modal__confirm`: that is an ELEMENT of the `purge-modal` block, and
+   this button lives outside that block — borrowing it coupled this modal to the
+   purge modal's stylesheet, so a change made for the dialog's confirm button
+   would silently restyle this entry point. The declarations are duplicated
+   deliberately; the shared thing is the danger token, not the class. */
+.channel-settings-purge-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 24px;
+  border: none;
+  border-radius: 8px;
+  background: var(--danger);
+  color: var(--on-accent);
+  font-family: var(--font-display-stack);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+
+.channel-settings-purge-btn:hover:not(:disabled) {
+  background: var(--danger-hover);
+}
+
+.channel-settings-purge-btn:focus-visible {
+  outline: 2px solid var(--danger);
+  outline-offset: 2px;
+}

@@ -21,6 +21,8 @@ export interface MainViewContextMenusProps {
   onDeleteServer: (server: ServerWithRole) => void;
   onLeaveServer: (server: ServerWithRole) => void;
   onInviteServer: (server: ServerWithRole) => void;
+  onPurgeServerMessages: (server: ServerWithRole) => void;
+  onPurgeChannelMessages: (channel: Channel) => void;
   onEditChannel: (channel: Channel) => void;
   onDeleteChannel: (channel: Channel) => void;
   onChannelPermissions: (channel: Channel) => void;
@@ -51,6 +53,7 @@ const MainViewContextMenus = (props: MainViewContextMenusProps) => {
           onDeleteServer={props.onDeleteServer}
           onLeaveServer={props.onLeaveServer}
           onInvite={props.onInviteServer}
+          onPurgeMessages={props.onPurgeServerMessages}
         />
       )}
 
@@ -68,6 +71,10 @@ const MainViewContextMenus = (props: MainViewContextMenusProps) => {
           onChannelPermissions={(channel) => {
             props.setChannelContextMenu(null);
             props.onChannelPermissions(channel);
+          }}
+          onPurgeMessages={(channel) => {
+            props.setChannelContextMenu(null);
+            props.onPurgeChannelMessages(channel);
           }}
         />
       )}

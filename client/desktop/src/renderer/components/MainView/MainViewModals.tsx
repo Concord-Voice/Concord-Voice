@@ -12,6 +12,9 @@ import EditCategoryModal from '../Channels/EditCategoryModal';
 import DeleteCategoryModal from '../Channels/DeleteCategoryModal';
 import ChannelSettingsModal from '../Channels/ChannelSettingsModal';
 import CategorySettingsModal from '../Channels/CategorySettingsModal';
+import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
+import { usePermissionStore } from '../../stores/permissionStore';
+import { MANAGE_ALL_MESSAGES, hasPermission } from '../../utils/permissions';
 import { ServerWithRole } from '../../types/server';
 import { Channel, ChannelGroup } from '../../types/chat';
 
@@ -44,12 +47,31 @@ export interface MainViewModalsProps {
   setChannelPermissions: (v: Channel | null) => void;
   categoryPermissions: ChannelGroup | null;
   setCategoryPermissions: (v: ChannelGroup | null) => void;
+  purgingServer: ServerWithRole | null;
+  setPurgingServer: (v: ServerWithRole | null) => void;
+  purgingChannel: Channel | null;
+  setPurgingChannel: (v: Channel | null) => void;
   activeServer: ServerWithRole | null;
   onCreateServerSuccess: (server: ServerWithRole) => void;
   onCreateChannelSuccess: (channel: Channel) => void;
 }
 
 const MainViewModals = (props: MainViewModalsProps) => {
+  // A ManageOwn-only actor keeps the entry point; the server self-scopes their
+  // purge to their own messages, so only the copy narrows (spec §4.2). Channel
+  // scope prefers per-channel effective permissions and falls back to the
+  // server-level grant, matching ChannelContextMenu's gate.
+  const serverPurgePerms = usePermissionStore((s) =>
+    props.purgingServer ? (s.serverPermissions[props.purgingServer.id] ?? 0n) : 0n
+  );
+  const channelPurgePerms = usePermissionStore((s) =>
+    props.purgingChannel
+      ? (s.channelPermissions[props.purgingChannel.id] ??
+        s.serverPermissions[props.purgingChannel.server_id] ??
+        0n)
+      : 0n
+  );
+
   return (
     <>
       <ServerActionModal
@@ -144,6 +166,28 @@ const MainViewModals = (props: MainViewModalsProps) => {
           channel={props.channelPermissions}
           serverId={props.activeServer.id}
           onClose={() => props.setChannelPermissions(null)}
+        />
+      )}
+
+      {props.purgingServer && (
+        <PurgeMessagesModal
+          context="server"
+          isOpen={!!props.purgingServer}
+          scopeId={props.purgingServer.id}
+          scopeName={props.purgingServer.name}
+          selfScopeOnly={!hasPermission(serverPurgePerms, MANAGE_ALL_MESSAGES)}
+          onClose={() => props.setPurgingServer(null)}
+        />
+      )}
+
+      {props.purgingChannel && (
+        <PurgeMessagesModal
+          context="channel"
+          isOpen={!!props.purgingChannel}
+          scopeId={props.purgingChannel.id}
+          scopeName={props.purgingChannel.name}
+          selfScopeOnly={!hasPermission(channelPurgePerms, MANAGE_ALL_MESSAGES)}
+          onClose={() => props.setPurgingChannel(null)}
         />
       )}
 
