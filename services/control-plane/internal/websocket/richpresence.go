@@ -223,28 +223,53 @@ func NewSenderPresenceResolver(
 //
 // It returns no error by contract: an error would reach failClosedGeneration and
 // turn a transient Redis blip into a global Rich Presence disconnect (#2444).
+// It is exactly RichPresenceEmissionState with the error absorbed, so the two
+// can never disagree about whether emission is permitted — only about whether
+// the answer was determined.
+func (r *senderPresenceResolver) RichPresenceEmissionPermitted(
+	ctx context.Context, senderID uuid.UUID,
+) bool {
+	permitted, err := r.RichPresenceEmissionState(ctx, senderID)
+	return err == nil && permitted
+}
+
+// RichPresenceEmissionState is the same check with the indeterminate cases kept
+// distinguishable, for the pre-mutation capture path only (see the contract on
+// presence.SenderPresenceResolver).
+//
+// Every branch that returns an error is one where the resolver could not learn
+// the sender's state, NOT one where it learned that emission is suppressed. A
+// determined suppression — hub says no, no persisted status, an invisible or
+// offline status, an active offline fence — returns (false, nil) exactly as
+// before.
 //
 // Note the deliberate asymmetry with resolveSnapshotVisibleStatus, which treats
 // a missing key as online. That path answers "what status do I display"; this
 // one answers "may this user broadcast their location", so a missing key is
 // offline and MUST suppress.
-func (r *senderPresenceResolver) RichPresenceEmissionPermitted(
+func (r *senderPresenceResolver) RichPresenceEmissionState(
 	ctx context.Context, senderID uuid.UUID,
-) bool {
-	if r == nil || r.redis == nil || !r.hub.richPresenceEmissionPermitted(senderID) {
-		return false
+) (bool, error) {
+	if r == nil || r.redis == nil {
+		// A resolver with no transport cannot determine anything. Under the
+		// bool form this was indistinguishable from a suppression; the capture
+		// path needs it to be a refusal, not a silent empty audience.
+		return false, errors.New("richpresence: resolver has no presence transport")
+	}
+	if !r.hub.richPresenceEmissionPermitted(senderID) {
+		return false, nil // determined: the hub holds no emitting session
 	}
 
 	status, err := r.redis.Get(ctx, presence.StatusRedisKey(senderID)).Result()
 	if errors.Is(err, redis.Nil) {
-		return false // no persisted visible status is never allowed to emit
+		return false, nil // determined: no persisted visible status ever emits
 	}
 	if err != nil {
 		log.Printf(
 			"[richpresence] presence lookup failed for user %s; suppressing activity: %v",
 			sanitizeLogValue(senderID.String()), err,
 		)
-		return false
+		return false, fmt.Errorf("read persisted presence status: %w", err)
 	}
 
 	permitted := presence.EmissionPermittedForStatus(status)
@@ -256,8 +281,11 @@ func (r *senderPresenceResolver) RichPresenceEmissionPermitted(
 			sanitizeLogValue(senderID.String()), sanitizeLogValue(status),
 		)
 	}
-	if !permitted || r.db == nil {
-		return false
+	if !permitted {
+		return false, nil // determined: this status does not emit
+	}
+	if r.db == nil {
+		return false, errors.New("richpresence: resolver has no fence database")
 	}
 
 	var fenced bool
@@ -268,7 +296,7 @@ func (r *senderPresenceResolver) RichPresenceEmissionPermitted(
 			"[richpresence] offline fence lookup failed for user %s; suppressing activity: %v",
 			sanitizeLogValue(senderID.String()), err,
 		)
-		return false
+		return false, fmt.Errorf("read presence offline fence: %w", err)
 	}
-	return !fenced
+	return !fenced, nil
 }

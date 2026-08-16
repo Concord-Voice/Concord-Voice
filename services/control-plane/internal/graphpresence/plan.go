@@ -110,7 +110,6 @@ func (p *Plan) HasWork() bool {
 	return false
 }
 
-// Degraded reports a stage-1 capture failure under FailConservativeDegrade.
 // Degraded reports that this plan carries the conservative principal
 // superset instead of an exact delta. TWO paths set it, not one: a capture
 // read that failed under FailConservativeDegrade, and a capture that

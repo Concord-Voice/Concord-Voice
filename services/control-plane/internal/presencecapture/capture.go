@@ -111,10 +111,27 @@ type Plan interface {
 	// HasWork reports whether anything was captured. An empty plan is the
 	// benign terminal: no dispatch, no disconnect, the handler's normal 2xx.
 	HasWork() bool
-	// Degraded reports that stage-1 capture failed under
-	// FailConservativeDegrade and the plan now carries only the conservative
-	// viewer superset. It exists so a call site can record a counter — NOT so
-	// it can branch its business logic.
+	// Degraded reports that the plan carries only the principals instead of an
+	// exact delta. TWO paths set it, not one: a stage-1 capture read that failed
+	// under FailConservativeDegrade, and a capture whose fan-out exceeded the
+	// implementation's bound — the second is a bound, not a failure, and is
+	// posture-independent.
+	//
+	// The bound path degrades only for a family whose CanRevokeVisibility is
+	// true. An ADDITIVE family over the bound returns a clean, non-degraded,
+	// empty plan instead, because it has nothing stale to clear and the
+	// conservative principal set would disconnect both users for a mutation
+	// that revokes nothing. So Degraded() == false does not by itself mean the
+	// bound was respected — it can also mean the bound was exceeded by a
+	// mutation that needed no reconciliation (PR #2770 review, CodeRabbit).
+	//
+	// It is NOT a viewer superset. Third parties who saw a sender only through
+	// the mutated edge are not covered and fall back to the presence TTL; an
+	// earlier version of this contract called it a superset, which overstated
+	// the guarantee to every consumer of this interface (PR #2738 review).
+	//
+	// It exists so a call site can record a counter — NOT so it can branch its
+	// business logic.
 	Degraded() bool
 }
 

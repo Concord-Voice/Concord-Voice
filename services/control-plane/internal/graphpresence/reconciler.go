@@ -83,9 +83,21 @@ func (r *Reconciler) checkFocalBound(focal []uuid.UUID) error {
 	return nil
 }
 
-// degradePlan builds the conservative superset: the principals themselves.
-// Disconnecting them forces a rebuild from committed state, which post-commit
-// no longer authorizes whatever they were holding. uuid.Nil is never a user.
+// degradePlan builds the PRINCIPALS-ONLY fallback. Disconnecting them forces a
+// rebuild from committed state, which post-commit no longer authorizes whatever
+// they were holding. uuid.Nil is never a user.
+//
+// It is NOT a superset of the exact plan, and three comments used to call it
+// one (PR #2738 review, @code-reviewer). The stale state this family exists to
+// clear is held by THIRD PARTIES — users who saw a sender only through the
+// mutated edge. Those live in leg.captured, which a degraded plan discards; they
+// are never disconnected and never rechecked, and fall back to the pre-#2446
+// baseline: the ≤90 s presence TTL.
+//
+// The residual is widest for FamilyFriendsOfFriendsToggle, where Counterpart is
+// uuid.Nil, so the degraded set is the single principal and clears none of the
+// population that just lost access. Do not restate this as complete coverage —
+// #2447/#2448 implementers will build on whatever this says.
 func (r *Reconciler) degradePlan(
 	subject presencecapture.Subject, cause degradeCause,
 ) *Plan {
@@ -161,6 +173,20 @@ func (r *Reconciler) Abandon(plan presencecapture.Plan, cause presencecapture.Ca
 			r.log.Error("graph presence abandon received a foreign plan",
 				"failure_class", "foreign_plan", "cause", string(cause))
 		}
+		// Escalate rather than return. Abandon is the fail-CLOSED terminal for a
+		// cause that does not prove the write was discarded, so a plan we cannot
+		// read is exactly the case where we do not know who to clear — and
+		// returning silently chose the open direction in the one place that
+		// exists to choose the closed one. Complete already refuses a foreign
+		// plan (PR #2738 review, @security-reviewer).
+		if r.disconnector != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), dispatchTimeout)
+			defer cancel()
+			if err := r.disconnector.DisconnectAllRichPresenceClients(ctx); err != nil && r.log != nil {
+				r.log.Error("graph presence foreign-plan escalation failed",
+					"failure_class", "foreign_plan")
+			}
+		}
 		return
 	}
 	r.abandonPlan(p, string(cause))
@@ -194,6 +220,25 @@ func (r *Reconciler) disconnect(recipients map[uuid.UUID]bool, cause string) {
 	if err == nil {
 		return
 	}
+
+	// A bare context error is NOT a failed disconnect. Hub.DisconnectRichPresenceClients
+	// returns errors.Join(perClientErr, ctx.Err()) and never checks ctx inside its
+	// loop, so every recipient is processed even when the deadline elapses
+	// mid-loop. Escalating here disconnected every client on the node precisely
+	// when the node was already slow — and they all reconnect at once, feeding
+	// the load that caused the timeout (PR #2738 review, @code-reviewer).
+	//
+	// The already-closed half of this is fixed at the source: disconnectPrivacyCriticalClient
+	// no longer reports an already-gone socket as an error, because the
+	// recipient WAS reached.
+	if onlyContextError(err) {
+		if r.log != nil {
+			r.log.Warn("graph presence disconnect exceeded its deadline",
+				"failure_class", cause, "recipient_count", len(recipients))
+		}
+		return
+	}
+
 	if r.log != nil {
 		r.log.Error("graph presence disconnect failed",
 			"failure_class", cause, "recipient_count", len(recipients))
@@ -233,8 +278,37 @@ func (r *Reconciler) dispatch(p *Plan) {
 	}
 
 	if p.degraded || len(p.active) == 0 {
-		r.abandonPlan(p, p.cause.String())
+		// A non-degraded plan with no legs is the ORDINARY peripheral case —
+		// every FoF toggle, and every removal or block where neither party is
+		// in voice. Logging it as the plan's cause emitted failure_class=none
+		// for the same operation the exact path logs as peripheral_disconnect
+		// (PR #2738 review, @code-reviewer).
+		cause := p.cause.String()
+		if !p.degraded {
+			cause = "peripheral_disconnect"
+		}
+		r.abandonPlan(p, cause)
 		return
+	}
+
+	// Disconnect each recipient at most once per dispatch. leg.captured and
+	// p.viewers overlap whenever the principals share a server, so the
+	// unconditional peripheral call below re-closed a socket the leg loop had
+	// just closed. That double-close is what manufactured the error that used
+	// to escalate to a whole-node teardown (PR #2738 review, @security-reviewer);
+	// the escalation is now guarded on both sides, and not asking twice is the
+	// cheaper half of the fix.
+	disconnected := make(map[uuid.UUID]bool)
+	disconnectOnce := func(recipients map[uuid.UUID]bool, cause string) {
+		pending := make(map[uuid.UUID]bool, len(recipients))
+		for id, included := range recipients {
+			if !included || disconnected[id] {
+				continue
+			}
+			pending[id] = true
+			disconnected[id] = true
+		}
+		r.disconnect(pending, cause)
 	}
 
 	for i := range p.active {
@@ -248,21 +322,54 @@ func (r *Reconciler) dispatch(p *Plan) {
 			// only THAT sender's captured viewers. Not a silent skip — the
 			// sender's own leave path computes the post-mutation audience and
 			// would never clear the revoked viewer.
-			r.disconnect(leg.captured, "sender_not_current")
+			disconnectOnce(leg.captured, "sender_not_current")
 		default:
 			// Unresolved for this sender only. Fail closed at leg scope and
 			// keep reconciling the others.
-			r.disconnect(leg.captured, "refresh_failed")
+			disconnectOnce(leg.captured, "refresh_failed")
 		}
 	}
 
-	r.disconnect(p.viewers, "peripheral_disconnect")
+	disconnectOnce(p.viewers, "peripheral_disconnect")
+}
+
+// onlyContextError reports whether EVERY leaf of err is a context deadline or
+// cancellation. errors.Join produces a tree, so this walks it rather than using
+// errors.Is, which answers "any leaf matches" — the wrong question here. One
+// real per-client failure alongside a deadline must still escalate.
+func onlyContextError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		leaves := joined.Unwrap()
+		if len(leaves) == 0 {
+			return false
+		}
+		for _, leaf := range leaves {
+			if !onlyContextError(leaf) {
+				return false
+			}
+		}
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
 // refreshLeg bounds one leg's post-commit refresh. The sender gate this enters
 // is shared with the voice-lifecycle writers and does stall under load, so an
 // unbounded call here can wedge the single dispatch worker permanently.
+//
+// The nil guard mirrors disconnect's r.disconnector == nil check. It is API
+// hygiene rather than a crash fix — router.go passes a concrete non-nil
+// *presence.ActivityService, and even a typed-nil pointer is rejected by
+// validateActivityServiceCall before any dereference — but the asymmetry was
+// real, and the sink worker has no recover(), so a panic here would take down
+// the control plane rather than one plan (PR #2738 review, @code-reviewer).
 func (r *Reconciler) refreshLeg(leg activeLeg) error {
+	if r.activity == nil {
+		return errors.New("graphpresence: activity refresher is not wired")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), dispatchTimeout)
 	defer cancel()
 	return r.activity.RefreshServerVoiceRecheck(ctx, leg.senderID, leg.scope, leg.captured)

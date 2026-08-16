@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"syscall"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
 // customTextCategory is the rich-presence category string for custom text. It
@@ -320,10 +323,36 @@ func (h *Hub) deliverPrivacyCriticalToClient(
 	return true, nil
 }
 
+// alreadyDisconnected reports whether a close error means the socket was
+// already gone rather than that the disconnect failed.
+//
+// The distinction is load-bearing. A disconnect's postcondition is "this client
+// is not receiving any more frames", and an already-closed socket satisfies it
+// — the recipient WAS reached. Reporting it as a failure is what let a benign
+// double-close escalate into a whole-node teardown: the graphpresence
+// reconciler treats any non-nil error from DisconnectRichPresenceClients as
+// "targeted disconnect failed" and escalates to
+// DisconnectAllRichPresenceClients (PR #2738 review, @security-reviewer).
+//
+// writePump closes Conn on any write error and never unregisters, so a client
+// stays in h.clients with a closed Conn until readPump's deadline expires —
+// the window is seconds wide, not microseconds. And graphpresence dispatch
+// disconnects overlapping sets back to back (leg.captured, then p.viewers), so
+// a shared-server counterpart is closed twice on the ordinary path.
+func alreadyDisconnected(err error) bool {
+	return errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, websocket.ErrCloseSent)
+}
+
 func (h *Hub) disconnectPrivacyCriticalClient(client *Client) error {
 	disconnect := h.customTextClientDisconnect
 	if disconnect != nil {
 		if err := disconnect(client); err != nil {
+			if alreadyDisconnected(err) {
+				return nil
+			}
 			return fmt.Errorf("%w: %w", ErrPrivacyCriticalDeliveryBroadcaster, err)
 		}
 		return nil
@@ -332,6 +361,9 @@ func (h *Hub) disconnectPrivacyCriticalClient(client *Client) error {
 		return nil
 	}
 	if err := client.Conn.Close(); err != nil {
+		if alreadyDisconnected(err) {
+			return nil
+		}
 		return fmt.Errorf("%w: %w", ErrPrivacyCriticalDeliveryBroadcaster, err)
 	}
 	return nil

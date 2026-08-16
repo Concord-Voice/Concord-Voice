@@ -40,6 +40,87 @@ func (p *recheckPresenceStub) RichPresenceEmissionPermitted(
 	return p.permitted
 }
 
+func (p *recheckPresenceStub) RichPresenceEmissionState(
+	ctx context.Context, senderID uuid.UUID,
+) (bool, error) {
+	// Test double: always DETERMINED, so it exercises the
+	// suppression path rather than the indeterminate one.
+	return p.RichPresenceEmissionPermitted(ctx, senderID), nil
+}
+
+// undeterminedPresenceStub is the Redis-blip shape: it cannot answer at all.
+type undeterminedPresenceStub struct{}
+
+func (undeterminedPresenceStub) RichPresenceEmissionPermitted(
+	context.Context, uuid.UUID,
+) bool {
+	return false
+}
+
+func (undeterminedPresenceStub) RichPresenceEmissionState(
+	context.Context, uuid.UUID,
+) (bool, error) {
+	return false, errors.New("presence lookup unavailable")
+}
+
+// The two entry points must answer an UNDETERMINED base presence differently,
+// and the lenient half is an RBAC-availability guarantee rather than a
+// stylistic default.
+//
+// voicepresence.Executor.PrepareCapture calls the lenient form before an RBAC
+// authority write, and rbac.withAuthorityCapture turns a PrepareCapture error
+// into a 500 with the write blocked. Propagating a transient Redis fault there
+// would put Redis availability in front of CreateRole / UpdateRole /
+// AssignRole / RemoveMember / ban — which is exactly what the first version of
+// this change did, before review caught it (PR #2770, Gitar).
+func TestCaptureServerVoiceCandidates_UndeterminedPresence_LenientVsStrict(t *testing.T) {
+	sender, server := uuid.New(), uuid.New()
+
+	t.Run("lenient absorbs it so an RBAC write is never blocked by a blip", func(t *testing.T) {
+		db := &recheckDBStub{}
+
+		candidates, err := CaptureServerVoiceCandidates(
+			context.Background(), db, undeterminedPresenceStub{}, sender, server,
+		)
+
+		require.NoError(t, err,
+			"an error here reaches rbac.withAuthorityCapture and 500s a privileged write")
+		assert.Empty(t, candidates)
+		assert.Zero(t, db.queryCalls,
+			"and it must short-circuit before the settings read, as the suppressed path does")
+	})
+
+	t.Run("strict refuses so the capture's posture actually runs", func(t *testing.T) {
+		db := &recheckDBStub{}
+
+		candidates, err := CaptureServerVoiceCandidatesStrict(
+			context.Background(), db, undeterminedPresenceStub{}, sender, server,
+		)
+
+		require.Error(t, err,
+			"an empty set here is indistinguishable from a suppression, so the leg is "+
+				"dropped and the caller's FailPosture never applies")
+		assert.Nil(t, candidates)
+	})
+
+	t.Run("a DETERMINED suppression is still empty on both", func(t *testing.T) {
+		for name, capture := range map[string]func() (map[uuid.UUID]bool, error){
+			"lenient": func() (map[uuid.UUID]bool, error) {
+				return CaptureServerVoiceCandidates(context.Background(),
+					&recheckDBStub{}, &recheckPresenceStub{permitted: false}, sender, server)
+			},
+			"strict": func() (map[uuid.UUID]bool, error) {
+				return CaptureServerVoiceCandidatesStrict(context.Background(),
+					&recheckDBStub{}, &recheckPresenceStub{permitted: false}, sender, server)
+			},
+		} {
+			candidates, err := capture()
+			require.NoError(t, err, "%s: a determined suppression is not a failure", name)
+			assert.Empty(t, candidates, "%s", name)
+		}
+	})
+}
+
 func TestRefreshServerVoiceRecheck_LostViewer_ProducesExactClear(t *testing.T) {
 	service, _, store, delivery, coordinator := newActivityServiceFixture(CategoryServerVoice)
 	lostViewer := uuid.New()

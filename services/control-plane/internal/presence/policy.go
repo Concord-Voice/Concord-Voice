@@ -24,12 +24,39 @@ type ChannelVisibilityResolver interface {
 }
 
 // SenderPresenceResolver reports whether one sender's base presence currently
-// permits rich-presence emission. Implementations absorb their own transport
-// errors into a fail-closed false and own their logging — returning an error
-// here would route through failClosedGeneration to a global disconnect, so a
-// Redis blip must never surface as one.
+// permits rich-presence emission.
+//
+// It has TWO methods answering the same question differently, and the split is
+// load-bearing in both directions. Implementations must keep them consistent:
+// Permitted is exactly State with the error absorbed into false.
 type SenderPresenceResolver interface {
+	// RichPresenceEmissionPermitted absorbs its own transport errors into a
+	// fail-closed false and owns its logging — returning an error to THESE
+	// callers would route through failClosedGeneration to a global disconnect,
+	// so a Redis blip must never surface as one (#2444). The delivery-policy
+	// and settings-cleanup paths use this form and must keep using it.
 	RichPresenceEmissionPermitted(ctx context.Context, senderID uuid.UUID) bool
+
+	// RichPresenceEmissionState answers the same question but distinguishes a
+	// DETERMINED suppression (false, nil) from one the resolver could not
+	// determine (false, err) — a Redis transport error or a failed
+	// presence_offline_fences read. A redis.Nil is NOT among them: a missing
+	// status key is a DETERMINED suppression and returns (false, nil), the
+	// same as an invisible or offline status (PR #2770 review, CodeRabbit).
+	//
+	// Only the PRE-MUTATION capture path may use this. Collapsing the two cases
+	// is correct when the question is "deliver now?", because both answers are
+	// "no" and the write is not gated on it. It is NOT correct when the question
+	// is "what did this sender's audience look like before the graph write?":
+	// there, an undetermined answer silently dropped the leg, the caller's
+	// declared FailPosture never applied, and a viewer who had just lost
+	// authorization kept the sender's activity until the presence TTL expired
+	// (CWE-284; PR #2770 review, CodeRabbit).
+	//
+	// The error is a signal to the CAPTURE, which routes it through its own
+	// posture — degrade or block the write — and never to failClosedGeneration.
+	// Do not wire this into a delivery path.
+	RichPresenceEmissionState(ctx context.Context, senderID uuid.UUID) (bool, error)
 }
 
 type policySettings struct {

@@ -202,6 +202,13 @@ func (permitAllSenders) RichPresenceEmissionPermitted(context.Context, uuid.UUID
 	return true
 }
 
+func (d permitAllSenders) RichPresenceEmissionState(
+	ctx context.Context, senderID uuid.UUID,
+) (bool, error) {
+	// Always DETERMINED — this double exercises the suppression path.
+	return d.RichPresenceEmissionPermitted(ctx, senderID), nil
+}
+
 func newMemberLoaderExecutor(t *testing.T, sendersPerChannel int) (*Executor, *memberLoaderState) {
 	t.Helper()
 	memberLoaderDriverOnce.Do(func() {

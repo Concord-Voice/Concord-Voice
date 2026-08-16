@@ -129,6 +129,14 @@ func (alwaysPermittedResolver) RichPresenceEmissionPermitted(context.Context, uu
 	return true
 }
 
+func (d alwaysPermittedResolver) RichPresenceEmissionState(
+	ctx context.Context, senderID uuid.UUID,
+) (bool, error) {
+	// Test double: always DETERMINED, so it exercises the
+	// suppression path rather than the indeterminate one.
+	return d.RichPresenceEmissionPermitted(ctx, senderID), nil
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------

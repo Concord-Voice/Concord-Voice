@@ -122,6 +122,14 @@ func (tempGrantPresencePermitted) RichPresenceEmissionPermitted(context.Context,
 	return true
 }
 
+func (d tempGrantPresencePermitted) RichPresenceEmissionState(
+	ctx context.Context, senderID uuid.UUID,
+) (bool, error) {
+	// Test double: always DETERMINED, so it exercises the
+	// suppression path rather than the indeterminate one.
+	return d.RichPresenceEmissionPermitted(ctx, senderID), nil
+}
+
 type tempGrantNoLeases struct{}
 
 func (tempGrantNoLeases) Matches(context.Context, uuid.UUID, uuid.UUID) (bool, error) {

@@ -48,3 +48,11 @@ func (alwaysPermitPresence) RichPresenceEmissionPermitted(
 ) bool {
 	return true
 }
+
+func (d alwaysPermitPresence) RichPresenceEmissionState(
+	ctx context.Context, senderID uuid.UUID,
+) (bool, error) {
+	// Test double: always DETERMINED, so it exercises the
+	// suppression path rather than the indeterminate one.
+	return d.RichPresenceEmissionPermitted(ctx, senderID), nil
+}

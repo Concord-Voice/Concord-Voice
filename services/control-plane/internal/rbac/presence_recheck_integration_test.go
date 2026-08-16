@@ -177,6 +177,14 @@ func (liveGenerations) VerifyActiveGenerations(
 	return out, nil
 }
 
+func (d alwaysPermitted) RichPresenceEmissionState(
+	ctx context.Context, senderID uuid.UUID,
+) (bool, error) {
+	// Test double: always DETERMINED, so it exercises the
+	// suppression path rather than the indeterminate one.
+	return d.RichPresenceEmissionPermitted(ctx, senderID), nil
+}
+
 // ── harnessRecheck: the rbac.PresenceRecheck under test ──────────────────────
 
 type harnessSender struct {

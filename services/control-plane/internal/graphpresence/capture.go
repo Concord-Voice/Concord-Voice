@@ -131,11 +131,33 @@ func (r *Reconciler) CaptureInTx(
 	}
 
 	if countCaptured(plan) > maxCapturedViewers {
-		// Too large for an exact delta. Degrade to the principal superset
-		// rather than attempt one; this is a bound, not a failure.
-		return r.degradePlan(subject, causeBoundExceeded), nil
+		return r.planForBoundExceeded(subject), nil
 	}
 	return plan, nil
+}
+
+// planForBoundExceeded decides what an over-large capture resolves to.
+//
+// Split out so the decision is reachable without a database — asserting on a
+// hand-built Plan instead would restate the expected value rather than exercise
+// this branch, which is the tautological-test shape review flagged elsewhere in
+// this PR.
+//
+// The SAME CanRevokeVisibility gate as the peripheral seed applies, and for the
+// same reason. degradePlan seeds both principals for a full device teardown, so
+// applying it unconditionally reintroduced exactly the defect that gate exists
+// to prevent: accepting a friend request while in voice on a large server tore
+// down every device of BOTH users for a mutation that revokes nothing
+// (PR #2738 review, @code-reviewer).
+//
+// For an additive family nothing can be stale, so an over-large capture means
+// only "no exact delta was computed" — the benign empty terminal, not a
+// disconnect. This is a bound, not a failure.
+func (r *Reconciler) planForBoundExceeded(subject presencecapture.Subject) *Plan {
+	if !subject.Family.CanRevokeVisibility() {
+		return &Plan{subject: subject}
+	}
+	return r.degradePlan(subject, causeBoundExceeded)
 }
 
 // focalSenders returns the users whose OWN audience changes. Every #2446 family
@@ -180,13 +202,38 @@ func (r *Reconciler) captureActiveLegs(
 
 	legs := make([]activeLeg, 0, len(scopes))
 	for _, scope := range scopes {
-		captured, capErr := presence.CaptureServerVoiceCandidates(
+		captured, capErr := presence.CaptureServerVoiceCandidatesStrict(
 			ctx, tx, r.senderPresence, senderID, scope.serverID,
 		)
 		if capErr != nil {
 			return nil, fmt.Errorf("capture server voice candidates: %w", capErr)
 		}
 		if len(captured) == 0 {
+			// A DETERMINED suppression: this sender holds a live voice row but
+			// is not currently permitted to emit, so there is no audience to
+			// reconcile and skipping the leg is correct.
+			//
+			// It is only correct because the indeterminate case no longer
+			// arrives here. CaptureServerVoiceCandidates used to return
+			// (empty, nil) both when emission was suppressed AND when the
+			// resolver could not determine it — a Redis transport error or a
+			// failed presence_offline_fences read (a redis.Nil is a DETERMINED
+			// suppression and always was) — so a transient fault during
+			// a removal/block/FoF-toggle silently dropped this leg with
+			// Degraded() false and no error, and the third parties who had just
+			// lost authorization were never cleared (CWE-284; PR #2738 review
+			// @security-reviewer, then PR #2770 review CodeRabbit). It now
+			// consults RichPresenceEmissionState and returns an error for the
+			// undetermined case, which reaches this function's caller and is
+			// routed through the subject's declared FailPosture.
+			//
+			// The log stays: a skipped leg is still worth seeing, and it is now
+			// an accurate statement that the sender was suppressed rather than
+			// an unclassified silence.
+			if r.log != nil {
+				r.log.Warn("graph presence skipped an active scope with no candidates",
+					"failure_class", "no_candidates")
+			}
 			continue
 		}
 		leg := activeLeg{

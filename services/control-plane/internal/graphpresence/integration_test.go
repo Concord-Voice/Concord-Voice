@@ -4,8 +4,10 @@
 package graphpresence_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 // testhelpers.TestServer exposes Router, Hub, DB, Redis, and PresenceHistory —
@@ -74,6 +77,29 @@ type alwaysPermitted struct{}
 
 func (alwaysPermitted) RichPresenceEmissionPermitted(context.Context, uuid.UUID) bool {
 	return true
+}
+
+func (d alwaysPermitted) RichPresenceEmissionState(
+	ctx context.Context, senderID uuid.UUID,
+) (bool, error) {
+	// Always DETERMINED, so it exercises the suppression path rather than the
+	// indeterminate one. undeterminedPresence below is the other half.
+	return d.RichPresenceEmissionPermitted(ctx, senderID), nil
+}
+
+// undeterminedPresence is a resolver that CANNOT answer — the Redis-blip shape.
+// Under the old bool-only contract this was indistinguishable from a
+// suppression and silently dropped the leg.
+type undeterminedPresence struct{}
+
+func (undeterminedPresence) RichPresenceEmissionPermitted(context.Context, uuid.UUID) bool {
+	return false // the bool form still absorbs it, exactly as #2444 requires
+}
+
+func (undeterminedPresence) RichPresenceEmissionState(
+	context.Context, uuid.UUID,
+) (bool, error) {
+	return false, errors.New("presence lookup unavailable")
 }
 
 func newReconciler(
@@ -701,4 +727,178 @@ func TestCaptureFailsClosedWhenTheSavepointCannotOpen(t *testing.T) {
 
 	require.Error(t, err, "no savepoint means no safe degrade, so this must fail closed")
 	assert.Nil(t, plan)
+}
+
+// The silent-skip path this PR made visible. A sender holding a LIVE voice row
+// whose capture resolves to zero candidates is dropped from the plan with no
+// error and Degraded() false — so before the warn log there was no signal at
+// all that a leg had gone missing (PR #2738 review, @security-reviewer).
+//
+// Zero candidates is reachable without any Redis fault: a Server Voice
+// candidate set at the default TierFriends is serverMembers ∩ (friends ∪ FoF),
+// so a sender alone on the server whose only friend is not a member intersects
+// to empty. That is a legitimate suppression rather than the indeterminate
+// case, and the whole point of the finding is that the bridge CANNOT tell them
+// apart — CaptureServerVoiceCandidates returns (empty, nil) for both, including
+// when RichPresenceEmissionPermitted fails closed on a Redis error. This test
+// therefore locks the SIGNAL, not the classification; the sentinel that would
+// separate the two changes a contract voicepresence also consumes and is left
+// to the author.
+func TestActiveScopeWithNoCandidatesIsLoggedNotSilentlyDropped(t *testing.T) {
+	env := testhelpers.SetupTestServer(t)
+	a, b := seedFriendship(t, env)
+	ctx := context.Background()
+
+	// a is the ONLY member, so the intersection with a's friends is empty.
+	serverID := uuid.New()
+	_, err := env.DB.Exec(
+		`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'solo', $2)`, serverID, a,
+	)
+	require.NoError(t, err, "seed server")
+	_, err = env.DB.Exec(
+		`INSERT INTO server_members (server_id, user_id) VALUES ($1, $2)`, serverID, a,
+	)
+	require.NoError(t, err, "seed membership")
+	joinVoiceChannel(t, env.DB, serverID, a)
+
+	var logBuf bytes.Buffer
+	r := graphpresence.New(env.DB, &testRefresher{}, env.Hub, alwaysPermitted{},
+		logger.NewWithWriter(&logBuf))
+	t.Cleanup(r.Close)
+
+	tx, err := env.DB.BeginTx(ctx, nil)
+	require.NoError(t, err, "begin")
+	defer func() { _ = tx.Rollback() }()
+
+	plan, err := r.CaptureInTx(ctx, tx, presencecapture.Subject{
+		Family:      presencecapture.FamilyFriendshipRemove,
+		Principal:   a,
+		Counterpart: b,
+	})
+	require.NoError(t, err, "a skipped scope is not an error")
+
+	assert.Contains(t, logBuf.String(), "failure_class=no_candidates",
+		"a dropped leg must leave a fixed-enum trace — an operator cannot act on a skip "+
+			"that emits nothing")
+	assert.Contains(t, logBuf.String(), "graph presence skipped an active scope with no candidates")
+
+	// The log is the only signal: the capture still returns cleanly and is not
+	// marked degraded, which is exactly why the skip was invisible.
+	assert.False(t, plan.Degraded(),
+		"the skip does not degrade the plan — locking this is what makes the log load-bearing")
+
+	// The removal's peripheral seed survives, so the plan is not empty; the
+	// missing piece is the LEG, whose captured third parties are never cleared.
+	assert.True(t, plan.HasWork(),
+		"the peripheral clear of the principals is unaffected by the dropped leg")
+
+	// PII discipline: the log line carries a fixed enum and nothing else — no
+	// user, server, or channel identifier ([internal]rules/observability.md).
+	for _, id := range []uuid.UUID{a, b, serverID} {
+		assert.NotContains(t, logBuf.String(), id.String(),
+			"the skip log must not carry an identifier")
+	}
+}
+
+// seedLiveVoiceSender puts a alone in voice on their own server with an accepted
+// edge to b — a live scope whose candidate set the resolver must be consulted
+// for. Shared by the two indeterminate-resolver tests below.
+func seedLiveVoiceSender(t *testing.T, env *testhelpers.TestServer) (uuid.UUID, uuid.UUID) {
+	t.Helper()
+	a, b := seedFriendship(t, env)
+	serverID := uuid.New()
+	_, err := env.DB.Exec(
+		`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'solo', $2)`, serverID, a)
+	require.NoError(t, err, "seed server")
+	_, err = env.DB.Exec(
+		`INSERT INTO server_members (server_id, user_id) VALUES ($1, $2)`, serverID, a)
+	require.NoError(t, err, "seed membership")
+	joinVoiceChannel(t, env.DB, serverID, a)
+	return a, b
+}
+
+// CWE-284, the Major from PR #2770 review (CodeRabbit). A resolver that cannot
+// DETERMINE the sender's base presence must not resolve to an empty audience:
+// that made a transient Redis fault indistinguishable from a legitimate
+// suppression, dropped the leg, and left a viewer who had just lost
+// authorization holding the sender's activity until the presence TTL expired —
+// while the caller's declared FailPosture never ran at all.
+//
+// Fail-closed posture: the write is BLOCKED. Nothing changed, nothing was
+// disclosed, and the request is retryable.
+func TestIndeterminatePresenceBlocksTheWriteUnderFailClosed(t *testing.T) {
+	env := testhelpers.SetupTestServer(t)
+	a, b := seedLiveVoiceSender(t, env)
+	ctx := context.Background()
+
+	r := graphpresence.New(env.DB, &testRefresher{}, env.Hub, undeterminedPresence{}, nil)
+	t.Cleanup(r.Close)
+
+	tx, err := env.DB.BeginTx(ctx, nil)
+	require.NoError(t, err, "begin")
+	defer func() { _ = tx.Rollback() }()
+
+	plan, err := r.CaptureInTx(ctx, tx, presencecapture.Subject{
+		Family:      presencecapture.FamilyFriendshipRemove,
+		FailPosture: presencecapture.FailClosedBlockWrite,
+		Principal:   a,
+		Counterpart: b,
+	})
+
+	require.Error(t, err,
+		"an undetermined base presence must reach the posture, not resolve to an "+
+			"empty audience — returning nil here is the silent leg drop")
+	assert.Nil(t, plan)
+}
+
+// The degrade half: BlockUser must still be able to block. The capture cannot
+// produce an exact delta, so it substitutes the conservative principal clear
+// rather than refusing the safety affordance.
+func TestIndeterminatePresenceDegradesUnderConservativePosture(t *testing.T) {
+	env := testhelpers.SetupTestServer(t)
+	a, b := seedLiveVoiceSender(t, env)
+	ctx := context.Background()
+
+	d := &countingDisconnectorForTest{}
+	r := graphpresence.New(env.DB, &testRefresher{}, d, undeterminedPresence{}, nil)
+	t.Cleanup(r.Close)
+
+	tx, err := env.DB.BeginTx(ctx, nil)
+	require.NoError(t, err, "begin")
+	defer func() { _ = tx.Rollback() }()
+
+	plan, err := r.CaptureInTx(ctx, tx, presencecapture.Subject{
+		Family:      presencecapture.FamilyBlock,
+		FailPosture: presencecapture.FailConservativeDegrade,
+		Principal:   a,
+		Counterpart: b,
+	})
+
+	require.NoError(t, err, "the degrade posture absorbs an undetermined presence")
+	require.True(t, plan.Degraded(),
+		"and it must SAY so — a clean empty plan here is the defect, because the "+
+			"caller records no counter and the viewers are never cleared")
+	assert.True(t, plan.HasWork(), "the conservative principal clear is carried")
+
+	// The transaction must still be usable, or the block 500s anyway and the
+	// posture is inert for the failure it exists to absorb.
+	var probe int
+	require.NoError(t, tx.QueryRowContext(ctx, `SELECT 1`).Scan(&probe),
+		"the savepoint restore must leave the caller's transaction usable")
+}
+
+// countingDisconnectorForTest is the external-package counterpart of the
+// in-package countingDisconnector; the reconciler needs a non-nil disconnector.
+type countingDisconnectorForTest struct{ calls int }
+
+func (c *countingDisconnectorForTest) DisconnectRichPresenceClients(
+	context.Context, map[uuid.UUID]bool,
+) error {
+	c.calls++
+	return nil
+}
+
+func (c *countingDisconnectorForTest) DisconnectAllRichPresenceClients(context.Context) error {
+	c.calls++
+	return nil
 }

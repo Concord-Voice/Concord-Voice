@@ -73,6 +73,14 @@ func (permitAllPresence) RichPresenceEmissionPermitted(context.Context, uuid.UUI
 	return true
 }
 
+func (d permitAllPresence) RichPresenceEmissionState(
+	ctx context.Context, senderID uuid.UUID,
+) (bool, error) {
+	// Test double: always DETERMINED, so it exercises the
+	// suppression path rather than the indeterminate one.
+	return d.RichPresenceEmissionPermitted(ctx, senderID), nil
+}
+
 // stubSenderPresence counts calls so a case can prove the gate ran exactly once.
 type stubSenderPresence struct {
 	permitted bool
@@ -82,6 +90,14 @@ type stubSenderPresence struct {
 func (s *stubSenderPresence) RichPresenceEmissionPermitted(context.Context, uuid.UUID) bool {
 	s.calls++
 	return s.permitted
+}
+
+func (s *stubSenderPresence) RichPresenceEmissionState(
+	ctx context.Context, senderID uuid.UUID,
+) (bool, error) {
+	// Test double: always DETERMINED, so it exercises the
+	// suppression path rather than the indeterminate one.
+	return s.RichPresenceEmissionPermitted(ctx, senderID), nil
 }
 
 // failDB fails every read, proving the presence gate short-circuits before any

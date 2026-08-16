@@ -2049,10 +2049,30 @@ func dmPrivacyLegacySync(level int) []string {
 // privacy_settings.dm_friends_of_friends is BOOLEAN NOT NULL DEFAULT FALSE
 // (migration 000032), so there is no NULL case. A missing row is the only
 // absent case and its effective value is that column default.
+// readPriorFoF reads the pre-mutation flag under a row lock.
+//
+// FOR UPDATE is load-bearing, not defensive. The capture fires only on an
+// actual transition (*req != oldFoF), so under READ COMMITTED two concurrent
+// PATCHes both read the pre-state, the second blocks on the first's row lock,
+// and its oldFoF is already stale by the time it proceeds: tx1 reads false and
+// writes true (widening, captures, delivers); tx2 read false earlier and
+// requests false, so *req == oldFoF, NO capture runs at all, and the UPDATE
+// narrows visibility back with no viewer ever cleared — the one place in this
+// family where a narrowing transition goes entirely uncaptured with no error,
+// no degrade and no log (PR #2738 review, @security-reviewer).
+//
+// Self-inflicted (a user racing their own settings), hence low severity, but
+// the lock costs nothing here: the row is the caller's own and the transaction
+// is about to UPDATE it regardless.
+//
+// The lock only bites once the row EXISTS, which is why the caller ensures it
+// first — see the ordering note in UpdatePrivacySettings. sql.ErrNoRows is
+// therefore unreachable from that call site and is kept only so this helper
+// stays correct for any caller that reads without ensuring.
 func readPriorFoF(ctx context.Context, tx *sql.Tx, userID string) (bool, error) {
 	var fof bool
 	err := tx.QueryRowContext(ctx,
-		`SELECT dm_friends_of_friends FROM privacy_settings WHERE user_id = $1`,
+		`SELECT dm_friends_of_friends FROM privacy_settings WHERE user_id = $1 FOR UPDATE`,
 		userID,
 	).Scan(&fof)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -2106,17 +2126,36 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 		}
 		defer presencehook.RollbackUnlessDone(tx, h.log) // no-op once the terminal committed
 
-		// The OLD flag value dies with the UPDATE below, so read it first and
-		// inside this transaction. Reading it afterwards computes the BEFORE
-		// audience against the NEW value and the delta comes out silently
-		// empty. This read precedes the row-ensuring INSERT so sql.ErrNoRows
-		// still distinguishes a first-ever write.
-		oldFoF, err := readPriorFoF(ctx, tx, userID)
-		if err != nil {
+		// The row-ensuring INSERT runs BEFORE the prior-value read, and that
+		// order is load-bearing rather than incidental. readPriorFoF locks with
+		// FOR UPDATE, which locks nothing when no row exists — so with the read
+		// first, two concurrent FIRST writes both saw the absent-row default
+		// (false) and neither blocked. One would set true and the other, having
+		// read false and requesting false, saw *req == oldFoF, ran NO capture,
+		// and narrowed visibility back with no viewer cleared (PR #2770 review,
+		// CodeRabbit). That is the same uncaptured-narrowing defect the FOR
+		// UPDATE was added to close, surviving in the one case the lock could
+		// not reach.
+		//
+		// ON CONFLICT DO NOTHING is what serializes them: the loser blocks on
+		// the primary-key index until the winner's transaction ends, then
+		// no-ops, so its subsequent locked read observes the winner's committed
+		// value instead of the default.
+		//
+		// Nothing is lost by reading second. sql.ErrNoRows no longer
+		// distinguishes a first-ever write, but the VALUE is identical either
+		// way — dm_friends_of_friends is NOT NULL DEFAULT FALSE, so an absent
+		// row and a freshly-inserted row both mean false, and no caller branches
+		// on the distinction.
+		if _, err := tx.ExecContext(ctx, `INSERT INTO privacy_settings (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
 			return err
 		}
 
-		if _, err := tx.ExecContext(ctx, `INSERT INTO privacy_settings (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
+		// The OLD flag value dies with the UPDATE below, so read it inside this
+		// transaction. Reading it afterwards computes the BEFORE audience
+		// against the NEW value and the delta comes out silently empty.
+		oldFoF, err := readPriorFoF(ctx, tx, userID)
+		if err != nil {
 			return err
 		}
 

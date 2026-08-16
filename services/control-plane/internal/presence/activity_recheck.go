@@ -123,9 +123,16 @@ func CurrentServerVoiceScope(
 // untouched by every hooked site, so binding it to the mutation's transaction
 // buys nothing and would cost O(#senders) round trips under the advisory lock.
 //
-// A nil or fail-closed sender-presence resolver yields an EMPTY candidate set,
-// so a Redis blip produces no clears rather than a spurious clear to a viewer
-// who never held the badge. That is the safe direction and it is deliberate.
+// A nil resolver, a DETERMINED suppression, or an UNDETERMINED base presence
+// all yield an EMPTY candidate set here, so a Redis blip produces no clears
+// rather than a spurious clear to a viewer who never held the badge. That is
+// the safe direction for THIS caller and it is deliberate.
+//
+// The #2446 pre-mutation capture needs the opposite for the undetermined case
+// and must call CaptureServerVoiceCandidatesStrict instead — see the contrast
+// documented there. Do NOT collapse the two back together: the leniency here is
+// load-bearing for RBAC write availability, and the strictness there is
+// load-bearing for not silently dropping a reconciliation leg.
 func CaptureServerVoiceCandidates(
 	ctx context.Context,
 	db DBTX,
@@ -133,9 +140,7 @@ func CaptureServerVoiceCandidates(
 	senderID uuid.UUID,
 	serverID uuid.UUID,
 ) (map[uuid.UUID]bool, error) {
-	return CaptureServerVoiceCandidatesWithMembers(
-		ctx, db, senderPresence, senderID, serverID, nil,
-	)
+	return captureServerVoiceCandidates(ctx, db, senderPresence, senderID, serverID, nil, false)
 }
 
 // CaptureServerVoiceCandidatesWithMembers is CaptureServerVoiceCandidates with
@@ -148,6 +153,10 @@ func CaptureServerVoiceCandidates(
 // The loader is consulted ONLY at the member read below, beneath every
 // short-circuit above it, so a capture whose senders all have presence disabled
 // still issues zero member reads. Hoisting it earlier regresses that to one.
+//
+// Like CaptureServerVoiceCandidates it is LENIENT about an undetermined base
+// presence: it serves the same #2445 caller, where an error blocks an RBAC
+// write.
 func CaptureServerVoiceCandidatesWithMembers(
 	ctx context.Context,
 	db DBTX,
@@ -156,14 +165,79 @@ func CaptureServerVoiceCandidatesWithMembers(
 	serverID uuid.UUID,
 	loader *ServerMemberLoader,
 ) (map[uuid.UUID]bool, error) {
+	return captureServerVoiceCandidates(
+		ctx, db, senderPresence, senderID, serverID, loader, false,
+	)
+}
+
+// CaptureServerVoiceCandidatesStrict is CaptureServerVoiceCandidates for the
+// #2446 PRE-MUTATION capture, where an undetermined base presence is an error
+// rather than an empty audience.
+//
+// The distinction is not stylistic. #2445's caller (voicepresence.Executor.
+// PrepareCapture) resolves candidates BEFORE an RBAC authority write, and per
+// rbac.withAuthorityCapture a PrepareCapture error returns 500 with the write
+// blocked — so propagating a transient Redis fault there would put Redis
+// availability in front of CreateRole/UpdateRole/AssignRole/RemoveMember/ban
+// (PR #2770 review, Gitar). #2446's caller instead reconciles an audience the
+// write is about to destroy, where an empty set means "clear nobody" and
+// silently drops the leg.
+//
+// Same fault, opposite correct answer, because the callers are asking different
+// questions. Hence separate entry points rather than one changed contract.
+//
+// It takes no member loader: graphpresence's loop varies serverID rather than
+// senderID, so there is nothing to share across senders (#2681).
+func CaptureServerVoiceCandidatesStrict(
+	ctx context.Context,
+	db DBTX,
+	senderPresence SenderPresenceResolver,
+	senderID uuid.UUID,
+	serverID uuid.UUID,
+) (map[uuid.UUID]bool, error) {
+	return captureServerVoiceCandidates(ctx, db, senderPresence, senderID, serverID, nil, true)
+}
+
+func captureServerVoiceCandidates(
+	ctx context.Context,
+	db DBTX,
+	senderPresence SenderPresenceResolver,
+	senderID uuid.UUID,
+	serverID uuid.UUID,
+	loader *ServerMemberLoader,
+	strictPresence bool,
+) (map[uuid.UUID]bool, error) {
 	if db == nil {
 		return nil, policyFailure(FailureSettingsRead, errors.New("missing capture database"))
 	}
 	if senderID == uuid.Nil || serverID == uuid.Nil {
 		return nil, ErrInvalidActivityScope
 	}
-	if senderPresence == nil ||
-		!senderPresence.RichPresenceEmissionPermitted(ctx, senderID) {
+	// A NIL resolver keeps its existing meaning — empty, not an error — on BOTH
+	// entry points. The finding this addresses is that TRANSIENT faults were
+	// collapsed into the same empty as a suppression; a nil resolver is a wiring
+	// bug, a different defect with a different control.
+	if senderPresence == nil {
+		return map[uuid.UUID]bool{}, nil
+	}
+	// The STATE form, not the bool one, so an undetermined answer is still
+	// distinguishable at this point even when the caller has asked to absorb it.
+	permitted, err := senderPresence.RichPresenceEmissionState(ctx, senderID)
+	if err != nil {
+		if !strictPresence {
+			// Lenient caller (#2445): absorb, exactly as before this change.
+			return map[uuid.UUID]bool{}, nil
+		}
+		// Strict caller (#2446): a capture that cannot determine the sender's
+		// base presence must refuse rather than return an empty audience — the
+		// empty was indistinguishable from a legitimate suppression, so the leg
+		// was dropped, the caller's FailPosture never applied, and a viewer who
+		// had just lost authorization kept the activity until the TTL expired
+		// (CWE-284; PR #2770 review, CodeRabbit).
+		return nil, policyFailure(FailureAudienceRead,
+			fmt.Errorf("read rich-presence emission state: %w", err))
+	}
+	if !permitted {
 		return map[uuid.UUID]bool{}, nil
 	}
 	settings, err := loadPolicySettings(ctx, db, senderID)

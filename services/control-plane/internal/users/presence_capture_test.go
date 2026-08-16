@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -137,4 +138,105 @@ func TestUpdatePrivacySettingsCapturesOnlyOnActualFoFChange(t *testing.T) {
 	assert.Len(t, capture.subjects, 1, "an unrelated privacy field must not capture")
 
 	assert.Empty(t, capture.abandoned, "no failure path ran")
+}
+
+// The FIRST-write half of the uncaptured-narrowing race (PR #2770 review,
+// CodeRabbit). readPriorFoF locks with FOR UPDATE, which locks NOTHING when no
+// row exists — so with the read ordered first, two concurrent first writes both
+// saw the absent-row default and neither blocked. One set true; the other, having
+// read false and requesting false, found *req == oldFoF, captured nothing, and
+// narrowed visibility back with no viewer cleared.
+//
+// UpdatePrivacySettings now ensures the row BEFORE that read, and ON CONFLICT DO
+// NOTHING is the serializer: the loser blocks on the primary-key index until the
+// winner's transaction ends, so its read observes a committed value instead of
+// the default.
+//
+// This drives the REAL handler. A version that ran ensure-then-read itself and
+// asserted on the result would prove a property of PostgreSQL and pass with the
+// handler's ordering reverted — the same reimplementation flaw the #2771 test
+// pass was cleaning up. Instead the test holds the competing transaction open
+// and asserts on whether a CAPTURE fires, which is the behaviour that differs:
+// under the old ordering the handler reads sql.ErrNoRows immediately, sees
+// false == false, and captures NOTHING.
+func TestFirstWriteFoFRaceStillCapturesTheNarrowing(t *testing.T) {
+	db, cleanup := testdb.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	userID := testdb.CreateUser(t, db)
+	ctx := context.Background()
+
+	var rows int
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM privacy_settings WHERE user_id = $1`, userID).Scan(&rows))
+	require.Zero(t, rows, "precondition: no row yet, so FOR UPDATE has nothing to lock")
+
+	capture := &stubCapture{}
+	h := &Handler{db: db, log: logger.New("test")}
+	h.SetGraphPresenceCapture(capture)
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		c.Set("user_id", userID.String())
+		c.Next()
+	})
+	engine.PATCH("/users/me/privacy", h.UpdatePrivacySettings)
+
+	// The competing first write: claims the row and turns the flag ON, holding
+	// its transaction open so the handler below races it.
+	rival, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err, "begin rival")
+	defer func() { _ = rival.Rollback() }()
+	_, err = rival.ExecContext(ctx,
+		`INSERT INTO privacy_settings (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
+		userID)
+	require.NoError(t, err, "rival ensure")
+	_, err = rival.ExecContext(ctx,
+		`UPDATE privacy_settings SET dm_friends_of_friends = TRUE WHERE user_id = $1`, userID)
+	require.NoError(t, err, "rival turns the flag on")
+
+	// The handler asks for FALSE. Against the rival's committed TRUE that is a
+	// narrowing and must capture; against the absent-row default it looks like
+	// a no-op and captures nothing.
+	code := make(chan int, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPatch, "/users/me/privacy",
+			strings.NewReader(`{"dm_friends_of_friends":false}`))
+		req.Header.Set("Content-Type", "application/json")
+		engine.ServeHTTP(w, req)
+		code <- w.Code
+	}()
+
+	// A slow machine can only make this MORE likely to still be blocked, so the
+	// wait cannot flake toward a false pass: if the ensure serializes, the
+	// handler cannot finish before the rival resolves at any speed.
+	select {
+	case got := <-code:
+		t.Fatalf("the handler finished (%d) without blocking on the rival's row — "+
+			"it did not ensure the row before its locked read", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	require.NoError(t, rival.Commit(), "committing the rival releases the handler")
+
+	select {
+	case got := <-code:
+		require.Equal(t, http.StatusOK, got, "the PATCH must still succeed")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handler never resumed after the rival committed")
+	}
+
+	require.Len(t, capture.subjects, 1,
+		"true→false is a NARROWING and must be captured; capturing nothing here is "+
+			"the defect — the handler would have read the absent-row default, seen "+
+			"false == false, and disabled the setting with no viewer ever cleared")
+	assert.Equal(t, presencecapture.FamilyFriendsOfFriendsToggle, capture.subjects[0].Family)
+	assert.Equal(t, userID, capture.subjects[0].Principal)
+
+	var final bool
+	require.NoError(t, db.QueryRow(
+		`SELECT dm_friends_of_friends FROM privacy_settings WHERE user_id = $1`,
+		userID).Scan(&final), "read back")
+	assert.False(t, final, "and the requested value still lands")
 }
