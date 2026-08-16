@@ -5,13 +5,13 @@
       "consumer": "node_modules/engine.io",
       "dep": "ws",
       "range": "~8.20.1",
-      "resolved": "8.21.0"
+      "resolved": "8.21.3"
     },
     {
       "consumer": "node_modules/socket.io-adapter",
       "dep": "ws",
       "range": "~8.20.1",
-      "resolved": "8.21.0"
+      "resolved": "8.21.3"
     }
   ]
 }

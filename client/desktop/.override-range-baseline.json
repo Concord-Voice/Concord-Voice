@@ -5,109 +5,61 @@
       "consumer": "node_modules/@electron/asar",
       "dep": "minimatch",
       "range": "^3.0.4",
-      "resolved": "9.0.9"
+      "resolved": "10.2.6"
     },
     {
       "consumer": "node_modules/@electron/node-gyp",
       "dep": "tar",
       "range": "^6.2.1",
-      "resolved": "7.5.19"
+      "resolved": "7.5.22"
     },
     {
       "consumer": "node_modules/@electron/node-gyp/node_modules/glob",
       "dep": "minimatch",
       "range": "^5.0.1",
-      "resolved": "9.0.9"
+      "resolved": "10.2.6"
     },
     {
       "consumer": "node_modules/@electron/rebuild",
       "dep": "tar",
       "range": "^6.0.5",
-      "resolved": "7.5.19"
+      "resolved": "7.5.22"
     },
     {
-      "consumer": "node_modules/@eslint-react/ast/node_modules/@typescript-eslint/typescript-estree",
+      "consumer": "node_modules/@electron/universal",
       "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/@eslint-react/core/node_modules/@typescript-eslint/typescript-estree",
-      "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/@eslint-react/eslint/node_modules/@typescript-eslint/typescript-estree",
-      "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/@eslint-react/jsx/node_modules/@typescript-eslint/typescript-estree",
-      "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/@eslint-react/shared/node_modules/@typescript-eslint/typescript-estree",
-      "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/@eslint-react/var/node_modules/@typescript-eslint/typescript-estree",
-      "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/@eslint/config-array",
-      "dep": "minimatch",
-      "range": "^10.2.4",
-      "resolved": "9.0.9"
+      "range": "^9.0.3",
+      "resolved": "10.2.6"
     },
     {
       "consumer": "node_modules/@eslint/eslintrc",
       "dep": "minimatch",
       "range": "^3.1.2",
-      "resolved": "9.0.9"
+      "resolved": "10.2.6"
     },
     {
       "consumer": "node_modules/@humanwhocodes/config-array",
       "dep": "minimatch",
       "range": "^3.0.5",
-      "resolved": "9.0.9"
+      "resolved": "10.2.6"
     },
     {
       "consumer": "node_modules/@microsoft/eslint-formatter-sarif/node_modules/eslint",
       "dep": "minimatch",
       "range": "^3.1.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/@typescript-eslint/typescript-estree",
-      "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/app-builder-lib",
-      "dep": "minimatch",
-      "range": "^10.2.5",
-      "resolved": "9.0.9"
+      "resolved": "10.2.6"
     },
     {
       "consumer": "node_modules/cacache",
       "dep": "tar",
       "range": "^6.1.11",
-      "resolved": "7.5.19"
+      "resolved": "7.5.22"
     },
     {
       "consumer": "node_modules/cacache/node_modules/glob",
       "dep": "minimatch",
       "range": "^5.0.1",
-      "resolved": "9.0.9"
+      "resolved": "10.2.6"
     },
     {
       "consumer": "node_modules/concurrently",
@@ -119,55 +71,13 @@
       "consumer": "node_modules/dir-compare",
       "dep": "minimatch",
       "range": "^3.0.5",
-      "resolved": "9.0.9"
+      "resolved": "10.2.6"
     },
     {
       "consumer": "node_modules/engine.io-client",
       "dep": "ws",
       "range": "~8.20.1",
-      "resolved": "8.21.0"
-    },
-    {
-      "consumer": "node_modules/eslint-plugin-react-dom/node_modules/@typescript-eslint/typescript-estree",
-      "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/eslint-plugin-react-jsx/node_modules/@typescript-eslint/typescript-estree",
-      "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/eslint-plugin-react-naming-convention/node_modules/@typescript-eslint/typescript-estree",
-      "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/eslint-plugin-react-rsc/node_modules/@typescript-eslint/typescript-estree",
-      "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/eslint-plugin-react-web-api/node_modules/@typescript-eslint/typescript-estree",
-      "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/eslint-plugin-react-x/node_modules/@typescript-eslint/typescript-estree",
-      "dep": "minimatch",
-      "range": "^10.2.2",
-      "resolved": "9.0.9"
-    },
-    {
-      "consumer": "node_modules/eslint",
-      "dep": "minimatch",
-      "range": "^10.2.5",
-      "resolved": "9.0.9"
+      "resolved": "8.21.3"
     },
     {
       "consumer": "node_modules/external-editor",
@@ -179,25 +89,19 @@
       "consumer": "node_modules/filelist",
       "dep": "minimatch",
       "range": "^5.0.1",
-      "resolved": "9.0.9"
+      "resolved": "10.2.6"
     },
     {
       "consumer": "node_modules/glob",
       "dep": "minimatch",
       "range": "^3.1.1",
-      "resolved": "9.0.9"
+      "resolved": "10.2.6"
     },
     {
       "consumer": "node_modules/http-proxy-agent",
       "dep": "@tootallnate/once",
       "range": "2",
       "resolved": "3.0.1"
-    },
-    {
-      "consumer": "node_modules/vite",
-      "dep": "postcss",
-      "range": "^8.5.25",
-      "resolved": "8.5.23"
     }
   ]
 }
