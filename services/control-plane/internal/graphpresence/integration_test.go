@@ -19,6 +19,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/graphpresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -252,12 +253,11 @@ func TestCaptureInTxRequiresATransaction(t *testing.T) {
 	assert.Error(t, err, "CaptureInTx with a nil tx must error, not silently succeed")
 }
 
-// A nil capture must leave every handler behaving exactly as before. This is
-// the mixed-version rollout claim.
-func TestNilCaptureIsSafeForConsumers(t *testing.T) {
-	var c presencecapture.GraphPresenceCapture
-	assert.Nil(t, c, "a zero GraphPresenceCapture must be nil so handlers can guard on it")
-}
+// The mixed-version rollout claim is locked by TestUnwiredHandlerBehavesAsBefore
+// below. A test asserting `var c GraphPresenceCapture; assert.Nil(t, c)` used to
+// stand here — that asserts the Go language's own zero-value rule, executes no
+// project code, and cannot fail for any change to this bridge (PR #2738 review,
+// @code-reviewer).
 
 // seedFriendship inserts an accepted edge and returns the two user IDs. The
 // fixture is raw SQL against env.DB on purpose: it pins this file to the schema
@@ -289,11 +289,41 @@ func seedFriendship(t *testing.T, env *testhelpers.TestServer) (uuid.UUID, uuid.
 // Phase-inversion lock. The capture reads the friend graph INSIDE the
 // transaction that destroys it. A concurrent delete committed on another
 // connection after the capture began must not tear what the capture saw.
+//
+// The assertion is on the viewer set the RECHECK receives, not on the returned
+// plan's accessors. An earlier version compared plan.HasWork()/Degraded()
+// before and after the concurrent delete, which only proved those two bools are
+// not lazily recomputed — they read already-populated maps, so they could not
+// have changed however wrong the capture's phase placement was (PR #2738
+// review, @code-reviewer).
 func TestCaptureSeesPreMutationGraphUnderConcurrentDelete(t *testing.T) {
 	env := testhelpers.SetupTestServer(t)
-	r, _ := newReconciler(t, env)
+	r, refresher := newReconciler(t, env)
 	a, b := seedFriendship(t, env)
 	ctx := context.Background()
+
+	// A Server Voice candidate set at the default TierFriends is
+	// serverMembers ∩ (friends ∪ FoF) — an INTERSECTION (presence.
+	// serverVoiceCandidates), so b must be BOTH a server member and a friend to
+	// be captured at all. Membership alone would keep b in the set after the
+	// friendship is gone and make this test pass regardless of when the capture
+	// ran; friendship alone never captures b in the first place.
+	//
+	// Deleting the edge therefore removes b from any POST-mutation re-read
+	// while leaving b in the pre-mutation capture, which is the discrimination
+	// this test needs.
+	serverID := uuid.New()
+	_, err := env.DB.Exec(
+		`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'shared', $2)`, serverID, a,
+	)
+	require.NoError(t, err, "seed server")
+	for _, id := range []uuid.UUID{a, b} {
+		_, err = env.DB.Exec(
+			`INSERT INTO server_members (server_id, user_id) VALUES ($1, $2)`, serverID, id,
+		)
+		require.NoError(t, err, "seed membership")
+	}
+	joinVoiceChannel(t, env.DB, serverID, a)
 
 	tx, err := env.DB.BeginTx(ctx, nil)
 	require.NoError(t, err, "begin")
@@ -308,30 +338,37 @@ func TestCaptureSeesPreMutationGraphUnderConcurrentDelete(t *testing.T) {
 		Counterpart: b,
 	})
 	require.NoError(t, err, "CaptureInTx")
+	require.True(t, plan.HasWork(),
+		"precondition: a in voice with an accepted edge must capture work")
 
-	hadWork, wasDegraded := plan.HasWork(), plan.Degraded()
-	require.True(t, hadWork || wasDegraded,
-		"capture over a live friendship must produce work or degrade, never a silent empty")
-
-	// A second connection deletes the edge and commits while our tx is open.
+	// A second connection deletes the edge and commits while our tx is open, so
+	// by the time Complete runs the friendship no longer exists anywhere.
 	_, err = env.DB.Exec(
 		`DELETE FROM friendships WHERE requester_id = $1 AND addressee_id = $2`, a, b,
 	)
 	require.NoError(t, err, "concurrent delete")
 
-	// The plan is already materialized: the concurrent commit cannot retro-edit
-	// what the capture saw. Nothing here may be re-read lazily at Complete time
-	// — that is exactly the tear the in-transaction capture exists to prevent.
-	assert.Equal(t, hadWork, plan.HasWork(),
-		"a concurrent commit must not change what the capture already materialized")
-	assert.Equal(t, wasDegraded, plan.Degraded(),
-		"a concurrent commit must not retroactively degrade a clean capture")
-	assert.NoError(t, r.Complete(ctx, tx, plan),
-		"Complete must still resolve the transaction after a concurrent commit")
+	require.NoError(t, r.Complete(ctx, tx, plan), "Complete")
+
+	// b was a viewer BEFORE the delete and must still be handed to the recheck.
+	// A capture that ran after the write, or that re-read anything at dispatch
+	// time, would hand over a set with b already gone — and b would then keep
+	// a's activity on screen with no clear ever computed for them.
+	require.Eventually(t, func() bool { return refresher.recheckViewersFor()[b] },
+		3*time.Second, 20*time.Millisecond,
+		"the recheck must receive the PRE-mutation viewer, not a post-delete re-read")
 }
 
 // Degrade proceeds: under FailConservativeDegrade the block WRITE commits and
 // the principals are disconnected, rather than the block being refused.
+//
+// The capture read is BROKEN here on purpose. An earlier version of this test
+// ran a perfectly healthy capture, so it never entered the degrade branch and
+// never asserted Degraded() — it proved only that a block commits, under a name
+// promising it proved the degrade commits (PR #2738 review, @code-reviewer).
+// The distinction is the whole point of the posture: #2446 names blocking the
+// priority regression, so a capture failure must not deny the safety
+// affordance.
 func TestBlockDegradesAndStillCommits(t *testing.T) {
 	env := testhelpers.SetupTestServer(t)
 	r, _ := newReconciler(t, env)
@@ -341,6 +378,7 @@ func TestBlockDegradesAndStillCommits(t *testing.T) {
 	tx, err := env.DB.BeginTx(ctx, nil)
 	require.NoError(t, err, "begin")
 	defer func() { _ = tx.Rollback() }()
+	hideTablesFromCapture(ctx, t, tx)
 
 	plan, err := r.CaptureInTx(ctx, tx, presencecapture.Subject{
 		Family:      presencecapture.FamilyBlock,
@@ -350,14 +388,25 @@ func TestBlockDegradesAndStillCommits(t *testing.T) {
 	})
 	require.NoError(t, err,
 		"block capture must never return an error under degrade posture")
+	require.True(t, plan.Degraded(),
+		"a failed capture read under this posture must produce the conservative plan")
 	assert.True(t, plan.HasWork(),
 		"the block must always carry the conservative disconnect of both principals")
+
+	// The savepoint restore does not undo the search_path redirect, which was
+	// set before the capture opened its savepoint. Put it back so the block
+	// write below exercises the handler's real statement rather than failing on
+	// a table the test itself hid.
+	_, err = tx.ExecContext(ctx, `SET LOCAL search_path TO public, pg_catalog`)
+	require.NoError(t, err, "restore search_path")
 
 	_, err = tx.ExecContext(ctx,
 		`UPDATE friendships SET status = 'blocked' WHERE requester_id = $1 AND addressee_id = $2`,
 		a, b,
 	)
-	require.NoError(t, err, "block write")
+	require.NoError(t, err,
+		"the write must succeed after a degrade — a poisoned transaction here is "+
+			"the exact inertness the capture savepoint exists to prevent")
 	require.NoError(t, r.Complete(ctx, tx, plan), "Complete must commit the transaction")
 
 	var status string
@@ -415,60 +464,93 @@ func TestSharedServerPreventsFalseClear(t *testing.T) {
 	require.NoError(t, err, "remove friendship")
 	require.NoError(t, r.Complete(ctx, tx, plan), "Complete")
 
-	// The recheck must have been handed b as a captured viewer — that is what
-	// lets RefreshServerVoiceRecheck compute captured-minus-fresh and decide.
+	// This test owns the two INPUTS to the clear decision; it does not own the
+	// decision. The subtraction lives in presence.recheckedActivityClears, which
+	// is unexported and reachable only through the real ActivityService that
+	// this file replaces with a double — so a locally re-derived
+	// captured-minus-fresh could only ever agree with itself.
+	//
+	// An earlier version derived it anyway and then asserted b was absent from
+	// it, two lines after a require.True(t, fresh[b]) that made that absence
+	// arithmetically certain: the assertion could not fail while its own
+	// precondition held (PR #2738 review, @code-reviewer). What remains are the
+	// two facts graphpresence is actually responsible for, each independently
+	// falsifiable.
+
+	// (1) b reaches the recheck. Without this the subtraction never considers b
+	// at all and the counterpart of a removal is silently never reconciled.
 	require.Eventually(t, func() bool { return refresher.recheckViewersFor()[b] },
 		3*time.Second, 20*time.Millisecond,
 		"the recheck must receive b in the captured set")
 
-	// Now compute the CLEAR DECISION itself, which is what "no false clear"
-	// actually means. The refresher double records the captured set but never
-	// computes captured-minus-fresh, so asserting on it alone would still pass
-	// if b were wrongly cleared (PR #2738 review, CodeRabbit). Rather than
-	// reimplement ActivityService in a double, derive the set here from the two
-	// real inputs — the captured audience the recheck received, and the freshly
-	// computed post-commit audience.
+	// (2) b is STILL authorized once the write has committed. This is the fact
+	// that makes clearing b a false clear rather than a correct one, and it is
+	// the half that breaks if the shared-server route ever stops counting.
 	fresh, err := presence.ComputePresenceAudience(ctx, env.DB, a)
 	require.NoError(t, err, "ComputePresenceAudience")
-	require.True(t, fresh[b],
-		"a shared server keeps the viewer authorized post-commit")
-
-	captured := refresher.recheckViewersFor()
-	cleared := make(map[uuid.UUID]bool)
-	for id := range captured {
-		if !fresh[id] {
-			cleared[id] = true
-		}
-	}
-	assert.NotContains(t, cleared, b,
-		"b is captured AND still authorized, so captured-minus-fresh must not "+
-			"clear b — clearing a viewer the shared server still authorizes is "+
-			"exactly the false clear this test is named for")
+	assert.True(t, fresh[b],
+		"the shared server must keep b authorized after the friendship is gone — "+
+			"a captured viewer who drops out of the fresh audience is exactly what "+
+			"recheckedActivityClears clears")
 }
 
 // Mixed-version rollout claim: with no capture wired, the normal write still
 // happens and the transaction semantics are untouched.
+//
+// This drives the REAL handler plumbing — presencehook's three terminals — with
+// a nil capture, which is what a replica that never called
+// SetGraphPresenceCapture actually holds. An earlier version ran a raw
+// tx.ExecContext + tx.Commit() and never referenced presencehook or
+// graphpresence at all, so it asserted that PostgreSQL commits a DELETE and
+// could not fail for any change to this PR's code (PR #2738 review,
+// @code-reviewer). The commit assertion below matters precisely because the
+// handler no longer owns the commit: Complete does, on BOTH paths.
 func TestUnwiredHandlerBehavesAsBefore(t *testing.T) {
 	env := testhelpers.SetupTestServer(t)
 	a, b := seedFriendship(t, env)
 	ctx := context.Background()
 
-	// Simulate an unwired handler: no capture, the caller commits directly.
+	// A nil INTERFACE, not a typed nil: this is the value the consumer field
+	// holds before any wiring runs.
+	var capture presencecapture.GraphPresenceCapture
+
 	tx, err := env.DB.BeginTx(ctx, nil)
 	require.NoError(t, err, "begin")
-	defer func() { _ = tx.Rollback() }()
+	defer presencehook.RollbackUnlessDone(tx, logger.New("test"))
+
+	plan, err := presencehook.Capture(ctx, capture, tx, presencehook.Spec{
+		Family:        presencecapture.FamilyFriendshipRemove,
+		PrincipalID:   a.String(),
+		CounterpartID: b.String(),
+	})
+	require.NoError(t, err,
+		"an unwired capture must not fail the handler — including on the ID parse, "+
+			"which an unwired path never had to perform before #2446")
+	require.Nil(t, plan, "an unwired capture produces no plan")
 
 	_, err = tx.ExecContext(ctx,
 		`DELETE FROM friendships WHERE requester_id = $1 AND addressee_id = $2`, a, b,
 	)
 	require.NoError(t, err, "delete")
-	require.NoError(t, tx.Commit(), "commit")
+
+	// The handler never calls tx.Commit() itself on either path. If the unwired
+	// branch of Complete stopped committing, the deferred rollback would discard
+	// this delete and the read-back below would still find the row — the write
+	// silently lost behind an HTTP 200.
+	require.NoError(t, presencehook.Complete(ctx, capture, tx, plan),
+		"Complete owns the commit on the unwired path too")
 
 	var count int
 	require.NoError(t, env.DB.QueryRow(
 		`SELECT COUNT(*) FROM friendships WHERE requester_id = $1 AND addressee_id = $2`, a, b,
 	).Scan(&count), "read back")
 	assert.Zero(t, count, "an unwired path must still perform its normal write")
+
+	// The third terminal. A handler's error path calls this unconditionally, so
+	// an unwired replica reaches it with a nil capture and a nil plan.
+	assert.NotPanics(t, func() {
+		presencehook.Abandon(capture, plan, presencecapture.CauseCommitUnresolved)
+	}, "the fail-closed terminal must be safe on an unwired replica")
 }
 
 // #2738 review: an ACCEPT must seed no peripheral disconnect.
@@ -528,15 +610,26 @@ func TestRemoveSeedsThePeripheralDisconnect(t *testing.T) {
 // posture exists to prevent. The fix is a SAVEPOINT around the reads; this
 // proves the primitive it now depends on actually restores a usable
 // transaction against real PostgreSQL.
+// Both statements come from the bridge's own beginCaptureSavepoint. An earlier
+// version hand-wrote the SAVEPOINT and ROLLBACK TO SAVEPOINT SQL and never
+// called the helper, so it proved a property of PostgreSQL: the two literals
+// could have been renamed, mismatched, or the whole helper deleted and this
+// test would still pass (PR #2738 review, @code-reviewer).
 func TestSavepointRestoresATransactionPoisonedByAFailedRead(t *testing.T) {
 	env := testhelpers.SetupTestServer(t)
+	r, _ := newReconciler(t, env)
 	ctx := context.Background()
 
 	tx, err := env.DB.BeginTx(ctx, nil)
 	require.NoError(t, err, "begin")
 	defer func() { _ = tx.Rollback() }()
 
-	_, err = tx.ExecContext(ctx, "SAVEPOINT concord_graph_presence_capture")
+	restore, err := r.BeginCaptureSavepointForTest(ctx, tx, presencecapture.Subject{
+		Family:      presencecapture.FamilyBlock,
+		FailPosture: presencecapture.FailConservativeDegrade,
+		Principal:   uuid.New(),
+		Counterpart: uuid.New(),
+	})
 	require.NoError(t, err, "open savepoint")
 
 	// A failed read poisons the transaction exactly as a capture read would.
@@ -548,8 +641,7 @@ func TestSavepointRestoresATransactionPoisonedByAFailedRead(t *testing.T) {
 	require.Error(t, tx.QueryRowContext(ctx, "SELECT 1").Scan(&probe),
 		"precondition: a poisoned transaction rejects further statements (25P02)")
 
-	_, err = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT concord_graph_presence_capture")
-	require.NoError(t, err, "restore savepoint")
+	require.NoError(t, restore(), "restore savepoint")
 
 	require.NoError(t, tx.QueryRowContext(ctx, "SELECT 1").Scan(&probe),
 		"after ROLLBACK TO SAVEPOINT the transaction must be usable again — "+
@@ -728,6 +820,59 @@ func TestCaptureFailsClosedWhenTheSavepointCannotOpen(t *testing.T) {
 	require.Error(t, err, "no savepoint means no safe degrade, so this must fail closed")
 	assert.Nil(t, plan)
 }
+
+// Refusing a foreign plan means refusing to COMMIT it. The error is the visible
+// half; the transaction still being open is the half that matters, because the
+// whole reason to refuse is that committing while silently dropping the
+// dispatch leaves viewers holding revoked state with no signal at all.
+//
+// This runs against a real transaction on purpose. The in-package version
+// passed a zero-value &sql.Tx{}, which made the test brittle in both
+// directions: it never observed whether tx was committed, and a reordering that
+// moved the guard after the commit would panic inside database/sql rather than
+// fail as a test (PR #2738 review, @code-reviewer).
+func TestCompleteRejectsAForeignPlanWithoutCommitting(t *testing.T) {
+	env := testhelpers.SetupTestServer(t)
+	r, _ := newReconciler(t, env)
+	a, b := seedFriendship(t, env)
+	ctx := context.Background()
+
+	tx, err := env.DB.BeginTx(ctx, nil)
+	require.NoError(t, err, "begin")
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx,
+		`DELETE FROM friendships WHERE requester_id = $1 AND addressee_id = $2`, a, b,
+	)
+	require.NoError(t, err, "the write the refusal must not commit")
+
+	err = r.Complete(ctx, tx, foreignTestPlan{})
+	require.Error(t, err, "a plan this bridge did not build must be refused")
+	assert.Contains(t, err.Error(), "foreign")
+
+	// The refusal returned BEFORE touching tx, so the transaction is still open
+	// and still usable.
+	var probe int
+	require.NoError(t, tx.QueryRowContext(ctx, `SELECT 1`).Scan(&probe),
+		"the refusal must leave the caller's transaction intact to roll back")
+
+	require.NoError(t, tx.Rollback(), "rollback")
+
+	var count int
+	require.NoError(t, env.DB.QueryRow(
+		`SELECT COUNT(*) FROM friendships WHERE requester_id = $1 AND addressee_id = $2`, a, b,
+	).Scan(&count), "read back")
+	assert.Equal(t, 1, count,
+		"the refused write must NOT have landed — a guard that ran after the commit "+
+			"would leave the mutation applied with its dispatch silently dropped")
+}
+
+// foreignTestPlan satisfies presencecapture.Plan without being this bridge's
+// concrete *Plan.
+type foreignTestPlan struct{}
+
+func (foreignTestPlan) HasWork() bool  { return true }
+func (foreignTestPlan) Degraded() bool { return false }
 
 // The silent-skip path this PR made visible. A sender holding a LIVE voice row
 // whose capture resolves to zero candidates is dropped from the plan with no

@@ -3,7 +3,6 @@ package graphpresence
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"testing"
@@ -425,19 +424,16 @@ type foreignPlan struct{}
 func (foreignPlan) HasWork() bool  { return true }
 func (foreignPlan) Degraded() bool { return false }
 
-// Committing while silently dropping the dispatch would leave viewers holding
-// revoked state with no signal at all, so a plan this bridge did not build is
-// refused rather than guessed at.
-func TestCompleteRejectsAForeignPlan(t *testing.T) {
-	r := New(nil, &fakeRefresher{}, &fakeDisconnector{}, nil, nil)
-	defer r.Close()
-
-	// The foreign-plan branch returns before anything touches tx.
-	err := r.Complete(context.Background(), &sql.Tx{}, foreignPlan{})
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "foreign")
-}
+// Complete's foreign-plan refusal is exercised against a REAL transaction by
+// TestCompleteRejectsAForeignPlanWithoutCommitting in integration_test.go. It
+// lives there because the property worth locking is that the caller's write is
+// not committed, and a zero-value &sql.Tx{} can neither be committed nor
+// observed — the version that stood here asserted only on the error string and
+// would have panicked, rather than failed, if the guard moved after the commit
+// (PR #2738 review, @code-reviewer).
+//
+// Complete's nil-tx guard needs no transaction to observe and stays in this
+// file, as TestCompleteRejectsNilTx above.
 
 func TestAbandonRejectsAForeignPlan(t *testing.T) {
 	d := &fakeDisconnector{}

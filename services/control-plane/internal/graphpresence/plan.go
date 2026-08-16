@@ -11,11 +11,21 @@
 //
 // The consequence is worth stating rather than leaving implicit: a leg's
 // captured set is the CANDIDATE superset that presence.CaptureServerVoiceCandidates
-// returns — friends ∪ FoF ∪ server peers — not the pre-mutation *authorized*
-// audience. That is safe for delivery, because ActivityService unions
-// recheckViewers into the clear set and a superset only over-clears. It is NOT
-// safe to hand to a disconnect, which is why Abandon is now bounded (see
-// presencecapture.CauseProvesNoCommit and CaptureInTx's accepted-edge gate).
+// returns, not the pre-mutation *authorized* audience. That is safe for
+// delivery, because ActivityService unions recheckViewers into the clear set
+// and a superset only over-clears. It is NOT safe to hand to a disconnect,
+// which is why Abandon is now bounded (see presencecapture.CauseProvesNoCommit
+// and CaptureInTx's accepted-edge gate).
+//
+// What that candidate set actually contains: the SENDER'S SERVER MEMBERS,
+// intersected with friends ∪ FoF at the default TierFriends and taken whole at
+// TierServers (presence.serverVoiceCandidates). It is therefore always a SUBSET
+// of the server's membership. An earlier version of this comment wrote it as
+// "friends ∪ FoF ∪ server peers", which is a union where the code performs an
+// intersection — it implies a non-member friend is captured, and a test written
+// against that reading cannot pass because such a viewer is never in the set at
+// all. It is "superset" only with respect to the missing channel-visibility
+// filter, which is the sense that matters above.
 package graphpresence
 
 import (
@@ -36,8 +46,8 @@ const (
 	maxFocalSenders = 8
 
 	// maxCapturedViewers bounds the exact-delta viewer set, which is unbounded
-	// in principle: a popular sender's audience is friends union FoF union
-	// server peers. Above it, escalate to a full rich-presence disconnect for
+	// in practice: at TierServers a popular sender's audience is every member
+	// of the server. Above it, escalate to a full rich-presence disconnect for
 	// the focal senders rather than attempting an exact delta.
 	maxCapturedViewers = 5000
 )
