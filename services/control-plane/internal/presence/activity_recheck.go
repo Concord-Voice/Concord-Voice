@@ -133,6 +133,29 @@ func CaptureServerVoiceCandidates(
 	senderID uuid.UUID,
 	serverID uuid.UUID,
 ) (map[uuid.UUID]bool, error) {
+	return CaptureServerVoiceCandidatesWithMembers(
+		ctx, db, senderPresence, senderID, serverID, nil,
+	)
+}
+
+// CaptureServerVoiceCandidatesWithMembers is CaptureServerVoiceCandidates with
+// the server-member read shared across one capture's senders (#2681).
+//
+// A nil loader means "read the members yourself" — the pre-#2681 behaviour, and
+// the correct choice for a caller whose loop varies serverID rather than
+// senderID, which is why internal/graphpresence stays on it.
+//
+// The loader is consulted ONLY at the member read below, beneath every
+// short-circuit above it, so a capture whose senders all have presence disabled
+// still issues zero member reads. Hoisting it earlier regresses that to one.
+func CaptureServerVoiceCandidatesWithMembers(
+	ctx context.Context,
+	db DBTX,
+	senderPresence SenderPresenceResolver,
+	senderID uuid.UUID,
+	serverID uuid.UUID,
+	loader *ServerMemberLoader,
+) (map[uuid.UUID]bool, error) {
 	if db == nil {
 		return nil, policyFailure(FailureSettingsRead, errors.New("missing capture database"))
 	}
@@ -150,9 +173,41 @@ func CaptureServerVoiceCandidates(
 	if !settings.master || settings.serverTier == TierOff {
 		return map[uuid.UUID]bool{}, nil
 	}
-	members, err := serverMembersOf(ctx, db, serverID, senderID)
+	members, err := captureServerMembers(ctx, db, serverID, senderID, loader)
 	if err != nil {
 		return nil, policyFailure(FailureAudienceRead, err)
 	}
 	return serverVoiceCandidates(ctx, db, senderID, settings.serverTier, members)
+}
+
+// ErrCaptureLoaderServerMismatch reports a capture whose shared member loader
+// was built for a different server than the call names. The loader resolves
+// membership from ITS OWN server binding, so honouring the mismatch would
+// return another server's members as this sender's presence audience.
+var ErrCaptureLoaderServerMismatch = errors.New(
+	"rich-presence capture loader is bound to a different server",
+)
+
+// captureServerMembers resolves the sender's member set through the capture's
+// shared loader when one is present, and falls back to a direct per-sender read
+// when it is not.
+//
+// A non-nil loader makes the serverID argument advisory rather than
+// authoritative — membersFor reads l.serverID, not this one. The binding is
+// therefore asserted here and a mismatch fails CLOSED: PrepareCapture
+// propagates the error and the RBAC mutation rolls back, where silently
+// resolving the loader's server would commit a cross-server audience.
+func captureServerMembers(
+	ctx context.Context,
+	db DBTX,
+	serverID, senderID uuid.UUID,
+	loader *ServerMemberLoader,
+) (map[uuid.UUID]bool, error) {
+	if loader == nil {
+		return serverMembersOf(ctx, db, serverID, senderID)
+	}
+	if !loader.boundTo(serverID) {
+		return nil, ErrCaptureLoaderServerMismatch
+	}
+	return loader.membersFor(ctx, senderID)
 }

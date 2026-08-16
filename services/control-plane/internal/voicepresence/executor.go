@@ -137,6 +137,15 @@ func (e *Executor) PrepareCapture(
 	if len(channelIDs) > presenceCaptureMaxChannels {
 		return nil, fmt.Errorf("%w: %d channels", ErrCaptureChannelLimit, len(channelIDs))
 	}
+	// ONE server_members read for this whole capture (#2681). Every sender on
+	// the server resolves the same membership, and the read was previously
+	// re-issued per sender because the sender exclusion was applied in SQL.
+	//
+	// Scoped to this call and discarded when it returns: reusing it across
+	// captures would compute an audience from pre-mutation membership, the
+	// error #2445 exists to prevent. It loads lazily, so a capture whose
+	// senders all have presence disabled still issues zero reads.
+	memberLoader := presence.NewServerMemberLoader(e.db, serverUUID)
 	builder := newPlanBuilder(serverID, onlyUserID)
 	for _, channelID := range channelIDs {
 		senders, sendersErr := e.activeSenders(ctx, channelID)
@@ -144,8 +153,8 @@ func (e *Executor) PrepareCapture(
 			return nil, sendersErr
 		}
 		for _, sender := range senders {
-			candidates, candidateErr := presence.CaptureServerVoiceCandidates(
-				ctx, e.db, e.senderPresence, sender.SenderID, serverUUID,
+			candidates, candidateErr := presence.CaptureServerVoiceCandidatesWithMembers(
+				ctx, e.db, e.senderPresence, sender.SenderID, serverUUID, memberLoader,
 			)
 			if candidateErr != nil {
 				return nil, fmt.Errorf("resolve rich-presence capture candidates: %w", candidateErr)

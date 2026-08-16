@@ -53,6 +53,22 @@ import (
 //
 // Do NOT "simplify" this by reimplementing the delta in the harness. The whole
 // value of these tests is that the delta is computed by production code.
+//
+// SCOPE LIMIT since #2681 — phase 1 above is no longer byte-for-byte the
+// production path. Production PrepareCapture now calls
+// presence.CaptureServerVoiceCandidatesWithMembers with a per-capture
+// ServerMemberLoader, so AT MOST ONE server_members read serves every sender —
+// and none at all when every sender short-circuits (nil resolver, emission not
+// permitted, master off, TierOff), because the loader is lazy. This harness's
+// own harnessRecheck.PrepareCapture calls the nil-loader entry point,
+// presence.CaptureServerVoiceCandidates, and therefore still reads per sender.
+//
+// The RESOLVED AUDIENCE is identical either way, which is what the spec §12
+// assertions key on — so these tests remain exactly as valid for what they
+// assert. What they do NOT do is exercise the shared-read path, so they must
+// not be cited as its regression surface. That lives in
+// internal/voicepresence/executor_member_loader_test.go, which drives the real
+// PrepareCapture and asserts the read count.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── recording sinks ──────────────────────────────────────────────────────────

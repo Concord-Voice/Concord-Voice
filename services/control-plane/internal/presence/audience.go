@@ -127,12 +127,17 @@ func serverPeersOf(ctx context.Context, db DBTX, senderID uuid.UUID) (map[uuid.U
 	return out, nil
 }
 
-// serverMembersOf returns the members of one exact server, excluding senderID.
-func serverMembersOf(ctx context.Context, db DBTX, serverID, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
+// allServerMembers returns every member of one exact server, INCLUDING senderID.
+//
+// The sender exclusion is deliberately NOT applied in SQL. An unexcluded result
+// is identical for every sender on the server, which is what lets one Rich
+// Presence capture share a single read across all of its senders (#2681).
+// Apply the exclusion with membersExcluding.
+func allServerMembers(ctx context.Context, db DBTX, serverID uuid.UUID) (map[uuid.UUID]bool, error) {
 	out := make(map[uuid.UUID]bool)
 	rows, err := db.QueryContext(ctx,
-		`SELECT user_id FROM server_members WHERE server_id = $1 AND user_id <> $2`,
-		serverID, senderID,
+		`SELECT user_id FROM server_members WHERE server_id = $1`,
+		serverID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("presence audience: query server members: %w", err)
@@ -141,6 +146,30 @@ func serverMembersOf(ctx context.Context, db DBTX, serverID, senderID uuid.UUID)
 		return nil, fmt.Errorf("presence audience: scan server members: %w", err)
 	}
 	return out, nil
+}
+
+// membersExcluding returns a COPY of all with senderID removed.
+//
+// It never mutates its input: the input is shared across every sender in a
+// capture, so an in-place delete would drop a legitimate viewer from a SIBLING
+// sender's audience — a silently missing presence frame, not an error (#2681).
+func membersExcluding(all map[uuid.UUID]bool, senderID uuid.UUID) map[uuid.UUID]bool {
+	out := make(map[uuid.UUID]bool, len(all))
+	for id := range all {
+		if id != senderID {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+// serverMembersOf returns the members of one exact server, excluding senderID.
+func serverMembersOf(ctx context.Context, db DBTX, serverID, senderID uuid.UUID) (map[uuid.UUID]bool, error) {
+	all, err := allServerMembers(ctx, db, serverID)
+	if err != nil {
+		return nil, err
+	}
+	return membersExcluding(all, senderID), nil
 }
 
 // friendsOfFriendsEnabled reads the sender's dm_friends_of_friends flag from
