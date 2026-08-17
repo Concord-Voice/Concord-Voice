@@ -3,10 +3,10 @@ package presence
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -51,7 +51,7 @@ func TestActivityStoreCurrentState(t *testing.T) {
 	}
 
 	t.Run("compare-set writes strict envelope with exact TTL", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 
 		stored, err := store.CompareAndSet(ctx, userID, CategoryServerVoice, state)
 		require.NoError(t, err)
@@ -87,7 +87,7 @@ func TestActivityStoreCurrentState(t *testing.T) {
 	})
 
 	t.Run("compare-set rejects older and conflicting generations", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		stored, err := store.CompareAndSet(ctx, userID, CategoryServerVoice, state)
 		require.NoError(t, err)
 		require.True(t, stored)
@@ -120,7 +120,7 @@ func TestActivityStoreCurrentState(t *testing.T) {
 	})
 
 	t.Run("refresh requires exact generation and restores TTL", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		stored, err := store.CompareAndSet(ctx, userID, CategoryServerVoice, state)
 		require.NoError(t, err)
 		require.True(t, stored)
@@ -147,7 +147,7 @@ func TestActivityStoreCurrentState(t *testing.T) {
 	})
 
 	t.Run("compare-delete requires exact token and version", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		stored, err := store.CompareAndSet(ctx, userID, CategoryServerVoice, state)
 		require.NoError(t, err)
 		require.True(t, stored)
@@ -167,7 +167,7 @@ func TestActivityStoreCurrentState(t *testing.T) {
 	})
 
 	t.Run("delete removes only the validated exact category key", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		otherCategoryKey, err := activityKey(userID, CategoryPrivateCall)
 		require.NoError(t, err)
 		otherUserID := uuid.MustParse("66666666-6666-6666-6666-666666666666")
@@ -187,7 +187,7 @@ func TestActivityStoreCurrentState(t *testing.T) {
 	})
 
 	t.Run("malformed state is deleted and never returned", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		for _, raw := range malformedActivityStates() {
 			require.NoError(t, rdb.Set(ctx, key, raw, time.Minute).Err())
 			got, found, err := store.Get(ctx, userID, CategoryServerVoice)
@@ -199,7 +199,7 @@ func TestActivityStoreCurrentState(t *testing.T) {
 	})
 
 	t.Run("generation operations delete malformed state", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		for _, raw := range append([]string{"not-json"}, malformedActivityStates()...) {
 			require.NoError(t, rdb.Set(ctx, key, raw, time.Minute).Err())
 			refreshed, err := store.Refresh(ctx, userID, CategoryServerVoice, token, state.SourceVersion)
@@ -227,7 +227,7 @@ func TestActivityStoreCurrentState(t *testing.T) {
 	})
 
 	t.Run("missing state is not fabricated", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		got, found, err := store.Get(ctx, userID, CategoryServerVoice)
 		require.NoError(t, err)
 		assert.False(t, found)
@@ -290,7 +290,7 @@ func TestActivityStoreCurrentState(t *testing.T) {
 	})
 
 	t.Run("caller context cancellation prevents every operation", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		stored, err := store.CompareAndSet(ctx, userID, CategoryServerVoice, state)
 		require.NoError(t, err)
 		require.True(t, stored)
@@ -420,7 +420,7 @@ func TestActivityStoreWrongTypeCurrentStateSelfHeals(t *testing.T) {
 		t.Run(operation.name, func(t *testing.T) {
 			for _, seed := range wrongTypeActivitySeeds() {
 				t.Run(seed.name, func(t *testing.T) {
-					require.NoError(t, rdb.FlushDB(ctx).Err())
+					require.NoError(t, redistest.Reset(ctx, rdb))
 					require.NoError(t, seed.seed(ctx, rdb, key))
 					operation.run(t)
 				})
@@ -440,7 +440,7 @@ func TestActivityStoreCompareAndSetActiveChecksLifecycleBeforeWrongTypeState(t *
 
 	for _, seed := range wrongTypeActivitySeeds() {
 		t.Run(seed.name, func(t *testing.T) {
-			require.NoError(t, rdb.FlushDB(ctx).Err())
+			require.NoError(t, redistest.Reset(ctx, rdb))
 			seedActivityLifecycle(
 				t, rdb, userID, CategoryServerVoice,
 				state.SourceToken, state.SourceVersion+1, true,
@@ -496,7 +496,7 @@ func TestCompareAndDeleteRawActivityStateGuardsTypeAndPreservesStringSuccessor(t
 	key := "presence:rich:11111111-1111-1111-1111-111111111111:server_voice"
 
 	t.Run("string successor", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		successor := `{"source_token":"22222222-2222-2222-2222-222222222222","source_version":1784088000000000,"minimized":false,"payload":{},"updated_at":1784088000}`
 		require.NoError(t, rdb.Set(ctx, key, successor, time.Minute).Err())
 
@@ -509,7 +509,7 @@ func TestCompareAndDeleteRawActivityStateGuardsTypeAndPreservesStringSuccessor(t
 	})
 
 	t.Run("wrong-type successor", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		require.NoError(t, rdb.HSet(ctx, key, "poison", "value").Err())
 
 		_, err := compareAndDeleteRawActivityScript.Run(
@@ -775,24 +775,15 @@ func withActivityState(state ActivityState, mutate func(*ActivityState)) Activit
 	return state
 }
 
+// setupActivityStoreRedis returns a client on this process's own Redis logical
+// database, allocated by redistest (#2680). Every reset in this package is
+// scoped to that index, so a flush here can no longer erase another test
+// binary's live fixtures.
 func setupActivityStoreRedis(t *testing.T) *redis.Client {
 	t.Helper()
 
-	redisURL := os.Getenv("REDIS_URL")
-	useDefaultDB := redisURL == ""
-	if useDefaultDB {
-		redisURL = "redis://:concord_dev_redis@localhost:6379" //nolint:gosec // dev-only test default
-	}
-	opts, err := redis.ParseURL(redisURL)
-	require.NoError(t, err)
-	if useDefaultDB {
-		opts.DB = 1
-	}
-
-	client := redis.NewClient(opts)
-	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	require.NoError(t, client.Ping(context.Background()).Err())
-	require.NoError(t, client.FlushDB(context.Background()).Err())
+	client := redistest.Client(t)
+	require.NoError(t, redistest.Reset(context.Background(), client))
 	return client
 }
 

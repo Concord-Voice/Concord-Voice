@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -472,23 +472,6 @@ type rbacPresenceEnv struct {
 	cleanupUsers   []string
 }
 
-// redisURLForTests mirrors internal/testhelpers.SetupTestRedis: that helper
-// cannot be imported here (testhelpers imports internal/rbac, so an in-package
-// rbac test importing it is a cycle), so the dev-compose default — INCLUDING
-// its password, without which every call returns NOAUTH and the whole suite
-// silently SKIPS — is repeated. DB 1 keeps fixtures off dev data.
-func redisURLForTests() string {
-	if fromEnv := os.Getenv("REDIS_URL"); fromEnv != "" {
-		return fromEnv
-	}
-	return "redis://:" + testRedisPassword + "@localhost:6379/1"
-}
-
-// The literal is the docker-compose dev default, not a credential: it is already
-// in the committed compose file, it reaches only a local container, and REDIS_URL
-// overrides it wherever the environment differs.
-var testRedisPassword = "concord_dev_redis" //nolint:gosec // pragma: allowlist secret
-
 func newRBACPresenceEnv(t *testing.T) *rbacPresenceEnv {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -496,16 +479,12 @@ func newRBACPresenceEnv(t *testing.T) *rbacPresenceEnv {
 	db, cleanupDB := dbtest.SetupTestDB(t)
 	t.Cleanup(cleanupDB)
 
-	opts, err := redis.ParseURL(redisURLForTests())
-	if err != nil {
-		t.Skipf("rich-presence rbac integration needs Redis: %v", err)
-	}
-	rdb := redis.NewClient(opts)
-	if pingErr := rdb.Ping(context.Background()).Err(); pingErr != nil {
-		// discard: best-effort close on a client that never connected.
-		_ = rdb.Close()
-		t.Skipf("rich-presence rbac integration needs Redis: %v", pingErr)
-	}
+	// redistest is a LEAF (stdlib + go-redis only), so the import cycle that
+	// forced this fixture to hand-roll its own DB-1 URL — testhelpers imports
+	// internal/rbac — no longer applies (#2680). It also carries the compose
+	// credential itself and fails loudly rather than skipping, so a mis-
+	// credentialled Redis can no longer make the whole suite silently vanish.
+	rdb := redistest.Client(t)
 
 	log := logger.New("test")
 	cache := NewPermissionCache(rdb)

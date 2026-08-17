@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -1042,7 +1043,7 @@ func TestActivitySnapshotRejectsStaleAmbiguousAndFailedPolicyState(t *testing.T)
 	}
 
 	t.Run("definitively stale generation is deleted", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		put()
 		builder := &activitySnapshotBuilderStub{err: ErrActivityNotCurrent}
 		service := newActivitySnapshotService(nil, builder, store, func(
@@ -1062,7 +1063,7 @@ func TestActivitySnapshotRejectsStaleAmbiguousAndFailedPolicyState(t *testing.T)
 	})
 
 	t.Run("newer successor is never deleted by stale candidates", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		newer := state
 		newer.SourceToken = uuid.New()
 		newer.SourceVersion += 2
@@ -1091,7 +1092,7 @@ func TestActivitySnapshotRejectsStaleAmbiguousAndFailedPolicyState(t *testing.T)
 	})
 
 	t.Run("ambiguous active scopes are omitted and cleaned", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		put()
 		service := newActivitySnapshotService(
 			nil,
@@ -1121,7 +1122,7 @@ func TestActivitySnapshotRejectsStaleAmbiguousAndFailedPolicyState(t *testing.T)
 	})
 
 	t.Run("policy failure aborts instead of returning a partial snapshot", func(t *testing.T) {
-		require.NoError(t, rdb.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, rdb))
 		put()
 		policyErr := errors.New("forced policy failure")
 		service := newActivitySnapshotService(nil, &activitySnapshotBuilderStub{built: BuiltActivity{

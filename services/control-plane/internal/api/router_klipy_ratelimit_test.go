@@ -25,12 +25,17 @@ import (
 // Test handler is a no-op 200 OK so the limiter behavior is what the assertions
 // see — KLIPY round-tripping has its own coverage in internal/klipy/handlers_test.go.
 //
-// The Redis backing is an in-process miniredis per test (#2324): the machine's
-// shared dev Redis (DB 1) is flushed by every concurrent test run's
-// testhelpers.SetupTestRedis, and a mid-test FLUSHDB resets the fixed-window
-// counter so the over-cap assertion flakes. miniredis gives each test its own
-// keyspace, no network to fail open on, and a frozen clock (TTLs advance only
-// via FastForward), making full-budget exhaustion deterministic.
+// The Redis backing is an in-process miniredis per test (#2324). Its original
+// motivation was cross-process interference: the machine's shared dev Redis
+// (DB 1) was flushed by every concurrent test run's testhelpers.SetupTestRedis,
+// and a mid-test FLUSHDB reset the fixed-window counter so the over-cap
+// assertion flaked. That specific hazard is closed since #2680 — every test
+// process now owns a private logical database — but miniredis STAYS, because
+// the reason it is still load-bearing was never isolation: it supplies a frozen
+// clock (TTLs advance only via FastForward), which is what lets
+// TestKlipyMediaLimiterWindowResets cross a one-minute fixed window without a
+// one-minute sleep, plus a keyspace with no network to fail open on. Do not
+// convert these tests to redistest; there is no FastForward on a real Redis.
 
 const (
 	klipyTestUserID   = "test-klipy-ratelimit-user"

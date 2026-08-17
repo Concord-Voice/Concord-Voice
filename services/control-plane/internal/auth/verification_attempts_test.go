@@ -6,34 +6,23 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"sync"
 	"testing"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
 
+// setupAuthAttemptRedis returns a client on this process's own Redis logical
+// database, allocated by redistest (#2680). The scoped reset replaces a bare
+// FLUSHDB that could reach whatever database the client happened to hold.
 func setupAuthAttemptRedis(t *testing.T) *redis.Client {
 	t.Helper()
 
-	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
-		redisURL = "redis://:concord_dev_redis@localhost:6379" //nolint:gosec // dev-only test Redis default
-	}
-
-	opts, err := redis.ParseURL(redisURL)
-	require.NoError(t, err)
-	if os.Getenv("REDIS_URL") == "" {
-		opts.DB = 1
-	}
-
-	client := redis.NewClient(opts)
-	ctx := context.Background()
-	require.NoError(t, client.Ping(ctx).Err())
-	require.NoError(t, client.Do(ctx, "FLUSHDB", "SYNC").Err())
-	t.Cleanup(func() { _ = client.Close() })
+	client := redistest.Client(t)
+	require.NoError(t, redistest.Reset(context.Background(), client))
 
 	return client
 }

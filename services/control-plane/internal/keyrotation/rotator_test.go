@@ -23,6 +23,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -37,9 +38,9 @@ var (
 	krMigrateErr  error
 )
 
-// Dev-only defaults matching docker-compose; production always sets DATABASE_URL / REDIS_URL.
+// Dev-only default matching docker-compose; production always sets DATABASE_URL.
+// The Redis counterpart is gone — redistest owns Redis URL resolution (#2680).
 var krTestDBPassword = "concord_dev_password" //nolint:gosec // matches docker-compose dev default // pragma: allowlist secret
-var krTestRedisPassword = "concord_dev_redis" //nolint:gosec // matches docker-compose dev default // pragma: allowlist secret
 
 const krTestPasswordHash = "$argon2id$v=19$m=65536,t=3,p=4$3pE9STD1TqLPoZQ2/BTLCg$8SKTCjsZh8Q7pAulEqAIEzJQK9eeOb5ipWhPz4REdCY" //nolint:gosec // dummy hash, not a credential // pragma: allowlist secret
 const krRotationFingerprint = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -97,24 +98,13 @@ func krSetupDB(t *testing.T) *sql.DB {
 	return db
 }
 
+// krSetupRedis returns a client on this process's own allocated logical database
+// (#2680). The DB-1 pin it replaced was the same index every other package
+// binary and every concurrent worktree used, so a sibling package's flush could
+// erase these fixtures mid-test.
 func krSetupRedis(t *testing.T) *redis.Client {
 	t.Helper()
-	redisURL := os.Getenv("REDIS_URL")
-	useDefaultDB := redisURL == ""
-	if useDefaultDB {
-		redisURL = "redis://:" + krTestRedisPassword + "@localhost:6379" //nolint:gosec
-	}
-	opts, err := redis.ParseURL(redisURL)
-	if err != nil {
-		t.Fatalf("keyrotation_test: failed to parse redis URL: %v", err)
-	}
-	if useDefaultDB {
-		opts.DB = 1 // matches testhelpers default test-isolation DB index
-	}
-	client := redis.NewClient(opts)
-	require.NoError(t, client.Ping(context.Background()).Err(), "keyrotation_test: failed to ping redis")
-	t.Cleanup(func() { _ = client.Close() })
-	return client
+	return redistest.Client(t)
 }
 
 func newRotator(t *testing.T) (*keyrotation.Rotator, *sql.DB) {

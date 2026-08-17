@@ -1,21 +1,13 @@
 package database
 
 import (
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-)
 
-// testRedisURL returns the Redis URL for tests, matching testhelpers.SetupTestRedis.
-func testRedisURL() string {
-	if url := os.Getenv("REDIS_URL"); url != "" {
-		return url
-	}
-	const devRedisVal = "concord_dev_redis" //nolint:gosec // dev-only default
-	return "redis://:" + devRedisVal + "@localhost:6379"
-}
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
+)
 
 func TestNewRedisClientInvalidURL(t *testing.T) {
 	_, err := NewRedisClient("not-a-valid-url")
@@ -35,11 +27,15 @@ func TestNewRedisClientMalformedScheme(t *testing.T) {
 }
 
 func TestNewRedisClientSuccess(t *testing.T) {
-	client, err := NewRedisClient(testRedisURL())
-	if err != nil {
-		// Redis not available in this environment — skip rather than fail
-		t.Skipf("Redis not available: %v", err)
-	}
+	// redistest.URL carries this process's own allocated logical database (#2680).
+	// The helper this replaced fell back to a URL with NO path segment, which
+	// go-redis resolves to DB 0 — the dev app's live database.
+	// No "Redis not available" skip: redistest.URL allocates and pings first, so
+	// an unreachable Redis fails there and never reaches this call. Keeping the
+	// skip would describe behaviour that can no longer happen — and silently
+	// vanishing suites is what #2680 removed from feedback, rbac and voice.
+	client, err := NewRedisClient(redistest.URL(t))
+	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, client.Close())
 	}()
@@ -47,10 +43,9 @@ func TestNewRedisClientSuccess(t *testing.T) {
 }
 
 func TestNewRedisClientEnablesContextTimeouts(t *testing.T) {
-	client, err := NewRedisClient(testRedisURL())
-	if err != nil {
-		t.Skipf("Redis not available in this environment: %v", err)
-	}
+	// Same as above: redistest.URL fails closed before this can error.
+	client, err := NewRedisClient(redistest.URL(t))
+	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, client.Close())
 	})

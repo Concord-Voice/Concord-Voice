@@ -17,6 +17,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
 	concordws "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -1034,7 +1035,7 @@ func TestHandleHeartbeat_DMRestoresMissingLeaseAndPresence(t *testing.T) {
 
 	// Simulate an outage long enough for the lease to expire and for /ring's
 	// bounded stale-presence cleanup to remove the old rows.
-	require.NoError(t, ts.Redis.FlushDB(context.Background()).Err())
+	require.NoError(t, redistest.Reset(context.Background(), ts.Redis))
 	_, err := ts.DB.Exec(`DELETE FROM dm_voice_participants WHERE conversation_id = $1`, convID)
 	require.NoError(t, err)
 

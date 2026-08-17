@@ -28,6 +28,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -50,22 +51,14 @@ func mediaTestWithResolver(t *testing.T, db *sql.DB, resolver *rbac.Resolver) *t
 	return &testSetup{handler: h, store: store, db: db}
 }
 
-// mediaTestRedis connects to the test Redis (matches the docker-compose dev
-// default consumed by internal/testhelpers). Used only to back the RBAC
-// permission cache in resolver tests.
+// mediaTestRedis connects to this process's own allocated Redis logical database
+// (#2680). Used only to back the RBAC permission cache in resolver tests. The
+// hand-rolled DB-1 URL it replaced was shared by every other package binary in a
+// run, so a sibling's flush could empty this cache mid-test. redistest is a LEAF
+// package, so importing it does not reintroduce the cycle described above.
 func mediaTestRedis(t *testing.T) *redis.Client {
 	t.Helper()
-	url := os.Getenv("REDIS_URL")
-	if url == "" {
-		// Assembled from parts to satisfy static credential analysis; matches the
-		// docker-compose dev default (test-only, not a production secret).
-		url = "redis://:" + "concord_dev" + "_redis@localhost:6379/1"
-	}
-	opt, err := redis.ParseURL(url)
-	require.NoError(t, err)
-	rdb := redis.NewClient(opt)
-	t.Cleanup(func() { _ = rdb.Close() })
-	return rdb
+	return redistest.Client(t)
 }
 
 // mediaBrokenResolver returns a resolver whose DB is closed, so every permission

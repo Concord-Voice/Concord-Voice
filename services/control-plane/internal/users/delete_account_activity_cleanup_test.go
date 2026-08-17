@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
@@ -134,15 +134,14 @@ func TestDeleteAccountDeletesActiveActivityStateWithoutPendingMarker(t *testing.
 	assertAccountActivityCleanupRows(t, db, userID, 0, 0)
 }
 
+// setupAccountActivityRedis returns a client on this process's own Redis logical
+// database, allocated by redistest (#2680). It no longer demands a hand-set
+// REDIS_URL: the isolation the old require.NotEmpty was asking an operator to
+// arrange is now structural, and unset is the normal local case.
 func setupAccountActivityRedis(t *testing.T) (*redis.Client, func()) {
 	t.Helper()
-	redisURL := os.Getenv("REDIS_URL")
-	require.NotEmpty(t, redisURL, "REDIS_URL must point to an isolated test Redis")
-	opts, err := redis.ParseURL(redisURL)
-	require.NoError(t, err)
-	client := redis.NewClient(opts)
-	require.NoError(t, client.Ping(context.Background()).Err())
-	require.NoError(t, client.FlushDB(context.Background()).Err())
+	client := redistest.Client(t)
+	require.NoError(t, redistest.Reset(context.Background(), client))
 	return client, func() { assert.NoError(t, client.Close()) }
 }
 

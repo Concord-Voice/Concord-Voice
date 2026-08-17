@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -388,37 +388,18 @@ type tempGrantPresenceEnv struct {
 	cleanupUsers   []string
 }
 
-// tempGrantRedisURL mirrors internal/testhelpers.SetupTestRedis. The password is
-// load-bearing: without it every call returns NOAUTH and the suite silently
-// SKIPS rather than failing. DB 1 keeps fixtures off dev data.
-func tempGrantRedisURL() string {
-	if fromEnv := os.Getenv("REDIS_URL"); fromEnv != "" {
-		return fromEnv
-	}
-	return "redis://:" + tempGrantRedisPassword + "@localhost:6379/1"
-}
-
-// The literal is the docker-compose dev default, not a credential: it is already
-// in the committed compose file, it reaches only a local container, and REDIS_URL
-// overrides it wherever the environment differs.
-var tempGrantRedisPassword = "concord_dev_redis" //nolint:gosec // pragma: allowlist secret
-
 func newTempGrantPresenceEnv(t *testing.T) *tempGrantPresenceEnv {
 	t.Helper()
 
 	db, cleanupDB := dbtest.SetupTestDB(t)
 	t.Cleanup(cleanupDB)
 
-	opts, err := redis.ParseURL(tempGrantRedisURL())
-	if err != nil {
-		t.Skipf("temp-grant presence integration needs Redis: %v", err)
-	}
-	rdb := redis.NewClient(opts)
-	if pingErr := rdb.Ping(context.Background()).Err(); pingErr != nil {
-		// discard: best-effort close on a client that never connected.
-		_ = rdb.Close()
-		t.Skipf("temp-grant presence integration needs Redis: %v", pingErr)
-	}
+	// redistest allocates this process's own Redis logical database (#2680) and
+	// carries the docker-compose credential itself, so the hand-rolled DB-1 URL
+	// helper this fixture used to own is gone. It also fails loudly instead of
+	// skipping: the old skip on an unreachable or mis-credentialled Redis made
+	// the whole suite silently vanish.
+	rdb := redistest.Client(t)
 
 	log := logger.New("test")
 	cache := rbac.NewPermissionCache(rdb)

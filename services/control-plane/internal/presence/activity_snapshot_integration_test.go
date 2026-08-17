@@ -9,6 +9,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -40,7 +41,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 
 	t.Run("server voice candidate is authorized against fresh policy", func(t *testing.T) {
 		require.NoError(t, testhelpers.TruncateAllTables(db))
-		require.NoError(t, redisClient.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, redisClient))
 		viewerID := testhelpers.CreateUser(t, db)
 		senderID, serverID, channelID := createServerVoiceBuilderFixture(t, db, "Concord", "General")
 		testhelpers.AddServerMember(t, db, serverID, viewerID)
@@ -91,7 +92,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 
 	t.Run("hidden exact voice channel is omitted", func(t *testing.T) {
 		require.NoError(t, testhelpers.TruncateAllTables(db))
-		require.NoError(t, redisClient.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, redisClient))
 		viewerID := testhelpers.CreateUser(t, db)
 		senderID, serverID, channelID := createServerVoiceBuilderFixture(t, db, "Hidden", "Secret")
 		testhelpers.AddServerMember(t, db, serverID, viewerID)
@@ -132,7 +133,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 
 	t.Run("stale viewer server membership is omitted", func(t *testing.T) {
 		require.NoError(t, testhelpers.TruncateAllTables(db))
-		require.NoError(t, redisClient.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, redisClient))
 		viewerID := testhelpers.CreateUser(t, db)
 		senderID, serverID, channelID := createServerVoiceBuilderFixture(t, db, "Former Viewer", "General")
 		testhelpers.AddServerMember(t, db, serverID, viewerID)
@@ -170,7 +171,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 
 	t.Run("stale server member row is omitted and cleaned", func(t *testing.T) {
 		require.NoError(t, testhelpers.TruncateAllTables(db))
-		require.NoError(t, redisClient.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, redisClient))
 		viewerID := testhelpers.CreateUser(t, db)
 		senderID, serverID, channelID := createServerVoiceBuilderFixture(t, db, "Former", "General")
 		testhelpers.AddServerMember(t, db, serverID, viewerID)
@@ -208,7 +209,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 
 	t.Run("private call candidate includes asymmetric sender opted-in friend of friend", func(t *testing.T) {
 		require.NoError(t, testhelpers.TruncateAllTables(db))
-		require.NoError(t, redisClient.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, redisClient))
 		senderID := testhelpers.CreateUser(t, db)
 		peerID := testhelpers.CreateUser(t, db)
 		mutualID := testhelpers.CreateUser(t, db)
@@ -259,7 +260,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 
 	t.Run("private tier off still includes current same-call stranger", func(t *testing.T) {
 		require.NoError(t, testhelpers.TruncateAllTables(db))
-		require.NoError(t, redisClient.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, redisClient))
 		senderID := testhelpers.CreateUser(t, db)
 		viewerID := testhelpers.CreateUser(t, db)
 		conversationID := uuid.New()
@@ -296,7 +297,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 
 	t.Run("ended private call lease is omitted and cleaned", func(t *testing.T) {
 		require.NoError(t, testhelpers.TruncateAllTables(db))
-		require.NoError(t, redisClient.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, redisClient))
 		senderID := testhelpers.CreateUser(t, db)
 		viewerID := testhelpers.CreateUser(t, db)
 		conversationID := uuid.New()
@@ -335,7 +336,7 @@ func TestActivitySnapshot_PostgresCandidateSupersetAndFreshAuthorization(t *test
 
 	t.Run("terminal participant fence with lingering row is omitted and cleaned", func(t *testing.T) {
 		require.NoError(t, testhelpers.TruncateAllTables(db))
-		require.NoError(t, redisClient.FlushDB(ctx).Err())
+		require.NoError(t, redistest.Reset(ctx, redisClient))
 		senderID := testhelpers.CreateUser(t, db)
 		formerParticipantID := testhelpers.CreateUser(t, db)
 		conversationID := uuid.New()

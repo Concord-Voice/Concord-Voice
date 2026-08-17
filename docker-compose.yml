@@ -34,6 +34,15 @@ services:
   redis:
     image: redis:7-alpine
     container_name: concordvoice-redis
+    # Deliberately NOT raising `--databases` (#2680 review). Widening the pool was
+    # proposed as test headroom, but it buys nothing measurable — collision needs
+    # more processes SIMULTANEOUSLY live than the pool holds, and `-p 1` plus
+    # ordinary runner concurrency keep that far below the stock 16 — while it does
+    # carry a real reversal hazard: `databases` is startup-only, so once tests
+    # write to DB >= 16, removing the flag later makes Redis fail its AOF load on
+    # the now-out-of-range SELECT, recoverable only by discarding the volume.
+    # redistest reads the real value via CONFIG GET (fallback 15), so it adapts to
+    # whatever a server reports rather than depending on this line.
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set - copy .env.example to .env}
     ports:
       - "6379:6379"

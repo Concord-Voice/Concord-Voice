@@ -4,54 +4,34 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// setupFeedbackTestRedis returns a Redis client isolated from dev data by
-// default, skipping the test if Redis is unreachable. Deliberately does NOT
-// use internal/testhelpers — that package imports internal/api, which imports
-// this (feedback) package via feedback_wiring.go, so importing it from a
-// package-internal test would create an import cycle. The client/cleanup shape
-// mirrors testhelpers.SetupTestRedis.
+// setupFeedbackTestRedis returns a client on this process's own Redis logical
+// database, allocated by redistest (#2680). It deliberately does NOT use
+// internal/testhelpers — that package imports internal/api, which imports this
+// (feedback) package via feedback_wiring.go, so importing it from a
+// package-internal test would create an import cycle. redistest is a leaf, so
+// it has no such problem.
 //
-// NOTE: tests using this share the FIXED globalFeedbackKey on one Redis DB.
-// The key is deleted at setup AND cleanup so SERIAL runs stay isolated, but for
-// that reason these tests MUST NOT call t.Parallel().
+// An unreachable Redis is now a failure, not a skip: the old skip made a broken
+// or mis-credentialled Redis look like a green suite.
+//
+// NOTE: tests using this share the FIXED globalFeedbackKey inside the one
+// database this process owns, so they MUST NOT call t.Parallel(). The scoped
+// reset at setup is what keeps SERIAL runs isolated from each other.
 func setupFeedbackTestRedis(t *testing.T) *redis.Client {
 	t.Helper()
 
-	redisURL := os.Getenv("REDIS_URL")
-	useDefaultDB := redisURL == ""
-	if useDefaultDB {
-		redisURL = "redis://:concord_dev_redis@localhost:6379" //nolint:gosec // dev-only default, matches docker-compose
-	}
-	opts, err := redis.ParseURL(redisURL)
-	if err != nil {
-		t.Fatalf("feedback test: failed to parse redis URL: %v", err)
-	}
-	if useDefaultDB {
-		opts.DB = 1 // isolate from dev data on DB 0
-	}
-
-	client := redis.NewClient(opts)
-	ctx := context.Background()
-	if err := client.Ping(ctx).Err(); err != nil {
-		_ = client.Close()
-		t.Skipf("Redis unavailable (%v) — skipping global-cap Redis-dependent test", err)
-	}
-	t.Cleanup(func() {
-		_ = client.Del(context.Background(), globalFeedbackKey).Err()
-		_ = client.Close()
-	})
-	// Start clean for the global counter key.
-	client.Del(ctx, globalFeedbackKey)
+	client := redistest.Client(t)
+	require.NoError(t, redistest.Reset(context.Background(), client))
 	return client
 }
 

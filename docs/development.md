@@ -225,13 +225,16 @@ Then open http://localhost:8081
 cd services/control-plane
 
 # Run all tests (unit + integration)
-go test ./...
+# -p 1 is required for anything touching PostgreSQL or NATS — see
+# [internal]rules/tests.md § What `-p 1` is actually for. Without it, concurrent
+# package binaries contend on the shared test database and fail widely.
+go test -p 1 ./...
 
 # Run with race detection (recommended)
-go test -race ./...
+go test -race -p 1 ./...
 
 # Run with coverage report
-go test -coverprofile=coverage.out ./...
+go test -p 1 -coverprofile=coverage.out ./...
 go tool cover -func=coverage.out     # Terminal summary
 go tool cover -html=coverage.out     # Browser report
 
@@ -244,11 +247,55 @@ go test ./internal/auth/ -run "TestHashPassword|TestValidatePassword|TestValidat
 go test ./pkg/config/...
 
 # Run integration tests (requires PostgreSQL + Redis via Docker)
-go test ./internal/auth/ -run "Integration"
-go test ./internal/servers/... ./internal/channels/... ./internal/messages/...
+# -p 1 for the same reason as above — these touch the shared PostgreSQL.
+go test -p 1 ./internal/auth/ -run "Integration"
+go test -p 1 ./internal/servers/... ./internal/channels/... ./internal/messages/...
 ```
 
 Integration tests use the `testhelpers` package. It auto-connects to PostgreSQL and Redis, runs migrations, and creates user, server, and channel helpers. See `services/control-plane/tests/README.md` for details.
+
+**Redis is isolated per test process, automatically.** Each `go test` process
+allocates its own Redis logical database, so two worktrees — or two package
+binaries in one run — cannot flush each other's keys. You do not need to set
+anything, and there is nothing to forget. Full convention in
+[`[internal]rules/tests.md`](../[internal]rules/tests.md) § Test isolation.
+
+One thing worth knowing: `CONCORD_TEST_REDIS_DB=<n>` pins one index and skips
+allocation, for inspecting a specific database while debugging. It **disables**
+isolation rather than redirecting it, and in a way that reaches further than it
+first looks: skipping allocation also skips the ticket, so the pinned index is
+never reserved. A pinned process therefore collides not only with another
+process sharing the same pin, but with any ordinary unpinned process the
+allocator happens to hand that same index — and neither can tell, because both
+computed it legitimately and `Reset` permits each to flush the other. Export it
+for one foreground command, never in a shell you then run a second `go test`
+from; if you need a pin while other tests are running, point that run at its own
+Redis instance. `0` and any non-positive value are rejected; `0` holds the
+allocator's counter and the dev app's own data.
+
+The pool is `databases - 1`, read live from the server with a fallback of 15 —
+so 15 usable indices against a stock Redis. Isolation holds while the number of
+test processes **simultaneously live** stays inside that pool; past it the
+allocator wraps and hands a second process an index the first is still using,
+and they flush each other exactly as they did before #2680. `-p 1` and the
+handful of worktrees one machine realistically runs keep this well out of reach,
+but it is the ceiling: a large parallel fan-out, or many concurrent worktrees,
+needs separate Redis instances rather than a bigger pool.
+
+There is deliberately no runtime wrap warning, which is a different question
+from the ceiling above. The ticket counts *cumulative* allocations rather than
+concurrent ones, and one full suite takes ~60 of them, so such a warning would
+be permanently true after the first ordinary run and would then fire forever
+while telling you nothing about whether anything is actually colliding.
+
+**PostgreSQL is not isolated the same way.** All test processes share one
+database, and the advisory lock guarding it is held only for each test's
+setup→cleanup window — so a concurrent worktree's cleanup can truncate rows your
+test is still using, **at any migration version**. Matching migration counts does
+not prevent this; it only prevents the separate schema-divergence hazard. Give the
+second worktree its own `DATABASE_URL`, or run the two serially. See the same
+rules file, and [#2790](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2790)
+for the fix.
 
 ### Media Plane
 

@@ -8,25 +8,22 @@ import (
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestDMVoiceCallLeaseVerifierMatchesOnlyTheCurrentExactLease(t *testing.T) {
-	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
-		redisURL = "redis://:concord_dev_redis@localhost:6379" //nolint:gosec // local test-only default
-	}
-	redisOptions, err := redis.ParseURL(redisURL)
-	require.NoError(t, err)
-	redisOptions.DB = 15
-	redisClient := redis.NewClient(redisOptions)
+	// The DB index is allocated per process by redistest (#2680); the hand-pinned
+	// DB 15 this used to carry was shared with every other concurrent test binary.
+	redisClient := redistest.Client(t)
 	t.Cleanup(func() {
-		_ = redisClient.FlushDB(context.Background()).Err()
-		_ = redisClient.Close()
+		// Reported, not discarded — a swallowed cleanup failure leaves lease keys
+		// for the next test in this package.
+		assert.NoError(t, redistest.Reset(context.Background(), redisClient))
 	})
-	require.NoError(t, redisClient.FlushDB(context.Background()).Err())
+	require.NoError(t, redistest.Reset(context.Background(), redisClient))
 	conversationID := uuid.New()
 	callID := uuid.New()
 	require.NoError(t, dm.RefreshDMVoiceCallLease(

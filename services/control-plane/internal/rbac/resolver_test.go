@@ -375,7 +375,11 @@ func TestResolveEffectivePermissionsUncachedUsesSingleSnapshot(t *testing.T) {
 			  AND query LIKE '%channel_permission_overrides%'
 		)`).Scan(&waiting)
 		return err == nil && waiting
-	}, time.Second, 10*time.Millisecond, "permission snapshot should wait for channel overrides")
+		// 5s, not 1s (#2680): this polls pg_stat_activity for a CROSS-PROCESS lock
+		// wait, so the budget has to cover another backend's scheduling, not just
+		// this goroutine's. One second was thin on a loaded machine even with the
+		// Redis interference removed. Poll interval is unchanged.
+	}, 5*time.Second, 10*time.Millisecond, "permission snapshot should wait for channel overrides")
 
 	_, err = ts.DB.Exec(
 		`DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3`,

@@ -2,76 +2,35 @@ package testhelpers
 
 import (
 	"context"
-	"os"
-	"strings"
 	"testing"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 )
 
-var defaultTestRedisURL = "redis://:" + testRedisVal + "@localhost:6379" //nolint:gosec // matches docker-compose dev default
-
-var testRedisVal = "concord_dev_redis" //nolint:gosec // dev-only default
-
-// SetupTestRedis creates a Redis client isolated from dev data by default.
+// SetupTestRedis returns a Redis client scoped to THIS PROCESS's own logical
+// database. The signature is unchanged from the pre-#2680 helper so that the
+// ~140 call sites did not have to move.
+//
+// The previous implementation pinned DB 1 whenever REDIS_URL was unset and
+// honoured the URL's own DB when it was set. Both branches are deleted. The
+// conditional was the defect: CI sets REDIS_URL (build.yml:423) with no DB
+// segment, so CI got DB 0 for every package and zero isolation, while local
+// runs got DB 1 for every package and zero isolation. The override is now
+// unconditional — an explicit DB in REDIS_URL is advisory and is replaced.
 func SetupTestRedis(t *testing.T) (*redis.Client, func()) {
 	t.Helper()
 
-	redisURL := os.Getenv("REDIS_URL")
-	useDefaultDB := redisURL == ""
-	if useDefaultDB {
-		redisURL = defaultTestRedisURL
+	client := redistest.Client(t)
+
+	if err := redistest.Reset(context.Background(), client); err != nil {
+		t.Fatalf("testhelpers: failed to reset the allocated test redis DB: %v", err)
 	}
 
-	opts, err := redis.ParseURL(redisURL)
-	if err != nil {
-		t.Fatalf("testhelpers: failed to parse redis URL: %v", err)
-	}
-
-	// Use DB 1 for the default dev URL; honor explicit REDIS_URL DBs for isolated runs.
-	if useDefaultDB {
-		opts.DB = 1
-	}
-
-	client := redis.NewClient(opts)
-
-	ctx := context.Background()
-	if err := client.Ping(ctx).Err(); err != nil {
-		t.Fatal(pingFailureMessage(err))
-	}
-
-	if err := flushTestRedis(ctx, client); err != nil {
-		t.Fatalf("testhelpers: failed to flush redis: %v", err)
-	}
-
-	cleanup := func() {
-		_ = client.Close()
-	}
+	// redistest.Client already registers t.Cleanup for Close; the returned
+	// closure stays for call-site compatibility and is safe to call twice.
+	cleanup := func() { _ = client.Close() }
 
 	return client, cleanup
-}
-
-// pingFailureMessage explains a failed test-Redis ping. Auth failures get their
-// own message because docker-compose starts Redis with --requirepass, so an
-// uncredentialed (NOAUTH) or stale-password (WRONGPASS) REDIS_URL fails every
-// Redis-backed test identically and the bare driver error names no cause.
-//
-// redis.IsAuthError is the authoritative check — it covers NOAUTH, WRONGPASS and
-// "unauthenticated", and unwraps. The string fallback exists because it matches
-// on redis' own error TYPES, which callers cannot construct: proto.RedisError is
-// internal, so the unit tests can only reach this branch by content.
-//
-// Never echo the URL — it carries a password.
-func pingFailureMessage(err error) string {
-	msg := err.Error()
-	if redis.IsAuthError(err) || strings.Contains(msg, "NOAUTH") || strings.Contains(msg, "WRONGPASS") {
-		return "testhelpers: redis rejected the connection (auth failed). REDIS_URL must carry the " +
-			"docker-compose REDIS_PASSWORD and select DB 1, e.g. " +
-			"redis://:<password>@localhost:6379/1 — see docs/development.md"
-	}
-	return "testhelpers: failed to ping redis: " + msg
-}
-
-func flushTestRedis(ctx context.Context, client *redis.Client) error {
-	return client.Do(ctx, "FLUSHDB", "SYNC").Err()
 }

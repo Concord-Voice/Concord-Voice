@@ -8,7 +8,8 @@ Test suite for the Concord Voice Control Plane service (Go).
 internal/
 ├── testhelpers/                    # Shared test infrastructure
 │   ├── testdb.go                   # SetupTestDB, TruncateAllTables, RunMigrations
-│   ├── testredis.go                # SetupTestRedis (DB index 1, FLUSHDB cleanup)
+│   ├── testredis.go                # SetupTestRedis — delegates to redistest/
+│   ├── redistest/                  # Per-process Redis logical-DB allocator (#2680)
 │   ├── testserver.go               # TestServer with CreateTestUser/Server/Channel helpers
 │   └── fixtures.go                 # TestUser struct, E2EETestKeys, ValidCiphertext
 ├── auth/
@@ -149,7 +150,7 @@ go tool cover -html=coverage.out  # Open in browser
 
 **SetupTestDB(t)** — Connects to PostgreSQL via the `DATABASE_URL` env var (default: localhost). Runs all migrations. Returns a DB handle plus a cleanup function that truncates all tables.
 
-**SetupTestRedis(t)** — Connects to Redis via `REDIS_URL` env var, uses DB index 1 for isolation, cleanup calls FLUSHDB.
+**SetupTestRedis(t)** — Delegates to `internal/testhelpers/redistest`, which allocates **this OS process** its own Redis logical database (never DB 0). The signature is unchanged. Cleanup closes the client; where a test needs an explicit flush use `redistest.Reset(ctx, c)` — a direct `FlushDB`/`FlushAll` is rejected by pre-commit and by CI.
 
 **SetupTestServer(t)** — Creates a full test server with Gin router, Hub, DB, Redis, and JWT secret. It offers these convenience methods:
 - `CreateTestUser(t, username)` — Inserts user with pre-computed Argon2id hash (avoids ~100ms per user), generates JWT
@@ -173,12 +174,16 @@ docker-compose up -d postgres redis
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | `postgres://concord:concord_dev_password@localhost:5432/concord?sslmode=disable` | Test database |
-| `REDIS_URL` | `redis://:concord_dev_redis@localhost:6379/1` | Test Redis. Must carry the compose `REDIS_PASSWORD`, or every Redis-backed test fails with `NOAUTH`/`WRONGPASS`. **Keep the `/1`** — see below |
+| `REDIS_URL` | `redis://:concord_dev_redis@localhost:6379` | Test Redis. Must carry the compose `REDIS_PASSWORD`, or every Redis-backed test fails with `NOAUTH`/`WRONGPASS`. The DB segment is ignored — see below |
 
-> **The `/1` is load-bearing.** `SetupTestRedis` forces DB 1 only when `REDIS_URL` is *unset*. When it is set, the
-> DB comes from the URL, and a URL with no path selects DB **0**. The helper then runs `FLUSHDB`, so a
-> `REDIS_URL` without `/1` wipes your development keyspace. This bites hardest if you export `REDIS_URL` for the
-> control-plane service (where DB 0 is correct) and then run the tests in the same shell.
+> **The DB segment is advisory (#2680).** Each `go test` process allocates its own Redis logical database via
+> `internal/testhelpers/redistest`, which rewrites whatever index the URL names (path *or* `?db=` query param) and
+> never allocates DB 0. Host and credentials are honoured; the index is not.
+>
+> This inverts the previous guidance, which told you to keep a `/1` suffix because the helper honoured the URL's own
+> DB and would otherwise `FLUSHDB` your development keyspace on DB 0. That is no longer true in either direction:
+> the pin is gone, and exporting `REDIS_URL` for the control-plane service and then running tests in the same shell
+> is now safe.
 
 ## CI/CD
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,6 +21,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 )
 
 var (
@@ -31,13 +34,13 @@ const (
 	msgTypeDM = "dm_message"
 )
 
-// hubTestDBPassword / hubTestRedisPassword mirror the assembled-from-parts
-// pattern in testhelpers/testdb.go to satisfy static credential analysis
+// hubTestDBPassword mirrors the assembled-from-parts pattern in
+// testhelpers/testdb.go to satisfy static credential analysis
 // (Semgrep "Hard-Coded Credentials in Postgres", SonarCloud S6698/S2068).
-// These are dev-only defaults that match docker-compose; production
-// always sets DATABASE_URL / REDIS_URL via env.
+// It is a dev-only default that matches docker-compose; production
+// always sets DATABASE_URL via env. The Redis counterpart is gone —
+// redistest owns Redis URL resolution now (#2680).
 var hubTestDBPassword = "concord_dev_password" //nolint:gosec // matches docker-compose dev default // pragma: allowlist secret
-var hubTestRedisPassword = "concord_dev_redis" //nolint:gosec // matches docker-compose dev default // pragma: allowlist secret
 
 // hubTestMigrationsPath resolves the absolute path to the migrations directory
 // using runtime.Caller, matching the pattern in testhelpers/testdb.go.
@@ -102,28 +105,41 @@ func setupHubTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
+// setupHubTestRedis returns a client on this process's own allocated logical
+// database (#2680). The DB-1 pin it replaced was shared by every package binary
+// in a run and by every concurrent worktree, so both flushes below could reach
+// another process's live fixtures; redistest.Reset refuses any database this
+// process does not own.
 func setupHubTestRedis(t *testing.T) *redis.Client {
 	t.Helper()
-	redisURL := os.Getenv("REDIS_URL")
-	useDefaultDB := redisURL == ""
-	if useDefaultDB {
-		redisURL = "redis://:" + hubTestRedisPassword + "@localhost:6379" //nolint:gosec
-	}
-	opts, err := redis.ParseURL(redisURL)
-	if err != nil {
-		t.Fatalf("hub_epoch_test: failed to parse redis URL: %v", err)
-	}
-	// Use DB 1 for the default dev URL; honor explicit REDIS_URL DBs for isolated runs.
-	if useDefaultDB {
-		opts.DB = 1
-	}
-	client := redis.NewClient(opts)
+	client := redistest.Client(t)
 	ctx := context.Background()
-	require.NoError(t, client.Ping(ctx).Err(), "hub_epoch_test: failed to ping redis")
-	require.NoError(t, client.FlushDB(ctx).Err(), "hub_epoch_test: failed to flush redis DB")
+	require.NoError(t, redistest.Reset(ctx, client), "hub_epoch_test: failed to reset redis DB")
+
 	t.Cleanup(func() {
-		_ = client.FlushDB(ctx).Err()
-		_ = client.Close()
+		// Reported, not discarded: Reset fails closed when the client's DB or
+		// server does not match this process's allocation, and swallowing that is
+		// what hid the guard refusals this assertion exists to catch.
+		//
+		// redis.ErrClosed is the one tolerated error. Several tests here close
+		// `client` mid-test on purpose to exercise the fail-closed paths against a
+		// dead Redis. Closing a client releases LOCAL resources only, so keys that
+		// test wrote do survive on the server — but **the setup Reset above, not
+		// this one, is what guarantees isolation**: every test entering through
+		// this helper flushes first, so a leaked key is cleared by the next test's
+		// setup rather than inherited. Cleanup here is opportunistic.
+		//
+		// Two stronger forms were tried and rejected, both measured: allocating a
+		// fresh client inside this closure took the package from 2 failures to 15,
+		// and opening a second client at setup left it at 13 — each extra
+		// connection and cleanup entry widens the window on the shared-Postgres
+		// TRUNCATE deadlock this package already flakes on (#2790). Making the
+		// suite flaky to close a leak the next setup already closes is a bad trade.
+		err := redistest.Reset(ctx, client)
+		if errors.Is(err, redis.ErrClosed) {
+			return
+		}
+		assert.NoError(t, err, "hub_epoch_test: cleanup reset failed")
 	})
 	return client
 }

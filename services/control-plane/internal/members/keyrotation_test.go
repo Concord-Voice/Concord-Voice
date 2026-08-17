@@ -1,7 +1,6 @@
 package members
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -20,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -34,11 +34,11 @@ var (
 	krMigrateErr  error
 )
 
-// krTestDBPassword / krTestRedisPassword mirror the assembled-from-parts pattern in
-// testhelpers/testdb.go to satisfy static credential analysis (S6698/S2068). Dev-only
-// defaults matching docker-compose; production always sets DATABASE_URL / REDIS_URL.
+// krTestDBPassword mirrors the assembled-from-parts pattern in
+// testhelpers/testdb.go to satisfy static credential analysis (S6698/S2068). It is a
+// dev-only default matching docker-compose; production always sets DATABASE_URL.
+// The Redis counterpart is gone — redistest owns Redis URL resolution (#2680).
 var krTestDBPassword = "concord_dev_password" //nolint:gosec // matches docker-compose dev default // pragma: allowlist secret
-var krTestRedisPassword = "concord_dev_redis" //nolint:gosec // matches docker-compose dev default // pragma: allowlist secret
 
 func krMigrationsPath() string {
 	_, filename, _, _ := runtime.Caller(0)
@@ -93,25 +93,13 @@ func krSetupDB(t *testing.T) *sql.DB {
 	return db
 }
 
+// krSetupRedis returns a client on this process's own allocated logical database
+// (#2680). The DB-1 pin it replaced was the same index every other package
+// binary and every concurrent worktree used, so a sibling package's flush could
+// erase these fixtures mid-test.
 func krSetupRedis(t *testing.T) *redis.Client {
 	t.Helper()
-	redisURL := os.Getenv("REDIS_URL")
-	useDefaultDB := redisURL == ""
-	if useDefaultDB {
-		redisURL = "redis://:" + krTestRedisPassword + "@localhost:6379" //nolint:gosec
-	}
-	opts, err := redis.ParseURL(redisURL)
-	if err != nil {
-		t.Fatalf("keyrotation_test: failed to parse redis URL: %v", err)
-	}
-	if useDefaultDB {
-		opts.DB = 1 // matches testhelpers default test-isolation DB index
-	}
-	client := redis.NewClient(opts)
-	ctx := context.Background()
-	require.NoError(t, client.Ping(ctx).Err(), "keyrotation_test: failed to ping redis")
-	t.Cleanup(func() { _ = client.Close() })
-	return client
+	return redistest.Client(t)
 }
 
 // newKeyRotationHandler wires a members.Handler to the integration DB/Redis/Hub.

@@ -32,13 +32,14 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
-// DB/Redis setup is self-contained (NOT via testhelpers) to avoid the import cycle
+// DB setup is self-contained (NOT via testhelpers) to avoid the import cycle
 // age <- testhelpers <- api <- age. Mirrors internal/websocket/hub_epoch_test.go.
+// Redis comes from redistest, a LEAF package that cannot cycle (#2680).
 const ageITDBPassword = "concord_dev_password" //nolint:gosec // docker-compose dev default // pragma: allowlist secret
-const ageITRedisPassword = "concord_dev_redis" //nolint:gosec // docker-compose dev default // pragma: allowlist secret
 
 var (
 	ageMigrateOnce sync.Once
@@ -131,14 +132,10 @@ func setupAgeIT(t *testing.T, withKey bool) (*ageITEnv, func()) {
 	ageMigrateOnce.Do(func() { ageMigrateErr = ageRunMigrations(db) })
 	require.NoError(t, ageMigrateErr)
 
-	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
-		redisURL = "redis://:" + ageITRedisPassword + "@localhost:6379"
-	}
-	opts, err := redis.ParseURL(redisURL)
-	require.NoError(t, err)
-	rdb := redis.NewClient(opts)
-	require.NoError(t, rdb.Ping(t.Context()).Err(), "age integration tests require Redis")
+	// This process's own allocated logical database (#2680). The URL this
+	// replaced carried no path segment, so go-redis resolved it to DB 0 — the
+	// dev app's live database.
+	rdb := redistest.Client(t)
 
 	key := sharedTestKey(t)
 	userID := uuid.New().String()
