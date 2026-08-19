@@ -1,6 +1,11 @@
 # Admin Portal build stage. This is the reviewed node:24-alpine multi-platform
 # index; the named admin_ui context keeps the primary Go context narrow.
-FROM node@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS admin-ui-builder
+# The `node:24-alpine` tag component is load-bearing, not decorative: a bare
+# `FROM node@sha256:` gives Dependabot no variant to anchor on, so it resolves
+# the default tag (`node:latest`, currently Debian-based `node:26`). PR #2800
+# did exactly that -- swapping this stage to a 443 MB Debian image with nothing
+# in the diff to show it. Keep tag+digest together on every bump.
+FROM node:24-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS admin-ui-builder
 
 WORKDIR /src
 COPY --from=admin_ui package.json package-lock.json ./
@@ -35,8 +40,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main ./cmd/server
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o migrate-media ./cmd/migrate-media
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mfa-rekey ./cmd/mfa-rekey
 
-# Final stage
-FROM alpine:3.21
+# Final stage. Tracks the supported Alpine line -- 3.21 reaches EOL 2026-11-01.
+FROM alpine:3.24
 
 LABEL org.opencontainers.image.source="https://github.com/Concord-Voice/Concord-Voice-Alpha"
 LABEL org.opencontainers.image.description="Concord Voice control-plane service"
