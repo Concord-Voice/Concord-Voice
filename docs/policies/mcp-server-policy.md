@@ -20,7 +20,7 @@ This policy defines the approved MCP server allowlist, the vetting process for a
 
 | Server | Maintainer | Status | Data Access | Network Access | Credentials Required | Risk Level | Notes |
 |---|---|---|---|---|---|---|---|
-| SonarQube (SonarSource) | SonarSource | Approved | Code quality metrics, issues, hotspots via SonarQube Cloud/Server API | Yes -- SonarQube Cloud (sonarcloud.io) | `SONARQUBE_TOKEN`, `SONARQUBE_ORG`, `SONARQUBE_URL` env vars | Medium | Actively used for quality gate enforcement. Delivered as the canonical SonarSource Docker image (`docker.io/mcp/sonarqube`); migrated from the earlier community npm fork in issue #431. Source-available (SSAL v1.0). Collects anonymous telemetry (no source code). Repo: [SonarSource/sonarqube-mcp-server](https://github.com/SonarSource/sonarqube-mcp-server). See §8 for integration notes (credential inheritance, state machine gotcha). |
+| SonarQube (SonarSource) | SonarSource | Approved | Code quality metrics, issues, hotspots via SonarQube Cloud/Server API | Yes -- SonarQube Cloud (sonarcloud.io) | Claude Code: `sonar auth login` → macOS Keychain. VS Code native MCP + Codex: `SONARQUBE_TOKEN`, `SONARQUBE_ORG`, `SONARQUBE_URL` env vars | Medium | Actively used for quality gate enforcement. Delivered as the canonical SonarSource Docker image (`docker.io/mcp/sonarqube`); migrated from the earlier community npm fork in issue #431. **Claude Code launches that same image through `sonarqube-cli` (`sonar run mcp`) rather than a `.mcp.json` entry**, so its credential never enters a process env — see §8. Source-available (SSAL v1.0). Collects anonymous telemetry (no source code). Repo: [SonarSource/sonarqube-mcp-server](https://github.com/SonarSource/sonarqube-mcp-server). See §8 for integration notes (credential surfaces, state machine gotcha). |
 | Context7 | Upstash | Approved | Read-only library/framework documentation from Context7 database | Yes -- context7.com API | API key (optional, for rate limits) | Low | Read-only documentation lookups. No code or project data sent. Open source, MIT. Repo: [upstash/context7](https://github.com/upstash/context7). |
 | Pylance MCP | Microsoft | Approved | Local Python source files (type analysis, completions, diagnostics) | No | None | Low | Runs locally as part of VS Code Pylance extension. No network requests. Proprietary (closed source), but core type engine (Pyright) is open source. Issue tracker: [microsoft/pylance-release](https://github.com/microsoft/pylance-release). |
 | Playwright | Microsoft | Approved | Local browser automation via accessibility trees; filesystem restricted to workspace root by default | Configurable -- can reach any URL the browser navigates to | None | Medium | Used for local testing only. Open source, Apache-2.0. DNS rebinding vulnerability (pre-v0.0.40) patched; ensure version >= 0.0.40. Supports origin allow/blocklists. Repo: [microsoft/playwright-mcp](https://github.com/microsoft/playwright-mcp). |
@@ -37,7 +37,7 @@ This policy defines the approved MCP server allowlist, the vetting process for a
 
 Approved MCP servers are configured in three committed files at the project root, one per host:
 
-- **`.mcp.json`** — Claude Code App + Claude Code CLI + Claude Code VS Code extension (the embedded-agent surface). Credentials come from process env (set via shell `export` for CLI, `launchctl setenv` for App + VS Code extension; see §8).
+- **`.mcp.json`** — Claude Code App + Claude Code CLI + Claude Code VS Code extension (the embedded-agent surface). Credentials come from process env (set via shell `export` for CLI, `launchctl setenv` for App + VS Code extension; see §8). **SonarQube is deliberately not in this file** — it is a user-scope `sonar run mcp` server whose credential lives in the macOS Keychain; see §8.
 - **`.vscode/mcp.json`** — VS Code's native MCP integration (the chat-panel surface). Credentials come from `${input:VAR}` prompts that store secrets in VS Code's secret store. The `.gitignore` carves both `mcp.json` and `extensions.json` out of the broad `.vscode/` ignore.
 - **`.codex/config.toml`** — Codex App/CLI project MCP. Credentials come from the Codex process environment for servers that declare `env_vars`.
 
@@ -47,11 +47,23 @@ These files use only vetted server implementations from §2. Do not substitute a
 
 | Server | Approved Package | Version | Credentials |
 | ------ | ---------------- | ------- | ----------- |
-| SonarQube | `docker.io/mcp/sonarqube` (canonical SonarSource Docker image) | `latest` | `SONARQUBE_TOKEN` env var only (see §8 for inheritance). `SONARQUBE_ORG` (`concord-voice`) and `SONARQUBE_URL` (`https://sonarcloud.io`) are hardcoded in `.mcp.json` since they are non-secret public values; this also avoids `${VAR}` literal-passthrough when launchd env is unset |
 | Context7 | `@upstash/context7-mcp` (Upstash) | 2.1.6 | None (optional API key for rate limits) |
 | Playwright | `@playwright/mcp` (Microsoft) | 0.0.70 | None |
 | GitHub | `@modelcontextprotocol/server-github` | 2025.4.8 | `GITHUB_PERSONAL_ACCESS_TOKEN` — use fine-grained PAT with minimum scope (note: in `.mcp.json` this env var is read from `${ADMIN_PAT}` in the shell/launchd env — set `ADMIN_PAT`, not `GITHUB_PERSONAL_ACCESS_TOKEN`, via `export` for CLI or `launchctl setenv ADMIN_PAT ...` for App + extension) |
 | Stripe | `@stripe/mcp` (Stripe) | 0.3.3 | `STRIPE_SECRET_KEY` — **restricted test-mode keys only (`rk_test_*`)** |
+
+**SonarQube is intentionally absent from this table.** It is registered at *user* scope
+(`~/.claude.json`) by `sonar integrate claude --global`, which runs the same SonarSource
+image via `sonar run mcp` and reads its token from the macOS Keychain. Two reasons it must
+not also live in `.mcp.json`:
+
+1. **Scope precedence shadows it.** Claude Code resolves MCP servers local → project →
+   user, matching on server *name*. A `.mcp.json` entry named `sonarqube` silently wins
+   over the user-scope one, with no warning at any layer.
+2. **The project entry cannot authenticate in a worktree.** It depends on `SONARQUBE_TOKEN`
+   being present in the process env. Sessions run from `[internal]worktrees/*` routinely have
+   no such env, so the server binds and then fails `CONNECTION_CLOSED`. The user-scope
+   Keychain entry has no env dependency and therefore works in every repo and worktree.
 
 ### Servers in `.vscode/mcp.json` (VS Code native MCP integration)
 
@@ -69,11 +81,19 @@ These files use only vetted server implementations from §2. Do not substitute a
 
 | Server | Approved Package | Version | Credentials |
 | ------ | ---------------- | ------- | ----------- |
-| SonarQube | `docker.io/mcp/sonarqube` (canonical SonarSource Docker image) | `latest` | `SONARQUBE_TOKEN` env var only. `SONARQUBE_ORG` (`concord-voice`) and `SONARQUBE_URL` (`https://sonarcloud.io`) are hardcoded since they are non-secret public values |
 | Context7 | `@upstash/context7-mcp` (Upstash) | 2.1.6 | None |
 | Playwright | `@playwright/mcp` (Microsoft) | 0.0.70 | None |
 | GitHub | `@modelcontextprotocol/server-github` | 2025.4.8 | `GITHUB_PERSONAL_ACCESS_TOKEN` — use a fine-grained PAT with minimum scope |
 | Stripe | `@stripe/mcp` (Stripe) | 0.3.3 | `STRIPE_SECRET_KEY` — **restricted test-mode keys only (`rk_test_*`)** |
+
+**SonarQube is absent here too, and not by choice.** `scripts/sync-codex-tooling.py`
+enforces MCP-*name* parity between `.codex/config.toml` and `.mcp.json` (it compares
+`set(claude_mcp) != set(codex_mcp)`, then `command`/`args` for shared names). Dropping
+SonarQube from `.mcp.json` therefore requires dropping it here in the same commit, or
+the `check-codex-mirrors` pre-commit hook fails. Restore the capability at user scope
+with `sonar integrate codex --global`, which uses the same Keychain credential as the
+Claude Code path. Note this coupling does **not** extend to `.vscode/mcp.json`, which
+the parity check does not read — that surface keeps its own Docker entry.
 
 ### Why separate configs?
 
@@ -144,7 +164,26 @@ All MCP server credential assignments must follow these rules:
 
 ## 8. SonarQube Integration Notes & Credential-Surface Taxonomy
 
-The canonical SonarQube MCP integration is the SonarSource-published Docker image (`docker.io/mcp/sonarqube`). It exposes the `change_sonar_issue_status`, `search_sonar_issues_in_projects`, and related tools that all our MCP host runtimes (Claude Code App + CLI + VS Code extension, VS Code native MCP, and Codex App/CLI) consume. **See §3 for the per-host server inventory: which servers live in `.mcp.json`, `.vscode/mcp.json`, and `.codex/config.toml`.**
+The canonical SonarQube MCP integration is the SonarSource-published Docker image (`docker.io/mcp/sonarqube`). It exposes the `change_sonar_issue_status`, `search_sonar_issues_in_projects`, and related tools that all our MCP host runtimes (Claude Code App + CLI + VS Code extension, VS Code native MCP, and Codex App/CLI) consume. The hosts differ only in **how they launch it**: VS Code native MCP and Codex declare the image directly, while Claude Code launches it through `sonarqube-cli` (`sonar run mcp`), which detects the container runtime and supplies the token from the macOS Keychain. **See §3 for the per-host server inventory: which servers live in `.mcp.json`, `.vscode/mcp.json`, and `.codex/config.toml`.**
+
+### Claude Code setup (`sonarqube-cli`)
+
+```bash
+brew install --cask sonarqube-cli
+sonar auth login -o concord-voice
+sonar integrate claude --global
+```
+
+`sonar auth status` verifies the connection. Two caveats learned on 2026-08-19:
+
+- **`--global` still writes a project-local entry.** Despite the flag, `integrate` auto-discovers the
+  nearest project and adds a *local*-scope `sonarqube` server to `~/.claude.json` pointing at
+  `https://api.sonarcloud.io/mcp` with a **plaintext `Authorization: Bearer` header**. That entry
+  outranks both project and user scope. Remove it — `claude mcp remove sonarqube -s local` — so the
+  Keychain-backed user-scope entry is the one that binds.
+- **`claude mcp get sonarqube` prints that bearer token in cleartext.** SonarCloud tokens can be bare
+  40-char hex with no `sq*_` prefix, so prefix-based redaction does not catch them. Redact on length
+  or entropy before pasting MCP config anywhere, and rotate any token that has been echoed.
 
 ### Credential mechanism per surface
 
@@ -157,21 +196,22 @@ Concord developers run MCPs from three operationally-distinct surfaces, each wit
 | **Claude Code App** (standalone `.app`) | `launchctl setenv VAR ...` (one-time) or LaunchAgent plist (persistent) | launchd env (process-wide — visible to **every GUI app the user launches** for the session, not just Claude Code) | Acceptable, but the launchd-env exposure is the textbook OWASP A02 misconfiguration — see "Rule of thumb" below |
 | **Claude Code VS Code extension** (embedded agent reading `.mcp.json`) | Same as Claude Code App: `launchctl setenv` (the extension inherits VS Code's process env, which inherits launchd's) | launchd env (same exposure profile as Claude Code App) | Acceptable with same OWASP A02 caveat as Claude Code App |
 | **VS Code native MCP** (`.vscode/mcp.json`, the chat-panel surface) | `${input:VAR}` prompts → VS Code secret store | VS Code secret store (encrypted, scoped per-workspace × per-user; never enters any process env) | **Preferred** — strictest credential boundary |
+| **`sonarqube-cli`** (`sonar run mcp`, user-scope MCP — SonarQube only) | `sonar auth login` → macOS Keychain | macOS Keychain (per-user, OS-protected; never enters any process env, never written to a config file) | **Preferred for SonarQube** — the only surface with no env-var dependency, so it works identically in every repo and worktree |
 
-**Rule of thumb:** if a surface supports `${input}`, use it. `launchctl setenv` remains the only available mechanism for Claude Code App + VS Code extension, but it is no longer presented as the answer for VS Code native MCP work — `${input}` was always the right answer there.
+**Rule of thumb:** if a surface supports `${input}` or a keychain, use it. `launchctl setenv` remains the only available mechanism for the remaining env-var servers on Claude Code App + VS Code extension, but it is no longer the answer for VS Code native MCP (`${input}` always was) or for SonarQube (the CLI keychain is).
 
 ### One-time `launchctl` setup (for Claude Code App + VS Code extension)
 
-When a developer needs SonarQube tokens available to the Claude Code App or the Claude Code VS Code extension on macOS, the env vars must be set in launchd (since GUI apps don't inherit terminal shell env):
+Two `.mcp.json` servers still take credentials from the process env — GitHub (`ADMIN_PAT`) and Stripe (`STRIPE_SECRET_KEY`). For the Claude Code App or the Claude Code VS Code extension on macOS, these must be set in launchd, since GUI apps don't inherit terminal shell env:
 
 ```bash
-launchctl setenv SONARQUBE_TOKEN '<your sonarcloud token>'
-# SONARQUBE_ORG and SONARQUBE_URL are hardcoded in .mcp.json
-# (concord-voice and https://sonarcloud.io respectively).
-# Only the secret token needs to be in the launchd env.
+launchctl setenv ADMIN_PAT '<your fine-grained github pat>'
+launchctl setenv STRIPE_SECRET_KEY '<your rk_test_... restricted key>'
 ```
 
-Persistent across reboots: create a LaunchAgent plist at `~/Library/LaunchAgents/com.concord.sonarqube-env.plist` that runs `launchctl setenv` at login. Shell env (`export SONARQUBE_TOKEN=...` in `~/.zshrc`) does NOT work for GUI-launched apps — terminal env doesn't propagate to launchd-managed GUI processes.
+Persistent across reboots: create a LaunchAgent plist at `~/Library/LaunchAgents/com.concord.mcp-env.plist` that runs `launchctl setenv` at login. Shell env (`export ADMIN_PAT=...` in `~/.zshrc`) does NOT work for GUI-launched apps — terminal env doesn't propagate to launchd-managed GUI processes.
+
+**SonarQube no longer needs any of this.** `SONARQUBE_TOKEN` was the original reason this section existed; the CLI keychain path replaced it. A stale `launchctl setenv SONARQUBE_TOKEN` does no harm but has no effect — and note that its absence is exactly why a `.mcp.json` SonarQube entry failed to connect from worktrees.
 
 ### `${input}` setup (for VS Code native MCP)
 
