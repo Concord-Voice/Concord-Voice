@@ -187,8 +187,10 @@ describe('PresenceExceptions', () => {
     expect(screen.getByText('Exceptions - 2 people')).toBeInTheDocument();
     expect(document.body).not.toHaveTextContent(UUID_UNKNOWN);
     expect(document.body).not.toHaveTextContent(UUID_UNKNOWN_B);
-    expect(screen.getByRole('status')).toHaveTextContent(
-      'Removed exception for Unavailable person.'
+    await waitFor(() =>
+      expect(screen.getByRole('status')).toHaveTextContent(
+        'Removed exception for Unavailable person.'
+      )
     );
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'Remove unavailable person' })).toHaveFocus()
@@ -208,7 +210,9 @@ describe('PresenceExceptions', () => {
 
     await waitFor(() => expect(save).toHaveBeenCalledWith([UUID_B]));
     expect(screen.queryByText('Alex Rivera')).not.toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent('Removed exception for Alex Rivera.');
+    await waitFor(() =>
+      expect(screen.getByRole('status')).toHaveTextContent('Removed exception for Alex Rivera.')
+    );
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'Remove Bea Kim' })).toHaveFocus()
     );
@@ -225,7 +229,7 @@ describe('PresenceExceptions', () => {
 
     fireEvent.click(removeAlex);
 
-    await waitFor(() => expect(screen.queryByText('Alex Rivera')).not.toBeInTheDocument());
+    expect(screen.queryByText('Alex Rivera')).not.toBeInTheDocument();
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'Add exceptions' })).toHaveFocus()
     );
@@ -250,11 +254,16 @@ describe('PresenceExceptions', () => {
     );
     expect(save).toHaveBeenCalledTimes(1);
 
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Retry removal' })).toBeEnabled()
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Retry removal' }));
 
     await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
     expect(save).toHaveBeenLastCalledWith([UUID_B]);
-    expect(screen.getByRole('status')).toHaveTextContent('Removed exception for Alex Rivera.');
+    await waitFor(() =>
+      expect(screen.getByRole('status')).toHaveTextContent('Removed exception for Alex Rivera.')
+    );
   });
 
   it('turns an unexpected rejected removal into a retryable error', async () => {
@@ -278,7 +287,9 @@ describe('PresenceExceptions', () => {
 
     await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
     expect(save).toHaveBeenLastCalledWith([UUID_B]);
-    expect(screen.getByRole('status')).toHaveTextContent('Removed exception for Alex Rivera.');
+    await waitFor(() =>
+      expect(screen.getByRole('status')).toHaveTextContent('Removed exception for Alex Rivera.')
+    );
   });
 
   it('clears an older removal retry when opening a new editor intent', async () => {
@@ -290,6 +301,9 @@ describe('PresenceExceptions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Remove Alex Rivera' }));
     await screen.findByRole('button', { name: 'Retry removal' });
 
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Add exceptions' })).toBeEnabled()
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Add exceptions' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
 
@@ -312,7 +326,9 @@ describe('PresenceExceptions', () => {
     fireEvent.click(await screen.findByRole('checkbox', { name: /Alex Rivera/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Save exceptions' }));
     await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
-    expect(screen.getByRole('status')).toHaveTextContent('Saved Custom Status exceptions.');
+    await waitFor(() =>
+      expect(screen.getByRole('status')).toHaveTextContent('Saved Custom Status exceptions.')
+    );
 
     fireEvent.click(screen.getByRole('button', { name: 'Add exceptions' }));
     expect(screen.getByRole('status')).toBeEmptyDOMElement();
@@ -438,13 +454,18 @@ describe('PresenceExceptions', () => {
       usePresenceOverrideStore.getState().apply([UUID_B], 4);
       usePresenceOverrideStore.getState().setError('Failed to save presence exceptions');
     });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Retry removal' })).toBeEnabled()
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Retry removal' }));
 
     await waitFor(() => expect(usePresenceOverrideStore.getState().conflict).toBe(true));
     expect(save).toHaveBeenCalledTimes(1);
     expect(usePresenceOverrideStore.getState().excludedUserIds).toEqual([UUID_B]);
-    expect(screen.getByRole('alert')).toHaveTextContent(
-      'Exceptions changed on another device. Review the current list and try again.'
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        'Exceptions changed on another device. Review the current list and try again.'
+      )
     );
   });
 
