@@ -46,6 +46,11 @@ export default defineConfig(() => {
     test: {
       globals: true,
       environment: 'jsdom',
+      // Node 26 defines both storage globals -- `localStorage` as an accessor returning
+      // `undefined` without --localstorage-file (so .clear() throws), `sessionStorage` as
+      // a working in-memory Storage. Vitest's populateGlobal skips keys already on
+      // globalThis, so both shadow jsdom's real Storage. Node 24 (CI) defines neither.
+      execArgv: ['--no-experimental-webstorage'],
       setupFiles: ['./tests/setup.ts'],
       include: [
         'tests/**/*.test.{ts,tsx}',

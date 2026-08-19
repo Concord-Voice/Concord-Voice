@@ -16,7 +16,8 @@ See [SETUP_GITHUB.md](./SETUP_GITHUB.md) for full GitHub collaboration workflow.
 ### Required
 
 - **Node.js** 24+ and npm 10+ for the desktop and media-plane workspaces.
-  `client/admin` needs **Node.js 24.x**. Go-only work does not require Node.js
+  `client/admin` needs **Node.js >= 24.15.0** (Node 26 included). Go-only work
+  does not require Node.js
 - **Go** 1.26.1+
 - **Docker** and **Docker Compose**
 - **Git**
@@ -651,7 +652,7 @@ Recommended:
 ### Node.js
 
 - Use the Node.js version that each workspace's `package.json` declares. The
-  Admin Portal requires Node.js 24.x
+  Admin Portal requires Node.js >= 24.15.0, which includes Node 26
 - Enable V8 flags: `--max-old-space-size=4096`
 - Profile with Chrome DevTools
 

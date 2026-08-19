@@ -17,6 +17,11 @@ export default defineConfig({
         url: "http://localhost/admin/",
       },
     },
+    // Node 26 defines both storage globals -- `localStorage` as an accessor returning
+    // `undefined` without --localstorage-file (so .clear() throws), `sessionStorage` as a
+    // working in-memory Storage. Vitest's populateGlobal skips keys already on globalThis,
+    // so both shadow jsdom's real Storage. Node 24 (CI) defines neither -- no-op there.
+    execArgv: ["--no-experimental-webstorage"],
     setupFiles: "./src/test/setup.ts",
     coverage: {
       provider: "istanbul",

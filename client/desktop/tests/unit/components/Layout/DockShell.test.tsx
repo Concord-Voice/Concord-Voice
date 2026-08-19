@@ -389,9 +389,14 @@ describe('DockShell', () => {
   });
 
   it('cleans up a pending pointer-leave timer on unmount', () => {
-    vi.useFakeTimers();
     useLayoutStore.setState({ sidebarProfiles: profiles(240, false) });
     const { container, unmount } = renderDock();
+
+    // Fake timers are installed here, not before the store write: jsdom's
+    // Storage.setItem schedules a setTimeout to dispatch the `storage` event,
+    // so a persisted setState above would add a timer that has nothing to do
+    // with the pointer-leave timer this test measures.
+    vi.useFakeTimers();
 
     fireEvent.mouseEnter(screen.getByRole('button', { name: 'Open Friends sidebar' }));
     fireEvent.mouseLeave(container.querySelector('.dock-shell__surface') as Element);
