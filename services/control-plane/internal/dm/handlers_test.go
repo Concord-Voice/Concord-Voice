@@ -318,7 +318,7 @@ func TestListConversations_Success(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conversations := body["conversations"].([]interface{})
+	conversations := jsonField[[]interface{}](t, body, "conversations")
 	assert.GreaterOrEqual(t, len(conversations), 1)
 }
 
@@ -331,7 +331,7 @@ func TestListConversations_Empty(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conversations := body["conversations"].([]interface{})
+	conversations := jsonField[[]interface{}](t, body, "conversations")
 	assert.Len(t, conversations, 0)
 }
 
@@ -347,11 +347,11 @@ func TestListConversations_IncludesParticipants(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conversations := body["conversations"].([]interface{})
+	conversations := jsonField[[]interface{}](t, body, "conversations")
 	require.Len(t, conversations, 1)
 
-	conv := conversations[0].(map[string]interface{})
-	participants := conv["participants"].([]interface{})
+	conv := jsonElem[map[string]interface{}](t, conversations, 0)
+	participants := jsonField[[]interface{}](t, conv, "participants")
 	assert.Len(t, participants, 2)
 }
 
@@ -369,11 +369,11 @@ func TestListConversations_WithLastMessage(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conversations := body["conversations"].([]interface{})
+	conversations := jsonField[[]interface{}](t, body, "conversations")
 	require.Len(t, conversations, 1)
 
-	conv := conversations[0].(map[string]interface{})
-	lm := conv["last_message"].(map[string]interface{})
+	conv := jsonElem[map[string]interface{}](t, conversations, 0)
+	lm := jsonField[map[string]interface{}](t, conv, "last_message")
 	assert.Equal(t, "hello there", lm["content"])
 	assert.Equal(t, user1.ID, lm["user_id"])
 }
@@ -395,10 +395,10 @@ func TestListConversations_WithLastCallEvent(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conversations := body["conversations"].([]interface{})
+	conversations := jsonField[[]interface{}](t, body, "conversations")
 	require.Len(t, conversations, 1)
 
-	lm := conversations[0].(map[string]interface{})["last_message"].(map[string]interface{})
+	lm := jsonField[map[string]interface{}](t, jsonElem[map[string]interface{}](t, conversations, 0), "last_message")
 	require.Equal(t, "call_event", lm["type"])
 	payloadResponse, ok := lm["call_event_payload"].(map[string]interface{})
 	require.True(t, ok, "call_event_payload is returned as an object")
@@ -423,9 +423,9 @@ func TestListConversations_UnreadCount(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conversations := body["conversations"].([]interface{})
+	conversations := jsonField[[]interface{}](t, body, "conversations")
 	require.Len(t, conversations, 1)
-	conv := conversations[0].(map[string]interface{})
+	conv := jsonElem[map[string]interface{}](t, conversations, 0)
 	assert.Equal(t, float64(3), conv["unread_count"])
 }
 
@@ -444,7 +444,7 @@ func TestListConversations_MultipleConversations(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conversations := body["conversations"].([]interface{})
+	conversations := jsonField[[]interface{}](t, body, "conversations")
 	assert.Len(t, conversations, 2)
 }
 
@@ -472,9 +472,9 @@ func TestGetConversation_Success(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conv := body["conversation"].(map[string]interface{})
+	conv := jsonField[map[string]interface{}](t, body, "conversation")
 	assert.Equal(t, convID, conv["id"])
-	participants := conv["participants"].([]interface{})
+	participants := jsonField[[]interface{}](t, conv, "participants")
 	assert.Len(t, participants, 2)
 }
 
@@ -538,7 +538,7 @@ func TestOpenConversation_Success(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conv := body["conversation"].(map[string]interface{})
+	conv := jsonField[map[string]interface{}](t, body, "conversation")
 	assert.NotEmpty(t, conv["id"])
 }
 
@@ -556,7 +556,7 @@ func TestOpenConversation_Idempotent(t *testing.T) {
 
 	var body1 map[string]interface{}
 	testhelpers.ParseJSON(t, w1, &body1)
-	conv1 := body1["conversation"].(map[string]interface{})
+	conv1 := jsonField[map[string]interface{}](t, body1, "conversation")
 
 	w2 := ts.DoRequest("POST", pathDMConversations, map[string]interface{}{
 		"user_id": user2.ID,
@@ -565,7 +565,7 @@ func TestOpenConversation_Idempotent(t *testing.T) {
 
 	var body2 map[string]interface{}
 	testhelpers.ParseJSON(t, w2, &body2)
-	conv2 := body2["conversation"].(map[string]interface{})
+	conv2 := jsonField[map[string]interface{}](t, body2, "conversation")
 
 	assert.Equal(t, conv1["id"], conv2["id"], "same conversation should be returned")
 }
@@ -965,12 +965,12 @@ func TestCreateGroup_Success(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conv := body["conversation"].(map[string]interface{})
+	conv := jsonField[map[string]interface{}](t, body, "conversation")
 	assert.NotEmpty(t, conv["id"])
 	assert.Equal(t, true, conv["is_group"])
 	assert.Equal(t, groupName, conv["name"])
 
-	participants := conv["participants"].([]interface{})
+	participants := jsonField[[]interface{}](t, conv, "participants")
 	assert.Len(t, participants, 3)
 }
 
@@ -987,8 +987,8 @@ func TestCreateGroup_NoName(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conv := body["conversation"].(map[string]interface{})
-	assert.True(t, conv["is_group"].(bool))
+	conv := jsonField[map[string]interface{}](t, body, "conversation")
+	assert.True(t, jsonField[bool](t, conv, "is_group"))
 }
 
 func TestCreateGroup_MissingUserIDs(t *testing.T) {
@@ -1229,7 +1229,7 @@ func TestUpdateConversation_RenameGroup(t *testing.T) {
 
 	var createBody map[string]interface{}
 	testhelpers.ParseJSON(t, w, &createBody)
-	convID := createBody["conversation"].(map[string]interface{})["id"].(string)
+	convID := jsonField[string](t, jsonField[map[string]interface{}](t, createBody, "conversation"), "id")
 
 	newName := "New Group Name"
 	w = ts.DoRequest("PATCH", pathDMConversationsPrefix+convID, map[string]interface{}{
@@ -1270,7 +1270,7 @@ func TestUpdateConversation_NotParticipant(t *testing.T) {
 
 	var createBody map[string]interface{}
 	testhelpers.ParseJSON(t, w, &createBody)
-	convID := createBody["conversation"].(map[string]interface{})["id"].(string)
+	convID := jsonField[string](t, jsonField[map[string]interface{}](t, createBody, "conversation"), "id")
 
 	w = ts.DoRequest("PATCH", pathDMConversationsPrefix+convID, map[string]interface{}{
 		"name": "Hacked Name",
@@ -1301,7 +1301,7 @@ func TestUpdateConversation_InvalidBody(t *testing.T) {
 
 	var createBody map[string]interface{}
 	testhelpers.ParseJSON(t, w, &createBody)
-	convID := createBody["conversation"].(map[string]interface{})["id"].(string)
+	convID := jsonField[string](t, jsonField[map[string]interface{}](t, createBody, "conversation"), "id")
 
 	// Send request with no JSON body
 	w = ts.DoRequest("PATCH", pathDMConversationsPrefix+convID, nil, testhelpers.AuthHeaders(user1.AccessToken))
@@ -1322,7 +1322,7 @@ func TestUpdateConversation_ClearName(t *testing.T) {
 
 	var createBody map[string]interface{}
 	testhelpers.ParseJSON(t, w, &createBody)
-	convID := createBody["conversation"].(map[string]interface{})["id"].(string)
+	convID := jsonField[string](t, jsonField[map[string]interface{}](t, createBody, "conversation"), "id")
 
 	// Setting name to null clears it
 	w = ts.DoRequest("PATCH", pathDMConversationsPrefix+convID, map[string]interface{}{
@@ -1350,7 +1350,7 @@ func TestGetMessages_Success(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	messages := body["messages"].([]interface{})
+	messages := jsonField[[]interface{}](t, body, "messages")
 	assert.Len(t, messages, 2)
 }
 
@@ -1366,7 +1366,7 @@ func TestGetMessages_Empty(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	messages := body["messages"].([]interface{})
+	messages := jsonField[[]interface{}](t, body, "messages")
 	assert.Len(t, messages, 0)
 }
 
@@ -1408,7 +1408,7 @@ func TestGetMessages_CursorPagination(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	messages := body["messages"].([]interface{})
+	messages := jsonField[[]interface{}](t, body, "messages")
 	// msg3 is the cursor, so we should get msg1 and msg2 (created before msg3)
 	assert.Equal(t, 2, len(messages))
 }
@@ -1438,10 +1438,10 @@ func TestGetMessages_MessageFields(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	messages := body["messages"].([]interface{})
+	messages := jsonField[[]interface{}](t, body, "messages")
 	require.Len(t, messages, 1)
 
-	msg := messages[0].(map[string]interface{})
+	msg := jsonElem[map[string]interface{}](t, messages, 0)
 	assert.NotEmpty(t, msg["id"])
 	assert.Equal(t, convID, msg["conversation_id"])
 	assert.Equal(t, user1.ID, msg["user_id"])
@@ -1601,9 +1601,9 @@ func TestMarkRead_ResetsUnreadCount(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	var listBody map[string]interface{}
 	testhelpers.ParseJSON(t, w, &listBody)
-	convs := listBody["conversations"].([]interface{})
+	convs := jsonField[[]interface{}](t, listBody, "conversations")
 	require.Len(t, convs, 1)
-	assert.Equal(t, float64(2), convs[0].(map[string]interface{})["unread_count"])
+	assert.Equal(t, float64(2), jsonElem[map[string]interface{}](t, convs, 0)["unread_count"])
 
 	// Mark as read
 	w = ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/read", nil, testhelpers.AuthHeaders(user1.AccessToken))
@@ -1613,9 +1613,9 @@ func TestMarkRead_ResetsUnreadCount(t *testing.T) {
 	w = ts.DoRequest("GET", pathDMConversations, nil, testhelpers.AuthHeaders(user1.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
 	testhelpers.ParseJSON(t, w, &listBody)
-	convs = listBody["conversations"].([]interface{})
+	convs = jsonField[[]interface{}](t, listBody, "conversations")
 	require.Len(t, convs, 1)
-	assert.Equal(t, float64(0), convs[0].(map[string]interface{})["unread_count"])
+	assert.Equal(t, float64(0), jsonElem[map[string]interface{}](t, convs, 0)["unread_count"])
 }
 
 // ============================================================================
@@ -1635,7 +1635,7 @@ func TestGetKeys_Success(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	key := body["key"].(map[string]interface{})
+	key := jsonField[map[string]interface{}](t, body, "key")
 	assert.Equal(t, convID, key["conversation_id"])
 	assert.Equal(t, user1.ID, key["user_id"])
 	assert.Equal(t, float64(1), key["key_version"])
@@ -1692,7 +1692,7 @@ func TestGetKeys_ReturnsLatestVersion(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	key := body["key"].(map[string]interface{})
+	key := jsonField[map[string]interface{}](t, body, "key")
 	assert.Equal(t, float64(3), key["key_version"])
 }
 
@@ -2159,7 +2159,7 @@ func TestAuthorizeVoiceJoin_Success(t *testing.T) {
 	assert.Equal(t, true, body["allowed"])
 	assert.NotNil(t, body["ice_servers"])
 
-	conv := body["conversation"].(map[string]interface{})
+	conv := jsonField[map[string]interface{}](t, body, "conversation")
 	assert.Equal(t, convID, conv["id"])
 }
 
@@ -2175,7 +2175,7 @@ func TestAuthorizeVoiceJoin_EncryptedConversation(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conv := body["conversation"].(map[string]interface{})
+	conv := jsonField[map[string]interface{}](t, body, "conversation")
 	assert.Equal(t, convID, conv["id"])
 }
 
@@ -2224,7 +2224,7 @@ func TestGetVoiceParticipants_EmptyList(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	participants := body["participants"].([]interface{})
+	participants := jsonField[[]interface{}](t, body, "participants")
 	assert.Len(t, participants, 0)
 }
 
@@ -2247,10 +2247,10 @@ func TestGetVoiceParticipants_WithParticipant(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	participants := body["participants"].([]interface{})
+	participants := jsonField[[]interface{}](t, body, "participants")
 	assert.Len(t, participants, 1)
 
-	p := participants[0].(map[string]interface{})
+	p := jsonElem[map[string]interface{}](t, participants, 0)
 	assert.Equal(t, user1.ID, p["user_id"])
 	assert.NotEmpty(t, p["username"])
 }
@@ -2288,12 +2288,12 @@ func TestGetOrCreatePersonalThread_Create(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conv := body["conversation"].(map[string]interface{})
+	conv := jsonField[map[string]interface{}](t, body, "conversation")
 	assert.NotEmpty(t, conv["id"])
 	assert.Equal(t, true, conv["is_personal"])
 	assert.Equal(t, false, conv["is_group"])
 
-	participants := conv["participants"].([]interface{})
+	participants := jsonField[[]interface{}](t, conv, "participants")
 	assert.Len(t, participants, 1, "personal thread should have only the creator")
 }
 
@@ -2307,7 +2307,7 @@ func TestGetOrCreatePersonalThread_Idempotent(t *testing.T) {
 
 	var body1 map[string]interface{}
 	testhelpers.ParseJSON(t, w1, &body1)
-	conv1ID := body1["conversation"].(map[string]interface{})["id"].(string)
+	conv1ID := jsonField[string](t, jsonField[map[string]interface{}](t, body1, "conversation"), "id")
 
 	// Second call returns existing
 	w2 := ts.DoRequest("POST", pathDMConversations+pathPersonal, nil, testhelpers.AuthHeaders(user.AccessToken))
@@ -2315,7 +2315,7 @@ func TestGetOrCreatePersonalThread_Idempotent(t *testing.T) {
 
 	var body2 map[string]interface{}
 	testhelpers.ParseJSON(t, w2, &body2)
-	conv2ID := body2["conversation"].(map[string]interface{})["id"].(string)
+	conv2ID := jsonField[string](t, jsonField[map[string]interface{}](t, body2, "conversation"), "id")
 
 	assert.Equal(t, conv1ID, conv2ID, "same personal thread should be returned")
 }
@@ -2349,7 +2349,7 @@ func TestUpdateMessage_Success(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	msg := body["message"].(map[string]interface{})
+	msg := jsonField[map[string]interface{}](t, body, "message")
 	assert.Equal(t, editedCiphertext, msg["content"])
 	assert.NotNil(t, msg["edited_at"], "edited_at should be set")
 }
@@ -2914,8 +2914,8 @@ func createTestGroup(t *testing.T, ts *testhelpers.TestServer, creator testhelpe
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conv := body["conversation"].(map[string]interface{})
-	return conv["id"].(string)
+	conv := jsonField[map[string]interface{}](t, body, "conversation")
+	return jsonField[string](t, conv, "id")
 }
 
 // ============================================================================
@@ -2936,12 +2936,12 @@ func TestCreateGroupCreatorIsAdmin(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conv := body["conversation"].(map[string]interface{})
-	participants := conv["participants"].([]interface{})
+	conv := jsonField[map[string]interface{}](t, body, "conversation")
+	participants := jsonField[[]interface{}](t, conv, "participants")
 	require.Len(t, participants, 3)
 
 	for _, p := range participants {
-		participant := p.(map[string]interface{})
+		participant := jsonAs[map[string]interface{}](t, p, "participant")
 		if participant["user_id"] == creator.ID {
 			assert.Equal(t, "admin", participant["role"], "creator should be admin")
 		} else {
@@ -2962,16 +2962,16 @@ func TestListConversationsIncludesRole(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conversations := body["conversations"].([]interface{})
+	conversations := jsonField[[]interface{}](t, body, "conversations")
 	require.GreaterOrEqual(t, len(conversations), 1)
 
 	// Find the group conversation
 	for _, c := range conversations {
-		conv := c.(map[string]interface{})
+		conv := jsonAs[map[string]interface{}](t, c, "conversation")
 		if conv["is_group"] == true {
-			participants := conv["participants"].([]interface{})
+			participants := jsonField[[]interface{}](t, conv, "participants")
 			for _, p := range participants {
-				participant := p.(map[string]interface{})
+				participant := jsonAs[map[string]interface{}](t, p, "participant")
 				assert.Contains(t, []string{"admin", "member"}, participant["role"],
 					"every participant should have a role field")
 			}
@@ -2993,13 +2993,13 @@ func TestGetConversationIncludesRoleAndCreatedBy(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conv := body["conversation"].(map[string]interface{})
+	conv := jsonField[map[string]interface{}](t, body, "conversation")
 
 	assert.Equal(t, creator.ID, conv["created_by"], "created_by should be the creator")
 
-	participants := conv["participants"].([]interface{})
+	participants := jsonField[[]interface{}](t, conv, "participants")
 	for _, p := range participants {
-		participant := p.(map[string]interface{})
+		participant := jsonAs[map[string]interface{}](t, p, "participant")
 		assert.NotEmpty(t, participant["role"], "role should be present")
 	}
 }
@@ -3052,8 +3052,8 @@ func TestAddMemberSuccess(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	conv := body["conversation"].(map[string]interface{})
-	participants := conv["participants"].([]interface{})
+	conv := jsonField[map[string]interface{}](t, body, "conversation")
+	participants := jsonField[[]interface{}](t, conv, "participants")
 	assert.Len(t, participants, 3, "should now have 3 participants")
 }
 
@@ -4335,7 +4335,7 @@ func TestAuthorizeVoiceJoinEnforcement(t *testing.T) {
 		assert.Equal(t, true, body["server_muted"])
 		assert.Equal(t, false, body["server_deafened"])
 
-		conv := body["conversation"].(map[string]interface{})
+		conv := jsonField[map[string]interface{}](t, body, "conversation")
 		assert.Equal(t, true, conv["is_group"])
 		assert.Equal(t, "member", conv["caller_role"])
 	})
@@ -4355,7 +4355,7 @@ func TestAuthorizeVoiceJoinEnforcement(t *testing.T) {
 		assert.Equal(t, false, body["server_muted"])
 		assert.Equal(t, false, body["server_deafened"])
 
-		conv := body["conversation"].(map[string]interface{})
+		conv := jsonField[map[string]interface{}](t, body, "conversation")
 		assert.Equal(t, false, conv["is_group"])
 	})
 }
@@ -5126,7 +5126,7 @@ func TestAuthorizeDMVoiceForMediaPlane_OmittedCallIDRejectsStaleJoinAdmission(t 
 	require.Equal(t, http.StatusOK, oldJoin.Code, "reserve old direct join: %s", oldJoin.Body.String())
 	var oldJoinBody map[string]interface{}
 	require.NoError(t, json.Unmarshal(oldJoin.Body.Bytes(), &oldJoinBody))
-	oldCallID := uuid.MustParse(oldJoinBody["call_id"].(string))
+	oldCallID := uuid.MustParse(jsonField[string](t, oldJoinBody, "call_id"))
 
 	ring := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceRing, nil,
 		testhelpers.AuthHeaders(caller.AccessToken))
@@ -5137,7 +5137,7 @@ func TestAuthorizeDMVoiceForMediaPlane_OmittedCallIDRejectsStaleJoinAdmission(t 
 	require.Equal(t, http.StatusOK, accepted.Code, "accept replacement ring: %s", accepted.Body.String())
 	var acceptedBody map[string]interface{}
 	require.NoError(t, json.Unmarshal(accepted.Body.Bytes(), &acceptedBody))
-	replacementCallID := uuid.MustParse(acceptedBody["call_id"].(string))
+	replacementCallID := uuid.MustParse(jsonField[string](t, acceptedBody, "call_id"))
 	require.NotEqual(t, oldCallID, replacementCallID)
 
 	// Model a delayed legacy media authorization for call A arriving after the
@@ -5364,7 +5364,7 @@ func TestAuthorizeDMVoiceForMediaPlane_MediaEntitlements_Premium(t *testing.T) {
 	// Tier resolves from the requesting user's own subscription — the premium
 	// value here is what the media-plane threads onto Participant.tier for the
 	// ADR-0029 DM max-participant-tier room-cap resolution.
-	me := body["media_entitlements"].(map[string]interface{})
+	me := jsonField[map[string]interface{}](t, body, "media_entitlements")
 	assert.Equal(t, "premium", me["tier"])
 }
 
@@ -5848,7 +5848,7 @@ func assertDMMediaEntitlements(t *testing.T, body map[string]interface{}, tier s
 	require.True(t, ok, "allowed_audio_tiers is an array")
 	gotTiers := make([]string, len(rawTiers))
 	for i, v := range rawTiers {
-		gotTiers[i] = v.(string)
+		gotTiers[i] = jsonAs[string](t, v, "allowed_audio_tiers element")
 	}
 	assert.Equal(t, want.AllowedAudioTiers, gotTiers, "allowed_audio_tiers")
 }
@@ -5867,7 +5867,7 @@ func TestAuthorizeVoiceJoin_MediaEntitlements_Free(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	assertDMMediaEntitlements(t, body, entitlements.TierFree)
 
-	me := body["media_entitlements"].(map[string]interface{})
+	me := jsonField[map[string]interface{}](t, body, "media_entitlements")
 	assert.Equal(t, "free", me["tier"])
 	assert.EqualValues(t, 20, me["min_ptime_ms"])
 	assert.EqualValues(t, 5000000, me["max_manual_bitrate_bps"])
@@ -5889,7 +5889,7 @@ func TestAuthorizeVoiceJoin_MediaEntitlements_Premium(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	assertDMMediaEntitlements(t, body, entitlements.TierPremium)
 
-	me := body["media_entitlements"].(map[string]interface{})
+	me := jsonField[map[string]interface{}](t, body, "media_entitlements")
 	assert.Equal(t, "premium", me["tier"])
 	assert.EqualValues(t, 10, me["min_ptime_ms"])
 	assert.EqualValues(t, 20000000, me["max_manual_bitrate_bps"]) // premium stream ceiling (#1602: 10M->20M matching matrix "<=20 Mbps stream")
@@ -5915,7 +5915,7 @@ func TestAuthorizeVoiceJoin_MediaEntitlements_FailClosedPerUser(t *testing.T) {
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
 	assertDMMediaEntitlements(t, body, entitlements.TierFree)
-	me := body["media_entitlements"].(map[string]interface{})
+	me := jsonField[map[string]interface{}](t, body, "media_entitlements")
 	assert.Equal(t, "free", me["tier"], "tier resolved from the joining user's own id")
 }
 
@@ -5941,7 +5941,7 @@ func TestAuthorizeVoiceJoin_MediaEntitlements_TierFromAuthenticatedUser(t *testi
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
 	assertDMMediaEntitlements(t, body, entitlements.TierFree)
-	me := body["media_entitlements"].(map[string]interface{})
+	me := jsonField[map[string]interface{}](t, body, "media_entitlements")
 	assert.Equal(t, "free", me["tier"], "tier must come from the JWT user, not the request body")
 	assert.EqualValues(t, 5000000, me["max_manual_bitrate_bps"], "body cannot raise the bitrate cap")
 }
